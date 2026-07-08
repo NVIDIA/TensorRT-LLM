@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from types import SimpleNamespace
 from typing import List, Optional, Type
 
 import pytest
@@ -25,6 +26,13 @@ from tensorrt_llm._torch.auto_deploy.llm_args import LlmArgs
 from tensorrt_llm._torch.auto_deploy.shim.ad_executor import ADEngine
 from tensorrt_llm._torch.auto_deploy.shim.demollm import DemoEngine
 from tensorrt_llm._torch.auto_deploy.shim.interface import CachedSequenceInterface
+from tensorrt_llm._torch.modules.mamba.mamba2_metadata import (
+    REPLAY_WORK_CACHE_BUF_IDX,
+    REPLAY_WORK_CACHE_SLOT,
+    REPLAY_WORK_ITEM_WIDTH,
+    REPLAY_WORK_PNAT,
+    REPLAY_WORK_POSITION_IN_DECODE_BATCH,
+)
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.llmapi import AttentionDpConfig
 
@@ -678,6 +686,72 @@ class _DummyRequestWithRequestId:
 
     def get_tokens(self, _beam: int) -> List[int]:
         return self._tokens
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_cached_sequence_interface_prepare_replay_metadata_write_first():
+    device = torch.device("cuda")
+    cache_seq_interface = CachedSequenceInterface(
+        max_seq_len=64,
+        max_batch_size=4,
+        max_num_tokens=64,
+        device=device,
+        kv_cache_config=KvCacheConfig(tokens_per_block=16),
+    )
+    cache_seq_interface.to(device)
+
+    prev_num_accepted_tokens = torch.zeros(6, dtype=torch.int32, device=device)
+    cache_buf_idx = torch.zeros(6, dtype=torch.int32, device=device)
+    slot_idx = torch.tensor([3, 1, 5, 0], dtype=torch.long, device=device)
+    prev_num_accepted_tokens[slot_idx] = torch.tensor(
+        [13, 7, 14, 2], dtype=torch.int32, device=device
+    )
+    cache_buf_idx[slot_idx] = torch.tensor([1, 0, 1, 0], dtype=torch.int32, device=device)
+
+    cache_seq_interface._replay_work_items = torch.empty(
+        cache_seq_interface.info.max_num_state_slots,
+        REPLAY_WORK_ITEM_WIDTH,
+        dtype=torch.int32,
+        device=device,
+    )
+    cache_seq_interface._replay_n_writes = torch.zeros(1, dtype=torch.int32, device=device)
+    cache_seq_interface._kv_cache_manager = SimpleNamespace(
+        shutdown=lambda: None,
+        get_replay_state_update_metadata=lambda: SimpleNamespace(
+            prev_num_accepted_tokens=prev_num_accepted_tokens,
+            cache_buf_idx=cache_buf_idx,
+            replay_step_width=6,
+            replay_history_size=16,
+        ),
+    )
+
+    cache_seq_interface.info.batch_info.update([0, 0, 4, 4, 0, 0])
+    cache_seq_interface.info.batch_info.update_use_replay(True)
+    cache_seq_interface.info._input_buffer.copy_("slot_idx", slot_idx)
+
+    cache_seq_interface.prepare_replay_metadata()
+
+    expected = torch.tensor(
+        [
+            [0, 3, 13, 1],
+            [2, 5, 14, 1],
+            [1, 1, 7, 0],
+            [3, 0, 2, 0],
+        ],
+        dtype=torch.int32,
+        device=device,
+    )
+    actual = cache_seq_interface._replay_work_items[:4]
+    assert cache_seq_interface._replay_n_writes.item() == 2
+    assert torch.equal(
+        actual[:, REPLAY_WORK_POSITION_IN_DECODE_BATCH],
+        expected[:, REPLAY_WORK_POSITION_IN_DECODE_BATCH],
+    )
+    assert torch.equal(actual[:, REPLAY_WORK_CACHE_SLOT], expected[:, REPLAY_WORK_CACHE_SLOT])
+    assert torch.equal(actual[:, REPLAY_WORK_PNAT], expected[:, REPLAY_WORK_PNAT])
+    assert torch.equal(actual[:, REPLAY_WORK_CACHE_BUF_IDX], expected[:, REPLAY_WORK_CACHE_BUF_IDX])
+
+    cache_seq_interface.shutdown()
 
 
 def test_ad_engine_prepare_inputs_with_hybrid_cache_manager():

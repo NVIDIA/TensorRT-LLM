@@ -57,7 +57,7 @@ public:
     [[nodiscard]] int getHeadSize(bool checkInit = true) const;
     [[nodiscard]] int getMaxNumSeqLenTile(int batch_beam_size = 1) const;
     [[nodiscard]] size_t getWorkspaceSizeForContext(nvinfer1::DataType type, int32_t nbReq, int32_t max_input_length,
-        int32_t cross_kv_length = 0, int32_t max_num_tokens = 0) const noexcept;
+        int32_t cross_kv_length = 0, int32_t max_num_tokens = 0, int32_t total_kv_len = 0) const noexcept;
     // total_num_seq is the sum of beam_width for multiple requests
     [[nodiscard]] size_t getWorkspaceSizeForGeneration(nvinfer1::DataType type, int32_t total_num_seq,
         int32_t max_attention_window_size, int32_t max_num_tokens, int32_t max_blocks_per_sequence) const noexcept;

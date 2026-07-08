@@ -1,13 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Unit tests for the Mamba SSM stochastic-rounding Philox seed plumbing.
+"""Unit tests for Mamba SSM stochastic-rounding Philox seed plumbing.
 
-The Mamba SSM SR path previously generated `rand_seed` tensors via
-`torch.randint(..., (1,))` on every decode forward.  The cache manager now
-owns a persistent per-cache-slot int64 buffer that is deterministically
-initialized and rewritten on fresh request assignment.  These tests pin the
-contract: pure-function seed generation, deterministic allocation, and
-per-slot reset without `torch.randint`.
+The cache manager owns a persistent per-cache-slot int64 seed buffer that is
+deterministically initialized and rewritten on fresh request assignment. These
+tests pin pure-function seed generation, deterministic allocation, and per-slot
+reset without per-forward `torch.randint`.
 """
 
 import pytest
@@ -149,8 +147,7 @@ def test_padding_sentinel_does_not_churn_seeds():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 def test_replay_path_still_allocates_seed_buffer():
-    # Backward-compatibility: the replay path used to allocate the seed
-    # buffer; the new wiring must not regress that.
+    # Replay stochastic rounding uses the persistent per-slot seed buffer.
     mgr = _make_python_manager(sr=False, replay=True)
     seed_buf = mgr.get_mamba_ssm_rand_seed()
     assert seed_buf is not None
@@ -205,9 +202,7 @@ def test_cpp_hybrid_non_replay_mtp_layer_cache_carries_rand_seed():
     mamba_ssm_rand_seed on the returned SpeculativeState.
 
     The mixer's non-replay MTP SR branch (mamba2_mixer.py) reads
-    `layer_cache.mamba_ssm_rand_seed` and asserts non-None.  Iter5 review
-    caught the regression where the seed was only forwarded inside the
-    replay branch of mamba_layer_cache; this test pins both paths."""
+    `layer_cache.mamba_ssm_rand_seed` and asserts non-None."""
     from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
 
     spec_config = MTPDecodingConfig(max_draft_len=2)

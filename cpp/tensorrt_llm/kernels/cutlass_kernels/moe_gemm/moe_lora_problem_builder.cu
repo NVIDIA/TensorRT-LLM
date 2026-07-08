@@ -68,8 +68,16 @@ __global__ void moeLoraProblemBuilderKernel(int32_t const* __restrict__ ranks, i
     // Problem sizes: each permuted token gets its own (M=1) GEMM. This matches
     // worst-case scheduling with no run-length aggregation; a future
     // optimization can aggregate consecutive identical-adapter tokens.
+    //
+    // Rank-0 rows carry no active adapter (base/no-LoRA request, padding, or
+    // warmup) and have null A/B pointers, so their delta is zero and the caller
+    // pre-zeroes the output. The in-GEMM already collapses to N=0 (rank is its
+    // N) and is skipped, but the out-GEMM's N is out_hidden_size; forcing it to
+    // zero here lets the grouped GEMM skip these rows too instead of launching
+    // tiles that dereference the null B pointer.
+    int const out_n = (rank > 0) ? static_cast<int>(out_hidden_size) : 0;
     problem_sizes_in[i] = cutlass::gemm::GemmCoord(1, rank, static_cast<int>(in_hidden_size));
-    problem_sizes_out[i] = cutlass::gemm::GemmCoord(1, static_cast<int>(out_hidden_size), rank);
+    problem_sizes_out[i] = cutlass::gemm::GemmCoord(1, out_n, rank);
 
     // Pointer rows. dtype_bytes scales the per-row stride so the same
     // builder serves bf16/fp16/fp32 adapters without templating.

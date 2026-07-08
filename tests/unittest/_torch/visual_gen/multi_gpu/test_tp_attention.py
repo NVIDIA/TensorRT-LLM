@@ -39,12 +39,21 @@ import torch.multiprocessing as mp
 import torch.nn.functional as F
 
 try:
+    import sys
+    from pathlib import Path
+
     from tensorrt_llm._torch.device_mesh import DeviceMeshTopologyImpl
-    from tensorrt_llm._torch.visual_gen.config import AttentionConfig, DiffusionModelConfig
+    from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
     from tensorrt_llm._torch.visual_gen.mapping import VisualGenMapping
     from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode
-    from tensorrt_llm._utils import get_free_port
+
+    # Spawn distributed workers via a helper that retries with a fresh master
+    # port when the c10d rendezvous TCPStore loses the bind race (EADDRINUSE).
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from _visual_gen_dist_utils import spawn_with_retry
+
     from tensorrt_llm.mapping import Mapping
+    from tensorrt_llm.visual_gen.args import AttentionConfig
 
     MODULES_AVAILABLE = True
 except ImportError:
@@ -92,9 +101,13 @@ def _run(world_size: int, test_fn: Callable, *args):
         pytest.skip("Required modules not available")
     if torch.cuda.device_count() < world_size:
         pytest.skip(f"Need {world_size} GPUs, have {torch.cuda.device_count()}")
-    port = get_free_port()
-    mp.spawn(
-        _distributed_worker, args=(world_size, test_fn, port, *args), nprocs=world_size, join=True
+    spawn_with_retry(
+        lambda port: mp.spawn(
+            _distributed_worker,
+            args=(world_size, test_fn, port, *args),
+            nprocs=world_size,
+            join=True,
+        )
     )
 
 

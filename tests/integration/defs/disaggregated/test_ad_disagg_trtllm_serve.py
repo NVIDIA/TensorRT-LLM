@@ -20,7 +20,7 @@ from pathlib import Path
 import pytest
 import requests
 from defs.common import get_free_port_in_ci as get_free_port
-from defs.conftest import llm_models_root
+from defs.conftest import check_device_contain, llm_models_root
 from disagg_test_utils import (
     CHECK_STATUS_INTERVAL,
     HEARTBEAT_INTERVAL,
@@ -33,6 +33,16 @@ from disagg_test_utils import (
 from openai import OpenAI
 
 pytest_plugins = ["disagg_test_utils"]
+
+
+@pytest.fixture(autouse=True)
+def skip_b300():
+    if check_device_contain(["B300"]):
+        pytest.skip(
+            "AutoDeploy disagg tests are disabled on B300/GB300 until capacity is available: "
+            "https://nvbugs/6301621"
+        )
+
 
 SERVER_START_TIMEOUT_S = 300
 SERVER_READY_REQUEST_TIMEOUT_S = 5

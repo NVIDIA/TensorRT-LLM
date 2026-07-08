@@ -945,7 +945,7 @@ class QuantizeMXFP4MOE(BaseTransform):
             # 88.02%).
             tp_size = int(getattr(dc, "tp_size", 1)) if dc is not None else 1
             if tp_size > 1:
-                from .sharding import _get_dist_ops
+                from .sharding_ir import _get_dist_ops
 
                 _, all_reduce_op = _get_dist_ops("auto")
                 view_node = next(

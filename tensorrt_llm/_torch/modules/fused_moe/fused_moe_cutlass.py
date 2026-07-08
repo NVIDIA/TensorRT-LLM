@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import inspect
 import os
 from functools import cached_property
@@ -15,21 +30,40 @@ from tensorrt_llm.tools.layer_wise_benchmarks import get_calibrator
 from ...distributed import allgather
 from ...expert_statistic import ExpertStatistic
 from ...model_config import ModelConfig
-from ...peft.lora.layer import LoraModuleType, MoeLoraLayer
+from ...peft.lora.layer import (MOE_LORA_MODULE_NAMES,
+                                MOE_LORA_MODULE_TO_KERNEL_SLOT, LoraModuleType,
+                                MoeLoraLayer)
+from ...peft.lora.validation import has_moe_lora_targets
 from ...utils import (ActivationType, AuxStreamType, EventType,
                       Fp4QuantizedTensor)
 from .interface import AlltoallMethodType, MoE
 from .quantization import UnquantizedFusedMoEMethod
+from .wide_ep_ft import get_wide_ep_ft_options
 
 # isort: off
 from .quantization import (
     DeepSeekFP8BlockScalesFusedMoEMethod, FP8QDQFusedMoEMethod,
-    MoEWeightLoadingMode, NVFP4CutlassFusedMoEMethod,
-    INT8WoqPerChannelFusedMoEMethod, W4A16NVFP4CutlassFusedMoEMethod,
-    W4A8MXFP4FP8CutlassFusedMoEMethod, W4A8MXFP4MXFP8CutlassFusedMoEMethod,
-    WFP4A16FusedMoEMethod, WInt4AFP8FusedMoEMethod)
+    MoEWeightLoadingMode, MXFP8CutlassFusedMoEMethod,
+    NVFP4CutlassFusedMoEMethod, INT8WoqPerChannelFusedMoEMethod,
+    W4A16NVFP4CutlassFusedMoEMethod, W4A8MXFP4FP8CutlassFusedMoEMethod,
+    W4A8MXFP4MXFP8CutlassFusedMoEMethod, WFP4A16FusedMoEMethod,
+    WInt4AFP8FusedMoEMethod)
 # isort: on
 from .routing import BaseMoeRoutingMethod
+
+
+def raise_moe_lora_multichunk_unsupported(num_chunks: int) -> None:
+    """Reject multi-chunk execution for routed-expert MoE LoRA.
+
+    Routed-expert MoE LoRA passes per-request/slot adapter metadata that is not
+    re-sliced per token-chunk, so multi-chunk execution would mismatch the
+    kernel's per-token expansion. Shared by CutlassFusedMoE.forward_impl and the
+    MoEScheduler so the message stays in one place.
+    """
+    raise NotImplementedError(
+        f"Routed-expert MoE LoRA does not support multi-chunk execution "
+        f"(num_chunks={num_chunks}). Reduce the per-forward token count or "
+        f"increase `moe_max_num_tokens` so the MoE runs in a single chunk.")
 
 
 class CutlassFusedMoE(MoE):
@@ -110,6 +144,12 @@ class CutlassFusedMoE(MoE):
         # W4A8_MXFP4_MXFP8: SM in {100, 103, 120, 121}
         QuantAlgo.W4A8_MXFP4_MXFP8: {
             "sm_constraint": ("in", {100, 103, 120, 121}),
+            "dtypes": {torch.float16, torch.bfloat16},
+        },
+        # MXFP8 (W8A8 e4m3xe4m3 with UE8M0 1x32 block scales): SM in {100, 103}.
+        # M3.1 enables construction/load; the fused kernel is M3.2.
+        QuantAlgo.MXFP8: {
+            "sm_constraint": ("in", {100, 103}),
             "dtypes": {torch.float16, torch.bfloat16},
         },
     }
@@ -225,6 +265,7 @@ class CutlassFusedMoE(MoE):
         swiglu_alpha: Optional[torch.Tensor] = None,
         swiglu_beta: Optional[torch.Tensor] = None,
         swiglu_limit: Optional[torch.Tensor] = None,
+        swiglu_limit_scalar: Optional[float] = None,
         init_load_balancer: bool = True,
         without_comm: bool = False,
         activation_type: ActivationType = ActivationType.Swiglu,
@@ -243,6 +284,7 @@ class CutlassFusedMoE(MoE):
             swiglu_alpha=swiglu_alpha,
             swiglu_beta=swiglu_beta,
             swiglu_limit=swiglu_limit,
+            swiglu_limit_scalar=swiglu_limit_scalar,
             layer_idx=layer_idx,
             init_load_balancer=init_load_balancer,
             activation_type=activation_type,
@@ -322,6 +364,8 @@ class CutlassFusedMoE(MoE):
                         dtype,
                         self.num_experts if self.layer_load_balancer else None,
                     )
+                    ep_group_health, watchdog_timeout_s, watchdog_poll_interval_s = (
+                        get_wide_ep_ft_options(model_config))
 
                     self.moe_a2a = MoeAlltoAll(
                         mapping=self.mapping,
@@ -331,6 +375,10 @@ class CutlassFusedMoE(MoE):
                         workspace_size_per_rank=workspace_size,
                         num_experts=self.num_experts
                         if self.layer_load_balancer else None,
+                        ep_group_health=ep_group_health,
+                        alltoall_watchdog_timeout_s=watchdog_timeout_s,
+                        alltoall_watchdog_poll_interval_s=
+                        watchdog_poll_interval_s,
                     )
                 elif self.alltoall_method_type == AlltoallMethodType.DeepEP or self.alltoall_method_type == AlltoallMethodType.DeepEPLowLatency:
                     raise NotImplementedError(
@@ -373,18 +421,12 @@ class CutlassFusedMoE(MoE):
 
     # ---- Routed-expert LoRA helpers ----
 
-    _MOE_LORA_MODULE_NAMES = ("moe_h_to_4h", "moe_4h_to_h", "moe_gate")
-
     def _has_moe_lora_targets(self, model_config: ModelConfig) -> bool:
         """Return True iff this MoE layer is in the routed-expert LoRA
         target-module set. The LoRA application itself is fused into
         `torch.ops.trtllm.fused_moe`; no submodule is registered.
         """
-        lora_config = getattr(model_config, "lora_config", None)
-        if lora_config is None:
-            return False
-        targets = set(getattr(lora_config, "lora_target_modules", []) or [])
-        return any(name in targets for name in self._MOE_LORA_MODULE_NAMES)
+        return has_moe_lora_targets(getattr(model_config, "lora_config", None))
 
     def _maybe_make_lora_marker(
             self, model_config: ModelConfig) -> Optional[MoeLoraLayer]:
@@ -399,10 +441,16 @@ class CutlassFusedMoE(MoE):
         lora_config = getattr(model_config, "lora_config", None)
         if lora_config is None:
             return None
-        targets = set(getattr(lora_config, "lora_target_modules", []) or [])
+        # Normalize to lowercase to match has_moe_lora_targets (which lowercases
+        # before comparing), so a mixed-case config marks the layer and builds
+        # the discovery marker consistently.
+        targets = {
+            name.lower()
+            for name in (getattr(lora_config, "lora_target_modules", []) or [])
+        }
         active_modules: List[LoraModuleType] = []
         active_out_sizes: List[int] = []
-        for name in self._MOE_LORA_MODULE_NAMES:
+        for name in MOE_LORA_MODULE_NAMES:
             if name not in targets:
                 continue
             module_type = LoraModuleType.from_string(name)
@@ -446,6 +494,22 @@ class CutlassFusedMoE(MoE):
         if getattr(self, "w3_w1_weight", None) is None:
             return
 
+        # The reservation must cover the engine's worst case, otherwise the first
+        # capture hits a lazy allocation that the C++ in-capture guard rejects.
+        assert max_lora_rank > 0, (
+            "reserve_moe_lora_cuda_graph_workspace requires max_lora_rank > 0 "
+            f"(got {max_lora_rank}); set lora_config.max_lora_rank.")
+        assert max_lora_size > 0, (
+            "reserve_moe_lora_cuda_graph_workspace requires max_lora_size > 0 "
+            f"(got {max_lora_size}).")
+        # MoE LoRA only runs on the unquantized fp16/bf16 path, so the MoERunner
+        # instance key below (all-False quant flags, x/weight/out == self.dtype)
+        # must match the key the runtime fused_moe op uses on the same layer;
+        # otherwise the reservation lands on a different cached C++ runner.
+        assert self.dtype in (torch.float16, torch.bfloat16), (
+            "MoE LoRA requires fp16/bf16 activations to reserve a deterministic "
+            f"FusedMoeRunner key; got {self.dtype}.")
+
         from ...custom_ops.torch_custom_ops import MoERunner
 
         # Build the MoERunner with the same instance key the functional
@@ -488,12 +552,60 @@ class CutlassFusedMoE(MoE):
         """
         if not lora_params or self.layer_idx is None:
             return False
+        # CUDA-graph slot-indexed mode carries MoE LoRA in cuda_graph_params
+        # rather than a per-layer eager dict (mirrors _extract_moe_lora_tensors),
+        # so consult the graph layer map to keep the stray-param and multi-chunk
+        # guards effective during capture/replay.
+        if lora_params.get("use_cuda_graph_mode", False):
+            cuda_graph_params = lora_params.get("cuda_graph_params")
+            if cuda_graph_params is None:
+                return False
+            layer_module2key = getattr(cuda_graph_params, "layer_module2key",
+                                       {})
+            return any(
+                (self.layer_idx,
+                 int(LoraModuleType.from_string(name))) in layer_module2key
+                for name in MOE_LORA_MODULE_NAMES)
         layer_params = lora_params.get(self.layer_idx, {})
         if not layer_params:
             return False
         return any(
             int(LoraModuleType.from_string(name)) in layer_params
-            for name in self._MOE_LORA_MODULE_NAMES)
+            for name in MOE_LORA_MODULE_NAMES)
+
+    @staticmethod
+    def _empty_kernel_slot_dict() -> Dict[str, Optional[torch.Tensor]]:
+        return {"fc1": None, "fc2": None, "gated": None}
+
+    def _gather_moe_lora_slots(self, source):
+        """Gather per-kernel-slot (ranks, weight_ptrs) tensors.
+
+        `source(module_type)` returns the (ranks, weight_ptrs) pair for an MoE
+        LoRA module, or None if absent. Returns (ranks_by_slot, ptrs_by_slot)
+        dicts keyed by the kernel slot ("fc1"/"gated"/"fc2"); see
+        MOE_LORA_MODULE_TO_KERNEL_SLOT for the module->slot convention. Shared by
+        the eager (per-request) and CUDA-graph (slot-indexed) extraction paths.
+        """
+        ranks = self._empty_kernel_slot_dict()
+        ptrs = self._empty_kernel_slot_dict()
+        for module_type, slot in MOE_LORA_MODULE_TO_KERNEL_SLOT.items():
+            got = source(module_type)
+            if got is None:
+                continue
+            ranks[slot], ptrs[slot] = got
+        return ranks, ptrs
+
+    @staticmethod
+    def _require_fc1_fc2(ranks: Dict[str, Optional[torch.Tensor]]) -> None:
+        """The kernel always dereferences the fc1 and fc2 rank/pointer arrays
+        (see setupLoraWorkspace in moe_kernels.cu), so moe_h_to_4h (fc1/gate) and
+        moe_4h_to_h (fc2/down) must both be present when MoE LoRA is active. The
+        gated slot (moe_gate) is only read for gated activations.
+        """
+        if ranks["fc1"] is None or ranks["fc2"] is None:
+            raise ValueError(
+                "MoE LoRA requires both `moe_h_to_4h` (gate/SiLU) and "
+                "`moe_4h_to_h` (down) in lora_target_modules.")
 
     def _extract_moe_lora_tensors(
             self, lora_params: Optional[Dict]) -> Optional[Dict[str, object]]:
@@ -520,79 +632,41 @@ class CutlassFusedMoE(MoE):
         if not layer_params:
             return None
 
-        # Map each MoE LoRA module to the kernel's fc1 / gated / fc2 slot.
-        # The kernel applies fc1_lora to the gate (SiLU) half of the packed FC1
-        # output and gated_lora to the up (linear) half (see loraFC1 and
-        # doActivationKernel in moe_kernels.cu). With the canonical convention
-        # (moe_h_to_4h is w1 gate/SiLU, moe_gate is w3 up/linear, moe_4h_to_h is
-        # w2 down), this gives moe_h_to_4h to fc1, moe_gate to gated, and
-        # moe_4h_to_h to fc2.
-        slot_to_kernel = {
-            int(LoraModuleType.MOE_H_TO_4H): "fc1",
-            int(LoraModuleType.MOE_GATE): "gated",
-            int(LoraModuleType.MOE_4H_TO_H): "fc2",
-        }
-        kernel_ranks: Dict[str, Optional[torch.Tensor]] = {
-            "fc1": None,
-            "fc2": None,
-            "gated": None,
-        }
-        kernel_ptrs: Dict[str, Optional[torch.Tensor]] = {
-            "fc1": None,
-            "fc2": None,
-            "gated": None,
-        }
+        # Gather (ranks, weight_ptrs) per kernel slot. weight_pointers is built
+        # flat ([num_seqs * 3], row-major (A, B, DoRA) per seq) in
+        # PyTorchModelEngine._build_lora_params; the op expects [num_seqs, 3].
         active_max_rank = 0
-        for module_id_int, slot in slot_to_kernel.items():
-            entry = layer_params.get(module_id_int)
+
+        def _source(module_type: LoraModuleType):
+            nonlocal active_max_rank
+            entry = layer_params.get(int(module_type))
             if entry is None:
-                continue
-            kernel_ranks[slot] = entry["adapter_size"]
-            kernel_ptrs[slot] = entry["weight_pointers"]
-            try:
-                active_max_rank = max(active_max_rank,
-                                      int(entry["adapter_size"].max().item()))
-            except (RuntimeError, ValueError):
-                # Empty tensor; treat as no contribution.
-                pass
+                return None
+            rank_t = entry["adapter_size"]
+            if rank_t.numel() > 0:
+                active_max_rank = max(active_max_rank, int(rank_t.max().item()))
+            return rank_t, entry["weight_pointers"].reshape(-1, 3)
 
-        if all(v is None for v in kernel_ranks.values()):
+        ranks, ptrs = self._gather_moe_lora_slots(_source)
+        if all(v is None for v in ranks.values()):
             return None
-
-        # The kernel always dereferences the fc1 and fc2 rank/pointer arrays
-        # (see setupLoraWorkspace in moe_kernels.cu), so moe_h_to_4h (fc1) and
-        # moe_4h_to_h (fc2) must both be present when MoE LoRA is active. The
-        # gated slot (moe_gate) is only read for gated activations and is
-        # checked in the C++ thop layer.
-        if kernel_ranks["fc1"] is None or kernel_ranks["fc2"] is None:
-            raise ValueError(
-                "MoE LoRA requires both `moe_h_to_4h` (gate/SiLU) and "
-                "`moe_4h_to_h` (down) in lora_target_modules; got modules: "
-                f"{[name for name in self._MOE_LORA_MODULE_NAMES if int(LoraModuleType.from_string(name)) in layer_params]}"
-            )
+        self._require_fc1_fc2(ranks)
 
         num_seqs = lora_params["num_seqs"]
+
+        def _slice(t):
+            return t[:num_seqs].contiguous() if t is not None else None
+
         return {
-            "fc1_lora_ranks":
-            kernel_ranks["fc1"][:num_seqs].contiguous(),
-            "fc1_lora_weight_ptrs":
-            kernel_ptrs["fc1"][:num_seqs].contiguous(),
-            "fc2_lora_ranks":
-            kernel_ranks["fc2"][:num_seqs].contiguous(),
-            "fc2_lora_weight_ptrs":
-            kernel_ptrs["fc2"][:num_seqs].contiguous(),
-            "gated_lora_ranks":
-            (kernel_ranks["gated"][:num_seqs].contiguous()
-             if kernel_ranks["gated"] is not None else None),
-            "gated_lora_weight_ptrs":
-            (kernel_ptrs["gated"][:num_seqs].contiguous()
-             if kernel_ptrs["gated"] is not None else None),
-            "host_request_types":
-            lora_params["host_request_types"][:num_seqs].contiguous(),
-            "host_context_lengths":
-            lora_params["prompt_lens_cpu"][:num_seqs].contiguous(),
-            "lora_max_low_rank":
-            active_max_rank,
+            "fc1_lora_ranks": _slice(ranks["fc1"]),
+            "fc1_lora_weight_ptrs": _slice(ptrs["fc1"]),
+            "fc2_lora_ranks": _slice(ranks["fc2"]),
+            "fc2_lora_weight_ptrs": _slice(ptrs["fc2"]),
+            "gated_lora_ranks": _slice(ranks["gated"]),
+            "gated_lora_weight_ptrs": _slice(ptrs["gated"]),
+            "host_request_types": _slice(lora_params["host_request_types"]),
+            "host_context_lengths": _slice(lora_params["prompt_lens_cpu"]),
+            "lora_max_low_rank": active_max_rank,
         }
 
     def _extract_moe_lora_tensors_cuda_graph(
@@ -616,28 +690,11 @@ class CutlassFusedMoE(MoE):
         if cuda_graph_params is None:
             return None
 
-        slot_to_kernel = {
-            int(LoraModuleType.MOE_H_TO_4H): "fc1",
-            int(LoraModuleType.MOE_GATE): "gated",
-            int(LoraModuleType.MOE_4H_TO_H): "fc2",
-        }
-        slot_ranks: Dict[str, Optional[torch.Tensor]] = {
-            "fc1": None,
-            "fc2": None,
-            "gated": None,
-        }
-        slot_ptrs: Dict[str, Optional[torch.Tensor]] = {
-            "fc1": None,
-            "fc2": None,
-            "gated": None,
-        }
-        for module_id_int, slot in slot_to_kernel.items():
-            inputs = cuda_graph_params.get_moe_slot_inputs(
-                self.layer_idx, module_id_int)
-            if inputs is None:
-                continue
-            slot_ranks[slot], slot_ptrs[slot] = inputs
+        def _source(module_type: LoraModuleType):
+            return cuda_graph_params.get_moe_slot_inputs(
+                self.layer_idx, int(module_type))
 
+        slot_ranks, slot_ptrs = self._gather_moe_lora_slots(_source)
         if slot_ranks["fc1"] is None or slot_ranks["fc2"] is None:
             return None
 
@@ -692,7 +749,8 @@ class CutlassFusedMoE(MoE):
                     | self.quant_config.quant_mode.is_weight_only()
                     | self.quant_config.quant_mode.has_w4a8_mxfp4_fp8()
                     | self.quant_config.quant_mode.has_w4a16_mxfp4()
-                    | self.quant_config.quant_mode.has_w4a8_mxfp4_mxfp8()):
+                    | self.quant_config.quant_mode.has_w4a8_mxfp4_mxfp8()
+                    | self.quant_config.quant_mode.has_mxfp8()):
                 raise ValueError(
                     f"unsupported quantization mode: {self.quant_config.quant_mode}"
                 )
@@ -824,7 +882,10 @@ class CutlassFusedMoE(MoE):
                         x, x_sf = torch.ops.trtllm.fp4_quantize(
                             x, self.fc31_input_scale, self.scaling_vector_size,
                             False, True)
-            elif self.has_w4a8_mxfp4_mxfp8:
+            elif self.has_w4a8_mxfp4_mxfp8 or self.has_mxfp8:
+                # MXFP8 dynamic activation quantize. The MXFP8xMXFP8 path reuses
+                # the same activation quant kernel as W4A8 MXFP4xMXFP8 -- only
+                # the weight side differs (B element widens from fp4 to fp8).
                 if post_quant_comm:
                     x, x_sf = torch.ops.trtllm.mxfp8_quantize(
                         x, False, alignment=self.quant_method.weight_alignment)
@@ -866,6 +927,8 @@ class CutlassFusedMoE(MoE):
                 return WFP4A16FusedMoEMethod()
             elif self.quant_config.layer_quant_mode.has_w4a8_mxfp4_mxfp8():
                 return W4A8MXFP4MXFP8CutlassFusedMoEMethod()
+            elif self.quant_config.layer_quant_mode.has_mxfp8():
+                return MXFP8CutlassFusedMoEMethod()
             else:
                 raise ValueError(
                     f"Unsupported quantization mode: {self.quant_config.quant_mode}"
@@ -1032,7 +1095,10 @@ class CutlassFusedMoE(MoE):
             use_deepseek_fp8_block_scale=self.has_deepseek_fp8_block_scales,
             use_w4_group_scaling=self.has_w4afp8 or self.has_w4a16_mxfp4,
             use_int8_woq_per_channel=self.has_int8_woq_per_channel,
-            use_mxfp8_act_scaling=self.has_w4a8_mxfp4_mxfp8,
+            # use_mxfp8_act_scaling drives dynamic MXFP8 activation quantization
+            # before the GEMM; required for both W4A8 MXFP4xMXFP8 and W8A8
+            # MXFP8xMXFP8 paths.
+            use_mxfp8_act_scaling=self.has_w4a8_mxfp4_mxfp8 or self.has_mxfp8,
             min_latency_mode=False,
             use_fused_finalize=self.use_fused_finalize,
             tune_max_num_tokens=self.tune_max_num_tokens,
@@ -1042,6 +1108,10 @@ class CutlassFusedMoE(MoE):
             unpadded_hidden_size=self.unpadded_hidden_size,
             out_tensor=moe_output,
             use_dynamic_fc2_scale=use_dynamic_fc2_scale,
+            # use_mxfp8_weight_scaling selects the MXFP8xMXFP8 block-scaled
+            # kernel path within the <e4m3, e4m3> CutlassMoeFCRunner template
+            # (per-tensor FP8 otherwise).
+            use_mxfp8_weight_scaling=self.has_mxfp8,
             **lora_kwargs,
         )
         # When moe_output is provided, the result is written in-place and
@@ -1136,6 +1206,7 @@ class CutlassFusedMoE(MoE):
         self,
         x: Union[torch.Tensor, Fp4QuantizedTensor],
         router_logits: torch.Tensor,
+        input_ids: Optional[torch.IntTensor],
         output_dtype: Optional[torch.dtype] = None,
         all_rank_num_tokens: Optional[List[int]] = None,
         use_dp_padding: Optional[bool] = None,
@@ -1153,7 +1224,7 @@ class CutlassFusedMoE(MoE):
 
         # apply routing
         token_selected_experts, token_final_scales = self.routing_method.apply(
-            router_logits)
+            router_logits, input_ids)
         assert token_selected_experts.shape[
             1] == self.routing_method.experts_per_token
         assert token_selected_experts.shape == token_final_scales.shape
@@ -1391,6 +1462,7 @@ class CutlassFusedMoE(MoE):
         x: Union[torch.Tensor, Fp4QuantizedTensor],
         router_logits: torch.Tensor,
         *,
+        input_ids: Optional[torch.IntTensor] = None,
         do_finalize: bool = True,  # used by other MoE backends
         output_dtype: Optional[torch.dtype] = None,
         all_rank_num_tokens: Optional[List[int]] = None,
@@ -1426,15 +1498,7 @@ class CutlassFusedMoE(MoE):
                       1) // self.moe_max_num_tokens
 
         if num_chunks > 1 and self._moe_lora_active(lora_params):
-            # Routed-expert MoE LoRA passes per-request adapter metadata that is
-            # not re-sliced per token-chunk, so multi-chunk execution would
-            # mismatch the kernel's per-token expansion. Reject with a clear
-            # message instead of failing inside the C++ op.
-            raise NotImplementedError(
-                f"Routed-expert MoE LoRA does not support multi-chunk execution "
-                f"(num_chunks={num_chunks}). Reduce the per-forward token count "
-                f"or increase `moe_max_num_tokens` so the MoE runs in a single "
-                f"chunk.")
+            raise_moe_lora_multichunk_unsupported(num_chunks)
 
         if num_chunks == 1:
             is_first_call = self.repeat_idx == 0
@@ -1442,7 +1506,8 @@ class CutlassFusedMoE(MoE):
             outputs = self.forward_chunk(
                 x,
                 router_logits,
-                output_dtype,
+                input_ids=input_ids,
+                output_dtype=output_dtype,
                 all_rank_num_tokens=all_rank_num_tokens_padded,
                 use_dp_padding=use_dp_padding,
                 repeating_info=(is_first_call, is_last_call),
@@ -1467,17 +1532,21 @@ class CutlassFusedMoE(MoE):
 
             x_list = x.split(chunk_size_list)
             router_logits_list = router_logits.split(chunk_size_list)
+            input_ids_list = input_ids.split(
+                chunk_size_list) if input_ids is not None else [None
+                                                                ] * num_chunks
 
             self.event_dict[EventType.Main].record()
             with torch.cuda.stream(self.aux_stream):
                 self.event_dict[EventType.Main].wait()
 
-            def _forward_chunk(x_, router_logits_, idx):
+            def _forward_chunk(x_, router_logits_, input_ids_, idx):
                 is_first_call = idx == 0 and self.repeat_idx == 0
                 is_last_call = idx == num_chunks - 1 and self.repeat_idx == self.repeat_count - 1
                 return self.forward_chunk(
                     x_,
                     router_logits_,
+                    input_ids=input_ids_,
                     all_rank_num_tokens=all_rank_num_tokens_list[idx]
                     if self.use_dp else None,
                     use_dp_padding=use_dp_padding,
@@ -1492,8 +1561,8 @@ class CutlassFusedMoE(MoE):
 
             outputs_list = []
             # Postpone reduce-scatter/all-reduce to the next iteration to achieve better overlap
-            for idx_chunk, (x, router_logits) in enumerate(
-                    zip(x_list, router_logits_list)):
+            for idx_chunk, (x, router_logits, input_ids) in enumerate(
+                    zip(x_list, router_logits_list, input_ids_list)):
                 if not (self.alltoall_method_type
                         == AlltoallMethodType.NVLinkOneSided
                         or self.alltoall_method_type
@@ -1501,17 +1570,19 @@ class CutlassFusedMoE(MoE):
                     if idx_chunk % 2 == 0:
                         with torch.cuda.stream(self.aux_stream):
                             outputs = _forward_chunk(x, router_logits,
-                                                     idx_chunk)
+                                                     input_ids, idx_chunk)
                         if idx_chunk > 0:
                             outputs_list[-1] = _reducescatter_or_allreduce(
                                 outputs_list[-1], idx_chunk - 1)
                     else:
-                        outputs = _forward_chunk(x, router_logits, idx_chunk)
+                        outputs = _forward_chunk(x, router_logits, input_ids,
+                                                 idx_chunk)
                         with torch.cuda.stream(self.aux_stream):
                             outputs_list[-1] = _reducescatter_or_allreduce(
                                 outputs_list[-1], idx_chunk - 1)
                 else:
-                    outputs = _forward_chunk(x, router_logits, idx_chunk)
+                    outputs = _forward_chunk(x, router_logits, input_ids,
+                                             idx_chunk)
 
                 outputs_list.append(outputs)
 
@@ -1572,6 +1643,3 @@ class CutlassFusedMoE(MoE):
             kargs["allow_partial_loading"] = allow_partial_loading
         self.quant_method.load_weights(self, weights, self.weight_loading_mode,
                                        **kargs)
-
-    def post_load_weights(self):
-        self.quant_method.post_load_weights(self)

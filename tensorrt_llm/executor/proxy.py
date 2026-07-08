@@ -327,7 +327,14 @@ class GenerationExecutorProxy(GenerationExecutor):
             nonlocal event_loop
             nonlocal async_queues
 
-            queue = self._results[client_id].queue
+            # The result may already be finalized and popped below — e.g. a
+            # `terminate` verdict sent a final Output while the
+            # engine still has in-flight responses (abort is async). Drop such
+            # late responses instead of crashing with a KeyError.
+            result = self._results.get(client_id)
+            if result is None:
+                return
+            queue = result.queue
             if isinstance(queue, _SyncQueue):
                 queue.put_nowait(res)
                 async_queues.append(queue)
@@ -342,7 +349,7 @@ class GenerationExecutorProxy(GenerationExecutor):
                     res,
                     ErrorResponse) or (isinstance(res, PostprocWorker.Output)
                                        and res.is_final):
-                self._results.pop(client_id)
+                self._results.pop(client_id, None)
 
         res = res if isinstance(res, list) else [res]
 
@@ -616,6 +623,22 @@ class GenerationExecutorProxy(GenerationExecutor):
 
         stats = self.rpc_client.fetch_stats_wait_async(timeout=timeout).remote()
         return [json.loads(s) if isinstance(s, str) else s for s in stats]
+
+    def get_kv_cache_capacity(self) -> dict:
+        """Get static primary/GPU KV cache capacity from the runtime via RPC."""
+        if self.rpc_client is None:
+            logger.warning(
+                "RPC client not initialized, cannot get kv cache capacity")
+            return {}
+
+        try:
+            capacity = self.rpc_client.fetch_kv_cache_capacity_async().remote()
+            if isinstance(capacity, str):
+                capacity = json.loads(capacity)
+            return capacity if isinstance(capacity, dict) else {}
+        except (RPCError, json.JSONDecodeError) as e:
+            logger.debug(f"Error fetching kv cache capacity via RPC: {e}")
+            return {}
 
     def get_disaggregated_params(self) -> dict:
         """Get disaggregated params from worker runtime via RPC."""

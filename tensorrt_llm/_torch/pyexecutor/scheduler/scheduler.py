@@ -21,6 +21,10 @@ PrefixSummaryCache: TypeAlias = dict[int, PrefixReuseSummary]
 T = TypeVar("T")
 
 
+def _zero_prefix_reuse_summary() -> PrefixReuseSummary:
+    return tb_internal.batch_manager.PrefixReuseSummary()
+
+
 def _call_with_optional_summary(
     fn: Callable[..., T],
     *args: Any,
@@ -52,6 +56,7 @@ def _call_with_optional_summary(
 SchedulerOutput = namedtuple(
     "SchedulerOutput",
     [
+        "encoder_requests",
         "context_requests",
         "generation_requests",
         "paused_requests",
@@ -61,15 +66,68 @@ SchedulerOutput = namedtuple(
 )
 
 
+def is_decoder_context_request_waiting_for_encoder_output(req: LlmRequest) -> bool:
+    """Return whether decoder-context scheduling is blocked on encoder output."""
+    if not req.is_context_init_state:
+        return False
+
+    ready_event = getattr(req, "py_encoder_output_ready_event", None)
+    return ready_event is not None and not ready_event.query()
+
+
+def drop_decoder_context_requests_waiting_for_encoder_output(
+    active_requests: RequestList,
+) -> RequestList:
+    """Drop ``CONTEXT_INIT`` requests whose encoder output is not ready yet."""
+    filtered_requests: RequestList = []
+    for req in active_requests:
+        if is_decoder_context_request_waiting_for_encoder_output(req):
+            logger.debug(
+                "Skipping context request %s until encoder output is ready.",
+                getattr(req, "py_request_id", req.request_id),
+            )
+            continue
+
+        filtered_requests.append(req)
+
+    return filtered_requests
+
+
+def split_encoder_from_decoder_context_requests(
+    requests: RequestList,
+) -> tuple[RequestList, RequestList]:
+    """Split scheduled encoder-init requests from decoder-context requests."""
+    encoder_requests: RequestList = []
+    context_requests: RequestList = []
+    for req in requests:
+        if req.is_encoder_init_state:
+            encoder_requests.append(req)
+        else:
+            context_requests.append(req)
+    return encoder_requests, context_requests
+
+
+def _get_lora_task_id(req: LlmRequest):
+    # C++ uses std::optional comparison where nullopt < any_value, so
+    # requests without LoRA (nullopt) should come first.
+    lora_id = getattr(req, "lora_task_id", None)
+    if lora_id is None:
+        return (0, 0)
+    return (1, lora_id)
+
+
 class ScheduledRequests:
     """Scheduled requests separated into disjoint sets.
 
     The reason for the separation is that requests are handled differently in different phases.
     For example,
+    - encoder requests run on the encoder stack and never enter decoder forward.
     - context requests and generation requests execute different attention kernels.
     - only context requests that are at the last chunk and generation requests sample new tokens.
     """
 
+    encoder_requests: RequestList
+    """Requests that are in the encoder phase."""
     context_requests_chunking: RequestList
     """Requests that are in the middle of the context phase."""
     context_requests_last_chunk: RequestList
@@ -80,6 +138,7 @@ class ScheduledRequests:
     """Requests that are paused."""
 
     def __init__(self):
+        self.encoder_requests: RequestList = []
         self.context_requests_chunking: RequestList = []
         self.context_requests_last_chunk: RequestList = []
         self.generation_requests: RequestList = []
@@ -100,6 +159,10 @@ class ScheduledRequests:
         return self.num_context_requests + len(self.generation_requests)
 
     @property
+    def num_encoder_requests(self) -> int:
+        return len(self.encoder_requests)
+
+    @property
     def num_context_requests(self) -> int:
         return len(self.context_requests_chunking) + len(self.context_requests_last_chunk)
 
@@ -113,6 +176,9 @@ class ScheduledRequests:
 
     def all_requests(self) -> RequestList:
         return self.context_requests + self.generation_requests
+
+    def append_encoder_request(self, request: LlmRequest) -> None:
+        self.encoder_requests.append(request)
 
     def append_context_request(self, request: LlmRequest) -> None:
         if request.is_last_context_chunk:
@@ -165,6 +231,7 @@ class SerializableSchedulerOutput:
     Need this class because LlmRequest is not serializable by pickle.
     """
 
+    encoder_requests: list[int]  # request ids of encoder requests
     context_requests_chunking: list[int]  # request ids of context requests chunking
     context_requests_last_chunk: list[int]  # request ids of context requests last chunk
     generation_requests: list[int]  # request ids of generation requests
@@ -173,6 +240,7 @@ class SerializableSchedulerOutput:
         int
     ]  # request ids of fitting disaggregated generation initialization requests
     num_fitting_requests: int  # number of fitting requests
+    wait_for_disagg_gen_transfer_progress: bool = False
 
     @classmethod
     def from_scheduler_result(
@@ -180,8 +248,10 @@ class SerializableSchedulerOutput:
         scheduled_requests: ScheduledRequests,
         fitting_disagg_gen_init_requests: RequestList,
         num_fitting_requests: int,
+        wait_for_disagg_gen_transfer_progress: bool = False,
     ) -> "SerializableSchedulerOutput":
         return cls(
+            encoder_requests=[req.request_id for req in scheduled_requests.encoder_requests],
             context_requests_chunking=[
                 req.request_id for req in scheduled_requests.context_requests_chunking
             ],
@@ -194,6 +264,7 @@ class SerializableSchedulerOutput:
                 req.request_id for req in fitting_disagg_gen_init_requests
             ],
             num_fitting_requests=num_fitting_requests,
+            wait_for_disagg_gen_transfer_progress=wait_for_disagg_gen_transfer_progress,
         )
 
     def to_scheduler_result(
@@ -201,6 +272,9 @@ class SerializableSchedulerOutput:
     ) -> tuple[ScheduledRequests, RequestList, int]:
         id_to_request = {req.request_id: req for req in active_requests}
         scheduled_requests = ScheduledRequests()
+        scheduled_requests.encoder_requests = [
+            id_to_request[req_id] for req_id in self.encoder_requests
+        ]
         scheduled_requests.context_requests_chunking = [
             id_to_request[req_id] for req_id in self.context_requests_chunking
         ]
@@ -236,39 +310,60 @@ class BindCapacityScheduler(CapacityScheduler):
     def __init__(
         self,
         max_num_requests: int,
-        kv_cache_manager,
+        kv_cache_manager: object | None,
         peft_cache_manager: tb_internal.batch_manager.PeftCacheManager | None,
         scheduler_policy: CapacitySchedulerPolicy = CapacitySchedulerPolicy.GUARANTEED_NO_EVICT,
+        *,
+        cross_kv_cache_manager: object | None = None,
         two_step_lookahead: bool = False,
-    ):
+        no_schedule_until_state: LlmRequestState = LlmRequestState.CONTEXT_INIT,
+        enable_prefix_aware_scheduling: bool = True,
+    ) -> None:
+        """C++-bound capacity scheduler wrapper.
+
+        ``cross_kv_cache_manager`` enables encoder-decoder dual-pool
+        scheduling.  When provided, callers should also pass
+        ``no_schedule_until_state=LlmRequestState.ENCODER_INIT`` so the
+        scheduler admits requests already in ``ENCODER_INIT`` for the
+        encoder loop.  The C++ ``CapacityScheduler`` already accepts a
+        cross manager in its ``__call__`` (legacy enc-dec relies on this);
+        the Python wrapper just widens its signature to expose it.
+        """
         super(BindCapacityScheduler, self).__init__()
         self.kv_cache_manager = kv_cache_manager
         self.peft_cache_manager = peft_cache_manager
+        self.cross_kv_cache_manager = cross_kv_cache_manager
 
         self.impl = tb_internal.algorithms.CapacityScheduler(
             max_num_requests=max_num_requests,
             capacity_scheduler_policy=scheduler_policy._to_pybind(),
             has_kv_cache_manager=kv_cache_manager is not None,
             two_step_lookahead=two_step_lookahead,
-            no_schedule_until_state=LlmRequestState.CONTEXT_INIT,
+            no_schedule_until_state=no_schedule_until_state,
             no_schedule_after_state=LlmRequestState.GENERATION_COMPLETE,
+            enable_prefix_aware_scheduling=enable_prefix_aware_scheduling,
         )
 
     def schedule_request(
         self, active_requests: RequestList
     ) -> tuple[list[LlmRequest], list[LlmRequest], list[LlmRequest]]:
-        return self.impl(active_requests, self.kv_cache_manager, self.peft_cache_manager)
+        return self.impl(
+            active_requests,
+            self.kv_cache_manager,
+            self.peft_cache_manager,
+            self.cross_kv_cache_manager,
+        )
 
 
 class MicroBatchScheduler(ABC):
     @abstractmethod
     def schedule(
         self, active_requests: RequestList, inflight_request_ids: set[int]
-    ) -> tuple[list[LlmRequest], list[LlmRequest]]:
+    ) -> tuple[list[LlmRequest], list[LlmRequest], list[LlmRequest]]:
         """
         :param active_requests: list of active requests, up to maximum number of sequences
         :param inflight_request_ids: set of request ids that are inflight (of all micro batches)
-        :return: (contextRequests, generationRequests)
+        :return: (encoderRequests, contextRequests, generationRequests)
         """
         # to be aligned with MicroBatchScheduler::scheduleRequests
         # in cpp/tensorrt_llm/batch_manager/microBatchScheduler.h
@@ -296,10 +391,16 @@ class BindMicroBatchScheduler(MicroBatchScheduler):
 
     def schedule(
         self, active_requests: RequestList, inflight_request_ids: set[int]
-    ) -> tuple[list[LlmRequest], list[LlmRequest]]:
-        return self.impl(
+    ) -> tuple[list[LlmRequest], list[LlmRequest], list[LlmRequest]]:
+        encoder_or_context_requests, generation_requests = self.impl(
             active_requests, inflight_request_ids, self.max_batch_size, self.max_num_tokens
         )
+        # Convert from binding type RequestVector to list[LlmRequest],
+        # so Python fields on LlmRequest won't be stripped away.
+        encoder_requests, context_requests = split_encoder_from_decoder_context_requests(
+            list(encoder_or_context_requests)
+        )
+        return encoder_requests, context_requests, list(generation_requests)
 
 
 class SimpleScheduler(RequestScheduler):
@@ -313,24 +414,25 @@ class SimpleScheduler(RequestScheduler):
     def schedule_request(
         self, active_requests: RequestList, inflight_request_ids: set[int]
     ) -> SchedulerOutput:
+        active_requests = drop_decoder_context_requests_waiting_for_encoder_output(active_requests)
         fitting_requests, fitting_disagg_gen_init_requests, paused_requests = (
             self.capacity_scheduler.schedule_request(active_requests)
         )
 
-        context_requests, generation_requests = self.micro_batch_scheduler.schedule(
-            fitting_requests, inflight_request_ids
+        encoder_requests, context_requests, generation_requests = (
+            self.micro_batch_scheduler.schedule(fitting_requests, inflight_request_ids)
         )
-        # Convert from binding type RequestVector to list[LlmRequest],
-        # so Python fields on LlmRequest won't be stripped away
         return SchedulerOutput(
-            list(context_requests),
-            list(generation_requests),
+            encoder_requests,
+            context_requests,
+            generation_requests,
             list(paused_requests),
             list(fitting_disagg_gen_init_requests),
             len(fitting_requests),
         )
 
     def can_schedule(self, requests: RequestList) -> bool:
+        requests = drop_decoder_context_requests_waiting_for_encoder_output(requests)
         fitting_requests, _, _ = self.capacity_scheduler.schedule_request(requests)
         return len(fitting_requests) == len(requests)
 
@@ -395,6 +497,8 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
         C++ reference: microBatchScheduler.cpp line 192-195
         Optimized: use state_value property to avoid enum object creation
         """
+        if is_decoder_context_request_waiting_for_encoder_output(req):
+            return False
         # Use state_value property (returns int directly, avoids enum object creation)
         state_value = req.state_value
         # Inline comparison: must have reached until_state but not after_state
@@ -405,7 +509,8 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
 
     def schedule(
         self, active_requests: RequestList, inflight_request_ids: set[int]
-    ) -> tuple[RequestList, RequestList]:
+    ) -> tuple[RequestList, RequestList, RequestList]:
+        encoder_requests: RequestList = []
         context_requests: RequestList = []
         generation_requests: RequestList = []
 
@@ -429,6 +534,9 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
             req_state_value = req.state_value
             # Skip requests already in flight (should be filtered by caller, but C++ checks)
             if req.request_id in inflight_request_ids:
+                continue
+
+            if is_decoder_context_request_waiting_for_encoder_output(req):
                 continue
 
             # Skip if request cannot be scheduled yet or should no longer be scheduled,
@@ -455,7 +563,7 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
                     break
 
                 logger.debug(f"encoder request scheduled: ID {req.request_id}")
-                context_requests.append(req)
+                encoder_requests.append(req)
                 batch_num_tokens += req_num_tokens
 
             # --- B. Context Request Handling ---
@@ -587,19 +695,20 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
 
         # Sort requests for consistency with C++
         # C++ reference: utils::sortRequests in inflightBatchingUtils.cpp
+        encoder_requests.sort(key=_get_lora_task_id)
         self._sort_requests(context_requests, generation_requests, not all_context_requests_fit)
 
         # Summary logs
         logger.debug(
             f"batchSize (num ctx/enc requests + num gen requests): "
-            f"{len(context_requests) + len(generation_requests)}"
+            f"{len(encoder_requests) + len(context_requests) + len(generation_requests)}"
         )
         logger.debug(
             f"batchNumTokens (num ctx/enc input tokens + num gen input tokens) "
             f"/ maxNumTokens: {batch_num_tokens} / {max_num_tokens or 0}"
         )
 
-        return context_requests, generation_requests
+        return encoder_requests, context_requests, generation_requests
 
     def _sort_requests(
         self, context_requests: RequestList, generation_requests: RequestList, chunks_present: bool
@@ -613,29 +722,21 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
         2. Sort all requests by lora task id for performance.
         """
 
-        def get_lora_task_id(req: LlmRequest):
-            # C++ uses std::optional comparison where nullopt < any_value
-            # So requests without LoRA (nullopt) should come first
-            lora_id = getattr(req, "lora_task_id", None)
-            if lora_id is None:
-                return (0, 0)  # (has_value=False, value=0) - comes first
-            return (1, lora_id)  # (has_value=True, value) - sorted by value
-
         if chunks_present:
             # Partition: non-last-chunk first, last-chunk at end
             not_last_chunk = [r for r in context_requests if not r.is_last_context_chunk]
             last_chunk = [r for r in context_requests if r.is_last_context_chunk]
             # Sort each group by lora_task_id
-            not_last_chunk.sort(key=get_lora_task_id)
-            last_chunk.sort(key=get_lora_task_id)
+            not_last_chunk.sort(key=_get_lora_task_id)
+            last_chunk.sort(key=_get_lora_task_id)
             # Rebuild the list in-place
             context_requests.clear()
             context_requests.extend(not_last_chunk)
             context_requests.extend(last_chunk)
         else:
-            context_requests.sort(key=get_lora_task_id)
+            context_requests.sort(key=_get_lora_task_id)
 
-        generation_requests.sort(key=get_lora_task_id)
+        generation_requests.sort(key=_get_lora_task_id)
 
     def _set_ctx_requests_chunk_size(
         self,
@@ -901,6 +1002,17 @@ class GuaranteedNoEvictPolicy(SchedulerPolicyBase):
     """
     GuaranteedNoEvictScheduler: Reserve blocks for requests to complete without eviction.
     C++ reference: capacityScheduler.cpp:194-331
+
+    Encoder-decoder support: when ``cross_kv_cache_manager`` is configured
+    on the parent scheduler and ``no_schedule_until_state=ENCODER_INIT``,
+    encoder-init requests are considered in the same *scheduler pass* as
+    context/generation requests. This does not mean encoder and decoder
+    context execute in the same model iteration: encoder admission only
+    admits encoder compute and leaves both KV pools untouched until the
+    request transitions to ``CONTEXT_INIT`` on a later decoder-context
+    iteration. The in-pass classification preserves the legacy invariant
+    that encoder and decoder context never collide on the same self pool
+    budget.
     """
 
     def __init__(self, static_batch: bool = False):
@@ -939,7 +1051,10 @@ class GuaranteedNoEvictPolicy(SchedulerPolicyBase):
         pending_requests: RequestList = []
         pending_dis_gen_init_requests: RequestList = []
 
-        # First pass: process in-progress generation and classify requests
+        # First pass: process in-progress generation and classify requests.
+        # Encoder-init and context-init both fall into ``pending_requests``
+        # and are budgeted in the second pass; they use distinct pool
+        # reservation rules but share ordering.
         for req in active_requests:
             if not scheduler._can_be_scheduled_with_disagg_exception(req):
                 continue
@@ -973,6 +1088,12 @@ class GuaranteedNoEvictPolicy(SchedulerPolicyBase):
 
             for requests in [pending_dis_gen_init_requests, pending_requests]:
                 for req in requests:
+                    if req.is_encoder_init_state and reserved_cross_blocks is None:
+                        raise RuntimeError(
+                            f"Encoder-init request {req.request_id} requires "
+                            "a cross_kv_cache_manager."
+                        )
+
                     if (
                         not self.static_batch
                         and skipping_is_relevant
@@ -997,10 +1118,33 @@ class GuaranteedNoEvictPolicy(SchedulerPolicyBase):
                     # MaxUtilizationPolicy.schedule and the C++
                     # single-walk-per-request convention.
                     req_id = req.py_request_id
-                    cached_summary = summary_by_req.get(req_id)
-                    cached_cross_summary = cross_summary_by_req.get(req_id)
+                    cached_summary = summary_by_req.get(
+                        req_id
+                    ) or scheduler._disabled_prefix_summary(req)
+                    cached_cross_summary = cross_summary_by_req.get(
+                        req_id
+                    ) or scheduler._disabled_prefix_summary(req)
 
-                    if req.is_context_init_state or req.is_disagg_generation_init_state:
+                    if req.is_encoder_init_state:
+                        # Encoder admission only admits encoder compute.
+                        # KV block budgeting happens when the request is
+                        # scheduled as decoder CONTEXT_INIT. Without a cross
+                        # manager, the later decoder context cannot satisfy
+                        # the dual-pool contract, so fail before running
+                        # encoder work.
+                        if has_peft:
+                            lora_task_id, is_new_task, needed_peft_pages = (
+                                scheduler._get_peft_task_info(req, uniq_task_ids)
+                            )
+                            if needed_peft_pages > available_peft_pages:
+                                continue
+                            available_peft_pages -= needed_peft_pages
+                            if is_new_task:
+                                uniq_task_ids.add(lora_task_id)
+
+                        scheduled_requests.append(req)
+
+                    elif req.is_context_init_state or req.is_disagg_generation_init_state:
                         enough_blocks = reserved_blocks.enough_available_blocks(
                             req, cached_summary=cached_summary
                         )
@@ -1040,6 +1184,15 @@ class MaxUtilizationPolicy(SchedulerPolicyBase):
     """
     MaxUtilizationScheduler: Maximize utilization, may pause started requests.
     C++ reference: capacityScheduler.cpp:341-425
+
+    Encoder-decoder support: encoder-init requests are considered in the
+    same *scheduler pass* as context/generation requests when
+    ``no_schedule_until_state=ENCODER_INIT`` and a
+    ``cross_kv_cache_manager`` is configured. Encoder admission only
+    schedules encoder compute; self- and cross-pool budgeting happens
+    when the request transitions to ``CONTEXT_INIT`` on a later
+    decoder-context iteration. Encoder requests are not eligible eviction
+    victims (they have no started KV blocks to free).
     """
 
     def schedule(
@@ -1052,6 +1205,12 @@ class MaxUtilizationPolicy(SchedulerPolicyBase):
         scheduled_blocks_manager = MaxUtilizationScheduledBlocksManager(
             scheduler.kv_cache_manager, scheduler.two_step_lookahead
         )
+        scheduled_cross_blocks_manager: Optional[MaxUtilizationScheduledBlocksManager] = None
+        if scheduler.cross_kv_cache_manager is not None:
+            scheduler.cross_kv_cache_manager.start_scheduling()
+            scheduled_cross_blocks_manager = MaxUtilizationScheduledBlocksManager(
+                scheduler.cross_kv_cache_manager, scheduler.two_step_lookahead
+            )
 
         num_scheduled_peft_pages = 0
         seen_task_ids: set[int] = set()
@@ -1065,6 +1224,8 @@ class MaxUtilizationPolicy(SchedulerPolicyBase):
         def is_started_request(req: LlmRequest) -> bool:
             if not scheduler._can_be_scheduled(req):
                 return False
+            # Encoder-init requests have not allocated any self-pool blocks
+            # yet, so they are never started in the eviction sense.
             return (
                 req.is_context_init_state and not req.is_first_context_chunk
             ) or req.is_generation_in_progress_state
@@ -1088,6 +1249,11 @@ class MaxUtilizationPolicy(SchedulerPolicyBase):
                 req_it += 1
                 continue
 
+            if req.is_encoder_init_state and scheduled_cross_blocks_manager is None:
+                raise RuntimeError(
+                    f"Encoder-init request {req.request_id} requires a cross_kv_cache_manager."
+                )
+
             if skipping_is_relevant and scheduler._beneficial_to_skip(
                 req,
                 newly_contributed_context_blocks,
@@ -1102,9 +1268,11 @@ class MaxUtilizationPolicy(SchedulerPolicyBase):
                 req,
                 scheduled_requests,
                 scheduled_blocks_manager,
+                scheduled_cross_blocks_manager,
                 num_scheduled_peft_pages,
                 seen_task_ids,
-                cached_summary=summary_by_req.get(req.py_request_id),
+                cached_summary=summary_by_req.get(req.py_request_id)
+                or scheduler._disabled_prefix_summary(req),
             )
 
             if was_scheduled:
@@ -1120,6 +1288,10 @@ class MaxUtilizationPolicy(SchedulerPolicyBase):
                 if last_started_idx is not None:
                     paused_req = requests_list[last_started_idx]
                     scheduler.kv_cache_manager.scheduling_remove_sequence(paused_req.py_request_id)
+                    if scheduler.cross_kv_cache_manager is not None:
+                        scheduler.cross_kv_cache_manager.scheduling_remove_sequence(
+                            paused_req.py_request_id
+                        )
                     paused_requests.append(paused_req)
                     logger.debug(
                         f"MaxUtilizationScheduler: request ID {paused_req.request_id} -> pause"
@@ -1136,6 +1308,7 @@ class MaxUtilizationPolicy(SchedulerPolicyBase):
         req: LlmRequest,
         scheduled_requests: RequestList,
         scheduled_blocks_manager: "MaxUtilizationScheduledBlocksManager",
+        scheduled_cross_blocks_manager: Optional["MaxUtilizationScheduledBlocksManager"],
         num_scheduled_peft_pages: int,
         seen_task_ids: set[int],
         cached_summary: Optional[PrefixReuseSummary] = None,
@@ -1143,11 +1316,25 @@ class MaxUtilizationPolicy(SchedulerPolicyBase):
         if len(scheduled_requests) >= scheduler.max_num_requests:
             return False, num_scheduled_peft_pages
 
-        blocks_if_scheduled = scheduled_blocks_manager.prepare_blocks_if_schedulable(
-            req, cached_summary=cached_summary
-        )
-        if blocks_if_scheduled is None:
-            return False, num_scheduled_peft_pages
+        # Encoder-init: no KV blocks are needed until the later decoder
+        # context admission. Still require the cross manager so a
+        # misconfigured enc-dec runtime fails before running encoder work.
+        if req.is_encoder_init_state:
+            blocks_if_scheduled = None
+            cross_blocks_if_scheduled = None
+        else:
+            blocks_if_scheduled = scheduled_blocks_manager.prepare_blocks_if_schedulable(
+                req, cached_summary=cached_summary
+            )
+            if blocks_if_scheduled is None:
+                return False, num_scheduled_peft_pages
+            cross_blocks_if_scheduled: Optional[dict] = None
+            if scheduled_cross_blocks_manager is not None:
+                cross_blocks_if_scheduled = (
+                    scheduled_cross_blocks_manager.prepare_blocks_if_schedulable(req)
+                )
+                if cross_blocks_if_scheduled is None:
+                    return False, num_scheduled_peft_pages
 
         # PEFT check only when needed
         if scheduler.peft_cache_manager is not None:
@@ -1168,7 +1355,10 @@ class MaxUtilizationPolicy(SchedulerPolicyBase):
             if is_new_task:
                 seen_task_ids.add(lora_task_id)
 
-        scheduled_blocks_manager.update_scheduled_blocks(blocks_if_scheduled)
+        if blocks_if_scheduled is not None:
+            scheduled_blocks_manager.update_scheduled_blocks(blocks_if_scheduled)
+        if scheduled_cross_blocks_manager is not None and cross_blocks_if_scheduled is not None:
+            scheduled_cross_blocks_manager.update_scheduled_blocks(cross_blocks_if_scheduled)
         scheduled_requests.append(req)
         return True, num_scheduled_peft_pages
 
@@ -1316,14 +1506,15 @@ class PyCapacityScheduler:
     def __init__(
         self,
         max_num_requests: int,
-        kv_cache_manager=None,
-        peft_cache_manager=None,
+        kv_cache_manager: object | None = None,
+        peft_cache_manager: object | None = None,
         scheduler_policy: CapacitySchedulerPolicy = CapacitySchedulerPolicy.GUARANTEED_NO_EVICT,
-        cross_kv_cache_manager=None,
+        cross_kv_cache_manager: object | None = None,
         two_step_lookahead: bool = False,
         no_schedule_until_state: LlmRequestState = LlmRequestState.CONTEXT_INIT,
         no_schedule_after_state: LlmRequestState = LlmRequestState.GENERATION_COMPLETE,
-    ):
+        enable_prefix_aware_scheduling: bool = True,
+    ) -> None:
         """
         Initialize the capacity scheduler.
 
@@ -1336,6 +1527,7 @@ class PyCapacityScheduler:
             two_step_lookahead: Enable two-step lookahead for MAX_UTILIZATION
             no_schedule_until_state: Don't schedule until this state is reached
             no_schedule_after_state: Don't schedule after this state is reached
+            enable_prefix_aware_scheduling: Use KV prefix-reuse estimates for scheduler decisions
         """
         self.max_num_requests = max_num_requests
         self.kv_cache_manager = kv_cache_manager
@@ -1345,6 +1537,7 @@ class PyCapacityScheduler:
         self.two_step_lookahead = two_step_lookahead
         self.no_schedule_until_state = no_schedule_until_state
         self.no_schedule_after_state = no_schedule_after_state
+        self.enable_prefix_aware_scheduling = enable_prefix_aware_scheduling
         # Cache state values to avoid repeated .value access (optimization)
         self._no_schedule_until_state_value = no_schedule_until_state.value
         self._no_schedule_after_state_value = no_schedule_after_state.value
@@ -1372,6 +1565,8 @@ class PyCapacityScheduler:
         but has not yet reached no_schedule_after_state.
         Optimized: use state_value property to avoid enum object creation
         """
+        if is_decoder_context_request_waiting_for_encoder_output(req):
+            return False
         # Use state_value property (returns int directly, avoids enum object creation)
         state_value = req.state_value
         # Inline comparison: must have reached until_state but not after_state
@@ -1387,6 +1582,8 @@ class PyCapacityScheduler:
         C++ reference: capacityScheduler.cpp:207-208, 348
         """
         if self.kv_cache_manager is None:
+            return False
+        if not self.enable_prefix_aware_scheduling:
             return False
         if self.kv_cache_manager.is_variable_window:
             return False
@@ -1407,7 +1604,7 @@ class PyCapacityScheduler:
         newly_contributed_context_blocks: Set = set()
         newly_contributed_cross_context_blocks: Set = set()
 
-        if self.kv_cache_manager is None:
+        if self.kv_cache_manager is None or not self.enable_prefix_aware_scheduling:
             return newly_contributed_context_blocks, newly_contributed_cross_context_blocks
 
         enable_block_reuse = self.kv_cache_manager.enable_block_reuse
@@ -1459,6 +1656,8 @@ class PyCapacityScheduler:
 
         C++ reference: capacityScheduler.cpp (beneficialToSkip / oneManagerBeneficialToSkip)
         """
+        if not self.enable_prefix_aware_scheduling:
+            return False
         if not (req.is_context_init_state and req.is_first_context_chunk):
             return False
 
@@ -1508,6 +1707,13 @@ class PyCapacityScheduler:
             newly_contributed_cross_context_blocks.add(cross_new_block)
 
         return False
+
+    def _disabled_prefix_summary(self, req: LlmRequest) -> Optional[PrefixReuseSummary]:
+        if self.enable_prefix_aware_scheduling:
+            return None
+        if req.is_context_init_state and req.is_first_context_chunk:
+            return _zero_prefix_reuse_summary()
+        return None
 
     def _get_max_peft_pages(self) -> int:
         """Get maximum PEFT cache pages."""
@@ -1587,14 +1793,16 @@ class SimpleUnifiedScheduler(RequestScheduler):
         self,
         max_batch_size: int,
         max_num_tokens: int,
-        kv_cache_manager,
-        peft_cache_manager,
+        kv_cache_manager: object | None,
+        peft_cache_manager: object | None,
         scheduler_policy: CapacitySchedulerPolicy,
         ctx_chunk_config: Optional[tuple[StrEnum, int]] = None,
-        cross_kv_cache_manager=None,
+        cross_kv_cache_manager: object | None = None,
         two_step_lookahead: bool = False,
         scheduler_capacity: Optional[int] = None,
-    ):
+        no_schedule_until_state: LlmRequestState = LlmRequestState.CONTEXT_INIT,
+        enable_prefix_aware_scheduling: bool = True,
+    ) -> None:
         # Use scheduler_capacity if provided, otherwise fall back to max_batch_size
         # scheduler_capacity may differ from max_batch_size (e.g., adjusted for attention_dp + disagg)
         capacity = scheduler_capacity if scheduler_capacity is not None else max_batch_size
@@ -1608,6 +1816,8 @@ class SimpleUnifiedScheduler(RequestScheduler):
             scheduler_policy=scheduler_policy,
             cross_kv_cache_manager=cross_kv_cache_manager,
             two_step_lookahead=two_step_lookahead,
+            no_schedule_until_state=no_schedule_until_state,
+            enable_prefix_aware_scheduling=enable_prefix_aware_scheduling,
         )
 
         # 2. Initialize Python MicroBatch Scheduler
@@ -1631,22 +1841,25 @@ class SimpleUnifiedScheduler(RequestScheduler):
             max_batch_size=max_batch_size,
             max_num_tokens=max_num_tokens,
             ctx_chunk_config=py_chunk_config,
+            no_schedule_until_state=no_schedule_until_state,
         )
 
     def schedule_request(
         self, active_requests: RequestList, inflight_request_ids: set[int]
     ) -> SchedulerOutput:
+        active_requests = drop_decoder_context_requests_waiting_for_encoder_output(active_requests)
         # Step 1: Capacity Check (Who fits in memory?)
         fitting_requests, fitting_disagg_gen_init, paused_requests = (
             self.capacity_scheduler.schedule_request(active_requests)
         )
 
         # Step 2: MicroBatch Check (Who fits in token budget? + Chunking)
-        context_requests, generation_requests = self.micro_batch_scheduler.schedule(
-            fitting_requests, inflight_request_ids
+        encoder_requests, context_requests, generation_requests = (
+            self.micro_batch_scheduler.schedule(fitting_requests, inflight_request_ids)
         )
 
         return SchedulerOutput(
+            encoder_requests=encoder_requests,
             context_requests=context_requests,
             generation_requests=generation_requests,
             paused_requests=paused_requests,
@@ -1655,6 +1868,7 @@ class SimpleUnifiedScheduler(RequestScheduler):
         )
 
     def can_schedule(self, requests: RequestList) -> bool:
+        requests = drop_decoder_context_requests_waiting_for_encoder_output(requests)
         # Dry run capacity check
         fitting, _, _ = self.capacity_scheduler.schedule_request(requests)
         return len(fitting) == len(requests)
