@@ -943,6 +943,9 @@ class AttentionForwardArgs:
     # `quantizeCopyInputToFp8Kernel`.
     quant_scale_qkv: Optional[torch.Tensor] = None
 
+    dsv4_inv_rope_cos_sin_cache: Optional[torch.Tensor] = None
+    enable_dsv4_epilogue_fusion: bool = False
+
     sage_attn_num_elts_per_blk_q: int = 0
     sage_attn_num_elts_per_blk_k: int = 0
     sage_attn_num_elts_per_blk_v: int = 0
