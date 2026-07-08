@@ -533,6 +533,8 @@ public:
 
     // Whether to fuse FP4 quant into attention kernel.
     bool mFuseFp4Quant = false;
+    // Whether to fuse DSv4 inverse-RoPE + FP8 output quant into trtllm-gen FMHA.
+    bool mFusesDsv4InvRopeFp8Quant = false;
 
     kernels::SparseAttentionParams mRuntimeSparseAttentionParams;
 
@@ -574,9 +576,9 @@ public:
             mMLAParams.data(), mCpSize, mCpRank, mCpGroup, mNumAttnHeads, mNumAttnKVHeads, mNumKVHeadsOrigin,
             mAttnTpSize, mAttnTpRank, mAttnCpSize, mAttnCpRank, mUlyssesMQABroadcast, mEnableContextFMHA,
             mFMHAForceFP32Acc, mMultiBlockMode, mEnableXQA, mUseKVCache, mSkipAttn, mFuseFp4Quant,
-            mNbMultiBlockSemaphores, mAttentionChunkSize.value_or(-1), mSkipSoftmaxThresholdScaleFactorPrefill,
-            mSkipSoftmaxThresholdScaleFactorDecode, mSageAttnNumEltsPerBlkQ, mSageAttnNumEltsPerBlkK,
-            mSageAttnNumEltsPerBlkV, mSageAttnQkInt8);
+            mFusesDsv4InvRopeFp8Quant, mNbMultiBlockSemaphores, mAttentionChunkSize.value_or(-1),
+            mSkipSoftmaxThresholdScaleFactorPrefill, mSkipSoftmaxThresholdScaleFactorDecode, mSageAttnNumEltsPerBlkQ,
+            mSageAttnNumEltsPerBlkK, mSageAttnNumEltsPerBlkV, mSageAttnQkInt8);
     };
 
 private:

@@ -1296,7 +1296,6 @@ common-files: &common_files |
         tests/unittest/trt/model/test_nemotron_nas.py |
         tests/unittest/trt/model/test_phi.py |
         tests/unittest/trt/model/test_unet.py |
-        tests/unittest/trt/model_api/profile_utils.py |
         tests/unittest/trt/model_api/test_model_api_multi_gpu.py |
         tests/unittest/trt/model_api/test_model_level_api.py |
         tests/unittest/trt/model_api/test_model_quantization.py |
@@ -2671,7 +2670,6 @@ legacy-files: &legacy_files |
         tests/unittest/trt/model/test_nemotron_nas.py |
         tests/unittest/trt/model/test_phi.py |
         tests/unittest/trt/model/test_unet.py |
-        tests/unittest/trt/model_api/profile_utils.py |
         tests/unittest/trt/model_api/test_model_api_multi_gpu.py |
         tests/unittest/trt/model_api/test_model_level_api.py |
         tests/unittest/trt/model_api/test_model_quantization.py |
@@ -2756,9 +2754,11 @@ legacy-files: &legacy_files |
 # Files to be subjected to static analysis
 static-analysis-files: &static_analysis_files |
     (?x)^(
-        tensorrt_llm/_torch/pyexecutor/sampler.py |
-        tensorrt_llm/_torch/pyexecutor/sampling_utils.py |
-        tensorrt_llm/_torch/pyexecutor/sampling_utils_flashinfer.py |
+        tensorrt_llm/_torch/pyexecutor/sampler/sampler.py |
+        tensorrt_llm/_torch/pyexecutor/sampler/sampling_utils.py |
+        tensorrt_llm/_torch/pyexecutor/sampler/ops/interface.py |
+        tensorrt_llm/_torch/pyexecutor/sampler/ops/flashinfer.py |
+        tensorrt_llm/_torch/pyexecutor/sampler/ops/vanilla.py |
         tests/unittest/_torch/sampler/test_torch_sampler.py |
         tests/unittest/_torch/sampler/test_beam_search.py |
         tests/unittest/_torch/sampler/test_beam_search_util.py |

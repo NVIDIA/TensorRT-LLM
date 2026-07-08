@@ -70,6 +70,7 @@ add_library(
   fp8Quantize.cpp
   dsv3FusedAGemmOp.cpp
   deepseekV4QNormOp.cpp
+  inverseRopeFp8QuantOp.cpp
   fusedQKNormRopeOp.cpp
   fusedDiTLayerNormShiftScaleOp.cpp
   fusedDiTQKNormRopeOp.cpp
@@ -95,6 +96,7 @@ add_library(
   moeAlltoAllOp.cpp
   moeLoadBalanceOp.cpp
   moeAlignOp.cpp
+  megaMoePrepareOp.cpp
   mxFp4BlockScaleMoe.cpp
   mxFp8Quantize.cpp
   mxfp8Gemm.cpp
