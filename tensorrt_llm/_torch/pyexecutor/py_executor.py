@@ -3107,10 +3107,38 @@ class PyExecutor:
         ctx = scheduled_batch.context_requests
         if not ctx:
             return
+        # Local readiness per context request, in batch order. The batch is
+        # broadcast from the leader and scheduling is deterministic, so ctx is
+        # identically ordered on every rank.
+        local_ready = [1 if kv.are_blocks_ready(req) else 0 for req in ctx]
+
+        # TP safety: a context request must be parked on EVERY rank or NONE. Each
+        # rank's detached disk-onboard reads land at slightly different times, so a
+        # per-rank park decision would give ranks different batches and the TP
+        # all-reduce in the forward would mismatch (hang/crash). AND readiness
+        # across the TP group: admit a request only once its KV has landed on all
+        # ranks. (pp_size==1 -> the TP group is the whole world; TP=1 is a no-op.)
+        local_has_pending = 0 if all(local_ready) else 1
+        if self.dist.tp_size > 1:
+            any_pending = self.dist.tp_allreduce(int(local_has_pending),
+                                                 op=ReduceOp.MAX)
+        else:
+            any_pending = local_has_pending
+        if not any_pending:
+            # Every rank has all context blocks ready -> keep the full batch.
+            for req in ctx:
+                req.py_onboard_pending = False
+            return
+        if self.dist.tp_size > 1:
+            gathered = self.dist.tp_allgather(local_ready)
+            global_ready = [all(bits) for bits in zip(*gathered)]
+        else:
+            global_ready = local_ready
+
         kept = []
         parked = 0
-        for req in ctx:
-            if kv.are_blocks_ready(req):
+        for req, ready in zip(ctx, global_ready):
+            if ready:
                 req.py_onboard_pending = False
                 kept.append(req)
             else:
@@ -3122,8 +3150,9 @@ class PyExecutor:
                                                  0) + parked
             if self._onboard_parked_total <= 5 or self._onboard_parked_total % 500 == 0:
                 logger.info(
-                    "disk-onboard: parked %d context request(s) awaiting KV read (cumulative %d)",
-                    parked, self._onboard_parked_total)
+                    f"disk-onboard: parked {parked} context request(s) "
+                    f"awaiting KV read (cumulative {self._onboard_parked_total})"
+                )
 
     def _handle_dynamic_draft_len(self,
                                   scheduled_batch: ScheduledRequests) -> None:

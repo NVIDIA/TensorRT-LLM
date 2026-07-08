@@ -621,8 +621,22 @@ class KVCacheManager(BaseResourceManager):
             logger.info(f"[disk-tier] {blocks_in_disk_pool} blocks "
                         f"({disk_cache_size / (1 << 30):.1f} GiB)")
         kwargs['blocks_in_disk_pool'] = blocks_in_disk_pool
-        kwargs['disk_cache_path'] = getattr(kv_cache_config, "disk_cache_path",
-                                            None) or ""
+        disk_cache_path = getattr(kv_cache_config, "disk_cache_path",
+                                  None) or ""
+        if disk_cache_path and blocks_in_disk_pool:
+            # Per-rank subdir: all ranks share one container filesystem and one
+            # disk_cache_path mount, but each holds a different KV shard while the
+            # disk slot files (block_<id>_pool_<p>.bin) are named identically across
+            # ranks -> without namespacing the ranks clobber each other's KV on load.
+            # mapping.rank is the global rank (unique across TP and PP). Note:
+            # disk_cache_size is per-rank, so total disk = world_size * disk_cache_size.
+            disk_cache_path = os.path.join(disk_cache_path,
+                                           f"rank_{self.mapping.rank}")
+            os.makedirs(disk_cache_path, exist_ok=True)
+            logger.info(
+                f"[disk-tier] per-rank disk cache dir: {disk_cache_path} "
+                f"(rank {self.mapping.rank}/{self.mapping.world_size})")
+        kwargs['disk_cache_path'] = disk_cache_path
         kwargs['disk_cache_retained_only'] = bool(
             getattr(kv_cache_config, "disk_cache_retained_only", False))
         kwargs['disk_cache_protect_unexpired'] = bool(
