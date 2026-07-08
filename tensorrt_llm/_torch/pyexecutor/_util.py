@@ -1547,6 +1547,7 @@ def _build_per_layer_num_kv_heads(
     num_hidden_layers: int,
     spec_config: Optional[SpeculativeConfig] = None,
     draft_config: Optional[ModelConfig] = None,
+    target_head_dim: Optional[int] = None,
 ) -> Union[int, List[int]]:
     """
     Returns:
@@ -1562,6 +1563,24 @@ def _build_per_layer_num_kv_heads(
     draft_num_kv_heads = getattr(
         draft_pretrained, 'num_key_value_heads',
         getattr(draft_pretrained, 'num_attention_heads', None))
+
+    # The manager has a single head_dim shared by all layers in a pool.
+    # When the draft's head_dim differs from the target's, express the
+    # draft layers' KV bytes in target-head_dim units so pool geometry
+    # stays exact; consumers view the buffers back to draft geometry
+    # (see DFlashSpecWorker._lazy_init_hybrid_ctx).
+    draft_head_dim = getattr(draft_pretrained, 'head_dim', None)
+    if (draft_num_kv_heads is not None and target_head_dim is not None
+            and draft_head_dim is not None
+            and draft_head_dim != target_head_dim):
+        draft_kv_elems = draft_num_kv_heads * draft_head_dim
+        if draft_kv_elems % target_head_dim != 0:
+            raise ValueError(
+                f"Draft KV row ({draft_num_kv_heads} heads x "
+                f"{draft_head_dim}) is not expressible in target head_dim "
+                f"({target_head_dim}) units; cannot place draft context in "
+                f"the target KV cache manager.")
+        draft_num_kv_heads = draft_kv_elems // target_head_dim
 
     if draft_num_kv_heads is None or draft_num_kv_heads == num_key_value_heads:
         return num_key_value_heads
@@ -1713,8 +1732,11 @@ def _create_kv_cache_manager(
         per_layer_num_kv_heads = num_key_value_heads
     else:
         per_layer_num_kv_heads = _build_per_layer_num_kv_heads(
-            num_key_value_heads, num_hidden_layers, spec_config,
-            draft_config_for_kv)
+            num_key_value_heads,
+            num_hidden_layers,
+            spec_config,
+            draft_config_for_kv,
+            target_head_dim=head_dim if isinstance(head_dim, int) else None)
     manager_extra_kwargs = {}
     if issubclass(kv_cache_manager_cls, KVCacheManagerV2):
         manager_extra_kwargs["enable_stats"] = enable_kv_cache_stats

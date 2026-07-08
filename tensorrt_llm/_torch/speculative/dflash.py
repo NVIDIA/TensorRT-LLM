@@ -231,8 +231,27 @@ class DFlashWorker(SpecWorkerBase):
         # get_pp_layers; take the last num_layers ids.
         layer_ids = sorted(mgr.layer_offsets.keys())[-num_layers:]
         bufs = [mgr.get_buffers(lid) for lid in layer_ids]  # NHD [P, 2, tpb, nkv, hd]
-        self._hybrid_k_bufs = [b[:, 0] for b in bufs]
-        self._hybrid_v_bufs = [b[:, 1] for b in bufs]
+
+        # The manager sizes spec layers in target-head_dim units (see
+        # _build_per_layer_num_kv_heads), so when the draft head_dim differs
+        # from the pool's, view each [P, tpb, nkv_pool, hd_pool] buffer back
+        # to the draft's per-rank [P, tpb, nkv_draft, hd_draft] geometry.
+        # The last two dims are contiguous per token, so this is a pure view.
+        nkv_draft = draft_model._num_kv_heads
+        hd_draft = draft_model._head_dim
+
+        def _as_draft_geometry(t: torch.Tensor) -> torch.Tensor:
+            if t.shape[-2] == nkv_draft and t.shape[-1] == hd_draft:
+                return t
+            if t.shape[-2] * t.shape[-1] != nkv_draft * hd_draft:
+                raise RuntimeError(
+                    f"DFlash hybrid ctx: pool row {tuple(t.shape[-2:])} does "
+                    f"not match draft KV geometry ({nkv_draft}, {hd_draft}) "
+                    f"per rank; check per-layer KV head registration.")
+            return t.flatten(-2).unflatten(-1, (nkv_draft, hd_draft))
+
+        self._hybrid_k_bufs = [_as_draft_geometry(b[:, 0]) for b in bufs]
+        self._hybrid_v_bufs = [_as_draft_geometry(b[:, 1]) for b in bufs]
 
         # Pool of the draft layers + its offsets-decode divisor
         # (encoded = block_idx * layers_in_pool * kv_factor).
