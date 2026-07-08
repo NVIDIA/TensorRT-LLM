@@ -4,6 +4,8 @@ import os
 import shutil
 from typing import Any, Dict, List, Optional
 
+from PIL import Image, UnidentifiedImageError
+
 from tensorrt_llm.logger import logger
 from tensorrt_llm.serve.openai_protocol import ImageGenerationRequest, VideoGenerationRequest
 from tensorrt_llm.visual_gen import VisualGen, VisualGenParams
@@ -84,6 +86,40 @@ def _merge_extra_params(
         params.extra_params = None
 
 
+def _reference_is_image(path: str) -> bool:
+    """True when ``path`` holds image content (anything PIL can open).
+
+    Capability-based: the supported set is whatever the decoder accepts,
+    with no enumerated format table. The probe parses only the header —
+    pixel decode stays in the worker.
+    """
+    try:
+        with Image.open(path):
+            return True
+    except UnidentifiedImageError:
+        return False
+
+
+def _reference_is_video(path: str) -> bool:
+    """True when ``path`` holds video content (a PyAV-openable video stream).
+
+    Total predicate: False for images, audio, and undecodable content
+    alike. Images must be excluded explicitly because FFmpeg demuxes a
+    still image as a valid single-frame video stream, so an av probe
+    alone would claim every PNG/JPEG. A missing ``av`` package raises
+    ``ImportError`` — that is a deployment problem, not a content
+    verdict.
+    """
+    if _reference_is_image(path):
+        return False
+    import av
+    try:
+        with av.open(path) as container:
+            return bool(container.streams.video)
+    except av.FFmpegError:
+        return False
+
+
 def parse_visual_gen_params(
     request: ImageGenerationRequest | VideoGenerationRequest,
     id: str,
@@ -156,14 +192,34 @@ def parse_visual_gen_params(
         if request.input_reference is not None:
             if media_storage_path is None:
                 raise ValueError("media_storage_path is required when input_reference is provided")
-            ref_path = os.path.join(media_storage_path, f"{id}_reference.png")
+            tmp_path = os.path.join(media_storage_path, f"{id}_reference.part")
             if isinstance(request.input_reference, str):
-                with open(ref_path, "wb") as f:
+                with open(tmp_path, "wb") as f:
                     f.write(base64.b64decode(request.input_reference))
             else:
-                with open(ref_path, "wb") as f:
+                with open(tmp_path, "wb") as f:
                     shutil.copyfileobj(request.input_reference.file, f)
-            params.image = ref_path
+            # image, video, or reject.
+            if _reference_is_image(tmp_path):
+                is_video = False
+            elif _reference_is_video(tmp_path):
+                is_video = True
+            else:
+                os.remove(tmp_path)
+                raise ValueError(
+                    "input_reference content is neither a decodable image "
+                    "nor a decodable video."
+                )
+            ref_path = os.path.join(
+                media_storage_path, f"{id}_reference{'.mp4' if is_video else '.png'}"
+            )
+            os.replace(tmp_path, ref_path)
+            if is_video:
+                if params.extra_params is None:
+                    params.extra_params = {}
+                params.extra_params["video"] = ref_path
+            else:
+                params.image = ref_path
 
     _warn_if_set_with_no_semantic(request, getattr(generator, "model", None))
     _merge_extra_params(params, request.extra_params, generator.extra_param_specs)
