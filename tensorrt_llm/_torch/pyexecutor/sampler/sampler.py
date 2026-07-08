@@ -80,19 +80,19 @@ from tensorrt_llm.sampling_params import (
     check_logprobs_limit,
 )
 
-from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
-from ..speculative.interface import get_force_num_accepted_tokens
-from ..speculative.spec_tree_manager import SpecTreeManager
-from ..utils import torch_multi_arange
-from .finish_reason import FinishedState
-from .llm_request import LlmRequest, LlmRequestState, get_draft_token_length
-from .resource_manager import ResourceManager, ResourceManagerType
+from ...speculative.interface import get_force_num_accepted_tokens
+from ...speculative.spec_tree_manager import SpecTreeManager
+from ...utils import torch_multi_arange
+from ..finish_reason import FinishedState
+from ..llm_request import LlmRequest, LlmRequestState, get_draft_token_length
+from ..resource_manager import ResourceManager, ResourceManagerType
+from ..scheduler import ScheduledRequests
+from .ops.interface import SamplerConfig, resolve_sampling_backend
 from .sampling_utils import (
     BEAM_SEARCH_PAD_TOKEN,
     GREEDY,
     BeamSearchMetadata,
     GenericStrategyKeyType,
-    SimpleGroupedStrategySampler,
     Strategy,
     StrategyMetadata,
     UtilsSamplingParams,
@@ -102,7 +102,6 @@ from .sampling_utils import (
     sample,
     sample_rejected,
 )
-from .scheduler import ScheduledRequests
 
 if sys.version_info[:2] >= (3, 12):
     from typing import override
@@ -113,8 +112,6 @@ if TYPE_CHECKING:
     from transformers import PretrainedConfig
 
     from tensorrt_llm._torch.models.modeling_utils import DecoderModel, DecoderModelForCausalLM
-
-    from .sampling_utils_flashinfer import FlashInferGroupedStrategySampler
 
     _ModelType = TypeVar("_ModelType", bound=DecoderModel)
     _ConfigType = TypeVar("_ConfigType", bound=PretrainedConfig)
@@ -2350,15 +2347,13 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         self.LOGPROBS_SHAPE = (self.max_num_sequences, self.max_beam_width, self.max_tokens)
         self.TOPK_LOGPROBS_SHAPE = (self.max_num_sequences, self.max_tokens, self.max_topk_logprobs)
 
-        self._grouped_sampler_cls: (
-            Type["FlashInferGroupedStrategySampler"] | Type[SimpleGroupedStrategySampler]
+        self._grouped_sampler_cls = resolve_sampling_backend(
+            is_cuda=True,
+            config=SamplerConfig(
+                # IS_FLASHINFER_AVAILABLE is checked inside resolve_sampling_backend.
+                use_flashinfer=not args.disable_flashinfer_sampling,
+            ),
         )
-        if IS_FLASHINFER_AVAILABLE and not args.disable_flashinfer_sampling:
-            from .sampling_utils_flashinfer import FlashInferGroupedStrategySampler
-
-            self._grouped_sampler_cls = FlashInferGroupedStrategySampler
-        else:
-            self._grouped_sampler_cls = SimpleGroupedStrategySampler
 
         # AutoDeploy build creates the sampler in inference mode,
         # which would disallow in-place mutating of new_tokens.

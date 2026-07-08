@@ -7,8 +7,10 @@ from utils.llm_data import llm_models_root
 from utils.util import force_ampere
 
 from tensorrt_llm import LLM, SamplingParams
-from tensorrt_llm._torch.pyexecutor.sampling_utils import top_k_top_p_sampling_batch
-from tensorrt_llm._torch.pyexecutor.sampling_utils_flashinfer import _StrategyImpls
+from tensorrt_llm._torch.pyexecutor.sampler.sampling_utils import (
+    _StrategyImpls,
+    top_k_top_p_sampling_batch,
+)
 from tensorrt_llm.executor.result import TokenLogprobs
 from tensorrt_llm.llmapi.llm_utils import KvCacheConfig
 
