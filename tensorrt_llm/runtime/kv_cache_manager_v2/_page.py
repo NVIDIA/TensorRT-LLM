@@ -183,6 +183,31 @@ class UncommittedPage(Page):
         block.storage[self.life_cycle] = rawref.ref(committed_page)
         return committed_page
 
+    def convert_to_ssm_committed(
+        self, block: Block, ready_event: CachedCudaEvent, num_tokens_in_block: int
+    ) -> "SsmCommittedPage":
+        """
+        Moves the slot to a new committed SSM page and add the new page to the block.
+        The uncommitted page becomes invalid.
+        """
+        assert not self.scheduled_for_eviction
+        assert block.storage[self.life_cycle] is None
+        assert self.status == PageStatus.DROPPABLE, "Release holder/lock first"
+        self.ready_event = ready_event
+        committed_page = SsmCommittedPage(
+            self.manager,
+            block,
+            self.life_cycle,
+            self.cache_level,
+            self,
+            self.priority,
+            num_tokens_in_block,
+        )
+        assert not self.has_valid_slot and self.ready_event is CachedCudaEvent.NULL
+        assert committed_page.has_valid_slot
+        block.storage[self.life_cycle] = rawref.ref(committed_page)
+        return committed_page
+
     def __del__(self) -> None:
         def check_page(p: "BlockPage") -> bool:
             return p is None or isinstance(p.page, CommittedPage)
@@ -234,20 +259,36 @@ class CommittedPage(Page):
         self.set_slot(slot)
 
     def __del__(self) -> None:
-        try:
-            block = self.block()
-            # block may be None when rebase happens, i.e. another block with the same key is committed,
-            # replacing it, but the page is still used by a _KVCache.
-            if block is not None:
-                block.unset_page(
-                    self.life_cycle,
-                    self.manager._life_cycles.get_life_cycle(self.life_cycle),
-                )
-        finally:
-            try:
-                Page.__del__(self)
-            finally:
-                self.__rawref__.invalidate()
+        block = self.block()
+        # block may be None when rebase happens, i.e. another block with the same key is committed,
+        # replacing it, but the page is still used by a _KVCache.
+        if block is not None:
+            block.unset_page(
+                self.life_cycle,
+                self.manager._life_cycles.get_life_cycle(self.life_cycle),
+                self,
+            )
+        Page.__del__(self)
+        self.__rawref__.invalidate()
+
+
+@dataclass(slots=True)
+class SsmCommittedPage(CommittedPage):
+    num_tokens_in_block: int
+
+    def __init__(
+        self,
+        storage: "StorageManager",
+        block: Block,
+        life_cycle: LifeCycleId,
+        cache_level: CacheLevel,
+        slot: Slot,
+        priority: Priority,
+        num_tokens_in_block: int,
+    ):
+        assert num_tokens_in_block > 0
+        self.num_tokens_in_block = num_tokens_in_block
+        CommittedPage.__init__(self, storage, block, life_cycle, cache_level, slot, priority)
 
 
 @dataclass(slots=True)

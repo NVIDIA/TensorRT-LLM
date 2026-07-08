@@ -15,24 +15,51 @@
 
 from __future__ import annotations
 
+import sys
 import time
 from collections import deque
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field, replace
+
+# avoid importing the whole tensorrt_llm module, which takes time during debugging.
+from importlib.util import find_spec
+from pathlib import Path
 from threading import Condition
 from typing import Any, Callable
 
-from tensorrt_llm.logger import logger
-from tensorrt_llm.runtime.kv_cache_hash import (
-    KV_CACHE_HASH_ALGO_AUTO,
-    KV_CACHE_HASH_ALGO_DEFAULT,
-    KV_CACHE_HASH_ALGO_V1,
-    KV_CACHE_HASH_ALGO_V2,
-    KV_CACHE_HASH_ALGO_V2_SHA256_64,
-    NonTextTokenHashError,
-    hash_v1_block_key,
-    truncate_sha256_hash_to_int64,
-)
+from ._utils import temporary_sys_path
+
+if "tensorrt_llm" in sys.modules:
+    from tensorrt_llm.logger import logger
+    from tensorrt_llm.runtime.kv_cache_hash import (
+        KV_CACHE_HASH_ALGO_AUTO,
+        KV_CACHE_HASH_ALGO_DEFAULT,
+        KV_CACHE_HASH_ALGO_V1,
+        KV_CACHE_HASH_ALGO_V2,
+        KV_CACHE_HASH_ALGO_V2_SHA256_64,
+        NonTextTokenHashError,
+        hash_v1_block_key,
+        truncate_sha256_hash_to_int64,
+    )
+else:
+    # fast path for dev, avoids importing the whole tensorrt_llm module
+    import logging
+
+    logger = logging.getLogger("tensorrt_llm")
+
+    spec = find_spec("kv_cache_manager_v2")
+    assert spec is not None and spec.origin is not None
+    with temporary_sys_path(str(Path(spec.origin).parent.parent)):
+        from kv_cache_hash import (  # noqa
+            KV_CACHE_HASH_ALGO_AUTO,
+            KV_CACHE_HASH_ALGO_DEFAULT,
+            KV_CACHE_HASH_ALGO_V1,
+            KV_CACHE_HASH_ALGO_V2,
+            KV_CACHE_HASH_ALGO_V2_SHA256_64,
+            NonTextTokenHashError,
+            hash_v1_block_key,
+            truncate_sha256_hash_to_int64,
+        )
 
 from ._common import GPU_LEVEL, PRIORITY_DEFAULT, CacheLevel, Priority, TokenIdExt
 
