@@ -626,6 +626,38 @@ class TestCosmos3V2V:
             use_karras_sigmas=False,
         )
 
+    def test_v2v_keep_last_smoke(self, cosmos3_pipeline):
+        """condition_video_keep="last" pins the tail of the input, not the head.
+
+        The input is longer than the conditioning window and color-coded
+        (dark head, bright tail), so this exercises the full-decode +
+        tail-slice path and asserts behavior: frame 0 of the output is a
+        pinned VAE round-trip of the bright tail frames.
+        """
+        dark = PIL.Image.new("RGB", (WIDTH, HEIGHT), (40, 40, 40))
+        bright = PIL.Image.new("RGB", (WIDTH, HEIGHT), (230, 230, 230))
+        # 5 = max(condition_frame_indexes_vision) * 4 + 1 conditioning frames.
+        video = [dark.copy() for _ in range(NUM_FRAMES)] + [bright.copy() for _ in range(5)]
+        result = _run_forward(
+            cosmos3_pipeline,
+            image=None,
+            video=video,
+            num_frames=NUM_FRAMES,
+            condition_frame_indexes_vision=[0, 1],
+            condition_video_keep="last",
+        )
+        _assert_valid_video(result.video, num_frames=NUM_FRAMES)
+        first_frame_mean = result.video[0, 0].float().mean().item()
+        assert first_frame_mean > 135, (
+            f"keep='last' must condition on the bright tail frames; frame-0 mean "
+            f"{first_frame_mean:.1f} matches the dark head instead"
+        )
+        _assert_scheduler_config(
+            cosmos3_pipeline,
+            flow_shift=10.0,
+            use_karras_sigmas=False,
+        )
+
     def test_v2v_flow_shift_override_request_path(self):
         pipeline = Cosmos3OmniMoTPipeline.__new__(Cosmos3OmniMoTPipeline)
         pipeline.transformer = SimpleNamespace(device=torch.device("cpu"))
@@ -722,6 +754,25 @@ class TestCosmos3Audio:
         _assert_valid_video(result.video, num_frames=NUM_FRAMES)
         assert result.frame_rate == FRAME_RATE
         _assert_valid_audio(result.audio, result.audio_sample_rate)
+
+    def test_v2v_audio_smoke(self, cosmos3_pipeline):
+        """Audio + V2V combined — allowed in both implementations (no guard),
+        previously untested in either."""
+        _require_audio_pipeline(cosmos3_pipeline)
+        result = _run_forward(
+            cosmos3_pipeline,
+            enable_audio=True,
+            video=_make_test_video(NUM_FRAMES),
+            condition_frame_indexes_vision=[0, 1],
+            condition_video_keep="first",
+        )
+        _assert_valid_video(result.video, num_frames=NUM_FRAMES)
+        _assert_valid_audio(result.audio, result.audio_sample_rate)
+        _assert_scheduler_config(
+            cosmos3_pipeline,
+            flow_shift=10.0,
+            use_karras_sigmas=False,
+        )
 
 
 @pytest.mark.integration
