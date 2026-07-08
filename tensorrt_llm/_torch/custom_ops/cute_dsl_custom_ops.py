@@ -5325,6 +5325,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                      large_occupancy,
                      chunk_size_per_cta,
                      num_ctas_per_row,
+                     overflow_policy="REREAD",
                      dynamic=False):
             """Compile and cache multi-CTA top-k kernels for the given config."""
             key = (
@@ -5336,6 +5337,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 large_occupancy,
                 chunk_size_per_cta,
                 num_ctas_per_row,
+                overflow_policy,
                 dynamic,
             )
             if key in cls.kernel_cache:
@@ -5348,12 +5350,17 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                                                stride_order=(1,
                                                                              0),
                                                                assumed_align=32)
-            buffer_fake = cute.runtime.make_fake_compact_tensor(
-                cutlass.Int32,
-                (cute.sym_int(), cute.sym_int(), cute.sym_int()),
-                stride_order=(2, 1, 0),
-                assumed_align=32,
-            )
+            # extra_buffer for GMEM_SPILL: spills threshold-bin candidates that
+            # overflow SMEM. Not needed for TRUNCATE/REREAD/REREAD_ALWAYS.
+            if overflow_policy == "GMEM_SPILL":
+                buffer_fake = cute.runtime.make_fake_compact_tensor(
+                    cutlass.Int32,
+                    (cute.sym_int(), cute.sym_int(), cute.sym_int()),
+                    stride_order=(2, 1, 0),
+                    assumed_align=32,
+                )
+            else:
+                buffer_fake = None
             seqlen_fake = cute.runtime.make_fake_compact_tensor(
                 cutlass.Int32,
                 (n_batch, ),
@@ -5388,6 +5395,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 num_ctas_per_row=num_ctas_per_row,
                 merge_blocks=False,
                 enable_dynamic_multi_cta=dynamic,
+                overflow_policy=overflow_policy,
             )
             compiled_kernel_first = cute.compile(
                 filtered_topk_func_first,
@@ -5434,6 +5442,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 enable_multi_cta=False,
                 merge_blocks=True,
                 varlen_merge_input=dynamic,
+                overflow_policy=overflow_policy,
             )
             compiled_kernel_second = cute.compile(
                 filtered_topk_func_second,
@@ -5460,6 +5469,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             return_val: bool = False,
             num_copy_bits: int = 256,
             chunk_size_per_cta: int = 16384,
+            overflow_policy: str = "REREAD",
             dynamic: bool = True,
             output_indices: Optional[torch.Tensor] = None,
         ):
@@ -5483,17 +5493,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 large_occupancy,
                 chunk_size_per_cta,
                 num_ctas_per_row,
+                overflow_policy,
                 dynamic,
             )
             cls._compile(*key)
             compiled_kernel_first, compiled_kernel_second = \
                 cls.kernel_cache[key]
             reserve = torch.cuda.is_current_stream_capturing()
-
-            if dtype == cutlass.Float32:
-                buffer_numbers = 2
-            else:
-                buffer_numbers = 1
 
             # Intermediate buffers for first kernel output
             first_output_indices = cls.buffers.get_buffer(
@@ -5507,13 +5513,18 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 buffer_name="multi_cta_first_output_values",
                 reserve_buffer=reserve)
 
-            # Shared buffer for both kernels (they run sequentially)
-            buffer_dim2 = max(chunk_size_per_cta, merge_cols)
-            buffer_torch = cls.buffers.get_buffer(
-                [num_rows * num_ctas_per_row, buffer_numbers, buffer_dim2],
-                torch.int32,
-                buffer_name="multi_cta_buffer",
-                reserve_buffer=reserve)
+            # extra_buffer for GMEM_SPILL: spills threshold-bin candidates that
+            # overflow SMEM. Not needed for TRUNCATE/REREAD/REREAD_ALWAYS.
+            if overflow_policy == "GMEM_SPILL":
+                buffer_numbers = 2 if dtype == cutlass.Float32 else 1
+                buffer_dim2 = max(chunk_size_per_cta, merge_cols)
+                buffer_torch = cls.buffers.get_buffer(
+                    [num_rows * num_ctas_per_row, buffer_numbers, buffer_dim2],
+                    torch.int32,
+                    buffer_name="multi_cta_buffer",
+                    reserve_buffer=reserve)
+            else:
+                buffer_torch = None
 
             # Final output tensors
             if output_indices is not None:
@@ -6189,6 +6200,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     return_val=False,
                     num_copy_bits=num_copy_bits,
                     chunk_size_per_cta=chunk_size_per_cta,
+                    overflow_policy=overflow_policy,
                     dynamic=dynamic,
                     output_indices=output_indices,
                 )
