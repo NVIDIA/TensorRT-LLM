@@ -476,6 +476,26 @@ class SequenceArena:
                 best = blocks
         return max(0, best)
 
+    def aliasable_span_blocks(self, num_blocks: int) -> int:
+        """Base-independent :meth:`aliasable_prefix_blocks` (ranges start
+        page-aligned in every pool, so the trim depends only on the block
+        count) -- usable before any range exists, e.g. at reuse lookup."""
+        return self.aliasable_prefix_blocks(0, num_blocks)
+
+    def trim_shared_to_blocks(
+        self, shared_per_pool: "list[list[SharedPhysMem]]", num_blocks: int
+    ) -> "list[list[SharedPhysMem]]":
+        """Per pool, the prefix of ``shared_per_pool`` fully covered by the
+        first ``num_blocks`` blocks (P3 partial-span aliasing: a match
+        shorter than the registered span aliases only its own chunks)."""
+        page = self._phys_page_size
+        out: list[list[SharedPhysMem]] = []
+        for pool, shared in enumerate(shared_per_pool):
+            stride = self._strides[pool]
+            k = (num_blocks * stride) // page
+            out.append(shared[:k])
+        return out
+
     def reserve(self, max_blocks: int) -> int:
         """Reserve VA for a sequence's maximum block count; returns base_block.
         No physical memory is mapped yet (that happens in :meth:`ensure_mapped`)."""

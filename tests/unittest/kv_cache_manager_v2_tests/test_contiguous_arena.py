@@ -887,7 +887,7 @@ class TestArenaPoolGroup(unittest.TestCase):
             canon = [self._FakeCanonicalPage(), self._FakeCanonicalPage()]
             group.register_canonical_span(rng_a, canon, CachedCudaEvent.NULL)
             key = id(canon[0])
-            self.assertEqual(rng_a._alias_span_key, key)
+            self.assertEqual(rng_a._alias_span_key, (key, 2))
             self.assertEqual(group.canonical_span_pages, 3)
             # charge moved range -> registry (net zero), retained-at-will
             self.assertEqual(self.budget.used_pages, 6)
@@ -897,9 +897,10 @@ class TestArenaPoolGroup(unittest.TestCase):
             self.assertIsNone(group.lookup_canonical_span(canon[0], canon[:1]))
             hit = group.lookup_canonical_span(canon[0], canon)
             self.assertIsNotNone(hit)
+            self.assertEqual(hit[2], 2)  # usable extent = the verified match
             rng_b = group.reserve_sequence(4)  # nothing parked yet -> fresh
             self.assertNotEqual(rng_b.base_block, rng_a.base_block)
-            self.assertEqual(group.alias_span_into_range(rng_b, hit[0], hit[1]), 3)
+            self.assertEqual(group.alias_span_into_range(rng_b, hit[0], hit[1], hit[2]), 3)
             self.assertEqual(self.budget.used_pages, 6)  # aliases charge nothing
             # B's remainder maps fresh: pool0 +2, pool1 +1
             self.assertEqual(group.ensure_mapped(rng_b, 4), 3)
@@ -921,9 +922,14 @@ class TestArenaPoolGroup(unittest.TestCase):
             self.assertEqual(group.drain_reclaim(CachedCudaEvent.NULL), 1)
             plain = group.reserve_sequence(4)  # alias_key=None
             self.assertNotEqual(plain.base_block, rng_a.base_block)
-            adopted = group.reserve_sequence(4, alias_key=key)
+            # extent is part of the signature: a shorter-extent admission
+            # must NOT adopt the owner's full-span range
+            self.assertNotEqual(
+                group.reserve_sequence(4, alias_key=(key, 1)).base_block, rng_a.base_block
+            )
+            adopted = group.reserve_sequence(4, alias_key=(key, 2))
             self.assertEqual(adopted.base_block, rng_a.base_block)
-            self.assertEqual(adopted._alias_span_key, key)
+            self.assertEqual(adopted._alias_span_key, (key, 2))
 
             # Spill the registry: pins drop, lookups miss, aliases keep bytes.
             torch.cuda.synchronize()
@@ -932,8 +938,9 @@ class TestArenaPoolGroup(unittest.TestCase):
             tb2 = TestSparseVirtMem._tensor_at(int(addr_b), n)
             self.assertTrue(bool((tb2 == 11.5).all().item()))
 
-            for rng in (rng_b, plain, adopted):
-                group.free_sequence(rng, CachedCudaEvent.NULL)
+            for base, rng in list(group._ranges.items()):
+                if not rng._freed:
+                    group.free_sequence(rng, CachedCudaEvent.NULL)
             group.drain_reclaim(CachedCudaEvent.NULL)
             torch.cuda.synchronize()
             group.spill_retained(1 << 62)
@@ -2247,6 +2254,85 @@ class TestArenaPrefixAliasing(unittest.TestCase):
             self.assertTrue(bool((data == -777.0).all().item()), "fallback not from host")
             kv_d.close()
         s4.take_finish_event().synchronize()
+        manager.drain_gpu_reclaim(CachedCudaEvent.NULL)
+
+    def test_alias_partial_span_from_longer_owner(self) -> None:
+        """P3 partial-span aliasing: the shared-prompt benchmark shape.
+
+        The canonical owner's committed chain is LONGER than the shared
+        prefix (system prompt + its own continuation), so a later
+        admission's match covers only part of the registered span. The
+        match aliases exactly its own fully-covered chunks and writes
+        strictly past them; the parked signature carries the extent so
+        adoption stays exact, and the owner's tail chunks are never
+        corrupted by a shorter adopter.
+        """
+        manager = self.manager
+        pg = self._pool_group()
+        shared_tok = self.PREFIX_BLOCKS * self.TPB  # 64 blocks = 1 chunk
+        owner_tok = 2 * shared_tok  # owner commits 128 blocks = 2 chunks
+        tokens = [3000 + i for i in range(owner_tok)]
+
+        kv_a = manager.create_kv_cache(max_capacity=owner_tok + 4 * self.TPB)
+        with TemporaryCudaStream([]) as s:
+            self.assertTrue(kv_a.resume(CudaStream(s.handle)))
+            self.assertTrue(kv_a.resize(owner_tok))
+            a_indices = list(kv_a.get_base_page_indices(LifeCycleId(0)))
+            for j, idx in enumerate(a_indices[: 2 * self.PREFIX_BLOCKS]):
+                self._block_floats(idx).fill_(float(j))
+            torch.cuda.synchronize()
+            kv_a.commit(tokens)
+            kv_a.close()
+        s.take_finish_event().synchronize()
+        self.assertEqual(pg.canonical_span_pages, 2)  # the full 128-block span
+        manager.drain_gpu_reclaim(CachedCudaEvent.NULL)
+
+        # B shares only the first 64 blocks; its match is HALF the span.
+        kv_b = manager.create_kv_cache(
+            input_tokens=tokens[:shared_tok] + [1, 2],
+            max_capacity=owner_tok + 4 * self.TPB,
+        )
+        self.assertEqual(kv_b.history_length, shared_tok)
+        for ordinal in range(self.PREFIX_BLOCKS):
+            host_id = kv_b._blocks[ordinal].pages[0][LifeCycleId(0)].page.slot_id
+            self._host_floats(host_id).fill_(-555.0)
+        with TemporaryCudaStream([]) as s2:
+            self.assertTrue(kv_b.resume(CudaStream(s2.handle)))
+            self.assertEqual(pg.alias_hits, 1)
+            rng = kv_b._arena_ranges[PoolGroupIndex(0)]
+            self.assertEqual(rng._alias_span_key[1], self.PREFIX_BLOCKS)  # extent
+            torch.cuda.synchronize()
+            b_indices = list(kv_b.get_base_page_indices(LifeCycleId(0)))
+            for j, idx in enumerate(b_indices[: self.PREFIX_BLOCKS]):
+                data = self._block_floats(idx)
+                self.assertTrue(bool((data == float(j)).all().item()), f"block {j} not aliased")
+            # B writes past the aliased extent: its block 64 lives in a
+            # FRESH chunk of its own range, not the owner's second chunk.
+            self.assertTrue(kv_b.resize(shared_tok + self.TPB))
+            tail_idx = list(kv_b.get_base_page_indices(LifeCycleId(0)))[self.PREFIX_BLOCKS]
+            self._block_floats(tail_idx).fill_(-1.0)
+            torch.cuda.synchronize()
+            kv_b.close()
+        s2.take_finish_event().synchronize()
+        manager.drain_gpu_reclaim(CachedCudaEvent.NULL)
+
+        # C matches the FULL owner chain: adoption is extent-exact (it takes
+        # the owner's (key, 128) range, not B's (key, 64) one), and the
+        # owner's tail chunk was never corrupted by B's shorter alias.
+        kv_c = manager.create_kv_cache(
+            input_tokens=tokens + [9], max_capacity=owner_tok + 4 * self.TPB
+        )
+        self.assertEqual(kv_c.history_length, owner_tok)
+        with TemporaryCudaStream([]) as s3:
+            self.assertTrue(kv_c.resume(CudaStream(s3.handle)))
+            self.assertEqual(pg.alias_hits, 2)
+            torch.cuda.synchronize()
+            c_indices = list(kv_c.get_base_page_indices(LifeCycleId(0)))
+            for j in (0, self.PREFIX_BLOCKS, 2 * self.PREFIX_BLOCKS - 1):
+                data = self._block_floats(c_indices[j])
+                self.assertTrue(bool((data == float(j)).all().item()), f"block {j} corrupted")
+            kv_c.close()
+        s3.take_finish_event().synchronize()
         manager.drain_gpu_reclaim(CachedCudaEvent.NULL)
 
 

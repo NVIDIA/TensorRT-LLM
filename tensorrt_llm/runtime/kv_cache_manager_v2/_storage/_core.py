@@ -743,12 +743,13 @@ class SequenceRange:
     # Ghost registry keys (§4.4 phase 2): ids of host pages whose bytes still
     # live in this (retained) range; purged when the range is reclaimed.
     _ghost_keys: list[int]
-    # P3 prefix aliasing: the canonical-span registry key whose physical pages
-    # are alias-mapped at this range's start (None = unaliased). Aliased
-    # ranges may only be adopted by a sequence whose reuse match carries the
-    # SAME key -- the span's physical pages are shared, so any other adopter
-    # writing the range head would corrupt every alias of the span.
-    _alias_span_key: "int | None"
+    # P3 prefix aliasing: (registry key, aliased block extent) of the span
+    # alias-mapped at this range's start (None = unaliased). Aliased ranges
+    # may only be adopted by a sequence whose reuse match carries the SAME
+    # signature -- the span's pages are shared, so an adopter writing past a
+    # SHORTER matched prefix (or any other-key adopter writing the range
+    # head) would corrupt every alias of the span.
+    _alias_span_key: "tuple[int, int] | None"
 
     def __init__(self, base_block: int, num_blocks: int) -> None:
         self.base_block = base_block
@@ -933,7 +934,9 @@ class ArenaPoolGroup(PoolGroupBase):
 
     # -- per-sequence API (replaces scattered slot allocation) --------------
 
-    def reserve_sequence(self, max_blocks: int, alias_key: "int | None" = None) -> SequenceRange:
+    def reserve_sequence(
+        self, max_blocks: int, alias_key: "tuple[int, int] | None" = None
+    ) -> SequenceRange:
         """Reserve a contiguous block-index range for a sequence's maximum
         block count, preferring the adoption of a parked (freed but still
         mapped) range over fresh VA: the adopted range's mapped prefix is
@@ -957,7 +960,9 @@ class ArenaPoolGroup(PoolGroupBase):
         insort(self._range_bases, base_block)
         return rng
 
-    def _try_adopt(self, max_blocks: int, alias_key: "int | None" = None) -> "SequenceRange | None":
+    def _try_adopt(
+        self, max_blocks: int, alias_key: "tuple[int, int] | None" = None
+    ) -> "SequenceRange | None":
         """Hand a parked freed range (pages still mapped, reclaim gates all
         complete) to a new sequence. LRU-first, so the most recently retired
         ranges keep their ghost entries (D2D reuse, §4.4 phase 2) longest.
@@ -1273,18 +1278,25 @@ class ArenaPoolGroup(PoolGroupBase):
         self._budget.release(span.num_pages)
         self._budget.consume(span.num_pages)
         self._budget.retain(span.num_pages)
-        rng._alias_span_key = key
+        # The owner's parked range aliases the FULL span; typical adopters
+        # alias a shorter matched prefix, so this range is usually adopted
+        # only by a full-span match (or spilled under pressure).
+        rng._alias_span_key = (key, num_blocks)
         self._canonical_spans[key] = span
 
     def lookup_canonical_span(
         self, head_page: object, matched_pages: "Sequence[object]"
-    ) -> "tuple[int, _CanonicalSpan] | None":
+    ) -> "tuple[int, _CanonicalSpan, int] | None":
         """Registry hit for an admission whose reuse match starts at
         ``head_page`` and covers ``matched_pages`` (canonical page objects in
-        ordinal order): returns ``(key, span)`` iff a live span exists, its
-        FULL extent is covered by the match (a shorter match would write into
-        shared pages), and every span page identity still holds. Any
-        staleness invalidates and unpins the entry."""
+        ordinal order): returns ``(key, span, usable_blocks)`` where
+        ``usable_blocks`` is the identity-verified matched prefix trimmed to
+        whole chunks in every pool -- the safely aliasable extent. A match
+        SHORTER than the span aliases only its own covered chunks (the
+        adopter writes strictly past them; the shared-prompt benchmark's
+        matches are the system prompt, while spans carry the whole committed
+        chain of their owner). A mismatch anywhere in the verified prefix
+        invalidates and unpins the entry."""
         if not self._prefix_aliasing:
             return None
         key = id(head_page)
@@ -1292,25 +1304,30 @@ class ArenaPoolGroup(PoolGroupBase):
         if span is None:
             self.alias_misses += 1
             return None
-        if len(matched_pages) < span.num_blocks:
-            self.alias_misses += 1
-            return None  # match too short to safely alias the whole span
-        for i, ref in enumerate(span.page_refs):
-            if ref() is not matched_pages[i]:
+        verified = min(len(matched_pages), span.num_blocks)
+        for i in range(verified):
+            if span.page_refs[i]() is not matched_pages[i]:
                 self._invalidate_span(key, span)
                 self.alias_misses += 1
                 return None
+        usable = self._arena.aliasable_span_blocks(verified)
+        if usable <= 0:
+            self.alias_misses += 1
+            return None
         self.alias_hits += 1
-        return key, span
+        return key, span, usable
 
-    def alias_span_into_range(self, rng: SequenceRange, key: int, span: "_CanonicalSpan") -> int:
-        """Alias-map ``span``'s physical pages at the start of ``rng`` (a
-        FRESH, unmapped range) and stamp its signature. Signature-matched
-        adopted ranges already carry the mappings and skip this. Returns the
-        chunks aliased."""
+    def alias_span_into_range(
+        self, rng: SequenceRange, key: int, span: "_CanonicalSpan", num_blocks: int
+    ) -> int:
+        """Alias-map the first ``num_blocks`` blocks' worth of ``span``'s
+        physical pages at the start of ``rng`` (a FRESH, unmapped range) and
+        stamp its signature. Signature-matched adopted ranges already carry
+        the mappings and skip this. Returns the chunks aliased."""
         assert rng._alias_span_key is None
-        aliased = self._arena.alias_prefix(rng.base_block, span.shared_per_pool)
-        rng._alias_span_key = key
+        trimmed = self._arena.trim_shared_to_blocks(span.shared_per_pool, num_blocks)
+        aliased = self._arena.alias_prefix(rng.base_block, trimmed)
+        rng._alias_span_key = (key, num_blocks)
         return aliased
 
     def _unpin_span(self, span: "_CanonicalSpan") -> None:

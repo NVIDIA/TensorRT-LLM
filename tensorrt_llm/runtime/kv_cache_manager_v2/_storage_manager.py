@@ -497,7 +497,7 @@ class StorageManager:
         return caps
 
     def reserve_gpu_sequence(
-        self, pg_idx: PoolGroupIndex, max_blocks: int, alias_key: "int | None" = None
+        self, pg_idx: PoolGroupIndex, max_blocks: int, alias_key: "tuple[int, int] | None" = None
     ) -> SequenceRange:
         """Reserve a contiguous block-index range for a sequence's maximum
         block count in every pool of the group (§4.1). Pure VA bookkeeping;
@@ -608,7 +608,7 @@ class StorageManager:
 
     def lookup_arena_canonical_span(
         self, pg_idx: PoolGroupIndex, head_page: Page, matched_pages: Sequence[Page]
-    ) -> "tuple[int, object] | None":
+    ) -> "tuple[int, object, int] | None":
         return (
             self._gpu_arena_storage()
             .pool_group(pg_idx)
@@ -616,7 +616,7 @@ class StorageManager:
         )
 
     def alias_arena_span(
-        self, pg_idx: PoolGroupIndex, rng: SequenceRange, key: int, span: object
+        self, pg_idx: PoolGroupIndex, rng: SequenceRange, key: int, span: object, num_blocks: int
     ) -> int:
         return (
             self._gpu_arena_storage()
@@ -625,6 +625,7 @@ class StorageManager:
                 rng,
                 key,
                 span,  # type: ignore[arg-type]
+                num_blocks,
             )
         )
 

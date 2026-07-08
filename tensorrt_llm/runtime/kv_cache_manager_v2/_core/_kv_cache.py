@@ -1068,9 +1068,9 @@ class _KVCache:
                 if hit is None:
                     continue
                 if rng._alias_span_key is None:
-                    storage.alias_arena_span(pg_idx, rng, hit[0], hit[1])
+                    storage.alias_arena_span(pg_idx, rng, hit[0], hit[1], hit[2])
                 else:
-                    assert rng._alias_span_key == hit[0], (
+                    assert rng._alias_span_key == (hit[0], hit[2]), (
                         "adopted range's alias signature must match the admission's span"
                     )
         if not self._arena_ensure_mapped(self.num_blocks, sync=True):
@@ -1093,7 +1093,7 @@ class _KVCache:
                     hit = alias_spans[pg_idx]
                     if (
                         hit is not None
-                        and int(ordinal) < hit[1].num_blocks
+                        and int(ordinal) < hit[2]
                         and hit[1].page_refs[int(ordinal)]() is page
                     ):
                         # P3: the block's bytes are already visible at this
@@ -1623,8 +1623,9 @@ class _KVCache:
                         # a parked range already alias-mapping this span is
                         # handed over with its mappings (and content) intact.
                         alias_key = None
-                        if alias_spans is not None and alias_spans[pg_idx] is not None:
-                            alias_key = alias_spans[pg_idx][0]
+                        hit = None if alias_spans is None else alias_spans[pg_idx]
+                        if hit is not None:
+                            alias_key = (hit[0], hit[2])
                         ranges.append(storage.reserve_gpu_sequence(pg_idx, max_blocks, alias_key))
                         pg_idx = PoolGroupIndex(pg_idx + 1)
                     except MemoryError:

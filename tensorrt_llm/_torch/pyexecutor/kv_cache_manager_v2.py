@@ -2644,6 +2644,11 @@ class KVCacheManagerV2(BaseResourceManager):
                         f"[arena] pool group {pg_idx}: ghost hits={group.ghost_hits} "
                         f"misses={group.ghost_misses} spilled ranges={group.spilled_ranges}"
                     )
+                if group.alias_hits or group.alias_misses or group.spilled_spans:
+                    logger.info(
+                        f"[arena] pool group {pg_idx}: alias hits={group.alias_hits} "
+                        f"misses={group.alias_misses} spilled spans={group.spilled_spans}"
+                    )
         self.impl.shutdown()
 
     def get_max_resource_count(self) -> int:
