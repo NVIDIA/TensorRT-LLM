@@ -1452,6 +1452,7 @@ private:
     bool mDiskProtectUnexpired{false};
     std::size_t mDiskSpills{0};
     std::size_t mDiskGateDropped{0};
+    std::size_t mDiskWritePressureDropped{0};
     std::size_t mDiskAdmissionRefused{0};
     std::size_t mDiskOnboards{0};
 

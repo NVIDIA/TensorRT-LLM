@@ -1431,6 +1431,25 @@ BlockPtr WindowBlockManager::reclaimSecondaryBlock()
         }
         return victim; // reused fewer than k times: discard, don't spill
     }
+    // Write-pressure shedding (opt-in via TLLM_KV_DISK_DROP_ON_PRESSURE): when the async writer is saturated,
+    // drop a BEST-EFFORT (non-retained) spill rather than stalling the scheduler behind the write queue.
+    // Retained blocks are never shed -- their TTL guarantee requires they reach disk (they bypass the cap at
+    // enqueue). Default (unset/0) preserves prior behavior: best-effort spills wait for queue room.
+    static bool const kDropOnPressure = []
+    {
+        auto const* e = std::getenv("TLLM_KV_DISK_DROP_ON_PRESSURE");
+        return e && std::atoi(e) != 0;
+    }();
+    if (kDropOnPressure && !victim->isRetainedNow() && mTransferManager->diskWriteQueueFull())
+    {
+        ++mDiskWritePressureDropped;
+        if (mDiskWritePressureDropped == 1 || mDiskWritePressureDropped % 10000 == 0)
+        {
+            TLLM_LOG_INFO(
+                "[disk-tier] write-pressure dropped=%zu (windowSize=%d)", mDiskWritePressureDropped, mWindowSize);
+        }
+        return victim; // best-effort spill shed under writer saturation: evict as stock (no scheduler stall)
+    }
     auto diskTarget = claimDiskTarget();
     if (diskTarget == nullptr)
     {
