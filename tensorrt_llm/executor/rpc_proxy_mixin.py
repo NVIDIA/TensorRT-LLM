@@ -158,12 +158,36 @@ class RpcExecutorMixin:
             logger.error(f"Error in {method_name}: {e}")
             raise
 
-    async def _fetch_responses_loop_async(self):
-        await self._generic_fetch_loop_async(
-            fetch_method_name="fetch_responses_loop_async",
-            handler_method=self.handle_responses,
-            method_name="_fetch_responses_loop_async",
+    def _fail_pending_requests(self, error_msg: str) -> None:
+        """Fail every in-flight request with an error message.
+
+        Reuses `handle_responses` to push an `ErrorResponse` into each pending result queue, so a
+        `result()` caller blocked on `queue.get()` wakes up immediately with a legible error instead
+        of hanging until externally interrupted (e.g. pytest timeout).
+        """
+        if not self._results:
+            return
+        logger.error(f"Failing {len(self._results)} pending request(s): {error_msg}")
+        self.handle_responses(
+            [
+                ErrorResponse(client_id, error_msg, client_id)
+                for client_id in list(self._results.keys())
+            ]
         )
+
+    async def _fetch_responses_loop_async(self):
+        try:
+            await self._generic_fetch_loop_async(
+                fetch_method_name="fetch_responses_loop_async",
+                handler_method=self.handle_responses,
+                method_name="_fetch_responses_loop_async",
+            )
+        except Exception as e:
+            # The response stream broke (e.g. the worker died). Fail all
+            # in-flight requests so blocked result() callers get an immediate
+            # error instead of hanging until the global timeout. NVBug 6336747.
+            self._fail_pending_requests(f"Executor worker died: {e!r}")
+            raise
 
     # NOTE: _fetch_stats_loop_async and _fetch_kv_cache_events_loop_async have been removed.
     # Stats and kv_events are now fetched on-demand via direct RPC calls

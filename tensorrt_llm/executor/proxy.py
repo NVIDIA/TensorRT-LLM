@@ -561,6 +561,39 @@ class GenerationExecutorProxy(GenerationExecutor):
         for result in list(self._results.values()):
             result.abort()
 
+    def _fail_pending_requests(self, error_msg: str) -> None:
+        """Fail every in-flight request with an error message.
+
+        Reuses `handle_responses` to push an `ErrorResponse` into each pending result queue, so a
+        `result()` caller blocked on `queue.get()` wakes up immediately with a legible error instead
+        of hanging until externally interrupted (e.g. pytest timeout).
+
+        Mirrors the delivery path in `dispatch_result_task`.
+        """
+        if not self._results:
+            return
+        logger.error(
+            f"Failing {len(self._results)} pending request(s): {error_msg}")
+        async_queues = []
+        event_loop = None
+        for client_id, result in list(self._results.items()):
+            queue = result.queue
+            err = ErrorResponse(client_id, error_msg, client_id)
+            if isinstance(queue, _SyncQueue):
+                queue.put_nowait(err)
+                async_queues.append(queue)
+                event_loop = event_loop or queue.loop
+            else:
+                queue.put(err)
+            self._results.pop(client_id, None)
+        if async_queues:
+            try:
+                _SyncQueue.notify_many(event_loop, async_queues)
+            except AsyncQueue.EventLoopShutdownError:
+                logger.warning(
+                    "proxy.py: EventLoopShutdownError while failing pending requests"
+                )
+
     def pre_shutdown(self):
         if not self.workers_started:
             return
@@ -576,6 +609,13 @@ class GenerationExecutorProxy(GenerationExecutor):
             self._shutdown_event.set()
 
         self._abort_all_requests()
+
+        # If we are shutting down because the worker died (fatal error), unblock any pending
+        # result() waiters with an error instead of letting them hang until the global timeout.
+        # Gated on `_fatal_error` so a clean shutdown is not affected.
+        if self._fatal_error is not None:
+            self._fail_pending_requests(
+                f"Executor worker died: {self._fatal_error!r}")
 
         # Notify surviving workers to quit.  Send the sentinel when:
         #   (a) ``mpi_futures`` is empty -- the
