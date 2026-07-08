@@ -1990,9 +1990,110 @@ class ServerArrivalTimeMiddleware:
             scope["state"] = {}
             scope["state"][
                 "server_arrival_time"] = get_steady_clock_now_in_seconds()
+            # Measure client-send -> server-accept latency: the network + HTTP
+            # accept-queue backlog BEFORE the handler runs (invisible to per-
+            # request server metrics, which start at server_arrival_time). The
+            # client stamps x-client-send-time (wall-clock epoch s); compare to
+            # our wall clock (NTP-synced hosts). Only /v1/ request paths.
+            path = scope.get("path", "")
+            if path.startswith("/v1/"):
+                for k, v in scope.get("headers", ()):  # raw ASGI header pairs
+                    if k == b"x-client-send-time":
+                        try:
+                            sent = float(v.decode())
+                            _accept_latency_logger().record(
+                                max(0.0,
+                                    time.time() - sent))
+                        except (ValueError, UnicodeDecodeError):
+                            pass
+                        break
 
         # Pass through the original receive/send - no wrapping!
         await self.app(scope, receive, send)
+
+
+_ACCEPT_LAT = None
+_TTFT_SPLIT = None
+
+
+def _accept_latency_logger():
+    """Lazy singleton for the client-send -> server-accept latency logger
+    (PeriodicLatencyLogger is defined below this class)."""
+    global _ACCEPT_LAT
+    if _ACCEPT_LAT is None:
+        _ACCEPT_LAT = PeriodicLatencyLogger("accept.client_send_to_arrival")
+    return _ACCEPT_LAT
+
+
+def ttft_split_logger():
+    """Lazy singleton aggregating the per-request TTFT breakdown (pre_ctx /
+    ctx_phase / xfer_gen / total), logged periodically instead of per request."""
+    global _TTFT_SPLIT
+    if _TTFT_SPLIT is None:
+        _TTFT_SPLIT = PeriodicBreakdownLogger(
+            "orchestrator",
+            ["pre_ctx_ms", "ctx_phase_ms", "xfer_gen_ms", "total_ms"])
+    return _TTFT_SPLIT
+
+
+class PeriodicLatencyLogger:
+    """Accumulates per-call latencies for a named coordinator API and logs
+    percentiles every ``window`` calls. Cheap, lock-free (single asyncio loop),
+    and self-resetting. Used to profile the coordinator surface on both the
+    in-process owner (DisaggCoordinatorService) and the HTTP client
+    (CoordinatorDelegatingRouter / CoordinatorClient) without per-call log spam."""
+
+    def __init__(self, name: str, window: int = 500):
+        self._name = name
+        self._window = window
+        self._samples: List[float] = []
+        self._n = 0
+
+    def record(self, dt_s: float) -> None:
+        self._samples.append(dt_s * 1000.0)  # ms
+        self._n += 1
+        if self._n % self._window == 0:
+            s = sorted(self._samples)
+            m = len(s)
+            p = lambda q: s[min(int(q * m), m - 1)]
+            logger.info(
+                f"[coord_api] {self._name} n={self._n} ms: "
+                f"mean={sum(s)/m:.2f} p50={p(0.5):.2f} p90={p(0.9):.2f} "
+                f"p99={p(0.99):.2f} max={s[-1]:.2f}")
+            self._samples = []
+
+
+class PeriodicBreakdownLogger:
+    """Like PeriodicLatencyLogger but for a multi-field breakdown: accumulates a
+    dict of named ms values per sample and logs p50/p95 of EACH field once every
+    ``window`` samples. Used for the per-request TTFT split so we get the
+    breakdown WITHOUT a synchronous log write per request (that per-request
+    logging inflated TTFT ~3s on the single-loop disagg server -- observer
+    effect). Negative values (stage not reached) are dropped per field."""
+
+    def __init__(self, name: str, fields, window: int = 1000):
+        self._name = name
+        self._fields = list(fields)
+        self._window = window
+        self._samples = {f: [] for f in self._fields}
+        self._n = 0
+
+    def record(self, values: dict) -> None:
+        self._n += 1
+        for f in self._fields:
+            v = values.get(f)
+            if v is not None and v >= 0:
+                self._samples[f].append(v)
+        if self._n % self._window == 0:
+            parts = []
+            for f in self._fields:
+                s = sorted(self._samples[f])
+                if s:
+                    p = lambda q: s[min(int(q * len(s)), len(s) - 1)]
+                    parts.append(f"{f}(p50={p(0.5):.0f},p95={p(0.95):.0f})")
+                self._samples[f] = []
+            logger.info(f"[ttft_split] {self._name} n={self._n} " +
+                        " ".join(parts))
 
 
 class ResponseHooks(ABC):
@@ -2003,6 +2104,13 @@ class ResponseHooks(ABC):
     @abstractmethod
     def on_req_begin(self, request: UCompletionRequest):
         pass
+
+    def on_ctx_dispatch(self, request: UCompletionRequest):
+        """Fired the instant the disagg service starts placing the request on a
+        ctx server (before routing / the ctx HTTP send). arrival->here measures
+        the pre-ctx wait in the orchestrator/fleet (accept queue + event loop +
+        pipeline), which dominates TTFT under high fleet concurrency. Default
+        no-op so non-instrumented hook implementations are unaffected."""
 
     @abstractmethod
     def on_ctx_resp(self, ctx_server: str, response: UCompletionResponse):

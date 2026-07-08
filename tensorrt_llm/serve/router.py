@@ -13,43 +13,31 @@
 # limitations under the License.
 
 import asyncio
-import os
 import time
 from abc import ABC, abstractmethod
 from collections import OrderedDict
-from typing import Awaitable, Callable, Dict, Iterable, List, Optional, Union
+from typing import Awaitable, Callable, Dict, Iterable, List, Optional
 
 import aiohttp
+import orjson
 
-from tensorrt_llm.bindings.internal.batch_manager import \
-    BlockKey as _NativeBlockKey
-from tensorrt_llm.bindings.internal.batch_manager import \
-    BlockKeyHasher as _NativeBlockKeyHasher
+# Content-Type for orjson-serialized bodies sent to the coordinator (we pass
+# data=bytes, so aiohttp doesn't set the json content type itself).
+_JSON_HEADERS = {"Content-Type": "application/json"}
+
 from tensorrt_llm.llmapi.disagg_utils import (MetadataServerConfig,
                                               RouterConfig, ServerRole)
 from tensorrt_llm.logger import logger
-from tensorrt_llm.runtime import kv_cache_hash
-from tensorrt_llm.runtime.kv_cache_manager_v2._block_radix_tree import \
-    Block as V2Block
-from tensorrt_llm.runtime.kv_cache_manager_v2._block_radix_tree import \
-    ReuseScope
-from tensorrt_llm.runtime.kv_cache_manager_v2._block_radix_tree import \
-    RootBlock as V2RootBlock
 from tensorrt_llm.serve.conversation_id import get_request_conversation_id
 from tensorrt_llm.serve.metadata_server import JsonDictionary
-from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
-                                                CompletionRequest)
-
-KV_CACHE_HASH_ALGO_DEFAULT = kv_cache_hash.KV_CACHE_HASH_ALGO_DEFAULT
-KV_CACHE_HASH_ALGO_V1 = kv_cache_hash.KV_CACHE_HASH_ALGO_V1
-KV_CACHE_HASH_ALGO_V2 = kv_cache_hash.KV_CACHE_HASH_ALGO_V2
-KV_CACHE_HASH_ALGO_V2_SHA256_64 = kv_cache_hash.KV_CACHE_HASH_ALGO_V2_SHA256_64
-get_cache_salt_id = kv_cache_hash.get_cache_salt_id
-hash_v1_block_key = kv_cache_hash.hash_v1_block_key
-truncate_sha256_hash_to_int64 = kv_cache_hash.truncate_sha256_hash_to_int64
-
-OpenAIRequest = Union[CompletionRequest, ChatCompletionRequest]
-BlockHash = Union[int, str]
+from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest
+# Shared tokenization / block-hashing utilities (single source of truth).
+# Re-exported here for backward compat.
+from tensorrt_llm.serve.router_utils import (  # noqa: F401
+    KV_CACHE_HASH_ALGO_DEFAULT, KV_CACHE_HASH_ALGO_V1, KV_CACHE_HASH_ALGO_V2,
+    KV_CACHE_HASH_ALGO_V2_SHA256_64, BlockHash, BlockHashMixin, OpenAIRequest,
+    block_key_hasher, get_cache_salt_id, get_request_num_tokens,
+    hash_v1_block_key, truncate_sha256_hash_to_int64, v2_sha256_block_hasher)
 
 # Max number of conversations whose home-server pin is retained (LRU).
 ROUTE_AFFINITY_CACHE_SIZE = 50000
@@ -107,13 +95,17 @@ class ServerState:
         return self._session_provider() if self._session_provider else None
 
     async def increment_load(self, request: OpenAIRequest):
-        num_tokens = get_request_num_tokens(request) if self._use_tokens else 0
+        # request may be None on the coordinator-delegated path (no request
+        # object crosses the HTTP hop); token accounting is skipped then.
+        num_tokens = (get_request_num_tokens(request)
+                      if self._use_tokens and request is not None else 0)
         async with self._lock:
             self._num_active_requests += 1
             self._num_active_tokens += num_tokens
 
     async def decrement_load(self, request: OpenAIRequest):
-        num_tokens = get_request_num_tokens(request) if self._use_tokens else 0
+        num_tokens = (get_request_num_tokens(request)
+                      if self._use_tokens and request is not None else 0)
         async with self._lock:
             self._num_active_requests -= 1
             self._num_active_tokens -= num_tokens
@@ -141,6 +133,7 @@ class KvCacheAwareServerState(ServerState):
         self._kv_cache_block_tables: dict[str, set[BlockHash]] = {
             KV_CACHE_HASH_ALGO_V1: self._kv_cache_block_table
         }
+        self._event_only_blocks: set[BlockHash] = set()
         self._kv_cache_hash_algo = KV_CACHE_HASH_ALGO_DEFAULT
         self._tokens_per_block = tokens_per_block
         self._poll_task: Optional[asyncio.Task] = None
@@ -198,11 +191,14 @@ class KvCacheAwareServerState(ServerState):
             if event["type"] == "created":
                 self.set_hash_algo(hash_algo)
             if event["type"] == "stored":
-                self.add_blocks(
-                    (block["block_hash"] for block in event["blocks"]),
-                    hash_algo=hash_algo)
+                block_hashes = [
+                    block["block_hash"] for block in event["blocks"]
+                ]
+                self.add_blocks(block_hashes, hash_algo=hash_algo)
+                self._event_only_blocks.update(block_hashes)
             elif event["type"] == "removed":
                 self.remove_blocks(event["block_hashes"], hash_algo=hash_algo)
+                self._event_only_blocks.difference_update(event["block_hashes"])
 
     async def poll_events(self, session: aiohttp.ClientSession):
         async with session.post(
@@ -210,20 +206,33 @@ class KvCacheAwareServerState(ServerState):
             events_raw = await response.json()
         return events_raw
 
+    _event_match_log_counter = 0
+
     async def matched_tokens(
             self,
             block_hashes: list[list[BlockHash]],
             hash_algo: str = KV_CACHE_HASH_ALGO_DEFAULT) -> int:
         match_count = 0
+        event_match_count = 0
         async with self._lock:
             block_table = self._block_table(hash_algo)
             for hash_list in block_hashes:
                 for block_hash in hash_list:
-                    # TODO: 1) parent hash verification, 2) partial matching
                     if block_hash in block_table:
                         match_count += self._tokens_per_block
+                        if block_hash in self._event_only_blocks:
+                            event_match_count += self._tokens_per_block
                     else:
                         break
+            KvCacheAwareServerState._event_match_log_counter += 1
+            if KvCacheAwareServerState._event_match_log_counter <= 20 or KvCacheAwareServerState._event_match_log_counter % 100 == 0:
+                logger.info(
+                    f"EVENT_MATCH_DIAG server={self._server} "
+                    f"total_match={match_count} event_match={event_match_count} "
+                    f"event_blocks={len(self._event_only_blocks)} "
+                    f"total_blocks={len(block_table)} "
+                    f"query_hashes={[h for hl in block_hashes for h in hl][:3]}"
+                )
         return match_count
 
     async def decrement_load(self, request: OpenAIRequest):
@@ -369,6 +378,31 @@ class Router(ABC):
         self._health_check_timeout = metadata_server_cfg.health_check_timeout if metadata_server_cfg else None
         self._server_preparation_func = server_preparation_func
         self._prepared_ready_servers: set[str] = set()
+        # Routing-latency diagnostics (gated by TLLM_LOG_ROUTE_TIMING=1): record
+        # get_next_server wall time per request and log percentiles periodically.
+        import os
+        self._log_route_timing = (os.environ.get("TLLM_LOG_ROUTE_TIMING",
+                                                 "0") == "1")
+        self._rt_samples: list = []
+        self._rt_n = 0
+
+    def _record_route_timing(self, dt_s: float) -> None:
+        """Record one get_next_server latency sample; log percentiles every
+        500 calls. No-op unless TLLM_LOG_ROUTE_TIMING=1."""
+        if not self._log_route_timing:
+            return
+        self._rt_samples.append(dt_s * 1000.0)  # ms
+        self._rt_n += 1
+        if self._rt_n % 500 == 0:
+            import statistics
+            s = sorted(self._rt_samples)
+            n = len(s)
+            p = lambda q: s[min(int(q * n), n - 1)]
+            logger.info(f"[route_timing] {type(self).__name__} n={self._rt_n} "
+                        f"get_next_server_ms: mean={statistics.mean(s):.2f} "
+                        f"p50={p(0.5):.2f} p90={p(0.9):.2f} p99={p(0.99):.2f} "
+                        f"max={s[-1]:.2f}")
+            self._rt_samples = []  # reset window
 
     async def close(self):
         """Close the shared HTTP session."""
@@ -1004,19 +1038,23 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
                  max_batch_size: int = 64,
                  tokens_per_block: Optional[int] = None,
                  custom_tokenizer: Optional[str] = None,
+                 tokenizer_dir: Optional[str] = None,
                  track_routed_blocks: bool = True,
                  load_weight: float = 0.25,
                  load_cap: float = float("inf"),
                  **kwargs):
         super().__init__(server_role, servers, metadata_server_cfg,
                          metadata_server, **kwargs)
-        self._init_block_hashing(tokens_per_block, custom_tokenizer)
+        self._init_block_hashing(tokens_per_block, custom_tokenizer,
+                                 tokenizer_dir)
         self._init_load_balancing(servers, use_tokens)
         # TODO: use max_num_tokens? per server?
         self._max_batch_size = max_batch_size
         self._load_weight = load_weight
         self._load_cap = load_cap
         self._track_routed_blocks = track_routed_blocks
+        # request key -> (flat block hashes, hash_algo). Key is id(request) on the
+        # standalone path, the disagg req_id on the coordinator path.
         self._pending_routed_blocks: dict[int, tuple[list[BlockHash], str]] = {}
 
     def _create_server_state(self, server: str) -> KvCacheAwareServerState:
@@ -1029,19 +1067,18 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
             await state.cancel_poll_task()
         await super().close()
 
-    def _stash_routed_blocks_on_route(self, request: OpenAIRequest,
+    def _stash_routed_blocks_on_route(self, key: int,
                                       block_hashes: list[list[BlockHash]],
                                       hash_algo: str) -> None:
         if not self._track_routed_blocks:
             return
         flat = [h for hl in block_hashes for h in hl]
-        self._pending_routed_blocks[id(request)] = (flat, hash_algo)
+        self._pending_routed_blocks[key] = (flat, hash_algo)
 
-    def _apply_routed_blocks_on_finish(self, request: OpenAIRequest,
-                                       server: Optional[str],
+    def _apply_routed_blocks_on_finish(self, key: int, server: Optional[str],
                                        success: bool) -> None:
         # Pop unconditionally to avoid leaks; apply only when eligible.
-        entry = self._pending_routed_blocks.pop(id(request), None)
+        entry = self._pending_routed_blocks.pop(key, None)
         if not (self._track_routed_blocks and success):
             return
         if entry is None:
@@ -1130,66 +1167,77 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
             self,
             request: OpenAIRequest,
             exclude_server: Optional[str] = None) -> tuple[str, dict]:
-        async with self._lock:
-            servers = list([
-                server for server in self._server_state.keys()
-                if server != exclude_server
-            ])
-            if not servers:
-                raise ValueError(
-                    f"No available servers after excluding {exclude_server}")
+        # Standalone (in-process) entry point = routing_key(tokenize+hash) then
+        # the shared _route core -- the SAME core the coordinator path uses.
+        key = await asyncio.to_thread(self._routing_key_sync, request)
+        server, info, _handle = await self._route(key,
+                                                  exclude_server=exclude_server,
+                                                  request=request)
+        return server, info
+
+    def _routing_key_sync(self, request: OpenAIRequest) -> dict:
+        """Tokenize + per-algo block-hash (CPU-bound; run in a thread). Returns a
+        plain dict so the coordinator path can send it over HTTP unchanged."""
         cache_salt_id = self._get_request_cache_salt_id(request)
-        hash_algo_by_server = {
-            server: self._get_server_hash_algo(server)
-            for server in servers
+        # Hash for every algo any server might use (usually one).
+        algos = {
+            self._get_server_hash_algo(s)
+            for s in self._server_state.keys()
+        } or None
+        token_lists, block_hashes_by_algo = \
+            self._tokenize_and_compute_block_hashes_by_algo(
+                request, algos, cache_salt_id)
+        return {
+            "token_lists": token_lists,
+            "block_hashes_by_algo": block_hashes_by_algo,
+            "conv_key": self._content_affinity_key(request)
         }
-        # Tokenize + block-hash is CPU-bound (~50 ms p50 for a 40 k-token
-        # chat request with a Rust-backed tokenizer). Running it directly
-        # inside the async handler blocks the orchestrator's event loop and
-        # serializes all concurrent requests through it; with HuggingFace
-        # tokenizers releasing the GIL, offloading to a thread lets multiple
-        # tokenize calls run in parallel and frees the event loop to
-        # dispatch HTTP traffic to the CTX/GEN workers meanwhile.
-        token_lists, block_hashes_by_algo = await asyncio.to_thread(
-            self._tokenize_and_compute_block_hashes_by_algo, request,
-            hash_algo_by_server.values(), cache_salt_id)
-        # select the server by (KV match - load), bounded by load_cap
+
+    async def _route(self, key, exclude_server=None, request=None, req_id=None):
+        """THE single routing core, shared by the standalone and coordinator
+        paths. Scores each server by (matched_tokens/tokens_per_block -
+        load_weight*load), applies load_cap, conversation affinity and RR
+        tie-break, then registers load + remembers routed blocks. The ONLY
+        difference between the two callers is request identity: standalone passes
+        the request (load keyed by id(request), finished via finish_request);
+        the coordinator passes req_id (the disagg request id) and finishes via
+        finish_request_by_id(req_id). Returns (server, info, req_id-or-None)."""
+        import time as _time
+        _rt_t0 = _time.monotonic()
+        token_lists = (key or {}).get("token_lists") or []
+        block_hashes_by_algo = (key or {}).get("block_hashes_by_algo") or {}
+        conv_key = (key or {}).get("conv_key")
+        async with self._lock:
+            servers = [
+                s for s in self._server_state.keys() if s != exclude_server
+            ]
+        if not servers:
+            raise ValueError(
+                f"No available servers after excluding {exclude_server}")
+
+        def _hashes(server):
+            algo = self._get_server_hash_algo(server)
+            return algo, block_hashes_by_algo.get(algo, [])
+
         workloads = [
-            self._server_state[server].num_active_requests()
-            for server in servers
+            self._server_state[s].num_active_requests() for s in servers
         ]
         load_fractions = [
             workloads[i] / self._max_batch_size for i in range(len(servers))
         ]
-        scores = []
-        matches = []
-        for i in range(len(servers)):
-            server = servers[i]
-            hash_algo = hash_algo_by_server[server]
-            block_hashes = block_hashes_by_algo[hash_algo]
-            # https://github.com/ai-dynamo/dynamo/blob/main/docs/kv_cache_routing.md#kv-cache-routing-and-load-balancing
-            matches.append(await self._server_state[server].matched_tokens(
-                block_hashes, hash_algo))
-            score = matches[-1] / self._tokens_per_block - self._load_weight * \
-                workloads[i]
-            scores.append(score)
-        # Optional hard cap: drop servers at/over load_cap; fall back to all if
-        # none remain. Disabled by default (load_cap=inf) to match the original
-        # score-only selection.
+        scores, matches = [], []
+        for i, server in enumerate(servers):
+            algo, bh = _hashes(server)
+            matches.append(await
+                           self._server_state[server].matched_tokens(bh, algo))
+            scores.append(matches[-1] / self._tokens_per_block -
+                          self._load_weight * workloads[i])
         candidate_idx = [
             i for i, lf in enumerate(load_fractions) if lf < self._load_cap
-        ]
-        if not candidate_idx:
-            candidate_idx = list(range(len(servers)))
-        # Conversation affinity: pin all turns of a conversation (keyed by a
-        # content-derived prefix hash, no conversation-id header) to the server
-        # it first landed on, so a worker eviction shrinking the match score
-        # cannot scatter the conversation off its warm home. New conversations
-        # (no pin yet) fall through to the score, which balances them by load.
+        ] or list(range(len(servers)))
         affinity = getattr(self, "_route_affinity", None)
         if affinity is None:
             affinity = self._route_affinity = OrderedDict()
-        conv_key = self._content_affinity_key(request)
         winner = None
         if conv_key is not None:
             pinned = affinity.get(conv_key)
@@ -1208,32 +1256,86 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
             affinity.move_to_end(conv_key)
             while len(affinity) > ROUTE_AFFINITY_CACHE_SIZE:
                 affinity.popitem(last=False)
-        hash_algo = hash_algo_by_server[server]
-        block_hashes = block_hashes_by_algo[hash_algo]
+        hash_algo, block_hashes = _hashes(server)
+
+        # Same load/routing maps as the standalone path; only the key differs:
+        # id(request) standalone, disagg req_id under the coordinator (the id that
+        # crosses the /finish HTTP hop).
+        key = id(request) if req_id is None else req_id
         async with self._lock:
-            await self._register_request(server, request)
-            self._stash_routed_blocks_on_route(request, block_hashes, hash_algo)
+            await self._server_state[server].increment_load(request)
+            self._req_routing_table[key] = server
+            self._stash_routed_blocks_on_route(key, block_hashes, hash_algo)
+        self._record_route_timing(_time.monotonic() - _rt_t0)
         return server, {
-            "block_hashes": block_hashes,  # list[list[int | str]]
+            "block_hashes": block_hashes,
             "hash_algo": hash_algo,
-            "token_lists": token_lists,  # list[list[int]]
-            "matches": matches,  # list[int]
+            "token_lists": token_lists,
+            "matches": matches,
             "server_info": self._server_info.get(server, {}),
-        }
+        }, req_id
 
     async def finish_request(self,
                              request: OpenAIRequest,
                              session: Optional[aiohttp.ClientSession] = None,
                              success: bool = True):
+        # Standalone entry point: key by id(request); pass request so token-load
+        # accounting matches the increment_load(request) done at route time.
+        await self._finish(id(request),
+                           success,
+                           request=request,
+                           session=session)
+
+    async def _finish(self, key, success, request=None, session=None):
+        """THE single finish core, shared by finish_request (standalone, key =
+        id(request), request passed) and finish_request_by_id (coordinator, key =
+        disagg req_id, request=None -- symmetric with its increment_load(None)).
+        Pops the SAME maps _route filled, decrements load, commits routed blocks
+        on success, and refreshes the block table."""
         async with self._lock:
-            server = self._req_routing_table.pop(id(request), None)
+            server = self._req_routing_table.pop(key, None)
             if server is not None and server in self._server_state:
                 await self._server_state[server].decrement_load(request)
-        self._apply_routed_blocks_on_finish(request, server, success)
+        self._apply_routed_blocks_on_finish(key, server, success)
+        self._poll_server_on_finish(server, session)
+
+    def _poll_server_on_finish(self, server, session=None):
+        """Refresh a server's KV-cache block table from /kv_cache_events after a
+        request finishes. Shared by finish_request (standalone) and
+        finish_request_by_id (coordinator) so the block table always stays warm --
+        the delegated path is inert without this (matches score 0)."""
         if (server is not None and server in self._server_state
                 and self._events_aligned(server)):
             # Fire-and-forget; poll runs in background and coalesces per server.
             self._server_state[server].schedule_poll_and_update(session)
+
+    # ---- coordinator delegation: thin wrappers over the shared _route core ---
+    # The fleet worker computes routing_key() locally; the coordinator (owns
+    # _server_state) runs get_next_server_by_key(). Both use the same _route core
+    # as the standalone get_next_server.
+
+    def routing_key(self, request: OpenAIRequest):
+        """Worker-side: tokenize + block-hash. Same dict _route consumes, JSON-
+        serializable for the /select POST."""
+        return self._routing_key_sync(request)
+
+    async def get_next_server_by_key(self,
+                                     routing_key,
+                                     exclude_server=None,
+                                     req_id=None):
+        """Coordinator-side placement: the SAME _route core, keyed by the
+        caller's disagg request id (req_id) instead of id(request)."""
+        return await self._route(routing_key,
+                                 exclude_server=exclude_server,
+                                 request=None,
+                                 req_id=req_id)
+
+    async def finish_request_by_id(self, req_id, success=True):
+        """Coordinator-side finish: the SAME _finish core, keyed by the disagg
+        request id instead of id(request)."""
+        if req_id is None:
+            return
+        await self._finish(req_id, success)
 
     def _on_servers_updated(self, old_servers, new_servers):
         new_state = {}
@@ -1383,6 +1485,9 @@ class ConversationRouter(BlockHashMixin, LoadBalancingMixin, Router):
         }
         # id(request) -> (server, weight, monotonic_timestamp)
         self._req_content_entry: dict[int, tuple[str, int, float]] = {}
+        # Coordinator-delegated path only: disagg req_id -> server, between
+        # select and finish (id(request) can't cross the HTTP hop).
+        self._coord_pending: dict = {}
 
     # ── content-based load tracking ──
 
@@ -1679,6 +1784,255 @@ class ConversationRouter(BlockHashMixin, LoadBalancingMixin, Router):
             logger.debug(f"ConversationRouter: FINISH server={server}, "
                          f"content_loads={loads}")
 
+    # -- coordinator-path: conversation_id-only sticky routing --
+    # The coordinator has no request object, so per-request load is tracked by an
+    # opaque handle instead of id(request). Only explicit conversation_id sessions
+    # are supported over the coordinator (no implicit content match).
+
+    def routing_key(self, request: OpenAIRequest):
+        """The conversation_id (or None); no tokenization on the worker."""
+        return self._get_conversation_id(request)
+
+    async def get_next_server_by_key(self,
+                                     routing_key,
+                                     exclude_server=None,
+                                     req_id=None):
+        conv_id = routing_key
+        self._validate_servers_available()
+        async with self._lock:
+            entry = self._session_table.get(conv_id) if conv_id else None
+            if (entry is not None and entry[0] in self._server_state
+                    and entry[0] != exclude_server):
+                server = entry[0]
+                self._session_table.move_to_end(conv_id)
+            else:
+                server = self._select_least_loaded(exclude_server)
+                if server is None:
+                    raise ValueError(
+                        f"No available servers after excluding {exclude_server}"
+                    )
+                if conv_id:
+                    self._update_session(conv_id, server, [])
+            # Request-count load (no request object at the coordinator). Keyed by
+            # the disagg req_id -- the sole id crossing the HTTP hop on /finish.
+            self._server_content_load[server] = (
+                self._server_content_load.get(server, 0) + 1)
+            if req_id is not None:
+                self._coord_pending[req_id] = server
+        return server, {
+            "server_info": self._server_info.get(server, {})
+        }, req_id
+
+    async def finish_request_by_id(self, req_id, success=True):
+        del success
+        if req_id is None:
+            return
+        async with self._lock:
+            server = self._coord_pending.pop(req_id, None)
+            if server and server in self._server_content_load:
+                self._server_content_load[server] = max(
+                    0, self._server_content_load[server] - 1)
+
+
+class CoordinatorDelegatingRouter(Router):
+    """Worker-side Router that delegates placement to the disagg coordinator.
+
+    Used only for *stateful* routers (conversation, kv_cache_aware): the worker
+    must not keep its own copy of that state, so it wraps a local router of the same
+    type and, for each request, computes the small ``routing_key`` locally and
+    POSTs it to the coordinator's ``/select``. ``finish_request`` POSTs the
+    returned handle to ``/finish`` so the coordinator releases per-request state.
+    Server-pool / prepare / close operations delegate to the wrapped local router.
+
+    Stateless routers (round_robin, load_balancing) are NOT wrapped -- the worker
+    holds the real router and places locally, so they never reach this class (see
+    ``CoordinatorClient``). ``OpenAIClient`` already drives
+    ``router.get_next_server`` / ``router.finish_request``, so the completions
+    service needs no worker-specific branching.
+    """
+
+    def __init__(self,
+                 coordinator_url: str,
+                 local_router: "Router",
+                 role: str,
+                 request_timeout_s: float = 5.0):
+        # Intentionally NOT calling Router.__init__: this is a thin proxy whose
+        # server-pool state lives on the wrapped local router (see __getattr__).
+        # coordinator_url may be a TCP URL or unix:/path (UDS avoids the TCP
+        # loopback stack for the hot /select,/finish calls). Resolve the request
+        # base URL now; the session (with UnixConnector when applicable) is made
+        # lazily so it binds to the running event loop.
+        from tensorrt_llm.serve.disagg_coordinator import coordinator_base_url
+        self._coordinator_url_raw = coordinator_url
+        self._coordinator_url = coordinator_base_url(coordinator_url)
+        self._local = local_router
+        self._role = role  # "context" | "generation"
+        self._request_timeout_s = request_timeout_s
+        self._session: Optional[aiohttp.ClientSession] = None
+        # Coordinator HTTP-client API latency (includes network round-trip to the
+        # coordinator + its in-process handler). Compare against the owner-side
+        # [coord_api] to isolate the fleet /select|/finish HTTP overhead.
+        from tensorrt_llm.serve.responses_utils import (PeriodicBreakdownLogger,
+                                                        PeriodicLatencyLogger)
+        self._select_lat = PeriodicLatencyLogger(f"client.select[{role}]")
+        self._finish_lat = PeriodicLatencyLogger(f"client.finish[{role}]")
+        # IPC latency breakdown (ms) for the coordinator client<->server round
+        # trip, decomposed via the X-Client-Send/X-Coord-Recv/X-Coord-Send headers
+        # (client + coordinator co-located => wall clock comparable):
+        #   req_wire  : client send  -> coord recv   (request transport + accept)
+        #   handler   : coord recv   -> coord send   (in-coordinator handler work)
+        #   resp_wire : coord send   -> client recv  (response transport)
+        #   rtt       : client send  -> client recv  (total observed round trip)
+        # Aggregated p50/p95 per field every window samples (no per-call logging).
+        self._ipc_fields = [
+            "req_wire_ms", "handler_ms", "resp_wire_ms", "rtt_ms"
+        ]
+        self._select_ipc = PeriodicBreakdownLogger(f"coord_ipc.select[{role}]",
+                                                   self._ipc_fields)
+        self._finish_ipc = PeriodicBreakdownLogger(f"coord_ipc.finish[{role}]",
+                                                   self._ipc_fields)
+
+    def __getattr__(self, name):
+        # servers / prepare_servers / num_prepared_servers / start_server_monitoring
+        # / routing_key / ... all delegate to the local router.
+        return getattr(self._local, name)
+
+    @property
+    def session(self) -> aiohttp.ClientSession:
+        if self._session is None:
+            from tensorrt_llm.serve.disagg_coordinator import \
+                make_coordinator_session
+            self._session = make_coordinator_session(self._coordinator_url_raw)
+        return self._session
+
+    def _on_servers_updated(self, old_servers, new_servers):
+        pass
+
+    def _record_ipc(self, ipc_logger, send_t: float, recv_t: float,
+                    resp) -> None:
+        """Decompose the coordinator round trip from the response timing headers.
+        send_t/recv_t are the client-side wall clocks (co-located => comparable).
+        Missing headers (older coordinator) => that field is dropped by the
+        breakdown logger (records -1). All values in ms."""
+        from tensorrt_llm.serve.coordinator_server import (HDR_COORD_RECV,
+                                                           HDR_COORD_SEND)
+
+        def _f(name):
+            v = resp.headers.get(name)
+            try:
+                return float(v) if v is not None else None
+            except (TypeError, ValueError):
+                return None
+
+        coord_recv = _f(HDR_COORD_RECV)
+        coord_send = _f(HDR_COORD_SEND)
+        ipc_logger.record({
+            "req_wire_ms": (coord_recv - send_t) * 1000 if coord_recv else -1.0,
+            "handler_ms": (coord_send - coord_recv) * 1000 if
+            (coord_recv and coord_send) else -1.0,
+            "resp_wire_ms":
+            (recv_t - coord_send) * 1000 if coord_send else -1.0,
+            "rtt_ms": (recv_t - send_t) * 1000,
+        })
+
+    def _request_id(self, request: OpenAIRequest) -> int:
+        """The request's disagg id -- the sole cross-process key for select/finish.
+        Context requests carry disagg_request_id; generation requests inherit the
+        SAME id as ctx_request_id (set by OpenAIDisaggregatedService before
+        routing). This id is what the ctx worker registered its KV-transfer
+        TxSession under, so the gen request MUST keep it -- never re-issue a new
+        id here, or the gen transceiver waits on a key the ctx side never
+        registered (transfer never completes -> DISAGG_GENERATION_TRANS_IN_PROGRESS
+        fills the gen IndexMapper and throughput collapses)."""
+        dp = request.disaggregated_params
+        assert dp is not None, "delegated routing requires disaggregated_params"
+        rid = (dp.disagg_request_id
+               if self._role == "context" else dp.ctx_request_id)
+        assert rid is not None, (
+            f"delegated {self._role} routing requires a disagg request id "
+            f"(disagg_request_id/ctx_request_id) on the request")
+        return rid
+
+    async def get_next_server(
+            self,
+            request: OpenAIRequest,
+            exclude_server: Optional[str] = None) -> tuple[str, dict]:
+        # routing_key() tokenizes + block-hashes the prompt (CPU-bound for
+        # kv_cache_aware); run it in a thread so it doesn't block the fleet worker
+        # event loop driving the concurrent streams.
+        key = await asyncio.to_thread(self._local.routing_key, request)
+        # Send the request's existing disagg id as the cross-process key (the
+        # coordinator keys pending state by it for /finish); placement must not
+        # change it, since the ctx<->gen KV transfer is keyed by it.
+        payload = {
+            "role": self._role,
+            "routing_key": key,
+            "req_id": self._request_id(request),
+            "exclude_server": exclude_server
+        }
+        # orjson.dumps (bytes) instead of aiohttp json= (stdlib dumps): the
+        # routing_key is hundreds of int64, and this is the hot fleet->coordinator
+        # call. Parse the response with orjson too. X-Client-Send-Time (wall clock)
+        # lets the coordinator echo timing headers back for the IPC breakdown.
+        from tensorrt_llm.serve.coordinator_server import HDR_CLIENT_SEND
+        _t0 = time.monotonic()
+        _send_wall = time.time()
+        hdrs = {**_JSON_HEADERS, HDR_CLIENT_SEND: repr(_send_wall)}
+        async with self.session.post(f"{self._coordinator_url}/select",
+                                     data=orjson.dumps(payload),
+                                     headers=hdrs,
+                                     timeout=self._request_timeout_s) as resp:
+            if resp.status != 200:
+                raise ValueError(f"coordinator /select returned {resp.status}: "
+                                 f"{await resp.text()}")
+            body = orjson.loads(await resp.read())
+            self._record_ipc(self._select_ipc, _send_wall, time.time(), resp)
+        self._select_lat.record(time.monotonic() - _t0)
+        info = body.get("info") or {}
+        return body["server"], info
+
+    async def finish_request(self,
+                             request: OpenAIRequest,
+                             session: Optional[aiohttp.ClientSession] = None,
+                             success: bool = True):
+        # Fire-and-forget: /finish only releases the coordinator's routed-load
+        # bookkeeping, so run it as a background task instead of awaiting the HTTP
+        # round trip on every request's critical path. Capture req_id first (the
+        # request may be freed after return); errors are logged, not propagated.
+        del session
+        req_id = self._request_id(request)
+        asyncio.create_task(self._finish_async(req_id, success))
+
+    async def _finish_async(self, req_id: int, success: bool):
+        from tensorrt_llm.serve.coordinator_server import HDR_CLIENT_SEND
+        _t0 = time.monotonic()
+        _send_wall = time.time()
+        hdrs = {**_JSON_HEADERS, HDR_CLIENT_SEND: repr(_send_wall)}
+        try:
+            async with self.session.post(
+                    f"{self._coordinator_url}/finish",
+                    data=orjson.dumps({
+                        "role": self._role,
+                        "req_id": req_id,
+                        "success": success
+                    }),
+                    headers=hdrs,
+                    timeout=self._request_timeout_s) as resp:
+                if resp.status != 200:
+                    logger.warning(
+                        f"coordinator /finish returned {resp.status}")
+                self._record_ipc(self._finish_ipc, _send_wall, time.time(),
+                                 resp)
+            self._finish_lat.record(time.monotonic() - _t0)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"CoordinatorDelegatingRouter finish failed: {e}")
+
+    async def close(self):
+        if self._session is not None:
+            await self._session.close()
+            self._session = None
+        await self._local.close()
+
 
 def create_router(
     router_config: Optional[RouterConfig],
@@ -1725,3 +2079,35 @@ def create_router(
                         metadata_server,
                         server_preparation_func=server_preparation_func,
                         **extra_args)
+
+
+def build_disagg_routers(
+    ctx_router_config: Optional[RouterConfig],
+    gen_router_config: Optional[RouterConfig],
+    ctx_servers: Optional[List[str]],
+    gen_servers: Optional[List[str]],
+    metadata_server_cfg: Optional[MetadataServerConfig] = None,
+    metadata_server: Optional[JsonDictionary] = None,
+    server_preparation_func: Optional[Callable[[str], Awaitable[None]]] = None,
+    disagg_node_id: int = 0,
+    is_delegating_client: bool = False,
+) -> tuple[Router, Router]:
+    """Build the ctx and gen routers for one disagg process.
+
+    Each side is built independently via :func:`create_router`. Stateful router
+    types (conversation, kv_cache_aware) expose ``routing_key`` /
+    ``get_next_server_by_key``; when this process is a delegating client, the
+    caller (:class:`CoordinatorClient`) wraps those in a
+    :class:`CoordinatorDelegatingRouter` so placement is delegated to the
+    coordinator. Stateless types (round_robin, load_balancing) place locally.
+    ``is_delegating_client`` is accepted for call-site symmetry; router
+    construction itself does not depend on it.
+    """
+    del is_delegating_client  # no build-time behavior differs by this flag
+    ctx_router = create_router(ctx_router_config, ctx_servers,
+                               metadata_server_cfg, metadata_server,
+                               server_preparation_func, disagg_node_id)
+    gen_router = create_router(gen_router_config, gen_servers,
+                               metadata_server_cfg, metadata_server,
+                               server_preparation_func, disagg_node_id)
+    return ctx_router, gen_router

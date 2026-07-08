@@ -200,29 +200,46 @@ def test_get_server_configs_dict():
                          ids=["multithread", "singlethread"])
 def test_get_global_disagg_request_id(multithread):
     iter = 10000
-    node_ids = list(range(10))
-    thread_num = len(node_ids)
+    # (node_id, process_id) pairs — the pair uniquely identifies a fleet worker.
+    # Mix of distinct nodes and distinct processes on the same node.
+    worker_ids = [(0, 0), (0, 1), (1, 0), (1, 1), (2, 0), (3, 5), (7, 2),
+                  (10, 0), (10, 3), (255, 63)]
+    thread_num = len(worker_ids)
 
-    def get_ids(node_ids):
-        all_node_ids = [[] for _ in range(len(node_ids))]
+    def get_ids(worker_ids):
+        all_ids = [[] for _ in range(len(worker_ids))]
         for i in range(iter):
             if i % (4000 // thread_num) == 0:
                 time.sleep(0.001)
-            for i, node_id in enumerate(node_ids):
-                all_node_ids[i].append(get_global_disagg_request_id(node_id))
-        return all_node_ids
+            for j, (node_id, process_id) in enumerate(worker_ids):
+                all_ids[j].append(
+                    get_global_disagg_request_id(node_id, process_id))
+        return all_ids
 
     if multithread:
-        with ThreadPoolExecutor(max_workers=len(node_ids)) as executor:
-            all_node_ids = [
-                ids[0] for ids in executor.map(get_ids, [[i] for i in node_ids])
+        with ThreadPoolExecutor(max_workers=len(worker_ids)) as executor:
+            all_worker_ids = [
+                ids[0]
+                for ids in executor.map(get_ids, [[w] for w in worker_ids])
             ]
     else:
-        all_node_ids = get_ids(node_ids)
+        all_worker_ids = get_ids(worker_ids)
 
-    all_ids = set(i for ids in all_node_ids for i in ids)
-    assert len(all_ids) == iter * len(node_ids)
+    all_ids = set(i for ids in all_worker_ids for i in ids)
+    # Each (node_id, process_id) worker's ids must be globally unique across all.
+    assert len(all_ids) == iter * len(worker_ids)
     assert all(id >= MIN_GLOBAL_ID and id < ((1 << 63) - 1) for id in all_ids)
+
+
+def test_get_global_disagg_request_id_range_validation():
+    # node_id: 8 bits [0,256); process_id: 6 bits [0,64).
+    with pytest.raises(ValueError):
+        get_global_disagg_request_id(256, 0)
+    with pytest.raises(ValueError):
+        get_global_disagg_request_id(0, 64)
+    # valid extremes
+    assert get_global_disagg_request_id(255, 63) >= MIN_GLOBAL_ID
+    assert get_global_disagg_request_id(0, 0) >= MIN_GLOBAL_ID
 
 
 def test_get_local_request_id():

@@ -1,4 +1,5 @@
 import asyncio
+import atexit
 import gc
 import importlib
 import inspect
@@ -9,6 +10,7 @@ import signal
 import socket
 import subprocess  # nosec B404
 import sys
+import time
 import uuid
 from pathlib import Path
 from typing import Any, Dict, Optional, Sequence, Set
@@ -1643,6 +1645,35 @@ def disaggregated(
 
     logger.info(f"Reserving disaggregated server address "
                 f"{disagg_cfg.hostname}:{disagg_cfg.port} (pid={os.getpid()})")
+    metadata_server_cfg = parse_metadata_server_config_file(
+        metadata_server_config_file)
+
+    # Topology from explicit config (num_workers + disagg_coordinator_url):
+    # (a) url set -> delegate to that external coordinator; (b) url absent,
+    # num_workers>1 -> implicit in-process coordinator + delegating fleet;
+    # (c) url absent, num_workers==1 -> single self-contained server.
+    num_workers = disagg_cfg.num_workers
+    coordinator_url = disagg_cfg.disagg_coordinator_url
+
+    if coordinator_url:
+        # (a) External coordinator: fork a fleet of delegating servers (or a
+        # single one) pointed at it; never start a coordinator in this process.
+        _serve_disagg_fleet(disagg_cfg, config_file,
+                            metadata_server_config_file, request_timeout,
+                            server_start_timeout, num_workers, coordinator_url)
+        return
+
+    if num_workers > 1:
+        # (b) Implicit coordinator in this process (on port-1) + a delegating
+        # uvicorn fleet (workers=N) on the public port. See below.
+        _serve_coordinator_and_fleet(disagg_cfg, config_file,
+                                     metadata_server_config_file,
+                                     metadata_server_cfg, request_timeout,
+                                     server_start_timeout, num_workers)
+        return
+
+    # (c) num_workers==1, no external coordinator: a single disagg server with an
+    # in-process (local) coordinator. Pre-bind the socket (validates port), serve.
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         try:
             s.bind((disagg_cfg.hostname, disagg_cfg.port))
@@ -1655,9 +1686,6 @@ def disaggregated(
             raise RuntimeError(
                 f"Failed to bind socket to {disagg_cfg.hostname}:{disagg_cfg.port}: {e}. "
                 f"Port holder(s): {holder}")
-
-        metadata_server_cfg = parse_metadata_server_config_file(
-            metadata_server_config_file)
 
         server = OpenAIDisaggServer(
             config=disagg_cfg,
@@ -1680,6 +1708,256 @@ def disaggregated(
             gc.disable()
 
         uvloop.run(server(disagg_cfg.hostname, disagg_cfg.port, sockets=[s]))
+
+
+def _launch_disagg_fleet(disagg_cfg, config_file, metadata_server_config_file,
+                         request_timeout, server_start_timeout, num_workers,
+                         coordinator_url):
+    """Launch ``num_workers`` delegating disagg servers (each its own ``Popen``
+    running ``_run_fleet_worker``) on the shared public port, pointed at
+    ``coordinator_url``. Separate Popens (not ``uvicorn --workers N``) so each gets
+    an explicit per-worker TLLM_DISAGG_WORKER_PROCESS_ID and binds its own
+    SO_REUSEPORT socket for kernel-balanced connections. MPI/PMIX/SLURM env is
+    stripped (workers are plain HTTP processes). Returns the list of Popen handles.
+    """
+    from tensorrt_llm.llmapi.disagg_utils import disagg_process_id_space
+    public_host, public_port = disagg_cfg.hostname, disagg_cfg.port
+    base_env = {
+        k: v
+        for k, v in os.environ.items()
+        if not k.startswith(("SLURM_", "PMIX_", "PMI_", "OMPI_", "UCX_",
+                             "I_MPI_", "HYDRA_", "MPI_"))
+    }
+    # num_workers is explicit config now; ensure no stale WEB_CONCURRENCY leaks in
+    # and re-forks each plain-HTTP worker into a nested fleet.
+    base_env.pop("WEB_CONCURRENCY", None)
+    base_env[DisaggWorkerEnvs.TLLM_DISAGG_COORDINATOR_URL] = coordinator_url
+    base_env[DisaggWorkerEnvs.TLLM_DISAGG_CONFIG_FILE] = os.path.abspath(
+        config_file)
+    if metadata_server_config_file:
+        base_env[DisaggWorkerEnvs.TLLM_DISAGG_METADATA_CONFIG_FILE] = \
+            os.path.abspath(metadata_server_config_file)
+    base_env[DisaggWorkerEnvs.TLLM_DISAGG_REQUEST_TIMEOUT] = str(
+        request_timeout)
+    base_env[DisaggWorkerEnvs.TLLM_DISAGG_SERVER_START_TIMEOUT] = str(
+        server_start_timeout)
+    # Propagate the parent's log level so fleet workers' INFO logs (e.g. the
+    # per-request [ttft_split] / [coord_api] breakdowns) are not dropped.
+    base_env[DisaggWorkerEnvs.TLLM_DISAGG_LOG_LEVEL] = logger.level
+
+    cmd = [
+        sys.executable, "-c",
+        "from tensorrt_llm.commands.serve import _run_fleet_worker; "
+        "_run_fleet_worker()"
+    ]
+    logger.info(
+        f"Launching disagg fleet: {num_workers} SO_REUSEPORT workers on "
+        f"{public_host}:{public_port}, coordinator={coordinator_url}")
+
+    procid_space = disagg_process_id_space()
+    fleet = []
+    for i in range(num_workers):
+        worker_env = dict(base_env)
+        # Explicit per-worker process index (no shared counter file). Wrap into
+        # the snowflake process_id space so ids stay in the 6-bit field.
+        worker_env[DisaggWorkerEnvs.TLLM_DISAGG_WORKER_PROCESS_ID] = str(
+            i % procid_space)
+        p = subprocess.Popen(cmd,
+                             env=worker_env,
+                             stdout=sys.stdout,
+                             stderr=sys.stderr,
+                             start_new_session=True)
+        logger.info(f"Disagg fleet worker {i} launched (pid={p.pid})")
+        fleet.append(p)
+
+    def _cleanup():
+        for p in fleet:
+            if p.poll() is None:
+                p.terminate()
+        for p in fleet:
+            try:
+                p.wait(timeout=10)
+            except Exception:
+                p.kill()
+
+    atexit.register(_cleanup)
+    return fleet
+
+
+def _serve_disagg_fleet(disagg_cfg, config_file, metadata_server_config_file,
+                        request_timeout, server_start_timeout, num_workers,
+                        coordinator_url):
+    """External coordinator: fork the delegating fleet and block on it.
+
+    No coordinator is started in this process -- the fleet delegates to the
+    already-running coordinator at ``coordinator_url``.
+    """
+    fleet = _launch_disagg_fleet(disagg_cfg, config_file,
+                                 metadata_server_config_file, request_timeout,
+                                 server_start_timeout, num_workers,
+                                 coordinator_url)
+    # Block until any worker exits; a nonzero exit from any worker is a failure.
+    while True:
+        for i, p in enumerate(fleet):
+            rc = p.poll()
+            if rc is not None:
+                if rc != 0:
+                    raise RuntimeError(
+                        f"Disagg fleet worker {i} (pid={p.pid}) exited with "
+                        f"code {rc}")
+                # A clean exit of one worker ends the fleet.
+                return
+        time.sleep(1)
+
+
+def _serve_coordinator_and_fleet(disagg_cfg, config_file,
+                                 metadata_server_config_file,
+                                 metadata_server_cfg, request_timeout,
+                                 server_start_timeout, num_workers):
+    """workers>1, no external URL: coordinator server here + a delegating fleet.
+
+    This process runs the coordinator server (owns the ctx/gen routers, cluster
+    state, and centralized ZMQ ingest) on ``port-1``; a uvicorn fleet on the
+    public port delegates to it.
+    """
+    from tensorrt_llm.serve.coordinator_server import CoordinatorServer
+    from tensorrt_llm.serve.disagg_coordinator import DisaggCoordinatorService
+
+    public_host, public_port = disagg_cfg.hostname, disagg_cfg.port
+    coord_port = int(
+        os.environ.get(DisaggWorkerEnvs.TLLM_DISAGG_COORDINATOR_PORT,
+                       public_port - 1))
+    # The fleet is co-located with the implicit coordinator, so route its hot
+    # /select,/finish over a Unix domain socket (avoids the TCP loopback stack
+    # that dominated per-request latency). Opt-out via the UDS env = "0".
+    use_uds = os.environ.get(DisaggWorkerEnvs.TLLM_DISAGG_COORDINATOR_UDS,
+                             "1") == "1"
+    coord_uds = (
+        f"/tmp/trtllm_disagg_coord_{public_port}.sock"  # nosec B108
+        if use_uds else None)
+    # Fleet points at the UDS when enabled; the TCP port stays up for health.
+    coord_url = f"unix:{coord_uds}" if coord_uds else \
+        f"http://{public_host}:{coord_port}"
+
+    # 1. Launch the delegating fleet pointed at the implicit coordinator we start
+    #    below (port-1 for TCP; UDS for the hot path). Workers hold
+    #    CoordinatorClients (no core), so they can't race the ZMQ ingest bind.
+    _launch_disagg_fleet(disagg_cfg, config_file, metadata_server_config_file,
+                         request_timeout, server_start_timeout, num_workers,
+                         coord_url)
+
+    # 2. Build + serve the coordinator in this process. It OWNS routing state and
+    #    builds the owner routers itself (single shared namespace-aware core + ONE
+    #    ZMQ ingest server, started once here).
+    def _client_factory(router, role, max_retries=1):
+        from tensorrt_llm.serve.openai_client import OpenAIHttpClient
+        return OpenAIHttpClient(router, role, request_timeout, max_retries)
+
+    coordinator = DisaggCoordinatorService(
+        disagg_cfg,
+        _client_factory,
+        metadata_config=metadata_server_cfg,
+        server_start_timeout_secs=server_start_timeout)
+    logger.info(f"Coordinator serving on {public_host}:{coord_port} "
+                f"(uds={coord_uds}) (fleet on public port {public_port})")
+    asyncio.run(
+        CoordinatorServer(coordinator)(public_host, coord_port, uds=coord_uds))
+
+
+def _init_fleet_worker_process():
+    """Per-process setup shared by every fleet worker (one OS process each).
+
+    Restores logging/GC state for the fresh ``python -c`` interpreter and tags
+    every log line with this worker's PID so the shared-stdout fleet output stays
+    attributable."""
+    # A worker is a plain HTTP process, never an MPI rank; drop WEB_CONCURRENCY so
+    # it is never itself re-forked into multiple uvicorn workers.
+    os.environ.pop("WEB_CONCURRENCY", None)
+    if os.getenv("TRTLLM_DISAGG_SERVER_DISABLE_GC", "1") == "1":
+        gc.disable()
+
+    # This is a fresh Python process, so the TRT-LLM logger defaults to WARNING
+    # and would drop the workers' INFO logs (per-request [ttft_split] /
+    # [coord_api]). Restore the parent's level.
+    _worker_log_level = os.environ.get(DisaggWorkerEnvs.TLLM_DISAGG_LOG_LEVEL)
+    if _worker_log_level:
+        logger.set_level(_worker_log_level)
+
+    # All N fleet workers share one stdout; tag every trtllm log line from this
+    # worker with its PID so interleaved fleet output is attributable.
+    import logging as _logging
+    for _h in _logging.getLogger("TRT-LLM").handlers:
+        _h.setFormatter(
+            _logging.Formatter(
+                fmt=
+                f"[%(asctime)s] [fleet-worker pid={os.getpid()}] %(message)s",
+                datefmt="%m/%d/%Y-%H:%M:%S"))
+
+
+def _build_disagg_server_from_env() -> "OpenAIDisaggServer":
+    """Build one delegating disagg server from the env the launcher exported.
+
+    Fully stateless -- reads config + coordinator URL from ``DisaggWorkerEnvs``;
+    the server holds a remote ``CoordinatorClient`` so routing/readiness are
+    delegated to the coordinator. The worker's process index (for the snowflake
+    disagg-id) is read from ``TLLM_DISAGG_WORKER_PROCESS_ID``, which the launcher
+    set explicitly per worker (see ``worker_local_process_id``)."""
+    config_file = os.environ[DisaggWorkerEnvs.TLLM_DISAGG_CONFIG_FILE]
+    coordinator_url = os.environ[DisaggWorkerEnvs.TLLM_DISAGG_COORDINATOR_URL]
+    metadata_config_file = os.environ.get(
+        DisaggWorkerEnvs.TLLM_DISAGG_METADATA_CONFIG_FILE)
+    request_timeout = int(
+        os.environ.get(DisaggWorkerEnvs.TLLM_DISAGG_REQUEST_TIMEOUT, "180"))
+    server_start_timeout = int(
+        os.environ.get(DisaggWorkerEnvs.TLLM_DISAGG_SERVER_START_TIMEOUT,
+                       "180"))
+
+    disagg_cfg = parse_disagg_config_file(config_file)
+    metadata_server_cfg = parse_metadata_server_config_file(
+        metadata_config_file)
+
+    server = OpenAIDisaggServer(config=disagg_cfg,
+                                req_timeout_secs=request_timeout,
+                                server_start_timeout_secs=server_start_timeout,
+                                metadata_server_cfg=metadata_server_cfg,
+                                coordinator_url=coordinator_url)
+    logger.info(f"Disagg server built, coordinator={coordinator_url}")
+    return server
+
+
+def create_disagg_server_app():
+    """uvicorn import-string factory: build one disagg server's FastAPI app.
+
+    Retained for the ``uvicorn --factory`` entry point; the SO_REUSEPORT fleet
+    launcher uses ``_run_fleet_worker`` instead."""
+    _init_fleet_worker_process()
+    return _build_disagg_server_from_env().app
+
+
+def _run_fleet_worker():
+    """Entry point for a single fleet worker (one OS process per worker), launched
+    as its own ``Popen`` so it takes an explicit TLLM_DISAGG_WORKER_PROCESS_ID and
+    binds its own SO_REUSEPORT socket to the shared public port (the kernel then
+    4-tuple-hashes connections across workers instead of the unfair shared-socket
+    accept() of ``uvicorn --workers N``)."""
+    _init_fleet_worker_process()
+    server = _build_disagg_server_from_env()
+    host, port = server._config.hostname, server._config.port
+
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    # SO_REUSEPORT: every worker binds the same (host, port); the kernel spreads
+    # connections across the workers' accept queues by 4-tuple hash.
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+    try:
+        s.bind((host, port))
+    except OSError as e:
+        raise RuntimeError(
+            f"Fleet worker failed to SO_REUSEPORT-bind {host}:{port}: {e}")
+    pidx = os.environ.get(DisaggWorkerEnvs.TLLM_DISAGG_WORKER_PROCESS_ID, "0")
+    logger.info(f"Fleet worker process_id={pidx} bound {host}:{port} "
+                f"(SO_REUSEPORT)")
+    asyncio.run(server(host, port, sockets=[s]))
 
 
 def set_cuda_device():
@@ -1777,6 +2055,28 @@ class DisaggLauncherEnvs(StrEnum):
     TLLM_DISAGG_RUN_REMOTE_MPI_SESSION_CLIENT = "TLLM_DISAGG_RUN_REMOTE_MPI_SESSION_CLIENT"
     TLLM_DISAGG_DEPLOYMENT_ID = "TRTLLM_DISAGG_DEPLOYMENT_ID"
     TLLM_DISAGG_ROLE = "TRTLLM_DISAGG_ROLE"
+
+
+class DisaggWorkerEnvs(StrEnum):
+    # Passed from the `disaggregated` coordinator to the fleet of worker processes
+    # (one Popen per worker) via env, then read by _run_fleet_worker in each worker.
+    TLLM_DISAGG_COORDINATOR_URL = "TRTLLM_DISAGG_COORDINATOR_URL"
+    TLLM_DISAGG_CONFIG_FILE = "TRTLLM_DISAGG_CONFIG_FILE"
+    TLLM_DISAGG_METADATA_CONFIG_FILE = "TRTLLM_DISAGG_METADATA_CONFIG_FILE"
+    TLLM_DISAGG_REQUEST_TIMEOUT = "TRTLLM_DISAGG_REQUEST_TIMEOUT"
+    TLLM_DISAGG_SERVER_START_TIMEOUT = "TRTLLM_DISAGG_SERVER_START_TIMEOUT"
+    # Parent's logger level; the forked uvicorn fleet is a fresh process that
+    # otherwise defaults to WARNING and drops the workers' INFO logs.
+    TLLM_DISAGG_LOG_LEVEL = "TRTLLM_DISAGG_LOG_LEVEL"
+    # Coordinator transport (read in _serve_coordinator_and_fleet): PORT overrides
+    # the coordinator TCP port (default public_port-1); UDS="1" (default) routes the
+    # co-located fleet's hot /select,/finish over a Unix domain socket, "0" for TCP.
+    TLLM_DISAGG_COORDINATOR_PORT = "TRTLLM_DISAGG_COORDINATOR_PORT"
+    TLLM_DISAGG_COORDINATOR_UDS = "TRTLLM_DISAGG_COORDINATOR_UDS"
+    # Per-fleet-worker process index (0..N-1) → the snowflake disagg-id process_id
+    # field so co-located workers never collide; the launcher sets one distinct
+    # value per worker Popen (see worker_local_process_id). Defaults to 0 if unset.
+    TLLM_DISAGG_WORKER_PROCESS_ID = "TRTLLM_DISAGG_WORKER_PROCESS_ID"
 
 
 def _launch_disaggregated_server(disagg_config_file: str, llm_args: dict):
