@@ -505,9 +505,17 @@ class TestArenaPoolGroup(unittest.TestCase):
             for s in slots:
                 group.release(s)
             group.free_sequence(rng, CachedCudaEvent.NULL)
+            # The fenced drain parks the range still mapped (freed-range
+            # adoption): pages stay charged but become retained/spillable.
             self.assertEqual(group.drain_reclaim(CachedCudaEvent.NULL), 1)
+            self.assertEqual(group.mapped_pages, 6)
+            self.assertEqual(self.budget.used_pages, 6)
+            self.assertEqual(self.budget.retained_pages, 6)
+            # Pressure spill actually unmaps and releases.
+            self.assertEqual(group.spill_retained(1 << 62), 6)
             self.assertEqual(group.mapped_pages, 0)
             self.assertEqual(self.budget.used_pages, 0)
+            self.assertEqual(self.budget.retained_pages, 0)
         finally:
             group.destroy()
 
@@ -542,10 +550,12 @@ class TestArenaPoolGroup(unittest.TestCase):
             self.assertEqual(group.drain_reclaim(), 0)
             self.assertEqual(group.drain_reclaim(None), 0)
             self.assertGreater(group.mapped_pages, 0)
-            # Assign-only fence, then an unfenced drain may reclaim.
+            # Assign-only fence, then an unfenced drain may reclaim (into the
+            # parked/adoptable pool — pages stay mapped until spilled).
             group.fence_pending_frees(CachedCudaEvent.NULL)
             self.assertEqual(group.drain_reclaim(), 1)
-            self.assertEqual(group.mapped_pages, 0)
+            self.assertGreater(group.mapped_pages, 0)
+            group.spill_retained(1 << 62)
         finally:
             group.destroy()
 
@@ -554,9 +564,10 @@ class TestArenaPoolGroup(unittest.TestCase):
 
         ``drain_reclaim(wait=True)`` blocks on a
         pending gate event (e.g. a suspend-evacuation copy still in flight)
-        and reclaims in the same call. The scheduler's mid-pass eviction path
-        depends on this — a non-waiting drain skips the range, the freed
-        pages stay charged, and a fully suspended batch deadlocks.
+        and processes the range in the same call (parking it for adoption).
+        The scheduler's mid-pass eviction path depends on this — a
+        non-waiting drain skips the range, the freed pages stay charged and
+        unadoptable, and a fully suspended batch deadlocks.
         """
         group = self._group()
         try:
@@ -574,9 +585,12 @@ class TestArenaPoolGroup(unittest.TestCase):
             group.free_sequence(rng, CachedCudaEvent.NULL)
             # Pending gate: the plain drain skips the range...
             self.assertEqual(group.drain_reclaim(CachedCudaEvent.NULL), 0)
-            # ...and the blocking drain waits it out and reclaims.
+            # ...and the blocking drain waits it out and parks it (freed-range
+            # adoption keeps the pages mapped; retained = spillable/adoptable).
             self.assertEqual(group.drain_reclaim(CachedCudaEvent.NULL, wait=True), 1)
             self.assertTrue(ev.query_complete())
+            self.assertEqual(self.budget.used_pages, self.budget.retained_pages)
+            group.spill_retained(1 << 62)
             self.assertEqual(group.mapped_pages, 0)
             self.assertEqual(self.budget.used_pages, 0)
         finally:
@@ -607,6 +621,8 @@ class TestArenaPoolGroup(unittest.TestCase):
             self.assertEqual(group.drain_reclaim(None, wait=True), 0)
             self.assertGreater(group.mapped_pages, 0)
             self.assertEqual(group.drain_reclaim(CachedCudaEvent.NULL, wait=True), 1)
+            # Both processed ranges are parked for adoption; spill releases.
+            group.spill_retained(1 << 62)
             self.assertEqual(group.mapped_pages, 0)
         finally:
             group.destroy()
@@ -628,6 +644,76 @@ class TestArenaPoolGroup(unittest.TestCase):
             with self.assertRaises(MemoryError):
                 group.reserve_sequence(1)
             group.free_sequence(rng, CachedCudaEvent.NULL)
+            group.drain_reclaim(CachedCudaEvent.NULL)
+        finally:
+            group.destroy()
+
+    def test_adoption_reuses_parked_range_without_new_maps(self) -> None:
+        """Freed-range adoption: parked ranges are reused without new maps.
+
+        A fenced-drained range is handed whole to
+        the next reservation — same base, mapped prefix intact, zero new
+        cuMemMap calls (the anti-churn fix for the driver TLB interference
+        IMA — WORK_LOG 2026-07-07).
+        """
+        group = self._group()
+        try:
+            rng = group.reserve_sequence(4)
+            self.assertEqual(group.ensure_mapped(rng, 4), 6)  # 4 + 2 pages
+            base = rng.base_block
+            group.free_sequence(rng, CachedCudaEvent.NULL)
+            self.assertEqual(group.drain_reclaim(CachedCudaEvent.NULL), 1)
+            self.assertEqual(self.budget.retained_pages, 6)
+            adopted = group.reserve_sequence(4)
+            self.assertEqual(adopted.base_block, base)
+            self.assertEqual(self.budget.retained_pages, 0)  # charge kept, not retained
+            self.assertEqual(self.budget.used_pages, 6)
+            # the mapped prefix carries over: nothing new to map
+            self.assertEqual(group.ensure_mapped(adopted, 4), 0)
+            self.assertEqual(group.mapped_pages, 6)
+            group.free_sequence(adopted, CachedCudaEvent.NULL)
+            group.drain_reclaim(CachedCudaEvent.NULL)
+        finally:
+            group.destroy()
+
+    def test_adoption_skips_unfit_and_unready_ranges(self) -> None:
+        group = self._group()
+        try:
+            rng = group.reserve_sequence(2)
+            group.ensure_mapped(rng, 2)
+            base = rng.base_block
+            group.free_sequence(rng, CachedCudaEvent.NULL)
+            # not drained yet -> nothing parked -> fresh VA
+            bigger = group.reserve_sequence(4)
+            self.assertNotEqual(bigger.base_block, base)
+            self.assertEqual(group.drain_reclaim(CachedCudaEvent.NULL), 1)
+            # parked, but too small for 4 blocks -> fresh VA again
+            another = group.reserve_sequence(4)
+            self.assertNotEqual(another.base_block, base)
+            # fits a 2-block request -> adopted
+            fit = group.reserve_sequence(2)
+            self.assertEqual(fit.base_block, base)
+            for r in (bigger, another, fit):
+                group.free_sequence(r, CachedCudaEvent.NULL)
+            group.drain_reclaim(CachedCudaEvent.NULL)
+        finally:
+            group.destroy()
+
+    def test_adoption_disabled_restores_unmap_on_drain(self) -> None:
+        group = self._group()
+        group._range_adoption = False
+        try:
+            rng = group.reserve_sequence(4)
+            group.ensure_mapped(rng, 4)
+            base = rng.base_block
+            group.free_sequence(rng, CachedCudaEvent.NULL)
+            self.assertEqual(group.drain_reclaim(CachedCudaEvent.NULL), 1)
+            self.assertEqual(group.mapped_pages, 0)
+            self.assertEqual(self.budget.used_pages, 0)
+            fresh = group.reserve_sequence(4)
+            self.assertEqual(fresh.base_block, base)  # allocator reuse, unmapped
+            self.assertEqual(group.ensure_mapped(fresh, 4), 6)  # must remap
+            group.free_sequence(fresh, CachedCudaEvent.NULL)
             group.drain_reclaim(CachedCudaEvent.NULL)
         finally:
             group.destroy()
@@ -665,6 +751,9 @@ class TestGpuArenaCacheLevelStorage(unittest.TestCase):
             g0.free_sequence(r0, CachedCudaEvent.NULL)
             g1.free_sequence(r1, CachedCudaEvent.NULL)
             self.assertEqual(storage.drain_reclaim(CachedCudaEvent.NULL), 2)
+            # both ranges parked for adoption; spill returns the pages
+            self.assertEqual(storage.page_budget.used_pages, storage.page_budget.retained_pages)
+            storage.spill_retained(1 << 62)
             self.assertEqual(storage.page_budget.used_pages, 0)
         finally:
             storage.destroy()
@@ -846,6 +935,8 @@ class TestStorageManagerArenaMode(unittest.TestCase):
         storage.release_slot(self.LC0, GPU_LEVEL, slot)
         storage.free_gpu_sequence(self.PG0, rng, CachedCudaEvent.NULL)
         self.assertEqual(storage.drain_gpu_reclaim(CachedCudaEvent.NULL), 1)
+        self.assertEqual(budget.used_pages, budget.retained_pages)  # parked
+        storage.spill_gpu_retained(1 << 62)
         self.assertEqual(budget.used_pages, 0)
 
     def test_offload_migrates_data_and_gates_reclaim(self) -> None:
@@ -875,6 +966,8 @@ class TestStorageManagerArenaMode(unittest.TestCase):
         # the vacated arena slots returned to the range: reclaim succeeds
         storage.free_gpu_sequence(self.PG0, rng, CachedCudaEvent.NULL)
         self.assertEqual(storage.drain_gpu_reclaim(CachedCudaEvent.NULL), 1)
+        self.assertEqual(storage.gpu_page_budget.used_pages, storage.gpu_page_budget.retained_pages)
+        storage.spill_gpu_retained(1 << 62)
         self.assertEqual(storage.gpu_page_budget.used_pages, 0)
         for page in pages:
             storage.release_slot(self.LC0, CacheLevel(1), page)
@@ -1036,6 +1129,8 @@ class TestArenaKVCacheManagerEndToEnd(unittest.TestCase):
         s.take_finish_event().synchronize()
         # copy-on-free write-out finished -> the range is reclaimable
         self.assertEqual(manager.drain_gpu_reclaim(CachedCudaEvent.NULL), 1)
+        # ranges park for adoption on drain; spill to assert full release
+        manager._storage.spill_gpu_retained(1 << 62)
         self.assertEqual(budget.used_pages, 0)
         # the 4 committed blocks live on in the host tier
         host_stats = manager._storage.get_statistics(CacheLevel(1))[0]
@@ -1151,6 +1246,8 @@ class TestArenaKVCacheManagerEndToEnd(unittest.TestCase):
             kv2.close()
         s.take_finish_event().synchronize()
         self.assertEqual(manager.drain_gpu_reclaim(CachedCudaEvent.NULL), 1)
+        # ranges park for adoption on drain; spill to assert full release
+        manager._storage.spill_gpu_retained(1 << 62)
         self.assertEqual(budget.used_pages, 0)
         # private copies were dropped, not offloaded: still exactly 2 host blocks
         host_stats = manager._storage.get_statistics(CacheLevel(1))[0]
@@ -1208,6 +1305,8 @@ class TestArenaKVCacheManagerEndToEnd(unittest.TestCase):
             kv2.close()
         s2.take_finish_event().synchronize()
         manager.drain_gpu_reclaim(CachedCudaEvent.NULL)
+        # ranges park for adoption on drain; spill to assert full release
+        manager._storage.spill_gpu_retained(1 << 62)
         self.assertEqual(budget.used_pages, 0)
 
     def test_intra_batch_commit_conflict_keeps_committing(self) -> None:
@@ -1237,6 +1336,8 @@ class TestArenaKVCacheManagerEndToEnd(unittest.TestCase):
             kv2.close()
         s.take_finish_event().synchronize()
         self.assertEqual(manager.drain_gpu_reclaim(CachedCudaEvent.NULL), 2)
+        # ranges park for adoption on drain; spill to assert full release
+        manager._storage.spill_gpu_retained(1 << 62)
         self.assertEqual(budget.used_pages, 0)
         # only the canonical copies were offloaded: no duplicates on host
         self.assertEqual(self._host_used(), 2)
@@ -1266,6 +1367,8 @@ class TestArenaKVCacheManagerEndToEnd(unittest.TestCase):
             kv.suspend()
         s.take_finish_event().synchronize()
         self.assertEqual(manager.drain_gpu_reclaim(CachedCudaEvent.NULL), 1)
+        # ranges park for adoption on drain; spill to assert full release
+        manager._storage.spill_gpu_retained(1 << 62)
         self.assertEqual(budget.used_pages, 0)
         self.assertEqual(self._host_used(), 3)  # 2 canonical + 1 uncommitted
 
@@ -1287,6 +1390,8 @@ class TestArenaKVCacheManagerEndToEnd(unittest.TestCase):
             kv.close()
         s2.take_finish_event().synchronize()
         self.assertEqual(manager.drain_gpu_reclaim(CachedCudaEvent.NULL), 1)
+        # ranges park for adoption on drain; spill to assert full release
+        manager._storage.spill_gpu_retained(1 << 62)
         self.assertEqual(budget.used_pages, 0)
         self.assertEqual(self._host_used(), 2)
 
@@ -1372,6 +1477,8 @@ class TestArenaKVCacheManagerEndToEnd(unittest.TestCase):
             kv2.suspend()
         s2.take_finish_event().synchronize()
         self.assertEqual(manager.drain_gpu_reclaim(CachedCudaEvent.NULL), 1)
+        # ranges park for adoption on drain; spill to assert full release
+        manager._storage.spill_gpu_retained(1 << 62)
         self.assertEqual(budget.used_pages, 0)
         self.assertEqual(self._host_used(), 2)  # privates dropped, no duplicates
 
@@ -1442,6 +1549,8 @@ class TestArenaBatchedMapSweep(unittest.TestCase):
             kv.close()
         s.take_finish_event().synchronize()
         self.assertEqual(manager.drain_gpu_reclaim(CachedCudaEvent.NULL), 1)
+        # ranges park for adoption on drain; spill to assert full release
+        manager._storage.spill_gpu_retained(1 << 62)
         self.assertEqual(budget.used_pages, 0)
 
     def test_freed_before_flush_releases_charge(self) -> None:
@@ -1457,6 +1566,8 @@ class TestArenaBatchedMapSweep(unittest.TestCase):
         s.take_finish_event().synchronize()
         manager.flush_gpu_mappings()
         self.assertEqual(manager.drain_gpu_reclaim(CachedCudaEvent.NULL), 1)
+        # ranges park for adoption on drain; spill to assert full release
+        manager._storage.spill_gpu_retained(1 << 62)
         self.assertEqual(budget.used_pages, 0)
 
     def test_reuse_onboarding_stays_synchronous(self) -> None:

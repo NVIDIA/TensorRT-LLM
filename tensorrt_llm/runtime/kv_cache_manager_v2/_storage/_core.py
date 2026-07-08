@@ -67,6 +67,16 @@ PoolGroupIndex = NewType("PoolGroupIndex", int)
 PoolIndex = NewType("PoolIndex", int)
 SlotId = NewType("SlotId", int)
 
+# Freed-range adoption (default on): freed arena ranges are parked still
+# mapped and handed whole to the next admitted sequence instead of being
+# unmapped and remapped. Concurrent cuMemMap/cuMemUnmap churn against
+# in-flight kernels reading *other* ranges of the same VA reservation
+# triggers device-side MMU faults (driver TLB interference — see
+# contiguous_primary_kvcache/WORK_LOG.md, 2026-07-07 discriminator matrix);
+# adoption removes that churn from the steady state entirely. "0" disables
+# (debugging only).
+_RANGE_ADOPTION = os.getenv("TRTLLM_KV_ARENA_RANGE_ADOPTION") != "0"
+
 # A temporary work-around while migrating to new page index API.
 # To be removed later.
 PoolIndex0 = PoolIndex(0)
@@ -755,6 +765,7 @@ class ArenaPoolGroup(PoolGroupBase):
         "ghost_misses",
         "spilled_ranges",
         "_pending_maps",
+        "_range_adoption",
     )
     _arena: SequenceArena
     _ranges: dict[int, SequenceRange]  # base_block -> live range
@@ -768,6 +779,9 @@ class ArenaPoolGroup(PoolGroupBase):
     # id(host page) -> (identity ref, retained-range base, ordinal): where a
     # committed block's bytes still live on GPU after its owner closed.
     _ghosts: "dict[int, tuple[rawref.ref[Any], int, int]]"
+    # Freed-range adoption (module default from TRTLLM_KV_ARENA_RANGE_ADOPTION;
+    # instance attribute so tests can pin either behavior).
+    _range_adoption: bool
 
     def __init__(
         self,
@@ -807,6 +821,7 @@ class ArenaPoolGroup(PoolGroupBase):
         self.ghost_hits = 0
         self.ghost_misses = 0
         self.spilled_ranges = 0
+        self._range_adoption = _RANGE_ADOPTION
         # base_block -> [range, target frontier (blocks), pages charged]:
         # growth maps deferred to the per-iteration batched sweep (§4.2).
         self._pending_maps: dict[int, list[Any]] = {}
@@ -852,13 +867,57 @@ class ArenaPoolGroup(PoolGroupBase):
 
     def reserve_sequence(self, max_blocks: int) -> SequenceRange:
         """Reserve a contiguous block-index range for a sequence's maximum
-        block count. Pure VA bookkeeping; no physical memory is mapped.
+        block count, preferring the adoption of a parked (freed but still
+        mapped) range over fresh VA: the adopted range's mapped prefix is
+        reused as-is, so the steady state issues no ``cuMemMap``/``cuMemUnmap``
+        at all (see ``_try_adopt``). A fresh reservation is pure VA
+        bookkeeping; no physical memory is mapped.
         Raises ``MemoryError`` on VA exhaustion (see DESIGN.md §4.8 sizing)."""
+        adopted = self._try_adopt(max_blocks)
+        if adopted is not None:
+            return adopted
         base_block = self._arena.reserve(max_blocks)
         rng = SequenceRange(base_block, self._arena.reserved_len(base_block))
         self._ranges[base_block] = rng
         insort(self._range_bases, base_block)
         return rng
+
+    def _try_adopt(self, max_blocks: int) -> "SequenceRange | None":
+        """Hand a parked freed range (pages still mapped, reclaim gates all
+        complete) to a new sequence. LRU-first, so the most recently retired
+        ranges keep their ghost entries (D2D reuse, §4.4 phase 2) longest.
+        The adopted range keeps its mapped prefix and budget charge; only its
+        ghost entries are purged (its bytes are about to be overwritten).
+        Returns None when nothing parked fits ``max_blocks``."""
+        if not self._range_adoption:
+            return None
+        for base in self._retained:
+            rng = self._retained[base]
+            if rng.num_blocks < max_blocks:
+                continue  # heterogeneous sizing: this range cannot hold it
+            if not rng._ready_to_reclaim():
+                continue  # e.g. an in-flight D2D onboard still reads from it
+            # With lazy retention, a range whose bytes still serve the ghost
+            # registry is worth more as a D2D reuse source than as adopted
+            # VA; keep it parked (pressure spill trims it eventually). Prune
+            # superseded keys so stale entries don't block adoption forever.
+            if rng._ghost_keys:
+                live: list[int] = []
+                for key in rng._ghost_keys:
+                    entry = self._ghosts.get(key)
+                    if entry is not None and entry[1] == base:
+                        live.append(key)
+                rng._ghost_keys = live
+                if live:
+                    continue
+            del self._retained[base]
+            self._budget.unretain(self._arena.mapped_pages_in_range(base))
+            # Fresh handle, same extent: the allocator reservation and the
+            # arena's mapped frontier carry over untouched.
+            fresh = SequenceRange(base, rng.num_blocks)
+            self._ranges[base] = fresh
+            return fresh
+        return None
 
     def take_slot(self, rng: SequenceRange, ordinal: int) -> Slot:
         """Issue the slot at ``rng.base_block + ordinal``. The caller (the
@@ -984,7 +1043,12 @@ class ArenaPoolGroup(PoolGroupBase):
         processed = 0
         for rng in self._pending_reclaim:
             if rng._ready_to_reclaim():
-                if self._lazy_retention:
+                if self._lazy_retention or self._range_adoption:
+                    # Park the range with its pages mapped: adoption hands it
+                    # whole to the next admitted sequence (no unmap+remap
+                    # churn against in-flight kernels); with lazy retention
+                    # its ghosts additionally serve D2D reuse. Unmapped only
+                    # under pressure (:meth:`spill_retained`).
                     self._retained[rng.base_block] = rng
                     self._budget.retain(self._arena.mapped_pages_in_range(rng.base_block))
                 else:

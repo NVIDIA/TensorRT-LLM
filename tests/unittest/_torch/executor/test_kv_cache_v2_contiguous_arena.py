@@ -210,6 +210,9 @@ class TestArenaAdapter(unittest.TestCase):
         torch.cuda.synchronize()
         reclaimed += mgr.impl.drain_gpu_reclaim(mgr._reclaim_fence())
         self.assertGreaterEqual(reclaimed, 1)
+        # drained ranges park mapped for adoption; spill to assert release
+        self.assertEqual(budget.used_pages, budget.retained_pages)
+        mgr.impl._storage.spill_gpu_retained(1 << 62)
         self.assertEqual(budget.used_pages, 0)
 
 
@@ -264,6 +267,9 @@ class TestArenaSchedulerDeadlockRecovery(unittest.TestCase):
             mgr.index_mapper.remove_sequence(1)
             torch.cuda.synchronize()
             mgr.impl.drain_gpu_reclaim(mgr._reclaim_fence(), wait=True)
+            # drained ranges park mapped for adoption; spill to assert release
+            self.assertEqual(budget.used_pages, budget.retained_pages)
+            mgr.impl._storage.spill_gpu_retained(1 << 62)
             self.assertEqual(budget.used_pages, 0)
         finally:
             mgr.shutdown()

@@ -57,8 +57,9 @@ from ._utils import CachedCudaEvent, div_up
 # faults, reproduced on H100 with Llama-3.1-8B under the overlap scheduler;
 # the fault vanishes when unmaps are serialized against kernels and is immune
 # to event-level ordering fixes, pointing at driver-level TLB interference).
-# The sync happens only at reclaim waves - once per admission burst - so the
-# cost is bounded; disable only for experiments.
+# With freed-range adoption parking ranges instead of unmapping them, actual
+# unmaps happen only under pressure spill or teardown, so the sync cost is
+# rare and bounded; disable only for experiments.
 _SYNC_BEFORE_UNMAP = os.getenv("TRTLLM_KV_ARENA_SYNC_BEFORE_UNMAP") != "0"
 
 # Kernel-facing offsets are int32, and v1's KVCacheIndex steals the high bit for
@@ -542,7 +543,6 @@ class SequenceArena:
         before the unmap batch unless explicitly disabled."""
         if _SYNC_BEFORE_UNMAP:
             from ._cuda_virt_mem import drv
-
             from ._utils import _unwrap
 
             _unwrap(drv.cuCtxSynchronize())
