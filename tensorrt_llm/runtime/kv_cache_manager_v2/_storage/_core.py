@@ -40,7 +40,7 @@ from .._common import (
     FileDescriptor,
     MemAddress,
 )
-from .._cuda_virt_mem import PooledPhysMemAllocator, VirtMem
+from .._cuda_virt_mem import PooledPhysMemAllocator, SharedPhysMem, VirtMem
 from .._exceptions import LogicError, OutOfPagesError
 from .._sequence_arena import PageBudget, SequenceArena, check_index_width
 from .._utils import (
@@ -76,6 +76,44 @@ SlotId = NewType("SlotId", int)
 # adoption removes that churn from the steady state entirely. "0" disables
 # (debugging only).
 _RANGE_ADOPTION = os.getenv("TRTLLM_KV_ARENA_RANGE_ADOPTION") != "0"
+# P3 prefix aliasing: map the SAME physical pages holding a shared,
+# fully-committed prefix into multiple sequences' VA ranges (zero-copy,
+# zero-charge reuse). Default OFF while the prototype bakes.
+_PREFIX_ALIASING = os.getenv("TRTLLM_KV_ARENA_PREFIX_ALIASING") == "1"
+
+
+class _CanonicalSpan:
+    """A closed canonical owner's resident prefix pages, pinned for aliasing
+    (P3). ``page_refs`` guard identity/liveness of every canonical (now
+    host-tier) page in the span -- any mismatch invalidates the entry, the
+    same discipline as the ghost registry. ``shared_per_pool`` holds one
+    registry reference per physical chunk (dropped on spill/invalidation);
+    ``ready_event`` covers the bytes' last writes (alias consumers wait it).
+    """
+
+    __slots__ = ("page_refs", "shared_per_pool", "num_blocks", "num_pages", "ready_event")
+    page_refs: "list[rawref.ref[Any]]"
+    shared_per_pool: "list[list[SharedPhysMem]]"
+    num_blocks: int
+    num_pages: int
+    ready_event: CachedCudaEvent
+
+    def __init__(
+        self,
+        page_refs: "list[rawref.ref[Any]]",
+        shared_per_pool: "list[list[SharedPhysMem]]",
+        num_blocks: int,
+        ready_event: CachedCudaEvent,
+    ) -> None:
+        self.page_refs = page_refs
+        self.shared_per_pool = shared_per_pool
+        self.num_blocks = num_blocks
+        num_pages = 0
+        for shared in shared_per_pool:
+            num_pages += len(shared)
+        self.num_pages = num_pages
+        self.ready_event = ready_event
+
 
 # A temporary work-around while migrating to new page index API.
 # To be removed later.
@@ -686,6 +724,7 @@ class SequenceRange:
         "_free_event",
         "_reclaim_fence",
         "_ghost_keys",
+        "_alias_span_key",
     )
     base_block: int
     num_blocks: int  # reserved (padded) length in blocks
@@ -704,6 +743,12 @@ class SequenceRange:
     # Ghost registry keys (§4.4 phase 2): ids of host pages whose bytes still
     # live in this (retained) range; purged when the range is reclaimed.
     _ghost_keys: list[int]
+    # P3 prefix aliasing: the canonical-span registry key whose physical pages
+    # are alias-mapped at this range's start (None = unaliased). Aliased
+    # ranges may only be adopted by a sequence whose reuse match carries the
+    # SAME key -- the span's physical pages are shared, so any other adopter
+    # writing the range head would corrupt every alias of the span.
+    _alias_span_key: "int | None"
 
     def __init__(self, base_block: int, num_blocks: int) -> None:
         self.base_block = base_block
@@ -714,6 +759,7 @@ class SequenceRange:
         self._free_event = CachedCudaEvent.NULL
         self._reclaim_fence = None
         self._ghost_keys = []
+        self._alias_span_key = None
 
     @property
     def end_block(self) -> int:
@@ -766,6 +812,11 @@ class ArenaPoolGroup(PoolGroupBase):
         "spilled_ranges",
         "_pending_maps",
         "_range_adoption",
+        "_prefix_aliasing",
+        "_canonical_spans",
+        "alias_hits",
+        "alias_misses",
+        "spilled_spans",
     )
     _arena: SequenceArena
     _ranges: dict[int, SequenceRange]  # base_block -> live range
@@ -782,6 +833,14 @@ class ArenaPoolGroup(PoolGroupBase):
     # Freed-range adoption (module default from TRTLLM_KV_ARENA_RANGE_ADOPTION;
     # instance attribute so tests can pin either behavior).
     _range_adoption: bool
+    # P3 prefix aliasing (module default from TRTLLM_KV_ARENA_PREFIX_ALIASING,
+    # default OFF for the prototype; instance attribute for tests).
+    _prefix_aliasing: bool
+    # Canonical-span registry (P3): id(head canonical page) -> _CanonicalSpan.
+    # A span pins the refcounted physical pages holding a closed canonical
+    # owner's fully-committed prefix, so same-prefix admissions alias them
+    # (zero-copy, zero-charge) instead of copying from the host tier.
+    _canonical_spans: "dict[int, _CanonicalSpan]"
 
     def __init__(
         self,
@@ -792,6 +851,7 @@ class ArenaPoolGroup(PoolGroupBase):
         map_ahead_pages: int,
         page_index_scale: int,
         lazy_retention: bool = False,
+        prefix_aliasing: bool = False,
     ) -> None:
         # The int31 kernel-offset ceiling must hold for every offset this
         # arena can emit (DESIGN.md §4.1); fail loudly at startup.
@@ -822,6 +882,11 @@ class ArenaPoolGroup(PoolGroupBase):
         self.ghost_misses = 0
         self.spilled_ranges = 0
         self._range_adoption = _RANGE_ADOPTION
+        self._prefix_aliasing = prefix_aliasing or _PREFIX_ALIASING
+        self._canonical_spans = {}
+        self.alias_hits = 0
+        self.alias_misses = 0
+        self.spilled_spans = 0
         # base_block -> [range, target frontier (blocks), pages charged]:
         # growth maps deferred to the per-iteration batched sweep (§4.2).
         self._pending_maps: dict[int, list[Any]] = {}
@@ -860,20 +925,30 @@ class ArenaPoolGroup(PoolGroupBase):
         assert not self._ranges and not self._pending_reclaim, (
             "destroying ArenaPoolGroup with live sequence ranges"
         )
+        # Unpin canonical spans (P3) so their handles return to the pool.
+        for key in list(self._canonical_spans):
+            self._unpin_span(self._canonical_spans.pop(key))
         super().destroy()
         self._arena.destroy()
 
     # -- per-sequence API (replaces scattered slot allocation) --------------
 
-    def reserve_sequence(self, max_blocks: int) -> SequenceRange:
+    def reserve_sequence(self, max_blocks: int, alias_key: "int | None" = None) -> SequenceRange:
         """Reserve a contiguous block-index range for a sequence's maximum
         block count, preferring the adoption of a parked (freed but still
         mapped) range over fresh VA: the adopted range's mapped prefix is
         reused as-is, so the steady state issues no ``cuMemMap``/``cuMemUnmap``
         at all (see ``_try_adopt``). A fresh reservation is pure VA
         bookkeeping; no physical memory is mapped.
+
+        ``alias_key`` is the admission's canonical-span registry key (P3):
+        adoption is prefix-affine -- a parked range whose head alias-maps span
+        ``K`` may only go to an admission with the same key (its prefix
+        content and mappings are exactly what the adopter wants, and any
+        other adopter writing the range head would corrupt every alias of the
+        shared pages).
         Raises ``MemoryError`` on VA exhaustion (see DESIGN.md §4.8 sizing)."""
-        adopted = self._try_adopt(max_blocks)
+        adopted = self._try_adopt(max_blocks, alias_key)
         if adopted is not None:
             return adopted
         base_block = self._arena.reserve(max_blocks)
@@ -882,12 +957,13 @@ class ArenaPoolGroup(PoolGroupBase):
         insort(self._range_bases, base_block)
         return rng
 
-    def _try_adopt(self, max_blocks: int) -> "SequenceRange | None":
+    def _try_adopt(self, max_blocks: int, alias_key: "int | None" = None) -> "SequenceRange | None":
         """Hand a parked freed range (pages still mapped, reclaim gates all
         complete) to a new sequence. LRU-first, so the most recently retired
         ranges keep their ghost entries (D2D reuse, §4.4 phase 2) longest.
         The adopted range keeps its mapped prefix and budget charge; only its
         ghost entries are purged (its bytes are about to be overwritten).
+        Alias-signature filter (P3): see :meth:`reserve_sequence`.
         Returns None when nothing parked fits ``max_blocks``."""
         if not self._range_adoption:
             return None
@@ -895,6 +971,8 @@ class ArenaPoolGroup(PoolGroupBase):
             rng = self._retained[base]
             if rng.num_blocks < max_blocks:
                 continue  # heterogeneous sizing: this range cannot hold it
+            if rng._alias_span_key != alias_key:
+                continue  # prefix-affine: shared span pages must not be overwritten
             if not rng._ready_to_reclaim():
                 continue  # e.g. an in-flight D2D onboard still reads from it
             # With lazy retention, a range whose bytes still serve the ghost
@@ -911,10 +989,12 @@ class ArenaPoolGroup(PoolGroupBase):
                 if live:
                     continue
             del self._retained[base]
-            self._budget.unretain(self._arena.mapped_pages_in_range(base))
+            self._budget.unretain(self._arena.charged_pages_in_range(base))
             # Fresh handle, same extent: the allocator reservation and the
-            # arena's mapped frontier carry over untouched.
+            # arena's mapped frontier (including any alias-mapped span, whose
+            # signature carries over) stay untouched.
             fresh = SequenceRange(base, rng.num_blocks)
+            fresh._alias_span_key = rng._alias_span_key
             self._ranges[base] = fresh
             return fresh
         return None
@@ -1050,7 +1130,7 @@ class ArenaPoolGroup(PoolGroupBase):
                     # its ghosts additionally serve D2D reuse. Unmapped only
                     # under pressure (:meth:`spill_retained`).
                     self._retained[rng.base_block] = rng
-                    self._budget.retain(self._arena.mapped_pages_in_range(rng.base_block))
+                    self._budget.retain(self._arena.charged_pages_in_range(rng.base_block))
                 else:
                     self._reclaim_range(rng)
                 processed += 1
@@ -1095,7 +1175,7 @@ class ArenaPoolGroup(PoolGroupBase):
             rng = self._retained[base]
             if not rng._ready_to_reclaim():
                 continue  # e.g. an in-flight D2D onboard still reads from it
-            pages = self._arena.mapped_pages_in_range(base)
+            pages = self._arena.charged_pages_in_range(base)
             del self._retained[base]
             self._budget.unretain(pages)
             self._reclaim_range(rng)
@@ -1105,7 +1185,7 @@ class ArenaPoolGroup(PoolGroupBase):
 
     @property
     def retained_pages(self) -> int:
-        return sum(self._arena.mapped_pages_in_range(base) for base in self._retained)
+        return sum(self._arena.charged_pages_in_range(base) for base in self._retained)
 
     # -- ghost registry (§4.4 phase 2): D2D reuse from retained ranges ------
 
@@ -1140,6 +1220,127 @@ class ArenaPoolGroup(PoolGroupBase):
             return None  # still pending (bytes not settled) or already spilled
         self.ghost_hits += 1
         return SlotId(base + ordinal), rng
+
+    # -- canonical-span registry (P3): zero-copy prefix aliasing ------------
+
+    def register_canonical_span(
+        self,
+        rng: SequenceRange,
+        pages: "Sequence[object]",
+        ready_event: CachedCudaEvent,
+    ) -> None:
+        """Pin the resident physical pages holding a closing canonical
+        owner's committed prefix (``pages``: the canonical -- by now
+        host-tier -- page objects of blocks ``[0, len(pages))``), so future
+        same-prefix admissions alias them instead of copying (P3).
+
+        Trims to the chunk-aligned aliasable span; no-op if aliasing is off,
+        the span is empty, or this range's head is itself an alias (the
+        registry already pins those pages under the original key -- the
+        adoption signature keeps serving them). The budget charge for the
+        span moves from the range to the registry (release+consume nets zero;
+        the range's later reclaim then correctly skips them) and is marked
+        retained so the pressure/resume gates count it reclaimable."""
+        if not self._prefix_aliasing or not pages:
+            return
+        if rng._alias_span_key is not None:
+            return
+        arena = self._arena
+        num_blocks = arena.aliasable_prefix_blocks(rng.base_block, len(pages))
+        if num_blocks <= 0:
+            return
+        shared_per_pool = arena.shared_prefix_chunks(rng.base_block, num_blocks)
+        span = _CanonicalSpan(
+            [rawref.ref(p) for p in pages[:num_blocks]],
+            shared_per_pool,
+            num_blocks,
+            ready_event,
+        )
+        if span.num_pages == 0:
+            return
+        key = id(pages[0])
+        old = self._canonical_spans.get(key)
+        if old is not None:
+            self._unpin_span(old)
+        for shared in shared_per_pool:
+            for s in shared:
+                s.add_ref()
+        # Transfer the span's budget charge from the owner range to the
+        # registry: mark the chunks alias-accounted in the arena (the range's
+        # park/adopt/reclaim math then excludes them) and re-charge them here,
+        # retained (reclaimable at will via spill_canonical_spans).
+        arena._aliased[rng.base_block] = arena._aliased.get(rng.base_block, 0) + span.num_pages
+        self._budget.release(span.num_pages)
+        self._budget.consume(span.num_pages)
+        self._budget.retain(span.num_pages)
+        rng._alias_span_key = key
+        self._canonical_spans[key] = span
+
+    def lookup_canonical_span(
+        self, head_page: object, matched_pages: "Sequence[object]"
+    ) -> "tuple[int, _CanonicalSpan] | None":
+        """Registry hit for an admission whose reuse match starts at
+        ``head_page`` and covers ``matched_pages`` (canonical page objects in
+        ordinal order): returns ``(key, span)`` iff a live span exists, its
+        FULL extent is covered by the match (a shorter match would write into
+        shared pages), and every span page identity still holds. Any
+        staleness invalidates and unpins the entry."""
+        if not self._prefix_aliasing:
+            return None
+        key = id(head_page)
+        span = self._canonical_spans.get(key)
+        if span is None:
+            self.alias_misses += 1
+            return None
+        if len(matched_pages) < span.num_blocks:
+            self.alias_misses += 1
+            return None  # match too short to safely alias the whole span
+        for i, ref in enumerate(span.page_refs):
+            if ref() is not matched_pages[i]:
+                self._invalidate_span(key, span)
+                self.alias_misses += 1
+                return None
+        self.alias_hits += 1
+        return key, span
+
+    def alias_span_into_range(self, rng: SequenceRange, key: int, span: "_CanonicalSpan") -> int:
+        """Alias-map ``span``'s physical pages at the start of ``rng`` (a
+        FRESH, unmapped range) and stamp its signature. Signature-matched
+        adopted ranges already carry the mappings and skip this. Returns the
+        chunks aliased."""
+        assert rng._alias_span_key is None
+        aliased = self._arena.alias_prefix(rng.base_block, span.shared_per_pool)
+        rng._alias_span_key = key
+        return aliased
+
+    def _unpin_span(self, span: "_CanonicalSpan") -> None:
+        for shared in span.shared_per_pool:
+            for s in shared:
+                s.drop_ref()
+        self._budget.unretain(span.num_pages)
+        self._budget.release(span.num_pages)
+
+    def _invalidate_span(self, key: int, span: "_CanonicalSpan") -> None:
+        self._canonical_spans.pop(key, None)
+        self._unpin_span(span)
+
+    def spill_canonical_spans(self, min_pages: int) -> int:
+        """Drop canonical-span pins (insertion order ≈ LRU) until at least
+        ``min_pages`` budget pages are freed. Live aliases keep their handles
+        (refcounts); future admissions fall back to host-copy reuse."""
+        freed = 0
+        for key in list(self._canonical_spans):
+            if freed >= min_pages:
+                break
+            span = self._canonical_spans.pop(key)
+            self._unpin_span(span)
+            self.spilled_spans += 1
+            freed += span.num_pages
+        return freed
+
+    @property
+    def canonical_span_pages(self) -> int:
+        return sum(s.num_pages for s in self._canonical_spans.values())
 
     def _find_range(self, slot_id: int) -> SequenceRange:
         idx = bisect_right(self._range_bases, slot_id) - 1
@@ -1556,6 +1757,7 @@ class GpuArenaCacheLevelStorage(CacheLevelStorage):
         phys_page_size: int,
         map_ahead_pages: int,
         lazy_retention: bool = False,
+        prefix_aliasing: bool = False,
     ):
         num_pool_groups = typed_len(slot_size_lists)
         assert num_pool_groups == typed_len(block_capacity_list), (
@@ -1581,6 +1783,7 @@ class GpuArenaCacheLevelStorage(CacheLevelStorage):
                 map_ahead_pages,
                 page_index_scale_list[pg_idx],
                 lazy_retention,
+                prefix_aliasing,
             ),
             num_pool_groups,
         )
@@ -1613,13 +1816,19 @@ class GpuArenaCacheLevelStorage(CacheLevelStorage):
     def spill_retained(self, min_pages: int) -> int:
         """Reclaim lazily retained ranges (§4.4 phase 2), LRU-first per pool
         group, until ``min_pages`` physical pages are freed or nothing more
-        is spillable. Returns pages freed."""
+        is spillable; canonical-span pins (P3) are spilled last -- shared
+        prefixes are the hottest bytes on the level. Returns pages freed."""
         freed = 0
         for pg in self._pool_groups:
             if freed >= min_pages:
                 break
             assert type(pg) is ArenaPoolGroup
             freed += pg.spill_retained(min_pages - freed)
+        for pg in self._pool_groups:
+            if freed >= min_pages:
+                break
+            assert type(pg) is ArenaPoolGroup
+            freed += pg.spill_canonical_spans(min_pages - freed)
         return freed
 
     def flush_mappings(self) -> int:

@@ -283,6 +283,75 @@ class TestSparseVirtMem(unittest.TestCase):
         finally:
             vm.destroy()
 
+    def test_alias_map_shares_bytes_and_refcounts(self) -> None:
+        """P3 aliasing: one physical handle mapped at two VA addresses.
+
+        Both mappings (across two reservations) show the same bytes;
+        unmapping either alias in either order keeps the handle alive
+        until the last reference drops.
+        """
+        vm_a = VirtMem(8 * MiB, self.allocator)
+        vm_b = VirtMem(8 * MiB, self.allocator)
+        try:
+            vm_a.map_range(0, 2)
+            shared = [vm_a.shared_chunk(0), vm_a.shared_chunk(2 * MiB)]
+            self.assertEqual([s.num_refs for s in shared], [1, 1])
+            # alias into a DIFFERENT reservation at a different offset
+            vm_b.map_alias(4 * MiB, shared)
+            self.assertEqual([s.num_refs for s in shared], [2, 2])
+            self.assertEqual(vm_b.num_sparse_chunks, 2)
+            n = (2 * MiB) // 4
+            src = self._tensor_at(int(vm_a.address), n)
+            dst = self._tensor_at(int(vm_b.address) + 4 * MiB, n)
+            src.fill_(3.25)
+            torch.cuda.synchronize()
+            self.assertTrue(bool((dst == 3.25).all().item()))
+            # owner unmaps first; alias keeps the bytes (refcount holds)
+            torch.cuda.synchronize()
+            vm_a.unmap_range(0, 2)
+            self.assertEqual([s.num_refs for s in shared], [1, 1])
+            dst2 = self._tensor_at(int(vm_b.address) + 4 * MiB, n)
+            self.assertTrue(bool((dst2 == 3.25).all().item()))
+            torch.cuda.synchronize()
+            vm_b.unmap_range(4 * MiB, 2)
+            self.assertEqual([s.num_refs for s in shared], [0, 0])
+        finally:
+            vm_a.destroy()
+            vm_b.destroy()
+
+    def test_alias_destroy_drops_refs(self) -> None:
+        """destroy() of an alias-holding reservation drops references.
+
+        The shared handle survives while another mapping lives.
+        """
+        vm_a = VirtMem(4 * MiB, self.allocator)
+        vm_b = VirtMem(4 * MiB, self.allocator)
+        try:
+            vm_a.map_range(0, 1)
+            shared = vm_a.shared_chunk(0)
+            vm_b.map_alias(0, [shared])
+            self.assertEqual(shared.num_refs, 2)
+            vm_b.destroy()
+            self.assertEqual(shared.num_refs, 1)
+            self.assertTrue(vm_a.is_mapped(0))
+            n = (2 * MiB) // 4
+            t = self._tensor_at(int(vm_a.address), n)
+            t.fill_(9.5)
+            torch.cuda.synchronize()
+            self.assertTrue(bool((t == 9.5).all().item()))
+        finally:
+            vm_a.destroy()
+
+    def test_alias_collision_asserts(self) -> None:
+        vm = VirtMem(8 * MiB, self.allocator)
+        try:
+            vm.map_range(0, 1)
+            shared = vm.shared_chunk(0)
+            with self.assertRaises(AssertionError):
+                vm.map_alias(0, [shared])  # chunk already mapped
+        finally:
+            vm.destroy()
+
     @staticmethod
     def _tensor_at(ptr: int, num_float32: int) -> "torch.Tensor":
         # Build a torch tensor aliasing an existing device pointer via the
@@ -364,6 +433,79 @@ class TestSequenceArena(unittest.TestCase):
             arena.ensure_mapped(b, 3)
             # mapping b must not have touched a's already-mapped pages twice
             self.assertGreater(arena.mapped_pages, pages_a)
+        finally:
+            arena.destroy()
+
+    def test_alias_prefix_shares_pages_uncharged(self) -> None:
+        """P3: a second sequence alias-maps the canonical prefix's pages.
+
+        Zero budget charge, correct frontier (growth continues past the
+        alias), and reclaim releases only the charged surplus while the
+        alias holds the handles alive.
+        """
+        budget = PageBudget(16)
+        arena = SequenceArena(
+            block_capacity=16,
+            record_stride=4 * MiB,  # 1 block = 2 pages
+            phys_mem_allocator=self.allocator,
+            map_ahead_pages=0,
+            page_budget=budget,
+        )
+        try:
+            a = arena.reserve(4)
+            arena.ensure_mapped(a, 4)  # 8 pages charged
+            self.assertEqual(budget.used_pages, 8)
+            # 3 of A's 4 blocks are the "committed prefix": fully covered
+            # chunks only -> 3 blocks * 4MiB / 2MiB = 6 chunks, all full.
+            self.assertEqual(arena.aliasable_prefix_blocks(a, 3), 3)
+            shared = arena.shared_prefix_chunks(a, 3)
+            self.assertEqual(sum(len(s) for s in shared), 6)
+            b = arena.reserve(4)
+            self.assertEqual(arena.alias_prefix(b, shared), 6)
+            self.assertEqual(budget.used_pages, 8)  # aliases charge nothing
+            self.assertEqual(arena.aliased_pages_in_range(b), 6)
+            self.assertEqual(arena.mapped_pages_in_range(b), 6)
+            self.assertEqual(arena.charged_pages_in_range(b), 0)
+            # growth continues after the aliased frontier
+            arena.ensure_mapped(b, 4)  # 8 chunks target; 6 aliased -> +2
+            self.assertEqual(budget.used_pages, 10)
+            self.assertEqual(arena.charged_pages_in_range(b), 2)
+            # write via A's VA, read via B's VA (same physical bytes)
+            n = (2 * MiB) // 4
+            addr_a = int(arena.base_address(0)) + a * 4 * MiB
+            addr_b = int(arena.base_address(0)) + b * 4 * MiB
+            ta = TestSparseVirtMem._tensor_at(addr_a, n)
+            ta.fill_(5.75)
+            torch.cuda.synchronize()
+            tb = TestSparseVirtMem._tensor_at(addr_b, n)
+            self.assertTrue(bool((tb == 5.75).all().item()))
+            # reclaim A (canonical owner): B's aliases keep the handles
+            torch.cuda.synchronize()
+            arena.reclaim(a)
+            self.assertEqual(budget.used_pages, 2)  # only A's own 8 released
+            tb2 = TestSparseVirtMem._tensor_at(addr_b, n)
+            self.assertTrue(bool((tb2 == 5.75).all().item()))
+            # reclaim B: releases only its charged surplus (2), aliased 6 not
+            torch.cuda.synchronize()
+            arena.reclaim(b)
+            self.assertEqual(budget.used_pages, 0)
+            self.assertEqual(arena.mapped_pages, 0)
+        finally:
+            arena.destroy()
+
+    def test_aliasable_prefix_partial_boundary_page(self) -> None:
+        """A half-covered boundary chunk is trimmed from the aliasable span.
+
+        The remainder falls back to the copy path.
+        """
+        arena = self._arena(record_stride=1 * MiB, capacity=32, margin=0)  # 2 blocks/page
+        try:
+            base = arena.reserve(8)
+            arena.ensure_mapped(base, 8)
+            self.assertEqual(arena.aliasable_prefix_blocks(base, 3), 2)  # 3rd block half-page
+            self.assertEqual(arena.aliasable_prefix_blocks(base, 4), 4)
+            shared = arena.shared_prefix_chunks(base, 3)
+            self.assertEqual(sum(len(s) for s in shared), 1)  # only the full chunk
         finally:
             arena.destroy()
 
@@ -715,6 +857,88 @@ class TestArenaPoolGroup(unittest.TestCase):
             self.assertEqual(group.ensure_mapped(fresh, 4), 6)  # must remap
             group.free_sequence(fresh, CachedCudaEvent.NULL)
             group.drain_reclaim(CachedCudaEvent.NULL)
+        finally:
+            group.destroy()
+
+    class _FakeCanonicalPage:
+        """Stand-in for a canonical (host-tier) page in registry tests."""
+
+        __slots__ = ("__rawref__",)
+
+        def __init__(self) -> None:
+            self.__rawref__ = rawref.NULL
+
+    def test_canonical_span_registry_alias_roundtrip(self) -> None:
+        """P3 registry roundtrip: register, alias, park, adopt affinely.
+
+        The aliased chunks charge nothing, parking carries the alias
+        signature, and charged accounting stays exact through every
+        transition.
+        """
+        group = self._group()
+        group._prefix_aliasing = True
+        try:
+            # Owner A: 4 blocks; blocks 0-1 are the "committed prefix".
+            # Pools (2MiB, 1MiB) on 2MiB pages: prefix covers pool0 2 full
+            # chunks + pool1 1 full chunk -> span = 3 pages.
+            rng_a = group.reserve_sequence(4)
+            self.assertEqual(group.ensure_mapped(rng_a, 4), 6)
+            self.assertEqual(self.budget.used_pages, 6)
+            canon = [self._FakeCanonicalPage(), self._FakeCanonicalPage()]
+            group.register_canonical_span(rng_a, canon, CachedCudaEvent.NULL)
+            key = id(canon[0])
+            self.assertEqual(rng_a._alias_span_key, key)
+            self.assertEqual(group.canonical_span_pages, 3)
+            # charge moved range -> registry (net zero), retained-at-will
+            self.assertEqual(self.budget.used_pages, 6)
+            self.assertEqual(self.budget.retained_pages, 3)
+
+            # Reuse admission B: registry hit requires full-span coverage.
+            self.assertIsNone(group.lookup_canonical_span(canon[0], canon[:1]))
+            hit = group.lookup_canonical_span(canon[0], canon)
+            self.assertIsNotNone(hit)
+            rng_b = group.reserve_sequence(4)  # nothing parked yet -> fresh
+            self.assertNotEqual(rng_b.base_block, rng_a.base_block)
+            self.assertEqual(group.alias_span_into_range(rng_b, hit[0], hit[1]), 3)
+            self.assertEqual(self.budget.used_pages, 6)  # aliases charge nothing
+            # B's remainder maps fresh: pool0 +2, pool1 +1
+            self.assertEqual(group.ensure_mapped(rng_b, 4), 3)
+            self.assertEqual(self.budget.used_pages, 9)
+
+            # Same physical bytes through both ranges' pool-0 VA addresses.
+            n = (2 * MiB) // 4
+            addr_a = group._pools[0].slot_address(rng_a.base_block)
+            addr_b = group._pools[0].slot_address(rng_b.base_block)
+            ta = TestSparseVirtMem._tensor_at(int(addr_a), n)
+            ta.fill_(11.5)
+            torch.cuda.synchronize()
+            tb = TestSparseVirtMem._tensor_at(int(addr_b), n)
+            self.assertTrue(bool((tb == 11.5).all().item()))
+
+            # Owner A parks with its signature; only same-key admissions
+            # adopt it. A None-key reservation must get fresh VA instead.
+            group.free_sequence(rng_a, CachedCudaEvent.NULL)
+            self.assertEqual(group.drain_reclaim(CachedCudaEvent.NULL), 1)
+            plain = group.reserve_sequence(4)  # alias_key=None
+            self.assertNotEqual(plain.base_block, rng_a.base_block)
+            adopted = group.reserve_sequence(4, alias_key=key)
+            self.assertEqual(adopted.base_block, rng_a.base_block)
+            self.assertEqual(adopted._alias_span_key, key)
+
+            # Spill the registry: pins drop, lookups miss, aliases keep bytes.
+            torch.cuda.synchronize()
+            self.assertEqual(group.spill_canonical_spans(1 << 62), 3)
+            self.assertIsNone(group.lookup_canonical_span(canon[0], canon))
+            tb2 = TestSparseVirtMem._tensor_at(int(addr_b), n)
+            self.assertTrue(bool((tb2 == 11.5).all().item()))
+
+            for rng in (rng_b, plain, adopted):
+                group.free_sequence(rng, CachedCudaEvent.NULL)
+            group.drain_reclaim(CachedCudaEvent.NULL)
+            torch.cuda.synchronize()
+            group.spill_retained(1 << 62)
+            self.assertEqual(self.budget.used_pages, 0)
+            self.assertEqual(group.mapped_pages, 0)
         finally:
             group.destroy()
 
@@ -1889,6 +2113,141 @@ class TestArenaWriteThroughOnCommit(TestArenaKVCacheManagerEndToEnd):
         s2.take_finish_event().synchronize()
         self.assertEqual(manager.drain_gpu_reclaim(CachedCudaEvent.NULL), 1)
         self.assertEqual(self._host_used(), 2)
+
+
+@requires_cuda
+class TestArenaPrefixAliasing(unittest.TestCase):
+    """P3 prefix aliasing end-to-end at the manager seam.
+
+    A closing canonical owner's fully-committed prefix pages are pinned in
+    the canonical-span registry; a same-prefix admission adopts the parked
+    range prefix-affinely (or alias-maps a fresh one) and reads the SAME
+    physical bytes -- no H2D copy (proven by corrupting the host copies), no
+    new budget charge for the span. Spilling the registry falls back to the
+    host-copy path.
+    """
+
+    TPB = 16
+    # One full 2 MiB chunk of 32 KiB coalesced block records.
+    PREFIX_BLOCKS = 64
+
+    def setUp(self) -> None:
+        init_cuda_once()
+        cfg = _make_manager_config(gpu_quota=32 * MiB, host_quota=64 * MiB)
+        cfg.contiguous_arena = ContiguousArenaConfig(map_ahead_pages=0, prefix_aliasing=True)
+        self.manager = KVCacheManager(cfg)
+
+    def tearDown(self) -> None:
+        self.manager.shutdown()
+        del self.manager
+
+    def _block_floats(self, page_index: int) -> "torch.Tensor":
+        addr = int(
+            self.manager._storage.slot_address(
+                GPU_LEVEL, PoolGroupIndex(0), page_index, PoolIndex(0)
+            )
+        )
+        return TestSparseVirtMem._tensor_at(addr, (4 * 8192) // 4)
+
+    def _host_floats(self, slot_id: int) -> "torch.Tensor":
+        import ctypes
+
+        addr = int(
+            self.manager._storage.slot_address(
+                CacheLevel(1), PoolGroupIndex(0), slot_id, PoolIndex(0)
+            )
+        )
+        buf = (ctypes.c_float * ((4 * 8192) // 4)).from_address(addr)
+        return torch.frombuffer(buf, dtype=torch.float32)
+
+    def _pool_group(self):
+        return self.manager._storage._gpu_arena_storage().pool_group(PoolGroupIndex(0))
+
+    def test_alias_roundtrip_zero_copy_and_affine_adoption(self) -> None:
+        manager = self.manager
+        budget = manager._storage.gpu_page_budget
+        pg = self._pool_group()
+        n_tok = self.PREFIX_BLOCKS * self.TPB
+        tokens = [1000 + i for i in range(n_tok)]
+
+        # Owner A: write patterns, commit the full-chunk prefix, close.
+        kv_a = manager.create_kv_cache(max_capacity=(self.PREFIX_BLOCKS + 4) * self.TPB)
+        with TemporaryCudaStream([]) as s:
+            stream = CudaStream(s.handle)
+            self.assertTrue(kv_a.resume(stream))
+            self.assertTrue(kv_a.resize(n_tok))
+            a_indices = list(kv_a.get_base_page_indices(LifeCycleId(0)))[: self.PREFIX_BLOCKS]
+            for j, idx in enumerate(a_indices):
+                self._block_floats(idx).fill_(float(j))
+            torch.cuda.synchronize()
+            kv_a.commit(tokens)
+            kv_a.close()
+        s.take_finish_event().synchronize()
+        self.assertEqual(pg.canonical_span_pages, 1)  # 64 x 32 KiB = 1 chunk
+        self.assertEqual(manager.drain_gpu_reclaim(CachedCudaEvent.NULL), 1)  # parked
+        used_after_a = budget.used_pages
+
+        # B: same-prefix admission. Corrupt every host copy first: correct
+        # GPU bytes can then only have come through the alias mapping.
+        kv_b = manager.create_kv_cache(
+            input_tokens=tokens + [1, 2], max_capacity=(self.PREFIX_BLOCKS + 4) * self.TPB
+        )
+        self.assertEqual(kv_b.history_length, n_tok)
+        for ordinal in range(self.PREFIX_BLOCKS):
+            host_id = kv_b._blocks[ordinal].pages[0][LifeCycleId(0)].page.slot_id
+            self._host_floats(host_id).fill_(-777.0)
+        with TemporaryCudaStream([]) as s2:
+            self.assertTrue(kv_b.resume(CudaStream(s2.handle)))
+            self.assertEqual(pg.alias_hits, 1)
+            torch.cuda.synchronize()
+            b_indices = list(kv_b.get_base_page_indices(LifeCycleId(0)))[: self.PREFIX_BLOCKS]
+            for j, idx in enumerate(b_indices):
+                data = self._block_floats(idx)
+                self.assertTrue(bool((data == float(j)).all().item()), f"block {j} not aliased")
+            kv_b.close()
+        s2.take_finish_event().synchronize()
+        self.assertEqual(manager.drain_gpu_reclaim(CachedCudaEvent.NULL), 1)
+
+        # C: adoption is prefix-affine -- C inherits a parked same-signature
+        # range with the alias mappings intact (no new maps for the span).
+        kv_c = manager.create_kv_cache(
+            input_tokens=tokens + [3, 4], max_capacity=(self.PREFIX_BLOCKS + 4) * self.TPB
+        )
+        with TemporaryCudaStream([]) as s3:
+            self.assertTrue(kv_c.resume(CudaStream(s3.handle)))
+            self.assertEqual(pg.alias_hits, 2)
+            self.assertIsNotNone(kv_c._arena_ranges[PoolGroupIndex(0)]._alias_span_key)
+            torch.cuda.synchronize()
+            c_indices = list(kv_c.get_base_page_indices(LifeCycleId(0)))[: self.PREFIX_BLOCKS]
+            for j, idx in enumerate(c_indices):
+                data = self._block_floats(idx)
+                self.assertTrue(bool((data == float(j)).all().item()), f"block {j} lost")
+            kv_c.close()
+        s3.take_finish_event().synchronize()
+        manager.drain_gpu_reclaim(CachedCudaEvent.NULL)
+        self.assertLessEqual(budget.used_pages, used_after_a + 2)
+
+        # Pressure spill drops parked ranges AND the registry pin; the next
+        # same-prefix admission misses and falls back to the (corrupted)
+        # host copies -- proving the fallback path engages.
+        torch.cuda.synchronize()
+        manager._storage.spill_gpu_retained(1 << 62)
+        self.assertEqual(budget.used_pages, 0)
+        self.assertEqual(pg.canonical_span_pages, 0)
+        kv_d = manager.create_kv_cache(
+            input_tokens=tokens + [5, 6], max_capacity=(self.PREFIX_BLOCKS + 4) * self.TPB
+        )
+        with TemporaryCudaStream([]) as s4:
+            self.assertTrue(kv_d.resume(CudaStream(s4.handle)))
+            self.assertEqual(pg.alias_hits, 2)  # no new hit
+            self.assertGreater(pg.alias_misses, 0)
+            torch.cuda.synchronize()
+            d_indices = list(kv_d.get_base_page_indices(LifeCycleId(0)))[: self.PREFIX_BLOCKS]
+            data = self._block_floats(d_indices[0])
+            self.assertTrue(bool((data == -777.0).all().item()), "fallback not from host")
+            kv_d.close()
+        s4.take_finish_event().synchronize()
+        manager.drain_gpu_reclaim(CachedCudaEvent.NULL)
 
 
 @requires_cuda

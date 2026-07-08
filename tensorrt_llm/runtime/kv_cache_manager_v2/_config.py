@@ -242,6 +242,12 @@ class ContiguousArenaConfig:
     # GPU work touches the newly grown blocks (the executor adapter does).
     # Off by default so direct users keep synchronous mapping semantics.
     batched_map_sweep: bool = False
+    # P3 prefix aliasing: pin a closing canonical owner's fully-committed
+    # prefix pages (refcounted) and cuMemMap the SAME physical pages into
+    # later same-prefix sequences' ranges -- zero-copy, zero-budget reuse,
+    # with prefix-affine range adoption. Prototype; off by default. Also
+    # settable via TRTLLM_KV_ARENA_PREFIX_ALIASING=1.
+    prefix_aliasing: bool = False
 
     def __post_init__(self) -> None:
         _MIN_GRANULARITY = 2 << 20

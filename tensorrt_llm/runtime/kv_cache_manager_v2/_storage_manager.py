@@ -168,6 +168,7 @@ class CacheLevelManager:
                         arena_spec.config.phys_page_size,
                         arena_spec.config.map_ahead_pages,
                         arena_spec.config.lazy_gpu_retention,
+                        arena_spec.config.prefix_aliasing,
                     )
                 granularity = CacheLevelManager.cache_tier_granularity(
                     CacheTier.GPU_MEM, config.quota
@@ -495,11 +496,15 @@ class StorageManager:
             caps[pg_idx] = max(cap, self._min_slots[pg_idx], 1)
         return caps
 
-    def reserve_gpu_sequence(self, pg_idx: PoolGroupIndex, max_blocks: int) -> SequenceRange:
+    def reserve_gpu_sequence(
+        self, pg_idx: PoolGroupIndex, max_blocks: int, alias_key: "int | None" = None
+    ) -> SequenceRange:
         """Reserve a contiguous block-index range for a sequence's maximum
         block count in every pool of the group (§4.1). Pure VA bookkeeping;
-        physical pages are mapped by :meth:`ensure_gpu_mapped`."""
-        return self._gpu_arena_storage().pool_group(pg_idx).reserve_sequence(max_blocks)
+        physical pages are mapped by :meth:`ensure_gpu_mapped`. ``alias_key``
+        makes freed-range adoption prefix-affine (P3, see
+        ``ArenaPoolGroup.reserve_sequence``)."""
+        return self._gpu_arena_storage().pool_group(pg_idx).reserve_sequence(max_blocks, alias_key)
 
     def take_gpu_sequence_slot(
         self, pg_idx: PoolGroupIndex, rng: SequenceRange, ordinal: int
@@ -574,6 +579,54 @@ class StorageManager:
         self, pg_idx: PoolGroupIndex, page: Page
     ) -> "tuple[SlotId, SequenceRange] | None":
         return self._gpu_arena_storage().pool_group(pg_idx).lookup_ghost(page)
+
+    # -- canonical-span registry (P3 prefix aliasing) ------------------------
+
+    @property
+    def arena_prefix_aliasing(self) -> bool:
+        """Whether P3 prefix aliasing is active on the GPU arena level."""
+        if not self.is_arena_mode:
+            return False
+        storage = self._gpu_arena_storage()
+        for pg_idx in typed_range(self.num_pool_groups):
+            return storage.pool_group(pg_idx)._prefix_aliasing
+        return False
+
+    def register_arena_canonical_span(
+        self,
+        pg_idx: PoolGroupIndex,
+        rng: SequenceRange,
+        pages: Sequence[Page],
+        ready_event: CachedCudaEvent,
+    ) -> None:
+        """Pin a closing canonical owner's resident prefix pages for
+        zero-copy aliasing (P3). ``pages``: the canonical page objects of the
+        committed prefix, ordinal order."""
+        self._gpu_arena_storage().pool_group(pg_idx).register_canonical_span(
+            rng, pages, ready_event
+        )
+
+    def lookup_arena_canonical_span(
+        self, pg_idx: PoolGroupIndex, head_page: Page, matched_pages: Sequence[Page]
+    ) -> "tuple[int, object] | None":
+        return (
+            self._gpu_arena_storage()
+            .pool_group(pg_idx)
+            .lookup_canonical_span(head_page, matched_pages)
+        )
+
+    def alias_arena_span(
+        self, pg_idx: PoolGroupIndex, rng: SequenceRange, key: int, span: object
+    ) -> int:
+        return (
+            self._gpu_arena_storage()
+            .pool_group(pg_idx)
+            .alias_span_into_range(
+                rng,
+                key,
+                span,  # type: ignore[arg-type]
+            )
+        )
 
     def onboard_from_retained(
         self,

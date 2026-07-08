@@ -103,6 +103,46 @@ class PhysMem(ItemHolderWithSharedPool[drv.CUmemGenericAllocationHandle]):
     __slots__ = ()
 
 
+class SharedPhysMem:
+    """Refcounted wrapper around a pooled physical handle (P3 prefix
+    aliasing, DESIGN.md §4.4 phase 3): one ``cuMemCreate`` handle may be
+    mapped at several VA offsets -- across different sequences' arenas --
+    and pinned by the canonical-resident registry. Each mapping and each
+    registry pin holds one reference; the pooled ``PhysMem`` returns to its
+    shared pool only when the last reference drops. The driver keeps a
+    released handle's memory alive while mappings remain (validated by
+    ``bench_alias_map.py``), but this class never relies on that: the
+    ``close()`` is strictly last-reference."""
+
+    __slots__ = ("_phys_mem", "_refs")
+    _phys_mem: PhysMem
+    _refs: int
+
+    def __init__(self, phys_mem: PhysMem) -> None:
+        self._phys_mem = phys_mem
+        self._refs = 1
+
+    @property
+    def handle(self) -> drv.CUmemGenericAllocationHandle:
+        assert self._refs > 0
+        return self._phys_mem.handle
+
+    @property
+    def num_refs(self) -> int:
+        return self._refs
+
+    def add_ref(self) -> "SharedPhysMem":
+        assert self._refs > 0
+        self._refs += 1
+        return self
+
+    def drop_ref(self) -> None:
+        assert self._refs > 0
+        self._refs -= 1
+        if self._refs == 0:
+            self._phys_mem.close()
+
+
 class PooledPhysMemAllocator(PooledFactoryBase[drv.CUmemGenericAllocationHandle, PhysMem]):
     _Holder: Type[PhysMem] = PhysMem
     __slots__ = ("device_id", "phys_mem_size")
@@ -131,8 +171,9 @@ class VirtMem:
     _address: drv.CUdeviceptr
     _pm_stack: list[PhysMem]
     _access_desc: drv.CUmemAccessDesc
-    # chunk_index -> mapped PhysMem, for sparse mode. chunk_index = byte_offset // phys_mem_size.
-    _page_map: dict[int, PhysMem]
+    # chunk_index -> mapped handle, for sparse mode; refcounted so a chunk can
+    # alias a handle owned elsewhere (P3). chunk_index = byte_offset // phys_mem_size.
+    _page_map: dict[int, SharedPhysMem]
 
     def __init__(
         self, vm_size: int, phys_mem_allocator: PooledPhysMemAllocator, init_num_phys_mem: int = 0
@@ -161,11 +202,12 @@ class VirtMem:
         while self._pm_stack:
             self._pop().close()
         # Tear down any sparse mappings (see `_page_map`). Unmap each chunk's VA
-        # and return its handle to the shared pool.
-        for chunk_index, phys_mem in self._page_map.items():
+        # and drop its handle reference (returned to the shared pool when this
+        # was the last mapping/pin -- aliased handles survive, P3).
+        for chunk_index, shared in self._page_map.items():
             vm_ptr = drv.CUdeviceptr(int(self._address) + self.phys_mem_size * chunk_index)
             _unwrap(drv.cuMemUnmap(vm_ptr, self.phys_mem_size))
-            phys_mem.close()
+            shared.drop_ref()
         self._page_map = {}
         _unwrap(drv.cuMemAddressFree(self._address, self._vm_size))
         self._address = drv.CUdeviceptr(0)
@@ -275,7 +317,7 @@ class VirtMem:
                 phys_mem = self._allocator.create()
                 vm_ptr = drv.CUdeviceptr(int(self._address) + phys_mem_size * chunk_index)
                 _unwrap(drv.cuMemMap(vm_ptr, phys_mem_size, 0, phys_mem.handle, 0))
-                self._page_map[chunk_index] = phys_mem
+                self._page_map[chunk_index] = SharedPhysMem(phys_mem)
                 mapped.append(chunk_index)
             span_ptr = drv.CUdeviceptr(int(self._address) + phys_mem_size * start_chunk)
             _unwrap(
@@ -285,12 +327,51 @@ class VirtMem:
             for chunk_index in mapped:
                 vm_ptr = drv.CUdeviceptr(int(self._address) + phys_mem_size * chunk_index)
                 _unwrap(drv.cuMemUnmap(vm_ptr, phys_mem_size))
-                self._page_map.pop(chunk_index).close()
+                self._page_map.pop(chunk_index).drop_ref()
+            raise
+
+    def map_alias(self, byte_offset: int, shared_chunks: "list[SharedPhysMem]") -> None:
+        """Map already-existing physical handles at a contiguous run of chunks
+        starting at ``byte_offset`` (P3 prefix aliasing, DESIGN.md §4.4 phase
+        3): the same physical pages become visible through this reservation's
+        VA addresses in addition to wherever else they are mapped. Takes one reference
+        per chunk; access is granted with a single ``cuMemSetAccess`` over the
+        run. Atomic on failure (mapped prefix rolled back).
+
+        The caller owns read-after-write ordering: aliased bytes must only be
+        read after the events covering their last writes (the canonical
+        blocks' ready events)."""
+        assert not self._pm_stack, "cannot use sparse map_alias() on a tail-stack VirtMem"
+        num_chunks = len(shared_chunks)
+        if num_chunks == 0:
+            return
+        phys_mem_size = self.phys_mem_size
+        start_chunk = self._chunk_index(byte_offset)
+        assert (start_chunk + num_chunks) * phys_mem_size <= self._vm_size
+        mapped: list[int] = []
+        try:
+            for i, shared in enumerate(shared_chunks):
+                chunk_index = start_chunk + i
+                assert chunk_index not in self._page_map, f"chunk {chunk_index} already mapped"
+                vm_ptr = drv.CUdeviceptr(int(self._address) + phys_mem_size * chunk_index)
+                _unwrap(drv.cuMemMap(vm_ptr, phys_mem_size, 0, shared.handle, 0))
+                self._page_map[chunk_index] = shared.add_ref()
+                mapped.append(chunk_index)
+            span_ptr = drv.CUdeviceptr(int(self._address) + phys_mem_size * start_chunk)
+            _unwrap(
+                drv.cuMemSetAccess(span_ptr, phys_mem_size * num_chunks, (self._access_desc,), 1)
+            )
+        except Exception:  # keep map_alias atomic
+            for chunk_index in mapped:
+                vm_ptr = drv.CUdeviceptr(int(self._address) + phys_mem_size * chunk_index)
+                _unwrap(drv.cuMemUnmap(vm_ptr, phys_mem_size))
+                self._page_map.pop(chunk_index).drop_ref()
             raise
 
     def unmap_range(self, byte_offset: int, num_chunks: int) -> None:
-        """Unmap ``num_chunks`` chunks starting at ``byte_offset`` and return
-        their physical handles to the shared pool.
+        """Unmap ``num_chunks`` chunks starting at ``byte_offset`` and drop
+        their handle references (each handle returns to the shared pool when
+        its last mapping/pin drops -- aliased handles survive, P3).
 
         The caller MUST guarantee no in-flight GPU work references this range
         (deferred-reclaim gating, DESIGN.md §4.2). ``cuMemUnmap`` is host-side
@@ -303,11 +384,19 @@ class VirtMem:
         start_chunk = self._chunk_index(byte_offset)
         for i in range(num_chunks):
             chunk_index = start_chunk + i
-            phys_mem = self._page_map.pop(chunk_index, None)
-            assert phys_mem is not None, f"chunk {chunk_index} is not mapped"
+            shared = self._page_map.pop(chunk_index, None)
+            assert shared is not None, f"chunk {chunk_index} is not mapped"
             vm_ptr = drv.CUdeviceptr(int(self._address) + phys_mem_size * chunk_index)
             _unwrap(drv.cuMemUnmap(vm_ptr, phys_mem_size))
-            phys_mem.close()
+            shared.drop_ref()
+
+    def shared_chunk(self, byte_offset: int) -> "SharedPhysMem":
+        """The refcounted handle mapped at ``byte_offset`` (for registry pins
+        and alias sources, P3). Does NOT take a reference -- callers pin via
+        ``add_ref()``."""
+        shared = self._page_map.get(self._chunk_index(byte_offset))
+        assert shared is not None, "chunk is not mapped"
+        return shared
 
     def is_mapped(self, byte_offset: int) -> bool:
         return self._chunk_index(byte_offset) in self._page_map

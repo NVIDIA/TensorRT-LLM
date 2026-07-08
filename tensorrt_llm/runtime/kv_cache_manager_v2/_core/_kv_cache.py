@@ -20,7 +20,7 @@ from collections.abc import Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from itertools import chain
-from typing import TYPE_CHECKING, Callable, ClassVar, Iterator, NamedTuple, Type, cast
+from typing import TYPE_CHECKING, Any, Callable, ClassVar, Iterator, NamedTuple, Type, cast
 
 from .. import rawref
 from .._block_radix_tree import Block, ReuseMatch, ReuseScope, RootBlock, UselessBlockError
@@ -223,6 +223,7 @@ class _KVCache:
         "_max_capacity",
         "_arena_ranges",
         "_write_through_slots",
+        "_alias_spans",
         "__rawref__",
     )
 
@@ -281,6 +282,11 @@ class _KVCache:
     # (ordinal, life cycle). A slot's ready event completes when its copy is
     # valid; close()/suspend() adopt these instead of copying.
     _write_through_slots: dict[tuple[int, int], Slot]
+    # P3 prefix aliasing: per pool group, the canonical-span registry hit for
+    # this admission's reuse match -- (key, span) or None. Set at
+    # _setup_for_reuse, consumed (and cleared) by the FIRST resume's
+    # reserve+onboard; never set on suspend/resume round-trips.
+    _alias_spans: "list[tuple[int, Any] | None] | None"
 
     def __init__(
         self,
@@ -328,6 +334,7 @@ class _KVCache:
         self._max_capacity = max_capacity
         self._arena_ranges = None
         self._write_through_slots = {}
+        self._alias_spans = None
         # Arena-mode preconditions are validated by KVCacheManager.create_kv_cache
         # (raising here would leave a partially constructed object for __del__).
         assert not manager._storage.is_arena_mode or (max_capacity is not None and max_capacity > 0)
@@ -603,6 +610,22 @@ class _KVCache:
                                 )
                             ),
                         )
+                    # P3 prefix aliasing: pin the committed prefix's resident
+                    # pages so same-prefix admissions alias them (zero-copy).
+                    # The prefix must be a contiguous ordinal run from 0 with
+                    # a unique page per ordinal (v1: single-lc pool groups).
+                    ordinals = arena_closing.offload_ordinals[pg_idx]
+                    if ordinals and len(set(ordinals)) == len(ordinals):
+                        by_ordinal = dict(zip(ordinals, arena_closing.offload[pg_idx]))
+                        prefix_pages: list[CommittedPage] = []
+                        o = 0
+                        while o in by_ordinal:
+                            prefix_pages.append(by_ordinal[o])
+                            o += 1
+                        if prefix_pages:
+                            storage.register_arena_canonical_span(
+                                pg_idx, arena_ranges[pg_idx], prefix_pages, prior_event
+                            )
                 except OutOfPagesError:
                     # Host tier cannot take the write-out: drop the blocks
                     # instead of keeping them (reuse loss only, never an
@@ -1031,7 +1054,25 @@ class _KVCache:
             holder = expect_type(_PageHolder, self._block(ordinal, beam_idx)[lc_idx])
             entries.append((ordinal, lc_idx, holder))
         if not entries:
+            self._alias_spans = None
             return True
+        # P3 prefix aliasing: map the registry-pinned canonical span into any
+        # FRESH range before growth maps run (frontier still at the range
+        # start); a signature-matched adopted range already carries the
+        # mappings. Consumed once -- suspend/resume round-trips never alias.
+        alias_spans = self._alias_spans
+        self._alias_spans = None
+        if alias_spans is not None:
+            for pg_idx, rng in typed_enumerate(ranges):
+                hit = alias_spans[pg_idx]
+                if hit is None:
+                    continue
+                if rng._alias_span_key is None:
+                    storage.alias_arena_span(pg_idx, rng, hit[0], hit[1])
+                else:
+                    assert rng._alias_span_key == hit[0], (
+                        "adopted range's alias signature must match the admission's span"
+                    )
         if not self._arena_ensure_mapped(self.num_blocks, sync=True):
             return False
         # One explicit-destination migrate per (pool group, source level,
@@ -1042,11 +1083,25 @@ class _KVCache:
         ghost_groups: dict[PoolGroupIndex, list[int]] = {}
         ghost_srcs: dict[PoolGroupIndex, list[SlotId]] = {}
         ghost_rngs: dict[PoolGroupIndex, list[SequenceRange]] = {}
+        aliased_idx = list[int]()
         for i, (ordinal, lc_idx, holder) in enumerate(entries):
             pg_idx = storage.get_pool_group_index(lc_idx)
             dst_slots.append(storage.take_gpu_sequence_slot(pg_idx, ranges[pg_idx], int(ordinal)))
             page = holder.page
             if page.is_committed():
+                if alias_spans is not None:
+                    hit = alias_spans[pg_idx]
+                    if (
+                        hit is not None
+                        and int(ordinal) < hit[1].num_blocks
+                        and hit[1].page_refs[int(ordinal)]() is page
+                    ):
+                        # P3: the block's bytes are already visible at this
+                        # exact slot through the alias mapping -- no copy.
+                        # Consumers wait the span's ready event.
+                        dst_slots[-1].ready_event = hit[1].ready_event
+                        aliased_idx.append(i)
+                        continue
                 ghost = storage.lookup_arena_ghost(pg_idx, page)
                 if ghost is not None:
                     src_id, src_rng = ghost
@@ -1082,6 +1137,10 @@ class _KVCache:
             )
             for i, slot in zip(idx_list, ghost_dsts):
                 copied[i] = slot
+        # P3 aliased blocks: the slot IS the data (no copy ran); the lock
+        # loop below builds the same sequence-private page over it.
+        for i in aliased_idx:
+            copied[i] = dst_slots[i]
         stream_wait_events(
             self.cuda_stream,
             (
@@ -1555,11 +1614,18 @@ class _KVCache:
             assert max_capacity is not None
             max_blocks = div_up(max_capacity, self.tokens_per_block)
             ranges = list[SequenceRange]()
+            alias_spans = self._alias_spans
             try:
                 pg_idx = PoolGroupIndex(0)
                 while pg_idx < storage.num_pool_groups:
                     try:
-                        ranges.append(storage.reserve_gpu_sequence(pg_idx, max_blocks))
+                        # P3: a registry hit makes adoption prefix-affine --
+                        # a parked range already alias-mapping this span is
+                        # handed over with its mappings (and content) intact.
+                        alias_key = None
+                        if alias_spans is not None and alias_spans[pg_idx] is not None:
+                            alias_key = alias_spans[pg_idx][0]
+                        ranges.append(storage.reserve_gpu_sequence(pg_idx, max_blocks, alias_key))
                         pg_idx = PoolGroupIndex(pg_idx + 1)
                     except MemoryError:
                         # VA exhaustion: retained ranges hold VA too (§4.4
@@ -2424,6 +2490,49 @@ class _KVCache:
                     indices.extend([BAD_PAGE_INDEX] * (self.num_blocks - len(indices)))
                 else:
                     assert len(indices) >= self.num_blocks
+        if self.manager._storage.is_arena_mode:
+            self._arena_lookup_alias_spans(matched, int(full_reused_end))
+
+    def _arena_lookup_alias_spans(self, matched: "Sequence[Block]", full_blocks: int) -> None:
+        """Resolve this admission's reuse match against the canonical-span
+        registry (P3 prefix aliasing): a hit means the matched prefix's bytes
+        are still GPU-resident and refcount-pinned, so the first resume
+        aliases them into the fresh ranges (or adopts a signature-matched
+        parked range) instead of copying. V1 scope: pool groups with exactly
+        one non-SSM life cycle; any staleness simply falls back to the copy
+        paths."""
+        storage = self._storage
+        if not storage.arena_prefix_aliasing or full_blocks <= 0:
+            return
+        life_cycles = self.manager._life_cycles
+        ssm_lc_id = life_cycles.ssm_life_cycle_id
+        lc_of_pg: dict[int, "LifeCycleId | None"] = {}
+        for lc_idx, _lc in life_cycles.items():
+            if lc_idx == ssm_lc_id:
+                continue
+            pg = int(storage.get_pool_group_index(lc_idx))
+            lc_of_pg[pg] = lc_idx if pg not in lc_of_pg else None  # None: multi-lc, skip
+        spans: "list[tuple[int, Any] | None]" = [None] * int(storage.num_pool_groups)
+        found = False
+        for pg, lc_idx in lc_of_pg.items():
+            if lc_idx is None:
+                continue
+            pages: list[CommittedPage] = []
+            for ordinal in range(full_blocks):
+                ref = matched[ordinal].storage[lc_idx]
+                page = None if ref is None else ref()
+                if page is None:
+                    pages.clear()
+                    break
+                pages.append(page)
+            if not pages:
+                continue
+            hit = storage.lookup_arena_canonical_span(PoolGroupIndex(pg), pages[0], pages)
+            if hit is not None:
+                spans[pg] = hit
+                found = True
+        if found:
+            self._alias_spans = spans
 
     def _free_scratch_slots(self) -> None:
         """Free all scratch slots back to the storage manager."""

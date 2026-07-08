@@ -47,7 +47,7 @@ from collections.abc import Sequence
 from math import gcd
 
 from ._common import MemAddress
-from ._cuda_virt_mem import PooledPhysMemAllocator, VirtMem
+from ._cuda_virt_mem import PooledPhysMemAllocator, SharedPhysMem, VirtMem
 from ._exceptions import OutOfPagesError
 from ._utils import CachedCudaEvent, div_up
 
@@ -331,6 +331,7 @@ class SequenceArena:
         "_budget",
         "_reclaim",
         "_frontiers",
+        "_aliased",
     )
     _vms: list[VirtMem]
     _alloc: BlockRangeAllocator
@@ -345,6 +346,11 @@ class SequenceArena:
     # holes can form. Lets growth/reclaim work in O(1) per pool instead of
     # rescanning every chunk from the range start.
     _frontiers: dict[int, list[int]]
+    # base_block -> total alias-mapped chunks across pools (P3 prefix
+    # aliasing). Aliased chunks are mapped below the frontier like any others
+    # but were never charged to the budget (their physical charge lives with
+    # the canonical registry pin), so reclaim/retain accounting subtracts them.
+    _aliased: dict[int, int]
 
     def __init__(
         self,
@@ -370,6 +376,7 @@ class SequenceArena:
         self._budget = page_budget
         self._reclaim = []
         self._frontiers = {}
+        self._aliased = {}
 
     @property
     def num_pools(self) -> int:
@@ -404,6 +411,70 @@ class SequenceArena:
         for pool in range(len(self._vms)):
             total += frontiers[pool] - self._chunk_range(pool, base_block, 0)[0]
         return total
+
+    def charged_pages_in_range(self, base_block: int) -> int:
+        """Pages this range holds against the budget: mapped pages minus
+        alias-mapped chunks (whose physical charge lives with the canonical
+        registry pin, P3)."""
+        return self.mapped_pages_in_range(base_block) - self._aliased.get(base_block, 0)
+
+    def aliased_pages_in_range(self, base_block: int) -> int:
+        return self._aliased.get(base_block, 0)
+
+    def alias_prefix(self, base_block: int, shared_per_pool: "list[list[SharedPhysMem]]") -> int:
+        """Map an already-resident canonical prefix's physical pages at the
+        START of this range in every pool (P3 zero-copy reuse). Must run
+        before any of the range's own growth maps (frontier still at the
+        range start). Charges NOTHING against the budget -- the pages'
+        physical charge is carried by their canonical registry pin. Returns
+        the total chunks aliased. Atomic per pool (``map_alias``); on failure
+        earlier pools' aliases remain and are accounted, so the range is
+        still safely reclaimable."""
+        frontiers = self._frontiers[base_block]
+        page = self._phys_page_size
+        total = 0
+        try:
+            for pool, shared in enumerate(shared_per_pool):
+                if not shared:
+                    continue
+                lo = self._chunk_range(pool, base_block, 0)[0]
+                assert frontiers[pool] == lo, "alias_prefix must precede growth maps"
+                self._vms[pool].map_alias(lo * page, shared)
+                frontiers[pool] = lo + len(shared)
+                total += len(shared)
+        finally:
+            if total:
+                self._aliased[base_block] = self._aliased.get(base_block, 0) + total
+        return total
+
+    def shared_prefix_chunks(self, base_block: int, num_blocks: int) -> "list[list[SharedPhysMem]]":
+        """Per pool, the refcounted handles of the chunks FULLY covered by the
+        first ``num_blocks`` blocks of this range (canonical registration,
+        P3). All such chunks are mapped (committed blocks lie below the
+        frontier). Takes no references -- callers pin via ``add_ref()``."""
+        page = self._phys_page_size
+        out: list[list[SharedPhysMem]] = []
+        for pool in range(len(self._vms)):
+            stride = self._strides[pool]
+            lo = self._chunk_range(pool, base_block, 0)[0]
+            hi = ((base_block + num_blocks) * stride) // page  # full coverage only
+            vm = self._vms[pool]
+            out.append([vm.shared_chunk(c * page) for c in range(lo, hi)])
+        return out
+
+    def aliasable_prefix_blocks(self, base_block: int, num_blocks: int) -> int:
+        """The longest block prefix whose bytes lie entirely within
+        fully-covered chunks in EVERY pool -- the aliasable span. The
+        remainder (a partial boundary page) falls back to the copy path."""
+        page = self._phys_page_size
+        best = num_blocks
+        for pool in range(len(self._vms)):
+            stride = self._strides[pool]
+            hi = ((base_block + num_blocks) * stride) // page
+            blocks = (hi * page) // stride - base_block
+            if blocks < best:
+                best = blocks
+        return max(0, best)
 
     def reserve(self, max_blocks: int) -> int:
         """Reserve VA for a sequence's maximum block count; returns base_block.
@@ -547,10 +618,14 @@ class SequenceArena:
 
             _unwrap(drv.cuCtxSynchronize())
         frontiers = self._frontiers.pop(base_block)
+        num_aliased = self._aliased.pop(base_block, 0)
         page = self._phys_page_size
         num_unmapped = 0
         for pool in range(len(self._vms)):
             # Mapped chunks are exactly the prefix [range start, frontier).
+            # Alias-mapped chunks unmap uniformly; their handles survive via
+            # the refcount (registry pin / other aliases) and were never
+            # charged here, so only the surplus returns to the budget.
             lo = self._chunk_range(pool, base_block, 0)[0]
             hi = frontiers[pool]
             if hi > lo:
@@ -558,12 +633,16 @@ class SequenceArena:
                 num_unmapped += hi - lo
         self._alloc.free(base_block)
         if self._budget is not None:
-            self._budget.release(num_unmapped)
+            self._budget.release(num_unmapped - num_aliased)
 
     def destroy(self) -> None:
         if self._budget is not None:
-            self._budget.release(self.mapped_pages)
+            total_aliased = 0
+            for v in self._aliased.values():
+                total_aliased += v
+            self._budget.release(self.mapped_pages - total_aliased)
         for vm in self._vms:
             vm.destroy()
         self._reclaim = []
         self._frontiers = {}
+        self._aliased = {}
