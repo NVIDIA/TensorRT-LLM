@@ -525,7 +525,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
             logger.debug(
                 f"CuteDSL: Found {len(valid_tactics)} valid tactics for M={m}, N={n}, K={real_k}"
             )
-            return valid_tactics
+            # Optionally rank/prune the sweep with nvMatmulHeuristics (opt-in via
+            # TRTLLM_CUTEDSL_NVMMH_ENABLE). Returns the full sweep unchanged when
+            # disabled, unconfigured, or on any failure.
+            return self._rank_prune_tactics(valid_tactics, m, n, real_k)
 
         def _swap_ab_candidates(self, m, n):
             """Deterministic swap_ab choice (not swept), constrained by C-layout
@@ -639,26 +642,25 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 return False
             return True
 
-        def filter_tactics_with_heuristics(self, inputs, profile, tactics,
-                                           tuning_config, **kwargs):
-            """Rank/prune the valid tactics with nvMatmulHeuristics (opt-in).
+        def _rank_prune_tactics(self, tactics, m, n, real_k):
+            """Rank/prune the full-sweep tactics with nvMatmulHeuristics (opt-in).
 
-            This is a strict ranking+subset of the ``tactics`` produced by
-            get_valid_tactics -- it never introduces a (tile, cluster, swap)
-            the kernel validator rejected. The model ranks the candidates and
-            we keep only the top ``TRTLLM_CUTEDSL_NVMMH_MAX_TACTICS`` distinct
-            (mma_tiler, cluster, swap) keys that also appear in the supplied
-            valid list (all matching prefetch variants retained), then re-run
-            the validity gate before emission. ``TRTLLM_CUTEDSL_NVMMH_FIELDS``
-            selects the model-driven knobs: tile/cluster (coupled) rank/prune
-            the tiles, while swizzle / cta_order additionally annotate the kept
-            tactic with the model's scheduler knobs (a safe 6-tuple extension --
-            they do not affect can_implement). Deterministic swap_ab selection
-            (small M swaps) is applied here, in the opt-in path only.
+            Called at the end of get_valid_tactics. A strict, re-validated subset
+            of ``tactics`` -- it never introduces a (tile, cluster, swap) the
+            kernel validator rejected. Gated by TRTLLM_CUTEDSL_NVMMH_ENABLE;
+            TRTLLM_CUTEDSL_NVMMH_FIELDS selects the model-driven knobs. When
+            "tile"/"cluster" is selected we keep only the top
+            TRTLLM_CUTEDSL_NVMMH_MAX_TACTICS ranked (mma_tiler, cluster, swap)
+            keys (all matching prefetch variants retained); when only scheduler
+            knobs (swizzle / cta_order) are selected we sweep every tile/cluster
+            and just annotate it with the model's swizzle / raster (a safe
+            6-tuple extension -- they do not affect can_implement). Deterministic
+            swap_ab selection (small M swaps) is applied here, in the opt-in path
+            only.
 
             Purely additive: on any failure, an empty match, or when heuristics
-            are disabled / unconfigured, returns the input ``tactics`` unchanged
-            so profiling never loses a valid candidate.
+            are disabled / unconfigured, returns ``tactics`` unchanged so
+            profiling never loses a valid candidate.
             """
             if not nvmmh_enabled_for_nvfp4() or not tactics:
                 return tactics
@@ -666,10 +668,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
             if not fields:
                 return tactics
             try:
-                m = inputs[0].shape[0]
-                n = inputs[1].shape[0]
-                real_k = inputs[0].shape[1] * 2  # FP4 packed in uint8
                 max_tactics = nvmmh_max_tactics()
+                # Only prune the tile/cluster set when the model is asked to
+                # drive it; scheduler-only fields keep the full sweep.
+                prune_tile_cluster = bool(fields & {"tile", "cluster"})
                 use_swizzle = "swizzle" in fields
                 use_cta_order = "cta_order" in fields
                 emit_extended = use_swizzle or use_cta_order
@@ -709,20 +711,23 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         pref_sched[key] = (max(1, int(swizzle_size)),
                                            bool(raster_along_m))
 
-                # Keep the top-K model-preferred keys that exist in the valid
-                # list (in model-rank order).
-                matched_keys = {(t[0], t[1], t[2])
-                                for t in tactics
-                                if (t[0], t[1], t[2]) in pref_rank}
-                if not matched_keys:
-                    return tactics
-                kept_keys = set(
-                    sorted(matched_keys,
-                           key=lambda kk: pref_rank[kk])[:max_tactics])
+                # Restrict to the top-K ranked tile/cluster keys ONLY when the
+                # model drives tile/cluster. For scheduler-only fields keep every
+                # valid tile/cluster key and just annotate it below.
+                valid_keys = {(t[0], t[1], t[2]) for t in tactics}
+                if prune_tile_cluster:
+                    matched_keys = valid_keys & pref_rank.keys()
+                    if not matched_keys:
+                        return tactics
+                    kept_keys = set(
+                        sorted(matched_keys,
+                               key=lambda kk: pref_rank[kk])[:max_tactics])
+                else:
+                    kept_keys = valid_keys
 
                 # Emit every supplied (already-valid) tactic whose key is kept,
                 # re-validating as a safety net and optionally annotating the
-                # model's swizzle / raster.
+                # model's swizzle / raster (neutral defaults for unranked keys).
                 selected = []
                 for t in tactics:
                     key = (t[0], t[1], t[2])
@@ -735,7 +740,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                             use_prefetch, m, n, real_k):
                         continue
                     if emit_extended:
-                        swizzle_size, raster_along_m = pref_sched[key]
+                        swizzle_size, raster_along_m = pref_sched.get(
+                            key, (1, True))
                         selected.append(
                             (mma_tiler_mn, cluster_shape_mn, swap_ab,
                              use_prefetch, swizzle_size, raster_along_m))

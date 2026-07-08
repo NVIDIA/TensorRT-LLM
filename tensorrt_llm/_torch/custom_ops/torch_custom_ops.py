@@ -1111,17 +1111,12 @@ class NVFP4GemmUnifiedRunner(TunableRunner):
                     # SM version OK, check if CuteDSL supports the current shape
                     cutedsl_runner = CuteDSLNVFP4BlackwellRunner(
                         self.output_dtype)
+                    # get_valid_tactics ranks/prunes with nvMatmulHeuristics
+                    # internally when TRTLLM_CUTEDSL_NVMMH_ENABLE=1 (no-op
+                    # otherwise), so the returned list already reflects any
+                    # opt-in pruning before it enters the unified tactic list.
                     cutedsl_tactics = cutedsl_runner.get_valid_tactics(
                         inputs, profile)
-                    # Let nvMatmulHeuristics rank/prune the CuteDSL tactics
-                    # before they enter the unified tactic list. No-op unless
-                    # TRTLLM_CUTEDSL_NVMMH_ENABLE=1; this is the only place the
-                    # heuristic applies on the nvfp4_gemm dispatcher path (the
-                    # direct cute_dsl_nvfp4_gemm_blackwell op uses the runner's
-                    # own hook).
-                    cutedsl_tactics = cutedsl_runner.filter_tactics_with_heuristics(
-                        inputs, profile, cutedsl_tactics,
-                        cutedsl_runner.tuning_config)
 
                     if cutedsl_tactics:
                         # CuteDSL supports this shape
