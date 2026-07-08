@@ -2033,9 +2033,12 @@ class MLA(nn.Module):
         return fp8_o, output_sf
 
     def _should_use_fused_oproj(self) -> bool:
-        return (os.environ.get("DSV4_FUSE_OPROJ", "0") == "1"
+        # Eligible Blackwell paths are on by default; keep an emergency fallback.
+        return (not _is_env_truthy("TRTLLM_DSV4_DISABLE_FUSED_OPROJ")
+                and is_sm_100f() and IS_CUTLASS_DSL_AVAILABLE
                 and self.n_local_groups == self.num_groups
                 and getattr(self.o_b_proj, "tp_size", 1) == 1
+                and self.o_a_proj.dtype == torch.float8_e4m3fn
                 and self.o_b_proj.has_fp8_block_scales and not getattr(
                     self.o_b_proj, "use_cute_dsl_blockscaling_mm", False))
 
@@ -2073,16 +2076,22 @@ class MLA(nn.Module):
         SK = _select_dsv4_ob_split_k(M, getattr(self, "ob_split_k", None))
         packed_k = K_ob // _DSV4_OB_PACKED_SCALE_K
         # CuTe specializes the DSV4-Pro O_b shape.
-        can_try_cute = (IS_CUTLASS_DSL_AVAILABLE and M > 0
-                        and (M >= _DSV4_OB_CUTE_SK1_MIN_M or SK > 1)
-                        and N == _DSV4_PRO_OB_N and K_ob == _DSV4_PRO_OB_K
-                        and K_ob % (_DSV4_OB_PACKED_SCALE_K * SK) == 0
-                        and sf_out.dtype == torch.int32 and sf_out.dim() == 2
-                        and sf_out.shape == (M, packed_k)
-                        and sf_out.stride(0) == 1 and sf_out.stride(1) >= M
-                        and sf_out.stride(1) % _UE8M0_SCALES_PER_WORD == 0)
+        use_cute_tactic = (IS_CUTLASS_DSL_AVAILABLE and M > 0
+                           and (M >= _DSV4_OB_CUTE_SK1_MIN_M or SK > 1)
+                           and N == _DSV4_PRO_OB_N and K_ob == _DSV4_PRO_OB_K
+                           and K_ob % (_DSV4_OB_PACKED_SCALE_K * SK) == 0)
+        activation_layout_ok = (sf_out.dtype == torch.int32
+                                and sf_out.dim() == 2
+                                and sf_out.shape == (M, packed_k)
+                                and sf_out.stride(0) == 1
+                                and sf_out.stride(1) >= M and
+                                sf_out.stride(1) % _UE8M0_SCALES_PER_WORD == 0)
+        if use_cute_tactic and not activation_layout_ok:
+            raise RuntimeError(
+                "DSV4-Pro O_b CuTe tactic requires packed activation scales.")
+
         cute_wsf = wsf
-        if can_try_cute and cute_wsf.dtype != torch.int32:
+        if use_cute_tactic and cute_wsf.dtype != torch.int32:
             from tensorrt_llm.quantization.utils.fp8_utils import \
                 transform_sf_into_required_layout
             cute_wsf = getattr(self.o_b_proj, "_ob_wsf_int", None)
@@ -2100,12 +2109,17 @@ class MLA(nn.Module):
                     is_sfa=False)
                 self.o_b_proj._ob_wsf_int = cute_wsf
 
-        can_use_cute = (can_try_cute and cute_wsf.dtype == torch.int32
-                        and cute_wsf.dim() == 2
-                        and cute_wsf.shape == (N, packed_k)
-                        and cute_wsf.stride(0) == 1 and cute_wsf.stride(1) == N)
-        if not can_use_cute:
-            # Keep DeepGEMM for unsupported shapes and layouts.
+        weight_layout_ok = (cute_wsf.dtype == torch.int32
+                            and cute_wsf.dim() == 2
+                            and cute_wsf.shape == (N, packed_k)
+                            and cute_wsf.stride(0) == 1
+                            and cute_wsf.stride(1) == N)
+        if use_cute_tactic and not weight_layout_ok:
+            raise RuntimeError(
+                "DSV4-Pro O_b CuTe tactic requires packed weight scales.")
+
+        if not use_cute_tactic:
+            # Keep DeepGEMM for shapes outside the tuned CuTe buckets.
             hidden = torch.empty([M, N],
                                  device=o_lora_fp8.device,
                                  dtype=self.dtype)

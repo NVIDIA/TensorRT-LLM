@@ -368,7 +368,7 @@ def calculate_reference_deepseek_v4_o_proj(
 
 def _build_dsv4_o_proj_case(num_tokens: int, dtype_str: str, device: torch.device):
     """Build an MLA module, inputs, and reference-path tensors for the DeepSeek-V4
-    o_proj tests. Shared by the correctness test and the DSV4_FUSE_OPROJ fused
+    o_proj tests. Shared by the correctness test and the default fused
     fp8-equivalence test so both exercise an identical setup.
 
     Returns:
@@ -622,18 +622,16 @@ def test_deepseek_v4_o_proj(num_tokens: int, dtype_str: str):
 @pytest.mark.skip_less_device_memory(80000)
 @pytest.mark.parametrize("num_tokens", [1, 16, 32, 128, 256])
 def test_deepseek_v4_o_proj_fused_fp8_equivalence(num_tokens: int, monkeypatch):
-    """The opt-in DSV4_FUSE_OPROJ fused fp8 epilogue must be numerically
-    equivalent to the default unfused path.
+    """The default fused FP8 epilogue must match the disabled baseline.
 
-    Fused (DSV4_FUSE_OPROJ=1): o_a's CuTe-DSL GEMM emits o_lora directly as fp8
+    Fused (default): o_a's CuTe-DSL GEMM emits o_lora directly as fp8
     e4m3 + packed-UE8M0 1x128 scale factors, fed straight to o_b.
-    Unfused (default): o_a emits bf16 o_lora, then ``o_b_proj`` runs the separate
-    1x128 quant + DeepGEMM. Since the fusion only folds the *same* quant into o_a's
-    epilogue, the two production paths must match far tighter than the fp8-vs-bf16
-    reference bar.
+    Disabled: o_a emits bf16 o_lora, then ``o_b_proj`` runs the separate 1x128
+    quant + DeepGEMM. Since the fusion only folds the *same* quant into o_a's
+    epilogue, the two paths must match far tighter than the fp8-vs-bf16 reference.
     """
     if get_sm_version() < 100:
-        pytest.skip("DSV4_FUSE_OPROJ fp8 fusion requires Blackwell (SM100+)")
+        pytest.skip("fused DeepSeek-V4 FP8 O-projection requires Blackwell (SM100+)")
 
     device = torch.device("cuda")
     mla, attn_out_latent, position_ids, refs = _build_dsv4_o_proj_case(num_tokens, "fp8", device)
@@ -645,12 +643,12 @@ def test_deepseek_v4_o_proj_fused_fp8_equivalence(num_tokens: int, monkeypatch):
     assert mla.o_b_proj.has_fp8_block_scales
     assert not getattr(mla.o_b_proj, "use_cute_dsl_blockscaling_mm", False)
 
-    # Unfused (default): DSV4_FUSE_OPROJ unset.
-    monkeypatch.delenv("DSV4_FUSE_OPROJ", raising=False)
+    # Explicit kill switch retains the unfused fallback.
+    monkeypatch.setenv("TRTLLM_DSV4_DISABLE_FUSED_OPROJ", "1")
     out_unfused = mla._deepseek_v4_o_proj(attn_out_latent.clone(), position_ids)
 
-    # Fused: opt in.
-    monkeypatch.setenv("DSV4_FUSE_OPROJ", "1")
+    # Unset is the production default and must take the fused path.
+    monkeypatch.delenv("TRTLLM_DSV4_DISABLE_FUSED_OPROJ", raising=False)
     mla.ob_split_k = 1
     out_fused = mla._deepseek_v4_o_proj(attn_out_latent.clone(), position_ids)
 
