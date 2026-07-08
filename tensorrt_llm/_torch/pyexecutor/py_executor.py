@@ -3118,21 +3118,35 @@ class PyExecutor:
         # all-reduce in the forward would mismatch (hang/crash). AND readiness
         # across the TP group: admit a request only once its KV has landed on all
         # ranks. (pp_size==1 -> the TP group is the whole world; TP=1 is a no-op.)
-        local_has_pending = 0 if all(local_ready) else 1
-        if self.dist.tp_size > 1:
-            any_pending = self.dist.tp_allreduce(int(local_has_pending),
+        # Cross-rank AND is only correct for plain TP, where every rank holds the identical batch
+        # (leader-broadcast + deterministic schedule). Under attention-DP the ranks schedule
+        # independent batches, and under PP the TP-group readiness misses PP peers' shards -- both
+        # break the collective (deadlock, or silent drops via zip-truncation). Do the cross-rank sync
+        # only for plain TP; otherwise gate locally (correct for TP=1, and a no-op under ADP/PP since
+        # disk onboards are refused there at KV-manager init).
+        tp_sync = (self.dist.tp_size > 1 and not self.enable_attention_dp
+                   and self.dist.pp_size == 1)
+        if tp_sync:
+            any_pending = self.dist.tp_allreduce(0 if all(local_ready) else 1,
                                                  op=ReduceOp.MAX)
-        else:
-            any_pending = local_has_pending
-        if not any_pending:
-            # Every rank has all context blocks ready -> keep the full batch.
-            for req in ctx:
-                req.py_onboard_pending = False
-            return
-        if self.dist.tp_size > 1:
+            if not any_pending:
+                for req in ctx:
+                    req.py_onboard_pending = False
+                return
             gathered = self.dist.tp_allgather(local_ready)
             global_ready = [all(bits) for bits in zip(*gathered)]
         else:
+            if self.dist.tp_size > 1 and not getattr(
+                    self, "_warned_park_local_only", False):
+                logger.warning(
+                    "disk-onboard readiness: cross-rank park sync is unsupported under "
+                    "attention-DP/PP; gating locally (disk onboards should be disabled here)"
+                )
+                self._warned_park_local_only = True
+            if all(local_ready):
+                for req in ctx:
+                    req.py_onboard_pending = False
+                return
             global_ready = local_ready
 
         kept = []
