@@ -434,7 +434,6 @@ unittest/disaggregated/test_kv_transfer.py::test_transfer_worker_v2[tp4_pp1_to_t
 unittest/executor/test_rpc.py::TestRpcCorrectness::test_incremental_task_async SKIP (https://nvbugs/5741476)
 unittest/executor/test_rpc_proxy.py SKIP (https://nvbugs/5605741)
 unittest/executor/test_rpc_worker.py SKIP (https://nvbugs/5605741)
-unittest/llmapi/test_additional_model_outputs.py -m "gpu2" SKIP (https://nvbugs/6428091)
 unittest/llmapi/test_additional_model_outputs.py::test_additional_model_outputs_integration_pp2 SKIP (https://nvbugs/6427411)
 unittest/llmapi/test_llm_multi_gpu_pytorch.py -m "gpu2" SKIP (https://nvbugs/6428092)
 unittest/llmapi/test_llm_multi_gpu_pytorch.py::test_llm_get_stats_pp2[False-False-True] SKIP (https://nvbugs/6432826)
