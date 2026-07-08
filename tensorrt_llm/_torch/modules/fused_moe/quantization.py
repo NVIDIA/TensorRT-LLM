@@ -2985,6 +2985,14 @@ class NVFP4MegaMoECuteDslMethod(NVFP4FusedMoEMethod):
         return (cls._round_up_int(hidden, 128) *
                 cls._round_up_int(cls._ceil_div_int(intermediate, 16), 4))
 
+    # Source-checkpoint tensors that are only needed transiently (filled
+    # from the checkpoint, packed into the mega_* buffers, then freed).
+    # They are kept as 0-element placeholders outside the load window so
+    # the full source set and the mega buffers never coexist in memory
+    # (streaming load: peak = steady set + ONE layer of sources).
+    _STREAMED_SOURCE_PARAMS = ("w3_w1_weight", "w3_w1_weight_scale",
+                               "w2_weight", "w2_weight_scale")
+
     # -----------------------------------------------------------------
     # create_weights: register MegaMoE-format parameters in addition to
     # the grandparent's standard NVFP4 parameters.
@@ -3021,6 +3029,23 @@ class NVFP4MegaMoECuteDslMethod(NVFP4FusedMoEMethod):
         super().create_weights(module, self.weight_dtype, weight_vec_size,
                                self.block_scales_dtype,
                                self.block_scales_vec_size)
+
+        # Streaming load: shrink the source params to 0-element
+        # placeholders right away (full shapes are preserved in
+        # ``rebuild_tensor_metadata``); ``load_weights`` rematerializes
+        # them one module at a time. Without this, init materializes the
+        # full source set AND the mega buffers together (~229 GB/rank on
+        # DSv4-Pro, which cannot fit on 180 GB-class GPUs).
+        for _name in self._STREAMED_SOURCE_PARAMS:
+            _p = getattr(module, _name)
+            replace_parameter_and_save_metadata(
+                module, _name,
+                nn.Parameter(torch.empty(0, dtype=_p.dtype),
+                             requires_grad=False),
+                module.rebuild_tensor_metadata)
+        # Rebind quant_scales to the placeholders so the full-size CPU
+        # init tensors are actually released.
+        self.setup_quant_scales(module)
 
         num_local_slots = module.expert_size_per_partition
         hidden = module.hidden_size
@@ -3085,6 +3110,35 @@ class NVFP4MegaMoECuteDslMethod(NVFP4FusedMoEMethod):
             requires_grad=False,
         )
         module.register_parameter("fc1_norm_const", fc1_norm_const)
+
+    def _materialize_source_params(self, module: torch.nn.Module):
+        """Rematerialize this module's streamed source params (full shape,
+        on CUDA) so the loader can fill them. No-op when already
+        materialized (repeated partial-loading calls / after
+        ``pre_reload_weights``)."""
+        for name in self._STREAMED_SOURCE_PARAMS:
+            p = getattr(module, name, None)
+            if (p is not None and p.data.numel() == 0
+                    and name in module.rebuild_tensor_metadata):
+                meta = module.rebuild_tensor_metadata[name]['meta']
+                module.register_parameter(
+                    name,
+                    nn.Parameter(torch.empty_like(meta, device="cuda"),
+                                 requires_grad=False))
+
+    def load_weights(self,
+                     module: torch.nn.Module,
+                     weights: List[Dict],
+                     weight_loading_mode: MoEWeightLoadingMode,
+                     allow_partial_loading: bool = False):
+        # Streaming load: sources exist only inside this window; the
+        # process_weights_after_loading tail packs them into the mega_*
+        # buffers and re-shrinks them to 0-element placeholders.
+        self._materialize_source_params(module)
+        super().load_weights(module,
+                             weights,
+                             weight_loading_mode,
+                             allow_partial_loading=allow_partial_loading)
 
     # -----------------------------------------------------------------
     # Loader overrides (4x @abstractmethod hooks on the grandparent).
@@ -3244,6 +3298,12 @@ class NVFP4MegaMoECuteDslMethod(NVFP4FusedMoEMethod):
     # built before the parent deletes raw input-scale staging.
     # -----------------------------------------------------------------
     def process_weights_after_loading(self, module: torch.nn.Module):
+        # Streaming load: nothing was loaded into this module (e.g. a
+        # stray finalize under LoadFormat.DUMMY) -- the sources are still
+        # 0-element placeholders and there is nothing to pack.
+        if (module.w3_w1_weight.data.numel() == 0
+                and not hasattr(module, 'tmp_cutlass_w3_w1_weights')):
+            return
         # ---- Cat raw w3+w1 weights ----
         # Iterates BOTH routed (module.w3_w1_weight.data) and shared
         # (module.local_shared_w3_w1_tensors) entries: the loader keys
@@ -3321,8 +3381,7 @@ class NVFP4MegaMoECuteDslMethod(NVFP4FusedMoEMethod):
         # ``replace_parameter_and_save_metadata`` so ``pre_reload_weights`` can
         # restore the original shape on a later reload.
         if not self.need_load_shared_weights(module):
-            for _name in ("w3_w1_weight", "w3_w1_weight_scale", "w2_weight",
-                          "w2_weight_scale"):
+            for _name in self._STREAMED_SOURCE_PARAMS:
                 _p = getattr(module, _name, None)
                 if _p is not None and _p.data.numel() > 0:
                     replace_parameter_and_save_metadata(
