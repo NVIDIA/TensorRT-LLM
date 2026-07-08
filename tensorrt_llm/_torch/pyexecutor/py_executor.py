@@ -3858,8 +3858,10 @@ class PyExecutor:
                 if can_queue:
                     self._kv_connector_start_batch(scheduled_batch)
 
-                # if using a kv connector, we need to call can_queue again since scheduled_batch might have changed
-                if self.kv_connector_manager:
+                # scheduled_batch may have shrunk since the gate above -- parking context requests whose
+                # disk onboard has not landed empties it, and a kv connector can change it too. Re-check
+                # before forwarding so we never forward on an empty batch.
+                if can_queue:
                     can_queue, _ = self._can_queue(scheduled_batch)
 
                 if not can_queue:
@@ -4324,8 +4326,10 @@ class PyExecutor:
                 if can_queue:
                     self._kv_connector_start_batch(scheduled_batch)
 
-                # if using a kv connector, we need to call can_queue again since scheduled_batch might have changed
-                if self.kv_connector_manager:
+                # scheduled_batch may have shrunk since the gate above -- parking context requests whose
+                # disk onboard has not landed empties it, and a kv connector can change it too. Re-check
+                # before forwarding so we never forward on an empty batch.
+                if can_queue:
                     can_queue, can_queue_this_rank = self._can_queue(
                         scheduled_batch)
 
