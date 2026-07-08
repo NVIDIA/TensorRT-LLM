@@ -1,14 +1,5 @@
 # How to run TRT-LLM tests
 
-> **Session prefetch (on by default).** Both the unittest and integration
-> trees load a pytest plugin (`tests/test_common/session_prefetcher.py`) that
-> hides per-test startup costs: while the current test runs on the GPUs it
-> (a) pre-spawns the next test's MPI worker pool (~50-65s of spawn+import per
-> bare `LLM(...)`) and (b) pre-reads the next test's model weights into the
-> OS page cache. It is fail-open — any miss or error falls back to the normal
-> synchronous path — and disabled automatically under pytest-xdist. Set
-> `TRTLLM_TEST_PREFETCH_SESSION=0` to turn it off entirely.
-
 ## 1. Unit test (Python)
 
 All the tests contained in the `unittest` directory folder are considered as "unit test" in this doc, these tests can use the python standard [unittests](https://docs.python.org/3/library/unittest.html) and [pytest](https://docs.pytest.org/en/stable/). Since pytest are compatible with the unittest framework, we use pytest to launch these in the CI.
