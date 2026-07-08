@@ -358,16 +358,25 @@ def test_allreduce_strategies(capfd, llm_root, shared_dataset, allreduce_strateg
             faulthandler.dump_traceback_later(60, repeat=True)
             try:
                 with _tee_tllm_errors(debug_stream):
-                    with timeout(TEST_TIMEOUT_SECONDS):
-                        result = runner.invoke(main, args, catch_exceptions=False)
-                        print(
-                            f"{debug_prefix} benchmark returned exit_code={result.exit_code} "
-                            f"elapsed={time.monotonic() - start_time:.1f}s",
-                            flush=True,
-                        )
-                        assert result.exit_code == 0, (
-                            f"Benchmark failed with output: {result.output}"
-                        )
+                    old_log_level = os.environ.get("TLLM_LOG_LEVEL")
+                    if allreduce_strategy == "TWOSHOT":
+                        os.environ["TLLM_LOG_LEVEL"] = "DEBUG"
+                    try:
+                        with timeout(TEST_TIMEOUT_SECONDS):
+                            result = runner.invoke(main, args, catch_exceptions=False)
+                            print(
+                                f"{debug_prefix} benchmark returned exit_code={result.exit_code} "
+                                f"elapsed={time.monotonic() - start_time:.1f}s",
+                                flush=True,
+                            )
+                            assert result.exit_code == 0, (
+                                f"Benchmark failed with output: {result.output}"
+                            )
+                    finally:
+                        if old_log_level is None:
+                            os.environ.pop("TLLM_LOG_LEVEL", None)
+                        else:
+                            os.environ["TLLM_LOG_LEVEL"] = old_log_level
             except TimeoutError as e:
                 pytest.fail(
                     f"Test timed out after {TEST_TIMEOUT_SECONDS}s for strategy "
