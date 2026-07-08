@@ -580,6 +580,14 @@ class PyExecutor:
         self.max_draft_len = max_draft_len
         self.max_total_draft_tokens = max_total_draft_tokens
         self.llm_args = self.model_engine.llm_args
+        # Detached disk-onboard readiness (and its per-step cross-rank collective in
+        # _park_requests_awaiting_onboard) is only reachable when BOTH the disk pool and the async reader
+        # pool are enabled; otherwise are_blocks_ready() is always true, so the park is pure overhead. Capture
+        # once so non-disk models -- including every TP>1 model sharing this image -- pay nothing for it.
+        _kvc = getattr(self.llm_args, "kv_cache_config", None)
+        self._disk_onboard_active = bool(
+            _kvc is not None and getattr(_kvc, "disk_cache_size", None)
+            and int(os.environ.get("TLLM_KV_DISK_READERS", "0") or "0") > 0)
         self.max_stats_len = self.llm_args.max_stats_len
         self.max_num_tokens = self.llm_args.max_num_tokens
         self.print_log = self.llm_args.print_iter_log
@@ -3101,6 +3109,11 @@ class PyExecutor:
         request stays active and is re-scheduled next step -- the capacity scheduler counts its already
         allocated blocks (getRemainingBlocksToCompletion) and _context_seq_len skips re-adding it -- then it
         is admitted once are_blocks_ready() reports its blocks landed."""
+        # No detached disk onboards possible (no disk pool or no async readers) -> are_blocks_ready() is
+        # always true and there is nothing to synchronize. Skip entirely so non-disk (esp. TP>1) models never
+        # pay the per-step cross-rank collective below.
+        if not self._disk_onboard_active:
+            return
         kv = getattr(self, "kv_cache_manager", None)
         if kv is None or not hasattr(kv, "are_blocks_ready"):
             return
