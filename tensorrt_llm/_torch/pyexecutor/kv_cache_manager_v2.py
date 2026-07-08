@@ -65,7 +65,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2._common import (
 )
 from tensorrt_llm.runtime.kv_cache_manager_v2._config import DataRole
 from tensorrt_llm.runtime.kv_cache_manager_v2._event_manager import KVCacheEventManager
-from tensorrt_llm.runtime.kv_cache_manager_v2._exceptions import CuError
+from tensorrt_llm.runtime.kv_cache_manager_v2._exceptions import CuError, OutOfPagesError
 from tensorrt_llm.runtime.kv_cache_manager_v2._exceptions import (
     OutOfMemoryError as KVCacheOutOfMemoryError,
 )
@@ -1579,7 +1579,16 @@ class KVCacheManagerV2(BaseResourceManager):
                 f"{kv_cache.capacity} to {pre_cap}"
             )
         if pre_cap > 0:
-            kv_cache.suspend(self._arena_write_out_fence())
+            try:
+                kv_cache.suspend(self._arena_write_out_fence())
+            except OutOfPagesError:
+                # This suspend only donates the deferred request's GPU pages
+                # to the wait window (an optimization); if the host tier
+                # cannot absorb the write-out, staying resident is safe.
+                logger.debug(
+                    f"KV cache manager V2: skipping revert-suspend for request "
+                    f"{req.py_request_id}: host tier full; cache stays resident."
+                )
 
     def _restore_page_index_bufs(self, request_id: int, kv_cache) -> None:
         """Re-connect host page-index buffers after resume().
@@ -1704,7 +1713,21 @@ class KVCacheManagerV2(BaseResourceManager):
             success = kv_cache.resize(capacity, history_length)
         if not success:
             if req.is_first_context_chunk:
-                kv_cache.suspend(self._arena_write_out_fence())
+                try:
+                    kv_cache.suspend(self._arena_write_out_fence())
+                except OutOfPagesError:
+                    # A first context chunk holds no computed KV worth
+                    # preserving; if the host tier cannot absorb even this
+                    # write-out, drop the cache outright (frees the GPU pages
+                    # without host capacity). prepare_context recreates it —
+                    # with a fresh reuse lookup — when the request is
+                    # scheduled again.
+                    logger.warning(
+                        f"KV cache manager V2: host tier full during context "
+                        f"backoff for request {req.py_request_id}; dropping "
+                        f"its (first-chunk) KV cache for re-preparation."
+                    )
+                    self.free_resources(req)
             return False
 
         # None means "no growth this iter, nothing to revert"; this also
@@ -1748,11 +1771,36 @@ class KVCacheManagerV2(BaseResourceManager):
             # per-iteration sweep has already flushed: map the delta now.
             self.impl.flush_gpu_mappings()
 
-    def suspend_request(self, req: LlmRequest) -> None:
-        """Suspend a request's KV cache (move to host tier)."""
+    def suspend_request(self, req: LlmRequest) -> bool:
+        """Suspend a request's KV cache (move to host tier).
+
+        Returns True if the cache was offloaded (resumable later) or there
+        was nothing to do. Returns False if the host tier could not absorb
+        the write-out — its capacity can be pinned by already-suspended
+        sequences' HELD pages, which LRU eviction cannot drop — and the
+        cache was DROPPED instead (v1-style preemption): the GPU pages are
+        freed either way, but the caller must pause the request so it
+        recomputes its KV from the prompt (whatever canonical prefix
+        survives in the reuse tree still shortens the re-prefill).
+        suspend() is atomic on failure, so the drop starts from an intact
+        ACTIVE cache and close()'s exhaustion-safe write-out path.
+        """
         kv_cache = self.kv_cache_map.get(req.py_request_id)
-        if kv_cache is not None and kv_cache.is_active:
+        if kv_cache is None or not kv_cache.is_active:
+            return True
+        try:
             kv_cache.suspend(self._arena_write_out_fence())
+            return True
+        except OutOfPagesError:
+            logger.warning(
+                f"KV cache manager V2: host tier cannot absorb the suspension "
+                f"write-out for request {req.py_request_id} (host capacity "
+                f"pinned by suspended sequences); dropping its KV cache for "
+                f"recomputation instead. Consider increasing "
+                f"kv_cache_config.host_cache_size."
+            )
+            self.free_resources(req)
+            return False
 
     def resume_request(self, req: LlmRequest) -> bool:
         """Resume a previously-suspended KV cache for *req*.

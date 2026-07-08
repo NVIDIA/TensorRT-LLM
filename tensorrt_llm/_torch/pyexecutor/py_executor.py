@@ -3154,6 +3154,8 @@ class PyExecutor:
                 if not self._is_kv_manager_v2:
                     self._terminate_requests(scheduled_batch.paused_requests)
                     self._pause_requests(scheduled_batch.paused_requests)
+                else:
+                    self._pause_dropped_requests(scheduled_batch)
 
                 finished_requests = []
                 sample_state = None
@@ -3726,6 +3728,8 @@ class PyExecutor:
 
                 if not self._is_kv_manager_v2:
                     self._pause_requests(scheduled_batch.paused_requests)
+                else:
+                    self._pause_dropped_requests(scheduled_batch)
 
                 if can_queue:
                     guided_decoder_failed_requests = None
@@ -5751,6 +5755,31 @@ class PyExecutor:
     def _pause_requests(self, requests_to_pause):
         for req in requests_to_pause:
             req.pause(self.max_input_len)
+
+    def _pause_dropped_requests(self, scheduled_batch: ScheduledRequests):
+        """V2 manager: pause only host-exhaustion drops.
+
+        V2 suspension normally preserves the KV on the host tier for a later
+        resume, so evicted (paused_requests) entries must NOT be paused. But
+        a suspend that degraded to a DROP under host-tier exhaustion
+        (``py_kv_dropped``, see ``V2Scheduler._suspend_request``) freed the
+        KV outright — reset those requests to CONTEXT_INIT (v1-style
+        preemption) so they recompute from the prompt on their next
+        scheduling.
+        """
+        dropped = [
+            req for req in scheduled_batch.paused_requests
+            if getattr(req, "py_kv_dropped", False)
+        ]
+        if dropped:
+            # Mirror the v1 pause flow: terminate first so ALL per-request
+            # resources are released (notably the seq slot — a paused request
+            # re-enters as context and add_slot asserts on a duplicate ID;
+            # the KV free is idempotent, the scheduler already dropped it).
+            self._terminate_requests(dropped)
+            self._pause_requests(dropped)
+            for req in dropped:
+                req.py_kv_dropped = False
 
     def _add_inflight_ids(self, scheduled_requests: ScheduledRequests):
         """Add request IDs of current sampling requests to self.inflight_req_ids.

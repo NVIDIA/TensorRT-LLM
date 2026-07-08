@@ -50,9 +50,9 @@ GPU_QUOTA = MAX_TOKENS * BYTES_PER_TOKEN
 
 def _create_arena_manager(**kv_cache_kwargs) -> KVCacheManagerV2:
     kv_cache_kwargs.setdefault("max_tokens", MAX_TOKENS)
+    kv_cache_kwargs.setdefault("host_cache_size", 64 * MiB)
     kv_cache_config = KvCacheConfig(
         enable_block_reuse=True,
-        host_cache_size=64 * MiB,
         use_contiguous_kv_arena=True,
         **kv_cache_kwargs,
     )
@@ -271,6 +271,66 @@ class TestArenaSchedulerDeadlockRecovery(unittest.TestCase):
             self.assertEqual(budget.used_pages, budget.retained_pages)
             mgr.impl._storage.spill_gpu_retained(1 << 62)
             self.assertEqual(budget.used_pages, 0)
+        finally:
+            mgr.shutdown()
+
+
+@requires_cuda
+class TestArenaSuspendDropFallback(unittest.TestCase):
+    """§4.5 hardening: suspend_request degrades to drop-and-recompute.
+
+    When the host tier cannot absorb a suspension write-out (its slots are
+    HELD by already-suspended sequences), ``suspend()`` raises atomically and
+    the adapter must DROP the victim's cache instead (freeing the GPU pages
+    without host capacity) and return False so the scheduler flags the
+    request for a v1-style pause/recompute. The first suspension of the same
+    shape must keep returning True (offloaded, resumable).
+    """
+
+    def _req(self, request_id: int):
+        return mock.Mock(
+            py_request_id=request_id,
+            py_draft_tokens=[],
+            is_disagg_generation_transmission_complete=False,
+            context_phase_params=None,
+            # free_resources -> try_commit_blocks_for_reuse must skip the
+            # commit branch for this synthetic request.
+            is_dummy_request=True,
+        )
+
+    def test_suspend_request_drops_on_host_exhaustion(self) -> None:
+        # Host tier: 3 block columns -- fits one 3-block suspension (HELD),
+        # not two.
+        mgr = _create_arena_manager(host_cache_size=3 * BLOCK_COLUMN_BYTES)
+        try:
+            kv1 = mgr._create_kv_cache(1, None, None)
+            kv1.cuda_stream = mgr._stream.cuda_stream
+            self.assertTrue(kv1.resume(mgr._stream.cuda_stream))
+            self.assertTrue(kv1.resize(3 * TOKENS_PER_BLOCK))
+            kv2 = mgr._create_kv_cache(2, None, None)
+            kv2.cuda_stream = mgr._stream.cuda_stream
+            self.assertTrue(kv2.resume(mgr._stream.cuda_stream))
+            self.assertTrue(kv2.resize(3 * TOKENS_PER_BLOCK))
+
+            # First suspension offloads (resumable) and fills the host tier.
+            self.assertTrue(mgr.suspend_request(self._req(1)))
+            self.assertIn(1, mgr.kv_cache_map)
+            self.assertFalse(mgr.kv_cache_map[1].is_active)
+
+            # Second suspension cannot fit: the adapter drops the cache and
+            # reports False for the pause/recompute flow.
+            self.assertFalse(mgr.suspend_request(self._req(2)))
+            self.assertNotIn(2, mgr.kv_cache_map)
+
+            # The survivor is untouched and still resumable.
+            self.assertTrue(mgr.try_allocate_generation(self._req(1)))
+            self.assertTrue(mgr.kv_cache_map[1].is_active)
+
+            mgr.kv_cache_map[1].close()
+            mgr.kv_cache_map.pop(1)
+            mgr.index_mapper.remove_sequence(1)
+            torch.cuda.synchronize()
+            mgr.impl.drain_gpu_reclaim(mgr._reclaim_fence(), wait=True)
         finally:
             mgr.shutdown()
 

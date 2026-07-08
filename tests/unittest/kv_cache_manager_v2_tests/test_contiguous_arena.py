@@ -1891,5 +1891,134 @@ class TestArenaWriteThroughOnCommit(TestArenaKVCacheManagerEndToEnd):
         self.assertEqual(self._host_used(), 2)
 
 
+@requires_cuda
+class TestArenaSuspendHostExhaustion(unittest.TestCase):
+    """§4.5 hardening: host-tier exhaustion during suspension.
+
+    The host tier fills with already-suspended sequences' HELD pages, which
+    LRU eviction cannot drop at the last level (``is_evictable``); a further
+    suspend() must then raise ``OutOfPagesError`` BEFORE mutating anything
+    (the pre-flight reservation in ``suspend``), leaving the victim fully
+    ACTIVE so the caller can degrade to drop-and-recompute. Stale DROPPABLE
+    host copies, by contrast, must keep churning through LRU eviction —
+    pressure means reuse loss, never a crash.
+    """
+
+    TPB = 16  # tokens per block
+
+    def setUp(self) -> None:
+        init_cuda_once()
+        # Host tier: exactly 4 block slots (4 x 32 KiB coalesced records).
+        cfg = _make_manager_config(gpu_quota=32 * MiB, host_quota=4 * 32 * 1024)
+        cfg.contiguous_arena = ContiguousArenaConfig(map_ahead_pages=0)
+        self.manager = KVCacheManager(cfg)
+
+    def tearDown(self) -> None:
+        self.manager.shutdown()
+        del self.manager
+
+    def _block_floats(self, page_index: int) -> "torch.Tensor":
+        addr = int(
+            self.manager._storage.slot_address(
+                GPU_LEVEL, PoolGroupIndex(0), page_index, PoolIndex(0)
+            )
+        )
+        return TestSparseVirtMem._tensor_at(addr, (4 * 8192) // 4)
+
+    def _host_used(self) -> int:
+        stats = self.manager._storage.get_statistics(CacheLevel(1))[0]
+        return stats.total - stats.free
+
+    def test_suspend_raises_atomically_when_host_pinned(self) -> None:
+        manager = self.manager
+        kv_a = manager.create_kv_cache(max_capacity=4 * self.TPB)
+        kv_b = manager.create_kv_cache(max_capacity=4 * self.TPB)
+        with TemporaryCudaStream([]) as s:
+            stream = CudaStream(s.handle)
+            self.assertTrue(kv_a.resume(stream))
+            self.assertTrue(kv_a.resize(3 * self.TPB))
+            self.assertTrue(kv_b.resume(stream))
+            self.assertTrue(kv_b.resize(3 * self.TPB))
+            b_indices = list(kv_b.get_base_page_indices(LifeCycleId(0)))
+            for j, idx in enumerate(b_indices):
+                self._block_floats(idx).fill_(10.0 + j)
+            torch.cuda.synchronize()
+            kv_a.commit([100 + i for i in range(2 * self.TPB)])
+            kv_b.commit([200 + i for i in range(2 * self.TPB)])
+            # A's suspension takes 3 of the 4 host slots as HELD state.
+            kv_a.suspend()
+            self.assertEqual(self._host_used(), 3)
+            # B needs 3 slots; 1 free, and A's HELD pages are not evictable
+            # at the last level -> pre-flight raises with B untouched.
+            with self.assertRaises(OutOfPagesError):
+                kv_b.suspend()
+            # Atomicity: B is still ACTIVE, byte-identical, and usable.
+            indices = list(kv_b.get_base_page_indices(LifeCycleId(0)))
+            self.assertEqual(indices, b_indices)
+            for j, idx in enumerate(indices):
+                data = self._block_floats(idx)
+                self.assertTrue(bool((data == 10.0 + j).all().item()))
+            self.assertTrue(kv_b.resize(4 * self.TPB))  # growth still works
+            # close() under the same exhaustion drops the write-out (reuse
+            # loss only) instead of raising -- the free path never errors.
+            kv_b.close()
+            self.assertEqual(self._host_used(), 3)  # nothing of B landed
+        s.take_finish_event().synchronize()
+        manager.drain_gpu_reclaim(CachedCudaEvent.NULL)
+        # A was not perturbed by B's failed suspend: resumes byte-... (A had
+        # no patterns written; assert the roundtrip machinery instead).
+        with TemporaryCudaStream([]) as s2:
+            self.assertTrue(kv_a.resume(CudaStream(s2.handle)))
+            torch.cuda.synchronize()
+            indices = list(kv_a.get_base_page_indices(LifeCycleId(0)))
+            self.assertEqual(indices, list(range(indices[0], indices[0] + 3)))
+            kv_a.close()
+        s2.take_finish_event().synchronize()
+        manager.drain_gpu_reclaim(CachedCudaEvent.NULL)
+
+    def test_suspend_churns_through_droppable_host_copies(self) -> None:
+        """Pressure evicts stale DROPPABLE host copies, not suspends.
+
+        Stale copies churn through LRU eviction (reuse loss), so a suspend
+        that fits after eviction succeeds.
+        """
+        manager = self.manager
+        kv_a = manager.create_kv_cache(max_capacity=4 * self.TPB)
+        kv_b = manager.create_kv_cache(max_capacity=4 * self.TPB)
+        with TemporaryCudaStream([]) as s:
+            stream = CudaStream(s.handle)
+            self.assertTrue(kv_a.resume(stream))
+            self.assertTrue(kv_a.resize(3 * self.TPB))
+            self.assertTrue(kv_b.resume(stream))
+            self.assertTrue(kv_b.resize(3 * self.TPB))
+            b_indices = list(kv_b.get_base_page_indices(LifeCycleId(0)))
+            for j, idx in enumerate(b_indices):
+                self._block_floats(idx).fill_(20.0 + j)
+            torch.cuda.synchronize()
+            kv_a.commit([100 + i for i in range(2 * self.TPB)])
+            kv_b.commit([300 + i for i in range(2 * self.TPB)])
+            # A: close (not suspend) -> its 2 committed blocks become stale
+            # DROPPABLE host copies (LRU-evictable), not HELD state.
+            kv_a.close()
+            self.assertEqual(self._host_used(), 2)
+            # B's suspension needs 3 slots; 2 free + A's 2 droppable -> LRU
+            # evicts A's oldest copy (block 0, the tree parent), whose GC
+            # collapses the now-unreachable child copy too (reuse loss), and
+            # the suspend SUCCEEDS: only B's 3 HELD pages remain.
+            kv_b.suspend()
+            self.assertEqual(self._host_used(), 3)
+        s.take_finish_event().synchronize()
+        manager.drain_gpu_reclaim(CachedCudaEvent.NULL)
+        with TemporaryCudaStream([]) as s2:
+            self.assertTrue(kv_b.resume(CudaStream(s2.handle)))
+            torch.cuda.synchronize()
+            for j, idx in enumerate(kv_b.get_base_page_indices(LifeCycleId(0))):
+                data = self._block_floats(idx)
+                self.assertTrue(bool((data == 20.0 + j).all().item()))
+            kv_b.close()
+        s2.take_finish_event().synchronize()
+        manager.drain_gpu_reclaim(CachedCudaEvent.NULL)
+
+
 if __name__ == "__main__":
     unittest.main()

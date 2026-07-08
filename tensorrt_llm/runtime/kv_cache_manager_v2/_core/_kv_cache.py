@@ -801,6 +801,43 @@ class _KVCache:
                             ret.offload_ordinals[pg_idx].append(ordinal)
         return ret
 
+    def _arena_evacuation_requirements(self) -> TypedIndexList[PoolGroupIndex, int]:
+        """Per-pool-group host slots the §4.5 evacuation write-out will need.
+
+        Mirrors :meth:`_arena_evacuate`'s partition WITHOUT side effects (in
+        particular the write-through stash is inspected, not popped): private
+        copies with a live canonical are dropped (0 slots), written-through
+        pages adopt their pre-copied slot (0 slots), everything else on GPU
+        migrates (1 slot). May overcount pages that later paths free before
+        the migration (e.g. scratch) -- overcounting only reserves extra free
+        slots, which the next consumer reuses; undercounting would break the
+        pre-flight atomicity gate in :meth:`suspend`.
+        """
+        storage = self.manager._storage
+        ssm_lc_id = self.manager._life_cycles.ssm_life_cycle_id
+        requirements = make_typed(lambda _: 0, storage.num_pool_groups)
+        for ordinal, beam_idx, lc_idx in self._active_pages():
+            beam_block = (
+                self._block(ordinal, beam_idx)
+                if lc_idx != ssm_lc_id
+                else self._ssm_blocks[beam_idx]
+            )
+            page = expect_type(_SharedPageLock, beam_block[lc_idx]).page
+            if page.cache_level != GPU_LEVEL:
+                continue
+            if type(page) is PrivateCommittedPage:
+                canonical = self._find_canonical(page, lc_idx)
+                if canonical is not None and canonical is not page:
+                    continue
+            if (
+                type(page) is CommittedPage
+                and (int(ordinal), int(lc_idx)) in self._write_through_slots
+            ):
+                continue
+            pg_idx = storage.get_pool_group_index(lc_idx)
+            requirements[pg_idx] += 1
+        return requirements
+
     @staticmethod
     def _find_canonical(page: CommittedPage, lc_idx: LifeCycleId) -> "CommittedPage | None":
         """The canonical radix-tree page for a private copy's block, or None
@@ -1421,9 +1458,26 @@ class _KVCache:
         *forward* stream (see ``StorageManager.offload_arena_pages``): the
         scheduler evicts mid-pass, when the victim's current step may still be
         in flight, and the evacuation copies would otherwise read its tail
-        block before the step's writes land."""
+        block before the step's writes land.
+
+        Raises ``OutOfPagesError`` -- with the sequence left fully intact and
+        ACTIVE -- if the host tier cannot absorb the evacuation write-out even
+        after LRU eviction (its capacity can be pinned by already-suspended
+        sequences' HELD pages, which are not droppable). The whole write-out
+        is pre-reserved below BEFORE any state mutation, so the error can
+        never leave a half-evacuated sequence; callers degrade to
+        drop-and-recompute (v1-style preemption) instead of crashing."""
         assert self.status == self.Status.ACTIVE
         assert self._check_sanity()
+        if self._arena_ranges is not None and self.manager._storage.num_cache_levels > 1:
+            # Pre-flight atomicity gate (§4.5 hardening): reserve host slots
+            # for the entire evacuation while nothing has been mutated yet.
+            # The manager is single-threaded, so slots freed here stay free
+            # until _arena_evacuate's per-pool-group offloads consume them
+            # (their own prepare_free_slots calls become no-ops).
+            requirements = self._arena_evacuation_requirements()
+            if any(requirements):
+                self.manager._storage.prepare_free_slots(CacheLevel(GPU_LEVEL + 1), requirements)
         # Assert on a local, not the attribute: `assert self._finish_event is
         # None` narrows the member to None for the rest of the function under
         # mypy(c) -- it cannot see _record_event's side effect -- and compiled

@@ -952,6 +952,16 @@ class KVCacheV2Scheduler(RequestScheduler):
     def _suspend_request(self, req: LlmRequest) -> None:
         """Suspend a request's KV cache in both main and draft managers.
 
+        Either manager may DROP the cache instead of offloading it when the
+        host tier cannot absorb the write-out (suspend_request returns
+        False).  The victim's GPU pages are freed in both cases, so callers
+        treat it as evicted either way; a dropped request is additionally
+        flagged with ``py_kv_dropped`` so the executor pauses it
+        (CONTEXT_INIT reset) for v1-style recomputation.  Main and draft
+        caches must drop together — a paused request re-runs its context
+        phase from the prompt, so a leftover suspended copy in the other
+        manager would leak host pages and desync from the recomputed KV.
+
         TODO: Also release PEFT resources (mark_request_done) for the
         suspended request so the C++ PeftCacheManager can evict its
         adapter pages.  Currently only KV cache is freed; the adapter
@@ -959,9 +969,14 @@ class KVCacheV2Scheduler(RequestScheduler):
         fail if it needs to load a different adapter into a full cache.
         """
         self._clear_request_runtime_state(req)
-        self.kv_cache_manager.suspend_request(req)
+        offloaded = self.kv_cache_manager.suspend_request(req)
         if self.draft_kv_cache_manager is not None:
-            self.draft_kv_cache_manager.suspend_request(req)
+            offloaded = self.draft_kv_cache_manager.suspend_request(req) and offloaded
+        if not offloaded:
+            self.kv_cache_manager.free_resources(req)
+            if self.draft_kv_cache_manager is not None:
+                self.draft_kv_cache_manager.free_resources(req)
+            req.py_kv_dropped = True
 
     def _clear_request_runtime_state(self, req: LlmRequest) -> None:
         req.py_batch_idx = None
