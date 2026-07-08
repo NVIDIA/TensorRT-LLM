@@ -10,6 +10,7 @@ from .modeling_auto import AutoModelForCausalLM
 from .modeling_bart import (BartForConditionalGeneration,
                             MBartForConditionalGeneration)
 from .modeling_bert import BertForSequenceClassification
+from .modeling_chatglm import ChatGLMForCausalLM
 from .modeling_clip import CLIPVisionModel
 from .modeling_cohere2 import Cohere2ForCausalLM
 from .modeling_cosmos3 import Cosmos3Model
@@ -66,6 +67,7 @@ __all__ = [
     "AutoModelForCausalLM",
     "BartForConditionalGeneration",
     "BertForSequenceClassification",
+    "ChatGLMForCausalLM",
     "CLIPVisionModel",
     "Cosmos3Model",
     "DeepseekV3ForCausalLM",

@@ -7,6 +7,7 @@ The following is a table of supported models for the PyTorch backend:
 | ------------------------------------ | ---------------------------------- | -------------------------------------------- |
 | `AfmoeForCausalLM`                   | Arcee Foundation MoE (Trinity)     | `arcee-ai/Trinity-Mini`                      |
 | `BertForSequenceClassification`      | BERT-based                         | `textattack/bert-base-uncased-yelp-polarity` |
+| `ChatGLMModel`                       | ChatGLM3                           | `THUDM/chatglm3-6b`                          |
 | `Cohere2ForCausalLM`                 | Command A                          | `CohereLabs/c4ai-command-a-03-2025`          |
 | `DeciLMForCausalLM`                  | Nemotron                           | `nvidia/Llama-3_1-Nemotron-51B-Instruct`     |
 | `DeepSeekV2ForCausalLM` [^5]         | DeepSeek V2                        | `deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct` |
@@ -62,6 +63,7 @@ Note: Support for other models may vary. Features marked "N/A" are not applicabl
 
 | Model Architecture/Feature       | Overlap Scheduler | CUDA Graph | Attention Data Parallelism | Disaggregated Serving | Chunked Prefill | MTP | EAGLE-3 — Linear | EAGLE-3 — Dynamic | DFlash | Torch Sampler | TLLM C++ Sampler | KV Cache Reuse | Sliding Window Attention | Logits Post Processor | Guided Decoding |
 | -------------------------------- | ----------------- | ---------- | -------------------------- | --------------------- | --------------- | --- | ---------------- | ----------------- | ------ | ------------- | ---------------- | -------------- | ------------------------ | --------------------- | --------------- |
+| `ChatGLMModel`                   | Yes               | Yes        | Untested                   | Untested              | Untested        | No  | No               | No                | No     | Yes           | Untested         | Yes            | N/A                      | Untested              | Untested        |
 | `DeepseekV3ForCausalLM`          | Yes               | Yes        | Yes                        | Yes                   | Yes [^1]        | Yes | No               | No                | No     | Yes           | Yes              | Yes [^2]       | N/A                      | Yes                   | Yes             |
 | `DeepseekV32ForCausalLM`         | Yes               | Yes        | Yes                        | Yes                   | Yes             | Yes | No               | No                | No     | Yes           | Yes              | Yes            | N/A                      | Yes                   | Yes             |
 | `DeepseekV4ForCausalLM` [^11]    | Yes               | Yes        | Yes                        | Untested              | Yes             | Yes | No               | No                | No     | Yes           | Yes              | Untested       | Yes                      | Untested              | Untested        |

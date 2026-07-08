@@ -125,6 +125,50 @@ def _run_multinode_accuracy(model_path,
             task.evaluate(llm)
 
 
+class TestChatGLM3_6B(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "THUDM/chatglm3-6b"
+    MODEL_PATH = f"{llm_models_root()}/chatglm3-6b"
+
+    # (cuda_graph, overlap_scheduler) configurations required by the task.
+    def _pytorch_config(self, *, cuda_graph: bool, overlap: bool):
+        return dict(
+            attn_backend="TRTLLM",
+            kv_cache_config=KvCacheConfig(use_kv_cache_manager_v2=True,
+                                          free_gpu_memory_fraction=0.5),
+            disable_overlap_scheduler=not overlap,
+            cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
+        )
+
+    def test_llm_api_smoke(self):
+        """Nonempty generation on both required configs with KVCacheManagerV2 + TRTLLM (no fallback)."""
+        for cuda_graph in [False, True]:
+            with LLM(self.MODEL_PATH,
+                     trust_remote_code=True,
+                     max_batch_size=8,
+                     **self._pytorch_config(cuda_graph=cuda_graph,
+                                            overlap=cuda_graph)) as llm:
+                assert llm.args.attn_backend == "TRTLLM"
+                assert llm.args.kv_cache_config.use_kv_cache_manager_v2 is True
+                assert llm.args.disable_overlap_scheduler is (not cuda_graph)
+                outputs = llm.generate(["1 + 1 =", "The capital of France is"],
+                                       SamplingParams(max_tokens=16,
+                                                      temperature=0.0))
+                for out in outputs:
+                    assert out.outputs[0].text.strip(), "empty generation"
+
+    # cuda_graph=False -> baseline (overlap off); cuda_graph=True -> enabled
+    # (overlap on), i.e. the two (cuda_graph, overlap_scheduler) configs.
+    @parametrize_with_ids("cuda_graph", [False, True])
+    def test_auto_dtype(self, cuda_graph):
+        """GSM8K gate within tolerance of the HF reference for the baseline and CUDA-graph+overlap configs."""
+        with LLM(self.MODEL_PATH,
+                 trust_remote_code=True,
+                 **self._pytorch_config(cuda_graph=cuda_graph,
+                                        overlap=cuda_graph)) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+
 class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
     MODEL_NAME = "meta-llama/Llama-3.1-8B"
     MODEL_PATH = f"{llm_models_root()}/llama-3.1-model/Meta-Llama-3.1-8B"
