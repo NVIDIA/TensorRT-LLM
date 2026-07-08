@@ -957,6 +957,28 @@ class TestGpuArenaCacheLevelStorage(unittest.TestCase):
     def setUp(self) -> None:
         init_cuda_once()
 
+    def test_total_quota_reports_physical_not_va(self) -> None:
+        """``total_quota`` must be the PHYSICAL page-budget bytes.
+
+        The base implementation sums pool byte sizes = the VA reservation
+        extent; the KV memory estimator credits ``total_quota`` back as a
+        "temporary pool to be freed", so reporting VA over-grants the final
+        KV budget (observed +8 GiB on H100: 60.8 vs 52.5 GiB quota).
+        """
+        storage = GpuArenaCacheLevelStorage(
+            slot_size_lists=[[2 * MiB], [1 * MiB]],
+            block_capacity_list=[16, 16],
+            page_index_scale_list=[64, 32],
+            quota=8 * self.PAGE,
+            phys_page_size=self.PAGE,
+            map_ahead_pages=0,
+        )
+        try:
+            # VA extent is 16 blocks x (2 MiB + 1 MiB) = 48 MiB >> quota.
+            self.assertEqual(storage.total_quota, 8 * self.PAGE)
+        finally:
+            storage.destroy()
+
     def test_budget_shared_across_pool_groups(self) -> None:
         storage = GpuArenaCacheLevelStorage(
             slot_size_lists=[[2 * MiB], [1 * MiB]],
@@ -2283,9 +2305,7 @@ class TestArenaPrefixAliasing(unittest.TestCase):
         manager.drain_gpu_reclaim(CachedCudaEvent.NULL)
 
         # Admission: lookup HIT stored (unpinned) on the kv cache.
-        kv_b = manager.create_kv_cache(
-            input_tokens=tokens + [1], max_capacity=n_tok + 4 * self.TPB
-        )
+        kv_b = manager.create_kv_cache(input_tokens=tokens + [1], max_capacity=n_tok + 4 * self.TPB)
         self.assertEqual(pg.alias_hits, 1)
         # Pressure: everything spills, registry pins drop to zero refs.
         torch.cuda.synchronize()

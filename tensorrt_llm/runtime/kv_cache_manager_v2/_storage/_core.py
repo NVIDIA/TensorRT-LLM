@@ -1875,6 +1875,20 @@ class GpuArenaCacheLevelStorage(CacheLevelStorage):
     def pool_size_granularity(self) -> int:
         return self.shared_phys_mem_pool.phys_mem_size
 
+    @property
+    def total_quota(self) -> int:
+        """The level's PHYSICAL byte quota (page budget x super-page size).
+
+        The base implementation sums pool byte sizes, which for arena pools
+        is the VA reservation extent -- virtual address space, not memory.
+        Consumers of ``total_quota`` (kv stats ``allocated_bytes`` and,
+        through it, the KV memory estimator's temporary-pool credit) need
+        physical bytes: crediting VA back over-grants the final KV budget by
+        the VA-vs-physical difference (observed: +8 GiB on an 80 GiB H100,
+        leaving <0.1 GiB of device headroom at full budget fill).
+        """
+        return self.page_budget.total_pages * self.shared_phys_mem_pool.phys_mem_size
+
     @override
     def destroy(self) -> None:
         # __init__ raises by design on an int31 violation (§4.1); a partially
