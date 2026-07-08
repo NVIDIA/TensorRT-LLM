@@ -114,6 +114,7 @@ Note: Support for other models may vary. Features marked "N/A" are not applicabl
 | `Step3p7ForConditionalGeneration`    | Yes               | Yes        | Untested        | Yes           | Untested         | Untested       | Untested              | Untested                  | L + I     |
 | `MiniMaxM3SparseForConditionalGeneration` [^12] | Yes               | Yes        | Untested        | Yes           | Untested         | No             | Untested              | Untested                  | L + I + V |
 | `Cosmos3ForConditionalGeneration` [^13] | Yes               | Yes        | Yes             | Yes           | Yes              | Yes            | Untested              | Untested                  | L + I + V |
+| `Qwen3_5ForConditionalGeneration`    | Yes               | Yes        | Untested        | Yes           | Yes              | No             | Untested              | Yes                       | L + I + V |
 | `Qwen3_5MoeForConditionalGeneration` | Yes               | Yes        | Untested        | Yes           | Yes              | No             | Untested              | Yes                       | L + I + V |
 
 Note:
