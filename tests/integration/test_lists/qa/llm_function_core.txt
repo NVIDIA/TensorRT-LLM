@@ -828,6 +828,7 @@ accuracy/test_llm_api_pytorch_multimodal.py::TestStep3_7::test_nvfp4[mtp_nextn=0
 accuracy/test_llm_api_pytorch_multimodal.py::TestStep3_7::test_nvfp4[mtp_nextn=3] TIMEOUT (120)
 accuracy/test_llm_api_pytorch_multimodal.py::TestQwen3_5_35B_A3B_VL::test_auto_dtype
 accuracy/test_llm_api_pytorch_multimodal.py::TestQwen3_5_35B_A3B_VL::test_fp8_prequantized
+accuracy/test_llm_api_pytorch_multimodal.py::TestQwen3_5_27B_VL::test_auto_dtype
 accuracy/test_llm_api_pytorch_multimodal.py::TestVILA1_5_3B::test_auto_dtype
 accuracy/test_llm_api_pytorch_ray.py::TestLlama3_1_8BInstruct::test_pp2_ray
 unittest/disaggregated/test_openai_disagg_server.py

@@ -16,12 +16,14 @@
 
 import datetime
 import gc
+import importlib
 import logging
 import os
 import platform
 import re
 import shutil
 import subprocess as sp
+import sys
 import tempfile
 import time
 import urllib.request
@@ -63,6 +65,14 @@ logger = logging.getLogger(__name__)
 DEBUG_CI_STORAGE = os.environ.get("DEBUG_CI_STORAGE", False)
 GITLAB_API_USER = os.environ.get("GITLAB_API_USER")
 GITLAB_API_TOKEN = os.environ.get("GITLAB_API_TOKEN")
+
+
+def _get_s3_output():
+    tests_root = Path(__file__).resolve().parents[2]
+    tests_root_str = str(tests_root)
+    if tests_root_str not in sys.path:
+        sys.path.append(tests_root_str)
+    return importlib.import_module("test_common.s3_output")
 
 
 def print_storage_usage(path, tag, capfd):
@@ -1933,6 +1943,7 @@ def get_device_memory():
 
 
 def pytest_addoption(parser):
+    _get_s3_output().add_options(parser)
     parser.addoption(
         "--test-list",
         "-F",
@@ -2225,6 +2236,8 @@ def pytest_configure(config):
         print_warning(
             "Warning: --periodic-junit requires --output-dir to be set. "
             "Periodic reporting disabled.")
+
+    _get_s3_output().register_plugin(config)
 
 
 def deselect_by_test_model_suites(test_model_suites, items, test_prefix,

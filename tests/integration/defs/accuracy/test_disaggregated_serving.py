@@ -1571,7 +1571,8 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         ctx_server_config = {
             "disable_overlap_scheduler": True,
             "cache_transceiver_config": {
-                "backend": "DEFAULT",
+                "backend": "NIXL",
+                "transceiver_runtime": "PYTHON",
                 "max_tokens_in_buffer": 4096
             },
             "tensor_parallel_size": 4
@@ -1579,7 +1580,8 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         gen_server_config = {
             "disable_overlap_scheduler": False,
             "cache_transceiver_config": {
-                "backend": "DEFAULT",
+                "backend": "NIXL",
+                "transceiver_runtime": "PYTHON",
                 "max_tokens_in_buffer": 4096
             },
             "tensor_parallel_size": 4

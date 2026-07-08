@@ -32,8 +32,17 @@ from tensorrt_llm._torch.models.checkpoints.mx.checkpoint_loader import (
     _normalize_model_identity,
     _resolve_mx_model_name,
 )
+from tensorrt_llm._torch.weight_sharing import SourceIdentity
 
-_MX_CHECKPOINT_LOADER_NVBUG = pytest.mark.skip(reason="https://nvbugs/6337235")
+_SOURCE_IDENTITY = SourceIdentity(
+    format_version=1,
+    model_fingerprint="model",
+    quant_fingerprint="quant",
+    backend_fingerprint="backend",
+    parallel_fingerprint="parallel",
+    rank=0,
+    shard_fingerprint="shard",
+)
 
 # ---------------------------------------------------------------------------
 # Construction & static properties
@@ -198,20 +207,21 @@ class TestLoadWeightsFallback:
 # ---------------------------------------------------------------------------
 
 
-@_MX_CHECKPOINT_LOADER_NVBUG
 class TestLoadWeightsMxPath:
     def test_p2p_full_success_returns_empty_dict(self):
         # Empty fallback dict means MX delivered all weights into model
         # params. ModelLoader uses the empty dict plus is_weights_preloaded()
         # to skip the standard weight-mapping pipeline.
         loader = MXCheckpointLoader(mx_server_url="http://mx:8001")
-        loader._source_identity_compatible = MagicMock(return_value=True)
         fake_mx = _build_fake_modelexpress(load_weights_return={})
         mapping = MagicMock(name="mapping")
         model = MagicMock(name="model")
+        source_identity_kwargs = _allow_mx_source_identity(loader)
 
         with _install_fake_modelexpress(fake_mx):
-            result = loader.load_weights("/nonexistent", mapping=mapping, model=model)
+            result = loader.load_weights(
+                "/nonexistent", mapping=mapping, model=model, **source_identity_kwargs
+            )
 
         assert result == {}
         assert loader.is_weights_preloaded() is True
@@ -233,15 +243,20 @@ class TestLoadWeightsMxPath:
         # tensors), keep the P2P transfer and let ModelLoader merge these
         # tensors through the standard disk pipeline.
         loader = MXCheckpointLoader(mx_server_url="http://mx:8001")
-        loader._source_identity_compatible = MagicMock(return_value=True)
-        fallback = {"some.weight": MagicMock()}
+        fallback_weight = MagicMock()
+        fallback_weight.numel.return_value = 2
+        fallback_weight.element_size.return_value = 4
+        fallback = {"some.weight": fallback_weight}
         fake_mx = _build_fake_modelexpress(load_weights_return=fallback)
+        source_identity_kwargs = _allow_mx_source_identity(loader)
 
         with (
             _install_fake_modelexpress(fake_mx),
             patch.object(HfCheckpointLoader, "load_weights") as mock_super_load,
         ):
-            result = loader.load_weights("/nonexistent", mapping=MagicMock(), model=MagicMock())
+            result = loader.load_weights(
+                "/nonexistent", mapping=MagicMock(), model=MagicMock(), **source_identity_kwargs
+            )
 
         assert loader.is_weights_preloaded() is True
         assert loader.is_post_transform_weights_preloaded() is False
@@ -471,6 +486,12 @@ def _install_fake_modelexpress(fake_pkg):
     return _Installer()
 
 
+def _allow_mx_source_identity(loader):
+    """Let MX P2P path tests bypass the metadata fetch seam with a matching identity."""
+    loader._fetch_source_identity = MagicMock(return_value=_SOURCE_IDENTITY)
+    return {"source_identity": _SOURCE_IDENTITY}
+
+
 # ---------------------------------------------------------------------------
 # Item 2: defensive MX_SOURCE_QUERY_TIMEOUT default
 # ---------------------------------------------------------------------------
@@ -488,36 +509,37 @@ class TestMxSourceQueryTimeoutDefault:
         monkeypatch.delenv("MX_SOURCE_QUERY_TIMEOUT", raising=False)
         yield
 
-    @_MX_CHECKPOINT_LOADER_NVBUG
     def test_no_registered_source_gets_short_default_during_load(self):
         def _assert_timeout(*args, **kwargs):
             assert os.environ.get("MX_SOURCE_QUERY_TIMEOUT") == "30"
             return {}
 
         loader = MXCheckpointLoader(mx_server_url="http://mx:8001")
-        loader._source_identity_compatible = MagicMock(return_value=True)
         fake_mx = _build_fake_modelexpress(load_weights_side_effect=_assert_timeout)
+        source_identity_kwargs = _allow_mx_source_identity(loader)
         with _install_fake_modelexpress(fake_mx):
-            loader.load_weights("/nonexistent", mapping=MagicMock(), model=MagicMock())
+            loader.load_weights(
+                "/nonexistent", mapping=MagicMock(), model=MagicMock(), **source_identity_kwargs
+            )
         assert "MX_SOURCE_QUERY_TIMEOUT" not in os.environ
 
-    @_MX_CHECKPOINT_LOADER_NVBUG
     def test_existing_source_keeps_upstream_default_when_unset(self):
         def _assert_no_timeout(*args, **kwargs):
             assert "MX_SOURCE_QUERY_TIMEOUT" not in os.environ
             return {}
 
         loader = MXCheckpointLoader(mx_server_url="http://mx:8001")
-        loader._source_identity_compatible = MagicMock(return_value=True)
         fake_mx = _build_fake_modelexpress(
             load_weights_side_effect=_assert_no_timeout,
             source_instances=[MagicMock()],
         )
+        source_identity_kwargs = _allow_mx_source_identity(loader)
         with _install_fake_modelexpress(fake_mx):
-            loader.load_weights("/nonexistent", mapping=MagicMock(), model=MagicMock())
+            loader.load_weights(
+                "/nonexistent", mapping=MagicMock(), model=MagicMock(), **source_identity_kwargs
+            )
         assert "MX_SOURCE_QUERY_TIMEOUT" not in os.environ
 
-    @_MX_CHECKPOINT_LOADER_NVBUG
     def test_env_value_preserved(self, monkeypatch):
         # If the user/orchestrator already set a value, our defensive
         # default must not stomp it.
@@ -528,23 +550,26 @@ class TestMxSourceQueryTimeoutDefault:
             return {}
 
         loader = MXCheckpointLoader(mx_server_url="http://mx:8001")
-        loader._source_identity_compatible = MagicMock(return_value=True)
         fake_mx = _build_fake_modelexpress(load_weights_side_effect=_assert_env_timeout)
+        source_identity_kwargs = _allow_mx_source_identity(loader)
         with _install_fake_modelexpress(fake_mx):
-            loader.load_weights("/nonexistent", mapping=MagicMock(), model=MagicMock())
+            loader.load_weights(
+                "/nonexistent", mapping=MagicMock(), model=MagicMock(), **source_identity_kwargs
+            )
         assert os.environ.get("MX_SOURCE_QUERY_TIMEOUT") == "120"
 
-    @_MX_CHECKPOINT_LOADER_NVBUG
     def test_configured_timeout_applies_during_load_and_restores_env(self):
         def _assert_config_timeout(*args, **kwargs):
             assert os.environ.get("MX_SOURCE_QUERY_TIMEOUT") == "900"
             return {}
 
         loader = MXCheckpointLoader(mx_server_url="http://mx:8001", query_timeout_s=900)
-        loader._source_identity_compatible = MagicMock(return_value=True)
         fake_mx = _build_fake_modelexpress(load_weights_side_effect=_assert_config_timeout)
+        source_identity_kwargs = _allow_mx_source_identity(loader)
         with _install_fake_modelexpress(fake_mx):
-            loader.load_weights("/nonexistent", mapping=MagicMock(), model=MagicMock())
+            loader.load_weights(
+                "/nonexistent", mapping=MagicMock(), model=MagicMock(), **source_identity_kwargs
+            )
         assert "MX_SOURCE_QUERY_TIMEOUT" not in os.environ
 
     def test_no_mx_url_does_not_touch_env(self):
