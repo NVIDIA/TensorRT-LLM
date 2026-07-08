@@ -1818,6 +1818,13 @@ WindowBlockManager::ReuseMatchResult WindowBlockManager::findReusableBlockMatche
             if (existing.has_value() && *existing)
             {
                 auto block = *existing;
+                // A non-full disk block would be flagged a partial match, routing to the broken
+                // partial-copy path. Stop here: the request keeps the fully-matched prefix (already
+                // committed via updateSafePrefix) and prefills the rest. A full disk block is unaffected.
+                if (block->isOnDisk() && !block->isFull())
+                {
+                    break;
+                }
                 candidateMatches.push_back(ReuseMatch{block, numMatchedTokens, !block->isFull(), false});
             }
             else if (mIsSWA)
@@ -1847,6 +1854,13 @@ WindowBlockManager::ReuseMatchResult WindowBlockManager::findReusableBlockMatche
                 }
 
                 auto block = *existing;
+                // Disk-resident blocks can't serve a partial reuse: the partial-copy path reads pool
+                // memory, but disk blocks are poolless (reserved disk slots), so the copy reads garbage.
+                // Skip this candidate; another partial candidate or a fresh prefill covers these tokens.
+                if (block->isOnDisk())
+                {
+                    continue;
+                }
                 if (copyOnPartialReuse || (!block->hasRefs() && block->isLeaf()))
                 {
                     auto const numMatchedTokens = static_cast<SizeType32>(match.key.uniqueTokens.size());
