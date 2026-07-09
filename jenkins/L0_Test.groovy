@@ -3570,12 +3570,6 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             }
         }
 
-        trtllm_utils.llmExecStepWithRetry(pipeline, script: "mkdir -p /opt/tritonserver/backends/tensorrtllm")
-        def isAarch64 = config.contains("aarch64")
-        if (!isAarch64) {
-            trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmPath} && cp TensorRT-LLM/triton_backend/inflight_batcher_llm/libtriton_tensorrtllm.so /opt/tritonserver/backends/tensorrtllm/")
-            trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmPath} && cp TensorRT-LLM/triton_backend/inflight_batcher_llm/trtllmExecutorWorker /opt/tritonserver/backends/tensorrtllm/")
-        }
         trtllm_utils.llmExecStepWithRetry(pipeline, script: "git config --global --add safe.directory \"*\"")
         } // timeout 45 min
     }
@@ -4484,8 +4478,8 @@ def launchTestJobs(pipeline, testFilter)
         // "A30-TensorRT-Post-Merge-6": ["a30", "l0_a30", 6, 6],
         "A30-CPP-Post-Merge-1": ["a30", "l0_a30", 1, 2],
         "A30-CPP-Post-Merge-2": ["a30", "l0_a30", 2, 2],
-        "A30-Triton-Post-Merge-1": ["a30", "l0_a30", 1, 2],
-        "A30-Triton-Post-Merge-2": ["a30", "l0_a30", 2, 2],
+        // "A30-Triton-Post-Merge-1": ["a30", "l0_a30", 1, 2],
+        // "A30-Triton-Post-Merge-2": ["a30", "l0_a30", 2, 2],
         // "A100X-TensorRT-Post-Merge-1": ["a100x", "l0_a100", 1, 6],
         // "A100X-TensorRT-Post-Merge-2": ["a100x", "l0_a100", 2, 6],
         // "A100X-TensorRT-Post-Merge-3": ["a100x", "l0_a100", 3, 6],
