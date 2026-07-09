@@ -78,12 +78,18 @@ def _attend_ctx_tokens(
         page = tl.load(blk_row_ptr + idx // TPB, mask=valid, other=0).to(tl.int64)
         toff = idx % TPB
         k_ptrs = (
-            k_cache_ptr + page[:, None] * stride_kp + toff[:, None] * stride_kt
-            + kvh * stride_kh + d[None, :]
+            k_cache_ptr
+            + page[:, None] * stride_kp
+            + toff[:, None] * stride_kt
+            + kvh * stride_kh
+            + d[None, :]
         )
         v_ptrs = (
-            v_cache_ptr + page[:, None] * stride_vp + toff[:, None] * stride_vt
-            + kvh * stride_vh + d[None, :]
+            v_cache_ptr
+            + page[:, None] * stride_vp
+            + toff[:, None] * stride_vt
+            + kvh * stride_vh
+            + d[None, :]
         )
         k = tl.load(k_ptrs, mask=valid[:, None], other=0.0).to(tl.bfloat16)
         v = tl.load(v_ptrs, mask=valid[:, None], other=0.0).to(tl.bfloat16)
@@ -143,8 +149,15 @@ def _attend_noise_suffix(
 
 @triton.jit
 def _load_q_tile(
-    q_ptr, b, kvh, stride_qb, stride_qq, stride_qh,
-    Q: tl.constexpr, GROUP: tl.constexpr, D: tl.constexpr,
+    q_ptr,
+    b,
+    kvh,
+    stride_qb,
+    stride_qq,
+    stride_qh,
+    Q: tl.constexpr,
+    GROUP: tl.constexpr,
+    D: tl.constexpr,
     R_PAD: tl.constexpr,
 ):
     # Row r -> (head h = kvh*GROUP + r // Q, query qi = r % Q). tl.arange
@@ -200,8 +213,7 @@ def _dflash_ctx_attn_kernel(
     kvh = tl.program_id(1)
     R: tl.constexpr = Q * GROUP
 
-    q_tile = _load_q_tile(q_ptr, b, kvh, stride_qb, stride_qq, stride_qh,
-                          Q, GROUP, D, R_PAD)
+    q_tile = _load_q_tile(q_ptr, b, kvh, stride_qb, stride_qq, stride_qh, Q, GROUP, D, R_PAD)
 
     m_i = tl.full([R_PAD], float("-inf"), dtype=tl.float32)
     l_i = tl.zeros([R_PAD], dtype=tl.float32)
@@ -209,13 +221,47 @@ def _dflash_ctx_attn_kernel(
 
     ctx_len = tl.load(ctx_len_ptr + b)
     m_i, l_i, acc = _attend_ctx_tokens(
-        q_tile, k_cache_ptr, v_cache_ptr, blk_ptr + b * stride_bb, kvh,
-        stride_kp, stride_kt, stride_kh, stride_vp, stride_vt, stride_vh,
-        0, ctx_len, sm_scale, m_i, l_i, acc, R_PAD, TPB, D, BLOCK_N)
+        q_tile,
+        k_cache_ptr,
+        v_cache_ptr,
+        blk_ptr + b * stride_bb,
+        kvh,
+        stride_kp,
+        stride_kt,
+        stride_kh,
+        stride_vp,
+        stride_vt,
+        stride_vh,
+        0,
+        ctx_len,
+        sm_scale,
+        m_i,
+        l_i,
+        acc,
+        R_PAD,
+        TPB,
+        D,
+        BLOCK_N,
+    )
 
     m_i, l_i, acc = _attend_noise_suffix(
-        q_tile, k_noise_ptr, v_noise_ptr, b, kvh, stride_nb, stride_nq,
-        stride_nh, sm_scale, m_i, l_i, acc, R_PAD, Q, D, NOISE_PAD)
+        q_tile,
+        k_noise_ptr,
+        v_noise_ptr,
+        b,
+        kvh,
+        stride_nb,
+        stride_nq,
+        stride_nh,
+        sm_scale,
+        m_i,
+        l_i,
+        acc,
+        R_PAD,
+        Q,
+        D,
+        NOISE_PAD,
+    )
 
     out = acc / l_i[:, None]
     r = tl.arange(0, R_PAD)
@@ -271,17 +317,35 @@ def _dflash_ctx_attn_split_kernel(
     start = s_id * per_split
     end = tl.minimum(start + per_split, ctx_len)
 
-    q_tile = _load_q_tile(q_ptr, b, kvh, stride_qb, stride_qq, stride_qh,
-                          Q, GROUP, D, R_PAD)
+    q_tile = _load_q_tile(q_ptr, b, kvh, stride_qb, stride_qq, stride_qh, Q, GROUP, D, R_PAD)
 
     m_i = tl.full([R_PAD], float("-inf"), dtype=tl.float32)
     l_i = tl.zeros([R_PAD], dtype=tl.float32)
     acc = tl.zeros([R_PAD, D], dtype=tl.float32)
 
     m_i, l_i, acc = _attend_ctx_tokens(
-        q_tile, k_cache_ptr, v_cache_ptr, blk_ptr + b * stride_bb, kvh,
-        stride_kp, stride_kt, stride_kh, stride_vp, stride_vt, stride_vh,
-        start, end, sm_scale, m_i, l_i, acc, R_PAD, TPB, D, BLOCK_N)
+        q_tile,
+        k_cache_ptr,
+        v_cache_ptr,
+        blk_ptr + b * stride_bb,
+        kvh,
+        stride_kp,
+        stride_kt,
+        stride_kh,
+        stride_vp,
+        stride_vt,
+        stride_vh,
+        start,
+        end,
+        sm_scale,
+        m_i,
+        l_i,
+        acc,
+        R_PAD,
+        TPB,
+        D,
+        BLOCK_N,
+    )
 
     # Padded rows are stored too (the partial buffers are R_PAD-strided);
     # the merge kernel discards them at its masked output store.
@@ -347,11 +411,25 @@ def _dflash_ctx_attn_merge_kernel(
         acc = acc * alpha[:, None] + a_s * beta[:, None]
         m_i = m_new
 
-    q_tile = _load_q_tile(q_ptr, b, kvh, stride_qb, stride_qq, stride_qh,
-                          Q, GROUP, D, R_PAD)
+    q_tile = _load_q_tile(q_ptr, b, kvh, stride_qb, stride_qq, stride_qh, Q, GROUP, D, R_PAD)
     m_i, l_i, acc = _attend_noise_suffix(
-        q_tile, k_noise_ptr, v_noise_ptr, b, kvh, stride_nb, stride_nq,
-        stride_nh, sm_scale, m_i, l_i, acc, R_PAD, Q, D, NOISE_PAD)
+        q_tile,
+        k_noise_ptr,
+        v_noise_ptr,
+        b,
+        kvh,
+        stride_nb,
+        stride_nq,
+        stride_nh,
+        sm_scale,
+        m_i,
+        l_i,
+        acc,
+        R_PAD,
+        Q,
+        D,
+        NOISE_PAD,
+    )
 
     out = acc / l_i[:, None]
     row_ok = r < R
@@ -374,8 +452,8 @@ def _get_partial_bufs(B, NKV, S, R, D, device):
     if bufs is None:
         acc = torch.empty(B * NKV * S * R * D, dtype=torch.float32, device=device)
         m = torch.empty(B * NKV * S * R, dtype=torch.float32, device=device)
-        l = torch.empty(B * NKV * S * R, dtype=torch.float32, device=device)
-        bufs = (acc, m, l)
+        l_buf = torch.empty(B * NKV * S * R, dtype=torch.float32, device=device)
+        bufs = (acc, m, l_buf)
         _PARTIAL_BUFS[key] = bufs
     return bufs
 
@@ -387,8 +465,7 @@ def _num_splits(B: int, NKV: int) -> int:
     above ~2 tiles. B is padded/static under CUDA graph capture, so the
     resulting grid is capture-safe.
     """
-    sm_count = torch.cuda.get_device_properties(
-        torch.cuda.current_device()).multi_processor_count
+    sm_count = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
     if B * NKV >= sm_count:
         return 1
     return min(16, max(1, sm_count // (B * NKV)))
@@ -413,12 +490,12 @@ def dflash_ctx_paged_attention(
     # (every known draft uses 64/128; the manager default page is 32).
     if D < 16 or (D & (D - 1)) != 0:
         raise ValueError(
-            f"DFlash hybrid ctx kernel requires a power-of-two head_dim "
-            f">= 16, got {D}.")
+            f"DFlash hybrid ctx kernel requires a power-of-two head_dim >= 16, got {D}."
+        )
     if TPB & (TPB - 1) != 0:
         raise ValueError(
-            f"DFlash hybrid ctx kernel requires a power-of-two "
-            f"tokens_per_block, got {TPB}.")
+            f"DFlash hybrid ctx kernel requires a power-of-two tokens_per_block, got {TPB}."
+        )
     assert q.stride(-1) == 1 and k_cache.stride(-1) == 1
 
     out = torch.empty_like(q)
@@ -437,40 +514,83 @@ def dflash_ctx_paged_attention(
     S = _num_splits(B, NKV)
     if S == 1:
         _dflash_ctx_attn_kernel[(B, NKV)](
-            q, k_cache, v_cache, block_idx, ctx_lens, k_noise, v_noise, out,
+            q,
+            k_cache,
+            v_cache,
+            block_idx,
+            ctx_lens,
+            k_noise,
+            v_noise,
+            out,
             *common_q,
-            k_cache.stride(0), k_cache.stride(1), k_cache.stride(2),
-            v_cache.stride(0), v_cache.stride(1), v_cache.stride(2),
+            k_cache.stride(0),
+            k_cache.stride(1),
+            k_cache.stride(2),
+            v_cache.stride(0),
+            v_cache.stride(1),
+            v_cache.stride(2),
             block_idx.stride(0),
             *common_n,
             *common_o,
             sm_scale,
-            Q=Q, GROUP=group, TPB=TPB, D=D, BLOCK_N=BLOCK_N,
-            NOISE_PAD=noise_pad, R_PAD=r_pad,
+            Q=Q,
+            GROUP=group,
+            TPB=TPB,
+            D=D,
+            BLOCK_N=BLOCK_N,
+            NOISE_PAD=noise_pad,
+            R_PAD=r_pad,
             num_warps=4,
         )
         return out
 
     part_acc, part_m, part_l = _get_partial_bufs(B, NKV, S, r_pad, D, q.device)
     _dflash_ctx_attn_split_kernel[(B, NKV, S)](
-        q, k_cache, v_cache, block_idx, ctx_lens,
-        part_acc, part_m, part_l,
+        q,
+        k_cache,
+        v_cache,
+        block_idx,
+        ctx_lens,
+        part_acc,
+        part_m,
+        part_l,
         *common_q,
-        k_cache.stride(0), k_cache.stride(1), k_cache.stride(2),
-        v_cache.stride(0), v_cache.stride(1), v_cache.stride(2),
+        k_cache.stride(0),
+        k_cache.stride(1),
+        k_cache.stride(2),
+        v_cache.stride(0),
+        v_cache.stride(1),
+        v_cache.stride(2),
         block_idx.stride(0),
         sm_scale,
-        NKV=NKV, S=S, Q=Q, GROUP=group, TPB=TPB, D=D, BLOCK_N=BLOCK_N,
+        NKV=NKV,
+        S=S,
+        Q=Q,
+        GROUP=group,
+        TPB=TPB,
+        D=D,
+        BLOCK_N=BLOCK_N,
         R_PAD=r_pad,
         num_warps=4,
     )
     _dflash_ctx_attn_merge_kernel[(B, NKV)](
-        q, part_acc, part_m, part_l, k_noise, v_noise, out,
+        q,
+        part_acc,
+        part_m,
+        part_l,
+        k_noise,
+        v_noise,
+        out,
         *common_q,
         *common_n,
         *common_o,
         sm_scale,
-        NKV=NKV, S=S, Q=Q, GROUP=group, D=D, NOISE_PAD=noise_pad,
+        NKV=NKV,
+        S=S,
+        Q=Q,
+        GROUP=group,
+        D=D,
+        NOISE_PAD=noise_pad,
         R_PAD=r_pad,
         num_warps=4,
     )
