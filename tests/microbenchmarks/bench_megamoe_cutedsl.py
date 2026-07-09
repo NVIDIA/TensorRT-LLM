@@ -62,6 +62,7 @@ from _torch.modules.moe.moe_test_utils import MoeBackendType
 from _torch.modules.moe.quantize_utils import get_test_quant_params
 from transformers.configuration_utils import PretrainedConfig
 
+from tensorrt_llm._torch.autotuner import AutoTuner, autotune
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.modules.fused_moe import RenormalizeMoeRoutingMethod, create_moe
 from tensorrt_llm._torch.modules.fused_moe.interface import MoEWeightLoadingMode
@@ -76,9 +77,26 @@ def _ensure_dist(rank: int, world_size: int) -> None:
     if dist.is_initialized():
         return
     import os
+    import socket
 
-    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
-    os.environ.setdefault("MASTER_PORT", "29561")
+    from tensorrt_llm._utils import mpi_comm
+
+    # Rank 0 draws a free port (a fixed one collides across concurrent
+    # same-node jobs) and every rank enters the same bcast; rank 0 alone
+    # decides, respecting ITS pre-set env vars. Single-node bench -> loopback.
+    def _pick_rendezvous():
+        addr = os.environ.get("MASTER_ADDR")
+        port = os.environ.get("MASTER_PORT")
+        if addr and port:
+            return (addr, port)
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind(("", 0))
+            port = sock.getsockname()[1]
+        return ("127.0.0.1", str(port))
+
+    addr, port = mpi_comm().bcast(_pick_rendezvous() if rank == 0 else None, root=0)
+    os.environ["MASTER_ADDR"] = str(addr)
+    os.environ["MASTER_PORT"] = str(port)
     # Global rank drives EP/Mapping; the CUDA device is the LOCAL index (robust
     # to multi-node / one-GPU-per-process launchers, where global rank != device).
     local_rank = rank % max(1, torch.cuda.device_count())
@@ -173,6 +191,21 @@ def _bench_one(tpr: int, mapping: Mapping, args, dtype) -> dict:
             return moe.forward(x, router_logits, all_rank_num_tokens=all_rank_num_tokens)
 
         with torch.inference_mode():
+            if args.autotune:
+                # One tuning forward (MERGE lockstep across EP ranks)
+                # populates the in-process tactic cache; without it the
+                # timed forwards silently run the fallback tactic while
+                # reporting autotune=true.
+                with autotune():
+                    _fwd()
+                # Drop the tuning-only symmetric scratch (serving does this
+                # after warmup); otherwise it stays resident through the
+                # timed window and accumulates across the sweep. Deferred
+                # access: the symbol exists only when the CuteDSL op is
+                # available (guaranteed here -- the backend just ran).
+                from tensorrt_llm._torch.custom_ops import cute_dsl_megamoe_custom_op as _megamoe_op
+
+                _megamoe_op.release_megamoe_profiling_scratch()
             if args.cuda_graph:
                 per_iter = _time_cuda_graph(_fwd, args, ws)
             else:
@@ -280,6 +313,10 @@ def main():
     )
     mapping.rank = rank
     _ensure_dist(rank, world_size)
+    if args.autotune:
+        # The MERGE tuning strategy barriers the EP ranks in lockstep and
+        # needs the tuner's distributed state wired up before any forward.
+        AutoTuner.get().setup_distributed_state(mapping)
     if args.num_experts % world_size != 0:
         raise SystemExit(
             f"--num-experts ({args.num_experts}) must be divisible by world_size ({world_size})"

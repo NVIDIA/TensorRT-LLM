@@ -1803,7 +1803,11 @@ if IS_MEGAMOE_OP_AVAILABLE:
         # reduce work on rows [num_tokens, max_T) -- worth ~5-8us/layer at
         # decode. ``num_tokens < 0`` (or an oversized value, e.g. from the
         # autotuner's regenerated profiling tensors) keeps the full bucket.
-        if num_tokens >= 0:
+        # ``num_tokens == 0`` (a zero-token rank in a lockstep chunk, launched
+        # anyway so peers can cross the in-kernel NVLink barrier) ALSO keeps
+        # the full bucket: a 0-row slice would make TopkReduce compute and
+        # launch a zero grid.
+        if num_tokens > 0:
             combine_output = combine_output[: min(num_tokens, combine_output.shape[0])]
 
         runner = Sm100MegaMoENvfp4Runner(

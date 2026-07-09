@@ -69,6 +69,7 @@ non-1 scales compute correctly.
 from __future__ import annotations
 
 import os
+import socket
 import weakref
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple, Union
@@ -558,13 +559,25 @@ class MegaMoECuteDsl(MoE):
         # (pure function of ``max_num_tokens`` + env, identical across ranks) and
         # the SAME per-chunk bucket (from ``max(all_rank_num_tokens)``, an
         # allgathered value), so the in-kernel NVLink barrier stays valid.
-        # ``self.max_num_tokens`` is the GLOBAL MoE budget (= per-rank
-        # ``max_num_tokens`` x attention dp_size; see model_config.py). Per-rank
-        # chunks never exceed the per-rank cap, so derive the ladder from that --
-        # else the top (global) bucket is allocated but never selected, wasting a
-        # symmetric provider. dp_size <= 1 -> no-op.
-        _dp = max(1, int(getattr(self.mapping, "dp_size", 1)))
-        self._maxt_buckets = self._resolve_maxt_buckets(self.max_num_tokens // _dp)
+        # ``self.max_num_tokens`` is the GLOBAL MoE budget (default = per-rank
+        # ``max_num_tokens`` x attention dp_size, but an explicit smaller
+        # ``moe_config.max_num_tokens`` is legal; see model_config.py). The
+        # scheduler slices PER-RANK chunks up to the UNDIVIDED
+        # ``moe_max_num_tokens`` (``FusedCommMoEScheduler._compute_chunk_layout``)
+        # and a rank never feeds more than the per-rank engine budget, so the
+        # true per-rank chunk upper bound is ``min(moe_max_num_tokens,
+        # max_num_tokens)``. A smaller ladder cap makes
+        # ``_select_launch_max_tokens`` raise on a legal chunk; a larger one
+        # allocates a top bucket that is never selected, wasting a symmetric
+        # provider. Both inputs are rank-identical, keeping the ladder
+        # rank-identical (the NVLink-barrier invariant). NOTE: the
+        # external-comm scheduler treats the same knob as a GLOBAL budget;
+        # this cap matches the fused scheduler's per-rank slicing.
+        per_rank_cap = self.max_num_tokens
+        _engine_max = int(getattr(model_config, "max_num_tokens", 0) or 0)
+        if _engine_max > 0:
+            per_rank_cap = min(per_rank_cap, _engine_max)
+        self._maxt_buckets = self._resolve_maxt_buckets(per_rank_cap)
         # Per-bucket symmetric providers (int bucket -> MegaMoeSymmMemProvider),
         # filled at ``create_weights`` time for the multi-rank EP path (the
         # ``_symm_provider`` property exposes the full bucket's provider).
@@ -589,6 +602,22 @@ class MegaMoECuteDsl(MoE):
                 f"to single-rank degenerate mode at run_moe time."
             )
             self._ep_pg = None
+        # Pure-DEP invariant, checked HERE (construction is synchronous
+        # across ranks) instead of at first forward: the barrier-reset fence
+        # in the custom op runs on the WORLD group, so a WORLD that is not
+        # exactly the EP group (PP / CP hybrids) would build fine and then
+        # fail or hang mid-serving. Mirrors the op's forward-time fence
+        # guard exactly (that guard is unconditional on world_size, so
+        # ep_size == 1 under a multi-rank WORLD is rejected too). ValueError
+        # on purpose -- the ``except RuntimeError`` above is the single-rank
+        # fallback and must not swallow this.
+        if dist.is_available() and dist.is_initialized() and dist.get_world_size() != self.ep_size:
+            raise ValueError(
+                f"MegaMoECuteDsl requires pure DEP (torch.distributed WORLD "
+                f"== EP): the forward-time barrier-reset fence runs on the "
+                f"WORLD process group. Got WORLD={dist.get_world_size()}, "
+                f"EP={self.ep_size}."
+            )
 
         # WEAK reference to the symmetric scratch provider used ONLY for
         # AutoTuner profiling (one buffer shared across same-shape MoE layers).
@@ -655,7 +684,8 @@ class MegaMoECuteDsl(MoE):
         rank-identical environment) so every EP rank derives the identical
         list -- a divergent ladder would break the cross-rank NVLink barrier.
         The ladder is ``{256, 1024, 4096}`` rungs below the PER-RANK cap
-        (``moe_max_num_tokens // dp_size``) plus that cap as the top bucket;
+        (``min(moe_max_num_tokens, max_num_tokens)``) plus that cap as the
+        top bucket;
         small by design, since extra rungs multiply the compile/fence/capture/
         memory surface. ``MEGAMOE_ADAPTIVE_MAXT=0`` is a temporary rollback
         switch (single full bucket = always-pad-to-max); ``MEGAMOE_AUTOTUNE=1``
@@ -698,7 +728,7 @@ class MegaMoECuteDsl(MoE):
         raise RuntimeError(
             f"MegaMoE-CuteDSL: chunk max_tokens_per_rank={chunk_max_tokens} exceeds "
             f"the top adaptive bucket {buckets[-1]} (per-rank cap = "
-            f"moe_max_num_tokens // attention_dp_size). Raise moe_max_num_tokens or "
+            f"min(moe_max_num_tokens, max_num_tokens)). Raise moe_max_num_tokens or "
             f"reduce the per-rank chunk."
         )
 
@@ -798,7 +828,7 @@ class MegaMoECuteDsl(MoE):
             return
         if os.environ.get("MEGAMOE_MPI_INIT_TORCH_DIST", "1") != "1":
             return
-        from tensorrt_llm._utils import mpi_rank, mpi_world_size
+        from tensorrt_llm._utils import mpi_comm, mpi_rank, mpi_world_size
 
         try:
             world = mpi_world_size()
@@ -811,10 +841,47 @@ class MegaMoECuteDsl(MoE):
             return
         if world <= 1:
             return
-        # env:// rendezvous needs only the master endpoint; rank/world_size are
-        # passed explicitly to ``init_process_group`` below.
-        os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
-        os.environ.setdefault("MASTER_PORT", "29561")
+        # Pure-DEP pre-check BEFORE any collective: under PP / CP hybrids
+        # some ranks never construct a MegaMoE module, so entering the
+        # bcast / init_process_group rendezvous below would hang instead of
+        # failing loud. Inputs are rank-identical, so every participating
+        # rank raises in lockstep.
+        if world != self.ep_size:
+            raise ValueError(
+                f"MegaMoECuteDsl requires pure DEP (MPI WORLD == EP) to "
+                f"bootstrap torch.distributed: got MPI world={world}, "
+                f"EP={self.ep_size}."
+            )
+
+        # env:// rendezvous needs only the master endpoint; rank/world_size
+        # are passed explicitly to ``init_process_group`` below. A fixed port
+        # would collide across concurrent same-node jobs, so rank 0 draws a
+        # free one. The bcast is UNCONDITIONAL on every rank and rank 0 alone
+        # decides (respecting ITS pre-set launcher env vars): gating the
+        # collective on per-rank env presence would desync the communicator
+        # when the vars are exported on only a subset of ranks. No bind-race
+        # retry: a sound one needs cross-rank failure agreement, and the
+        # close()->bind() window is negligible next to the fixed-port
+        # collision this replaces.
+        def _pick_rendezvous():
+            addr = os.environ.get("MASTER_ADDR")
+            port = os.environ.get("MASTER_PORT")
+            if addr and port:
+                return (addr, port)
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                sock.bind(("", 0))
+                port = sock.getsockname()[1]
+            try:
+                addr = socket.gethostbyname(socket.gethostname())
+            except OSError:
+                # Unresolvable hostname (minimal containers / broken DNS):
+                # this bootstrap is documented single-node, loopback works.
+                addr = "127.0.0.1"
+            return (addr, str(port))
+
+        host, port = mpi_comm().bcast(_pick_rendezvous() if rank == 0 else None, root=0)
+        os.environ["MASTER_ADDR"] = str(host)
+        os.environ["MASTER_PORT"] = str(port)
         logger.info(
             f"[MegaMoECuteDsl] torch.distributed not initialized under MPI; "
             f"bootstrapping NCCL WORLD group (rank={rank}/{world}, "

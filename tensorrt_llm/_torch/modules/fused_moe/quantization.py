@@ -2970,7 +2970,9 @@ class NVFP4MegaMoECuteDslMethod(NVFP4FusedMoEMethod):
     @classmethod
     def fc1_sf_flat_size(cls, intermediate: int, hidden: int) -> int:
         """``round_up(expand_intermediate, SfPaddingBlock=128) *
-        round_up(ceil(hidden / 16), 4)`` -- matches kernel_fc12.py:880-890.
+        round_up(ceil(hidden / 16), 4)`` -- matches the FC1 weight-SF view
+        in ``kernel_fc12.py`` (``intermediate_gateup_padded`` /
+        ``expected_fc1_weight_sf_cols``).
         ``expand_intermediate = 2 * intermediate``.
         """
         expand_intermediate = intermediate * 2
@@ -2980,7 +2982,9 @@ class NVFP4MegaMoECuteDslMethod(NVFP4FusedMoEMethod):
     @classmethod
     def fc2_sf_flat_size(cls, hidden: int, intermediate: int) -> int:
         """``round_up(hidden, SfPaddingBlock=128) *
-        round_up(ceil(intermediate / 16), 4)`` -- matches runner_fc12.py:1305.
+        round_up(ceil(intermediate / 16), 4)`` -- matches the FC2 weight-SF
+        view in ``kernel_fc12.py`` (``hidden_padded_fc2`` /
+        ``expected_fc2_weight_sf_cols``).
         """
         return (cls._round_up_int(hidden, 128) *
                 cls._round_up_int(cls._ceil_div_int(intermediate, 16), 4))
@@ -3125,6 +3129,33 @@ class NVFP4MegaMoECuteDslMethod(NVFP4FusedMoEMethod):
                     name,
                     nn.Parameter(torch.empty_like(meta, device="cuda"),
                                  requires_grad=False))
+                # The fresh buffer is UNINITIALIZED: finalize must verify the
+                # load covered every local expert before packing (see
+                # ``process_weights_after_loading``).
+                module._streamed_sources_rematerialized = True
+
+    def pre_reload_weights(self, module: torch.nn.Module):
+        # Hot-reload hook. The base implementation rematerializes EVERY
+        # ``rebuild_tensor_metadata`` entry at full shape up front; for this
+        # method those are exactly the streamed source params, so a
+        # model-wide reload would recreate the ~229 GB/rank init peak the
+        # streaming scheme exists to avoid. Keep them as 0-element
+        # placeholders -- ``load_weights`` rematerializes each module's
+        # sources at its first reload shard instead. KNOWN LIMITS: reload
+        # runs with allow_partial_loading=True, so no per-module finalize
+        # frees the sources until the model-wide sweep -- a FULL-model hot
+        # reload therefore still accumulates every layer's sources at the
+        # sweep start (per-bucket finalization is the follow-up); and a
+        # reload must cover every local expert of each touched module
+        # (enforced in ``process_weights_after_loading``).
+        for param_name, metadata in module.rebuild_tensor_metadata.items():
+            if param_name in self._STREAMED_SOURCE_PARAMS:
+                continue
+            meta_tensor = metadata['meta']
+            module.register_parameter(
+                param_name,
+                nn.Parameter(torch.empty_like(meta_tensor, device="cuda"),
+                             requires_grad=False))
 
     def load_weights(self,
                      module: torch.nn.Module,
@@ -3304,6 +3335,21 @@ class NVFP4MegaMoECuteDslMethod(NVFP4FusedMoEMethod):
         if (module.w3_w1_weight.data.numel() == 0
                 and not hasattr(module, 'tmp_cutlass_w3_w1_weights')):
             return
+        # A load that rematerialized the streamed sources must cover every
+        # local expert: the fresh buffers are uninitialized, so packing a
+        # partially-covered module would bake garbage rows into the mega_*
+        # buffers (silent corruption). The w3_w1 stash holds one entry per
+        # covered expert (routed slots, plus EPLB shared staging if any).
+        if getattr(module, "_streamed_sources_rematerialized", False):
+            covered = len(getattr(module, 'tmp_cutlass_w3_w1_weights', ()))
+            n_slots = module.expert_size_per_partition
+            if covered < n_slots:
+                raise RuntimeError(
+                    f"MegaMoE-CuteDSL streamed (re)load covered only "
+                    f"{covered}/{n_slots} local experts of this module; the "
+                    f"uncovered source rows are uninitialized. A (re)load "
+                    f"must cover every local expert of a touched module.")
+            module._streamed_sources_rematerialized = False
         # ---- Cat raw w3+w1 weights ----
         # Iterates BOTH routed (module.w3_w1_weight.data) and shared
         # (module.local_shared_w3_w1_tensors) entries: the loader keys
@@ -3391,6 +3437,13 @@ class NVFP4MegaMoECuteDslMethod(NVFP4FusedMoEMethod):
                                                  device=_p.data.device),
                                      requires_grad=False),
                         module.rebuild_tensor_metadata)
+            # Rebind quant_scales to the placeholders NOW: the base class
+            # bound them to the full block-scale tensors above, and the
+            # model-wide post_load_weights sweep only rebinds at the very
+            # end of the load -- without this, every layer's freed source
+            # scales (~11 GB/rank total) stay reachable until then,
+            # defeating the streaming-load peak reduction.
+            self.setup_quant_scales(module)
 
     @staticmethod
     def _build_fc1_norm_const_tensor(raw_input_scales: Dict,
