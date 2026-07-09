@@ -4,7 +4,7 @@
 
 Runs the same JIT-compiled SM100 kernel binaries through (a) MSA's
 host-centric `fmha_sm100_plan` / `fmha_sm100` driver and (b) the in-tree
-graph-safe `dispatch.M3DecodeKernelDriver`, on identical inputs, and
+graph-safe `dispatch.M3DecodePlanner`, on identical inputs, and
 asserts bit-equality:
 
 * proxy MQA max-score pass: uniform and heterogeneous KV lens;
@@ -212,10 +212,12 @@ def _msa_sparse(inp, kv_block_indexes, causal=False):
 
 def _driver(max_batch):
     from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.decode_wrapper.dispatch import (  # noqa: E501
-        get_decode_driver,
+        M3DecodePlanner,
     )
 
-    return get_decode_driver(_geometry(max_batch), torch.device("cuda"))
+    planner = M3DecodePlanner(_geometry(max_batch), torch.device("cuda"))
+    planner.plan(max_batch)
+    return planner
 
 
 def _intree_proxy(driver, inp):

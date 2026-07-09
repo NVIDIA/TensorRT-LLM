@@ -34,7 +34,7 @@ This mirrors the Triton reference backend's
 from __future__ import annotations
 
 import functools
-from typing import TYPE_CHECKING, ClassVar, Optional, Tuple
+from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
 
@@ -47,30 +47,30 @@ from .common import (
     write_main_kv_slots,
 )
 from .indexer import MsaIndexer
-from .metadata import MiniMaxM3SparseConfig, build_m3_sparse_metadata_and_plans
+from .metadata import M3StepState, MiniMaxM3SparseConfig, build_m3_sparse_metadata_and_plans
 
 if TYPE_CHECKING:
-    from .metadata import MiniMaxM3SparseAttentionMetadata
-    from .msa_plan_cache import MsaPlanCacheGeometry
+    from .decode_wrapper.dispatch import M3DecodePlanner
+    from .metadata import M3PlanTables, MiniMaxM3SparseAttentionMetadata
 
 
 def _whole_batch_lens(
     m3_meta: "MiniMaxM3SparseAttentionMetadata",
+    plans: Optional["M3PlanTables"],
     page_size: int,
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
     """Whole-batch `(qo_lens_cpu, kv_lens_cpu, qo_offset_cpu, kv_indices)`.
 
-    Prefers the pre-staged `msa_plans` (CUDA-graph-stable buffers) and
+    Prefers the pre-staged plan tables (CUDA-graph-stable buffers) and
     falls back to an eager rebuild for focused tests and the first eager
     warmup pass.
     """
-    msa_plans = getattr(m3_meta, "msa_plans", None)
-    if msa_plans is not None:
+    if plans is not None:
         return (
-            msa_plans["qo_lens_cpu"],
-            msa_plans["kv_lens_cpu"],
-            msa_plans["qo_offset_cpu"],
-            msa_plans["kv_indices"],
+            plans.qo_lens_cpu,
+            plans.kv_lens_cpu,
+            plans.qo_offset_cpu,
+            plans.kv_indices,
         )
     seq_lens_cpu = m3_meta.seq_lens_cpu.to(torch.int32)
     if m3_meta.is_prefill:
@@ -111,15 +111,42 @@ def get_minimax_m3_msa_attention_backend_cls():
         Implements `MsaSparseMetadataProtocol`.
         """
 
-        # Published by the model layer's first sparse forward. Set on the
-        # class so CUDA-graph metadata clones see it before capture.
-        _msa_geometry: ClassVar[Optional["MsaPlanCacheGeometry"]] = None
-
         def __init__(self, *args, **kwargs):
             super().__init__(*args, **kwargs)
-            self.minimax_m3: Optional[dict] = None
+            # Per-rank sparse config, published once by the attention
+            # layer's first (eager warmup) forward via ensure_m3_config().
+            # CUDA-graph metadata instances receive it through the
+            # shallow copy in create_cuda_graph_metadata(), which runs
+            # after warmup and before capture.
+            self._m3_config: Optional[MiniMaxM3SparseConfig] = None
+            # Per-step state rebuilt by prepare().
+            self.m3_step: Optional[M3StepState] = None
+            # Per-instance CUDA-graph-stable staging: the paged-KV table
+            # buffers and the decode planner. Each capture bucket has its
+            # own metadata instance and therefore its own buffers,
+            # mirroring the FlashInfer backend's per-instance wrappers.
             self._m3_static_buffers: Optional[dict] = None
             self._msa_plan_cache = None
+            self._m3_decode_planner: Optional["M3DecodePlanner"] = None
+
+        def ensure_m3_config(self, config: MiniMaxM3SparseConfig) -> None:
+            """Publish the per-rank sparse config (first writer wins)."""
+            if self._m3_config is None:
+                self._m3_config = config
+
+        def create_cuda_graph_metadata(self, *args, **kwargs):
+            clone = super().create_cuda_graph_metadata(*args, **kwargs)
+            if clone is self:
+                return clone
+            # The shallow copy shares this instance's mutable staging;
+            # reset it so the graph bucket allocates and plans its own
+            # buffers in its first prepare(). _m3_config is immutable and
+            # intentionally carried over.
+            clone.m3_step = None
+            clone._m3_static_buffers = None
+            clone._msa_plan_cache = None
+            clone._m3_decode_planner = None
+            return clone
 
         # lifecycle
 
@@ -159,39 +186,97 @@ def get_minimax_m3_msa_attention_backend_cls():
 
         def prepare(self) -> None:
             super().prepare()
-            self.minimax_m3 = None
-            geometry = type(self)._msa_geometry
-            if geometry is None:
-                from .msa_plan_cache import get_global_msa_geometry
-
-                geometry = get_global_msa_geometry()
+            self.m3_step = None
             cache_device = self._cache_device()
             static_buffers = self._maybe_static_buffers(cache_device)
-            attachment, self._msa_plan_cache = build_m3_sparse_metadata_and_plans(
+            # The sparse KV block size equals the cache manager's
+            # tokens_per_block (asserted by MiniMaxM3KVCacheManagerV2), so
+            # the page-table staging needs no model geometry.
+            kv_cache_manager = getattr(self, "kv_cache_manager", None)
+            plan_block_size = (
+                int(kv_cache_manager.tokens_per_block)
+                if kv_cache_manager is not None
+                and bool(getattr(kv_cache_manager, "use_msa", False))
+                else None
+            )
+            self.m3_step, self._msa_plan_cache = build_m3_sparse_metadata_and_plans(
                 self,
                 static_buffers=static_buffers,
                 plan_cache=self._msa_plan_cache,
-                geometry=geometry,
+                plan_block_size=plan_block_size,
             )
-            self.minimax_m3 = attachment
+            # Decode: refresh the per-instance planner's CTA work split
+            # for the current batch (host work, outside any capture).
+            step = self.m3_step
+            if (
+                step is not None
+                and step.plans is not None
+                and not step.metadata.is_prefill
+                and self._m3_config is not None
+            ):
+                batch = int(step.metadata.seq_lens.shape[0])
+                self.m3_decode_planner(batch)
 
         # internal accessors
 
-        def _require_attachment(self) -> dict:
-            if self.minimax_m3 is None:
+        def _require_step(self) -> M3StepState:
+            if self.m3_step is None:
                 raise RuntimeError(
-                    "MiniMaxM3MSATrtllmAttentionMetadata.minimax_m3 is not built; "
+                    "MiniMaxM3MSATrtllmAttentionMetadata.m3_step is not built; "
                     "prepare() must run before the sparse forward."
                 )
-            return self.minimax_m3
+            return self.m3_step
 
         @property
         def m3_meta(self) -> "MiniMaxM3SparseAttentionMetadata":
-            return self._require_attachment()["metadata"]
+            return self._require_step().metadata
 
         @property
         def m3_out_cache_loc(self) -> torch.Tensor:
-            return self._require_attachment()["out_cache_loc"]
+            return self._require_step().out_cache_loc
+
+        @property
+        def m3_plans(self) -> Optional["M3PlanTables"]:
+            return self._require_step().plans
+
+        def m3_decode_planner(self, batch: int) -> "M3DecodePlanner":
+            """Per-instance decode planner, planned for `batch` requests.
+
+            Created lazily on the first (eager, pre-capture) decode use;
+            `prepare()` replans it every decode step, so calls during
+            capture or replay hit the already-planned state and do no
+            host work.
+            """
+            planner = self._m3_decode_planner
+            if planner is None:
+                from .decode_wrapper.dispatch import M3DecodeGeometry, M3DecodePlanner
+
+                if self._m3_config is None:
+                    raise RuntimeError(
+                        "MiniMax-M3 MSA decode requires the sparse config; "
+                        "the attention layer must call ensure_m3_config() "
+                        "before the first decode step."
+                    )
+                config = self._m3_config
+                m3_meta = self.m3_meta
+                page_size = int(self._kv_views(0)[0].shape[1])
+                max_batch = int(getattr(self, "max_num_sequences", None) or self.max_num_requests)
+                geometry = M3DecodeGeometry(
+                    num_q_heads=config.num_q_heads,
+                    num_kv_heads=config.num_kv_heads,
+                    num_index_heads=config.num_index_heads,
+                    head_dim=config.head_dim,
+                    page_size=page_size,
+                    topk=config.topk,
+                    init_blocks=config.init_blocks,
+                    local_blocks=config.local_blocks,
+                    max_batch=max(max_batch, batch),
+                    max_kv_len=int(m3_meta.req_to_token.shape[1]),
+                )
+                planner = M3DecodePlanner(geometry, m3_meta.seq_lens.device)
+                self._m3_decode_planner = planner
+            planner.plan(batch)
+            return planner
 
         def _kv_views(self, layer_idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
             """Per-layer NHD K/V slot views `[num_pages, page_size, num_kv_heads, head_dim]`."""
@@ -246,7 +331,9 @@ def get_minimax_m3_msa_attention_backend_cls():
             # whole-batch q the model passes and the whole-batch block
             # indices the indexer produced.
             page_size = int(self._kv_views(0)[0].shape[1])
-            qo_all, kv_all, qo_off_all, kv_indices_all = _whole_batch_lens(self.m3_meta, page_size)
+            qo_all, kv_all, qo_off_all, kv_indices_all = _whole_batch_lens(
+                self.m3_meta, self.m3_plans, page_size
+            )
             return qo_all, kv_all, (qo_off_all if causal else None), kv_indices_all
 
         def msa_run_sparse_decode(
@@ -257,53 +344,35 @@ def get_minimax_m3_msa_attention_backend_cls():
             kv_block_indexes: torch.Tensor,
             sm_scale: float,
         ) -> torch.Tensor:
-            """CUDA-graph-safe decode sparse GQA via the in-tree driver.
+            """CUDA-graph-safe decode sparse GQA via the in-tree planner.
 
-            Reuses the same geometry-keyed driver instance the indexer used
-            for proxy and block selection (`get_decode_driver` caches by
-            `(geometry, device)`), so the persistent buffers are shared.
-            Returns `[num_tokens, num_q_heads * head_dim]`.
+            Uses this metadata instance's `M3DecodePlanner` (the same one
+            the indexer used for proxy and block selection), planned by
+            `prepare()`. Returns `[num_tokens, num_q_heads * head_dim]`.
             """
-            from .decode_wrapper.dispatch import M3DecodeGeometry, get_decode_driver
-
-            attachment = self._require_attachment()
-            msa_plans = attachment.get("msa_plans")
-            if msa_plans is None:
+            plans = self.m3_plans
+            if plans is None:
                 raise RuntimeError(
-                    "MiniMax-M3 MSA decode requires pre-staged msa_plans; "
-                    "prepare() did not build them (missing geometry / use_msa)."
+                    "MiniMax-M3 MSA decode requires pre-staged plan tables; "
+                    "prepare() did not build them (missing use_msa on the "
+                    "KV cache manager)."
                 )
-            geometry_cfg = msa_plans["geometry"]
             k_paged, v_paged = self.msa_get_paged_kv(layer_idx)
-            page_size = int(k_paged.shape[2])
             seq_lens = self.m3_meta.seq_lens.to(torch.int32)
-            geometry = M3DecodeGeometry(
-                num_q_heads=geometry_cfg.num_q_heads,
-                num_kv_heads=geometry_cfg.num_kv_heads,
-                num_index_heads=geometry_cfg.num_index_heads,
-                head_dim=geometry_cfg.head_dim,
-                page_size=page_size,
-                topk=geometry_cfg.topk,
-                init_blocks=geometry_cfg.init_blocks,
-                local_blocks=geometry_cfg.local_blocks,
-                max_batch=int(msa_plans.get("max_batch") or 0)
-                or max(64, 1 << (int(q.shape[0]) - 1).bit_length()),
-                max_kv_len=int(msa_plans.get("max_kv_len") or 0)
-                or int(self.m3_meta.req_to_token.shape[1]),
-            )
-            driver = get_decode_driver(geometry, q.device)
-            out = driver.sparse_attention(
+            batch = int(q.shape[0])
+            planner = self.m3_decode_planner(batch)
+            out = planner.sparse_attention(
                 q,
                 k_paged,
                 v_paged,
                 kv_block_indexes,
                 seq_lens=seq_lens,
-                kv_page_indptr=msa_plans["kv_page_indptr"],
-                kv_indices=msa_plans["kv_indices"],
+                kv_page_indptr=plans.kv_page_indptr,
+                kv_indices=plans.kv_indices,
                 sm_scale=sm_scale,
             )
-            batch = int(q.shape[0])
-            return out.reshape(batch, geometry_cfg.num_q_heads * geometry_cfg.head_dim)
+            g = planner.geom
+            return out.reshape(batch, g.num_q_heads * g.head_dim)
 
     class MiniMaxM3MSATrtllmAttention(TrtllmAttention):
         """MSA-backed MiniMax-M3 sparse attention (mimics `DSATrtllmAttention`)."""
@@ -340,7 +409,6 @@ def get_minimax_m3_msa_attention_backend_cls():
             self.disable_index_value = bool(sparse_params.disable_index_value)
             self._validate_msa_preconditions()
             self.indexer = MsaIndexer(self.m3_config)
-            self._register_global_geometry()
 
         def _validate_msa_preconditions(self) -> None:
             if not self.disable_index_value:
@@ -363,43 +431,17 @@ def get_minimax_m3_msa_attention_backend_cls():
                     f"MSA backend requires topk={_MSA_REQUIRED_TOPK}, got {self.m3_config.topk}."
                 )
 
-        def _register_global_geometry(self) -> None:
-            # Register the per-rank sparse geometry process-wide at
-            # construction, before any forward or CUDA graph capture, so
-            # every metadata instance's prepare() can pre-build the MSA
-            # plans.
-            from .msa_plan_cache import MsaPlanCacheGeometry, set_global_msa_geometry
-
-            set_global_msa_geometry(
-                MsaPlanCacheGeometry(
-                    num_q_heads=int(self.m3_config.num_q_heads),
-                    num_kv_heads=int(self.m3_config.num_kv_heads),
-                    num_index_heads=int(self.m3_config.num_index_heads),
-                    head_dim=int(self.m3_config.head_dim),
-                    block_size=int(self.m3_config.block_size),
-                    topk=int(self.m3_config.topk),
-                    init_blocks=int(self.m3_config.init_blocks),
-                    local_blocks=int(self.m3_config.local_blocks),
-                )
-            )
-
         @classmethod
         def support_fused_rope(cls) -> bool:
             # The MiniMax-M3 model layer applies partial RoPE to both the
             # main and index branches explicitly.
             return False
 
-        def create_fmha_libs(self) -> None:
-            # The MSA layer runs its main attention exclusively through the
-            # fmha_sm100 block-sparse GQA kernel. Restrict the dispatch loop
-            # to MsaSparseGqaFmha so the standard libs (flashinfer
-            # trtllm-gen, fallback), which come first in the registry and
-            # would otherwise claim the request but cannot handle the M3
-            # sparse contract (unfused q/k/v plus selected block indices),
-            # never win.
-            from tensorrt_llm._torch.attention_backend.fmha import MsaSparseGqaFmha
-
-            self.fmha_libs = [MsaSparseGqaFmha(self)]
+        # No create_fmha_libs override: MsaSparseGqaFmha is registered
+        # first in FMHA_LIBS and its is_available() claims exactly the
+        # MiniMaxM3MSATrtllmAttention layers, so the inherited dispatch
+        # builds [MsaSparseGqaFmha, ...standard libs] here and the
+        # standard libs stay reachable for dense (non-sparse) requests.
 
         # indexer entry point (called by the model layer, DSA-style)
 
@@ -419,6 +461,7 @@ def get_minimax_m3_msa_attention_backend_cls():
             topk]`.
             """
             config = self.m3_config
+            metadata.ensure_m3_config(config)
             idx_sm_scale = (
                 idx_sm_scale if idx_sm_scale is not None else config.sparse_index_dim**-0.5
             )
@@ -432,11 +475,12 @@ def get_minimax_m3_msa_attention_backend_cls():
             page_size = page_size_from_view(metadata._kv_views(self.layer_idx)[0])
 
             if m3_meta.is_prefill:
-                qo, kv, qo_off, kv_indices = _whole_batch_lens(m3_meta, page_size)
+                qo, kv, qo_off, kv_indices = _whole_batch_lens(
+                    m3_meta, metadata.m3_plans, page_size
+                )
                 return self.indexer.select_blocks_prefill(
                     idx_q_view,
                     idx_k_cache,
-                    m3_meta,
                     idx_sm_scale=idx_sm_scale,
                     qo_lens_cpu=qo,
                     kv_lens_cpu=kv,
@@ -446,7 +490,7 @@ def get_minimax_m3_msa_attention_backend_cls():
             return self.indexer.select_blocks_decode(
                 idx_q_view,
                 idx_k_cache,
-                m3_meta,
+                metadata,
                 idx_sm_scale=idx_sm_scale,
                 page_size=page_size,
             )

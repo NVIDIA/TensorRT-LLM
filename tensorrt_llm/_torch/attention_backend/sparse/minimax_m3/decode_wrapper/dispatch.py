@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Graph-safe decode driver for MiniMax-M3 sparse attention.
+"""Graph-safe decode planner for MiniMax-M3 sparse attention.
 
 Replaces MSA's host-centric `fmha_sm100_plan` / `fmha_sm100` driver for
 the decode path while invoking the same JIT-compiled SM100 kernel
@@ -8,21 +8,30 @@ binaries via `fmha_sm100.jit.get_fmha_variant`. MSA's plan bakes
 host-side values into the launch, which CUDA graph replays would freeze,
 so only the driver is replaced and the kernels are reused.
 
-Design contract:
+Ownership follows the FlashInfer backend convention: one
+:class:`M3DecodePlanner` per attention-metadata instance (the CUDA graph
+runner creates one metadata instance per captured batch size, so each
+capture bucket automatically gets its own planner and buffers), with
+`plan()` called from `metadata.prepare()` outside any capture window.
 
-* No plan/run split: every call assembles launch args directly.
-* Everything per-step-varying is a device tensor: `seq_lens`,
-  `kv_page_indptr`, `kv_indices`, `kv_block_indexes`, and the `max_score`
-  contents.
-* Host-baked values are geometry or per-batch-size constants only: head
-  counts, pack factor, page size, `max_k_tiles` capacity, and worklists
-  (a pure function of batch size for decode).
-* Every method is callable inside a CUDA graph capture and yields correct
-  results at replay: no `.item()`, `.cpu()`, or `.tolist()`.
+Buffer discipline:
+
+* Persistent (cross the capture boundary; written by `plan()` on the
+  host, read by the captured kernels): the persistent-CTA worklists and
+  the packed qo segment constants.
+* Everything else (`max_score`, selected block indexes, cumulative KV
+  offsets, causal offsets, the output) is either derived from device
+  tensors inside the forward or is a plain intermediate, so it is
+  allocated normally and CUDA graph capture bakes the allocations.
+
+Every kernel-facing method is callable inside a CUDA graph capture and
+yields correct results at replay: no `.item()`, `.cpu()`, or
+`.tolist()`.
 """
 
 from __future__ import annotations
 
+import functools
 import math
 from dataclasses import dataclass
 from typing import Dict, Tuple
@@ -61,6 +70,33 @@ def _max_k_tiles_capacity(max_kv_len: int) -> int:
     return math.ceil(math.ceil(max_kv_len / 128) / 128) * 128
 
 
+@functools.lru_cache(maxsize=None)
+def _get_variant_module(sparse_mode: int, page_size: int, pack_factor: int):
+    """JIT-compiled `fmha_sm100` kernel variant (stateless, process-wide)."""
+    import fmha_sm100  # noqa: F401  (hard dependency of this driver)
+    from fmha_sm100.jit import _dlpack_dtype_code, get_fmha_variant
+
+    bf16_code = _dlpack_dtype_code(torch.bfloat16)
+    return get_fmha_variant(
+        bf16_code, _QO_TILE_SIZE, True, sparse_mode, page_size, False, pack_factor
+    )
+
+
+_workspace_buffers: Dict[Tuple[str, int], torch.Tensor] = {}
+
+
+def _get_workspace(device: torch.device) -> torch.Tensor:
+    """Shared per-device kernel scratch (contentless, like FlashInfer's
+    `workspace_buffer`; graphs replay serially on a stream so sharing one
+    scratch across planners and capture buckets is safe)."""
+    key = (device.type, device.index if device.index is not None else torch.cuda.current_device())
+    buf = _workspace_buffers.get(key)
+    if buf is None:
+        buf = torch.empty(_WORKSPACE_BYTES, dtype=torch.uint8, device=device)
+        _workspace_buffers[key] = buf
+    return buf
+
+
 @dataclass(frozen=True)
 class M3DecodeGeometry:
     """Compile/alloc-time constants for one M3 layer family (per rank)."""
@@ -88,18 +124,17 @@ class M3DecodeGeometry:
             raise ValueError("num_index_heads must be divisible by num_kv_heads")
 
 
-class M3DecodeKernelDriver:
-    """Persistent-state decode driver for one (device, geometry) pair.
+class M3DecodePlanner:
+    """Per-metadata-instance decode planner and kernel launcher.
 
-    Allocates every buffer once at construction with max-capacity
-    geometry; per-call views are prefix or strided views of those buffers
-    so their `data_ptr()` is stable across CUDA graph replays.
+    Owns exactly the buffers whose contents are produced on the host and
+    consumed by captured kernels (worklists and packed qo constants);
+    `plan()` refreshes them for the current batch size from
+    `metadata.prepare()`, outside any capture window. The owning metadata
+    instance is per capture bucket, so buckets never share these buffers.
     """
 
     def __init__(self, geometry: M3DecodeGeometry, device: torch.device):
-        import fmha_sm100  # noqa: F401  (hard dependency of this driver)
-        from fmha_sm100.jit import _dlpack_dtype_code, get_fmha_variant
-
         self.geom = g = geometry
         self.device = device
 
@@ -112,84 +147,102 @@ class M3DecodeKernelDriver:
         self.max_k_tiles = _max_k_tiles_capacity(g.max_kv_len)
         self.num_ctas = int(torch.cuda.get_device_properties(device).multi_processor_count)
 
-        # --- kernel variant modules (JIT-compiled once, same binaries the
-        #     MSA api path runs) -----------------------------------------
-        bf16_code = _dlpack_dtype_code(torch.bfloat16)
-        # Proxy: OnlyScore (sparse_mode=2), single_wg, no split.
-        self._proxy_module = get_fmha_variant(
-            bf16_code, _QO_TILE_SIZE, True, 2, g.page_size, False, self.pf_proxy
-        )
-        # Sparse GQA: Sparse (sparse_mode=0).
-        self._sparse_module = get_fmha_variant(
-            bf16_code, _QO_TILE_SIZE, True, 0, g.page_size, False, self.pf_sparse
-        )
+        # Kernel variant modules (JIT-compiled once per process, same
+        # binaries the MSA api path runs). Proxy: OnlyScore
+        # (sparse_mode=2); sparse GQA: Sparse (sparse_mode=0).
+        self._proxy_module = _get_variant_module(2, g.page_size, self.pf_proxy)
+        self._sparse_module = _get_variant_module(0, g.page_size, self.pf_sparse)
+        self._workspace = _get_workspace(device)
 
-        # --- persistent buffers -----------------------------------------
-        self.workspace_buffer = torch.empty(_WORKSPACE_BYTES, dtype=torch.uint8, device=device)
-        self._max_score_flat = torch.empty(
-            g.num_index_heads * self.max_k_tiles * g.max_batch,
-            dtype=torch.float32,
+        # --- persistent host-planned buffers ------------------------------
+        # `work_info[i] = head << 16 | batch` in batch-major order is a
+        # pure function of the item index, so the batch-`b` worklist is a
+        # prefix of the max-batch worklist: fill the info buffers once and
+        # take prefix views. Only the CTA split (`work_range`) depends on
+        # the batch size and is rewritten by `plan()`.
+        max_range, max_info_proxy = build_decode_worklist(
+            batch_size=g.max_batch,
+            num_packed_heads=self.heads_packed_proxy,
+            num_ctas=self.num_ctas,
             device=device,
         )
-        self._kv_block_indexes = torch.full(
-            (g.max_batch, g.num_kv_heads, g.topk), -1, dtype=torch.int32, device=device
+        _, max_info_sparse = build_decode_worklist(
+            batch_size=g.max_batch,
+            num_packed_heads=self.heads_packed_sparse,
+            num_ctas=self.num_ctas,
+            device=device,
         )
-        self._out = torch.empty(
-            g.max_batch, g.num_q_heads, g.head_dim, dtype=torch.bfloat16, device=device
+        self._work_info_proxy = max_info_proxy
+        self._work_info_sparse = max_info_sparse
+        self._work_range_proxy = max_range
+        self._work_range_sparse = torch.empty_like(max_range)
+
+        # Packed qo segment constants are batch-prefix-stable as well
+        # (`lens[i] = pf`, `offsets[i] = i * pf`): fill once, view later.
+        self._qo_lens_proxy = torch.full(
+            (g.max_batch,), self.pf_proxy, dtype=torch.int32, device=device
         )
-        self._kv_segment_offsets = torch.zeros(g.max_batch + 1, dtype=torch.int32, device=device)
-        self._valid_pages = torch.zeros(g.max_batch, dtype=torch.int32, device=device)
-        self._qo_offset = torch.zeros(g.max_batch, dtype=torch.int32, device=device)
+        self._qo_lens_sparse = torch.full(
+            (g.max_batch,), self.pf_sparse, dtype=torch.int32, device=device
+        )
+        arange = torch.arange(g.max_batch + 1, dtype=torch.int64)
+        self._qo_offsets_proxy = (arange * self.pf_proxy).to(torch.int32).to(device)
+        self._qo_offsets_sparse = (arange * self.pf_sparse).to(torch.int32).to(device)
 
-        # Per-batch-size constants, built lazily and cached (bounded by
-        # the distinct batch sizes seen: CUDA graph buckets + eager).
-        self._qo_const_cache: Dict[Tuple[int, int], Tuple[torch.Tensor, torch.Tensor]] = {}
-        self._worklist_cache: Dict[Tuple[int, int], Tuple[torch.Tensor, torch.Tensor]] = {}
+        self._planned_batch = -1
+        self.plan(min(1, g.max_batch) or 1)
 
     # ------------------------------------------------------------------
-    # Cached per-batch-size constants (host work happens once per shape,
-    # outside any capture; callers warm shapes up before capturing).
+    # Host-side planning (call from metadata.prepare(), outside capture)
     # ------------------------------------------------------------------
 
-    def _qo_consts(self, batch: int, pack_factor: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        """(qo_segment_lens, qo_segment_offsets) for packed decode lens."""
-        key = (batch, pack_factor)
-        cached = self._qo_const_cache.get(key)
-        if cached is None:
-            lens = torch.full((batch,), pack_factor, dtype=torch.int32, device=self.device)
-            offsets = (
-                (torch.arange(batch + 1, dtype=torch.int64) * pack_factor)
-                .to(torch.int32)
-                .to(self.device)
+    def plan(self, batch: int) -> None:
+        """Refresh the CTA work split for `batch` decode requests.
+
+        Idempotent per batch size; during CUDA graph replay the bucket's
+        batch never changes so this is a no-op after the pre-capture
+        plan.
+        """
+        if batch == self._planned_batch:
+            return
+        if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "M3DecodePlanner.plan() called for a new batch size during CUDA "
+                "graph capture; metadata.prepare() must plan before capture."
             )
-            cached = (lens, offsets)
-            self._qo_const_cache[key] = cached
-        return cached
+        if not 0 < batch <= self.geom.max_batch:
+            raise ValueError(f"batch {batch} out of range (max_batch={self.geom.max_batch})")
 
-    def _worklist(self, batch: int, num_packed_heads: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        key = (batch, num_packed_heads)
-        cached = self._worklist_cache.get(key)
-        if cached is None:
-            cached = build_decode_worklist(
-                batch_size=batch,
-                num_packed_heads=num_packed_heads,
-                num_ctas=self.num_ctas,
-                device=self.device,
+        def _cta_split(n_items: int) -> torch.Tensor:
+            bounds = (torch.arange(self.num_ctas + 1, dtype=torch.int64) * n_items) // self.num_ctas
+            return (bounds[1:] << 32) | bounds[:-1]
+
+        self._work_range_proxy.copy_(_cta_split(batch * self.heads_packed_proxy), non_blocking=True)
+        self._work_range_sparse.copy_(
+            _cta_split(batch * self.heads_packed_sparse), non_blocking=True
+        )
+        self._planned_batch = batch
+
+    def _require_planned(self, batch: int) -> None:
+        if batch != self._planned_batch:
+            raise RuntimeError(
+                f"M3DecodePlanner: batch {batch} was not planned (planned="
+                f"{self._planned_batch}); metadata.prepare() must call plan() first."
             )
-            self._worklist_cache[key] = cached
-        return cached
 
     # ------------------------------------------------------------------
-    # Shared per-call device-side metadata refresh
+    # Shared per-call device-side metadata (intra-capture intermediates)
     # ------------------------------------------------------------------
 
-    def _kv_offsets_view(self, seq_lens: torch.Tensor, batch: int) -> torch.Tensor:
-        """Cumulative KV lengths into the persistent buffer (device op)."""
-        view = self._kv_segment_offsets[: batch + 1]
-        torch.cumsum(seq_lens, 0, dtype=torch.int32, out=view[1:])
-        return view
+    @staticmethod
+    def _kv_offsets(seq_lens: torch.Tensor, batch: int) -> torch.Tensor:
+        """Cumulative KV lengths (device op; capture-safe intermediate)."""
+        out = torch.zeros(batch + 1, dtype=torch.int32, device=seq_lens.device)
+        torch.cumsum(seq_lens, 0, dtype=torch.int32, out=out[1:])
+        return out
 
-    def _qo_offset_view(self, seq_lens: torch.Tensor, batch: int) -> torch.Tensor:
+    @staticmethod
+    def _causal_qo_offset(seq_lens: torch.Tensor) -> torch.Tensor:
         """Per-request causal offset `kv_len - 1` (device op).
 
         The kernel's causal bound is inclusive (attend positions
@@ -198,9 +251,7 @@ class M3DecodeKernelDriver:
         `kv_len` itself would leak one stale slot from a partially-filled
         last page in sparse mode, which has no secondary seqlen clip.
         """
-        view = self._qo_offset[:batch]
-        torch.sub(seq_lens, 1, out=view)
-        return view
+        return seq_lens - 1
 
     # ------------------------------------------------------------------
     # Proxy MQA pass (indexer): per-KV-block max scores
@@ -229,36 +280,34 @@ class M3DecodeKernelDriver:
 
         Returns
         -------
-        `[num_index_heads, max_k_tiles, batch]` fp32 view into the
-        persistent max-score buffer; unwritten tiles are -inf.
+        `[num_index_heads, max_k_tiles, batch]` fp32; unwritten tiles are
+        -inf.
         """
         g = self.geom
         batch = idx_q.shape[0]
+        self._require_planned(batch)
         seq_lens = seq_lens[:batch]
 
-        max_score = torch.as_strided(
-            self._max_score_flat,
+        max_score = torch.full(
             (g.num_index_heads, self.max_k_tiles, batch),
-            (self.max_k_tiles * batch, batch, 1),
+            float("-inf"),
+            dtype=torch.float32,
+            device=idx_q.device,
         )
-        max_score.fill_(float("-inf"))
-
-        qo_lens, qo_offsets = self._qo_consts(batch, self.pf_proxy)
-        work_range, work_info = self._worklist(batch, self.heads_packed_proxy)
-        kv_offsets = self._kv_offsets_view(seq_lens, batch)
-        qo_offset = self._qo_offset_view(seq_lens, batch)
+        kv_offsets = self._kv_offsets(seq_lens, batch)
+        qo_offset = self._causal_qo_offset(seq_lens)
 
         self._proxy_module.run(
-            self.workspace_buffer,
+            self._workspace,
             idx_q,
             idx_k_paged,
             idx_k_paged,
-            qo_lens,
+            self._qo_lens_proxy[:batch],
             seq_lens,
-            qo_offsets,
+            self._qo_offsets_proxy[: batch + 1],
             kv_offsets,
-            work_range,
-            work_info,
+            self._work_range_proxy,
+            self._work_info_proxy[: batch * self.heads_packed_proxy],
             None,  # out (OnlyScore)
             float(sm_scale),
             1.0,
@@ -298,8 +347,7 @@ class M3DecodeKernelDriver:
     ) -> torch.Tensor:
         """Group-reduce index-head scores to KV heads and pick top-k blocks.
 
-        Returns `[batch, num_kv_heads, topk]` int32 view into the
-        persistent `kv_block_indexes` buffer.
+        Returns `[batch, num_kv_heads, topk]` int32, ascending, -1 padded.
         """
         g = self.geom
         batch = max_score.shape[2]
@@ -313,10 +361,13 @@ class M3DecodeKernelDriver:
         else:
             max_score_kv = max_score
 
-        valid_pages = self._valid_pages[:batch]
-        torch.div(seq_lens + (g.page_size - 1), g.page_size, rounding_mode="floor", out=valid_pages)
+        valid_pages = torch.div(
+            seq_lens + (g.page_size - 1), g.page_size, rounding_mode="floor"
+        ).to(torch.int32)
 
-        out = self._kv_block_indexes[:batch]
+        out = torch.full(
+            (batch, g.num_kv_heads, g.topk), -1, dtype=torch.int32, device=max_score.device
+        )
         return select_topk_blocks(
             max_score_kv,
             valid_pages,
@@ -354,29 +405,28 @@ class M3DecodeKernelDriver:
 
         Returns
         -------
-        `[batch, num_q_heads, 128]` bf16 view into the persistent output
-        buffer.
+        `[batch, num_q_heads, 128]` bf16.
         """
         batch = q.shape[0]
+        g = self.geom
+        self._require_planned(batch)
         seq_lens = seq_lens[:batch]
 
-        out = self._out[:batch]
-        qo_lens, qo_offsets = self._qo_consts(batch, self.pf_sparse)
-        work_range, work_info = self._worklist(batch, self.heads_packed_sparse)
-        kv_offsets = self._kv_offsets_view(seq_lens, batch)
-        qo_offset = self._qo_offset_view(seq_lens, batch)
+        out = torch.empty(batch, g.num_q_heads, g.head_dim, dtype=torch.bfloat16, device=q.device)
+        kv_offsets = self._kv_offsets(seq_lens, batch)
+        qo_offset = self._causal_qo_offset(seq_lens)
 
         self._sparse_module.run(
-            self.workspace_buffer,
+            self._workspace,
             q,
             k_paged,
             v_paged,
-            qo_lens,
+            self._qo_lens_sparse[:batch],
             seq_lens,
-            qo_offsets,
+            self._qo_offsets_sparse[: batch + 1],
             kv_offsets,
-            work_range,
-            work_info,
+            self._work_range_sparse,
+            self._work_info_sparse[: batch * self.heads_packed_sparse],
             out,
             float(sm_scale),
             1.0,
@@ -384,7 +434,7 @@ class M3DecodeKernelDriver:
             1.0,
             1.0,
             self.pf_sparse,  # max_qo_len after packing
-            qo_offset,  # kv_len - 1 (see _qo_offset_view)
+            qo_offset,  # kv_len - 1 (see _causal_qo_offset)
             1,  # num_kv_splits
             None,
             None,
@@ -405,78 +455,7 @@ class M3DecodeKernelDriver:
         return out
 
 
-# ---------------------------------------------------------------------------
-# Module-level convenience API (driver cache + functional entry points)
-# ---------------------------------------------------------------------------
-
-_driver_cache: Dict[Tuple, M3DecodeKernelDriver] = {}
-
-
-def get_decode_driver(geometry: M3DecodeGeometry, device: torch.device) -> M3DecodeKernelDriver:
-    key = (
-        geometry,
-        device.type,
-        device.index if device.index is not None else torch.cuda.current_device(),
-    )
-    driver = _driver_cache.get(key)
-    if driver is None:
-        driver = M3DecodeKernelDriver(geometry, device)
-        _driver_cache[key] = driver
-    return driver
-
-
-def proxy_mqa_decode(
-    idx_q: torch.Tensor,
-    idx_k_paged: torch.Tensor,
-    *,
-    geometry: M3DecodeGeometry,
-    seq_lens: torch.Tensor,
-    kv_page_indptr: torch.Tensor,
-    kv_indices: torch.Tensor,
-    sm_scale: float,
-) -> torch.Tensor:
-    """Functional proxy pass: returns per-KV-block max scores."""
-    driver = get_decode_driver(geometry, idx_q.device)
-    return driver.proxy_max_score(
-        idx_q,
-        idx_k_paged,
-        seq_lens=seq_lens,
-        kv_page_indptr=kv_page_indptr,
-        kv_indices=kv_indices,
-        sm_scale=sm_scale,
-    )
-
-
-def sparse_gqa_decode(
-    q: torch.Tensor,
-    k_paged: torch.Tensor,
-    v_paged: torch.Tensor,
-    kv_block_indexes: torch.Tensor,
-    *,
-    geometry: M3DecodeGeometry,
-    seq_lens: torch.Tensor,
-    kv_page_indptr: torch.Tensor,
-    kv_indices: torch.Tensor,
-    sm_scale: float,
-) -> torch.Tensor:
-    """Functional sparse GQA pass over selected KV blocks."""
-    driver = get_decode_driver(geometry, q.device)
-    return driver.sparse_attention(
-        q,
-        k_paged,
-        v_paged,
-        kv_block_indexes,
-        seq_lens=seq_lens,
-        kv_page_indptr=kv_page_indptr,
-        kv_indices=kv_indices,
-        sm_scale=sm_scale,
-    )
-
-
 __all__ = [
     "M3DecodeGeometry",
-    "M3DecodeKernelDriver",
-    "get_decode_driver",
-    "proxy_mqa_decode",
-    "sparse_gqa_decode",
+    "M3DecodePlanner",
 ]

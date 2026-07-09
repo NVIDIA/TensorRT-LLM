@@ -190,7 +190,7 @@ def test_whole_batch_lens_prefill_uses_extend_lens_and_prefix():
     meta = _build_metadata_for_test(
         is_prefill=True, seq_lens=[256, 384], extend_seq_lens=[128, 128]
     )
-    qo, kv, qo_off, _ = msa_backend._whole_batch_lens(meta, 128)
+    qo, kv, qo_off, _ = msa_backend._whole_batch_lens(meta, None, 128)
     assert qo.dtype == torch.int32
     assert qo.tolist() == [128, 128]
     assert kv.tolist() == [256, 384]
@@ -199,7 +199,7 @@ def test_whole_batch_lens_prefill_uses_extend_lens_and_prefix():
 
 def test_whole_batch_lens_decode_uses_unit_q_and_kv_minus_one():
     meta = _build_metadata_for_test(is_prefill=False, seq_lens=[200, 300])
-    qo, kv, qo_off, _ = msa_backend._whole_batch_lens(meta, 128)
+    qo, kv, qo_off, _ = msa_backend._whole_batch_lens(meta, None, 128)
     assert qo.tolist() == [1, 1]
     assert kv.tolist() == [200, 300]
     assert qo_off.tolist() == [199, 299]
@@ -242,7 +242,10 @@ def test_msa_sparse_gqa_is_supported_gates_on_sparse_prediction():
     """is_supported must reject non-M3-MSA requests (no sparse block indices)."""
     from tensorrt_llm._torch.attention_backend.fmha import MsaSparseGqaFmha
 
-    fmha = MsaSparseGqaFmha()  # owner-less construction is tolerated for tests
+    class _DummyAttn:
+        pass
+
+    fmha = MsaSparseGqaFmha(_DummyAttn())
     # No forward_args / no sparse_prediction -> not an MSA sparse request.
     assert fmha.is_supported(None, None, None, None, None) is False
 

@@ -264,12 +264,7 @@ class MsaSparseGqaFmha(Fmha):
     HEAD_DIM = 128
     REQUIRES_PAGED_KV = True
 
-    def __init__(self, attn: Optional["TrtllmAttention"] = None):
-        # The registry constructs this with an owning TrtllmAttention (for
-        # layer_idx, num_heads, scale). Owner-less construction is
-        # tolerated for focused unit tests that only exercise
-        # is_available() or run_msa_sparse_gqa().
-        #
+    def __init__(self, attn: "TrtllmAttention"):
         # kv_factor and the out-head sizes are set for parity with the
         # other FMHA libs. The whole-batch path does not read them, but
         # keeping them avoids surprising a future caller.
@@ -279,7 +274,18 @@ class MsaSparseGqaFmha(Fmha):
         self.context_out_head_size = self.HEAD_DIM
 
     @classmethod
-    def is_available(cls, attn: Optional["TrtllmAttention"] = None) -> bool:
+    def is_available(cls, attn: "TrtllmAttention") -> bool:
+        # Claim only MiniMax-M3 MSA layers so that, despite being listed
+        # first in FMHA_LIBS, this class never enters any other layer's
+        # dispatch loop. Imported lazily: the factory defers its trtllm
+        # import, so this does not create the trtllm -> fmha -> interface
+        # import cycle.
+        from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_backend import (
+            get_minimax_m3_msa_attention_backend_cls,
+        )
+
+        if not isinstance(attn, get_minimax_m3_msa_attention_backend_cls()):
+            return False
         return _sm100_fmha_available(cls.__name__)
 
     def is_supported(

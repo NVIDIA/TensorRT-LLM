@@ -39,7 +39,7 @@ from .common import (
 )
 
 if TYPE_CHECKING:
-    from .metadata import MiniMaxM3SparseAttentionMetadata, MiniMaxM3SparseConfig
+    from .metadata import MiniMaxM3SparseConfig
 
 
 def _proxy_max_score_direct(
@@ -117,9 +117,8 @@ def _group_max_reduce(max_score: torch.Tensor, config: "MiniMaxM3SparseConfig") 
 class MsaIndexer:
     """Predictor submodule: proxy MQA and top-k block selection.
 
-    Owned by `MiniMaxM3MSATrtllmAttention`. Stateless except for a cached
-    decode driver (keyed by geometry/device) that keeps CUDA-graph-stable
-    persistent buffers.
+    Owned by `MiniMaxM3MSATrtllmAttention` and stateless: the decode pass
+    borrows the per-metadata-instance `M3DecodePlanner`.
     """
 
     def __init__(self, config: "MiniMaxM3SparseConfig"):
@@ -131,7 +130,6 @@ class MsaIndexer:
         self,
         idx_q: torch.Tensor,
         idx_k_cache: torch.Tensor,
-        metadata: "MiniMaxM3SparseAttentionMetadata",
         *,
         idx_sm_scale: float,
         qo_lens_cpu: torch.Tensor,
@@ -184,63 +182,42 @@ class MsaIndexer:
         self,
         idx_q: torch.Tensor,
         idx_k_cache: torch.Tensor,
-        metadata: "MiniMaxM3SparseAttentionMetadata",
+        metadata,
         *,
         idx_sm_scale: float,
         page_size: int,
     ) -> torch.Tensor:
-        """Return `kv_block_indexes` via the graph-safe decode driver.
+        """Return `kv_block_indexes` via the graph-safe decode planner.
 
-        The driver runs the same `fmha_sm100` proxy binary and device-side
-        top-k with persistent buffers, so this path is CUDA-graph
+        `metadata` is the owning `MiniMaxM3MSATrtllmAttentionMetadata`;
+        its per-instance `M3DecodePlanner` runs the same `fmha_sm100`
+        proxy binary plus a device-side top-k, so this path is CUDA-graph
         capturable.
         """
-        from .decode_wrapper.dispatch import M3DecodeGeometry, get_decode_driver
-
-        config = self.config
         idx_k_paged = idx_cache_to_msa_paged(idx_k_cache)
         batch = int(idx_q.shape[0])
-        seq_lens = metadata.seq_lens.to(torch.int32)
+        m3_meta = metadata.m3_meta
+        seq_lens = m3_meta.seq_lens.to(torch.int32)
 
-        msa_plans = getattr(metadata, "msa_plans", None)
-        if msa_plans is not None:
-            kv_indices = msa_plans["kv_indices"]
-            kv_page_indptr = msa_plans["kv_page_indptr"]
-            max_batch = int(msa_plans.get("max_batch") or 0)
-            max_kv_len = int(msa_plans.get("max_kv_len") or 0)
+        plans = metadata.m3_plans
+        if plans is not None:
+            kv_indices = plans.kv_indices
+            kv_page_indptr = plans.kv_page_indptr
         else:
+            # Eager-only fallback (focused tests / first warmup step).
             if torch.cuda.is_current_stream_capturing():
                 raise RuntimeError(
                     "MiniMax-M3 MSA decode reached the eager fallback during CUDA graph "
-                    "capture: metadata.msa_plans was not pre-staged by prepare()."
+                    "capture: plan tables were not pre-staged by prepare()."
                 )
-            kv_indices, _ = build_kv_indices_and_lens(metadata, page_size)
-            num_pages_cpu = (metadata.seq_lens_cpu.to(torch.long) + page_size - 1) // page_size
+            kv_indices, _ = build_kv_indices_and_lens(m3_meta, page_size)
+            num_pages_cpu = (m3_meta.seq_lens_cpu.to(torch.long) + page_size - 1) // page_size
             kv_page_indptr = torch.zeros(batch + 1, dtype=torch.int32)
             kv_page_indptr[1:] = num_pages_cpu.to(torch.int32).cumsum(0)
             kv_page_indptr = kv_page_indptr.to(idx_q.device, non_blocking=True)
-            max_batch = 0
-            max_kv_len = 0
 
-        if max_batch <= 0:
-            max_batch = max(64, 1 << (batch - 1).bit_length())
-        if max_kv_len <= 0:
-            max_kv_len = int(metadata.req_to_token.shape[1])
-
-        geometry = M3DecodeGeometry(
-            num_q_heads=config.num_q_heads,
-            num_kv_heads=config.num_kv_heads,
-            num_index_heads=config.num_index_heads,
-            head_dim=config.head_dim,
-            page_size=page_size,
-            topk=config.topk,
-            init_blocks=config.init_blocks,
-            local_blocks=config.local_blocks,
-            max_batch=max_batch,
-            max_kv_len=max_kv_len,
-        )
-        driver = get_decode_driver(geometry, idx_q.device)
-        max_score = driver.proxy_max_score(
+        planner = metadata.m3_decode_planner(batch)
+        max_score = planner.proxy_max_score(
             idx_q,
             idx_k_paged,
             seq_lens=seq_lens,
@@ -248,7 +225,7 @@ class MsaIndexer:
             kv_indices=kv_indices,
             sm_scale=idx_sm_scale,
         )
-        return driver.select_blocks(max_score, seq_lens=seq_lens)
+        return planner.select_blocks(max_score, seq_lens=seq_lens)
 
 
 __all__ = ["MsaIndexer"]

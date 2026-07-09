@@ -9,12 +9,10 @@ reads every step:
     (global page ids) into a persistent int32 buffer using vectorized
     ops. The buffer's `data_ptr()` is stable across calls, so a captured
     CUDA graph keeps reading current values on every replay.
-  * `MsaPlanCache` owns those buffers plus the per-rank sparse geometry,
+  * `MsaPlanCache` owns those buffers, one instance per attention
+    metadata instance (so each CUDA graph capture bucket has its own),
     refreshed once per scheduler step from the metadata's `prepare()`
     (outside any capture window).
-  * `set_global_msa_geometry` registers the geometry process-wide from
-    the backend constructor, so CUDA-graph metadata instances (created
-    separately by the graph runner) can stage before any forward runs.
 
 Prefill plans in-forward (it always runs eagerly) and decode assembles
 launch arguments from device tensors, so only `kv_indices` /
@@ -23,7 +21,6 @@ launch arguments from device tensors, so only `kv_indices` /
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Optional, Tuple
 
 import torch
@@ -141,58 +138,6 @@ def build_stable_kv_indices(
     return dst[:total_pages], kv_page_indptr_dst[: batch + 1]
 
 
-# ---------------------------------------------------------------------------
-# Cross-run cache
-# ---------------------------------------------------------------------------
-
-
-_GLOBAL_MSA_GEOMETRY: Optional["MsaPlanCacheGeometry"] = None
-
-
-def set_global_msa_geometry(geometry: "MsaPlanCacheGeometry") -> None:
-    """Register the per-rank M3 sparse geometry process-wide.
-
-    Called from `MiniMaxM3MSATrtllmAttention.__init__`, at layer
-    construction, before any forward and therefore before any CUDA graph
-    capture. The M3 metadata's `prepare()` reads this so the kv-indices
-    staging runs for every metadata instance, including the separate
-    instances the CUDA graph runner creates. Registering here (rather than
-    from the first sparse forward) ensures graph-capture metadata has a
-    geometry, so its `prepare()` pre-builds the plan instead of falling
-    back to in-forward planning that would freeze capture-time host values
-    into every replay.
-
-    All sparse layers on a rank share one geometry; the first writer wins
-    and later identical writes are no-ops.
-    """
-    global _GLOBAL_MSA_GEOMETRY
-    if _GLOBAL_MSA_GEOMETRY is None:
-        _GLOBAL_MSA_GEOMETRY = geometry
-
-
-def get_global_msa_geometry() -> Optional["MsaPlanCacheGeometry"]:
-    return _GLOBAL_MSA_GEOMETRY
-
-
-@dataclass
-class MsaPlanCacheGeometry:
-    """Per-rank M3 model geometry needed to allocate the plan cache.
-
-    Populated by the MSA backend at construction. All sparse layers share
-    the same geometry, so the value written by the first layer is
-    authoritative for the rest.
-    """
-
-    num_q_heads: int
-    num_kv_heads: int
-    num_index_heads: int
-    head_dim: int
-    block_size: int
-    topk: int
-    init_blocks: int
-    local_blocks: int
-
-
 class MsaPlanCache:
     """Persistent paged-KV table staging for the M3 sparse decode path.
 
@@ -203,7 +148,7 @@ class MsaPlanCache:
     Lifecycle
     ---------
       1. Allocated lazily on the first `build_from_metadata` call once the
-         geometry, device, and capacity are known.
+         device and capacity are known.
       2. Every subsequent `build_from_metadata` call rewrites the buffer
          contents in-place for the current scheduler step.
     """
@@ -212,12 +157,10 @@ class MsaPlanCache:
         self,
         *,
         device: torch.device,
-        geometry: MsaPlanCacheGeometry,
         max_batch: int,
         max_kv_indices: int,
     ):
         self.device = device
-        self.geometry = geometry
         self.max_batch = int(max_batch)
         self.max_kv_indices = int(max_kv_indices)
         self.kv_indices_buf = torch.zeros(self.max_kv_indices, dtype=torch.int32, device=device)
@@ -256,8 +199,5 @@ class MsaPlanCache:
 
 __all__ = [
     "MsaPlanCache",
-    "MsaPlanCacheGeometry",
     "build_stable_kv_indices",
-    "get_global_msa_geometry",
-    "set_global_msa_geometry",
 ]

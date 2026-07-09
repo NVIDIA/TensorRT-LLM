@@ -1230,31 +1230,6 @@ class MiniMaxM3Attention(Attention):
         o = self._forward_attention_core(q, k, v, idx_q, idx_k, attn_metadata)
         return self.o_proj(o)
 
-    def _maybe_publish_msa_geometry(self, attn_metadata: AttentionMetadata) -> None:
-        """Publish the per-rank sparse geometry on the metadata class.
-
-        prepare() reads this on later steps to pre-build the MSA plan into
-        CUDA-graph-stable buffers. Published on the class (not the
-        instance) because CUDA graph capture uses separate metadata
-        instances that would not see an instance attribute written during
-        the first (eager warmup) forward.
-        """
-        if getattr(attn_metadata, "_msa_geometry", None) is not None:
-            return
-        from ..attention_backend.sparse.minimax_m3.msa_plan_cache import MsaPlanCacheGeometry
-
-        m3_config = self.attn.m3_config
-        type(attn_metadata)._msa_geometry = MsaPlanCacheGeometry(
-            num_q_heads=int(m3_config.num_q_heads),
-            num_kv_heads=int(m3_config.num_kv_heads),
-            num_index_heads=int(m3_config.num_index_heads),
-            head_dim=int(m3_config.head_dim),
-            block_size=int(m3_config.block_size),
-            topk=int(m3_config.topk),
-            init_blocks=int(m3_config.init_blocks),
-            local_blocks=int(m3_config.local_blocks),
-        )
-
     def _sparse_attention_core(
         self,
         q: torch.Tensor,
@@ -1280,8 +1255,6 @@ class MiniMaxM3Attention(Attention):
                 f"MiniMax-M3 sparse forward (layer {self.layer_idx}) requires "
                 "attn_metadata.kv_cache_manager to be a MiniMaxM3KVCacheManagerV2."
             )
-        self._maybe_publish_msa_geometry(attn_metadata)
-
         from ..attention_backend.sparse.minimax_m3 import (
             get_minimax_m3_attention_backend_cls,
             get_minimax_m3_msa_attention_backend_cls,
