@@ -2126,7 +2126,15 @@ std::vector<WindowBlockManager::BatchSeqStats> WindowBlockManager::addSequenceBa
 
 bool WindowBlockManager::blockInRadixTree(BlockPtr const& block)
 {
-    return !block->getUniqueTokens().empty() && block->getPrevBlock() != nullptr;
+    // Test actual trie membership, not parent-chain validity. getPrevBlock()
+    // walks mLookupNode -> parentNode -> getValue(windowSize) and returns
+    // nullptr whenever the PARENT node's value slot is empty -- which happens
+    // as soon as the parent block is reclaimed. With that check, every
+    // descendant of an evicted ancestor was misreported as not-in-tree at its
+    // own reclaim, so getFreeBlock/releaseSubtree skipped its KV removed event
+    // while silently detaching it, leaking the hash forever in every
+    // kv-event consumer.
+    return !block->getUniqueTokens().empty() && block->getLookupNode() != nullptr;
 }
 
 std::shared_ptr<KVCacheBlock> WindowBlockManager::findBlocksInReuseTreeByBlockKey(BlockKey const& blockKey)
