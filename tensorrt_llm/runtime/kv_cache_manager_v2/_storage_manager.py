@@ -655,6 +655,14 @@ class StorageManager:
             .lookup_canonical_span(head_page, matched_pages, count_stats)
         )
 
+    def arena_span_covers(
+        self, pg_idx: PoolGroupIndex, head_page: Page, ordinal: int, page: Page
+    ) -> bool:
+        """Non-destructive mappability probe (P3 v3 R1): whether a live
+        registered span identity-covers ``page`` at chain position
+        ``ordinal``. See :meth:`ArenaPoolGroup.span_covers`."""
+        return self._gpu_arena_storage().pool_group(pg_idx).span_covers(head_page, ordinal, page)
+
     def alias_arena_span(
         self, pg_idx: PoolGroupIndex, rng: SequenceRange, key: int, span: object, num_blocks: int
     ) -> int:

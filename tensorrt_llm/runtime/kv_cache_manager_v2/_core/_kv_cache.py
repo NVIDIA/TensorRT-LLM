@@ -890,25 +890,6 @@ class _KVCache:
             return None
         return ref()
 
-    def _arena_canonical_chain(self, num_blocks: int, lc_idx: LifeCycleId) -> "list[CommittedPage]":
-        """The contiguous run of live canonical tree pages for this
-        sequence's first ``num_blocks`` COMMITTED blocks (mappability probe
-        input, P3 v3 R1). Stops at the first missing/dead entry: a
-        registered span identity-covers pages only through an unbroken run
-        from its head, so a break already proves no live span covers
-        anything past it."""
-        chain: list[CommittedPage] = []
-        for i in range(num_blocks):
-            blk = self._get_tree_block(BlockOrdinal(i))
-            ref = blk.storage[lc_idx]
-            if ref is None:
-                break
-            page = ref()
-            if page is None:
-                break
-            chain.append(page)
-        return chain
-
     def _arena_try_displace_canonical(
         self, tree_block: "Block", lc_idx: LifeCycleId, ordinal: BlockOrdinal
     ) -> bool:
@@ -943,19 +924,24 @@ class _KVCache:
         if incumbent.status != PageStatus.DROPPABLE:
             return False  # held: someone is mid-read or keeping it recallable
         if storage.arena_prefix_aliasing:
-            # Blocks [0, ordinal) are committed (commit proceeds in order);
-            # the incumbent completes the chain at position ``ordinal``.
-            chain = self._arena_canonical_chain(int(ordinal), lc_idx)
-            if len(chain) == int(ordinal):
-                chain.append(incumbent)
-                pg_idx = storage.get_pool_group_index(lc_idx)
-                hit = storage.lookup_arena_canonical_span(
-                    pg_idx, chain[0], chain, count_stats=False
+            # Non-destructive probe: spans are keyed by their chain's HEAD
+            # canonical, so fetch block 0's entry and ask whether a live
+            # span identity-covers the incumbent at ``ordinal``. Must NOT
+            # go through lookup_arena_canonical_span -- its verify loop
+            # invalidates the span on mismatch, and probe chains diverge
+            # legitimately from the owner's path past the shared prefix
+            # (observed as spurious alias misses on the f070 shape).
+            head = (
+                incumbent
+                if int(ordinal) == 0
+                else map_optional(
+                    self._get_tree_block(BlockOrdinal(0)).storage[lc_idx], lambda p: p()
                 )
-                if hit is not None:
-                    span: Any = hit[1]
-                    if span.num_blocks > int(ordinal):
-                        return False  # a live span covers it: mappable, keep it
+            )
+            if head is not None:
+                pg_idx = storage.get_pool_group_index(lc_idx)
+                if storage.arena_span_covers(pg_idx, head, int(ordinal), incumbent):
+                    return False  # a live span covers it: mappable, keep it
         if incumbent.scheduled_for_eviction:
             storage.exclude_from_eviction(incumbent)
         if (

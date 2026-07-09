@@ -1472,6 +1472,24 @@ class ArenaPoolGroup(PoolGroupBase):
             self.alias_hits += 1
         return key, span, usable
 
+    def span_covers(self, head_page: object, ordinal: int, page: object) -> bool:
+        """Whether a LIVE registered span identity-covers ``page`` at
+        position ``ordinal`` of the chain headed by ``head_page`` -- the
+        mappability probe for promotion decisions (P3 v3 R1).
+
+        Deliberately NOT :meth:`lookup_canonical_span`: that verify loop
+        INVALIDATES the span on any identity mismatch, which is correct for
+        admissions (their matched pages share the owner's tree path, so a
+        mismatch means staleness) but destructive for promotion probes,
+        whose chains legitimately diverge from the span owner's path past
+        the shared prefix. This check touches nothing."""
+        if not self._prefix_aliasing:
+            return False
+        span = self._canonical_spans.get(id(head_page))
+        if span is None or ordinal >= span.num_blocks:
+            return False
+        return span.page_refs[ordinal]() is page
+
     def alias_span_into_range(
         self, rng: SequenceRange, key: int, span: "_CanonicalSpan", num_blocks: int
     ) -> int:
