@@ -1981,6 +1981,16 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
 
                             touch '${pytestDoneFile}'
                             wait \$WATCHER_PID 2>/dev/null || true
+
+                            # ---- immediate final snapshot ----
+                            if [ -f '${WORKSPACE}/${stageName}/results.xml' ]; then
+                                ( cd '${WORKSPACE}' && tar -czf '${progressTar}' '${stageName}/' ) && \
+                                curl -fsSL --retry 2 -u "\$ART_USER:\$ART_PASS" \
+                                    -T '${WORKSPACE}/${progressTar}' '${progressUrl}' && \
+                                echo "[PROGRESS-UPLOAD] ${stageName}: uploaded sbatch final snapshot" || \
+                                echo "[PROGRESS-UPLOAD] ${stageName}: sbatch final snapshot upload failed (non-fatal)"
+                            fi
+
                             exit \$rc
                         """
                     }
@@ -2039,11 +2049,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
         try {
             captureSlurmJobNodeList(pipeline, cluster, partition.clusterName, placementContext?.slurmJobId ?: null, placementContext, stageName, jobWorkspace)
             uploadResults(pipeline, cluster, partition.clusterName, jobUID, stageName, stageIsInterrupted, postTag)
-            if (pytestSucceeded) {
-                // pytest reached its natural end: drop the in-progress checkpoint
-                // tar; the final tar just uploaded by uploadResults supersedes it.
-                deleteProgressArtifact(stageName)
-            }
+            deleteProgressArtifact(stageName)
         } finally {
             stage("Clean Up Slurm Resource") {
                 // Workaround to handle the interruption during clean up SLURM resources
@@ -2686,6 +2692,7 @@ def cacheErrorAndUploadResult(stageName, taskRunner, finallyRunner, noResultIfSu
                 "results-${stageName}${postTag}.tar.gz",
                 "${UPLOAD_PATH}/test-results/"
             )
+            deleteProgressArtifact(stageName)
             if (!suppressTestReporting) {
                 junit(testResults: "${stageName}/results*.xml")
             }
@@ -3851,9 +3858,15 @@ def deleteProgressArtifact(stageName) {
                 credentialsId: 'urm-artifactory-creds',
                 usernameVariable: 'ART_USER',
                 passwordVariable: 'ART_PASS')]) {
-            sh """
-                curl -fsSL --retry 2 -X DELETE -u "\$ART_USER:\$ART_PASS" '${targetUrl}'
-            """
+            def httpStatus = sh(
+                script: "curl -sSo /dev/null -w '%{http_code}' --retry 2 -u \"\$ART_USER:\$ART_PASS\" '${targetUrl}'",
+                returnStdout: true
+            ).trim()
+            if (httpStatus == '404') {
+                echo "[PROGRESS-UPLOAD] ${stageName}: progress tar not found, skipping delete"
+                return
+            }
+            sh "curl -fsSL --retry 2 -X DELETE -u \"\$ART_USER:\$ART_PASS\" '${targetUrl}'"
         }
         echo "[PROGRESS-UPLOAD] ${stageName}: deleted progress tar ${targetUrl}"
     } catch (InterruptedException e) {
@@ -4343,13 +4356,6 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         if (fileExists("${stageName}/results-timeout.xml") || generateTimeoutTestResultXml(pipeline, stageName)) {
             error "Some tests terminated unexpectedly, please check the test report."
         }
-
-        // pytest succeeded (possibly after rerun) -- the in-progress checkpoint
-        // tar is no longer needed; the stage's `finally` will upload the final
-        // results tar shortly. Drop the progress tar so consumers don't pick
-        // up a stale snapshot. Forensic tars from failed runs are intentionally
-        // left in place.
-        deleteProgressArtifact(stageName)
 
         if (perfMode) {
             // Only PyTorch perf stages remain; the TensorRT perf baseline was removed.
