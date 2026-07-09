@@ -499,15 +499,12 @@ class CUDAGraphRunner:
                 or new_batch_size > self.max_supported_batch_size):
             return 0
 
-        # When dynamic draft length is enabled (one-model path), we treat the determined runtime draft length
-        # as the source of truth and pad the batch size up to the nearest existing graph
-        # for that draft length.
-        if (self.spec_config and self.spec_config.draft_len_schedule
-                and self.spec_config.spec_dec_mode.support_dynamic_draft_len()):
-            padded_batch_size = self._round_up_batch_size_with_draft_len(
-                new_batch_size, runtime_draft_len)
-        else:
-            padded_batch_size = self._round_up_batch_size(new_batch_size)
+        # Pad the batch size up to the nearest existing graph for the runtime
+        # draft length. With dynamic draft length (one-model path) the runtime
+        # draft length is the source of truth for which graphs are eligible;
+        # otherwise this reduces to plain batch-size rounding.
+        padded_batch_size = self._round_up_batch_size_with_draft_len(
+            new_batch_size, runtime_draft_len)
 
         if batch_size == padded_batch_size:
             return 0
@@ -609,15 +606,11 @@ class CUDAGraphRunner:
         max batch size 1, every batch already matches a graph size and no
         padding dummy is ever needed.
         """
-        use_dynamic_draft_len = (
-            self.spec_config and self.spec_config.draft_len_schedule
-            and self.spec_config.spec_dec_mode.support_dynamic_draft_len())
         max_unpadded_batch_size = min(self.config.batch_size,
                                       self.max_supported_batch_size)
         for batch_size in range(1, max_unpadded_batch_size + 1):
-            padded = (self._round_up_batch_size_with_draft_len(
-                batch_size, runtime_draft_len) if use_dynamic_draft_len else
-                      self._round_up_batch_size(batch_size))
+            padded = self._round_up_batch_size_with_draft_len(
+                batch_size, runtime_draft_len)
             if batch_size < padded <= self.config.batch_size:
                 return True
         return False
@@ -713,9 +706,14 @@ class CUDAGraphRunner:
 
     def _round_up_batch_size_with_draft_len(self, batch_size: int,
                                             draft_len: int) -> int:
-        """Finds the smallest graph batch size >= batch_size that also matches the given draft_len."""
+        """Finds the smallest graph batch size >= batch_size that also matches the given draft_len.
+
+        The dynamic draft length mapping exists exactly when the dynamic draft
+        length feature is active (see _compute_dynamic_draft_len_mapping);
+        without it, this ignores draft_len and reduces to plain batch-size
+        rounding.
+        """
         if not self.dynamic_draft_len_mapping:
-            # Fallback to regular round up if no mapping
             return self._round_up_batch_size(batch_size)
 
         start_idx = bisect.bisect_left(self.supported_batch_sizes, batch_size)

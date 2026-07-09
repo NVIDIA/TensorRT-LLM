@@ -1605,15 +1605,6 @@ class KvCacheCreator:
                 cross_kv_cache_config, estimating_kv_cache,
                 original_max_seq_len)
 
-        # Let consumers (e.g. CUDAGraphRunner.preallocate_padding_dummies)
-        # distinguish the throwaway estimation-phase managers from the final
-        # ones: the estimation cache is sized with no headroom for retained
-        # dummy requests.
-        for manager in (kv_cache_manager, draft_kv_cache_manager,
-                        cross_kv_cache_manager):
-            if manager is not None:
-                manager.is_estimating_kv_cache = estimating_kv_cache
-
         resources[ResourceManagerType.KV_CACHE_MANAGER] = kv_cache_manager
         resources[
             ResourceManagerType.DRAFT_KV_CACHE_MANAGER] = draft_kv_cache_manager
