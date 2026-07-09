@@ -119,7 +119,7 @@ pipeline {
                     sh '''
                         apt-get update -qq
                         apt-get install -y -qq git python3-pip curl
-                        pip3 install --quiet requests
+                        pip3 install --quiet requests pyyaml
                     '''
                 }
             }

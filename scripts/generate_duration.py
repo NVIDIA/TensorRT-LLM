@@ -18,6 +18,7 @@ import csv
 import glob
 import json
 import os
+import re
 import time
 
 # Default CSV columns from pytest-csv:
@@ -26,6 +27,53 @@ STATUS_COLUMN = 6
 DURATION_COLUMN = 8
 
 OPENSEARCH_INDEX = "df-swdl-trtllm-infra-ci-prod-test_info-*"
+
+# Test-list YAML entries may carry trailing turtle directives that are NOT part
+# of the test identity and never appear in an OpenSearch s_turtle_name:
+#   - "TIMEOUT (90)"  (also the rare no-space form "TIMEOUT(60)")
+#   - "ISOLATION"
+# They can be chained, e.g. "... TIMEOUT (90) ISOLATION".  pytest-native flags
+# such as -k / -m DO change what runs and MUST be preserved.  No node-id
+# parameter list contains a space, so anchoring to the end is safe.
+_TURTLE_DIRECTIVE_RE = re.compile(
+    r"(?:\s+(?:TIMEOUT\s*\(\d+\)|ISOLATION))+\s*$")
+
+# Default location of the turtle test-db lists, relative to the repo root.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DEFAULT_TEST_LIST_DIR = os.path.join(_REPO_ROOT, "tests", "integration",
+                                     "test_lists", "test-db")
+
+
+def normalize_test_spec(name):
+    """Strip trailing turtle directives (TIMEOUT/ISOLATION), keep -k/-m flags."""
+    if not name:
+        return name
+    return _TURTLE_DIRECTIVE_RE.sub("", name).strip()
+
+
+def load_test_list_specs(test_list_dir):
+    """Collect the set of normalized test specs declared in the test-db YAMLs."""
+    import yaml
+
+    specs = set()
+    yml_files = sorted(glob.glob(os.path.join(test_list_dir, "*.yml")))
+    for path in yml_files:
+        with open(path) as f:
+            try:
+                data = yaml.safe_load(f) or {}
+            except yaml.YAMLError as e:
+                print(f"  Warning: failed to parse {path}: {e}")
+                continue
+        for value in data.values():
+            if not isinstance(value, list):
+                continue
+            for block in value:
+                if not isinstance(block, dict):
+                    continue
+                for test in block.get("tests", []) or []:
+                    if isinstance(test, str):
+                        specs.add(normalize_test_spec(test))
+    return specs, yml_files
 
 
 def query_opensearch_durations(url, credentials, days):
@@ -49,7 +97,7 @@ def query_opensearch_durations(url, credentials, days):
             "sources": [{
                 "test_name": {
                     "terms": {
-                        "field": "s_test_name"
+                        "field": "s_turtle_name"
                     }
                 }
             }]
@@ -74,7 +122,7 @@ def query_opensearch_durations(url, credentials, days):
                     }],
                     "must_not": [{
                         "term": {
-                            "s_test_name": "Stage Failed"
+                            "s_turtle_name": "Stage Failed"
                         }
                     }]
                 }
@@ -151,6 +199,18 @@ parser.add_argument(
     help=
     "OpenSearch credentials as 'user:password'. Defaults to OPEN_SEARCH_DB_CREDENTIALS env var."
 )
+parser.add_argument(
+    "--test-list-dir",
+    type=str,
+    default=DEFAULT_TEST_LIST_DIR,
+    help="Directory of turtle test-db YAML lists used to filter OpenSearch "
+    "results. Only turtle names present in these lists are written "
+    f"(default: {DEFAULT_TEST_LIST_DIR}).")
+parser.add_argument(
+    "--no-filter",
+    action="store_true",
+    default=False,
+    help="Skip filtering OpenSearch results against the test-db lists.")
 args = parser.parse_args()
 
 # Resolve output path
@@ -173,6 +233,30 @@ if args.from_opensearch:
     )
     test_durations = query_opensearch_durations(opensearch_url,
                                                 opensearch_creds, args.days)
+    raw_count = len(test_durations)
+
+    # Filter against the turtle test-db lists: an aggregated turtle name may be
+    # a stale entry or a subtest that is no longer scheduled.  Keep only names
+    # that still appear in the checked-in lists.
+    dropped = 0
+    if args.no_filter:
+        print("Filtering disabled (--no-filter); writing all turtle names.")
+        specs = None
+    else:
+        specs, yml_files = load_test_list_specs(args.test_list_dir)
+        print(f"Loaded {len(specs)} test specs from {len(yml_files)} list(s) "
+              f"in {args.test_list_dir}")
+        if not specs:
+            print("  Warning: no test specs loaded; writing all turtle names "
+                  "unfiltered.")
+        else:
+            filtered = {
+                name: dur
+                for name, dur in test_durations.items()
+                if normalize_test_spec(name) in specs
+            }
+            dropped = raw_count - len(filtered)
+            test_durations = filtered
 
     with open(NEW_TEST_DURATION, 'w') as file:
         json.dump(test_durations, file, indent=3)
@@ -180,6 +264,8 @@ if args.from_opensearch:
     print("\nSummary:")
     print(f"  OpenSearch URL         : {opensearch_url}")
     print(f"  Days looked back       : {args.days}")
+    print(f"  Turtle names from query: {raw_count}")
+    print(f"  Dropped (not in lists) : {dropped}")
     print(f"  Unique tests in output : {len(test_durations)}")
     print(f"  Output written to      : {NEW_TEST_DURATION}")
 
