@@ -989,6 +989,10 @@ class PyTorchModelEngine(ModelEngine):
         self.kv_cache_manager_key = ResourceManagerType.DRAFT_KV_CACHE_MANAGER if is_draft_model else ResourceManagerType.KV_CACHE_MANAGER
         self.lora_model_config: Optional[LoraModelConfig] = None
         self._trtllm_gen_jit_warmup = False
+        # KV-cache estimation re-instantiates PyExecutor and re-runs warmup on
+        # the same engine; the TRTLLM-Gen FMHA JIT cache is process-global, so
+        # skip subsequent passes. See nvbugs/6432948.
+        self._trtllm_gen_jit_warmup_done = False
 
         # Create the encoder runner first. For encoder-decoder models it derives
         # every reachable startup capture key through get_graph_key().
@@ -1797,6 +1801,12 @@ class PyTorchModelEngine(ModelEngine):
         if not issubclass(self.attn_backend.Metadata, TrtllmAttentionMetadata):
             return
 
+        if self._trtllm_gen_jit_warmup_done:
+            logger.info(
+                "Skipping TRTLLM-Gen FMHA JIT warmup: already populated by a prior warmup pass."
+            )
+            return
+
         @contextlib.contextmanager
         def trtllm_gen_fmha_jit_warmup():
             previous = self._trtllm_gen_jit_warmup
@@ -1861,6 +1871,8 @@ class PyTorchModelEngine(ModelEngine):
                                  new_tensors_device=None,
                                  resource_manager=resource_manager)
                 torch.cuda.synchronize()
+
+        self._trtllm_gen_jit_warmup_done = True
 
     @staticmethod
     def _release_megamoe_profiling_scratch():
