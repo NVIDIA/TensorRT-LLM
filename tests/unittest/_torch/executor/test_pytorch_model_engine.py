@@ -111,18 +111,21 @@ def create_model_engine_and_kvcache(llm_args: TorchLlmArgs = None,
     num_layers = 1
     batch_size = 13
 
-    llm_args = llm_args if llm_args else TorchLlmArgs(
-        model="dummy",
-        max_batch_size=batch_size,
-        max_num_tokens=max_tokens,
-        cuda_graph_config=CudaGraphConfig(
-            enable_padding=True, batch_sizes=[1, 2, 4, 8, 16, 32, 64, 128]))
-    test_batches = (5, 13)
-    for batch_size in test_batches:
-        assert batch_size not in llm_args.cuda_graph_config.batch_sizes
+    if llm_args is None:
+        llm_args = TorchLlmArgs(model="dummy",
+                                max_batch_size=batch_size,
+                                max_num_tokens=max_tokens,
+                                cuda_graph_config=CudaGraphConfig(
+                                    enable_padding=True,
+                                    batch_sizes=[1, 2, 4, 8, 16, 32, 64, 128]))
+        # The padding tests below rely on these properties of the default
+        # config: batches of 5 and 13 must round up to 8 and 16 respectively.
+        test_batches = (5, 13)
+        for test_batch_size in test_batches:
+            assert test_batch_size not in llm_args.cuda_graph_config.batch_sizes
 
-    assert (8 in llm_args.cuda_graph_config.batch_sizes
-            and 16 in llm_args.cuda_graph_config.batch_sizes)
+        assert (8 in llm_args.cuda_graph_config.batch_sizes
+                and 16 in llm_args.cuda_graph_config.batch_sizes)
 
     model_engine = DummyModelEngine(llm_args, torch.half)
 
@@ -338,11 +341,12 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         num_free_before = kv_cache_manager.get_num_free_blocks()
         model_engine.warmup(resource_manager)
 
-        # Warmup pre-allocates the CUDA graph padding dummy (draft_len 0),
-        # which intentionally keeps holding its KV blocks so padding cannot
-        # fall back to eager once the cache saturates.
+        # Warmup pre-allocates the CUDA graph padding dummy for each captured
+        # draft length (only draft_len 0 here, no speculation), which
+        # intentionally keeps holding its KV blocks so padding cannot fall
+        # back to eager once the cache saturates.
         padding_dummies = model_engine.cuda_graph_runner.padding_dummy_requests
-        self.assertIn(0, padding_dummies)
+        self.assertEqual([0], sorted(padding_dummies.keys()))
 
         # Make sure we don't leak any blocks beyond that dummy: freeing it
         # must restore the exact pre-warmup free-block count.
@@ -351,6 +355,76 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
                          kv_cache_manager.get_num_free_blocks())
 
         kv_cache_manager.shutdown()
+
+    def test_warmup_skips_padding_dummy_when_padding_impossible(self):
+        # With max_batch_size=1 and a graph for batch size 1, every batch
+        # already matches a graph size, so no padded batch can ever occur and
+        # warmup must not retain a padding dummy (it would permanently hold
+        # KV blocks and spec/hybrid resources that are never used).
+        llm_args = TorchLlmArgs(model="dummy",
+                                max_batch_size=1,
+                                max_num_tokens=258,
+                                cuda_graph_config=CudaGraphConfig(
+                                    enable_padding=True, batch_sizes=[1, 2, 4]))
+        model_engine, kv_cache_manager = create_model_engine_and_kvcache(
+            llm_args)
+        resource_manager = ResourceManager(
+            {ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager})
+
+        num_free_before = kv_cache_manager.get_num_free_blocks()
+        model_engine.warmup(resource_manager)
+
+        self.assertEqual({},
+                         model_engine.cuda_graph_runner.padding_dummy_requests)
+        self.assertEqual(num_free_before,
+                         kv_cache_manager.get_num_free_blocks())
+
+        kv_cache_manager.shutdown()
+
+    def test_warmup_skips_padding_dummy_during_estimation(self):
+        # The estimation-phase KV cache is sized with no headroom for retained
+        # dummies; holding blocks there can leave the estimation requests
+        # unschedulable. Warmup must skip the preallocation for managers
+        # created for KV cache capacity estimation.
+        model_engine, kv_cache_manager = create_model_engine_and_kvcache()
+        kv_cache_manager.is_estimating_kv_cache = True
+        resource_manager = ResourceManager(
+            {ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager})
+
+        num_free_before = kv_cache_manager.get_num_free_blocks()
+        model_engine.warmup(resource_manager)
+
+        self.assertEqual({},
+                         model_engine.cuda_graph_runner.padding_dummy_requests)
+        self.assertEqual(num_free_before,
+                         kv_cache_manager.get_num_free_blocks())
+
+        kv_cache_manager.shutdown()
+
+    def test_preallocate_padding_dummies_uses_captured_draft_lens(self):
+        # Speculative engines pad batches with the runtime draft length, so
+        # the preallocation must create dummies for the draft lengths of the
+        # captured graphs — not draft_len 0 unconditionally (an extra
+        # draft_len-0 dummy would permanently hold KV blocks that runtime
+        # padding never uses).
+        model_engine, kv_cache_manager = create_model_engine_and_kvcache()
+        resource_manager = ResourceManager(
+            {ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager})
+
+        runner = model_engine.cuda_graph_runner
+        # Simulate a spec-decode capture: graphs keyed (batch_size, draft_len,
+        # is_first_draft, short_seq_len_mode, is_all_greedy_sample) exist only
+        # for draft_len 2.
+        runner.graphs[(8, 2, False, False, True)] = Mock()
+        try:
+            runner.preallocate_padding_dummies(resource_manager)
+
+            self.assertEqual([2], sorted(runner.padding_dummy_requests.keys()))
+        finally:
+            runner.graphs.clear()
+            for dummy in runner.padding_dummy_requests.values():
+                kv_cache_manager.free_resources(dummy)
+            kv_cache_manager.shutdown()
 
     def test_layerwise_nvtx_marker(self):
         llm_args = TorchLlmArgs(

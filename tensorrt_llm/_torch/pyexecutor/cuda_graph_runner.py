@@ -602,26 +602,67 @@ class CUDAGraphRunner:
         self.padding_dummy_requests[runtime_draft_len] = dummy_request
         return dummy_request
 
-    def preallocate_padding_dummy(self,
-                                  resource_manager: ResourceManager) -> None:
-        """Eagerly allocates the draft_len-0 padding dummy while the KV cache
-        still has free blocks (called at the end of ModelEngine.warmup).
+    def _can_pad_any_batch(self, runtime_draft_len: int) -> bool:
+        """Returns True when _get_padded_batch can pad at least one feasible
+        batch size for the given draft length (mirrors its rounding and
+        capacity guards). For example, with graph batch sizes [1, 2, 4] and
+        max batch size 1, every batch already matches a graph size and no
+        padding dummy is ever needed.
+        """
+        use_dynamic_draft_len = (
+            self.spec_config and self.spec_config.draft_len_schedule
+            and self.spec_config.spec_dec_mode.support_dynamic_draft_len())
+        max_unpadded_batch_size = min(self.config.batch_size,
+                                      self.max_supported_batch_size)
+        for batch_size in range(1, max_unpadded_batch_size + 1):
+            padded = (self._round_up_batch_size_with_draft_len(
+                batch_size, runtime_draft_len) if use_dynamic_draft_len else
+                      self._round_up_batch_size(batch_size))
+            if batch_size < padded <= self.config.batch_size:
+                return True
+        return False
 
-        _get_padded_batch otherwise allocates the dummy lazily at the first
+    def preallocate_padding_dummies(self,
+                                    resource_manager: ResourceManager) -> None:
+        """Eagerly allocates the padding dummies while the KV cache still has
+        free blocks (called at the end of ModelEngine.warmup, after graph
+        capture).
+
+        _get_padded_batch otherwise allocates the dummies lazily at the first
         padded step; when the KV cache is already saturated by then, the
         allocation fails on every step and padded batches permanently fall
         back to eager mode.
+
+        Only the draft lengths of captured graphs are preallocated — those are
+        exactly the ones runtime padding requests — and only when padding can
+        actually occur for that draft length. Anything else would permanently
+        hold KV blocks (and spec/hybrid cache slots) that the lazy path never
+        consumes, regressing tightly-sized deployments.
         """
         if not (self.enabled and self.padding_enabled):
             return
-        if self._get_or_create_padding_dummy(resource_manager, 0) is None:
-            logger.warning(
-                "Could not pre-allocate the CUDA graph padding dummy request "
-                "at warmup; allocation will be retried at the first padded "
-                "step.")
-        else:
-            logger.info(
-                "Pre-allocated the CUDA graph padding dummy request at warmup.")
+        kv_cache_manager = resource_manager.get_resource_manager(
+            self.config.kv_cache_manager_key)
+        if kv_cache_manager is None or getattr(kv_cache_manager,
+                                               'is_estimating_kv_cache', False):
+            # The estimation-phase KV cache is sized with no headroom for
+            # retained dummies; holding blocks there can leave the estimation
+            # requests unschedulable. That executor is discarded anyway, so
+            # preallocation only matters for the final one.
+            return
+        for draft_len in sorted({key[1] for key in self.graphs}):
+            if not self._can_pad_any_batch(draft_len):
+                continue
+            if self._get_or_create_padding_dummy(resource_manager,
+                                                 draft_len) is None:
+                logger.warning(
+                    "Could not pre-allocate the CUDA graph padding dummy "
+                    f"request (draft_len={draft_len}) at warmup; allocation "
+                    "will be retried at the first padded step.")
+            else:
+                logger.info(
+                    "Pre-allocated the CUDA graph padding dummy request "
+                    f"(draft_len={draft_len}) at warmup.")
 
     def _add_cross_dummy_request(
             self, dummy_request: LlmRequest, resource_manager: ResourceManager,
