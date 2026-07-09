@@ -1,0 +1,24 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Single-workload smoke suite for validating the BOLT plumbing end-to-end on one
+# node. NOT a representative profiling set -- it just exercises the TRT-LLM host
+# control paths enough to emit non-empty .fdata.
+#
+# Requires: export BOLT_SMOKE_MODEL=<small HF id or local model path>
+# Optional: BOLT_SMOKE_TP, BOLT_SMOKE_MAX_TOKENS, BOLT_SMOKE_PROMPTS
+
+defaults:
+  precision: FP4
+
+workloads:
+  - name: smoke_single_node
+    model: env:BOLT_SMOKE_MODEL
+    gpu: any
+    isl_osl: short/short
+    concurrency: 32
+    mode: Agg
+    nodes: 1
+    reason: Plumbing smoke test (not representative)
+    enabled: true
+    command: python3 "$BOLT_WORKLOADS_DIR/smoke_generate.py"
