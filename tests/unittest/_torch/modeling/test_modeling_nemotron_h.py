@@ -64,10 +64,20 @@ def create_nemotron_h_llm(model_folder,
 @pytest.mark.parametrize("mamba_ssm_cache_dtype", [None, "float32"],
                          ids=lambda n: f"mamba_ssm_cache_dtype:{n}")
 @pytest.mark.parametrize("model_folder", [
-    pytest.param("NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
-                 marks=skip_gpu_memory_less_than((2 * 30 + 1) * 2**30)),
-    pytest.param("NVIDIA-Nemotron-3-Nano-30B-A3B-FP8",
-                 marks=skip_gpu_memory_less_than((30 + 1) * 2**30)),
+    pytest.param(
+        "NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
+        marks=[
+            skip_gpu_memory_less_than((2 * 30 + 1) * 2**30),
+            pytest.mark.prefetch_model_dir(
+                f"{llm_models_root()}/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16"),
+        ]),
+    pytest.param(
+        "NVIDIA-Nemotron-3-Nano-30B-A3B-FP8",
+        marks=[
+            skip_gpu_memory_less_than((30 + 1) * 2**30),
+            pytest.mark.prefetch_model_dir(
+                f"{llm_models_root()}/NVIDIA-Nemotron-3-Nano-30B-A3B-FP8"),
+        ]),
 ])
 def test_nemotron_h_sanity(mamba_ssm_cache_dtype, model_folder):
     # Skip test if FP8 is not supported on the current architecture.
@@ -121,7 +131,11 @@ def test_nemotron_h_sanity(mamba_ssm_cache_dtype, model_folder):
                          ids=lambda n: f"mamba_ssm_cache_dtype:{n}")
 @pytest.mark.parametrize("model_folder", [
     pytest.param("Nemotron-H-8B-Base-8K",
-                 marks=skip_gpu_memory_less_than((2 * 8 + 1) * 2**30)),
+                 marks=[
+                     skip_gpu_memory_less_than((2 * 8 + 1) * 2**30),
+                     pytest.mark.prefetch_model_dir(
+                         f"{llm_models_root()}/Nemotron-H-8B-Base-8K"),
+                 ]),
 ])
 def test_nemotron_h_correctness(mamba_ssm_cache_dtype, model_folder):
     torch.cuda.empty_cache()
@@ -321,6 +335,7 @@ def test_nemotron_h_correctness(mamba_ssm_cache_dtype, model_folder):
         nemotron_h.shutdown()
 
 
+@pytest.mark.prefetch_model_dir(f"{llm_models_root()}/Nemotron-H-8B-Base-8K")
 def test_nemotron_h_cuda_graph_overlap_scheduler():
     prompts = [
         "The sky is blue because",
@@ -416,6 +431,7 @@ def test_nemotron_h_cuda_graph_overlap_scheduler():
         )
 
 
+@pytest.mark.prefetch_model_dir(f"{llm_models_root()}/Nemotron-H-8B-Base-8K")
 def test_nemotron_h_chunked_prefill():
     # Long prompts (~100 tokens) to make sure chunked prefill is enabled
     # (At the time of development, tokens_per_block isn't configurable from the LLM API,

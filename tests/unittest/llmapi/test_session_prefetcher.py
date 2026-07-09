@@ -233,6 +233,55 @@ def test_handover_waits_for_gpu_settle(prefetcher, monkeypatch):
     assert settled == [1]
 
 
+def test_session_summary_counters_and_emission(prefetcher, capfd):
+    # Handover / stale-discard / busy-discard / superseded each count once;
+    # dispose() emits ONE summary line (outside pytest capture in real runs,
+    # the only guaranteed console-visible record of prefetch activity).
+    hit = _FakePool(4)
+    _arm(prefetcher, hit, spec=4)
+    assert prefetcher.take(4) is hit
+    stale = _FakePool(4)
+    _arm(prefetcher, stale, spec=4)
+    assert prefetcher.take(2) is None  # spec mismatch -> stale discard
+    busy = _FakePool(4)
+    _arm(prefetcher, busy, spec=4)
+    prefetcher._build_gen += 0  # no-op, keep gen valid
+    import test_common.session_prefetcher as sp
+
+    orig = sp.wait_gpu_memory_settle
+    sp.wait_gpu_memory_settle = lambda: False
+    try:
+        assert prefetcher.take(4) is None  # busy refusal
+    finally:
+        sp.wait_gpu_memory_settle = orig
+    late = _FakePool(4)
+    prefetcher._publish(4, late, session_prefetcher._spawn_snapshot(), prefetcher._build_gen - 1)
+    assert prefetcher.stats["pools_handed_over"] == 1
+    assert prefetcher.stats["pools_discarded_stale"] == 1
+    assert prefetcher.stats["pools_discarded_gpu_busy"] == 1
+    assert prefetcher.stats["pools_discarded_superseded"] == 1
+    prefetcher.dispose()
+    out = capfd.readouterr().out
+    assert "[session-prefetch] session summary:" in out
+    assert "pools_handed_over=1" in out
+
+
+def test_no_summary_when_prefetch_never_fired(prefetcher, capfd):
+    prefetcher.dispose()
+    assert "session summary" not in capfd.readouterr().out
+
+
+def test_warm_counters_track_gib(tmp_path, monkeypatch):
+    monkeypatch.setenv("TRTLLM_TEST_PREFETCH_SESSION", "1")
+    monkeypatch.delenv("PYTEST_XDIST_WORKER", raising=False)
+    p = SessionPrefetcher()  # real _warm (fixture would stub it)
+    (tmp_path / "model-00001.safetensors").write_bytes(b"x" * (1 << 20))
+    p._warm(str(tmp_path))
+    assert p.stats["warms"] == 1 and p._warmed_gib > 0
+    p._warm("not/a/real/dir")
+    assert p.stats["warm_noops"] == 1
+
+
 def test_model_switch_triggers_warm_and_dedups(prefetcher):
     items = _as_session(_FakeItem("/models/a"), _FakeItem("/models/b"))
     prefetcher.on_test_setup(items[0])

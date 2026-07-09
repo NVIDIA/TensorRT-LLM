@@ -41,6 +41,7 @@ import os
 import sys
 import threading
 import time
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from typing import NamedTuple
 
@@ -339,6 +340,12 @@ class SessionPrefetcher:
         self._patched = set()
         self._next_model = None  # item -> next model dir; built lazily
         self._warmed_dirs = set()
+        # Activity counters, reported once per session by dispose(). pytest
+        # captures per-test stdout (swallowing the per-event prints for
+        # passing tests), but pytest_sessionfinish runs OUTSIDE capture, so
+        # the summary is the one line guaranteed to reach the CI console.
+        self.stats = Counter()
+        self._warmed_gib = 0.0
 
     @property
     def enabled(self) -> bool:
@@ -398,7 +405,13 @@ class SessionPrefetcher:
 
     def _warm(self, model_dir: str) -> None:
         try:
-            warm_page_cache(model_dir)
+            gib = warm_page_cache(model_dir)
+            with self._lock:
+                if gib > 0:
+                    self.stats["warms"] += 1
+                    self._warmed_gib += gib
+                else:
+                    self.stats["warm_noops"] += 1  # no local weights / RAM guard
         except Exception as e:  # warming must never break the tests
             print(f"[session-prefetch] page-cache warm failed (harmless): {e}", flush=True)
 
@@ -457,7 +470,9 @@ class SessionPrefetcher:
         with self._lock:
             if gen == self._build_gen and self._built is None:
                 self._built = _Built(spec, session, snapshot)
+                self.stats["pools_built"] += 1
                 return
+            self.stats["pools_discarded_superseded"] += 1
         print("[session-prefetch] discarding superseded background build", flush=True)
         session.shutdown()
 
@@ -495,18 +510,22 @@ class SessionPrefetcher:
             # to give the PREVIOUS LLM's worker time to exit and release its
             # GPU memory; don't start the next model build into that race.
             if wait_gpu_memory_settle():
+                self.stats["pools_handed_over"] += 1
                 print(f"[session-prefetch] handing over prefetched {spec}-worker pool", flush=True)
                 return built.session
             # GPUs still mostly used after the wait: a handed-over build
             # would likely OOM. The sync fallback's ~50s spawn restores the
             # natural release window.
+            self.stats["pools_discarded_gpu_busy"] += 1
             print(
                 "[session-prefetch] GPU memory still mostly used: discarding "
                 "prefetched pool, building synchronously",
                 flush=True,
             )
-        # Spec/env/sys.path mismatch (test skipped, reordered, or changed
-        # state the frozen workers would not see) or busy GPU: discard.
+        else:
+            # Spec/env/sys.path mismatch (test skipped, reordered, or changed
+            # state the frozen workers would not see): discard.
+            self.stats["pools_discarded_stale"] += 1
         threading.Thread(
             target=built.session.shutdown, daemon=True, name="session-prefetch-discard"
         ).start()
@@ -563,6 +582,15 @@ class SessionPrefetcher:
         built = self._drain(timeout=60)
         if built is not None:
             built.session.shutdown()
+        # One line per session, emitted OUTSIDE pytest's per-test capture
+        # (pytest_sessionfinish) so it reaches the CI console: the per-event
+        # prints above are swallowed for passing tests. Silent when the
+        # prefetcher never did anything (non-LLM suites).
+        if self.stats:
+            parts = ", ".join(f"{k}={v}" for k, v in sorted(self.stats.items()))
+            if self._warmed_gib:
+                parts += f", warmed_gib={self._warmed_gib:.1f}"
+            print(f"[session-prefetch] session summary: {parts}", flush=True)
 
 
 PREFETCHER = SessionPrefetcher()
