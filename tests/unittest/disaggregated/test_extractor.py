@@ -278,7 +278,7 @@ def test_extract_logical_pool_view_uses_physical_stride(bytes_per_region, expect
     assert region.memory.bytes_per_region == expected_region_size
 
 
-def test_v2_index_key_builder_emits_per_layer_logical_views():
+def test_v2_index_key_builder_keeps_pool_level_view():
     from types import SimpleNamespace
 
     from tensorrt_llm.runtime.kv_cache_manager_v2 import CacheTier
@@ -320,20 +320,6 @@ def test_v2_index_key_builder_emits_per_layer_logical_views():
             ],
         )
 
-        def get_aggregated_pages(self, buffers):
-            local_attrs = self._storage._buffer_attr
-            ordered = sorted(buffers, key=lambda b: local_attrs[b].offset)
-            first = local_attrs[ordered[0]]
-            size = sum(local_attrs[b].size for b in ordered)
-            return [
-                SimpleNamespace(
-                    base=base + first.offset,
-                    size=size,
-                    stride=slot_bytes,
-                    buffers=[SimpleNamespace(id=b) for b in ordered],
-                )
-            ]
-
     manager = SimpleNamespace(
         impl=FakeImpl(),
         pp_layers=[0, 1],
@@ -346,22 +332,22 @@ def test_v2_index_key_builder_emits_per_layer_logical_views():
 
     page_table = build_page_table_from_manager(manager)
     views = page_table.layer_groups[0].pool_views
-    assert [view.pool_role for view in views] == [
-        frozenset({"key", "value"}),
-        frozenset({"index_key"}),
-        frozenset({"key", "value"}),
-    ]
-    assert [view.mapper_kind for view in views] == [
+    assert len(views) == 1
+    assert views[0].pool_role == frozenset({"key", "value", "index_key"})
+    assert views[0].mapper_kind == MapperKind.MIXED
+    assert views[0].buffer_roles == ("key", "value", "index_key", "key", "value")
+    assert views[0].buffer_mapper_kinds == (
+        MapperKind.NHD,
         MapperKind.NHD,
         MapperKind.REPLICATED,
         MapperKind.NHD,
-    ]
-    assert [view.byte_offset for view in views] == [0, 256, 384]
-    assert [view.bytes_per_region for view in views] == [256, 128, 256]
+        MapperKind.NHD,
+    )
+    assert views[0].byte_offset == 0
+    assert views[0].bytes_per_region is None
 
-    # A dense-only PP rank has no local INDEX_KEY entry, but model-level sparse
-    # metadata must still force per-layer views so it can interoperate with a
-    # peer PP rank that also owns sparse layers.
+    # A dense-only PP rank has no local INDEX_KEY entry, so its one physical
+    # pool view is homogeneous NHD.
     dense_impl = FakeImpl()
     dense_impl._storage = SimpleNamespace(
         _buffer_attr={key: attr for key, attr in attrs.items() if key[1] != Role.INDEX_KEY},
@@ -376,8 +362,9 @@ def test_v2_index_key_builder_emits_per_layer_logical_views():
         get_disagg_role_mapper_kinds=manager.get_disagg_role_mapper_kinds,
     )
     dense_views = build_page_table_from_manager(dense_manager).layer_groups[0].pool_views
-    assert len(dense_views) == 2
-    assert [get_unique_layers(view) for view in dense_views] == [{0}, {1}]
+    assert len(dense_views) == 1
+    assert get_unique_layers(dense_views[0]) == {0, 1}
+    assert dense_views[0].mapper_kind == MapperKind.NHD
 
     # A private attribute with a coincidental name must not opt a manager into
     # model-specific logical views.

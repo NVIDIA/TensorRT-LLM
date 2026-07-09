@@ -853,8 +853,15 @@ class Sender(SenderBase):
         # Aggregate fragments from all matching pools using numpy concatenation.
         # Ownership is decided per logical pool because replicated side caches
         # have different fan-in rules from head-sharded K/V.
-        for (self_lg, self_pi), (peer_lg, peer_pi) in pool_mapping.items():
-            if not self._registrar.should_send_pool(targets, peer_ri, self_lg, self_pi):
+        for (self_lg, self_pi), (peer_lg, peer_pi) in pool_mapping:
+            if not self._registrar.should_send_pool(
+                targets,
+                peer_ri,
+                self_lg,
+                self_pi,
+                peer_lg,
+                peer_pi,
+            ):
                 continue
             layer_group_pair = (self_lg, peer_lg)
             if layer_group_pair not in aligned_blocks_by_layer_groups:

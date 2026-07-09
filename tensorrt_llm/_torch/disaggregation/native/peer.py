@@ -3,7 +3,11 @@ from typing import Dict, List, Tuple
 
 from tensorrt_llm import logger
 from tensorrt_llm._torch.disaggregation.base.region import RegionMapperBase
-from tensorrt_llm._torch.disaggregation.native.mixers.attention.peer import AttentionPolicy
+from tensorrt_llm._torch.disaggregation.native.mixers.attention.peer import (
+    AttentionPolicy,
+    PoolBufferMapper,
+    PoolBufferMapping,
+)
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
 from tensorrt_llm._torch.disaggregation.resource.page import (
@@ -12,6 +16,7 @@ from tensorrt_llm._torch.disaggregation.resource.page import (
     PoolView,
 )
 from tensorrt_llm._torch.disaggregation.resource.utils import (
+    get_buffer_mapper_kinds,
     get_global_layer_ids,
     get_layer_group_num_layers,
     get_layer_to_layer_group,
@@ -23,6 +28,7 @@ from tensorrt_llm._torch.disaggregation.resource.utils import (
 
 # Type alias for (lg_idx, pool_idx) pair
 LGPoolKey = Tuple[int, int]
+PoolPair = Tuple[LGPoolKey, LGPoolKey]
 
 
 @dataclass
@@ -46,9 +52,7 @@ class PeerRegistrar:
         self._self_ext_cache = self_extractor
         self._peer_ext_cache: Dict[str, KVRegionExtractorV1] = {}
         self._overlap_cache: Dict[str, PeerOverlap] = {}
-        self._lg_pool_mapping_cache: Dict[
-            str, Dict[LGPoolKey, LGPoolKey]
-        ] = {}  # peer_key -> {(self_lg, self_pi) -> (peer_lg, peer_pi)}
+        self._lg_pool_mapping_cache: Dict[str, List[PoolPair]] = {}
 
     def register(self, peer_name: str, peer_rank: int, peer_ri: RankInfo):
         assert self._self_ext_cache is not None
@@ -65,13 +69,17 @@ class PeerRegistrar:
         head_match, _ = self._attention_policy.head_match(peer_ri)
         if not head_match:
             self_page_table = self._self_ext_cache.page_table
+            mapped_self_pools = {
+                self_pool_key for self_pool_key, _ in self.get_pool_mapping(peer_ri)
+            }
             nhd_fragments_per_token = sum(
-                get_num_buffer_entries(
-                    self_page_table.layer_groups[layer_group_id].pool_views[pool_idx]
+                sum(
+                    kind == MapperKind.NHD
+                    for kind in get_buffer_mapper_kinds(
+                        self_page_table.layer_groups[layer_group_id].pool_views[pool_idx]
+                    )
                 )
-                for layer_group_id, pool_idx in self.get_pool_mapping(peer_ri)
-                if self_page_table.layer_groups[layer_group_id].pool_views[pool_idx].mapper_kind
-                == MapperKind.NHD
+                for layer_group_id, pool_idx in mapped_self_pools
             )
             if nhd_fragments_per_token:
                 local_heads = self._ri.attention.kv_heads_per_rank
@@ -138,24 +146,52 @@ class PeerRegistrar:
 
         return True
 
-    def get_pool_mapping(self, peer_ri: RankInfo) -> Dict[LGPoolKey, LGPoolKey]:
-        """Get mapping from (self_lg_idx, self_pool_idx) -> (peer_lg_idx, peer_pool_idx).
+    @staticmethod
+    def _buffer_records(
+        pool_view: PoolView,
+        layer_group: AttentionLayerGroup,
+    ) -> dict[tuple[int, str], tuple[int, int, MapperKind]]:
+        """Map ``(global_layer_id, role)`` to ``(offset, size, kind)``."""
+        if not pool_view.buffer_roles:
+            return {}
+        local_to_global = {
+            layer.local_layer_id: layer.global_layer_id for layer in layer_group.local_layers
+        }
+        mapper_kinds = get_buffer_mapper_kinds(pool_view)
+        records = {}
+        for entry, role, mapper_kind in zip(
+            pool_view.buffer_entries,
+            pool_view.buffer_roles,
+            mapper_kinds,
+        ):
+            local_layer_id = int(entry["local_layer_id"])
+            if local_layer_id not in local_to_global:
+                raise ValueError(
+                    "PoolView references a layer outside its layer group: "
+                    f"local_layer_id={local_layer_id}"
+                )
+            buffer_key = (local_to_global[local_layer_id], role)
+            if buffer_key in records:
+                raise ValueError(f"Duplicate PoolView buffer metadata for {buffer_key!r}")
+            records[buffer_key] = (
+                int(entry["offset"]),
+                int(entry["size"]),
+                mapper_kind,
+            )
+        return records
 
-        Two-step matching:
-        1. Find peer layer_group via layer_to_layer_group (global_layer_id -> lg_idx).
-        2. Within the matched peer layer_group, find the unique peer pool whose
-           ``PoolView.pool_role`` equals self's and whose global_layer_ids
-           overlap.
+    def get_pool_mapping(self, peer_ri: RankInfo) -> List[PoolPair]:
+        """Return physical pool pairs that share logical layer/role buffers.
 
-        Layer-overlap is required: a peer pool with the same pool_role but
-        zero layer overlap with self is *not* a match — the two pools cover
-        disjoint layers and have nothing to transfer.
+        New V2 page tables carry per-buffer roles, so a coalesced local pool
+        may map to multiple peer pools when topology changes pool grouping.
+        Legacy page tables retain the original one-to-one role-set matching.
         """
         key = self._unique_key(peer_ri.instance_name, peer_ri.instance_rank)
         if key in self._lg_pool_mapping_cache:
             return self._lg_pool_mapping_cache[key]
 
-        mapping: Dict[LGPoolKey, LGPoolKey] = {}
+        mapping: List[PoolPair] = []
         self_pt = self._self_ext_cache.page_table
         peer_pt = peer_ri.page_table
 
@@ -186,52 +222,57 @@ class PeerRegistrar:
                 if not pv_global_ids:
                     continue
 
-                # Step 1: find peer layer_group via any overlapping global_layer_id.
-                peer_lg_idx = next(
-                    (peer_layer_to_group[g] for g in pv_global_ids if g in peer_layer_to_group),
-                    None,
-                )
-                if peer_lg_idx is None:
-                    continue
-                peer_lg = peer_pt.layer_groups[peer_lg_idx]
-
-                # Step 2: pick the first peer pool with the same pool_role
-                # whose layers overlap self's (zero-overlap pools cover
-                # disjoint layers — nothing to transfer).
-                #
-                # Uniqueness assumption: at most one peer pool can match on
-                # both ``pool_role`` (frozenset equality) and layer overlap.
-                # We do *not* assume ``pool_role`` is unique within a peer LG
-                # — V2 may split an LG into multiple same-role pools by
-                # buffer-size class (e.g. VSWA). What we rely on is that both
-                # peers run the same pool-grouping logic, so for every self_pv
-                # there is exactly one peer pool with the same role *and* an
-                # overlapping layer set; other same-role peer pools cover
-                # disjoint layers and fall out via the overlap filter.
-                self_layer_set = set(pv_global_ids)
-                matched_peer_pi = None
-                for peer_pi, peer_pv in enumerate(peer_lg.pool_views):
-                    if peer_pv.pool_role != self_pv.pool_role:
-                        continue
-                    peer_global_ids = (
-                        get_global_layer_ids(peer_lg)
-                        if peer_pv.mapper_kind == MapperKind.FLAT
-                        else get_pool_view_global_layer_ids(peer_pv, peer_lg)
+                # One physical pool may span layers that land in different
+                # peer PP layer groups. Preserve their order while visiting
+                # every overlapping group.
+                peer_lg_indices = list(
+                    dict.fromkeys(
+                        peer_layer_to_group[g] for g in pv_global_ids if g in peer_layer_to_group
                     )
-                    if not set(peer_global_ids) & self_layer_set:
-                        continue
-                    if peer_pv.mapper_kind != self_pv.mapper_kind:
-                        raise ValueError(
-                            "PeerRegistrar.get_pool_mapping: incompatible mapper "
-                            f"kinds for pool role {sorted(self_pv.pool_role)} "
-                            f"(local={self_pv.mapper_kind.name}, "
-                            f"peer={peer_pv.mapper_kind.name}, peer_pool={peer_pi})"
+                )
+                if not peer_lg_indices:
+                    continue
+                self_records = self._buffer_records(self_pv, self_lg)
+                self_layer_set = set(pv_global_ids)
+                for peer_lg_idx in peer_lg_indices:
+                    peer_lg = peer_pt.layer_groups[peer_lg_idx]
+                    for peer_pi, peer_pv in enumerate(peer_lg.pool_views):
+                        peer_global_ids = (
+                            get_global_layer_ids(peer_lg)
+                            if peer_pv.mapper_kind == MapperKind.FLAT
+                            else get_pool_view_global_layer_ids(peer_pv, peer_lg)
                         )
-                    matched_peer_pi = peer_pi
-                    break
+                        if not set(peer_global_ids) & self_layer_set:
+                            continue
 
-                if matched_peer_pi is not None:
-                    mapping[(self_lg_idx, self_pi)] = (peer_lg_idx, matched_peer_pi)
+                        peer_records = self._buffer_records(peer_pv, peer_lg)
+                        if self_records and peer_records:
+                            overlapping_keys = self_records.keys() & peer_records.keys()
+                            if not overlapping_keys:
+                                continue
+                            for buffer_key in overlapping_keys:
+                                self_kind = self_records[buffer_key][2]
+                                peer_kind = peer_records[buffer_key][2]
+                                if self_kind != peer_kind:
+                                    raise ValueError(
+                                        "PeerRegistrar.get_pool_mapping: incompatible mapper "
+                                        f"kinds for buffer {buffer_key!r} "
+                                        f"(local={self_kind.name}, peer={peer_kind.name})"
+                                    )
+                            mapping.append(((self_lg_idx, self_pi), (peer_lg_idx, peer_pi)))
+                            continue
+
+                        if peer_pv.pool_role != self_pv.pool_role:
+                            continue
+                        if peer_pv.mapper_kind != self_pv.mapper_kind:
+                            raise ValueError(
+                                "PeerRegistrar.get_pool_mapping: incompatible mapper "
+                                f"kinds for pool role {sorted(self_pv.pool_role)} "
+                                f"(local={self_pv.mapper_kind.name}, "
+                                f"peer={peer_pv.mapper_kind.name}, peer_pool={peer_pi})"
+                            )
+                        mapping.append(((self_lg_idx, self_pi), (peer_lg_idx, peer_pi)))
+                        break
 
         self._lg_pool_mapping_cache[key] = mapping
         return mapping
@@ -264,8 +305,56 @@ class PeerRegistrar:
         peer_lg = peer_pt.layer_groups[peer_lg_idx]
         self_pv = self_lg.pool_views[self_pi]
         peer_pv = peer_lg.pool_views[peer_pi]
+        self_phys = get_physical_pool(self_pt, self_lg_idx, self_pv.pool_idx)
+        peer_phys = get_physical_pool(peer_pt, peer_lg_idx, peer_pv.pool_idx)
 
         assert self._ri.attention is not None
+        assert isinstance(self_lg, AttentionLayerGroup)
+        assert isinstance(peer_lg, AttentionLayerGroup)
+        self_records = self._buffer_records(self_pv, self_lg)
+        peer_records = self._buffer_records(peer_pv, peer_lg)
+        if self_records and peer_records:
+            overlapping_keys = [key for key in self_records if key in peer_records]
+            mappings = []
+            for buffer_key in overlapping_keys:
+                self_offset, self_size, self_kind = self_records[buffer_key]
+                peer_offset, peer_size, peer_kind = peer_records[buffer_key]
+                if self_kind != peer_kind:
+                    raise ValueError(
+                        "PeerRegistrar.get_kv_map: incompatible mapper kinds "
+                        f"for buffer {buffer_key!r} "
+                        f"(local={self_kind.name}, peer={peer_kind.name})"
+                    )
+                mappings.append(
+                    PoolBufferMapping(
+                        src_offset=self_offset,
+                        dst_offset=peer_offset,
+                        src_bytes=self_size,
+                        dst_bytes=peer_size,
+                        mapper_kind=self_kind,
+                    )
+                )
+
+            full_region_identity = len(overlapping_keys) == len(self_records) == len(
+                peer_records
+            ) and all(
+                self_records[buffer_key] == peer_records[buffer_key]
+                for buffer_key in overlapping_keys
+            )
+            targets = self.get_peer_overlap(peer_ri, peer_ri.dp_rank)
+            mapper = PoolBufferMapper(
+                mappings=mappings,
+                self_ri=self._ri,
+                peer_ri=peer_ri,
+                self_region_bytes=self_phys.slot_bytes,
+                peer_region_bytes=peer_phys.slot_bytes,
+                full_region_identity=full_region_identity,
+                include_sharded=self.should_send_kv(targets, peer_ri),
+                include_replicated=self._owns_tp_fan_in(peer_ri),
+            )
+            self._kv_map_cache[cache_key] = mapper
+            return mapper
+
         if self_pv.mapper_kind != peer_pv.mapper_kind:
             raise ValueError(
                 "PeerRegistrar.get_kv_map: incompatible mapper kinds "
@@ -325,9 +414,6 @@ class PeerRegistrar:
         else:
             self_layer_offset = 0
             peer_layer_offset = 0
-
-        self_phys = get_physical_pool(self_pt, self_lg_idx, self_pv.pool_idx)
-        peer_phys = get_physical_pool(peer_pt, peer_lg_idx, peer_pv.pool_idx)
 
         self_region_bytes = self_pv.bytes_per_region or self_phys.slot_bytes
         peer_region_bytes = peer_pv.bytes_per_region or peer_phys.slot_bytes
@@ -483,19 +569,35 @@ class PeerRegistrar:
         peer_rank_info: RankInfo,
         layer_group_id: int,
         pool_idx: int,
+        peer_layer_group_id: int,
+        peer_pool_idx: int,
     ) -> bool:
-        """Return whether this rank owns the transfer for one logical pool.
+        """Return whether this rank owns any logical buffer in a pool pair.
 
-        Normal KV pools retain head-duplication routing. Replicated side-cache
-        pools use one sender per fan-in group so TEP->DEP does not race several
-        identical INDEX_KEY copies into the same destination.
+        Normal KV buffers retain head-duplication routing. Replicated side
+        caches use one sender per fan-in group. A mixed physical pool is sent
+        when this rank owns at least one of its overlapping logical buffers;
+        PoolBufferMapper filters the remaining entries.
         """
         layer_group = self._self_ext_cache.page_table.layer_groups[layer_group_id]
         pool_view = layer_group.pool_views[pool_idx]
-        if pool_view.mapper_kind != MapperKind.REPLICATED:
-            return self.should_send_kv(peer_overlap, peer_rank_info)
+        peer_layer_group = peer_rank_info.page_table.layer_groups[peer_layer_group_id]
+        peer_pool_view = peer_layer_group.pool_views[peer_pool_idx]
+        self_records = self._buffer_records(pool_view, layer_group)
+        peer_records = self._buffer_records(peer_pool_view, peer_layer_group)
+        if self_records and peer_records:
+            kinds = {
+                self_records[buffer_key][2]
+                for buffer_key in self_records.keys() & peer_records.keys()
+            }
+        else:
+            kinds = {pool_view.mapper_kind}
 
-        return self._owns_tp_fan_in(peer_rank_info)
+        owns_sharded = any(kind != MapperKind.REPLICATED for kind in kinds) and self.should_send_kv(
+            peer_overlap, peer_rank_info
+        )
+        owns_replicated = MapperKind.REPLICATED in kinds and self._owns_tp_fan_in(peer_rank_info)
+        return owns_sharded or owns_replicated
 
     def should_send_aux(self, peer_rank_info: RankInfo) -> bool:
         # to ensure the transfer aux is not duplicated

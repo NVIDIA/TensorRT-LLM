@@ -2,12 +2,18 @@ import numpy as np
 import pytest
 
 import tensorrt_llm._torch.disaggregation.native.peer as peer_module
-from tensorrt_llm._torch.disaggregation.base.region import MemRegionGroup, SpecRegion
+from tensorrt_llm._torch.disaggregation.base.region import (
+    MemRegionGroup,
+    SpecRegion,
+    SpecRegionPair,
+)
 from tensorrt_llm._torch.disaggregation.native.mixers.attention.peer import (
     HeadMatchMapper,
     HeadMismatchMapper,
     IdentityMapper,
     NHDHeadMismatchMapper,
+    PoolBufferMapper,
+    PoolBufferMapping,
     ReplicatedMapper,
 )
 from tensorrt_llm._torch.disaggregation.native.mixers.attention.spec import AttentionInfo
@@ -551,6 +557,77 @@ def test_nhd_head_mismatch_mapper_uses_scale_pool_geometry():
     assert pair.dst.memory.bytes_per_region == 1
 
 
+def test_pool_buffer_mapper_uses_whole_pool_identity_for_equal_layout():
+    self_ri = make_rankinfo(instance_name="local", kv_heads_per_rank=2)
+    peer_ri = make_rankinfo(instance_name="peer", kv_heads_per_rank=2)
+    mapper = PoolBufferMapper(
+        mappings=[
+            PoolBufferMapping(0, 0, 256, 256, MapperKind.NHD),
+            PoolBufferMapping(256, 256, 128, 128, MapperKind.REPLICATED),
+        ],
+        self_ri=self_ri,
+        peer_ri=peer_ri,
+        self_region_bytes=384,
+        peer_region_bytes=384,
+        full_region_identity=True,
+        include_sharded=True,
+        include_replicated=True,
+    )
+
+    pair = mapper.map(
+        SpecRegion(memory=MemRegionGroup(ptrs=np.array([1000, 2000]), bytes_per_region=384)),
+        SpecRegion(memory=MemRegionGroup(ptrs=np.array([3000, 4000]), bytes_per_region=384)),
+    )
+
+    assert isinstance(pair, SpecRegionPair)
+    assert pair.src.memory.ptrs.size == 2  # One descriptor per input block.
+    assert pair.src.memory.ptrs.tolist() == [1000, 2000]
+    assert pair.dst.memory.ptrs.tolist() == [3000, 4000]
+    assert pair.src.memory.bytes_per_region == 384
+
+
+def test_pool_buffer_mapper_uses_entry_offsets_for_head_mismatch():
+    self_ri = make_rankinfo(
+        instance_name="local",
+        tp_size=2,
+        kv_heads_per_rank=2,
+        tokens_per_block=2,
+        dims_per_head=2,
+        element_bytes=2,
+    )
+    peer_ri = make_rankinfo(
+        instance_name="peer",
+        tp_size=1,
+        kv_heads_per_rank=1,
+        tokens_per_block=2,
+        dims_per_head=2,
+        element_bytes=2,
+    )
+    mapper = PoolBufferMapper(
+        mappings=[
+            PoolBufferMapping(0, 0, 16, 8, MapperKind.NHD),
+            PoolBufferMapping(16, 8, 4, 4, MapperKind.REPLICATED),
+        ],
+        self_ri=self_ri,
+        peer_ri=peer_ri,
+        self_region_bytes=20,
+        peer_region_bytes=12,
+        full_region_identity=False,
+        include_sharded=True,
+        include_replicated=True,
+    )
+
+    pairs = mapper.map(
+        SpecRegion(memory=MemRegionGroup(ptrs=np.array([1000]), bytes_per_region=20)),
+        SpecRegion(memory=MemRegionGroup(ptrs=np.array([2000]), bytes_per_region=12)),
+    )
+
+    assert len(pairs) == 1
+    assert pairs[0].src.memory.ptrs.tolist() == [1000, 1008, 1016]
+    assert pairs[0].dst.memory.ptrs.tolist() == [2000, 2004, 2008]
+    assert pairs[0].src.memory.bytes_per_region == 4
+
+
 def test_replicated_mapper_ignores_kv_head_mismatch():
     self_pt = make_page_table(global_layer_ids=[0])
     peer_pt = make_page_table(global_layer_ids=[0])
@@ -598,7 +675,7 @@ def test_replicated_pool_has_single_owner_on_tp_fan_in():
             layer_num_per_pp=[1],
         )
         reg = _make_peer_registrar(self_ri)
-        ownership.append(reg.should_send_pool(overlap, peer_ri, 0, 0))
+        ownership.append(reg.should_send_pool(overlap, peer_ri, 0, 0, 0, 0))
 
     assert ownership == [True, False, False, False, False, False, False, False]
 

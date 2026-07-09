@@ -319,12 +319,10 @@ def _build_page_table_v2(manager) -> KVCachePageTable:
             gpu_level = level_idx
             break
 
-    # Collect buffer entries keyed by (life_cycle_id, pool_idx).
-    # Also collect the set of native role-name strings per pool — used as
-    # ``PoolView.pool_role``, the manager-supplied equivalence label that
-    # disagg uses to match pools across peers without enumerating roles.
-    buffer_by_lc_pool: Dict[tuple, list] = defaultdict(list)
-    buffer_ids_by_lc_layer: Dict[tuple, list] = defaultdict(list)
+    # Collect buffer IDs keyed by (life_cycle_id, pool_idx). PoolView stays at
+    # physical-pool granularity; per-buffer roles, offsets, and mapper kinds
+    # let the mapper handle heterogeneous layouts within the pool.
+    buffer_ids_by_lc_pool: Dict[tuple, list] = defaultdict(list)
     native_roles_by_pool: Dict[tuple, set] = defaultdict(set)
 
     for buffer_id, attr in storage._buffer_attr.items():
@@ -332,16 +330,14 @@ def _build_page_table_v2(manager) -> KVCachePageTable:
         lc_id = attr.life_cycle_id
         pool_idx = attr.pool_index
         pool_key = (int(lc_id), pool_idx)
-        buffer_by_lc_pool[pool_key].append((layer_id, attr.offset, attr.size))
-        buffer_ids_by_lc_layer[(int(lc_id), int(layer_id))].append(buffer_id)
+        buffer_ids_by_lc_pool[pool_key].append(buffer_id)
         native_roles_by_pool[pool_key].add(str(role))
 
     # Every V2 manager declares how native roles map to the closed set of
     # disaggregation mappers. Role.ALL is the fallback for future/native roles
     # unknown to this shared extractor. An all-INDEXED mapping preserves the
-    # legacy whole-slot page table; any logical mapper opts every PP rank into
-    # per-layer views, even when that rank has no local buffer of the overriding
-    # role (for example, a dense-only MiniMax rank without INDEX_KEY).
+    # legacy whole-slot behavior. Heterogeneous declarations are recorded per
+    # buffer while retaining one PoolView per physical pool.
     role_mapper_kinds = manager.get_disagg_role_mapper_kinds()
     if Role.ALL not in role_mapper_kinds:
         raise ValueError("Disaggregation role mapping must define Role.ALL")
@@ -361,8 +357,6 @@ def _build_page_table_v2(manager) -> KVCachePageTable:
     }:
         raise ValueError("MapperKind.INDEXED is only valid as the sole Role.ALL mapping")
     default_mapper_kind = role_mapper_kinds[Role.ALL]
-    mapper_kind_order = list(dict.fromkeys(role_mapper_kinds.values()))
-    use_logical_views = any(kind != MapperKind.INDEXED for kind in mapper_kind_order)
 
     # Iterate over life cycles (layer groups), not storage pool groups.
     # Multiple layer_groups can share the same storage pool_group when their
@@ -414,67 +408,43 @@ def _build_page_table_v2(manager) -> KVCachePageTable:
         ]
 
         pool_views = []
-        if use_logical_views:
-            # Depending on topology, replicated side caches may occupy their
-            # own physical pools or be coalesced with sharded K/V. Describe
-            # each layer and role class as a logical byte range so matching is
-            # independent of that physical coalescing decision.
-            physical_pools = pool_groups[storage_pg_to_list_idx[storage_pg_idx]].pools
-            for layer_id in all_internal_layer_ids:
-                layer_buffers = buffer_ids_by_lc_layer.get((lc_idx, int(layer_id)), [])
-                buffers_by_mapper_kind: Dict[MapperKind, list] = defaultdict(list)
-                for buffer_id in layer_buffers:
-                    mapper_kind = role_mapper_kinds.get(buffer_id[1], default_mapper_kind)
-                    buffers_by_mapper_kind[mapper_kind].append(buffer_id)
+        for pool_idx in range(num_pools):
+            pool_key = (lc_idx, pool_idx)
+            buffer_ids = sorted(
+                buffer_ids_by_lc_pool.get(pool_key, []),
+                key=lambda buffer_id: int(storage._buffer_attr[buffer_id].offset),
+            )
 
-                for mapper_kind in mapper_kind_order:
-                    buffers = buffers_by_mapper_kind.get(mapper_kind, [])
-                    if not buffers:
-                        continue
-                    for desc in manager.impl.get_aggregated_pages(buffers):
-                        desc_buffer_ids = [expanded.id for expanded in desc.buffers]
-                        first_attr = storage._buffer_attr[desc_buffer_ids[0]]
-                        pool_idx = int(first_attr.pool_index)
-                        pool_base = physical_pools[pool_idx].base_address
-                        entries = [
-                            (
-                                int(buffer_id[0]),
-                                int(storage._buffer_attr[buffer_id].offset),
-                                int(storage._buffer_attr[buffer_id].size),
-                            )
-                            for buffer_id in desc_buffer_ids
-                        ]
-                        pool_views.append(
-                            PoolView(
-                                pool_idx=pool_idx,
-                                buffer_entries=np.array(entries, dtype=BUFFER_ENTRY_DTYPE),
-                                pool_role=frozenset(
-                                    str(buffer_id[1]) for buffer_id in desc_buffer_ids
-                                ),
-                                mapper_kind=mapper_kind,
-                                byte_offset=int(desc.base) - pool_base,
-                                bytes_per_region=int(desc.size),
-                            )
-                        )
-        else:
-            for pool_idx in range(num_pools):
-                pool_key = (lc_idx, pool_idx)
-                buffers_info = buffer_by_lc_pool.get(pool_key, [])
+            # Skip pools that have no buffers for this layer group.
+            # Multiple life cycles may share the same storage pool group;
+            # only include pools that actually belong to this life cycle.
+            if not buffer_ids:
+                continue
 
-                # Skip pools that have no buffers for this layer group.
-                # Multiple life cycles may share the same storage pool group;
-                # only include pools that actually belong to this life cycle.
-                if not buffers_info:
-                    continue
-
-                pool_views.append(
-                    PoolView(
-                        pool_idx=pool_idx,
-                        buffer_entries=np.array(buffers_info, dtype=BUFFER_ENTRY_DTYPE),
-                        pool_role=frozenset(native_roles_by_pool[pool_key]),
-                        mapper_kind=MapperKind.INDEXED,
-                    )
+            entries = [
+                (
+                    int(buffer_id[0]),
+                    int(storage._buffer_attr[buffer_id].offset),
+                    int(storage._buffer_attr[buffer_id].size),
                 )
+                for buffer_id in buffer_ids
+            ]
+            buffer_mapper_kinds = tuple(
+                role_mapper_kinds.get(buffer_id[1], default_mapper_kind) for buffer_id in buffer_ids
+            )
+            mapper_kind = (
+                buffer_mapper_kinds[0] if len(set(buffer_mapper_kinds)) == 1 else MapperKind.MIXED
+            )
+            pool_views.append(
+                PoolView(
+                    pool_idx=pool_idx,
+                    buffer_entries=np.array(entries, dtype=BUFFER_ENTRY_DTYPE),
+                    pool_role=frozenset(native_roles_by_pool[pool_key]),
+                    mapper_kind=mapper_kind,
+                    buffer_roles=tuple(str(buffer_id[1]) for buffer_id in buffer_ids),
+                    buffer_mapper_kinds=buffer_mapper_kinds,
+                )
+            )
 
         # Determine layer group metadata.
         # For managers with virtual layers, internal layer_ids

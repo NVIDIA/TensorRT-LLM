@@ -104,12 +104,16 @@ def test_minimax_disagg_rejects_unmanaged_index_value(monkeypatch) -> None:
 
 def _create_manager(mapping: Mapping, dtype: DataType) -> MiniMaxM3KVCacheManagerV2:
     max_num_tokens = 2048
+    kv_cache_dtype = {
+        DataType.FP8: "fp8",
+        DataType.NVFP4: "nvfp4",
+    }.get(dtype, "auto")
     return MiniMaxM3KVCacheManagerV2(
         kv_cache_config=KvCacheConfig(
             enable_block_reuse=False,
             max_tokens=max_num_tokens,
             event_buffer_max_size=0,
-            dtype="nvfp4" if dtype == DataType.NVFP4 else "auto",
+            dtype=kv_cache_dtype,
         ),
         kv_cache_type=CacheTypeCpp.SELF,
         num_layers=NUM_LAYERS,
@@ -173,9 +177,12 @@ def _get_nvfp4_scale_view(
     scale_roles = frozenset({"key_block_scale", "value_block_scale"})
     for layer_group_id, layer_group in enumerate(page_table.layer_groups):
         for pool_view in getattr(layer_group, "pool_views", ()):
-            if pool_view.pool_role != scale_roles:
-                continue
-            if local_layer_id not in pool_view.buffer_entries["local_layer_id"]:
+            matching_entries = [
+                entry
+                for entry, role in zip(pool_view.buffer_entries, pool_view.buffer_roles)
+                if int(entry["local_layer_id"]) == local_layer_id and role in scale_roles
+            ]
+            if not matching_entries:
                 continue
             pool = get_physical_pool(page_table, layer_group_id, pool_view.pool_idx)
             raw_slots = convert_to_torch_tensor(
@@ -185,8 +192,9 @@ def _get_nvfp4_scale_view(
                     [pool.num_slots, pool.slot_bytes],
                 )
             )
-            end = pool_view.byte_offset + pool_view.bytes_per_region
-            return raw_slots[:, pool_view.byte_offset : end]
+            start = min(int(entry["offset"]) for entry in matching_entries)
+            end = max(int(entry["offset"] + entry["size"]) for entry in matching_entries)
+            return raw_slots[:, start:end]
     raise AssertionError(f"missing NVFP4 scale view for layer {layer_idx}")
 
 
@@ -433,18 +441,21 @@ HEAD_MISMATCHED_BF16_TOPOLOGIES = [
 
 BF16_TOPOLOGIES = HEAD_MATCHED_BF16_TOPOLOGIES + HEAD_MISMATCHED_BF16_TOPOLOGIES
 
-# A smaller NVFP4 set covers packed K/V and scale-view geometry across the
-# same production directions without repeating the BF16 topology matrix.
-NVFP4_TOPOLOGIES = [
-    (4, 1, True, 4, 1, True, "nvfp4_dep4_to_dep4"),
-    (8, 1, True, 1, 1, True, "nvfp4_dep8_to_dep1"),
-    (1, 1, False, 8, 1, True, "nvfp4_tep1_to_dep8"),
-    (4, 1, False, 4, 1, True, "nvfp4_tep4_to_dep4"),
-    (8, 1, False, 1, 1, True, "nvfp4_tep8_to_dep1"),
+# Smaller quantized-cache sets cover packed K/V geometry across the same
+# production directions without repeating the BF16 topology matrix. NVFP4
+# additionally exercises its block-scale pools.
+QUANTIZED_TOPOLOGIES = [
+    (4, 1, True, 4, 1, True, "dep4_to_dep4"),
+    (8, 1, True, 1, 1, True, "dep8_to_dep1"),
+    (1, 1, False, 8, 1, True, "tep1_to_dep8"),
+    (4, 1, False, 4, 1, True, "tep4_to_dep4"),
+    (8, 1, False, 1, 1, True, "tep8_to_dep1"),
 ]
 
 CACHE_CASES = [(*topology[:6], DataType.BF16, topology[6]) for topology in BF16_TOPOLOGIES] + [
-    (*topology[:6], DataType.NVFP4, topology[6]) for topology in NVFP4_TOPOLOGIES
+    (*topology[:6], dtype, f"{prefix}_{topology[6]}")
+    for dtype, prefix in ((DataType.FP8, "fp8"), (DataType.NVFP4, "nvfp4"))
+    for topology in QUANTIZED_TOPOLOGIES
 ]
 
 

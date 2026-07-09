@@ -1,7 +1,6 @@
 """Golden tests for ``PeerRegistrar.get_pool_mapping``.
 
-Locks the current (pre-refactor) behavior of disagg pool matching across the
-representative scenarios that the refactor must keep working:
+Covers pool-level and legacy disagg matching across representative scenarios:
 
   * single KV pool, full layer overlap (basic MHA)
   * MLA (kv_factor=1, KEY-only pool)
@@ -11,9 +10,8 @@ representative scenarios that the refactor must keep working:
   * Two pools with same role but different layer sets within a peer LG
     (DSv4 virtual-layer scenario, exercises ``best_overlap``)
 
-The refactor (PoolRole -> PoolMatchKey + TransferLayout) must keep these
-results stable. If a test needs updating, the change should be deliberate and
-called out in the refactor commit message.
+New V2 views carry per-buffer roles and mapper kinds. Legacy views without
+that metadata retain role-set matching.
 """
 
 import numpy as np
@@ -67,6 +65,8 @@ def _pool_view(pool_idx, layer_role_pairs, *, pool_role=None, mapper_kind=Mapper
         buffer_entries=_entries(layer_role_pairs),
         pool_role=pool_role,
         mapper_kind=mapper_kind,
+        buffer_roles=tuple(role for _, role in layer_role_pairs),
+        buffer_mapper_kinds=(mapper_kind,) * len(layer_role_pairs),
     )
 
 
@@ -191,7 +191,7 @@ def test_kv_only_full_overlap():
     peer_ri = _rank_info(name="peer", rank=1, page_table=_page_table([peer_lg]))
 
     mapping = reg.get_pool_mapping(peer_ri)
-    assert mapping == {(0, 0): (0, 0)}
+    assert mapping == [((0, 0), (0, 0))]
 
 
 def test_mla_kv_only_full_overlap():
@@ -203,7 +203,7 @@ def test_mla_kv_only_full_overlap():
     peer_ri = _rank_info(name="peer", rank=1, page_table=_page_table([peer_lg]), is_mla=True)
 
     mapping = reg.get_pool_mapping(peer_ri)
-    assert mapping == {(0, 0): (0, 0)}
+    assert mapping == [((0, 0), (0, 0))]
 
 
 def test_kv_and_block_scale_in_same_lg():
@@ -225,7 +225,7 @@ def test_kv_and_block_scale_in_same_lg():
     peer_ri = _rank_info(name="peer", rank=1, page_table=peer_pt)
 
     mapping = reg.get_pool_mapping(peer_ri)
-    assert mapping == {(0, 0): (0, 0), (0, 1): (0, 1)}
+    assert mapping == [((0, 0), (0, 0)), ((0, 1), (0, 1))]
 
 
 def test_kv_and_indexer_in_same_lg():
@@ -248,38 +248,48 @@ def test_kv_and_indexer_in_same_lg():
     peer_ri = _rank_info(name="peer", rank=1, page_table=peer_pt)
 
     mapping = reg.get_pool_mapping(peer_ri)
-    assert mapping == {(0, 0): (0, 0), (0, 1): (0, 1)}
+    assert mapping == [((0, 0), (0, 0)), ((0, 1), (0, 1))]
 
 
-def test_minimax_logical_views_match_across_physical_coalescing():
-    """DEP split pools and TEP coalesced pools match by logical role/layer."""
-    dep_kv = _pool_view(0, [(0, "key"), (0, "value")])
-    dep_kv.bytes_per_region = 512
+def test_minimax_pool_views_match_across_physical_coalescing():
+    """One coalesced TEP pool maps to two role-separated DEP pools."""
+    dep_kv = _pool_view(
+        0,
+        [(0, "key"), (0, "value")],
+        mapper_kind=MapperKind.NHD,
+    )
     dep_index = _pool_view(
         1,
         [(0, "index_key")],
         mapper_kind=MapperKind.REPLICATED,
     )
-    dep_index.bytes_per_region = 128
-
-    tep_kv = _pool_view(0, [(0, "key"), (0, "value")])
-    tep_kv.bytes_per_region = 128
-    tep_index = _pool_view(
-        0,
-        [(0, "index_key")],
-        mapper_kind=MapperKind.REPLICATED,
+    tep_mixed = PoolView(
+        pool_idx=0,
+        buffer_entries=_entries([(0, "key"), (0, "value"), (0, "index_key")]),
+        pool_role=frozenset({"key", "value", "index_key"}),
+        mapper_kind=MapperKind.MIXED,
+        buffer_roles=("key", "value", "index_key"),
+        buffer_mapper_kinds=(MapperKind.NHD, MapperKind.NHD, MapperKind.REPLICATED),
     )
-    tep_index.byte_offset = 128
-    tep_index.bytes_per_region = 128
 
     dep_lg = _attn_lg(0, [(0, 10)], [dep_kv, dep_index])
-    tep_lg = _attn_lg(0, [(0, 10)], [tep_kv, tep_index])
-    dep_pt = _page_table([dep_lg], pool_specs={0: [(512, 64, 0x1000), (128, 64, 0x2000)]})
-    tep_pt = _page_table([tep_lg], pool_specs={0: [(256, 64, 0x3000)]})
+    tep_lg = _attn_lg(0, [(0, 10)], [tep_mixed])
+    dep_pt = _page_table([dep_lg], pool_specs={0: [(256, 64, 0x1000), (128, 64, 0x2000)]})
+    tep_pt = _page_table([tep_lg], pool_specs={0: [(384, 64, 0x3000)]})
 
     reg = _registrar(dep_pt, kv_heads=8)
     peer_ri = _rank_info(name="peer", rank=1, page_table=tep_pt, kv_heads=1)
-    assert reg.get_pool_mapping(peer_ri) == {(0, 0): (0, 0), (0, 1): (0, 1)}
+    assert reg.get_pool_mapping(peer_ri) == [
+        ((0, 0), (0, 0)),
+        ((0, 1), (0, 0)),
+    ]
+
+    reverse_reg = _registrar(tep_pt, kv_heads=1)
+    reverse_peer_ri = _rank_info(name="peer", rank=1, page_table=dep_pt, kv_heads=8)
+    assert reverse_reg.get_pool_mapping(reverse_peer_ri) == [
+        ((0, 0), (0, 0)),
+        ((0, 0), (0, 1)),
+    ]
 
 
 def test_pp_partial_layer_overlap():
@@ -293,7 +303,27 @@ def test_pp_partial_layer_overlap():
     )
 
     mapping = reg.get_pool_mapping(peer_ri)
-    assert mapping == {(0, 0): (0, 0)}
+    assert mapping == [((0, 0), (0, 0))]
+
+
+def test_pool_view_maps_across_multiple_peer_pp_layer_groups():
+    """One local physical pool can overlap multiple peer PP life cycles."""
+    self_lg = _attn_lg(0, [(0, 10), (1, 11)], [_kv_pool_view(0, [0, 1])])
+    peer_lg0 = _attn_lg(0, [(0, 10)], [_kv_pool_view(0, [0])])
+    peer_lg1 = _attn_lg(1, [(1, 11)], [_kv_pool_view(0, [1])])
+
+    reg = _registrar(_page_table([self_lg]), layer_num_per_pp=[2])
+    peer_ri = _rank_info(
+        name="peer",
+        rank=1,
+        page_table=_page_table([peer_lg0, peer_lg1]),
+        layer_num_per_pp=[1, 1],
+    )
+
+    assert reg.get_pool_mapping(peer_ri) == [
+        ((0, 0), (0, 0)),
+        ((0, 0), (1, 0)),
+    ]
 
 
 def test_two_pools_distinct_roles_in_same_lg():
@@ -319,7 +349,7 @@ def test_two_pools_distinct_roles_in_same_lg():
     peer_ri = _rank_info(name="peer", rank=1, page_table=peer_pt)
 
     mapping = reg.get_pool_mapping(peer_ri)
-    assert mapping == {(0, 0): (0, 0), (0, 1): (0, 1)}
+    assert mapping == [((0, 0), (0, 0)), ((0, 1), (0, 1))]
 
 
 def test_same_role_pools_disambiguated_by_layer_overlap():
@@ -348,7 +378,7 @@ def test_same_role_pools_disambiguated_by_layer_overlap():
     peer_ri = _rank_info(name="peer", rank=1, page_table=peer_pt, layer_num_per_pp=[3])
 
     mapping = reg.get_pool_mapping(peer_ri)
-    assert mapping == {(0, 0): (0, 1)}
+    assert mapping == [((0, 0), (0, 1))]
 
 
 @pytest.mark.parametrize(

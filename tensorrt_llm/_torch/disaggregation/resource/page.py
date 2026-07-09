@@ -36,6 +36,9 @@ class MapperKind(IntEnum):
         token-major ``[token, head, dim]``. Heterogeneous-head transfer must
         select the corresponding head slice inside every token rather than a
         single contiguous head-major range.
+    MIXED: PoolView describes one physical V2 pool whose individual buffer
+        entries use different mapper kinds. ``buffer_mapper_kinds`` carries
+        the per-entry kinds; managers cannot declare MIXED directly.
 
     INDEXED and FLAT retain the legacy full-slot byte arithmetic unless a
     PoolView supplies a logical ``byte_offset`` / ``bytes_per_region``.
@@ -49,6 +52,7 @@ class MapperKind(IntEnum):
     FLAT = 1
     REPLICATED = 2
     NHD = 3
+    MIXED = 4
 
 
 @dataclass
@@ -123,6 +127,11 @@ class PoolView:
             are equal. Disagg never enumerates the role-name vocabulary —
             adding a new role on the manager side requires no disagg change.
         mapper_kind: Closed-set discriminator for picking the Mapper family.
+        buffer_roles: Native role string for each ``buffer_entries`` item.
+            Empty for legacy page tables whose view is homogeneous.
+        buffer_mapper_kinds: Mapper kind for each ``buffer_entries`` item.
+            Empty for legacy page tables, where ``mapper_kind`` applies to
+            the complete view.
         byte_offset: Byte offset of this logical view from the physical pool's
             slot base. Defaults to zero for legacy full-slot views.
         bytes_per_region: Number of bytes transferred from each slot. ``None``
@@ -133,8 +142,23 @@ class PoolView:
     buffer_entries: np.ndarray  # dtype=BUFFER_ENTRY_DTYPE
     pool_role: FrozenSet[str] = field(default_factory=frozenset)
     mapper_kind: MapperKind = MapperKind.INDEXED
+    buffer_roles: tuple[str, ...] = ()
+    buffer_mapper_kinds: tuple[MapperKind, ...] = ()
     byte_offset: int = 0
     bytes_per_region: Optional[int] = None
+
+    def __post_init__(self) -> None:
+        num_entries = len(self.buffer_entries)
+        if self.buffer_roles and len(self.buffer_roles) != num_entries:
+            raise ValueError(
+                "PoolView buffer_roles must align with buffer_entries: "
+                f"roles={len(self.buffer_roles)}, entries={num_entries}"
+            )
+        if self.buffer_mapper_kinds and len(self.buffer_mapper_kinds) != num_entries:
+            raise ValueError(
+                "PoolView buffer_mapper_kinds must align with buffer_entries: "
+                f"kinds={len(self.buffer_mapper_kinds)}, entries={num_entries}"
+            )
 
     def to_dict(self) -> dict:
         return {
@@ -142,6 +166,8 @@ class PoolView:
             "buffer_entries": self.buffer_entries.tolist(),
             "pool_role": sorted(self.pool_role),
             "mapper_kind": int(self.mapper_kind),
+            "buffer_roles": list(self.buffer_roles),
+            "buffer_mapper_kinds": [int(kind) for kind in self.buffer_mapper_kinds],
             "byte_offset": int(self.byte_offset),
             "bytes_per_region": (
                 int(self.bytes_per_region) if self.bytes_per_region is not None else None
@@ -161,6 +187,10 @@ class PoolView:
             ),
             pool_role=frozenset(data["pool_role"]),
             mapper_kind=MapperKind(int(data["mapper_kind"])),
+            buffer_roles=tuple(data.get("buffer_roles", ())),
+            buffer_mapper_kinds=tuple(
+                MapperKind(int(kind)) for kind in data.get("buffer_mapper_kinds", ())
+            ),
             byte_offset=int(data.get("byte_offset", 0)),
             bytes_per_region=(
                 int(data["bytes_per_region"]) if data.get("bytes_per_region") is not None else None

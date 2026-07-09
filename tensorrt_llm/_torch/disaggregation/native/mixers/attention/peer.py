@@ -1,3 +1,5 @@
+from dataclasses import dataclass
+
 import numpy as np
 
 from tensorrt_llm import logger
@@ -9,7 +11,19 @@ from tensorrt_llm._torch.disaggregation.base.region import (
 )
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
 from tensorrt_llm._torch.disaggregation.resource.page import MapperKind
+from tensorrt_llm._torch.disaggregation.resource.utils import get_pool_view_mapper_kinds
 from tensorrt_llm._utils import nvtx_range
+
+
+@dataclass(frozen=True)
+class PoolBufferMapping:
+    """One logical buffer mapped between two physical pool slots."""
+
+    src_offset: int
+    dst_offset: int
+    src_bytes: int
+    dst_bytes: int
+    mapper_kind: MapperKind
 
 
 class IdentityMapper(RegionMapperBase):
@@ -62,6 +76,226 @@ class ReplicatedMapper(IdentityMapper):
 
     def __init__(self, self_region_bytes: int, peer_region_bytes: int) -> None:
         super().__init__(self_region_bytes, peer_region_bytes, mapper_name="Replicated")
+
+
+class PoolBufferMapper(RegionMapperBase):
+    """Map heterogeneous logical buffers inside one physical pool view.
+
+    Matching physical layouts with equal heads retain the whole-pool identity
+    path. Otherwise, per-buffer offsets select NHD head slices, replicated
+    buffers, or legacy HND buffers without expanding the page table per layer.
+    """
+
+    def __init__(
+        self,
+        *,
+        mappings: list[PoolBufferMapping],
+        self_ri: RankInfo,
+        peer_ri: RankInfo,
+        self_region_bytes: int,
+        peer_region_bytes: int,
+        full_region_identity: bool,
+        include_sharded: bool,
+        include_replicated: bool,
+    ) -> None:
+        head_match = (
+            self_ri.attention.is_mla
+            or self_ri.attention.kv_heads_per_rank == peer_ri.attention.kv_heads_per_rank
+        )
+        all_mappings_included = all(
+            include_replicated if mapping.mapper_kind == MapperKind.REPLICATED else include_sharded
+            for mapping in mappings
+        )
+        self._identity = (
+            IdentityMapper(self_region_bytes, peer_region_bytes, mapper_name="PoolBuffer")
+            if full_region_identity and head_match and all_mappings_included
+            else None
+        )
+        self._plans = self._build_plans(
+            mappings=mappings,
+            self_ri=self_ri,
+            peer_ri=peer_ri,
+            include_sharded=include_sharded,
+            include_replicated=include_replicated,
+        )
+
+    @staticmethod
+    def _exact_div(numerator: int, denominator: int, *, what: str) -> int:
+        if denominator <= 0 or numerator % denominator != 0:
+            raise ValueError(
+                f"{what} is not evenly divisible: numerator={numerator}, denominator={denominator}"
+            )
+        return numerator // denominator
+
+    @classmethod
+    def _build_plans(
+        cls,
+        *,
+        mappings: list[PoolBufferMapping],
+        self_ri: RankInfo,
+        peer_ri: RankInfo,
+        include_sharded: bool,
+        include_replicated: bool,
+    ) -> list[tuple[np.ndarray, np.ndarray, int]]:
+        head_match = (
+            self_ri.attention.is_mla
+            or self_ri.attention.kv_heads_per_rank == peer_ri.attention.kv_heads_per_rank
+        )
+        self_heads = self_ri.attention.kv_heads_per_rank
+        peer_heads = peer_ri.attention.kv_heads_per_rank
+        self_tpb = self_ri.attention.tokens_per_block
+        peer_tpb = peer_ri.attention.tokens_per_block
+        offsets_by_size: dict[int, tuple[list[int], list[int]]] = {}
+
+        def append_offsets(size: int, src_offsets, dst_offsets) -> None:
+            src_list, dst_list = offsets_by_size.setdefault(size, ([], []))
+            src_list.extend(int(offset) for offset in src_offsets)
+            dst_list.extend(int(offset) for offset in dst_offsets)
+
+        for mapping in mappings:
+            kind = mapping.mapper_kind
+            if kind == MapperKind.REPLICATED:
+                if not include_replicated:
+                    continue
+            elif not include_sharded:
+                continue
+
+            if head_match or kind == MapperKind.REPLICATED:
+                if mapping.src_bytes != mapping.dst_bytes:
+                    raise ValueError(
+                        "Pool buffer size mismatch: "
+                        f"local={mapping.src_bytes}, peer={mapping.dst_bytes}, "
+                        f"mapper={kind.name}"
+                    )
+                append_offsets(
+                    mapping.src_bytes,
+                    [mapping.src_offset],
+                    [mapping.dst_offset],
+                )
+                continue
+
+            if kind == MapperKind.NHD:
+                if self_tpb != peer_tpb:
+                    raise ValueError(
+                        "NHD pool buffer mapping requires equal tokens_per_block: "
+                        f"local={self_tpb}, peer={peer_tpb}"
+                    )
+                self_bytes_per_token_head = cls._exact_div(
+                    mapping.src_bytes,
+                    self_tpb * self_heads,
+                    what="local NHD buffer bytes",
+                )
+                peer_bytes_per_token_head = cls._exact_div(
+                    mapping.dst_bytes,
+                    peer_tpb * peer_heads,
+                    what="peer NHD buffer bytes",
+                )
+                if self_bytes_per_token_head != peer_bytes_per_token_head:
+                    raise ValueError(
+                        "NHD bytes per token/head mismatch: "
+                        f"local={self_bytes_per_token_head}, "
+                        f"peer={peer_bytes_per_token_head}"
+                    )
+                src_head_off, dst_head_off = HeadMismatchMapper._compute_head_offsets(
+                    self_ri.tp_size_per_dp_group,
+                    peer_ri.tp_size_per_dp_group,
+                    self_ri.tp_rank,
+                    peer_ri.tp_rank,
+                    self_kv_heads=self_heads,
+                    peer_kv_heads=peer_heads,
+                    bytes_per_head=self_bytes_per_token_head,
+                )
+                transfer_bytes = min(self_heads, peer_heads) * self_bytes_per_token_head
+                token_indices = np.arange(self_tpb, dtype=np.int64)
+                append_offsets(
+                    transfer_bytes,
+                    mapping.src_offset
+                    + token_indices * self_heads * self_bytes_per_token_head
+                    + src_head_off,
+                    mapping.dst_offset
+                    + token_indices * peer_heads * peer_bytes_per_token_head
+                    + dst_head_off,
+                )
+                continue
+
+            if kind == MapperKind.INDEXED:
+                self_bytes_per_head = cls._exact_div(
+                    mapping.src_bytes,
+                    self_heads,
+                    what="local HND buffer bytes",
+                )
+                peer_bytes_per_head = cls._exact_div(
+                    mapping.dst_bytes,
+                    peer_heads,
+                    what="peer HND buffer bytes",
+                )
+                if self_bytes_per_head != peer_bytes_per_head:
+                    raise ValueError(
+                        "HND bytes per head mismatch: "
+                        f"local={self_bytes_per_head}, peer={peer_bytes_per_head}"
+                    )
+                src_head_off, dst_head_off = HeadMismatchMapper._compute_head_offsets(
+                    self_ri.tp_size_per_dp_group,
+                    peer_ri.tp_size_per_dp_group,
+                    self_ri.tp_rank,
+                    peer_ri.tp_rank,
+                    self_kv_heads=self_heads,
+                    peer_kv_heads=peer_heads,
+                    bytes_per_head=self_bytes_per_head,
+                )
+                transfer_bytes = min(self_heads, peer_heads) * self_bytes_per_head
+                append_offsets(
+                    transfer_bytes,
+                    [mapping.src_offset + src_head_off],
+                    [mapping.dst_offset + dst_head_off],
+                )
+                continue
+
+            raise ValueError(f"Unsupported per-buffer mapper kind: {kind.name}")
+
+        return [
+            (
+                np.asarray(src_offsets, dtype=np.int64),
+                np.asarray(dst_offsets, dtype=np.int64),
+                size,
+            )
+            for size, (src_offsets, dst_offsets) in offsets_by_size.items()
+        ]
+
+    @nvtx_range("PoolBufferMapper.map")
+    def map(
+        self,
+        src_regions: SpecRegion,
+        dst_regions: SpecRegion,
+    ) -> SpecRegionPair | list[SpecRegionPair]:
+        if self._identity is not None:
+            return self._identity.map(src_regions, dst_regions)
+
+        src_group = src_regions.memory
+        dst_group = dst_regions.memory
+        if src_group.ptrs.size != dst_group.ptrs.size:
+            raise ValueError(
+                f"Number of regions of src({src_group.ptrs.size}) and "
+                f"dst({dst_group.ptrs.size}) must match"
+            )
+
+        results = []
+        for src_offsets, dst_offsets, transfer_bytes in self._plans:
+            src_ptrs = np.add.outer(src_group.ptrs, src_offsets).ravel()
+            dst_ptrs = np.add.outer(dst_group.ptrs, dst_offsets).ravel()
+            results.append(
+                SpecRegionPair(
+                    src=SpecRegion(
+                        memory=MemRegionGroup(src_ptrs, transfer_bytes),
+                        spec=src_regions.spec,
+                    ),
+                    dst=SpecRegion(
+                        memory=MemRegionGroup(dst_ptrs, transfer_bytes),
+                        spec=dst_regions.spec,
+                    ),
+                )
+            )
+        return results
 
 
 class HeadMatchMapper(RegionMapperBase):
@@ -512,7 +746,7 @@ class AttentionPolicy:
         if ri.page_table is None:
             return False
         return any(
-            pool_view.mapper_kind in (MapperKind.NHD, MapperKind.REPLICATED)
+            bool(get_pool_view_mapper_kinds(pool_view) & {MapperKind.NHD, MapperKind.REPLICATED})
             for layer_group in ri.page_table.layer_groups
             for pool_view in getattr(layer_group, "pool_views", ())
         )
@@ -525,7 +759,7 @@ class AttentionPolicy:
         if ri.page_table is None:
             return True
         return any(
-            pool_view.mapper_kind not in (MapperKind.NHD, MapperKind.REPLICATED)
+            bool(get_pool_view_mapper_kinds(pool_view) - {MapperKind.NHD, MapperKind.REPLICATED})
             for layer_group in ri.page_table.layer_groups
             for pool_view in getattr(layer_group, "pool_views", ())
         )

@@ -57,21 +57,32 @@ def test_logical_pool_view_roundtrip_and_legacy_defaults():
         buffer_entries=entries,
         pool_role=frozenset({"index_key"}),
         mapper_kind=MapperKind.REPLICATED,
+        buffer_roles=("index_key", "index_key"),
+        buffer_mapper_kinds=(MapperKind.REPLICATED, MapperKind.REPLICATED),
         byte_offset=768,
         bytes_per_region=256,
     )
 
     restored = PoolView.from_dict(view.to_dict())
     assert restored.mapper_kind == MapperKind.REPLICATED
+    assert restored.buffer_roles == ("index_key", "index_key")
+    assert restored.buffer_mapper_kinds == (
+        MapperKind.REPLICATED,
+        MapperKind.REPLICATED,
+    )
     assert restored.byte_offset == 768
     assert restored.bytes_per_region == 256
 
     legacy = view.to_dict()
     del legacy["byte_offset"]
     del legacy["bytes_per_region"]
+    del legacy["buffer_roles"]
+    del legacy["buffer_mapper_kinds"]
     restored_legacy = PoolView.from_dict(legacy)
     assert restored_legacy.byte_offset == 0
     assert restored_legacy.bytes_per_region is None
+    assert restored_legacy.buffer_roles == ()
+    assert restored_legacy.buffer_mapper_kinds == ()
 
 
 def test_local_layer_roundtrip():
