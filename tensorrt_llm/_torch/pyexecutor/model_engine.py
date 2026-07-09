@@ -5688,10 +5688,10 @@ class PyTorchModelEngine(ModelEngine):
     ):
         """Pack encoder inputs for feature-driven audio encoders (Whisper).
 
-        The encoder input is a per-request feature tensor (a log-mel
-        spectrogram) rather than token ids, and the packed sequence lengths are
-        the post-encoder position counts (``encoder_output_len``), not the raw
-        feature length.
+        The encoder input is a per-request feature tensor (an opaque audio
+        tensor, e.g. Whisper's 30 s-padded waveform) rather than token ids, and
+        the packed sequence lengths are the post-encoder position counts
+        (``encoder_output_len``), not the raw feature length.
         """
         features: List[torch.Tensor] = []
         sequence_lengths: List[int] = []

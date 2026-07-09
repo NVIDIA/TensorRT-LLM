@@ -21,6 +21,11 @@ convolutional + Transformer audio encoder, and a text decoder attends to the
 encoder output via cross-attention while generating a transcript
 autoregressively.
 
+The request carries the raw 30 s-padded waveform (not the mel): the input
+processor only pads/validates audio on the host, and the encoder computes the
+log-mel spectrogram on GPU inside the engine process (batched across the
+encoder step; see :class:`WhisperLogMelFrontend`).
+
 Key differences from BART:
     - Pre-norm (LayerNorm → sub-layer → residual add) instead of post-norm.
     - The encoder ingests a mel-feature tensor through a 2x ``Conv1d`` stem
@@ -319,13 +324,77 @@ class WhisperDecoderLayer(nn.Module):
 # ---------------------------------------------------------------------------
 
 
+class WhisperLogMelFrontend(nn.Module):
+    """GPU log-mel spectrogram front-end, numerics-identical to the HF
+    ``WhisperFeatureExtractor`` torch path (``_torch_extract_fbank_features``).
+
+    Consumes the raw 30 s zero-padded waveform batch shipped by
+    :class:`WhisperInputProcessor` and produces ``[batch, num_mel_bins, 3000]``
+    in fp32 (STFT precision; the caller casts to the model dtype). Kept as a
+    separate module so a future encoder CUDA-graph capture can choose to keep
+    the STFT outside the graphed region.
+    """
+
+    N_FFT = 400
+    HOP_LENGTH = 160
+    SAMPLING_RATE = 16000
+
+    def __init__(self, config: WhisperConfig):
+        super().__init__()
+        from transformers.audio_utils import mel_filter_bank
+
+        # Same construction as WhisperFeatureExtractor.__init__ (slaney-norm
+        # slaney-scale bank over 201 frequency bins, 0-8 kHz).
+        self._mel_filters_np = mel_filter_bank(
+            num_frequency_bins=1 + self.N_FFT // 2,
+            num_mel_filters=config.num_mel_bins,
+            min_frequency=0.0,
+            max_frequency=8000.0,
+            sampling_rate=self.SAMPLING_RATE,
+            norm="slaney",
+            mel_scale="slaney",
+        )
+        # Materialized lazily on the input device (NOT register_buffer: these
+        # are derived constants that must stay fp32 and out of the state dict,
+        # and lazy creation sidesteps meta-device module initialization).
+        self._mel_filters: Optional[torch.Tensor] = None
+        self._window: Optional[torch.Tensor] = None
+
+    def forward(self, waveforms: torch.Tensor) -> torch.Tensor:
+        # waveforms: [batch, n_samples] fp32, zero-padded to exactly 30 s.
+        if self._mel_filters is None or self._mel_filters.device != waveforms.device:
+            self._mel_filters = torch.from_numpy(self._mel_filters_np).to(
+                waveforms.device, torch.float32
+            )
+            self._window = torch.hann_window(self.N_FFT, device=waveforms.device)
+
+        waveforms = waveforms.to(torch.float32)
+        stft = torch.stft(
+            waveforms,
+            self.N_FFT,
+            self.HOP_LENGTH,
+            window=self._window,
+            return_complex=True,
+        )
+        magnitudes = stft[..., :-1].abs() ** 2
+        mel_spec = self._mel_filters.T @ magnitudes
+        log_spec = torch.clamp(mel_spec, min=1e-10).log10()
+        # Per-sample dynamic-range floor (batched samples must not share a max).
+        max_val = log_spec.max(dim=2, keepdim=True)[0].max(dim=1, keepdim=True)[0]
+        log_spec = torch.maximum(log_spec, max_val - 8.0)
+        return (log_spec + 4.0) / 4.0
+
+
 class WhisperEncoder(nn.Module):
-    """Whisper audio encoder: 2x Conv1d stem + positions + self-attn layers."""
+    """Whisper audio encoder: log-mel front-end + 2x Conv1d stem + positions +
+    self-attn layers."""
 
     def __init__(self, model_config: ModelConfig[WhisperConfig]):
         super().__init__()
         config = model_config.pretrained_config
         embed_dim = config.d_model
+
+        self.log_mel = WhisperLogMelFrontend(config)
 
         # 2x Conv1d stem. conv2 has stride 2, halving the time axis
         # (3000 mel frames -> 1500 encoder positions).
@@ -366,7 +435,12 @@ class WhisperEncoder(nn.Module):
         input_features: torch.Tensor,
         attn_metadata: AttentionMetadata,
     ) -> torch.Tensor:
-        # input_features: [batch, num_mel_bins, num_frames] (num_frames = 3000)
+        # input_features: [batch, n_samples] raw 30 s-padded waveform (the
+        # request contract), or a precomputed [batch, num_mel_bins, 3000] mel
+        # (kept for direct-callers/validation harnesses).
+        if input_features.dim() == 2:
+            input_features = self.log_mel(input_features)
+        input_features = input_features.to(self.conv1.weight.dtype)
         inputs_embeds = F.gelu(self.conv1(input_features))
         inputs_embeds = F.gelu(self.conv2(inputs_embeds))
         # [batch, embed_dim, seq_len] -> [batch, seq_len, embed_dim]
@@ -448,33 +522,36 @@ class WhisperDecoder(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Input processor (audio -> mel features + forced decoder prompt)
+# Input processor (audio -> padded waveform + forced decoder prompt)
 # ---------------------------------------------------------------------------
 
 
 class WhisperInputProcessor(InputProcessor):
     """Host-side Whisper preprocessing for the LLM API.
 
-    Turns ``multi_modal_data["audio"]`` into the log-mel spectrogram the
-    audio encoder consumes, and returns the forced decoder prompt as the
-    request's token ids. An empty text prompt selects the checkpoint default
+    Validates and zero-pads ``multi_modal_data["audio"]`` to the fixed 30 s
+    window (the log-mel spectrogram itself is computed on GPU inside the
+    engine, see :class:`WhisperLogMelFrontend`), and returns the forced
+    decoder prompt as the request's token ids. An empty text prompt selects
+    the checkpoint default
     (``<|startoftranscript|>[<|en|>][<|transcribe|>]<|notimestamps|>``); a
     non-empty text prompt is tokenized verbatim as the decoder prompt, which
     is how language/task are overridden, e.g.
     ``"<|startoftranscript|><|de|><|transcribe|><|notimestamps|>"``.
     Pre-tokenized ``prompt_token_ids`` are not consumed.
 
-    The mel rides ``multimodal_data["audio"]`` under ``encoder_input_features``
-    + ``encoder_output_len``, which ``executor_request_to_llm_request`` forwards
-    into the request's native encoder fields.
+    The padded waveform rides ``multimodal_data["audio"]`` under
+    ``encoder_input_features`` + ``encoder_output_len``, which
+    ``executor_request_to_llm_request`` forwards into the request's native
+    encoder fields.
     """
 
     # Marks this model as feature-driven for the encoder side: prompts
     # without audio cannot be served and are rejected at submission.
     requires_encoder_features = True
 
-    # Whisper checkpoints are trained on 30 s windows at 16 kHz; the feature
-    # extractor always pads/truncates to exactly 3000 mel frames. Longer audio
+    # Whisper checkpoints are trained on 30 s windows at 16 kHz; the waveform
+    # is always zero-padded to exactly 30 s (3000 mel frames). Longer audio
     # is rejected instead of silently truncated (long-form chunking is a
     # separate feature).
     MAX_AUDIO_SECONDS = 30.0
@@ -626,14 +703,15 @@ class WhisperInputProcessor(InputProcessor):
             sampling_params.max_tokens = decoder_budget
 
         waveform = self._load_waveform(audio_items[0])
-        input_features = self.processor.feature_extractor(
-            waveform, sampling_rate=self.SAMPLING_RATE, return_tensors="pt"
-        ).input_features
-        # [1, num_mel_bins, 3000]; store in the checkpoint dtype (the engine
-        # re-casts to the actual parameter dtype at the encoder step).
-        torch_dtype = getattr(self.config, "torch_dtype", None)
-        if torch_dtype is not None:
-            input_features = input_features.to(torch_dtype)
+        # Zero-pad to the fixed 30 s window (same padding the HF feature
+        # extractor applies). Shipped as fp32 [1, n_samples]: the STFT needs
+        # fp32 precision, and the leading dim of 1 keeps the C++ request's
+        # encoder-input-length bookkeeping unchanged. The GPU mel front-end in
+        # the encoder does the rest.
+        n_samples = int(self.MAX_AUDIO_SECONDS * self.SAMPLING_RATE)
+        padded = np.zeros((1, n_samples), dtype=np.float32)
+        padded[0, : waveform.shape[0]] = waveform
+        input_features = torch.from_numpy(padded)
 
         extra = {
             "multimodal_data": {
