@@ -39,7 +39,14 @@ from .guardrails import check_video_safety, download_guardrail_checkpoint
 from .sound_tokenizer import LatentAutoEncoderV2
 from .transformer_cosmos3 import Cosmos3VFMTransformer
 
-COSMOS3_DEFAULT_NEGATIVE_PROMPT = ""
+COSMOS3_DEFAULT_NEGATIVE_PROMPT = (
+    "The video captures a series of frames showing ugly scenes, static with no motion, motion blur, "
+    "over-saturation, shaky footage, low resolution, grainy texture, pixelated images, poorly lit areas, "
+    "underexposed and overexposed scenes, poor color balance, washed out colors, choppy sequences, jerky movements, "
+    "low frame rate, artifacting, color banding, unnatural transitions, outdated special effects, fake elements, "
+    "unconvincing visuals, poorly edited content, jump cuts, visual noise, and flickering. Overall, the video is of "
+    "poor quality."
+)
 COSMOS3_DEFAULT_SYSTEM_PROMPT = (
     "You are a helpful assistant who will generate videos from a given prompt."
 )
