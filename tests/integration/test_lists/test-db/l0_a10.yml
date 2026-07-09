@@ -74,6 +74,7 @@ l0_a10:
   - unittest/tools
   - unittest/usage/test_collectors.py
   - unittest/usage/test_config.py
+  - unittest/usage/test_llmapi_config_telemetry_docs.py
   - unittest/usage/test_opt_out.py
   - unittest/usage/test_reporter.py
   - unittest/usage/test_schema.py

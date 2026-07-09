@@ -598,6 +598,8 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         sparse_params = attn.sparse_params
         has_skip_softmax = sparse_params is not None and sparse_params.algorithm == "skip_softmax"
         has_sparse_attention = sparse_params is not None and not has_skip_softmax
+        if fwd.enable_dsv4_epilogue_fusion:
+            return False, "trtllm-gen does not support DSv4 epilogue fusion."
         if (
             fwd.sage_attn_num_elts_per_blk_q > 0
             or fwd.sage_attn_num_elts_per_blk_k > 0
@@ -1075,6 +1077,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             fwd.out_scale,  # attention_output_orig_quant
             attn.rotary_inv_freq,  # rotary_inv_freq
             attn.rotary_cos_sin,  # rotary_cos_sin
+            fwd.mrope_position_deltas,  # mrope_position_deltas
             attn.local_layer_idx,  # layer_idx
             params.seq_offset,  # seq_offset
             attn.num_heads,  # num_heads

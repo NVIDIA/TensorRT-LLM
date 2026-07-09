@@ -171,7 +171,6 @@ accuracy/test_llm_api_pytorch.py::TestNemotronV3Ultra::test_nvfp4_4gpus_block_re
 accuracy/test_llm_api_pytorch.py::TestNemotronV3Ultra::test_nvfp4_parallelism[TP2_PP2]
 accuracy/test_llm_api_pytorch.py::TestNemotronV3Ultra::test_nvfp4_parallelism[TEP2_PP2]
 accuracy/test_llm_api_pytorch.py::TestNemotronV3Ultra::test_nvfp4_parallelism[ADP2_PP2]
-accuracy/test_llm_api_pytorch.py::TestNemotronV3Ultra::test_nvfp4_4gpu_mtp_ar
 accuracy/test_llm_api_autodeploy.py::TestQwen3_5_397B_MoE::test_nvfp4[8]
 accuracy/test_llm_api_pytorch.py::TestDeepSeekR1::test_fp8_blockscale[latency]
 accuracy/test_llm_api_pytorch.py::TestDeepSeekR1::test_fp8_blockscale[throughput]
@@ -689,11 +688,6 @@ accuracy/test_llm_api_pytorch.py::TestMistralLarge3_675B::test_nvfp4_4gpus[laten
 accuracy/test_llm_api_pytorch.py::TestMistralLarge3_675B::test_nvfp4_4gpus[latency_moe_trtllm_eagle]
 accuracy/test_llm_api_pytorch.py::TestNemotronV3Nano::test_auto_dtype
 accuracy/test_llm_api_pytorch.py::TestNemotronV3Nano::test_fp8
-accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_auto_dtype_4gpus[4-1-False]
-accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_auto_dtype_4gpus[4-1-True]
-accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_auto_dtype_4gpus[4-4-False]
-accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_auto_dtype_4gpus[4-4-True]
-accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_bf16_4gpu_mtp_ar
 accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_fp8_4gpus[attention_dp_off-cpp_mamba_cache]
 accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_fp8_4gpus[attention_dp_off-python_mamba_cache]
 accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_fp8_4gpus[attention_dp_on-cpp_mamba_cache]
@@ -705,9 +699,6 @@ accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_nvfp4_4gpus_online_e
 accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_nvfp4_4gpus_static_eplb[moe_backend=CUTLASS]
 accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_nvfp4_4gpus_static_eplb[moe_backend=TRTLLM]
 accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_nvfp4_4gpus_static_eplb[moe_backend=CUTEDSL]
-accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_nvfp4_8gpus[attention_dp_on-cutlass]
-accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_nvfp4_8gpus[attention_dp_on-trtllm]
-accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_nvfp4_8gpus[attention_dp_on-cutedsl]
 accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_nvfp4_8gpus_mtp
 accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_nvfp4_8gpus_mtp_custom_op
 accuracy/test_llm_api_pytorch.py::TestNemotronV3Nano::test_nvfp4_marlin_multi_gpus[tp_size=8]
@@ -718,9 +709,7 @@ accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_nvfp4_parallelism[TE
 accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_nvfp4_parallelism[TP4_PP2]
 accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_nvfp4_parallelism[TP8_PP1]
 accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_nvfp4_parallelism[TP8_PP1_ADP]
-accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_nvfp4_4gpus_block_reuse[TEP4_ADP_MTP]
-accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_bf16_trtllm_gen_moe_backend[attention_dp=True]
-accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_bf16_trtllm_gen_moe_backend[attention_dp=False]
+accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_nvfp4_4gpus_block_reuse[DEP4_MTP_ON]
 accuracy/test_llm_api_pytorch.py::TestPhi4MiniInstruct::test_auto_dtype
 accuracy/test_llm_api_pytorch.py::TestQwen2_7BInstruct::test_auto_dtype
 accuracy/test_llm_api_pytorch.py::TestQwen3_235B_A22B::test_fp8[latency]
@@ -768,6 +757,8 @@ accuracy/test_llm_api_pytorch.py::TestQwen3_5_4B::test_fp8_piecewise_cuda_graph
 accuracy/test_llm_api_pytorch.py::TestQwen3_5_4B::test_dflash
 accuracy/test_llm_api_pytorch.py::TestQwen3_5_35B_A3B::test_fp8_moe_dflash
 accuracy/test_llm_api_pytorch.py::TestQwen3_5_35B_A3B::test_fp8[enable_block_reuse=False]
+accuracy/test_llm_api_pytorch.py::TestQwen3_6_35B_A3B::test_nvfp4[TRTLLM]
+accuracy/test_llm_api_pytorch.py::TestQwen3_6_35B_A3B::test_nvfp4[CUTEDSL]
 accuracy/test_llm_api_pytorch.py::TestQwen3_5_397B_A17B::test_nvfp4[adp4_cutedsl]
 accuracy/test_llm_api_pytorch.py::TestQwen3_5_397B_A17B::test_nvfp4[adp4_trtllm]
 accuracy/test_llm_api_pytorch.py::TestQwen3_5_397B_A17B::test_nvfp4[tep4_cutedsl]
