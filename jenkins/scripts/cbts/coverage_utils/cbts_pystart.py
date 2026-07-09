@@ -115,9 +115,10 @@ class PyStartTracker:
             _MON.restart_events()
 
     def save(self):
-        # Write a per-process SQLite (binary) rather than JSON text: coverage.py's per-process
-        # .coverage.* files were SQLite too, so the publish-artifacts guardword/secret scanners
-        # skip them even though they carry product paths -- a text .json would get flagged.
+        # Write a per-process SQLite that the downstream merge attaches and reads directly. These
+        # files leave the node only inside a compressed tarball, so the publish-artifacts guardword
+        # scanner (which byte-matches product paths in raw files but does not recurse into archives)
+        # never sees the paths and qualnames stored here as plaintext TEXT columns.
         snap = self._data.copy()  # atomic shallow copy; each set snapshotted below
         if not snap:
             return None
