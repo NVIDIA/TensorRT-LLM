@@ -616,6 +616,33 @@ class BlockRadixTree:
         )
         return ReuseMatch([block for block, _ in matched], self._num_matched_tokens(matched))
 
+    def match_block_keys(self, reuse_scope: ReuseScope, block_keys: Sequence[BlockKey]) -> ReuseMatch:
+        """
+        Return the currently reusable prefix match by walking precomputed block keys.
+
+        Equivalent to :meth:`match` for an unchanged token prefix, but skips token
+        hashing entirely: each key is a plain child-dict lookup on the previous
+        block. Intended for callers that cached the committed block-key chain of
+        an earlier request over the same prefix (e.g. a per-conversation probe
+        cache). Because block keys are chained content hashes, a matched key
+        implies the whole prefix up to that block matches the cached content; it
+        does NOT re-verify the new request's tokens against that content.
+
+        The result is volatile, same as :meth:`match`.
+        """
+        matched: list[tuple[Block, int]] = []
+        root = self.next.get(RootBlock.make_key(reuse_scope))
+        if root is not None:
+            block: RootBlock | Block = root
+            for key in block_keys:
+                child = block.next.get(key)
+                if child is None:
+                    break
+                matched.append((child, len(child.tokens)))
+                block = child
+        matched = self._prune_match(matched)
+        return ReuseMatch([block for block, _ in matched], self._num_matched_tokens(matched))
+
     def _check_sanity(self) -> bool:
         raise NotImplementedError(
             "[KVCacheManager] Check if there are any unusable blocks that should have been removed."

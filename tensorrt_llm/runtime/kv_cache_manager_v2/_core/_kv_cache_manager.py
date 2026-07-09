@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Iterable, Iterator, cast
 
 from .. import rawref
-from .._block_radix_tree import BlockRadixTree, ReuseMatch, ReuseScope
+from .._block_radix_tree import BlockKey, BlockRadixTree, ReuseMatch, ReuseScope
 from .._common import (
     BAD_PAGE_INDEX,
     GPU_LEVEL,
@@ -438,6 +438,29 @@ class KVCacheManager:
         if input_tokens is None:
             input_tokens = ()
         return self._match_reuse(reuse_scope, input_tokens).num_tokens
+
+    def probe_reuse_by_keys(
+        self,
+        reuse_scope: ReuseScope | None = None,
+        block_keys: Sequence[BlockKey] | None = None,
+    ) -> int:
+        """
+        :meth:`probe_reuse` variant that walks precomputed block keys instead of
+        hashing tokens.
+
+        ``block_keys`` is typically obtained from
+        :meth:`_KVCache.committed_block_keys` of an earlier request whose token
+        sequence is a prefix of the new request. The returned length is advisory
+        because no page ownership is acquired, and it reflects the CACHED
+        content: callers are responsible for knowing that the new request's
+        prefix is unchanged (or treating the result as a routing hint only).
+        """
+        if reuse_scope is None:
+            reuse_scope = ReuseScope()
+        assert type(reuse_scope) is ReuseScope
+        if not block_keys:
+            return 0
+        return self._radix_tree.match_block_keys(reuse_scope, block_keys).num_tokens
 
     def resize(self, cache_level: CacheLevel, quota: int, best_efforts: bool = False) -> bool:
         """

@@ -503,10 +503,17 @@ class KVCacheAwareADPRouter(ADPRouter):
             # cache_salt_id scopes block reuse on both v1 and v2 backends;
             # passing None for non-salted requests is a no-op.
             cache_salt_id = getattr(req, "cache_salt_id", None)
+            # conv_key enables the v2 per-conversation probe cache (skips
+            # prefix re-hashing). Read from the same serve-side field the
+            # conversation-aware routing uses; None when not propagated.
+            disagg_params = getattr(req, "py_disaggregated_params", None)
+            conv_key = getattr(disagg_params, "conversation_id", None) \
+                if disagg_params is not None else None
             match_len = self.kv_cache_manager.probe_prefix_match_length(
                 probe_tokens,
                 lora_task_id,
                 cache_salt_id=cache_salt_id,
+                conv_key=conv_key or None,
             )
             local_matches.extend([req_item.id, match_len])
 

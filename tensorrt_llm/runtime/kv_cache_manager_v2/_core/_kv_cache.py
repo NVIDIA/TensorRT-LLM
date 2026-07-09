@@ -23,7 +23,14 @@ from itertools import chain
 from typing import TYPE_CHECKING, Callable, ClassVar, Iterator, NamedTuple, Type, cast
 
 from .. import rawref
-from .._block_radix_tree import Block, ReuseMatch, ReuseScope, RootBlock, UselessBlockError
+from .._block_radix_tree import (
+    Block,
+    BlockKey,
+    ReuseMatch,
+    ReuseScope,
+    RootBlock,
+    UselessBlockError,
+)
 from .._common import (
     BAD_BLOCK_ORDINAL,
     BAD_PAGE_INDEX,
@@ -589,6 +596,26 @@ class _KVCache:
                     yield BAD_PAGE_INDEX
             else:
                 yield holder.page.slot_id
+
+    def committed_block_keys(self) -> "list[BlockKey]":
+        """
+        Keys of the blocks this KV cache committed into the radix tree, in chain
+        order.
+
+        The keys can later drive :meth:`KVCacheManager.probe_reuse_by_keys` to
+        re-probe the same token prefix without re-hashing it (e.g. from a
+        per-conversation probe cache). They are computed during commit, so this
+        accessor is hashing-free. Blocks that were virtually committed
+        (VIRTUAL_STOP) or rebased away have no tree block and terminate the
+        chain early.
+        """
+        keys: list[BlockKey] = []
+        for ordinal in range(self._num_committed_blocks):
+            tree_block = self._blocks[BlockOrdinal(ordinal)].tree_block
+            if tree_block is None:
+                break
+            keys.append(tree_block.key)
+        return keys
 
     def get_scratch_desc(self, layer_group_id: LayerGroupId) -> "ScratchDesc | None":
         """
