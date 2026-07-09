@@ -25,6 +25,7 @@ tolerance below only guards hypothetical cross-arch fp contraction drift.
 
 import pytest
 import torch
+from utils.util import skip_pre_blackwell
 
 import tensorrt_llm  # noqa: F401  (registers trtllm torch ops)
 import tensorrt_llm._torch.custom_ops.flashinfer_custom_ops  # noqa: F401
@@ -32,6 +33,8 @@ from tensorrt_llm._torch.modules.fused_ops.gelu_tanh_mul_fp4_quant import (
     gelu_tanh_mul_fp4_quant,
     sf_swizzled_offsets,
 )
+
+pytestmark = skip_pre_blackwell
 
 
 def _reference(x, gs):
