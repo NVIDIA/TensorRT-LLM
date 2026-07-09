@@ -1175,8 +1175,8 @@ def collectTestResults(pipeline, testFilter, globalVars)
             trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, false, true)
             if (testFilter[(IS_POST_MERGE)]) {
                 try {
-                    sh "python3 llm/scripts/generate_duration.py --duration-file=new_test_duration.json"
-                    trtllm_utils.uploadArtifacts("new_test_duration.json", "${UPLOAD_PATH}/test-results/")
+                    sh "python3 llm/jenkins/scripts/generate_duration.py --from-opensearch --duration-file new_test_durations.json"
+                    trtllm_utils.uploadArtifacts("new_test_durations.json", "${UPLOAD_PATH}/test-results/")
                 } catch (Exception e) {
                     // No need to fail the stage if the duration file generation fails
                     echo "An error occurred while generating or uploading the duration file: ${e.toString()}"

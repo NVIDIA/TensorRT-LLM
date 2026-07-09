@@ -137,7 +137,7 @@ pipeline {
                 container('trt-llm') {
                     sh """
                         cd ${LLM_ROOT}
-                        python3 scripts/generate_duration.py \
+                        python3 jenkins/scripts/generate_duration.py \
                             --from-opensearch \
                             --days ${params.DAYS} \
                             --opensearch-url "${OPEN_SEARCH_DB_BASE_URL}" \

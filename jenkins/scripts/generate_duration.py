@@ -35,13 +35,12 @@ OPENSEARCH_INDEX = "df-swdl-trtllm-infra-ci-prod-test_info-*"
 # They can be chained, e.g. "... TIMEOUT (90) ISOLATION".  pytest-native flags
 # such as -k / -m DO change what runs and MUST be preserved.  No node-id
 # parameter list contains a space, so anchoring to the end is safe.
-_TURTLE_DIRECTIVE_RE = re.compile(
-    r"(?:\s+(?:TIMEOUT\s*\(\d+\)|ISOLATION))+\s*$")
+_TURTLE_DIRECTIVE_RE = re.compile(r"(?:\s+(?:TIMEOUT\s*\(\d+\)|ISOLATION))+\s*$")
 
 # Default location of the turtle test-db lists, relative to the repo root.
-_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DEFAULT_TEST_LIST_DIR = os.path.join(_REPO_ROOT, "tests", "integration",
-                                     "test_lists", "test-db")
+# This file lives at <repo>/jenkins/scripts/, so go up three levels.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+DEFAULT_TEST_LIST_DIR = os.path.join(_REPO_ROOT, "tests", "integration", "test_lists", "test-db")
 
 
 def normalize_test_spec(name):
@@ -83,8 +82,8 @@ def query_opensearch_durations(url, credentials, days):
     search_url = f"{url.rstrip('/')}/{OPENSEARCH_INDEX}/_search"
 
     auth = None
-    if credentials and ':' in credentials:
-        user, password = credentials.split(':', 1)
+    if credentials and ":" in credentials:
+        user, password = credentials.split(":", 1)
         auth = (user, password)
 
     test_durations = {}
@@ -94,13 +93,7 @@ def query_opensearch_durations(url, credentials, days):
     while True:
         composite_agg = {
             "size": 1000,
-            "sources": [{
-                "test_name": {
-                    "terms": {
-                        "field": "s_turtle_name"
-                    }
-                }
-            }]
+            "sources": [{"test_name": {"terms": {"field": "s_turtle_name"}}}],
         }
         if after_key is not None:
             composite_agg["after"] = after_key
@@ -109,36 +102,19 @@ def query_opensearch_durations(url, credentials, days):
             "size": 0,
             "query": {
                 "bool": {
-                    "must": [{
-                        "term": {
-                            "s_status": "PASSED"
-                        }
-                    }, {
-                        "range": {
-                            "ts_created": {
-                                "gte": since_ms
-                            }
-                        }
-                    }],
-                    "must_not": [{
-                        "term": {
-                            "s_turtle_name": "Stage Failed"
-                        }
-                    }]
+                    "must": [
+                        {"term": {"s_status": "PASSED"}},
+                        {"range": {"ts_created": {"gte": since_ms}}},
+                    ],
+                    "must_not": [{"term": {"s_turtle_name": "Stage Failed"}}],
                 }
             },
             "aggs": {
                 "by_test": {
                     "composite": composite_agg,
-                    "aggs": {
-                        "avg_duration_ms": {
-                            "avg": {
-                                "field": "l_e2e_time_ms"
-                            }
-                        }
-                    }
+                    "aggs": {"avg_duration_ms": {"avg": {"field": "l_e2e_time_ms"}}},
                 }
-            }
+            },
         }
 
         response = requests.post(search_url, json=query, auth=auth, timeout=60)
@@ -168,36 +144,36 @@ parser.add_argument(
     "--duration-file",
     type=str,
     default="new_test_duration.json",
-    help="Path to the output duration file (default: new_test_duration.json)")
+    help="Path to the output duration file (default: new_test_duration.json)",
+)
 parser.add_argument(
     "--cluster",
     type=str,
     default=None,
     help="Cluster name (e.g. 'aws_dfw').  When set, writes "
     "tests/integration/defs/.test_durations_<cluster> relative to the "
-    "repo root instead of --duration-file.")
-parser.add_argument("--from-opensearch",
-                    action="store_true",
-                    default=False,
-                    help="Query OpenSearch instead of reading local CSV files.")
+    "repo root instead of --duration-file.",
+)
 parser.add_argument(
-    "--days",
-    type=int,
-    default=3,
-    help="Number of days to look back in OpenSearch (default: 3).")
+    "--from-opensearch",
+    action="store_true",
+    default=False,
+    help="Query OpenSearch instead of reading local CSV files.",
+)
+parser.add_argument(
+    "--days", type=int, default=3, help="Number of days to look back in OpenSearch (default: 3)."
+)
 parser.add_argument(
     "--opensearch-url",
     type=str,
     default=None,
-    help=
-    "OpenSearch base URL. Defaults to OPEN_SEARCH_DB_BASE_URL env var or http://gpuwa.nvidia.com/opensearch."
+    help="OpenSearch base URL. Defaults to OPEN_SEARCH_DB_BASE_URL env var or http://gpuwa.nvidia.com/opensearch.",
 )
 parser.add_argument(
     "--opensearch-credentials",
     type=str,
     default=None,
-    help=
-    "OpenSearch credentials as 'user:password'. Defaults to OPEN_SEARCH_DB_CREDENTIALS env var."
+    help="OpenSearch credentials as 'user:password'. Defaults to OPEN_SEARCH_DB_CREDENTIALS env var.",
 )
 parser.add_argument(
     "--test-list-dir",
@@ -205,34 +181,36 @@ parser.add_argument(
     default=DEFAULT_TEST_LIST_DIR,
     help="Directory of turtle test-db YAML lists used to filter OpenSearch "
     "results. Only turtle names present in these lists are written "
-    f"(default: {DEFAULT_TEST_LIST_DIR}).")
+    f"(default: {DEFAULT_TEST_LIST_DIR}).",
+)
 parser.add_argument(
     "--no-filter",
     action="store_true",
     default=False,
-    help="Skip filtering OpenSearch results against the test-db lists.")
+    help="Skip filtering OpenSearch results against the test-db lists.",
+)
 args = parser.parse_args()
 
 # Resolve output path
 if args.cluster:
-    _repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    NEW_TEST_DURATION = os.path.join(_repo_root, "tests", "integration", "defs",
-                                     f".test_durations_{args.cluster}")
+    NEW_TEST_DURATION = os.path.join(
+        _REPO_ROOT, "tests", "integration", "defs", f".test_durations_{args.cluster}"
+    )
 else:
     NEW_TEST_DURATION = args.duration_file
 
 if args.from_opensearch:
-    opensearch_url = (args.opensearch_url
-                      or os.environ.get("OPEN_SEARCH_DB_BASE_URL")
-                      or "http://gpuwa.nvidia.com/opensearch")
-    opensearch_creds = (args.opensearch_credentials
-                        or os.environ.get("OPEN_SEARCH_DB_CREDENTIALS") or "")
-
-    print(
-        f"Querying OpenSearch at {opensearch_url} for last {args.days} day(s)..."
+    opensearch_url = (
+        args.opensearch_url
+        or os.environ.get("OPEN_SEARCH_DB_BASE_URL")
+        or "http://gpuwa.nvidia.com/opensearch"
     )
-    test_durations = query_opensearch_durations(opensearch_url,
-                                                opensearch_creds, args.days)
+    opensearch_creds = (
+        args.opensearch_credentials or os.environ.get("OPEN_SEARCH_DB_CREDENTIALS") or ""
+    )
+
+    print(f"Querying OpenSearch at {opensearch_url} for last {args.days} day(s)...")
+    test_durations = query_opensearch_durations(opensearch_url, opensearch_creds, args.days)
     raw_count = len(test_durations)
 
     # Filter against the turtle test-db lists: an aggregated turtle name may be
@@ -244,11 +222,11 @@ if args.from_opensearch:
         specs = None
     else:
         specs, yml_files = load_test_list_specs(args.test_list_dir)
-        print(f"Loaded {len(specs)} test specs from {len(yml_files)} list(s) "
-              f"in {args.test_list_dir}")
+        print(
+            f"Loaded {len(specs)} test specs from {len(yml_files)} list(s) in {args.test_list_dir}"
+        )
         if not specs:
-            print("  Warning: no test specs loaded; writing all turtle names "
-                  "unfiltered.")
+            print("  Warning: no test specs loaded; writing all turtle names unfiltered.")
         else:
             filtered = {
                 name: dur
@@ -258,7 +236,7 @@ if args.from_opensearch:
             dropped = raw_count - len(filtered)
             test_durations = filtered
 
-    with open(NEW_TEST_DURATION, 'w') as file:
+    with open(NEW_TEST_DURATION, "w") as file:
         json.dump(test_durations, file, indent=3)
 
     print("\nSummary:")
@@ -272,8 +250,7 @@ if args.from_opensearch:
 else:
     # CSV mode: read from local report.csv files produced by the CI run
     TEST_RESULTS_DIR = os.getcwd()
-    all_csv_files = sorted(
-        glob.glob(os.path.join(TEST_RESULTS_DIR, '*/report.csv')))
+    all_csv_files = sorted(glob.glob(os.path.join(TEST_RESULTS_DIR, "*/report.csv")))
 
     print(f"TEST_RESULTS_DIR: {TEST_RESULTS_DIR}")
     print(f"Found {len(all_csv_files)} CSV report file(s)")
@@ -285,14 +262,14 @@ else:
     for report_csv in all_csv_files:
         print(f"Processing {report_csv}...")
         try:
-            with open(report_csv, 'r', newline='') as csv_file:
+            with open(report_csv, "r", newline="") as csv_file:
                 reader = csv.reader(csv_file)
                 for row in reader:
                     if len(row) <= max(STATUS_COLUMN, DURATION_COLUMN):
                         continue
 
                     status = row[STATUS_COLUMN].strip()
-                    if status != 'passed':
+                    if status != "passed":
                         skipped_count += 1
                         continue
 
@@ -300,7 +277,7 @@ else:
                     duration_str = row[DURATION_COLUMN].strip()
 
                     # Remove stage name prefix (everything up to first '/')
-                    test_name = test_id.split('/', 1)[-1]
+                    test_name = test_id.split("/", 1)[-1]
 
                     try:
                         duration = float(duration_str)
@@ -309,9 +286,7 @@ else:
                         try:
                             duration = float(row[-1].strip())
                         except ValueError:
-                            print(
-                                f"  Warning: Could not parse duration for {test_name}. Skipping."
-                            )
+                            print(f"  Warning: Could not parse duration for {test_name}. Skipping.")
                             continue
 
                     test_durations[test_name] = duration
@@ -319,7 +294,7 @@ else:
         except (OSError, csv.Error) as e:
             print(f"  Warning: Failed to process {report_csv}: {e}")
 
-    with open(NEW_TEST_DURATION, 'w') as file:
+    with open(NEW_TEST_DURATION, "w") as file:
         json.dump(test_durations, file, indent=3)
 
     print("\nSummary:")
