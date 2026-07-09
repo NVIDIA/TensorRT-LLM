@@ -2057,6 +2057,12 @@ class TestStrictBaseModelArbitraryArgs:
 
 class TestServeDefaults:
 
+    def test_self_benchmark_config_default_output_path_uses_tempdir(self):
+        config = SelfBenchmarkConfig()
+
+        assert config.output_path == str(
+            Path(tempfile.gettempdir()) / "trtllm_self_benchmark.json")
+
     def test_serve_loads_self_benchmark_config_from_yaml(self):
         llm_args, _ = get_llm_args(model="dummy",
                                    backend="pytorch",

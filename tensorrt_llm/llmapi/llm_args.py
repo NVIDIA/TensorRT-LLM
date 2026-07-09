@@ -18,6 +18,7 @@ import functools
 import json
 import math
 import os
+import tempfile
 import types
 from abc import ABC, abstractmethod
 from collections import defaultdict
@@ -86,6 +87,8 @@ from .utils import (StrictBaseModel, generate_api_docs_as_docstring,
 
 TypeBaseModel = TypeVar("T", bound=BaseModel)
 _TRTLLM_JSON_SCHEMA_EXTRA_ATTR = "_trtllm_json_schema_extra"
+_DEFAULT_SELF_BENCHMARK_OUTPUT_PATH = os.path.join(
+    tempfile.gettempdir(), "trtllm_self_benchmark.json")
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.virtual_memory import \
@@ -2720,7 +2723,7 @@ class SelfBenchmarkConfig(StrictBaseModel):
         status="prototype")
 
     output_path: str = Field(
-        default="/tmp/trtllm_self_benchmark.json",
+        default=_DEFAULT_SELF_BENCHMARK_OUTPUT_PATH,
         description="Path to write self-benchmark results JSON.",
         status="prototype")
 
