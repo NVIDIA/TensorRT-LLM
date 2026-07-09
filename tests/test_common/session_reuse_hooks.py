@@ -11,6 +11,24 @@ not even the tensorrt_llm import.
 
 from test_common.session_reuse import REUSE
 
+# Node-id substrings that are opted out of session reuse as a class, in
+# addition to the per-test ``private_mpi_session`` marker. AutoDeploy's
+# executor adapter keeps worker-process state sized for the previous engine's
+# config (graph/sequence-length shaped buffers); on a reused pool the next
+# test hits e.g. "The expanded size of the tensor (128) must match the
+# existing size (256)". Remove entries once the underlying state is
+# re-initialized per engine.
+_PRIVATE_NODEID_PATTERNS = (
+    "autodeploy",
+    "auto_deploy",
+    "/test_ad_",
+)
+
+
+def _is_private_nodeid(nodeid: str) -> bool:
+    lowered = nodeid.lower()
+    return any(pat in lowered for pat in _PRIVATE_NODEID_PATTERNS)
+
 
 def pytest_configure(config):
     config.addinivalue_line(
@@ -25,7 +43,9 @@ def pytest_configure(config):
 def pytest_runtest_setup(item):
     if not REUSE.enabled:
         return
-    opt_out = item.get_closest_marker("private_mpi_session") is not None
+    opt_out = item.get_closest_marker("private_mpi_session") is not None or _is_private_nodeid(
+        item.nodeid
+    )
     if opt_out:
         REUSE.drain()
     REUSE.suspend(opt_out)

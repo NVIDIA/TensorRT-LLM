@@ -176,3 +176,22 @@ def test_drain_shuts_cached_pools(reuse_cache):
     s.shutdown()
     reuse_cache.drain()
     assert real.shut
+
+
+def test_autodeploy_nodeids_are_private():
+    from test_common.session_reuse_hooks import _is_private_nodeid
+
+    assert _is_private_nodeid(
+        "accuracy/test_llm_api_autodeploy.py::TestModelRegistryAccuracy::"
+        "test_autodeploy_from_registry[m-True]"
+    )
+    assert _is_private_nodeid(
+        "examples/test_ad_guided_decoding.py::test_autodeploy_guided_decoding_main_json"
+    )
+    assert _is_private_nodeid("unittest/_torch/auto_deploy/unit/singlegpu/test_x.py::test_y")
+    assert not _is_private_nodeid(
+        "accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4_4gpus[a]"
+    )
+    assert not _is_private_nodeid(
+        "unittest/_torch/speculative/test_eagle3.py::test_llama_eagle3[x]"
+    )
