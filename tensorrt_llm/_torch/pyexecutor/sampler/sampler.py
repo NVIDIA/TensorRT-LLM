@@ -1113,8 +1113,6 @@ class SampleStateTensorsHostTorch(SampleStateTensors):
 @dataclass(kw_only=True)
 class SampleStateTorch(SampleState[SampleStateTensorsHostTorch, SampleStateTensors]):
     beam_history_builders: list[BeamHistoryBuilder | None] | None = None
-    use_host_stop_criteria: bool = False
-    """Whether update_requests should evaluate end-ID and length limits on the host."""
 
 
 @dataclass(kw_only=True, frozen=True)
@@ -2454,21 +2452,6 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 return False
         return True
 
-    def _can_use_host_stop_criteria(self, requests: list[LlmRequest]) -> bool:
-        """Check whether stop criteria can be evaluated from the host token copy.
-
-        The non-speculative, single-beam path already copies sampled tokens to
-        the host. When no request has stop words, checking end IDs and length
-        limits on the host avoids the device finish-reason kernels and their
-        additional D2H copy.
-        """
-        return (
-            bool(requests)
-            and self.max_tokens == 1
-            and self.max_beam_width == 1
-            and all(not req.py_is_draft and not req.py_stop_words_list for req in requests)
-        )
-
     @staticmethod
     def _meet_max_token_stop_criteria(
         request: LlmRequest, max_seq_len: int, beam_idx: int = DEFAULT_BEAM_IDX
@@ -3736,23 +3719,13 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 req.py_rewind_len = 0
             else:
                 processed = 1
-                if state.use_host_stop_criteria:
-                    new_token = add_token(req, new_tokens_list, beam_idx=DEFAULT_BEAM_IDX)
-                    self._handle_stop_criteria(
-                        req,
-                        new_token,
-                        max_seq_len=self.max_seq_len,
-                        beam_idx=DEFAULT_BEAM_IDX,
-                    )
-                    num_accepted = 0
-                else:
-                    num_accepted = self.process_draft_tokens(
-                        req,
-                        new_tokens_tensor=new_tokens,
-                        new_tokens_list=new_tokens_list,
-                        finish_reasons=finish_reasons,
-                        resource_manager=resource_manager,
-                    )
+                num_accepted = self.process_draft_tokens(
+                    req,
+                    new_tokens_tensor=new_tokens,
+                    new_tokens_list=new_tokens_list,
+                    finish_reasons=finish_reasons,
+                    resource_manager=resource_manager,
+                )
                 if (actual_draft_len := get_draft_token_length(req)) > 0:
                     req.py_num_accepted_draft_tokens = num_accepted
                     req.py_rewind_len = actual_draft_len - num_accepted
@@ -3811,10 +3784,10 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         (
             requests,
             seq_slots_host,
+            seq_lens_host,
             seq_slots_cuda,
             seq_lens_cuda,
             new_tokens_host,
-            use_host_stop_criteria,
         ) = self._process_requests(
             scheduled_requests,
             model_outputs,
@@ -3828,8 +3801,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         # Forwarded to _record_sampler_event so SamplerEvent.synchronize
         # awaits any side-stream D2H copies host-side.
         side_stream_event: torch.cuda.Event | None = None
-        if requests and not use_host_stop_criteria:
-            assert seq_lens_cuda is not None
+        if requests:
             beam_search_store = self.store.beam_search_store
             assert self._use_beam_search == (beam_search_store is not None)
             # Prepare stop word handling
@@ -3895,7 +3867,6 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             ),
             sampler_event=sampler_event,
             beam_history_builders=beam_history_builders,
-            use_host_stop_criteria=use_host_stop_criteria,
         )
 
     @staticmethod
@@ -4679,12 +4650,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         new_tokens_cuda: torch.Tensor,
         num_context_logits_prefix_sum: list[int],
     ) -> tuple[
-        list[LlmRequest],
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor | None,
-        torch.Tensor,
-        bool,
+        list[LlmRequest], torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
     ]:
         raw_logits_cuda = model_outputs["logits"]
 
@@ -4697,11 +4663,6 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         if return_log_probs:
             self._prepare_log_probs(sampling_requests)
 
-        use_fast_greedy_path = self._can_use_fast_greedy_path(sampling_requests)
-        use_host_stop_criteria = use_fast_greedy_path and self._can_use_host_stop_criteria(
-            sampling_requests
-        )
-
         seq_slots_host = torch.tensor(
             [r.py_seq_slot for r in sampling_requests],
             dtype=torch.int32,
@@ -4709,24 +4670,18 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         )
 
         # necessary for beam search and max_length checks
-        seq_lens_host = (
-            None
-            if use_host_stop_criteria
-            else torch.tensor(
-                [r.max_beam_num_tokens for r in sampling_requests],
-                dtype=torch.int32,
-                pin_memory=prefer_pinned(),
-            )
+        seq_lens_host = torch.tensor(
+            [r.max_beam_num_tokens for r in sampling_requests],
+            dtype=torch.int32,
+            pin_memory=prefer_pinned(),
         )
 
-        # Cast seq_slots / seq_lens to CUDA exactly once. The fast host stop-
-        # criteria path only needs seq_slots for scattering sampled tokens;
-        # all other paths also consume seq_lens in device-side finish handling
-        # or beam-search metadata.
+        # Cast seq_slots / seq_lens to CUDA exactly once; consumed by both
+        # the per-group beam-search metadata builder and the finish-reasons
+        # handler in sample_async. int64 is required for the index_*_ ops
+        # downstream.
         seq_slots_cuda = seq_slots_host.to(device="cuda", dtype=torch.int64, non_blocking=True)
-        seq_lens_cuda = (
-            None if seq_lens_host is None else seq_lens_host.to(device="cuda", non_blocking=True)
-        )
+        seq_lens_cuda = seq_lens_host.to(device="cuda", non_blocking=True)
 
         # Handle embedding bias
         self._apply_embedding_bias(
@@ -4741,25 +4696,19 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         )
 
         # Fast path for greedy sampling
-        if use_fast_greedy_path:
-            if use_host_stop_criteria:
-                # There is exactly one token and one beam per request, so the
-                # linearized destination indices are the sequence slots.
-                batch_dest_indices_cuda = seq_slots_cuda
-            else:
-                # Compute destination indices on CPU (same pattern as
-                # _unbatch_sampling_results).
-                batch_destination_indexer = _UnpackedStepIndexer(
-                    seq_slots=seq_slots_host,
-                    num_steps=sampling_requests_metadata.req_num_generated_tokens,
-                    steps_dim_size=new_tokens_cuda.size(0),
-                    slots_dim_size=new_tokens_cuda.size(1),
-                    dim_order=_UnpackedStepIndexer.DimOrder.STEP_MAJOR,
-                    index_dtype=torch.int64,
-                )
-                batch_dest_indices_cuda = batch_destination_indexer[:].to(
-                    new_tokens_cuda.device, non_blocking=True
-                )
+        if self._can_use_fast_greedy_path(sampling_requests):
+            # Compute destination indices on CPU (same pattern as _unbatch_sampling_results)
+            batch_destination_indexer = _UnpackedStepIndexer(
+                seq_slots=seq_slots_host,
+                num_steps=sampling_requests_metadata.req_num_generated_tokens,
+                steps_dim_size=new_tokens_cuda.size(0),
+                slots_dim_size=new_tokens_cuda.size(1),
+                dim_order=_UnpackedStepIndexer.DimOrder.STEP_MAJOR,
+                index_dtype=torch.int64,
+            )
+            batch_dest_indices_cuda = batch_destination_indexer[:].to(
+                new_tokens_cuda.device, non_blocking=True
+            )
 
             # Get d2t tensor if present
             d2t = model_outputs.get("d2t", None)
@@ -4777,10 +4726,10 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             return (
                 sampling_requests,
                 seq_slots_host,
+                seq_lens_host,
                 seq_slots_cuda,
                 seq_lens_cuda,
                 new_tokens_host,
-                use_host_stop_criteria,
             )
 
         # Indexer for accessing tokens in 'logits_cuda', corresponding to the
@@ -4793,8 +4742,6 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         )
 
         # Perform sampling in batches
-        assert seq_lens_host is not None
-        assert seq_lens_cuda is not None
         batched_sampling_result = self._sample_batched_by_strategy(
             logits_cuda,
             sampling_requests,
@@ -4832,10 +4779,10 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         return (
             sampling_requests,
             seq_slots_host,
+            seq_lens_host,
             seq_slots_cuda,
             seq_lens_cuda,
             new_tokens_host,
-            use_host_stop_criteria,
         )
 
     @override
