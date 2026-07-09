@@ -13,7 +13,7 @@ Provides:
 
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import List, Optional, Sequence
 
 import torch
 
@@ -444,11 +444,12 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
 
     def _get_batch_cache_indices_by_pool_id(
         self,
-        request_ids,
+        request_ids: List[int],
         *,
         pool_id: int = 0,
         is_kv_aggregate: bool = True,
-    ):
+        num_blocks_per_seq: Optional[Sequence[int]] = None,
+    ) -> List[List[int]]:
         """Return per-request slot ids in ``[0, num_slots)`` directly.
 
         The base method converts slot ids to V1-style block ids via
@@ -465,8 +466,12 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         padding contract.
         """
         res = []
-        for req_id in request_ids:
-            idx_tensor = torch.as_tensor(self.kv_cache_map[req_id].get_base_page_indices(pool_id))
+        for req_idx, req_id in enumerate(request_ids):
+            kv_cache = self.kv_cache_map[req_id]
+            num_blocks = kv_cache.num_blocks
+            if num_blocks_per_seq is not None:
+                num_blocks = min(num_blocks, num_blocks_per_seq[req_idx])
+            idx_tensor = torch.as_tensor(kv_cache.get_base_page_indices(pool_id)[:num_blocks])
             res.append(
                 (
                     torch.where(
