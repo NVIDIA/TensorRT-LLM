@@ -1094,6 +1094,24 @@ if IS_MEGAMOE_OP_AVAILABLE:
         _, shared_bytes = probe.get_workspace_sizes()
         return int(shared_bytes)
 
+    def _megamoe_autotune_num_tokens(shapes: List[torch.Size]) -> int:
+        """Shape-derivation rule: the activation token count (input[0] dim0)
+        drives every other tensor's leading axis.
+
+        Module-scope on purpose: ``ConstraintSpec`` hashes include the
+        callable and the AutoTuner's unbounded profile lru_cache keys on
+        those specs -- a per-call closure would defeat that memoization and
+        leak one dead cache entry per eager op call.
+        """
+        return shapes[0][0]
+
+    # Deliberately NO tuning-config cache on the runner: ``TuningConfig``
+    # embeds ``inputs_pre_hook``, a bound method that reads the CURRENT
+    # runner's ``_profiling_scratch``. The op rebuilds a runner per call,
+    # so a class-scope cache would keep serving a hook bound to a dead
+    # runner whose scratch is stale/cleared -- profiling would then mix
+    # non-symmetric tensors with the new runner's peer offsets. Rebuilding
+    # the small config per call costs microseconds.
     class Sm100MegaMoENvfp4Runner(TunableRunner):
         """TunableRunner for the ported MegaMoE CuteDSL NVFP4 kernel.
 
@@ -1106,13 +1124,6 @@ if IS_MEGAMOE_OP_AVAILABLE:
 
         # Module-scope compile cache shared by every runner instance.
         kernel_cache: dict = {}
-
-        # Module-scope tuning-config cache keyed on ``unique_id()``. The op
-        # rebuilds a runner per call, so an instance-level cache would never
-        # hit; keeping it at class scope amortizes the config build across
-        # calls (mirrors the ``tuning_config_cache`` of the CuteDSL
-        # grouped-gemm runners in ``cute_dsl_custom_ops.py``).
-        tuning_config_cache: dict = {}
 
         def __init__(
             self,
@@ -1321,26 +1332,14 @@ if IS_MEGAMOE_OP_AVAILABLE:
             autotuner does not double-enumerate tile sizes for
             independent token axes.
 
-            Cached at class scope keyed on ``unique_id()``: every field below
-            is constant except ``inputs_pre_hook`` and ``tune_max_num_tokens``.
-            ``inputs_pre_hook`` is a bound method that only reads
-            ``num_experts_per_rank`` / ``world_size`` and ``tune_max_num_tokens``
-            is ``max_tokens_per_rank`` -- all three are part of ``unique_id()``,
-            so two runners that map to the same key share a functionally
-            identical config. (Mirrors the ``tuning_config_cache`` pattern of
-            the CuteDSL grouped-gemm runners.)
+            Rebuilt on every call, NEVER cached across runners:
+            ``inputs_pre_hook`` is a bound method that reads THIS runner's
+            ``_profiling_scratch`` (set per op call, before this config is
+            built). A cross-runner cache would hand the autotuner a hook
+            bound to a dead runner with a stale/cleared scratch, mixing
+            non-symmetric profiling tensors with the live runner's peer
+            offsets (CUDA illegal access + peer barrier hang class).
             """
-            key = self.unique_id()
-            cached = self.__class__.tuning_config_cache.get(key)
-            if cached is not None:
-                return cached
-
-            # Constraints reuse the runner's own shape-derivation rules
-            # (the activation token count drives every other tensor's
-            # leading axis). We pass shape-derivation lambdas that pull
-            # the runtime ``num_tokens`` from input[0].
-            def _num_tokens(shapes: List[torch.Size]) -> int:
-                return shapes[0][0]
 
             config = TuningConfig(
                 dynamic_tensor_specs=(
@@ -1348,13 +1347,15 @@ if IS_MEGAMOE_OP_AVAILABLE:
                         0, 0, get_last_power_of_2_num_tokens_buckets, last_positive_power_of_2
                     ),
                 ),
+                # Constraints reuse the module-scope shape-derivation rule
+                # (stable callable identity -- see _megamoe_autotune_num_tokens).
                 constraint_specs=(
-                    ConstraintSpec(1, 0, _num_tokens),  # activation_sf
-                    ConstraintSpec(2, 0, _num_tokens),  # topk_idx
-                    ConstraintSpec(3, 0, _num_tokens),  # topk_weights
+                    ConstraintSpec(1, 0, _megamoe_autotune_num_tokens),  # activation_sf
+                    ConstraintSpec(2, 0, _megamoe_autotune_num_tokens),  # topk_idx
+                    ConstraintSpec(3, 0, _megamoe_autotune_num_tokens),  # topk_weights
                     # combine_output moved from idx 8 -> 11 after inserting
                     # fc1_alpha(8) / fc2_alpha(9) / fc1_norm_const(10).
-                    ConstraintSpec(11, 0, _num_tokens),  # combine_output
+                    ConstraintSpec(11, 0, _megamoe_autotune_num_tokens),  # combine_output
                 ),
                 inputs_pre_hook=self._autotuner_inputs_pre_hook,
                 # MUST stay False for multi-rank MegaMoE. ``use_cold_l2_cache``
@@ -1405,7 +1406,6 @@ if IS_MEGAMOE_OP_AVAILABLE:
                 # used here.
                 distributed_tuning_strategy=DistributedTuningStrategy.MERGE,
             )
-            self.__class__.tuning_config_cache[key] = config
             return config
 
         def _build_kernel(self, tactic: Tuple):

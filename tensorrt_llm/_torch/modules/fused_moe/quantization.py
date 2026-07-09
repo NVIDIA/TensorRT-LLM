@@ -2997,6 +2997,9 @@ class NVFP4MegaMoECuteDslMethod(NVFP4FusedMoEMethod):
     _STREAMED_SOURCE_PARAMS = ("w3_w1_weight", "w3_w1_weight_scale",
                                "w2_weight", "w2_weight_scale")
 
+    # One-time (process-wide) dynamic-EPLB memory-residency warning latch.
+    _warned_dynamic_eplb_residency = False
+
     # -----------------------------------------------------------------
     # create_weights: register MegaMoE-format parameters in addition to
     # the grandparent's standard NVFP4 parameters.
@@ -3237,6 +3240,12 @@ class NVFP4MegaMoECuteDslMethod(NVFP4FusedMoEMethod):
         cast_w2_weight_shard = self._maybe_padding_shape(
             cast_w2_weight_shard, dst_w2_weight)
         dst_w2_weight.copy_(cast_w2_weight_shard, non_blocking=True)
+        # Streamed-coverage bookkeeping (no expert_idx in this hook: the dst
+        # row view's data_ptr identifies the slot). Consumed by the finalize
+        # coverage guard in ``process_weights_after_loading``.
+        if not hasattr(module, '_streamed_w2_covered'):
+            module._streamed_w2_covered = set()
+        module._streamed_w2_covered.add(dst_w2_weight.data_ptr())
 
     def load_expert_w3_w1_weight_scale_nvfp4(
             self,
@@ -3297,6 +3306,10 @@ class NVFP4MegaMoECuteDslMethod(NVFP4FusedMoEMethod):
         cast_w2_weight_scale = self._maybe_padding_shape(
             cast_w2_weight_scale, dst_w2_weight_scale)
         dst_w2_weight_scale.copy_(cast_w2_weight_scale)
+        # Streamed-coverage bookkeeping, mirroring ``load_expert_w2_weight``.
+        if not hasattr(module, '_streamed_w2_scale_covered'):
+            module._streamed_w2_scale_covered = set()
+        module._streamed_w2_scale_covered.add(dst_w2_weight_scale.data_ptr())
 
     @staticmethod
     def _maybe_padding_shape(source_tensor: torch.Tensor,
@@ -3336,20 +3349,59 @@ class NVFP4MegaMoECuteDslMethod(NVFP4FusedMoEMethod):
                 and not hasattr(module, 'tmp_cutlass_w3_w1_weights')):
             return
         # A load that rematerialized the streamed sources must cover every
-        # local expert: the fresh buffers are uninitialized, so packing a
-        # partially-covered module would bake garbage rows into the mega_*
-        # buffers (silent corruption). The w3_w1 stash holds one entry per
-        # covered expert (routed slots, plus EPLB shared staging if any).
+        # local expert FOR EVERY COMPONENT: the fresh buffers are
+        # uninitialized, so packing a partially-covered module would bake
+        # garbage rows into the mega_* buffers (silent corruption). Checked
+        # per component -- a stash entry only counts when BOTH halves
+        # arrived (a w1-only shard creates an entry the packing loop then
+        # skips), and the direct-copy w2 paths are tracked via the
+        # ``_streamed_w2*_covered`` row-pointer sets. Routed slots are told
+        # apart from EPLB shared-staging entries by their storage base.
         if getattr(module, "_streamed_sources_rematerialized", False):
-            covered = len(getattr(module, 'tmp_cutlass_w3_w1_weights', ()))
             n_slots = module.expert_size_per_partition
-            if covered < n_slots:
+
+            def _stash_covered(stash_name: str, param) -> int:
+                base = param.data.storage().data_ptr()
+                stash = getattr(module, stash_name, {})
+                return sum(1 for (b, _idx), e in stash.items()
+                           if b == base and 'w1' in e and 'w3' in e)
+
+            def _rows_covered(set_name: str, param) -> int:
+                # Tensor (not storage) base: the recorded row addresses came
+                # from ``dst.data_ptr()`` of slices of this tensor.
+                base = param.data.data_ptr()
+                end = base + param.data.numel() * param.data.element_size()
+                ptrs = getattr(module, set_name, ())
+                return sum(1 for p in ptrs if base <= p < end)
+
+            coverage = {
+                'w3_w1_weight':
+                _stash_covered('tmp_cutlass_w3_w1_weights',
+                               module.w3_w1_weight),
+                'w3_w1_weight_scale':
+                _stash_covered('tmp_cutlass_w3_w1_weight_scales',
+                               module.w3_w1_weight_scale),
+                'w2_weight':
+                _rows_covered('_streamed_w2_covered', module.w2_weight),
+                'w2_weight_scale':
+                _rows_covered('_streamed_w2_scale_covered',
+                              module.w2_weight_scale),
+            }
+            incomplete = {k: v for k, v in coverage.items() if v < n_slots}
+            if incomplete:
                 raise RuntimeError(
-                    f"MegaMoE-CuteDSL streamed (re)load covered only "
-                    f"{covered}/{n_slots} local experts of this module; the "
-                    f"uncovered source rows are uninitialized. A (re)load "
-                    f"must cover every local expert of a touched module.")
+                    "MegaMoE-CuteDSL streamed (re)load left source components "
+                    f"partially covered ({n_slots} local experts required per "
+                    "component): " + ", ".join(f"{k}={v}/{n_slots}"
+                                               for k, v in incomplete.items()) +
+                    ". The uncovered rows are uninitialized. A (re)load must "
+                    "deliver w1+w3+w2 weights AND block scales for every "
+                    "local expert of a touched module; aux-only expert "
+                    "updates are unsupported once the sources were freed.")
             module._streamed_sources_rematerialized = False
+        for _attr in ('_streamed_w2_covered', '_streamed_w2_scale_covered'):
+            if hasattr(module, _attr):
+                delattr(module, _attr)
         # ---- Cat raw w3+w1 weights ----
         # Iterates BOTH routed (module.w3_w1_weight.data) and shared
         # (module.local_shared_w3_w1_tensors) entries: the loader keys
@@ -3422,11 +3474,26 @@ class NVFP4MegaMoECuteDslMethod(NVFP4FusedMoEMethod):
         # ``run_moe`` reads only ``mega_fc1/fc2_weight(_sf)``; the source
         # ``w3_w1_weight`` / ``w2_weight`` (+ block scales) were fully consumed
         # by ``_build_mega_format_weights`` above and are never read at runtime.
-        # Free them -- EXCEPT under dynamic EPLB (``need_load_shared_weights``),
-        # which re-reads the source to rebuild mega buffers. Freeing goes through
-        # ``replace_parameter_and_save_metadata`` so ``pre_reload_weights`` can
-        # restore the original shape on a later reload.
-        if not self.need_load_shared_weights(module):
+        # Free them -- EXCEPT under dynamic EPLB (``need_load_shared_weights``):
+        # not because the kernel reads them, but because the inherited load-
+        # balancer plumbing (base ``post_load_weights`` and the NVFP4 parent's
+        # scale registration) registers the RAW params as migration targets;
+        # a 0-element placeholder would IndexError when the balancer slices
+        # per-slot weights. Cost: the raw source set stays resident alongside
+        # the mega_* buffers (~2x expert-weight footprint). Deriving-only
+        # registration (as MegaMoE-DeepGemm does) is the tracked follow-up.
+        # Freeing goes through ``replace_parameter_and_save_metadata`` so
+        # ``pre_reload_weights`` can restore the original shape on reload.
+        if self.need_load_shared_weights(module):
+            if not NVFP4MegaMoECuteDslMethod._warned_dynamic_eplb_residency:
+                NVFP4MegaMoECuteDslMethod._warned_dynamic_eplb_residency = True
+                logger.warning(
+                    "[MegaMoE-CuteDSL] dynamic EPLB keeps the raw NVFP4 "
+                    "source weights resident next to the packed mega buffers "
+                    "(~2x expert-weight memory, ~229 GB/rank on DSv4-Pro "
+                    "EP8). Use static EPLB or more memory headroom until "
+                    "derived-only migration registration lands.")
+        else:
             for _name in self._STREAMED_SOURCE_PARAMS:
                 _p = getattr(module, _name, None)
                 if _p is not None and _p.data.numel() > 0:
