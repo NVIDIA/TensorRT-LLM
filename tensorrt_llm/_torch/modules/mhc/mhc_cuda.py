@@ -695,48 +695,32 @@ def _fused_hc_call(
 
 
 class _FusedHcWorkspaceCache:
-    """Size-keyed bounded LRU for the 4 outputs + 3 workspaces of mhc_fused_hc.
+    """Forward-scoped single-slot reuse for the outputs + workspaces of
+    mhc_fused_hc: no LRU, no eviction.
 
-    The 4 outputs are consumed by the caller (so they can't alias across
-    calls at different B), but repeatedly calling ``torch.empty`` for each
-    call inside a CUDA-graph-captured inference loop is wasteful. Keyed on
-    ``(B, ws_ks, tile_m, device)``: same-shape calls reuse the previously
-    allocated buffers; tensors are stable across graph captures (same ptr
-    under the torch allocator's retained block).
+    All ~60 mHC layers share one runner and run a forward at the same ``B``, so
+    the only useful reuse is within a forward -- layer 0 allocates the set and
+    layers 1..N reuse it. Exactly one set is cached at a time, keyed on
+    ``(B, ws_ks, m_batches, device)``; a shape change just replaces the slot.
 
-    Two bounds keep this from ballooning:
-
-    1. ``_CACHE_MAX_B``: a per-call threshold. Only cache when the request's
-       residual_cur footprint is modest (B * n * hidden * 2 bytes; e.g. at
-       n=4 hidden=4096 that's 32 KB/token, so a 256-token cap = 8 MB/entry).
-       Prefill shapes (B in the tens of thousands) flow straight through to
-       ``torch.empty``, which the torch caching allocator already keeps
-       cheap on repeated calls.
-    2. ``_maxsize``: LRU cap on the number of cached entries. Covers the
-       discrete CUDA-graph decode batch sizes plus a few stragglers; decode
-       is the only regime that actually benefits from the cache.
-
-    Without these bounds every distinct prefill B leaks ~B * n * hidden * 2
-    bytes (≈1.3 GB at B=32768, n=4, hidden=4096). Under a prefill ramp-up
-    admitting one new ctx request per iter, the leak reaches tens of GB per
-    rank within a dozen iters and blows past HBM.
+    Capture and large-prefill shapes bypass the slot (see ``get``). This matters
+    for correctness: a bounded LRU here previously freed a workspace still
+    referenced by a captured CUDA graph, causing an illegal memory access
+    (WARP_MMU_FAULT in mhcBigFuseKernel).
     """
 
-    __slots__ = ("n", "hidden_size", "_cache", "_maxsize")
+    __slots__ = ("n", "hidden_size", "_slot_key", "_slot_val")
 
-    # Up to 48 distinct entries — covers the 35 CUDA-graph decode buckets
-    # plus headroom. Each entry at B<=256 is under ~10 MB.
-    DEFAULT_MAXSIZE = 48
-    # Skip the cache above this B; prefill rides the torch allocator.
+    # Skip the slot above this B; prefill rides the torch allocator.
     _CACHE_MAX_B = 256
 
-    def __init__(self, n: int, hidden_size: int, maxsize: int = DEFAULT_MAXSIZE):
+    def __init__(self, n: int, hidden_size: int, maxsize: int = None):
+        # ``maxsize`` kept for backward-compatible construction; unused now that
+        # the reuse is a single forward-scoped slot rather than a bounded LRU.
         self.n = n
         self.hidden_size = hidden_size
-        self._maxsize = maxsize
-        from collections import OrderedDict
-
-        self._cache: "OrderedDict" = OrderedDict()
+        self._slot_key = None
+        self._slot_val = None
 
     def get(self, B: int, num_k_splits: int, tile_m: int, device):
         n = self.n
@@ -769,19 +753,25 @@ class _FusedHcWorkspaceCache:
                 done_counter_ws,
             )
 
-        if B > self._CACHE_MAX_B:
+        # Bypass the slot (allocate fresh) when reuse would be unsafe or wasteful:
+        #  - CUDA-graph capture: each per-batch-size graph is captured in turn and
+        #    replays raw pointers into its workspace, so it must own that buffer
+        #    for its lifetime. Sharing a slot would free an earlier graph's buffer
+        #    when the next size is captured -> IMA on replay. Fresh allocs are
+        #    retained by the graph's private mempool instead.
+        #  - large prefill B: a single set can be ~1 GB; leave those to the torch
+        #    allocator rather than pin one in the slot.
+        if torch.cuda.is_current_stream_capturing() or B > self._CACHE_MAX_B:
             return _alloc()
 
+        # Eager decode: reuse one set across the forward's same-B layers; a shape
+        # change replaces it. These buffers are never captured, so freeing the
+        # previous set is always safe.
         key = (B, ws_ks, m_batches, device)
-        hit = self._cache.get(key)
-        if hit is not None:
-            self._cache.move_to_end(key)
-            return hit
-        entry = _alloc()
-        self._cache[key] = entry
-        if len(self._cache) > self._maxsize:
-            self._cache.popitem(last=False)
-        return entry
+        if self._slot_key != key:
+            self._slot_key = key
+            self._slot_val = _alloc()
+        return self._slot_val
 
 
 def _alloc_fused_hc_outputs(
