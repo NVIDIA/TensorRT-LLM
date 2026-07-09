@@ -139,6 +139,7 @@ class TrtllmAttentionMetadata:
         else:
             seq_lens_tensor = seq_lens.to(dtype=torch.int32)
         max_seq_len = seq_lens_tensor.max().item()
+        # Keep CUDA graph-captured metadata buffers stable per batch/seq-lens shape.
         cache_key = (batch_size, tuple(int(x) for x in seq_lens_tensor.tolist()))
 
         cached = self._metadata_cache.get(cache_key)
