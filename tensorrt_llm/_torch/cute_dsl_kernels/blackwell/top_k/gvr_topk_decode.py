@@ -252,9 +252,9 @@ class GvrTopKKernel:
         self.seqlen_sorted = seqlen_sorted
         # SMEM slice cache (optional): pre-stage each CTA's slice into SMEM
         # once between Phase 1 and Phase 2, so Phase 2/3's GE-count scans
-        # read LDS instead of re-streaming GMEM. Requires
-        # ``slice_len <= smem_cache_elems`` at runtime (wrapper auto-disables
-        # otherwise); ``smem_cache_elems`` also sets the JIT-time alloc size.
+        # read LDS instead of re-streaming GMEM. Caller is responsible for
+        # ensuring slice_len <= smem_cache_elems; ``smem_cache_elems`` sets
+        # the JIT-time alloc size (see TODO at _compile for host-side assert).
         if enable_smem_cache and smem_cache_elems <= 0:
             raise ValueError("smem_cache_elems must be > 0 when enable_smem_cache")
         self.enable_smem_cache = enable_smem_cache
@@ -1966,9 +1966,9 @@ class GvrTopKKernel:
             s_cluster_partial = None
 
         # SMEM slice cache (optional). Sized in ``self.dtype`` so the same
-        # vec_w-wide LDG→STS→LDS pipeline works for fp32/bf16/fp16. The
-        # wrapper auto-disables this when slice_len > smem_cache_elems
-        # (e.g. cs=2 + N>64K, cs=4 + N>128K).
+        # vec_w-wide LDG→STS→LDS pipeline works for fp32/bf16/fp16.
+        # enable_smem_cache=False by default; caller ensures slice_len <=
+        # smem_cache_elems before enabling (no runtime guard in kernel).
         if cutlass.const_expr(self.enable_smem_cache):
             smem_input = smem.allocate_tensor(
                 element_type=self.dtype,
