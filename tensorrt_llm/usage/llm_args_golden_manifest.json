@@ -187,9 +187,10 @@
     {
       "allowed_values": [
         "CPP",
-        "PYTHON"
+        "PYTHON",
+        "auto"
       ],
-      "annotation": "Optional[Literal['CPP', 'PYTHON']]",
+      "annotation": "Optional[Literal['CPP', 'PYTHON', 'auto']]",
       "converter": "",
       "kind": "categorical",
       "path": "cache_transceiver_config.transceiver_runtime"
