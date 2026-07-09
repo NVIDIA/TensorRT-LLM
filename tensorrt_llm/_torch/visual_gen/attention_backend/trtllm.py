@@ -122,6 +122,11 @@ class TrtllmAttentionMetadata:
         )
         self._prepared = False  # Reset prepare state on new metadata
 
+    def _select_cached_metadata(self, cached) -> None:
+        self._metadata = cached["metadata"]
+        self._prepared = cached["prepared"]
+        self._cached_seq_lens = cached["seq_lens"]
+
     def prepare(
         self,
         batch_size: int,
@@ -145,17 +150,14 @@ class TrtllmAttentionMetadata:
         cached = self._metadata_cache.get(cache_key)
         if cached is None:
             self._create_metadata(batch_size, max_seq_len)
-            self._cached_seq_lens = None
             cached = {
                 "metadata": self._metadata,
                 "prepared": False,
                 "seq_lens": None,
             }
             self._metadata_cache[cache_key] = cached
-        else:
-            self._metadata = cached["metadata"]
-            self._prepared = cached["prepared"]
-            self._cached_seq_lens = cached["seq_lens"]
+
+        self._select_cached_metadata(cached)
 
         if self._needs_prepare(batch_size, seq_lens_tensor):
             cached_seq_lens = seq_lens_tensor.clone()
@@ -166,10 +168,10 @@ class TrtllmAttentionMetadata:
             self._metadata.prepare()
 
             # Cache per-shape state without sharing the tensor across entries.
-            self._cached_seq_lens = cached_seq_lens
-            self._prepared = True
             cached["prepared"] = True
-            cached["seq_lens"] = self._cached_seq_lens
+            cached["seq_lens"] = cached_seq_lens
+
+            self._select_cached_metadata(cached)
 
         return self._metadata
 
