@@ -1945,25 +1945,12 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                             export PROGRESS_TAR='${progressTar}'
                             export PROGRESS_URL='${progressUrl}'
                             # ---- background watcher: SSH-stat remote XML, SCP, tar, upload ----
-                            (
-                                last=0
-                                while [ ! -f '${pytestDoneFile}' ]; do
-                                    sleep ${PROGRESS_UPLOAD_INTERVAL_SEC}
-                                    [ -f '${pytestDoneFile}' ] && break
-                                    m=\$(${sshStatCmd} 2>/dev/null | tr -dc '0-9')
-                                    [ -z "\$m" ] && m=0
-                                    [ "\$m" -le "\$last" ] && continue
-                                    last=\$m
-                                    mkdir -p '${WORKSPACE}/${stageName}'
-                                    if ! ${scpXmlCmd}; then
-                                        echo "[PROGRESS-UPLOAD] ${stageName}: scp failed; skipping this iteration"
-                                        continue
-                                    fi
-                                    LABEL="sbatch checkpoint (mtime=\$m)" \\
-                                    bash '${WORKSPACE}/jenkins/scripts/progress_upload_snapshot.sh' || continue
-                                done
-                                echo "[PROGRESS-UPLOAD] ${stageName}: track done, watcher exiting"
-                            ) &
+                            PROGRESS_DONE_FILE='${pytestDoneFile}' \\
+                            PROGRESS_INTERVAL=${PROGRESS_UPLOAD_INTERVAL_SEC} \\
+                            LABEL_PREFIX='sbatch checkpoint' \\
+                            SLURM_SSH_STAT_CMD='${sshStatCmd}' \\
+                            SLURM_SCP_XML_CMD='${scpXmlCmd}' \\
+                            bash '${WORKSPACE}/jenkins/scripts/progress_upload_watcher.sh' &
                             WATCHER_PID=\$!
 
                             # ---- foreground track: retry up to 3 times on failure ----
@@ -3509,15 +3496,10 @@ def rerunFailedTests(stageName, llmSrc, testCmdLine, resultFileName="results.xml
                     export PROGRESS_TAR='${rerunProgressTar}'
                     export PROGRESS_URL='${rerunProgressUrl}'
                     # ---- background watcher for rerun${times} ----
-                    (
-                        while [ ! -f '${rerunDoneFile}' ]; do
-                            sleep ${PROGRESS_UPLOAD_INTERVAL_SEC}
-                            [ -f '${rerunDoneFile}' ] && break
-                            LABEL='rerun${times} checkpoint' \\
-                            bash '${WORKSPACE}/jenkins/scripts/progress_upload_snapshot.sh' || continue
-                        done
-                        echo "[PROGRESS-UPLOAD] ${stageName}: rerun${times} watcher exiting"
-                    ) &
+                    PROGRESS_DONE_FILE='${rerunDoneFile}' \\
+                    PROGRESS_INTERVAL=${PROGRESS_UPLOAD_INTERVAL_SEC} \\
+                    LABEL_PREFIX='rerun${times} checkpoint' \\
+                    bash '${WORKSPACE}/jenkins/scripts/progress_upload_watcher.sh' &
                     WATCHER_PID=\$!
 
                     # ---- foreground rerun ----
@@ -4234,20 +4216,11 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                                 export PROGRESS_TAR='${progressTar}'
                                 export PROGRESS_URL='${progressUrl}'
                                 # ---- background watcher ----
-                                (
-                                    last=0
-                                    while [ ! -f '${pytestDoneFile}' ]; do
-                                        sleep ${PROGRESS_UPLOAD_INTERVAL_SEC}
-                                        [ -f '${pytestDoneFile}' ] && break
-                                        xml='${WORKSPACE}/${stageName}/results.xml'
-                                        m=\$(stat -c %Y "\$xml" 2>/dev/null || echo 0)
-                                        [ "\$m" -le "\$last" ] && continue
-                                        last=\$m
-                                        LABEL="checkpoint (mtime=\$m)" \\
-                                        bash '${WORKSPACE}/jenkins/scripts/progress_upload_snapshot.sh' || continue
-                                    done
-                                    echo "[PROGRESS-UPLOAD] ${stageName}: pytest done, watcher exiting"
-                                ) &
+                                PROGRESS_DONE_FILE='${pytestDoneFile}' \\
+                                PROGRESS_INTERVAL=${PROGRESS_UPLOAD_INTERVAL_SEC} \\
+                                LABEL_PREFIX='checkpoint' \\
+                                XML_PATH='${WORKSPACE}/${stageName}/results.xml' \\
+                                bash '${WORKSPACE}/jenkins/scripts/progress_upload_watcher.sh' &
                                 WATCHER_PID=\$!
 
                                 # ---- foreground pytest ----
