@@ -22,8 +22,6 @@ from tensorrt_llm._torch.pyexecutor._util import \
 from tensorrt_llm._torch.pyexecutor.py_executor_creator import \
     _extend_full_attention_windows_for_spec_decode
 from tensorrt_llm._torch.speculative.eagle3 import Eagle3OneModelSpecMetadata
-from tensorrt_llm._torch.speculative.interface import SpeculativeDecodingMode
-from tensorrt_llm._torch.speculative.spec_tree_manager import SpecTreeManager
 from tensorrt_llm.executor.request import LoRARequest
 from tensorrt_llm.llmapi import (CudaGraphConfig, Eagle3DecodingConfig,
                                  KvCacheConfig, MoeConfig, MTPDecodingConfig)
