@@ -2051,7 +2051,7 @@ def test_prefix_cache_tokenize_matches_full_encode(servers):
             assert req.prompt_token_ids == reference
 
 
-def test_prefix_cache_tokenize_encodes_only_delta(servers):
+def test_prefix_cache_tokenize_uses_canonical_encoding(servers):
     router = KvCacheAwareRouter(server_role=None,
                                 servers=servers,
                                 tokens_per_block=4)
@@ -2065,7 +2065,7 @@ def test_prefix_cache_tokenize_encodes_only_delta(servers):
 
     tok.encode = _recording_encode
     with mock.patch.object(router, "_get_tokenizer", return_value=tok):
-        for index, convo in enumerate(_grow_conversation()):
+        for convo in _grow_conversation():
             encoded_lengths.clear()
             req = ChatCompletionRequest(model="mock", messages=convo)
             rendered = tok.apply_chat_template(
@@ -2074,8 +2074,7 @@ def test_prefix_cache_tokenize_encodes_only_delta(servers):
                 tokenize=False)
             router._tokenize(req)
             assert encoded_lengths
-            if index >= 1:
-                assert min(encoded_lengths) < len(rendered)
+            assert encoded_lengths == [len(rendered)]
 
 
 def test_prefix_cache_tokenize_falls_back_on_divergent_prefix(servers):

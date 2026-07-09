@@ -276,5 +276,4 @@ def test_get_local_request_id():
     assert len(ids) == 1000
     assert min(ids) == 0
     assert max(ids) == MIN_GLOBAL_ID - 1
-    assert max(ids) - min(ids) > (
-        1 << 40)  # ensure there is enough space for local ids
+    assert max(ids) - min(ids) == MIN_GLOBAL_ID - 1

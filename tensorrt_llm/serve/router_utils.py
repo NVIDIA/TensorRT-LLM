@@ -21,8 +21,6 @@ import os
 from collections import OrderedDict
 from typing import Iterable, List, Optional, Union
 
-from transformers import AutoTokenizer
-
 from tensorrt_llm.bindings.internal.batch_manager import BlockKey as _NativeBlockKey
 from tensorrt_llm.bindings.internal.batch_manager import BlockKeyHasher as _NativeBlockKeyHasher
 from tensorrt_llm.logger import logger
@@ -202,12 +200,12 @@ class BlockHashMixin:
 
                 self._tokenizers[model] = load_custom_tokenizer(self._custom_tokenizer, model_path)
             else:
-                from tensorrt_llm.tokenizer import maybe_fix_byte_level_tokenizer
+                from tensorrt_llm.tokenizer import TransformersTokenizer
 
-                tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-                self._tokenizers[model] = maybe_fix_byte_level_tokenizer(
-                    tokenizer, model_path, trust_remote_code=True
+                tokenizer = TransformersTokenizer.from_pretrained(
+                    model_path, trust_remote_code=True
                 )
+                self._tokenizers[model] = tokenizer.tokenizer
         return self._tokenizers[model]
 
     def _encode_with_prefix_cache(self, rendered: str, key: int, tokenizer) -> list[int]:
