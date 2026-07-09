@@ -126,7 +126,8 @@ def get_request_num_tokens(request: OpenAIRequest) -> int:
             )
 
         if isinstance(request.prompt, str) or (
-            isinstance(request.prompt, list) and isinstance(request.prompt[0], int)
+            isinstance(request.prompt, list)
+            and (not request.prompt or isinstance(request.prompt[0], int))
         ):
             prompts = [request.prompt]
         else:
@@ -214,9 +215,11 @@ class BlockHashMixin:
         if cache is None:
             cache = self._tok_prefix_cache = OrderedDict()
         entry = cache.get(key)
-        if entry is not None and len(rendered) > len(entry[0]) and rendered.startswith(entry[0]):
-            ids = entry[1] + tokenizer.encode(rendered[len(entry[0]) :], add_special_tokens=False)
+        if entry is not None and rendered == entry[0]:
+            ids = entry[1]
         else:
+            # Tokenizing a suffix independently is not generally composable:
+            # BPE/SentencePiece merges can cross the cached string boundary.
             ids = tokenizer.encode(rendered, add_special_tokens=False)
         cache[key] = (rendered, ids)
         cache.move_to_end(key)
@@ -270,6 +273,8 @@ class BlockHashMixin:
 
         # Handle CompletionRequest (has prompt)
         prompts = request.prompt
+        if isinstance(prompts, list) and not prompts:
+            return [prompts]
         if isinstance(prompts, list) and isinstance(prompts[0], list):
             return prompts
         elif isinstance(prompts, list) and isinstance(prompts[0], int):

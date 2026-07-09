@@ -98,7 +98,7 @@ The context and generation phases of one request must share a single request ID:
 
 The disaggregated server generates this ID itself as a **snowflake** — a self-contained 64-bit positive integer that is unique without any cross-process coordination. The bit layout is:
 
-```
+```text
 [ 0 (1 bit) | timestamp_ms (39 bits) | node_id (8 bits) | process_id (6 bits) | counter (10 bits) ]
 ```
 
@@ -185,7 +185,7 @@ Once the context and generation servers are launched, you can launch the disaggr
 server, which will accept requests from clients and do the orchestration between context
 and generation servers. The disaggregated server can be launched with:
 
-```
+```bash
 trtllm-serve disaggregated -c disagg_config.yaml
 ```
 where `disagg_config.yaml` contains information about the context and generation servers. For the current example,
@@ -295,7 +295,7 @@ generation_servers:
 
 Launch it exactly as before — the coordinator and fleet are started for you:
 
-```
+```bash
 trtllm-serve disaggregated -c disagg_config.yaml
 ```
 

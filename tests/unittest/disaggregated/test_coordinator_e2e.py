@@ -66,9 +66,10 @@ pytestmark = pytest.mark.threadleak(enabled=False)
 
 @pytest.fixture(autouse=True)
 def _reset_prometheus_registry():
-    """Role-prefixed Prometheus counters are registered in the global default
-    registry; clear it between tests so a second server build in the same pytest
-    process does not hit duplicate-timeseries errors.
+    """Reset role-prefixed Prometheus counters.
+
+    Counters use the global default registry, so clear it between tests to avoid
+    duplicate-timeseries errors when another server is built in this process.
     """
     from prometheus_client import REGISTRY
 
@@ -198,7 +199,9 @@ class _ReadinessClient:
 
 
 def _make_config(ctx_url, gen_url, public_port):
-    host_port = lambda u: (u.split(":")[0], int(u.split(":")[1]))
+    def host_port(url):
+        return url.split(":")[0], int(url.split(":")[1])
+
     ctx_host, ctx_port = host_port(ctx_url)
     gen_host, gen_port = host_port(gen_url)
     return DisaggServerConfig(
@@ -286,11 +289,12 @@ def test_disagg_completion_e2e_through_coordinator():
     assert body["choices"][0]["finish_reason"] == "stop"
 
 
-def _write_config(path, ctx_url, gen_url, public_port):
+def _write_config(path, ctx_url, gen_url, public_port, num_workers=1):
     """A disagg config YAML: round-robin ctx, conversation gen (delegated)."""
     cfg = {
         "hostname": "127.0.0.1",
         "port": public_port,
+        "num_workers": num_workers,
         "context_servers": {
             "num_instances": 1,
             "urls": [ctx_url],
@@ -307,10 +311,11 @@ def _write_config(path, ctx_url, gen_url, public_port):
 
 
 def test_disagg_completion_e2e_web_concurrency_4():
-    """WEB_CONCURRENCY=4 through the real CLI: `trtllm-serve disaggregated`
-    forks a coordinator (port-1) + a uvicorn fleet of 4 disagg servers on the
-    public port. Mock ctx/gen workers run in this test process; a real HTTP
-    completion round-trips through one of the four workers -> coordinator -> gen.
+    """Exercise the real CLI disaggregated-fleet path.
+
+    ``num_workers=4`` starts a coordinator and four disaggregated servers on the
+    public port. A completion traverses a fleet worker, coordinator, and mock
+    context/generation workers.
     """
     logger.set_level("info")  # trtllm logger defaults to "error"; show progress
     WORKERS = 4
@@ -326,10 +331,9 @@ def test_disagg_completion_e2e_web_concurrency_4():
 
         with tempfile.TemporaryDirectory() as td:
             cfg_path = os.path.join(td, "disagg.yaml")
-            _write_config(cfg_path, ctx_url, gen_url, public_port)
+            _write_config(cfg_path, ctx_url, gen_url, public_port, WORKERS)
 
             env = dict(os.environ)
-            env["WEB_CONCURRENCY"] = str(WORKERS)
             # Unbuffered so the child's launch logs stream out live (else stdout
             # to a pipe is block-buffered and nothing shows until it exits).
             env["PYTHONUNBUFFERED"] = "1"
@@ -346,7 +350,7 @@ def test_disagg_completion_e2e_web_concurrency_4():
 
             logger.info(
                 f"mock ctx={ctx_url} gen={gen_url}; launching "
-                f"`trtllm-serve disaggregated` WEB_CONCURRENCY={WORKERS}, "
+                f"`trtllm-serve disaggregated` num_workers={WORKERS}, "
                 f"public={public_port} coordinator={coord_port}"
             )
             proc = subprocess.Popen(

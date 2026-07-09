@@ -352,8 +352,7 @@ def get_server_configs_dict(
 def extract_disagg_cluster_config(
         cluster_config_dict: Dict[str, Any],
         cluster_uri: Optional[str] = None) -> DisaggClusterConfig:
-    """
-    Build the DisaggClusterConfig from the cluster_config_dict.
+    """Build the DisaggClusterConfig from the cluster_config_dict.
     Use the default value of DisaggClusterConfig and MinimalInstances if the corresponding fields are not provided.
     If cluster_uri is provided, it will override the cluster_uri in the cluster_config_dict.
     """
@@ -489,7 +488,7 @@ def get_global_disagg_request_id(node_id: int, process_id: int = 0) -> int:
 
 
 def get_local_request_id(last_id: int) -> int:
-    """ increment the last_id by 1 and mod by MIN_GLOBAL_ID """
+    """Increment the last_id by 1 and mod by MIN_GLOBAL_ID"""
     return (last_id + 1) & (MIN_GLOBAL_ID - 1)
 
 
@@ -499,8 +498,15 @@ def disagg_process_id_space() -> int:
 
 
 def worker_local_process_id() -> int:
-    """Read this fleet worker's process index from TRTLLM_DISAGG_WORKER_PROCESS_ID
-    (set explicitly per worker by the fleet launcher, one distinct value 0..N-1
-    per Popen). 0 if unset (e.g. single-process / non-fleet path)."""
-    return int(os.environ.get("TRTLLM_DISAGG_WORKER_PROCESS_ID", "0")) \
-        % disagg_process_id_space()
+    """Return this fleet worker's process index.
+
+    The fleet launcher sets ``TRTLLM_DISAGG_WORKER_PROCESS_ID`` to a distinct
+    value per process. A standalone disaggregated server defaults to 0.
+    """
+    process_id = int(os.environ.get("TRTLLM_DISAGG_WORKER_PROCESS_ID", "0"))
+    process_id_space = disagg_process_id_space()
+    if not 0 <= process_id < process_id_space:
+        raise ValueError(
+            "TRTLLM_DISAGG_WORKER_PROCESS_ID must be between 0 and "
+            f"{process_id_space - 1}, got {process_id}")
+    return process_id

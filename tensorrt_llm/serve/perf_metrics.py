@@ -152,6 +152,7 @@ class DisaggPerfMetricsCollector:
         self._lock = asyncio.Lock()
         self._collect_lock = asyncio.Lock()
         self._clients = []
+        self._background_tasks: set[asyncio.Task] = set()
         self._metrics = {
             definition.name: instance_metric(definition)
             for definition in SERVER_METRICS_DEFINITIONS

@@ -222,7 +222,7 @@ async def test_is_ready_waits_for_router_preparation():
         AsyncMock(),
     )
     # Readiness now lives on the DisaggCoordinatorService the service holds.
-    local = service._cluster
+    local = service._coordinator
     local._disagg_cluster_manager = cluster_manager
 
     cluster_manager._current_ctx_workers["ctx"] = WorkerInfo(

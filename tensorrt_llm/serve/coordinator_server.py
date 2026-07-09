@@ -83,9 +83,11 @@ class CoordinatorServer:
         self.app.add_api_route("/version", self.version, methods=["GET"])
 
     def _timing_headers(self, raw_req: Request, recv_t: float) -> dict:
-        """Echo the client send time + stamp coord recv/send times so the client
-        can decompose the IPC round-trip. recv_t is captured at handler entry;
-        send time is 'now' (just before responding).
+        """Return timestamps used to decompose the coordinator round trip.
+
+        The client send time is echoed and coordinator receive/send times are
+        added. ``recv_t`` is captured at handler entry; send time is captured
+        immediately before responding.
         """
         h = {HDR_COORD_RECV: repr(recv_t), HDR_COORD_SEND: repr(time.time())}
         cs = raw_req.headers.get(HDR_CLIENT_SEND)
@@ -99,16 +101,24 @@ class CoordinatorServer:
             body = orjson.loads(await raw_req.body())
         except Exception as e:
             return ORJSONResponse(status_code=400, content={"error": f"invalid JSON body: {e}"})
-        if not isinstance(body, dict) or "role" not in body:
+        if not isinstance(body, dict) or "role" not in body or "routing_key" not in body:
             return ORJSONResponse(
                 status_code=400, content={"error": "body must include 'role' and 'routing_key'"}
             )
+        role = body["role"]
+        if role not in ("context", "ctx", "generation", "gen"):
+            return ORJSONResponse(status_code=400, content={"error": f"invalid role: {role}"})
+        req_id = body.get("req_id")
+        if req_id is not None and (not isinstance(req_id, int) or isinstance(req_id, bool)):
+            return ORJSONResponse(status_code=400, content={"error": "req_id must be an integer"})
+        exclude_server = body.get("exclude_server")
+        if exclude_server is not None and not isinstance(exclude_server, str):
+            return ORJSONResponse(
+                status_code=400, content={"error": "exclude_server must be a string"}
+            )
         try:
             server, info, req_id = await self._coordinator.select(
-                body["role"],
-                body.get("routing_key"),
-                body.get("req_id"),
-                body.get("exclude_server"),
+                role, body["routing_key"], req_id, exclude_server
             )
         except ValueError as e:
             return ORJSONResponse(status_code=503, content={"error": str(e)})
@@ -126,9 +136,20 @@ class CoordinatorServer:
             body = orjson.loads(await raw_req.body())
         except Exception as e:
             return ORJSONResponse(status_code=400, content={"error": f"invalid JSON body: {e}"})
-        await self._coordinator.finish(
-            body.get("role", "gen"), body.get("req_id"), body.get("success", True)
-        )
+        if not isinstance(body, dict) or "role" not in body or "req_id" not in body:
+            return ORJSONResponse(
+                status_code=400, content={"error": "body must include 'role' and 'req_id'"}
+            )
+        role = body["role"]
+        if role not in ("context", "ctx", "generation", "gen"):
+            return ORJSONResponse(status_code=400, content={"error": f"invalid role: {role}"})
+        req_id = body["req_id"]
+        if not isinstance(req_id, int) or isinstance(req_id, bool):
+            return ORJSONResponse(status_code=400, content={"error": "req_id must be an integer"})
+        success = body.get("success", True)
+        if not isinstance(success, bool):
+            return ORJSONResponse(status_code=400, content={"error": "success must be a boolean"})
+        await self._coordinator.finish(role, req_id, success)
         return ORJSONResponse(content={}, headers=self._timing_headers(raw_req, _recv))
 
     async def cluster_info(self) -> Response:
@@ -151,9 +172,15 @@ class CoordinatorServer:
             # the fleet (hot path) and TCP for health/external clients.
             import asyncio as _asyncio
 
-            uds_cfg = uvicorn.Config(self.app, uds=uds, **kwargs)
-            tcp_cfg = uvicorn.Config(self.app, host=host, port=port, **kwargs)
-            await _asyncio.gather(uvicorn.Server(uds_cfg).serve(), uvicorn.Server(tcp_cfg).serve())
+            await self._coordinator.start()
+            try:
+                uds_cfg = uvicorn.Config(self.app, uds=uds, lifespan="off", **kwargs)
+                tcp_cfg = uvicorn.Config(self.app, host=host, port=port, lifespan="off", **kwargs)
+                await _asyncio.gather(
+                    uvicorn.Server(uds_cfg).serve(), uvicorn.Server(tcp_cfg).serve()
+                )
+            finally:
+                await self._coordinator.stop()
         else:
             config = uvicorn.Config(self.app, host=host, port=port, **kwargs)
             await uvicorn.Server(config).serve()

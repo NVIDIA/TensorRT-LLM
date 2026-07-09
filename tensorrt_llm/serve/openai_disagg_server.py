@@ -55,6 +55,10 @@ from tensorrt_llm.version import __version__ as VERSION
 
 # yapf: enale
 TIMEOUT_KEEP_ALIVE = 10  # seconds.
+_LOG_CONTROL_CHARACTERS = {
+    code: f"\\x{code:02x}"
+    for code in (*range(32), 127)
+}
 
 class RawRequestResponseHooks(ResponseHooks):
     def __init__(self, raw_req: Request, perf_metrics_collector: DisaggPerfMetricsCollector):
@@ -101,7 +105,19 @@ class RawRequestResponseHooks(ResponseHooks):
             })
         if request.disaggregated_params:
             ctx_req_id = request.disaggregated_params.ctx_request_id
-            asyncio.create_task(self.perf_metrics_collector.add_per_request_metrics(self.ctx_server, gen_server, ctx_req_id, self.raw_req.state.server_arrival_time, self.server_first_token_time, self.ctx_dispatch_time))
+            task = asyncio.create_task(
+                self.perf_metrics_collector.add_per_request_metrics(
+                    self.ctx_server,
+                    gen_server,
+                    ctx_req_id,
+                    self.raw_req.state.server_arrival_time,
+                    self.server_first_token_time,
+                    self.ctx_dispatch_time,
+                )
+            )
+            background_tasks = self.perf_metrics_collector._background_tasks
+            background_tasks.add(task)
+            task.add_done_callback(background_tasks.discard)
 
 
 class OpenAIDisaggServer:
@@ -172,6 +188,11 @@ class OpenAIDisaggServer:
             await self._service.setup()
             yield
             await self._service.teardown()
+            if self._perf_metrics_collector._background_tasks:
+                await asyncio.gather(
+                    *self._perf_metrics_collector._background_tasks,
+                    return_exceptions=True,
+                )
 
         self.app = FastAPI(lifespan=lifespan)
 
@@ -193,8 +214,10 @@ class OpenAIDisaggServer:
                               "msg": e.get("msg")} for e in errs][:8]
                 except Exception:  # noqa: BLE001
                     brief = str(exc)[:500]
+                method = request.method.translate(_LOG_CONTROL_CHARACTERS)
+                path = request.url.path.translate(_LOG_CONTROL_CHARACTERS)
                 logger.warning(
-                    f"[validation] {request.method} {request.url.path} 400 "
+                    f"[validation] {method} {path} 400 "
                     f"(n={self._val_err_n}): {brief}")
             return JSONResponse(status_code=400, content={"error": str(exc)})
 
@@ -283,7 +306,7 @@ class OpenAIDisaggServer:
 
     async def health(self) -> Response:
         if not await self._coordinator.is_ready():
-            return Response(status_code=500)
+            return Response(status_code=503)
         return Response(status_code=200)
 
     async def cluster_info(self) -> JSONResponse:
@@ -301,7 +324,7 @@ class OpenAIDisaggServer:
         await uvicorn.Server(config).serve(sockets=sockets)
 
     async def _sync_server_clock(self, server: str):
-        """ Sync the ctx/gen server's steady clock with the disagg-server's steady clock (in case NTP service is not running). """
+        """Sync the ctx/gen server's steady clock with the disagg-server's steady clock (in case NTP service is not running)."""
         async def query_steady_clock_offset(session: aiohttp.ClientSession, server_url: str) -> tuple[Optional[float], Optional[float]]:
             try:
                 originate_ts = get_steady_clock_now_in_seconds()

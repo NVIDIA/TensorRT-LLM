@@ -337,9 +337,6 @@ class OpenAIServer(_VideoRoutesMixin):
         self.disagg_cluster_worker = None
         self.resource_governor = None
 
-        self._active_request_count = 0
-        self._active_request_count_lock = __import__('threading').Lock()
-
         # Skip loading AutoProcessor and model_config for VISUAL_GEN models
         # These are LLM-specific and can cause unnecessary memory usage
         if self._is_visual_gen:
@@ -473,30 +470,6 @@ class OpenAIServer(_VideoRoutesMixin):
             self.register_routes()
 
         self.app.add_middleware(ServerArrivalTimeMiddleware)
-
-        # Track active /v1/ requests (in-flight request gauge).
-        server_ref = self
-
-        @self.app.middleware("http")
-        async def _track_active_requests(request, call_next):
-            if request.url.path.startswith("/v1/"):
-                with server_ref._active_request_count_lock:
-                    server_ref._active_request_count += 1
-                try:
-                    return await call_next(request)
-                finally:
-                    with server_ref._active_request_count_lock:
-                        server_ref._active_request_count -= 1
-            return await call_next(request)
-
-    def _get_iteration_stats_buffer_maxlen(self) -> Optional[int]:
-        if isinstance(self.generator, VisualGen):
-            return None
-
-        max_iterations = self.generator.args.iter_stats_max_iterations
-        if max_iterations is None or max_iterations < 0:
-            return None
-        return max_iterations
 
     def _init_visual_gen(self):
         self.processor = None

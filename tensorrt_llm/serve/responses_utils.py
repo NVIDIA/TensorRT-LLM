@@ -124,7 +124,7 @@ def _parse_response_input(
     if not isinstance(input_msg, dict):
         input_msg = input_msg.model_dump()
 
-    _responses_debug_log(f"------- Parsing input -----------")
+    _responses_debug_log("------- Parsing input -----------")
     _responses_debug_log(input_msg)
     _responses_debug_log("")
 
@@ -218,8 +218,7 @@ class ConversationHistoryStore:
                                  Union[list[Message],
                                        list[ChatCompletionMessageParam]]] = [],
                              prev_resp_id: Optional[str] = None) -> None:
-        """
-        Store the response and its messages(model output messages) in the conversation store. If the previous response id is provided,
+        """Store the response and its messages(model output messages) in the conversation store. If the previous response id is provided,
         the messages will be appended to the conversation. Otherwise, a new conversation will be created.
 
         Args:
@@ -234,7 +233,7 @@ class ConversationHistoryStore:
         _responses_debug_log(
             f"ConversationHistoryStore storing resp: {resp_id}")
         if ENABLE_RESPONSES_DEBUG_MSG:
-            _responses_debug_log(f" -> resp_msgs:")
+            _responses_debug_log(" -> resp_msgs:")
             for msg in resp_msgs:
                 _responses_debug_log(f" -> {msg}")
 
@@ -278,8 +277,7 @@ class ConversationHistoryStore:
                              msgs: Union[list[Message],
                                          list[ChatCompletionMessageParam]],
                              prev_resp_id: Optional[str]) -> None:
-        """
-        Store the messages in the conversation store.
+        """Store the messages in the conversation store.
 
         `msgs` should always contains the whole conversation messages, including the previous messages and the new messages.
 
@@ -291,7 +289,7 @@ class ConversationHistoryStore:
         Returns:
             None
         """
-        _responses_debug_log(f"ConversationHistoryStore storing msg:")
+        _responses_debug_log("ConversationHistoryStore storing msg:")
         if ENABLE_RESPONSES_DEBUG_MSG:
             for msg in msgs:
                 _responses_debug_log(f" -> {msg}")
@@ -317,7 +315,7 @@ class ConversationHistoryStore:
     async def get_conversation_history(
             self, resp_id: str
     ) -> Union[list[Message], list[ChatCompletionMessageParam]]:
-        _responses_debug_log(f"ConversationHistoryStore getting prev_msgs:")
+        _responses_debug_log("ConversationHistoryStore getting prev_msgs:")
         _responses_debug_log(f" -> prev_resp_id: {resp_id}")
         async with self.conversations_lock:
             if resp_id in self.response_to_conversation:
@@ -330,8 +328,7 @@ class ConversationHistoryStore:
             return []
 
     def _update_visited_conversation(self, conversation_id) -> None:
-        """
-        Update the visited conversation to the front of the conversation store.
+        """Update the visited conversation to the front of the conversation store.
         This function is used to keep the conversation store sorted by the visited time.
         And also remove the least recently visited conversation if the number of conversations exceeds the limit.
 
@@ -356,8 +353,7 @@ class ConversationHistoryStore:
             self.conversation_to_response.pop(removed_id)
 
     def _pop_conversation(self, resp_id) -> None:
-        """
-        Pop the oldest conversation messages from a conversation.
+        """Pop the oldest conversation messages from a conversation.
         The conversation is starting by a user message and ending by an assistant message.
         This function is used to keep the number of messages in a conversation within the limit.
 
@@ -539,8 +535,7 @@ def _parse_output_tokens(tokens: list[int]) -> list[Message]:
 
 
 def _parse_output_message_harmony(message: Message) -> list[ResponseOutputItem]:
-    """
-    Parse a Harmony message into a list of output response items.
+    """Parse a Harmony message into a list of output response items.
     """
     if message.author.role != "assistant":
         # This is a message from a tool to the assistant (e.g., search result).
@@ -721,8 +716,7 @@ async def _create_input_messages(
 
 def _create_output_messages(
         output_contents: dict[str, Any]) -> list[ChatCompletionMessageParam]:
-    """
-    Convert output contents to chat completion messages for conversation store.
+    """Convert output contents to chat completion messages for conversation store.
 
     Reasoning content is not included in the output messages to reduce the token usage.
 
@@ -804,8 +798,7 @@ async def _create_input_tokens(
     model_config: PretrainedConfig,
     processor: AutoProcessor,
 ) -> Tuple[list[int], Optional[dict[str, list[Any]]]]:
-    """
-    Create input tokens for the model. Also return the mm data if the model is multimodal.
+    """Create input tokens for the model. Also return the mm data if the model is multimodal.
 
     Returns:
         Tuple[list[int], Optional[dict[str, list[Any]]]]: Input tokens and mm data.
@@ -895,7 +888,7 @@ async def request_preprocess(
         prev_msgs = await conversation_store.get_conversation_history(
             prev_response_id)
 
-        _responses_debug_log(f"Prev msgs:")
+        _responses_debug_log("Prev msgs:")
         for msg in prev_msgs:
             _responses_debug_log(f" -> {msg}")
 
@@ -1375,8 +1368,7 @@ class ResponsesStreamingEventsHelper:
     def _get_output_added_events(
         self, output_item: ResponseOutputMessage | ResponseReasoningItem
     ) -> list[StreamingResponsesResponse]:
-        """
-        Get item added event and content part added event for a message item which is starting
+        """Get item added event and content part added event for a message item which is starting
         to be generated.
 
         Returns:
@@ -1435,8 +1427,7 @@ def _should_send_done_events(
     streaming_events_helper: Optional[ResponsesStreamingEventsHelper] = None,
     finished_generation: bool = False,
 ) -> Tuple[bool, bool, Optional[str], Optional[str]]:
-    """
-    Determine if done events should be sent for text or reasoning items.
+    """Determine if done events should be sent for text or reasoning items.
 
     Analyzes the complete output text to detect when reasoning or text sections
     have been completed and should receive done events.
@@ -1964,8 +1955,7 @@ async def process_streaming_events(
 
 
 class ServerArrivalTimeMiddleware:
-    """
-    Custom ASGI middleware to track server arrival time.
+    """Custom ASGI middleware to track server arrival time.
 
     We implement this as a pure ASGI middleware instead of using FastAPI's
     @app.middleware("http") decorator because the decorator internally uses
@@ -2017,8 +2007,10 @@ _TTFT_SPLIT = None
 
 
 def _accept_latency_logger():
-    """Lazy singleton for the client-send -> server-accept latency logger
-    (PeriodicLatencyLogger is defined below this class)."""
+    """Return the client-send to server-accept latency logger.
+
+    ``PeriodicLatencyLogger`` is defined below this function.
+    """
     global _ACCEPT_LAT
     if _ACCEPT_LAT is None:
         _ACCEPT_LAT = PeriodicLatencyLogger("accept.client_send_to_arrival")
@@ -2026,8 +2018,11 @@ def _accept_latency_logger():
 
 
 def ttft_split_logger():
-    """Lazy singleton aggregating the per-request TTFT breakdown (pre_ctx /
-    ctx_phase / xfer_gen / total), logged periodically instead of per request."""
+    """Return the per-request TTFT breakdown logger.
+
+    Pre-context, context, transfer/generation, and total times are aggregated
+    and logged periodically rather than once per request.
+    """
     global _TTFT_SPLIT
     if _TTFT_SPLIT is None:
         _TTFT_SPLIT = PeriodicBreakdownLogger(
@@ -2037,11 +2032,11 @@ def ttft_split_logger():
 
 
 class PeriodicLatencyLogger:
-    """Accumulates per-call latencies for a named coordinator API and logs
-    percentiles every ``window`` calls. Cheap, lock-free (single asyncio loop),
-    and self-resetting. Used to profile the coordinator surface on both the
-    in-process owner (DisaggCoordinatorService) and the HTTP client
-    (CoordinatorDelegatingRouter / CoordinatorClient) without per-call log spam."""
+    """Periodically log latency percentiles for a named coordinator API.
+
+    This lock-free, self-resetting logger runs on one asyncio loop and profiles
+    the in-process owner and HTTP client without per-call log spam.
+    """
 
     def __init__(self, name: str, window: int = 500):
         self._name = name
@@ -2055,21 +2050,23 @@ class PeriodicLatencyLogger:
         if self._n % self._window == 0:
             s = sorted(self._samples)
             m = len(s)
-            p = lambda q: s[min(int(q * m), m - 1)]
-            logger.info(
-                f"[coord_api] {self._name} n={self._n} ms: "
-                f"mean={sum(s)/m:.2f} p50={p(0.5):.2f} p90={p(0.9):.2f} "
-                f"p99={p(0.99):.2f} max={s[-1]:.2f}")
+
+            def percentile(q):
+                return s[min(int(q * m), m - 1)]
+
+            logger.info(f"[coord_api] {self._name} n={self._n} ms: "
+                        f"mean={sum(s)/m:.2f} p50={percentile(0.5):.2f} "
+                        f"p90={percentile(0.9):.2f} "
+                        f"p99={percentile(0.99):.2f} max={s[-1]:.2f}")
             self._samples = []
 
 
 class PeriodicBreakdownLogger:
-    """Like PeriodicLatencyLogger but for a multi-field breakdown: accumulates a
-    dict of named ms values per sample and logs p50/p95 of EACH field once every
-    ``window`` samples. Used for the per-request TTFT split so we get the
-    breakdown WITHOUT a synchronous log write per request (that per-request
-    logging inflated TTFT ~3s on the single-loop disagg server -- observer
-    effect). Negative values (stage not reached) are dropped per field."""
+    """Periodically log a multi-field latency breakdown.
+
+    Named millisecond values are accumulated and each field's p50/p95 is logged
+    every ``window`` samples. Negative values for stages not reached are dropped.
+    """
 
     def __init__(self, name: str, fields, window: int = 1000):
         self._name = name
@@ -2089,16 +2086,19 @@ class PeriodicBreakdownLogger:
             for f in self._fields:
                 s = sorted(self._samples[f])
                 if s:
-                    p = lambda q: s[min(int(q * len(s)), len(s) - 1)]
-                    parts.append(f"{f}(p50={p(0.5):.0f},p95={p(0.95):.0f})")
+
+                    def percentile(q):
+                        return s[min(int(q * len(s)), len(s) - 1)]
+
+                    parts.append(f"{f}(p50={percentile(0.5):.0f},"
+                                 f"p95={percentile(0.95):.0f})")
                 self._samples[f] = []
             logger.info(f"[ttft_split] {self._name} n={self._n} " +
                         " ".join(parts))
 
 
 class ResponseHooks(ABC):
-    """
-    Hooks for response processing and (disagg) service perf observability.
+    """Hooks for response processing and (disagg) service perf observability.
     """
 
     @abstractmethod
@@ -2106,11 +2106,11 @@ class ResponseHooks(ABC):
         pass
 
     def on_ctx_dispatch(self, request: UCompletionRequest):
-        """Fired the instant the disagg service starts placing the request on a
-        ctx server (before routing / the ctx HTTP send). arrival->here measures
-        the pre-ctx wait in the orchestrator/fleet (accept queue + event loop +
-        pipeline), which dominates TTFT under high fleet concurrency. Default
-        no-op so non-instrumented hook implementations are unaffected."""
+        """Record when the disaggregated service starts context placement.
+
+        Arrival to this point measures the pre-context wait in the orchestrator
+        or fleet. The default is a no-op for non-instrumented implementations.
+        """
 
     @abstractmethod
     def on_ctx_resp(self, ctx_server: str, response: UCompletionResponse):

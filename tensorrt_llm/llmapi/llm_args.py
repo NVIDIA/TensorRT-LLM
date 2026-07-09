@@ -3523,22 +3523,6 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         description="KV cache manager v2 block reuse policy. "
         "With SWA scratch reuse and 'all_reusable', only non-scratch "
         "blocks are saved for reuse.")
-    # Per-rank centralized KV cache routing
-    centralized_router_report_address: Optional[str] = Field(
-        default=None,
-        status="prototype",
-        description=
-        "ZMQ address to push KV cache events to for centralized routing "
-        "(e.g. 'tcp://orchestrator:5557'). When set with per_rank_routing=True, "
-        "each DP rank reports its own events independently.")
-
-    per_rank_routing: bool = Field(
-        default=False,
-        status="prototype",
-        description=
-        "Enable per-rank KV cache event reporting. Each DP rank reports its "
-        "own cache blocks independently (no allgather). Requires "
-        "use_kv_cache_manager_v2=True and event_buffer_max_size > 0.")
 
     def _to_pybind(self):
         config = _KvCacheConfig(

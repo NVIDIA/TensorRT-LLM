@@ -64,6 +64,8 @@ __all__ = [
     "DisaggCoordinator",
     "DisaggCoordinatorService",
     "CoordinatorClient",
+    "coordinator_base_url",
+    "make_coordinator_session",
 ]
 
 
@@ -168,9 +170,11 @@ class DisaggCoordinatorService(DisaggCoordinator):
     # -- coordinator-path placement (workers call these via the HTTP server) --
 
     def _api_lat(self, name: str):
-        """Lazily create a per-API PeriodicLatencyLogger. Measures the coordinator
-        owner's in-process handler time (excludes the fleet->coordinator HTTP hop,
-        which is captured client-side as [coord_api] client.*).
+        """Return a lazily created per-API latency logger.
+
+        It measures the coordinator owner's in-process handler time, excluding
+        the fleet-to-coordinator HTTP hop captured client-side as
+        ``[coord_api] client.*``.
         """
         cache = self.__dict__.setdefault("_coord_api_lat", {})
         if name not in cache:
@@ -202,7 +206,12 @@ class DisaggCoordinatorService(DisaggCoordinator):
         self._api_lat(f"finish[{role}]").record(time.monotonic() - _t0)
 
     def _router_for_role(self, role: str) -> Router:
-        return self._ctx_router if str(role).lower().startswith("c") else self._gen_router
+        normalized_role = str(role).lower()
+        if normalized_role in ("context", "ctx"):
+            return self._ctx_router
+        if normalized_role in ("generation", "gen"):
+            return self._gen_router
+        raise ValueError(f"Unsupported coordinator role: {role}")
 
     async def start(self) -> None:
         await self._ctx_router.prepare_servers()
@@ -329,10 +338,11 @@ def coordinator_base_url(remote_url: str) -> str:
 
 
 def make_coordinator_session(remote_url: str) -> aiohttp.ClientSession:
-    """Aiohttp session for the coordinator endpoint. Uses a UnixConnector for a
-    ``unix:/path`` URL -- UDS avoids the TCP loopback stack, since the fleet is
-    co-located with the implicit coordinator. Created lazily by callers so it
-    binds to the running event loop.
+    """Create an aiohttp session for the coordinator endpoint.
+
+    A ``unix:/path`` URL uses a UnixConnector to avoid the TCP loopback stack
+    when the fleet is co-located with the implicit coordinator. Callers create
+    the session lazily so it binds to the running event loop.
 
     limit=0 (unlimited pool): each fleet worker has ~concurrency/num_workers
     requests in flight (e.g. 320 at c1280/4), but aiohttp's default pool caps at

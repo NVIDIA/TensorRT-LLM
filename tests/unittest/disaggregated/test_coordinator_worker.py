@@ -49,15 +49,15 @@ from tensorrt_llm.llmapi.disagg_utils import (
 from tensorrt_llm.serve.coordinator_server import CoordinatorServer
 from tensorrt_llm.serve.disagg_coordinator import CoordinatorClient, DisaggCoordinatorService
 from tensorrt_llm.serve.openai_protocol import CompletionRequest, DisaggregatedParams
+from tensorrt_llm.serve.router_utils import BlockHashMixin as SharedBlockHashMixin
 
 
 @pytest.fixture(autouse=True)
 def _reset_prometheus_registry():
-    """Each coordinator builds role-prefixed Prometheus counters in the global
-    default registry (via its readiness OpenAIHttpClients). In production the
-    coordinator is a single process; here two coordinators share one pytest
-    process, so clear the registry between tests to avoid duplicate-timeseries
-    registration errors.
+    """Reset role-prefixed Prometheus counters.
+
+    Tests create multiple coordinators in one process, so clear their shared
+    default registry between tests to avoid duplicate-timeseries errors.
     """
     from prometheus_client import REGISTRY
 
@@ -180,9 +180,38 @@ async def _wait_coord_ready(url, timeout_s=30.0):
     return False
 
 
+def test_coordinator_rejects_unknown_role():
+    config = _make_config([], [], "round_robin", "round_robin")
+    coordinator = DisaggCoordinatorService(config, _client_factory)
+
+    with pytest.raises(ValueError, match="Unsupported coordinator role"):
+        coordinator._router_for_role("typo")
+
+
+def test_prefix_token_cache_retokenizes_extended_text():
+    class BoundarySensitiveTokenizer:
+        def __init__(self):
+            self.calls = []
+
+        def encode(self, text, add_special_tokens=False):
+            assert add_special_tokens is False
+            self.calls.append(text)
+            return {"ab": [1], "abc": [2], "c": [3]}[text]
+
+    tokenizer = BoundarySensitiveTokenizer()
+    block_hashing = SharedBlockHashMixin()
+    block_hashing._init_block_hashing()
+
+    assert block_hashing._encode_with_prefix_cache("ab", 1, tokenizer) == [1]
+    assert block_hashing._encode_with_prefix_cache("abc", 1, tokenizer) == [2]
+    assert block_hashing._encode_with_prefix_cache("abc", 1, tokenizer) == [2]
+    assert tokenizer.calls == ["ab", "abc"]
+
+
 def test_stateless_router_places_locally_in_worker():
-    """A round-robin (stateless) router is NOT wrapped: the worker places locally
-    with the real router and never calls the coordinator.
+    """Verify stateless round-robin placement remains local.
+
+    The worker uses the real router without calling the coordinator.
     """
     from tensorrt_llm.serve.router import CoordinatorDelegatingRouter, RoundRobinRouter
 
@@ -212,8 +241,10 @@ def test_stateless_router_places_locally_in_worker():
 
 
 def test_conversation_coordinator_sticky_by_conv_id():
-    """Same conversation_id sticks to one gen worker; a stateful (conversation)
-    router delegates placement to the coordinator via /select.
+    """Verify conversation IDs remain sticky through delegated routing.
+
+    The stateful generation router delegates placement to coordinator
+    ``/select``.
     """
     from tensorrt_llm.serve.router import CoordinatorDelegatingRouter
 
@@ -222,12 +253,14 @@ def test_conversation_coordinator_sticky_by_conv_id():
         with _CoordinatorThread(config) as coord:
             assert asyncio.run(_wait_coord_ready(coord.url))
 
-            def _req(conv_id):
+            def _req(conv_id, request_id):
                 return CompletionRequest(
                     model="m",
                     prompt="hi",
                     disaggregated_params=DisaggregatedParams(
-                        request_type="context_only", conversation_id=conv_id
+                        request_type="generation_only",
+                        ctx_request_id=request_id,
+                        conversation_id=conv_id,
                     ),
                 )
 
@@ -236,12 +269,16 @@ def test_conversation_coordinator_sticky_by_conv_id():
                 # Stateful -> wrapped in a coordinator-delegating router.
                 assert isinstance(remote.gen_router, CoordinatorDelegatingRouter)
                 assert await remote.is_ready() is True
-                first, _ = await remote.gen_router.get_next_server(_req("conv-A"))
+                first_request = _req("conv-A", 1)
+                first, _ = await remote.gen_router.get_next_server(first_request)
+                await remote.gen_router.finish_request(first_request)
                 # Repeated conv-A requests must land on the same worker.
                 repeats = []
-                for _ in range(3):
-                    s, _ = await remote.gen_router.get_next_server(_req("conv-A"))
+                for request_id in range(2, 5):
+                    request = _req("conv-A", request_id)
+                    s, _ = await remote.gen_router.get_next_server(request)
                     repeats.append(s)
+                    await remote.gen_router.finish_request(request)
                 await remote.stop()
                 return first, repeats
 
@@ -251,8 +288,8 @@ def test_conversation_coordinator_sticky_by_conv_id():
             )
 
 
-def test_coordinator_owns_generation_disagg_request_id():
-    """Generation routing receives its request ID from the coordinator."""
+def test_worker_generates_disagg_request_id_before_generation_routing():
+    """Generation routing uses the ID generated by the coordinator client."""
     from tensorrt_llm.serve.router import CoordinatorDelegatingRouter
 
     with _FakeWorker() as ctx0, _FakeWorker() as gen0:
@@ -263,24 +300,26 @@ def test_coordinator_owns_generation_disagg_request_id():
             async def drive():
                 remote = CoordinatorClient(coord.url, config)
                 assert isinstance(remote.gen_router, CoordinatorDelegatingRouter)
+                assigned_id = await remote.get_disagg_request_id()
                 request = CompletionRequest(
                     model="m",
                     prompt="hello",
                     disaggregated_params=DisaggregatedParams(
                         request_type="generation_only",
-                        ctx_request_id=123,
+                        ctx_request_id=assigned_id,
                         disagg_request_id=None,
                         conversation_id="conv-A",
                     ),
                 )
                 await remote.gen_router.get_next_server(request)
-                assigned_id = request.disaggregated_params.disagg_request_id
+                assert request.disaggregated_params.disagg_request_id is None
+                assert request.disaggregated_params.ctx_request_id == assigned_id
                 await remote.gen_router.finish_request(request)
                 await remote.stop()
                 return assigned_id
 
             assigned_id = asyncio.run(drive())
-            assert assigned_id is not None and assigned_id != 123
+            assert assigned_id > 0
 
 
 if __name__ == "__main__":

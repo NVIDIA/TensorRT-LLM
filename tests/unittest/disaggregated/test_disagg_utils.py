@@ -6,9 +6,10 @@ import yaml
 
 # isort: off
 from tensorrt_llm.llmapi.disagg_utils import (
-    MIN_GLOBAL_ID, CtxGenServerConfig, DisaggServerConfig, extract_ctx_gen_cfgs,
-    extract_router_config, extract_disagg_cfg, get_global_disagg_request_id,
-    get_local_request_id, get_server_configs_dict, parse_disagg_config_file)
+    MIN_GLOBAL_ID, CtxGenServerConfig, DisaggServerConfig,
+    disagg_process_id_space, extract_ctx_gen_cfgs, extract_router_config,
+    extract_disagg_cfg, get_global_disagg_request_id, get_local_request_id,
+    get_server_configs_dict, parse_disagg_config_file, worker_local_process_id)
 # isort: on
 
 
@@ -110,9 +111,20 @@ def test_parse_disagg_config_file(sample_yaml_file, sample_yaml_config):
 @pytest.mark.parametrize("sample_yaml_config", ["disagg_cluster", ""],
                          indirect=True)
 def test_extract_disagg_cfg(sample_yaml_config):
+    sample_yaml_config.update({
+        "gen_tokids_ctxbytes":
+        True,
+        "num_workers":
+        4,
+        "disagg_coordinator_url":
+        "http://coordinator:7999",
+    })
     config = extract_disagg_cfg(**sample_yaml_config)
     assert isinstance(config, DisaggServerConfig)
     verify_disagg_config(config, sample_yaml_config)
+    assert config.gen_tokids_ctxbytes is True
+    assert config.num_workers == 4
+    assert config.disagg_coordinator_url == "http://coordinator:7999"
 
 
 def test_extract_ctx_gen_cfgs():
@@ -240,6 +252,17 @@ def test_get_global_disagg_request_id_range_validation():
     # valid extremes
     assert get_global_disagg_request_id(255, 63) >= MIN_GLOBAL_ID
     assert get_global_disagg_request_id(0, 0) >= MIN_GLOBAL_ID
+
+
+def test_worker_local_process_id_range_validation(monkeypatch):
+    process_id_space = disagg_process_id_space()
+    monkeypatch.setenv("TRTLLM_DISAGG_WORKER_PROCESS_ID",
+                       str(process_id_space - 1))
+    assert worker_local_process_id() == process_id_space - 1
+
+    monkeypatch.setenv("TRTLLM_DISAGG_WORKER_PROCESS_ID", str(process_id_space))
+    with pytest.raises(ValueError):
+        worker_local_process_id()
 
 
 def test_get_local_request_id():
