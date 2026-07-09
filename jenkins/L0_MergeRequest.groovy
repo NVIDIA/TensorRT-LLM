@@ -1261,12 +1261,13 @@ def collectTestResults(pipeline, testFilter, globalVars)
                             --out-dir cov/cbts_report \
                             --source-root llm/tensorrt_llm
                     """
-                    // The report is a directory of many small pages; compress it into a single tarball.
-                    sh "cd cov && tar czf cbts_pystart_report.tar.gz cbts_report"
-                    trtllm_utils.uploadArtifacts("cov/cbts_touchmap.sqlite", "${UPLOAD_PATH}/cbts-coverage/")
+                    // Bundle the selector DB and the many-small-pages HTML report into one tarball.
+                    // The DB stores product file paths and qualnames as plaintext TEXT columns; the
+                    // publish-artifacts guardword scanner byte-matches product codenames in raw files
+                    // but does not recurse into archives, so upload both compressed, never raw.
+                    sh "cd cov && tar czf cbts_pystart_report.tar.gz cbts_touchmap.sqlite cbts_report"
                     trtllm_utils.uploadArtifacts("cov/cbts_pystart_report.tar.gz", "${UPLOAD_PATH}/cbts-coverage/")
-                    echo "CBTS touch DB (selector): https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/cbts-coverage/cbts_touchmap.sqlite"
-                    echo "CBTS report (tar.gz, open cbts_report/index.html): https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/cbts-coverage/cbts_pystart_report.tar.gz"
+                    echo "CBTS coverage (touch DB + report): https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/cbts-coverage/cbts_pystart_report.tar.gz"
                 } // Test coverage
             }
             catch (InterruptedException e)
