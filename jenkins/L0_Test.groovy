@@ -190,6 +190,7 @@ def uploadResults(def pipeline, SlurmCluster cluster, String clusterName, String
         def hasTimeoutTest = false
         def downloadResultSucceed = false
         def downloadPerfResultSucceed = false
+        def downloadSharedTensorTraceSucceed = false
 
         pipeline.stage('Submit Test Result') {
             sh "mkdir -p ${stageName}"
@@ -229,8 +230,20 @@ def uploadResults(def pipeline, SlurmCluster cluster, String clusterName, String
                 downloadPerfResultSucceed = Utils.exec(pipeline, script: scpFromRemoteCmd(remote, scpSources, "${stageName}/"), returnStatus: true, numRetries: 3) == 0
             }
 
-            echo "hasTimeoutTest: ${hasTimeoutTest}, downloadResultSucceed: ${downloadResultSucceed}, downloadPerfResultSucceed: ${downloadPerfResultSucceed}"
-            if (hasTimeoutTest || downloadResultSucceed || downloadPerfResultSucceed) {
+            // The NVBug 6336747 native-sbatch job writes both shared-memory and
+            // shutdown diagnostics into this directory in its remote workspace.
+            if (stageName == "DGX_B200-PyTorch-10") {
+                def sharedTensorTracePath = "${perfResultsBasePath}/shared_tensor_shm_trace"
+                downloadSharedTensorTraceSucceed = Utils.exec(
+                    pipeline,
+                    script: scpFromRemoteCmd(remote, sharedTensorTracePath, "${stageName}/"),
+                    returnStatus: true,
+                    numRetries: 3
+                ) == 0
+            }
+
+            echo "hasTimeoutTest: ${hasTimeoutTest}, downloadResultSucceed: ${downloadResultSucceed}, downloadPerfResultSucceed: ${downloadPerfResultSucceed}, downloadSharedTensorTraceSucceed: ${downloadSharedTensorTraceSucceed}"
+            if (hasTimeoutTest || downloadResultSucceed || downloadPerfResultSucceed || downloadSharedTensorTraceSucceed) {
                 // On retry attempts, rename freshly-downloaded result XMLs so that
                 // (a) the tar for this attempt is distinguishable from prior attempts
                 //     already uploaded to Artifactory, and
@@ -1437,6 +1450,22 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     envVarsToExport[varName] = env."${varName}"
                 }
 
+                def sharedTensorHostDiagnosticsSetup = ""
+                if (testList == "l0_b200_nvbug_6336747") {
+                    sharedTensorHostDiagnosticsSetup = '''
+                    TLLM_HOST_SHM_CANARY_PATH=$(mktemp "/dev/shm/nvbug6336747_${SLURM_JOB_ID}.XXXXXX")
+                    export TLLM_HOST_SHM_CANARY_PATH
+                    export TLLM_HOST_SHM_CANARY_STAT=$(stat -Lc '%d:%i' "$TLLM_HOST_SHM_CANARY_PATH")
+                    export TLLM_HOST_SHM_STAT=$(stat -Lc '%d:%i' /dev/shm)
+                    export TLLM_HOST_MNTNS=$(readlink /proc/self/ns/mnt)
+
+                    cleanupNvbug6336747HostCanary() {
+                        rm -f "$TLLM_HOST_SHM_CANARY_PATH"
+                    }
+                    trap cleanupNvbug6336747HostCanary EXIT
+                    '''.replaceAll("(?m)^\\s*", "")
+                }
+
                 def srunArgs = [
                     "--container-name=multi_node_test-\${SLURM_JOB_ID}",
                     "--container-image=$containerImageArg",
@@ -1445,6 +1474,14 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     "--no-container-mount-home",
                     "--container-env=NVIDIA_IMEX_CHANNELS"
                 ]
+                if (testList == "l0_b200_nvbug_6336747") {
+                    srunArgs.addAll([
+                        "--container-env=TLLM_HOST_SHM_CANARY_PATH",
+                        "--container-env=TLLM_HOST_SHM_CANARY_STAT",
+                        "--container-env=TLLM_HOST_SHM_STAT",
+                        "--container-env=TLLM_HOST_MNTNS",
+                    ])
+                }
                 if (ENABLE_UPLOAD_TEST_RESULTS) {
                     srunArgs.add("--container-env=S3_SECRET_KEY")
                 }
@@ -1509,6 +1546,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     echo "Env NVIDIA_VISIBLE_DEVICES: \$NVIDIA_VISIBLE_DEVICES"
 
                     ${srunPrologue}
+                    ${sharedTensorHostDiagnosticsSetup}
                 """.replaceAll("(?m)^\\s*", "")
 
                 if (disaggMultiNodeMode || aggMultiNodeMode) {
@@ -3771,7 +3809,30 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             containerLD_LIBRARY_PATH = "${containerPIP_LLM_LIB_PATH}:${containerLD_LIBRARY_PATH}"
         }
         containerLD_LIBRARY_PATH = containerLD_LIBRARY_PATH.replaceAll(':+$', '')
-        withEnv(["LD_LIBRARY_PATH=${containerLD_LIBRARY_PATH}"]) {
+
+        // NVBug 6336747 needs the actor that first removes a /dev/shm/torch_* name. Build the
+        // diagnostic preload shim at runtime so the stress-only stage does not require a shipped
+        // binary. Loading it before pytest also covers MPI children and torch_shm_manager.
+        def sharedTensorShmTraceEnv = []
+        def outputDirectorySetup = "rm -rf ${stageName}/"
+        if (testList == "l0_b200_nvbug_6336747") {
+            def traceLibrary = "/tmp/libnvbug6336747_shm_trace.so"
+            def traceDirectory = "${WORKSPACE}/${stageName}/shared_tensor_shm_trace"
+            sh """
+                gcc -shared -fPIC -Wall -Wextra -Werror \
+                    -o ${traceLibrary} \
+                    ${llmSrc}/tests/integration/defs/shared_tensor_shm_trace.c -ldl
+            """
+            def existingPreload = env.LD_PRELOAD ?: ""
+            def tracePreload = existingPreload ? "${traceLibrary}:${existingPreload}" : traceLibrary
+            sharedTensorShmTraceEnv = [
+                "LD_PRELOAD=${tracePreload}",
+                "TLLM_SHM_TRACE_DIR=${traceDirectory}",
+            ]
+            outputDirectorySetup += " && mkdir -p ${traceDirectory}"
+        }
+
+        withEnv(["LD_LIBRARY_PATH=${containerLD_LIBRARY_PATH}"] + sharedTensorShmTraceEnv) {
             withCredentials([
                 string(credentialsId: 'TRTLLM_HF_TOKEN', variable: 'HF_TOKEN'),
                 usernamePassword(
@@ -3786,7 +3847,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                 try {
                     if (preprocessedLists.regularCount > 0) {
                         sh """
-                            rm -rf ${stageName}/ && \
+                            ${outputDirectorySetup} && \
                             cd ${llmSrc}/tests/integration/defs && \
                             ${pytestCommand.join(" ")}
                         """

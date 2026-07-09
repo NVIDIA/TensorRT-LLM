@@ -1,8 +1,13 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import base64
 import itertools
 import logging
 import os
+import struct
 import threading
+import time
 from typing import Any, Callable, Dict, Optional, Tuple
 
 import torch
@@ -44,6 +49,10 @@ class _LocalTensorStore:
             return cls._store.pop(token, None)
 
 
+_FAIL_REBUILD_AT_ENV = "TLLM_SHARED_TENSOR_FAIL_REBUILD_AT"
+_rebuild_attempt = 0
+_trace_lock = threading.Lock()
+
 DTYPE_MAPPING = {
     'torch.float32': torch.float32,
     'torch.float64': torch.float64,
@@ -56,6 +65,104 @@ DTYPE_MAPPING = {
     'torch.float16': torch.float16,
     'torch.bfloat16': torch.bfloat16,
 }
+
+
+def _shared_memory_name(storage_handle: bytes) -> str:
+    return storage_handle.decode("utf-8", errors="backslashreplace")
+
+
+def _shared_memory_path(storage_handle: bytes) -> str:
+    # PyTorch's POSIX shared-memory objects live in Linux's /dev/shm namespace.
+    return os.path.join("/dev", "shm",
+                        _shared_memory_name(storage_handle).lstrip("/"))
+
+
+def _read_shared_memory_refcount(storage_handle: bytes) -> int | None:
+    """Read PyTorch's MapInfo refcount stored at offset zero."""
+    try:
+        fd = os.open(_shared_memory_path(storage_handle),
+                     os.O_RDONLY | os.O_CLOEXEC)
+    except OSError:
+        return None
+
+    try:
+        data = os.pread(fd, struct.calcsize("=i"), 0)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+    if len(data) != struct.calcsize("=i"):
+        return None
+    return struct.unpack("=i", data)[0]
+
+
+def _trace_shared_tensor_lifecycle(event: str, storage_handle: bytes,
+                                   **fields: Any) -> None:
+    trace_directory = os.environ.get("TLLM_SHM_TRACE_DIR")
+    if trace_directory is None:
+        return
+
+    refcount = _read_shared_memory_refcount(storage_handle)
+    details = " ".join(f"{key}={str(value).replace(chr(10), ' ')}"
+                       for key, value in fields.items())
+    record = (
+        f"time_ns={time.time_ns()} event={event} pid={os.getpid()} "
+        f"tid={threading.get_native_id()} name={_shared_memory_name(storage_handle)} "
+        f"refcount={refcount if refcount is not None else '?'}{(' ' + details) if details else ''}\n"
+    ).encode("utf-8", errors="backslashreplace")
+    trace_path = os.path.join(trace_directory,
+                              f"shared_tensor_lifecycle.{os.getpid()}.log")
+    try:
+        with _trace_lock:
+            fd = os.open(trace_path,
+                         os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_CLOEXEC,
+                         0o600)
+            try:
+                os.write(fd, record)
+            finally:
+                os.close(fd)
+    except OSError:
+        logger.debug("Failed to write shared-tensor lifecycle trace",
+                     exc_info=True)
+
+
+def _next_rebuild_attempt() -> int | None:
+    if (os.environ.get("TLLM_SHM_TRACE_DIR") is None
+            and os.environ.get(_FAIL_REBUILD_AT_ENV) is None):
+        return None
+    global _rebuild_attempt
+    with _trace_lock:
+        _rebuild_attempt += 1
+        return _rebuild_attempt
+
+
+def _maybe_inject_rebuild_enoent(storage_handle: bytes, attempt: int) -> None:
+    fail_at = os.environ.get(_FAIL_REBUILD_AT_ENV)
+    if fail_at is None:
+        return
+    try:
+        configured_attempt = int(fail_at)
+    except ValueError as error:
+        raise ValueError(
+            f"{_FAIL_REBUILD_AT_ENV} must be a positive integer, got {fail_at!r}"
+        ) from error
+    if configured_attempt <= 0:
+        raise ValueError(
+            f"{_FAIL_REBUILD_AT_ENV} must be a positive integer, got {configured_attempt}"
+        )
+    if attempt != configured_attempt:
+        return
+
+    path = _shared_memory_path(storage_handle)
+    try:
+        os.unlink(path)
+        outcome = "unlinked"
+    except FileNotFoundError:
+        outcome = "already_missing"
+    _trace_shared_tensor_lifecycle("fault_unlink",
+                                   storage_handle,
+                                   attempt=attempt,
+                                   outcome=outcome)
 
 
 def str_to_torch_dtype(dtype_str: str) -> torch.dtype:
@@ -326,7 +433,26 @@ class SharedTensorContainer:
                                 storage_handle, tensor_info['storage_size'],
                                 str_to_torch_dtype(
                                     tensor_info['storage_dtype']))
-            storage = rebuild_storage_filename(*storage_metadata)
+            rebuild_attempt = _next_rebuild_attempt()
+            if rebuild_attempt is not None:
+                _trace_shared_tensor_lifecycle("rebuild_begin",
+                                               storage_handle,
+                                               attempt=rebuild_attempt)
+                _maybe_inject_rebuild_enoent(storage_handle, rebuild_attempt)
+            try:
+                storage = rebuild_storage_filename(*storage_metadata)
+            except Exception as error:
+                if rebuild_attempt is not None:
+                    _trace_shared_tensor_lifecycle(
+                        "rebuild_failure",
+                        storage_handle,
+                        attempt=rebuild_attempt,
+                        error_type=type(error).__name__)
+                raise
+            if rebuild_attempt is not None:
+                _trace_shared_tensor_lifecycle("rebuild_success",
+                                               storage_handle,
+                                               attempt=rebuild_attempt)
             if not isinstance(storage, torch.storage.TypedStorage):
                 storage = rebuild_typed_storage(
                     storage, str_to_torch_dtype(tensor_info['storage_dtype']))
@@ -454,14 +580,17 @@ class SharedTensorContainer:
         elif self.method_key == _SharedTensorRebuildMethodRegistry.REBUILD_CPU:
             sharing_strategy = get_sharing_strategy()
             # Here we use file_system sharing strategy to make it serializable between two non-python independent processes
-            set_sharing_strategy("file_system")
-            storage = self.tensor_handle[1]
-            meta_data = self.tensor_handle[2]
-            storage_handle = reduce_storage(storage)
-            # restore the original sharing strategy
-            set_sharing_strategy(sharing_strategy)
+            try:
+                set_sharing_strategy("file_system")
+                storage = self.tensor_handle[1]
+                meta_data = self.tensor_handle[2]
+                storage_handle = reduce_storage(storage)
+            finally:
+                # Restore the process-global strategy even if reduction fails.
+                set_sharing_strategy(sharing_strategy)
             # exclude the first element which is the type of the storage
             storage_metadata = storage_handle[-1][1:]
+            _trace_shared_tensor_lifecycle("credit", storage_metadata[1])
             tensor_dict = SharedTensorContainer.cpu_handle_to_dict(
                 meta_data, storage_metadata)
         else:

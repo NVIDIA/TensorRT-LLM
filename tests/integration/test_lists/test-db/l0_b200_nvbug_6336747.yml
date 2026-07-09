@@ -16,7 +16,9 @@ l0_b200_nvbug_6336747:
       stage: pre_merge
       backend: pytorch
   tests:
-  # NVBug 6336747 stress coverage: run the high-churn NVFP4 VideoMME case 20 times.
+  # NVBug 6336747 stress coverage: run the high-churn NVFP4 multimodal task set (MMMU +
+  # VoxPopuli) 20 times. The native-sbatch runner enables the shared-memory and shutdown
+  # diagnostics only for this list and archives them under shared_tensor_shm_trace/.
   - accuracy/test_llm_api_pytorch_multimodal.py::TestNanoV3Omni::test_auto_dtype[nvfp4-repeat_1]
   - accuracy/test_llm_api_pytorch_multimodal.py::TestNanoV3Omni::test_auto_dtype[nvfp4-repeat_2]
   - accuracy/test_llm_api_pytorch_multimodal.py::TestNanoV3Omni::test_auto_dtype[nvfp4-repeat_3]

@@ -1,9 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import multiprocessing as mp
+import os
+import tempfile
 import unittest
+from pathlib import Path
+from unittest import mock
 
 import torch
 
-from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
+from tensorrt_llm._torch.shared_tensor import (SharedTensorContainer,
+                                               shared_tensor)
 
 
 class TestShareTensor(unittest.TestCase):
@@ -87,6 +95,35 @@ class TestShareTensor(unittest.TestCase):
             # Explicit cleanup to prevent QueueFeederThread leak
             queue.close()
             queue.join_thread()
+
+    def test_cpu_lifecycle_trace_records_credit_and_rebuild(self):
+        with tempfile.TemporaryDirectory() as trace_directory:
+            with mock.patch.dict(os.environ,
+                                 {"TLLM_SHM_TRACE_DIR": trace_directory}):
+                tensor = torch.randn(2, 3)
+                container = SharedTensorContainer.from_tensor(tensor)
+                handle = container.dump_to_dict()
+                reconstructed = SharedTensorContainer.from_dict(
+                    handle).get_local_view()
+                self.assertTrue(torch.equal(tensor, reconstructed))
+
+            records = "".join(path.read_text() for path in Path(
+                trace_directory).glob("shared_tensor_lifecycle.*.log"))
+            self.assertIn("event=credit", records)
+            self.assertIn("event=rebuild_begin", records)
+            self.assertIn("event=rebuild_success", records)
+
+    def test_rebuild_enoent_injection_is_one_shot(self):
+        storage_handle = b"/torch_nvbug6336747_unit_test"
+        with mock.patch.dict(os.environ,
+                             {"TLLM_SHARED_TENSOR_FAIL_REBUILD_AT": "2"
+                              }), mock.patch.object(shared_tensor.os,
+                                                    "unlink") as unlink:
+            shared_tensor._maybe_inject_rebuild_enoent(storage_handle, 1)
+            shared_tensor._maybe_inject_rebuild_enoent(storage_handle, 2)
+            shared_tensor._maybe_inject_rebuild_enoent(storage_handle, 3)
+
+        unlink.assert_called_once_with("/dev/shm/torch_nvbug6336747_unit_test")
 
     def test_share_tensor_different_shapes(self):
         """Test CPU tensor sharing with different tensor shapes."""

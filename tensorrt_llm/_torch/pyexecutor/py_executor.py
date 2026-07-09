@@ -34,6 +34,7 @@ from tensorrt_llm.bindings.executor import (DisServingRequestStats,
 from tensorrt_llm.bindings.internal.batch_manager import (LlmRequestType,
                                                           ReqIdsSet)
 from tensorrt_llm.executor.request import TruncateKVCacheRequest
+from tensorrt_llm.executor.shutdown_diagnostics import wait_for_shutdown_event
 from tensorrt_llm.inputs.multimodal import strip_mm_data_for_generation
 from tensorrt_llm.llmapi.llm_args import PeftCacheConfig, WaitingQueuePolicy
 from tensorrt_llm.logger import logger
@@ -1416,7 +1417,8 @@ class PyExecutor:
         Signals the server to shutdown.
         """
         self.executor_request_queue.enqueue_shutdown_request()
-        self.shutdown_event.wait()
+        wait_for_shutdown_event(self.shutdown_event, "PyExecutor",
+                                "shutdown_event.wait")
         if self.hang_detector.detected():
             # Early return here to avoid waiting for hanging threads.
             # Since `on_detected` has sent the error message as response,
@@ -1536,7 +1538,8 @@ class PyExecutor:
         return events
 
     def wait_shutdown(self):
-        self.shutdown_event.wait()
+        wait_for_shutdown_event(self.shutdown_event, "PyExecutor",
+                                "wait_shutdown")
 
     def enqueue_request(
             self,

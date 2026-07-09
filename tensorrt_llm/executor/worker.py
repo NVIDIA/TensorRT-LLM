@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import gc
 import os
 import threading
@@ -26,12 +29,30 @@ from .postproc_worker import (PostprocWorker, PostprocWorkerConfig,
                               postproc_worker_main)
 from .request import CancellingRequest, GenerationRequest
 from .rpc_worker_mixin import RpcWorkerMixin
+from .shutdown_diagnostics import shutdown_watchdog, trace_shutdown_phase
 from .utils import (ErrorResponse, IntraProcessQueue, RequestError,
                     WorkerCommIpcAddrs)
 
 __all__ = [
     "GenerationExecutorWorker",
 ]
+
+
+def _verify_required_shm_trace_is_loaded() -> None:
+    if os.environ.get("TLLM_SHM_TRACE_REQUIRED") != "1":
+        return
+    try:
+        with open("/proc/self/maps", encoding="utf-8") as process_maps:
+            tracer_loaded = any("libnvbug6336747_shm_trace" in mapping
+                                for mapping in process_maps)
+    except OSError as error:
+        raise RuntimeError(
+            "Unable to verify the NVBug 6336747 shared-memory tracer"
+        ) from error
+    if not tracer_loaded:
+        raise RuntimeError(
+            "NVBug 6336747 shared-memory tracer is not loaded in the executor worker"
+        )
 
 
 class GenerationExecutorWorker(RpcWorkerMixin, BaseWorker):
@@ -99,14 +120,24 @@ class GenerationExecutorWorker(RpcWorkerMixin, BaseWorker):
             self.doing_shutdown = True
 
         logger_debug(f'Worker {mpi_rank()} shutdown...\n', "yellow")
+        trace_shutdown_phase("GenerationExecutorWorker",
+                             "shutdown",
+                             state="begin",
+                             rank=mpi_rank())
 
         if self.engine is not None:
             if self.engine.can_enqueue_requests():
                 if self.await_response_thread.is_alive():
                     self.await_response_thread.stop()
-                    self.await_response_thread.join()
+                    with shutdown_watchdog("GenerationExecutorWorker",
+                                           "await_response_thread.join",
+                                           force_exit=True):
+                        self.await_response_thread.join()
 
-            self.engine.shutdown()
+            with shutdown_watchdog("GenerationExecutorWorker",
+                                   "engine.shutdown",
+                                   force_exit=True):
+                self.engine.shutdown()
             self.engine = None
 
             if self.llm_args is not None:
@@ -149,6 +180,10 @@ class GenerationExecutorWorker(RpcWorkerMixin, BaseWorker):
         # Check if there are any errors from the threads before shutdown.
         self._handle_background_error()
 
+        trace_shutdown_phase("GenerationExecutorWorker",
+                             "shutdown",
+                             state="end",
+                             rank=mpi_rank())
         logger_debug(f"Worker {mpi_rank()} shutdown done.\n", "yellow")
 
     def block_subordinates(self):
@@ -183,6 +218,8 @@ def worker_main(
     rpc_addr: Optional[str] = None,
     hmac_key: bytes = b"",
 ) -> None:
+
+    _verify_required_shm_trace_is_loaded()
 
     def _print_stacks():
         counter = 0

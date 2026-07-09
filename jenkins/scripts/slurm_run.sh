@@ -1,4 +1,6 @@
 #!/bin/bash
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 
 # Set up error handling
 set -xEeuo pipefail
@@ -29,6 +31,40 @@ set_value_in_command() {
     echo "$result"
 }
 
+# Record the host/container /dev/shm relationship before installation can
+# start helper processes or remove the host-created canary.
+if [[ "$pytestCommand" == *"l0_b200_nvbug_6336747.txt"* ]]; then
+    export TLLM_SHM_TRACE_DIR="$jobWorkspace/shared_tensor_shm_trace"
+    mkdir -p "$TLLM_SHM_TRACE_DIR"
+    innerShmStat=$(stat -Lc '%d:%i' /dev/shm)
+    innerCanaryStat="missing"
+    sharedHostShm="not-configured"
+    if [[ -n "${TLLM_HOST_SHM_CANARY_PATH:-}" ]]; then
+        sharedHostShm="no"
+        if [[ -e "$TLLM_HOST_SHM_CANARY_PATH" ]]; then
+            innerCanaryStat=$(stat -Lc '%d:%i' "$TLLM_HOST_SHM_CANARY_PATH")
+            if [[ "$innerCanaryStat" == "${TLLM_HOST_SHM_CANARY_STAT:-}" ]]; then
+                sharedHostShm="yes"
+            else
+                sharedHostShm="mismatch"
+            fi
+        fi
+    fi
+    {
+        echo "time=$(date +%s.%N)"
+        echo "host_mntns=${TLLM_HOST_MNTNS:-?}"
+        echo "inner_mntns=$(readlink /proc/self/ns/mnt)"
+        echo "inner_ipcns=$(readlink /proc/self/ns/ipc)"
+        echo "host_shm_stat=${TLLM_HOST_SHM_STAT:-?}"
+        echo "inner_shm_stat=$innerShmStat"
+        echo "host_canary_path=${TLLM_HOST_SHM_CANARY_PATH:-?}"
+        echo "host_canary_stat=${TLLM_HOST_SHM_CANARY_STAT:-?}"
+        echo "inner_canary_stat=$innerCanaryStat"
+        echo "shared_host_dev_shm=$sharedHostShm"
+        awk '$5 == "/dev/shm" {print "inner_mountinfo=" $0}' /proc/self/mountinfo
+    } > "$TLLM_SHM_TRACE_DIR/shm_mount_topology.${SLURM_PROCID}.log"
+fi
+
 # Only the first process will set the git config
 if [ $SLURM_PROCID -eq 0 ]; then
     # Update HOME/.gitconfig
@@ -43,6 +79,96 @@ if [[ "$stageName" != *Disagg* ]]; then
     installScriptPath="$(dirname "${BASH_SOURCE[0]}")/$(basename "${BASH_SOURCE[0]}" | sed 's/slurm_run\.sh/slurm_install.sh/')"
     source "$installScriptPath"
     slurm_install_setup
+fi
+
+# NVBug 6336747 runs through this native-sbatch path, after the source archive is
+# unpacked. Build and validate the preload tracer here so pytest, MPI children,
+# and torch_shm_manager all inherit it.
+if [[ "$pytestCommand" == *"l0_b200_nvbug_6336747.txt"* ]]; then
+    traceLibrary="/tmp/libnvbug6336747_shm_trace_${SLURM_JOB_ID}_${SLURM_PROCID}.so"
+    gcc -shared -fPIC -Wall -Wextra -Werror \
+        -o "$traceLibrary" \
+        "$llmSrcNode/tests/integration/defs/shared_tensor_shm_trace.c" -ldl
+    export LD_PRELOAD="${traceLibrary}${LD_PRELOAD:+:${LD_PRELOAD}}"
+
+    traceProbe="torch_nvbug6336747_probe_${SLURM_JOB_ID}_${SLURM_PROCID}"
+    TRACE_PROBE="$traceProbe" python3 -c \
+        'import os; from multiprocessing import shared_memory; shm = shared_memory.SharedMemory(name=os.environ["TRACE_PROBE"], create=True, size=4096); shm.unlink(); shm.close()'
+    if ! grep -R -Fq -- "$traceProbe" "$TLLM_SHM_TRACE_DIR"; then
+        echo "NVBug 6336747 tracer self-test failed: no record for $traceProbe" >&2
+        exit 1
+    fi
+
+    # The preload shim cannot see raw syscalls or libc-private calls. Build a
+    # ptrace/seccomp wrapper that follows pytest descendants and records the
+    # result of every unlink/unlinkat syscall without tracing unrelated calls.
+    syscallTraceBinary="/tmp/nvbug6336747_unlink_trace_${SLURM_JOB_ID}_${SLURM_PROCID}"
+    gcc -std=c11 -Wall -Wextra -Werror \
+        -o "$syscallTraceBinary" \
+        "$llmSrcNode/tests/integration/defs/shared_tensor_unlink_syscall_trace.c"
+    syscallTraceProbe="/tmp/torch_nvbug6336747_syscall_probe_${SLURM_JOB_ID}_${SLURM_PROCID}"
+    syscallTraceProbeLog="$TLLM_SHM_TRACE_DIR/unlink_syscalls_probe.${SLURM_PROCID}.log"
+    SYSCALL_TRACE_PROBE="$syscallTraceProbe" "$syscallTraceBinary" "$syscallTraceProbeLog" -- python3 -c \
+        'import os; path = os.environ["SYSCALL_TRACE_PROBE"]; open(path, "wb").close(); os.unlink(path)'
+    if ! grep -Fq -- "result=0 errno=0 path=$syscallTraceProbe" "$syscallTraceProbeLog"; then
+        echo "NVBug 6336747 syscall tracer self-test failed: no unlink record for $syscallTraceProbe" >&2
+        exit 1
+    fi
+    export TLLM_UNLINK_SYSCALL_TRACER="$syscallTraceBinary"
+    export TLLM_UNLINK_SYSCALL_TRACE_FILE="$TLLM_SHM_TRACE_DIR/unlink_syscalls.${SLURM_PROCID}.log"
+
+    # inotify observes namespace mutations from every process that can modify
+    # this /dev/shm directory, including processes outside the pytest tree. It
+    # cannot identify the actor, but distinguishes unlink, rename, and unmount.
+    shmEventTraceBinary="/tmp/nvbug6336747_shm_event_trace_${SLURM_JOB_ID}_${SLURM_PROCID}"
+    gcc -std=c11 -Wall -Wextra -Werror \
+        -o "$shmEventTraceBinary" \
+        "$llmSrcNode/tests/integration/defs/shared_tensor_shm_event_trace.c"
+    shmEventTraceProbeLog="$TLLM_SHM_TRACE_DIR/shm_namespace_events_probe.${SLURM_PROCID}.log"
+    "$shmEventTraceBinary" "$shmEventTraceProbeLog" /dev/shm &
+    shmEventTraceProbePid=$!
+    shmEventTraceProbeReady=0
+    for _ in {1..50}; do
+        if grep -Fq -- "event=watch_start" "$shmEventTraceProbeLog"; then
+            shmEventTraceProbeReady=1
+            break
+        fi
+        if ! kill -0 "$shmEventTraceProbePid" 2>/dev/null; then
+            break
+        fi
+        sleep 0.1
+    done
+    if [[ $shmEventTraceProbeReady -ne 1 ]]; then
+        kill -TERM "$shmEventTraceProbePid" 2>/dev/null || true
+        wait "$shmEventTraceProbePid" || true
+        echo "NVBug 6336747 shm namespace tracer failed to start" >&2
+        exit 1
+    fi
+    shmEventTraceProbe="/dev/shm/torch_nvbug6336747_event_probe_${SLURM_JOB_ID}_${SLURM_PROCID}"
+    : > "$shmEventTraceProbe"
+    rm -f "$shmEventTraceProbe"
+    kill -TERM "$shmEventTraceProbePid"
+    wait "$shmEventTraceProbePid"
+    shmEventTraceProbeName=$(basename "$shmEventTraceProbe")
+    if ! awk -v name="$shmEventTraceProbeName" \
+        'index($0, "create=1") && index($0, "name=" name) {found=1} END {exit !found}' \
+        "$shmEventTraceProbeLog"; then
+        echo "NVBug 6336747 shm namespace tracer self-test failed: no create event" >&2
+        exit 1
+    fi
+    if ! awk -v name="$shmEventTraceProbeName" \
+        'index($0, "delete=1") && index($0, "name=" name) {found=1} END {exit !found}' \
+        "$shmEventTraceProbeLog"; then
+        echo "NVBug 6336747 shm namespace tracer self-test failed: no delete event" >&2
+        exit 1
+    fi
+    export TLLM_SHM_EVENT_TRACER="$shmEventTraceBinary"
+    export TLLM_SHM_EVENT_TRACE_FILE="$TLLM_SHM_TRACE_DIR/shm_namespace_events.${SLURM_PROCID}.log"
+
+    export TLLM_SHUTDOWN_TRACE_DIR="$TLLM_SHM_TRACE_DIR"
+    export TLLM_SHUTDOWN_TRACE_TIMEOUT_SEC=60
+    export TLLM_SHUTDOWN_FORCE_EXIT=1
+    export TLLM_SHM_TRACE_REQUIRED=1
 fi
 
 if [[ "$stageName" == *GB200* ]]; then
@@ -119,6 +245,31 @@ if [ "${SLURM_JOB_NUM_NODES:-1}" -eq 1 ] || \
     done
 fi
 
+# Start the directory watcher outside the ptrace wrapper so it continues to
+# observe the namespace if pytest or the wrapper aborts.
+shmEventTracePid=""
+if [[ -n "${TLLM_SHM_EVENT_TRACE_FILE:-}" ]]; then
+    "$TLLM_SHM_EVENT_TRACER" "$TLLM_SHM_EVENT_TRACE_FILE" /dev/shm &
+    shmEventTracePid=$!
+    shmEventTraceReady=0
+    for _ in {1..50}; do
+        if grep -Fq -- "event=watch_start" "$TLLM_SHM_EVENT_TRACE_FILE"; then
+            shmEventTraceReady=1
+            break
+        fi
+        if ! kill -0 "$shmEventTracePid" 2>/dev/null; then
+            break
+        fi
+        sleep 0.1
+    done
+    if [[ $shmEventTraceReady -ne 1 ]]; then
+        kill -TERM "$shmEventTracePid" 2>/dev/null || true
+        wait "$shmEventTracePid" || true
+        echo "NVBug 6336747 shm namespace tracer failed to start for pytest" >&2
+        exit 1
+    fi
+fi
+
 # Turn off "exit on error" so the following lines always run
 set +e
 
@@ -126,9 +277,27 @@ pytest_exit_code=0
 perf_check_exit_code=0
 perf_report_exit_code=0
 
-eval $pytestCommand
+if [[ -n "${TLLM_UNLINK_SYSCALL_TRACE_FILE:-}" ]]; then
+    "$TLLM_UNLINK_SYSCALL_TRACER" "$TLLM_UNLINK_SYSCALL_TRACE_FILE" -- bash -c "$pytestCommand"
+else
+    eval "$pytestCommand"
+fi
 pytest_exit_code=$?
 echo "Rank${SLURM_PROCID} Pytest finished execution with exit code $pytest_exit_code"
+
+if [[ -n "$shmEventTracePid" ]]; then
+    kill -TERM "$shmEventTracePid" 2>/dev/null
+    shm_event_trace_kill_exit_code=$?
+    wait "$shmEventTracePid"
+    shm_event_trace_exit_code=$?
+    if [[ $shm_event_trace_kill_exit_code -ne 0 || $shm_event_trace_exit_code -ne 0 ]]; then
+        echo "NVBug 6336747 shm namespace tracer exited unexpectedly: " \
+            "kill=$shm_event_trace_kill_exit_code, wait=$shm_event_trace_exit_code" >&2
+        if [[ $pytest_exit_code -eq 0 ]]; then
+            pytest_exit_code=1
+        fi
+    fi
+fi
 
 # DEBUG: Diagnose intermittent "unrecognized arguments" failure (Exit Code 4)
 # Remove this after the issue is resolved

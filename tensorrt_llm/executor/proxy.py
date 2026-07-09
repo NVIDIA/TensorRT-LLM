@@ -41,6 +41,9 @@ from .request import CancellingRequest, GenerationRequest
 from .result import GenerationResult, IterationResult
 from .rpc import RPCClient
 from .rpc.rpc_common import RPCError, get_unique_ipc_addr
+from .shutdown_diagnostics import (dump_shutdown_stacks,
+                                   get_shutdown_timeout_seconds,
+                                   shutdown_watchdog, trace_shutdown_phase)
 from .utils import (EngineDeadError, ErrorResponse, RequestError,
                     WorkerCommIpcAddrs, create_mpi_comm_session,
                     get_spawn_proxy_process_env, is_llm_response,
@@ -603,6 +606,9 @@ class GenerationExecutorProxy(GenerationExecutor):
             return
         else:
             self.doing_shutdown = True
+        trace_shutdown_phase("GenerationExecutorProxy",
+                             "pre_shutdown",
+                             state="begin")
 
         # Wake the error monitor thread immediately so it exits cleanly
         if hasattr(self, '_shutdown_event'):
@@ -635,6 +641,9 @@ class GenerationExecutorProxy(GenerationExecutor):
         # case (a); keep both behaviours explicit.
         if not self.mpi_futures or any(not f.done() for f in self.mpi_futures):
             self.request_queue.put_noblock(None, retry=4)
+        trace_shutdown_phase("GenerationExecutorProxy",
+                             "pre_shutdown",
+                             state="end")
 
     def shutdown(self):
         if not self.workers_started:
@@ -644,11 +653,26 @@ class GenerationExecutorProxy(GenerationExecutor):
             self.pre_shutdown()
 
         logger_debug('Proxy.shutdown...\n', "yellow")
+        trace_shutdown_phase("GenerationExecutorProxy",
+                             "shutdown",
+                             state="begin")
+        shutdown_timeout = get_shutdown_timeout_seconds()
+        worker_wait_timed_out = False
 
-        for f in self.mpi_futures:
+        for index, future in enumerate(self.mpi_futures):
             try:
-                f.result()
-            except:
+                with shutdown_watchdog("GenerationExecutorProxy",
+                                       f"worker_future[{index}]"):
+                    future.result(timeout=shutdown_timeout)
+            except concurrent.futures.TimeoutError:
+                worker_wait_timed_out = True
+                trace_shutdown_phase("GenerationExecutorProxy",
+                                     f"worker_future[{index}]",
+                                     state="bounded_fallback")
+                dump_shutdown_stacks("GenerationExecutorProxy",
+                                     f"worker_future[{index}]")
+                break
+            except Exception:
                 # The errors are already captured in mpi_done_callback, ignored
                 # here
                 pass
@@ -662,7 +686,16 @@ class GenerationExecutorProxy(GenerationExecutor):
         if self.dispatch_result_thread is not None and self.dispatch_result_thread.is_alive(
         ):
             self.dispatch_result_thread.stop()
-            self.dispatch_result_thread.join()
+            with shutdown_watchdog("GenerationExecutorProxy",
+                                   "dispatch_result_thread.join"):
+                self.dispatch_result_thread.join(timeout=shutdown_timeout)
+            if self.dispatch_result_thread.is_alive():
+                worker_wait_timed_out = True
+                trace_shutdown_phase("GenerationExecutorProxy",
+                                     "dispatch_result_thread.join",
+                                     state="bounded_fallback")
+                dump_shutdown_stacks("GenerationExecutorProxy",
+                                     "dispatch_result_thread.join")
 
         # step3: finish all remaining work
 
@@ -680,13 +713,21 @@ class GenerationExecutorProxy(GenerationExecutor):
 
         self.workers_started = False
         if self._owns_mpi_session:
-            self.mpi_session.shutdown()
+            if shutdown_timeout is None:
+                self.mpi_session.shutdown()
+            else:
+                # Diagnostic runs must not consume the outer one-hour pytest timeout
+                # after graceful worker teardown has already wedged.
+                self.mpi_session.shutdown_abort(
+                    grace=1 if worker_wait_timed_out else shutdown_timeout,
+                    reason="bounded executor shutdown fallback")
 
         # Process the errors in-case error during shutting down the threads
         self._handle_background_error()
 
         if enable_llm_debug():
             print_alive_threads()
+        trace_shutdown_phase("GenerationExecutorProxy", "shutdown", state="end")
 
     def submit(self, request: GenerationRequest) -> GenerationResult:
         """
