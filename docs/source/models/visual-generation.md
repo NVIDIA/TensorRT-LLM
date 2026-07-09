@@ -270,9 +270,9 @@ attention_config:
     vsa_sparsity: 0.90
 ```
 
-### CPU Offloading (Wan T2V only)
+### CPU Offloading (Wan and Cosmos3 T2V)
 
-CPU offloading stages move selected Wan T2V pipeline components between CPU and GPU to reduce peak GPU memory usage; enable it with `cpu_offload_config.enable: true`
+CPU offloading stages move selected Wan and Cosmos3 T2V pipeline components between CPU and GPU to reduce peak GPU memory usage; enable it with `cpu_offload_config.enable: true`.
 
 ### Multi-GPU Parallelism
 
