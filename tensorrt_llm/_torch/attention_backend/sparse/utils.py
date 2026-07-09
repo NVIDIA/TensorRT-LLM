@@ -104,6 +104,9 @@ def get_flashinfer_sparse_attn_attention_backend(
         sparse_params: "SparseParams") -> Type["AttentionBackend"]:
     if sparse_params.algorithm == "minimax_m3":
         return _resolve_minimax_m3_backend_cls(sparse_params)
+    if sparse_params.algorithm == "deepseek_v4":
+        from .deepseek_v4.flashinfer import DeepseekV4FlashInferAttention
+        return DeepseekV4FlashInferAttention
     raise ValueError(
         f"Unsupported sparse attention algorithm in flashinfer attention backend: {sparse_params.algorithm}"
     )

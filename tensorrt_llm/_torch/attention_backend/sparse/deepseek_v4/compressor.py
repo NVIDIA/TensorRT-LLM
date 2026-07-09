@@ -104,6 +104,10 @@ class Compressor(nn.Module):
         self.kv_cache_dtype: KVCacheDtype = resolve_kv_cache_dtype(kv_cache_dtype)
         self.is_indexer = is_indexer
         self.rotate_activation = rotate_activation
+        # FlashInfer footer-scale mode: the COMPRESS pool holds footer-scale
+        # pages the fused C++ scatter cannot write, so postprocess + scatter
+        # run in Python instead (see _footer_scale_postprocess_scatter).
+        self.footer_scale_cache = False
 
         # Modules
         self.wkv_gate = Linear(
@@ -273,6 +277,21 @@ class Compressor(nn.Module):
         position_ids = metadata.compressed_position_ids_cuda[self.compress_ratio][:total_tokens]
         compressed_mask = metadata.compressed_mask_cuda[self.compress_ratio][:total_tokens]
 
+        if self.footer_scale_cache and not self.is_indexer:
+            self._footer_scale_postprocess_scatter(
+                kv_comp,
+                kv_cache,
+                block_table,
+                compress_tokens_per_block,
+                num_comp_tokens,
+                cu_new_comp_kv,
+                start_pos,
+                position_ids,
+                compressed_mask,
+                bsz,
+            )
+            return kv_comp, None
+
         # Fused postprocess + scatter: RMSNorm + RoPE + Hadamard + paged cache write
         torch.ops.trtllm.compressor_postprocess_scatter(
             kv_comp,
@@ -303,3 +322,75 @@ class Compressor(nn.Module):
         if kv_out is not None:
             return kv_out, None
         return kv_comp, None
+
+    def enable_footer_scale_cache(self) -> None:
+        assert not self.is_indexer, "the indexer compressor keeps its native cache layout"
+        self.footer_scale_cache = True
+
+    def _footer_scale_postprocess_scatter(
+        self,
+        kv_comp: torch.Tensor,
+        kv_cache: torch.Tensor,
+        block_table: torch.Tensor,
+        tokens_per_block: int,
+        num_comp_tokens: torch.Tensor,
+        cu_new_comp_kv: torch.Tensor,
+        start_pos: torch.Tensor,
+        position_ids: torch.Tensor,
+        compressed_mask: torch.Tensor,
+        batch_size: int,
+    ) -> None:
+        """Postprocess + footer-scale scatter, in Python.
+
+        Mirrors ``postProcessScatterKernel`` with ``ROTATE_ACTIVATION=false``:
+        full-row RMSNorm x weight, interleaved RoPE on the rope tail (fp32
+        throughout), then the cu-search + block-table walk to per-token slots.
+        Invalid tokens (masked, padded, or without a mapped block) become slot
+        ``-1``, which the scatter kernel skips.
+        """
+        from . import footer_scale_kv
+
+        total_tokens = kv_comp.shape[0]
+        if total_tokens == 0:
+            return
+        device = kv_comp.device
+
+        x = kv_comp.to(torch.float32)
+        rms = torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.norm.variance_epsilon)
+        x = x * rms * self.norm.weight.to(torch.float32)
+
+        rope_dim = self.rope_head_dim
+        half = rope_dim // 2
+        cos_sin = self.rotary_emb.rotary_cos_sin.view(-1, rope_dim)[position_ids.to(torch.long)]
+        cos, sin = cos_sin[:, :half], cos_sin[:, half:]
+        rope = x[:, self.nope_head_dim :]
+        even, odd = rope[:, 0::2], rope[:, 1::2]
+        rope_rot = torch.empty_like(rope)
+        rope_rot[:, 0::2] = even * cos - odd * sin
+        rope_rot[:, 1::2] = odd * cos + even * sin
+        rows = torch.cat([x[:, : self.nope_head_dim], rope_rot], dim=-1).to(torch.bfloat16)
+
+        token_idx = torch.arange(total_tokens, dtype=torch.int32, device=device)
+        cu = cu_new_comp_kv[: batch_size + 1].to(torch.int32)
+        batch_idx = torch.searchsorted(cu[1:], token_idx, right=True).clamp(
+            max=batch_size - 1
+        )
+        local_idx = token_idx - cu[batch_idx]
+        valid = compressed_mask.to(torch.bool) & (local_idx < num_comp_tokens[batch_idx])
+
+        cache_pos = start_pos[batch_idx] + local_idx
+        logical_block = torch.div(cache_pos, tokens_per_block, rounding_mode="floor")
+        token_in_block = cache_pos - logical_block * tokens_per_block
+        max_blocks = block_table.shape[1]
+        in_range = valid & (logical_block >= 0) & (logical_block < max_blocks)
+        phys_block = block_table[
+            batch_idx.to(torch.long),
+            logical_block.clamp(min=0, max=max_blocks - 1).to(torch.long),
+        ]
+        slot = phys_block * tokens_per_block + token_in_block
+        loc = torch.where(in_range & (phys_block >= 0), slot, torch.full_like(slot, -1))
+
+        pool = kv_cache.view(torch.uint8).reshape(kv_cache.shape[0], -1)
+        footer_scale_kv.quant_scatter(
+            pool, loc.to(torch.int32).contiguous(), rows, page_size=tokens_per_block
+        )
