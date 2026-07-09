@@ -652,6 +652,12 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
     SlurmPartition partition = SlurmConfig.resolvePlatform(platform)
     SlurmCluster cluster = SlurmConfig.clusterConfig[partition.clusterName]
 
+    // Record which cluster this attempt ran on so a failed node is remembered
+    // against its own cluster (auto: platforms pick a cluster at random per attempt).
+    if (placementContext != null) {
+        placementContext.lastSlurmClusterName = partition.clusterName
+    }
+
     def entrypoint = SlurmConfig.containerRuntimeToEntrypoint[cluster.containerRuntime]
 
     // Create a unique suffix for the node name and workspace
@@ -679,8 +685,9 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
 
                 def mounts = getMountListForSlurmTest(cluster, false).join(",")
                 def slurmCommand = SlurmConfig.generateCommand(cluster, partition, nodeSecret, nodeName, Jenkins.instance.rootUrl, LLM_DOCKER_IMAGE, mounts)
-                def slurmCommandWithExclusion = trtllm_utils.addSlurmExcludeToCommand(slurmCommand, placementContext?.excludedSlurmNodeLists)
-                def slurmExcludeArg = trtllm_utils.buildSlurmExcludeArg(placementContext?.excludedSlurmNodeLists)
+                def clusterExcludes = placementContext?.excludedSlurmNodeListsByCluster?.get(partition.clusterName)
+                def slurmCommandWithExclusion = trtllm_utils.addSlurmExcludeToCommand(slurmCommand, clusterExcludes)
+                def slurmExcludeArg = trtllm_utils.buildSlurmExcludeArg(clusterExcludes)
                 if (slurmExcludeArg) {
                     if (slurmCommandWithExclusion != slurmCommand) {
                         echo "[INFRA-RETRY] ${stageName}: requesting SLURM retry placement exclusion: ${slurmExcludeArg}"
@@ -1136,6 +1143,12 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
     SlurmPartition partition = SlurmConfig.resolvePlatform(platform)
     SlurmCluster cluster = SlurmConfig.clusterConfig[partition.clusterName]
 
+    // Record which cluster this attempt ran on so a failed node is remembered
+    // against its own cluster (auto: platforms pick a cluster at random per attempt).
+    if (placementContext != null) {
+        placementContext.lastSlurmClusterName = partition.clusterName
+    }
+
     // Create a unique suffix for the job name
     String customSuffix = "${env.BUILD_TAG}-${UUID.randomUUID().toString().replaceAll("-", "").substring(0, 6)}".toLowerCase()
     def jobUID = "${cluster.host}-multi_node_test-${customSuffix}"
@@ -1441,7 +1454,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 if (SlurmConfig.needsIdleGpuExemption(cluster)) {
                     exemptionComment = "--comment='${SlurmConfig.IDLE_GPU_EXEMPTION_PAYLOAD}'"
                 }
-                def slurmExcludeArg = trtllm_utils.buildSlurmExcludeArg(placementContext?.excludedSlurmNodeLists)
+                def slurmExcludeArg = trtllm_utils.buildSlurmExcludeArg(placementContext?.excludedSlurmNodeListsByCluster?.get(partition.clusterName))
                 def slurmExcludeDirective = slurmExcludeArg ? "#SBATCH ${slurmExcludeArg}" : ""
                 if (slurmExcludeArg) {
                     echo "[INFRA-RETRY] ${stageName}: requesting SLURM retry placement exclusion: ${slurmExcludeArg}"
@@ -1810,18 +1823,25 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
   echo "Run Slurm job with native sbatch: $runWithSbatch"
 
   def attempt = 0
-  def avoidedSlurmNodeLists = []
+  // Avoided SLURM nodes keyed by cluster. The platform can resolve to a
+  // different cluster on each attempt (auto: platforms pick one at random), and
+  // a node name from one cluster is unknown to another's controller -- passing
+  // it to --exclude makes sbatch hard-fail with "Invalid node name specified".
+  // Keying by cluster lets each attempt exclude only nodes that belong to the
+  // cluster it actually submits to.
+  def avoidedSlurmNodeListsByCluster = [:]
 
   while (true) {
     attempt++
     Map attemptPlacementContext = [
-      excludedSlurmNodeLists: avoidedSlurmNodeLists.collect()
+      excludedSlurmNodeListsByCluster: avoidedSlurmNodeListsByCluster.collectEntries { c, ns -> [(c): ns.collect()] }
     ]
     try {
       if (attempt > 1) {
         echo "[INFRA-RETRY] ${stageName}: Starting attempt ${attempt} of ${SLURM_INFRA_RETRY_MAX + 1}"
-        if (!avoidedSlurmNodeLists.isEmpty()) {
-          echo "[INFRA-RETRY] ${stageName}: avoiding prior SLURM node list(s): ${avoidedSlurmNodeLists.join(', ')}"
+        if (!avoidedSlurmNodeListsByCluster.isEmpty()) {
+          echo "[INFRA-RETRY] ${stageName}: avoiding prior SLURM node list(s): " +
+               avoidedSlurmNodeListsByCluster.collect { c, ns -> "${c}: ${ns.join(' ')}" }.join('; ')
         }
       }
 
@@ -1863,7 +1883,7 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
       if (c instanceof PipelineInterruption) throw e
       if (!(c instanceof InfraFailure))      throw e   // UserFailure -> don't retry
 
-      rememberAvoidedSlurmNodeLists(avoidedSlurmNodeLists, attemptPlacementContext.lastSlurmNodeList, stageName)
+      rememberAvoidedSlurmNodeLists(avoidedSlurmNodeListsByCluster, attemptPlacementContext.lastSlurmClusterName, attemptPlacementContext.lastSlurmNodeList, stageName)
 
       def effectiveMax = (c.severity == InfraFailure.PERSISTENT) ? 1 : SLURM_INFRA_RETRY_MAX
 
@@ -2100,17 +2120,29 @@ def rememberAvoidedKubernetesHostNodes(List avoidedNodes, def nodes, String stag
     }
 }
 
-def rememberAvoidedSlurmNodeLists(List avoidedNodeLists, def nodes, String stageName)
+def rememberAvoidedSlurmNodeLists(Map avoidedNodeListsByCluster, String clusterName, def nodes, String stageName)
 {
+    // Without the cluster the node ran on we can't safely exclude it (a node name
+    // is only valid on its own cluster's controller), so skip -- degrading to no
+    // avoidance rather than risking a cross-cluster "Invalid node name" submit.
+    if (!clusterName) {
+        return
+    }
     def nodeLists = trtllm_utils.normalizeSlurmNodeLists(nodes)
+    if (nodeLists.isEmpty()) {
+        return
+    }
+    def clusterNodeLists = avoidedNodeListsByCluster.get(clusterName)
+    if (clusterNodeLists == null) {
+        clusterNodeLists = []
+        avoidedNodeListsByCluster.put(clusterName, clusterNodeLists)
+    }
     nodeLists.each { nodeList ->
-        if (!avoidedNodeLists.contains(nodeList)) {
-            avoidedNodeLists << nodeList
+        if (!clusterNodeLists.contains(nodeList)) {
+            clusterNodeLists << nodeList
         }
     }
-    if (!nodeLists.isEmpty()) {
-        echo "[INFRA-RETRY] ${stageName}: recorded SLURM node list(s) for retry avoidance: ${nodeLists.join(', ')}"
-    }
+    echo "[INFRA-RETRY] ${stageName}: recorded SLURM node list(s) for retry avoidance on ${clusterName}: ${nodeLists.join(', ')}"
 }
 
 def readSlurmWorkspaceFile(def pipeline, Map remote, String path, String stageName, int numRetries=1)
@@ -3570,12 +3602,6 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             }
         }
 
-        trtllm_utils.llmExecStepWithRetry(pipeline, script: "mkdir -p /opt/tritonserver/backends/tensorrtllm")
-        def isAarch64 = config.contains("aarch64")
-        if (!isAarch64) {
-            trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmPath} && cp TensorRT-LLM/triton_backend/inflight_batcher_llm/libtriton_tensorrtllm.so /opt/tritonserver/backends/tensorrtllm/")
-            trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmPath} && cp TensorRT-LLM/triton_backend/inflight_batcher_llm/trtllmExecutorWorker /opt/tritonserver/backends/tensorrtllm/")
-        }
         trtllm_utils.llmExecStepWithRetry(pipeline, script: "git config --global --add safe.directory \"*\"")
         } // timeout 45 min
     }
@@ -4324,12 +4350,66 @@ def runKubernetesPodWithInfraRetry(Map opts = [:], pipeline, podSpec, containerN
 
     // DEBUG_MODE preserves the existing 2-hour-input human-inspection workflow
     // inside runLLMTestlistOnPlatform's finallyRunner: a single attempt only.
-    // singleAttempt (per-call opt) opts out of the retry loop for the same
-    // reason at the call site -- e.g. SLURM dispatcher pods rely on their
-    // inner SLURM retry and don't want an outer pod-level retry budget.
-    if (singleAttempt || testFilter[(DEBUG_MODE)]) {
+    if (testFilter[(DEBUG_MODE)]) {
         trtllm_utils.launchKubernetesPod(pipeline, podSpec, containerName, { runner("", true, null) })
         return
+    }
+
+    // singleAttempt opts out of the outer pod-level *execution* retry: the inner
+    // retry (e.g. SLURM) owns re-runs, and re-running after work has started
+    // could double-submit. But a failure *before* the runner body begins is a
+    // pod/agent launch failure (the JNLP agent never came online, the node was
+    // pulled during provisioning, etc.): nothing has been dispatched yet, so
+    // relaunching a fresh pod -- steered off the bad node by host-node avoidance
+    // -- is safe and is the only way these recover. Retry launch failures only;
+    // once the runner starts (runnerStarted), honor singleAttempt and rethrow.
+    if (singleAttempt) {
+        def avoidedKubernetesHostNodes = []
+        def launchAttempt = 0
+        while (true) {
+            launchAttempt++
+            Map attemptPlacementContext = [runnerStarted: false]
+            try {
+                if (launchAttempt > 1 && !avoidedKubernetesHostNodes.isEmpty()) {
+                    echo "[INFRA-RETRY] ${stageName}: relaunching pod (attempt ${launchAttempt}), avoiding prior host node(s): ${avoidedKubernetesHostNodes.join(', ')}"
+                }
+                def attemptPodSpec = trtllm_utils.withKubernetesHostNodeExclusion(podSpec, avoidedKubernetesHostNodes)
+                trtllm_utils.launchKubernetesPodWithPlacement(pipeline, attemptPodSpec, containerName, attemptPlacementContext, {
+                    attemptPlacementContext.runnerStarted = true
+                    runner("", true, null)
+                })
+                return
+            } catch (InterruptedException e) {
+                throw e
+            } catch (Exception e) {
+                // Once the runner has started, this is an execution failure the
+                // inner retry owns -- honor singleAttempt and do not re-run.
+                if (attemptPlacementContext.runnerStarted) {
+                    throw e
+                }
+                def c = FailureClassifier.classify(e, InfraFailure.K8S)
+                if (c instanceof PipelineInterruption) throw e
+                if (!(c instanceof InfraFailure))      throw e   // UserFailure -> don't retry
+
+                rememberAvoidedKubernetesHostNodes(avoidedKubernetesHostNodes, attemptPlacementContext.lastHostNode, stageName)
+
+                if (launchAttempt > K8S_INFRA_RETRY_MAX) {
+                    echo "[INFRA-RETRY] ${stageName}: pod launch failed before execution (${c.detectedPattern}), " +
+                         "but max launch retries (${K8S_INFRA_RETRY_MAX}) exhausted after ${launchAttempt} attempts. Failing."
+                    throw e
+                }
+                if (!hasBudgetForInfraRetry(pipeline, stageName, InfraFailure.K8S, c, launchAttempt, K8S_INFRA_RETRY_MAX, 60L * 1000L, true)) {
+                    echo "[INFRA-RETRY] ${stageName}: pod launch failed (${c.detectedPattern}) is retryable, " +
+                         "but remaining CI timeout budget is too small for a relaunch. Failing without retry."
+                    throw e
+                }
+
+                echo "[INFRA-RETRY] ${stageName}: pod/agent launch failed before execution on attempt ${launchAttempt}: ${c.detectedPattern}"
+                echo "[INFRA-RETRY] ${stageName}: Exception: ${e.toString()}"
+                echo "[INFRA-RETRY] ${stageName}: Will relaunch (attempt ${launchAttempt + 1} of ${K8S_INFRA_RETRY_MAX + 1}) after 60s cooldown."
+                sleep(60)
+            }
+        }
     }
 
     def attempt = 0
@@ -4484,8 +4564,8 @@ def launchTestJobs(pipeline, testFilter)
         // "A30-TensorRT-Post-Merge-6": ["a30", "l0_a30", 6, 6],
         "A30-CPP-Post-Merge-1": ["a30", "l0_a30", 1, 2],
         "A30-CPP-Post-Merge-2": ["a30", "l0_a30", 2, 2],
-        "A30-Triton-Post-Merge-1": ["a30", "l0_a30", 1, 2],
-        "A30-Triton-Post-Merge-2": ["a30", "l0_a30", 2, 2],
+        // "A30-Triton-Post-Merge-1": ["a30", "l0_a30", 1, 2],
+        // "A30-Triton-Post-Merge-2": ["a30", "l0_a30", 2, 2],
         // "A100X-TensorRT-Post-Merge-1": ["a100x", "l0_a100", 1, 6],
         // "A100X-TensorRT-Post-Merge-2": ["a100x", "l0_a100", 2, 6],
         // "A100X-TensorRT-Post-Merge-3": ["a100x", "l0_a100", 3, 6],

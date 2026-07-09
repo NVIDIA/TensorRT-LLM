@@ -54,6 +54,7 @@ DEFAULT_TEST_TIMEOUT = 3600
 DEFAULT_SERVER_WAITING_TIMEOUT = 2100
 # Timeout for the accuracy evaluation
 DEFAULT_ACC_EVALUATION_TIMEOUT = 1500
+DEEPSEEKV4_TEST_MAX_BATCH_SIZE = 128
 
 
 @functools.lru_cache(maxsize=1)
@@ -2567,3 +2568,189 @@ class TestGLM52NVFP4(LlmapiAccuracyTestHarness):
             llm.args.speculative_config = MTPDecodingConfig(
                 max_draft_len=speculative_config["max_draft_len"])
             run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])
+
+
+@pytest.mark.timeout(DEFAULT_TEST_TIMEOUT)
+@skip_pre_blackwell
+class TestDeepSeekV4Flash(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "deepseek-ai/DeepSeek-V4-Flash"
+    MODEL_PATH = f"{llm_models_root()}/DeepSeek-V4-Flash"
+
+    @pytest.mark.skip_less_device(4)
+    def test_auto_dtype(self):
+        # Disagg smoke test: CTX TP=2 + GEN TP=2 = 4 GPUs.
+        # NVFP4 weights ~71 GB/rank at TP=2, leaving ~107 GB for KV on B200.
+        # TRTLLM backend required (WIDEEP lacks MXFP4 support for V4-Flash).
+        # V4 uses pure-Python KVCacheManagerV2; needs Python transceiver.
+        # NIXL (not DEFAULT) skips the TRTLLM_USE_UCX_KVCACHE=1 fallback.
+        cache_transceiver_config = {
+            "backend": "NIXL",
+            "transceiver_runtime": "PYTHON",
+            "max_tokens_in_buffer": 4096,
+        }
+        ctx_server_config = {
+            "tensor_parallel_size": 2,
+            "moe_expert_parallel_size": 2,
+            "disable_overlap_scheduler": True,
+            "max_batch_size": DEEPSEEKV4_TEST_MAX_BATCH_SIZE,
+            "max_seq_len": 4096,
+            "kv_cache_config": {
+                "free_gpu_memory_fraction": 0.5,
+            },
+            "cache_transceiver_config": cache_transceiver_config,
+        }
+        gen_server_config = {
+            "tensor_parallel_size": 2,
+            "moe_expert_parallel_size": 2,
+            "enable_attention_dp": True,
+            "disable_overlap_scheduler": True,
+            "max_batch_size": DEEPSEEKV4_TEST_MAX_BATCH_SIZE,
+            "max_seq_len": 4096,
+            "moe_config": {
+                "backend": "TRTLLM",
+            },
+            "kv_cache_config": {
+                "free_gpu_memory_fraction": 0.5,
+            },
+            "cache_transceiver_config": cache_transceiver_config,
+        }
+        disaggregated_server_config = {
+            "hostname": "localhost",
+            "backend": "pytorch",
+            "context_servers": {
+                "num_instances": 1
+            },
+            "generation_servers": {
+                "num_instances": 1
+            },
+        }
+        # V4-Flash 148GB weight prefetch + warmup needs >35 min, default wait timeout times out.
+        with launch_disaggregated_llm(disaggregated_server_config,
+                                      ctx_server_config,
+                                      gen_server_config,
+                                      self.MODEL_PATH,
+                                      server_waiting_timeout=3600) as llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm, is_integration_test=True)
+
+    @pytest.mark.skip_less_device(4)
+    def test_gen_first(self):
+        """Gen-first quick validation for DSv4-Flash on KVCacheManagerV2 + NIXL python."""
+        cache_transceiver_config = {
+            "backend": "NIXL",
+            "transceiver_runtime": "PYTHON",
+            "max_tokens_in_buffer": 4096,
+        }
+        ctx_server_config = {
+            "tensor_parallel_size": 2,
+            "moe_expert_parallel_size": 2,
+            "disable_overlap_scheduler": True,
+            "max_batch_size": DEEPSEEKV4_TEST_MAX_BATCH_SIZE,
+            "max_seq_len": 4096,
+            "kv_cache_config": {
+                "free_gpu_memory_fraction": 0.5,
+            },
+            "cache_transceiver_config": cache_transceiver_config,
+        }
+        gen_server_config = {
+            "tensor_parallel_size": 2,
+            "moe_expert_parallel_size": 2,
+            "enable_attention_dp": True,
+            "disable_overlap_scheduler": True,
+            "max_batch_size": DEEPSEEKV4_TEST_MAX_BATCH_SIZE,
+            "max_seq_len": 4096,
+            "moe_config": {
+                "backend": "TRTLLM",
+            },
+            "kv_cache_config": {
+                "free_gpu_memory_fraction": 0.5,
+            },
+            "cache_transceiver_config": cache_transceiver_config,
+        }
+        disaggregated_server_config = {
+            "hostname": "localhost",
+            "backend": "pytorch",
+            "context_servers": {
+                "num_instances": 1
+            },
+            "generation_servers": {
+                "num_instances": 1
+            },
+            "schedule_style": "generation_first",
+        }
+        with launch_disaggregated_llm(disaggregated_server_config,
+                                      ctx_server_config,
+                                      gen_server_config,
+                                      self.MODEL_PATH,
+                                      server_waiting_timeout=3600) as llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm, is_integration_test=True)
+
+
+@pytest.mark.timeout(14400)
+@skip_pre_blackwell
+@pytest.mark.skip_less_device_memory(140000)
+class TestDeepSeekV4FlashBase(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "deepseek-ai/DeepSeek-V4-Flash-Base"
+    MODEL_PATH = f"{llm_models_root()}/DeepSeek-V4-Flash-Base"
+
+    @pytest.mark.skip_less_device(4)
+    def test_auto_dtype(self):
+        # Disagg smoke test: CTX TP=2 + GEN TP=2 = 4 GPUs.
+        # FP8 weights ~71 GB/rank at TP=4 → ~142 GB/rank at TP=2; requires
+        # ≥140 GB per GPU (fits on B300 288 GB, tight on B200 178 GB).
+        # TRTLLM backend: WIDEEP's FP8 block-scale path is Hopper-only.
+        # Compact batching keeps KV cache ~1 GB/rank (default ~100 GB requires fully-clean GPU memory).
+        # V4 uses pure-Python KVCacheManagerV2; needs Python transceiver.
+        # NIXL (not DEFAULT) skips the TRTLLM_USE_UCX_KVCACHE=1 fallback.
+        cache_transceiver_config = {
+            "backend": "NIXL",
+            "transceiver_runtime": "PYTHON",
+            "max_tokens_in_buffer": 4096,
+        }
+        ctx_server_config = {
+            "tensor_parallel_size": 2,
+            "moe_expert_parallel_size": 2,
+            "disable_overlap_scheduler": True,
+            "max_batch_size": 16,
+            "max_num_tokens": 4096,
+            "max_seq_len": 4096,
+            "kv_cache_config": {
+                "free_gpu_memory_fraction": 0.5,
+            },
+            "cache_transceiver_config": cache_transceiver_config,
+        }
+        gen_server_config = {
+            "tensor_parallel_size": 2,
+            "moe_expert_parallel_size": 2,
+            "enable_attention_dp": True,
+            "disable_overlap_scheduler": True,
+            "max_batch_size": DEEPSEEKV4_TEST_MAX_BATCH_SIZE,
+            "max_num_tokens": 4096,
+            "max_seq_len": 4096,
+            "moe_config": {
+                "backend": "TRTLLM",
+            },
+            "kv_cache_config": {
+                "free_gpu_memory_fraction": 0.5,
+            },
+            "cache_transceiver_config": cache_transceiver_config,
+        }
+        disaggregated_server_config = {
+            "hostname": "localhost",
+            "backend": "pytorch",
+            "context_servers": {
+                "num_instances": 1
+            },
+            "generation_servers": {
+                "num_instances": 1
+            },
+        }
+        # Same long-init reason as TestDeepSeekV4Flash above.
+        with launch_disaggregated_llm(disaggregated_server_config,
+                                      ctx_server_config,
+                                      gen_server_config,
+                                      self.MODEL_PATH,
+                                      server_waiting_timeout=3600) as llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm, is_integration_test=True)

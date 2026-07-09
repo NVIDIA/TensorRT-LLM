@@ -261,6 +261,7 @@ class AccuracyTask:
             f"Hypothesis testing report:\n{hypothesis_testing_params.report(score)}"
         )
         hypothesis_testing_params.assert_passing(score)
+        return score
 
 
 class VoxPopuli(AccuracyTask):

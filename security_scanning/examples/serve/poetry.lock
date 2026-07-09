@@ -185,13 +185,13 @@ typing-extensions = {version = ">=4.2", markers = "python_version < \"3.13\""}
 
 [[package]]
 name = "aiperf"
-version = "0.10.0"
+version = "0.11.0"
 description = "AIPerf is a package for performance testing of AI models"
 optional = false
 python-versions = "<3.14,>=3.10"
 groups = ["main"]
 files = [
-    {file = "aiperf-0.10.0-py3-none-any.whl", hash = "sha256:cf8c01d0fd8f45a9e29abddc9cdbd404586c17a05834044c4c3720d272d6591d"},
+    {file = "aiperf-0.11.0-py3-none-any.whl", hash = "sha256:1638f293d05d4261425ca881402a1003136b6de72bac72a950428f32b6e19260"},
 ]
 
 [package.dependencies]
@@ -244,11 +244,12 @@ zstandard = ">=0.25.0"
 [package.extras]
 accuracy = ["deepeval (>=2.9.0,<5.0.0)", "latex2sympy2-extended (>=1.0.6)", "lighteval (>=0.13.0)", "sympy (>=1.14.0)"]
 botorch = ["botorch (>=0.10)", "gpytorch (>=1.11)", "optuna-integration (>=3.6)", "torch (>=2.0)"]
-dev = ["black (>=25.1.0)", "httpx (>=0.27.0)", "hypothesis (>=6.0.0)", "jsonschema (>=4.0.0)", "looptime (>=0.5)", "mlflow (>=3.10.0,<4.0.0)", "opentelemetry-exporter-otlp-proto-http (>=1.24.0,<2.0.0)", "opentelemetry-sdk (>=1.24.0,<2.0.0)", "pre-commit (>=4.2.0)", "pytest (>=7.0.0)", "pytest-asyncio", "pytest-cov", "pytest-xdist (>=3.8.0)", "ruff (>=0.14.0,<0.15.0)", "trustme (>=1.0.0)"]
+dev = ["black (>=25.1.0)", "httpx (>=0.27.0)", "hypothesis (>=6.0.0)", "jsonschema (>=4.0.0)", "looptime (>=0.5)", "mlflow (>=3.10.0,<4.0.0)", "opentelemetry-exporter-otlp-proto-http (>=1.24.0,<2.0.0)", "opentelemetry-sdk (>=1.24.0,<2.0.0)", "pre-commit (>=4.2.0)", "pytest (>=7.0.0)", "pytest-asyncio", "pytest-cov", "pytest-rerunfailures (>=15.0)", "pytest-xdist (>=3.8.0)", "ruff (>=0.14.0,<0.15.0)", "trustme (>=1.0.0)", "wandb (>=0.19.0,<1.0.0)"]
 mlflow = ["mlflow (>=3.10.0,<4.0.0)"]
 optuna = ["botorch (>=0.10)", "gpytorch (>=1.11)", "optuna-integration (>=3.6)", "torch (>=2.0)"]
 otel = ["opentelemetry-exporter-otlp-proto-http (>=1.24.0,<2.0.0)", "opentelemetry-sdk (>=1.24.0,<2.0.0)"]
-test = ["httpx (>=0.27.0)", "hypothesis (>=6.0.0)", "jsonschema (>=4.0.0)", "looptime (>=0.5)", "pytest (>=7.0.0)", "pytest-asyncio", "pytest-cov", "pytest-xdist (>=3.8.0)", "trustme (>=1.0.0)"]
+test = ["httpx (>=0.27.0)", "hypothesis (>=6.0.0)", "jsonschema (>=4.0.0)", "looptime (>=0.5)", "pytest (>=7.0.0)", "pytest-asyncio", "pytest-cov", "pytest-rerunfailures (>=15.0)", "pytest-xdist (>=3.8.0)", "trustme (>=1.0.0)"]
+wandb = ["wandb (>=0.19.0,<1.0.0)"]
 
 [[package]]
 name = "alembic"
@@ -1230,14 +1231,14 @@ dev = ["Sphinx (==2.1.0)", "future (==0.17.1)", "numpy (==1.16.4)", "pytest (==4
 
 [[package]]
 name = "filelock"
-version = "3.29.6"
+version = "3.29.7"
 description = "A platform independent file lock."
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "filelock-3.29.6-py3-none-any.whl", hash = "sha256:14d5f5597d2e0c4dbd774cfb6d8132da1db44da83732aab679d54f7dcf97ab65"},
-    {file = "filelock-3.29.6.tar.gz", hash = "sha256:895c532ef3f4ef04972b9446a8c4e2931a5c399ff3c4be4c9369f2639b80f793"},
+    {file = "filelock-3.29.7-py3-none-any.whl", hash = "sha256:987db6f789a3a2a59f55081801b2b3697cb97e2a736b5f1a9e99b559285fbc51"},
+    {file = "filelock-3.29.7.tar.gz", hash = "sha256:5b481979797ae69e72f0b389d89a80bdd585c260c5b3f1fb9c0a5ba9bb3f195d"},
 ]
 
 [[package]]
@@ -5461,19 +5462,18 @@ zstd = ["backports-zstd (>=1.0.0) ; python_version < \"3.14\""]
 
 [[package]]
 name = "uvicorn"
-version = "0.50.2"
+version = "0.51.0"
 description = "The lightning-fast ASGI server."
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "uvicorn-0.50.2-py3-none-any.whl", hash = "sha256:4ae72a385630bcc17a0adb8290f26c993865e0b43a2114c2aab96420172c056a"},
-    {file = "uvicorn-0.50.2.tar.gz", hash = "sha256:b92bf03509b82bcb9d49e7335b4fd364518ad021c2dc18b4e6a2fec8c955a0bb"},
+    {file = "uvicorn-0.51.0-py3-none-any.whl", hash = "sha256:5d38af6cd620f2ae3849fb44fd4879e0890aa1febe8d47eb355fb45d93fe6a5b"},
+    {file = "uvicorn-0.51.0.tar.gz", hash = "sha256:f6f4b69b657c312f516dd2d268ab9ae6f254b11e4bac504f37b2ab58b24dd0b0"},
 ]
 
 [package.dependencies]
 click = ">=7.0"
-colorama = {version = ">=0.4", optional = true, markers = "sys_platform == \"win32\" and extra == \"standard\""}
 h11 = ">=0.8"
 httptools = {version = ">=0.8.0", optional = true, markers = "extra == \"standard\""}
 python-dotenv = {version = ">=0.13", optional = true, markers = "extra == \"standard\""}
@@ -5484,7 +5484,7 @@ watchfiles = {version = ">=0.20", optional = true, markers = "extra == \"standar
 websockets = {version = ">=13.0", optional = true, markers = "extra == \"standard\""}
 
 [package.extras]
-standard = ["colorama (>=0.4) ; sys_platform == \"win32\"", "httptools (>=0.8.0)", "python-dotenv (>=0.13)", "pyyaml (>=5.1)", "uvloop (>=0.15.1) ; sys_platform != \"win32\" and sys_platform != \"cygwin\" and platform_python_implementation != \"PyPy\"", "watchfiles (>=0.20)", "websockets (>=13.0)"]
+standard = ["httptools (>=0.8.0)", "python-dotenv (>=0.13)", "pyyaml (>=5.1)", "uvloop (>=0.15.1) ; sys_platform != \"win32\" and sys_platform != \"cygwin\" and platform_python_implementation != \"PyPy\"", "watchfiles (>=0.20)", "websockets (>=13.0)"]
 
 [[package]]
 name = "uvloop"
@@ -6211,4 +6211,4 @@ cffi = ["cffi (>=1.17,<2.0) ; platform_python_implementation != \"PyPy\" and pyt
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.10,<3.13"
-content-hash = "6fe4a92ad66f61dc15babde063a5f440dc1031b79c6a98b2487653e29cf20f79"
+content-hash = "f7095182a4635b06c6045e5b43d8a96ee8fddd80ad4d0b0c7323db9fe62089d0"
