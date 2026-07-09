@@ -38,7 +38,7 @@ from .flux import Flux2Pipeline, FluxPipeline
 from .ltx2 import LTX2Pipeline  # noqa: F401
 from .qwen_image import QwenImageEditPlusPipeline, QwenImagePipeline
 from .qwen_image_layered import QwenImageLayeredPipeline
-from .wan import WanImageToVideoPipeline, WanPipeline
+from .wan import FastWanPipeline, WanImageToVideoPipeline, WanPipeline
 
 __all__ = [
     "AutoPipeline",
@@ -49,6 +49,7 @@ __all__ = [
     "QwenImageLayeredPipeline",
     "QwenImagePipeline",
     "WanPipeline",
+    "FastWanPipeline",
     "WanImageToVideoPipeline",
     "Cosmos3OmniMoTPipeline",
     "register_pipeline",

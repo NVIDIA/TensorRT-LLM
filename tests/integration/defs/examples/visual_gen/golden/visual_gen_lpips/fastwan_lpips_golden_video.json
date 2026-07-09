@@ -1,0 +1,16 @@
+{
+  "video": "fastwan_lpips_golden_video.mp4",
+  "model": "FastVideo/FastWan2.2-TI2V-5B-FullAttn-Diffusers",
+  "source": "SGLang multimodal_gen (trusted reference)",
+  "prompt": "A red fox walking through snow",
+  "negative_prompt": "",
+  "height": 704,
+  "width": 1280,
+  "num_frames": 9,
+  "num_inference_steps": 3,
+  "guidance_scale": 1.0,
+  "seed": 42,
+  "frame_rate": 24.0,
+  "lpips_net": "alex",
+  "lpips_threshold": 0.05
+}

@@ -131,6 +131,18 @@ def get_wan_default_params(
     return params
 
 
+def get_fastwan_default_params() -> dict:
+    """Default generation params for FastWan 2.2 TI2V-5B.
+
+    Same as the base Wan 2.2 TI2V-5B defaults, but distilled: a fixed 3-step
+    DMD schedule and CFG-free (guidance_scale 1.0).
+    """
+    params = dict(_WAN22_5B_PARAMS)
+    params["num_inference_steps"] = 3
+    params["guidance_scale"] = 1.0
+    return params
+
+
 def get_wan_extra_param_specs(is_wan22_14b: bool) -> Dict[str, ExtraParamSchema]:
     """Return extra_param_specs for a Wan model.
 
