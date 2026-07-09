@@ -144,7 +144,7 @@ class ModelList(OpenAIBaseModel):
 
 
 class TokenizeRequest(OpenAIBaseModel):
-    """Request body for the ``POST /v1/tokenize`` endpoint.
+    """Request body for the ``POST /_internal/tokenize`` endpoint.
 
     Asks the server to encode some text into the token-id sequence its
     loaded tokenizer would produce, without running any generation. The
@@ -178,7 +178,7 @@ class TokenizeRequest(OpenAIBaseModel):
 
 
 class TokenizeResponse(OpenAIBaseModel):
-    """Response body for the ``POST /v1/tokenize`` endpoint.
+    """Response body for the ``POST /_internal/tokenize`` endpoint.
 
     Fields:
         count: Number of tokens in the encoded sequence. Always populated;

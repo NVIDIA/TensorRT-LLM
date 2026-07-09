@@ -741,7 +741,9 @@ class OpenAIServer(_VideoRoutesMixin):
         self.app.add_api_route('/v1/responses/{response_id}',
                                self.openai_responses_delete_response,
                                methods=["DELETE"])
-        self.app.add_api_route("/v1/tokenize", self.tokenize, methods=["POST"])
+        self.app.add_api_route("/_internal/tokenize",
+                               self.tokenize,
+                               methods=["POST"])
 
         # RL-only endpoints
         self.app.add_api_route("/release_memory",

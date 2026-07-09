@@ -449,12 +449,10 @@ class OpenaiWorker(Worker):
 
     async def tokenize_handler(self, task: TokenizeTask) -> TaskStatus:
         base_url = str(self.async_client.base_url).rstrip("/")
-        candidate_urls = [f"{base_url}/tokenize"]
-        if base_url.endswith("/v1"):
-            candidate_urls.append(f"{base_url[:-3]}/tokenize")
-        else:
-            candidate_urls.append(f"{base_url}/v1/tokenize")
-        candidate_urls = list(dict.fromkeys(candidate_urls))
+        # The tokenize endpoint is served under /_internal (not part of the
+        # OpenAI-compatible /v1 surface), so strip a trailing /v1 if present.
+        root_url = base_url[:-3] if base_url.endswith("/v1") else base_url
+        candidate_urls = [f"{root_url}/_internal/tokenize"]
         failures = []
         task.tokenize_error = None
         headers = {}

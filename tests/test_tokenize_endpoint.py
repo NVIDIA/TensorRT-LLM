@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Unit tests for the /v1/tokenize endpoint.
+"""Unit tests for the /_internal/tokenize endpoint.
 
 Tests the Pydantic request/response models and the endpoint handler logic
 using FastAPI TestClient. The handler is re-implemented locally to mirror
@@ -68,7 +68,7 @@ def _fake_encode(text: str) -> list:
 
 
 def _build_test_app():
-    """Build a minimal FastAPI app with the /v1/tokenize route.
+    """Build a minimal FastAPI app with the /_internal/tokenize route.
 
     Wires the route to a handler that mirrors the real
     OpenAIServer.tokenize logic.
@@ -76,7 +76,7 @@ def _build_test_app():
     app = FastAPI()
     tokenizer = SimpleNamespace(encode=_fake_encode)
 
-    @app.post("/v1/tokenize")
+    @app.post("/_internal/tokenize")
     async def tokenize(request: TokenizeRequest) -> JSONResponse:
         try:
             if request.prompt is not None:
@@ -172,7 +172,7 @@ class TestTokenizeResponseModel:
 
 class TestTokenizeEndpoint:
     def test_prompt_returns_200(self, client):
-        resp = client.post("/v1/tokenize", json={"prompt": "Hello, world!"})
+        resp = client.post("/_internal/tokenize", json={"prompt": "Hello, world!"})
         assert resp.status_code == 200
         data = resp.json()
         assert "count" in data
@@ -184,7 +184,7 @@ class TestTokenizeEndpoint:
 
     def test_messages_returns_200(self, client):
         resp = client.post(
-            "/v1/tokenize", json={"messages": [{"role": "user", "content": "Hello, world!"}]}
+            "/_internal/tokenize", json={"messages": [{"role": "user", "content": "Hello, world!"}]}
         )
         assert resp.status_code == 200
         data = resp.json()
@@ -194,25 +194,27 @@ class TestTokenizeEndpoint:
     def test_messages_count_gte_prompt_count(self, client):
         """Chat template wrapping should produce at least as many tokens."""
         text = "Hello world"
-        r1 = client.post("/v1/tokenize", json={"prompt": text})
-        r2 = client.post("/v1/tokenize", json={"messages": [{"role": "user", "content": text}]})
+        r1 = client.post("/_internal/tokenize", json={"prompt": text})
+        r2 = client.post(
+            "/_internal/tokenize", json={"messages": [{"role": "user", "content": text}]}
+        )
         assert r1.status_code == 200
         assert r2.status_code == 200
         assert r2.json()["count"] >= r1.json()["count"]
 
     def test_empty_body_returns_422(self, client):
-        resp = client.post("/v1/tokenize", json={})
+        resp = client.post("/_internal/tokenize", json={})
         assert resp.status_code == 422
 
     def test_both_prompt_and_messages_returns_422(self, client):
         resp = client.post(
-            "/v1/tokenize",
+            "/_internal/tokenize",
             json={"prompt": "Hello", "messages": [{"role": "user", "content": "Hello"}]},
         )
         assert resp.status_code == 422
 
     def test_empty_string_prompt(self, client):
-        resp = client.post("/v1/tokenize", json={"prompt": ""})
+        resp = client.post("/_internal/tokenize", json={"prompt": ""})
         assert resp.status_code == 200
         data = resp.json()
         assert data["count"] == 0
@@ -220,7 +222,7 @@ class TestTokenizeEndpoint:
 
     def test_long_prompt(self, client):
         text = "The quick brown fox jumps over the lazy dog. " * 10
-        resp = client.post("/v1/tokenize", json={"prompt": text})
+        resp = client.post("/_internal/tokenize", json={"prompt": text})
         assert resp.status_code == 200
         data = resp.json()
         assert data["count"] > 10
@@ -228,7 +230,7 @@ class TestTokenizeEndpoint:
 
     def test_multi_turn_messages(self, client):
         resp = client.post(
-            "/v1/tokenize",
+            "/_internal/tokenize",
             json={
                 "messages": [
                     {"role": "system", "content": "You are helpful."},
@@ -243,7 +245,7 @@ class TestTokenizeEndpoint:
         assert data["count"] > 0
 
     def test_response_has_no_extra_fields(self, client):
-        resp = client.post("/v1/tokenize", json={"prompt": "test"})
+        resp = client.post("/_internal/tokenize", json={"prompt": "test"})
         assert resp.status_code == 200
         keys = set(resp.json().keys())
         assert keys == {"count", "tokens"}
