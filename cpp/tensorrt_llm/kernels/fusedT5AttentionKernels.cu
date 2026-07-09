@@ -69,7 +69,7 @@ constexpr int kKvTileRows  = 64;   // Bk
 constexpr int kBlockSize   = 128;  // 4 warps
 constexpr int kWarpSize    = 32;
 constexpr int kWarpsPerBlk = kBlockSize / kWarpSize;
-constexpr int kFloatMaskV  = -FLT_MAX;
+constexpr float kFloatMaskV = -FLT_MAX;
 
 // Environment variable that gates the fused kernel at runtime.
 constexpr char kEnableEnv[] = "TRTLLM_ENABLE_FUSED_T5_ATTENTION";
