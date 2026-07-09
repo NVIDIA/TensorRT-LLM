@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import os
 from typing import Any, Dict, List, Optional, Union
 
 from pydantic import Field
@@ -93,6 +94,8 @@ _TYPE_MAP = {
     "bool": (bool,),
     "str": (str,),
     "list": (list,),
+    # Cosmos3 V2V `video` reference: a media path or an in-memory frame list.
+    "path_or_list": (str, os.PathLike, list),
 }
 
 # Generation config fields that pipelines declare defaults for. If a user
