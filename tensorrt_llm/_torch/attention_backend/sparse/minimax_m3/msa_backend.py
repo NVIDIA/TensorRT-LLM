@@ -228,6 +228,20 @@ def get_minimax_m3_msa_attention_backend_cls():
             return self.m3_step
 
         @property
+        def minimax_m3(self) -> Optional[dict]:
+            """Read-only adapter for the model's dense-core dict contract.
+
+            The dense forward (and the Triton-class backend) consume
+            ``attn_metadata.minimax_m3 = {"metadata": ..., "out_cache_loc":
+            ...}``; here it is derived from ``m3_step`` instead of being a
+            second copy of the state.
+            """
+            step = self.m3_step
+            if step is None:
+                return None
+            return {"metadata": step.metadata, "out_cache_loc": step.out_cache_loc}
+
+        @property
         def m3_meta(self) -> "MiniMaxM3SparseAttentionMetadata":
             return self._require_step().metadata
 
