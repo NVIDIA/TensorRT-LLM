@@ -16,7 +16,9 @@ def _run_and_get_worker_rank(fn) -> int:
     return mpi_rank()
 
 
-def submit_sync_per_worker(mpi_session, fn, max_rounds: int = 8) -> None:
+def submit_sync_per_worker(
+    mpi_session, fn, max_rounds: int = 8, round_timeout: float = 60.0
+) -> None:
     """Run ``fn`` at least once on EVERY worker of the pool.
 
     ``MpiPoolSession.submit_sync`` enqueues ``n_workers`` tasks, but
@@ -24,11 +26,26 @@ def submit_sync_per_worker(mpi_session, fn, max_rounds: int = 8) -> None:
     be drained twice by one idle worker, leaving another untouched. Verify
     coverage by collecting the worker ranks that actually ran ``fn`` and
     resubmitting until all workers are covered.
+
+    Each round is bounded by ``round_timeout``: a worker that is alive but
+    wedged (e.g. stuck in a collective after the previous test's executor died
+    mid-shutdown) never completes its future, so an unbounded ``result()``
+    would hang the whole session. A timed-out round is reported as probe
+    failure, making the caller retire the pool and spawn a fresh one.
     """
+    import concurrent.futures
+
     expected = mpi_session.n_workers
     seen: set = set()
     for _ in range(max_rounds):
-        seen.update(mpi_session.submit_sync(_run_and_get_worker_rank, fn))
+        futures = mpi_session.submit(_run_and_get_worker_rank, fn)
+        done, not_done = concurrent.futures.wait(futures, timeout=round_timeout)
+        if not_done:
+            raise RuntimeError(
+                f"health probe timed out after {round_timeout}s: "
+                f"{len(not_done)}/{len(futures)} worker tasks never returned"
+            )
+        seen.update(f.result() for f in done)
         if len(seen) >= expected:
             return
     raise RuntimeError(

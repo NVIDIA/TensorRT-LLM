@@ -236,7 +236,26 @@ class SessionReuseCache:
 
     @staticmethod
     def _retire(real):
-        threading.Thread(target=real.shutdown, daemon=True, name="session-reuse-retire").start()
+        """Dispose of a pool in the background without blocking the test.
+
+        Pools are usually retired because they are broken (failed health
+        probe, stale env, lifetime cap). A graceful ``shutdown()`` on a pool
+        whose workers are wedged in a collective blocks forever and leaks the
+        workers' GPU memory into subsequent tests, so prefer
+        ``shutdown_abort`` (bounded grace, then kill) and fall back to
+        ``shutdown`` only if abort is unavailable or raises.
+        """
+
+        def _dispose():
+            try:
+                real.shutdown_abort(grace=30, reason=TimeoutError("session-reuse retire"))
+            except Exception:
+                try:
+                    real.shutdown(wait=False)
+                except Exception:
+                    pass
+
+        threading.Thread(target=_dispose, daemon=True, name="session-reuse-retire").start()
 
     # ---- factory installed at the pool-creation seam ----
 
