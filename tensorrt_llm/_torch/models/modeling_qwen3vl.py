@@ -2,6 +2,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import copy
+import math
 import re
 from functools import lru_cache
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -161,6 +162,61 @@ def _expand_prompt_token_ids_for_mm_handoff(
     )
 
 
+def _decide_do_sample_frames(
+    video_datas: Optional[List[Any]],
+    mm_processor_kwargs: Dict[str, Any],
+) -> bool:
+    """Pick a single `do_sample_frames` flag for the HF processor call.
+
+    HF's video processor takes a scalar `do_sample_frames` that applies to
+    every video in the request. Decide it as follows:
+
+      1. If `mm_processor_kwargs.do_sample_frames` is explicitly set
+         (True or False), honor it.
+      2. If the caller supplies no frame target (`num_frames` / `fps`),
+         match HF's class default, which samples frames (returns True).
+      3. Otherwise, for each video compute the target frame count from the
+         kwargs (`num_frames` directly, or `floor(duration * fps)` if
+         `fps` is given) and compare to `len(vd.frames)`. If any video
+         needs a different count, the batch is sampled (returns True).
+
+    Per-video targets that match the IO-decoded count don't need HF
+    sampling; the all-or-nothing reduction over the batch means a single
+    video needing resampling pulls the rest along through a no-op
+    identity `np.linspace`.
+    """
+    if "do_sample_frames" in mm_processor_kwargs:
+        return bool(mm_processor_kwargs["do_sample_frames"])
+
+    if not video_datas:
+        return False
+
+    user_num_frames = mm_processor_kwargs.get("num_frames")
+    user_fps = mm_processor_kwargs.get("fps")
+    has_num_frames = user_num_frames is not None and user_num_frames != -1
+    has_fps = user_fps is not None and user_fps != -1
+
+    # No explicit frame target from the caller: defer to HF's class-default
+    # sampling (the stock processor sets `do_sample_frames=True` when neither
+    # `num_frames` nor `fps` is given). Returning False here would hand the
+    # IO-decoded frames straight to HF unchanged and diverge from stock HF
+    # whenever the IO loader decoded a different number of frames than HF's
+    # default sampler would select.
+    if not has_num_frames and not has_fps:
+        return True
+
+    for vd in video_datas:
+        n_decoded = len(vd.frames)
+        if has_num_frames:
+            n_target = user_num_frames
+        else:  # has_fps
+            duration = (vd.metadata or {}).get("duration") or 0
+            n_target = math.floor(duration * user_fps)
+        if n_target != n_decoded:
+            return True
+    return False
+
+
 class Qwen3VLInputProcessorBase(Qwen2VLInputProcessorBase):
     """Qwen3-VL input processor.
 
@@ -253,19 +309,42 @@ class Qwen3VLInputProcessorBase(Qwen2VLInputProcessorBase):
         if videos and isinstance(videos[0][0], torch.Tensor):
             do_rescale = False
 
-        # Forward video metadata only when the caller opts into per-request kwargs;
-        # the default path pre-samples frames in the IO loader, so unconditional
-        # metadata triggers IndexError in HF's _decode_and_sample_videos.
-        video_metadata = (
-            [vd.metadata for vd in video_datas] if video_datas and mm_processor_kwargs else None
-        )
+        do_sample_frames = _decide_do_sample_frames(video_datas, mm_processor_kwargs)
 
-        # num_frames and fps are mutually exclusive in the HF processor's sample_frames.
-        # If the caller set num_frames without fps, null fps explicitly so the class-level
-        # default fps=2 does not interfere.
-        proc_kwargs = dict(mm_processor_kwargs)
-        if "num_frames" in proc_kwargs and "fps" not in proc_kwargs:
-            proc_kwargs["fps"] = None
+        # Pass `do_sample_frames` plus, when sampling is needed, the
+        # caller's `num_frames` / `fps` target. Everything else the caller
+        # supplied (resize, normalize knobs, etc.) flows through unchanged.
+        proc_kwargs: Dict[str, Any] = {"do_sample_frames": do_sample_frames}
+        for k, v in mm_processor_kwargs.items():
+            if k in ("num_frames", "fps", "do_sample_frames"):
+                continue
+            proc_kwargs[k] = v
+        if do_sample_frames:
+            if "num_frames" in mm_processor_kwargs:
+                proc_kwargs["num_frames"] = mm_processor_kwargs["num_frames"]
+            if "fps" in mm_processor_kwargs:
+                proc_kwargs["fps"] = mm_processor_kwargs["fps"]
+            elif "num_frames" in mm_processor_kwargs:
+                # HF's `sample_frames` honors `num_frames` only when `fps` is
+                # not also set; the class-default `fps=2` would otherwise cap
+                # the returned count below the caller's requested
+                # `num_frames` for short clips. Null `fps` so `num_frames` is
+                # respected verbatim.
+                proc_kwargs["fps"] = None
+
+        # Forward per-video metadata with `total_num_frames` rewritten to the
+        # actual decoded frame count. HF's `sample_frames` computes indices
+        # via `np.linspace(0, total_num_frames - 1, num_frames)` and indexes
+        # the frame tensor with them; the rewrite keeps those indices in
+        # range and the no-sampling path consistent for downstream qwen3vl
+        # code that consults the metadata.
+        video_metadata: Optional[List[Dict[str, Any]]] = None
+        if video_datas:
+            video_metadata = []
+            for vd in video_datas:
+                m = dict(vd.metadata or {})
+                m["total_num_frames"] = len(vd.frames)
+                video_metadata.append(m)
 
         return self.processor(
             text=[text],
@@ -317,6 +396,11 @@ class Qwen3VLInputProcessorBase(Qwen2VLInputProcessorBase):
                 "video_grid_thw for the provided video."
             )
         return self.get_num_tokens_per_video(video=video, video_grid_thw=vgt)
+
+    def get_preferred_media_io_kwargs(self) -> Dict[str, Dict[str, Any]]:
+        # uint8 HWC frames let the HF processor rescale/permute once, skipping
+        # the per-frame CHW-float conversion in the IO loader.
+        return {"video": {"format": "np"}}
 
     def build_disagg_prefill_multimodal_inputs(
         self, inputs: TextPrompt, mm_handles: List[Dict[str, Any]]
@@ -1151,6 +1235,7 @@ class Qwen3VLModelBase(PreTrainedModel, MultimodalModelMixin):
             "QwenImageBenchForConditionalGeneration": "Qwen3_5ForCausalLM",
             "Cosmos3ForConditionalGeneration": "Qwen3ForCausalLM",
             "Qwen3_5MoeForConditionalGeneration": "Qwen3_5MoeForCausalLM",
+            "Qwen3_5ForConditionalGeneration": "Qwen3_5ForCausalLM",
         }
         llm_arch = vlm_to_llm_arch.get(self.original_arch)
         if llm_arch is None:
@@ -1224,6 +1309,26 @@ class Qwen3VLModelBase(PreTrainedModel, MultimodalModelMixin):
 
     def infer_max_seq_len(self) -> int:
         return self.llm.infer_max_seq_len()
+
+    # Draft-model (two-model speculative decoding, e.g. DFlash / Eagle3)
+    # delegation: `ModelLoader.load` reads `draft_config` / `draft_model` and
+    # calls `load_draft_weights` on the *outer* model it resolved, but the
+    # spec-decoding wrapper (`SpecDecOneEngineForCausalLM`) is applied to the
+    # inner `self.llm` when this VLM composes it. Composite checkpoints
+    # (e.g. Qwen3.5-4B publishes text_config + vision_config) route text-only
+    # spec tests through this wrapper, so surface the inner LM's draft state.
+    # Note: `load_draft_weights` must keep an explicit signature — the loader
+    # dispatches kwargs via `inspect.getfullargspec`.
+    @property
+    def draft_config(self):
+        return self.llm.draft_config
+
+    @property
+    def draft_model(self):
+        return self.llm.draft_model
+
+    def load_draft_weights(self, weights: Dict, weight_mapper: Optional[BaseWeightMapper] = None):
+        return self.llm.load_draft_weights(weights, weight_mapper=weight_mapper)
 
     def apply_llm_torch_compile(self, *, backend: Any, fullgraph: bool) -> None:
         # TODO: Move this hook to MultimodalModelMixin once multimodal models

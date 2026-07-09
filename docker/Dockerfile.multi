@@ -181,21 +181,9 @@ ENV TRT_LLM_GIT_COMMIT=${GIT_COMMIT} \
 RUN --mount=type=bind,source=scripts/generate_container_oss_attribution.sh,target=/mnt/gen_attribution.sh \
     bash /mnt/gen_attribution.sh "release" "${TRT_LLM_VER}" "${TARGETARCH}"
 
-FROM wheel AS tritonbuild
-
-WORKDIR /src/tensorrt_llm
-RUN pip install /src/tensorrt_llm/build/tensorrt_llm*.whl
-COPY ./triton_backend/ ./triton_backend/
-ARG TRITON_BASE_TAG
-RUN bash ./triton_backend/inflight_batcher_llm/scripts/build.sh -s "r${TRITON_BASE_TAG%-py3}"
-
-
 FROM release AS tritonrelease
 
 WORKDIR /app/tensorrt_llm
 COPY ./triton_backend/all_models ./triton_backend/all_models
 COPY ./triton_backend/scripts ./triton_backend/scripts
 COPY ./triton_backend/tools ./triton_backend/tools
-COPY ./triton_backend/inflight_batcher_llm/scripts ./triton_backend/inflight_batcher_llm/scripts
-COPY ./triton_backend/inflight_batcher_llm/client ./triton_backend/inflight_batcher_llm/client
-COPY --from=tritonbuild /opt/tritonserver/backends/tensorrtllm /opt/tritonserver/backends/tensorrtllm

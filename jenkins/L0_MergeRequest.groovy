@@ -123,6 +123,8 @@ def DEBUG_MODE = "debug"
 def DETAILED_LOG = "detailed_log"
 @Field
 def CBTS_RESULT = "cbts_result"
+@Field
+def DISABLE_CBTS = "disable_cbts"
 
 def testFilter = [
     (REUSE_TEST): gitlabParamsFromBot.get(REUSE_TEST, null),
@@ -142,6 +144,7 @@ def testFilter = [
     (AUTO_TRIGGER_TAG_LIST): [],
     (DETAILED_LOG): gitlabParamsFromBot.get(DETAILED_LOG, false),
     (CBTS_RESULT): null,
+    (DISABLE_CBTS): gitlabParamsFromBot.get((DISABLE_CBTS), false),
 ]
 
 String reuseBuild = gitlabParamsFromBot.get('reuse_build', null)
@@ -713,6 +716,13 @@ def getAutoTriggerTagList(pipeline, testFilter, globalVars) {
 
 def getCbtsResult(pipeline, testFilter, globalVars)
 {
+    // Explicit kill switch: `/bot run --disable-cbts` forces a full run.
+    if (testFilter[(DISABLE_CBTS)]) {
+        pipeline.echo("CBTS: disabled — user-specified /bot run --disable-cbts")
+        _cbtsReportDecision(pipeline, globalVars, "disabled", "user flag: disable_cbts", null)
+        return null
+    }
+
     def isOfficialPostMergeJob = (env.JOB_NAME ==~ /.*PostMerge.*/)
     if (env.alternativeTRT || isOfficialPostMergeJob) {
         pipeline.echo("CBTS: deferring — post-merge job or alternativeTRT set")
@@ -1204,8 +1214,16 @@ def collectTestResults(pipeline, testFilter, globalVars)
                     --output-file=rerun/rerun_report.xml \
                     --input-files=${inputfiles}
                 """
-                trtllm_utils.uploadArtifacts("rerun/rerun_report.html", "${UPLOAD_PATH}/test-results/")
-                echo "Rerun report: https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/test-results/rerun_report.html"
+                if (fileExists("rerun/rerun_report.html")) {
+                    try {
+                        trtllm_utils.uploadArtifacts("rerun/rerun_report.html", "${UPLOAD_PATH}/test-results/")
+                        echo "Rerun report: https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/test-results/rerun_report.html"
+                    } catch (Exception e) {
+                        echo "Failed to upload rerun report: ${e.toString()}"
+                    }
+                } else {
+                    echo "No rerun test results found, skipping rerun report upload."
+                }
                 catchError(
                     buildResult: 'SUCCESS',
                     stageResult: 'UNSTABLE') {

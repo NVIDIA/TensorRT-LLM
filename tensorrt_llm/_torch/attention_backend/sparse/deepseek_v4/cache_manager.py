@@ -20,7 +20,6 @@ import torch
 
 from tensorrt_llm._torch.pyexecutor import llm_request
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import GPU_LEVEL, KVCacheManagerV2
-from tensorrt_llm._torch.utils import maybe_compile
 from tensorrt_llm._utils import (
     TensorWrapper,
     convert_to_torch_tensor,
@@ -165,77 +164,6 @@ def _get_index_mode(attn_type: DeepseekV4AttentionType) -> PageIndexMode:
         return PageIndexMode.PER_LAYER
     else:
         return PageIndexMode.SHARED
-
-
-@maybe_compile(options={"max-autotune": True})
-def _compute_sliding_block_tables_compiled(
-    block_offsets: torch.Tensor,
-    copy_idx: torch.Tensor,
-    pool_ids: torch.Tensor,
-    valid_pool: torch.Tensor,
-    scales: torch.Tensor,
-    layer_offsets: torch.Tensor,
-    output: torch.Tensor,
-) -> None:
-    base = block_offsets[pool_ids[:, :, None], copy_idx[None, None, :], 0, :]
-    scaled_base = torch.where(
-        (base == BAD_PAGE_INDEX) | ~(valid_pool[:, :, None, None]),
-        BAD_PAGE_INDEX,
-        base * scales[:, :, None, None] + layer_offsets[:, :, None, None],
-    )
-    output.copy_(scaled_base)
-
-
-@maybe_compile(options={"max-autotune": True})
-def _compute_sliding_block_tables_with_scratch_compiled(
-    block_offsets: torch.Tensor,
-    copy_idx: torch.Tensor,
-    pool_ids: torch.Tensor,
-    valid_pool: torch.Tensor,
-    scales: torch.Tensor,
-    layer_offsets: torch.Tensor,
-    block_positions: torch.Tensor,
-    scratch_pages: torch.Tensor,
-    scratch_begs: torch.Tensor,
-    scratch_ends: torch.Tensor,
-    scratch_slots: torch.Tensor,
-    num_contexts: torch.Tensor,
-    output: torch.Tensor,
-) -> None:
-    base = block_offsets[pool_ids[:, :, None], copy_idx[None, None, :], 0, :]
-    scaled_base = torch.where(
-        (base == BAD_PAGE_INDEX) | ~(valid_pool[:, :, None, None]),
-        BAD_PAGE_INDEX,
-        base * scales[:, :, None, None] + layer_offsets[:, :, None, None],
-    )
-    output.copy_(scaled_base)
-
-    context_positions = torch.arange(
-        scratch_begs.shape[1],
-        dtype=torch.int32,
-        device=scratch_begs.device,
-    )
-    active_context = context_positions < num_contexts
-    mask = (
-        (block_positions >= scratch_begs[:, :, None])
-        & (block_positions < scratch_ends[:, :, None])
-        & active_context[None, :, None]
-    )
-    range_index = torch.where(mask, block_positions - scratch_begs[:, :, None], 0)
-    total_offset = range_index[pool_ids] * scratch_pages[:, :, None, None]
-    slot_idx = (total_offset // scales[:, :, None, None]).clamp(
-        max=scratch_slots.shape[-1] - 1,
-    )
-    slot_id = scratch_slots[pool_ids].gather(-1, slot_idx.long())
-    offset = total_offset % scales[:, :, None, None]
-    scratch_index = (
-        slot_id * scales[:, :, None, None]
-        + (offset + layer_offsets[:, :, None, None]) % scales[:, :, None, None]
-    )
-    scratch_capacity = scratch_begs.shape[1]
-    scratch_rows = scaled_base[:, :, :scratch_capacity, :]
-    mask = mask[pool_ids] & valid_pool[:, :, None, None]
-    output[:, :, :scratch_capacity, :].copy_(torch.where(mask, scratch_index, scratch_rows))
 
 
 class DeepseekV4CacheManager(KVCacheManagerV2):
@@ -1330,14 +1258,13 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
                 self._host_scratch_slots_staging,
             )
             self._device_num_contexts.fill_(num_contexts)
-            _compute_sliding_block_tables_with_scratch_compiled(
+            torch.ops.trtllm.deepseek_v4_compute_sliding_block_tables_with_scratch(
                 self._device_kv_cache_block_offsets_input,
                 device_copy_idx,
                 self._device_layer_attn_pool_ids,
                 self._device_valid_sliding_pool,
                 self._device_layer_attn_scales,
                 self._device_layer_offsets,
-                self._device_block_positions,
                 self._device_scratch_pages,
                 scratch_begs,
                 scratch_ends,
@@ -1346,7 +1273,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
                 self._precomputed_sliding_block_tables,
             )
         else:
-            _compute_sliding_block_tables_compiled(
+            torch.ops.trtllm.deepseek_v4_compute_sliding_block_tables(
                 self._device_kv_cache_block_offsets_input,
                 device_copy_idx,
                 self._device_layer_attn_pool_ids,

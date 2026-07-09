@@ -67,6 +67,11 @@ public:
   void selectMlaGenerationKernel();
 
 private:
+  // computeNumCtas uses the same cluster occupancy helper as enableCgaReduction.
+  friend std::tuple<int32_t, int32_t, int32_t> computeNumCtas(FmhaOptions& options,
+                                                              int32_t multiProcessorCount,
+                                                              bool enablesLogging);
+
   // Enables the cgaReduction if all clusters can be launched in one wave.
   void enableCgaReduction(int32_t numCtasX, int32_t numCtasY, int32_t numCtasZ);
 
@@ -78,7 +83,7 @@ private:
 
   // Get the maximum number of active clusters for a given cluster size which considers the
   // floorsweeping configurations.
-  int32_t getMaxNumActiveClusters(int32_t clusterSize);
+  static int32_t getMaxNumActiveClusters(int32_t clusterSize);
 
   // Selects the tileSizeQ for GQA generation kernels.
   void selectTileSizeQForGqaGeneration();

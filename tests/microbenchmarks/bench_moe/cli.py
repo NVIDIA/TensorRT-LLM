@@ -29,6 +29,7 @@ from tensorrt_llm._torch.modules.fused_moe.routing import DeepSeekV3MoeRoutingMe
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 
 from .backend import MoeBackendType
+from .mapping import _resolve_mapping_layout
 from .routing import _per_rank_tokens
 from .search import (
     _coerce_str_tuple,
@@ -91,7 +92,14 @@ def _build_worker_header(ctx: _BenchmarkContext, launcher: str, world_size: int)
         "world_size": world_size,
         "analysis": list(ctx.analysis) or ["summary"],
         "workloads": [
-            w.to_dict(per_rank_num_tokens=_per_rank_tokens(w, world_size)) for w in ctx.workloads
+            w.to_dict(
+                per_rank_num_tokens=_per_rank_tokens(
+                    w,
+                    world_size,
+                    enable_dp=bool(_resolve_mapping_layout(ctx.base_config, world_size)[2]),
+                )
+            )
+            for w in ctx.workloads
         ],
         "base_config": ctx.base_config.to_dict(),
     }
@@ -214,8 +222,9 @@ def parse_args() -> argparse.Namespace:
         nargs="+",
         required=False,
         help=(
-            "Global token counts to sweep. Each value is balanced across ranks "
-            "with any remainder on rank 0. Example: --balanced_total_num_tokens 64 256 1024."
+            "Global token counts to sweep. Each value is balanced across ranks, "
+            "spreading any remainder one token per leading rank (e.g. world_size=4, "
+            "tokens=2 -> [1, 1, 0, 0]). Example: --balanced_total_num_tokens 64 256 1024."
         ),
     )
 

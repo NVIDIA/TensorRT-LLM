@@ -161,7 +161,9 @@ class Mamba2Mixer(nn.Module):
         # TODO: Update head_dims once flashinfer is updated.
         # Nemotron-v2-Nano (mamba_head_dim=80) is not supported by flashinfer yet.
         supported_head_dims = [64, 128]
-        supported_head_group_ratios = [1, 8, 16]
+        # flashinfer supports some head group ratios:
+        # https://github.com/flashinfer-ai/flashinfer/blob/v0.6.14/include/flashinfer/mamba/kernel_selective_state_update_stp.cuh#L1338
+        supported_head_group_ratios = [1, 2, 4, 8, 16, 32, 64]
         supported_d_states = [64, 128, 256]
         head_group_ratio = (self.tp_nheads //
                             self.tp_ngroups if self.tp_ngroups > 0 else 0)
@@ -250,8 +252,8 @@ class Mamba2Mixer(nn.Module):
         self.aux_steram = torch.cuda.Stream()
         self.events = [torch.cuda.Event(), torch.cuda.Event()]
 
-    def post_load_weights(self):
-        """Post-process after loading weights."""
+    def cache_derived_state(self) -> None:
+        """Recompute state derived from loaded weights."""
         if (self.norm.is_nvfp4 and fused_gated_rmsnorm_quant_shape_ok(
                 self.norm.hidden_size, self.norm.group_size)
                 and self.norm.nvfp4_scale is None):
@@ -273,6 +275,9 @@ class Mamba2Mixer(nn.Module):
             self._A_expanded.copy_(a_exp)
             self._dt_bias_expanded.copy_(dt_exp)
             self._D_expanded.copy_(d_exp)
+
+    def post_load_weights(self) -> None:
+        self.cache_derived_state()
 
     def _try_attach_nvfp4_scale(self):
         """Attach input_scale from out_proj to norm for fused RMSNorm+Quant."""

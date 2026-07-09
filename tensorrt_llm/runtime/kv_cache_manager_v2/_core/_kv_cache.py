@@ -1449,8 +1449,7 @@ class _KVCache:
                 assert not block.is_committed
                 for beam_block in block.pages:
                     if beam_block[lc_idx] is None:
-                        assert self.enable_swa_scratch_reuse
-                        continue  # Scratch block — already handled
+                        continue  # Scratch or skipped stale block — no page to release
                     assert isinstance(beam_block[lc_idx], _PageHolder)
                     beam_block[lc_idx] = None
         assert NDEBUG or self._check_sanity()
@@ -1485,8 +1484,7 @@ class _KVCache:
                     )
                     for beam_idx, beam_block in typed_enumerate(block.pages):
                         if beam_block[lc_idx] is None:
-                            assert self.enable_swa_scratch_reuse
-                            continue  # Scratch block — no page to unlock
+                            continue  # Scratch or skipped stale block — no page to unlock
                         holder = expect_type(_SharedPageLock, beam_block[lc_idx]).holder
                         ret.append((ordinal, beam_idx, lc_idx, holder))
                         beam_block[lc_idx] = holder if hold_for_commit else None

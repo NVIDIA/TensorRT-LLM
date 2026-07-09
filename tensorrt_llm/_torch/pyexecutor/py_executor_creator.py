@@ -17,7 +17,8 @@ from tensorrt_llm._utils import get_sm_version, global_mpi_rank
 from tensorrt_llm.llmapi.llm_args import (CapacitySchedulerPolicy,
                                           ContextChunkingPolicy,
                                           ExecutorMemoryType,
-                                          GuidedDecodingConfig, LoadFormat,
+                                          GuidedDecodingConfig, KvCacheConfig,
+                                          LoadFormat, SpeculativeConfig,
                                           TorchLlmArgs)
 from tensorrt_llm.llmapi.tokenizer import (TokenizerBase,
                                            _llguidance_tokenizer_info,
@@ -204,6 +205,31 @@ def update_sampler_max_seq_len(max_seq_len, sampler):
     if isinstance(sampler, TRTLLMSampler):
         assert hasattr(sampler, "max_seq_len")
         sampler.max_seq_len = max_seq_len
+
+
+def _extend_full_attention_windows_for_spec_decode(
+    kv_cache_config: KvCacheConfig,
+    spec_config: Optional[SpeculativeConfig],
+    net_max_seq_len: int,
+    model_engine_max_seq_len: int,
+) -> None:
+    max_attention_window = kv_cache_config.max_attention_window
+    if spec_config is None or max_attention_window is None:
+        return
+    if model_engine_max_seq_len <= net_max_seq_len:
+        return
+
+    adjusted_max_attention_window = [
+        model_engine_max_seq_len if window >= net_max_seq_len else window
+        for window in max_attention_window
+    ]
+    if adjusted_max_attention_window == max_attention_window:
+        return
+
+    logger.info("Extending full-attention max_attention_window entries for "
+                f"speculative decoding from {max_attention_window} to "
+                f"{adjusted_max_attention_window}.")
+    kv_cache_config.max_attention_window = adjusted_max_attention_window
 
 
 def get_guided_decoding_config(guided_decoding_backend: str,
@@ -622,6 +648,13 @@ def create_py_executor(
     if spec_config is not None:
         model_engine_max_seq_len += get_num_extra_kv_tokens(spec_config)
         model_engine_max_seq_len += spec_config.tokens_per_gen_step - 1
+
+    _extend_full_attention_windows_for_spec_decode(
+        kv_cache_config=kv_cache_config,
+        spec_config=spec_config,
+        net_max_seq_len=net_max_seq_len,
+        model_engine_max_seq_len=model_engine_max_seq_len,
+    )
 
     if has_draft_model_engine and not llm_args.disable_overlap_scheduler:
         logger.warning(

@@ -741,7 +741,7 @@ __device__ void vectorized_combine_impl(T* dst_typed_base, int size_per_token, i
         {
             int target_rank = ptrs.topk_target_ranks[local_token_idx * TOP_K + k];
             int dst_idx = ptrs.topk_send_indices[local_token_idx * TOP_K + k];
-            if (dst_idx < 0)
+            if (dst_idx < 0 || !is_rank_active(ptrs.active_rank_mask, target_rank))
             {
                 acc[k].fill(0.0f);
                 continue;
@@ -766,8 +766,12 @@ __device__ void vectorized_combine_impl(T* dst_typed_base, int size_per_token, i
 #pragma unroll
         for (int k = 0; k < TOP_K; ++k)
         {
-            if (ptrs.topk_send_indices[local_token_idx * TOP_K + k] < 0)
+            int target_rank = ptrs.topk_target_ranks[local_token_idx * TOP_K + k];
+            int dst_idx = ptrs.topk_send_indices[local_token_idx * TOP_K + k];
+            if (dst_idx < 0 || !is_rank_active(ptrs.active_rank_mask, target_rank))
+            {
                 continue; // acc[k] already holds 0.0f from fill() above
+            }
 #pragma unroll
             for (int j = elems_per_vec - 1; j >= 0; --j)
                 acc[k][j] = static_cast<float>(reinterpret_cast<InT const*>(&acc[k])[j]);

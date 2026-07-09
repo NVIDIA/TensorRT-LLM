@@ -855,6 +855,35 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
 
     @skip_pre_hopper
     @pytest.mark.parametrize("backend", ["xgrammar", "llguidance"])
+    def test_guided_decoding_with_eagle3_low_latency_dispatch(
+            self, backend: str, mocker):
+        """Smoke-test enable_low_latency_host_dispatch with Eagle3 + guided decoding.
+
+        Eagle3 spec-dec captures guided-decoder hostfuncs inside the CUDA graph
+        (via _execute_guided_decoder_if_present in the target forward pass), so
+        this combination exercises the cudaLaunchHostFunc_v2 / spin-wait path.
+        """
+        mocker.patch.dict(os.environ, {"TRTLLM_XGUIDANCE_LENIENT": "1"})
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8)
+        cuda_graph_config = CudaGraphConfig(enable_padding=True)
+        spec_config = Eagle3DecodingConfig(
+            max_draft_len=3,
+            speculative_model=f"{llm_models_root()}/EAGLE3-LLaMA3.1-Instruct-8B",
+            eagle3_one_model=True)
+        llm = LLM(self.MODEL_PATH,
+                  guided_decoding_backend=backend,
+                  kv_cache_config=kv_cache_config,
+                  cuda_graph_config=cuda_graph_config,
+                  enable_chunked_prefill=True,
+                  max_num_tokens=256,
+                  speculative_config=spec_config,
+                  enable_low_latency_host_dispatch=True)
+        with llm:
+            task = JsonModeEval(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @skip_pre_hopper
+    @pytest.mark.parametrize("backend", ["xgrammar", "llguidance"])
     def test_guided_decoding_with_ngram(self, backend: str, mocker):
         mocker.patch.dict(os.environ, {"TRTLLM_XGUIDANCE_LENIENT": "1"})
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8)
@@ -3706,6 +3735,40 @@ def _make_deepseekv4_eplb_config(model_path, layer_updates_per_iter, ep_size=8):
 
 DEEPSEEKV4_TEST_MAX_BATCH_SIZE = 128
 
+_DEEPSEEK_V4_GSM8K_SYSTEM_PROMPT = (
+    "Solve the problem carefully. End your response with a final line exactly "
+    "in the form #### <answer>, using the simplest numeric form without units "
+    "or trailing zeros.")
+
+
+def _deepseekv4_pro_agg_llm_kwargs(**overrides):
+    kwargs = dict(
+        tensor_parallel_size=8,
+        moe_expert_parallel_size=8,
+        moe_config=MoeConfig(backend="TRTLLM"),
+        enable_attention_dp=True,
+        max_seq_len=4096,
+        max_batch_size=16,
+        max_num_tokens=8192,
+        custom_tokenizer="deepseek_v4",
+        # Cap the KV cache so the padded CUDA-graph capture (batch sizes up to
+        # 1024) and other post-KV resources have headroom; without this the
+        # default fraction (~0.9) leaves too little and engine init OOMs on
+        # large-memory GPUs. These tests need very little KV.
+        kv_cache_config=KvCacheConfig(enable_block_reuse=False,
+                                      tokens_per_block=128,
+                                      dtype="fp8",
+                                      host_cache_size=0,
+                                      free_gpu_memory_fraction=0.6),
+        cuda_graph_config=CudaGraphConfig(batch_sizes=[
+            1, 2, 4, 8, 16, 32, 64, 128, 192, 256, 320, 384, 448, 512, 768, 1024
+        ],
+                                          enable_padding=True),
+        speculative_config=MTPDecodingConfig(max_draft_len=1),
+    )
+    kwargs.update(overrides)
+    return kwargs
+
 
 def _run_deepseekv4_eplb(model_name,
                          model_path,
@@ -3807,6 +3870,36 @@ class TestDeepSeekV4Flash(LlmapiAccuracyTestHarness):
                              moe_backend,
                              eplb_config,
                              mtp_nextn=mtp_nextn)
+
+
+@pytest.mark.timeout(14400)
+@pytest.mark.skip_less_device(8)
+@pytest.mark.skip_less_device_memory(140000)
+@skip_pre_blackwell
+class TestDeepSeekV4Pro(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "deepseek-ai/DeepSeek-V4-Pro"
+    MODEL_PATH = f"{llm_models_root()}/DeepSeek-V4-Pro"
+    EXTRA_EVALUATOR_KWARGS = dict(
+        apply_chat_template=True,
+        system_prompt=_DEEPSEEK_V4_GSM8K_SYSTEM_PROMPT,
+    )
+
+    @pytest.mark.skip_less_mpi_world_size(8)
+    def test_gsm8k_full_accuracy(self):
+        with LLM(self.MODEL_PATH, **_deepseekv4_pro_agg_llm_kwargs()) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            acc_params = task.get_hypothesis_testing_params(
+                dtype=llm.args.dtype,
+                quant_algo=llm.args.quant_config.quant_algo,
+                kv_cache_quant_algo=llm.args.quant_config.kv_cache_quant_algo,
+                spec_dec_algo=llm.args.speculative_config.decoding_type)
+            assert acc_params.num_samples == GSM8K.NUM_SAMPLES
+            with mock.patch.dict(os.environ, {"INTEGRATION_TEST": "0"}):
+                score = task.evaluate(
+                    llm, extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+            assert score >= acc_params.ref_accuracy, (
+                f"GSM8K accuracy {score:.3f} is below recorded reference "
+                f"{acc_params.ref_accuracy:.3f}")
 
 
 @pytest.mark.timeout(14400)
@@ -6079,6 +6172,51 @@ class TestQwen3_5_35B_A3B(LlmapiAccuracyTestHarness):
                           extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
 
 
+@pytest.mark.skip_less_device_memory(80000)
+@skip_pre_blackwell
+class TestQwen3_6_35B_A3B(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "Qwen/Qwen3.6-35B-A3B"
+    MODEL_PATH = f"{llm_models_root()}/Qwen3.6-35B-A3B-NVFP4"
+    EXTRA_EVALUATOR_KWARGS = dict(
+        apply_chat_template=True,
+        fewshot_as_multiturn=True,
+        chat_template_kwargs=dict(enable_thinking=False),
+    )
+    GSM8K_MAX_OUTPUT_LEN = 512
+
+    @pytest.mark.parametrize("moe_backend", ["TRTLLM", "CUTEDSL"])
+    def test_nvfp4(self, moe_backend, mocker):
+        # Qwen3.6-35B-A3B NVFP4 MoE checkpoint. The TRTLLM-Gen / CuteDSL NVFP4
+        # MoE backends only support the SM100 family (B200/B300); RTX 6000
+        # (SM120) uses a different MoE path, so restrict this test to SM100/103.
+        if get_sm_version() not in (100, 103):
+            pytest.skip("Qwen3.6-35B-A3B NVFP4 MoE test runs on SM100/103 only")
+
+        if not os.path.exists(self.MODEL_PATH):
+            pytest.skip(f"Model directory {self.MODEL_PATH} does not exist")
+
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8,
+                                        enable_block_reuse=False)
+        cuda_graph_config = CudaGraphConfig(enable_padding=True,
+                                            max_batch_size=128)
+        moe_config = MoeConfig(backend=moe_backend)
+
+        with LLM(self.MODEL_PATH,
+                 trust_remote_code=True,
+                 tensor_parallel_size=1,
+                 moe_expert_parallel_size=1,
+                 max_seq_len=4096,
+                 max_batch_size=128,
+                 kv_cache_config=kv_cache_config,
+                 cuda_graph_config=cuda_graph_config,
+                 moe_config=moe_config) as llm:
+            mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN",
+                                self.GSM8K_MAX_OUTPUT_LEN)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+
+
 @skip_pre_blackwell
 @pytest.mark.skip_less_device_memory(183000)
 @pytest.mark.timeout(14400)
@@ -7611,6 +7749,39 @@ class TestMiniMaxM3(LlmapiAccuracyTestHarness):
             assert llm.args.quant_config.quant_algo == QuantAlgo.MXFP8
             task = MMLU(model_name)
             task.evaluate(llm)
+            task = GSM8K(model_name)
+            task.evaluate(llm)
+
+    @pytest.mark.skip_less_device(8)
+    @pytest.mark.skip_less_device_memory(140000)
+    @parametrize_with_ids("tp_size,ep_size", [(8, 8)])
+    def test_mxfp8_piecewise_cuda_graph(self, tp_size, ep_size):
+        model_name = "MiniMaxAI/MiniMax-M3-MXFP8"
+        model_path = f"{llm_models_root()}/MiniMax-M3-MXFP8"
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.5,
+                                        enable_block_reuse=False)
+        sparse_attention_config = MiniMaxM3SparseAttentionConfig()
+        cuda_graph_config = CudaGraphConfig(
+            enable_padding=True, batch_sizes=[1, 2, 4, 8, 12, 16, 24, 32])
+        torch_compile_config = TorchCompileConfig(
+            enable_piecewise_cuda_graph=True,
+            capture_num_tokens=[1, 8192],
+            max_num_streams=3)
+
+        with LLM(model_path,
+                 tensor_parallel_size=tp_size,
+                 moe_expert_parallel_size=ep_size,
+                 enable_attention_dp=True,
+                 moe_config=MoeConfig(backend="TRTLLM"),
+                 kv_cache_config=kv_cache_config,
+                 sparse_attention_config=sparse_attention_config,
+                 cuda_graph_config=cuda_graph_config,
+                 torch_compile_config=torch_compile_config,
+                 max_seq_len=2048,
+                 max_num_tokens=8192,
+                 max_batch_size=32,
+                 trust_remote_code=True) as llm:
+            assert llm.args.quant_config.quant_algo == QuantAlgo.MXFP8
             task = GSM8K(model_name)
             task.evaluate(llm)
 

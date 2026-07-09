@@ -45,7 +45,13 @@ from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import Linear, TensorParallelMode, copy_weight, load_weight_shard
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
-from ..utils import ActivationType, AuxStreamType, EventType
+from ..utils import (
+    ActivationType,
+    AuxStreamType,
+    EventType,
+    get_model_extra_attrs,
+    is_torch_compiling,
+)
 from .modeling_utils import DecoderModel, DecoderModelForCausalLM, ModelConfig, register_auto_model
 
 # Dense layers use SDPA with non-contiguous Q/K/V and a bool attn_mask.
@@ -579,6 +585,49 @@ class MiniMaxRMSNorm(nn.Module):
         return self.minimax_all_reduce_rms(hidden_states, self.weight, self.eps)
 
 
+def _extract_minimax_m3_attention_extra_attrs(layer_idx: str):
+    """Resolve runtime metadata and the registered MiniMax-M3 layer."""
+    extra_attrs = get_model_extra_attrs()
+    assert extra_attrs is not None, "Model extra attrs is not set"
+
+    metadata_ref = extra_attrs.get("attention_metadata")
+    assert metadata_ref is not None, "Attention metadata is not set"
+    metadata = metadata_ref()
+    assert isinstance(metadata, AttentionMetadata), "Invalid MiniMax-M3 attention metadata"
+
+    attn_layers = extra_attrs.get("attn_layers")
+    assert attn_layers is not None, "Attention layer is not registered"
+    attn_layer_ref = attn_layers.get(layer_idx)
+    assert attn_layer_ref is not None, f"Cannot find attention layer for layer {layer_idx}"
+    attn_layer = attn_layer_ref()
+    assert isinstance(attn_layer, MiniMaxM3Attention), "Invalid MiniMax-M3 attention layer"
+    return metadata, attn_layer
+
+
+@torch.library.custom_op("trtllm::minimax_m3_attn_custom_op_inplace", mutates_args=("output",))
+def minimax_m3_attn_custom_op_inplace(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    idx_q: Optional[torch.Tensor],
+    idx_k: Optional[torch.Tensor],
+    layer_idx: str,
+    output: torch.Tensor,
+) -> None:
+    """Run MiniMax-M3 cache and attention work behind a compile boundary."""
+    attn_metadata, attn_layer = _extract_minimax_m3_attention_extra_attrs(layer_idx)
+    num_tokens = attn_metadata.num_tokens
+    attn_layer._attention_core(
+        q[:num_tokens],
+        k[:num_tokens],
+        v[:num_tokens],
+        idx_q[:num_tokens] if idx_q is not None else None,
+        idx_k[:num_tokens] if idx_k is not None else None,
+        attn_metadata,
+        output[:num_tokens],
+    )
+
+
 class MiniMaxM3Attention(Attention):
     """M3 attention: dense (layers 0-2) or sparse (layers 3-59).
 
@@ -830,21 +879,10 @@ class MiniMaxM3Attention(Attention):
              (causal for prefill, no-causal for decode).
           8. Apply ``o_proj``.
         """
-        from ..attention_backend.sparse.minimax_m3 import (
-            _gather_paged_batched,
-            _write_main_kv_slots_to_pool,
-        )
-
         if attn_metadata is None:
             raise RuntimeError(
                 f"MiniMax-M3 dense forward (layer {self.layer_idx}) requires "
                 "attn_metadata; received None."
-            )
-        kv_cache_manager = getattr(attn_metadata, "kv_cache_manager", None)
-        if kv_cache_manager is None:
-            raise RuntimeError(
-                f"MiniMax-M3 dense forward (layer {self.layer_idx}) requires "
-                "attn_metadata.kv_cache_manager to be a MiniMaxM3KVCacheManagerV2."
             )
 
         # 1. Projections (no index branch).
@@ -858,7 +896,34 @@ class MiniMaxM3Attention(Attention):
         if self.rotary_emb is not None and position_ids is not None:
             q, k = self.rotary_emb(position_ids, [q, k])
 
-        num_tokens = int(hidden_states.shape[0])
+        # Keep token-wise projections and the output projection visible to
+        # torch.compile. Only the metadata/cache-dependent attention core is
+        # hidden behind the inplace custom op.
+        o = self._forward_attention_core(q, k, v, None, None, attn_metadata)
+        return self.o_proj(o)
+
+    def _dense_attention_core(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        output: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run dense cache updates and attention into ``output``."""
+        from ..attention_backend.sparse.minimax_m3 import (
+            _gather_paged_batched,
+            _write_main_kv_slots_to_pool,
+        )
+
+        kv_cache_manager = getattr(attn_metadata, "kv_cache_manager", None)
+        if kv_cache_manager is None:
+            raise RuntimeError(
+                f"MiniMax-M3 dense forward (layer {self.layer_idx}) requires "
+                "attn_metadata.kv_cache_manager to be a MiniMaxM3KVCacheManagerV2."
+            )
+
+        num_tokens = int(q.shape[0])
         q_view = q.view(num_tokens, self.num_heads, self.head_dim)
         k_view = k.view(num_tokens, self.num_key_value_heads, self.head_dim)
         v_view = v.view(num_tokens, self.num_key_value_heads, self.head_dim)
@@ -964,7 +1029,7 @@ class MiniMaxM3Attention(Attention):
             # Build per-batch attention by routing each Q to its K via q_batch_row.
             # Easiest path: SDPA expects [batch, num_heads, q_len, head_dim].
             # We process each batch row independently to keep the math straightforward.
-            attn_outputs = []
+            output_view = output.view(-1, self.num_heads, self.head_dim)
             cu = m3_meta.cu_seqlens_q.to(torch.long).tolist()
             for b in range(batch):
                 start, end = cu[b], cu[b + 1]
@@ -984,18 +1049,7 @@ class MiniMaxM3Attention(Attention):
                         dropout_p=0.0,
                         is_causal=False,
                     )  # [1, H, q, d]
-                attn_outputs.append(out_b.squeeze(0).transpose(0, 1))  # [q, H, d]
-            o = (
-                torch.cat(attn_outputs, dim=0)
-                if attn_outputs
-                else torch.empty(
-                    0,
-                    self.num_heads,
-                    self.head_dim,
-                    device=q.device,
-                    dtype=q.dtype,
-                )
-            )
+                output_view[start:end].copy_(out_b.squeeze(0).transpose(0, 1))
         else:
             # Decode: one Q token per request at position seq_lens - 1.
             # Every input tensor here is already on q.device (set up by
@@ -1014,9 +1068,8 @@ class MiniMaxM3Attention(Attention):
                     dropout_p=0.0,
                     is_causal=False,
                 )  # [batch, H, 1, d]
-            # Drop the singleton Q-length axis. The result is already the
-            # ``[batch, num_heads, head_dim]`` layout the prefill branch
-            # produces, so the shared flatten on line below is sufficient.
+            # Drop the singleton Q-length axis and write the resulting
+            # ``[batch, num_heads, head_dim]`` tensor into the final buffer.
             # The prior ``.transpose(1, 2).reshape(batch, H, d)`` pattern
             # was wrong: with ``H != head_dim`` (M3 TP=8 has H=8, d=128)
             # the non-contiguous transpose forces ``reshape`` to copy the
@@ -1026,13 +1079,49 @@ class MiniMaxM3Attention(Attention):
             # into ``o_proj``. Prefill is unaffected because its
             # ``transpose(0, 1)`` runs between q-len and num_heads axes
             # which the per-batch loop already laid out correctly.
-            o = out_b.squeeze(2)  # [batch, num_heads, head_dim]
+            output.view(batch, self.num_heads, self.head_dim).copy_(out_b.squeeze(2))
 
-        # Flatten to [num_tokens, num_heads * head_dim] for o_proj.
-        o = o.reshape(-1, self.num_heads * self.head_dim)
+        return output
 
-        # 8. Output projection.
-        return self.o_proj(o)
+    def _forward_attention_core(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        idx_q: Optional[torch.Tensor],
+        idx_k: Optional[torch.Tensor],
+        attn_metadata: AttentionMetadata,
+    ) -> torch.Tensor:
+        output = q.new_empty((q.shape[0], self.num_heads * self.head_dim))
+        if self.register_to_config and is_torch_compiling():
+            minimax_m3_attn_custom_op_inplace(
+                q,
+                k,
+                v,
+                idx_q,
+                idx_k,
+                self.layer_idx_str,
+                output,
+            )
+        else:
+            self._attention_core(q, k, v, idx_q, idx_k, attn_metadata, output)
+        return output
+
+    def _attention_core(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        idx_q: Optional[torch.Tensor],
+        idx_k: Optional[torch.Tensor],
+        attn_metadata: AttentionMetadata,
+        output: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.is_sparse_attention_layer:
+            assert idx_q is not None and idx_k is not None
+            return self._sparse_attention_core(q, k, v, idx_q, idx_k, attn_metadata, output)
+        assert idx_q is None and idx_k is None
+        return self._dense_attention_core(q, k, v, attn_metadata, output)
 
     def _sparse_forward(
         self,
@@ -1079,13 +1168,6 @@ class MiniMaxM3Attention(Attention):
                 f"MiniMax-M3 sparse forward (layer {self.layer_idx}) requires "
                 "attn_metadata; received None."
             )
-        kv_cache_manager = getattr(attn_metadata, "kv_cache_manager", None)
-        if kv_cache_manager is None:
-            raise RuntimeError(
-                f"MiniMax-M3 sparse forward (layer {self.layer_idx}) requires "
-                "attn_metadata.kv_cache_manager to be a MiniMaxM3KVCacheManagerV2."
-            )
-
         # 1. Projections.
         qkv = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
@@ -1102,6 +1184,27 @@ class MiniMaxM3Attention(Attention):
         if self.rotary_emb is not None and position_ids is not None:
             q, k = self.rotary_emb(position_ids, [q, k])
             idx_q, idx_k = self.rotary_emb(position_ids, [idx_q, idx_k])
+
+        o = self._forward_attention_core(q, k, v, idx_q, idx_k, attn_metadata)
+        return self.o_proj(o)
+
+    def _sparse_attention_core(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        idx_q: torch.Tensor,
+        idx_k: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        output: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run sparse cache updates and attention into ``output``."""
+        kv_cache_manager = getattr(attn_metadata, "kv_cache_manager", None)
+        if kv_cache_manager is None:
+            raise RuntimeError(
+                f"MiniMax-M3 sparse forward (layer {self.layer_idx}) requires "
+                "attn_metadata.kv_cache_manager to be a MiniMaxM3KVCacheManagerV2."
+            )
 
         # 4. Get the paged-block main K/V cache + flat side index-K cache.
         # The base KVCacheManagerV2 layout is
@@ -1177,11 +1280,12 @@ class MiniMaxM3Attention(Attention):
                 "ModelConfig so the standard attention-backend dispatch selects "
                 "the M3 sparse runtime."
             )
-        o = self.attn.forward(
+        return self.attn.forward(
             q,
             k,
             v,
             None,
+            output=output,
             idx_q=idx_q,
             idx_k=idx_k,
             idx_v=None,  # disable_index_value=True for M3 checkpoint
@@ -1192,9 +1296,6 @@ class MiniMaxM3Attention(Attention):
             out_cache_loc=out_cache_loc,
             m3_metadata=m3_meta,
         )
-
-        # 8. Output projection.
-        return self.o_proj(o)
 
 
 class MiniMaxM3DecoderLayer(DecoderLayer):

@@ -60,12 +60,14 @@ l0_gb200_multi_gpus:
   - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3_4gpus[v1_kv_cache-trtllm-one_model-overlap_scheduler]
   - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3_4gpus[v2_kv_cache-trtllm-one_model-overlap_scheduler]
   - accuracy/test_llm_api_pytorch_multimodal.py::TestMistralLarge3_675B::test_nvfp4_4gpus[latency_moe_trtllm] TIMEOUT (90)
+  - accuracy/test_disaggregated_serving.py::TestDeepSeekV4Flash::test_auto_dtype TIMEOUT (60)
   - accuracy/test_dwdp_disaggregated_serving.py::TestDwdpDeepSeekV3Lite::test_dwdp_accuracy
   - accuracy/test_dwdp_disaggregated_serving.py::TestDwdpDeepSeekV3Lite::test_dwdp_accuracy_contention_opt
   - accuracy/test_dwdp_disaggregated_serving.py::TestDwdpDeepSeekV3Lite::test_dwdp_accuracy_mode_b_overlap
   - unittest/_torch/modules/moe/test_moe_comm.py::TestMoEComm::test_moe_comm
   - unittest/_torch/modules/moe/test_moe_comm.py::TestMoEComm::test_moe_comm_postquant
   - disaggregated/test_disaggregated.py::test_disaggregated_overlap_transceiver_runtime_python_fabric_memory[TinyLlama-1.1B-Chat-v1.0]
+  - disaggregated/test_disaggregated.py::test_disaggregated_overlap_transceiver_runtime_python_bounce[TinyLlama-1.1B-Chat-v1.0]
 
 - condition:
     ranges:
