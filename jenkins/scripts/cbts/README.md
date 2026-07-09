@@ -130,6 +130,10 @@ stage-selection flag (`--stage-list`, `--extra-stage`, `--gpu-type`,
 `--test-backend`, `--skip-test`, `--add-multi-gpu-test`, `--only-multi-gpu-test`,
 `--disable-multi-gpu-test`) makes `getCbtsResult` return null.
 
+`--disable-cbts` is an explicit kill switch: `getCbtsResult` returns null
+before any narrowing, so the pipeline runs the full test set. The opt-out is
+recorded in OpenSearch with `s_cbts_status=disabled`.
+
 Orthogonal flags (`--reuse-test`, `--disable-reuse-test`, `--debug`,
 `--detailed-log`, `--disable-fail-fast`, `--high-priority`) do not affect CBTS.
 

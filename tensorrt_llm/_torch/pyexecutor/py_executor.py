@@ -1289,6 +1289,35 @@ class PyExecutor:
             self.stats = []
         return latest_stats
 
+    def get_kv_cache_capacity(self) -> dict:
+        kv_cache_manager = self.resource_manager.resource_managers.get(
+            ResourceManagerType.KV_CACHE_MANAGER)
+        if kv_cache_manager is None:
+            return {}
+
+        kv_stats = kv_cache_manager.get_kv_cache_stats()
+        max_num_blocks = getattr(kv_stats, "max_num_blocks", 0)
+        tokens_per_block = getattr(kv_stats, "tokens_per_block", 0)
+
+        if not max_num_blocks:
+            max_num_blocks = getattr(kv_cache_manager, "blocks_in_primary_pool",
+                                     0)
+        if not max_num_blocks:
+            max_num_blocks = kv_cache_manager.get_max_resource_count()
+        if not tokens_per_block:
+            tokens_per_block = getattr(kv_cache_manager, "tokens_per_block", 0)
+
+        if not max_num_blocks or not tokens_per_block:
+            return {}
+
+        max_num_blocks = int(max_num_blocks)
+        tokens_per_block = int(tokens_per_block)
+        return {
+            "maxNumBlocks": max_num_blocks,
+            "tokensPerBlock": tokens_per_block,
+            "maxNumTokens": max_num_blocks * tokens_per_block,
+        }
+
     def get_latest_kv_cache_events(self):
         kv_cache_manager = self.resource_manager.resource_managers.get(
             ResourceManagerType.KV_CACHE_MANAGER)
@@ -5140,8 +5169,8 @@ class PyExecutor:
         Called immediately after `_forward_step`, so the side-stream encoder
         work can overlap current-iteration sampling in the non-overlap loop and
         previous-batch `_update_requests` in the overlap loop. No-op unless
-        `TLLM_MM_SIDE_STREAM_MAX_AHEAD` is positive and the model is a
-        `MultimodalModelMixin` subclass.
+        `multimodal_config.encoder_side_stream_max_ahead` is positive and the
+        model is a `MultimodalModelMixin` subclass.
 
         Walks `active_requests` for context-init candidates that are NOT
         in the just-scheduled batch (and, in overlap mode, not in the
@@ -5171,12 +5200,15 @@ class PyExecutor:
         ]
         if not pending:
             return
+        max_prefetch_ahead = (
+            self.llm_args.multimodal_config.encoder_side_stream_max_ahead)
         try:
             maybe_prefetch_mm_encoder_for_next_iter(
                 model=model,
                 pending_requests=pending,
                 in_flight_request_ids=in_flight,
                 max_prefetch=1,
+                max_prefetch_ahead=max_prefetch_ahead,
             )
         except Exception:
             # Speculative prefetch is best-effort and must never crash the
