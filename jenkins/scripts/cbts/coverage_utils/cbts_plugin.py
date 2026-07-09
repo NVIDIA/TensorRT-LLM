@@ -15,8 +15,7 @@
 
 import inspect
 import os
-
-import pytest
+import sys
 
 MARKER_FILE = os.environ.get("CBTS_MARKER_FILE", "/tmp/cbts/current_test.txt")
 
@@ -81,28 +80,36 @@ def _switch_test_context(nodeid):
         switch(nodeid)
 
 
-def pytest_configure(config):  # noqa: D401 - pytest hook
-    """Apply ``mpi_session`` monkeypatch with a compatibility guard."""
-    del config
-    install_mpi_pool_patch(raise_on_refactor=True)
+# The pytest hooks below are only meaningful when this module is loaded as a pytest
+# plugin, and at that point pytest is already imported. Importing pytest at module
+# scope would otherwise drag its large module graph into any process that imports this
+# module solely for ``install_mpi_pool_patch`` (e.g. the sitecustomize daemon in a plain
+# CLI such as trtllm-bench), where a heavy import on a background thread races the host's
+# own startup imports and can crash it. Bind pytest only when it is already loaded.
+if "pytest" in sys.modules:
+    import pytest
 
+    def pytest_configure(config):  # noqa: D401 - pytest hook
+        """Apply ``mpi_session`` monkeypatch with a compatibility guard."""
+        del config
+        install_mpi_pool_patch(raise_on_refactor=True)
 
-@pytest.hookimpl(hookwrapper=True)
-def pytest_runtest_protocol(item, nextitem):  # noqa: D401 - pytest hook
-    """Per-test marker write + switch the tracking context to the current test."""
-    del nextitem
-    nodeid = item.nodeid
+    @pytest.hookimpl(hookwrapper=True)
+    def pytest_runtest_protocol(item, nextitem):  # noqa: D401 - pytest hook
+        """Per-test marker write + switch the tracking context to the current test."""
+        del nextitem
+        nodeid = item.nodeid
 
-    marker_dir = os.path.dirname(MARKER_FILE)
-    if marker_dir:
-        os.makedirs(marker_dir, exist_ok=True)
-    with open(MARKER_FILE, "w") as f:
-        f.write(nodeid)
-        f.flush()
+        marker_dir = os.path.dirname(MARKER_FILE)
+        if marker_dir:
+            os.makedirs(marker_dir, exist_ok=True)
+        with open(MARKER_FILE, "w") as f:
+            f.write(nodeid)
+            f.flush()
 
-    # Propagate nodeid via env so subprocesses pick it up in sitecustomize.py.
-    os.environ["CBTS_TEST_ID"] = nodeid
+        # Propagate nodeid via env so subprocesses pick it up in sitecustomize.py.
+        os.environ["CBTS_TEST_ID"] = nodeid
 
-    _switch_test_context(nodeid)
+        _switch_test_context(nodeid)
 
-    yield
+        yield

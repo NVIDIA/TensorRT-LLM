@@ -61,14 +61,18 @@ class PyStartTracker:
     _SKIP_QUALNAMES = frozenset(("<genexpr>", "<listcomp>", "<setcomp>", "<dictcomp>", "<lambda>"))
 
     def _on_py_start(self, code, offset):
-        fn = code.co_filename
-        ok = self._file_ok.get(fn)
-        if ok is None:
-            ok = self._file_ok[fn] = self._in_source(fn)
-        if ok:
-            qual = code.co_qualname
-            if "<locals>" not in qual and qual not in self._SKIP_QUALNAMES:
-                self._data.setdefault(self._ctx, set()).add((fn, qual))
+        try:
+            fn = code.co_filename
+            ok = self._file_ok.get(fn)
+            if ok is None:
+                ok = self._file_ok[fn] = self._in_source(fn)
+            if ok:
+                qual = code.co_qualname
+                if "<locals>" not in qual and qual not in self._SKIP_QUALNAMES:
+                    self._data.setdefault(self._ctx, set()).add((fn, qual))
+        except Exception:
+            # A tracker fault must never propagate into monitored host code.
+            pass
         # Disable this code object's PY_START (for this tool) until the next test's restart_events().
         return _MON.DISABLE
 
@@ -79,8 +83,15 @@ class PyStartTracker:
             _MON.use_tool_id(self.tool_id, "cbts-pystart")
         except ValueError:
             return False
-        _MON.register_callback(self.tool_id, _MON.events.PY_START, self._on_py_start)
-        _MON.set_events(self.tool_id, _MON.events.PY_START)
+        try:
+            _MON.register_callback(self.tool_id, _MON.events.PY_START, self._on_py_start)
+            _MON.set_events(self.tool_id, _MON.events.PY_START)
+        except Exception:
+            try:
+                _MON.free_tool_id(self.tool_id)
+            except Exception:
+                pass
+            return False
         self._active = True
         try:
             os.register_at_fork(after_in_child=self._after_fork_child)

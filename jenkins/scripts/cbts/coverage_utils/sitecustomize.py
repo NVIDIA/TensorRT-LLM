@@ -142,18 +142,26 @@ if os.getenv("CBTS_COVERAGE_CONFIG"):
             )
 
     if not _skip_daemons:
-        import time as _time
 
         def _watch_mpi_session():
-            try:
-                from cbts_plugin import install_mpi_pool_patch
-            except ImportError:
-                return
-            while True:
+            # Every import is deferred until the host has itself imported the target
+            # modules, so this daemon never runs a heavy or concurrent import during the
+            # host process's own startup import phase -- a background import that races the
+            # main thread's imports can hand it a partially-initialized module and crash it
+            # (e.g. NameError during huggingface_hub import).
+            while not _stop_event.is_set():
                 mod = sys.modules.get("tensorrt_llm.llmapi.mpi_session")
-                # Gate on MpiPoolSession existing to avoid patching a half-initialized module.
-                if mod is not None and hasattr(mod, "MpiPoolSession"):
+                # Act only once the host has fully loaded the session module (with
+                # MpiPoolSession) AND mpi4py.futures, so the patch touches only
+                # already-imported modules and triggers no fresh import here.
+                if (
+                    mod is not None
+                    and hasattr(mod, "MpiPoolSession")
+                    and "mpi4py.futures" in sys.modules
+                ):
                     try:
+                        from cbts_plugin import install_mpi_pool_patch
+
                         install_mpi_pool_patch(raise_on_refactor=False)
                     except Exception as exc:
                         print(
@@ -161,7 +169,7 @@ if os.getenv("CBTS_COVERAGE_CONFIG"):
                             file=sys.stderr,
                         )
                     return
-                _time.sleep(0.1)
+                _stop_event.wait(0.1)
 
         threading.Thread(
             target=_watch_mpi_session,
