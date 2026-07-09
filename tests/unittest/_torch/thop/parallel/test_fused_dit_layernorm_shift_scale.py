@@ -174,6 +174,40 @@ def test_adaln_batch_modulation_correctness():
 
 
 # ---------------------------------------------------------------------------
+# Affine fp32->bf16 downcast: model keeps norm2 weight/bias in float32; the op
+# reads them as bf16. Verify the downcast matches the float32-weight reference.
+# ---------------------------------------------------------------------------
+
+
+def test_affine_fp32_weight_downcast_matches_eager():
+    """fp32 weight/bias downcast to bf16 matches the float32-weight reference."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+    device = torch.device("cuda")
+    torch.manual_seed(0)
+    M = 128
+
+    x = torch.randn(M, D, device=device).to(torch.bfloat16)
+    ln_weight = torch.ones(D, device=device) + torch.randn(D, device=device) * 0.1
+    ln_bias = torch.randn(D, device=device) * 0.1
+
+    # The op reads weight/bias as bf16 (kernel ABI); mimic the model's downcast.
+    out = torch.ops.trtllm.fused_dit_layernorm_shift_scale(
+        x, ln_weight.to(torch.bfloat16), ln_bias.to(torch.bfloat16), None, None, M, EPS
+    )
+    ref_fp32 = _ref_layernorm_affine(x, ln_weight, ln_bias, EPS)
+    torch.testing.assert_close(
+        out.float(), ref_fp32.to(torch.bfloat16).float(), rtol=2e-2, atol=2e-2
+    )
+
+    # Isolated fp32->bf16 weight-downcast error stays well below the bf16 output tol.
+    ref_bf16 = _ref_layernorm_affine(
+        x, ln_weight.to(torch.bfloat16), ln_bias.to(torch.bfloat16), EPS
+    )
+    assert (ref_fp32 - ref_bf16).norm() / ref_fp32.norm() < 5e-3
+
+
+# ---------------------------------------------------------------------------
 # FP4 correctness: feed quant output through nvfp4_gemm, cosine_sim > 0.98.
 # Pattern from Yiyun's LTX-2 test_fused_dit_gate_resid_norm_shift_scale.py.
 # ---------------------------------------------------------------------------
