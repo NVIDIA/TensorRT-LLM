@@ -489,6 +489,7 @@ class NVLinkOneSided(Communication):
                 self.top_k,
                 self.num_experts,
                 eplb_local_stats,
+                self.ep_group_health is not None,
                 active_rank_mask,
             )
         )
@@ -628,6 +629,7 @@ class NVLinkOneSided(Communication):
             int(combine_payload_offset),
             bool(self.payload_in_workspace),
             bool(self.use_low_precision_combine),
+            self.ep_group_health is not None,
             active_rank_mask,
         )
         self._watchdog_coordinator.watch_collective(

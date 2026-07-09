@@ -79,11 +79,6 @@ inline void resolveActiveRankMask(torch::optional<torch::Tensor> const& maskTens
         ") as active");
 }
 
-inline bool hasActiveRankMask(torch::optional<torch::Tensor> const& maskTensor)
-{
-    return maskTensor.has_value() && maskTensor.value().defined();
-}
-
 // Calculate auxiliary data offsets
 MoeA2ADataOffsets calculateOffsets(int epSize, int maxNumTokens, int eplbStatsNumExperts)
 {
@@ -227,7 +222,7 @@ std::tuple<std::vector<torch::Tensor>, int64_t, torch::Tensor> moeA2ADispatchOp(
     torch::Tensor const& tokenSelectedExperts, std::vector<torch::Tensor> const& inputPayloads,
     torch::Tensor const& workspace, torch::Tensor const& metainfo, int64_t runtimeMaxTokensPerRank, int64_t epRank,
     int64_t epSize, int64_t topK, int64_t numExperts, torch::optional<torch::Tensor> eplbLocalStats,
-    torch::optional<torch::Tensor> activeRankMask)
+    bool enableFaultTolerance, torch::optional<torch::Tensor> activeRankMask)
 {
     using tensorrt_llm::kernels::moe_comm::PayloadDescriptor;
     using tensorrt_llm::kernels::moe_comm::MoeA2ADispatchParams;
@@ -408,10 +403,15 @@ std::tuple<std::vector<torch::Tensor>, int64_t, torch::Tensor> moeA2ADispatchOp(
         params.eplb_local_stats = nullptr;
     }
 
-    params.enable_fault_tolerance = hasActiveRankMask(activeRankMask);
+    params.enable_fault_tolerance = enableFaultTolerance;
     if (params.enable_fault_tolerance)
     {
         resolveActiveRankMask(activeRankMask, epRank, params.active_rank_mask);
+    }
+    else
+    {
+        TORCH_CHECK(!activeRankMask.has_value() || !activeRankMask.value().defined(),
+            "active_rank_mask requires enable_fault_tolerance=True");
     }
 
     params.stream = at::cuda::getCurrentCUDAStream();
@@ -467,7 +467,7 @@ std::tuple<std::vector<torch::Tensor>, int64_t, torch::Tensor> moeA2ADispatchOp(
 // In both cases, the combine kernel reads from the workspace at 'combinePayloadOffset'.
 torch::Tensor moeA2ACombineOp(torch::Tensor const& payload, int64_t localNumTokens, torch::Tensor const& workspace,
     torch::Tensor const& metainfo, int64_t runtimeMaxTokensPerRank, int64_t epRank, int64_t epSize, int64_t topK,
-    int64_t combinePayloadOffset, bool payloadInWorkspace, bool useLowPrecision = false,
+    int64_t combinePayloadOffset, bool payloadInWorkspace, bool useLowPrecision, bool enableFaultTolerance,
     torch::optional<torch::Tensor> activeRankMask = torch::nullopt)
 {
     using tensorrt_llm::kernels::moe_comm::MoeA2ACombineParams;
@@ -577,10 +577,15 @@ torch::Tensor moeA2ACombineOp(torch::Tensor const& payload, int64_t localNumToke
         params.recv_buffers[target_rank] = target_workspace_ptr + combinePayloadOffset;
     }
 
-    params.enable_fault_tolerance = hasActiveRankMask(activeRankMask);
+    params.enable_fault_tolerance = enableFaultTolerance;
     if (params.enable_fault_tolerance)
     {
         resolveActiveRankMask(activeRankMask, epRank, params.active_rank_mask);
+    }
+    else
+    {
+        TORCH_CHECK(!activeRankMask.has_value() || !activeRankMask.value().defined(),
+            "active_rank_mask requires enable_fault_tolerance=True");
     }
 
     params.stream = at::cuda::getCurrentCUDAStream();
@@ -677,13 +682,13 @@ TORCH_LIBRARY_FRAGMENT(trtllm, module)
         "Tensor(a!->*) workspace, Tensor metainfo, int runtime_max_tokens_per_rank, "
         "int ep_rank, int ep_size, int top_k, int num_experts, "
         "Tensor? eplb_local_stats=None, "
-        "Tensor? active_rank_mask=None) -> (Tensor(a!)[], int, Tensor(a!))");
+        "bool enable_fault_tolerance=False, Tensor? active_rank_mask=None) -> (Tensor(a!)[], int, Tensor(a!))");
     module.def(
         "moe_a2a_combine(Tensor(a) payload, int local_num_tokens,"
         "Tensor(a!) workspace, Tensor metainfo, int runtime_max_tokens_per_rank, "
         "int ep_rank, int ep_size, int top_k, int combine_payload_offset, "
         "bool payload_in_workspace, bool use_low_precision=False, "
-        "Tensor? active_rank_mask=None) -> Tensor");
+        "bool enable_fault_tolerance=False, Tensor? active_rank_mask=None) -> Tensor");
     module.def(
         "moe_a2a_initialize(Tensor(a!) workspace, int ep_rank, int ep_size, int max_num_tokens_per_rank, "
         "int? eplb_stats_num_experts=None) -> Tensor");
