@@ -364,6 +364,7 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         `host_kv_cache_block_offsets`, and the NVFP4-stacked pointers) mirror
         the base's non-SWA else branch so downstream consumers keep working.
         """
+        assert not self.enable_swa_scratch_reuse, "MiniMax M3 does not support SWA scratch reuse"
         kv_cache_pool_pointers = torch.tensor(
             [
                 [
