@@ -493,6 +493,13 @@ endif()
 message("CMAKE_CUDA_FLAGS: ${CMAKE_CUDA_FLAGS}")
 
 set(COMMON_HEADER_DIRS ${PROJECT_SOURCE_DIR} ${CUDAToolkit_INCLUDE_DIR})
+if(ENABLE_MULTI_DEVICE AND NCCL_INCLUDE_DIR)
+  # nccl.h is included from common headers whenever multi-device is enabled,
+  # by targets that do not link NCCL::nccl; propagate the directory FindNCCL
+  # located so a build against an NCCL outside the compiler's default search
+  # path (e.g. --nccl_root) can compile.
+  list(APPEND COMMON_HEADER_DIRS ${NCCL_INCLUDE_DIR})
+endif()
 message(STATUS "COMMON_HEADER_DIRS: ${COMMON_HEADER_DIRS}")
 
 if(NOT WIN32 AND NOT DEFINED USE_CXX11_ABI)
