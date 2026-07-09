@@ -160,6 +160,30 @@ def wait_gpu_memory_settle() -> None:
             pass
 
 
+def _get_worker_pid() -> int:
+    """Runs inside a worker; module-level so it is picklable."""
+    return os.getpid()
+
+
+def _collect_worker_pids(real, n_workers: int) -> tuple:
+    """Record the worker PIDs of a freshly spawned pool.
+
+    ``_retire`` uses them to SIGKILL wedged workers: a graceful shutdown
+    blocks forever on a broken pool and ``shutdown_abort`` would MPI_Abort
+    the parent test process too. Best effort — a missing PID just means that
+    worker is left for the graceful-shutdown fallback.
+    """
+    pids: set = set()
+    try:
+        for _ in range(4):
+            pids.update(real.submit_sync(_get_worker_pid))
+            if len(pids) >= n_workers:
+                break
+    except Exception:
+        pass
+    return tuple(sorted(pids))
+
+
 def _describe_mismatch(spawn_snap, now_snap, uses, max_uses):
     """One line naming WHY a cached pool cannot be handed out (observability)."""
     if uses >= max_uses:
@@ -241,19 +265,27 @@ class SessionReuseCache:
         Pools are usually retired because they are broken (failed health
         probe, stale env, lifetime cap). A graceful ``shutdown()`` on a pool
         whose workers are wedged in a collective blocks forever and leaks the
-        workers' GPU memory into subsequent tests, so prefer
-        ``shutdown_abort`` (bounded grace, then kill) and fall back to
-        ``shutdown`` only if abort is unavailable or raises.
+        workers' GPU memory into subsequent tests. ``shutdown_abort`` is NOT
+        an option either: it calls ``MPI_COMM_WORLD.Abort``, which kills the
+        parent test process along with the workers. Instead SIGKILL the
+        worker PIDs recorded at spawn (retired pools are discarded, so
+        nothing needs a graceful stop; the driver reclaims GPU memory on
+        process death) and then reap the client side.
         """
+        pids = getattr(real, "_reuse_worker_pids", ())
 
         def _dispose():
-            try:
-                real.shutdown_abort(grace=30, reason=TimeoutError("session-reuse retire"))
-            except Exception:
+            import signal
+
+            for pid in pids:
                 try:
-                    real.shutdown(wait=False)
-                except Exception:
+                    os.kill(pid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
                     pass
+            try:
+                real.shutdown()
+            except Exception:
+                pass
 
         threading.Thread(target=_dispose, daemon=True, name="session-reuse-retire").start()
 
@@ -363,6 +395,7 @@ class SessionReuseCache:
                 os.environ.pop(k, None)
         real._reuse_uses = 0
         real._reuse_spawn_snapshot = snapshot
+        real._reuse_worker_pids = _collect_worker_pids(real, n_workers)
         return real
 
     def _release(self, real):
