@@ -551,6 +551,9 @@ When defining any user-facing configuration classes (particularly `LlmArgs` or a
 - Prefer `PositiveInt`, `NonNegativeInt`, `NonNegativeFloat`, `PositiveFloat`, `Field(gt=0)`, `Field(ge=0)`, etc. for numeric constraints instead of defining custom validators
 - Use `Field(min_length=1)` to enforce minimum length of a list
 
+- After changing LLM args or nested configs, run `python3 scripts/generate_llm_args_golden_manifest.py` and commit
+  `tensorrt_llm/usage/llm_args_golden_manifest.json`; new fields require telemetry/privacy CODEOWNER approval.
+
 **Validation:**
 - Use `@field_validator` and `@model_validator` instead of manual `validate()` or `is_valid()` methods
 - Raise `ValueError` instead of using assertions

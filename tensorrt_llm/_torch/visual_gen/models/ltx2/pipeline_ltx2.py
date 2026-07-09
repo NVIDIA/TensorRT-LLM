@@ -16,7 +16,7 @@ import torch.distributed as dist
 from transformers import Gemma3ForConditionalGeneration, GemmaTokenizerFast
 
 from tensorrt_llm._torch.utils import make_weak_ref
-from tensorrt_llm._torch.visual_gen.cache.teacache import CacheContext
+from tensorrt_llm._torch.visual_gen.cache.teacache import CacheContext, register_extractor
 from tensorrt_llm._torch.visual_gen.checkpoints.prefetch import prefetch_files_to_host_cache
 from tensorrt_llm._torch.visual_gen.cuda_graph_runner import CUDAGraphRunner, CUDAGraphRunnerConfig
 from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer, PipelineOutput
@@ -44,6 +44,7 @@ from .ltx2_core.types import (
     VideoPixelShape,
 )
 from .ltx2_core.video_vae import TilingConfig, VideoDecoderConfigurator, VideoEncoderConfigurator
+from .parallel_vae import tile_parallel_decode
 from .transformer_ltx2 import LTXModel, LTXModelType
 
 LTX2_FORCE_ONE_STAGE_ENV = "TLLM_LTX2_FORCE_ONE_STAGE_PIPELINE"
@@ -619,6 +620,16 @@ class LTX2Pipeline(BasePipeline):
     ``transformers`` library.
     """
 
+    def __init__(self, model_config):
+        _sa_cfg = model_config.attention.sparse_attention_config
+        if _sa_cfg is not None and getattr(_sa_cfg, "algorithm", None) == "vsa":
+            raise ValueError(
+                "Video Sparse Attention (sparse_attention_config.algorithm='vsa') is "
+                "only supported by the Wan 2.1 T2V 14B (720P) pipeline. Remove "
+                "sparse_attention_config for LTX-2."
+            )
+        super().__init__(model_config)
+
     @classmethod
     def resolve_variant(cls, config):
         if getattr(config, "cache_backend", None) == "cache_dit":
@@ -1015,17 +1026,22 @@ class LTX2Pipeline(BasePipeline):
         """Finalize after weight loading: TeaCache, Cache-DiT, derived attributes."""
         super().post_load_weights()
 
-        # TODO: TeaCache disabled: LTX2_TEACACHE_COEFFICIENTS are unverified.
-        # To re-enable, uncomment the following lines and verify coefficients.
-        # register_extractor(
-        #     "LTXModel",
-        #     LTX2TeaCacheExtractor(self._compute_ltx2_timestep_embedding),
-        # )
-        # self._setup_teacache(self.transformer, coefficients=LTX2_TEACACHE_COEFFICIENTS)
+        # LTX-2: single transformer (one DiT for video+audio); TeaCache only with explicit coefficients.
+        if self.transformer is not None and self.pipeline_config.cache_backend == "teacache":
+            if self.pipeline_config.teacache.coefficients is None:
+                raise ValueError(
+                    "TeaCache on LTX-2 requires explicit teacache.coefficients "
+                    "(no built-in coefficient table)."
+                )
+            register_extractor(
+                "LTXModel",
+                LTX2TeaCacheExtractor(self._compute_ltx2_timestep_embedding),
+            )
+            self._setup_cache_acceleration()
 
         # Cache-DiT
         if self.transformer is not None and self.pipeline_config.cache_backend == "cache_dit":
-            self._setup_cache_acceleration(self.transformer, coefficients=None)
+            self._setup_cache_acceleration()
 
         # Compression ratios from native scale factors
         self.vae_spatial_compression_ratio = VIDEO_SCALE_FACTORS.width
@@ -1045,6 +1061,31 @@ class LTX2Pipeline(BasePipeline):
             self.tokenizer_max_length = self.tokenizer.model_max_length
 
         logger.info("LTX2 pipeline post-load complete")
+
+    def setup_parallel_vae(self) -> None:
+        """Enable tile-parallel VAE decode for LTX-2.
+
+        LTX-2 decodes via ``self.video_decoder`` (not ``self.vae``), so the base
+        ``setup_parallel_vae`` — which gates on ``self.vae`` + the halo-shaped
+        ``ParallelVAEFactory`` — never engages. Set the global
+        ``_parallel_vae_enabled`` flag directly from config + mapping so
+        ``decode_latents`` routes the decode to ``vae_ranks``; the tile-shard +
+        ``all_reduce`` happens in ``decode_video_fn`` via ``tile_parallel_decode``.
+        The flag is global (computed identically on every rank).
+        """
+        parallel_cfg = self.pipeline_config.parallel
+        vgm = self.pipeline_config.visual_gen_mapping
+        self._parallel_vae_enabled = (
+            parallel_cfg.parallel_vae_size > 1
+            and dist.is_initialized()
+            and dist.get_world_size() > 1
+            and vgm is not None
+        )
+        if self._parallel_vae_enabled and self.rank == 0:
+            logger.info(
+                f"LTX-2 tile-parallel VAE enabled: vae_ranks={vgm.vae_ranks}, "
+                f"parallel_vae_size={parallel_cfg.parallel_vae_size}"
+            )
 
     # ------------------------------------------------------------------
     # Text encoding
@@ -1991,14 +2032,28 @@ class LTX2Pipeline(BasePipeline):
 
             vid_latents = vid_latents.to(self.dtype)
             tiling_config = TilingConfig.default()
-            chunks = list(
-                self.video_decoder.tiled_decode(
+            if self._parallel_vae_enabled:
+                # Tile-parallel: shard tiled_decode's tiles across vae_ranks and
+                # all_reduce the blend buffer. Output matches serial tiled_decode
+                # up to bf16 re-association. decode_latents calls this only on
+                # vae_ranks, so the all_reduce over vgm.vae_group is collective.
+                vgm = self.pipeline_config.visual_gen_mapping
+                video = tile_parallel_decode(
+                    self.video_decoder,
                     vid_latents,
                     tiling_config,
+                    pg=vgm.vae_group,
                     generator=generator,
                 )
-            )
-            video = torch.cat(chunks, dim=2)
+            else:
+                chunks = list(
+                    self.video_decoder.tiled_decode(
+                        vid_latents,
+                        tiling_config,
+                        generator=generator,
+                    )
+                )
+                video = torch.cat(chunks, dim=2)
             video = postprocess_video_tensor(video)
             return video
 

@@ -15,7 +15,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import contextlib
-import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Dict, Iterable, Iterator, Optional, Sequence
 
@@ -36,49 +35,20 @@ if TYPE_CHECKING:
     from ..pyexecutor.llm_request import LlmRequest
 
 
-_MM_SIDE_STREAM_MAX_AHEAD_ENV_NAME = "TLLM_MM_SIDE_STREAM_MAX_AHEAD"
-_MM_SIDE_STREAM_DEFAULT_MAX_AHEAD = 0
 _MM_DATA_INPUT_MODALITY_KEYS = frozenset({"audio", "image", "video"})
 _MM_AUX_STREAM: Optional[tuple[int, torch.cuda.Stream]] = None
 
 
-def _get_mm_side_stream_max_ahead() -> int:
-    raw_value = os.getenv(_MM_SIDE_STREAM_MAX_AHEAD_ENV_NAME)
-    if raw_value is None:
-        return _MM_SIDE_STREAM_DEFAULT_MAX_AHEAD
-
-    try:
-        max_ahead = int(raw_value)
-    except ValueError:
-        logger.warning_once(
-            f"Invalid {_MM_SIDE_STREAM_MAX_AHEAD_ENV_NAME}={raw_value!r}; "
-            f"using default value {_MM_SIDE_STREAM_DEFAULT_MAX_AHEAD}.",
-            key="invalid_mm_side_stream_max_ahead",
-        )
-        return _MM_SIDE_STREAM_DEFAULT_MAX_AHEAD
-
-    if max_ahead < 0:
-        logger.warning_once(
-            f"Invalid {_MM_SIDE_STREAM_MAX_AHEAD_ENV_NAME}={raw_value!r}; "
-            "treating negative value as 0.",
-            key="negative_mm_side_stream_max_ahead",
-        )
-        return 0
-    return max_ahead
-
-
-def _get_mm_aux_stream(max_prefetch_ahead: Optional[int] = None) -> Optional[torch.cuda.Stream]:
+def _get_mm_aux_stream(max_prefetch_ahead: int = 0) -> Optional[torch.cuda.Stream]:
     """Return the side CUDA stream used for multimodal encoder prefetch.
 
-    Returns `None` when `TLLM_MM_SIDE_STREAM_MAX_AHEAD` is unset or non-positive,
-    CUDA is unavailable, or the current stream is being captured. The cache intentionally
-    keeps only one stream because executor processes are expected to run on one current
+    Returns `None` when side-stream prefetch is disabled, CUDA is unavailable,
+    or the current stream is being captured. The cache intentionally keeps only
+    one stream because executor processes are expected to run on one current
     CUDA device; if the current device changes, the cached stream is replaced.
     """
     global _MM_AUX_STREAM
 
-    if max_prefetch_ahead is None:
-        max_prefetch_ahead = _get_mm_side_stream_max_ahead()
     if max_prefetch_ahead <= 0:
         return None
     if not torch.cuda.is_available():
@@ -91,7 +61,7 @@ def _get_mm_aux_stream(max_prefetch_ahead: Optional[int] = None) -> Optional[tor
         _MM_AUX_STREAM = (device, torch.cuda.Stream(device=device))
         logger.warning_once(
             f"Using multimodal encoder side stream on CUDA device {device} "
-            f"with {_MM_SIDE_STREAM_MAX_AHEAD_ENV_NAME}={max_prefetch_ahead}. "
+            f"with encoder_side_stream_max_ahead={max_prefetch_ahead}. "
             "This may increase peak GPU memory usage because raw multimodal "
             "encoder inputs and computed embeddings can be resident before "
             "request prefill.",
@@ -121,27 +91,6 @@ def _run_on_aux_stream(aux_stream: torch.cuda.Stream) -> Iterator[torch.cuda.Eve
             # Keep the sync point valid even if the block raises after queuing
             # aux-stream work.
             exit_event.record()
-
-
-@dataclass(frozen=True)
-class MultimodalEncoderOutput:
-    """Output produced by a model-owned multimodal encoder hook.
-
-    Contract:
-    - `embeddings` contains all multimodal embedding rows for the supplied
-      `multimodal_params`.
-    - Rows are concatenated in the same order as `multimodal_params`.
-    - Per-request row counts match `total_embeds_in_request` from runtime
-      metadata when that metadata is available.
-    - Special multimodal tokens occupy token positions but do not have rows in
-      this tensor.
-
-    The single-tensor shape is required for chunked-prefill embedding reuse,
-    which lets later chunks skip the encoder. See
-    `modeling_multimodal_utils.py` for the caching machinery.
-    """
-
-    embeddings: torch.Tensor
 
 
 @dataclass(frozen=True)
@@ -181,8 +130,13 @@ class MultimodalModelMixin:
     def encode_multimodal_inputs(
         self,
         multimodal_params: Sequence[MultimodalParams],
-    ) -> MultimodalEncoderOutput:
-        """Run model-specific multimodal encoder work."""
+    ) -> torch.Tensor:
+        """Run model-specific multimodal encoder work.
+
+        Returns the single primary multimodal embedding tensor for the supplied params. Rows are
+        expected to be concatenated in request order, and special multimodal tokens occupy token
+        positions but do not have rows here.
+        """
         raise NotImplementedError
 
     @property
@@ -222,16 +176,16 @@ class MultimodalModelMixin:
         *,
         input_ids: torch.Tensor,
         multimodal_params: Sequence[MultimodalParams],
-        encoder_output: MultimodalEncoderOutput,
+        embeddings: torch.Tensor,
         **forward_kwargs: Any,
-    ) -> tuple[torch.Tensor, MultimodalEncoderOutput]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Optional hook before active chunk rows are selected.
 
         Runs after cache lookup or encoder execution has produced full
         per-request multimodal embeddings, but before the mixin selects rows
         active in the current forward chunk.
         """
-        return input_ids, encoder_output
+        return input_ids, embeddings
 
     def after_active_multimodal_embeddings(
         self,
@@ -274,21 +228,16 @@ class MultimodalModelMixin:
         if not context_params:
             return PreparedLlmInputs(input_ids=input_ids, inputs_embeds=None)
 
-        full_output = self._get_or_encode_multimodal_embeddings(context_params)
+        full_embeddings = self._get_or_encode_multimodal_embeddings(context_params)
 
-        input_ids, full_output = self.after_full_multimodal_embeddings(
+        input_ids, full_embeddings = self.after_full_multimodal_embeddings(
             input_ids=input_ids,
             multimodal_params=context_params,
-            encoder_output=full_output,
+            embeddings=full_embeddings,
             **forward_kwargs,
         )
 
-        active_embeddings = self._find_active_multimodal_embeddings(
-            [full_output.embeddings],
-            input_ids=input_ids,
-            positions=positions,
-            multimodal_params=context_params,
-        )
+        active_embeddings = find_input_mm_embeds([full_embeddings], list(context_params))
         active_embeddings, extra_embeds = self.after_active_multimodal_embeddings(
             active_embeddings=active_embeddings,
             multimodal_params=context_params,
@@ -319,49 +268,20 @@ class MultimodalModelMixin:
     def _get_or_encode_multimodal_embeddings(
         self,
         multimodal_params: Sequence[MultimodalParams],
-    ) -> MultimodalEncoderOutput:
+    ) -> torch.Tensor:
         """Return cached multimodal embeddings or run the encoder for misses.
 
-        Delegates cache lookup and gather behavior to
-        `get_multimodal_embeddings`, then validates the single primary tensor
-        contract for both encoded and cached-only paths.
+        Delegates cache lookup and gather behavior to `get_multimodal_embeddings`, then validates
+        the single tensor contract for both encoded and cached-only paths.
         """
-
-        def encoder_forward_fn(params: list[MultimodalParams]) -> list[torch.Tensor]:
-            encoder_output = self.encode_multimodal_inputs(params)
-            if not isinstance(encoder_output, MultimodalEncoderOutput):
-                raise TypeError("encode_multimodal_inputs must return MultimodalEncoderOutput.")
-            if not isinstance(encoder_output.embeddings, torch.Tensor):
-                raise TypeError("MultimodalEncoderOutput.embeddings must be a torch.Tensor.")
-            return [encoder_output.embeddings]
-
         embeddings = get_multimodal_embeddings(
-            encoder_forward_fn=encoder_forward_fn,
+            encoder_forward_fn=self.encode_multimodal_inputs,
             multimodal_params=list(multimodal_params),
         )
-        primary = self._require_primary_embedding(embeddings)
-        # Validate post-gather so cached-only paths (KV reuse, all-cached chunked
-        # prefill) are also checked, not just paths that ran the encoder.
-        self._validate_primary_embedding_rows(primary, multimodal_params)
-        return MultimodalEncoderOutput(embeddings=primary)
-
-    def _find_active_multimodal_embeddings(
-        self,
-        multimodal_embeddings: list[torch.Tensor],
-        *,
-        input_ids: torch.Tensor,
-        positions: Optional[torch.Tensor],
-        multimodal_params: Sequence[MultimodalParams],
-    ) -> list[torch.Tensor]:
-        """Named internal stage for selecting active chunk multimodal rows.
-
-        This initial template stage currently delegates to
-        `find_input_mm_embeds`. Model-specific behavior around slicing should
-        use `after_full_multimodal_embeddings` or
-        `after_active_multimodal_embeddings` so the common mixin sequence stays
-        centralized.
-        """
-        return find_input_mm_embeds(multimodal_embeddings, list(multimodal_params))
+        # Validate post-gather so cached-only paths (KV reuse, all-cached chunked prefill) are also
+        # checked, not just paths that ran the encoder.
+        self._validate_embeddings(embeddings, multimodal_params)
+        return embeddings[0]
 
     def _fuse_multimodal_embeddings(
         self,
@@ -403,40 +323,46 @@ class MultimodalModelMixin:
         return fused_input_ids, inputs_embeds, ()
 
     @staticmethod
-    def _require_primary_embedding(embeddings: list[torch.Tensor]) -> torch.Tensor:
-        if len(embeddings) != 1:
-            raise ValueError(
-                "MultimodalModelMixin requires a single primary embedding tensor, "
-                f"got {len(embeddings)} tensors."
-            )
-        return embeddings[0]
-
-    @staticmethod
-    def _validate_primary_embedding_rows(
-        primary: torch.Tensor,
+    def _validate_embeddings(
+        embeddings: list[torch.Tensor],
         multimodal_params: Sequence[MultimodalParams],
     ) -> None:
-        """Validate gathered primary embedding row count against runtime metadata.
+        """Validate gathered embeddings' row count against runtime metadata.
 
         Skipped if any param lacks `multimodal_runtime.total_embeds_in_request`, since the contract
         cannot be evaluated without complete metadata.
         """
+        if len(embeddings) != 1:
+            raise ValueError(
+                f"MultimodalModelMixin requires a single embedding tensor, got {len(embeddings)} "
+                "tensors."
+            )
+
+        embeddings_tensor = embeddings[0]
         expected_rows = 0
+        has_runtime_metadata = []
         for param in multimodal_params:
             runtime = param.multimodal_runtime
-            if runtime is None or runtime.total_embeds_in_request is None:
-                logger.debug(
-                    "Skipping multimodal embedding row-count validation: "
-                    "runtime metadata missing or incomplete for at least one param."
-                )
-                return
-            expected_rows += runtime.total_embeds_in_request
+            has_runtime = runtime is not None and runtime.total_embeds_in_request is not None
+            has_runtime_metadata.append(has_runtime)
+            if has_runtime:
+                expected_rows += runtime.total_embeds_in_request
 
-        actual_rows = primary.shape[0]
+        if any(has_runtime_metadata) and not all(has_runtime_metadata):
+            raise ValueError(
+                "Multimodal runtime metadata must be present for every param or none of them."
+            )
+        if not all(has_runtime_metadata):
+            logger.debug(
+                "Skipping multimodal embedding row-count validation: runtime metadata missing "
+                "for all params."
+            )
+            return
+
+        actual_rows = embeddings_tensor.shape[0]
         if actual_rows != expected_rows:
             raise ValueError(
-                "Multimodal embedding row count mismatch: "
-                f"expected {expected_rows}, got {actual_rows}."
+                f"Multimodal embedding row count mismatch: expected {expected_rows}, got {actual_rows}."
             )
 
 
@@ -539,9 +465,7 @@ def _dispatch_cross_iter_prefetch(
             for (req, _, _), p in zip(candidates, params_list):
                 req.py_multimodal_data = p.multimodal_data
             encoder_output = model.encode_multimodal_inputs(params_list)
-            if not isinstance(encoder_output, MultimodalEncoderOutput):
-                raise TypeError("encode_multimodal_inputs must return MultimodalEncoderOutput.")
-            _cache_multimodal_embeddings(params_list, [encoder_output.embeddings])
+            _cache_multimodal_embeddings(params_list, [encoder_output])
     finally:
         # Stash the event on every candidate's durable LlmRequest (not the
         # per-iter `MultimodalParams`), since `_prepare_inputs` rebuilds the
@@ -591,9 +515,9 @@ def maybe_prefetch_mm_encoder_for_next_iter(
     - With `max_prefetch < len(pending)`, if the head is bumped by budget reasons, the next-admitted
       request is one we did not prefetch.
 
-    Gated by `TLLM_MM_SIDE_STREAM_MAX_AHEAD`: unset or 0 disables the side stream; a positive
-    integer enables it and caps the total number of not-in-flight requests with prefetched MM
-    encoder work.
+    Gated by `MultimodalConfig.encoder_side_stream_max_ahead`: 0 disables the side stream; a
+    positive integer enables it and caps the total number of not-in-flight requests with
+    prefetched MM encoder work.
 
     Returns the number of requests for which an encoder kick-off was queued.
     """
@@ -602,7 +526,7 @@ def maybe_prefetch_mm_encoder_for_next_iter(
     if max_prefetch <= 0:
         return 0
     if max_prefetch_ahead is None:
-        max_prefetch_ahead = _get_mm_side_stream_max_ahead()
+        max_prefetch_ahead = 0
     if max_prefetch_ahead <= 0:
         return 0
 

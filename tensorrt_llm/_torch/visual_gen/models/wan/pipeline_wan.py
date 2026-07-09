@@ -5,11 +5,15 @@ from typing import List, Optional, Union
 import diffusers
 import PIL.Image
 import torch
-from diffusers import AutoencoderKLWan, FlowMatchEulerDiscreteScheduler
+from diffusers import FlowMatchEulerDiscreteScheduler
 from diffusers.utils.torch_utils import randn_tensor
 from diffusers.video_processor import VideoProcessor
 from transformers import AutoTokenizer, UMT5EncoderModel
 
+from tensorrt_llm._torch.visual_gen.attention_backend import (
+    VSAMetadataBuilder,
+    set_vsa_forward_context,
+)
 from tensorrt_llm._torch.visual_gen.cache.teacache import (
     ExtractorConfig,
     register_extractor_from_config,
@@ -27,6 +31,7 @@ from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.logger import logger
 
 from .transformer_wan import WanTransformer3DModel
+from .vae_loader import load_wan_vae
 
 # Supported Wan models:
 # - Wan2.1-T2V-14B: Single-stage text-to-video (14B parameters)
@@ -101,13 +106,6 @@ class WanPipeline(BasePipeline):
         # Derived model type flags
         self.is_wan22_14b = self.boundary_ratio is not None
         self.is_wan22_5b = self.expand_timesteps
-
-        # Validate TeaCache compatibility before allocating GPU memory
-        if (self.is_wan22_14b or self.is_wan22_5b) and pipeline_config.cache_backend == "teacache":
-            raise ValueError(
-                "TeaCache is not supported for Wan 2.2 models. "
-                "Use cache_backend='none' or 'cache_dit' (not 'teacache')."
-            )
 
         # Fixed latent for reproducible benchmarking (e.g. MLPerf).
         # Set TRTLLM_VIDEO_FIXED_LATENT_PATH to a .pt file containing a pre-sampled
@@ -250,11 +248,12 @@ class WanPipeline(BasePipeline):
 
         if PipelineComponent.VAE not in skip_components:
             logger.info("Loading VAE...")
-            self.vae = AutoencoderKLWan.from_pretrained(
+            self.vae = load_wan_vae(
                 checkpoint_dir,
-                subfolder=PipelineComponent.VAE,
-                torch_dtype=torch.bfloat16,  # load VAE in BF16 for memory saving
-            ).to(device)
+                device,
+                self.pipeline_config.visual_gen_mapping,
+                dtype=self.pipeline_config.torch_dtype,
+            )
 
             self.vae_scale_factor_temporal = getattr(self.vae.config, "scale_factor_temporal", 4)
             self.vae_scale_factor_spatial = getattr(
@@ -331,19 +330,30 @@ class WanPipeline(BasePipeline):
                 )
 
             if not self.is_wan22_14b:
-                self._setup_cache_acceleration(
-                    self.transformer, coefficients=WAN_TEACACHE_COEFFICIENTS
-                )
-                self.transformer_cache_backend = self.cache_accelerator
+                self._apply_teacache_coefficients(WAN_TEACACHE_COEFFICIENTS)
+                self._setup_cache_acceleration()
             else:
                 if self.pipeline_config.cache_backend == "cache_dit":
-                    self._setup_cache_acceleration(self.transformer, coefficients=None)
-                # TeaCache is not supported for Wan 2.2 unless using Cache-DiT.
-                self.transformer_cache_backend = self.cache_accelerator
+                    self._setup_cache_acceleration()
 
         if self.transformer_2 is not None:
             if hasattr(self.transformer_2, "post_load_weights"):
                 self.transformer_2.post_load_weights()
+
+        # Wan 2.2 TeaCache after both transformers' post_load_weights (FP8 scales, etc.)
+        if (
+            self.transformer is not None
+            and self.transformer_2 is not None
+            and self.pipeline_config.cache_backend == "teacache"
+        ):
+            tc = self.pipeline_config.teacache
+            if tc.coefficients is None or tc.coefficients_2 is None:
+                raise ValueError(
+                    "Wan 2.2 TeaCache requires explicit teacache.coefficients and "
+                    "teacache.coefficients_2 (high-noise and low-noise stage polynomials). "
+                    "There is no built-in coefficient table for Wan 2.2."
+                )
+            self._setup_cache_acceleration()
 
     def _run_warmup(self, height: int, width: int, num_frames: int, steps: int) -> None:
         with torch.no_grad():
@@ -516,9 +526,22 @@ class WanPipeline(BasePipeline):
                 f"guidance_scale={guidance_scale}, guidance_scale_2={guidance_scale_2}"
             )
 
+        # VSA: build metadata builder once per forward() call; reused across timesteps.
+        _attn_cfg = self.pipeline_config.primary_model_config.attention
+        _sparse_cfg = getattr(_attn_cfg, "sparse_attention_config", None)
+        _vsa_active = (
+            getattr(_attn_cfg, "backend", "VANILLA") == "CUTEDSL"
+            and _sparse_cfg is not None
+            and getattr(_sparse_cfg, "algorithm", None) == "vsa"
+        )
+        _vsa_builder = VSAMetadataBuilder() if _vsa_active else None
+        _vsa_patch_size = tuple(getattr(self.config, "patch_size", [1, 2, 2]))  # (pT, pH, pW)
+        _vsa_sparsity = _sparse_cfg.vsa_sparsity if _vsa_active else 0.0
+
         # Denoising with two-stage support
         # Track which model was used in last step (for logging model transitions)
         last_model_used = [None]
+        _vsa_step_counter = [0]
 
         def forward_fn(
             latents,
@@ -566,6 +589,24 @@ class WanPipeline(BasePipeline):
                 else:
                     # T2V: current_t for all frames
                     timestep = current_t.reshape(1, 1).expand(latents.shape[0], nf * nh * nw)
+
+            if _vsa_active and _vsa_builder is not None:
+                # latents: [B, C, T_latent, H_latent, W_latent]
+                raw_latent_shape = (latents.shape[2], latents.shape[3], latents.shape[4])
+                vsa_metadata = _vsa_builder.build(
+                    current_timestep=_vsa_step_counter[0],
+                    raw_latent_shape=raw_latent_shape,
+                    patch_size=_vsa_patch_size,
+                    vsa_sparsity=_vsa_sparsity,
+                    device=latents.device,
+                )
+                _vsa_step_counter[0] += 1
+                with set_vsa_forward_context(vsa_metadata):
+                    return current_model(
+                        hidden_states=latents,
+                        timestep=timestep / self.scheduler.config.num_train_timesteps,
+                        encoder_hidden_states=encoder_hidden_states,
+                    )
 
             return current_model(
                 hidden_states=latents,

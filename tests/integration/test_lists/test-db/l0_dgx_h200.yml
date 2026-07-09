@@ -23,6 +23,9 @@ l0_dgx_h200:
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV32::test_dsa_host_cache_offload[host_cache_offload]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV32::test_dsa_host_cache_offload[host_cache_offload_mtp1]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV32::test_dsa_host_cache_offload[host_cache_offload_mtp3_no_adp]
+  - accuracy/test_llm_api_pytorch.py::TestNemotronV3Nano::test_nvfp4_marlin_multi_gpus[tp_size=8]
+  - accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_nvfp4_marlin_multi_gpus[tp_size=8]
+  - accuracy/test_llm_api_pytorch.py::TestNemotronV3Ultra::test_nvfp4_marlin_8gpus
   - accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_auto_dtype[mtp_nextn=0-overlap_scheduler=True]
   - accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_auto_dtype[mtp_nextn=0-overlap_scheduler=False]
   - accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_auto_dtype[mtp_nextn=2-overlap_scheduler=True]
@@ -35,12 +38,13 @@ l0_dgx_h200:
   - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_ctx_pp_gen_tp_asymmetric[MMLU-gen_tp=2-ctx_pp=4]
   - accuracy/test_disaggregated_serving.py::TestGPTOSS::test_auto_dtype[False]
   - accuracy/test_disaggregated_serving.py::TestGPTOSS::test_auto_dtype[True]
-  - accuracy/test_llm_api_pytorch.py::TestQwen3NextInstruct::test_bf16_4gpu[tp4ep4_cudagraph_overlap_adp_off]
-  - accuracy/test_llm_api_pytorch.py::TestQwen3NextInstruct::test_bf16_4gpu[tp4ep4_cudagraph_overlap_adp_on]
+  - accuracy/test_llm_api_pytorch.py::TestQwen3NextInstruct::test_bf16_4gpu[tep4]
+  - accuracy/test_llm_api_pytorch.py::TestQwen3NextInstruct::test_bf16_4gpu[dep4]
   - disaggregated/test_disaggregated.py::test_disaggregated_ctxtp2pp2_gentp2pp2[TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated.py::test_disaggregated_ctxpp4_genpp4[TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_ctxtp2ep2pp2_gentp4_one_mtp_block_reuse[DeepSeek-V3-Lite-fp8]
   - disaggregated/test_disaggregated.py::test_disaggregated_qwen3_32b_fp8[Qwen3/Qwen3-32B-FP8]
+  - disaggregated/test_disaggregated.py::test_disaggregated_mixed_stress_test[req60-conc64-qwen3_32b_fp8_mixed_stress]
   - unittest/llmapi/test_llm_pytorch.py::test_nemotron_nas_lora
   - accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_gen_only_spec_dec
 - condition:
@@ -153,54 +157,19 @@ l0_dgx_h200:
       backend: tensorrt
   tests:
   # ------------- TRT tests ---------------
-  - accuracy/test_cli_flow.py::TestTinyLlama1_1BChat::test_pp4
-  - accuracy/test_cli_flow.py::TestLlama3_1_8B::test_fp8_rowwise_tp4[enable_gemm_allreduce_plugin]
-  - accuracy/test_cli_flow.py::TestQwen2_57B_A14B::test_tp4
   - accuracy/test_llm_api.py::TestQwen2_7BInstruct::test_tp2
   - accuracy/test_llm_api.py::TestLlama3_1_8BInstruct::test_cp2
   - accuracy/test_llm_api.py::TestLlama3_1_8BInstruct::test_tp2cp2
   - accuracy/test_llm_api.py::TestLlama3_1_8BInstruct::test_guided_decoding_4gpus[xgrammar]
-  - examples/test_llama.py::test_llm_llama_long_alpaca_8gpu_summary[pg64317-tp4pp2-nb:4]
-  - unittest/llmapi/test_llm_multi_gpu.py -m "gpu2 and part0"
-  - unittest/llmapi/test_llm_multi_gpu.py -m "gpu2 and part1"
-  - unittest/llmapi/test_llm_multi_gpu.py -m "gpu2 and part2"
-  - unittest/llmapi/test_llm_multi_gpu.py -m "gpu2 and part3"
-  - unittest/llmapi/test_llm_multi_gpu.py -m "gpu4 and part0"
-  - unittest/llmapi/test_llm_multi_gpu.py -m "not (gpu2 or gpu4)"
   - unittest/llmapi/test_llm_kv_cache_events.py::test_llm_api_attention_dp_kv_events
-  - examples/test_enc_dec.py::test_llm_enc_dec_general[compare_hf-t5-small-float32-enable_gemm_plugin-enable_attention_plugin-enable_paged_kv_cache-tp:2-pp:2-nb:1-enable_fp8]
   - llmapi/test_llm_e2e.py::test_llmapi_exit_multi_gpu
   - test_e2e.py::test_trtllm_bench_llmapi_launch[trt_backend-llama-v3-llama3-8b]
   - examples/test_nemotron_nas.py::test_nemotron_nas_summary_2gpu[DeciLM-7B]
   - llmapi/test_llm_examples.py::test_llmapi_example_distributed_tp2
-  - unittest/trt/functional/test_allreduce_norm.py
   - examples/test_multimodal.py::test_llm_multimodal_general[Llama-3.2-11B-Vision-pp:1-tp:2-bfloat16-bs:1-cpp_e2e:False-nb:1]
   # ------------- TRT tests ---------------
   - examples/test_bert.py::test_llm_bert_general[compare_hf-enable_remove_input_padding-use_attention_plugin-enable_context_fmha-tp:2-pp:1-float16-BertForSequenceClassification-bert/bert-base-uncased-yelp-polarity]
   - examples/test_bert.py::test_llm_bert_general[compare_hf-enable_remove_input_padding-use_attention_plugin-enable_context_fmha-tp:2-pp:1-float16-RobertaForQuestionAnswering-bert/roberta-base-squad2]
   - examples/test_bert.py::test_llm_bert_general[compare_hf-enable_remove_input_padding-disable_attention_plugin-disable_context_fmha-tp:2-pp:1-float16-RobertaForSequenceClassification-bert/twitter-roberta-base-emotion]
-  - examples/test_mamba.py::test_llm_mamba2_2gpu[mamba-codestral-7B-v0.1]
-  - accuracy/test_cli_flow.py::TestLlama3_1_8B::test_tp4[disable_gemm_allreduce_plugin]
-  - accuracy/test_cli_flow.py::TestLlama3_1_8B::test_tp4[enable_gemm_allreduce_plugin]
-  - accuracy/test_cli_flow.py::TestLlama3_1_8B::test_fp8_rowwise_tp4[disable_gemm_allreduce_plugin]
-  - accuracy/test_cli_flow.py::TestPhi2::test_tp2
   - llmapi/test_llm_e2e.py::test_llmapi_quant_llama_70b
-  - examples/test_enc_dec.py::test_llm_enc_dec_general[compare_hf-t5-small-float16-enable_gemm_plugin-enable_attention_plugin-disable_paged_kv_cache-tp:2-pp:2-nb:1-disable_fp8]
-  - examples/test_gpt.py::test_llm_gpt2_next_prompt_tuning[use_py_session-tp2]
   - unittest/llmapi/apps/_test_openai_multi_gpu.py -m "part0"
-- condition:
-    ranges:
-      system_gpu_count:
-        gte: 4
-        lte: 4
-    wildcards:
-      gpu:
-      - '*h200*'
-      linux_distribution_name: ubuntu*
-      cpu: x86_64
-    terms:
-      stage: post_merge
-      backend: triton
-  tests:
-  # ------------- Triton tests ---------------
-  - triton_server/test_triton_llm.py::test_llmapi_backend[4-0-disableDecoupleMode-tensorrt_llm]

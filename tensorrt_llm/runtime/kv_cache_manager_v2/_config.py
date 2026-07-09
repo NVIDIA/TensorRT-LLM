@@ -223,6 +223,12 @@ class KVCacheManagerConfig:
     layer groups.
     """
 
+    initial_pool_ratio: list[float] | None = None
+    """
+    User-provided initial memory partitioning between pool groups. When set, this
+    takes precedence over typical_step and constraints for initial sizing.
+    """
+
     ssm_reuse_interval: int = 512
     """
     Interval (in tokens) at which SSM state is snapshotted for prefix reuse.
@@ -241,6 +247,11 @@ class KVCacheManagerConfig:
 
     Most useful for disaggregated prefill servers handling long prompts or long prompt chunks,
     where the number of out-of-window blocks dominates memory usage.
+    """
+
+    enable_stats: bool = True
+    """
+    Collect V2 KV cache allocation, reuse, and transfer statistics.
     """
 
     # unsupported yet

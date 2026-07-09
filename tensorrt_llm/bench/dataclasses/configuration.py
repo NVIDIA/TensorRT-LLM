@@ -82,7 +82,8 @@ class RuntimeConfig(BaseModel):
         if self.backend in backend_config_map:
             llm_args.update(backend_config_map[self.backend]())
 
-        kv_cache_config = self.settings_config.get_kvcache_config().__dict__
+        kv_cache_config = self.settings_config.get_kvcache_config().model_dump(
+            exclude_unset=True)
         backend_cache_config = llm_args.pop("kv_cache_config", {})
         llm_args["kv_cache_config"] = backend_cache_config | kv_cache_config
 

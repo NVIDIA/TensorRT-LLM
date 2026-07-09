@@ -160,9 +160,11 @@
 /tensorrt_llm/_torch/models/modeling_nemotron_nano.py @NVIDIA/trt-llm-multimodal-devs @NVIDIA/trt-llm-torch-models-devs
 /tensorrt_llm/_torch/models/modeling_qwen3vl.py @NVIDIA/trt-llm-multimodal-devs @NVIDIA/trt-llm-torch-models-devs
 /tensorrt_llm/_torch/models/modeling_qwen3vl_moe.py @NVIDIA/trt-llm-multimodal-devs @NVIDIA/trt-llm-torch-models-devs
+/tensorrt_llm/_torch/models/modeling_cosmos3.py @NVIDIA/trt-llm-multimodal-devs @NVIDIA/trt-llm-torch-models-devs
 /tensorrt_llm/_torch/models/modeling_qwen3_5.py @NVIDIA/trt-llm-multimodal-devs @NVIDIA/trt-llm-torch-models-devs
 /tensorrt_llm/_torch/models/modeling_hunyuan_dense.py @NVIDIA/trt-llm-multimodal-devs @NVIDIA/trt-llm-torch-models-devs
 /tensorrt_llm/_torch/models/checkpoints/hf/qwen3vl_weight_mapper.py @NVIDIA/trt-llm-multimodal-devs @NVIDIA/trt-llm-torch-models-devs
+/tensorrt_llm/_torch/models/checkpoints/hf/cosmos3_weight_mapper.py @NVIDIA/trt-llm-multimodal-devs @NVIDIA/trt-llm-torch-models-devs
 /tensorrt_llm/_torch/models/checkpoints/hf/qwen3vl_moe_weight_mapper.py @NVIDIA/trt-llm-multimodal-devs @NVIDIA/trt-llm-torch-models-devs
 /tensorrt_llm/_torch/models/checkpoints/hf/qwen3_5_weight_mapper.py @NVIDIA/trt-llm-multimodal-devs @NVIDIA/trt-llm-torch-models-devs
 /tensorrt_llm/_torch/models/checkpoints/hf/llava_next_weight_mapper.py @NVIDIA/trt-llm-multimodal-devs @NVIDIA/trt-llm-torch-models-devs
@@ -299,7 +301,7 @@ docs/source/performance/perf-benchmarking.md @NVIDIA/trtllm-bench-reviewers
 # Without approval from a member of this team, PRs cannot be merged to release branches.
 # * @NVIDIA/trt-llm-release-branch-approval
 
-### Telemetry / privacy review
-# Golden manifest is the privacy-review artifact; route it and the usage package to the privacy owner.
-/tensorrt_llm/usage/llm_args_golden_manifest.json @NVIDIA/trt-llm-oss-compliance
-/tensorrt_llm/usage/ @NVIDIA/trt-llm-oss-compliance
+### Usage telemetry / privacy review
+/tensorrt_llm/usage/ @NVIDIA/trt-llm-usage-telemetry-devs
+/tests/unittest/usage/ @NVIDIA/trt-llm-usage-telemetry-devs
+/tensorrt_llm/usage/llm_args_golden_manifest.json @NVIDIA/trt-llm-usage-telemetry-devs @NVIDIA/trt-llm-oss-compliance @NVIDIA/trt-llm-noncommitted-api-review-committee

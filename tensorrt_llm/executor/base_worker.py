@@ -16,17 +16,19 @@ import datetime
 import enum
 import gc
 import json
-import os
+import time
+import traceback
+import uuid
 import weakref
 from pathlib import Path
 from queue import Queue
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 
-import psutil
 import torch
 
 from tensorrt_llm.logger import logger
 
+from .._torch.pyexecutor.kv_cache_stats import append_kv_cache_iteration_stats
 from .._torch.pyexecutor.llm_request import LlmResponse
 from .._utils import (global_mpi_rank, global_mpi_size, mpi_comm, mpi_rank,
                       nvtx_range_debug)
@@ -35,7 +37,7 @@ from ..builder import ConfigEncoder, Engine, EngineConfig
 from ..llmapi.llm_args import BaseLlmArgs, ExecutorMemoryType, PybindMirror
 from ..llmapi.tokenizer import TokenizerBase
 from ..llmapi.tracer import global_tracer
-from ..llmapi.utils import _SyncQueue, get_numa_aware_cpu_affinity, logger_debug
+from ..llmapi.utils import _SyncQueue, configure_cpu_affinity, logger_debug
 from ..lora_manager import LoraManager
 from ..prompt_adapter_manager import PromptAdapterManager
 from ..runtime import ModelConfig
@@ -137,58 +139,6 @@ class BaseWorker(GenerationExecutor):
     def resource_governor_queue(self):
         return self._resource_governor_queue
 
-    def _configure_affinity(self, device_id):
-        '''Probe and configure the CPU affinity of the worker based on NUMA topology.
-
-        Args:
-            device_id: The CUDA device ID to determine optimal CPU affinity.
-
-        Note:
-            If the process already has constrained affinity, a warning is logged.
-            Configuration is handled as follows:
-                TLLM_NUMA_AWARE_WORKER_AFFINITY = <unset>
-                    -> Affinity is automatically configured if it is unconstrained,
-                       and deleted if it is constrained externally by the user.
-                TLLM_NUMA_AWARE_WORKER_AFFINITY = 1
-                    -> Affinity is unconditionally auto-configured.
-                TLLM_NUMA_AWARE_WORKER_AFFINITY = 0 or any other value
-                    -> Affinity is unconditionally _not_ auto-configured.
-        '''
-
-        # Get the current affinity setting
-        pid = os.getpid()
-        process = psutil.Process(pid)
-        cpu_affinity = process.cpu_affinity()
-
-        all_cpus = list(range(psutil.cpu_count()))
-
-        constrained_affinity = (cpu_affinity != all_cpus)
-        numa_aware_affinity = os.environ.get("TLLM_NUMA_AWARE_WORKER_AFFINITY")
-
-        # If affinity is constrained but the user hasn't explicitly
-        # requested NUMA-aware affinity, remove the constraints.
-        if constrained_affinity:
-            logger.warning(
-                f"Worker process {pid} is affined to run on the following CPUs: "
-                f"{cpu_affinity} (subset of all logical CPUs). This may harm "
-                f"performance if set incorrectly.")
-            if numa_aware_affinity is None:
-                logger.warning(
-                    f"Worker process {pid} has constrained CPU affinity "
-                    f"but `TLLM_NUMA_AWARE_WORKER_AFFINITY` is not set. "
-                    f"Removing CPU affinity constraints.")
-                process.cpu_affinity(all_cpus)
-
-        # If affinity is unconstrained and the user hasn't explicitly
-        # prohibited it or the user has explicitly requested it, choose the
-        # optimal affinity based upon the NUMA topology
-        if ((numa_aware_affinity is None and not constrained_affinity)
-                or (numa_aware_affinity == "1")):
-            process.cpu_affinity(get_numa_aware_cpu_affinity(device_id))
-            logger.info(
-                f"Worker process {pid} CPU affinity set to "
-                f"{process.cpu_affinity()} for optimal NUMA-aware scheduling.")
-
     def _get_comm_ranks_device_id(self):
         device_id = self.global_rank % torch.cuda.device_count()
         torch.cuda.set_device(device_id)
@@ -197,7 +147,7 @@ class BaseWorker(GenerationExecutor):
         comm_ranks = mpi_comm().allgather(global_rank)
         device_ids = mpi_comm().allgather(device_id)
 
-        self._configure_affinity(device_id)
+        configure_cpu_affinity(device_id)
 
         return comm_ranks, device_ids
 
@@ -333,6 +283,16 @@ class BaseWorker(GenerationExecutor):
         else:
             return self.engine.get_latest_iteration_stats()
 
+    def fetch_kv_cache_capacity(self) -> dict:
+        if self.engine is None or isinstance(self.engine, tllm.Executor):
+            return {}
+
+        from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+        if isinstance(self.engine, PyExecutor):
+            return self.engine.get_kv_cache_capacity()
+
+        return {}
+
     def fetch_kv_cache_events(self) -> list:
         if isinstance(self.engine, tllm.Executor):
             return self.engine.get_latest_kv_cache_events()
@@ -448,7 +408,18 @@ class BaseWorker(GenerationExecutor):
         else:
             lora_config = None
 
-        prompt_token_ids = list(request.prompt_token_ids)
+        # prompt_token_ids stays list[int] for all consumers. If an int32 buffer
+        # rode along on the wire (GenerationRequest._prompt_token_ids_i32), hand
+        # THAT to the C++ Request ctor (memcpy) instead of the list -- this avoids
+        # the O(ISL) list copy + element-wise nanobind cast on the GIL-held submit
+        # thread. No buffer (in-process, or prompt-adapter prepend) -> list path.
+        # If both forms exist, they are assumed to describe the same token ids;
+        # in-place mutations of request.prompt_token_ids must clear the i32 buffer.
+        i32_buf = getattr(request, "_prompt_token_ids_i32", None)
+        if i32_buf is not None and request.prompt_adapter_request is None:
+            prompt_token_ids = i32_buf
+        else:
+            prompt_token_ids = list(request.prompt_token_ids)
         prompt_tuning_config = None
         if request.prompt_adapter_request is not None:
             self._load_prompt_adapter(request.prompt_adapter_request)
@@ -625,6 +596,10 @@ class BaseWorker(GenerationExecutor):
             if self._is_pytorch_backend and request.scheduling_params is not None:
                 executor_request.py_scheduling_params = request.scheduling_params
 
+            executor_request.py_conversation_params = None
+            if self._is_pytorch_backend and request.conversation_params is not None:
+                executor_request.py_conversation_params = request.conversation_params
+
             if request.arrival_time is not None:
                 executor_request.py_arrival_time = request.arrival_time
 
@@ -693,7 +668,6 @@ class BaseWorker(GenerationExecutor):
         Raises:
             ValueError: If the backend is not ``"pytorch"`` or
                 ``sleep_config`` is not set.
-            NotImplementedError: If ``parallel_config.world_size > 1``.
         """
         # _autodeploy is intentionally excluded: its allocations are not tagged
         # under sleep_config VMM scopes, so release_with_tag would silently
@@ -707,20 +681,245 @@ class BaseWorker(GenerationExecutor):
             raise ValueError(
                 "Sleep feature is not enabled, please set sleep_config in "
                 "the LLM arguments.")
-        # Non-rank-0 processes block on their local control_action_done
-        # threading.Event with no Python caller to release it — deadlock.
-        if self.llm_args.parallel_config.world_size > 1:
-            raise NotImplementedError(
-                f"{method}() requires parallel_config.world_size == 1; "
-                "use the Ray executor for multi-rank deployments.")
 
-    def sleep(self, sleep_tags: List[str]) -> None:
+    def _multi_rank_sleep_wakeup(
+        self,
+        action: str,
+        tags: list[ExecutorMemoryType],
+    ) -> None:
+        """Coordinate a sleep or wakeup operation across all MPI ranks.
+
+        Called on rank-0 only for ``world_size > 1`` deployments.
+
+        Sequence:
+        1. Enter ``control_action()`` to drain in-flight requests and pause
+           rank-0's event loop.  Non-rank-0 event loops become idle (starved
+           of NCCL collectives from rank-0) once the current iteration drains.
+        2. Send PREPARE to every non-rank-0 rank via the dedicated
+           ``_sleep_wakeup_comm`` communicator.  Peers quiesce and ACK without
+           changing VMM state.
+        3. Execute the VMM operation (``release_with_tag`` or
+           ``materialize_with_tag``) locally on rank-0.
+        4. Send COMMIT to prepared peers and collect ACKs after their local VMM
+           operations.  If PREPARE or rank-0 local execution fails, send ABORT
+           so peers leave the control barrier without changing VMM state.
+        5. Exit ``control_action()``, resuming rank-0's event loop.
+
+        Args:
+            action: ``"sleep"`` or ``"wakeup"``.
+            tags: Parsed :class:`~tensorrt_llm.llmapi.llm_args.ExecutorMemoryType`
+                values; forwarded verbatim to each rank's VMM call.
+        """
+        from tensorrt_llm._torch.pyexecutor.py_executor import (
+            _SLEEP_WAKEUP_ACK_TIMEOUT_S, _recv_sleep_wakeup_ack_until,
+            _SleepWakeupAction, _SleepWakeupTag)
+        from tensorrt_llm._torch.virtual_memory import (materialize_with_tag,
+                                                        release_with_tag)
+
+        if self.rank != 0:
+            raise RuntimeError(
+                "_multi_rank_sleep_wakeup must only be called on rank 0")
+
+        sleep_wakeup_comm = self.engine._sleep_wakeup_comm
+        if sleep_wakeup_comm is None:
+            raise RuntimeError(
+                "_sleep_wakeup_comm not initialised; was start_worker() called?"
+            )
+
+        world_size = self.llm_args.parallel_config.world_size
+        if world_size <= 1:
+            raise ValueError(
+                "_multi_rank_sleep_wakeup requires world_size greater than 1")
+
+        tag_strings = [t.value for t in tags]
+        op_id = uuid.uuid4().hex
+        target_action = _SleepWakeupAction(action)
+        prepare_msg = {
+            "action": _SleepWakeupAction.PREPARE,
+            "target_action": target_action,
+            "tags": tag_strings,
+            "op_id": op_id,
+        }
+        commit_msg = {
+            "action": _SleepWakeupAction.COMMIT,
+            "target_action": target_action,
+            "tags": tag_strings,
+            "op_id": op_id,
+        }
+
+        # Serialise concurrent sleep/wakeup calls.  control_action() uses an
+        # Event-based barrier, not a mutex, so two concurrent callers can both
+        # pass the barrier and then interleave sends/recvs on _sleep_wakeup_comm,
+        # consuming the wrong ACKs or resuming the event loop prematurely.
+        # _sleep_wakeup_lock turns the whole sequence into a critical section.
+        with self.engine._sleep_wakeup_lock, self.engine.control_action(
+                control_id=op_id):
+            prepared_ranks = []
+            errors = []
+            local_error = None
+            abort_sent = False
+
+            def send_abort(reason: str,
+                           ranks: Optional[list[int]] = None) -> list[int]:
+                abort_ranks = []
+                abort_dests = ranks if ranks is not None else range(
+                    1, world_size)
+                abort_msg = {
+                    "action": _SleepWakeupAction.ABORT,
+                    "tags": [],
+                    "op_id": op_id,
+                    "reason": reason,
+                }
+                for abort_dest in abort_dests:
+                    try:
+                        sleep_wakeup_comm.send(
+                            abort_msg,
+                            dest=abort_dest,
+                            tag=_SleepWakeupTag.ACTION,
+                        )
+                        abort_ranks.append(abort_dest)
+                    except Exception as abort_exc:
+                        abort_error = (
+                            "rank 0 failed to send sleep/wakeup abort "
+                            f"to rank {abort_dest}: {abort_exc}")
+                        errors.append(abort_error)
+                        logger.error(
+                            "_multi_rank_sleep_wakeup: %s",
+                            abort_error,
+                            exc_info=True,
+                        )
+                return abort_ranks
+
+            def drain_acks(ranks: list[int], phase: _SleepWakeupAction) -> None:
+                ack_deadline = time.monotonic() + _SLEEP_WAKEUP_ACK_TIMEOUT_S
+                for src in ranks:
+                    try:
+                        ack = _recv_sleep_wakeup_ack_until(sleep_wakeup_comm,
+                                                           src,
+                                                           ack_deadline,
+                                                           expected_op_id=op_id,
+                                                           expected_phase=phase)
+                    except Exception as exc:
+                        errors.append(
+                            f"rank 0 failed to receive {phase} ACK from "
+                            f"rank {src}: {exc}")
+                        logger.error(
+                            "_multi_rank_sleep_wakeup: failed to receive %s "
+                            "ACK from rank %d",
+                            phase,
+                            src,
+                            exc_info=True,
+                        )
+                        continue
+                    if ack.get("status") != "ok":
+                        errors.append(
+                            ack.get("error")
+                            or f"rank {src} returned unknown {phase} ACK")
+
+            try:
+                # Phase 1: prepare peers.  A prepared peer has reached the
+                # control barrier and synchronized CUDA, but has not modified
+                # VMM state yet.  This keeps send/local failures from leaving
+                # a subset of ranks slept/woken while rank 0 did not commit.
+                for dest in range(1, world_size):
+                    try:
+                        sleep_wakeup_comm.send(prepare_msg,
+                                               dest=dest,
+                                               tag=_SleepWakeupTag.ACTION)
+                        prepared_ranks.append(dest)
+                    except Exception as exc:
+                        send_error = (
+                            f"rank 0 failed to send '{action}' prepare to rank "
+                            f"{dest}: {exc}")
+                        errors.append(send_error)
+                        logger.error(
+                            "_multi_rank_sleep_wakeup: %s",
+                            send_error,
+                            exc_info=True,
+                        )
+                        abort_ranks = send_abort(send_error)
+                        abort_sent = True
+                        drain_acks(prepared_ranks, _SleepWakeupAction.PREPARE)
+                        drain_acks(abort_ranks, _SleepWakeupAction.ABORT)
+                        break
+
+                if not errors:
+                    drain_acks(prepared_ranks, _SleepWakeupAction.PREPARE)
+
+                if not errors:
+                    # Execute locally on rank-0.  Only CUDA/VMM errors are
+                    # captured as local_error. Peers are still prepared but
+                    # uncommitted, so local failure can abort them without
+                    # changing their VMM state.
+                    torch.cuda.synchronize()
+                    if action == _SleepWakeupAction.SLEEP:
+                        release_with_tag(*tags)
+                        torch.cuda.synchronize()
+                        gc.collect()
+                        torch.cuda.empty_cache()
+                    else:
+                        materialize_with_tag(*tags)
+                        torch.cuda.synchronize()
+            except (RuntimeError, torch.OutOfMemoryError) as exc:
+                local_error = (f"rank 0 '{action}' failed: {exc}\n"
+                               f"{traceback.format_exc()}")
+                logger.error(
+                    "_multi_rank_sleep_wakeup: rank-0 local %s failed:",
+                    action,
+                    exc_info=True,
+                )
+            finally:
+                if local_error:
+                    errors.append(local_error)
+
+                if errors and prepared_ranks and not abort_sent:
+                    abort_ranks = send_abort("\n".join(errors))
+                    drain_acks(abort_ranks, _SleepWakeupAction.ABORT)
+                elif not errors:
+                    commit_ranks = []
+                    commit_failed_ranks = []
+                    for dest in prepared_ranks:
+                        try:
+                            sleep_wakeup_comm.send(
+                                commit_msg,
+                                dest=dest,
+                                tag=_SleepWakeupTag.ACTION,
+                            )
+                            commit_ranks.append(dest)
+                        except Exception as exc:
+                            commit_error = (
+                                f"rank 0 failed to send '{action}' commit to "
+                                f"rank {dest}: {exc}")
+                            errors.append(commit_error)
+                            commit_failed_ranks.append(dest)
+                            logger.error(
+                                "_multi_rank_sleep_wakeup: %s",
+                                commit_error,
+                                exc_info=True,
+                            )
+                    if commit_failed_ranks:
+                        abort_ranks = send_abort("\n".join(errors),
+                                                 ranks=commit_failed_ranks)
+                        drain_acks(abort_ranks, _SleepWakeupAction.ABORT)
+                    drain_acks(commit_ranks, _SleepWakeupAction.COMMIT)
+
+                if errors:
+                    raise RuntimeError(
+                        f"{action}() failed on {len(errors)} rank(s):\n" +
+                        "\n".join(errors))
+
+    def sleep(self, sleep_tags: list[str]) -> None:
         """Release GPU virtual memory for the specified memory type tags.
 
-        Single-rank (``world_size == 1``) only.  Uses
-        ``PyExecutor.control_action()`` to drain in-flight requests and pause
-        the event loop before calling ``release_with_tag()``, matching the
-        ``@control_action_decorator`` behaviour used in Ray.
+        Supports both single-rank (``world_size == 1``) and multi-rank
+        (TP/PP > 1) MPI executor deployments.  For multi-rank, a lightweight
+        control-listener thread on each non-rank-0 worker handles the local
+        ``release_with_tag()`` call while rank-0 coordinates via a dedicated
+        secondary MPI communicator.
+
+        Uses ``PyExecutor.control_action()`` to drain in-flight requests and
+        pause rank-0's event loop, matching the ``@control_action_decorator``
+        behaviour used in the Ray executor.
 
         Only allocations backed by virtual memory (VMM) and registered under
         the active :class:`~tensorrt_llm.llmapi.llm_args.SleepConfig` are
@@ -735,13 +934,12 @@ class BaseWorker(GenerationExecutor):
 
         Returns:
             None.  The call is synchronous; when it returns all requested
-            VMM-tagged allocations have been released and the event loop
-            has been resumed.
+            VMM-tagged allocations have been released on every rank and the
+            event loop has been resumed.
 
         Raises:
             ValueError: If the backend is not ``"pytorch"`` or
                 ``sleep_config`` is not set.
-            NotImplementedError: If ``parallel_config.world_size > 1``.
         """
         self._check_sleep_wakeup_preconditions("sleep")
 
@@ -749,18 +947,23 @@ class BaseWorker(GenerationExecutor):
 
         tags = [ExecutorMemoryType(tag) for tag in sleep_tags]
         logger.info(f"Sleep: {tags}")
-        with self.engine.control_action():
-            torch.cuda.synchronize()
-            release_with_tag(*tags)
-            torch.cuda.synchronize()
-            gc.collect()
-            torch.cuda.empty_cache()
+        if self.llm_args.parallel_config.world_size > 1:
+            self._multi_rank_sleep_wakeup("sleep", tags)
+        else:
+            with self.engine._sleep_wakeup_lock, self.engine.control_action():
+                torch.cuda.synchronize()
+                release_with_tag(*tags)
+                torch.cuda.synchronize()
+                gc.collect()
+                torch.cuda.empty_cache()
 
-    def wakeup(self, wakeup_tags: List[str]) -> None:
+    def wakeup(self, wakeup_tags: list[str]) -> None:
         """Materialize GPU virtual memory for the specified memory type tags.
 
-        Single-rank (``world_size == 1``) only.  See :meth:`sleep` for
-        details on VMM scope restrictions and backend prerequisites.
+        Supports both single-rank (``world_size == 1``) and multi-rank
+        (TP/PP > 1) MPI executor deployments.  See :meth:`sleep` for details
+        on VMM scope restrictions, backend prerequisites, and multi-rank
+        coordination.
 
         Args:
             wakeup_tags: List of
@@ -769,13 +972,12 @@ class BaseWorker(GenerationExecutor):
 
         Returns:
             None.  The call is synchronous; when it returns all requested
-            VMM-tagged allocations have been materialized and the event loop
-            has been resumed.
+            VMM-tagged allocations have been materialized on every rank and the
+            event loop has been resumed.
 
         Raises:
             ValueError: If the backend is not ``"pytorch"`` or
                 ``sleep_config`` is not set.
-            NotImplementedError: If ``parallel_config.world_size > 1``.
         """
         self._check_sleep_wakeup_preconditions("wakeup")
 
@@ -783,10 +985,13 @@ class BaseWorker(GenerationExecutor):
 
         tags = [ExecutorMemoryType(tag) for tag in wakeup_tags]
         logger.info(f"Wakeup: {tags}")
-        with self.engine.control_action():
-            torch.cuda.synchronize()
-            materialize_with_tag(*tags)
-            torch.cuda.synchronize()
+        if self.llm_args.parallel_config.world_size > 1:
+            self._multi_rank_sleep_wakeup("wakeup", tags)
+        else:
+            with self.engine._sleep_wakeup_lock, self.engine.control_action():
+                torch.cuda.synchronize()
+                materialize_with_tag(*tags)
+                torch.cuda.synchronize()
 
     def shutdown(self):
         if self.doing_shutdown:
@@ -804,7 +1009,6 @@ class BaseWorker(GenerationExecutor):
             return {}
         return self.engine.kv_cache_transceiver.get_disaggregated_params()
 
-    # Define a Callable to join iteration and request stats
     @staticmethod
     def _stats_serializer(stats) -> str:
         # Per-rank path: stats is ("per_rank_dict", {..., "rank": N}).
@@ -836,34 +1040,7 @@ class BaseWorker(GenerationExecutor):
                 stats_dict["requestStats"].append(
                     json.loads(req_stat.to_json_str()))
 
-        # Inject per-iteration KV cache stats (keyed by window size)
-        if kv_iter_stats is not None:
-            stats_dict["kvCacheIterationStats"] = {
-                str(window_size): {
-                    "primaryMaxNumBlocks": s.primary_max_num_blocks,
-                    "primaryFreeNumBlocks": s.primary_free_num_blocks,
-                    "primaryUsedNumBlocks": s.primary_used_num_blocks,
-                    "secondaryMaxNumBlocks": s.secondary_max_num_blocks,
-                    "secondaryFreeNumBlocks": s.secondary_free_num_blocks,
-                    "secondaryUsedNumBlocks": s.secondary_used_num_blocks,
-                    "iterAllocTotalBlocks": s.iter_alloc_total_blocks,
-                    "iterAllocNewBlocks": s.iter_alloc_new_blocks,
-                    "iterReusedBlocks": s.iter_reused_blocks,
-                    "iterFullReusedBlocks": s.iter_full_reused_blocks,
-                    "iterPartialReusedBlocks": s.iter_partial_reused_blocks,
-                    "iterMissedBlocks": s.iter_missed_blocks,
-                    "iterCacheHitRate": s.iter_cache_hit_rate,
-                    "iterGenAllocBlocks": s.iter_gen_alloc_blocks,
-                    "iterOnboardBlocks": s.iter_onboard_blocks,
-                    "iterOnboardBytes": s.iter_onboard_bytes,
-                    "iterOffloadBlocks": s.iter_offload_blocks,
-                    "iterOffloadBytes": s.iter_offload_bytes,
-                    "iterIntraDeviceCopyBlocks":
-                    s.iter_intra_device_copy_blocks,
-                    "iterIntraDeviceCopyBytes": s.iter_intra_device_copy_bytes,
-                }
-                for window_size, s in kv_iter_stats.items()
-            }
+        append_kv_cache_iteration_stats(stats_dict, kv_iter_stats)
 
         # Per-loop CPU wall captured by profile_step() — always a clean
         # single-loop measurement, matching the log line's `host_step_time`.
@@ -894,6 +1071,10 @@ class BaseWorker(GenerationExecutor):
 
         # Convert back to JSON string
         return json.dumps(stats_dict)
+
+    @staticmethod
+    def _kv_cache_capacity_serializer(capacity) -> str:
+        return json.dumps(capacity)
 
     # Define a Callable to serialize KV cache events
     @staticmethod

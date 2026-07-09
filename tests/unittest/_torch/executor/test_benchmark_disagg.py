@@ -393,6 +393,8 @@ class MockPadDummyExecutor:
         self.num_fetch_requests = num_fetch_requests
         self.benchmark_req_queues_size = benchmark_req_queues_size
         self.max_total_draft_tokens = 0
+        self._adp_dummy_is_gen = True
+        self.max_num_tokens = None
 
         self.dist = Mock()
         self.dist.tp_size = tp_size
@@ -499,6 +501,7 @@ class TestPrepareAndScheduleBatchNoBlock:
         ex = object.__new__(PyExecutor)
         ex.benchmark_req_queues_size = 8
         ex.kv_cache_transceiver = Mock()
+        ex.kv_cache_manager = Mock()
         ex.is_benchmark_disagg = True
         ex._benchmark_fill_phase_active = True
         ex._fill_admit_cap = 0

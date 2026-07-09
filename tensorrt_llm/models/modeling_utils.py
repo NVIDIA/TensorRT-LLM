@@ -257,6 +257,13 @@ class QuantConfig(StrictBaseModel):
         module (without a glob suffix) implicitly excludes all of its
         children.
 
+        A trailing ``.*`` subtree wildcard also matches the parent node
+        itself, so an entry like ``model.layers.1.*`` excludes both
+        ``model.layers.1`` and everything under it. This keeps a subtree
+        exclusion consistent regardless of whether the producer wrote it as
+        ``model.layers.1`` / ``model.layers.1*`` / ``model.layers.1.*``
+        (modelopt mixes these forms within a single checkpoint).
+
         Args:
             name (str): The name of the module.
 
@@ -272,6 +279,9 @@ class QuantConfig(StrictBaseModel):
                     if re.fullmatch(exclude_module[3:], candidate):
                         return True
                 elif fnmatch.fnmatchcase(candidate, exclude_module):
+                    return True
+                elif exclude_module.endswith(".*") and fnmatch.fnmatchcase(
+                        candidate, exclude_module[:-2]):
                     return True
             if '.' not in candidate:
                 return False

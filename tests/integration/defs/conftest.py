@@ -16,12 +16,14 @@
 
 import datetime
 import gc
+import importlib
 import logging
 import os
 import platform
 import re
 import shutil
 import subprocess as sp
+import sys
 import tempfile
 import time
 import urllib.request
@@ -63,6 +65,14 @@ logger = logging.getLogger(__name__)
 DEBUG_CI_STORAGE = os.environ.get("DEBUG_CI_STORAGE", False)
 GITLAB_API_USER = os.environ.get("GITLAB_API_USER")
 GITLAB_API_TOKEN = os.environ.get("GITLAB_API_TOKEN")
+
+
+def _get_s3_output():
+    tests_root = Path(__file__).resolve().parents[2]
+    tests_root_str = str(tests_root)
+    if tests_root_str not in sys.path:
+        sys.path.append(tests_root_str)
+    return importlib.import_module("test_common.s3_output")
 
 
 def print_storage_usage(path, tag, capfd):
@@ -1776,7 +1786,12 @@ def skip_by_device_memory(request):
 
 def get_sm_version():
     "get compute capability"
-    prop = torch.cuda.get_device_properties(0)
+    if not torch.cuda.is_available():
+        return 0
+    try:
+        prop = torch.cuda.get_device_properties(0)
+    except RuntimeError:
+        return 0
     return prop.major * 10 + prop.minor
 
 
@@ -1802,6 +1817,15 @@ def check_device_contain(keyword_list):
     return any(keyword in device for keyword in keyword_list)
 
 
+def is_ipc_nvls_supported():
+    if not torch.cuda.is_available():
+        return False
+    try:
+        return ipc_nvls_supported()
+    except RuntimeError:
+        return False
+
+
 skip_pre_ada = pytest.mark.skipif(
     get_sm_version() < 89,
     reason="This test is not supported in pre-Ada architecture")
@@ -1809,6 +1833,11 @@ skip_pre_ada = pytest.mark.skipif(
 skip_pre_hopper = pytest.mark.skipif(
     get_sm_version() < 90,
     reason="This test is not supported in pre-Hopper architecture",
+)
+
+skip_post_hopper = pytest.mark.skipif(
+    get_sm_version() > 90,
+    reason="This test is not supported in post-Hopper architecture",
 )
 
 skip_pre_blackwell = pytest.mark.skipif(
@@ -1831,7 +1860,7 @@ skip_device_contain_gb200 = pytest.mark.skipif(
     reason="This test is not supported on GB200 or GB100",
 )
 
-skip_no_nvls = pytest.mark.skipif(not ipc_nvls_supported(),
+skip_no_nvls = pytest.mark.skipif(not is_ipc_nvls_supported(),
                                   reason="NVLS is not supported")
 skip_no_hopper = pytest.mark.skipif(
     get_sm_version() != 90,
@@ -1914,6 +1943,7 @@ def get_device_memory():
 
 
 def pytest_addoption(parser):
+    _get_s3_output().add_options(parser)
     parser.addoption(
         "--test-list",
         "-F",
@@ -2206,6 +2236,8 @@ def pytest_configure(config):
         print_warning(
             "Warning: --periodic-junit requires --output-dir to be set. "
             "Periodic reporting disabled.")
+
+    _get_s3_output().register_plugin(config)
 
 
 def deselect_by_test_model_suites(test_model_suites, items, test_prefix,

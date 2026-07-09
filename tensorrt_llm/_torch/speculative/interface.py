@@ -41,10 +41,49 @@ if TYPE_CHECKING:
 if IS_FLASHINFER_AVAILABLE:
     import flashinfer
 
-from .one_model_sampler import (compute_probs_from_logits,
-                                rejection_sampling_one_model,
-                                sampling_batch_spec_dec_one_model,
-                                sampling_batch_spec_dec_one_model_for_rejection)
+from ..pyexecutor.sampler.sampling_utils import (
+    compute_probs_from_logits, greedy, sampling_batch_spec_dec_one_model,
+    sampling_batch_spec_dec_one_model_for_rejection)
+
+
+def rejection_sampling_one_model(
+    draft_probs: torch.Tensor,
+    draft_token_ids: torch.Tensor,
+    target_probs: torch.Tensor,
+    deterministic: bool = True,
+    seed: Optional[int] = None,
+    offset: Optional[int] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    # chain_speculative_sampling requires flashinfer>=0.6.4. This entry point can
+    # be reached independently of SpecWorkerBase.__init__'s use_flashinfer gate
+    # (e.g. via _can_use_rejection_sampling), so re-check the version here to fail
+    # with a clear message instead of a cryptic flashinfer error.
+    if not IS_FLASHINFER_AVAILABLE or Version(
+            flashinfer.__version__) < Version("0.6.4"):
+        raise RuntimeError(
+            "Rejection sampling for one-model speculative decoding requires flashinfer>=0.6.4"
+        )
+    batch_size = draft_token_ids.shape[0]
+    device = draft_token_ids.device
+    output_accepted_token_num = torch.zeros(batch_size,
+                                            dtype=torch.int32,
+                                            device=device)
+    output_emitted_draft_token_num = torch.zeros(batch_size,
+                                                 dtype=torch.int32,
+                                                 device=device)
+    accepted_tokens, _, output_emitted_draft_token_num = flashinfer.sampling.chain_speculative_sampling(
+        draft_probs,
+        draft_token_ids,
+        target_probs,
+        maybe_output_accepted_token_num=output_accepted_token_num,
+        maybe_output_emitted_draft_token_num=output_emitted_draft_token_num,
+        deterministic=deterministic,
+        generator=None,
+        seed=seed,
+        offset=offset,
+    )
+    return accepted_tokens, output_emitted_draft_token_num + 1
+
 
 # Environment variable name for forcing the number of accepted tokens in speculative decoding
 FORCE_NUM_ACCEPTED_TOKENS_ENV_VAR = "TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS"
@@ -104,6 +143,8 @@ def prepare_attn_metadata_for_draft_replay(attn_metadata,
     attn_metadata.kv_cache_block_offsets = attn_metadata.draft_kv_cache_block_offsets
     attn_metadata.host_kv_cache_block_offsets = (
         draft_kv_cache_manager.host_kv_cache_block_offsets)
+    if attn_metadata.enable_flash_mla:
+        attn_metadata.prepare_flash_mla()
 
     from ..attention_backend.sparse.dsa import (DSAtrtllmAttentionMetadata,
                                                 Indexer)
@@ -157,6 +198,8 @@ def restore_attn_metadata_after_draft_replay(attn_metadata, saved_state):
         saved_state['target_kv_cache_block_offsets'])
     attn_metadata.host_kv_cache_block_offsets = (
         saved_state['target_host_kv_cache_block_offsets'])
+    if attn_metadata.enable_flash_mla:
+        attn_metadata.prepare_flash_mla()
     saved_dsa = saved_state.get('saved_dsa_state')
     if saved_dsa is not None:
         m = attn_metadata
@@ -315,8 +358,9 @@ class SpeculativeDecodingMode(IntEnum):
         ) or self.is_external_drafter() or self.is_sa()
 
     def support_dynamic_draft_len(self):
-        # TODO: expand to all one-model algorithms
-        return self.is_eagle3_one_model() or self.is_mtp_eagle_one_model()
+        return self.is_mtp_one_model() or self.is_eagle3_one_model(
+        ) or self.is_mtp_eagle_one_model() or self.is_pard() or self.is_dflash(
+        ) or self.is_draft_target_one_model() or self.is_sa()
 
     def has_draft_model(self):
         return self.is_eagle3() or self.is_draft_target() or self.is_mtp_eagle()
@@ -455,6 +499,9 @@ class SpecMetadata:
     # draft_len_schedule.  Otherwise it equals max_draft_len (the static max).
     # Always set by model_engine.forward() before any downstream code reads it.
     runtime_draft_len: int = 0
+    # Total runtime tokens per generation request for the current iteration,
+    # Normally, it equals 1 + runtime_draft_len. But for PARD, it equals 2 * runtime_draft_len.
+    runtime_tokens_per_gen_step: int = 1
 
     # Auto-detected per step from populated sampling params:
     # True if every request is greedy (no temp/top_k/top_p) and we can take
@@ -1005,8 +1052,11 @@ class SpecWorkerBase(nn.Module, ABC):
                                                      dtype=torch.int64,
                                                      device=device)
 
-    def _apply_force_accepted_tokens(self, num_accepted_tokens, num_contexts,
-                                     runtime_draft_len: int):
+    def _apply_force_accepted_tokens(self,
+                                     num_accepted_tokens,
+                                     num_contexts,
+                                     runtime_draft_len: int,
+                                     spec_metadata=None):
         """
         Apply a forced (synthetic) number of accepted draft tokens if the
         ``TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS`` environment variable is
@@ -1033,12 +1083,23 @@ class SpecWorkerBase(nn.Module, ABC):
                 accepted counts (target token + accepted draft tokens).
             num_contexts: Number of context (prefill) requests in the batch.
             runtime_draft_len: The draft length for the current iteration.
+            spec_metadata: Optional SpecMetadata. When provided, used to
+                detect eager CUDA-graph warmup so the override is skipped
+                there — warmup batches use dummy requests whose KV cache and
+                draft buffers are not populated for an inflated accepted
+                count, which would drive downstream MTP ops out-of-bounds.
 
         Returns:
             Modified num_accepted_tokens tensor.
         """
         if self.force_num_accepted_tokens == 0.0:
             return num_accepted_tokens
+
+        if spec_metadata is not None:
+            is_warmup = (spec_metadata.is_cuda_graph
+                         and not torch.cuda.is_current_stream_capturing())
+            if is_warmup:
+                return num_accepted_tokens
 
         # Decompose into a deterministic integer part (always accepted) and a
         # probabilistic fractional part. ``int(...)`` truncates toward zero,
@@ -1113,9 +1174,8 @@ class SpecWorkerBase(nn.Module, ABC):
             num_accepted_tokens: [batch_size] - Number of accepted tokens per request
         """
         # Derive draft length from the actual draft_tokens shape rather than
-        # spec_metadata.runtime_draft_len, because they can differ: PARD sets
-        # runtime_draft_len = 2K-1 for input sizing but only passes K draft
-        # tokens for acceptance;
+        # spec_metadata.runtime_draft_len, because callers may slice a wider
+        # runtime token layout down to the K draft tokens used for acceptance.
         runtime_draft_len = draft_tokens.shape[-1]
         num_gens = batch_size - num_contexts
 
@@ -1151,7 +1211,10 @@ class SpecWorkerBase(nn.Module, ABC):
 
         # Apply force override if set
         num_accepted_tokens = self._apply_force_accepted_tokens(
-            num_accepted_tokens, num_contexts, runtime_draft_len)
+            num_accepted_tokens,
+            num_contexts,
+            runtime_draft_len,
+            spec_metadata=spec_metadata)
 
         return accepted_tokens, num_accepted_tokens
 
@@ -1324,11 +1387,22 @@ class SpecWorkerBase(nn.Module, ABC):
                 offset=self.offset,
             )
 
+            if self.force_num_accepted_tokens != 0.0:
+                # Fill gen_accepted positions 1..runtime_draft_len with all draft tokens
+                # so that when _apply_force_accepted_tokens inflates num_accepted_tokens
+                # the decoder reads valid draft tokens instead of zeros.
+                # Slice bounds are Python ints (static at CUDA-graph capture time).
+                gen_accepted[:,
+                             1:runtime_draft_len + 1].copy_(full_draft_tokens)
+
             accepted_tokens[num_contexts:] = gen_accepted
             num_accepted_tokens[num_contexts:] = gen_num_accepted
 
         num_accepted_tokens = self._apply_force_accepted_tokens(
-            num_accepted_tokens, num_contexts, runtime_draft_len)
+            num_accepted_tokens,
+            num_contexts,
+            runtime_draft_len,
+            spec_metadata=spec_metadata)
         return accepted_tokens, num_accepted_tokens
 
     def _draft_sampler_greedy(self, logits: torch.Tensor, d2t=None):
@@ -1342,7 +1416,7 @@ class SpecWorkerBase(nn.Module, ABC):
         Returns:
             draft_tokens: [num_tokens] - Sampled draft token ids (int32)
         """
-        draft_tokens = torch.argmax(logits, dim=-1)
+        draft_tokens = greedy(logits, return_probs=False)[0]
 
         # Apply d2t (offsets between draft and target model dictionaries)
         if d2t is not None:
@@ -1381,7 +1455,6 @@ class SpecWorkerBase(nn.Module, ABC):
         top_ps = spec_metadata.request_top_ps[:batch_size]
 
         if self.use_flashinfer:
-            top_ks = top_ks.clamp(min=1, max=logits.shape[-1] - 1)
             if self.seed is None:
                 self.seed = torch.tensor([0],
                                          dtype=torch.int64,
@@ -1392,14 +1465,12 @@ class SpecWorkerBase(nn.Module, ABC):
             self.seed += 1
             self.seed %= (2**31)
 
-        draft_tokens = sampling_batch_spec_dec_one_model(
-            logits,
-            temperatures,
-            top_ks,
-            top_ps,
-            use_flashinfer=self.use_flashinfer,
-            seed=self.seed,
-            offset=self.offset)
+        draft_tokens = sampling_batch_spec_dec_one_model(logits,
+                                                         temperatures,
+                                                         top_ks,
+                                                         top_ps,
+                                                         seed=self.seed,
+                                                         offset=self.offset)
 
         if d2t is not None:
             draft_tokens = d2t[draft_tokens] + draft_tokens
@@ -1572,6 +1643,8 @@ class SpecWorkerBase(nn.Module, ABC):
         attn_metadata.kv_cache_manager = draft_kv_cache_manager
         attn_metadata.kv_cache_block_offsets = attn_metadata.draft_kv_cache_block_offsets
         attn_metadata.host_kv_cache_block_offsets = draft_kv_cache_manager.host_kv_cache_block_offsets
+        if attn_metadata.enable_flash_mla:
+            attn_metadata.prepare_flash_mla()
 
         try:
             yield
@@ -1580,6 +1653,8 @@ class SpecWorkerBase(nn.Module, ABC):
             attn_metadata.kv_cache_manager = target_kv_cache_manager
             attn_metadata.kv_cache_block_offsets = target_kv_cache_block_offsets
             attn_metadata.host_kv_cache_block_offsets = target_host_kv_cache_block_offsets
+            if attn_metadata.enable_flash_mla:
+                attn_metadata.prepare_flash_mla()
 
     def _sample_tokens_for_batch(
         self,
@@ -1613,7 +1688,6 @@ class SpecWorkerBase(nn.Module, ABC):
             top_ps = spec_metadata.top_ps[:num_tokens]
 
             if self.use_flashinfer:
-                top_ks = top_ks.clamp(min=1, max=logits.shape[-1] - 1)
                 # Lazily initialize seed/offset tensors on correct device
                 if self.seed is None:
                     self.seed = torch.tensor([0],
@@ -1630,7 +1704,6 @@ class SpecWorkerBase(nn.Module, ABC):
                 temperatures,
                 top_ks,
                 top_ps,
-                use_flashinfer=self.use_flashinfer,
                 seed=self.seed,
                 offset=self.offset)
         else:

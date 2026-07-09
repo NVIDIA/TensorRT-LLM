@@ -128,6 +128,14 @@ class Flux2Pipeline(BasePipeline):
                 "Flux2Pipeline does not support CFG parallelism. Please set cfg_size to 1."
             )
 
+        _sa_cfg = pipeline_config.attention.sparse_attention_config
+        if _sa_cfg is not None and getattr(_sa_cfg, "algorithm", None) == "vsa":
+            raise ValueError(
+                "Video Sparse Attention (sparse_attention_config.algorithm='vsa') is "
+                "only supported by the Wan 2.1 T2V 14B (720P) pipeline. Remove "
+                "sparse_attention_config for FLUX.2."
+            )
+
         super().__init__(pipeline_config)
 
     @staticmethod
@@ -302,33 +310,34 @@ class Flux2Pipeline(BasePipeline):
             self.transformer.eval()
 
     def post_load_weights(self) -> None:
-        """Post-load setup: TeaCache registration."""
+        """Post-load setup: cache acceleration (TeaCache or Cache-DiT)."""
         super().post_load_weights()
         if self.transformer is not None:
-            # Register TeaCache extractor for FLUX.2 (must be after device placement)
-            # Only set guidance_param_name for variants with guidance_embeds
-            guidance_param = "guidance" if self.transformer.guidance_embeds else None
-            forward_params = [
-                "hidden_states",
-                "encoder_hidden_states",
-                "timestep",
-                "img_ids",
-                "txt_ids",
-                "guidance",
-                "return_dict",
-            ]
-            register_extractor_from_config(
-                ExtractorConfig(
-                    model_class_name="Flux2Transformer2DModel",
-                    timestep_embed_fn=self._compute_flux2_timestep_embedding,
-                    guidance_param_name=guidance_param,
-                    forward_params=forward_params,
-                    return_dict_default=False,
+            if self.pipeline_config.cache_backend == "teacache":
+                # Register TeaCache extractor for FLUX.2 (must be after device placement)
+                # Only set guidance_param_name for variants with guidance_embeds
+                guidance_param = "guidance" if self.transformer.guidance_embeds else None
+                forward_params = [
+                    "hidden_states",
+                    "encoder_hidden_states",
+                    "timestep",
+                    "img_ids",
+                    "txt_ids",
+                    "guidance",
+                    "return_dict",
+                ]
+                register_extractor_from_config(
+                    ExtractorConfig(
+                        model_class_name="Flux2Transformer2DModel",
+                        timestep_embed_fn=self._compute_flux2_timestep_embedding,
+                        guidance_param_name=guidance_param,
+                        forward_params=forward_params,
+                        return_dict_default=False,
+                    )
                 )
-            )
 
-            # TeaCache or Cache-DiT
-            self._setup_cache_acceleration(self.transformer, FLUX2_TEACACHE_COEFFICIENTS)
+            self._apply_teacache_coefficients(FLUX2_TEACACHE_COEFFICIENTS)
+            self._setup_cache_acceleration()
 
     @property
     def default_generation_params(self):

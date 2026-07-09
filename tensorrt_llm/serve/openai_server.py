@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 import asyncio
 import base64
+import functools
 import json
 import os
 import re
@@ -10,6 +11,7 @@ import time
 import traceback
 import uuid
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from datetime import datetime
 from http import HTTPStatus
@@ -34,7 +36,9 @@ from tensorrt_llm.executor import CppExecutorError
 from tensorrt_llm.executor.postproc_worker import PostprocParams
 from tensorrt_llm.inputs import prompt_inputs
 from tensorrt_llm.inputs.data import TokensPrompt
+from tensorrt_llm.inputs.media_io import BaseMediaIO
 from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
+from tensorrt_llm.inputs.registry import BaseMultimodalInputProcessor
 from tensorrt_llm.inputs.utils import ConversationMessage, apply_chat_template
 from tensorrt_llm.llmapi import DisaggregatedParams as LlmDisaggregatedParams
 from tensorrt_llm.llmapi import MultimodalEncoder, SchedulingParams, tracing
@@ -47,30 +51,25 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.media.encoding import image_to_bytes
 from tensorrt_llm.media.tensor_payload import is_tensor_format
 from tensorrt_llm.metrics.collector import MetricsCollector
+from tensorrt_llm.runtime.kv_cache_hash import \
+    get_effective_kv_cache_event_hash_algo
 from tensorrt_llm.sampling_params import GuidedDecodingParams
 from tensorrt_llm.serve.chat_utils import (load_chat_template,
                                            parse_chat_messages_coroutines,
                                            resolve_top_level_model_type)
 from tensorrt_llm.serve.cluster_storage import create_cluster_storage_client
+from tensorrt_llm.serve.conversation_id import resolve_request_conversation_id
 from tensorrt_llm.serve.disagg_auto_scaling import DisaggClusterWorker
 from tensorrt_llm.serve.metadata_server import create_metadata_server
-from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
-                                                ChatCompletionResponse,
-                                                ChatCompletionResponseChoice,
-                                                ChatMessage, CompletionRequest,
-                                                CompletionResponse,
-                                                CompletionResponseChoice,
-                                                ErrorResponse,
-                                                ImageGenerationRequest,
-                                                ImageGenerationResponse,
-                                                ImageObject,
-                                                MemoryUpdateRequest, ModelCard,
-                                                ModelList, PromptTokensDetails,
-                                                ResponseFormat,
-                                                ResponsesRequest,
-                                                ResponsesResponse,
-                                                UpdateWeightsRequest, UsageInfo,
-                                                to_llm_disaggregated_params)
+from tensorrt_llm.serve.openai_protocol import (
+    ChatCompletionRequest, ChatCompletionResponse, ChatCompletionResponseChoice,
+    ChatMessage, CompletionRequest, CompletionResponse,
+    CompletionResponseChoice, ErrorResponse, ImageGenerationRequest,
+    ImageGenerationResponse, ImageObject, MemoryUpdateRequest, ModelCard,
+    ModelList, PromptTokensDetails, ResponseFormat, ResponsesRequest,
+    ResponsesResponse, UpdateWeightsRequest, UsageInfo,
+    ensure_request_chat_template_allowed, to_llm_conversation_params,
+    to_llm_disaggregated_params)
 from tensorrt_llm.serve.openai_video_routes import _VideoRoutesMixin
 from tensorrt_llm.serve.postprocess_handlers import (
     ChatCompletionPostprocArgs, ChatPostprocArgs, CompletionPostprocArgs,
@@ -188,6 +187,15 @@ def _normalize_image_output(image) -> list:
 
 class OpenAIServer(_VideoRoutesMixin):
 
+    @staticmethod
+    def _iteration_stats_buffer_maxlen(
+            iter_stats_max_iterations: Optional[int]) -> Optional[int]:
+        if iter_stats_max_iterations is None or iter_stats_max_iterations == 0:
+            return 1000
+        if iter_stats_max_iterations < 0:
+            return None
+        return iter_stats_max_iterations
+
     def __init__(
             self,
             generator: Union[LLM, MultimodalEncoder, VisualGen],
@@ -197,18 +205,49 @@ class OpenAIServer(_VideoRoutesMixin):
             metadata_server_cfg: MetadataServerConfig,
             disagg_cluster_config: Optional[DisaggClusterConfig] = None,
             multimodal_server_config: Optional[MultimodalServerConfig] = None,
-            chat_template: Optional[str] = None):
+            chat_template: Optional[str] = None,
+            allow_request_chat_template: bool = False,
+            input_processor_workers: int = 8,
+            media_load_workers: int = 8):
         self.generator = generator
         self._is_visual_gen = isinstance(generator, VisualGen)
         self.tool_parser = tool_parser
         self.metadata_server = create_metadata_server(metadata_server_cfg)
         self.disagg_cluster_config = disagg_cluster_config
         self.multimodal_server_config = multimodal_server_config
+        # Seed media-IO decode defaults from the model's input processor, then
+        # let the server's --media_io_kwargs win (per-request kwargs still
+        # override at request time).
+        ip = getattr(self.generator, "input_processor", None)
+        if isinstance(ip, BaseMultimodalInputProcessor):
+            model_pref = ip.get_preferred_media_io_kwargs() or {}
+            if model_pref:
+                cfg = self.multimodal_server_config or MultimodalServerConfig()
+                merged = {m: dict(kw) for m, kw in model_pref.items()}
+                for modality, kw in (cfg.media_io_kwargs or {}).items():
+                    merged.setdefault(modality, {}).update(kw)
+                cfg.media_io_kwargs = merged
+                self.multimodal_server_config = cfg
+        self.allow_request_chat_template = allow_request_chat_template
         self.server_role = server_role
         # Will be set in __call__
         self.binding_addr = None
         self.host = None
         self.port = None
+
+        # Dedicated thread pools for the chat / completion path. Keeping
+        # multimodal preprocessing and decode work off the asyncio default
+        # executor avoids contention with unrelated `to_thread` callers and
+        # lets the two stages be sized independently.
+        self._input_proc_executor = ThreadPoolExecutor(
+            max_workers=input_processor_workers,
+            thread_name_prefix="trtllm_inputproc",
+        )
+        self._media_load_executor = ThreadPoolExecutor(
+            max_workers=media_load_workers,
+            thread_name_prefix="trtllm_media_load",
+        )
+        BaseMediaIO.set_executor(self._media_load_executor)
 
         model_dir = Path(model)
         if model_dir.exists() and model_dir.is_dir():
@@ -291,8 +330,14 @@ class OpenAIServer(_VideoRoutesMixin):
                     # engine stats queue; /metrics reads from a tee buffer
                     # bounded by iter_stats_max_iterations to avoid racing
                     # the loop for the queue (nvbug 6102381).
-                    max_buf = getattr(self.generator.args,
-                                      "iter_stats_max_iterations", 1000) or 1000
+                    # One shared buffer is sufficient while this collector task
+                    # is the only consumer of the engine iteration-stats queue.
+                    # Other consumers can read it through get_iteration_stats(),
+                    # which clears the buffer. Adding another queue consumer
+                    # requires revisiting the buffering and clearing ownership.
+                    max_buf = self._iteration_stats_buffer_maxlen(
+                        getattr(self.generator.args,
+                                "iter_stats_max_iterations", 1000))
                     self._iteration_stats_buffer = deque(maxlen=max_buf)
                     self._iteration_stats_collector_task = asyncio.create_task(
                         self._iteration_stats_collector_loop())
@@ -403,6 +448,10 @@ class OpenAIServer(_VideoRoutesMixin):
         else:
             self.use_harmony = (type(self.model_config).model_type == "gpt_oss")
 
+        self._ensure_post_processor_hook_supported(
+            self.use_harmony,
+            getattr(self.generator.args, "post_processor_hook", None))
+
         self.tool_call_id_type = "random"  # default tool call id type is random
         if self.model_config is not None:
             # NOTE: Use the instance-level ``model_type`` (JSON-derived) here, not
@@ -446,6 +495,22 @@ class OpenAIServer(_VideoRoutesMixin):
             if max_perf_metrics > 0:
                 self.perf_metrics = deque(maxlen=max_perf_metrics)
                 self.perf_metrics_lock = asyncio.Lock()
+
+    @staticmethod
+    def _ensure_post_processor_hook_supported(
+            use_harmony: bool, post_processor_hook: Optional[str]) -> None:
+        """Reject ``--post_processor_hook`` combined with a harmony/gpt-oss model.
+
+        The harmony output path is rebuilt from raw token ids, not detokenized
+        text, so the text-based hook cannot act there.
+        """
+        if use_harmony and post_processor_hook:
+            raise ValueError(
+                "--post_processor_hook is not supported with harmony/gpt-oss models "
+                "in this version: the harmony output path is reconstructed from "
+                "raw token ids and would bypass the text-based hook. Disable the "
+                "hook or set DISABLE_HARMONY_ADAPTER=1 if the harmony path is "
+                "not needed.")
 
     def _logit_bias_vocab_size(self) -> int:
         for config in (self.model_config,
@@ -674,6 +739,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 tokenizer=self.tokenizer,
                 model_config=self.model_config,
                 processor=self.processor,
+                allow_request_chat_template=self.allow_request_chat_template,
                 harmony_adapter_factory=get_harmony_adapter
                 if self.use_harmony else None,
             )
@@ -895,6 +961,19 @@ class OpenAIServer(_VideoRoutesMixin):
         return JSONResponse(content=model_list.model_dump())
 
     async def get_iteration_stats(self) -> JSONResponse:
+        # Visual-gen deployments use a separate iteration-stats producer
+        # (see ``DiffusionRemoteClient._iter_stats``).  The LLM PyExecutor
+        # stats queue is empty in visual-gen mode, so route /metrics to the
+        # visual-gen-shaped producer instead. Each snapshot mirrors LLM
+        # field names where it makes sense (numActiveRequests,
+        # numQueuedRequests) so downstream consumers that already parse the
+        # LLM /metrics shape work for visual-gen with minimal changes.
+        if self._is_visual_gen:
+            stats = []
+            async for stat in self.generator.get_stats_async(timeout=None):
+                stats.append(stat)
+            return JSONResponse(content=stats)
+
         # When the background collector loop is active it is the sole
         # consumer of the engine stats queue; serve /metrics from the tee
         # buffer it populates so we do not race it for queue items. Racing
@@ -1183,6 +1262,8 @@ class OpenAIServer(_VideoRoutesMixin):
                 raise
 
         try:
+            ensure_request_chat_template_allowed(
+                request, self.allow_request_chat_template)
             conversation: List[ConversationMessage] = []
             tool_dicts = None if request.tools is None else [
                 tool.model_dump() for tool in request.tools
@@ -1238,6 +1319,13 @@ class OpenAIServer(_VideoRoutesMixin):
                     self.multimodal_server_config,
                     request_media_io_kwargs=request.media_io_kwargs)
 
+            # Decode base64 int32 prompt_token_ids relayed by the orchestrator.
+            if request.prompt_token_ids is None and request.prompt_token_ids_b64:
+                import numpy as np
+                request.prompt_token_ids = np.frombuffer(
+                    base64.b64decode(request.prompt_token_ids_b64),
+                    dtype=np.int32).tolist()
+
             if request.prompt_token_ids is not None:
                 prompt = request.prompt_token_ids
             else:
@@ -1283,15 +1371,21 @@ class OpenAIServer(_VideoRoutesMixin):
             trace_headers = (None if raw_request is None else
                              tracing.extract_trace_headers(raw_request.headers))
 
+            resolve_request_conversation_id(
+                request, None if raw_request is None else raw_request.headers)
+            conversation_params = to_llm_conversation_params(
+                request.conversation_params)
             scheduling_params = SchedulingParams(
                 agent_hierarchy=request.agent_hierarchy)
 
             generate_inputs = prompt
             preprocess_fn = getattr(self.generator, "preprocess", None)
             if preprocess_fn is not None:
-                generate_inputs = await asyncio.to_thread(
-                    preprocess_fn, prompt, sampling_params,
-                    disaggregated_params)
+                loop = asyncio.get_event_loop()
+                generate_inputs = await loop.run_in_executor(
+                    self._input_proc_executor,
+                    functools.partial(preprocess_fn, prompt, sampling_params,
+                                      disaggregated_params))
 
             promise = self.generator.generate_async(
                 inputs=generate_inputs,
@@ -1301,6 +1395,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 streaming=request.stream,
                 lora_request=request.lora_request,
                 disaggregated_params=disaggregated_params,
+                conversation_params=conversation_params,
                 cache_salt=request.cache_salt,
                 trace_headers=trace_headers,
                 scheduling_params=scheduling_params,
@@ -1318,11 +1413,25 @@ class OpenAIServer(_VideoRoutesMixin):
             else:
                 response = await self._create_chat_response(
                     promise, postproc_params, raw_request, disaggregated_params)
+                # Context-only: optionally return prompt_token_ids as a base64
+                # int32 buffer (one string) so the disagg orchestrator relays it
+                # without materializing the int list on its event loop. The encode
+                # runs here on the context worker (1-of-N), not the orchestrator.
+                if (request.disaggregated_params is not None and
+                        request.disaggregated_params.return_prompt_token_ids_b64
+                        and response.prompt_token_ids is not None):
+                    import numpy as np
+                    response.prompt_token_ids_b64 = base64.b64encode(
+                        np.asarray(response.prompt_token_ids,
+                                   dtype=np.int32).tobytes()).decode("ascii")
+                    response.prompt_token_ids = None
                 return JSONResponse(content=response.model_dump())
         except CppExecutorError:
             logger.error(traceback.format_exc())
             # If internal executor error is raised, shutdown the server
             signal.raise_signal(signal.SIGINT)
+        except ValueError as e:
+            return self.create_error_response(str(e))
         except Exception as e:
             logger.error(traceback.format_exc())
             return self.create_error_response(str(e))
@@ -1370,6 +1479,8 @@ class OpenAIServer(_VideoRoutesMixin):
             )
 
         try:
+            ensure_request_chat_template_allowed(
+                request, self.allow_request_chat_template)
             conversation: List[ConversationMessage] = []
             tool_dicts = None if request.tools is None else [
                 tool.model_dump() for tool in request.tools
@@ -1568,6 +1679,10 @@ class OpenAIServer(_VideoRoutesMixin):
                 sampling_params.return_perf_metrics = True
             disaggregated_params = to_llm_disaggregated_params(
                 request.disaggregated_params)
+            resolve_request_conversation_id(
+                request, None if raw_request is None else raw_request.headers)
+            conversation_params = to_llm_conversation_params(
+                request.conversation_params)
             for idx, prompt in enumerate(prompts):
                 postproc_args = CompletionPostprocArgs.from_request(request)
                 postproc_args.prompt_idx = idx
@@ -1586,8 +1701,11 @@ class OpenAIServer(_VideoRoutesMixin):
 
                 prompt = prompt_inputs(prompt)
                 if prompt.get("prompt") is not None:
-                    prompt_token_ids, extra_processed_inputs = await asyncio.to_thread(
-                        self.generator.input_processor, prompt, sampling_params)
+                    loop = asyncio.get_event_loop()
+                    prompt_token_ids, extra_processed_inputs = await loop.run_in_executor(
+                        self._input_proc_executor,
+                        functools.partial(self.generator.input_processor,
+                                          prompt, sampling_params))
                     tokens_prompt = TokensPrompt(
                         prompt_token_ids=prompt_token_ids,
                         query_token_ids=extra_processed_inputs.get(
@@ -1603,6 +1721,7 @@ class OpenAIServer(_VideoRoutesMixin):
                     streaming=request.stream,
                     lora_request=request.lora_request,
                     disaggregated_params=disaggregated_params,
+                    conversation_params=conversation_params,
                     trace_headers=trace_headers)
                 asyncio.create_task(
                     self.await_disconnected(raw_request, promise))
@@ -1679,6 +1798,8 @@ class OpenAIServer(_VideoRoutesMixin):
                 raise
 
         try:
+            ensure_request_chat_template_allowed(
+                request, self.allow_request_chat_template)
             # Initialize HarmonyAdapter
             # NOTE: WAR for Disagg failure, may affect perf if no warmup
             if not self.harmony_adapter:
@@ -1743,6 +1864,10 @@ class OpenAIServer(_VideoRoutesMixin):
                 postproc_args=postproc_args,
             )
 
+            resolve_request_conversation_id(
+                request, None if raw_request is None else raw_request.headers)
+            conversation_params = to_llm_conversation_params(
+                request.conversation_params)
             scheduling_params = SchedulingParams(
                 agent_hierarchy=request.agent_hierarchy)
 
@@ -1756,6 +1881,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 lora_request=request.lora_request,
                 scheduling_params=scheduling_params,
                 disaggregated_params=disaggregated_params,
+                conversation_params=conversation_params,
                 trace_headers=trace_headers,
             )
             if not self.postproc_worker_enabled:
@@ -1774,6 +1900,8 @@ class OpenAIServer(_VideoRoutesMixin):
                     promise, postproc_params, raw_request, disaggregated_params)
                 return JSONResponse(response.model_dump())
 
+        except ValueError as e:
+            return self.create_error_response(str(e))
         except Exception as e:
             logger.error("Error in harmony chat completion: %s", e)
             logger.debug("Error details: %s", traceback.format_exc())
@@ -1980,10 +2108,21 @@ class OpenAIServer(_VideoRoutesMixin):
         return JSONResponse(content={"status": "success"})
 
     async def get_server_info(self) -> JSONResponse:
-        return JSONResponse(
-            content={
-                "disaggregated_params": self.generator.disaggregated_params
-            })
+        content = {"disaggregated_params": self.generator.disaggregated_params}
+        args = getattr(self.generator, "args", None)
+        if args is not None:
+            if args.max_batch_size is not None:
+                content["max_batch_size"] = args.max_batch_size
+            kv_cache_config = args.kv_cache_config
+            if kv_cache_config is not None:
+                content[
+                    "kv_cache_hash_algo"] = get_effective_kv_cache_event_hash_algo(
+                        kv_cache_config.kv_cache_event_hash_algo,
+                        kv_cache_config.use_kv_cache_manager_v2)
+                if kv_cache_config.tokens_per_block is not None:
+                    content[
+                        "tokens_per_block"] = kv_cache_config.tokens_per_block
+        return JSONResponse(content=content)
 
     async def openai_image_generation(self, request: ImageGenerationRequest,
                                       raw_request: Request) -> Response:
