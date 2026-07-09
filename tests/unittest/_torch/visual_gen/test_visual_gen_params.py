@@ -760,6 +760,30 @@ class TestRequestValidation:
         req = self._make_request(extra_params={"stg_scale": 0.5})
         self._merge_and_validate(executor, req)  # should not raise
 
+    def test_path_or_list_extra_param_type_enforced(self):
+        """Cosmos3 V2V's `video` extra param declares type "path_or_list"; the
+        type map must know it, otherwise the type check is silently skipped
+        and a bad value reaches the pipeline."""
+        from tensorrt_llm._torch.visual_gen.pipeline import ExtraParamSchema
+        from tensorrt_llm.visual_gen.params import VisualGenParams, validate_visual_gen_params
+
+        specs = {"video": ExtraParamSchema(type="path_or_list", default=None)}
+
+        # A media path and an in-memory frame list are both valid forms.
+        for good in ("/tmp/clip.mp4", ["frame0.png", "frame1.png"]):
+            validate_visual_gen_params(
+                VisualGenParams(extra_params={"video": good}),
+                declared_defaults={},
+                extra_param_specs=specs,
+            )
+
+        with pytest.raises(ValueError, match="expected type 'path_or_list'"):
+            validate_visual_gen_params(
+                VisualGenParams(extra_params={"video": 42}),
+                declared_defaults={},
+                extra_param_specs=specs,
+            )
+
     # --- unsupported universal fields ---
 
     def test_num_frames_on_image_pipeline_raises(self):
