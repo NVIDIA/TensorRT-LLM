@@ -12,19 +12,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import faulthandler
-import logging
-import os
 import signal
-import socket
 import subprocess
-import sys
 import tempfile
-import time
-from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import TextIO
 
 import pytest
 import torch
@@ -50,20 +42,6 @@ from tensorrt_llm.functional import AllReduceStrategy
 
 # needed since LLM API uses MPI executor pool internally for TP>1, which leaks a thread on shutdown
 pytestmark = pytest.mark.threadleak(enabled=False)
-
-
-@contextmanager
-def _tee_tllm_errors(stream: TextIO) -> Iterator[None]:
-    """Mirror TensorRT-LLM errors to a stream that Click does not capture."""
-    handler = logging.StreamHandler(stream)
-    handler.setLevel(logging.ERROR)
-    handler.setFormatter(logging.Formatter("[allreduce-strategy-debug][tllm-error] %(message)s"))
-    tllm_logger = logging.getLogger("TRT-LLM")
-    tllm_logger.addHandler(handler)
-    try:
-        yield
-    finally:
-        tllm_logger.removeHandler(handler)
 
 
 class TimeoutError(Exception):
@@ -226,7 +204,7 @@ def _prepare_dataset(root_dir: str, temp_dir: str, model_path_or_name: str, num_
         "SYMM_MEM",
     ],
 )
-def test_allreduce_strategies(capfd, llm_root, shared_dataset, allreduce_strategy):  # noqa: F811
+def test_allreduce_strategies(llm_root, shared_dataset, allreduce_strategy):  # noqa: F811
     """Test different allreduce strategies with multi-GPU configuration making sure that there are no crashes or hangs.
 
     Configuration:
@@ -321,74 +299,15 @@ def test_allreduce_strategies(capfd, llm_root, shared_dataset, allreduce_strateg
             ]
         )
 
-        debug_prefix = f"[allreduce-strategy-debug][{allreduce_strategy}]"
-        start_time = time.monotonic()
-        with capfd.disabled():
-            debug_stream = sys.stderr
-            print(
-                f"{debug_prefix} starting on host={socket.gethostname()} pid={os.getpid()} "
-                f"timeout={TEST_TIMEOUT_SECONDS}s",
-                flush=True,
+        try:
+            with timeout(TEST_TIMEOUT_SECONDS):
+                result = runner.invoke(main, args, catch_exceptions=False)
+                assert result.exit_code == 0, f"Benchmark failed with output: {result.output}"
+        except TimeoutError as e:
+            pytest.fail(
+                f"Test timed out after {TEST_TIMEOUT_SECONDS}s for strategy {allreduce_strategy}. "
+                f"This might indicate a hang (e.g., TWOSHOT without C++ fix). Error: {e}"
             )
-            print(
-                f"{debug_prefix} torch={torch.__version__} cuda={torch.version.cuda} "
-                f"gpu_count={torch.cuda.device_count()} "
-                f"gpus={[torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())]}",
-                flush=True,
-            )
-            print(
-                f"{debug_prefix} model_path={config['args']['model']} "
-                f"LLM_MODELS_ROOT={os.environ.get('LLM_MODELS_ROOT', '<unset>')}",
-                flush=True,
-            )
-            print(
-                f"{debug_prefix} workload=requests=10 input_tokens=128 output_tokens=128 "
-                f"tp={tp_size} max_batch_size={max_batch_size} "
-                f"max_num_tokens={max_num_tokens}",
-                flush=True,
-            )
-            print(
-                f"{debug_prefix} extra_llm_api_options:\n"
-                f"{Path(extra_llm_api_options_path).read_text()}",
-                flush=True,
-            )
-
-            # Preserve useful parent-process stacks in CI even if a native CUDA/MPI wait
-            # prevents the Python-level timeout from unwinding the benchmark.
-            faulthandler.dump_traceback_later(60, repeat=True)
-            try:
-                with _tee_tllm_errors(debug_stream):
-                    old_log_level = os.environ.get("TLLM_LOG_LEVEL")
-                    if allreduce_strategy == "TWOSHOT":
-                        os.environ["TLLM_LOG_LEVEL"] = "DEBUG"
-                    try:
-                        with timeout(TEST_TIMEOUT_SECONDS):
-                            result = runner.invoke(main, args, catch_exceptions=False)
-                            print(
-                                f"{debug_prefix} benchmark returned exit_code={result.exit_code} "
-                                f"elapsed={time.monotonic() - start_time:.1f}s",
-                                flush=True,
-                            )
-                            assert result.exit_code == 0, (
-                                f"Benchmark failed with output: {result.output}"
-                            )
-                    finally:
-                        if old_log_level is None:
-                            os.environ.pop("TLLM_LOG_LEVEL", None)
-                        else:
-                            os.environ["TLLM_LOG_LEVEL"] = old_log_level
-            except TimeoutError as e:
-                pytest.fail(
-                    f"Test timed out after {TEST_TIMEOUT_SECONDS}s for strategy "
-                    f"{allreduce_strategy}. This might indicate a hang "
-                    f"(e.g., TWOSHOT without C++ fix). Error: {e}"
-                )
-            finally:
-                faulthandler.cancel_dump_traceback_later()
-                print(
-                    f"{debug_prefix} finished elapsed={time.monotonic() - start_time:.1f}s",
-                    flush=True,
-                )
 
 
 @pytest.mark.parametrize(
