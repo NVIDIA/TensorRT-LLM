@@ -83,6 +83,20 @@ COSMOS3_ACTION_RESOLUTIONS = tuple(int(key) for key in sorted(VIDEO_RES_SIZE_INF
 
 
 def normalize_action_resolution(resolution: Any) -> int:
+    """Validate and coerce the requested action resolution bucket.
+
+    Args:
+        resolution: Bucket selector, int-like (e.g. ``480``, ``"720"``). Must
+            match one of the buckets declared in ``VIDEO_RES_SIZE_INFO``
+            (``COSMOS3_ACTION_RESOLUTIONS``).
+
+    Returns:
+        The validated bucket as ``int``.
+
+    Raises:
+        ValueError: If ``resolution`` is ``None``, not int-coercible, or not a
+            known bucket.
+    """
     if resolution is None:
         raise ValueError("Cosmos3 action_resolution is required for action generation.")
     try:
@@ -100,6 +114,19 @@ def normalize_action_resolution(resolution: Any) -> int:
 
 
 def normalize_action_mode(mode: Any) -> str | None:
+    """Canonicalize the requested action mode.
+
+    Args:
+        mode: Raw request value. Strings are stripped and lower-cased;
+            ``None`` or an empty string means action generation is disabled.
+
+    Returns:
+        One of ``ACTION_MODES`` (``"policy"``, ``"forward_dynamics"``,
+        ``"inverse_dynamics"``), or ``None`` when no action mode is requested.
+
+    Raises:
+        ValueError: If ``mode`` is non-empty but not a supported action mode.
+    """
     if mode is None:
         return None
     normalized = str(mode).strip().lower()
@@ -340,6 +367,51 @@ def prepare_action_latents(
     dtype: torch.dtype,
     action_input: Any = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+    """Build the initial action-token latents for denoising.
+
+    The action analog of the video-side latent preparation: tokens that are
+    *given* are pinned to their clean values via the condition mask, tokens
+    that are *predicted* start as Gaussian noise. For ``forward_dynamics``
+    the trajectory in ``action_input`` is the given conditioning; for
+    ``policy`` and ``inverse_dynamics`` every action token is generated.
+
+    Args:
+        mode: Canonical action mode (see :func:`normalize_action_mode`).
+        action_chunk_size: Number of action timesteps (tokens) in the
+            sequence. A ``forward_dynamics`` input trajectory is right-padded
+            by repeating its last row, or truncated, to this length.
+        raw_action_dim: The embodiment's true degrees of freedom — the number
+            of *meaningful* leading channels of each action vector (e.g. 9
+            for ``av``, 10 for ``bridge_orig_lerobot``). Channels beyond it
+            are zeroed in both the clean values and the noise. Optional for
+            ``forward_dynamics`` (inferred from ``action_input``'s last dim);
+            required for ``policy`` / ``inverse_dynamics``.
+        action_dim: Model-side padded action width (the checkpoint's
+            ``max_action_dim``, 64 for Cosmos3-Nano). Trajectories are
+            zero-padded from ``raw_action_dim`` up to this width.
+        generator: RNG for the noise draw (seed reproducibility).
+        device: Device for the returned tensors.
+        dtype: Dtype for the returned tensors.
+        action_input: ``forward_dynamics`` only — the given trajectory of
+            shape ``[T, raw_action_dim]`` (tensor, array, nested list, or
+            anything :func:`load_action_tensor` accepts). Ignored otherwise.
+
+    Returns:
+        A ``(action_latents, action_velocity_mask, clean_action,
+        raw_action_dim)`` tuple:
+
+        * ``action_latents``: ``[1, action_chunk_size, action_dim]`` — clean
+          values at conditioned positions, noise elsewhere.
+        * ``action_velocity_mask``: ``1 - condition_mask``; 1 where the
+          scheduler should integrate the predicted velocity.
+        * ``clean_action``: ``[1, action_chunk_size, action_dim]`` padded
+          clean trajectory (all zeros in the generative modes).
+        * ``raw_action_dim``: the resolved value as ``int``.
+
+    Raises:
+        ValueError: If ``raw_action_dim`` is missing in a generative mode or
+            falls outside ``[1, action_dim]``.
+    """
     if mode == ACTION_MODE_FORWARD_DYNAMICS:
         action = load_action_tensor(action_input)
         if action.shape[0] < action_chunk_size:
