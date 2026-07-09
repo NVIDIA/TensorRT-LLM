@@ -16,6 +16,8 @@ import PIL.Image
 import torch
 import torch.nn.functional as F
 
+from .utils import read_video_tensor
+
 TRANSFER_HINT_KEYS: tuple[str, ...] = ("edge", "blur", "depth", "seg", "wsm")
 TRANSFER_SAMPLE_DEFAULTS: dict[str, Any] = {
     "num_video_frames_per_chunk": 93,
@@ -234,14 +236,19 @@ def media_hw(value: Any) -> tuple[int, int] | None:
         if media_path.suffix.lower() in IMAGE_EXTENSIONS:
             with PIL.Image.open(media_path) as image:
                 return image.height, image.width
+        # Probe the container header via PyAV (the declared media dep) —
+        # no frame decode needed for dimensions.
         try:
-            import imageio.v3 as iio
+            import av
         except ImportError:
             return None
-        for frame in iio.imiter(media_path):
-            array = np.asarray(frame)
-            if array.ndim >= 2:
-                return int(array.shape[0]), int(array.shape[1])
+        try:
+            with av.open(str(media_path)) as container:
+                if container.streams.video:
+                    stream = container.streams.video[0]
+                    return int(stream.height), int(stream.width)
+        except av.FFmpegError:
+            return None
         return None
     if isinstance(value, torch.Tensor):
         tensor = value.detach()
@@ -326,23 +333,10 @@ def _path_media_to_uint8_cthw(path: str | Path, max_frames: int | None) -> torch
         array = _pil_to_uint8_rgb(media_path)
         return torch.from_numpy(array).permute(2, 0, 1).unsqueeze(1).contiguous()
 
-    try:
-        import imageio.v3 as iio
-    except ImportError as exc:
-        raise ImportError(
-            "Cosmos3 transfer video control_path loading requires imageio. "
-            "Install imageio[ffmpeg] or provide decoded control frames."
-        ) from exc
-
-    frames: list[torch.Tensor] = []
-    limit = max_frames if max_frames is not None else None
-    for frame in iio.imiter(media_path):
-        frames.append(torch.from_numpy(_pil_to_uint8_rgb(frame)).permute(2, 0, 1))
-        if limit is not None and len(frames) >= int(limit):
-            break
-    if not frames:
-        raise ValueError(f"Cosmos3 transfer control_path produced no frames: {media_path}")
-    return torch.stack(frames, dim=1).contiguous()
+    # Same torchvision/PyAV decode stack as V2V, consumed as a tensor:
+    # [T, H, W, C] -> [C, T, H, W] with the layout `contiguous` as the only copy.
+    frames_thwc = read_video_tensor(media_path, max_frames=max_frames)
+    return frames_thwc[..., :3].permute(3, 0, 1, 2).contiguous()
 
 
 def media_to_uint8_cthw(value: Any, *, height: int, width: int, max_frames: int | None = None) -> torch.Tensor:

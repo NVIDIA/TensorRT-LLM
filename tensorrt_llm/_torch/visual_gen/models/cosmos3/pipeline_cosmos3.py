@@ -1405,8 +1405,8 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             )
             result = self.transformer(
                 hidden_states=latents,
-                timestep=timestep,
-                attention_timestep=timestep / self.scheduler.config.num_train_timesteps,
+                timestep=timestep / self.scheduler.config.num_train_timesteps,
+                raw_timestep=timestep,
                 text_ids=text_ids,
                 text_mask=text_mask,
                 control_latents=branch_control_latents,

@@ -21,7 +21,24 @@ def pil_to_rgb(value: Any) -> PIL.Image.Image:
     raise TypeError(f"Cosmos3 preprocessing expected PIL image or image path, got {type(value)!r}.")
 
 
+def read_video_tensor(path: Path, max_frames: Optional[int] = None):
+    """Decode a video file to a uint8 ``[T, H, W, C]`` CPU tensor.
+
+    Tensor-form companion of :func:`decode_video_file` for consumers that
+    post-process frames numerically (the transfer control pipeline). The
+    OpenCV decode itself lives in ``media_io.decode_video_frames``.
+    """
+    import numpy as np
+    import torch
+
+    from tensorrt_llm.inputs.media_io import decode_video_frames
+
+    frames = decode_video_frames(path, max_frames=max_frames)
+    return torch.from_numpy(np.stack([np.asarray(frame) for frame in frames]))
+
+
 def decode_video_file(path: Path, max_frames: Optional[int] = None) -> List[PIL.Image.Image]:
+    # The OpenCV full decode lives in media_io, shared with the serve layer.
     from tensorrt_llm.inputs.media_io import decode_video_frames
 
     return decode_video_frames(path, max_frames=max_frames)
