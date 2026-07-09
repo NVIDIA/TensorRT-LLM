@@ -46,7 +46,7 @@ import triton.language as tl
 
 @triton.jit
 def _attend_ctx_tokens(
-    q_tile,  # [R, D] bf16
+    q_tile,  # [R_PAD, D] bf16
     k_cache_ptr,
     v_cache_ptr,
     blk_row_ptr,  # page-id row for this request
@@ -63,7 +63,7 @@ def _attend_ctx_tokens(
     m_i,
     l_i,
     acc,
-    R: tl.constexpr,
+    R_PAD: tl.constexpr,
     TPB: tl.constexpr,
     D: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -88,7 +88,7 @@ def _attend_ctx_tokens(
         k = tl.load(k_ptrs, mask=valid[:, None], other=0.0).to(tl.bfloat16)
         v = tl.load(v_ptrs, mask=valid[:, None], other=0.0).to(tl.bfloat16)
 
-        s = tl.dot(q_tile, tl.trans(k)) * sm_scale  # [R, BLOCK_N]
+        s = tl.dot(q_tile, tl.trans(k)) * sm_scale  # [R_PAD, BLOCK_N]
         s = tl.where(valid[None, :], s, float("-inf"))
 
         m_new = tl.maximum(m_i, tl.max(s, axis=1))
@@ -105,7 +105,7 @@ def _attend_ctx_tokens(
 
 @triton.jit
 def _attend_noise_suffix(
-    q_tile,  # [R, D]
+    q_tile,  # [R_PAD, D]
     k_noise_ptr,
     v_noise_ptr,
     b,
@@ -117,7 +117,7 @@ def _attend_noise_suffix(
     m_i,
     l_i,
     acc,
-    R: tl.constexpr,
+    R_PAD: tl.constexpr,
     Q: tl.constexpr,
     D: tl.constexpr,
     NOISE_PAD: tl.constexpr,
@@ -131,7 +131,7 @@ def _attend_noise_suffix(
     kn = tl.load(kn_ptrs, mask=n_valid[:, None], other=0.0).to(tl.bfloat16)
     vn = tl.load(vn_ptrs, mask=n_valid[:, None], other=0.0).to(tl.bfloat16)
 
-    s = tl.dot(q_tile, tl.trans(kn)) * sm_scale  # [R, NOISE_PAD]
+    s = tl.dot(q_tile, tl.trans(kn)) * sm_scale  # [R_PAD, NOISE_PAD]
     s = tl.where(n_valid[None, :], s, float("-inf"))
     m_new = tl.maximum(m_i, tl.max(s, axis=1))
     alpha = tl.where(m_new == float("-inf"), 1.0, tl.exp(m_i - m_new))
@@ -145,15 +145,19 @@ def _attend_noise_suffix(
 def _load_q_tile(
     q_ptr, b, kvh, stride_qb, stride_qq, stride_qh,
     Q: tl.constexpr, GROUP: tl.constexpr, D: tl.constexpr,
+    R_PAD: tl.constexpr,
 ):
-    # Row r -> (head h = kvh*GROUP + r // Q, query qi = r % Q)
+    # Row r -> (head h = kvh*GROUP + r // Q, query qi = r % Q). tl.arange
+    # needs a power-of-two span, so rows are padded to R_PAD; padded rows
+    # load zeros and are masked again at the output store.
     R: tl.constexpr = Q * GROUP
-    r = tl.arange(0, R)
+    r = tl.arange(0, R_PAD)
+    row_ok = r < R
     h = kvh * GROUP + r // Q
     qi = r % Q
     d = tl.arange(0, D)
     q_ptrs = q_ptr + b * stride_qb + qi[:, None] * stride_qq + h[:, None] * stride_qh + d[None, :]
-    return tl.load(q_ptrs).to(tl.bfloat16)  # [R, D]
+    return tl.load(q_ptrs, mask=row_ok[:, None], other=0.0).to(tl.bfloat16)  # [R_PAD, D]
 
 
 @triton.jit
@@ -189,36 +193,40 @@ def _dflash_ctx_attn_kernel(
     D: tl.constexpr,  # head dim
     BLOCK_N: tl.constexpr,  # ctx tokens per iteration
     NOISE_PAD: tl.constexpr,  # Q padded to >=16 for tl.dot
+    R_PAD: tl.constexpr,  # Q*GROUP padded to a power of two
 ):
     """Single-pass path: one CTA per (request, kv head)."""
     b = tl.program_id(0)
     kvh = tl.program_id(1)
     R: tl.constexpr = Q * GROUP
 
-    q_tile = _load_q_tile(q_ptr, b, kvh, stride_qb, stride_qq, stride_qh, Q, GROUP, D)
+    q_tile = _load_q_tile(q_ptr, b, kvh, stride_qb, stride_qq, stride_qh,
+                          Q, GROUP, D, R_PAD)
 
-    m_i = tl.full([R], float("-inf"), dtype=tl.float32)
-    l_i = tl.zeros([R], dtype=tl.float32)
-    acc = tl.zeros([R, D], dtype=tl.float32)
+    m_i = tl.full([R_PAD], float("-inf"), dtype=tl.float32)
+    l_i = tl.zeros([R_PAD], dtype=tl.float32)
+    acc = tl.zeros([R_PAD, D], dtype=tl.float32)
 
     ctx_len = tl.load(ctx_len_ptr + b)
     m_i, l_i, acc = _attend_ctx_tokens(
         q_tile, k_cache_ptr, v_cache_ptr, blk_ptr + b * stride_bb, kvh,
         stride_kp, stride_kt, stride_kh, stride_vp, stride_vt, stride_vh,
-        0, ctx_len, sm_scale, m_i, l_i, acc, R, TPB, D, BLOCK_N)
+        0, ctx_len, sm_scale, m_i, l_i, acc, R_PAD, TPB, D, BLOCK_N)
 
     m_i, l_i, acc = _attend_noise_suffix(
         q_tile, k_noise_ptr, v_noise_ptr, b, kvh, stride_nb, stride_nq,
-        stride_nh, sm_scale, m_i, l_i, acc, R, Q, D, NOISE_PAD)
+        stride_nh, sm_scale, m_i, l_i, acc, R_PAD, Q, D, NOISE_PAD)
 
     out = acc / l_i[:, None]
-    qi = tl.arange(0, R) % Q
-    h = kvh * GROUP + tl.arange(0, R) // Q
+    r = tl.arange(0, R_PAD)
+    row_ok = r < R
+    qi = r % Q
+    h = kvh * GROUP + r // Q
     d = tl.arange(0, D)
     out_ptrs = (
         out_ptr + b * stride_ob + qi[:, None] * stride_oq + h[:, None] * stride_oh + d[None, :]
     )
-    tl.store(out_ptrs, out.to(out_ptr.dtype.element_ty))
+    tl.store(out_ptrs, out.to(out_ptr.dtype.element_ty), mask=row_ok[:, None])
 
 
 @triton.jit
@@ -250,12 +258,12 @@ def _dflash_ctx_attn_split_kernel(
     TPB: tl.constexpr,
     D: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    R_PAD: tl.constexpr,
 ):
     """Split phase: CTA (b, kvh, s) covers a slice of the context."""
     b = tl.program_id(0)
     kvh = tl.program_id(1)
     s_id = tl.program_id(2)
-    R: tl.constexpr = Q * GROUP
 
     ctx_len = tl.load(ctx_len_ptr + b)
     # Even token split, rounded to BLOCK_N so slices don't share tiles.
@@ -263,20 +271,23 @@ def _dflash_ctx_attn_split_kernel(
     start = s_id * per_split
     end = tl.minimum(start + per_split, ctx_len)
 
-    q_tile = _load_q_tile(q_ptr, b, kvh, stride_qb, stride_qq, stride_qh, Q, GROUP, D)
+    q_tile = _load_q_tile(q_ptr, b, kvh, stride_qb, stride_qq, stride_qh,
+                          Q, GROUP, D, R_PAD)
 
-    m_i = tl.full([R], float("-inf"), dtype=tl.float32)
-    l_i = tl.zeros([R], dtype=tl.float32)
-    acc = tl.zeros([R, D], dtype=tl.float32)
+    m_i = tl.full([R_PAD], float("-inf"), dtype=tl.float32)
+    l_i = tl.zeros([R_PAD], dtype=tl.float32)
+    acc = tl.zeros([R_PAD, D], dtype=tl.float32)
 
     m_i, l_i, acc = _attend_ctx_tokens(
         q_tile, k_cache_ptr, v_cache_ptr, blk_ptr + b * stride_bb, kvh,
         stride_kp, stride_kt, stride_kh, stride_vp, stride_vt, stride_vh,
-        start, end, sm_scale, m_i, l_i, acc, R, TPB, D, BLOCK_N)
+        start, end, sm_scale, m_i, l_i, acc, R_PAD, TPB, D, BLOCK_N)
 
-    r = tl.arange(0, R)
+    # Padded rows are stored too (the partial buffers are R_PAD-strided);
+    # the merge kernel discards them at its masked output store.
+    r = tl.arange(0, R_PAD)
     d = tl.arange(0, D)
-    base = ((b * NKV + kvh) * S + s_id) * R
+    base = ((b * NKV + kvh) * S + s_id) * R_PAD
     tl.store(part_m_ptr + base + r, m_i)
     tl.store(part_l_ptr + base + r, l_i)
     tl.store(part_acc_ptr + (base + r)[:, None] * D + d[None, :], acc)
@@ -307,20 +318,21 @@ def _dflash_ctx_attn_merge_kernel(
     GROUP: tl.constexpr,
     D: tl.constexpr,
     NOISE_PAD: tl.constexpr,
+    R_PAD: tl.constexpr,
 ):
     """Merge phase: fold split partials, then the noise suffix."""
     b = tl.program_id(0)
     kvh = tl.program_id(1)
     R: tl.constexpr = Q * GROUP
-    r = tl.arange(0, R)
+    r = tl.arange(0, R_PAD)
     d = tl.arange(0, D)
 
-    m_i = tl.full([R], float("-inf"), dtype=tl.float32)
-    l_i = tl.zeros([R], dtype=tl.float32)
-    acc = tl.zeros([R, D], dtype=tl.float32)
+    m_i = tl.full([R_PAD], float("-inf"), dtype=tl.float32)
+    l_i = tl.zeros([R_PAD], dtype=tl.float32)
+    acc = tl.zeros([R_PAD, D], dtype=tl.float32)
 
     for s_id in range(0, S):
-        base = ((b * NKV + kvh) * S + s_id) * R
+        base = ((b * NKV + kvh) * S + s_id) * R_PAD
         m_s = tl.load(part_m_ptr + base + r)
         l_s = tl.load(part_l_ptr + base + r)
         a_s = tl.load(part_acc_ptr + (base + r)[:, None] * D + d[None, :])
@@ -335,18 +347,20 @@ def _dflash_ctx_attn_merge_kernel(
         acc = acc * alpha[:, None] + a_s * beta[:, None]
         m_i = m_new
 
-    q_tile = _load_q_tile(q_ptr, b, kvh, stride_qb, stride_qq, stride_qh, Q, GROUP, D)
+    q_tile = _load_q_tile(q_ptr, b, kvh, stride_qb, stride_qq, stride_qh,
+                          Q, GROUP, D, R_PAD)
     m_i, l_i, acc = _attend_noise_suffix(
         q_tile, k_noise_ptr, v_noise_ptr, b, kvh, stride_nb, stride_nq,
-        stride_nh, sm_scale, m_i, l_i, acc, R, Q, D, NOISE_PAD)
+        stride_nh, sm_scale, m_i, l_i, acc, R_PAD, Q, D, NOISE_PAD)
 
     out = acc / l_i[:, None]
+    row_ok = r < R
     qi = r % Q
     h = kvh * GROUP + r // Q
     out_ptrs = (
         out_ptr + b * stride_ob + qi[:, None] * stride_oq + h[:, None] * stride_oh + d[None, :]
     )
-    tl.store(out_ptrs, out.to(out_ptr.dtype.element_ty))
+    tl.store(out_ptrs, out.to(out_ptr.dtype.element_ty), mask=row_ok[:, None])
 
 
 # Reused across steps so CUDA graph capture sees stable addresses; keyed by
@@ -393,7 +407,18 @@ def dflash_ctx_paged_attention(
     _, TPB, NKV, _ = k_cache.shape
     assert NH % NKV == 0
     group = NH // NKV
-    assert (Q * group) >= 16 and D >= 16, "tl.dot needs tiles >= 16"
+    # tl.arange spans must be powers of two. Query rows (R = Q*GROUP) are
+    # padded below, so any draft length / GQA ratio works; head_dim and the
+    # manager page size have no such padding path and must be powers of two
+    # (every known draft uses 64/128; the manager default page is 32).
+    if D < 16 or (D & (D - 1)) != 0:
+        raise ValueError(
+            f"DFlash hybrid ctx kernel requires a power-of-two head_dim "
+            f">= 16, got {D}.")
+    if TPB & (TPB - 1) != 0:
+        raise ValueError(
+            f"DFlash hybrid ctx kernel requires a power-of-two "
+            f"tokens_per_block, got {TPB}.")
     assert q.stride(-1) == 1 and k_cache.stride(-1) == 1
 
     out = torch.empty_like(q)
@@ -401,6 +426,9 @@ def dflash_ctx_paged_attention(
     noise_pad = max(16, triton.next_power_of_2(Q))
     BLOCK_N = 128
     R = Q * group
+    # Pad query rows to a power of two (>= 16 for tl.dot); e.g. a draft
+    # length of 5 gives Q = 6 and R = 24 -> R_PAD = 32.
+    r_pad = max(16, triton.next_power_of_2(R))
 
     common_q = (q.stride(0), q.stride(1), q.stride(2))
     common_n = (k_noise.stride(0), k_noise.stride(1), k_noise.stride(2))
@@ -418,12 +446,12 @@ def dflash_ctx_paged_attention(
             *common_o,
             sm_scale,
             Q=Q, GROUP=group, TPB=TPB, D=D, BLOCK_N=BLOCK_N,
-            NOISE_PAD=noise_pad,
+            NOISE_PAD=noise_pad, R_PAD=r_pad,
             num_warps=4,
         )
         return out
 
-    part_acc, part_m, part_l = _get_partial_bufs(B, NKV, S, R, D, q.device)
+    part_acc, part_m, part_l = _get_partial_bufs(B, NKV, S, r_pad, D, q.device)
     _dflash_ctx_attn_split_kernel[(B, NKV, S)](
         q, k_cache, v_cache, block_idx, ctx_lens,
         part_acc, part_m, part_l,
@@ -433,6 +461,7 @@ def dflash_ctx_paged_attention(
         block_idx.stride(0),
         sm_scale,
         NKV=NKV, S=S, Q=Q, GROUP=group, TPB=TPB, D=D, BLOCK_N=BLOCK_N,
+        R_PAD=r_pad,
         num_warps=4,
     )
     _dflash_ctx_attn_merge_kernel[(B, NKV)](
@@ -442,6 +471,7 @@ def dflash_ctx_paged_attention(
         *common_o,
         sm_scale,
         NKV=NKV, S=S, Q=Q, GROUP=group, D=D, NOISE_PAD=noise_pad,
+        R_PAD=r_pad,
         num_warps=4,
     )
     return out
