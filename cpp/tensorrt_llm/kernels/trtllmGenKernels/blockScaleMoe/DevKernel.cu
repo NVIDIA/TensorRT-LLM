@@ -317,11 +317,9 @@ __global__ void activationDeepSeekKernel(KernelParams params)
                     // Process blocks for this CTA
                     int64_t const baseIdx = static_cast<int64_t>(permutedIdx) * params.innerDim + hiddenIdx;
 
-                    int64_t const scale1Idx
-                        = permutedIdx + static_cast<int64_t>(totalNumPaddedTokens) * (hiddenIdx / 128);
-                    int64_t const scale2Idx = permutedIdx
-                        + static_cast<int64_t>(totalNumPaddedTokens)
-                            * ((hiddenIdx / 128) + (params.innerDim / 2 / 128));
+                    int const scale1Idx = permutedIdx + totalNumPaddedTokens * (hiddenIdx / 128);
+                    int const scale2Idx
+                        = permutedIdx + totalNumPaddedTokens * ((hiddenIdx / 128) + (params.innerDim / 2 / 128));
 
                     scale1Arr[tokenInCtaIdx] = params.inDqSfsPtr[scale1Idx];
                     scale2Arr[tokenInCtaIdx] = params.inDqSfsPtr[scale2Idx];
@@ -695,9 +693,8 @@ __global__ void permuteKernel(KernelParams params)
                     int const expandedIdx = tokenIdx * params.topK + k;
                     int const permutedIdx = params.expandedIdxToPermutedIdx[expandedIdx];
 
-                    int64_t const idx_in = tokenIdx + static_cast<int64_t>(params.numTokens) * scaleIdx;
-                    int64_t const idx_out
-                        = permutedIdx + static_cast<int64_t>(params.totalNumPaddedTokens[0]) * scaleIdx;
+                    int const idx_in = tokenIdx + params.numTokens * scaleIdx;
+                    int const idx_out = permutedIdx + params.totalNumPaddedTokens[0] * scaleIdx;
 
                     params.outDqSfsPtr[idx_out] = params.inDqSfsPtr[idx_in];
                 }
@@ -904,7 +901,7 @@ __global__ void finalizeDeepSeekKernel(KernelParams params)
                     continue;
                 }
                 int const totalNumPaddedTokens = params.totalNumPaddedTokens[0];
-                int64_t const scaleIdx = permutedIdx + static_cast<int64_t>(totalNumPaddedTokens) * (hiddenIdx / 128);
+                int const scaleIdx = permutedIdx + totalNumPaddedTokens * (hiddenIdx / 128);
                 float const blockScale = params.inDqSfsPtr ? params.inDqSfsPtr[scaleIdx] : 1;
 
                 float const expertProb = (float) params.expertWeightsPtr[tokenIdx * params.topK + k];
@@ -926,7 +923,7 @@ __global__ void finalizeDeepSeekKernel(KernelParams params)
                 if (params.outDqSfsPtr)
                 {
                     s_scaleOut = aMax / E4m3MaxVal;
-                    int64_t const scaleOut_idx = tokenIdx + static_cast<int64_t>(hiddenIdx / 128) * params.numTokens;
+                    int const scaleOut_idx = tokenIdx + hiddenIdx / 128 * params.numTokens;
                     params.outDqSfsPtr[scaleOut_idx] = aMax / E4m3MaxVal;
                 }
                 else
