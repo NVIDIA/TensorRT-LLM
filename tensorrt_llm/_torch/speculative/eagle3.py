@@ -395,6 +395,10 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
     # for the first loop iteration and per-sequence token counts for
     # subsequent iterations.
     subseq_all_rank_num_tokens: Optional[List[int]] = None
+    # Real (unpadded) scheduled token count for the target forward. Captured in
+    # prepare() before self.num_tokens is decremented to the attention-DP subseq
+    # shape; maybe_capture_hidden_states must bound by this, not self.num_tokens.
+    num_capture_tokens: int = 0
 
     def __post_init__(self):
         if self.layers_to_capture is None:
@@ -487,6 +491,12 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
                                      pin_memory=prefer_pinned())
         self.batch_indices_cuda[:num_seqs].copy_(batch_indices,
                                                  non_blocking=True)
+        # Snapshot the real (unpadded) scheduled token count before the decrement
+        # below. maybe_capture_hidden_states runs during the target forward and
+        # must bound the capture by this count; self.num_tokens is about to be
+        # rewritten to the attention-DP subseq shape and would otherwise drop the
+        # draft-verification positions from the captured hidden states.
+        self.num_capture_tokens = self.num_tokens
         # `num_tokens` here only feeds the attention-DP shape hint
         # (allgathered in model_engine and overridden into
         # `attn_metadata.all_rank_num_tokens` on the step-0 draft forward).
@@ -529,7 +539,32 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
 
         for i, captured_layer_id in enumerate(self.layers_to_capture):
             if captured_layer_id == layer_id:
-                to_save = hidden_states + residual if residual is not None else hidden_states
+                assert self.hidden_states is not None
+                # CUDA graph padding can make hidden_states larger than the
+                # scheduled token count. Capture only real tokens; otherwise
+                # EAGLE one-model can overrun the preallocated capture buffer.
+                # Use num_capture_tokens (the real scheduled token count), not
+                # self.num_tokens which prepare() decremented to the
+                # attention-DP subseq shape.
+                num_tokens = self.num_capture_tokens
+                if num_tokens > self.hidden_states.shape[0]:
+                    raise RuntimeError(
+                        "EAGLE3 hidden-state capture token count exceeds "
+                        f"buffer capacity: num_tokens={num_tokens}, "
+                        f"capacity={self.hidden_states.shape[0]}")
+                if num_tokens > hidden_states.shape[0]:
+                    raise RuntimeError(
+                        "EAGLE3 hidden-state capture token count exceeds "
+                        f"available hidden states: num_tokens={num_tokens}, "
+                        f"hidden_states={hidden_states.shape[0]}")
+                to_save = hidden_states[:num_tokens]
+                if residual is not None:
+                    if num_tokens > residual.shape[0]:
+                        raise RuntimeError(
+                            "EAGLE3 hidden-state capture token count exceeds "
+                            f"available residual states: num_tokens={num_tokens}, "
+                            f"residual={residual.shape[0]}")
+                    to_save = to_save + residual[:num_tokens]
                 inplace_slice_copy(self.hidden_states, to_save,
                                    i * self.hidden_size,
                                    (i + 1) * self.hidden_size)

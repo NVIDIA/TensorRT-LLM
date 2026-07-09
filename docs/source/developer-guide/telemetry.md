@@ -18,6 +18,9 @@ unless a field carries an explicit allowlist (`TelemetryField.categorical(...)`)
 and any field may opt out with `telemetry=False`. Every captured field is listed
 below; the runtime can capture nothing absent from this list.
 
+If the manifest check fails, run `python3 scripts/generate_llm_args_golden_manifest.py`, then commit
+`tensorrt_llm/usage/llm_args_golden_manifest.json`; new fields require telemetry/privacy CODEOWNER approval.
+
 ## LLM API Configuration Fields
 
 A field can still be absent from a specific payload when its parent config is
@@ -25,7 +28,7 @@ unset or when the safety sanitizer rejects the runtime value.
 
 ### `TorchLlmArgs`
 
-234 captured fields.
+258 captured fields.
 
 | Captured key | Annotation | Kind | Converter | Allowed values |
 |--------------|------------|------|-----------|----------------|
@@ -33,10 +36,13 @@ unset or when the safety sanitizer rejects the runtime value.
 | `attention_dp_config.batching_wait_iters` | `<class 'int'>` | `value` |  |  |
 | `attention_dp_config.enable_balance` | `<class 'bool'>` | `value` |  |  |
 | `attention_dp_config.enable_kv_cache_aware_routing` | `<class 'bool'>` | `value` |  |  |
+| `attention_dp_config.kv_cache_routing_account_for_in_transfer` | `<class 'bool'>` | `value` |  |  |
 | `attention_dp_config.kv_cache_routing_cold_start_warmup` | `<class 'bool'>` | `value` |  |  |
+| `attention_dp_config.kv_cache_routing_conversation_affinity` | `<class 'bool'>` | `value` |  |  |
 | `attention_dp_config.kv_cache_routing_fair_share_multiplier` | `<class 'float'>` | `value` |  |  |
 | `attention_dp_config.kv_cache_routing_load_balance_weight` | `<class 'float'>` | `value` |  |  |
 | `attention_dp_config.kv_cache_routing_match_rate_threshold` | `<class 'float'>` | `value` |  |  |
+| `attention_dp_config.kv_cache_routing_max_sessions` | `<class 'int'>` | `value` |  |  |
 | `attention_dp_config.timeout_iters` | `<class 'int'>` | `value` |  |  |
 | `attn_backend` | `<class 'str'>` | `categorical` | allowlist | `VANILLA`, `TRTLLM`, `FLASHINFER`, `FLASHINFER_STAR_ATTENTION` |
 | `backend` | `Literal['pytorch']` | `categorical` |  | `pytorch` |
@@ -44,6 +50,7 @@ unset or when the safety sanitizer rejects the runtime value.
 | `batch_wait_timeout_iters` | `<class 'int'>` | `value` |  |  |
 | `batch_wait_timeout_ms` | `<class 'float'>` | `value` |  |  |
 | `cache_transceiver_config.backend` | `Optional[Literal['DEFAULT', 'UCX', 'NIXL', 'MOONCAKE', 'MPI']]` | `categorical` |  | `DEFAULT`, `UCX`, `NIXL`, `MOONCAKE`, `MPI` |
+| `cache_transceiver_config.kv_transfer_poll_interval_ms` | `Optional[Annotated[int, Gt(gt=0)]]` | `value` |  |  |
 | `cache_transceiver_config.kv_transfer_sender_future_timeout_ms` | `Optional[Annotated[int, Gt(gt=0)]]` | `value` |  |  |
 | `cache_transceiver_config.kv_transfer_timeout_ms` | `Optional[Annotated[int, Gt(gt=0)]]` | `value` |  |  |
 | `cache_transceiver_config.max_tokens_in_buffer` | `Optional[int]` | `value` |  |  |
@@ -85,6 +92,8 @@ unset or when the safety sanitizer rejects the runtime value.
 | `enable_resource_governor` | `<class 'bool'>` | `value` |  |  |
 | `enable_speculative_beam_history_d2h` | `<class 'bool'>` | `value` |  |  |
 | `encode_only` | `<class 'bool'>` | `value` |  |  |
+| `encoder_max_batch_size` | `Optional[int]` | `value` |  |  |
+| `encoder_max_num_tokens` | `Optional[int]` | `value` |  |  |
 | `force_dynamic_quantization` | `<class 'bool'>` | `value` |  |  |
 | `garbage_collection_gen0_threshold` | `<class 'int'>` | `value` |  |  |
 | `gather_generation_logits` | `<class 'bool'>` | `value` |  |  |
@@ -93,15 +102,22 @@ unset or when the safety sanitizer rejects the runtime value.
 | `guided_decoding_backend` | `Optional[Literal['xgrammar', 'llguidance']]` | `categorical` |  | `xgrammar`, `llguidance` |
 | `iter_stats_max_iterations` | `Optional[int]` | `value` |  |  |
 | `kv_cache_config.attention_dp_events_gather_period_ms` | `<class 'int'>` | `value` |  |  |
+| `kv_cache_config.avg_seq_len` | `Optional[Annotated[int, Gt(gt=0)]]` | `value` |  |  |
+| `kv_cache_config.block_reuse_policy` | `Literal['all_reusable', 'per_request']` | `categorical` |  | `all_reusable`, `per_request` |
 | `kv_cache_config.copy_on_partial_reuse` | `<class 'bool'>` | `value` |  |  |
 | `kv_cache_config.cross_kv_cache_fraction` | `Optional[float]` | `value` |  |  |
+| `kv_cache_config.disk_cache_size` | `Optional[Annotated[int, Ge(ge=0)]]` | `value` |  |  |
+| `kv_cache_config.disk_prefetch_num_reqs` | `<class 'int'>` | `value` |  |  |
 | `kv_cache_config.dtype` | `<class 'str'>` | `categorical` | allowlist | `auto`, `float16`, `bfloat16`, `float32`, `fp8`, `nvfp4` |
 | `kv_cache_config.enable_block_reuse` | `<class 'bool'>` | `value` |  |  |
+| `kv_cache_config.enable_kv_pool_rebalance` | `<class 'bool'>` | `value` |  |  |
 | `kv_cache_config.enable_partial_reuse` | `<class 'bool'>` | `value` |  |  |
+| `kv_cache_config.enable_swa_scratch_reuse` | `<class 'bool'>` | `value` |  |  |
 | `kv_cache_config.event_buffer_max_size` | `<class 'int'>` | `value` |  |  |
 | `kv_cache_config.free_gpu_memory_fraction` | `Optional[float]` | `value` |  |  |
 | `kv_cache_config.host_cache_size` | `Optional[int]` | `value` |  |  |
 | `kv_cache_config.iteration_stats_interval` | `<class 'int'>` | `value` |  |  |
+| `kv_cache_config.kv_cache_event_hash_algo` | `Literal['auto', 'v1_block_key', 'v2_sha256', 'v2_sha256_64']` | `categorical` |  | `auto`, `v1_block_key`, `v2_sha256`, `v2_sha256_64` |
 | `kv_cache_config.mamba_ssm_cache_dtype` | `Literal['auto', 'float16', 'bfloat16', 'float32']` | `categorical` |  | `auto`, `float16`, `bfloat16`, `float32` |
 | `kv_cache_config.mamba_ssm_philox_rounds` | `<class 'int'>` | `value` |  |  |
 | `kv_cache_config.mamba_ssm_stochastic_rounding` | `<class 'bool'>` | `value` |  |  |
@@ -110,6 +126,7 @@ unset or when the safety sanitizer rejects the runtime value.
 | `kv_cache_config.max_gpu_total_bytes` | `<class 'int'>` | `value` |  |  |
 | `kv_cache_config.max_tokens` | `Optional[int]` | `value` |  |  |
 | `kv_cache_config.max_util_for_resume` | `<class 'float'>` | `value` |  |  |
+| `kv_cache_config.pool_ratio` | `Optional[List[float]]` | `value` |  |  |
 | `kv_cache_config.secondary_offload_min_priority` | `Optional[int]` | `value` |  |  |
 | `kv_cache_config.sink_token_length` | `Optional[int]` | `value` |  |  |
 | `kv_cache_config.tokens_per_block` | `<class 'int'>` | `value` |  |  |
@@ -132,7 +149,7 @@ unset or when the safety sanitizer rejects the runtime value.
 | `max_stats_len` | `<class 'int'>` | `value` |  |  |
 | `mm_encoder_only` | `<class 'bool'>` | `value` |  |  |
 | `moe_cluster_parallel_size` | `Optional[int]` | `value` |  |  |
-| `moe_config.backend` | `Literal['AUTO', 'CUTLASS', 'CUTEDSL', 'WIDEEP', 'TRTLLM', 'DEEPGEMM', 'DENSEGEMM', 'VANILLA', 'TRITON']` | `categorical` |  | `AUTO`, `CUTLASS`, `CUTEDSL`, `WIDEEP`, `TRTLLM`, `DEEPGEMM`, `DENSEGEMM`, `VANILLA`, `TRITON` |
+| `moe_config.backend` | `Literal['AUTO', 'CUTLASS', 'CUTEDSL', 'WIDEEP', 'TRTLLM', 'DEEPGEMM', 'DENSEGEMM', 'VANILLA', 'TRITON', 'MARLIN', 'MEGAMOE_DEEPGEMM']` | `categorical` |  | `AUTO`, `CUTLASS`, `CUTEDSL`, `WIDEEP`, `TRTLLM`, `DEEPGEMM`, `DENSEGEMM`, `VANILLA`, `TRITON`, `MARLIN`, `MEGAMOE_DEEPGEMM` |
 | `moe_config.disable_finalize_fusion` | `<class 'bool'>` | `value` |  |  |
 | `moe_config.max_num_tokens` | `Optional[int]` | `value` |  |  |
 | `moe_config.use_low_precision_moe_combine` | `<class 'bool'>` | `value` |  |  |
@@ -141,7 +158,7 @@ unset or when the safety sanitizer rejects the runtime value.
 | `mx_config.preshard_strategy` | `<class 'str'>` | `categorical` | allowlist | `per_module` |
 | `mx_config.server_query_timeout_s` | `Optional[Annotated[int, Ge(ge=0)]]` | `value` |  |  |
 | `num_postprocess_workers` | `<class 'int'>` | `value` |  |  |
-| `nvfp4_gemm_config.allowed_backends` | `List[Literal['cutlass', 'cublaslt', 'cutedsl', 'cuda_core']]` | `value` |  | `cutlass`, `cublaslt`, `cutedsl`, `cuda_core` |
+| `nvfp4_gemm_config.allowed_backends` | `List[Literal['cutlass', 'cublaslt', 'cutedsl', 'cuda_core', 'marlin']]` | `value` |  | `cutlass`, `cublaslt`, `cutedsl`, `cuda_core`, `marlin` |
 | `orchestrator_type` | `Optional[Literal['rpc', 'ray']]` | `categorical` |  | `rpc`, `ray` |
 | `peft_cache_config.device_cache_percent` | `<class 'float'>` | `value` |  |  |
 | `peft_cache_config.host_cache_size` | `<class 'int'>` | `value` |  |  |
@@ -185,7 +202,8 @@ unset or when the safety sanitizer rejects the runtime value.
 | `scheduler_config.use_python_scheduler` | `<class 'bool'>` | `value` |  |  |
 | `scheduler_config.waiting_queue_policy` | `<enum 'WaitingQueuePolicy'>` | `categorical` |  | `fcfs`, `priority` |
 | `skip_tokenizer_init` | `<class 'bool'>` | `value` |  |  |
-| `sparse_attention_config.algorithm` | `Literal['dsa']` | `categorical` |  | `dsa`, `rocket`, `skip_softmax` |
+| `sparse_attention_config.algorithm` | `Literal['dsa']` | `categorical` |  | `dsa`, `deepseek_v4`, `minimax_m3`, `rocket`, `skip_softmax` |
+| `sparse_attention_config.compress_ratios` | `List[int]` | `value` |  |  |
 | `sparse_attention_config.enable_heuristic_topk` | `<class 'bool'>` | `value` |  |  |
 | `sparse_attention_config.index_head_dim` | `Optional[int]` | `value` |  |  |
 | `sparse_attention_config.index_n_heads` | `Optional[int]` | `value` |  |  |
@@ -200,11 +218,19 @@ unset or when the safety sanitizer rejects the runtime value.
 | `sparse_attention_config.q_split_threshold` | `<class 'int'>` | `value` |  |  |
 | `sparse_attention_config.seq_len_threshold` | `Optional[int]` | `value` |  |  |
 | `sparse_attention_config.skip_indexer_for_short_seqs` | `<class 'bool'>` | `value` |  |  |
+| `sparse_attention_config.sparse_block_size` | `<class 'int'>` | `value` |  |  |
+| `sparse_attention_config.sparse_disable_index_value` | `<class 'bool'>` | `value` |  |  |
+| `sparse_attention_config.sparse_index_dim` | `<class 'int'>` | `value` |  |  |
+| `sparse_attention_config.sparse_init_blocks` | `<class 'int'>` | `value` |  |  |
+| `sparse_attention_config.sparse_local_blocks` | `<class 'int'>` | `value` |  |  |
+| `sparse_attention_config.sparse_num_index_heads` | `<class 'int'>` | `value` |  |  |
+| `sparse_attention_config.sparse_score_type` | `Literal['max']` | `categorical` |  | `max` |
+| `sparse_attention_config.sparse_topk_blocks` | `<class 'int'>` | `value` |  |  |
 | `sparse_attention_config.topk` | `Optional[int]` | `value` |  |  |
 | `sparse_attention_config.topr` | `Union[int, float, NoneType]` | `value` |  |  |
 | `sparse_attention_config.use_cute_dsl_paged_mqa_logits` | `<class 'bool'>` | `value` |  |  |
 | `sparse_attention_config.use_cute_dsl_topk` | `<class 'bool'>` | `value` |  |  |
-| `sparse_attention_config.window_size` | `Optional[int]` | `value` |  |  |
+| `sparse_attention_config.window_size` | `<class 'int'>` | `value` |  |  |
 | `speculative_config.acceptance_length_threshold` | `Optional[Annotated[float, Ge(ge=0)]]` | `value` |  |  |
 | `speculative_config.acceptance_window` | `Optional[Annotated[int, Ge(ge=0)]]` | `value` |  |  |
 | `speculative_config.allow_advanced_sampling` | `<class 'bool'>` | `value` |  |  |
@@ -267,7 +293,7 @@ unset or when the safety sanitizer rejects the runtime value.
 
 ### `TrtLlmArgs`
 
-260 captured fields.
+279 captured fields.
 
 | Captured key | Annotation | Kind | Converter | Allowed values |
 |--------------|------------|------|-----------|----------------|
@@ -343,6 +369,7 @@ unset or when the safety sanitizer rejects the runtime value.
 | `build_config.weight_sparsity` | `<class 'bool'>` | `value` |  |  |
 | `build_config.weight_streaming` | `<class 'bool'>` | `value` |  |  |
 | `cache_transceiver_config.backend` | `Optional[Literal['DEFAULT', 'UCX', 'NIXL', 'MOONCAKE', 'MPI']]` | `categorical` |  | `DEFAULT`, `UCX`, `NIXL`, `MOONCAKE`, `MPI` |
+| `cache_transceiver_config.kv_transfer_poll_interval_ms` | `Optional[Annotated[int, Gt(gt=0)]]` | `value` |  |  |
 | `cache_transceiver_config.kv_transfer_sender_future_timeout_ms` | `Optional[Annotated[int, Gt(gt=0)]]` | `value` |  |  |
 | `cache_transceiver_config.kv_transfer_timeout_ms` | `Optional[Annotated[int, Gt(gt=0)]]` | `value` |  |  |
 | `cache_transceiver_config.max_tokens_in_buffer` | `Optional[int]` | `value` |  |  |
@@ -382,15 +409,22 @@ unset or when the safety sanitizer rejects the runtime value.
 | `guided_decoding_backend` | `Optional[Literal['xgrammar', 'llguidance']]` | `categorical` |  | `xgrammar`, `llguidance` |
 | `iter_stats_max_iterations` | `Optional[int]` | `value` |  |  |
 | `kv_cache_config.attention_dp_events_gather_period_ms` | `<class 'int'>` | `value` |  |  |
+| `kv_cache_config.avg_seq_len` | `Optional[Annotated[int, Gt(gt=0)]]` | `value` |  |  |
+| `kv_cache_config.block_reuse_policy` | `Literal['all_reusable', 'per_request']` | `categorical` |  | `all_reusable`, `per_request` |
 | `kv_cache_config.copy_on_partial_reuse` | `<class 'bool'>` | `value` |  |  |
 | `kv_cache_config.cross_kv_cache_fraction` | `Optional[float]` | `value` |  |  |
+| `kv_cache_config.disk_cache_size` | `Optional[Annotated[int, Ge(ge=0)]]` | `value` |  |  |
+| `kv_cache_config.disk_prefetch_num_reqs` | `<class 'int'>` | `value` |  |  |
 | `kv_cache_config.dtype` | `<class 'str'>` | `categorical` | allowlist | `auto`, `float16`, `bfloat16`, `float32`, `fp8`, `nvfp4` |
 | `kv_cache_config.enable_block_reuse` | `<class 'bool'>` | `value` |  |  |
+| `kv_cache_config.enable_kv_pool_rebalance` | `<class 'bool'>` | `value` |  |  |
 | `kv_cache_config.enable_partial_reuse` | `<class 'bool'>` | `value` |  |  |
+| `kv_cache_config.enable_swa_scratch_reuse` | `<class 'bool'>` | `value` |  |  |
 | `kv_cache_config.event_buffer_max_size` | `<class 'int'>` | `value` |  |  |
 | `kv_cache_config.free_gpu_memory_fraction` | `Optional[float]` | `value` |  |  |
 | `kv_cache_config.host_cache_size` | `Optional[int]` | `value` |  |  |
 | `kv_cache_config.iteration_stats_interval` | `<class 'int'>` | `value` |  |  |
+| `kv_cache_config.kv_cache_event_hash_algo` | `Literal['auto', 'v1_block_key', 'v2_sha256', 'v2_sha256_64']` | `categorical` |  | `auto`, `v1_block_key`, `v2_sha256`, `v2_sha256_64` |
 | `kv_cache_config.mamba_ssm_cache_dtype` | `Literal['auto', 'float16', 'bfloat16', 'float32']` | `categorical` |  | `auto`, `float16`, `bfloat16`, `float32` |
 | `kv_cache_config.mamba_ssm_philox_rounds` | `<class 'int'>` | `value` |  |  |
 | `kv_cache_config.mamba_ssm_stochastic_rounding` | `<class 'bool'>` | `value` |  |  |
@@ -399,6 +433,7 @@ unset or when the safety sanitizer rejects the runtime value.
 | `kv_cache_config.max_gpu_total_bytes` | `<class 'int'>` | `value` |  |  |
 | `kv_cache_config.max_tokens` | `Optional[int]` | `value` |  |  |
 | `kv_cache_config.max_util_for_resume` | `<class 'float'>` | `value` |  |  |
+| `kv_cache_config.pool_ratio` | `Optional[List[float]]` | `value` |  |  |
 | `kv_cache_config.secondary_offload_min_priority` | `Optional[int]` | `value` |  |  |
 | `kv_cache_config.sink_token_length` | `Optional[int]` | `value` |  |  |
 | `kv_cache_config.tokens_per_block` | `<class 'int'>` | `value` |  |  |
@@ -446,11 +481,11 @@ unset or when the safety sanitizer rejects the runtime value.
 | `quant_config.clamp_val` | `Optional[List[float]]` | `value` |  |  |
 | `quant_config.group_size` | `Optional[int]` | `value` |  |  |
 | `quant_config.has_zero_point` | `<class 'bool'>` | `value` |  |  |
-| `quant_config.kv_cache_quant_algo` | `Optional[tensorrt_llm.quantization.mode.QuantAlgo]` | `categorical` |  | `W8A16`, `W4A16`, `W4A16_AWQ`, `W4A8_AWQ`, `W8A16_GPTQ`, `W4A16_GPTQ`, `W8A8_SQ_PER_CHANNEL`, `W8A8_SQ_PER_TENSOR_PLUGIN`, `W8A8_SQ_PER_CHANNEL_PER_TOKEN_PLUGIN`, `W8A8_SQ_PER_CHANNEL_PER_TENSOR_PLUGIN`, `W8A8_SQ_PER_TENSOR_PER_TOKEN_PLUGIN`, `W4A8_QSERVE_PER_GROUP`, `W4A8_QSERVE_PER_CHANNEL`, `FP8`, `FP8_PER_CHANNEL_PER_TOKEN`, `FP8_BLOCK_SCALES`, `INT8`, `MIXED_PRECISION`, `NVFP4`, `W4A8_NVFP4_FP8`, `W4A8_MXFP4_FP8`, `W4A8_MXFP4_MXFP8`, `W4A16_MXFP4`, `NVFP4_AWQ`, `NVFP4_ARC`, `NO_QUANT` |
+| `quant_config.kv_cache_quant_algo` | `Optional[tensorrt_llm.quantization.mode.QuantAlgo]` | `categorical` |  | `W8A16`, `W4A16`, `W4A16_AWQ`, `W4A8_AWQ`, `W8A16_GPTQ`, `W4A16_GPTQ`, `W8A8_SQ_PER_CHANNEL`, `W8A8_SQ_PER_TENSOR_PLUGIN`, `W8A8_SQ_PER_CHANNEL_PER_TOKEN_PLUGIN`, `W8A8_SQ_PER_CHANNEL_PER_TENSOR_PLUGIN`, `W8A8_SQ_PER_TENSOR_PER_TOKEN_PLUGIN`, `W4A8_QSERVE_PER_GROUP`, `W4A8_QSERVE_PER_CHANNEL`, `FP8`, `FP8_PER_CHANNEL_PER_TOKEN`, `FP8_BLOCK_SCALES`, `INT8`, `MIXED_PRECISION`, `NVFP4`, `W4A8_NVFP4_FP8`, `W4A8_MXFP4_FP8`, `W4A8_MXFP4_MXFP8`, `W4A16_MXFP4`, `MXFP8`, `NVFP4_AWQ`, `NVFP4_ARC`, `NO_QUANT` |
 | `quant_config.mamba_ssm_philox_rounds` | `<class 'int'>` | `value` |  |  |
 | `quant_config.mamba_ssm_stochastic_rounding` | `<class 'bool'>` | `value` |  |  |
 | `quant_config.pre_quant_scale` | `<class 'bool'>` | `value` |  |  |
-| `quant_config.quant_algo` | `Optional[tensorrt_llm.quantization.mode.QuantAlgo]` | `categorical` |  | `W8A16`, `W4A16`, `W4A16_AWQ`, `W4A8_AWQ`, `W8A16_GPTQ`, `W4A16_GPTQ`, `W8A8_SQ_PER_CHANNEL`, `W8A8_SQ_PER_TENSOR_PLUGIN`, `W8A8_SQ_PER_CHANNEL_PER_TOKEN_PLUGIN`, `W8A8_SQ_PER_CHANNEL_PER_TENSOR_PLUGIN`, `W8A8_SQ_PER_TENSOR_PER_TOKEN_PLUGIN`, `W4A8_QSERVE_PER_GROUP`, `W4A8_QSERVE_PER_CHANNEL`, `FP8`, `FP8_PER_CHANNEL_PER_TOKEN`, `FP8_BLOCK_SCALES`, `INT8`, `MIXED_PRECISION`, `NVFP4`, `W4A8_NVFP4_FP8`, `W4A8_MXFP4_FP8`, `W4A8_MXFP4_MXFP8`, `W4A16_MXFP4`, `NVFP4_AWQ`, `NVFP4_ARC`, `NO_QUANT` |
+| `quant_config.quant_algo` | `Optional[tensorrt_llm.quantization.mode.QuantAlgo]` | `categorical` |  | `W8A16`, `W4A16`, `W4A16_AWQ`, `W4A8_AWQ`, `W8A16_GPTQ`, `W4A16_GPTQ`, `W8A8_SQ_PER_CHANNEL`, `W8A8_SQ_PER_TENSOR_PLUGIN`, `W8A8_SQ_PER_CHANNEL_PER_TOKEN_PLUGIN`, `W8A8_SQ_PER_CHANNEL_PER_TENSOR_PLUGIN`, `W8A8_SQ_PER_TENSOR_PER_TOKEN_PLUGIN`, `W4A8_QSERVE_PER_GROUP`, `W4A8_QSERVE_PER_CHANNEL`, `FP8`, `FP8_PER_CHANNEL_PER_TOKEN`, `FP8_BLOCK_SCALES`, `INT8`, `MIXED_PRECISION`, `NVFP4`, `W4A8_NVFP4_FP8`, `W4A8_MXFP4_FP8`, `W4A8_MXFP4_MXFP8`, `W4A16_MXFP4`, `MXFP8`, `NVFP4_AWQ`, `NVFP4_ARC`, `NO_QUANT` |
 | `quant_config.smoothquant_val` | `<class 'float'>` | `value` |  |  |
 | `quant_config.use_meta_recipe` | `<class 'bool'>` | `value` |  |  |
 | `reasoning_parser` | `Optional[str]` | `categorical` | allowlist | `auto`, `deepseek-r1`, `laguna`, `qwen3`, `qwen3_5`, `minimax_m2`, `minimax_m2_append_think`, `nano-v3`, `gemma4`, `kimi_k2`, `kimi_k25` |
@@ -465,7 +500,8 @@ unset or when the safety sanitizer rejects the runtime value.
 | `scheduler_config.use_python_scheduler` | `<class 'bool'>` | `value` |  |  |
 | `scheduler_config.waiting_queue_policy` | `<enum 'WaitingQueuePolicy'>` | `categorical` |  | `fcfs`, `priority` |
 | `skip_tokenizer_init` | `<class 'bool'>` | `value` |  |  |
-| `sparse_attention_config.algorithm` | `Literal['dsa']` | `categorical` |  | `dsa`, `rocket`, `skip_softmax` |
+| `sparse_attention_config.algorithm` | `Literal['dsa']` | `categorical` |  | `dsa`, `deepseek_v4`, `minimax_m3`, `rocket`, `skip_softmax` |
+| `sparse_attention_config.compress_ratios` | `List[int]` | `value` |  |  |
 | `sparse_attention_config.enable_heuristic_topk` | `<class 'bool'>` | `value` |  |  |
 | `sparse_attention_config.index_head_dim` | `Optional[int]` | `value` |  |  |
 | `sparse_attention_config.index_n_heads` | `Optional[int]` | `value` |  |  |
@@ -480,11 +516,19 @@ unset or when the safety sanitizer rejects the runtime value.
 | `sparse_attention_config.q_split_threshold` | `<class 'int'>` | `value` |  |  |
 | `sparse_attention_config.seq_len_threshold` | `Optional[int]` | `value` |  |  |
 | `sparse_attention_config.skip_indexer_for_short_seqs` | `<class 'bool'>` | `value` |  |  |
+| `sparse_attention_config.sparse_block_size` | `<class 'int'>` | `value` |  |  |
+| `sparse_attention_config.sparse_disable_index_value` | `<class 'bool'>` | `value` |  |  |
+| `sparse_attention_config.sparse_index_dim` | `<class 'int'>` | `value` |  |  |
+| `sparse_attention_config.sparse_init_blocks` | `<class 'int'>` | `value` |  |  |
+| `sparse_attention_config.sparse_local_blocks` | `<class 'int'>` | `value` |  |  |
+| `sparse_attention_config.sparse_num_index_heads` | `<class 'int'>` | `value` |  |  |
+| `sparse_attention_config.sparse_score_type` | `Literal['max']` | `categorical` |  | `max` |
+| `sparse_attention_config.sparse_topk_blocks` | `<class 'int'>` | `value` |  |  |
 | `sparse_attention_config.topk` | `Optional[int]` | `value` |  |  |
 | `sparse_attention_config.topr` | `Union[int, float, NoneType]` | `value` |  |  |
 | `sparse_attention_config.use_cute_dsl_paged_mqa_logits` | `<class 'bool'>` | `value` |  |  |
 | `sparse_attention_config.use_cute_dsl_topk` | `<class 'bool'>` | `value` |  |  |
-| `sparse_attention_config.window_size` | `Optional[int]` | `value` |  |  |
+| `sparse_attention_config.window_size` | `<class 'int'>` | `value` |  |  |
 | `speculative_config.acceptance_length_threshold` | `Optional[Annotated[float, Ge(ge=0)]]` | `value` |  |  |
 | `speculative_config.acceptance_window` | `Optional[Annotated[int, Ge(ge=0)]]` | `value` |  |  |
 | `speculative_config.allow_advanced_sampling` | `<class 'bool'>` | `value` |  |  |
