@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import math
+import os
 from typing import Tuple
 
 import torch
@@ -419,6 +420,14 @@ class Mamba2Metadata:
                                                   device='cpu')
 
             self.has_initial_states_cpu[:num_contexts].copy_(initial_states_cpu)
+            # Warmup-only override: force HAS_INITSTATES=True path so the
+            # HAS_INITSTATES=True variants of _state_passing_fwd_kernel,
+            # _chunk_scan_fwd_kernel, and _chunk_state_varlen_kernel compile
+            # during warmup instead of the first real-request iter that hits
+            # chunked prefill with cached tokens.
+            if os.environ.get(
+                    "TLLM_MAMBA_WARMUP_FORCE_INITSTATES") == "1":
+                self.has_initial_states_cpu[:num_contexts].fill_(True)
             # Mirror CPU staging flags to the CUDA-side buffer asynchronously.
             self.has_initial_states[:num_contexts].copy_(
                 self.has_initial_states_cpu[:num_contexts], non_blocking=True)

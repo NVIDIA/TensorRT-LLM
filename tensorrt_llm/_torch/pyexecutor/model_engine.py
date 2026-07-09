@@ -1150,6 +1150,13 @@ class PyTorchModelEngine(ModelEngine):
         if not is_enc_dec and not self.mapping.has_cp_helix():
             self._run_autotuner_warmup(resource_manager)
             log_mem_snapshot("warmup/after_autotuner")
+            # Pre-JIT Mamba SSD multi-seq + HAS_INITSTATES=True Triton kernels
+            # for Mamba hybrid models. Runs regardless of enable_autotuner,
+            # since MambaHybridCacheManager skips _general_warmup and the
+            # default autotuner shape is single-seq / no-initstates. Safe
+            # no-op for non-Mamba models.
+            self._run_mamba_hybrid_warmup(resource_manager)
+            log_mem_snapshot("warmup/after_mamba_hybrid")
             # Release the autotuner's exploration-mode intermediates. The
             # exploration leftovers are pure waste that hide tens of GiB from
             # non-torch allocators (cuBLAS handle workspace, UCX/NIXL,
@@ -1488,6 +1495,115 @@ class PyTorchModelEngine(ModelEngine):
         # causes the global Buffers pool to cache large MoE/GEMM workspaces.
         # If not cleared, these inflate the memory baseline seen by the KV cache
         # profiler, reducing memory available for activations during inference.
+        clear_memory_buffers()
+        torch.cuda.empty_cache()
+
+    def _run_mamba_hybrid_warmup(self, resource_manager: ResourceManager):
+        """Pre-JIT the Mamba SSD multi-seq + HAS_INITSTATES=True Triton kernels.
+
+        Mamba hybrid models (e.g. Nemotron 3 Super 120B, Nemotron-Nano-12B-v2)
+        skip ``_general_warmup`` because ``can_run_general_warmup`` is False
+        when the KV cache manager is a ``MambaHybridCacheManager``. The default
+        ``_run_autotuner_warmup`` then issues a single ``least_requests=True``
+        prefill = 1 sequence with ``num_cached_tokens_per_seq = 0``, which only
+        compiles the ``num_seqs == 1`` / ``HAS_INITSTATES=False`` variants of
+        the SSD kernels. The first real serve iteration with chunked prefill
+        and multiple context requests then triggers autotune of the missing
+        variants mid-inference, producing a ~30 s stall / large P99 spike.
+
+        This method runs two extra forward passes to compile those variants
+        during warmup:
+
+        1. ``least_requests=False`` — splits ``curr_max_num_tokens`` into many
+           short sequences, forcing the multi-seq path of
+           ``cu_seqlens_to_chunk_indices_offsets_triton`` and its
+           ``_cu_seqlens_triton_kernel``.
+        2. ``least_requests=False`` with ``TLLM_MAMBA_WARMUP_FORCE_INITSTATES=1``
+           — same as (1) plus the ``HAS_INITSTATES=True`` variants of
+           ``_state_passing_fwd_kernel``, ``_chunk_scan_fwd_kernel``, and
+           ``_chunk_state_varlen_kernel``.
+
+        Runs regardless of ``enable_autotuner``. Wraps in ``autotune()`` when
+        the autotuner is enabled so op-level (M,N,K) caches also get primed
+        for these shapes. Set ``TLLM_MAMBA_MULTISEQ_WARMUP=0`` to disable.
+        """
+        if os.environ.get("TLLM_MAMBA_MULTISEQ_WARMUP", "1") != "1":
+            return
+        kv_cache_manager = resource_manager.get_resource_manager(
+            self.kv_cache_manager_key)
+        if kv_cache_manager is None or not isinstance(
+                kv_cache_manager, MambaHybridCacheManager):
+            return
+
+        token_num_upper_bound = min(self.max_num_tokens,
+                                    self.batch_size * (self.max_seq_len - 1))
+        curr_max_num_tokens = kv_cache_manager.get_num_available_tokens(
+            token_num_upper_bound=token_num_upper_bound,
+            max_num_draft_tokens=self.original_max_draft_len)
+        if curr_max_num_tokens < 4:
+            return
+
+        logger.info(
+            "Running Mamba hybrid warmup (multi-seq + HAS_INITSTATES=True)...")
+
+        @contextlib.contextmanager
+        def _force_mamba_initstates_env():
+            prev = os.environ.get("TLLM_MAMBA_WARMUP_FORCE_INITSTATES")
+            os.environ["TLLM_MAMBA_WARMUP_FORCE_INITSTATES"] = "1"
+            try:
+                yield
+            finally:
+                if prev is None:
+                    os.environ.pop(
+                        "TLLM_MAMBA_WARMUP_FORCE_INITSTATES", None)
+                else:
+                    os.environ["TLLM_MAMBA_WARMUP_FORCE_INITSTATES"] = prev
+
+        # (num_tokens, num_gen_requests, least_requests, force_initstates)
+        mamba_warmup_shapes = [
+            (curr_max_num_tokens, 0, False, False),
+            (curr_max_num_tokens, 0, False, True),
+        ]
+
+        autotuner_enabled = self.llm_args.enable_autotuner
+        cache_path = os.environ.get("TLLM_AUTOTUNER_CACHE_PATH", None)
+        autotune_ctx = (autotune(cache_path=cache_path)
+                        if autotuner_enabled else contextlib.nullcontext())
+
+        with self.no_cuda_graph(), autotune_ctx:
+            for (num_tokens_i, num_gen_requests_i, least_req_i,
+                 force_init_i) in mamba_warmup_shapes:
+                init_ctx = (_force_mamba_initstates_env()
+                            if force_init_i else contextlib.nullcontext())
+                with init_ctx:
+                    warmup_request = self._create_warmup_request(
+                        resource_manager, num_tokens_i, num_gen_requests_i,
+                        least_requests=least_req_i)
+                    with self._release_batch_context(
+                            warmup_request, resource_manager) as batch:
+                        if batch is None and self.mapping.tp_size <= 1:
+                            continue
+                        self._assert_all_tp_ranks_have_warmup_batch(
+                            batch, num_tokens_i)
+                        if batch is None:
+                            continue
+                        spec_resource_manager = resource_manager.get_resource_manager(
+                            ResourceManagerType.SPEC_RESOURCE_MANAGER)
+                        if self.is_draft_model and isinstance(
+                                spec_resource_manager, Eagle3ResourceManager):
+                            spec_resource_manager.is_first_draft = True
+
+                        self.forward(batch,
+                                     new_tensors_device=None,
+                                     resource_manager=resource_manager)
+
+                        if autotuner_enabled:
+                            AutoTuner.get().cache_pp_recv()
+                            AutoTuner.get().cache_pp_send()
+                            AutoTuner.get().clean_pp_flag()
+
+                        torch.cuda.synchronize()
+
         clear_memory_buffers()
         torch.cuda.empty_cache()
 
