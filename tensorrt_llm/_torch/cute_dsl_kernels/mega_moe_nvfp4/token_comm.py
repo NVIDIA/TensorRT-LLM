@@ -1324,10 +1324,14 @@ class TokenInPullTokenBackPush:
                             )
 
                 if cutlass.const_expr(self.push_sf):
-                    sf_local_addr = fc2_output_sf[pool_token_idx, 0,
+                    # Int64 like the DATA/metadata paths above: the Int32
+                    # row index would overflow the multi-GiB SF pool offset
+                    # at large max_tokens_per_rank x EP.
+                    sf_local_addr = fc2_output_sf[Int64(pool_token_idx), 0,
                                                   None].iterator.toint()
                     sf_peer_ptr = peer_rank_ptr_mapper.ptr_map_to_rank(
-                        combine_sf_u8[src_token, src_topk, None].iterator,
+                        combine_sf_u8[Int64(src_token), src_topk,
+                                      None].iterator,
                         src_rank,
                     )
                     for chunk in cutlass.range(num_sf_chunks, unroll=1):

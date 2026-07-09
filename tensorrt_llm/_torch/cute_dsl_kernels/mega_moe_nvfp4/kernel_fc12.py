@@ -838,10 +838,10 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
                 (tokens_sum_padded, cutlass.Int32(hidden_padded), c1),
                 self.sf_vec_size),
         )
-        intermediate_gateup_padded = round_up(
-            intermediate_gateup,
-            self.sf_vec_size * 4,
-        )
+        # M-side SF atom is 128 rows (same as the fc2 path below); the
+        # K-side ``sf_vec_size * 4`` granularity would understate the padded
+        # row count for non-128-aligned intermediate sizes.
+        intermediate_gateup_padded = round_up(intermediate_gateup, 128)
         expected_fc1_weight_sf_cols = (intermediate_gateup_padded *
                                        hidden_padded // self.sf_vec_size)
         if cutlass.const_expr(
