@@ -49,12 +49,12 @@ if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
         WriteThroughPolicy,
         rawref,
     )
-    from kv_cache_manager_v2._common import GPU_LEVEL, CacheLevel, LayerId, Priority
+    from kv_cache_manager_v2._common import GPU_LEVEL, BlockOrdinal, CacheLevel, LayerId, Priority
     from kv_cache_manager_v2._copy_engine import CopyTask
     from kv_cache_manager_v2._cuda_virt_mem import PooledPhysMemAllocator, VirtMem
     from kv_cache_manager_v2._exceptions import LogicError, OutOfPagesError
     from kv_cache_manager_v2._life_cycle_registry import LifeCycleId, LifeCycleRegistry
-    from kv_cache_manager_v2._page import Page
+    from kv_cache_manager_v2._page import CommittedPage, Page
     from kv_cache_manager_v2._sequence_arena import (
         INT31_MAX,
         BlockRangeAllocator,
@@ -87,6 +87,7 @@ else:
     )
     from tensorrt_llm.runtime.kv_cache_manager_v2._common import (
         GPU_LEVEL,
+        BlockOrdinal,
         CacheLevel,
         LayerId,
         Priority,
@@ -101,7 +102,7 @@ else:
         LifeCycleId,
         LifeCycleRegistry,
     )
-    from tensorrt_llm.runtime.kv_cache_manager_v2._page import Page
+    from tensorrt_llm.runtime.kv_cache_manager_v2._page import CommittedPage, Page
     from tensorrt_llm.runtime.kv_cache_manager_v2._sequence_arena import (
         INT31_MAX,
         BlockRangeAllocator,
@@ -2644,14 +2645,17 @@ class TestArenaPrefixAliasing(unittest.TestCase):
         self.assertEqual(budget.used_pages, 0)
 
     def test_dedup_remap_frees_commit_conflict_loser(self) -> None:
-        """P3 v2 pressure-time dedup at the manager seam: the loser shape.
+        """P3 v3 pressure-time dedup at the manager seam: the loser shape.
 
         A and B prefill the same tokens concurrently; A commits first
         (winner, owner-live span), B's commit takes the arena conflict
-        branch (sequence-private duplicates referencing A's tree blocks).
-        The dedup scan finds B, the remap re-backs B's prefix with A's
-        physical pages at the same VA -- B's holders, slots, and offsets
-        are untouched -- and the duplicates' budget charge is freed.
+        branch (sequence-private duplicates referencing A's tree blocks --
+        A is GPU-resident and span-covered, so mappability-weighted
+        resolution keeps A canonical) and flags B in the dedup dirty set.
+        hard_reclaim_gpu scans ONLY the flagged B (clearing the flag on the
+        attempt), the remap re-backs B's prefix with A's physical pages at
+        the same VA -- B's holders, slots, and offsets are untouched -- and
+        the duplicates' budget charge is freed.
         """
         manager = self.manager
         budget = manager._storage.gpu_page_budget
@@ -2675,15 +2679,20 @@ class TestArenaPrefixAliasing(unittest.TestCase):
             kv_a.commit(tokens)  # winner; owner-live span registers here
             kv_b.commit(tokens)  # loser -> private duplicates of A's blocks
             self.assertEqual(len(pg._canonical_spans), 1)
+            # R2: the commit-conflict loss to a MAPPABLE incumbent flagged
+            # exactly B in the dirty set; the winner is not flagged.
+            self.assertEqual(list(manager._arena_dedup_dirty.keys()), [id(kv_b)])
             used_before = budget.used_pages
             hits_before = pg.alias_hits
             misses_before = pg.alias_misses
 
-            freed = manager.dedup_remap_gpu(1 << 62)
+            freed = manager.hard_reclaim_gpu(1 << 62)
             self.assertEqual(freed, 1)  # 64 x 32KiB blocks = 1 chunk
             self.assertEqual(budget.used_pages, used_before - 1)
             self.assertEqual(pg.dedup_remapped_pages, 1)
             self.assertIsNotNone(kv_b._arena_ranges[PoolGroupIndex(0)]._alias_span_key)
+            # Clear-on-attempt: the scan consumed the flag.
+            self.assertEqual(len(manager._arena_dedup_dirty), 0)
             # The scan must not disturb the admission counters.
             self.assertEqual(pg.alias_hits, hits_before)
             self.assertEqual(pg.alias_misses, misses_before)
@@ -2692,8 +2701,10 @@ class TestArenaPrefixAliasing(unittest.TestCase):
             self._block_floats(a0).fill_(43.0)
             torch.cuda.synchronize()
             self.assertTrue(bool((self._block_floats(b0) == 43.0).all().item()))
-            # Idempotent: nothing left to dedup.
-            self.assertEqual(manager.dedup_remap_gpu(1 << 62), 0)
+            # Idempotent AND sync-free: the dirty set is empty, nothing is
+            # parked or pending, and the only span is owner-live (no
+            # registry excess) -- there is nothing to reclaim anywhere.
+            self.assertEqual(manager.hard_reclaim_gpu(1 << 62), 0)
             kv_b.close()
             kv_a.close()
         s.take_finish_event().synchronize()
@@ -2999,6 +3010,372 @@ class TestArenaSuspendHostExhaustion(unittest.TestCase):
             kv_b.close()
         s2.take_finish_event().synchronize()
         manager.drain_gpu_reclaim(CachedCudaEvent.NULL)
+
+
+class TestArenaV3HardReclaimAndPromotion(unittest.TestCase):
+    """P3 v3: hard-reclaim ladder + mappability-weighted promotion.
+
+    Covers the canonical-residency trap fix (once a canonical is evicted to
+    host and its span pin dies, every same-prefix admission would otherwise
+    copy from host forever), the destruction-ordered hard reclaim (dedup
+    before parked ranges), the dirty-set lifecycle, and the single-quiesce
+    discipline.
+    """
+
+    TPB = 16
+    PREFIX_BLOCKS = 64  # one full 2 MiB chunk of 32 KiB coalesced records
+
+    def setUp(self) -> None:
+        init_cuda_once()
+        cfg = _make_manager_config(gpu_quota=32 * MiB, host_quota=64 * MiB)
+        cfg.contiguous_arena = ContiguousArenaConfig(map_ahead_pages=0, prefix_aliasing=True)
+        self.manager = KVCacheManager(cfg)
+
+    def tearDown(self) -> None:
+        self.manager.shutdown()
+        del self.manager
+
+    def _block_floats(self, page_index: int) -> "torch.Tensor":
+        addr = int(
+            self.manager._storage.slot_address(
+                GPU_LEVEL, PoolGroupIndex(0), page_index, PoolIndex(0)
+            )
+        )
+        return TestSparseVirtMem._tensor_at(addr, (4 * 8192) // 4)
+
+    def _host_floats(self, slot_id: int) -> "torch.Tensor":
+        import ctypes
+
+        addr = int(
+            self.manager._storage.slot_address(
+                CacheLevel(1), PoolGroupIndex(0), slot_id, PoolIndex(0)
+            )
+        )
+        buf = (ctypes.c_float * ((4 * 8192) // 4)).from_address(addr)
+        return torch.frombuffer(buf, dtype=torch.float32)
+
+    def _pool_group(self):
+        return self.manager._storage._gpu_arena_storage().pool_group(PoolGroupIndex(0))
+
+    def _cap(self) -> int:
+        return (self.PREFIX_BLOCKS + 4) * self.TPB
+
+    def _spawn_owner_then_spill(self, tokens: "list[int]") -> "list[int]":
+        """A commits ``tokens`` and closes; then everything spillable is
+        spilled (parked range AND span pin), leaving the canonical entries
+        host-resident and UNMAPPABLE -- the trap precondition. Returns A's
+        host slot ids for the prefix, ordinal order.
+        """
+        manager = self.manager
+        kv_a = manager.create_kv_cache(max_capacity=self._cap())
+        with TemporaryCudaStream([]) as s:
+            self.assertTrue(kv_a.resume(CudaStream(s.handle)))
+            self.assertTrue(kv_a.resize(len(tokens)))
+            for j, idx in enumerate(list(kv_a.get_base_page_indices(LifeCycleId(0)))):
+                self._block_floats(idx).fill_(float(j))
+            torch.cuda.synchronize()
+            kv_a.commit(tokens)
+            blocks = [kv_a._get_tree_block(BlockOrdinal(o)) for o in range(self.PREFIX_BLOCKS)]
+            kv_a.close()
+        s.take_finish_event().synchronize()
+        manager.drain_gpu_reclaim(CachedCudaEvent.NULL)
+        torch.cuda.synchronize()
+        manager._storage.spill_gpu_retained(1 << 62)
+        pg = self._pool_group()
+        self.assertEqual(pg.canonical_span_pages, 0)  # span pin is gone
+        self.assertEqual(self.manager._storage.gpu_page_budget.used_pages, 0)
+        host_ids = []
+        for blk in blocks:
+            page = blk.storage[LifeCycleId(0)]()
+            self.assertIsNotNone(page)
+            self.assertNotEqual(page.cache_level, GPU_LEVEL)  # host-resident
+            host_ids.append(int(page.slot_id))
+        return host_ids
+
+    def test_onboard_promotion_breaks_canonical_residency_trap(self) -> None:
+        """The owner-found trap (P3 v3 R1(b)): A's canonicals are
+        host-resident with a dead span pin. C's admission copy-onboards --
+        and the promotion pass re-points every canonical entry to C's
+        GPU-resident copy, ADOPTING A's host slot (same slot id, no new
+        host allocation). C's context-end commit then registers a live
+        span over the promoted pages, so D ALIASES (zero-copy, proven by
+        corrupting the host bytes) instead of copying from host --
+        breaking the eternal-copy loop. C's close adopts the stolen slot
+        copy-free (the corrupted host bytes stay corrupted: no D2H copy
+        ran).
+        """
+        manager = self.manager
+        pg = self._pool_group()
+        n_tok = self.PREFIX_BLOCKS * self.TPB
+        tokens = [3000 + i for i in range(n_tok)]
+        a_host_ids = self._spawn_owner_then_spill(tokens)
+
+        kv_c = manager.create_kv_cache(input_tokens=tokens + [1, 2], max_capacity=self._cap())
+        self.assertEqual(kv_c.history_length, n_tok)
+        with TemporaryCudaStream([]) as s2:
+            self.assertTrue(kv_c.resume(CudaStream(s2.handle)))
+            # Promotion: every prefix canonical is now C's GPU page...
+            c_indices = list(kv_c.get_base_page_indices(LifeCycleId(0)))[: self.PREFIX_BLOCKS]
+            for o in range(self.PREFIX_BLOCKS):
+                entry = kv_c._get_tree_block(BlockOrdinal(o)).storage[LifeCycleId(0)]()
+                self.assertIsNotNone(entry, f"block {o} canonical died")
+                self.assertEqual(entry.cache_level, GPU_LEVEL, f"block {o} not promoted")
+                self.assertEqual(int(entry.slot_id), int(c_indices[o]))
+                self.assertIs(type(entry), CommittedPage)
+            # ...whose host slots were ADOPTED, not freed (same ids)...
+            stash_ids = [
+                int(kv_c._write_through_slots[(o, 0)].slot_id) for o in range(self.PREFIX_BLOCKS)
+            ]
+            self.assertEqual(stash_ids, a_host_ids)
+            # ...and nothing was flagged dirty (promotion is a win).
+            self.assertEqual(len(manager._arena_dedup_dirty), 0)
+            torch.cuda.synchronize()
+            for j, idx in enumerate(c_indices):
+                self.assertTrue(bool((self._block_floats(idx) == float(j)).all().item()))
+            # Context-end commit registers a live span over promoted pages.
+            self.assertTrue(kv_c.resize(n_tok + self.TPB))
+            kv_c.commit([1] * self.TPB)  # delta: the matched prefix is committed
+            self.assertEqual(len(pg._canonical_spans), 1)
+            # Corrupt the (adopted) host copies: correct bytes at D can then
+            # only arrive through the alias mapping.
+            for slot_id in a_host_ids:
+                self._host_floats(slot_id).fill_(-777.0)
+            hits_before = pg.alias_hits
+            kv_d = manager.create_kv_cache(input_tokens=tokens + [5, 6], max_capacity=self._cap())
+            with TemporaryCudaStream([]) as s3:
+                self.assertTrue(kv_d.resume(CudaStream(s3.handle)))
+                self.assertEqual(pg.alias_hits, hits_before + 1)
+                torch.cuda.synchronize()
+                d_indices = list(kv_d.get_base_page_indices(LifeCycleId(0)))
+                for j in range(self.PREFIX_BLOCKS):
+                    self.assertTrue(
+                        bool((self._block_floats(d_indices[j]) == float(j)).all().item()),
+                        f"block {j} not aliased from the promoted canonical",
+                    )
+                kv_d.close()
+            s3.take_finish_event().synchronize()
+            kv_c.close()
+        s2.take_finish_event().synchronize()
+        manager.drain_gpu_reclaim(CachedCudaEvent.NULL)
+        # Copy-free adoption at close: the host bytes are still the
+        # corruption pattern -- no D2H copy overwrote them.
+        for slot_id in a_host_ids:
+            self.assertTrue(bool((self._host_floats(slot_id) == -777.0).all().item()))
+        torch.cuda.synchronize()
+        manager._storage.spill_gpu_retained(1 << 62)
+
+    def test_commit_conflict_promotes_over_host_incumbent(self) -> None:
+        """P3 v3 R1(a), the staggered no-match arrival: C admitted before
+        A commits (empty tree, no reuse match) computes the same tokens
+        itself; by the time C commits, A has closed, offloaded, and its
+        span pin was spilled. C's commit conflicts with the HOST-resident
+        incumbent -- and wins: C's page becomes canonical, A's host slot
+        is adopted, C is NOT flagged dirty, and C's own commit burst
+        registers a live span that a follower aliases mid-C-life.
+        """
+        manager = self.manager
+        pg = self._pool_group()
+        n_tok = self.PREFIX_BLOCKS * self.TPB
+        tokens = [4000 + i for i in range(n_tok)]
+        kv_c = manager.create_kv_cache(max_capacity=self._cap())  # BEFORE any commit
+        a_host_ids = self._spawn_owner_then_spill(tokens)
+        with TemporaryCudaStream([]) as s:
+            self.assertTrue(kv_c.resume(CudaStream(s.handle)))
+            self.assertTrue(kv_c.resize(n_tok))
+            c_indices = list(kv_c.get_base_page_indices(LifeCycleId(0)))
+            for j, idx in enumerate(c_indices):
+                self._block_floats(idx).fill_(100.0 + j)
+            torch.cuda.synchronize()
+            kv_c.commit(tokens)  # conflicts with A's host-resident entries
+            for o in range(self.PREFIX_BLOCKS):
+                entry = kv_c._get_tree_block(BlockOrdinal(o)).storage[LifeCycleId(0)]()
+                self.assertIsNotNone(entry)
+                self.assertEqual(entry.cache_level, GPU_LEVEL, f"block {o} not promoted")
+                self.assertEqual(int(entry.slot_id), int(c_indices[o]))
+            stash_ids = [
+                int(kv_c._write_through_slots[(o, 0)].slot_id) for o in range(self.PREFIX_BLOCKS)
+            ]
+            self.assertEqual(stash_ids, a_host_ids)
+            self.assertEqual(len(manager._arena_dedup_dirty), 0)  # winner
+            # C's commit burst registered a live span over the promoted run.
+            self.assertEqual(len(pg._canonical_spans), 1)
+            hits_before = pg.alias_hits
+            kv_b = manager.create_kv_cache(input_tokens=tokens + [7, 8], max_capacity=self._cap())
+            with TemporaryCudaStream([]) as s2:
+                self.assertTrue(kv_b.resume(CudaStream(s2.handle)))
+                self.assertEqual(pg.alias_hits, hits_before + 1)
+                torch.cuda.synchronize()
+                b0 = list(kv_b.get_base_page_indices(LifeCycleId(0)))[0]
+                self.assertTrue(bool((self._block_floats(b0) == 100.0).all().item()))
+                kv_b.close()
+            s2.take_finish_event().synchronize()
+            kv_c.close()
+        s.take_finish_event().synchronize()
+        manager.drain_gpu_reclaim(CachedCudaEvent.NULL)
+        torch.cuda.synchronize()
+        manager._storage.spill_gpu_retained(1 << 62)
+
+    def test_promotion_window_race_becomes_productive_dedup(self) -> None:
+        """P3 v3 R1 window self-heal: D onboards right after C promoted but
+        BEFORE C's commit registered the live span -- D's copy sources are
+        C's GPU-resident canonicals (mappable), so D is NOT promoted; it is
+        flagged dirty instead, and once C's span registers, hard_reclaim
+        remaps D's duplicates onto C's pages (the productive dedup case).
+        """
+        manager = self.manager
+        pg = self._pool_group()
+        n_tok = self.PREFIX_BLOCKS * self.TPB
+        tokens = [5000 + i for i in range(n_tok)]
+        self._spawn_owner_then_spill(tokens)
+        budget = manager._storage.gpu_page_budget
+
+        kv_c = manager.create_kv_cache(input_tokens=tokens + [1, 2], max_capacity=self._cap())
+        with TemporaryCudaStream([]) as s, TemporaryCudaStream([]) as s2:
+            self.assertTrue(kv_c.resume(CudaStream(s.handle)))  # promotes
+            self.assertEqual(len(manager._arena_dedup_dirty), 0)
+            # D lands inside the window: canonical is C's live GPU page, no
+            # span registered yet -> D2D copy, not promoted, flagged dirty.
+            kv_d = manager.create_kv_cache(input_tokens=tokens + [3, 4], max_capacity=self._cap())
+            self.assertTrue(kv_d.resume(CudaStream(s2.handle)))
+            self.assertEqual(list(manager._arena_dedup_dirty.keys()), [id(kv_d)])
+            d_rng = kv_d._arena_ranges[PoolGroupIndex(0)]
+            self.assertIsNone(d_rng._alias_span_key)
+            # C's context-end commit registers the live span...
+            self.assertTrue(kv_c.resize(n_tok + self.TPB))
+            kv_c.commit([1] * self.TPB)  # delta: the matched prefix is committed
+            self.assertEqual(len(pg._canonical_spans), 1)
+            # ...and the hard reclaim dedups D onto it (clearing the flag).
+            used_before = budget.used_pages
+            freed = manager.hard_reclaim_gpu(1 << 62)
+            self.assertGreaterEqual(freed, 1)
+            self.assertEqual(budget.used_pages, used_before - freed)
+            self.assertEqual(len(manager._arena_dedup_dirty), 0)
+            self.assertIsNotNone(d_rng._alias_span_key)
+            self.assertGreaterEqual(pg.dedup_remapped_pages, 1)
+            kv_d.close()
+            kv_c.close()
+        s.take_finish_event().synchronize()
+        s2.take_finish_event().synchronize()
+        manager.drain_gpu_reclaim(CachedCudaEvent.NULL)
+        torch.cuda.synchronize()
+        manager._storage.spill_gpu_retained(1 << 62)
+
+    def test_hard_reclaim_dedups_before_spilling_parked_ranges(self) -> None:
+        """Destruction order: a sufficient dedup harvest PRESERVES parked
+        ranges (they carry adoption/D2D value; duplicates carry none).
+        """
+        manager = self.manager
+        pg = self._pool_group()
+        n_tok = self.PREFIX_BLOCKS * self.TPB
+        tokens = [6000 + i for i in range(n_tok)]
+
+        # Winner A (live, span registered at commit) + loser B (dirty).
+        # Reserved BEFORE the parked range exists, so adoption cannot
+        # consume it.
+        kv_a = manager.create_kv_cache(max_capacity=self._cap())
+        kv_b = manager.create_kv_cache(max_capacity=self._cap())
+        with TemporaryCudaStream([]) as s, TemporaryCudaStream([]) as s2:
+            self.assertTrue(kv_a.resume(CudaStream(s.handle)))
+            self.assertTrue(kv_b.resume(CudaStream(s2.handle)))
+            self.assertTrue(kv_a.resize(n_tok))
+            self.assertTrue(kv_b.resize(n_tok))
+
+            # Z: an unrelated closed sequence -> a parked (retained) range.
+            pg._range_adoption = True  # park instead of unmapping on drain
+            kv_z = manager.create_kv_cache(max_capacity=self._cap())
+            with TemporaryCudaStream([]) as s0:
+                self.assertTrue(kv_z.resume(CudaStream(s0.handle)))
+                self.assertTrue(kv_z.resize(2 * self.TPB))
+                kv_z.commit([9000 + i for i in range(2 * self.TPB)])
+                kv_z.close()
+            s0.take_finish_event().synchronize()
+            manager.drain_gpu_reclaim(CachedCudaEvent.NULL)
+            self.assertGreaterEqual(len(pg._retained), 1)
+            spilled_before = pg.spilled_ranges
+
+            torch.cuda.synchronize()
+            kv_a.commit(tokens)
+            kv_b.commit(tokens)  # loser: flagged dirty
+            self.assertEqual(list(manager._arena_dedup_dirty.keys()), [id(kv_b)])
+            freed = manager.hard_reclaim_gpu(1)
+            self.assertGreaterEqual(freed, 1)
+            # The dedup satisfied the request: parked range untouched.
+            self.assertEqual(pg.spilled_ranges, spilled_before)
+            self.assertGreaterEqual(len(pg._retained), 1)
+            self.assertGreaterEqual(pg.dedup_remapped_pages, 1)
+            kv_b.close()
+            kv_a.close()
+        s.take_finish_event().synchronize()
+        s2.take_finish_event().synchronize()
+        manager.drain_gpu_reclaim(CachedCudaEvent.NULL)
+        torch.cuda.synchronize()
+        manager._storage.spill_gpu_retained(1 << 62)
+
+    def test_hard_reclaim_sync_discipline(self) -> None:
+        """No-sync guarantee + single-quiesce guarantee: with nothing to
+        reclaim anywhere, hard_reclaim syncs ZERO times; with a dedup batch
+        AND multiple parked ranges to spill, it syncs EXACTLY ONCE (the old
+        ladder quiesced per range).
+        """
+        import sys
+
+        storage_core = sys.modules[ArenaPoolGroup.__module__]
+        manager = self.manager
+        pg = self._pool_group()
+        n_tok = self.PREFIX_BLOCKS * self.TPB
+        counter = {"n": 0}
+        real_quiesce = storage_core.quiesce_before_unmap
+
+        def counting_quiesce() -> None:
+            counter["n"] += 1
+            real_quiesce()
+
+        storage_core.quiesce_before_unmap = counting_quiesce
+        try:
+            # Nothing anywhere: zero syncs.
+            self.assertEqual(manager.hard_reclaim_gpu(1 << 62), 0)
+            self.assertEqual(counter["n"], 0)
+
+            # Build work: one dirty loser + two parked ranges (A/B reserved
+            # first so adoption cannot consume the parked ranges).
+            tokens = [9500 + i for i in range(n_tok)]
+            kv_a = manager.create_kv_cache(max_capacity=self._cap())
+            kv_b = manager.create_kv_cache(max_capacity=self._cap())
+            with TemporaryCudaStream([]) as s, TemporaryCudaStream([]) as s2:
+                self.assertTrue(kv_a.resume(CudaStream(s.handle)))
+                self.assertTrue(kv_b.resume(CudaStream(s2.handle)))
+                self.assertTrue(kv_a.resize(n_tok))
+                self.assertTrue(kv_b.resize(n_tok))
+                pg._range_adoption = True  # park instead of unmapping
+                for base in (7000, 8000):
+                    kv_z = manager.create_kv_cache(max_capacity=self._cap())
+                    with TemporaryCudaStream([]) as s0:
+                        self.assertTrue(kv_z.resume(CudaStream(s0.handle)))
+                        self.assertTrue(kv_z.resize(2 * self.TPB))
+                        kv_z.commit([base + i for i in range(2 * self.TPB)])
+                        kv_z.close()
+                    s0.take_finish_event().synchronize()
+                manager.drain_gpu_reclaim(CachedCudaEvent.NULL)
+                self.assertGreaterEqual(len(pg._retained), 2)
+                torch.cuda.synchronize()
+                kv_a.commit(tokens)
+                kv_b.commit(tokens)  # dirty loser
+                counter["n"] = 0
+                # Demand everything: dedup + spill BOTH parked ranges, one
+                # quiesce total (per-range re-sync eliminated).
+                freed = manager.hard_reclaim_gpu(1 << 62)
+                self.assertGreaterEqual(freed, 3)  # 1 dedup chunk + 2 parked
+                self.assertEqual(counter["n"], 1)
+                self.assertEqual(len(pg._retained), 0)
+                kv_b.close()
+                kv_a.close()
+            s.take_finish_event().synchronize()
+            s2.take_finish_event().synchronize()
+            manager.drain_gpu_reclaim(CachedCudaEvent.NULL)
+            torch.cuda.synchronize()
+            manager._storage.spill_gpu_retained(1 << 62)
+        finally:
+            storage_core.quiesce_before_unmap = real_quiesce
 
 
 if __name__ == "__main__":

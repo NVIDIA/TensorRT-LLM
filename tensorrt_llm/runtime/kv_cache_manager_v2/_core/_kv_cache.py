@@ -37,6 +37,7 @@ from .._common import (
     CudaStream,
     PageIndex,
     PageIndexMode,
+    PageStatus,
     Priority,
     TokenIdExt,
 )
@@ -76,6 +77,7 @@ from .._utils import (
     intersect,
     make_typed,
     map_optional,
+    merge_events,
     stream_wait_events,
     to_typed,
     typed_enumerate,
@@ -225,6 +227,7 @@ class _KVCache:
         "_write_through_slots",
         "_alias_spans",
         "_arena_live_span_registered",
+        "_arena_promote_pending",
         "__rawref__",
     )
 
@@ -292,6 +295,12 @@ class _KVCache:
     # its first commit burst (context end). Post-resume onboarded blocks are
     # private copies, never registrable, so the flag never re-arms.
     _arena_live_span_registered: bool
+    # P3 v3 R1(b): copy-onboarded committed blocks awaiting the promotion
+    # pass -- stashed by _arena_onboard_matched, consumed by
+    # _arena_promote_onboarded AFTER the onboarding frame exits (the
+    # incumbent must be DROPPABLE, so our transient source holders must have
+    # died first).
+    _arena_promote_pending: "list[tuple[BlockOrdinal, LifeCycleId]]"
 
     def __init__(
         self,
@@ -341,6 +350,7 @@ class _KVCache:
         self._write_through_slots = {}
         self._alias_spans = None
         self._arena_live_span_registered = False
+        self._arena_promote_pending = []
         # Arena-mode preconditions are validated by KVCacheManager.create_kv_cache
         # (raising here would leave a partially constructed object for __del__).
         assert not manager._storage.is_arena_mode or (max_capacity is not None and max_capacity > 0)
@@ -661,6 +671,7 @@ class _KVCache:
                 storage.free_gpu_sequence(pg_idx, rng, arena_last_consumer)
             self._arena_ranges = None
         self._status = self.Status.CLOSED
+        manager._arena_dedup_dirty.pop(id(self), None)
         manager._living_kv_caches.remove(self.__rawref__)
 
     def __del__(self) -> None:
@@ -879,6 +890,173 @@ class _KVCache:
             return None
         return ref()
 
+    def _arena_canonical_chain(self, num_blocks: int, lc_idx: LifeCycleId) -> "list[CommittedPage]":
+        """The contiguous run of live canonical tree pages for this
+        sequence's first ``num_blocks`` COMMITTED blocks (mappability probe
+        input, P3 v3 R1). Stops at the first missing/dead entry: a
+        registered span identity-covers pages only through an unbroken run
+        from its head, so a break already proves no live span covers
+        anything past it."""
+        chain: list[CommittedPage] = []
+        for i in range(num_blocks):
+            blk = self._get_tree_block(BlockOrdinal(i))
+            ref = blk.storage[lc_idx]
+            if ref is None:
+                break
+            page = ref()
+            if page is None:
+                break
+            chain.append(page)
+        return chain
+
+    def _arena_try_displace_canonical(
+        self, tree_block: "Block", lc_idx: LifeCycleId, ordinal: BlockOrdinal
+    ) -> bool:
+        """Mappability-weighted conflict resolution (P3 v3 R1): decide
+        whether a GPU-resident challenger may take over ``tree_block``'s
+        canonical entry for ``lc_idx``, and if so displace the incumbent.
+
+        The challenger wins iff the incumbent is UNMAPPABLE -- it is not
+        GPU-resident and no live registered span identity-covers this
+        ordinal (a span-covered host page IS aliasable; killing it would
+        forfeit the span pin) -- and DROPPABLE (no holders: nobody is
+        mid-read or keeping it recallable). A dead/absent incumbent is a
+        win by default.
+
+        Displacement discipline (see P3_DESIGN.md v3): exclude the
+        incumbent from eviction (dropping the controller's strong ref),
+        steal its host slot into the write-through stash (the bytes are
+        identical -- our future eviction becomes copy-free; disk slots are
+        not adoptable and just die), neutralize its block back-reference so
+        its ``__del__`` cannot unset OUR entry, and clear ``storage[lc]``
+        for the caller's ``convert_to_committed``. Returns True on a win
+        (``storage[lc]`` is now None); False means keep today's
+        private-copy path."""
+        storage = self.manager._storage
+        ref = tree_block.storage[lc_idx]
+        incumbent = ref() if ref is not None else None
+        if incumbent is None:
+            tree_block.storage[lc_idx] = None  # drop a dangling ref, if any
+            return True
+        if incumbent.cache_level == GPU_LEVEL:
+            return False  # live GPU canonical: mappable (owner-live aliasing)
+        if incumbent.status != PageStatus.DROPPABLE:
+            return False  # held: someone is mid-read or keeping it recallable
+        if storage.arena_prefix_aliasing:
+            # Blocks [0, ordinal) are committed (commit proceeds in order);
+            # the incumbent completes the chain at position ``ordinal``.
+            chain = self._arena_canonical_chain(int(ordinal), lc_idx)
+            if len(chain) == int(ordinal):
+                chain.append(incumbent)
+                pg_idx = storage.get_pool_group_index(lc_idx)
+                hit = storage.lookup_arena_canonical_span(
+                    pg_idx, chain[0], chain, count_stats=False
+                )
+                if hit is not None:
+                    span: Any = hit[1]
+                    if span.num_blocks > int(ordinal):
+                        return False  # a live span covers it: mappable, keep it
+        if incumbent.scheduled_for_eviction:
+            storage.exclude_from_eviction(incumbent)
+        if (
+            storage.num_cache_levels > 1
+            and incumbent.cache_level == GPU_LEVEL + 1
+            and incumbent.has_valid_slot
+        ):
+            # Byte-identical host copy: adopt it as our pre-valid host
+            # backing (the write-through stash the close/suspend paths
+            # consume) -- a future eviction of the promoted canonical is
+            # then copy-free. Its ready event rides along in the slot.
+            self._write_through_slots[(int(ordinal), int(lc_idx))] = incumbent.move_to_new_slot()
+        # CommittedPage.__del__ unsets its block's entry unconditionally --
+        # after the takeover that would clobber the NEW canonical (and can
+        # remove whole subtrees). Sever the back-reference first.
+        incumbent.block = rawref.NULL
+        tree_block.storage[lc_idx] = None
+        return True
+
+    def _arena_promote_onboarded(self) -> None:
+        """Mappability-weighted promotion at the onboarding seam (P3 v3
+        R1(b)) -- the fix for the canonical-residency trap: once a canonical
+        is evicted to host, every same-prefix admission copy-onboards from
+        host forever (matched blocks never re-commit, so the commit-conflict
+        seam alone cannot break the loop). For each copy-onboarded block
+        whose canonical is unmappable-and-droppable, our GPU-resident
+        private copy becomes the NEW canonical: a fresh ``CommittedPage``
+        takes over its arena slot (same slot id -- offset tables unchanged),
+        ``block.storage`` re-points to it, and the incumbent's host slot is
+        adopted into the write-through stash. The promoted pages then
+        satisfy ``_arena_register_live_span``'s canonical-run walk at
+        context-end, so descendants ALIAS instead of copying.
+
+        Must run after ``_arena_onboard_matched``'s frame has exited: the
+        displacement requires the incumbent DROPPABLE, and onboarding held
+        the copy sources until then. Blocks that stay private under a
+        MAPPABLE canonical flag this sequence for the pressure-time dedup
+        scan instead (P3 v3 R2 site 2/3: copy- and resume-onboarding)."""
+        pending = self._arena_promote_pending
+        if not pending:
+            return
+        self._arena_promote_pending = []
+        if self._arena_ranges is None:
+            return
+        storage = self.manager._storage
+        beam_idx = DEFAULT_BEAM_INDEX
+        dirty = False
+        with self._record_event():  # unlock() notifies our finish event
+            for ordinal, lc_idx in pending:
+                entry = self._block(ordinal, beam_idx)[lc_idx]
+                if entry is None:
+                    continue
+                old_lock = expect_type(_SharedPageLock, entry)
+                private = old_lock.page
+                if type(private) is not PrivateCommittedPage or private.cache_level != GPU_LEVEL:
+                    continue
+                tree_block = private.block()
+                if tree_block is None or tree_block.is_orphan:
+                    continue  # sole copy of an orphaned block: not a duplicate
+                if not self._arena_try_displace_canonical(tree_block, lc_idx, ordinal):
+                    # Mappable (or held) canonical: our copy stays a private
+                    # duplicate -- harvestable by the pressure-time dedup
+                    # remap.
+                    dirty = True
+                    continue
+                # The onboarding copy READS the incumbent's host slot; the
+                # displacement stole that slot into the write-through stash.
+                # Merge the copy's finish (our private page's ready event)
+                # into the slot's ready event so a future recycle of the
+                # slot cannot overwrite bytes the copy is still reading.
+                stolen = self._write_through_slots.get((int(ordinal), int(lc_idx)))
+                if stolen is not None:
+                    stolen.ready_event = merge_events([stolen.ready_event, private.ready_event])
+                # Transplant the private copy's arena slot into a fresh
+                # canonical page: same bytes, same slot id, ready event (the
+                # onboarding copy's finish) rides along in the slot. Unlock
+                # explicitly first -- locals still reference the old lock, so
+                # replacement alone would not release the base-page-index
+                # entry the new lock re-registers.
+                old_lock.unlock()
+                self._block(ordinal, beam_idx)[lc_idx] = None
+                promoted = CommittedPage(
+                    storage,
+                    tree_block,
+                    lc_idx,
+                    GPU_LEVEL,
+                    private.move_to_new_slot(),
+                    private.priority,
+                )
+                tree_block.storage[lc_idx] = rawref.ref(promoted)
+                # The onboarding already made this stream wait the copy
+                # events.
+                self._block(ordinal, beam_idx)[lc_idx] = promoted.lock(
+                    self, beam_idx, ordinal, lc_idx, skip_wait=True
+                )
+                event_manager = self.manager.event_manager
+                if event_manager is not None:
+                    event_manager.add_stored_life_cycle_event_from_block(tree_block, int(lc_idx))
+        if dirty:
+            self.manager._arena_mark_dedup_dirty(self)
+
     def _arena_evacuate(self, prior_event: CachedCudaEvent = CachedCudaEvent.NULL) -> None:
         """Suspend-side write-out (DESIGN.md §4.5): move this sequence's GPU
         pages out of its arena ranges so the ranges can be unmapped.
@@ -1070,7 +1248,11 @@ class _KVCache:
         commit-conflict loser) -- replaceable by aliases of the canonical
         physical pages with zero information loss. Page holders, slot ids,
         and offsets are untouched by the remap (same-VA swap), so no
-        per-sequence state changes here. Returns
+        per-sequence state changes here. Mappability filter (P3 v3 R3): a
+        candidate requires a LIVE span-registry hit on its canonical chain,
+        so the hard-reclaim path never pays a device quiesce for a harvest
+        it cannot collect (a host-resident canonical without a span pin
+        yields no candidate). Returns
         ``(pg_idx, rng, key, span, usable_blocks, pages_freeable)``."""
         storage = self._storage
         ranges = self._arena_ranges
@@ -1129,13 +1311,13 @@ class _KVCache:
         now but the driver calls are deferred to the owner's per-iteration
         ``flush_gpu_mappings`` sweep; callers that touch the pages immediately
         (e.g. reuse onboarding copies) pass ``sync=True``. On page exhaustion,
-        walks the reclaim ladder -- drain deferred reclaim, spill lazily
-        retained ranges (LRU-first, §4.4 phase 2), DEDUP-REMAP duplicate
-        prefixes onto their canonical spans (P3 v2: frees pages from live
-        sequences with zero information loss), and only then spill the
-        registry excess -- retrying while any rung makes progress; returns
-        False if pages are still unavailable — the caller backs off exactly
-        like a failed slot allocation (§4.6)."""
+        calls ``hard_reclaim_gpu`` (P3 v3): fenced drain, dedup remap of ALL
+        flagged sequences' duplicate prefixes, parked-range spill, and
+        registry-excess spill -- destruction-ordered, behind ONE device
+        quiesce (zero syncs when nothing is reclaimable anywhere) -- retrying
+        while it makes progress; returns False if pages are still
+        unavailable — the caller backs off exactly like a failed slot
+        allocation (§4.6)."""
         storage = self._storage
         ranges = self._arena_ranges
         assert ranges is not None
@@ -1150,16 +1332,16 @@ class _KVCache:
                         storage.ensure_gpu_mapped(pg_idx, rng, num_valid_blocks)
                     break
                 except OutOfPagesError:
-                    if storage.drain_gpu_reclaim() > 0:
-                        continue
+                    # The fence is recorded BEFORE the quiesce inside
+                    # hard_reclaim_gpu, so it completes under it -- letting
+                    # the fenced drain take ranges freed since the last
+                    # iteration-boundary fence (risk #3 stays honored).
                     if (
-                        storage.spill_gpu_retained(self._ARENA_SPILL_CHUNK_PAGES, spill_spans=False)
+                        self.manager.hard_reclaim_gpu(
+                            self._ARENA_SPILL_CHUNK_PAGES, CachedCudaEvent(self.cuda_stream)
+                        )
                         > 0
                     ):
-                        continue
-                    if self.manager.dedup_remap_gpu(self._ARENA_SPILL_CHUNK_PAGES) > 0:
-                        continue
-                    if storage.spill_gpu_retained(self._ARENA_SPILL_CHUNK_PAGES) > 0:
                         continue
                     return False
         return True
@@ -1284,6 +1466,7 @@ class _KVCache:
                 copied[i] = slot
         # P3 aliased blocks: the slot IS the data (no copy ran); the lock
         # loop below builds the same sequence-private page over it.
+        aliased_set = set(aliased_idx)
         for i in aliased_idx:
             copied[i] = dst_slots[i]
         stream_wait_events(
@@ -1296,7 +1479,8 @@ class _KVCache:
         # Lock everything in place. For copies, the private page replaces the
         # holder; dropping it releases the source back to eviction control at
         # its current level. Moved pages keep their holder and simply lock.
-        for (ordinal, lc_idx, holder), copied_slot in zip(entries, copied):
+        assert not self._arena_promote_pending
+        for i, ((ordinal, lc_idx, holder), copied_slot) in enumerate(zip(entries, copied)):
             src_page = holder.page
             if copied_slot is None:  # moved uncommitted page, now living in the arena
                 assert src_page.cache_level == GPU_LEVEL
@@ -1311,6 +1495,13 @@ class _KVCache:
                     storage, tree_block, lc_idx, GPU_LEVEL, copied_slot, src_page.priority
                 )
                 lock = private.lock(self, beam_idx, ordinal, lc_idx, skip_wait=True)
+                if i not in aliased_set:
+                    # A committed copy is either a promotion candidate (its
+                    # canonical is unmappable, P3 v3 R1(b)) or a duplicate
+                    # to flag for the pressure-time dedup (R2 sites 2/3) --
+                    # the promotion pass decides, once our transient source
+                    # holders have died with this frame.
+                    self._arena_promote_pending.append((ordinal, lc_idx))
             self._block(ordinal, beam_idx)[lc_idx] = lock
         return True
 
@@ -1858,6 +2049,11 @@ class _KVCache:
             assert all(slot is None for slot in deferred_slots)
             if not self._arena_onboard_matched():
                 return False
+            # P3 v3 R1(b): _arena_onboard_matched's frame (and with it our
+            # transient holders on the copy sources) is gone -- promote
+            # copied blocks whose canonical is unmappable, so this prompt
+            # class stops copying from host forever.
+            self._arena_promote_onboarded()
         else:
             tasks = list[BatchedLockTarget]()
             for ordinal, beam_idx, lc_idx in self._active_pages():
@@ -2242,16 +2438,35 @@ class _KVCache:
             # onto its pages would share GPU pages across arenas (§4.4
             # invariant), so keep our own pages as sequence-private committed
             # copies referencing the existing tree block, and keep committing.
+            # Mappability-weighted resolution (P3 v3 R1): if the incumbent
+            # canonical is UNMAPPABLE (no live span covers it -- e.g. its
+            # owner closed and offloaded before we committed) and droppable,
+            # our GPU-resident page WINS the conflict instead: it becomes the
+            # canonical entry (descendants alias it rather than copying from
+            # host forever) and the incumbent's host slot is adopted as our
+            # pre-valid host backing (a future eviction is copy-free).
             skip_lcs = {ssm_lc_id} if ssm_lc_id is not None else None
             uncommitted_pages = self._take_uncommitted_page(ordinal, beam_idx, skip_lcs)
+            lost = False
             for lc, (page, locked) in typed_enumerate(uncommitted_pages):
                 if page is None:
                     continue
-                p = page.convert_to_private_committed(tree_block, self.finish_event)
+                if self._arena_try_displace_canonical(tree_block, lc, ordinal):
+                    p: CommittedPage = page.convert_to_committed(tree_block, self.finish_event)
+                    event_manager = self.manager.event_manager
+                    if event_manager is not None:
+                        event_manager.add_stored_life_cycle_event_from_block(tree_block, int(lc))
+                else:
+                    p = page.convert_to_private_committed(tree_block, self.finish_event)
+                    lost = True
                 # The page comes from an uncommitted page of self, so safe to skip wait.
                 beam_block[lc] = (
                     p.lock(self, beam_idx, ordinal, lc, skip_wait=True) if locked else p.hold()
                 )
+            if lost:
+                # Loser to a MAPPABLE incumbent: our private copy is a
+                # duplicate the pressure-time dedup can remap (P3 v3 R2).
+                self.manager._arena_mark_dedup_dirty(self)
             seq_block.tree_block = tree_block
             assert self._get_tree_block(ordinal) is tree_block
             self._num_committed_blocks = BlockOrdinal(ordinal + 1)

@@ -1163,13 +1163,16 @@ class ArenaPoolGroup(PoolGroupBase):
         rng._free_event = last_consumer
         self._pending_reclaim.append(rng)
 
-    def drain_reclaim(self, fence: CachedCudaEvent | None = None, wait: bool = False) -> int:
+    def drain_reclaim(
+        self, fence: CachedCudaEvent | None = None, wait: bool = False, quiesce: bool = True
+    ) -> int:
         """Process every freed range whose gating conditions have all
         completed: unmap and recycle it, or -- with lazy retention (§4.4
         phase 2) -- keep its pages mapped and park it on the retained LRU,
         to be reclaimed only under pressure (:meth:`spill_retained`).
         Returns the number of ranges processed. Call at iteration
-        boundaries.
+        boundaries. ``quiesce=False`` skips the per-range device quiesce
+        (hard-reclaim path, P3 v3: the caller quiesced once for the batch).
 
         ``fence`` must be an event recorded on the *execution* stream at the
         call site; it is attached to ranges freed since the previous fenced
@@ -1213,7 +1216,7 @@ class ArenaPoolGroup(PoolGroupBase):
                     self._retained[rng.base_block] = rng
                     self._budget.retain(self._arena.charged_pages_in_range(rng.base_block))
                 else:
-                    self._reclaim_range(rng)
+                    self._reclaim_range(rng, quiesce)
                 processed += 1
             else:
                 remaining.append(rng)
@@ -1229,7 +1232,7 @@ class ArenaPoolGroup(PoolGroupBase):
             if rng._reclaim_fence is None:
                 rng._reclaim_fence = fence
 
-    def _reclaim_range(self, rng: SequenceRange) -> None:
+    def _reclaim_range(self, rng: SequenceRange, quiesce: bool = True) -> None:
         """Unmap a range's pages, return its block indices, purge its ghosts."""
         for key in rng._ghost_keys:
             entry = self._ghosts.get(key)
@@ -1239,16 +1242,19 @@ class ArenaPoolGroup(PoolGroupBase):
             if entry is not None and entry[1] == rng.base_block:
                 self._ghosts.pop(key)
         rng._ghost_keys.clear()
-        self._arena.reclaim(rng.base_block)
+        self._arena.reclaim(rng.base_block, quiesce)
         del self._ranges[rng.base_block]
         idx = bisect_right(self._range_bases, rng.base_block) - 1
         assert self._range_bases[idx] == rng.base_block
         self._range_bases.pop(idx)
 
-    def spill_retained(self, min_pages: int) -> int:
+    def spill_retained(self, min_pages: int, quiesce: bool = True) -> int:
         """Reclaim retained ranges (LRU first, skipping ranges with pending
         gate events) until at least ``min_pages`` physical pages have been
-        freed or nothing more is spillable. Returns pages freed."""
+        freed or nothing more is spillable. Returns pages freed.
+        ``quiesce=False`` skips the per-range device quiesce (hard-reclaim
+        path, P3 v3: the caller quiesced once for the whole batch -- fixes
+        the per-range re-sync of the old ladder)."""
         freed = 0
         for base in list(self._retained):
             if freed >= min_pages:
@@ -1259,7 +1265,7 @@ class ArenaPoolGroup(PoolGroupBase):
             pages = self._arena.charged_pages_in_range(base)
             del self._retained[base]
             self._budget.unretain(pages)
-            self._reclaim_range(rng)
+            self._reclaim_range(rng, quiesce)
             self.spilled_ranges += 1
             freed += pages
         return freed
@@ -2006,17 +2012,20 @@ class GpuArenaCacheLevelStorage(CacheLevelStorage):
         assert type(pg) is ArenaPoolGroup
         return pg
 
-    def drain_reclaim(self, fence: CachedCudaEvent | None = None, wait: bool = False) -> int:
+    def drain_reclaim(
+        self, fence: CachedCudaEvent | None = None, wait: bool = False, quiesce: bool = True
+    ) -> int:
         """Drain every pool group's deferred-reclaim queue (call at iteration
         boundaries). ``fence`` gates newly freed ranges against speculatively
         enqueued steps; ``wait=True`` blocks on in-flight gating events
         instead of skipping their ranges (see
-        :meth:`ArenaPoolGroup.drain_reclaim`). Returns the number of sequence
-        ranges reclaimed."""
+        :meth:`ArenaPoolGroup.drain_reclaim`); ``quiesce=False`` skips the
+        per-range device quiesce (:meth:`hard_reclaim` quiesced once for the
+        batch). Returns the number of sequence ranges reclaimed."""
         reclaimed = 0
         for pg in self._pool_groups:
             assert type(pg) is ArenaPoolGroup
-            reclaimed += pg.drain_reclaim(fence, wait)
+            reclaimed += pg.drain_reclaim(fence, wait, quiesce)
         return reclaimed
 
     def fence_pending_frees(self, fence: CachedCudaEvent) -> None:
@@ -2026,7 +2035,7 @@ class GpuArenaCacheLevelStorage(CacheLevelStorage):
             assert type(pg) is ArenaPoolGroup
             pg.fence_pending_frees(fence)
 
-    def spill_retained(self, min_pages: int, spill_spans: bool = True) -> int:
+    def spill_retained(self, min_pages: int, spill_spans: bool = True, quiesce: bool = True) -> int:
         """Reclaim lazily retained ranges (§4.4 phase 2), LRU-first per pool
         group, until ``min_pages`` physical pages are freed or nothing more
         is spillable; canonical-span pins (P3) are spilled last -- shared
@@ -2036,15 +2045,15 @@ class GpuArenaCacheLevelStorage(CacheLevelStorage):
         it every zero-copy alias hit, to cover a transient need worth a
         handful of pages. Protected callers back off like any failed
         allocation instead (§4.6). ``spill_spans=False`` skips the span pass
-        entirely -- the reclaim ladder runs the dedup remap (which FREES
-        duplicates instead of forfeiting the registry) between the two.
-        Returns pages freed."""
+        entirely; ``quiesce=False`` skips the per-range device quiesce
+        (:meth:`hard_reclaim` quiesced once for the batch). Returns pages
+        freed."""
         freed = 0
         for pg in self._pool_groups:
             if freed >= min_pages:
                 break
             assert type(pg) is ArenaPoolGroup
-            freed += pg.spill_retained(min_pages - freed)
+            freed += pg.spill_retained(min_pages - freed, quiesce)
         if not spill_spans:
             return freed
         spillable = -self._span_spill_floor
@@ -2060,23 +2069,86 @@ class GpuArenaCacheLevelStorage(CacheLevelStorage):
             spillable -= got
         return freed
 
-    def dedup_remap(self, items: "list[tuple[int, SequenceRange, int, object, int]]") -> int:
+    def dedup_remap(
+        self, items: "list[tuple[int, SequenceRange, int, object, int]]", quiesce: bool = True
+    ) -> int:
         """Execute a dedup-remap batch (P3 v2) behind ONE device quiesce:
         each item ``(pg_idx, rng, key, span, num_blocks)`` replaces the
         range's private duplicate prefix backing with aliases of the span's
         handles. The caller (the manager's pressure-time scan) has already
         verified eligibility host-side; nothing here enqueues GPU work, so
         the batch is atomic with respect to the executor's enqueue thread.
-        Returns total pages freed."""
+        ``quiesce=False`` skips the quiesce (:meth:`hard_reclaim` already
+        quiesced). Returns total pages freed."""
         if not items:
             return 0
-        quiesce_before_unmap()
+        if quiesce:
+            quiesce_before_unmap()
         freed = 0
         for pg_idx, rng, key, span, num_blocks in items:
             pg = self._pool_groups[PoolGroupIndex(pg_idx)]
             assert type(pg) is ArenaPoolGroup
             freed += pg.remap_range_onto_span(rng, key, cast("_CanonicalSpan", span), num_blocks)
         return freed
+
+    def hard_reclaim(
+        self,
+        min_pages: int,
+        dedup_items: "list[tuple[int, SequenceRange, int, object, int]]",
+        fence: CachedCudaEvent | None = None,
+    ) -> int:
+        """Pressure-time hard reclaim (P3 v3): every rung that needs the
+        device quiesced, behind ONE quiesce, harvesting maximally
+        (destruction-ordered -- see the manager's ``hard_reclaim_gpu``).
+
+        Sync-free exit first: if there is nothing to reclaim anywhere (no
+        dedup candidates, nothing pending, nothing parked, no registry
+        excess above the protection floor), returns 0 WITHOUT syncing.
+        Otherwise quiesces once, then:
+
+        1. fenced drain -- every pending free's gates are complete
+           post-sync, so all of them park (adoption/retention) or unmap
+           (plain mode) now;
+        2. dedup remap of ALL ``dedup_items`` (duplicates have zero
+           retention value: this frees pages from live sequences without
+           touching the parked cache);
+        3. parked-range spill for the REMAINDER still needed, then registry
+           excess above the floor last (both destroy reuse value).
+
+        ``fence``: an execution-stream event recorded by the caller BEFORE
+        this call (it completes under the quiesce); attached to pending
+        frees that have none yet so the drain can take them. Returns pages
+        freed (budget delta)."""
+        budget = self.page_budget
+        free_before = budget.free_pages
+        has_work = bool(dedup_items)
+        if not has_work:
+            for pg in self._pool_groups:
+                assert type(pg) is ArenaPoolGroup
+                # Pending ranges with outstanding slot refs can never drain
+                # (their release is host-side state, not an event) -- do not
+                # pay a quiesce for them.
+                if pg._retained or any(r._outstanding == 0 for r in pg._pending_reclaim):
+                    has_work = True
+                    break
+        if not has_work:
+            spillable = -self._span_spill_floor
+            for pg in self._pool_groups:
+                assert type(pg) is ArenaPoolGroup
+                spillable += pg.canonical_span_pages
+            has_work = spillable > 0
+        if not has_work:
+            return 0
+        quiesce_before_unmap()
+        if fence is not None:
+            self.fence_pending_frees(fence)
+        self.drain_reclaim(quiesce=False)
+        if dedup_items:
+            self.dedup_remap(dedup_items, quiesce=False)
+        needed = min_pages - (budget.free_pages - free_before)
+        if needed > 0:
+            self.spill_retained(needed, spill_spans=True, quiesce=False)
+        return budget.free_pages - free_before
 
     @property
     def protected_span_pages(self) -> int:

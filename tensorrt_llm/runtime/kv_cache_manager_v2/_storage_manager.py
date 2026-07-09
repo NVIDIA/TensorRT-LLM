@@ -552,11 +552,18 @@ class StorageManager:
         reclaim ladder runs the dedup remap between the two, §P3 v2)."""
         return self._gpu_arena_storage().spill_retained(min_pages, spill_spans)
 
-    def dedup_remap_arena(self, items: "list[tuple[int, SequenceRange, int, object, int]]") -> int:
-        """Execute a pressure-time dedup-remap batch (P3 v2) behind one
-        device quiesce. Items: ``(pg_idx, rng, key, span, num_blocks)``.
+    def hard_reclaim_gpu(
+        self,
+        min_pages: int,
+        dedup_items: "list[tuple[int, SequenceRange, int, object, int]]",
+        fence: CachedCudaEvent | None = None,
+    ) -> int:
+        """Pressure-time hard reclaim (P3 v3): fenced drain, dedup remap of
+        ``dedup_items``, parked-range spill, and registry-excess spill --
+        all behind ONE device quiesce (or zero syncs if there is nothing to
+        reclaim anywhere). See :meth:`GpuArenaCacheLevelStorage.hard_reclaim`.
         Returns pages freed."""
-        return self._gpu_arena_storage().dedup_remap(items)
+        return self._gpu_arena_storage().hard_reclaim(min_pages, dedup_items, fence)
 
     def arena_span_pages_for_blocks(
         self, pg_idx: PoolGroupIndex, span: object, num_blocks: int

@@ -199,6 +199,7 @@ class KVCacheManager:
         "_radix_tree",
         "_storage",
         "_living_kv_caches",
+        "_arena_dedup_dirty",
         "_avg_reused_length",
         "_avg_sqr_capacity",
         "_avg_sqr_history_length",
@@ -220,6 +221,13 @@ class KVCacheManager:
     _radix_tree: BlockRadixTree
     _storage: StorageManager
     _living_kv_caches: set[rawref.ref[_KVCache]]
+    # P3 v3 dedup dirty set: id(kv) -> rawref of sequences that created
+    # sequence-private duplicates of a mappable canonical (commit-conflict
+    # loss, copy-onboarding, resume-onboarding) since their last dedup scan.
+    # Gate for hard_reclaim_gpu's scan: empty set == nothing to dedup, O(1).
+    # Entries clear on scan ATTEMPT (success or failure) and on close; any
+    # later duplicate creation re-enters through one of the three sites.
+    _arena_dedup_dirty: dict[int, rawref.ref[_KVCache]]
     # Eventually we should let the eviction controller evict associated pages together, i.e.
     # when a page eviction makes other pages in the same cache level useless, it should also
     # evict those pages. When we have that, we can simply decide capacity ratio based on
@@ -265,6 +273,7 @@ class KVCacheManager:
             arena_config=config.contiguous_arena,
         )
         self._living_kv_caches = set[rawref.ref[_KVCache]]()
+        self._arena_dedup_dirty = {}
         decay = 0.9999
         self._avg_reused_length = MovingAverage(decay)
         self._avg_sqr_capacity = MovingAverage(decay)
@@ -590,36 +599,47 @@ class KVCacheManager:
         Returns the number of pages mapped."""
         return self._storage.flush_gpu_mappings()
 
-    def dedup_remap_gpu(self, min_pages: int) -> int:
-        """Pressure-time dedup remap (P3 v2): free duplicate private copies
-        of registered canonical prefixes by remapping their VA onto the
-        canonical physical pages -- a reclaim-ladder rung between the
-        parked-range spill and the registry-excess spill. Frees memory from
-        LIVE sequences with zero information loss (the byte content is the
-        committed prefix either way), shielding both the registry and the
-        preemption path. Scans ALL live sequences host-side first, then
-        remaps largest-savings-first behind one device quiesce until
-        ``min_pages`` are freed. Returns pages freed."""
+    def _arena_mark_dedup_dirty(self, kv: _KVCache) -> None:
+        """Flag a sequence for the pressure-time dedup scan (P3 v3): called
+        at the duplicate-creating sites (commit-conflict loss to a mappable
+        incumbent, copy-onboarding of committed blocks, resume-onboarding).
+        No-op unless prefix aliasing is on (nothing could ever be remapped)."""
+        if self._storage.arena_prefix_aliasing:
+            self._arena_dedup_dirty[id(kv)] = kv.__rawref__
+
+    def hard_reclaim_gpu(self, min_pages: int, fence: CachedCudaEvent | None = None) -> int:
+        """Pressure-time hard reclaim (P3 v3), replacing the old ladder's
+        three lower rungs: harvest maximally behind ONE device quiesce, in
+        destruction order -- dedup remap first (duplicates have zero
+        retention value), then parked terminated-request ranges, then
+        registry excess above the protection floor. Pausing (preemption)
+        stays the caller's fallback when this returns 0.
+
+        The dedup scan walks ONLY sequences in the dirty set (flagged at the
+        duplicate-creating sites) and dedups ALL their candidates -- no
+        ``min_pages`` cutoff: if we halt the device, reclaim everything
+        harvestable. Flags clear on the attempt regardless of outcome (a
+        candidate-less sequence stays clean until a new duplicate-creating
+        event re-flags it). If there is nothing to reclaim anywhere, returns
+        0 WITHOUT syncing.
+
+        ``fence``: an execution-stream event recorded by the caller before
+        the call; gates pending frees that have no reclaim fence yet (they
+        complete under the quiesce). Returns pages freed."""
         storage = self._storage
-        if not storage.is_arena_mode or not storage.arena_prefix_aliasing:
+        if not storage.is_arena_mode:
             return 0
-        candidates: "list[tuple[int, Any, int, Any, int, int]]" = []
-        for r in self._living_kv_caches:
-            kv = r()
-            if kv is None:
-                continue
-            candidates.extend(kv._arena_collect_dedup_candidates())
-        if not candidates:
-            return 0
-        candidates.sort(key=lambda c: c[5], reverse=True)
         picked: "list[tuple[int, Any, int, Any, int]]" = []
-        total = 0
-        for c in candidates:
-            if total >= min_pages:
-                break
-            picked.append((c[0], c[1], c[2], c[3], c[4]))
-            total += c[5]
-        return storage.dedup_remap_arena(picked)
+        if storage.arena_prefix_aliasing and self._arena_dedup_dirty:
+            dirty = self._arena_dedup_dirty
+            self._arena_dedup_dirty = {}
+            for r in dirty.values():
+                kv = r()
+                if kv is None:
+                    continue
+                for c in kv._arena_collect_dedup_candidates():
+                    picked.append((c[0], c[1], c[2], c[3], c[4]))
+        return storage.hard_reclaim_gpu(min_pages, picked, fence)
 
     @property
     def enable_partial_match(self) -> bool:

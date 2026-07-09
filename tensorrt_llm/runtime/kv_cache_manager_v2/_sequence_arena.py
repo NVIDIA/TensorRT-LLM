@@ -703,21 +703,26 @@ class SequenceArena:
         self._reclaim = remaining
         return reclaimed
 
-    def reclaim(self, base_block: int) -> None:
+    def reclaim(self, base_block: int, quiesce: bool = True) -> None:
         """Immediately unmap a range's pages and return its block indices to
         the allocator. The caller must itself guarantee that no in-flight GPU
         work references the range (e.g. ``ArenaPoolGroup`` gates on slot
         release and CUDA events before calling this). For simple single-event
-        gating use :meth:`enqueue_free` + :meth:`drain_reclaim` instead."""
-        self._reclaim_now(base_block)
+        gating use :meth:`enqueue_free` + :meth:`drain_reclaim` instead.
+        ``quiesce=False`` skips the per-call device quiesce -- ONLY for
+        callers that already quiesced for the whole batch (the hard-reclaim
+        path, P3 v3) and enqueue no GPU work in between."""
+        self._reclaim_now(base_block, quiesce)
 
-    def _reclaim_now(self, base_block: int) -> None:
+    def _reclaim_now(self, base_block: int, quiesce: bool = True) -> None:
         """Unmap a range's pages in every pool and return the block range to
         the allocator. Caller guarantees no in-flight work references it --
         and, because concurrent unmaps can fault unrelated in-flight reads at
         the driver level (see ``_SYNC_BEFORE_UNMAP``), the GPU is quiesced
-        before the unmap batch unless explicitly disabled."""
-        quiesce_before_unmap()
+        before the unmap batch unless explicitly disabled or the caller
+        already quiesced for the batch (``quiesce=False``)."""
+        if quiesce:
+            quiesce_before_unmap()
         frontiers = self._frontiers.pop(base_block)
         num_aliased = self._aliased.pop(base_block, 0)
         page = self._phys_page_size
