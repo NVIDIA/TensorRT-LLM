@@ -27,7 +27,8 @@ from tensorrt_llm.models.modeling_utils import QuantAlgo
 from ...distributed import allgather
 from ...memory_buffer_utils import get_memory_buffers
 from ...model_config import ModelConfig
-from ...utils import AuxStreamType, EventType, Fp4QuantizedTensor
+from ...utils import (AuxStreamType, EventType, Fp4QuantizedTensor,
+                      configure_deep_gemm_pdl)
 from .fused_moe_cutlass import CutlassFusedMoE
 from .interface import AlltoallMethodType
 from .quantization import (DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm,
@@ -802,6 +803,8 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
         init_load_balancer: bool = True,
         without_comm: bool = False,
     ):
+        configure_deep_gemm_pdl()
+
         # moe_max_num_tokens is set in ModelConfig.__post_init__ if not specified
         # The default value is max_num_tokens * dp_size
         # For DeepGemm, we need to limit moe_max_num_tokens to avoid OOM

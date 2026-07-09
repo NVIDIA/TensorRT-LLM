@@ -643,3 +643,18 @@ def torch_multi_arange(
     seq = seq.repeat_interleave(seq_repeats, output_size=output_length_arg)
     seq = seq.cumsum(0, dtype=ends.dtype)
     return seq
+
+
+_DEEP_GEMM_PDL_CONFIGURED = False
+
+
+def configure_deep_gemm_pdl() -> None:
+    # Deferred until first DeepGEMM-backed op init: set-time reserves
+    # a workspace that would otherwise shrink KV-cache HBM on non-DG
+    # workloads.
+    global _DEEP_GEMM_PDL_CONFIGURED
+    if _DEEP_GEMM_PDL_CONFIGURED:
+        return
+    from tensorrt_llm import deep_gemm
+    deep_gemm.set_pdl(os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1")
+    _DEEP_GEMM_PDL_CONFIGURED = True

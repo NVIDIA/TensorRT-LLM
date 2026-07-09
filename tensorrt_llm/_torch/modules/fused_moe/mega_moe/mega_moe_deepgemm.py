@@ -34,7 +34,7 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 
 from ....model_config import ModelConfig
-from ....utils import ActivationType, AuxStreamType
+from ....utils import ActivationType, AuxStreamType, configure_deep_gemm_pdl
 from ..interface import MoE, MoESchedulerKind, MoEWeightLoadingMode
 from ..quantization import (
     W4A8MXFP4MXFP8MegaMoEDeepGemmMethod,
@@ -211,6 +211,7 @@ class MegaMoEDeepGemm(MoE):
         fast_math: bool = True,
         **kwargs,
     ) -> None:
+        configure_deep_gemm_pdl()
         super().__init__(
             routing_method=routing_method,
             num_experts=num_experts,
