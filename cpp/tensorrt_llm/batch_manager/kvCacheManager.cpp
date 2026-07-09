@@ -3994,7 +3994,7 @@ tle::RetentionPriority KVCacheManager::getPriorityByBlockId(KVCacheBlock::IdType
 }
 
 std::vector<kernels::KVCacheIndex::UnderlyingType> KVCacheManager::getMemoryPoolBlockIndicesByBlockIds(
-    std::vector<KVCacheBlock::IdType> const& blockIds, SizeType32 windowSize, bool requirePrimary) const
+    std::vector<KVCacheBlock::IdType> const& blockIds, SizeType32 windowSize) const
 {
     std::vector<kernels::KVCacheIndex::UnderlyingType> indices;
     indices.reserve(blockIds.size());
@@ -4002,13 +4002,14 @@ std::vector<kernels::KVCacheIndex::UnderlyingType> KVCacheManager::getMemoryPool
     {
         BlockPtr const& block = mBlockManager.getBlockById(blockId, windowSize);
         TLLM_CHECK_WITH_INFO(block != nullptr, "Block not found (blockId=%d, windowSize=%d)", blockId, windowSize);
-        if (requirePrimary)
-        {
-            TLLM_CHECK_WITH_INFO(block->isPrimary(),
-                "Block is not in the primary pool (blockId=%d, windowSize=%d) but the caller "
-                "requested primary residency",
-                blockId, windowSize);
-        }
+        // Invariant, not a recoverable condition: blocks referenced here are held by a live
+        // request, allocation onboards offloaded blocks, and offload only selects free blocks.
+        // A secondary block therefore indicates a block-lifetime bug, and the returned index
+        // (pool flag stripped) would silently alias a primary slot.
+        TLLM_CHECK_WITH_INFO(block->isPrimary(),
+            "Block is not in the primary pool (blockId=%d, windowSize=%d); the returned index is only "
+            "valid for primary-pool blocks",
+            blockId, windowSize);
         indices.push_back(block->getMemoryPoolBlockIndex());
     }
     return indices;

@@ -111,11 +111,15 @@ class _CacheReuseAdapterV1(CacheReuseAdapter):
         if not raw_ids:
             return np.array([], dtype=np.int64)
         # block_id != primary-pool slot index once host offload kicks in; translate
-        # so the cache transceiver's pointer arithmetic is correct. require_primary=True
-        # asks the cache manager to abort if any referenced block is currently offloaded —
-        # disagg transfer cannot read from the secondary pool.
+        # so the cache transceiver's pointer arithmetic is correct. The manager aborts
+        # if any referenced block is currently offloaded — disagg transfer cannot read
+        # from the secondary pool, and a held block can never be offloaded.
+        window_size = lg.sliding_window_size
+        # V1 layer groups carry the manager's window key (full-attention layers get the
+        # max window), so this is always set; see kv_extractor.build_page_table.
+        assert window_size is not None
         pool_indices = self._mgr.get_memory_pool_block_indices(
-            list(raw_ids), window_size=lg.sliding_window_size, require_primary=True
+            list(raw_ids), window_size=window_size
         )
         return np.asarray(pool_indices, dtype=np.int64)
 

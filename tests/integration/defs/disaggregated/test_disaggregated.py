@@ -2538,8 +2538,8 @@ def test_disaggregated_deepseek_v3_lite_bf16_empty_batch(
 def test_llama4_long_context_kv_cache_overflow(disaggregated_test_root,
                                                disaggregated_example_root,
                                                llm_venv, model_path):
-    """RCCA: https://nvbugspro.nvidia.com/bug/5555681.
-
+    """
+    RCCA: https://nvbugspro.nvidia.com/bug/5555681
     Test to reproduce KV cache buffer overflow bug with long context.
     """
     models_root = llm_models_root()
@@ -2771,7 +2771,9 @@ def run_cancel_stress_test(server_url: str,
                            requests_per_burst: int = 32,
                            prompt_len_range: tuple = (2000, 8000),
                            cancel_after_range: tuple = (0.01, 0.1)):
-    """Stress test that sends requests with large contexts and cancels them during prefill to test resource cleanup under cancellation.
+    """
+    Stress test that sends requests with large contexts and cancels them
+    during prefill to test resource cleanup under cancellation.
 
     Args:
         server_url: The server URL (e.g., "http://localhost:8000")

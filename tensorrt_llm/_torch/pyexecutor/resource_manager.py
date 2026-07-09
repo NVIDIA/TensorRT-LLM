@@ -1331,25 +1331,14 @@ class KVCacheManager(BaseResourceManager):
         window_size = self._resolve_window_size(window_size)
         return self.impl.get_priority_by_block_id(block_id, window_size)
 
-    def get_memory_pool_block_indices(
-            self,
-            block_ids: List[int],
-            *,
-            require_primary: bool,
-            window_size: Optional[int] = None) -> List[int]:
-        # Translate logical block IDs to memory-pool slot indices. With host offload enabled,
+    def get_memory_pool_block_indices(self, block_ids: List[int], *,
+                                      window_size: int) -> List[int]:
+        # Translate logical block IDs to primary-pool slot indices. With host offload enabled,
         # a block's ID and its current pool slot can diverge after an offload/onboard cycle.
-        # `require_primary` has no default: the returned slot index alone does not encode
-        # primary vs. secondary residency, so the caller must spell out which behavior it
-        # wants. require_primary=True aborts on any offloaded block — this is what callers
-        # doing primary-pool pointer arithmetic (e.g. the disagg cache transceiver) want.
-        if window_size is None:
-            if len(self.max_attention_window_vec) > 1:
-                raise ValueError("window_size must be provided for VSWA")
-            window_size = self.max_attention_window_vec[0]
+        # Every referenced block must be primary (asserted in C++): callers do primary-pool
+        # pointer arithmetic and the returned index carries no residency information.
         return self.impl.get_memory_pool_block_indices(list(block_ids),
-                                                       window_size,
-                                                       require_primary)
+                                                       window_size)
 
     def get_batch_cache_indices(
         self,

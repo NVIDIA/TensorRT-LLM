@@ -346,7 +346,6 @@ def test_get_memory_pool_block_indices_vswa():
 
     Without host offload, primary slot indices should equal block IDs
     (no offload has happened), and the wrapper must:
-    - reject ambiguous calls (no window_size on a multi-window manager),
     - dispatch correctly per window_size,
     - return non-negative pool indices that match what
       `KVRegionExtractorV1.extract` plugs into `base_ptr + idx * slot_bytes`.
@@ -391,10 +390,6 @@ def test_get_memory_pool_block_indices_vswa():
     )
 
     try:
-        # Multi-window: omitting window_size must raise
-        with pytest.raises(ValueError, match="window_size must be provided for VSWA"):
-            manager.get_memory_pool_block_indices([0], require_primary=True)
-
         # Drive a small prefill so the manager has resident blocks.
         sampling_params = SamplingParams()
         req = LlmRequest(
@@ -421,9 +416,7 @@ def test_get_memory_pool_block_indices_vswa():
             block_ids = manager.get_batch_cache_indices([req.py_request_id], layer_idx=layer_idx)[0]
             assert len(block_ids) > 0, f"prefill should populate window={w}"
 
-            translated = manager.get_memory_pool_block_indices(
-                block_ids, window_size=w, require_primary=True
-            )
+            translated = manager.get_memory_pool_block_indices(block_ids, window_size=w)
             assert len(translated) == len(block_ids)
             assert all(idx >= 0 for idx in translated), (
                 f"primary pool slot indices must be >= 0, got {translated}"
@@ -442,89 +435,11 @@ def test_get_memory_pool_block_indices_vswa():
 
 
 @pytest.mark.cuda
-def test_get_memory_pool_block_indices_no_offload_is_identity():
-    """With host_cache_size=0 the new wrapper is a strict identity over the block IDs returned by the manager.
-
-    This is the single-window companion to the VSWA test above.
-    """
-    import torch
-
-    import tensorrt_llm
-    from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
-    from tensorrt_llm.sampling_params import SamplingParams
-
-    if not torch.cuda.is_available():
-        pytest.skip("Requires CUDA")
-
-    tokens_per_block = 16
-    kv_cache_config = KvCacheConfig(
-        max_tokens=256,
-        free_gpu_memory_fraction=0.1,
-        enable_block_reuse=False,
-        host_cache_size=0,
-    )
-    mapping = Mapping(world_size=1, rank=0, tp_size=1, pp_size=1, gpus_per_node=1)
-
-    manager = KVCacheManager(
-        kv_cache_config=kv_cache_config,
-        kv_cache_type=CacheTypeCpp.SELF,
-        num_layers=2,
-        num_kv_heads=2,
-        head_dim=64,
-        tokens_per_block=tokens_per_block,
-        max_seq_len=256,
-        max_batch_size=2,
-        mapping=mapping,
-        dtype=DataType.HALF,
-    )
-
-    try:
-        sampling_params = SamplingParams()
-        req = LlmRequest(
-            request_id=0,
-            max_new_tokens=1,
-            input_tokens=list(range(tokens_per_block * 2)),
-            sampling_config=tensorrt_llm.bindings.SamplingConfig(
-                sampling_params._get_sampling_config()
-            ),
-            is_streaming=False,
-        )
-        manager.impl.add_sequence_batch([(req.py_request_id, req.prompt_len, 1)], [req])
-
-        block_ids = manager.get_batch_cache_indices([req.py_request_id], layer_idx=0)[0]
-        assert len(block_ids) > 0
-
-        translated = manager.get_memory_pool_block_indices(block_ids, require_primary=True)
-        assert list(translated) == list(block_ids)
-
-        # Verify ptrs computed via the extractor agree with the
-        # primary-pool base + translated_index * slot_bytes.
-        extractor = KVRegionExtractorV1(manager)
-        spec_region = extractor.extract(np.asarray(translated, dtype=np.int64))
-        slot_bytes = spec_region.memory.bytes_per_region
-        pool_ptrs = manager.get_unique_primary_pool()
-        if hasattr(pool_ptrs, "__getitem__"):
-            base = (
-                int(pool_ptrs[0].data_ptr())
-                if hasattr(pool_ptrs[0], "data_ptr")
-                else int(pool_ptrs[0])
-            )
-        else:
-            base = int(pool_ptrs.data_ptr()) if hasattr(pool_ptrs, "data_ptr") else int(pool_ptrs)
-        expected = [base + idx * slot_bytes for idx in translated]
-        np.testing.assert_array_equal(spec_region.memory.ptrs, expected)
-    finally:
-        manager.shutdown()
-
-
-@pytest.mark.cuda
 def test_get_memory_pool_block_indices_with_offload_onboard():
     """Offload -> onboard -> transfer cycle.
 
     What this test proves:
-      1. While a block is offloaded, its current pool slot index can
-         differ from its logical block ID (offload-side divergence).
-      2. While a block IS primary, its block ID can still differ from
+      1. While a block IS primary, its block ID can still differ from
          its primary-pool slot (primary-side divergence). This happens
          because block IDs are allocated globally (req_b's blocks get
          IDs 4-7 after req_a took 0-3), but primary-pool slots are
@@ -533,11 +448,10 @@ def test_get_memory_pool_block_indices_with_offload_onboard():
          compute `base + 4 * slot_bytes` and read past the end of a
          4-block primary pool — the exact pointer-arithmetic bug this
          fix addresses.
-      3. require_primary=True aborts on offloaded blocks with the
-         documented "Block is not in the primary pool" message — this is
-         the policy the disagg cache transceiver relies on to refuse
-         host-pool transfers.
-      4. After reuse-driven onboard, all blocks are primary again and
+      2. Translation aborts on offloaded blocks with the documented
+         "Block is not in the primary pool" message — the disagg cache
+         transceiver relies on this to refuse host-pool transfers.
+      3. After reuse-driven onboard, all blocks are primary again and
          pointers computed from the translated slot indices match
          `primary_pool_base + slot_idx * slot_bytes`.
     """
@@ -603,6 +517,8 @@ def test_get_memory_pool_block_indices_with_offload_onboard():
             manager.impl.add_sequence_batch([(req.py_request_id, req.prompt_len, 1)], [req])
             return req
 
+        window = manager.max_attention_window_vec[0]
+
         # Warm: take blocks for a 4-block prefill, capture its block_ids,
         # then commit to reuse so they live in the radix tree (eligible
         # for offload, not freed outright).
@@ -611,7 +527,7 @@ def test_get_memory_pool_block_indices_with_offload_onboard():
         block_ids_a = manager.get_batch_cache_indices([req_a.py_request_id], layer_idx=0)[0]
         # Translation is the identity at this point — block_ids equal
         # primary slot indices because nothing has been offloaded yet.
-        original_indices = manager.get_memory_pool_block_indices(block_ids_a, require_primary=True)
+        original_indices = manager.get_memory_pool_block_indices(block_ids_a, window_size=window)
         assert list(original_indices) == list(block_ids_a)
         simulate_prefill_completion_only_use_for_testing(req_a)
         manager.free_resources(req_a)
@@ -631,7 +547,7 @@ def test_get_memory_pool_block_indices_with_offload_onboard():
         # would compute `base + block_id_b * slot_bytes` and walk off the
         # end of a 4-block primary pool.
         block_ids_b = list(manager.get_batch_cache_indices([req_b.py_request_id], layer_idx=0)[0])
-        slots_b = list(manager.get_memory_pool_block_indices(block_ids_b, require_primary=True))
+        slots_b = list(manager.get_memory_pool_block_indices(block_ids_b, window_size=window))
         primary_diverged = [(b, s) for b, s in zip(block_ids_b, slots_b) if b != s]
         assert primary_diverged, (
             f"expected req_b's block_ids to differ from its primary slots "
@@ -639,46 +555,23 @@ def test_get_memory_pool_block_indices_with_offload_onboard():
             f"identity mapping block_ids={block_ids_b}, slots={slots_b}"
         )
 
-        # require_primary=False just returns the current pool slot for any
-        # block (no abort on offloaded). require_primary=True is the policy
-        # the disagg cache transceiver uses; it must abort for any offloaded
-        # block (otherwise the sender would compute garbage pointers against
-        # host-pool blocks).
+        # Translation must abort for any offloaded block — this is the policy
+        # the disagg cache transceiver relies on (otherwise the sender would
+        # compute garbage pointers against host-pool blocks).
         any_non_primary = False
-        offloaded_slots: dict[int, int] = {}
         for bid in block_ids_a:
-            # require_primary=False never throws on offloaded blocks; capture
-            # the secondary-pool slot index for the divergence assertion below.
-            slot = manager.get_memory_pool_block_indices([int(bid)], require_primary=False)[0]
             try:
-                manager.get_memory_pool_block_indices([int(bid)], require_primary=True)
+                manager.get_memory_pool_block_indices([int(bid)], window_size=window)
             except RuntimeError as exc:
                 assert "Block is not in the primary pool" in str(exc), (
                     f"unexpected error message: {exc}"
                 )
                 any_non_primary = True
-                offloaded_slots[int(bid)] = slot
         # If the eviction policy ended up keeping every prefix block in
         # primary (small possibility under fragmentation), we cannot
         # observe the offload assertion — skip the negative leg.
         if not any_non_primary:
             pytest.skip("no req_a block was offloaded under this build's eviction policy")
-
-        # Core divergence assertion: at least one offloaded block must have a
-        # current slot index that DIFFERS from its logical block ID. Without
-        # this, the bug ("Python uses block_id as pool offset") would be
-        # invisible — pre-fix code would have computed `base + block_id *
-        # slot_bytes` and accidentally landed on a valid (but wrong) primary
-        # block. The .get()-stripped slot we see here is the secondary-pool
-        # index; it is independent of the primary block_id, so on a primary
-        # pool of size 4 with 4 offloaded blocks we typically observe a
-        # permutation rather than the identity.
-        diverged = [(bid, slot) for bid, slot in offloaded_slots.items() if bid != slot]
-        assert diverged, (
-            f"expected at least one offloaded block to have slot != block_id "
-            f"(otherwise this test cannot prove the fix is solving a real "
-            f"pointer-translation bug); got identity mapping {offloaded_slots}"
-        )
 
         # Onboard back: re-issue req_a with the same prompt. Reuse will
         # bring its blocks back to primary, possibly at *different*
@@ -689,9 +582,9 @@ def test_get_memory_pool_block_indices_with_offload_onboard():
         req_a2 = _run(2, prefill_tokens_a)
         block_ids_a2 = manager.get_batch_cache_indices([req_a2.py_request_id], layer_idx=0)[0]
         # After reuse-driven onboard, every block must be primary again
-        # (require_primary=True succeeds); its primary slot may differ from
-        # the logical block ID because onboard swaps slots in-place.
-        translated_a2 = manager.get_memory_pool_block_indices(block_ids_a2, require_primary=True)
+        # (translation succeeds); its primary slot may differ from the
+        # logical block ID because onboard swaps slots in-place.
+        translated_a2 = manager.get_memory_pool_block_indices(block_ids_a2, window_size=window)
         assert all(idx >= 0 for idx in translated_a2)
 
         # All translated indices must currently be live primary slots —
