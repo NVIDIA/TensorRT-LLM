@@ -805,6 +805,52 @@ class TestCosmos3V2V:
             )
 
 
+class TestCosmos3TransferRouting:
+    def test_transfer_use_system_prompt_defaults_off(self):
+        """Reference parity: transfer defaults ``use_system_prompt=False`` even
+        when a video input is present — V2V's default-True rule must not leak
+        into the transfer branch (vllm-omni ``_forward_transfer`` defaults False).
+        An explicit request value is still honored."""
+        from tensorrt_llm._torch.visual_gen.models.cosmos3.transfer import resolve_transfer_config
+
+        pipeline = Cosmos3OmniMoTPipeline.__new__(Cosmos3OmniMoTPipeline)
+        pipeline.transformer = SimpleNamespace(device=torch.device("cpu"))
+        pipeline.action_gen = False
+        pipeline.audio_gen = False
+        pipeline._set_flow_shift = lambda *args, **kwargs: None
+        captured = {}
+
+        def fake_forward_transfer(**kwargs):
+            captured.update(kwargs)
+            return None
+
+        pipeline._forward_transfer = fake_forward_transfer
+        cfg = resolve_transfer_config(
+            {"edge": True}, SimpleNamespace(num_frames=93, guidance_scale=None), None
+        )
+
+        for explicit, expected in ((None, False), (True, True)):
+            captured.clear()
+            pipeline.forward(
+                prompt="bounce",
+                video=_make_test_video(5, width=16, height=16),
+                transfer_config=cfg,
+                height=16,
+                width=16,
+                num_frames=5,
+                num_inference_steps=1,
+                guidance_scale=1.0,
+                seed=1,
+                max_sequence_length=8,
+                frame_rate=8.0,
+                use_duration_template=False,
+                use_resolution_template=False,
+                use_system_prompt=explicit,
+                use_guardrails=False,
+            )
+            assert captured["use_system_prompt"] is expected
+
+
 @pytest.mark.integration
 @pytest.mark.cosmos3_t2i
 @pytest.mark.high_cuda_memory
