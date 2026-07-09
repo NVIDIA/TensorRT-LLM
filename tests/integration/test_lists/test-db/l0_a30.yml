@@ -19,6 +19,7 @@ l0_a30:
   - unittest/_torch/modeling -k "modeling_qwen"
   - unittest/_torch/modeling -k "modeling_qwen_moe"
   - unittest/_torch/modeling -k "modeling_out_of_tree"
+  - unittest/_torch/modeling -k "modeling_speculative"
   - unittest/_torch/sampler/test_beam_search.py
   - unittest/_torch/sampler/test_beam_search_speculative_d2h.py
   - unittest/_torch/sampler/test_logits_logprobs.py
