@@ -347,6 +347,7 @@ Startup self-benchmarking is also configured as a nested option. For example:
    self_benchmark_config:
        mode: agg
        prefill_isl_granularity: 16
+       prefill_batch_granularity: 6
        prefill_kv_read_granularity: 4
        decode_context_granularity: 6
        decode_batch_granularity: 6

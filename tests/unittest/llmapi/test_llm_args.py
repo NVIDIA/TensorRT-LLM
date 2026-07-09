@@ -2066,6 +2066,7 @@ class TestServeDefaults:
         yaml_args = yaml.safe_load("""\
 self_benchmark_config:
   mode: decode
+  prefill_batch_granularity: 4
   decode_context_granularity: 3
   decode_batch_granularity: 2
   warmup_iterations: 0
@@ -2078,6 +2079,7 @@ self_benchmark_config:
         config = parsed.self_benchmark_config
         assert isinstance(config, SelfBenchmarkConfig)
         assert config.mode == "decode"
+        assert config.prefill_batch_granularity == 4
         assert config.decode_context_granularity == 3
         assert config.decode_batch_granularity == 2
         assert config.prefill_isl_granularity == 16

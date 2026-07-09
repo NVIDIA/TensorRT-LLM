@@ -63,7 +63,7 @@ class SelfBenchmark:
         self.config = executor.llm_args.self_benchmark_config
         self._grid = self._build_grid()
         self._grid_index = 0
-        # Per-point request-id stride must exceed the largest decode batch so
+        # Per-point request-id stride must exceed the largest synthetic batch so
         # point N's request ids never overflow into point N+1's id range.
         self._id_stride = max(1024, self._max_decode_batch_size() + 1)
         self._current: Optional[BenchmarkPointResult] = None
@@ -89,7 +89,7 @@ class SelfBenchmark:
     def make_prefill_requests(
         self, active_requests: list["LlmRequest"], waiting_queue: WaitingQueue
     ) -> list["LlmRequest"]:
-        """Build the synthetic prefill request for the next grid point.
+        """Build the synthetic prefill requests for the next grid point.
 
         Per-rank lockstep rationale: this runs on EVERY TP rank (alongside
         decode injection in ``_fetch_and_activate_new_requests``), not via the
@@ -99,9 +99,9 @@ class SelfBenchmark:
         deterministic function of ``point.index`` (which is itself driven by the
         grid + ``_grid_index``, advanced identically on all ranks), so the
         constructed ``LlmRequest`` is bit-for-bit identical across ranks:
-          * request id  -> ``_request_id(point.index, 0)`` (pure arithmetic)
+          * request ids -> ``_request_id(point.index, offset)`` (pure arithmetic)
           * prompt tokens -> ``[1] * isl`` (isl is a grid field)
-          * cache_salt  -> ``_cache_salt_id(point.index)`` (pure arithmetic)
+          * cache salts -> point salt + request offset (pure arithmetic)
           * max_tokens / sampling / end_id / pad_id -> constants
         Because the request is constructed locally on each rank, it must NOT be
         injected into rank 0's broadcast queue as well (that would double-inject
@@ -117,19 +117,20 @@ class SelfBenchmark:
             return []
 
         self._start_point(point)
-        request = self._make_prefill_request(point)
-        # Construct the LlmRequest locally on this rank instead of going through
-        # the rank-0 fetch + RequestBroadcaster path. exclude_last_generation
-        # logits is a deterministic engine-wide flag (identical across TP ranks).
-        llm_request = executor_request_to_llm_request(
-            req_id=self._request_id(point.index, 0),
-            executor_request=request,
-            child_req_ids=None,
-            exclude_last_generation_logits=self._exclude_last_generation_logits(),
-        )
-        llm_request.is_self_benchmark_request = True
-        llm_request.py_self_benchmark_point_id = point.index
-        return [llm_request]
+        requests = []
+        for offset in range(point.batch_size):
+            request = self._make_prefill_request(point, offset)
+            # Construct each LlmRequest locally on this rank instead of going
+            # through the rank-0 fetch + RequestBroadcaster path.
+            llm_request = executor_request_to_llm_request(
+                req_id=self._request_id(point.index, offset),
+                executor_request=request,
+                child_req_ids=None,
+                exclude_last_generation_logits=self._exclude_last_generation_logits(),
+            )
+            self._mark_benchmark_request(llm_request, point)
+            requests.append(llm_request)
+        return requests
 
     def make_decode_requests(
         self, active_requests: list["LlmRequest"], waiting_queue: WaitingQueue
@@ -329,28 +330,35 @@ class SelfBenchmark:
                 self._max_prefill_isl(), self.config.prefill_isl_granularity
             ):
                 for kv_read_tokens in self._kv_read_values_for_isl(isl):
-                    cache_salt_id = self._cache_salt_id(next_index)
-                    if kv_read_tokens > 0:
+                    batch_values = self._sample_values(
+                        self._max_prefill_batch_size(isl),
+                        self.config.prefill_batch_granularity,
+                    )
+                    for batch_size in batch_values:
+                        cache_salt_id = self._cache_salt_id(next_index)
+                        if kv_read_tokens > 0:
+                            grid.append(
+                                BenchmarkPoint(
+                                    point_type="prefill_seed",
+                                    index=next_index,
+                                    isl=kv_read_tokens,
+                                    kv_read_tokens=kv_read_tokens,
+                                    batch_size=batch_size,
+                                    cache_salt_id=cache_salt_id,
+                                )
+                            )
+                            next_index += 1
                         grid.append(
                             BenchmarkPoint(
-                                point_type="prefill_seed",
+                                point_type="prefill",
                                 index=next_index,
-                                isl=kv_read_tokens,
+                                isl=isl,
                                 kv_read_tokens=kv_read_tokens,
+                                batch_size=batch_size,
                                 cache_salt_id=cache_salt_id,
                             )
                         )
                         next_index += 1
-                    grid.append(
-                        BenchmarkPoint(
-                            point_type="prefill",
-                            index=next_index,
-                            isl=isl,
-                            kv_read_tokens=kv_read_tokens,
-                            cache_salt_id=cache_salt_id,
-                        )
-                    )
-                    next_index += 1
 
         if self.config.mode in ("decode", "agg"):
             context_values = self._sample_values(
@@ -372,7 +380,7 @@ class SelfBenchmark:
                     next_index += 1
         return grid
 
-    def _make_prefill_request(self, point: BenchmarkPoint) -> Request:
+    def _make_prefill_request(self, point: BenchmarkPoint, offset: int) -> Request:
         output_config = OutputConfig()
         output_config.return_perf_metrics = True
         cache_salt_id = point.cache_salt_id
@@ -391,7 +399,7 @@ class SelfBenchmark:
             pad_id=0,
             output_config=output_config,
             return_all_generated_tokens=False,
-            cache_salt=str(cache_salt_id),
+            cache_salt=f"{cache_salt_id}:{offset}",
         )
         request.py_is_self_benchmark_request = True
         request.py_self_benchmark_point_id = point.index
@@ -454,7 +462,7 @@ class SelfBenchmark:
         if self._current is None:
             return False
         if self._current.point.point_type in ("warmup", "prefill_seed", "prefill"):
-            return self._num_context_requests(stats) > 0
+            return self._num_context_requests(stats) >= self._current.point.batch_size
         if self._current.point.point_type == "decode":
             return self._num_decode_requests(stats) > 0
         return False
@@ -494,7 +502,9 @@ class SelfBenchmark:
                 and hasattr(req, "cached_tokens")
             )
         ]
-        return max(observed) if observed else None
+        if len(observed) != point.batch_size:
+            return None
+        return min(observed)
 
     def _should_record_current_point(self) -> bool:
         return self._current is not None and self._current.point.point_type not in (
@@ -554,6 +564,13 @@ class SelfBenchmark:
 
     def _max_prefill_isl(self) -> int:
         return self._bounded_length(default=1)
+
+    def _max_prefill_batch_size(self, isl: int) -> int:
+        max_batch_size = self._max_decode_batch_size()
+        max_num_tokens = getattr(self._executor, "max_num_tokens", None)
+        if not isinstance(max_num_tokens, int) or max_num_tokens <= 0:
+            return 1
+        return max(1, min(max_batch_size, max_num_tokens // max(1, isl)))
 
     def _max_decode_context_length(self) -> int:
         return max(1, self._bounded_length(default=2) - 1)

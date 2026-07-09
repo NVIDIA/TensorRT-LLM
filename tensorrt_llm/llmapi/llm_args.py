@@ -2676,7 +2676,7 @@ class SelfBenchmarkConfig(StrictBaseModel):
     mode: Literal["prefill", "decode", "agg"] = Field(
         default="agg",
         description=
-        "Self-benchmark mode. 'prefill' sweeps input sequence lengths, "
+        "Self-benchmark mode. 'prefill' sweeps input sequence lengths and batch sizes, "
         "'decode' sweeps decode context lengths and batch sizes, and 'agg' "
         "runs both sweeps.",
         status="prototype")
@@ -2685,6 +2685,12 @@ class SelfBenchmarkConfig(StrictBaseModel):
         default=16,
         description=
         "Number of input sequence length sample points in the prefill sweep.",
+        status="prototype")
+
+    prefill_batch_granularity: PositiveInt = Field(
+        default=6,
+        description=
+        "Number of batch size sample points for each prefill input sequence length.",
         status="prototype")
 
     prefill_kv_read_granularity: PositiveInt = Field(
