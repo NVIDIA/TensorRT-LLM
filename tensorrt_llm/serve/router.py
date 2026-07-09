@@ -828,9 +828,6 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
         self._load_weight = load_weight
         self._load_cap = load_cap
         self._track_routed_blocks = track_routed_blocks
-        # request key -> (flat block hashes, hash_algo). Key is id(request) on the
-        # standalone path, the disagg req_id on the coordinator path.
-        self._pending_routed_blocks: dict[int, tuple[list[BlockHash], str]] = {}
 
     def _create_server_state(self, server: str) -> KvCacheAwareServerState:
         return KvCacheAwareServerState(server, self._use_tokens,
@@ -842,25 +839,12 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
             await state.cancel_poll_task()
         await super().close()
 
-    def _stash_routed_blocks_on_route(self, key: int,
+    def _apply_routed_blocks_on_route(self, server: str,
                                       block_hashes: list[list[BlockHash]],
                                       hash_algo: str) -> None:
         if not self._track_routed_blocks:
             return
-        flat = [h for hl in block_hashes for h in hl]
-        self._pending_routed_blocks[key] = (flat, hash_algo)
-
-    def _apply_routed_blocks_on_finish(self, key: int, server: Optional[str],
-                                       success: bool) -> None:
-        # Pop unconditionally to avoid leaks; apply only when eligible.
-        entry = self._pending_routed_blocks.pop(key, None)
-        if not (self._track_routed_blocks and success):
-            return
-        if entry is None:
-            return
-        if server is None or server not in self._server_state:
-            return
-        flat_block_hashes, hash_algo = entry
+        flat_block_hashes = [h for hashes in block_hashes for h in hashes]
         self._server_state[server].add_blocks(flat_block_hashes,
                                               hash_algo=hash_algo)
 
@@ -1045,7 +1029,7 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
                     f"Selected server {server} is no longer available")
             await server_states[server].increment_load(request)
             self._req_routing_table[key] = server
-            self._stash_routed_blocks_on_route(key, block_hashes, hash_algo)
+            self._apply_routed_blocks_on_route(server, block_hashes, hash_algo)
         self._record_route_timing(time.monotonic() - route_start)
         return server, {
             "block_hashes": block_hashes,
@@ -1069,14 +1053,14 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
     async def _finish(self, key, success, request=None, session=None):
         """Finish through the core shared by standalone and coordinator paths.
 
-        This removes the maps populated by ``_route``, decrements load, commits
-        routed blocks on success, and refreshes the block table.
+        This removes the maps populated by ``_route``, decrements load, and
+        refreshes the block table. Routed blocks are applied at route time.
         """
+        del success
         async with self._lock:
             server = self._req_routing_table.pop(key, None)
             if server is not None and server in self._server_state:
                 await self._server_state[server].decrement_load(request)
-        self._apply_routed_blocks_on_finish(key, server, success)
         self._poll_server_on_finish(server, session)
 
     def _poll_server_on_finish(self, server, session=None):

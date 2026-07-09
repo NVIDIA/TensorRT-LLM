@@ -786,7 +786,7 @@ def test_kv_cache_aware_server_state_remove_blocks_silent_on_missing():
 
 
 @pytest.mark.asyncio
-async def test_kv_cache_aware_router_tracks_routed_blocks_at_routing(servers):
+async def test_kv_cache_aware_router_applies_routed_blocks_at_routing(servers):
     tokens_per_block = 4
     token_lists = [[1000, 1001, 1002, 1003, 1004, 1005, 1006, 1007, 1008]]
     router = KvCacheAwareRouter(server_role=None,
@@ -800,19 +800,17 @@ async def test_kv_cache_aware_router_tracks_routed_blocks_at_routing(servers):
                                 prompt=copy.deepcopy(token_lists))
     server, info = await router.get_next_server(request)
 
-    assert id(request) in router._pending_routed_blocks
-    stashed, stashed_algo = router._pending_routed_blocks[id(request)]
     expected_flat = [h for hl in info["block_hashes"] for h in hl]
-    assert stashed == expected_flat
-    assert stashed and not isinstance(stashed[0], list)
-    assert stashed_algo == info["hash_algo"]
+    block_table = router._server_state[server]._block_table(info["hash_algo"])
+    assert block_table.issuperset(expected_flat)
 
     await router.finish_request(request)
-    assert id(request) not in router._pending_routed_blocks
+    assert block_table.issuperset(expected_flat)
 
 
 @pytest.mark.asyncio
-async def test_kv_cache_aware_router_inserts_routed_blocks_on_finish(servers):
+async def test_kv_cache_aware_router_does_not_wait_for_finish_to_apply_blocks(
+        servers):
     tokens_per_block = 4
     token_lists = [[2000, 2001, 2002, 2003, 2004, 2005, 2006, 2007, 2008]]
     router = KvCacheAwareRouter(server_role=None,
@@ -829,7 +827,7 @@ async def test_kv_cache_aware_router_inserts_routed_blocks_on_finish(servers):
     hash_algo = info["hash_algo"]
 
     assert await router._server_state[server].matched_tokens(
-        info["block_hashes"], hash_algo=hash_algo) == 0
+        info["block_hashes"], hash_algo=hash_algo) == 8
 
     await router.finish_request(request)
 
@@ -855,8 +853,6 @@ async def test_kv_cache_aware_router_routed_blocks_disabled_skips_pending(
                                 prompt=copy.deepcopy(token_lists))
     server, info = await router.get_next_server(request)
 
-    assert router._pending_routed_blocks == {}
-
     await router.finish_request(request)
 
     assert await router._server_state[server].matched_tokens(
@@ -864,7 +860,7 @@ async def test_kv_cache_aware_router_routed_blocks_disabled_skips_pending(
 
 
 @pytest.mark.asyncio
-async def test_kv_cache_aware_router_drops_routed_blocks_on_failure(servers):
+async def test_kv_cache_aware_router_keeps_routed_blocks_on_failure(servers):
     tokens_per_block = 4
     token_lists = [[4000, 4001, 4002, 4003, 4004, 4005, 4006, 4007, 4008]]
     router = KvCacheAwareRouter(server_role=None,
@@ -877,13 +873,13 @@ async def test_kv_cache_aware_router_drops_routed_blocks_on_failure(servers):
     request = CompletionRequest(model="TinyLlama",
                                 prompt=copy.deepcopy(token_lists))
     server, info = await router.get_next_server(request)
-    assert id(request) in router._pending_routed_blocks
+    assert await router._server_state[server].matched_tokens(
+        info["block_hashes"], hash_algo=info["hash_algo"]) == 8
 
     await router.finish_request(request, success=False)
 
-    assert id(request) not in router._pending_routed_blocks
     assert await router._server_state[server].matched_tokens(
-        info["block_hashes"], hash_algo=info["hash_algo"]) == 0
+        info["block_hashes"], hash_algo=info["hash_algo"]) == 8
 
 
 @pytest.mark.asyncio
