@@ -1215,8 +1215,12 @@ def collectTestResults(pipeline, testFilter, globalVars)
                     --input-files=${inputfiles}
                 """
                 if (fileExists("rerun/rerun_report.html")) {
-                    trtllm_utils.uploadArtifacts("rerun/rerun_report.html", "${UPLOAD_PATH}/test-results/")
-                    echo "Rerun report: https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/test-results/rerun_report.html"
+                    try {
+                        trtllm_utils.uploadArtifacts("rerun/rerun_report.html", "${UPLOAD_PATH}/test-results/")
+                        echo "Rerun report: https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/test-results/rerun_report.html"
+                    } catch (Exception e) {
+                        echo "Failed to upload rerun report: ${e.toString()}"
+                    }
                 } else {
                     echo "No rerun test results found, skipping rerun report upload."
                 }
