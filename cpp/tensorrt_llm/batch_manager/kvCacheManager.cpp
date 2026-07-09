@@ -1414,6 +1414,16 @@ BlockPtr WindowBlockManager::reclaimSecondaryBlock()
     }
     auto victim = std::get<0>(mEvictionPolicy->getFreeBlock(kSecondaryLevel));
     mEvictionPolicy->claimBlock(victim);
+    // Reap landed read-pending releases BEFORE testing disk free space. Parked onboarded cards (and
+    // release-deferred blocks) sit OUTSIDE the free queues until reaped, so an onboard-heavy burst that
+    // parks every free disk card would drive getNumFreeBlocks(kDiskLevel) to 0, fire the early-return
+    // below, and never reach claimDiskTarget() -- the only other reap site -- wedging spills permanently.
+    // Reaping here (covering both reclaimSecondaryBlock callers) lets landed cards rejoin the disk free
+    // queue so the check sees the true count.
+    if (mNumDiskBlocks > 0)
+    {
+        reapReadPendingReleases();
+    }
     if (mNumDiskBlocks == 0 || victim->getUniqueTokens().empty() || mEvictionPolicy->getNumFreeBlocks(kDiskLevel) == 0)
     {
         return victim; // disk tier off, nothing reusable to keep, or disk full: same as before
