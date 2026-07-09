@@ -366,6 +366,30 @@ class TestInputReferenceMaterialization:
         # The temporary materialization is removed on rejection.
         assert list(tmp_path.iterdir()) == []
 
+    def test_malformed_base64_reference_raises_and_cleans_up(self, tmp_path):
+        generator = _StubVisualGen()
+        # "ABC" survives the lenient alphabet filter but has an invalid
+        # length, so b64decode raises.
+        request = VideoGenerationRequest(prompt="x", input_reference="ABC")
+        with pytest.raises(ValueError, match="not valid base64"):
+            parse_visual_gen_params(request, "vid-7", generator, media_storage_path=str(tmp_path))
+        assert list(tmp_path.iterdir()) == []
+
+    def test_upload_stream_failure_cleans_up_tmp(self, tmp_path):
+        generator = _StubVisualGen()
+
+        class _BrokenStream:
+            def read(self, *args, **kwargs):
+                raise OSError("client went away")
+
+        upload = UploadFile(file=_BrokenStream(), filename="clip.mp4")
+        request = VideoGenerationRequest(prompt="x", input_reference=upload)
+        # I/O failures keep their server-error semantics (no 400 masking) …
+        with pytest.raises(OSError, match="client went away"):
+            parse_visual_gen_params(request, "vid-8", generator, media_storage_path=str(tmp_path))
+        # … but the partial materialization must not leak.
+        assert list(tmp_path.iterdir()) == []
+
 
 # =============================================================================
 # _merge_extra_params — the merge truth table
