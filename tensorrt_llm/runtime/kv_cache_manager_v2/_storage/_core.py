@@ -86,18 +86,35 @@ _SPAN_PROTECT_FRACTION = float(os.getenv("TRTLLM_KV_ARENA_SPAN_PROTECT_FRACTION"
 
 
 class _CanonicalSpan:
-    """A closed canonical owner's resident prefix pages, pinned for aliasing
-    (P3). ``page_refs`` guard identity/liveness of every canonical (now
-    host-tier) page in the span -- any mismatch invalidates the entry, the
-    same discipline as the ghost registry. ``shared_per_pool`` holds one
-    registry reference per physical chunk (dropped on spill/invalidation);
-    ``ready_event`` covers the bytes' last writes (alias consumers wait it).
+    """A canonical owner's resident prefix pages, pinned for aliasing (P3).
+    ``page_refs`` guard identity/liveness of every canonical page in the
+    span -- any mismatch invalidates the entry, the same discipline as the
+    ghost registry. ``shared_per_pool`` holds one registry reference per
+    physical chunk (dropped on spill/invalidation); ``ready_event`` covers
+    the bytes' last writes (alias consumers wait it).
+
+    ``owner_base`` >= 0 marks an OWNER-LIVE span (P3 v2): registered at the
+    owner's context-end commit, while the pages are still the owner's
+    active KV in the range at that base block. Owner-live spans hold no
+    registry budget charge (the owner's range charge covers the pages) and
+    are exempt from spilling (dropping the pin frees nothing). The owner's
+    ``free_sequence`` flips the span to the registry-charged state
+    (owner_base = -1) -- the same accounting close-time registration
+    produces directly.
     """
 
-    __slots__ = ("page_refs", "shared_per_pool", "num_blocks", "num_pages", "ready_event")
+    __slots__ = (
+        "page_refs",
+        "shared_per_pool",
+        "num_blocks",
+        "num_pages",
+        "ready_event",
+        "owner_base",
+    )
     page_refs: "list[rawref.ref[Any]]"
     shared_per_pool: "list[list[SharedPhysMem]]"
     num_blocks: int
+    owner_base: int
 
     def is_live(self) -> bool:
         """Whether every pinned handle is still referenced. A registry hit is
@@ -121,6 +138,7 @@ class _CanonicalSpan:
         shared_per_pool: "list[list[SharedPhysMem]]",
         num_blocks: int,
         ready_event: CachedCudaEvent,
+        owner_base: int = -1,
     ) -> None:
         self.page_refs = page_refs
         self.shared_per_pool = shared_per_pool
@@ -130,6 +148,7 @@ class _CanonicalSpan:
             num_pages += len(shared)
         self.num_pages = num_pages
         self.ready_event = ready_event
+        self.owner_base = owner_base
 
 
 # A temporary work-around while migrating to new page index API.
@@ -1131,6 +1150,13 @@ class ArenaPoolGroup(PoolGroupBase):
         ready events of all released slots, and the release of every
         outstanding slot have all happened -- see :meth:`drain_reclaim`."""
         assert not rng._freed, "double free of a sequence range"
+        if rng._alias_span_key is not None:
+            # Single choke point for the owner-live -> registry-charged flip
+            # (P3 v2): close, evacuate, and error unwinds all free the range
+            # here, and an owner-live span must not outlive its range's
+            # charge (the registry pin keeps the physical handles alive, so
+            # unflipped it would hold pages the budget no longer counts).
+            self._commit_live_span_charge(rng)
         rng._freed = True
         rng._free_event = last_consumer
         self._pending_reclaim.append(rng)
@@ -1332,6 +1358,73 @@ class ArenaPoolGroup(PoolGroupBase):
         rng._alias_span_key = (key, num_blocks)
         self._canonical_spans[key] = span
 
+    def register_live_canonical_span(
+        self,
+        rng: SequenceRange,
+        pages: "Sequence[object]",
+        ready_event: CachedCudaEvent,
+    ) -> None:
+        """Pin a LIVE owner's committed leading prefix at context-end commit
+        (P3 v2 owner-live aliasing), so same-prefix admissions alias it while
+        the owner is still generating -- close-time registration makes the
+        whole first concurrent wave copy instead.
+
+        Differences from :meth:`register_canonical_span`: the pages are the
+        owner's active KV, so the span stays OWNER-CHARGED -- no budget
+        transfer, no retain, no alias-accounting mark on the range, and the
+        spill path skips it (dropping the pin frees nothing). The owner's
+        ``free_sequence`` (close, evacuate, and error unwinds all pass
+        through it) flips the entry to the registry-charged state via
+        :meth:`_commit_live_span_charge`."""
+        if not self._prefix_aliasing or not pages:
+            return
+        if rng._alias_span_key is not None:
+            return
+        arena = self._arena
+        num_blocks = arena.aliasable_prefix_blocks(rng.base_block, len(pages))
+        if num_blocks <= 0:
+            return
+        shared_per_pool = arena.shared_prefix_chunks(rng.base_block, num_blocks)
+        span = _CanonicalSpan(
+            [rawref.ref(p) for p in pages[:num_blocks]],
+            shared_per_pool,
+            num_blocks,
+            ready_event,
+            owner_base=rng.base_block,
+        )
+        if span.num_pages == 0:
+            return
+        key = id(pages[0])
+        old = self._canonical_spans.get(key)
+        if old is not None:
+            self._unpin_span(old)
+        for shared in shared_per_pool:
+            for s in shared:
+                s.add_ref()
+        rng._alias_span_key = (key, num_blocks)
+        self._canonical_spans[key] = span
+
+    def _commit_live_span_charge(self, rng: SequenceRange) -> None:
+        """Flip an owner-live span to the registry-charged state as its
+        owner's range is freed: transfer the span's budget charge from the
+        range to the registry (mark the chunks alias-accounted so the
+        range's park/adopt/reclaim math excludes them; release+consume nets
+        zero) and mark it retained -- exactly the accounting close-time
+        registration produces. No-op for alias CONSUMERS (their span belongs
+        to another owner) and for spans already flipped, superseded, or
+        invalidated."""
+        key_extent = rng._alias_span_key
+        assert key_extent is not None
+        span = self._canonical_spans.get(key_extent[0])
+        if span is None or span.owner_base != rng.base_block:
+            return
+        arena = self._arena
+        arena._aliased[rng.base_block] = arena._aliased.get(rng.base_block, 0) + span.num_pages
+        self._budget.release(span.num_pages)
+        self._budget.consume(span.num_pages)
+        self._budget.retain(span.num_pages)
+        span.owner_base = -1
+
     def lookup_canonical_span(
         self, head_page: object, matched_pages: "Sequence[object]"
     ) -> "tuple[int, _CanonicalSpan, int] | None":
@@ -1382,8 +1475,11 @@ class ArenaPoolGroup(PoolGroupBase):
         for shared in span.shared_per_pool:
             for s in shared:
                 s.drop_ref()
-        self._budget.unretain(span.num_pages)
-        self._budget.release(span.num_pages)
+        if span.owner_base < 0:
+            # Owner-live spans hold no registry charge (the owner's range
+            # charge covers the pages); only flipped spans release budget.
+            self._budget.unretain(span.num_pages)
+            self._budget.release(span.num_pages)
 
     def _invalidate_span(self, key: int, span: "_CanonicalSpan") -> None:
         self._canonical_spans.pop(key, None)
@@ -1392,12 +1488,17 @@ class ArenaPoolGroup(PoolGroupBase):
     def spill_canonical_spans(self, min_pages: int) -> int:
         """Drop canonical-span pins (insertion order ≈ LRU) until at least
         ``min_pages`` budget pages are freed. Live aliases keep their handles
-        (refcounts); future admissions fall back to host-copy reuse."""
+        (refcounts); future admissions fall back to host-copy reuse.
+        OWNER-LIVE spans are skipped: they hold no registry charge, so
+        dropping the pin would forfeit future aliasing and free nothing."""
         freed = 0
         for key in list(self._canonical_spans):
             if freed >= min_pages:
                 break
-            span = self._canonical_spans.pop(key)
+            span = self._canonical_spans[key]
+            if span.owner_base >= 0:
+                continue
+            del self._canonical_spans[key]
             self._unpin_span(span)
             self.spilled_spans += 1
             freed += span.num_pages
@@ -1405,7 +1506,10 @@ class ArenaPoolGroup(PoolGroupBase):
 
     @property
     def canonical_span_pages(self) -> int:
-        return sum(s.num_pages for s in self._canonical_spans.values())
+        """Registry-CHARGED span pages (the spillable/protected population).
+        Owner-live spans are excluded: their pages are charged to their
+        owner's range, not the registry."""
+        return sum(s.num_pages for s in self._canonical_spans.values() if s.owner_base < 0)
 
     def _find_range(self, slot_id: int) -> SequenceRange:
         idx = bisect_right(self._range_bases, slot_id) - 1

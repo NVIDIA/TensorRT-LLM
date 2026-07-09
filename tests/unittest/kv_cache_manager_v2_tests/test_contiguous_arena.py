@@ -957,6 +957,57 @@ class TestArenaPoolGroup(unittest.TestCase):
         def __init__(self) -> None:
             self.__rawref__ = rawref.NULL
 
+    def test_live_span_owner_charged_lifecycle(self) -> None:
+        """P3 v2 owner-live span: registered at commit time, owner-charged.
+
+        No budget transfer or retain while the owner lives, excluded from
+        the spillable population, spill-exempt, but fully lookupable and
+        aliasable; the owner's free_sequence flips it to the
+        registry-charged state with close-time-identical accounting.
+        """
+        group = self._group()
+        group._prefix_aliasing = True
+        try:
+            rng = group.reserve_sequence(4)
+            self.assertEqual(group.ensure_mapped(rng, 4), 6)
+            canon = [self._FakeCanonicalPage(), self._FakeCanonicalPage()]
+            group.register_live_canonical_span(rng, canon, CachedCudaEvent.NULL)
+            key = id(canon[0])
+            self.assertEqual(rng._alias_span_key, (key, 2))
+            # Owner-charged: no budget movement, not in the spillable set.
+            self.assertEqual(self.budget.used_pages, 6)
+            self.assertEqual(self.budget.retained_pages, 0)
+            self.assertEqual(group.canonical_span_pages, 0)
+            self.assertEqual(group.spill_canonical_spans(1 << 62), 0)  # exempt
+            self.assertEqual(group.spilled_spans, 0)
+            # Lookup + alias work exactly like a charged span.
+            hit = group.lookup_canonical_span(canon[0], canon)
+            self.assertIsNotNone(hit)
+            rng_b = group.reserve_sequence(4)
+            self.assertEqual(group.alias_span_into_range(rng_b, hit[0], hit[1], hit[2]), 3)
+            self.assertEqual(self.budget.used_pages, 6)  # aliases charge nothing
+            # Consumer close first: flip must NOT trigger (span belongs to rng).
+            group.free_sequence(rng_b, CachedCudaEvent.NULL)
+            self.assertEqual(self.budget.retained_pages, 0)
+            self.assertEqual(group.canonical_span_pages, 0)
+            # Owner close: charge flips range -> registry (release+consume
+            # nets zero; retained-at-will; alias-accounted on the range).
+            group.free_sequence(rng, CachedCudaEvent.NULL)
+            self.assertEqual(self.budget.used_pages, 6)
+            self.assertEqual(self.budget.retained_pages, 3)
+            self.assertEqual(group.canonical_span_pages, 3)
+            self.assertIsNotNone(group.lookup_canonical_span(canon[0], canon))
+            # Full teardown drains cleanly: parked ranges spill their
+            # non-aliased charge, the (now spillable) span spills the rest.
+            torch.cuda.synchronize()
+            group.drain_reclaim(CachedCudaEvent.NULL)
+            group.spill_retained(1 << 62)
+            self.assertEqual(group.spill_canonical_spans(1 << 62), 3)
+            self.assertEqual(self.budget.used_pages, 0)
+            self.assertEqual(group.mapped_pages, 0)
+        finally:
+            group.destroy()
+
     def test_canonical_span_registry_alias_roundtrip(self) -> None:
         """P3 registry roundtrip: register, alias, park, adopt affinely.
 
@@ -2465,6 +2516,78 @@ class TestArenaPrefixAliasing(unittest.TestCase):
             kv_d.close()
         s4.take_finish_event().synchronize()
         manager.drain_gpu_reclaim(CachedCudaEvent.NULL)
+
+    def test_owner_live_alias_while_owner_generating(self) -> None:
+        """P3 v2 owner-live aliasing at the manager seam.
+
+        A same-prefix admission aliases the owner's prefix pages while the
+        owner is still ACTIVE (just past its context-end commit) -- no
+        close required. Physical sharing is proven by writing through the
+        owner's VA and reading the change through the consumer's VA (a D2D
+        copy could not see it). The owner's later close flips the span to
+        the registry-charged state without disturbing anything.
+        """
+        manager = self.manager
+        budget = manager._storage.gpu_page_budget
+        pg = self._pool_group()
+        n_tok = self.PREFIX_BLOCKS * self.TPB
+        tokens = [9000 + i for i in range(n_tok)]
+
+        kv_a = manager.create_kv_cache(max_capacity=(self.PREFIX_BLOCKS + 4) * self.TPB)
+        with TemporaryCudaStream([]) as s:
+            self.assertTrue(kv_a.resume(CudaStream(s.handle)))
+            self.assertTrue(kv_a.resize(n_tok))
+            a_indices = list(kv_a.get_base_page_indices(LifeCycleId(0)))[: self.PREFIX_BLOCKS]
+            for j, idx in enumerate(a_indices):
+                self._block_floats(idx).fill_(float(j))
+            torch.cuda.synchronize()
+            kv_a.commit(tokens)
+            # Registered at the commit burst, owner-charged: entry exists
+            # but holds no registry charge and is not spillable.
+            self.assertEqual(len(pg._canonical_spans), 1)
+            self.assertEqual(pg.canonical_span_pages, 0)
+            self.assertEqual(budget.retained_pages, 0)
+            used_with_a_live = budget.used_pages
+
+            # B admits and resumes WHILE A is still generating.
+            kv_b = manager.create_kv_cache(
+                input_tokens=tokens + [1, 2],
+                max_capacity=(self.PREFIX_BLOCKS + 4) * self.TPB,
+            )
+            self.assertEqual(pg.alias_hits, 1)
+            with TemporaryCudaStream([]) as s2:
+                self.assertTrue(kv_b.resume(CudaStream(s2.handle)))
+                torch.cuda.synchronize()
+                b_indices = list(kv_b.get_base_page_indices(LifeCycleId(0)))[: self.PREFIX_BLOCKS]
+                for j, idx in enumerate(b_indices):
+                    self.assertTrue(
+                        bool((self._block_floats(idx) == float(j)).all().item()),
+                        f"block {j} bytes wrong through the alias",
+                    )
+                # Same physical pages, not a copy: a write through A's VA is
+                # visible through B's VA.
+                self._block_floats(a_indices[0]).fill_(-123.0)
+                torch.cuda.synchronize()
+                self.assertTrue(
+                    bool((self._block_floats(b_indices[0]) == -123.0).all().item()),
+                    "consumer VA does not share the owner's physical page",
+                )
+                # The aliased span chunk charged nothing for B.
+                self.assertLessEqual(budget.used_pages, used_with_a_live + 2)
+                # Consumer closes FIRST: the flip must not trigger.
+                kv_b.close()
+            s2.take_finish_event().synchronize()
+            self.assertEqual(pg.canonical_span_pages, 0)
+
+            kv_a.close()
+        s.take_finish_event().synchronize()
+        manager.drain_gpu_reclaim(CachedCudaEvent.NULL)
+        # A's close flipped the span to the registry-charged state.
+        self.assertEqual(pg.canonical_span_pages, 1)
+        self.assertGreaterEqual(budget.retained_pages, 1)
+        torch.cuda.synchronize()
+        manager._storage.spill_gpu_retained(1 << 62)
+        self.assertEqual(budget.used_pages, 0)
 
     def test_stale_span_falls_back_to_copy(self) -> None:
         """Spill between an admission's lookup hit and its first resume.

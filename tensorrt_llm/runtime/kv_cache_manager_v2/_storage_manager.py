@@ -607,6 +607,21 @@ class StorageManager:
             rng, pages, ready_event
         )
 
+    def register_arena_live_span(
+        self,
+        pg_idx: PoolGroupIndex,
+        rng: SequenceRange,
+        pages: Sequence[Page],
+        ready_event: CachedCudaEvent,
+    ) -> None:
+        """Pin a LIVE owner's committed leading prefix at context-end commit
+        for zero-copy aliasing while the owner is still generating (P3 v2).
+        ``pages``: the canonical page objects of the committed prefix,
+        ordinal order."""
+        self._gpu_arena_storage().pool_group(pg_idx).register_live_canonical_span(
+            rng, pages, ready_event
+        )
+
     def lookup_arena_canonical_span(
         self, pg_idx: PoolGroupIndex, head_page: Page, matched_pages: Sequence[Page]
     ) -> "tuple[int, object, int] | None":

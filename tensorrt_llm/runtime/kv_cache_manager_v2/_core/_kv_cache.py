@@ -224,6 +224,7 @@ class _KVCache:
         "_arena_ranges",
         "_write_through_slots",
         "_alias_spans",
+        "_arena_live_span_registered",
         "__rawref__",
     )
 
@@ -287,6 +288,10 @@ class _KVCache:
     # _setup_for_reuse, consumed (and cleared) by the FIRST resume's
     # reserve+onboard; never set on suspend/resume round-trips.
     _alias_spans: "list[tuple[int, Any] | None] | None"
+    # P3 v2 owner-live aliasing: one registration attempt per sequence, at
+    # its first commit burst (context end). Post-resume onboarded blocks are
+    # private copies, never registrable, so the flag never re-arms.
+    _arena_live_span_registered: bool
 
     def __init__(
         self,
@@ -335,6 +340,7 @@ class _KVCache:
         self._arena_ranges = None
         self._write_through_slots = {}
         self._alias_spans = None
+        self._arena_live_span_registered = False
         # Arena-mode preconditions are validated by KVCacheManager.create_kv_cache
         # (raising here would leave a partially constructed object for __del__).
         assert not manager._storage.is_arena_mode or (max_capacity is not None and max_capacity > 0)
@@ -983,6 +989,66 @@ class _KVCache:
     def _arena_take_write_through_slot(self, ordinal: int, lc_idx: LifeCycleId) -> Slot | None:
         return self._write_through_slots.pop((int(ordinal), int(lc_idx)), None)
 
+    def _arena_register_live_span(self) -> None:
+        """P3 v2 owner-live aliasing: pin this sequence's leading canonical
+        committed blocks in the span registry at its FIRST commit burst
+        (context end), so same-prefix admissions alias the prefix while this
+        sequence is still generating -- with close-time registration alone,
+        the whole first concurrent wave of a prompt class copies.
+
+        The entry stays owner-charged (the pages are our live KV: no
+        registry budget charge, no retain, exempt from spilling) until
+        ``free_sequence`` -- reached from close, evacuate, and error
+        unwinds alike -- flips it to the registry-charged state.
+
+        V1 scope mirrors close-time registration: pool groups with exactly
+        one non-SSM life cycle, and a contiguous CANONICAL run from ordinal
+        0 -- a commit-conflict loser's blocks are private copies
+        (``PrivateCommittedPage``) and stop the run, so losers register
+        nothing and the winner's entry serves their prompt class."""
+        storage = self._storage
+        if not storage.arena_prefix_aliasing:
+            return
+        ranges = self._arena_ranges
+        assert ranges is not None
+        life_cycles = self.manager._life_cycles
+        ssm_lc_id = life_cycles.ssm_life_cycle_id
+        lc_of_pg: dict[int, "LifeCycleId | None"] = {}
+        for lc_idx, _lc in life_cycles.items():
+            if lc_idx == ssm_lc_id:
+                continue
+            pg = int(storage.get_pool_group_index(lc_idx))
+            lc_of_pg[pg] = lc_idx if pg not in lc_of_pg else None  # None: multi-lc, skip
+        num_committed = int(self._num_committed_blocks)
+        beam_idx = DEFAULT_BEAM_INDEX
+        prior: CachedCudaEvent | None = None
+        for pg, lc_idx in lc_of_pg.items():
+            if lc_idx is None:
+                continue
+            rng = ranges[PoolGroupIndex(pg)]
+            if rng._alias_span_key is not None:
+                continue  # head is an alias; the original entry keeps serving
+            pages: list[CommittedPage] = []
+            for ordinal in range(num_committed):
+                block = self._blocks[ordinal]
+                if not block.is_committed:
+                    break
+                p = block.pages[beam_idx][lc_idx]
+                if p is None:
+                    break
+                page = p.page
+                if type(page) is not CommittedPage or page.cache_level != GPU_LEVEL:
+                    break  # private copy (commit loser) or offloaded: not ours to pin
+                pages.append(page)
+            if not pages:
+                continue
+            if prior is None:
+                # Consumers' first reads must order after the prefill step's
+                # KV writes; an event on the sequence's stream covers them
+                # (same discipline as the write-through copies).
+                prior = CachedCudaEvent(self.cuda_stream)
+            storage.register_arena_live_span(PoolGroupIndex(pg), rng, pages, prior)
+
     def _arena_release_unused_write_through(self) -> None:
         """Return any unconsumed write-through host slots to their pool."""
         storage = self.manager._storage
@@ -1485,6 +1551,16 @@ class _KVCache:
                         # committed, same as the entry guard above.
                         break
                     self._commit_block(ordinal, False)
+            if (
+                not self._arena_live_span_registered
+                and self._arena_ranges is not None
+                and self._num_committed_blocks > 0
+            ):
+                # P3 v2: the first commit burst is the context-end signal --
+                # register the owner-live span so concurrent same-prefix
+                # admissions alias instead of copying.
+                self._arena_live_span_registered = True
+                self._arena_register_live_span()
         if self.history_length < self.num_committed_tokens:
             self.history_length = self.num_committed_tokens
 
