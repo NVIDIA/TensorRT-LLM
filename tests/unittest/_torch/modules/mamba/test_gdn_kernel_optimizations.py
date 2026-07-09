@@ -16,6 +16,8 @@
 decode QKV packing, the dense in_proj row permutation, and the multi-row
 gated RMSNorm."""
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -459,3 +461,77 @@ def test_pack_gdn_decode_qkv(
     torch.testing.assert_close(actual_q.view(num_tokens, -1), expected_q, rtol=0, atol=0)
     torch.testing.assert_close(actual_k.view(num_tokens, -1), expected_k, rtol=0, atol=0)
     torch.testing.assert_close(actual_v.view(num_tokens, -1), expected_v, rtol=0, atol=0)
+
+
+# ---- Tests for the GDN compile boundary and derived state ----
+
+
+def test_gdn_custom_op_forwards_split_inputs(monkeypatch):
+    """The compile boundary consumes split inputs and mutates its output."""
+    import tensorrt_llm._torch.modules.mamba.gdn_mixer as gdn_mixer
+
+    class FakeMetadata:
+        num_tokens = 2
+        mamba_metadata = object()
+
+    class FakeLayer:
+        def forward_core(
+            self,
+            mixed_qkv,
+            a,
+            b,
+            attn_metadata,
+            mamba_metadata,
+            spec_metadata,
+            output,
+        ):
+            assert mixed_qkv.shape[0] == 2
+            assert a.shape[0] == 2
+            assert b.shape[0] == 2
+            assert attn_metadata is metadata
+            assert mamba_metadata is metadata.mamba_metadata
+            assert spec_metadata is None
+            output.fill_(5)
+
+    metadata = FakeMetadata()
+    monkeypatch.setattr(
+        gdn_mixer,
+        "_extract_gdn_extra_attrs",
+        lambda layer_idx: (metadata, FakeLayer(), None),
+    )
+    mixed_qkv = torch.zeros(3, 8)
+    a = torch.zeros(3, 2)
+    b = torch.zeros(3, 2)
+    output = torch.zeros(1, 3, 2, 2)
+
+    gdn_mixer.gdn_custom_op_inplace(mixed_qkv, a, b, "0", output)
+
+    torch.testing.assert_close(output[:, :2], torch.full_like(output[:, :2], 5))
+    torch.testing.assert_close(output[:, 2:], torch.zeros_like(output[:, 2:]))
+
+
+def test_gdn_attaches_only_static_fp8_scale():
+    from tensorrt_llm._torch.modules.linear import FP8QDQLinearMethod
+    from tensorrt_llm._torch.modules.mamba.gdn_mixer import Qwen3NextGatedDeltaNet
+    from tensorrt_llm._torch.modules.mamba.layernorm_gated import RMSNorm
+
+    layer = Qwen3NextGatedDeltaNet.__new__(Qwen3NextGatedDeltaNet)
+    torch.nn.Module.__init__(layer)
+    layer.norm = RMSNorm(8)
+    scale = torch.nn.Parameter(torch.tensor(0.13), requires_grad=False)
+    layer.out_proj = SimpleNamespace(
+        quant_method=FP8QDQLinearMethod(),
+        input_scale=scale,
+        force_dynamic_quantization=False,
+    )
+
+    layer.cache_derived_state()
+    assert not isinstance(layer.norm.fp8_scale, torch.nn.Parameter)
+    assert "fp8_scale" not in layer.norm.state_dict()
+    assert "fp8_scale" not in dict(layer.norm.named_parameters())
+    assert torch.equal(layer.norm.fp8_scale, scale)
+    assert layer.norm.fp8_scale.data_ptr() == scale.data_ptr()
+
+    layer.out_proj.force_dynamic_quantization = True
+    layer.cache_derived_state()
+    assert layer.norm.fp8_scale is None

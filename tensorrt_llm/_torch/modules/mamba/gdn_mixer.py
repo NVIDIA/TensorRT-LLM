@@ -28,7 +28,7 @@ from ...distributed import AllReduceParams
 from ...model_config import ModelConfig
 from ...speculative import SpecMetadata
 from ...utils import EventType, get_model_extra_attrs, is_torch_compiling
-from ..linear import Linear, TensorParallelMode
+from ..linear import FP8QDQLinearMethod, Linear, TensorParallelMode
 from ..multi_stream_utils import maybe_execute_in_parallel
 from .causal_conv1d import causal_conv1d_fn, causal_conv1d_update
 from .causal_conv1d_triton import causal_conv1d_update as causal_conv1d_update_triton
@@ -316,6 +316,19 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         self.event_dict = {key: torch.cuda.Event() for key in [EventType.Main, EventType.Attention]}
         self.aux_stream = aux_stream
 
+    def cache_derived_state(self) -> None:
+        """Attach downstream static quantization state after loading weights."""
+        self.norm.fp8_scale = None
+        if isinstance(self.out_proj.quant_method, FP8QDQLinearMethod):
+            scale = self.out_proj.quant_method.get_static_input_scale(self.out_proj)
+            # detach() strips the Parameter wrapper so nn.Module.__setattr__
+            # does not register the derived scale into norm's state_dict; the
+            # detached view still shares storage with out_proj.input_scale.
+            self.norm.fp8_scale = scale.detach() if scale is not None else None
+
+    def post_load_weights(self) -> None:
+        self.cache_derived_state()
+
     def _compute_tokenwise_inputs(self, hidden_states: torch.Tensor):
         def _compute_projected_states_qkvz():
             return self.in_proj_qkvz(hidden_states)
@@ -359,7 +372,11 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         # gated norm reads it through its token stride instead of packing a
         # copy.
         attn_out = rms_norm_gated_token_major(
-            attn_out.reshape(-1, self.head_v_dim), z, self.norm.weight, self.norm.eps
+            attn_out.reshape(-1, self.head_v_dim),
+            z,
+            self.norm.weight,
+            self.norm.eps,
+            fp8_scale=self.norm.fp8_scale,
         )
         attn_out = attn_out.view(-1, self.value_dim_per_tp)
         return self.out_proj(attn_out, all_reduce_params=all_reduce_params)

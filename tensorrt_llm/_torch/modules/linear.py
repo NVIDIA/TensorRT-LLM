@@ -610,6 +610,11 @@ class FP8QDQLinearMethod(UnquantizedLinearMethod):
 
     supports_nccl_symmetric_memory_window_output: ClassVar[bool] = True
 
+    def get_static_input_scale(self, module: Linear) -> Optional[torch.Tensor]:
+        if module.input_scale is not None and not module.force_dynamic_quantization:
+            return module.input_scale
+        return None
+
     def create_weights(self, module: Linear, in_features: int,
                        out_features: int, bias: bool, dtype: torch.dtype):
         weight_shape = (out_features, in_features)
@@ -643,12 +648,13 @@ class FP8QDQLinearMethod(UnquantizedLinearMethod):
         if input.dim() > 2:
             input = input.reshape(-1, input.shape[-1])
 
+        static_input_scale = self.get_static_input_scale(module)
         cur_input_scale = module.input_scale
         if input.dtype != torch.float8_e4m3fn:
-            if module.input_scale is not None and not module.force_dynamic_quantization:
+            if static_input_scale is not None:
                 # Static quantization
                 qinput, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
-                    input, module.input_scale)
+                    input, static_input_scale)
             else:
                 # Dynamic quantization
                 qinput, cur_input_scale = torch.ops.tensorrt_llm.quantize_e4m3_per_tensor(
