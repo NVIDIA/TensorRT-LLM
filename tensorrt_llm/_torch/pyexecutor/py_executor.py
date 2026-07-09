@@ -75,7 +75,8 @@ from .llm_request import (ATTENTION_DP_DUMMY_REQUEST_ID,
                           MAX_SPEC_DECODE_POSITIONS, ExecutorRequest,
                           LlmRequest, LlmRequestState, LlmResponse,
                           get_draft_token_length,
-                          initialize_multimodal_encoder_request)
+                          initialize_multimodal_encoder_request,
+                          is_multimodal_encoder_ready)
 from .mamba_cache_manager import (BaseMambaCacheManager,
                                   MixedMambaHybridCacheManager)
 from .model_engine import ModelEngine
@@ -252,7 +253,7 @@ def _strip_py_multimodal_data_post_prefill(request: LlmRequest) -> None:
     strip_mm_data_for_generation(mm_data)
     request.py_mm_encoder_outputs.clear()
     request.py_mm_encoder_output_buffer = None
-    request.py_mm_encoder_inflight_items.clear()
+    request.py_mm_encoder_output_offsets.clear()
 
 
 @dataclasses.dataclass
@@ -5011,17 +5012,14 @@ class PyExecutor:
         remaining_items = self.model_engine.encoder_batch_size
         remaining_tokens = self.model_engine.encoder_max_num_tokens
 
-        def consume_pending(costs, ready_outputs=None, inflight_items=None):
+        def consume_pending(costs, ready_outputs=None):
             nonlocal remaining_items, remaining_tokens
             ready_outputs = ready_outputs or [None] * len(costs)
-            inflight_items = inflight_items or set()
             progressed = False
             for item_idx, (cost, output) in enumerate(zip(costs,
                                                           ready_outputs)):
                 if output is not None:
                     continue
-                if item_idx in inflight_items:
-                    break
                 if remaining_items == 0 or cost > remaining_tokens:
                     break
                 remaining_items -= 1
@@ -5030,12 +5028,12 @@ class PyExecutor:
             return progressed
 
         for request in self.active_requests:
-            if not request.py_is_multimodal_encoder_request:
+            if (not request.py_is_multimodal_encoder_request
+                    or is_multimodal_encoder_ready(request)):
                 continue
             mm_data = request.py_multimodal_data or {}
             costs = mm_data.get("multimodal_encoder_token_lengths") or []
-            consume_pending(costs, request.py_mm_encoder_outputs,
-                            request.py_mm_encoder_inflight_items)
+            consume_pending(costs, request.py_mm_encoder_outputs)
 
         admitted = []
         deferred = []
@@ -5050,6 +5048,12 @@ class PyExecutor:
             has_full_embedding = (isinstance(mm_data, dict)
                                   and mm_data.get("multimodal_embedding")
                                   is not None)
+            if costs and any(cost > self.model_engine.encoder_max_num_tokens
+                             for cost in costs):
+                # Admit the invalid request so normal request validation can
+                # return an error instead of leaving the FCFS queue blocked.
+                admitted.append(queue_item)
+                continue
             if costs and not has_full_embedding and not consume_pending(costs):
                 blocked = True
                 deferred.append(queue_item)
@@ -5197,8 +5201,7 @@ class PyExecutor:
                 if self.is_multimodal_model:
                     initialize_multimodal_encoder_request(
                         request,
-                        max_num_tokens=self.model_engine.
-                        model_max_mm_encoder_item_tokens)
+                        max_num_tokens=self.model_engine.encoder_max_num_tokens)
                 return False
             except Exception as e:
                 self._handle_errors(str(e),

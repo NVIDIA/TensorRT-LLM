@@ -519,11 +519,8 @@ class MultimodalScheduler(RequestScheduler):
             ):
                 if output is not None:
                     continue
-                if item_idx in request.py_mm_encoder_inflight_items:
-                    break
                 if remaining_items == 0 or cost > remaining_tokens:
                     break
-                request.py_mm_encoder_inflight_items.add(item_idx)
                 request_items.append(item_idx)
                 remaining_items -= 1
                 remaining_tokens -= cost
@@ -558,9 +555,7 @@ class MultimodalScheduler(RequestScheduler):
             token_lengths = get_multimodal_encoder_token_lengths(request)
             if token_lengths is None:
                 return False
-            if request.py_mm_encoder_inflight_items or any(
-                output is not None for output in request.py_mm_encoder_outputs
-            ):
+            if any(output is not None for output in request.py_mm_encoder_outputs):
                 return False
             if len(token_lengths) > remaining_items or sum(token_lengths) > remaining_tokens:
                 return False

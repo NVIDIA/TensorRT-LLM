@@ -313,6 +313,7 @@ class PyTorchModelEngine(ModelEngine):
             self.encoder_batch_size,
             self.encoder_max_num_tokens,
         ) = llm_args.get_encoder_runtime_sizes()
+        self.configured_encoder_max_num_tokens = self.encoder_max_num_tokens
 
         if checkpoint_loader is None:
             checkpoint_loader = _construct_checkpoint_loader(
@@ -450,20 +451,26 @@ class PyTorchModelEngine(ModelEngine):
         if self.supports_mm_encoder_item_scheduling:
             max_tokens_per_item = self.input_processor.get_mm_max_tokens_per_item(
             )
-            if max_tokens_per_item:
-                model_max_atomic_item_tokens = max(max_tokens_per_item.values())
-                self.model_max_mm_encoder_item_tokens = (
-                    model_max_atomic_item_tokens)
-                if model_max_atomic_item_tokens > self.encoder_max_num_tokens:
-                    logger.warning_once(
-                        f"encoder_max_num_tokens={self.encoder_max_num_tokens} "
-                        "is smaller than the model's largest atomic "
-                        f"multimodal item ({model_max_atomic_item_tokens}); "
-                        f"using {model_max_atomic_item_tokens} as the "
-                        "effective runtime budget.",
-                        key="raise_encoder_max_num_tokens_for_atomic_item",
-                    )
-                    self.encoder_max_num_tokens = model_max_atomic_item_tokens
+            if not max_tokens_per_item:
+                raise ValueError(
+                    "A model with MM encoder item scheduling must implement "
+                    "get_mm_max_tokens_per_item()")
+            if any(value <= 0 for value in max_tokens_per_item.values()):
+                raise ValueError(
+                    "get_mm_max_tokens_per_item() must return positive token "
+                    "counts")
+            model_max_atomic_item_tokens = max(max_tokens_per_item.values())
+            self.model_max_mm_encoder_item_tokens = model_max_atomic_item_tokens
+            if model_max_atomic_item_tokens > self.encoder_max_num_tokens:
+                logger.warning_once(
+                    f"encoder_max_num_tokens={self.encoder_max_num_tokens} "
+                    "is smaller than the model's largest atomic "
+                    f"multimodal item ({model_max_atomic_item_tokens}); "
+                    f"using {model_max_atomic_item_tokens} as the "
+                    "effective runtime budget.",
+                    key="raise_encoder_max_num_tokens_for_atomic_item",
+                )
+                self.encoder_max_num_tokens = model_max_atomic_item_tokens
         self._set_up_multimodal_encoder_attn_metadata()
         if self.llm_args.enable_layerwise_nvtx_marker:
             layerwise_nvtx_marker = LayerwiseNvtxMarker()
@@ -2528,7 +2535,10 @@ class PyTorchModelEngine(ModelEngine):
         selected = []
         selected_owners: List[Tuple[LlmRequest, int]] = []
         for request_id, item_indices in scheduled_items.items():
-            request = request_by_id[request_id]
+            request = request_by_id.get(request_id)
+            if request is None:
+                raise RuntimeError(
+                    f"Scheduled MM request {request_id} is no longer active")
             multimodal_param = MultimodalParams(
                 multimodal_data=request.py_multimodal_data)
             for item_idx in item_indices:
@@ -2554,14 +2564,18 @@ class PyTorchModelEngine(ModelEngine):
                                                selected_owners,
                                                strict=True):
             embedding_lengths = get_multimodal_embedding_lengths(request)
-            if (embedding_lengths is not None
-                    and output.shape[0] != embedding_lengths[item_idx]):
-                raise ValueError(
-                    f"MM item {item_idx} produced {output.shape[0]} embeddings; "
-                    f"expected {embedding_lengths[item_idx]}")
             if embedding_lengths is None:
                 raise ValueError(
                     f"MM request {request.py_request_id} is missing embedding lengths"
+                )
+            if output.shape[0] != embedding_lengths[item_idx]:
+                raise ValueError(
+                    f"MM item {item_idx} produced {output.shape[0]} embeddings; "
+                    f"expected {embedding_lengths[item_idx]}")
+            output_offsets = request.py_mm_encoder_output_offsets
+            if len(output_offsets) != len(embedding_lengths) + 1:
+                raise ValueError(
+                    f"MM request {request.py_request_id} has invalid output offsets"
                 )
             if request.py_mm_encoder_output_buffer is None:
                 request.py_mm_encoder_output_buffer = torch.empty(
@@ -2576,12 +2590,11 @@ class PyTorchModelEngine(ModelEngine):
                 raise ValueError(
                     "MM encoder items for one request must have matching "
                     "output shape, dtype, and device")
-            output_start = sum(embedding_lengths[:item_idx])
-            output_end = output_start + embedding_lengths[item_idx]
+            output_start = output_offsets[item_idx]
+            output_end = output_offsets[item_idx + 1]
             output_view = output_buffer[output_start:output_end]
             output_view.copy_(output)
             request.py_mm_encoder_outputs[item_idx] = output_view
-            request.py_mm_encoder_inflight_items.discard(item_idx)
 
         touched_requests = {
             request.request_id: request

@@ -8,8 +8,11 @@ import torch
 from tensorrt_llm._torch.models.modeling_mistral import Mistral3InputProcessor
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import MultimodalModelMixin
 from tensorrt_llm._torch.models.modeling_qwen2vl import Qwen2VLInputProcessorBase
+from tensorrt_llm._torch.pyexecutor.executor_request_queue import RequestQueueItem
 from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
+from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm._torch.pyexecutor.scheduler.scheduler import MultimodalScheduler
+from tensorrt_llm._torch.pyexecutor.scheduler.waiting_queue import FCFSWaitingQueue
 from tensorrt_llm.inputs.multimodal import MultimodalParams, strip_mm_encoder_inputs
 
 
@@ -52,7 +55,6 @@ def _request(request_id, costs, *, ready=()):
             "multimodal_embedding_lengths": [1] * len(costs),
         },
         py_mm_encoder_outputs=outputs,
-        py_mm_encoder_inflight_items=set(),
         multimodal_lengths=None,
         is_context_init_state=False,
     )
@@ -67,8 +69,6 @@ def test_multimodal_scheduler_keeps_items_atomic_and_backfills_requests():
 
     assert output.scheduled_mm_encoder_items == {1: [0], 2: [0]}
     assert output.context_requests == [second]
-    assert first.py_mm_encoder_inflight_items == {0}
-    assert second.py_mm_encoder_inflight_items == {0}
 
 
 def test_multimodal_scheduler_uses_legacy_path_when_all_items_fit():
@@ -79,7 +79,6 @@ def test_multimodal_scheduler_uses_legacy_path_when_all_items_fit():
 
     assert output.scheduled_mm_encoder_items is None
     assert output.context_requests == [request]
-    assert request.py_mm_encoder_inflight_items == set()
 
 
 def test_multimodal_scheduler_uses_item_path_only_for_overflow():
@@ -90,7 +89,6 @@ def test_multimodal_scheduler_uses_item_path_only_for_overflow():
 
     assert output.scheduled_mm_encoder_items == {1: [0, 1]}
     assert output.context_requests == []
-    assert request.py_mm_encoder_inflight_items == {0, 1}
 
 
 def test_multimodal_scheduler_preserves_non_multimodal_requests():
@@ -126,6 +124,56 @@ def test_independent_mode_encodes_request_rejected_by_llm_capacity():
 
     assert output.scheduled_mm_encoder_items == {1: [0]}
     assert output.context_requests == [text_request]
+
+
+def _executor_for_mm_admission(active_requests, *, max_num_tokens=8):
+    executor = object.__new__(PyExecutor)
+    executor.enable_attention_dp = False
+    executor.dist = SimpleNamespace(tp_size=1)
+    executor.max_num_active_requests = 8
+    executor.is_benchmark_disagg = False
+    executor.is_multimodal_model = True
+    executor.model_engine = SimpleNamespace(
+        encoder_batch_size=8,
+        encoder_max_num_tokens=max_num_tokens,
+    )
+    executor.active_requests = active_requests
+    return executor
+
+
+def _waiting_item(request_id, costs=None):
+    multimodal_data = None
+    if costs is not None:
+        multimodal_data = {
+            "multimodal_encoder_token_lengths": costs,
+            "multimodal_embedding_lengths": [1] * len(costs),
+        }
+    return RequestQueueItem(
+        request_id,
+        SimpleNamespace(py_multimodal_data=multimodal_data),
+    )
+
+
+def test_mm_admission_does_not_charge_ready_active_request():
+    active = _request(1, [8])
+    active.py_multimodal_data["multimodal_embedding"] = torch.empty(1, 1)
+    waiting = FCFSWaitingQueue([_waiting_item(2, [8])])
+    executor = _executor_for_mm_admission([active])
+
+    admitted = executor._pop_from_waiting_queue(waiting, 1)
+
+    assert [item.id for item in admitted] == [2]
+    assert not waiting
+
+
+def test_mm_admission_passes_oversized_request_to_validation():
+    waiting = FCFSWaitingQueue([_waiting_item(1, [9]), _waiting_item(2, None)])
+    executor = _executor_for_mm_admission([], max_num_tokens=8)
+
+    admitted = executor._pop_from_waiting_queue(waiting, 0)
+
+    assert [item.id for item in admitted] == [1, 2]
+    assert not waiting
 
 
 def test_item_encoder_slices_and_restores_selected_item_order():
@@ -223,7 +271,7 @@ def test_item_outputs_fill_one_contiguous_buffer_and_release_raw_data(monkeypatc
         },
         py_mm_encoder_outputs=[None, None],
         py_mm_encoder_output_buffer=None,
-        py_mm_encoder_inflight_items={0, 1},
+        py_mm_encoder_output_offsets=[0, 2, 5],
         multimodal_lengths=None,
     )
 

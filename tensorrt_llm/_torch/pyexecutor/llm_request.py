@@ -685,7 +685,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_is_multimodal_encoder_request = False
         self.py_mm_encoder_outputs: List[Optional[torch.Tensor]] = []
         self.py_mm_encoder_output_buffer: Optional[torch.Tensor] = None
-        self.py_mm_encoder_inflight_items: set[int] = set()
+        self.py_mm_encoder_output_offsets: List[int] = []
         encoder_input_tokens = kwargs.get("encoder_input_tokens")
         encoder_output_len = kwargs.get("encoder_output_len")
         return_encoder_output = bool(kwargs.get("return_encoder_output", False))
@@ -1124,7 +1124,16 @@ def initialize_multimodal_encoder_request(request: LlmRequest,
     request.py_mm_encoder_outputs = ([None] * len(token_lengths)
                                      if token_lengths is not None else [])
     request.py_mm_encoder_output_buffer = None
-    request.py_mm_encoder_inflight_items.clear()
+    request.py_mm_encoder_output_offsets = []
+    if token_lengths is not None:
+        embedding_lengths = get_multimodal_embedding_lengths(request)
+        if embedding_lengths is None:
+            raise ValueError("Multimodal item scheduling requires "
+                             "multimodal_embedding_lengths")
+        request.py_mm_encoder_output_offsets.append(0)
+        for length in embedding_lengths:
+            request.py_mm_encoder_output_offsets.append(
+                request.py_mm_encoder_output_offsets[-1] + length)
 
 
 def is_multimodal_encoder_ready(request: LlmRequest) -> bool:
