@@ -210,3 +210,39 @@ def test_stop_profile_after_start_without_num_steps_cancels_pending(tmp_path):
 
     assert 11 not in executor.profile_start_iters
     assert executor._runtime_profile_pending_start_iter is None
+
+
+def test_start_profile_rejects_num_steps_zero(tmp_path):
+    """``num_steps == 0`` would make ``stop_iter == start_iter``;
+    ``profile_step()`` would discard the stop marker as stale and the
+    profile window would run forever. The Pydantic schema rejects this
+    at the HTTP layer, but programmatic callers must also see a clean
+    error rather than a silently-stuck profile window.
+    """
+    import pytest as _pytest
+
+    executor = _bare_executor()
+    executor.iter_counter = 5
+
+    with _pytest.raises(ValueError, match="num_steps must be >= 1"):
+        executor.start_profile(output_dir=str(tmp_path), num_steps=0)
+
+    # State must remain pristine — no pending markers, no scheduled
+    # iterations — because the request was rejected before any side
+    # effect happened.
+    assert executor._runtime_profile_pending_start_iter is None
+    assert not executor.profile_start_iters
+    assert not executor.profile_stop_iters
+
+
+def test_start_profile_rejects_num_steps_negative(tmp_path):
+    """Negative ``num_steps`` is also rejected for the same reason."""
+    import pytest as _pytest
+
+    executor = _bare_executor()
+    executor.iter_counter = 5
+
+    with _pytest.raises(ValueError, match="num_steps must be >= 1"):
+        executor.start_profile(output_dir=str(tmp_path), num_steps=-3)
+
+    assert executor._runtime_profile_pending_start_iter is None
