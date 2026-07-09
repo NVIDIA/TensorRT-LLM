@@ -1230,6 +1230,17 @@ void WindowBlockManager::startScheduling()
 
 void WindowBlockManager::freeLeafBlock(BlockPtr const& block)
 {
+    // Emit a KV "removed" event before detaching from the reuse trie. This
+    // path (partial-leaf reuse in onboardAndAllocateBlocks) previously dropped
+    // announced blocks from the trie silently: the block's hash had been
+    // published via enqueueStoredEvent when it was stored, but no removed
+    // event ever followed, so KV-event consumers that mirror the cache from
+    // stored/removed events retain the hash forever. Same event contract as
+    // getFreeBlock/releaseSubtree.
+    if (mEventManager && blockInRadixTree(block))
+    {
+        mEventManager->enqueueRemovedEvent(block, mWindowSize);
+    }
     // The eviction policy needs blocks to still be linked to their old parents when they're reclaimed.
     // This is so it can check if the parent should be queued for eviction.
     block->freeLeafBlock();
