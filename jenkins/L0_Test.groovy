@@ -3492,11 +3492,52 @@ def rerunFailedTests(stageName, llmSrc, testCmdLine, resultFileName="results.xml
             "--periodic-junit-xmlpath ${xmlFile}",
             "--reruns ${times - 1}"
         ]
+        def rerunProgressTar = "results-${stageName}-progress.tar.gz"
+        def rerunProgressUrl = "https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/test-results-progress/${rerunProgressTar}"
+        def rerunDoneFile = "${WORKSPACE}/.rerun${times}-done-${stageName}"
+        sh "rm -f ${rerunDoneFile}"
         try {
-            sh """
-                cd ${llmSrc}/tests/integration/defs && \
-                ${newTestCmdLine.join(" ")}
-            """
+            withCredentials([usernamePassword(
+                    credentialsId: 'urm-artifactory-creds',
+                    usernameVariable: 'ART_USER',
+                    passwordVariable: 'ART_PASS')]) {
+                sh """
+                    set +e
+                    # ---- background watcher for rerun${times} ----
+                    (
+                        while [ ! -f '${rerunDoneFile}' ]; do
+                            sleep ${PROGRESS_UPLOAD_INTERVAL_SEC}
+                            [ -f '${rerunDoneFile}' ] && break
+                            ( cd '${WORKSPACE}' && tar -czf '${rerunProgressTar}' '${stageName}/' ) || continue
+                            if curl -fsSL --retry 2 -u "\$ART_USER:\$ART_PASS" \\
+                                    -T '${WORKSPACE}/${rerunProgressTar}' '${rerunProgressUrl}'; then
+                                echo "[PROGRESS-UPLOAD] ${stageName}: rerun${times} checkpoint uploaded"
+                            else
+                                echo "[PROGRESS-UPLOAD] ${stageName}: rerun${times} checkpoint upload failed (non-fatal)"
+                            fi
+                        done
+                        echo "[PROGRESS-UPLOAD] ${stageName}: rerun${times} watcher exiting"
+                    ) &
+                    WATCHER_PID=\$!
+
+                    # ---- foreground rerun ----
+                    cd ${llmSrc}/tests/integration/defs && \\
+                    ${newTestCmdLine.join(" ")}
+                    rc=\$?
+
+                    touch '${rerunDoneFile}'
+                    wait \$WATCHER_PID 2>/dev/null || true
+
+                    # ---- immediate final snapshot of rerun${times} ----
+                    ( cd '${WORKSPACE}' && tar -czf '${rerunProgressTar}' '${stageName}/' ) && \\
+                    curl -fsSL --retry 2 -u "\$ART_USER:\$ART_PASS" \\
+                        -T '${WORKSPACE}/${rerunProgressTar}' '${rerunProgressUrl}' && \\
+                    echo "[PROGRESS-UPLOAD] ${stageName}: rerun${times} final snapshot uploaded" || \\
+                    echo "[PROGRESS-UPLOAD] ${stageName}: rerun${times} final snapshot upload failed (non-fatal)"
+
+                    exit \$rc
+                """
+            }
         } catch(InterruptedException e) {
             throw e
         } catch (Exception e) {
@@ -4216,6 +4257,16 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
 
                                 touch '${pytestDoneFile}'
                                 wait \$WATCHER_PID 2>/dev/null || true
+
+                                # ---- immediate final snapshot of run 1 ----
+                                if [ -f '${WORKSPACE}/${stageName}/results.xml' ]; then
+                                    ( cd '${WORKSPACE}' && tar -czf '${progressTar}' '${stageName}/' ) && \
+                                    curl -fsSL --retry 2 -u "\$ART_USER:\$ART_PASS" \
+                                        -T '${WORKSPACE}/${progressTar}' '${progressUrl}' && \
+                                    echo "[PROGRESS-UPLOAD] ${stageName}: uploaded run1 final snapshot" || \
+                                    echo "[PROGRESS-UPLOAD] ${stageName}: run1 final snapshot upload failed (non-fatal)"
+                                fi
+
                                 exit \$rc
                             """
                         }
