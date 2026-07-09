@@ -1,4 +1,3 @@
-import math
 import time
 import uuid
 from collections import defaultdict
@@ -263,21 +262,6 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 total += n * pool.slot_bytes
         return total
 
-    def _collect_base_slice(self, req: LlmRequest) -> KVSlice:
-        """Collect a full KVSlice (including metadata) for a request.
-
-        This returns the complete slice produced by ``_create_kv_slice``,
-        preserving fields like ``mamba_state_index`` that are required
-        for hybrid-state model transfers.
-
-        Args:
-            req: The LLM request whose KV cache block IDs to collect.
-
-        Returns:
-            A ``KVSlice`` with all metadata populated.
-        """
-        return self._create_kv_slice(req)
-
     @staticmethod
     def _split_packed_beam_block_ids(
         block_ids: np.ndarray,
@@ -527,6 +511,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 When True, aux data is sent and context_phase_params
                 is populated.
         """
+        assert req.py_beam_width == 1, "beam_width > 1 is not supported for chunked KV transfer"
         rid = get_unique_rid(req)
         assert rid is not None
         cuda_event = torch.cuda.Event()
@@ -534,18 +519,17 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
 
         session = self._get_or_create_send_session(req)
         self._send_reqs[rid] = req
-        base_slice = self._collect_base_slice(req)
+        base_slice = self._create_kv_slice(req)
         all_block_ids = base_slice.block_ids_per_layer_groups
         max_resident_blocks = max((len(ids) for ids in all_block_ids), default=0)
         tpb = self._reuse_adapter.tokens_per_block
-        prompt_len = getattr(req, "prompt_len", None)
-        if isinstance(prompt_len, int) and prompt_len > 0:
-            total_blocks = math.ceil(prompt_len / tpb)
-        elif base_slice.token_range is not None:
-            total_blocks = math.ceil(base_slice.token_range.end / tpb)
-        else:
-            total_blocks = max_resident_blocks
-        total_blocks = max(max_resident_blocks, total_blocks)
+        # prompt_len defines the full logical block span [0, total_blocks) that
+        # chunk offsets and the resident-suffix projection are expressed in.
+        # Resident block lists are a suffix of that span (and are capped to
+        # prompt_len blocks in _create_kv_slice), so total_blocks must never be
+        # smaller than the largest resident layer group.
+        prompt_blocks = (req.prompt_len + tpb - 1) // tpb
+        total_blocks = max(max_resident_blocks, prompt_blocks)
 
         chunk_start = min(chunk_start_block, total_blocks)
         chunk_end = min(chunk_end_block, total_blocks)
@@ -571,8 +555,6 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             block_ids_per_layer_groups=chunk_block_ids,
             mamba_state_index=base_slice.mamba_state_index,
             token_range=chunk_token_range,
-            chunk_block_offset=chunk_start,
-            transfer_chunk_size=chunk_block_count,
             total_blocks=total_blocks,
             cuda_event=cuda_event,
         )

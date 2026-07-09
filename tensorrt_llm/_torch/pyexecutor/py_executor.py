@@ -4748,6 +4748,10 @@ class PyExecutor:
 
         if (not self.is_warmup and self.kv_cache_transceiver is not None
                 and self.kv_cache_transceiver.enable_pipelined_transfer):
+            if request.py_beam_width != 1:
+                raise ValueError(
+                    "beam_width > 1 is not supported when enable_pipelined_transfer is set.")
+
             disagg_params = request.py_disaggregated_params
             if (disagg_params is None or disagg_params.schedule_style
                     != DisaggScheduleStyle.GENERATION_FIRST):

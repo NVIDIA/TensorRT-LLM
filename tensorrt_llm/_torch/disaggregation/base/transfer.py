@@ -56,6 +56,28 @@ class TokenRange:
             raise ValueError(f"Invalid range: [{self.start}, {self.end})")
 
 
+def derive_chunk_block_coords(
+    token_range: Optional[TokenRange],
+    tokens_per_block: int,
+) -> tuple[int, int]:
+    """Derive global chunk block offset and count from a block-aligned token_range."""
+    if token_range is None:
+        return 0, 0
+    if tokens_per_block <= 0:
+        raise ValueError("tokens_per_block must be positive")
+    if (
+        token_range.start % tokens_per_block != 0
+        or token_range.end % tokens_per_block != 0
+    ):
+        raise ValueError(
+            f"token_range [{token_range.start}, {token_range.end}) must be "
+            f"block-aligned with tokens_per_block={tokens_per_block}"
+        )
+    chunk_offset = token_range.start // tokens_per_block
+    chunk_block_count = (token_range.end - token_range.start) // tokens_per_block
+    return chunk_offset, chunk_block_count
+
+
 @dataclass
 class LayerRange:
     """Range of layers to transfer."""
@@ -75,7 +97,9 @@ class KVSlice:
     """A KV cache slice covering token_range = [start, end) of one request.
 
     Single-slice transfer uses [0, prompt_len) with is_last_slice=True;
-    multi-slice transfers split token_range and mark the last slice.
+    multi-slice (pipelined) transfers split token_range and mark the last slice.
+    For pipelined chunks, token_range is block-aligned and encodes the global
+    chunk position; derive block offset/count via derive_chunk_block_coords().
 
     Per-layer token starts are NOT encoded in token_range — they are derived
     from block count by the sender:
@@ -96,8 +120,6 @@ class KVSlice:
     )  # Physical block IDs per layer group, each np.ndarray(dtype=np.int64)
     is_last_slice: bool = False
     mamba_state_index: Optional[int] = None
-    chunk_block_offset: int = 0
-    transfer_chunk_size: Optional[int] = None
     total_blocks: Optional[int] = None
     cuda_event: Optional[torch.cuda.Event] = None
 
@@ -139,7 +161,7 @@ class SessionArgsBase:
 
     params: DisaggregatedParams
     # Captured from LlmRequest.prompt_len; needed for SWA stale_end derivation.
-    prompt_len: Optional[int] = None
+    prompt_len: int
     beam_width: int = 1
 
 
@@ -198,10 +220,11 @@ class TxSessionBase(_SessionBase):
 
         Args:
             slice: The KV slice describing which source blocks to send.
-                The slice's ``chunk_block_offset`` field is the shared
-                sender-side chunk cursor. Each layer group projects it into its
-                own resident/windowed source and destination block ranges.
-                The slice's ``cuda_event`` is an optional CUDA event to synchronize before initiating the RDMA transfer.
+                For pipelined chunks, ``token_range`` is the shared sender-side
+                chunk cursor; each layer group projects it into its own
+                resident/windowed source and destination block ranges.
+                The slice's ``cuda_event`` is an optional CUDA event to
+                synchronize before initiating the RDMA transfer.
         """
         ...
 

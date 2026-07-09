@@ -183,7 +183,7 @@ def _send_prefill_chunks(
     session.kv_tasks = []
     transceiver = MagicMock()
     transceiver._get_or_create_send_session.return_value = session
-    transceiver._collect_base_slice = MagicMock(return_value=base_slice)
+    transceiver._create_kv_slice = MagicMock(return_value=base_slice)
     transceiver._reuse_adapter.tokens_per_block = tokens_per_block
     transceiver._send_reqs = {}
 
@@ -191,6 +191,7 @@ def _send_prefill_chunks(
     req = MagicMock()
     req.py_disaggregated_params = DisaggregatedParams(disagg_request_id=42)
     req.prompt_len = prompt_len
+    req.py_beam_width = 1
 
     if chunk_size_blocks is None or chunk_size_blocks >= total_blocks:
         chunk_ranges = [(0, total_blocks)]

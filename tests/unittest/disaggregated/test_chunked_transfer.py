@@ -28,6 +28,7 @@ from tensorrt_llm import DisaggregatedParams
 from tensorrt_llm._torch.disaggregation.base.transfer import (
     KVSlice,
     SessionStatus,
+    TokenRange,
     WaitResult,
     project_blocks_to_global_chunk,
 )
@@ -70,32 +71,33 @@ def _stub_receiver():
     return receiver
 
 
-def _make_tx_session(num_slices: int, rid: int = 42, **kwargs) -> TxSession:
+def _make_tx_session(num_slices: int, rid: int = 42, prompt_len: int = 8, **kwargs) -> TxSession:
     """Create a real TxSession and send num_slices slices into it."""
     params = _make_params(rid)
     session = TxSession(
         request_id=rid,
         params=params,
         sender=_stub_sender(),
+        prompt_len=prompt_len,
         **kwargs,
     )
     for i in range(num_slices):
         s = KVSlice(
             is_last_slice=(i == num_slices - 1),
             block_ids_per_layer_groups=[[i]],
-            chunk_block_offset=i,
         )
         session.send(s)
     return session
 
 
-def _make_rx_session(num_slices: int, rid: int = 42) -> RxSession:
+def _make_rx_session(num_slices: int, rid: int = 42, prompt_len: int = 8) -> RxSession:
     """Create a real RxSession and receive num_slices slices into it."""
     params = _make_params(rid)
     session = RxSession(
         request_id=rid,
         params=params,
         receiver=_stub_receiver(),
+        prompt_len=prompt_len,
     )
     for i in range(num_slices):
         s = KVSlice(
@@ -104,27 +106,6 @@ def _make_rx_session(num_slices: int, rid: int = 42) -> RxSession:
         )
         session.receive(s)
     return session
-
-
-# ---------------------------------------------------------------------------
-# KVSendTask tests
-# ---------------------------------------------------------------------------
-
-
-def test_kv_send_task_chunk_block_offset():
-    """KVSendTask reads chunk_block_offset from the slice."""
-    s = KVSlice(is_last_slice=False, block_ids_per_layer_groups=[[0, 1]], chunk_block_offset=512)
-    task = KVSendTask(s, _make_params(), slice_id=1)
-    assert task._slice.chunk_block_offset == 512
-    assert task.slice_id == 1
-    assert task._slice is s
-
-
-def test_kv_send_task_default_offset():
-    """Default chunk_block_offset on KVSlice is 0."""
-    s = KVSlice(is_last_slice=True, block_ids_per_layer_groups=[[0]])
-    task = KVSendTask(s, _make_params(), slice_id=0)
-    assert task._slice.chunk_block_offset == 0
 
 
 # ---------------------------------------------------------------------------
@@ -221,13 +202,12 @@ def test_build_kv_write_meta_projects_asymmetric_layer_group_chunk():
                 np.array([4, 5, 6, 7], dtype=np.int64),
                 np.array([10, 11, 12], dtype=np.int64),
             ],
-            token_range=SimpleNamespace(end=64),
-            chunk_block_offset=4,
-            transfer_chunk_size=4,
+            token_range=TokenRange(start=32, end=64),
             total_blocks=8,
         ),
         _make_params(),
         slice_id=1,
+        prompt_len=64,
     )
     req_info = RecvReqInfo(
         sender_req_id=42,
@@ -330,12 +310,14 @@ def test_rx_session_status_error_on_any_failure():
     assert session.status == SessionStatus.ERROR
 
 
-def test_rx_session_process_aux_uses_last_task():
-    """process_aux_agent_result uses the last task's expected_transfers."""
-    session = _make_rx_session(3)
-    session._kv_tasks[0].expected_transfers = 99
-    session._kv_tasks[1].expected_transfers = 99
-    session._kv_tasks[2].expected_transfers = 1
+def test_rx_session_process_aux_completes_at_expected_transfers():
+    """Aux completes only once _aux_count reaches the RxSession's single
+    task's expected_transfers (the receiver always has exactly one task)."""
+    session = _make_rx_session(1)
+    session._kv_tasks[0].expected_transfers = 2
+
+    session.process_aux_agent_result(0, AgentResult.SUCCESS)
+    assert session._aux_status != TaskStatus.TRANSFERRED
 
     session.process_aux_agent_result(0, AgentResult.SUCCESS)
     assert session._aux_status == TaskStatus.TRANSFERRED
@@ -444,6 +426,7 @@ def test_pipelined_transfer_requires_gen_first_flow():
 
     request = MagicMock()
     request.sampling_config = None
+    request.py_beam_width = 1
     request.py_disaggregated_params = SimpleNamespace(
         schedule_style=DisaggScheduleStyle.CONTEXT_FIRST)
 
@@ -476,7 +459,7 @@ def test_pipelined_last_chunk_defers_aux_finalization(monkeypatch):
     transceiver._send_reqs = {}
     transceiver._reuse_adapter.tokens_per_block = 4
     transceiver._page_table = MagicMock()
-    transceiver._collect_base_slice.return_value = KVSlice(
+    transceiver._create_kv_slice.return_value = KVSlice(
         is_last_slice=False,
         block_ids_per_layer_groups=[
             np.array([0, 1], dtype=np.int64),
@@ -487,6 +470,7 @@ def test_pipelined_last_chunk_defers_aux_finalization(monkeypatch):
         py_disaggregated_params=DisaggregatedParams(disagg_request_id=42),
         request_id=42,
         prompt_len=8,
+        py_beam_width=1,
     )
 
     KvCacheTransceiverV2.send_prefill_chunk(
@@ -511,12 +495,12 @@ def test_cuda_event_stored_on_task():
     """KVSlice stores cuda_event correctly."""
     event = MagicMock()
     s = KVSlice(is_last_slice=False, cuda_event=event, block_ids_per_layer_groups=[[0, 1]])
-    task = KVSendTask(s, MagicMock(disagg_request_id=1), slice_id=0)
+    task = KVSendTask(s, MagicMock(disagg_request_id=1), slice_id=0, prompt_len=8)
     assert task._slice.cuda_event is event
 
 
 def test_cuda_event_none_by_default():
     """KVSlice.cuda_event defaults to None."""
     s = KVSlice(is_last_slice=True, block_ids_per_layer_groups=[[0]])
-    task = KVSendTask(s, MagicMock(disagg_request_id=1), slice_id=0)
+    task = KVSendTask(s, MagicMock(disagg_request_id=1), slice_id=0, prompt_len=8)
     assert task._slice.cuda_event is None

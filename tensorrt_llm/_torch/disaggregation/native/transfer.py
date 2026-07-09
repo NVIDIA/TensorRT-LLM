@@ -38,6 +38,7 @@ from tensorrt_llm._torch.disaggregation.base.transfer import (
     SessionStatus,
     TxSessionBase,
     WaitResult,
+    derive_chunk_block_coords,
     project_blocks_to_global_chunk,
 )
 from tensorrt_llm._torch.disaggregation.native.auxiliary import AuxBuffer
@@ -243,8 +244,8 @@ class KVSendTask(SendTaskBase):
 
     Args:
         kv_slice: The KV slice describing which blocks to transfer.
-            The slice's ``chunk_block_offset`` field indicates the
-            shared global chunk cursor in block units.
+            For pipelined chunks, ``token_range`` encodes the shared global
+            chunk cursor in block-aligned token units.
             The slice's ``cuda_event`` is an optional CUDA event to synchronize before initiating the RDMA transfer.
         params: Disaggregated serving parameters for this request.
         slice_id: Index of this slice within the session's task list.
@@ -255,7 +256,7 @@ class KVSendTask(SendTaskBase):
         kv_slice: KVSlice,
         params: DisaggregatedParams,
         slice_id: int,
-        prompt_len: Optional[int] = None,
+        prompt_len: int,
         beam_width: int = 1,
     ) -> None:
         super().__init__(params)
@@ -554,14 +555,9 @@ class Sender(SenderBase):
             task.fail(
                 RuntimeError(f"session {write_meta.unique_rid} {status.value}, transfer aborted")
             )
-            self._get_or_connect_dealer(write_meta.peer_endpoint).send(
-                _make_kv_result_msg(
-                    self._instance_rank,
-                    write_meta.unique_rid,
-                    write_meta.slice_id,
-                    True,  # is_last_slice — ensures receiver resolves its task future
-                    AgentResult.FAILED,
-                )
+            # is_last=True ensures the receiver resolves its task event.
+            self._send_kv_result_to_receiver(
+                write_meta, is_last=True, result=AgentResult.FAILED
             )
             return
 
@@ -603,24 +599,20 @@ class Sender(SenderBase):
         if timer:
             timer.record_transfer_end(write_meta.peer_rank)
 
-        # The receiver always has a single monolithic task (slice_id=0).
-        # Sender-side chunking is transparent to the receiver: only the
-        # last chunk carries is_last_slice=True so the receiver knows
-        # when all data has arrived.
+        # Intermediate chunk results are sent (not suppressed) so that RDMA
+        # failures propagate to the receiver immediately rather than requiring
+        # a timeout. Only the last chunk carries is_last_slice=True.
         tail = (
             encode_result_tail(write_meta)
             if send_slot_id is not None and agent_result == AgentResult.SUCCESS
             else None
         )
-        result_msg = _make_kv_result_msg(
-            self._instance_rank,
-            write_meta.unique_rid,
-            write_meta.slice_id,
-            write_meta.is_last_slice,
-            agent_result,
+        self._send_kv_result_to_receiver(
+            write_meta,
+            is_last=write_meta.is_last_slice,
+            result=agent_result,
             tail=tail,
         )
-        self._get_or_connect_thread_dealer(write_meta.peer_endpoint).send(result_msg)
 
         if timer:
             timer.record_task_end(write_meta.peer_rank)
@@ -648,6 +640,30 @@ class Sender(SenderBase):
             f"deliver_kv_to_agent completed: unique_rid={write_meta.unique_rid}, "
             f"slice_id={write_meta.slice_id}, agent_result={agent_result}"
         )
+
+    def _send_kv_result_to_receiver(
+        self,
+        write_meta: WriteMeta,
+        is_last: bool,
+        result: AgentResult,
+        tail=None,
+    ) -> None:
+        """Send a KV_AGENT_RESULT for a worker-thread delivery outcome.
+
+        Covers every per-slice outcome (pre-transfer abort, RDMA failure, and
+        success). The receiver always has a single monolithic task, so
+        sender-side chunking is transparent to it and slice_id is always 0.
+        Uses the per-thread DEALER because this runs on worker threads.
+        """
+        result_msg = _make_kv_result_msg(
+            self._instance_rank,
+            write_meta.unique_rid,
+            0,  # receiver slice_id: always the single monolithic task
+            is_last,
+            result,
+            tail=tail,
+        )
+        self._get_or_connect_thread_dealer(write_meta.peer_endpoint).send(result_msg)
 
     @nvtx_range("_deliver_aux_to_agent")
     def _deliver_aux_to_agent(self, write_meta: WriteMeta):
@@ -777,16 +793,29 @@ class Sender(SenderBase):
 
             tpb = extractor.page_table.tokens_per_block
             token_range = task._slice.token_range
-            slice_end = (
-                task._prompt_len
-                if task._prompt_len is not None
-                else (token_range.end if token_range is not None else 0)
-            )
+            slice_end = task._prompt_len
             total_blocks = task._slice.total_blocks
             if total_blocks is None:
                 total_blocks = (slice_end + tpb - 1) // tpb
-            chunk_offset = task._slice.chunk_block_offset
-            chunk_block_count = task._slice.transfer_chunk_size
+            # A slice is chunked (pipelined) when it is not the last slice or
+            # its block-aligned token_range starts past the sequence beginning.
+            # Only chunked slices need block-space chunk coordinates; a full
+            # transfer's token_range (end = prompt_len + extra) need not be
+            # block-aligned, so avoid deriving/validating it in that case.
+            is_chunked = (not task._slice.is_last_slice) or (
+                token_range is not None and token_range.start > 0
+            )
+            chunk_offset, chunk_block_count = (
+                derive_chunk_block_coords(token_range, tpb)
+                if is_chunked
+                else (0, 0)
+            )
+            # Resident block lists are the suffix of a range ending at the
+            # current global chunk boundary when pipelined, or at the full
+            # prompt end otherwise. token_start = (suffix_end - n_blocks) * tpb.
+            suffix_end_blocks = (
+                chunk_offset + chunk_block_count if is_chunked else total_blocks
+            )
 
             for (self_lg, self_pi), (peer_lg, peer_pi) in pool_mapping.items():
                 src_block_ids = src_block_ids_per_groups[self_lg]
@@ -795,7 +824,7 @@ class Sender(SenderBase):
                 # When sender uses chunking, the receiver sends all dst blocks
                 # in a single RecvReqInfo. Project the global chunk cursor into
                 # each destination layer group's resident/windowed block range.
-                if chunk_offset > 0 or not task._slice.is_last_slice:
+                if is_chunked:
                     dst_projectable_blocks = full_dst_block_ids[:total_blocks]
                     dst_block_ids = project_blocks_to_global_chunk(
                         dst_projectable_blocks,
@@ -838,27 +867,13 @@ class Sender(SenderBase):
                     f"dst beam-0 block list ({dst_beam0_blocks}) exceeds total slice "
                     f"blocks ({total_blocks}); slice_end={slice_end}, tpb={tpb}"
                 )
-                if chunk_block_count is not None and (
-                    chunk_offset > 0 or not task._slice.is_last_slice
-                ):
-                    # Chunked lists are suffixes of the current global chunk,
-                    # not of the full prompt.
-                    src_start = (chunk_offset + chunk_block_count - src_beam0_blocks) * tpb
-                    dst_start = (chunk_offset + chunk_block_count - dst_beam0_blocks) * tpb
-                else:
-                    src_start = (total_blocks - src_beam0_blocks) * tpb
-                    dst_start = (total_blocks - dst_beam0_blocks) * tpb
+                src_start = (suffix_end_blocks - src_beam0_blocks) * tpb
+                dst_start = (suffix_end_blocks - dst_beam0_blocks) * tpb
                 if req_info.dst_start_token is not None:
                     dst_start = max(dst_start, req_info.dst_start_token)
                 if window_size is not None:
                     # SWA stale_end uses the request prompt_len (not slice_end —
-                    # they differ for non-final slices). prompt_len must be plumbed
-                    # via the session; falling back to slice_end is wrong on
-                    # non-final slices.
-                    assert task._prompt_len is not None, (
-                        "SWA layer requires session.prompt_len; "
-                        "set TxSession(prompt_len=request.prompt_len)."
-                    )
+                    # they differ for non-final slices).
                     stale_end = max(0, (task._prompt_len + 1 - window_size) // tpb)
                     src_start = max(stale_end * tpb, src_start)
                     dst_start = max(stale_end * tpb, dst_start)
@@ -1204,9 +1219,9 @@ class TxSession(TxSessionBase):
         request_id: int,
         params: DisaggregatedParams,
         sender: Sender,
+        prompt_len: int,
         aux_buffer: Optional[AuxBuffer] = None,
         timeout_s: Optional[float] = None,
-        prompt_len: Optional[int] = None,
         beam_width: int = 1,
     ):
         super().__init__(
@@ -1802,9 +1817,9 @@ class RxSession(RxSessionBase):
         request_id: int,
         params: DisaggregatedParams,
         receiver: Receiver,
+        prompt_len: int,
         aux_buffer: Optional[AuxBuffer] = None,
         timeout_s: Optional[float] = None,
-        prompt_len: Optional[int] = None,
         beam_width: int = 1,
     ):
         super().__init__(
@@ -1972,15 +1987,15 @@ class RxSession(RxSessionBase):
                 )
 
     def process_aux_agent_result(self, _peer_rank: int, status: AgentResult):
-        # Aux is session-level (not per-slice); use the final KV task's
-        # expected transfer count so chunked sessions wait for all senders.
+        # Aux is session-level (not per-slice); the RxSession's single task's
+        # expected_transfers is the number of sender transfers to wait for.
         with self.lock:
             if not self._kv_tasks:
                 logger.warning(
                     f"Aux result received before any KV tasks for request {self.request_id}"
                 )
                 return
-            task = self._kv_tasks[-1]
+            task = self._kv_tasks[0]
             if status == AgentResult.SUCCESS:
                 self._aux_count += 1
 
