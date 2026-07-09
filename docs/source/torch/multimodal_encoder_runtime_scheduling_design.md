@@ -10,7 +10,7 @@ SPDX-License-Identifier: Apache-2.0
 | Status | Proposed |
 | Scope | TensorRT-LLM PyTorch backend |
 | Follow-up | [PR #13503: encoder sizing controls](https://github.com/NVIDIA/TensorRT-LLM/pull/13503) |
-| Last updated | 2026-07-06 |
+| Last updated | 2026-07-09 |
 
 ## Summary
 
@@ -27,8 +27,8 @@ the number of placeholder embeddings inserted into the LLM prompt.
 
 The default admission policy follows the vLLM model: an MM request rejected by LLM capacity does not
 run its encoder independently. An opt-in environment variable enables an experimental independent
-policy for A/B testing. That policy may encode waiting requests into request-local storage before an
-LLM slot is available, without adding those requests to the LLM active set.
+policy for A/B testing. That policy lets an already-admitted request make encoder progress before the
+current iteration's LLM-capacity filtering; it does not pre-encode waiting requests.
 
 This is a design specification. A prototype on the development branch may contain request-level
 scheduling, native encoder request states, or video temporal splitting that this document explicitly
@@ -227,32 +227,31 @@ ensures that the scheduler never submits more physical work than it reserved.
 
 ## Mutable request-local state
 
-The Python request owns fixed-size item slots and an in-flight set:
+The Python request owns fixed-size item slots, one contiguous output buffer, and precomputed offsets:
 
 ```python
 py_mm_encoder_outputs: list[Optional[torch.Tensor]]
 py_mm_encoder_output_buffer: Optional[torch.Tensor]
-py_mm_encoder_inflight_items: set[int]
+py_mm_encoder_output_offsets: list[int]
 ```
 
-An item has exactly one of three states:
+An item has exactly one of two persistent states:
 
-| State | Output slot | In-flight set | Meaning |
-| --- | --- | --- | --- |
-| `PENDING` | `None` | absent | Eligible for selection |
-| `INFLIGHT` | `None` | present | Selected but not committed |
-| `READY` | tensor | absent | Reusable request-local result |
+| State | Output slot | Meaning |
+| --- | --- | --- |
+| `PENDING` | `None` | Eligible for selection |
+| `READY` | tensor | Reusable request-local result |
 
-The scheduler marks an item `INFLIGHT` at selection time, before execution. This reservation prevents
-an overlapped or pipelined scheduling turn from selecting the same item twice. An old in-flight item is
-not considered ready for same-step LLM eligibility.
+Selection does not mutate request state. The current executor consumes one schedule result before
+constructing another result that could select the same item. Keeping selection in the serialized
+scheduler output avoids reservations that could leak when a result is canceled or discarded.
 
 On the first successful item, the executor allocates one contiguous final output buffer using the
 declared per-item embedding lengths. Each completed item is copied directly into its canonical slice;
 the output slots hold views into this buffer rather than independent allocations. Once all slots are
 ready, that same buffer becomes `multimodal_embedding` without a final `torch.cat` allocation. On
-request cancellation, validation failure, or execution error, the buffer, slots, and reservations are
-released with the request.
+request cancellation, validation failure, or execution error, the buffer and slots are released with
+the request.
 
 ## Scheduler architecture
 
@@ -304,7 +303,9 @@ The selection rules are deliberately simple and deterministic:
 3. Running/admitted requests may backfill across requests: if one request's next item cannot fit, the
    scheduler may consider another active request.
 4. New waiting MM admission is strict FCFS. If the head request cannot make initial progress with its
-   first pending item, stop admitting later waiting MM requests in that turn.
+   first pending item, stop admitting all later waiting requests in that turn to preserve strict FCFS.
+   An item larger than the effective budget is admitted so normal validation can fail that request
+   instead of permanently blocking the queue.
 5. Preserve the existing scheduler-policy order when passing ready requests to the
    MicroBatchScheduler. Do not append newly completed MM requests at the end.
 
@@ -318,8 +319,8 @@ An admitted request is eligible for the current LLM microbatch when every requir
 - already `READY`; or
 - selected for encoder execution in this same schedule result.
 
-Items left over from an earlier in-flight turn do not satisfy the second condition. If the request is
-selected by the MicroBatchScheduler, execution runs its selected encoder items, assembles the full
+If the request is selected by the MicroBatchScheduler, execution runs its selected encoder items,
+assembles the full
 embedding, and runs the LLM forward in the same iteration. This preserves the existing MM latency
 behavior.
 
@@ -360,16 +361,17 @@ TLLM_MM_ENCODER_INDEPENDENT_SCHEDULING=1
 
 The default is `0`. This is intentionally not a public `LlmArgs` field in the initial experiment.
 
-Independent mode may encode an MM request even when it has no LLM slot. Such requests live in a
-separate Python collection:
+The implementation also has two diagnostic/rollout environment variables:
 
-```python
-independent_mm_encoder_requests: list[LlmRequest]
+```text
+TLLM_MM_ENCODER_RUNTIME_SCHEDULING=0  # disable item scheduling; default is 1
+TLLM_MM_ENCODER_FORWARD_LOG=1         # log Qwen-style grid item/token counts
 ```
 
-They are not appended to `active_requests`, and `active_requests` must never exceed the existing LLM
-capacity as a side effect of this mode. Completed outputs stay in request-local slots until normal LLM
-admission. The same FCFS and atomic-item rules apply.
+Independent mode selects encoder items from the existing `active_requests` before LLM capacity
+filtering. It lets an already-admitted request continue encoder progress in an iteration where LLM
+capacity rejects it; it does not create a separate pre-admission collection or increase the active
+request limit. Completed outputs stay request-local until normal LLM scheduling.
 
 Independent mode changes only admission. Both policies use the same serial execution order, item
 selection, model hooks, correctness checks, and output assembly, which makes throughput and latency
@@ -433,10 +435,10 @@ behavior.
 
 ### Physical grouping
 
-Scheduler packing is modality- and shape-agnostic. During execution, the model groups **consecutive**
-selected items that have compatible modality, fields, dtype/device, and shape/configuration
-requirements. An incompatible sequence produces multiple physical encoder forwards, all charged to
-the one per-iteration budget.
+Scheduler packing is modality- and shape-agnostic. Current supported models group **consecutive**
+selected items by modality; their preparation contracts produce compatible fields, dtype/device, and
+shapes within each run. A future model that cannot guarantee this must override the encoding hook or
+use a stricter compatibility key. All physical forwards share one per-iteration budget.
 
 Nonconsecutive items are not reordered to make a larger batch. Reordering would require an additional
 permutation contract and increases the risk of attaching outputs to the wrong placeholders. The
@@ -509,9 +511,9 @@ implementation does not attempt strong per-item fault isolation or continue the 
 a potentially invalid CUDA state. Successfully completed request-local outputs are released when the
 request is torn down unless owned by a future cache.
 
-Cancellation removes the request from waiting, active, or independent collections; clears its
-in-flight reservations; and releases request-local output tensors. A canceled request must not be
-resurrected when an overlapped schedule result returns.
+Cancellation removes the request from waiting or active collections and releases request-local output
+tensors. A scheduled request that is no longer active is treated as an explicit scheduler lifecycle
+error.
 
 ## Memory ownership and future cache integration
 
@@ -625,9 +627,9 @@ with LLM work.
 ### Phase 4: experimental independent admission
 
 1. Add the environment-variable gate, default off.
-2. Add the separate independent request collection without growing `active_requests`.
+2. Select items from admitted active requests before LLM capacity filtering.
 3. Reuse the same packing, execution, assembly, and correctness path.
-4. Reject unsupported attention-DP and disaggregated combinations explicitly.
+4. Keep admission and the active-request capacity unchanged.
 5. Run the coupled-versus-independent A/B matrix before considering a public option.
 
 ### Phase 5: deferred hardening

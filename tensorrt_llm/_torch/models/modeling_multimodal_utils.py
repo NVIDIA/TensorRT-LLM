@@ -63,7 +63,8 @@ def _log_mm_encoder_forward_shape(
             num_items += len(grids)
             num_tokens += int(torch.prod(grids, dim=1).sum().item())
 
-    logger.info("MM encoder forward diagnostics: "
+    logger.info("MM encoder forward diagnostics "
+                "(Qwen-style grid metadata only): "
                 f"items={num_items}, encoder_tokens={num_tokens}")
 
 
