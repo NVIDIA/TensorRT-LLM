@@ -429,8 +429,8 @@ class NVLinkOneSided(Communication):
             **kwargs: Strategy-specific arguments. In fault-tolerance mode, ``active_rank_mask`` may override
                 the committed membership for dispatch. Without an override, the committed mask and generation
                 are captured together; combine reuses that mask and fails closed if the generation changes first.
-                Routing must exclude inactive ranks before dispatch; this kernel does not drop or rewrite routes
-                whose target rank is inactive.
+                In fault-tolerance mode, dispatch marks routes to inactive ranks invalid, and combine omits their
+                payloads.
 
         Returns:
             Tuple of (hidden_states, hidden_states_sf, token_selected_slots, token_final_scales)

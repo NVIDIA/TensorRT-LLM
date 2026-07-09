@@ -62,17 +62,16 @@ struct DispatchKernelPointers
     int* local_token_counter;      // Atomic counter for completed tokens
 
     // Top-K compact routing info per local token (size: [local_num_tokens, top_k])
-    int* topk_target_ranks; // target rank per k, -1 for duplicates
-    int* topk_send_indices; // dst index per k, -1 for duplicates
+    int* topk_target_ranks; // target rank per k, -1 for invalid or duplicate routes
+    int* topk_send_indices; // dst index per k, -1 for invalid or duplicate routes
 
     // Optional: Statistics for EPLB
     int const* eplb_local_stats;         // [eplb_stats_num_experts]
     int* eplb_gathered_stats[kMaxRanks]; // [ep_size, eplb_stats_num_experts] per rank
 
     // Active-rank bitmask: bit i set => rank i is alive and participates in this collective.
-    // Word 0 covers ranks 0..63; word 1 covers ranks 64..127. Routing is expected to avoid
-    // inactive ranks; the kernel uses this mask only for peer counters, stats, and completion
-    // flag writes/waits.
+    // Word 0 covers ranks 0..63; word 1 covers ranks 64..127. The FT kernel uses this mask to
+    // reject inactive route targets and to skip peer counters, stats, and completion flags.
     uint64_t active_rank_mask[kRankMaskWords];
 };
 
@@ -89,11 +88,11 @@ struct CombineKernelPointers
     uint32_t* flag_val;                    // The value of the flag for this round (stored on the local rank)
 
     // Top-K compact routing info per local token (size: [local_num_tokens, top_k])
-    int const* topk_target_ranks; // target rank per k, -1 for duplicates
-    int const* topk_send_indices; // dst index per k, -1 for duplicates
+    int const* topk_target_ranks; // target rank per k, -1 for invalid or duplicate routes
+    int const* topk_send_indices; // dst index per k, -1 for invalid or duplicate routes
 
-    // Active-rank bitmask: see DispatchKernelPointers::active_rank_mask. Combine skips flag
-    // writes/waits to/from masked peers.
+    // Active-rank bitmask: see DispatchKernelPointers::active_rank_mask. The FT kernel skips
+    // payload reads and completion flag writes/waits involving inactive peers.
     uint64_t active_rank_mask[kRankMaskWords];
 };
 
