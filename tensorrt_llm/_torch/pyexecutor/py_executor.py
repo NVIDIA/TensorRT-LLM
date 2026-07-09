@@ -1639,8 +1639,17 @@ class PyExecutor:
                     logger.info(
                         f"Profiling stopped at iteration {self.iter_counter}, "
                         f"trace saved to {torch_trace_path}")
-                torch.cuda.cudart().cudaProfilerStop()
+                # Persist calibration data and quiesce the device before
+                # cudaProfilerStop(): profiling tools may stop collecting or
+                # even end the process (e.g. nsys with
+                # --capture-range-end=stop-shutdown) as soon as the capture
+                # range closes, so the calibration file dump must happen
+                # before the stop, and the capture should end on an idle
+                # device with no in-flight async copies
+                # (https://nvbugs/6127669).
                 calibrator.stop()
+                torch.cuda.synchronize()
+                torch.cuda.cudart().cudaProfilerStop()
                 enabled = False
 
             # Capture per-loop timing whenever stats or the iter log are
@@ -1735,8 +1744,10 @@ class PyExecutor:
                     torch_profiler.export_chrome_trace(torch_trace_path)
                     logger.info(f"Profiling stopped at iteration {it}, "
                                 f"trace saved to {torch_trace_path}")
-                torch.cuda.cudart().cudaProfilerStop()
+                # See the ordering rationale at the in-loop cudaProfilerStop().
                 calibrator.stop()
+                torch.cuda.synchronize()
+                torch.cuda.cudart().cudaProfilerStop()
 
     def _get_init_iter_stats(self, num_new_active_requests,
                              new_active_requests_queue_latency_ms):

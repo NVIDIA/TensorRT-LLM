@@ -56,6 +56,8 @@ parser.add_argument("--target-ctx-reqs", type=int, default=0)
 parser.add_argument("--target-gen-reqs", type=int)
 parser.add_argument("--layer-indices", type=comma_separated_ints, required=True)
 parser.add_argument("--warmup-times", type=int, default=5)
+parser.add_argument("--start-iter", type=int, help="Only consider iterations with ID >= this value")
+parser.add_argument("--stop-iter", type=int, help="Only consider iterations with ID <= this value")
 group = parser.add_mutually_exclusive_group()
 group.add_argument("--error-on-unknown-kernel", action="store_true", dest="error_on_unknown_kernel")
 group.add_argument(
@@ -73,6 +75,21 @@ print(args)
 
 def is_gemm(name: str) -> bool:
     return "nvjet" in name or "gemm" in name.lower()
+
+
+# Groups: (1) iteration id, (2) ctx reqs, (3) gen reqs. The "ctx tokens"
+# segment is optional so traces recorded before it was added still parse.
+FORWARD_STEP_RE = re.compile(
+    r"^\[Executor\] _forward_step (\d+): (\d+) ctx reqs(?:, \d+ ctx tokens)?, (\d+) gen reqs"
+)
+
+
+def iter_in_window(iter_id: int) -> bool:
+    if args.start_iter is not None and iter_id < args.start_iter:
+        return False
+    if args.stop_iter is not None and iter_id > args.stop_iter:
+        return False
+    return True
 
 
 eager_nsys_rep_file_path = Path(args.eager_trace)
@@ -106,12 +123,10 @@ target_gen_reqs = args.target_gen_reqs
 if target_gen_reqs is None:
     if target_ctx_reqs == 0:
         for _, _, text in df.itertuples(index=False):
-            if m := re.match(
-                r"^\[Executor\] _forward_step (\d+): (\d+) ctx reqs, (\d+) gen reqs", text
-            ):
+            if m := FORWARD_STEP_RE.match(text):
                 ctx_reqs = int(m.group(2))
                 gen_reqs = int(m.group(3))
-                if ctx_reqs == target_ctx_reqs:
+                if ctx_reqs == target_ctx_reqs and iter_in_window(int(m.group(1))):
                     target_gen_reqs = gen_reqs
                     break
         else:
@@ -121,11 +136,11 @@ if target_gen_reqs is None:
 print(f"{target_ctx_reqs=} {target_gen_reqs=}")
 eager_iters: list[IterInfo] = []
 for start, end, text in df.itertuples(index=False):
-    if m := re.match(r"^\[Executor\] _forward_step (\d+): (\d+) ctx reqs, (\d+) gen reqs", text):
+    if m := FORWARD_STEP_RE.match(text):
         iter_id = int(m.group(1))
         ctx_reqs = int(m.group(2))
         gen_reqs = int(m.group(3))
-        if ctx_reqs == target_ctx_reqs and gen_reqs == target_gen_reqs:
+        if ctx_reqs == target_ctx_reqs and gen_reqs == target_gen_reqs and iter_in_window(iter_id):
             eager_iters.append(IterInfo(start, end, iter_id))
 eager_iters = sorted(eager_iters)[args.warmup_times :]
 iter_id_list = [it.iter_id for it in eager_iters]
@@ -146,11 +161,11 @@ for eager_layers in per_iter_eager_layers:
 df = pd.read_sql_query(query, graph_conn, params=(graph_event_id_NvtxPushPopRange,))
 graph_iters: list[IterInfo] = []
 for start, end, text in df.itertuples(index=False):
-    if m := re.match(r"^\[Executor\] _forward_step (\d+): (\d+) ctx reqs, (\d+) gen reqs", text):
+    if m := FORWARD_STEP_RE.match(text):
         iter_id = int(m.group(1))
         ctx_reqs = int(m.group(2))
         gen_reqs = int(m.group(3))
-        if ctx_reqs == target_ctx_reqs and gen_reqs == target_gen_reqs:
+        if ctx_reqs == target_ctx_reqs and gen_reqs == target_gen_reqs and iter_in_window(iter_id):
             graph_iters.append(IterInfo(start, end, iter_id))
 graph_iters = sorted(graph_iters)[args.warmup_times :]
 graph_iter_id_list = [it.iter_id for it in graph_iters]
