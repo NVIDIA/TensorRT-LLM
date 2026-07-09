@@ -1513,6 +1513,10 @@ private:
     // Held out of the disk free queue until the read lands so a spill cannot overwrite the slot file
     // mid-read; reapReadPendingReleases() returns each card once its read completes.
     std::unordered_map<KVCacheBlock::IdType, BlockPtr> mReadPendingReleases;
+    // Blocks whose owning request was released while their detached disk-onboard read was still in flight:
+    // held out of the free queue until the read lands (reapReadPendingReleases frees them) so the DMA
+    // destination is never repurposed mid-read. See releaseBlocks / the areBlocksReady park.
+    std::vector<BlockPtr> mReleaseReadPending;
     void reapReadPendingReleases();
     std::uint64_t mUnstagedSpillSeq{0};
 

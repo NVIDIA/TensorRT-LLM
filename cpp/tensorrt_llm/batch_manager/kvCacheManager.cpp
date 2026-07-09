@@ -1336,6 +1336,19 @@ void WindowBlockManager::reapReadPendingReleases()
         mEvictionPolicy->releaseBlock(it->second);
         it = mReadPendingReleases.erase(it);
     }
+    // Blocks whose owning request was released (completed/cancelled) while their detached onboard read was
+    // still in flight (see releaseBlocks): free them only once the DMA has landed, so the destination GPU
+    // memory is never handed to another request mid-read.
+    for (auto it = mReleaseReadPending.begin(); it != mReleaseReadPending.end();)
+    {
+        if (mTransferManager->isBlockReadPending((*it)->getBlockId()))
+        {
+            ++it;
+            continue;
+        }
+        mEvictionPolicy->releaseBlock(*it);
+        it = mReleaseReadPending.erase(it);
+    }
 }
 
 BlockPtr WindowBlockManager::claimDiskTarget()
@@ -1499,27 +1512,30 @@ BlockPtr WindowBlockManager::reclaimSecondaryBlock()
     {
         TLLM_LOG_INFO("[disk-tier] spills=%zu (windowSize=%d)", mDiskSpills, mWindowSize);
     }
+    // diskTarget carries a displaced disk-cached identity (it was a cached disk slot before we claimed it
+    // as a spill target). Detach that identity from the reuse tree UNCONDITIONALLY here: getFreeBlock (one
+    // caller) would detach it via its own cleanup below, but offloadBlock (the other caller) does NOT --
+    // leaving a radix-tree node pointing at the recycled host slot => silent wrong-token reuse. Detaching
+    // for both callers closes that hole; getFreeBlock's later detach then becomes a harmless no-op.
+    {
+        std::lock_guard<std::recursive_mutex> treeLock(mLookupTree->getMutex());
+        if (mEventManager && blockInRadixTree(diskTarget))
+        {
+            mEventManager->enqueueRemovedEvent(diskTarget, mWindowSize);
+        }
+        diskTarget->detachFromLookupNode();
+    }
+    diskTarget->clearRetention();
     if (useUnstaged)
     {
-        // diskTarget now owns the victim's old host slot, which the writer is still reading. It will
-        // NOT flow through getFreeBlock's cleanup (we return a reserved block instead), so evict any
-        // displaced disk-block identity it still carries HERE, then pin it until the write drains.
-        {
-            std::lock_guard<std::recursive_mutex> treeLock(mLookupTree->getMutex());
-            if (mEventManager && blockInRadixTree(diskTarget))
-            {
-                mEventManager->enqueueRemovedEvent(diskTarget, mWindowSize);
-            }
-            diskTarget->detachFromLookupNode();
-        }
-        diskTarget->clearRetention();
+        // Unstaged: diskTarget owns the victim's old host slot, which the writer is still reading. Pin it
+        // until the write drains so nobody reuses the slot mid-write; hand the caller a clean reserved block.
         mPendingSpillBlocks[unstagedSpillId] = diskTarget; // pinned: keeps the host slot out of every free list
         auto reserved = mReservedHostBlocks.back();        // clean, claimed, secondary host block
         mReservedHostBlocks.pop_back();
         return reserved;
     }
-    diskTarget->clearRetention();
-    return diskTarget; // owns the victim's old host slot; already claimed
+    return diskTarget; // owns the victim's old host slot; already claimed, identity detached above
 }
 
 BlockPtr WindowBlockManager::getFreeBlock(GenerationRequest& sequence, executor::RetentionPriority priority,
@@ -3518,6 +3534,9 @@ std::optional<KVCacheBlock::IdType> WindowBlockManager::releaseBlocks(
         TLLM_LOG_DEBUG("%s::releaseBlocks Request %lu, %d blocks stored for reuse", mLogPrefix.c_str(),
             sequence.getRequestId(), numBlocksStoredForReuse);
     }
+    // Fast-path gate: only consult per-block read-pendingness when a detached disk onboard could be in
+    // flight. Non-disk models (and the steady state with no reads queued) take the original path for free.
+    bool const guardReadPending = mNumDiskBlocks > 0 && mTransferManager->anyReadPending();
     // Iterate all allocated blocks (including placeholder sentinels at OOW positions);
     // EvictionPolicy::releaseBlock silently skips placeholders.
     for (auto it = allocatedBlocks.rbegin(); it != allocatedBlocks.rend(); ++it)
@@ -3533,16 +3552,27 @@ std::optional<KVCacheBlock::IdType> WindowBlockManager::releaseBlocks(
         // mRefCount==0 and are silently ignored by EvictionPolicy::releaseBlock().
         if (!block->hasRefs())
         {
-            auto const isDetached = block->isDetached();
-            if (isDetached)
+            // Silent-corruption guard (disk tier), the RELEASE-path mirror of areBlocksReady()'s park: if a
+            // detached disk-onboard read is still filling this block, returning it to the free queue now lets
+            // getFreeBlock hand it to another request while the DMA is in flight -- their prefill and the late
+            // read collide in the same GPU memory. Hold it out until the read lands; reapReadPendingReleases()
+            // releases it once !isBlockReadPending.
+            if (guardReadPending && mTransferManager->isBlockReadPending(block->getBlockId()))
             {
-                // Detached blocks have no reusable hash chain. Drop the stale owning link before recycling the block;
-                // otherwise front-queue reuse can join completed request chains into an unbounded ownership chain.
-                block->setPrevBlockInSeq(nullptr);
+                mReleaseReadPending.push_back(block);
             }
-            // Send block to front of free queue if it has no reusable state,
-            // so detached blocks are evicted before blocks cached for reuse.
-            mEvictionPolicy->releaseBlock(block, /*toFront=*/isDetached);
+            else
+            {
+                auto const isDetached = block->isDetached();
+                if (isDetached)
+                {
+                    // Detached blocks have no reusable hash chain. Drop the stale owning link before recycling;
+                    // otherwise front-queue reuse can join completed request chains into an unbounded chain.
+                    block->setPrevBlockInSeq(nullptr);
+                }
+                // Send blocks with no reusable state to the front so they evict before cached-for-reuse blocks.
+                mEvictionPolicy->releaseBlock(block, /*toFront=*/isDetached);
+            }
         }
     }
     // Remove stored block ids in sequence
