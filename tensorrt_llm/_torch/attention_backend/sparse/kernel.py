@@ -1,5 +1,6 @@
 import math
 import os
+from typing import Optional, Tuple
 
 import torch
 import triton
@@ -2095,6 +2096,7 @@ def _deepseek_v4_local_to_global_kernel(
     swa_local_indices_ptr,
     compressed_local_indices_ptr,
     out_ptr,
+    out_extra_ptr,
     swa_buffer_offset_in_tokens,
     compressed_buffer_offset_in_tokens,
     tokens_per_block_swa: tl.constexpr,
@@ -2115,6 +2117,9 @@ def _deepseek_v4_local_to_global_kernel(
     compressed_indices_stride1,
     out_stride0,
     out_stride1,
+    out_extra_stride0,
+    out_extra_stride1,
+    SPLIT_EXTRA: tl.constexpr,
     LAUNCH_WITH_PDL: tl.constexpr,
 ):
     """
@@ -2188,9 +2193,16 @@ def _deepseek_v4_local_to_global_kernel(
         compressed_global_index = tl.where(compressed_full_mask,
                                            compressed_global_index, -1)
 
-        # Store compressed results at fixed positions [num_swa_indices, total)
-        compressed_write_pos = num_swa_indices + compressed_ids
-        compressed_out_ptr = out_ptr + token_id * out_stride0 + compressed_write_pos * out_stride1
+        if SPLIT_EXTRA:
+            # Store compressed results into their own tensor (consumers that
+            # take the two pools as separate contiguous segments).
+            compressed_out_ptr = (out_extra_ptr + token_id * out_extra_stride0 +
+                                  compressed_ids * out_extra_stride1)
+        else:
+            # Store compressed results at fixed positions [num_swa_indices, total)
+            compressed_write_pos = num_swa_indices + compressed_ids
+            compressed_out_ptr = (out_ptr + token_id * out_stride0 +
+                                  compressed_write_pos * out_stride1)
         tl.store(compressed_out_ptr, compressed_global_index)
 
     if LAUNCH_WITH_PDL:
@@ -2212,7 +2224,8 @@ def deepseek_v4_local_to_global_indices(
         compressed_buffer_ptr: int = 0,
         compress_ratio: int = 1,
         num_compressed_indices: int = 0,  # max number of compressed indices
-) -> torch.Tensor:
+        split_extra: bool = False,
+) -> torch.Tensor | Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """
     Convert local token indices to global KV cache pool indices.
 
@@ -2242,9 +2255,18 @@ def deepseek_v4_local_to_global_indices(
         compress_ratio: Compression ratio (1: no compression, >1: with compression)
         num_compressed_indices: Max number of compressed indices for CUDA graph compatibility
             Output width = num_swa_indices + num_compressed_indices.
+        split_extra: Emit the two regions as separate contiguous tensors
+            instead of one combined table. The combined layout serves the
+            C++ FMHA kernel (tile index selects the TMA descriptor); the
+            split layout serves consumers that take per-pool index segments
+            (the FlashInfer sparse-MLA backend) without slicing copies.
 
     Returns:
-        global_indices: int32 [num_tokens, num_swa_indices + num_compressed_indices]
+        split_extra=False:
+            global_indices: int32 [num_tokens, num_swa_indices + num_compressed_indices]
+        split_extra=True:
+            (swa_indices [num_tokens, num_swa_indices],
+             compressed_indices [num_tokens, num_compressed_indices] or None)
     """
     assert req_id.dtype == torch.int32, f"req_id must be int32, got {req_id.dtype}"
     assert block_table_swa.dtype == torch.int32, f"block_table_swa must be int32, got {block_table_swa.dtype}"
@@ -2302,10 +2324,24 @@ def deepseek_v4_local_to_global_indices(
     block_table_swa_c = block_table_swa.contiguous()
     swa_local_indices_c = swa_local_indices.contiguous()
 
-    # Create output tensor
-    out = torch.empty((num_tokens, total_output_indices),
-                      dtype=torch.int32,
-                      device=req_id.device)
+    # Create output tensor(s)
+    if split_extra:
+        out = torch.empty((num_tokens, num_swa_indices),
+                          dtype=torch.int32,
+                          device=req_id.device)
+        out_extra = (torch.empty((num_tokens, num_compressed_indices),
+                                 dtype=torch.int32,
+                                 device=req_id.device)
+                     if has_compressed and num_compressed_indices > 0 else None)
+    else:
+        out = torch.empty((num_tokens, total_output_indices),
+                          dtype=torch.int32,
+                          device=req_id.device)
+        out_extra = None
+    # The kernel needs a tensor argument even when the extra output is unused
+    # (SPLIT_EXTRA is a constexpr, so the branch touching it compiles out).
+    out_extra_arg = out_extra if out_extra is not None else out
+    out_extra_stride0, out_extra_stride1 = out_extra_arg.stride()
 
     # Grid: one program per token
     grid = (num_tokens, )
@@ -2328,6 +2364,7 @@ def deepseek_v4_local_to_global_indices(
         swa_local_indices_c,
         compressed_local_indices_c,
         out,
+        out_extra_arg,
         swa_buffer_offset_in_tokens,
         compressed_buffer_offset_in_tokens,
         tokens_per_block,
@@ -2348,8 +2385,13 @@ def deepseek_v4_local_to_global_indices(
         compressed_indices_stride1,
         out_stride0,
         out_stride1,
+        out_extra_stride0,
+        out_extra_stride1,
+        SPLIT_EXTRA=split_extra,
         LAUNCH_WITH_PDL=launch_with_pdl,
         launch_pdl=launch_with_pdl,
     )
 
+    if split_extra:
+        return out, out_extra
     return out

@@ -150,11 +150,30 @@ def get_token_bytes(
     attn_type: DeepseekV4AttentionType,
     has_fp8_kv_cache: bool,
     indexer_k_dtype: str = "fp8",
+    kv_token_layout: str = "native",
 ) -> int:
     if not compress_ratio_has_attention(compress_ratio, attn_type):
         raise ValueError(
             f"Layer with compress ratio {compress_ratio} does not have attention type {attn_type}"
         )
+
+    # The FlashInfer SM120 sparse-MLA kernels read SWA and COMPRESS tokens as
+    # footer-scale pages (see footer_scale_kv.py) regardless of the kv-cache
+    # quant mode; every other attention type keeps its native layout.
+    if kv_token_layout == "footer_scale" and attn_type in (
+        DeepseekV4AttentionType.SWA,
+        DeepseekV4AttentionType.COMPRESS,
+    ):
+        from . import footer_scale_kv
+
+        if head_dim != footer_scale_kv.DIM_NOPE + footer_scale_kv.DIM_ROPE:
+            raise ValueError(
+                f"footer-scale KV layout requires head_dim "
+                f"{footer_scale_kv.DIM_NOPE + footer_scale_kv.DIM_ROPE}, got {head_dim}"
+            )
+        return footer_scale_kv.TOKEN_BYTES
+    if kv_token_layout not in ("native", "footer_scale"):
+        raise ValueError(f"Unsupported kv_token_layout: {kv_token_layout!r}")
 
     attn_dim = get_attn_dim(head_dim, index_head_dim, compress_ratio, attn_type)
 
@@ -512,6 +531,17 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             self.cached_token_lens_cuda, device="cpu", pin_memory=prefer_pinned()
         )
 
+        # token_positions_cuda: absolute position (cached + offset) per token.
+        # The FlashInfer backend consumes it for SWA append slots and the
+        # per-token valid-SWA lengths; kept as a graph-stable buffer.
+        self.token_positions_cuda = self.get_empty(
+            self.cuda_graph_buffers,
+            (self.max_num_tokens,),
+            cache_name="token_positions_cuda",
+            dtype=torch.int32,
+            capture_graph=capture_graph,
+        )
+
         # Cache buffer data pointers are constant after KV cache allocation,
         # so compute them once during initialization instead of every prepare().
         self._init_cache_buffer_data_pointers()
@@ -568,6 +598,8 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             req_idx = torch.searchsorted(cu_seq_lens[1:].to(torch.int32), token_idx, right=True)
             offsets = token_idx - cu_seq_lens[req_idx].to(torch.int32)
             token_positions = cached_tokens[req_idx].to(torch.int32) + offsets
+
+        self.token_positions_cuda[: token_positions.shape[0]] = token_positions
 
         self._prepare_deepseek_v4_indices_compiled(
             token_positions,
@@ -1339,6 +1371,11 @@ class DeepseekV4Indexer(Indexer):
 class DeepseekV4TrtllmAttention(TrtllmAttention):
     Metadata = DeepseekV4TrtllmAttentionMetadata
 
+    # SWA/COMPRESS pool token layout this backend reads and writes; the
+    # FlashInfer subclass overrides it with the footer-scale layout and the
+    # cache manager derives the same value from the attn-backend selection.
+    kv_token_layout = "native"
+
     def __init__(
         self,
         layer_idx: int,
@@ -1473,8 +1510,15 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
         k: Optional[torch.Tensor],
         metadata: DeepseekV4TrtllmAttentionMetadata,
         forward_args: AttentionForwardArgs,
+        split_extra: bool = False,
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
-        """Convert local indices (SWA + compressed) to global pool indices."""
+        """Convert local indices (SWA + compressed) to global pool indices.
+
+        Returns ``(combined_indices, None)`` by default (the C++ FMHA kernel
+        takes one table whose tile index selects the TMA descriptor); with
+        ``split_extra`` the two regions come back as separate contiguous
+        tensors ``(swa_indices, compressed_indices_or_None)``.
+        """
         layer_idx = self.layer_idx
         kv_cache_manager = metadata.kv_cache_manager
         attention_input_type = forward_args.attention_input_type
@@ -1495,6 +1539,7 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
             self.compress_ratio,
             DeepseekV4AttentionType.SWA,
             has_fp8_kv_cache,
+            kv_token_layout=self.kv_token_layout,
         )
 
         # Select token range based on phase
@@ -1532,7 +1577,7 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
             block_table_compressed = None
             compressed_local_indices = None
 
-        global_indices = deepseek_v4_local_to_global_indices(
+        result = deepseek_v4_local_to_global_indices(
             req_id=req_id,
             block_table_swa=block_table_swa,
             swa_local_indices=swa_local_indices,
@@ -1546,9 +1591,12 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
             compressed_buffer_ptr=compressed_buffer_ptr,
             compress_ratio=self.compress_ratio,
             num_compressed_indices=metadata.max_compressed_indices[self.compress_ratio],
+            split_extra=split_extra,
         )
 
-        return global_indices, None
+        if split_extra:
+            return result
+        return result, None
 
     def sparse_kv_predict(
         self,

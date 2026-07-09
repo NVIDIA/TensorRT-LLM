@@ -926,6 +926,10 @@ class MLA(nn.Module):
             return False
         if num_generations > 0:
             return False
+        # The fused-FP8-Q path is part of the C++ attention op contract; the
+        # non-fused backends (FlashInfer SM120 sparse MLA) take bf16 Q only.
+        if not self.rope_fusion:
+            return False
         return bool(getattr(self.mqa, "has_fp8_kv_cache", False))
 
     def _deepseek_v4_q_b_layernorm_fused_fp8(self, q_proj: torch.Tensor):
@@ -1761,6 +1765,9 @@ class MLA(nn.Module):
             if self.apply_rotary_emb:
                 assert ctx_position_ids is not None
                 k_pe_ctx = self.apply_rope(q_ctx, k_pe_ctx, ctx_position_ids)
+                # Non-fused backends append latent_cache as-is, so its rope
+                # half must carry the rotated k_pe.
+                latent_cache_ctx[..., self.kv_lora_rank :] = k_pe_ctx
 
             self.forward_context_sparse_mla(
                 q_ctx,
@@ -1789,6 +1796,9 @@ class MLA(nn.Module):
             if self.apply_rotary_emb:
                 assert gen_position_ids is not None
                 k_pe_gen = self.apply_rope(q_gen, k_pe_gen, gen_position_ids)
+                # Non-fused backends append latent_cache as-is, so its rope
+                # half must carry the rotated k_pe.
+                latent_cache_gen[..., self.kv_lora_rank :] = k_pe_gen
 
             self.forward_generation_sparse_mla(
                 q_gen,
@@ -2358,18 +2368,23 @@ class MLA(nn.Module):
 
         if self.is_deepseek_v4:
             fused_q = q
-            self.mqa.mla_rope_generation(
-                fused_q,
-                q_pe,
-                latent_cache,
-                attn_metadata,
-                cu_q_seqlens,
-                cu_kv_seqlens,
-                fmha_scheduler_counter,
-                mla_bmm1_scale,
-                mla_bmm2_scale,
-                quant_q_buffer,
-            )
+            # Non-fused backends (apply_rotary_emb): RoPE and the latent-cache
+            # resync already ran in forward_impl_with_deepseek_v4, the backend
+            # appends the latent rows itself, and the trtllm-gen scheduler
+            # buffers this op would fill have no consumer.
+            if not self.apply_rotary_emb:
+                self.mqa.mla_rope_generation(
+                    fused_q,
+                    q_pe,
+                    latent_cache,
+                    attn_metadata,
+                    cu_q_seqlens,
+                    cu_kv_seqlens,
+                    fmha_scheduler_counter,
+                    mla_bmm1_scale,
+                    mla_bmm2_scale,
+                    quant_q_buffer,
+                )
         else:
             fused_q = torch.empty(
                 [num_tokens, self.num_heads_tp, (self.kv_lora_rank + self.qk_rope_head_dim)],
