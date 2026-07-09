@@ -174,11 +174,6 @@ l0_dgx_b200:
   - accuracy/test_disaggregated_serving.py::TestKimiK25::test_nvfp4 TIMEOUT (180)
   - accuracy/test_llm_api_pytorch.py::TestKimiK25::test_nvfp4[tp8] TIMEOUT (60)
   - accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_nvfp4_8gpus_mtp TIMEOUT (60)
-  - accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_nvfp4_8gpus_mtp_custom_op TIMEOUT (60)
-  - accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_nvfp4_8gpus[attention_dp_on-trtllm] TIMEOUT (60)
-  - accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_nvfp4_8gpus[attention_dp_on-cutlass] TIMEOUT (60)
-  - accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_nvfp4_8gpus[attention_dp_on-cutedsl] TIMEOUT (60)
-  - accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_nvfp4_parallelism[TP4_PP2] TIMEOUT (60)
   - accuracy/test_llm_api_pytorch.py::TestNemotronV3Ultra::test_nvfp4_8gpus[attention_dp_on-cutedsl] TIMEOUT (60)
   - accuracy/test_llm_api_pytorch.py::TestNemotronV3Ultra::test_nvfp4_8gpus[attention_dp_off-trtllm] TIMEOUT (60)
   - accuracy/test_disaggregated_serving.py::TestNemotron3Super120B::test_auto_dtype[mtp_nextn=0-block_reuse=False-use_py_transceiver=True] TIMEOUT (60)
@@ -259,6 +254,8 @@ l0_dgx_b200:
   - accuracy/test_llm_api_pytorch_multimodal.py::TestKimiK25::test_nvfp4[dep8] TIMEOUT (120)
   - accuracy/test_llm_api_pytorch.py::TestMistralLarge3_675B::test_fp8[latency_moe_deepgemm] TIMEOUT (60)
   - accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_nvfp4_parallelism[TP8_PP1] TIMEOUT (60)
+  - accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_nvfp4_parallelism[TP4_PP2] TIMEOUT (60)
+  - accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_nvfp4_8gpus_mtp_custom_op TIMEOUT (60)
   - test_e2e.py::test_deepseek_r1_mtp_bench TIMEOUT(60) # Cover https://nvbugs/5670108
   - examples/visual_gen/test_visual_gen_multi_gpu.py::test_wan22_t2v_lpips_against_golden_multi_gpu[cfg2_ulysses2_attn2d_2x1]
   - examples/visual_gen/test_visual_gen_multi_gpu.py::test_wan22_t2v_lpips_against_golden_multi_gpu[attn2d_2x2_ulysses2]
@@ -301,10 +298,6 @@ l0_dgx_b200:
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4_4gpus[moe_backend=CUTEDSL-mtp_nextn=2-pp4-fp8kv=False-attention_dp=False-cuda_graph=False-overlap_scheduler=False-low_precision_combine=False-torch_compile=False]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4_4gpus[moe_backend=CUTEDSL-mtp_nextn=0-ep4-fp8kv=True-attention_dp=True-cuda_graph=True-overlap_scheduler=True-low_precision_combine=False-torch_compile=False]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_guided_decoding_4gpus[xgrammar-mtp_nextn=0]
-  - accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_auto_dtype_4gpus[4-1-False]
-  - accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_auto_dtype_4gpus[4-1-True]
-  - accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_auto_dtype_4gpus[4-4-False]
-  - accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_auto_dtype_4gpus[4-4-True]
   - accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_nvfp4_4gpu_mtp_ar_custom_op TIMEOUT (60)
   - accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_nvfp4_4gpus_static_eplb[moe_backend=CUTEDSL]
   - accuracy/test_llm_api_pytorch.py::TestNemotronV3Ultra::test_nvfp4_4gpus_static_eplb[moe_backend=CUTLASS]
