@@ -62,6 +62,20 @@ from ._utils import CachedCudaEvent, div_up
 # rare and bounded; disable only for experiments.
 _SYNC_BEFORE_UNMAP = os.getenv("TRTLLM_KV_ARENA_SYNC_BEFORE_UNMAP") != "0"
 
+
+def quiesce_before_unmap() -> None:
+    """Quiesce the device before a ``cuMemUnmap`` batch (gated by
+    ``TRTLLM_KV_ARENA_SYNC_BEFORE_UNMAP``, default ON): concurrent unmaps
+    can fault unrelated in-flight reads at the driver level -- see the
+    driver-interference escalation. Callers batch all unmaps behind ONE
+    quiesce per pressure/teardown event."""
+    if _SYNC_BEFORE_UNMAP:
+        from ._cuda_virt_mem import drv
+        from ._utils import _unwrap
+
+        _unwrap(drv.cuCtxSynchronize())
+
+
 # Kernel-facing offsets are int32, and v1's KVCacheIndex steals the high bit for
 # primary/secondary selection, leaving int31. The emitted value is
 # ``block_index * num_coalesced_subbuffers + field``; its maximum must fit. See
@@ -447,6 +461,55 @@ class SequenceArena:
                 self._aliased[base_block] = self._aliased.get(base_block, 0) + total
         return total
 
+    def remap_prefix_to_alias(
+        self, base_block: int, shared_per_pool: "list[list[SharedPhysMem]]"
+    ) -> int:
+        """Replace the PHYSICAL backing of this range's head chunks with
+        aliases of a canonical span's handles (pressure-time dedup remap,
+        P3 v2): the chunks stay mapped at the same VA addresses, so block
+        offsets and slot ids are untouched -- only the bytes behind them
+        become the canonical copy, and the range's private handles are
+        dropped (returning to the pool when unreferenced). Releases the
+        freed pages' budget charge and marks the chunks alias-accounted.
+        Frontiers are untouched (the head is below the frontier).
+
+        The CALLER must quiesce the device first (``quiesce_before_unmap``,
+        once per remap batch): ``cuMemUnmap`` racing in-flight kernels can
+        fault unrelated reads. If re-aliasing a pool fails after its unmap,
+        the pool's original private handles are mapped back (references are
+        held across the swap), so the range is never left with holes.
+
+        Returns the physical pages freed."""
+        page = self._phys_page_size
+        frontiers = self._frontiers[base_block]
+        total = 0
+        for pool, shared in enumerate(shared_per_pool):
+            if not shared:
+                continue
+            lo = self._chunk_range(pool, base_block, 0)[0]
+            n = len(shared)
+            assert frontiers[pool] >= lo + n, "remap head must be below the mapped frontier"
+            vm = self._vms[pool]
+            # Hold the private handles across the swap so a failed alias map
+            # can restore them (unmap dropped their mapping references).
+            saved = [vm.shared_chunk(c * page).add_ref() for c in range(lo, lo + n)]
+            try:
+                vm.unmap_range(lo * page, n)
+                try:
+                    vm.map_alias(lo * page, shared)
+                except Exception:
+                    vm.map_alias(lo * page, saved)  # restore; range stays intact
+                    raise
+            finally:
+                for s in saved:
+                    s.drop_ref()
+            total += n
+        if total:
+            self._aliased[base_block] = self._aliased.get(base_block, 0) + total
+            if self._budget is not None:
+                self._budget.release(total)
+        return total
+
     def shared_prefix_chunks(self, base_block: int, num_blocks: int) -> "list[list[SharedPhysMem]]":
         """Per pool, the refcounted handles of the chunks FULLY covered by the
         first ``num_blocks`` blocks of this range (canonical registration,
@@ -654,11 +717,7 @@ class SequenceArena:
         and, because concurrent unmaps can fault unrelated in-flight reads at
         the driver level (see ``_SYNC_BEFORE_UNMAP``), the GPU is quiesced
         before the unmap batch unless explicitly disabled."""
-        if _SYNC_BEFORE_UNMAP:
-            from ._cuda_virt_mem import drv
-            from ._utils import _unwrap
-
-            _unwrap(drv.cuCtxSynchronize())
+        quiesce_before_unmap()
         frontiers = self._frontiers.pop(base_block)
         num_aliased = self._aliased.pop(base_block, 0)
         page = self._phys_page_size

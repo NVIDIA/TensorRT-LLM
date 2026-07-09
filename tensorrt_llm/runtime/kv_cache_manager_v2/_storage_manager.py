@@ -545,11 +545,24 @@ class StorageManager:
         ranges without draining."""
         self._gpu_arena_storage().fence_pending_frees(fence)
 
-    def spill_gpu_retained(self, min_pages: int) -> int:
+    def spill_gpu_retained(self, min_pages: int, spill_spans: bool = True) -> int:
         """Reclaim lazily retained ranges (§4.4 phase 2) until ``min_pages``
         physical pages are freed or nothing is spillable. Returns pages
-        freed."""
-        return self._gpu_arena_storage().spill_retained(min_pages)
+        freed. ``spill_spans=False`` skips the canonical-span pass (the
+        reclaim ladder runs the dedup remap between the two, §P3 v2)."""
+        return self._gpu_arena_storage().spill_retained(min_pages, spill_spans)
+
+    def dedup_remap_arena(self, items: "list[tuple[int, SequenceRange, int, object, int]]") -> int:
+        """Execute a pressure-time dedup-remap batch (P3 v2) behind one
+        device quiesce. Items: ``(pg_idx, rng, key, span, num_blocks)``.
+        Returns pages freed."""
+        return self._gpu_arena_storage().dedup_remap(items)
+
+    def arena_span_pages_for_blocks(
+        self, pg_idx: PoolGroupIndex, span: object, num_blocks: int
+    ) -> int:
+        """Pages a dedup remap of ``num_blocks`` onto ``span`` would free."""
+        return self._gpu_arena_storage().pool_group(pg_idx).span_pages_for_blocks(span, num_blocks)
 
     def queue_gpu_mapping(
         self, pg_idx: PoolGroupIndex, rng: SequenceRange, num_valid_blocks: int
@@ -623,12 +636,16 @@ class StorageManager:
         )
 
     def lookup_arena_canonical_span(
-        self, pg_idx: PoolGroupIndex, head_page: Page, matched_pages: Sequence[Page]
+        self,
+        pg_idx: PoolGroupIndex,
+        head_page: Page,
+        matched_pages: Sequence[Page],
+        count_stats: bool = True,
     ) -> "tuple[int, object, int] | None":
         return (
             self._gpu_arena_storage()
             .pool_group(pg_idx)
-            .lookup_canonical_span(head_page, matched_pages)
+            .lookup_canonical_span(head_page, matched_pages, count_stats)
         )
 
     def alias_arena_span(

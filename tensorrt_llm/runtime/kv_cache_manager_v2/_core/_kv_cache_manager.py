@@ -18,7 +18,7 @@ from collections import defaultdict
 from collections.abc import Callable, Sequence
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Iterable, Iterator, cast
+from typing import TYPE_CHECKING, Any, Iterable, Iterator, cast
 
 from .. import rawref
 from .._block_radix_tree import BlockRadixTree, ReuseMatch, ReuseScope
@@ -589,6 +589,37 @@ class KVCacheManager:
         scheduling and before any GPU work touches the newly grown blocks.
         Returns the number of pages mapped."""
         return self._storage.flush_gpu_mappings()
+
+    def dedup_remap_gpu(self, min_pages: int) -> int:
+        """Pressure-time dedup remap (P3 v2): free duplicate private copies
+        of registered canonical prefixes by remapping their VA onto the
+        canonical physical pages -- a reclaim-ladder rung between the
+        parked-range spill and the registry-excess spill. Frees memory from
+        LIVE sequences with zero information loss (the byte content is the
+        committed prefix either way), shielding both the registry and the
+        preemption path. Scans ALL live sequences host-side first, then
+        remaps largest-savings-first behind one device quiesce until
+        ``min_pages`` are freed. Returns pages freed."""
+        storage = self._storage
+        if not storage.is_arena_mode or not storage.arena_prefix_aliasing:
+            return 0
+        candidates: "list[tuple[int, Any, int, Any, int, int]]" = []
+        for r in self._living_kv_caches:
+            kv = r()
+            if kv is None:
+                continue
+            candidates.extend(kv._arena_collect_dedup_candidates())
+        if not candidates:
+            return 0
+        candidates.sort(key=lambda c: c[5], reverse=True)
+        picked: "list[tuple[int, Any, int, Any, int]]" = []
+        total = 0
+        for c in candidates:
+            if total >= min_pages:
+                break
+            picked.append((c[0], c[1], c[2], c[3], c[4]))
+            total += c[5]
+        return storage.dedup_remap_arena(picked)
 
     @property
     def enable_partial_match(self) -> bool:

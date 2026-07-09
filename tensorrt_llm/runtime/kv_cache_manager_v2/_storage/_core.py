@@ -23,7 +23,7 @@ from bisect import bisect_right, insort
 from collections import deque
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any, ClassVar, NewType, final
+from typing import Any, ClassVar, NewType, cast, final
 
 if sys.version_info[:2] >= (3, 12):
     from typing import override
@@ -42,7 +42,7 @@ from .._common import (
 )
 from .._cuda_virt_mem import PooledPhysMemAllocator, SharedPhysMem, VirtMem
 from .._exceptions import LogicError, OutOfPagesError
-from .._sequence_arena import PageBudget, SequenceArena, check_index_width
+from .._sequence_arena import PageBudget, SequenceArena, check_index_width, quiesce_before_unmap
 from .._utils import (
     CachedCudaEvent,
     DynamicBitset,
@@ -854,6 +854,7 @@ class ArenaPoolGroup(PoolGroupBase):
         "alias_hits",
         "alias_misses",
         "spilled_spans",
+        "dedup_remapped_pages",
     )
     _arena: SequenceArena
     _ranges: dict[int, SequenceRange]  # base_block -> live range
@@ -924,6 +925,7 @@ class ArenaPoolGroup(PoolGroupBase):
         self.alias_hits = 0
         self.alias_misses = 0
         self.spilled_spans = 0
+        self.dedup_remapped_pages = 0
         # base_block -> [range, target frontier (blocks), pages charged]:
         # growth maps deferred to the per-iteration batched sweep (§4.2).
         self._pending_maps: dict[int, list[Any]] = {}
@@ -1426,7 +1428,7 @@ class ArenaPoolGroup(PoolGroupBase):
         span.owner_base = -1
 
     def lookup_canonical_span(
-        self, head_page: object, matched_pages: "Sequence[object]"
+        self, head_page: object, matched_pages: "Sequence[object]", count_stats: bool = True
     ) -> "tuple[int, _CanonicalSpan, int] | None":
         """Registry hit for an admission whose reuse match starts at
         ``head_page`` and covers ``matched_pages`` (canonical page objects in
@@ -1437,25 +1439,31 @@ class ArenaPoolGroup(PoolGroupBase):
         adopter writes strictly past them; the shared-prompt benchmark's
         matches are the system prompt, while spans carry the whole committed
         chain of their owner). A mismatch anywhere in the verified prefix
-        invalidates and unpins the entry."""
+        invalidates and unpins the entry. ``count_stats=False`` keeps the
+        hit/miss counters clean for non-admission callers (the dedup-remap
+        scan probes every live sequence)."""
         if not self._prefix_aliasing:
             return None
         key = id(head_page)
         span = self._canonical_spans.get(key)
         if span is None:
-            self.alias_misses += 1
+            if count_stats:
+                self.alias_misses += 1
             return None
         verified = min(len(matched_pages), span.num_blocks)
         for i in range(verified):
             if span.page_refs[i]() is not matched_pages[i]:
                 self._invalidate_span(key, span)
-                self.alias_misses += 1
+                if count_stats:
+                    self.alias_misses += 1
                 return None
         usable = self._arena.aliasable_span_blocks(verified)
         if usable <= 0:
-            self.alias_misses += 1
+            if count_stats:
+                self.alias_misses += 1
             return None
-        self.alias_hits += 1
+        if count_stats:
+            self.alias_hits += 1
         return key, span, usable
 
     def alias_span_into_range(
@@ -1470,6 +1478,34 @@ class ArenaPoolGroup(PoolGroupBase):
         aliased = self._arena.alias_prefix(rng.base_block, trimmed)
         rng._alias_span_key = (key, num_blocks)
         return aliased
+
+    def span_pages_for_blocks(self, span: "_CanonicalSpan", num_blocks: int) -> int:
+        """Physical pages a dedup remap of ``num_blocks`` onto ``span`` would
+        free (the whole-chunk trim across pools) -- the scan's sort key."""
+        trimmed = self._arena.trim_shared_to_blocks(span.shared_per_pool, num_blocks)
+        pages = 0
+        for shared in trimmed:
+            pages += len(shared)
+        return pages
+
+    def remap_range_onto_span(
+        self, rng: SequenceRange, key: int, span: "_CanonicalSpan", num_blocks: int
+    ) -> int:
+        """Pressure-time dedup remap (P3 v2): replace the physical backing
+        of a LIVE range's head chunks -- currently sequence-private duplicate
+        copies of ``span``'s canonical prefix -- with aliases of the span's
+        handles, freeing the duplicates' pages. Same-VA swap: slot ids,
+        block offsets, page holders, and frontiers are all untouched; the
+        range gains the alias signature so it parks prefix-affinely at
+        close. The CALLER quiesces once per remap batch. Returns pages
+        freed."""
+        assert not rng._freed and rng._alias_span_key is None
+        trimmed = self._arena.trim_shared_to_blocks(span.shared_per_pool, num_blocks)
+        freed = self._arena.remap_prefix_to_alias(rng.base_block, trimmed)
+        if freed:
+            rng._alias_span_key = (key, num_blocks)
+            self.dedup_remapped_pages += freed
+        return freed
 
     def _unpin_span(self, span: "_CanonicalSpan") -> None:
         for shared in span.shared_per_pool:
@@ -1990,7 +2026,7 @@ class GpuArenaCacheLevelStorage(CacheLevelStorage):
             assert type(pg) is ArenaPoolGroup
             pg.fence_pending_frees(fence)
 
-    def spill_retained(self, min_pages: int) -> int:
+    def spill_retained(self, min_pages: int, spill_spans: bool = True) -> int:
         """Reclaim lazily retained ranges (§4.4 phase 2), LRU-first per pool
         group, until ``min_pages`` physical pages are freed or nothing more
         is spillable; canonical-span pins (P3) are spilled last -- shared
@@ -1999,13 +2035,18 @@ class GpuArenaCacheLevelStorage(CacheLevelStorage):
         still forfeits the whole registry under sustained pressure, and with
         it every zero-copy alias hit, to cover a transient need worth a
         handful of pages. Protected callers back off like any failed
-        allocation instead (§4.6). Returns pages freed."""
+        allocation instead (§4.6). ``spill_spans=False`` skips the span pass
+        entirely -- the reclaim ladder runs the dedup remap (which FREES
+        duplicates instead of forfeiting the registry) between the two.
+        Returns pages freed."""
         freed = 0
         for pg in self._pool_groups:
             if freed >= min_pages:
                 break
             assert type(pg) is ArenaPoolGroup
             freed += pg.spill_retained(min_pages - freed)
+        if not spill_spans:
+            return freed
         spillable = -self._span_spill_floor
         for pg in self._pool_groups:
             assert type(pg) is ArenaPoolGroup
@@ -2017,6 +2058,24 @@ class GpuArenaCacheLevelStorage(CacheLevelStorage):
             got = pg.spill_canonical_spans(min(min_pages - freed, spillable))
             freed += got
             spillable -= got
+        return freed
+
+    def dedup_remap(self, items: "list[tuple[int, SequenceRange, int, object, int]]") -> int:
+        """Execute a dedup-remap batch (P3 v2) behind ONE device quiesce:
+        each item ``(pg_idx, rng, key, span, num_blocks)`` replaces the
+        range's private duplicate prefix backing with aliases of the span's
+        handles. The caller (the manager's pressure-time scan) has already
+        verified eligibility host-side; nothing here enqueues GPU work, so
+        the batch is atomic with respect to the executor's enqueue thread.
+        Returns total pages freed."""
+        if not items:
+            return 0
+        quiesce_before_unmap()
+        freed = 0
+        for pg_idx, rng, key, span, num_blocks in items:
+            pg = self._pool_groups[PoolGroupIndex(pg_idx)]
+            assert type(pg) is ArenaPoolGroup
+            freed += pg.remap_range_onto_span(rng, key, cast("_CanonicalSpan", span), num_blocks)
         return freed
 
     @property

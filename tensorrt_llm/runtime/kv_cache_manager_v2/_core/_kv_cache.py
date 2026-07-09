@@ -1060,6 +1060,67 @@ class _KVCache:
     # most of the retained cache, large enough to bound retry loops.
     _ARENA_SPILL_CHUNK_PAGES: ClassVar[int] = 64
 
+    def _arena_collect_dedup_candidates(
+        self,
+    ) -> "list[tuple[int, Any, int, Any, int, int]]":
+        """Pressure-time dedup-remap scan (P3 v2), host-only: per single-lc
+        pool group, this sequence's leading run of committed blocks whose
+        holders are sequence-private DUPLICATES of a registered canonical
+        span's pages (copy-onboarded before the span existed, or a
+        commit-conflict loser) -- replaceable by aliases of the canonical
+        physical pages with zero information loss. Page holders, slot ids,
+        and offsets are untouched by the remap (same-VA swap), so no
+        per-sequence state changes here. Returns
+        ``(pg_idx, rng, key, span, usable_blocks, pages_freeable)``."""
+        storage = self._storage
+        ranges = self._arena_ranges
+        if ranges is None:
+            return []
+        life_cycles = self.manager._life_cycles
+        ssm_lc_id = life_cycles.ssm_life_cycle_id
+        lc_of_pg: dict[int, "LifeCycleId | None"] = {}
+        for lc_idx, _lc in life_cycles.items():
+            if lc_idx == ssm_lc_id:
+                continue
+            pg = int(storage.get_pool_group_index(lc_idx))
+            lc_of_pg[pg] = lc_idx if pg not in lc_of_pg else None  # None: multi-lc, skip
+        out: "list[tuple[int, Any, int, Any, int, int]]" = []
+        num_committed = int(self._num_committed_blocks)
+        beam_idx = DEFAULT_BEAM_INDEX
+        for pg, lc_idx in lc_of_pg.items():
+            if lc_idx is None:
+                continue
+            rng = ranges[PoolGroupIndex(pg)]
+            if rng._alias_span_key is not None:
+                continue  # head already aliased: nothing duplicated
+            canon: list[CommittedPage] = []
+            for ordinal in range(num_committed):
+                block = self._blocks[ordinal]
+                if not block.is_committed:
+                    break
+                p = block.pages[beam_idx][lc_idx]
+                if p is None:
+                    break
+                page = p.page
+                if type(page) is not PrivateCommittedPage or page.cache_level != GPU_LEVEL:
+                    break  # canonical owner / offloaded: not a duplicate
+                canonical = self._find_canonical(page, lc_idx)
+                if canonical is None or canonical is page:
+                    break  # orphaned: our copy is the sole copy, keep it
+                canon.append(canonical)
+            if not canon:
+                continue
+            hit = storage.lookup_arena_canonical_span(
+                PoolGroupIndex(pg), canon[0], canon, count_stats=False
+            )
+            if hit is None:
+                continue
+            key, span, usable = hit
+            pages = storage.arena_span_pages_for_blocks(PoolGroupIndex(pg), span, usable)
+            if pages > 0:
+                out.append((pg, rng, key, span, usable, pages))
+        return out
+
     def _arena_ensure_mapped(self, num_valid_blocks: int, sync: bool = False) -> bool:
         """Make physical pages covering the first ``num_valid_blocks`` of this
         sequence's range available in every pool group (DESIGN.md §4.2).
@@ -1068,10 +1129,13 @@ class _KVCache:
         now but the driver calls are deferred to the owner's per-iteration
         ``flush_gpu_mappings`` sweep; callers that touch the pages immediately
         (e.g. reuse onboarding copies) pass ``sync=True``. On page exhaustion,
-        drains deferred reclaim, then spills lazily retained ranges
-        (LRU-first, §4.4 phase 2), retrying while either makes progress;
-        returns False if pages are still unavailable — the caller backs off
-        exactly like a failed slot allocation (§4.6)."""
+        walks the reclaim ladder -- drain deferred reclaim, spill lazily
+        retained ranges (LRU-first, §4.4 phase 2), DEDUP-REMAP duplicate
+        prefixes onto their canonical spans (P3 v2: frees pages from live
+        sequences with zero information loss), and only then spill the
+        registry excess -- retrying while any rung makes progress; returns
+        False if pages are still unavailable — the caller backs off exactly
+        like a failed slot allocation (§4.6)."""
         storage = self._storage
         ranges = self._arena_ranges
         assert ranges is not None
@@ -1087,6 +1151,13 @@ class _KVCache:
                     break
                 except OutOfPagesError:
                     if storage.drain_gpu_reclaim() > 0:
+                        continue
+                    if (
+                        storage.spill_gpu_retained(self._ARENA_SPILL_CHUNK_PAGES, spill_spans=False)
+                        > 0
+                    ):
+                        continue
+                    if self.manager.dedup_remap_gpu(self._ARENA_SPILL_CHUNK_PAGES) > 0:
                         continue
                     if storage.spill_gpu_retained(self._ARENA_SPILL_CHUNK_PAGES) > 0:
                         continue

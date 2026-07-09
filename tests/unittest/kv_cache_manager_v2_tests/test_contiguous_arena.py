@@ -1008,6 +1008,60 @@ class TestArenaPoolGroup(unittest.TestCase):
         finally:
             group.destroy()
 
+    def test_dedup_remap_replaces_private_backing(self) -> None:
+        """Pressure-time dedup remap (P3 v2) at the pool-group seam.
+
+        A live range's head chunks -- private duplicates of a registered
+        span -- are re-backed by the span's physical pages at the SAME VA:
+        bytes flip to the canonical copy, the duplicates' budget charge is
+        released, and the range gains the alias signature. Frontier and
+        slot bookkeeping are untouched (the range can keep growing).
+        """
+        group = self._group()
+        group._prefix_aliasing = True
+        try:
+            n = (2 * MiB) // 4
+            # Owner A: 2-block committed prefix, span registered owner-live.
+            rng_a = group.reserve_sequence(4)
+            self.assertEqual(group.ensure_mapped(rng_a, 4), 6)
+            addr_a = group._pools[0].slot_address(rng_a.base_block)
+            TestSparseVirtMem._tensor_at(int(addr_a), n).fill_(7.0)
+            canon = [self._FakeCanonicalPage(), self._FakeCanonicalPage()]
+            group.register_live_canonical_span(rng_a, canon, CachedCudaEvent.NULL)
+            # B: same-content private duplicate in its own range.
+            rng_b = group.reserve_sequence(4)
+            self.assertEqual(group.ensure_mapped(rng_b, 4), 6)
+            self.assertEqual(self.budget.used_pages, 12)
+            addr_b = group._pools[0].slot_address(rng_b.base_block)
+            TestSparseVirtMem._tensor_at(int(addr_b), n).fill_(8.0)
+            torch.cuda.synchronize()
+            # Remap B's head onto the span (caller-quiesce contract).
+            hit = group.lookup_canonical_span(canon[0], canon, count_stats=False)
+            self.assertIsNotNone(hit)
+            freed = group.remap_range_onto_span(rng_b, hit[0], hit[1], hit[2])
+            self.assertEqual(freed, 3)  # pool0: 2 chunks, pool1: 1 chunk
+            self.assertEqual(self.budget.used_pages, 9)
+            self.assertEqual(rng_b._alias_span_key, (hit[0], 2))
+            self.assertEqual(group.dedup_remapped_pages, 3)
+            # B's VA now reads the canonical bytes...
+            tb = TestSparseVirtMem._tensor_at(int(addr_b), n)
+            self.assertTrue(bool((tb == 7.0).all().item()))
+            # ...and shares physical pages with A (write A, read B).
+            TestSparseVirtMem._tensor_at(int(addr_a), n).fill_(9.5)
+            torch.cuda.synchronize()
+            tb2 = TestSparseVirtMem._tensor_at(int(addr_b), n)
+            self.assertTrue(bool((tb2 == 9.5).all().item()))
+            group.free_sequence(rng_b, CachedCudaEvent.NULL)
+            group.free_sequence(rng_a, CachedCudaEvent.NULL)
+            torch.cuda.synchronize()
+            group.drain_reclaim(CachedCudaEvent.NULL)
+            group.spill_retained(1 << 62)
+            group.spill_canonical_spans(1 << 62)
+            self.assertEqual(self.budget.used_pages, 0)
+            self.assertEqual(group.mapped_pages, 0)
+        finally:
+            group.destroy()
+
     def test_canonical_span_registry_alias_roundtrip(self) -> None:
         """P3 registry roundtrip: register, alias, park, adopt affinely.
 
@@ -2588,6 +2642,108 @@ class TestArenaPrefixAliasing(unittest.TestCase):
         torch.cuda.synchronize()
         manager._storage.spill_gpu_retained(1 << 62)
         self.assertEqual(budget.used_pages, 0)
+
+    def test_dedup_remap_frees_commit_conflict_loser(self) -> None:
+        """P3 v2 pressure-time dedup at the manager seam: the loser shape.
+
+        A and B prefill the same tokens concurrently; A commits first
+        (winner, owner-live span), B's commit takes the arena conflict
+        branch (sequence-private duplicates referencing A's tree blocks).
+        The dedup scan finds B, the remap re-backs B's prefix with A's
+        physical pages at the same VA -- B's holders, slots, and offsets
+        are untouched -- and the duplicates' budget charge is freed.
+        """
+        manager = self.manager
+        budget = manager._storage.gpu_page_budget
+        pg = self._pool_group()
+        n_tok = self.PREFIX_BLOCKS * self.TPB
+        tokens = [7000 + i for i in range(n_tok)]
+        cap = (self.PREFIX_BLOCKS + 4) * self.TPB
+
+        kv_a = manager.create_kv_cache(max_capacity=cap)
+        kv_b = manager.create_kv_cache(max_capacity=cap)  # before any commit: no match
+        with TemporaryCudaStream([]) as s, TemporaryCudaStream([]) as s2:
+            self.assertTrue(kv_a.resume(CudaStream(s.handle)))
+            self.assertTrue(kv_b.resume(CudaStream(s2.handle)))
+            self.assertTrue(kv_a.resize(n_tok))
+            self.assertTrue(kv_b.resize(n_tok))
+            a0 = list(kv_a.get_base_page_indices(LifeCycleId(0)))[0]
+            b0 = list(kv_b.get_base_page_indices(LifeCycleId(0)))[0]
+            self._block_floats(a0).fill_(41.0)
+            self._block_floats(b0).fill_(42.0)  # B's own (equivalent) KV
+            torch.cuda.synchronize()
+            kv_a.commit(tokens)  # winner; owner-live span registers here
+            kv_b.commit(tokens)  # loser -> private duplicates of A's blocks
+            self.assertEqual(len(pg._canonical_spans), 1)
+            used_before = budget.used_pages
+            hits_before = pg.alias_hits
+            misses_before = pg.alias_misses
+
+            freed = manager.dedup_remap_gpu(1 << 62)
+            self.assertEqual(freed, 1)  # 64 x 32KiB blocks = 1 chunk
+            self.assertEqual(budget.used_pages, used_before - 1)
+            self.assertEqual(pg.dedup_remapped_pages, 1)
+            self.assertIsNotNone(kv_b._arena_ranges[PoolGroupIndex(0)]._alias_span_key)
+            # The scan must not disturb the admission counters.
+            self.assertEqual(pg.alias_hits, hits_before)
+            self.assertEqual(pg.alias_misses, misses_before)
+            # B's VA now reads A's bytes (same physical page).
+            self.assertTrue(bool((self._block_floats(b0) == 41.0).all().item()))
+            self._block_floats(a0).fill_(43.0)
+            torch.cuda.synchronize()
+            self.assertTrue(bool((self._block_floats(b0) == 43.0).all().item()))
+            # Idempotent: nothing left to dedup.
+            self.assertEqual(manager.dedup_remap_gpu(1 << 62), 0)
+            kv_b.close()
+            kv_a.close()
+        s.take_finish_event().synchronize()
+        s2.take_finish_event().synchronize()
+        manager.drain_gpu_reclaim(CachedCudaEvent.NULL)
+        torch.cuda.synchronize()
+        manager._storage.spill_gpu_retained(1 << 62)
+        self.assertEqual(budget.used_pages, 0)
+
+    def test_reclaim_ladder_dedups_to_grow(self) -> None:
+        """The reclaim ladder reaches the dedup rung under real exhaustion.
+
+        Quota of exactly 2 pages: winner A holds one, loser B the other.
+        B's growth past its first chunk raises OutOfPagesError; drain and
+        the parked-range spill free nothing (both sequences live), so the
+        dedup rung remaps B's duplicate prefix onto A's pages -- and the
+        growth then succeeds. No preemption, no registry spill.
+        """
+        cfg = _make_manager_config(gpu_quota=4 * MiB, host_quota=64 * MiB)
+        cfg.contiguous_arena = ContiguousArenaConfig(map_ahead_pages=0, prefix_aliasing=True)
+        manager = KVCacheManager(cfg)
+        try:
+            budget = manager._storage.gpu_page_budget
+            pg = manager._storage._gpu_arena_storage().pool_group(PoolGroupIndex(0))
+            n_tok = self.PREFIX_BLOCKS * self.TPB
+            tokens = [8000 + i for i in range(n_tok)]
+            cap = (self.PREFIX_BLOCKS + 4) * self.TPB
+            kv_a = manager.create_kv_cache(max_capacity=cap)
+            kv_b = manager.create_kv_cache(max_capacity=cap)
+            with TemporaryCudaStream([]) as s, TemporaryCudaStream([]) as s2:
+                self.assertTrue(kv_a.resume(CudaStream(s.handle)))
+                self.assertTrue(kv_b.resume(CudaStream(s2.handle)))
+                self.assertTrue(kv_a.resize(n_tok))
+                self.assertTrue(kv_b.resize(n_tok))
+                torch.cuda.synchronize()
+                kv_a.commit(tokens)  # winner
+                kv_b.commit(tokens)  # loser duplicates
+                self.assertEqual(budget.free_pages, 0)
+                # Growth needs a second chunk; only the dedup rung can free.
+                self.assertTrue(kv_b.resize(n_tok + self.TPB))
+                self.assertEqual(pg.dedup_remapped_pages, 1)
+                self.assertEqual(pg.spilled_spans, 0)  # registry survived
+                self.assertEqual(budget.free_pages, 0)  # freed page consumed
+                kv_b.close()
+                kv_a.close()
+            s.take_finish_event().synchronize()
+            s2.take_finish_event().synchronize()
+            manager.drain_gpu_reclaim(CachedCudaEvent.NULL)
+        finally:
+            manager.shutdown()
 
     def test_stale_span_falls_back_to_copy(self) -> None:
         """Spill between an admission's lookup hit and its first resume.
