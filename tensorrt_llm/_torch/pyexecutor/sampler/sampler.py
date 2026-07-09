@@ -38,6 +38,7 @@ from typing import (
 import numpy as np
 import torch
 
+from tensorrt_llm._torch.flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from tensorrt_llm._torch.pyexecutor.make_decoding_batch_input_output import (
     MakeDecodingBatchInputOutput,
 )
@@ -84,7 +85,6 @@ from ...speculative.interface import get_force_num_accepted_tokens
 from ...speculative.spec_tree_manager import SpecTreeManager
 from ...utils import torch_multi_arange
 from ..finish_reason import FinishedState
-from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from ..llm_request import LlmRequest, LlmRequestState, get_draft_token_length
 from ..resource_manager import ResourceManager, ResourceManagerType
 from ..scheduler import ScheduledRequests
