@@ -22,6 +22,8 @@ __all__ = [
     "GenerationRequest",
     "TruncateKVCacheRequest",
     "CancellingRequest",
+    "StartProfileRequest",
+    "StopProfileRequest",
 ]
 
 # Mirrors C++ executor.h Request::kDefaultPriority

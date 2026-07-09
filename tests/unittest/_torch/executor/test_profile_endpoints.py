@@ -22,6 +22,7 @@ or an MPI/RPC environment.
 
 import threading
 
+from tensorrt_llm._torch.pyexecutor.profiling import PyExecutorProfileManager
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 
 
@@ -40,6 +41,11 @@ def _bare_executor():
     executor._runtime_profile_pending_stop_iter = None
     executor._profile_state_lock = threading.Lock()
     executor._profile_enabled = False
+    # The profile-state machine lives in PyExecutorProfileManager. The
+    # real PyExecutor.__init__ wires this up; replicate that here for
+    # the bare-bones test double so ``executor.start_profile``,
+    # ``executor.stop_profile``, etc. delegate correctly.
+    executor._profile_manager = PyExecutorProfileManager(executor)
     return executor
 
 
