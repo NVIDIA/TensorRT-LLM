@@ -12,9 +12,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Fused gelu_tanh+mul+NVFP4-quantize for the Gemma4 MLP.
+"""Fused gelu_tanh+mul+NVFP4-quantize (single Triton kernel).
 
-Replaces the per-layer pair on the NVFP4 down_proj path:
+Replaces the unfused pair between a packed [gate | up] GEMM output and an
+NVFP4 GEMM consumer (e.g. a gated-MLP down_proj):
 
     trtllm::flashinfer_gelu_tanh_and_mul (bf16 out, full HBM round-trip)
     -> trtllm::fp4_quantize (reads it back, emits FP4 + swizzled scales)
@@ -35,8 +36,10 @@ Numerics replicate the unfused chain byte-for-byte on SM100:
   get_sf_out_offset_128x4 (rows padded to 128; padding is zero-filled here,
   uninitialized in the unfused op).
 
-The unfused path is kept only for configurations this kernel does not
-support (non-NVFP4 down_proj, LoRA, torch.compile).
+Callers own enablement and keep the unfused pair as the fallback for
+configurations this kernel does not support (non-NVFP4 consumer, LoRA,
+torch.compile, ...); see the gelu_tanh + down_proj quantize fusion in
+modeling_gemma4.py.
 """
 
 from typing import Tuple
@@ -54,7 +57,7 @@ def _rcp_approx(x):
 
 
 @triton.jit
-def _gemma4_gelu_mul_fp4_kernel(
+def _gelu_tanh_mul_fp4_kernel(
     x_ptr,  # [M, 2I] bf16 packed [gate | up], row stride SX
     out_ptr,  # [M, I//2] uint8, two e2m1 per byte (element 0 = low nibble)
     sf_ptr,  # [pad128(M) * 4 * NKT] uint8, swizzled 128x4 layout
@@ -151,7 +154,7 @@ def sf_swizzled_offsets(m: int, nvec: int, device: torch.device) -> torch.Tensor
     return off.reshape(-1)
 
 
-def gemma4_fused_gelu_mul_fp4(
+def gelu_tanh_mul_fp4_quant(
     x: torch.Tensor, global_scale: torch.Tensor
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Fused gelu_tanh(gate) * up + NVFP4 block-scale quantize.
@@ -188,7 +191,7 @@ def gemma4_fused_gelu_mul_fp4(
     # decode shape.
     bm, bk = 8, 512
     grid = (triton.cdiv(m, bm), triton.cdiv(i, bk))
-    _gemma4_gelu_mul_fp4_kernel[grid](
+    _gelu_tanh_mul_fp4_kernel[grid](
         x, out, sf, global_scale, m, x.stride(0), nkt, IDIM=i, BM=bm, BK=bk, num_warps=8
     )
     return out, sf

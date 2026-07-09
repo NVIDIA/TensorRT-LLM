@@ -12,13 +12,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Parity tests: fused Gemma4 residual-chain kernels vs the unfused chains.
+"""Parity tests: fused post-norm residual kernels (modules/fused_ops/
+rmsnorm_residual_add) vs the unfused chains.
 
 Covers the three variants served by the shared kernel body:
-- layer tail (post_ffn norm + residual add + fp32 layer_scalar + bf16 cast),
-- post-attention norm + residual add (no scalar stage),
-- the tail's optional second output (the NEXT layer's input RMSNorm of the
-  bf16-rounded tail output).
+- ``rmsnorm_residual_add_scale`` (norm + residual add + fp32 scalar mul +
+  bf16 cast),
+- ``rmsnorm_residual_add`` (no scalar stage),
+- the optional second output (the RMSNorm of the bf16-rounded primary
+  output, e.g. the next decoder layer's input norm).
 
 Each reference reproduces the exact serving-path op sequence it replaces
 (flashinfer_rmsnorm + aten ops). The only tolerated difference is the fp32
@@ -31,9 +33,9 @@ import torch
 
 import tensorrt_llm  # noqa: F401  (registers trtllm torch ops)
 import tensorrt_llm._torch.custom_ops.flashinfer_custom_ops  # noqa: F401
-from tensorrt_llm._torch.modules.gemma4.fused_tail import (
-    gemma4_fused_norm_add,
-    gemma4_fused_norm_add_scale,
+from tensorrt_llm._torch.modules.fused_ops.rmsnorm_residual_add import (
+    rmsnorm_residual_add,
+    rmsnorm_residual_add_scale,
 )
 
 
@@ -49,7 +51,7 @@ def _mismatch(a, b):
 
 
 def _check(x, r, w, sc, eps):
-    fused = gemma4_fused_norm_add_scale(x, r, w, sc, eps)
+    fused = rmsnorm_residual_add_scale(x, r, w, sc, eps)
     ref = _reference(x, r, w, sc, eps)
     mm = _mismatch(fused, ref)
     assert mm < 1e-4, f"bf16 mismatch fraction {mm}"
@@ -59,7 +61,7 @@ def _check(x, r, w, sc, eps):
 # round-3 profiled prefill token count; 333 exercises the row tail.
 @pytest.mark.parametrize("n_tokens", [1, 7, 228, 333, 7700])
 @pytest.mark.parametrize("hidden", [5376, 512])
-def test_fused_tail_parity(n_tokens, hidden):
+def test_rmsnorm_residual_add_scale_parity(n_tokens, hidden):
     torch.manual_seed(1234)
     x = torch.randn((n_tokens, hidden), dtype=torch.bfloat16, device="cuda")
     r = torch.randn((n_tokens, hidden), dtype=torch.bfloat16, device="cuda")
@@ -69,7 +71,7 @@ def test_fused_tail_parity(n_tokens, hidden):
 
 
 @pytest.mark.parametrize("scalar", [0.987654, 2.5, 0.0])
-def test_fused_tail_nontrivial_scalar(scalar):
+def test_rmsnorm_residual_add_scale_nontrivial_scalar(scalar):
     """layer_scalar loads from the checkpoint - never assume 1.0."""
     torch.manual_seed(7)
     x = torch.randn((333, 5376), dtype=torch.bfloat16, device="cuda")
@@ -79,7 +81,7 @@ def test_fused_tail_nontrivial_scalar(scalar):
     _check(x, r, w, sc, 1e-6)
 
 
-def test_fused_tail_non_pow2_hidden_and_strided():
+def test_rmsnorm_residual_add_scale_non_pow2_hidden_and_strided():
     """Masked tail columns (non-power-of-2 H) + row-strided inputs."""
     torch.manual_seed(3)
     n, h = 65, 384
@@ -88,7 +90,7 @@ def test_fused_tail_non_pow2_hidden_and_strided():
     x, r = xbuf[:, :h], rbuf[:, :h]
     w = torch.rand((h,), dtype=torch.bfloat16, device="cuda") + 0.5
     sc = torch.tensor([1.25], dtype=torch.float32, device="cuda")
-    fused = gemma4_fused_norm_add_scale(x, r, w, sc, 1e-6)
+    fused = rmsnorm_residual_add_scale(x, r, w, sc, 1e-6)
     ref = _reference(x.contiguous(), r.contiguous(), w, sc, 1e-6)
     mm = _mismatch(fused, ref)
     assert mm < 1e-4, f"bf16 mismatch fraction {mm}"
@@ -96,13 +98,13 @@ def test_fused_tail_non_pow2_hidden_and_strided():
 
 @pytest.mark.parametrize("n_tokens", [1, 7, 228, 333, 7700])
 @pytest.mark.parametrize("hidden", [5376, 512])
-def test_fused_norm_add_parity(n_tokens, hidden):
+def test_rmsnorm_residual_add_parity(n_tokens, hidden):
     """Post-attention variant: rmsnorm(x) then the aten bf16 residual add."""
     torch.manual_seed(42)
     x = torch.randn((n_tokens, hidden), dtype=torch.bfloat16, device="cuda")
     r = torch.randn((n_tokens, hidden), dtype=torch.bfloat16, device="cuda")
     w = torch.rand((hidden,), dtype=torch.bfloat16, device="cuda") + 0.5
-    fused = gemma4_fused_norm_add(x, r, w, 1e-6)
+    fused = rmsnorm_residual_add(x, r, w, 1e-6)
     ref = r + torch.ops.trtllm.flashinfer_rmsnorm(x, w, 1e-6)
     mm = _mismatch(fused, ref)
     assert mm < 1e-4, f"bf16 mismatch fraction {mm}"
@@ -110,7 +112,7 @@ def test_fused_norm_add_parity(n_tokens, hidden):
 
 @pytest.mark.parametrize("n_tokens", [1, 228, 333, 7700])
 @pytest.mark.parametrize("hidden", [5376, 512])
-def test_fused_tail_dual_norm_parity(n_tokens, hidden):
+def test_rmsnorm_residual_add_scale_dual_norm_parity(n_tokens, hidden):
     """Tail with the secondary next-layer input-norm output.
 
     The primary output must match the plain tail; the secondary output must
@@ -124,9 +126,7 @@ def test_fused_tail_dual_norm_parity(n_tokens, hidden):
     w = torch.rand((hidden,), dtype=torch.bfloat16, device="cuda") + 0.5
     w2 = torch.rand((hidden,), dtype=torch.bfloat16, device="cuda") + 0.5
     sc = torch.tensor([0.987654], dtype=torch.float32, device="cuda")
-    out, n2 = gemma4_fused_norm_add_scale(
-        x, r, w, sc, 1e-6, next_norm_weight=w2, next_norm_eps=1e-6
-    )
+    out, n2 = rmsnorm_residual_add_scale(x, r, w, sc, 1e-6, next_norm_weight=w2, next_norm_eps=1e-6)
     ref = _reference(x, r, w, sc, 1e-6)
     mm = _mismatch(out, ref)
     assert mm < 1e-4, f"primary-output bf16 mismatch fraction {mm}"
@@ -136,12 +136,12 @@ def test_fused_tail_dual_norm_parity(n_tokens, hidden):
 
 
 if __name__ == "__main__":
-    test_fused_tail_parity(7700, 5376)
-    test_fused_tail_parity(228, 5376)
-    test_fused_tail_nontrivial_scalar(0.987654)
-    test_fused_tail_non_pow2_hidden_and_strided()
-    test_fused_norm_add_parity(7700, 5376)
-    test_fused_norm_add_parity(228, 5376)
-    test_fused_tail_dual_norm_parity(7700, 5376)
-    test_fused_tail_dual_norm_parity(228, 5376)
+    test_rmsnorm_residual_add_scale_parity(7700, 5376)
+    test_rmsnorm_residual_add_scale_parity(228, 5376)
+    test_rmsnorm_residual_add_scale_nontrivial_scalar(0.987654)
+    test_rmsnorm_residual_add_scale_non_pow2_hidden_and_strided()
+    test_rmsnorm_residual_add_parity(7700, 5376)
+    test_rmsnorm_residual_add_parity(228, 5376)
+    test_rmsnorm_residual_add_scale_dual_norm_parity(7700, 5376)
+    test_rmsnorm_residual_add_scale_dual_norm_parity(228, 5376)
     print("ALL PARITY CHECKS PASSED")

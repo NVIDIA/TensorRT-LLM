@@ -12,17 +12,19 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Fused RMSNorm + NVFP4 quantize for the Gemma4 pre-feedforward norm.
+"""Fused RMSNorm + NVFP4 quantize (flashinfer CuTe-DSL ``rmsnorm_fp4quant``).
 
-Replaces the per-layer pair in front of the NVFP4 gate_up GEMM:
+Replaces the unfused pair in front of an NVFP4 GEMM whose input is the
+RMSNorm of a bf16 activation (e.g. a pre-feedforward norm feeding a
+gate_up projection):
 
     trtllm::flashinfer_rmsnorm (bf16 out, full [M, H] HBM round-trip)
     -> trtllm::fp4_quantize (reads it back, emits FP4 + swizzled scales)
 
 with flashinfer's CuTe-DSL ``rmsnorm_fp4quant`` (SM100+), which reads the
-residual-stream input once and emits the packed E2M1 payload plus the
-128x4-swizzled E4M3 block scales directly - eliminating the intermediate
-bf16 activation write+read.
+input once and emits the packed E2M1 payload plus the 128x4-swizzled E4M3
+block scales directly - eliminating the intermediate bf16 activation
+write+read.
 
 TRT-LLM's static ``input_scale`` (448*6/amax convention) is exactly
 flashinfer's ``global_scale``: both the unfused ``trtllm::fp4_quantize`` and
@@ -35,13 +37,14 @@ the fused kernel store ``e4m3(gs * blockAmax / 6)`` as the block scale, and
 Numerics: the fused kernel quantizes the fp32 norm result directly, without
 the intermediate bf16 round the unfused chain performs when materializing
 the normed tensor. Outputs are therefore near- but not byte-identical to the
-unfused pair (~1.4% of payload nibbles differ by one code step at serving
-shapes); the quantization error against the fp32 norm is statistically
-identical (see tests/unittest/_torch/modules/test_gemma4_fused_norm_quant.py).
+unfused pair (~1.4% of payload nibbles differ by one code step at Gemma4
+serving shapes); the quantization error against the fp32 norm is statistically
+identical (see tests/unittest/_torch/modules/fused_ops/test_rmsnorm_fp4_quant.py).
 
-The unfused path is kept for configurations this kernel does not support
-(non-NVFP4 gate_up_proj, MoE block, LoRA, torch.compile, or flashinfer's
-CuTe-DSL kernels unavailable).
+Callers own enablement and keep the unfused pair as the fallback for
+configurations this kernel does not support (non-NVFP4 consumer, LoRA,
+torch.compile, flashinfer's CuTe-DSL kernels unavailable, ...); see the
+pre-feedforward norm + gate_up quantize fusion in modeling_gemma4.py.
 """
 
 from typing import Tuple
@@ -61,12 +64,12 @@ else:
     _rmsnorm_fp4quant = None
 
 
-def gemma4_fused_norm_fp4_available() -> bool:
+def rmsnorm_fp4_quant_available() -> bool:
     """Whether the flashinfer CuTe-DSL fused norm+quant kernel is usable."""
     return _rmsnorm_fp4quant is not None
 
 
-def gemma4_fused_norm_fp4(
+def rmsnorm_fp4_quant(
     x: torch.Tensor,
     norm_weight: torch.Tensor,
     eps: float,
@@ -75,10 +78,10 @@ def gemma4_fused_norm_fp4(
     """Fused RMSNorm + NVFP4 block-scale quantize.
 
     Args:
-        x: [M, H] bf16 residual-stream input (a row stride larger than the
-            width is allowed; the innermost dim must be contiguous).
-        norm_weight: [H] bf16 - pre_feedforward_layernorm weight (plain
-            multiplier convention, ``use_gemma=False``).
+        x: [M, H] bf16 input (a row stride larger than the width is
+            allowed; the innermost dim must be contiguous).
+        norm_weight: [H] bf16 RMSNorm weight (plain multiplier convention,
+            ``use_gemma=False``).
         eps: RMSNorm epsilon.
         global_scale: [1] fp32 tensor - the consumer Linear's static
             ``input_scale`` (448*6/amax convention).
@@ -90,7 +93,7 @@ def gemma4_fused_norm_fp4(
         ``trtllm::fp4_quantize``'s outputs and consumable as
         ``Fp4QuantizedTensor(fp4, sf)``.
     """
-    assert gemma4_fused_norm_fp4_available()
+    assert rmsnorm_fp4_quant_available()
     assert x.dim() == 2 and x.stride(-1) == 1
     assert x.dtype == torch.bfloat16
     assert global_scale.dtype == torch.float32

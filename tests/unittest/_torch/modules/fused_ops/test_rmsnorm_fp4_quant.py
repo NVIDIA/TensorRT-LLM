@@ -12,8 +12,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Quality test: fused Gemma4 RMSNorm+NVFP4-quantize (flashinfer CuTe-DSL
-``rmsnorm_fp4quant``) vs the unfused reference chain
+"""Quality test: fused RMSNorm+NVFP4-quantize (modules/fused_ops/
+rmsnorm_fp4_quant, backed by flashinfer's CuTe-DSL ``rmsnorm_fp4quant``) vs
+the unfused reference chain
 (trtllm::flashinfer_rmsnorm -> trtllm::fp4_quantize).
 
 The fused kernel quantizes the fp32 norm result directly, without the
@@ -35,14 +36,14 @@ import torch
 
 import tensorrt_llm  # noqa: F401  (registers trtllm torch ops)
 import tensorrt_llm._torch.custom_ops.flashinfer_custom_ops  # noqa: F401
-from tensorrt_llm._torch.modules.gemma4.fused_gelu_quant import sf_swizzled_offsets
-from tensorrt_llm._torch.modules.gemma4.fused_norm_quant import (
-    gemma4_fused_norm_fp4,
-    gemma4_fused_norm_fp4_available,
+from tensorrt_llm._torch.modules.fused_ops.gelu_tanh_mul_fp4_quant import sf_swizzled_offsets
+from tensorrt_llm._torch.modules.fused_ops.rmsnorm_fp4_quant import (
+    rmsnorm_fp4_quant,
+    rmsnorm_fp4_quant_available,
 )
 
 pytestmark = pytest.mark.skipif(
-    not gemma4_fused_norm_fp4_available(),
+    not rmsnorm_fp4_quant_available(),
     reason="flashinfer CuTe-DSL rmsnorm_fp4quant unavailable",
 )
 
@@ -77,7 +78,7 @@ def _dequant(q, sf, m, h, gs):
 
 
 def _check(x, w, eps, gs):
-    fq, fsf = gemma4_fused_norm_fp4(x, w, eps, gs)
+    fq, fsf = rmsnorm_fp4_quant(x, w, eps, gs)
     rq, rsf = _reference(x.contiguous(), w, eps, gs)
     assert fq.shape == rq.shape and fsf.numel() == rsf.numel()
     assert fq.dtype == torch.uint8 and fsf.dtype == torch.uint8
@@ -106,7 +107,7 @@ def _check(x, w, eps, gs):
 # profiled serving prefill size; 333 exercises padded tail rows.
 @pytest.mark.parametrize("n_tokens", [1, 7, 228, 333, 7700])
 @pytest.mark.parametrize("hidden", [5376, 512])
-def test_fused_norm_quant_quality(n_tokens, hidden):
+def test_rmsnorm_fp4_quant_quality(n_tokens, hidden):
     torch.manual_seed(1234)
     x = (
         torch.randn((n_tokens, hidden), dtype=torch.bfloat16, device="cuda")
@@ -120,7 +121,7 @@ def test_fused_norm_quant_quality(n_tokens, hidden):
 
 
 @pytest.mark.parametrize("gs_value", [1e6, 1.0, 1e-6])
-def test_fused_norm_quant_extreme_scales(gs_value):
+def test_rmsnorm_fp4_quant_extreme_scales(gs_value):
     """Saturating / degenerate global scales must behave like the unfused op."""
     torch.manual_seed(7)
     x = torch.randn((333, 5376), dtype=torch.bfloat16, device="cuda")
@@ -129,7 +130,7 @@ def test_fused_norm_quant_extreme_scales(gs_value):
     _check(x, w, 1e-6, gs)
 
 
-def test_fused_norm_quant_strided_rows():
+def test_rmsnorm_fp4_quant_strided_rows():
     """Row-strided input (a view of a wider buffer)."""
     torch.manual_seed(3)
     n, h = 65, 5376
@@ -141,20 +142,20 @@ def test_fused_norm_quant_strided_rows():
     _check(x, w, 1e-6, gs)
 
 
-def test_fused_norm_quant_zero_row():
+def test_rmsnorm_fp4_quant_zero_row():
     """An all-zero row must dequantize to exactly zero (zero block scales)."""
     torch.manual_seed(5)
     x = torch.randn((9, 5376), dtype=torch.bfloat16, device="cuda")
     x[4] = 0
     w = torch.rand((5376,), dtype=torch.bfloat16, device="cuda") + 0.5
     gs = torch.tensor([100.0], dtype=torch.float32, device="cuda")
-    fq, fsf = gemma4_fused_norm_fp4(x, w, 1e-6, gs)
+    fq, fsf = rmsnorm_fp4_quant(x, w, 1e-6, gs)
     dq = _dequant(fq, fsf, 9, 5376, gs)
     assert dq[4].abs().max().item() == 0.0
     _check(x, w, 1e-6, gs)
 
 
-def test_fused_norm_quant_cuda_graph():
+def test_rmsnorm_fp4_quant_cuda_graph():
     """The kernel must be CUDA-graph capturable and replay deterministically
     (the serving decode path replays it inside captured graphs)."""
     torch.manual_seed(11)
@@ -162,11 +163,11 @@ def test_fused_norm_quant_cuda_graph():
     w = torch.rand((5376,), dtype=torch.bfloat16, device="cuda") + 0.5
     gs = torch.tensor([100.0], dtype=torch.float32, device="cuda")
 
-    eager_q, eager_sf = gemma4_fused_norm_fp4(x, w, 1e-6, gs)  # also JIT warmup
+    eager_q, eager_sf = rmsnorm_fp4_quant(x, w, 1e-6, gs)  # also JIT warmup
     torch.cuda.synchronize()
     g = torch.cuda.CUDAGraph()
     with torch.cuda.graph(g):
-        graph_q, graph_sf = gemma4_fused_norm_fp4(x, w, 1e-6, gs)
+        graph_q, graph_sf = rmsnorm_fp4_quant(x, w, 1e-6, gs)
     g.replay()
     torch.cuda.synchronize()
     assert torch.equal(graph_q, eager_q)
@@ -175,10 +176,10 @@ def test_fused_norm_quant_cuda_graph():
 
 
 if __name__ == "__main__":
-    test_fused_norm_quant_quality(7700, 5376)
-    test_fused_norm_quant_quality(228, 5376)
-    test_fused_norm_quant_extreme_scales(1e6)
-    test_fused_norm_quant_strided_rows()
-    test_fused_norm_quant_zero_row()
-    test_fused_norm_quant_cuda_graph()
+    test_rmsnorm_fp4_quant_quality(7700, 5376)
+    test_rmsnorm_fp4_quant_quality(228, 5376)
+    test_rmsnorm_fp4_quant_extreme_scales(1e6)
+    test_rmsnorm_fp4_quant_strided_rows()
+    test_rmsnorm_fp4_quant_zero_row()
+    test_rmsnorm_fp4_quant_cuda_graph()
     print("ALL QUALITY CHECKS PASSED")

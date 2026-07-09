@@ -44,11 +44,14 @@ from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from ..model_config import ModelConfig
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
+from ..modules.fused_ops.gelu_tanh_mul_fp4_quant import gelu_tanh_mul_fp4_quant
+from ..modules.fused_ops.rmsnorm_fp4_quant import rmsnorm_fp4_quant, rmsnorm_fp4_quant_available
+from ..modules.fused_ops.rmsnorm_residual_add import (
+    rmsnorm_residual_add,
+    rmsnorm_residual_add_scale,
+)
 from ..modules.gated_mlp import GatedMLP
-from ..modules.gemma4.fused_gelu_quant import gemma4_fused_gelu_mul_fp4
-from ..modules.gemma4.fused_norm_quant import gemma4_fused_norm_fp4, gemma4_fused_norm_fp4_available
 from ..modules.gemma4.fused_qkv import gemma4_fused_qkv_norm_rope_quant
-from ..modules.gemma4.fused_tail import gemma4_fused_norm_add, gemma4_fused_norm_add_scale
 from ..modules.linear import Linear, TensorParallelMode, WeightMode, WeightsLoadingConfig
 from ..modules.rms_norm import RMSNorm
 from ..utils import ActivationType, Fp4QuantizedTensor, is_torch_compiling
@@ -154,7 +157,7 @@ class _Gemma4GeluQuantMLP(GatedMLP):
             and not is_torch_compiling()
             and self._fused_gelu_quant_enabled()
         ):
-            fp4, sf = gemma4_fused_gelu_mul_fp4(x, self.down_proj.input_scale)
+            fp4, sf = gelu_tanh_mul_fp4_quant(x, self.down_proj.input_scale)
             return Fp4QuantizedTensor(fp4, sf)
         return super()._apply_activation(x, has_lora=has_lora)
 
@@ -820,7 +823,7 @@ class Gemma4DecoderLayer(DecoderLayer):
             self._fused_norm_quant = (
                 # flashinfer's CuTe-DSL kernel backs this fusion (SM100+,
                 # needs nvidia-cutlass-dsl importable).
-                gemma4_fused_norm_fp4_available()
+                rmsnorm_fp4_quant_available()
                 and not self.enable_moe_block
                 and self._norm_is_plain_bf16(self.pre_feedforward_layernorm)
                 # Mirror the checks the pre-quantized-input path in
@@ -902,7 +905,7 @@ class Gemma4DecoderLayer(DecoderLayer):
             and not is_torch_compiling()
             and self._fused_norm_add_enabled()
         ):
-            hidden_states = gemma4_fused_norm_add(
+            hidden_states = rmsnorm_residual_add(
                 hidden_states,
                 residual,
                 self.post_attention_layernorm.weight,
@@ -929,7 +932,7 @@ class Gemma4DecoderLayer(DecoderLayer):
             and not is_torch_compiling()
             and self._fused_norm_quant_enabled()
         ):
-            fp4, sf = gemma4_fused_norm_fp4(
+            fp4, sf = rmsnorm_fp4_quant(
                 hidden_states,
                 self.pre_feedforward_layernorm.weight,
                 self.pre_feedforward_layernorm.variance_epsilon,
@@ -979,7 +982,7 @@ class Gemma4DecoderLayer(DecoderLayer):
                 # (returned as a (hidden, pre_normed) pair the model loop
                 # hands to the next layer).
                 nxt = self._next_input_layernorm
-                return gemma4_fused_norm_add_scale(
+                return rmsnorm_residual_add_scale(
                     hidden_states,
                     residual,
                     self.post_feedforward_layernorm.weight,
@@ -988,7 +991,7 @@ class Gemma4DecoderLayer(DecoderLayer):
                     next_norm_weight=nxt.weight,
                     next_norm_eps=nxt.variance_epsilon,
                 )
-            return gemma4_fused_norm_add_scale(
+            return rmsnorm_residual_add_scale(
                 hidden_states,
                 residual,
                 self.post_feedforward_layernorm.weight,

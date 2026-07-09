@@ -12,8 +12,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Parity test: fused Gemma4 gelu_tanh+mul+NVFP4-quantize vs the unfused
-reference chain (trtllm::flashinfer_gelu_tanh_and_mul -> trtllm::fp4_quantize).
+"""Parity test: fused gelu_tanh+mul+NVFP4-quantize (modules/fused_ops/
+gelu_tanh_mul_fp4_quant) vs the unfused reference chain
+(trtllm::flashinfer_gelu_tanh_and_mul -> trtllm::fp4_quantize).
 
 Both the packed E2M1 payload and the swizzled E4M3 scale factors are compared
 at the byte level; the scale comparison is restricted to the valid (row, kvec)
@@ -27,8 +28,8 @@ import torch
 
 import tensorrt_llm  # noqa: F401  (registers trtllm torch ops)
 import tensorrt_llm._torch.custom_ops.flashinfer_custom_ops  # noqa: F401
-from tensorrt_llm._torch.modules.gemma4.fused_gelu_quant import (
-    gemma4_fused_gelu_mul_fp4,
+from tensorrt_llm._torch.modules.fused_ops.gelu_tanh_mul_fp4_quant import (
+    gelu_tanh_mul_fp4_quant,
     sf_swizzled_offsets,
 )
 
@@ -39,7 +40,7 @@ def _reference(x, gs):
 
 
 def _check(x, gs):
-    fq, fsf = gemma4_fused_gelu_mul_fp4(x, gs)
+    fq, fsf = gelu_tanh_mul_fp4_quant(x, gs)
     rq, rsf = _reference(x, gs)
     assert fq.shape == rq.shape and fsf.numel() == rsf.numel()
     mm_fp4 = (fq != rq).float().mean().item()
@@ -53,7 +54,7 @@ def _check(x, gs):
 # 6455 the profiled serving prefill size; 333 exercises masked tail rows.
 @pytest.mark.parametrize("n_tokens", [1, 7, 228, 333, 6455])
 @pytest.mark.parametrize("intermediate", [21504, 1024])
-def test_fused_gelu_quant_parity(n_tokens, intermediate):
+def test_gelu_tanh_mul_fp4_quant_parity(n_tokens, intermediate):
     torch.manual_seed(1234)
     x = (
         torch.randn((n_tokens, 2 * intermediate), dtype=torch.bfloat16, device="cuda")
@@ -66,7 +67,7 @@ def test_fused_gelu_quant_parity(n_tokens, intermediate):
 
 
 @pytest.mark.parametrize("gs_value", [1e6, 1.0, 1e-6])
-def test_fused_gelu_quant_extreme_scales(gs_value):
+def test_gelu_tanh_mul_fp4_quant_extreme_scales(gs_value):
     """Saturating / degenerate global scales must match the unfused op."""
     torch.manual_seed(7)
     x = torch.randn((333, 2 * 21504), dtype=torch.bfloat16, device="cuda")
@@ -74,7 +75,7 @@ def test_fused_gelu_quant_extreme_scales(gs_value):
     _check(x, gs)
 
 
-def test_fused_gelu_quant_strided_rows():
+def test_gelu_tanh_mul_fp4_quant_strided_rows():
     """Row-strided input (a view of a wider buffer)."""
     torch.manual_seed(3)
     n, i = 65, 21504
@@ -82,7 +83,7 @@ def test_fused_gelu_quant_strided_rows():
     x = buf[:, : 2 * i]
     h = torch.ops.trtllm.flashinfer_gelu_tanh_and_mul(x.contiguous())
     gs = (448.0 * 6.0 / h.abs().max().float()).reshape(1)
-    fq, fsf = gemma4_fused_gelu_mul_fp4(x, gs)
+    fq, fsf = gelu_tanh_mul_fp4_quant(x, gs)
     rq, rsf = torch.ops.trtllm.fp4_quantize(h, gs, 16, False)
     valid = sf_swizzled_offsets(n, i // 16, x.device)
     assert (fq != rq).float().mean().item() < 1e-4
@@ -90,8 +91,8 @@ def test_fused_gelu_quant_strided_rows():
 
 
 if __name__ == "__main__":
-    test_fused_gelu_quant_parity(6455, 21504)
-    test_fused_gelu_quant_parity(228, 21504)
-    test_fused_gelu_quant_extreme_scales(1e6)
-    test_fused_gelu_quant_strided_rows()
+    test_gelu_tanh_mul_fp4_quant_parity(6455, 21504)
+    test_gelu_tanh_mul_fp4_quant_parity(228, 21504)
+    test_gelu_tanh_mul_fp4_quant_extreme_scales(1e6)
+    test_gelu_tanh_mul_fp4_quant_strided_rows()
     print("ALL PARITY CHECKS PASSED")
