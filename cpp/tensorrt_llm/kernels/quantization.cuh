@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2019-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -932,9 +932,11 @@ quantize_with_block_size(
     // CTA-wide barrier, an early-finishing warp can trigger completion while
     // other warps in the same CTA are still writing sf_out / out, allowing the
     // downstream NVF4 GEMM consumer to read partial data once
-    // wait_on_dependent_grids returns. Drain the CTA's stores before trigger.
-    __syncthreads();
+    // wait_on_dependent_grids returns. Each thread first makes its own stores
+    // device-visible; the barrier then guarantees every thread has done so
+    // before any thread can reach the trigger.
     __threadfence();
+    __syncthreads();
     cudaTriggerProgrammaticLaunchCompletion();
 #endif
 }
