@@ -1542,9 +1542,10 @@ class OpenAIServer(_VideoRoutesMixin):
             if mm_data is not None:
                 prompt["multi_modal_data"] = mm_data
 
-            promise = self.generator.generate_async(
-                inputs=prompt,
-                kv_cache_retention_config=_disk_retention_config(request))
+            # NB: MultimodalEncoder.generate_async(inputs, sampling_params) takes no
+            # kv_cache_retention_config (and no **kwargs); encoders emit embeddings and hold no
+            # KV cache to retain. Passing it here 500s every mm-encoder request, so omit it.
+            promise = self.generator.generate_async(inputs=prompt)
             asyncio.create_task(self.await_disconnected(raw_request, promise))
 
             response = await create_mm_embedding_response(promise)
