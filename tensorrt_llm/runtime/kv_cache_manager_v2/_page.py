@@ -395,15 +395,19 @@ class _SharedPageLock:
         ordinal: BlockOrdinal,
         life_cycle: LifeCycleId,
         skip_wait: bool,
+        update_index: bool = True,
     ) -> None:
         self._uniq_lock = uniq_lock
         if not skip_wait:
             self.page.ready_event.wait_in_stream(kv_cache.cuda_stream)
         self._user = LockOwner(rawref.ref(kv_cache), beam_index, ordinal, life_cycle)
-        old_base_index = kv_cache._update_base_page_index(
-            beam_index, ordinal, life_cycle, PageIndex(self.page.slot_id)
-        )
-        assert old_base_index == BAD_PAGE_INDEX
+        if update_index:
+            old_base_index = kv_cache._update_base_page_index(
+                beam_index, ordinal, life_cycle, PageIndex(self.page.slot_id)
+            )
+            assert old_base_index == BAD_PAGE_INDEX
+        # When update_index is False (bulk allocation), the caller writes the base
+        # page indices for the whole range at once instead of per element.
 
     def __del__(self) -> None:
         if self._uniq_lock is not None:
@@ -443,63 +447,40 @@ def bulk_lock_new_pages(
     slots: Sequence[Slot],
 ) -> "tuple[list[_SharedPageLock], array.array[int]]":
     """
-    Fused equivalent of, for each slot at consecutive ordinals starting from first_ordinal:
+    Batched equivalent of, for each slot at consecutive ordinals starting from first_ordinal:
         UncommittedPage(kv_cache, ordinal, life_cycle, cache_level, slot, beam_index)
             .lock(kv_cache, beam_index, ordinal, life_cycle, skip_wait=True)
-    Builds the identical object graph (UncommittedPage <- _PageHolder <- _UniqPageLock
-    <- _SharedPageLock) in one tight loop, skipping work that is statically dead for
-    brand-new pages: hold()/lock() existence checks, scheduled_for_eviction handling
-    (fresh pages have node_ref None), and the ready-event wait (skip_wait contract).
+    All objects are built with their regular constructors; only the hold()/lock()
+    wrapper wiring is inlined, because for brand-new pages the checks in those
+    wrappers are statically false (a fresh page has no holder, no lock, and is
+    never scheduled for eviction).
 
     Caller responsibilities (differences from the layered path):
-      - All slots' ready_event must already be waited on in kv_cache.cuda_stream.
-      - _base_page_indices is NOT updated per element here; the returned slot-id
-        array must be written by the caller (bulk slice assignment).
+      - All slots' ready_event must already be waited on in kv_cache.cuda_stream
+        (skip_wait contract).
+      - _base_page_indices is NOT updated per element (update_index=False); the
+        returned slot-id array must be written by the caller (bulk slice assignment).
     """
     if cache_level != GPU_LEVEL:
         raise ValueError("bulk_lock_new_pages supports GPU pages only")
-    manager = kv_cache.manager
-    # rawref.ref is a per-target singleton: these are the same objects the per-page
-    # constructors would create, hoisted out of the loop.
-    storage_ref = rawref.ref(manager._storage)
-    kv_ref = rawref.ref(kv_cache)
-    get_priority = kv_cache._get_priority
-    lc_obj = manager._life_cycles.get_life_cycle(life_cycle)
     locks: list[_SharedPageLock] = []
     ids = array.array("i")
     ordinal = int(first_ordinal)
     for slot in slots:
-        slot_id = slot.slot_id
-        ids.append(slot_id)
+        ids.append(slot.slot_id)  # read before set_slot() transfers ownership
         bo = BlockOrdinal(ordinal)
-        # -- UncommittedPage.__init__ + Page.__init__ + set_slot, flattened.
-        #    (tokens is intentionally left unset: the layered __init__ never sets it.)
-        page = UncommittedPage.__new__(UncommittedPage)
-        page._slot_id = slot_id  # set_slot: take ownership from `slot`
-        page.ready_event = slot.ready_event
-        slot._slot_id = None
-        slot.ready_event = CachedCudaEvent.NULL
-        page._manager = storage_ref
-        page.life_cycle = life_cycle
-        page.cache_level = cache_level
-        page._priority = get_priority(bo, lc_obj)  # user callback; may depend on ordinal
-        page._holder = None
-        page.node_ref = None
-        page.kv_cache = kv_ref
-        page.ordinal = bo
-        page.beam_index = beam_index
-        # -- Page.hold(): fresh page has no holder and is not scheduled for eviction.
+        page = UncommittedPage(kv_cache, bo, life_cycle, cache_level, slot, beam_index)
+        # Page.hold(): a fresh page has no holder and is not scheduled for eviction.
         holder = _PageHolder(page)
         page._holder = rawref.ref(holder)
-        # -- _PageHolder.lock(): fresh holder has no lock.
+        # _PageHolder.lock(): a fresh holder has no lock.
         lock = _UniqPageLock(holder)
         holder._lock = rawref.ref(lock)
-        # -- _UniqPageLock.share() / _SharedPageLock.__init__ with skip_wait=True,
-        #    minus the per-element _update_base_page_index (caller bulk-writes).
-        shared = _SharedPageLock.__new__(_SharedPageLock)
-        shared._uniq_lock = lock
-        shared._user = LockOwner(kv_ref, beam_index, bo, life_cycle)
-        locks.append(shared)
+        locks.append(
+            _SharedPageLock(
+                lock, kv_cache, beam_index, bo, life_cycle, skip_wait=True, update_index=False
+            )
+        )
         ordinal += 1
     return locks, ids
 
