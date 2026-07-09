@@ -7,11 +7,14 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import urlparse
 
 import numpy as np
 import PIL.Image
 import torch
 from diffusers.utils.torch_utils import randn_tensor
+
+from tensorrt_llm.inputs.utils import load_image
 
 from .utils import IMAGE_EXTENSIONS, normalize_video_input, pil_to_rgb
 
@@ -284,6 +287,10 @@ def action_reference_image(
     if isinstance(source, PIL.Image.Image):
         return source.convert("RGB")
     if isinstance(source, str):
+        if urlparse(source).scheme in ("http", "https", "data", "file"):
+            # Same URI-aware loader as the I2V image branch; plain local
+            # paths keep the richer path handling below (frame dirs, videos).
+            return load_image(source, format="pil").convert("RGB")
         path = Path(source)
         if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS:
             return PIL.Image.open(source).convert("RGB")

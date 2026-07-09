@@ -182,6 +182,23 @@ class TestActionReferenceImage:
         )
         assert ref.getpixel((0, 0)) == (0, 0, 255)
 
+    def test_policy_accepts_data_uri_image(self):
+        # URI references must go through the same loader as the I2V image
+        # branch instead of being treated as local filesystem paths.
+        import base64
+        from io import BytesIO
+
+        buf = BytesIO()
+        PIL.Image.new("RGB", (3, 3), "green").save(buf, format="PNG")
+        data_uri = "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+        ref = action_reference_image(
+            action_mode="policy",
+            image=data_uri,
+            video=None,
+        )
+        assert ref.size == (3, 3)
+        assert ref.getpixel((0, 0)) == (0, 128, 0)
+
 
 class TestNormalizeVideoInput:
     def test_image_path_returns_singleton_list(self, tmp_path):
