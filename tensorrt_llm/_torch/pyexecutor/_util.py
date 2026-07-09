@@ -230,6 +230,66 @@ def is_vswa_enabled(kv_cache_config):
         set(max_attention_window)) > 1
 
 
+def _is_sliding_attention_layer(layer_type: object) -> bool:
+    layer_type_name = getattr(layer_type, "name", str(layer_type)).lower()
+    return "sliding" in layer_type_name
+
+
+def _normalize_attention_windows(
+    max_attention_window: List[int],
+    max_seq_len: int,
+) -> Optional[List[int]]:
+    normalized = [min(max_seq_len, window) for window in max_attention_window]
+    if all(window == max_seq_len for window in normalized):
+        return None
+    if len(set(normalized)) == 1:
+        return [normalized[0]]
+    return normalized
+
+
+def _derive_draft_max_attention_window(
+    kv_cache_config: KvCacheConfig,
+    draft_pretrained_config: object,
+    max_seq_len: int,
+    num_draft_layers: int,
+) -> Optional[List[int]]:
+    if not is_vswa_enabled(kv_cache_config):
+        max_attention_window = kv_cache_config.max_attention_window
+        if max_attention_window is None:
+            return None
+        return _normalize_attention_windows(max_attention_window, max_seq_len)
+
+    sliding_window = getattr(draft_pretrained_config, "sliding_window", None)
+    layer_types = getattr(draft_pretrained_config, "layer_types", None)
+    # HF configs today expose a single scalar `sliding_window`; `layer_types`
+    # only marks sliding vs full. A draft with *multiple distinct* sliding window
+    # sizes cannot be represented here — fail loudly instead of silently
+    # collapsing every sliding layer to one size. Extension point: map each
+    # sliding layer_type to its own window size.
+    if isinstance(sliding_window, (list, tuple)):
+        raise NotImplementedError(
+            "Draft KV window derivation assumes a single sliding-window size, "
+            f"got multiple: {sliding_window}")
+    if sliding_window is not None and layer_types:
+        layer_type_pattern = list(layer_types)
+        if layer_type_pattern:
+            draft_windows = []
+            for layer_idx in range(num_draft_layers):
+                layer_type = layer_type_pattern[layer_idx %
+                                                len(layer_type_pattern)]
+                draft_windows.append(
+                    int(sliding_window)
+                    if _is_sliding_attention_layer(layer_type) else max_seq_len)
+            return _normalize_attention_windows(draft_windows, max_seq_len)
+
+    use_sliding_window = getattr(draft_pretrained_config, "use_sliding_window",
+                                 None)
+    if sliding_window is not None and use_sliding_window is True:
+        return _normalize_attention_windows([int(sliding_window)], max_seq_len)
+
+    return None
+
+
 class KvCacheCreator:
     """Groups together logic related to KV cache construction."""
 
@@ -1016,7 +1076,40 @@ class KvCacheCreator:
         effective_draft_config = self._get_effective_draft_config()
 
         draft_kv_config = (kv_cache_config_override if kv_cache_config_override
-                           is not None else self._kv_cache_config)
+                           is not None else self._kv_cache_config).model_copy()
+        draft_kv_config.max_attention_window = _derive_draft_max_attention_window(
+            self._kv_cache_config,
+            effective_draft_config.pretrained_config,
+            self._max_seq_len,
+            num_draft_layers,
+        )
+        # A draft whose *own* config is VSWA (mixed sliding/full attention
+        # layers, so the derived window has >1 distinct size) is envisioned but
+        # not yet supported here. ``draft_kv_config`` inherits the target's
+        # combined ``max_gpu_total_bytes`` via the ``model_copy()`` above; a
+        # VSWA draft would route through ``calculate_max_num_blocks_for_vswa``,
+        # which sizes pools from that full byte budget rather than the draft's
+        # ``max_tokens`` share — so the separate draft manager would re-allocate
+        # the whole KV budget and OOM. Only the non-SWA draft path (single/None
+        # window, which falls back to the ``max_tokens``-partitioned allocation)
+        # is exercised today; no draft model currently ships with mixed
+        # ``layer_types``. When one does, partition the budget here before the
+        # per-window split, e.g.:
+        #     _, draft_cost = self._get_target_and_draft_cache_costs()
+        #     draft_kv_config.max_gpu_total_bytes = draft_cost.bytes_for_tokens(
+        #         self._kv_cache_config.max_tokens)
+        if is_vswa_enabled(draft_kv_config):
+            raise NotImplementedError(
+                "A VSWA draft model (mixed sliding-window and full-attention "
+                "layers) is not yet supported for one-model speculative "
+                "decoding with a separate draft KV cache manager: its KV budget "
+                "would not be partitioned from the target's and would overrun "
+                "GPU memory. Derived draft max_attention_window="
+                f"{draft_kv_config.max_attention_window}.")
+        if is_vswa_enabled(self._kv_cache_config):
+            logger.info(
+                f"Derived draft KV cache max_attention_window for separate "
+                f"draft manager: {draft_kv_config.max_attention_window}")
         # Get the appropriate KV cache manager class for the draft model
         draft_kv_cache_manager_cls = get_kv_cache_manager_cls(
             effective_draft_config, draft_kv_config, is_disagg=self._is_disagg)
