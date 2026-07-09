@@ -67,10 +67,11 @@ def test_start_profile_none_body_uses_defaults(server_with_mock_generator):
     )
 
 
-def test_start_profile_custom_args(server_with_mock_generator):
+def test_start_profile_custom_args(server_with_mock_generator, tmp_path):
     server = server_with_mock_generator
+    custom_dir = str(tmp_path / "my_traces")
     request = StartProfileRequest(
-        output_dir="/tmp/my_traces",
+        output_dir=custom_dir,
         num_steps=10,
         start_step=3,
         activities=["CUDA_PROFILER"],
@@ -79,7 +80,7 @@ def test_start_profile_custom_args(server_with_mock_generator):
 
     assert response.status_code == 200
     server.generator.start_profile.assert_called_once_with(
-        output_dir="/tmp/my_traces",
+        output_dir=custom_dir,
         num_steps=10,
         start_step=3,
         activities=["CUDA_PROFILER"],

@@ -260,9 +260,23 @@ class ZeroMqQueue:
             logger.error(traceback.format_exc())
             raise e
 
-    def get(self) -> Any:
+    def get(self, timeout: Optional[float] = None) -> Any:
+        """Receive an object from the queue.
+
+        Args:
+            timeout: If ``None`` (default), block until a message arrives.
+                If a non-negative float, wait up to that many seconds and
+                raise ``queue.Empty`` if nothing arrives in time.
+        """
         self.setup_lazily()
         self._check_thread_safety()
+        if timeout is not None:
+            # ``zmq.Socket.poll`` takes timeout in milliseconds; convert
+            # from seconds. ``poll`` returns 0 when the timeout fires
+            # without any event on the socket.
+            if not self.socket.poll(timeout=int(timeout * 1000)):
+                from queue import Empty
+                raise Empty()
         return self._recv_data()
 
     def drain(self) -> list[Any]:

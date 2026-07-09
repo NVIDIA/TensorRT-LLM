@@ -103,7 +103,7 @@ def test_apply_profile_start_config_no_num_steps_leaves_stop_open(tmp_path):
     assert 3 not in executor.profile_stop_iters
 
 
-def test_stop_profile_cancels_pending_start_before_firing():
+def test_stop_profile_cancels_pending_start_before_firing(tmp_path):
     """If ``start_profile()`` was scheduled but the engine has not yet
     reached ``start_iter`` (idle server), ``stop_profile()`` must remove
     the pending start so profiling does not silently begin later."""
@@ -112,10 +112,10 @@ def test_stop_profile_cancels_pending_start_before_firing():
 
     # Simulate the full ``start_profile`` path for a bare executor: the
     # broadcast apply is what populates ``profile_start_iters``.
-    executor.start_profile(output_dir="/tmp/unused", num_steps=50)
+    executor.start_profile(output_dir=str(tmp_path), num_steps=50)
     executor._apply_profile_start_config(
         {
-            "output_dir": "/tmp/unused",
+            "output_dir": str(tmp_path),
             "start_step": 0,
             "num_steps": 50,
         }
