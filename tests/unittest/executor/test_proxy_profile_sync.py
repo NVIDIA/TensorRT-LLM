@@ -19,6 +19,7 @@ The contract documented in
 These tests pin that contract for the IPC-proxy path.
 """
 
+import queue
 import threading
 import time
 from unittest.mock import MagicMock
@@ -175,11 +176,15 @@ def test_stop_profile_timeout_warns_does_not_hang():
     If the worker is stuck (no ack within the timeout), the proxy
     must not hang the HTTP event loop forever. It logs a warning and
     returns so the handler can produce a 5xx response.
+
+    ``queue.Queue.get(timeout=...)`` raises ``queue.Empty`` on timeout
+    (not ``TimeoutError``), so the mock must mirror that to exercise the
+    real ``except Empty`` branch in ``_wait_profile_ack``.
     """
     proxy = _bare_proxy()
 
     def never_ack(timeout=None):
-        raise TimeoutError("simulated worker hang")
+        raise queue.Empty()
 
     proxy.profile_ack_queue.get.side_effect = never_ack
 
