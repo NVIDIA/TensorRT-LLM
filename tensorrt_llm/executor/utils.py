@@ -1,7 +1,23 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import asyncio
 import concurrent.futures
 import ctypes
 import os
+import re
 import sys
 import threading
 import traceback
@@ -31,6 +47,7 @@ class LlmLauncherEnvs(StrEnum):
 
 
 _SPAWN_PROXY_PROCESS_IPC_HMAC_KEY: bytes | None = None
+_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY_PATTERN = re.compile(r"^[0-9a-fA-F]{64}$")
 
 
 def _scrub_process_env_value(key_name: str, value: str) -> None:
@@ -39,12 +56,15 @@ def _scrub_process_env_value(key_name: str, value: str) -> None:
 
     libc = ctypes.CDLL(None, use_errno=True)
     libc.getenv.restype = ctypes.c_void_p
-    value_ptr = libc.getenv(key_name.encode())
+    value_ptr = libc.getenv(os.fsencode(key_name))
     if value_ptr:
-        ctypes.memset(value_ptr, 0, len(value))
+        ctypes.memset(value_ptr, 0, len(os.fsencode(value)))
 
 
 def _normalize_spawn_proxy_process_ipc_hmac_key(key: str) -> bytes:
+    if not _SPAWN_PROXY_PROCESS_IPC_HMAC_KEY_PATTERN.fullmatch(key):
+        raise ValueError("IPC HMAC key must be a 64-character hex string.")
+
     try:
         key_bytes = bytes.fromhex(key)
     except ValueError as exc:
