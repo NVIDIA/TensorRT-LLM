@@ -182,8 +182,9 @@ class NVLinkOneSided(Communication):
             use_low_precision_combine: If True, quantize the combine payload to FP8 for NVLink
                 transfer (halves NVLink bandwidth usage, output precision is preserved).
                 Corresponds to model_config.use_low_precision_moe_combine.
-            ep_group_health: Optional read-only committed EP membership. When present, its mask is passed to
-                the CUDA kernels and defines the peers expected by the watchdog. Timeout detection never mutates it.
+            ep_group_health: Optional read-only committed EP membership. When present, rank-mask handling is
+                enabled in the CUDA kernels, and its mask defines the peers expected by the watchdog. Timeout
+                detection never mutates it.
             alltoall_watchdog_timeout_s: Optional timeout for the host-side AlltoAll watchdog. If None, the
                 watchdog is disabled.
             alltoall_watchdog_poll_interval_s: Poll interval for the watchdog thread.
@@ -321,6 +322,8 @@ class NVLinkOneSided(Communication):
         self.moe_a2a_metainfo = workspace_state["metainfo"]
         self.max_num_tokens_per_rank = workspace_state["max_num_tokens_per_rank"]
         self.ep_group_health = ep_group_health
+        # Keep the kernel specialization stable for this communicator's lifetime.
+        self._rank_mask_enabled = ep_group_health is not None
         self._watchdog_coordinator = AlltoAllWatchdogCoordinator(
             workspace_state=workspace_state,
             workspace=self.workspace,
@@ -425,9 +428,10 @@ class NVLinkOneSided(Communication):
             token_final_scales: Router weights [local_num_tokens, top_k]
             all_rank_num_tokens: Token counts per rank [ep_size]
             use_dp_padding: Whether to use DP padding (optional)
-            **kwargs: Strategy-specific arguments. ``active_rank_mask`` may override the committed membership
-                for dispatch. Without an override, the committed mask and generation are captured together;
-                combine reuses that mask and fails closed if the generation changes first.
+            **kwargs: Strategy-specific arguments. In rank-mask mode, ``active_rank_mask`` may override the
+                committed membership for dispatch. Without an override, the committed mask and generation are
+                captured together; combine reuses that mask and fails closed if the generation changes first.
+                Routing must exclude inactive ranks before dispatch; the kernel does not rewrite those routes.
 
         Returns:
             Tuple of (hidden_states, hidden_states_sf, token_selected_slots, token_final_scales)
@@ -458,8 +462,11 @@ class NVLinkOneSided(Communication):
             assert eplb_local_stats.size(0) == self.eplb_stats_num_experts, (
                 "eplb_local_stats size must match eplb_stats_num_experts"
             )
+        requested_active_rank_mask = kwargs.get("active_rank_mask")
+        if not self._rank_mask_enabled and requested_active_rank_mask is not None:
+            raise ValueError("active_rank_mask requires committed EP group health")
         active_rank_mask_snapshot = self._watchdog_coordinator.capture_active_rank_mask(
-            kwargs.get("active_rank_mask")
+            requested_active_rank_mask
         )
         active_rank_mask = active_rank_mask_snapshot.active_rank_mask
 
@@ -550,9 +557,9 @@ class NVLinkOneSided(Communication):
             final_hidden_states: Output from MoE computation
                 Shape: [ep_size, max_tokens_per_rank, hidden_size] or
                        [ep_size * max_tokens_per_rank, hidden_size] (will be reshaped)
-            **kwargs: Strategy-specific arguments. If ``active_rank_mask`` is supplied, it must match the mask
-                captured by dispatch for this collective. A committed-generation change since dispatch aborts
-                the collective epoch.
+            **kwargs: Strategy-specific arguments. In rank-mask mode, ``active_rank_mask`` must match the mask
+                captured by dispatch for this collective when supplied. A committed-generation change since
+                dispatch aborts the collective epoch.
 
         Returns:
             Combined output tensor [local_num_tokens, hidden_size]
@@ -590,9 +597,12 @@ class NVLinkOneSided(Communication):
         active_rank_mask_snapshot = self._dispatch_state.get("active_rank_mask_snapshot")
         if not isinstance(active_rank_mask_snapshot, ActiveRankMaskSnapshot):
             raise RuntimeError("combine called but dispatch rank-mask snapshot is missing")
+        requested_active_rank_mask = kwargs.get("active_rank_mask")
+        if not self._rank_mask_enabled and requested_active_rank_mask is not None:
+            raise ValueError("active_rank_mask requires committed EP group health")
         active_rank_mask = self._watchdog_coordinator.active_rank_mask_for_combine(
             active_rank_mask_snapshot,
-            kwargs.get("active_rank_mask"),
+            requested_active_rank_mask,
         )
         output = torch.ops.trtllm.moe_a2a_combine(
             final_hidden_states,

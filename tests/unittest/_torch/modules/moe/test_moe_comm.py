@@ -328,14 +328,16 @@ def _run_nvlink_rank_mask_dispatch_combine(
     payload: torch.Tensor,
     runtime_max_tokens_per_rank: int,
     active_rank_mask: Optional[torch.Tensor],
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Run raw NVLink one-sided dispatch/combine with an optional active rank mask."""
-    recv_tensors, combine_payload_offset, topk_target_ranks, _ = _run_nvlink_rank_mask_dispatch(
-        comm,
-        token_selected_experts,
-        payload,
-        runtime_max_tokens_per_rank,
-        active_rank_mask,
+    recv_tensors, combine_payload_offset, topk_target_ranks, topk_send_indices = (
+        _run_nvlink_rank_mask_dispatch(
+            comm,
+            token_selected_experts,
+            payload,
+            runtime_max_tokens_per_rank,
+            active_rank_mask,
+        )
     )
     combined = _run_nvlink_rank_mask_combine(
         comm,
@@ -345,7 +347,7 @@ def _run_nvlink_rank_mask_dispatch_combine(
         combine_payload_offset,
         active_rank_mask,
     )
-    return combined.cpu(), topk_target_ranks
+    return combined.cpu(), topk_target_ranks, topk_send_indices
 
 
 def _expected_nvlink_rank_mask_combine_output(
@@ -355,15 +357,14 @@ def _expected_nvlink_rank_mask_combine_output(
     topk_send_indices: torch.Tensor,
     local_num_tokens: int,
     runtime_max_tokens_per_rank: int,
-    dead_ranks: Set[int],
 ) -> torch.Tensor:
-    """Compute combine output from dispatched workspace while skipping dead ranks."""
+    """Compute combine output from the routes recorded by dispatch."""
     from tensorrt_llm.bindings import internal as _tllm_internal
 
     hidden_size = payload.shape[-1]
     expected = torch.zeros(
         (local_num_tokens, hidden_size),
-        dtype=payload.dtype,
+        dtype=torch.float32,
         device=payload.device,
     )
     payload_offset_index = int(_tllm_internal.thop.MOE_A2A_PAYLOAD_DATA_OFFSET_INDEX)
@@ -376,7 +377,7 @@ def _expected_nvlink_rank_mask_combine_output(
         for k in range(comm.top_k):
             target_rank = int(topk_target_ranks[token_idx, k].item())
             dst_idx = int(topk_send_indices[token_idx, k].item())
-            if dst_idx < 0 or target_rank in dead_ranks:
+            if dst_idx < 0:
                 continue
             raw = comm.workspace[target_rank, payload_offset : payload_offset + bytes_per_rank]
             recv_payload = raw.view(payload.dtype).view(
@@ -384,8 +385,8 @@ def _expected_nvlink_rank_mask_combine_output(
                 runtime_max_tokens_per_rank,
                 hidden_size,
             )
-            expected[token_idx] += recv_payload[comm.ep_rank, dst_idx]
-    return expected.cpu()
+            expected[token_idx] += recv_payload[comm.ep_rank, dst_idx].float()
+    return expected.to(payload.dtype).cpu()
 
 
 # ============================================================================
@@ -1209,14 +1210,14 @@ def _worker_rank_mask_all_active_matches_no_mask(config: CommTestConfig) -> dict
         )
         payload = _make_rank_mask_payload(local_num_tokens, config.hidden_size, rank)
 
-        out_no_mask, topk_no_mask = _run_nvlink_rank_mask_dispatch_combine(
+        out_no_mask, topk_no_mask, _ = _run_nvlink_rank_mask_dispatch_combine(
             comm,
             token_selected_experts,
             payload,
             local_num_tokens,
             active_rank_mask=None,
         )
-        out_all_active, topk_all_active = _run_nvlink_rank_mask_dispatch_combine(
+        out_all_active, topk_all_active, _ = _run_nvlink_rank_mask_dispatch_combine(
             comm,
             token_selected_experts,
             payload,
@@ -1256,7 +1257,7 @@ def _worker_rank_mask_one_rank_masked(
     config: CommTestConfig,
     dead_rank: int,
 ) -> dict:
-    """Run dispatch/combine with one EP rank omitted from active_rank_mask."""
+    """Run with one peer masked after routing only to surviving ranks."""
     rank = tllm.mpi_rank()
     torch.cuda.set_device(rank)
 
@@ -1278,17 +1279,27 @@ def _worker_rank_mask_one_rank_masked(
 
         local_num_tokens = config.all_num_tokens[rank]
         torch.manual_seed(0xA2A + rank)
-        token_selected_experts = torch.randint(
-            0,
-            config.num_experts,
-            (local_num_tokens, config.top_k),
+        live_expert_ids = torch.tensor(
+            [
+                expert_id
+                for expert_id in range(config.num_experts)
+                if _expert_id_to_rank(expert_id, config.num_experts, config.ep_size) != dead_rank
+            ],
             dtype=torch.int32,
             device="cuda",
         )
+        live_expert_indices = torch.randint(
+            0,
+            live_expert_ids.numel(),
+            (local_num_tokens, config.top_k),
+            dtype=torch.int64,
+            device="cuda",
+        )
+        token_selected_experts = live_expert_ids[live_expert_indices]
         payload = _make_rank_mask_payload(local_num_tokens, config.hidden_size, rank)
         mask = _ep_mask_words(config.ep_size, dead_ranks={dead_rank})
 
-        combined, topk_target_ranks = _run_nvlink_rank_mask_dispatch_combine(
+        combined, topk_target_ranks, topk_send_indices = _run_nvlink_rank_mask_dispatch_combine(
             comm,
             token_selected_experts,
             payload,
@@ -1300,67 +1311,6 @@ def _worker_rank_mask_one_rank_masked(
             config.num_experts,
             config.ep_size,
         )
-
-        MPI.COMM_WORLD.barrier()
-        return {
-            "rank": rank,
-            "status": "alive",
-            "combined": combined,
-            "topk_target_ranks": topk_target_ranks,
-            "expected_target_ranks": expected_target_ranks,
-        }
-    except Exception:
-        traceback.print_exc()
-        raise
-    finally:
-        if comm is not None and hasattr(comm, "destroy"):
-            comm.destroy()
-
-
-def _worker_rank_mask_inactive_before_combine(
-    config: CommTestConfig,
-    dead_rank: int,
-) -> dict:
-    """Dispatch with all ranks active, then omit one rank from combine's active mask."""
-    rank = tllm.mpi_rank()
-    torch.cuda.set_device(rank)
-
-    comm = None
-    try:
-        mapping = Mapping(
-            rank=rank,
-            tp_size=config.ep_size,
-            moe_ep_size=config.ep_size,
-            world_size=config.ep_size,
-        )
-        comm = create_comm_object(config.comm_type, mapping, config)
-
-        local_num_tokens = config.all_num_tokens[rank]
-        torch.manual_seed(0xA2A + rank)
-        token_selected_experts = torch.randint(
-            0,
-            config.num_experts,
-            (local_num_tokens, config.top_k),
-            dtype=torch.int32,
-            device="cuda",
-        )
-        payload = _make_rank_mask_payload(local_num_tokens, config.hidden_size, rank)
-
-        recv_tensors, combine_payload_offset, topk_target_ranks, topk_send_indices = (
-            _run_nvlink_rank_mask_dispatch(
-                comm,
-                token_selected_experts,
-                payload,
-                local_num_tokens,
-                active_rank_mask=_ep_mask_words(config.ep_size, dead_ranks=set()),
-            )
-        )
-
-        if rank == dead_rank:
-            MPI.COMM_WORLD.barrier()
-            return {"rank": rank, "status": "dead"}
-
-        dead_ranks = {dead_rank}
         expected = _expected_nvlink_rank_mask_combine_output(
             comm,
             payload,
@@ -1368,16 +1318,7 @@ def _worker_rank_mask_inactive_before_combine(
             topk_send_indices,
             local_num_tokens,
             local_num_tokens,
-            dead_ranks,
         )
-        combined = _run_nvlink_rank_mask_combine(
-            comm,
-            recv_tensors[0],
-            local_num_tokens,
-            local_num_tokens,
-            combine_payload_offset,
-            active_rank_mask=_ep_mask_words(config.ep_size, dead_ranks=dead_ranks),
-        ).cpu()
 
         MPI.COMM_WORLD.barrier()
         return {
@@ -1385,6 +1326,8 @@ def _worker_rank_mask_inactive_before_combine(
             "status": "alive",
             "combined": combined,
             "expected": expected,
+            "topk_target_ranks": topk_target_ranks,
+            "expected_target_ranks": expected_target_ranks,
         }
     except Exception:
         traceback.print_exc()
@@ -2370,10 +2313,14 @@ def _run_rank_mask_one_rank_masked_test(
 
         assert result["status"] == "alive"
         combined = result["combined"]
+        expected = result["expected"]
         topk_target_ranks = result["topk_target_ranks"]
         expected_target_ranks = result["expected_target_ranks"]
 
         assert combined.shape == (local_num_tokens, config.hidden_size)
+        assert torch.equal(combined, expected), (
+            f"rank {rank}: combine output does not match the pre-routed live payloads"
+        )
 
         live_topk = topk_target_ranks[:local_num_tokens]
         live_expected = expected_target_ranks[:local_num_tokens]
@@ -2382,12 +2329,8 @@ def _run_rank_mask_one_rank_masked_test(
             for k in range(top_k):
                 expected = int(live_expected[token_idx, k].item())
                 got = int(live_topk[token_idx, k].item())
-                if expected == dead_rank:
-                    assert got == -1, (
-                        f"rank {rank} token {token_idx} k={k}: token routed to dead "
-                        f"rank {dead_rank} should have been dropped (got={got})"
-                    )
-                elif expected in seen_ranks:
+                assert expected != dead_rank
+                if expected in seen_ranks:
                     assert got == -1
                 else:
                     assert got == expected, (
@@ -2395,45 +2338,6 @@ def _run_rank_mask_one_rank_masked_test(
                         f"(expected={expected}, got={got})"
                     )
                     seen_ranks.add(expected)
-
-    assert saw_dead, f"dead rank {dead_rank} did not appear in results"
-
-
-def _run_rank_mask_inactive_before_combine_test(
-    mpi_pool_executor,
-    dead_rank: int,
-    local_num_tokens: int,
-    top_k: int,
-) -> None:
-    ep_size = mpi_pool_executor.num_workers
-    config = _make_rank_mask_config(ep_size, local_num_tokens, top_k)
-    _skip_if_rank_mask_config_unsupported(config)
-    assert 0 <= dead_rank < ep_size
-
-    worker_args = [(config, dead_rank)] * config.ep_size
-    results = list(
-        mpi_pool_executor.map(
-            _worker_rank_mask_inactive_before_combine,
-            *zip(*worker_args),
-        )
-    )
-
-    saw_dead = False
-    for result in results:
-        rank = result["rank"]
-        if result["status"] == "dead":
-            assert rank == dead_rank
-            saw_dead = True
-            continue
-
-        assert result["status"] == "alive"
-        combined = result["combined"]
-        expected = result["expected"]
-        assert combined is not None
-        assert expected is not None
-        assert torch.equal(combined, expected), (
-            f"rank {rank}: combine output included a rank masked inactive before combine"
-        )
 
     assert saw_dead, f"dead rank {dead_rank} did not appear in results"
 
@@ -2526,31 +2430,8 @@ class TestMoEComm:
         local_num_tokens: int,
         top_k: int,
     ) -> None:
-        """Verify masked-dead rank is skipped by raw NVLinkOneSided moe_a2a ops."""
+        """Verify peer synchronization skips a masked rank after routing excludes it."""
         _run_rank_mask_one_rank_masked_test(
-            mpi_pool_executor,
-            dead_rank,
-            local_num_tokens,
-            top_k,
-        )
-
-    @pytest.mark.threadleak(enabled=False)
-    @pytest.mark.parametrize(
-        "mpi_pool_executor,dead_rank,local_num_tokens,top_k",
-        [
-            (4, 2, 16, 2),
-        ],
-        indirect=["mpi_pool_executor"],
-    )
-    def test_moe_comm_rank_mask_inactive_before_combine_skips_stale_dispatch_slots(
-        self,
-        mpi_pool_executor,
-        dead_rank: int,
-        local_num_tokens: int,
-        top_k: int,
-    ) -> None:
-        """Verify combine skips slots from a rank masked inactive after dispatch."""
-        _run_rank_mask_inactive_before_combine_test(
             mpi_pool_executor,
             dead_rank,
             local_num_tokens,

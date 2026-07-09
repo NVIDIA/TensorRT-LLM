@@ -42,12 +42,13 @@ inline size_t alignOffset(size_t offset, size_t alignment)
     return (offset + alignment - 1) & ~(alignment - 1);
 }
 
-// Resolve an optional rank-mask tensor into a fixed-width uint64 array.
-// If the caller did not provide a mask, default to "all ranks active" (all bits set), which
-// reproduces the pre-fault-tolerance behavior bit-for-bit.
-//
-// On failure (wrong dtype / device / shape), throws via TORCH_CHECK so the error surfaces
-// at the Python op boundary rather than the kernel launch.
+inline bool hasActiveRankMask(torch::optional<torch::Tensor> const& maskTensor)
+{
+    return maskTensor.has_value() && maskTensor.value().defined();
+}
+
+// Resolve a provided rank-mask tensor into a fixed-width uint64 array. On failure
+// (wrong dtype / device / shape), throw at the Python op boundary rather than launch.
 inline void resolveActiveRankMask(torch::optional<torch::Tensor> const& maskTensor, int64_t epRank,
     uint64_t (&out)[tensorrt_llm::kernels::moe_comm::kRankMaskWords])
 {
@@ -55,14 +56,7 @@ inline void resolveActiveRankMask(torch::optional<torch::Tensor> const& maskTens
     using tensorrt_llm::kernels::moe_comm::kMaxRanks;
     TORCH_CHECK(
         epRank >= 0 && epRank < kMaxRanks, "epRank must be in the range [0, ", kMaxRanks, ") for active_rank_mask");
-    if (!maskTensor.has_value() || !maskTensor.value().defined())
-    {
-        for (int w = 0; w < kRankMaskWords; ++w)
-        {
-            out[w] = ~uint64_t{0};
-        }
-        return;
-    }
+    TORCH_CHECK(hasActiveRankMask(maskTensor), "active_rank_mask must be defined");
     torch::Tensor const& t = maskTensor.value();
     TORCH_CHECK(t.is_cpu(), "active_rank_mask must be a CPU tensor");
     TORCH_CHECK(t.scalar_type() == torch::kUInt64, "active_rank_mask must have dtype uint64");
@@ -403,9 +397,11 @@ std::tuple<std::vector<torch::Tensor>, int64_t, torch::Tensor> moeA2ADispatchOp(
         params.eplb_local_stats = nullptr;
     }
 
-    // Resolve the optional active-rank mask. Default (no mask) = all bits set, which
-    // exactly reproduces the pre-fault-tolerance kernel behavior.
-    resolveActiveRankMask(activeRankMask, epRank, params.active_rank_mask);
+    params.enable_rank_mask = hasActiveRankMask(activeRankMask);
+    if (params.enable_rank_mask)
+    {
+        resolveActiveRankMask(activeRankMask, epRank, params.active_rank_mask);
+    }
 
     params.stream = at::cuda::getCurrentCUDAStream();
 
@@ -570,8 +566,11 @@ torch::Tensor moeA2ACombineOp(torch::Tensor const& payload, int64_t localNumToke
         params.recv_buffers[target_rank] = target_workspace_ptr + combinePayloadOffset;
     }
 
-    // Resolve the optional active-rank mask. Default (no mask) = all bits set.
-    resolveActiveRankMask(activeRankMask, epRank, params.active_rank_mask);
+    params.enable_rank_mask = hasActiveRankMask(activeRankMask);
+    if (params.enable_rank_mask)
+    {
+        resolveActiveRankMask(activeRankMask, epRank, params.active_rank_mask);
+    }
 
     params.stream = at::cuda::getCurrentCUDAStream();
 
