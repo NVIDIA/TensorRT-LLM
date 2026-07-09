@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Dense Sparse Attention (DSA) backend for TRT-LLM with indexer-based TopK selection."""
 import math
+import os
 import threading
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -44,6 +45,18 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 from .params import SparseMetadataParams, SparseParams
 
 ModelConfig = tensorrt_llm.bindings.ModelConfig
+
+# Cap the per-call indexer MQA-logits transient (in elements). fp8_mqa_logits
+# allocates its [q x kv] logits output via torch.empty; the KV dimension is the
+# full (compressed) context and is unbounded, so for a large query chunk on a
+# long-context prefill this single allocation can reach tens of GB. Under
+# PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True such an allocation can stall
+# indefinitely in cuMemCreate on the longest-context (attention_dp laggard) rank
+# -> GPU idle -> peers block at the next MoE all-to-all -> watchdog hang. Tiling
+# the query dimension caps the transient to q_tile x kv with identical results
+# (each query row's logits/top-k are independent). Override via env if needed.
+_INDEXER_MQA_LOGITS_ELEM_BUDGET = int(
+    os.environ.get("TLLM_INDEXER_MQA_LOGITS_ELEM_BUDGET", 1 << 31))
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.speculative.interface import SpecMetadata
@@ -441,6 +454,29 @@ def split_prefill_chunks(
             current_req += 1
 
     return chunk_groups
+
+
+# Shrink the indexer prefill chunk size for very long requests to bound the
+# fp8(_fp4)_mqa_logits activation memory (~ chunk_size * K_compressed), keyed on
+# the largest compressed KV length in the batch. Entries are
+# (k_compressed_lower_bound_exclusive, chunk_size); >512K -> 8K, [256K, 512K]
+# -> 16K, otherwise unchanged.
+_INDEXER_CHUNK_SIZE_HEURISTIC = (
+    (512 * 1024, 8 * 1024),
+    (256 * 1024 - 1, 16 * 1024),
+)
+
+
+def select_indexer_chunk_size(configured_chunk_size: int,
+                              max_k_compressed: int) -> int:
+    """Pick the indexer prefill chunk size from the batch's largest K_compressed.
+
+    Only reduces ``configured_chunk_size`` (never increases it).
+    """
+    for threshold, chunk_size in _INDEXER_CHUNK_SIZE_HEURISTIC:
+        if max_k_compressed > threshold:
+            return min(configured_chunk_size, chunk_size)
+    return configured_chunk_size
 
 
 def _select_indexer_compress_ratio(compress_ratios: List[int]) -> int:
@@ -2011,9 +2047,15 @@ class Indexer(nn.Module):
         else:
             # Use indexer's own chunking logic to prevent L^2 complexity of indexer MQA logits computation for long sequences.
             # This is only used when MLA chunked prefill is not enabled.
+            # Adapt chunk size to the batch's largest K_compressed (see
+            # select_indexer_chunk_size).
+            max_k_compressed = int(indexer_params.kv_lens[:num_contexts].max().
+                                   item()) if num_contexts > 0 else 0
+            effective_chunk_size = select_indexer_chunk_size(
+                metadata.indexer_max_chunk_size, max_k_compressed)
             chunk_groups = split_prefill_chunks(
                 seq_lens[:num_contexts],
-                metadata.indexer_max_chunk_size,
+                effective_chunk_size,
                 start_idx=0,
             )
 
@@ -2404,44 +2446,61 @@ class Indexer(nn.Module):
                     global_q_start = chunk.token_start + chunk_q_start
                     global_q_end = chunk.token_start + chunk_q_end
 
-                    chunk_q_scale = q_scale[global_q_start:global_q_end,
-                                            ...] if self.use_fp4 else None
-                    logits = self._call_mqa_logits(
-                        q_fp8[global_q_start:global_q_end, ...],
-                        chunk_k_fp8,
-                        chunk_k_scale,
-                        weights[global_q_start:global_q_end, ...],
-                        chunk.cu_seqlen_ks[chunk_q_start:chunk_q_end],
-                        chunk.cu_seqlen_ke[chunk_q_start:chunk_q_end],
-                        chunk_q_scale,
-                    )
-                    if use_custom_topk:
-                        torch.ops.trtllm.indexer_topk_prefill(
-                            logits,
-                            chunk.cu_seqlen_ks[chunk_q_start:chunk_q_end],
-                            chunk.cu_seqlen_ke[chunk_q_start:chunk_q_end],
-                            topk_indices_buffer[global_q_start:global_q_end, :],
-                            self.index_topk)
-                    else:
-                        topk_indices = logits.topk(min(self.index_topk,
-                                                       logits.shape[-1]),
-                                                   dim=-1)[1]
-                        topk_indices -= chunk.cu_seqlen_ks[
-                            chunk_q_start:chunk_q_end][:, None]
+                    # Tile the query dimension so each fp8_mqa_logits call
+                    # allocates at most [q_tile x num_k_tokens] instead of the
+                    # full [local_q x num_k_tokens] (which can reach tens of GB
+                    # on a long context and stall cuMemCreate under
+                    # expandable_segments -> engine hang; see
+                    # _INDEXER_MQA_LOGITS_ELEM_BUDGET). Results are identical:
+                    # each query row's logits/top-k are independent and the KV
+                    # (chunk_k_fp8) is unchanged across tiles, so the per-call
+                    # allocation is the same size and the caching allocator
+                    # reuses one block (peak ~= one tile, no extra sync).
+                    local_q_len = chunk_q_end - chunk_q_start
+                    q_tile = max(
+                        1,
+                        min(
+                            local_q_len, _INDEXER_MQA_LOGITS_ELEM_BUDGET //
+                            max(1, num_k_tokens)))
+                    for tile_off in range(0, local_q_len, q_tile):
+                        c0 = chunk_q_start + tile_off
+                        c1 = min(c0 + q_tile, chunk_q_end)
+                        g0 = chunk.token_start + c0
+                        g1 = chunk.token_start + c1
+                        tile_q_scale = q_scale[g0:g1,
+                                               ...] if self.use_fp4 else None
+                        logits = self._call_mqa_logits(
+                            q_fp8[g0:g1, ...],
+                            chunk_k_fp8,
+                            chunk_k_scale,
+                            weights[g0:g1, ...],
+                            chunk.cu_seqlen_ks[c0:c1],
+                            chunk.cu_seqlen_ke[c0:c1],
+                            tile_q_scale,
+                        )
+                        if use_custom_topk:
+                            torch.ops.trtllm.indexer_topk_prefill(
+                                logits, chunk.cu_seqlen_ks[c0:c1],
+                                chunk.cu_seqlen_ke[c0:c1],
+                                topk_indices_buffer[g0:g1, :], self.index_topk)
+                        else:
+                            topk_indices = logits.topk(min(
+                                self.index_topk, logits.shape[-1]),
+                                                       dim=-1)[1]
+                            topk_indices -= chunk.cu_seqlen_ks[c0:c1][:, None]
 
-                        mask_lo = topk_indices >= 0
-                        mask_hi = topk_indices - (
-                            chunk.cu_seqlen_ke[chunk_q_start:chunk_q_end] -
-                            chunk.cu_seqlen_ks[chunk_q_start:chunk_q_end]
-                        )[:, None] < 0
-                        mask = mask_lo & mask_hi
+                            mask_lo = topk_indices >= 0
+                            mask_hi = topk_indices - (
+                                chunk.cu_seqlen_ke[c0:c1] -
+                                chunk.cu_seqlen_ks[c0:c1])[:, None] < 0
+                            mask = mask_lo & mask_hi
 
-                        # local indices per sequence
-                        topk_indices = topk_indices.masked_fill(~mask, -1)
+                            # local indices per sequence
+                            topk_indices = topk_indices.masked_fill(~mask, -1)
 
-                        topk_indices_buffer[
-                            global_q_start:global_q_end, :topk_indices.
-                            shape[-1]] = topk_indices.to(dtype=torch.int32)
+                            topk_indices_buffer[
+                                g0:g1, :topk_indices.shape[-1]] = \
+                                topk_indices.to(dtype=torch.int32)
 
                     if apply_q_split:
                         q_sizes = [(r + 1) * chunk_num_token // tp_size -

@@ -215,8 +215,10 @@ class GenerationExecutorRpcProxy(RpcExecutorMixin, GenerationExecutor):
     ) -> List:
         """Execute a method call on the rank-0 RpcWorker via the RPC client.
 
-        Rank-0-only shim; only ``model_world_size == 1`` is supported.
-        See :meth:`~tensorrt_llm.executor.proxy.GenerationExecutorProxy.collective_rpc`
+        Rank-0 RPC shim.  ``sleep`` and ``wakeup`` are allowed for
+        ``model_world_size > 1``; all other methods require
+        ``model_world_size == 1``.  See
+        :meth:`~tensorrt_llm.executor.proxy.GenerationExecutorProxy.collective_rpc`
         for details.
 
         Args:
@@ -235,11 +237,15 @@ class GenerationExecutorRpcProxy(RpcExecutorMixin, GenerationExecutor):
             (non-blocking).
 
         Raises:
-            NotImplementedError: If ``model_world_size > 1``, or if
-                ``unique_reply_rank`` or ``target_ranks`` are provided.
+            NotImplementedError: If ``model_world_size > 1`` and the method
+                is not in the allowed-methods set (currently ``sleep`` and
+                ``wakeup``), or if ``unique_reply_rank`` or ``target_ranks``
+                are provided.
         """
-        _check_collective_rpc_guard(self.model_world_size, unique_reply_rank,
-                                    target_ranks)
+        _check_collective_rpc_guard(self.model_world_size,
+                                    unique_reply_rank,
+                                    target_ranks,
+                                    method=method)
         kwargs = kwargs or {}
         remote_call = getattr(self.rpc_client, method)(*args, **kwargs)
         if non_block:

@@ -50,6 +50,8 @@ struct FmhaOptions : public KernelConfigBase {
   int32_t mDsv4ScaleBufM{0};
   // Enable the auto tuner.
   bool mEnablesAutoTuner{false};
+  // Select the grouped MLA generation kernel in the auto tuner.
+  bool mSelectsGroupedMla{false};
   // Enable the BF16Q+FP8KV K-only transform path. Disabled by default.
   bool mEnablesBf16QFp8KvKOnlyTransform{false};
   // Whether is exporting cubin.
@@ -133,6 +135,7 @@ struct FmhaOptions : public KernelConfigBase {
     TO_JSON(mDryRun);
     TO_JSON(mDsv4ScaleBufM);
     TO_JSON(mEnablesAutoTuner);
+    TO_JSON(mSelectsGroupedMla);
     TO_JSON(mEnablesBf16QFp8KvKOnlyTransform);
     TO_JSON(mIsExportingCubin);
     TO_JSON(mIsTracing);
@@ -529,12 +532,13 @@ inline void checkFmhaOptions(FmhaOptions const& options,
     }
   }
 
-  // The mGroupsTokensHeadsQ only works with GQA generation kernels.
+  // groupsTokensHeadsQ is allowed for GQA gen and explicitly selected MLA gen kernels.
   if (options.mGroupsTokensHeadsQ) {
     TLLM_CHECK_ERROR(!isContextKernel(options.mFmhaKernelType),
                      "mGroupsTokensHeadsQ should only be enabled for generation kernels.");
-    TLLM_CHECK_ERROR(!options.mIsMlaGen,
-                     "MLA gen kernels haven't supported mGroupsTokensHeadsQ yet.");
+    TLLM_CHECK_ERROR(!options.mIsMlaGen
+                       || options.mSelectsGroupedMla,
+                     "MLA generation with mGroupsTokensHeadsQ requires mSelectsGroupedMla.");
   }
 
 

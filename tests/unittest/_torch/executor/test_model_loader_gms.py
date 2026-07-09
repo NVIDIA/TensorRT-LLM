@@ -29,6 +29,7 @@ _SOURCE_IDENTITY = model_loader_mod.SourceIdentity(
 class _TinyModel(nn.Module):
     def __init__(self, events, *, include_draft=False):
         super().__init__()
+        self._weights_transformed = False
         self._events = events
         if include_draft:
             self.draft_model = nn.Module()
@@ -129,6 +130,19 @@ def _build_gms_backend(*, is_rw, events):
 
 def _install_gms_backend(monkeypatch, backend):
     monkeypatch.setattr(memory_mod, "GMSBackend", MagicMock(return_value=backend))
+
+
+class _PostTransformMxLoader:
+    checkpoint_format = "MX"
+
+    def __init__(self) -> None:
+        self.load_weights = MagicMock(return_value={})
+        self.is_weights_preloaded = MagicMock(return_value=True)
+        self.post_load_apply = MagicMock()
+        self.post_load_publish = MagicMock()
+
+    def is_post_transform_weights_preloaded(self) -> bool:
+        return True
 
 
 def _spec_config_needing_draft_weights():
@@ -293,9 +307,9 @@ def test_gms_rw_post_load_runs_inside_pool_before_finalize(monkeypatch):
         "to",
         "load_weights",
         "post_load_apply",
-        "post_load_publish",
         "post_load_weights",
         "move_untracked_params",
+        "post_load_publish",
         "pool_exit",
         "finalize_write",
     ]
@@ -344,6 +358,58 @@ def test_gms_rw_loader_preload_skips_mapping_pipeline(monkeypatch):
 
     loader._call_load_weights.assert_not_called()
     backend.move_untracked_params.assert_called_once_with(model)
+    backend.finalize_write.assert_called_once_with(model)
+
+
+def test_gms_rw_mx_post_transform_preload_uses_staged_path(monkeypatch):
+    """GMS writers that receive post-transform MX bytes must not transform again."""
+    events = []
+    loader = _make_loader(monkeypatch, events=events)
+    monkeypatch.setattr(
+        ModelLoader,
+        "_MX_STAGED_RECEIVER_ALLOWLIST",
+        frozenset({(_TinyModel, ModelLoader._MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION)}),
+    )
+    backend = _build_gms_backend(is_rw=True, events=events)
+    backend.move_untracked_params.side_effect = lambda _model: events.append(
+        "move_untracked_params"
+    )
+    backend.finalize_write.side_effect = lambda _model: events.append("finalize_write")
+    _install_gms_backend(monkeypatch, backend)
+
+    checkpoint_loader = _PostTransformMxLoader()
+    checkpoint_loader.post_load_apply.side_effect = lambda *_a, **_kw: events.append(
+        "post_load_apply"
+    )
+    checkpoint_loader.post_load_publish.side_effect = lambda *_a, **_kw: events.append(
+        "post_load_publish"
+    )
+
+    model, _ = loader.load("/ckpt", checkpoint_loader)
+
+    assert events == [
+        "pool_enter",
+        "_apply",
+        "to",
+        "post_load_apply",
+        "setup_aliases",
+        "cache_derived_state",
+        "move_untracked_params",
+        "post_load_publish",
+        "pool_exit",
+        "finalize_write",
+    ]
+    assert "post_load_weights" not in events
+    assert model._weights_transformed is True
+    _args, kwargs = checkpoint_loader.load_weights.call_args
+    assert kwargs["allow_post_transform_weights"] is True
+    loader._call_load_weights.assert_not_called()
+    checkpoint_loader.post_load_publish.assert_called_once_with(
+        model,
+        checkpoint_dir="/ckpt",
+        weights_preloaded=True,
+        source_identity=loader._source_identity,
+    )
     backend.finalize_write.assert_called_once_with(model)
 
 

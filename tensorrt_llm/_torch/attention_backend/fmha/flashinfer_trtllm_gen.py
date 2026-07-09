@@ -1077,6 +1077,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             fwd.out_scale,  # attention_output_orig_quant
             attn.rotary_inv_freq,  # rotary_inv_freq
             attn.rotary_cos_sin,  # rotary_cos_sin
+            fwd.mrope_position_deltas,  # mrope_position_deltas
             attn.local_layer_idx,  # layer_idx
             params.seq_offset,  # seq_offset
             attn.num_heads,  # num_heads

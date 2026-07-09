@@ -161,7 +161,9 @@ class Mamba2Mixer(nn.Module):
         # TODO: Update head_dims once flashinfer is updated.
         # Nemotron-v2-Nano (mamba_head_dim=80) is not supported by flashinfer yet.
         supported_head_dims = [64, 128]
-        supported_head_group_ratios = [1, 8, 16]
+        # flashinfer supports some head group ratios:
+        # https://github.com/flashinfer-ai/flashinfer/blob/v0.6.14/include/flashinfer/mamba/kernel_selective_state_update_stp.cuh#L1338
+        supported_head_group_ratios = [1, 2, 4, 8, 16, 32, 64]
         supported_d_states = [64, 128, 256]
         head_group_ratio = (self.tp_nheads //
                             self.tp_ngroups if self.tp_ngroups > 0 else 0)

@@ -19,6 +19,7 @@ l0_a30:
   - unittest/_torch/modeling -k "modeling_qwen"
   - unittest/_torch/modeling -k "modeling_qwen_moe"
   - unittest/_torch/modeling -k "modeling_out_of_tree"
+  - unittest/_torch/modeling -k "modeling_speculative"
   - unittest/_torch/sampler/test_beam_search.py
   - unittest/_torch/sampler/test_beam_search_speculative_d2h.py
   - unittest/_torch/sampler/test_logits_logprobs.py
@@ -87,25 +88,6 @@ l0_a30:
   - accuracy/test_llm_api.py::TestQwen2_7BInstruct::test_weight_only
   - examples/test_granite.py::test_llm_granite[granite-3.0-2b-instruct-bfloat16] # 5 mins
   - examples/test_ngram.py::test_llm_ngram_1gpu[no_streaming-gpt2-use_cpp_session-use_tokens-max_matching_ngram_size_2-max_draft_len_8-float16-bs2] # 1 min
-- condition:
-    ranges:
-      system_gpu_count:
-        gte: 1
-        lte: 1
-    wildcards:
-      gpu:
-      - '*a30*'
-      linux_distribution_name: ubuntu*
-    terms:
-      stage: post_merge
-      backend: triton
-  tests:
-  - triton_server/test_triton.py::test_cpp_unit_tests[cpp-unit-tests]
-  - triton_server/test_triton.py::test_python_bls_unit_tests[python-bls-unit-tests]
-  - triton_server/test_triton.py::test_python_preproc_unit_tests[python-preproc-unit-tests]
-  - triton_server/test_triton.py::test_fill_template[fill-template]
-  - triton_server/test_triton.py::test_python_multimodal_encoders_unit_tests[python-multimodal-encoders-unit-tests]
-  - triton_server/test_triton.py::test_llmapi_unit_tests[llmapi-unit-tests]
 # ------------- AutoDeploy Backend Stages ---------------
 - condition:
     ranges:

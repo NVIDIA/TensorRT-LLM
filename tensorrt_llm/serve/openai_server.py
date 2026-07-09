@@ -1319,6 +1319,13 @@ class OpenAIServer(_VideoRoutesMixin):
                     self.multimodal_server_config,
                     request_media_io_kwargs=request.media_io_kwargs)
 
+            # Decode base64 int32 prompt_token_ids relayed by the orchestrator.
+            if request.prompt_token_ids is None and request.prompt_token_ids_b64:
+                import numpy as np
+                request.prompt_token_ids = np.frombuffer(
+                    base64.b64decode(request.prompt_token_ids_b64),
+                    dtype=np.int32).tolist()
+
             if request.prompt_token_ids is not None:
                 prompt = request.prompt_token_ids
             else:
@@ -1406,6 +1413,18 @@ class OpenAIServer(_VideoRoutesMixin):
             else:
                 response = await self._create_chat_response(
                     promise, postproc_params, raw_request, disaggregated_params)
+                # Context-only: optionally return prompt_token_ids as a base64
+                # int32 buffer (one string) so the disagg orchestrator relays it
+                # without materializing the int list on its event loop. The encode
+                # runs here on the context worker (1-of-N), not the orchestrator.
+                if (request.disaggregated_params is not None and
+                        request.disaggregated_params.return_prompt_token_ids_b64
+                        and response.prompt_token_ids is not None):
+                    import numpy as np
+                    response.prompt_token_ids_b64 = base64.b64encode(
+                        np.asarray(response.prompt_token_ids,
+                                   dtype=np.int32).tobytes()).decode("ascii")
+                    response.prompt_token_ids = None
                 return JSONResponse(content=response.model_dump())
         except CppExecutorError:
             logger.error(traceback.format_exc())
