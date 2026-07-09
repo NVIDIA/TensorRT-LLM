@@ -13,6 +13,8 @@ Python and C++ codebase supporting TensorRT engine-based and PyTorch-based execu
 - `git commit -s` (DCO sign-off required). Never attribute AI tools in sign-off line. Always rely on `git` to do the sign off instead of directly adding sign off in commit message.
 - Do not add co-authors to the git commit message unless explicitly instructed to do so by the user.
 - `pre-commit` hooks run on commit — if files are modified by hooks, re-stage and commit again
+- LLM args or nested-config changes must run `python3 scripts/generate_llm_args_golden_manifest.py` and commit
+  `tensorrt_llm/usage/llm_args_golden_manifest.json`; new fields require telemetry/privacy CODEOWNER approval
 - PR title format: `[JIRA/NVBUG/None][type] description` (e.g., `[TRTLLM-5516][perf] optimize cuda graph padding`)
 - Set `LLM_MODELS_ROOT` env var when running tests that need model weights
 

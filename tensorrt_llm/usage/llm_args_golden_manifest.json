@@ -43,7 +43,21 @@
       "annotation": "<class 'bool'>",
       "converter": "",
       "kind": "value",
+      "path": "attention_dp_config.kv_cache_routing_account_for_in_transfer"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
       "path": "attention_dp_config.kv_cache_routing_cold_start_warmup"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "attention_dp_config.kv_cache_routing_conversation_affinity"
     },
     {
       "allowed_values": [],
@@ -65,6 +79,13 @@
       "converter": "",
       "kind": "value",
       "path": "attention_dp_config.kv_cache_routing_match_rate_threshold"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "attention_dp_config.kv_cache_routing_max_sessions"
     },
     {
       "allowed_values": [],
@@ -127,6 +148,13 @@
       "converter": "",
       "kind": "categorical",
       "path": "cache_transceiver_config.backend"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[Annotated[int, Gt(gt=0)]]",
+      "converter": "",
+      "kind": "value",
+      "path": "cache_transceiver_config.kv_transfer_poll_interval_ms"
     },
     {
       "allowed_values": [],
@@ -433,6 +461,20 @@
     },
     {
       "allowed_values": [],
+      "annotation": "Optional[int]",
+      "converter": "",
+      "kind": "value",
+      "path": "encoder_max_batch_size"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[int]",
+      "converter": "",
+      "kind": "value",
+      "path": "encoder_max_num_tokens"
+    },
+    {
+      "allowed_values": [],
       "annotation": "<class 'bool'>",
       "converter": "",
       "kind": "value",
@@ -496,6 +538,23 @@
     },
     {
       "allowed_values": [],
+      "annotation": "Optional[Annotated[int, Gt(gt=0)]]",
+      "converter": "",
+      "kind": "value",
+      "path": "kv_cache_config.avg_seq_len"
+    },
+    {
+      "allowed_values": [
+        "all_reusable",
+        "per_request"
+      ],
+      "annotation": "Literal['all_reusable', 'per_request']",
+      "converter": "",
+      "kind": "categorical",
+      "path": "kv_cache_config.block_reuse_policy"
+    },
+    {
+      "allowed_values": [],
       "annotation": "<class 'bool'>",
       "converter": "",
       "kind": "value",
@@ -507,6 +566,20 @@
       "converter": "",
       "kind": "value",
       "path": "kv_cache_config.cross_kv_cache_fraction"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[Annotated[int, Ge(ge=0)]]",
+      "converter": "",
+      "kind": "value",
+      "path": "kv_cache_config.disk_cache_size"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "kv_cache_config.disk_prefetch_num_reqs"
     },
     {
       "allowed_values": [
@@ -534,7 +607,21 @@
       "annotation": "<class 'bool'>",
       "converter": "",
       "kind": "value",
+      "path": "kv_cache_config.enable_kv_pool_rebalance"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
       "path": "kv_cache_config.enable_partial_reuse"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "kv_cache_config.enable_swa_scratch_reuse"
     },
     {
       "allowed_values": [],
@@ -563,6 +650,18 @@
       "converter": "",
       "kind": "value",
       "path": "kv_cache_config.iteration_stats_interval"
+    },
+    {
+      "allowed_values": [
+        "auto",
+        "v1_block_key",
+        "v2_sha256",
+        "v2_sha256_64"
+      ],
+      "annotation": "Literal['auto', 'v1_block_key', 'v2_sha256', 'v2_sha256_64']",
+      "converter": "",
+      "kind": "categorical",
+      "path": "kv_cache_config.kv_cache_event_hash_algo"
     },
     {
       "allowed_values": [
@@ -624,6 +723,13 @@
       "converter": "",
       "kind": "value",
       "path": "kv_cache_config.max_util_for_resume"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[List[float]]",
+      "converter": "",
+      "kind": "value",
+      "path": "kv_cache_config.pool_ratio"
     },
     {
       "allowed_values": [],
@@ -805,9 +911,11 @@
         "DEEPGEMM",
         "DENSEGEMM",
         "VANILLA",
-        "TRITON"
+        "TRITON",
+        "MARLIN",
+        "MEGAMOE_DEEPGEMM"
       ],
-      "annotation": "Literal['AUTO', 'CUTLASS', 'CUTEDSL', 'WIDEEP', 'TRTLLM', 'DEEPGEMM', 'DENSEGEMM', 'VANILLA', 'TRITON']",
+      "annotation": "Literal['AUTO', 'CUTLASS', 'CUTEDSL', 'WIDEEP', 'TRTLLM', 'DEEPGEMM', 'DENSEGEMM', 'VANILLA', 'TRITON', 'MARLIN', 'MEGAMOE_DEEPGEMM']",
       "converter": "",
       "kind": "categorical",
       "path": "moe_config.backend"
@@ -875,9 +983,10 @@
         "cutlass",
         "cublaslt",
         "cutedsl",
-        "cuda_core"
+        "cuda_core",
+        "marlin"
       ],
-      "annotation": "List[Literal['cutlass', 'cublaslt', 'cutedsl', 'cuda_core']]",
+      "annotation": "List[Literal['cutlass', 'cublaslt', 'cutedsl', 'cuda_core', 'marlin']]",
       "converter": "",
       "kind": "value",
       "path": "nvfp4_gemm_config.allowed_backends"
@@ -1218,6 +1327,8 @@
     {
       "allowed_values": [
         "dsa",
+        "deepseek_v4",
+        "minimax_m3",
         "rocket",
         "skip_softmax"
       ],
@@ -1225,6 +1336,13 @@
       "converter": "",
       "kind": "categorical",
       "path": "sparse_attention_config.algorithm"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "List[int]",
+      "converter": "",
+      "kind": "value",
+      "path": "sparse_attention_config.compress_ratios"
     },
     {
       "allowed_values": [],
@@ -1332,6 +1450,64 @@
     },
     {
       "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "sparse_attention_config.sparse_block_size"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "sparse_attention_config.sparse_disable_index_value"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "sparse_attention_config.sparse_index_dim"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "sparse_attention_config.sparse_init_blocks"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "sparse_attention_config.sparse_local_blocks"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "sparse_attention_config.sparse_num_index_heads"
+    },
+    {
+      "allowed_values": [
+        "max"
+      ],
+      "annotation": "Literal['max']",
+      "converter": "",
+      "kind": "categorical",
+      "path": "sparse_attention_config.sparse_score_type"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "sparse_attention_config.sparse_topk_blocks"
+    },
+    {
+      "allowed_values": [],
       "annotation": "Optional[int]",
       "converter": "",
       "kind": "value",
@@ -1360,7 +1536,7 @@
     },
     {
       "allowed_values": [],
-      "annotation": "Optional[int]",
+      "annotation": "<class 'int'>",
       "converter": "",
       "kind": "value",
       "path": "sparse_attention_config.window_size"
@@ -2466,6 +2642,13 @@
       "annotation": "Optional[Annotated[int, Gt(gt=0)]]",
       "converter": "",
       "kind": "value",
+      "path": "cache_transceiver_config.kv_transfer_poll_interval_ms"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[Annotated[int, Gt(gt=0)]]",
+      "converter": "",
+      "kind": "value",
       "path": "cache_transceiver_config.kv_transfer_sender_future_timeout_ms"
     },
     {
@@ -2759,6 +2942,23 @@
     },
     {
       "allowed_values": [],
+      "annotation": "Optional[Annotated[int, Gt(gt=0)]]",
+      "converter": "",
+      "kind": "value",
+      "path": "kv_cache_config.avg_seq_len"
+    },
+    {
+      "allowed_values": [
+        "all_reusable",
+        "per_request"
+      ],
+      "annotation": "Literal['all_reusable', 'per_request']",
+      "converter": "",
+      "kind": "categorical",
+      "path": "kv_cache_config.block_reuse_policy"
+    },
+    {
+      "allowed_values": [],
       "annotation": "<class 'bool'>",
       "converter": "",
       "kind": "value",
@@ -2770,6 +2970,20 @@
       "converter": "",
       "kind": "value",
       "path": "kv_cache_config.cross_kv_cache_fraction"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[Annotated[int, Ge(ge=0)]]",
+      "converter": "",
+      "kind": "value",
+      "path": "kv_cache_config.disk_cache_size"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "kv_cache_config.disk_prefetch_num_reqs"
     },
     {
       "allowed_values": [
@@ -2797,7 +3011,21 @@
       "annotation": "<class 'bool'>",
       "converter": "",
       "kind": "value",
+      "path": "kv_cache_config.enable_kv_pool_rebalance"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
       "path": "kv_cache_config.enable_partial_reuse"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "kv_cache_config.enable_swa_scratch_reuse"
     },
     {
       "allowed_values": [],
@@ -2826,6 +3054,18 @@
       "converter": "",
       "kind": "value",
       "path": "kv_cache_config.iteration_stats_interval"
+    },
+    {
+      "allowed_values": [
+        "auto",
+        "v1_block_key",
+        "v2_sha256",
+        "v2_sha256_64"
+      ],
+      "annotation": "Literal['auto', 'v1_block_key', 'v2_sha256', 'v2_sha256_64']",
+      "converter": "",
+      "kind": "categorical",
+      "path": "kv_cache_config.kv_cache_event_hash_algo"
     },
     {
       "allowed_values": [
@@ -2887,6 +3127,13 @@
       "converter": "",
       "kind": "value",
       "path": "kv_cache_config.max_util_for_resume"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[List[float]]",
+      "converter": "",
+      "kind": "value",
+      "path": "kv_cache_config.pool_ratio"
     },
     {
       "allowed_values": [],
@@ -3251,6 +3498,7 @@
         "W4A8_MXFP4_FP8",
         "W4A8_MXFP4_MXFP8",
         "W4A16_MXFP4",
+        "MXFP8",
         "NVFP4_AWQ",
         "NVFP4_ARC",
         "NO_QUANT"
@@ -3306,6 +3554,7 @@
         "W4A8_MXFP4_FP8",
         "W4A8_MXFP4_MXFP8",
         "W4A16_MXFP4",
+        "MXFP8",
         "NVFP4_AWQ",
         "NVFP4_ARC",
         "NO_QUANT"
@@ -3439,6 +3688,8 @@
     {
       "allowed_values": [
         "dsa",
+        "deepseek_v4",
+        "minimax_m3",
         "rocket",
         "skip_softmax"
       ],
@@ -3446,6 +3697,13 @@
       "converter": "",
       "kind": "categorical",
       "path": "sparse_attention_config.algorithm"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "List[int]",
+      "converter": "",
+      "kind": "value",
+      "path": "sparse_attention_config.compress_ratios"
     },
     {
       "allowed_values": [],
@@ -3553,6 +3811,64 @@
     },
     {
       "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "sparse_attention_config.sparse_block_size"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "sparse_attention_config.sparse_disable_index_value"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "sparse_attention_config.sparse_index_dim"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "sparse_attention_config.sparse_init_blocks"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "sparse_attention_config.sparse_local_blocks"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "sparse_attention_config.sparse_num_index_heads"
+    },
+    {
+      "allowed_values": [
+        "max"
+      ],
+      "annotation": "Literal['max']",
+      "converter": "",
+      "kind": "categorical",
+      "path": "sparse_attention_config.sparse_score_type"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "sparse_attention_config.sparse_topk_blocks"
+    },
+    {
+      "allowed_values": [],
       "annotation": "Optional[int]",
       "converter": "",
       "kind": "value",
@@ -3581,7 +3897,7 @@
     },
     {
       "allowed_values": [],
-      "annotation": "Optional[int]",
+      "annotation": "<class 'int'>",
       "converter": "",
       "kind": "value",
       "path": "sparse_attention_config.window_size"
