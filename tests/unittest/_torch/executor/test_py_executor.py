@@ -984,6 +984,11 @@ _STATE_DISAGG_GENERATION_TRANS_IN_PROGRESS = "_disagg_trans_sentinel"
 def _make_adp_request(state, *, llm_request_type=None, is_dummy_request=False):
     req = Mock()
     req.state = state
+    req.state_value = (
+        state.value
+        if isinstance(state, LlmRequestState)
+        else LlmRequestState.GENERATION_IN_PROGRESS.value
+    )
     req.is_disagg_generation_init_state = state == _STATE_DISAGG_GENERATION_INIT
     req.is_disagg_generation_transmission_in_progress = (
         state == _STATE_DISAGG_GENERATION_TRANS_IN_PROGRESS
@@ -1125,6 +1130,68 @@ def test_pad_dummy_counts_generation_to_complete():
 
     assert stub.add_dummy_calls == []
     assert len(stub.active_requests) == 1
+
+
+def test_pad_dummy_added_when_only_to_complete_requests_disagg():
+    # In disaggregated mode a GENERATION_TO_COMPLETE request is refused by
+    # MicroBatchScheduler (no_schedule_after_state), so a rank holding only
+    # such requests schedules batch=0. It must receive a pad dummy, or
+    # can_queue goes False fleet-wide and pad dummies leak on other ranks.
+    stub = _StubADPExecutor()
+    stub.active_requests = [_make_adp_request(_STATE_GENERATION_TO_COMPLETE)]
+    stub.expected_num_active_requests = 2
+
+    _run_pad(stub)
+
+    assert len(stub.add_dummy_calls) == 1
+    assert len(stub.active_requests) == 2
+
+
+def _make_fetch_stub(active_requests):
+    stub = types.SimpleNamespace()
+    stub.enable_attention_dp = True
+    stub.iter_counter = 7
+    stub.active_requests = active_requests
+    stub.inflight_req_ids = Mock()
+    stub._terminate_request = Mock()
+    stub.enable_iter_perf_stats = False
+    stub.adp_router = Mock()
+    stub.adp_router.gather_all_rank_states.return_value = [
+        Mock(num_active_requests=len(active_requests))
+    ]
+    stub.adp_router.needs_prefix_matches = False
+    stub.adp_router.route_requests.return_value = ({0: []}, 1)
+    stub._fetch_and_enqueue_requests = Mock()
+    stub._pop_from_waiting_queue = Mock(return_value=[])
+    stub.num_fetch_requests = 0
+    stub.num_fetch_requests_cur_rank = 0
+    stub.max_num_active_requests = 8
+    stub._update_adp_dummy_role = Mock()
+    stub._should_exclude_last_generation_logits = Mock(return_value=False)
+    stub.dist = Mock(tp_rank=0, rank=0, cp_rank=0, cp_size=1)
+    stub.dist.cp_config = {}
+    return stub
+
+
+def test_fetch_new_requests_strips_leaked_adp_dummy():
+    # A pad dummy leaks whenever can_queue goes False fleet-wide: forward and
+    # _update_request_states (the only same-iteration dummy removal) are both
+    # skipped. It must be terminated at the top of _fetch_new_requests, before
+    # gather_all_rank_states counts it against expected_num_active_requests.
+    real = _make_adp_request(_STATE_GENERATION_IN_PROGRESS)
+    leaked = _make_adp_request(_STATE_GENERATION_IN_PROGRESS, is_dummy_request=True)
+    leaked.is_attention_dp_dummy = True
+    stub = _make_fetch_stub([real, leaked])
+
+    result = PyExecutor._fetch_new_requests(stub, Mock(), stub.active_requests)
+
+    assert stub.active_requests == [real]
+    assert leaked.state == LlmRequestState.GENERATION_COMPLETE
+    stub._terminate_request.assert_called_once_with(leaked)
+    stub.inflight_req_ids.erase.assert_called_once_with(leaked.py_request_id)
+    gathered = stub.adp_router.gather_all_rank_states.call_args.args[0]
+    assert leaked not in gathered
+    assert result == []
 
 
 def test_pad_dummy_skips_when_active_request_present():

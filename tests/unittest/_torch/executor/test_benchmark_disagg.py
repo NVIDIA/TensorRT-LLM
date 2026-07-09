@@ -28,6 +28,7 @@ from unittest.mock import Mock, patch
 
 import pytest
 
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 
 # ---------------------------------------------------------------------------
@@ -41,6 +42,7 @@ def _make_active_request(
 ) -> Mock:
     """Create an active request stub with disagg state flags."""
     req = Mock()
+    req.state_value = LlmRequestState.GENERATION_IN_PROGRESS.value
     req.is_disagg_generation_init_state = in_init
     req.is_disagg_generation_transmission_in_progress = in_transfer
     req.is_attention_dp_dummy = False

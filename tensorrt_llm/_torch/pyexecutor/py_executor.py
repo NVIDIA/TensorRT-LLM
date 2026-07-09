@@ -4212,6 +4212,25 @@ class PyExecutor:
             self, waiting_queue: WaitingQueue,
             active_requests: List[LlmRequest]) -> List[LlmRequest]:
         """Fetch new requests and return LlmRequests ready for execution."""
+        # An ADP pad dummy must not survive into a new scheduling round. When
+        # can_queue goes False fleet-wide (some rank scheduled batch=0),
+        # _forward_step and _update_request_states are both skipped, so the
+        # only same-iteration dummy removal (_update_request_states_tp) never
+        # runs. A leaked dummy is then counted by gather_all_rank_states and
+        # can push this rank past expected_num_active_requests (hard-capped by
+        # pp_size * max_batch_size), tripping the assert in
+        # _pad_attention_dp_dummy_request. Strip and terminate it here,
+        # mirroring the removal sequence in _update_request_states_tp.
+        if self.enable_attention_dp:
+            for req in [r for r in active_requests if r.is_attention_dp_dummy]:
+                logger.warning(
+                    f"Terminating ADP pad dummy leaked from a skipped "
+                    f"iteration (iter {self.iter_counter}).")
+                req.state = LlmRequestState.GENERATION_COMPLETE
+                self.inflight_req_ids.erase(req.py_request_id)
+                self._terminate_request(req)
+                self.active_requests.remove(req)
+
         # 1. Gather rank states and calculate total_num_active_requests
         if self.enable_attention_dp:
             # NOTE: gather_all_rank_states is called here (before step 3)
@@ -4728,7 +4747,9 @@ class PyExecutor:
         In disaggregated mode, requests still waiting for KV cache
         transfer (in INIT or transmission-in-progress state) are
         excluded because they cannot participate in the forward pass
-        until transfer completes.
+        until transfer completes. Requests at state >=
+        GENERATION_TO_COMPLETE are likewise excluded, matching the
+        scheduler's no_schedule_after_state window.
 
         Returns:
             The number of active requests eligible for scheduling.
@@ -4736,12 +4757,22 @@ class PyExecutor:
         if self.kv_cache_transceiver is None:
             return len(self.active_requests)
 
-        def _is_awaiting_kv_transfer(req) -> bool:
-            return (req.is_disagg_generation_init_state
-                    or req.is_disagg_generation_transmission_in_progress)
+        # Mirror the upper bound of the scheduler's schedulability window:
+        # MicroBatchScheduler refuses requests at state >=
+        # GENERATION_TO_COMPLETE (no_schedule_after_state), so counting them
+        # here as schedulable
+        # suppresses the pad dummy while the rank still schedules batch=0,
+        # which turns can_queue False fleet-wide and stalls every rank.
+        to_complete_value = LlmRequestState.GENERATION_TO_COMPLETE.value
+
+        def _is_pad_schedulable(req) -> bool:
+            if (req.is_disagg_generation_init_state
+                    or req.is_disagg_generation_transmission_in_progress):
+                return False
+            return req.state_value < to_complete_value
 
         return sum(1 for req in self.active_requests
-                   if not _is_awaiting_kv_transfer(req))
+                   if _is_pad_schedulable(req))
 
     def _should_skip_dummy_for_benchmark_disagg(
             self, num_schedulable_requests: int) -> bool:
