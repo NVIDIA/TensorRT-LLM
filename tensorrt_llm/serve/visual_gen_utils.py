@@ -194,26 +194,37 @@ def parse_visual_gen_params(
             if media_storage_path is None:
                 raise ValueError("media_storage_path is required when input_reference is provided")
             tmp_path = os.path.join(media_storage_path, f"{id}_reference.part")
-            if isinstance(request.input_reference, str):
-                with open(tmp_path, "wb") as f:
-                    f.write(base64.b64decode(request.input_reference))
-            else:
-                with open(tmp_path, "wb") as f:
-                    shutil.copyfileobj(request.input_reference.file, f)
-            # image, video, or reject.
-            if _reference_is_image(tmp_path):
-                is_video = False
-            elif _reference_is_video(tmp_path):
-                is_video = True
-            else:
-                os.remove(tmp_path)
-                raise ValueError(
-                    "input_reference content is neither a decodable image nor a decodable video."
+            try:
+                if isinstance(request.input_reference, str):
+                    try:
+                        payload = base64.b64decode(request.input_reference)
+                    except ValueError as exc:
+                        raise ValueError("input_reference is not valid base64 data.") from exc
+                    with open(tmp_path, "wb") as f:
+                        f.write(payload)
+                else:
+                    with open(tmp_path, "wb") as f:
+                        shutil.copyfileobj(request.input_reference.file, f)
+                # image, video, or reject.
+                if _reference_is_image(tmp_path):
+                    is_video = False
+                elif _reference_is_video(tmp_path):
+                    is_video = True
+                else:
+                    raise ValueError(
+                        "input_reference content is neither a decodable image nor a decodable video."
+                    )
+                ref_path = os.path.join(
+                    media_storage_path, f"{id}_reference{'.mp4' if is_video else '.png'}"
                 )
-            ref_path = os.path.join(
-                media_storage_path, f"{id}_reference{'.mp4' if is_video else '.png'}"
-            )
-            os.replace(tmp_path, ref_path)
+                os.replace(tmp_path, ref_path)
+            except Exception:
+                # Cleanup-and-reraise, not handling: every failure path —
+                # validation errors (400) and I/O or dependency errors (500)
+                # alike — must not leak the temporary materialization.
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+                raise
             if is_video:
                 if params.extra_params is None:
                     params.extra_params = {}
