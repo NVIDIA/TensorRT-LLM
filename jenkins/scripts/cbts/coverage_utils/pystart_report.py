@@ -13,14 +13,17 @@
 # limitations under the License.
 """Merge per-process CBTS PY_START data files into the CBTS touch artifacts.
 
-Reads all ``.cbtscov.*.json`` files (each ``{context: [[file, qualname], ...]}``) and unions
-them per test context, then emits any of:
+Reads all ``.cbtscov.*.sqlite`` files (each a ``touch(test, file, qualname)`` table; legacy
+``.json`` / ``.json.gz`` are also accepted) and unions them. The merge is streamed straight into
+the output SQLite (dedup done on disk via a UNIQUE index, one input file's rows in memory at a
+time) so peak memory stays bounded even for a full run of thousands of per-process files. Emits
+any of:
   --out-sqlite : indexed ``touch(test, file, qualname)`` DB -- the machine-readable artifact the
                  selector queries ("which tests touch file/function X"); single file, scales.
   --out-dir    : a browsable HTML report split by source file (index + one page per file), so no
-                 single page is large and the whole tree compresses well (like coverage.py's report).
-  --out-json   : the full per-test -> [file::qualname] map (kept for small/local runs).
-stdlib-only; also prints a one-line touch-count summary (+ coverage rate when --source-root is given).
+                 single page is large and the whole tree compresses well.
+  --out-json   : the full per-test -> [file::qualname] map (streamed from the merged DB).
+stdlib-only; also prints a one-line touch-count summary (+ coverage rate when --source-root given).
 """
 
 import argparse
@@ -31,6 +34,7 @@ import json
 import os
 import re
 import sqlite3
+import tempfile
 from collections import defaultdict
 from html import escape
 
@@ -41,21 +45,68 @@ def canon(path):
     return m.group(1) if m else path
 
 
+def _iter_rows(fp):
+    """Yield (test, file, qualname) rows from one per-process data file (SQLite or legacy JSON)."""
+    if fp.endswith(".sqlite"):
+        con = sqlite3.connect(f"file:{fp}?mode=ro", uri=True)
+        try:
+            yield from con.execute("SELECT test, file, qualname FROM touch")
+        finally:
+            con.close()
+    else:
+        opener = gzip.open if fp.endswith(".gz") else open
+        with opener(fp, "rt") as f:
+            data = json.load(f)
+        for ctx, pairs in data.items():
+            for file, qual in pairs:
+                yield ctx, file, qual
+
+
+def merge_to_sqlite(pattern, out_path):
+    """Stream every per-process file into a deduped touch DB. Returns (connection, n_data_files)."""
+    files = sorted(glob.glob(pattern))
+    if os.path.exists(out_path):
+        os.remove(out_path)
+    con = sqlite3.connect(out_path)
+    con.execute("PRAGMA journal_mode=OFF")
+    con.execute("PRAGMA synchronous=OFF")
+    con.execute(
+        "CREATE TABLE touch (test TEXT, file TEXT, qualname TEXT, UNIQUE(test, file, qualname))"
+    )
+    con.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT)")
+    for fp in files:
+        batch = []
+        try:
+            for test, file, qual in _iter_rows(fp):
+                batch.append((test, canon(file), qual))
+                if len(batch) >= 20000:
+                    con.executemany("INSERT OR IGNORE INTO touch VALUES (?, ?, ?)", batch)
+                    batch = []
+            if batch:
+                con.executemany("INSERT OR IGNORE INTO touch VALUES (?, ?, ?)", batch)
+        except (OSError, ValueError, sqlite3.Error):
+            continue
+    con.execute("CREATE INDEX ix_file ON touch(file)")
+    con.execute("CREATE INDEX ix_func ON touch(file, qualname)")
+    con.execute("CREATE INDEX ix_test ON touch(test)")
+    con.commit()
+    return con, len(files)
+
+
 def enumerate_defs(source_root):
     """Enumerate the static coverage-rate denominator from the product source tree.
 
     Every product .py file and every top-level function / method defined in it (nested /
     comprehension frames are excluded to match what the PY_START tracker records).
-    Returns (set(files), set((file, qualname))).
+    Returns (set(coverable_files), set((file, qualname))).
     """
-    files, funcs = set(), set()
+    funcs = set()
     for dirpath, _dirs, names in os.walk(source_root):
         for nm in names:
             if not nm.endswith(".py"):
                 continue
             full = os.path.join(dirpath, nm)
             rel = canon(os.path.abspath(full))
-            files.add(rel)
             try:
                 tree = ast.parse(open(full, encoding="utf-8").read())
             except (OSError, SyntaxError):
@@ -71,53 +122,7 @@ def enumerate_defs(source_root):
                                 funcs.add((rel, f"{prefix}{child.name}.{m.name}"))
 
             visit(tree, "")
-    return files, funcs
-
-
-def load_merged(pattern):
-    """Union all per-process data files -> {test_context: set((file, qualname))}.
-
-    Per-process files are SQLite (`.cbtscov.*.sqlite`, a `touch(test, file, qualname)` table);
-    legacy `.json` / `.json.gz` are still accepted so older data merges too.
-    """
-    per_test = defaultdict(set)
-    files = sorted(glob.glob(pattern))
-    for fp in files:
-        try:
-            if fp.endswith(".sqlite"):
-                con = sqlite3.connect(fp)
-                try:
-                    for ctx, file, qual in con.execute("SELECT test, file, qualname FROM touch"):
-                        per_test[ctx].add((canon(file), qual))
-                finally:
-                    con.close()
-            else:
-                opener = gzip.open if fp.endswith(".gz") else open
-                with opener(fp, "rt") as f:
-                    data = json.load(f)
-                for ctx, pairs in data.items():
-                    for file, qual in pairs:
-                        per_test[ctx].add((canon(file), qual))
-        except (OSError, ValueError, sqlite3.Error):
-            continue
-    return per_test, len(files)
-
-
-def write_sqlite(path, per_test, meta):
-    """Indexed touch DB for the selector: touch(test, file, qualname) + a meta table."""
-    if os.path.exists(path):
-        os.remove(path)
-    con = sqlite3.connect(path)
-    con.execute("CREATE TABLE touch (test TEXT, file TEXT, qualname TEXT)")
-    con.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT)")
-    rows = ((t, f, q) for t, pairs in per_test.items() if t for (f, q) in pairs)
-    con.executemany("INSERT INTO touch VALUES (?, ?, ?)", rows)
-    con.execute("CREATE INDEX ix_file ON touch(file)")
-    con.execute("CREATE INDEX ix_func ON touch(file, qualname)")
-    con.execute("CREATE INDEX ix_test ON touch(test)")
-    con.executemany("INSERT INTO meta VALUES (?, ?)", list(meta.items()))
-    con.commit()
-    con.close()
+    return {f for f, _q in funcs}, funcs
 
 
 _CSS = (
@@ -134,28 +139,29 @@ def _page_name(file):
     return re.sub(r"[^A-Za-z0-9]", "_", file) + ".html"
 
 
-def write_html_tree(out_dir, per_test, rate_line, n_tests, n_data_files):
-    """Split HTML report: index.html (files grouped by directory) + files/<file>.html (per-file detail)."""
+def write_html_tree(out_dir, con, rate_line, n_tests, n_data_files):
+    """Split HTML report, queried per file from the merged DB (bounded memory per page)."""
     files_dir = os.path.join(out_dir, "files")
     os.makedirs(files_dir, exist_ok=True)
+    files = [
+        r[0] for r in con.execute("SELECT DISTINCT file FROM touch WHERE test != '' ORDER BY file")
+    ]
 
-    # file -> {qualname -> sorted[tests]}
-    file_funcs = defaultdict(lambda: defaultdict(list))
-    for ctx, pairs in per_test.items():
-        if not ctx:
-            continue
-        for file, qual in pairs:
-            file_funcs[file][qual].append(ctx)
-
-    # per-file pages
-    for file, funcs in file_funcs.items():
+    for file in files:
+        # one file's (qualname -> tests) held at a time
+        funcs = defaultdict(list)
+        for qual, test in con.execute(
+            "SELECT qualname, test FROM touch WHERE file = ? AND test != '' ORDER BY qualname, test",
+            (file,),
+        ):
+            funcs[qual].append(test)
         h = [f"<!doctype html><meta charset='utf-8'><title>{escape(file)}</title>{_CSS}"]
         h.append(
             f"<p><a href='../index.html'>&larr; index</a></p><h1 class='mono'>{escape(file)}</h1>"
         )
         h.append(f"<p class='t'>{len(funcs)} functions touched</p>")
         for qual in sorted(funcs):
-            tests = sorted(set(funcs[qual]))
+            tests = funcs[qual]
             h.append(
                 f"<details><summary class='mono'>{escape(qual)} "
                 f"<span class='t'>&larr; {len(tests)} tests</span></summary>"
@@ -166,33 +172,72 @@ def write_html_tree(out_dir, per_test, rate_line, n_tests, n_data_files):
         with open(os.path.join(files_dir, _page_name(file)), "w") as fh:
             fh.write("\n".join(h))
 
-    # index: group files by directory
+    # index: files grouped by directory, with per-file counts (SQL aggregate)
+    counts = {
+        f: (nf, nt)
+        for f, nf, nt in con.execute(
+            "SELECT file, COUNT(DISTINCT qualname), COUNT(DISTINCT test) "
+            "FROM touch WHERE test != '' GROUP BY file"
+        )
+    }
     by_dir = defaultdict(list)
-    for file in file_funcs:
-        by_dir[os.path.dirname(file)].append(file)
+    for f in files:
+        by_dir[os.path.dirname(f)].append(f)
     h = [f"<!doctype html><meta charset='utf-8'><title>CBTS coverage</title>{_CSS}"]
     h.append("<h1>CBTS function-level coverage (PY_START)</h1>")
     h.append(
-        f"<p>{n_tests} tests · {len(file_funcs)} product files touched · {n_data_files} data files merged.</p>"
+        f"<p>{n_tests} tests · {len(files)} product files touched · {n_data_files} data files merged.</p>"
     )
     if rate_line:
         h.append(f"<p><b>{escape(rate_line)}</b></p>")
     for d in sorted(by_dir):
-        flist = sorted(by_dir[d])
+        flist = by_dir[d]
         h.append(
             f"<details><summary class='mono'>{escape(d or '.')} <span class='t'>({len(flist)} files)</span></summary>"
         )
         h.append("<table><tr><th class='l'>file</th><th>funcs</th><th>tests</th></tr>")
-        for file in flist:
-            funcs = file_funcs[file]
-            ntests = len({t for ts in funcs.values() for t in ts})
+        for f in flist:
+            nf, nt = counts.get(f, (0, 0))
             h.append(
-                f"<tr><td class='l mono'><a href='files/{_page_name(file)}'>{escape(os.path.basename(file))}</a></td>"
-                f"<td>{len(funcs)}</td><td>{ntests}</td></tr>"
+                f"<tr><td class='l mono'><a href='files/{_page_name(f)}'>{escape(os.path.basename(f))}</a></td>"
+                f"<td>{nf}</td><td>{nt}</td></tr>"
             )
         h.append("</table></details>")
     with open(os.path.join(out_dir, "index.html"), "w") as fh:
         fh.write("\n".join(h))
+
+
+def write_json(con, out_path):
+    """Stream the per-test touch map to JSON without holding it all in memory."""
+    with open(out_path, "w") as f:
+        f.write("{")
+        first = True
+        cur_test = None
+        touched = []
+        rows = con.execute(
+            "SELECT test, file, qualname FROM touch WHERE test != '' ORDER BY test, file, qualname"
+        )
+        for test, file, qual in rows:
+            if test != cur_test:
+                if cur_test is not None:
+                    f.write(
+                        ("," if not first else "")
+                        + json.dumps(cur_test)
+                        + ":"
+                        + json.dumps(sorted(touched))
+                    )
+                    first = False
+                cur_test = test
+                touched = []
+            touched.append(f"{file}::{qual}")
+        if cur_test is not None:
+            f.write(
+                ("," if not first else "")
+                + json.dumps(cur_test)
+                + ":"
+                + json.dumps(sorted(touched))
+            )
+        f.write("}")
 
 
 def main():
@@ -216,35 +261,31 @@ def main():
     )
     a = ap.parse_args()
 
-    per_test, n_data_files = load_merged(a.glob)
+    # Merge streams into a SQLite DB (bounded memory). Use --out-sqlite as that DB directly, else a temp file.
+    keep = a.out_sqlite is not None
+    db_path = a.out_sqlite if keep else os.path.join(tempfile.gettempdir(), "cbts_merge_tmp.sqlite")
+    con, n_data_files = merge_to_sqlite(a.glob, db_path)
 
-    # reverse counts (skip the empty context: import-time frames collected before any test)
-    file_to_tests = defaultdict(set)
-    func_to_tests = defaultdict(set)
-    for ctx, pairs in per_test.items():
-        if not ctx:
-            continue
-        for file, qual in pairs:
-            file_to_tests[file].add(ctx)
-            func_to_tests[(file, qual)].add(ctx)
-
-    n_tests = len([c for c in per_test if c])
+    n_tests = con.execute("SELECT COUNT(DISTINCT test) FROM touch WHERE test != ''").fetchone()[0]
+    n_files = con.execute("SELECT COUNT(DISTINCT file) FROM touch WHERE test != ''").fetchone()[0]
+    n_funcs = con.execute(
+        "SELECT COUNT(*) FROM (SELECT DISTINCT file, qualname FROM touch WHERE test != '')"
+    ).fetchone()[0]
     print(
         f"CBTS PY_START: merged {n_data_files} data files -> "
-        f"{n_tests} tests, {len(file_to_tests)} product files, {len(func_to_tests)} functions touched"
+        f"{n_tests} tests, {n_files} product files, {n_funcs} functions touched"
     )
 
-    meta = {
-        "tests": str(n_tests),
-        "files": str(len(file_to_tests)),
-        "functions": str(len(func_to_tests)),
-    }
+    meta = {"tests": str(n_tests), "files": str(n_files), "functions": str(n_funcs)}
     rate_line = ""
     if a.source_root:
-        _all_files, all_funcs = enumerate_defs(a.source_root)
-        coverable_files = {f for f, _q in all_funcs}
-        touched_files = {f for f in file_to_tests} & coverable_files
-        touched_funcs = {k for k in func_to_tests} & all_funcs
+        coverable_files, all_funcs = enumerate_defs(a.source_root)
+        touched_files = {
+            r[0] for r in con.execute("SELECT DISTINCT file FROM touch WHERE test != ''")
+        } & coverable_files
+        touched_funcs = {
+            t for t in con.execute("SELECT DISTINCT file, qualname FROM touch WHERE test != ''")
+        } & all_funcs
         fr = 100.0 * len(touched_files) / len(coverable_files) if coverable_files else 0.0
         qr = 100.0 * len(touched_funcs) / len(all_funcs) if all_funcs else 0.0
         rate_line = (
@@ -261,21 +302,23 @@ def main():
             }
         )
 
-    if a.out_sqlite:
-        write_sqlite(a.out_sqlite, per_test, meta)
+    con.executemany("INSERT OR REPLACE INTO meta VALUES (?, ?)", list(meta.items()))
+    con.commit()
+    if keep:
         print(f"wrote {a.out_sqlite}")
     if a.out_json:
-        touchmap = {
-            ctx: sorted(f"{f}::{q}" for f, q in pairs)
-            for ctx, pairs in sorted(per_test.items())
-            if ctx
-        }
-        with open(a.out_json, "w") as f:
-            json.dump(touchmap, f, indent=0)
+        write_json(con, a.out_json)
         print(f"wrote {a.out_json}")
     if a.out_dir:
-        write_html_tree(a.out_dir, per_test, rate_line, n_tests, n_data_files)
+        write_html_tree(a.out_dir, con, rate_line, n_tests, n_data_files)
         print(f"wrote {a.out_dir}/index.html")
+
+    con.close()
+    if not keep:
+        try:
+            os.remove(db_path)
+        except OSError:
+            pass
 
 
 if __name__ == "__main__":
