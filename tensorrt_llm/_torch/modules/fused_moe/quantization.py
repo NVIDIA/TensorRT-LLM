@@ -1308,20 +1308,35 @@ class INT8WoqPerChannelFusedMoEMethod(FusedMoEMethodBase):
                 f"Weight Only Quantization currently only supports INT8. Got: {module.quant_config.layer_quant_mode}."
             )
 
+        # The INT8 mixed-GEMM preprocessor packs rows in tiles of 64
+        # (preprocess_weights_for_mixed_gemm: rows_per_tile = 128 * 8 //
+        # BITS_PER_ELT_A, and BITS_PER_ELT_A = 16 for W8A16). When the per-partition
+        # intermediate size is not a multiple of 64 - e.g. moe_intermediate_size
+        # = 1856 = 64 * 29 sharded by a power-of-2 tp_size - the sharded rows are not
+        # 64-aligned and weight loading fails at TP>1. The FP8/NVFP4/MXFP4/WFP4A16
+        # methods round the sharded intermediate up and F.pad; do the same here.
+        ALIGN = 64
+        inter_padded = ((module.intermediate_size_per_partition + ALIGN - 1) //
+                        ALIGN) * ALIGN
+        module._int8woq_inter_padded = inter_padded
+        # expand_intermediate_size_per_partition is 2*inter (gated) or inter
+        # (non-gated); scale the padded width by the same ratio.
+        expand_ratio = (module.expand_intermediate_size_per_partition //
+                        module.intermediate_size_per_partition)
+        expand_padded = inter_padded * expand_ratio
+
         # notice the weight shape for int8 weight-only is different from the original shape,
         # since the quantized weights have their own layout
         w3_w1_weight_shape = (module.expert_size_per_partition,
-                              module.hidden_size,
-                              module.expand_intermediate_size_per_partition)
-        w2_weight_shape = (module.expert_size_per_partition,
-                           module.intermediate_size_per_partition,
+                              module.hidden_size, expand_padded)
+        w2_weight_shape = (module.expert_size_per_partition, inter_padded,
                            module.hidden_size)
 
-        fc31_weight_scale = nn.Parameter(torch.empty(
-            module.expert_size_per_partition,
-            module.expand_intermediate_size_per_partition,
-            dtype=module.dtype),
-                                         requires_grad=False)
+        fc31_weight_scale = nn.Parameter(
+            torch.empty(module.expert_size_per_partition,
+                        expand_padded,
+                        dtype=module.dtype),
+            requires_grad=False)
         module.register_parameter("fc31_weight_scale", fc31_weight_scale)
 
         fc2_weight_scale = nn.Parameter(torch.empty(
@@ -1354,6 +1369,11 @@ class INT8WoqPerChannelFusedMoEMethod(FusedMoEMethodBase):
         w1_weight_shard = load_weight_shard(w1_weight, module.tp_size,
                                             module.tp_rank,
                                             TensorParallelMode.COLUMN)
+        # Pad the sharded intermediate rows up to a multiple of 64 (see
+        # create_weights); the mixed-GEMM preprocessor requires 64-aligned rows.
+        pad = module._int8woq_inter_padded - w1_weight_shard.shape[0]
+        if pad:
+            w1_weight_shard = F.pad(w1_weight_shard, (0, 0, 0, pad))
 
         # w3_weight (gate_proj) is empty for non-gated MoE (e.g. Nemotron-H squared-ReLU).
         # Only concatenate the gate projection when present; otherwise the single
@@ -1363,6 +1383,8 @@ class INT8WoqPerChannelFusedMoEMethod(FusedMoEMethodBase):
             w3_weight_shard = load_weight_shard(w3_weight, module.tp_size,
                                                 module.tp_rank,
                                                 TensorParallelMode.COLUMN)
+            if pad:
+                w3_weight_shard = F.pad(w3_weight_shard, (0, 0, 0, pad))
             w31_weight_shard = torch.cat([w3_weight_shard, w1_weight_shard],
                                          dim=0)
         else:
@@ -1392,6 +1414,11 @@ class INT8WoqPerChannelFusedMoEMethod(FusedMoEMethodBase):
         w2_weight_shard = load_weight_shard(w2_weight, module.tp_size,
                                             module.tp_rank,
                                             TensorParallelMode.ROW)
+        # Pad the row-sharded intermediate up to a multiple of 64 (see
+        # create_weights) so the mixed-GEMM preprocessor sees 64-aligned rows.
+        pad = module._int8woq_inter_padded - w2_weight_shard.shape[1]
+        if pad:
+            w2_weight_shard = F.pad(w2_weight_shard, (0, pad))
 
         weight_dtype = torch.int8
         if not module.quant_config.layer_quant_mode.is_int8_weight_only():
@@ -1411,25 +1438,34 @@ class INT8WoqPerChannelFusedMoEMethod(FusedMoEMethodBase):
         # for non-gated MoE (e.g. Nemotron-H squared-ReLU). Only concatenate the
         # gate-projection scales when the gate weights are present; otherwise the
         # up-projection scales alone fill the (non-doubled) fc31 scale buffer.
+        # Pad each per-channel scale shard to the 64-aligned intermediate size
+        # (value=1.0 is inert: the padded weight rows are zero, so 0 * scale = 0;
+        # 1.0 merely avoids any downstream reciprocal producing NaN/Inf).
+        def _pad_scale(t):
+            p = module._int8woq_inter_padded - t.shape[-1]
+            return F.pad(t, (0, p), value=1.0) if p else t
+
         all_w1_scales = [
-            load_weight_shard(weights[f"{expert_id}.w1.weight_scale"],
-                              module.tp_size, module.tp_rank,
-                              TensorParallelMode.COLUMN)
+            _pad_scale(
+                load_weight_shard(weights[f"{expert_id}.w1.weight_scale"],
+                                  module.tp_size, module.tp_rank,
+                                  TensorParallelMode.COLUMN))
             for expert_id in module.initial_local_expert_ids
         ]
-        has_w3_scales = all(
-            f"{expert_id}.w3.weight_scale" in weights
-            for expert_id in module.initial_local_expert_ids)
+        has_w3_scales = all(f"{expert_id}.w3.weight_scale" in weights
+                            for expert_id in module.initial_local_expert_ids)
         if module.is_gated_activation and has_w3_scales:
             all_w3_scales = [
-                load_weight_shard(weights[f"{expert_id}.w3.weight_scale"],
-                                  module.tp_size, module.tp_rank,
-                                  TensorParallelMode.COLUMN)
+                _pad_scale(
+                    load_weight_shard(weights[f"{expert_id}.w3.weight_scale"],
+                                      module.tp_size, module.tp_rank,
+                                      TensorParallelMode.COLUMN))
                 for expert_id in module.initial_local_expert_ids
             ]
             w3_w1_scales = torch.cat(
                 [torch.stack(all_w3_scales),
-                 torch.stack(all_w1_scales)], dim=-1)
+                 torch.stack(all_w1_scales)],
+                dim=-1)
         else:
             w3_w1_scales = torch.stack(all_w1_scales)
         w3_w1_scales = w3_w1_scales.to(module.dtype)
