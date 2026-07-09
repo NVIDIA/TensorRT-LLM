@@ -974,7 +974,12 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         is_v2v = video is not None and not is_t2i
         if use_system_prompt is None:
             # V2V always wants it; otherwise the checkpoint declares the default.
-            use_system_prompt = is_v2v or self.default_use_system_prompt
+            # Transfer opts out for reference parity (vllm-omni
+            # `_forward_transfer` defaults it False).
+            if transfer_config is not None:
+                use_system_prompt = False
+            else:
+                use_system_prompt = is_v2v or self.default_use_system_prompt
         else:
             use_system_prompt = bool(use_system_prompt)
         if transfer_config is not None:
