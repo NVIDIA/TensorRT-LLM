@@ -2521,7 +2521,7 @@ class DFlashDecodingConfig(DecodingBaseConfig):
 
     decoding_type: Literal["DFlash"] = Field(default="DFlash")
 
-    # Draft attention layer count; resolved from the draft model config by
+    # Draft attention layer count is resolved from the draft model config by
     # KvCacheCreator when use_hybrid_context is enabled.
     _num_draft_layers: Optional[int] = PrivateAttr(default=None)
 
@@ -2529,8 +2529,7 @@ class DFlashDecodingConfig(DecodingBaseConfig):
     def set_max_total_draft_tokens(self):
         self.max_total_draft_tokens = self.max_draft_len
         if self.use_hybrid_context:
-            # Draft context lives in the target manager; a separate one-model
-            # draft KV cache would be redundant.
+            # Draft context lives in the target manager
             self._allow_separate_draft_kv_cache = False
         return self
 

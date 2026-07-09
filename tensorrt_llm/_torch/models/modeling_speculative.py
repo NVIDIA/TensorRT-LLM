@@ -1376,8 +1376,7 @@ class DFlashForCausalLM(nn.Module):
                                                    head_dim)
 
             if hybrid_k_bufs is not None:
-                # Hybrid: ctx K/V paged in the target manager's pool; the
-                # per-step noise K/V is a dense suffix, never cached.
+                # Hybrid: ctx K/V paged in the target manager's pool
                 out = dflash_ctx_paged_attention(
                     Q_bshd,
                     hybrid_k_bufs[layer_idx],

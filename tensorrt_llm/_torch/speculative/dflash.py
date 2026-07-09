@@ -227,16 +227,13 @@ class DFlashWorker(SpecWorkerBase):
         draft_model._build_fused_kv_buffers()
         num_layers = draft_model._num_attn_layers
 
-        # Draft spec layers are appended after the target layers by
-        # get_pp_layers; take the last num_layers ids.
+        # Draft spec layers are appended after the target layers.
         layer_ids = sorted(mgr.layer_offsets.keys())[-num_layers:]
         bufs = [mgr.get_buffers(lid) for lid in layer_ids]  # NHD [P, 2, tpb, nkv, hd]
 
-        # The manager sizes spec layers in target-head_dim units (see
-        # _build_per_layer_num_kv_heads), so when the draft head_dim differs
+        # The manager sizes spec layers in target-head_dim units, so when the draft head_dim differs
         # from the pool's, view each [P, tpb, nkv_pool, hd_pool] buffer back
         # to the draft's per-rank [P, tpb, nkv_draft, hd_draft] geometry.
-        # The last two dims are contiguous per token, so this is a pure view.
         nkv_draft = draft_model._num_kv_heads
         hd_draft = draft_model._head_dim
 
@@ -247,7 +244,8 @@ class DFlashWorker(SpecWorkerBase):
                 raise RuntimeError(
                     f"DFlash hybrid ctx: pool row {tuple(t.shape[-2:])} does "
                     f"not match draft KV geometry ({nkv_draft}, {hd_draft}) "
-                    f"per rank; check per-layer KV head registration.")
+                    f"per rank; check per-layer KV head registration."
+                )
             return t.flatten(-2).unflatten(-1, (nkv_draft, hd_draft))
 
         self._hybrid_k_bufs = [_as_draft_geometry(b[:, 0]) for b in bufs]
@@ -437,8 +435,7 @@ class DFlashWorker(SpecWorkerBase):
                     continue
                 slot = self._free_slots.popleft()
                 self._req_to_slot[req_id] = slot
-                # Hybrid: reused blocks already hold ctx for [0, first_pos);
-                # start from there instead of losing the prefix.
+                # Hybrid: reused blocks already hold ctx for [0, first_pos).
                 self._ctx_len[slot] = first_pos if self._use_hybrid_context else 0
 
             slot = self._req_to_slot[req_id]
@@ -447,7 +444,7 @@ class DFlashWorker(SpecWorkerBase):
             actual = end - cur
             if actual > 0:
                 if self._use_hybrid_context:
-                    # Keep the compute dtype; cast to the pool dtype at write.
+                    # Cast to the pool dtype at write.
                     chunk_proj_cast = chunk_proj[:actual]
                 else:
                     chunk_proj_cast = chunk_proj[:actual].to(self._ctx_k_buf.dtype)
@@ -508,7 +505,6 @@ class DFlashWorker(SpecWorkerBase):
         spec_metadata._dflash_worker = self
 
         if self._use_hybrid_context:
-            # Page ids straight from the manager's offsets (device, in-graph).
             self._cur_block_idx = self._hybrid_block_idx(attn_metadata)
 
         # Save context lengths before warmup to prevent accumulation

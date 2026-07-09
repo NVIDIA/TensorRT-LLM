@@ -437,9 +437,7 @@ class KvCacheCreator:
                     num_layers=self._get_num_draft_layers())
         if self._is_dflash_hybrid_ctx() and self._mapping.is_last_pp_rank():
             # Hybrid ctx: draft layers live in the target manager, so their
-            # per-token cost adds to the same budget. Resolve the manager
-            # class from the draft config: the target may be hybrid-Mamba
-            # while the draft context layers are plain attention.
+            # per-token cost adds to the same budget.
             effective_draft_config = self._get_effective_draft_config()
             draft_kv_cache_manager_cls = get_kv_cache_manager_cls(
                 effective_draft_config,
@@ -1573,9 +1571,7 @@ def _build_per_layer_num_kv_heads(
 
     # The manager has a single head_dim shared by all layers in a pool.
     # When the draft's head_dim differs from the target's, express the
-    # draft layers' KV bytes in target-head_dim units so pool geometry
-    # stays exact; consumers view the buffers back to draft geometry
-    # (see DFlashSpecWorker._lazy_init_hybrid_ctx).
+    # draft layers' KV bytes in target-head_dim units.
     draft_head_dim = getattr(draft_pretrained, 'head_dim', None)
     if (draft_num_kv_heads is not None and target_head_dim is not None
             and draft_head_dim is not None
