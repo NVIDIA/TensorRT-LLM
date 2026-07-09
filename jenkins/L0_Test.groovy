@@ -1941,6 +1941,9 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                             passwordVariable: 'ART_PASS')]) {
                         sh """
                             set +e
+                            export STAGE_NAME='${stageName}'
+                            export PROGRESS_TAR='${progressTar}'
+                            export PROGRESS_URL='${progressUrl}'
                             # ---- background watcher: SSH-stat remote XML, SCP, tar, upload ----
                             (
                                 last=0
@@ -1956,13 +1959,8 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                                         echo "[PROGRESS-UPLOAD] ${stageName}: scp failed; skipping this iteration"
                                         continue
                                     fi
-                                    ( cd '${WORKSPACE}' && tar -czf '${progressTar}' '${stageName}/' ) || continue
-                                    if curl -fsSL --retry 2 -u "\$ART_USER:\$ART_PASS" \\
-                                            -T '${WORKSPACE}/${progressTar}' '${progressUrl}'; then
-                                        echo "[PROGRESS-UPLOAD] ${stageName}: uploaded sbatch checkpoint (mtime=\$m)"
-                                    else
-                                        echo "[PROGRESS-UPLOAD] ${stageName}: upload iteration failed (non-fatal)"
-                                    fi
+                                    LABEL="sbatch checkpoint (mtime=\$m)" \\
+                                    bash '${WORKSPACE}/jenkins/scripts/progress_upload_snapshot.sh' || continue
                                 done
                                 echo "[PROGRESS-UPLOAD] ${stageName}: track done, watcher exiting"
                             ) &
@@ -1984,11 +1982,8 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
 
                             # ---- immediate final snapshot ----
                             if [ -f '${WORKSPACE}/${stageName}/results.xml' ]; then
-                                ( cd '${WORKSPACE}' && tar -czf '${progressTar}' '${stageName}/' ) && \
-                                curl -fsSL --retry 2 -u "\$ART_USER:\$ART_PASS" \
-                                    -T '${WORKSPACE}/${progressTar}' '${progressUrl}' && \
-                                echo "[PROGRESS-UPLOAD] ${stageName}: uploaded sbatch final snapshot" || \
-                                echo "[PROGRESS-UPLOAD] ${stageName}: sbatch final snapshot upload failed (non-fatal)"
+                                LABEL='sbatch final snapshot' \\
+                                bash '${WORKSPACE}/jenkins/scripts/progress_upload_snapshot.sh' || true
                             fi
 
                             exit \$rc
@@ -3510,18 +3505,16 @@ def rerunFailedTests(stageName, llmSrc, testCmdLine, resultFileName="results.xml
                     passwordVariable: 'ART_PASS')]) {
                 sh """
                     set +e
+                    export STAGE_NAME='${stageName}'
+                    export PROGRESS_TAR='${rerunProgressTar}'
+                    export PROGRESS_URL='${rerunProgressUrl}'
                     # ---- background watcher for rerun${times} ----
                     (
                         while [ ! -f '${rerunDoneFile}' ]; do
                             sleep ${PROGRESS_UPLOAD_INTERVAL_SEC}
                             [ -f '${rerunDoneFile}' ] && break
-                            ( cd '${WORKSPACE}' && tar -czf '${rerunProgressTar}' '${stageName}/' ) || continue
-                            if curl -fsSL --retry 2 -u "\$ART_USER:\$ART_PASS" \\
-                                    -T '${WORKSPACE}/${rerunProgressTar}' '${rerunProgressUrl}'; then
-                                echo "[PROGRESS-UPLOAD] ${stageName}: rerun${times} checkpoint uploaded"
-                            else
-                                echo "[PROGRESS-UPLOAD] ${stageName}: rerun${times} checkpoint upload failed (non-fatal)"
-                            fi
+                            LABEL='rerun${times} checkpoint' \\
+                            bash '${WORKSPACE}/jenkins/scripts/progress_upload_snapshot.sh' || continue
                         done
                         echo "[PROGRESS-UPLOAD] ${stageName}: rerun${times} watcher exiting"
                     ) &
@@ -3536,11 +3529,8 @@ def rerunFailedTests(stageName, llmSrc, testCmdLine, resultFileName="results.xml
                     wait \$WATCHER_PID 2>/dev/null || true
 
                     # ---- immediate final snapshot of rerun${times} ----
-                    ( cd '${WORKSPACE}' && tar -czf '${rerunProgressTar}' '${stageName}/' ) && \\
-                    curl -fsSL --retry 2 -u "\$ART_USER:\$ART_PASS" \\
-                        -T '${WORKSPACE}/${rerunProgressTar}' '${rerunProgressUrl}' && \\
-                    echo "[PROGRESS-UPLOAD] ${stageName}: rerun${times} final snapshot uploaded" || \\
-                    echo "[PROGRESS-UPLOAD] ${stageName}: rerun${times} final snapshot upload failed (non-fatal)"
+                    LABEL='rerun${times} final snapshot' \\
+                    bash '${WORKSPACE}/jenkins/scripts/progress_upload_snapshot.sh' || true
 
                     exit \$rc
                 """
@@ -4240,6 +4230,9 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                                 passwordVariable: 'ART_PASS')]) {
                             sh """
                                 set +e
+                                export STAGE_NAME='${stageName}'
+                                export PROGRESS_TAR='${progressTar}'
+                                export PROGRESS_URL='${progressUrl}'
                                 # ---- background watcher ----
                                 (
                                     last=0
@@ -4250,13 +4243,8 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                                         m=\$(stat -c %Y "\$xml" 2>/dev/null || echo 0)
                                         [ "\$m" -le "\$last" ] && continue
                                         last=\$m
-                                        ( cd '${WORKSPACE}' && tar -czf '${progressTar}' '${stageName}/' ) || continue
-                                        if curl -fsSL --retry 2 -u "\$ART_USER:\$ART_PASS" \\
-                                                -T '${WORKSPACE}/${progressTar}' '${progressUrl}'; then
-                                            echo "[PROGRESS-UPLOAD] ${stageName}: uploaded checkpoint (mtime=\$m)"
-                                        else
-                                            echo "[PROGRESS-UPLOAD] ${stageName}: upload iteration failed (non-fatal)"
-                                        fi
+                                        LABEL="checkpoint (mtime=\$m)" \\
+                                        bash '${WORKSPACE}/jenkins/scripts/progress_upload_snapshot.sh' || continue
                                     done
                                     echo "[PROGRESS-UPLOAD] ${stageName}: pytest done, watcher exiting"
                                 ) &
@@ -4273,11 +4261,8 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
 
                                 # ---- immediate final snapshot of run 1 ----
                                 if [ -f '${WORKSPACE}/${stageName}/results.xml' ]; then
-                                    ( cd '${WORKSPACE}' && tar -czf '${progressTar}' '${stageName}/' ) && \
-                                    curl -fsSL --retry 2 -u "\$ART_USER:\$ART_PASS" \
-                                        -T '${WORKSPACE}/${progressTar}' '${progressUrl}' && \
-                                    echo "[PROGRESS-UPLOAD] ${stageName}: uploaded run1 final snapshot" || \
-                                    echo "[PROGRESS-UPLOAD] ${stageName}: run1 final snapshot upload failed (non-fatal)"
+                                    LABEL='run1 final snapshot' \\
+                                    bash '${WORKSPACE}/jenkins/scripts/progress_upload_snapshot.sh' || true
                                 fi
 
                                 exit \$rc
