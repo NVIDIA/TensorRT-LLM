@@ -51,6 +51,13 @@ def test_gate_falls_back_on_mismatch():
     assert loader._source_metadata_identity_compatible(_build_mx_source_metadata(source)) is False
 
 
+def test_gate_falls_back_on_checkpoint_artifact_mismatch():
+    local = _identity(artifact_key="fine-tune-a")
+    source = _identity(artifact_key="fine-tune-b")
+    loader = _new_loader(local, source)
+    assert loader._source_identity_compatible("ckpt", _STUB_CLIENT, _STUB_BUILD) is False
+
+
 def test_gate_falls_back_when_no_local_identity():
     # MX must not consume shared weights unless the receiver identity exists.
     loader = _new_loader(None)

@@ -14,6 +14,9 @@ from tensorrt_llm._torch import memory as memory_mod
 from tensorrt_llm._torch.pyexecutor import model_loader as model_loader_mod
 from tensorrt_llm._torch.pyexecutor.model_loader import ModelLoader
 from tensorrt_llm._torch.weight_sharing import (
+    ARTIFACT_IDENTITY_FORMAT_VERSION,
+    SOURCE_IDENTITY_FORMAT_VERSION,
+    ArtifactIdentity,
     PostTransformProfile,
     PostTransformProfileRegistry,
     PostTransformTransferScope,
@@ -21,7 +24,12 @@ from tensorrt_llm._torch.weight_sharing import (
 from tensorrt_llm.llmapi.llm_args import LoadFormat
 
 _SOURCE_IDENTITY = model_loader_mod.SourceIdentity(
-    format_version=1,
+    format_version=SOURCE_IDENTITY_FORMAT_VERSION,
+    artifact_identity=ArtifactIdentity(
+        format_version=ARTIFACT_IDENTITY_FORMAT_VERSION,
+        scheme="checkpoint_manifest_sha256",
+        digest="0" * 64,
+    ),
     model_fingerprint="model",
     quant_fingerprint="quant",
     backend_fingerprint="backend",
@@ -100,10 +108,15 @@ def _make_loader(monkeypatch, *, events, spec_config=None):
     monkeypatch.setattr(model_loader_mod, "MetaInitMode", lambda: nullcontext())
     # These tests stub ModelConfig, while SourceIdentity has dedicated
     # coverage. Keep this file focused on ModelLoader GMS branch behavior.
+
+    def _build_source_identity(_cls, *_args, **kwargs):
+        assert kwargs["checkpoint_dir"] == "/ckpt"
+        return _SOURCE_IDENTITY
+
     monkeypatch.setattr(
         model_loader_mod.SourceIdentity,
         "from_model_config",
-        classmethod(lambda cls, *_args, **_kwargs: _SOURCE_IDENTITY),
+        classmethod(_build_source_identity),
     )
     monkeypatch.setattr(
         model_loader_mod.AutoModelForCausalLM,

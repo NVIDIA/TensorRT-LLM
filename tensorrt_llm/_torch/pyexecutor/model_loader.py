@@ -478,6 +478,7 @@ class ModelLoader:
                 self._source_identity = SourceIdentity.from_model_config(
                     config,
                     model,
+                    checkpoint_dir=checkpoint_dir,
                     model_name=str(
                         getattr(self.llm_args, "model", None)
                         or checkpoint_dir),
