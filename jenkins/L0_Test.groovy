@@ -2144,6 +2144,10 @@ def readSlurmWorkspaceFile(def pipeline, Map remote, String path, String stageNa
     } catch (InterruptedException e) {
         throw e
     } catch (Exception e) {
+        // A dead frontend must propagate so the enclosing withSlurmFrontendFailover
+        // fails over to another remote; swallowing it as "" would strand the stage on
+        // the unreachable frontend. Any other read failure (missing file, transient)
+        // is non-fatal -- the metadata is best-effort, so return "" and carry on.
         if (CloudManager.isSlurmFrontendConnectionFailure(e)) {
             throw e
         }
