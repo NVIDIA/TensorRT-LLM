@@ -1,4 +1,5 @@
 import transformers
+from packaging import version
 
 from .modeling_auto import AutoModelForCausalLM
 from .modeling_bert import BertForSequenceClassification
@@ -89,7 +90,7 @@ __all__ = [
     "Cohere2ForCausalLM",
 ]
 
-if transformers.__version__ >= "4.45.1":
+if version.parse(transformers.__version__) >= version.parse("4.45.1"):
     from .modeling_mllama import MllamaForConditionalGeneration  # noqa
 
     __all__.append("MllamaForConditionalGeneration")
