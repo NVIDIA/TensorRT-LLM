@@ -80,6 +80,23 @@ class RequestError(RuntimeError):
     ''' The error raised when the request is failed. '''
 
 
+class EngineDeadError(RuntimeError):
+    """Raised by pending and new requests once the engine is known dead.
+
+    Sticky and engine-level (unlike the per-request ``RequestError``): when a
+    worker process dies, every queued ``GenerationResult`` is unblocked with this
+    error and every subsequent ``submit()`` raises it immediately, instead of
+    blocking forever on a response queue whose producer is gone.
+    """
+
+    def __init__(self, root_cause: Optional[BaseException] = None):
+        msg = "Engine has died"
+        if root_cause is not None:
+            msg += f": {type(root_cause).__name__}: {root_cause}"
+        super().__init__(msg)
+        self.root_cause = root_cause
+
+
 class ProcessPoolExecutorSession(MpiSession):
     # This process pool is introduced for better recoverable exceptions handling.
     # It replaces MpiPoolExecutor for single-gpu case.
