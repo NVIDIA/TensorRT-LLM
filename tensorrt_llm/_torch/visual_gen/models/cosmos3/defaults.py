@@ -127,16 +127,34 @@ COSMOS3_EXTRA_SPECS: Dict[str, ExtraParamSchema] = {
     "seg": ExtraParamSchema(type="bool_or_str_or_dict", default=None, description="Segmentation transfer control."),
     "wsm": ExtraParamSchema(type="bool_or_str_or_dict", default=None, description="World scenario model transfer control."),
 
-    # TODO: 
-    "control_guidance": ExtraParamSchema(type="float", default=None),
-    "control_guidance_interval": ExtraParamSchema(type="list", default=None),
-    "resolution": ExtraParamSchema(type="str", default=None),
-    "num_video_frames_per_chunk": ExtraParamSchema(type="int", default=None),
-    "num_conditional_frames": ExtraParamSchema(type="int", default=None),
-    "num_first_chunk_conditional_frames": ExtraParamSchema(type="int", default=None),
-    "max_frames": ExtraParamSchema(type="int", default=None),
-    "show_control_condition": ExtraParamSchema(type="bool", default=False),
-    "show_input": ExtraParamSchema(type="bool", default=False),
-    "share_vision_temporal_positions": ExtraParamSchema(type="bool", default=None),
-    
+    "control_guidance": ExtraParamSchema(
+        type="float", default=None, description="Transfer control-guidance scale (CFG for the control branch)."
+    ),
+    "control_guidance_interval": ExtraParamSchema(
+        type="list", default=None, description="[lo, hi] timestep window where control guidance is active."
+    ),
+    "resolution": ExtraParamSchema(
+        type="str", default=None, description="Transfer resolution bucket (e.g. '720')."
+    ),
+    "num_video_frames_per_chunk": ExtraParamSchema(
+        type="int", default=None, description="Transfer chunk length in frames (default 93; 101 for wsm)."
+    ),
+    "num_conditional_frames": ExtraParamSchema(
+        type="int", default=None, description="Overlap frames pinned from the previous chunk when stitching."
+    ),
+    "num_first_chunk_conditional_frames": ExtraParamSchema(
+        type="int", default=None, description="Input-video frames pinned at the start of the first chunk."
+    ),
+    "max_frames": ExtraParamSchema(
+        type="int", default=None, description="Cap on frames decoded from transfer inputs/controls."
+    ),
+    "show_control_condition": ExtraParamSchema(
+        type="bool", default=False, description="Concatenate the control video beside the output."
+    ),
+    "show_input": ExtraParamSchema(
+        type="bool", default=False, description="Concatenate the input video beside the output."
+    ),
+    "share_vision_temporal_positions": ExtraParamSchema(
+        type="bool", default=None, description="Controls share the target frames' temporal mRoPE positions."
+    ),
 }
