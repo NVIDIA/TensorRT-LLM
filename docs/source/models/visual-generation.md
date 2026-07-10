@@ -18,7 +18,7 @@ TensorRT-LLM **VisualGen** provides a unified inference stack for diffusion mode
 - Sparse attention support: see [VisualGen Sparse Attention](../visual-gen/features/sparse-attention.md).
 - Multi-GPU parallelism (CFG parallel, Ulysses sequence parallel, Tensor parallelism).
 - **Step caching** — two runtime caching backends (**TeaCache** and **Cache-DiT**) that skip transformer computation on steps where the step-to-step change is small.
-- CPU offloading for Wan text-to-video pipelines to reduce peak GPU memory usage.
+- CPU offloading to reduce peak GPU memory usage.
 - `trtllm-serve` integration with OpenAI-compatible API endpoints for image and video generation.
 
 ## Supported Models
