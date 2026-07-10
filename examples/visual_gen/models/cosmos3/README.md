@@ -6,6 +6,7 @@ Cosmos3 supports the following generation modes from a single checkpoint:
 - **T2I** — text-to-image (`prompts/t2i.json`); emits a still frame (use `--output_type image` / a non-video `--output_path`).
 - **I2V / TI2V** — image-conditioned video (`prompts/i2v.json`). Condition on a reference frame via the prompt file's `vision_path` or `--image_path`. The image may be a local path, a `file://` / `http(s)://` URL, or a `data:` URI.
 - **V2V** — video-conditioned video (`prompts/v2v.json`). Condition on a reference video via `--video_path` (a local frame directory or `.mp4`/`.avi` file). Only the first (or last, per `condition_video_keep`) `max(condition_video_latent_indexes) * 4 + 1` input frames condition the output (5 by default); `.mp4`/`.avi` decode uses OpenCV (see [Media I/O dependencies](#media-io-dependencies)).
+- **Transfer** — control-video conditioning (`edge`/`blur`/`depth`/`seg`/`wsm` hints via `--extra_params`). The control constrains structure frame by frame; the prompt supplies appearance. `edge` and `blur` are auto-computed from `--video_path`; any hint accepts a precomputed `{"control_path": ...}` (server-/machine-local media). Multiple hints compose (each adds a full control-token copy of the video sequence); long videos run chunked (93 frames/chunk, stitched on overlap frames).
 - **T2AV** — text-to-video with synchronized audio (`prompts/t2av.json` with `enable_audio: true`, or pass `--enable_audio`). Combine with a `vision_path` for image-conditioned audio-video (TI2AV).
 
 ## Checkpoints
@@ -34,7 +35,8 @@ export TRTLLM_DISABLE_COSMOS3_GUARDRAILS=1
 ## Media I/O dependencies
 
 - Saving `.mp4` output requires the `ffmpeg` CLI on `PATH` (`apt-get install -y ffmpeg`); without it the encoder falls back to `.avi`.
-- Decoding `.mp4`/`.avi` reference videos (V2V) uses OpenCV — the same optional decoder as the multimodal video path. It is **not** bundled with TensorRT-LLM — install it yourself: `pip install opencv-python-headless`. Frame directories work without it.
+- Decoding `.mp4`/`.avi` reference videos (V2V, transfer controls) uses OpenCV — the same optional decoder as the multimodal video path. It is **not** bundled with TensorRT-LLM — install it yourself: `pip install opencv-python-headless`. Frame directories work without it.
+- Transfer's `edge`/`blur` auto-computation also uses OpenCV (same `opencv-python-headless`).
 
 ## Deployment configs
 
@@ -84,6 +86,34 @@ python cosmos3.py --model nvidia/Cosmos3-Nano \
     --prompt_file prompts/t2i.json \
     --visual_gen_args ../configs/cosmos3-nano-1gpu.yaml \
     --output_path output.png
+
+# Transfer: control-video conditioning — structure from the control video,
+# appearance from the prompt. edge/blur are computed from --video_path.
+python cosmos3.py --model nvidia/Cosmos3-Nano \
+    --prompt "The same scene rendered as a photorealistic video, sharp detail." \
+    --video_path /path/to/reference.mp4 \
+    --extra_params '{"edge": true}' \
+    --visual_gen_args ../configs/cosmos3-nano-1gpu.yaml
+
+# Transfer with a fully synthetic control (no assets): generate an edge-map
+# video of a bouncing ball, then let the prompt paint it photoreal.
+# Keep synthetic controls edge-style: the blur hint expects the low
+# frequencies of natural video, and flat synthetic color fields degrade
+# generation. Temporal exposure swings (e.g. pulsing global light) do not
+# transfer — express lighting spatially or in the prompt instead.
+python generate_bouncing_ball_control.py --out_dir ./ball_control
+python cosmos3.py --model nvidia/Cosmos3-Nano \
+    --prompt "A photorealistic beach ball with colorful panels bouncing between the walls of an enclosed room, studio lighting." \
+    --extra_params '{"edge": {"control_path": "./ball_control/control.mp4"}}' \
+    --visual_gen_args ../configs/cosmos3-nano-1gpu.yaml
+
+# Multi-hint transfer: edge pins the layout, blur pins the palette/lighting.
+# Hints must describe the same underlying video as each other and the prompt.
+python cosmos3.py --model nvidia/Cosmos3-Nano \
+    --prompt "The same scene, ultra sharp, professional photography." \
+    --video_path /path/to/reference.mp4 \
+    --extra_params '{"edge": true, "blur": true}' \
+    --visual_gen_args ../configs/cosmos3-nano-1gpu.yaml
 
 # Inline prompt (--prompt or a JSON file path)
 python cosmos3.py --model nvidia/Cosmos3-Nano \

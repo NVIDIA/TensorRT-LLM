@@ -27,6 +27,12 @@ Cosmos3 supports the following generation modes from a single checkpoint:
   first (or last, per ``condition_video_keep``) frames of a reference video
   via ``--video_path`` (a local frame directory, ``.mp4``/``.avi`` file, or
   single image; ``.mp4``/``.avi`` decode requires OpenCV).
+- **Transfer** — control-video conditioning via ``--extra_params`` hints
+  (``edge``/``blur``/``depth``/``seg``/``wsm``): the control constrains
+  structure, the prompt supplies appearance. ``edge``/``blur`` are computed
+  from ``--video_path``; any hint accepts ``{"control_path": ...}``. See the
+  README's transfer examples (incl. the synthetic bouncing-ball control from
+  ``generate_bouncing_ball_control.py``).
 - **T2AV** — text-to-video with synchronized audio (``prompts/t2av.json`` with
   ``enable_audio: true``, or pass ``--enable_audio``). Combine with a
   ``vision_path`` for image-conditioned audio-video (TI2AV).
@@ -81,6 +87,14 @@ Usage::
     python cosmos3.py --model nvidia/Cosmos3-Nano \
         --prompt_file prompts/v2v.json \
         --video_path /path/to/reference.mp4 \
+        --visual_gen_args ../configs/cosmos3-nano-1gpu.yaml
+
+    # Transfer: control-video conditioning (structure from the control,
+    # appearance from the prompt)
+    python cosmos3.py --model nvidia/Cosmos3-Nano \
+        --prompt "The same scene rendered photorealistically, sharp detail." \
+        --video_path /path/to/reference.mp4 \
+        --extra_params '{"edge": true}' \
         --visual_gen_args ../configs/cosmos3-nano-1gpu.yaml
 
     # T2AV: text-to-video with synchronized audio
@@ -235,6 +249,18 @@ def main():
     parser.add_argument(
         "--output_type", type=str, default="video", help="Output type (video, image)"
     )
+    parser.add_argument(
+        "--extra_params",
+        type=json.loads,
+        default=None,
+        help=(
+            "Model-specific extra params as a JSON object, merged last (overrides "
+            "flag-derived values). Keys are validated against the pipeline's "
+            "extra_param_specs. Transfer example: "
+            '\'{"edge": true, "blur": true, "control_guidance": 1.5}\' with --video_path, '
+            'or \'{"edge": {"control_path": "/path/control.mp4"}}\' for a precomputed control.'
+        ),
+    )
 
     # Guardrails
     parser.add_argument(
@@ -281,6 +307,9 @@ def main():
 
     if args.video_path is not None:
         params.multi_modal_data = {"video": load_reference_video(args.video_path)}
+    if args.extra_params:
+        # Merged last: explicit JSON wins over flag-derived values.
+        params.extra_params.update(args.extra_params)
 
     if negative_prompt is None:
         params.negative_prompt = None

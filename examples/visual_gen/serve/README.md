@@ -315,7 +315,7 @@ Examples:
 - **LTX-2**: `stg_scale`, `stg_blocks`, `modality_scale`, `guidance_rescale`, `output_type`, ...
 - **Wan 2.2 A14B**: `guidance_scale_2`, `boundary_ratio`
 - **Wan 2.1 / Flux**: no model-specific `extra_params` declared
-- **Cosmos3**: `condition_video_latent_indexes`, `condition_video_keep` (V2V conditioning), `flow_shift`, `use_system_prompt`, ...
+- **Cosmos3**: `condition_video_latent_indexes`, `condition_video_keep` (V2V conditioning), `flow_shift`, `use_system_prompt`, and the transfer hints `edge`/`blur`/`depth`/`seg`/`wsm` with `control_guidance`, `control_guidance_interval`, `num_video_frames_per_chunk`, ... (`edge`/`blur` auto-compute from an uploaded video reference; a hint's `control_path` must be a **server-local** path — control upload is not supported yet)
 
 > **Note:** LTX-2 generates video **with audio**. The `ltx2.yml` config must include
 > `text_encoder_path` pointing to a Gemma3 model (e.g., `google/gemma-3-12b-it`).
