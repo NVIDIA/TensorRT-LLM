@@ -1053,7 +1053,38 @@ def _make_fused_hc_runner_case(n: int, hidden_size: int, hc_mult: int, seed: int
     return runner, inputs
 
 
-def test_mhc_fused_hc_chained_outputs_do_not_alias_inputs():
+@pytest.mark.parametrize(
+    "backend,num_k_splits,tile_m,expected_shapes",
+    [
+        ("fused_half_mma", 56, 1, ((129, 24), (129,), (1,))),
+        ("fused_half_fma", 4, 1, ((4, 129, 24), (4, 129), (1,))),
+        ("fused_all_mma", 56, 1, ((129, 24), (129,), (3,))),
+        ("fused_all_fma", 2, 4, ((129, 24), (129,), (33,))),
+    ],
+)
+def test_mhc_fused_hc_allocates_minimal_scratch(
+    backend: str,
+    num_k_splits: int,
+    tile_m: int,
+    expected_shapes: tuple[tuple[int, ...], ...],
+) -> None:
+    from tensorrt_llm._torch.modules.mhc import mhc_cuda
+
+    alloc_scratch = mhc_cuda._alloc_fused_hc_scratch
+
+    scratch = alloc_scratch(
+        backend=backend,
+        B=129,
+        n=4,
+        num_k_splits=num_k_splits,
+        tile_m=tile_m,
+        device=torch.device("cpu"),
+    )
+
+    assert tuple(tuple(tensor.shape) for tensor in scratch) == expected_shapes
+
+
+def test_mhc_fused_hc_preserves_chained_inputs():
     """A fused-HC call must not overwrite state returned by the previous call."""
     runner, inputs = _make_fused_hc_runner_case(n=6, hidden_size=7168, hc_mult=4, seed=61)
     tactic = ("fused_half_fma", 2, 4, 512, 1)
@@ -1069,15 +1100,6 @@ def test_mhc_fused_hc_chained_outputs_do_not_alias_inputs():
     saved_inputs = tuple(tensor.clone() for tensor in chained_inputs[1:4])
 
     second_outputs = runner(inputs=chained_inputs, tactic=tactic)
-
-    for output, input_tensor, name in zip(
-        second_outputs[:3],
-        chained_inputs[1:4],
-        ("residual", "post_mix", "comb_mix"),
-    ):
-        assert output.data_ptr() != input_tensor.data_ptr(), (
-            f"fused_hc {name} output aliases its input"
-        )
 
     for actual, expected, name in zip(
         chained_inputs[1:4],
@@ -1157,8 +1179,8 @@ def test_mhc_fused_hc_three_call_cuda_graph_replay():
             )
 
 
-def test_mhc_fused_hc_scratch_isolated_between_streams():
-    """Concurrent fused-HC calls must not mutate another stream's scratch."""
+def test_mhc_fused_hc_concurrent_streams() -> None:
+    """Concurrent fused-HC calls on separate streams must remain independent."""
     runner, first_inputs = _make_fused_hc_runner_case(n=6, hidden_size=4096, hc_mult=4, seed=79)
     second_inputs = [tensor.clone() for tensor in first_inputs]
     for tensor in second_inputs[:4]:
@@ -1172,18 +1194,13 @@ def test_mhc_fused_hc_scratch_isolated_between_streams():
     second_stream.wait_stream(current_stream)
 
     with torch.cuda.stream(first_stream):
-        first_scratch = runner._scratch_cache.get(6, 1, 1, first_inputs[0].device)
         first_outputs = runner(inputs=first_inputs, tactic=tactic)
     with torch.cuda.stream(second_stream):
-        second_scratch = runner._scratch_cache.get(6, 1, 1, second_inputs[0].device)
         second_outputs = runner(inputs=second_inputs, tactic=tactic)
 
     current_stream.wait_stream(first_stream)
     current_stream.wait_stream(second_stream)
     torch.cuda.synchronize()
-
-    for first_workspace, second_workspace in zip(first_scratch, second_scratch):
-        assert first_workspace.data_ptr() != second_workspace.data_ptr()
 
     first_reference = tuple(tensor.clone() for tensor in runner(inputs=first_inputs, tactic=tactic))
     second_reference = tuple(

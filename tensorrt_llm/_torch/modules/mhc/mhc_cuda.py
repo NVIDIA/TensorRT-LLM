@@ -525,6 +525,7 @@ _FUSED_HC_BACKEND_CODE = {
     "fused_all_mma": 2,  # 1-kernel tf32 tcgen05 all-in-one (Path D)
     "fused_all_fma": 3,  # 1-kernel fp32 FMA all-in-one    (Path F)
 }
+_FUSED_HC_MMA_BLOCK_M = 64
 
 # The SM100/tcgen05 MMA fused-HC C++ kernels are statically instantiated.
 # FMA fused-HC paths use runtime hidden_size, but MMA paths must be explicitly
@@ -697,76 +698,34 @@ def _fused_hc_call(
     )
 
 
-class _FusedHcScratchCache:
-    """Size- and stream-keyed bounded LRU for fused-HC scratch tensors.
+def _alloc_fused_hc_scratch(
+    backend: str,
+    B: int,
+    n: int,
+    num_k_splits: int,
+    tile_m: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Allocate backend-specific scratch for one fused-HC invocation."""
+    shape_n = n * (2 + n)
 
-    Public outputs are deliberately not cached: target layers feed one
-    fused-HC call's outputs into the next call, so reusing an output tensor
-    for the same shape would make the next kernel read and write the same
-    storage. The FMA backends are not in-place safe.
+    if backend == "fused_half_fma" and num_k_splits > 1:
+        y_acc_ws = torch.empty((num_k_splits, B, shape_n), dtype=torch.float32, device=device)
+        r_acc_ws = torch.empty((num_k_splits, B), dtype=torch.float32, device=device)
+    else:
+        y_acc_ws = torch.empty((B, shape_n), dtype=torch.float32, device=device)
+        r_acc_ws = torch.empty((B,), dtype=torch.float32, device=device)
 
-    Eager scratch reuse is scoped to a CUDA stream because the kernels mutate
-    every workspace. During CUDA graph capture scratch allocation bypasses
-    this cache and is owned by the graph-private memory pool instead.
-
-    Two bounds keep this from ballooning:
-
-    1. ``_CACHE_MAX_B``: a per-call threshold. Prefill shapes flow straight
-       through to ``torch.empty``, which the torch caching allocator already
-       keeps cheap on repeated calls.
-    2. ``_maxsize``: LRU cap on the number of cached entries. Covers the
-       discrete eager decode batch sizes plus a few stragglers; decode is the
-       only regime that actually benefits from the cache.
-
-    These bounds prevent a long sequence of distinct eager prefill shapes
-    from retaining one scratch allocation per shape.
-    """
-
-    __slots__ = ("n", "_cache", "_maxsize")
-
-    # Up to 48 distinct entries covers the eager decode buckets plus headroom.
-    DEFAULT_MAXSIZE = 48
-    # Skip the cache above this B; prefill rides the torch allocator.
-    _CACHE_MAX_B = 256
-
-    def __init__(self, n: int, maxsize: int = DEFAULT_MAXSIZE):
-        self.n = n
-        self._maxsize = maxsize
-        from collections import OrderedDict
-
-        self._cache: "OrderedDict" = OrderedDict()
-
-    def get(self, B: int, num_k_splits: int, tile_m: int, device):
-        n = self.n
-        ws_ks = max(1, num_k_splits)
-        tm = max(1, tile_m)
-        m_batches = (B + tm - 1) // tm
-        shape_n = n * (2 + n)
-
-        def _alloc():
-            if ws_ks == 1:
-                y_acc_ws = torch.empty((B, shape_n), dtype=torch.float32, device=device)
-                r_acc_ws = torch.empty((B,), dtype=torch.float32, device=device)
-            else:
-                y_acc_ws = torch.empty((ws_ks, B, shape_n), dtype=torch.float32, device=device)
-                r_acc_ws = torch.empty((ws_ks, B), dtype=torch.float32, device=device)
-            done_counter_ws = torch.empty((m_batches,), dtype=torch.int32, device=device)
-            return y_acc_ws, r_acc_ws, done_counter_ws
-
-        if B > self._CACHE_MAX_B or torch.cuda.is_current_stream_capturing():
-            return _alloc()
-
-        stream = torch.cuda.current_stream(device)
-        key = (B, ws_ks, m_batches, device, stream.cuda_stream)
-        hit = self._cache.get(key)
-        if hit is not None:
-            self._cache.move_to_end(key)
-            return hit
-        entry = _alloc()
-        self._cache[key] = entry
-        if len(self._cache) > self._maxsize:
-            self._cache.popitem(last=False)
-        return entry
+    if backend == "fused_all_mma":
+        num_done_counters = (B + _FUSED_HC_MMA_BLOCK_M - 1) // _FUSED_HC_MMA_BLOCK_M
+    elif backend == "fused_all_fma":
+        tokens_per_cta = max(1, tile_m)
+        num_done_counters = (B + tokens_per_cta - 1) // tokens_per_cta
+    else:
+        # The half-fused backends do not consume this argument.
+        num_done_counters = 1
+    done_counter_ws = torch.empty((num_done_counters,), dtype=torch.int32, device=device)
+    return y_acc_ws, r_acc_ws, done_counter_ws
 
 
 # Fallback tactic: backend, tile_n, num_k_splits, bigfuse_bs, tile_m.
@@ -826,8 +785,6 @@ class MhcFusedHcRunner(TunableRunner):
             # comb_mix_prev (input[3]) dim 0 = M
             ConstraintSpec(input_idx=3, dim_idx=0, infer_shape=lambda shapes: shapes[0][0]),
         ),
-        # TODO: re-enable distributed_tuning_strategy=PARALLEL once
-        # _FusedHcScratchCache no longer keys on chosen-tactic fields.
     )
 
     def __init__(
@@ -847,7 +804,6 @@ class MhcFusedHcRunner(TunableRunner):
         self.hc_sinkhorn_eps = hc_sinkhorn_eps
         self.hc_post_mult_value = hc_post_mult_value
         self.sinkhorn_repeat = sinkhorn_repeat
-        self._scratch_cache = _FusedHcScratchCache(n=n)
 
     def unique_id(self):
         return (self.n, self.hidden_size)
@@ -942,8 +898,13 @@ class MhcFusedHcRunner(TunableRunner):
         post_mix_cur = torch.empty((B, self.n), dtype=torch.float32, device=x_prev.device)
         comb_mix_cur = torch.empty((B, self.n * self.n), dtype=torch.float32, device=x_prev.device)
         layer_input_cur = torch.empty_like(x_prev)
-        y_acc_ws, r_acc_ws, done_counter_ws = self._scratch_cache.get(
-            B, num_k_splits, tile_m, x_prev.device
+        y_acc_ws, r_acc_ws, done_counter_ws = _alloc_fused_hc_scratch(
+            backend=backend,
+            B=B,
+            n=self.n,
+            num_k_splits=num_k_splits,
+            tile_m=tile_m,
+            device=x_prev.device,
         )
 
         _fused_hc_call(
@@ -981,8 +942,7 @@ class MhcFusedHcRunner(TunableRunner):
 
 
 # Process-wide runner cache keyed on the mHC configuration. Avoids recreating
-# a MhcFusedHcRunner (and its scratch cache) on every call, which would also
-# defeat scratch reuse inside the runner.
+# a MhcFusedHcRunner on every call.
 _fused_hc_runner_cache: dict = {}
 
 
