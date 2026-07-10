@@ -12,19 +12,37 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import socket
+from unittest import mock
+
 import pytest
 
+import tensorrt_llm.commands.serve as serve_mod
 from tensorrt_llm.commands.serve import launch_server
 
 
-def test_launch_server_rejects_nonpositive_port_without_disagg() -> None:
+@pytest.mark.parametrize("port", [0, -1])
+def test_launch_server_rejects_nonpositive_port_without_disagg(port: int) -> None:
     # --port is user input; a non-positive port without a disagg cluster
     # config must raise a clear ValueError (survives `python -O`) rather than
-    # an AssertionError, before any bind/model load.
-    with pytest.raises(ValueError, match="Port must be specified"):
-        launch_server(
-            host="localhost",
-            port=0,
-            llm_args={"backend": "pytorch", "model": "dummy-model"},
-            disagg_cluster_config=None,
-        )
+    # an AssertionError, and must never bind a socket. socket is mocked so the
+    # negative-port case does not fail earlier in getaddrinfo.
+    with mock.patch.object(serve_mod, "socket") as mock_socket:
+        mock_socket.AF_UNSPEC = socket.AF_UNSPEC
+        mock_socket.AF_INET = socket.AF_INET
+        mock_socket.AF_INET6 = socket.AF_INET6
+        mock_socket.SOCK_STREAM = socket.SOCK_STREAM
+        mock_socket.getaddrinfo.return_value = [
+            (socket.AF_INET, None, None, None, ("127.0.0.1", port))
+        ]
+        sock = mock_socket.socket.return_value.__enter__.return_value
+
+        with pytest.raises(ValueError, match="Port must be specified"):
+            launch_server(
+                host="localhost",
+                port=port,
+                llm_args={"backend": "pytorch", "model": "dummy-model"},
+                disagg_cluster_config=None,
+            )
+
+        sock.bind.assert_not_called()
