@@ -456,7 +456,11 @@ class MambaForCausalLM(PretrainedModel):
                                                quant_config=quant_config,
                                                **kwargs)
 
-        if not os.path.exists(hf_model_dir):
+        if use_preloading:
+            # hf_model_dir is unset on the preload path; use the already
+            # provided model directly.
+            weights = convert_hf_mamba(hf_model, dtype)
+        elif not os.path.exists(hf_model_dir):
             hf_model = AutoModelForCausalLM.from_pretrained(
                 hf_model_dir, dtype="auto", trust_remote_code=True)
 
