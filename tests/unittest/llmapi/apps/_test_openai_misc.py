@@ -108,21 +108,8 @@ def test_tokenize(server: RemoteOpenAIServer):
     prompt_body = prompt_resp.json()
     assert prompt_body["count"] == len(prompt_body["tokens"]) > 0
 
-    # messages path: goes through the chat template, so it wraps the content
-    # and yields at least as many tokens as the bare prompt.
-    messages_resp = requests.post(
-        tokenize_url,
-        json={"messages": [{
-            "role": "user",
-            "content": "Hello, world!"
-        }]})
-    assert messages_resp.status_code == 200
-    messages_body = messages_resp.json()
-    assert messages_body["count"] == len(messages_body["tokens"])
-    assert messages_body["count"] >= prompt_body["count"]
-
-    # exactly one of prompt/messages is required; FastAPI rejects an empty
-    # body at request-model validation (422) before the handler runs.
+    # prompt is required; FastAPI rejects an empty body at request-model
+    # validation (422) before the handler runs.
     assert requests.post(tokenize_url, json={}).status_code == 422
 
 

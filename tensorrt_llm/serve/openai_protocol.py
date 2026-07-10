@@ -147,34 +147,24 @@ class TokenizeRequest(OpenAIBaseModel):
     """Request body for the ``POST /_internal/tokenize`` endpoint.
 
     Asks the server to encode some text into the token-id sequence its
-    loaded tokenizer would produce, without running any generation. The
-    caller must supply exactly one of ``prompt`` or ``messages``; providing
-    both, or neither, is rejected with a 400 by the validator below.
+    loaded tokenizer would produce, without running any generation.
+
+    Only plain-text ``prompt`` tokenization is supported. A ``messages``
+    path was intentionally left out: to be meaningful it must reuse the full
+    ``/v1/chat/completions`` preprocessing (server chat template, tools,
+    documents, template kwargs, model-type resolution, multimodal handling),
+    otherwise the returned token ids would silently diverge from the actual
+    inference prompt. It can be added once that path is shared.
 
     Fields:
         model: Target model name. Accepted for compatibility with
             multi-model routers but ignored -- the server always tokenizes
             against its own loaded model.
         prompt: Plain text to tokenize directly via ``tokenizer.encode``.
-            Mutually exclusive with ``messages``.
-        messages: OpenAI chat-completion messages rendered through the
-            server's chat template (mirroring the ``/v1/chat/completions``
-            prefill path) before being encoded. Mutually exclusive with
-            ``prompt``.
     """
 
     model: Optional[str] = None
-    prompt: Optional[str] = None
-    messages: Optional[List[OpenAIChatCompletionMessageParam]] = None
-
-    @model_validator(mode="after")
-    def check_prompt_or_messages(self):
-        if self.prompt is None and self.messages is None:
-            raise ValueError("Either 'prompt' or 'messages' must be provided")
-        if self.prompt is not None and self.messages is not None:
-            raise ValueError(
-                "Only one of 'prompt' or 'messages' should be provided")
-        return self
+    prompt: str
 
 
 class TokenizeResponse(OpenAIBaseModel):
@@ -183,9 +173,8 @@ class TokenizeResponse(OpenAIBaseModel):
     Fields:
         count: Number of tokens in the encoded sequence. Always populated;
             clients needing only the length can ignore ``tokens``.
-        tokens: The encoded token ids. Populated for both the ``prompt``
-            and ``messages`` paths. Kept ``Optional`` so future count-only
-            variants can omit it without breaking the schema.
+        tokens: The encoded token ids. Kept ``Optional`` so future
+            count-only variants can omit it without breaking the schema.
     """
 
     count: int
