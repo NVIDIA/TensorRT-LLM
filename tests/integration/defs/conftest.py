@@ -2588,15 +2588,6 @@ def pytest_runtest_protocol(item, nextitem):
 
 
 @pytest.fixture(scope="function")
-def deterministic_test_root(llm_root, llm_venv):
-    "Get deterministic test root"
-    deterministic_root = os.path.join(llm_root,
-                                      "tests/integration/defs/deterministic")
-
-    return deterministic_root
-
-
-@pytest.fixture(scope="function")
 def disaggregated_test_root(llm_root, llm_venv):
     "Get disaggregated test root"
     disaggregated_root = os.path.join(llm_root,
