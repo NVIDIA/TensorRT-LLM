@@ -32,6 +32,7 @@ from tensorrt_llm._torch.attention_backend.interface import (
 from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm.bindings.internal import thop
 from tensorrt_llm.functional import PositionEmbeddingType
+from tensorrt_llm.quantization.mode import QuantMode
 
 
 def test_triton_custom_mask_precedes_general_fmha_libraries() -> None:
@@ -201,11 +202,20 @@ def test_mixed_batch_runs_context_and_generation_on_different_fmhas(monkeypatch)
     assert called_phases[1][2].attention_mask_data is None
 
 
-def test_large_head_generation_support_is_owned_by_trtllm_gen() -> None:
+@pytest.mark.parametrize(
+    "quant_mode",
+    [
+        QuantMode(0),
+        QuantMode.from_description(use_fp8_kv_cache=True),
+    ],
+)
+def test_large_head_generation_support_is_owned_by_trtllm_gen(
+    quant_mode: QuantMode,
+) -> None:
     attn = SimpleNamespace(
         head_dim=512,
         is_mla_enable=False,
-        quant_mode=0,
+        quant_mode=int(quant_mode),
         position_embedding_type=int(PositionEmbeddingType.learned_absolute),
     )
     fmha = object.__new__(FlashInferTrtllmGenFmha)
@@ -238,12 +248,88 @@ def test_large_head_generation_support_is_owned_by_trtllm_gen() -> None:
     assert supported, reason
 
 
+def test_fp8_kv_generation_uses_fp8_query() -> None:
+    attn = SimpleNamespace(
+        quant_mode=int(QuantMode.from_description(use_fp8_kv_cache=True)),
+    )
+    fmha = object.__new__(FlashInferTrtllmGenFmha)
+    fmha._attn_ref = lambda: attn
+
+    assert fmha.get_fp8_context_fmha(
+        torch.empty(1, dtype=torch.bfloat16),
+        torch.empty(1, dtype=torch.bfloat16),
+        SimpleNamespace(),
+        AttentionForwardArgs(),
+        is_gen_only=True,
+    )
+
+
+def test_generation_only_uses_generation_provider_fp8_mode(monkeypatch) -> None:
+    attn = SimpleNamespace(
+        is_mla_enable=False,
+        num_heads=1,
+        num_kv_heads=1,
+        head_dim=4,
+        v_head_dim=None,
+        kv_lora_rank=None,
+        predicted_tokens_per_seq=1,
+    )
+    fmha = object.__new__(FlashInferTrtllmGenFmha)
+    fmha._attn_ref = lambda: attn
+    fmha._followup_fmhas = ()
+    fmha.kv_factor = 2
+    fmha.context_out_head_size = 4
+    fmha.generation_out_head_size = 4
+
+    monkeypatch.setattr(FlashInferTrtllmGenFmha, "is_generation_supported", lambda *args: True)
+    monkeypatch.setattr(FlashInferTrtllmGenFmha, "prepare_workspace", lambda *args: None)
+    monkeypatch.setattr(
+        FlashInferTrtllmGenFmha,
+        "get_fp8_context_fmha",
+        lambda *args: True,
+    )
+    fp8_mode = None
+
+    def _run_generation(self, params):
+        nonlocal fp8_mode
+        fp8_mode = params.fp8_context_fmha
+
+    monkeypatch.setattr(FlashInferTrtllmGenFmha, "run_generation", _run_generation)
+
+    metadata = SimpleNamespace(
+        kv_cache_block_offsets=object(),
+        effective_workspace=torch.empty(0, dtype=torch.int8),
+        num_contexts=0,
+        num_ctx_tokens=0,
+        num_generations=1,
+        kv_lens_cuda_runtime=torch.tensor([5], dtype=torch.int32),
+        kv_lens_runtime=torch.tensor([5], dtype=torch.int32),
+        beam_width=1,
+        cache_indirection=None,
+        tokens_per_block=32,
+        kv_cache_manager=None,
+        is_cross=False,
+        is_spec_decoding_enabled=False,
+    )
+    q = torch.empty((1, 4), dtype=torch.bfloat16)
+    forward_args = AttentionForwardArgs(
+        output=torch.empty_like(q),
+        attention_mask=PredefinedAttentionMask.CAUSAL,
+        attention_input_type=AttentionInputType.generation_only,
+        attention_window_size=8,
+    )
+
+    assert fmha.try_forward(q, None, None, metadata, forward_args)
+    assert fp8_mode is True
+
+
 def test_preprocessed_generation_launches_trtllm_gen_directly(monkeypatch) -> None:
+    fp8_kv_quant_mode = QuantMode.from_description(use_fp8_kv_cache=True)
     attn = SimpleNamespace(
         num_heads=2,
         num_kv_heads=1,
         head_dim=512,
-        quant_mode=0,
+        quant_mode=int(fp8_kv_quant_mode),
         local_layer_idx=0,
         q_scaling=1.0,
         attention_chunk_size=None,
@@ -284,17 +370,31 @@ def test_preprocessed_generation_launches_trtllm_gen_directly(monkeypatch) -> No
     fmha._enable_pdl = False
     fmha._multi_processor_count = 1
 
+    appended_kv_dtypes = None
+
+    def _capture_append(params, q, k, v, *args, **kwargs):
+        nonlocal appended_kv_dtypes
+        appended_kv_dtypes = (q.dtype, k.dtype, v.dtype)
+        return object(), object(), object(), object(), [5]
+
     monkeypatch.setattr(
         FlashInferTrtllmGenFmha,
         "_append_preprocessed_kv",
-        staticmethod(lambda *args, **kwargs: (object(), object(), object(), object(), [5])),
+        staticmethod(_capture_append),
     )
     kv_pool = torch.empty(1)
     block_tables = torch.zeros(1, 2, 4, dtype=torch.int32)
+    metadata_dtype = None
+
+    def _build_metadata(*args, **kwargs):
+        nonlocal metadata_dtype
+        metadata_dtype = args[-1]
+        return kv_pool, block_tables
+
     monkeypatch.setattr(
         thop,
         "build_trtllm_gen_kv_cache_metadata",
-        lambda *args, **kwargs: (kv_pool, block_tables),
+        _build_metadata,
     )
     monkeypatch.setattr(
         trtllm_gen_module,
@@ -317,6 +417,9 @@ def test_preprocessed_generation_launches_trtllm_gen_directly(monkeypatch) -> No
 
     assert decode_args is not None
     assert decode_args[0].shape == (1, 2, 512)
+    assert decode_args[0].dtype == torch.float8_e4m3fn
+    assert appended_kv_dtypes == (torch.float8_e4m3fn,) * 3
+    assert metadata_dtype == torch.float8_e4m3fn
     assert decode_args[1] is kv_pool
     assert decode_args[3] is block_tables
     assert decode_args[5] == 5

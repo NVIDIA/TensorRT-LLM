@@ -702,6 +702,32 @@ class TestGemma4ForConditionalGeneration(unittest.TestCase):
         # TRT-LLM class, not ``transformers.AutoModel`` output.
         self.assertIsInstance(model.vision_tower, Gemma4VisionModel)
 
+    def test_text_submodel_preserves_explicit_attention_backend(self):
+        """The text submodel honors explicit backend overrides."""
+        text_config = Gemma4TextConfig(**SMALL_TEXT_CONFIG)
+        vision_config = Gemma4VisionConfig(**SMALL_VISION_CONFIG)
+        config = Gemma4Config(
+            text_config=text_config,
+            vision_config=vision_config,
+            audio_config=None,
+        )
+
+        for backend in ("FLASHINFER", "TRTLLM"):
+            model_config = ModelConfig(
+                pretrained_config=config,
+                mapping=Mapping(world_size=1, tp_size=1, rank=0),
+                attn_backend=backend,
+            )
+            text_model_config = Gemma4ForConditionalGeneration.get_sub_model_config(
+                model_config, "text_config"
+            )
+            vision_model_config = Gemma4ForConditionalGeneration.get_sub_model_config(
+                model_config, "vision_config"
+            )
+
+            self.assertEqual(text_model_config.attn_backend, backend)
+            self.assertEqual(vision_model_config.attn_backend, "TRTLLM")
+
     def test_chunked_prefill_reuses_cached_vision_embeddings(self):
         """Later active chunks slice cached features without rerunning vision."""
         model = self._make_model()

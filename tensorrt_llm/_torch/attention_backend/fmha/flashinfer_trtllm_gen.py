@@ -771,8 +771,9 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             return False, "Preprocessed generation requires output to match the input dtype."
         if forward_args.output_sf is not None:
             return False, "Preprocessed generation does not support NVFP4 output."
-        if QuantMode(self.attn.quant_mode).has_kv_cache_quant():
-            return False, "Preprocessed generation does not support quantized KV cache."
+        kv_cache_quant_mode = QuantMode(self.attn.quant_mode)
+        if kv_cache_quant_mode.has_kv_cache_quant() and not kv_cache_quant_mode.has_fp8_kv_cache():
+            return False, "Preprocessed generation supports only unquantized or FP8 KV cache."
         if forward_args.attention_sinks is not None:
             return False, "Preprocessed generation does not support attention sinks."
         if PositionEmbeddingType(self.attn.position_embedding_type).is_rope():
@@ -806,7 +807,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             output.dtype == torch.float8_e4m3fn
             or output.dtype == torch.uint8
             or kv_cache_quant_mode.has_fp4_kv_cache()
-            or (kv_cache_quant_mode.has_fp8_kv_cache() and not is_gen_only)
+            or kv_cache_quant_mode.has_fp8_kv_cache()
         )
 
     def prepare_workspace(
@@ -1208,8 +1209,9 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             raise RuntimeError("Preprocessed generation requires output and sequence lengths.")
         if meta.kv_cache_manager is None:
             raise RuntimeError("Preprocessed generation requires a KV cache manager.")
-        if QuantMode(attn.quant_mode).has_kv_cache_quant():
-            raise RuntimeError("Preprocessed generation does not support quantized KV cache.")
+        kv_cache_quant_mode = QuantMode(attn.quant_mode)
+        if kv_cache_quant_mode.has_kv_cache_quant() and not kv_cache_quant_mode.has_fp8_kv_cache():
+            raise RuntimeError("Preprocessed generation supports only unquantized or FP8 KV cache.")
 
         if params.qkv_input is None:
             raise RuntimeError("Preprocessed generation requires Q input.")
@@ -1218,6 +1220,8 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             attn.num_heads,
             attn.head_dim,
         )
+        if kv_cache_quant_mode.has_fp8_kv_cache():
+            q = q.to(torch.float8_e4m3fn)
         num_sequences = meta.num_generations
         extend_lens = meta.seq_lens[params.seq_offset : params.seq_offset + num_sequences].tolist()
         cached_lens = meta.kv_cache_params.num_cached_tokens_per_seq[
@@ -1249,6 +1253,9 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         qo_indptr, prefix_lens = length_tensors
         if params.key_input is not None and params.value_input is not None:
             _, k, v = self._split_preprocessed_qkv(params)
+            if kv_cache_quant_mode.has_fp8_kv_cache():
+                k = k.to(torch.float8_e4m3fn)
+                v = v.to(torch.float8_e4m3fn)
             self._append_preprocessed_kv(
                 params,
                 q,

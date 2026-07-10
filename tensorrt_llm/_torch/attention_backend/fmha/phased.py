@@ -415,9 +415,11 @@ class PhasedFmha(Fmha):
                 f"num_ctx_tokens={num_ctx_tokens}, attention_input_type={attention_input_type}."
             )
 
+        fp8_fmha = context_fmha if context_fmha is not None else generation_fmha
+        fp8_args = context_args if context_fmha is not None else generation_args
         fp8_context_fmha = (
-            context_fmha.get_fp8_context_fmha(q, output, metadata, context_args, is_gen_only)
-            if context_fmha is not None
+            fp8_fmha.get_fp8_context_fmha(q, output, metadata, fp8_args, is_gen_only)
+            if fp8_fmha is not None
             else False
         )
         prepared_fmhas: set[PhasedFmha] = set()
