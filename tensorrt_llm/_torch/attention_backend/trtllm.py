@@ -1312,11 +1312,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             or metadata.runtime_features.has_speculative_draft_tokens
         ) if metadata.runtime_features else False
 
-        # This is a workaround for https://nvbugs/5624818
-        # Paged context FMHA is forced on SM90 for correctness
-        if get_sm_version() == 90:
-            use_paged_context_fmha = True
-
         return self._is_nvfp4_output_kernel_available(
             tokens_per_block=metadata.tokens_per_block,
             attention_mask=attention_mask,
@@ -1487,17 +1482,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         # Cross-attention uses the THOP path; the trtllm-gen backend API does
         # not carry encoder K/V tensors yet.
 
-        # cpp/tensorrt_llm/thop/attentionOp.cpp enables mFP8ContextFMHA for an
-        # FP8 KV cache only when use_paged_context_fmha is true. Force paged
-        # context so QKV preprocessing and context FMHA use the FP8 path.
-        if self.has_fp8_kv_cache:
-            metadata.use_paged_context_fmha = True
-
-        # SM90 forces `use_paged_context_fmha` on for correctness
-        # (https://nvbugs/5624818).
-        if get_sm_version() == 90:
-            metadata.use_paged_context_fmha = True
-
         # Sparse mqa/gqa attention uses generation kernel which reads Q from qPtr (separate buffer).
         # Force paged context FMHA so QKV preprocessing writes Q to q_buf_2_.
         if (self.sparse_params is not None and getattr(
@@ -1507,6 +1491,12 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         if self.is_mla_enable:
             # Context MLA uses separate qkv instead of paged_context_fmha
             metadata.use_paged_context_fmha = False
+
+        if (forward_args.enable_dsv4_epilogue_fusion and
+            (forward_args.output is None or forward_args.output_sf is None)):
+            raise ValueError(
+                "DSv4 epilogue fusion requires caller-provided output and "
+                "output_sf buffers.")
 
         if forward_args.output is None:
             is_gen_only = (forward_args.attention_input_type ==
@@ -1718,7 +1708,9 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         # populated by `create_output` in `forward` above, so the
         # decision is correct only here, not at the modules/attention.py
         # call site where `output_sf` is always `None`.
-        if forward_args.output_sf is not None and forward_args.out_scale_sf is not None:
+        if (not forward_args.enable_dsv4_epilogue_fusion
+                and forward_args.output_sf is not None
+                and forward_args.out_scale_sf is not None):
             forward_args.out_scale = forward_args.out_scale_sf
 
         # Default `forward_args.kv_scale_*` to the layer-level mirrors when

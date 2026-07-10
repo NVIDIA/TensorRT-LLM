@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -160,14 +160,69 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
     if run_ray:
         command += ["--run-ray"]
 
+    s3_secret_key = None
+    s3_upload_path = request.config.getoption("--s3-upload-path", default=None)
+    if s3_upload_path:
+        inner_output_dir = os.path.join(output_dir, "inner-s3", case_fn)
+        inner_upload_path = os.path.join(s3_upload_path, "inner", case_fn)
+        command += [
+            "-s",
+            f"--output-dir={inner_output_dir}",
+            f"--s3-upload-path={inner_upload_path}",
+            "--s3-capture-mode=direct",
+            "--s3-upload-mode=deferred",
+        ]
+        inline_output_max_bytes = request.config.getoption(
+            "--s3-inline-output-max-bytes", default=256)
+        command += [f"--s3-inline-output-max-bytes={inline_output_max_bytes}"]
+        for option in ("--s3-endpoint", "--s3-username", "--s3-bucket"):
+            value = request.config.getoption(option, default=None)
+            if value:
+                command += [f"{option}={value}"]
+        if request.config.getoption("--s3-skip-upload", default=False):
+            command += ["--s3-skip-upload"]
+        s3_secret_key = request.config.getoption("--s3-secret-key",
+                                                 default=None)
+
     command += arg_list
 
     print(f"Running unit test:\"python {' '.join(command)}\"")
 
+    def build_pythonpath():
+        pythonpath = os.environ.get("PYTHONPATH", "")
+        pythonpath_entries = [f"{llm_root}/tests/unittest"]
+
+        # MPI worker processes start from the tests directory and otherwise
+        # may resolve an older site-packages triton_kernels package.
+        triton_kernels_src = os.path.join(llm_root, "triton_kernels")
+        if os.path.isdir(triton_kernels_src):
+            pythonpath_overrides_dir = os.path.join(
+                output_dir, f"pythonpath-overrides-{case_fn}")
+            os.makedirs(pythonpath_overrides_dir, exist_ok=True)
+            triton_kernels_link = os.path.join(pythonpath_overrides_dir,
+                                               "triton_kernels")
+            if os.path.lexists(triton_kernels_link):
+                is_expected_link = False
+                if os.path.islink(triton_kernels_link):
+                    is_expected_link = (
+                        os.readlink(triton_kernels_link) == triton_kernels_src)
+                if not is_expected_link:
+                    raise RuntimeError(
+                        f"Unexpected triton_kernels path: {triton_kernels_link}"
+                    )
+            else:
+                os.symlink(triton_kernels_src, triton_kernels_link)
+            pythonpath_entries.insert(0, pythonpath_overrides_dir)
+
+        if pythonpath:
+            pythonpath_entries.append(pythonpath)
+        return os.pathsep.join(pythonpath_entries)
+
     def run_command(cmd, num_workers=1):
         try:
-            pythonpath = os.environ.get("PYTHONPATH", "")
-            env = {'PYTHONPATH': f"{llm_root}/tests/unittest:{pythonpath}"}
+            env = {'PYTHONPATH': build_pythonpath()}
+            if s3_secret_key:
+                env["S3_SECRET_KEY"] = s3_secret_key
             if num_workers > 1:
                 env['TORCHINDUCTOR_COMPILE_THREADS'] = '1'
             llm_venv.run_cmd(

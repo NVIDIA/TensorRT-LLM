@@ -9,8 +9,8 @@
 """Helpers for the offline sharding-IR equivalence test.
 
 The test takes a path to a sharding-IR-aware modeling file (e.g.
-``tensorrt_llm/_torch/auto_deploy/models/custom/modeling_deepseek.py``,
-``modeling_qwen3.py``, or any ``modeling_<name>.py`` whose canonical
+``models/custom/modeling_deepseek.py``, ``modeling_qwen3.py``, or any
+``modeling_<name>.py`` whose canonical
 implementation uses the sharding-IR path) and builds a tiny variant of that
 model -- few layers, small hidden size, random weights -- without touching
 the filesystem or LLM_MODELS_ROOT.
@@ -253,28 +253,28 @@ def _apply_per_family_quirks(config: Any) -> None:
 # -----------------------------------------------------------------------------
 
 
-def _path_to_dotted_module(path: str) -> str:
+def _path_to_dotted_module(path: str, custom_models_package: str) -> str:
     """Convert a modeling-file path to its Python dotted module name.
 
     Accepts:
 
-    * An absolute path: ``/.../tensorrt_llm/_torch/auto_deploy/models/custom/modeling_x.py``
-    * A path relative to cwd or repo root: ``tensorrt_llm/_torch/.../modeling_x.py``
-    * A bare module short name: ``modeling_x`` (resolved under
-      ``tensorrt_llm._torch.auto_deploy.models.custom``)
+    * An absolute path ending in ``models/custom/modeling_x.py``.
+    * A relative path ending in ``models/custom/modeling_x.py``.
+    * A bare module short name such as ``modeling_x``.
 
-    The conversion is purely syntactic -- no filename pattern is required.
+    ``custom_models_package`` comes from the loaded factory's module, so the
+    result targets either bundled AutoDeploy or standalone ``llmc`` without a
+    filesystem-root or top-level-package assumption. The conversion is purely
+    syntactic -- no filename pattern is required.
     """
-    if "/" not in path and not path.endswith(".py"):
-        return f"tensorrt_llm._torch.auto_deploy.models.custom.{path}"
-
-    p = Path(path).resolve() if not Path(path).is_absolute() else Path(path)
-    p = p.with_suffix("")
-    parts = p.parts
-    if "tensorrt_llm" not in parts:
-        raise ValueError(f"Path {path!r} does not contain a 'tensorrt_llm' package root anchor.")
-    idx = parts.index("tensorrt_llm")
-    return ".".join(parts[idx:])
+    candidate = Path(path.replace("\\", "/"))
+    if len(candidate.parts) > 1:
+        if candidate.suffix != ".py" or candidate.parent.name != "custom":
+            raise ValueError(f"Path {path!r} must identify a Python file under models/custom.")
+        if candidate.parent.parent.name != "models":
+            raise ValueError(f"Path {path!r} must identify a Python file under models/custom.")
+    module_name = candidate.stem
+    return f"{custom_models_package}.{module_name}"
 
 
 def _resolve_config_cls_from_transformers_registry(config_cls_name: str) -> Any:
@@ -319,12 +319,13 @@ def spec_from_modeling_file(path: str) -> IRModelSpec:
        files that only reference the config class by string in their
        registration call.
     """
-    module_name = _path_to_dotted_module(path)
-    mod = importlib.import_module(module_name)
-
-    # Deferred import: pulls in tensorrt_llm and so must run *after* the
-    # caller has done any necessary sys.path / env-var setup.
+    # Deferred import: pulls in the active AutoDeploy package and so must run
+    # after the caller has done any necessary sys.path / env-var setup.
     from tensorrt_llm._torch.auto_deploy.models.hf import AutoModelForCausalLMFactory
+
+    models_package = AutoModelForCausalLMFactory.__module__.rsplit(".", 1)[0]
+    module_name = _path_to_dotted_module(path, f"{models_package}.custom")
+    mod = importlib.import_module(module_name)
 
     # Walk AutoModelForCausalLMFactory AND every subclass. Each subclass gets
     # its own _custom_model_mapping via __init_subclass__ (see hf.py:668), so a
