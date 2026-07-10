@@ -851,17 +851,10 @@ class KVCacheManagerV2(BaseResourceManager):
             # can OOM the host (observed on GB300 NVL72 with 4 ranks/node
             # and ~170GiB device quota each on a 975GiB node).
             local_ranks = 1
-            try:
-                if mapping.world_size > 1:
-                    hostnames = Distributed.get(mapping).allgather(socket.gethostname())
-                    if hostnames:
-                        self_hostname = socket.gethostname()
-                        local_ranks = max(1, sum(1 for h in hostnames if h == self_hostname))
-            except Exception:
-                try:
-                    local_ranks = max(1, mapping.gpus_per_node)
-                except Exception:
-                    local_ranks = 1
+            if mapping.world_size > 1:
+                self_hostname = socket.gethostname()
+                hostnames = Distributed.get(mapping).allgather(self_hostname)
+                local_ranks = max(1, sum(1 for h in hostnames if h == self_hostname))
 
             try:
                 mem_available = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_AVPHYS_PAGES")
