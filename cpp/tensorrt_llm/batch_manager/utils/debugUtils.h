@@ -25,7 +25,6 @@
 
 namespace tensorrt_llm::runtime
 {
-class TllmRuntime;
 } // namespace tensorrt_llm::runtime
 
 namespace tensorrt_llm::batch_manager::utils

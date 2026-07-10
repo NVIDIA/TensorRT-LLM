@@ -27,6 +27,7 @@
 #include "tensorrt_llm/batch_manager/decoderBuffers.h"
 #include "tensorrt_llm/batch_manager/guidedDecoder.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h"
+#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/executor/executor.h"
 
 using namespace tensorrt_llm::runtime;
@@ -60,7 +61,7 @@ public:
     void initData(std::filesystem::path tokenizerInfoPath, SizeType32 vocabSizePadded, VecTokens outputIds,
         std::vector<int32_t> expectedNumRejected)
     {
-        mLogitsDtype = nvinfer1::DataType::kFLOAT;
+        mLogitsDtype = tensorrt_llm::DataType::kFLOAT;
         mMaxNumRequests = 16;
 
         mVocabSizePadded = vocabSizePadded;
@@ -191,7 +192,7 @@ public:
 private:
     SizeType32 mMaxNumRequests;
     SizeType32 mVocabSizePadded;
-    nvinfer1::DataType mLogitsDtype;
+    tensorrt_llm::DataType mLogitsDtype;
 
     std::vector<TensorPtr> mLogits;     // [mBatchSize, mVocabSizePadded]
     std::vector<TensorPtr> mLogitsHost; // [mBatchSize, mVocabSizePadded]

@@ -16,7 +16,3 @@
 # guidedDecoderTest requires model tokenizer info, so it's easier to run it with
 # e2e tests instead of unit tests.
 add_gtest(guidedDecoderTest guidedDecoderTest.cpp)
-add_gtest(trtEncoderModelTest trtEncoderModelTest.cpp)
-add_gtest(trtGptModelTest trtGptModelTest.cpp)
-add_gtest(trtGptModelRealDecoderTest trtGptModelRealDecoderTest.cpp)
-target_link_libraries(trtGptModelRealDecoderTest PRIVATE testingUtils)

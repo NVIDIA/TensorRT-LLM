@@ -32,34 +32,21 @@ set(SRCS
     contextProgress.cpp
     dataTransceiver.cpp
     decoderBuffers.cpp
-    encoderBuffers.cpp
     guidedDecoder.cpp
-    handleContextLogits.cpp
-    handleGenerationLogits.cpp
     kvCacheManager.cpp
     kvCacheEventManager.cpp
     kvCacheTransferManager.cpp
     kvCacheManagerV2Utils.cpp
     kvCacheManagerV2Utils.cu
     llmRequest.cpp
-    logitsPostProcessor.cpp
-    loraBuffers.cpp
-    makeDecodingBatchInputOutput.cpp
     medusaBuffers.cpp
     microBatchScheduler.cpp
     pauseRequests.cpp
     peftCacheManager.cpp
-    promptTuningBuffers.cpp
-    rnnStateBuffers.cpp
     rnnStateManager.cpp
     rnnCacheFormatter.cpp
     rnnCacheTransBuffer.cpp
-    runtimeBuffers.cpp
     sequenceSlotManager.cpp
-    transformerBuffers.cpp
-    trtEncoderModel.cpp
-    trtGptModelInflightBatching.cpp
-    updateDecoderBuffers.cpp
     utils/debugUtils.cpp
     utils/inflightBatchingUtils.cpp
     utils/logitsThread.cpp

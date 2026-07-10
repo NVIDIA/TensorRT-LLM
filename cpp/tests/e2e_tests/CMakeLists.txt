@@ -14,4 +14,3 @@
 # the License.
 
 add_subdirectory(batch_manager)
-add_subdirectory(executor)

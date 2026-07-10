@@ -19,14 +19,6 @@ add_gtest(decodingConfigTest decodingConfigTest.cpp)
 add_gtest(requestTest requestTest.cpp)
 add_gtest(responseTest responseTest.cpp)
 
-add_gtest(executorTestSmall executorTestSmall.cpp)
-target_link_libraries(executorTestSmall PRIVATE testingUtils)
-
-add_gtest(executorTestSmallArbitraryOutputTensors
-          executorTestSmallArbitraryOutputTensors.cpp)
-target_link_libraries(executorTestSmallArbitraryOutputTensors
-                      PRIVATE testingUtils)
-
 add_gtest(executorConfigTest executorConfigTest.cpp)
 add_gtest(executorTensorTest tensorTest.cpp)
 add_gtest(serializeUtilsTest serializeUtilsTest.cpp)

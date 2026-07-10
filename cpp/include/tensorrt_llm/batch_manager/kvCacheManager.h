@@ -23,6 +23,7 @@
 #include "tensorrt_llm/batch_manager/llmRequest.h" // TODO forward declare
 #include "tensorrt_llm/batch_manager/radixBlockTree.h"
 #include "tensorrt_llm/common/optionalRef.h"
+#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/executor/transferAgent.h"
 #include "tensorrt_llm/kernels/kvCacheIndex.h"
@@ -32,7 +33,6 @@
 #include "tensorrt_llm/runtime/iBuffer.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
-#include <NvInferRuntime.h>
 
 #include <algorithm>
 #include <array>
@@ -140,7 +140,7 @@ struct PoolConfiguration
 {
     SizeType32 windowSize;
     SizeType32 sizePerHead;
-    nvinfer1::DataType dtype;
+    tensorrt_llm::DataType dtype;
 };
 
 struct LinearAttentionMetadata
@@ -872,7 +872,7 @@ public:
     using BlockMap = std::unordered_multimap<size_t, BlockPtr>;
     using BlockMapIterRange = std::pair<BlockMap::const_iterator, BlockMap::const_iterator>;
 
-    explicit WindowBlockManager(nvinfer1::DataType dtype, SizeType32 windowSize,
+    explicit WindowBlockManager(tensorrt_llm::DataType dtype, SizeType32 windowSize,
         std::vector<SizeType32> const& managedLayers, std::vector<SizeType32> const& numKvHeadsPerLayer,
         SizeType32 sizePerHead, SizeType32 tokensPerBlock, bool isSWA, SizeType32 blocksInPrimaryPool,
         SizeType32 blocksInSecondaryPool, SizeType32 maxNumSequences, std::shared_ptr<runtime::CudaStream> stream,
@@ -1037,7 +1037,7 @@ public:
     //!          host pools with mixed precisions when constructed with a per-window
     //!          dtype map.  Empty pools or NVFP4-scale pools are routed through the
     //!          per-pool tensor metadata instead.
-    [[nodiscard]] nvinfer1::DataType getDataType() const noexcept
+    [[nodiscard]] tensorrt_llm::DataType getDataType() const noexcept
     {
         return mDataType;
     }
@@ -1127,7 +1127,7 @@ public:
     [[nodiscard]] SizeType32 getNumEltsPerContainer() const
     {
 #ifdef ENABLE_FP4
-        return mDataType == nvinfer1::DataType::kFP4 ? 2 : 1;
+        return mDataType == tensorrt_llm::DataType::kFP4 ? 2 : 1;
 #else
         return 1;
 #endif
@@ -1192,7 +1192,7 @@ public:
         return mLayerToIndexWithinPool.at(layerIdx);
     }
 
-    void setOffsets(kernels::KVCacheIndex* offsetsPtr, nvinfer1::Dims const& offsetsShape, SizeType32 beamIdx,
+    void setOffsets(kernels::KVCacheIndex* offsetsPtr, tensorrt_llm::Dims const& offsetsShape, SizeType32 beamIdx,
         SizeType32 blockIdx, KVCacheBlock::IdType blockId) const;
 
     //! \brief Bring offloaded block from secondary to primary memory.
@@ -1353,7 +1353,7 @@ private:
     }
 
 private:
-    nvinfer1::DataType mDataType;
+    tensorrt_llm::DataType mDataType;
     SizeType32 mWindowSize;
 
     // Number of blocks in pools
@@ -1481,7 +1481,7 @@ public:
     explicit BlockManager(std::vector<SizeType32> const& numKvHeadsPerLayer, SizeType32 sizePerHead,
         SizeType32 tokensPerBlock, BlocksPerWindow const& blocksPerWindow, SizeType32 maxNumSequences,
         CudaStreamPtr stream, SizeType32 maxSequenceLength, SizeType32 maxBeamWidth,
-        std::vector<SizeType32> const& maxAttentionWindowVec, nvinfer1::DataType dtype, SizeType32 sinkBubbleLength,
+        std::vector<SizeType32> const& maxAttentionWindowVec, tensorrt_llm::DataType dtype, SizeType32 sinkBubbleLength,
         SizeType32 chunkSize, CacheType cacheType = CacheType::kSELF,
         std::optional<executor::RetentionPriority> secondaryOffloadMinPriority = std::nullopt,
         std::shared_ptr<KVCacheEventManager> eventManager = nullptr, bool enablePartialReuse = true,
@@ -1563,7 +1563,7 @@ public:
 
     void releaseLastBlock(GenerationRequest& sequence, SizeType32 windowSize);
 
-    void setOffsets(kernels::KVCacheIndex* offsetsPtr, nvinfer1::Dims const& offsetsShape, SizeType32 beamIdx,
+    void setOffsets(kernels::KVCacheIndex* offsetsPtr, tensorrt_llm::Dims const& offsetsShape, SizeType32 beamIdx,
         SizeType32 blockIdx, KVCacheBlock::IdType blockId, SizeType32 windowSize) const;
 
     //! \brief Combined prefix reuse analysis — single radix tree walk.
@@ -1621,9 +1621,9 @@ public:
 
     //! \brief Convenience: window_size -> dataType, derived from getPoolConfigurations().
     //!        For one-pool-per-window managers only; multi-pool-per-window will collide.
-    [[nodiscard]] std::map<SizeType32, nvinfer1::DataType> getDataTypePerWindow() const
+    [[nodiscard]] std::map<SizeType32, tensorrt_llm::DataType> getDataTypePerWindow() const
     {
-        std::map<SizeType32, nvinfer1::DataType> result;
+        std::map<SizeType32, tensorrt_llm::DataType> result;
         for (auto const& [windowSize, manager] : mWindowBlockManagers)
         {
             result[windowSize] = manager.getDataType();
@@ -1636,7 +1636,7 @@ public:
         return mWindowBlockManagers.at(windowSize).getSizePerHead();
     }
 
-    [[nodiscard]] nvinfer1::DataType getDataTypeForWindow(SizeType32 windowSize) const
+    [[nodiscard]] tensorrt_llm::DataType getDataTypeForWindow(SizeType32 windowSize) const
     {
         return mWindowBlockManagers.at(windowSize).getDataType();
     }
@@ -2189,7 +2189,7 @@ public:
     ///        head_dim=512).  Empty vector = uniform @p sizePerHead / @p dtype across all windows.
     /// @return Map from window size to tuple of (primary blocks, secondary blocks)
     [[nodiscard]] static BlocksPerWindow calculateMaxNumBlocks(executor::KvCacheConfig const& config,
-        nvinfer1::DataType dtype, std::vector<SizeType32> const& numKvHeadsPerLayer, SizeType32 sizePerHead,
+        tensorrt_llm::DataType dtype, std::vector<SizeType32> const& numKvHeadsPerLayer, SizeType32 sizePerHead,
         SizeType32 tokensPerBlock, tensorrt_llm::runtime::WorldConfig const& worldConfig,
         std::map<SizeType32, std::vector<SizeType32>> const& windowSizeToLayers, uint64_t allottedPrimaryMemBytes,
         uint64_t allottedSecondaryMemBytes, size_t extraCostMemory, SizeType32 kvFactor, SizeType32 maxBatchSize,
@@ -2276,7 +2276,7 @@ public:
     //!        and disagg transfer machinery applies natively.  Empty vector = uniform.
     KVCacheManager(std::vector<SizeType32> const& numKvHeadsPerLayer, SizeType32 sizePerHead, SizeType32 tokensPerBlock,
         BlocksPerWindow const& blocksPerWindow, SizeType32 maxNumSequences, SizeType32 maxBeamWidth,
-        std::vector<SizeType32> const& maxAttentionWindowVec, nvinfer1::DataType dtype, SizeType32 sinkTokenLength,
+        std::vector<SizeType32> const& maxAttentionWindowVec, tensorrt_llm::DataType dtype, SizeType32 sinkTokenLength,
         CudaStreamPtr stream, SizeType32 maxSequenceLength, SizeType32 chunkSize, bool enableBlockReuse = false,
         CacheType cacheType = CacheType::kSELF,
         std::optional<executor::RetentionPriority> secondaryOffloadMinPriority = std::nullopt,
@@ -2290,7 +2290,7 @@ public:
 
     KVCacheManager(std::vector<SizeType32> const& numKvHeadsPerLayer, SizeType32 sizePerHead, SizeType32 tokensPerBlock,
         BlocksPerWindow const& blocksPerWindow, SizeType32 maxNumSequences, SizeType32 maxBeamWidth,
-        std::vector<SizeType32> const& maxAttentionWindowVec, nvinfer1::DataType dtype, SizeType32 sinkTokenLength,
+        std::vector<SizeType32> const& maxAttentionWindowVec, tensorrt_llm::DataType dtype, SizeType32 sinkTokenLength,
         int64_t stream, SizeType32 maxSequenceLength, SizeType32 chunkSize, bool enableBlockReuse = false,
         CacheType cacheType = CacheType::kSELF,
         std::optional<executor::RetentionPriority> secondaryOffloadMinPriority = std::nullopt,
@@ -2304,7 +2304,7 @@ public:
 
     KVCacheManager(SizeType32 numLayers, SizeType32 numKvHeads, SizeType32 sizePerHead, SizeType32 tokensPerBlock,
         BlocksPerWindow const& blocksPerWindow, SizeType32 maxNumSequences, SizeType32 maxBeamWidth,
-        std::vector<SizeType32> const& maxAttentionWindowVec, nvinfer1::DataType dtype, SizeType32 sinkTokenLength,
+        std::vector<SizeType32> const& maxAttentionWindowVec, tensorrt_llm::DataType dtype, SizeType32 sinkTokenLength,
         CudaStreamPtr stream, SizeType32 maxSequenceLength, SizeType32 chunkSize, bool enableBlockReuse = true,
         CacheType cacheType = CacheType::kSELF,
         std::optional<executor::RetentionPriority> secondaryOffloadMinPriority = std::nullopt,
@@ -2318,7 +2318,7 @@ public:
 
     KVCacheManager(SizeType32 numLayers, SizeType32 numKvHeads, SizeType32 sizePerHead, SizeType32 tokensPerBlock,
         BlocksPerWindow const& blocksPerWindow, SizeType32 maxNumSequences, SizeType32 maxBeamWidth,
-        std::vector<SizeType32> const& maxAttentionWindowVec, nvinfer1::DataType dtype, SizeType32 sinkTokenLength,
+        std::vector<SizeType32> const& maxAttentionWindowVec, tensorrt_llm::DataType dtype, SizeType32 sinkTokenLength,
         int64_t stream, SizeType32 maxSequenceLength, SizeType32 chunkSize, bool enableBlockReuse = false,
         CacheType cacheType = CacheType::kSELF, bool enablePartialReuse = true, bool copyOnpartialReuse = true,
         bool enableIndexerKCache = false, SizeType32 indexerKCacheQuantBlockSize = 128,
@@ -2664,7 +2664,7 @@ private:
     SizeType32 mMaxNumSequences;
     // Maximum beam width
     SizeType32 mMaxBeamWidth;
-    nvinfer1::DataType mDataType;
+    tensorrt_llm::DataType mDataType;
     // Maximum kv cache length per sequence
     SizeType32 mMaxAttentionWindow;
     // Number of tokens per block

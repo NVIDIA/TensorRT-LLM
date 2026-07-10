@@ -25,8 +25,13 @@ include_directories(
   ${PROJECT_SOURCE_DIR}/include
   ${cutlass_source_dir}/include
   ${cutlass_source_dir}/tools/util/include
-  ${PROJECT_SOURCE_DIR}/tests/batch_manager
-  ${PROJECT_SOURCE_DIR}/tests/utils)
+  ${PROJECT_SOURCE_DIR}/tests/batch_manager)
+
+# Tests previously inherited the MPI include dirs transitively through the
+# removed TensorRT plugin target's PUBLIC includes.
+if(ENABLE_MULTI_DEVICE)
+  include_directories(${MPI_C_INCLUDE_DIRS})
+endif()
 
 set(TOP_LEVEL_DIR "${PROJECT_SOURCE_DIR}/..")
 
@@ -38,13 +43,12 @@ function(add_gtest test_name test_src)
                         ${ARGN})
   add_executable(${test_name} ${test_src})
 
-  target_link_libraries(${test_name} PUBLIC gmock_main TensorRT::OnnxParser)
+  target_link_libraries(${test_name} PUBLIC gmock_main)
   if(NOT ARGS_NO_GTEST_MAIN)
     target_link_libraries(${test_name} PUBLIC gtest_main)
   endif()
   if(NOT ARGS_NO_TLLM_LINKAGE)
-    target_link_libraries(${test_name} PUBLIC ${SHARED_TARGET}
-                                              nvinfer_plugin_tensorrt_llm)
+    target_link_libraries(${test_name} PUBLIC ${SHARED_TARGET})
     if(WIN32)
       target_link_libraries(${test_name} PRIVATE context_attention_src)
     endif()
@@ -66,6 +70,5 @@ function(add_gtest test_name test_src)
   add_dependencies(google-tests ${test_name})
 endfunction()
 
-add_subdirectory(utils)
 add_subdirectory(unit_tests)
 add_subdirectory(e2e_tests)

@@ -47,6 +47,7 @@
 #include "tensorrt_llm/batch_manager/rnnStateManager.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/logger.h"
+#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/executor/cache_transmission/mpi_utils/connection.h"
 #include "tensorrt_llm/executor/dataTransceiverState.h"
 #include "tensorrt_llm/executor/serializeUtils.h"
@@ -290,7 +291,7 @@ std::unique_ptr<BaseCacheTransceiver> CacheTransceiverFactory::createCacheTransc
 
 CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheManager,
     executor::kv_cache::CacheState::ModelConfig const& cacheStateModelCfg, runtime::WorldConfig const& worldConfig,
-    std::vector<SizeType32> const& attentionLayerNumPerPP, nvinfer1::DataType dataType,
+    std::vector<SizeType32> const& attentionLayerNumPerPP, tensorrt_llm::DataType dataType,
     executor::kv_cache::CacheState::AttentionType attentionType,
     std::optional<executor::CacheTransceiverConfig> cacheTransceiverConfig,
     std::vector<SizeType32> const& rnnLayerNumPerPP)
@@ -385,20 +386,20 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
         // Pool dtype is UINT8 (raw byte storage), so we cannot use pool->getDataType().
         // Only the byte size matters for split/concat kernel stride calculations — the actual
         // dtype enum is not interpreted numerically, just used for getDTypeSize() dispatch.
-        auto dtypeFromSize = [](SizeType32 size) -> nvinfer1::DataType
+        auto dtypeFromSize = [](SizeType32 size) -> tensorrt_llm::DataType
         {
             switch (size)
             {
-            case 4: return nvinfer1::DataType::kFLOAT;
-            case 2: return nvinfer1::DataType::kBF16;
-            case 1: return nvinfer1::DataType::kFP8;
+            case 4: return tensorrt_llm::DataType::kFLOAT;
+            case 2: return tensorrt_llm::DataType::kBF16;
+            case 1: return tensorrt_llm::DataType::kFP8;
             default: TLLM_THROW("Unsupported RNN state dtype size: %d", size);
             }
         };
         TLLM_CHECK_WITH_INFO(linearMeta->rnnSsmDtypeSize > 0, "rnnSsmDtypeSize not set in LinearAttentionMetadata");
         TLLM_CHECK_WITH_INFO(linearMeta->rnnConvDtypeSize > 0, "rnnConvDtypeSize not set in LinearAttentionMetadata");
-        nvinfer1::DataType ssmDtype = dtypeFromSize(linearMeta->rnnSsmDtypeSize);
-        nvinfer1::DataType convDtype = dtypeFromSize(linearMeta->rnnConvDtypeSize);
+        tensorrt_llm::DataType ssmDtype = dtypeFromSize(linearMeta->rnnSsmDtypeSize);
+        tensorrt_llm::DataType convDtype = dtypeFromSize(linearMeta->rnnConvDtypeSize);
         mCacheState->setRnnConfig(rnnModelCfg, rnnLayerNumPerPP, convDtype, ssmDtype);
 
         // Create RnnCacheTransBufferManager for unified pool path.

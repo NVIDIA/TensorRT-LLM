@@ -370,7 +370,7 @@ def _rewrite_imports_in_file(filepath: str, *, optional_trtllm_guards: bool = Tr
 
     if optional_trtllm_guards:
         # The standalone package can rely on the installed trtllm-bench entrypoint,
-        # but it does not ship TensorRT-LLM's source-tree benchmarks/cpp directory.
+        # but it does not ship TensorRT-LLM's source-tree benchmarks directory.
         content = content.replace(
             '    script_dir = Path(root_dir, "benchmarks", "cpp")\n',
             "    script_dir = Path(temp_dir)\n",

@@ -19,6 +19,7 @@
 #include "tensorrt_llm/batch_manager/decoderBuffers.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h"
 #include "tensorrt_llm/common/envUtils.h"
+#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/kernels/logitsBitmask.h"
 
 #include <nlohmann/json.hpp>
@@ -30,7 +31,7 @@ namespace tensorrt_llm::batch_manager
 {
 
 GuidedDecoder::GuidedDecoder(executor::GuidedDecodingConfig const& guidedDecodingConfig, SizeType32 maxNumSequences,
-    SizeType32 vocabSizePadded, nvinfer1::DataType logitsDtype, BufferManager const& runtimeBufferManager)
+    SizeType32 vocabSizePadded, tensorrt_llm::DataType logitsDtype, BufferManager const& runtimeBufferManager)
     : mGuidedDecodingBackend{guidedDecodingConfig.getBackend()}
     , mMaxNumSequences{maxNumSequences}
     , mVocabSizePadded{vocabSizePadded}
@@ -201,13 +202,13 @@ void GuidedDecoder::execute(DecoderInputBuffers const& decoderInputBuffers, Buff
                 *ITensor::slice(mLogitsBitmaskPtrVec, 0, batchIdx));
 
             auto logitsBitmaskPtrVec = bufferCast<BitmaskT const*>(*mLogitsBitmaskPtrVec);
-            if (mLogitsDtype == nvinfer1::DataType::kFLOAT)
+            if (mLogitsDtype == tensorrt_llm::DataType::kFLOAT)
             {
                 auto logitsPtrVec = bufferCast<float*>(*mLogitsPtrVec);
                 tensorrt_llm::kernels::invokeLogitsBitmask<float>(
                     logitsPtrVec, logitsBitmaskPtrVec, batchIdx, mVocabSizePadded, stream.get());
             }
-            else if (mLogitsDtype == nvinfer1::DataType::kHALF)
+            else if (mLogitsDtype == tensorrt_llm::DataType::kHALF)
             {
                 auto logitsPtrVec = bufferCast<half*>(*mLogitsPtrVec);
                 tensorrt_llm::kernels::invokeLogitsBitmask<half>(

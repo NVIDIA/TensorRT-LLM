@@ -20,6 +20,7 @@
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/opUtils.h"
+#include "tensorrt_llm/common/tllmDataType.h"
 
 #include <mutex>
 
@@ -51,7 +52,7 @@ void BufferIndexHolder::release() noexcept
 }
 
 BaseTransBufferManager::BaseTransBufferManager(
-    size_t transferBufferSize, nvinfer1::DataType dataType, std::optional<size_t> maxNumTokens)
+    size_t transferBufferSize, tensorrt_llm::DataType dataType, std::optional<size_t> maxNumTokens)
     : mDataType{dataType}
     , mBufferManager{std::make_shared<runtime::CudaStream>()}
     , mMaxNumTokens{maxNumTokens}

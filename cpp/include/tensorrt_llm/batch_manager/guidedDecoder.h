@@ -17,6 +17,7 @@
 #pragma once
 
 #include "tensorrt_llm/batch_manager/common.h"
+#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
 #include "tensorrt_llm/runtime/iTensor.h"
@@ -39,7 +40,8 @@ public:
     using BitmaskT = uint32_t;
 
     GuidedDecoder(executor::GuidedDecodingConfig const& guidedDecodingConfig, SizeType32 maxNumSequences,
-        SizeType32 vocabSizePadded, nvinfer1::DataType logitsDtype, runtime::BufferManager const& runtimeBufferManager);
+        SizeType32 vocabSizePadded, tensorrt_llm::DataType logitsDtype,
+        runtime::BufferManager const& runtimeBufferManager);
     void build(ScheduledRequests const& scheduledRequests);
     void execute(DecoderInputBuffers const& decoderInputBuffers, runtime::BufferManager const& runtimeBufferManager);
 
@@ -51,7 +53,7 @@ private:
     SizeType32 mMaxNumSequences;
     SizeType32 mVocabSizePadded;
     SizeType32 mBitmaskSize; // CeilDiv(vocabSizePadded, 32)
-    nvinfer1::DataType mLogitsDtype;
+    tensorrt_llm::DataType mLogitsDtype;
 
     TensorPtr mLogitsBitmask;           // [mMaxNumRequests, mBitmaskSize]
     TensorPtr mLogitsBitmaskHost;       // [mMaxNumRequests, mBitmaskSize]

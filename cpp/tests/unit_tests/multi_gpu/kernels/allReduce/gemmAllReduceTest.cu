@@ -27,10 +27,10 @@
 #endif
 #include "common.h"
 #include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/kernels/userbuffers/ub_interface.h"
 #include "tensorrt_llm/runtime/ipcNvlsMemory.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
-#include <NvInferRuntime.h>
 
 #include "cute/tensor.hpp"
 #include "cutlass/cutlass.h"
@@ -54,7 +54,6 @@
 #include "cutlass/util/reference/host/tensor_fill.h"
 
 using namespace cutlass;
-using namespace nvinfer1;
 using namespace tensorrt_llm::mpi;
 using namespace tensorrt_llm::runtime;
 using namespace tensorrt_llm::common;
@@ -238,7 +237,7 @@ struct ToType
 template <>
 struct ToType<cutlass::bfloat16_t>
 {
-    nvinfer1::DataType trt_value = nvinfer1::DataType::kBF16;
+    tensorrt_llm::DataType trt_value = tensorrt_llm::DataType::kBF16;
     ncclDataType_t nccl_value = ncclBfloat16;
     char const* str_value = "bf16";
 };
@@ -246,7 +245,7 @@ struct ToType<cutlass::bfloat16_t>
 template <>
 struct ToType<cutlass::half_t>
 {
-    nvinfer1::DataType trt_value = nvinfer1::DataType::kHALF;
+    tensorrt_llm::DataType trt_value = tensorrt_llm::DataType::kHALF;
     ncclDataType_t nccl_value = ncclFloat16;
     char const* str_value = "fp16";
 };
@@ -254,7 +253,7 @@ struct ToType<cutlass::half_t>
 template <>
 struct ToType<cutlass::float_e4m3_t>
 {
-    nvinfer1::DataType trt_value = nvinfer1::DataType::kFP8;
+    tensorrt_llm::DataType trt_value = tensorrt_llm::DataType::kFP8;
     ncclDataType_t nccl_value = ncclFloat8e4m3;
     char const* str_value = "fp8_e4m3";
 };

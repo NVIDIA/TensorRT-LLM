@@ -1,16 +1,16 @@
 {
   "_meta": {
     "generated_by": "scripts/legacy_utils.py lint-update-violations",
-    "total_violations": 2917,
-    "total_files": 303
+    "total_violations": 2307,
+    "total_files": 270
   },
   ".github/scripts/label_community_user.py": {
     "D212": 1
   },
-  "benchmarks/cpp/utils/convert_nemo_dataset.py": {
+  "benchmarks/utils/convert_nemo_dataset.py": {
     "E741": 1
   },
-  "benchmarks/cpp/utils/prepare_real_data.py": {
+  "benchmarks/utils/prepare_real_data.py": {
     "D202": 1,
     "D205": 1,
     "D410": 7,
@@ -257,9 +257,6 @@
     "D212": 1,
     "E741": 1
   },
-  "scripts/check_test_list.py": {
-    "D212": 1
-  },
   "scripts/dco_check.py": {
     "D212": 1
   },
@@ -292,26 +289,14 @@
     "D212": 1,
     "E402": 20
   },
-  "tensorrt_llm/_torch/attention_backend/sparse/dsa.py": {
-    "F821": 2
-  },
   "tensorrt_llm/_torch/attention_backend/sparse/kernel.py": {
     "E731": 3
   },
   "tensorrt_llm/_torch/attention_backend/sparse/rocket.py": {
     "E712": 2
   },
-  "tensorrt_llm/_torch/attention_backend/sparse/utils.py": {
-    "F821": 4
-  },
   "tensorrt_llm/_torch/attention_backend/trtllm.py": {
     "E712": 1
-  },
-  "tensorrt_llm/_torch/attention_backend/utils.py": {
-    "F821": 2
-  },
-  "tensorrt_llm/_torch/compilation/patterns/ar_residual_norm.py": {
-    "E402": 1
   },
   "tensorrt_llm/_torch/compilation/patterns/residual_add_norm.py": {
     "E402": 1
@@ -319,22 +304,12 @@
   "tensorrt_llm/_torch/compilation/piecewise_optimizer.py": {
     "E711": 2
   },
-  "tensorrt_llm/_torch/custom_ops/cute_dsl_custom_ops.py": {
-    "E741": 11
-  },
-  "tensorrt_llm/_torch/custom_ops/torch_custom_ops.py": {
-    "F821": 2
-  },
   "tensorrt_llm/_torch/cute_dsl_kernels/blackwell/dense_blockscaled_gemm_persistent.py": {
     "E741": 3
   },
   "tensorrt_llm/_torch/distributed/ops.py": {
     "E712": 1,
     "E731": 1
-  },
-  "tensorrt_llm/_torch/model_config.py": {
-    "F811": 1,
-    "F821": 4
   },
   "tensorrt_llm/_torch/models/checkpoints/auto_mapper.py": {
     "F821": 1
@@ -366,21 +341,12 @@
   "tensorrt_llm/_torch/models/modeling_nemotron.py": {
     "E731": 1
   },
-  "tensorrt_llm/_torch/models/modeling_qwen2vl.py": {
-    "F811": 1
-  },
-  "tensorrt_llm/_torch/models/modeling_qwen3_next.py": {
-    "F821": 1
-  },
   "tensorrt_llm/_torch/models/modeling_siglip.py": {
     "F811": 1
   },
   "tensorrt_llm/_torch/models/modeling_utils.py": {
     "E731": 1,
     "F821": 5
-  },
-  "tensorrt_llm/_torch/modules/attention.py": {
-    "E731": 2
   },
   "tensorrt_llm/_torch/modules/fused_moe/deep_ep_utils.py": {
     "F821": 2
@@ -415,18 +381,6 @@
   "tensorrt_llm/_torch/modules/mamba/ssd_state_passing.py": {
     "E731": 1
   },
-  "tensorrt_llm/_torch/pyexecutor/_util.py": {
-    "F811": 1
-  },
-  "tensorrt_llm/_torch/pyexecutor/cuda_graph_runner.py": {
-    "F821": 1
-  },
-  "tensorrt_llm/_torch/pyexecutor/mamba_cache_manager.py": {
-    "F821": 1
-  },
-  "tensorrt_llm/_torch/pyexecutor/model_engine.py": {
-    "F821": 1
-  },
   "tensorrt_llm/_torch/pyexecutor/model_loader.py": {
     "F811": 1
   },
@@ -434,23 +388,14 @@
     "E712": 1,
     "E721": 1
   },
-  "tensorrt_llm/_torch/pyexecutor/resource_manager.py": {
-    "F821": 2
-  },
   "tensorrt_llm/_torch/pyexecutor/seq_slot_manager.py": {
     "F821": 1
   },
   "tensorrt_llm/_torch/speculative/auto_heuristic.py": {
     "F821": 1
   },
-  "tensorrt_llm/_torch/speculative/interface.py": {
-    "F821": 1
-  },
   "tensorrt_llm/_torch/speculative/ngram.py": {
     "E741": 1
-  },
-  "tensorrt_llm/_torch/speculative/speculation_gate.py": {
-    "F821": 1
   },
   "tensorrt_llm/_utils.py": {
     "E722": 1,
@@ -535,9 +480,7 @@
     "D202": 1,
     "D205": 1,
     "D208": 3,
-    "D210": 1,
     "D212": 1,
-    "D300": 1,
     "E722": 1
   },
   "tensorrt_llm/executor/ray_executor.py": {
@@ -578,7 +521,6 @@
   },
   "tensorrt_llm/executor/rpc_proxy.py": {
     "D205": 1,
-    "D212": 1,
     "D415": 1
   },
   "tensorrt_llm/executor/rpc_worker.py": {
@@ -588,24 +530,6 @@
     "D210": 6,
     "D300": 6,
     "F811": 1
-  },
-  "tensorrt_llm/functional.py": {
-    "D200": 42,
-    "D202": 6,
-    "D205": 20,
-    "D207": 1,
-    "D208": 6,
-    "D210": 2,
-    "D212": 142,
-    "D214": 3,
-    "D300": 144,
-    "D301": 2,
-    "D411": 8,
-    "D415": 9
-  },
-  "tensorrt_llm/inputs/evs.py": {
-    "D205": 1,
-    "D212": 2
   },
   "tensorrt_llm/inputs/multimodal.py": {
     "D415": 1
@@ -657,11 +581,7 @@
   },
   "tensorrt_llm/llmapi/mpi_session.py": {
     "D200": 1,
-    "D205": 2,
-    "D210": 7,
-    "D212": 3,
-    "D300": 10,
-    "D411": 1,
+    "D205": 1,
     "D415": 1
   },
   "tensorrt_llm/llmapi/reasoning_parser.py": {
@@ -702,25 +622,6 @@
     "D415": 3,
     "E731": 1,
     "F821": 1
-  },
-  "tensorrt_llm/models/modeling_utils.py": {
-    "D200": 3,
-    "D202": 1,
-    "D205": 4,
-    "D208": 4,
-    "D210": 3,
-    "D212": 2,
-    "D300": 5,
-    "D415": 4,
-    "E721": 2,
-    "E722": 1
-  },
-  "tensorrt_llm/quantization/functional.py": {
-    "D205": 4,
-    "D212": 4,
-    "D300": 4,
-    "D411": 2,
-    "D415": 2
   },
   "tensorrt_llm/quantization/quantize_by_modelopt.py": {
     "D200": 1,
@@ -797,9 +698,6 @@
   "tensorrt_llm/scaffolding/task.py": {
     "F821": 1
   },
-  "tensorrt_llm/scaffolding/task_collection.py": {
-    "F821": 1
-  },
   "tensorrt_llm/scaffolding/worker.py": {
     "PLE0302": 1
   },
@@ -817,11 +715,6 @@
   "tensorrt_llm/serve/openai_disagg_server.py": {
     "D210": 1,
     "F811": 1
-  },
-  "tensorrt_llm/serve/openai_server.py": {
-    "D205": 1,
-    "D212": 2,
-    "F821": 3
   },
   "tensorrt_llm/serve/responses_utils.py": {
     "D200": 2,
@@ -896,19 +789,9 @@
     "D403": 9,
     "D415": 11
   },
-  "tests/integration/defs/accuracy/accuracy_core.py": {
-    "D205": 1,
-    "D212": 1
-  },
   "tests/integration/defs/accuracy/test_disaggregated_serving.py": {
     "D212": 1,
     "F601": 1
-  },
-  "tests/integration/defs/accuracy/test_llm_api_autodeploy.py": {
-    "D205": 1,
-    "D209": 1,
-    "D415": 1,
-    "F811": 2
   },
   "tests/integration/defs/accuracy/test_llm_api_pytorch.py": {
     "D212": 1,
@@ -1159,16 +1042,6 @@
     "E741": 2,
     "F811": 1
   },
-  "tests/integration/defs/test_mlpf_results.py": {
-    "D200": 1,
-    "D205": 1,
-    "D208": 4,
-    "D212": 2,
-    "D415": 2
-  },
-  "tests/integration/defs/triton_server/common.py": {
-    "E402": 1
-  },
   "tests/integration/defs/triton_server/conftest.py": {
     "D200": 3,
     "D202": 1,
@@ -1215,16 +1088,6 @@
   "tests/integration/defs/utils/timeout_manager.py": {
     "D212": 9
   },
-  "tests/microbenchmarks/build_time_benchmark.py": {
-    "D200": 1,
-    "D300": 1,
-    "D415": 1
-  },
-  "tests/microbenchmarks/build_time_dashboard.py": {
-    "D200": 1,
-    "D300": 1,
-    "D415": 1
-  },
   "tests/scripts/allreduce_perf/allreduce_heuristic_code_gen.py": {
     "D212": 1,
     "E712": 1
@@ -1243,13 +1106,6 @@
   },
   "tests/unittest/bindings/test_bindings_moe.py": {
     "D415": 6
-  },
-  "tests/unittest/bindings/test_executor_bindings.py": {
-    "D202": 1,
-    "E712": 54,
-    "F403": 2,
-    "F405": 3,
-    "F811": 1
   },
   "tests/unittest/conftest.py": {
     "D200": 3,
@@ -1329,10 +1185,6 @@
     "D205": 1,
     "D212": 1
   },
-  "tests/unittest/llmapi/test_llm_utils.py": {
-    "F403": 2,
-    "F405": 14
-  },
   "tests/unittest/llmapi/test_mpi_session.py": {
     "D200": 1,
     "D212": 1,
@@ -1344,12 +1196,6 @@
   },
   "tests/unittest/others/test_kv_cache_transceiver.py": {
     "D212": 1
-  },
-  "tests/unittest/others/test_leak.py": {
-    "D200": 1,
-    "D210": 1,
-    "D300": 1,
-    "D415": 1
   },
   "tests/unittest/others/test_time_breakdown.py": {
     "D212": 1,
