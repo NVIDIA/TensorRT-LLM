@@ -28,19 +28,9 @@ def _parent_is_pytest():
 
 
 def _is_dependency_build_process():
-    """Return True for pip / setuptools / native build-tool processes.
-
-    Tests that build third-party deps at runtime (e.g. the verl fixture's
-    ``python setup.py install`` for DeepEP) spawn these via ``subprocess`` with the
-    parent env, so they inherit ``CBTS_COVERAGE_CONFIG`` and import this file. They
-    fork their own build subprocesses, where the background-save threads started
-    below can cause fork-with-threads deadlocks, and they hold no product source to
-    cover. Detect them so the whole build subtree opts out.
-    """
+    """Return True for pip / setuptools / native build-tool processes, which opt the subtree out."""
     argv = getattr(sys, "orig_argv", sys.argv) or [""]
-    # Scan every token's basename: shebang launches put the tool in argv[1]
-    # (e.g. ["python3", "/usr/local/bin/pip", "install", ...]), bare launches in
-    # argv[0] (["pip", "install", ...]), and "python setup.py" in argv[1:].
+    # Scan each token's basename: the tool may be in argv[0] (bare) or argv[1] (shebang / setup.py).
     tools = {"pip", "pip3", "cmake", "ninja", "ninja-build", "meson"}
     for a in argv:
         base = os.path.basename(a or "").lower()
@@ -50,8 +40,7 @@ def _is_dependency_build_process():
     return any(n in joined for n in ("-m pip", "-m build", "_in_process", "pyproject_hooks"))
 
 
-# Dependency build/install tooling must not be instrumented. Drop the gate var so
-# this process -- and everything it spawns, which inherits the env -- opts out.
+# Drop the gate var so build tooling and everything it spawns opts out of instrumentation.
 if os.getenv("CBTS_COVERAGE_CONFIG") and _is_dependency_build_process():
     os.environ.pop("CBTS_COVERAGE_CONFIG", None)
 
@@ -66,9 +55,7 @@ if os.getenv("CBTS_COVERAGE_CONFIG"):
 
     _CONFIG = os.getenv("CBTS_COVERAGE_CONFIG")
 
-    # The rendered rcfile carries the two things the tracker needs:
-    #   [run] source    -> product roots (PY_START attributes only functions under these)
-    #   [run] data_file -> <dir>/.coverage.<stage>; the dir and stage name are derived from it
+    # Read [run] source (product roots) and data_file (dir + stage name) from the rendered rcfile.
     def _read_config(path):
         cp = configparser.ConfigParser()
         try:
@@ -116,15 +103,11 @@ if os.getenv("CBTS_COVERAGE_CONFIG"):
     _orig_argv = getattr(sys, "orig_argv", sys.argv)
     _is_pytest_main = any("pytest" in a for a in _orig_argv[:4])
     _is_nested_pytest = _parent_is_pytest() and _is_pytest_main
-    # MpiPoolSession spawns each executor worker via `python -m mpi4py.futures.server`.
-    # A worker serves a single test, so it relies on the inherited CBTS_TEST_ID context
-    # and the atexit save and runs no background daemons during the test.
+    # mpi4py.futures pool workers serve one test via the inherited CBTS_TEST_ID and the atexit save; no daemons.
     _is_mpi_pool_worker = any("mpi4py.futures" in a for a in _orig_argv)
     _skip_daemons = _is_pytest_main or _is_mpi_pool_worker
 
-    # Inner pytests and worker processes carry the current nodeid via CBTS_TEST_ID; the outer
-    # pytest re-switches per test via the plugin. An inner unittest pytest carries no plugin, so
-    # its whole batch stays under the one inherited context -- exactly the test-db entry granularity.
+    # Subprocesses inherit the current nodeid via CBTS_TEST_ID; the outer pytest re-switches per test via the plugin.
     _initial_nodeid = os.environ.get("CBTS_TEST_ID", "").strip()
     if _initial_nodeid:
         switch_test_context(_initial_nodeid)
@@ -144,16 +127,9 @@ if os.getenv("CBTS_COVERAGE_CONFIG"):
     if not _skip_daemons:
 
         def _watch_mpi_session():
-            # Every import is deferred until the host has itself imported the target
-            # modules, so this daemon never runs a heavy or concurrent import during the
-            # host process's own startup import phase -- a background import that races the
-            # main thread's imports can hand it a partially-initialized module and crash it
-            # (e.g. NameError during huggingface_hub import).
+            # Wait until the host has imported the target modules so this daemon triggers no racing import.
             while not _stop_event.is_set():
                 mod = sys.modules.get("tensorrt_llm.llmapi.mpi_session")
-                # Act only once the host has fully loaded the session module (with
-                # MpiPoolSession) AND mpi4py.futures, so the patch touches only
-                # already-imported modules and triggers no fresh import here.
                 if (
                     mod is not None
                     and hasattr(mod, "MpiPoolSession")
@@ -196,8 +172,7 @@ if os.getenv("CBTS_COVERAGE_CONFIG"):
                     with open(_MARKER_FILE) as f:
                         nodeid = f.read().strip()
                     if nodeid and nodeid != last_seen:
-                        # Long-lived non-pytest processes (e.g. trtllm-serve) switch
-                        # test context when the marker file changes.
+                        # Long-lived non-pytest processes (e.g. trtllm-serve) switch context on marker change.
                         switch_test_context(nodeid)
                         last_seen = nodeid
                 except (FileNotFoundError, OSError):

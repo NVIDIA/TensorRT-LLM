@@ -11,13 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Function/class-level per-test coverage tracker via sys.monitoring PY_START (Python 3.12+).
-
-Records, per test context, the set of product functions (file + qualname) each test entered.
-Overhead is proportional to the number of functions a test enters (each fires once, then the
-code object's PY_START is DISABLEd until the next test's restart_events()), so it is far cheaper
-than per-line tracing. Uses a dedicated monitoring tool id, so it coexists with coverage.py.
-"""
+"""Function/class-level per-test coverage tracker via sys.monitoring PY_START (Python 3.12+)."""
 
 import os
 import secrets
@@ -30,7 +24,7 @@ _DEFAULT_TOOL_ID = int(os.environ.get("CBTS_PYSTART_TOOL_ID", "4"))
 
 
 class PyStartTracker:
-    """Per-process tracker; one JSON data file per process, merged (unioned) downstream."""
+    """Per-process tracker; one SQLite data file per process, merged (unioned) downstream."""
 
     def __init__(self, source_roots, data_dir, stage="stage", tool_id=_DEFAULT_TOOL_ID):
         self.source_roots = tuple(os.path.abspath(p).rstrip("/") + "/" for p in source_roots if p)
@@ -55,9 +49,7 @@ class PyStartTracker:
             return False
         return os.path.abspath(filename).startswith(self.source_roots)
 
-    # Synthetic frames (comprehensions / generator expressions / lambdas) carry no useful
-    # function/class identity for change-impact; skip them but keep real functions, methods,
-    # and module bodies (module bodies preserve file-level "imported/executed" signal).
+    # Skip synthetic comprehension / genexpr / lambda frames; keep real functions, methods, module bodies.
     _SKIP_QUALNAMES = frozenset(("<genexpr>", "<listcomp>", "<setcomp>", "<dictcomp>", "<lambda>"))
 
     def _on_py_start(self, code, offset):
@@ -115,10 +107,7 @@ class PyStartTracker:
             _MON.restart_events()
 
     def save(self):
-        # Write a per-process SQLite that the downstream merge attaches and reads directly. These
-        # files leave the node only inside a compressed tarball, so the publish-artifacts guardword
-        # scanner (which byte-matches product paths in raw files but does not recurse into archives)
-        # never sees the paths and qualnames stored here as plaintext TEXT columns.
+        # Write a per-process SQLite the downstream merge reads directly; uploaded compressed only.
         snap = self._data.copy()  # atomic shallow copy; each set snapshotted below
         if not snap:
             return None

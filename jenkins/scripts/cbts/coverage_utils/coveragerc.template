@@ -1,7 +1,4 @@
-# CBTS runtime config template, substituted by make_coveragerc.sh (or inline sed in the pipeline).
-# Only [run] source and data_file are consumed by sitecustomize.py's PY_START tracker:
-#   source    -> product roots to attribute (functions outside these are ignored)
-#   data_file -> <dir>/.coverage.<stage>; the tracker writes .cbtscov.<stage>.<suffix>.json into <dir>
+# CBTS runtime config template; only [run] source and data_file are consumed by sitecustomize.py.
 
 [run]
 source =

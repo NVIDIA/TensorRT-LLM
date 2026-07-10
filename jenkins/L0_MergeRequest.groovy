@@ -1237,13 +1237,12 @@ def collectTestResults(pipeline, testFilter, globalVars)
         }
         parallelTasks["Test Coverage"] = {
             try {
-            timeout(time: 30, unit: 'MINUTES') {
+            timeout(time: 10, unit: 'MINUTES') {
             try {
                 stage("Test Coverage") {
                     sh "ls"
                     sh "rm -rf cov && mkdir -p cov"
-                    // Gather the per-process PY_START data files (SQLite) that rode back inside each
-                    // stage's results tarball (under <stage>/cbts/). Batch moves avoid per-file fork/exec.
+                    // Collect the per-process PY_START data files from every stage's results tarball.
                     sh "find . -type f -name '.cbtscov.*.sqlite' -exec mv -t cov/ {} + || true"
                     sh "cd cov && ls -la"
                     def fileCount = sh(returnStdout: true, script: 'find cov -name ".cbtscov.*.sqlite" | wc -l').replaceAll("\\s","").toInteger()
@@ -1251,9 +1250,7 @@ def collectTestResults(pipeline, testFilter, globalVars)
                         echo "CBTS coverage skipped: no PY_START data files."
                         return
                     }
-                    // Merge all stages' data into: an indexed SQLite touch DB (the selector artifact),
-                    // a per-file split HTML report (each page small; the tree compresses well), and the
-                    // file/function coverage rate against the full tensorrt_llm/ source tree.
+                    // Merge into the indexed touch DB, a per-file HTML report, and the coverage rate.
                     sh """
                         python3 llm/jenkins/scripts/cbts/coverage_utils/pystart_report.py \
                             --glob 'cov/.cbtscov.*.sqlite' \
@@ -1261,10 +1258,7 @@ def collectTestResults(pipeline, testFilter, globalVars)
                             --out-dir cov/cbts_report \
                             --source-root llm/tensorrt_llm
                     """
-                    // Bundle the selector DB and the many-small-pages HTML report into one tarball.
-                    // The DB stores product file paths and qualnames as plaintext TEXT columns; the
-                    // publish-artifacts guardword scanner byte-matches product codenames in raw files
-                    // but does not recurse into archives, so upload both compressed, never raw.
+                    // Upload compressed only: the guardword scanner byte-matches raw files but not archives.
                     sh "cd cov && tar czf cbts_pystart_report.tar.gz cbts_touchmap.sqlite cbts_report"
                     trtllm_utils.uploadArtifacts("cov/cbts_pystart_report.tar.gz", "${UPLOAD_PATH}/cbts-coverage/")
                     echo "CBTS coverage (touch DB + report): https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/cbts-coverage/cbts_pystart_report.tar.gz"
@@ -1278,7 +1272,7 @@ def collectTestResults(pipeline, testFilter, globalVars)
             {
                 pipeline.echo("Test coverage failed execution.")
             }
-            } // timeout 30 min
+            } // timeout 10 min
             } catch (Exception e) {
                 echo "Test Coverage failed or timed out: ${e.toString()}"
             }

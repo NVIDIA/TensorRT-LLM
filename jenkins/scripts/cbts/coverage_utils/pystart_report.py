@@ -11,20 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Merge per-process CBTS PY_START data files into the CBTS touch artifacts.
-
-Reads all ``.cbtscov.*.sqlite`` files (each a ``touch(test, file, qualname)`` table; legacy
-``.json`` / ``.json.gz`` are also accepted) and unions them. The merge is streamed straight into
-the output SQLite (dedup done on disk via a UNIQUE index, one input file's rows in memory at a
-time) so peak memory stays bounded even for a full run of thousands of per-process files. Emits
-any of:
-  --out-sqlite : indexed ``touch(test, file, qualname)`` DB -- the machine-readable artifact the
-                 selector queries ("which tests touch file/function X"); single file, scales.
-  --out-dir    : a browsable HTML report split by source file (index + one page per file), so no
-                 single page is large and the whole tree compresses well.
-  --out-json   : the full per-test -> [file::qualname] map (streamed from the merged DB).
-stdlib-only; also prints a one-line touch-count summary (+ coverage rate when --source-root given).
-"""
+"""Merge per-process CBTS PY_START data files (streamed, deduped) into the touch DB / HTML report / JSON map."""
 
 import argparse
 import ast
@@ -94,12 +81,7 @@ def merge_to_sqlite(pattern, out_path):
 
 
 def enumerate_defs(source_root):
-    """Enumerate the static coverage-rate denominator from the product source tree.
-
-    Every product .py file and every top-level function / method defined in it (nested /
-    comprehension frames are excluded to match what the PY_START tracker records).
-    Returns (set(coverable_files), set((file, qualname))).
-    """
+    """Return (coverable_files, funcs) for the coverage-rate denominator, matching what the tracker records."""
     funcs = set()
     for dirpath, _dirs, names in os.walk(source_root):
         for nm in names:

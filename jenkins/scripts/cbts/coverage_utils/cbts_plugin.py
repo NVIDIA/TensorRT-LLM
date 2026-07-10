@@ -80,12 +80,7 @@ def _switch_test_context(nodeid):
         switch(nodeid)
 
 
-# The pytest hooks below are only meaningful when this module is loaded as a pytest
-# plugin, and at that point pytest is already imported. Importing pytest at module
-# scope would otherwise drag its large module graph into any process that imports this
-# module solely for ``install_mpi_pool_patch`` (e.g. the sitecustomize daemon in a plain
-# CLI such as trtllm-bench), where a heavy import on a background thread races the host's
-# own startup imports and can crash it. Bind pytest only when it is already loaded.
+# Bind pytest only when already loaded, so importing this module for install_mpi_pool_patch stays cheap.
 if "pytest" in sys.modules:
     import pytest
 

@@ -174,8 +174,7 @@ ENABLE_NGC_RELEASE_IMAGE_TEST = params.enableNgcReleaseImageTest ?: false
 
 COMMON_SSH_OPTIONS = "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o TCPKeepAlive=no -o ServerAliveInterval=30 -o ServerAliveCountMax=20"
 
-// CBTS coverage gate: cbts_plugin + sitecustomize per-test coverage on stages passing this gate, gated to post-merge pipelines via CBTS_PIPELINE_ELIGIBLE.
-// Phase 1: single-GPU stages only; multi-GPU / multi-node stages are disabled and enabled incrementally later.
+// CBTS per-test coverage gate; active on every pipeline, single-GPU stages only in Phase 1.
 ENABLE_CBTS_COVERAGE = true
 CBTS_EXCLUDE_STAGES = [] as Set
 // Reassigned in the Setup Environment stage once testFilter is populated.
@@ -192,14 +191,11 @@ def isCbtsStage(String stageName) {
     if (stageName.contains("Perf")) {
         return false
     }
-    // Skip legacy / non-Python-coverage backends: TensorRT is legacy (features target PyTorch/AutoDeploy),
-    // and CPP stages run C++ gtest binaries that produce no product Python coverage.
-    // AutoDeploy stages are moving out of L0 CI, so they no longer need coverage.
+    // Skip stages with no product Python coverage: TensorRT (legacy), CPP (gtest), AutoDeploy (leaving L0).
     if (stageName.contains("TensorRT") || stageName.contains("CPP") || stageName.contains("AutoDeploy")) {
         return false
     }
-    // Phase 1: single-GPU stages only. Multi-GPU / multi-node stages (named with the
-    // "-<N>_GPUs" or "-<N>_Nodes" tokens) are disabled for now and enabled incrementally later.
+    // Phase 1: single-GPU only; multi-GPU / multi-node stages carry the "_GPUs" / "_Nodes" token.
     if (stageName.contains("_GPUs") || stageName.contains("_Nodes")) {
         return false
     }
@@ -280,12 +276,7 @@ def uploadResults(def pipeline, SlurmCluster cluster, String clusterName, String
                 downloadPerfResultSucceed = Utils.exec(pipeline, script: scpFromRemoteCmd(remote, scpSources, "${stageName}/"), returnStatus: true, numRetries: 3) == 0
             }
 
-            // CBTS: bundle the per-process .cbtscov.<stage>*.json files (one per worker/server
-            // process) into a single archive on the login node, transfer that one file, and unpack
-            // it into ${stageName}/cbts/ to ride along in results-<stage>.tar.gz. A glob scp of the
-            // individual files is dominated by per-file round trips and can exceed this stage's
-            // timeout; one compressed stream transfers in seconds. The pull is bounded and non-fatal
-            // so a slow or empty coverage set never aborts a stage whose tests already passed.
+            // Pull this stage's per-process .cbtscov files as one archive into ${stageName}/cbts/; bounded and non-fatal.
             if (isCbtsStage(stageName)) {
                 def remoteWs = "/home/svc_tensorrt/bloom/scripts/${nodeName}"
                 def cbtsLocalDir = "${stageName}/cbts"
@@ -293,8 +284,7 @@ def uploadResults(def pipeline, SlurmCluster cluster, String clusterName, String
                 sh "mkdir -p ${cbtsLocalDir}"
                 try {
                     timeout(time: 5, unit: 'MINUTES') {
-                        // Pack on the login node; remove any partial archive when no
-                        // coverage files match so the scp below fails cleanly.
+                        // Pack on the login node; drop a partial archive when nothing matches so the scp fails cleanly.
                         Utils.exec(
                             pipeline,
                             script: Utils.sshUserCmd(
@@ -1379,7 +1369,6 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     sh """
                         cp ${llmSrcLocal}/jenkins/scripts/cbts/coverage_utils/coveragerc.template ./.coveragerc
                         sed -i \\
-                            -e 's|@TRTLLM_SRC_PATH@|${llmSrcNode}|g' \\
                             -e 's|@JOB_WORKSPACE@|${jobWorkspace}|g' \\
                             -e 's|@STAGE_NAME@|${stageName}|g' \\
                             ./.coveragerc
@@ -3870,12 +3859,11 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         sh "mkdir -p ${llmSrc}/${stageName} && touch ${coverageConfigFile}"
         // CBTS stages render coveragerc.template; all other stages leave the rcfile empty (no coverage). Keep in sync with the SLURM branch.
         if (isCbtsStage(stageName)) {
-            // K8s runner knows TRTLLM_WHL_PATH here, so all four placeholders are substituted at controller time (no worker-side sed).
+            // K8s runner knows TRTLLM_WHL_PATH here, so all placeholders are substituted at controller time (no worker-side sed).
             sh """
                 cp ${llmSrc}/jenkins/scripts/cbts/coverage_utils/coveragerc.template ${coverageConfigFile}
                 sed -i \\
                     -e 's|@TRTLLM_WHEEL_PATH@|${TRTLLM_WHL_PATH}|g' \\
-                    -e 's|@TRTLLM_SRC_PATH@|${llmSrc}|g' \\
                     -e 's|@JOB_WORKSPACE@|${WORKSPACE}/${stageName}|g' \\
                     -e 's|@STAGE_NAME@|${stageName}|g' \\
                     ${coverageConfigFile}
