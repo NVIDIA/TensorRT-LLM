@@ -207,45 +207,68 @@ class CuteDslMlaFmha(PhasedFmha):
             forward_args,
         )
         if not supported:
-            logger.debug(f"CuTe DSL MLA FMHA does not support request: {reason}")
+            # info_once keyed on the reason text (which embeds the offending
+            # shape), so each distinct reject cause is visible in default logs
+            # exactly once per process instead of flooding every dispatch.
+            logger.info_once(
+                f"CuTe DSL MLA FMHA does not support request: {reason}", key=reason
+            )
         return supported
+
+    # Minimum per-rank decode batch size at which the CuteDSL kernel beats the
+    # default TRTLLM path, keyed by (num_heads, seq_len_q). Derived from a
+    # layer-wise DeepSeek-V3 A/B sweep (8xB200, fp8 KV, CUDA graph; MLA-module
+    # time across KV in {1024, 2048, 8192}): the threshold is the smallest
+    # batch whose row -- and every larger batch -- is at or above parity in
+    # ALL KV columns. (16, 1) is absent because it has no such region: it is
+    # non-monotonic (batch 64 wins but 128/256 regress).
+    # (128, 1) is set below its strict-parity batch (64): the 1-2% module
+    # dips at batch 8-32 are measurement noise (the kernel itself is at or
+    # above parity from batch 8 up), and an end-to-end A/B that admitted
+    # (128, 1) at every batch measured a net +1.5% win.
+    # For H=16 the thresholds line up with batch*seq_len_q >= 128, i.e. enough
+    # rows to fill the kernel's M-tile of 128; H=128 fills the tile at any
+    # batch, so its small-batch losses (and threshold) come from parallelism,
+    # not tile occupancy.
+    _PERF_MIN_BATCH = {
+        (16, 2): 64,
+        (16, 4): 32,
+        (16, 8): 16,
+        (128, 1): 8,
+        (128, 2): 32,
+        (128, 4): 32,
+        (128, 8): 16,
+    }
 
     @staticmethod
     def _is_perf_favorable(
-        num_heads: int, seq_len_q: int, predicted_tokens_per_seq: int
+        num_heads: int, batch_size: int, seq_len_q: int, predicted_tokens_per_seq: int
     ) -> tuple[bool, str]:
-        """Perf-only allowlist, separate from the correctness checks: admit
-        just the (num_heads, seq_len_q) shapes where CuteDSL decode is an
-        end-to-end win over the default backend.
-
-        Shapes where the CuTe DSL decode kernel BEATS the default TRTLLM path
-        end-to-end (DeepSeek-V3 8xB200 TP=8/EP=8 A/B, ISL1024/OSL2048):
-          H=16  (TP=8, attention-DP off): seq_len_q=2 +1.0%, seq_len_q=4 +2.2%
-          H=128 (attention-DP on)       : seq_len_q=1 +1.5%
-        Every other measured cell is at or below parity, so the gate admits
-        only the winning shapes and lets everything else fall back to the next
+        """Perf-only gate, separate from the correctness checks: admit a
+        (num_heads, seq_len_q) shape only above its measured critical batch
+        size (``_PERF_MIN_BATCH``); everything else falls back to the next
         FMHA library.
 
         The (128, 1) entry additionally requires spec-decode OFF
         (``predicted_tokens_per_seq == 1``): with MTP enabled, seq_len_q == 1
-        requests are the draft-step forwards, whose tiny effective batch makes
-        CuteDSL a net E2E loss (ADP+MTP3 measured about -13%), while the
-        allowlisted win was measured on the MTP-off main decode."""
-        if (num_heads, seq_len_q) in ((16, 2), (16, 4)):
-            return True, ""
-        if (num_heads, seq_len_q) == (128, 1):
-            if predicted_tokens_per_seq == 1:
-                return True, ""
+        requests are the draft-step forwards, which are a steady-state E2E
+        loss (ADP+MTP3 measured about -13%) even at batch sizes where the
+        MTP-off main decode wins."""
+        min_batch = CuteDslMlaFmha._PERF_MIN_BATCH.get((num_heads, seq_len_q))
+        if min_batch is None:
             return False, (
-                "CuTe DSL MLA decode (128, 1) is only a perf win without "
-                "spec-decode; got predicted_tokens_per_seq="
-                f"{predicted_tokens_per_seq} (draft-step forward)."
+                f"CuTe DSL MLA decode is not a perf win for "
+                f"num_heads={num_heads}, seq_len_q={seq_len_q}; allowed "
+                f"(num_heads, seq_len_q): "
+                f"{sorted(CuteDslMlaFmha._PERF_MIN_BATCH)}."
             )
-        return False, (
-            f"CuTe DSL MLA decode is not a perf win for num_heads={num_heads}, "
-            f"seq_len_q={seq_len_q}; allowed (num_heads, seq_len_q): "
-            "[(16, 2), (16, 4), (128, 1)]."
-        )
+        if batch_size < min_batch:
+            return False, (
+                f"CuTe DSL MLA decode wins for num_heads={num_heads}, "
+                f"seq_len_q={seq_len_q} only at batch_size >= {min_batch}; "
+                f"got batch_size={batch_size}."
+            )
+        return True, ""
 
     def _is_supported_with_reason(
         self,
@@ -293,13 +316,22 @@ class CuteDslMlaFmha(PhasedFmha):
         seq_len_q = q.shape[0] // meta.num_generations
         if seq_len_q < 1:
             return False, f"Query length must be >= 1, got {seq_len_q}."
+        batch_size = meta.num_generations
         # Perf gate (NOT a correctness limit): only admit shapes where CuteDSL
-        # beats the default path E2E; everything else falls back.
-        favorable, reason = self._is_perf_favorable(
-            attn.num_heads, seq_len_q, attn.predicted_tokens_per_seq
-        )
-        if not favorable:
-            return False, reason
+        # beats the default path E2E; everything else falls back. Skipped
+        # entirely while the AutoTuner is tuning: the autotuner warmup's
+        # generation forward carries a single request (batch 1), which every
+        # batch floor would reject, yet it must reach the CuteDSL op so the
+        # op's max-batch bucket ladder gets profiled. Runtime dispatch
+        # (tuning mode off) honors the gate as usual.
+        from tensorrt_llm._torch.autotuner import AutoTuner
+
+        if not AutoTuner.get().is_tuning_mode:
+            favorable, reason = self._is_perf_favorable(
+                attn.num_heads, batch_size, seq_len_q, attn.predicted_tokens_per_seq
+            )
+            if not favorable:
+                return False, reason
         if meta.kv_cache_block_offsets is None:
             return False, "Paged KV block offsets are required."
         if meta.kv_cache_manager is None:
@@ -509,6 +541,8 @@ class CuteDslMlaFmha(PhasedFmha):
             page_size,
             softmax_scale,
             output_scale,
+            # Max batch size for the AutoTuner to profile.
+            int(meta.max_num_requests),
         )
 
     def run_mla_generation(
