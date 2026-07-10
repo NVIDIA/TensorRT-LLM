@@ -323,27 +323,12 @@ class Qwen3ForEmbedding(Qwen3ForCausalLM):
     ) -> torch.Tensor:
         """Extract the last token's hidden state for each sequence.
 
-        Handles mixed batches where context (prefill) and generation
-        (decode) requests are scheduled together.
+        Uses the same cumsum pattern as LogitsProcessor to remain
+        compatible with piecewise CUDA graph capture.
         """
-        pieces = []
-        num_contexts = attn_metadata.num_contexts
-
-        if num_contexts > 0:
-            context_lens = attn_metadata.seq_lens_cuda[:num_contexts]
-            last_indices = torch.cumsum(context_lens, dim=0) - 1
-            pieces.append(hidden_states.index_select(0, last_indices))
-            num_ctx_tokens = attn_metadata.num_ctx_tokens
-        else:
-            num_ctx_tokens = 0
-
-        # Generation tokens (one per decode request) follow context tokens.
-        if hidden_states.shape[0] > num_ctx_tokens:
-            pieces.append(hidden_states[num_ctx_tokens:])
-
-        if not pieces:
-            return hidden_states.new_empty((0, hidden_states.shape[-1]))
-        return torch.cat(pieces, dim=0).contiguous()
+        last_indices = torch.cumsum(
+            attn_metadata.seq_lens_cuda, dim=0, dtype=torch.long) - 1
+        return hidden_states.index_select(0, last_indices)
 
     def forward(
         self,
