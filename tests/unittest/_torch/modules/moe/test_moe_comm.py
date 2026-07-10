@@ -267,6 +267,7 @@ def _run_nvlink_rank_mask_dispatch(
     token_selected_experts: torch.Tensor,
     payload: torch.Tensor,
     runtime_max_tokens_per_rank: int,
+    enable_rank_mask: bool,
     active_rank_mask: Optional[torch.Tensor],
 ) -> Tuple[List[torch.Tensor], int, torch.Tensor, torch.Tensor]:
     """Run raw NVLink one-sided dispatch with an optional active rank mask."""
@@ -281,6 +282,7 @@ def _run_nvlink_rank_mask_dispatch(
         comm.top_k,
         comm.num_experts,
         None,  # eplb_local_stats
+        enable_rank_mask,
         active_rank_mask,
     )
 
@@ -303,6 +305,7 @@ def _run_nvlink_rank_mask_combine(
     local_num_tokens: int,
     runtime_max_tokens_per_rank: int,
     combine_payload_offset: int,
+    enable_rank_mask: bool,
     active_rank_mask: Optional[torch.Tensor],
 ) -> torch.Tensor:
     """Run raw NVLink one-sided combine with an optional active rank mask."""
@@ -318,6 +321,7 @@ def _run_nvlink_rank_mask_combine(
         combine_payload_offset,
         False,  # payload_in_workspace
         False,  # use_low_precision
+        enable_rank_mask,
         active_rank_mask,
     )
 
@@ -327,6 +331,7 @@ def _run_nvlink_rank_mask_dispatch_combine(
     token_selected_experts: torch.Tensor,
     payload: torch.Tensor,
     runtime_max_tokens_per_rank: int,
+    enable_rank_mask: bool,
     active_rank_mask: Optional[torch.Tensor],
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Run raw NVLink one-sided dispatch/combine with an optional active rank mask."""
@@ -336,6 +341,7 @@ def _run_nvlink_rank_mask_dispatch_combine(
             token_selected_experts,
             payload,
             runtime_max_tokens_per_rank,
+            enable_rank_mask,
             active_rank_mask,
         )
     )
@@ -345,6 +351,7 @@ def _run_nvlink_rank_mask_dispatch_combine(
         token_selected_experts.size(0),
         runtime_max_tokens_per_rank,
         combine_payload_offset,
+        enable_rank_mask,
         active_rank_mask,
     )
     return combined.cpu(), topk_target_ranks, topk_send_indices
@@ -1209,12 +1216,33 @@ def _worker_rank_mask_all_active_matches_no_mask(config: CommTestConfig) -> dict
             device="cuda",
         )
         payload = _make_rank_mask_payload(local_num_tokens, config.hidden_size, rank)
+        all_active_mask = _ep_mask_words(config.ep_size, dead_ranks=set())
+
+        with pytest.raises(RuntimeError, match="requires enable_rank_mask"):
+            _run_nvlink_rank_mask_dispatch(
+                comm,
+                token_selected_experts,
+                payload,
+                local_num_tokens,
+                enable_rank_mask=False,
+                active_rank_mask=all_active_mask,
+            )
+        with pytest.raises(RuntimeError, match="active_rank_mask must be defined"):
+            _run_nvlink_rank_mask_dispatch(
+                comm,
+                token_selected_experts,
+                payload,
+                local_num_tokens,
+                enable_rank_mask=True,
+                active_rank_mask=None,
+            )
 
         out_no_mask, topk_no_mask, _ = _run_nvlink_rank_mask_dispatch_combine(
             comm,
             token_selected_experts,
             payload,
             local_num_tokens,
+            enable_rank_mask=False,
             active_rank_mask=None,
         )
         out_all_active, topk_all_active, _ = _run_nvlink_rank_mask_dispatch_combine(
@@ -1222,7 +1250,8 @@ def _worker_rank_mask_all_active_matches_no_mask(config: CommTestConfig) -> dict
             token_selected_experts,
             payload,
             local_num_tokens,
-            active_rank_mask=_ep_mask_words(config.ep_size, dead_ranks=set()),
+            enable_rank_mask=True,
+            active_rank_mask=all_active_mask,
         )
 
         return {
@@ -1257,7 +1286,7 @@ def _worker_rank_mask_one_rank_masked(
     config: CommTestConfig,
     dead_rank: int,
 ) -> dict:
-    """Run with one peer masked after routing only to surviving ranks."""
+    """Verify masked-route rejection, then run with survivor-only routing."""
     rank = tllm.mpi_rank()
     torch.cuda.set_device(rank)
 
@@ -1279,6 +1308,27 @@ def _worker_rank_mask_one_rank_masked(
 
         local_num_tokens = config.all_num_tokens[rank]
         torch.manual_seed(0xA2A + rank)
+        mask = _ep_mask_words(config.ep_size, dead_ranks={dead_rank})
+        dead_expert_id = next(
+            expert_id
+            for expert_id in range(config.num_experts)
+            if _expert_id_to_rank(expert_id, config.num_experts, config.ep_size) == dead_rank
+        )
+        masked_routes = torch.full(
+            (local_num_tokens, config.top_k),
+            dead_expert_id,
+            dtype=torch.int32,
+            device="cuda",
+        )
+        _, _, masked_target_ranks, masked_send_indices = _run_nvlink_rank_mask_dispatch(
+            comm,
+            masked_routes,
+            _make_rank_mask_payload(local_num_tokens, config.hidden_size, rank),
+            local_num_tokens,
+            enable_rank_mask=True,
+            active_rank_mask=mask,
+        )
+
         live_expert_ids = torch.tensor(
             [
                 expert_id
@@ -1297,13 +1347,13 @@ def _worker_rank_mask_one_rank_masked(
         )
         token_selected_experts = live_expert_ids[live_expert_indices]
         payload = _make_rank_mask_payload(local_num_tokens, config.hidden_size, rank)
-        mask = _ep_mask_words(config.ep_size, dead_ranks={dead_rank})
 
         combined, topk_target_ranks, topk_send_indices = _run_nvlink_rank_mask_dispatch_combine(
             comm,
             token_selected_experts,
             payload,
             local_num_tokens,
+            enable_rank_mask=True,
             active_rank_mask=mask,
         )
         expected_target_ranks = _expected_target_ranks(
@@ -1324,6 +1374,8 @@ def _worker_rank_mask_one_rank_masked(
         return {
             "rank": rank,
             "status": "alive",
+            "masked_target_ranks": masked_target_ranks[:local_num_tokens],
+            "masked_send_indices": masked_send_indices[:local_num_tokens],
             "combined": combined,
             "expected": expected,
             "topk_target_ranks": topk_target_ranks,
@@ -2312,6 +2364,12 @@ def _run_rank_mask_one_rank_masked_test(
             continue
 
         assert result["status"] == "alive"
+        assert torch.all(result["masked_target_ranks"] == -1), (
+            f"rank {rank}: dispatch retained a route to masked rank {dead_rank}"
+        )
+        assert torch.all(result["masked_send_indices"] == -1), (
+            f"rank {rank}: dispatch allocated a send slot for masked rank {dead_rank}"
+        )
         combined = result["combined"]
         expected = result["expected"]
         topk_target_ranks = result["topk_target_ranks"]

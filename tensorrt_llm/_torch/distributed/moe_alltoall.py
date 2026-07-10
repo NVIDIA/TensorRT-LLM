@@ -19,7 +19,7 @@ from tensorrt_llm._torch.alltoall_watchdog import (
     DEFAULT_ALLTOALL_WATCHDOG_POLL_INTERVAL_S,
     DEFAULT_ALLTOALL_WATCHDOG_TIMEOUT_S, ActiveRankMaskSnapshot,
     AlltoAllWatchdog, AlltoAllWatchdogCoordinator, AlltoAllWatchdogTimeout,
-    EPGroupHealthLike)
+    EPGroupHealthLike, reject_rank_mask_cuda_graph_capture)
 from tensorrt_llm.bindings import internal as _tllm_internal
 from tensorrt_llm.logger import logger as tllm_logger
 from tensorrt_llm.mapping import Mapping
@@ -153,7 +153,7 @@ class MoeAlltoAll:
                 Note: The terminology is mapped to `eplb_stats_num_experts` in this class and the kernels.
             ep_group_health: Optional read-only committed EP membership. When present, rank-mask handling is
                 enabled in the CUDA kernels, and its mask defines the peers expected by the watchdog. Timeout
-                detection never mutates it.
+                detection never mutates it. CUDA graphs are rejected until membership-scoped recapture lands.
             alltoall_watchdog_timeout_s: Optional timeout for the host-side AlltoAll watchdog. If None, the
                 watchdog is disabled.
             alltoall_watchdog_poll_interval_s: Poll interval for the watchdog thread.
@@ -296,13 +296,14 @@ class MoeAlltoAll:
             eplb_local_stats: (Optional) [num_experts] tensor containing local statistics for EPLB
             active_rank_mask: Optional uint64 CPU tensor overriding committed membership in rank-mask mode. When
                 omitted, the committed mask and generation are captured together. Combine reuses that mask and
-                fails closed if the committed generation changes first. Routing must exclude inactive ranks
-                before dispatch; the kernel does not rewrite those routes.
+                fails closed if the committed generation changes first. The masked kernel rejects inactive routes
+                before remote access; that sentinel is an internal abort artifact, not valid model output.
 
         Returns:
             recv_tensors: List of tensors received, each has shape [ep_size, max_tokens_per_rank, payload_num_elements_per_token]
         """
         assert self._state.phase == "idle", "dispatch called twice without an intervening combine"
+        reject_rank_mask_cuda_graph_capture(self._rank_mask_enabled)
         assert runtime_max_tokens_per_rank <= self.max_num_tokens, "runtime_max_tokens_per_rank must not exceed max_num_tokens"
         if eplb_local_stats is not None:
             assert self.enable_eplb, "eplb_local_stats provided but enable_eplb is False"
@@ -331,6 +332,7 @@ class MoeAlltoAll:
             self.top_k,
             self.num_experts,
             eplb_local_stats,
+            self._rank_mask_enabled,
             active_rank_mask,
         )
         self._watchdog_coordinator.watch_collective(self._alltoall_watchdog,
@@ -384,6 +386,7 @@ class MoeAlltoAll:
             combined_output: [local_num_tokens, num_elements_per_token] tensor of combined results
         """
         assert self._state.phase == "dispatched", "combine called before a successful dispatch"
+        reject_rank_mask_cuda_graph_capture(self._rank_mask_enabled)
         assert runtime_max_tokens_per_rank <= self.max_num_tokens, "runtime_max_tokens_per_rank must not exceed max_num_tokens"
 
         active_rank_mask_snapshot = self._state.active_rank_mask_snapshot
@@ -399,7 +402,8 @@ class MoeAlltoAll:
             payload, self._state.local_num_tokens, self.workspace,
             self.metainfo, runtime_max_tokens_per_rank, self.ep_rank,
             self.ep_size, self.top_k, self._state.combine_payload_offset,
-            payload_in_workspace, use_low_precision_combine, active_rank_mask)
+            payload_in_workspace, use_low_precision_combine,
+            self._rank_mask_enabled, active_rank_mask)
         self._watchdog_coordinator.watch_collective(self._alltoall_watchdog,
                                                     "combine", active_rank_mask)
 

@@ -213,15 +213,8 @@ __device__ __forceinline__ int compute_target_rank_id(int expert_id, int base, i
 // Test bit `rank` in a kRankMaskWords-wide little-endian uint64 bitmask.
 // Word 0 covers ranks 0..63, word 1 covers ranks 64..127, etc.
 // `rank >> 6` and `rank & 63` divide / modulo by 64.
-// The disabled specialization compiles to a constant so non-FT kernels do not
-// load or test the mask.
-template <bool ENABLE_RANK_MASK>
 __device__ __forceinline__ bool is_rank_active(uint64_t const* mask, int rank)
 {
-    if constexpr (!ENABLE_RANK_MASK)
-    {
-        return true;
-    }
     return (mask[rank >> 6] >> (rank & 63)) & 1ULL;
 }
 
@@ -447,12 +440,17 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
             // Supports the non-divisible case where num_experts % ep_size != 0.
             int target_rank = compute_target_rank_id(expert_id, ep_base, ep_remainder);
 
-            // Routing must already exclude inactive ranks. The rank mask only makes peer
-            // synchronization safe; it must not silently turn a missing route into model output.
             int const mask_word = target_rank >> 6;
             uint64_t const mask_bit = 1ULL << (target_rank & 63);
             bool const target_already_copied = (already_copied[mask_word] & mask_bit) != 0;
-            if (target_already_copied)
+            bool skip_target = target_already_copied;
+            if constexpr (ENABLE_RANK_MASK)
+            {
+                // This is a fail-closed safety guard until post-commit routing is enforced end to end.
+                // A masked route is not valid model output; the failed execution epoch must be discarded.
+                skip_target = skip_target || !is_rank_active(ptrs.active_rank_mask, target_rank);
+            }
+            if (skip_target)
             {
                 if (thread_idx == 0)
                 {
@@ -536,8 +534,11 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
 #pragma unroll 1 // No unroll as one iter is typically enough
             for (int target_rank = lane_id; target_rank < ep_size; target_rank += warpSize)
             {
-                if (!is_rank_active<ENABLE_RANK_MASK>(ptrs.active_rank_mask, target_rank))
-                    continue;
+                if constexpr (ENABLE_RANK_MASK)
+                {
+                    if (!is_rank_active(ptrs.active_rank_mask, target_rank))
+                        continue;
+                }
                 int send_count = ptrs.send_counters[target_rank];
                 ptrs.recv_counters[target_rank][rank_id] = send_count;
             }
@@ -549,8 +550,11 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
 #pragma unroll 1
                 for (int target_rank = 0; target_rank < ep_size; ++target_rank)
                 {
-                    if (!is_rank_active<ENABLE_RANK_MASK>(ptrs.active_rank_mask, target_rank))
-                        continue;
+                    if constexpr (ENABLE_RANK_MASK)
+                    {
+                        if (!is_rank_active(ptrs.active_rank_mask, target_rank))
+                            continue;
+                    }
                     int* target_stats = ptrs.eplb_gathered_stats[target_rank];
                     for (int expert_id = lane_id; expert_id < eplb_stats_num_experts; expert_id += warpSize)
                     {
@@ -574,8 +578,11 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
 #pragma unroll 1 // No unroll as one iter is typically enough
             for (int target_rank = lane_id; target_rank < ep_size; target_rank += warpSize)
             {
-                if (!is_rank_active<ENABLE_RANK_MASK>(ptrs.active_rank_mask, target_rank))
-                    continue;
+                if constexpr (ENABLE_RANK_MASK)
+                {
+                    if (!is_rank_active(ptrs.active_rank_mask, target_rank))
+                        continue;
+                }
                 uint32_t* flag_addr = &ptrs.completion_flags[target_rank][rank_id];
                 asm volatile("st.relaxed.sys.u32 [%0], %1;" ::"l"(flag_addr), "r"(expected_value));
 
@@ -590,8 +597,11 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
 #pragma unroll 1 // No unroll
             for (int peer_rank = lane_id; peer_rank < ep_size; peer_rank += warpSize)
             {
-                if (!is_rank_active<ENABLE_RANK_MASK>(ptrs.active_rank_mask, peer_rank))
-                    continue;
+                if constexpr (ENABLE_RANK_MASK)
+                {
+                    if (!is_rank_active(ptrs.active_rank_mask, peer_rank))
+                        continue;
+                }
                 bool flag_set = false;
                 auto s = clock64();
                 do
@@ -1207,8 +1217,11 @@ __global__ void moeA2ACombineKernel(
 #pragma unroll 1 // No unroll
             for (int peer_rank = lane_id; peer_rank < ep_size; peer_rank += warpSize)
             {
-                if (!is_rank_active<ENABLE_RANK_MASK>(ptrs.active_rank_mask, peer_rank))
-                    continue;
+                if constexpr (ENABLE_RANK_MASK)
+                {
+                    if (!is_rank_active(ptrs.active_rank_mask, peer_rank))
+                        continue;
+                }
                 uint32_t* flag_addr = &ptrs.completion_flags[peer_rank][rank_id];
                 asm volatile("st.relaxed.sys.u32 [%0], %1;" ::"l"(flag_addr), "r"(expected_value));
 #if ENABLE_DEBUG_PRINT
@@ -1223,8 +1236,11 @@ __global__ void moeA2ACombineKernel(
 #pragma unroll 1 // No unroll
         for (int peer_rank = lane_id; peer_rank < ep_size; peer_rank += warpSize)
         {
-            if (!is_rank_active<ENABLE_RANK_MASK>(ptrs.active_rank_mask, peer_rank))
-                continue;
+            if constexpr (ENABLE_RANK_MASK)
+            {
+                if (!is_rank_active(ptrs.active_rank_mask, peer_rank))
+                    continue;
+            }
             bool flag_set = false;
             auto s = clock64();
             do
