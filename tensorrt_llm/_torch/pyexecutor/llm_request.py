@@ -47,7 +47,7 @@ REQUEST_TYPE_MAPPING = {
 ATTENTION_DP_DUMMY_REQUEST_ID = 0
 
 if TYPE_CHECKING:
-    from .sampling_utils import Strategy
+    from .sampler.sampling_utils import Strategy
 
 
 @dataclass(slots=True)

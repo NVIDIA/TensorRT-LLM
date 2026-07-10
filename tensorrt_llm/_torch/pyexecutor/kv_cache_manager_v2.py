@@ -823,7 +823,11 @@ class KVCacheManagerV2(BaseResourceManager):
             # inf max_tokens means all layers are SWA and every rank quota can
             # fit all SWA fixed cache.
             if not math.isinf(max_tokens):
-                quota = self._get_quota_from_max_tokens(max_tokens)
+                # allreduce(MIN) must never increase the local quota. The
+                # token↔quota round-trip is not identity when SWA layers
+                # dominate (full_attn_size_per_token==0), so clamp to guard
+                # against a bogus inflation (nvbugs/6418103).
+                quota = min(quota, self._get_quota_from_max_tokens(max_tokens))
 
         logger.info(f"KV cache manager v2 device quota set to {quota / (1 << 30)}GiB")
 

@@ -11,6 +11,7 @@ from typing import Any, Callable, Dict, List, Optional, Union
 
 import safetensors.torch
 import torch
+import torch.distributed as dist
 
 from tensorrt_llm._torch.modules.linear import Linear, UnquantizedLinearMethod
 from tensorrt_llm._torch.visual_gen.cuda_graph_runner import CUDAGraphRunnerConfig
@@ -38,6 +39,7 @@ from .ltx2_core.types import (
 )
 from .ltx2_core.upsampler import LatentUpsamplerConfigurator, upsample_video
 from .ltx2_core.video_vae import TilingConfig
+from .parallel_vae import tile_parallel_decode
 from .pipeline_ltx2 import (
     LTX2Pipeline,
     _assert_resolution,
@@ -1229,8 +1231,123 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
             return timer.fill(PipelineOutput(video=None, audio=None, frame_rate=float(frame_rate)))
 
         # ================================================================
-        # Spatial upsample: 2x via learned upsampler
+        # Stage 2: spatial upsample + refinement denoise (rank-0 only)
         # ================================================================
+        # Only rank 0 refines; other vae_ranks skip Stage 2 and rejoin at the
+        # collective decode below, receiving the refined latents via broadcast.
+        if self.rank == 0:
+            video_latents, audio_latents = self._upsample_and_refine(
+                video_latents=video_latents,
+                audio_latents=audio_latents,
+                prompt=prompt,
+                height=height,
+                width=width,
+                num_frames=num_frames,
+                frame_rate=frame_rate,
+                seed=seed,
+                max_sequence_length=max_sequence_length,
+                image=image,
+                image_cond_strength=image_cond_strength,
+            )
+        else:
+            video_latents, audio_latents = None, None
+
+        # ================================================================
+        # Decode
+        # ================================================================
+        if output_type == "latent":
+            # No decode: only rank 0 holds the refined latents.
+            video_out, audio_out = (
+                (video_latents, audio_latents) if self.rank == 0 else (None, None)
+            )
+            if self.rank == 0:
+                logger.info(f"Two-stage total time: {time.time() - pipeline_start:.2f}s")
+            timer.mark_end()
+            return timer.fill(
+                PipelineOutput(
+                    video=video_out,
+                    audio=audio_out,
+                    frame_rate=float(frame_rate),
+                    audio_sample_rate=(
+                        int(self.audio_sampling_rate)
+                        if getattr(self, "audio_sampling_rate", None) is not None
+                        and audio_out is not None
+                        else None
+                    ),
+                )
+            )
+
+        if self._parallel_vae_enabled:
+            # Broadcast rank-0's refined Stage-2 latents to every vae_rank, then
+            # decode collectively (tile-parallel over vgm.vae_group).
+            vgm = self.pipeline_config.visual_gen_mapping
+            video_latents = self._broadcast_video_latents(video_latents, vgm.vae_group)
+            logger.info("Decoding upsampled video (tile-parallel)...")
+            video = tile_parallel_decode(
+                self.video_decoder,
+                video_latents,
+                TilingConfig.default(),
+                pg=vgm.vae_group,
+            )
+            video = postprocess_video_tensor(video)
+        else:
+            logger.info("Decoding upsampled video (tiled)...")
+            video_latents = video_latents.to(self.dtype)
+            chunks = list(
+                self.video_decoder.tiled_decode(
+                    video_latents,
+                    TilingConfig.default(),
+                    generator=None,
+                )
+            )
+            video = torch.cat(chunks, dim=2)
+            video = postprocess_video_tensor(video)
+
+        # Audio decode is rank-0 only (not tile-parallel).
+        audio_out = None
+        if self.rank == 0 and audio_latents is not None:
+            audio_latents = audio_latents.to(self.dtype)
+            audio_out = decode_audio(audio_latents, self.audio_decoder, self.vocoder)
+
+        if self.rank == 0:
+            logger.info(f"Two-stage total time: {time.time() - pipeline_start:.2f}s")
+        timer.mark_end()
+        return timer.fill(
+            PipelineOutput(
+                video=video,
+                audio=audio_out,
+                frame_rate=float(frame_rate),
+                audio_sample_rate=(
+                    int(self.audio_sampling_rate)
+                    if getattr(self, "audio_sampling_rate", None) is not None
+                    and audio_out is not None
+                    else None
+                ),
+            )
+        )
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _upsample_and_refine(
+        self,
+        video_latents: torch.Tensor,
+        audio_latents: Optional[torch.Tensor],
+        prompt: Union[str, List[str]],
+        height: int,
+        width: int,
+        num_frames: int,
+        frame_rate: float,
+        seed: int,
+        max_sequence_length: int,
+        image: Optional[Union[str, torch.Tensor]] = None,
+        image_cond_strength: float = 1.0,
+    ) -> tuple:
+        """Stage 2 (rank-0 only): learned 2x spatial upsample + refinement denoise.
+
+        Returns the refined ``(video_latents, audio_latents)`` in 5-D form.
+        """
         per_ch_stats = self._get_per_channel_statistics()
         video_latents = upsample_video(
             video_latents[:1],
@@ -1239,9 +1356,6 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
         )
         logger.info("Upsampled video latents via learned upsampler")
 
-        # ================================================================
-        # Stage 2: refinement denoising with distilled LoRA
-        # ================================================================
         # The persistent cache owns original and merged tensors when it can be
         # built at load time. Stage 2 only rebinds pointers and FP4 quant_method
         # state, so no per-request clone, merge, or unmerge math is needed.
@@ -1330,65 +1444,34 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
             else:
                 self._lora_cuda_graph_state = "original"
 
-        # ================================================================
-        # Decode
-        # ================================================================
-        if output_type == "latent":
-            if self.rank == 0:
-                logger.info(f"Two-stage total time: {time.time() - pipeline_start:.2f}s")
-            timer.mark_end()
-            return timer.fill(
-                PipelineOutput(
-                    video=video_latents,
-                    audio=audio_latents,
-                    frame_rate=float(frame_rate),
-                    audio_sample_rate=(
-                        int(self.audio_sampling_rate)
-                        if getattr(self, "audio_sampling_rate", None) is not None
-                        and audio_latents is not None
-                        else None
-                    ),
-                )
+        return video_latents, audio_latents
+
+    def _broadcast_video_latents(
+        self, video_latents: Optional[torch.Tensor], vae_group
+    ) -> torch.Tensor:
+        """Broadcast rank-0's refined Stage-2 latents to every ``vae_rank``.
+
+        ``tile_parallel_decode`` needs the full latent replicated on each rank of
+        ``vae_group``; only rank 0 ran Stage 2, so it is the broadcast source.
+        Video latents are 5-D ``(B, C, F, H, W)``.
+        """
+        if vae_group is None:
+            raise ValueError(
+                "parallel VAE decode requires a valid vae_group, got None "
+                "(a None group would fall back to the world group and hang on non-VAE ranks)."
             )
-
-        logger.info("Decoding upsampled video (tiled)...")
-        video_latents = video_latents.to(self.dtype)
-        tiling_config = TilingConfig.default()
-        chunks = list(
-            self.video_decoder.tiled_decode(
-                video_latents,
-                tiling_config,
-                generator=None,
-            )
-        )
-        video = torch.cat(chunks, dim=2)
-        video = postprocess_video_tensor(video)
-
-        audio_out = None
-        if audio_latents is not None:
-            audio_latents = audio_latents.to(self.dtype)
-            audio_out = decode_audio(audio_latents, self.audio_decoder, self.vocoder)
-
         if self.rank == 0:
-            logger.info(f"Two-stage total time: {time.time() - pipeline_start:.2f}s")
-        timer.mark_end()
-        return timer.fill(
-            PipelineOutput(
-                video=video,
-                audio=audio_out,
-                frame_rate=float(frame_rate),
-                audio_sample_rate=(
-                    int(self.audio_sampling_rate)
-                    if getattr(self, "audio_sampling_rate", None) is not None
-                    and audio_out is not None
-                    else None
-                ),
+            video_latents = video_latents.to(self.dtype).contiguous()
+            shape = torch.tensor(video_latents.shape, dtype=torch.long, device=self.device)
+        else:
+            shape = torch.empty(5, dtype=torch.long, device=self.device)
+        dist.broadcast(shape, src=0, group=vae_group)
+        if self.rank != 0:
+            video_latents = torch.empty(
+                torch.Size(shape.tolist()), dtype=self.dtype, device=self.device
             )
-        )
-
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
+        dist.broadcast(video_latents, src=0, group=vae_group)
+        return video_latents
 
     def _get_per_channel_statistics(self) -> torch.nn.Module:
         """Return per-channel statistics for un-normalize/normalize.

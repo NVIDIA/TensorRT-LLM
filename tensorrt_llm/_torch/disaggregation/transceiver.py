@@ -17,12 +17,16 @@ from tensorrt_llm._torch.disaggregation.base.transfer import (
     WaitResult,
     get_unique_rid,
 )
+from tensorrt_llm._torch.disaggregation.native.bounce import (
+    config_from_size as bounce_config_from_size,
+)
 from tensorrt_llm._torch.disaggregation.native.transfer import TransferWorker, TransferWorkerConfig
 from tensorrt_llm._torch.disaggregation.resource.cache_reuse import (
     CacheReuseAdapter,
     create_cache_reuse_adapter,
 )
 from tensorrt_llm._torch.disaggregation.resource.page import MambaLayerGroup
+from tensorrt_llm._torch.disaggregation.resource.utils import get_physical_pool
 from tensorrt_llm._torch.distributed.communicator import Distributed
 from tensorrt_llm._torch.pyexecutor.kv_cache_transceiver import KvCacheTransceiver
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
@@ -85,6 +89,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 max_concurrent_sessions=max(1, int(kv_cache_manager.max_batch_size)) * 20000,
                 tx_timeout_s=self._sender_future_timeout_ms / 1000.0,
                 rx_timeout_s=self.kv_transfer_timeout_ms / 1000.0,
+                # On/off switch via config (size 0 => None => per-block path).
+                bounce=bounce_config_from_size(cache_transceiver_config.kv_cache_bounce_size_mb),
             )
         )
         self._dp_rank = mapping.tp_rank if mapping.enable_attention_dp else 0
@@ -98,6 +104,9 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         self._recv_reqs = {}
         self._wait_reqs = {}
         self._page_table = self._transfer_worker.page_table
+        # _slice_num_bytes() is this rank's KV shard, so scale by tp_size to get the request total (kv_cache_size),
+        # except under attention DP where the local count already is the total.
+        self._kv_size_rank_factor = 1 if mapping.enable_attention_dp else max(1, mapping.tp_size)
 
         # Sticky role markers; flip True once any session opens, used to short-circuit
         # per-iter tp_allgather when this transceiver never sends/receives.
@@ -238,6 +247,27 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             mamba_state_index=mamba_state_index,
             token_range=token_range,
         )
+
+    def _slice_num_bytes(self, slice: KVSlice) -> int:
+        """Local-rank KV bytes covered by a slice (sum of num_valid_blocks * pool.slot_bytes), enough to populate
+        kv_cache_size and unblock the perf-metric timestamps that gate on it."""
+        pt = self._page_table
+        if pt is None:
+            return 0
+        total = 0
+        for lg_id, block_ids in enumerate(slice.block_ids_per_layer_groups):
+            if block_ids is None or block_ids.size == 0:
+                continue
+            lg = pt.layer_groups[lg_id]
+            if isinstance(lg, MambaLayerGroup):
+                continue
+            n = int((block_ids >= 0).sum())
+            if n == 0:
+                continue
+            for pv in lg.pool_views:
+                pool = get_physical_pool(pt, lg_id, pv.pool_idx)
+                total += n * pool.slot_bytes
+        return total
 
     @staticmethod
     def _split_packed_beam_block_ids(
@@ -482,10 +512,13 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             session = self._transfer_worker.create_rx_session(req)
             self._recv_sessions[rid] = session
             self._recv_reqs[rid] = req
-            session.receive(self._create_kv_slice(req))
+            kv_slice = self._create_kv_slice(req)
+            session.receive(kv_slice)
             result = session.wait_complete(blocking=True)
 
             if result == WaitResult.COMPLETED:
+                # KV-transfer timing setters deferred to #15871 (clock-source consistency); size only.
+                req.set_kv_cache_size(self._slice_num_bytes(kv_slice) * self._kv_size_rank_factor)
                 if self._need_aux_transfer(req):
                     self._apply_aux(session, req)
                 self._assert_disagg_history_declared(req)
@@ -513,7 +546,9 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         req.state = LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
         session = self._transfer_worker.create_rx_session(req)
         self._recv_sessions[rid] = session
-        session.receive(self._create_kv_slice(req))
+        kv_slice = self._create_kv_slice(req)
+        req.py_kv_cache_xfer_bytes = self._slice_num_bytes(kv_slice) * self._kv_size_rank_factor
+        session.receive(kv_slice)
         self._recv_reqs[rid] = req
 
     def check_context_transfer_status(
@@ -625,6 +660,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         for rid in completed:
             session = self._recv_sessions[rid]
             req = self._recv_reqs[rid]
+            # transfer_end already stamped at completion detection above.
+            req.set_kv_cache_size(getattr(req, "py_kv_cache_xfer_bytes", 0))
             if self._need_aux_transfer(req):
                 self._apply_aux(session, req)
             self._assert_disagg_history_declared(req)

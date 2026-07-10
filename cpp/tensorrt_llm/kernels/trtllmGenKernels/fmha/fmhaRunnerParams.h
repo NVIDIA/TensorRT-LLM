@@ -38,7 +38,9 @@ enum class TrtllmGenAttentionMaskType
     // Sliding window or chunked causal mask.
     SlidingOrChunkedCausal,
     // Custom mask.
-    Custom
+    Custom,
+    // Sliding window mask combined with custom packed mask.
+    SlidingWindowCustom
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -54,9 +56,21 @@ enum class TrtllmGenAttentionMaskType
 ATTENTION_MASK_TYPE_FUNCTION(Dense)
 ATTENTION_MASK_TYPE_FUNCTION(Causal)
 ATTENTION_MASK_TYPE_FUNCTION(SlidingOrChunkedCausal)
-ATTENTION_MASK_TYPE_FUNCTION(Custom)
+ATTENTION_MASK_TYPE_FUNCTION(SlidingWindowCustom)
 
 #undef ATTENTION_MASK_TYPE_FUNCTION
+
+inline bool isCustomMask(TrtllmGenAttentionMaskType maskType)
+{
+    return maskType == TrtllmGenAttentionMaskType::Custom
+        || maskType == TrtllmGenAttentionMaskType::SlidingWindowCustom;
+}
+
+inline bool usesSlidingWindowMask(TrtllmGenAttentionMaskType maskType)
+{
+    return maskType == TrtllmGenAttentionMaskType::SlidingOrChunkedCausal
+        || maskType == TrtllmGenAttentionMaskType::SlidingWindowCustom;
+}
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -210,6 +224,16 @@ MULTI_CTAS_KV_MODE_FUNCTION(CgaSmemReduction)
 
 struct TllmGenFmhaRunnerParams
 {
+    struct Dsv4EpilogueFusionParams
+    {
+        // Enable DSv4 inverse-RoPE + FP8 quant epilogue fusion.
+        bool enabled{false};
+        // The cos/sin cache used by the fused inverse-RoPE epilogue.
+        float const* cosSinCache{nullptr};
+        // The physical token stride of the FP32 output scale tensor.
+        int32_t scaleBufM{0};
+    };
+
     // Input layout.
     QkvLayout mQkvLayout;
     // Attention mask type.
@@ -274,6 +298,8 @@ struct TllmGenFmhaRunnerParams
     void* oPtr;
     // The output scaling factor buffer.
     void* oSfPtr;
+    // Optional DSv4 fused inverse-RoPE + FP8 quant epilogue parameters.
+    Dsv4EpilogueFusionParams mDsv4EpilogueFusion;
     // SageAttention scaling factors for Q, K, P and V.
     float const* sageAttnSfsQPtr = nullptr;
     float const* sageAttnSfsKPtr = nullptr;
@@ -360,7 +386,7 @@ struct TllmGenFmhaRunnerParams
         case 2: // tensorrt_llm::kernels::ContextAttentionMaskType::SLIDING_OR_CHUNKED_CAUSAL
             mMaskType = TrtllmGenAttentionMaskType::SlidingOrChunkedCausal;
             break;
-        case 3: // tensorrt_llm::kernels::ContextAttentionMaskType::CUSTOM_MASK
+        case 4: // tensorrt_llm::kernels::ContextAttentionMaskType::CUSTOM_MASK
             mMaskType = TrtllmGenAttentionMaskType::Custom;
             break;
         default:

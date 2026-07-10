@@ -147,6 +147,18 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         weight_loading_mode = (MoEWeightLoadingMode.FUSED_GATE_UP_PROJ
                                if config.model_type == "qwen3_5_moe_text" else
                                MoEWeightLoadingMode.VANILLA)
+        # For MIXED_PRECISION checkpoints (e.g. ModelOpt), the experts' real
+        # quant algo lives in the per-layer quant_config_dict keyed by TRT-LLM
+        # module name. Pass it as override_quant_config so the backend resolves
+        # the correct quant method (e.g. NVFP4) at construction, instead of
+        # inheriting the unquantized MIXED_PRECISION global and relying on
+        # apply_layerwise_quant_config (which rebinds the ConfigurableMoE
+        # wrapper but not its delegated backend).
+        expert_quant_config = None
+        quant_config_dict = getattr(model_config, "quant_config_dict", None)
+        if quant_config_dict and layer_idx is not None:
+            expert_quant_config = quant_config_dict.get(
+                f"model.layers.{layer_idx}.mlp.experts")
         self.experts = create_moe(
             num_experts=self.num_experts,
             routing_method=self.gate.routing_method,
@@ -158,6 +170,7 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             model_config=model_config,
             layer_idx=layer_idx,
             weight_loading_mode=weight_loading_mode,
+            override_quant_config=expert_quant_config,
         )
 
         self.shared_expert = GatedMLP(
