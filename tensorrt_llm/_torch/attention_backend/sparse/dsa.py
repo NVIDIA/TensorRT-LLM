@@ -2447,6 +2447,30 @@ class Indexer(nn.Module):
                             chunk.token_start:chunk.token_end, :].fill_(-1)
                         continue
                     num_k_tokens = chunk.k_token_end - chunk.k_token_start
+                    if os.environ.get("TRTLLM_DEBUG_INDEXER_GATHER_BOUNDS",
+                                      "0") == "1":
+                        # The C++ indexer_k_cache_gather_op has no internal
+                        # bounds check, unlike its Python sibling
+                        # _gather_k_cache_for_chunk. Assert the flat byte indices
+                        # stay inside the indexer K-cache before launch. Costs a
+                        # device sync on the prefill hot path, so it is env-gated
+                        # and default-off. Catches an over-strided slot mapping
+                        # (e.g. a raw-vs-compressed tokens_per_block mismatch)
+                        # before it becomes an illegal memory access.
+                        _sm = metadata.slot_mapping_fp8_fullkv[
+                            chunk.k_token_start:chunk.k_token_end]
+                        _sc = metadata.slot_mapping_scale_fullkv[
+                            chunk.k_token_start:chunk.k_token_end]
+                        _numel = k_cache_4d.numel()
+                        _max_fp8 = int(_sm.max().item()) + gather_head_dim
+                        _max_scale = int(_sc.max().item()) + 4
+                        assert _max_fp8 <= _numel and _max_scale <= _numel, (
+                            "indexer_k_cache_gather OOB: max byte index "
+                            f"fp8={_max_fp8} scale={_max_scale} > "
+                            f"k_cache.numel()={_numel}. The fullkv slot mapping "
+                            "over-strides the indexer K-cache (check "
+                            "IndexerParams.tokens_per_block vs the compressed "
+                            "block size).")
                     chunk_k_fp8, chunk_k_scale = torch.ops.trtllm.indexer_k_cache_gather_op(
                         k_cache_4d, metadata.slot_mapping_fp8_fullkv,
                         metadata.slot_mapping_scale_fullkv, chunk.k_token_start,
