@@ -349,15 +349,23 @@ class CompletionRequest(OpenAIBaseModel):
     stream: Optional[bool] = False
     stream_options: Optional[StreamOptions] = None
     suffix: Optional[str] = None
-    temperature: Optional[float] = Field(default=None, ge=0.0)
-    top_p: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    temperature: Optional[float] = Field(
+        default=None, ge=0.0, description="Sampling temperature; must be >= 0.")
+    top_p: Optional[float] = Field(
+        default=None,
+        ge=0.0,
+        le=1.0,
+        description="Nucleus sampling probability; must be in [0, 1].")
     user: Optional[str] = None
     lora_request: Optional[LoRARequest] = None
     prompt_ignore_length: Optional[int] = 0
 
     # doc: begin-completion-sampling-params
     use_beam_search: bool = False
-    top_k: int = Field(default=0, ge=0)
+    top_k: int = Field(
+        default=0,
+        ge=0,
+        description="Top-k sampling; must be >= 0 (0 disables top-k).")
     top_p_min: float = 0.0
     min_p: float = 0.0
     repetition_penalty: float = 1.0
@@ -664,8 +672,13 @@ class ChatCompletionRequest(OpenAIBaseModel):
     stop: Optional[Union[str, List[str]]] = Field(default_factory=list)
     stream: Optional[bool] = False
     stream_options: Optional[StreamOptions] = None
-    temperature: Optional[float] = Field(default=None, ge=0.0)
-    top_p: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    temperature: Optional[float] = Field(
+        default=None, ge=0.0, description="Sampling temperature; must be >= 0.")
+    top_p: Optional[float] = Field(
+        default=None,
+        ge=0.0,
+        le=1.0,
+        description="Nucleus sampling probability; must be in [0, 1].")
     tools: Optional[List[ChatCompletionToolsParam]] = None
     tool_choice: Optional[Union[Literal["none", "auto"],
                                 ChatCompletionNamedToolChoiceParam]] = "none"
@@ -683,7 +696,10 @@ class ChatCompletionRequest(OpenAIBaseModel):
     # doc: begin-chat-completion-sampling-params
     best_of: Optional[int] = None
     use_beam_search: bool = False
-    top_k: int = Field(default=0, ge=0)
+    top_k: int = Field(
+        default=0,
+        ge=0,
+        description="Top-k sampling; must be >= 0 (0 disables top-k).")
     top_p_min: float = 0.0
     min_p: float = 0.0
     repetition_penalty: float = 1.0
