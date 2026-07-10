@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -81,6 +81,46 @@ int getSm()
     cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev);
     return major * 10 + minor;
 }
+
+// RAII wrapper around a cudaMalloc'd device buffer. Guarantees the memory is
+// released even when a test aborts early via ASSERT_*, which returns from the
+// enclosing function and would otherwise skip a manual cudaFree.
+template <typename T>
+class DeviceBuffer
+{
+public:
+    explicit DeviceBuffer(size_t count)
+    {
+        if (count > 0)
+        {
+            cudaMalloc(&mPtr, count * sizeof(T));
+        }
+    }
+
+    ~DeviceBuffer()
+    {
+        if (mPtr != nullptr)
+        {
+            cudaFree(mPtr);
+        }
+    }
+
+    DeviceBuffer(DeviceBuffer const&) = delete;
+    DeviceBuffer& operator=(DeviceBuffer const&) = delete;
+
+    T* get() const
+    {
+        return mPtr;
+    }
+
+    operator T*() const
+    {
+        return mPtr;
+    }
+
+private:
+    T* mPtr = nullptr;
+};
 
 template <typename T>
 struct TypeTag;
@@ -209,9 +249,9 @@ struct RunCase
 };
 
 template <typename T>
-void runNumericParityCase(RunCase const& c)
+void runNumericParityCase(RunCase const& c, bool forceSimt = false)
 {
-    if (getSm() < 80)
+    if (!forceSimt && getSm() < 80)
     {
         GTEST_SKIP() << "Fused T5 WMMA path requires SM80+; SIMT fallback path exercised in a separate "
                         "test on old GPUs.";
@@ -270,19 +310,13 @@ void runNumericParityCase(RunCase const& c)
     referenceAttention(qkvF, biasF, hostTable, inputLengths, cuSeqlens, c.batchSize, c.numHeads, c.headSize,
         c.maxSeqLen, c.numBuckets, qkScale, c.removePadding, outRef);
 
-    // Device buffers.
-    T* dQkv       = nullptr;
-    T* dBias      = nullptr;
-    T* dOut       = nullptr;
-    int16_t* dTbl = nullptr;
-    int* dLen     = nullptr;
-    int* dCu      = nullptr;
-    cudaMalloc(&dQkv, qkvT.size() * sizeof(T));
-    cudaMalloc(&dBias, biasT.size() * sizeof(T));
-    cudaMalloc(&dOut, static_cast<size_t>(numTokens) * outStride * sizeof(T));
-    cudaMalloc(&dTbl, tableLen * sizeof(int16_t));
-    cudaMalloc(&dLen, c.batchSize * sizeof(int));
-    cudaMalloc(&dCu, (c.batchSize + 1) * sizeof(int));
+    // Device buffers (RAII — freed even if an ASSERT_* below returns early).
+    DeviceBuffer<T> dQkv(qkvT.size());
+    DeviceBuffer<T> dBias(biasT.size());
+    DeviceBuffer<T> dOut(static_cast<size_t>(numTokens) * outStride);
+    DeviceBuffer<int16_t> dTbl(tableLen);
+    DeviceBuffer<int> dLen(c.batchSize);
+    DeviceBuffer<int> dCu(c.batchSize + 1);
 
     cudaMemcpy(dQkv, qkvT.data(), qkvT.size() * sizeof(T), cudaMemcpyHostToDevice);
     cudaMemcpy(dBias, biasT.data(), biasT.size() * sizeof(T), cudaMemcpyHostToDevice);
@@ -302,6 +336,7 @@ void runNumericParityCase(RunCase const& c)
     params.isBidirectional = true;
     params.removePadding  = c.removePadding;
     params.forceEnable    = true; // bypass env-var gate
+    params.forceSimt      = forceSimt; // test-only: exercise SIMT reference path
     params.qkScale        = qkScale;
 
     ASSERT_TRUE(tk::FusedT5AttentionRunner::isSupported(params))
@@ -338,13 +373,6 @@ void runNumericParityCase(RunCase const& c)
             }
         }
     }
-
-    cudaFree(dQkv);
-    cudaFree(dBias);
-    cudaFree(dOut);
-    cudaFree(dTbl);
-    cudaFree(dLen);
-    cudaFree(dCu);
 
     // fp16/bf16 tolerance follows the convention used by other kernel tests
     // in this repo (see e.g. ropeTest / decodingKernelTest).
@@ -506,5 +534,45 @@ TEST(FusedT5Runner, ParityBf16Head128Packed)
 {
     RunCase c{"bf16-h128-packed", 2, 2, 128, 96, 32, 128, true};
     runNumericParityCase<__nv_bfloat16>(c);
+}
+#endif
+
+// ---------------------------------------------------------------------------
+// SIMT fallback numeric parity.
+//
+// The SIMT reference path is normally only selected on SM70-79, which CI
+// machines rarely have, leaving it unvalidated. We force it here via
+// `forceSimt=true` so the fallback is exercised against the scalar reference
+// on any GPU (including SM80+).
+// ---------------------------------------------------------------------------
+TEST(FusedT5RunnerSimt, ParityFp16Head32Padded)
+{
+    RunCase c{"simt-fp16-h32-padded", 2, 4, 32, 64, 32, 128, false};
+    runNumericParityCase<half>(c, /*forceSimt=*/true);
+}
+
+TEST(FusedT5RunnerSimt, ParityFp16Head64Padded)
+{
+    RunCase c{"simt-fp16-h64-padded", 2, 4, 64, 96, 32, 128, false};
+    runNumericParityCase<half>(c, /*forceSimt=*/true);
+}
+
+TEST(FusedT5RunnerSimt, ParityFp16Head64Packed)
+{
+    RunCase c{"simt-fp16-h64-packed", 3, 4, 64, 96, 32, 128, true};
+    runNumericParityCase<half>(c, /*forceSimt=*/true);
+}
+
+TEST(FusedT5RunnerSimt, ParityFp16Head128Padded)
+{
+    RunCase c{"simt-fp16-h128-padded", 1, 4, 128, 128, 32, 128, false};
+    runNumericParityCase<half>(c, /*forceSimt=*/true);
+}
+
+#ifdef ENABLE_BF16
+TEST(FusedT5RunnerSimt, ParityBf16Head64Packed)
+{
+    RunCase c{"simt-bf16-h64-packed", 2, 4, 64, 96, 32, 128, true};
+    runNumericParityCase<__nv_bfloat16>(c, /*forceSimt=*/true);
 }
 #endif

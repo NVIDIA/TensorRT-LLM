@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -97,6 +97,7 @@ struct FusedT5AttentionParams
     // Runtime toggles.
     bool removePadding = false;  // true → variable-length packed input
     bool forceEnable   = false;  // true → bypass env-var gate
+    bool forceSimt     = false;  // test-only → force the SIMT reference path
 
     // Scaling: typically 1/sqrt(head_size) / q_scaling.
     float qkScale = 0.f;

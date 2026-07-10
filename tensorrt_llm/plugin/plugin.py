@@ -40,6 +40,9 @@ TRT_LLM_PLUGIN_NAMESPACE = 'tensorrt_llm'
 
 
 def plugin_lib_path() -> str:
+    """Return the absolute path to the compiled TensorRT-LLM plugin shared
+    library, picking the correct file name for the current platform
+    (``.so`` on Linux, ``.dll`` on Windows)."""
     project_dir = Path(__file__).parent.parent.absolute()
     dyn_lib = "libnvinfer_plugin_tensorrt_llm.so" if platform.system(
     ) != "Windows" else "nvinfer_plugin_tensorrt_llm.dll"
@@ -47,6 +50,14 @@ def plugin_lib_path() -> str:
 
 
 def _load_plugin_lib():
+    """Load the TensorRT-LLM plugin shared library with ``ctypes`` and register
+    all plugins under :data:`TRT_LLM_PLUGIN_NAMESPACE`.
+
+    Raises:
+        ImportError: if the library does not expose ``initTrtLlmPlugins``.
+        RuntimeError: if plugin initialization fails (e.g. a missing MSVC
+            redistributable on Windows).
+    """
     on_windows = platform.system() == "Windows"
     winmode = 0 if on_windows else None
     handle = ctypes.CDLL(plugin_lib_path(),
@@ -75,6 +86,12 @@ def _load_plugin_lib():
 
 
 class ContextFMHAType(IntEnum):
+    """Context-phase fused multi-head attention mode.
+
+    ``disabled`` turns context FMHA off; ``enabled`` uses FP16 I/O with FP16
+    accumulation; ``enabled_with_fp32_acc`` uses FP16 I/O with FP32
+    accumulation for improved numerical accuracy.
+    """
     disabled = 0
     # FP16 I/O, FP16 Accumulation
     enabled = 1
@@ -320,6 +337,8 @@ class PluginConfig(StrictBaseModel):
     @field_validator("dtype")
     @classmethod
     def validate_dtype_not_auto(cls, v: str) -> str:
+        """Reject ``"auto"`` for the plugin base ``dtype``; it must be a
+        concrete precision such as ``"float16"`` or ``"bfloat16"``."""
         if v == "auto":
             raise ValueError("Plugin dtype cannot be 'auto'")
         return v
@@ -389,6 +408,8 @@ class PluginConfig(StrictBaseModel):
 
     @model_validator(mode="after")
     def _validate_sm_compatibility(self) -> "PluginConfig":
+        """Raise if any enabled plugin is unsupported on the current GPU's SM
+        (compute capability), e.g. fp8 gemm plugins on SM100."""
         unsupported_plugins = {
             # bert_attention_plugin is handled within BertAttention
             100: [
@@ -408,6 +429,8 @@ class PluginConfig(StrictBaseModel):
 
     @property
     def context_fmha_type(self):
+        """Derive the effective :class:`ContextFMHAType` from the
+        ``context_fmha`` and ``bert_context_fmha_fp32_acc`` fields."""
         if self.bert_context_fmha_fp32_acc:
             return ContextFMHAType.enabled_with_fp32_acc
         elif self.context_fmha:
@@ -416,10 +439,13 @@ class PluginConfig(StrictBaseModel):
             return ContextFMHAType.disabled
 
     def is_context_fmha_enabled(self):
+        """Return True if context FMHA is enabled in any mode."""
         return self.context_fmha_type != ContextFMHAType.disabled
 
     @context_fmha_type.setter
     def context_fmha_type(self, value):
+        """Set ``context_fmha`` / ``bert_context_fmha_fp32_acc`` to match the
+        requested :class:`ContextFMHAType`."""
         if value == ContextFMHAType.disabled:
             self.context_fmha = False
             self.bert_context_fmha_fp32_acc = False
@@ -431,6 +457,11 @@ class PluginConfig(StrictBaseModel):
                 self.bert_context_fmha_fp32_acc = True
 
     def set_smooth_quant_plugins(self, dtype: str = "auto"):
+        """Enable the SmoothQuant plugin set (GEMM, RMS/LayerNorm quantization
+        and per-token/per-tensor quantize plugins) using ``dtype``.
+
+        Returns ``self`` to allow call chaining.
+        """
         self.smooth_quant_gemm_plugin = dtype
         self.rmsnorm_quantization_plugin = dtype
         self.layernorm_quantization_plugin = dtype
@@ -439,12 +470,19 @@ class PluginConfig(StrictBaseModel):
         return self
 
     def set_qserve_plugins(self, dtype: str = "auto"):
+        """Enable the QServe plugin set (GEMM + RMSNorm quantization and
+        per-token quantize) using ``dtype``. Returns ``self`` for chaining."""
         self.qserve_gemm_plugin = dtype
         self.rmsnorm_quantization_plugin = dtype
         self.quantize_per_token_plugin = True
         return self
 
     def set_fp8_rowwise_quant_plugins(self, dtype: str = "auto"):
+        """Enable the FP8 row-wise quantization plugin set (GEMM, RMS/LayerNorm
+        quantization and per-token/per-tensor quantize plugins) using ``dtype``.
+
+        Returns ``self`` to allow call chaining.
+        """
         self.fp8_rowwise_gemm_plugin = dtype
         self.rmsnorm_quantization_plugin = dtype
         self.layernorm_quantization_plugin = dtype
@@ -453,25 +491,41 @@ class PluginConfig(StrictBaseModel):
         return self
 
     def set_context_fmha(self, context_fmha_type=ContextFMHAType.enabled):
+        """Set the context-phase fused multi-head attention mode.
+
+        ``context_fmha_type`` must be a :class:`ContextFMHAType`. Returns
+        ``self`` to allow call chaining.
+        """
         assert type(context_fmha_type) == ContextFMHAType
         self.context_fmha_type = context_fmha_type
         return self
 
     def enable_paged_kv_cache(self, tokens_per_block: int = 32):
+        """Enable the paged KV cache with ``tokens_per_block`` tokens per block.
+
+        Returns ``self`` to allow call chaining.
+        """
         self.paged_kv_cache = True
         self.tokens_per_block = tokens_per_block
         return self
 
     def set_nccl_plugin(self, dtype: str = "auto"):
+        """Enable the NCCL plugin with ``dtype`` and initialize the custom
+        all-reduce helper. Returns ``self`` to allow call chaining."""
         self.nccl_plugin = dtype
         init_all_reduce_helper()
         return self
 
     def set_lora_plugin(self, dtype: str = None):
+        """Enable (or disable, when ``dtype`` is ``None``) the LoRA plugin.
+
+        Returns ``self`` to allow call chaining.
+        """
         self.lora_plugin = dtype
         return self
 
     def set_dora_plugin(self, enable: bool = False):
+        """Enable or disable the DoRA plugin. Returns ``self`` for chaining."""
         self.dora_plugin = enable
         return self
 
@@ -515,6 +569,12 @@ cli_plugin_args = [
 
 
 def add_plugin_argument(parser: argparse.ArgumentParser):
+    """Register the CLI-exposed plugin fields on ``parser``.
+
+    Iterates over :data:`cli_plugin_args`, deriving each ``trtllm-build``
+    argument's type, default and choices from the corresponding
+    :class:`PluginConfig` model field. Returns the same ``parser``.
+    """
     for field_name, field_info in PluginConfig.model_fields.items():
         if field_name not in cli_plugin_args:
             continue
@@ -561,6 +621,8 @@ def add_plugin_argument(parser: argparse.ArgumentParser):
 
 
 def force_all_reduce_deterministic():
+    """Return True when deterministic all-reduce is requested via the
+    ``FORCE_DETERMINISTIC`` or ``FORCE_ALL_REDUCE_DETERMINISTIC`` env var."""
     return os.getenv("FORCE_DETERMINISTIC", "0") == "1" or os.getenv(
         "FORCE_ALL_REDUCE_DETERMINISTIC", "0") == "1"
 
@@ -584,11 +646,18 @@ class CustomAllReduceHelper:
     POINTERS_OF_COUNTER = 3
 
     def __init__(self) -> None:
+        """Create a helper with no workspace tensor bound yet."""
         self.workspace: Optional[Tensor] = None
 
     def set_workspace_tensor(self,
                              mapping: Mapping,
                              num_profiles: Optional[int] = None):
+        """Build and store the ``all_reduce_workspace`` tensor sized for the
+        given ``mapping``.
+
+        When ``num_profiles`` is provided, an optimization-profile dim range is
+        attached so the workspace size is replicated across profiles.
+        """
         from ..functional import Tensor
         workspace_size = self.POINTERS_PER_RANK * mapping.tp_size + self.POINTERS_OF_COUNTER
 
@@ -648,11 +717,14 @@ class CustomAllReduceHelper:
 
     @staticmethod
     def max_workspace_size_lowprecision(tp_size: int) -> int:
+        """Return the low-precision all-reduce workspace size for ``tp_size``."""
         return max_workspace_size_lowprecision(tp_size)
 
     @staticmethod
     def initialize_lowprecision_buffers(workspace: "torch.tensor",
                                         tp_size: int) -> None:
+        """Initialize the static low-precision all-reduce buffers in-place for
+        the given ``workspace`` tensor and ``tp_size``."""
         import torch
         return torch.ops.trtllm.initialize_static_lowprecision_buffers(
             workspace, tp_size)
@@ -660,8 +732,14 @@ class CustomAllReduceHelper:
     @staticmethod
     def allocate_workspace(mapping: Mapping,
                            size: int) -> Tuple[List[IpcMemory], "torch.tensor"]:
-        import torch
+        """Allocate the standard custom all-reduce workspace for ``mapping``.
 
+        Creates the ping/pong IPC data buffers, in/out barriers and the three
+        lamport buffers (sized by ``size``), initializing lamport memory when
+        peer-to-peer access is available. Returns the list of owning
+        :class:`IpcMemory` objects and a serialized CPU int64 pointer tensor.
+        """
+        import torch
         # Force pull mode and disable lamport when force deterministic is enabled, for reducing device memory usage.
         force_deterministic = force_all_reduce_deterministic()
         is_p2p_supported = can_access_peer(mapping)
@@ -718,6 +796,12 @@ class CustomAllReduceHelper:
     def allocate_lowprecision_workspace(
             mapping: Mapping,
             size: int) -> Tuple[List[IpcMemory], "torch.tensor"]:
+        """Allocate the low-precision custom all-reduce workspace for ``mapping``.
+
+        Like :meth:`allocate_workspace` but without the lamport buffers.
+        Returns the owning :class:`IpcMemory` objects and a serialized CPU
+        int64 pointer tensor.
+        """
         import torch
 
         # Force pull mode and disable lamport when force deterministic is enabled, for reducing device memory usage.
@@ -749,6 +833,13 @@ class CustomAllReduceHelper:
     def allocate_allreduce_fusion_workspace(
             mapping: Mapping,
             size: int) -> Tuple[List[IpcMemory], "torch.tensor"]:
+        """Allocate the all-reduce fusion workspace for ``mapping``.
+
+        Creates the IPC data buffer, barriers, triple-buffered lamport buffers,
+        and the flag/layout bookkeeping tensors used by the fusion kernel.
+        Returns the owning :class:`IpcMemory` objects plus a serialized CUDA
+        int64 pointer tensor.
+        """
         import torch
         is_p2p_supported = can_access_peer(mapping)
         ipc_buffers_size = size * mapping.tp_size
@@ -790,11 +881,17 @@ custom_all_reduce_helper = None
 
 
 def init_all_reduce_helper():
+    """Create the process-global :class:`CustomAllReduceHelper` singleton."""
     global custom_all_reduce_helper
     custom_all_reduce_helper = CustomAllReduceHelper()
 
 
 def current_all_reduce_helper():
+    """Return the global :class:`CustomAllReduceHelper`.
+
+    Raises ``AssertionError`` if :func:`init_all_reduce_helper` was not called
+    first.
+    """
     global custom_all_reduce_helper
     assert custom_all_reduce_helper is not None, "You must call `init_all_reduce_helper` first"
     return custom_all_reduce_helper

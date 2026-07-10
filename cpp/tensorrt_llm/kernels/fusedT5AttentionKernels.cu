@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -31,6 +31,7 @@
 
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/logger.h"
 
 #include <algorithm>
@@ -39,6 +40,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <string>
 #include <type_traits>
 #include <vector>
@@ -70,9 +72,6 @@ constexpr int kBlockSize   = 128;  // 4 warps
 constexpr int kWarpSize    = 32;
 constexpr int kWarpsPerBlk = kBlockSize / kWarpSize;
 constexpr float kFloatMaskV = -FLT_MAX;
-
-// Environment variable that gates the fused kernel at runtime.
-constexpr char kEnableEnv[] = "TRTLLM_ENABLE_FUSED_T5_ATTENTION";
 
 // ---------------------------------------------------------------------------
 // Type conversion helpers.
@@ -636,24 +635,30 @@ __global__ void fusedT5AttentionSimtKernel(T const* __restrict__ qkv, T const* _
 }
 
 // ---------------------------------------------------------------------------
-// Env-var / SM gate.
+// SM gate.
 // ---------------------------------------------------------------------------
-bool isEnabledByEnv()
-{
-    static bool const sEnabled = []() -> bool {
-        char const* v = std::getenv(kEnableEnv);
-        if (v == nullptr)
-        {
-            return false;
-        }
-        return std::string(v) == "1" || std::string(v) == "true" || std::string(v) == "TRUE";
-    }();
-    return sEnabled;
-}
-
 bool headSizeSupported(int headSize)
 {
     return headSize == kFusedT5HeadSize32 || headSize == kFusedT5HeadSize64 || headSize == kFusedT5HeadSize128;
+}
+
+// Configure the opt-in dynamic shared-memory limit for a given kernel
+// specialization. cudaFuncSetAttribute mutates global driver state for the
+// function, so calling it concurrently from multiple host threads (which the
+// runner allows) is a data race. We serialize the configuration behind a
+// per-specialization guard and only touch the driver when the requested
+// footprint grows beyond what we have already set.
+template <typename KernelT>
+void configureMaxDynamicSmem(KernelT kernel, int smemBytes)
+{
+    static std::mutex sMutex;
+    static int sConfiguredBytes = -1;
+    std::lock_guard<std::mutex> lock(sMutex);
+    if (smemBytes > sConfiguredBytes)
+    {
+        TLLM_CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smemBytes));
+        sConfiguredBytes = smemBytes;
+    }
 }
 
 // Dispatch to the SM-specific WMMA specialization when available, otherwise
@@ -663,7 +668,7 @@ void launchDispatch(FusedT5AttentionParams const& params, T const* qkv, T const*
     int16_t const* bucketTable, int const* inputLengths, int const* cuSeqlens, T* out, cudaStream_t stream)
 {
     int const sm = common::getSMVersion();
-    bool const useWmma = sm >= 80;
+    bool const useWmma = sm >= 80 && !params.forceSimt;
 
     if (useWmma)
     {
@@ -685,7 +690,7 @@ void launchDispatch(FusedT5AttentionParams const& params, T const* qkv, T const*
         auto launchOne = [&](auto headSizeConst) {
             constexpr int kHeadSize = decltype(headSizeConst)::value;
             auto kernel = fusedT5AttentionWmmaKernel<T, kHeadSize>;
-            TLLM_CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smemBytes));
+            configureMaxDynamicSmem(kernel, smemBytes);
             kernel<<<grid, block, smemBytes, stream>>>(qkv, bucketBias, bucketTable, out, inputLengths, cuSeqlens,
                 params.numHeads, params.maxSeqLen, params.numBuckets, params.qkScale, params.removePadding);
         };
@@ -885,7 +890,7 @@ bool FusedT5AttentionRunner::isSupported(FusedT5AttentionParams const& params)
     {
         return true;
     }
-    return isEnabledByEnv();
+    return common::getEnvEnableFusedT5Attention();
 }
 
 template <typename T>
