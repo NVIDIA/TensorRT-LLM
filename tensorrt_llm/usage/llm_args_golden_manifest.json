@@ -969,6 +969,13 @@
       "annotation": "<class 'int'>",
       "converter": "",
       "kind": "value",
+      "path": "multimodal_config.encoder_cache_max_bytes"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
       "path": "multimodal_config.encoder_side_stream_max_ahead"
     },
     {
