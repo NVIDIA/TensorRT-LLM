@@ -517,7 +517,7 @@ async def test_kv_cache_aware_router_routes_with_cache_salt(
                                 use_tokens=False,
                                 max_batch_size=32,
                                 tokens_per_block=tokens_per_block)
-    monkeypatch.setattr("tensorrt_llm.serve.router.get_cache_salt_id",
+    monkeypatch.setattr("tensorrt_llm.serve.router_utils.get_cache_salt_id",
                         lambda cache_salt: cache_salt_id)
     for server in servers:
         router._server_info[server] = {
@@ -783,29 +783,6 @@ def test_kv_cache_aware_server_state_remove_blocks_silent_on_missing():
 
     state.remove_blocks((h for h in [10]), hash_algo=KV_CACHE_HASH_ALGO_V1)
     assert state._block_table(KV_CACHE_HASH_ALGO_V1) == {30}
-
-
-@pytest.mark.asyncio
-async def test_kv_cache_aware_router_applies_routed_blocks_at_routing(servers):
-    tokens_per_block = 4
-    token_lists = [[1000, 1001, 1002, 1003, 1004, 1005, 1006, 1007, 1008]]
-    router = KvCacheAwareRouter(server_role=None,
-                                servers=servers,
-                                use_tokens=False,
-                                max_batch_size=32,
-                                tokens_per_block=tokens_per_block,
-                                track_routed_blocks=True)
-
-    request = CompletionRequest(model="TinyLlama",
-                                prompt=copy.deepcopy(token_lists))
-    server, info = await router.get_next_server(request)
-
-    expected_flat = [h for hl in info["block_hashes"] for h in hl]
-    block_table = router._server_state[server]._block_table(info["hash_algo"])
-    assert block_table.issuperset(expected_flat)
-
-    await router.finish_request(request)
-    assert block_table.issuperset(expected_flat)
 
 
 @pytest.mark.asyncio

@@ -324,7 +324,7 @@ class OpenAIDisaggServer:
         await uvicorn.Server(config).serve(sockets=sockets)
 
     async def _sync_server_clock(self, server: str):
-        """Sync the ctx/gen server's steady clock with the disagg-server's steady clock (in case NTP service is not running)."""
+        """ Sync the ctx/gen server's steady clock with the disagg-server's steady clock (in case NTP service is not running). """
         async def query_steady_clock_offset(session: aiohttp.ClientSession, server_url: str) -> tuple[Optional[float], Optional[float]]:
             try:
                 originate_ts = get_steady_clock_now_in_seconds()

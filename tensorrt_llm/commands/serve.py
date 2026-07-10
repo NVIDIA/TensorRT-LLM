@@ -120,7 +120,8 @@ def _signal_handler_cleanup_child(signum, frame):
 
 
 def is_non_default_or_required(param_name, value, backend, explicit_cli_keys):
-    """Check if a parameter should be explicitly included in llm_args.
+    """
+    Check if a parameter should be explicitly included in llm_args.
 
     Returns True if parameter is either:
     1. Always required (core params that must be present), OR
@@ -435,7 +436,8 @@ def launch_grpc_server(host: str,
                        port: int,
                        llm_args: dict,
                        served_model_name: Optional[str] = None):
-    """Launch a gRPC server for TensorRT-LLM.
+    """
+    Launch a gRPC server for TensorRT-LLM.
 
     This provides a high-performance gRPC interface designed for external routers
     (e.g., sgl-router) using pre-tokenized input and raw token ID output.
@@ -1622,6 +1624,7 @@ def disaggregated(
     schedule_style: str,
 ):
     """Running server in disaggregated mode"""
+
     logger.set_level(log_level)
 
     if metrics_log_interval != 0:
@@ -1954,16 +1957,6 @@ def _build_disagg_server_from_env() -> "OpenAIDisaggServer":
     return server
 
 
-def create_disagg_server_app():
-    """Uvicorn import-string factory: build one disagg server's FastAPI app.
-
-    Retained for the ``uvicorn --factory`` entry point; the SO_REUSEPORT fleet
-    launcher uses ``_run_fleet_worker`` instead.
-    """
-    _init_fleet_worker_process()
-    return _build_disagg_server_from_env().app
-
-
 def _run_fleet_worker():
     """Run one fleet worker process.
 
@@ -2021,6 +2014,7 @@ def set_cuda_device():
                   status="beta")
 def disaggregated_mpi_worker(config_file: Optional[str], log_level: str):
     """Launching disaggregated MPI worker"""
+
     from tensorrt_llm._utils import mpi_rank
     if os.environ.get(DisaggLauncherEnvs.
                       TLLM_DISAGG_RUN_REMOTE_MPI_SESSION_CLIENT) != "1":
@@ -2230,7 +2224,7 @@ def _launch_disaggregated_leader(sub_comm, instance_idx: int, config_file: str,
                             f"Child process {_child_p_global.pid} failed to be killed even after 30s."
                         )
             assert _child_p_global.poll(
-            ) is not None, "the subprocess should be terminated"
+            ) is not None, f"the subprocess should be terminated"
 
     # Check if the process was launched and assert it's terminated
     if _child_p_global and hasattr(_child_p_global,

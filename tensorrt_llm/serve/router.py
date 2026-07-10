@@ -487,7 +487,7 @@ class Router(ABC):
             self,
             request: OpenAIRequest,
             exclude_server: Optional[str] = None) -> tuple[str, dict]:
-        """Select server by request and return some intermediate information, exclude_server is a server to exclude from the selection"""
+        """Select server by request and return some intermediate information"""
 
     @abstractmethod
     async def finish_request(self,
@@ -792,17 +792,6 @@ class LoadBalancingRouter(LoadBalancingMixin, Router):
 class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
 
     _server_state_class = KvCacheAwareServerState
-
-    @staticmethod
-    def _get_request_cache_salt_id(request: OpenAIRequest) -> Optional[int]:
-        """Resolve request cache salt through this module's public shim.
-
-        ``router.py`` historically exposed ``get_cache_salt_id``. Keeping the
-        lookup here preserves that compatibility while hashing helpers live in
-        ``router_utils.py``.
-        """
-        cache_salt = getattr(request, "cache_salt", None)
-        return None if cache_salt is None else get_cache_salt_id(cache_salt)
 
     def __init__(self,
                  server_role: ServerRole = None,
@@ -1293,10 +1282,8 @@ class ConversationRouter(BlockHashMixin, LoadBalancingMixin, Router):
         return self._server_content_load.get(server, 0)
 
     def _get_server_load(self, server: str) -> int:
-        """Return content-weighted server load.
-
-        This makes ``_select_least_loaded`` balance by estimated tokens rather
-        than request count.
+        """Use content weight so ``_select_least_loaded`` balances by
+        estimated tokens rather than request count.
         """
         return self._get_content_load(server)
 

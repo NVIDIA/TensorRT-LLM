@@ -352,7 +352,8 @@ def get_server_configs_dict(
 def extract_disagg_cluster_config(
         cluster_config_dict: Dict[str, Any],
         cluster_uri: Optional[str] = None) -> DisaggClusterConfig:
-    """Build the DisaggClusterConfig from the cluster_config_dict.
+    """
+    Build the DisaggClusterConfig from the cluster_config_dict.
     Use the default value of DisaggClusterConfig and MinimalInstances if the corresponding fields are not provided.
     If cluster_uri is provided, it will override the cluster_uri in the cluster_config_dict.
     """
@@ -488,7 +489,7 @@ def get_global_disagg_request_id(node_id: int, process_id: int = 0) -> int:
 
 
 def get_local_request_id(last_id: int) -> int:
-    """Increment the last_id by 1 and mod by MIN_GLOBAL_ID"""
+    """ increment the last_id by 1 and mod by MIN_GLOBAL_ID """
     return (last_id + 1) & (MIN_GLOBAL_ID - 1)
 
 

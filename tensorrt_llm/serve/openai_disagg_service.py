@@ -265,9 +265,10 @@ class OpenAIDisaggregatedService(OpenAIService):
                 else:
                     request.prompt_token_ids = ctx_response.prompt_token_ids
                 # Opt-in: drop conversation history so the gen worker doesn't
-                # re-parse the full conversation JSON (a GIL cost at high
-                # concurrency); it uses prompt_token_ids and only the last message,
-                # tools preserved. Config-gated (unsafe for harmony/multimodal).
+                # re-parse the full conversation JSON (dominates its GIL at high
+                # concurrency). It uses prompt_token_ids and only reads the last
+                # message; tools are preserved. Config-gated because it's unsafe
+                # for harmony/multimodal workers (model type is fixed per deploy).
                 if (
                     self._strip_gen_message_history
                     and request.messages
@@ -418,10 +419,15 @@ class OpenAIDisaggregatedService(OpenAIService):
         )
 
         if request.stream and need_ctx:
-            # Streaming gen_first: the gen POST is deferred until its generator is
-            # iterated, but the ctx server blocks on the gen rx session, so gather
-            # would deadlock. Eagerly consume the gen generator in a background task
-            # (firing the POST) and pipe chunks through a queue.
+            # For streaming gen_first requests, the gen client returns a lazy
+            # async generator whose HTTP POST only fires when iterated. The ctx
+            # server blocks waiting for the gen server's rx session (gen_first
+            # protocol). Using asyncio.gather would deadlock: ctx waits for gen
+            # server, but gen POST is deferred until the generator is consumed,
+            # and the generator isn't consumed until gather returns.
+            #
+            # Fix: eagerly start consuming the gen generator in a background
+            # task so the HTTP POST fires, then pipe chunks through a queue.
             gen_response = await self._gen_client.send_request(
                 gen_req, server=gen_server, hooks=hooks
             )

@@ -124,7 +124,7 @@ def _parse_response_input(
     if not isinstance(input_msg, dict):
         input_msg = input_msg.model_dump()
 
-    _responses_debug_log("------- Parsing input -----------")
+    _responses_debug_log(f"------- Parsing input -----------")
     _responses_debug_log(input_msg)
     _responses_debug_log("")
 
@@ -218,8 +218,10 @@ class ConversationHistoryStore:
                                  Union[list[Message],
                                        list[ChatCompletionMessageParam]]] = [],
                              prev_resp_id: Optional[str] = None) -> None:
-        """Store the response and its messages(model output messages) in the conversation store. If the previous response id is provided,
-        the messages will be appended to the conversation. Otherwise, a new conversation will be created.
+        """Store a response and its model-output messages.
+
+        If the previous response ID is provided, the messages are appended to
+        that conversation. Otherwise, a new conversation is created.
 
         Args:
             resp: ResponsesResponse
@@ -233,7 +235,7 @@ class ConversationHistoryStore:
         _responses_debug_log(
             f"ConversationHistoryStore storing resp: {resp_id}")
         if ENABLE_RESPONSES_DEBUG_MSG:
-            _responses_debug_log(" -> resp_msgs:")
+            _responses_debug_log(f" -> resp_msgs:")
             for msg in resp_msgs:
                 _responses_debug_log(f" -> {msg}")
 
@@ -277,7 +279,8 @@ class ConversationHistoryStore:
                              msgs: Union[list[Message],
                                          list[ChatCompletionMessageParam]],
                              prev_resp_id: Optional[str]) -> None:
-        """Store the messages in the conversation store.
+        """
+        Store the messages in the conversation store.
 
         `msgs` should always contains the whole conversation messages, including the previous messages and the new messages.
 
@@ -289,7 +292,7 @@ class ConversationHistoryStore:
         Returns:
             None
         """
-        _responses_debug_log("ConversationHistoryStore storing msg:")
+        _responses_debug_log(f"ConversationHistoryStore storing msg:")
         if ENABLE_RESPONSES_DEBUG_MSG:
             for msg in msgs:
                 _responses_debug_log(f" -> {msg}")
@@ -315,7 +318,7 @@ class ConversationHistoryStore:
     async def get_conversation_history(
             self, resp_id: str
     ) -> Union[list[Message], list[ChatCompletionMessageParam]]:
-        _responses_debug_log("ConversationHistoryStore getting prev_msgs:")
+        _responses_debug_log(f"ConversationHistoryStore getting prev_msgs:")
         _responses_debug_log(f" -> prev_resp_id: {resp_id}")
         async with self.conversations_lock:
             if resp_id in self.response_to_conversation:
@@ -328,7 +331,8 @@ class ConversationHistoryStore:
             return []
 
     def _update_visited_conversation(self, conversation_id) -> None:
-        """Update the visited conversation to the front of the conversation store.
+        """Move the visited conversation to the front of the store.
+
         This function is used to keep the conversation store sorted by the visited time.
         And also remove the least recently visited conversation if the number of conversations exceeds the limit.
 
@@ -353,7 +357,8 @@ class ConversationHistoryStore:
             self.conversation_to_response.pop(removed_id)
 
     def _pop_conversation(self, resp_id) -> None:
-        """Pop the oldest conversation messages from a conversation.
+        """Pop the oldest messages from a conversation.
+
         The conversation is starting by a user message and ending by an assistant message.
         This function is used to keep the number of messages in a conversation within the limit.
 
@@ -535,7 +540,8 @@ def _parse_output_tokens(tokens: list[int]) -> list[Message]:
 
 
 def _parse_output_message_harmony(message: Message) -> list[ResponseOutputItem]:
-    """Parse a Harmony message into a list of output response items.
+    """
+    Parse a Harmony message into a list of output response items.
     """
     if message.author.role != "assistant":
         # This is a message from a tool to the assistant (e.g., search result).
@@ -716,7 +722,8 @@ async def _create_input_messages(
 
 def _create_output_messages(
         output_contents: dict[str, Any]) -> list[ChatCompletionMessageParam]:
-    """Convert output contents to chat completion messages for conversation store.
+    """
+    Convert output contents to chat completion messages for conversation store.
 
     Reasoning content is not included in the output messages to reduce the token usage.
 
@@ -798,7 +805,8 @@ async def _create_input_tokens(
     model_config: PretrainedConfig,
     processor: AutoProcessor,
 ) -> Tuple[list[int], Optional[dict[str, list[Any]]]]:
-    """Create input tokens for the model. Also return the mm data if the model is multimodal.
+    """
+    Create input tokens for the model. Also return the mm data if the model is multimodal.
 
     Returns:
         Tuple[list[int], Optional[dict[str, list[Any]]]]: Input tokens and mm data.
@@ -888,7 +896,7 @@ async def request_preprocess(
         prev_msgs = await conversation_store.get_conversation_history(
             prev_response_id)
 
-        _responses_debug_log("Prev msgs:")
+        _responses_debug_log(f"Prev msgs:")
         for msg in prev_msgs:
             _responses_debug_log(f" -> {msg}")
 
@@ -1368,8 +1376,10 @@ class ResponsesStreamingEventsHelper:
     def _get_output_added_events(
         self, output_item: ResponseOutputMessage | ResponseReasoningItem
     ) -> list[StreamingResponsesResponse]:
-        """Get item added event and content part added event for a message item which is starting
-        to be generated.
+        """Get the added events for a message item.
+
+        Returns the item-added and content-part-added events when generation
+        starts.
 
         Returns:
             list[StreamingResponsesResponse]: A list of streaming responses responses
@@ -1427,7 +1437,8 @@ def _should_send_done_events(
     streaming_events_helper: Optional[ResponsesStreamingEventsHelper] = None,
     finished_generation: bool = False,
 ) -> Tuple[bool, bool, Optional[str], Optional[str]]:
-    """Determine if done events should be sent for text or reasoning items.
+    """
+    Determine if done events should be sent for text or reasoning items.
 
     Analyzes the complete output text to detect when reasoning or text sections
     have been completed and should receive done events.
@@ -1955,7 +1966,8 @@ async def process_streaming_events(
 
 
 class ServerArrivalTimeMiddleware:
-    """Custom ASGI middleware to track server arrival time.
+    """
+    Custom ASGI middleware to track server arrival time.
 
     We implement this as a pure ASGI middleware instead of using FastAPI's
     @app.middleware("http") decorator because the decorator internally uses
@@ -2098,7 +2110,8 @@ class PeriodicBreakdownLogger:
 
 
 class ResponseHooks(ABC):
-    """Hooks for response processing and (disagg) service perf observability.
+    """
+    Hooks for response processing and (disagg) service perf observability.
     """
 
     @abstractmethod
