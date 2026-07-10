@@ -1061,6 +1061,25 @@ class TestFailFastDuringBenchmarkFill:
         )
         ex._handle_errors.assert_not_called()
 
+    def test_partial_transfer_admission_uses_only_admitted_requests(self):
+        """The admitted subset is prepared and passed to the idle check."""
+        admitted_req = _make_active_request(in_init=True)
+        deferred_req = _make_active_request(in_init=True)
+        candidates = [admitted_req, deferred_req]
+        ex = self._make_executor(fill_phase_active=True, fitting_init_requests=candidates)
+        ex._apply_disagg_transfer_admission = Mock(return_value=([admitted_req], False))
+        ex._check_disagg_transfer_progress_when_idle = Mock()
+
+        result, _ = ex._prepare_and_schedule_batch()
+
+        assert result is not None
+        ex._apply_disagg_transfer_admission.assert_called_once_with(candidates)
+        ex._prepare_disagg_gen_init.assert_called_once_with([admitted_req])
+        ex._check_disagg_transfer_progress_when_idle.assert_called_once_with(
+            0, [admitted_req], False, False
+        )
+        ex._handle_errors.assert_not_called()
+
     def test_fill_with_no_init_requests_does_not_kill(self):
         """The final fill iteration is ready for the gate, not terminal."""
         ex = self._make_executor(fill_phase_active=True, num_init_requests=0)

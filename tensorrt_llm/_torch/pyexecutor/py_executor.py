@@ -3328,6 +3328,8 @@ class PyExecutor:
     def _allgather_model_parallel_status(
             self, local_status: Tuple[int, bool]) -> List[Tuple[int, bool]]:
         """Gather a status over the TP+CP scheduling group."""
+        # CP may coexist with TP; tp_cp_allgather covers both CP-only and
+        # TP+CP configurations.
         if self._dist_size(self.dist, "cp_size") > 1:
             return self.dist.tp_cp_allgather(local_status)
         if self._dist_size(self.dist, "tp_size") > 1:
