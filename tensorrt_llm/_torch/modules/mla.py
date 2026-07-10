@@ -1505,6 +1505,10 @@ class MLA(nn.Module):
             if self.apply_rotary_emb:
                 assert ctx_position_ids is not None
                 k_pe_ctx = self.apply_rope(q_ctx, k_pe_ctx, ctx_position_ids)
+                # External RoPE: keep the latent cache's rope half in sync, as
+                # forward_impl does for the dense path — the backend appends
+                # these rows verbatim.
+                latent_cache_ctx[..., self.kv_lora_rank :] = k_pe_ctx
 
             self.forward_context_sparse_mla(
                 q_ctx,
@@ -1522,13 +1526,10 @@ class MLA(nn.Module):
             compressed_kv_gen = compressed_kv[num_ctx_tokens:, ...]
             k_pe_gen = k_pe[num_ctx_tokens:, ...]
             latent_cache_gen = latent_cache[num_ctx_tokens:, ...]
-            gen_position_ids = (
-                position_ids[..., num_ctx_tokens:num_tokens] if position_ids is not None else None
-            )
-            if self.apply_rotary_emb:
-                assert gen_position_ids is not None
-                k_pe_gen = self.apply_rope(q_gen, k_pe_gen, gen_position_ids)
-
+            # No external RoPE here: forward_absorption_generation's
+            # _mla_gen_rope rotates q_pe/k_pe itself (slicing position_ids by
+            # num_ctx_tokens), so rotating in this phase split too would
+            # rotate them twice. Pass the full position_ids for that slicing.
             self.forward_generation_sparse_mla(
                 q_gen,
                 compressed_kv_gen,
@@ -1537,7 +1538,7 @@ class MLA(nn.Module):
                 output[num_ctx_tokens:num_tokens, :],
                 latent_cache=latent_cache_gen,
                 topk_indices=topk_indices[num_ctx_tokens:num_tokens, :],
-                position_ids=gen_position_ids,
+                position_ids=position_ids,
             )
 
     def forward_impl_with_deepseek_v4(

@@ -682,15 +682,15 @@ def create_py_executor(
     if (llm_args.attn_backend in ["FLASHINFER", "FLASHINFER_STAR_ATTENTION"]
             and kv_cache_config.enable_block_reuse):
         # Workaround for the dense flashinfer wrapper and star attention.
-        # DeepSeek-V4 routes attention through its dedicated sparse backend:
-        # reused blocks reach its kernels through the same position-based
-        # block tables as fresh ones, and the indexer K-cache stride defect
-        # that used to fault under reuse retention is fixed at
-        # Indexer.build_indexer_params, so it keeps prefix caching.
+        # DeepSeek-V4 and DSA route attention through dedicated sparse
+        # backends: reused blocks reach their kernels through the same
+        # position-based block tables as fresh ones, and the indexer K-cache
+        # stride defect that used to fault under reuse retention is fixed at
+        # Indexer.build_indexer_params, so they keep prefix caching.
         routes_to_sparse_backend = (
             sparse_attention_config is not None
             and getattr(sparse_attention_config, "algorithm",
-                        None) == "deepseek_v4")
+                        None) in ("deepseek_v4", "dsa"))
         if not routes_to_sparse_backend:
             logger.warning(
                 f"Disabling block reuse for {llm_args.attn_backend} backend")
