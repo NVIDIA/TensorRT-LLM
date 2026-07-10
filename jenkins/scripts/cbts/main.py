@@ -190,7 +190,14 @@ class Selector:
         reasons = [f"[{rule.name}] {r.reason}" for rule, r in pairs]
         scope = _combine_scopes([r.scope for _, r in pairs])
         if scope is None:
-            return SelectionResult(scope=None, reasons=reasons + ["Scopes cannot be combined"])
+            # scope=None is a rule's force-fallback signal; attribute it, not a scope conflict.
+            forced = sorted({rule.name for rule, r in pairs if r.scope is None})
+            if forced:
+                summary = f"Fallback forced by rule(s): {', '.join(forced)}"
+            else:
+                actionable = sorted({r.scope for _, r in pairs if r.scope and r.scope != "noop"})
+                summary = f"Scopes cannot be combined: {', '.join(actionable)}"
+            return SelectionResult(scope=None, reasons=reasons + [summary])
 
         affected_stages: set[str] = set()
         for _, r in pairs:

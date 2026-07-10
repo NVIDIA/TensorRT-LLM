@@ -24,8 +24,8 @@ import triton.language as tl
 from tensorrt_llm._utils import get_sm_version, nvtx_range
 
 from ..attention_backend import AttentionMetadata
+from ..pyexecutor.sampler.sampling_utils import sampling_batch_spec_dec_one_model
 from .eagle3 import Eagle3OneModelWorker
-from .one_model_sampler import sampling_batch_spec_dec_one_model
 
 if TYPE_CHECKING:
     from ...llmapi.llm_args import EagleDecodingConfig
@@ -782,7 +782,6 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
                 spec_metadata.temperatures[:num_flat_tokens],
                 top_ks,
                 spec_metadata.top_ps[:num_flat_tokens],
-                use_flashinfer=self.use_flashinfer,
                 seed=self.seed,
                 offset=self.offset,
             )
@@ -891,7 +890,6 @@ class Eagle3OneModelDynamicTreeWorker(Eagle3OneModelWorker):
                 spec_metadata.temperatures[:num_contexts],
                 top_ks_ctx,
                 spec_metadata.top_ps[:num_contexts],
-                use_flashinfer=self.use_flashinfer,
                 seed=self.seed,
                 offset=self.offset,
             )

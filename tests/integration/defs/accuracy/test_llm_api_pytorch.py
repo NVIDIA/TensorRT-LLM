@@ -855,6 +855,35 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
 
     @skip_pre_hopper
     @pytest.mark.parametrize("backend", ["xgrammar", "llguidance"])
+    def test_guided_decoding_with_eagle3_low_latency_dispatch(
+            self, backend: str, mocker):
+        """Smoke-test enable_low_latency_host_dispatch with Eagle3 + guided decoding.
+
+        Eagle3 spec-dec captures guided-decoder hostfuncs inside the CUDA graph
+        (via _execute_guided_decoder_if_present in the target forward pass), so
+        this combination exercises the cudaLaunchHostFunc_v2 / spin-wait path.
+        """
+        mocker.patch.dict(os.environ, {"TRTLLM_XGUIDANCE_LENIENT": "1"})
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8)
+        cuda_graph_config = CudaGraphConfig(enable_padding=True)
+        spec_config = Eagle3DecodingConfig(
+            max_draft_len=3,
+            speculative_model=f"{llm_models_root()}/EAGLE3-LLaMA3.1-Instruct-8B",
+            eagle3_one_model=True)
+        llm = LLM(self.MODEL_PATH,
+                  guided_decoding_backend=backend,
+                  kv_cache_config=kv_cache_config,
+                  cuda_graph_config=cuda_graph_config,
+                  enable_chunked_prefill=True,
+                  max_num_tokens=256,
+                  speculative_config=spec_config,
+                  enable_low_latency_host_dispatch=True)
+        with llm:
+            task = JsonModeEval(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @skip_pre_hopper
+    @pytest.mark.parametrize("backend", ["xgrammar", "llguidance"])
     def test_guided_decoding_with_ngram(self, backend: str, mocker):
         mocker.patch.dict(os.environ, {"TRTLLM_XGUIDANCE_LENIENT": "1"})
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8)
@@ -3706,6 +3735,40 @@ def _make_deepseekv4_eplb_config(model_path, layer_updates_per_iter, ep_size=8):
 
 DEEPSEEKV4_TEST_MAX_BATCH_SIZE = 128
 
+_DEEPSEEK_V4_GSM8K_SYSTEM_PROMPT = (
+    "Solve the problem carefully. End your response with a final line exactly "
+    "in the form #### <answer>, using the simplest numeric form without units "
+    "or trailing zeros.")
+
+
+def _deepseekv4_pro_agg_llm_kwargs(**overrides):
+    kwargs = dict(
+        tensor_parallel_size=8,
+        moe_expert_parallel_size=8,
+        moe_config=MoeConfig(backend="TRTLLM"),
+        enable_attention_dp=True,
+        max_seq_len=4096,
+        max_batch_size=16,
+        max_num_tokens=8192,
+        custom_tokenizer="deepseek_v4",
+        # Cap the KV cache so the padded CUDA-graph capture (batch sizes up to
+        # 1024) and other post-KV resources have headroom; without this the
+        # default fraction (~0.9) leaves too little and engine init OOMs on
+        # large-memory GPUs. These tests need very little KV.
+        kv_cache_config=KvCacheConfig(enable_block_reuse=False,
+                                      tokens_per_block=128,
+                                      dtype="fp8",
+                                      host_cache_size=0,
+                                      free_gpu_memory_fraction=0.6),
+        cuda_graph_config=CudaGraphConfig(batch_sizes=[
+            1, 2, 4, 8, 16, 32, 64, 128, 192, 256, 320, 384, 448, 512, 768, 1024
+        ],
+                                          enable_padding=True),
+        speculative_config=MTPDecodingConfig(max_draft_len=1),
+    )
+    kwargs.update(overrides)
+    return kwargs
+
 
 def _run_deepseekv4_eplb(model_name,
                          model_path,
@@ -3807,6 +3870,36 @@ class TestDeepSeekV4Flash(LlmapiAccuracyTestHarness):
                              moe_backend,
                              eplb_config,
                              mtp_nextn=mtp_nextn)
+
+
+@pytest.mark.timeout(14400)
+@pytest.mark.skip_less_device(8)
+@pytest.mark.skip_less_device_memory(140000)
+@skip_pre_blackwell
+class TestDeepSeekV4Pro(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "deepseek-ai/DeepSeek-V4-Pro"
+    MODEL_PATH = f"{llm_models_root()}/DeepSeek-V4-Pro"
+    EXTRA_EVALUATOR_KWARGS = dict(
+        apply_chat_template=True,
+        system_prompt=_DEEPSEEK_V4_GSM8K_SYSTEM_PROMPT,
+    )
+
+    @pytest.mark.skip_less_mpi_world_size(8)
+    def test_gsm8k_full_accuracy(self):
+        with LLM(self.MODEL_PATH, **_deepseekv4_pro_agg_llm_kwargs()) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            acc_params = task.get_hypothesis_testing_params(
+                dtype=llm.args.dtype,
+                quant_algo=llm.args.quant_config.quant_algo,
+                kv_cache_quant_algo=llm.args.quant_config.kv_cache_quant_algo,
+                spec_dec_algo=llm.args.speculative_config.decoding_type)
+            assert acc_params.num_samples == GSM8K.NUM_SAMPLES
+            with mock.patch.dict(os.environ, {"INTEGRATION_TEST": "0"}):
+                score = task.evaluate(
+                    llm, extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+            assert score >= acc_params.ref_accuracy, (
+                f"GSM8K accuracy {score:.3f} is below recorded reference "
+                f"{acc_params.ref_accuracy:.3f}")
 
 
 @pytest.mark.timeout(14400)
@@ -5376,7 +5469,9 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_device(4)
     @pytest.mark.parametrize("one_model", [True, False],
                              ids=["one_model", "two_model"])
-    def test_eagle3_vswa_reuse_4gpus(self, one_model, mocker):
+    @pytest.mark.parametrize("v2_kv_cache", [True, False],
+                             ids=["v2_kv_cache", "v1_kv_cache"])
+    def test_eagle3_vswa_reuse_4gpus(self, v2_kv_cache, one_model, mocker):
         MAX_OUTPUT_LEN = 128179
         MAX_INPUT_LEN = 32768
 
@@ -5387,11 +5482,17 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         mocker.patch.object(GPQADiamond, "MAX_OUTPUT_LEN", MAX_OUTPUT_LEN)
         mocker.patch.object(GPQADiamond, "MAX_INPUT_LEN", MAX_INPUT_LEN)
 
+        if v2_kv_cache and not one_model:
+            pytest.skip(
+                "KVCacheManagerV2 not compatible with two-model overlap scheduling"
+            )
+
         pytorch_config = dict(cuda_graph_config=CudaGraphConfig())
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.4,
                                         dtype="auto",
                                         enable_block_reuse=True,
-                                        max_attention_window=[128, 32768])
+                                        max_attention_window=[128, 32768],
+                                        use_kv_cache_manager_v2=v2_kv_cache)
 
         eagle_model_dir = f"{llm_models_root()}/gpt_oss/gpt-oss-120b-Eagle3"
         draft_len = 3
@@ -6079,6 +6180,51 @@ class TestQwen3_5_35B_A3B(LlmapiAccuracyTestHarness):
                           extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
 
 
+@pytest.mark.skip_less_device_memory(80000)
+@skip_pre_blackwell
+class TestQwen3_6_35B_A3B(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "Qwen/Qwen3.6-35B-A3B"
+    MODEL_PATH = f"{llm_models_root()}/Qwen3.6-35B-A3B-NVFP4"
+    EXTRA_EVALUATOR_KWARGS = dict(
+        apply_chat_template=True,
+        fewshot_as_multiturn=True,
+        chat_template_kwargs=dict(enable_thinking=False),
+    )
+    GSM8K_MAX_OUTPUT_LEN = 512
+
+    @pytest.mark.parametrize("moe_backend", ["TRTLLM", "CUTEDSL"])
+    def test_nvfp4(self, moe_backend, mocker):
+        # Qwen3.6-35B-A3B NVFP4 MoE checkpoint. The TRTLLM-Gen / CuteDSL NVFP4
+        # MoE backends only support the SM100 family (B200/B300); RTX 6000
+        # (SM120) uses a different MoE path, so restrict this test to SM100/103.
+        if get_sm_version() not in (100, 103):
+            pytest.skip("Qwen3.6-35B-A3B NVFP4 MoE test runs on SM100/103 only")
+
+        if not os.path.exists(self.MODEL_PATH):
+            pytest.skip(f"Model directory {self.MODEL_PATH} does not exist")
+
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8,
+                                        enable_block_reuse=False)
+        cuda_graph_config = CudaGraphConfig(enable_padding=True,
+                                            max_batch_size=128)
+        moe_config = MoeConfig(backend=moe_backend)
+
+        with LLM(self.MODEL_PATH,
+                 trust_remote_code=True,
+                 tensor_parallel_size=1,
+                 moe_expert_parallel_size=1,
+                 max_seq_len=4096,
+                 max_batch_size=128,
+                 kv_cache_config=kv_cache_config,
+                 cuda_graph_config=cuda_graph_config,
+                 moe_config=moe_config) as llm:
+            mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN",
+                                self.GSM8K_MAX_OUTPUT_LEN)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+
+
 @skip_pre_blackwell
 @pytest.mark.skip_less_device_memory(183000)
 @pytest.mark.timeout(14400)
@@ -6554,71 +6700,6 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
     EXTRA_EVALUATOR_KWARGS = dict(chat_template_kwargs=dict(
         enable_thinking=False))
 
-    @skip_pre_blackwell
-    @pytest.mark.skip_less_device_memory(80000)
-    @pytest.mark.skip_less_mpi_world_size(4)
-    @pytest.mark.parametrize(
-        "tp_size, ep_size, attention_dp",
-        [
-            (4, 4, False),
-            (4, 1, False),
-            (4, 4, True),
-            (4, 1, True),
-        ],
-    )
-    def test_auto_dtype_4gpus(self, tp_size, ep_size, attention_dp):
-
-        kv_cache_config = KvCacheConfig(enable_block_reuse=False,
-                                        mamba_ssm_cache_dtype="float32")
-        pytorch_config = dict(disable_overlap_scheduler=False,
-                              cuda_graph_config=CudaGraphConfig(
-                                  max_batch_size=32, enable_padding=True))
-
-        with LLM(
-                f"{llm_models_root()}/NVIDIA-Nemotron-3-Super-120B-A12B-BF16",
-                kv_cache_config=kv_cache_config,
-                max_batch_size=32,
-                tensor_parallel_size=tp_size,
-                moe_expert_parallel_size=ep_size,
-                enable_attention_dp=attention_dp,
-                **pytorch_config,
-        ) as llm:
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm,
-                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm,
-                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
-
-    @skip_pre_blackwell
-    @pytest.mark.skip_less_device_memory(80000)
-    @pytest.mark.skip_less_mpi_world_size(4)
-    @parametrize_with_ids("attention_dp", [False, True])
-    def test_bf16_trtllm_gen_moe_backend(self, attention_dp):
-
-        kv_cache_config = KvCacheConfig(enable_block_reuse=False,
-                                        mamba_ssm_cache_dtype="float32")
-        pytorch_config = dict(disable_overlap_scheduler=False,
-                              cuda_graph_config=CudaGraphConfig(
-                                  max_batch_size=32, enable_padding=True))
-
-        with LLM(
-                f"{llm_models_root()}/NVIDIA-Nemotron-3-Super-120B-A12B-BF16",
-                kv_cache_config=kv_cache_config,
-                max_batch_size=32,
-                tensor_parallel_size=4,
-                moe_expert_parallel_size=4,
-                enable_attention_dp=attention_dp,
-                moe_config=MoeConfig(backend="TRTLLM"),
-                **pytorch_config,
-        ) as llm:
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm,
-                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm,
-                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
-
     def _run_nvfp4_4gpus_eplb(self, moe_backend, eplb_config, model_path):
         kv_cache_config = KvCacheConfig(
             enable_block_reuse=False,
@@ -6791,49 +6872,6 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
                           extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
 
     @skip_pre_blackwell
-    @pytest.mark.skip_less_mpi_world_size(8)
-    @pytest.mark.parametrize("moe_backend", ["TRTLLM", "CUTLASS", "CUTEDSL"],
-                             ids=["trtllm", "cutlass", "cutedsl"])
-    @pytest.mark.parametrize(
-        "attention_dp",
-        [
-            False,
-            True,
-        ],
-        ids=[
-            "attention_dp_off",
-            "attention_dp_on",
-        ],
-    )
-    def test_nvfp4_8gpus(self, attention_dp, moe_backend):
-        # Use this test to track the best performance config.
-        # The optimized config is still under investigation.
-        # Adding this test as placeholder.
-        with LLM(
-                f"{llm_models_root()}/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4",
-                kv_cache_config=KvCacheConfig(
-                    enable_block_reuse=False,
-                    mamba_ssm_cache_dtype="float16",
-                    free_gpu_memory_fraction=0.5,
-                ),
-                max_batch_size=32,
-                tensor_parallel_size=8,
-                moe_expert_parallel_size=8,
-                pipeline_parallel_size=1,
-                enable_attention_dp=attention_dp,
-                cuda_graph_config=CudaGraphConfig(max_batch_size=32,
-                                                  enable_padding=True),
-                disable_overlap_scheduler=False,
-                moe_config=MoeConfig(backend=moe_backend),
-        ) as llm:
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm,
-                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm,
-                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
-
-    @skip_pre_blackwell
     @pytest.mark.parametrize(
         "tp_size, ep_size, mamba_state_cache_interval, attention_dp, use_mtp",
         [
@@ -6843,7 +6881,7 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
             (4, 4, 256, True, False),
             (4, 4, 512, True, True),
         ],
-        ids=["TP1", "TP4_MTP", "TEP4", "TEP4_ADP", "TEP4_ADP_MTP"],
+        ids=["TP1", "TP4_MTP", "TEP4", "DEP4_MTP_OFF", "DEP4_MTP_ON"],
     )
     def test_nvfp4_4gpus_block_reuse(self, tp_size, ep_size,
                                      mamba_state_cache_interval, attention_dp,
@@ -6976,114 +7014,50 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
                 mamba_ssm_cache_dtype="float16",
                 free_gpu_memory_fraction=0.5,
             ),
-            max_batch_size=4,
+            max_batch_size=64,
             enable_attention_dp=True,
-            cuda_graph_config=CudaGraphConfig(max_batch_size=4,
+            cuda_graph_config=CudaGraphConfig(max_batch_size=64,
                                               enable_padding=True),
             disable_overlap_scheduler=False,
             moe_config=MoeConfig(backend="CUTLASS"),
         )
 
-        llm_spec = LLM(**llm_common_config, speculative_config=mtp_config)
+        with LLM(**llm_common_config,
+                 speculative_config=mtp_config) as llm_spec:
+            raw_prompts = [
+                "The capital of France is",
+                "The president of the United States is",
+                "The future of AI is",
+            ]
+            prompts = [
+                llm_spec.tokenizer.apply_chat_template(
+                    [{
+                        "role": "user",
+                        "content": p
+                    }],
+                    tokenize=False,
+                    add_generation_prompt=True,
+                ) for p in raw_prompts
+            ]
+            tok_ids = [llm_spec.tokenizer.encode(p) for p in prompts]
 
-        raw_prompts = [
-            "The capital of France is",
-            "The president of the United States is",
-            "The future of AI is",
-        ]
-        prompts = [
-            llm_spec.tokenizer.apply_chat_template(
-                [{
-                    "role": "user",
-                    "content": p
-                }],
-                tokenize=False,
-                add_generation_prompt=True,
-            ) for p in raw_prompts
-        ]
-        tok_ids = [llm_spec.tokenizer.encode(p) for p in prompts]
+            sampling_params = SamplingParams(max_tokens=128, temperature=0)
 
-        sampling_params = SamplingParams(max_tokens=128, temperature=0)
+            for i in range(len(tok_ids)):
+                num_tokens = 0
+                num_drafted = 0
+                num_accepted = 0
+                for output in llm_spec.generate_async(tok_ids[i],
+                                                      sampling_params,
+                                                      streaming=True):
+                    new_tokens = output.outputs[0].token_ids
+                    num_drafted += max_draft_len
+                    num_accepted += len(new_tokens) - num_tokens - 1
+                    num_tokens = len(new_tokens)
 
-        for i in range(len(tok_ids)):
-            num_tokens = 0
-            num_drafted = 0
-            num_accepted = 0
-            for output in llm_spec.generate_async(tok_ids[i],
-                                                  sampling_params,
-                                                  streaming=True):
-                new_tokens = output.outputs[0].token_ids
-                num_drafted += max_draft_len
-                num_accepted += len(new_tokens) - num_tokens - 1
-                num_tokens = len(new_tokens)
-
-            accept_rate = num_accepted / num_drafted
-            assert accept_rate > 0.2, \
-                f"Acceptance rate too low for prompt {i}: {accept_rate:.2f}"
-
-    @skip_pre_blackwell
-    @pytest.mark.skip_less_device(4)
-    @pytest.mark.skip_less_device_memory(80000)
-    def test_bf16_4gpu_mtp_ar(self):
-        max_draft_len = 7
-        mtp_config = MTPDecodingConfig(
-            max_draft_len=max_draft_len,
-            mtp_eagle_one_model=True,
-        )
-        model_path = f"{llm_models_root()}/NVIDIA-Nemotron-3-Super-120B-A12B-BF16"
-        llm_common_config = dict(
-            model=model_path,
-            tensor_parallel_size=4,
-            moe_expert_parallel_size=4,
-            kv_cache_config=KvCacheConfig(
-                enable_block_reuse=False,
-                mamba_ssm_cache_dtype="float16",
-                free_gpu_memory_fraction=0.5,
-            ),
-            max_batch_size=4,
-            enable_attention_dp=True,
-            cuda_graph_config=CudaGraphConfig(max_batch_size=4,
-                                              enable_padding=True),
-            disable_overlap_scheduler=False,
-            moe_config=MoeConfig(backend="CUTLASS"),
-        )
-
-        llm_spec = LLM(**llm_common_config, speculative_config=mtp_config)
-
-        raw_prompts = [
-            "The capital of France is",
-            "The president of the United States is",
-            "The future of AI is",
-        ]
-        prompts = [
-            llm_spec.tokenizer.apply_chat_template(
-                [{
-                    "role": "user",
-                    "content": p
-                }],
-                tokenize=False,
-                add_generation_prompt=True,
-            ) for p in raw_prompts
-        ]
-        tok_ids = [llm_spec.tokenizer.encode(p) for p in prompts]
-
-        sampling_params = SamplingParams(max_tokens=128, temperature=0)
-
-        for i in range(len(tok_ids)):
-            num_tokens = 0
-            num_drafted = 0
-            num_accepted = 0
-            for output in llm_spec.generate_async(tok_ids[i],
-                                                  sampling_params,
-                                                  streaming=True):
-                new_tokens = output.outputs[0].token_ids
-                num_drafted += max_draft_len
-                num_accepted += len(new_tokens) - num_tokens - 1
-                num_tokens = len(new_tokens)
-
-            accept_rate = num_accepted / num_drafted
-            assert accept_rate > 0.2, \
-                f"Acceptance rate too low for prompt {i}: {accept_rate:.2f}"
+                accept_rate = num_accepted / num_drafted
+                assert accept_rate > 0.2, \
+                    f"Acceptance rate too low for prompt {i}: {accept_rate:.2f}"
 
     @skip_pre_blackwell
     @pytest.mark.skip_less_device(4)
@@ -7114,42 +7088,42 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
             moe_config=MoeConfig(backend="CUTLASS"),
         )
 
-        llm_spec = LLM(**llm_common_config, speculative_config=mtp_config)
+        with LLM(**llm_common_config,
+                 speculative_config=mtp_config) as llm_spec:
+            raw_prompts = [
+                "The capital of France is",
+                "The president of the United States is",
+                "The future of AI is",
+            ]
+            prompts = [
+                llm_spec.tokenizer.apply_chat_template(
+                    [{
+                        "role": "user",
+                        "content": p
+                    }],
+                    tokenize=False,
+                    add_generation_prompt=True,
+                ) for p in raw_prompts
+            ]
+            tok_ids = [llm_spec.tokenizer.encode(p) for p in prompts]
 
-        raw_prompts = [
-            "The capital of France is",
-            "The president of the United States is",
-            "The future of AI is",
-        ]
-        prompts = [
-            llm_spec.tokenizer.apply_chat_template(
-                [{
-                    "role": "user",
-                    "content": p
-                }],
-                tokenize=False,
-                add_generation_prompt=True,
-            ) for p in raw_prompts
-        ]
-        tok_ids = [llm_spec.tokenizer.encode(p) for p in prompts]
+            sampling_params = SamplingParams(max_tokens=128, temperature=0)
 
-        sampling_params = SamplingParams(max_tokens=128, temperature=0)
+            for i in range(len(tok_ids)):
+                num_tokens = 0
+                num_drafted = 0
+                num_accepted = 0
+                for output in llm_spec.generate_async(tok_ids[i],
+                                                      sampling_params,
+                                                      streaming=True):
+                    new_tokens = output.outputs[0].token_ids
+                    num_drafted += max_draft_len
+                    num_accepted += len(new_tokens) - num_tokens - 1
+                    num_tokens = len(new_tokens)
 
-        for i in range(len(tok_ids)):
-            num_tokens = 0
-            num_drafted = 0
-            num_accepted = 0
-            for output in llm_spec.generate_async(tok_ids[i],
-                                                  sampling_params,
-                                                  streaming=True):
-                new_tokens = output.outputs[0].token_ids
-                num_drafted += max_draft_len
-                num_accepted += len(new_tokens) - num_tokens - 1
-                num_tokens = len(new_tokens)
-
-            accept_rate = num_accepted / num_drafted
-            assert accept_rate > 0.2, \
-                f"Acceptance rate too low for prompt {i}: {accept_rate:.2f}"
+                accept_rate = num_accepted / num_drafted
+                assert accept_rate > 0.2, \
+                    f"Acceptance rate too low for prompt {i}: {accept_rate:.2f}"
 
     @skip_pre_blackwell
     @pytest.mark.skip_less_mpi_world_size(8)
@@ -7411,71 +7385,6 @@ class TestNemotronV3Ultra(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm,
                           extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
-
-    @skip_pre_blackwell
-    @pytest.mark.skip_less_device(4)
-    @pytest.mark.skip_less_device_memory(80000)
-    def test_nvfp4_4gpu_mtp_ar(self):
-        max_draft_len = 7
-        mtp_config = MTPDecodingConfig(
-            max_draft_len=max_draft_len,
-            mtp_eagle_one_model=True,
-        )
-        model_path = f"{llm_models_root()}/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4"
-
-        llm_common_config = dict(
-            model=model_path,
-            tensor_parallel_size=4,
-            moe_expert_parallel_size=4,
-            kv_cache_config=KvCacheConfig(
-                enable_block_reuse=False,
-                mamba_ssm_cache_dtype="float16",
-                free_gpu_memory_fraction=0.5,
-            ),
-            max_batch_size=4,
-            enable_attention_dp=True,
-            cuda_graph_config=CudaGraphConfig(max_batch_size=4,
-                                              enable_padding=True),
-            disable_overlap_scheduler=False,
-            moe_config=MoeConfig(backend="CUTLASS"),
-        )
-
-        with LLM(**llm_common_config,
-                 speculative_config=mtp_config) as llm_spec:
-            raw_prompts = [
-                "The capital of France is",
-                "The president of the United States is",
-                "The future of AI is",
-            ]
-            prompts = [
-                llm_spec.tokenizer.apply_chat_template(
-                    [{
-                        "role": "user",
-                        "content": p
-                    }],
-                    tokenize=False,
-                    add_generation_prompt=True,
-                ) for p in raw_prompts
-            ]
-            tok_ids = [llm_spec.tokenizer.encode(p) for p in prompts]
-
-            sampling_params = SamplingParams(max_tokens=128, temperature=0)
-
-            for i in range(len(tok_ids)):
-                num_tokens = 0
-                num_drafted = 0
-                num_accepted = 0
-                for output in llm_spec.generate_async(tok_ids[i],
-                                                      sampling_params,
-                                                      streaming=True):
-                    new_tokens = output.outputs[0].token_ids
-                    num_drafted += max_draft_len
-                    num_accepted += len(new_tokens) - num_tokens - 1
-                    num_tokens = len(new_tokens)
-
-                accept_rate = num_accepted / num_drafted
-                assert accept_rate > 0.2, \
-                    f"Acceptance rate too low for prompt {i}: {accept_rate:.2f}"
 
 
 @skip_pre_hopper

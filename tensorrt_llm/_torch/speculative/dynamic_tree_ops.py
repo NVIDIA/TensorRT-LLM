@@ -27,7 +27,7 @@ Key Features:
 
 import torch
 
-from tensorrt_llm._torch.speculative.one_model_sampler import compute_probs_from_logits
+from tensorrt_llm._torch.pyexecutor.sampler.sampling_utils import compute_probs_from_logits
 
 
 class DynamicTreeOpsConverter:

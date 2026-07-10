@@ -47,9 +47,10 @@ from tensorrt_llm._torch.pyexecutor.sampler import (
     _request_get_sampling_params,
     _request_strategy,
 )
-from tensorrt_llm._torch.pyexecutor.sampling_utils import (
+from tensorrt_llm._torch.pyexecutor.sampler.sampling_utils import (
     GREEDY,
     BeamSearch,
+    FlashInferGroupedStrategySampler,
     Greedy,
     SimpleGroupedStrategySampler,
     Strategy,
@@ -59,9 +60,6 @@ from tensorrt_llm._torch.pyexecutor.sampling_utils import (
     TopKTopP,
     TopP,
     UtilsSamplingParams,
-)
-from tensorrt_llm._torch.pyexecutor.sampling_utils_flashinfer import (
-    FlashInferGroupedStrategySampler,
 )
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.bindings import SamplingConfig
@@ -867,107 +865,6 @@ class TestFinishReasons:
         )
 
         run_test_with_warmup(uut_provider, max_sync_s=0.5)
-
-    @pytest.mark.parametrize(
-        "sampled_token,end_id,max_new_tokens,expected_reason",
-        [
-            pytest.param(42, 99, 5, None, id="not-finished"),
-            pytest.param(99, 99, 5, FinishReason.END_ID, id="end-id"),
-            pytest.param(42, 99, 1, FinishReason.LENGTH, id="length"),
-            pytest.param(
-                99,
-                99,
-                1,
-                FinishReason.END_ID,
-                id="end-id-precedes-length",
-            ),
-        ],
-    )
-    def test_host_stop_criteria_fast_path(
-        self,
-        mocker,
-        sampled_token: int,
-        end_id: int,
-        max_new_tokens: int,
-        expected_reason: FinishReason | None,
-    ):
-        sampler = TorchSampler(
-            TorchSampler.Args(
-                max_seq_len=20,
-                max_draft_len=0,
-                max_total_draft_tokens=0,
-                max_num_sequences=1,
-                max_beam_width=1,
-            )
-        )
-        request = LlmRequest(
-            request_id=0,
-            seq_slot=0,
-            input_tokens=[1, 2],
-            max_new_tokens=max_new_tokens,
-            end_id=end_id,
-            sampling_config=SamplingConfig(),
-            is_streaming=False,
-        )
-
-        setup_requests = ScheduledRequests()
-        setup_requests.context_requests_last_chunk = [request]
-        sampler.setup_sampler_step(setup_requests)
-
-        scheduled_requests = ScheduledRequests()
-        scheduled_requests.generation_requests = [request]
-        logits = torch.full((1, 128), -1.0, dtype=torch.float32, device="cuda")
-        logits[0, sampled_token] = 1.0
-
-        finish_by = mocker.spy(request, "finish_by")
-        write_finish_reasons = mocker.patch.object(
-            sampler._finish_reasons_handler,
-            "write_finish_reasons",
-            side_effect=AssertionError("device finish reasons should be skipped"),
-        )
-
-        state = sampler.sample_async(
-            scheduled_requests,
-            model_outputs={"logits": logits},
-            num_context_logits_prefix_sum=[0],
-        )
-        assert state.use_host_stop_criteria
-        assert state.host is not None
-        assert state.host.finish_reasons is None
-
-        sampler.update_requests(state)
-
-        write_finish_reasons.assert_not_called()
-        assert request.get_tokens(0)[-1] == sampled_token
-        if expected_reason is None:
-            finish_by.assert_not_called()
-        else:
-            finish_by.assert_called_once_with(expected_reason, 0)
-
-    @pytest.mark.parametrize(
-        "sample_request",
-        [
-            pytest.param(
-                SimpleNamespace(py_is_draft=False, py_stop_words_list=[[42], [1]]),
-                id="stop-words",
-            ),
-            pytest.param(
-                SimpleNamespace(py_is_draft=True, py_stop_words_list=None),
-                id="draft-request",
-            ),
-        ],
-    )
-    def test_host_stop_criteria_fast_path_fallback(self, sample_request):
-        sampler = TorchSampler(
-            TorchSampler.Args(
-                max_seq_len=20,
-                max_draft_len=0,
-                max_total_draft_tokens=0,
-                max_num_sequences=1,
-                max_beam_width=1,
-            )
-        )
-        assert not sampler._can_use_host_stop_criteria([cast(LlmRequest, sample_request)])
 
     @classmethod
     def test_are_stop_words_isnt_called_when_no_stop_words(cls, monkeypatch: pytest.MonkeyPatch):
@@ -1919,9 +1816,7 @@ class TestBatchedSampling:
 
         if use_flashinfer:
             assert sampler._grouped_sampler_cls == FlashInferGroupedStrategySampler
-            sample_grouped_strategies_orig = (
-                FlashInferGroupedStrategySampler.sample_grouped_strategies
-            )
+            sample_grouped_strategies_orig = sampler._grouped_sampler_cls.sample_grouped_strategies
 
             def _sample_grouped_strategies(
                 group_key: FlashInferGroupedStrategySampler.STRATEGY_KEY_TYPE,
@@ -1941,7 +1836,9 @@ class TestBatchedSampling:
                 nonlocal flashinfer_keys_seen
                 assert (group_key, return_probs) not in flashinfer_keys_seen
                 flashinfer_keys_seen.add((group_key, return_probs))
-                return sample_grouped_strategies_orig(
+                result: tuple[
+                    torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor] | float
+                ] = sample_grouped_strategies_orig(
                     group_key,
                     strategies,
                     logits,
@@ -1949,12 +1846,16 @@ class TestBatchedSampling:
                     generator=generator,
                     return_probs=return_probs,
                 )
+                return result
 
-            patch_ctx.setattr(
-                sampler._grouped_sampler_cls,
-                "sample_grouped_strategies",
-                _sample_grouped_strategies,
+            # _grouped_sampler_cls is a class; point the instance at a subclass
+            # that overrides the callable, rather than mutating the shared class.
+            instrumented_cls = type(
+                "InstrumentedFlashInferGroupedStrategySampler",
+                (FlashInferGroupedStrategySampler,),
+                {"sample_grouped_strategies": staticmethod(_sample_grouped_strategies)},
             )
+            patch_ctx.setattr(sampler, "_grouped_sampler_cls", instrumented_cls)
 
             sample_async_orig = sampler.sample_async
 

@@ -41,10 +41,49 @@ if TYPE_CHECKING:
 if IS_FLASHINFER_AVAILABLE:
     import flashinfer
 
-from .one_model_sampler import (compute_probs_from_logits,
-                                rejection_sampling_one_model,
-                                sampling_batch_spec_dec_one_model,
-                                sampling_batch_spec_dec_one_model_for_rejection)
+from ..pyexecutor.sampler.sampling_utils import (
+    compute_probs_from_logits, greedy, sampling_batch_spec_dec_one_model,
+    sampling_batch_spec_dec_one_model_for_rejection)
+
+
+def rejection_sampling_one_model(
+    draft_probs: torch.Tensor,
+    draft_token_ids: torch.Tensor,
+    target_probs: torch.Tensor,
+    deterministic: bool = True,
+    seed: Optional[int] = None,
+    offset: Optional[int] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    # chain_speculative_sampling requires flashinfer>=0.6.4. This entry point can
+    # be reached independently of SpecWorkerBase.__init__'s use_flashinfer gate
+    # (e.g. via _can_use_rejection_sampling), so re-check the version here to fail
+    # with a clear message instead of a cryptic flashinfer error.
+    if not IS_FLASHINFER_AVAILABLE or Version(
+            flashinfer.__version__) < Version("0.6.4"):
+        raise RuntimeError(
+            "Rejection sampling for one-model speculative decoding requires flashinfer>=0.6.4"
+        )
+    batch_size = draft_token_ids.shape[0]
+    device = draft_token_ids.device
+    output_accepted_token_num = torch.zeros(batch_size,
+                                            dtype=torch.int32,
+                                            device=device)
+    output_emitted_draft_token_num = torch.zeros(batch_size,
+                                                 dtype=torch.int32,
+                                                 device=device)
+    accepted_tokens, _, output_emitted_draft_token_num = flashinfer.sampling.chain_speculative_sampling(
+        draft_probs,
+        draft_token_ids,
+        target_probs,
+        maybe_output_accepted_token_num=output_accepted_token_num,
+        maybe_output_emitted_draft_token_num=output_emitted_draft_token_num,
+        deterministic=deterministic,
+        generator=None,
+        seed=seed,
+        offset=offset,
+    )
+    return accepted_tokens, output_emitted_draft_token_num + 1
+
 
 # Environment variable name for forcing the number of accepted tokens in speculative decoding
 FORCE_NUM_ACCEPTED_TOKENS_ENV_VAR = "TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS"
@@ -1377,7 +1416,7 @@ class SpecWorkerBase(nn.Module, ABC):
         Returns:
             draft_tokens: [num_tokens] - Sampled draft token ids (int32)
         """
-        draft_tokens = torch.argmax(logits, dim=-1)
+        draft_tokens = greedy(logits, return_probs=False)[0]
 
         # Apply d2t (offsets between draft and target model dictionaries)
         if d2t is not None:
@@ -1426,14 +1465,12 @@ class SpecWorkerBase(nn.Module, ABC):
             self.seed += 1
             self.seed %= (2**31)
 
-        draft_tokens = sampling_batch_spec_dec_one_model(
-            logits,
-            temperatures,
-            top_ks,
-            top_ps,
-            use_flashinfer=self.use_flashinfer,
-            seed=self.seed,
-            offset=self.offset)
+        draft_tokens = sampling_batch_spec_dec_one_model(logits,
+                                                         temperatures,
+                                                         top_ks,
+                                                         top_ps,
+                                                         seed=self.seed,
+                                                         offset=self.offset)
 
         if d2t is not None:
             draft_tokens = d2t[draft_tokens] + draft_tokens
@@ -1667,7 +1704,6 @@ class SpecWorkerBase(nn.Module, ABC):
                 temperatures,
                 top_ks,
                 top_ps,
-                use_flashinfer=self.use_flashinfer,
                 seed=self.seed,
                 offset=self.offset)
         else:

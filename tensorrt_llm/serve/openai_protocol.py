@@ -171,6 +171,9 @@ class DisaggregatedParams(OpenAIBaseModel):
     # encoder embedding handles, multimodal hashes, and optional mRoPE handles.
     # Add them here and in to_disaggregated_params()/to_llm_disaggregated_params()
     # before routing MM encoder -> context -> generation through OpenAI protocol.
+    # Orchestrator -> context-worker instruction: return prompt_token_ids as a
+    # base64 int32 buffer (prompt_token_ids_b64) instead of a JSON int array.
+    return_prompt_token_ids_b64: bool = False
 
 
 class ConversationParams(OpenAIBaseModel):
@@ -661,6 +664,9 @@ class ChatCompletionResponse(OpenAIBaseModel):
     # Add prompt_tokens_ids to the response to remove the tokenization
     # in the generation server in disaggreated serving
     prompt_token_ids: Optional[List[int]] = None
+    # base64 int32 buffer alternative to prompt_token_ids; set by the context
+    # worker so the orchestrator can relay a string instead of the int list.
+    prompt_token_ids_b64: Optional[str] = None
 
 
 class DeltaMessage(OpenAIBaseModel):
@@ -718,6 +724,9 @@ class ChatCompletionRequest(OpenAIBaseModel):
     # Add prompt_tokens_ids to the request to remove the tokenization
     # in the generation server in disaggreated serving
     prompt_token_ids: Optional[List[int]] = None
+    # base64 int32 buffer relayed by the orchestrator from the ctx response;
+    # decoded back to prompt_token_ids on the generation worker. Not for clients.
+    prompt_token_ids_b64: Optional[str] = None
     model: str
     frequency_penalty: Optional[float] = 0.0
     logit_bias: Optional[Dict[str, float]] = None

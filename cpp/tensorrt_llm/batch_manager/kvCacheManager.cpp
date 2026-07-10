@@ -3182,9 +3182,16 @@ std::optional<KVCacheBlock::IdType> WindowBlockManager::releaseBlocks(
         // mRefCount==0 and are silently ignored by EvictionPolicy::releaseBlock().
         if (!block->hasRefs())
         {
+            auto const isDetached = block->isDetached();
+            if (isDetached)
+            {
+                // Detached blocks have no reusable hash chain. Drop the stale owning link before recycling the block;
+                // otherwise front-queue reuse can join completed request chains into an unbounded ownership chain.
+                block->setPrevBlockInSeq(nullptr);
+            }
             // Send block to front of free queue if it has no reusable state,
             // so detached blocks are evicted before blocks cached for reuse.
-            mEvictionPolicy->releaseBlock(block, /*toFront = */ block->isDetached());
+            mEvictionPolicy->releaseBlock(block, /*toFront=*/isDetached);
         }
     }
     // Remove stored block ids in sequence
