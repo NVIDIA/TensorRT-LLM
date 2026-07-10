@@ -259,20 +259,23 @@ class SessionReuseCache:
         return int(os.environ.get("TRTLLM_TEST_REUSE_MAX_USES", "16"))
 
     @staticmethod
-    def _retire(real):
+    def _retire(real, broken: bool = False):
         """Dispose of a pool in the background without blocking the test.
 
-        Pools are usually retired because they are broken (failed health
-        probe, stale env, lifetime cap). A graceful ``shutdown()`` on a pool
-        whose workers are wedged in a collective blocks forever and leaks the
-        workers' GPU memory into subsequent tests. ``shutdown_abort`` is NOT
-        an option either: it calls ``MPI_COMM_WORLD.Abort``, which kills the
-        parent test process along with the workers. Instead SIGKILL the
-        worker PIDs recorded at spawn (retired pools are discarded, so
-        nothing needs a graceful stop; the driver reclaims GPU memory on
-        process death) and then reap the client side.
+        Healthy retires (lifetime cap, stale env snapshot, duplicate cache
+        slot) use a graceful ``shutdown()``: the workers are idle and exit
+        cleanly, and killing MPI-spawned children abnormally can upset the
+        MPI runtime in the parent process.
+
+        ``broken=True`` (failed health probe) means the workers may be wedged
+        in a collective: a graceful shutdown would block forever and leak
+        their GPU memory into subsequent tests, and ``shutdown_abort`` calls
+        ``MPI_COMM_WORLD.Abort``, which kills the parent test process too.
+        Instead SIGKILL the worker PIDs recorded at spawn (a discarded pool
+        needs no graceful stop; the driver reclaims GPU memory on process
+        death) and then reap the client side.
         """
-        pids = getattr(real, "_reuse_worker_pids", ())
+        pids = getattr(real, "_reuse_worker_pids", ()) if broken else ()
 
         def _dispose():
             import signal
@@ -371,7 +374,7 @@ class SessionReuseCache:
                         f"[session-reuse] cached pool failed reset, rebuilding: {e}",
                         flush=True,
                     )
-                    self._retire(real)
+                    self._retire(real, broken=True)
         return _ReusableSession(self._spawn_fresh(real_cls, n_workers), self)
 
     def _spawn_fresh(self, real_cls, n_workers):
