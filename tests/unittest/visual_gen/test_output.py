@@ -32,8 +32,12 @@ def test_visual_gen_output_is_dataclass():
         "image",
         "video",
         "audio",
+        "action",
         "frame_rate",
         "audio_sample_rate",
+        "raw_action_dim",
+        "action_mode",
+        "domain_id",
         "error",
         "metrics",
     }
@@ -62,6 +66,10 @@ def test_minimal_construction_defaults():
     assert out.audio is None
     assert out.frame_rate is None
     assert out.audio_sample_rate is None
+    assert out.action is None
+    assert out.raw_action_dim is None
+    assert out.action_mode is None
+    assert out.domain_id is None
     assert out.error is None
     assert out.metrics is None
 
@@ -753,15 +761,19 @@ def test_encoding_not_top_level_reexport():
 # ---------------------------------------------------------------------------
 
 
-def test_pipeline_output_has_eight_fields():
-    """PipelineOutput has the eight expected fields."""
+def test_pipeline_output_field_set():
+    """PipelineOutput exposes exactly the expected fields."""
     field_names = {f.name for f in fields(PipelineOutput)}
     assert field_names == {
         "image",
         "video",
         "audio",
+        "action",
         "frame_rate",
         "audio_sample_rate",
+        "raw_action_dim",
+        "action_mode",
+        "domain_id",
         "pre_denoise",
         "denoise",
         "post_denoise",
@@ -774,11 +786,52 @@ def test_pipeline_output_default_construction():
     assert p.image is None
     assert p.video is None
     assert p.audio is None
+    assert p.action is None
+    assert p.raw_action_dim is None
+    assert p.action_mode is None
+    assert p.domain_id is None
     assert p.frame_rate is None
     assert p.audio_sample_rate is None
     assert p.pre_denoise == 0.0
     assert p.denoise == 0.0
     assert p.post_denoise == 0.0
+
+
+def test_from_response_propagates_action_fields():
+    """to_visual_gen_output carries the action tensor and its metadata."""
+    action = torch.zeros(1, 16, 10, dtype=torch.float32)
+    pipeline_out = PipelineOutput(
+        action=action,
+        raw_action_dim=10,
+        action_mode="policy",
+        domain_id=7,
+    )
+    resp = DiffusionResponse(request_id=5, output=pipeline_out, generation=12.0)
+    out = to_visual_gen_output(resp)
+    assert out.action is action
+    assert out.raw_action_dim == 10
+    assert out.action_mode == "policy"
+    assert out.domain_id == 7
+
+
+def test_batch_split_slices_action():
+    """split_visual_gen_output slices batched actions per item and shares scalar metadata."""
+    action = torch.stack([torch.full((16, 10), float(v), dtype=torch.float32) for v in (1, 2, 3)])
+    pipeline_out = PipelineOutput(
+        action=action,
+        raw_action_dim=10,
+        action_mode="inverse_dynamics",
+        domain_id=1,
+    )
+    resp = DiffusionResponse(request_id=9, output=pipeline_out, generation=30.0)
+    outs = split_visual_gen_output(resp, batch_size=3)
+    assert len(outs) == 3
+    for i, out in enumerate(outs):
+        assert out.action.shape == (16, 10)
+        assert float(out.action[0, 0]) == float(i + 1)
+        assert out.raw_action_dim == 10
+        assert out.action_mode == "inverse_dynamics"
+        assert out.domain_id == 1
 
 
 def test_media_output_unimportable():
