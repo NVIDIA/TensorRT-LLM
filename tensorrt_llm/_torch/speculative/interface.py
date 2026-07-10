@@ -548,6 +548,13 @@ class SpecMetadata:
     # Shape: [num_seq_slots, max_draft_len, vocab_size].
     draft_probs: Optional[torch.Tensor] = None
     draft_probs_vocab_size: int = 0
+    # Scratch row index that dummy/padding requests (py_seq_slot is None) route
+    # to, captured when draft_probs is allocated so it tracks the buffer's real
+    # size. It must NOT be re-derived from max_num_requests at use time:
+    # create_cuda_graph_metadata shrinks max_num_requests to the graph bucket
+    # size while sharing the full-size buffer, so a bucket-relative index would
+    # collide with a real request's slot row and overwrite its draft probs.
+    dummy_slot_row: int = 0
     # Whether draft_probs contains valid data.
     draft_probs_valid: bool = False
     # Last dimension size of the draft logits/probs stored in draft_probs.
@@ -592,6 +599,11 @@ class SpecMetadata:
                 dtype=torch.float32,
                 device='cuda')
             self.draft_probs_vocab_size = self.vocab_size
+            # Dummy requests route to the extra scratch row (the buffer's last
+            # row at index ``slot_capacity``). Capture it here against the real
+            # allocation size so it stays correct on graph copies that shrink
+            # max_num_requests and under overlap where slot_capacity exceeds it.
+            self.dummy_slot_row = slot_capacity
         if self.batch_slot_ids is None and self.max_num_requests > 0:
             self.batch_slot_ids = torch.empty((self.max_num_requests, ),
                                               dtype=torch.long,
@@ -738,12 +750,12 @@ class SpecMetadata:
                 (temp_val, tk_val, tp_val, num_tokens))
             # py_seq_slot is a stable per-request id used to scatter/gather draft
             # probs across iterations. Dummy/padding requests (py_seq_slot is
-            # None) route to the scratch row at index ``slot_capacity`` (==
-            # num_seq_slots or max_num_requests), matching the buffer sizing in
-            # prepare_rejection_sampling_buffers so a real slot never collides.
+            # None) route to the scratch row captured at allocation time (the
+            # buffer's real last row), not max_num_requests, which a graph copy
+            # shrinks to the bucket size and would alias a real request's slot.
             per_request_slot_ids.append(
-                request.py_seq_slot if request.py_seq_slot is not None else
-                (self.num_seq_slots or self.max_num_requests))
+                request.py_seq_slot if request.
+                py_seq_slot is not None else self.dummy_slot_row)
 
         self.skip_temperature = not temperature_enabled
         self.skip_top_k = not top_k_enabled

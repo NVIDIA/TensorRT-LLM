@@ -444,6 +444,24 @@ class CUDAGraphRunner:
         self.graph_outputs[key] = make_weak_ref(output)
         self.memory_pool = graph.pool()
 
+        self._invalidate_draft_probs_after_capture(
+            self.graph_metadata[key].get("spec_metadata"))
+
+    @staticmethod
+    def _invalidate_draft_probs_after_capture(spec_metadata):
+        """Clear the one-model rejection producer flag on the captured metadata.
+
+        Warmup ran dummy requests through the full draft forward, which sets
+        ``draft_probs_valid=True`` while only the dummy scratch slot was
+        populated. Clearing it here makes the first real replay's acceptance fail
+        closed to strict acceptance until the real draft forward repopulates the
+        per-slot draft-prob buffers. No-op when spec metadata is absent or does
+        not carry the flag (non-rejection paths).
+        """
+        if spec_metadata is not None and hasattr(spec_metadata,
+                                                 "draft_probs_valid"):
+            spec_metadata.draft_probs_valid = False
+
     def replay(self, key: KeyType,
                current_inputs: Dict[str, Any]) -> Optional[torch.Tensor]:
         """Replays a previously captured graph."""
