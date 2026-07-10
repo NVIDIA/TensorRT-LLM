@@ -1096,7 +1096,14 @@ class KVCacheManagerV2(BaseResourceManager):
           ("super-page", multiple of 2; default 2). Larger pages amortize the
           fixed per-mapping cuMemSetAccess cost (§4.8).
         - ``TRTLLM_KV_ARENA_MAP_AHEAD_PAGES``: demand-paging margin (§4.2,
-          default 1).
+          default 0). The margin is charged against the page budget per
+          sequence, so near the admission-utilization ceiling it converts
+          directly into fewer admitted sequences (measured on Llama-3.1-8B
+          at 256-way concurrency, 16 MiB pages, 0.85 memory fraction:
+          margin 1 cost 9.5 mean batch and 1.7% throughput versus margin
+          0), while its latency hiding does not measure — at super-page
+          granularity a sequence crosses a page boundary only every
+          ``page_size / bytes_per_token`` tokens.
         - ``TRTLLM_KV_ARENA_WRITE_THROUGH``: ``on_free`` (default) or
           ``on_commit`` (§4.3).
         - ``TRTLLM_KV_ARENA_LAZY_RETENTION``: ``1`` keeps freed sequence
@@ -1120,7 +1127,7 @@ class KVCacheManagerV2(BaseResourceManager):
           default 0.05, ``0`` restores unprotected spilling).
         """
         page_mb = int(os.environ.get("TRTLLM_KV_ARENA_PHYS_PAGE_SIZE_MB", "2"))
-        map_ahead = int(os.environ.get("TRTLLM_KV_ARENA_MAP_AHEAD_PAGES", "1"))
+        map_ahead = int(os.environ.get("TRTLLM_KV_ARENA_MAP_AHEAD_PAGES", "0"))
         write_through_env = os.environ.get("TRTLLM_KV_ARENA_WRITE_THROUGH", "on_free").lower()
         assert write_through_env in ("on_free", "on_commit"), (
             f"TRTLLM_KV_ARENA_WRITE_THROUGH must be 'on_free' or 'on_commit', "

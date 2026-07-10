@@ -215,6 +215,7 @@ class TestContiguousArenaConfig(unittest.TestCase):
     def test_defaults(self) -> None:
         c = ContiguousArenaConfig()
         self.assertEqual(c.phys_page_size, 2 * MiB)
+        self.assertEqual(c.map_ahead_pages, 0)
         self.assertEqual(c.write_through, WriteThroughPolicy.ON_FREE)
         self.assertFalse(c.lazy_gpu_retention)
 

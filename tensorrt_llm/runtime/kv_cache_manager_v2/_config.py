@@ -220,7 +220,11 @@ class ContiguousArenaConfig:
             (~page_size/2 per sequence per pool group). See DESIGN.md §4.8.
         map_ahead_pages: Number of physical pages to keep mapped ahead of a
             growing sequence's write frontier, to hide driver-call latency and
-            absorb speculative-decoding bursts (DESIGN.md §4.2).
+            absorb speculative-decoding bursts (DESIGN.md §4.2). The margin
+            is charged against the page budget per sequence, so near the
+            admission-utilization ceiling it converts into fewer admitted
+            sequences; at super-page granularity boundary crossings are rare
+            enough that the latency hiding does not measure. Default 0.
         write_through: See :class:`WriteThroughPolicy`.
         lazy_gpu_retention: If True, keep a freed sequence's pages mapped
             (LRU-ordered) until the shared pool needs them, so a reuse hit on a
@@ -231,7 +235,7 @@ class ContiguousArenaConfig:
     """
 
     phys_page_size: int = 2 << 20
-    map_ahead_pages: int = 1
+    map_ahead_pages: int = 0
     write_through: WriteThroughPolicy = WriteThroughPolicy.ON_FREE
     lazy_gpu_retention: bool = False
     max_va_bytes_per_pool: int = 0

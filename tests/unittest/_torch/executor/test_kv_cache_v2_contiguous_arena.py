@@ -236,9 +236,11 @@ class TestArenaSchedulerDeadlockRecovery(unittest.TestCase):
         )
 
     def test_try_allocate_generation_recovers_from_all_suspended(self) -> None:
-        # Budget = exactly the pages one 31-block request maps, so a single
-        # suspended request pins utilization at 100% (> the 0.95 resume gate)
-        # until its freed range actually drains.
+        # Budget = exactly the pages one 33-block request maps (2 pages at
+        # 32 blocks/page — the request itself spans both, independent of the
+        # map-ahead margin), so a single suspended request pins utilization
+        # at 100% (> the 0.95 resume gate) until its freed range actually
+        # drains.
         mgr = _create_arena_manager(max_tokens=512)
         try:
             budget = mgr.impl._storage.gpu_page_budget
@@ -246,7 +248,7 @@ class TestArenaSchedulerDeadlockRecovery(unittest.TestCase):
             kv = mgr._create_kv_cache(1, None, None)
             kv.cuda_stream = mgr._stream.cuda_stream
             self.assertTrue(kv.resume(mgr._stream.cuda_stream))
-            self.assertTrue(kv.resize(31 * TOKENS_PER_BLOCK))
+            self.assertTrue(kv.resize(33 * TOKENS_PER_BLOCK))
             self.assertEqual(budget.used_pages, 2)
 
             # Scheduler self-eviction mid-pass: the freed range lands in
