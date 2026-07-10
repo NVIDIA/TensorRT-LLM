@@ -245,6 +245,9 @@ def make_deepseek_v4_sparse_metadata_params(
         max_sparse_topk=_sparse_config_value(
             sparse_attention_config, pretrained_config, "index_topk"
         ),
+        index_head_dim=_sparse_config_value(
+            sparse_attention_config, pretrained_config, "index_head_dim", 128
+        ),
         enable_indexer_skip=sparse_attention_config.skip_indexer_for_short_seqs,
         enable_heuristic_topk=sparse_attention_config.enable_heuristic_topk,
         use_cute_dsl_paged_mqa_logits=(sparse_attention_config.use_cute_dsl_paged_mqa_logits),
@@ -271,16 +274,11 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         super().__post_init__()
         self.num_total_compressed_tokens = {}
         self.max_ctx_compressed_tokens = {}
-        window_size = getattr(self.sparse_metadata_params, "window_size", None)
-        if window_size is None and self.sparse_attention_config is not None:
-            window_size = self.sparse_attention_config.window_size
-        compress_ratios = getattr(self.sparse_metadata_params, "compress_ratios", None)
-        if not compress_ratios and self.sparse_attention_config is not None:
-            compress_ratios = self.sparse_attention_config.compress_ratios
-        if compress_ratios:
-            self.compress_ratios = compress_ratios
-
-        self.window_size = window_size
+        sparse_metadata_params = self.sparse_metadata_params
+        if not isinstance(sparse_metadata_params, DeepSeekV4MetadataParams):
+            raise ValueError("DeepSeek-V4 sparse attention metadata params are not set")
+        self.window_size = sparse_metadata_params.window_size
+        window_size = self.window_size
         assert window_size == 128, (
             f"Dual-pool sparse MLA requires window_size == 128, which equals to the"
             f"TileSizeKV of the FMHA kernel. (got {window_size})."
