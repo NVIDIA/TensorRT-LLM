@@ -343,7 +343,9 @@ class SharedTensorContainer:
             raise ValueError(f"Failed to deserialize tensor information: {e}")
 
     @classmethod
-    def from_tensor(cls, tensor: torch.Tensor, local: bool = False) -> 'SharedTensorContainer':
+    def from_tensor(cls,
+                    tensor: torch.Tensor,
+                    local: bool = False) -> 'SharedTensorContainer':
         """Create a SharedTensorContainer from a local tensor (Producer side).
 
         This method is called by the producer process to prepare a tensor for sharing
@@ -355,14 +357,20 @@ class SharedTensorContainer:
 
         Args:
             tensor: The tensor to share
+            local: When True, keep the tensor in a process-local store and
+                skip the cross-process IPC handle, for a consumer in the same
+                process (e.g. external-launch where producer and consumer are
+                threads of one process). CUDA IPC handles are invalid same-process.
 
         Returns:
             SharedTensorContainer instance that can be serialized later for IPC
         """
         if local:
             token = _LocalTensorStore.stash(tensor)
-            return cls(_SharedTensorRebuildMethodRegistry.REBUILD_LOCAL,
-                       {"local_token": token, "producer_pid": os.getpid()})
+            return cls(_SharedTensorRebuildMethodRegistry.REBUILD_LOCAL, {
+                "local_token": token,
+                "producer_pid": os.getpid()
+            })
         rebuild_method, tensor_handle = reduce_tensor(tensor)
         method_key = _SharedTensorRebuildMethodRegistry.register(rebuild_method)
         return cls(method_key, tensor_handle)
@@ -386,10 +394,11 @@ class SharedTensorContainer:
         """
         method_key = tensor_info['method_key']
         if method_key == _SharedTensorRebuildMethodRegistry.REBUILD_LOCAL:
-            return cls(method_key, {
-                "local_token": tensor_info["local_token"],
-                "producer_pid": tensor_info["producer_pid"],
-            })
+            return cls(
+                method_key, {
+                    "local_token": tensor_info["local_token"],
+                    "producer_pid": tensor_info["producer_pid"],
+                })
         if method_key == _SharedTensorRebuildMethodRegistry.REBUILD_CUDA:
             tensor_handle = SharedTensorContainer.dict_to_cuda_handle(
                 tensor_info)

@@ -86,7 +86,9 @@ class PipelineOutput:
         for f in fields(self):
             t = getattr(self, f.name)
             if isinstance(t, torch.Tensor):
-                setattr(self, f.name, SharedTensorContainer.from_tensor(t, local=local).dump_to_dict())
+                setattr(
+                    self, f.name, SharedTensorContainer.from_tensor(t, local=local).dump_to_dict()
+                )
 
     def to_tensor(self) -> None:
         """Rebuild media tensors from handle dicts, in place. ``clone()`` so the client
