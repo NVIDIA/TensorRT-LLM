@@ -9,6 +9,7 @@ The ``trtllm-serve`` command starts an OpenAI compatible server that supports th
 - ``/v1/models``
 - ``/v1/completions``
 - ``/v1/chat/completions``
+- ``/v1/embeddings``
 
 For information about the inference endpoints, refer to the `OpenAI API Reference <https://platform.openai.com/docs/api-reference>`__.
 
@@ -81,6 +82,40 @@ Another example uses ``curl``:
     :language: bash
     :linenos:
 
+
+Embeddings API
+~~~~~~~~~~~~~~
+
+The ``/v1/embeddings`` endpoint serves embedding models that return dense vector representations of text.
+
+Embedding models have the following current limitations:
+
+* Embedding models use the generate path internally, so ``TRTLLM_EMBEDDING_OUTPUT_NAME`` must be set
+  to the model's output key name. Each model defines this key in its model class — for example,
+  ``Qwen3ForEmbedding`` uses ``last_token_hidden_state``. The serving layer does not yet discover
+  this automatically.
+* KV cache block reuse must be disabled because cached prefixes skip the forward pass and do not
+  produce the hidden-state outputs needed for embeddings.
+
+To serve an embedding model, set the environment variable and create a configuration file:
+
+.. code-block:: bash
+
+   TRTLLM_EMBEDDING_OUTPUT_NAME=last_token_hidden_state \
+     trtllm-serve ./qwen3-embedding-8b/ --config config.yaml
+
+Where ``config.yaml`` contains:
+
+.. code-block:: yaml
+
+   model_kwargs:
+     architectures: ["Qwen3ForEmbedding"]
+     tie_word_embeddings: true
+   kv_cache_config:
+     enable_block_reuse: false
+
+The endpoint supports ``encoding_format`` (``"float"`` or ``"base64"``), optional ``dimensions``
+truncation (for Matryoshka Representation Learning), and L2 normalization.
 
 More openai compatible examples can be found in the `compatibility examples <https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/serve/compatibility>`_ directory.
 
