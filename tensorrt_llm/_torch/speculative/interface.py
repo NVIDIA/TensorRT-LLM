@@ -681,6 +681,41 @@ class SpecMetadata:
                 is_greedy,
             )
 
+        # Hot-path fast-exit for the all-greedy batch. `py_is_greedy_sample`
+        # is cached on LlmRequest at admission (sampling params are
+        # immutable), so this is an O(batch_size) `all(...)` over cached
+        # bools instead of a per-request Python-level normalization of
+        # temperature / top_k / top_p. `populate_sampling_params_for_one_model`
+        # returns early when `is_all_greedy_sample` is True (skipping the
+        # H2D copies of the per-token buffers), so producing the normalized
+        # tuples here is wasted work in the common case.
+        #
+        # Skipped when `_force_non_greedy_for_capture` is set (CUDA-graph
+        # warmup capture of the advanced-sampling variant): the caller
+        # needs a populated `per_request_normalized` with synthetic
+        # non-greedy scalars for Phase 2 to fill the GPU buffers.
+        if (requests
+                and not getattr(self, '_force_non_greedy_for_capture', False)
+                and all(r.py_is_greedy_sample for r in requests)):
+            self.skip_temperature = True
+            self.skip_top_k = True
+            self.skip_top_p = True
+            self.has_greedy_requests = True
+            self.is_all_greedy_sample = True
+            # Slot ids are only consumed downstream when
+            # `use_rejection_sampling` is enabled (see the
+            # `batch_slot_ids` copy in `populate_sampling_params_for_one_model`).
+            # For default MTP / Eagle3 one-model configs
+            # (`use_rejection_sampling=False`), skip that list too.
+            if self.use_rejection_sampling:
+                per_request_slot_ids = [
+                    r.py_seq_slot if r.py_seq_slot is not None else 0
+                    for r in requests
+                ]
+            else:
+                per_request_slot_ids = []
+            return [], per_request_slot_ids
+
         # Phase 1: collect per-request flags and normalized values.
         per_request_normalized: list[tuple[float, int, float, int]] = []
         temperature_enabled = False
