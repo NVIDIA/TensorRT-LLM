@@ -148,7 +148,12 @@ class CacheLevelManager:
                     f"Disk path {config.path} does not exist or is not a directory"
                 )
                 filename_template = os.path.join(config.path, "g{}p{}.bin")
-                return DiskCacheLevelStorage(slot_size_lists, slot_count_list, filename_template)
+                return DiskCacheLevelStorage(
+                    slot_size_lists,
+                    slot_count_list,
+                    filename_template,
+                    direct_io=config.backend == "nixl_gds",
+                )
             case _:
                 raise ValueError(f"Invalid cache tier: {config.tier}")
 
