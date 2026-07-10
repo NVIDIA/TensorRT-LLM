@@ -86,6 +86,7 @@ worker_config:
     cache_transceiver_config:
       max_tokens_in_buffer: 4608
       backend: NIXL
+      transceiver_runtime: PYTHON
     stream_interval: 20
     num_postprocess_workers: 4
     speculative_config:
@@ -111,6 +112,7 @@ worker_config:
     cache_transceiver_config:
       max_tokens_in_buffer: 4608
       backend: NIXL
+      transceiver_runtime: PYTHON
     speculative_config:
       decoding_type: MTP
       num_nextn_predict_layers: 3
