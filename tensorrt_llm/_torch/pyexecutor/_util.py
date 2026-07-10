@@ -584,6 +584,10 @@ class KvCacheCreator:
                 self._profiling_stage_data,
                 dict) and not self._profiling_stage_data.get("enable_mm_reqs"):
             return []
+        # No local multimodal encoder (disable_mm_encoder or MM E/P disagg):
+        # nothing to profile.
+        if getattr(self._model_engine.model, "mm_encoder", object()) is None:
+            return []
         input_processor = self._model_engine.input_processor
         _, encoder_max_num_tokens = self._llm_args.get_encoder_runtime_sizes()
         # Modality-agnostic: the model declares each modality's per-item token

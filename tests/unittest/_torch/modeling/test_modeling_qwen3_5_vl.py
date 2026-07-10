@@ -165,6 +165,31 @@ def test_qwen35_dense_vl_resolves_model_and_mapper(tmp_path: Path) -> None:
     )
 
 
+def test_qwen35_dense_vl_disable_mm_encoder_skips_vision_tower(
+    tmp_path: Path,
+) -> None:
+    """disable_mm_encoder must not instantiate the vision encoder (nvbug
+    6405760: the tower's GPU memory shrank the KV cache pool for text-only
+    serving of VLM checkpoints)."""
+    config = load_pretrained_config(str(_write_qwen35_dense_vl_config(tmp_path)))
+    model_config = ModelConfig(pretrained_config=config, disable_mm_encoder=True)
+    with torch.device("cuda"):
+        model = Qwen3_5VLModel(model_config)
+
+    assert model.mm_encoder is None
+    assert not any("mm_encoder" in name for name, _ in model.named_parameters())
+
+
+def test_qwen35_dense_vl_default_keeps_vision_tower(tmp_path: Path) -> None:
+    config = load_pretrained_config(str(_write_qwen35_dense_vl_config(tmp_path)))
+    model_config = ModelConfig(pretrained_config=config)
+    with torch.device("cuda"):
+        model = Qwen3_5VLModel(model_config)
+
+    assert model.mm_encoder is not None
+    assert any("mm_encoder" in name for name, _ in model.named_parameters())
+
+
 def test_qwen35_dense_vl_placeholder_metadata_registered() -> None:
     metadata = MULTIMODAL_PLACEHOLDER_REGISTRY.get_placeholder_metadata("qwen3_5")
 
