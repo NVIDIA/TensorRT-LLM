@@ -1,4 +1,5 @@
 import json
+import math
 import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field, fields
@@ -324,6 +325,8 @@ class SamplingParams:
             raise ValueError(f"require 0 <= top_p <= 1, got top_p={self.top_p}")
         if self.top_k is not None and self.top_k < 0:
             raise ValueError(f"require top_k >= 0, got top_k={self.top_k}")
+        if self.temperature is not None and not math.isfinite(self.temperature):
+            raise ValueError(f"temperature must be finite, got temperature={self.temperature}")
         if self.temperature is not None and self.temperature < 0:
             raise ValueError(f"require temperature >= 0, got temperature={self.temperature}")
         # Clamp very small non-zero temperatures up to a numerically safe floor;
