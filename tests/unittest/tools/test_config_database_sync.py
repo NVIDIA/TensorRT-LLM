@@ -89,6 +89,7 @@ class TestConfigDatabaseSync(unittest.TestCase):
                 r.config_path,
                 r.profile,
                 r.validated_trtllm_commit,
+                r.validated_trtllm_version,
             )
             for r in recipes
         }
@@ -132,6 +133,7 @@ class TestConfigDatabaseSync(unittest.TestCase):
                 e.get("config_path"),
                 e.get("profile"),
                 e.get("validated_trtllm_commit"),
+                e.get("validated_trtllm_version"),
             )
             self.assertIn(
                 key,
@@ -160,6 +162,7 @@ class TestConfigDatabaseSync(unittest.TestCase):
 
     def test_profile_and_validated_commit_metadata(self) -> None:
         commit = "93CB6518B6D6DBD6095748189E626DB731F44545"
+        version = "1.3.0rc14"
         recipes = []
         for profile in ("latency", "balanced", "throughput"):
             recipes.append(
@@ -174,6 +177,7 @@ class TestConfigDatabaseSync(unittest.TestCase):
                     "config_path": f"examples/configs/database/example_{profile}.yaml",
                     "profile": profile,
                     "validated_trtllm_commit": commit,
+                    "validated_trtllm_version": version,
                 }
             )
 
@@ -195,6 +199,9 @@ class TestConfigDatabaseSync(unittest.TestCase):
         self.assertTrue(
             all(entry["validated_trtllm_commit"] == commit.lower() for entry in payload["entries"])
         )
+        self.assertTrue(
+            all(entry["validated_trtllm_version"] == version for entry in payload["entries"])
+        )
 
         parsed = RecipeList.model_validate(recipes)
         server_names = [generate_server_name(recipe) for recipe in parsed]
@@ -214,7 +221,18 @@ class TestConfigDatabaseSync(unittest.TestCase):
         }
 
         with self.assertRaisesRegex(ValueError, "full 40-character Git SHA"):
-            RecipeList.model_validate([{**base, "validated_trtllm_commit": "deadbeef"}])
+            RecipeList.model_validate(
+                [
+                    {
+                        **base,
+                        "validated_trtllm_commit": "deadbeef",
+                        "validated_trtllm_version": "1.3.0rc14",
+                    }
+                ]
+            )
+
+        with self.assertRaisesRegex(ValueError, "must be provided together"):
+            RecipeList.model_validate([{**base, "validated_trtllm_commit": "a" * 40}])
 
         with self.assertRaisesRegex(ValueError, "profile is only allowed"):
             RecipeList.model_validate([{**base, "profile": "balanced"}])

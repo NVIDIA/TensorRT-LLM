@@ -1176,9 +1176,16 @@
         } else {
           meta.appendChild(el("span", { text: e.config_path || "" }));
         }
+        if (e.validated_trtllm_version) {
+          meta.appendChild(
+            el("span", {
+              text: ` \u00b7 Validated with TensorRT-LLM ${e.validated_trtllm_version}`,
+            })
+          );
+        }
         const commitUrl = validatedCommitUrl(e.validated_trtllm_commit);
         if (commitUrl) {
-          meta.appendChild(el("span", { text: " \u00b7 Validated commit: " }));
+          meta.appendChild(el("span", { text: " \u00b7 Commit: " }));
           meta.appendChild(
             el("a", {
               class: "trtllm-config-selector__configLink",

@@ -122,6 +122,7 @@ class RecipeRow:
     config_raw_url: str
     profile: str | None
     validated_trtllm_commit: str | None
+    validated_trtllm_version: str | None
 
 
 @dataclass(frozen=True)
@@ -243,6 +244,7 @@ def build_rows(yaml_path: Path) -> list[RecipeRow]:
                         config_raw_url=config_raw_url,
                         profile=entry.profile,
                         validated_trtllm_commit=entry.validated_trtllm_commit,
+                        validated_trtllm_version=entry.validated_trtllm_version,
                     )
                 )
 

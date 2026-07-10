@@ -48,6 +48,7 @@ PROFILE_DISPLAY_NAMES = {
 }
 PROFILE_ORDER = {profile: idx for idx, profile in enumerate(PROFILE_DISPLAY_NAMES)}
 VALIDATED_COMMIT_PATTERN = re.compile(r"^[0-9a-f]{40}$")
+VALIDATED_VERSION_PATTERN = re.compile(r"^[0-9A-Za-z][0-9A-Za-z._+-]*$")
 Profile = Literal["latency", "balanced", "throughput"]
 
 
@@ -114,6 +115,10 @@ class Recipe(BaseModel):
         default=None,
         description="Full TensorRT-LLM commit SHA against which the recipe was validated",
     )
+    validated_trtllm_version: str | None = Field(
+        default=None,
+        description="TensorRT-LLM release version reported by the validation source",
+    )
 
     @field_validator("validated_trtllm_commit")
     @classmethod
@@ -124,6 +129,24 @@ class Recipe(BaseModel):
         if not VALIDATED_COMMIT_PATTERN.fullmatch(normalized):
             raise ValueError("validated_trtllm_commit must be a full 40-character Git SHA")
         return normalized
+
+    @field_validator("validated_trtllm_version")
+    @classmethod
+    def _validate_version(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        if not VALIDATED_VERSION_PATTERN.fullmatch(normalized):
+            raise ValueError("validated_trtllm_version must be a release-tag-safe version")
+        return normalized
+
+    @model_validator(mode="after")
+    def _validate_provenance_pair(self) -> "Recipe":
+        if bool(self.validated_trtllm_commit) != bool(self.validated_trtllm_version):
+            raise ValueError(
+                "validated_trtllm_commit and validated_trtllm_version must be provided together"
+            )
+        return self
 
     def load_config(self) -> dict[str, Any]:
         """Load and return the YAML config at config_path."""
