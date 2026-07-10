@@ -1,9 +1,6 @@
 --extra-index-url https://download.pytorch.org/whl/cu130
 -c constraints.txt
 accelerate>=1.7.0
-# Video reference decode (torchvision.io.read_video backend) and serve-side
-# image-vs-video content classification for visual_gen (Cosmos3 V2V).
-av
 build
 colored
 cuda-python>=13
