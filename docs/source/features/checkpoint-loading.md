@@ -161,9 +161,11 @@ changed, so a warm cache skips the download:
 
 ```bash
 export TRTLLM_MODEL_CACHE="${TRTLLM_MODEL_CACHE:-/models/cache}"
-LOCAL_DIR="${TRTLLM_MODEL_CACHE}/llama-3.1-8b-fp8"
+S3_PREFIX="${S3_PREFIX:-engines/llama-3.1-8b-fp8}"
+S3_PREFIX="${S3_PREFIX%/}"
+LOCAL_DIR="${TRTLLM_MODEL_CACHE}/${S3_PREFIX}"
 
-aws s3 sync "s3://${S3_BUCKET_NAME}/engines/llama-3.1-8b-fp8" \
+aws s3 sync "s3://${S3_BUCKET_NAME}/${S3_PREFIX}" \
     "$LOCAL_DIR" "${S3_ENDPOINT_ARGS[@]}"
 
 trtllm-serve "$LOCAL_DIR" --host 0.0.0.0 --port 8000
@@ -212,10 +214,14 @@ for page in paginator.paginate(Bucket=BUCKET, Prefix=PREFIX):
         dest = (LOCAL_DIR / rel_path).resolve()
         if not dest.is_relative_to(CACHE_ROOT):
             raise ValueError(f"Unsafe S3 object key: {key}")
-        if dest.exists() and dest.stat().st_size == obj["Size"]:
-            continue
+        remote_mtime = obj["LastModified"].timestamp()
+        if dest.exists():
+            stat = dest.stat()
+            if stat.st_size == obj["Size"] and int(stat.st_mtime) >= int(remote_mtime):
+                continue
         dest.parent.mkdir(parents=True, exist_ok=True)
         s3.download_file(BUCKET, key, str(dest))
+        os.utime(dest, (remote_mtime, remote_mtime))
 
 llm = LLM(model=str(LOCAL_DIR))
 ```
