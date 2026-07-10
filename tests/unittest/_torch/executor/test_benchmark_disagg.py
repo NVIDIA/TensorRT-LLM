@@ -231,6 +231,7 @@ class TestFillCompleteADP:
         ex.dist.tp_allgather.assert_called_once_with((1, False))
 
     def test_single_rank_skips_model_parallel_allgather(self):
+        """A singleton group returns local status without a collective."""
         reqs = [_make_active_request() for _ in range(4)]
         ex = MockBenchmarkExecutor(
             benchmark_req_queues_size=4,
@@ -409,7 +410,14 @@ class TestCheckBenchmarkDisaggGate:
     def test_gate_waits_for_blocked_model_parallel_peer(
         self, enable_attention_dp, tp_size, cp_size, gather_name
     ):
-        """A ready local slice cannot open the gate ahead of a peer."""
+        """A ready local slice cannot open the gate ahead of a peer.
+
+        Args:
+            enable_attention_dp: Whether to simulate attention data parallelism.
+            tp_size: Tensor-parallel group size.
+            cp_size: Context-parallel group size.
+            gather_name: Expected model-parallel allgather method.
+        """
         reqs = [_make_active_request() for _ in range(4)]
         ex = MockBenchmarkExecutor(
             benchmark_req_queues_size=4,
@@ -1090,7 +1098,12 @@ class TestFailFastDuringBenchmarkFill:
         ex._handle_errors.assert_not_called()
 
     def test_transfer_admission_backpressure_does_not_kill(self, monkeypatch):
-        """NVBug 6438658: admission backpressure is not KV exhaustion."""
+        """NVBug 6438658: admission backpressure is not KV exhaustion.
+
+        Args:
+            monkeypatch: Pytest fixture used to select asynchronous transfer
+                behavior.
+        """
         monkeypatch.delenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY", raising=False)
         monkeypatch.delenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP", raising=False)
         fitting_req = _make_active_request(in_init=True)
@@ -1120,7 +1133,14 @@ class TestFailFastDuringBenchmarkFill:
     def test_model_parallel_peer_terminal_no_fit_kills_all_ranks(
         self, enable_attention_dp, tp_size, cp_size, gather_name
     ):
-        """A terminal peer makes every model-parallel rank fail together."""
+        """A terminal peer makes every model-parallel rank fail together.
+
+        Args:
+            enable_attention_dp: Whether to simulate attention data parallelism.
+            tp_size: Tensor-parallel group size.
+            cp_size: Context-parallel group size.
+            gather_name: Expected model-parallel allgather method.
+        """
         fitting_req = _make_active_request(in_init=True)
         ex = self._make_executor(fill_phase_active=True, fitting_init_requests=[fitting_req])
         ex.enable_attention_dp = enable_attention_dp

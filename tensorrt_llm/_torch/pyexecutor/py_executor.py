@@ -3327,7 +3327,17 @@ class PyExecutor:
 
     def _allgather_model_parallel_status(
             self, local_status: Tuple[int, bool]) -> List[Tuple[int, bool]]:
-        """Gather a status over the TP+CP scheduling group."""
+        """Gather a status over the TP+CP scheduling group.
+
+        Args:
+            local_status: Caller-defined ``(state, flag)`` pair from this rank.
+                The fill gate uses ``(ready, synchronous_progress)`` and the
+                fail-fast path uses ``(all_fetched, terminal_no_fit)``.
+
+        Returns:
+            One status pair per TP+CP rank in the current pipeline-parallel
+            slice. A singleton group returns ``[local_status]``.
+        """
         # CP may coexist with TP; tp_cp_allgather covers both CP-only and
         # TP+CP configurations.
         if self._dist_size(self.dist, "cp_size") > 1:
@@ -3404,6 +3414,20 @@ class PyExecutor:
         handling path. One terminal rank prevents the global benchmark fill
         gate from opening. The vote is fill-only to avoid adding a collective
         to every decode iteration after the gate opens.
+
+        Args:
+            scheduler_fitting_disagg_gen_init_requests: Generation INIT
+                requests that fit KV capacity before transfer admission. A
+                nonempty list means KV capacity exists even if transfer
+                admission temporarily defers every request.
+            wait_for_disagg_gen_transfer_progress: Whether active generation
+                transfers are consuming the admission budget and transfer
+                progress can unblock a deferred request.
+
+        Returns:
+            True when every TP+CP rank has fetched its full benchmark queue and
+            at least one rank has an INIT request that cannot fit KV capacity
+            and has no transfer progress that can unblock it; otherwise False.
         """
         if (self.benchmark_req_queues_size <= 0 or self.is_warmup
                 or not self._benchmark_fill_phase_active):
@@ -3419,9 +3443,9 @@ class PyExecutor:
         local_status = (local_all_fetched, local_terminal_no_fit)
 
         all_rank_status = self._allgather_model_parallel_status(local_status)
-
-        return (all(status[0] for status in all_rank_status)
-                and any(status[1] for status in all_rank_status))
+        all_ranks_fetched = all(status[0] for status in all_rank_status)
+        any_rank_terminal_no_fit = any(status[1] for status in all_rank_status)
+        return all_ranks_fetched and any_rank_terminal_no_fit
 
     def _prepare_and_schedule_batch(self):
         self._sync_disagg_transfer_made_progress = False
