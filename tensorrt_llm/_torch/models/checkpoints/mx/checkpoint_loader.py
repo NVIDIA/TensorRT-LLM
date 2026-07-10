@@ -300,7 +300,7 @@ class MXCheckpointLoader(HfCheckpointLoader):
                 mapping,
                 reason=(
                     "source publishes post-transform weights but this model is "
-                    "not allow-listed for staged MX receiver loading"
+                    "not qualified for staged MX receiver loading"
                 ),
                 **kwargs,
             )
@@ -554,7 +554,7 @@ class MXCheckpointLoader(HfCheckpointLoader):
 
         Called by the integration in `model_loader.py` after
         `post_load_weights()` so targets receive the post-transform runtime
-        layout and, when allow-listed, can skip their own one-shot transforms.
+        layout and, when qualified, can skip their own one-shot transforms.
 
         Delegates to the upstream
         `modelexpress.trtllm_live_transfer.publish_model_params`
