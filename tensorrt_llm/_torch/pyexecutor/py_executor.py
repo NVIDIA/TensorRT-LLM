@@ -3476,17 +3476,34 @@ class PyExecutor:
             # scheduler could not allocate KV for any of them, the benchmark
             # will hang forever because in-progress generation requests won't
             # release their KV cache.
-            if (self.benchmark_req_queues_size > 0 and not self.is_warmup
-                    and not fitting_disagg_gen_init_requests):
+            if self.benchmark_req_queues_size > 0 and not self.is_warmup:
                 stuck_init_requests = [
                     req for req in self.active_requests
                     if req.is_disagg_generation_init_state
                 ]
                 # Only fail once all benchmark requests have been fetched
                 # so that _handle_errors covers every request and every
-                # client receives an error response.
-                if (stuck_init_requests and self.num_fetch_requests
-                        >= self.benchmark_req_queues_size):
+                # client receives an error response.  Requests deferred by
+                # the transfer admission controller
+                # (wait_for_disagg_gen_transfer_progress) are waiting on
+                # in-flight transfers, not on KV capacity, so they are
+                # not stuck.
+                local_stuck = bool(stuck_init_requests
+                                   and not fitting_disagg_gen_init_requests
+                                   and not wait_for_disagg_gen_transfer_progress
+                                   and self.num_fetch_requests
+                                   >= self.benchmark_req_queues_size)
+                # All DP ranks must agree before failing: entering
+                # _handle_errors on a subset of ranks desyncs its response
+                # gather against the fill-gate allgather running on the
+                # other ranks (https://nvbugs/6438586).  The consensus
+                # allgather runs on every iteration regardless of local
+                # state so all ranks stay collective-aligned.
+                if self.enable_attention_dp and self.dist.world_size != 1:
+                    should_fail = any(self.dist.tp_allgather(local_stuck))
+                else:
+                    should_fail = local_stuck
+                if should_fail:
                     error_msg = (
                         f"Insufficient KV cache for gen-only benchmark mode: "
                         f"{len(stuck_init_requests)} request(s) are waiting for "
@@ -5992,8 +6009,14 @@ class PyExecutor:
                                      client_id=getattr(item.request,
                                                        'client_id', None))))
 
-            if waiting_responses:
+            # Under ADP, waiting_responses is only populated on rank 0
+            # (or with gather_all_responses), but _enqueue_responses runs
+            # a collective gather — every rank must enter it, even with an
+            # empty list, to stay in lockstep.
+            if waiting_responses or (self.enable_attention_dp
+                                     and self.dist.world_size != 1):
                 self._enqueue_responses(waiting_responses)
+            if waiting_responses:
                 logger.info(f"Drained {len(waiting_responses)} queued requests "
                             "on fatal error")
 

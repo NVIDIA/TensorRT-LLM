@@ -1065,6 +1065,80 @@ class TestFailFastDuringBenchmarkFill:
             )
             ex._handle_errors.assert_called_once()
 
+    def test_admission_deferral_does_not_kill(self):
+        """Requests deferred by the transfer admission controller are not stuck.
+
+        When the scheduler fits INIT requests but the admission controller
+        defers all of them behind in-flight transfers
+        (wait_for_disagg_gen_transfer_progress=True), the fill is making
+        progress and the fail-fast must not fire (nvbug 6438586).
+        """
+        ex = self._make_executor(fill_phase_active=True)
+        ex._apply_disagg_transfer_admission = Mock(return_value=([], True))
+
+        result, _ = ex._prepare_and_schedule_batch()
+
+        assert result is not None, (
+            "Fail-fast should NOT fire while the admission controller is "
+            "deferring INIT requests behind active KV transfers"
+        )
+        ex._handle_errors.assert_not_called()
+
+    def _make_adp_executor(self, **kwargs):
+        """ADP variant of the executor stub (2 DP ranks)."""
+        ex = self._make_executor(**kwargs)
+        ex.enable_attention_dp = True
+        ex.dist = Mock(rank=0, tp_size=2, world_size=2)
+        ex.dist.allreduce.return_value = 0
+        ex.dist.tp_allreduce.return_value = 0
+        return ex
+
+    def test_adp_consensus_runs_allgather_even_when_healthy(self):
+        """Under ADP the stuck-consensus allgather must run every iteration.
+
+        A rank that skips the collective while a peer enters it desyncs all
+        subsequent collectives (nvbug 6438586: peers crashed with
+        `TypeError: '<' not supported between instances of 'list' and 'int'`
+        in the fill-gate allgather).
+        """
+        fitting_req = _make_active_request(in_init=True)
+        ex = self._make_adp_executor(fill_phase_active=True, fitting_init_requests=[fitting_req])
+        ex.dist.tp_allgather.return_value = [False, False]
+
+        result, _ = ex._prepare_and_schedule_batch()
+
+        assert result is not None
+        ex.dist.tp_allgather.assert_called_once_with(False)
+        ex._handle_errors.assert_not_called()
+
+    def test_adp_consensus_kills_all_ranks_when_peer_is_stuck(self):
+        """A healthy rank must fail together with a stuck peer rank."""
+        fitting_req = _make_active_request(in_init=True)
+        ex = self._make_adp_executor(fill_phase_active=True, fitting_init_requests=[fitting_req])
+        # This rank is healthy (local flag False) but a peer reports stuck.
+        ex.dist.tp_allgather.return_value = [False, True]
+
+        result, _ = ex._prepare_and_schedule_batch()
+
+        assert result is None, (
+            "All DP ranks must enter _handle_errors together when any rank "
+            "is stuck; failing on a subset desyncs the response gather "
+            "against the fill-gate allgather on the healthy ranks"
+        )
+        ex.dist.tp_allgather.assert_called_once_with(False)
+        ex._handle_errors.assert_called_once()
+
+    def test_adp_consensus_local_stuck_reported(self):
+        """A locally stuck rank contributes True to the consensus."""
+        ex = self._make_adp_executor(fill_phase_active=True)
+        ex.dist.tp_allgather.return_value = [True, False]
+
+        result, _ = ex._prepare_and_schedule_batch()
+
+        assert result is None
+        ex.dist.tp_allgather.assert_called_once_with(True)
+        ex._handle_errors.assert_called_once()
+
 
 # ---------------------------------------------------------------------------
 # End-to-end fill phase reproducer
@@ -1172,10 +1246,15 @@ class TestFillPhaseEndToEnd:
         # Phase 2b: Healthy fill keeps making progress, so fail-fast must not
         # fire even though some active requests remain in INIT.
         ex._schedule = Mock(return_value=(ScheduledRequests(), [init_reqs[0]], 0))
+        # The stuck-consensus allgather (nvbug 6438586) shares
+        # dist.tp_allgather with the fill gate; during a healthy fill no
+        # rank reports stuck.
+        ex.dist.tp_allgather = Mock(return_value=[False, False])
         result, _ = ex._prepare_and_schedule_batch()
         assert result is not None, (
             "Fail-fast must not kill requests while the scheduler can still fit INIT requests"
         )
+        ex.dist.tp_allgather.assert_called_once_with(False)
 
         # Phase 3: All transfers complete, gate opens
         for req in init_reqs:
