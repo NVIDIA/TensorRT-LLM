@@ -1962,14 +1962,17 @@ class NVFP4SVDLinearMethod(NVFP4LinearMethod):
             else:
                 module.register_buffer(name, value, persistent=False)
 
-        shapes_are_supported = (lora_a is not None and lora_b is not None
-                                and pqs is not None and lora_a.dim() == 2
-                                and lora_b.dim() == 2 and lora_a.shape[0] == 32
-                                and lora_b.shape[1] == 32
-                                and module.weight.shape[0] == lora_b.shape[0]
-                                and module.weight.shape[1] * 2
-                                == lora_a.shape[1]
-                                and pqs.numel() == lora_a.shape[1])
+        # The fused FlashInfer kernel accepts any LoRA rank that is a positive
+        # multiple of 32 (ranks 32-128 are validated); other ranks fall back to
+        # the unfused reference path below.
+        shapes_are_supported = (
+            lora_a is not None and lora_b is not None and pqs is not None
+            and lora_a.dim() == 2 and lora_b.dim() == 2
+            and lora_a.shape[0] == lora_b.shape[1] and lora_a.shape[0] >= 32
+            and lora_a.shape[0] % 32 == 0
+            and module.weight.shape[0] == lora_b.shape[0]
+            and module.weight.shape[1] * 2 == lora_a.shape[1]
+            and pqs.numel() == lora_a.shape[1])
         if not shapes_are_supported:
             set_derived_buffer("_svdquant_l2t_smoothed", None)
             set_derived_buffer("_svdquant_l1_scaled", None)

@@ -27,7 +27,9 @@ skip_sm100 = pytest.mark.skipif(
     not _IS_SM100, reason="NVFP4 SVDQuant kernels require SM100 (Blackwell)"
 )
 
-_RANK = 32  # SVDQuant low-rank r (== the kernel's LoRA K)
+_RANK = 32  # base SVDQuant low-rank r (== the kernel's rank granularity)
+# The fused kernel supports any rank that is a positive multiple of 32; ranks 32-128
+# are exercised here (see test_nvfp4_svdquant_gemm_ranks for the wide-rank coverage).
 
 _GEMM_CASES = [
     (m, n, k, use_bias, tactic)
@@ -74,7 +76,7 @@ def _sqnr_db(ref: torch.Tensor, got: torch.Tensor) -> float:
     return float(10 * torch.log10((ref.float() ** 2).mean() / noise))
 
 
-def _make_svdquant_operator_chain():
+def _make_svdquant_operator_chain(rank: int = _RANK):
     """Build the production single-linear operator chain and one representative input."""
     torch.manual_seed(0)
     device = torch.device("cuda")
@@ -89,9 +91,9 @@ def _make_svdquant_operator_chain():
     weight_fp4, weight_sf = torch.ops.trtllm.fp4_quantize(weight, weight_scale, 16, False, True)
     alpha = (1.0 / (act_scale * weight_scale)).reshape(1).float()
 
-    lora_a = torch.randn((_RANK, k), dtype=torch.bfloat16, device=device)
+    lora_a = torch.randn((rank, k), dtype=torch.bfloat16, device=device)
     l2t_smoothed = (pqs.unsqueeze(1) * lora_a.t()).contiguous()
-    lora_b = torch.randn((n, _RANK), dtype=torch.bfloat16, device=device)
+    lora_b = torch.randn((n, rank), dtype=torch.bfloat16, device=device)
     lora_b_scaled = (lora_b.float() / alpha).to(torch.bfloat16).contiguous()
     bias = torch.randn((n,), dtype=torch.bfloat16, device=device).contiguous()
 
@@ -131,9 +133,7 @@ def _make_svdquant_operator_chain():
     return {"fused": fused_chain, "reference": reference_chain}, x
 
 
-@skip_sm100
-@pytest.mark.parametrize("m, n, k, use_bias, tactic", _GEMM_CASES)
-def test_nvfp4_svdquant_gemm(m, n, k, use_bias, tactic):
+def _run_svdquant_gemm_case(m, n, k, use_bias, tactic, rank):
     torch.manual_seed(0)
     dev = "cuda"
     x = torch.randn(m, k, dtype=torch.bfloat16, device=dev) / (k**0.25)
@@ -143,8 +143,8 @@ def test_nvfp4_svdquant_gemm(m, n, k, use_bias, tactic):
     xq, x_sf = torch.ops.trtllm.fp4_quantize(x, gx, 16, False, True)
     wq, w_sf = torch.ops.trtllm.fp4_quantize(w, gw, 16, False, True)
     alpha = (1.0 / (gx * gw)).reshape(1).contiguous()
-    D = torch.randn(m, _RANK, dtype=torch.bfloat16, device=dev) / (_RANK**0.25)
-    L1 = torch.randn(n, _RANK, dtype=torch.bfloat16, device=dev) / (_RANK**0.25)
+    D = torch.randn(m, rank, dtype=torch.bfloat16, device=dev) / (rank**0.25)
+    L1 = torch.randn(n, rank, dtype=torch.bfloat16, device=dev) / (rank**0.25)
     # 1/alpha is folded into L1 so the epilogue out = alpha*acc yields the unscaled D @ L1ᵀ.
     L1_scaled = (L1.float() / alpha.reshape(-1)[:1]).to(torch.bfloat16).contiguous()
     bias = torch.randn(n, dtype=torch.bfloat16, device=dev) if use_bias else None
@@ -187,6 +187,24 @@ def test_nvfp4_svdquant_gemm(m, n, k, use_bias, tactic):
 
 
 @skip_sm100
+@pytest.mark.parametrize("m, n, k, use_bias, tactic", _GEMM_CASES)
+def test_nvfp4_svdquant_gemm(m, n, k, use_bias, tactic):
+    _run_svdquant_gemm_case(m, n, k, use_bias, tactic, _RANK)
+
+
+# Wide-rank coverage of the chunked LoRA path: tactics 0/1 use K128 residual tiles
+# (32-column LoRA chunks: rank 64 -> 2 chunks, 96 -> 3, 128 -> 4) and tactics 19/25
+# use K256 tiles (64-column chunks: rank 64 -> 1, 96 -> 1.5 with a TMA-zero-filled
+# tail, 128 -> 2).
+@skip_sm100
+@pytest.mark.parametrize("m", [129, 6912])
+@pytest.mark.parametrize("rank", [64, 96, 128])
+@pytest.mark.parametrize("tactic", [0, 1, 19, 25])
+def test_nvfp4_svdquant_gemm_ranks(m, rank, tactic):
+    _run_svdquant_gemm_case(m, 3072, 3072, True, tactic, rank)
+
+
+@skip_sm100
 @pytest.mark.parametrize("m, k", [(256, 3072), (6912, 12288)])
 def test_nvfp4_quantize_smooth(m, k):
     torch.manual_seed(0)
@@ -204,11 +222,12 @@ def test_nvfp4_quantize_smooth(m, k):
 
 
 @skip_sm100
-def test_nvfp4_svdquant_fused_matches_reference():
+@pytest.mark.parametrize("rank", [32, 64, 96, 128])
+def test_nvfp4_svdquant_fused_matches_reference(rank):
     """The fused operator preserves the unfused single-linear computation."""
     from tensorrt_llm._torch.autotuner import autotune
 
-    operator_chains, x = _make_svdquant_operator_chain()
+    operator_chains, x = _make_svdquant_operator_chain(rank)
     with torch.no_grad(), autotune(tune_mode=True, skip_dynamic_tuning_buckets=True):
         expected = operator_chains["reference"](x)
         actual = operator_chains["fused"](x)
