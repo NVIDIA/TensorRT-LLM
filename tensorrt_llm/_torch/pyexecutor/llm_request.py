@@ -4,6 +4,7 @@
 
 from copy import copy, deepcopy
 from dataclasses import dataclass, field
+from enum import Enum, auto
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union, cast
 
 import torch
@@ -13,6 +14,7 @@ from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.bindings import executor as tllm_executor
 from tensorrt_llm.executor.result import SimpleTokenLogprobs, TokenLogprobs
+from tensorrt_llm.inputs.registry import get_multimodal_encoder_item_metadata
 from tensorrt_llm.sampling_params import LogprobMode
 
 SamplingConfig = tensorrt_llm.bindings.SamplingConfig
@@ -49,6 +51,15 @@ REQUEST_TYPE_MAPPING = {
 # Internal request id for the attention-DP padding dummy. Generated real
 # request ids do not use 0; disaggregated global ids use a separate high range.
 ATTENTION_DP_DUMMY_REQUEST_ID = 0
+
+
+class MultimodalEncoderProgress(Enum):
+    """Python-only progress derived from request-local MM item outputs."""
+
+    PENDING = auto()
+    PARTIAL = auto()
+    READY = auto()
+
 
 if TYPE_CHECKING:
     from .sampler.sampling_utils import Strategy
@@ -1083,21 +1094,41 @@ def get_multimodal_encoder_token_lengths(
     if py_multimodal_data is not None and not isinstance(
             py_multimodal_data, dict):
         raise TypeError("py_multimodal_data must be a dict")
-    token_lengths = _validate_optional_int_list(
-        py_multimodal_data.get("multimodal_encoder_token_lengths")
-        if py_multimodal_data is not None else None,
-        "multimodal_encoder_token_lengths")
-    if token_lengths is None:
+    item_metadata = get_multimodal_encoder_item_metadata(py_multimodal_data)
+    if item_metadata is None:
         return None
+    token_lengths = _validate_optional_int_list(
+        item_metadata.encoder_token_lengths,
+        "multimodal_encoder_item_metadata.encoder_token_lengths")
+    if token_lengths is None:
+        raise ValueError("Multimodal encoder token lengths are required")
     if any(length <= 0 for length in token_lengths):
         raise ValueError(
-            "multimodal_encoder_token_lengths must contain positive values")
+            "multimodal_encoder_item_metadata.encoder_token_lengths must "
+            "contain positive values")
+
+    output_embedding_lengths = _validate_optional_int_list(
+        item_metadata.output_embedding_lengths,
+        "multimodal_encoder_item_metadata.output_embedding_lengths")
+    if output_embedding_lengths is None:
+        raise ValueError(
+            "Multimodal encoder output embedding lengths are required")
+    if any(length <= 0 for length in output_embedding_lengths):
+        raise ValueError(
+            "multimodal_encoder_item_metadata.output_embedding_lengths must "
+            "contain positive values")
 
     embedding_lengths = get_multimodal_embedding_lengths(request)
-    if (embedding_lengths is not None
-            and len(token_lengths) != len(embedding_lengths)):
-        raise ValueError("multimodal_encoder_token_lengths length must match "
+    if embedding_lengths is None:
+        raise ValueError("Multimodal encoder item scheduling requires "
                          "multimodal_embedding_lengths")
+    if output_embedding_lengths != embedding_lengths:
+        raise ValueError("Multimodal encoder item output lengths must match "
+                         "multimodal_embedding_lengths")
+    if not (len(item_metadata.item_refs) == len(token_lengths) ==
+            len(output_embedding_lengths)):
+        raise ValueError(
+            "Multimodal encoder item references and lengths must align")
     return token_lengths
 
 
@@ -1136,14 +1167,25 @@ def initialize_multimodal_encoder_request(request: LlmRequest,
                 request.py_mm_encoder_output_offsets[-1] + length)
 
 
-def is_multimodal_encoder_ready(request: LlmRequest) -> bool:
-    """Return whether this request needs no further MM encoder work."""
+def get_multimodal_encoder_progress(
+        request: LlmRequest) -> MultimodalEncoderProgress:
+    """Derive MM encoder progress without changing the C++ request state."""
     if not request.py_is_multimodal_encoder_request:
-        return True
+        return MultimodalEncoderProgress.READY
     if (isinstance(request.py_multimodal_data, dict) and
             request.py_multimodal_data.get("multimodal_embedding") is not None):
-        return True
-    return all(output is not None for output in request.py_mm_encoder_outputs)
+        return MultimodalEncoderProgress.READY
+    if all(output is not None for output in request.py_mm_encoder_outputs):
+        return MultimodalEncoderProgress.READY
+    if any(output is not None for output in request.py_mm_encoder_outputs):
+        return MultimodalEncoderProgress.PARTIAL
+    return MultimodalEncoderProgress.PENDING
+
+
+def is_multimodal_encoder_ready(request: LlmRequest) -> bool:
+    """Return whether this request needs no further MM encoder work."""
+    return (get_multimodal_encoder_progress(request)
+            is MultimodalEncoderProgress.READY)
 
 
 def executor_request_to_llm_request(

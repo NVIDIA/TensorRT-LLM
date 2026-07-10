@@ -21,6 +21,8 @@ from tensorrt_llm.logger import logger
 from ..llm_request import (
     LlmRequest,
     LlmRequestState,
+    MultimodalEncoderProgress,
+    get_multimodal_encoder_progress,
     get_multimodal_encoder_token_lengths,
     is_multimodal_encoder_ready,
 )
@@ -475,17 +477,21 @@ class MultimodalScheduler(RequestScheduler):
     The wrapper is constructed only for ``MultimodalModelMixin`` models. It
     deliberately reuses the wrapped scheduler's capacity and microbatch
     schedulers so MM encoder costs never enter the LLM token budget.
+
+    ``max_num_items`` is the resolved user-facing
+    ``encoder_max_batch_size``. It counts atomic MM items across all requests
+    and modalities, not LLM requests or model-internal attention segments.
     """
 
     def __init__(
         self,
         scheduler: SimpleScheduler,
-        max_batch_size: int,
+        max_num_items: int,
         max_num_tokens: int,
         independent: bool = False,
     ) -> None:
         self.scheduler = scheduler
-        self.max_batch_size = max_batch_size
+        self.max_num_items = max_num_items
         self.max_num_tokens = max_num_tokens
         self.independent = independent
         self.has_separate_stages = hasattr(scheduler, "capacity_scheduler") and hasattr(
@@ -493,7 +499,7 @@ class MultimodalScheduler(RequestScheduler):
         )
 
     def _select_items(self, requests: RequestList) -> tuple[dict[int, list[int]], RequestList]:
-        remaining_items = self.max_batch_size
+        remaining_items = self.max_num_items
         remaining_tokens = self.max_num_tokens
         selected: dict[int, list[int]] = {}
         llm_eligible: RequestList = []
@@ -510,7 +516,7 @@ class MultimodalScheduler(RequestScheduler):
             if token_lengths is None:
                 raise ValueError(
                     f"Multimodal request {request.py_request_id} is missing "
-                    "multimodal_encoder_token_lengths"
+                    "multimodal_encoder_item_metadata"
                 )
 
             request_items: list[int] = []
@@ -538,24 +544,27 @@ class MultimodalScheduler(RequestScheduler):
 
         return selected, llm_eligible
 
-    def _fits_legacy_encoder_path(self, requests: RequestList) -> bool:
-        """Return whether pristine MM requests fit one legacy encoder call.
+    def _can_schedule_full_request_mm_batch(self, requests: RequestList) -> bool:
+        """Return whether MM requests can use full-request batch encoding.
 
-        Keeping the existing path for an in-budget batch avoids item-state
+        Keeping full-request encoding for an in-budget batch avoids item-state
         bookkeeping and preserves its established latency characteristics.
         Once item scheduling has made partial progress, continue through the
         item path until the request is complete.
         """
-        remaining_items = self.max_batch_size
+        remaining_items = self.max_num_items
         remaining_tokens = self.max_num_tokens
 
         for request in requests:
-            if not request.py_is_multimodal_encoder_request or is_multimodal_encoder_ready(request):
+            if not request.py_is_multimodal_encoder_request:
+                continue
+            progress = get_multimodal_encoder_progress(request)
+            if progress is MultimodalEncoderProgress.READY:
                 continue
             token_lengths = get_multimodal_encoder_token_lengths(request)
             if token_lengths is None:
                 return False
-            if any(output is not None for output in request.py_mm_encoder_outputs):
+            if progress is MultimodalEncoderProgress.PARTIAL:
                 return False
             if len(token_lengths) > remaining_items or sum(token_lengths) > remaining_tokens:
                 return False
@@ -577,7 +586,7 @@ class MultimodalScheduler(RequestScheduler):
             scheduler_output = self.scheduler.schedule_request(
                 active_requests, inflight_request_ids
             )
-            if self._fits_legacy_encoder_path(list(scheduler_output.context_requests)):
+            if self._can_schedule_full_request_mm_batch(list(scheduler_output.context_requests)):
                 return scheduler_output
             selected_items, llm_eligible = self._select_items(
                 list(scheduler_output.context_requests)
@@ -600,7 +609,7 @@ class MultimodalScheduler(RequestScheduler):
             llm_eligible = [
                 request for request in fitting_requests if request.request_id in llm_eligible_ids
             ]
-        elif self._fits_legacy_encoder_path(list(fitting_requests)):
+        elif self._can_schedule_full_request_mm_batch(list(fitting_requests)):
             llm_eligible = fitting_requests
         else:
             selected_items, llm_eligible = self._select_items(list(fitting_requests))

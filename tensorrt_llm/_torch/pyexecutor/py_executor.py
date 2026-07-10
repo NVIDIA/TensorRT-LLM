@@ -39,6 +39,7 @@ from tensorrt_llm.bindings.internal.batch_manager import (LlmRequestType,
                                                           ReqIdsSet)
 from tensorrt_llm.executor.request import TruncateKVCacheRequest
 from tensorrt_llm.inputs.multimodal import strip_mm_data_for_generation
+from tensorrt_llm.inputs.registry import get_multimodal_encoder_item_metadata
 from tensorrt_llm.llmapi.llm_args import PeftCacheConfig, WaitingQueuePolicy
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import CpType
@@ -614,7 +615,7 @@ class PyExecutor:
                             "enabled for capacity-rejected active requests.")
             scheduler = MultimodalScheduler(
                 scheduler,
-                max_batch_size=model_engine.encoder_batch_size,
+                max_num_items=model_engine.encoder_max_num_items,
                 max_num_tokens=model_engine.encoder_max_num_tokens,
                 independent=self.independent_mm_scheduling,
             )
@@ -4976,6 +4977,75 @@ class PyExecutor:
 
         waiting_queue.add_requests(new_requests)
 
+    def _apply_mm_encoder_admission(
+            self, waiting_queue: WaitingQueue,
+            new_requests: List[RequestQueueItem]) -> List[RequestQueueItem]:
+        """Apply MM encoder item/token budgets to capacity-admitted requests.
+
+        Active requests consume this iteration's encoder budget first. New
+        requests then preserve waiting-queue FCFS order: once the head request
+        cannot make encoder progress, all later requests are deferred and
+        prepended to the waiting queue.
+        """
+        remaining_items = self.model_engine.encoder_max_num_items
+        remaining_tokens = self.model_engine.encoder_max_num_tokens
+
+        def consume_pending(costs, ready_outputs=None):
+            nonlocal remaining_items, remaining_tokens
+            ready_outputs = ready_outputs or [None] * len(costs)
+            progressed = False
+            for item_idx, (cost, output) in enumerate(zip(costs,
+                                                          ready_outputs)):
+                if output is not None:
+                    continue
+                if remaining_items == 0 or cost > remaining_tokens:
+                    break
+                remaining_items -= 1
+                remaining_tokens -= cost
+                progressed = True
+            return progressed
+
+        for request in self.active_requests:
+            if (not request.py_is_multimodal_encoder_request
+                    or is_multimodal_encoder_ready(request)):
+                continue
+            mm_data = request.py_multimodal_data or {}
+            item_metadata = get_multimodal_encoder_item_metadata(mm_data)
+            costs = (item_metadata.encoder_token_lengths
+                     if item_metadata is not None else [])
+            consume_pending(costs, request.py_mm_encoder_outputs)
+
+        admitted = []
+        deferred = []
+        blocked = False
+        for queue_item in new_requests:
+            if blocked:
+                deferred.append(queue_item)
+                continue
+            mm_data = getattr(queue_item.request, "py_multimodal_data", None)
+            item_metadata = (get_multimodal_encoder_item_metadata(mm_data)
+                             if isinstance(mm_data, dict) else None)
+            costs = (item_metadata.encoder_token_lengths
+                     if item_metadata is not None else None)
+            has_full_embedding = (isinstance(mm_data, dict)
+                                  and mm_data.get("multimodal_embedding")
+                                  is not None)
+            if costs and any(cost > self.model_engine.encoder_max_num_tokens
+                             for cost in costs):
+                # Admit the invalid request so normal request validation can
+                # return an error instead of leaving the FCFS queue blocked.
+                admitted.append(queue_item)
+                continue
+            if costs and not has_full_embedding and not consume_pending(costs):
+                blocked = True
+                deferred.append(queue_item)
+                continue
+            admitted.append(queue_item)
+
+        if deferred:
+            waiting_queue.prepend_requests(deferred)
+        return admitted
+
     def _pop_from_waiting_queue(
         self,
         waiting_queue: WaitingQueue,
@@ -5005,64 +5075,10 @@ class PyExecutor:
             enable_attention_dp=self.enable_attention_dp,
             max_num_active_requests=self.max_num_active_requests,
             all_ranks_num_active_requests=all_ranks_num_active_requests)
-        if (not getattr(self, "is_multimodal_model", False)
+        if (not new_requests or not getattr(self, "is_multimodal_model", False)
                 or self.enable_attention_dp):
             return new_requests
-
-        remaining_items = self.model_engine.encoder_batch_size
-        remaining_tokens = self.model_engine.encoder_max_num_tokens
-
-        def consume_pending(costs, ready_outputs=None):
-            nonlocal remaining_items, remaining_tokens
-            ready_outputs = ready_outputs or [None] * len(costs)
-            progressed = False
-            for item_idx, (cost, output) in enumerate(zip(costs,
-                                                          ready_outputs)):
-                if output is not None:
-                    continue
-                if remaining_items == 0 or cost > remaining_tokens:
-                    break
-                remaining_items -= 1
-                remaining_tokens -= cost
-                progressed = True
-            return progressed
-
-        for request in self.active_requests:
-            if (not request.py_is_multimodal_encoder_request
-                    or is_multimodal_encoder_ready(request)):
-                continue
-            mm_data = request.py_multimodal_data or {}
-            costs = mm_data.get("multimodal_encoder_token_lengths") or []
-            consume_pending(costs, request.py_mm_encoder_outputs)
-
-        admitted = []
-        deferred = []
-        blocked = False
-        for queue_item in new_requests:
-            if blocked:
-                deferred.append(queue_item)
-                continue
-            mm_data = getattr(queue_item.request, "py_multimodal_data", None)
-            costs = (mm_data.get("multimodal_encoder_token_lengths")
-                     if isinstance(mm_data, dict) else None)
-            has_full_embedding = (isinstance(mm_data, dict)
-                                  and mm_data.get("multimodal_embedding")
-                                  is not None)
-            if costs and any(cost > self.model_engine.encoder_max_num_tokens
-                             for cost in costs):
-                # Admit the invalid request so normal request validation can
-                # return an error instead of leaving the FCFS queue blocked.
-                admitted.append(queue_item)
-                continue
-            if costs and not has_full_embedding and not consume_pending(costs):
-                blocked = True
-                deferred.append(queue_item)
-                continue
-            admitted.append(queue_item)
-
-        if deferred:
-            waiting_queue.prepend_requests(deferred)
-        return admitted
+        return self._apply_mm_encoder_admission(waiting_queue, new_requests)
 
     @nvtx_range("_fetch_new_requests")
     def _fetch_new_requests(

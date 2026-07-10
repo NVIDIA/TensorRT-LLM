@@ -17,6 +17,7 @@ from tensorrt_llm.logger import logger
 # Default hasher
 default_hasher = blake3
 _INT32_MAX = 2**31 - 1
+MULTIMODAL_ENCODER_ITEM_METADATA_KEY = "multimodal_encoder_item_metadata"
 
 # Versioned tag prefixed to every content hash so the canonical, self-describing
 # serialization scheme can evolve without silently reusing stale cache keys.
@@ -461,8 +462,7 @@ class MultimodalRuntimeData:
 _CPU_ONLY_MULTIMODAL_DATA_KEYS = frozenset({
     "multimodal_embed_mask_cumsum",
     "multimodal_embedding_lengths",
-    "multimodal_encoder_token_lengths",
-    "multimodal_item_refs",
+    MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
 })
 
 
@@ -1080,6 +1080,7 @@ _MM_METADATA_ONLY_KEYS = frozenset({
     "mrope_config",
     "multimodal_embed_mask_cumsum",
     "multimodal_embedding_lengths",
+    MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
     "special_token_offsets",
     "layout_metadata",
 })

@@ -1,4 +1,4 @@
-# Copyright 2024 NVIDIA CORPORATION & AFFILIATES
+# Copyright 2024-2026 NVIDIA CORPORATION & AFFILIATES
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -24,18 +24,17 @@ from transformers import AutoConfig, AutoModel
 from ..attention_backend.interface import AttentionMetadata
 from .modeling_multimodal_utils import multiscale_forward
 
-# Fallback capacity for the encoder ``AttentionMetadata``'s per-segment buffers
-# (``max_num_requests``). The encoder runs one attention segment per vision tile
-# / window, so the real bound is the segment count, which can far exceed the
-# request count (one image can expand into many tiles/windows).
+# Legacy fallback for encoders that do not yet opt into atomic-item scheduling
+# or provide a model-specific item/token-to-segment mapping. Their encoder
+# forward is not runtime-budgeted, so configured item/token limits cannot
+# safely size fixed ``AttentionMetadata`` per-segment buffers.
 #
-# TODO: Once the scheduler caps an encoder forward at ``encoder_max_num_tokens``,
-# derive this from the token budget instead -- ``encoder_max_num_tokens //
-# min_tokens_per_segment`` (an exact segment bound). We cannot do that today:
-# ``encoder_max_num_tokens`` is not yet enforced (the attention workspace grows
-# past it), so a low value would under-size these fixed buffers, which -- unlike
-# the token workspace -- cannot grow. Until then, fall back to the legacy
-# worst-case capacity.
+# TODO: Replace this fallback as the remaining encoders provide model-specific
+# conversions from atomic item/token budgets to attention segments. The exact
+# conversion requires each encoder's minimum tokens per tile/window/segment, so
+# retain this worst-case capacity for models without that contract.
+# Runtime-scheduled Qwen and Mistral/Pixtral encoders override
+# ``get_encoder_attention_metadata_capacity`` and do not consume this fallback.
 _ENCODER_FALLBACK_MAX_NUM_REQUESTS = 8192
 
 
@@ -44,7 +43,7 @@ class MultimodalEncoderMixin:
 
     Marker + default ``setup_attn_metadata`` for multimodal encoders whose
     ``AttentionMetadata`` is built by ``PyTorchModelEngine`` after model load
-    using runtime sizes (``max_batch_size``, ``max_num_tokens``).
+    using runtime sizes (``max_num_items``, ``max_num_tokens``).
 
     Subclasses set ``metadata_cls`` in their own ``__init__`` (typically from
     ``get_attention_backend(model_config.attn_backend).Metadata``) and either
@@ -54,12 +53,21 @@ class MultimodalEncoderMixin:
     metadata_cls: Type[AttentionMetadata]
     attn_metadata: Optional[AttentionMetadata] = None
 
-    def setup_attn_metadata(self, max_num_requests: int,
+    def get_encoder_attention_metadata_capacity(
+            self, max_num_items: int, max_num_tokens: int) -> dict[str, int]:
+        """Map item/token budgets to model-internal attention sequences."""
+        del max_num_tokens
+        return {
+            "attention": max(max_num_items, _ENCODER_FALLBACK_MAX_NUM_REQUESTS)
+        }
+
+    def setup_attn_metadata(self, max_num_items: int,
                             max_num_tokens: int) -> None:
-        max_num_requests = max(max_num_requests,
-                               _ENCODER_FALLBACK_MAX_NUM_REQUESTS)
+        """Map encoder item/token budgets to attention metadata capacity."""
+        capacities = self.get_encoder_attention_metadata_capacity(
+            max_num_items, max_num_tokens)
         self.attn_metadata = self.metadata_cls(
-            max_num_requests=max_num_requests,
+            max_num_requests=capacities["attention"],
             max_num_tokens=max_num_tokens,
             kv_cache_manager=None,
         )

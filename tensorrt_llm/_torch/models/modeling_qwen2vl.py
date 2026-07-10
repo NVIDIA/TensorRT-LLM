@@ -32,6 +32,7 @@ from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.inputs.multimodal import (DisaggPrefillMultimodalInputs,
                                             MultimodalParams)
+from tensorrt_llm.inputs.registry import MultimodalEncoderItemMetadata
 
 from ..._utils import async_tensor_h2d, nvtx_range, prefer_pinned
 from ...inputs import (BaseMultimodalDummyInputsBuilder,
@@ -188,6 +189,7 @@ _MAX_PIXELS_TOKEN_PROBE = 1 << 31
 
 class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
                                 BaseMultimodalDummyInputsBuilder):
+    supports_mm_encoder_item_scheduling = True
 
     def __init__(self,
                  model_path: str,
@@ -242,7 +244,7 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
         self,
         prompt_token_ids: List[int],
         multimodal_data: Dict[str, Any],
-    ) -> Optional[Tuple[List[Tuple[str, int]], List[int], List[int]]]:
+    ) -> Optional[MultimodalEncoderItemMetadata]:
         """Return prompt-ordered Qwen vision items and pre-merger costs."""
         grids_by_modality: Dict[str, torch.Tensor] = {}
         for modality, grid_key in (("image", "image_grid_thw"),
@@ -316,7 +318,7 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
 
         local_indices = {"image": 0, "video": 0}
         item_refs: List[Tuple[str, int]] = []
-        token_lengths: List[int] = []
+        encoder_token_lengths: List[int] = []
         for modality in canonical_modalities:
             local_idx = local_indices[modality]
             grids = grids_by_modality.get(modality)
@@ -324,18 +326,22 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
                 raise ValueError(
                     f"Prompt contains more {modality} items than encoder grids")
             item_refs.append((modality, local_idx))
-            token_lengths.append(int(torch.prod(grids[local_idx]).item()))
+            encoder_token_lengths.append(
+                int(torch.prod(grids[local_idx]).item()))
             local_indices[modality] += 1
 
         expected_items = sum(len(grids) for grids in grids_by_modality.values())
         if len(item_refs) != expected_items:
             raise ValueError("Prompt multimodal item order does not match "
                              "processed Qwen encoder grids")
-        embedding_lengths = [
+        output_embedding_lengths = [
             token_length // self.spatial_merge_unit
-            for token_length in token_lengths
+            for token_length in encoder_token_lengths
         ]
-        return item_refs, token_lengths, embedding_lengths
+        return MultimodalEncoderItemMetadata(
+            item_refs=item_refs,
+            encoder_token_lengths=encoder_token_lengths,
+            output_embedding_lengths=output_embedding_lengths)
 
     # ------------------------------------------------------------------
     # Deterministic dummy-input sizing for multimodal profiling.
@@ -1506,25 +1512,36 @@ class Qwen2_5_VisionModel(torch.nn.Module, MultimodalEncoderMixin):
                              None,
                              persistent=False)
 
-    def setup_attn_metadata(self, max_num_requests: int,
+    def setup_attn_metadata(self, max_num_items: int,
                             max_num_tokens: int) -> None:
         # Override: Qwen2/2.5-VL uses two metadata objects (full + window
         # attention) instead of the mixin's single ``attn_metadata``.
         #
-        # Windowed attention uses one metadata sequence per non-empty window.
-        # Runtime scheduling now caps the sum of physical attention tokens, so
-        # the number of non-empty windows cannot exceed ``max_num_tokens``.
-        max_num_requests = max(max_num_requests, max_num_tokens)
-        kwargs = dict(max_num_requests=max_num_requests,
-                      max_num_tokens=max_num_tokens,
-                      kv_cache_manager=None)
-        self.full_attn_metadata = self.metadata_cls(**kwargs)
-        self.window_attn_metadata = self.metadata_cls(**kwargs)
+        capacities = self.get_encoder_attention_metadata_capacity(
+            max_num_items, max_num_tokens)
+        kwargs = dict(max_num_tokens=max_num_tokens, kv_cache_manager=None)
+        self.full_attn_metadata = self.metadata_cls(
+            max_num_requests=capacities["full_attention"], **kwargs)
+        self.window_attn_metadata = self.metadata_cls(
+            max_num_requests=capacities["window_attention"], **kwargs)
         # Size the vision-block ``rope_position_ids`` scratch to the encoder
         # token budget; ``forward`` grows it on the rare miss above the budget.
         self._rope_position_ids_buffer = torch.arange(max_num_tokens,
                                                       dtype=torch.int32,
                                                       device=self.device)
+
+    def get_encoder_attention_metadata_capacity(
+            self, max_num_items: int, max_num_tokens: int) -> Dict[str, int]:
+        """Bound Qwen full/window sequences from the physical token budget.
+
+        ``max_num_items`` is intentionally ignored because one atomic video
+        item can expand to multiple temporal and window-attention sequences.
+        """
+        max_num_sequences = max(1, max_num_tokens // self.spatial_merge_unit)
+        return {
+            "full_attention": max_num_sequences,
+            "window_attention": max_num_sequences,
+        }
 
     def get_rotary_pos_emb_window_data(
         self, grid_rows: List[List[int]]

@@ -19,8 +19,8 @@ import enum
 import traceback
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import (Any, Callable, ClassVar, Dict, List, Optional, Protocol,
-                    Tuple, Type, TypeVar, Union)
+from typing import (Any, Callable, ClassVar, Dict, List, NamedTuple, Optional,
+                    Protocol, Tuple, Type, TypeVar, Union)
 
 import torch
 from PIL import Image
@@ -33,7 +33,8 @@ from ..logger import logger
 from ..sampling_params import SamplingParams
 from .content_format import ContentFormat
 from .data import TextPrompt
-from .multimodal import (MultimodalInput, _as_cpu_tensor, _compute_mm_masks,
+from .multimodal import (MULTIMODAL_ENCODER_ITEM_METADATA_KEY, MultimodalInput,
+                         _as_cpu_tensor, _compute_mm_masks,
                          _find_mm_embedding_lengths_from_masks,
                          _find_mm_token_runs_from_mask,
                          _find_mm_token_start_pos_from_masks, apply_mm_hashes,
@@ -54,6 +55,31 @@ def _hash_mm_processor_kwargs(mm_processor_kwargs: Dict[str, Any],
     except (TypeError, ValueError, RuntimeError):
         return None
     return hasher.hexdigest()
+
+
+class MultimodalEncoderItemMetadata(NamedTuple):
+    """Prompt-ordered metadata for atomic multimodal encoder items."""
+
+    item_refs: List[Tuple[str, int]]
+    encoder_token_lengths: List[int]
+    output_embedding_lengths: List[int]
+
+
+def get_multimodal_encoder_item_metadata(
+    multimodal_data: Optional[Dict[str, Any]],
+) -> Optional[MultimodalEncoderItemMetadata]:
+    """Return typed atomic-item metadata from Python multimodal data."""
+    if multimodal_data is None:
+        return None
+    if not isinstance(multimodal_data, dict):
+        raise TypeError("multimodal_data must be a dict")
+    metadata = multimodal_data.get(MULTIMODAL_ENCODER_ITEM_METADATA_KEY)
+    if metadata is None:
+        return None
+    if not isinstance(metadata, MultimodalEncoderItemMetadata):
+        raise TypeError(f"{MULTIMODAL_ENCODER_ITEM_METADATA_KEY} must be a "
+                        "MultimodalEncoderItemMetadata")
+    return metadata
 
 
 class InputProcessor(Protocol):
@@ -178,11 +204,15 @@ class BaseMultimodalInputProcessor(ABC):
     # inputs to `call_with_token_ids` instead of detokenizing upstream.
     supports_token_id_mm_expansion: ClassVar[bool] = False
 
+    # Whether this processor provides complete atomic-item metadata for the
+    # multimodal encoder runtime scheduler.
+    supports_mm_encoder_item_scheduling: ClassVar[bool] = False
+
     def get_mm_encoder_item_metadata(
         self,
         prompt_token_ids: List[int],
         multimodal_data: Dict[str, Any],
-    ) -> Optional[Tuple[List[Tuple[str, int]], List[int], List[int]]]:
+    ) -> Optional[MultimodalEncoderItemMetadata]:
         """Return item refs, physical costs, and encoder output lengths.
 
         Models opting into runtime MM encoder scheduling override this hook.
@@ -1323,21 +1353,61 @@ def create_input_processor_with_hash(
             multimodal_data = extra_processed_inputs.get("multimodal_data")
             if (isinstance(multimodal_data, dict)
                     and multimodal_data.get("multimodal_embedding") is None):
-                metadata_fn = getattr(input_processor,
-                                      "get_mm_encoder_item_metadata", None)
-                item_metadata = (metadata_fn(prompt_token_ids, multimodal_data)
-                                 if metadata_fn is not None else None)
+                supports_item_scheduling = getattr(
+                    input_processor, "supports_mm_encoder_item_scheduling",
+                    False)
+                has_raw_payload = any(
+                    isinstance(multimodal_data.get(modality), dict)
+                    for modality in ("image", "video", "audio"))
+                item_metadata = None
+                if supports_item_scheduling and has_raw_payload:
+                    item_metadata = input_processor.get_mm_encoder_item_metadata(
+                        prompt_token_ids, multimodal_data)
+                    if item_metadata is None:
+                        raise ValueError(
+                            "An input processor supporting MM encoder item "
+                            "scheduling must return item metadata for raw "
+                            "multimodal payloads")
                 if item_metadata is not None:
-                    item_refs, token_lengths, embedding_lengths = item_metadata
-                    if not (len(item_refs) == len(token_lengths) ==
-                            len(embedding_lengths)):
+                    if not isinstance(item_metadata,
+                                      MultimodalEncoderItemMetadata):
+                        raise TypeError(
+                            "get_mm_encoder_item_metadata() must return a "
+                            "MultimodalEncoderItemMetadata")
+                    if not all(
+                            isinstance(values, list)
+                            for values in item_metadata):
+                        raise TypeError(
+                            "Multimodal encoder item metadata fields must be lists"
+                        )
+                    if not (len(item_metadata.item_refs) == len(
+                            item_metadata.encoder_token_lengths) == len(
+                                item_metadata.output_embedding_lengths)):
                         raise ValueError("Multimodal encoder item references "
                                          "and lengths must align")
-                    multimodal_data["multimodal_item_refs"] = item_refs
+                    if any(length <= 0
+                           for length in item_metadata.encoder_token_lengths):
+                        raise ValueError("Multimodal encoder token lengths "
+                                         "must be positive")
+                    if any(length <= 0 for length in
+                           item_metadata.output_embedding_lengths):
+                        raise ValueError("Multimodal encoder output embedding "
+                                         "lengths must be positive")
                     multimodal_data[
-                        "multimodal_encoder_token_lengths"] = token_lengths
-                    multimodal_data.setdefault("multimodal_embedding_lengths",
-                                               embedding_lengths)
+                        MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = item_metadata
+                    existing_embedding_lengths = multimodal_data.get(
+                        "multimodal_embedding_lengths")
+                    if existing_embedding_lengths is not None:
+                        if not isinstance(existing_embedding_lengths, list):
+                            raise TypeError(
+                                "multimodal_embedding_lengths must be a list")
+                        if (existing_embedding_lengths
+                                != item_metadata.output_embedding_lengths):
+                            raise ValueError(
+                                "Computed multimodal encoder embedding lengths "
+                                "do not match the existing prompt metadata")
+                    multimodal_data[
+                        "multimodal_embedding_lengths"] = item_metadata.output_embedding_lengths
         return prompt_token_ids, extra_processed_inputs
 
     return input_processor_wrapper

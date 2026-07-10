@@ -801,19 +801,19 @@ class Qwen3VisionModel(torch.nn.Module, MultimodalEncoderMixin):
     def device(self) -> torch.device:
         return self.patch_embed.proj.weight.device
 
-    def setup_attn_metadata(self, max_num_requests: int, max_num_tokens: int) -> None:
+    def setup_attn_metadata(self, max_num_items: int, max_num_tokens: int) -> None:
         # Override the mixin default: each image / video frame is its own
         # attention segment (``seq_lens.extend([h * w] * t)`` in ``forward``),
         # so a single multi-image or video request can produce many more
-        # segments than ``max_batch_size``. The number of segments in one
-        # encoder forward is bounded by the token budget (every segment holds
-        # at least one token), NOT by the request count -- so floor the
-        # metadata's request capacity at ``max_num_tokens`` to keep the
+        # segments than ``max_num_items``. The number of segments in one
+        # encoder forward is bounded by the token budget and each segment
+        # contains at least ``spatial_merge_unit`` physical tokens. Use the
+        # model-specific capacity hook to keep the
         # per-request buffers (prompt_lens / host_request_types / kv_lens) from
         # overflowing when ``num_contexts`` is set to the segment count.
-        max_num_requests = max(max_num_requests, max_num_tokens)
+        capacities = self.get_encoder_attention_metadata_capacity(max_num_items, max_num_tokens)
         self.attn_metadata = self.metadata_cls(
-            max_num_requests=max_num_requests,
+            max_num_requests=capacities["attention"],
             max_num_tokens=max_num_tokens,
             kv_cache_manager=None,
         )
@@ -825,6 +825,16 @@ class Qwen3VisionModel(torch.nn.Module, MultimodalEncoderMixin):
         self._rope_position_ids_buffer = torch.arange(
             max_num_tokens, dtype=torch.int32, device=self.device
         )
+
+    def get_encoder_attention_metadata_capacity(
+        self, max_num_items: int, max_num_tokens: int
+    ) -> Dict[str, int]:
+        """Bound temporal attention segments from the physical token budget.
+
+        ``max_num_items`` is intentionally ignored because one atomic video
+        item can expand to multiple temporal attention segments.
+        """
+        return {"attention": max(1, max_num_tokens // self.spatial_merge_unit)}
 
     @staticmethod
     @lru_cache(maxsize=1024)

@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import gc
 import os
 import pathlib
@@ -33,7 +36,7 @@ pytestmark = pytest.mark.threadleak(enabled=False)
 # sized once at load to this max budget; each forward re-preps it with the real
 # per-image seq lens. Two distinct axes: requests = image/sequence count budget,
 # tokens = total patch budget.
-_ENCODER_TEST_MAX_NUM_REQUESTS = 2048
+_ENCODER_TEST_MAX_NUM_ITEMS = 2048
 _ENCODER_TEST_MAX_NUM_TOKENS = 8192
 
 
@@ -89,7 +92,7 @@ def test_pixtral_vision_model_vs_hf():
     )
     # Engine normally calls this after model load; standalone tests must do it themselves.
     pixtral_model.setup_attn_metadata(
-        max_num_requests=_ENCODER_TEST_MAX_NUM_REQUESTS, max_num_tokens=_ENCODER_TEST_MAX_NUM_TOKENS
+        max_num_items=_ENCODER_TEST_MAX_NUM_ITEMS, max_num_tokens=_ENCODER_TEST_MAX_NUM_TOKENS
     )
     hf_pixtral_model = init_hf_model(
         cls=hf_modeling_pixtral.PixtralVisionModel,
@@ -148,7 +151,7 @@ def test_tensor_parallelism(mpi_pool_executor, tmp_path):
         modeling_pixtral.PixtralVisionModel(model_config=pixtral_vision_config).eval().to("cuda")
     )
     pixtral_model.setup_attn_metadata(
-        max_num_requests=_ENCODER_TEST_MAX_NUM_REQUESTS, max_num_tokens=_ENCODER_TEST_MAX_NUM_TOKENS
+        max_num_items=_ENCODER_TEST_MAX_NUM_ITEMS, max_num_tokens=_ENCODER_TEST_MAX_NUM_TOKENS
     )
     pixtral_model.load_weights(state_dict)
     # Save the number of params to check that the model gets shared in the workers.
@@ -221,7 +224,7 @@ def _run_pixtral_and_compare_against_ref(
         modeling_pixtral.PixtralVisionModel(model_config=pixtral_vision_config).eval().to("cuda")
     )
     pixtral_model.setup_attn_metadata(
-        max_num_requests=_ENCODER_TEST_MAX_NUM_REQUESTS, max_num_tokens=_ENCODER_TEST_MAX_NUM_TOKENS
+        max_num_items=_ENCODER_TEST_MAX_NUM_ITEMS, max_num_tokens=_ENCODER_TEST_MAX_NUM_TOKENS
     )
     state_dict = torch.load(hf_weights_path, map_location="cuda")
     pixtral_model.load_weights(state_dict)

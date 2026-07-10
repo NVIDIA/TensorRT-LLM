@@ -34,6 +34,7 @@ from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.tensor_lru_cache import TensorLRUCache
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.inputs.multimodal import MultimodalParams, MultimodalRuntimeData
+from tensorrt_llm.inputs.registry import get_multimodal_encoder_item_metadata
 from tensorrt_llm.logger import logger
 
 from .modeling_multimodal_utils import (
@@ -172,13 +173,20 @@ class MultimodalModelMixin:
     ) -> MultimodalParams:
         """Build encoder inputs for one canonical original MM item."""
         multimodal_data = multimodal_param.multimodal_data or {}
-        item_refs = multimodal_data.get("multimodal_item_refs")
-        if not isinstance(item_refs, list) or item_idx >= len(item_refs):
+        item_metadata = get_multimodal_encoder_item_metadata(multimodal_data)
+        if item_metadata is None:
+            raise ValueError(f"Missing multimodal item reference for index {item_idx}")
+        item_refs = item_metadata.item_refs
+        if not isinstance(item_refs, list):
+            raise TypeError("Multimodal encoder item references must be a list")
+        if item_idx >= len(item_refs):
             raise ValueError(f"Missing multimodal item reference for index {item_idx}")
         modality, local_idx = item_refs[item_idx]
         modality_data = multimodal_data.get(modality)
-        if not isinstance(modality_data, dict):
+        if modality_data is None:
             raise ValueError(f"Missing {modality} encoder data for item {item_idx}")
+        if not isinstance(modality_data, dict):
+            raise TypeError(f"{modality} encoder data must be a dict")
 
         selected_data: Dict[str, Any] = {}
         grid_key = (
@@ -215,31 +223,35 @@ class MultimodalModelMixin:
             selected_data["image_sizes"] = image_sizes[local_idx : local_idx + 1]
             selected_data["pixel_values"] = pixel_values[local_idx : local_idx + 1]
         else:
-            raise NotImplementedError(
-                f"Item-level encoder slicing is not implemented for {modality}"
-            )
+            raise TypeError(f"Unsupported multimodal item layout for {modality}")
 
         return MultimodalParams(multimodal_data={modality: selected_data})
-
-    def encode_multimodal_items(
-        self,
-        selected_items: Sequence[tuple[MultimodalParams, int]],
-    ) -> list[torch.Tensor]:
-        """Prepare and encode atomic items in scheduler order."""
-        return self.encode_prepared_multimodal_items(self.prepare_multimodal_items(selected_items))
 
     def prepare_multimodal_items(
         self,
         selected_items: Sequence[tuple[MultimodalParams, int]],
     ) -> list[tuple[MultimodalParams, int, str]]:
-        """Slice selected items before any caller performs H2D transfer."""
+        """Slice selected items before any caller performs H2D transfer.
+
+        Args:
+            selected_items: ``(request params, item index)`` pairs in
+                scheduler-selected order. Each params object must contain
+                parallel item references and embedding lengths.
+
+        Returns:
+            Tuples containing the sliced single-item params, its expected
+            encoder output row count, and its modality, in input order.
+        """
         prepared_items: list[tuple[MultimodalParams, int, str]] = []
         for multimodal_param, item_idx in selected_items:
             multimodal_data = multimodal_param.multimodal_data or {}
-            item_refs = multimodal_data.get("multimodal_item_refs")
-            embedding_lengths = multimodal_data.get("multimodal_embedding_lengths")
-            if not isinstance(item_refs, list) or not isinstance(embedding_lengths, list):
+            item_metadata = get_multimodal_encoder_item_metadata(multimodal_data)
+            if item_metadata is None:
                 raise ValueError("MM item metadata is required for item encoding")
+            item_refs = item_metadata.item_refs
+            embedding_lengths = item_metadata.output_embedding_lengths
+            if not isinstance(item_refs, list) or not isinstance(embedding_lengths, list):
+                raise TypeError("MM item metadata must contain lists")
             modality = item_refs[item_idx][0]
             prepared_items.append(
                 (
@@ -254,7 +266,17 @@ class MultimodalModelMixin:
         self,
         prepared_items: Sequence[tuple[MultimodalParams, int, str]],
     ) -> list[torch.Tensor]:
-        """Encode already-sliced compatible items in scheduler order."""
+        """Encode already-sliced items in scheduler order.
+
+        Args:
+            prepared_items: Tuples returned by
+                :meth:`prepare_multimodal_items`. Consecutive items with the
+                same modality must be batch-compatible.
+
+        Returns:
+            One encoder output tensor per prepared item. Each tensor has the
+            declared embedding row count and retains scheduler input order.
+        """
         outputs: list[torch.Tensor] = []
         group_params: list[MultimodalParams] = []
         group_lengths: list[int] = []
