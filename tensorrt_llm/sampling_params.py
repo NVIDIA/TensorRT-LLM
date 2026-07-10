@@ -409,9 +409,23 @@ class SamplingParams:
                 # For tiktokenizer, the encode method does not have add_special_tokens argument
                 return tokenizer.encode(text)
 
+        def _encode_bad_word(tokenizer, word, add_special_tokens):
+            # BPE / prefix-space tokenizers (GPT-2, Qwen, ...) tokenize a word
+            # differently at the start of a sequence ("London") than in the
+            # middle (" London"). Record both variants so the word is blocked
+            # in every position. Deduplicate for tokenizers where the two forms
+            # coincide.
+            variants = [_encode(tokenizer, word, add_special_tokens)]
+            prefixed = _encode(tokenizer, f" {word}", add_special_tokens)
+            if prefixed not in variants:
+                variants.append(prefixed)
+            return variants
+
         if self.bad is not None:
             strs = [self.bad] if isinstance(self.bad, str) else self.bad
-            self._bad_word_ids = [_encode(tokenizer, s, add_special_tokens) for s in strs]
+            self._bad_word_ids = [
+                ids for s in strs for ids in _encode_bad_word(tokenizer, s, add_special_tokens)
+            ]
 
         if self.stop is not None:
             strs = [self.stop] if isinstance(self.stop, str) else self.stop
