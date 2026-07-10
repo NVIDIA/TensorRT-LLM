@@ -26,23 +26,6 @@ python3 ../../benchmarks/cpp/prepare_dataset.py \
     --output-stdev 0 \
     >/tmp/dataset.jsonl
 
-# Notes on profiling Steps 1 and 2 under recent nsys versions
-# (https://nvbugs/6127669):
-#   - The whole benchmark process is traced instead of gating the collection
-#     with "-c cudaProfilerApi": kernels launched by CUDA graphs that were
-#     instantiated before the capture range opened are exported without
-#     runtime correlation (correlationId 0), which breaks parse_e2e.py, and
-#     the engine captures its CUDA graphs during warmup, before any capture
-#     range can open. TLLM_PROFILE_START_STOP still bounds the calibration
-#     data collection, and parse_e2e.py selects the matching iterations via
-#     --start-iter/--stop-iter.
-#   - max_num_tokens admits all prefills in a single iteration, so all
-#     requests finish at the same iteration. Draining the batch through
-#     progressively smaller CUDA graph batch sizes with the profiler attached
-#     has been observed to wedge the device stream and hang the executor;
-#     a uniform batch also matches the steady-state assumption of the
-#     correlation methodology.
-
 # Step 1
 
 rm -f -- "$TLLM_AUTOTUNER_CACHE_PATH"
@@ -130,13 +113,6 @@ NP=$NP ./mpi_launch.sh ./run.sh config_gen.yaml \
     --replay-file-path "$PROFILE_DIR/calibration_data.json" \
     --replay-start-iter $((BATCH_SIZE + 10 + 5)) \
     --replay-stop-iter $((BATCH_SIZE + 34))
-# The calibration file contains the 25 iterations [BATCH_SIZE+10, BATCH_SIZE+34]:
-# collection starts at the TLLM_PROFILE_START_STOP start iteration and the stop
-# iteration itself is not collected. Replaying [BATCH_SIZE+15, BATCH_SIZE+34]
-# matches the 20 iterations that parse_e2e.py keeps after --warmup-times 5.
-# --seq-len-kv-cache is the average past length over the replayed iterations:
-# 2048 prompt tokens (all requests prefill at iteration 1 and decode in
-# lockstep) plus the mid-window decode offset.
 
 # Step 4
 

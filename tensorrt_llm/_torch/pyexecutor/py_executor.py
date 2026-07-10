@@ -1645,8 +1645,7 @@ class PyExecutor:
                 # --capture-range-end=stop-shutdown) as soon as the capture
                 # range closes, so the calibration file dump must happen
                 # before the stop, and the capture should end on an idle
-                # device with no in-flight async copies
-                # (https://nvbugs/6127669).
+                # device with no in-flight async copies.
                 calibrator.stop()
                 torch.cuda.synchronize()
                 torch.cuda.cudart().cudaProfilerStop()
