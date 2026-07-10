@@ -24,5 +24,9 @@ def test_constant_delays() -> None:
 def test_unknown_delay_dist_raises_value_error() -> None:
     # Previously fell through to `return delays` with delays unbound,
     # raising a cryptic UnboundLocalError.
-    with pytest.raises(ValueError, match="Unknown delay_dist"):
+    with pytest.raises(
+        ValueError,
+        match=r"Unknown delay_dist 'uniform'; expected 'constant' or "
+        r"'exponential_dist'\.",
+    ):
         get_list_of_delays("uniform", 1.0, 5, 0)
