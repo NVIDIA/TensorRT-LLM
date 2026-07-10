@@ -769,6 +769,17 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self.shared_topk_indices = None
 
         if self.kv_cache_manager is not None and self.num_tokens > 0:
+            # Refresh the effective tokens-per-block from the CURRENT cache
+            # manager: the __post_init__-cached value may have been computed
+            # against a non-DSV4 manager (e.g. during KV cache estimation),
+            # skipping the compress-ratio division and leaving the raw
+            # tokens_per_block, which makes the slot-mapping stride 4x too
+            # large.
+            if hasattr(self.kv_cache_manager, 'compressed_block_sizes'):
+                self._tokens_per_block = (
+                    self.kv_cache_manager.tokens_per_block //
+                    _effective_compress_ratio_divisor(
+                        self._indexer_compress_ratio))
             seq_lens = self.seq_lens_cuda[:self.num_seqs]
             # Runtime cached lengths after overlap/spec-dec correction.
             start_positions = self.kv_lens_cuda[:self.num_seqs] - seq_lens
@@ -1930,13 +1941,25 @@ class Indexer(nn.Module):
             kv_cache_manager, 'use_fp4', False) else head_dim
         compress_ratio = _effective_compress_ratio_divisor(
             _select_indexer_compress_ratio(metadata.compress_ratios))
+        # Derive the effective tokens-per-block from the CURRENT cache
+        # manager instead of metadata._tokens_per_block. The cached value is
+        # computed once in __post_init__, but the kv_cache_manager attached
+        # at that time may not be the DeepSeek-V4 manager (e.g. during KV
+        # cache estimation); the compress-ratio division is then skipped and
+        # the raw tokens_per_block (256) is cached, which makes every
+        # indexer slot mapping stride 4x too large (indexer cache blocks
+        # hold tokens_per_block // compress_ratio compressed tokens).
+        tokens_per_block = kv_cache_manager.tokens_per_block
+        if hasattr(kv_cache_manager, 'compressed_block_sizes'):
+            tokens_per_block = tokens_per_block // compress_ratio
+        metadata._tokens_per_block = tokens_per_block
         return IndexerParams(
             num_contexts=metadata.num_contexts,
             num_generations=metadata.num_generations,
             num_ctx_tokens=metadata.num_ctx_tokens,
             head_dim=head_dim,
             quant_block_size=metadata.indexer_quant_block_size,
-            tokens_per_block=metadata._tokens_per_block,
+            tokens_per_block=tokens_per_block,
             compress_ratio=compress_ratio,
             request_ids=metadata.request_ids,
             num_past_tokens=metadata.kv_cache_params.num_cached_tokens_per_seq,
