@@ -1089,7 +1089,7 @@ def getPytestBaseCommandLine(
         testCmdLine += ["--run-ray"]
     }
     def unittestMarkExpr = (stageName.startsWith("CPU-")) ? "cpu_only and not disabled" : "not cpu_only"
-    testCmdLine += ["--unittest-markexpr=\"${unittestMarkExpr}\""]
+    testCmdLine += ["--unittest-markexpr='${unittestMarkExpr}'"]
     if (extraArgs) {
         testCmdLine += extraArgs
     }
