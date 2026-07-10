@@ -1472,12 +1472,6 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
     // a retryable infra failure (a retry follows) -- otherwise a stage that fails
     // an intermediate attempt and passes on retry leaves the build UNSTABLE.
     def caughtStageError = null
-    // Tracks whether the Run Pytest stage's track step returned without
-    // throwing. Only on `true` do we sweep this stage's progress tar from
-    // Artifactory in the finally block (forensic tars from failed runs are
-    // kept). Set after the `node(...)` block; defaults to false so any
-    // earlier-thrown exception leaves the progress tar untouched.
-    def pytestSucceeded = false
 
     try {
         // Run ssh command to start node in desired cluster via SLURM
@@ -2197,8 +2191,6 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
             echo "Finished test stage execution."
             }  // end CloudManager.withSlurmFrontendFailover
         }  // end withCredentials
-        // Reached only if no stage above (Initialize Test, Run Pytest) threw.
-        pytestSucceeded = true
     } catch (InterruptedException e) {
         stageIsInterrupted = true
         throw e
@@ -2892,7 +2884,6 @@ def cacheErrorAndUploadResult(stageName, taskRunner, finallyRunner, noResultIfSu
                     sh "echo '${stageXml}' > ${stageName}/results-stage.xml"
                 }
             }
-            sh "STAGE_NAME=${stageName}"
             sh "STAGE_NAME=${stageName} && env | sort > ${stageName}/debug_env.txt"
             echo "Upload test results."
             sh "tar -czvf results-${stageName}${postTag}.tar.gz ${stageName}/"
