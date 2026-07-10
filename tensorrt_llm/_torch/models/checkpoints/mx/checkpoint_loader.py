@@ -222,6 +222,9 @@ class MXCheckpointLoader(HfCheckpointLoader):
             mapping: Distributed mapping configuration.
             **kwargs: Additional keyword arguments. When `model` is
                 passed it is used as the target for direct P2P writes.
+                `prepare_post_transform_receiver`, when present, is called
+                after a post-transform source is qualified and before those
+                direct writes begin.
 
         Returns:
             A weights dict. Empty when MX P2P fully succeeded (weights
@@ -232,6 +235,7 @@ class MXCheckpointLoader(HfCheckpointLoader):
         # Popped here so it never leaks into the disk-fallback signature.
         self._local_source_identity = kwargs.pop("source_identity", None)
         allow_post_transform_weights = kwargs.pop("allow_post_transform_weights", False)
+        prepare_post_transform_receiver = kwargs.pop("prepare_post_transform_receiver", None)
         self._p2p_succeeded = False
         self._post_transform_weights_preloaded = False
         self._source_identity_compatible_for_last_load = False
@@ -304,6 +308,23 @@ class MXCheckpointLoader(HfCheckpointLoader):
                 ),
                 **kwargs,
             )
+        if self._post_transform_weights_preloaded:
+            if prepare_post_transform_receiver is None:
+                self._post_transform_weights_preloaded = False
+                self._source_identity_compatible_for_last_load = False
+                return self._fallback_to_disk(
+                    checkpoint_dir,
+                    mapping,
+                    reason=(
+                        "post-transform source requires receiver structure "
+                        "preparation before exact-name P2P transfer"
+                    ),
+                    **kwargs,
+                )
+            # Source-side setup_aliases() may change the first canonical name
+            # returned for aliased parameters. Mirror that structural state on
+            # the receiver before upstream MX matches tensors by exact name.
+            prepare_post_transform_receiver(model)
 
         timeout_override = self._resolve_query_timeout_override(
             checkpoint_dir,

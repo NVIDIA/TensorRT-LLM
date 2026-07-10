@@ -560,6 +560,9 @@ class ModelLoader:
                         loads_draft_weights=loads_draft_weights)
                     load_weights_kwargs[
                         "allow_post_transform_weights"] = qualification.qualified
+                    if qualification.qualified:
+                        load_weights_kwargs[
+                            "prepare_post_transform_receiver"] = self._setup_aliases
 
                 if hasattr(model, 'llm_checkpoint_dir'):
                     weights = checkpoint_loader.load_weights(
@@ -684,6 +687,9 @@ class ModelLoader:
                                     loads_draft_weights=loads_draft_weights)
                                 load_weights_kwargs[
                                     "allow_post_transform_weights"] = qualification.qualified
+                                if qualification.qualified:
+                                    load_weights_kwargs[
+                                        "prepare_post_transform_receiver"] = self._setup_aliases
                             weights = checkpoint_loader.load_weights(
                                 weight_source, **load_weights_kwargs)
 

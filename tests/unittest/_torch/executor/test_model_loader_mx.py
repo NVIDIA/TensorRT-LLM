@@ -292,6 +292,8 @@ class _PostTransformMxLoader:
             self._post_transform = False
             self._weights_preloaded = False
             return {"disk.weight": self._disk_weight}
+        if self._post_transform:
+            kwargs["prepare_post_transform_receiver"](kwargs["model"])
         return {}
 
     def is_post_transform_weights_preloaded(self) -> bool:
@@ -318,6 +320,7 @@ def test_mx_post_transform_receiver_uses_staged_path_when_qualified(monkeypatch)
     loader._call_load_weights.assert_not_called()
     _args, kwargs = checkpoint_loader.load_weights.call_args
     assert kwargs["allow_post_transform_weights"] is True
+    assert callable(kwargs["prepare_post_transform_receiver"])
     checkpoint_loader.post_load_publish.assert_called_once_with(
         model,
         checkpoint_dir="/ckpt",
@@ -330,7 +333,7 @@ def test_mx_post_transform_receiver_uses_staged_path_when_qualified(monkeypatch)
     assert model._weights_transformed is True
     assert model.linear._weights_transformed is True
     assert model.draft_model.linear._weights_transformed is True
-    assert events == ["setup_aliases", "cache_derived_state"]
+    assert events == ["setup_aliases", "setup_aliases", "cache_derived_state"]
 
 
 def test_default_profile_qualifies_real_tiny_llama_lifecycle(monkeypatch):
@@ -407,6 +410,7 @@ def test_mx_post_transform_receiver_falls_back_for_unqualified_model(monkeypatch
 
     _args, kwargs = checkpoint_loader.load_weights.call_args
     assert kwargs["allow_post_transform_weights"] is False
+    assert "prepare_post_transform_receiver" not in kwargs
     assert checkpoint_loader.is_weights_preloaded() is False
     assert loader._call_load_weights.call_count == 1
     load_fn, weights, mapper = loader._call_load_weights.call_args.args

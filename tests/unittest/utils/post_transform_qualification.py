@@ -190,10 +190,13 @@ def assert_post_transform_lifecycle_equivalent(
     assert decision.profile is not None
     assert decision.profile.profile_id == case.profile_id
 
+    transform_calls = _install_transform_call_recorders(receiver)
     ModelLoader._walk_full_post_load(producer)
+    ModelLoader._setup_aliases(receiver)
     case.prepare_receiver(producer, receiver)
 
-    transform_calls = _install_transform_call_recorders(receiver)
+    # Runtime finalization repeats setup_aliases(), whose contract is
+    # idempotent, after the checkpoint loader's pre-transfer preparation.
     ModelLoader._setup_aliases(receiver)
     ModelLoader._mark_weights_transformed(receiver)
     ModelLoader._walk_cache_state(receiver)

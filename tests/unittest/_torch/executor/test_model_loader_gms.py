@@ -144,10 +144,15 @@ class _PostTransformMxLoader:
     checkpoint_format = "MX"
 
     def __init__(self) -> None:
-        self.load_weights = MagicMock(return_value={})
+        self.load_weights = MagicMock(side_effect=self._load_weights)
         self.is_weights_preloaded = MagicMock(return_value=True)
         self.post_load_apply = MagicMock()
         self.post_load_publish = MagicMock()
+
+    @staticmethod
+    def _load_weights(*_args, **kwargs):
+        kwargs["prepare_post_transform_receiver"](kwargs["model"])
+        return {}
 
     def is_post_transform_weights_preloaded(self) -> bool:
         return True
@@ -415,6 +420,7 @@ def test_gms_rw_mx_post_transform_preload_uses_staged_path(monkeypatch):
         "pool_enter",
         "_apply",
         "to",
+        "setup_aliases",
         "post_load_apply",
         "setup_aliases",
         "cache_derived_state",
@@ -427,6 +433,7 @@ def test_gms_rw_mx_post_transform_preload_uses_staged_path(monkeypatch):
     assert model._weights_transformed is True
     _args, kwargs = checkpoint_loader.load_weights.call_args
     assert kwargs["allow_post_transform_weights"] is True
+    assert callable(kwargs["prepare_post_transform_receiver"])
     loader._call_load_weights.assert_not_called()
     checkpoint_loader.post_load_publish.assert_called_once_with(
         model,
