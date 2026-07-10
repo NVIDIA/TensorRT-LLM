@@ -91,7 +91,7 @@ _GPU_DTYPE = torch.bfloat16
 # ``encoder_max_batch_size`` / ``encoder_max_num_tokens``, defaulting to
 # ``max_batch_size`` / ``max_num_tokens``). Two distinct axes: requests =
 # image/sequence count budget, tokens = total patch budget.
-_ENCODER_TEST_MAX_NUM_REQUESTS = 2048
+_ENCODER_TEST_MAX_NUM_ITEMS = 2048
 _ENCODER_TEST_MAX_NUM_TOKENS = 8192
 
 
@@ -199,7 +199,7 @@ def _setup_encoder_attn_metadata(module, max_num_tokens: int = _ENCODER_TEST_MAX
     for m in module.modules():
         if isinstance(m, MultimodalEncoderMixin):
             m.setup_attn_metadata(
-                max_num_requests=_ENCODER_TEST_MAX_NUM_REQUESTS, max_num_tokens=max_num_tokens
+                max_num_items=_ENCODER_TEST_MAX_NUM_ITEMS, max_num_tokens=max_num_tokens
             )
     return module
 

@@ -341,7 +341,7 @@ class PyTorchModelEngine(ModelEngine):
         # Multimodal encoder runtime sizes; fall back to LLM-side values when
         # the encoder-specific knobs are unset.
         (
-            self.encoder_batch_size,
+            self.encoder_max_num_items,
             self.encoder_max_num_tokens,
         ) = llm_args.get_encoder_runtime_sizes()
         self.configured_encoder_max_num_tokens = self.encoder_max_num_tokens
@@ -472,12 +472,9 @@ class PyTorchModelEngine(ModelEngine):
         # In case that some tests use stub models and override `_load_model`.
         if not hasattr(self.model, 'extra_attrs'):
             self.model.extra_attrs = {}
-        processor_metadata_fn = getattr(type(self.input_processor),
-                                        "get_mm_encoder_item_metadata", None)
         self.supports_mm_encoder_item_scheduling = (
             isinstance(self.model, MultimodalModelMixin)
-            and processor_metadata_fn is not None and processor_metadata_fn
-            is not BaseMultimodalInputProcessor.get_mm_encoder_item_metadata)
+            and self.input_processor.supports_mm_encoder_item_scheduling)
         self.model_max_mm_encoder_item_tokens: Optional[int] = None
         if self.supports_mm_encoder_item_scheduling:
             max_tokens_per_item = self.input_processor.get_mm_max_tokens_per_item(
@@ -2771,7 +2768,7 @@ class PyTorchModelEngine(ModelEngine):
         for module in self.model.modules():
             if isinstance(module, MultimodalEncoderMixin):
                 module.setup_attn_metadata(
-                    max_num_requests=self.encoder_batch_size,
+                    max_num_items=self.encoder_max_num_items,
                     max_num_tokens=self.encoder_max_num_tokens)
                 module.set_attn_max_seq_len(max_seq_len)
 

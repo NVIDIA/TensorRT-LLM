@@ -50,7 +50,8 @@ from tensorrt_llm.inputs import (BaseMultimodalDummyInputsBuilder,
                                  MultimodalPlaceholderPlacement, TextPrompt,
                                  register_input_processor)
 from tensorrt_llm.inputs.multimodal import MultimodalParams
-from tensorrt_llm.inputs.registry import MULTIMODAL_PLACEHOLDER_REGISTRY
+from tensorrt_llm.inputs.registry import (MULTIMODAL_PLACEHOLDER_REGISTRY,
+                                          MultimodalEncoderItemMetadata)
 from tensorrt_llm.inputs.utils import encode_base64_image
 from tensorrt_llm.llmapi import SamplingParams
 from tensorrt_llm.logger import logger
@@ -362,6 +363,8 @@ class MistralHFInputProcessor(BaseMultimodalInputProcessor,
                               BaseMultimodalDummyInputsBuilder):
     """Input processor for Mistral VLM checkpoints in HuggingFace format."""
 
+    supports_mm_encoder_item_scheduling = True
+
     def __init__(self,
                  model_path: str,
                  config: PretrainedConfig,
@@ -411,11 +414,10 @@ class MistralHFInputProcessor(BaseMultimodalInputProcessor,
 
     def get_mm_encoder_item_metadata(
         self,
-        prompt_token_ids: List[int],
+        _prompt_token_ids: List[int],
         multimodal_data: Dict[str, Any],
-    ) -> Optional[Tuple[List[Tuple[str, int]], List[int], List[int]]]:
+    ) -> Optional[MultimodalEncoderItemMetadata]:
         """Return Pixtral image items and physical ViT patch counts."""
-        del prompt_token_ids
         image_data = multimodal_data.get("image")
         if not isinstance(image_data, dict):
             return None
@@ -423,14 +425,20 @@ class MistralHFInputProcessor(BaseMultimodalInputProcessor,
         if image_sizes is None:
             return None
         patch, merge, _, _ = self._vision_geometry()
-        token_lengths = [(int(height) // patch) * (int(width) // patch)
-                         for height, width in image_sizes]
-        item_refs = [("image", item_idx)
-                     for item_idx in range(len(token_lengths))]
-        embedding_lengths = [
-            token_length // (merge * merge) for token_length in token_lengths
+        encoder_token_lengths = [
+            self._vit_tokens(width=int(width), height=int(height), patch=patch)
+            for height, width in image_sizes
         ]
-        return item_refs, token_lengths, embedding_lengths
+        item_refs = [("image", item_idx)
+                     for item_idx in range(len(encoder_token_lengths))]
+        output_embedding_lengths = [
+            token_length // (merge * merge)
+            for token_length in encoder_token_lengths
+        ]
+        return MultimodalEncoderItemMetadata(
+            item_refs=item_refs,
+            encoder_token_lengths=encoder_token_lengths,
+            output_embedding_lengths=output_embedding_lengths)
 
     @torch.inference_mode()
     def call_with_text_prompt(

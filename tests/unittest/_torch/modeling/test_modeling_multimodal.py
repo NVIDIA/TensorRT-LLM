@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import gc
 import os
 import unittest
@@ -214,11 +217,10 @@ class TestModelingMultimodal(unittest.TestCase, ABC):
         for module in model.modules():
             if isinstance(module, MultimodalEncoderMixin):
                 module.setup_attn_metadata(
-                    # Encoder batch axis (image/sequence count) is a distinct
-                    # budget from the token axis; mirror the engine's
-                    # max_batch_size default. Qwen-family subclasses floor this
-                    # up to max_num_tokens internally for windowed fan-out.
-                    max_num_requests=2048,
+                    # Atomic item count is distinct from the token budget.
+                    # Each encoder maps both inputs to its internal attention
+                    # sequence/window capacity.
+                    max_num_items=2048,
                     max_num_tokens=model_config.max_num_tokens,
                 )
 
