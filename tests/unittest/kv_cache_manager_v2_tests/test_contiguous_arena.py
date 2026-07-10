@@ -3012,6 +3012,80 @@ class TestArenaSuspendHostExhaustion(unittest.TestCase):
         s2.take_finish_event().synchronize()
         manager.drain_gpu_reclaim(CachedCudaEvent.NULL)
 
+    def test_close_offload_can_evict_just_adopted_pages(self) -> None:
+        """close() must not pin its just-adopted pages against eviction.
+
+        The adopt step hands written-through/promoted pages to the host
+        eviction controller BEFORE the offload step asks the same level for
+        free slots. Under exhaustion (everything else HELD) those adopted
+        pages are the only droppable pages on the level, so the offload's
+        eviction pops one -- and if close() still held a strong reference,
+        the page could not die, no slot was freed, and the free-count
+        invariant in ``_prepare_free_slots`` asserted (a mid-run fatal on
+        drop-heavy shapes). With ``on_free`` write-through the adopt set is
+        populated only by v3 promotion's stolen host slots, which is why
+        this fired first on the tinyhost reproducer with aliasing off.
+        """
+        manager = self.manager
+        n_tok = 2 * self.TPB
+        tokens = [4000 + i for i in range(n_tok)]
+        # A: 2 committed blocks become host-resident canonicals (2 slots).
+        kv_a = manager.create_kv_cache(max_capacity=4 * self.TPB)
+        with TemporaryCudaStream([]) as s:
+            self.assertTrue(kv_a.resume(CudaStream(s.handle)))
+            self.assertTrue(kv_a.resize(3 * self.TPB))
+            torch.cuda.synchronize()
+            kv_a.commit(tokens)
+            kv_a.close()
+        s.take_finish_event().synchronize()
+        manager.drain_gpu_reclaim(CachedCudaEvent.NULL)
+        self.assertEqual(self._host_used(), 2)
+        # C: same-prefix admission copy-onboards A's canonicals; promotion
+        # displaces the host incumbents and adopts their slots into C's
+        # write-through stash (host slots stay occupied, controller empty).
+        kv_c = manager.create_kv_cache(
+            input_tokens=tokens + [1, 2], max_capacity=4 * self.TPB
+        )
+        self.assertEqual(kv_c.history_length, n_tok)
+        with TemporaryCudaStream([]) as s2:
+            stream2 = CudaStream(s2.handle)
+            self.assertTrue(kv_c.resume(stream2))
+            self.assertEqual(
+                sorted(self._kv_stash_ordinals(kv_c)), [0, 1], "promotion did not adopt"
+            )
+            # X: suspension pins the remaining 2 host slots as HELD state.
+            kv_x = manager.create_kv_cache(max_capacity=4 * self.TPB)
+            self.assertTrue(kv_x.resume(stream2))
+            self.assertTrue(kv_x.resize(2 * self.TPB))
+            torch.cuda.synchronize()
+            kv_x.commit([5000 + i for i in range(2 * self.TPB)])
+            kv_x.suspend()
+            self.assertEqual(self._host_used(), 4)  # 2 stash + 2 HELD: full
+            # C commits one block past the prefix (no write-through copy) and
+            # closes: adopt(2 promoted) then offload(1) -> the offload must
+            # evict a just-adopted page and actually get its slot back.
+            self.assertTrue(kv_c.resize(3 * self.TPB))
+            kv_c.commit([1] * self.TPB)
+            kv_c.close()  # pre-fix: AssertionError (free-count invariant)
+            # Evicting adopted block 0 collapses the now-unreachable child
+            # copy too (tree-parent GC, as in the churn test above) AND
+            # orphans C's block-2 -- whose page the offload then correctly
+            # skips (a treeless copy is unreachable for reuse). Only X's
+            # HELD suspension state remains.
+            self.assertEqual(self._host_used(), 2)
+        s2.take_finish_event().synchronize()
+        manager.drain_gpu_reclaim(CachedCudaEvent.NULL)
+        # The manager stays healthy: X resumes and closes cleanly.
+        with TemporaryCudaStream([]) as s3:
+            self.assertTrue(kv_x.resume(CudaStream(s3.handle)))
+            kv_x.close()
+        s3.take_finish_event().synchronize()
+        manager.drain_gpu_reclaim(CachedCudaEvent.NULL)
+
+    @staticmethod
+    def _kv_stash_ordinals(kv) -> "list[int]":
+        return [ordinal for (ordinal, _lc) in kv._write_through_slots.keys()]
+
 
 class TestArenaV3HardReclaimAndPromotion(unittest.TestCase):
     """P3 v3: hard-reclaim ladder + mappability-weighted promotion.

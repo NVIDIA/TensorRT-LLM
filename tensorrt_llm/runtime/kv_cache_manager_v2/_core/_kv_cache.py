@@ -613,6 +613,13 @@ class _KVCache:
                             )
                         ),
                     )
+                # The adopted pages are host-controller property now. Drop our
+                # strong refs BEFORE the offload below: its prepare_free_slots
+                # may evict them (under exhaustion they can be the only
+                # droppable pages on the level), and an evicted page that a
+                # live reference keeps from dying frees no slot -- breaking
+                # the free-count invariant _prepare_free_slots asserts.
+                arena_closing.adopt_pages[pg_idx] = []
                 try:
                     storage.offload_arena_pages(pg_idx, arena_closing.offload[pg_idx], prior_event)
                     if arena_lazy:
@@ -635,7 +642,10 @@ class _KVCache:
                         by_ordinal = dict(zip(ordinals, arena_closing.offload[pg_idx]))
                         prefix_pages: list[CommittedPage] = []
                         o = 0
-                        while o in by_ordinal:
+                        # A page still at GPU level was skipped by the offload
+                        # (its tree block died mid-call) -- it ends the
+                        # registrable prefix run.
+                        while o in by_ordinal and by_ordinal[o].cache_level != GPU_LEVEL:
                             prefix_pages.append(by_ordinal[o])
                             o += 1
                         if prefix_pages:

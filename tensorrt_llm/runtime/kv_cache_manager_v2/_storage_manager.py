@@ -751,6 +751,27 @@ class StorageManager:
         requirements = filled_list(0, self.num_pool_groups)
         requirements[pg_idx] = len(pages)
         self.prepare_free_slots(host_lvl, requirements)
+        # The eviction above can collapse radix subtrees (a dying parent
+        # removes its descendants), unlinking some of OUR pages from the tree
+        # mid-call. A treeless droppable canonical is unreachable for reuse:
+        # offloading it would burn a host slot on a copy no lookup can find,
+        # scheduled in the host controller with no tree entry -- which the
+        # shutdown sweep (tree-driven exclusion) can never clear. Skip them;
+        # they die with the caller's references. Held pages (suspension
+        # state) are never skipped -- their bytes must survive regardless of
+        # tree linkage. (Over-reserved free slots above are harmless.)
+        kept: list[Page] = []
+        for p in pages:
+            if p.is_committed() and p.status == PageStatus.DROPPABLE:
+                blk = cast(CommittedPage, p).block()
+                if blk is None or blk.is_orphan:
+                    if p.scheduled_for_eviction:
+                        self.exclude_from_eviction(p)
+                    continue
+            kept.append(p)
+        pages = kept
+        if not pages:
+            return
         # Pages freshly released by a closing sequence are typically already in
         # the (otherwise unused) GPU eviction queue; migration requires them
         # unscheduled.
