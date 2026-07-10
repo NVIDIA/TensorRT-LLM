@@ -146,8 +146,8 @@ def _prepare_dataset(root_dir: str, temp_dir: str, model_path_or_name: str, num_
     """Prepare a synthetic dataset for benchmarking."""
     _DATASET_NAME = "synthetic_128_128.txt"
     dataset_path = Path(temp_dir, _DATASET_NAME)
-    dataset_tool = Path(root_dir, "benchmarks", "cpp", "prepare_dataset.py")
-    script_dir = Path(root_dir, "benchmarks", "cpp")
+    dataset_tool = Path(root_dir, "benchmarks", "prepare_dataset.py")
+    script_dir = Path(root_dir, "benchmarks")
 
     # Generate a small dataset to run a test - matching workload configuration
     command = [
