@@ -113,7 +113,10 @@ class PrefixBlockSet:
         return bool(self._blocks)
 
 
-def get_request_num_tokens(request: OpenAIRequest) -> int:
+def get_request_num_tokens(request: Optional[OpenAIRequest]) -> int:
+    if request is None:
+        return 0
+
     if (
         request.disaggregated_params is None
         or request.disaggregated_params.request_type == "context_only"

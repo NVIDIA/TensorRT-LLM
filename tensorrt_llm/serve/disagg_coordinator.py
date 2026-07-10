@@ -40,6 +40,7 @@ from abc import ABC, abstractmethod
 from typing import Any, Dict, Optional, Tuple
 
 import aiohttp
+import msgpack
 
 from tensorrt_llm.llmapi.disagg_utils import (
     DisaggServerConfig,
@@ -475,7 +476,7 @@ class CoordinatorClient(DisaggCoordinator):
                         logger.info(
                             f"CoordinatorClient: coordinator reachable at {self._remote_url}"
                         )
-                        return await resp.json()
+                        return msgpack.unpackb(await resp.read(), raw=False)
                     last_err = f"HTTP {resp.status}"
             except Exception as e:  # noqa: BLE001
                 last_err = str(e)
@@ -503,10 +504,31 @@ class CoordinatorClient(DisaggCoordinator):
             async with self.session.get(
                 f"{self._remote_url}/health", timeout=self._request_timeout_s
             ) as resp:
-                return resp.status == 200
+                if resp.status != 200:
+                    return False
+            info = await self.cluster_info()
+            await self._sync_stateless_routers(info)
+            return info.get("is_ready", False)
         except Exception as e:  # noqa: BLE001
             logger.warning(f"CoordinatorClient health check failed: {e}")
             return False
+
+    async def _sync_stateless_routers(self, info: Dict[str, Any]) -> None:
+        current_workers = info.get("current_workers")
+        if current_workers is None:
+            return
+        router_workers = (
+            (self._ctx_router, current_workers.get("context_servers", [])),
+            (self._gen_router, current_workers.get("generation_servers", [])),
+        )
+        for router, workers in router_workers:
+            if isinstance(router, CoordinatorDelegatingRouter):
+                continue
+            desired = {f"{worker['host']}:{worker['port']}" for worker in workers}
+            for server in set(router.servers) - desired:
+                await router.remove_server(server)
+            for server in desired - set(router.servers):
+                await router.add_server(server)
 
     async def cluster_info(self) -> Dict[str, Any]:
         try:
@@ -514,7 +536,7 @@ class CoordinatorClient(DisaggCoordinator):
                 f"{self._remote_url}/cluster_info", timeout=self._request_timeout_s
             ) as resp:
                 if resp.status == 200:
-                    return await resp.json()
+                    return msgpack.unpackb(await resp.read(), raw=False)
         except Exception as e:  # noqa: BLE001
             logger.warning(f"CoordinatorClient cluster_info failed: {e}")
         return {"is_ready": False}

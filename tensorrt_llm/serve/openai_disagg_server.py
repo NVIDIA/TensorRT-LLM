@@ -48,8 +48,7 @@ from tensorrt_llm.serve.openai_protocol import (
     UCompletionResponse, ensure_request_chat_template_allowed)
 from tensorrt_llm.serve.perf_metrics import DisaggPerfMetricsCollector
 from tensorrt_llm.serve.responses_utils import (ServerArrivalTimeMiddleware,
-                                                get_steady_clock_now_in_seconds,
-                                                ttft_split_logger)
+                                                get_steady_clock_now_in_seconds)
 from tensorrt_llm.serve.router import Router
 from tensorrt_llm.version import __version__ as VERSION
 
@@ -67,11 +66,7 @@ class RawRequestResponseHooks(ResponseHooks):
         self.gen_server = ""
         self.request_arrival_time = raw_req.state.server_arrival_time
         self.server_first_token_time = 0
-        # Orchestrator-side TTFT timeline stamps: arrival -> ctx_dispatch (pre-ctx
-        # wait) -> ctx_resp (ctx routing + prefill) -> first_token (KV transfer +
-        # gen). 0 until the corresponding hook fires.
         self.ctx_dispatch_time = 0
-        self.ctx_resp_time = 0
         self.perf_metrics_collector = perf_metrics_collector
 
     def on_req_begin(self, request: UCompletionRequest):
@@ -82,27 +77,12 @@ class RawRequestResponseHooks(ResponseHooks):
 
     def on_ctx_resp(self, ctx_server: str, response: UCompletionResponse):
         self.ctx_server = ctx_server
-        self.ctx_resp_time = get_steady_clock_now_in_seconds()
 
     def on_first_token(self, gen_server: str, request: UCompletionRequest, response: UCompletionResponse = None):
         self.gen_server = gen_server
         self.server_first_token_time = get_steady_clock_now_in_seconds()
 
     def on_resp_done(self, gen_server: str, request: UCompletionRequest, response: UCompletionResponse = None):
-        # Feed the TTFT breakdown to a periodic aggregator (p50/p95 every N reqs),
-        # not one log line per request -- per-request logging on the disagg event
-        # loop inflated TTFT ~3s (observer effect).
-        arr = self.request_arrival_time
-        disp = self.ctx_dispatch_time
-        cresp = self.ctx_resp_time
-        ft = self.server_first_token_time
-        if arr and ft:
-            ttft_split_logger().record({
-                "pre_ctx_ms": (disp - arr) * 1000 if disp else -1.0,
-                "ctx_phase_ms": (cresp - disp) * 1000 if (disp and cresp) else -1.0,
-                "xfer_gen_ms": (ft - cresp) * 1000 if cresp else -1.0,
-                "total_ms": (ft - arr) * 1000,
-            })
         if request.disaggregated_params:
             ctx_req_id = request.disaggregated_params.ctx_request_id
             task = asyncio.create_task(

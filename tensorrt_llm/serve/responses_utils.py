@@ -1992,55 +1992,9 @@ class ServerArrivalTimeMiddleware:
             scope["state"] = {}
             scope["state"][
                 "server_arrival_time"] = get_steady_clock_now_in_seconds()
-            # Measure client-send -> server-accept latency: the network + HTTP
-            # accept-queue backlog BEFORE the handler runs (invisible to per-
-            # request server metrics, which start at server_arrival_time). The
-            # client stamps x-client-send-time (wall-clock epoch s); compare to
-            # our wall clock (NTP-synced hosts). Only /v1/ request paths.
-            path = scope.get("path", "")
-            if path.startswith("/v1/"):
-                for k, v in scope.get("headers", ()):  # raw ASGI header pairs
-                    if k == b"x-client-send-time":
-                        try:
-                            sent = float(v.decode())
-                            _accept_latency_logger().record(
-                                max(0.0,
-                                    time.time() - sent))
-                        except (ValueError, UnicodeDecodeError):
-                            pass
-                        break
 
         # Pass through the original receive/send - no wrapping!
         await self.app(scope, receive, send)
-
-
-_ACCEPT_LAT = None
-_TTFT_SPLIT = None
-
-
-def _accept_latency_logger():
-    """Return the client-send to server-accept latency logger.
-
-    ``PeriodicLatencyLogger`` is defined below this function.
-    """
-    global _ACCEPT_LAT
-    if _ACCEPT_LAT is None:
-        _ACCEPT_LAT = PeriodicLatencyLogger("accept.client_send_to_arrival")
-    return _ACCEPT_LAT
-
-
-def ttft_split_logger():
-    """Return the per-request TTFT breakdown logger.
-
-    Pre-context, context, transfer/generation, and total times are aggregated
-    and logged periodically rather than once per request.
-    """
-    global _TTFT_SPLIT
-    if _TTFT_SPLIT is None:
-        _TTFT_SPLIT = PeriodicBreakdownLogger(
-            "orchestrator",
-            ["pre_ctx_ms", "ctx_phase_ms", "xfer_gen_ms", "total_ms"])
-    return _TTFT_SPLIT
 
 
 class PeriodicLatencyLogger:
@@ -2071,42 +2025,6 @@ class PeriodicLatencyLogger:
                         f"p90={percentile(0.9):.2f} "
                         f"p99={percentile(0.99):.2f} max={s[-1]:.2f}")
             self._samples = []
-
-
-class PeriodicBreakdownLogger:
-    """Periodically log a multi-field latency breakdown.
-
-    Named millisecond values are accumulated and each field's p50/p95 is logged
-    every ``window`` samples. Negative values for stages not reached are dropped.
-    """
-
-    def __init__(self, name: str, fields, window: int = 1000):
-        self._name = name
-        self._fields = list(fields)
-        self._window = window
-        self._samples = {f: [] for f in self._fields}
-        self._n = 0
-
-    def record(self, values: dict) -> None:
-        self._n += 1
-        for f in self._fields:
-            v = values.get(f)
-            if v is not None and v >= 0:
-                self._samples[f].append(v)
-        if self._n % self._window == 0:
-            parts = []
-            for f in self._fields:
-                s = sorted(self._samples[f])
-                if s:
-
-                    def percentile(q):
-                        return s[min(int(q * len(s)), len(s) - 1)]
-
-                    parts.append(f"{f}(p50={percentile(0.5):.0f},"
-                                 f"p95={percentile(0.95):.0f})")
-                self._samples[f] = []
-            logger.info(f"[ttft_split] {self._name} n={self._n} " +
-                        " ".join(parts))
 
 
 class ResponseHooks(ABC):

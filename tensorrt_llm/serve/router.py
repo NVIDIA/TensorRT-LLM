@@ -13,15 +13,13 @@
 # limitations under the License.
 
 import asyncio
-import os
-import statistics
 import time
 from abc import ABC, abstractmethod
 from collections import OrderedDict
 from typing import Awaitable, Callable, Dict, Iterable, List, Optional
 
 import aiohttp
-import orjson
+import msgpack
 
 from tensorrt_llm.llmapi.disagg_utils import (MetadataServerConfig,
                                               RouterConfig, ServerRole)
@@ -37,9 +35,7 @@ from tensorrt_llm.serve.router_utils import (  # noqa: F401
     block_key_hasher, get_cache_salt_id, get_request_num_tokens,
     hash_v1_block_key, truncate_sha256_hash_to_int64, v2_sha256_block_hasher)
 
-# Content-Type for orjson-serialized bodies sent to the coordinator (we pass
-# data=bytes, so aiohttp doesn't set the json content type itself).
-_JSON_HEADERS = {"Content-Type": "application/json"}
+_MSGPACK_HEADERS = {"Content-Type": "application/msgpack"}
 
 # Max number of conversations whose home-server pin is retained (LRU).
 ROUTE_AFFINITY_CACHE_SIZE = 50000
@@ -70,17 +66,13 @@ class ServerState:
         return self._session_provider() if self._session_provider else None
 
     async def increment_load(self, request: OpenAIRequest):
-        # request may be None on the coordinator-delegated path (no request
-        # object crosses the HTTP hop); token accounting is skipped then.
-        num_tokens = (get_request_num_tokens(request)
-                      if self._use_tokens and request is not None else 0)
+        num_tokens = get_request_num_tokens(request) if self._use_tokens else 0
         async with self._lock:
             self._num_active_requests += 1
             self._num_active_tokens += num_tokens
 
     async def decrement_load(self, request: OpenAIRequest):
-        num_tokens = (get_request_num_tokens(request)
-                      if self._use_tokens and request is not None else 0)
+        num_tokens = get_request_num_tokens(request) if self._use_tokens else 0
         async with self._lock:
             self._num_active_requests -= 1
             self._num_active_tokens -= num_tokens
@@ -108,7 +100,6 @@ class KvCacheAwareServerState(ServerState):
         self._kv_cache_block_tables: dict[str, set[BlockHash]] = {
             KV_CACHE_HASH_ALGO_V1: self._kv_cache_block_table
         }
-        self._event_only_blocks: set[BlockHash] = set()
         self._kv_cache_hash_algo = KV_CACHE_HASH_ALGO_DEFAULT
         self._tokens_per_block = tokens_per_block
         self._poll_task: Optional[asyncio.Task] = None
@@ -170,10 +161,8 @@ class KvCacheAwareServerState(ServerState):
                     block["block_hash"] for block in event["blocks"]
                 ]
                 self.add_blocks(block_hashes, hash_algo=hash_algo)
-                self._event_only_blocks.update(block_hashes)
             elif event["type"] == "removed":
                 self.remove_blocks(event["block_hashes"], hash_algo=hash_algo)
-                self._event_only_blocks.difference_update(event["block_hashes"])
 
     async def poll_events(self, session: aiohttp.ClientSession):
         async with session.post(
@@ -181,33 +170,19 @@ class KvCacheAwareServerState(ServerState):
             events_raw = await response.json()
         return events_raw
 
-    _event_match_log_counter = 0
-
     async def matched_tokens(
             self,
             block_hashes: list[list[BlockHash]],
             hash_algo: str = KV_CACHE_HASH_ALGO_DEFAULT) -> int:
         match_count = 0
-        event_match_count = 0
         async with self._lock:
             block_table = self._block_table(hash_algo)
             for hash_list in block_hashes:
                 for block_hash in hash_list:
                     if block_hash in block_table:
                         match_count += self._tokens_per_block
-                        if block_hash in self._event_only_blocks:
-                            event_match_count += self._tokens_per_block
                     else:
                         break
-            KvCacheAwareServerState._event_match_log_counter += 1
-            if KvCacheAwareServerState._event_match_log_counter <= 20 or KvCacheAwareServerState._event_match_log_counter % 100 == 0:
-                logger.info(
-                    f"EVENT_MATCH_DIAG server={self._server} "
-                    f"total_match={match_count} event_match={event_match_count} "
-                    f"event_blocks={len(self._event_only_blocks)} "
-                    f"total_blocks={len(block_table)} "
-                    f"query_hashes={[h for hl in block_hashes for h in hl][:3]}"
-                )
         return match_count
 
     async def decrement_load(self, request: OpenAIRequest):
@@ -353,37 +328,6 @@ class Router(ABC):
         self._health_check_timeout = metadata_server_cfg.health_check_timeout if metadata_server_cfg else None
         self._server_preparation_func = server_preparation_func
         self._prepared_ready_servers: set[str] = set()
-        # Routing-latency diagnostics (gated by TLLM_LOG_ROUTE_TIMING=1): record
-        # get_next_server wall time per request and log percentiles periodically.
-        self._log_route_timing = (os.environ.get("TLLM_LOG_ROUTE_TIMING",
-                                                 "0") == "1")
-        self._rt_samples: list = []
-        self._rt_n = 0
-
-    def _record_route_timing(self, dt_s: float) -> None:
-        """Record one routing-latency sample.
-
-        Percentiles are logged every 500 calls. This is a no-op unless
-        ``TLLM_LOG_ROUTE_TIMING=1``.
-        """
-        if not self._log_route_timing:
-            return
-        self._rt_samples.append(dt_s * 1000.0)  # ms
-        self._rt_n += 1
-        if self._rt_n % 500 == 0:
-            s = sorted(self._rt_samples)
-            n = len(s)
-
-            def percentile(q):
-                return s[min(int(q * n), n - 1)]
-
-            logger.info(f"[route_timing] {type(self).__name__} n={self._rt_n} "
-                        f"get_next_server_ms: mean={statistics.mean(s):.2f} "
-                        f"p50={percentile(0.5):.2f} "
-                        f"p90={percentile(0.9):.2f} "
-                        f"p99={percentile(0.99):.2f} "
-                        f"max={s[-1]:.2f}")
-            self._rt_samples = []  # reset window
 
     async def close(self):
         """Close the shared HTTP session."""
@@ -951,7 +895,6 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
         conversation affinity, and round-robin tie-breaking. Standalone requests
         are keyed by ``id(request)``; coordinator requests use ``req_id``.
         """
-        route_start = time.monotonic()
         token_lists = (key or {}).get("token_lists") or []
         block_hashes_by_algo = (key or {}).get("block_hashes_by_algo") or {}
         conv_key = (key or {}).get("conv_key")
@@ -1019,7 +962,6 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
             await server_states[server].increment_load(request)
             self._req_routing_table[key] = server
             self._apply_routed_blocks_on_route(server, block_hashes, hash_algo)
-        self._record_route_timing(time.monotonic() - route_start)
         return server, {
             "block_hashes": block_hashes,
             "hash_algo": hash_algo,
@@ -1631,25 +1573,9 @@ class CoordinatorDelegatingRouter(Router):
         # Coordinator HTTP-client API latency (includes network round-trip to the
         # coordinator + its in-process handler). Compare against the owner-side
         # [coord_api] to isolate the fleet /select|/finish HTTP overhead.
-        from tensorrt_llm.serve.responses_utils import (PeriodicBreakdownLogger,
-                                                        PeriodicLatencyLogger)
+        from tensorrt_llm.serve.responses_utils import PeriodicLatencyLogger
         self._select_lat = PeriodicLatencyLogger(f"client.select[{role}]")
         self._finish_lat = PeriodicLatencyLogger(f"client.finish[{role}]")
-        # IPC latency breakdown (ms) for the coordinator client<->server round
-        # trip, decomposed via the X-Client-Send/X-Coord-Recv/X-Coord-Send headers
-        # (client + coordinator co-located => wall clock comparable):
-        #   req_wire  : client send  -> coord recv   (request transport + accept)
-        #   handler   : coord recv   -> coord send   (in-coordinator handler work)
-        #   resp_wire : coord send   -> client recv  (response transport)
-        #   rtt       : client send  -> client recv  (total observed round trip)
-        # Aggregated p50/p95 per field every window samples (no per-call logging).
-        self._ipc_fields = [
-            "req_wire_ms", "handler_ms", "resp_wire_ms", "rtt_ms"
-        ]
-        self._select_ipc = PeriodicBreakdownLogger(f"coord_ipc.select[{role}]",
-                                                   self._ipc_fields)
-        self._finish_ipc = PeriodicBreakdownLogger(f"coord_ipc.finish[{role}]",
-                                                   self._ipc_fields)
 
     def __getattr__(self, name):
         # servers / prepare_servers / num_prepared_servers / start_server_monitoring
@@ -1666,35 +1592,6 @@ class CoordinatorDelegatingRouter(Router):
 
     def _on_servers_updated(self, old_servers, new_servers):
         pass
-
-    def _record_ipc(self, ipc_logger, send_t: float, recv_t: float,
-                    resp) -> None:
-        """Record a coordinator round-trip breakdown.
-
-        ``send_t`` and ``recv_t`` are client-side wall clocks. Missing headers
-        from an older coordinator are recorded as ``-1`` and dropped by the
-        breakdown logger. All values are milliseconds.
-        """
-        from tensorrt_llm.serve.coordinator_server import (HDR_COORD_RECV,
-                                                           HDR_COORD_SEND)
-
-        def _f(name):
-            v = resp.headers.get(name)
-            try:
-                return float(v) if v is not None else None
-            except (TypeError, ValueError):
-                return None
-
-        coord_recv = _f(HDR_COORD_RECV)
-        coord_send = _f(HDR_COORD_SEND)
-        ipc_logger.record({
-            "req_wire_ms": (coord_recv - send_t) * 1000 if coord_recv else -1.0,
-            "handler_ms": (coord_send - coord_recv) * 1000 if
-            (coord_recv and coord_send) else -1.0,
-            "resp_wire_ms":
-            (recv_t - coord_send) * 1000 if coord_send else -1.0,
-            "rtt_ms": (recv_t - send_t) * 1000,
-        })
 
     def _request_id(self, request: OpenAIRequest) -> int:
         """The request's disagg id -- the sole cross-process key for select/finish.
@@ -1735,23 +1632,16 @@ class CoordinatorDelegatingRouter(Router):
             "req_id": self._request_id(request),
             "exclude_server": exclude_server
         }
-        # orjson.dumps (bytes) instead of aiohttp json= (stdlib dumps): the
-        # routing_key is hundreds of int64, and this is the hot fleet->coordinator
-        # call. Parse the response with orjson too. X-Client-Send-Time (wall clock)
-        # lets the coordinator echo timing headers back for the IPC breakdown.
-        from tensorrt_llm.serve.coordinator_server import HDR_CLIENT_SEND
         _t0 = time.monotonic()
-        _send_wall = time.time()
-        hdrs = {**_JSON_HEADERS, HDR_CLIENT_SEND: repr(_send_wall)}
         async with self.session.post(f"{self._coordinator_url}/select",
-                                     data=orjson.dumps(payload),
-                                     headers=hdrs,
+                                     data=msgpack.packb(payload,
+                                                        use_bin_type=True),
+                                     headers=_MSGPACK_HEADERS,
                                      timeout=self._request_timeout_s) as resp:
+            body = msgpack.unpackb(await resp.read(), raw=False)
             if resp.status != 200:
                 raise ValueError(f"coordinator /select returned {resp.status}: "
-                                 f"{await resp.text()}")
-            body = orjson.loads(await resp.read())
-            self._record_ipc(self._select_ipc, _send_wall, time.time(), resp)
+                                 f"{body.get('error', body)}")
         self._select_lat.record(time.monotonic() - _t0)
         info = body.get("info") or {}
         return body["server"], info
@@ -1771,25 +1661,24 @@ class CoordinatorDelegatingRouter(Router):
         task.add_done_callback(self._background_tasks.discard)
 
     async def _finish_async(self, req_id: int, success: bool):
-        from tensorrt_llm.serve.coordinator_server import HDR_CLIENT_SEND
         _t0 = time.monotonic()
-        _send_wall = time.time()
-        hdrs = {**_JSON_HEADERS, HDR_CLIENT_SEND: repr(_send_wall)}
         try:
             async with self.session.post(
                     f"{self._coordinator_url}/finish",
-                    data=orjson.dumps({
-                        "role": self._role,
-                        "req_id": req_id,
-                        "success": success
-                    }),
-                    headers=hdrs,
+                    data=msgpack.packb(
+                        {
+                            "role": self._role,
+                            "req_id": req_id,
+                            "success": success
+                        },
+                        use_bin_type=True),
+                    headers=_MSGPACK_HEADERS,
                     timeout=self._request_timeout_s) as resp:
                 if resp.status != 200:
+                    body = msgpack.unpackb(await resp.read(), raw=False)
                     logger.warning(
-                        f"coordinator /finish returned {resp.status}")
-                self._record_ipc(self._finish_ipc, _send_wall, time.time(),
-                                 resp)
+                        f"coordinator /finish returned {resp.status}: "
+                        f"{body.get('error', body)}")
             self._finish_lat.record(time.monotonic() - _t0)
         except Exception as e:  # noqa: BLE001
             logger.warning(f"CoordinatorDelegatingRouter finish failed: {e}")

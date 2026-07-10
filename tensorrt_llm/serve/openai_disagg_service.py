@@ -14,7 +14,6 @@
 
 import asyncio
 import os
-import time as _time
 from typing import Callable, Optional
 
 from tensorrt_llm.llmapi.disagg_utils import ConditionalDisaggConfig, DisaggServerConfig, ServerRole
@@ -41,28 +40,6 @@ from tensorrt_llm.serve.router import KvCacheAwareRouter, Router
 # Finish reasons for which a GEN handoff is still pending; any other reason means
 # the CTX request already completed and the disagg KV-cache handoff was never set up.
 _GEN_PENDING_FINISH_REASONS = ("length", "not_finished")
-
-
-_PRECTX_LOGGER = None
-
-
-def _prectx_logger():
-    """Return the orchestrator pre-context timing logger.
-
-    The logger isolates where arrival-to-context-dispatch time is spent:
-      cond_ms   : _check_conditional_disagg + _check_gen_only_disagg
-      idgen_ms  : get_disagg_request_id (local now; was an HTTP hop)
-      ctxroute_ms: ctx_router.get_next_server (routing/select round trip)
-    No per-request logging (observer effect on the single fleet loop).
-    """
-    global _PRECTX_LOGGER
-    if _PRECTX_LOGGER is None:
-        from tensorrt_llm.serve.responses_utils import PeriodicBreakdownLogger
-
-        _PRECTX_LOGGER = PeriodicBreakdownLogger(
-            "orchestrator_prectx", ["cond_ms", "idgen_ms", "ctxroute_ms"]
-        )
-    return _PRECTX_LOGGER
 
 
 class OpenAIDisaggregatedService(OpenAIService):
@@ -146,20 +123,11 @@ class OpenAIDisaggregatedService(OpenAIService):
         # empty server means client decides which server to use
         ctx_server = None
         # reserve a gen_server if conditional disagg is needed
-        _t_cond = _time.monotonic()
         gen_server, need_ctx = await self._check_conditional_disagg(request)
         need_ctx = need_ctx and not await self._check_gen_only_disagg(request)
-        _t_idgen = _time.monotonic()
         ctx_response = None
         gen_req = request
         disagg_request_id = await self._coordinator.get_disagg_request_id()
-        _t_afterid = _time.monotonic()
-        # Fine-grained pre-ctx breakdown (aggregated). ctxroute is filled below.
-        _prectx = {
-            "cond_ms": (_t_idgen - _t_cond) * 1000,
-            "idgen_ms": (_t_afterid - _t_idgen) * 1000,
-            "ctxroute_ms": -1.0,
-        }
         if need_ctx:
             # Mark ctx-dispatch start: arrival->here is the pre-ctx wait in the
             # orchestrator/fleet (accept queue + event loop + pipeline).
@@ -167,11 +135,9 @@ class OpenAIDisaggregatedService(OpenAIService):
                 hooks.on_ctx_dispatch(request)
             ctx_req = self._get_ctx_request(request, disagg_request_id)
             # ctx generator is empty
-            _t_route = _time.monotonic()
             ctx_server, _ = await self._ctx_router.get_next_server(
                 ctx_req, exclude_server=gen_server
             )
-            _prectx["ctxroute_ms"] = (_time.monotonic() - _t_route) * 1000
             ctx_response = await self._ctx_client.send_request(
                 ctx_req, server=ctx_server, hooks=hooks
             )
@@ -190,7 +156,6 @@ class OpenAIDisaggregatedService(OpenAIService):
                 and gen_req.disaggregated_params.request_type == "context_only"
             ):
                 gen_req.disaggregated_params = None
-        _prectx_logger().record(_prectx)
         if ctx_response is None or self._need_gen(ctx_response):
             if not gen_server:
                 gen_server, _ = await self._gen_router.get_next_server(
