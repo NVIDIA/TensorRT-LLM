@@ -174,10 +174,10 @@ ENABLE_NGC_RELEASE_IMAGE_TEST = params.enableNgcReleaseImageTest ?: false
 
 COMMON_SSH_OPTIONS = "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o TCPKeepAlive=no -o ServerAliveInterval=30 -o ServerAliveCountMax=20"
 
-// CBTS per-test coverage gate; active on every pipeline, single-GPU stages only in Phase 1.
+// CBTS per-test coverage gate; official post-merge pipeline only, single-GPU stages only in Phase 1.
 ENABLE_CBTS_COVERAGE = true
 CBTS_EXCLUDE_STAGES = [] as Set
-// Reassigned in the Setup Environment stage once testFilter is populated.
+// Reassigned in the Setup Environment stage: true only on the official L0_PostMerge job.
 CBTS_PIPELINE_ELIGIBLE = false
 
 def isCbtsStage(String stageName) {
@@ -5720,8 +5720,8 @@ pipeline {
                     echo "env.testFilter is: ${env.testFilter}"
                     testFilter = trtllm_utils.updateMapWithJson(this, testFilter, env.testFilter, "testFilter")
                     println testFilter
-                    // CBTS coverage runs on every pipeline (pre- and post-merge).
-                    CBTS_PIPELINE_ELIGIBLE = true
+                    // CBTS coverage runs only on the official post-merge pipeline (JOB_NAME carries L0_PostMerge).
+                    CBTS_PIPELINE_ELIGIBLE = (env.JOB_NAME ?: "").contains("L0_PostMerge")
                     echo "CBTS_PIPELINE_ELIGIBLE is: ${CBTS_PIPELINE_ELIGIBLE}"
                     echo "env.globalVars is: ${env.globalVars}"
                     globalVars = trtllm_utils.updateMapWithJson(this, globalVars, env.globalVars, "globalVars")

@@ -24,7 +24,7 @@ not lines executed (far cheaper than line tracing).
 
 `isCbtsStage()` in `jenkins/L0_Test.groovy` gates each stage on:
 
-- `CBTS_PIPELINE_ELIGIBLE` — set on every pipeline (pre- and post-merge)
+- `CBTS_PIPELINE_ELIGIBLE` — true only on the official post-merge pipeline (`JOB_NAME` carries `L0_PostMerge`)
 - not a perf stage, and not a TensorRT / CPP / AutoDeploy stage
 - single-GPU only — stages named with `-<N>_GPUs` or `-<N>_Nodes` (multi-GPU / multi-node) are disabled in phase 1 and enabled incrementally later
 - `ENABLE_CBTS_COVERAGE` (global kill-switch) and `CBTS_EXCLUDE_STAGES` (per-stage skip)
