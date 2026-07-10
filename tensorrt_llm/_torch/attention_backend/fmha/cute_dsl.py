@@ -210,9 +210,7 @@ class CuteDslMlaFmha(PhasedFmha):
             # info_once keyed on the reason text (which embeds the offending
             # shape), so each distinct reject cause is visible in default logs
             # exactly once per process instead of flooding every dispatch.
-            logger.info_once(
-                f"CuTe DSL MLA FMHA does not support request: {reason}", key=reason
-            )
+            logger.info_once(f"CuTe DSL MLA FMHA does not support request: {reason}", key=reason)
         return supported
 
     # Minimum per-rank decode batch size at which the CuteDSL kernel beats the
