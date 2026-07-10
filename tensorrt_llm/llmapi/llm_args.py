@@ -5199,9 +5199,11 @@ class TorchLlmArgs(BaseLlmArgs):
         description=
         ("Maximum encoder batch size. For encoder-decoder models, this also "
          "controls encoder microbatch admission and limits encoder CUDA graph "
-         "batch sizes. For multimodal models, this is the shared "
-         "AttentionMetadata budget across all encoded modalities. Falls back "
-         "to `max_batch_size` when unset."),
+         "batch sizes. For multimodal models, it is the maximum number of "
+         "atomic items scheduled for encoder execution in one iteration, "
+         "shared across requests and modalities, and provides the "
+         "model-specific AttentionMetadata sizing input. "
+         "Falls back to `max_batch_size` when unset."),
         status="prototype")
 
     encoder_max_num_tokens: Optional[int] = Field(
@@ -5567,7 +5569,7 @@ class TorchLlmArgs(BaseLlmArgs):
         self._quant_config = value
 
     def get_encoder_runtime_sizes(self) -> Tuple[int, int]:
-        """Return encoder runtime batch and token limits.
+        """Return encoder runtime item-count and token limits.
 
         Returns `(encoder_max_batch_size, encoder_max_num_tokens)`, falling
         back to the LLM-side `max_batch_size` / `max_num_tokens` when the
