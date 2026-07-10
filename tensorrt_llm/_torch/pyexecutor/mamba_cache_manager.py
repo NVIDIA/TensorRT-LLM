@@ -725,6 +725,7 @@ class PythonMambaCacheManager(BaseResourceManager):
         return (CUDA_GRAPH_DUMMY_REQUEST_ID - max_dl <= request_id <=
                 CUDA_GRAPH_DUMMY_REQUEST_ID)
 
+    @torch.inference_mode()
     def add_dummy_requests(self, request_ids: List[int], **kwargs):
         # Sentinels alias to the shared _padding_slot; non-sentinel
         # dummies (warmup, attention-DP idle padding) get their own
