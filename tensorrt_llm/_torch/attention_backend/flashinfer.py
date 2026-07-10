@@ -122,15 +122,6 @@ def _append_paged_kv_cache(
         )
 
 
-def _staging_int32(arr: np.ndarray) -> torch.Tensor:
-    """Host int32 staging tensor for async H2D copies; pinned when beneficial.
-
-    torch.tensor(..., pin_memory=True) rejects numpy sources, hence
-    from_numpy + pin.
-    """
-    return maybe_pin_memory(torch.from_numpy(arr.astype(np.int32, copy=False)))
-
-
 @dataclass(kw_only=True, frozen=True)
 class FlashInferMultiItemParams:
     """Multi-item scoring related parameters for FlashInfer APIs.
@@ -1052,6 +1043,17 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                 del self._plan_params_to_wrappers[plan_params]
 
     def prepare(self) -> None:
+
+        def _to_int32_tensor(arr: np.ndarray) -> torch.Tensor:
+            """Host int32 staging tensor for async H2D copies; pinned when
+            beneficial.
+
+            torch.tensor(..., pin_memory=True) rejects numpy sources, hence
+            from_numpy + pin.
+            """
+            return maybe_pin_memory(
+                torch.from_numpy(arr.astype(np.int32, copy=False)))
+
         super().prepare()
         extra_attrs = get_model_extra_attrs()
         if extra_attrs is None:
@@ -1176,16 +1178,16 @@ class FlashInferAttentionMetadata(AttentionMetadata):
 
         # number of tokens in the last cache block used by each sequence,
         # derived on the host so no GPU arithmetic or sync is needed.
-        paged_kv_last_page_len = _staging_int32(kv_lens_host -
-                                                (num_blocks - 1) *
-                                                self.page_size)
+        paged_kv_last_page_len = _to_int32_tensor(kv_lens_host -
+                                                  (num_blocks - 1) *
+                                                  self.page_size)
         self._paged_kv_last_page_len[:paged_kv_last_page_len.size(0)].copy_(
             paged_kv_last_page_len, non_blocking=True)
 
         # Ragged page table, see https://docs.flashinfer.ai/tutorials/kv_layout.html#page-table-layout
         # For decoding, this MUST be allocated ahead of time (for CUDA graphs).
         # Prefill is prepared here as well just for the sake of consistency.
-        paged_kv_indptr_decode = _staging_int32(
+        paged_kv_indptr_decode = _to_int32_tensor(
             np.concatenate([[0], np.cumsum(num_blocks[self.num_contexts:])]))
         self.paged_kv_indptr_decode[:paged_kv_indptr_decode.size(0)].copy_(
             paged_kv_indptr_decode, non_blocking=True)
@@ -1193,7 +1195,7 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         # its indptr.cpu()/get_seq_lens calls do no D2H work.
         self._host_paged_kv_indptr_decode = paged_kv_indptr_decode
 
-        paged_kv_indptr_prefill = _staging_int32(
+        paged_kv_indptr_prefill = _to_int32_tensor(
             np.concatenate([[0], np.cumsum(num_blocks[:self.num_contexts])]))
         self.paged_kv_indptr_prefill[:paged_kv_indptr_prefill.size(0)].copy_(
             paged_kv_indptr_prefill, non_blocking=True)
@@ -1213,7 +1215,7 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             # Accumulate on the host and stage through pinned memory: .cuda()
             # on an unpinned tensor is a synchronous H2D that stalls the
             # executor thread behind in-flight kernels on every mixed step.
-            self.paged_kv_indptr = _staging_int32(
+            self.paged_kv_indptr = _to_int32_tensor(
                 np.concatenate([[0],
                                 np.cumsum(num_blocks)])).to(device='cuda',
                                                             non_blocking=True)
@@ -1340,7 +1342,7 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                 block_tables.copy_(new_block_tables)
                 kv_lens_buf = getattr(decode_wrapper, '_kv_lens_buffer', None)
                 if kv_lens_buf is not None:
-                    decode_kv_lens = _staging_int32(
+                    decode_kv_lens = _to_int32_tensor(
                         kv_lens_host[self.num_contexts:self.num_contexts +
                                      self.num_generations])
                     kv_lens_buf[:self.num_generations].copy_(decode_kv_lens,
