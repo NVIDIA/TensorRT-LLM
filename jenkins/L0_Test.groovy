@@ -4127,7 +4127,7 @@ def runLLMBuild(
     }
 
     withCredentials([usernamePassword(credentialsId: "urm-artifactory-creds", usernameVariable: 'CONAN_LOGIN_USERNAME', passwordVariable: 'CONAN_PASSWORD')]) {
-        trtllm_utils.llmExecStepWithRetry(pipeline, script: "#!/bin/bash \n" + "cd tensorrt_llm/ && python3 scripts/build_wheel.py --use_ccache -G Ninja -j ${BUILD_JOBS} -D 'WARNING_IS_ERROR=ON' ${buildArgs}${platNameArg}")
+        trtllm_utils.llmExecStepWithRetry(pipeline, script: "#!/bin/bash \n" + "cd tensorrt_llm/ && python3 scripts/build_wheel.py --use_ccache -G Ninja -j ${BUILD_JOBS} -D 'WARNING_IS_ERROR=ON' --extra-cmake-vars ENABLE_BOLT_COMPATIBLE=ON ${buildArgs}${platNameArg}")
     }
     if (env.alternativeTRT) {
         sh "bash -c 'pip3 show tensorrt || true'"
@@ -4350,12 +4350,66 @@ def runKubernetesPodWithInfraRetry(Map opts = [:], pipeline, podSpec, containerN
 
     // DEBUG_MODE preserves the existing 2-hour-input human-inspection workflow
     // inside runLLMTestlistOnPlatform's finallyRunner: a single attempt only.
-    // singleAttempt (per-call opt) opts out of the retry loop for the same
-    // reason at the call site -- e.g. SLURM dispatcher pods rely on their
-    // inner SLURM retry and don't want an outer pod-level retry budget.
-    if (singleAttempt || testFilter[(DEBUG_MODE)]) {
+    if (testFilter[(DEBUG_MODE)]) {
         trtllm_utils.launchKubernetesPod(pipeline, podSpec, containerName, { runner("", true, null) })
         return
+    }
+
+    // singleAttempt opts out of the outer pod-level *execution* retry: the inner
+    // retry (e.g. SLURM) owns re-runs, and re-running after work has started
+    // could double-submit. But a failure *before* the runner body begins is a
+    // pod/agent launch failure (the JNLP agent never came online, the node was
+    // pulled during provisioning, etc.): nothing has been dispatched yet, so
+    // relaunching a fresh pod -- steered off the bad node by host-node avoidance
+    // -- is safe and is the only way these recover. Retry launch failures only;
+    // once the runner starts (runnerStarted), honor singleAttempt and rethrow.
+    if (singleAttempt) {
+        def avoidedKubernetesHostNodes = []
+        def launchAttempt = 0
+        while (true) {
+            launchAttempt++
+            Map attemptPlacementContext = [runnerStarted: false]
+            try {
+                if (launchAttempt > 1 && !avoidedKubernetesHostNodes.isEmpty()) {
+                    echo "[INFRA-RETRY] ${stageName}: relaunching pod (attempt ${launchAttempt}), avoiding prior host node(s): ${avoidedKubernetesHostNodes.join(', ')}"
+                }
+                def attemptPodSpec = trtllm_utils.withKubernetesHostNodeExclusion(podSpec, avoidedKubernetesHostNodes)
+                trtllm_utils.launchKubernetesPodWithPlacement(pipeline, attemptPodSpec, containerName, attemptPlacementContext, {
+                    attemptPlacementContext.runnerStarted = true
+                    runner("", true, null)
+                })
+                return
+            } catch (InterruptedException e) {
+                throw e
+            } catch (Exception e) {
+                // Once the runner has started, this is an execution failure the
+                // inner retry owns -- honor singleAttempt and do not re-run.
+                if (attemptPlacementContext.runnerStarted) {
+                    throw e
+                }
+                def c = FailureClassifier.classify(e, InfraFailure.K8S)
+                if (c instanceof PipelineInterruption) throw e
+                if (!(c instanceof InfraFailure))      throw e   // UserFailure -> don't retry
+
+                rememberAvoidedKubernetesHostNodes(avoidedKubernetesHostNodes, attemptPlacementContext.lastHostNode, stageName)
+
+                if (launchAttempt > K8S_INFRA_RETRY_MAX) {
+                    echo "[INFRA-RETRY] ${stageName}: pod launch failed before execution (${c.detectedPattern}), " +
+                         "but max launch retries (${K8S_INFRA_RETRY_MAX}) exhausted after ${launchAttempt} attempts. Failing."
+                    throw e
+                }
+                if (!hasBudgetForInfraRetry(pipeline, stageName, InfraFailure.K8S, c, launchAttempt, K8S_INFRA_RETRY_MAX, 60L * 1000L, true)) {
+                    echo "[INFRA-RETRY] ${stageName}: pod launch failed (${c.detectedPattern}) is retryable, " +
+                         "but remaining CI timeout budget is too small for a relaunch. Failing without retry."
+                    throw e
+                }
+
+                echo "[INFRA-RETRY] ${stageName}: pod/agent launch failed before execution on attempt ${launchAttempt}: ${c.detectedPattern}"
+                echo "[INFRA-RETRY] ${stageName}: Exception: ${e.toString()}"
+                echo "[INFRA-RETRY] ${stageName}: Will relaunch (attempt ${launchAttempt + 1} of ${K8S_INFRA_RETRY_MAX + 1}) after 60s cooldown."
+                sleep(60)
+            }
+        }
     }
 
     def attempt = 0
@@ -4484,6 +4538,7 @@ def launchTestJobs(pipeline, testFilter)
         "A30-PyTorch-1": ["a30", "l0_a30", 1, 2],
         "A30-PyTorch-2": ["a30", "l0_a30", 2, 2],
         "A10-CPP-1": ["a10", "l0_a10", 1, 1],
+        "A30-CPP-1": ["a30", "l0_a30", 1, 1],
         "A30-AutoDeploy-1": ["a30", "l0_a30", 1, 1],
         "A100X-PyTorch-1": ["a100x", "l0_a100", 1, 1],
         "L40S-PyTorch-1": ["l40s", "l0_l40s", 1, 2],
