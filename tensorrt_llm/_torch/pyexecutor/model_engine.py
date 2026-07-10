@@ -2086,6 +2086,7 @@ class PyTorchModelEngine(ModelEngine):
                 enable_context_mla_with_cached_kv,
                 cache_indirection=cache_indirection,
                 num_heads_per_kv=num_heads_per_kv,
+                sparse_attention_config=self.sparse_attention_config,
                 sparse_metadata_params=sparse_metadata_params)
             self.encoder_attn_metadata.block_ids_per_seq = None
             self.encoder_attn_metadata.kv_block_ids_per_seq = None
@@ -2109,6 +2110,7 @@ class PyTorchModelEngine(ModelEngine):
             enable_context_mla_with_cached_kv=enable_context_mla_with_cached_kv,
             cache_indirection=cache_indirection,
             num_heads_per_kv=num_heads_per_kv,
+            sparse_attention_config=self.sparse_attention_config,
             sparse_metadata_params=sparse_metadata_params,
         )
 
