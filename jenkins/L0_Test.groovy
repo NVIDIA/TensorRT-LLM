@@ -1944,7 +1944,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                             LABEL_PREFIX='sbatch checkpoint' \\
                             SLURM_SSH_STAT_CMD='${sshStatCmd}' \\
                             SLURM_SCP_XML_CMD='${scpXmlCmd}' \\
-                            bash '${WORKSPACE}/jenkins/scripts/progress_upload_watcher.sh' &
+                            bash '${llmSrcLocal}/jenkins/scripts/progress_upload_watcher.sh' &
                             WATCHER_PID=\$!
 
                             # ---- foreground track: retry up to 3 times on failure ----
@@ -1962,9 +1962,11 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                             wait \$WATCHER_PID 2>/dev/null || true
 
                             # ---- immediate final snapshot ----
+                            mkdir -p '${WORKSPACE}/${stageName}'
+                            ${scpXmlCmd} || true
                             if [ -f '${WORKSPACE}/${stageName}/results.xml' ]; then
                                 LABEL='sbatch final snapshot' \\
-                                bash '${WORKSPACE}/jenkins/scripts/progress_upload_snapshot.sh' || true
+                                bash '${llmSrcLocal}/jenkins/scripts/progress_upload_snapshot.sh' || true
                             fi
 
                             exit \$rc
@@ -3490,7 +3492,7 @@ def rerunFailedTests(stageName, llmSrc, testCmdLine, resultFileName="results.xml
                     PROGRESS_DONE_FILE='${rerunDoneFile}' \\
                     PROGRESS_INTERVAL=${PROGRESS_UPLOAD_INTERVAL_SEC} \\
                     LABEL_PREFIX='rerun${times} checkpoint' \\
-                    bash '${WORKSPACE}/jenkins/scripts/progress_upload_watcher.sh' &
+                    bash '${llmSrc}/jenkins/scripts/progress_upload_watcher.sh' &
                     WATCHER_PID=\$!
 
                     # ---- foreground rerun ----
@@ -3503,7 +3505,7 @@ def rerunFailedTests(stageName, llmSrc, testCmdLine, resultFileName="results.xml
 
                     # ---- immediate final snapshot of rerun${times} ----
                     LABEL='rerun${times} final snapshot' \\
-                    bash '${WORKSPACE}/jenkins/scripts/progress_upload_snapshot.sh' || true
+                    bash '${llmSrc}/jenkins/scripts/progress_upload_snapshot.sh' || true
 
                     exit \$rc
                 """
@@ -4211,7 +4213,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                                 PROGRESS_INTERVAL=${PROGRESS_UPLOAD_INTERVAL_SEC} \\
                                 LABEL_PREFIX='checkpoint' \\
                                 XML_PATH='${WORKSPACE}/${stageName}/results.xml' \\
-                                bash '${WORKSPACE}/jenkins/scripts/progress_upload_watcher.sh' &
+                                bash '${llmSrc}/jenkins/scripts/progress_upload_watcher.sh' &
                                 WATCHER_PID=\$!
 
                                 # ---- foreground pytest ----
@@ -4226,7 +4228,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                                 # ---- immediate final snapshot of run 1 ----
                                 if [ -f '${WORKSPACE}/${stageName}/results.xml' ]; then
                                     LABEL='run1 final snapshot' \\
-                                    bash '${WORKSPACE}/jenkins/scripts/progress_upload_snapshot.sh' || true
+                                    bash '${llmSrc}/jenkins/scripts/progress_upload_snapshot.sh' || true
                                 fi
 
                                 exit \$rc
