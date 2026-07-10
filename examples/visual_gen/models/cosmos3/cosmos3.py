@@ -15,10 +15,10 @@
 # limitations under the License.
 """Cosmos3 Text(+Image/Video)-to-Video(+Audio) generation.
 
-One checkpoint serves T2V, T2I, I2V/TI2V, V2V and T2AV; ``prompts/`` holds a
-prompt file per mode and ``--help`` lists the flags. See ``README.md`` in this
-directory for the checkpoints, guardrail setup, deployment configs, and a
-worked command line per mode.
+One checkpoint serves T2V, T2I, I2V/TI2V, V2V, Transfer and T2AV;
+``prompts/`` holds a prompt file per mode and ``--help`` lists the flags.
+See ``README.md`` in this directory for the checkpoints, guardrail setup,
+deployment configs, and a worked command line per mode.
 """
 
 import argparse
@@ -162,6 +162,18 @@ def main():
     parser.add_argument(
         "--output_type", type=str, default="video", help="Output type (video, image)"
     )
+    parser.add_argument(
+        "--extra_params",
+        type=json.loads,
+        default=None,
+        help=(
+            "Model-specific extra params as a JSON object, merged last (overrides "
+            "flag-derived values). Keys are validated against the pipeline's "
+            "extra_param_specs. Transfer example: "
+            '\'{"edge": true, "blur": true, "control_guidance": 1.5}\' with --video_path, '
+            'or \'{"edge": {"control_path": "/path/control.mp4"}}\' for a precomputed control.'
+        ),
+    )
 
     # Guardrails
     parser.add_argument(
@@ -209,6 +221,9 @@ def main():
 
     if args.video_path is not None:
         params.extra_params["video"] = Path(args.video_path).read_bytes()
+    if args.extra_params:
+        # Merged last: explicit JSON wins over flag-derived values.
+        params.extra_params.update(args.extra_params)
 
     if negative_prompt is None:
         params.negative_prompt = None
