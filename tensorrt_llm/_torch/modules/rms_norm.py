@@ -32,8 +32,8 @@ _WS_MAX_N = 16384
 # Row-count crossover for the layer-boundary add+RMSNorm+quant edge: below this
 # the one-CTA-per-row reduce_fusion kernel (fused_add_rmsnorm_fp4_quantize) is
 # faster; at/above it the warp-specialized kernel's DMA-ahead pipeline wins.
-# Measured at N=7168 on GB200 (ws first overtakes at M=4096, ~6% faster; M<=3072
-# favors reduce_fusion). See analysis/bench_rmsnorm_threshold_n7168.py.
+# Measured at N=7168 on GB200 (ws first overtakes at M=4096, ~6% faster;
+# M<=3072 favors reduce_fusion).
 _WS_M_THRESHOLD = 4096
 
 

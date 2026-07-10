@@ -7,6 +7,7 @@ from torch import nn
 
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.quantization.utils.fp4_utils import NVFP4_SF_VEC_SIZE
 
 from ..attention_backend import (AttentionForwardArgs, AttentionMetadata,
                                  FlashInferAttentionMetadata,
@@ -55,11 +56,12 @@ def _slice_hidden_states_to_num_tokens(hidden_states, num_tokens: int):
             "_slice_hidden_states_to_num_tokens only supports swizzled FP4 "
             "scaling factors")
     sf = hidden_states.scaling_factor
-    # fp4 packs 2 elements/byte, so the logical hidden dim is fp4_cols*2 and the
-    # scale-factor column count is that / SF_VEC_SIZE(16). The swizzled SF is
-    # laid out in independent 128-row tiles, so the leading num_tokens rows'
-    # scale factors occupy exactly the first padded_rows*padded_cols bytes.
-    sf_cols = fp4.shape[-1] * 2 // 16
+    # fp4 packs 2 elements/byte, so the logical hidden dim is fp4_cols*2 and
+    # the scale-factor column count is that / NVFP4_SF_VEC_SIZE. The swizzled
+    # SF is laid out in independent 128-row tiles, so the leading num_tokens
+    # rows' scale factors occupy exactly the first padded_rows*padded_cols
+    # bytes.
+    sf_cols = fp4.shape[-1] * 2 // NVFP4_SF_VEC_SIZE
     padded_rows, padded_cols = compute_swizzled_sf_shape(num_tokens, sf_cols)
     sf_len = padded_rows * padded_cols
     sliced_bf16 = (hidden_states.bf16_hidden_states[:num_tokens]
