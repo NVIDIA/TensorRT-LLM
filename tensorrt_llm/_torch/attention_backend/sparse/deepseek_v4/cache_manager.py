@@ -310,14 +310,10 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             return super()._format_kv_cache_pool_lifecycle_entry(layer_id, role)
 
         model_layer_idx, attn_type = layer_semantics
-        attr = self.impl._storage.get_buffer_attr(layer_id, role)
-        pool_group_id = self.impl._storage.get_pool_group_index(attr.life_cycle_id)
-        lifecycle = self.impl._life_cycles.get_life_cycle(attr.life_cycle_id)
         return (
             f"deepseek_role={attn_type.name}, "
             f"compress_ratio={self._compress_ratios[model_layer_idx]}, "
-            f"pool_group_id={int(pool_group_id)}, "
-            f"lifecycle_id={int(attr.life_cycle_id)}, lifecycle={lifecycle}"
+            f"{super()._format_kv_cache_pool_lifecycle_entry(layer_id, role)}"
         )
 
     def get_buffers(self, layer_idx: int, attn_type: DeepseekV4AttentionType) -> torch.Tensor:
@@ -934,7 +930,6 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
 
         return KVCacheManagerConfigPy(
             tokens_per_block=tokens_per_block,
-            vocab_size=vocab_size,
             cache_tiers=cache_tiers,
             max_util_for_resume=kv_cache_config.max_util_for_resume,
             swa_scratch_reuse=scratch_reuse_config,

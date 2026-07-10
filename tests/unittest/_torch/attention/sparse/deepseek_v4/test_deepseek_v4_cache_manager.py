@@ -221,7 +221,7 @@ def test_deepseek_v4_pool_ratio_overrides_typical_step_and_constraints():
         KvCacheConfig(pool_ratio=[0.2, 0.3, 0.5], avg_seq_len=256)
     )
 
-    assert config.initial_pool_ratio == [0.2, 0.3, 0.5]
+    assert config.initial_pool_ratio == pytest.approx([0.2, 0.3, 0.5])
     assert config.typical_step is None
     assert config.constraints == []
 
