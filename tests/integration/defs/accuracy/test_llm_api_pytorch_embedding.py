@@ -65,9 +65,15 @@ EMBEDDING_MODELS = [
 
 def _last_token_pool(hidden_states: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
     """Extract the last real token's hidden state per sequence using attention mask lengths."""
-    sequence_lengths = attention_mask.sum(dim=1) - 1
-    batch_size = hidden_states.shape[0]
-    return hidden_states[torch.arange(batch_size, device=hidden_states.device), sequence_lengths]
+    left_padding = attention_mask[:, -1].sum() == attention_mask.shape[0]
+    if left_padding:
+        return hidden_states[:, -1]
+    else:
+        sequence_lengths = attention_mask.sum(dim=1) - 1
+        batch_size = hidden_states.shape[0]
+        return hidden_states[
+            torch.arange(batch_size, device=hidden_states.device), sequence_lengths
+        ]
 
 
 def _hf_embeddings(model_path: str, texts: list[str]) -> torch.Tensor:
