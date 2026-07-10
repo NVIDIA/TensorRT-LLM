@@ -397,7 +397,10 @@ def launch_server(
         [info[0] == socket.AF_INET6 for info in addr_info]) else socket.AF_INET
     with socket.socket(address_family, socket.SOCK_STREAM) as s:
         # If disagg cluster config is provided and port is not specified, try to find a free port, otherwise try to bind to the specified port
-        assert port > 0 or disagg_cluster_config is not None, "Port must be specified if disagg cluster config is not provided"
+        if not (port > 0 or disagg_cluster_config is not None):
+            raise ValueError(
+                "Port must be specified (--port > 0) if disagg cluster config is not provided"
+            )
         try:
             s.bind((host, port))
             if port == 0:
