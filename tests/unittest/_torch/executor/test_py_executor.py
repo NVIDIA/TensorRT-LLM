@@ -22,7 +22,7 @@ from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
     SHUTDOWN_REQUEST_ID,
     RequestQueueItem,
 )
-from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState, SamplingConfig
 from tensorrt_llm._torch.pyexecutor.py_executor import DisaggTransferAdmissionController, PyExecutor
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
 from tensorrt_llm._torch.pyexecutor.scheduler import (
@@ -419,6 +419,50 @@ def _make_gen_request(num_draft_tokens=0):
     req = Mock()
     req.num_draft_tokens = num_draft_tokens
     return req
+
+
+def test_prepare_and_schedule_reserves_one_engine_spec_decode_tokens():
+    """One-engine MTP reserves draft tokens before invoking the scheduler."""
+    executor = PyExecutor.__new__(PyExecutor)
+    executor.drafter = None
+    executor.model_engine = types.SimpleNamespace(spec_config=object())
+    executor.max_total_draft_tokens = 3
+
+    generation_request = LlmRequest(
+        request_id=1,
+        max_new_tokens=8,
+        input_tokens=[1],
+        sampling_config=SamplingConfig(1),
+        is_streaming=False,
+    )
+    generation_request.state = LlmRequestState.GENERATION_IN_PROGRESS
+    context_request = types.SimpleNamespace(state=LlmRequestState.CONTEXT_INIT, draft_tokens=[123])
+    executor.active_requests = [generation_request, context_request]
+
+    executor._fetch_and_activate_new_requests = Mock(return_value=[])
+    executor.is_shutdown = False
+    executor.waiting_queue = []
+    executor._handle_control_request = Mock()
+    executor.kv_cache_transceiver = None
+    executor.enable_iter_perf_stats = False
+    executor._pad_attention_dp_dummy_request = Mock()
+    executor._prefetch_for_context_requests = Mock()
+
+    scheduled_batch = ScheduledRequests()
+
+    def schedule():
+        assert generation_request.draft_tokens == [0, 0, 0]
+        assert generation_request.num_draft_tokens == 3
+        assert context_request.draft_tokens == [123]
+        return scheduled_batch, [], 0
+
+    executor._schedule = Mock(side_effect=schedule)
+
+    result, iter_stats = executor._prepare_and_schedule_batch()
+
+    assert result is scheduled_batch
+    assert iter_stats is None
+    executor._schedule.assert_called_once_with()
 
 
 def _make_disagg_transfer_request(

@@ -3403,21 +3403,13 @@ class PyExecutor:
             logger.debug(f"Use spec decode: {self.use_spec_decode}")
             self.model_engine.enable_spec_decode = self.use_spec_decode
 
-            # Set up draft_tokens in active_requests, because they could be used in the scheduling stage.
-            for request in self.active_requests:
-                if request.state not in (
-                        LlmRequestState.GENERATION_IN_PROGRESS,
-                        LlmRequestState.DISAGG_GENERATION_INIT):
-                    continue
-                request.draft_tokens = [
-                    0
-                ] * self.max_total_draft_tokens if self.max_total_draft_tokens > 0 else []
-
             # If speculation is off, this function sets py_draft_tokens to []
             # for all active requests. If it's on, we initialize py_draft_tokens
             # with dummy draft tokens to make the scheduler aware of the fact
             # that speculation is about to happen.
             self._prepare_draft_requests()
+
+        self._prepare_scheduler_draft_tokens()
 
         scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs = self._schedule(
         )
@@ -3889,6 +3881,32 @@ class PyExecutor:
             error_msg = str(e)
             logger.error(f"Encountered an error in decode: {error_msg}")
             self._handle_errors(error_msg)
+
+    def _prepare_scheduler_draft_tokens(self) -> None:
+        """Reserve speculative generation tokens in the micro-batch budget.
+
+        One-engine speculative decoders such as MTP_EAGLE_ONE_MODEL keep their
+        draft model inside ``ModelEngine`` instead of exposing an executor-level
+        ``Drafter``.  In overlap mode, their next draft tokens are produced by
+        the previous batch and may not have been copied to the C++ request when
+        the next scheduling pass starts.  The model still consumes the full
+        speculative step, so expose placeholder draft tokens to the scheduler
+        for every speculative decoder, not only executor-level drafters.
+        """
+        if not getattr(self, 'use_spec_decode', True):
+            return
+
+        model_engine = getattr(self, 'model_engine', None)
+        if (self.drafter is None
+                and getattr(model_engine, 'spec_config', None) is None):
+            return
+
+        for request in self.active_requests:
+            if request.state not in (LlmRequestState.GENERATION_IN_PROGRESS,
+                                     LlmRequestState.DISAGG_GENERATION_INIT):
+                continue
+            request.draft_tokens = ([0] * self.max_total_draft_tokens
+                                    if self.max_total_draft_tokens > 0 else [])
 
     def _handle_control_request(self):
         """Fire the next pending control action at the next step boundary.
