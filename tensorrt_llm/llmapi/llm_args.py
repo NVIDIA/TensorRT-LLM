@@ -3324,6 +3324,17 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         description=
         "Directory used for disk KV cache files. Must be set when `disk_cache_size` is positive."
     )
+    disk_cache_backend: Literal["posix", "nixl_gds"] = Field(
+        default="posix",
+        description=
+        "Disk KV cache transfer backend used by KV cache manager v2. "
+        "`nixl_gds` requests direct GPU-to-disk transfers and NIXL-managed "
+        "host-to-disk transfers, with NIXL's POSIX compatibility fallback.")
+    disk_cache_gds_thread_count: PositiveInt = Field(
+        default=8,
+        description=
+        "Number of worker threads used by the NIXL GDS_MT backend for KV "
+        "cache disk transfers.")
     cross_kv_cache_fraction: Optional[float] = Field(
         default=None,
         description=

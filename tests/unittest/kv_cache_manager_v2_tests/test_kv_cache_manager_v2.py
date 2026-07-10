@@ -19,6 +19,7 @@ import hashlib
 import itertools
 import os
 import random
+import tempfile
 import time
 import unittest
 from contextlib import contextmanager
@@ -27,6 +28,9 @@ from importlib.util import find_spec
 from random import randbytes
 from statistics import median
 from typing import TYPE_CHECKING, Iterator, NamedTuple, cast
+from unittest import mock
+
+import torch
 
 if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
     from kv_cache_manager_v2 import (
@@ -53,6 +57,7 @@ if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
         TokenIdExt,
         _KVCache,
     )
+    from kv_cache_manager_v2 import _copy_engine as copy_engine_module
     from kv_cache_manager_v2._block_radix_tree import Hasher, traverse_post_order
     from kv_cache_manager_v2._common import (
         BAD_PAGE_INDEX,
@@ -63,8 +68,8 @@ if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
         PageStatus,
         SlidingWindowSize,
     )
-    from kv_cache_manager_v2._copy_engine import CopyTask, batched_copy
-    from kv_cache_manager_v2._exceptions import OutOfPagesError
+    from kv_cache_manager_v2._copy_engine import CopyEngine, CopyTask, batched_copy
+    from kv_cache_manager_v2._exceptions import CuError, OutOfPagesError
     from kv_cache_manager_v2._life_cycle_registry import LifeCycleRegistry, SsmLifeCycle
     from kv_cache_manager_v2._storage._config import create_storage_config
     from kv_cache_manager_v2._storage._core import CacheLevelStorage, SlotAllocator
@@ -108,6 +113,7 @@ else:
         TokenIdExt,
         _KVCache,
     )
+    from tensorrt_llm.runtime.kv_cache_manager_v2 import _copy_engine as copy_engine_module
     from tensorrt_llm.runtime.kv_cache_manager_v2._block_radix_tree import (
         Hasher,
         traverse_post_order,
@@ -121,8 +127,12 @@ else:
         PageStatus,
         SlidingWindowSize,
     )
-    from tensorrt_llm.runtime.kv_cache_manager_v2._copy_engine import CopyTask, batched_copy
-    from tensorrt_llm.runtime.kv_cache_manager_v2._exceptions import OutOfPagesError
+    from tensorrt_llm.runtime.kv_cache_manager_v2._copy_engine import (
+        CopyEngine,
+        CopyTask,
+        batched_copy,
+    )
+    from tensorrt_llm.runtime.kv_cache_manager_v2._exceptions import CuError, OutOfPagesError
     from tensorrt_llm.runtime.kv_cache_manager_v2._life_cycle_registry import (
         LifeCycleRegistry,
         SsmLifeCycle,
@@ -2610,6 +2620,184 @@ class TestSlotAllocatorShrink(unittest.TestCase):
 
         for s in slots[:8]:
             allocator.release(s)
+
+
+class TestNixlGdsCopyEngine(unittest.TestCase):
+    @mock.patch.object(copy_engine_module, "_NixlGdsCopyEngine")
+    def test_routes_disk_transfers_without_host_staging(self, engine_cls: mock.Mock) -> None:
+        native_engine = mock.Mock()
+        native_engine.copy_device_to_disk.return_value = 0
+        native_engine.copy_disk_to_device.return_value = 0
+        native_engine.copy_host_to_disk.return_value = 0
+        native_engine.copy_disk_to_host.return_value = 0
+        engine_cls.return_value = native_engine
+
+        engine = CopyEngine()
+        disk = copy_engine_module.DiskAddress(17, 4096)
+        memory = MemAddress(0x1000)
+        stream = CudaStream(23)
+
+        cases = (
+            (CacheTier.DISK, CacheTier.GPU_MEM, CopyTask(disk, memory), "copy_device_to_disk"),
+            (CacheTier.GPU_MEM, CacheTier.DISK, CopyTask(memory, disk), "copy_disk_to_device"),
+            (CacheTier.DISK, CacheTier.HOST_MEM, CopyTask(disk, memory), "copy_host_to_disk"),
+            (CacheTier.HOST_MEM, CacheTier.DISK, CopyTask(memory, disk), "copy_disk_to_host"),
+        )
+        for dst_tier, src_tier, task, method_name in cases:
+            with self.subTest(dst_tier=dst_tier, src_tier=src_tier):
+                engine.transfer(
+                    dst_tier,
+                    src_tier,
+                    8192,
+                    [task],
+                    stream,
+                    disk_backend="nixl_gds",
+                    gds_thread_count=4,
+                )
+                getattr(native_engine, method_name).assert_called_once()
+
+        engine_cls.assert_called_once_with(4)
+        self.assertIsNone(engine._staging_buffer_manager)
+
+    @mock.patch.object(copy_engine_module, "_NixlGdsCopyEngine")
+    def test_rejects_invalid_thread_count(self, engine_cls: mock.Mock) -> None:
+        engine = CopyEngine()
+        disk = copy_engine_module.DiskAddress(17, 0)
+        with self.assertRaisesRegex(ValueError, "thread count must be positive"):
+            engine.transfer(
+                CacheTier.DISK,
+                CacheTier.GPU_MEM,
+                4096,
+                [CopyTask(disk, MemAddress(0x1000))],
+                CudaStream(0),
+                disk_backend="nixl_gds",
+                gds_thread_count=0,
+            )
+        engine_cls.assert_not_called()
+
+    @mock.patch.object(copy_engine_module, "_copy_gpu_to_host")
+    @mock.patch.object(copy_engine_module, "_NixlGdsCopyEngine")
+    def test_gds_config_does_not_change_non_disk_routes(
+        self, engine_cls: mock.Mock, copier: mock.Mock
+    ) -> None:
+        task = CopyTask(MemAddress(0x2000), MemAddress(0x1000))
+        CopyEngine().transfer(
+            CacheTier.HOST_MEM,
+            CacheTier.GPU_MEM,
+            4096,
+            [task],
+            CudaStream(0),
+            disk_backend="nixl_gds",
+        )
+        copier.assert_called_once_with([task], 4096, CudaStream(0))
+        engine_cls.assert_not_called()
+
+    def test_gds_gpu_and_host_disk_round_trips(self) -> None:
+        """Exercise GDS when TLLM_KVCACHE_V2_GDS_PATH names a supported filesystem."""
+        root = os.environ.get("TLLM_KVCACHE_V2_GDS_PATH")
+        if not root:
+            self.skipTest("TLLM_KVCACHE_V2_GDS_PATH is not set")
+        if not os.path.isdir(root):
+            self.skipTest(f"GDS test path is not a directory: {root}")
+        if copy_engine_module._NixlGdsCopyEngine is None:
+            self.skipTest("TensorRT-LLM was built without NIXL GDS support")
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA is not available")
+        if not hasattr(os, "O_DIRECT"):
+            self.skipTest("O_DIRECT is not available")
+
+        size = 4 << 20
+        try:
+            buffered_fd, path = tempfile.mkstemp(prefix="kvcv2-gds-", dir=root)
+        except OSError as error:
+            self.skipTest(f"cannot create a GDS test file under {root}: {error}")
+
+        fd: int | None = None
+        engine: CopyEngine | None = None
+        try:
+            os.close(buffered_fd)
+            try:
+                fd = os.open(path, os.O_RDWR | os.O_DIRECT)
+            except OSError as error:
+                self.skipTest(f"filesystem at {root} does not support O_DIRECT: {error}")
+            os.ftruncate(fd, size * 2)
+
+            engine = CopyEngine()
+            stream = CudaStream(torch.cuda.current_stream().cuda_stream)
+
+            gpu_disk = copy_engine_module.DiskAddress(fd, 0)
+            gpu = torch.arange(size, dtype=torch.uint8, device="cuda")
+            expected_gpu = gpu.clone()
+            try:
+                engine.transfer(
+                    CacheTier.DISK,
+                    CacheTier.GPU_MEM,
+                    size,
+                    [CopyTask(gpu_disk, MemAddress(gpu.data_ptr()))],
+                    stream,
+                    disk_backend="nixl_gds",
+                    gds_thread_count=4,
+                )
+            except CuError as error:
+                self.skipTest(f"NIXL GDS cannot use the filesystem at {root}: {error}")
+            native_engine = engine._nixl_gds_engines[4]
+            if not native_engine.last_transfer_used_gds():
+                self.skipTest(f"filesystem at {root} is not supported by NIXL GDS")
+
+            gpu.zero_()
+            engine.transfer(
+                CacheTier.GPU_MEM,
+                CacheTier.DISK,
+                size,
+                [CopyTask(MemAddress(gpu.data_ptr()), gpu_disk)],
+                stream,
+                disk_backend="nixl_gds",
+                gds_thread_count=4,
+            )
+            self.assertTrue(
+                native_engine.last_transfer_used_gds(),
+                "NIXL GDS fell back while reading disk data into GPU memory",
+            )
+            self.assertTrue(torch.equal(gpu, expected_gpu))
+
+            host_disk = copy_engine_module.DiskAddress(fd, size)
+            host = torch.arange(size, dtype=torch.uint8, pin_memory=True)
+            output = torch.empty(size, dtype=torch.uint8, pin_memory=True)
+            engine.transfer(
+                CacheTier.DISK,
+                CacheTier.HOST_MEM,
+                size,
+                [CopyTask(host_disk, MemAddress(host.data_ptr()))],
+                stream,
+                disk_backend="nixl_gds",
+                gds_thread_count=4,
+            )
+            self.assertTrue(
+                native_engine.last_transfer_used_gds(),
+                "NIXL GDS fell back while writing host data to disk",
+            )
+
+            output.zero_()
+            engine.transfer(
+                CacheTier.HOST_MEM,
+                CacheTier.DISK,
+                size,
+                [CopyTask(MemAddress(output.data_ptr()), host_disk)],
+                stream,
+                disk_backend="nixl_gds",
+                gds_thread_count=4,
+            )
+            self.assertTrue(
+                native_engine.last_transfer_used_gds(),
+                "NIXL GDS fell back while reading disk data into host memory",
+            )
+            self.assertTrue(torch.equal(output, host))
+        finally:
+            if engine is not None:
+                engine.close()
+            if fd is not None:
+                os.close(fd)
+            os.unlink(path)
 
 
 class TestBlockKeyHashing(unittest.TestCase):

@@ -18,12 +18,17 @@
 #include "tensorrt_llm/batch_manager/kvCacheManagerV2Utils.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/memoryUtils.h"
+#include "tensorrt_llm/executor/transferAgent.h"
+#include <atomic>
 #include <cassert>
 #include <cstdio>
 #include <cuda.h>
+#include <exception>
 #include <fcntl.h>
 #include <memory>
+#include <string>
 #include <unistd.h>
+#include <utility>
 #include <vector>
 
 namespace tc = tensorrt_llm::common;
@@ -31,6 +36,174 @@ using namespace tensorrt_llm::runtime;
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
+
+namespace kvc = tensorrt_llm::executor::kv_cache;
+
+class NixlGdsCopyEngineImpl
+{
+public:
+    explicit NixlGdsCopyEngineImpl(SizeType32 threadCount)
+    {
+        TLLM_CHECK_WITH_INFO(threadCount > 0, "NIXL GDS thread count must be positive");
+        static std::atomic<uint64_t> nextAgentId{0};
+        auto const agentId = nextAgentId.fetch_add(1);
+        kvc::BaseAgentConfig config{std::string{"KVCacheManagerV2Gds"} + std::to_string(agentId), true, true, false,
+            false, {{"thread_count", std::to_string(threadCount)}}};
+        mAgent = kvc::makeLoopbackAgent("nixl", &config);
+    }
+
+    CUresult copyToDisk(std::vector<Task<DiskAddress, MemAddress>> const& tasks, ssize_t numBytes, CUstream stream,
+        kvc::MemoryType memoryType) noexcept
+    {
+        try
+        {
+            CUdevice device = 0;
+            CUresult const result = prepare(tasks.size(), numBytes, stream, device);
+            if (result != CUDA_SUCCESS || tasks.empty())
+            {
+                return result;
+            }
+            std::vector<kvc::MemoryDesc> memoryBlobs;
+            std::vector<kvc::FileDesc> fileBlobs;
+            memoryBlobs.reserve(tasks.size());
+            fileBlobs.reserve(tasks.size());
+            for (auto const& task : tasks)
+            {
+                memoryBlobs.emplace_back(task.src, static_cast<size_t>(numBytes), static_cast<uint32_t>(device));
+                fileBlobs.emplace_back(task.dst.fd, static_cast<size_t>(task.dst.pos), static_cast<size_t>(numBytes));
+            }
+            return execute(std::move(memoryBlobs), std::move(fileBlobs), memoryType, true);
+        }
+        catch (std::exception const& e)
+        {
+            TLLM_LOG_ERROR("[KVCacheManagerV2] Failed to prepare NIXL GDS transfer: %s", e.what());
+        }
+        catch (...)
+        {
+            TLLM_LOG_ERROR("[KVCacheManagerV2] Failed to prepare NIXL GDS transfer with unknown exception");
+        }
+        return CUDA_ERROR_UNKNOWN;
+    }
+
+    CUresult copyFromDisk(std::vector<Task<MemAddress, DiskAddress>> const& tasks, ssize_t numBytes, CUstream stream,
+        kvc::MemoryType memoryType) noexcept
+    {
+        try
+        {
+            CUdevice device = 0;
+            CUresult const result = prepare(tasks.size(), numBytes, stream, device);
+            if (result != CUDA_SUCCESS || tasks.empty())
+            {
+                return result;
+            }
+            std::vector<kvc::MemoryDesc> memoryBlobs;
+            std::vector<kvc::FileDesc> fileBlobs;
+            memoryBlobs.reserve(tasks.size());
+            fileBlobs.reserve(tasks.size());
+            for (auto const& task : tasks)
+            {
+                memoryBlobs.emplace_back(task.dst, static_cast<size_t>(numBytes), static_cast<uint32_t>(device));
+                fileBlobs.emplace_back(task.src.fd, static_cast<size_t>(task.src.pos), static_cast<size_t>(numBytes));
+            }
+            return execute(std::move(memoryBlobs), std::move(fileBlobs), memoryType, false);
+        }
+        catch (std::exception const& e)
+        {
+            TLLM_LOG_ERROR("[KVCacheManagerV2] Failed to prepare NIXL GDS transfer: %s", e.what());
+        }
+        catch (...)
+        {
+            TLLM_LOG_ERROR("[KVCacheManagerV2] Failed to prepare NIXL GDS transfer with unknown exception");
+        }
+        return CUDA_ERROR_UNKNOWN;
+    }
+
+    [[nodiscard]] bool lastTransferUsedGds() const noexcept
+    {
+        return mLastTransferUsedGds.load();
+    }
+
+private:
+    CUresult prepare(size_t numTasks, ssize_t numBytes, CUstream stream, CUdevice& device) noexcept
+    {
+        if (numTasks == 0)
+        {
+            return CUDA_SUCCESS;
+        }
+        if (numBytes <= 0)
+        {
+            TLLM_LOG_ERROR("[KVCacheManagerV2] NIXL GDS transfer size must be positive");
+            return CUDA_ERROR_INVALID_VALUE;
+        }
+
+        CUresult const syncResult = cuStreamSynchronize(stream);
+        if (syncResult != CUDA_SUCCESS)
+        {
+            return syncResult;
+        }
+        return cuCtxGetDevice(&device);
+    }
+
+    CUresult execute(std::vector<kvc::MemoryDesc>&& memoryBlobs, std::vector<kvc::FileDesc>&& fileBlobs,
+        kvc::MemoryType memoryType, bool isOffload) noexcept
+    {
+        try
+        {
+            kvc::MemoryDescs memoryDescs(memoryType, std::move(memoryBlobs));
+            kvc::FileDescs fileDescs(std::move(fileBlobs));
+            mLastTransferUsedGds.store(mAgent->executeLoopbackRequest(memoryDescs, fileDescs, isOffload));
+            return CUDA_SUCCESS;
+        }
+        catch (std::exception const& e)
+        {
+            TLLM_LOG_ERROR("[KVCacheManagerV2] NIXL GDS transfer failed: %s", e.what());
+        }
+        catch (...)
+        {
+            TLLM_LOG_ERROR("[KVCacheManagerV2] NIXL GDS transfer failed with unknown exception");
+        }
+        return CUDA_ERROR_UNKNOWN;
+    }
+
+    std::shared_ptr<kvc::BaseLoopbackAgent> mAgent;
+    std::atomic<bool> mLastTransferUsedGds{false};
+};
+
+NixlGdsCopyEngine::NixlGdsCopyEngine(SizeType32 threadCount)
+    : mImpl{std::make_unique<NixlGdsCopyEngineImpl>(threadCount)}
+{
+}
+
+NixlGdsCopyEngine::~NixlGdsCopyEngine() = default;
+
+CUresult NixlGdsCopyEngine::copyDeviceToDisk(
+    std::vector<Task<DiskAddress, MemAddress>> const& tasks, ssize_t numBytes, CUstream stream) noexcept
+{
+    return mImpl->copyToDisk(tasks, numBytes, stream, kvc::MemoryType::kVRAM);
+}
+
+CUresult NixlGdsCopyEngine::copyDiskToDevice(
+    std::vector<Task<MemAddress, DiskAddress>> const& tasks, ssize_t numBytes, CUstream stream) noexcept
+{
+    return mImpl->copyFromDisk(tasks, numBytes, stream, kvc::MemoryType::kVRAM);
+}
+
+CUresult NixlGdsCopyEngine::copyHostToDisk(
+    std::vector<Task<DiskAddress, MemAddress>> const& tasks, ssize_t numBytes, CUstream stream) noexcept
+{
+    return mImpl->copyToDisk(tasks, numBytes, stream, kvc::MemoryType::kDRAM);
+}
+
+CUresult NixlGdsCopyEngine::copyDiskToHost(
+    std::vector<Task<MemAddress, DiskAddress>> const& tasks, ssize_t numBytes, CUstream stream) noexcept
+{
+    return mImpl->copyFromDisk(tasks, numBytes, stream, kvc::MemoryType::kDRAM);
+}
+
+bool NixlGdsCopyEngine::lastTransferUsedGds() const noexcept
+{
+    return mImpl->lastTransferUsedGds();
+}
 
 template <typename Func>
 bool loopedReadWrite(Func&& func, ssize_t size) noexcept
@@ -57,15 +230,13 @@ bool loopedReadWrite(Func&& func, ssize_t size) noexcept
 bool writeAll(int fd, ssize_t pos, void const* data, ssize_t size) noexcept
 {
     return loopedReadWrite([=](ssize_t finished)
-        { return pwrite(fd, static_cast<std::byte const*>(data) + finished, size - finished, pos + finished); },
-        size);
+        { return pwrite(fd, static_cast<std::byte const*>(data) + finished, size - finished, pos + finished); }, size);
 }
 
 bool readAll(int fd, ssize_t pos, void* data, ssize_t size) noexcept
 {
     return loopedReadWrite([=](ssize_t finished)
-        { return pread(fd, static_cast<std::byte*>(data) + finished, size - finished, pos + finished); },
-        size);
+        { return pread(fd, static_cast<std::byte*>(data) + finished, size - finished, pos + finished); }, size);
 }
 
 template <typename DstAddr, typename SrcAddr>

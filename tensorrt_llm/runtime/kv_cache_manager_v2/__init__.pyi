@@ -23,6 +23,7 @@ from typing import (
     Final,
     Iterable,
     Iterator,
+    Literal,
     NamedTuple,
     NewType,
     Protocol,
@@ -122,6 +123,8 @@ class HostCacheTierConfig:
 class DiskCacheTierConfig:
     quota: int
     path: str
+    backend: Literal["posix", "nixl_gds"] = "posix"
+    gds_thread_count: int = 8
     @property
     def tier(self) -> CacheTier: ...
     def assert_valid(self) -> None: ...

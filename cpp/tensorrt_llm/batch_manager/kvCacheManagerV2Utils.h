@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -24,6 +24,7 @@
 #include <ATen/ATen.h>
 #include <cstdint>
 #include <cuda.h>
+#include <memory>
 #include <set>
 #include <unordered_map>
 #include <vector>
@@ -50,6 +51,31 @@ struct Task
 {
     DstAddr dst;
     SrcAddr src;
+};
+
+class NixlGdsCopyEngineImpl;
+
+class NixlGdsCopyEngine
+{
+public:
+    explicit NixlGdsCopyEngine(SizeType32 threadCount);
+    ~NixlGdsCopyEngine();
+
+    NixlGdsCopyEngine(NixlGdsCopyEngine const&) = delete;
+    NixlGdsCopyEngine& operator=(NixlGdsCopyEngine const&) = delete;
+
+    CUresult copyDeviceToDisk(
+        std::vector<Task<DiskAddress, MemAddress>> const& tasks, ssize_t numBytes, CUstream stream) noexcept;
+    CUresult copyDiskToDevice(
+        std::vector<Task<MemAddress, DiskAddress>> const& tasks, ssize_t numBytes, CUstream stream) noexcept;
+    CUresult copyHostToDisk(
+        std::vector<Task<DiskAddress, MemAddress>> const& tasks, ssize_t numBytes, CUstream stream) noexcept;
+    CUresult copyDiskToHost(
+        std::vector<Task<MemAddress, DiskAddress>> const& tasks, ssize_t numBytes, CUstream stream) noexcept;
+    [[nodiscard]] bool lastTransferUsedGds() const noexcept;
+
+private:
+    std::unique_ptr<NixlGdsCopyEngineImpl> mImpl;
 };
 
 using PackedInt = union

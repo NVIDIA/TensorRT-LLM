@@ -199,10 +199,11 @@ _kv_metrics_logger = _KVMetricsLoggerShim()
 
 
 class KVCacheMetrics:
-    """Per-pool-group KV cache transfer counters (interval-resettable)."""
+    """Per-pool-group and per-cache-level transfer counters."""
 
-    def __init__(self, num_pool_groups: int) -> None:
+    def __init__(self, num_pool_groups: int, num_cache_levels: int) -> None:
         self._num_pool_groups = num_pool_groups
+        self._num_cache_levels = num_cache_levels
         self._lock = threading.Lock()
         self._offload_blocks = [0] * num_pool_groups
         self._offload_bytes = [0] * num_pool_groups
@@ -210,16 +211,36 @@ class KVCacheMetrics:
         self._onboard_bytes = [0] * num_pool_groups
         self._host_dropped_blocks = [0] * num_pool_groups
         self._host_dropped_bytes = [0] * num_pool_groups
+        self._transfer_blocks = [
+            [[0] * num_cache_levels for _ in range(num_cache_levels)]
+            for _ in range(num_pool_groups)
+        ]
+        self._transfer_bytes = [
+            [[0] * num_cache_levels for _ in range(num_cache_levels)]
+            for _ in range(num_pool_groups)
+        ]
 
-    def record_offload(self, pg_idx: int, num_blocks: int, bytes_per_block: int) -> None:
+    def record_transfer(
+        self,
+        pg_idx: int,
+        src_level: CacheLevel,
+        dst_level: CacheLevel,
+        num_blocks: int,
+        bytes_per_block: int,
+    ) -> None:
+        assert src_level != dst_level
+        src_idx = int(src_level)
+        dst_idx = int(dst_level)
+        num_bytes = num_blocks * bytes_per_block
         with self._lock:
-            self._offload_blocks[pg_idx] += num_blocks
-            self._offload_bytes[pg_idx] += num_blocks * bytes_per_block
-
-    def record_onboard(self, pg_idx: int, num_blocks: int, bytes_per_block: int) -> None:
-        with self._lock:
-            self._onboard_blocks[pg_idx] += num_blocks
-            self._onboard_bytes[pg_idx] += num_blocks * bytes_per_block
+            if dst_level > src_level:
+                self._offload_blocks[pg_idx] += num_blocks
+                self._offload_bytes[pg_idx] += num_bytes
+            else:
+                self._onboard_blocks[pg_idx] += num_blocks
+                self._onboard_bytes[pg_idx] += num_bytes
+            self._transfer_blocks[pg_idx][src_idx][dst_idx] += num_blocks
+            self._transfer_bytes[pg_idx][src_idx][dst_idx] += num_bytes
 
     def record_host_dropped(self, pg_idx: int, num_blocks: int, bytes_per_block: int) -> None:
         with self._lock:
@@ -228,22 +249,36 @@ class KVCacheMetrics:
 
     def snapshot_and_reset(self) -> list[dict[str, int]]:
         with self._lock:
-            result = []
-            for i in range(self._num_pool_groups):
-                result.append({
-                    "offload_blocks": self._offload_blocks[i],
-                    "offload_bytes": self._offload_bytes[i],
-                    "onboard_blocks": self._onboard_blocks[i],
-                    "onboard_bytes": self._onboard_bytes[i],
-                    "host_dropped_blocks": self._host_dropped_blocks[i],
-                    "host_dropped_bytes": self._host_dropped_bytes[i],
-                })
-                self._offload_blocks[i] = 0
-                self._offload_bytes[i] = 0
-                self._onboard_blocks[i] = 0
-                self._onboard_bytes[i] = 0
-                self._host_dropped_blocks[i] = 0
-                self._host_dropped_bytes[i] = 0
+            result: list[dict[str, int]] = []
+            for pg_idx in range(self._num_pool_groups):
+                snapshot = {
+                    "offload_blocks": self._offload_blocks[pg_idx],
+                    "offload_bytes": self._offload_bytes[pg_idx],
+                    "onboard_blocks": self._onboard_blocks[pg_idx],
+                    "onboard_bytes": self._onboard_bytes[pg_idx],
+                    "host_dropped_blocks": self._host_dropped_blocks[pg_idx],
+                    "host_dropped_bytes": self._host_dropped_bytes[pg_idx],
+                }
+                for src_idx in range(self._num_cache_levels):
+                    for dst_idx in range(self._num_cache_levels):
+                        if src_idx == dst_idx:
+                            continue
+                        route = f"level{src_idx}_to_level{dst_idx}"
+                        snapshot[f"{route}_blocks"] = self._transfer_blocks[pg_idx][src_idx][
+                            dst_idx
+                        ]
+                        snapshot[f"{route}_bytes"] = self._transfer_bytes[pg_idx][src_idx][
+                            dst_idx
+                        ]
+                        self._transfer_blocks[pg_idx][src_idx][dst_idx] = 0
+                        self._transfer_bytes[pg_idx][src_idx][dst_idx] = 0
+                result.append(snapshot)
+                self._offload_blocks[pg_idx] = 0
+                self._offload_bytes[pg_idx] = 0
+                self._onboard_blocks[pg_idx] = 0
+                self._onboard_bytes[pg_idx] = 0
+                self._host_dropped_blocks[pg_idx] = 0
+                self._host_dropped_bytes[pg_idx] = 0
             return result
 
 
@@ -260,6 +295,8 @@ class StorageManager:
         "_levels",
         "_min_slots",
         "_event_manager",
+        "_disk_backend",
+        "_disk_gds_thread_count",
         "__rawref__",
         "_metrics",
         "_metrics_interval",
@@ -276,6 +313,8 @@ class StorageManager:
     _levels: TypedIndexList[CacheLevel, CacheLevelManager]
     _min_slots: TypedIndexList[PoolGroupIndex, int]
     _event_manager: "KVCacheEventManager | None"
+    _disk_backend: str
+    _disk_gds_thread_count: int
     __rawref__: rawref.ref["StorageManager"]
 
     def __init__(
@@ -291,6 +330,15 @@ class StorageManager:
     ) -> None:
         self.__rawref__ = rawref.NULL
         self._event_manager = event_manager
+        disk_configs = [tier for tier in config.cache_tiers if tier.tier == CacheTier.DISK]
+        if disk_configs:
+            disk_config = disk_configs[0]
+            assert isinstance(disk_config, DiskCacheTierConfig)
+            self._disk_backend = disk_config.backend
+            self._disk_gds_thread_count = disk_config.gds_thread_count
+        else:
+            self._disk_backend = "posix"
+            self._disk_gds_thread_count = 8
         assert config.cache_tiers[GPU_LEVEL].tier == CacheTier.GPU_MEM, (
             "The first cache tier must be GPU memory"
         )
@@ -366,7 +414,7 @@ class StorageManager:
             self._levels, lambda level: level.storage.num_pool_groups
         )
 
-        self._metrics = KVCacheMetrics(int(self.num_pool_groups))
+        self._metrics = KVCacheMetrics(int(self.num_pool_groups), int(self.num_cache_levels))
         self._metrics_interval = float(os.environ.get("TRTLLM_KV_METRICS_INTERVAL_S", "30"))
         self._metrics_timer_stop = threading.Event()
         self._start_metrics_logger()
@@ -390,8 +438,22 @@ class StorageManager:
         t = threading.Thread(target=_log_loop, daemon=True, name="kv_cache_metrics")
         t.start()
 
+    def _cache_level_name(self, level: CacheLevel) -> str:
+        match self._levels[level].cache_tier:
+            case CacheTier.GPU_MEM:
+                return "gpu"
+            case CacheTier.HOST_MEM:
+                return "host"
+            case CacheTier.DISK:
+                return "disk"
+            case tier:
+                return f"tier{int(tier)}"
+
     def _log_metrics(self) -> None:
         snapshots = self._metrics.snapshot_and_reset()
+        level_names = [
+            self._cache_level_name(level) for level in typed_range(self.num_cache_levels)
+        ]
         for pg_idx in typed_range(self.num_pool_groups):
             snap = snapshots[int(pg_idx)]
             parts = [
@@ -403,8 +465,20 @@ class StorageManager:
                 f" dropped_blocks={snap['host_dropped_blocks']}"
                 f" dropped_bytes={snap['host_dropped_bytes']}"
             ]
+            for src_idx, src_name in enumerate(level_names):
+                for dst_idx, dst_name in enumerate(level_names):
+                    if src_idx == dst_idx:
+                        continue
+                    route = f"level{src_idx}_to_level{dst_idx}"
+                    blocks = snap[f"{route}_blocks"]
+                    num_bytes = snap[f"{route}_bytes"]
+                    if blocks > 0 or num_bytes > 0:
+                        parts.append(
+                            f"| transfer={src_name}->{dst_name}"
+                            f" blocks={blocks} bytes={num_bytes}"
+                        )
             for lvl_id in typed_range(self.num_cache_levels):
-                level_name = "gpu" if lvl_id == GPU_LEVEL else f"level{int(lvl_id)}"
+                level_name = level_names[int(lvl_id)]
                 stats = self.get_statistics(lvl_id)
                 s = stats[pg_idx]
                 used = s.total - s.free
@@ -715,7 +789,15 @@ class StorageManager:
             with TemporaryCudaStream(prior_events) as stream:
                 slot_sizes = self.slot_size(pool_group_index)
                 for pool_idx, tasks in typed_enumerate(tasks_per_pool):
-                    batched_copy(dst_tier, src_tier, slot_sizes[pool_idx], tasks, stream.get())
+                    batched_copy(
+                        dst_tier,
+                        src_tier,
+                        slot_sizes[pool_idx],
+                        tasks,
+                        stream.get(),
+                        self._disk_backend,
+                        self._disk_gds_thread_count,
+                    )
             finish_event = stream.take_finish_event()
             emit_cache_level_updates = (
                 update_src
@@ -746,10 +828,13 @@ class StorageManager:
                         self.schedule_for_eviction(src)
             if not defrag:
                 bytes_per_block = sum(self.slot_size(pool_group_index))
-                if dst_level > src_level:
-                    self._metrics.record_offload(int(pool_group_index), num_slots, bytes_per_block)
-                else:
-                    self._metrics.record_onboard(int(pool_group_index), num_slots, bytes_per_block)
+                self._metrics.record_transfer(
+                    int(pool_group_index),
+                    src_level,
+                    dst_level,
+                    num_slots,
+                    bytes_per_block,
+                )
             return None if update_src else dst_slots
         except Exception:
             for s in dst_slots:

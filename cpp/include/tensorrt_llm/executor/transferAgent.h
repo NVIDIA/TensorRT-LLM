@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2025-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -121,43 +121,69 @@ class FileDesc
 public:
     FileDesc(std::string const& filename, int flags, mode_t mode, size_t len)
         : mLen{len}
+        , mOwnsFd{true}
     {
-        int fd = ::open(filename.c_str(), flags, mode);
-        TLLM_CHECK_WITH_INFO(fd >= 0, "Failed to open '%s' (GDS)", filename.c_str());
-        this->fd = fd;
+        mFd = ::open(filename.c_str(), flags, mode);
+        TLLM_CHECK_WITH_INFO(mFd >= 0, "Failed to open '%s' (GDS)", filename.c_str());
+    }
+
+    FileDesc(int fd, size_t offset, size_t len)
+        : mFd{fd}
+        , mOffset{offset}
+        , mLen{len}
+        , mOwnsFd{false}
+    {
+        TLLM_CHECK_WITH_INFO(mFd >= 0, "Invalid borrowed file descriptor %d (GDS)", mFd);
     }
 
     FileDesc(FileDesc&& other) noexcept
-        : fd(other.fd)
+        : mFd(other.mFd)
+        , mOffset(other.mOffset)
         , mLen(other.mLen)
+        , mOwnsFd(other.mOwnsFd)
     {
-        other.fd = -1;
+        other.mFd = -1;
+        other.mOffset = 0;
         other.mLen = 0;
+        other.mOwnsFd = false;
     }
 
     FileDesc& operator=(FileDesc&& other) noexcept
     {
         if (this != &other)
         {
-            if (fd != -1)
-                ::close(fd);
-            fd = other.fd;
+            if (mOwnsFd && mFd != -1)
+            {
+                ::close(mFd);
+            }
+            mFd = other.mFd;
+            mOffset = other.mOffset;
             mLen = other.mLen;
-            other.fd = -1;
+            mOwnsFd = other.mOwnsFd;
+            other.mFd = -1;
+            other.mOffset = 0;
             other.mLen = 0;
+            other.mOwnsFd = false;
         }
         return *this;
     }
 
     ~FileDesc()
     {
-        if (fd != -1)
-            ::close(fd);
+        if (mOwnsFd && mFd != -1)
+        {
+            ::close(mFd);
+        }
     }
 
     [[nodiscard]] uint64_t getFd() const noexcept
     {
-        return fd;
+        return mFd;
+    }
+
+    [[nodiscard]] size_t getOffset() const noexcept
+    {
+        return mOffset;
     }
 
     [[nodiscard]] size_t getLen() const noexcept
@@ -169,8 +195,10 @@ public:
     FileDesc& operator=(FileDesc const&) = delete;
 
 private:
-    int fd;
+    int mFd{-1};
+    size_t mOffset{0};
     size_t mLen;
+    bool mOwnsFd{false};
 };
 
 class FileDescs
@@ -426,7 +454,9 @@ class BaseLoopbackAgent
 {
 public:
     virtual ~BaseLoopbackAgent() = default;
-    virtual void executeLoopbackRequest(MemoryDescs const& memoryDescs, FileDescs const& fileDescs, bool isOffload) = 0;
+    /// Execute a synchronous memory/file transfer.
+    /// @return true when NIXL handled the transfer, false when the POSIX compatibility path was used.
+    virtual bool executeLoopbackRequest(MemoryDescs const& memoryDescs, FileDescs const& fileDescs, bool isOffload) = 0;
 };
 
 class DynLibLoader final
