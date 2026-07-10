@@ -317,6 +317,11 @@ def load_calib_dataset(dataset_name_or_dir: str,
                     key = meta[2]
                 break
 
+    # The bare "cnn_dailymail" repo id was relocated to "abisee/cnn_dailymail";
+    # newer huggingface_hub rejects un-namespaced ids.
+    if dataset_name_or_dir == "cnn_dailymail":
+        dataset_name_or_dir = "abisee/cnn_dailymail"
+
     dataset = load_dataset(dataset_name_or_dir,
                            name=config_name,
                            split=split,
