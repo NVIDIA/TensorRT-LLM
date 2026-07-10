@@ -858,6 +858,19 @@ int BertAttentionPlugin::enqueueImpl(nvinfer1::PluginTensorDesc const* inputDesc
                 request_batch_size * mNumHeads,  // global batch size
                 CUDA_R_32F);
 
+            // add relative position bias
+            if (mRelativeAttention)
+            {
+                // add rel pos bias
+                // QK is (batch_size, local_head_num, q_length, k_length), rel pos bias is (1, local_head_num,
+                // max_output_len + 1, max_output_len + 1). broadcast along 1st dim. max_seq_len is already
+                // max_output_len + 1. In implicit mode, relative_attention_bias is rel attn table
+                // [num_heads, num_buckets], with necessary params (max_distance, num_buckets) passed at the end
+                invokeAddRelativeAttentionBiasUnaligned(qk_buf_float_, relative_attn_table, request_batch_size,
+                    mNumHeads, attention_seq_len_1, attention_seq_len_2, stream, mMaxDistance > 0,
+                    inputDesc[3].dims.d[1], mMaxDistance, true /* bidirectional */);
+            }
+
             MaskedSoftmaxParam<T, float> param;
             param.attention_score = qk_buf_;       // (batch_size, head_num, q_length, k_length)
             param.qk = qk_buf_float_;              // (batch_size, head_num, q_length, k_length)
@@ -868,26 +881,6 @@ int BertAttentionPlugin::enqueueImpl(nvinfer1::PluginTensorDesc const* inputDesc
             param.num_heads = mNumHeads;
             param.qk_scale = qk_scale_softmax;
             param.linear_bias_slopes = const_cast<T*>(linear_bias_slopes); // (head_num,), optional
-
-            if (mRelativeAttention)
-            {
-                bool const implicit = mMaxDistance > 0;
-                int const num_bkts = inputDesc[3].dims.d[1];
-                param.relative_attention_bias = relative_attn_table;
-                param.implicit_relative_bias = implicit;
-                param.max_k_length = attention_seq_len_2;
-                if (implicit)
-                {
-                    param.num_buckets = num_bkts;
-                    param.max_distance = mMaxDistance;
-                    param.bidirectional = true;
-                    int const active = (true /* bidirectional */ ? num_bkts / 2 : num_bkts);
-                    int const max_exact = active / 2;
-                    param.inv_log_ratio = (mMaxDistance > max_exact && max_exact > 0)
-                        ? 1.0f / logf((float) mMaxDistance / max_exact)
-                        : 0.0f;
-                }
-            }
             invokeMaskedSoftmax(param, stream);
         }
         else
@@ -897,6 +890,19 @@ int BertAttentionPlugin::enqueueImpl(nvinfer1::PluginTensorDesc const* inputDesc
                 attention_seq_len_1 * mHeadSize, qk_buf_, attention_seq_len_2,
                 attention_seq_len_2 * attention_seq_len_1, request_batch_size * mNumHeads, qk_scale_gemm,
                 0.0f); // alpha, beta
+
+            // add relative position bias
+            if (mRelativeAttention)
+            {
+                // add rel pos bias
+                // QK is (batch_size, local_head_num, q_length, k_length), rel pos bias is (1, local_head_num,
+                // max_output_len + 1, max_output_len + 1). broadcast along 1st dim. max_seq_len is already
+                // max_output_len + 1. In implicit mode, relative_attention_bias is rel attn table
+                // [num_heads, num_buckets], with necessary params (max_distance, num_buckets) passed at the end
+                invokeAddRelativeAttentionBiasUnaligned(qk_buf_, relative_attn_table, request_batch_size, mNumHeads,
+                    attention_seq_len_1, attention_seq_len_2, stream, mMaxDistance > 0, inputDesc[3].dims.d[1],
+                    mMaxDistance, true /* bidirectional */);
+            }
 
             MaskedSoftmaxParam<T, T> param;
             param.attention_score = qk_buf_;       // (batch_size, head_num, q_length, k_length)
@@ -908,26 +914,6 @@ int BertAttentionPlugin::enqueueImpl(nvinfer1::PluginTensorDesc const* inputDesc
             param.num_heads = mNumHeads;
             param.qk_scale = qk_scale_softmax;
             param.linear_bias_slopes = const_cast<T*>(linear_bias_slopes); // (head_num,), optional
-
-            if (mRelativeAttention)
-            {
-                bool const implicit = mMaxDistance > 0;
-                int const num_bkts = inputDesc[3].dims.d[1];
-                param.relative_attention_bias = relative_attn_table;
-                param.implicit_relative_bias = implicit;
-                param.max_k_length = attention_seq_len_2;
-                if (implicit)
-                {
-                    param.num_buckets = num_bkts;
-                    param.max_distance = mMaxDistance;
-                    param.bidirectional = true;
-                    int const active = (true /* bidirectional */ ? num_bkts / 2 : num_bkts);
-                    int const max_exact = active / 2;
-                    param.inv_log_ratio = (mMaxDistance > max_exact && max_exact > 0)
-                        ? 1.0f / logf((float) mMaxDistance / max_exact)
-                        : 0.0f;
-                }
-            }
             invokeMaskedSoftmax(param, stream);
         }
 
