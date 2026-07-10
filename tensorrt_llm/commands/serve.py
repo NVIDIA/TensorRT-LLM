@@ -386,8 +386,8 @@ def launch_server(
         multimodal_server_config: Optional[MultimodalServerConfig] = None,
         served_model_name: Optional[str] = None,
         allow_request_chat_template: bool = False,
-        input_processor_workers: int = 8,
-        media_load_workers: int = 8):
+        num_input_processor_workers: int = 8,
+        num_media_load_workers: int = 8):
 
     backend = llm_args["backend"]
     model = served_model_name or llm_args["model"]
@@ -437,8 +437,8 @@ def launch_server(
             multimodal_server_config=multimodal_server_config,
             chat_template=chat_template,
             allow_request_chat_template=allow_request_chat_template,
-            input_processor_workers=input_processor_workers,
-            media_load_workers=media_load_workers)
+            input_processor_workers=num_input_processor_workers,
+            media_load_workers=num_media_load_workers)
         _apply_fastapi_middlewares(server.app, middleware)
 
         # Optionally disable GC (default: not disabled)
@@ -818,16 +818,14 @@ class ChoiceWithAlias(click.Choice):
                   help="Number of workers to postprocess raw responses "
                   "to comply with OpenAI protocol.",
                   status="prototype")
-@stability_option("--input-processor-workers",
-                  "input_processor_workers",
+@stability_option("--num_input_processor_workers",
                   type=click.IntRange(min=1),
                   default=8,
                   help="Size of the dedicated thread pool that runs the HF "
                   "input processor (multimodal preprocess) on the chat "
                   "and completion endpoints.",
                   status="prototype")
-@stability_option("--media-load-workers",
-                  "media_load_workers",
+@stability_option("--num_media_load_workers",
                   type=click.IntRange(min=1),
                   default=8,
                   help="Size of the dedicated thread pool that decodes media "
@@ -1010,8 +1008,8 @@ def serve(
         moe_expert_parallel_size: Optional[int],
         moe_cluster_parallel_size: Optional[int], gpus_per_node: Optional[int],
         free_gpu_memory_fraction: float, kv_cache_dtype: str,
-        num_postprocess_workers: int, input_processor_workers: int,
-        media_load_workers: int, trust_remote_code: bool,
+        num_postprocess_workers: int, num_input_processor_workers: int,
+        num_media_load_workers: int, trust_remote_code: bool,
         revision: Optional[str], extra_llm_api_options: Optional[str],
         reasoning_parser: Optional[str], tool_parser: Optional[str],
         metadata_server_config_file: Optional[str], server_role: Optional[str],
@@ -1213,8 +1211,8 @@ def serve(
                 multimodal_server_config,
                 served_model_name=served_model_name,
                 allow_request_chat_template=allow_request_chat_template,
-                input_processor_workers=input_processor_workers,
-                media_load_workers=media_load_workers)
+                num_input_processor_workers=num_input_processor_workers,
+                num_media_load_workers=num_media_load_workers)
 
     def _serve_visual_gen():
         parsed_visual_gen_args = (VisualGenArgs.from_yaml(visual_gen_args)
