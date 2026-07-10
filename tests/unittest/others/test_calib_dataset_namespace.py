@@ -14,6 +14,8 @@
 # limitations under the License.
 from unittest import mock
 
+import pytest
+
 import tensorrt_llm.models.convert_utils as convert_utils
 from tensorrt_llm.models.convert_utils import load_calib_dataset
 
@@ -29,10 +31,13 @@ def test_bare_cnn_dailymail_is_namespaced() -> None:
     assert load_dataset.call_args.args[0] == "abisee/cnn_dailymail"
 
 
-def test_other_dataset_ids_are_passed_through() -> None:
+# ccdv/cnn_dailymail is the important boundary: the already-qualified id must
+# NOT be rewritten — only the bare "cnn_dailymail" maps to abisee/cnn_dailymail.
+@pytest.mark.parametrize("dataset_name", ["lambada", "ccdv/cnn_dailymail"])
+def test_other_dataset_ids_are_passed_through(dataset_name: str) -> None:
     with mock.patch.object(
-        convert_utils, "load_dataset", return_value={"text": ["x"]}
+        convert_utils, "load_dataset", return_value={"text": ["x"], "article": ["x"]}
     ) as load_dataset:
-        load_calib_dataset("lambada")
+        load_calib_dataset(dataset_name)
 
-    assert load_dataset.call_args.args[0] == "lambada"
+    assert load_dataset.call_args.args[0] == dataset_name
