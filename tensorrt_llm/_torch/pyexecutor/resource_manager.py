@@ -19,8 +19,8 @@ import os
 from abc import ABC, abstractmethod
 from collections import OrderedDict, defaultdict, deque
 from dataclasses import dataclass
-from typing import (TYPE_CHECKING, Dict, Iterable, List, Optional, Set, Tuple,
-                    Union)
+from typing import (TYPE_CHECKING, Dict, Iterable, List, Optional, Sequence,
+                    Set, Tuple, Union)
 
 import torch
 from mpi4py import MPI
@@ -643,11 +643,19 @@ class KVCacheManager(BaseResourceManager):
             device='cpu')
         self.blocks_per_window = blocks_per_window
 
-    def probe_prefix_match_length(self, input_tokens, lora_task_id=None):
+    def probe_prefix_match_length(self,
+                                  input_tokens,
+                                  lora_task_id=None,
+                                  cache_salt=None):
         """Probe the KV cache radix tree for prefix match length.
 
         Returns the number of prefix tokens already cached on this rank.
         Used by KVCacheAwareADPRouter for cache-aware routing.
+
+        ``cache_salt`` scopes the probe to the same per-request
+        namespace that ``_create_kv_cache`` uses; without it, salted
+        requests would be probed against the salt=None namespace and the
+        router would see the wrong match length.
         """
         if not self.enable_block_reuse:
             return 0
@@ -664,12 +672,16 @@ class KVCacheManager(BaseResourceManager):
             LlmRequest as CppLlmRequest
         block_key = BlockKey(tokens=input_tokens, lora_task_id=lora_task_id)
         unique_tokens = block_key.unique_tokens
+        # buildBlockKeys() on the C++ side derives the salt id from
+        # cache_salt, so the dummy request must carry the same string used by
+        # the real create_kv_cache path.
         dummy_req = CppLlmRequest(request_id=0,
                                   max_new_tokens=0,
                                   input_tokens=input_tokens,
                                   sampling_config=SamplingConfig(),
                                   is_streaming=False,
-                                  lora_task_id=lora_task_id)
+                                  lora_task_id=lora_task_id,
+                                  cache_salt=cache_salt)
         summary = self.impl.analyze_prefix_reuse(unique_tokens, dummy_req)
         return summary.reusable_blocks_all * self.tokens_per_block
 
@@ -848,6 +860,7 @@ class KVCacheManager(BaseResourceManager):
         kv_reserve_draft_tokens: Optional[int] = None,
         use_mrope: bool = False,
         max_beam_width: int = 1,
+        encoder_output_lens: Optional[List[int]] = None,
         # For capturable drafting loops. During normal inference, the draft model always
         # has enough KV cache space to fit all of our draft tokens. During warmup, however,
         # we need to make the KV cache manager aware that multiple autoregressive steps will
@@ -881,9 +894,10 @@ class KVCacheManager(BaseResourceManager):
             # in _prepare_tp_inputs; need token_num >= 2 so that doesn't go negative.
             if self.mapping.has_cp_helix():
                 token_num = max(token_num, 2)
-            encoder_input_tokens = [
-                1
-            ] * token_num if self.impl.cross_kv else None
+            encoder_output_len = (encoder_output_lens[i]
+                                  if encoder_output_lens is not None else None)
+            encoder_input_tokens = ([1] * encoder_output_len
+                                    if encoder_output_len is not None else None)
             # Using 1 instead of 0 prevents NaN during warmup in e.g. Deepseek
             req = LlmRequest(request_id=req_id,
                              max_new_tokens=1,
@@ -891,7 +905,8 @@ class KVCacheManager(BaseResourceManager):
                              sampling_config=SamplingConfig(
                                  sampling_params._get_sampling_config()),
                              is_streaming=False,
-                             encoder_input_tokens=encoder_input_tokens)
+                             encoder_input_tokens=encoder_input_tokens,
+                             encoder_output_len=encoder_output_len)
             req.is_dummy_request = True
             req.paged_kv_block_ids = []
             if prepare_resource:
@@ -1326,6 +1341,7 @@ class KVCacheManager(BaseResourceManager):
         layer_idx: Optional[int] = None,
         window_size: Optional[int] = None,
         beam_width: Optional[int] = 1,
+        num_blocks_per_seq: Optional[Sequence[int]] = None,
     ) -> List[List[int]]:
         beam_width = beam_width or 1
         if window_size is None:
@@ -1349,6 +1365,8 @@ class KVCacheManager(BaseResourceManager):
             )
             result[i] = beams[
                 0] if beam_width == 1 else self._pack_beam_cache_indices(beams)
+            if num_blocks_per_seq is not None:
+                result[i] = result[i][:num_blocks_per_seq[i]]
         return result
 
     @staticmethod
@@ -2097,6 +2115,13 @@ class KVCacheManager(BaseResourceManager):
     def copy_batch_block_offsets(self, dst_tensor: torch.Tensor,
                                  request_ids: List[int], beam_width: int,
                                  num_context: int, num_seqs: int):
+        # Fill the persistent host buffer in place, exactly as before. CPU-side
+        # consumers read self.host_kv_cache_block_offsets directly and depend on
+        # its persistent, max_batch-sized layout: DSA sparse attention, the
+        # speculative-decoding draft/target swap, and the KV-cache relocation
+        # path. Reassigning this attribute to a per-call, num_seqs-sized buffer
+        # broke those readers (nvbug 6293536 regression), so it must stay the
+        # buffer they see.
         if self.kv_cache_type == CacheTypeCpp.CROSS and beam_width > 1:
             # This branch is reached only via attribute aliasing, never a
             # direct cross_kv_cache_manager.copy_batch_block_offsets(...) call:
@@ -2119,14 +2144,18 @@ class KVCacheManager(BaseResourceManager):
             # tensor whose rows are decoder-sequence scoped.
             self.impl.copy_batch_block_offsets(self.host_kv_cache_block_offsets,
                                                request_ids, 1, 0)
-            for pool_idx in range(self.host_kv_cache_block_offsets.shape[0]):
+            # Snapshot the rows this call reads into a fresh pinned buffer so the
+            # async H2D below has a private, immutable source (see the non-cross
+            # path for the full rationale).
+            num_rows = num_context + num_gen_requests
+            host_block_offsets = self._stage_block_offsets_for_copy(num_rows)
+            for pool_idx in range(self.num_pools):
                 if num_context > 0:
                     dst_tensor[pool_idx, :num_context].copy_(
-                        self.host_kv_cache_block_offsets[
-                            pool_idx, :num_context],
+                        host_block_offsets[pool_idx, :num_context],
                         non_blocking=True)
                 if num_gen_requests > 0:
-                    gen_block_offsets = self.host_kv_cache_block_offsets[
+                    gen_block_offsets = host_block_offsets[
                         pool_idx, num_context:num_context + num_gen_requests]
                     dst_tensor[pool_idx, num_context:num_seqs].copy_(
                         gen_block_offsets.repeat_interleave(beam_width, dim=0),
@@ -2139,10 +2168,36 @@ class KVCacheManager(BaseResourceManager):
                                            request_ids[num_context:],
                                            beam_width, num_context)
 
-        for pool_idx in range(self.host_kv_cache_block_offsets.shape[0]):
-            dst_tensor[pool_idx, :num_seqs].copy_(
-                self.host_kv_cache_block_offsets[pool_idx, :num_seqs],
-                non_blocking=True)
+        # The H2D copies below are asynchronous, so their source is read at copy
+        # execution time, not enqueue time. With the overlap scheduler the CPU
+        # runs an iteration ahead, so copying straight from the persistent buffer
+        # let the next iteration's in-place refill clobber the source of this
+        # iteration's still-pending H2D -> the attention kernel indexed another
+        # batch's blocks (nvbug 6293536; the window is widened when host
+        # offloading stalls the execution stream in front of the H2D). Stage the
+        # async copy through a freshly-allocated pinned buffer instead; the
+        # caching host allocator holds it until the consuming copy completes,
+        # matching the already-safe kv_lens / block_ids_per_seq staging. The
+        # persistent buffer above is untouched by this and stays valid for the
+        # synchronous CPU readers.
+        host_block_offsets = self._stage_block_offsets_for_copy(num_seqs)
+        for pool_idx in range(self.num_pools):
+            dst_tensor[pool_idx, :num_seqs].copy_(host_block_offsets[pool_idx],
+                                                  non_blocking=True)
+
+    def _stage_block_offsets_for_copy(self, num_rows: int) -> torch.Tensor:
+        """Snapshot the first ``num_rows`` rows of the persistent host block
+        offset buffer into a fresh pinned buffer, to serve as the private source
+        of an asynchronous H2D copy (nvbug 6293536)."""
+        host_block_offsets = torch.empty(self.num_pools,
+                                         num_rows,
+                                         2,
+                                         self.max_blocks_per_seq,
+                                         dtype=torch.int32,
+                                         pin_memory=prefer_pinned(),
+                                         device='cpu')
+        host_block_offsets.copy_(self.host_kv_cache_block_offsets[:, :num_rows])
+        return host_block_offsets
 
     def truncate_blocks(self, target_tokens: List[int],
                         num_tokens_to_keep: int):

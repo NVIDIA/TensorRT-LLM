@@ -577,16 +577,17 @@ trtllmGenGenerationPreprocess(torch::Tensor qkv_input, torch::Tensor workspace, 
     std::optional<torch::Tensor> host_kv_cache_pool_pointers, std::optional<torch::Tensor> host_kv_cache_pool_mapping,
     std::optional<torch::Tensor> kv_scale_orig_quant, std::optional<torch::Tensor> kv_scale_quant_orig,
     std::optional<torch::Tensor> attention_output_orig_quant, std::optional<torch::Tensor> rotary_inv_freq,
-    std::optional<torch::Tensor> rotary_cos_sin, int64_t const layer_idx, int64_t const seq_offset,
-    int64_t const num_heads, int64_t const num_kv_heads, int64_t const head_size, int64_t const tokens_per_block,
-    int64_t const kv_cache_quant_mode, int64_t const max_attention_window_size,
-    int64_t const cyclic_attention_window_size, int64_t const num_tokens, int64_t const batch_beam,
-    int64_t const input_seq_length, int64_t const max_past_kv_length, int64_t const rotary_embedding_dim,
-    double const rotary_embedding_base, int64_t const rotary_embedding_scale_type, double const rotary_embedding_scale,
-    int64_t const rotary_embedding_max_positions, int64_t const position_embedding_type, double const bmm1_scale,
-    double const bmm2_scale, bool const fp8_context_fmha, int64_t const predicted_tokens_per_seq,
-    int64_t const attention_chunk_size, int64_t const multi_processor_count, int64_t const total_num_blocks,
-    int64_t const kv_factor, bool const need_build_kv_cache_metadata, bool const cross_attention)
+    std::optional<torch::Tensor> rotary_cos_sin, std::optional<torch::Tensor> mrope_position_deltas,
+    int64_t const layer_idx, int64_t const seq_offset, int64_t const num_heads, int64_t const num_kv_heads,
+    int64_t const head_size, int64_t const tokens_per_block, int64_t const kv_cache_quant_mode,
+    int64_t const max_attention_window_size, int64_t const cyclic_attention_window_size, int64_t const num_tokens,
+    int64_t const batch_beam, int64_t const input_seq_length, int64_t const max_past_kv_length,
+    int64_t const rotary_embedding_dim, double const rotary_embedding_base, int64_t const rotary_embedding_scale_type,
+    double const rotary_embedding_scale, int64_t const rotary_embedding_max_positions,
+    int64_t const position_embedding_type, double const bmm1_scale, double const bmm2_scale,
+    bool const fp8_context_fmha, int64_t const predicted_tokens_per_seq, int64_t const attention_chunk_size,
+    int64_t const multi_processor_count, int64_t const total_num_blocks, int64_t const kv_factor,
+    bool const need_build_kv_cache_metadata, bool const cross_attention)
 {
     TORCH_CHECK(host_kv_cache_pool_pointers.has_value(), "host_kv_cache_pool_pointers is required.");
     TORCH_CHECK(host_kv_cache_pool_mapping.has_value(), "host_kv_cache_pool_mapping is required.");
@@ -701,7 +702,7 @@ trtllmGenGenerationPreprocess(torch::Tensor qkv_input, torch::Tensor workspace, 
         qkvParams.spec_decoding_position_offsets
             = isMultiTokenGen ? optPtr<int>(spec_decoding_position_offsets) : nullptr;
         qkvParams.mrope_rotary_cos_sin = nullptr;
-        qkvParams.mrope_position_deltas = nullptr;
+        qkvParams.mrope_position_deltas = optPtr<int>(mrope_position_deltas);
         qkvParams.batch_size = static_cast<int>(batch_beam);
         qkvParams.max_input_seq_len = static_cast<int>(input_seq_length);
         qkvParams.max_kv_seq_len = static_cast<int>(max_past_kv_length);

@@ -15,8 +15,8 @@ from tensorrt_llm._torch.disaggregation.resource.page import (
 def _make_buffer_entries():
     return np.array(
         [
-            (0, 0, 0, 128),  # local_layer_id=0, role=0(KEY), offset=0, size=128
-            (0, 1, 128, 128),  # local_layer_id=0, role=1(VALUE), offset=128, size=128
+            (0, 0, 128),  # local_layer_id=0, offset=0, size=128
+            (0, 128, 128),  # local_layer_id=0, offset=128, size=128
         ],
         dtype=BUFFER_ENTRY_DTYPE,
     )

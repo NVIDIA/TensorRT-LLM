@@ -774,11 +774,13 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
             layer_type="moe",
         )
 
-        # The shared expert is replicated (excluded from TP sharding), so all-reduce
-        # the sharded routed-expert output first, then add the replicated shared
-        # output; adding before would scale it by the TP world size.
-        expert_output = torch.ops.auto_deploy.all_reduce(expert_output, layer_type="moe")
+        # Single merge-point all_reduce for routed + shared partial sums.
+        # Both branches produce per-rank partial outputs under TP/EP sharding
+        # (routed: MoEShardableNode; shared: rowwise down_proj inside the MLP).
+        # One reduction on the sum lifts both to full; reducing before the add
+        # would mix a full routed contribution with an unreduced shared one.
         expert_output = expert_output + shared_expert_output
+        expert_output = torch.ops.auto_deploy.all_reduce(expert_output, layer_type="moe")
 
         expert_output = expert_output.reshape(batch_size, sequence_length, hidden_dim)
         return expert_output

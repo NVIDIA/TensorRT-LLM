@@ -300,11 +300,25 @@ class DecoderModel(nn.Module, metaclass=PPInitCaller):
                 skip_forward(module)
 
         num_hidden_layers = self.model_config.pretrained_config.num_hidden_layers
-        assert num_hidden_layers >= mapping.pp_size, f"{num_hidden_layers} layers are not enough for PP{mapping.pp_size}"
+        assert num_hidden_layers >= mapping.pp_size, (
+            f"{num_hidden_layers} layers are not enough for PP{mapping.pp_size}"
+        )
+
         pp_layer_list = mapping.pp_layers(num_hidden_layers)
+        total_num_layers = num_hidden_layers
+        spec_config = getattr(self.model_config, "spec_config", None)
+        if spec_config is not None:
+            from ..speculative.utils import get_num_spec_layers
+
+            num_spec_layers = get_num_spec_layers(spec_config) or 0
+            total_num_layers += num_spec_layers
+            if num_spec_layers > 0 and mapping.is_last_pp_rank():
+                pp_layer_list.extend(
+                    range(total_num_layers - num_spec_layers, total_num_layers))
+        if len(pp_layer_list) == 0:
+            pp_layer_list.append(0)
         has_pp_layer = len(pp_layer_list) > 0
-        for layer_idx in range(num_hidden_layers):
-            layer = self.layers[layer_idx]
+        for layer_idx, layer in enumerate(self.layers[:num_hidden_layers]):
             is_last_layer = (layer_idx == num_hidden_layers - 1)
             if layer_idx not in pp_layer_list:
                 # keep next layer's input_layernorm's weights for fusion
@@ -376,8 +390,6 @@ class DecoderModelForCausalLM(nn.Module,
                 dtype=config.pretrained_config.torch_dtype,
             )
         else:
-            # TODO(zhenhuanc): Currently lm_head Linear will not accept QuantConfig
-            # will considering per layer QuantConfig in the future.
             if (hasattr(config, 'lora_config')
                     and config.lora_config is not None
                     and len(config.lora_config.lora_dir) == 1):
@@ -389,6 +401,30 @@ class DecoderModelForCausalLM(nn.Module,
                         self.has_custom_lm_head = True
                         vocab_size = lora_loader.vocab_size
 
+            # Per-layer quant entry for lm_head (e.g. ModelOpt MIXED_PRECISION
+            # checkpoints that quantize lm_head to NVFP4). Model-specific
+            # config normalizers opt in by keeping/synthesizing this entry;
+            # exclude_modules still wins.
+            lm_head_quant_config = None
+            if not self.has_custom_lm_head and config.quant_config_dict is not None:
+                lm_head_quant_config = config.quant_config_dict.get("lm_head")
+                if (lm_head_quant_config is not None
+                        and config.quant_config is not None
+                        and config.quant_config.
+                        is_module_excluded_from_quantization("lm_head")):
+                    lm_head_quant_config = None
+                if (lm_head_quant_config is not None
+                        and getattr(config.pretrained_config,
+                                    'tie_word_embeddings', False)):
+                    # Tied embeddings replace lm_head.weight with the dense
+                    # bf16 embedding weight below, which would silently clash
+                    # with a quantized (packed) weight and its quant method.
+                    logger.info(
+                        "Ignoring lm_head quant entry: tie_word_embeddings "
+                        "shares the dense embedding weight, so lm_head stays "
+                        "unquantized")
+                    lm_head_quant_config = None
+
             self.lm_head = LMHead(
                 vocab_size,
                 hidden_size,
@@ -399,6 +435,7 @@ class DecoderModelForCausalLM(nn.Module,
                 reduce_output=False,
                 use_custom_cublas_mm=getattr(model, 'use_custom_cublas_mm',
                                              False),
+                quant_config=lm_head_quant_config,
             )
 
             if self.has_custom_lm_head:
@@ -828,6 +865,7 @@ def get_config_loader(name: str) -> Type["BaseConfigLoader"]:
 _GEMMA4_ARCHITECTURES = (
     "Gemma4ForCausalLM",
     "Gemma4ForConditionalGeneration",
+    "Gemma4UnifiedForConditionalGeneration",
 )
 
 

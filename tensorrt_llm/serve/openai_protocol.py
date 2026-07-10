@@ -38,6 +38,7 @@ from typing_extensions import Annotated, Required, TypeAlias, TypedDict
 
 from tensorrt_llm.executor.request import LoRARequest
 from tensorrt_llm.inputs.media_io import MediaModality
+from tensorrt_llm.llmapi import ConversationParams as LlmConversationParams
 from tensorrt_llm.llmapi import DisaggregatedParams as LlmDisaggregatedParams
 from tensorrt_llm.llmapi import (DisaggScheduleStyle, GuidedDecodingParams,
                                  SamplingParams)
@@ -170,6 +171,28 @@ class DisaggregatedParams(OpenAIBaseModel):
     # encoder embedding handles, multimodal hashes, and optional mRoPE handles.
     # Add them here and in to_disaggregated_params()/to_llm_disaggregated_params()
     # before routing MM encoder -> context -> generation through OpenAI protocol.
+    # Orchestrator -> context-worker instruction: return prompt_token_ids as a
+    # base64 int32 buffer (prompt_token_ids_b64) instead of a JSON int array.
+    return_prompt_token_ids_b64: bool = False
+
+
+class ConversationParams(OpenAIBaseModel):
+    model_config = ConfigDict(extra="forbid",
+                              populate_by_name=True,
+                              validate_assignment=True)
+
+    conversation_id: str = Field(
+        description=("Stable multi-turn conversation id used for routing"), )
+
+    @field_validator("conversation_id", mode="before")
+    @classmethod
+    def validate_conversation_id(cls, value: Any) -> str:
+        if value is None:
+            raise ValueError("conversation_id must be non-empty")
+        conversation_id = str(value).strip()
+        if not conversation_id:
+            raise ValueError("conversation_id must be non-empty")
+        return conversation_id
 
 
 class ErrorResponse(OpenAIBaseModel):
@@ -429,6 +452,10 @@ class CompletionRequest(OpenAIBaseModel):
         default=None,
         description=("Parameters for disaggregated serving"),
     )
+    conversation_params: Optional[ConversationParams] = Field(
+        default=None,
+        description=("Parameters for multi-turn conversation routing"),
+    )
 
     # doc: end-completion-extra-params
 
@@ -637,6 +664,9 @@ class ChatCompletionResponse(OpenAIBaseModel):
     # Add prompt_tokens_ids to the response to remove the tokenization
     # in the generation server in disaggreated serving
     prompt_token_ids: Optional[List[int]] = None
+    # base64 int32 buffer alternative to prompt_token_ids; set by the context
+    # worker so the orchestrator can relay a string instead of the int list.
+    prompt_token_ids_b64: Optional[str] = None
 
 
 class DeltaMessage(OpenAIBaseModel):
@@ -694,6 +724,9 @@ class ChatCompletionRequest(OpenAIBaseModel):
     # Add prompt_tokens_ids to the request to remove the tokenization
     # in the generation server in disaggreated serving
     prompt_token_ids: Optional[List[int]] = None
+    # base64 int32 buffer relayed by the orchestrator from the ctx response;
+    # decoded back to prompt_token_ids on the generation worker. Not for clients.
+    prompt_token_ids_b64: Optional[str] = None
     model: str
     frequency_penalty: Optional[float] = 0.0
     logit_bias: Optional[Dict[str, float]] = None
@@ -806,6 +839,10 @@ class ChatCompletionRequest(OpenAIBaseModel):
     disaggregated_params: Optional[DisaggregatedParams] = Field(
         default=None,
         description=("Parameters for disaggregated serving"),
+    )
+    conversation_params: Optional[ConversationParams] = Field(
+        default=None,
+        description=("Parameters for multi-turn conversation routing"),
     )
 
     cache_salt: Optional[str] = Field(
@@ -1329,6 +1366,7 @@ def to_disaggregated_params(
         ctx_info_endpoint=tllm_disagg_params.ctx_info_endpoint,
         schedule_style=tllm_disagg_params.schedule_style,
         ctx_usage=ctx_usage,
+        conversation_id=tllm_disagg_params.conversation_id,
     )
 
 
@@ -1353,7 +1391,17 @@ def to_llm_disaggregated_params(
         ctx_info_endpoint=disaggregated_params.ctx_info_endpoint,
         schedule_style=disaggregated_params.schedule_style,
         ctx_usage=None if ctx_usage is None else ctx_usage.model_dump(),
+        conversation_id=disaggregated_params.conversation_id,
     )
+
+
+def to_llm_conversation_params(
+    conversation_params: Optional[ConversationParams]
+) -> Optional[LlmConversationParams]:
+    if conversation_params is None:
+        return None
+    return LlmConversationParams(
+        conversation_id=conversation_params.conversation_id)
 
 
 # ============================================================================

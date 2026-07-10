@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.
+# Copyright (c) 2025-2026, NVIDIA CORPORATION.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -150,6 +150,7 @@ class DisaggPerfMetricsCollector:
         self._request_meteics = deque(maxlen=max_requests)
         self._server_metrics = defaultdict(dict)
         self._lock = asyncio.Lock()
+        self._collect_lock = asyncio.Lock()
         self._clients = []
         self._metrics = {
             definition.name: instance_metric(definition)
@@ -182,58 +183,60 @@ class DisaggPerfMetricsCollector:
             )
 
     async def get_perf_metrics(self) -> List[Dict[str, Any]]:
-        perf_metrics = {}
-        for client in self._clients:
-            metrics_dict = await client.collect_metrics()
-            perf_metrics.update(metrics_dict)
+        async with self._collect_lock:
+            perf_metrics = {}
+            for client in self._clients:
+                metrics_dict = await client.collect_metrics()
+                perf_metrics.update(metrics_dict)
 
-        return_metrics = []
-        async with self._lock:
-            for server, metrics_data in perf_metrics.items():
-                server_metrics = self._server_metrics[server]
-                # avoid metrics map inflation by limiting the number of requests to add
-                available_req_num = min(
-                    max(0, self._max_requests - len(server_metrics)), len(metrics_data)
-                )
-                req_metrics_map = {
-                    req_metrics["ctx_request_id"]: req_metrics
-                    for req_metrics in metrics_data[:available_req_num]
-                    if "ctx_request_id" in req_metrics
-                }
-                server_metrics.update(req_metrics_map)
-
-            remain_keys = []
-            for (
-                ctx_server,
-                gen_server,
-                ctx_request_id,
-                server_arrival_time,
-                server_first_token_time,
-            ) in self._request_meteics:
-                gen_perf_metrics = self._server_metrics[gen_server].pop(ctx_request_id, None)
-                if gen_perf_metrics is None:
-                    # generation not finished
-                    remain_keys.append(
-                        (
-                            ctx_server,
-                            gen_server,
-                            ctx_request_id,
-                            server_arrival_time,
-                            server_first_token_time,
-                        )
+            return_metrics = []
+            async with self._lock:
+                for server, metrics_data in perf_metrics.items():
+                    server_metrics = self._server_metrics[server]
+                    # avoid metrics map inflation by limiting the number of requests to add
+                    available_req_num = min(
+                        max(0, self._max_requests - len(server_metrics)),
+                        len(metrics_data),
                     )
-                    continue
-                ctx_perf_metrics = self._server_metrics[ctx_server].pop(ctx_request_id, None)
-                # TODO: strip the keys for less repeating and use table style response
-                return_metrics.append(
-                    {
-                        "ctx_server": ctx_server,
-                        "gen_server": gen_server,
-                        "disagg_server_arrival_time": server_arrival_time,
-                        "disagg_server_first_token_time": server_first_token_time,
-                        "ctx_perf_metrics": ctx_perf_metrics,
-                        "gen_perf_metrics": gen_perf_metrics,
+                    req_metrics_map = {
+                        req_metrics["ctx_request_id"]: req_metrics
+                        for req_metrics in metrics_data[:available_req_num]
+                        if "ctx_request_id" in req_metrics
                     }
-                )
-            self._request_meteics = deque(remain_keys, maxlen=self._max_requests)
-        return return_metrics
+                    server_metrics.update(req_metrics_map)
+
+                remain_keys = []
+                for (
+                    ctx_server,
+                    gen_server,
+                    ctx_request_id,
+                    server_arrival_time,
+                    server_first_token_time,
+                ) in self._request_meteics:
+                    gen_perf_metrics = self._server_metrics[gen_server].pop(ctx_request_id, None)
+                    if gen_perf_metrics is None:
+                        # generation not finished
+                        remain_keys.append(
+                            (
+                                ctx_server,
+                                gen_server,
+                                ctx_request_id,
+                                server_arrival_time,
+                                server_first_token_time,
+                            )
+                        )
+                        continue
+                    ctx_perf_metrics = self._server_metrics[ctx_server].pop(ctx_request_id, None)
+                    # TODO: strip the keys for less repeating and use table style response
+                    return_metrics.append(
+                        {
+                            "ctx_server": ctx_server,
+                            "gen_server": gen_server,
+                            "disagg_server_arrival_time": server_arrival_time,
+                            "disagg_server_first_token_time": server_first_token_time,
+                            "ctx_perf_metrics": ctx_perf_metrics,
+                            "gen_perf_metrics": gen_perf_metrics,
+                        }
+                    )
+                self._request_meteics = deque(remain_keys, maxlen=self._max_requests)
+            return return_metrics

@@ -97,6 +97,14 @@ class DisaggServerConfig():
     schedule_style: Literal['context_first',
                             'generation_first'] = 'context_first'
     allow_request_chat_template: bool = False
+    # Drop conversation history from generation_only requests to shrink the gen
+    # worker's request body / JSON-parse GIL cost at high concurrency. Enable
+    # ONLY for text-only, non-harmony deployments (see _get_gen_request).
+    gen_strip_message_history: bool = False
+    # Ask context workers to return prompt_token_ids as a base64 int32 buffer so
+    # the orchestrator relays a string instead of materializing the token-id list
+    # on its event loop. Text-only, non-harmony deployments (see _get_ctx_request).
+    gen_tokids_ctxbytes: bool = False
 
 
 @dataclass
@@ -181,6 +189,8 @@ def extract_disagg_cfg(hostname: str = 'localhost',
                            'context_first',
                            'generation_first'] = 'context_first',
                        allow_request_chat_template: bool = False,
+                       gen_strip_message_history: bool = False,
+                       gen_tokids_ctxbytes: bool = False,
                        **kwargs: Any) -> DisaggServerConfig:
     context_servers = context_servers or {}
     generation_servers = generation_servers or {}
@@ -230,6 +240,8 @@ def extract_disagg_cfg(hostname: str = 'localhost',
         config.schedule_style = schedule_style
     config.allow_request_chat_template = validate_config_bool(
         allow_request_chat_template, "allow_request_chat_template")
+    config.gen_strip_message_history = gen_strip_message_history
+    config.gen_tokids_ctxbytes = gen_tokids_ctxbytes
     return config
 
 
@@ -286,6 +298,13 @@ def extract_router_config(server_cfg: dict) -> RouterConfig:
     for key in extract_keys:
         if key in server_cfg:
             args[key] = server_cfg[key]
+
+    # tokens_per_block lives under kv_cache_config; the cache-aware router must
+    # use the same block size as the worker or block hashes never match. Carry
+    # the explicit server value over unless the router block already set it.
+    kv_cache_config = server_cfg.get("kv_cache_config") or {}
+    if "tokens_per_block" not in args and "tokens_per_block" in kv_cache_config:
+        args["tokens_per_block"] = kv_cache_config["tokens_per_block"]
 
     return RouterConfig(type=router_type, args=args)
 

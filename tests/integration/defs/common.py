@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -1212,16 +1212,20 @@ def get_free_port_in_ci(max_attempts=100):
     """
     global PORTS_IN_USE
 
+    pid = os.getpid()
     container_port_start = int(os.environ.get("CONTAINER_PORT_START", -1))
     container_port_num = int(os.environ.get("CONTAINER_PORT_NUM", -1))
     if container_port_start != -1 and container_port_num != -1:
+        port_range = (container_port_start,
+                      container_port_start + container_port_num - 1)
         available_ports = [
             port for port in range(container_port_start, container_port_start +
                                    container_port_num)
             if port not in PORTS_IN_USE
         ]
+        num_candidates = len(available_ports)
 
-        for _ in range(len(available_ports)):
+        for attempt in range(1, num_candidates + 1):
             # Get a random port from the available ports
             port = random.choice(available_ports)
 
@@ -1230,16 +1234,35 @@ def get_free_port_in_ci(max_attempts=100):
                 try:
                     s.bind(("localhost", port))
                     PORTS_IN_USE.add(port)
+                    print_info(
+                        f"[get_free_port_in_ci] pid={pid} allocated port={port} "
+                        f"from CI range {port_range} after {attempt} attempt(s); "
+                        f"{len(PORTS_IN_USE)} reserved in-process. The probe "
+                        f"socket is now closed, so another process may take the "
+                        f"port before the caller rebinds it (TOCTOU).")
                     return port
-                except OSError:
+                except OSError as e:
+                    print_info(
+                        f"[get_free_port_in_ci] pid={pid} candidate port={port} "
+                        f"in CI range {port_range} is busy ({e}); trying another."
+                    )
                     available_ports.remove(port)
                     continue
+
+        print_warning(
+            f"[get_free_port_in_ci] pid={pid} exhausted all {num_candidates} "
+            f"candidate ports in CI range {port_range}; falling back to a "
+            f"system-assigned ephemeral port.")
 
     # No port found in the range, try to get a random free port from the system
     for _ in range(max_attempts):
         port = get_free_port()
         if port not in PORTS_IN_USE:
             PORTS_IN_USE.add(port)
+            print_info(
+                f"[get_free_port_in_ci] pid={pid} allocated system ephemeral "
+                f"port={port}; {len(PORTS_IN_USE)} reserved in-process. Another "
+                f"process may take it before the caller rebinds it (TOCTOU).")
             return port
 
     raise Exception(

@@ -216,6 +216,35 @@ def fmin(a: Union[float, cutlass.Float32],
         ))
 
 
+@dsl_user_op
+def fclip_xorsign(a: Union[float, cutlass.Float32],
+                  limit: Union[float, cutlass.Float32],
+                  *,
+                  loc=None,
+                  ip=None) -> cutlass.Float32:
+    """Symmetric clip.
+
+    Emits PTX ``min.xorsign.abs.f32`` with semantics
+    ``d = sign(a XOR limit) * min(|a|, |limit|)``.
+    When ``limit > 0`` this equals ``clip(a, -limit, +limit)``.
+
+    Requires sm_86+.
+    """
+    return cutlass.Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [
+                cutlass.Float32(a).ir_value(loc=loc, ip=ip),
+                cutlass.Float32(limit).ir_value(loc=loc, ip=ip),
+            ],
+            "min.xorsign.abs.f32 $0, $1, $2;",
+            "=f,f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        ))
+
+
 def sigmoid_f32(a: Union[float, cutlass.Float32],
                 fastmath: bool = False) -> Union[float, cutlass.Float32]:
     """
@@ -230,6 +259,22 @@ def silu_f32(a: Union[float, cutlass.Float32],
     Compute the silu of the input tensor.
     """
     return a * sigmoid_f32(a, fastmath=fastmath)
+
+
+def gelu_tanh_f32(a: Union[float, cutlass.Float32],
+                  fastmath: bool = False) -> Union[float, cutlass.Float32]:
+    """
+    Compute the tanh approximation of GELU (matches F.gelu(approximate="tanh")).
+
+    gelu(a) = 0.5 * a * (1 + tanh(c * (a + 0.044715 * a^3))),  c = sqrt(2/pi)
+            = a * sigmoid(2c * (a + 0.044715 * a^3))
+
+    using the identity tanh(z) = 2 * sigmoid(2z) - 1, so the activation reuses
+    the same exp2-based sigmoid as silu_f32.
+    """
+    c2 = 1.5957691216057308  # 2 * sqrt(2/pi)
+    inner = c2 * (a + 0.044715 * a * a * a)
+    return a * sigmoid_f32(inner, fastmath=fastmath)
 
 
 # TODO(zhichenj): try to move these to NVVM wrapper or helper functions

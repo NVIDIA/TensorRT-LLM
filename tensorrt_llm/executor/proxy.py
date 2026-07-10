@@ -49,22 +49,40 @@ __all__ = [
     "GenerationExecutorProxy",
 ]
 
+# Methods that are explicitly implemented for multi-rank MPI/IPC executor
+# deployments and may be called via collective_rpc even when world_size > 1.
+# sleep() and wakeup() coordinate across all ranks via a dedicated control
+# communicator started in PyExecutor.start_worker(); rank-0 is the entry
+# point, so routing through the rank-0 RPC shim is correct.
+_MULTI_RANK_ALLOWED_METHODS: frozenset[str] = frozenset({"sleep", "wakeup"})
+
 
 def _check_collective_rpc_guard(
     model_world_size: int,
     unique_reply_rank: Optional[int],
     target_ranks: Optional[Union[int, List[int]]],
+    method: str = "",
 ) -> None:
     """Validate collective_rpc preconditions shared by IPC and RPC proxies.
 
+    Args:
+        model_world_size: Total number of GPU worker processes.
+        unique_reply_rank: Must be ``None`` for this shim.
+        target_ranks: Must be ``None`` for this shim.
+        method: Name of the method being invoked; used to allow selected
+            multi-rank-capable methods past the world_size guard.
+
     Raises:
-        NotImplementedError: If ``model_world_size > 1``, or if
+        NotImplementedError: If ``model_world_size > 1`` and ``method`` is not
+            in :data:`_MULTI_RANK_ALLOWED_METHODS`, or if
             ``unique_reply_rank`` or ``target_ranks`` are provided.
     """
-    if model_world_size > 1:
+    if model_world_size > 1 and method not in _MULTI_RANK_ALLOWED_METHODS:
         raise NotImplementedError(
-            "MPI collective_rpc only supports model_world_size == 1; "
-            "use the Ray executor for multi-rank deployments.")
+            f"MPI collective_rpc does not support model_world_size > 1 for "
+            f"method '{method}'; use the Ray executor for general multi-rank "
+            "deployments, or use sleep()/wakeup() which handle multi-rank "
+            "coordination internally.")
     if unique_reply_rank is not None or target_ranks is not None:
         raise NotImplementedError(
             "unique_reply_rank and target_ranks are not supported; "
@@ -327,7 +345,14 @@ class GenerationExecutorProxy(GenerationExecutor):
             nonlocal event_loop
             nonlocal async_queues
 
-            queue = self._results[client_id].queue
+            # The result may already be finalized and popped below — e.g. a
+            # `terminate` verdict sent a final Output while the
+            # engine still has in-flight responses (abort is async). Drop such
+            # late responses instead of crashing with a KeyError.
+            result = self._results.get(client_id)
+            if result is None:
+                return
+            queue = result.queue
             if isinstance(queue, _SyncQueue):
                 queue.put_nowait(res)
                 async_queues.append(queue)
@@ -342,7 +367,7 @@ class GenerationExecutorProxy(GenerationExecutor):
                     res,
                     ErrorResponse) or (isinstance(res, PostprocWorker.Output)
                                        and res.is_final):
-                self._results.pop(client_id)
+                self._results.pop(client_id, None)
 
         res = res if isinstance(res, list) else [res]
 
@@ -566,10 +591,13 @@ class GenerationExecutorProxy(GenerationExecutor):
     ) -> List:
         """Execute a method call on the rank-0 GPU worker via the RPC client.
 
-        Rank-0-only shim; only ``model_world_size == 1`` is supported.
-        Shares the :meth:`RayExecutor.collective_rpc` signature for uniform
-        dispatch from :meth:`~tensorrt_llm.llmapi.llm.LLM._collective_rpc`,
-        but does not broadcast to all workers.
+        Rank-0 RPC shim used for uniform dispatch from
+        :meth:`~tensorrt_llm.llmapi.llm.LLM._collective_rpc`.  Most methods
+        require ``model_world_size == 1``; ``sleep`` and ``wakeup`` are
+        explicitly allowed for multi-rank deployments because
+        :meth:`~tensorrt_llm.executor.base_worker.BaseWorker.sleep` and
+        :meth:`~tensorrt_llm.executor.base_worker.BaseWorker.wakeup` handle
+        cross-rank coordination internally via the control communicator.
 
         Args:
             method: Name of the worker method to invoke.
@@ -586,15 +614,19 @@ class GenerationExecutorProxy(GenerationExecutor):
 
         Raises:
             RuntimeError: If the RPC client has not been initialised yet.
-            NotImplementedError: If ``model_world_size > 1``, or if
-                ``unique_reply_rank`` or ``target_ranks`` are provided.
+            NotImplementedError: If ``model_world_size > 1`` and the method
+                is not in the allowed-methods set (currently ``sleep`` and
+                ``wakeup``), or if ``unique_reply_rank`` or ``target_ranks``
+                are provided.
         """
         if self.rpc_client is None:
             raise RuntimeError(
                 "RPC client is not initialised — collective_rpc() cannot be "
                 "called before the executor workers have started.")
-        _check_collective_rpc_guard(self.model_world_size, unique_reply_rank,
-                                    target_ranks)
+        _check_collective_rpc_guard(self.model_world_size,
+                                    unique_reply_rank,
+                                    target_ranks,
+                                    method=method)
         kwargs = kwargs or {}
         remote_call = getattr(self.rpc_client, method)(*args, **kwargs)
         if non_block:
@@ -616,6 +648,22 @@ class GenerationExecutorProxy(GenerationExecutor):
 
         stats = self.rpc_client.fetch_stats_wait_async(timeout=timeout).remote()
         return [json.loads(s) if isinstance(s, str) else s for s in stats]
+
+    def get_kv_cache_capacity(self) -> dict:
+        """Get static primary/GPU KV cache capacity from the runtime via RPC."""
+        if self.rpc_client is None:
+            logger.warning(
+                "RPC client not initialized, cannot get kv cache capacity")
+            return {}
+
+        try:
+            capacity = self.rpc_client.fetch_kv_cache_capacity_async().remote()
+            if isinstance(capacity, str):
+                capacity = json.loads(capacity)
+            return capacity if isinstance(capacity, dict) else {}
+        except (RPCError, json.JSONDecodeError) as e:
+            logger.debug(f"Error fetching kv cache capacity via RPC: {e}")
+            return {}
 
     def get_disaggregated_params(self) -> dict:
         """Get disaggregated params from worker runtime via RPC."""

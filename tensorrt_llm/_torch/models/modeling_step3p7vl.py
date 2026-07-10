@@ -56,6 +56,7 @@ from ..modules.layer_norm import LayerNorm
 from ..modules.linear import Linear
 from ..modules.mlp import MLP
 from ..speculative import SpecMetadata
+from .modeling_multimodal_encoder import MultimodalEncoderMixin
 from .modeling_multimodal_utils import (
     _is_mm_disagg,
     find_input_mm_embeds,
@@ -445,7 +446,7 @@ class Step3VisionTransformer(nn.Module):
         return hidden_states
 
 
-class Step3p7VisionEncoder(nn.Module):
+class Step3p7VisionEncoder(nn.Module, MultimodalEncoderMixin):
     """Perception-Encoder vision tower (``vision_model.*`` checkpoint subtree).
 
     HF carries two trailing Conv2d downsamplers inside the same module
@@ -570,23 +571,19 @@ class Step3p7VisionEncoder(nn.Module):
         self.to(dtype)
         self._dtype = dtype
 
-        # Context-only attention metadata (no KV cache); rebuilt lazily when a
-        # batch needs more token capacity than the current allocation.
-        self._metadata_cls = get_attention_backend(model_config.attn_backend).Metadata
-        self._attn_metadata: Optional[AttentionMetadata] = None
-        self._attn_metadata_capacity = 0
+        # Context-only attention metadata (kv_cache_manager=None) built by the
+        # engine via ``MultimodalEncoderMixin.setup_attn_metadata`` at the
+        # encoder budget; filled per forward by ``_prepare_attn_metadata``.
+        self.metadata_cls = get_attention_backend(model_config.attn_backend).Metadata
+        self.attn_metadata: Optional[AttentionMetadata] = None
 
     def _prepare_attn_metadata(self, seq_lens: List[int]) -> AttentionMetadata:
-        total_tokens = int(sum(seq_lens))
-        if self._attn_metadata is None or total_tokens > self._attn_metadata_capacity:
-            capacity = max(total_tokens, 8192)
-            self._attn_metadata = self._metadata_cls(
-                max_num_requests=8192,
-                max_num_tokens=capacity,
-                kv_cache_manager=None,
+        md = self.attn_metadata
+        if md is None:
+            raise RuntimeError(
+                "Vision encoder AttentionMetadata is not initialized. "
+                "It must be set up before the encoder forward runs."
             )
-            self._attn_metadata_capacity = capacity
-        md = self._attn_metadata
         batch_size = len(seq_lens)
         md.num_contexts = batch_size
         md.request_ids = list(range(1, batch_size + 1))

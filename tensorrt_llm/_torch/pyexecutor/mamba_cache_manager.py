@@ -725,6 +725,7 @@ class PythonMambaCacheManager(BaseResourceManager):
         return (CUDA_GRAPH_DUMMY_REQUEST_ID - max_dl <= request_id <=
                 CUDA_GRAPH_DUMMY_REQUEST_ID)
 
+    @torch.inference_mode()
     def add_dummy_requests(self, request_ids: List[int], **kwargs):
         # Sentinels alias to the shared _padding_slot; non-sentinel
         # dummies (warmup, attention-DP idle padding) get their own
@@ -1804,6 +1805,7 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         kv_reserve_draft_tokens: Optional[int] = None,
         use_mrope: bool = False,
         max_beam_width: int = 1,
+        encoder_output_lens: Optional[List[int]] = None,
         # For capturable drafting loops. During normal inference, the draft model always
         # has enough KV cache space to fit all of our draft tokens. During warmup, however,
         # we need to make the KV cache manager aware that multiple autoregressive steps will
@@ -1820,6 +1822,7 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
             kv_reserve_draft_tokens=kv_reserve_draft_tokens,
             use_mrope=use_mrope,
             max_beam_width=max_beam_width,
+            encoder_output_lens=encoder_output_lens,
             num_extra_decoding_steps=num_extra_decoding_steps,
             draft_kv_cache_manager=draft_kv_cache_manager,
         )
