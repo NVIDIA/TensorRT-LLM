@@ -205,12 +205,19 @@ class Gemma4HfWeightMapper(HfWeightMapper):
         HF stores MoE as 3D tensors:
           experts.gate_up_proj [E, 2*I, H] → per-expert {id}.w1.weight + {id}.w3.weight
           experts.down_proj    [E, H, I]   → per-expert {id}.w2.weight
+        ModelOpt NVFP4 checkpoints store already-split per-expert tensors:
+          experts.{id}.{gate,up,down}_proj.{field} → moe.experts.{id}.{w1,w3,w2}.{field}
           router.per_expert_scale          → moe.per_expert_scale
           router.*                         → moe.router.*
 
         Paths are also adjusted: layers.N.{experts,router} → layers.N.moe.{...}
         """
         _layer_re = r"((?:model\.|language_model\.model\.)?layers\.\d+)\."
+        expert_projection_map = {
+            "gate_proj": "w1",
+            "up_proj": "w3",
+            "down_proj": "w2",
+        }
         remapped = {}
         for key, val in weights.items():
             # per_expert_scale: HF router.per_expert_scale → TRT moe.per_expert_scale
@@ -218,6 +225,18 @@ class Gemma4HfWeightMapper(HfWeightMapper):
             if m_pes:
                 prefix = m_pes.group(1)
                 remapped[f"{prefix}.moe.per_expert_scale"] = val
+                continue
+
+            # ModelOpt NVFP4 per-expert layout. Preserve the field suffix so
+            # weight, weight_scale, input_scale, and weight_scale_2 all map.
+            m_expert = re.match(
+                _layer_re + r"experts\.(\d+)\.(gate_proj|up_proj|down_proj)\.(.+)$", key
+            )
+            if m_expert:
+                prefix, expert_id, projection, field = m_expert.groups()
+                remapped[
+                    f"{prefix}.moe.experts.{expert_id}.{expert_projection_map[projection]}.{field}"
+                ] = val
                 continue
 
             # experts.gate_up_proj [E, 2*I, H] → per-expert w1 + w3
@@ -244,6 +263,9 @@ class Gemma4HfWeightMapper(HfWeightMapper):
                 new_key = re.sub(_layer_re + r"router\.", r"\1.moe.router.", key)
                 remapped[new_key] = val
                 continue
+
+            if re.match(_layer_re + r"experts\.", key):
+                raise ValueError(f"Unsupported Gemma4 expert checkpoint tensor: {key}")
 
             # Non-MoE key: pass through
             remapped[key] = val
