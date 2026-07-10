@@ -22,7 +22,7 @@ The checkpoint loading design is built around a plugin-like architecture that is
 - **Checkpoint Loaders**: Orchestrate the loading process for specific formats
 - **Config Loaders**: Handle model configuration parsing and validation
 - **Weight Loaders**: Manage the actual loading of model weights from storage into memory
-- **Weight Mappers**: Map and transform loaded weights to TensorRT LLM model's definition
+- **Weight Mappers**: Map and transform loaded weights to TensorRT-LLM model's definition
 
 This modular design allows for easy extension to support new checkpoint formats while maintaining backward compatibility and performance optimizations. By separating the checkpoint loading components into four different subcomponents, any user can employ any relevant previous work while also introducing their own custom checkpoint-specific components.
 
@@ -91,7 +91,7 @@ Currently, HF checkpoint loader is the primary built-in format, supporting:
 
 ## Distributing checkpoints and engine artifacts from object storage
 
-TensorRT LLM reads checkpoints and engines from a local directory and does
+TensorRT-LLM reads checkpoints and engines from a local directory and does
 not include an object-store client. To distribute artifacts across a GPU
 fleet you stage them in object storage and pull them onto each serving node
 with standard S3 tooling. This suits object storage that exposes the Amazon
@@ -168,6 +168,8 @@ LOCAL_DIR="${TRTLLM_MODEL_CACHE}/${S3_PREFIX}"
 aws s3 sync "s3://${S3_BUCKET_NAME}/${S3_PREFIX}" \
     "$LOCAL_DIR" "${S3_ENDPOINT_ARGS[@]}"
 
+# Engine directories use the TensorRT backend. For checkpoint directories,
+# omit --backend tensorrt so trtllm-serve uses the PyTorch backend.
 trtllm-serve "$LOCAL_DIR" --backend tensorrt --host 0.0.0.0 --port 8000
 ```
 
@@ -235,9 +237,9 @@ llm = LLM(model=str(LOCAL_DIR))
   across GPU SKU, driver, or TensorRT version. Encode those values in the
   object prefix (for example, `engines/<model>/<gpu>/<precision>/`) so a node
   never loads an engine built for a different configuration.
-- **Multipart transfers.** The default `boto3` and `aws` CLI transfer config
-  issues multipart requests, which suits the large `.safetensors` checkpoint
-  shards and `rank*.engine` files typical of LLM artifacts.
+- **Multipart transfers.** The default `boto3` and `aws` CLI transfer
+  configuration uses multipart requests, which suits the large `.safetensors`
+  checkpoint shards and `rank*.engine` files typical of LLM artifacts.
 - **Local cache reuse.** Mount `TRTLLM_MODEL_CACHE` on persistent storage so a
   cold pull happens once per node rather than once per pod restart.
 - **Custom weight loader.** To stream checkpoint weights directly from the
