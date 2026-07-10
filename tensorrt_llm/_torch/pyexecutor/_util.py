@@ -1992,13 +1992,16 @@ def _create_kv_cache_manager(
     if issubclass(kv_cache_manager_cls, MambaHybridCacheManagerV2):
         manager_extra_kwargs["is_disagg"] = is_disagg
 
-    # The DeepSeek-V4 manager derives its SWA/COMPRESS pool token layout from
-    # the attention backend selection (FlashInfer reads footer-scale pages);
-    # the base managers ignore the kwarg. Imported lazily like the sparse
-    # manager factory to avoid the resource_manager import cycle.
+    # The DeepSeek-V4 and DSA managers derive their pool token layout from
+    # the attention backend selection (FlashInfer reads footer-scale /
+    # inline-scale pages respectively); the base managers ignore the kwarg.
+    # Imported lazily like the sparse manager factory to avoid the
+    # resource_manager import cycle.
     from ..attention_backend.sparse.deepseek_v4.cache_manager import \
         DeepseekV4CacheManager
-    if issubclass(kv_cache_manager_cls, DeepseekV4CacheManager):
+    from ..attention_backend.sparse.dsa import DSACacheManager
+    if issubclass(kv_cache_manager_cls,
+                  (DeepseekV4CacheManager, DSACacheManager)):
         manager_extra_kwargs["attn_backend"] = _model_config.attn_backend
 
     if is_mla(config):
