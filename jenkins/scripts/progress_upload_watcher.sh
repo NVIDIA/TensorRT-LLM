@@ -38,6 +38,6 @@ while [ ! -f "$PROGRESS_DONE_FILE" ]; do
     fi
 
     LABEL="${LABEL_PREFIX}${m:+ (mtime=$m)}" \
-    bash "${WORKSPACE}/jenkins/scripts/progress_upload_snapshot.sh" || continue
+    bash "$(dirname "${BASH_SOURCE[0]}")/progress_upload_snapshot.sh" || continue
 done
 echo "[PROGRESS-UPLOAD] ${STAGE_NAME}: watcher exiting"
