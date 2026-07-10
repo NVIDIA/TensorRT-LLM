@@ -8214,23 +8214,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
     # MLA decode (Blackwell) - wraps the CuTe DSL kernels that live at
     # tensorrt_llm/_torch/cute_dsl_kernels/blackwell/attention/mla/.
     # Used by the cute_dsl_mla FMHA library (see attention_backend/fmha/cute_dsl.py).
-    #
-    # One generic Runner ``CuteDSLNVMlaDecodeBlackwellRunner`` services both
-    # FP8 and FP16/BF16 paths - only the cutlass ``in_dtype`` is passed at
-    # construction; the kernel class is derived from it via
-    # ``CuteDSLNVMlaDecodeBlackwellRunner._KERNEL_CLASS_BY_DTYPE``. Each
-    # dtype still has its own ``@torch.library.custom_op`` (distinct op
-    # name + fake-tensor rule); the ops differ only in which ``in_dtype``
-    # they hand the generic Runner.
-    #
-    #   torch.ops.trtllm.cute_dsl_mla_decode_fp8_blackwell
-    #       -> CuteDSLNVMlaDecodeBlackwellRunner(in_dtype=cutlass.Float8E4M3FN)
-    #         (-> BlackwellMultiHeadLatentAttentionForwardFP8)
-    #
-    #   torch.ops.trtllm.cute_dsl_mla_decode_fp16_blackwell
-    #       -> CuteDSLNVMlaDecodeBlackwellRunner(in_dtype=cutlass.Float16)
-    #         or CuteDSLNVMlaDecodeBlackwellRunner(in_dtype=cutlass.BFloat16)
-    #         (-> BlackwellMultiHeadLatentAttentionForwardFP16)
     # =========================================================================
 
     from ..cute_dsl_kernels.blackwell.attention.mla.mla_decode_fp8 import \
@@ -8250,16 +8233,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 in_dtype=cutlass.Float16, ...)        # -> ...ForwardFP16
             CuteDSLNVMlaDecodeBlackwellRunner(
                 in_dtype=cutlass.BFloat16, ...)       # -> ...ForwardFP16
-
-        ``get_valid_tactics`` returns the tiler shapes as tactics
-        (``(mma_qk_tiler_mn, mma_pv_tiler_mn)`` tuples), filtered by the
-        kernel's static ``can_implement``. The current candidate list
-        carries only ``((128, 128), (128, 256))`` - the lone combination
-        both kernels accept today - but more can be added without
-        touching ``forward``. ``kernel_cache`` is class-level and keyed
-        by ``(in_dtype, ..., out_dtype, mma_qk_tiler_mn,
-        mma_pv_tiler_mn)``, so FP8/FP16/BF16 output variants and future
-        tilers coexist without collisions.
         """
         kernel_cache = dict()
         tuning_config_cache = dict()
@@ -8287,6 +8260,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             num_heads: int,
             seq_len_q: int,
             page_size: int,
+            max_batch_size: int = 0,
         ):
             super().__init__()
             kernel_class = self.__class__._KERNEL_CLASS_BY_DTYPE.get(in_dtype)
@@ -8300,8 +8274,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
             self.num_heads = num_heads
             self.seq_len_q = seq_len_q
             self.page_size = page_size
+            self.max_batch_size = max_batch_size
 
         def unique_id(self):
+            # seq_len_q is part of the id: each decode variant (the MTP
+            # target step's sq = 1 + draft_len, the draft steps' sq = 1)
+            # constructs its own runner and is tuned independently during
+            # the autotuner warmup's generation forward.
             return (
                 self.in_dtype,
                 self.num_heads,
@@ -8332,23 +8311,31 @@ if IS_CUTLASS_DSL_AVAILABLE:
             return cached
 
         @staticmethod
-        def get_split_kv_candidates(B: int, S: int,
-                                    max_active_blocks: int) -> List[int]:
-            # TODO: split_kv is not always the best choice. We need to optimize it.
+        def get_default_split_kv(B: int, S: int,
+                                 max_active_blocks: int) -> int:
             max_split_kv = 32
             blocks_per_batch = max(1, max_active_blocks // B // (S * 2))
             split_kv = min(blocks_per_batch, max_split_kv)
-            return [split_kv]
+            return split_kv
+
+        @staticmethod
+        def get_default_is_persistent(B: int) -> bool:
+            if B >= 64:
+                return True
+            else:
+                return False
+
+        @staticmethod
+        def get_split_kv_candidates(B: int, S: int,
+                                    max_active_blocks: int) -> List[int]:
+            # TODO: default split_kv is not always the best choice. We need to optimize it.
+            return [
+                CuteDSLNVMlaDecodeBlackwellRunner.get_default_split_kv(
+                    B, S, max_active_blocks)
+            ]
 
         @staticmethod
         def get_is_persistent_candidates() -> List[bool]:
-            """``is_persistent`` values the AutoTuner profiles over (it is the
-            4th tactic element, NOT a fixed compile-time flag): the persistent
-            tile-scheduler wins at large effective batch (split_kv==1 many-tiles
-            regime) while non-persistent is ~1-2% faster at small batch, so
-            instead of a hard batch threshold we let the tuner pick the faster
-            variant per shape. True is listed first so it wins exact ties
-            (prior default)."""
             return [True, False]
 
         @classmethod
@@ -8378,10 +8365,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             # Then the workspace address of previously captured graph will be invalid.
             # So we need to return the max workspace size for all batch sizes.
 
-            # workspace_size = B * H * S * split_kv * (D + 1) * acc_dtype.width // 8
-            # split_kv <= max_active_blocks // B // (S * 2) in get_split_kv_candidates
-            # workspace_size <= H * (max_active_blocks // 2) * (D + 1) * acc_dtype.width // 8
-            return H * (max_active_blocks // 2) * (D + 1) * acc_dtype.width // 8
+            return  2 * H * (max_active_blocks // 2) * (D + 1) * acc_dtype.width // 8
+
 
         def get_valid_tactics(
             self,
@@ -8457,14 +8442,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         def _tuning_inputs_pre_hook(
                 self, inputs: List[torch.Tensor]) -> List[torch.Tensor]:
             """Fix up the RECONSTRUCTED profiling tensors so the decode kernel
-            compiles and runs in-bounds during AutoTuner profiling. The tuner
-            rebuilds every dynamic-dim input as a plain contiguous
-            ``torch.rand`` tensor, which discards the permuted layouts the real
-            decode path passes (the kernel asserts stride[leading_dim] == 1)
-            and leaves garbage page_table / cache_seqs content. Re-permute the
-            rebuilt tensors to the real layouts, clamp page ids into the pool
-            range, and set cache_seqs to a representative KV (the tactic is
-            KV-independent)."""
+            compiles and runs in-bounds during AutoTuner profiling."""
             inputs = list(inputs)
 
             def _relayout(t, base_shape, permute_order):
@@ -8511,12 +8489,20 @@ if IS_CUTLASS_DSL_AVAILABLE:
             return inputs
 
         def get_tuning_config(self) -> TuningConfig:
-            """Batch is the one free tuning dim: bucket it (power-of-2) on
-            cache_seqs and tie every other batch-carrying dim to it via
-            constraints, so any runtime batch maps to a profiled bucket.
-            Static-size dims (page_table's max_blocks) are excluded from the
-            cache key (constraint -> -1) so a differing max_seq_len does not
-            miss."""
+            """Batch is the single free tuning dim (on cache_seqs), and its
+            power-of-2 bucket ladder is determined by ``max_batch_size``
+            (when known, i.e. > 0), NOT by the batch observed while tuning:
+            one in-autotune forward at ANY batch then profiles every bucket
+            up to the engine's max batch, so no runtime batch falls to
+            ``default_tactic`` (whose freshly computed split_kv could
+            JIT-compile a kernel inside the timed region). Without
+            max_batch_size (standalone / unit-test callers) the ladder is
+            derived from the tuning-time batch instead.
+
+            Every other dim carrying batch is tied to it via constraints.
+            seq_len_q needs no dynamic axis: it is fixed per runner (part of
+            ``unique_id``), and each decode variant is tuned by its own
+            forward inside the autotuner warmup."""
             key = self.unique_id()
             cache = self.__class__.tuning_config_cache
             if key not in cache:
@@ -8526,10 +8512,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 # cache_seqs (B,) -> 0, page_table (max_blocks, B) -> 1.
                 batch_dims = ((0, 3), (1, 3), (4, 1), (5, 0), (6, 3), (7, 2))
                 free = 5  # cache_seqs -- the free dynamic batch dim
-                # (input, dim) whose size is a static config quantity
-                # (page_table dim 0 = max_blocks), not per-request -- kept at
-                # its real size for profiling but excluded from the cache key.
-                static_size_dims = ((4, 0), )
+                # (input, dim) whose size is a static config quantity, not
+                # per-request -- kept at its real size for profiling but
+                # excluded from the cache key: page_table dim0 (max_blocks),
+                # c_latent/c_rope dim2 (KV pool num_pages, differs between
+                # the estimation-phase and final KV cache), workspace dim0.
+                static_size_dims = ((2, 2), (3, 2), (4, 0), (8, 0))
                 constraint_dims = [(i, d) for (i, d) in batch_dims if i != free]
                 batch_constraints = tuple(
                     ConstraintSpec(
@@ -8539,11 +8527,16 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     ConstraintSpec(
                         i, d, lambda shapes, _i=i, _d=d: shapes[_i][_d])
                     for (i, d) in static_size_dims)
+                # The batch search space, fixed up-front by max_batch_size
+                # when the engine max is known.
+                batch_buckets = (get_last_power_of_2_num_tokens_buckets(
+                    self.max_batch_size) if self.max_batch_size > 0 else
+                                 get_last_power_of_2_num_tokens_buckets)
                 cache[key] = TuningConfig(
                     dynamic_tensor_specs=(DynamicTensorSpec(
                         free,
                         0,
-                        get_last_power_of_2_num_tokens_buckets,
+                        batch_buckets,
                         last_positive_power_of_2,
                     ), ),
                     constraint_specs=batch_constraints + static_constraints,
@@ -8561,10 +8554,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
             mma_qk_tiler_mn = (128, 128)
             mma_pv_tiler_mn = (128, 256)
             max_active_blocks = self._get_max_active_blocks()
-            split_candidates = self.get_split_kv_candidates(
+            split_kv = self.get_default_split_kv(
                 batch_size, self.seq_len_q, max_active_blocks)
-            split_kv = split_candidates[-1] if split_candidates else 1
-            return (mma_qk_tiler_mn, mma_pv_tiler_mn, split_kv, False)
+            is_persistent = self.get_default_is_persistent(batch_size)
+            return (mma_qk_tiler_mn, mma_pv_tiler_mn, split_kv, is_persistent)
 
         def forward(
             self,
@@ -8598,6 +8591,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             else:
                 out_dtype = self.in_dtype
 
+            seq_len_q = self.seq_len_q
+
             cache_key = self.unique_id() + (
                 out_dtype,
                 mma_qk_tiler_mn,
@@ -8606,6 +8601,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 is_persistent,
             )
             if cache_key not in CuteDSLNVMlaDecodeBlackwellRunner.kernel_cache:
+                # A compile outside the tuning window stalls the serving loop
+                # for seconds -- always log enough to identify the variant.
+                logger.info(
+                    f"CuteDSL MLA decode: compiling kernel variant {cache_key} "
+                    f"B={cache_seqs.shape[0]} "
+                    f"tuning={AutoTuner.get().is_tuning_mode} "
+                    f"capturing={torch.cuda.is_current_stream_capturing()}")
                 hardware_info = cutlass.utils.HardwareInfo()
                 max_active_clusters = hardware_info.get_max_active_clusters(
                     self._CLUSTER_SHAPE_MNK[0] * self._CLUSTER_SHAPE_MNK[1] *
@@ -8613,12 +8615,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
                 # Fold seq_len_q into the head dimension when the head count
                 # alone does not fill the MMA M tile (num_heads < M) and there
-                # is more than one query token (MTP / spec-decode). The kernel
-                # derives the actual fold factor; this flag just enables the
-                # folding code path. For seq_len_q == 1 it is always False, so
-                # plain decode is unchanged.
+                # is more than one query token (MTP / spec-decode).
                 fold_sq = (self.num_heads < mma_qk_tiler_mn[0]
-                           and self.seq_len_q > 1)
+                           and seq_len_q > 1)
 
                 mla = self.kernel_class(
                     cutlass.Float32,  # acc_dtype
@@ -8632,7 +8631,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     self._IS_VAR_SEQ,
                     self._IS_VAR_SPLIT_KV,
                     num_heads=self.num_heads,
-                    seq_len_q=self.seq_len_q,
+                    seq_len_q=seq_len_q,
                     fold_sq=fold_sq,
                 )
 
@@ -8726,11 +8725,14 @@ if IS_CUTLASS_DSL_AVAILABLE:
         page_size: int,
         softmax_scale: float,
         output_scale: float,
+        max_batch_size: int = 0,
     ) -> None:
         """CuTe DSL FP8 MLA decode (Blackwell SM100/SM103).
 
         ``o``, ``lse``, ``workspace`` are mutated in place. Tensor layouts:
         see ``BlackwellMultiHeadLatentAttentionForwardFP8``.
+        ``max_batch_size`` > 0 lets the AutoTuner profile batch buckets up to
+        the engine's max batch instead of stopping at the tuning-time batch.
         """
         if (sm_version := get_sm_version()) not in (100, 103):
             raise ValueError(
@@ -8744,6 +8746,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             num_heads=num_heads,
             seq_len_q=seq_len_q,
             page_size=page_size,
+            max_batch_size=max_batch_size,
         )
         inputs = [
             q_latent, q_rope, c_latent, c_rope, page_table, cache_seqs, o, lse,
@@ -8784,6 +8787,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         page_size: int,
         softmax_scale: float,
         output_scale: float,
+        max_batch_size: int = 0,
     ) -> None:
         return None
 
@@ -8807,11 +8811,14 @@ if IS_CUTLASS_DSL_AVAILABLE:
         page_size: int,
         softmax_scale: float,
         output_scale: float,
+        max_batch_size: int = 0,
     ) -> None:
         """CuTe DSL FP16/BF16 MLA decode (Blackwell SM100/SM103).
 
         ``o``, ``lse``, ``workspace`` are mutated in place. Tensor layouts:
         see ``BlackwellMultiHeadLatentAttentionForwardFP16``.
+        ``max_batch_size`` > 0 lets the AutoTuner profile batch buckets up to
+        the engine's max batch instead of stopping at the tuning-time batch.
         """
         if (sm_version := get_sm_version()) not in (100, 103):
             raise ValueError(
@@ -8842,6 +8849,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             num_heads=num_heads,
             seq_len_q=seq_len_q,
             page_size=page_size,
+            max_batch_size=max_batch_size,
         )
         inputs = [
             q_latent, q_rope, c_latent, c_rope, page_table, cache_seqs, o, lse,
@@ -8882,5 +8890,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
         page_size: int,
         softmax_scale: float,
         output_scale: float,
+        max_batch_size: int = 0,
     ) -> None:
         return None
