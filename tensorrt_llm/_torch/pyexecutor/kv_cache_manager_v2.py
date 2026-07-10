@@ -280,9 +280,19 @@ def _ensure_int64_cpu_tensor(values: Sequence[int] | torch.Tensor) -> torch.Tens
     return torch.as_tensor(values, dtype=torch.int64)
 
 
+_MM_RUN_METADATA_UNSET = object()
+
+
 def _resolve_multimodal_run_metadata(req: LlmRequest) -> Optional[_MmRunMetadata]:
-    # TODO(perf): cache per request; block-reuse invokes this once per block,
-    # repeatedly rebuilding identical tensors for the same request metadata.
+    # Memoize on the request. Block reuse resolves this on the first context
+    # chunk, again on every commit during chunked prefill, and on prefetch, yet
+    # the result is a pure function of the request's immutable multimodal run
+    # layout. Caching on the request bounds the cache to the request lifetime,
+    # so no separate teardown is needed.
+    cached = getattr(req, "py_mm_run_metadata", _MM_RUN_METADATA_UNSET)
+    if cached is not _MM_RUN_METADATA_UNSET:
+        return cached
+
     # Worked example for one logical multimodal item split by text:
     #
     #   prompt index: 0    1      2      3    4      5
@@ -315,6 +325,7 @@ def _resolve_multimodal_run_metadata(req: LlmRequest) -> Optional[_MmRunMetadata
     run_lengths = req.multimodal_run_lengths
 
     if all(field is None for field in (item_run_cu_offsets, run_positions, run_lengths)):
+        req.py_mm_run_metadata = None
         return None
 
     if item_run_cu_offsets is None or run_positions is None or run_lengths is None:
@@ -349,12 +360,14 @@ def _resolve_multimodal_run_metadata(req: LlmRequest) -> Optional[_MmRunMetadata
     # Shape [num_runs]; one-past-last full-prompt index for each flat run.
     run_ends = run_positions + run_lengths
 
-    return _MmRunMetadata(
+    metadata = _MmRunMetadata(
         run_positions=run_positions,
         run_ends=run_ends,
         run_item_indices=run_item_indices,
         run_item_offsets=run_item_offsets,
     )
+    req.py_mm_run_metadata = metadata
+    return metadata
 
 
 def _augment_tokens_with_mm_run_metadata(

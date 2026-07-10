@@ -2261,10 +2261,6 @@ class BlockManager:
         self.tokens_per_block = tokens_per_block
         self.max_blocks_per_seq = self.num_blocks
 
-        self.base_block_offsets = torch.arange(self.num_blocks,
-                                               device="cpu",
-                                               dtype=torch.int32)
-
         self.block_ids = dict()
         self.num_sequences = dict()
         self.free_blocks = deque(range(self.num_blocks))
@@ -2288,10 +2284,9 @@ class BlockManager:
         for i in range(len(request_ids)):
             block_ids = self.block_ids[request_ids[i]]
             block_num = len(block_ids)
+            # Block ids are the page offsets directly; no lookup table needed.
             block_offsets[i, 0:block_num].copy_(
-                self.base_block_offsets[torch.tensor(block_ids,
-                                                     dtype=torch.int32,
-                                                     device="cpu")])
+                torch.tensor(block_ids, dtype=torch.int32, device="cpu"))
 
     def compute_block_count(self, token_count: int,
                             tokens_per_page: int) -> int:
