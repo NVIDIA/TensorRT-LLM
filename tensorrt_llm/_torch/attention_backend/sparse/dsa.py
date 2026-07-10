@@ -1930,13 +1930,31 @@ class Indexer(nn.Module):
             kv_cache_manager, 'use_fp4', False) else head_dim
         compress_ratio = _effective_compress_ratio_divisor(
             _select_indexer_compress_ratio(metadata.compress_ratios))
+        # INDEXER_COMPRESS is stored per-compressed-token: the K-cache page is the
+        # compressed block size (raw tokens_per_block // indexer compress ratio),
+        # so the indexer slot mappings must stride by that, not the raw
+        # tokens_per_block. Derive it from the LIVE compress ratio here instead of
+        # metadata._tokens_per_block: that value is frozen in the base metadata
+        # __post_init__ (dsa.py) which runs inside super().__post_init__() BEFORE
+        # the DeepseekV4 metadata installs its real compress_ratios, so the
+        # derivation sees the pre-override [1] and leaves the raw tokens_per_block
+        # (256). The stale raw stride over-strides the fullkv indexer gather by
+        # the compress ratio and runs off the indexer K-cache under reuse
+        # retention (measured: flat = block_ids*256*bpt crosses the pool at
+        # block_ids ~= upper_bound/ratio). NOTE: the on_update slot_mapping_fp8 is
+        # dead on DSv4 — the shared DSA scatter is no-op'd
+        # (DeepseekV4Indexer._update_k_cache) and the indexer reads go paged via
+        # the block table — so this IndexerParams stride is the live indexer
+        # consumer. DSA v3.2 has ratio-divisor 1, so the value is unchanged there.
+        indexer_tokens_per_block = (
+            metadata.kv_cache_manager.tokens_per_block // compress_ratio)
         return IndexerParams(
             num_contexts=metadata.num_contexts,
             num_generations=metadata.num_generations,
             num_ctx_tokens=metadata.num_ctx_tokens,
             head_dim=head_dim,
             quant_block_size=metadata.indexer_quant_block_size,
-            tokens_per_block=metadata._tokens_per_block,
+            tokens_per_block=indexer_tokens_per_block,
             compress_ratio=compress_ratio,
             request_ids=metadata.request_ids,
             num_past_tokens=metadata.kv_cache_params.num_cached_tokens_per_seq,
