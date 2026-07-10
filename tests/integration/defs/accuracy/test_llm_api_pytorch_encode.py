@@ -119,6 +119,27 @@ PER_TOKEN_REWARD_MODELS = [
     ),
 ]
 
+# Qwen3-Embedding family. All variants are Qwen3ForCausalLM + a sentence-transformers
+# last-token-pool + L2-normalize pipeline; one wrapper class (Qwen3ForTextEmbedding)
+# serves all sizes. We cover both 0.6B (small/fast) and 8B (the large variant
+# downstream users actually serve); 8B is memory-gated so it skips on small GPUs.
+# The CI L0 list selects each variant by its `id=` below
+# (tests/integration/test_lists/test-db/l0_l40s.yml) — the ids must stay in sync
+# with that list or CI silently drops the test.
+TEXT_EMBEDDING_MODELS = [
+    pytest.param(
+        "Qwen/Qwen3-Embedding-0.6B",
+        f"{llm_models_root()}/Qwen3/Qwen3-Embedding-0.6B",
+        id="qwen3-embedding-0.6b",
+    ),
+    pytest.param(
+        "Qwen/Qwen3-Embedding-8B",
+        f"{llm_models_root()}/Qwen3/Qwen3-Embedding-8B",
+        marks=pytest.mark.skip_less_device_memory(32000),
+        id="qwen3-embedding-8b",
+    ),
+]
+
 # Encoder CUDA graph configs for parametrization. PROMPTS tokenize to short
 # (~6-12 token) sequences, so we only need buckets that cover that range plus
 # one small/larger pair to exercise dispatch + padding. Larger grids inflate
@@ -282,6 +303,43 @@ class TestEncoderEncode(LlmapiAccuracyTestHarness):
                 f"TLLM={t_last.argmax(dim=-1)} (logits={t_last.tolist()}) vs "
                 f"HF={hf_last.argmax(dim=-1)} (logits={hf_last.tolist()})"
             )
+
+    @pytest.mark.parametrize("model_name,model_path", TEXT_EMBEDDING_MODELS)
+    def test_qwen3_text_embedding_matches_huggingface(self, model_name, model_path):
+        """Decoder text-embedding: L2-normalized last-token hidden state vs HF."""
+        import torch.nn.functional as F
+        from transformers import AutoModel, AutoTokenizer
+
+        torch_dtype, llm_dtype = _resolve_checkpoint_dtype(model_path)
+
+        # Force the embedding wrapper class (the model's config declares
+        # Qwen3ForCausalLM). encode() then returns the pooled+normalized vector.
+        with LLM(
+            model_path,
+            encode_only=True,
+            dtype=llm_dtype,
+            model_kwargs={"architectures": ["Qwen3ForTextEmbedding"]},
+        ) as llm:
+            outs = llm.encode(PROMPTS)
+
+        tokenizer = AutoTokenizer.from_pretrained(model_path)
+        hf_model = AutoModel.from_pretrained(model_path, torch_dtype=torch_dtype).cuda().eval()
+
+        for i, prompt in enumerate(PROMPTS):
+            with torch.inference_mode():
+                ids = tokenizer(prompt, return_tensors="pt").to(hf_model.device)
+                last_hidden = hf_model(**ids).last_hidden_state  # [1, seq, hidden]
+            # Last-token pool + L2 normalize (matches Qwen3ForTextEmbedding).
+            hf_emb = F.normalize(last_hidden[0, -1].float(), p=2, dim=-1).cpu()
+
+            tllm_emb = outs[i].logits.cpu().float()
+            assert tllm_emb.shape == hf_emb.shape, (
+                f"[{model_name}] prompt#{i} shape {tuple(tllm_emb.shape)} "
+                f"!= HF {tuple(hf_emb.shape)}"
+            )
+            torch.testing.assert_close(tllm_emb, hf_emb, rtol=1.5e-2, atol=1.5e-2)
+            # Embeddings must be unit-norm.
+            assert abs(tllm_emb.norm().item() - 1.0) < 1e-2
 
 
 # --------------------------------------------------------------------------- #

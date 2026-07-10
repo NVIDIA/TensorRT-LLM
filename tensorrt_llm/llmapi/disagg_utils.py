@@ -35,6 +35,7 @@ class ServerRole(IntEnum):
     GENERATION = 1
     MM_ENCODER = 2
     VISUAL_GEN = 3
+    EMBEDDING = 4
 
 
 @dataclass
