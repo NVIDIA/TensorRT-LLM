@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+-->
+
 # Checkpoint Loading
 
 The PyTorch backend provides a flexible and extensible infrastructure for loading model checkpoints from different formats, such as HuggingFace (HF). This system allows you to load models from various sources (e.g., HuggingFace or custom formats) by implementing the required components, such as the checkpoint’s weight loader, mapper, and configuration parser.
@@ -6,8 +11,9 @@ The PyTorch backend provides a flexible and extensible infrastructure for loadin
 1. [Overview](#overview)
 2. [Core Components](#core-components)
 3. [Built-in Checkpoint Formats](#built-in-checkpoint-formats)
-4. [Using Checkpoint Loaders](#using-checkpoint-loaders)
-5. [Creating Custom Checkpoint Loaders](#creating-custom-checkpoint-loaders)
+4. [Distributing checkpoints and engine artifacts from object storage](#distributing-checkpoints-and-engine-artifacts-from-object-storage)
+5. [Using Checkpoint Loaders](#using-checkpoint-loaders)
+6. [Creating Custom Checkpoint Loaders](#creating-custom-checkpoint-loaders)
 
 ## Overview
 
@@ -105,8 +111,8 @@ cached path.
 ### Credentials and endpoint
 
 The `aws` CLI and `boto3` read AWS-style environment variables. Set your
-access key, secret key, region, bucket, and (for a non-AWS store) the S3
-endpoint. Adjust the region and endpoint to match your bucket:
+access key, secret key, region, and bucket. For a non-AWS store, also set the
+S3 endpoint. Adjust the region and endpoint to match your bucket:
 
 ```bash
 # S3 credentials, mapped onto the AWS_* names the tooling reads.
@@ -114,14 +120,22 @@ export AWS_ACCESS_KEY_ID="$S3_ACCESS_KEY_ID"
 export AWS_SECRET_ACCESS_KEY="$S3_SECRET_ACCESS_KEY"
 export AWS_DEFAULT_REGION="${S3_REGION:-us-east-1}"
 
-# Bucket and S3 endpoint.
+# Bucket.
 export S3_BUCKET_NAME="my-trtllm-artifacts"
-export S3_ENDPOINT="https://your-s3-endpoint.example.com"
+
+# For non-AWS S3-compatible storage, uncomment and set the endpoint.
+# Leave S3_ENDPOINT unset for Amazon S3.
+# export S3_ENDPOINT="https://your-s3-endpoint.example.com"
+
+S3_ENDPOINT_ARGS=()
+if [ -n "${S3_ENDPOINT:-}" ]; then
+    S3_ENDPOINT_ARGS=(--endpoint-url "$S3_ENDPOINT")
+fi
 ```
 
-For Amazon S3, drop `--endpoint-url` and use AWS credentials directly. For any
-other S3-compatible store, keep `--endpoint-url "$S3_ENDPOINT"` on every
-command and set it to that store's endpoint.
+For Amazon S3, leave `S3_ENDPOINT` unset and use AWS credentials directly. For
+any other S3-compatible store, set `S3_ENDPOINT` so the examples pass
+`--endpoint-url "$S3_ENDPOINT"` on each command.
 
 ### Build and upload an engine
 
@@ -136,7 +150,7 @@ trtllm-build --checkpoint_dir ./llama-3.1-8b-ckpt \
 # Sync the engine directory (config.json + rank*.engine shards) to the bucket.
 aws s3 sync ./engines/llama-3.1-8b-fp8 \
     "s3://${S3_BUCKET_NAME}/engines/llama-3.1-8b-fp8" \
-    --endpoint-url "$S3_ENDPOINT"
+    "${S3_ENDPOINT_ARGS[@]}"
 ```
 
 ### Download on the serving node
@@ -150,7 +164,7 @@ export TRTLLM_MODEL_CACHE="${TRTLLM_MODEL_CACHE:-/models/cache}"
 LOCAL_DIR="${TRTLLM_MODEL_CACHE}/llama-3.1-8b-fp8"
 
 aws s3 sync "s3://${S3_BUCKET_NAME}/engines/llama-3.1-8b-fp8" \
-    "$LOCAL_DIR" --endpoint-url "$S3_ENDPOINT"
+    "$LOCAL_DIR" "${S3_ENDPOINT_ARGS[@]}"
 
 trtllm-serve "$LOCAL_DIR" --host 0.0.0.0 --port 8000
 ```
@@ -172,27 +186,36 @@ from tensorrt_llm import LLM
 
 CACHE_DIR = Path(os.environ.get("TRTLLM_MODEL_CACHE", "/models/cache"))
 BUCKET = os.environ["S3_BUCKET_NAME"]
-PREFIX = os.environ.get("S3_PREFIX", "engines/llama-3.1-8b-fp8/")
-LOCAL_DIR = CACHE_DIR / PREFIX.rstrip("/").split("/")[-1]
+PREFIX = os.environ.get("S3_PREFIX", "engines/llama-3.1-8b-fp8/").strip("/") + "/"
+LOCAL_DIR = CACHE_DIR / PREFIX.rstrip("/")
+CACHE_ROOT = LOCAL_DIR.resolve()
 
 s3 = boto3.client(
     "s3",
-    endpoint_url=os.environ["S3_ENDPOINT"],
-    aws_access_key_id=os.environ["S3_ACCESS_KEY_ID"],
-    aws_secret_access_key=os.environ["S3_SECRET_ACCESS_KEY"],
-    region_name=os.environ.get("S3_REGION", "us-east-1"),
+    endpoint_url=os.environ.get("S3_ENDPOINT"),
+    aws_access_key_id=os.environ["AWS_ACCESS_KEY_ID"],
+    aws_secret_access_key=os.environ["AWS_SECRET_ACCESS_KEY"],
+    region_name=os.environ.get("AWS_DEFAULT_REGION", "us-east-1"),
     config=Config(user_agent_extra="tensorrt-llm-docs"),
 )
 
 paginator = s3.get_paginator("list_objects_v2")
 for page in paginator.paginate(Bucket=BUCKET, Prefix=PREFIX):
     for obj in page.get("Contents", []):
-        rel = obj["Key"][len(PREFIX):]
+        key = obj["Key"]
+        rel = key[len(PREFIX):]
         if not rel:
             continue
-        dest = LOCAL_DIR / rel
+        rel_path = Path(rel)
+        if rel_path.is_absolute() or ".." in rel_path.parts:
+            raise ValueError(f"Unsafe S3 object key: {key}")
+        dest = (LOCAL_DIR / rel_path).resolve()
+        if not dest.is_relative_to(CACHE_ROOT):
+            raise ValueError(f"Unsafe S3 object key: {key}")
+        if dest.exists() and dest.stat().st_size == obj["Size"]:
+            continue
         dest.parent.mkdir(parents=True, exist_ok=True)
-        s3.download_file(BUCKET, obj["Key"], str(dest))
+        s3.download_file(BUCKET, key, str(dest))
 
 llm = LLM(model=str(LOCAL_DIR))
 ```
