@@ -10,7 +10,7 @@ import time
 import traceback
 from contextlib import contextmanager
 from enum import IntEnum
-from queue import Empty, Queue
+from queue import Queue
 from typing import (TYPE_CHECKING, Callable, Dict, Iterable, List, Optional,
                     Tuple, Union)
 
@@ -1221,13 +1221,10 @@ class PyExecutor:
         with self.worker_lock:
             if not self.worker_started:
                 if self.dist.pp_size > 1:
-                    # Both relay modes deposit relayed sample states here
-                    # for the executor loop to handle.
-                    self.executed_batch_response_queue: Queue[
-                        BatchStatePP] = Queue(maxsize=-1)
-                if self.dist.pp_size > 1 and self.pp_async_broadcast_sample_state:
                     self.executed_batch_queue: Queue[BatchStatePP] = Queue(
                         maxsize=self.num_micro_batches)
+                    self.executed_batch_response_queue: Queue[
+                        BatchStatePP] = Queue(maxsize=-1)
                     # Duplicate the communicator on the main thread before the
                     # PP event loop starts. MPI_Comm_dup is collective across
                     # ranks, so doing it here avoids racing with the worker
@@ -1449,7 +1446,7 @@ class PyExecutor:
             logger.error("Hang detected, shutting down immediately.")
             return
         self.worker_thread.join()
-        if self.dist.pp_size > 1 and self.pp_async_broadcast_sample_state:
+        if self.dist.pp_size > 1:
             self.executed_batch_queue.put(None)
             self.broadcast_sample_state_handler.join()
         # Signal non-rank-0 sleep/wakeup listener threads to exit.  This runs
@@ -2741,6 +2738,9 @@ class PyExecutor:
                         # Relay inline on the executor thread; unlike the
                         # background thread, delivery cannot be starved by the
                         # GIL when a forward blocks inside a native call.
+                        # Requires the pre-forward drain above: the isend
+                        # completes via rendezvous only while this rank keeps
+                        # entering MPI calls.
                         self._ring_broadcast_sample_state(executed_batch)
                     self.unhandled_batch_counter += 1
                 self.micro_batches[executed_microbatch_id] = None
@@ -2791,23 +2791,8 @@ class PyExecutor:
                         dequeue_counter = 0
                         while dequeue_counter < executed_batch_num:
                             with nvtx_range("get_executed_batch"):
-                                if self.pp_async_broadcast_sample_state:
-                                    executed_batch = self.executed_batch_response_queue.get(
-                                    )
-                                else:
-                                    # The inline relay deposits batches in the
-                                    # same iteration they are handled; an empty
-                                    # queue means the PP ranks diverged.
-                                    try:
-                                        executed_batch = self.executed_batch_response_queue.get_nowait(
-                                        )
-                                    except Empty as e:
-                                        raise RuntimeError(
-                                            f"PP rank {self.dist.pp_rank} expected "
-                                            f"{executed_batch_num} relayed sample states "
-                                            f"this iteration but found only {dequeue_counter}; "
-                                            f"PP ranks diverged on the microbatch schedule."
-                                        ) from e
+                                executed_batch = self.executed_batch_response_queue.get(
+                                )
                             self._handle_executed_batch(executed_batch)
                             dequeue_counter += 1
                     else:
