@@ -2487,8 +2487,11 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
     dtype: str = Field(
         default="auto",
         description=
-        "The data type to use for the KV cache. Use 'auto' to follow checkpoint metadata, otherwise force the specified dtype."
-    )
+        "The data type to use for the KV cache. 'auto' (default) follows the checkpoint's own "
+        "quantization metadata, leaving quant_config.kv_cache_quant_algo untouched. 'fp8' or "
+        "'nvfp4' override it, setting quant_config.kv_cache_quant_algo to that KV-cache "
+        "quantization algorithm. Applied at LLM construction time, including via "
+        "trtllm-serve --extra_llm_api_options.")
 
     # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
     mamba_ssm_cache_dtype: Literal[
@@ -2801,8 +2804,14 @@ class BaseLlmArgs(StrictBaseModel):
     tensor_parallel_size: int = Field(default=1,
                                       description="The tensor parallel size.")
 
-    dtype: str = Field(default="auto",
-                       description="The data type to use for the model.")
+    dtype: str = Field(
+        default="auto",
+        description=
+        "The data type to use for the model. 'auto' (default) infers the dtype from the "
+        "checkpoint: the HF config's 'torch_dtype' (or the deprecated 'dtype' field), falling "
+        "back to 'bfloat16' when the checkpoint specifies none. Any other value must be a valid "
+        "torch dtype string (e.g. 'float16', 'bfloat16') and forces that dtype."
+    )
 
     revision: Optional[str] = Field(
         default=None, description="The revision to use for the model.")
