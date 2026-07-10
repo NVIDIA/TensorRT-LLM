@@ -168,7 +168,7 @@ LOCAL_DIR="${TRTLLM_MODEL_CACHE}/${S3_PREFIX}"
 aws s3 sync "s3://${S3_BUCKET_NAME}/${S3_PREFIX}" \
     "$LOCAL_DIR" "${S3_ENDPOINT_ARGS[@]}"
 
-trtllm-serve "$LOCAL_DIR" --host 0.0.0.0 --port 8000
+trtllm-serve "$LOCAL_DIR" --backend tensorrt --host 0.0.0.0 --port 8000
 ```
 
 ### Equivalent download with boto3
@@ -184,7 +184,7 @@ from pathlib import Path
 import boto3
 from botocore.config import Config
 
-from tensorrt_llm import LLM
+from tensorrt_llm._tensorrt_engine import LLM
 
 CACHE_DIR = Path(os.environ.get("TRTLLM_MODEL_CACHE", "/models/cache"))
 BUCKET = os.environ["S3_BUCKET_NAME"]
