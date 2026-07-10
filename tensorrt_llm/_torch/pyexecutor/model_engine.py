@@ -1102,21 +1102,24 @@ class PyTorchModelEngine(ModelEngine):
             log_mem_snapshot("warmup/after_memory_pool_prepop")
 
     def _warmup_dg_paged_mqa_logits_metadata(self) -> None:
-        """Pre-compile the DeepGEMM `smxx_paged_mqa_logits_metadata` kernel
-        for every 32-aligned batch bucket up to `max_batch_size`.
+        """Pre-compile DeepGEMM's `get_paged_mqa_logits_metadata` helper for
+        every 32-aligned batch bucket up to `max_batch_size`.
 
         DSA's `Indexer.prepare_scheduler_metadata` calls
         `deep_gemm.get_paged_mqa_logits_metadata(context_lens, block_kv,
-        num_sms)` inside `_prepare_inputs` every iteration. The kernel is
-        templated on `kAlignedBatchSize = ceil(num_generations, 32)`, and
-        deep_gemm's Python-side JIT compiles a fresh cubin (spawning
-        nvcc/cicc/ptxas, ~3s on GB300) the first time any bucket is
-        requested. CUDA-graph warmup exercises only the batch sizes in
+        num_sms)` inside `_prepare_inputs` every iteration. The underlying
+        kernel is templated on `kAlignedBatchSize = ceil(num_generations,
+        32)`, and deep_gemm's Python-side JIT compiles a fresh cubin
+        (spawning nvcc/cicc/ptxas, ~3s on GB300) the first time any bucket
+        is requested. CUDA-graph warmup exercises only the batch sizes in
         `cuda_graph_batch_sizes`, which round up to a subset of the 32-
         aligned buckets; every uncovered bucket that the inference
         workload later touches produces a 3s stall on that iteration.
         Pre-touching every bucket here funnels those compiles into the
         deterministic warmup phase.
+
+        Best-effort: per-bucket JIT failures are logged and skipped so a
+        single broken bucket does not abort PyExecutor startup.
 
         Cost: one nvcc invocation per bucket the CUDA-graph warmup didn't
         already trigger (typically 5-6 extra compiles for max_batch_size
@@ -1127,7 +1130,7 @@ class PyTorchModelEngine(ModelEngine):
             return
         try:
             from tensorrt_llm._torch.attention_backend.sparse.dsa import (
-                DSAtrtllmAttentionMetadata, _DG_SCHEDULE_BLOCK_KV)
+                _DG_SCHEDULE_BLOCK_KV, DSAtrtllmAttentionMetadata)
         except ImportError:
             return
         if not isinstance(attn_meta, DSAtrtllmAttentionMetadata):
@@ -1144,21 +1147,24 @@ class PyTorchModelEngine(ModelEngine):
         max_bs = max(1, int(self.batch_size))
         max_aligned = ((max_bs + 31) // 32) * 32
         buckets = list(range(32, max_aligned + 32, 32))
-        logger.info(
-            f"[DG warmup] Pre-compiling paged_mqa_logits_metadata for "
-            f"{len(buckets)} aligned batch buckets up to {max_aligned} "
-            f"(block_kv={_DG_SCHEDULE_BLOCK_KV}, num_sms={num_sms})")
+        logger.info(f"[DG warmup] Pre-compiling paged_mqa_logits_metadata for "
+                    f"{len(buckets)} aligned batch buckets up to {max_aligned} "
+                    f"(block_kv={_DG_SCHEDULE_BLOCK_KV}, num_sms={num_sms})")
         for aligned_bs in buckets:
             # Kernel scans `context_lens` and prefix-sums schedules; a
             # zero-filled 2D tensor of shape (aligned_bs, 1) is enough to
             # trigger dispatch and compile — the metadata output is
             # discarded.
-            dummy = torch.zeros(aligned_bs,
-                                1,
-                                dtype=torch.int32,
-                                device="cuda")
-            _ = get_paged_mqa_logits_metadata(dummy, _DG_SCHEDULE_BLOCK_KV,
-                                              num_sms)
+            dummy = torch.zeros(aligned_bs, 1, dtype=torch.int32, device="cuda")
+            try:
+                _ = get_paged_mqa_logits_metadata(dummy, _DG_SCHEDULE_BLOCK_KV,
+                                                  num_sms)
+            except Exception as e:
+                logger.warning(
+                    f"[DG warmup] paged_mqa_logits_metadata prewarm failed "
+                    f"for aligned_bs={aligned_bs} "
+                    f"(block_kv={_DG_SCHEDULE_BLOCK_KV}, num_sms={num_sms}); "
+                    f"skipping bucket. {type(e).__name__}: {e}")
         torch.cuda.synchronize()
 
     def _general_warmup(self, resource_manager: ResourceManager,
