@@ -14,7 +14,10 @@ google/gemma-3-27b-it:
     kv_cache_quant_algo: FP8
     accuracy: 48.0
 google/gemma-4-26B-A4B-it:
-  - accuracy: 56.667
+  # B200 PyTorch backend baseline for nvidia/Gemma-4-26B-A4B-NVFP4.
+  - quant_algo: NVFP4
+    kv_cache_quant_algo: FP8
+    accuracy: 54.0
 google/gemma-3-12b-it:
   - accuracy: 50.44
   - quant_algo: FP8

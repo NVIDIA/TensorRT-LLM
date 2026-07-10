@@ -39,11 +39,25 @@ l0_a30:
       - '*a30*'
       linux_distribution_name: ubuntu*
     terms:
-      stage: post_merge
+      stage: pre_merge
       backend: cpp
   tests:
   # ------------- CPP tests ---------------
   - cpp/test_unit_tests.py::test_unit_tests[batch_manager-80]
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 1
+        lte: 1
+    wildcards:
+      gpu:
+      - '*a30*'
+      linux_distribution_name: ubuntu*
+    terms:
+      stage: post_merge
+      backend: cpp
+  tests:
+  # ------------- CPP tests ---------------
   - cpp/test_unit_tests.py::test_unit_tests[common-80]
   - cpp/test_unit_tests.py::test_unit_tests[executor-80]
   - cpp/test_unit_tests.py::test_unit_tests[kernels-80]

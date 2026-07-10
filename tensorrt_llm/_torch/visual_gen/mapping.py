@@ -113,6 +113,10 @@ class VisualGenMapping(DeviceMeshTopologyImpl):
     # across instances via the class object.
     seq_mesh: Optional[DeviceMesh] = None
 
+    # Protect shutdown_pg from being called multiple times if multiple mappings
+    # are used throughout the process
+    _shutdown_pg_registered: bool = False
+
     def __init__(
         self,
         world_size: int,
@@ -243,9 +247,14 @@ class VisualGenMapping(DeviceMeshTopologyImpl):
         assert self.local_comm is not None
 
         from tensorrt_llm._utils import torch_pybind11_abi
-        from tensorrt_llm.bindings.internal.process_group import init_pg
+        from tensorrt_llm.bindings.internal.process_group import init_pg, shutdown_pg
 
         init_pg(dist.group.WORLD, self.local_comm, torch_pybind11_abi())
+        if not VisualGenMapping._shutdown_pg_registered:
+            import atexit
+
+            atexit.register(shutdown_pg)
+            VisualGenMapping._shutdown_pg_registered = True
 
     # ------------------------------------------------------------------
     # Mesh construction

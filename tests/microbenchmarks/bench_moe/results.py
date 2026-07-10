@@ -415,6 +415,7 @@ def _make_skipped_run_result(
         "level": ",".join(sorted(analysis)) if analysis else "summary",
         "cuda_graph": bool(config.cuda_graph),
         "cupti_available": False,
+        "nsys_capture": False,
         "phase_timing_available": False,
         "kernel_breakdown_available": False,
     }
