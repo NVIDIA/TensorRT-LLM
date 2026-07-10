@@ -735,9 +735,21 @@ class PyExecutor:
         self.benchmark_req_queues_size = int(
             os.environ.get("TLLM_BENCHMARK_REQ_QUEUES_SIZE", 0))
 
+        # Sample-state relay mode. "1": a background thread relays them,
+        # overlapping with forward, but it needs the GIL and can be starved
+        # into a PP deadlock by GIL-holding native calls. "0": relay inline.
+        self.pp_async_broadcast_sample_state = os.environ.get(
+            "TLLM_PP_ASYNC_BROADCAST_SAMPLE_STATE", "0") == "1"
+
         # list of requests in each PP micro batch
-        self.num_micro_batches = max(self.dist.pp_size,
-                                     self.MIN_ASYNC_MICRO_BATCH_NUM)
+        # The synchronous relay retires each microbatch within its own
+        # iteration, so pipeline-depth many slots suffice; the async relay
+        # thread needs a large window to absorb its delivery lag.
+        if self.pp_async_broadcast_sample_state:
+            self.num_micro_batches = max(self.dist.pp_size,
+                                         self.MIN_ASYNC_MICRO_BATCH_NUM)
+        else:
+            self.num_micro_batches = self.dist.pp_size
         self.micro_batches: List[BatchStatePP
                                  | None] = [None] * self.num_micro_batches
         self.send_handles = [None] * self.num_micro_batches
@@ -958,11 +970,6 @@ class PyExecutor:
 
         if self.dist.pp_size > 1:
             self.event_loop = self._executor_loop_pp
-            # Sample-state relay mode. "1": a background thread relays them,
-            # overlapping with forward, but it needs the GIL and can be starved
-            # into a PP deadlock by GIL-holding native calls. "0": relay inline.
-            self.pp_async_broadcast_sample_state = os.environ.get(
-                "TLLM_PP_ASYNC_BROADCAST_SAMPLE_STATE", "0") == "1"
         else:
             self.event_loop = self._executor_loop if self.disable_overlap_scheduler else self._executor_loop_overlap
         if is_trace_enabled("TLLM_TRACE_EXECUTOR_LOOP"):
