@@ -600,9 +600,28 @@ void CacheTransceiver::respondAndSendLayerWise(
 void CacheTransceiver::requestAndReceiveSync(std::shared_ptr<LlmRequest> llmRequest)
 {
     TLLM_CHECK(llmRequest && llmRequest->isGenerationOnlyRequest());
+    auto const requestId = llmRequest->mRequestId;
+    auto const contextRequestId = llmRequest->getContextPhaseParams().value().getReqId();
+    TLLM_LOG_DEBUG("Synchronous KV cache receive request %zu, context request %zu waiting for native completion.",
+        requestId, contextRequestId);
+    try
     {
         auto future = mCacheReceiver->receiveAsync(llmRequest);
         future.get();
+    }
+    catch (std::exception const& err)
+    {
+        llmRequest->setState(LlmRequestState::kDISAGG_TRANS_ERROR);
+        llmRequest->setKvCacheTransferEnd(LlmRequest::getSteadyClockNow());
+        TLLM_LOG_ERROR("Synchronous KV cache receive request %zu, context request %zu failed: %s", requestId,
+            contextRequestId, err.what());
+        return;
+    }
+    if (llmRequest->getState() == LlmRequestState::kDISAGG_TRANS_ERROR)
+    {
+        TLLM_LOG_ERROR("Synchronous KV cache receive request %zu, context request %zu completed with an error state.",
+            requestId, contextRequestId);
+        return;
     }
     llmRequest->setState(LlmRequestState::kDISAGG_GENERATION_TRANS_COMPLETE);
 }
