@@ -22,8 +22,10 @@ def temp_extra_llm_api_options_file():
     temp_dir = tempfile.gettempdir()
     temp_file_path = os.path.join(temp_dir, "extra_llm_api_options.yaml")
     try:
+        # YAML attempts to override tensor_parallel_size; the CLI's --tp_size 1
+        # must win. max_num_tokens is YAML-only and should still be applied.
         extra_llm_api_options_dict = {
-            "tensor_parallel_size": 1,
+            "tensor_parallel_size": 99,
             "max_num_tokens": 16384,
         }
 
@@ -45,8 +47,10 @@ def example_root():
 @pytest.fixture(scope="module")
 def server(model_name: str, temp_extra_llm_api_options_file: str):
     model_path = get_model_path(model_name)
+    # If YAML's tensor_parallel_size: 99 won over the CLI, the server would
+    # fail to start; the server starting at TP=1 is the assertion.
     args = [
-        "--tp_size", "99", "--extra_llm_api_options",
+        "--tp_size", "1", "--extra_llm_api_options",
         temp_extra_llm_api_options_file
     ]
     with RemoteOpenAIServer(model_path, port=8000,

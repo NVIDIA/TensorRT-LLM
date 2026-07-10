@@ -54,6 +54,11 @@ generation_servers:
     kv_transfer_timeout_ms: 60000
 
 stress_config:
+  # Placeholder template for the future full marathon. This YAML is
+  # intentionally not parametrized until the runtime supports the
+  # cancellation + poison-buffer contract and canary references are
+  # recorded for Qwen2.5-7B-Instruct.
+  mode: full_cancel_poison
   duration_min: 120
 
   kv_cache_manager: v2

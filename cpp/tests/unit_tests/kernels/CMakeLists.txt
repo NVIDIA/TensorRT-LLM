@@ -16,6 +16,8 @@
 add_gtest(banRepeatNGramsKernelsTest banRepeatNGramsKernelsTest.cpp)
 add_gtest(decodingKernelsTest decodingKernelTest.cpp)
 add_gtest(logitsBitmaskTest logitsBitmaskTest.cpp)
+add_gtest(cascadeAttentionKernelTest cascadeAttentionKernelTest.cpp)
+add_gtest(cascadeAttentionNumericsTest cascadeAttentionNumericsTest.cu)
 
 macro(remove_compile_definition TARGET_NAME DEFINITION)
   get_target_property(DEFS ${TARGET_NAME} COMPILE_DEFINITIONS)
@@ -94,6 +96,12 @@ add_gtest(routingKernelsTest "${ROUTING_KERNEL_TEST_SRC}")
 target_link_libraries(routingKernelsTest PRIVATE Python3::Python)
 
 add_gtest(moeLoadBalanceKernelTest moeLoadBalanceKernelTest.cpp)
+
+if(USING_OSS_CUTLASS_MOE_GEMM)
+  add_gtest(moeLoraPointerExpandTest moeLoraPointerExpandTest.cu)
+  add_gtest(moeLoraProblemBuilderTest moeLoraProblemBuilderTest.cu)
+  add_gtest(moeLoraSlotExpandTest moeLoraSlotExpandTest.cu)
+endif()
 
 add_gtest(eaglePackDataTest eaglePackDataTest.cpp)
 add_gtest(sparseKvCacheTest sparseKvCacheTest.cu)

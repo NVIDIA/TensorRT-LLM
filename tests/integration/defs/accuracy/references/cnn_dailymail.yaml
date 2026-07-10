@@ -70,27 +70,6 @@ lmsys/vicuna-7b-v1.3:
     accuracy: 27.832
   - spec_dec_algo: Eagle3
     accuracy: 27.832
-llama-7b-hf:
-  - accuracy: 30.457
-  - quant_algo: W4A16_GPTQ
-    accuracy: 28.844
-  - extra_acc_spec: beam_width=5
-    accuracy: 33.611
-  - extra_acc_spec: streamingllm
-    accuracy: 30.351
-meta-llama/Llama-2-7b-hf:
-  - accuracy: 28.960
-  - quant_algo: W8A8_SQ_PER_CHANNEL_PER_TOKEN_PLUGIN
-    accuracy: 28.227
-  - quant_algo: W8A8_SQ_PER_CHANNEL
-    accuracy: 30.000
-  - quant_algo: FP8
-    kv_cache_quant_algo: FP8
-    accuracy: 28.726
-  - quant_algo: W4A16_AWQ
-    accuracy: 29.144
-  - quant_algo: W4A16_GPTQ
-    accuracy: 27.999
 TinyLlama/TinyLlama-1.1B-Chat-v1.0:
   - accuracy: 28.328
   - dtype: float32
@@ -229,11 +208,6 @@ mistralai/Mistral-Small-3.1-24B-Instruct-2503:
   - quant_algo: FP8
     kv_cache_quant_algo: FP8
     accuracy: 27.0
-mistralai/Mistral-Nemo-12b-Base:
-  - accuracy: 28.906
-  - quant_algo: FP8
-    kv_cache_quant_algo: FP8
-    accuracy: 24.0
 nvidia/Mistral-NeMo-Minitron-8B-Instruct:
   - quant_algo: FP8
     accuracy: 32.553
@@ -345,8 +319,6 @@ nvidia/Nemotron-Mini-4B-Instruct:
   - quant_algo: FP8
     kv_cache_quant_algo: FP8
     accuracy: 25.72
-nemotron-nas/Llama-3_1-Nemotron-51B-Instruct:
-  - accuracy: 35.672
 deepseek-ai/DeepSeek-V3-Lite:
   - accuracy: 26.465
   - quant_algo: NVFP4

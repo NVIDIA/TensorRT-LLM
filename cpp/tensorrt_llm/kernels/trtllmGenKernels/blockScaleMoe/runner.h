@@ -85,8 +85,10 @@ enum class RoutingMethodType : int64_t
     MiniMax2 = 5,
     // SigmoidRenorm: Sigmoid -> TopK -> Renormalize
     SigmoidRenorm = 6,
+    // DeepSeek-V4
+    DeepSeekV4 = 7,
     // Unspecified
-    Unspecified = 7,
+    Unspecified = 8,
 };
 
 inline int32_t maybeGetMinTokenCount(int32_t numPaddedTokens, int32_t hiddenSize, int32_t dtypeSizeBits)
@@ -107,6 +109,7 @@ inline std::string serializeMoeRoutingMethodType(RoutingMethodType routingMethod
     case RoutingMethodType::RenormalizeNaive: return "RenormalizeNaive";
     case RoutingMethodType::MiniMax2: return "MiniMax2";
     case RoutingMethodType::SigmoidRenorm: return "SigmoidRenorm";
+    case RoutingMethodType::DeepSeekV4: return "DeepSeekV4";
     default: TLLM_CHECK_WITH_INFO(false, "Invalid routing method"); return "";
     };
 }
@@ -281,7 +284,15 @@ struct MoERunnerArgs
     float* gemm1_bias = nullptr;
     float* gemm1_alpha = nullptr;
     float* gemm1_beta = nullptr;
+    // Per-expert clamp tensor consumed by fused-activation GEMM cubins on the
+    // NVFP4 / MXFP4 paths. The FP8 separate-activation kernel uses the scalar
+    // variants below instead — see DevKernel.h::activation::Data::swigluLimit.
     float* gemm1_clamp_limit = nullptr;
+    // Uniform-across-experts scalar variant, only consumed by the FP8
+    // separate-activation kernel (DevKernel.cu::activationKernel /
+    // activationDeepSeekKernel). Avoids a per-CTA global load.
+    float gemm1_clamp_limit_value = 0.0f;
+    bool has_gemm1_clamp_limit_value = false;
     float* gemm2_bias = nullptr;
 
     int32_t num_tokens{0};

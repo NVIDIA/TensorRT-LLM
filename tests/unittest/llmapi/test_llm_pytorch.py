@@ -67,7 +67,7 @@ from dataclasses import replace
 
 
 @force_ampere
-@pytest.mark.parametrize("enable_chunked_prefill,", [False, True])
+@pytest.mark.parametrize("enable_chunked_prefill", [False, True])
 @pytest.mark.part2
 def test_tinyllama_logits_processor(enable_chunked_prefill):
     tinyllama_logits_processor_test_harness(
@@ -610,7 +610,8 @@ def test_nemotron_nas_lora(cuda_graph_config) -> None:
         model=
         f"{llm_models_root()}/nemotron-nas/Llama-3_3-Nemotron-Super-49B-v1",
         lora_config=lora_config,
-        cuda_graph_config=cuda_graph_config)
+        cuda_graph_config=cuda_graph_config,
+        trust_remote_code=True)
 
     prompts = [
         "Hello, how are you?",
@@ -951,8 +952,7 @@ def test_nemo_lora_unsupported_modules_validation(tmp_path):
 @pytest.mark.part1
 @test_lora_with_and_without_cuda_graph
 def test_gqa_nemo_lora(tmp_path, cuda_graph_config):
-    """
-    Test NeMo-format LoRA checkpoint loading and GQA support in TinyLlama.
+    """Test NeMo-format LoRA checkpoint loading and GQA support in TinyLlama.
 
     This test verifies two properties:
     1. That a NeMo-format LoRA checkpoint with GQA (grouped query attention) can be loaded and applied to a TinyLlama model,
@@ -1097,7 +1097,7 @@ class TestLlmError:
 
     @pytest.mark.part3
     def test_max_num_token_check(self):
-        """ LLM should raise error when got prompt length exceed the valid range. """
+        """LLM should raise error when got prompt length exceed the valid range."""
         llm = LLM(llama_model_path,
                   kv_cache_config=global_kvcache_config,
                   max_num_tokens=100)
@@ -1395,7 +1395,7 @@ class TestLlmError:
 
     @pytest.mark.part3
     def test_max_num_token_check(self):
-        """ LLM should raise error when got prompt length exceed the valid range. """
+        """LLM should raise error when got prompt length exceed the valid range."""
         llm = LLM(llama_model_path,
                   kv_cache_config=global_kvcache_config,
                   max_num_tokens=100)
@@ -1449,7 +1449,6 @@ async def test_llm_rpc_streaming():
 @skip_ray
 def test_llm_rpc_get_stats():
     """Test that get_stats works with RPC orchestrator."""
-
     with LLM(model=llama_model_path,
              kv_cache_config=global_kvcache_config,
              enable_iter_perf_stats=True,

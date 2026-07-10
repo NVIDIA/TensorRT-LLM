@@ -36,63 +36,12 @@ from typing import Callable
 
 import pytest
 
-from .harness import DisaggCancellationStressHarness, WorkerLaunchSpec, _LogSource
+from ._testing import DUMMY_YAML, make_spec
+from .harness import DisaggCancellationStressHarness, _LogSource
 
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
-
-
-_DUMMY_YAML = textwrap.dedent(
-    """\
-    hostname: localhost
-    model: dummy
-    backend: pytorch
-    context_servers: {}
-    generation_servers: {}
-    stress_config:
-      duration_min: 1
-      kv_cache_manager: v1
-      transceiver: cpp
-      log_scan:
-        hard_zero_patterns:
-          - "Broken promise"
-          - "Segfault"
-          - "Poisoned .* cache transfer buffer"
-    """
-)
-
-
-def _make_spec(role: str, index: int, log_path: Path | None) -> WorkerLaunchSpec:
-    """Tiny ``WorkerLaunchSpec`` factory for unit tests.
-
-    Only ``role`` / ``index`` / ``log_path`` are scanner-relevant —
-    the other fields are placeholders that would normally be set by
-    ``setup_disagg_cluster``.
-
-    Args:
-        role: Worker role tag, ``"ctx"`` or ``"gen"``. Surfaces in
-            failure reasons via ``_LogSource``.
-        index: Per-role index (``ctx_0``, ``gen_0``, ...). Surfaces
-            in failure reasons.
-        log_path: Path the scanner should tail, or ``None`` to
-            simulate ``save_log=False`` workers.
-
-    Returns:
-        A ``WorkerLaunchSpec`` with placeholder values for the
-        scanner-irrelevant fields.
-    """
-    return WorkerLaunchSpec(
-        role=role,
-        index=index,
-        model_name="dummy",
-        worker_config={},
-        work_dir="/tmp",
-        port=18000 + index,
-        device="0",
-        env={},
-        log_path=str(log_path) if log_path is not None else None,
-    )
 
 
 @pytest.fixture
@@ -109,7 +58,7 @@ def harness_with_two_workers(tmp_path: Path):
         so test wall-clock times stay bounded.
     """
     yaml_path = tmp_path / "stress.yaml"
-    yaml_path.write_text(_DUMMY_YAML)
+    yaml_path.write_text(DUMMY_YAML)
 
     # Tighten the scanner cadence so the tests finish quickly. The
     # default 0.5 s makes tests slow; 20 ms keeps real-clock latency
@@ -122,8 +71,8 @@ def harness_with_two_workers(tmp_path: Path):
     gen_log.touch()
 
     h._worker_specs = [
-        _make_spec("ctx", 0, ctx_log),
-        _make_spec("gen", 0, gen_log),
+        make_spec("ctx", 0, log_path=ctx_log),
+        make_spec("gen", 0, log_path=gen_log),
     ]
     return h, ctx_log, gen_log
 
@@ -360,7 +309,7 @@ def test_log_file_created_after_scanner_starts(harness_with_two_workers):
 
 def test_no_worker_specs_exits_immediately(tmp_path: Path):
     yaml_path = tmp_path / "stress.yaml"
-    yaml_path.write_text(_DUMMY_YAML)
+    yaml_path.write_text(DUMMY_YAML)
     h = DisaggCancellationStressHarness(yaml_path)
     # No specs at all.
 
@@ -374,11 +323,11 @@ def test_no_worker_specs_exits_immediately(tmp_path: Path):
 
 def test_specs_with_none_log_path_skip_gracefully(tmp_path: Path):
     yaml_path = tmp_path / "stress.yaml"
-    yaml_path.write_text(_DUMMY_YAML)
+    yaml_path.write_text(DUMMY_YAML)
     h = DisaggCancellationStressHarness(yaml_path)
     h._worker_specs = [
-        _make_spec("ctx", 0, None),
-        _make_spec("gen", 0, None),
+        make_spec("ctx", 0, log_path=None),
+        make_spec("gen", 0, log_path=None),
     ]
 
     t = threading.Thread(target=h._log_scanner_thread_body, daemon=True)
@@ -411,7 +360,7 @@ def test_no_hard_zero_patterns_exits_immediately(tmp_path: Path):
     h = DisaggCancellationStressHarness(yaml_path)
     ctx_log = tmp_path / "worker_ctx_18000.log"
     ctx_log.write_text("Broken promise: A\n")  # would match in normal config
-    h._worker_specs = [_make_spec("ctx", 0, ctx_log)]
+    h._worker_specs = [make_spec("ctx", 0, log_path=ctx_log)]
 
     t = threading.Thread(target=h._log_scanner_thread_body, daemon=True)
     t.start()
@@ -452,7 +401,7 @@ def test_invalid_regex_is_skipped_with_warning(tmp_path: Path, caplog):
     h = DisaggCancellationStressHarness(yaml_path, log_scanner_poll_interval_s=0.02)
     ctx_log = tmp_path / "worker_ctx_18000.log"
     ctx_log.write_text("Broken promise: A\n")
-    h._worker_specs = [_make_spec("ctx", 0, ctx_log)]
+    h._worker_specs = [make_spec("ctx", 0, log_path=ctx_log)]
 
     with caplog.at_level("ERROR"):
         fired = _run_scanner_until_failure_or_timeout(h)
@@ -494,7 +443,7 @@ def _consume_marks(seen: list[str]) -> Callable[[str], None]:
 
 
 def test_log_source_poll_returns_false_when_file_absent(tmp_path: Path):
-    spec = _make_spec("ctx", 0, tmp_path / "missing.log")
+    spec = make_spec("ctx", 0, log_path=tmp_path / "missing.log")
     src = _LogSource(spec=spec, path=Path(spec.log_path))  # type: ignore[arg-type]
     seen: list[str] = []
     assert src.poll([("X", re.compile("X"))], _consume_marks(seen)) is False
@@ -504,7 +453,7 @@ def test_log_source_poll_returns_false_when_file_absent(tmp_path: Path):
 def test_log_source_poll_returns_false_on_empty_read(tmp_path: Path):
     log = tmp_path / "empty.log"
     log.touch()
-    spec = _make_spec("gen", 0, log)
+    spec = make_spec("gen", 0, log_path=log)
     src = _LogSource(spec=spec, path=log)
     seen: list[str] = []
     assert src.poll([("X", re.compile("X"))], _consume_marks(seen)) is False
@@ -515,7 +464,7 @@ def test_log_source_poll_returns_false_on_empty_read(tmp_path: Path):
 def test_log_source_close_is_idempotent(tmp_path: Path):
     log = tmp_path / "x.log"
     log.write_text("hello\n")
-    spec = _make_spec("ctx", 0, log)
+    spec = make_spec("ctx", 0, log_path=log)
     src = _LogSource(spec=spec, path=log)
     src.poll([("X", re.compile("X"))], lambda r: None)
     src.close()

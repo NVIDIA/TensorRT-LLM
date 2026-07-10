@@ -50,6 +50,7 @@ from ..attention_interface import (
     AttentionDescriptor,
     AttentionLayout,
     AttentionRegistry,
+    AttentionType,
     BatchInfo,
     Constant,
     MHACallable,
@@ -847,6 +848,7 @@ class MLAPagedResourceHandler(ResourceHandler):
         """
         self.token_shape = token_shape
         self.dtype = dtype
+        self.attention_type = AttentionType.mla
 
     def _get_bytes_per_token(self) -> int:
         """The size of the resource per token in bytes."""

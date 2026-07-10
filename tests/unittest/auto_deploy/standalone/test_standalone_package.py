@@ -141,6 +141,40 @@ class TestStandalonePackage:
         )
         assert result.returncode == 0, f"stdout: {result.stdout}\nstderr: {result.stderr}"
 
+    def test_linear_simple_works_in_standalone_on_b200(self, standalone_package):
+        """The standalone linear op must work on the B200 bf16 path."""
+        result = _run_isolated(
+            standalone_package,
+            """
+            from unittest import mock
+
+            import torch
+            import llmc
+            from llmc.custom_ops.linear import linear
+
+            if torch.cuda.is_available():
+                device = "cuda"
+                dtype = torch.bfloat16
+            else:
+                device = "cpu"
+                dtype = torch.float32
+
+            x = torch.randn(2, 3, 5, device=device, dtype=dtype)
+            weight = torch.randn(7, 5, device=device, dtype=dtype)
+            bias = torch.randn(7, device=device, dtype=dtype)
+
+            # Force the Blackwell bf16 branch even when this standalone test
+            # runs on H100 CI instead of B200 CI.
+            with mock.patch.object(linear, "get_sm_version", return_value=100):
+                out = torch.ops.auto_deploy.torch_linear_simple(x, weight, bias)
+
+            ref = torch.ops.aten.linear(x, weight, bias)
+            torch.testing.assert_close(out, ref)
+            print("OK")
+            """,
+        )
+        assert result.returncode == 0, f"stdout: {result.stdout}\nstderr: {result.stderr}"
+
     def test_compat_types(self, standalone_package):
         """Standalone _compat types should work."""
         result = _run_isolated(
@@ -174,27 +208,65 @@ class TestStandalonePackage:
         if not os.path.isdir(tests_dir):
             pytest.skip("No tests directory in standalone package")
 
-        # Pass through the host env but override PYTHONPATH to use standalone tests.
-        # The venv's pip install already put llmc in the venv's site-packages,
-        # so `import llmc` resolves there (not to the host TRT-LLM).
+        # Keep runtime/compiler environment, but remove host Python import paths.
         standalone_env = {
-            **os.environ,
-            "PYTHONPATH": tests_dir + os.pathsep + os.path.join(tests_dir, "_utils_test"),
-            # Override PATH to prefer venv's python/pytest
-            "PATH": os.path.join(standalone_package["venv_dir"], "bin")
-            + os.pathsep
-            + os.environ.get("PATH", ""),
-            # FlashInfer JIT-compiles kernels and caches .so files under
-            # FLASHINFER_WORKSPACE_BASE (default: $HOME). Ninja records absolute
-            # source paths from the flashinfer package. Since this venv is
-            # ephemeral, a subsequent run would find stale cache entries pointing
-            # at the old (deleted) venv paths, causing all JIT builds to fail.
-            # Redirect the cache into the venv so it's discarded with it.
-            "FLASHINFER_WORKSPACE_BASE": standalone_package["venv_dir"],
+            key: value
+            for key, value in os.environ.items()
+            if key not in {"PYTHONHOME", "PYTHONPATH", "PYTHONUSERBASE"}
         }
+        standalone_env.update(
+            {
+                # Override PATH to prefer venv's python/pytest.
+                "PATH": os.path.join(standalone_package["venv_dir"], "bin")
+                + os.pathsep
+                + os.environ.get("PATH", ""),
+                # Keep subprocess workers from adding cwd/user paths that can
+                # expose the TensorRT-LLM checkout to standalone tests.
+                "PYTHONNOUSERSITE": "1",
+                "PYTHONSAFEPATH": "1",
+                # FlashInfer JIT-compiles kernels and caches .so files under
+                # FLASHINFER_WORKSPACE_BASE (default: $HOME). Ninja records absolute
+                # source paths from the flashinfer package. Since this venv is
+                # ephemeral, a subsequent run would find stale cache entries pointing
+                # at the old (deleted) venv paths, causing all JIT builds to fail.
+                # Redirect the cache into the venv so it's discarded with it.
+                "FLASHINFER_WORKSPACE_BASE": standalone_package["venv_dir"],
+            }
+        )
+
+        isolation_probe = subprocess.run(
+            [
+                python,
+                "-I",
+                "-c",
+                textwrap.dedent(
+                    """
+                    import importlib.util
+                    import sys
+
+                    spec = importlib.util.find_spec("tensorrt_llm")
+                    if spec is not None:
+                        raise SystemExit(
+                            "tensorrt_llm is importable in standalone test env: "
+                            "origin=%r, sys.path=%r" % (getattr(spec, "origin", None), sys.path)
+                        )
+                    """
+                ),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            cwd=pkg_dir,
+            env=standalone_env,
+        )
+        assert isolation_probe.returncode == 0, (
+            f"Standalone env leaked TensorRT-LLM\n"
+            f"stdout:\n{isolation_probe.stdout}\nstderr:\n{isolation_probe.stderr}"
+        )
 
         cmd = [
             python,
+            "-I",
             "-m",
             "pytest",
             os.path.join(tests_dir, "singlegpu"),

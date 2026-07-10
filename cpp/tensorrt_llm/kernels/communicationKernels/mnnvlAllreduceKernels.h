@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,6 +17,7 @@
 #define TRTLLM_MNNVL_ALLREDUCE_KERNELS_H
 
 #include "tensorrt_llm/common/config.h"
+#include "tensorrt_llm/kernels/communicationKernels/allReduceFusionKernels.h"
 #include <NvInferRuntime.h>
 #include <cstdint>
 
@@ -48,6 +49,8 @@ struct AllReduceFusionParams
     void* multicastPtr;       //!< Multicast buffer pointer.
     uint32_t* bufferFlags;    //!< Synchronization flags for coordinating communication phases
     bool rmsNormFusion;       //!< Whether to fuse RMS normalization with the AllReduce operation
+    ar_fusion::AllReduceFusionPattern pattern
+        = ar_fusion::AllReduceFusionPattern::kAllReduce; //!< Fused epilogue pattern
 
     //! @}
 
@@ -59,9 +62,13 @@ struct AllReduceFusionParams
     void const* gamma;      //!< Gamma parameters for RMS normalization (used when rmsnormFusion=true)
     double epsilon;         //!< Epsilon value for RMS normalization numerical stability (used when rmsnormFusion=true)
 
-    void* residualOut;      //!< Output tensor for residual connection result (used when rmsnormFusion=true)
-    void* output;           //!< Final output tensor containing the AllReduce result
-    cudaStream_t stream;    //!< CUDA stream for asynchronous kernel execution
+    void* residualOut = nullptr;        //!< Output tensor for residual connection result (used when rmsnormFusion=true)
+    void* output = nullptr;             //!< Output tensor containing the AllReduce or RMSNorm result
+    void* quantOut = nullptr;           //!< Quantized RMSNorm output (used by quantized fusion patterns)
+    void* scaleOut = nullptr;           //!< NVFP4 scale-factor output (used by NVFP4 fusion patterns)
+    float const* scaleFactor = nullptr; //!< Quantization scale factor
+    QuantizationSFLayout layout = QuantizationSFLayout::SWIZZLED; //!< NVFP4 scale-factor layout
+    cudaStream_t stream;                                          //!< CUDA stream for asynchronous kernel execution
 
     //! @}
 };

@@ -46,6 +46,87 @@ enum class BufferKind : uint8_t
     kRNN = 2
 };
 
+class BaseTransBufferManager;
+
+/// @brief RAII holder for an index from BaseTransBufferManager::assignBufferIndexFor{Send,Recv}.
+///        Releases on destruction (incl. exception unwind). Move-only; call release() on
+///        the happy path or detach() when ownership is handed off downstream.
+class BufferIndexHolder
+{
+public:
+    BufferIndexHolder() = default;
+
+    BufferIndexHolder(BaseTransBufferManager& mgr, std::optional<int> index, bool isRecv) noexcept
+        : mMgr(&mgr)
+        , mIndex(index)
+        , mHeld(index.has_value())
+        , mIsRecv(isRecv)
+    {
+    }
+
+    // Defined out-of-line in baseTransBuffer.cpp: release() calls
+    // BaseTransBufferManager methods, whose full definition appears later
+    // in this header.
+    ~BufferIndexHolder()
+    {
+        release();
+    }
+
+    BufferIndexHolder(BufferIndexHolder const&) = delete;
+    BufferIndexHolder& operator=(BufferIndexHolder const&) = delete;
+
+    BufferIndexHolder(BufferIndexHolder&& other) noexcept
+        : mMgr(other.mMgr)
+        , mIndex(other.mIndex)
+        , mHeld(other.mHeld)
+        , mIsRecv(other.mIsRecv)
+    {
+        other.mHeld = false;
+    }
+
+    BufferIndexHolder& operator=(BufferIndexHolder&& other) noexcept
+    {
+        if (this != &other)
+        {
+            release();
+            mMgr = other.mMgr;
+            mIndex = other.mIndex;
+            mHeld = other.mHeld;
+            mIsRecv = other.mIsRecv;
+            other.mHeld = false;
+        }
+        return *this;
+    }
+
+    [[nodiscard]] std::optional<int> index() const noexcept
+    {
+        return mIndex;
+    }
+
+    [[nodiscard]] bool held() const noexcept
+    {
+        return mHeld;
+    }
+
+    /// @brief Relinquish ownership without releasing. Use when a downstream
+    ///        owner (e.g. the formatter inside receiveSync) takes over the
+    ///        release responsibility on the happy path.
+    std::optional<int> detach() noexcept
+    {
+        mHeld = false;
+        return mIndex;
+    }
+
+    /// @brief Release the slot now and disarm the destructor. Safe to call multiple times.
+    void release() noexcept;
+
+private:
+    BaseTransBufferManager* mMgr{nullptr};
+    std::optional<int> mIndex{};
+    bool mHeld{false};
+    bool mIsRecv{true};
+};
+
 /// @brief Base class for cache transfer buffer management.
 /// Handles buffer pool allocation, index assignment, and slicing.
 /// Derived classes provide cache-specific size calculations.

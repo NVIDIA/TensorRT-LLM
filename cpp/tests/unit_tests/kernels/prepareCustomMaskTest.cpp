@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -372,6 +372,14 @@ TEST_F(PrepareCustomMaskTest, MediumBatch)
         /* maxSeqLenQ */ 32,
         /* maxSeqLenKv */ 256,
         /* numHeadsQPerKv */ 8);
+}
+
+TEST_F(PrepareCustomMaskTest, LargeBatchParallelOffsetScan)
+{
+    testPrepareCustomMask(/* batchSize */ 128,
+        /* maxSeqLenQ */ 16,
+        /* maxSeqLenKv */ 128,
+        /* numHeadsQPerKv */ 4);
 }
 
 } // namespace

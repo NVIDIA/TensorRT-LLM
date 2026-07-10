@@ -42,7 +42,8 @@ from ...sampling_params import SamplingParams
 from ..attention_backend import AttentionMetadata
 from ..model_config import ModelConfig
 from .modeling_auto import AutoModelForCausalLM
-from .modeling_multimodal_utils import (find_input_mm_embeds, fuse_input_embeds,
+from .modeling_multimodal_utils import (_is_mm_disagg, find_input_mm_embeds,
+                                        fuse_input_embeds,
                                         get_multimodal_embeddings)
 from .modeling_utils import register_auto_model
 
@@ -71,10 +72,6 @@ Phi4MMConfig = None
 # Make this a runtime lookup rather than a module-wide constant for easier unit testing.
 def _is_torch_compile() -> bool:
     return os.getenv("TLLM_MULTIMODAL_ENCODER_TORCH_COMPILE", "0") == "1"
-
-
-def _is_disagg() -> bool:
-    return os.getenv("TLLM_MULTIMODAL_DISAGGREGATED", "0") == "1"
 
 
 # Load the Phi4MM classes from HuggingFace Phi-4-multimodal-instruct repo.
@@ -957,7 +954,7 @@ class Phi4MMForCausalLM(transformers.PreTrainedModel):
     _supports_flash_attn = True
 
     def __init__(self, model_config: ModelConfig):
-        if _is_disagg():
+        if _is_mm_disagg():
             raise ValueError(
                 "Phi4MM does not support disaggregated inference yet.")
 
@@ -968,7 +965,7 @@ class Phi4MMForCausalLM(transformers.PreTrainedModel):
         if hasattr(self, "llm"):
             return
 
-        if not _is_disagg():
+        if not _is_mm_disagg():
             _load_phi4mm_classes(config._name_or_path)
 
             self.hf_phi4mm_model = HFPhi4MultimodalEncoder(config).eval()
@@ -989,7 +986,7 @@ class Phi4MMForCausalLM(transformers.PreTrainedModel):
 
     def load_weights(self, weights):
         # Load weights into HFPhi4MultimodalEncoder.
-        if not _is_disagg():
+        if not _is_mm_disagg():
             filtered_weights = {}
             for k, v in weights.items():
                 # Skip image_embed head weights since we set it as NoOp.
@@ -1029,10 +1026,17 @@ class Phi4MMForCausalLM(transformers.PreTrainedModel):
         weights = updated_weights
         self.llm.load_weights(weights)
 
-        # Move mm_token_ids to the correct device.
         self.mm_token_ids = torch.tensor(
-            [_IMAGE_SPECIAL_TOKEN_ID, _AUDIO_SPECIAL_TOKEN_ID],
-            device=self.device)
+            [_IMAGE_SPECIAL_TOKEN_ID, _AUDIO_SPECIAL_TOKEN_ID])
+
+    @property
+    def mm_token_ids(self) -> torch.Tensor:
+        return self._mm_token_ids
+
+    @mm_token_ids.setter
+    def mm_token_ids(self, token_ids: torch.Tensor) -> None:
+        self._mm_token_ids = token_ids.to("cpu")
+        self._mm_token_ids_device = token_ids.to(self.device)
 
     @property
     def vocab_size_padded(self) -> int:
@@ -1076,9 +1080,9 @@ class Phi4MMForCausalLM(transformers.PreTrainedModel):
         multimodal_params = kwargs.get("multimodal_params", [])
         mm_embedding = []
         if len(multimodal_params) > 0:
-            if not _is_disagg():
+            if not _is_mm_disagg():
                 encoder_kwargs = {
-                    "mm_token_ids": self.mm_token_ids,
+                    "mm_token_ids": self._mm_token_ids_device,
                 }
                 mm_embedding = get_multimodal_embeddings(
                     encoder_forward_fn=self.hf_phi4mm_model.forward,
@@ -1097,8 +1101,9 @@ class Phi4MMForCausalLM(transformers.PreTrainedModel):
             self.llm.model.embed_tokens,
             input_ids,
             mm_embedding,
-            mm_token_ids=self.mm_token_ids,
-            **kwargs,
+            mm_token_ids=self._mm_token_ids_device,
+            mm_token_indices=kwargs.get("mm_token_indices"),
+            text_token_indices=kwargs.get("text_token_indices"),
         )
 
         output_prob = self.llm.forward(

@@ -131,6 +131,21 @@ class TestPyResult:
 
         # Should not raise errors
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+    def test_get_diff_moves_encoder_output_to_cpu(self):
+        """Test get_diff normalizes encoder_output for cross-rank sync."""
+        result = PyResult(prompt_len=5, max_new_tokens=10)
+        encoder_output = torch.arange(6, dtype=torch.float32,
+                                      device="cuda").reshape(2, 3)
+
+        result.set_encoder_output(encoder_output)
+        diff = result.get_diff()
+
+        assert diff.encoder_output is not None
+        assert diff.encoder_output.device.type == "cpu"
+        assert result.encoder_output is encoder_output
+        torch.testing.assert_close(diff.encoder_output, encoder_output.cpu())
+
 
 class TestGetLatestLogitsUnexcluded:
     """Tests for PyResult.get_latest_logits_unexcluded"""

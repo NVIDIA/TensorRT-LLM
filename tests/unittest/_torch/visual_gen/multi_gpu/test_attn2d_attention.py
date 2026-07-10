@@ -34,6 +34,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 try:
+    import sys
+    from pathlib import Path
+
     from tensorrt_llm._torch.attention_backend.interface import PredefinedAttentionMask
     from tensorrt_llm._torch.visual_gen.attention_backend import Attention2DAttention
     from tensorrt_llm._torch.visual_gen.attention_backend.flash_attn4 import FlashAttn4Attention
@@ -41,7 +44,11 @@ try:
         _flash_attn_fwd as _fa4_fwd,
     )
     from tensorrt_llm._torch.visual_gen.attention_backend.interface import AttentionTensorLayout
-    from tensorrt_llm._utils import get_free_port
+
+    # Spawn distributed workers via a helper that retries with a fresh master
+    # port when the c10d rendezvous TCPStore loses the bind race (EADDRINUSE).
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from _visual_gen_dist_utils import spawn_with_retry
 
     MODULES_AVAILABLE = True
 except ImportError:
@@ -70,12 +77,23 @@ class _LSEVanillaAttention(nn.Module):
     values are available, as required by Attention2DAttention.
     """
 
-    def __init__(self, num_heads: int, head_dim: int):
+    def __init__(self, num_heads: int, head_dim: int, num_kv_heads: int | None = None):
         super().__init__()
         self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads or num_heads
         self.head_dim = head_dim
         self.scale = 1.0 / math.sqrt(head_dim)
         self._preferred_layout = AttentionTensorLayout.NHD
+
+    def _expand_kv_heads(
+        self, k_t: torch.Tensor, v_t: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.num_heads == self.num_kv_heads:
+            return k_t, v_t
+        repeat_factor = self.num_heads // self.num_kv_heads
+        k_t = k_t.repeat_interleave(repeat_factor, dim=1)
+        v_t = v_t.repeat_interleave(repeat_factor, dim=1)
+        return k_t, v_t
 
     @property
     def preferred_layout(self) -> AttentionTensorLayout:
@@ -93,14 +111,18 @@ class _LSEVanillaAttention(nn.Module):
         q_t = q.transpose(1, 2).float()
         k_t = k.transpose(1, 2).float()
         v_t = v.transpose(1, 2).float()
-        out = F.scaled_dot_product_attention(q_t, k_t, v_t, scale=self.scale)
+        k_t, v_t = self._expand_kv_heads(k_t, v_t)
+        out = F.scaled_dot_product_attention(
+            q_t, k_t, v_t, scale=self.scale, enable_gqa=self.num_heads != self.num_kv_heads
+        )
         return out.to(q.dtype).transpose(1, 2).contiguous()
 
     def forward_with_lse(self, q, k, v, batch_size=None, seq_len=None, **kwargs):
         """Return (output [B, S, H, D], lse [B, H, S])."""
-        q_t = q.transpose(1, 2).float()  # [B, H, S_q, D]
-        k_t = k.transpose(1, 2).float()  # [B, H, S_k, D]
-        v_t = v.transpose(1, 2).float()  # [B, H, S_k, D]
+        q_t = q.transpose(1, 2).float()  # [B, H_q, S_q, D]
+        k_t = k.transpose(1, 2).float()  # [B, H_kv, S_k, D]
+        v_t = v.transpose(1, 2).float()  # [B, H_kv, S_k, D]
+        k_t, v_t = self._expand_kv_heads(k_t, v_t)
         scores = torch.matmul(q_t, k_t.transpose(-2, -1)) * self.scale  # [B, H, S_q, S_k]
         lse = torch.logsumexp(scores, dim=-1)  # [B, H, S_q]
         attn = torch.softmax(scores, dim=-1)
@@ -146,12 +168,13 @@ def run_test_in_distributed(world_size: int, test_fn: Callable, use_cuda: bool =
         pytest.skip(f"Test requires {world_size} GPUs, only {torch.cuda.device_count()} available")
 
     backend = "nccl" if use_cuda else "gloo"
-    port = get_free_port()
-    mp.spawn(
-        _distributed_worker,
-        args=(world_size, backend, test_fn, port),
-        nprocs=world_size,
-        join=True,
+    spawn_with_retry(
+        lambda port: mp.spawn(
+            _distributed_worker,
+            args=(world_size, backend, test_fn, port),
+            nprocs=world_size,
+            join=True,
+        )
     )
 
 
@@ -385,6 +408,97 @@ def _logic_attn2d_asymmetric_mesh_4x1(rank, world_size):
     )
 
 
+def _logic_attn2d_gqa(rank, world_size):
+    """GQA (H_kv < H_q) with equal Q/KV sequence lengths on a 2x2 mesh."""
+    row_size, col_size = 2, 2
+    batch, num_heads, num_kv_heads, head_dim = 2, 8, 2, 64
+    seq_per_rank = 8
+    seq_full = seq_per_rank * world_size
+
+    device = torch.device(f"cuda:{rank}" if torch.cuda.is_available() else "cpu")
+    row_pg, col_pg = _make_process_groups(rank, world_size, row_size, col_size)
+
+    inner = _LSEVanillaAttention(num_heads=num_heads, head_dim=head_dim, num_kv_heads=num_kv_heads)
+    try:
+        attn = Attention2DAttention(inner, row_pg, col_pg)
+    except ImportError:
+        pytest.skip("flash_attn_combine JIT kernels not available")
+
+    torch.manual_seed(42)
+    q_full = torch.randn(batch, seq_full, num_heads, head_dim, device=device)
+    k_full = torch.randn(batch, seq_full, num_kv_heads, head_dim, device=device)
+    v_full = torch.randn(batch, seq_full, num_kv_heads, head_dim, device=device)
+
+    q_shard = q_full[:, rank * seq_per_rank : (rank + 1) * seq_per_rank].contiguous()
+    k_shard = k_full[:, rank * seq_per_rank : (rank + 1) * seq_per_rank].contiguous()
+    v_shard = v_full[:, rank * seq_per_rank : (rank + 1) * seq_per_rank].contiguous()
+
+    attn2d_output = attn(q_shard, k_shard, v_shard, batch_size=batch)
+
+    scale = 1.0 / math.sqrt(head_dim)
+    q_std = q_full.transpose(1, 2).float()
+    k_std = k_full.transpose(1, 2).float()
+    v_std = v_full.transpose(1, 2).float()
+    std_output = F.scaled_dot_product_attention(q_std, k_std, v_std, scale=scale, enable_gqa=True)
+    std_output = std_output.transpose(1, 2).to(attn2d_output.dtype)
+
+    expected_shard = std_output[:, rank * seq_per_rank : (rank + 1) * seq_per_rank]
+    torch.testing.assert_close(
+        attn2d_output,
+        expected_shard,
+        rtol=1e-3,
+        atol=1e-3,
+        msg=f"Rank {rank}: Attention2D GQA output differs from standard attention",
+    )
+
+
+def _logic_attn2d_cross_attention(rank, world_size):
+    """Cross-attention with different Q/KV lengths and GQA on a 2x2 mesh."""
+    row_size, col_size = 2, 2
+    batch, num_heads, num_kv_heads, head_dim = 2, 8, 2, 64
+    seq_per_rank_q = 8
+    seq_per_rank_kv = 4
+    seq_full_q = seq_per_rank_q * world_size
+    seq_full_kv = seq_per_rank_kv * world_size
+
+    device = torch.device(f"cuda:{rank}" if torch.cuda.is_available() else "cpu")
+    row_pg, col_pg = _make_process_groups(rank, world_size, row_size, col_size)
+
+    inner = _LSEVanillaAttention(num_heads=num_heads, head_dim=head_dim, num_kv_heads=num_kv_heads)
+    try:
+        attn = Attention2DAttention(inner, row_pg, col_pg)
+    except ImportError:
+        pytest.skip("flash_attn_combine JIT kernels not available")
+
+    torch.manual_seed(42)
+    q_full = torch.randn(batch, seq_full_q, num_heads, head_dim, device=device)
+    k_full = torch.randn(batch, seq_full_kv, num_kv_heads, head_dim, device=device)
+    v_full = torch.randn(batch, seq_full_kv, num_kv_heads, head_dim, device=device)
+
+    q_shard = q_full[:, rank * seq_per_rank_q : (rank + 1) * seq_per_rank_q].contiguous()
+    k_shard = k_full[:, rank * seq_per_rank_kv : (rank + 1) * seq_per_rank_kv].contiguous()
+    v_shard = v_full[:, rank * seq_per_rank_kv : (rank + 1) * seq_per_rank_kv].contiguous()
+
+    attn2d_output = attn(q_shard, k_shard, v_shard, batch_size=batch)
+    assert attn2d_output.shape == q_shard.shape
+
+    scale = 1.0 / math.sqrt(head_dim)
+    q_std = q_full.transpose(1, 2).float()
+    k_std = k_full.transpose(1, 2).float()
+    v_std = v_full.transpose(1, 2).float()
+    std_output = F.scaled_dot_product_attention(q_std, k_std, v_std, scale=scale, enable_gqa=True)
+    std_output = std_output.transpose(1, 2).to(attn2d_output.dtype)
+
+    expected_shard = std_output[:, rank * seq_per_rank_q : (rank + 1) * seq_per_rank_q]
+    torch.testing.assert_close(
+        attn2d_output,
+        expected_shard,
+        rtol=1e-3,
+        atol=1e-3,
+        msg=f"Rank {rank}: Attention2D cross-attention output differs from standard attention",
+    )
+
+
 # =============================================================================
 # Test classes
 # =============================================================================
@@ -420,6 +534,18 @@ class TestAttn2DAttentionMeshVariants:
         run_test_in_distributed(
             world_size=4, test_fn=_logic_attn2d_asymmetric_mesh_4x1, use_cuda=True
         )
+
+
+class TestAttn2DAttentionGQAAndCrossAttention:
+    """Attention2DAttention with GQA and cross-attention."""
+
+    def test_attn2d_gqa(self):
+        """GQA with H_kv < H_q on a 2x2 mesh."""
+        run_test_in_distributed(world_size=4, test_fn=_logic_attn2d_gqa, use_cuda=True)
+
+    def test_attn2d_cross_attention(self):
+        """Cross-attention with different Q/KV lengths and GQA on a 2x2 mesh."""
+        run_test_in_distributed(world_size=4, test_fn=_logic_attn2d_cross_attention, use_cuda=True)
 
 
 def _logic_attn2d_fa4_vs_standard(rank, world_size):

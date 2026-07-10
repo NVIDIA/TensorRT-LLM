@@ -1,9 +1,14 @@
+from unittest import mock
+
 import pytest
 import torch
 
+import tensorrt_llm._torch.models.modeling_multimodal_utils as multimodal_utils
 from tensorrt_llm._torch.models.modeling_multimodal_utils import (
-    filter_mm_token_from_input_ids, fuse_input_embeds)
+    filter_mm_token_from_input_ids, find_input_mm_embeds, fuse_input_embeds)
 from tensorrt_llm._torch.modules.embedding import Embedding
+from tensorrt_llm.inputs.multimodal import (MultimodalParams,
+                                            MultimodalRuntimeData)
 
 
 def make_embedding(num_embeddings: int = 100,
@@ -107,6 +112,60 @@ def test_fuse_input_embeds_mismatch_raises(device):
 
 @pytest.mark.parametrize("device", ["cpu"] +
                          (["cuda"] if torch.cuda.is_available() else []))
+def test_fuse_input_embeds_mismatch_error_includes_counts(device):
+    emb = make_embedding(num_embeddings=50, hidden_size=8, device=device)
+    input_ids = torch.tensor([1, 51, 2, 52, 3], dtype=torch.long, device=device)
+    text_idx, mm_idx = filter_mm_token_from_input_ids(
+        input_ids, vocab_size=emb.num_embeddings)
+    wrong_mm = torch.randn(mm_idx.shape[0] + 1, 8, device=device)
+
+    with pytest.raises(ValueError,
+                       match="Multimodal token count mismatch") as exc_info:
+        fuse_input_embeds(
+            emb,
+            input_ids,
+            [wrong_mm],
+            text_token_indices=text_idx,
+            mm_token_indices=mm_idx,
+        )
+
+    error_message = str(exc_info.value)
+    assert "found 2 image tokens in input_ids" in error_message
+    assert "received 3 image embeddings" in error_message
+
+
+@pytest.mark.parametrize("device", ["cpu"] +
+                         (["cuda"] if torch.cuda.is_available() else []))
+def test_fuse_input_embeds_with_chunked_multimodal_slice(device):
+    hidden = 8
+    emb = make_embedding(num_embeddings=50, hidden_size=hidden, device=device)
+    input_ids = torch.tensor([1, 51, 2, 52, 3], dtype=torch.long, device=device)
+    full_mm_embed = torch.randn(5, hidden, device=device)
+    runtime = MultimodalRuntimeData(
+        past_seen_token_num=3,
+        chunk_end_pos=5,
+        embed_mask_cumsum=torch.arange(1, 6, dtype=torch.int64),
+    )
+    multimodal_params = [MultimodalParams(multimodal_runtime=runtime)]
+
+    mm_embeds = find_input_mm_embeds([full_mm_embed], multimodal_params)
+    out_ids, out_embeds = fuse_input_embeds(emb,
+                                            input_ids,
+                                            mm_embeds,
+                                            mm_token_ids=None)
+
+    assert out_ids is None
+    assert out_embeds is not None
+    _, mm_idx = filter_mm_token_from_input_ids(input_ids,
+                                               vocab_size=emb.num_embeddings)
+    torch.testing.assert_close(
+        out_embeds[mm_idx],
+        full_mm_embed[3:5].to(dtype=out_embeds.dtype, device=out_embeds.device),
+    )
+
+
+@pytest.mark.parametrize("device", ["cpu"] +
+                         (["cuda"] if torch.cuda.is_available() else []))
 def test_fuse_input_embeds_success_oov_path(device):
     hidden = 8
     emb = make_embedding(num_embeddings=40, hidden_size=hidden, device=device)
@@ -186,10 +245,12 @@ def test_fuse_input_embeds_empty_multimodal_params_falls_through(device):
 
 @pytest.mark.parametrize("device", ["cpu"] +
                          (["cuda"] if torch.cuda.is_available() else []))
-def test_fuse_input_embeds_kwargs_precedence_over_sentinel_and_ids(device):
+def test_fuse_input_embeds_skips_filter_when_indices_provided(device):
     """
-    Ensure that when kwargs provide precomputed indices, they take precedence
-    over both OOV-sentinel filtering and explicit mm_token_ids.
+    Sync-free contract: when both ``text_token_indices`` and
+    ``mm_token_indices`` are passed in, ``fuse_input_embeds`` must NOT call
+    ``filter_mm_token_from_input_ids`` (which is the source of the torch.where
+    host sync on GPU input_ids).
     """
     hidden = 8
     vocab_size = 40
@@ -197,34 +258,151 @@ def test_fuse_input_embeds_kwargs_precedence_over_sentinel_and_ids(device):
                          hidden_size=hidden,
                          device=device)
 
-    # Use vocab_size+1 as OOV sentinel
-    oov_sentinel = vocab_size + 1
-    input_ids = torch.tensor([0, oov_sentinel, 1, oov_sentinel, 2],
+    input_ids = torch.tensor([0, 1, 41, 2, 42, 3, 43, 4],
+                             dtype=torch.long,
+                             device=device)
+    text_idx, mm_idx = filter_mm_token_from_input_ids(input_ids,
+                                                      vocab_size=vocab_size)
+    mm_emb = torch.randn(mm_idx.shape[0], hidden, device=device)
+
+    with mock.patch.object(
+            multimodal_utils,
+            "filter_mm_token_from_input_ids",
+            wraps=multimodal_utils.filter_mm_token_from_input_ids) as spy:
+        fuse_input_embeds(
+            emb,
+            input_ids,
+            mm_embeds=[mm_emb],
+            mm_token_ids=None,
+            text_token_indices=text_idx,
+            mm_token_indices=mm_idx,
+        )
+    spy.assert_not_called()
+
+
+@pytest.mark.parametrize("device", ["cpu"] +
+                         (["cuda"] if torch.cuda.is_available() else []))
+def test_fuse_input_embeds_calls_filter_when_indices_missing(device):
+    """
+    Negative half of the sync-free contract: when indices are absent the
+    function falls back to ``filter_mm_token_from_input_ids`` (the host-sync
+    path). Pairs with the test above so a regression that silently drops the
+    sync-free fast path is caught.
+    """
+    hidden = 8
+    vocab_size = 40
+    emb = make_embedding(num_embeddings=vocab_size,
+                         hidden_size=hidden,
+                         device=device)
+
+    input_ids = torch.tensor([0, 1, 41, 2, 42, 3, 43, 4],
+                             dtype=torch.long,
+                             device=device)
+    _, mm_idx = filter_mm_token_from_input_ids(input_ids, vocab_size=vocab_size)
+    mm_emb = torch.randn(mm_idx.shape[0], hidden, device=device)
+
+    with mock.patch.object(
+            multimodal_utils,
+            "filter_mm_token_from_input_ids",
+            wraps=multimodal_utils.filter_mm_token_from_input_ids) as spy:
+        fuse_input_embeds(
+            emb,
+            input_ids,
+            mm_embeds=[mm_emb],
+            mm_token_ids=None,
+        )
+    spy.assert_called_once()
+
+
+@pytest.mark.parametrize("device", ["cpu"] +
+                         (["cuda"] if torch.cuda.is_available() else []))
+def test_fuse_input_embeds_in_vocab_fast_path_matches_oov(device):
+    """
+    In-vocab fast path: when ``mm_token_ids`` is provided, fuse_input_embeds
+    embeds the full ``input_ids`` and overwrites mm rows. The result must
+    match the OOV-style gather+scatter path bit-for-bit on an in-vocab input.
+    """
+    hidden = 8
+    vocab_size = 40
+    emb = make_embedding(num_embeddings=vocab_size,
+                         hidden_size=hidden,
+                         device=device)
+
+    mm_placeholder = 17
+    input_ids = torch.tensor([0, mm_placeholder, 1, mm_placeholder, 2],
+                             dtype=torch.long,
+                             device=device)
+    text_idx = torch.tensor([0, 2, 4], dtype=torch.long, device=device)
+    mm_idx = torch.tensor([1, 3], dtype=torch.long, device=device)
+    mm_emb = torch.randn(mm_idx.shape[0], hidden, device=device)
+    mm_token_ids = torch.tensor([mm_placeholder],
+                                dtype=torch.long,
+                                device=device)
+
+    # OOV-style path (mm_token_ids=None): gather text positions + scatter
+    _, out_embeds_oov = fuse_input_embeds(
+        emb,
+        input_ids,
+        mm_embeds=[mm_emb],
+        mm_token_ids=None,
+        text_token_indices=text_idx,
+        mm_token_indices=mm_idx,
+    )
+
+    # In-vocab fast path (mm_token_ids set): full embed + scatter mm
+    _, out_embeds_fast = fuse_input_embeds(
+        emb,
+        input_ids,
+        mm_embeds=[mm_emb],
+        mm_token_ids=mm_token_ids,
+        text_token_indices=text_idx,
+        mm_token_indices=mm_idx,
+    )
+
+    torch.testing.assert_close(out_embeds_fast, out_embeds_oov)
+
+
+@pytest.mark.parametrize("device", ["cpu"] +
+                         (["cuda"] if torch.cuda.is_available() else []))
+def test_fuse_input_embeds_kwargs_precedence_over_mm_token_ids(device):
+    """
+    When precomputed indices are provided, they take precedence over
+    ``mm_token_ids`` for filtering. Callers that pass ``mm_token_ids`` are
+    declaring mm tokens are in-vocab (the in-vocab fast path), so we exercise
+    this here with in-vocab placeholders rather than the (unsupported) OOV
+    sentinel + ``mm_token_ids`` combination.
+    """
+    hidden = 8
+    vocab_size = 40
+    emb = make_embedding(num_embeddings=vocab_size,
+                         hidden_size=hidden,
+                         device=device)
+
+    # In-vocab mm placeholder ID
+    mm_placeholder = 17
+    input_ids = torch.tensor([0, mm_placeholder, 1, mm_placeholder, 2],
                              dtype=torch.long,
                              device=device)
 
-    # Precompute correct indices (kwargs path)
-    text_idx, mm_idx = filter_mm_token_from_input_ids(input_ids,
-                                                      vocab_size=vocab_size,
-                                                      mm_token_ids=None)
+    # Hand-pick the correct precomputed indices
+    text_idx = torch.tensor([0, 2, 4], dtype=torch.long, device=device)
+    mm_idx = torch.tensor([1, 3], dtype=torch.long, device=device)
     mm_emb = torch.randn(mm_idx.shape[0], hidden, device=device)
 
     # Provide a deliberately incorrect mm_token_ids to ensure it is ignored
-    bad_mm_token_ids = torch.tensor(
-        [0], dtype=torch.long,
-        device=device)  # would misclassify index 0 as mm if used
+    # for filtering. It also signals "in-vocab safe" so the fast path is taken.
+    bad_mm_token_ids = torch.tensor([0], dtype=torch.long, device=device)
 
     out_ids, out_embeds = fuse_input_embeds(
         emb,
         input_ids,
         mm_embeds=[mm_emb],
-        mm_token_ids=
-        bad_mm_token_ids,  # should be ignored because indices are provided
+        mm_token_ids=bad_mm_token_ids,
         text_token_indices=text_idx,
         mm_token_indices=mm_idx,
     )
 
-    # Validate outputs
+    # Validate outputs: precomputed indices must win over bad_mm_token_ids
     assert out_ids is None
     assert out_embeds is not None
     assert out_embeds.shape == (input_ids.numel(), hidden)

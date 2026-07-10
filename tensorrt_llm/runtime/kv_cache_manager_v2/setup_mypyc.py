@@ -76,6 +76,7 @@ modules = [
     "kv_cache_manager_v2/_config.py",
     "kv_cache_manager_v2/_copy_engine.py",
     "kv_cache_manager_v2/_cuda_virt_mem.py",
+    "kv_cache_manager_v2/_event_manager.py",
     "kv_cache_manager_v2/_exceptions.py",
     "kv_cache_manager_v2/_life_cycle_registry.py",
     "kv_cache_manager_v2/_page.py",
@@ -85,6 +86,7 @@ modules = [
     "kv_cache_manager_v2/_core/__init__.py",
     "kv_cache_manager_v2/_core/_kv_cache_manager.py",
     "kv_cache_manager_v2/_core/_kv_cache.py",
+    "kv_cache_manager_v2/_core/_pending_stats.py",
     # _eviction_controller submodule
     "kv_cache_manager_v2/_eviction_controller/__init__.py",
     "kv_cache_manager_v2/_eviction_controller/_eviction_controller.py",

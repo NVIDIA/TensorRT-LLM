@@ -223,10 +223,14 @@ class TestSingleNodeSpawnLocalRank:
             return e
 
         with (
-            patch("tensorrt_llm.visual_gen.visual_gen._detect_external_launch", return_value=None),
-            patch("tensorrt_llm.visual_gen.visual_gen.mp.get_context", return_value=mock_ctx),
-            patch("tensorrt_llm.visual_gen.visual_gen.threading.Thread") as mock_thread_cls,
-            patch("tensorrt_llm.visual_gen.visual_gen.threading.Event", side_effect=pre_set_event),
+            patch(
+                "tensorrt_llm._torch.visual_gen.executor._detect_external_launch", return_value=None
+            ),
+            patch("tensorrt_llm._torch.visual_gen.executor.mp.get_context", return_value=mock_ctx),
+            patch("tensorrt_llm._torch.visual_gen.executor.threading.Thread") as mock_thread_cls,
+            patch(
+                "tensorrt_llm._torch.visual_gen.executor.threading.Event", side_effect=pre_set_event
+            ),
             patch.object(DiffusionRemoteClient, "_wait_ready"),
         ):
             mock_thread_cls.return_value = MagicMock()  # thread.start() is a no-op

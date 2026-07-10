@@ -40,6 +40,7 @@ from ..attention_interface import (
     AttentionDescriptor,
     AttentionLayout,
     AttentionRegistry,
+    AttentionType,
     BatchInfo,
     Constant,
     KVPagedResourceHandler,
@@ -416,6 +417,11 @@ def flashinfer_mha_with_cache(
             kv_layout=_GlobalFlashInferPlanner.kv_layout,
         )
 
+    if num_prefill > 0 and not read_cache_only:
+        # FlashInfer planning depends on the preceding paged-KV append completing.
+        # Keep the same append-before-plan synchronization used by the PyTorch backend.
+        torch.cuda.current_stream().synchronize()
+
     bs = b * s
     if out is not None:
         y = out.view(-1, n_heads, head_dim)
@@ -600,6 +606,7 @@ class FlashInferAttention(AttentionDescriptor):
                 kv_factor=2,
                 kv_layout=_GlobalFlashInferPlanner.kv_layout,
                 sliding_window=sliding_window,
+                attention_type=AttentionType.mha,
             )
         }
 

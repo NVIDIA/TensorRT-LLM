@@ -49,47 +49,6 @@ def test_llmapi_quant_llama_70b(llm_root, engine_dir, llm_venv):
 run_llm_path = os.path.join(os.path.dirname(__file__), "_run_llmapi_llm.py")
 
 
-@pytest.mark.parametrize("model_name,model_path", [
-    ("llama", "llama-models-v2/llama-v2-7b-hf"),
-])
-def test_llmapi_load_engine_from_build_command_with_lora(
-        llm_root, llm_venv, engine_dir, model_name, model_path):
-    llama_example_root = os.path.join(llm_root, "examples", "models", "core",
-                                      model_name)
-    dtype = 'bfloat16'
-    cmodel_dir = os.path.join(engine_dir, f"{model_name}-engine")
-
-    ckpt_dir = convert_weights(llm_venv=llm_venv,
-                               example_root=llama_example_root,
-                               cmodel_dir=cmodel_dir,
-                               model=model_name,
-                               model_path=f'{llm_models_root()}/{model_path}',
-                               data_type=dtype)
-
-    engine_dir = os.path.join(engine_dir, f"{model_name}-engine")
-
-    build_cmd = [
-        "trtllm-build",
-        f"--checkpoint_dir={ckpt_dir}",
-        f"--output_dir={engine_dir}",
-        f"--max_batch_size={1}",
-        f"--max_input_len={924}",
-        f"--max_seq_len={1024}",
-        f"--max_beam_width={1}",
-        f"--gemm_plugin={dtype}",
-        f"--gpt_attention_plugin={dtype}",
-        f"--lora_plugin={dtype}",
-        f"--lora_target_modules=attn_q",
-    ]
-    check_call(" ".join(build_cmd), shell=True, env=llm_venv._new_env)
-
-    venv_check_call(llm_venv, [
-        run_llm_path,
-        "--model_dir",
-        engine_dir,
-    ])
-
-
 @pytest.mark.skip(reason="https://nvbugs/5574355")
 @pytest.mark.parametrize("model_name,model_path", [
     ("llama", "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"),
@@ -154,27 +113,6 @@ def test_llmapi_build_command_parameters_align(llm_root, llm_venv, engine_dir,
     assert build_cmd_cfg == build_llmapi_cfg
 
 
-def test_llmapi_load_ckpt_from_convert_command(llm_root, llm_venv, engine_dir):
-    llama_example_root = os.path.join(llm_root, "examples", "models", "core",
-                                      "llama")
-    dtype = 'float16'
-    cmodel_dir = os.path.join(engine_dir, "llama-7b-cmodel")
-
-    ckpt_dir = convert_weights(
-        llm_venv=llm_venv,
-        example_root=llama_example_root,
-        cmodel_dir=cmodel_dir,
-        model='llama-7b',
-        model_path=f'{llm_models_root()}/llama-models/llama-7b-hf',
-        data_type=dtype)
-
-    venv_check_call(llm_venv, [
-        run_llm_path,
-        "--model_dir",
-        ckpt_dir,
-    ])
-
-
 def test_llmapi_exit(llm_venv):
     llm_exit_script = unittest_path() / "llmapi/run_llm_exit.py"
     llama_model_dir = Path(
@@ -201,7 +139,6 @@ def test_llmapi_exit_multi_gpu(llm_venv):
 
 
 @pytest.mark.parametrize("model_name,model_path", [
-    ("llama", "llama-models/llama-7b-hf"),
     ("llama", "codellama/CodeLlama-7b-Instruct-hf"),
 ])
 def test_llmapi_load_engine_from_build_command(llm_root, llm_venv, engine_dir,

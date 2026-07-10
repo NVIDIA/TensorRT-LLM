@@ -1,5 +1,4 @@
 import copy
-import os
 from typing import Any, ClassVar, Dict, List, Optional, Tuple, Union
 
 import numpy as np
@@ -15,7 +14,9 @@ from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import \
     BaseWeightMapper
 from tensorrt_llm._torch.models.checkpoints.hf.llava_next_weight_mapper import \
     LlavaNextHfWeightMapper
-from tensorrt_llm.inputs.multimodal import MultimodalParams
+from tensorrt_llm._torch.models.modeling_multimodal_utils import _is_mm_disagg
+from tensorrt_llm.inputs.multimodal import (DisaggPrefillMultimodalInputs,
+                                            MultimodalParams)
 
 from ...inputs import (BaseMultimodalDummyInputsBuilder,
                        BaseMultimodalInputProcessor, ContentFormat,
@@ -29,10 +30,9 @@ from ..model_config import ModelConfig
 from .modeling_auto import AutoModelForCausalLM
 from .modeling_clip import CLIPVisionModel
 from .modeling_multimodal_utils import (find_input_mm_embeds, fuse_input_embeds,
+                                        get_attached_multimodal_embeddings,
                                         get_multimodal_embeddings)
 from .modeling_utils import register_auto_model, register_vision_encoder
-
-DISAGG = os.getenv('TLLM_MULTIMODAL_DISAGGREGATED', '0') == '1'
 
 
 class LlavaNextInputProcessor(BaseMultimodalInputProcessor,
@@ -86,6 +86,10 @@ class LlavaNextInputProcessor(BaseMultimodalInputProcessor,
     def dtype(self) -> torch.dtype:
         return self._dtype
 
+    def get_mm_token_ids(self) -> Optional[torch.Tensor]:
+        """Return in-vocab multimodal placeholder token IDs."""
+        return torch.tensor([self.image_token_index], dtype=torch.int32)
+
     def get_text_with_mm_placeholders(self, mm_counts: Dict[str, int]) -> str:
         """
         Return minimal placeholder text for the given multimodal item counts,
@@ -111,7 +115,8 @@ class LlavaNextInputProcessor(BaseMultimodalInputProcessor,
         num_mm_tokens_per_placeholder: List[int],
     ) -> Tuple[List[int], List[int], List[int]]:
         """
-        Shared logic (called by expand_prompt_token_ids_for_mm and get_prompt_token_ids):
+        Shared logic (called by expand_prompt_token_ids_for_mm and
+        build_disagg_prefill_multimodal_inputs):
         replace each image placeholder token in prompt_token_ids
         with placeholder_id repeated num_mm_tokens_per_placeholder[i] times.
 
@@ -121,7 +126,11 @@ class LlavaNextInputProcessor(BaseMultimodalInputProcessor,
             mm_token_offsets (List[int]): Offset (position) in the expanded sequence where each MM token group (for each placeholder) begins.
         """
         image_token_id = self.config.image_token_index
-        placeholder_id = self.vocab_size + 1
+        # Keep the placeholder in-vocab so the model engine can locate mm
+        # positions via ``torch.isin(input_ids, mm_token_ids)``. The previous
+        # ``vocab_size + 1`` OOV remap is no longer needed — the model class
+        # exposes ``mm_token_ids = [image_token_index]`` to the engine.
+        placeholder_id = image_token_id
 
         expanded: List[int] = []
         mm_token_lengths: List[int] = []
@@ -236,10 +245,15 @@ class LlavaNextInputProcessor(BaseMultimodalInputProcessor,
             [mm_token_positions, mm_token_positions + 1]).unique()
         input_ids_splits = list(input_ids.tensor_split(mm_split_positions.cpu(
         )))  # len(input_ids_splits) = num_segments after mm tokens are isolated
+        # Use the in-vocab image_token_index repeated mm_total_length times
+        # (instead of unique arange(vocab_size, vocab_size + L) OOV IDs).
+        # ``fuse_input_embeds`` only needs a predicate that distinguishes mm vs
+        # text positions, not unique per-position IDs.
         mm_ids_splits = list(
-            torch.arange(self.vocab_size,
-                         self.vocab_size + mm_total_length,
-                         device=input_ids.device).split(mm_lengths_per_split)
+            torch.full((mm_total_length, ),
+                       self.config.image_token_index,
+                       dtype=input_ids.dtype,
+                       device=input_ids.device).split(mm_lengths_per_split)
         )  # len(mm_ids_splits) = num_mm_segments
 
         for i, mm_ids in enumerate(mm_ids_splits):
@@ -268,12 +282,11 @@ class LlavaNextInputProcessor(BaseMultimodalInputProcessor,
         mm_features = mm_features.view(-1, mm_features.shape[-1])
         return fused_input_ids, mm_features
 
-    def get_prompt_token_ids(
-        self, inputs: Union[TextPrompt, TokensPrompt],
-        mm_handles: List[Dict[str,
-                              Any]]) -> Tuple[List[int], List[int], List[int]]:
+    def build_disagg_prefill_multimodal_inputs(
+            self, inputs: Union[TextPrompt, TokensPrompt],
+            mm_handles: List[Dict[str, Any]]) -> DisaggPrefillMultimodalInputs:
         """
-        Build input token ids with multimodal placeholders expanded to the number of MM tokens.
+        Build disaggregated prefill inputs from multimodal embedding handles.
 
         Uses an already tokenized prompt or tokenizes the txt prompt first.
 
@@ -282,10 +295,9 @@ class LlavaNextInputProcessor(BaseMultimodalInputProcessor,
             mm_handles: List of multimodal embedding handles.
 
         Returns:
-            Tuple[List[int], List[int], List[int]]:
-                - expanded_ids: token ids with each image token expanded to a placeholder repeated per MM token
-                - mm_token_length: per-image MM token lengths
-                - mm_token_offsets: start offsets (positions) for each image's MM tokens within expanded_ids
+            DisaggPrefillMultimodalInputs containing expanded token IDs,
+            prompt-side MM positions/lengths, exact runs, and encoder-output
+            embedding lengths.
         """
         # TODO: Move this function to the base input processor class when extending for more models
         text_prompt = inputs.get("prompt")
@@ -327,7 +339,18 @@ class LlavaNextInputProcessor(BaseMultimodalInputProcessor,
                 f"({mm_token_length[-1] + mm_token_offsets[-1]}) should be less "
                 f"than or equal to final_length ({final_length})")
 
-        return expanded_ids, mm_token_length, mm_token_offsets
+        return DisaggPrefillMultimodalInputs(
+            prompt_token_ids=expanded_ids,
+            multimodal_lengths=mm_token_length,
+            multimodal_positions=mm_token_offsets,
+            multimodal_embedding_lengths=[
+                mm_handle["tensor_size"][0] for mm_handle in mm_handles
+            ],
+            multimodal_item_run_cu_offsets=list(range(len(mm_token_length) +
+                                                      1)),
+            multimodal_run_positions=mm_token_offsets,
+            multimodal_run_lengths=mm_token_length,
+        )
 
     def _attach_multimodal_embeddings_impl(
         self, inputs: TextPrompt,
@@ -393,10 +416,9 @@ class LlavaNextInputProcessor(BaseMultimodalInputProcessor,
             images=images,
             do_rescale=not (images and isinstance(images[0], torch.Tensor)),
             return_tensors="pt")
-        # Postprocess
+        # Keep image_token_index in-vocab; mm positions are located by
+        # the model engine via ``torch.isin(input_ids, mm_token_ids)``.
         fused_input_ids = processed_values['input_ids'][0]
-        fused_input_ids[fused_input_ids ==
-                        self.image_token_index] = self.vocab_size + 1
 
         multimodal_data = {}
         multimodal_data["image"] = {
@@ -619,7 +641,7 @@ class LlavaNextModel(PreTrainedModel):
         super().__init__(config)
         if hasattr(self, "llm"):
             return
-        if not DISAGG:
+        if not _is_mm_disagg():
             self.mm_encoder = LlavaNextVisionModel(model_config)
         else:
             self.mm_encoder = None
@@ -641,8 +663,18 @@ class LlavaNextModel(PreTrainedModel):
 
         self.llm = AutoModelForCausalLM.from_config(llm_model_config)
 
+        # Surface the in-vocab image placeholder to the model engine's
+        # ``_prepare_multimodal_indices``.
+        self._mm_token_ids = torch.tensor(
+            [model_config.pretrained_config.image_token_index],
+            dtype=torch.int32)
+
         self.model_config = model_config
         self.post_config()
+
+    @property
+    def mm_token_ids(self) -> torch.Tensor:
+        return self._mm_token_ids
 
     def load_weights(self, weights, weight_mapper: BaseWeightMapper):
         if isinstance(weight_mapper, LlavaNextHfWeightMapper):
@@ -694,19 +726,24 @@ class LlavaNextModel(PreTrainedModel):
         multimodal_params = kwargs.get("multimodal_params", [])
         mm_embeds = []
         if len(multimodal_params) > 0:
-            if not DISAGG:
+            if self.mm_encoder is not None:
                 mm_embeds = get_multimodal_embeddings(
                     encoder_forward_fn=self.mm_encoder.forward,
                     multimodal_params=multimodal_params[:num_context_requests])
             else:
-                raise NotImplementedError(
-                    "LlavaNextModel does not support disaggregated inference yet. Please unset "
-                    f"the TLLM_MULTIMODAL_DISAGGREGATED environment variable, or set it to '0'."
-                )
+                # E/P prefill: encoder already ran; use attached embeddings.
+                mm_embeds = get_attached_multimodal_embeddings(
+                    multimodal_params[:num_context_requests])
             mm_embeds = find_input_mm_embeds(
                 mm_embeds, multimodal_params[:num_context_requests])
         input_ids, inputs_embeds = fuse_input_embeds(
-            self.llm.model.embed_tokens, input_ids, mm_embeds, **kwargs)
+            self.llm.model.embed_tokens,
+            input_ids,
+            mm_embeds,
+            mm_token_ids=self.mm_token_ids,
+            mm_token_indices=kwargs.get("mm_token_indices"),
+            text_token_indices=kwargs.get("text_token_indices"),
+        )
         logits = self.llm.forward(attn_metadata, input_ids, position_ids,
                                   inputs_embeds, return_context_logits)
         return logits

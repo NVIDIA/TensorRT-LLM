@@ -24,13 +24,10 @@ from typing import Any, Optional, Tuple, Union
 
 import pytest
 import yaml
-from defs.common import convert_weights
 from defs.trt_test_alternative import (check_call, check_call_negative_test,
                                        check_output, print_info, print_warning)
 
-from .common import (PluginOptions, convert_weights, get_mmlu_accuracy,
-                     prune_checkpoint, quantize_data, refit_model,
-                     venv_check_call)
+from .common import get_mmlu_accuracy, venv_check_call
 from .conftest import (get_device_count, get_sm_version, llm_models_root,
                        skip_no_sm120, skip_nvlink_inactive, skip_post_blackwell,
                        skip_pre_ada, skip_pre_blackwell, skip_pre_hopper,
@@ -72,215 +69,32 @@ def test_gpt3_175b_1layers_build_only(llm_root, llm_venv, engine_dir):
     check_call(" ".join(build_cmd), shell=True, env=llm_venv._new_env)
 
 
-@pytest.mark.parametrize("prune", [False, True], ids=["", "prune"])
-@pytest.mark.parametrize(
-    "additional_build_option",
-    ["", "remove_input_padding", "quantization int8_sq_per_tensor"],
-    ids=lambda x: x.replace(" ", "_"))
-@pytest.mark.parametrize("use_py_session", [False, True],
-                         ids=["use_cpp_session", "use_py_session"])
-def test_llama_e2e(llama_example_root, llama_tokenizer_model_root, llm_venv,
-                   cmodel_dir, engine_dir, additional_build_option,
-                   use_py_session, prune):
-
-    model_name = 'llama-e2e'
-    model_dir = convert_weights(
-        llm_venv=llm_venv,
-        example_root=llama_example_root,
-        cmodel_dir=cmodel_dir,
-        model=model_name,
-        model_path=llama_tokenizer_model_root,
-    )
-
-    unpruned_model_dir = model_dir
-    if prune:
-        print("Pruning checkpoint...")
-        model_dir = prune_checkpoint(llm_venv, model_dir)
-
-    build_cmd = [
-        "trtllm-build", f"--checkpoint_dir={model_dir}",
-        f"--output_dir={engine_dir}", "--max_beam_width=4",
-        f"--max_batch_size={1}", f"--max_input_len={1024}",
-        "--gpt_attention_plugin=float16", "--gemm_plugin=float16"
-    ]
-
-    print("Build engines...")
-
-    if additional_build_option == "":
-        build_cmd += ["--remove_input_padding=disable"]
-    elif additional_build_option == "remove_input_padding":
-        build_cmd += ["--remove_input_padding=enable"]
-    else:
-        build_cmd += [f"--{additional_build_option}"]
-
-    if prune:
-        build_cmd.append("--strip_plan")
-
-    build_cmd.extend(PluginOptions("float16", None, "float16", None).to_args())
-
-    check_call(" ".join(build_cmd), shell=True, env=llm_venv._new_env)
-
-    if prune:
-        print("Refitting engine...")
-        engine_dir = refit_model(llm_venv, engine_dir, unpruned_model_dir)
-
-    print("Run inference...")
-    run_cmd = [
-        f"{llama_example_root}/../../../run.py",
-        "--max_output_len=1",
-        f"--tokenizer_dir={llama_tokenizer_model_root}",
-        "--log_level=verbose",
-        f"--engine_dir={engine_dir}",
-    ]
-    if use_py_session:
-        run_cmd.extend(["--use_py_session"])
-    venv_check_call(llm_venv, run_cmd)
-
-
-@pytest.mark.parametrize("prune", [False, True], ids=["", "prune"])
-@pytest.mark.parametrize("enable_fp8", [False, True], ids=["", "enable_fp8"])
-@pytest.mark.parametrize("additional_build_option",
-                         ["", "remove_input_padding"],
-                         ids=lambda x: x)
-@pytest.mark.parametrize("use_py_session", [False, True],
-                         ids=["use_cpp_session", "use_py_session"])
-def test_mistral_e2e(llama_example_root, llama_tokenizer_model_root, llm_venv,
-                     cmodel_dir, engine_dir, enable_fp8,
-                     additional_build_option, use_py_session, prune):
-
-    model_name = 'mistral-e2e'
-    if enable_fp8:
-        model_dir = quantize_data(llm_venv=llm_venv,
-                                  example_root=llama_example_root,
-                                  model_dir=llama_tokenizer_model_root,
-                                  dtype='float16',
-                                  qformat='fp8',
-                                  quantize_dir=cmodel_dir,
-                                  kv_cache_dtype='fp8',
-                                  calib_size=32)
-    else:
-        model_dir = convert_weights(llm_venv=llm_venv,
-                                    example_root=llama_example_root,
-                                    cmodel_dir=cmodel_dir,
-                                    model=model_name,
-                                    model_path=llama_tokenizer_model_root,
-                                    enable_fp8=enable_fp8)
-
-    unpruned_model_dir = model_dir
-    if prune:
-        print("Pruning checkpoint...")
-        model_dir = prune_checkpoint(llm_venv, model_dir)
-
-    build_cmd = [
-        "trtllm-build",
-        f"--checkpoint_dir={model_dir}",
-        f"--output_dir={engine_dir}",
-        "--max_batch_size=1",
-        "--max_input_len=1024",
-        "--max_num_tokens=1024",
-        "--max_beam_width=4",
-        "--gemm_plugin=float16",
-    ]
-    print("Build engines...")
-
-    if additional_build_option == "":
-        if not enable_fp8:
-            build_cmd += ["--remove_input_padding=disable"]
-    elif additional_build_option == "remove_input_padding":
-        build_cmd += ["--remove_input_padding=enable"]
-    else:
-        build_cmd += [f"--{additional_build_option}"]
-
-    if enable_fp8:
-        build_cmd.append("--use_fp8_context_fmha=enable")
-    else:
-        build_cmd.append("--context_fmha=disable")
-        build_cmd.append("--gpt_attention_plugin=float16")
-        build_cmd.extend(
-            PluginOptions("float16", None, "float16", None).to_args())
-    if prune:
-        build_cmd.append("--strip_plan")
-
-    os.path.join(cmodel_dir, ".internal_trt.cfg")
-    check_call(" ".join(build_cmd), shell=True, env=llm_venv._new_env)
-
-    if prune:
-        print("Refitting engine...")
-        engine_dir = refit_model(llm_venv, engine_dir, unpruned_model_dir)
-
-    print("Run inference...")
-    run_cmd = [
-        f"{llama_example_root}/../../../run.py",
-        "--max_output_len=1",
-        f"--tokenizer_dir={llama_tokenizer_model_root}",
-        "--log_level=verbose",
-        "--max_attention_window_size=5",
-        f"--engine_dir={engine_dir}",
-    ]
-    if use_py_session:
-        run_cmd.extend(["--use_py_session"])
-    venv_check_call(llm_venv, run_cmd)
-
-
 @pytest.mark.parametrize("model_name,model_path", [
     ("DeepSeek-R1-Distill-Qwen-1.5B", "DeepSeek-R1-Distill-Qwen-1.5B"),
 ])
-def test_qwen_e2e_cpprunner_large_new_tokens(model_name, model_path, llm_venv,
-                                             qwen_example_root, cmodel_dir,
-                                             engine_dir):
-    """RCCA: https://nvbugs/5238105"""
-    model_dir = convert_weights(
-        llm_venv=llm_venv,
-        example_root=qwen_example_root,
-        cmodel_dir=cmodel_dir,
-        model=model_name,
-        model_path=f"{llm_models_root()}/{model_path}",
+def test_qwen_e2e_cpprunner_large_new_tokens(model_name, model_path, llm_venv):
+    """RCCA: https://nvbugs/5238105 - none of n>1 sequences may be empty."""
+    from tensorrt_llm import LLM, SamplingParams
+
+    prompt = r"<｜begin▁of▁sentence｜><｜User｜>The operation $\otimes$ is defined for all nonzero numbers by $a \otimes b = \frac{a^{2}}{b}$. Determine $[(1 \otimes 2) \otimes 3] - [1 \otimes (2 \otimes 3)]$. Let's think step by step and output the final answer within \boxed{}.<｜Assistant｜>"
+
+    sampling_params = SamplingParams(
+        max_tokens=1024,
+        n=4,
+        temperature=0.6,
+        top_p=1.0,
+        top_k=1024,
     )
 
-    build_cmd = [
-        "trtllm-build", f"--checkpoint_dir={model_dir}",
-        f"--output_dir={engine_dir}", "--gemm_plugin=float16",
-        "--max_num_tokens=32768"
-    ]
+    with LLM(model=f"{llm_models_root()}/{model_path}",
+             max_batch_size=8,
+             max_seq_len=4224) as llm:
+        outputs = llm.generate([prompt], sampling_params=sampling_params)
 
-    check_call(" ".join(build_cmd), shell=True, env=llm_venv._new_env)
-
-    from transformers import AutoTokenizer
-
-    from tensorrt_llm.runtime import PYTHON_BINDINGS
-
-    if PYTHON_BINDINGS:
-        from tensorrt_llm.runtime import ModelRunnerCpp
-    tokenizer = AutoTokenizer.from_pretrained(
-        f"{llm_models_root()}/{model_path}",
-        trust_remote_code=True,
-        use_fast=False)
-
-    message = r"<｜begin▁of▁sentence｜><｜User｜>The operation $\otimes$ is defined for all nonzero numbers by $a \otimes b = \frac{a^{2}}{b}$. Determine $[(1 \otimes 2) \otimes 3] - [1 \otimes (2 \otimes 3)]$. Let's think step by step and output the final answer within \boxed{}.<｜Assistant｜>"
-
-    inputs = tokenizer(message, return_tensors='pt',
-                       add_special_tokens=False)['input_ids']
-
-    runner = ModelRunnerCpp.from_dir(engine_dir=f"{engine_dir}",
-                                     max_input_len=128,
-                                     max_output_len=4096,
-                                     max_batch_size=8)
-
-    outputs = runner.generate(inputs,
-                              end_id=tokenizer.eos_token_id,
-                              pad_id=tokenizer.pad_token_id,
-                              temperature=0.6,
-                              top_p=1.0,
-                              top_k=1024,
-                              max_new_tokens=1024,
-                              return_dict=True,
-                              min_length=1,
-                              num_return_sequences=4,
-                              output_sequence_lengths=True)
-
-    seq_lengths = outputs['sequence_lengths']
-    assert not (seq_lengths == 0).any(
-    ), f"Found zero length in sequence_lengths tensor: {seq_lengths}"
+    completions = outputs[0].outputs
+    seq_lengths = [len(c.token_ids) for c in completions]
+    assert all(length > 0 for length in seq_lengths), \
+        f"Found zero-length completion: {seq_lengths}"
 
 
 # TODO replace the trtllm_bench_prolog
@@ -946,59 +760,6 @@ def test_trtllm_bench_iteration_log(llm_root, llm_venv, model_name,
             shutil.rmtree(engine_dir, ignore_errors=True)
 
 
-def test_mistral_large_hidden_vocab_size(llama_example_root, llm_venv,
-                                         llama_tokenizer_model_root,
-                                         engine_dir):
-    """RCCA https://nvbugs/4753548"""
-    config = {
-        "architecture": "LlamaForCausalLM",
-        "dtype": "float16",
-        "vocab_size": 131072,
-        "hidden_size": 16384,
-        "num_hidden_layers": 1,
-        "num_attention_heads": 96,
-        "hidden_act": "silu",
-        "logits_dtype": "float32",
-        "norm_epsilon": 1e-06,
-        "position_embedding_type": "rope_gpt_neox",
-        "max_position_embeddings": 131072,
-        "num_key_value_heads": 8,
-        "intermediate_size": 36864,
-        "head_size": 128,
-    }
-
-    # Save the dummy-weight checkpoint config.json to engine_dir
-    if not os.path.exists(engine_dir):
-        os.makedirs(engine_dir)
-    ckpt_config_path = os.path.join(engine_dir, 'ckpt_config.json')
-    with open(ckpt_config_path, 'w') as f:
-        json.dump(config, f, indent=4)
-
-    build_cmd = [
-        "trtllm-build",
-        f"--model_config={ckpt_config_path}",
-        f"--output_dir={engine_dir}",
-        "--max_input_len=8096",
-        "--max_seq_len=52488",
-        "--max_num_tokens=52488",
-        "--gemm_plugin=float16",
-        "--gpt_attention_plugin=float16",
-        "--paged_kv_cache=enable",
-        "--remove_input_padding=enable",
-        "--max_batch_size=32",
-    ]
-    check_call(" ".join(build_cmd), shell=True, env=llm_venv._new_env)
-
-    print("Run inference...")
-    run_cmd = [
-        f"{llama_example_root}/../../../run.py",
-        "--max_output_len=20",
-        f"--engine_dir={engine_dir}",
-        f"--tokenizer_dir={llama_tokenizer_model_root}",
-    ]
-    venv_check_call(llm_venv, run_cmd)
-
-
 def test_trtllm_serve_example(llm_root, llm_venv):
     example_root = Path(os.path.join(llm_root, "examples", "serve"))
     test_root = unittest_path() / "llmapi" / "apps"
@@ -1108,6 +869,13 @@ def test_openai_tool_call(llm_root, llm_venv):
          str(test_root / "_test_openai_tool_call.py")])
 
 
+def test_openai_post_processor(llm_root, llm_venv):
+    test_root = unittest_path() / "llmapi" / "apps"
+    llm_venv.run_cmd(
+        ["-m", "pytest",
+         str(test_root / "_test_openai_post_processor.py")])
+
+
 @pytest.mark.parametrize("sampler", ["torch_sampler", "trtllm_sampler"])
 def test_openai_completions_with_logit_bias(llm_root, llm_venv, sampler: str):
     test_root = unittest_path() / "llmapi" / "apps"
@@ -1139,6 +907,15 @@ def test_openai_chat_harmony(llm_root, llm_venv):
     llm_venv.run_cmd(
         ["-m", "pytest",
          str(test_root / "_test_openai_chat_harmony.py")])
+
+
+@skip_pre_hopper
+def test_openai_chat_harmony_perf_metrics(llm_root, llm_venv):
+    test_root = unittest_path() / "llmapi" / "apps"
+    llm_venv.run_cmd([
+        "-m", "pytest",
+        str(test_root / "_test_openai_chat_harmony_perf_metrics.py")
+    ])
 
 
 def test_openai_responses(llm_root, llm_venv):
@@ -1332,12 +1109,6 @@ def test_ptp_quickstart(llm_root, llm_venv):
                  marks=skip_pre_blackwell),
     pytest.param('Llama3.1-8B-FP8',
                  'llama-3.1-model/Llama-3.1-8B-Instruct-FP8',
-                 marks=skip_pre_hopper),
-    pytest.param('Llama3.1-70B-NVFP4',
-                 'nvfp4-quantized/Meta-Llama-3.1-70B',
-                 marks=skip_pre_blackwell),
-    pytest.param('Llama3.1-70B-FP8',
-                 'llama-3.1-model/Llama-3.1-70B-Instruct-FP8',
                  marks=skip_pre_hopper),
     pytest.param('Nemotron-Super-49B-v1-NVFP4',
                  'nvfp4-quantized/Llama-3_3-Nemotron-Super-49B-v1_nvfp4_hf',
@@ -1870,16 +1641,7 @@ def test_deepseek_r1_mtp_bench(llm_root, llm_venv):
 
 @pytest.mark.skip_less_device_memory(80000)
 @pytest.mark.parametrize("model_name,model_path,gpu_count", [
-    ("Llama3.1-70B-BF16", "llama-3.1-model/Meta-Llama-3.1-70B", 8),
     ("Mixtral-8x7B-BF16", "Mixtral-8x7B-v0.1", 8),
-    pytest.param('Llama3.1-70B-FP8',
-                 'llama-3.1-model/Llama-3.1-70B-Instruct-FP8',
-                 2,
-                 marks=skip_pre_hopper),
-    pytest.param('Llama3.1-405B-FP8',
-                 'llama-3.1-model/Llama-3.1-405B-Instruct-FP8',
-                 8,
-                 marks=(skip_pre_hopper, pytest.mark.timeout(7200))),
     pytest.param('Mixtral-8x7B-NVFP4',
                  'nvfp4-quantized/Mixtral-8x7B-Instruct-v0.1',
                  8,
@@ -1997,9 +1759,6 @@ def test_ptp_quickstart_advanced_8gpus_chunked_prefill_sq_22k(
     ('Nemotron-Super-49B-v1-BF16',
      'nemotron-nas/Llama-3_3-Nemotron-Super-49B-v1'),
     ("Mixtral-8x7B-BF16", "Mixtral-8x7B-Instruct-v0.1"),
-    pytest.param('Llama3.1-70B-BF16',
-                 'llama-3.1-model/Meta-Llama-3.1-70B',
-                 marks=pytest.mark.skip_less_device_memory(95000)),
 ])
 def test_ptp_quickstart_advanced_2gpus_sm120(llm_root, llm_venv, model_name,
                                              model_path):
@@ -2356,6 +2115,8 @@ def test_ptp_scaffolding(llm_root, llm_venv, model_name, model_path):
                  marks=skip_pre_blackwell),
     pytest.param('DeepSeek-R1/DeepSeek-R1-0528-FP4', marks=skip_pre_blackwell),
     pytest.param('Kimi-K2-Thinking-NVFP4', marks=skip_pre_blackwell),
+    pytest.param('MiniMax-M2', marks=skip_pre_hopper),
+    pytest.param('MiniMax-M3', marks=skip_pre_blackwell),
 ])
 def test_multi_nodes_eval(model_path, tp_size, pp_size, ep_size, eval_task,
                           mmlu_dataset_root):
@@ -2372,7 +2133,7 @@ def test_multi_nodes_eval(model_path, tp_size, pp_size, ep_size, eval_task,
         "--backend=pytorch",
     ]
 
-    if "Kimi" in model_path:
+    if "Kimi" in model_path or "MiniMax-M3" in model_path:
         run_cmd.append("--trust_remote_code")
     else:
         run_cmd.append(f"--tokenizer={model_dir}")
@@ -2401,7 +2162,6 @@ def test_multi_nodes_eval(model_path, tp_size, pp_size, ep_size, eval_task,
 @pytest.mark.parametrize("tp_size,pp_size", [(2, 1), (1, 2)],
                          ids=["tp2", "pp2"])
 @pytest.mark.parametrize("model_path", [
-    pytest.param('llama-3.1-model/Meta-Llama-3.1-70B', marks=skip_pre_hopper),
     pytest.param('llama-3.3-models/Llama-3.3-70B-Instruct',
                  marks=skip_pre_hopper),
     pytest.param('Qwen3/saved_models_Qwen3-235B-A22B_nvfp4_hf',
@@ -2412,8 +2172,6 @@ def test_multi_nodes_eval(model_path, tp_size, pp_size, ep_size, eval_task,
                  marks=skip_pre_hopper),
     pytest.param('llama4-models/Llama-4-Scout-17B-16E-Instruct',
                  marks=skip_pre_hopper),
-    pytest.param('modelopt-hf-model-hub/Llama-3.1-405B-Instruct-fp4',
-                 marks=skip_pre_blackwell),
 ])
 def test_ptp_quickstart_advanced_multinode(llm_root, llm_venv, model_path,
                                            tp_size, pp_size):

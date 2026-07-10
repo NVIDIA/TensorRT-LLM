@@ -62,6 +62,39 @@ namespace tle = tensorrt_llm::executor;
 namespace tr = tensorrt_llm::runtime;
 namespace fs = std::filesystem;
 
+namespace tensorrt_llm::testing
+{
+namespace tbk = batch_manager::kv_cache_manager;
+
+class KVCacheTransferManagerTestAccess
+{
+public:
+    [[nodiscard]] static std::size_t pendingReadCount(tbk::KVCacheTransferManager const& transferManager)
+    {
+        return transferManager.mPendingReads.size();
+    }
+
+    [[nodiscard]] static std::size_t pendingWriteCount(tbk::KVCacheTransferManager const& transferManager)
+    {
+        return transferManager.mPendingWrites.size();
+    }
+
+    [[nodiscard]] static bool hasPendingReadForBlock(
+        tbk::KVCacheTransferManager const& transferManager, tbk::BlockPtr const& block)
+    {
+        return transferManager.mPendingReads.find(tbk::KVCacheTransferManager::getPendingTransferIndex(block))
+            != transferManager.mPendingReads.end();
+    }
+
+    [[nodiscard]] static bool hasPendingWriteForBlock(
+        tbk::KVCacheTransferManager const& transferManager, tbk::BlockPtr const& block)
+    {
+        return transferManager.mPendingWrites.find(tbk::KVCacheTransferManager::getPendingTransferIndex(block))
+            != transferManager.mPendingWrites.end();
+    }
+};
+} // namespace tensorrt_llm::testing
+
 using BlocksPerWindow = std::map<SizeType32, std::tuple<SizeType32, SizeType32>>;
 
 using ParamType = bool;
@@ -186,6 +219,11 @@ TEST_F(KVCacheManagerTest, BlockManagerTest)
     EXPECT_EQ(idSet.size(), occupiedBlocks);
     blockManager.releaseBlocks(seq0);
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool);
+    for (auto const blockId : idSet)
+    {
+        auto const block = blockManager.getBlockById(blockId, maxAttentionWindow);
+        EXPECT_EQ(block->getPrevBlockInSeq(), nullptr);
+    }
 
     // Test: last block shared (inputLength aligned to tokensPerBlock)
     auto inputTokensAligned = makeInputTokens(numTokens);
@@ -291,12 +329,12 @@ void runPartialCopyTest()
     auto constexpr maxAttentionWindowAllLayer = 4096;
     auto constexpr sinkTokenLen = 0;
     auto constexpr canUseOneMoreBlock = true;
-    std::string directory = "";
-    static int file_num = 0;
+    std::string directory;
 
     if constexpr (transferMode == KvCacheTransferMode::GDS)
     {
-        std::string filename = std::string("test_copy") + std::to_string(file_num++);
+        auto const filename
+            = std::string("test_copy_") + std::to_string(::getpid()) + "_" + std::to_string(static_cast<int>(type));
         auto dirPath = fs::absolute(filename);
         fs::create_directories(dirPath);
         directory = dirPath.string();
@@ -404,7 +442,7 @@ void runPartialCopyTest()
     llmRequest1->setPrepopulatedPromptLen(prepopulatedPromptLen1, blockManager.getTokensPerBlock());
     EXPECT_EQ(llmRequest1->getContextCurrentPosition(), 16);
     auto cacheBlockIds1 = seq1.getCacheBlockIds(maxAttentionWindow).at(beamIdx);
-    EXPECT_THAT(cacheBlockIds1, ::testing::ElementsAreArray({0, 1, 6}));
+    EXPECT_THAT(cacheBlockIds1, ::testing::ElementsAreArray({0, 1, 2}));
     // store blocks 0, 1 ([0,1,2,3,4,5,6,7], [8,9,10,11,12,13,14,15])
     tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*llmRequest1);
     blockManager.storeContextBlocks(seq1, *llmRequest1);
@@ -412,11 +450,12 @@ void runPartialCopyTest()
 
     // Add sequence [0,1,2,3,4,5,6,7,8,9,10,11] again.
     // Reuse blocks 0 and 1(pc). Block 1 is partially reused, but already referenced by seq1 so must be partial copied
-    // into new block 2. Clear block 2 so we can see what was partial copied.
-    auto block2 = blockManager.getBlockById(2, maxAttentionWindow);
-    auto memoryPoolIndex2 = block2->getMemoryPoolBlockIndex();
-    auto block2Ptr{tr::ITensor::slice(primaryPoolPtr, memoryPoolIndex2, 1)};
-    EXPECT_EQ(cudaMemset(block2Ptr->data(), 0, blockSize * sizeof(T)), cudaSuccess);
+    // into new block 6. Clear block 6 so we can see what was partial copied.
+    auto constexpr partialCopyBlockId = 6;
+    auto partialCopyBlock = blockManager.getBlockById(partialCopyBlockId, maxAttentionWindow);
+    auto memoryPoolIndex = partialCopyBlock->getMemoryPoolBlockIndex();
+    auto partialCopyBlockPtr{tr::ITensor::slice(primaryPoolPtr, memoryPoolIndex, 1)};
+    EXPECT_EQ(cudaMemset(partialCopyBlockPtr->data(), 0, blockSize * sizeof(T)), cudaSuccess);
     auto inputTokens2 = inputTokens;
     auto constexpr partiallyReusedTokens = 3;
     inputTokens2->resize(8 + partiallyReusedTokens + 1);
@@ -434,22 +473,22 @@ void runPartialCopyTest()
     llmRequest2->setPrepopulatedPromptLen(prepopulatedPromptLen2, blockManager.getTokensPerBlock());
     EXPECT_EQ(llmRequest2->getContextCurrentPosition(), 11);
     auto cacheBlockIds2 = seq2.getCacheBlockIds(maxAttentionWindow).at(beamIdx);
-    EXPECT_THAT(cacheBlockIds2, ::testing::ElementsAreArray({0, 2}));
+    EXPECT_THAT(cacheBlockIds2, ::testing::ElementsAreArray({0, partialCopyBlockId}));
     EXPECT_EQ(cudaDeviceSynchronize(), cudaSuccess);
 
-    // Verify partial copied block 2
+    // Verify the partially copied block.
     // Block has shape [2, numLayers, numKvHeads, tokensPerBlock, sizePerHead]
-    blockManager.offloadBlock(block2, maxAttentionWindow);
-    EXPECT_FALSE(block2->isPrimary());
+    blockManager.offloadBlock(partialCopyBlock, maxAttentionWindow);
+    EXPECT_FALSE(partialCopyBlock->isPrimary());
     // need to sync so D2H transfer is done before accessing blocks
     EXPECT_EQ(cudaDeviceSynchronize(), cudaSuccess);
-    memoryPoolIndex2 = block2->getMemoryPoolBlockIndex();
-    block2Ptr = tr::ITensor::slice(secondaryPoolPtr, memoryPoolIndex2, 1);
-    T const* rawPtr2 = reinterpret_cast<T*>(block2Ptr->data());
+    memoryPoolIndex = partialCopyBlock->getMemoryPoolBlockIndex();
+    partialCopyBlockPtr = tr::ITensor::slice(secondaryPoolPtr, memoryPoolIndex, 1);
+    T const* rawPtr = reinterpret_cast<T*>(partialCopyBlockPtr->data());
     int numBad = 0;
     for (int i = 0; i < blockSize && numBad < 10; ++i)
     {
-        T value = rawPtr2[i];
+        T value = rawPtr[i];
         int kOrV = i / (numLayers * numKvHeads * tokensPerBlock * sizePerHead);
         int j = i - kOrV * (numLayers * numKvHeads * tokensPerBlock * sizePerHead);
         int layer = j / (numKvHeads * tokensPerBlock * sizePerHead);
@@ -461,14 +500,14 @@ void runPartialCopyTest()
         T expectedValue = (token < partiallyReusedTokens) ? i & mask : 0;
         if (value != expectedValue)
         {
-            TLLM_LOG_WARNING(
-                "block2[%d,%d,%d,%d,%d] - expected %d, actual %d", kOrV, layer, head, token, j, expectedValue, value);
+            TLLM_LOG_WARNING("partialCopyBlock[%d,%d,%d,%d,%d] - expected %d, actual %d", kOrV, layer, head, token, j,
+                expectedValue, value);
             ++numBad;
         }
     }
     EXPECT_EQ(numBad, 0);
-    blockManager.onboardBlock(seq2, block2, maxAttentionWindow, transferMode, directory);
-    EXPECT_TRUE(block2->isPrimary());
+    blockManager.onboardBlock(seq2, partialCopyBlock, maxAttentionWindow, KvCacheTransferMode::DRAM);
+    EXPECT_TRUE(partialCopyBlock->isPrimary());
     EXPECT_EQ(cudaDeviceSynchronize(), cudaSuccess);
 
     tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*llmRequest1);
@@ -878,7 +917,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseTest)
     // note that seq0_dup is holding blocks 0, 1 and 2 until releaseBlocks is called
 
     // input tokens [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
-    // reuse blocks 0, 1 ([0, 1, 2, 3], [4, 5, 6, 7]) and get new block 4
+    // reuse blocks 0, 1 ([0, 1, 2, 3], [4, 5, 6, 7]) and get recycled block 3
     auto inputTokens1 = std::make_shared<VecTokens>(llmRequest1->getTokens(0));
     GenerationRequest seq1_dup{11, inputLength, beamWidth, blockManager.getWindowSizesMetadata()};
     llmRequest1 = std::make_shared<LlmRequest>(
@@ -891,8 +930,8 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseTest)
                                  .prepopulatedLen;
     llmRequest1->setPrepopulatedPromptLen(prepopulatedPromptLen1, blockManager.getTokensPerBlock());
     EXPECT_EQ(llmRequest1->getContextCurrentPosition(), 2 * tokensPerBlock);
-    EXPECT_THAT(seq1_dup.getCacheBlockIds(maxAttentionWindow).at(beamIdx), ::testing::ElementsAreArray({0, 1, 4}));
-    llmRequest1->addNewToken(10, beamIdx); // block 4 contains [8, 9, 10]
+    EXPECT_THAT(seq1_dup.getCacheBlockIds(maxAttentionWindow).at(beamIdx), ::testing::ElementsAreArray({0, 1, 3}));
+    llmRequest1->addNewToken(10, beamIdx); // block 3 contains [8, 9, 10]
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), numBlocks + 1);
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - numBlocks - 1);
 
@@ -901,7 +940,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseTest)
     blockManager.releaseBlocks(seq0_dup, llmRequest0);
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), numBlocks);
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - numBlocks);
-    // block 4 is stored for reuse (block contains [8, 9]). nb! Last token of last block is never stored
+    // block 3 is stored for reuse (block contains [8, 9]). nb! Last token of last block is never stored
     tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*llmRequest1);
     blockManager.releaseBlocks(seq1_dup, llmRequest1);
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), 0);
@@ -918,7 +957,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseTest)
 
     numTokens = llmRequest2->getNumTokens(beamIdx);
     GenerationRequest seq2{requestId, numTokens, beamWidth, blockManager.getWindowSizesMetadata()};
-    // reuse block 0 ([0, 1, 2, 3]), get new block 5
+    // reuse block 0 ([0, 1, 2, 3]), get new block 4
     auto promptLen2 = llmRequest2->getNumTokens(beamIdx);
     auto numContextBlocks2 = tc::ceilDiv(promptLen2, blockManager.getTokensPerBlock());
     auto prepopulatedPromptLen2 = blockManager
@@ -927,8 +966,8 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseTest)
                                       .prepopulatedLen;
     llmRequest2->setPrepopulatedPromptLen(prepopulatedPromptLen2, blockManager.getTokensPerBlock());
     EXPECT_EQ(llmRequest2->getContextCurrentPosition(), tokensPerBlock);
-    EXPECT_THAT(seq2.getCacheBlockIds(maxAttentionWindow).at(beamIdx), ::testing::ElementsAreArray({0, 5}));
-    llmRequest2->addNewToken(5, beamIdx); // block 5 contains [4]
+    EXPECT_THAT(seq2.getCacheBlockIds(maxAttentionWindow).at(beamIdx), ::testing::ElementsAreArray({0, 4}));
+    llmRequest2->addNewToken(5, beamIdx); // block 4 contains [4]
     numTokens = llmRequest2->getNumTokens(beamIdx);
     numBlocks = tc::ceilDiv(numTokens, tokensPerBlock);
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), numBlocks);
@@ -943,7 +982,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseTest)
 
     numTokens = llmRequest3->getNumTokens(beamIdx);
     GenerationRequest seq3{requestId, numTokens, beamWidth, blockManager.getWindowSizesMetadata()};
-    // reuse blocks 0, 1, 4(p) ([0, 1, 2, 3], [4, 5, 6, 7], [8, 9])
+    // reuse blocks 0, 1, 3(p) ([0, 1, 2, 3], [4, 5, 6, 7], [8, 9])
     auto promptLen3 = llmRequest3->getNumTokens(beamIdx);
     auto numContextBlocks3 = tc::ceilDiv(promptLen3, blockManager.getTokensPerBlock());
     auto prepopulatedPromptLen3 = blockManager
@@ -952,18 +991,18 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseTest)
                                       .prepopulatedLen;
     llmRequest3->setPrepopulatedPromptLen(prepopulatedPromptLen3, blockManager.getTokensPerBlock());
     EXPECT_EQ(llmRequest3->getContextCurrentPosition(), numTokens - 1);
-    EXPECT_THAT(seq3.getCacheBlockIds(maxAttentionWindow).at(beamIdx), ::testing::ElementsAreArray({0, 1, 4}));
-    llmRequest3->addNewToken(11, beamIdx); // block 4 contains [8, 9, 11]
+    EXPECT_THAT(seq3.getCacheBlockIds(maxAttentionWindow).at(beamIdx), ::testing::ElementsAreArray({0, 1, 3}));
+    llmRequest3->addNewToken(11, beamIdx); // block 3 contains [8, 9, 11]
     numTokens = llmRequest3->getNumTokens(beamIdx);
     // one block used by both seq2 and seq3
     numBlocks += tc::ceilDiv(numTokens, tokensPerBlock) - 1;
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), numBlocks);
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - numBlocks);
 
-    // block 5 is not stored since it is last block and has only one token
+    // block 4 is not stored since it is last block and has only one token
     tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*llmRequest2);
     blockManager.releaseBlocks(seq2, llmRequest2);
-    // block 4 is stored for reuse (block contains [8, 9]). nb! Last token of last block not stored
+    // block 3 is stored for reuse (block contains [8, 9]). nb! Last token of last block not stored
     tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*llmRequest3);
     blockManager.releaseBlocks(seq3, llmRequest3);
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), 0);
@@ -979,7 +1018,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseTest)
     numTokens = llmRequest4->getNumTokens(beamIdx);
     GenerationRequest seq4{requestId, numTokens, beamWidth, blockManager.getWindowSizesMetadata()};
 
-    // reuse blocks 0, 1, 4(p) ([0, 1, 2, 3], [4, 5, 6, 7], [8,9])
+    // reuse blocks 0, 1, 3(p) ([0, 1, 2, 3], [4, 5, 6, 7], [8,9])
     auto promptLen4 = llmRequest4->getNumTokens(beamIdx);
     auto numContextBlocks4 = tc::ceilDiv(promptLen4, blockManager.getTokensPerBlock());
     auto prepopulatedPromptLen4 = blockManager
@@ -988,7 +1027,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseTest)
                                       .prepopulatedLen;
     llmRequest4->setPrepopulatedPromptLen(prepopulatedPromptLen4, blockManager.getTokensPerBlock());
     EXPECT_EQ(llmRequest4->getContextCurrentPosition(), promptLen4 - 1);
-    EXPECT_THAT(seq4.getCacheBlockIds(maxAttentionWindow).at(beamIdx), ::testing::ElementsAreArray({0, 1, 4}));
+    EXPECT_THAT(seq4.getCacheBlockIds(maxAttentionWindow).at(beamIdx), ::testing::ElementsAreArray({0, 1, 3}));
     numTokens = llmRequest4->getNumTokens(beamIdx);
     numBlocks = tc::ceilDiv(numTokens, tokensPerBlock);
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), numBlocks);
@@ -999,7 +1038,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseTest)
 
     // llmRequest4Short tokens [0, 1, 2, 3, 4, 5, 6, 7, 8]
     // blocks 0 and 1 ([0, 1, 2, 3], [4, 5, 6, 7]) are already stored,
-    // block 4 is freed
+    // block 3 is freed
     tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*llmRequest4Short);
     blockManager.releaseBlocks(seq4, llmRequest4Short);
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), 0);
@@ -1204,7 +1243,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithExtraIdTest)
 
     ///////////////////////////////////////////////////////////////////////////
     // add both requests again and then remove them
-    // reuse blocks 0, 1 and get new block 4
+    // reuse blocks 0, 1 and get recycled block 3
     GenerationRequest seq0_dup{10, inputLength, beamWidth, blockManager.getWindowSizesMetadata()};
     llmRequest0 = std::make_shared<LlmRequest>(seq0_dup.getRequestId(), maxNewTokens, inputTokens, samplingConfig,
         isStreaming, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
@@ -1222,7 +1261,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithExtraIdTest)
     llmRequest0->setPrepopulatedPromptLen(prepopulatedPromptLen0, blockManager.getTokensPerBlock());
     llmRequest0->addNewToken(3, beamIdx);
     EXPECT_EQ(llmRequest0->getContextCurrentPosition(), 2 * tokensPerBlock);
-    EXPECT_THAT(seq0_dup.getCacheBlockIds(maxAttentionWindow).at(beamIdx), ::testing::ElementsAreArray({0, 1, 4}));
+    EXPECT_THAT(seq0_dup.getCacheBlockIds(maxAttentionWindow).at(beamIdx), ::testing::ElementsAreArray({0, 1, 3}));
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), numBlocks);
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - numBlocks);
 
@@ -1275,7 +1314,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithExtraIdTest)
 
     numTokens = llmRequest2->getNumTokens(beamIdx);
     GenerationRequest seq2{requestId, numTokens, beamWidth, blockManager.getWindowSizesMetadata()};
-    // no reuse, get new block 5, 6, 7
+    // no reuse, get new blocks 4, 5, 6
     auto promptLen2 = llmRequest2->getNumTokens(beamIdx);
     auto numContextBlocks2 = tc::ceilDiv(promptLen2, blockManager.getTokensPerBlock());
     auto prepopulatedPromptLen2 = blockManager
@@ -1285,7 +1324,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithExtraIdTest)
                                       .prepopulatedLen;
     llmRequest2->setPrepopulatedPromptLen(prepopulatedPromptLen2, blockManager.getTokensPerBlock());
     EXPECT_EQ(llmRequest2->getContextCurrentPosition(), 0);
-    EXPECT_THAT(seq2.getCacheBlockIds(maxAttentionWindow).at(beamIdx), ::testing::ElementsAreArray({5, 6, 7}));
+    EXPECT_THAT(seq2.getCacheBlockIds(maxAttentionWindow).at(beamIdx), ::testing::ElementsAreArray({4, 5, 6}));
     llmRequest2->addNewToken(3, beamIdx);
     numTokens = llmRequest2->getNumTokens(beamIdx);
     numBlocks = tc::ceilDiv(numTokens, tokensPerBlock);
@@ -1305,7 +1344,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithExtraIdTest)
 
     numTokens = llmRequest3->getNumTokens(beamIdx);
     GenerationRequest seq3{requestId, numTokens, beamWidth, blockManager.getWindowSizesMetadata()};
-    // reuse block 0, get new block 8, 9
+    // reuse block 0, get new blocks 7 and 8
     auto promptLen3 = llmRequest3->getNumTokens(beamIdx);
     auto numContextBlocks3 = tc::ceilDiv(promptLen3, blockManager.getTokensPerBlock());
     auto prepopulatedPromptLen3 = blockManager
@@ -1315,7 +1354,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithExtraIdTest)
                                       .prepopulatedLen;
     llmRequest3->setPrepopulatedPromptLen(prepopulatedPromptLen3, blockManager.getTokensPerBlock());
     EXPECT_EQ(llmRequest3->getContextCurrentPosition(), tokensPerBlock);
-    EXPECT_THAT(seq3.getCacheBlockIds(maxAttentionWindow).at(beamIdx), ::testing::ElementsAreArray({0, 8, 9}));
+    EXPECT_THAT(seq3.getCacheBlockIds(maxAttentionWindow).at(beamIdx), ::testing::ElementsAreArray({0, 7, 8}));
     llmRequest3->addNewToken(3, beamIdx);
     numTokens = llmRequest3->getNumTokens(beamIdx);
     numBlocks = tc::ceilDiv(numTokens, tokensPerBlock);
@@ -1468,7 +1507,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithMultimodalHashTest)
         numReturnSequences);
 
     GenerationRequest seq2{requestId, inputLength, beamWidth, blockManager.getWindowSizesMetadata()};
-    // no reuse, get new blocks 4, 5, 6
+    // no reuse, get new blocks 3, 4, 5
     auto promptLen2 = llmRequest2->getNumTokens(beamIdx);
     auto numContextBlocks2 = tc::ceilDiv(promptLen2, blockManager.getTokensPerBlock());
     auto prepopulatedPromptLen2 = blockManager
@@ -1478,7 +1517,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithMultimodalHashTest)
                                       .prepopulatedLen;
     llmRequest2->setPrepopulatedPromptLen(prepopulatedPromptLen2, blockManager.getTokensPerBlock());
     EXPECT_EQ(llmRequest2->getContextCurrentPosition(), 0);
-    EXPECT_THAT(seq2.getCacheBlockIds(maxAttentionWindow).at(beamIdx), ::testing::ElementsAreArray({4, 5, 6}));
+    EXPECT_THAT(seq2.getCacheBlockIds(maxAttentionWindow).at(beamIdx), ::testing::ElementsAreArray({3, 4, 5}));
     llmRequest2->addNewToken(9, beamIdx);
     numTokens = llmRequest2->getNumTokens(beamIdx);
     numBlocks = tc::ceilDiv(numTokens, tokensPerBlock);
@@ -1506,7 +1545,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithMultimodalHashTest)
         std::nullopt, std::nullopt, LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION, std::nullopt,
         numReturnSequences);
     GenerationRequest seq3{requestId, inputLength, beamWidth, blockManager.getWindowSizesMetadata()};
-    // reuse block 0, get new blocks 7, 8
+    // reuse block 0, get new blocks 6 and 7
     auto promptLen3 = llmRequest3->getNumTokens(beamIdx);
     auto numContextBlocks3 = tc::ceilDiv(promptLen3, blockManager.getTokensPerBlock());
     auto prepopulatedPromptLen3 = blockManager
@@ -1517,7 +1556,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithMultimodalHashTest)
     llmRequest3->setPrepopulatedPromptLen(prepopulatedPromptLen3, blockManager.getTokensPerBlock());
     EXPECT_EQ(llmRequest3->getContextCurrentPosition(),
         tokensPerBlock); // only reuse block 0 [100, 101, 102, 103] with same hash/offset
-    EXPECT_THAT(seq3.getCacheBlockIds(maxAttentionWindow).at(beamIdx), ::testing::ElementsAreArray({0, 7, 8}));
+    EXPECT_THAT(seq3.getCacheBlockIds(maxAttentionWindow).at(beamIdx), ::testing::ElementsAreArray({0, 6, 7}));
     llmRequest3->addNewToken(11, beamIdx);
     numTokens = llmRequest3->getNumTokens(beamIdx);
     numBlocks = tc::ceilDiv(numTokens, tokensPerBlock);
@@ -1639,7 +1678,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithLoraTaskIdTest)
     ///////////////////////////////////////////////////////////////////////////
     // add both requests again and then remove them
     // inputTokens = (0, 1, 2, 3, 4, 5, 6, 7, 8)
-    // reuse blocks 0, 1 and get new block 4
+    // reuse blocks 0, 1 and get recycled block 3
     GenerationRequest seq0_dup{10, inputLength, beamWidth, blockManager.getWindowSizesMetadata()};
     llmRequest0 = std::make_shared<LlmRequest>(seq0_dup.getRequestId(), maxNewTokens, inputTokens, samplingConfig,
         isStreaming, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
@@ -1660,7 +1699,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithLoraTaskIdTest)
     // but promptLen is number of input tokens.
     llmRequest0->addNewToken(9, beamIdx);
     EXPECT_EQ(llmRequest0->getContextCurrentPosition(), 2 * tokensPerBlock);
-    EXPECT_THAT(seq0_dup.getCacheBlockIds(maxAttentionWindow).at(beamIdx), ::testing::ElementsAreArray({0, 1, 4}));
+    EXPECT_THAT(seq0_dup.getCacheBlockIds(maxAttentionWindow).at(beamIdx), ::testing::ElementsAreArray({0, 1, 3}));
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), numBlocks);
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - numBlocks);
 
@@ -1686,7 +1725,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithLoraTaskIdTest)
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), numBlocks + 1);
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - numBlocks - 1);
 
-    // store block 4 for reuse ([8])
+    // store block 3 for reuse ([8])
     tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*llmRequest0);
     blockManager.releaseBlocks(seq0_dup, llmRequest0);
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), numBlocks);
@@ -1707,7 +1746,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithLoraTaskIdTest)
 
     numTokens = llmRequest2->getNumTokens(beamIdx);
     GenerationRequest seq2{requestId, numTokens, beamWidth, blockManager.getWindowSizesMetadata()};
-    // no reuse, get new block 5, 6, 7
+    // no reuse, get new blocks 4, 5, 6
     auto promptLen2 = llmRequest2->getNumTokens(beamIdx);
     auto numContextBlocks2 = tc::ceilDiv(promptLen2, blockManager.getTokensPerBlock());
     auto prepopulatedPromptLen2 = blockManager
@@ -1718,13 +1757,13 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithLoraTaskIdTest)
     llmRequest2->setPrepopulatedPromptLen(prepopulatedPromptLen2, blockManager.getTokensPerBlock());
     // no reuse expected. Input tokens match blocks 0 and 1, but lora task id differs.
     EXPECT_EQ(llmRequest2->getContextCurrentPosition(), 0);
-    EXPECT_THAT(seq2.getCacheBlockIds(maxAttentionWindow).at(beamIdx), ::testing::ElementsAreArray({5, 6, 7}));
+    EXPECT_THAT(seq2.getCacheBlockIds(maxAttentionWindow).at(beamIdx), ::testing::ElementsAreArray({4, 5, 6}));
     llmRequest2->addNewToken(9, beamIdx);
     numTokens = llmRequest2->getNumTokens(beamIdx);
     numBlocks = tc::ceilDiv(numTokens, tokensPerBlock);
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), numBlocks);
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - numBlocks);
-    // store blocks 5, 6, 7 for reuse ([0,1,2,3], [4,5,6,7], [8]) with loraTaskId 1
+    // store blocks 4, 5, 6 for reuse ([0,1,2,3], [4,5,6,7], [8]) with loraTaskId 1
     tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*llmRequest2);
     blockManager.releaseBlocks(seq2, llmRequest2);
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), 0);
@@ -1740,7 +1779,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithLoraTaskIdTest)
 
     numTokens = llmRequest3->getNumTokens(beamIdx);
     GenerationRequest seq3{requestId, numTokens, beamWidth, blockManager.getWindowSizesMetadata()};
-    // reuse blocks 5, 6, 7(p) ([0,1,2,3], [4,5,6,7], [8])
+    // reuse blocks 4, 5, 6(p) ([0,1,2,3], [4,5,6,7], [8])
     auto promptLen3 = llmRequest3->getNumTokens(beamIdx);
     auto numContextBlocks3 = tc::ceilDiv(promptLen3, blockManager.getTokensPerBlock());
     auto prepopulatedPromptLen3 = blockManager
@@ -1750,13 +1789,13 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithLoraTaskIdTest)
                                       .prepopulatedLen;
     llmRequest3->setPrepopulatedPromptLen(prepopulatedPromptLen3, blockManager.getTokensPerBlock());
     EXPECT_EQ(llmRequest3->getContextCurrentPosition(), promptLen3 - 2);
-    EXPECT_THAT(seq3.getCacheBlockIds(maxAttentionWindow).at(beamIdx), ::testing::ElementsAreArray({5, 6, 7}));
+    EXPECT_THAT(seq3.getCacheBlockIds(maxAttentionWindow).at(beamIdx), ::testing::ElementsAreArray({4, 5, 6}));
     llmRequest3->addNewToken(11, beamIdx);
     numTokens = llmRequest3->getNumTokens(beamIdx);
     numBlocks = tc::ceilDiv(numTokens, tokensPerBlock);
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), numBlocks);
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - numBlocks);
-    // store block 7 for reuse ([8,9]) with loraTaskId 1
+    // store block 6 for reuse ([8,9]) with loraTaskId 1
     tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*llmRequest3);
     blockManager.releaseBlocks(seq3, llmRequest3);
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), 0);
@@ -1774,7 +1813,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithLoraTaskIdTest)
 
     numTokens = llmRequest4->getNumTokens(beamIdx);
     GenerationRequest seq4{requestId, numTokens, beamWidth, blockManager.getWindowSizesMetadata()};
-    // reuse blocks 0, get new block 8
+    // reuse block 0, get new block 7
     auto promptLen4 = llmRequest4->getNumTokens(beamIdx);
     auto numContextBlocks4 = tc::ceilDiv(promptLen4, blockManager.getTokensPerBlock());
     auto prepopulatedPromptLen4 = blockManager
@@ -1784,13 +1823,13 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithLoraTaskIdTest)
                                       .prepopulatedLen;
     llmRequest4->setPrepopulatedPromptLen(prepopulatedPromptLen4, blockManager.getTokensPerBlock());
     EXPECT_EQ(llmRequest4->getContextCurrentPosition(), tokensPerBlock);
-    EXPECT_THAT(seq4.getCacheBlockIds(maxAttentionWindow).at(beamIdx), ::testing::ElementsAreArray({0, 8}));
+    EXPECT_THAT(seq4.getCacheBlockIds(maxAttentionWindow).at(beamIdx), ::testing::ElementsAreArray({0, 7}));
     llmRequest4->addNewToken(5, beamIdx);
     numTokens = llmRequest4->getNumTokens(beamIdx);
     numBlocks = tc::ceilDiv(numTokens, tokensPerBlock);
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), numBlocks);
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - numBlocks);
-    // blocks 8 is stored with [4] and loraTaskId 0
+    // block 7 is stored with [4] and loraTaskId 0
     tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*llmRequest4);
     blockManager.releaseBlocks(seq4, llmRequest4);
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), 0);
@@ -1803,7 +1842,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithLoraTaskIdTest)
 
     numTokens = llmRequest5->getNumTokens(beamIdx);
     GenerationRequest seq5{requestId, numTokens, beamWidth, blockManager.getWindowSizesMetadata()};
-    // no reuse, get new block 9, 10, 11
+    // no reuse, get new blocks 8, 9, 10
     auto promptLen5 = llmRequest5->getNumTokens(beamIdx);
     auto numContextBlocks5 = tc::ceilDiv(promptLen5, blockManager.getTokensPerBlock());
     auto prepopulatedPromptLen5 = blockManager
@@ -1813,13 +1852,13 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithLoraTaskIdTest)
                                       .prepopulatedLen;
     llmRequest5->setPrepopulatedPromptLen(prepopulatedPromptLen5, blockManager.getTokensPerBlock());
     EXPECT_EQ(llmRequest5->getContextCurrentPosition(), 0);
-    EXPECT_THAT(seq5.getCacheBlockIds(maxAttentionWindow).at(beamIdx), ::testing::ElementsAreArray({9, 10, 11}));
+    EXPECT_THAT(seq5.getCacheBlockIds(maxAttentionWindow).at(beamIdx), ::testing::ElementsAreArray({8, 9, 10}));
     llmRequest5->addNewToken(9, beamIdx);
     numTokens = llmRequest5->getNumTokens(beamIdx);
     numBlocks = tc::ceilDiv(numTokens, tokensPerBlock);
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), numBlocks);
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - numBlocks);
-    // blocks 9, 10, 11 are stored without loraTaskId
+    // blocks 8, 9, 10 are stored without loraTaskId
     tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*llmRequest5);
     blockManager.releaseBlocks(seq5, llmRequest5);
     EXPECT_EQ(blockManager.getNumAllocatedBlocks(), 0);
@@ -2094,12 +2133,11 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithExtraIdAndLoraTaskIdTest)
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool);
 }
 
-TEST_F(KVCacheManagerTest, BlockManagerReuseWithCacheSaltIdTest)
+TEST_F(KVCacheManagerTest, BlockManagerReuseWithCacheSaltTest)
 {
-    // Test that cache_salt_id prevents KV cache reuse between requests with same tokens
-    // but different cache_salt_id values.
+    // Test that cache_salt prevents KV cache reuse between requests with same tokens
+    // but different cache_salt values.
     using VecTokenExtraIds = LlmRequest::VecTokenExtraIds;
-    using CacheSaltIDType = LlmRequest::CacheSaltIDType;
 
     auto constexpr numLayers = 12;
     auto constexpr numKvHeads = 6;
@@ -2135,7 +2173,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithCacheSaltIdTest)
     auto const inputLength = static_cast<SizeType32>(inputTokens->size());
 
     ///////////////////////////////////////////////////////////////////////////
-    // Test Case 1: Request without cache_salt_id
+    // Test Case 1: Request without cache_salt
     LlmRequest::RequestIdType requestId{0};
     auto llmRequest0 = std::make_shared<LlmRequest>(requestId, maxNewTokens, inputTokens, samplingConfig, isStreaming,
         std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
@@ -2143,8 +2181,8 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithCacheSaltIdTest)
         std::nullopt, std::nullopt, std::nullopt, std::nullopt, false, false, false, std::nullopt, std::nullopt, false,
         std::nullopt, false, std::nullopt, false, std::nullopt, 0.5, std::nullopt, std::nullopt, std::nullopt,
         LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION, std::nullopt, numReturnSequences, std::nullopt,
-        std::nullopt, false, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
-        std::nullopt); // No cache_salt_id
+        std::nullopt, false, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
+        std::nullopt); // No cache_salt
 
     GenerationRequest seq0{requestId, inputLength, beamWidth, blockManager.getWindowSizesMetadata()};
 
@@ -2177,21 +2215,22 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithCacheSaltIdTest)
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool);
 
     ///////////////////////////////////////////////////////////////////////////
-    // Test Case 2: Request with same tokens but with cache_salt_id = 12345
+    // Test Case 2: Request with same tokens but with cache_salt = "tenant-A"
     requestId = 1;
-    CacheSaltIDType cacheSaltId1{12345};
+    std::string const cacheSalt1{"tenant-A"};
     auto llmRequest1 = std::make_shared<LlmRequest>(requestId, maxNewTokens, inputTokens, samplingConfig, isStreaming,
         std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
         std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
         std::nullopt, std::nullopt, std::nullopt, std::nullopt, false, false, false, std::nullopt, std::nullopt, false,
         std::nullopt, false, std::nullopt, false, std::nullopt, 0.5, std::nullopt, std::nullopt, std::nullopt,
         LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION, std::nullopt, numReturnSequences, std::nullopt,
-        std::nullopt, false, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
-        cacheSaltId1); // With cache_salt_id = 12345
+        std::nullopt, false, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
+        std::nullopt, std::nullopt, std::nullopt,
+        cacheSalt1); // With cache_salt = "tenant-A"
 
     GenerationRequest seq1{requestId, inputLength, beamWidth, blockManager.getWindowSizesMetadata()};
 
-    // Should NOT reuse blocks despite same tokens, because cache_salt_id is different
+    // Should NOT reuse blocks despite same tokens, because cache_salt is different
     auto promptLen1 = llmRequest1->getNumTokens(beamIdx);
     auto numContextBlocks1 = tc::ceilDiv(promptLen1, blockManager.getTokensPerBlock());
     auto prepopulatedPromptLen1 = blockManager
@@ -2215,7 +2254,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithCacheSaltIdTest)
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool);
 
     ///////////////////////////////////////////////////////////////////////////
-    // Test Case 3: Request with same tokens and same cache_salt_id = 12345
+    // Test Case 3: Request with same tokens and same cache_salt = "tenant-A"
     requestId = 2;
     auto llmRequest2 = std::make_shared<LlmRequest>(requestId, maxNewTokens, inputTokens, samplingConfig, isStreaming,
         std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
@@ -2223,12 +2262,13 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithCacheSaltIdTest)
         std::nullopt, std::nullopt, std::nullopt, std::nullopt, false, false, false, std::nullopt, std::nullopt, false,
         std::nullopt, false, std::nullopt, false, std::nullopt, 0.5, std::nullopt, std::nullopt, std::nullopt,
         LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION, std::nullopt, numReturnSequences, std::nullopt,
-        std::nullopt, false, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
-        cacheSaltId1); // Same cache_salt_id = 12345
+        std::nullopt, false, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
+        std::nullopt, std::nullopt, std::nullopt,
+        cacheSalt1); // Same cache_salt = "tenant-A"
 
     GenerationRequest seq2{requestId, inputLength, beamWidth, blockManager.getWindowSizesMetadata()};
 
-    // SHOULD reuse blocks because both tokens and cache_salt_id match
+    // SHOULD reuse blocks because both tokens and cache_salt match
     auto promptLen2 = llmRequest2->getNumTokens(beamIdx);
     auto numContextBlocks2 = tc::ceilDiv(promptLen2, blockManager.getTokensPerBlock());
     auto prepopulatedPromptLen2 = blockManager
@@ -2252,21 +2292,22 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithCacheSaltIdTest)
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool);
 
     ///////////////////////////////////////////////////////////////////////////
-    // Test Case 4: Request with same tokens but different cache_salt_id = 67890
+    // Test Case 4: Request with same tokens but different cache_salt = "tenant-B"
     requestId = 3;
-    CacheSaltIDType cacheSaltId2{67890};
+    std::string const cacheSalt2{"tenant-B"};
     auto llmRequest3 = std::make_shared<LlmRequest>(requestId, maxNewTokens, inputTokens, samplingConfig, isStreaming,
         std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
         std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
         std::nullopt, std::nullopt, std::nullopt, std::nullopt, false, false, false, std::nullopt, std::nullopt, false,
         std::nullopt, false, std::nullopt, false, std::nullopt, 0.5, std::nullopt, std::nullopt, std::nullopt,
         LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION, std::nullopt, numReturnSequences, std::nullopt,
-        std::nullopt, false, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
-        cacheSaltId2); // Different cache_salt_id = 67890
+        std::nullopt, false, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
+        std::nullopt, std::nullopt, std::nullopt,
+        cacheSalt2); // Different cache_salt = "tenant-B"
 
     GenerationRequest seq3{requestId, inputLength, beamWidth, blockManager.getWindowSizesMetadata()};
 
-    // Should NOT reuse blocks from any previous request because cache_salt_id is different
+    // Should NOT reuse blocks from any previous request because cache_salt is different
     auto promptLen3 = llmRequest3->getNumTokens(beamIdx);
     auto numContextBlocks3 = tc::ceilDiv(promptLen3, blockManager.getTokensPerBlock());
     auto prepopulatedPromptLen3 = blockManager
@@ -2276,7 +2317,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithCacheSaltIdTest)
                                       .prepopulatedLen;
     llmRequest3->setPrepopulatedPromptLen(prepopulatedPromptLen3, blockManager.getTokensPerBlock());
     EXPECT_EQ(llmRequest3->getContextCurrentPosition(), 0); // No reuse
-    EXPECT_THAT(seq3.getCacheBlockIds(maxAttentionWindow).at(beamIdx), ::testing::ElementsAreArray({7, 8, 9}));
+    EXPECT_THAT(seq3.getCacheBlockIds(maxAttentionWindow).at(beamIdx), ::testing::ElementsAreArray({6, 7, 8}));
 
     llmRequest3->addNewToken(5, beamIdx);
     llmRequest3->addNewToken(6, beamIdx);
@@ -2284,7 +2325,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithCacheSaltIdTest)
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - numBlocks);
 
     ///////////////////////////////////////////////////////////////////////////
-    // Test Case 5: Request without cache_salt_id again
+    // Test Case 5: Request without cache_salt again
     requestId = 4;
     auto llmRequest4 = std::make_shared<LlmRequest>(requestId, maxNewTokens, inputTokens, samplingConfig, isStreaming,
         std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
@@ -2292,12 +2333,12 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithCacheSaltIdTest)
         std::nullopt, std::nullopt, std::nullopt, std::nullopt, false, false, false, std::nullopt, std::nullopt, false,
         std::nullopt, false, std::nullopt, false, std::nullopt, 0.5, std::nullopt, std::nullopt, std::nullopt,
         LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION, std::nullopt, numReturnSequences, std::nullopt,
-        std::nullopt, false, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
-        std::nullopt); // No cache_salt_id
+        std::nullopt, false, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
+        std::nullopt); // No cache_salt
 
     GenerationRequest seq4{requestId, inputLength, beamWidth, blockManager.getWindowSizesMetadata()};
 
-    // Should reuse blocks from request0 (blocks 0,1) because both have no cache_salt_id
+    // Should reuse blocks from request0 (blocks 0,1) because both have no cache_salt
     auto promptLen4 = llmRequest4->getNumTokens(beamIdx);
     auto numContextBlocks4 = tc::ceilDiv(promptLen4, blockManager.getTokensPerBlock());
     auto prepopulatedPromptLen4 = blockManager
@@ -2307,7 +2348,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithCacheSaltIdTest)
                                       .prepopulatedLen;
     llmRequest4->setPrepopulatedPromptLen(prepopulatedPromptLen4, blockManager.getTokensPerBlock());
     EXPECT_EQ(llmRequest4->getContextCurrentPosition(), 2 * tokensPerBlock); // Reuse blocks 0,1
-    EXPECT_THAT(seq4.getCacheBlockIds(maxAttentionWindow).at(beamIdx), ::testing::ElementsAreArray({0, 1, 10}));
+    EXPECT_THAT(seq4.getCacheBlockIds(maxAttentionWindow).at(beamIdx), ::testing::ElementsAreArray({0, 1, 9}));
 
     llmRequest4->addNewToken(7, beamIdx);
     numTokens = llmRequest4->getNumTokens(beamIdx);
@@ -3023,8 +3064,8 @@ TEST_F(KVCacheManagerTest, KVCacheManagerLeafBlockTest)
 
     GenerationRequest const& seq1 = kvCacheManager.getSequence(1);
     EXPECT_EQ(llmRequest1->getContextCurrentPosition(), 0);
-    // Block 1 should NOT be reused. It was not freed even if partial.
-    EXPECT_THAT(seq1.getCacheBlockIds(maxAttentionWindow).at(0), ::testing::ElementsAreArray({2}));
+    // Detached block 1 is recycled without reusing its KV contents.
+    EXPECT_THAT(seq1.getCacheBlockIds(maxAttentionWindow).at(0), ::testing::ElementsAreArray({1}));
 
     // Allocate the remaining 3 blocks in primary
     auto inputTokens2 = std::make_shared<VecTokens>(VecTokens{2, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11});
@@ -3897,39 +3938,40 @@ TEST_F(KVCacheManagerTest, KVCacheManagerEventStream)
 
     events = getEvents(kvCacheManager);
 
-    // Onboard block 0, in replace, offload block 7
-    // Offload block 6, and write content of [1,1,1,1] to block 1
-    // Upon freeing up block 1, its child block 2, will be removed from the search tree,
-    // which is a remove event.
-    // Offload block 5, in replace onboard block 7, and write content of [0] to block 7.
-    // In total, there are 2 offloads, 1 onboard, 1 removed, total of 4 events.
-    // FIXME: For better improvement, when block 1 is overwritten, child blocks
-    // are removed from the search tree and no longer reusable. Therefore these blocks
-    // should be the first to be called upon when we want a new block.
+    // Replacing block 1 removes its detached child block 2 from the search tree. Block 2 is then recycled before a
+    // reusable block needs to be offloaded, producing one offload, one onboard, and one remove event.
     auto onboardedBlocks = 0;
     auto offloadedBlocks = 0;
     auto removedBlocks = 0;
 
-    EXPECT_EQ(events.size(), 4);
+    ASSERT_EQ(events.size(), 3);
 
-    for (int i = 0; i < 4; i++)
+    for (int i = 0; i < 3; i++)
     {
         if (std::holds_alternative<tle::KVCacheUpdatedData>(events.front().data))
         {
             if (std::get<tle::KVCacheUpdatedData>(events.front().data).cacheLevel->oldValue == 0)
+            {
                 offloadedBlocks++;
+            }
             else
+            {
                 onboardedBlocks++;
+            }
         }
         else if (std::holds_alternative<tle::KVCacheRemovedData>(events.front().data))
+        {
             removedBlocks++;
+        }
         else
+        {
             FAIL();
+        }
         events.pop_front();
     }
 
     EXPECT_EQ(onboardedBlocks, 1);
-    EXPECT_EQ(offloadedBlocks, 2);
+    EXPECT_EQ(offloadedBlocks, 1);
     EXPECT_EQ(removedBlocks, 1);
 
     tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*llmRequest4);
@@ -4045,7 +4087,7 @@ TEST_F(KVCacheManagerTest, KVCacheManagerMaxAttentionWindowWithReuseTest)
 
     ///////////////////////////////////////////////////////////////////////////
     // add a medium request and then remove it
-    // reuse first 3 blocks {0, 1, 2(p)} in first request, copying block 2 to a new block 8
+    // reuse first 3 blocks {0, 1, 2(p)} in first request, copying block 2 to block 16
     requestId = 2;
     inputLength = 10;
     inputTokens->resize(inputLength);
@@ -4054,14 +4096,14 @@ TEST_F(KVCacheManagerTest, KVCacheManagerMaxAttentionWindowWithReuseTest)
     kvCacheManager.addSequenceBatch({{{requestId, inputLength, beamWidth}}}, {std::ref(*llmRequest)});
     GenerationRequest const& seq2 = kvCacheManager.getSequence(requestId);
     EXPECT_EQ(llmRequest->getContextCurrentPosition(), 9);
-    EXPECT_THAT(seq2.getCacheBlockIds(onlyWindowSize).at(beamIdx), ::testing::ElementsAreArray({0, 1, 8}));
+    EXPECT_THAT(seq2.getCacheBlockIds(onlyWindowSize).at(beamIdx), ::testing::ElementsAreArray({0, 1, 16}));
     tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*llmRequest);
     EXPECT_NO_THROW(static_cast<void>(kvCacheManager.removeSequence(requestId, llmRequest)));
 
     ///////////////////////////////////////////////////////////////////////////
     // add a longer request within attention window and try to reuse
-    // reuse blocks {0, 1, 2, 3(p)}, copying block 3 to a new block 9
-    // then upon reaching attention window, get new block 10
+    // reuse blocks {0, 1, 2, 3(p)}, copying block 3 to recycled block 7
+    // then upon reaching attention window, get block 8
     requestId = 3;
     inputLength = 15;
     inputTokens->resize(inputLength);
@@ -4070,14 +4112,14 @@ TEST_F(KVCacheManagerTest, KVCacheManagerMaxAttentionWindowWithReuseTest)
     kvCacheManager.addSequenceBatch({{{requestId, inputLength, beamWidth}}}, {std::ref(*llmRequest)});
     GenerationRequest const& seq3 = kvCacheManager.getSequence(requestId);
     EXPECT_EQ(llmRequest->getContextCurrentPosition(), 14);
-    EXPECT_THAT(seq3.getCacheBlockIds(onlyWindowSize).at(beamIdx), ::testing::ElementsAreArray({0, 1, 2, 9}));
+    EXPECT_THAT(seq3.getCacheBlockIds(onlyWindowSize).at(beamIdx), ::testing::ElementsAreArray({0, 1, 2, 7}));
 
     // add new tokens to allocate another block, but not enough to detach block
     llmRequest->addNewToken(1015, beamIdx);
     kvCacheManager.addToken(requestId);
     llmRequest->addNewToken(1016, beamIdx);
     kvCacheManager.addToken(requestId);
-    EXPECT_THAT(seq3.getCacheBlockIds(onlyWindowSize).at(beamIdx), ::testing::ElementsAreArray({0, 1, 2, 9, 10}));
+    EXPECT_THAT(seq3.getCacheBlockIds(onlyWindowSize).at(beamIdx), ::testing::ElementsAreArray({0, 1, 2, 7, 8}));
     tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*llmRequest);
     EXPECT_NO_THROW(static_cast<void>(kvCacheManager.removeSequence(requestId, llmRequest)));
 }
@@ -4483,6 +4525,216 @@ TEST_F(KVCacheManagerTest, GetPriorityByBlockId)
     EXPECT_EQ(invalidOutOfRange, KvCacheRetentionConfig::kDefaultRetentionPriority);
 }
 
+TEST_F(KVCacheManagerTest, CommitAndGetBlockHashesForRequest)
+{
+    // Validates KVCacheManager::commitAndGetBlockHashesForRequest (the hash chain exposed to
+    // the KV cache connector):
+    //   * a request with fewer than one full block yields an empty chain,
+    //   * one hash is returned per *full* block; a partial trailing block is clipped,
+    //   * the chain matches BlockKeyHasher applied block-by-block to the request's tokens,
+    //   * a block that fills during generation is committed in the same step (the front-running
+    //     semantic exercising the "set" branch, not just the already-full lookup branch),
+    //   * repeated calls are idempotent (already-full blocks become pure lookups), and
+    //   * the committed hashes equal the hashes the KV cache Stored events later emit.
+    auto constexpr numLayers = 2;
+    auto constexpr numKvHeads = 2;
+    auto constexpr sizePerHead = 16;
+    auto constexpr tokensPerBlock = 4;
+    auto constexpr numBlocks = 8;
+    auto constexpr maxAttentionWindow = 32;
+    auto constexpr maxNumSequences = 4;
+    auto constexpr beamWidth = 1;
+    auto constexpr beamIdx = 0;
+    auto constexpr dtype = nvinfer1::DataType::kHALF;
+    auto const stream = std::make_shared<tr::CudaStream>();
+    SizeType32 constexpr maxNewTokens = 8;
+    tr::SamplingConfig const samplingConfig{beamWidth};
+    bool constexpr isStreaming{false};
+
+    auto const blocksPerWindow = BlocksPerWindow{{maxAttentionWindow, {numBlocks, 0}}};
+
+    KVCacheManager kvCacheManager(numLayers, numKvHeads, sizePerHead, tokensPerBlock, blocksPerWindow, maxNumSequences,
+        beamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow}, dtype, 0, stream, maxAttentionWindow,
+        maxAttentionWindow, /*enableBlockReuse=*/true, CacheType::kSELF, std::nullopt,
+        std::make_unique<tlk::KVCacheEventManager>(1024));
+    kvCacheManager.allocatePools(false);
+    (void) getEvents(kvCacheManager); // Drain the Created event.
+
+    // Ground truth: chain BlockKeyHasher over the request's full token blocks, exactly as the
+    // production storeBlocks path (and KV cache events) would for a freshly-allocated sequence.
+    auto const expectedChain = [&](LlmRequest const& req)
+    {
+        auto const& uniqueTokens = req.getUniqueTokens(beamIdx);
+        auto const numFull = static_cast<SizeType32>(uniqueTokens.size()) / tokensPerBlock;
+        std::vector<tle::IdType> expected;
+        std::size_t parentHash = 0;
+        for (SizeType32 b = 0; b < numFull; ++b)
+        {
+            VecUniqueTokens slice(
+                uniqueTokens.begin() + b * tokensPerBlock, uniqueTokens.begin() + (b + 1) * tokensPerBlock);
+            BlockKey const blockKey(/*usesExtraIds=*/false, /*loraTaskId=*/std::nullopt, std::move(slice));
+            auto const hash = BlockKeyHasher::hash(blockKey, parentHash);
+            expected.push_back(static_cast<tle::IdType>(hash));
+            parentHash = hash;
+        }
+        return expected;
+    };
+
+    // Case 1: fewer than one full block -> empty chain.
+    {
+        auto inputTokens = std::make_shared<VecTokens>(VecTokens{0, 1});
+        auto llmRequest = std::make_shared<LlmRequest>(0, maxNewTokens, inputTokens, samplingConfig, isStreaming);
+        kvCacheManager.addSequenceBatch(
+            {{{0, static_cast<SizeType32>(inputTokens->size()), beamWidth}}}, {std::ref(*llmRequest)});
+        EXPECT_TRUE(kvCacheManager.commitAndGetBlockHashesForRequest(*llmRequest, maxAttentionWindow).empty());
+        tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*llmRequest);
+        (void) kvCacheManager.removeSequence(0, llmRequest);
+    }
+
+    // Case 2: 6 context tokens -> 1 full block (committed at allocation, lookup branch) + a
+    // partial trailing block. The partial 2nd block must be clipped, so only one hash is returned.
+    auto inputTokens = std::make_shared<VecTokens>(VecTokens{10, 11, 12, 13, 14, 15});
+    auto llmRequest = std::make_shared<LlmRequest>(1, maxNewTokens, inputTokens, samplingConfig, isStreaming);
+    kvCacheManager.addSequenceBatch(
+        {{{1, static_cast<SizeType32>(inputTokens->size()), beamWidth}}}, {std::ref(*llmRequest)});
+    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*llmRequest);
+
+    auto contextHashes = kvCacheManager.commitAndGetBlockHashesForRequest(*llmRequest, maxAttentionWindow);
+    auto contextExpected = expectedChain(*llmRequest);
+    ASSERT_EQ(contextExpected.size(), 1u); // Partial 2nd block must be clipped.
+    EXPECT_EQ(contextHashes, contextExpected);
+
+    // Generate tokens 16, 17, 18 so the 2nd block (tokens 14..17) fills *during generation*. It
+    // was allocated partial, so commitAndGetBlockHashesForRequest must take the "set" branch:
+    // build the full BlockKey, mark the block full, and hash it chained from the first block.
+    // Token 18 starts a 3rd (partial) block so that block 2 is no longer the sequence's trailing
+    // block: storeBlocks drops the final unusable token, and we want block 2 keyed with all four
+    // tokens at store time so its stored hash matches the committed one (see the event check).
+    for (auto const token : {16, 17, 18})
+    {
+        llmRequest->addNewToken(token, beamIdx);
+        kvCacheManager.addToken(1);
+    }
+
+    auto hashes = kvCacheManager.commitAndGetBlockHashesForRequest(*llmRequest, maxAttentionWindow);
+    auto expected = expectedChain(*llmRequest);
+    ASSERT_EQ(expected.size(), 2u);
+    EXPECT_EQ(hashes, expected);
+    // The first block's hash is unchanged from the context-only call (front-running only appends).
+    EXPECT_EQ(hashes.front(), contextHashes.front());
+
+    // Idempotent: a repeated call (now pure lookups on full blocks) returns the same chain.
+    EXPECT_EQ(kvCacheManager.commitAndGetBlockHashesForRequest(*llmRequest, maxAttentionWindow), hashes);
+
+    // The committed hashes must match the hashes the KV cache Stored events emit for the same
+    // blocks once the sequence is released and its full blocks are stored for reuse. This holds
+    // for blocks that are not the sequence's trailing block (storeBlocks drops the final unusable
+    // token, which would otherwise shorten the trailing block's key relative to the committed one).
+    (void) getEvents(kvCacheManager); // Drain pending events before storing.
+    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*llmRequest);
+    (void) kvCacheManager.removeSequence(1, llmRequest);
+
+    std::set<tle::IdType> storedHashes;
+    for (auto const& event : getEvents(kvCacheManager))
+    {
+        if (std::holds_alternative<tle::KVCacheStoredData>(event.data))
+        {
+            for (auto const& block : std::get<tle::KVCacheStoredData>(event.data).blocks)
+            {
+                storedHashes.insert(static_cast<tle::IdType>(block.blockHash));
+            }
+        }
+    }
+    for (auto const hash : hashes)
+    {
+        EXPECT_GT(storedHashes.count(hash), 0u) << "committed hash not emitted by a Stored event";
+    }
+}
+
+TEST_F(KVCacheManagerTest, CommitAndGetBlockHashesFrontRunsTrailingFullBlock)
+{
+    // Regression guard for the front-running contract: when a block fills *exactly* on a block
+    // boundary so that it is the sequence's trailing block (no partial block follows it),
+    // commitAndGetBlockHashesForRequest must still commit and return that block's hash in the
+    // same step. The sibling test CommitAndGetBlockHashesForRequest only covers a just-filled
+    // block that is followed by a partial block, so it would still pass if the implementation
+    // switched to getUsableUniqueTokenCountForReuse (which subtracts the final unmaterialized
+    // token and would drop the trailing full block). This test pins the exact-boundary case so
+    // that regression fails loudly: with tokensPerBlock=4 and 8 tokens, the usable-count path
+    // would yield (8 - 1) / 4 = 1 block, whereas the correct front-running chain has 2.
+    auto constexpr numLayers = 2;
+    auto constexpr numKvHeads = 2;
+    auto constexpr sizePerHead = 16;
+    auto constexpr tokensPerBlock = 4;
+    auto constexpr numBlocks = 8;
+    auto constexpr maxAttentionWindow = 32;
+    auto constexpr maxNumSequences = 4;
+    auto constexpr beamWidth = 1;
+    auto constexpr beamIdx = 0;
+    auto constexpr dtype = nvinfer1::DataType::kHALF;
+    auto const stream = std::make_shared<tr::CudaStream>();
+    SizeType32 constexpr maxNewTokens = 8;
+    tr::SamplingConfig const samplingConfig{beamWidth};
+    bool constexpr isStreaming{false};
+
+    auto const blocksPerWindow = BlocksPerWindow{{maxAttentionWindow, {numBlocks, 0}}};
+
+    KVCacheManager kvCacheManager(numLayers, numKvHeads, sizePerHead, tokensPerBlock, blocksPerWindow, maxNumSequences,
+        beamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow}, dtype, 0, stream, maxAttentionWindow,
+        maxAttentionWindow, /*enableBlockReuse=*/true, CacheType::kSELF, std::nullopt);
+    kvCacheManager.allocatePools(false);
+
+    // Chain BlockKeyHasher over the request's full token blocks (keyed by uniqueTokens.size()),
+    // mirroring the front-running chain the connector expects.
+    auto const expectedChain = [&](LlmRequest const& req)
+    {
+        auto const& uniqueTokens = req.getUniqueTokens(beamIdx);
+        auto const numFull = static_cast<SizeType32>(uniqueTokens.size()) / tokensPerBlock;
+        std::vector<tle::IdType> expected;
+        std::size_t parentHash = 0;
+        for (SizeType32 b = 0; b < numFull; ++b)
+        {
+            VecUniqueTokens slice(
+                uniqueTokens.begin() + b * tokensPerBlock, uniqueTokens.begin() + (b + 1) * tokensPerBlock);
+            BlockKey const blockKey(/*usesExtraIds=*/false, /*loraTaskId=*/std::nullopt, std::move(slice));
+            auto const hash = BlockKeyHasher::hash(blockKey, parentHash);
+            expected.push_back(static_cast<tle::IdType>(hash));
+            parentHash = hash;
+        }
+        return expected;
+    };
+
+    // 6 context tokens -> block 0 full (10..13), block 1 partial (14, 15).
+    auto inputTokens = std::make_shared<VecTokens>(VecTokens{10, 11, 12, 13, 14, 15});
+    auto llmRequest = std::make_shared<LlmRequest>(0, maxNewTokens, inputTokens, samplingConfig, isStreaming);
+    kvCacheManager.addSequenceBatch(
+        {{{0, static_cast<SizeType32>(inputTokens->size()), beamWidth}}}, {std::ref(*llmRequest)});
+    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*llmRequest);
+
+    auto contextHashes = kvCacheManager.commitAndGetBlockHashesForRequest(*llmRequest, maxAttentionWindow);
+    ASSERT_EQ(contextHashes.size(), 1u); // block 1 is still partial here.
+
+    // Generate exactly tokens 16, 17 so block 1 (tokens 14..17) fills and becomes the *trailing*
+    // block -- no further (partial) block is started. The just-filled trailing block must be
+    // committed via the "set" branch in this same step.
+    for (auto const token : {16, 17})
+    {
+        llmRequest->addNewToken(token, beamIdx);
+        kvCacheManager.addToken(0);
+    }
+
+    auto hashes = kvCacheManager.commitAndGetBlockHashesForRequest(*llmRequest, maxAttentionWindow);
+    auto expected = expectedChain(*llmRequest);
+    ASSERT_EQ(expected.size(), 2u);
+    // The crux: 2 hashes, not 1. A usable-count implementation would drop the trailing block.
+    EXPECT_EQ(hashes, expected);
+    // Front-running only appends; block 0's hash is unchanged from the context-only call.
+    EXPECT_EQ(hashes.front(), contextHashes.front());
+
+    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*llmRequest);
+    (void) kvCacheManager.removeSequence(0, llmRequest);
+}
+
 TEST(KVCacheManagerHelpersTest, ChopVectorIntoBlocksBasicNoPartial)
 {
     using namespace tensorrt_llm::batch_manager::kv_cache_manager;
@@ -4799,6 +5051,49 @@ TEST_F(KVCacheManagerTest, KVCacheTransferManagerConcurrencyTest)
     {
         EXPECT_EQ(tr::bufferCast<float>(*pool.secondaryPtr)[i], 0);
     }
+}
+
+TEST_F(KVCacheManagerTest, KVCacheTransferManagerPendingTransfersDistinguishPrimaryAndSecondarySlots)
+{
+    using tensorrt_llm::testing::KVCacheTransferManagerTestAccess;
+
+    auto constexpr kBlockSize = 1024;
+    auto constexpr kNumSlotsPerPool = 2;
+
+    auto bufferManager = tr::BufferManager(std::make_shared<tr::CudaStream>());
+    auto transferManager = KVCacheTransferManager(bufferManager);
+
+    auto pool = KVCacheBlockPool(0, 2, 0, 0, 0);
+    pool.primaryPtr
+        = bufferManager.gpu(tr::ITensor::makeShape({kNumSlotsPerPool, kBlockSize}), nvinfer1::DataType::kFLOAT);
+    bufferManager.setZero(*pool.primaryPtr);
+
+    pool.secondaryPtr
+        = tr::BufferManager::pinned(tr::ITensor::makeShape({kNumSlotsPerPool, kBlockSize}), nvinfer1::DataType::kFLOAT);
+
+    auto primarySlot0 = std::make_shared<KVCacheBlock>(0, tk::KVCacheIndex(0, false));
+    auto primarySlot1 = std::make_shared<KVCacheBlock>(1, tk::KVCacheIndex(1, false));
+    auto secondarySlot0 = std::make_shared<KVCacheBlock>(2, tk::KVCacheIndex(0, true));
+    auto secondarySlot1 = std::make_shared<KVCacheBlock>(3, tk::KVCacheIndex(1, true));
+
+    transferManager.offload(primarySlot0, secondarySlot1, {pool});
+
+    EXPECT_EQ(KVCacheTransferManagerTestAccess::pendingReadCount(transferManager), 1);
+    EXPECT_EQ(KVCacheTransferManagerTestAccess::pendingWriteCount(transferManager), 1);
+    EXPECT_TRUE(KVCacheTransferManagerTestAccess::hasPendingReadForBlock(transferManager, primarySlot0));
+    EXPECT_TRUE(KVCacheTransferManagerTestAccess::hasPendingWriteForBlock(transferManager, secondarySlot1));
+
+    transferManager.onboard(secondarySlot0, primarySlot1, {pool});
+
+    EXPECT_EQ(KVCacheTransferManagerTestAccess::pendingReadCount(transferManager), 2);
+    EXPECT_EQ(KVCacheTransferManagerTestAccess::pendingWriteCount(transferManager), 2);
+    EXPECT_TRUE(KVCacheTransferManagerTestAccess::hasPendingReadForBlock(transferManager, primarySlot0));
+    EXPECT_TRUE(KVCacheTransferManagerTestAccess::hasPendingReadForBlock(transferManager, secondarySlot0));
+    EXPECT_TRUE(KVCacheTransferManagerTestAccess::hasPendingWriteForBlock(transferManager, primarySlot1));
+    EXPECT_TRUE(KVCacheTransferManagerTestAccess::hasPendingWriteForBlock(transferManager, secondarySlot1));
+
+    transferManager.syncTransfers();
+    bufferManager.getStream().synchronize();
 }
 
 TEST_P(KVCacheManagerTest, DISABLED_KVCacheManagerSinkTokenLengthTest)
@@ -6301,6 +6596,91 @@ TEST(KVCacheManagerReuseAccountingTest, ReuseAwareBlockEstimatesStayConsistentAf
     EXPECT_EQ(remainingAfterContextAlloc, maxNewTokens / tokensPerBlock);
 }
 
+// Validates the two independent budgets getNeededBlocksOneStep drives for a first-chunk context request.
+// The block/capacity budget (numRequiredBlocks) credits only allocated reuse, since a free-but-cached
+// block still costs a free-pool block when reused. The compute/token budget (estimatedReusableTokens)
+// credits all cached prefix blocks, since the engine skips recomputing them via prepopulatedPromptLen
+// regardless of ref state.
+//
+// In steady state a shared prefix is free-but-cached (no active refs), so reusableBlocksAllocated is 0
+// while reusableBlocksAll stays large. Crediting only allocated reuse to the token budget would charge
+// the full prompt as compute and starve the FCFS micro-batch scheduler, serializing context requests.
+TEST(KVCacheManagerReuseAccountingTest, NeededBlocksOneStepCreditsFreeCachedReuseInTokenBudget)
+{
+    auto const stream = std::make_shared<tr::CudaStream>();
+    auto constexpr tokensPerBlock = 16;
+    auto constexpr promptLength = 64; // 4 full context blocks
+    auto constexpr maxNewTokens = 32;
+    auto constexpr maxBeamWidth = 1;
+    auto constexpr maxAttentionWindow = 512;
+    auto constexpr maxNumTokens = 1024;
+
+    auto kvCacheManager = createKvCacheManager(
+        KvCacheManagerInstantiationParameters{
+            /* numLayers */ 1,
+            /* numHeads */ 1,
+            /* sizePerHead */ 1,
+            /* tokensPerBlock */ tokensPerBlock,
+            /* blocksPerWindow */ blocksAndWindow(/* numPrimaryBlocks */ 256, /* windowSize */ maxAttentionWindow),
+            /* sinkTokenLength */ 0,
+            /* maxAttentionWindow */ maxAttentionWindow,
+            /* maxBeamWidth */ maxBeamWidth,
+            /* maxNumTokens */ maxNumTokens,
+            /* kvCacheBlockReuse */ true,
+        },
+        stream);
+    kvCacheManager->allocatePools(/*useUvm=*/false);
+    auto const onlyWindowSize = theOnlyWindowSize(*kvCacheManager);
+
+    auto const baseTokens = std::make_shared<std::vector<TokenIdType>>(static_cast<std::size_t>(promptLength), 7);
+
+    // req0 populates the radix tree, then is removed so its prefix blocks are FREE-but-cached
+    // (present in the reuse tree, but with no active references).
+    auto req0 = LlmRequest{0, maxNewTokens, baseTokens, tensorrt_llm::runtime::SamplingConfig{maxBeamWidth}, true};
+    kvCacheManager->addSequenceBatch({{{req0.mRequestId, req0.getPromptLen(), maxBeamWidth}}}, {std::ref(req0)});
+    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(req0);
+    kvCacheManager->storeContextBlocks(req0);
+    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(req0);
+    kvCacheManager->removeSequence(req0.mRequestId, req0);
+
+    // req1 shares the whole prefix. Because req0 was removed, the matching blocks have no refs.
+    auto req1 = LlmRequest{1, maxNewTokens, baseTokens, tensorrt_llm::runtime::SamplingConfig{maxBeamWidth}, true};
+
+    // storeContextBlocks only commits (promptLength - 1) tokens worth of blocks -> 3 full blocks.
+    auto const expectedReusableBlocks = (promptLength - 1) / tokensPerBlock; // 3
+    auto const summary = kvCacheManager->analyzePrefixReuse(req1.getUniqueTokens(0), req1);
+    // Every reusable block is free-but-cached, so all of them count in All and none in Allocated.
+    ASSERT_EQ(summary.reusableBlocksAll, expectedReusableBlocks);
+    ASSERT_EQ(summary.reusableBlocksAllocated, 0);
+
+    auto const numContextBlocks = promptLength / tokensPerBlock; // 4
+
+    // Block/capacity budget: free-cached reuse is not subtracted, since it still costs free blocks.
+    auto const neededOneStep
+        = kvCacheManager->getNeededBlocksOneStep(req1, /*twoStepsLookAhead=*/false, onlyWindowSize);
+    EXPECT_EQ(neededOneStep, numContextBlocks);
+
+    // Token/compute budget: the MAX_UTILIZATION path credits all cached blocks, so the whole prefix is
+    // free for compute.
+    auto const estimatedReusableTokens = req1.getEstimatedReusableTokens();
+    EXPECT_EQ(estimatedReusableTokens, expectedReusableBlocks * tokensPerBlock); // 48
+
+    // Model the FCFS micro-batch scheduler's compute-aware admission for a fixed per-iteration token
+    // budget: each first-chunk context request costs (promptLength - reusableTokens) compute tokens.
+    // Crediting all cached reuse admits more requests than crediting only allocated reuse.
+    auto const ctxTokenBudget = promptLength;                                                  // 64
+    auto const allocatedOnlyReusableTokens = summary.reusableBlocksAllocated * tokensPerBlock; // 0
+    auto const computeCostAllCached = std::max(1, promptLength - estimatedReusableTokens);
+    auto const computeCostAllocatedOnly = std::max(1, promptLength - allocatedOnlyReusableTokens);
+
+    auto const admittedAllocatedOnly = ctxTokenBudget / computeCostAllocatedOnly;
+    auto const admittedAllCached = ctxTokenBudget / computeCostAllCached;
+
+    EXPECT_EQ(admittedAllocatedOnly, 1); // full-prompt compute: only one request fits
+    EXPECT_EQ(admittedAllCached, 4);     // cached prefix is free: four requests fit
+    EXPECT_GT(admittedAllCached, admittedAllocatedOnly);
+}
+
 TEST(KVCacheManagerReuseAccountingTest, NeededBlocksOneStepCapsAllocatedReuseAtExactBlockBoundary)
 {
     auto const stream = std::make_shared<tr::CudaStream>();
@@ -6485,8 +6865,8 @@ TEST(KVCacheManagerReuseAccountingTest, CountReusableBlocksPartialMatch)
         = kvCacheManager->getNeededBlocksOneStep(req1, /*twoStepsLookAhead=*/false, onlyWindowSize);
     EXPECT_EQ(neededOneStep, promptLength / tokensPerBlock); // All 4 context blocks
 
-    // Blocks are free (released via removeSequence), so onlyAllocated=true yields 0 reusable blocks.
-    EXPECT_EQ(req1.getEstimatedReusableTokens(), 0);
+    // Free-but-cached blocks still consume free-pool capacity, but their tokens do not require recomputation.
+    EXPECT_EQ(req1.getEstimatedReusableTokens(), summaryShared.reusableBlocksAll * tokensPerBlock);
 }
 
 TEST(KVCacheManagerReuseAccountingTest, GetRemainingBlocksToCompletionWithPartialReuse)
@@ -6603,7 +6983,7 @@ TEST(KVCacheManagerReuseAccountingTest, GetNeededBlocksOneStepWithFullReuse)
     tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(req0);
     kvCacheManager->removeSequence(req0.mRequestId, req0);
 
-    // Second request with identical tokens - all context blocks should be reusable
+    // Second request with identical tokens - the recoverable cached prefix should be reusable
     auto req1 = LlmRequest{
         1,
         maxNewTokens,
@@ -6616,11 +6996,12 @@ TEST(KVCacheManagerReuseAccountingTest, GetNeededBlocksOneStepWithFullReuse)
     // getNeededBlocksOneStep must NOT subtract free reusable blocks.
     auto const neededOneStep
         = kvCacheManager->getNeededBlocksOneStep(req1, /*twoStepsLookAhead=*/false, onlyWindowSize);
-    auto const numSharedBlocks = promptLength / tokensPerBlock; // 3 blocks
-    EXPECT_EQ(neededOneStep, numSharedBlocks);                  // All 3 context blocks
+    auto const numContextBlocks = promptLength / tokensPerBlock; // 3 blocks
+    EXPECT_EQ(neededOneStep, numContextBlocks);                  // All 3 context blocks
 
-    // Blocks are free (released via removeSequence), so onlyAllocated=true yields 0 reusable blocks.
-    EXPECT_EQ(req1.getEstimatedReusableTokens(), 0);
+    // Sequence insertion omits the final prompt token, so only the preceding full blocks are recoverable.
+    auto const expectedReusableBlocks = (promptLength - 1) / tokensPerBlock;
+    EXPECT_EQ(req1.getEstimatedReusableTokens(), expectedReusableBlocks * tokensPerBlock);
 }
 
 TEST(KVCacheManagerReuseAccountingTest, ReuseDisabledReturnsFullBlockCount)
@@ -6758,8 +7139,8 @@ TEST(KVCacheManagerReuseAccountingTest, MultipleRequestsWithSharedPrefix)
         = kvCacheManager->getNeededBlocksOneStep(req1, /*twoStepsLookAhead=*/false, onlyWindowSize);
     EXPECT_EQ(neededOneStep, promptLength / tokensPerBlock); // All 4 context blocks
 
-    // Blocks are free (released via removeSequence), so onlyAllocated=true yields 0 reusable blocks.
-    EXPECT_EQ(req1.getEstimatedReusableTokens(), 0);
+    // Free-but-cached blocks still consume free-pool capacity, but their tokens do not require recomputation.
+    EXPECT_EQ(req1.getEstimatedReusableTokens(), summaryPrefix.reusableBlocksAll * tokensPerBlock);
 
     // getRemainingBlocksToCompletion: 4 context + 1 gen = 5 blocks (no subtraction; blocks are free)
     auto const remaining = kvCacheManager->getRemainingBlocksToCompletion(req1, onlyWindowSize);

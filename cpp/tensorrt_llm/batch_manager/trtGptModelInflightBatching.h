@@ -88,6 +88,7 @@ class TrtGptModelTest;
 
 // Algorithms
 class CapacityScheduler;
+class DisaggTransferAdmissionController;
 class MicroBatchScheduler;
 class PauseRequests;
 class AssignReqSeqSlots;
@@ -600,6 +601,7 @@ private:
 
     /******************** Cache transceiver ********************/
     std::unique_ptr<BaseCacheTransceiver> mCacheTransceiver;
+    std::unique_ptr<DisaggTransferAdmissionController> mDisaggTransferAdmissionController;
 
     /******************** Spec dec ***********************/
     std::unique_ptr<std::thread> mDraftModelSendLogitsThread;

@@ -42,6 +42,10 @@ MODEL_INFO = {
         "display_name": "Nemotron v3 Super (NVFP4)",
         "url": "https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4",
     },
+    "nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4": {
+        "display_name": "Nemotron v3 Ultra (NVFP4)",
+        "url": "https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4",
+    },
     "deepseek-ai/DeepSeek-R1-0528": {
         "display_name": "DeepSeek-R1",
         "url": "https://huggingface.co/deepseek-ai/DeepSeek-R1-0528",
@@ -66,6 +70,10 @@ MODEL_INFO = {
         "display_name": "Qwen3-Next-80B",
         "url": "https://huggingface.co/Qwen/Qwen3-Next-80B-A3B-Thinking",
     },
+    "nvidia/Qwen3.5-397B-A17B-NVFP4": {
+        "display_name": "Qwen3.5-397B-A17B (NVFP4)",
+        "url": "https://huggingface.co/nvidia/Qwen3.5-397B-A17B-NVFP4",
+    },
     "Qwen/Qwen3-30B-A3B": {
         "display_name": "Qwen3-30B-A3B",
         "url": "https://huggingface.co/Qwen/Qwen3-30B-A3B",
@@ -81,6 +89,10 @@ MODEL_INFO = {
     "nvidia/Kimi-K2-Thinking-NVFP4": {
         "display_name": "Kimi-K2-Thinking (NVFP4)",
         "url": "https://huggingface.co/nvidia/Kimi-K2-Thinking-NVFP4",
+    },
+    "MiniMaxAI/MiniMax-M3": {
+        "display_name": "MiniMax-M3 (BF16)",
+        "url": "https://huggingface.co/MiniMaxAI/MiniMax-M3",
     },
 }
 

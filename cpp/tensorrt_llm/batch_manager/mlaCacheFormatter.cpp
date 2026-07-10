@@ -254,6 +254,8 @@ void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& ses
         };
         auto bufferEleSizes = getBufferSizeForTarget();
         auto cacheBufferId = mCacheTransBufferManagers[transferIndexerKCache]->assignBufferIndexForSend();
+        BufferIndexHolder sendHolder(
+            *mCacheTransBufferManagers[transferIndexerKCache], cacheBufferId, /*isRecv=*/false);
         auto result = mCacheTransBufferManagers[transferIndexerKCache]->getOrAllocateSendBuffers(
             cacheBufferId, static_cast<int>(pPDomainSize * cPDomainSize), bufferEleSizes, bufferManager);
         auto& outputSplitCaches = std::get<0>(result);
@@ -302,6 +304,13 @@ void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& ses
             auto cpDomainIdx = processIdx / connectionsPerCPDomain;
             auto ppDomainIdx = (processIdx % connectionsPerCPDomain) % pPDomainSize;
             auto cacheIdx = cpDomainIdx * pPDomainSize + ppDomainIdx;
+            // Helix: skip CP ranks that own no blocks for this sequence (num_total_blocks < cp_size).
+            // The matching gen rank skips its receive, so no 0-byte transfer is posted on either side.
+            auto const& splitCache = outputSplitCaches.at(cacheIdx);
+            if (splitCache == nullptr || splitCache->getSizeInBytes() == 0)
+            {
+                return;
+            }
             if (cacheIdx < bufferCoverTargetNum)
             {
                 size_t size = outputSplitCaches.at(cacheIdx)->getSizeInBytes();
@@ -380,7 +389,7 @@ void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& ses
         {
             sendBufferFun(deviceId, pickUpConnections[0]);
         }
-        mCacheTransBufferManagers[transferIndexerKCache]->freeBufferIndexForSend(cacheBufferId);
+        sendHolder.release();
     }
     session.setTime(TransferSession::kTimeTransmissions);
     session.setTime(TransferSession::kTimePostprocess);
@@ -456,9 +465,17 @@ void MLACacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& s
             }
         }
 
+        // Helix: an "empty" CP rank owns no KV blocks for this sequence (num_total_blocks < cp_size).
+        // There is nothing to receive; the sender (context, CP=1) skips the matching 0-byte transfer.
+        if (blockNum == 0)
+        {
+            continue;
+        }
+
         int deviceId = bufferManager.getStream().getDevice();
 
         std::optional<int> cacheBufferId = std::nullopt;
+        BufferIndexHolder recvHolder;
 
         if (common::getEnvTryZCopyForKVCacheTransfer()
             && destConfig.getParallelConfig().mPipelineParallelism
@@ -495,6 +512,8 @@ void MLACacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& s
             {
                 cacheBufferId = mCacheTransBufferManagers[transferIndexerKCache]->assignBufferIndexForRecv();
             }
+            recvHolder
+                = BufferIndexHolder(*mCacheTransBufferManagers[transferIndexerKCache], cacheBufferId, /*isRecv=*/true);
 
             auto targetNum = pickUpConnections.size();
 
@@ -642,10 +661,7 @@ void MLACacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& s
             bufferManager.getStream().synchronize();
         }
 
-        if (cacheBufferId.has_value())
-        {
-            mCacheTransBufferManagers[transferIndexerKCache]->freeBufferIndexForRecv(cacheBufferId);
-        }
+        recvHolder.release();
     }
     session.setTime(TransferSession::kTimePostprocess);
 

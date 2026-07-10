@@ -2,7 +2,7 @@
 #
 # Exercises the C++-backed disagg path (BindKvCacheTransceiver + V1
 # KVCacheManager + NIXL backend) — the configuration NVBug 6104831
-# was filed against and that PR #13713 stabilizes. Schema
+# was filed against and that the in-flight cancellation fix stabilizes. Schema
 # documentation lives in ../README.md.
 
 hostname: localhost
@@ -52,12 +52,28 @@ generation_servers:
 # Schema documented in ../README.md.
 # ============================================================================
 stress_config:
-  duration_min: 120                  # 2 h marathon
+  # MODE SWITCH (intentionally loud):
+  # - log_only: current registered CI mode. Launches the real disagg cluster,
+  #   sends normal non-cancel probes, and scans saved worker/server logs for
+  #   UAF, broken-promise, and segmentation-fault signatures. This mode does
+  #   NOT require in-flight cancellation or poison-buffer support.
+  # - full_cancel_poison: future opt-in mode after in-flight cancellation and
+  #   poison-buffer hardening are available. It enables the cancellation load,
+  #   fault injections, token-equivalent canaries, and KV-growth checks below.
+  mode: log_only
+  duration_min: 10                   # regular guardrail run; use 120 for full_cancel_poison
 
   # Backend-knob axis selectors. Must match
   # context_servers / generation_servers above.
   kv_cache_manager: v1               # V1 (C++) KV cache manager
   transceiver: cpp                   # C++-backed transceiver (BindKvCacheTransceiver)
+
+  log_only_probe:
+    interval_s: 30
+    prompt: "Write one sentence about reliable distributed inference."
+    max_tokens: 32
+    seed: 42
+    request_timeout_s: 30
 
   base_concurrency: 64
   client_cancel_rate: 0.10
@@ -120,10 +136,13 @@ stress_config:
   log_scan:
     hard_zero_patterns:
       - "Broken promise"
-      - "NO RECOVERY"
       - "Segfault"
+      - "Segmentation fault"
       - "SIGSEGV"
       - "0xffffffffffffffff"
-      - "Poisoned .* cache transfer buffer"
+      - "use-after-free"
+      - "heap-use-after-free"
+      - "AddressSanitizer:.*use-after-free"
+      - "double[- ]free"
 
   kv_cache_growth_max: 0.10   # final utilization ≤ baseline + 10 percentage points

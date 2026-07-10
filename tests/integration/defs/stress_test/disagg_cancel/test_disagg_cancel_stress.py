@@ -25,7 +25,11 @@ each one is added to ``_MARATHON_CONFIGS`` below.
 
 from __future__ import annotations
 
+import textwrap
+import threading
+import time
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -57,28 +61,7 @@ def test_all_marathon_yamls_parse_and_validate() -> None:
 
 @pytest.mark.parametrize("config_filename", _MARATHON_CONFIGS)
 def test_disagg_cancellation_marathon(config_filename: str) -> None:
-    """Drive a long-running disagg cancellation marathon and assert pass criteria.
-
-    Current scope: only what the already-implemented thread bodies
-    can contribute. The marathon entry point exists; the marathon
-    *content* lands incrementally as each thread body is wired up:
-
-    - lifecycle plumbing (setup -> start -> wait -> stop ->
-      collect_results, fail-fast event propagation, dict-shape
-      contract).
-    - log-pattern fail-fast — a hard-zero pattern in any worker log
-      trips ``failure_reason`` via the log_scanner thread
-      (component-level coverage in ``test_log_scanner.py``).
-
-    Marathon pass criteria not yet enforced here (will land alongside
-    their owning thread bodies in follow-up changes): canary error
-    rate, recovery time after each injection, KV-cache utilization
-    growth bound, injection-schedule completeness, sustained load
-    throughput. Until those land, this test passes trivially after
-    the lifecycle smoke completes; the value at this stage is that
-    the entry point and result-dict contract are pinned down so the
-    follow-up commits can extend in place rather than restructure.
-    """
+    """Drive the configured disagg stress mode and assert current pass criteria."""
     config_path = _CONFIG_DIR / config_filename
     assert config_path.exists(), (
         f"Marathon config not found: {config_path}. "
@@ -89,14 +72,8 @@ def test_disagg_cancellation_marathon(config_filename: str) -> None:
     try:
         harness.setup()
         harness.start()
-        # Skeleton stage: stub threads exit immediately; the
-        # load-thread stub signals ``stop_event`` on exit so this
-        # returns cleanly (True) almost instantly. Once the
-        # duration-bounded load thread is wired up, the timeout
-        # becomes ``stress_config.duration_min`` plus a safety
-        # margin, and ``clean`` reports whether the marathon ran to
-        # completion without tripping fail-fast.
-        clean = harness.wait_until_done(timeout_s=10.0)
+        timeout_s = float(harness.config.duration_min) * 60.0 + 300.0
+        clean = harness.wait_until_done(timeout_s=timeout_s)
         assert clean is True, (
             f"wait_until_done did not return cleanly; failure_reason={harness.failure_reason!r}"
         )
@@ -108,8 +85,113 @@ def test_disagg_cancellation_marathon(config_filename: str) -> None:
     # collector returns the expected shape so future commits can
     # extend in place.
     assert "canary_records" in results
+    assert "load_records" in results
     assert "kv_utilization_samples" in results
     assert "injection_events" in results
     assert results["failure_reason"] is None, (
-        f"Harness tripped fail-fast in skeleton run: {results['failure_reason']!r}"
+        f"Harness tripped fail-fast: {results['failure_reason']!r}"
     )
+    if harness.config.is_log_only:
+        assert any(
+            record.get("mode") == "log_only" and record.get("success")
+            for record in results["canary_records"]
+        ), "log_only mode completed without a successful server probe"
+
+
+def _write_mode_yaml(tmp_path: Path, stress_config: str) -> Path:
+    """Write a minimal marathon YAML for mode-level harness tests."""
+    yaml_path = tmp_path / "mode.yaml"
+    content = textwrap.dedent(
+        """\
+        hostname: localhost
+        model: dummy
+        backend: pytorch
+        context_servers: {}
+        generation_servers: {}
+        stress_config:
+        """
+    )
+    content += textwrap.indent(textwrap.dedent(stress_config).strip(), "  ") + "\n"
+    yaml_path.write_text(content)
+    return yaml_path
+
+
+@pytest.mark.parametrize("mode", ["log_only", "full_cancel_poison"])
+def test_stress_config_accepts_supported_modes(tmp_path: Path, mode: str) -> None:
+    """Both supported mode strings should parse and expose helper predicates."""
+    cfg = StressConfig.from_yaml_path(
+        _write_mode_yaml(
+            tmp_path,
+            f"""\
+            mode: {mode}
+            duration_min: 1
+            kv_cache_manager: v1
+            transceiver: cpp
+            """,
+        )
+    )
+
+    assert cfg.mode == mode
+    assert cfg.is_log_only is (mode == "log_only")
+    assert cfg.is_full_cancel_poison is (mode == "full_cancel_poison")
+
+
+def test_stress_config_rejects_unknown_mode(tmp_path: Path) -> None:
+    """Typos in mode must fail during YAML validation."""
+    with pytest.raises(ValueError, match="mode must be one of"):
+        StressConfig.from_yaml_path(
+            _write_mode_yaml(
+                tmp_path,
+                """\
+                mode: accidental
+                duration_min: 1
+                kv_cache_manager: v1
+                transceiver: cpp
+                """,
+            )
+        )
+
+
+def test_log_only_thread_sends_probe_and_stops(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The regular-protection mode should require at least one clean probe."""
+    h = DisaggCancellationStressHarness(
+        _write_mode_yaml(
+            tmp_path,
+            """\
+            mode: log_only
+            duration_min: 1
+            kv_cache_manager: v1
+            transceiver: cpp
+            log_only_probe:
+              interval_s: 0.01
+              max_tokens: 8
+              request_timeout_s: 1
+            log_scan:
+              hard_zero_patterns:
+                - "Broken promise"
+            """,
+        ),
+        load_duration_s=0.03,
+    )
+    h.bind_server_endpoint("http://127.0.0.1:8000", "test-model")
+    h._marathon_start_monotonic = time.monotonic()
+
+    calls: list[dict[str, Any]] = []
+
+    def fake_probe(**kwargs: Any) -> tuple[list[int], None, None]:
+        calls.append(kwargs)
+        return [1, 2], None, None
+
+    monkeypatch.setattr(h, "_send_log_only_probe", fake_probe)
+
+    thread = threading.Thread(target=h._log_only_thread_body, name="test-log-only", daemon=True)
+    thread.start()
+    thread.join(timeout=2.0)
+
+    assert not thread.is_alive()
+    assert h.stop_event.is_set()
+    assert not h.failed_event.is_set()
+    assert calls
+    assert any(record["success"] for record in h._canary_records)

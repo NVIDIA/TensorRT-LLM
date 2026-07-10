@@ -39,6 +39,12 @@ Single commit by SHA (debug a specific PR)::
 
     python3 jenkins/scripts/cbts/tools/dryrun.py \\
         --sha 219559c --out /tmp/cbts_one
+
+Cumulative diff of a commit range as one CBTS run (mirrors a whole-PR
+diff rather than replaying each commit separately)::
+
+    python3 jenkins/scripts/cbts/tools/dryrun.py \\
+        --range origin/main...HEAD --out /tmp/cbts_range
 """
 
 from __future__ import annotations
@@ -84,6 +90,30 @@ def _list_changed_files(repo: Path, sha: str) -> list[str]:
 
 def _file_diff(repo: Path, sha: str, path: str) -> str:
     return _git(repo, "diff", f"{sha}^", sha, "--", path, check=False).stdout
+
+
+def _split_range(expr: str) -> tuple[str, str, str]:
+    """Split a git range into (base, tip, diff_arg).
+
+    Supports 'A..B' (endpoint diff), 'A...B' (merge-base diff), and a bare
+    'A' (treated as A^..A, the single-commit diff). `diff_arg` is passed
+    verbatim to `git diff`, preserving two- vs three-dot semantics; an empty
+    side defaults to HEAD, matching git's own range parsing.
+    """
+    for sep in ("...", ".."):
+        if sep in expr:
+            left, right = expr.split(sep, 1)
+            return (left or "HEAD"), (right or "HEAD"), expr
+    return f"{expr}^", expr, f"{expr}^..{expr}"
+
+
+def _list_changed_files_range(repo: Path, diff_arg: str) -> list[str]:
+    out = _git(repo, "diff", "--name-only", diff_arg).stdout
+    return [ln for ln in out.splitlines() if ln.strip()]
+
+
+def _file_diff_range(repo: Path, diff_arg: str, path: str) -> str:
+    return _git(repo, "diff", diff_arg, "--", path, check=False).stdout
 
 
 def _resolve_pr(subject: str, sha: str) -> tuple[str, str]:
@@ -156,6 +186,7 @@ def _fmt_summary(
         return "\n".join(lines) + "\n"
     scope = result.get("scope")
     lines.append(f"scope:                {scope!r}")
+    lines.append(f"scopes:               {result.get('scopes', [])}")
     lines.append(f"sanity_required:      {result.get('sanity_required')}")
     lines.append(f"perfsanity_required:  {result.get('perfsanity_required')}")
     override = result.get("test_db_dir_override")
@@ -163,6 +194,12 @@ def _fmt_summary(
     stages = result.get("affected_stages", [])
     lines.append(f"affected_stages ({len(stages)}):")
     lines.extend(f"  - {s}" for s in stages)
+    counts = result.get("affected_stage_test_counts", {})
+    splits = result.get("affected_stage_split_counts", {})
+    if splits:
+        lines.append(f"split sizing ({len(splits)} stages, kept_entries -> shards):")
+        for s in sorted(splits):
+            lines.append(f"  - {s}: {counts.get(s, '?')} -> {splits[s]}")
     lines.append("reasons:")
     lines.extend(f"  - {r}" for r in result.get("reasons", []))
     return "\n".join(lines) + "\n"
@@ -202,6 +239,54 @@ def _is_tests_only(files: list[str]) -> bool:
 # --- main loop --------------------------------------------------------------
 
 
+def _prep_pr_dir(out_dir: Path, label: str) -> Path:
+    """Create out_dir/label and wipe stale artifacts (keeping summary.txt)."""
+    pr_dir = out_dir / label
+    pr_dir.mkdir(parents=True, exist_ok=True)
+    for old in pr_dir.iterdir():
+        if old.name == "summary.txt":
+            continue
+        if old.is_dir():
+            shutil.rmtree(old)
+        else:
+            old.unlink()
+    return pr_dir
+
+
+def _cbts_for_snapshot(
+    repo: Path,
+    tip_sha: str,
+    files: list[str],
+    diffs: dict[str, str],
+    post_merge: bool,
+    pr_dir: Path,
+) -> dict:
+    """Run CBTS against the tree at `tip_sha` over `files`/`diffs`.
+
+    Materializes `tip_sha` as a detached worktree so every path CBTS reads
+    (post-change YAML, .py source, accuracy refs) is the end-state of the
+    commit/range, not whatever HEAD is now. Copies any filtered test-db
+    YAMLs into `pr_dir` before the worktree is torn down.
+    """
+    if not files:
+        return {"_error": "no files changed"}
+    payload = {"changed_files": files, "diffs": diffs, "post_merge": post_merge}
+    with tempfile.TemporaryDirectory() as td:
+        wt = Path(td) / "wt"
+        _git(repo, "worktree", "add", "--detach", str(wt), tip_sha)
+        try:
+            test_db = wt / TEST_DB_REL
+            groovy = wt / GROOVY_REL
+            shared_out = wt / "cbts_test_db"
+            result = _run_cbts(payload, test_db, groovy, wt)
+            if shared_out.exists():
+                for yml in shared_out.glob("*.yml"):
+                    shutil.copy2(yml, pr_dir / yml.name)
+        finally:
+            _git(repo, "worktree", "remove", "--force", str(wt), check=False)
+    return result
+
+
 def _replay_one(
     repo: Path,
     sha: str,
@@ -212,45 +297,41 @@ def _replay_one(
     label, pr_url = _resolve_pr(subject, sha)
     files = _list_changed_files(repo, sha)
     tests_only = _is_tests_only(files)
-
-    pr_dir = out_dir / label
-    pr_dir.mkdir(parents=True, exist_ok=True)
-
-    # Wipe any stale artifacts from a previous run before writing fresh ones.
-    for old in pr_dir.iterdir():
-        if old.name == "summary.txt":
-            continue
-        if old.is_dir():
-            shutil.rmtree(old)
-        else:
-            old.unlink()
-
-    if not files:
-        result: dict = {"_error": "commit touched no files"}
-    else:
-        diffs = {f: _file_diff(repo, sha, f) for f in files}
-        payload = {"changed_files": files, "diffs": diffs, "post_merge": post_merge}
-        with tempfile.TemporaryDirectory() as td:
-            wt = Path(td) / "wt"
-            # Materialize the SHA's tree as a detached worktree so every
-            # path CBTS reads (post-PR YAML, .py source, accuracy refs)
-            # is the state at PR-decision time, not whatever HEAD is now.
-            _git(repo, "worktree", "add", "--detach", str(wt), sha)
-            try:
-                test_db = wt / TEST_DB_REL
-                groovy = wt / GROOVY_REL
-                shared_out = wt / "cbts_test_db"
-                result = _run_cbts(payload, test_db, groovy, wt)
-                # Copy filtered test-db YAMLs out before the worktree
-                # is torn down in the finally block.
-                if shared_out.exists():
-                    for yml in shared_out.glob("*.yml"):
-                        shutil.copy2(yml, pr_dir / yml.name)
-            finally:
-                _git(repo, "worktree", "remove", "--force", str(wt), check=False)
-
+    pr_dir = _prep_pr_dir(out_dir, label)
+    diffs = {f: _file_diff(repo, sha, f) for f in files}
+    result = _cbts_for_snapshot(repo, sha, files, diffs, post_merge, pr_dir)
     (pr_dir / "summary.txt").write_text(
         _fmt_summary(pr_url, sha, subject, files, result, post_merge, tests_only)
+    )
+    return label, pr_url, files, subject, result, tests_only
+
+
+def _replay_range(
+    repo: Path,
+    range_expr: str,
+    out_dir: Path,
+    post_merge: bool,
+) -> tuple[str, str, list[str], str, dict, bool]:
+    """Replay the cumulative diff of a git range as a single CBTS run.
+
+    The range's tip commit supplies the tree CBTS reads; the cumulative
+    `git diff` over the range supplies changed_files + diffs. This mirrors
+    how a real PR is evaluated (whole-PR diff, not commit-by-commit).
+    """
+    base, tip, diff_arg = _split_range(range_expr)
+    tip_sha = _git(repo, "rev-parse", tip).stdout.strip()
+    base_sha = _git(repo, "rev-parse", base, check=False).stdout.strip()
+    subject = _git(repo, "log", "-1", "--pretty=%s", tip_sha).stdout.strip()
+    files = _list_changed_files_range(repo, diff_arg)
+    tests_only = _is_tests_only(files)
+    base_disp = base_sha[:8] or base
+    label = f"range-{base_disp}-{tip_sha[:8]}"
+    pr_url = f"range {range_expr} (base={base_disp}, tip={tip_sha[:8]})"
+    pr_dir = _prep_pr_dir(out_dir, label)
+    diffs = {f: _file_diff_range(repo, diff_arg, f) for f in files}
+    result = _cbts_for_snapshot(repo, tip_sha, files, diffs, post_merge, pr_dir)
+    (pr_dir / "summary.txt").write_text(
+        _fmt_summary(pr_url, tip_sha, subject, files, result, post_merge, tests_only)
     )
     return label, pr_url, files, subject, result, tests_only
 
@@ -262,6 +343,7 @@ def _write_index(
     window: int,
     filter_mode: str,
     post_merge: bool,
+    range_expr: Optional[str] = None,
 ) -> None:
     counts: dict[Optional[str], int] = {}
     for _, _, _, _, result, _ in rows:
@@ -269,12 +351,23 @@ def _write_index(
         counts[scope] = counts.get(scope, 0) + 1
 
     trigger = "/bot run --post-merge" if post_merge else "/bot run"
+    if range_expr:
+        source_line = (
+            f"Range: `{range_expr}` (cumulative diff), simulated as "
+            f"`{trigger}` (post_merge={post_merge})."
+        )
+        detail_line = "Replayed as a single cumulative CBTS run."
+    else:
+        source_line = (
+            f"Source ref: `{ref}` (last {window} commits), simulated as "
+            f"`{trigger}` (post_merge={post_merge})."
+        )
+        detail_line = f"Filter: `{filter_mode}` — replayed commits: **{len(rows)}**"
     lines = [
         "# CBTS dry-run results",
         "",
-        f"Source ref: `{ref}` (last {window} commits), simulated as "
-        f"`{trigger}` (post_merge={post_merge}).",
-        f"Filter: `{filter_mode}` — replayed commits: **{len(rows)}**",
+        source_line,
+        detail_line,
         "",
         "| Label | Scope | Stages | YAMLs | Sanity | Perf | Files | PR | Subject |",
         "|---|---|---|---|---|---|---|---|---|",
@@ -336,6 +429,14 @@ def main(argv: Optional[list[str]] = None) -> int:
         default=[],
         help="replay specific SHA (repeatable; ignores --ref/--window/--filter)",
     )
+    ap.add_argument(
+        "--range",
+        dest="range_expr",
+        default=None,
+        help="replay the CUMULATIVE diff of a git range as a single CBTS run "
+        "(e.g. 'main..HEAD', 'origin/main...HEAD', or a bare SHA); "
+        "ignores --ref/--window/--filter/--sha/--limit",
+    )
     ap.add_argument("--post-merge", action="store_true", help="set post_merge=True")
     ap.add_argument("--out", default="cbts_dryrun", help="output directory (default: cbts_dryrun)")
     ap.add_argument(
@@ -366,40 +467,59 @@ def main(argv: Optional[list[str]] = None) -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
     if not args.keep_stale:
         for old in out_dir.iterdir():
-            if old.is_dir() and old.name.startswith(("pr-", "sha-")):
+            if old.is_dir() and old.name.startswith(("pr-", "sha-", "range-")):
                 shutil.rmtree(old)
 
-    if args.sha:
-        shas = args.sha
-        print(f"Replaying {len(shas)} explicit SHA(s)", file=sys.stderr)
-    else:
-        all_shas = _walk_commits(repo, args.ref, args.window)
-        if args.filter == "tests-only":
-            shas = [s for s in all_shas if _is_tests_only(_list_changed_files(repo, s))]
-        else:
-            shas = all_shas
-        if args.limit is not None:
-            shas = shas[: args.limit]
-        suffix = f", limit={args.limit}" if args.limit else ""
-        print(
-            f"Window: last {args.window} commits on {args.ref} → "
-            f"{len(shas)} commits after filter={args.filter}{suffix}",
-            file=sys.stderr,
-        )
-
     rows: list[tuple[str, str, list[str], str, dict, bool]] = []
-    for sha in shas:
+    if args.range_expr:
+        print(f"Replaying cumulative range: {args.range_expr}", file=sys.stderr)
         try:
-            row = _replay_one(repo, sha, out_dir, args.post_merge)
+            row = _replay_range(repo, args.range_expr, out_dir, args.post_merge)
         except subprocess.CalledProcessError as e:
-            print(f"  {sha[:8]}: git error: {e.stderr.strip()}", file=sys.stderr)
-            continue
+            print(f"git error: {e.stderr.strip()}", file=sys.stderr)
+            return 1
         rows.append(row)
         label, _, _, _, result, _ = row
         scope = result.get("scope", "ERROR") if "_error" not in result else "ERROR"
         print(f"  {label}: {scope}", file=sys.stderr)
+    else:
+        if args.sha:
+            shas = args.sha
+            print(f"Replaying {len(shas)} explicit SHA(s)", file=sys.stderr)
+        else:
+            all_shas = _walk_commits(repo, args.ref, args.window)
+            if args.filter == "tests-only":
+                shas = [s for s in all_shas if _is_tests_only(_list_changed_files(repo, s))]
+            else:
+                shas = all_shas
+            if args.limit is not None:
+                shas = shas[: args.limit]
+            suffix = f", limit={args.limit}" if args.limit else ""
+            print(
+                f"Window: last {args.window} commits on {args.ref} → "
+                f"{len(shas)} commits after filter={args.filter}{suffix}",
+                file=sys.stderr,
+            )
+        for sha in shas:
+            try:
+                row = _replay_one(repo, sha, out_dir, args.post_merge)
+            except subprocess.CalledProcessError as e:
+                print(f"  {sha[:8]}: git error: {e.stderr.strip()}", file=sys.stderr)
+                continue
+            rows.append(row)
+            label, _, _, _, result, _ = row
+            scope = result.get("scope", "ERROR") if "_error" not in result else "ERROR"
+            print(f"  {label}: {scope}", file=sys.stderr)
 
-    _write_index(out_dir, rows, args.ref, args.window, args.filter, args.post_merge)
+    _write_index(
+        out_dir,
+        rows,
+        args.ref,
+        args.window,
+        args.filter,
+        args.post_merge,
+        range_expr=args.range_expr,
+    )
 
     counts: dict[Optional[str], int] = {}
     for _, _, _, _, result, _ in rows:

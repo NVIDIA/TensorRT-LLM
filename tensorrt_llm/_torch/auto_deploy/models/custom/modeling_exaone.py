@@ -17,7 +17,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Slimmed down PyTorch EXAONE model implementation for auto_deploy export.
+"""EXAONE model (sharding IR).
 
 Source:
 https://huggingface.co/LGAI-EXAONE/EXAONE-3.5-2.4B-Instruct
@@ -175,6 +175,11 @@ class ExaoneMLP(nn.Module):
     """MLP layer for EXAONE (SwiGLU activation).
 
     Uses EXAONE naming: c_fc_0 (gate), c_fc_1 (up), c_proj (down).
+
+    Sharding strategy:
+      c_fc_0 -> colwise
+      c_fc_1 -> colwise
+      c_proj -> rowwise + all_reduce
     """
 
     def __init__(self, config):
@@ -187,7 +192,29 @@ class ExaoneMLP(nn.Module):
         self.act = ACT2FN[config.hidden_act]
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.c_proj(self.act(self.c_fc_0(x)) * self.c_fc_1(x))
+        gate = torch.ops.auto_deploy.torch_linear_simple(
+            x,
+            self.c_fc_0.weight,
+            self.c_fc_0.bias,
+            tp_mode="colwise",
+            layer_type="mlp",
+        )
+        up = torch.ops.auto_deploy.torch_linear_simple(
+            x,
+            self.c_fc_1.weight,
+            self.c_fc_1.bias,
+            tp_mode="colwise",
+            layer_type="mlp",
+        )
+        down = torch.ops.auto_deploy.torch_linear_simple(
+            self.act(gate) * up,
+            self.c_proj.weight,
+            self.c_proj.bias,
+            tp_mode="rowwise",
+            layer_type="mlp",
+        )
+        down = torch.ops.auto_deploy.all_reduce(down, layer_type="mlp")
+        return down
 
 
 class ExaoneAttention(nn.Module):
@@ -195,6 +222,13 @@ class ExaoneAttention(nn.Module):
 
     Uses AD canonical ops for attention and RoPE. GQA is handled natively
     by torch_attention — no repeat_kv needed.
+
+    Sharding strategy:
+      q_proj   -> colwise (+ tp_min_local_shape for GQA)
+      k_proj   -> colwise (+ tp_min_local_shape for GQA)
+      v_proj   -> colwise (+ tp_min_local_shape for GQA)
+      view     -> tp_scaled_dim=2 (head count dimension)
+      out_proj -> rowwise + all_reduce
     """
 
     def __init__(self, config, layer_idx: Optional[int] = None):
@@ -223,9 +257,48 @@ class ExaoneAttention(nn.Module):
         bsz, q_len, _ = hidden_states.size()
 
         # Project Q/K/V and reshape to [B, S, N, head_dim] (BSND layout)
-        q = self.q_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim)
-        k = self.k_proj(hidden_states).view(bsz, q_len, self.num_kv_heads, self.head_dim)
-        v = self.v_proj(hidden_states).view(bsz, q_len, self.num_kv_heads, self.head_dim)
+        q = torch.ops.auto_deploy.torch_linear_simple(
+            hidden_states,
+            self.q_proj.weight,
+            self.q_proj.bias,
+            tp_mode="colwise",
+            tp_min_local_shape=self.head_dim,
+            layer_type="mha",
+        )
+        k = torch.ops.auto_deploy.torch_linear_simple(
+            hidden_states,
+            self.k_proj.weight,
+            self.k_proj.bias,
+            tp_mode="colwise",
+            tp_min_local_shape=self.head_dim,
+            layer_type="mha",
+        )
+        v = torch.ops.auto_deploy.torch_linear_simple(
+            hidden_states,
+            self.v_proj.weight,
+            self.v_proj.bias,
+            tp_mode="colwise",
+            tp_min_local_shape=self.head_dim,
+            layer_type="mha",
+        )
+        q = torch.ops.auto_deploy.view(
+            q,
+            [bsz, q_len, self.num_heads, self.head_dim],
+            tp_scaled_dim=2,
+            layer_type="mha",
+        )
+        k = torch.ops.auto_deploy.view(
+            k,
+            [bsz, q_len, self.num_kv_heads, self.head_dim],
+            tp_scaled_dim=2,
+            layer_type="mha",
+        )
+        v = torch.ops.auto_deploy.view(
+            v,
+            [bsz, q_len, self.num_kv_heads, self.head_dim],
+            tp_scaled_dim=2,
+            layer_type="mha",
+        )
 
         # Get pre-sliced cos/sin from position_embeddings (already indexed by position_ids)
         cos, sin = position_embeddings  # [B, S, head_dim]
@@ -249,8 +322,20 @@ class ExaoneAttention(nn.Module):
         )
 
         # Reshape [B, S, N, head_dim] -> [B, S, N * head_dim] and project
-        attn_output = attn_output.reshape(bsz, q_len, self.num_heads * self.head_dim)
-        attn_output = self.out_proj(attn_output)
+        attn_output = torch.ops.auto_deploy.view(
+            attn_output,
+            [bsz, q_len, self.num_heads * self.head_dim],
+            tp_scaled_dim=2,
+            layer_type="mha",
+        )
+        attn_output = torch.ops.auto_deploy.torch_linear_simple(
+            attn_output,
+            self.out_proj.weight,
+            self.out_proj.bias,
+            tp_mode="rowwise",
+            layer_type="mha",
+        )
+        attn_output = torch.ops.auto_deploy.all_reduce(attn_output, layer_type="mha")
 
         return attn_output
 

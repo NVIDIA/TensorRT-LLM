@@ -311,13 +311,13 @@ class TestProtoMessages:
     def test_model_info_response(self):
         """Test GetModelInfoResponse message."""
         response = pb2.GetModelInfoResponse(
-            model_id="meta-llama/Llama-2-7b",
+            model_id="meta-llama/Meta-Llama-3-8B",
             max_input_len=4096,
             max_seq_len=8192,
             vocab_size=32000,
         )
 
-        assert response.model_id == "meta-llama/Llama-2-7b"
+        assert response.model_id == "meta-llama/Meta-Llama-3-8B"
         assert response.max_input_len == 4096
         assert response.max_seq_len == 8192
         assert response.vocab_size == 32000

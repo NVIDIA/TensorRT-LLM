@@ -20,11 +20,8 @@ plus the public API surface at `tensorrt_llm/visual_gen/`.
 Block selection — entry-pattern based only:
 VisualGen does NOT have its own `condition.terms.backend`; VG test
 entries live in `backend: pytorch` and `backend: tensorrt` blocks.
-A block "belongs to VG" iff any of its `tests:` entries matches one
-of the three stable VG entry path families:
-  - `unittest/_torch/visual_gen/...`         (28 entries)
-  - `examples/test_visual_gen.py...`         (1 entry)
-  - `visual_gen/test_visual_gen_benchmark.py` (1 entry)
+A block "belongs to VG" iff any of its `tests:` entries lives under a
+dedicated `visual_gen/` test path or is the VisualGen perf-sanity entry.
 
 Outward-facing fallback:
 Unlike AutoDeploy, VG is imported eagerly (module-level) by non-VG
@@ -32,9 +29,9 @@ code: `commands/serve.py`, `commands/utils.py`, and
 `serve/openai_server.py` import `VisualGenArgs` / `ParallelConfig` /
 `VisualGen` / `VisualGenParams` at top level. A signature change to
 those symbols can break trtllm-serve startup, which would affect
-non-VG tests. The 5 files that define / re-export those symbols are
-listed in `_VG_OUTWARD_FILES`; touching any of them forces fallback
-even if the rest of the diff is VG-internal.
+non-VG tests. The public API package prefix is listed in
+`_VG_OUTWARD_PREFIXES`; touching any file under it forces fallback even
+if the rest of the diff is VG-internal.
 """
 
 from __future__ import annotations
@@ -55,27 +52,17 @@ _VG_SRC_PREFIXES: tuple[str, ...] = (
     "tensorrt_llm/visual_gen/",
 )
 
-# Files inside _VG_SRC_PREFIXES that are imported eagerly by non-VG
-# code (top-level `from ... import VisualGenArgs / ParallelConfig /
-# VisualGen / VisualGenParams`). Touching any of these can break
-# trtllm-serve / trtllm-bench startup paths, so the rule defers to
-# baseline rather than narrowing.
-_VG_OUTWARD_FILES: frozenset[str] = frozenset(
-    {
-        "tensorrt_llm/_torch/visual_gen/config.py",
-        "tensorrt_llm/visual_gen/__init__.py",
-        "tensorrt_llm/visual_gen/args.py",
-        "tensorrt_llm/visual_gen/params.py",
-        "tensorrt_llm/visual_gen/visual_gen.py",
-    }
-)
+# Public VisualGen API package imported eagerly by non-VG code. Touching
+# any non-doc file under this prefix can break trtllm-serve / trtllm-bench
+# startup paths, so the rule defers to baseline rather than narrowing.
+_VG_OUTWARD_PREFIXES: tuple[str, ...] = ("tensorrt_llm/visual_gen/",)
 
-# Substrings that mark a test entry as VG. Cover all three path
-# families that appear in test-db YAMLs (audited 2026-05).
+# Substrings that mark a test entry as VG. VG tests are expected to live
+# under dedicated visual_gen test directories, except the perf-sanity
+# frontend which stays with the shared perf tests.
 _VG_ENTRY_PATTERNS: tuple[str, ...] = (
-    "unittest/_torch/visual_gen/",
-    "examples/test_visual_gen.py",
-    "visual_gen/test_visual_gen_benchmark.py",
+    "visual_gen/",
+    "perf/test_visual_gen_perf_sanity.py",
 )
 
 
@@ -122,19 +109,19 @@ class VisualGenRule(Rule):
         if not claimed:
             return None
 
-        # Outward-facing VG files break the "self-contained subsystem"
+        # Outward-facing VG paths break the "self-contained subsystem"
         # assumption — they are imported eagerly by trtllm-serve /
         # trtllm-bench. Claim the files (so they don't go unhandled and
         # silently fallback) but emit scope=None so Selector falls back
         # to baseline coverage instead of narrowing to VG-only stages.
-        outward = claimed & _VG_OUTWARD_FILES
+        outward = {f for f in claimed if f.startswith(_VG_OUTWARD_PREFIXES)}
         if outward:
             return RuleResult(
                 handled_files=claimed,
                 affected_stages=set(),
                 scope=None,
                 reason=(
-                    f"visualgen: {len(outward)} outward-facing VG file(s) "
+                    f"visualgen: {len(outward)} outward-facing VG path(s) "
                     f"touched ({sorted(outward)[0]}{'...' if len(outward) > 1 else ''}); "
                     "fallback to baseline"
                 ),

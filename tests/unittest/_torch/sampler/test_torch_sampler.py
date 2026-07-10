@@ -47,9 +47,10 @@ from tensorrt_llm._torch.pyexecutor.sampler import (
     _request_get_sampling_params,
     _request_strategy,
 )
-from tensorrt_llm._torch.pyexecutor.sampling_utils import (
+from tensorrt_llm._torch.pyexecutor.sampler.sampling_utils import (
     GREEDY,
     BeamSearch,
+    FlashInferGroupedStrategySampler,
     Greedy,
     SimpleGroupedStrategySampler,
     Strategy,
@@ -59,9 +60,6 @@ from tensorrt_llm._torch.pyexecutor.sampling_utils import (
     TopKTopP,
     TopP,
     UtilsSamplingParams,
-)
-from tensorrt_llm._torch.pyexecutor.sampling_utils_flashinfer import (
-    FlashInferGroupedStrategySampler,
 )
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.bindings import SamplingConfig
@@ -1818,9 +1816,7 @@ class TestBatchedSampling:
 
         if use_flashinfer:
             assert sampler._grouped_sampler_cls == FlashInferGroupedStrategySampler
-            sample_grouped_strategies_orig = (
-                FlashInferGroupedStrategySampler.sample_grouped_strategies
-            )
+            sample_grouped_strategies_orig = sampler._grouped_sampler_cls.sample_grouped_strategies
 
             def _sample_grouped_strategies(
                 group_key: FlashInferGroupedStrategySampler.STRATEGY_KEY_TYPE,
@@ -1840,7 +1836,9 @@ class TestBatchedSampling:
                 nonlocal flashinfer_keys_seen
                 assert (group_key, return_probs) not in flashinfer_keys_seen
                 flashinfer_keys_seen.add((group_key, return_probs))
-                return sample_grouped_strategies_orig(
+                result: tuple[
+                    torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor] | float
+                ] = sample_grouped_strategies_orig(
                     group_key,
                     strategies,
                     logits,
@@ -1848,12 +1846,16 @@ class TestBatchedSampling:
                     generator=generator,
                     return_probs=return_probs,
                 )
+                return result
 
-            patch_ctx.setattr(
-                sampler._grouped_sampler_cls,
-                "sample_grouped_strategies",
-                _sample_grouped_strategies,
+            # _grouped_sampler_cls is a class; point the instance at a subclass
+            # that overrides the callable, rather than mutating the shared class.
+            instrumented_cls = type(
+                "InstrumentedFlashInferGroupedStrategySampler",
+                (FlashInferGroupedStrategySampler,),
+                {"sample_grouped_strategies": staticmethod(_sample_grouped_strategies)},
             )
+            patch_ctx.setattr(sampler, "_grouped_sampler_cls", instrumented_cls)
 
             sample_async_orig = sampler.sample_async
 
@@ -2173,11 +2175,11 @@ class TestBatchedSampling:
             test_expected_counts != 0, 0, test_token_counts
         )
         assert (test_token_counts_for_zero_prob == 0).all()
-        test_expected_counts_ma = np.ma.masked_array(
+        test_expected_counts_ma = np.ma.MaskedArray(
             test_expected_counts.numpy(),
             mask=(test_expected_counts.numpy() == 0),
         )
-        test_token_counts_ma = np.ma.masked_array(
+        test_token_counts_ma = np.ma.MaskedArray(
             test_token_counts.numpy(),
             mask=test_expected_counts_ma.mask,
         )
@@ -2227,7 +2229,7 @@ class TestBatchedSampling:
             prob_delta = np.where(prob_delta > 5e-2, prob_delta, 0)  # NB: this is rather liberal
             # bound relative differences on remaining probs
             prob_delta_rel = (
-                np.ma.masked_array(num_samples * prob_delta, mask=test_expected_counts_ma.mask)
+                np.ma.MaskedArray(num_samples * prob_delta, mask=test_expected_counts_ma.mask)
                 / test_expected_counts_ma.data
             )
             assert prob_delta_rel.max() < 0.05

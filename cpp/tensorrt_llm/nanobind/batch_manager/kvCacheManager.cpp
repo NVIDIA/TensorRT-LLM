@@ -379,9 +379,17 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
         .def_rw("primary_max_num_blocks", &tbk::KvCacheIterationStats::primaryMaxNumBlocks)
         .def_rw("primary_free_num_blocks", &tbk::KvCacheIterationStats::primaryFreeNumBlocks)
         .def_rw("primary_used_num_blocks", &tbk::KvCacheIterationStats::primaryUsedNumBlocks)
+        .def_rw("primary_evictable_num_blocks", &tbk::KvCacheIterationStats::primaryEvictableNumBlocks)
+        .def_rw("primary_peak_free_num_blocks", &tbk::KvCacheIterationStats::primaryPeakFreeNumBlocks)
+        .def_rw("primary_peak_used_num_blocks", &tbk::KvCacheIterationStats::primaryPeakUsedNumBlocks)
+        .def_rw("primary_peak_evictable_num_blocks", &tbk::KvCacheIterationStats::primaryPeakEvictableNumBlocks)
         .def_rw("secondary_max_num_blocks", &tbk::KvCacheIterationStats::secondaryMaxNumBlocks)
         .def_rw("secondary_free_num_blocks", &tbk::KvCacheIterationStats::secondaryFreeNumBlocks)
         .def_rw("secondary_used_num_blocks", &tbk::KvCacheIterationStats::secondaryUsedNumBlocks)
+        .def_rw("secondary_evictable_num_blocks", &tbk::KvCacheIterationStats::secondaryEvictableNumBlocks)
+        .def_rw("secondary_peak_free_num_blocks", &tbk::KvCacheIterationStats::secondaryPeakFreeNumBlocks)
+        .def_rw("secondary_peak_used_num_blocks", &tbk::KvCacheIterationStats::secondaryPeakUsedNumBlocks)
+        .def_rw("secondary_peak_evictable_num_blocks", &tbk::KvCacheIterationStats::secondaryPeakEvictableNumBlocks)
         .def_rw("iter_alloc_total_blocks", &tbk::KvCacheIterationStats::iterAllocTotalBlocks)
         .def_rw("iter_alloc_new_blocks", &tbk::KvCacheIterationStats::iterAllocNewBlocks)
         .def_rw("iter_reused_blocks", &tbk::KvCacheIterationStats::iterReusedBlocks)
@@ -395,7 +403,9 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
         .def_rw("iter_offload_blocks", &tbk::KvCacheIterationStats::iterOffloadBlocks)
         .def_rw("iter_offload_bytes", &tbk::KvCacheIterationStats::iterOffloadBytes)
         .def_rw("iter_intra_device_copy_blocks", &tbk::KvCacheIterationStats::iterIntraDeviceCopyBlocks)
-        .def_rw("iter_intra_device_copy_bytes", &tbk::KvCacheIterationStats::iterIntraDeviceCopyBytes);
+        .def_rw("iter_intra_device_copy_bytes", &tbk::KvCacheIterationStats::iterIntraDeviceCopyBytes)
+        .def_rw("iter_host_dropped_blocks", &tbk::KvCacheIterationStats::iterHostDroppedBlocks)
+        .def_rw("iter_host_dropped_bytes", &tbk::KvCacheIterationStats::iterHostDroppedBytes);
 
     nb::class_<tbk::BlockKey>(m, "BlockKey")
         .def(nb::init<>())
@@ -629,7 +639,9 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
         .def("unpin_blocks_by_id", &BaseKVCacheManager::unpinBlocksById, nb::call_guard<nb::gil_scoped_release>())
         .def("reset_reuse_state", &BaseKVCacheManager::resetReuseState, nb::call_guard<nb::gil_scoped_release>())
         .def("get_priority_by_block_id", &BaseKVCacheManager::getPriorityByBlockId, nb::arg("block_id"),
-            nb::arg("window_size"), nb::call_guard<nb::gil_scoped_release>());
+            nb::arg("window_size"), nb::call_guard<nb::gil_scoped_release>())
+        .def("commit_and_get_block_hashes_for_request", &BaseKVCacheManager::commitAndGetBlockHashesForRequest,
+            nb::arg("llm_request"), nb::arg("window_size"), nb::call_guard<nb::gil_scoped_release>());
 
     nb::bind_vector<CacheBlockIds>(m, "CacheBlockIds")
         .def("__getstate__", [](CacheBlockIds const& v) { return nb::make_tuple(v); })

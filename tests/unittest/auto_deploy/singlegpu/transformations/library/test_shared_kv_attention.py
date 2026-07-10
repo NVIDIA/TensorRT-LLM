@@ -12,9 +12,7 @@ from tensorrt_llm._torch.auto_deploy.custom_ops.attention.flashinfer_attention i
 from tensorrt_llm._torch.auto_deploy.custom_ops.attention.torch_backend_attention import (
     TorchBackendAttention,
 )
-from tensorrt_llm._torch.auto_deploy.custom_ops.attention.triton_paged_attention import (
-    TritonPagedAttention,
-)
+from tensorrt_llm._torch.auto_deploy.custom_ops.attention.triton_attention import TritonAttention
 from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import BatchInfo
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.shim.interface import CachedSequenceInterface
@@ -352,7 +350,7 @@ def test_flashinfer_cached_attention_is_dynamic_for_piecewise():
     )
 
 
-def test_triton_paged_backend_attention_metadata_for_shared_kv_node():
+def test_triton_backend_attention_metadata_for_shared_kv_node():
     module = _TinySharedKVModule().eval()
     gm = torch_export_to_gm(module, (torch.randn(1, 4, 8),))
     source_nodes = [
@@ -366,18 +364,18 @@ def test_triton_paged_backend_attention_metadata_for_shared_kv_node():
         for node in source_nodes
         if node.target == torch.ops.auto_deploy.torch_attention.default
     )
-    shared = next(node for node in source_nodes if TritonPagedAttention.get_layer_idx(node) == 1)
+    shared = next(node for node in source_nodes if TritonAttention.get_layer_idx(node) == 1)
 
-    assert TritonPagedAttention.get_layer_idx(regular) == 0
-    assert TritonPagedAttention.get_layer_idx(shared) == 1
-    assert TritonPagedAttention.get_shared_kv_source_layer_idx(regular) is None
-    assert TritonPagedAttention.get_shared_kv_source_layer_idx(shared) == 0
-    assert TritonPagedAttention.get_cached_attention_op() == (
-        torch.ops.auto_deploy.triton_paged_mha_with_cache.default
+    assert TritonAttention.get_layer_idx(regular) == 0
+    assert TritonAttention.get_layer_idx(shared) == 1
+    assert TritonAttention.get_shared_kv_source_layer_idx(regular) is None
+    assert TritonAttention.get_shared_kv_source_layer_idx(shared) == 0
+    assert TritonAttention.get_cached_attention_op() == (
+        torch.ops.auto_deploy.triton_mha_with_cache.default
     )
 
 
-def test_shared_kv_transform_aliases_source_cache_placeholders_for_triton_paged():
+def test_shared_kv_transform_aliases_source_cache_placeholders_for_triton():
     module = _TinySharedKVModule().eval()
     gm = torch_export_to_gm(module, (torch.randn(1, 4, 8),))
 
@@ -388,7 +386,7 @@ def test_shared_kv_transform_aliases_source_cache_placeholders_for_triton_paged(
         device="cpu",
     )
     transform = _InsertCachedOperator(
-        InsertCachedAttentionConfig(stage=Stages.CACHE_INIT, backend="triton_paged")
+        InsertCachedAttentionConfig(stage=Stages.CACHE_INIT, backend="triton")
     )
     gm, info = transform._apply(gm, cm, factory=None, shared_config=SharedConfig())
 
@@ -403,27 +401,27 @@ def test_shared_kv_transform_aliases_source_cache_placeholders_for_triton_paged(
     regular_node = next(
         node
         for node in cached_nodes
-        if node.target == torch.ops.auto_deploy.triton_paged_mha_with_cache.default
+        if node.target == torch.ops.auto_deploy.triton_mha_with_cache.default
         and node.args[-1] is False
     )
     shared_node = next(
         node
         for node in cached_nodes
-        if node.target == torch.ops.auto_deploy.triton_paged_mha_with_cache.default
+        if node.target == torch.ops.auto_deploy.triton_mha_with_cache.default
         and node.args[-1] is True
     )
 
     assert regular_node.args[13] is shared_node.args[13]
-    assert regular_node.target == torch.ops.auto_deploy.triton_paged_mha_with_cache.default
-    assert shared_node.target == torch.ops.auto_deploy.triton_paged_mha_with_cache.default
+    assert regular_node.target == torch.ops.auto_deploy.triton_mha_with_cache.default
+    assert shared_node.target == torch.ops.auto_deploy.triton_mha_with_cache.default
     assert regular_node.args[-1] is False
     assert shared_node.args[-1] is True
 
 
 @torch.no_grad()
-def test_triton_paged_shared_kv_cached_attention_reads_aliased_cache_without_writing():
+def test_triton_shared_kv_cached_attention_reads_aliased_cache_without_writing():
     if not torch.cuda.is_available():
-        pytest.skip("CUDA is required for triton_paged shared-KV runtime coverage")
+        pytest.skip("CUDA is required for triton shared-KV runtime coverage")
 
     device = torch.device("cuda")
     head_dim = 16
@@ -462,14 +460,14 @@ def test_triton_paged_shared_kv_cached_attention_reads_aliased_cache_without_wri
     seq_len_with_cache_host = torch.tensor([3], dtype=torch.int32)
     position_ids = torch.tensor([[0]], dtype=torch.int32, device=device)
 
-    triton_batch_indices, triton_positions = torch.ops.auto_deploy.triton_paged_prepare_metadata(
+    triton_batch_indices, triton_positions = torch.ops.auto_deploy.triton_prepare_metadata(
         position_ids,
         batch_info_host.serialize(),
         cu_seqlen_host.to(device),
         seq_len_with_cache_host.to(device),
     )
 
-    output = torch.ops.auto_deploy.triton_paged_mha_with_cache(
+    output = torch.ops.auto_deploy.triton_mha_with_cache(
         q,
         dummy_k,
         dummy_v,
@@ -488,7 +486,7 @@ def test_triton_paged_shared_kv_cached_attention_reads_aliased_cache_without_wri
         None,
         True,
     )
-    expected = torch.ops.auto_deploy.triton_paged_mha_with_cache(
+    expected = torch.ops.auto_deploy.triton_mha_with_cache(
         q,
         owner_k[:, 2:3],
         owner_v[:, 2:3],
@@ -514,9 +512,9 @@ def test_triton_paged_shared_kv_cached_attention_reads_aliased_cache_without_wri
 
 
 @torch.no_grad()
-def test_triton_paged_shared_kv_prefill_sdpa_reads_aliased_cache_without_writing():
+def test_triton_shared_kv_prefill_sdpa_reads_aliased_cache_without_writing():
     if not torch.cuda.is_available():
-        pytest.skip("CUDA is required for triton_paged shared-KV SDPA runtime coverage")
+        pytest.skip("CUDA is required for triton shared-KV SDPA runtime coverage")
 
     from unittest.mock import patch
 
@@ -567,7 +565,7 @@ def test_triton_paged_shared_kv_prefill_sdpa_reads_aliased_cache_without_writing
         return original_sdpa(*args, **kwargs)
 
     with patch.object(torch.nn.functional, "scaled_dot_product_attention", tracking_sdpa):
-        output = torch.ops.auto_deploy.triton_paged_mha_with_cache(
+        output = torch.ops.auto_deploy.triton_mha_with_cache(
             q,
             dummy_k,
             dummy_v,
@@ -586,7 +584,7 @@ def test_triton_paged_shared_kv_prefill_sdpa_reads_aliased_cache_without_writing
             None,
             True,
         )
-        expected = torch.ops.auto_deploy.triton_paged_mha_with_cache(
+        expected = torch.ops.auto_deploy.triton_mha_with_cache(
             q,
             owner_k,
             owner_v,

@@ -36,6 +36,7 @@ from tensorrt_llm.inputs.registry import (MULTIMODAL_PLACEHOLDER_REGISTRY,
                                           MultimodalPlaceholderPlacement)
 from tensorrt_llm.llmapi.llm_utils import ModelLoader
 from tensorrt_llm.tokenizer import TokenizerBase, TransformersTokenizer
+from tensorrt_llm.tokenizer.deepseek_v4 import DeepseekV4Tokenizer
 from tensorrt_llm.tokenizer.deepseek_v32 import DeepseekV32Tokenizer
 
 logger = logging.get_logger(__name__)
@@ -653,8 +654,8 @@ def apply_chat_template(
     - STRING: keeps flattened text with pre-inserted placeholders
     """
 
-    # Handle DeepSeek V32 tokenizer with custom chat template
-    if isinstance(tokenizer, DeepseekV32Tokenizer):
+    # Handle DeepSeek tokenizers with custom chat templates.
+    if isinstance(tokenizer, (DeepseekV32Tokenizer, DeepseekV4Tokenizer)):
         prompt = tokenizer.apply_chat_template(
             messages=conversation,
             tools=tools,

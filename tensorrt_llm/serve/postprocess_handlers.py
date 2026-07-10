@@ -1,3 +1,4 @@
+import time
 from dataclasses import dataclass, field
 from typing import Any, List, Literal, Optional, Tuple, Union
 
@@ -89,6 +90,10 @@ class ChatPostprocArgs(PostprocArgs):
     tool_call_id_type: str = "random"
     chat_template_kwargs: Optional[dict[str, Any]] = None
     ctx_usage: Optional[UsageInfo] = None
+    # Cache per-request stream metadata so every chunk reuses the same response
+    # id and created timestamp instead of regenerating them for each chunk.
+    stream_response_id: Optional[str] = None
+    stream_created: Optional[int] = None
 
     @classmethod
     def from_request(cls, request: ChatCompletionRequest):
@@ -107,6 +112,15 @@ class ChatPostprocArgs(PostprocArgs):
             ctx_usage=None if request.disaggregated_params is None else
             request.disaggregated_params.ctx_usage,
         )
+
+
+def _ensure_stream_metadata(args: Any, rsp: GenerationResultBase,
+                            prefix: str) -> Tuple[str, int]:
+    if args.stream_response_id is None:
+        args.stream_response_id = f"{prefix}-{rsp.id}"
+    if args.stream_created is None:
+        args.stream_created = int(time.time())
+    return args.stream_response_id, args.stream_created
 
 
 def create_logprobs(token_ids: List[int], tokenizer: TransformersTokenizer,
@@ -212,7 +226,9 @@ def chat_stream_post_processor(rsp: GenerationResultBase,
                                                              content=content),
                                                          finish_reason=None)
         chunk = ChatCompletionStreamResponse(choices=[choice_data],
-                                             model=args.model)
+                                             model=args.model,
+                                             id=stream_response_id,
+                                             created=stream_created)
         if include_continuous_usage:
             chunk.usage = UsageInfo(
                 prompt_tokens=num_tokens,
@@ -229,6 +245,8 @@ def chat_stream_post_processor(rsp: GenerationResultBase,
     finish_reason_sent = [False] * args.num_choices
     prompt_tokens = args.num_prompt_tokens
     ctx_usage = _ctx_usage_for_postproc(args, rsp.outputs)
+    stream_response_id, stream_created = _ensure_stream_metadata(
+        args, rsp, "chatcmpl")
     if stream_option := args.stream_options:
         include_usage = stream_option.include_usage
         include_continuous_usage = include_usage and stream_option.continuous_usage_stats
@@ -252,8 +270,8 @@ def chat_stream_post_processor(rsp: GenerationResultBase,
         if finish_reason_sent[i]:
             continue
 
+        has_token_delta = bool(output.token_ids_diff)
         delta_text = output.text_diff
-
         delta_text, reasoning_delta_text = apply_reasoning_parser(
             args,
             i,
@@ -297,7 +315,10 @@ def chat_stream_post_processor(rsp: GenerationResultBase,
                             arguments=call_item.parameters,
                         ),
                     ))
-            if tool_calls or delta_text or reasoning_delta_text or output.finish_reason:
+            # Keep token-bearing chunks visible even when detokenization has no
+            # text to flush yet.
+            if (tool_calls or delta_text or reasoning_delta_text
+                    or output.finish_reason or has_token_delta):
                 delta_message = DeltaMessage(
                     content=delta_text,
                     reasoning_content=reasoning_delta_text,
@@ -326,7 +347,10 @@ def chat_stream_post_processor(rsp: GenerationResultBase,
                 choice.finish_reason = output.finish_reason
             choice.stop_reason = output.stop_reason
             finish_reason_sent[i] = True
-        chunk = ChatCompletionStreamResponse(choices=[choice], model=args.model)
+        chunk = ChatCompletionStreamResponse(choices=[choice],
+                                             model=args.model,
+                                             id=stream_response_id,
+                                             created=stream_created)
         if include_continuous_usage:
             chunk.usage = UsageInfo(prompt_tokens=prompt_tokens,
                                     completion_tokens=output.length,
@@ -350,7 +374,9 @@ def chat_stream_post_processor(rsp: GenerationResultBase,
 
         final_usage_chunk = ChatCompletionStreamResponse(choices=[],
                                                          model=args.model,
-                                                         usage=final_usage)
+                                                         usage=final_usage,
+                                                         id=stream_response_id,
+                                                         created=stream_created)
         final_usage_data = final_usage_chunk.model_dump_json()
         res.append(f"data: {final_usage_data}\n\n")
     return res
@@ -446,6 +472,10 @@ class CompletionPostprocArgs(PostprocArgs):
     return_logprobs: bool = False
     stream_options: Optional[StreamOptions] = None
     ctx_usage: Optional[UsageInfo] = None
+    # Cache per-request stream metadata so every chunk reuses the same response
+    # id and created timestamp instead of regenerating them for each chunk.
+    stream_response_id: Optional[str] = None
+    stream_created: Optional[int] = None
 
     @classmethod
     def from_request(cls, request: CompletionRequest):
@@ -500,6 +530,8 @@ def completion_stream_post_processor(rsp: DetokenizedGenerationResultBase,
     res: List[str] = []
     prompt_tokens = args.num_prompt_tokens
     ctx_usage = _ctx_usage_for_postproc(args, rsp.outputs)
+    stream_response_id, stream_created = _ensure_stream_metadata(
+        args, rsp, "cmpl")
     if stream_option := args.stream_options:
         include_usage = stream_option.include_usage
         include_continuous_usage = include_usage and stream_option.continuous_usage_stats
@@ -527,7 +559,10 @@ def completion_stream_post_processor(rsp: DetokenizedGenerationResultBase,
             choice.logprobs = create_completion_logprobs(
                 token_ids, args.tokenizer, logprobs, output._last_text_len)
 
-        chunk = CompletionStreamResponse(model=args.model, choices=[choice])
+        chunk = CompletionStreamResponse(model=args.model,
+                                         choices=[choice],
+                                         id=stream_response_id,
+                                         created=stream_created)
         if include_continuous_usage:
             chunk.usage = UsageInfo(prompt_tokens=prompt_tokens,
                                     completion_tokens=output.length,
@@ -549,9 +584,11 @@ def completion_stream_post_processor(rsp: DetokenizedGenerationResultBase,
         )
         rewrite_usage_info_from_ctx(final_usage, ctx_usage)
 
-        final_usage_chunk = ChatCompletionStreamResponse(choices=[],
-                                                         model=args.model,
-                                                         usage=final_usage)
+        final_usage_chunk = CompletionStreamResponse(choices=[],
+                                                     model=args.model,
+                                                     usage=final_usage,
+                                                     id=stream_response_id,
+                                                     created=stream_created)
         final_usage_data = final_usage_chunk.model_dump_json()
         res.append(f"data: {final_usage_data}\n\n")
     args.first_iteration = False
@@ -616,6 +653,8 @@ class ChatCompletionPostprocArgs(PostprocArgs):
     stream_options: Optional[StreamOptions] = None
     chat_template_kwargs: Optional[dict[str, Any]] = None
     ctx_usage: Optional[UsageInfo] = None
+    stream_response_id: Optional[str] = None
+    stream_created: Optional[int] = None
 
     @classmethod
     def from_request(cls, request: ChatCompletionRequest):
@@ -662,6 +701,8 @@ def chat_harmony_streaming_post_processor(
     if ctx_prompt_tokens is not None:
         prompt_tokens = ctx_prompt_tokens
         cached_tokens = ctx_cached_tokens
+    stream_response_id, stream_created = _ensure_stream_metadata(
+        args, rsp, "chatcmpl")
     response = handle_streaming_response(
         tools=args.tools,
         tool_choice=args.tool_choice,
@@ -673,6 +714,8 @@ def chat_harmony_streaming_post_processor(
         first_iteration=args.first_iteration,
         stream_options=args.stream_options,
         cached_tokens=cached_tokens,
+        stream_response_id=stream_response_id,
+        stream_created=stream_created,
     )
     args.first_iteration = False
     return response

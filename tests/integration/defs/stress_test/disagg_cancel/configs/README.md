@@ -25,6 +25,25 @@ The new `stress_config:` top-level block is consumed by
 `StressConfig` itself (dataclass field docstrings) and the
 example values in `marathon_cpp_v1_deepseek.yaml`.
 
+## Harness modes
+
+`stress_config.mode` is the switch between the regular guardrail and
+the full cancellation/poison marathon:
+
+- `log_only`: registered CI mode. The harness launches the real
+  disaggregated cluster, sends normal non-cancel probes, and scans
+  worker/server logs for UAF, broken-promise, and segmentation-fault
+  signatures. This mode is safe before in-flight cancellation and
+  poison-buffer hardening are available.
+- `full_cancel_poison`: opt-in mode for the completed runtime. The
+  harness enables the cancellation load, SIGSTOP/SIGKILL injections,
+  token-equivalent canaries, metrics scraping, and KV-growth checks.
+
+When switching from `log_only` to `full_cancel_poison`, update
+`duration_min`, canary references, poison-buffer log expectations, and
+the test-list timeout together. The top-level README has the exact
+checklist.
+
 ## Backend-knob axis: KV-cache manager × transceiver runtime
 
 Two knobs select which (KV cache manager × transceiver runtime)
@@ -51,7 +70,8 @@ Python changes** required beyond extending the parametrize list. To
 add a new config:
 
 1. Copy `marathon_cpp_v1_deepseek.yaml` as a template.
-2. Adjust `model`, `kv_cache_manager`, `transceiver`, and any
+2. Choose `stress_config.mode`, then adjust `model`,
+   `kv_cache_manager`, `transceiver`, and any
    load-shape knobs (`base_concurrency`, `client_cancel_rate`,
    `output_length`, `injections:`, `pass_criteria:`).
 3. Add the new filename to `_MARATHON_CONFIGS` in

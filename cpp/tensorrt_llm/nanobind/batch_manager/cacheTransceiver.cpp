@@ -46,17 +46,17 @@ public:
     // using BaseCacheTransceiver::BaseCacheTransceiver; // Inherit constructors
     NB_TRAMPOLINE(tb::BaseCacheTransceiver, 6);
 
-    void respondAndSendAsync(tb::LlmRequest* llmRequest) override
+    void respondAndSendAsync(std::shared_ptr<tb::LlmRequest> llmRequest) override
     {
         NB_OVERRIDE_PURE(respondAndSendAsync, llmRequest);
     }
 
-    void requestAndReceiveSync(tb::LlmRequest* llmRequest) override
+    void requestAndReceiveSync(std::shared_ptr<tb::LlmRequest> llmRequest) override
     {
         NB_OVERRIDE_PURE(requestAndReceiveSync, llmRequest);
     }
 
-    void requestAndReceiveAsync(tb::LlmRequest* llmRequest) override
+    void requestAndReceiveAsync(std::shared_ptr<tb::LlmRequest> llmRequest) override
     {
         NB_OVERRIDE_PURE(requestAndReceiveAsync, llmRequest);
     }
@@ -77,7 +77,7 @@ public:
         NB_OVERRIDE_PURE(checkGenTransferComplete);
     }
 
-    bool cancelRequest(tb::LlmRequest* llmRequest) override
+    bool cancelRequest(std::shared_ptr<tb::LlmRequest> llmRequest) override
     {
         NB_OVERRIDE_PURE(cancelRequest, llmRequest);
     }

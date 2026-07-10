@@ -1037,6 +1037,33 @@ def test_dense_conditional_generation_wrapper():
     assert torch.isfinite(out.logits).all()
 
 
+def test_conditional_generation_wrapper_handles_exported_text_graph_without_per_layer_inputs():
+    config = Gemma4Config(
+        text_config=_small_text_config(),
+        vision_config=Gemma4VisionConfig(hidden_size=32),
+    )
+    model = Gemma4ForConditionalGeneration(config).eval()
+
+    B, S = 2, 4
+    input_ids = torch.randint(0, config.text_config.vocab_size, (B, S))
+    pos_ids = _position_ids(B, S, "cpu")
+    language_model = model.model.language_model
+    inputs_embeds = language_model.get_input_embeddings()(input_ids)
+    gm = torch_export_to_gm(
+        language_model,
+        args=(),
+        kwargs={"inputs_embeds": inputs_embeds, "position_ids": pos_ids},
+    )
+    gm.get_input_embeddings = language_model.get_input_embeddings
+    assert not hasattr(gm, "get_per_layer_inputs")
+
+    model.model.language_model = gm
+    with torch.no_grad():
+        out = model(input_ids=input_ids, position_ids=pos_ids)
+
+    assert out.logits.shape == (B, S, config.text_config.vocab_size)
+
+
 def test_dense_export():
     """Dense model (no MoE) can be exported with torch.export."""
     device = "cpu"

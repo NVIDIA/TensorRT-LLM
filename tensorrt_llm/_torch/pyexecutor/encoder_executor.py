@@ -41,7 +41,9 @@ class EncoderExecutor:
             "are bypassed. Use llm.encode() for inference."
         )
 
-    def batch_forward(self, inputs: Dict[str, Any]) -> Dict[str, torch.Tensor]:
+        self.model_engine.warmup_encoder()
+
+    def batch_forward(self, inputs: Dict[str, Any], **kwargs) -> Dict[str, torch.Tensor]:
         """Execute a pre-formed batch in one forward pass.
 
         Args:
@@ -52,7 +54,7 @@ class EncoderExecutor:
         Returns:
             Dict with 'logits' tensor and any other model outputs.
         """
-        return self.model_engine.encoder_forward(inputs)
+        return self.model_engine.encoder_forward(inputs, **kwargs)
 
     def shutdown(self):
         """No background thread to stop — just release model engine resources."""

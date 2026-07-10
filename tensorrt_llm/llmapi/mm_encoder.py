@@ -14,8 +14,7 @@ from .mpi_session import external_mpi_comm_available
 
 
 class MultimodalEncoder(_TorchLLM):
-    """MultimodalEncoder class is the main class for running a multimodal encoder model using PyTorch backend.
-"""
+    """MultimodalEncoder class is the main class for running a multimodal encoder model using PyTorch backend."""
 
     def __init__(self,
                  model: Union[str, Path],
@@ -76,9 +75,11 @@ class MultimodalEncoder(_TorchLLM):
             llm_args=self.args)
 
     def _validate_mm_args_for_torch_backend(self, kwargs: dict) -> None:
-        """Validate that users don't pass LLM-specific arguments when using MultimodalEncoder (PyTorch).
-        Placeholder for now.
-        """
+        """Validate that users don't pass LLM-specific arguments when using MultimodalEncoder (PyTorch)."""
+        if kwargs.get("encode_only") is True:
+            raise ValueError(
+                "MultimodalEncoder does not support encode_only=True. "
+                "It uses mm_encoder_only execution internally.")
 
     def generate(
         self,

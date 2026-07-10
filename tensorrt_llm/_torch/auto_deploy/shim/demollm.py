@@ -22,7 +22,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import torch
 import torch.multiprocessing as mp
 
-from tensorrt_llm._torch.pyexecutor.sampling_utils import (
+from tensorrt_llm._torch.pyexecutor.sampler.sampling_utils import (
     greedy_search_sampling_batch,
     top_k_sampling_batch,
 )
@@ -34,7 +34,7 @@ from tensorrt_llm.sampling_params import SamplingParams
 
 from ..distributed import common as dist_ad
 from ..utils.logger import ad_logger
-from .ad_executor import ADEngine
+from .ad_executor import _RESERVED_MM_DATA_KEYS, ADEngine
 
 FusedMHACallable = Callable[..., torch.Tensor]
 
@@ -164,6 +164,8 @@ class DemoEngine(ADEngine):
             cu_seqlen.append(len(input_ids_flat))
             if request.multimodal_params is not None:
                 for k, v in request.multimodal_params.multimodal_data.items():
+                    if k in _RESERVED_MM_DATA_KEYS:
+                        continue
                     extra_args[k].append(v)
 
         sequence_info.reset()

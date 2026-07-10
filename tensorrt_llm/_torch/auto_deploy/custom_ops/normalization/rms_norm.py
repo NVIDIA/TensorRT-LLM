@@ -21,9 +21,12 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from einops import rearrange
 
-import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
-
 from ..quantization.quant import TRTLLM_NVFP4_SCALING_VECTOR_SIZE
+
+try:
+    import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
+except (ModuleNotFoundError, ImportError):
+    fp4_utils = None
 
 try:
     from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
@@ -41,8 +44,22 @@ except (ModuleNotFoundError, ImportError):
 from .triton_rms_norm import rms_norm
 
 
+def _pad_up(x, y: int):
+    return ((x + y - 1) // y) * y
+
+
 def _get_nvfp4_fake_shapes(x: torch.Tensor) -> tuple[tuple[int, ...], int]:
-    output_shape, sf_size = fp4_utils.get_fp4_shape(x.shape, TRTLLM_NVFP4_SCALING_VECTOR_SIZE)
+    if fp4_utils is not None:
+        output_shape, sf_size = fp4_utils.get_fp4_shape(x.shape, TRTLLM_NVFP4_SCALING_VECTOR_SIZE)
+        return tuple(output_shape), sf_size
+
+    input_shape = tuple(x.shape)
+    m = 1
+    for dim in input_shape[:-1]:
+        m *= dim
+    output_shape = list(input_shape)
+    output_shape[-1] //= 2
+    sf_size = _pad_up(m, 128) * _pad_up(input_shape[-1] // TRTLLM_NVFP4_SCALING_VECTOR_SIZE, 4)
     return tuple(output_shape), sf_size
 
 

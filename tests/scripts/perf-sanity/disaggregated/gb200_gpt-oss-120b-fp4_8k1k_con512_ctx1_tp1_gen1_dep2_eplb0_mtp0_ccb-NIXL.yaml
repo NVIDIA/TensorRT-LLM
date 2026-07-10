@@ -39,11 +39,6 @@ environment:
   server_env_var: TRTLLM_SERVER_DISABLE_GC=1
 profiling:
   nsys_on: false
-accuracy:
-  enable_accuracy_test: false
-  model: local-completions
-  tasks: gsm8k
-  model_args_extra: num_concurrent=512,max_retries=3,tokenized_requests=false,timeout=1200,max_gen_toks=256,max_length=4096
 worker_config:
   gen:
     print_iter_log: true
@@ -62,6 +57,7 @@ worker_config:
       enable_padding: true
       max_batch_size: 512
     kv_cache_config:
+      use_kv_cache_manager_v2: false
       enable_block_reuse: false
       free_gpu_memory_fraction: 0.9
       dtype: fp8
@@ -70,6 +66,7 @@ worker_config:
     cache_transceiver_config:
       max_tokens_in_buffer: 8448
       backend: NIXL
+      transceiver_runtime: PYTHON
     disable_overlap_scheduler: true
     num_postprocess_workers: 4
     stream_interval: 20
@@ -84,6 +81,7 @@ worker_config:
     enable_attention_dp: false
     cuda_graph_config: null
     kv_cache_config:
+      use_kv_cache_manager_v2: false
       enable_block_reuse: false
       free_gpu_memory_fraction: 0.9
       dtype: fp8
@@ -93,4 +91,5 @@ worker_config:
     cache_transceiver_config:
       max_tokens_in_buffer: 8448
       backend: NIXL
+      transceiver_runtime: PYTHON
     disable_overlap_scheduler: true
