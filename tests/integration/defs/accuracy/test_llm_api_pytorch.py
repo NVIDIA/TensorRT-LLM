@@ -6764,8 +6764,8 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
         ],
     )
     def test_fp8_4gpus(self, attention_dp, use_cpp_mamba, monkeypatch):
-        monkeypatch.setenv("TRTLLM_USE_CPP_MAMBA",
-                           "1" if use_cpp_mamba else "0")
+        monkeypatch.setenv("TRTLLM_USE_PY_MAMBA",
+                           "1" if not use_cpp_mamba else "0")
 
         with LLM(
                 f"{llm_models_root()}/NVIDIA-Nemotron-3-Super-120B-A12B-FP8",
