@@ -1011,7 +1011,9 @@ def quantize(hf_model_dir: str,
     gen_config_path = os.path.join(hf_model_dir, 'generation_config.json')
     with open(gen_config_path, 'r') as f:
         gen_config = json.load(f)
-    chat_format = getattr(gen_config, 'chat_format', 'chatml')
+    # gen_config is a dict from json.load; getattr never finds the key and
+    # always returned the 'chatml' default, ignoring the checkpoint's value.
+    chat_format = gen_config.get('chat_format', 'chatml')
     act_range = capture_activation_range(hf_model, config.qwen_type, tokenizer,
                                          dataset, system_prompt, chat_format)
     qkv_para = {}
