@@ -954,10 +954,8 @@ def test_mhc_fused_hc_cuda_graph(n: int, hidden_size: int, hc_mult: int):
             cur_module.base,
         ]
 
-    # Eager reference — runner's workspace cache reuses output tensors across
-    # calls with matching shape, so eager_out and graph_out alias the same
-    # storage. Clone eager_out so we can compare after the graph replay
-    # overwrites the workspace.
+    # Clone the eager result into an immutable golden before warmup and graph
+    # capture exercise additional allocations.
     eager_raw = runner(inputs=_inputs(), tactic=tactic)
     eager_out = tuple(t.clone() for t in eager_raw)
 
@@ -1053,6 +1051,150 @@ def _make_fused_hc_runner_case(n: int, hidden_size: int, hc_mult: int, seed: int
         cur_module.base,
     ]
     return runner, inputs
+
+
+def test_mhc_fused_hc_chained_outputs_do_not_alias_inputs():
+    """A fused-HC call must not overwrite state returned by the previous call."""
+    runner, inputs = _make_fused_hc_runner_case(n=6, hidden_size=7168, hc_mult=4, seed=61)
+    tactic = ("fused_half_fma", 2, 4, 512, 1)
+
+    first_outputs = runner(inputs=inputs, tactic=tactic)
+    chained_inputs = [
+        inputs[0],
+        first_outputs[0],
+        first_outputs[1],
+        first_outputs[2],
+        *inputs[4:],
+    ]
+    saved_inputs = tuple(tensor.clone() for tensor in chained_inputs[1:4])
+
+    second_outputs = runner(inputs=chained_inputs, tactic=tactic)
+
+    for output, input_tensor, name in zip(
+        second_outputs[:3],
+        chained_inputs[1:4],
+        ("residual", "post_mix", "comb_mix"),
+    ):
+        assert output.data_ptr() != input_tensor.data_ptr(), (
+            f"fused_hc {name} output aliases its input"
+        )
+
+    for actual, expected, name in zip(
+        chained_inputs[1:4],
+        saved_inputs,
+        ("residual", "post_mix", "comb_mix"),
+    ):
+        torch.testing.assert_close(
+            actual,
+            expected,
+            rtol=0,
+            atol=0,
+            msg=f"fused_hc mutated its {name} input",
+        )
+
+    reference_inputs = [inputs[0].clone(), *saved_inputs, *inputs[4:]]
+    reference_outputs = runner(inputs=reference_inputs, tactic=tactic)
+    for actual, expected, name, tolerance in zip(
+        second_outputs,
+        reference_outputs,
+        ("residual", "post_mix", "comb_mix", "layer_input"),
+        (1e-2, 5e-3, 5e-3, 1e-2),
+    ):
+        torch.testing.assert_close(
+            actual,
+            expected,
+            rtol=tolerance,
+            atol=tolerance,
+            msg=f"chained fused_hc produced an incorrect {name}",
+        )
+
+
+def test_mhc_fused_hc_three_call_cuda_graph_replay():
+    """An odd-length fused-HC chain must remain stable across graph replays."""
+    runner, inputs = _make_fused_hc_runner_case(n=6, hidden_size=4096, hc_mult=4, seed=73)
+    tactic = ("fused_half_fma", 2, 1, 512, 1)
+
+    def run_chain():
+        first = runner(inputs=inputs, tactic=tactic)
+        second = runner(
+            inputs=[inputs[0], first[0], first[1], first[2], *inputs[4:]],
+            tactic=tactic,
+        )
+        return runner(
+            inputs=[inputs[0], second[0], second[1], second[2], *inputs[4:]],
+            tactic=tactic,
+        )
+
+    warmup_stream = torch.cuda.Stream()
+    warmup_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(warmup_stream):
+        for _ in range(3):
+            run_chain()
+    torch.cuda.current_stream().wait_stream(warmup_stream)
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_outputs = run_chain()
+
+    for scale in (1.0003, 1.0005, 1.0007):
+        for tensor in inputs[:4]:
+            tensor.mul_(scale)
+        expected = tuple(tensor.clone() for tensor in run_chain())
+        graph.replay()
+        torch.cuda.synchronize()
+        for actual, reference, name in zip(
+            graph_outputs,
+            expected,
+            ("residual", "post_mix", "comb_mix", "layer_input"),
+        ):
+            torch.testing.assert_close(
+                actual,
+                reference,
+                rtol=0,
+                atol=0,
+                msg=f"three-call CUDA graph replay mismatch in {name}",
+            )
+
+
+def test_mhc_fused_hc_scratch_isolated_between_streams():
+    """Concurrent fused-HC calls must not mutate another stream's scratch."""
+    runner, first_inputs = _make_fused_hc_runner_case(n=6, hidden_size=4096, hc_mult=4, seed=79)
+    second_inputs = [tensor.clone() for tensor in first_inputs]
+    for tensor in second_inputs[:4]:
+        tensor.mul_(1.01)
+    tactic = ("fused_half_fma", 2, 1, 512, 1)
+
+    current_stream = torch.cuda.current_stream()
+    first_stream = torch.cuda.Stream()
+    second_stream = torch.cuda.Stream()
+    first_stream.wait_stream(current_stream)
+    second_stream.wait_stream(current_stream)
+
+    with torch.cuda.stream(first_stream):
+        first_scratch = runner._scratch_cache.get(6, 1, 1, first_inputs[0].device)
+        first_outputs = runner(inputs=first_inputs, tactic=tactic)
+    with torch.cuda.stream(second_stream):
+        second_scratch = runner._scratch_cache.get(6, 1, 1, second_inputs[0].device)
+        second_outputs = runner(inputs=second_inputs, tactic=tactic)
+
+    current_stream.wait_stream(first_stream)
+    current_stream.wait_stream(second_stream)
+    torch.cuda.synchronize()
+
+    for first_workspace, second_workspace in zip(first_scratch, second_scratch):
+        assert first_workspace.data_ptr() != second_workspace.data_ptr()
+
+    first_reference = tuple(tensor.clone() for tensor in runner(inputs=first_inputs, tactic=tactic))
+    second_reference = tuple(
+        tensor.clone() for tensor in runner(inputs=second_inputs, tactic=tactic)
+    )
+    for actual_outputs, reference_outputs in (
+        (first_outputs, first_reference),
+        (second_outputs, second_reference),
+    ):
+        for actual, reference in zip(actual_outputs, reference_outputs):
+            torch.testing.assert_close(actual, reference, rtol=0, atol=0)
 
 
 def _assert_graph_replay_matches_eager(runner, inputs, tactic):

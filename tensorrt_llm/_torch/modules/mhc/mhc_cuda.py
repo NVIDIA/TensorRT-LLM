@@ -697,45 +697,40 @@ def _fused_hc_call(
     )
 
 
-class _FusedHcWorkspaceCache:
-    """Size-keyed bounded LRU for the 4 outputs + 3 workspaces of mhc_fused_hc.
+class _FusedHcScratchCache:
+    """Size- and stream-keyed bounded LRU for fused-HC scratch tensors.
 
-    The 4 outputs are consumed by the caller (so they can't alias across
-    calls at different B), but repeatedly calling ``torch.empty`` for each
-    call inside a CUDA-graph-captured inference loop is wasteful. Keyed on
-    ``(B, ws_ks, tile_m, device)``: same-shape calls reuse the previously
-    allocated buffers; tensors are stable across graph captures (same ptr
-    under the torch allocator's retained block).
+    Public outputs are deliberately not cached: target layers feed one
+    fused-HC call's outputs into the next call, so reusing an output tensor
+    for the same shape would make the next kernel read and write the same
+    storage. The FMA backends are not in-place safe.
+
+    Eager scratch reuse is scoped to a CUDA stream because the kernels mutate
+    every workspace. During CUDA graph capture scratch allocation bypasses
+    this cache and is owned by the graph-private memory pool instead.
 
     Two bounds keep this from ballooning:
 
-    1. ``_CACHE_MAX_B``: a per-call threshold. Only cache when the request's
-       residual_cur footprint is modest (B * n * hidden * 2 bytes; e.g. at
-       n=4 hidden=4096 that's 32 KB/token, so a 256-token cap = 8 MB/entry).
-       Prefill shapes (B in the tens of thousands) flow straight through to
-       ``torch.empty``, which the torch caching allocator already keeps
-       cheap on repeated calls.
+    1. ``_CACHE_MAX_B``: a per-call threshold. Prefill shapes flow straight
+       through to ``torch.empty``, which the torch caching allocator already
+       keeps cheap on repeated calls.
     2. ``_maxsize``: LRU cap on the number of cached entries. Covers the
-       discrete CUDA-graph decode batch sizes plus a few stragglers; decode
-       is the only regime that actually benefits from the cache.
+       discrete eager decode batch sizes plus a few stragglers; decode is the
+       only regime that actually benefits from the cache.
 
-    Without these bounds every distinct prefill B leaks ~B * n * hidden * 2
-    bytes (≈1.3 GB at B=32768, n=4, hidden=4096). Under a prefill ramp-up
-    admitting one new ctx request per iter, the leak reaches tens of GB per
-    rank within a dozen iters and blows past HBM.
+    These bounds prevent a long sequence of distinct eager prefill shapes
+    from retaining one scratch allocation per shape.
     """
 
-    __slots__ = ("n", "hidden_size", "_cache", "_maxsize")
+    __slots__ = ("n", "_cache", "_maxsize")
 
-    # Up to 48 distinct entries — covers the 35 CUDA-graph decode buckets
-    # plus headroom. Each entry at B<=256 is under ~10 MB.
+    # Up to 48 distinct entries covers the eager decode buckets plus headroom.
     DEFAULT_MAXSIZE = 48
     # Skip the cache above this B; prefill rides the torch allocator.
     _CACHE_MAX_B = 256
 
-    def __init__(self, n: int, hidden_size: int, maxsize: int = DEFAULT_MAXSIZE):
+    def __init__(self, n: int, maxsize: int = DEFAULT_MAXSIZE):
         self.n = n
-        self.hidden_size = hidden_size
         self._maxsize = maxsize
         from collections import OrderedDict
 
@@ -743,18 +738,12 @@ class _FusedHcWorkspaceCache:
 
     def get(self, B: int, num_k_splits: int, tile_m: int, device):
         n = self.n
-        hidden_size = self.hidden_size
         ws_ks = max(1, num_k_splits)
         tm = max(1, tile_m)
         m_batches = (B + tm - 1) // tm
-        n2 = n * n
         shape_n = n * (2 + n)
 
         def _alloc():
-            residual_cur = torch.empty((B, n, hidden_size), dtype=torch.bfloat16, device=device)
-            post_mix_cur = torch.empty((B, n), dtype=torch.float32, device=device)
-            comb_mix_cur = torch.empty((B, n2), dtype=torch.float32, device=device)
-            layer_input_cur = torch.empty((B, hidden_size), dtype=torch.bfloat16, device=device)
             if ws_ks == 1:
                 y_acc_ws = torch.empty((B, shape_n), dtype=torch.float32, device=device)
                 r_acc_ws = torch.empty((B,), dtype=torch.float32, device=device)
@@ -762,20 +751,13 @@ class _FusedHcWorkspaceCache:
                 y_acc_ws = torch.empty((ws_ks, B, shape_n), dtype=torch.float32, device=device)
                 r_acc_ws = torch.empty((ws_ks, B), dtype=torch.float32, device=device)
             done_counter_ws = torch.empty((m_batches,), dtype=torch.int32, device=device)
-            return (
-                residual_cur,
-                post_mix_cur,
-                comb_mix_cur,
-                layer_input_cur,
-                y_acc_ws,
-                r_acc_ws,
-                done_counter_ws,
-            )
+            return y_acc_ws, r_acc_ws, done_counter_ws
 
-        if B > self._CACHE_MAX_B:
+        if B > self._CACHE_MAX_B or torch.cuda.is_current_stream_capturing():
             return _alloc()
 
-        key = (B, ws_ks, m_batches, device)
+        stream = torch.cuda.current_stream(device)
+        key = (B, ws_ks, m_batches, device, stream.cuda_stream)
         hit = self._cache.get(key)
         if hit is not None:
             self._cache.move_to_end(key)
@@ -845,7 +827,7 @@ class MhcFusedHcRunner(TunableRunner):
             ConstraintSpec(input_idx=3, dim_idx=0, infer_shape=lambda shapes: shapes[0][0]),
         ),
         # TODO: re-enable distributed_tuning_strategy=PARALLEL once
-        # _FusedHcWorkspaceCache no longer keys on chosen-tactic fields.
+        # _FusedHcScratchCache no longer keys on chosen-tactic fields.
     )
 
     def __init__(
@@ -865,7 +847,7 @@ class MhcFusedHcRunner(TunableRunner):
         self.hc_sinkhorn_eps = hc_sinkhorn_eps
         self.hc_post_mult_value = hc_post_mult_value
         self.sinkhorn_repeat = sinkhorn_repeat
-        self._ws_cache = _FusedHcWorkspaceCache(n=n, hidden_size=hidden_size)
+        self._scratch_cache = _FusedHcScratchCache(n=n)
 
     def unique_id(self):
         return (self.n, self.hidden_size)
@@ -956,15 +938,13 @@ class MhcFusedHcRunner(TunableRunner):
             norm_weight = norm_weight.contiguous()
 
         B = residual_prev.shape[0]
-        (
-            residual_cur,
-            post_mix_cur,
-            comb_mix_cur,
-            layer_input_cur,
-            y_acc_ws,
-            r_acc_ws,
-            done_counter_ws,
-        ) = self._ws_cache.get(B, num_k_splits, tile_m, x_prev.device)
+        residual_cur = torch.empty_like(residual_prev)
+        post_mix_cur = torch.empty((B, self.n), dtype=torch.float32, device=x_prev.device)
+        comb_mix_cur = torch.empty((B, self.n * self.n), dtype=torch.float32, device=x_prev.device)
+        layer_input_cur = torch.empty_like(x_prev)
+        y_acc_ws, r_acc_ws, done_counter_ws = self._scratch_cache.get(
+            B, num_k_splits, tile_m, x_prev.device
+        )
 
         _fused_hc_call(
             backend_code,
@@ -1001,8 +981,8 @@ class MhcFusedHcRunner(TunableRunner):
 
 
 # Process-wide runner cache keyed on the mHC configuration. Avoids recreating
-# a MhcFusedHcRunner (and its workspace cache) on every call, which would also
-# defeat the workspace cache inside the runner.
+# a MhcFusedHcRunner (and its scratch cache) on every call, which would also
+# defeat scratch reuse inside the runner.
 _fused_hc_runner_cache: dict = {}
 
 
