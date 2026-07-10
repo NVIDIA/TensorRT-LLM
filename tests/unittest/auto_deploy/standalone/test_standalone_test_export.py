@@ -129,7 +129,7 @@ def _expected_exported_test(source: str, relative_path: Path) -> str:
             ensure_imports(trtllm_import.start(), "os", "pytest")
             insert_optional_trtllm_guard()
     expected = expected.replace(
-        '    script_dir = Path(root_dir, "benchmarks", "cpp")\n',
+        '    script_dir = Path(root_dir, "benchmarks")\n',
         "    script_dir = Path(temp_dir)\n",
     )
     return expected
