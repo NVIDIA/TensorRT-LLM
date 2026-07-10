@@ -54,6 +54,7 @@ l0_b200:
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_w4a16_mxfp4[latency-TRTLLM]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B_Instruct_2507::test_skip_softmax_attention[target_sparsity_0.9-fp8kv=True]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_5_35B_A3B::test_fp8[enable_block_reuse=True]
+  - accuracy/test_llm_api_pytorch.py::TestQwen3_6_35B_A3B::test_nvfp4[TRTLLM]
   - accuracy/test_llm_api_pytorch_multimodal.py::TestNanoV3Omni::test_auto_dtype[fp8_mmmu_encoder_cuda_graph]
   - accuracy/test_epd_disagg_multimodal.py::TestVideoMMEEPD::test_disaggregated_videomme[qwen3vl_2b_instruct]
   - accuracy/test_epd_disagg_multimodal.py::TestVideoMMEEPD::test_disaggregated_videomme[nemotron_nano_v3_omni_nvfp4]
@@ -219,6 +220,7 @@ l0_b200:
   - unittest/_torch/visual_gen/test_cache_dit.py
   - unittest/_torch/visual_gen/test_quant_ops.py
   - unittest/_torch/visual_gen/test_attention_cute_dsl.py
+  - unittest/_torch/visual_gen/test_attention_cute_dsl_vsa.py
   - unittest/_torch/visual_gen/test_attention_trtllm_sage.py
   - unittest/_torch/visual_gen/test_attention_integration.py
   - unittest/_torch/visual_gen/test_attention_perf.py
@@ -236,6 +238,8 @@ l0_b200:
   - unittest/_torch/visual_gen/test_wan22_i2v_pipeline.py
   - unittest/_torch/visual_gen/test_wan22_t2v_pipeline.py
   - unittest/_torch/visual_gen/test_wan22_ti2v_5b_pipeline.py
+  - unittest/_torch/visual_gen/test_wan_vsa_pipeline.py
+  - unittest/_torch/visual_gen/test_wan_vae.py
   - unittest/_torch/visual_gen/test_wan21_i2v_teacache.py
   - unittest/_torch/visual_gen/test_wan21_t2v_teacache.py
   - unittest/_torch/visual_gen/test_wan21_t2v_teacache_user_coefficients.py
@@ -278,35 +282,9 @@ l0_b200:
       backend: tensorrt
   tests:
   # ------------- TRT tests ---------------
-  - accuracy/test_cli_flow.py::TestLlama3_8BInstruct::test_nvfp4
-  - accuracy/test_cli_flow.py::TestLlama3_8BInstruct::test_nvfp4_gemm_plugin[disable_norm_quant_fusion-disable_fused_quant]
-  - accuracy/test_cli_flow.py::TestLlama3_8BInstruct::test_nvfp4_gemm_plugin[disable_norm_quant_fusion-enable_fused_quant]
-  - accuracy/test_cli_flow.py::TestLlama3_8BInstruct::test_nvfp4_gemm_plugin[enable_norm_quant_fusion-disable_fused_quant]
-  - accuracy/test_cli_flow.py::TestLlama3_8BInstruct::test_nvfp4_gemm_plugin[enable_norm_quant_fusion-enable_fused_quant]
-  - accuracy/test_cli_flow.py::TestLlama3_8BInstruct::test_auto_dtype
-  - accuracy/test_cli_flow.py::TestLlama3_8BInstruct::test_fp8
-  - unittest/trt/attention/test_gpt_attention.py -k "trtllm_gen"
   - unittest/llmapi/test_llm_quant.py # 3.5 mins on B200
-  - unittest/trt/functional/test_fp4_gemm.py # 3 mins on B200
   - unittest/disaggregated/test_router.py
   - unittest/disaggregated/test_openai_server_info.py
-- condition:
-    ranges:
-      system_gpu_count:
-        gte: 1
-        lte: 1
-    wildcards:
-      gpu:
-      - '*b100*'
-      - '*b200*'
-      linux_distribution_name: ubuntu*
-    terms:
-      stage: post_merge
-      backend: triton
-  tests:
-  - triton_server/test_triton.py::test_llava[llava]
-  - triton_server/test_triton.py::test_gpt_ib_ptuning[gpt-ib-ptuning]
-  - triton_server/test_triton.py::test_gpt_2b_ib_lora[gpt-2b-ib-lora]
 - condition:
     ranges:
       system_gpu_count:

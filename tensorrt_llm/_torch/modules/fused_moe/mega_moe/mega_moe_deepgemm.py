@@ -16,8 +16,8 @@
 
 This backend owns capability checks, routing/activation quantization, and the
 fused kernel entry point. ``W4A8MXFP4MXFP8MegaMoEDeepGemmMethod`` owns the
-DG-native weight tensors, checkpoint loading, scale conversion, SymmBuffer
-allocation, and DeepGEMM weight transform.
+DG-native weight tensors, checkpoint loading, scale conversion, and DeepGEMM
+weight transform. The backend owns SymmBuffer allocation and reuse.
 """
 
 from __future__ import annotations
@@ -327,20 +327,15 @@ class MegaMoEDeepGemm(MoE):
         # capture because rendezvous is a host-side IPC operation.
         # ``_resolve_ep_pg`` above relies on the same lockstep window.
         #
-        # The actual allocation is deferred to ``create_weights`` so that
-        # ConfigurableMoE has a chance to overwrite EPLB-derived
-        # attributes (``num_slots``, ``expert_size_per_partition``, ...)
-        # via ``_BACKEND_SYNC_ATTRS`` before we size the buffer. When the
-        # backend is constructed with ``init_load_balancer=False`` (the
-        # ConfigurableMoE path), ``MoE.__init__`` only seeds
-        # ``num_slots = num_experts`` as a placeholder; under EPLB the
-        # real slot count is larger, and sizing the SymmBuffer here would
-        # produce ``sym_buffer.num_experts != num_experts_per_rank *
-        # num_ranks`` at forward time. ``create_weights`` is also
-        # collective across ranks (called by ConfigurableMoE on all ranks
-        # right after the sync, or by the backend itself when used
-        # standalone with ``init_load_balancer=True``), so deferring keeps
-        # the rendezvous lockstep guarantee intact.
+        # The actual allocation is deferred to ``cache_derived_state`` so
+        # ConfigurableMoE can first sync EPLB-derived attributes (``num_slots``,
+        # ``expert_size_per_partition``, ...) via ``_BACKEND_SYNC_ATTRS`` and
+        # MetaInitMode can exit before the collective. ``MoE.__init__`` only
+        # seeds ``num_slots = num_experts`` as a placeholder when the backend
+        # is constructed with ``init_load_balancer=False``; sizing the buffer
+        # here would therefore break EPLB. The loader walks the cache stage in
+        # deterministic module order on all EP ranks, preserving rendezvous
+        # lockstep for ordinary and GMS RO loads.
         # See ``_alloc_symm_buffer`` for the cache contract.
         self._symm_buffer = None
 
@@ -605,29 +600,18 @@ class MegaMoEDeepGemm(MoE):
             self.create_weights()
         self.quant_method.load_weights(self, weights, allow_partial_loading)
 
+    def cache_derived_state(self) -> None:
+        # The rendezvous cannot run from create_weights under MetaInitMode.
+        # This stage runs in deterministic module order after materialization
+        # for both ordinary loads and GMS RO readers.
+        self._alloc_symm_buffer()
+        super().cache_derived_state()
+
     def post_load_weights(self) -> None:
         if self.quant_method is None:
             self.create_weights()
-        # Allocate the DG NVLink SymmBuffer and run its EP rendezvous here
-        # rather than in create_weights, for two reasons:
-        #   1. EPLB sizing: ConfigurableMoE syncs the EPLB-derived attributes
-        #      (num_slots, expert_size_per_partition, ...) onto the backend only
-        #      after __init__. Sizing the buffer earlier would use the
-        #      placeholder num_slots = num_experts and break EPLB at forward
-        #      time (DeepGEMM asserts num_experts == num_experts_per_rank *
-        #      num_ranks in mega.hpp).
-        #   2. MetaInitMode: the rendezvous (symm_mem.rendezvous + EP barrier
-        #      inside get_symm_buffer_for_mega_moe) is a real collective, but
-        #      create_weights runs under MetaInitMode where a c10d.barrier on a
-        #      meta tensor raises MetaInitException — aborting meta-init and
-        #      forcing the slow regular-init fallback that materializes every
-        #      weight on host RAM and OOM-kills small-host nodes (e.g. GB300,
-        #      ~900 GiB/node).
-        # The loader invokes this hook for every module in deterministic order
-        # on all EP ranks (lockstep), after MetaInitMode has exited and before
-        # forward / CUDA-graph capture. Idempotent — a no-op once allocated.
-        self._alloc_symm_buffer()
-        self.quant_method.post_load_weights(self)
+        self.transform_weights()
+        self.cache_derived_state()
 
     # ------------------------------------------------------------------
     # MoE-contract methods
@@ -690,7 +674,7 @@ class MegaMoEDeepGemm(MoE):
         buf = self._symm_buffer
         assert buf is not None, (
             "MegaMoE SymmBuffer not allocated — _alloc_symm_buffer runs in "
-            "post_load_weights; ensure the model loader's post_load_weights "
+            "cache_derived_state; ensure the model loader's cache/post-load "
             "pass ran before forward (and was not skipped by _weights_removed)."
         )
         num_tokens = x.shape[0]

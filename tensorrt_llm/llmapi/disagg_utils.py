@@ -101,6 +101,10 @@ class DisaggServerConfig():
     # worker's request body / JSON-parse GIL cost at high concurrency. Enable
     # ONLY for text-only, non-harmony deployments (see _get_gen_request).
     gen_strip_message_history: bool = False
+    # Ask context workers to return prompt_token_ids as a base64 int32 buffer so
+    # the orchestrator relays a string instead of materializing the token-id list
+    # on its event loop. Text-only, non-harmony deployments (see _get_ctx_request).
+    gen_tokids_ctxbytes: bool = False
 
 
 @dataclass
@@ -186,6 +190,7 @@ def extract_disagg_cfg(hostname: str = 'localhost',
                            'generation_first'] = 'context_first',
                        allow_request_chat_template: bool = False,
                        gen_strip_message_history: bool = False,
+                       gen_tokids_ctxbytes: bool = False,
                        **kwargs: Any) -> DisaggServerConfig:
     context_servers = context_servers or {}
     generation_servers = generation_servers or {}
@@ -236,6 +241,7 @@ def extract_disagg_cfg(hostname: str = 'localhost',
     config.allow_request_chat_template = validate_config_bool(
         allow_request_chat_template, "allow_request_chat_template")
     config.gen_strip_message_history = gen_strip_message_history
+    config.gen_tokids_ctxbytes = gen_tokids_ctxbytes
     return config
 
 

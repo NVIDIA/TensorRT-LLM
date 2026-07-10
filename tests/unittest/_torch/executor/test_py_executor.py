@@ -24,6 +24,7 @@ from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
 )
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 from tensorrt_llm._torch.pyexecutor.py_executor import DisaggTransferAdmissionController, PyExecutor
+from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
 from tensorrt_llm._torch.pyexecutor.scheduler import (
     FCFSWaitingQueue,
     ScheduledRequests,
@@ -191,14 +192,98 @@ def test_getter_methods(mock_executor):
     assert mock_executor.get_waiting_queue_size() == 1
 
 
-def _classify_termination(request, enable_partial_reuse_for_disagg, is_vswa, pp_size):
+def _make_executor_with_kv_cache_manager(kv_cache_manager):
+    executor = PyExecutor.__new__(PyExecutor)
+    executor.resource_manager = Mock()
+    executor.resource_manager.resource_managers = {
+        ResourceManagerType.KV_CACHE_MANAGER: kv_cache_manager
+    }
+    return executor
+
+
+def test_get_kv_cache_capacity_without_manager():
+    executor = _make_executor_with_kv_cache_manager(None)
+
+    assert executor.get_kv_cache_capacity() == {}
+
+
+def test_get_kv_cache_capacity_from_stats():
+    """KV capacity is available without consuming iteration stats."""
+    kv_stats = Mock()
+    kv_stats.max_num_blocks = 123
+    kv_stats.tokens_per_block = 64
+
+    kv_cache_manager = Mock()
+    kv_cache_manager.get_kv_cache_stats.return_value = kv_stats
+
+    executor = _make_executor_with_kv_cache_manager(kv_cache_manager)
+
+    assert executor.get_kv_cache_capacity() == {
+        "maxNumBlocks": 123,
+        "tokensPerBlock": 64,
+        "maxNumTokens": 7872,
+    }
+
+
+def test_get_kv_cache_capacity_falls_back_to_manager_pool_size():
+    """KVCacheManagerV2 exposes capacity through pool attributes."""
+    kv_stats = Mock()
+    kv_stats.max_num_blocks = 0
+    kv_stats.tokens_per_block = 0
+
+    kv_cache_manager = Mock()
+    kv_cache_manager.get_kv_cache_stats.return_value = kv_stats
+    kv_cache_manager.get_max_resource_count.return_value = 0
+    kv_cache_manager.blocks_in_primary_pool = 256
+    kv_cache_manager.tokens_per_block = 32
+
+    executor = _make_executor_with_kv_cache_manager(kv_cache_manager)
+
+    assert executor.get_kv_cache_capacity() == {
+        "maxNumBlocks": 256,
+        "tokensPerBlock": 32,
+        "maxNumTokens": 8192,
+    }
+
+
+def test_get_kv_cache_capacity_falls_back_to_max_resource_count():
+    kv_stats = Mock()
+    kv_stats.max_num_blocks = 0
+    kv_stats.tokens_per_block = 0
+
+    kv_cache_manager = Mock()
+    kv_cache_manager.get_kv_cache_stats.return_value = kv_stats
+    kv_cache_manager.blocks_in_primary_pool = 0
+    kv_cache_manager.get_max_resource_count.return_value = 512
+    kv_cache_manager.tokens_per_block = 16
+
+    executor = _make_executor_with_kv_cache_manager(kv_cache_manager)
+
+    assert executor.get_kv_cache_capacity() == {
+        "maxNumBlocks": 512,
+        "tokensPerBlock": 16,
+        "maxNumTokens": 8192,
+    }
+
+
+def _classify_termination(
+    request, enable_partial_reuse_for_disagg, is_vswa, is_kv_manager_v2, pp_size=1
+):
     """Reproduce the termination logic from _handle_responses (py_executor.py).
+
+    Mirrors ``force_terminate_for_partial_reuse = force_terminate_ctx_for_partial_reuse``:
+    the early-termination path is enabled only for partial-reuse disagg on the
+    V1 KVCacheManager at PP=1. It is disabled for VSWA, KVCacheManagerV2 (no
+    store_blocks_for_reuse equivalent), and PP>1 — where termination is routed
+    through the DisaggPPTerminationHandler ring consensus via the
+    transfer-complete path. (Eager block store stays enabled for PP>1, but it
+    is a separate, rank-local concern that does not affect this branch.)
 
     Returns:
         "terminate" | "stats_only" | "skip"
     """
     force_terminate_for_partial_reuse = (
-        enable_partial_reuse_for_disagg and not is_vswa and pp_size == 1
+        enable_partial_reuse_for_disagg and not is_vswa and not is_kv_manager_v2 and pp_size == 1
     )
     if request.is_disagg_context_complete_state:
         return "stats_only"
@@ -224,38 +309,87 @@ class TestDisaggTerminationGuard:
     def test_normal_path_skips_context_complete(self):
         """Without partial reuse, CONTEXT_COMPLETE goes to stats only."""
         req = _make_request(complete_state=True, transmission_state=False)
-        assert _classify_termination(req, False, False, 1) == "stats_only"
+        assert _classify_termination(req, False, False, False) == "stats_only"
 
     def test_normal_path_skips_transmission_in_progress(self):
         """Without partial reuse, TRANS_IN_PROGRESS is skipped (still in flight)."""
         req = _make_request(complete_state=False, transmission_state=True)
-        assert _classify_termination(req, False, False, 1) == "skip"
+        assert _classify_termination(req, False, False, False) == "skip"
 
     def test_normal_path_terminates_regular_request(self):
         """Without partial reuse, a normal finished request is terminated."""
         req = _make_request(complete_state=False, transmission_state=False)
-        assert _classify_termination(req, False, False, 1) == "terminate"
+        assert _classify_termination(req, False, False, False) == "terminate"
 
     def test_partial_reuse_terminates_non_complete(self):
         """With partial reuse, non-CONTEXT_COMPLETE requests are terminated."""
         for complete, transmission in [(False, True), (False, False)]:
             req = _make_request(complete, transmission)
-            assert _classify_termination(req, True, False, 1) == "terminate"
+            assert _classify_termination(req, True, False, False) == "terminate"
+
+    def test_partial_reuse_early_terminate_is_pp1_only(self):
+        """Early termination of an in-transmission ctx request is a PP=1-only
+        optimization. Under PP>1 it is skipped here and terminated later via
+        the transfer-complete path (ring consensus); eager store still applies."""
+        req = _make_request(complete_state=False, transmission_state=True)
+        assert _classify_termination(req, True, False, False, pp_size=1) == "terminate"
+        req = _make_request(complete_state=False, transmission_state=True)
+        assert _classify_termination(req, True, False, False, pp_size=4) == "skip"
 
     def test_partial_reuse_skips_context_complete(self):
         """With partial reuse, CONTEXT_COMPLETE still goes to stats only."""
         req = _make_request(complete_state=True, transmission_state=False)
-        assert _classify_termination(req, True, False, 1) == "stats_only"
+        assert _classify_termination(req, True, False, False) == "stats_only"
 
     def test_partial_reuse_disabled_by_vswa(self):
         """VSWA disables partial reuse path, falling back to normal logic."""
-        req = _make_request(complete_state=True, transmission_state=False)
-        assert _classify_termination(req, True, True, 1) == "stats_only"
+        req = _make_request(complete_state=False, transmission_state=True)
+        assert _classify_termination(req, True, True, False) == "skip"
 
-    def test_partial_reuse_disabled_by_pp(self):
-        """PP > 1 disables partial reuse path, falling back to normal logic."""
-        req = _make_request(complete_state=True, transmission_state=False)
-        assert _classify_termination(req, True, False, 2) == "stats_only"
+    def test_partial_reuse_disabled_by_kv_manager_v2(self):
+        """KVCacheManagerV2 disables the eager-store path (no
+        store_blocks_for_reuse), falling back to normal logic."""
+        req = _make_request(complete_state=False, transmission_state=True)
+        assert _classify_termination(req, True, False, True) == "skip"
+
+    def test_pp_gt_1_terminates_on_transfer_complete(self):
+        """PP>1: the early path leaves the request out of requests_to_terminate
+        AND out of new_active_requests, so it is removed from active_requests
+        but retained by AsyncTransferManager. The real
+        _end_transfer_and_maybe_terminate must then terminate it exactly once
+        when the transfer completes (force_terminate_ctx_for_partial_reuse=False)."""
+        req = Mock()
+        executor = types.SimpleNamespace(
+            kv_cache_transceiver=Mock(),
+            active_requests=[],  # already removed by _handle_responses
+            async_transfer_manager=Mock(),
+            force_terminate_ctx_for_partial_reuse=False,
+            _terminate_request=Mock(),
+        )
+        executor.async_transfer_manager.end_transfer.return_value = True
+
+        PyExecutor._end_transfer_and_maybe_terminate(executor, req)
+
+        executor._terminate_request.assert_called_once_with(req)
+
+    def test_pp1_does_not_double_terminate_on_transfer_complete(self):
+        """PP=1: the early path already terminated the request (and removed it
+        from active_requests). The real _end_transfer_and_maybe_terminate must
+        skip re-terminating it (force_terminate_ctx_for_partial_reuse=True) to
+        avoid a double free_resources (nvbug/5961736)."""
+        req = Mock()
+        executor = types.SimpleNamespace(
+            kv_cache_transceiver=Mock(),
+            active_requests=[],  # already removed + terminated by early path
+            async_transfer_manager=Mock(),
+            force_terminate_ctx_for_partial_reuse=True,
+            _terminate_request=Mock(),
+        )
+        executor.async_transfer_manager.end_transfer.return_value = True
+
+        PyExecutor._end_transfer_and_maybe_terminate(executor, req)
+
+        executor._terminate_request.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

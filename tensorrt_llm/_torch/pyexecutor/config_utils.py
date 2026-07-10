@@ -52,14 +52,21 @@ def resolve_hf_torch_dtype(config):
     return None
 
 
-def resolve_mamba_ssm_cache_dtype(config):
-    """Return the dtype to use for hybrid Mamba/SSM cache allocations.
+def resolve_ssm_cache_dtype(config):
+    """Return the dtype to use for hybrid SSM-style state cache allocations.
 
-    Qwen3.5-style configs may store this field on the top-level config or the
-    nested text_config, and may call it either mamba_ssm_cache_dtype or
-    mamba_ssm_dtype. This helper centralizes that lookup so cache creation does
-    not fail later with a missing dtype. An "auto" value in any field is
-    treated the same as missing.
+    Covers all recurrent-state hybrids (Mamba SSM, Qwen3.5 GDN linear
+    attention); the "mamba" in the config field name is historical.
+    Qwen3.5-style configs may store the field on the top-level config or the
+    nested text_config. An "auto" value is treated the same as missing.
+
+    Only the explicit mamba_ssm_cache_dtype field is honored here. The
+    checkpoint's mamba_ssm_dtype field expresses the SSM *compute* dtype
+    intent, not the cache dtype: honoring it for cache allocation silently
+    switches Qwen3.5 GDN state caches to fp32, which disables the FlashInfer
+    bf16-state decode kernel and doubles state memory traffic (~20% serving
+    throughput loss). Users can opt in explicitly via
+    kv_cache_config.mamba_ssm_cache_dtype.
     """
     configs = [config]
     text_config = getattr(config, "text_config", None)
@@ -67,10 +74,10 @@ def resolve_mamba_ssm_cache_dtype(config):
         configs.append(text_config)
 
     for candidate_config in configs:
-        for attr in ("mamba_ssm_cache_dtype", "mamba_ssm_dtype"):
-            coerced = _coerce_torch_dtype(getattr(candidate_config, attr, None))
-            if coerced is not None:
-                return coerced
+        coerced = _coerce_torch_dtype(
+            getattr(candidate_config, "mamba_ssm_cache_dtype", None))
+        if coerced is not None:
+            return coerced
     return None
 
 
@@ -307,7 +314,7 @@ def extract_mamba_kv_cache_params(
         mamba_ssm_cache_dtype = _coerce_torch_dtype(
             quant_config.mamba_ssm_cache_dtype)
     if mamba_ssm_cache_dtype is None:
-        mamba_ssm_cache_dtype = (resolve_mamba_ssm_cache_dtype(config)
+        mamba_ssm_cache_dtype = (resolve_ssm_cache_dtype(config)
                                  or resolve_hf_torch_dtype(config)
                                  or torch.bfloat16)
 
@@ -418,10 +425,24 @@ def load_pretrained_config(model_name_or_path: str,
             and architectures[0] == "Qwen3_5MoeForConditionalGeneration"))):
         # Qwen3.5-MoE VLM: HF native composite config + model-side normalizer.
         from tensorrt_llm._torch.models.modeling_qwen3_5 import \
-            _normalize_qwen35_moe_vl_config
+            _normalize_qwen35_vl_config
         model_config = transformers.Qwen3_5MoeConfig.from_pretrained(
             model_name_or_path, **kwargs)
-        _normalize_qwen35_moe_vl_config(model_config)
+        _normalize_qwen35_vl_config(model_config,
+                                    inner_arch="Qwen3_5MoeForCausalLM")
+    elif (model_type == "qwen3_5" and
+          (("text_config" in config_dict and "vision_config" in config_dict) or
+           (architectures
+            and architectures[0] == "Qwen3_5ForConditionalGeneration"))):
+        # Qwen3.5 dense VLM: HF native composite config + model-side normalizer.
+        # Must precede the text-only `qwen3_5` branch below so the composite
+        # config isn't flattened and vision_config dropped.
+        from tensorrt_llm._torch.models.modeling_qwen3_5 import \
+            _normalize_qwen35_vl_config
+        model_config = transformers.Qwen3_5Config.from_pretrained(
+            model_name_or_path, **kwargs)
+        _normalize_qwen35_vl_config(model_config,
+                                    inner_arch="Qwen3_5ForCausalLM")
     elif model_type in _CONFIG_REGISTRY:
         config_class = _CONFIG_REGISTRY[model_type]
         model_config = config_class.from_pretrained(model_name_or_path,

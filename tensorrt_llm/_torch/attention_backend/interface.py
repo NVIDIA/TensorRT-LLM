@@ -27,7 +27,7 @@ from ..pyexecutor.mamba_cache_manager import BaseMambaCacheManager
 from ..pyexecutor.resource_manager import KVCacheManager
 from ..pyexecutor.trace_log_utils import log_tensor_size
 from ..utils import get_model_extra_attrs
-from .sparse.params import SparseMetadataParams
+from .sparse.params import SkipSoftmaxKernelParams, SparseMetadataParams
 
 try:
     # Transformers v5
@@ -938,6 +938,13 @@ class AttentionForwardArgs:
     mla_bmm1_scale: Optional[torch.Tensor] = None
     mla_bmm2_scale: Optional[torch.Tensor] = None
     quant_q_buffer: Optional[torch.Tensor] = None
+    # Per-tensor FP8 scale (fp32 [1]) for the fused DSv4 FP8-Q-quant path.
+    # When non-None alongside `quant_q_buffer`, the C++ op skips
+    # `quantizeCopyInputToFp8Kernel`.
+    quant_scale_qkv: Optional[torch.Tensor] = None
+
+    dsv4_inv_rope_cos_sin_cache: Optional[torch.Tensor] = None
+    enable_dsv4_epilogue_fusion: bool = False
 
     sage_attn_num_elts_per_blk_q: int = 0
     sage_attn_num_elts_per_blk_k: int = 0
@@ -953,6 +960,8 @@ class AttentionForwardArgs:
 
     sparse_prediction: SparsePrediction = field(
         default_factory=SparsePrediction)
+    skip_softmax_kernel_params: SkipSoftmaxKernelParams = field(
+        default_factory=SkipSoftmaxKernelParams)
 
     @property
     def mask_type(self) -> int:
