@@ -99,6 +99,33 @@ def test_model(client: openai.OpenAI, model_name: str):
     assert model.id == model_name.split('/')[-1]
 
 
+def test_tokenize(server: RemoteOpenAIServer):
+    tokenize_url = server.url_for("_internal", "tokenize")
+
+    # prompt path: encode raw text directly.
+    prompt_resp = requests.post(tokenize_url, json={"prompt": "Hello, world!"})
+    assert prompt_resp.status_code == 200
+    prompt_body = prompt_resp.json()
+    assert prompt_body["count"] == len(prompt_body["tokens"]) > 0
+
+    # messages path: goes through the chat template, so it wraps the content
+    # and yields at least as many tokens as the bare prompt.
+    messages_resp = requests.post(
+        tokenize_url,
+        json={"messages": [{
+            "role": "user",
+            "content": "Hello, world!"
+        }]})
+    assert messages_resp.status_code == 200
+    messages_body = messages_resp.json()
+    assert messages_body["count"] == len(messages_body["tokens"])
+    assert messages_body["count"] >= prompt_body["count"]
+
+    # exactly one of prompt/messages is required; FastAPI rejects an empty
+    # body at request-model validation (422) before the handler runs.
+    assert requests.post(tokenize_url, json={}).status_code == 422
+
+
 @pytest.mark.parametrize("use_beam_search", [False, True])
 # reference: https://github.com/vllm-project/vllm/blob/44f990515b124272f87954fc763d90697d8aa1db/tests/entrypoints/openai/test_basic.py#L123
 @pytest.mark.asyncio
