@@ -235,9 +235,34 @@ def _visual_gen_deps(llm_venv):
     """Install av + diffusers + ffmpeg once per session (shared by all video-gen fixtures)."""
     llm_venv.run_cmd(["-m", "pip", "install", "av"])
     llm_venv.run_cmd(["-m", "pip", "install", "diffusers>=0.37.0"])
-    # Install ffmpeg system package required by save_video() for MP4 encoding
-    check_call(["apt-get", "update", "-y"], shell=False)
-    check_call(["apt-get", "install", "-y", "ffmpeg"], shell=False)
+    _ensure_ffmpeg_available(llm_venv)
+
+
+def _ensure_ffmpeg_available(llm_venv):
+    """Put an ffmpeg binary on PATH for save_video()'s MP4 encoder.
+
+    Unprivileged CI containers (LOCAL_USER=1) fail apt-get with exit 100 on
+    /var/lib/apt/lists/partial; fall back to the imageio-ffmpeg wheel, which
+    bundles a static libx264-enabled ffmpeg 7.x binary needing no root.
+    """
+    if shutil.which("ffmpeg"):
+        return
+
+    try:
+        check_call(["apt-get", "update", "-y"], shell=False)
+        check_call(["apt-get", "install", "-y", "ffmpeg"], shell=False)
+    except subprocess.CalledProcessError:
+        llm_venv.run_cmd(["-m", "pip", "install", "imageio-ffmpeg"])
+        import imageio_ffmpeg
+
+        target_dir = os.path.expanduser("~/.local/bin")
+        os.makedirs(target_dir, exist_ok=True)
+        target = os.path.join(target_dir, "ffmpeg")
+        if os.path.lexists(target):
+            os.remove(target)
+        os.symlink(imageio_ffmpeg.get_ffmpeg_exe(), target)
+
+    assert shutil.which("ffmpeg"), "ffmpeg install did not put a binary on PATH"
 
 
 @pytest.fixture(scope="session")
