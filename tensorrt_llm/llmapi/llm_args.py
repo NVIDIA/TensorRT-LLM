@@ -2488,10 +2488,11 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         default="auto",
         description=
         "The data type to use for the KV cache. 'auto' (default) follows the checkpoint's own "
-        "quantization metadata, leaving quant_config.kv_cache_quant_algo untouched. 'fp8' or "
+        "quantization metadata: if quant_config.kv_cache_quant_algo is unset it may be populated "
+        "from the checkpoint, while an explicitly configured value is preserved. 'fp8' or "
         "'nvfp4' override it, setting quant_config.kv_cache_quant_algo to that KV-cache "
         "quantization algorithm. Applied at LLM construction time, including via "
-        "trtllm-serve --extra_llm_api_options.")
+        "trtllm-serve --config.")
 
     # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
     mamba_ssm_cache_dtype: Literal[
@@ -2810,7 +2811,8 @@ class BaseLlmArgs(StrictBaseModel):
         "The data type to use for the model. 'auto' (default) infers the dtype from the "
         "checkpoint: the HF config's 'torch_dtype' (or the deprecated 'dtype' field), falling "
         "back to 'bfloat16' when the checkpoint specifies none. Any other value must be a valid "
-        "torch dtype string (e.g. 'float16', 'bfloat16') and forces that dtype."
+        "torch dtype string (e.g. 'float16', 'bfloat16') and forces that dtype. On GPUs with "
+        "compute capability below 8.0 (pre-Ampere), 'auto' resolves to 'float16'."
     )
 
     revision: Optional[str] = Field(
