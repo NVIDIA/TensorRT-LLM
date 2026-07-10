@@ -458,8 +458,10 @@ class MambaForCausalLM(PretrainedModel):
 
         if use_preloading:
             # hf_model_dir is unset on the preload path; use the already
-            # provided model directly.
-            weights = convert_hf_mamba(hf_model, dtype)
+            # provided model directly. Use the config's resolved dtype since
+            # convert_hf_mamba expects a concrete torch dtype name (the
+            # incoming dtype may still be 'auto').
+            weights = convert_hf_mamba(hf_model, config.dtype)
         elif not os.path.exists(hf_model_dir):
             hf_model = AutoModelForCausalLM.from_pretrained(
                 hf_model_dir, dtype="auto", trust_remote_code=True)
