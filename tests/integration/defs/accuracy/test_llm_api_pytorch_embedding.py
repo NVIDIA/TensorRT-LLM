@@ -55,7 +55,7 @@ OUTPUT_NAME = "last_token_hidden_state"
 
 EMBEDDING_MODELS = [
     pytest.param(
-        f"{llm_models_root()}/qwen3-embedding-8b",
+        f"{llm_models_root()}/Qwen3/Qwen3-Embedding-8B",
         {"score_tol": 0.02, "cos_tol": 0.99},
         marks=pytest.mark.skip_less_device_memory(32000),
         id="qwen3-embedding-8b-bf16",
