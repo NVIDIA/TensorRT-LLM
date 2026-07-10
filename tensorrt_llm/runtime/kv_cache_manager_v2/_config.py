@@ -218,7 +218,7 @@ class KVCacheManagerConfig:
     User-provided initial memory partitioning between pool groups. When set, this
     takes precedence over typical_step and constraints for initial sizing.
     """
-    
+
     swa_scratch_reuse: SwaScratchReuseConfig | None = None
     """
     When set, SWA layers reuse physical pages for out-of-window blocks during prefill.
