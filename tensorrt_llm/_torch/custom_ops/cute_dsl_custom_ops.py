@@ -8311,8 +8311,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             return cached
 
         @staticmethod
-        def get_default_split_kv(B: int, S: int,
-                                 max_active_blocks: int) -> int:
+        def get_default_split_kv(B: int, S: int, max_active_blocks: int) -> int:
             max_split_kv = 32
             blocks_per_batch = max(1, max_active_blocks // B // (S * 2))
             split_kv = min(blocks_per_batch, max_split_kv)
@@ -8365,8 +8364,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             # Then the workspace address of previously captured graph will be invalid.
             # So we need to return the max workspace size for all batch sizes.
 
-            return  2 * H * (max_active_blocks // 2) * (D + 1) * acc_dtype.width // 8
-
+            return 2 * H * (max_active_blocks // 2) * (D +
+                                                       1) * acc_dtype.width // 8
 
         def get_valid_tactics(
             self,
@@ -8554,8 +8553,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             mma_qk_tiler_mn = (128, 128)
             mma_pv_tiler_mn = (128, 256)
             max_active_blocks = self._get_max_active_blocks()
-            split_kv = self.get_default_split_kv(
-                batch_size, self.seq_len_q, max_active_blocks)
+            split_kv = self.get_default_split_kv(batch_size, self.seq_len_q,
+                                                 max_active_blocks)
             is_persistent = self.get_default_is_persistent(batch_size)
             return (mma_qk_tiler_mn, mma_pv_tiler_mn, split_kv, is_persistent)
 
