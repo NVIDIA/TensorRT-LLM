@@ -3147,14 +3147,11 @@ class DSACacheManager(KVCacheManager):
         # allocates the pool with this smaller stride when the flag is set.
         self.use_fp4 = sparse_params.indexer_k_dtype == "fp4"
 
-        # The FlashInfer attention backend reads the main latent pool as
-        # inline-scale pages (see inline_scale_kv.py): a fixed 656 bytes per
-        # token instead of head_dim (576) elements of the declared KV dtype.
-        # Both BF16- and FP8-declared checkpoints land in the same physical
-        # layout — inline-scale IS this path's fp8-KV realization (per-tile
-        # scales) — so only the head_dim carrying the byte budget differs.
-        # The creation site passes `attn_backend` explicitly (`model_config`
-        # is the base manager's C++ ModelConfig parameter of the same name).
+        # The FlashInfer backend reads the main latent pool as inline-scale
+        # pages (inline_scale_kv.py): a fixed 656 bytes per token regardless
+        # of the declared KV dtype, carried through head_dim as a byte
+        # budget. The creation site passes `attn_backend` explicitly
+        # (`model_config` is the base manager's C++ ModelConfig parameter).
         attn_backend = kwargs.pop("attn_backend", None)
         self._kv_token_layout = ("inline_scale"
                                  if attn_backend == "FLASHINFER" else "native")

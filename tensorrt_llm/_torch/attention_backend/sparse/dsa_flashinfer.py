@@ -21,11 +21,6 @@ only the attention call and the KV append:
   auto-dispatches its decode fast path (<= 64 query tokens) vs the prefill
   orchestrator, and ``-1`` index padding carries the per-token top-k
   semantics the indexer already emits.
-
-The indexer path — fp8 K-cache write, ``fp8_paged_mqa_logits``, top-k
-selection — is untouched: it is shared Python/DeepGEMM code, which is what
-makes this backend a faithful testbed for indexer-side defects reported on
-other SMs.
 """
 
 import math
@@ -51,14 +46,11 @@ def _sparse_mla_op():
 def _inline_scale_pool_paged(metadata: DSAtrtllmAttentionMetadata) -> torch.Tensor:
     """Whole-pool uint8 view [num_pages, page_size, 656] anchored at slot 0.
 
-    The global slot ids from ``convert_req_index_to_global`` address
-    ``tokens_per_block``-token rows of the layer-interleaved primary pool
-    (page ordinal = block * num_layers + layer), so a flat page view over the
-    same memory serves every layer. Cached on the metadata object keyed by
-    the cache manager's identity: pool addresses are constant for a
-    manager's lifetime, but a metadata object that outlives a manager swap
-    (KV-cache estimation builds a throwaway manager) must not serve views
-    into the old manager's freed pool.
+    Global slot ids from ``convert_req_index_to_global`` address pages of the
+    layer-interleaved primary pool (page ordinal = block * num_layers +
+    layer), so one flat view serves every layer. Keyed by the manager's
+    identity: a metadata object can outlive a manager swap (KV-cache
+    estimation builds a throwaway manager) and must not serve stale views.
     """
     manager = metadata.kv_cache_manager
     cached = getattr(metadata, "_inline_scale_pool", None)
@@ -99,9 +91,8 @@ class DSAFlashInferAttention(DSATrtllmAttention):
         """Quantize the new latent rows and scatter them into the main pool.
 
         Write slots come from the same ``convert_req_index_to_global`` op the
-        top-k conversion uses — each token's own absolute position converts
-        to its global pool slot, so the write and read sides share one
-        currency by construction.
+        top-k conversion uses, fed each token's own position — write and read
+        sides share one slot currency by construction.
         """
         metadata._ensure_pool_view_cached()
         positions = metadata.token_positions_cuda[start_idx:end_idx]
@@ -209,9 +200,7 @@ class DSAFlashInferAttention(DSATrtllmAttention):
         if num_tokens <= 64:
             # Split-K scratch must be initialized: per-token top-k truncation
             # can leave splits the kernel never writes, and the merge reads
-            # every split slot. A -inf LSE makes an unwritten split
-            # weightless; uninitialized scratch was a decode nondeterminism
-            # source in the DSv4 sibling backend.
+            # every split slot. A -inf LSE makes an unwritten split weightless.
             num_splits = (topk + _KV_SPLIT_TILE - 1) // _KV_SPLIT_TILE
             mid_out = torch.zeros(
                 num_tokens,
@@ -231,10 +220,9 @@ class DSAFlashInferAttention(DSATrtllmAttention):
             mid_out = None
             mid_lse = None
 
-        # Absorption preserves the pre-absorption inner-product scale: use the
-        # per-head qk width (nope + rope), NOT the absorbed latent width the
-        # backend's head_dim carries — they coincide for DSv4 (512) but differ
-        # for DSA geometries (GLM: 256 vs 576).
+        # The softmax scale uses the per-head qk width, not the absorbed
+        # latent width in self.head_dim — they coincide for DSv4 (512) but
+        # differ here (GLM: 256 vs 576).
         qk_head_dim = (self.mla_params.qk_nope_head_dim +
                        self.mla_params.qk_rope_head_dim)
         sm_scale = 1.0 / (self.q_scaling * math.sqrt(qk_head_dim))
