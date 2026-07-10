@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
@@ -75,6 +78,50 @@ function setupDeepSeekNvfp4() {
 test("selector exports a pure view-model helper for compatibility logic", () => {
   const selector = loadSelectorExports();
   assert.equal(typeof selector.createSelectorViewModel, "function");
+});
+
+test("selector builds a validated TensorRT-LLM commit link", () => {
+  const selector = loadSelectorExports();
+  const commit = "93cb6518b6d6dbd6095748189e626db731f44545";
+  assert.equal(
+    selector.validatedCommitUrl(commit),
+    `https://github.com/NVIDIA/TensorRT-LLM/commit/${commit}`
+  );
+  assert.equal(selector.validatedCommitUrl("not-a-commit"), "");
+});
+
+test("selector resolves same-concurrency conflicts by explicit profile", () => {
+  const selector = loadSelectorExports();
+  const entries = ["latency", "balanced", "throughput"].map((profile) => ({
+    model: "example/model",
+    gpu: "B200_NVL",
+    gpu_display: "8xB200_NVL",
+    num_gpus: 8,
+    isl: 1024,
+    osl: 1024,
+    concurrency: 256,
+    profile,
+    performance_profile: profile,
+    config_path: `${profile}.yaml`,
+    command: profile,
+  }));
+  const baseState = {
+    model: "example/model",
+    topology: "8|B200_NVL",
+    islOsl: "1024|1024",
+    concurrency: "256",
+  };
+
+  const unresolved = selector.createSelectorViewModel(entries, {}, baseState);
+  assert.equal(unresolved.finalEntries.length, 3);
+  assert.match(unresolved.message, /Available Profile options/);
+
+  const resolved = selector.createSelectorViewModel(entries, {}, {
+    ...baseState,
+    profile: "balanced",
+  });
+  assert.equal(resolved.finalEntries.length, 1);
+  assert.equal(resolved.resolvedEntry.profile, "balanced");
 });
 
 test("selector keeps both 4x and 8x B200 topologies visible for DeepSeek NVFP4", () => {
