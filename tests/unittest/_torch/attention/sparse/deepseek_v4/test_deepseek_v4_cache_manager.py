@@ -189,6 +189,7 @@ def _build_deepseek_v4_cache_config_for_test(
     max_seq_len: int = 1024,
     max_num_tokens: int | None = 2048,
     max_draft_len: int = 0,
+    max_cuda_graph_batch_size: int | None = None,
 ):
     cache_manager = object.__new__(DeepseekV4CacheManager)
     cache_manager.pp_layers = [0, 1, 2]
@@ -196,6 +197,7 @@ def _build_deepseek_v4_cache_config_for_test(
     cache_manager._swa_window_size = 128
     cache_manager._max_draft_len = max_draft_len
     cache_manager._max_num_tokens = max_num_tokens
+    cache_manager._max_cuda_graph_batch_size = max_cuda_graph_batch_size
     cache_manager.compressed_block_sizes = [128, 32, 1]
     cache_manager.index_head_dim = 128
     cache_manager.head_dim = 512
@@ -216,13 +218,95 @@ def _build_deepseek_v4_cache_config_for_test(
     )
 
 
-def test_deepseek_v4_pool_ratio_overrides_typical_step_and_constraints():
+def test_deepseek_v4_pool_ratio_overrides_typical_step_but_keeps_constraints():
+    """pool_ratio replaces the typical_step-derived ratio, but the warmup
+    constraints must still be built: they are feasibility floors, and dropping
+    them lets a tight quota (the KV-estimation temporary pool) starve a pool
+    group so CUDA-graph warmup silently skips batch sizes (DSV4-Pro OOM)."""
     config = _build_deepseek_v4_cache_config_for_test(
         KvCacheConfig(pool_ratio=[0.2, 0.3, 0.5], avg_seq_len=256)
     )
 
     assert config.initial_pool_ratio == [0.2, 0.3, 0.5]
     assert config.typical_step is None
+    assert len(config.constraints) == 2
+    assert config.constraints[0].kv_caches[0].capacity == 1024
+    assert config.constraints[0].kv_caches[0].history_length == 1023
+
+
+def test_deepseek_v4_constraints_cover_cuda_graph_warmup_batch():
+    """Constraint 1 must describe the whole CUDA-graph warmup batch: one
+    decode request at max_seq_len plus minimal decode requests matching
+    _create_cuda_graph_warmup_request's dummy batch. When the real graph
+    batch size is unknown, it falls back to max_batch_size."""
+    max_batch_size = 4
+    max_draft_len = 2
+    config = _build_deepseek_v4_cache_config_for_test(
+        KvCacheConfig(),
+        max_batch_size=max_batch_size,
+        max_seq_len=1024,
+        max_num_tokens=2048,
+        max_draft_len=max_draft_len,
+    )
+
+    warmup = config.constraints[0].kv_caches
+    assert len(warmup) == max_batch_size
+    assert warmup[0].capacity == 1024
+    assert warmup[0].history_length == 1023
+    # num_extra_kv_tokens is 0 in this fixture.
+    assert all(kv.capacity == 1 + max_draft_len for kv in warmup[1:])
+    assert all(kv.history_length == 0 for kv in warmup[1:])
+
+
+def test_deepseek_v4_warmup_floor_shrinks_to_actual_graph_batch():
+    """With max(cuda_graph_batch_sizes) far below max_batch_size, the warmup
+    floor must size to the real graph batch — an unconditional
+    max_batch_size floor would force pool allocations (and quota bumps) for
+    a warmup that never runs."""
+    config = _build_deepseek_v4_cache_config_for_test(
+        KvCacheConfig(),
+        max_batch_size=128,
+        max_seq_len=1024,
+        max_num_tokens=2048,
+        max_cuda_graph_batch_size=4,
+    )
+
+    warmup = config.constraints[0].kv_caches
+    assert len(warmup) == 4
+    assert warmup[0].capacity == 1024
+
+
+def test_deepseek_v4_no_warmup_floor_when_graphs_disabled():
+    """CUDA graphs disabled (max_cuda_graph_batch_size=0): the generation
+    graph warmup never runs, and no other warmup creates a max_seq_len-long
+    request, so the constraint must be dropped entirely — keeping even the
+    single full-length request would floor (and possibly bump) the quota for
+    a warmup that will not happen. Only the chunked-prefill constraint
+    remains."""
+    max_num_tokens = 2048
+    config = _build_deepseek_v4_cache_config_for_test(
+        KvCacheConfig(),
+        max_batch_size=128,
+        max_seq_len=1024,
+        max_num_tokens=max_num_tokens,
+        max_cuda_graph_batch_size=0,
+    )
+
+    assert len(config.constraints) == 1
+    prefill = config.constraints[0].kv_caches
+    assert len(prefill) == 1
+    # num_extra_kv_tokens is 0 in this fixture.
+    assert prefill[0].capacity == max_num_tokens
+    assert prefill[0].history_length == 0
+
+    # Without a chunked-prefill budget either, no constraints remain at all.
+    config = _build_deepseek_v4_cache_config_for_test(
+        KvCacheConfig(),
+        max_batch_size=128,
+        max_seq_len=1024,
+        max_num_tokens=None,
+        max_cuda_graph_batch_size=0,
+    )
     assert config.constraints == []
 
 

@@ -1799,6 +1799,12 @@ def _create_kv_cache_manager(
     manager_extra_kwargs = {}
     if issubclass(kv_cache_manager_cls, KVCacheManagerV2):
         manager_extra_kwargs["enable_stats"] = enable_kv_cache_stats
+        # Lets the manager size its warmup-batch feasibility floor by the
+        # CUDA-graph warmup the engine will actually run (0 = graphs
+        # disabled, None = unknown).
+        manager_extra_kwargs["max_cuda_graph_batch_size"] = (
+            model_engine._max_cuda_graph_batch_size
+            if model_engine is not None else None)
 
     if is_mla(config):
         kv_cache_manager = kv_cache_manager_cls(
@@ -1814,6 +1820,7 @@ def _create_kv_cache_manager(
             dtype=kv_cache_dtype,
             spec_config=spec_config,
             vocab_size=config.vocab_size,
+            max_num_tokens=max_num_tokens,
             max_beam_width=max_beam_width,
             is_draft=is_draft,
             kv_connector_manager=kv_connector_manager

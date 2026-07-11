@@ -204,7 +204,11 @@ class KVCacheManagerConfig:
 
     constraints: list[BatchDesc] = field(default_factory=list)
     """
-    A list of step configurations that must always be supported.
+    A list of step configurations that must always be supported. They act as
+    feasibility floors: every pool group is guaranteed at least the slots these
+    batches need, scaled by 1/max_util_for_resume so the last request of a
+    constraint batch still passes resume's utilization gate. The floors apply
+    even when initial_pool_ratio is set.
     """
 
     typical_step: BatchDesc | None = None
@@ -216,7 +220,9 @@ class KVCacheManagerConfig:
     initial_pool_ratio: list[float] | None = None
     """
     User-provided initial memory partitioning between pool groups. When set, this
-    takes precedence over typical_step and constraints for initial sizing.
+    replaces the typical_step-derived ratio and decides how quota beyond the
+    constraint floors is split; constraints still clamp each pool group up to its
+    minimum feasible size.
     """
 
     swa_scratch_reuse: SwaScratchReuseConfig | None = None

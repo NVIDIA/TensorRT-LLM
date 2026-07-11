@@ -219,6 +219,7 @@ class StorageManager:
         constraints: list[BatchDesc] | None = None,
         initial_pool_ratio: list[float] | None = None,
         event_manager: "KVCacheEventManager | None" = None,
+        max_util_for_resume: float = 1.0,
     ) -> None:
         self.__rawref__ = rawref.NULL
         self._event_manager = event_manager
@@ -243,9 +244,17 @@ class StorageManager:
         gpu_quota = config.cache_tiers[GPU_LEVEL].quota
         gpu_granularity = CacheLevelManager.cache_tier_granularity(CacheTier.GPU_MEM, gpu_quota)
 
-        constraints_for_min_slots = [] if initial_pool_ratio is not None else constraints or []
+        # Constraints are feasibility floors and apply even when an explicit
+        # initial_pool_ratio is provided: the ratio drives how excess quota is
+        # split, but must not shrink a pool group below what the declared
+        # batches (e.g. the CUDA-graph warmup batch) need — with a tight quota
+        # (such as the KV-estimation temporary pool) a pure ratio split can
+        # starve one pool group while others hold unused excess. The floors
+        # are scaled by 1/max_util_for_resume because _KVCache.resume rejects
+        # any pool group above that utilization, so a constraint batch only
+        # runs if its slots stay below the utilization gate.
         self._min_slots = self._compute_min_slots_from_constraints(
-            constraints_for_min_slots, tokens_per_block, swa_scratch_reuse
+            constraints or [], tokens_per_block, swa_scratch_reuse, max_util_for_resume
         )
 
         # Compute init_ratio from explicit config, typical_batch, constraints, or fallback.
@@ -901,11 +910,23 @@ class StorageManager:
         constraints: list[BatchDesc],
         tokens_per_block: int,
         swa_scratch_reuse: SwaScratchReuseConfig | None,
+        max_util_for_resume: float = 1.0,
     ) -> TypedIndexList[PoolGroupIndex, int]:
         """Compute the minimum slots per pool group across all constraints (element-wise max).
 
-        All returned elements are positive.
+        All returned elements are positive. Constraint-derived counts are
+        scaled by 1/max_util_for_resume so the last request of a constraint
+        batch still passes _KVCache.resume's utilization gate when the batch
+        fully occupies its floor.
         """
+        # The gate only binds for values in (0, 1): with 0 (permitted by the
+        # llmapi field) only the first resume of an empty pool passes and
+        # every later one is rejected, so no finite floor helps; values >= 1
+        # never trigger since utilization cannot exceed 1. Scale floors only
+        # in the binding range so 0 doesn't divide by zero and >1 doesn't
+        # shrink floors.
+        if not 0 < max_util_for_resume < 1:
+            max_util_for_resume = 1.0
         max_slots = filled_list(0, self.num_pool_groups)
 
         def swa_floor_blocks(lc: AttnLifeCycle) -> int:
@@ -931,7 +952,8 @@ class StorageManager:
         for batch in constraints:
             slots = self._compute_slots_for_batch(batch, tokens_per_block, swa_scratch_reuse)
             for pg_idx in typed_range(self.num_pool_groups):
-                max_slots[pg_idx] = max(max_slots[pg_idx], slots[pg_idx])
+                scaled = math.ceil(slots[pg_idx] / max_util_for_resume)
+                max_slots[pg_idx] = max(max_slots[pg_idx], scaled)
         return max_slots
 
     def _compute_slots_for_batch(

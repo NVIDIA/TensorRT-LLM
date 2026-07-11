@@ -477,3 +477,69 @@ def test_kv_manager_int_max_seq_len_stays_int_through_util_expression():
         "Sanity check: the pre-fix float path must still be demonstrable "
         "in the test, otherwise this regression guard is hollow."
     )
+
+
+# ---------------------------------------------------------------------------
+# _create_kv_cache_manager: MLA branch must forward max_num_tokens
+# ---------------------------------------------------------------------------
+
+
+def test_mla_branch_forwards_max_num_tokens_to_manager() -> None:
+    """The is_mla branch of ``_create_kv_cache_manager`` must pass
+    ``max_num_tokens`` to the manager, like the generic branch does.
+
+    Regression guard: when the argument is dropped,
+    ``DeepseekV4CacheManager._max_num_tokens`` stays ``None`` and the
+    profiling-phase context extra quota is sized by the full ``max_tokens``
+    estimate instead of the runtime chunk size (observed as a 27.59 GiB vs
+    11.92 GiB temp-quota inflation on DeepSeek-V4-Pro, raising peak memory
+    and OOM risk during KV cache estimation).
+    """
+    import torch
+
+    from tensorrt_llm._torch.pyexecutor._util import _create_kv_cache_manager
+
+    captured_kwargs = {}
+
+    class _RecordingManager:
+        def __init__(self, *args, **kwargs) -> None:
+            captured_kwargs.update(kwargs)
+
+    # Minimal MLA pretrained config: is_mla() keys on kv_lora_rank and
+    # qk_rope_head_dim being set.
+    pretrained = SimpleNamespace(
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+        hidden_size=1024,
+        num_attention_heads=8,
+        num_key_value_heads=8,
+        num_hidden_layers=2,
+        vocab_size=32000,
+    )
+    model_config = Mock()
+    model_config.pretrained_config = pretrained
+    model_config.quant_config = None
+
+    _create_kv_cache_manager(
+        model_engine=None,
+        kv_cache_manager_cls=_RecordingManager,
+        mapping=Mock(),
+        kv_cache_config=KvCacheConfig(),
+        tokens_per_block=32,
+        max_seq_len=2048,
+        max_batch_size=8,
+        spec_config=None,
+        sparse_attention_config=None,
+        max_num_tokens=333,
+        max_beam_width=1,
+        kv_connector_manager=None,
+        model_config=model_config,
+        dtype=torch.bfloat16,
+        is_draft=False,
+    )
+
+    assert captured_kwargs.get("max_num_tokens") == 333, (
+        "is_mla branch dropped max_num_tokens: DeepseekV4CacheManager then "
+        "falls back to _max_num_tokens=None and over-sizes the estimation "
+        "temp quota."
+    )

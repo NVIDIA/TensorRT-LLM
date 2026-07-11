@@ -17,6 +17,7 @@ import functools
 import gc
 import hashlib
 import itertools
+import math
 import os
 import random
 import time
@@ -2040,10 +2041,14 @@ class TestInitRatioConfig(unittest.TestCase):
         mgr_unconstrained.shutdown()
         mgr_constrained.shutdown()
 
-    def test_initial_pool_ratio_overrides_typical_step_and_constraints(self):
-        """Explicit initial_pool_ratio takes precedence over inferred sizing inputs."""
+    def test_initial_pool_ratio_overrides_typical_step(self):
+        """Explicit initial_pool_ratio takes precedence over typical_step.
+
+        A constraint whose floors are far below the ratio shares does not
+        disturb the requested split.
+        """
         typical = BatchDesc(kv_caches=[KVCacheDesc(capacity=4096, history_length=4000)] * 32)
-        constraint = BatchDesc(kv_caches=[KVCacheDesc(capacity=256, history_length=128)] * 256)
+        constraint = BatchDesc(kv_caches=[KVCacheDesc(capacity=64, history_length=32)])
         cfg = self._make_config(
             typical_step=typical,
             constraints=[constraint],
@@ -2054,6 +2059,115 @@ class TestInitRatioConfig(unittest.TestCase):
 
         self.assertGreater(ratio[0], ratio[1])
         self.assertAlmostEqual(sum(ratio), 1.0, places=6)
+        manager.shutdown()
+
+    def test_initial_pool_ratio_respects_constraint_floors(self):
+        """Constraints stay feasibility floors under explicit initial_pool_ratio.
+
+        A ratio share below what a declared batch needs in some pool group is
+        clamped up to the constraint minimum.
+
+        Regression guard for the DSV4-Pro KV-estimation warmup starvation:
+        pool_ratio used to disable constraint floors entirely, so a tight
+        estimation quota starved the ageless pool group and CUDA-graph warmup
+        silently skipped batch sizes.
+
+        The floors must additionally be scaled by 1/max_util_for_resume:
+        _KVCache.resume rejects any pool group above that utilization, so a
+        batch that exactly fills an unscaled floor fails its last resume
+        (observed as a 32-request warmup batch failing at request 32 with a
+        32-slot pool group at 31/32 = 97% utilization).
+        """
+        granularity = 2 << 20
+        num_requests = 8
+        capacity = 512
+        tpb = self.TOKENS_PER_BLOCK
+        total_blocks = div_up(capacity, tpb)
+        # history_length=0: no stale blocks in either pool group.
+        slots_pg0 = num_requests * total_blocks
+        slots_pg1 = num_requests * total_blocks
+        constraint = BatchDesc(
+            kv_caches=[KVCacheDesc(capacity=capacity, history_length=0)] * num_requests
+        )
+
+        # Quota exactly covers the unscaled floors; the skewed ratio alone
+        # would give PG1 a small fraction of its floor, and the utilization
+        # scaling must push both pool groups above the raw batch need.
+        pg0_bytes = round_up(slots_pg0 * self.PG0_SLOT_SIZE, granularity)
+        pg1_bytes = round_up(slots_pg1 * self.PG1_SLOT_SIZE, granularity)
+        cfg = self._make_config(
+            gpu_quota=pg0_bytes + pg1_bytes,
+            constraints=[constraint],
+            initial_pool_ratio=[0.9, 0.1],
+        )
+        floor_pg0 = math.ceil(slots_pg0 / cfg.max_util_for_resume)
+        floor_pg1 = math.ceil(slots_pg1 / cfg.max_util_for_resume)
+        assert floor_pg1 > slots_pg1, "utilization scaling must be observable"
+        manager = KVCacheManager(cfg)
+        stats = manager._storage.get_statistics()
+        self.assertGreaterEqual(
+            stats[0].total,
+            floor_pg0,
+            f"Pool group 0 must have >= {floor_pg0} slots so the constraint "
+            f"batch passes resume's utilization gate",
+        )
+        self.assertGreaterEqual(
+            stats[1].total,
+            floor_pg1,
+            f"Pool group 1 must have >= {floor_pg1} slots so the constraint "
+            f"batch passes resume's utilization gate",
+        )
+        manager.shutdown()
+
+    def test_small_constraint_floors_do_not_inflate_quota(self):
+        """Floors below the ratio shares must leave the tier quota untouched.
+
+        Guards the graphs-disabled path: when the generation-graph warmup
+        constraint is dropped, the remaining small constraints must not bump
+        the requested quota or disturb the explicit ratio split.
+        """
+        gpu_quota = 128 << 20
+        tiny = BatchDesc(kv_caches=[KVCacheDesc(capacity=64, history_length=0)])
+        cfg = self._make_config(
+            gpu_quota=gpu_quota,
+            constraints=[tiny],
+            initial_pool_ratio=[0.5, 0.5],
+        )
+        manager = KVCacheManager(cfg)
+        stats = manager._storage.get_statistics()
+        total_bytes = stats[0].total * self.PG0_SLOT_SIZE + stats[1].total * self.PG1_SLOT_SIZE
+        self.assertLessEqual(
+            total_bytes,
+            gpu_quota,
+            "non-binding constraint floors must not inflate the allocation "
+            "beyond the requested quota",
+        )
+        manager.shutdown()
+
+    def test_constraint_floors_tolerate_degenerate_max_util_for_resume(self):
+        """max_util_for_resume=0 is permitted by the llmapi field (ge=0).
+
+        The gate then rejects every resume of a non-empty pool (only the
+        first resume, at utilization 0, passes), so no finite floor helps and
+        no scaling applies — construction must not divide by zero, and the
+        floors must fall back to the unscaled constraint counts.
+        """
+        num_requests = 8
+        capacity = 512
+        total_blocks = div_up(capacity, self.TOKENS_PER_BLOCK)
+        raw_slots = num_requests * total_blocks
+        constraint = BatchDesc(
+            kv_caches=[KVCacheDesc(capacity=capacity, history_length=0)] * num_requests
+        )
+        cfg = self._make_config(
+            constraints=[constraint],
+            initial_pool_ratio=[0.9, 0.1],
+        )
+        cfg.max_util_for_resume = 0.0
+        manager = KVCacheManager(cfg)
+        stats = manager._storage.get_statistics()
+        self.assertGreaterEqual(stats[0].total, raw_slots)
+        self.assertGreaterEqual(stats[1].total, raw_slots)
         manager.shutdown()
 
     def test_initial_pool_ratio_length_must_match_pool_groups(self):

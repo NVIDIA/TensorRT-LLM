@@ -253,6 +253,10 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         # _build_cache_config() needs them to build constraints
         self._max_input_len = max_input_len
         self._max_num_tokens = max_num_tokens
+        # Size of the largest CUDA-graph warmup batch the engine will run:
+        # 0 when graphs are disabled, None when unknown (falls back to
+        # max_batch_size so the warmup floor stays conservative).
+        self._max_cuda_graph_batch_size = kwargs.pop("max_cuda_graph_batch_size", None)
 
         # General initialization
         super().__init__(
@@ -903,27 +907,53 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
                 * (max_batch_size - 1),
             )
 
-            # Constraint 1: cuda graph generation warmup — one decode request that has
-            # accumulated to the tail of max_seq_len. Using history_length=max_seq_len-1
-            # (instead of 0) lets SWA / SSM pools collapse to their windowed working set,
-            # while full-cache pools still need max_seq_len/tokens_per_block blocks
-            # because they don't age.
+        # The constraints below are feasibility floors (min slots per pool
+        # group) for the warmup workloads every executor runs, so they are
+        # built even when an explicit pool_ratio is provided — the ratio only
+        # decides how quota beyond these floors is split. Without the floors,
+        # a tight quota (e.g. the KV-estimation temporary pool) sized by a
+        # pure ratio split can starve one pool group and make warmup silently
+        # skip batch sizes, which under-measures the profiling peak and
+        # inflates the final KV cache estimate.
+
+        # Constraint 1: cuda graph generation warmup batch — one decode request
+        # that has accumulated to the tail of max_seq_len, plus enough fresh
+        # minimal decode requests to match the largest CUDA-graph warmup batch
+        # the engine will actually run (_create_cuda_graph_warmup_request's
+        # dummy batch). Skipped entirely when graphs are disabled: no other
+        # warmup creates a max_seq_len-long request, so keeping even the
+        # single long request would floor (and possibly bump) the quota for a
+        # warmup that will not happen. Using history_length=max_seq_len-1
+        # (instead of 0) lets SWA / SSM pools collapse to their windowed
+        # working set, while full-cache pools still need
+        # max_seq_len/tokens_per_block blocks because they don't age.
+        warmup_batch_size = (
+            max_batch_size
+            if self._max_cuda_graph_batch_size is None
+            else min(max_batch_size, self._max_cuda_graph_batch_size)
+        )
+        if warmup_batch_size > 0:
+            min_decode_capacity = 1 + max_draft_len + self.num_extra_kv_tokens
             constraints.append(
-                BatchDesc([KVCacheDesc(capacity=max_seq_len, history_length=max_seq_len - 1)])
+                BatchDesc(
+                    [KVCacheDesc(capacity=max_seq_len, history_length=max_seq_len - 1)]
+                    + [KVCacheDesc(capacity=min_decode_capacity, history_length=0)]
+                    * (warmup_batch_size - 1)
+                )
             )
 
-            # Constraint 2: general / chunked-prefill warmup — one fresh context request
-            # at max_num_tokens (the per-iteration token budget).
-            if max_num_tokens is not None:
-                constraints.append(
-                    BatchDesc(
-                        [
-                            KVCacheDesc(
-                                capacity=max_num_tokens + self.num_extra_kv_tokens, history_length=0
-                            )
-                        ]
-                    )
+        # Constraint 2: general / chunked-prefill warmup — one fresh context request
+        # at max_num_tokens (the per-iteration token budget).
+        if max_num_tokens is not None:
+            constraints.append(
+                BatchDesc(
+                    [
+                        KVCacheDesc(
+                            capacity=max_num_tokens + self.num_extra_kv_tokens, history_length=0
+                        )
+                    ]
                 )
+            )
 
         scratch_reuse_config = None
         if self.enable_swa_scratch_reuse:
