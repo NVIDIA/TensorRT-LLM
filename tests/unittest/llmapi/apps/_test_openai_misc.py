@@ -108,9 +108,10 @@ def test_tokenize(server: RemoteOpenAIServer):
     prompt_body = prompt_resp.json()
     assert prompt_body["count"] == len(prompt_body["tokens"]) > 0
 
-    # prompt is required; FastAPI rejects an empty body at request-model
-    # validation (422) before the handler runs.
-    assert requests.post(tokenize_url, json={}).status_code == 422
+    # prompt is required; an empty body fails request-model validation. The
+    # server's RequestValidationError handler renders that as 400 (not the
+    # FastAPI default 422) to match the shared {"error": ...} envelope.
+    assert requests.post(tokenize_url, json={}).status_code == 400
 
 
 @pytest.mark.parametrize("use_beam_search", [False, True])
