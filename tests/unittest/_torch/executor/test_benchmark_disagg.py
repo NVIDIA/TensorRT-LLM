@@ -499,6 +499,7 @@ class TestPrepareAndScheduleBatchNoBlock:
         from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 
         ex = object.__new__(PyExecutor)
+        ex.self_benchmark = None
         ex.benchmark_req_queues_size = 8
         ex.kv_cache_transceiver = Mock()
         ex.kv_cache_manager = Mock()
@@ -890,6 +891,7 @@ class TestFailFastDuringBenchmarkFill:
         from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 
         ex = object.__new__(PyExecutor)
+        ex.self_benchmark = None
         ex.benchmark_req_queues_size = 8
         ex.kv_cache_transceiver = Mock()
         ex.is_benchmark_disagg = True
@@ -1036,6 +1038,7 @@ class TestFillPhaseEndToEnd:
         from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 
         ex = object.__new__(PyExecutor)
+        ex.self_benchmark = None
         ex.benchmark_req_queues_size = self.TOTAL_REQUESTS
         ex.kv_cache_transceiver = _make_transceiver(transfer_complete=False)
         ex.is_benchmark_disagg = True

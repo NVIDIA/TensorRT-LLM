@@ -86,7 +86,7 @@ from .scheduler import (RequestScheduler, ScheduledRequests,
                         SerializableSchedulerOutput, WaitingQueue,
                         create_waiting_queue)
 from .scheduler.adp_router import ADPRouter
-from .self_benchmark import SelfBenchmark
+from .self_benchmark import BenchmarkOutcome, DrainTarget, SelfBenchmark
 
 if TYPE_CHECKING:
     from ray.actor import ActorHandle
@@ -593,6 +593,7 @@ class PyExecutor:
             self.enable_disagg_partial_reuse_store and self.dist.pp_size == 1)
 
         self.max_input_len = max_input_len
+        self.max_seq_len = max_seq_len
         # _executor_loop private data
         self.max_num_active_requests = model_engine.get_max_num_sequences()
         # nvbug-6133201: under attention DP, tighten the per-rank request
@@ -802,6 +803,7 @@ class PyExecutor:
         self.waiting_queue: WaitingQueue = create_waiting_queue(
             waiting_queue_policy)
         self.self_benchmark = self._create_self_benchmark(enable_self_benchmark)
+        self._sync_self_benchmark_plan()
 
         self.control_request_barrier = threading.Event()
         self.control_action_done = threading.Event()
@@ -890,7 +892,6 @@ class PyExecutor:
                     "Drafting is not supported for selected executor loop. "
                     "Please disable disagg/pipeline parallelism scheduler.")
         self.garbage_collection_gen0_threshold = garbage_collection_gen0_threshold
-        self.max_seq_len = max_seq_len
 
         self.worker_started = False
         self.worker_lock = threading.Lock()
@@ -1574,8 +1575,7 @@ class PyExecutor:
 
     @staticmethod
     def _is_stats_dummy_request(req) -> bool:
-        return bool(getattr(req, "is_dummy", False)) and not bool(
-            getattr(req, "is_self_benchmark_request", False))
+        return bool(getattr(req, "is_dummy", False))
 
     def _collect_scheduled_batch_stats(
             self, scheduled_batch: ScheduledRequests) -> ScheduledBatchStats:
@@ -2103,7 +2103,8 @@ class PyExecutor:
                                         batch_state.scheduled_requests,
                                         micro_batch_id,
                                         batch_state.scheduled_batch_stats)
-        if self.self_benchmark is not None and self.self_benchmark.active:
+        benchmark = self.self_benchmark
+        if benchmark is not None and benchmark.sync_active:
             stats_dict = json.loads(stats.to_json_str())
             if host_step_time_ms is not None:
                 stats_dict["hostStepTimeMS"] = host_step_time_ms
@@ -2115,8 +2116,8 @@ class PyExecutor:
                                or self.dist.pp_size > 1)
             stats_dict["schedulerMode"] = ("overlap" if is_overlap_like else
                                            "non_overlap")
-            if self.self_benchmark.observe_iteration(
-                    batch_state.scheduled_requests, stats_dict):
+            if benchmark.observe_executed_batch(batch_state.scheduled_requests,
+                                                stats_dict):
                 return
         if self.enable_attention_dp:
             self._adp_iter_stats.queue(
@@ -2669,6 +2670,9 @@ class PyExecutor:
                     self._send_kv_async(finished_ctx_reqs)
                 self._flush_pending_transfer_responses()
                 self._handle_canceled_requests()
+                benchmark = self.self_benchmark
+                if benchmark is not None and benchmark.sync_active:
+                    self._observe_self_benchmark_finished(scheduled_requests)
 
                 finished_requests = self._handle_responses()
                 # Complete ctx send sessions AFTER responses are created so
@@ -2986,7 +2990,16 @@ class PyExecutor:
 
     def _prepare_and_schedule_batch(self):
         new_requests = self._fetch_and_activate_new_requests()
-        if self.should_stop_processing:
+
+        benchmark = self.self_benchmark
+        if benchmark is not None and benchmark.sync_active:
+            if self.is_shutdown:
+                benchmark.request_interrupt()
+            self._sync_self_benchmark_outcome()
+            self._drain_self_benchmark_requests(
+                self._self_benchmark_protected_ids())
+        if (self.should_stop_processing
+                and (benchmark is None or not benchmark.sync_active)):
             return None, None
 
         self._handle_control_request()
@@ -3051,6 +3064,16 @@ class PyExecutor:
         scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs = self._schedule(
         )
 
+        if benchmark is not None and benchmark.sync_active:
+            benchmark.observe_scheduled_batch(scheduled_batch)
+            self._sync_self_benchmark_outcome()
+            protected_ids = self._self_benchmark_protected_ids()
+            protected_ids.update({
+                request.py_request_id
+                for request in scheduled_batch.all_requests()
+            })
+            self._drain_self_benchmark_requests(protected_ids)
+
         if self.drafter is not None and not self.use_spec_decode:
             for request in scheduled_batch.all_requests():
                 request.py_disable_speculative_decoding = True
@@ -3108,6 +3131,95 @@ class PyExecutor:
             f'{scheduled_batch.num_context_requests} context requests and '
             f'{scheduled_batch.num_generation_requests} generation requests')
         return scheduled_batch, iter_stats
+
+    def _sync_self_benchmark_plan(self) -> None:
+        benchmark = self.self_benchmark
+        if benchmark is None:
+            return
+
+        local_record = benchmark.local_planner_record(self.dist.tp_rank)
+        records = (self.dist.tp_allgather(local_record)
+                   if self.dist.tp_size > 1 else [local_record])
+        benchmark.apply_planner_consensus(records)
+
+    def _sync_self_benchmark_outcome(self) -> None:
+        benchmark = self.self_benchmark
+        if benchmark is None or not benchmark.sync_active:
+            return
+
+        local_outcome = benchmark.local_outcome()
+        global_value = (self.dist.tp_allreduce(int(local_outcome),
+                                               op=ReduceOp.MAX)
+                        if self.dist.tp_size > 1 else int(local_outcome))
+        outcome = BenchmarkOutcome(int(global_value))
+        reason = None
+        origin_rank = None
+        drain_target = None
+        if outcome in (BenchmarkOutcome.SKIP, BenchmarkOutcome.ABORT):
+            local_record = benchmark.local_diagnostic(outcome,
+                                                      self.dist.tp_rank)
+            records = (self.dist.tp_allgather(local_record)
+                       if self.dist.tp_size > 1 else [local_record])
+            candidates = [
+                record for record in records
+                if record is not None and record["outcome"] == int(outcome)
+            ]
+            if outcome == BenchmarkOutcome.ABORT:
+                ordinary_failures = [
+                    record for record in candidates
+                    if record["drain_target"] == DrainTarget.ABORT.value
+                ]
+                if ordinary_failures:
+                    candidates = ordinary_failures
+            canonical = min(candidates, key=lambda record: record["rank"])
+            reason = canonical["reason"]
+            origin_rank = canonical["rank"]
+            drain_target = DrainTarget(canonical["drain_target"])
+        benchmark.apply_global_outcome(
+            outcome,
+            reason=reason,
+            origin_rank=origin_rank,
+            drain_target=drain_target,
+        )
+
+    def _self_benchmark_protected_ids(self) -> set[int]:
+        previous_batch = getattr(self, "previous_batch", None)
+        if previous_batch is None:
+            return set()
+        return {
+            request.py_request_id
+            for request in previous_batch.scheduled_requests.all_requests()
+            if getattr(request, "is_self_benchmark_request", False)
+        }
+
+    def _drain_self_benchmark_requests(self, protected_ids: set[int]) -> None:
+        benchmark = self.self_benchmark
+        if benchmark is None:
+            return
+
+        retained_requests = []
+        requests_to_terminate = []
+        for request in self.active_requests:
+            should_terminate = (getattr(request, "is_self_benchmark_request",
+                                        False)
+                                and request.py_request_id not in protected_ids
+                                and benchmark.should_terminate(request))
+            if should_terminate:
+                requests_to_terminate.append(request)
+            else:
+                retained_requests.append(request)
+
+        self.active_requests.clear()
+        self.active_requests.extend(retained_requests)
+        for request in requests_to_terminate:
+            self._terminate_request(request)
+
+    def _observe_self_benchmark_finished(
+            self, scheduled_requests: ScheduledRequests) -> None:
+        benchmark = self.self_benchmark
+        if benchmark is None or not benchmark.sync_active:
+            return
+        benchmark.observe_finished_requests(scheduled_requests.all_requests())
 
     def _kv_connector_start_batch(self, scheduled_batch):
         if self.kv_connector_manager:
@@ -3435,6 +3547,9 @@ class PyExecutor:
 
                     self._update_request_states(scheduled_batch)
                     self._update_requests(sample_state, self.resource_manager)
+                    benchmark = self.self_benchmark
+                    if benchmark is not None and benchmark.sync_active:
+                        self._observe_self_benchmark_finished(scheduled_batch)
 
                     if self._is_kv_manager_v2:
                         # Finalize V2 context KV before disagg transfer/response
@@ -3445,6 +3560,15 @@ class PyExecutor:
                     self._flush_pending_transfer_responses()
 
                     self._handle_canceled_requests()
+                    benchmark_active = benchmark is not None and benchmark.sync_active
+                    if benchmark_active:
+                        attn_metadata = getattr(self.model_engine,
+                                                'attn_metadata', None)
+                        kv_cache_dtype_byte_size = getattr(
+                            self.model_engine, 'kv_cache_dtype_byte_size', None)
+                        self.resource_manager.update_resources(
+                            scheduled_batch, attn_metadata,
+                            kv_cache_dtype_byte_size)
                     finished_requests = self._handle_responses()
                     # Complete ctx send sessions AFTER responses are created so
                     # _handle_responses sees the request before it is terminated.
@@ -3454,13 +3578,14 @@ class PyExecutor:
                     # (safe in non-overlap mode: no next iteration to overwrite events)
                     self.perf_manager.compute_batch_gpu_times(
                         scheduled_batch.all_requests())
-                    attn_metadata = getattr(self.model_engine, 'attn_metadata',
-                                            None)
-                    kv_cache_dtype_byte_size = getattr(
-                        self.model_engine, 'kv_cache_dtype_byte_size', None)
-                    self.resource_manager.update_resources(
-                        scheduled_batch, attn_metadata,
-                        kv_cache_dtype_byte_size)
+                    if not benchmark_active:
+                        attn_metadata = getattr(self.model_engine,
+                                                'attn_metadata', None)
+                        kv_cache_dtype_byte_size = getattr(
+                            self.model_engine, 'kv_cache_dtype_byte_size', None)
+                        self.resource_manager.update_resources(
+                            scheduled_batch, attn_metadata,
+                            kv_cache_dtype_byte_size)
                     if self.enable_kv_cache_events:
                         self._add_kv_cache_events()
 
@@ -4082,17 +4207,27 @@ class PyExecutor:
 
     def _process_previous_batch(self):
         self._handle_canceled_requests()
+        benchmark = self.self_benchmark
+        if benchmark is not None and benchmark.sync_active:
+            self._observe_self_benchmark_finished(
+                self.previous_batch.scheduled_requests)
         # Skip iter-1 emission when `_emit_first_token_responses` already
         # handled it.
-        finished_requests = self._handle_responses(
-            emit_first_iter=not self.enable_early_first_token_response)
         scheduled_requests = self.previous_batch.scheduled_requests
         attn_metadata = getattr(self.model_engine, 'attn_metadata', None)
         kv_cache_dtype_byte_size = getattr(self.model_engine,
                                            'kv_cache_dtype_byte_size', None)
-        self.resource_manager.update_resources(scheduled_requests,
-                                               attn_metadata,
-                                               kv_cache_dtype_byte_size)
+        benchmark_active = benchmark is not None and benchmark.sync_active
+        if benchmark_active:
+            self.resource_manager.update_resources(scheduled_requests,
+                                                   attn_metadata,
+                                                   kv_cache_dtype_byte_size)
+        finished_requests = self._handle_responses(
+            emit_first_iter=not self.enable_early_first_token_response)
+        if not benchmark_active:
+            self.resource_manager.update_resources(scheduled_requests,
+                                                   attn_metadata,
+                                                   kv_cache_dtype_byte_size)
         if self.enable_kv_cache_events:
             self._add_kv_cache_events()
 
@@ -4417,11 +4552,11 @@ class PyExecutor:
             # Self-benchmark injection runs identically on EVERY TP rank here
             # (this method is invoked per-rank by the main loops). Both prefill
             # and decode requests are constructed locally and deterministically
-            # from the grid point index, so each rank advances the same state
+            # from the next case index, so each rank advances the same state
             # machine and produces the same forward batch in lockstep -- no
             # per-iteration broadcast/collective is needed. Prefill is attempted
-            # first; make_prefill_requests returns [] when the next point is a
-            # decode point (and vice versa), so at most one path injects.
+            # first; make_prefill_requests returns [] when the next case is a
+            # decode case (and vice versa), so at most one path injects.
             benchmark_requests = self.self_benchmark.make_prefill_requests(
                 self.active_requests, self.waiting_queue)
             benchmark_requests.extend(
@@ -4558,8 +4693,14 @@ class PyExecutor:
 
     @nvtx_range("_schedule")
     def _schedule(self):
+        active_requests = self.active_requests
+        if self.self_benchmark is not None and self.self_benchmark.sync_active:
+            active_requests = [
+                request for request in active_requests
+                if not self.self_benchmark.should_hold_from_scheduler(request)
+            ]
         scheduler_output = self.scheduler.schedule_request(
-            self.active_requests, self.inflight_req_ids)
+            active_requests, self.inflight_req_ids)
 
         scheduled_context_requests = scheduler_output.context_requests
         if self.enable_attention_dp and self.attention_dp_enable_balance:
@@ -5573,13 +5714,26 @@ class PyExecutor:
 
         failed_requests = (list(self.active_requests)
                            if requests is None else requests)
+        benchmark = self.self_benchmark
+        benchmark_failed_requests = ([
+            request for request in failed_requests
+            if getattr(request, "is_self_benchmark_request", False)
+        ] if benchmark is not None else [])
+        benchmark_request_ids = {
+            request.py_request_id
+            for request in benchmark_failed_requests
+        }
+        if not is_fatal and benchmark_failed_requests:
+            benchmark.observe_failed_requests(benchmark_failed_requests,
+                                              error_msg)
         for request in failed_requests:
             req_id = request.py_request_id
             request.state = LlmRequestState.GENERATION_COMPLETE
-            error_responses[req_id] = LlmResponse(
-                request_id=req_id,
-                error_msg=error_msg,
-                client_id=request.py_client_id)
+            if req_id not in benchmark_request_ids:
+                error_responses[req_id] = LlmResponse(
+                    request_id=req_id,
+                    error_msg=error_msg,
+                    client_id=request.py_client_id)
         if requests is None:
             self.active_requests.clear()
         else:
@@ -5607,6 +5761,10 @@ class PyExecutor:
 
     def _do_terminate_request(self, request: LlmRequest):
         self.resource_manager.free_resources(request)
+        benchmark = self.self_benchmark
+        if (benchmark is not None
+                and getattr(request, "is_self_benchmark_request", False)):
+            benchmark.observe_terminated_requests([request])
         self._prefetched_request_ids.discard(request.py_request_id)
 
         if self.gather_all_responses or self.dist.rank == 0:
@@ -5793,6 +5951,7 @@ class PyExecutor:
         )
 
         batch_token_time = self.perf_manager.get_timestamp()
+        benchmark = self.self_benchmark
 
         for request in self.active_requests:
             req_id = request.py_request_id
@@ -5800,12 +5959,16 @@ class PyExecutor:
             if request.is_attention_dp_dummy:
                 requests_to_terminate.append(request)
                 continue
-            if getattr(request, "is_self_benchmark_request", False):
+            if (benchmark is not None
+                    and getattr(request, "is_self_benchmark_request", False)):
                 self.perf_manager.append_step_metrics(
                     request,
                     self.iter_counter,
                     batch_token_time=batch_token_time)
-                requests_to_terminate.append(request)
+                if benchmark.should_terminate(request):
+                    requests_to_terminate.append(request)
+                else:
+                    new_active_requests.append(request)
                 continue
 
             # Check if generation request needs cleanup due to KV cache transfer timeout
