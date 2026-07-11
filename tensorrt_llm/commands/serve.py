@@ -713,6 +713,16 @@ def launch_visual_gen_server(
         visual_gen_args: Optional validated VisualGenArgs for model configuration.
         metadata_server_cfg: Optional metadata server configuration.
     """
+    # Only global rank 0 serves HTTP; in external multi-rank launch ranks > 0
+    # must become workers before binding, else every rank on a multi-GPU node
+    # races the same port and all but one die EADDRINUSE. VisualGen() on a
+    # worker rank never returns (sys.exit in __init__).
+    from tensorrt_llm._torch.visual_gen.executor import _detect_external_launch
+    ext = _detect_external_launch()
+    if ext is not None and ext[0] != 0:
+        VisualGen(model=model, args=visual_gen_args)
+        return
+
     # Reserve the listening (host, port) by binding the socket *before*
     # constructing the VisualGen pipeline, then hand the bound socket to
     # uvicorn. VisualGen initialization can take many minutes; if we deferred
