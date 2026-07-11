@@ -267,11 +267,9 @@ class UploadLogPlugin:
                 aws_secret_access_key=aws_secret_access_key,
             )
         # nodeid -> dict of open capture context managers + handler.
-        # Capture must span setup + call (so fixture output is recorded) but
-        # not teardown — closing the capture before teardown lets us add
-        # upload metadata inside pytest_runtest_logreport(teardown), where
-        # `report.sections.append(...)` is still seen by the junitxml plugin
-        # (pluggy LIFO order makes our handler fire before junitxml's).
+        # Capture spans setup + call so fixture output is recorded. It is
+        # closed after the call report is built but before logreport hooks run,
+        # keeping pytest's result/progress output on the original stdout.
         self._active_capture: dict = {}
         self._test_names: dict = {}
         self._deferred_uploads = []
@@ -381,10 +379,24 @@ class UploadLogPlugin:
         yield
 
     @pytest.hookimpl(wrapper=True)
+    def pytest_runtest_makereport(self, item, call):
+        report = yield
+        if report.when == "call" or (report.when == "setup" and report.outcome != "passed"):
+            self._close_capture(self._active_capture.pop(item.nodeid, None))
+        return report
+
+    @pytest.hookimpl(wrapper=True)
     def pytest_runtest_teardown(self, item, nextitem):
-        # Stop capturing BEFORE teardown runs, so the captured log files are
-        # final by the time we upload in pytest_runtest_logreport(teardown).
-        self._close_capture(self._active_capture.pop(item.nodeid, None))
+        # Fallback for custom or interrupted runtest protocols that did not
+        # produce a call report. Normal execution closes capture earlier.
+        state = self._active_capture.pop(item.nodeid, None)
+        self._close_capture(state)
+        if state is not None:
+            logger.warning(
+                "S3 capture for %r remained active until teardown; "
+                "pytest result/progress output may have been captured",
+                item.nodeid,
+            )
         yield
 
     def get_file_size(self, path):

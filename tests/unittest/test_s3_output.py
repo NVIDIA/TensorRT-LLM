@@ -13,15 +13,27 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 import subprocess
 import sys
 
+import pytest
 from test_common.s3_output import FDRedirector, UploadLogPlugin
 
 
 class Report:
-    def __init__(self):
+    def __init__(self, when=None, outcome=None):
         self.sections = []
+        self.when = when
+        self.outcome = outcome
+
+
+class CaptureContext:
+    def __init__(self):
+        self.closed = False
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.closed = True
 
 
 class RecordingS3Client:
@@ -49,6 +61,68 @@ def write_log(tmp_path, test_name, filename, content):
     test_dir = tmp_path / test_name
     test_dir.mkdir()
     (test_dir / filename).write_text(content, encoding="utf-8")
+
+
+def complete_makereport_hook(plugin, nodeid, report):
+    item = type("Item", (), {"nodeid": nodeid})()
+    hook = plugin.pytest_runtest_makereport(item, call=None)
+    next(hook)
+    with pytest.raises(StopIteration) as stop:
+        hook.send(report)
+    assert stop.value.value is report
+
+
+def test_capture_stays_open_after_successful_setup_report(tmp_path):
+    nodeid = "test_module.py::test_case"
+    plugin = make_plugin(tmp_path, inline_output_max_bytes=256)
+    capture = CaptureContext()
+    plugin._active_capture[nodeid] = {"stdout_redir": capture}
+
+    complete_makereport_hook(plugin, nodeid, Report(when="setup", outcome="passed"))
+
+    assert not capture.closed
+    assert nodeid in plugin._active_capture
+    plugin._close_capture(plugin._active_capture.pop(nodeid))
+
+
+@pytest.mark.parametrize(
+    ("when", "outcome"),
+    [
+        ("call", "passed"),
+        ("call", "failed"),
+        ("setup", "failed"),
+        ("setup", "skipped"),
+    ],
+)
+def test_capture_closes_before_terminal_report(tmp_path, when, outcome):
+    nodeid = "test_module.py::test_case"
+    plugin = make_plugin(tmp_path, inline_output_max_bytes=256)
+    capture = CaptureContext()
+    plugin._active_capture[nodeid] = {"stdout_redir": capture}
+
+    complete_makereport_hook(plugin, nodeid, Report(when=when, outcome=outcome))
+
+    assert capture.closed
+    assert nodeid not in plugin._active_capture
+
+
+def test_teardown_fallback_warns_when_capture_is_still_active(tmp_path, caplog):
+    nodeid = "test_module.py::test_case"
+    plugin = make_plugin(tmp_path, inline_output_max_bytes=256)
+    capture = CaptureContext()
+    plugin._active_capture[nodeid] = {"stdout_redir": capture}
+    item = type("Item", (), {"nodeid": nodeid})()
+
+    caplog.set_level(logging.WARNING, logger="test_common.s3_output")
+    hook = plugin.pytest_runtest_teardown(item, nextitem=None)
+    next(hook)
+
+    assert capture.closed
+    assert nodeid not in plugin._active_capture
+    assert "remained active until teardown" in caplog.text
+
+    with pytest.raises(StopIteration):
+        next(hook)
 
 
 def test_small_stdout_is_inlined_without_upload(tmp_path):

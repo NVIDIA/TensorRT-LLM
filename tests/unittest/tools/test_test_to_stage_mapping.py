@@ -97,6 +97,9 @@ def test_s3_stdout_echo_requires_explicit_opt_in():
         context = lines[max(0, idx - 3):idx]
         assert any('if (ENABLE_S3_ECHO_STDOUT)' in line for line in context)
 
+    assert any('console_output_style=progress-even-when-capture-no' in line
+               for line in lines)
+
 
 @pytest.mark.skip(reason="https://nvbugs/5547275")
 @pytest.mark.parametrize("direction",
