@@ -6,11 +6,15 @@ verl_config:
   test_dir: "tests"
 
   install_commands:
-    # Install gdrcopy
+    # Install gdrcopy (skip if already installed; build as user, install with sudo
+    # so the install step works under both root (CI) and non-root (LOCAL_USER=1) setups).
     - >-
+      if [ ! -f /usr/local/lib/libgdrapi.so ]; then
+      rm -rf gdrcopy &&
       git clone -b v2.5.1 https://github.com/NVIDIA/gdrcopy.git &&
-      (cd gdrcopy && make prefix=/usr/local lib_install) &&
-      rm -rf gdrcopy
+      (cd gdrcopy && make lib && sudo make prefix=/usr/local lib_install) &&
+      rm -rf gdrcopy;
+      fi
     # DeepEP's deep_ep_cpp extension hard-links against the static device archive
     # (-l:libnvshmem_device.a) and the host lib (-l:libnvshmem_host.so), neither of
     # which the NGC PyTorch base image ships (it provides only libnvshmem_host.so.3
@@ -22,25 +26,28 @@ verl_config:
     # and break `import torch`. Then expose the wheel at a stable NVSHMEM_DIR and add
     # the libnvshmem_host.so symlink DeepEP links by soname-less name.
     - >-
-      pip3 install --no-cache-dir nvidia-nvshmem-cu13==3.6.5 &&
+      sudo -H pip3 install --no-cache-dir nvidia-nvshmem-cu13==3.6.5 &&
       NVSHMEM_PKG=$(python3 -c "import nvidia.nvshmem as n; print(list(n.__path__)[0])") &&
-      ln -sfn "$NVSHMEM_PKG" /opt/nvshmem &&
-      (cd /opt/nvshmem/lib && [ -e libnvshmem_host.so ] || ln -sf libnvshmem_host.so.3 libnvshmem_host.so)
-    # Install DeepEP
+      sudo ln -sfn "$NVSHMEM_PKG" /opt/nvshmem &&
+      (cd /opt/nvshmem/lib && [ -e libnvshmem_host.so ] || sudo ln -sf libnvshmem_host.so.3 libnvshmem_host.so)
+    # Install DeepEP. Use --user so setuptools targets ~/.local (works under both root
+    # and LOCAL_USER=1; the /code source tree is on NFS with root_squash, so a
+    # sudo/system-wide install would be blocked from writing back).
     - >-
       git clone -b hybrid-ep https://github.com/deepseek-ai/DeepEP.git &&
       (cd DeepEP &&
       export CPATH=/usr/local/cuda/targets/$(uname -m | sed 's/aarch64/sbsa-linux/;s/x86_64/x86_64-linux/')/include/cccl:$CPATH &&
-      TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0" python setup.py install) &&
+      TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0" python setup.py install --user) &&
       rm -rf DeepEP
-    # Install Python dependencies
-    - "pip3 install --no-cache-dir --no-deps trl==0.27.0"
-    - "pip3 install --no-cache-dir nvtx matplotlib liger_kernel cachetools"
-    - "pip3 install --no-cache-dir cupy-cuda12x==14.0.1"
-    - "pip install --no-cache-dir -U git+https://github.com/ISEEKYAN/mbridge.git@641a5a0"
-    - "pip install --no-deps --no-cache-dir git+https://github.com/NVIDIA/Megatron-LM.git@core_v0.16.0"
-    - "pip3 install pytest-asyncio"
-    - "pip3 install --no-cache-dir 'ray[default]==2.55.1'"
+    # Install Python dependencies (sudo -H so system-wide installs also work when the
+    # setup runs under LOCAL_USER=1; no-op when already root).
+    - "sudo -H pip3 install --no-cache-dir --no-deps trl==0.27.0"
+    - "sudo -H pip3 install --no-cache-dir nvtx matplotlib liger_kernel cachetools"
+    - "sudo -H pip3 install --no-cache-dir cupy-cuda12x==14.0.1"
+    - "sudo -H pip install --no-cache-dir -U git+https://github.com/ISEEKYAN/mbridge.git@641a5a0"
+    - "sudo -H pip install --no-deps --no-cache-dir git+https://github.com/NVIDIA/Megatron-LM.git@core_v0.16.0"
+    - "sudo -H pip3 install pytest-asyncio"
+    - "sudo -H pip3 install --no-cache-dir 'ray[default]==2.55.1'"
 
 
   # The environment variables to expose in the container before setting up
