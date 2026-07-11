@@ -755,7 +755,13 @@ class TestDisaggTransferIdleProgress:
         executor.kv_cache_transceiver = Mock()
         executor.enable_attention_dp = True
         executor.dist = Mock(world_size=4, rank=0)
-        executor.dist.tp_allgather.return_value = [[1], [], [], []]
+        local_vote = {"error_ids": [1], "blocked_ids": []}
+        executor.dist.tp_allgather.return_value = [
+            local_vote,
+            {"error_ids": [], "blocked_ids": []},
+            {"error_ids": [], "blocked_ids": []},
+            {"error_ids": [], "blocked_ids": []},
+        ]
         executor._handle_errors = Mock()
         executor._check_cache_transfer_errors = Mock()
         executor._sync_disagg_transfer_made_progress = False
@@ -795,7 +801,7 @@ class TestDisaggTransferIdleProgress:
 
         PyExecutor._handle_disagg_cache_errors_synced(executor)
 
-        executor.dist.tp_allgather.assert_called_once_with([1])
+        executor.dist.tp_allgather.assert_called_once_with(local_vote)
         executor._handle_errors.assert_called_once_with(
             "Disagg KV cache transfer error",
             requests=[error_request],
@@ -1401,6 +1407,13 @@ def _err_req(request_id=1):
     return _make_adp_request(LlmRequestState.DISAGG_TRANS_ERROR, request_id=request_id)
 
 
+def _disagg_error_vote(error_ids=(), blocked_ids=()):
+    return {
+        "error_ids": list(error_ids),
+        "blocked_ids": list(blocked_ids),
+    }
+
+
 _DEFAULT_KV_CACHE_TRANSCEIVER = object()
 
 
@@ -1419,6 +1432,7 @@ def _make_disagg_err_stub(
         kv_cache_transceiver.supports_inflight_request_cancellation.return_value = False
         kv_cache_transceiver.has_poisoned_transfer_buffer.return_value = False
     stub.kv_cache_transceiver = kv_cache_transceiver
+    stub._disagg_inflight_cancel_unsupported_logged = False
     stub.active_requests = active_requests if active_requests is not None else []
     stub.dist = Mock()
     stub.dist.world_size = world_size
@@ -1435,8 +1449,11 @@ def _make_disagg_err_stub(
         )
 
     stub._handle_errors = _rec_handle_errors
+    stub._request_vote_id = PyExecutor._request_vote_id
     for helper in (
         "_handle_disagg_cache_errors_synced",
+        "_is_disagg_inflight_cancel_active",
+        "_is_disagg_error_cleanup_blocked",
         "_get_disagg_reqs_in_error_state",
         "_check_cache_transfer_errors",
     ):
@@ -1469,7 +1486,8 @@ class TestDisaggCacheErrorsSynced:
         matching = _make_adp_request(_STATE_GENERATION_IN_PROGRESS, request_id=7)
         unrelated = _make_adp_request(_STATE_GENERATION_IN_PROGRESS, request_id=8)
         stub = _make_disagg_err_stub(
-            active_requests=[matching, unrelated], tp_allgather_result=[[], [7]]
+            active_requests=[matching, unrelated],
+            tp_allgather_result=[_disagg_error_vote(), _disagg_error_vote([7])],
         )
         stub._handle_disagg_cache_errors_synced()
         assert len(stub.handle_errors_calls) == 1
@@ -1477,13 +1495,19 @@ class TestDisaggCacheErrorsSynced:
         assert stub.handle_errors_calls[0]["charge_budget"] is False
 
     def test_no_handle_when_no_rank_has_error(self):
-        stub = _make_disagg_err_stub(active_requests=[], tp_allgather_result=[[], []])
+        stub = _make_disagg_err_stub(
+            active_requests=[],
+            tp_allgather_result=[_disagg_error_vote(), _disagg_error_vote()],
+        )
         stub._handle_disagg_cache_errors_synced()
         assert stub.handle_errors_calls == []
 
     def test_peer_error_without_local_replica_still_enters_handler(self):
         unrelated = _make_adp_request(_STATE_GENERATION_IN_PROGRESS, request_id=8)
-        stub = _make_disagg_err_stub(active_requests=[unrelated], tp_allgather_result=[[], [7]])
+        stub = _make_disagg_err_stub(
+            active_requests=[unrelated],
+            tp_allgather_result=[_disagg_error_vote(), _disagg_error_vote([7])],
+        )
 
         stub._handle_disagg_cache_errors_synced()
 
@@ -1492,7 +1516,9 @@ class TestDisaggCacheErrorsSynced:
     def test_local_error_req_forwarded_request_scoped(self):
         err = _err_req()
         ok = _make_adp_request(_STATE_GENERATION_IN_PROGRESS, request_id=2)
-        stub = _make_disagg_err_stub(active_requests=[ok, err], tp_allgather_result=[[1]])
+        stub = _make_disagg_err_stub(
+            active_requests=[ok, err], tp_allgather_result=[_disagg_error_vote([1])]
+        )
         stub._handle_disagg_cache_errors_synced()
         assert len(stub.handle_errors_calls) == 1
         assert stub.handle_errors_calls[0]["requests"] == [err]
@@ -1505,11 +1531,34 @@ class TestDisaggCacheErrorsSynced:
             is_child=True,
             parent_request_id=9,
         )
-        stub = _make_disagg_err_stub(active_requests=[child], tp_allgather_result=[[], [9]])
+        stub = _make_disagg_err_stub(
+            active_requests=[child],
+            tp_allgather_result=[_disagg_error_vote(), _disagg_error_vote([9])],
+        )
 
         stub._handle_disagg_cache_errors_synced()
 
         assert stub.handle_errors_calls[0]["requests"] == [child]
+
+    def test_peer_vote_does_not_clean_up_locally_deferred_request(self):
+        request = _err_req(request_id=7)
+        request.is_context_only_request = True
+        stub = _make_disagg_err_stub(
+            active_requests=[request],
+            tp_allgather_result=[
+                _disagg_error_vote(blocked_ids=[7]),
+                _disagg_error_vote([7]),
+            ],
+        )
+        stub.canceled_req_ids = []
+        stub.async_transfer_manager = Mock()
+        stub.async_transfer_manager.requests_in_transfer.return_value = {
+            request.py_request_id: request
+        }
+
+        stub._handle_disagg_cache_errors_synced()
+
+        assert stub.handle_errors_calls == []
 
 
 class TestCheckCacheTransferErrorsAdpNoop:

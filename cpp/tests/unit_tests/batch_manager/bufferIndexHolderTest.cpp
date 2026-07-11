@@ -48,6 +48,16 @@ public:
     {
         return mConcurrenceRecvResource.mConcurrence.load();
     }
+
+    void configureIndexPoolsForTest(size_t count)
+    {
+        ASSERT_EQ(mConcurrenceSendResource.mConcurrence.load(), 0);
+        ASSERT_EQ(mConcurrenceRecvResource.mConcurrence.load(), 0);
+        mSendBufferCount = count;
+        mRecvBufferCount = count;
+        mConcurrenceSendResource.mBufferIndexFlag.assign(count, 0);
+        mConcurrenceRecvResource.mBufferIndexFlag.assign(count, 0);
+    }
 };
 
 } // namespace
@@ -69,12 +79,6 @@ class BufferIndexHolderLifecycleTest : public ::testing::TestWithParam<HolderCas
 protected:
     void SetUp() override
     {
-        setenv("TRTLLM_USE_UCX_KVCACHE", "1", 1);
-        // Move-assignment coverage requires two simultaneously held indices from either pool.
-        setenv("TRTLLM_REQUEST_KV_CACHE_CONCURRENT", "1", 1);
-        setenv("TRTLLM_KVCACHE_RECV_BUFFER_COUNT", "2", 1);
-        setenv("TRTLLM_KVCACHE_SEND_MAX_CONCURRENCY_NUM", "2", 1);
-
         int constexpr numLayers = 2;
         int constexpr numHeads = 2;
         int constexpr sizePerHead = 8;
@@ -95,6 +99,9 @@ protected:
             /*enableBlockReuse=*/true, CacheType::kSELF, std::nullopt, nullptr, true);
         mKv->allocatePools(false);
         mTrans = std::make_unique<ObservableTransBufferManager>(mKv.get(), std::optional<size_t>{kvMaxNumTokens});
+        // envUtils caches process-wide settings, so set up the index-only test
+        // pools directly instead of relying on test-order-sensitive setenv calls.
+        mTrans->configureIndexPoolsForTest(2);
     }
 
     void TearDown() override
@@ -174,6 +181,29 @@ TEST_P(BufferIndexHolderLifecycleTest, NulloptIndexCanPoisonManager)
     EXPECT_FALSE(holder.held());
     EXPECT_TRUE(mgr().hasPoisonedBuffer());
     EXPECT_EQ(inUse(), before);
+}
+
+// Poisoning a concrete slot fails the entire direction closed: the slot stays
+// reserved and no later request can acquire another buffer from that pool.
+TEST_P(BufferIndexHolderLifecycleTest, ValidIndexPoisonPreventsReuse)
+{
+    int const before = inUse();
+    auto idx = acquire();
+    ASSERT_TRUE(idx.has_value());
+    BufferIndexHolder holder{mgr(), idx, isRecv()};
+    EXPECT_EQ(inUse(), before + 1);
+
+    holder.poison();
+
+    EXPECT_FALSE(holder.held());
+    EXPECT_TRUE(mgr().hasPoisonedBuffer());
+    EXPECT_EQ(inUse(), before + 1);
+    EXPECT_THROW((void) acquire(), std::exception);
+
+    // poison() disarms the holder; neither an explicit release nor its
+    // destructor may return the quarantined slot to the pool.
+    holder.release();
+    EXPECT_EQ(inUse(), before + 1);
 }
 
 // RAII: a held slot is released when the holder goes out of scope.

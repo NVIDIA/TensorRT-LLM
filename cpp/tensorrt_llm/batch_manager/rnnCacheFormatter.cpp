@@ -170,7 +170,9 @@ void RnnCacheFormatter::format(TransferSession& session)
                 bufferSizesPerTarget[t] = ssmBufBytes + convBufBytes;
             }
 
-            auto const* sendCancelFlag = &session.getDataContext().getTransferTerminate();
+            auto const* sendCancelFlag = common::getEnvDisaggEnableInflightCancel()
+                ? &session.getDataContext().getTransferTerminate()
+                : nullptr;
             auto cacheBufferId = mRnnCacheTransBufferManager->assignBufferIndexForSend(sendCancelFlag);
             BufferIndexHolder sendHolder(*mRnnCacheTransBufferManager, cacheBufferId, /*isRecv=*/false);
             auto allocationResult = mRnnCacheTransBufferManager->getOrAllocateSendBuffers(
@@ -217,6 +219,10 @@ void RnnCacheFormatter::format(TransferSession& session)
             int deviceId;
             TLLM_CUDA_CHECK(cudaGetDevice(&deviceId));
             auto preAllocSendBuffer = mRnnCacheTransBufferManager->getSendBuffer(cacheBufferId);
+            if (sendCancelFlag != nullptr && sendCancelFlag->load(std::memory_order_relaxed))
+            {
+                TLLM_THROW("Unified-pool RNN cache transfer cancelled before NIXL submission");
+            }
             try
             {
                 sendAllBuffers(session, deviceId, outputBuffers, bufferCoverTargetNum, preAllocSendBuffer,
@@ -372,15 +378,21 @@ void RnnCacheFormatter::unformat(TransferSession& session)
 
             // Use pre-assigned buffer ID from NIXL connection if available.
             std::optional<int> cacheBufferId = std::nullopt;
+            BufferIndexHolder recvHolder;
             auto preAssignedRnnId
                 = connections[rnnRecvConns[0]]->getPreAssignedBufferId(static_cast<uint8_t>(BufferKind::kRNN));
             if (preAssignedRnnId.has_value())
             {
                 cacheBufferId = static_cast<int>(*preAssignedRnnId);
+                if (!session.hasReservedRecvBuffer(*mRnnCacheTransBufferManager))
+                {
+                    recvHolder = BufferIndexHolder(*mRnnCacheTransBufferManager, cacheBufferId, /*isRecv=*/true);
+                }
             }
             else
             {
                 cacheBufferId = mRnnCacheTransBufferManager->assignBufferIndexForRecv();
+                recvHolder = BufferIndexHolder(*mRnnCacheTransBufferManager, cacheBufferId, /*isRecv=*/true);
             }
 
             auto allocationResult = mRnnCacheTransBufferManager->getOrAllocateRecvBuffers(
@@ -427,9 +439,11 @@ void RnnCacheFormatter::unformat(TransferSession& session)
 
             bufferManager.getStream().synchronize();
 
-            mRnnCacheTransBufferManager->freeBufferIndexForRecv(cacheBufferId);
+            recvHolder.release();
         }
     }
+
+    (void) session.releaseReservedRecvBuffer(*mRnnCacheTransBufferManager);
 
     TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), "End receiving unified pool RNN state for request ID: %ld.",
         llmRequest.mRequestId);

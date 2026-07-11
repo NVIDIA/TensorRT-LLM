@@ -321,6 +321,7 @@ void NixlHelper::posixFileToGpuFallback(MemoryDescs const& memoryDescs, FileDesc
 NixlTransferStatus::NixlTransferStatus(std::weak_ptr<nixlAgent> agent, nixlXferReqH* handle)
     : mWeakAgent{std::move(agent)}
     , mHandle{handle}
+    , mSynchronizeHandleAccess{common::getEnvDisaggEnableInflightCancel()}
 {
     TLLM_CHECK(!mWeakAgent.expired());
     TLLM_CHECK(mHandle);
@@ -510,24 +511,7 @@ TransferState NixlTransferStatus::wait(int64_t timeout_ms) const
 
     while (true)
     {
-        nixl_status_t status;
-        {
-            std::lock_guard<std::mutex> lock(mHandleMutex);
-            if (mHandle == nullptr)
-            {
-                mLastStatus.store(static_cast<int>(NIXL_ERR_INVALID_PARAM), std::memory_order_relaxed);
-                return TransferState::kFAILURE;
-            }
-            auto agent = mWeakAgent.lock();
-            if (!agent)
-            {
-                // Owning agent was reset; report failure so callers don't deref a null status.
-                mLastStatus.store(static_cast<int>(NIXL_ERR_INVALID_PARAM), std::memory_order_relaxed);
-                return TransferState::kFAILURE;
-            }
-            status = agent->getXferStatus(mHandle);
-            mLastStatus.store(static_cast<int>(status), std::memory_order_relaxed);
-        }
+        auto const status = queryStatus();
         if (status == NIXL_SUCCESS)
         {
             return TransferState::kSUCCESS;
@@ -569,21 +553,36 @@ std::string NixlTransferStatus::getLastStatusStr() const
 
 [[nodiscard]] bool NixlTransferStatus::isCompleted() const
 {
-    std::lock_guard<std::mutex> lock(mHandleMutex);
-    if (mHandle == nullptr)
+    return queryStatus() == NIXL_SUCCESS;
+}
+
+nixl_status_t NixlTransferStatus::queryStatus() const
+{
+    auto const query = [this]()
     {
-        mLastStatus.store(static_cast<int>(NIXL_ERR_INVALID_PARAM), std::memory_order_relaxed);
-        return false;
-    }
-    auto agent = mWeakAgent.lock();
-    if (!agent)
+        if (mHandle == nullptr)
+        {
+            mLastStatus.store(static_cast<int>(NIXL_ERR_INVALID_PARAM), std::memory_order_relaxed);
+            return NIXL_ERR_INVALID_PARAM;
+        }
+        auto agent = mWeakAgent.lock();
+        if (!agent)
+        {
+            // Owning agent was reset; report failure so callers don't deref a null status.
+            mLastStatus.store(static_cast<int>(NIXL_ERR_INVALID_PARAM), std::memory_order_relaxed);
+            return NIXL_ERR_INVALID_PARAM;
+        }
+        auto const status = agent->getXferStatus(mHandle);
+        mLastStatus.store(static_cast<int>(status), std::memory_order_relaxed);
+        return status;
+    };
+
+    if (mSynchronizeHandleAccess)
     {
-        mLastStatus.store(static_cast<int>(NIXL_ERR_INVALID_PARAM), std::memory_order_relaxed);
-        return false;
+        std::lock_guard<std::mutex> lock(mHandleMutex);
+        return query();
     }
-    auto status = agent->getXferStatus(mHandle);
-    mLastStatus.store(static_cast<int>(status), std::memory_order_relaxed);
-    return status == NIXL_SUCCESS;
+    return query();
 }
 
 [[nodiscard]] bool NixlTransferStatus::release()

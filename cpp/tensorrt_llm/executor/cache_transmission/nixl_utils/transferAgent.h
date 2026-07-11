@@ -77,10 +77,13 @@ public:
     [[nodiscard]] bool release() override;
 
 private:
+    [[nodiscard]] nixl_status_t queryStatus() const;
+
     // weak_ptr so the status outliving the owning agent is safe (lock() returns null after reset).
     std::weak_ptr<nixlAgent> mWeakAgent;
     nixlXferReqH* mHandle{};
     mutable std::atomic<int> mLastStatus{0};
+    bool const mSynchronizeHandleAccess;
     mutable std::mutex mHandleMutex;
 };
 

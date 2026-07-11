@@ -411,6 +411,7 @@ def test_cancel_request_in_transmission(attention_type):
 
     # Block the main thread due to the async operation
     time.sleep(2)
+    kv_cache_transceiver_gen.check_gen_transfer_status(0)
     assert gen_request.state == LlmRequestState.DISAGG_TRANS_ERROR
 
 
@@ -1025,4 +1026,5 @@ def test_hybrid_cache_transceiver_cancel_request(backend):
 
     # Block the main thread due to the async operation
     time.sleep(2)
+    cache_transceiver_gen.check_gen_transfer_status(0)
     assert gen_request.state == LlmRequestState.DISAGG_TRANS_ERROR

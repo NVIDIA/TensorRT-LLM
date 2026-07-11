@@ -111,6 +111,11 @@ public:
         return mHeld;
     }
 
+    [[nodiscard]] bool isBoundTo(BaseTransBufferManager const& manager) const noexcept
+    {
+        return mMgr == &manager;
+    }
+
     /// @brief Relinquish ownership without releasing. Use when a downstream
     ///        owner (e.g. the formatter inside receiveSync) takes over the
     ///        release responsibility on the happy path.

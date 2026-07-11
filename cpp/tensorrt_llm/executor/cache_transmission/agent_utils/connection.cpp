@@ -189,25 +189,35 @@ void AgentConnection::send(DataContext const& ctx, void const* data, size_t size
     NotificationInfo notificationInfo{syncInfo};
     std::stringstream ss;
     NotificationInfo::serialize(notificationInfo, ss);
-    static constexpr int64_t kCancelPollTimeoutMs = 100;
-    TransferState transferState = TransferState::kIN_PROGRESS;
-    while (transferState == TransferState::kIN_PROGRESS)
+    bool const inflightCancelEnabled = common::getEnvDisaggEnableInflightCancel();
+    TransferState transferState;
+    if (!inflightCancelEnabled)
     {
-        transferState = status->wait(kCancelPollTimeoutMs);
-        if (transferState == TransferState::kIN_PROGRESS && ctx.getTransferTerminate().load(std::memory_order_relaxed))
+        transferState = status->wait();
+    }
+    else
+    {
+        static constexpr int64_t kCancelPollTimeoutMs = 100;
+        transferState = TransferState::kIN_PROGRESS;
+        while (transferState == TransferState::kIN_PROGRESS)
         {
-            bool const released = status->release();
-            TLLM_LOG_WARNING(
-                "AgentConnection::send cancelled while transfer was in progress (ctx tag=%d, remote=%s, "
-                "releaseAccepted=%d)",
-                ctx.getTag(), mRemoteAgentName.c_str(), released);
-            TLLM_CHECK_WITH_INFO(
-                released, "AgentConnection::send cancel could not release the backend transfer handle");
-            TLLM_THROW("AgentConnection::send cancelled mid-transfer");
+            transferState = status->wait(kCancelPollTimeoutMs);
+            if (transferState == TransferState::kIN_PROGRESS
+                && ctx.getTransferTerminate().load(std::memory_order_relaxed))
+            {
+                bool const released = status->release();
+                TLLM_LOG_WARNING(
+                    "AgentConnection::send cancelled while transfer was in progress (ctx tag=%d, remote=%s, "
+                    "releaseAccepted=%d)",
+                    ctx.getTag(), mRemoteAgentName.c_str(), released);
+                TLLM_CHECK_WITH_INFO(
+                    released, "AgentConnection::send cancel could not release the backend transfer handle");
+                TLLM_THROW("AgentConnection::send cancelled mid-transfer");
+            }
         }
     }
     TLLM_CHECK_WITH_INFO(transferState == TransferState::kSUCCESS, "AgentConnection::send failed");
-    if (ctx.getTransferTerminate().load(std::memory_order_relaxed))
+    if (inflightCancelEnabled && ctx.getTransferTerminate().load(std::memory_order_relaxed))
     {
         bool const released = status->release();
         TLLM_LOG_WARNING(
@@ -290,7 +300,8 @@ void AgentConnection::sendRequestAndBufferInfo(batch_manager::RequestInfo& reque
     std::stringstream ss;
     NotificationInfo notificationInfo{requestAndBufferInfo};
     NotificationInfo::serialize(notificationInfo, ss);
-    if (perRequestCancel != nullptr && perRequestCancel->load(std::memory_order_relaxed))
+    if (common::getEnvDisaggEnableInflightCancel() && perRequestCancel != nullptr
+        && perRequestCancel->load(std::memory_order_relaxed))
     {
         TLLM_THROW("sendRequestAndBufferInfo cancelled before notify");
     }

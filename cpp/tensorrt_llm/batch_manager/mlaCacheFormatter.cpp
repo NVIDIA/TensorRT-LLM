@@ -253,7 +253,8 @@ void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& ses
             return bufferSizeForTarget;
         };
         auto bufferEleSizes = getBufferSizeForTarget();
-        auto const* sendCancelFlag = &session.getDataContext().getTransferTerminate();
+        auto const* sendCancelFlag
+            = common::getEnvDisaggEnableInflightCancel() ? &session.getDataContext().getTransferTerminate() : nullptr;
         auto cacheBufferId = mCacheTransBufferManagers[transferIndexerKCache]->assignBufferIndexForSend(sendCancelFlag);
         BufferIndexHolder sendHolder(
             *mCacheTransBufferManagers[transferIndexerKCache], cacheBufferId, /*isRecv=*/false);
@@ -346,6 +347,11 @@ void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& ses
             auto endTime = LlmRequest::getSteadyClockNow();
             session.appendMeasure(startTime, endTime, outputSplitCaches.at(cacheIdx)->getSizeInBytes());
         };
+
+        if (sendCancelFlag != nullptr && sendCancelFlag->load(std::memory_order_relaxed))
+        {
+            TLLM_THROW("MLA cache transfer cancelled before NIXL submission");
+        }
 
         try
         {
@@ -519,13 +525,18 @@ void MLACacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& s
             if (preAssignedId.has_value())
             {
                 cacheBufferId = static_cast<int>(*preAssignedId);
+                if (!session.hasReservedRecvBuffer(*mCacheTransBufferManagers[transferIndexerKCache]))
+                {
+                    recvHolder = BufferIndexHolder(
+                        *mCacheTransBufferManagers[transferIndexerKCache], cacheBufferId, /*isRecv=*/true);
+                }
             }
             else
             {
                 cacheBufferId = mCacheTransBufferManagers[transferIndexerKCache]->assignBufferIndexForRecv();
+                recvHolder = BufferIndexHolder(
+                    *mCacheTransBufferManagers[transferIndexerKCache], cacheBufferId, /*isRecv=*/true);
             }
-            recvHolder
-                = BufferIndexHolder(*mCacheTransBufferManagers[transferIndexerKCache], cacheBufferId, /*isRecv=*/true);
 
             auto targetNum = pickUpConnections.size();
 
@@ -673,6 +684,7 @@ void MLACacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& s
             bufferManager.getStream().synchronize();
         }
 
+        (void) session.releaseReservedRecvBuffer(*mCacheTransBufferManagers[transferIndexerKCache]);
         recvHolder.release();
     }
     session.setTime(TransferSession::kTimePostprocess);

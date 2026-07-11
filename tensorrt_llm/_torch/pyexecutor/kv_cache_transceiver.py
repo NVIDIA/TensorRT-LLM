@@ -21,6 +21,9 @@ BackendTypeCpp = tensorrt_llm.bindings.executor.CacheTransceiverBackendType
 
 _DISAGG_INFLIGHT_CANCEL_ENABLED_ENV = "TRTLLM_DISAGG_ENABLE_INFLIGHT_CANCEL"
 _NIXL_KVCACHE_BACKEND_ENV = "TRTLLM_NIXL_KVCACHE_BACKEND"
+_DISABLE_KV_CACHE_TRANSFER_OVERLAP_ENV = "TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP"
+_DISAGG_LAYERWISE_ENV = "TRTLLM_DISAGG_LAYERWISE"
+_TRY_ZCOPY_FOR_KV_CACHE_TRANSFER_ENV = "TRTLLM_TRY_ZCOPY_FOR_KVCACHE_TRANSFER"
 _SUPPORTED_INFLIGHT_CANCEL_NIXL_BACKEND = "UCX"
 _CACHE_TRANSCEIVER_BACKEND_ENV_VARS = (
     ("TRTLLM_USE_NIXL_KVCACHE", "NIXL"),
@@ -51,7 +54,11 @@ def _is_disagg_inflight_cancel_config_supported(
     nixl_backend = getenv(_NIXL_KVCACHE_BACKEND_ENV,
                           _SUPPORTED_INFLIGHT_CANCEL_NIXL_BACKEND)
     return (runtime == "CPP" and cache_transceiver_config.backend == "NIXL"
-            and nixl_backend == _SUPPORTED_INFLIGHT_CANCEL_NIXL_BACKEND)
+            and nixl_backend == _SUPPORTED_INFLIGHT_CANCEL_NIXL_BACKEND
+            and cache_transceiver_config.kv_transfer_timeout_ms is not None
+            and getenv(_DISABLE_KV_CACHE_TRANSFER_OVERLAP_ENV) != "1"
+            and getenv(_DISAGG_LAYERWISE_ENV) != "1"
+            and getenv(_TRY_ZCOPY_FOR_KV_CACHE_TRANSFER_ENV) != "1")
 
 
 def _validate_disagg_inflight_cancel_config(
@@ -63,7 +70,8 @@ def _validate_disagg_inflight_cancel_config(
         env_name for env_name, _ in _CACHE_TRANSCEIVER_BACKEND_ENV_VARS
         if getenv(env_name) == "1"
     ]
-    if len(enabled_backend_env_vars) > 1:
+    if (cache_transceiver_config.backend == "DEFAULT"
+            and len(enabled_backend_env_vars) > 1):
         raise ValueError(
             f"{_DISAGG_INFLIGHT_CANCEL_ENABLED_ENV}=1 requires an "
             "unambiguous cache transceiver backend, but multiple legacy "
@@ -75,13 +83,21 @@ def _validate_disagg_inflight_cancel_config(
     runtime = cache_transceiver_config.transceiver_runtime or "CPP"
     nixl_backend = getenv(_NIXL_KVCACHE_BACKEND_ENV,
                           _SUPPORTED_INFLIGHT_CANCEL_NIXL_BACKEND)
+    disable_overlap = getenv(_DISABLE_KV_CACHE_TRANSFER_OVERLAP_ENV)
+    layerwise = getenv(_DISAGG_LAYERWISE_ENV)
+    try_zcopy = getenv(_TRY_ZCOPY_FOR_KV_CACHE_TRANSFER_ENV)
     raise ValueError(
         f"{_DISAGG_INFLIGHT_CANCEL_ENABLED_ENV}=1 is experimental and "
         "currently supported only with transceiver_runtime='CPP', "
-        "backend='NIXL', and the UCX NIXL backend; got "
+        "backend='NIXL', the UCX NIXL backend, a finite "
+        "kv_transfer_timeout_ms, asynchronous non-layer-wise transfer, and "
+        "zero-copy disabled; got "
         f"transceiver_runtime={runtime!r}, "
         f"backend={cache_transceiver_config.backend!r}, "
-        f"resolved_nixl_backend={nixl_backend!r}.")
+        f"resolved_nixl_backend={nixl_backend!r}, "
+        f"kv_transfer_timeout_ms={cache_transceiver_config.kv_transfer_timeout_ms!r}, "
+        f"disable_transfer_overlap={disable_overlap!r}, "
+        f"layerwise={layerwise!r}, try_zcopy={try_zcopy!r}.")
 
 
 def mapping_to_world_config(mapping: Mapping) -> WorldConfig:

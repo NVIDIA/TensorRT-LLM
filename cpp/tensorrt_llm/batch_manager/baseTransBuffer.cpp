@@ -332,13 +332,20 @@ std::optional<int> BaseTransBufferManager::assignBufferIndex(ConcurrenceResource
         return resource.mPoisoned.load(std::memory_order_relaxed)
             || static_cast<size_t>(resource.mConcurrence) < bufferCount;
     };
-    auto const slice = std::chrono::milliseconds{waitSliceMs};
-    while (!predicate())
+    if (perRequestCancel == nullptr)
     {
-        resource.mBuffersCV.wait_for(lk, slice);
-        if (isCancelled())
+        resource.mBuffersCV.wait(lk, predicate);
+    }
+    else
+    {
+        auto const slice = std::chrono::milliseconds{waitSliceMs};
+        while (!predicate())
         {
-            TLLM_THROW("Cache transfer buffer acquisition cancelled");
+            resource.mBuffersCV.wait_for(lk, slice);
+            if (isCancelled())
+            {
+                TLLM_THROW("Cache transfer buffer acquisition cancelled");
+            }
         }
     }
     if (isCancelled())

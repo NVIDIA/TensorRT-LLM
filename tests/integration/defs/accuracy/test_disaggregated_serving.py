@@ -1086,19 +1086,21 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_device(2)
     @pytest.mark.skip_less_device_memory(60000)
     @skip_no_hopper
-    def test_gen_only_sync(self):
-        """Test gen-only synchronous KV transfer path with NIXL C++ transceiver.
+    @pytest.mark.parametrize("transceiver_runtime", ["PYTHON", "CPP"],
+                             ids=["python", "cpp"])
+    def test_gen_only_sync(self, transceiver_runtime):
+        """Test gen-only synchronous KV transfer with each NIXL runtime.
 
         Sets TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP=1 so the gen worker calls
-        the blocking request_and_receive_sync path. A bounded client timeout
-        makes a stuck transfer fail this test instead of waiting for its outer
-        one-hour timeout.
+        the blocking request_and_receive_sync path. The C++ variant uses a
+        bounded client timeout so a stuck transfer fails this test instead of
+        waiting for its outer one-hour timeout.
         """
         ctx_server_config = {
             "disable_overlap_scheduler": True,
             "cache_transceiver_config": {
                 "backend": "NIXL",
-                "transceiver_runtime": "CPP",
+                "transceiver_runtime": transceiver_runtime,
                 "max_tokens_in_buffer": 4096,
             },
         }
@@ -1106,7 +1108,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             "disable_overlap_scheduler": True,
             "cache_transceiver_config": {
                 "backend": "NIXL",
-                "transceiver_runtime": "CPP",
+                "transceiver_runtime": transceiver_runtime,
                 "max_tokens_in_buffer": 4096,
             },
         }
@@ -1127,8 +1129,10 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                 self.MODEL_PATH,
                 # Apply to both servers: gen worker uses sync receive path.
                 extra_env={"TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP": "1"},
-                request_timeout_s=120,
-                request_max_retries=0,
+                request_timeout_s=(120 if transceiver_runtime == "CPP" else
+                                   DEFAULT_REQUEST_TIMEOUT_S),
+                request_max_retries=(0
+                                     if transceiver_runtime == "CPP" else None),
         ) as llm:
             run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])
 
