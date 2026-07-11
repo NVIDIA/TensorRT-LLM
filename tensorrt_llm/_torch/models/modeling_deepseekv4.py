@@ -1024,7 +1024,21 @@ class DeepseekV4WeightLoader:
                                 ][:]
                                 fused_a_scale = torch.cat([q_a_proj_scale, fused_a_scale], dim=0)
 
-                            _copy_deepseek_v4_fused_a_weight_scale(module, fused_a, fused_a_scale)
+                            if hasattr(module, "weight_scale"):
+                                _copy_deepseek_v4_fused_a_weight_scale(
+                                    module, fused_a, fused_a_scale
+                                )
+                            else:
+                                # Module was built unquantized (e.g. MIXED_PRECISION
+                                # with "*.attn.*" in exclude_modules, as in the
+                                # ModelOpt experts-only NVFP4 checkpoints) while the
+                                # checkpoint stores fused A as block-scale FP8:
+                                # dequantize instead of copying raw FP8 bytes into
+                                # the BF16 weight.
+                                fused_a = weight_dequant(
+                                    fused_a.cuda().contiguous(),
+                                    fused_a_scale.cuda().contiguous(),
+                                ).to(module.weight.dtype)
                         # For DeepseekV32: kv_a_proj_with_mqa is oversized
                         # to include indexer k weights, which is filled in post_load_weights.
                         module.weight.data[0 : fused_a.shape[0]].copy_(fused_a)
