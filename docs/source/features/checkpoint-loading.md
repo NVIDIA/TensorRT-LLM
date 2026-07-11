@@ -162,7 +162,7 @@ changed, so a warm cache skips the download:
 ```bash
 export TRTLLM_MODEL_CACHE="${TRTLLM_MODEL_CACHE:-/models/cache}"
 S3_PREFIX="${S3_PREFIX:-engines/llama-3.1-8b-fp8}"
-S3_PREFIX="${S3_PREFIX%/}"
+S3_PREFIX="$(printf '%s' "$S3_PREFIX" | sed 's#^/*##; s#/*$##')"
 LOCAL_DIR="${TRTLLM_MODEL_CACHE}/${S3_PREFIX}"
 
 aws s3 sync "s3://${S3_BUCKET_NAME}/${S3_PREFIX}" \
