@@ -36,6 +36,7 @@ from ...model_config import ModelConfig
 from ...utils import ActivationType, AuxStreamType, Fp4QuantizedTensor
 from .interface import AlltoallMethodType, MoE, MoEWeightLoadingMode
 from .moe_op_backend import MoEOpBackend, get_op_backend
+from .wide_ep_ft import get_wide_ep_ft_options
 
 # isort: off
 from .quantization import (
@@ -291,6 +292,8 @@ class TRTLLMGenFusedMoE(MoE):
                         ep_size, self.routing_method.experts_per_token,
                         max_num_tokens, hidden_size, dtype,
                         self.num_experts if self.layer_load_balancer else None)
+                    ep_group_health, watchdog_timeout_s, watchdog_poll_interval_s = (
+                        get_wide_ep_ft_options(model_config))
 
                     self.moe_a2a = MoeAlltoAll(
                         mapping=self.mapping,
@@ -299,7 +302,11 @@ class TRTLLMGenFusedMoE(MoE):
                         num_slots=self.num_slots,
                         workspace_size_per_rank=workspace_size,
                         num_experts=self.num_experts
-                        if self.layer_load_balancer else None)
+                        if self.layer_load_balancer else None,
+                        ep_group_health=ep_group_health,
+                        alltoall_watchdog_timeout_s=watchdog_timeout_s,
+                        alltoall_watchdog_poll_interval_s=
+                        watchdog_poll_interval_s)
                 elif self.alltoall_method_type == AlltoallMethodType.DeepEP or self.alltoall_method_type == AlltoallMethodType.DeepEPLowLatency:
                     raise NotImplementedError(
                         "DeepEP and DeepEPLowLatency are not supported for TRTLLMGenFusedMoE yet"
@@ -551,9 +558,6 @@ class TRTLLMGenFusedMoE(MoE):
             kargs["allow_partial_loading"] = allow_partial_loading
         self.quant_method.load_weights(self, weights, self.weight_loading_mode,
                                        **kargs)
-
-    def post_load_weights(self):
-        self.quant_method.post_load_weights(self)
 
     def quantize_input(self, x, post_quant_comm: bool = True):
         """Quantize inputs prior to post-communication (alltoall/allgather) or before MoE computation.

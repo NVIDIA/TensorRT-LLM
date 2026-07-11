@@ -1130,6 +1130,12 @@ int AttentionOp::mlaGeneration(
 
         tllmRunnerParams.oPtr = reinterpret_cast<void*>(params.context_buf);
         tllmRunnerParams.oSfPtr = generation_params.context_buf_sf;
+        if (params.dsv4_epilogue_fusion.enabled)
+        {
+            tllmRunnerParams.mDsv4EpilogueFusion.enabled = true;
+            tllmRunnerParams.mDsv4EpilogueFusion.cosSinCache = params.dsv4_epilogue_fusion.cos_sin_cache;
+            tllmRunnerParams.mDsv4EpilogueFusion.scaleBufM = params.dsv4_epilogue_fusion.scale_buf_m;
+        }
 
         // softmax stats if needed
         tllmRunnerParams.softmaxStatsPtr = generation_params.softmax_stats;
@@ -1601,6 +1607,16 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
     auto const workspaceViews = AttentionWorkspaceManager::materializeContext<T>(
         params.workspace, workspaceLayout, cpMaxPadedSequenceLength, getHeadSize(), mNumHeads, mNumKVHeads);
 
+    auto* fp8QBuf = workspaceViews.fp8QBuf;
+    // Fused FP8-Q path: caller pre-fills the nope segment of `quant_q_buf`;
+    // route the context-MLA Q pointer to it so the fused RoPE kernel appends
+    // rope FP8 in place and the FMHA Q load reads the merged [nope|rope] buffer.
+    if (mIsMLAEnabled && params.mla_param != nullptr && params.mla_param->fuse_q_fp8_in_rope
+        && params.mla_param->quant_q_buf != nullptr)
+    {
+        fp8QBuf = reinterpret_cast<__nv_fp8_e4m3*>(params.mla_param->quant_q_buf);
+    }
+
     // build attention mask, cu_seqlens, and padding offset tensors
     // Note: self attn and cross attn should use different params
     // cross attn's seqlen info is from encoder input lengths, not decoder input lengths!
@@ -1827,7 +1843,7 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
             // Set BMM scales for FP8 context computation
             params.mla_param->bmm1_scale = workspaceViews.fmhaBmm1Scale;
             params.mla_param->bmm2_scale = workspaceViews.fmhaBmm2Scale;
-            params.mla_param->quant_q_buf = mFP8ContextMLA ? workspaceViews.fp8QBuf : nullptr;
+            params.mla_param->quant_q_buf = mFP8ContextMLA ? fp8QBuf : nullptr;
             params.mla_param->quant_k_buf = mFP8ContextMLA ? workspaceViews.fp8KBuf : nullptr;
             params.mla_param->quant_v_buf = mFP8ContextMLA ? workspaceViews.fp8VBuf : nullptr;
             // Set additional scales for context phase
@@ -1840,11 +1856,16 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
                 = 1 / (mQScaling * sqrt((float) (mMLAParams.qk_nope_head_dim + mMLAParams.qk_rope_head_dim)));
             // The sparse MLA is in the absorption mode for the context phase.
             params.mla_param->absorption_mode = useSparseMLA();
+            // Fused FP8-Q-quant: RoPE kernel writes FP8 rope into `quant_q_buf`,
+            // so we skip the standalone invokeMLAContextFp8Quantize call below.
+            bool const useFusedQFp8 = params.mla_param->fuse_q_fp8_in_rope && mFP8ContextMLA
+                && params.mla_param->absorption_mode && cache_type == KvCacheDataType::FP8
+                && params.mla_param->quant_q_buf != nullptr && params.mla_param->quant_scale_qkv != nullptr;
             if (params.mla_param->latent_cache != nullptr)
             {
                 invokeMLARopeContext<T, KVCacheBuffer>(*params.mla_param, kv_cache_buffer, stream);
             }
-            if (mFP8ContextMLA)
+            if (mFP8ContextMLA && !useFusedQFp8)
             {
                 invokeMLAContextFp8Quantize(*params.mla_param, params.total_kv_len, stream);
             }
@@ -1956,14 +1977,14 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
             {
                 TLLM_CHECK_WITH_INFO(
                     mFmhaDispatcher->isSeparateQAndKvInput(), "Separate QKV input is required for fp8 context MLA");
-                TLLM_CHECK_WITH_INFO(workspaceViews.fp8QBuf != nullptr, "FP8 q buffer is required for fp8 context MLA");
+                TLLM_CHECK_WITH_INFO(fp8QBuf != nullptr, "FP8 q buffer is required for fp8 context MLA");
                 // In sparse MLA (absorption mode), K and V are stored in KV cache, not as separate FP8 buffers
                 TLLM_CHECK_WITH_INFO(useSparseMLA() || workspaceViews.fp8KBuf != nullptr,
                     "FP8 k buffer is required for fp8 context MLA in non-sparse mode");
                 TLLM_CHECK_WITH_INFO(useSparseMLA() || workspaceViews.fp8VBuf != nullptr,
                     "FP8 v buffer is required for fp8 context MLA in non-sparse mode");
 
-                fmhaParams.qPtr = reinterpret_cast<void const*>(workspaceViews.fp8QBuf);
+                fmhaParams.qPtr = reinterpret_cast<void const*>(fp8QBuf);
                 fmhaParams.kPtr = useSparseMLA() ? nullptr : reinterpret_cast<void const*>(workspaceViews.fp8KBuf);
                 fmhaParams.vPtr = useSparseMLA() ? nullptr : reinterpret_cast<void const*>(workspaceViews.fp8VBuf);
             }
@@ -2003,6 +2024,12 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
         // Only use [totalLength, h / cpSize, Dh].
         fmhaParams.outputPtr = mCpSize > 1 ? workspaceViews.gatherOutBuffer : params.context_buf;
         fmhaParams.outputSfPtr = params.context_buf_sf;
+        if (params.mla_param != nullptr && params.mla_param->dsv4_epilogue_fusion.enabled)
+        {
+            fmhaParams.dsv4EpilogueFusion.enabled = true;
+            fmhaParams.dsv4EpilogueFusion.cosSinCache = params.mla_param->dsv4_epilogue_fusion.cos_sin_cache;
+            fmhaParams.dsv4EpilogueFusion.scaleBufM = params.mla_param->dsv4_epilogue_fusion.scale_buf_m;
+        }
         fmhaParams.attentionSinksPtr = params.attention_sinks;
         fmhaParams.packedMaskPtr = params.attention_packed_mask;
         if constexpr (std::is_same_v<KVCacheBuffer, KVBlockArray>)
@@ -2951,6 +2978,10 @@ int AttentionOp::initialize() noexcept
             fmhaParams.dataTypeKv = DATA_TYPE_E4M3;
             fmhaParams.dataTypeOut = DATA_TYPE_BF16;
         }
+        if (mFusesDsv4InvRopeFp8Quant)
+        {
+            fmhaParams.dataTypeOut = DATA_TYPE_E4M3;
+        }
         // TODO: remove forceFp32Acc from MHARunnerFixedParams after adding host_runtime_perf_knobs to
         // bertAttentionPlugin input tensors, so that we can change mLaunchParams.force_fp32_acc value in runtime.
         fmhaParams.forceFp32Acc = false;
@@ -3025,6 +3056,7 @@ int AttentionOp::initialize() noexcept
         fmhaParams.scaleAlibi = isAliBiWithScale();
         fmhaParams.useSparseMLA = useSparseMLA();
         fmhaParams.useTllmGenSparseAttention = useTllmGenSparseAttention();
+        fmhaParams.fusesDsv4InvRopeFp8Quant = mFusesDsv4InvRopeFp8Quant;
 
         // SageAttention: set block sizes for sage quantization.
         if (useSageAttn)
@@ -3069,9 +3101,14 @@ int AttentionOp::initialize() noexcept
                     qDataType = DATA_TYPE_E4M3;
                     kvDataType = DATA_TYPE_E4M3;
                 }
+                if (mFusesDsv4InvRopeFp8Quant)
+                {
+                    outputDataType = DATA_TYPE_E4M3;
+                }
 
                 // Instantiate the mTllmGenFMHARunner used for MLA
-                mTllmGenFMHARunner.reset(new TllmGenFmhaRunner(qDataType, kvDataType, kvDataType, outputDataType));
+                mTllmGenFMHARunner.reset(new TllmGenFmhaRunner(
+                    qDataType, kvDataType, kvDataType, outputDataType, 0, 0, 0, 0, mFusesDsv4InvRopeFp8Quant));
             }
             else if (mIsGenerationMLA && !mUseGenFlashMLA)
             {

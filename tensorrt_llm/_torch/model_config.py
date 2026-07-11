@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import contextlib
 import errno
 import json
@@ -313,7 +328,8 @@ class ModelConfig(Generic[TConfig]):
             return False
         return model_architectures[0] not in [
             "BertForSequenceClassification", "Qwen2ForProcessRewardModel",
-            "Qwen2ForRewardModel", "LlamaForTextEmbedding"
+            "Qwen2ForRewardModel", "LlamaForTextEmbedding",
+            "Qwen3ForTextEmbedding"
         ]
         # TODO: should be 'not model_type == ModelType.ENCODER_ONLY'
         # once ModelType is used in pytorch flow.
@@ -429,6 +445,7 @@ class ModelConfig(Generic[TConfig]):
                 'group_size', quant_config.group_size)
             quant_config.exclude_modules = json_quant_configs.get(
                 'exclude_modules', quant_config.exclude_modules)
+
             for layer in mixed_quant_configs:
                 layer_cfg = mixed_quant_configs[layer]
                 config = QuantConfig()
@@ -817,7 +834,16 @@ class ModelConfig(Generic[TConfig]):
             if sparse_attention_config:
                 index_n_heads = sparse_attention_config.index_n_heads or pretrained_config.index_n_heads
                 index_head_dim = sparse_attention_config.index_head_dim or pretrained_config.index_head_dim
-                index_topk = sparse_attention_config.index_topk or pretrained_config.index_topk
+                # index_topk needs an explicit-set check rather than `or`: the
+                # DeepSeekV4SparseAttentionConfig default (512) is truthy, so a
+                # plain `or` shadows the checkpoint's index_topk (e.g. Pro's
+                # 1024) whenever the user did not set it. Mirror the window_size
+                # handling below and consult model_fields_set. (index_n_heads /
+                # index_head_dim stay on `or` since their defaults are None.)
+                if 'index_topk' in sparse_attention_config.model_fields_set:
+                    index_topk = sparse_attention_config.index_topk
+                else:
+                    index_topk = pretrained_config.index_topk
                 indexer_max_chunk_size = sparse_attention_config.indexer_max_chunk_size
                 skip_indexer_for_short_seqs = sparse_attention_config.skip_indexer_for_short_seqs
                 # Pass-through DSA tuning flags so user-set values survive the
@@ -838,13 +864,15 @@ class ModelConfig(Generic[TConfig]):
                 index_topk = pretrained_config.index_topk
                 indexer_max_chunk_size = None
                 skip_indexer_for_short_seqs = True
-                # Defaults match DeepSeekSparseAttentionConfig field defaults.
+                # Defaults match DeepSeekV4SparseAttentionConfig field defaults.
                 use_cute_dsl_topk = False
                 use_cute_dsl_paged_mqa_logits = False
                 q_split_threshold = 8192
                 indexer_rope_interleave = False
                 enable_heuristic_topk = False
-                indexer_k_dtype = "fp8"
+                default_sparse_attention_config = DeepSeekV4SparseAttentionConfig(
+                )
+                indexer_k_dtype = default_sparse_attention_config.indexer_k_dtype
             indexer_config = {}
             indexer_config['index_n_heads'] = index_n_heads
             indexer_config['index_head_dim'] = index_head_dim
@@ -882,7 +910,13 @@ class ModelConfig(Generic[TConfig]):
                     if sparse_attention_config:
                         index_n_heads = sparse_attention_config.index_n_heads or pretrained_config.index_n_heads
                         index_head_dim = sparse_attention_config.index_head_dim or pretrained_config.index_head_dim
-                        index_topk = sparse_attention_config.index_topk or pretrained_config.index_topk
+                        # Explicit-set check (see V4 path above): only honor a
+                        # user-provided index_topk; otherwise take the
+                        # checkpoint value rather than a truthy subclass default.
+                        if 'index_topk' in sparse_attention_config.model_fields_set:
+                            index_topk = sparse_attention_config.index_topk
+                        else:
+                            index_topk = pretrained_config.index_topk
                         indexer_max_chunk_size = sparse_attention_config.indexer_max_chunk_size
                         skip_indexer_for_short_seqs = sparse_attention_config.skip_indexer_for_short_seqs
                         use_cute_dsl_topk = sparse_attention_config.use_cute_dsl_topk

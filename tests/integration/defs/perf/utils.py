@@ -133,6 +133,22 @@ def add_host_port_to_cmd(cmd: List[str], host: str, port: int) -> List[str]:
     return cmd + ["--host", host, "--port", str(port)]
 
 
+def resolve_node_hostname() -> str:
+    """Node(s) that ran a case, recorded per-case (not per-run).
+
+    Parallel splits are submitted as separate SLURM allocations and can land on
+    different nodes within a single run, so a per-run hostname would be
+    ambiguous. We deliberately prefer the SLURM nodelist (a single string that
+    also covers multi-node allocations) over ``socket.gethostname()``: for a
+    single-node allocation it *is* the executing host, and for a multi-node one
+    it records the full allocation rather than one arbitrary rank. Falls back to
+    the local hostname for bare-metal / non-SLURM runs. Precedence:
+    ``SLURM_JOB_NODELIST`` -> ``SLURM_NODELIST`` -> ``socket.gethostname()``.
+    """
+    return (os.environ.get("SLURM_JOB_NODELIST")
+            or os.environ.get("SLURM_NODELIST") or socket.gethostname())
+
+
 #if hang time > 30 mins, it will be killed
 _STALL_TIMEOUT = 1800
 #if hang with error time > 3 mins, it will be killed
@@ -703,15 +719,9 @@ class AbstractPerfScriptTestClass(abc.ABC):
         if self._gpu_clock_lock:
             device_subtype = self._gpu_clock_lock.get_device_subtype()
 
-        # Node(s) that ran this case. Recorded per-case (not per-run) because
-        # parallel splits are submitted as separate SLURM allocations and can
-        # land on different nodes within a single run — a per-run hostname would
-        # be ambiguous. Prefer the SLURM nodelist (a single string that also
-        # covers multinode cases) and fall back to the local hostname for
-        # bare-metal/non-SLURM runs.
-        node_hostname = (os.environ.get("SLURM_JOB_NODELIST")
-                         or os.environ.get("SLURM_NODELIST")
-                         or socket.gethostname())
+        # Node(s) that ran this case (see resolve_node_hostname for why this is
+        # per-case and prefers the SLURM nodelist over socket.gethostname()).
+        node_hostname = resolve_node_hostname()
 
         test_description_dict = {
             "network_name": self.get_test_name(),

@@ -98,6 +98,10 @@ def _make_transceiver(
     transceiver._send_sessions = sessions
     transceiver._send_reqs = reqs or {rid: _FakeRequest() for rid in sessions}
     transceiver._sender_future_timeout_ms = 123
+    # Attributes read by check_context_transfer_status before it processes sessions.
+    transceiver._ever_had_send_session = True
+    transceiver._ctx_need_tp_sync = False
+    transceiver._ctx_need_pp_sync = False
     transceiver._transfer_worker = _FakeTransferWorker()
     transceiver._ctx_consensus = lambda local_ids: list(local_ids)
     transceiver._ctx_consensus_outcome = (
@@ -223,6 +227,63 @@ def test_gen_transfer_status_enters_consensus_when_sync_required() -> None:
     assert failed == []
     assert cancelled == []
     transceiver._gen_consensus.assert_called_once_with([])
+
+
+def test_consensus_outcome_uses_single_batched_allgather() -> None:
+    # The cancelled/failed/completed id lists are exchanged with ONE allgather
+    # (packed as a list-of-lists) instead of three; verify a single call and that
+    # union (cancelled/failed) + intersection (completed) semantics are preserved.
+    transceiver = object.__new__(KvCacheTransceiverV2)
+    calls: list = []
+
+    def fake_allgather(payload):
+        calls.append(payload)
+        # rank0 = this rank's [cancelled, failed, completed]; rank1 = a peer rank.
+        return [payload, [[], [99], [7, 8]]]
+
+    to_process = [1, 2, 7, 8, 99]
+    new_cancelled, new_failed, new_completed = transceiver._consensus_outcome(
+        to_process, [1], [2], [7], fake_allgather, True
+    )
+
+    assert len(calls) == 1  # batched: a single allgather, not three
+    assert calls[0] == [[1], [2], [7]]
+    assert new_cancelled == [1]  # union of cancelled across ranks
+    assert new_failed == [2, 99]  # union of failed across ranks
+    assert new_completed == [7]  # intersection only (8 is completed on the peer only)
+
+
+def test_ctx_consensus_fastpath_skips_when_idle(monkeypatch) -> None:
+    # With the fast-path enabled, an all-zero terminal count (one fixed-size
+    # allreduce) makes every rank skip the variable-length consensus; a non-zero
+    # count falls through to the normal consensus path.
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.disaggregation.transceiver._CTX_CONSENSUS_FASTPATH", True
+    )
+    transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver._ever_had_send_session = True
+    transceiver._ctx_need_tp_sync = True
+    transceiver._ctx_need_pp_sync = False
+    transceiver._send_sessions = {}
+    transceiver._send_reqs = {}
+    transceiver._dist = Mock()
+    transceiver._dist.allreduce = Mock(return_value=0)
+    transceiver._ctx_consensus = Mock(return_value=[])
+    transceiver._build_to_process = Mock(return_value=[])
+    transceiver._ctx_consensus_outcome = Mock(return_value=([], [], [], []))
+    transceiver._transfer_worker = _FakeTransferWorker()
+    transceiver._close_failed_sessions = Mock()
+
+    completed, failed = transceiver.check_context_transfer_status(at_least_request_num=0)
+
+    assert completed == [] and failed == []
+    transceiver._dist.allreduce.assert_called_once()
+    transceiver._ctx_consensus.assert_not_called()  # idle fast-path skipped the consensus
+
+    # Non-zero global terminal count => fast-path does not skip; consensus runs.
+    transceiver._dist.allreduce = Mock(return_value=2)
+    transceiver.check_context_transfer_status(at_least_request_num=0)
+    transceiver._ctx_consensus.assert_called_once()
 
 
 def test_tx_session_wait_complete_defaults_to_blocking() -> None:

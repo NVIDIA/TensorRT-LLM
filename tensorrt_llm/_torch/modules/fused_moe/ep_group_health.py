@@ -13,21 +13,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""EP group health tracking for WideEP fault tolerance.
+"""Committed EP data-plane membership for WideEP fault tolerance.
 
 This module provides :class:`EPGroupHealth`, a process-local, thread-safe data
-structure that records which ranks in an Expert Parallel (EP) group are currently
-alive vs. failed. It is the single source of truth for EP rank health within one
-process and is consumed by:
+structure that records which Expert Parallel (EP) ranks the recovery coordinator
+has committed as included vs. excluded from the data plane. It is consumed by:
 
   * AlltoAll communication backends (rank masking on dispatch / combine)
-  * The host-side AlltoAll watchdog (failure detection)
+  * The host-side AlltoAll watchdog (read-only expected-peer snapshot)
   * The MoE load balancer (emergency-mask reconfiguration)
   * The model engine and PyExecutor (degraded health reporting)
 
-Cross-process consensus on which ranks are dead (failure broadcast across the EP
-group) is the responsibility of higher-layer coordination components and is not
-performed here.
+Detected or suspected physical liveness is separate evidence. Higher-layer
+coordination reconciles that evidence and commits membership; detectors and
+telemetry consumers must not mutate this object to drive recovery.
 """
 
 import threading

@@ -190,7 +190,14 @@ class Selector:
         reasons = [f"[{rule.name}] {r.reason}" for rule, r in pairs]
         scope = _combine_scopes([r.scope for _, r in pairs])
         if scope is None:
-            return SelectionResult(scope=None, reasons=reasons + ["Scopes cannot be combined"])
+            # scope=None is a rule's force-fallback signal; attribute it, not a scope conflict.
+            forced = sorted({rule.name for rule, r in pairs if r.scope is None})
+            if forced:
+                summary = f"Fallback forced by rule(s): {', '.join(forced)}"
+            else:
+                actionable = sorted({r.scope for _, r in pairs if r.scope and r.scope != "noop"})
+                summary = f"Scopes cannot be combined: {', '.join(actionable)}"
+            return SelectionResult(scope=None, reasons=reasons + [summary])
 
         affected_stages: set[str] = set()
         for _, r in pairs:
@@ -242,7 +249,9 @@ def _load_pr_inputs(input_json_path: Path) -> PRInputs:
     # Pre-strip blank- and comment-only `+/-` lines once so every rule
     # sees a "meaningful changes only" diff. Avoids spurious anchor
     # walk-up and stage-select misfires from cosmetic edits.
-    diffs = {path: strip_noop_diff_lines(d) for path, d in data.get("diffs", {}).items()}
+    # A null diff (PR API omits the patch for binary, rename, or
+    # too-large diffs) normalizes to an empty diff.
+    diffs = {path: strip_noop_diff_lines(d or "") for path, d in data.get("diffs", {}).items()}
     return PRInputs(
         changed_files=list(data.get("changed_files", [])),
         diffs=diffs,

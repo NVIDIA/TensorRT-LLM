@@ -30,7 +30,7 @@ from tensorrt_llm.llmapi.llm_args import Field
 from tensorrt_llm.llmapi.utils import StrictBaseModel, set_api_status
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
-from .sparse_attention import SkipSoftmaxAttentionConfig
+from .sparse_attention import SkipSoftmaxAttentionConfig, VideoSparseAttentionConfig
 
 # =============================================================================
 # Type aliases
@@ -86,7 +86,7 @@ class QuantAttentionConfig(StrictBaseModel):
 
 # Discriminated union of sparse attention configs.
 SparseAttentionConfig = Annotated[
-    Union[SkipSoftmaxAttentionConfig],
+    Union[SkipSoftmaxAttentionConfig, VideoSparseAttentionConfig],
     Field(discriminator="algorithm"),
 ]
 
@@ -111,7 +111,10 @@ class AttentionConfig(StrictBaseModel):
     sparse_attention_config: Optional[SparseAttentionConfig] = Field(
         None,
         status="prototype",
-        description="Sparse attention configuration. Currently supports: skip_softmax.",
+        description=(
+            "Sparse attention recipe. Discriminated by algorithm: "
+            "skip_softmax (TRTLLM backend) or VSA (CUTEDSL backend)."
+        ),
     )
 
     @model_validator(mode="after")
@@ -158,6 +161,41 @@ class AttentionConfig(StrictBaseModel):
                 f"quant_attention_config requires backend in ('TRTLLM', 'CUTEDSL'), "
                 f"got backend='{self.backend}'. Either change backend or "
                 f"remove quant_attention_config."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_sparse_attention_config(self) -> "AttentionConfig":
+        if self.sparse_attention_config is None:
+            return self
+
+        algo = self.sparse_attention_config.algorithm
+        required_backend = {"skip_softmax": "TRTLLM", "vsa": "CUTEDSL"}.get(algo)
+        if required_backend is None:
+            return self
+
+        if self.backend != required_backend:
+            raise ValueError(
+                f"sparse_attention_config with algorithm='{algo}' requires "
+                f"backend='{required_backend}', got backend='{self.backend}'. "
+                f"Either set backend='{required_backend}' or remove "
+                f"sparse_attention_config."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_cutedsl_quant_sparse_mutex(self) -> "AttentionConfig":
+        # quant_attention_config and sparse_attention_config are mutually exclusive.
+        if (
+            self.backend == "CUTEDSL"
+            and self.quant_attention_config is not None
+            and self.sparse_attention_config is not None
+        ):
+            raise ValueError(
+                "CUTEDSL backend: quant_attention_config and "
+                "sparse_attention_config are mutually exclusive (the "
+                "CuTeDSLAttention dispatcher selects either the dense path "
+                "or the sparse VSA path, not both)."
             )
         return self
 
@@ -620,6 +658,7 @@ __all__ = [
     "QuantAttentionConfig",
     "SparseAttentionConfig",
     "SkipSoftmaxAttentionConfig",
+    "VideoSparseAttentionConfig",
     "AttentionConfig",
     "ParallelConfig",
     "BaseCacheConfig",

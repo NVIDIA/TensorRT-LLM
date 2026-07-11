@@ -23,6 +23,7 @@ from .executor import GenerationExecutor
 from .postproc_worker import PostprocWorkerConfig
 from .proxy import _check_collective_rpc_guard
 from .result import IterationResult
+from .rpc.rpc_common import RPCError
 from .rpc_proxy_mixin import RpcExecutorMixin
 from .rpc_worker import RpcWorker
 from .utils import create_mpi_comm_session, get_spawn_proxy_process_env
@@ -115,6 +116,17 @@ class GenerationExecutorRpcProxy(RpcExecutorMixin, GenerationExecutor):
             logger.debug(f"Error fetching stats via RPC: {e}")
             return []
 
+    def get_kv_cache_capacity(self) -> dict:
+        """Get static primary/GPU KV cache capacity from the runtime via RPC."""
+        try:
+            capacity = self.rpc_client.fetch_kv_cache_capacity_async().remote()
+            if isinstance(capacity, str):
+                capacity = json.loads(capacity)
+            return capacity if isinstance(capacity, dict) else {}
+        except (RPCError, json.JSONDecodeError) as e:
+            logger.debug(f"Error fetching kv cache capacity via RPC: {e}")
+            return {}
+
     def aget_stats(self, timeout: float) -> IterationResult:
         """Get iteration statistics from the runtime via RPC (async).
 
@@ -203,8 +215,10 @@ class GenerationExecutorRpcProxy(RpcExecutorMixin, GenerationExecutor):
     ) -> List:
         """Execute a method call on the rank-0 RpcWorker via the RPC client.
 
-        Rank-0-only shim; only ``model_world_size == 1`` is supported.
-        See :meth:`~tensorrt_llm.executor.proxy.GenerationExecutorProxy.collective_rpc`
+        Rank-0 RPC shim.  ``sleep`` and ``wakeup`` are allowed for
+        ``model_world_size > 1``; all other methods require
+        ``model_world_size == 1``.  See
+        :meth:`~tensorrt_llm.executor.proxy.GenerationExecutorProxy.collective_rpc`
         for details.
 
         Args:
@@ -223,11 +237,15 @@ class GenerationExecutorRpcProxy(RpcExecutorMixin, GenerationExecutor):
             (non-blocking).
 
         Raises:
-            NotImplementedError: If ``model_world_size > 1``, or if
-                ``unique_reply_rank`` or ``target_ranks`` are provided.
+            NotImplementedError: If ``model_world_size > 1`` and the method
+                is not in the allowed-methods set (currently ``sleep`` and
+                ``wakeup``), or if ``unique_reply_rank`` or ``target_ranks``
+                are provided.
         """
-        _check_collective_rpc_guard(self.model_world_size, unique_reply_rank,
-                                    target_ranks)
+        _check_collective_rpc_guard(self.model_world_size,
+                                    unique_reply_rank,
+                                    target_ranks,
+                                    method=method)
         kwargs = kwargs or {}
         remote_call = getattr(self.rpc_client, method)(*args, **kwargs)
         if non_block:

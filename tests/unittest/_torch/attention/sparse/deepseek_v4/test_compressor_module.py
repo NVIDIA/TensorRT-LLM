@@ -43,6 +43,7 @@ from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.deepseek_v4 import
 from tensorrt_llm._torch.modules.rotary_embedding import RopeParams
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
+from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.bindings import DataType, SamplingConfig
 from tensorrt_llm.bindings.internal.batch_manager import CacheType as CacheTypeCpp
 from tensorrt_llm.llmapi.llm_args import DeepSeekV4SparseAttentionConfig, KvCacheConfig
@@ -764,10 +765,14 @@ class CompressorWrapper:
         compress_ratios = [compress_ratio]
 
         # Create sparse attention config
+        indexer_k_dtype = (
+            "fp4" if get_sm_version() >= 100 and self.kv_cache_dtype != "fp8_blockwise" else "fp8"
+        )
         sparse_attn_config = DeepSeekV4SparseAttentionConfig(
             index_head_dim=INDEX_HEAD_DIM,
             window_size=self.WINDOW_SIZE,
             compress_ratios=compress_ratios,
+            indexer_k_dtype=indexer_k_dtype,
         )
 
         # Create KV cache config

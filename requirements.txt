@@ -7,6 +7,7 @@ cuda-python>=13
 diffusers>=0.37.1
 ftfy
 lark
+lazy_loader~=0.5
 mpi4py
 numpy>=2.0.0,<2.4 # numba 0.63.1 requires numpy<2.4
 onnx>=1.21.0
@@ -54,8 +55,7 @@ ordered-set
 peft>=0.18.1,<0.19.0
 patchelf
 einops
-flashinfer-python==0.6.12
-opencv-python-headless
+flashinfer-python==0.6.14
 xgrammar==0.1.32
 llguidance==0.7.29
 jsonschema
@@ -91,3 +91,4 @@ smg-grpc-proto>=0.4.2
 cache-dit>=1.3.5
 librosa
 msgpack
+uvloop>=0.19.0

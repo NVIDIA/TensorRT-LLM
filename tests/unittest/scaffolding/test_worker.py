@@ -18,10 +18,6 @@ from tensorrt_llm.scaffolding import (ChatTask, GenerationTask, TaskStatus,
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 from llmapi.test_llm import get_model_path
 
-_SCAFFOLDING_EXECUTOR_NVBUG = pytest.mark.skip(reason="https://nvbugs/6341070")
-_SCAFFOLDING_MCP_NVBUG = pytest.mark.skip(reason="https://nvbugs/6337229")
-_TRTOAI_PROCESSPOOL_NVBUG = pytest.mark.skip(reason="https://nvbugs/6341072")
-
 
 @pytest.fixture(scope="module")
 def deepseek_distill_7b_path() -> Path:
@@ -38,7 +34,7 @@ def default_prompt():
 @pytest.fixture(scope="module")
 def model_name():
     #return "DeepSeek-R1/DeepSeek-R1-Distill-Qwen-7B"
-    return "gpt-oss-20b"
+    return "gpt_oss/gpt-oss-20b"
 
 
 @pytest.fixture(scope="module", params=['pytorch'])
@@ -69,7 +65,6 @@ def create_trtoai_worker(model_name, async_client):
     )
 
 
-@_TRTOAI_PROCESSPOOL_NVBUG
 @pytest.mark.asyncio(loop_scope="module")
 def test_trtoai_worker_generation(default_prompt, model_name, server):
     worker = create_trtoai_worker(model_name, server.get_async_client())
@@ -83,7 +78,6 @@ def test_trtoai_worker_generation(default_prompt, model_name, server):
         raise e
 
 
-@_SCAFFOLDING_MCP_NVBUG
 @pytest.mark.asyncio(loop_scope="module")
 def test_trtoai_worker_chat(default_prompt, model_name, server):
     worker = create_trtoai_worker(model_name, server.get_async_client())
@@ -98,7 +92,6 @@ def create_trtllm_worker(model_path):
     return TRTLLMWorker.init_with_new_llm(str(model_path), backend="pytorch")
 
 
-@_SCAFFOLDING_EXECUTOR_NVBUG
 def test_trtllm_worker_generation(default_prompt, deepseek_distill_7b_path):
     worker = create_trtllm_worker(deepseek_distill_7b_path)
     task = GenerationTask.create_from_prompt(default_prompt)

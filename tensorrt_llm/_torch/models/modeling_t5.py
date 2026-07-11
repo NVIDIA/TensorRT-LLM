@@ -755,7 +755,6 @@ class T5Model(nn.Module):
             dtype=config.torch_dtype,
             mapping=model_config.mapping,
             tensor_parallel_mode=TensorParallelMode.COLUMN,
-            gather_output=True,
         )
 
         self.encoder = T5Encoder(model_config)
@@ -908,6 +907,11 @@ class T5ForConditionalGeneration(nn.Module, metaclass=PostInitCaller):
         config = self.model_config.pretrained_config
         tllm_weights = _convert_hf_t5_weights(weights, config, dtype=self.model_config.torch_dtype)
 
+        # __init__ aliases lm_head.weight to shared_embedding.weight when
+        # tie_word_embeddings=True, so checkpoints that omit lm_head.weight are
+        # handled correctly (lm_head picks up the loaded embedding automatically).
+        # When lm_head.weight is present in the checkpoint, break the alias so
+        # lm_head gets its own independent weight loaded from the checkpoint.
         if "lm_head.weight" in weights:
             self.lm_head.weight = nn.Parameter(torch.empty_like(self.lm_head.weight))
 

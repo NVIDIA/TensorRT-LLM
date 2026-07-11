@@ -15,7 +15,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import contextlib
-import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Dict, Iterable, Iterator, Optional, Sequence
 
@@ -36,49 +35,20 @@ if TYPE_CHECKING:
     from ..pyexecutor.llm_request import LlmRequest
 
 
-_MM_SIDE_STREAM_MAX_AHEAD_ENV_NAME = "TLLM_MM_SIDE_STREAM_MAX_AHEAD"
-_MM_SIDE_STREAM_DEFAULT_MAX_AHEAD = 0
 _MM_DATA_INPUT_MODALITY_KEYS = frozenset({"audio", "image", "video"})
 _MM_AUX_STREAM: Optional[tuple[int, torch.cuda.Stream]] = None
 
 
-def _get_mm_side_stream_max_ahead() -> int:
-    raw_value = os.getenv(_MM_SIDE_STREAM_MAX_AHEAD_ENV_NAME)
-    if raw_value is None:
-        return _MM_SIDE_STREAM_DEFAULT_MAX_AHEAD
-
-    try:
-        max_ahead = int(raw_value)
-    except ValueError:
-        logger.warning_once(
-            f"Invalid {_MM_SIDE_STREAM_MAX_AHEAD_ENV_NAME}={raw_value!r}; "
-            f"using default value {_MM_SIDE_STREAM_DEFAULT_MAX_AHEAD}.",
-            key="invalid_mm_side_stream_max_ahead",
-        )
-        return _MM_SIDE_STREAM_DEFAULT_MAX_AHEAD
-
-    if max_ahead < 0:
-        logger.warning_once(
-            f"Invalid {_MM_SIDE_STREAM_MAX_AHEAD_ENV_NAME}={raw_value!r}; "
-            "treating negative value as 0.",
-            key="negative_mm_side_stream_max_ahead",
-        )
-        return 0
-    return max_ahead
-
-
-def _get_mm_aux_stream(max_prefetch_ahead: Optional[int] = None) -> Optional[torch.cuda.Stream]:
+def _get_mm_aux_stream(max_prefetch_ahead: int = 0) -> Optional[torch.cuda.Stream]:
     """Return the side CUDA stream used for multimodal encoder prefetch.
 
-    Returns `None` when `TLLM_MM_SIDE_STREAM_MAX_AHEAD` is unset or non-positive,
-    CUDA is unavailable, or the current stream is being captured. The cache intentionally
-    keeps only one stream because executor processes are expected to run on one current
+    Returns `None` when side-stream prefetch is disabled, CUDA is unavailable,
+    or the current stream is being captured. The cache intentionally keeps only
+    one stream because executor processes are expected to run on one current
     CUDA device; if the current device changes, the cached stream is replaced.
     """
     global _MM_AUX_STREAM
 
-    if max_prefetch_ahead is None:
-        max_prefetch_ahead = _get_mm_side_stream_max_ahead()
     if max_prefetch_ahead <= 0:
         return None
     if not torch.cuda.is_available():
@@ -91,7 +61,7 @@ def _get_mm_aux_stream(max_prefetch_ahead: Optional[int] = None) -> Optional[tor
         _MM_AUX_STREAM = (device, torch.cuda.Stream(device=device))
         logger.warning_once(
             f"Using multimodal encoder side stream on CUDA device {device} "
-            f"with {_MM_SIDE_STREAM_MAX_AHEAD_ENV_NAME}={max_prefetch_ahead}. "
+            f"with encoder_side_stream_max_ahead={max_prefetch_ahead}. "
             "This may increase peak GPU memory usage because raw multimodal "
             "encoder inputs and computed embeddings can be resident before "
             "request prefill.",
@@ -545,9 +515,9 @@ def maybe_prefetch_mm_encoder_for_next_iter(
     - With `max_prefetch < len(pending)`, if the head is bumped by budget reasons, the next-admitted
       request is one we did not prefetch.
 
-    Gated by `TLLM_MM_SIDE_STREAM_MAX_AHEAD`: unset or 0 disables the side stream; a positive
-    integer enables it and caps the total number of not-in-flight requests with prefetched MM
-    encoder work.
+    Gated by `MultimodalConfig.encoder_side_stream_max_ahead`: 0 disables the side stream; a
+    positive integer enables it and caps the total number of not-in-flight requests with
+    prefetched MM encoder work.
 
     Returns the number of requests for which an encoder kick-off was queued.
     """
@@ -556,7 +526,7 @@ def maybe_prefetch_mm_encoder_for_next_iter(
     if max_prefetch <= 0:
         return 0
     if max_prefetch_ahead is None:
-        max_prefetch_ahead = _get_mm_side_stream_max_ahead()
+        max_prefetch_ahead = 0
     if max_prefetch_ahead <= 0:
         return 0
 

@@ -15,6 +15,7 @@ from typing import Optional, final
 import torch
 
 from tensorrt_llm._torch.attention_backend.interface import AttentionMetadata
+from tensorrt_llm._torch.pyexecutor.sampler.sampling_utils import greedy
 from tensorrt_llm._torch.speculative.eagle3 import Eagle3SpecMetadata
 from tensorrt_llm._torch.speculative.interface import SpecMetadata
 from tensorrt_llm._torch.speculative.spec_tree_manager import SpecTreeManager
@@ -149,7 +150,7 @@ class LinearDraftingLoopWrapper(BaseDraftingLoopWrapper):
 
     def sample(self, logits: torch.Tensor) -> torch.Tensor:
         # TODO: inject the sampler here so we can support non-greedy
-        tokens = torch.argmax(logits, dim=-1)
+        tokens, _ = greedy(logits, return_probs=False)
         if hasattr(self.draft_model.model, "d2t"):
             d2t = self.draft_model.model.d2t.data
             return tokens + d2t[tokens]

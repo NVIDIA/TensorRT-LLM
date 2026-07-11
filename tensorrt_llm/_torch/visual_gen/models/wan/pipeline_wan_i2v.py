@@ -6,7 +6,7 @@ from typing import List, Optional, Tuple, Union
 import diffusers
 import PIL.Image
 import torch
-from diffusers import AutoencoderKLWan, FlowMatchEulerDiscreteScheduler
+from diffusers import FlowMatchEulerDiscreteScheduler
 from diffusers.utils.torch_utils import randn_tensor
 from diffusers.video_processor import VideoProcessor
 from transformers import AutoTokenizer, CLIPImageProcessor, CLIPVisionModel, UMT5EncoderModel
@@ -31,6 +31,7 @@ from tensorrt_llm.logger import logger
 # - Wan2.1-I2V-14B-720P: Single-stage image-to-video
 # - Wan2.2-I2V-14B: Two-stage image-to-video (no CLIP, boundary_ratio for two-stage denoising)
 from .transformer_wan import WanTransformer3DModel
+from .vae_loader import load_wan_vae
 
 WAN_I2V_TEACACHE_COEFFICIENTS = {
     # Wan 2.1 I2V 14B 480P
@@ -95,6 +96,14 @@ class WanImageToVideoPipeline(BasePipeline):
             pipeline_config.primary_pretrained_config, "boundary_ratio", None
         )
         self.is_wan22_14b = self.boundary_ratio is not None
+
+        _sa_cfg = pipeline_config.attention.sparse_attention_config
+        if _sa_cfg is not None and getattr(_sa_cfg, "algorithm", None) == "vsa":
+            raise ValueError(
+                "Video Sparse Attention (sparse_attention_config.algorithm='vsa') is "
+                "only supported by the Wan 2.1 T2V 14B (720P) pipeline. Remove "
+                "sparse_attention_config for Wan I2V."
+            )
 
         super().__init__(pipeline_config)
 
@@ -224,11 +233,12 @@ class WanImageToVideoPipeline(BasePipeline):
 
         if PipelineComponent.VAE not in skip_components:
             logger.info("Loading VAE...")
-            self.vae = AutoencoderKLWan.from_pretrained(
+            self.vae = load_wan_vae(
                 checkpoint_dir,
-                subfolder=PipelineComponent.VAE,
-                torch_dtype=torch.bfloat16,  # load VAE in BF16 for memory saving
-            ).to(device)
+                device,
+                self.pipeline_config.visual_gen_mapping,
+                dtype=self.pipeline_config.torch_dtype,
+            )
 
             self.vae_scale_factor_temporal = getattr(self.vae.config, "scale_factor_temporal", 4)
             self.vae_scale_factor_spatial = getattr(self.vae.config, "scale_factor_spatial", 8)
