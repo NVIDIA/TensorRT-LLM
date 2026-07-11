@@ -26,10 +26,10 @@ verl_config:
     # and break `import torch`. Then expose the wheel at a stable NVSHMEM_DIR and add
     # the libnvshmem_host.so symlink DeepEP links by soname-less name.
     - >-
-      pip3 install --no-cache-dir nvidia-nvshmem-cu13==3.6.5 &&
+      sudo -H pip3 install --no-cache-dir nvidia-nvshmem-cu13==3.6.5 &&
       NVSHMEM_PKG=$(python3 -c "import nvidia.nvshmem as n; print(list(n.__path__)[0])") &&
-      ln -sfn "$NVSHMEM_PKG" /opt/nvshmem &&
-      (cd /opt/nvshmem/lib && [ -e libnvshmem_host.so ] || ln -sf libnvshmem_host.so.3 libnvshmem_host.so)
+      sudo ln -sfn "$NVSHMEM_PKG" /opt/nvshmem &&
+      (cd /opt/nvshmem/lib && [ -e libnvshmem_host.so ] || sudo ln -sf libnvshmem_host.so.3 libnvshmem_host.so)
     # Install DeepEP
     - >-
       git clone -b hybrid-ep https://github.com/deepseek-ai/DeepEP.git &&
