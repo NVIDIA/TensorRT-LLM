@@ -408,7 +408,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         (320, 256),
         (576, 512),
     }
-    MISSING_MLA_GENERATION_KERNELS = {
+    SLOWER_MLA_GENERATION_KERNELS = {
         (576, 512, 32),
     }
 
@@ -567,10 +567,10 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
                 f"headDimQk={head_dim_qk}, headDimV={head_dim_v}. Supported: {supported}.",
             )
 
-        if (head_dim_qk, head_dim_v, tokens_per_block) in cls.MISSING_MLA_GENERATION_KERNELS:
+        if (head_dim_qk, head_dim_v, tokens_per_block) in cls.SLOWER_MLA_GENERATION_KERNELS:
             return (
                 False,
-                f"[Generation][MLA] Missing TRTLLM-GEN decode kernel for "
+                f"[Generation][MLA] slower TRTLLM-GEN decode kernel for "
                 f"headDimQk={head_dim_qk}, headDimV={head_dim_v}, "
                 f"tokens_per_block={tokens_per_block}.",
             )
