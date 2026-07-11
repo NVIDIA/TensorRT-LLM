@@ -888,8 +888,7 @@ class FP8BlockScaleMoERunner(TunableRunner):
             self.intermediate_size, self.local_expert_offset,
             self.local_num_experts, self.routed_scaling_factor,
             self.routing_method_type, tactic, args.topk_weights, args.topk_ids,
-            self.gemm1_clamp_limit_value,
-            output)
+            self.gemm1_clamp_limit_value, output)
 
     def get_valid_tactics(self, inputs: List[torch.Tensor],
                           profile: OptimizationProfile,
