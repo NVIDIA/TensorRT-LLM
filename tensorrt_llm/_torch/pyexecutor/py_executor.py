@@ -3447,6 +3447,25 @@ class PyExecutor:
             # with dummy draft tokens to make the scheduler aware of the fact
             # that speculation is about to happen.
             self._prepare_draft_requests()
+        elif (getattr(self, "model_engine", None) is not None
+              and self.model_engine.is_spec_decode
+              and self.max_total_draft_tokens > 0):
+            # One-model speculative decoding (MTP / Eagle3 one-model) has no separate
+            # drafter, so the block above is skipped -- but the model still verifies
+            # max_total_draft_tokens draft tokens per generation step. The C++ micro-batch
+            # scheduler budgets each gen request as beam_width + getNumDraftTokens(); without
+            # populating the draft-token count here it under-reserves and, under chunked
+            # prefill + overlap scheduler, the forward's uniform (1 + runtime_draft_len)
+            # build overshoots max_num_tokens (total_num_tokens > max_num_tokens). Mirror the
+            # two-model normalization so scheduling reserves the correct token budget.
+            # model_engine is guarded first so partially-constructed executors in unit tests
+            # (which may not set model_engine) do not raise AttributeError.
+            for request in self.active_requests:
+                if request.state not in (
+                        LlmRequestState.GENERATION_IN_PROGRESS,
+                        LlmRequestState.DISAGG_GENERATION_INIT):
+                    continue
+                request.draft_tokens = [0] * self.max_total_draft_tokens
 
         scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs = self._schedule(
         )

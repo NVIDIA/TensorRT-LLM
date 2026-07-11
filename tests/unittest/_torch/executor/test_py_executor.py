@@ -22,7 +22,7 @@ from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
     SHUTDOWN_REQUEST_ID,
     RequestQueueItem,
 )
-from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState, SamplingConfig
 from tensorrt_llm._torch.pyexecutor.py_executor import DisaggTransferAdmissionController, PyExecutor
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
 from tensorrt_llm._torch.pyexecutor.scheduler import (
@@ -1525,3 +1525,110 @@ class TestCheckCacheTransferErrorsAdpNoop:
         stub = _make_disagg_err_stub(world_size=1, active_requests=[err])
         stub._check_cache_transfer_errors("gen")
         assert len(stub.handle_errors_calls) == 1
+
+
+class TestOneModelMTPDraftTokenScheduling:
+    """Regression tests for the one-model MTP over-scheduling bug (#16101).
+
+    One-model MTP (``mtp_eagle_one_model``) has no separate drafter, so
+    ``get_spec_drafter()`` returns None and the ``if self.drafter is not None``
+    draft-token normalization block in ``_prepare_and_schedule_batch`` is
+    skipped. Without the ``elif`` fallback that mirrors it, generation requests
+    keep ``num_draft_tokens == 0`` and the C++ micro-batch scheduler
+    under-reserves each gen request (it budgets ``beam_width +
+    getNumDraftTokens()``). Under chunked prefill + overlap scheduler the
+    forward then builds a uniform ``1 + runtime_draft_len`` per gen request and
+    overshoots ``max_num_tokens`` (``total_num_tokens > max_num_tokens``).
+
+    The fix populates ``request.draft_tokens = [0] * max_total_draft_tokens``
+    on every in-progress generation request so scheduling reserves the correct
+    token budget. This test drives ``_prepare_and_schedule_batch`` for a
+    one-model-MTP executor and asserts generation requests get
+    ``num_draft_tokens == max_total_draft_tokens`` while context requests are
+    left untouched.
+
+    NOTE: Like ``test_fetch_called_once_even_in_benchmark_disagg`` in
+    ``test_benchmark_disagg.py``, this uses ``object.__new__(PyExecutor)`` to
+    bypass ``__init__`` and sets internal attributes by hand. Real
+    ``LlmRequest`` objects (not Mocks) are used so ``draft_tokens = [0] * N``
+    actually updates the C++-backed ``num_draft_tokens`` count.
+    """
+
+    MAX_TOTAL_DRAFT_TOKENS = 3
+
+    @staticmethod
+    def _make_llm_request(request_id: int, state: LlmRequestState) -> LlmRequest:
+        """Build a real LlmRequest in the given state (mirrors the helper in
+        test_py_scheduler.py::make_generation_request)."""
+        req = LlmRequest(
+            request_id=request_id,
+            max_new_tokens=10,
+            input_tokens=list(range(10)),
+            sampling_config=SamplingConfig(1),
+            is_streaming=False,
+            draft_tokens=None,
+        )
+        req.state = state
+        return req
+
+    @classmethod
+    def _make_one_model_mtp_executor(cls, active_requests):
+        """Construct a partially-initialised one-model-MTP PyExecutor.
+
+        drafter is None (one-model MTP has no separate drafter) and
+        model_engine.is_spec_decode is True, so _prepare_and_schedule_batch
+        takes the elif draft-token normalization branch. kv_cache_transceiver
+        is None to keep the test hermetic (skips the disagg blocks).
+        """
+        ex = object.__new__(PyExecutor)
+        ex.drafter = None
+        ex.max_total_draft_tokens = cls.MAX_TOTAL_DRAFT_TOKENS
+        ex.model_engine = Mock(is_spec_decode=True)
+        ex.kv_cache_transceiver = None
+        ex.is_shutdown = False
+        ex.enable_iter_perf_stats = False
+        ex.active_requests = active_requests
+        ex.waiting_queue = []
+
+        ex._fetch_and_activate_new_requests = Mock(return_value=[])
+        ex._check_disagg_ctx_schedulable_status = Mock()
+        ex._check_disagg_gen_transfer_status = Mock()
+        ex._check_kv_transfer_timeout = Mock()
+        ex._check_disagg_ctx_cache_transfer_status = Mock()
+        ex._pad_attention_dp_dummy_request = Mock()
+        ex._prefetch_for_context_requests = Mock()
+        ex._prepare_disagg_gen_init = Mock()
+        ex._schedule = Mock(return_value=(ScheduledRequests(), [], 0))
+        return ex
+
+    def test_one_model_mtp_populates_draft_tokens_for_scheduling(self):
+        """The draft-token normalization must cover BOTH aggregated and
+        disaggregated serving in one shot.
+
+        The fix's state filter is {GENERATION_IN_PROGRESS,
+        DISAGG_GENERATION_INIT}, mirroring the two-model normalization, so a
+        single fix covers the aggregated decode path (GENERATION_IN_PROGRESS)
+        and the disagg decode-worker path (DISAGG_GENERATION_INIT). Context
+        requests (CONTEXT_INIT) are not generation requests and must be left
+        untouched.
+        """
+        gen = self._make_llm_request(0, LlmRequestState.GENERATION_IN_PROGRESS)
+        disagg_gen = self._make_llm_request(1, LlmRequestState.DISAGG_GENERATION_INIT)
+        ctx = self._make_llm_request(2, LlmRequestState.CONTEXT_INIT)
+
+        # Precondition: no draft tokens reserved yet on either gen request.
+        assert gen.num_draft_tokens == 0
+        assert disagg_gen.num_draft_tokens == 0
+
+        ex = self._make_one_model_mtp_executor([gen, disagg_gen, ctx])
+        scheduled_batch, _ = ex._prepare_and_schedule_batch()
+
+        assert scheduled_batch is not None
+        # Aggregated case: in-progress generation request is normalized to the
+        # full draft-token budget so the micro-batch scheduler reserves
+        # beam + max_total_draft_tokens.
+        assert gen.num_draft_tokens == self.MAX_TOTAL_DRAFT_TOKENS
+        # Disaggregated case: decode-worker request awaiting KV also normalized.
+        assert disagg_gen.num_draft_tokens == self.MAX_TOTAL_DRAFT_TOKENS
+        # Context requests are not generation requests and must be left alone.
+        assert ctx.num_draft_tokens == 0
