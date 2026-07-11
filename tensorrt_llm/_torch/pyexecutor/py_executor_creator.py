@@ -48,9 +48,14 @@ from .model_engine import PyTorchModelEngine
 from .model_loader import ModelLoader, _construct_checkpoint_loader
 from .py_executor import PyExecutor
 
-_MLA_SUPPORTED_SM_VERSIONS = (90, 100, 103, 120, 121)
-_MLA_SUPPORTED_SM_VERSIONS_STR = "/".join(
-    f"SM{sm_version}" for sm_version in _MLA_SUPPORTED_SM_VERSIONS)
+_MLA_KV_CACHE_REUSE_SUPPORTED_SM_VERSIONS = (90, 100, 103, 120, 121)
+_MLA_CHUNKED_PREFILL_SUPPORTED_SM_VERSIONS = (90, 100, 103, 120)
+_MLA_KV_CACHE_REUSE_SUPPORTED_SM_VERSIONS_STR = "/".join(
+    f"SM{sm_version}"
+    for sm_version in _MLA_KV_CACHE_REUSE_SUPPORTED_SM_VERSIONS)
+_MLA_CHUNKED_PREFILL_SUPPORTED_SM_VERSIONS_STR = "/".join(
+    f"SM{sm_version}"
+    for sm_version in _MLA_CHUNKED_PREFILL_SUPPORTED_SM_VERSIONS)
 
 
 class _ExecutorMemoryMonitor:
@@ -708,11 +713,11 @@ def create_py_executor(
             )
 
         sm_version = get_sm_version()
-        if (kv_cache_config.enable_block_reuse
-                and sm_version not in _MLA_SUPPORTED_SM_VERSIONS):
-            logger.warning(
-                f"KV cache reuse for MLA can only be enabled on {_MLA_SUPPORTED_SM_VERSIONS_STR}, "
-                f"disable enable_block_reuse for SM{sm_version}")
+        if (kv_cache_config.enable_block_reuse and sm_version
+                not in _MLA_KV_CACHE_REUSE_SUPPORTED_SM_VERSIONS):
+            logger.warning("KV cache reuse for MLA can only be enabled on "
+                           f"{_MLA_KV_CACHE_REUSE_SUPPORTED_SM_VERSIONS_STR}, "
+                           f"disable enable_block_reuse for SM{sm_version}")
             kv_cache_config.enable_block_reuse = False
             _set_model_engines_cache_reuse([model_engine, draft_model_engine],
                                            False)
@@ -728,11 +733,11 @@ def create_py_executor(
             kv_cache_config.enable_block_reuse = False
             _set_model_engines_cache_reuse([model_engine, draft_model_engine],
                                            False)
-        if (enable_chunked_context
-                and sm_version not in _MLA_SUPPORTED_SM_VERSIONS):
-            logger.warning(
-                f"Chunked Prefill for MLA can only be enabled on {_MLA_SUPPORTED_SM_VERSIONS_STR}, "
-                f"disable enable_chunked_context for SM{sm_version}")
+        if (enable_chunked_context and sm_version
+                not in _MLA_CHUNKED_PREFILL_SUPPORTED_SM_VERSIONS):
+            logger.warning("Chunked Prefill for MLA can only be enabled on "
+                           f"{_MLA_CHUNKED_PREFILL_SUPPORTED_SM_VERSIONS_STR}, "
+                           f"disable enable_chunked_context for SM{sm_version}")
             enable_chunked_context = False
             model_engine.attn_runtime_features.chunked_prefill = False
             if draft_model_engine is not None:

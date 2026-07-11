@@ -18,7 +18,10 @@ from types import SimpleNamespace
 import pytest
 
 from tensorrt_llm._torch.pyexecutor import py_executor_creator
-from tensorrt_llm._torch.pyexecutor.py_executor_creator import _MLA_SUPPORTED_SM_VERSIONS
+from tensorrt_llm._torch.pyexecutor.py_executor_creator import (
+    _MLA_CHUNKED_PREFILL_SUPPORTED_SM_VERSIONS,
+    _MLA_KV_CACHE_REUSE_SUPPORTED_SM_VERSIONS,
+)
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
 from tensorrt_llm.quantization import QuantAlgo
 
@@ -326,7 +329,7 @@ def test_mla_unsupported_kv_quant_fallback_syncs_cache_reuse(monkeypatch):
     assert runtime_cache_reuse is False
 
 
-@pytest.mark.parametrize("sm_version", _MLA_SUPPORTED_SM_VERSIONS)
+@pytest.mark.parametrize("sm_version", _MLA_KV_CACHE_REUSE_SUPPORTED_SM_VERSIONS)
 def test_mla_supported_configuration_preserves_cache_reuse(monkeypatch, sm_version):
     """Verify every supported MLA SM preserves cache reuse in both config and runtime.
 
@@ -345,7 +348,7 @@ def test_mla_supported_configuration_preserves_cache_reuse(monkeypatch, sm_versi
     assert runtime_cache_reuse is True
 
 
-@pytest.mark.parametrize("sm_version", _MLA_SUPPORTED_SM_VERSIONS)
+@pytest.mark.parametrize("sm_version", _MLA_CHUNKED_PREFILL_SUPPORTED_SM_VERSIONS)
 def test_mla_supported_configuration_preserves_chunked_prefill(monkeypatch, sm_version):
     """Verify every supported MLA SM preserves chunked prefill when requested."""
     _, _, runtime_chunked_prefill = _run_create_py_executor(
@@ -356,3 +359,19 @@ def test_mla_supported_configuration_preserves_chunked_prefill(monkeypatch, sm_v
     )
 
     assert runtime_chunked_prefill is True
+
+
+def test_mla_sm121_fallback_preserves_cache_reuse_and_disables_chunked_prefill(
+    monkeypatch,
+):
+    """Verify SM121 keeps cache reuse while disabling unsupported chunked prefill."""
+    kv_cache_reuse, runtime_cache_reuse, runtime_chunked_prefill = _run_create_py_executor(
+        monkeypatch,
+        sm_version=121,
+        kv_cache_quant_algo=QuantAlgo.NO_QUANT,
+        enable_chunked_prefill=True,
+    )
+
+    assert kv_cache_reuse is True
+    assert runtime_cache_reuse is True
+    assert runtime_chunked_prefill is False
