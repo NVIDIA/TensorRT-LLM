@@ -296,6 +296,51 @@ def _resolve_enable_fused_hc(config: PretrainedConfig) -> bool:
     return bool(getattr(config, "enable_fused_hc", True))
 
 
+def _mixed_precision_base_quant_config(
+    model_config: ModelConfig[PretrainedConfig],
+) -> Optional[QuantConfig]:
+    """Quant config for modules a MIXED_PRECISION checkpoint keeps at the BASE
+    model's precision.
+
+    The ModelOpt experts-only NVFP4 repacks (e.g. nvidia/DeepSeek-V4-Pro-NVFP4)
+    re-quantize only the routed experts and list everything else in
+    exclude_modules -- but the excluded projections (attention, shared experts,
+    MTP e_proj/h_proj) are still stored as the FP8 base model's block-scale
+    tensors (fp8_e4m3 weight + ue8m0 scale), not BF16. Build them the same way
+    the native FP8 checkpoint flow does (FP8_BLOCK_SCALES) so they carry a
+    weight_scale and the MLA fused-q-quant contract holds at runtime.
+    """
+    quant_config = model_config.quant_config
+    if quant_config is None or quant_config.quant_algo != QuantAlgo.MIXED_PRECISION:
+        return None
+    hf_qc = getattr(model_config.pretrained_config, "quantization_config", None)
+    if hf_qc is not None and not isinstance(hf_qc, dict):
+        to_dict = getattr(hf_qc, "to_dict", None)
+        hf_qc = to_dict() if callable(to_dict) else None
+    if (
+        not hf_qc
+        or hf_qc.get("quant_method") != "fp8"
+        or not hf_qc.get("weight_block_size")
+    ):
+        return None
+    return QuantConfig(
+        quant_algo=QuantAlgo.FP8_BLOCK_SCALES,
+        kv_cache_quant_algo=quant_config.kv_cache_quant_algo,
+        group_size=hf_qc["weight_block_size"][0],
+    )
+
+
+def _with_quant_config(
+    model_config: ModelConfig[PretrainedConfig], quant_config: QuantConfig
+) -> ModelConfig[PretrainedConfig]:
+    """Shallow-copy model_config with a different quant_config."""
+    resolved = copy.copy(model_config)
+    resolved._frozen = False
+    resolved.quant_config = quant_config
+    resolved._frozen = True
+    return resolved
+
+
 def _copy_deepseek_v4_fused_a_weight_scale(
     module: Linear, fused_a: torch.Tensor, fused_a_scale: torch.Tensor
 ) -> None:
@@ -1528,10 +1573,21 @@ class DeepseekV4MoE(nn.Module):
 
         self.mapping = model_config.mapping
 
-        # FIXME: incompatible with mixed quantization mode (including excluding modules from quantization)
+        # Shared experts are excluded from the experts-only NVFP4 repack and
+        # stored at the FP8 base model's precision -- build them accordingly.
+        shared_base_quant_config = _mixed_precision_base_quant_config(model_config)
+        shared_model_config = (
+            _with_quant_config(model_config, shared_base_quant_config)
+            if shared_base_quant_config is not None
+            else model_config
+        )
+
         block_size = 1
-        if model_config.quant_config and model_config.quant_config.group_size is not None:
-            block_size = model_config.quant_config.group_size
+        if (
+            shared_model_config.quant_config
+            and shared_model_config.quant_config.group_size is not None
+        ):
+            block_size = shared_model_config.quant_config.group_size
 
         shared_tp_size, self.shared_output_scale = self._compute_shared_expert_tp_size(
             shared_expert_intermediate_size, block_size
@@ -1542,7 +1598,7 @@ class DeepseekV4MoE(nn.Module):
             intermediate_size=shared_expert_intermediate_size,
             bias=False,
             dtype=dtype,
-            config=model_config,
+            config=shared_model_config,
             overridden_tp_size=shared_tp_size,
             reduce_output=False,
             swiglu_limit=swiglu_limit,
@@ -1607,8 +1663,12 @@ class DeepseekV4MoE(nn.Module):
     def _get_experts_quant_config(model_config, layer_idx: int) -> QuantConfig:
         if getattr(model_config, "quant_config_dict", None) is None:
             return model_config.quant_config
-        return model_config.quant_config_dict.get(
-            f"model.layers.{layer_idx}.mlp.experts", model_config.quant_config
+        qcd = model_config.quant_config_dict
+        return qcd.get(
+            f"model.layers.{layer_idx}.mlp.experts",
+            # ModelOpt DSV4 repacks key quantized_layers by the checkpoint's
+            # native module names.
+            qcd.get(f"layers.{layer_idx}.ffn.experts", model_config.quant_config),
         )
 
     def compute_routed_output(
@@ -1744,8 +1804,17 @@ class DeepseekV4DecoderLayer(DecoderLayer):
         if attention_layer_idx is None:
             attention_layer_idx = layer_idx
 
+        # Under MIXED_PRECISION (experts-only NVFP4 repack) the attention
+        # projections are stored at the FP8 base model's precision; build them
+        # as FP8_BLOCK_SCALES like the native FP8 flow instead of unquantized.
+        attn_base_quant_config = _mixed_precision_base_quant_config(model_config)
+        attn_model_config = (
+            _with_quant_config(model_config, attn_base_quant_config)
+            if attn_base_quant_config is not None
+            else model_config
+        )
         self.self_attn = DeepseekV4Attention(
-            model_config,
+            attn_model_config,
             layer_idx=attention_layer_idx,
             aux_stream=aux_stream_dict[AuxStreamType.Attention],
             reduce_output=not self.enable_attention_dp and self.mapping.tp_size > 1,
@@ -1866,8 +1935,16 @@ class DeepseekV4DecoderLayer(DecoderLayer):
                 quant_algo=None,
                 kv_cache_quant_algo=quant_config.kv_cache_quant_algo,
             )
-        else:
-            return model_config.quant_config
+        if quant_config.quant_algo == QuantAlgo.MIXED_PRECISION:
+            # The layer's compute character is set by its routed experts
+            # (experts-only NVFP4 repack); the excluded attention/shared
+            # experts are handled by _mixed_precision_base_quant_config.
+            experts_quant_config = DeepseekV4MoE._get_experts_quant_config(
+                model_config, layer_idx
+            )
+            if experts_quant_config.quant_algo != QuantAlgo.MIXED_PRECISION:
+                return experts_quant_config
+        return model_config.quant_config
 
     def _compute_mlp_tp_size(self, intermediate_size: int, block_size: int) -> int:
         """
@@ -2205,13 +2282,19 @@ class DeepseekV4MTP(DeepseekV4DecoderLayer):
             hidden_size=config.hidden_size, eps=config.rms_norm_eps, dtype=config.torch_dtype
         )
         self.hc_mult = config.hc_mult
+        # MTP e_proj/h_proj are excluded from the experts-only NVFP4 repack
+        # and stored at the FP8 base model's precision.
+        eh_proj_quant_config = (
+            _mixed_precision_base_quant_config(model_config)
+            or model_config.get_quant_config()
+        )
         if model_config.mapping.enable_attention_dp:
             self.e_proj = Linear(
                 config.hidden_size,
                 config.hidden_size,
                 bias=False,
                 dtype=config.torch_dtype,
-                quant_config=model_config.get_quant_config(),
+                quant_config=eh_proj_quant_config,
                 skip_create_weights_in_init=model_config.skip_create_weights_in_init,
             )
             self.h_proj = Linear(
@@ -2219,7 +2302,7 @@ class DeepseekV4MTP(DeepseekV4DecoderLayer):
                 config.hidden_size,
                 bias=False,
                 dtype=config.torch_dtype,
-                quant_config=model_config.get_quant_config(),
+                quant_config=eh_proj_quant_config,
                 skip_create_weights_in_init=model_config.skip_create_weights_in_init,
             )
         else:
@@ -2231,7 +2314,7 @@ class DeepseekV4MTP(DeepseekV4DecoderLayer):
                 tensor_parallel_mode=TensorParallelMode.ROW,
                 mapping=model_config.mapping,
                 reduce_output=True,
-                quant_config=model_config.get_quant_config(),
+                quant_config=eh_proj_quant_config,
                 skip_create_weights_in_init=model_config.skip_create_weights_in_init,
             )
             self.h_proj = Linear(
@@ -2242,7 +2325,7 @@ class DeepseekV4MTP(DeepseekV4DecoderLayer):
                 tensor_parallel_mode=TensorParallelMode.ROW,
                 mapping=model_config.mapping,
                 reduce_output=True,
-                quant_config=model_config.get_quant_config(),
+                quant_config=eh_proj_quant_config,
                 skip_create_weights_in_init=model_config.skip_create_weights_in_init,
             )
 
