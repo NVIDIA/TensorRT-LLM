@@ -67,6 +67,11 @@ def test_llm_update_weights_fp8(model_dir, fp8_model_dir):
         additional_kwargs["moe_config"] = {
             "backend": "DEEPGEMM",
         }
+        # moe_intermediate_size is 768, and FP8 block scaling needs each
+        # MoE TP shard to stay a multiple of the 128 block size, so MoE TP
+        # is capped at 2 (768 / 2 = 384) and EP covers the rest of tp=4.
+        additional_kwargs["moe_tensor_parallel_size"] = 2
+        additional_kwargs["moe_expert_parallel_size"] = 2
     num_hidden_layers = 1
     hf_model = RefHFModelWithIPCHandles(fp8_model_dir, num_hidden_layers=num_hidden_layers)
     tokenizer = AutoTokenizer.from_pretrained(fp8_model_dir)
@@ -74,7 +79,7 @@ def test_llm_update_weights_fp8(model_dir, fp8_model_dir):
     with LLM(
         model=model_dir,
         ray_worker_extension_cls="tensorrt_llm.llmapi.rlhf_utils.WorkerExtension",
-        tensor_parallel_size=2,
+        tensor_parallel_size=4,
         load_format="dummy",
         pipeline_parallel_size=1,
         kv_cache_config=kv_cache_config,
@@ -102,7 +107,7 @@ def test_llm_update_weights_fp8(model_dir, fp8_model_dir):
             temperature=0, return_generation_logits=True, max_tokens=1024
         )
 
-        ipc_handles = hf_model.get_weight_ipc_handles_serialized([0, 1])
+        ipc_handles = hf_model.get_weight_ipc_handles_serialized([0, 1, 2, 3])
 
         llm._collective_rpc("update_weights", (ipc_handles,))
         # Finalize the update weights
@@ -131,6 +136,11 @@ def test_llm_partial_update_weights_fp8(model_dir, fp8_model_dir):
         additional_kwargs["moe_config"] = {
             "backend": "DEEPGEMM",
         }
+        # moe_intermediate_size is 768, and FP8 block scaling needs each
+        # MoE TP shard to stay a multiple of the 128 block size, so MoE TP
+        # is capped at 2 (768 / 2 = 384) and EP covers the rest of tp=4.
+        additional_kwargs["moe_tensor_parallel_size"] = 2
+        additional_kwargs["moe_expert_parallel_size"] = 2
     num_hidden_layers = 1
     hf_model = RefHFModelWithIPCHandles(fp8_model_dir, num_hidden_layers=num_hidden_layers)
     tokenizer = AutoTokenizer.from_pretrained(fp8_model_dir)
@@ -138,7 +148,7 @@ def test_llm_partial_update_weights_fp8(model_dir, fp8_model_dir):
     with LLM(
         model=model_dir,
         ray_worker_extension_cls="tensorrt_llm.llmapi.rlhf_utils.WorkerExtension",
-        tensor_parallel_size=2,
+        tensor_parallel_size=4,
         load_format="dummy",
         pipeline_parallel_size=1,
         kv_cache_config=kv_cache_config,
@@ -185,7 +195,7 @@ def test_llm_partial_update_weights_fp8(model_dir, fp8_model_dir):
         for filter_name in filter_list:
             weight_filter = common_filter(filter_name=filter_name)
             ipc_handles = hf_model.get_weight_ipc_handles_serialized(
-                [0, 1], weight_filter=weight_filter
+                [0, 1, 2, 3], weight_filter=weight_filter
             )
             llm._collective_rpc("update_weights", (ipc_handles,))
         # Finalize the update weights
@@ -350,9 +360,8 @@ class RefNVFP4ModelWithIPCHandles(RefHFModel):
 
         # Only populate the owning device. Extra replicas are materialized
         # lazily by ``get_weight_ipc_handles_serialized`` so that GPUs never
-        # asked for via IPC (e.g. cuda:2/3 on a 4-GPU runner when a TP=2
-        # test only requests device_ids=[0, 1]) don't hold NVFP4 quantized
-        # tensors that persist across parametrize IDs.
+        # asked for via IPC don't hold NVFP4 quantized tensors that persist
+        # across parametrize IDs.
         self.all_weights[self.device_id] = model_weights
 
         with torch.no_grad():
@@ -500,7 +509,7 @@ def test_llm_update_weights_nvfp4(model_dir, kv_cache_dtype):
     with LLM(
         model=model_dir,
         ray_worker_extension_cls="tensorrt_llm.llmapi.rlhf_utils.WorkerExtension",
-        tensor_parallel_size=2,
+        tensor_parallel_size=4,
         load_format="dummy",
         pipeline_parallel_size=1,
         kv_cache_config=kv_cache_config,
@@ -525,7 +534,7 @@ def test_llm_update_weights_nvfp4(model_dir, kv_cache_dtype):
             temperature=0, return_generation_logits=True, max_tokens=1024
         )
 
-        ipc_handles = hf_model.get_weight_ipc_handles_serialized([0, 1])
+        ipc_handles = hf_model.get_weight_ipc_handles_serialized([0, 1, 2, 3])
         llm._collective_rpc("update_weights", (ipc_handles,))
         llm._collective_rpc("update_weights", (None,))
 
@@ -563,7 +572,7 @@ def test_llm_partial_update_weights_nvfp4(model_dir, kv_cache_dtype):
     with LLM(
         model=model_dir,
         ray_worker_extension_cls="tensorrt_llm.llmapi.rlhf_utils.WorkerExtension",
-        tensor_parallel_size=2,
+        tensor_parallel_size=4,
         load_format="dummy",
         pipeline_parallel_size=1,
         kv_cache_config=kv_cache_config,
@@ -606,7 +615,7 @@ def test_llm_partial_update_weights_nvfp4(model_dir, kv_cache_dtype):
         for filter_name in filter_list:
             weight_filter = common_filter(filter_name=filter_name)
             ipc_handles = hf_model.get_weight_ipc_handles_serialized(
-                [0, 1], weight_filter=weight_filter
+                [0, 1, 2, 3], weight_filter=weight_filter
             )
             llm._collective_rpc("update_weights", (ipc_handles,))
         llm._collective_rpc("update_weights", (None,))
