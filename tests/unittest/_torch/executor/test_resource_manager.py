@@ -1,3 +1,17 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import os
 import pathlib
 import subprocess
@@ -64,6 +78,31 @@ def test_v1_kv_cache_event_hash_algo_no_warning_for_auto():
             KV_CACHE_HASH_ALGO_AUTO)
 
     warning.assert_not_called()
+
+
+def test_torch_sampler_args_overlap_doubles_slot_pool():
+    """Ensure overlap scheduling reserves slots for adjacent iterations."""
+    from tensorrt_llm._torch.pyexecutor._util import create_torch_sampler_args
+
+    mapping = Mapping(world_size=1, tp_size=1, pp_size=1)
+    common_args = dict(
+        mapping=mapping,
+        max_seq_len=64,
+        max_batch_size=2,
+        speculative_config=None,
+        max_beam_width=1,
+        disable_flashinfer_sampling=False,
+        enable_async_worker=False,
+        enable_speculative_beam_history_d2h=False,
+    )
+
+    overlap_args = create_torch_sampler_args(**common_args,
+                                             disable_overlap_scheduler=False)
+    assert overlap_args.max_num_sequences == 4
+
+    non_overlap_args = create_torch_sampler_args(**common_args,
+                                                 disable_overlap_scheduler=True)
+    assert non_overlap_args.max_num_sequences == 2
 
 
 class TestResourceManager(unittest.TestCase):
