@@ -1661,6 +1661,13 @@ class DeepseekV4MoE(nn.Module):
 
     @staticmethod
     def _get_experts_quant_config(model_config, layer_idx: int) -> QuantConfig:
+        """Resolve the routed experts' quant config for one decoder layer.
+
+        Looks up the per-layer table under the internal module name first and
+        falls back to the checkpoint-native key form (layers.N.ffn.experts)
+        emitted by the ModelOpt experts-only NVFP4 repacks; returns the global
+        quant config when neither entry exists.
+        """
         if getattr(model_config, "quant_config_dict", None) is None:
             return model_config.quant_config
         qcd = model_config.quant_config_dict
@@ -1922,10 +1929,13 @@ class DeepseekV4DecoderLayer(DecoderLayer):
     def _get_decoder_layer_quant_config(
         self, model_config: ModelConfig[PretrainedConfig], layer_idx: int
     ):
-        """
-        The MTP layer in the nvfp4 checkpoint is unquantized. Because the TRTLLM
-        moe_backend only supports fp8/fp4 quantization, we need to override
-        the quant_config for the MTP layer.
+        """Resolve the effective quant config for one decoder layer.
+
+        The MTP layer in the nvfp4 checkpoint is unquantized; because the
+        TRTLLM moe_backend only supports fp8/fp4 quantization, the MTP layer's
+        quant_config is overridden to unquantized. Under MIXED_PRECISION
+        (experts-only NVFP4 repacks) the layer's algo is resolved from the
+        per-layer quantized_layers table instead of the ambiguous global.
         """
         quant_config = model_config.quant_config
 
