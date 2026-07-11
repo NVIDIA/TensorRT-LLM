@@ -23,6 +23,7 @@
 #include <torch/library.h>
 
 #include <cstdint>
+#include <cstdlib>
 #include <memory>
 #include <unordered_map>
 
@@ -391,10 +392,25 @@ public:
             = topK + (numFusedSharedExpert.value_or(0) > 0 ? numFusedSharedExpert.value() : 0);
         int64_t const numTotalLocalExperts
             = numLocalExperts + (numFusedSharedExpert.value_or(0) > 0 ? numFusedSharedExpert.value() : 0);
+        // WAR: the small-tile (tileN 8/16) dynB TRTLLM-Gen batched-GEMM cubins flakily hit an
+        // illegal memory access (garbage TMA-descriptor pointer, MMU fault in the gemm2 K-loop)
+        // when shared experts are fused into the grouped GEMM (num_fused_shared_experts > 0);
+        // tileN >= 32 is unaffected (10/10 clean vs minutes-to-crash baseline on B300 TP=4).
+        // Restrict the fused path to tileN >= 32 until the kernel-side fix lands (nvbug TBD).
+        // TLLM_MOE_FUSED_MIN_TILEN overrides the threshold (0 disables) for A/B experiments.
+        static int const fusedMinTileN = []()
+        {
+            char const* env = std::getenv("TLLM_MOE_FUSED_MIN_TILEN");
+            return env != nullptr ? std::atoi(env) : 32;
+        }();
         // returns (tileN, config)
         std::vector<std::vector<int64_t>> tactics;
         for (auto& [tileN, runner] : mRunners)
         {
+            if (numFusedSharedExpert.value_or(0) > 0 && tileN < fusedMinTileN)
+            {
+                continue;
+            }
             auto chosen = computeSelectedTileN(mSupportedTileN, numTokens, totalExpertsPerToken, numTotalLocalExperts);
             if (chosen.find(tileN) == chosen.end())
             {
@@ -453,8 +469,18 @@ public:
                     if (t != tileN)
                         tileN_candidates.push_back(t);
                 }
+                // Same small-tile exclusion as getValidConfigs (see the WAR comment there).
+                static int const fusedMinTileNFallback = []()
+                {
+                    char const* env = std::getenv("TLLM_MOE_FUSED_MIN_TILEN");
+                    return env != nullptr ? std::atoi(env) : 32;
+                }();
                 for (auto t : tileN_candidates)
                 {
+                    if (t < fusedMinTileNFallback)
+                    {
+                        continue;
+                    }
                     auto valid = mRunners.at(t)->getValidConfigIndices(
                         total_experts_per_token, hidden_size, intermediate_size, num_total_local_experts, num_tokens);
                     if (!valid.empty())
