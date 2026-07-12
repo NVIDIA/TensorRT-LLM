@@ -985,7 +985,7 @@ def test_qwenimage_lpips_against_golden(tmp_path):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-def test_cosmos3_nano_t2v_lpips_against_golden(tmp_path):
+def test_cosmos3_nano_t2v_lpips_against_golden(_visual_gen_deps, tmp_path):
     generated_path = tmp_path / "cosmos3_nano_t2v_generated.mp4"
     golden_path = _golden_media_path(
         tmp_path,

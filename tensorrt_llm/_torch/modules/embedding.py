@@ -6,6 +6,7 @@ import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 
 from tensorrt_llm.functional import AllReduceParams
+from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.math_utils import ceil_div
 
@@ -34,6 +35,7 @@ class LMHead(Linear):
         gather_output: bool = False,
         reduce_output: bool = True,
         use_custom_cublas_mm: bool = False,
+        quant_config=None,
     ):
         local_in_features = embedding_dim
         local_out_features = num_embeddings
@@ -66,6 +68,7 @@ class LMHead(Linear):
             gather_output=gather_output,
             reduce_output=reduce_output,
             use_custom_cublas_mm=use_custom_cublas_mm,
+            quant_config=quant_config,
         )
 
         if tensor_parallel_mode == TensorParallelMode.ROW:
@@ -76,9 +79,35 @@ class LMHead(Linear):
         self.num_embeddings = num_embeddings
         self.embedding_dim = embedding_dim
 
-        weight_shape = (self.out_features, self.in_features)
-        self.weight = Parameter(torch.empty(weight_shape, dtype=dtype))
-        self.register_parameter("bias", None)
+        if self.has_any_quant:
+            # Keep the quantized weights created by Linear (e.g. NVFP4 packed
+            # weight + scales). The plain-Parameter override below only exists
+            # to (a) drop bias and (b) shrink the ROW-mode padded shard, both
+            # of which assume a dense high-precision weight.
+            if self.padding_size > 0 or tensor_parallel_mode == TensorParallelMode.ROW:
+                raise NotImplementedError(
+                    "Quantized LMHead does not support vocab/hidden padding or "
+                    "ROW tensor-parallel mode")
+            if self.enable_lm_head_tp_in_adp:
+                logger.error(
+                    "Quantized LMHead constructed with lm_head TP in ADP: "
+                    "the spec-decoding head slices the raw weight, which is "
+                    "incompatible with quantized (packed) weights. The "
+                    "lm_head quant entry should have been dropped upstream "
+                    f"(quant_algo={quant_config.quant_algo}).")
+                raise NotImplementedError(
+                    "Quantized LMHead does not support lm_head TP in ADP "
+                    "(spec-decoding head slices the raw weight)")
+            # lm_head has historically always been bf16; make the switch to a
+            # quantized head visible so unexpected accuracy/perf behavior is
+            # attributable without a profiler.
+            logger.info(f"LMHead is quantized: quant_algo="
+                        f"{quant_config.quant_algo}, weight shape "
+                        f"{tuple(self.weight.shape)} dtype {self.weight.dtype}")
+        else:
+            weight_shape = (self.out_features, self.in_features)
+            self.weight = Parameter(torch.empty(weight_shape, dtype=dtype))
+            self.register_parameter("bias", None)
 
     @property
     def vocab_size_padded(self) -> int:

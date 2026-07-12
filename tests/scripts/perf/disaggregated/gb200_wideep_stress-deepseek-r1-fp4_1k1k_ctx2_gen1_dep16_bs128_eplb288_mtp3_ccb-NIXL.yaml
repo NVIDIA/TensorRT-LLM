@@ -46,7 +46,7 @@ environment:
 profiling:
   nsys_on: false
 accuracy:
-  enable_accuracy_test: false
+  enable_accuracy_test: true
   env_var:
     HF_HOME: <hf_home_path>
   tasks:
