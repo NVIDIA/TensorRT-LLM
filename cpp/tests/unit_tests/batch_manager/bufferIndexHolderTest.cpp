@@ -70,6 +70,10 @@ protected:
     void SetUp() override
     {
         setenv("TRTLLM_USE_UCX_KVCACHE", "1", 1);
+        // Move-assignment coverage requires two simultaneously held indices from either pool.
+        setenv("TRTLLM_REQUEST_KV_CACHE_CONCURRENT", "1", 1);
+        setenv("TRTLLM_KVCACHE_RECV_BUFFER_COUNT", "2", 1);
+        setenv("TRTLLM_KVCACHE_SEND_MAX_CONCURRENCY_NUM", "2", 1);
 
         int constexpr numLayers = 2;
         int constexpr numHeads = 2;
@@ -249,6 +253,7 @@ TEST_P(BufferIndexHolderLifecycleTest, MoveConstructTransfersOwnership)
 TEST_P(BufferIndexHolderLifecycleTest, MoveAssignReleasesPriorThenTransfers)
 {
     int const before = inUse();
+    ASSERT_GE(isRecv() ? mgr().getRecvBufferCount() : mgr().getSendBufferCount(), 2);
     auto firstIdx = acquire();
     auto secondIdx = acquire();
     ASSERT_TRUE(firstIdx.has_value());

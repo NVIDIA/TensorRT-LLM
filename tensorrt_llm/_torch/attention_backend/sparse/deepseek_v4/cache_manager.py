@@ -916,7 +916,13 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             # at max_num_tokens (the per-iteration token budget).
             if max_num_tokens is not None:
                 constraints.append(
-                    BatchDesc([KVCacheDesc(capacity=max_num_tokens, history_length=0)])
+                    BatchDesc(
+                        [
+                            KVCacheDesc(
+                                capacity=max_num_tokens + self.num_extra_kv_tokens, history_length=0
+                            )
+                        ]
+                    )
                 )
 
         scratch_reuse_config = None

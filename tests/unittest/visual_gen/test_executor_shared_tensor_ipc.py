@@ -79,6 +79,20 @@ class TestExecutorSharedTensorIPC(unittest.TestCase):
             resp.output.to_tensor()
         self.assertEqual(resp.output, {"status": "READY"})
 
+    def test_roundtrip_local_same_process(self):
+        """Same-process handoff: media stays in-process (local=True), not cross-process IPC."""
+        video = torch.arange(2 * 3 * 4 * 5 * 3, dtype=torch.uint8).reshape(2, 3, 4, 5, 3)
+        audio = torch.randn(2, 2, 100)
+        output = PipelineOutput(video=video, audio=audio, frame_rate=24.0)
+        output.to_handle(local=True)
+        self.assertIsInstance(output.video, dict)
+        self.assertIsInstance(output.audio, dict)
+        resp = DiffusionResponse(request_id=2, output=output)
+        resp.output.to_tensor()
+        self.assertTrue(torch.equal(resp.output.video, video))
+        self.assertTrue(torch.equal(resp.output.audio, audio))
+        self.assertEqual(resp.output.frame_rate, 24.0)
+
 
 if __name__ == "__main__":
     mp.set_start_method("spawn", force=True)

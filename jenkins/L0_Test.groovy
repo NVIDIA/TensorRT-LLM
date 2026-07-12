@@ -47,6 +47,7 @@ ARTIFACT_PATH = env.artifactPath ? env.artifactPath : "sw-tensorrt-generic/llm-a
 UPLOAD_PATH = env.uploadPath ? env.uploadPath : "sw-tensorrt-generic/llm-artifacts/${JOB_NAME}/${BUILD_NUMBER}"
 URM_ARTIFACTORY_BASE = "https://urm.nvidia.com/artifactory"
 ENABLE_UPLOAD_TEST_RESULTS = params.enableUploadTestResults != null ? params.enableUploadTestResults : true
+ENABLE_S3_ECHO_STDOUT = params.enableS3EchoStdout != null ? params.enableS3EchoStdout : false
 
 X86_64_TRIPLE = "x86_64-linux-gnu"
 AARCH64_TRIPLE = "aarch64-linux-gnu"
@@ -1193,16 +1194,15 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
             def coverageConfigFile = "${jobWorkspace}/.coveragerc"
 
             stage("Initialize Test") {
-                timeout(time: 30, unit: 'MINUTES') {
                 println("Selected Cluster: ${cluster.name}")
                 // Create Job Workspace folder in Frontend Node
                 Utils.exec(pipeline, script: Utils.sshUserCmd(remote, "\"mkdir -p ${jobWorkspace}\""), numRetries: 3)
 
                 // Download and Unzip Tar File
-                timeout(time: 15, unit: 'MINUTES') {
+                timeout(time: 30, unit: 'MINUTES') {
                     trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmPath} && wget -nv ${llmTarfile}")
-                    sh "cd ${llmPath} && tar -zxf ${BUILD_CONFIGS[config][TARNAME]}"
                 }
+                sh "cd ${llmPath} && tar -zxf ${BUILD_CONFIGS[config][TARNAME]}"
 
                 Utils.exec(pipeline, script: "echo \"Script for Slurm srun job to submit: \" && cat ${scriptRunLocalPath}")
                 Utils.copyFileToRemoteHost(
@@ -1315,8 +1315,10 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     extraArgs += [
                         "-s",
                         "--s3-upload-path=${uploadPath}/${stageName}",
-                        "--s3-echo-stdout",
                     ]
+                    if (ENABLE_S3_ECHO_STDOUT) {
+                        extraArgs += ["--s3-echo-stdout"]
+                    }
                 }
                 def pytestCommand = getPytestBaseCommandLine(
                     llmSrcNode,
@@ -1613,7 +1615,6 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     scriptSubmitPathNode,
                     true
                 )
-                } // timeout 30 min
             }
 
             stage("[${stageName}] Run Pytest") {
@@ -3558,7 +3559,6 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
     // Step 2: run tests
     stage ("Setup Environment")
     {
-        timeout(time: 45, unit: 'MINUTES') {
         // Random sleep to avoid resource contention
         sleep(10 * Math.random())
         sh "curl ifconfig.me || true"
@@ -3583,17 +3583,18 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         // download TRT-LLM tarfile
         def tarName = BUILD_CONFIGS[config][TARNAME]
         def llmTarfile = "https://urm.nvidia.com/artifactory/${ARTIFACT_PATH}/${tarName}"
-        timeout(time: 15, unit: 'MINUTES') {
+        timeout(time: 30, unit: 'MINUTES') {
             trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmPath} && wget -nv ${llmTarfile}")
-            sh "cd ${llmPath} && tar -zxf ${tarName}"
         }
+        sh "cd ${llmPath} && tar -zxf ${tarName}"
 
         // install python package
-        timeout(time: 30, unit: 'MINUTES') {
+        timeout(time: 45, unit: 'MINUTES') {
             if (env.alternativeTRT) {
                 sh "cd ${llmSrc} && sed -i 's#tensorrt~=.*\$#tensorrt#g' requirements.txt && cat requirements.txt"
             }
             trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmSrc} && pip3 install -r requirements-dev.txt")
+            trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install opencv-python-headless")
             if (stageName.contains("-Ray-")) {
                 trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install ray[default]==2.55.1")
             }
@@ -3603,7 +3604,6 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         }
 
         trtllm_utils.llmExecStepWithRetry(pipeline, script: "git config --global --add safe.directory \"*\"")
-        } // timeout 45 min
     }
 
     if (testFilter[(DEBUG_MODE)]) {
@@ -3740,8 +3740,10 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             extraArgs += [
                 "-s",
                 "--s3-upload-path=${uploadPath}/${stageName}",
-                "--s3-echo-stdout",
             ]
+            if (ENABLE_S3_ECHO_STDOUT) {
+                extraArgs += ["--s3-echo-stdout"]
+            }
         }
         def pytestCommand = getPytestBaseCommandLine(
             llmSrc,
@@ -4127,7 +4129,7 @@ def runLLMBuild(
     }
 
     withCredentials([usernamePassword(credentialsId: "urm-artifactory-creds", usernameVariable: 'CONAN_LOGIN_USERNAME', passwordVariable: 'CONAN_PASSWORD')]) {
-        trtllm_utils.llmExecStepWithRetry(pipeline, script: "#!/bin/bash \n" + "cd tensorrt_llm/ && python3 scripts/build_wheel.py --use_ccache -G Ninja -j ${BUILD_JOBS} -D 'WARNING_IS_ERROR=ON' ${buildArgs}${platNameArg}")
+        trtllm_utils.llmExecStepWithRetry(pipeline, script: "#!/bin/bash \n" + "cd tensorrt_llm/ && python3 scripts/build_wheel.py --use_ccache -G Ninja -j ${BUILD_JOBS} -D 'WARNING_IS_ERROR=ON' --extra-cmake-vars ENABLE_BOLT_COMPATIBLE=ON ${buildArgs}${platNameArg}")
     }
     if (env.alternativeTRT) {
         sh "bash -c 'pip3 show tensorrt || true'"
@@ -4350,12 +4352,66 @@ def runKubernetesPodWithInfraRetry(Map opts = [:], pipeline, podSpec, containerN
 
     // DEBUG_MODE preserves the existing 2-hour-input human-inspection workflow
     // inside runLLMTestlistOnPlatform's finallyRunner: a single attempt only.
-    // singleAttempt (per-call opt) opts out of the retry loop for the same
-    // reason at the call site -- e.g. SLURM dispatcher pods rely on their
-    // inner SLURM retry and don't want an outer pod-level retry budget.
-    if (singleAttempt || testFilter[(DEBUG_MODE)]) {
+    if (testFilter[(DEBUG_MODE)]) {
         trtllm_utils.launchKubernetesPod(pipeline, podSpec, containerName, { runner("", true, null) })
         return
+    }
+
+    // singleAttempt opts out of the outer pod-level *execution* retry: the inner
+    // retry (e.g. SLURM) owns re-runs, and re-running after work has started
+    // could double-submit. But a failure *before* the runner body begins is a
+    // pod/agent launch failure (the JNLP agent never came online, the node was
+    // pulled during provisioning, etc.): nothing has been dispatched yet, so
+    // relaunching a fresh pod -- steered off the bad node by host-node avoidance
+    // -- is safe and is the only way these recover. Retry launch failures only;
+    // once the runner starts (runnerStarted), honor singleAttempt and rethrow.
+    if (singleAttempt) {
+        def avoidedKubernetesHostNodes = []
+        def launchAttempt = 0
+        while (true) {
+            launchAttempt++
+            Map attemptPlacementContext = [runnerStarted: false]
+            try {
+                if (launchAttempt > 1 && !avoidedKubernetesHostNodes.isEmpty()) {
+                    echo "[INFRA-RETRY] ${stageName}: relaunching pod (attempt ${launchAttempt}), avoiding prior host node(s): ${avoidedKubernetesHostNodes.join(', ')}"
+                }
+                def attemptPodSpec = trtllm_utils.withKubernetesHostNodeExclusion(podSpec, avoidedKubernetesHostNodes)
+                trtllm_utils.launchKubernetesPodWithPlacement(pipeline, attemptPodSpec, containerName, attemptPlacementContext, {
+                    attemptPlacementContext.runnerStarted = true
+                    runner("", true, null)
+                })
+                return
+            } catch (InterruptedException e) {
+                throw e
+            } catch (Exception e) {
+                // Once the runner has started, this is an execution failure the
+                // inner retry owns -- honor singleAttempt and do not re-run.
+                if (attemptPlacementContext.runnerStarted) {
+                    throw e
+                }
+                def c = FailureClassifier.classify(e, InfraFailure.K8S)
+                if (c instanceof PipelineInterruption) throw e
+                if (!(c instanceof InfraFailure))      throw e   // UserFailure -> don't retry
+
+                rememberAvoidedKubernetesHostNodes(avoidedKubernetesHostNodes, attemptPlacementContext.lastHostNode, stageName)
+
+                if (launchAttempt > K8S_INFRA_RETRY_MAX) {
+                    echo "[INFRA-RETRY] ${stageName}: pod launch failed before execution (${c.detectedPattern}), " +
+                         "but max launch retries (${K8S_INFRA_RETRY_MAX}) exhausted after ${launchAttempt} attempts. Failing."
+                    throw e
+                }
+                if (!hasBudgetForInfraRetry(pipeline, stageName, InfraFailure.K8S, c, launchAttempt, K8S_INFRA_RETRY_MAX, 60L * 1000L, true)) {
+                    echo "[INFRA-RETRY] ${stageName}: pod launch failed (${c.detectedPattern}) is retryable, " +
+                         "but remaining CI timeout budget is too small for a relaunch. Failing without retry."
+                    throw e
+                }
+
+                echo "[INFRA-RETRY] ${stageName}: pod/agent launch failed before execution on attempt ${launchAttempt}: ${c.detectedPattern}"
+                echo "[INFRA-RETRY] ${stageName}: Exception: ${e.toString()}"
+                echo "[INFRA-RETRY] ${stageName}: Will relaunch (attempt ${launchAttempt + 1} of ${K8S_INFRA_RETRY_MAX + 1}) after 60s cooldown."
+                sleep(60)
+            }
+        }
     }
 
     def attempt = 0
@@ -4484,6 +4540,7 @@ def launchTestJobs(pipeline, testFilter)
         "A30-PyTorch-1": ["a30", "l0_a30", 1, 2],
         "A30-PyTorch-2": ["a30", "l0_a30", 2, 2],
         "A10-CPP-1": ["a10", "l0_a10", 1, 1],
+        "A30-CPP-1": ["a30", "l0_a30", 1, 1],
         "A30-AutoDeploy-1": ["a30", "l0_a30", 1, 1],
         "A100X-PyTorch-1": ["a100x", "l0_a100", 1, 1],
         "L40S-PyTorch-1": ["l40s", "l0_l40s", 1, 2],

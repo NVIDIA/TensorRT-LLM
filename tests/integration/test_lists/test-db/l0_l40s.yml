@@ -28,6 +28,11 @@ l0_l40s:
   - unittest/_torch/modeling/test_modeling_step3p7vl.py
   - test_e2e.py::test_ptp_scaffolding[DeepSeek-R1-Distill-Qwen-7B-DeepSeek-R1/DeepSeek-R1-Distill-Qwen-7B]
   - unittest/llmapi/apps/_test_openai_chat_multimodal.py::test_single_chat_session_image_embeds -m needs_l40s
+  # Encoder-only /v1/embeddings dynamic batching (BERT classifier + PRM-7B reward + Qwen3-Embedding)
+  - unittest/llmapi/apps/_test_openai_embeddings.py
+  # Qwen3-Embedding text-embedding accuracy vs HuggingFace (0.6B small/fast + 8B large)
+  - accuracy/test_llm_api_pytorch_encode.py::TestEncoderEncode::test_qwen3_text_embedding_matches_huggingface[qwen3-embedding-0.6b]
+  - accuracy/test_llm_api_pytorch_encode.py::TestEncoderEncode::test_qwen3_text_embedding_matches_huggingface[qwen3-embedding-8b]
   # AutoDeploy: Nemotron-Nano-V3 on Ada uses flashinfer; trtllm has no
   # (E4M3 input, BF16 output, paged_kv, head_dim=128, sm_89) FMHA cubin.
   - accuracy/test_llm_api_autodeploy.py::TestNemotronNanoV3::test_accuracy[fp8-1-attn_dp_off-flashinfer]
