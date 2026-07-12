@@ -51,7 +51,9 @@ from tensorrt_llm.models.automodel import AutoConfig, AutoModelForCausalLM
 from tensorrt_llm.models.modeling_utils import SpeculativeDecodingMode
 from tensorrt_llm.sampling_params import (BatchedLogitsProcessor,
                                           LogitsProcessor, SamplingParams)
-from tensorrt_llm.serve.openai_protocol import CompletionRequest
+from tensorrt_llm.serve.openai_protocol import (CompletionRequest,
+                                                MemoryUpdateRequest,
+                                                UpdateWeightsRequest)
 from tensorrt_llm.serve.openai_server import OpenAIServer
 from tensorrt_llm.serve.postprocess_handlers import (ChatPostprocArgs,
                                                      chat_stream_post_processor)
@@ -2706,6 +2708,182 @@ class _FakeRawRequest:
 
     async def is_disconnected(self):
         return True
+
+
+class _FakeResetExecutor:
+
+    def __init__(self):
+        self.num_reset_calls = 0
+
+    def reset_prefix_cache(self):
+        self.num_reset_calls += 1
+
+    def shutdown(self):
+        pass
+
+
+class _FakeCollectiveResetExecutor:
+
+    def __init__(self):
+        self.calls = []
+
+    def collective_rpc(self, method, args, kwargs, non_block, unique_reply_rank,
+                       target_ranks):
+        self.calls.append(
+            (method, args, kwargs, non_block, unique_reply_rank, target_ranks))
+        return [None]
+
+    def shutdown(self):
+        pass
+
+
+class _FakeUnsupportedResetExecutor:
+
+    def shutdown(self):
+        pass
+
+
+class _FakeWorkerControlExecutor:
+
+    def __init__(self):
+        self.calls = []
+
+    def sleep(self, tags):
+        self.calls.append(("sleep", tags))
+
+    def wakeup(self, tags):
+        self.calls.append(("wakeup", tags))
+
+
+class _FakeWorkerControlGenerator:
+
+    def __init__(self):
+        self._executor = _FakeWorkerControlExecutor()
+
+
+class _FakeCollectiveWorkerControlGenerator:
+
+    def __init__(self):
+        self._executor = object()
+        self.calls = []
+
+    def _collective_rpc(self, method, args):
+        self.calls.append((method, args))
+
+
+class _FakeNotImplementedResetGenerator:
+
+    def reset_prefix_cache(self):
+        raise NotImplementedError("not supported")
+
+
+def test_llm_reset_prefix_cache_dispatches_to_executor() -> None:
+    llm = object.__new__(LLM_torch)
+    llm._encode_only = False
+    llm._executor = _FakeResetExecutor()
+
+    llm.reset_prefix_cache()
+
+    assert llm._executor.num_reset_calls == 1
+
+
+def test_llm_reset_prefix_cache_uses_collective_rpc() -> None:
+    llm = object.__new__(LLM_torch)
+    llm._encode_only = False
+    llm._executor = _FakeCollectiveResetExecutor()
+
+    llm.reset_prefix_cache()
+
+    assert llm._executor.calls == [("reset_prefix_cache", (), None, False, None,
+                                    None)]
+
+
+def test_llm_reset_prefix_cache_rejects_encode_only() -> None:
+    llm = object.__new__(LLM_torch)
+    llm._encode_only = True
+    llm._executor = _FakeResetExecutor()
+
+    with pytest.raises(RuntimeError, match="encode_only=True"):
+        llm.reset_prefix_cache()
+
+
+def test_llm_reset_prefix_cache_rejects_unsupported_executor() -> None:
+    llm = object.__new__(LLM_torch)
+    llm._encode_only = False
+    llm._executor = _FakeUnsupportedResetExecutor()
+
+    with pytest.raises(NotImplementedError,
+                       match="only supported by the PyTorch backend"):
+        llm.reset_prefix_cache()
+
+
+def test_openai_reset_prefix_cache_endpoint() -> None:
+    server = object.__new__(OpenAIServer)
+    server.generator = _FakeResetExecutor()
+
+    response = asyncio.run(server.reset_prefix_cache())
+
+    assert response.status_code == 200
+    assert server.generator.num_reset_calls == 1
+
+
+def test_openai_reset_prefix_cache_endpoint_rejects_unsupported_generator(
+) -> None:
+    server = object.__new__(OpenAIServer)
+    server.generator = object()
+
+    response = asyncio.run(server.reset_prefix_cache())
+
+    assert response.status_code == 501
+
+
+def test_openai_reset_prefix_cache_endpoint_maps_not_implemented() -> None:
+    server = object.__new__(OpenAIServer)
+    server.generator = _FakeNotImplementedResetGenerator()
+
+    response = asyncio.run(server.reset_prefix_cache())
+
+    assert response.status_code == 501
+
+
+def test_openai_memory_endpoints_dispatch_to_non_ray_executor() -> None:
+    server = object.__new__(OpenAIServer)
+    server.generator = _FakeWorkerControlGenerator()
+
+    release_response = asyncio.run(
+        server.release_memory(MemoryUpdateRequest(tags=["kv_cache"])))
+    resume_response = asyncio.run(
+        server.resume_memory(MemoryUpdateRequest(tags=["kv_cache"])))
+
+    assert release_response.status_code == 200
+    assert resume_response.status_code == 200
+    assert server.generator._executor.calls == [("sleep", ["kv_cache"]),
+                                                ("wakeup", ["kv_cache"])]
+
+
+def test_openai_memory_endpoints_dispatch_to_non_ray_collective_rpc() -> None:
+    server = object.__new__(OpenAIServer)
+    server.generator = _FakeCollectiveWorkerControlGenerator()
+
+    release_response = asyncio.run(
+        server.release_memory(MemoryUpdateRequest(tags=["kv_cache"])))
+    resume_response = asyncio.run(
+        server.resume_memory(MemoryUpdateRequest(tags=["kv_cache"])))
+
+    assert release_response.status_code == 200
+    assert resume_response.status_code == 200
+    assert server.generator.calls == [("sleep", (["kv_cache"], )),
+                                      ("wakeup", (["kv_cache"], ))]
+
+
+def test_openai_update_weights_rejects_non_ray_generator() -> None:
+    server = object.__new__(OpenAIServer)
+    server.generator = _FakeWorkerControlGenerator()
+
+    response = asyncio.run(
+        server.update_weights(UpdateWeightsRequest(weights=None)))
+
+    assert response.status_code == 501
 
 
 def test_openai_completion_list_prompt_stream_reuses_stream_metadata() -> None:

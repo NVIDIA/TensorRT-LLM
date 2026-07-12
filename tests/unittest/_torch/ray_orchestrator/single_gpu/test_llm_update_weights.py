@@ -13,7 +13,9 @@ from utils.util import getSMVersion, skip_pre_hopper
 
 from tensorrt_llm import LLM
 from tensorrt_llm._torch.utils import get_device_uuid
+from tensorrt_llm.executor.ray_gpu_worker import RayGPUWorker, RayWorkerWrapper
 from tensorrt_llm.llmapi import KvCacheConfig, MoeConfig, SamplingParams
+from tensorrt_llm.llmapi.rlhf_utils import WorkerExtension
 
 # Ray-backed LLM teardown spawns the executor main-loop, GC and log/error
 # listener threads in ray-core. These are torn down only when ``ray.shutdown()``
@@ -24,6 +26,16 @@ from tensorrt_llm.llmapi import KvCacheConfig, MoeConfig, SamplingParams
 # file (matches the sibling pattern at
 # tests/unittest/_torch/ray_orchestrator/multi_gpu/test_executor.py).
 pytestmark = pytest.mark.threadleak(enabled=False)
+
+
+@pytest.mark.part0
+def test_rlhf_worker_extension_uses_base_reset_prefix_cache():
+    worker_cls = RayWorkerWrapper._inject_worker_extension(
+        RayGPUWorker, "tensorrt_llm.llmapi.rlhf_utils.WorkerExtension"
+    )
+
+    assert "reset_prefix_cache" not in WorkerExtension.__dict__
+    assert worker_cls.reset_prefix_cache is RayGPUWorker.reset_prefix_cache
 
 
 class RefHFModelWithIPCHandles(RefHFModel):
