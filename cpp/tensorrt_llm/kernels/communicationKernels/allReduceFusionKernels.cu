@@ -24,21 +24,53 @@ TRTLLM_NAMESPACE_BEGIN
 
 namespace kernels::ar_fusion
 {
-__device__ __forceinline__ float warpReduceSumActive(float val)
+__device__ __forceinline__ uint32_t getLaneMask(int activeLanes)
 {
-    auto const mask = __activemask();
-    auto const lane = threadIdx.x & (warpSize - 1);
-    auto const activeLanes = __popc(mask);
+    return activeLanes == warpSize ? 0xffffffffU : ((1U << activeLanes) - 1U);
+}
+
+__device__ __forceinline__ float warpReduceSum(float val, uint32_t mask, int activeLanes)
+{
+    int const lane = threadIdx.x & (warpSize - 1);
 #pragma unroll
     for (int offset = warpSize / 2; offset > 0; offset >>= 1)
     {
-        auto const other = __shfl_down_sync(mask, val, offset);
-        if (lane + offset < activeLanes)
+        if (offset < activeLanes)
         {
-            val += other;
+            float const other = __shfl_xor_sync(mask, val, offset, warpSize);
+            if ((lane ^ offset) < activeLanes)
+            {
+                val += other;
+            }
         }
     }
     return val;
+}
+
+__device__ __forceinline__ void blockReduceSum(float* val)
+{
+    __shared__ float shared[32];
+    int const lane = threadIdx.x & (warpSize - 1);
+    int const warpId = threadIdx.x / warpSize;
+    int const warpStart = warpId * warpSize;
+    int const remainingLanes = static_cast<int>(blockDim.x) - warpStart;
+    int const activeLanes = remainingLanes < warpSize ? remainingLanes : warpSize;
+    uint32_t const mask = getLaneMask(activeLanes);
+
+    *val = warpReduceSum(*val, mask, activeLanes);
+    if (lane == 0)
+    {
+        shared[warpId] = *val;
+    }
+
+    __syncthreads();
+
+    int const warpCount = (blockDim.x + warpSize - 1) / warpSize;
+    if (warpCount > 1 && warpId == 0)
+    {
+        *val = lane < warpCount ? shared[lane] : 0.f;
+        *val = warpReduceSum(*val, 0xffffffffU, warpSize);
+    }
 }
 
 template <int NRanks>
@@ -313,9 +345,9 @@ protected:
             float v = static_cast<float>(reinterpret_cast<DType const*>(&residual)[i]);
             acc += v * v;
         }
-        if (blockDim.x < warpSize)
+        if (blockDim.x % warpSize != 0)
         {
-            acc = warpReduceSumActive(acc);
+            blockReduceSum(&acc);
         }
         else
         {

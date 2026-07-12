@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -429,10 +429,8 @@ public:
         }
         else if constexpr (ar_fusion::GetQuantType<Pattern> == ar_fusion::QuantType::kFP8)
         {
-            // We need norm out to verify the accuracy of quantization.
-            static_assert(Pattern == ar_fusion::AllReduceFusionPattern::kARResidualRMSNormOutFP8Quant);
             CudaBuffer ref_fp8_output(message_size * sizeof(__nv_fp8_e4m3));
-            quantize_to_fp8(m_norm_out.device_data<DType>(), ref_fp8_output.device_data<__nv_fp8_e4m3>(), message_size,
+            quantize_to_fp8(ref_output.device_data<DType>(), ref_fp8_output.device_data<__nv_fp8_e4m3>(), message_size,
                 m_scale_factor.device_data<float>(), m_stream->get());
             TLLM_CHECK(compare<__nv_fp8_e4m3>(
                 m_rank, m_quant_out.host_data(), ref_fp8_output.host_data(), message_size, "fp8 quant out", 0));
@@ -600,13 +598,13 @@ TEST(Kernel_AllReduceFusion, AllReduceFusionAccuracyDifferentHiddenDim)
     ASSERT_EQ(world_size % 2, 0) << "Requires even world size (got " << world_size << ")";
 
     int const arch = tensorrt_llm::common::getSMVersion();
+    TEST_AR_FUSION(half, ar_fusion::AllReduceFusionPattern::kARResidualRMSNormFP8Quant);
+    TEST_AR_FUSION(half, ar_fusion::AllReduceFusionPattern::kARResidualRMSNormOutFP8Quant);
+    TEST_AR_FUSION(__nv_bfloat16, ar_fusion::AllReduceFusionPattern::kARResidualRMSNormFP8Quant);
+    TEST_AR_FUSION(__nv_bfloat16, ar_fusion::AllReduceFusionPattern::kARResidualRMSNormOutFP8Quant);
     if (arch >= 100)
     {
         TEST_AR_FUSION(half, ar_fusion::AllReduceFusionPattern::kARResidualRMSNormOutFP4Quant);
-    }
-    else
-    {
-        TEST_AR_FUSION(half, ar_fusion::AllReduceFusionPattern::kARResidualRMSNormOutFP8Quant);
     }
 #undef TEST_AR_FUSION
 }
