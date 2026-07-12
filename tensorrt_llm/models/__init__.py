@@ -58,6 +58,8 @@ from .nemotron_nas.model import DeciLMForCausalLM
 from .opt.model import OPTForCausalLM, OPTModel
 from .phi3.model import Phi3ForCausalLM, Phi3Model
 from .phi.model import PhiForCausalLM, PhiModel
+from .qwen3_next.config import Qwen3NextConfig
+from .qwen3_next.model import Qwen3NextForCausalLM
 from .qwen.model import QWenForCausalLM
 from .recurrentgemma.model import RecurrentGemmaForCausalLM
 from .redrafter.model import ReDrafterForLLaMALM, ReDrafterForQWenLM
@@ -113,6 +115,8 @@ __all__ = [
     'QWenConfig'
     'QWenForCausalLM',
     'QWenModel',
+    'Qwen3NextConfig',
+    'Qwen3NextForCausalLM',
     'EncoderModel',
     'DecoderModel',
     'PretrainedConfig',
@@ -197,6 +201,8 @@ MODEL_MAP = {
     'Qwen2VLModel': QWenForCausalLM,
     'Qwen3ForCausalLM': QWenForCausalLM,
     'Qwen3MoeForCausalLM': QWenForCausalLM,
+    'Qwen3_5MoeForConditionalGeneration': Qwen3NextForCausalLM,
+    'Qwen3NextForCausalLM': Qwen3NextForCausalLM,
     'WhisperEncoder': WhisperEncoder,
     'EncoderModel': EncoderModel,
     'DecoderModel': DecoderModel,

@@ -7178,6 +7178,124 @@ def selective_scan(input: Tensor,
         return output, present_state
 
 
+def gated_delta_rule(q: Tensor,
+                     k: Tensor,
+                     v: Tensor,
+                     g: Tensor,
+                     beta: Tensor,
+                     state_or_ptr: Tensor,
+                     host_request_types: Tensor,
+                     last_token_ids: Tensor,
+                     num_v_heads: int,
+                     head_k_dim: int,
+                     head_v_dim: int,
+                     chunk_size: int = 64,
+                     use_qk_l2norm: bool = True,
+                     dtype: str = 'float32',
+                     host_context_lengths: Optional[Tensor] = None,
+                     slot_mapping: Optional[Tensor] = None):
+    """Gated DeltaNet (Qwen3-Next linear attention) recurrence.
+
+    Binds the ``GatedDeltaNet`` TensorRT plugin. The recurrent state is a
+    per-(request, v-head) matrix ``[head_k_dim, head_v_dim]`` carried across
+    context/generation phases via the paged RNN-state path (like Mamba/RG-LRU).
+    The depthwise causal conv is handled separately by ``mamba_conv1d``; this op
+    consumes the post-conv, head-split ``q/k/v`` and the per-head ``g``/``beta``.
+
+    Parameters:
+        q : Tensor (On GPU)
+            Query. Shape ``[batch, seq_len, num_v_heads, head_k_dim]`` or
+            ``[num_tokens, num_v_heads, head_k_dim]`` for remove_input_padding.
+        k : Tensor (On GPU)
+            Key. Same shape as ``q`` (GQA already expanded to ``num_v_heads``).
+        v : Tensor (On GPU)
+            Value. ``[batch, seq_len, num_v_heads, head_v_dim]`` or packed.
+        g : Tensor (On GPU)
+            Per-head log-decay (``<= 0``). ``[batch, seq_len, num_v_heads]``.
+        beta : Tensor (On GPU)
+            Per-head update gate in ``(0, 1)``. ``[batch, seq_len, num_v_heads]``.
+        state_or_ptr : Tensor (On GPU or CPU)
+            The recurrent state ``[batch, num_v_heads, head_k_dim, head_v_dim]``
+            in float32, or a CPU ``[1]`` int64 pointer for paged state.
+        host_request_types : Tensor (On CPU)
+            ``[batch]`` int32. 0: context; 1: generation.
+        last_token_ids : Tensor (On GPU)
+            The inclusive prefix-sum of the lengths or the lengths of the
+            sequences in the batch.
+        num_v_heads, head_k_dim, head_v_dim : int
+            GDN head configuration.
+        chunk_size : int
+            Prefill chunk size (kernel attribute).
+        use_qk_l2norm : bool
+            Whether to L2-normalize q,k over ``head_k_dim`` inside the kernel.
+        dtype : str
+            Compute dtype (state is always float32).
+        host_context_lengths : Tensor (On CPU) (Optional)
+            Required for remove_input_padding.
+        slot_mapping : Tensor (On GPU) (Optional)
+            Required for paged_state.
+
+    Returns:
+        (output, present_state). ``output`` has the value-head shape of ``v``;
+        ``present_state`` is ``None`` when paged_state (updated in place).
+    """
+    assert host_request_types is not None
+    gdn_plg_creator = trt.get_plugin_registry().get_plugin_creator(
+        'GatedDeltaNet', '1', TRT_LLM_PLUGIN_NAMESPACE)
+    assert gdn_plg_creator is not None
+
+    num_v_heads = trt.PluginField("num_v_heads",
+                                  np.array(num_v_heads, dtype=np.int32),
+                                  trt.PluginFieldType.INT32)
+    head_k_dim = trt.PluginField("head_k_dim",
+                                 np.array(head_k_dim, dtype=np.int32),
+                                 trt.PluginFieldType.INT32)
+    head_v_dim = trt.PluginField("head_v_dim",
+                                 np.array(head_v_dim, dtype=np.int32),
+                                 trt.PluginFieldType.INT32)
+    chunk_size = trt.PluginField("chunk_size",
+                                 np.array(chunk_size, dtype=np.int32),
+                                 trt.PluginFieldType.INT32)
+    use_qk_l2norm = trt.PluginField(
+        "use_qk_l2norm", np.array(np.int8(use_qk_l2norm), dtype=np.int8),
+        trt.PluginFieldType.INT8)
+    pf_type = trt.PluginField(
+        "type_id", np.array([int(str_dtype_to_trt(dtype))], np.int32),
+        trt.PluginFieldType.INT32)
+    remove_input_padding = trt.PluginField(
+        "remove_input_padding",
+        np.array(np.int8(default_net().plugin_config.remove_input_padding),
+                 dtype=np.int8), trt.PluginFieldType.INT8)
+    paged_state = trt.PluginField(
+        "paged_state",
+        np.array(np.int8(default_net().plugin_config.paged_state),
+                 dtype=np.int8), trt.PluginFieldType.INT8)
+
+    pfc = trt.PluginFieldCollection([
+        num_v_heads, head_k_dim, head_v_dim, chunk_size, use_qk_l2norm, pf_type,
+        remove_input_padding, paged_state
+    ])
+    gdn_plug = gdn_plg_creator.create_plugin("gated_delta_rule", pfc)
+
+    plug_inputs = [
+        q, k, v, g, beta, state_or_ptr, host_request_types, last_token_ids
+    ]
+    if default_net().plugin_config.remove_input_padding:
+        plug_inputs += [host_context_lengths]
+    if default_net().plugin_config.paged_state:
+        plug_inputs += [slot_mapping]
+    plug_inputs = [i.trt_tensor for i in plug_inputs]
+
+    layer = default_trtnet().add_plugin_v2(plug_inputs, gdn_plug)
+    _add_plugin_info(layer, gdn_plg_creator, "gated_delta_rule", pfc)
+    output = _create_tensor(layer.get_output(0), layer)
+    if default_net().plugin_config.paged_state:
+        return output, None
+    else:
+        present_state = _create_tensor(layer.get_output(1), layer)
+        return output, present_state
+
+
 def rg_lru(input: Tensor,
            A: Tensor,
            state_or_ptr: Tensor,

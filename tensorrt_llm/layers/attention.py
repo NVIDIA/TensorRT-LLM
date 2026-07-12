@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -366,6 +366,7 @@ class Attention(Module):
                  layernorm_type=LayerNormType.LayerNorm,
                  layernorm_share=True,
                  inner_layernorm=False,
+                 attn_output_gate=False,
                  eps=1e-05,
                  attention_mask_type=AttentionMaskType.padding,
                  bias=True,
@@ -530,6 +531,25 @@ class Attention(Module):
                                dtype=dtype,
                                tp_group=tp_group,
                                tp_size=tp_size)
+
+        # Optional sigmoid output gate on the attention output (Qwen3-Next /
+        # Qwen3.5-MoE ``attn_output_gate``). In HF this is fused into a doubled
+        # q projection; on the engine path the converter de-interleaves the
+        # gate half into this separate projection. ``gate`` shards over heads
+        # exactly like Q (ColumnLinear, gather_output=False) so the elementwise
+        # ``context * sigmoid(gate)`` stays per-rank-consistent, and the real
+        # ``dense`` (o_proj) below still owns the single TP all-reduce and the
+        # FP8 output-quant wiring (set_fp8_context_fmha keys on ``self.dense``).
+        self.attn_output_gate = attn_output_gate
+        if self.attn_output_gate:
+            self.gate = ColumnLinear(hidden_size,
+                                     tp_size * self.num_attention_heads *
+                                     self.attention_head_size,
+                                     bias=bias,
+                                     dtype=dtype,
+                                     tp_group=tp_group,
+                                     tp_size=tp_size,
+                                     gather_output=False)
 
         # see optimize_model's add_lora for LoRA initialization
         self.qkv_lora = None
@@ -1587,6 +1607,30 @@ class Attention(Module):
 
         if self.inner_layernorm is not None:
             context = self.inner_layernorm(context)
+        if self.attn_output_gate:
+            # Qwen3-Next / Qwen3.5-MoE output gate: context * sigmoid(gate),
+            # applied on the pre-dense context (post-plugin, head-sharded under
+            # TP) so the elementwise multiply lines up with ``self.gate``'s
+            # matching per-rank Q-head shard, then ``self.dense`` (o_proj) does
+            # the single all-reduce. ``attention_input`` is the module input
+            # hidden_states (the gate is a projection of the layer input).
+            gate = ACT2FN['sigmoid'](self.gate(attention_input))
+            # The gpt_attention plugin can emit its context already quantized to
+            # FP8 (so a downstream FP8 ``dense`` consumes it directly). FP8 can't
+            # be an elementwise-PROD operand, and TRT only lets an FP8 tensor be
+            # consumed by a Dequantize/plugin layer -- so dequantize the context
+            # back to the gate dtype using ``dense``'s activation scale, apply the
+            # gate, and let ``dense`` re-quantize its (now model-dtype) input.
+            if context.dtype == trt.fp8 and context.dtype != gate.dtype:
+                deq_scale = getattr(self.dense, 'activation_scaling_factor',
+                                    None)
+                assert deq_scale is not None, (
+                    "FP8 attention context requires the dense activation scale "
+                    "to dequantize before the attn_output_gate multiply.")
+                context = dequantize(context, deq_scale.value, -1, gate.dtype)
+            elif context.dtype != gate.dtype:
+                context = context.cast(gate.dtype)
+            context = context * gate
         context = self.dense(context,
                              lora_runtime_params=dense_lora_params,
                              all_reduce_params=all_reduce_params)

@@ -47,6 +47,7 @@ public:
         kMamba = 3,          // https://github.com/state-spaces/mamba
         kRecurrentGemma = 4, // https://github.com/google-deepmind/recurrentgemma
         kEncDec = 5,
+        kQwen3Next = 6,      // Qwen3.5/3.6 hybrid: Gated DeltaNet (linear attention) + full attention
     };
 
     struct RnnConfig
@@ -782,7 +783,8 @@ public:
 
     [[nodiscard]] bool constexpr isRnnBased() const noexcept
     {
-        return mModelVariant == ModelVariant::kMamba || mModelVariant == ModelVariant::kRecurrentGemma;
+        return mModelVariant == ModelVariant::kMamba || mModelVariant == ModelVariant::kRecurrentGemma
+            || mModelVariant == ModelVariant::kQwen3Next;
     }
 
     [[nodiscard]] std::vector<LayerType> const& getLayerTypes() const noexcept

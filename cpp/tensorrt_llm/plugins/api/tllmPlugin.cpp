@@ -23,6 +23,7 @@
 #include "tensorrt_llm/plugins/doraPlugin/doraPlugin.h"
 #include "tensorrt_llm/plugins/fp8RowwiseGemmPlugin/fp8RowwiseGemmPlugin.h"
 #include "tensorrt_llm/plugins/fusedLayernormPlugin/fusedLayernormPlugin.h"
+#include "tensorrt_llm/plugins/gatedDeltaNetPlugin/gatedDeltaNetPlugin.h"
 #include "tensorrt_llm/plugins/gemmPlugin/gemmPlugin.h"
 #include "tensorrt_llm/plugins/gemmSwigluPlugin/gemmSwigluPlugin.h"
 #include "tensorrt_llm/plugins/gptAttentionPlugin/gptAttentionPlugin.h"
@@ -237,6 +238,7 @@ extern "C"
         static tensorrt_llm::plugins::SelectiveScanPluginCreator selectiveScanPluginCreator;
         static tensorrt_llm::plugins::Fp4GemmPluginCreator fp4GemmPluginCreator;
         static tensorrt_llm::plugins::MambaConv1dPluginCreator mambaConv1DPluginCreator;
+        static tensorrt_llm::plugins::GatedDeltaNetPluginCreator gatedDeltaNetPluginCreator;
         static tensorrt_llm::plugins::lruPluginCreator lruPluginCreator;
         static tensorrt_llm::plugins::CumsumLastDimPluginCreator cumsumLastDimPluginCreator;
         static tensorrt_llm::plugins::TopkLastDimPluginCreator topkLastDimPluginCreator;
@@ -276,6 +278,7 @@ extern "C"
                   creatorPtr(lookupPluginCreator),
                   creatorPtr(loraPluginCreator),
                   creatorPtr(selectiveScanPluginCreator),
+                  creatorPtr(gatedDeltaNetPluginCreator),
                   creatorPtr(fp4GemmPluginCreator),
                   creatorPtr(mambaConv1DPluginCreator),
                   creatorPtr(lruPluginCreator),
