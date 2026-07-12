@@ -59,6 +59,7 @@ from ..models.modeling_multimodal_utils import filter_mm_token_from_input_ids
 from ..models.modeling_utils import DecoderModelForCausalLM
 from ..modules.fused_moe.moe_load_balancer import (MoeLoadBalancer,
                                                    MoeLoadBalancerIterContext)
+from ..modules.mamba.mamba2_metadata import Mamba2Metadata
 from ..peft.lora.cuda_graph_lora_manager import CudaGraphLoraManager
 from ..speculative import (SpecMetadata, get_draft_kv_cache_manager,
                            get_num_extra_kv_tokens, get_spec_metadata,
@@ -1518,8 +1519,9 @@ class PyTorchModelEngine(ModelEngine):
            short sequences, forcing the multi-seq path of
            ``cu_seqlens_to_chunk_indices_offsets_triton`` and its
            ``_cu_seqlens_triton_kernel``.
-        2. ``least_requests=False`` with ``TLLM_MAMBA_WARMUP_FORCE_INITSTATES=1``
-           — same as (1) plus the ``HAS_INITSTATES=True`` variants of
+        2. ``least_requests=False`` inside
+           ``Mamba2Metadata.force_initial_states_for_warmup()`` — same as (1)
+           plus the ``HAS_INITSTATES=True`` variants of
            ``_state_passing_fwd_kernel``, ``_chunk_scan_fwd_kernel``, and
            ``_chunk_state_varlen_kernel``.
 
@@ -1531,8 +1533,8 @@ class PyTorchModelEngine(ModelEngine):
             return
         kv_cache_manager = resource_manager.get_resource_manager(
             self.kv_cache_manager_key)
-        if kv_cache_manager is None or not isinstance(
-                kv_cache_manager, MambaHybridCacheManager):
+        if kv_cache_manager is None or not isinstance(kv_cache_manager,
+                                                      MambaHybridCacheManager):
             return
 
         token_num_upper_bound = min(self.max_num_tokens,
@@ -1545,19 +1547,6 @@ class PyTorchModelEngine(ModelEngine):
 
         logger.info(
             "Running Mamba hybrid warmup (multi-seq + HAS_INITSTATES=True)...")
-
-        @contextlib.contextmanager
-        def _force_mamba_initstates_env():
-            prev = os.environ.get("TLLM_MAMBA_WARMUP_FORCE_INITSTATES")
-            os.environ["TLLM_MAMBA_WARMUP_FORCE_INITSTATES"] = "1"
-            try:
-                yield
-            finally:
-                if prev is None:
-                    os.environ.pop(
-                        "TLLM_MAMBA_WARMUP_FORCE_INITSTATES", None)
-                else:
-                    os.environ["TLLM_MAMBA_WARMUP_FORCE_INITSTATES"] = prev
 
         # (num_tokens, num_gen_requests, least_requests, force_initstates)
         mamba_warmup_shapes = [
@@ -1573,14 +1562,16 @@ class PyTorchModelEngine(ModelEngine):
         with self.no_cuda_graph(), autotune_ctx:
             for (num_tokens_i, num_gen_requests_i, least_req_i,
                  force_init_i) in mamba_warmup_shapes:
-                init_ctx = (_force_mamba_initstates_env()
+                init_ctx = (Mamba2Metadata.force_initial_states_for_warmup()
                             if force_init_i else contextlib.nullcontext())
                 with init_ctx:
                     warmup_request = self._create_warmup_request(
-                        resource_manager, num_tokens_i, num_gen_requests_i,
+                        resource_manager,
+                        num_tokens_i,
+                        num_gen_requests_i,
                         least_requests=least_req_i)
-                    with self._release_batch_context(
-                            warmup_request, resource_manager) as batch:
+                    with self._release_batch_context(warmup_request,
+                                                     resource_manager) as batch:
                         if batch is None and self.mapping.tp_size <= 1:
                             continue
                         self._assert_all_tp_ranks_have_warmup_batch(

@@ -13,8 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
 import math
-import os
 from typing import Tuple
 
 import torch
@@ -214,6 +214,23 @@ def cu_seqlens_to_chunk_indices_offsets(
 
 
 class Mamba2Metadata:
+
+    # Warmup-only knob: when set via ``force_initial_states_for_warmup``,
+    # ``prepare()`` forces ``has_initial_states_cpu[:num_contexts]`` to True so
+    # the ``HAS_INITSTATES=True`` variants of the SSD Triton kernels compile
+    # during warmup. Class-scoped (not env-var) so it cannot leak into real
+    # inference from a stray shell export or a forked worker.
+    _warmup_force_initial_states: bool = False
+
+    @classmethod
+    @contextlib.contextmanager
+    def force_initial_states_for_warmup(cls):
+        prev = cls._warmup_force_initial_states
+        cls._warmup_force_initial_states = True
+        try:
+            yield
+        finally:
+            cls._warmup_force_initial_states = prev
 
     def __init__(self, max_batch_size: int, chunk_size: int):
         self.max_batch_size = max_batch_size
@@ -424,9 +441,10 @@ class Mamba2Metadata:
             # HAS_INITSTATES=True variants of _state_passing_fwd_kernel,
             # _chunk_scan_fwd_kernel, and _chunk_state_varlen_kernel compile
             # during warmup instead of the first real-request iter that hits
-            # chunked prefill with cached tokens.
-            if os.environ.get(
-                    "TLLM_MAMBA_WARMUP_FORCE_INITSTATES") == "1":
+            # chunked prefill with cached tokens. Gate is a class-scoped
+            # context manager (see ``force_initial_states_for_warmup``) so it
+            # cannot silently affect real inference.
+            if Mamba2Metadata._warmup_force_initial_states:
                 self.has_initial_states_cpu[:num_contexts].fill_(True)
             # Mirror CPU staging flags to the CUDA-side buffer asynchronously.
             self.has_initial_states[:num_contexts].copy_(
