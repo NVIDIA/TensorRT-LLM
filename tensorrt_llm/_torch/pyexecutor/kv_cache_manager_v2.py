@@ -1811,9 +1811,18 @@ class KVCacheManagerV2(BaseResourceManager):
     def _required_gen_capacity(self, req: LlmRequest, current_capacity: int) -> int:
         """Compute generation KV cache capacity for a request.
 
-        Grows *current_capacity* by 1 + draft tokens.
+        Grows *current_capacity* by 1 + draft tokens, plus another draft_len
+        of slack for one-model speculative decoding: under the overlap
+        scheduler the device-side KV position runs one verification round
+        ahead of host bookkeeping (up to draft_len accepted-but-uncommitted
+        tokens), and the MTP draft layers then append draft KV beyond that
+        position. Without the slack, the draft KV append can address a block
+        ordinal the host has not allocated yet whenever the overrun crosses a
+        tokens_per_block boundary — an illegal memory access in the MLA rope
+        generation kernel (observed with DSV4 DEP+MTP3 at 128k, where the
+        first window-slide boundary crossing after prefill faults).
         """
-        return current_capacity + 1 + self._effective_draft_len(req)
+        return current_capacity + 1 + 2 * self._effective_draft_len(req)
 
     def try_allocate_generation(self, req: LlmRequest) -> bool:
         """Try to allocate one additional KV cache slot for a generation request.
@@ -1853,7 +1862,8 @@ class KVCacheManagerV2(BaseResourceManager):
         draft_len = self._allocated_draft_lens.pop(
             req.py_request_id, self._effective_draft_len(req)
         )
-        reverted_cap = kv_cache.capacity - 1 - draft_len
+        # Mirror the 1 + 2 * draft_len growth in _required_gen_capacity.
+        reverted_cap = kv_cache.capacity - 1 - 2 * draft_len
         if reverted_cap < 0:
             return
         if not kv_cache.resize(reverted_cap):
@@ -2059,7 +2069,9 @@ class KVCacheManagerV2(BaseResourceManager):
         if allocated is None:
             return
         current_draft_len = get_draft_token_length(request)
-        delta = current_draft_len - allocated
+        # Growth is 1 + 2 * draft_len (see _required_gen_capacity), so the
+        # padding delta scales by 2 as well.
+        delta = 2 * (current_draft_len - allocated)
         if delta <= 0:
             return
         kv_cache = self.kv_cache_map[request.py_request_id]
