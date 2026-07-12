@@ -1153,6 +1153,15 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
         token_lists, block_hashes_by_algo = await asyncio.to_thread(
             self._tokenize_and_compute_block_hashes_by_algo, request,
             hash_algo_by_server.values(), cache_salt_id)
+        # The await above releases the event loop, so a concurrent
+        # remove_server / _on_servers_updated may have dropped entries from
+        # _server_state that were in our snapshot. Reconcile under the lock
+        # before indexing into _server_state below.
+        async with self._lock:
+            servers = [s for s in servers if s in self._server_state]
+        if not servers:
+            raise ValueError(
+                f"No available servers after excluding {exclude_server}")
         # select the server by (KV match - load), bounded by load_cap
         workloads = [
             self._server_state[server].num_active_requests()
