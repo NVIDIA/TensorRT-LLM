@@ -2389,10 +2389,12 @@ class Indexer(nn.Module):
         has_prefill = num_contexts > 0
         num_gen_tokens = num_tokens - num_ctx_tokens
 
-        topk_indices_buffer = torch.empty(
+        topk_indices_buffer = metadata.get_empty(
+            metadata.cuda_graph_buffers,
             (hidden_states.shape[0], self.index_topk),
+            cache_name="indexer_topk_out_buffer",
             dtype=torch.int32,
-            device=hidden_states.device)
+            capture_graph=metadata.is_cuda_graph)
         if not use_custom_topk:
             topk_indices_buffer[:hidden_states.shape[0]] = -1
 
