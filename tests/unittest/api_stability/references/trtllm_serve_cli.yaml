@@ -321,6 +321,24 @@ commands:
         is_flag: false
         flags:
         - "--num_media_load_workers"
+      openengine_host:
+        type: str
+        default: 127.0.0.1
+        status: prototype
+        required: false
+        multiple: false
+        is_flag: false
+        flags:
+        - "--openengine-host"
+      openengine_port:
+        type: int
+        default: null
+        status: prototype
+        required: false
+        multiple: false
+        is_flag: false
+        flags:
+        - "--openengine-port"
       otlp_traces_endpoint:
         type: str
         default: null

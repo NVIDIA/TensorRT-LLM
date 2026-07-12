@@ -1223,7 +1223,10 @@ class KVCacheEventSerializer:
                 KVCacheEventSerializer._unique_tokens_to_json(token)
                 for token in data.tokens
             ],
-            # "lora_id": data.lora_id, # TODO (shreyasm): enable serialization of lora_id
+            "lora_id":
+            getattr(data, "lora_id", None),
+            "lora_name":
+            getattr(data, "lora_name", None),
             "cache_salt":
             data.cache_salt,
             "cache_level":

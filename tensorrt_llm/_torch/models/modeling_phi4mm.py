@@ -36,6 +36,7 @@ from ...inputs import (BaseMultimodalDummyInputsBuilder,
                        ExtraProcessedInputs, MultimodalPlaceholderMetadata,
                        MultimodalPlaceholderPlacement, TextPrompt,
                        register_input_processor)
+from ...inputs.registry import MultimodalLoraSpec
 from ...logger import logger
 from ...lora_helper import LoraConfig
 from ...sampling_params import SamplingParams
@@ -760,6 +761,36 @@ class HFPhi4MultimodalEncoder(transformers.PreTrainedModel):
 class Phi4MMInputProcessor(BaseMultimodalInputProcessor,
                            BaseMultimodalDummyInputsBuilder):
 
+    def get_model_owned_lora_identities(self) -> dict[str, int]:
+        return {"vision-lora": 0, "speech-lora": 1}
+
+    def get_openengine_modalities(self) -> tuple[str, ...]:
+        return ("image", "audio")
+
+    def get_openengine_prefill_decode_modalities(self) -> tuple[str, ...]:
+        return ()
+
+    def get_required_lora_spec(
+            self, modalities: tuple[str, ...]) -> MultimodalLoraSpec | None:
+        requested = set(modalities)
+        if {"image", "audio"}.issubset(requested):
+            raise ValueError(
+                "Phi-4 multimodal requests cannot combine image and audio because they "
+                "require different built-in LoRA adapters")
+        if "image" in requested:
+            return MultimodalLoraSpec(
+                name="vision-lora",
+                adapter_id=0,
+                path=os.path.join(self._model_path, "vision-lora"),
+            )
+        if "audio" in requested:
+            return MultimodalLoraSpec(
+                name="speech-lora",
+                adapter_id=1,
+                path=os.path.join(self._model_path, "speech-lora"),
+            )
+        return None
+
     def __init__(self,
                  model_path: str,
                  config: transformers.PretrainedConfig,
@@ -1092,7 +1123,7 @@ class Phi4MMForCausalLM(transformers.PreTrainedModel):
             else:
                 raise NotImplementedError(
                     "Phi-4-multimodal does not support disaggregated inference yet. Please unset "
-                    f"the TLLM_MULTIMODAL_DISAGGREGATED environment variable, or set it to '0'."
+                    "the TLLM_MULTIMODAL_DISAGGREGATED environment variable, or set it to '0'."
                 )
             mm_embedding = find_input_mm_embeds(
                 mm_embedding, multimodal_params[:num_context_requests])

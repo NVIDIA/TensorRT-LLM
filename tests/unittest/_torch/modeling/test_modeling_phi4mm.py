@@ -2,6 +2,7 @@ import os
 from dataclasses import dataclass
 from typing import List
 
+import pytest
 import torch
 import transformers
 from test_modeling_multimodal import MultimodalScenario, TestModelingMultimodal, llm_models_root
@@ -10,8 +11,24 @@ from tensorrt_llm._torch.models.modeling_phi4mm import (
     _AUDIO_SPECIAL_TOKEN_ID,
     _IMAGE_SPECIAL_TOKEN_ID,
     Phi4MMForCausalLM,
+    Phi4MMInputProcessor,
 )
 from tensorrt_llm.inputs import default_multimodal_input_loader, prompt_inputs
+
+
+def test_phi4mm_required_multimodal_lora_selection(tmp_path) -> None:
+    processor = object.__new__(Phi4MMInputProcessor)
+    processor._model_path = str(tmp_path)
+
+    assert processor.get_model_owned_lora_identities() == {
+        "vision-lora": 0,
+        "speech-lora": 1,
+    }
+    assert processor.get_required_lora_spec(("image",)).name == "vision-lora"
+    assert processor.get_required_lora_spec(("audio",)).name == "speech-lora"
+    with pytest.raises(ValueError, match="cannot combine"):
+        processor.get_required_lora_spec(("image", "audio"))
+
 
 PHI4MM_CONFIG = {
     "_name_or_path": str(os.path.join(llm_models_root(), "multimodals/Phi-4-multimodal-instruct")),

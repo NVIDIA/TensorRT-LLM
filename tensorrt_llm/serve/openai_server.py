@@ -65,6 +65,7 @@ from tensorrt_llm.serve.conversation_id import resolve_request_conversation_id
 from tensorrt_llm.serve.disagg_auto_scaling import DisaggClusterWorker
 from tensorrt_llm.serve.encode_batcher import (EncodeBatcher, InputTooLongError,
                                                QueueFullError)
+from tensorrt_llm.serve.kv_event_fanout import KvEventFanout
 from tensorrt_llm.serve.metadata_server import create_metadata_server
 from tensorrt_llm.serve.openai_protocol import (
     ChatCompletionRequest, ChatCompletionResponse, ChatCompletionResponseChoice,
@@ -92,6 +93,7 @@ from tensorrt_llm.serve.responses_utils import \
 from tensorrt_llm.serve.responses_utils import get_steady_clock_now_in_seconds
 from tensorrt_llm.serve.responses_utils import \
     request_preprocess as responses_api_request_preprocess
+from tensorrt_llm.serve.stats_fanout import StatsFanout
 from tensorrt_llm.serve.tool_parser.tool_parser_factory import ToolParserFactory
 from tensorrt_llm.serve.visual_gen_metrics import \
     build_visual_gen_timing_headers
@@ -265,7 +267,10 @@ class OpenAIServer(_VideoRoutesMixin):
             embedding_max_queue_delay: float = 0.005,
             embedding_max_queue_size: int = 2048,
             input_processor_workers: int = 8,
-            media_load_workers: int = 8):
+            media_load_workers: int = 8,
+            kv_event_fanout: Optional[KvEventFanout] = None,
+            stats_fanout: Optional[StatsFanout] = None,
+            shutdown_generator: bool = True):
         self.generator = generator
         self._is_visual_gen = isinstance(generator, VisualGen)
         self._embedding_max_queue_delay = embedding_max_queue_delay
@@ -290,6 +295,9 @@ class OpenAIServer(_VideoRoutesMixin):
                 self.multimodal_server_config = cfg
         self.allow_request_chat_template = allow_request_chat_template
         self.server_role = server_role
+        self.kv_event_fanout = kv_event_fanout
+        self.stats_fanout = stats_fanout
+        self.shutdown_generator = shutdown_generator
         # Will be set in __call__
         self.binding_addr = None
         self.host = None
@@ -346,6 +354,8 @@ class OpenAIServer(_VideoRoutesMixin):
 
         @asynccontextmanager
         async def lifespan(app: FastAPI):
+            if self.kv_event_fanout is not None:
+                self.kv_event_fanout.start()
             if self.metadata_server is not None:
                 metadata = {
                     "model": self.model,
@@ -384,7 +394,12 @@ class OpenAIServer(_VideoRoutesMixin):
                 # Start background iteration stats collector if metrics are enabled
                 # The args for pytorch and autodeploy backend has attribute `enable_iter_perf_stats` while
                 # tensorrt backend does not have this attribute but it always has iter stats enabled.
-                if self.metrics_collector and getattr(
+                if self.stats_fanout is not None and getattr(
+                        self.generator.args, "enable_iter_perf_stats", True):
+                    consumer = (self.metrics_collector.log_iteration_stats
+                                if self.metrics_collector is not None else None)
+                    self.stats_fanout.start(consumer)
+                elif self.metrics_collector and getattr(
                         self.generator.args, "enable_iter_perf_stats", True):
                     # The background loop becomes the sole consumer of the
                     # engine stats queue; /metrics reads from a tee buffer
@@ -432,7 +447,12 @@ class OpenAIServer(_VideoRoutesMixin):
                 await self.disagg_cluster_worker.deregister_worker()
             if self.resource_governor is not None:
                 self.resource_governor.close()
-            self.generator.shutdown()
+            if self.kv_event_fanout is not None:
+                await self.kv_event_fanout.stop()
+            if self.stats_fanout is not None:
+                await self.stats_fanout.stop()
+            if self.shutdown_generator:
+                self.generator.shutdown()
 
         self.app = FastAPI(lifespan=lifespan)
         if _MSGSPEC_ENABLED:
@@ -1193,6 +1213,9 @@ class OpenAIServer(_VideoRoutesMixin):
                 stats.append(stat)
             return JSONResponse(content=stats)
 
+        if self.stats_fanout is not None:
+            return JSONResponse(content=self.stats_fanout.drain_http_buffer())
+
         # When the background collector loop is active it is the sole
         # consumer of the engine stats queue; serve /metrics from the tee
         # buffer it populates so we do not race it for queue items. Racing
@@ -1316,6 +1339,9 @@ class OpenAIServer(_VideoRoutesMixin):
         return JSONResponse(content=list(perf_metrics))
 
     async def get_kv_cache_events(self) -> JSONResponse:
+        if self.kv_event_fanout is not None:
+            return JSONResponse(
+                content=self.kv_event_fanout.drain_http_buffer())
         events = []
         try:
             async for event in self.generator.get_kv_cache_events_async(0):
@@ -1337,10 +1363,13 @@ class OpenAIServer(_VideoRoutesMixin):
                 # (e.g. PostprocWorker).
                 self.metrics_collector.log_request_metrics_dict(
                     res.metrics_dict)
-            # Note: Iteration stats are collected by the background _iteration_stats_collector_loop task
-            # Wake up the stats collector to drain iteration stats
-            if getattr(self.generator.args, "enable_iter_perf_stats", True):
+            # Note: Iteration stats are collected by the background collector.
+            if (self.stats_fanout is None and getattr(
+                    self.generator.args, "enable_iter_perf_stats", True)):
                 self._iteration_stats_wakeup_event.set()
+        if self.stats_fanout is not None and getattr(
+                self.generator.args, "enable_iter_perf_stats", True):
+            self.stats_fanout.wake()
         if self.generator.args.return_perf_metrics:
             output = res.outputs[0]
             item = {

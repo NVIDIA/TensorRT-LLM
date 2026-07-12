@@ -954,6 +954,12 @@ class NanoV2VLMultimodalEncoder(NanoV2VLVisionEncoder):
 class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInputsBuilder):
     supports_token_id_mm_expansion: ClassVar[bool] = True
 
+    def get_openengine_modalities(self) -> tuple[str, ...]:
+        return ("image", "video", "audio")
+
+    def get_openengine_prefill_decode_modalities(self) -> tuple[str, ...]:
+        return ()
+
     def __init__(
         self,
         model_path: str,

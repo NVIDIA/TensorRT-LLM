@@ -28,9 +28,17 @@ N = TypeVar("N", bound=Type[nn.Module])
 ExtraProcessedInputs = Dict[str, Any]
 
 
+@dataclass(frozen=True)
+class MultimodalLoraSpec:
+    """Model-required LoRA adapter for a set of input modalities."""
+
+    name: str
+    adapter_id: int
+    path: str
+
+
 class InputProcessor(Protocol):
-    """
-    Protocol for InputProcessor classes.
+    """Protocol for InputProcessor classes.
     InputProcessor's functions are more relevant to multimodal use cases:
         - Preprocess: extra steps to manipulate the prompts.
         - Forward: the main logic to process the inputs. In multimodal cases, this may run a multimodal encoder model.
@@ -121,8 +129,7 @@ class DefaultInputProcessor(InputProcessor):
 
 
 class BaseMultimodalInputProcessor(ABC):
-    """
-    Base class for multimodal input processors with default implementations
+    """Base class for multimodal input processors with default implementations
     of get_num_tokens_per_image and get_num_tokens_per_video methods.
 
     This class provides default implementations that work with most AutoProcessor-based
@@ -149,6 +156,24 @@ class BaseMultimodalInputProcessor(ABC):
     # When True, `__call__` may route `prompt_token_ids + multi_modal_data`
     # inputs to `call_with_token_ids` instead of detokenizing upstream.
     supports_token_id_mm_expansion: ClassVar[bool] = False
+
+    def get_openengine_modalities(self) -> tuple[str, ...]:
+        """Modalities this processor accepts through aggregated OpenEngine."""
+        return ("image", )
+
+    def get_openengine_prefill_decode_modalities(self) -> tuple[str, ...]:
+        """Modalities supported in context-first OpenEngine P/D requests."""
+        return ()
+
+    def get_required_lora_spec(
+            self, modalities: tuple[str, ...]) -> MultimodalLoraSpec | None:
+        """Return a model-owned adapter required to process these modalities."""
+        del modalities
+        return None
+
+    def get_model_owned_lora_identities(self) -> dict[str, int]:
+        """Names and IDs reserved for adapters selected by the model processor."""
+        return {}
 
     def __init__(self,
                  model_path,
@@ -373,16 +398,14 @@ class BaseMultimodalInputProcessor(ABC):
 
     @property
     def use_fast(self) -> bool:
-        """
-        Whether to use fast tokenizer for AutoProcessor.
+        """Whether to use fast tokenizer for AutoProcessor.
         Default is True for most multimodal models.
         """
         return self._use_fast
 
     @property
     def multimodal_hashing_supported(self) -> Optional[bool]:
-        """
-        Whether multimodal hashing is supported for this processor.
+        """Whether multimodal hashing is supported for this processor.
 
         Returns None if unknown (will be detected at runtime),
         True if supported, False if not supported.
@@ -474,8 +497,7 @@ class BaseMultimodalInputProcessor(ABC):
 
     @property
     def get_num_multimodal_tokens(self):
-        """
-        Get the Hugging Face processor's '_get_num_multimodal_tokens' method.
+        """Get the Hugging Face processor's '_get_num_multimodal_tokens' method.
         """
         if hasattr(self.processor, '_get_num_multimodal_tokens'):
             return self.processor._get_num_multimodal_tokens
@@ -491,8 +513,7 @@ class BaseMultimodalInputProcessor(ABC):
         image: Union[Image.Image, torch.Tensor],
         **kwargs,
     ):
-        """
-        Calculate the number of tokens generated for an image.
+        """Calculate the number of tokens generated for an image.
 
         Delegates to the Hugging Face processor's ``_get_num_multimodal_tokens``.
 
@@ -521,8 +542,7 @@ class BaseMultimodalInputProcessor(ABC):
         video_audio: Optional[Any] = None,
         **kwargs,
     ):
-        """
-        Calculate the number of tokens generated for a video.
+        """Calculate the number of tokens generated for a video.
 
         Delegates to the Hugging Face processor's ``_get_num_multimodal_tokens``;
         a fallback treats the video as a stack of frames if the HF processor
@@ -643,10 +663,9 @@ class BaseMultimodalDummyInputsBuilder(ABC):
 
 
 class MultimodalPlaceholderPlacement(enum.Enum):
-    """
-    The placement of the multimodal placeholder in the prompt. Valid values are:
-        - BEFORE_TEXT: the placeholders are placed before the text prompt.
-        - AFTER_TEXT: the placeholders are placed after the text prompt.
+    """The placement of the multimodal placeholder in the prompt. Valid values are:
+    - BEFORE_TEXT: the placeholders are placed before the text prompt.
+    - AFTER_TEXT: the placeholders are placed after the text prompt.
     """
     INVALID = -1
     BEFORE_TEXT = 0
@@ -655,31 +674,30 @@ class MultimodalPlaceholderPlacement(enum.Enum):
 
 @dataclass(frozen=True)
 class MultimodalPlaceholderMetadata:
-    """
-    Metadata for the multimodal placeholder. It has 5 components:
-        - placeholder_map:
-            A mapping from modality to placeholder string.
-            Modality can be "image", "video", "audio", etc.
-        - placeholder_placement:
-            The placement of the placeholders, e.g. before or after the text prompt.
-            Only used when interleave_placeholders is False (the default).
-            Ignored when interleave_placeholders is True.
-        - placeholders_separator:
-            The separator between the placeholders, e.g. some models use "\n" to separate the placeholders.
-        - content_format:
-            Optional override for the content format expected by the chat template.
-            ContentFormat.OPENAI means the template handles multimodal content dicts natively.
-            ContentFormat.STRING means the template expects plain string content.
-            ContentFormat.PASSTHROUGH skips chat template rendering entirely.
-            None means auto-detect at runtime via Jinja AST analysis.
-        - interleave_placeholders:
-            When True and content_parts is available, placeholders are inserted
-            at the exact media positions within the text (interleaved).
-            In this mode, placeholder_placement is ignored - the position of
-            each placeholder is determined by where the media appears in the
-            user's message.
-            When False (default), placeholders are bulk-prepended or appended
-            according to placeholder_placement.
+    """Metadata for the multimodal placeholder. It has 5 components:
+    - placeholder_map:
+        A mapping from modality to placeholder string.
+        Modality can be "image", "video", "audio", etc.
+    - placeholder_placement:
+        The placement of the placeholders, e.g. before or after the text prompt.
+        Only used when interleave_placeholders is False (the default).
+        Ignored when interleave_placeholders is True.
+    - placeholders_separator:
+        The separator between the placeholders, e.g. some models use "\n" to separate the placeholders.
+    - content_format:
+        Optional override for the content format expected by the chat template.
+        ContentFormat.OPENAI means the template handles multimodal content dicts natively.
+        ContentFormat.STRING means the template expects plain string content.
+        ContentFormat.PASSTHROUGH skips chat template rendering entirely.
+        None means auto-detect at runtime via Jinja AST analysis.
+    - interleave_placeholders:
+        When True and content_parts is available, placeholders are inserted
+        at the exact media positions within the text (interleaved).
+        In this mode, placeholder_placement is ignored - the position of
+        each placeholder is determined by where the media appears in the
+        user's message.
+        When False (default), placeholders are bulk-prepended or appended
+        according to placeholder_placement.
     """
     placeholder_map: Dict[str, str] = field(default_factory=dict)
     placeholder_placement: MultimodalPlaceholderPlacement = MultimodalPlaceholderPlacement.AFTER_TEXT
@@ -689,8 +707,7 @@ class MultimodalPlaceholderMetadata:
 
 
 class MultimodalPlaceholderRegistry:
-    """
-    Registry for the multimodal models to keep track of the placeholder information.
+    """Registry for the multimodal models to keep track of the placeholder information.
     """
 
     def __init__(self) -> None:
@@ -806,8 +823,7 @@ INPUT_PROCESSOR_REGISTRY = InputProcessorRegistry()
 
 
 def support_multimodal_disaggregated(model_cls: Type[nn.Module]):
-    """
-    Model-class decorator to declare support for multimodal disaggregated inputs.
+    """Model-class decorator to declare support for multimodal disaggregated inputs.
 
     Apply this to a model class AFTER its input processor has been registered via
     @register_input_processor. The decorator will locate the processor class,
@@ -840,10 +856,9 @@ def register_input_processor(
         processor_cls: Type[InputProcessor],
         model_type: str,
         placeholder_metadata: MultimodalPlaceholderMetadata = None):
-    """
-    Register an input processor to a model class.
+    """Register an input processor to a model class.
 
-    NOTE:
+    Note:
         1. Since this API is only used for multimodal models, we are checking
            the model type only for that.
         2. If this is used for other models in the future, this logic needs to be
@@ -1066,8 +1081,7 @@ def create_input_processor_with_hash(
     def multimodal_hashing_process(
         inputs: TextPrompt, sampling_params: SamplingParams
     ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
-        """
-        Process multimodal hashing for media tokens if possible.
+        """Process multimodal hashing for media tokens if possible.
 
         Delegates the raw `(token_ids, extra_processed_inputs)` production to
         the input processor's `__call__` (which itself dispatches between the

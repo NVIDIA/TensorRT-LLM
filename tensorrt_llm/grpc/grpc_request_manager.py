@@ -34,6 +34,7 @@ from tensorrt_llm.executor.result import GenerationResult
 from tensorrt_llm.llmapi.llm_utils import KvCacheRetentionConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.sampling_params import GuidedDecodingParams, SamplingParams
+from tensorrt_llm.serve.request_tracker import RequestTracker
 
 from . import trtllm_service_pb2 as pb2
 
@@ -59,8 +60,9 @@ class GrpcRequestManager:
             llm: The TensorRT-LLM LLM instance (tensorrt_llm.LLM or tensorrt_llm._tensorrt_engine.LLM)
         """
         self.llm = llm
-        # Track active requests: request_id -> GenerationResult
-        self._rid_to_result: Dict[str, GenerationResult] = {}
+        self._request_tracker = RequestTracker(llm)
+        # Kept as an alias for callers which inspect native gRPC state.
+        self._rid_to_result = self._request_tracker.active_requests
 
         logger.info("GrpcRequestManager initialized")
 
@@ -93,6 +95,7 @@ class GrpcRequestManager:
             GenerationResult objects containing token IDs (text will be empty
             because detokenize=False)
         """
+        admitted = False
         try:
             # Submit to LLM.generate_async which returns a GenerationResult
             # that is an async iterator
@@ -111,7 +114,15 @@ class GrpcRequestManager:
             )
 
             # Track the result for potential abort
-            self._rid_to_result[request_id] = gen_result
+            try:
+                self._request_tracker.admit(request_id, gen_result)
+            except (RuntimeError, ValueError):
+                try:
+                    gen_result.abort()
+                except (RuntimeError, AssertionError) as error:
+                    logger.warning("Failed to abort rejected request %s: %s", request_id, error)
+                raise
+            admitted = True
 
             # Iterate over the async generator
             # GenerationResult implements __aiter__ and __anext__
@@ -130,7 +141,8 @@ class GrpcRequestManager:
             raise
         finally:
             # Cleanup tracking
-            self._rid_to_result.pop(request_id, None)
+            if admitted:
+                await self._request_tracker.finish(request_id)
 
     async def abort(self, request_id: str) -> bool:
         """Abort a running request.
@@ -141,22 +153,13 @@ class GrpcRequestManager:
         Returns:
             True if request was found and aborted, False otherwise
         """
-        gen_result = self._rid_to_result.get(request_id)
-
-        if gen_result is None:
+        if request_id not in self._rid_to_result:
             logger.debug(f"Abort: request {request_id} not found (may have already completed)")
             return False
-
-        try:
-            # GenerationResult has an abort() method
-            gen_result.abort()
-            self._rid_to_result.pop(request_id, None)
+        aborted = await self._request_tracker.abort(request_id)
+        if aborted:
             logger.info(f"Request {request_id} aborted")
-            return True
-        except Exception as e:
-            logger.error(f"Error aborting request {request_id}: {e}")
-            self._rid_to_result.pop(request_id, None)
-            return False
+        return aborted
 
     async def health_check(self) -> Tuple[bool, str]:
         """Check if the engine is healthy.
@@ -168,22 +171,7 @@ class GrpcRequestManager:
             if self.llm is None:
                 return False, "LLM not initialized"
 
-            # Check executor health (includes error queue, MPI worker
-            # liveness, and fatal error state — not just doing_shutdown).
-            if hasattr(self.llm, "_executor"):
-                if self.llm._executor is None:
-                    return False, "Executor is not available"
-                if not self.llm._executor.check_health():
-                    error_msg = "Executor is unhealthy"
-                    if self.llm._executor._fatal_error is not None:
-                        exc = self.llm._executor._fatal_error
-                        lines = str(exc).splitlines()
-                        short = (lines[0] if lines else type(exc).__name__)[:200]
-                        error_msg = f"{type(exc).__name__}: {short}"
-                        logger.error(f"Health check fatal error: {repr(exc)}")
-                    return False, error_msg
-
-            return True, "OK"
+            return await self._request_tracker.health()
         except Exception as e:
             logger.error(f"Health check error: {e}")
             return False, f"Error: {e}"

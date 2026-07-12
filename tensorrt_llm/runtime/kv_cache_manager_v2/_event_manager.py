@@ -91,6 +91,8 @@ class KVCacheStoredBlockData:
     priority: int
     mm_keys: list[MmKey] = field(default_factory=list)
     cache_salt: str | None = None
+    lora_id: int | None = None
+    lora_name: str | None = None
 
 
 @dataclass(slots=True, frozen=True)
@@ -552,12 +554,19 @@ class KVCacheEventManager:
         if life_cycle_ids is not None and not found_page:
             return None
 
+        root = block
+        while self._is_radix_block(root):
+            root = root.prev
+        lora_id, cache_salt = self._root_attrs_from_root_block(root)
+
         return KVCacheStoredBlockData(
             block_hash=self._hash_from_radix_block(block),
             tokens=[self._normalize_token(token) for token in block.tokens],
             cache_level=int(cache_level),
             priority=int(priority),
             mm_keys=[],
+            cache_salt=None if cache_salt is None else str(cache_salt),
+            lora_id=lora_id,
         )
 
     @staticmethod

@@ -402,6 +402,12 @@ class Qwen3VLInputProcessorBase(Qwen2VLInputProcessorBase):
         # the per-frame CHW-float conversion in the IO loader.
         return {"video": {"format": "np"}}
 
+    def get_openengine_modalities(self) -> tuple[str, ...]:
+        return ("image", "video")
+
+    def get_openengine_prefill_decode_modalities(self) -> tuple[str, ...]:
+        return ("image", "video")
+
     def build_disagg_prefill_multimodal_inputs(
         self, inputs: TextPrompt, mm_handles: List[Dict[str, Any]]
     ) -> DisaggPrefillMultimodalInputs:
