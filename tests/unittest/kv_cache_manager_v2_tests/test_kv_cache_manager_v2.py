@@ -697,6 +697,88 @@ class TestNoBatching(TestKVCacheManagerV2):
             profiler.dump_stats("profiler.prof")
 
 
+class TestSwaRingReuse(TestNoBatching):
+    """KVCacheManagerConfig.enable_swa_ring_reuse.
+
+    Drives a disaggregated-decode-style uncommitted generation (committing disallowed,
+    history advanced directly via resize) across many sliding-window advances and checks:
+      * data correctness via FakeEngine refcheck at every step, and
+      * allocator traffic: with the flag ON, the windowed layer's freshly staled pages are
+        parked in the reuse pocket and recycled in place, so after the pocket warms up the
+        global allocator receives no further requests for the windowed life cycle (only the
+        full-attention life cycle still allocates one block per boundary crossing); with the
+        flag OFF, every boundary crossing requests one block for each life cycle.
+    """
+
+    def _run_uncommitted_decode(self, enable: bool) -> "tuple[int, int]":
+        tokens_per_block = 32
+        window = 2 * tokens_per_block
+        self.cfg = create_config(
+            tokens_per_block,
+            32 << 20,
+            0,
+            0,
+            num_layers=2,  # layer 0: sliding window; layer 1: full attention
+            window_size=window,
+            sink_tokens=0,
+        )
+        self.cfg.enable_swa_ring_reuse = enable
+        self.engine = FakeEngine(self.cfg)
+        self.manager = KVCacheManager(self.cfg)
+
+        prompt_len = window  # no prompt block is stale at generation start
+        decode_len = 8 * tokens_per_block
+        req = self.new_request(0, None, prompt_len, decode_len)
+        kv_cache = req.kv_cache
+
+        alloc_requests: "list[int]" = []
+        orig_new_gpu_slots = StorageManager.new_gpu_slots
+
+        def spying_new_gpu_slots(mgr, counts, *args, **kwargs):
+            alloc_requests.append(sum(int(c) for c in counts))
+            return orig_new_gpu_slots(mgr, counts, *args, **kwargs)
+
+        with TemporaryCudaStream([]) as s:
+            stream = cast(CudaStream, s.handle)
+            self.assertTrue(kv_cache.resume(stream))
+            # Disaggregated decode style: KV arrives from elsewhere; nothing is committed,
+            # so freshly staled blocks are fully orphaned.
+            kv_cache.stop_committing()
+            self.assertTrue(kv_cache.resize(prompt_len, prompt_len))
+            self.engine.execute([Step(kv_cache, req.prompt, [])], stream)
+            history = list(req.prompt)
+            StorageManager.new_gpu_slots = spying_new_gpu_slots  # type: ignore[method-assign]
+            try:
+                for _ in range(decode_len):
+                    token = self.next_token()
+                    self.assertTrue(kv_cache.resize(len(history) + 1, len(history)))
+                    self.engine.execute([Step(kv_cache, [token], history)], stream)
+                    history.append(token)
+            finally:
+                StorageManager.new_gpu_slots = orig_new_gpu_slots  # type: ignore[method-assign]
+            self.engine.execute([Step(kv_cache, [], history)], stream)
+        s.take_finish_event().synchronize()
+        kv_cache.close()
+        total_requested = sum(alloc_requests)
+        num_crossings = div_up(prompt_len + decode_len, tokens_per_block) - div_up(
+            prompt_len, tokens_per_block
+        )
+        return total_requested, num_crossings
+
+    def test_disabled_baseline_traffic(self) -> None:
+        total, crossings = self._run_uncommitted_decode(enable=False)
+        # One new block per boundary crossing for the windowed AND the full-attention
+        # life cycle.
+        self.assertEqual(total, 2 * crossings)
+
+    def test_enabled_reuses_stale_window_pages(self) -> None:
+        total, crossings = self._run_uncommitted_decode(enable=True)
+        # The windowed life cycle allocates only until its first page goes stale (one
+        # block); every later boundary crossing is served from the reuse pocket. The
+        # full-attention life cycle still allocates one block per crossing.
+        self.assertEqual(total, crossings + 1)
+
+
 class TestBatching(TestKVCacheManagerV2):
     num_requests: int
     avg_length: int

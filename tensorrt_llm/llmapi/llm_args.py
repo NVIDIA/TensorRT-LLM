@@ -3481,6 +3481,16 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         "The maximum utilization of the KV cache for resume. Default is 95%. Only used when using KV cache manager v2 (experimental)."
     )
 
+    enable_swa_ring_reuse: bool = Field(
+        default=False,
+        status="prototype",
+        description=
+        "Recycle a sequence's freshly out-of-window sliding-window-attention pages in "
+        "place to back the new blocks its decode allocates, instead of a free-list "
+        "round-trip. Only fully-orphaned pages (no prefix-reuse retention) are recycled, "
+        "so behavior is unchanged except for which physical slot backs the new block. "
+        "Only used when using KV cache manager v2 (experimental).")
+
     enable_kv_pool_rebalance: bool = Field(
         default=False,
         status="prototype",

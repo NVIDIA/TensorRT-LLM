@@ -197,6 +197,7 @@ class _KVCache:
         "_never_resumed",
         "_enable_swa_scratch_reuse",
         "_scratch_slots",
+        "_swa_reuse_pocket",
         "_pending_stats",
         "__rawref__",
     )
@@ -245,6 +246,9 @@ class _KVCache:
     # Managed via delta in resize(): existing slots are reused across resize calls,
     # only the additional needed slots are allocated. Freed on teardown/suspend.
     _scratch_slots: TypedIndexList[LifeCycleId, list[ScratchSlotLock]]
+    # Freshly out-of-window, fully-orphaned pages parked for in-place reuse by upcoming
+    # decode blocks (enable_swa_ring_reuse). Drained on suspend()/close().
+    _swa_reuse_pocket: TypedIndexList[LifeCycleId, list[_PageHolder]]
     _pending_stats: _PendingStats
 
     def __init__(
@@ -287,6 +291,9 @@ class _KVCache:
         self._enable_swa_scratch_reuse = manager.enable_swa_scratch_reuse
         self._scratch_slots = make_typed(
             lambda _: list[ScratchSlotLock](), manager._storage.num_life_cycles
+        )
+        self._swa_reuse_pocket = make_typed(
+            lambda _: list[_PageHolder](), manager._storage.num_life_cycles
         )
         self._pending_stats = _PendingStats()
         self.__rawref__ = rawref.NULL
@@ -519,6 +526,10 @@ class _KVCache:
             return
         self.discard_pending_stats()
         self.stop_committing()
+        if any(self._swa_reuse_pocket):
+            with self._record_event():
+                for pocket in self._swa_reuse_pocket:
+                    pocket.clear()  # release parked pages back to the allocator
         assert NDEBUG or self._check_sanity()
         manager = self.manager
         if self.capacity > 0:
@@ -752,8 +763,23 @@ class _KVCache:
                         num_new_blocks_to_add = new_num_blocks - max(stale_end, old_num_blocks)
                     num_new_slots[lc] = num_new_blocks_to_add * beam_width
 
+            # SWA ring reuse: consume pages parked in the reuse pocket by earlier
+            # resize() calls (freshly out-of-window, fully-orphaned pages -- see the refill
+            # below) to back new blocks, instead of requesting slots from the allocator.
+            # Scratch mode has its own slot machinery, so the pocket is bypassed there.
+            enable_ring_reuse = (
+                manager._init_config.enable_swa_ring_reuse and not enable_scratch
+            )
+            num_pocket_slots = filled_list(0, num_life_cycles)
+            if enable_ring_reuse:
+                for lc in typed_range(num_life_cycles):
+                    num_pocket_slots[lc] = min(
+                        len(self._swa_reuse_pocket[lc]), num_new_slots[lc]
+                    )
+
             net_alloc_counts = make_typed(
-                lambda lc: num_new_slots[lc] + delta_scratch_slots[lc], num_life_cycles
+                lambda lc: num_new_slots[lc] - num_pocket_slots[lc] + delta_scratch_slots[lc],
+                num_life_cycles,
             )
             storage = self._storage
             if any(c > 0 for c in net_alloc_counts):
@@ -778,9 +804,18 @@ class _KVCache:
             # Combine slots and distribute
             slots = make_typed(lambda _: list[Slot](), num_life_cycles)
             for lc in typed_range(num_life_cycles):
-                slots[lc] = new_slots[lc] + [
-                    lock.detach_slot() for lock in excess_scratch_slots[lc]
-                ]
+                # Pocket pages transfer their slots directly: moving the slot out
+                # invalidates the page, making its destruction a no-op. Their last use
+                # was issued on this cache's stream, so in-order execution makes them
+                # immediately safe for the new block without an event wait.
+                slots[lc] = (
+                    new_slots[lc]
+                    + [lock.detach_slot() for lock in excess_scratch_slots[lc]]
+                    + [
+                        self._swa_reuse_pocket[lc].pop().page.move_to_new_slot()
+                        for _ in range(num_pocket_slots[lc])
+                    ]
+                )
                 new_slots[lc].clear()
                 excess_scratch_slots[lc].clear()
 
@@ -851,6 +886,24 @@ class _KVCache:
                         ).lock(self, beam_index, ordinal, lc, skip_wait=True)
                 self._blocks.append(SeqBlock(block, None))
             assert all(len(slots[lc]) == 0 for lc in typed_range(num_life_cycles))
+            # Park this call's freshly staled, fully-orphaned pages for reuse by upcoming
+            # resize() calls. Qualifying pages are uncommitted with committing disallowed
+            # (the radix tree cannot retain them; backup_holders holds the sole reference)
+            # and GPU-resident. Holding the _PageHolder keeps the slot alive. Bounded per
+            # life cycle to the ring working set (one block retired per boundary crossing,
+            # +1 for straddle).
+            if enable_ring_reuse and self._commit_state != self.CommitState.ALLOWED:
+                for _, _, holder_lc, holder in backup_holders:
+                    if len(self._swa_reuse_pocket[holder_lc]) >= 2:
+                        continue
+                    page = holder.page
+                    if (
+                        page.is_committed()
+                        or not page.has_valid_slot
+                        or page.cache_level != GPU_LEVEL
+                    ):
+                        continue
+                    self._swa_reuse_pocket[holder_lc].append(holder)
         self._capacity = capacity
         self._history_length = history_length
         self._refresh_generation_alloc_ready()
@@ -1020,6 +1073,8 @@ class _KVCache:
                     self.set_base_page_index_buf(beam_idx, lc, None)
         ssm_lc_id = self.manager._life_cycles.ssm_life_cycle_id
         with self._record_event():  # used by _SharedPageLock.__del__
+            for pocket in self._swa_reuse_pocket:
+                pocket.clear()  # release parked pages back to the allocator
             for ordinal, beam_idx, lc_idx in self._active_pages():
                 beam_block = (
                     self._block(ordinal, beam_idx)
