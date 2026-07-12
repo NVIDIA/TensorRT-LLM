@@ -4084,7 +4084,8 @@ def runLLMBuild(
     wheel_path="",
     version_local="",
     cpver="cp312",
-    plat_name="")
+    plat_name="",
+    pin_torch=false)
 {
     sh "pwd && ls -alh"
     sh "env | sort"
@@ -4093,6 +4094,12 @@ def runLLMBuild(
     trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, "tensorrt_llm", false, true)
     if (env.alternativeTRT) {
         sh "cd tensorrt_llm/ && sed -i 's#tensorrt~=.*\$#tensorrt#g' requirements.txt && cat requirements.txt"
+    }
+    if (pin_torch) {
+        // WAR: Upgrading to torch 2.12 conflicts with the current triton dependency, so we
+        // pin build_wheel to the public torch 2.11.0 here. Remove this WAR once triton is
+        // upgraded to 3.7.0 and torch is upgraded to 2.12.0.
+        sh "cd tensorrt_llm/ && sed -i 's#^torch[><=].*#torch==2.11.0#g' requirements.txt && cat requirements.txt"
     }
 
     // Random sleep to avoid resource contention
@@ -5140,7 +5147,7 @@ def launchTestJobs(pipeline, testFilter)
             }
 
             buildRunner("[${toStageName(values[1], key)}] Build") {
-                wheelName = runLLMBuild(pipeline, cpu_arch, values[3], "", versionLocal, cpver, values[7])
+                wheelName = runLLMBuild(pipeline, cpu_arch, values[3], "", versionLocal, cpver, values[7], values[0] != LLM_DOCKER_IMAGE)
             }
 
             // TODO: Re-enable the sanity check after updating GPU testers' driver version.

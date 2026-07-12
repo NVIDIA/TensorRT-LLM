@@ -45,7 +45,7 @@ driver version. For additional information, refer to the [CUDA Forward Compatibi
 
 ```bash
 # By default, PyTorch CUDA 12.8 package is installed. Install PyTorch CUDA 13.0 package to align with the CUDA version used for building TensorRT LLM wheels.
-pip3 install torch==2.10.0 torchvision --index-url https://download.pytorch.org/whl/cu130
+pip3 install torch==2.11.0 torchvision --index-url https://download.pytorch.org/whl/cu130
 
 sudo apt-get -y install libopenmpi-dev
 
@@ -75,7 +75,6 @@ pip3 uninstall nvidia-cutlass-dsl nvidia-cutlass-dsl-libs-base nvidia-cutlass-ds
 pip3 install --ignore-installed pip setuptools wheel && pip3 install tensorrt_llm
 ```
 
-> **Note:** The TensorRT LLM wheel on PyPI is built with PyTorch 2.10.0. This version may be incompatible with the NVIDIA NGC PyTorch container, which uses a more recent PyTorch build. If you are using the NGC PyTorch container, install the wheel built specifically for that container using the `+ngcpytorch{YYMM}` local version suffix, where `YYMM` is derived from the container tag (e.g., `pytorch:26.02` → `ngcpytorch2602`):
 >
 > ```bash
 > # Example: install TensorRT LLM 1.3.0rc16 inside the pytorch:26.02 NGC container
