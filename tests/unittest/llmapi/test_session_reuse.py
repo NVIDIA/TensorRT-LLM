@@ -195,3 +195,46 @@ def test_autodeploy_nodeids_are_private():
     assert not _is_private_nodeid(
         "unittest/_torch/speculative/test_eagle3.py::test_llama_eagle3[x]"
     )
+
+
+def test_failed_item_fences_cached_pools(reuse_cache, monkeypatch):
+    """After a failed item the next acquire must NOT reuse the cached pool."""
+    from test_common import session_reuse_hooks as hooks
+
+    monkeypatch.setattr(hooks, "REUSE", reuse_cache)
+
+    s = reuse_cache.acquire(_FakePool, 2)
+    real = s._real
+    s.shutdown()  # pool returned to the cache
+
+    class _FailedReport:
+        failed = True
+        nodeid = "tests/foo.py::test_bar"
+
+    hooks.pytest_runtest_logreport(_FailedReport)
+    hooks.pytest_runtest_logfinish(_FailedReport.nodeid, None)
+
+    assert real.shut  # fence drained the cached pool
+    s2 = reuse_cache.acquire(_FakePool, 2)
+    assert s2._real is not real  # fresh pool, no reuse across the failure
+
+
+def test_passing_item_keeps_reuse(reuse_cache, monkeypatch):
+    """The fence must not fire for passing items; reuse stays intact."""
+    from test_common import session_reuse_hooks as hooks
+
+    monkeypatch.setattr(hooks, "REUSE", reuse_cache)
+
+    s = reuse_cache.acquire(_FakePool, 2)
+    real = s._real
+    s.shutdown()
+
+    class _PassedReport:
+        failed = False
+        nodeid = "tests/foo.py::test_ok"
+
+    hooks.pytest_runtest_logreport(_PassedReport)
+    hooks.pytest_runtest_logfinish(_PassedReport.nodeid, None)
+
+    s2 = reuse_cache.acquire(_FakePool, 2)
+    assert s2._real is real  # pool survived and was reused

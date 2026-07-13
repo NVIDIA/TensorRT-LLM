@@ -52,5 +52,27 @@ def pytest_runtest_setup(item):
     REUSE.install_pool_factory_if_loaded()
 
 
+# Failure fence: a failed test's pool can pass the health probe (workers alive
+# and responsive) while still carrying worker-side state the probe cannot see,
+# and would otherwise serve up to max_uses-1 more tests. Treat any failed item
+# as untrusted and drain ALL cached pools after its teardown (by which time
+# the pool has been returned to the cache). This is a conservative fallback
+# for contamination the probe cannot detect — not a replacement for the
+# broken-pool retirement path — and costs nothing on the passing-test path.
+_FAILED_ITEMS: set = set()
+
+
+def pytest_runtest_logreport(report):
+    if report.failed:
+        _FAILED_ITEMS.add(report.nodeid)
+
+
+def pytest_runtest_logfinish(nodeid, location):
+    if nodeid in _FAILED_ITEMS:
+        _FAILED_ITEMS.discard(nodeid)
+        if REUSE.enabled:
+            REUSE.drain()
+
+
 def pytest_sessionfinish(session, exitstatus):
     REUSE.drain()
