@@ -1091,10 +1091,12 @@ class PyTorchModelEngine(ModelEngine):
             # NVSHMEM).
             gc.collect()
             torch.cuda.empty_cache()
+        # Capture twice without replay. The first pass uses a disposable pool
+        # to discover the maximum attention workspace across every graph shape.
+        # Some kernels need more workspace for smaller shapes. Discard those
+        # graphs and pool, then capture the runtime graphs after the workspace
+        # is fully sized.
         with self.cuda_graph_runner.allow_capture():
-            # Discover the maximum attention workspace across every graph
-            # shape before capturing the graphs used at runtime. Some kernels
-            # select a larger-workspace implementation for a smaller batch size.
             with self.no_cuda_graph_replay():
                 memory_pool = self.cuda_graph_runner.memory_pool
                 self.cuda_graph_runner.memory_pool = None
@@ -5135,8 +5137,18 @@ class PyTorchModelEngine(ModelEngine):
             torch.cuda.empty_cache()
 
         self._run_autotuner_warmup_encoder()
+        # Capture once with a disposable pool to discover the maximum encoder
+        # attention workspace across every graph shape. Some kernels need more
+        # workspace for smaller shapes. Discard those graphs and pool, then
+        # capture the runtime graphs after the workspace is fully sized.
         with self.encoder_cuda_graph_runner.allow_capture():
-            self._run_cuda_graph_warmup_encoder()
+            with self.no_cuda_graph_replay():
+                memory_pool = self.encoder_cuda_graph_runner.memory_pool
+                self.encoder_cuda_graph_runner.memory_pool = None
+                self._run_cuda_graph_warmup_encoder()
+                self.encoder_cuda_graph_runner.clear()
+                self.encoder_cuda_graph_runner.memory_pool = memory_pool
+                self._run_cuda_graph_warmup_encoder()
 
         # Pre-populate the memory pool with max-shape allocations to reduce
         # fragmentation at runtime.
@@ -5287,7 +5299,9 @@ class PyTorchModelEngine(ModelEngine):
                         return self._forward_step(model_inputs,
                                                   **forward_kwargs)
 
-                if self.encoder_cuda_graph_runner.needs_capture(key):
+                needs_capture = self.encoder_cuda_graph_runner.needs_capture(
+                    key)
+                if needs_capture:
 
                     def forward_fn(
                             capture_inputs: Dict[str, Any]) -> Dict[str, Any]:
@@ -5302,11 +5316,16 @@ class PyTorchModelEngine(ModelEngine):
                             **model_inputs, "_forward_kwargs": forward_kwargs
                         })
 
-                with MoeLoadBalancerIterContext(moe_load_balancer):
-                    graph_outputs = self.encoder_cuda_graph_runner.replay(
-                        key, {
-                            **model_inputs, "_forward_kwargs": forward_kwargs
-                        })
+                if not self._cuda_graph_replay_enabled:
+                    graph_outputs = self.encoder_cuda_graph_runner.graph_outputs[
+                        key]
+                else:
+                    with MoeLoadBalancerIterContext(moe_load_balancer):
+                        graph_outputs = self.encoder_cuda_graph_runner.replay(
+                            key, {
+                                **model_inputs, "_forward_kwargs":
+                                forward_kwargs
+                            })
 
             # Return a clone to avoid sharing data_ptr with the static buffers.
             outputs = {}
