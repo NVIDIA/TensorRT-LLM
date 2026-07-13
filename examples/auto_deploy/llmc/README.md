@@ -41,6 +41,20 @@ from llmc._compat import TRTLLM_AVAILABLE
 print(f"TRT-LLM available: {TRTLLM_AVAILABLE}")  # False in standalone mode
 ```
 
+### Use the TensorRT-LLM runtime
+
+TensorRT-LLM releases that still import their bundled AutoDeploy package can be redirected to use
+LLMC as the compiler implementation:
+
+```bash
+TRTLLM_REDIRECT_AD_TO_LLMC=true \
+python runners/trtllm/build_and_run_llmc_trtllm.py ...
+```
+
+The redirect is disabled by default and must be enabled before importing either LLMC or bundled
+AutoDeploy. It maps `tensorrt_llm._torch.auto_deploy.*` imports to the corresponding canonical
+`llmc.*` modules in the parent process and TensorRT-LLM MPI workers.
+
 In standalone mode the package uses the PyTorch, Triton, and FlashInfer kernel paths. TRT-LLM-only kernels (custom CUDA, optimized all-reduce, MoE fused kernels, the `pyexecutor` runtime) are skipped at registration time.
 
 ### Run the bundled tests

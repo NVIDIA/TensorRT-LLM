@@ -135,10 +135,6 @@ methods:
         annotation: bool
         default: False
         status: beta
-      disable_flashinfer_sampling:
-        annotation: bool
-        default: False
-        status: prototype
       moe_config:
         annotation: tensorrt_llm.llmapi.llm_args.MoeConfig
         status: beta
@@ -164,6 +160,10 @@ methods:
         default: False
         status: prototype
       enable_early_first_token_response:
+        annotation: bool
+        default: False
+        status: prototype
+      enable_low_latency_host_dispatch:
         annotation: bool
         default: False
         status: prototype

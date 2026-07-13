@@ -145,6 +145,16 @@ deepseek-ai/DeepSeek-V4-Flash:
   #   95.11 reference still holds for the hypothesis test.
   - quant_algo: FP8_BLOCK_SCALES
     accuracy: 95.11
+deepseek-ai/DeepSeek-V4-Pro:
+  # Full GSM8K aggregate gate for the Pro deployment path: TP=8, EP=8,
+  # attention DP, TRTLLM MoE, FP8 KV cache, MTP max_draft_len=1, padded CUDA
+  # graphs, custom DeepSeek-V4 tokenizer, and the same system prompt used by
+  # the Pro GSM8K bench script. Measured 96.32 on the full Pro aggregate run
+  # (GSM8K, 1319 samples); floor set slightly below for run-to-run margin.
+  - quant_algo: FP8_BLOCK_SCALES
+    kv_cache_quant_algo: FP8
+    spec_dec_algo: MTP
+    accuracy: 96.0
 Qwen3/Qwen3-4B:
   - spec_dec_algo: Eagle
     accuracy: 85.823
@@ -222,6 +232,10 @@ Qwen/Qwen3.5-35B-A3B:
   - spec_dec_algo: DFlash
     quant_algo: FP8_BLOCK_SCALES
     accuracy: 94.52
+Qwen/Qwen3.6-35B-A3B:
+  - quant_algo: MIXED_PRECISION
+    kv_cache_quant_algo: FP8
+    accuracy: 95.0
 Qwen/Qwen3.5-397B-A17B:
   - quant_algo: NVFP4
     kv_cache_quant_algo: FP8

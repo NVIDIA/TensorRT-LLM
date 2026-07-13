@@ -84,13 +84,19 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
 
     # This dataframe is not manually edited. Infra team will regularly generate this dataframe based on test execution results.
     # If you need to override this policy, please use postprocess code as below.
-    agg_unit_mem_df = pd.read_csv(
-        f'{test_root}/integration/defs/agg_unit_mem_df.csv')
+    agg_unit_mem_path = f'{test_root}/integration/defs/agg_unit_mem_df.csv'
+    print(f'Loading unittest parallel config from: {agg_unit_mem_path}')
+    agg_unit_mem_df = pd.read_csv(agg_unit_mem_path)
     gpu_handle = pynvml.nvmlDeviceGetHandleByIndex(0)
     gpu_name = pynvml.nvmlDeviceGetName(gpu_handle)
     if isinstance(gpu_name, bytes):
         gpu_name = gpu_name.decode()
+    print(f'GPU name from NVML (index 0): {gpu_name!r}')
+    print(f'GPU names available in parallel config: '
+          f'{sorted(agg_unit_mem_df["gpu"].dropna().unique().tolist())}')
     agg_unit_mem_df = agg_unit_mem_df[agg_unit_mem_df['gpu'] == gpu_name]
+    print(f'Matched parallel config rows for GPU {gpu_name!r}: '
+          f'{len(agg_unit_mem_df)}')
     print(agg_unit_mem_df)
 
     parallel_dict = {}
@@ -101,6 +107,7 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
     print(parallel_dict)
 
     cur_key = (gpu_name, case)
+    print(f'Parallel config lookup key: {cur_key!r}')
     if cur_key in parallel_dict:
         num_workers = parallel_dict[cur_key]
         num_workers = min(num_workers, 8)
@@ -188,10 +195,39 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
 
     print(f"Running unit test:\"python {' '.join(command)}\"")
 
+    def build_pythonpath():
+        pythonpath = os.environ.get("PYTHONPATH", "")
+        pythonpath_entries = [f"{llm_root}/tests/unittest"]
+
+        # MPI worker processes start from the tests directory and otherwise
+        # may resolve an older site-packages triton_kernels package.
+        triton_kernels_src = os.path.join(llm_root, "triton_kernels")
+        if os.path.isdir(triton_kernels_src):
+            pythonpath_overrides_dir = os.path.join(
+                output_dir, f"pythonpath-overrides-{case_fn}")
+            os.makedirs(pythonpath_overrides_dir, exist_ok=True)
+            triton_kernels_link = os.path.join(pythonpath_overrides_dir,
+                                               "triton_kernels")
+            if os.path.lexists(triton_kernels_link):
+                is_expected_link = False
+                if os.path.islink(triton_kernels_link):
+                    is_expected_link = (
+                        os.readlink(triton_kernels_link) == triton_kernels_src)
+                if not is_expected_link:
+                    raise RuntimeError(
+                        f"Unexpected triton_kernels path: {triton_kernels_link}"
+                    )
+            else:
+                os.symlink(triton_kernels_src, triton_kernels_link)
+            pythonpath_entries.insert(0, pythonpath_overrides_dir)
+
+        if pythonpath:
+            pythonpath_entries.append(pythonpath)
+        return os.pathsep.join(pythonpath_entries)
+
     def run_command(cmd, num_workers=1):
         try:
-            pythonpath = os.environ.get("PYTHONPATH", "")
-            env = {'PYTHONPATH': f"{llm_root}/tests/unittest:{pythonpath}"}
+            env = {'PYTHONPATH': build_pythonpath()}
             if s3_secret_key:
                 env["S3_SECRET_KEY"] = s3_secret_key
             if num_workers > 1:
