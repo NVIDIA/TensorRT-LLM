@@ -127,6 +127,43 @@ class TestMergeKVCachePoolPointers(unittest.TestCase):
         self.assertTrue(torch.equal(merged, expected))
 
 
+class TestKVCacheManagerPoolPointers(unittest.TestCase):
+
+    @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
+    def test_default_nvfp4_pool_configuration_merges_scale_pointers(self):
+        manager = KVCacheManager(
+            kv_cache_config=KvCacheConfig(max_tokens=64),
+            kv_cache_type=tensorrt_llm.bindings.internal.batch_manager.
+            CacheType.SELF,
+            num_layers=1,
+            num_kv_heads=1,
+            head_dim=128,
+            tokens_per_block=32,
+            max_seq_len=64,
+            max_batch_size=1,
+            mapping=Mapping(),
+            dtype=DataType.NVFP4,
+        )
+        try:
+            data_pointers = manager.impl.get_block_pool_pointers()
+            scale_pointers = manager.impl.get_block_scale_pool_pointers()
+
+            self.assertEqual(manager.pool_configurations, [])
+            self.assertEqual(
+                [(config.window_size, config.dtype)
+                 for config in manager.impl.pool_configurations],
+                [(64, DataType.NVFP4)],
+            )
+            self.assertTrue(
+                torch.equal(manager.kv_cache_pool_pointers[..., 0],
+                            data_pointers))
+            self.assertTrue(
+                torch.equal(manager.kv_cache_pool_pointers[..., 1],
+                            scale_pointers))
+        finally:
+            manager.shutdown()
+
+
 class TestResourceManager(unittest.TestCase):
     CPP_RESOURCES_DIR = os.path.join(str(root_dir), "cpp", "tests", "resources")
     CPP_DATA_DIR = os.path.join(CPP_RESOURCES_DIR, "data")

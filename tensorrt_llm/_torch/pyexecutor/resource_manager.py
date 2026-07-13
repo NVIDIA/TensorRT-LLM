@@ -646,6 +646,8 @@ class KVCacheManager(BaseResourceManager):
         kv_cache_block_scale_pool_pointers = self.impl.get_block_scale_pool_pointers(
         )
         if kv_cache_block_scale_pool_pointers.numel() > 0:
+            # C++ reports one effective configuration per actual window,
+            # including manager-level defaults when none were supplied.
             dtype_by_window = {
                 config.window_size: config.dtype
                 for config in self.impl.pool_configurations
