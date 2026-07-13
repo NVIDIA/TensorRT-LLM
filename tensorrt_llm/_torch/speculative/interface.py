@@ -1815,6 +1815,39 @@ class SpecWorkerBase(nn.Module, ABC):
 
         return flat_tokens.reshape(num_gens, K).type(torch.int32)
 
+    def write_context_onehot_draft_probs(self,
+                                         spec_metadata,
+                                         num_contexts,
+                                         num_gens,
+                                         draft_len,
+                                         gen_vocab=None):
+        """Write a one-hot draft-prob distribution (prob 1.0 at draft-vocab token
+        id 0, the placeholder draft token) into each context request's stable
+        slot row, so the row is a legal distribution when the context request
+        becomes a generation request next iteration and rejection acceptance
+        reads ``draft_probs[slot, :draft_len, :stored_vocab]``.
+
+        Block workers (PARD/DFlash) do not draft context requests (they get a
+        zero placeholder token), leaving their slot rows unwritten. Mixed
+        iterations reuse the vocab width the gen scatter just set (``gen_vocab``);
+        pure-context iterations have no gen logits, so use the buffer's full
+        draft-vocab width and publish it via ``draft_probs_last_dim`` (acceptance
+        next iter reads this scalar). No-op unless rejection is enabled and the
+        slot-indexed buffers exist. Static shapes -> CUDA-graph safe.
+        """
+        if (num_contexts <= 0
+                or not getattr(spec_metadata, "use_rejection_sampling", False)
+                or spec_metadata.draft_probs is None):
+            return
+        ctx_slot_ids = spec_metadata.batch_slot_ids[:num_contexts]
+        if num_gens > 0:
+            onehot_vocab = gen_vocab  # matches the gen scatter's width
+        else:
+            onehot_vocab = spec_metadata.draft_probs_vocab_size
+            spec_metadata.draft_probs_last_dim = onehot_vocab
+        spec_metadata.draft_probs[ctx_slot_ids, :draft_len, :onehot_vocab] = 0.0
+        spec_metadata.draft_probs[ctx_slot_ids, :draft_len, 0] = 1.0
+
     def sample_draft_tokens(self,
                             logits,
                             spec_metadata,
@@ -1890,12 +1923,14 @@ class SpecWorkerBase(nn.Module, ABC):
             tokens = self._d2t[tokens] + tokens
 
         if is_last_draft_cycle and use_rejection:
-            # Trust the captured draft_probs only for a non-all-greedy batch
-            # (and, for the block form, a pure-gen batch: a mixed batch's block
-            # capture is partial).
+            # Trust the captured draft_probs for any non-all-greedy batch. For
+            # the block form, the gen subset is scattered here and context slots
+            # are filled with a one-hot placeholder distribution at the worker's
+            # placeholder-assembly point, so every slot the next iteration's gen
+            # acceptance reads is a legal distribution.
             valid = not spec_metadata.is_all_greedy_sample
-            if is_block:
-                valid = valid and num_contexts == 0
+            if is_block and spec_metadata.draft_probs is None:
+                valid = False
             spec_metadata.draft_probs_valid = valid
 
         return tokens.type(torch.int32)

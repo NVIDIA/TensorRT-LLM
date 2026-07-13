@@ -298,6 +298,12 @@ class PARDWorker(SpecWorkerBase):
         else:
             gen_draft_tokens = torch.empty((0, 2 * K - 1), dtype=torch.int32, device="cuda")
 
+        # Context requests are not drafted by the block worker (zero placeholder
+        # token); fill their draft-prob slot rows with a one-hot placeholder so
+        # they are a legal distribution when they become gen requests next iter.
+        gen_vocab = vocab_size if num_gens > 0 else None
+        self.write_context_onehot_draft_probs(spec_metadata, num_contexts, num_gens, K, gen_vocab)
+
         if num_contexts > 0 and num_gens > 0:
             ctx_draft_tokens = torch.zeros(
                 (num_contexts, 2 * K - 1), dtype=torch.int32, device="cuda"
