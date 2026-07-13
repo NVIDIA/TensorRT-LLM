@@ -82,8 +82,8 @@ PlanBufs planBufs(ExecCtx* ctx, std::size_t n)
 // at most `maxPieces` entries (>= 1) — when the budget runs out the remainder goes in as ONE
 // oversized entry (the kernel's strided loop handles any size, so an unsplit entry only costs
 // parallelism, never correctness). Emits exactly piecesFor(size, maxPieces) entries.
-void appendSplitInto(PlanBufs const& bufs, std::size_t& idx, std::uint64_t src, std::uint64_t dst,
-    std::uint32_t size, std::size_t maxPieces)
+void appendSplitInto(PlanBufs const& bufs, std::size_t& idx, std::uint64_t src, std::uint64_t dst, std::uint32_t size,
+    std::size_t maxPieces)
 {
     while (size > kCopySplitBytes && maxPieces > 1)
     {
@@ -485,8 +485,7 @@ void BounceReceiver::scatterWorkerLoop()
                 // Run-level source bounds: every piece p reads region[bounceOffset + p*bounceStride
                 // .. +pieceSize). count-1 and bounceStride are both u32 so the span product cannot
                 // overflow u64. A count of 0 is malformed (a run always carries >= 1 piece).
-                std::uint64_t const span
-                    = static_cast<std::uint64_t>(e.count - 1) * e.bounceStride + e.pieceSize;
+                std::uint64_t const span = static_cast<std::uint64_t>(e.count - 1) * e.bounceStride + e.pieceSize;
                 srcInBounds = srcInBounds && e.count >= 1 && e.bounceOffset <= job.regionBytes
                     && span <= job.regionBytes - e.bounceOffset;
                 rawPieces += std::max<std::uint32_t>(e.count, 1);
@@ -552,8 +551,8 @@ void BounceReceiver::scatterWorkerLoop()
         // ACK would tell the sender corrupt/absent data landed; it must time out instead.
         if (ok)
         {
-            BounceNvtxScope ackScope(kNvtxAckSend, "ackSend rid=%llu chunk=%u",
-                static_cast<unsigned long long>(job.rid), job.chunkIdx);
+            BounceNvtxScope ackScope(
+                kNvtxAckSend, "ackSend rid=%llu chunk=%u", static_cast<unsigned long long>(job.rid), job.chunkIdx);
             mCtx.channel->sendTo(job.peer, encodeAck(job.rid, job.chunkIdx, job.offset));
         }
         {
@@ -665,7 +664,7 @@ void BounceSender::onGrant(std::string const& peer, BounceMsgHeader const& h, st
 
 void BounceSender::attachCredits(std::uint64_t rid, Request& req)
 {
-    // Credits pair with chunks strictly in order (the receiver serves the WANT's size list FIFO), so
+    // Credits pair with chunks strictly in order (the receiver serves the WANT size list FIFO), so
     // pendingCredits.front() is always chunk `nextCredit`'s credit. Attach parked credits to chunks
     // that eager gather already posted credit-less; chunks not yet posted keep their credit parked
     // for pumpRequest to consume at gather-launch time.

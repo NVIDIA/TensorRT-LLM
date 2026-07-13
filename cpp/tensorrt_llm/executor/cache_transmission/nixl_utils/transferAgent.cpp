@@ -70,8 +70,8 @@ struct NixlBounceState
 {
     BounceConfig cfg;
     std::unique_ptr<ControlChannel> channel; // ZmqControlChannel or NixlNotifControlChannel (cfg.nixlControl)
-    std::unique_ptr<BounceArena> arena; // ONE shared buffer: receiver targets + local gather staging
-    std::unique_ptr<ExecPool> exec;     // gather/scatter exec contexts (streams/scratch)
+    std::unique_ptr<BounceArena> arena;      // ONE shared buffer: receiver targets + local gather staging
+    std::unique_ptr<ExecPool> exec;          // gather/scatter exec contexts (streams/scratch)
     // Engine is declared AFTER the arena so it is destroyed BEFORE it: ~NixlTransferEngine
     // deregisters the arena from the agent while the arena memory is still alive (the arena's
     // cudaFree runs afterwards).
