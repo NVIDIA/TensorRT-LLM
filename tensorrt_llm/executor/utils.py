@@ -1,6 +1,23 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import asyncio
 import concurrent.futures
+import ctypes
 import os
+import re
 import sys
 import threading
 import traceback
@@ -29,6 +46,36 @@ class LlmLauncherEnvs(StrEnum):
     TLLM_EXECUTOR_PERIODICAL_RESP_IN_AWAIT = "TLLM_EXECUTOR_PERIODICAL_RESP_IN_AWAIT"
 
 
+_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY: bytes | None = None
+_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY_PATTERN = re.compile(r"^[0-9a-fA-F]{64}$")
+
+
+def _scrub_process_env_value(key_name: str, value: str) -> None:
+    if sys.platform != "linux":
+        return
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.getenv.restype = ctypes.c_void_p
+    value_ptr = libc.getenv(os.fsencode(key_name))
+    if value_ptr:
+        ctypes.memset(value_ptr, 0, len(os.fsencode(value)))
+
+
+def _normalize_spawn_proxy_process_ipc_hmac_key(key: str) -> bytes:
+    if not _SPAWN_PROXY_PROCESS_IPC_HMAC_KEY_PATTERN.fullmatch(key):
+        raise ValueError("IPC HMAC key must be a 64-character hex string.")
+
+    try:
+        key_bytes = bytes.fromhex(key)
+    except ValueError as exc:
+        raise ValueError(
+            "IPC HMAC key must be a 64-character hex string.") from exc
+
+    if len(key_bytes) != 32:
+        raise ValueError("IPC HMAC key must be 32 bytes.")
+    return key_bytes
+
+
 def get_spawn_proxy_process_ipc_addr_env() -> str | None:
     ''' Get the IPC address for the spawn proxy process dynamically. '''
     return os.getenv(LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR)
@@ -36,11 +83,22 @@ def get_spawn_proxy_process_ipc_addr_env() -> str | None:
 
 def get_spawn_proxy_process_ipc_hmac_key_env() -> bytes:
     ''' Get the HMAC key for the spawn proxy process dynamically. '''
-    key = os.getenv("TLLM_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY")
-    assert key is not None, (
-        f"{LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY} is not set. "
-        "HMAC encryption is required for IPC communication.")
-    return bytes.fromhex(key)
+    global _SPAWN_PROXY_PROCESS_IPC_HMAC_KEY
+    if _SPAWN_PROXY_PROCESS_IPC_HMAC_KEY is not None:
+        return _SPAWN_PROXY_PROCESS_IPC_HMAC_KEY
+
+    env_name = LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY.value
+    key = os.environ.get(env_name)
+    if key is None:
+        raise RuntimeError(
+            f"{LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY} is not set. "
+            "HMAC encryption is required for IPC communication.")
+    _scrub_process_env_value(env_name, key)
+    os.environ.pop(env_name, None)
+
+    _SPAWN_PROXY_PROCESS_IPC_HMAC_KEY = (
+        _normalize_spawn_proxy_process_ipc_hmac_key(key))
+    return _SPAWN_PROXY_PROCESS_IPC_HMAC_KEY
 
 
 def get_spawn_proxy_process_env() -> bool:

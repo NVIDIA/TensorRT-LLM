@@ -70,7 +70,6 @@ unset or when the safety sanitizer rejects the runtime value.
 | `cuda_graph_config.mode` | `Literal['decode']` | `categorical` |  | `decode`, `encode` |
 | `cuda_graph_config.num_tokens` | `Optional[List[Annotated[int, Gt(gt=0)]]]` | `value` |  |  |
 | `cuda_graph_config.seq_lens` | `Optional[List[Annotated[int, Gt(gt=0)]]]` | `value` |  |  |
-| `disable_flashinfer_sampling` | `<class 'bool'>` | `value` |  |  |
 | `disable_overlap_scheduler` | `<class 'bool'>` | `value` |  |  |
 | `dtype` | `<class 'str'>` | `categorical` | allowlist | `auto`, `float16`, `bfloat16`, `float32` |
 | `dwdp_config.contention_opt` | `<class 'bool'>` | `value` |  |  |

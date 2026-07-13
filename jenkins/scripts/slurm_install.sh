@@ -29,6 +29,7 @@ slurm_install_setup() {
         if [[ $pytestCommand == *--run-ray* ]]; then
             retry_command --timeout 2700 pip3 install --retries 10 "ray[default]==2.55.1"
         fi
+        retry_command --timeout 2700 bash -c "pip3 install --retries 10 opencv-python-headless"
         retry_command --timeout 2700 bash -c "cd $llmSrcNode && pip3 install --retries 10 -r requirements-dev.txt"
         retry_command --timeout 2700 bash -c "cd $resourcePathNode && pip3 install --retries 10 --force-reinstall --no-deps TensorRT-LLM/tensorrt_llm-*.whl"
         gpuUuids=$(nvidia-smi -q | grep "GPU UUID" | awk '{print $4}' | tr '\n' ',' || true)

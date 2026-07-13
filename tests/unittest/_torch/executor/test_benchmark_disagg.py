@@ -28,6 +28,7 @@ from unittest.mock import Mock, patch
 
 import pytest
 
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 
 # ---------------------------------------------------------------------------
@@ -38,11 +39,15 @@ from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 def _make_active_request(
     in_init: bool = False,
     in_transfer: bool = False,
+    in_error: bool = False,
 ) -> Mock:
     """Create an active request stub with disagg state flags."""
     req = Mock()
     req.is_disagg_generation_init_state = in_init
     req.is_disagg_generation_transmission_in_progress = in_transfer
+    req.state = (
+        LlmRequestState.DISAGG_TRANS_ERROR if in_error else LlmRequestState.GENERATION_IN_PROGRESS
+    )
     req.is_attention_dp_dummy = False
     return req
 
@@ -80,6 +85,8 @@ class MockBenchmarkExecutor:
             benchmark_req_queues_size > 0 and kv_cache_transceiver is not None
         )
         self._benchmark_fill_phase_active = self.is_benchmark_disagg
+        self._sync_disagg_transfer_made_progress = False
+        self._benchmark_sync_progress_global = False
         self._fill_admit_cap = 0
         self.enable_attention_dp = enable_attention_dp
         self.num_fetch_requests = num_fetch_requests
@@ -89,6 +96,7 @@ class MockBenchmarkExecutor:
         self.dist = Mock()
         self.dist.rank = rank
         self.dist.tp_size = tp_size
+        self.dist.world_size = tp_size
 
     from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 
@@ -183,9 +191,13 @@ class TestFillCompleteADP:
     @pytest.mark.parametrize(
         "allgather_result, expected",
         [
-            pytest.param([1, 1, 1, 1], True, id="all_ranks_ready"),
-            pytest.param([1, 1, 0, 1], False, id="one_rank_blocked"),
-            pytest.param([0, 0, 0, 0], False, id="all_ranks_blocked"),
+            pytest.param([(1, False)] * 4, True, id="all_ranks_ready"),
+            pytest.param(
+                [(1, False), (1, False), (0, False), (1, False)],
+                False,
+                id="one_rank_blocked",
+            ),
+            pytest.param([(0, False)] * 4, False, id="all_ranks_blocked"),
         ],
     )
     def test_global_gate(self, allgather_result, expected):
@@ -211,9 +223,9 @@ class TestFillCompleteADP:
             num_fetch_requests=4,
             active_requests=reqs,
         )
-        ex.dist.tp_allgather.return_value = [1, 1]
+        ex.dist.tp_allgather.return_value = [(1, False), (1, False)]
         ex._is_benchmark_disagg_fill_complete(ScheduledRequests())
-        ex.dist.tp_allgather.assert_called_once_with(1)
+        ex.dist.tp_allgather.assert_called_once_with((1, False))
 
     def test_no_allgather_without_adp(self):
         reqs = [_make_active_request() for _ in range(4)]
@@ -247,7 +259,7 @@ class TestFillCompleteADPRouterImbalance:
             num_fetch_requests=8192,
             active_requests=reqs,
         )
-        ex.dist.tp_allgather.return_value = [1] * 32
+        ex.dist.tp_allgather.return_value = [(1, False)] * 32
         assert ex._is_benchmark_disagg_fill_complete(ScheduledRequests()) is True
 
     def test_gate_blocked_when_overflow_requests_in_init(self):
@@ -261,7 +273,17 @@ class TestFillCompleteADPRouterImbalance:
             num_fetch_requests=8192,
             active_requests=reqs,
         )
-        ex.dist.tp_allgather.return_value = [0] + [1] * 31
+        ex.dist.tp_allgather.return_value = [(0, False)] + [(1, False)] * 31
+        assert ex._is_benchmark_disagg_fill_complete(ScheduledRequests()) is False
+
+    def test_gate_blocked_when_sync_transfer_failed(self):
+        ex = MockBenchmarkExecutor(
+            benchmark_req_queues_size=1,
+            kv_cache_transceiver=_make_transceiver(transfer_complete=True),
+            num_fetch_requests=1,
+            active_requests=[_make_active_request(in_error=True)],
+        )
+
         assert ex._is_benchmark_disagg_fill_complete(ScheduledRequests()) is False
 
 
@@ -330,6 +352,44 @@ class TestCheckBenchmarkDisaggGate:
         assert can_forward is False
         assert should_retry is True
         mock_time.sleep.assert_called_once_with(0.1)
+
+    @patch("tensorrt_llm._torch.pyexecutor.py_executor.time")
+    def test_gate_retries_without_sleep_after_sync_transfer_progress(self, mock_time):
+        reqs = [_make_active_request(in_init=True)]
+        ex = MockBenchmarkExecutor(
+            benchmark_req_queues_size=4,
+            kv_cache_transceiver=_make_transceiver(transfer_complete=False),
+            num_fetch_requests=2,
+            active_requests=reqs,
+        )
+        ex._sync_disagg_transfer_made_progress = True
+
+        can_forward, should_retry = ex._check_benchmark_disagg_gate(ScheduledRequests(), False)
+
+        assert can_forward is False
+        assert should_retry is True
+        assert ex._sync_disagg_transfer_made_progress is False
+        mock_time.sleep.assert_not_called()
+
+    @patch("tensorrt_llm._torch.pyexecutor.py_executor.time")
+    def test_gate_skips_sleep_on_all_adp_ranks_when_peer_makes_progress(self, mock_time):
+        reqs = [_make_active_request(in_init=True)]
+        ex = MockBenchmarkExecutor(
+            benchmark_req_queues_size=4,
+            kv_cache_transceiver=_make_transceiver(transfer_complete=False),
+            enable_attention_dp=True,
+            tp_size=2,
+            num_fetch_requests=4,
+            active_requests=reqs,
+        )
+        ex.dist.tp_allgather.return_value = [(0, False), (0, True)]
+
+        can_forward, should_retry = ex._check_benchmark_disagg_gate(ScheduledRequests(), False)
+
+        assert can_forward is False
+        assert should_retry is True
+        ex.dist.tp_allgather.assert_called_once_with((0, False))
+        mock_time.sleep.assert_not_called()
 
     @pytest.mark.parametrize(
         "is_warmup, can_forward_in",
@@ -1046,6 +1106,7 @@ class TestFillPhaseEndToEnd:
         ex.max_num_active_requests = self.MAX_BATCH_SIZE
         ex.dist = Mock(rank=0, tp_size=self.TP_SIZE)
         ex.dist.tp_allreduce.return_value = 0
+        ex.dist.tp_allgather.return_value = [(0, False)] * self.TP_SIZE
         ex.is_shutdown = False
         ex._is_warmup = False
         ex.enable_iter_perf_stats = False
@@ -1103,7 +1164,7 @@ class TestFillPhaseEndToEnd:
         ready_reqs = [_make_active_request() for _ in range(5)]
         ex.active_requests = init_reqs + ready_reqs
 
-        ex.dist.tp_allgather = Mock(return_value=[0, 1])
+        ex.dist.tp_allgather = Mock(return_value=[(0, False), (1, False)])
         assert not ex._is_benchmark_disagg_fill_complete(batch), (
             "Gate should not open: 3 requests still in INIT"
         )
@@ -1120,7 +1181,7 @@ class TestFillPhaseEndToEnd:
         for req in init_reqs:
             req.is_disagg_generation_init_state = False
         ex.kv_cache_transceiver.check_gen_transfer_complete.return_value = True
-        ex.dist.tp_allgather = Mock(return_value=[1, 1])
+        ex.dist.tp_allgather = Mock(return_value=[(1, False), (1, False)])
 
         assert ex._is_benchmark_disagg_fill_complete(batch), (
             "Gate should open: all requests past transfer, transceiver complete"

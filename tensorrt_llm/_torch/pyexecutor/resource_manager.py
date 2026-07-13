@@ -566,6 +566,8 @@ class KVCacheManager(BaseResourceManager):
             for pc in self.pool_configurations
         ]
 
+        self.enable_indexer_k_cache = enable_indexer_k_cache
+
         kwargs = {
             'num_kv_heads_per_layer': self.num_kv_heads_per_layer,
             'size_per_head': head_dim,

@@ -1980,6 +1980,11 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
                 # MLA generation: output has kv_lora_rank per head
                 output = q.new_empty(
                     [q.shape[0], self.num_heads * self.kv_lora_rank])
+            elif q.dtype == torch.float8_e4m3fn:
+                # Q may arrive pre-quantized to FP8 (fused model-side QKV
+                # prep); the trtllm-gen FP8 cubins emit BF16
+                # (QkvE4m3OBfloat16), so the output must not follow q's dtype.
+                output = q.new_empty(q.shape, dtype=torch.bfloat16)
             else:
                 output = torch.empty_like(q)
 
