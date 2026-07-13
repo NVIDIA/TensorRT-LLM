@@ -185,16 +185,17 @@ def scpFromRemoteCmd(Map remote, String remotePath, String localPath) {
 // Print the last `lines` lines of the remote Slurm job log file to the console when the Slurm job fails.
 // If the log file does not exist, print a message to the console.
 def echoRemoteLogTail(def pipeline, Map remote, String remotePath, int lines = 200) {
+    pipeline.echo("===== Last ${lines} lines of ${remotePath} on ${remote.host} =====")
     try {
         def tailOut = Utils.exec(
             pipeline,
             script: Utils.sshUserCmd(remote,
-                "\"if [ -f ${remotePath} ]; then tail -n ${lines} ${remotePath}; " +
-                "else echo '[log not found: ${remotePath}]'; fi\""),
+                "\"bash -c 'if [ -f \\\"${remotePath}\\\" ]; then tail -n ${lines} -- \\\"${remotePath}\\\"; " +
+                "else echo \\\"[log not found: ${remotePath}]\\\"; fi'\""),
             returnStdout: true,
             numRetries: 1,
         )?.trim()
-        pipeline.echo("===== Last ${lines} lines of ${remotePath} on ${remote.host} =====\n${tailOut}")
+        pipeline.echo(tailOut ?: "")
     } catch (Exception tailEx) {
         pipeline.echo("Ignorable warning: could not tail ${remotePath} on ${remote.host}: ${tailEx.message}")
     }
