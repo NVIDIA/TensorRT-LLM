@@ -20,7 +20,8 @@ from transformers.utils import logging
 
 from tensorrt_llm.inputs.content_format import (ContentFormat,
                                                 detect_content_format)
-from tensorrt_llm.inputs.media_io import (_get_aiohttp_session,
+from tensorrt_llm.inputs.media_io import (_blake3_hex_stream,
+                                          _get_aiohttp_session,
                                           _load_and_convert_image,
                                           _load_video_by_cv2,
                                           _normalize_file_uri,
@@ -139,10 +140,13 @@ def load_video(video: str,
                fps: int = 30,
                format: str = "pt",
                device: str = "cpu",
-               extract_audio: bool = False) -> VideoData:
+               extract_audio: bool = False,
+               hash_source: bool = False) -> VideoData:
     parsed_url = urlparse(video)
     if parsed_url.scheme in ["http", "https"]:
         resp = _safe_request_get(video, stream=False)
+        raw_bytes_hash = _blake3_hex_stream(
+            resp.content) if hash_source else None
         with tempfile.NamedTemporaryFile(delete=True,
                                          suffix=".mp4") as tmp_file:
             tmp_file.write(resp.content)
@@ -152,16 +156,21 @@ def load_video(video: str,
                                       fps,
                                       format,
                                       device,
-                                      extract_audio=extract_audio)
+                                      extract_audio=extract_audio,
+                                      raw_bytes_hash=raw_bytes_hash)
     elif parsed_url.scheme in ("", "file"):
+        raw_bytes_hash = _blake3_hex_stream(video) if hash_source else None
         return _load_video_by_cv2(video,
                                   num_frames,
                                   fps,
                                   format,
                                   device,
-                                  extract_audio=extract_audio)
+                                  extract_audio=extract_audio,
+                                  raw_bytes_hash=raw_bytes_hash)
     elif parsed_url.scheme == "data":
         decoded_video = load_base64_video(video)
+        raw_bytes_hash = _blake3_hex_stream(
+            decoded_video) if hash_source else None
         with tempfile.NamedTemporaryFile(delete=True,
                                          suffix='.mp4') as tmp_file:
             tmp_file.write(decoded_video)
@@ -171,7 +180,8 @@ def load_video(video: str,
                                       fps,
                                       format,
                                       device,
-                                      extract_audio=extract_audio)
+                                      extract_audio=extract_audio,
+                                      raw_bytes_hash=raw_bytes_hash)
     else:
         raise ValueError(f"Unsupported video scheme: {parsed_url.scheme}")
 
@@ -181,12 +191,14 @@ async def async_load_video(video: str,
                            fps: int = 30,
                            format: str = "pt",
                            device: str = "cpu",
-                           extract_audio: bool = False) -> VideoData:
+                           extract_audio: bool = False,
+                           hash_source: bool = False) -> VideoData:
     assert format in ["pt", "pil"], "format must be either Pytorch or PIL"
 
     parsed_url = urlparse(video)
 
     def _load_from_bytes(data: bytes) -> VideoData:
+        raw_bytes_hash = _blake3_hex_stream(data) if hash_source else None
         with tempfile.NamedTemporaryFile(delete=True, suffix='.mp4') as tmp:
             tmp.write(data)
             tmp.flush()
@@ -195,7 +207,8 @@ async def async_load_video(video: str,
                                       fps,
                                       format,
                                       device,
-                                      extract_audio=extract_audio)
+                                      extract_audio=extract_audio,
+                                      raw_bytes_hash=raw_bytes_hash)
 
     if parsed_url.scheme in ["http", "https"]:
         session = await _get_aiohttp_session()
@@ -205,13 +218,15 @@ async def async_load_video(video: str,
         decoded_video = await asyncio.to_thread(load_base64_video, video)
         return await asyncio.to_thread(_load_from_bytes, decoded_video)
     elif parsed_url.scheme in ("", "file"):
+        raw_bytes_hash = _blake3_hex_stream(video) if hash_source else None
         return await asyncio.to_thread(_load_video_by_cv2,
                                        video,
                                        num_frames,
                                        fps,
                                        format,
                                        device,
-                                       extract_audio=extract_audio)
+                                       extract_audio=extract_audio,
+                                       raw_bytes_hash=raw_bytes_hash)
     else:
         raise ValueError(f"Unsupported URL scheme: {parsed_url.scheme!r}")
 
