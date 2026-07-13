@@ -115,18 +115,8 @@ class FilteredTopKKernelVarlen:
 
         if cutlass.const_expr(self.per_row_max_num_cols <= 65536):
             self.index_type = cutlass.Uint16
-            # TODO: remove after perf validation (replaced by _compute_smem_input_size_for_occupancy)
-            # if cutlass.const_expr(self.num_buffer_smem_input_idx == 2):
-            #     self.max_smem_input_size = 32 * 1024
-            # else:
-            #     self.max_smem_input_size = 64 * 1024
         else:
             self.index_type = cutlass.Uint32
-            # TODO: remove after perf validation (replaced by _compute_smem_input_size_for_occupancy)
-            # if cutlass.const_expr(self.num_buffer_smem_input_idx == 2):
-            #     self.max_smem_input_size = 16 * 1024
-            # else:
-            #     self.max_smem_input_size = 32 * 1024
 
         self.vec_size = num_copy_bits // dtype.width
         if cutlass.const_expr(dtype not in [cutlass.Float32, cute.BFloat16, cutlass.Float16]):
