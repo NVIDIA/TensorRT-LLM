@@ -738,6 +738,9 @@ class PyExecutor:
         self.previous_batch: Optional[BatchState] = None
         self.has_previous_draft_tokens = False
         self.num_scheduled_requests: int = 0
+        # Populated at schedule time (see _prepare_and_schedule_batch).
+        self.num_dummy_requests: int = 0
+        self.num_unscheduled_requests: int = 0
         self._iter_adp_dummy_ctx_tokens = 0
         self._iter_adp_dummy_gen_tokens = 0
         self._configure_benchmark_req_queues_size()
@@ -2734,6 +2737,11 @@ class PyExecutor:
                 self.disagg.poll_progress_when_idle()
 
                 self.num_scheduled_requests = scheduled_batch.batch_size
+                self.num_dummy_requests = sum(
+                    1 for r in scheduled_batch.all_requests()
+                    if r.is_attention_dp_dummy)
+                self.num_unscheduled_requests = (len(self.active_requests) -
+                                                 scheduled_batch.batch_size)
 
                 logger.debug(
                     f'iteration {self.iter_counter}, microbatch {microbatch_id}, '
@@ -3843,6 +3851,10 @@ class PyExecutor:
                 return None, None
 
         self.num_scheduled_requests = scheduled_batch.batch_size
+        self.num_dummy_requests = sum(1 for r in scheduled_batch.all_requests()
+                                      if r.is_attention_dp_dummy)
+        self.num_unscheduled_requests = (len(self.active_requests) -
+                                         scheduled_batch.batch_size)
         logger.debug(
             f'has {len(self.active_requests)} active_requests, '
             f'scheduled {scheduled_batch.num_encoder_requests} encoder requests, '
