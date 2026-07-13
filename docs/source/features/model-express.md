@@ -6,11 +6,12 @@ SPDX-License-Identifier: Apache-2.0
 # ModelExpress (MX) Checkpoint Loading
 
 TensorRT-LLM can use ModelExpress (MX) as a checkpoint-loading path for
-PyTorch backend deployments. When `checkpoint_format="MX"` is selected,
-TensorRT-LLM attempts to fetch compatible weights from another running
-TensorRT-LLM instance through the MX server. If no compatible source is
-available, or if MX transfer fails, loading falls back to the standard
-Hugging Face checkpoint path.
+PyTorch backend deployments. `checkpoint_format="MX"` selects this loading
+path; it does not identify an MX-specific on-disk checkpoint format, and no
+checkpoint conversion is required. TensorRT-LLM attempts to fetch compatible
+weights from another running TensorRT-LLM instance through the MX server. If
+no compatible source is available, or if MX transfer fails, loading falls back
+to the provided Hugging Face checkpoint.
 
 This integration is intended to reduce repeated disk reads when multiple
 TensorRT-LLM workers load the same model. A worker that loads from disk can
@@ -90,8 +91,9 @@ docker run -d --name modelexpress-server \
 
 ## Configure TensorRT-LLM
 
-Set the checkpoint format to `MX` and provide the MX server URL in a
-`trtllm-serve` config:
+Select the MX checkpoint-loading path and provide the MX server URL in a
+`trtllm-serve` config. The model argument remains a standard Hugging Face model
+ID or checkpoint path:
 
 ```yaml
 checkpoint_format: MX

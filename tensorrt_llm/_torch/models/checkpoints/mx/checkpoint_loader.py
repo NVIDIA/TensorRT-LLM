@@ -35,7 +35,7 @@ import traceback
 from contextlib import contextmanager
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Iterator, Optional, Type, Union
+from typing import Any, Callable, Iterator, MutableMapping, Optional, Protocol, Type, Union
 
 from tensorrt_llm._torch.models.checkpoints.base_config_loader import BaseConfigLoader
 from tensorrt_llm._torch.models.checkpoints.base_weight_loader import BaseWeightLoader
@@ -76,6 +76,12 @@ class _MxWeightLayoutStatus(Enum):
     UNSUPPORTED = "unsupported"
 
 
+class _MxSourceIdentity(Protocol):
+    """Subset of ModelExpress's protobuf SourceIdentity used by this adapter."""
+
+    extra_parameters: MutableMapping[str, str]
+
+
 @contextmanager
 def _temporary_env(key: str, value: Optional[str]) -> Iterator[None]:
     """Temporarily set one environment variable when a value is provided."""
@@ -103,8 +109,8 @@ def _serialize_source_identity(identity: SourceIdentity) -> str:
 
 
 def _attach_trtllm_metadata_to_mx_identity(
-    mx_identity: Any, source_identity: Optional[SourceIdentity]
-) -> Any:
+    mx_identity: _MxSourceIdentity, source_identity: Optional[SourceIdentity]
+) -> _MxSourceIdentity:
     """Attach TRT-LLM compatibility metadata to an MX SourceIdentity."""
     if source_identity is None:
         return mx_identity
@@ -138,7 +144,7 @@ def _patched_trtllm_identity_builder(
         yield
         return
 
-    def _wrapped_build_identity(*args: Any, **kwargs: Any) -> Any:
+    def _wrapped_build_identity(*args: Any, **kwargs: Any) -> _MxSourceIdentity:
         return _attach_trtllm_metadata_to_mx_identity(
             original(*args, **kwargs),
             source_identity,
@@ -390,10 +396,12 @@ class MXCheckpointLoader(HfCheckpointLoader):
         source_registered = source_metadata is not None
         if not source_registered and self._local_source_identity is not None:
             # ModelExpress 0.4.1 hashes every SourceIdentity field, including
-            # extra_parameters. The upstream loader polls with this same
-            # patched identity, so any source it later discovers necessarily
-            # carries the expected TRT-LLM identity and layout metadata. Keep
-            # the polling path alive so query_timeout_s remains meaningful.
+            # extra_parameters. Proceed to MxLiveWeightLoader.load_weights()
+            # even though this immediate probe found no source: that method
+            # retries list_sources every five seconds until a source appears or
+            # query_timeout_s expires. It uses this same patched identity, so
+            # any source discovered later necessarily carries the expected
+            # TRT-LLM identity and layout metadata.
             source_metadata = _build_mx_source_metadata(self._local_source_identity)
         # Pre-transfer compatibility gate: on mismatch, skip the transfer
         # before any RDMA work starts and fall back to disk.
@@ -625,11 +633,11 @@ class MXCheckpointLoader(HfCheckpointLoader):
     def _build_mx_identity(
         self,
         checkpoint_dir: str,
-        build_identity: Callable[..., Any],
+        build_identity: Callable[..., _MxSourceIdentity],
         source_identity: Optional[SourceIdentity],
         *,
         model_name: Optional[str] = None,
-    ) -> Any:
+    ) -> _MxSourceIdentity:
         """Build the MX identity used for discovery and attach TRT-LLM identity."""
         resolved_name = model_name or self._resolve_publish_name(checkpoint_dir)
         return _attach_trtllm_metadata_to_mx_identity(
