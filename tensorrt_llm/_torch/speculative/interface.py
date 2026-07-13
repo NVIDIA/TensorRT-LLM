@@ -555,8 +555,6 @@ class SpecMetadata:
     # size while sharing the full-size buffer, so a bucket-relative index would
     # collide with a real request's slot row and overwrite its draft probs.
     dummy_slot_row: int = 0
-    # Whether draft_probs contains valid data.
-    draft_probs_valid: bool = False
     # Last dimension size of the draft logits/probs stored in draft_probs.
     draft_probs_last_dim: int = 0
     # Per-request slot ids (py_seq_slot) for the current batch, in batch order.
@@ -1313,7 +1311,7 @@ class SpecWorkerBase(nn.Module, ABC):
                             spec_metadata.draft_probs_vocab_size)
             # Fail closed: run the rejection kernel only when every buffer is
             # present and correctly shaped; otherwise fall back to strict
-            # acceptance. draft_probs_valid is reset so stale state is not reused.
+            # acceptance.
             if self._rejection_buffers_valid(draft_tokens, draft_len,
                                              stored_vocab, num_contexts,
                                              batch_size, logits, spec_metadata):
@@ -1326,7 +1324,6 @@ class SpecWorkerBase(nn.Module, ABC):
                 return self._sample_and_accept_draft_tokens_rejection(
                     logits, draft_tokens, draft_probs, num_contexts, batch_size,
                     spec_metadata)
-            spec_metadata.draft_probs_valid = False
         return self._sample_and_accept_draft_tokens_base(
             logits, draft_tokens, num_contexts, batch_size, spec_metadata)
 
@@ -1480,17 +1477,6 @@ class SpecWorkerBase(nn.Module, ABC):
         return self._accept_draft_tokens(logits, draft_tokens, num_contexts,
                                          batch_size, spec_metadata)
 
-    def reset_draft_probs_valid_for_capture(self, spec_metadata):
-        """Clear the producer->consumer ``draft_probs_valid`` flag at the start
-        of every draft forward (when rejection is enabled), so it is trusted
-        only after the current forward finishes scattering its draft probs. This
-        fails closed across batch-composition changes: a pure-context or
-        partial/failed capture cannot leave a stale True for the next forward's
-        acceptance. The worker re-sets it to True only after a full capture.
-        """
-        if getattr(spec_metadata, "use_rejection_sampling", False):
-            spec_metadata.draft_probs_valid = False
-
     def _rejection_buffers_valid(self, draft_tokens, draft_len, stored_vocab,
                                  num_contexts, batch_size, logits,
                                  spec_metadata) -> bool:
@@ -1533,7 +1519,6 @@ class SpecWorkerBase(nn.Module, ABC):
         # batches (context + gen) are handled via slot-indexed draft probs and
         # are split inside _sample_and_accept_draft_tokens_rejection.
         return (spec_metadata.use_rejection_sampling
-                and spec_metadata.draft_probs_valid
                 and not spec_metadata.is_all_greedy_sample)
 
     def _sample_and_accept_draft_tokens_rejection(
@@ -1886,7 +1871,6 @@ class SpecWorkerBase(nn.Module, ABC):
                             *,
                             num_contexts=0,
                             draft_step=None,
-                            is_last_draft_cycle=False,
                             mapping_lm_head_tp=None):
         """Unified draft-token production entry for all one-model workers.
 
@@ -1896,12 +1880,6 @@ class SpecWorkerBase(nn.Module, ABC):
         (autoregressive workers called once per draft step, e.g. MTP/
         DraftTarget). ``draft_step`` applies only to the step form and
         ``num_contexts`` only to the block form. d2t is read from ``self._d2t``.
-
-        ``is_last_draft_cycle`` marks the final production call of the draft
-        forward. On that call ``draft_probs_valid`` is set True only when
-        rejection is enabled, the batch is not all-greedy, and (block form) the
-        batch is pure generation; otherwise a partial/greedy/mixed capture fails
-        closed to strict acceptance next iteration.
 
         In a mixed (context + generation) batch the block form receives
         gen-only logits (context requests draft from accepted tokens they do not
@@ -1952,17 +1930,6 @@ class SpecWorkerBase(nn.Module, ABC):
         # Map draft-vocab token ids to target vocab (no-op for shared vocab).
         if self._d2t is not None:
             tokens = self._d2t[tokens] + tokens
-
-        if is_last_draft_cycle and use_rejection:
-            # Trust the captured draft_probs for any non-all-greedy batch. For
-            # the block form, the gen subset is scattered here and context slots
-            # are filled with a one-hot placeholder distribution at the worker's
-            # placeholder-assembly point, so every slot the next iteration's gen
-            # acceptance reads is a legal distribution.
-            valid = not spec_metadata.is_all_greedy_sample
-            if is_block and spec_metadata.draft_probs is None:
-                valid = False
-            spec_metadata.draft_probs_valid = valid
 
         return tokens.type(torch.int32)
 

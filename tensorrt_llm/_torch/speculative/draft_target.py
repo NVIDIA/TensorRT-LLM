@@ -213,8 +213,6 @@ class DraftTargetOneModelWorker(SpecWorkerBase):
         next_draft_tokens = []
         original_all_rank_num_tokens = attn_metadata.all_rank_num_tokens
 
-        self.reset_draft_probs_valid_for_capture(spec_metadata)
-
         # Get the draft KV cache manager if using separate layouts
         draft_kv_cache_manager = self.get_draft_kv_cache_manager(resource_manager)
 
@@ -266,7 +264,6 @@ class DraftTargetOneModelWorker(SpecWorkerBase):
                     spec_metadata,
                     batch_size,
                     draft_step=i,
-                    is_last_draft_cycle=(i == runtime_draft_len - 1),
                 )
                 next_draft_tokens.append(new_draft_token)
 

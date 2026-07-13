@@ -12,12 +12,6 @@ from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig, PARDDecodingConf
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
 
-@pytest.fixture(scope="function")
-def enforce_single_worker(monkeypatch):
-    monkeypatch.setenv("TLLM_WORKER_USE_SINGLE_PROCESS", "1")
-    yield
-
-
 @pytest.mark.parametrize("disable_overlap_scheduler", [True, False])
 def test_pard(disable_overlap_scheduler: bool):
     """Test PARD speculative decoding with CUDA graph support.
@@ -119,51 +113,6 @@ def test_pard_rejection():
     for out in outputs:
         assert len(out.outputs[0].token_ids) > 0
         assert out.outputs[0].text.strip()
-
-
-@pytest.mark.high_cuda_memory
-def test_pard_rejection_draft_probs_valid_cleared_after_warmup(enforce_single_worker):
-    """CUDA-graph warmup runs dummy requests through the draft forward, which sets
-    the rejection producer flag draft_probs_valid=True on each captured graph
-    metadata copy while only the dummy scratch slot is populated. capture() must
-    clear it so the first real replay's acceptance fails closed. Assert every
-    captured graph's flag is False after warmup (which runs during LLM init,
-    before any generate())."""
-    total_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
-    if total_mem_gb < 35:
-        pytest.skip("Not enough memory to load target + draft model")
-
-    models_path = llm_models_root()
-    pard_model_dir = f"{models_path}/PARD-Llama-3.2-1B"
-    target_model_dir = f"{models_path}/llama-3.1-model/Llama-3.1-8B-Instruct"
-
-    spec_config = PARDDecodingConfig(
-        max_draft_len=4,
-        speculative_model=pard_model_dir,
-        use_rejection_sampling=True,
-    )
-    llm_spec = LLM(
-        model=target_model_dir,
-        attn_backend="TRTLLM",
-        disable_overlap_scheduler=True,
-        cuda_graph_config=CudaGraphConfig(batch_sizes=[1, 2], enable_padding=True),
-        max_batch_size=2,
-        kv_cache_config=KvCacheConfig(enable_block_reuse=False, max_tokens=2048),
-        max_seq_len=2048,
-        speculative_config=spec_config,
-    )
-    try:
-        runner = llm_spec._executor.engine.model_engine.cuda_graph_runner
-        checked = 0
-        for meta in runner.graph_metadata.values():
-            spec_metadata = meta.get("spec_metadata")
-            if spec_metadata is not None and hasattr(spec_metadata, "draft_probs_valid"):
-                assert spec_metadata.draft_probs_valid is False
-                checked += 1
-        # At least one rejection-carrying graph must have been captured and checked.
-        assert checked > 0
-    finally:
-        llm_spec.shutdown()
 
 
 if __name__ == "__main__":

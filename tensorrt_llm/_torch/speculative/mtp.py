@@ -446,12 +446,6 @@ class MTPWorker(SpecWorkerBase):
         last_tokens_idx = torch.cumsum(
             attn_metadata.seq_lens_cuda, dim=0, dtype=torch.long) - 1
 
-        # Rejection sampling captures each draft step's sampling distribution
-        # into the slot-indexed spec_metadata.draft_probs buffer (engaged only
-        # for non-greedy batches; all-greedy uses argmax). draft_probs_valid is
-        # finalized inside sample_draft_tokens on the last draft cycle.
-        self.reset_draft_probs_valid_for_capture(spec_metadata)
-
         draft_kv_cache_manager = self.get_draft_kv_cache_manager(
             resource_manager)
 
@@ -474,12 +468,10 @@ class MTPWorker(SpecWorkerBase):
                     self.guided_decoder.execute_draft_batch(logits,
                                                             draft_step=i)
 
-                new_draft_token = self.sample_draft_tokens(
-                    logits,
-                    spec_metadata,
-                    batch_size,
-                    draft_step=i,
-                    is_last_draft_cycle=(i == runtime_draft_len - 1))
+                new_draft_token = self.sample_draft_tokens(logits,
+                                                           spec_metadata,
+                                                           batch_size,
+                                                           draft_step=i)
                 next_draft_tokens.append(new_draft_token)
                 # shift input_ids and hidden_states
                 input_ids = draft_inputs["input_ids"]
@@ -852,9 +844,9 @@ class MTPWorker(SpecWorkerBase):
                 spec_metadata=spec_metadata)
 
         # Rejection sampling acceptance. _can_use_rejection_sampling() requires
-        # use_rejection_sampling, draft_probs_valid, and a non-all-greedy batch;
-        # otherwise falls through to strict acceptance below. Context rows take
-        # the target's first sampled token; gen rows run the rejection kernel.
+        # use_rejection_sampling and a non-all-greedy batch; otherwise falls
+        # through to strict acceptance below. Context rows take the target's
+        # first sampled token; gen rows run the rejection kernel.
         elif self._can_use_rejection_sampling(spec_metadata):
             draft_tokens = spec_metadata.draft_tokens.reshape(
                 num_gens, runtime_draft_len)

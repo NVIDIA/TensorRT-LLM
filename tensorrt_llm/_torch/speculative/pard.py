@@ -238,8 +238,6 @@ class PARDWorker(SpecWorkerBase):
 
         draft_kv_cache_manager = self.get_draft_kv_cache_manager(resource_manager)
 
-        self.reset_draft_probs_valid_for_capture(spec_metadata)
-
         if num_gens > 0:
             with self.draft_kv_cache_context(attn_metadata, draft_kv_cache_manager):
                 hidden_states_out = draft_model.model(**inputs)
@@ -275,7 +273,6 @@ class PARDWorker(SpecWorkerBase):
                     spec_metadata,
                     batch_size,
                     num_contexts=num_contexts,
-                    is_last_draft_cycle=True,
                 )
 
                 if self.sa_enhancer is not None and sa_manager is not None:

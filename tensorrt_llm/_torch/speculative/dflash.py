@@ -462,8 +462,6 @@ class DFlashWorker(SpecWorkerBase):
 
         draft_kv_cache_manager = self.get_draft_kv_cache_manager(resource_manager)
 
-        self.reset_draft_probs_valid_for_capture(spec_metadata)
-
         if num_gens > 0:
             with self.draft_kv_cache_context(attn_metadata, draft_kv_cache_manager):
                 hidden_states_out = draft_model.dflash_forward(
@@ -496,7 +494,6 @@ class DFlashWorker(SpecWorkerBase):
                     spec_metadata,
                     batch_size,
                     num_contexts=num_contexts,
-                    is_last_draft_cycle=True,
                 )
 
         else:

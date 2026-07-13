@@ -189,8 +189,7 @@ def test_guard_false_on_malformed_state(build_case):
 
 # --------------------------------------------------------------------------
 # Fail-closed acceptance dispatch: prove _accept_draft_tokens() routes to
-# strict/base acceptance (and clears draft_probs_valid) when the buffers are
-# malformed even though draft_probs_valid was left True, and routes to the
+# strict/base acceptance when the buffers are malformed, and routes to the
 # rejection method when the state is valid. The two acceptance methods are
 # stubbed to record which path ran; the real _can_use_rejection_sampling and
 # _rejection_buffers_valid are exercised.
@@ -206,7 +205,6 @@ class _Worker(SpecWorkerBase):
 def _dispatch_meta(**over):
     base = dict(
         use_rejection_sampling=True,
-        draft_probs_valid=True,
         is_all_greedy_sample=False,
         draft_probs_vocab_size=V,
         draft_probs_last_dim=V,
@@ -236,16 +234,15 @@ def _make_worker():
 
 def test_accept_dispatch_fails_closed_on_malformed_buffers():
     w, calls = _make_worker()
-    # draft_probs_valid is True, but the buffers are malformed (draft_probs None)
-    # -> _rejection_buffers_valid must return False, so acceptance falls back to
-    # base, the rejection kernel is skipped, and draft_probs_valid is cleared.
+    # Buffers are malformed (draft_probs None) -> _rejection_buffers_valid must
+    # return False, so acceptance falls back to base and the rejection kernel is
+    # skipped.
     meta = _dispatch_meta(draft_probs=None)
     draft_tokens = torch.zeros((_NUM_GENS, K), dtype=torch.int, device="cuda")
     logits = torch.zeros((_NUM_CTX + _NUM_GENS * (K + 1), V), device="cuda")
     out = w._accept_draft_tokens(logits, draft_tokens, _NUM_CTX, _BATCH, meta)
     assert out == ("base", None)
     assert calls["base"] == 1 and calls["rejection"] == 0
-    assert meta.draft_probs_valid is False  # stale flag cleared on fallback
 
 
 def test_accept_dispatch_routes_to_rejection_on_valid_state():

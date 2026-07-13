@@ -805,7 +805,6 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         runtime_draft_len = spec_metadata.runtime_draft_len
         num_gens = batch_size - num_contexts
         next_draft_tokens = []
-        self.reset_draft_probs_valid_for_capture(spec_metadata)
         last_tokens_idx = torch.cumsum(
             attn_metadata.seq_lens_cuda, dim=0, dtype=torch.long) - 1
         position_ids = inputs["position_ids"]
@@ -917,7 +916,6 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                     spec_metadata,
                     batch_size,
                     draft_step=i,
-                    is_last_draft_cycle=(i == runtime_draft_len - 1),
                     mapping_lm_head_tp=mapping_lm_head_tp)
                 next_draft_tokens.append(new_draft_token)
 
