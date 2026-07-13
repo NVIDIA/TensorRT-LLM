@@ -820,9 +820,20 @@ def _update_hash(hasher, item: object) -> None:
 
 
 class MMHashResult(NamedTuple):
-    """Per-modality outputs from :func:`apply_mm_hashes`."""
+    """Parallel per-modality dicts of content hashes and their UUIDs.
+
+    Both dicts are indexed first by modality name (`"image"`, `"video"`,
+    ...) then by within-modality item position, so `hashes[m][i]` and
+    `uuids[m][i]` describe the same item.
+    """
+
     hashes: Dict[str, List[str]]
+    """Modality -> list of BLAKE3 hex digests (64 chars each)."""
+
     uuids: Optional[Dict[str, List[Optional[str]]]]
+    """Modality -> list of original UUID strings. `None` entries mark
+    items that fell back to content-only hashing. The whole dict is
+    `None` when the caller supplied no UUIDs at all."""
 
 
 def apply_mm_hashes(mm_data: Dict[str, Any],
@@ -843,12 +854,8 @@ def apply_mm_hashes(mm_data: Dict[str, Any],
         hash_lib: Hash function to use (default: blake3)
 
     Returns:
-        MMHashResult of two per-modality dicts, parallel-indexed by
-        modality then by within-modality item position:
-        - ``hashes``: modality -> list of hash hex strings (64 chars each)
-        - ``uuids``: modality -> list of UUID strings (``None`` entries for
-          items that fell back to content-only hashing). The whole dict is
-          ``None`` when the caller supplied no UUIDs at all.
+        `MMHashResult` with per-modality `hashes` and `uuids` dicts. See
+        the type's own docstring for the field-level contract.
     """
 
     def _hash_item(item):
@@ -902,11 +909,10 @@ def apply_mm_hashes(mm_data: Dict[str, Any],
             if uuid is not None:
                 # Hash UUID + content together for cache correctness
                 hashes.append(_hash_item_with_uuid(item, uuid))
-                uuids.append(uuid)
             else:
                 # Fall back to content-only hashing
                 hashes.append(_hash_item(item))
-                uuids.append(None)
+            uuids.append(uuid)  # `None` when the caller didn't supply one
 
         mm_hashes[modality] = hashes
         mm_uuids_by_key[modality] = uuids

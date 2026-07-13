@@ -372,9 +372,12 @@ class MultimodalDataTracker:
         self._embeddings = defaultdict[str, list](list)
         self._placeholder_counts = defaultdict[str, int](int)
         self._placeholder_to_modality: dict[str, str] = {}
-        # Prompt-order manifest of data-backed items. Populated by
-        # ``add_data`` (skipping ``is_embedding=True`` items — the
-        # interleave manifest addresses raw payload only).
+        # Prompt-order manifest of data-backed items. Each entry is
+        # `{"modality": <str>, "index": <int>}`; the value union reflects
+        # those two typed fields (`modality` is the modality name, `index`
+        # is the item's position in `multi_modal_data[modality]`).
+        # Populated by `add_data` (skipping `is_embedding=True` items —
+        # the interleave manifest addresses raw payload only).
         self._item_order: list[dict[str, Union[str, int]]] = []
         self._multimodal_server_config = multimodal_server_config if multimodal_server_config is not None else MultimodalServerConfig(
         )
@@ -467,8 +470,9 @@ class MultimodalDataTracker:
     def item_order(self) -> List[Dict[str, Union[str, int]]]:
         """Prompt-order manifest of data-backed items.
 
-        Each entry is ``{"modality": m, "index": i}`` where ``i`` indexes
-        ``multi_modal_data[m]``.
+        Each entry is `{"modality": <str>, "index": <int>}` where `index`
+        is the item's position in `multi_modal_data[modality]`. The union
+        value type reflects those two typed fields.
         """
         return list(self._item_order)
 
