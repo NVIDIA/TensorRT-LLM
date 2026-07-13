@@ -1,6 +1,8 @@
 #!/bin/bash
 set -euo pipefail
 
+job_tmpdir_root=""
+
 # Parse named arguments
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -17,12 +19,32 @@ while [[ $# -gt 0 ]]; do
         --build-wheel) build_wheel="$2"; shift 2 ;;
         --cuda-architectures) cuda_architectures="$2"; shift 2 ;;
         --trtllm-wheel-path) trtllm_wheel_path="$2"; shift 2 ;;
+        --job-tmpdir-root) job_tmpdir_root="$2"; shift 2 ;;
         *)
             echo "Unknown argument: $1"
             exit 1
             ;;
     esac
 done
+
+# cuFile/NIXL GDS discovers block-device topology through udev.  Make the
+# host database visible to every Pyxis/enroot step launched by this script.
+udev_mount="/run/udev:/run/udev"
+case ",${container_mount}," in
+    *",${udev_mount},"*) ;;
+    *) container_mount="${container_mount:+${container_mount},}${udev_mount}" ;;
+esac
+
+# Native editable-build artifacts embed /code/tensorrt_llm as their source and
+# JIT include root.  Preserve that build-time path inside every container while
+# retaining the normal /data mount used by configs and logs.
+if [ -n "${trtllm_repo}" ]; then
+    editable_repo_mount="${trtllm_repo}:/code/tensorrt_llm"
+    case ",${container_mount}," in
+        *",${editable_repo_mount},"*) ;;
+        *) container_mount="${container_mount:+${container_mount},}${editable_repo_mount}" ;;
+    esac
+fi
 
 # Print all parsed arguments
 echo "Parsed arguments:"
@@ -39,6 +61,15 @@ echo "  container_image: ${container_image}"
 echo "  build_wheel: ${build_wheel}"
 echo "  cuda_architectures: ${cuda_architectures}"
 echo "  trtllm_wheel_path: ${trtllm_wheel_path}"
+echo "  job_tmpdir_root: ${job_tmpdir_root}"
+
+if [ -n "${job_tmpdir_root}" ]; then
+    job_tmpdir="${job_tmpdir_root}/${SLURM_JOB_ID}"
+    mkdir -p "${job_tmpdir}"
+    chmod 700 "${job_tmpdir}"
+    export TMPDIR="${job_tmpdir}"
+    echo "Prepared job TMPDIR: ${TMPDIR}"
+fi
 
 # Set TRTLLM_DISAGG_BENCHMARK_GEN_ONLY=1 for gen_only_no_context mode
 if [ "${benchmark_mode}" = "gen_only_no_context" ]; then
@@ -144,12 +175,41 @@ all_nodes=($(scontrol show hostname $SLURM_NODELIST | sort))
 all_nodes_str=$(IFS=','; echo "${all_nodes[*]}")
 echo "all_nodes_str: ${all_nodes_str}"
 
+# Materialize per-job local-NVMe cache directories before the containers start.
+# batch_3 nodes do not have consistent permissions on /scratch itself, while
+# /scratch/pyxis/runtime is writable on every node.  Experiment configs can use
+# <jobid_placeholder> to keep cache files isolated between runs.
+for worker_config_file in "${full_logdir}/ctx_config.yaml" "${full_logdir}/gen_config.yaml"; do
+    [ -f "${worker_config_file}" ] || continue
+    sed -i "s|<jobid_placeholder>|${SLURM_JOB_ID}|g" "${worker_config_file}"
+done
+mapfile -t disk_cache_paths < <(
+    awk '/^[[:space:]]*disk_cache_path:/ {print $2}' \
+        "${full_logdir}/ctx_config.yaml" "${full_logdir}/gen_config.yaml" 2>/dev/null | sort -u
+)
+for disk_cache_path in "${disk_cache_paths[@]}"; do
+    [ -n "${disk_cache_path}" ] || continue
+    echo "Preparing local disk cache on all nodes: ${disk_cache_path}"
+    srun --overlap -N "${#all_nodes[@]}" --ntasks-per-node=1 \
+        mkdir -p "${disk_cache_path}"
+    srun --overlap -N "${#all_nodes[@]}" --ntasks-per-node=1 \
+        chmod 700 "${disk_cache_path}"
+done
+
 start_server_cmds_base_file=${full_logdir}/start_server_cmds_base.sh
 start_server_cmds_file=${full_logdir}/start_server_cmds.sh
 replace_placeholder "${start_server_cmds_base_file}" "${all_nodes_str}" "${start_server_cmds_file}"
 server_config_base_file=${full_logdir}/server_config_base.yaml
 server_config_file=${full_logdir}/server_config.yaml
 replace_placeholder "${server_config_base_file}" "${all_nodes_str}" "${server_config_file}"
+# A node's own hostname can resolve to 127.0.1.1 on batch_3.  Bind the router
+# to its routable address while leaving worker/client URLs as hostnames.
+router_hostname=$(awk '/^hostname:/ {print $2; exit}' "${server_config_file}")
+router_address=$(getent ahostsv4 "${router_hostname}" | awk '$1 !~ /^127\./ {print $1; exit}')
+if [ -n "${router_address}" ]; then
+    sed -i "s|^hostname:.*|hostname: ${router_address}|" "${server_config_file}"
+    echo "Router bind address: ${router_address} (${router_hostname})"
+fi
 client_cmds_base_file=${full_logdir}/client_cmds_base.sh
 client_cmds_file=${full_logdir}/client_cmds.sh
 replace_placeholder "${client_cmds_base_file}" "${all_nodes_str}" "${client_cmds_file}"

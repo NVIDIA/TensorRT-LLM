@@ -30,10 +30,25 @@ if [[ ${SLURM_PROCID} != "0" ]]; then
     exit 0
 fi
 
-# Always install/upgrade aiperf to ensure we have the version with trust_remote_code fix
-# (container may have an older version with parallel_decode.py that lacks trust_remote_code)
 echo "Installing aiperf..."
-pip install --force-reinstall --no-deps 'aiperf @ git+https://github.com/ai-dynamo/aiperf.git@ac3d91652e5e024bfb4ac38d48603423aad666bc'
+aiperf_repo=${AIPERF_REPO:-}
+if [[ -n "${aiperf_repo}" ]]; then
+    if [[ ! -d "${aiperf_repo}" ]]; then
+        echo "AIPerf repository does not exist: ${aiperf_repo}" >&2
+        exit 1
+    fi
+    echo "Installing AIPerf from workspace: ${aiperf_repo}"
+    git -C "${aiperf_repo}" log -1 --oneline
+    pip install --force-reinstall --no-deps "${aiperf_repo}"
+else
+    pip install --force-reinstall --no-deps 'aiperf @ git+https://github.com/ai-dynamo/aiperf.git@ac3d91652e5e024bfb4ac38d48603423aad666bc'
+fi
+if [[ -n "${AIPERF_DATASETS_VERSION:-}" ]]; then
+    echo "Installing Hugging Face datasets ${AIPERF_DATASETS_VERSION}..."
+    pip install --force-reinstall --no-deps "datasets==${AIPERF_DATASETS_VERSION}"
+fi
+python -c 'import datasets; print(f"Hugging Face datasets: {datasets.__version__}")'
+
 
 # warmup requests for ucx connections
 if [ "${ucx_warmup_requests}" -gt 0 ]; then
@@ -59,6 +74,12 @@ export HF_HUB_TRUST_REMOTE_CODE=1
 echo "Hostname: ${hostname}, Port: ${port}"
 echo "Starting aiperf benchmark..."
 
+if [[ -n "${AIPERF_RUNTIME_TMPDIR:-}" ]]; then
+    mkdir -p "${AIPERF_RUNTIME_TMPDIR}"
+    export TMPDIR="${AIPERF_RUNTIME_TMPDIR}"
+    echo "AIPerf runtime TMPDIR: ${TMPDIR}"
+fi
+
 concurrency_list=$(echo "${concurrency_list}" | tr ',' ' ')
 for concurrency in ${concurrency_list}; do
     concurrency=$((concurrency))
@@ -66,28 +87,67 @@ for concurrency in ${concurrency_list}; do
     # benchmark_duration: 20min per round
     benchmark_duration=$((multi_round * 1200))
     echo "Benchmarking with concurrency ${concurrency} ... ${request_count} requests, duration ${benchmark_duration}s"
-    mkdir -p ${log_path}/concurrency_${concurrency}
+    mkdir -p "${log_path}/concurrency_${concurrency}"
+
+    dataset_args=()
+    stop_args=(
+        --benchmark-duration "${benchmark_duration}"
+        --benchmark-grace-period "${AIPERF_BENCHMARK_GRACE_PERIOD:-60}"
+    )
+    if [[ -n "${AIPERF_PUBLIC_DATASET:-}" ]]; then
+        dataset_args+=(--public-dataset "${AIPERF_PUBLIC_DATASET}")
+        if [[ "${AIPERF_PUBLIC_DATASET}" == "weka_hf" ]]; then
+            if [[ -z "${AIPERF_HF_WEKA_REPO:-}" ]]; then
+                echo "AIPERF_HF_WEKA_REPO is required for weka_hf" >&2
+                exit 1
+            fi
+            dataset_args+=(--hf-weka-repo "${AIPERF_HF_WEKA_REPO}")
+        fi
+        if [[ -n "${AIPERF_NUM_DATASET_ENTRIES:-}" ]]; then
+            dataset_args+=(--num-dataset-entries "${AIPERF_NUM_DATASET_ENTRIES}")
+        fi
+        if [[ -n "${AIPERF_EXCLUDE_TRACE_IDS:-}" ]]; then
+            dataset_args+=(--exclude-trace-id "${AIPERF_EXCLUDE_TRACE_IDS}")
+        fi
+        if [[ -n "${AIPERF_MAX_CONTEXT_LENGTH:-}" ]]; then
+            dataset_args+=(--max-context-length "${AIPERF_MAX_CONTEXT_LENGTH}")
+        fi
+        if [[ "${AIPERF_NO_FIXED_SCHEDULE:-0}" == "1" ]]; then
+            dataset_args+=(--no-fixed-schedule)
+        fi
+        if [[ "${AIPERF_IGNORE_TRACE_DELAYS:-0}" == "1" ]]; then
+            dataset_args+=(--ignore-trace-delays)
+        fi
+    else
+        dataset_args+=(--input-file "${dataset_file}" --custom-dataset-type mooncake_trace)
+        stop_args+=(--request-count "${request_count}")
+    fi
 
     aiperf profile \
-        -m ${model_name} \
-        --tokenizer ${model_name} \
+        -m "${model_name}" \
+        --tokenizer "${model_name}" \
         --tokenizer-trust-remote-code \
-        --url http://${hostname}:${port} \
+        --url "http://${hostname}:${port}" \
+        --endpoint-type chat \
         --streaming \
         --ui simple \
-        --input-file ${dataset_file} \
-        --artifact-dir ${log_path}/concurrency_${concurrency} \
-        --concurrency ${concurrency} \
+        "${dataset_args[@]}" \
+        --artifact-dir "${log_path}/concurrency_${concurrency}" \
+        --concurrency "${concurrency}" \
         --concurrency-ramp-duration 60 \
-        --custom-dataset-type mooncake_trace \
-        --benchmark-duration ${benchmark_duration} \
-        --benchmark-grace-period 60 \
+        "${stop_args[@]}" \
         --workers-max 200 \
         --request-timeout-seconds 1200 \
         --profile-export-level records \
         --extra-inputs ignore_eos:true \
-        --request-count ${request_count} \
         --record-processors 8
+
+    if ! find "${log_path}/concurrency_${concurrency}" -type f \
+        -name profile_export_aiperf.json -size +0c -print -quit | grep -q .; then
+        echo "AIPerf did not produce profile_export_aiperf.json" >&2
+        exit 1
+    fi
+
 
     echo "Benchmark with concurrency ${concurrency} done"
 done

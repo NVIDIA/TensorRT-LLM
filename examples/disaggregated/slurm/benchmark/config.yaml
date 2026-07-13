@@ -12,6 +12,8 @@ slurm:
 # Benchmark Mode
 benchmark:
   mode: "e2e"  # Options: e2e, gen_only, gen_only_no_context
+  use_evalscope: false  # Use EvalScope's SWE-smith multi-turn client
+  use_aiperf: false  # Use the AIPerf client
   use_nv_sa_benchmark: false  # Whether to use NVIDIA SA benchmark script
   multi_round: 8  # Number of benchmark rounds
   benchmark_ratio: 0.8  # Benchmark ratio

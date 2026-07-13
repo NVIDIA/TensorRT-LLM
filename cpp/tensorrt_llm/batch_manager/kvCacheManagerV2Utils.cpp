@@ -58,7 +58,7 @@ public:
         try
         {
             CUdevice device = 0;
-            CUresult const result = prepare(tasks.size(), numBytes, stream, device);
+            CUresult const result = prepare(tasks.size(), numBytes, stream, device, true);
             if (result != CUDA_SUCCESS || tasks.empty())
             {
                 return result;
@@ -91,7 +91,7 @@ public:
         try
         {
             CUdevice device = 0;
-            CUresult const result = prepare(tasks.size(), numBytes, stream, device);
+            CUresult const result = prepare(tasks.size(), numBytes, stream, device, false);
             if (result != CUDA_SUCCESS || tasks.empty())
             {
                 return result;
@@ -124,7 +124,8 @@ public:
     }
 
 private:
-    CUresult prepare(size_t numTasks, ssize_t numBytes, CUstream stream, CUdevice& device) noexcept
+    CUresult prepare(
+        size_t numTasks, ssize_t numBytes, CUstream stream, CUdevice& device, bool isOffload) noexcept
     {
         if (numTasks == 0)
         {
@@ -136,10 +137,13 @@ private:
             return CUDA_ERROR_INVALID_VALUE;
         }
 
-        CUresult const syncResult = cuStreamSynchronize(stream);
-        if (syncResult != CUDA_SUCCESS)
+        if (isOffload)
         {
-            return syncResult;
+            CUresult const syncResult = cuStreamSynchronize(stream);
+            if (syncResult != CUDA_SUCCESS)
+            {
+                return syncResult;
+            }
         }
         return cuCtxGetDevice(&device);
     }
