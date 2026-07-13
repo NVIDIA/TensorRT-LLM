@@ -26,6 +26,7 @@ import builtins
 import random
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
@@ -53,7 +54,10 @@ from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.bindings.internal.batch_manager import CacheType as CacheTypeCpp
 from tensorrt_llm.deep_gemm import fp8_paged_mqa_logits
 from tensorrt_llm.functional import PositionEmbeddingType
-from tensorrt_llm.llmapi.llm_args import DeepSeekSparseAttentionConfig
+from tensorrt_llm.llmapi.llm_args import (
+    DeepSeekSparseAttentionConfig,
+    DeepSeekV4SparseAttentionConfig,
+)
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.quantization.utils import fp8_utils
 
@@ -64,6 +68,35 @@ def has_deep_gemm():
         return deep_gemm is not None
     except Exception:
         return False
+
+
+def test_metadata_cache_geometry_comes_from_sparse_metadata_params():
+    sparse_config = DeepSeekV4SparseAttentionConfig(
+        compress_ratios=[1, 4, 128],
+        index_head_dim=96,
+        indexer_k_dtype="fp8",
+    )
+    sparse_metadata_params = sparse_config.to_sparse_metadata_params()
+    metadata = object.__new__(DSAtrtllmAttentionMetadata)
+    metadata.sparse_metadata_params = sparse_metadata_params
+    metadata.kv_cache_manager = SimpleNamespace(
+        tokens_per_block=256,
+        compressed_block_sizes={},
+        get_cache_indices=Mock(),
+    )
+    metadata.is_cuda_graph = False
+    metadata.create_buffers_for_mla_rope_append = Mock()
+    metadata.create_buffers_for_indexer = Mock()
+
+    with patch(
+        "tensorrt_llm._torch.attention_backend.sparse.dsa.TrtllmAttentionMetadata.__post_init__"
+    ):
+        DSAtrtllmAttentionMetadata.__post_init__(metadata)
+
+    assert metadata.indexer_head_dim == 96
+    assert metadata.compress_ratios == [1, 4, 128]
+    assert metadata._indexer_compress_ratio == 4
+    assert metadata._tokens_per_block == 64
 
 
 def test_indexer_post_load_weights_caches_fused_weight():

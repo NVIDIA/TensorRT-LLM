@@ -17,7 +17,8 @@ from tensorrt_llm._utils import get_sm_version, global_mpi_rank
 from tensorrt_llm.llmapi.llm_args import (CapacitySchedulerPolicy,
                                           ContextChunkingPolicy,
                                           ExecutorMemoryType,
-                                          GuidedDecodingConfig, LoadFormat,
+                                          GuidedDecodingConfig, KvCacheConfig,
+                                          LoadFormat, SpeculativeConfig,
                                           TorchLlmArgs)
 from tensorrt_llm.llmapi.tokenizer import (TokenizerBase,
                                            _llguidance_tokenizer_info,
@@ -204,6 +205,31 @@ def update_sampler_max_seq_len(max_seq_len, sampler):
     if isinstance(sampler, TRTLLMSampler):
         assert hasattr(sampler, "max_seq_len")
         sampler.max_seq_len = max_seq_len
+
+
+def _extend_full_attention_windows_for_spec_decode(
+    kv_cache_config: KvCacheConfig,
+    spec_config: Optional[SpeculativeConfig],
+    net_max_seq_len: int,
+    model_engine_max_seq_len: int,
+) -> None:
+    max_attention_window = kv_cache_config.max_attention_window
+    if spec_config is None or max_attention_window is None:
+        return
+    if model_engine_max_seq_len <= net_max_seq_len:
+        return
+
+    adjusted_max_attention_window = [
+        model_engine_max_seq_len if window >= net_max_seq_len else window
+        for window in max_attention_window
+    ]
+    if adjusted_max_attention_window == max_attention_window:
+        return
+
+    logger.info("Extending full-attention max_attention_window entries for "
+                f"speculative decoding from {max_attention_window} to "
+                f"{adjusted_max_attention_window}.")
+    kv_cache_config.max_attention_window = adjusted_max_attention_window
 
 
 def get_guided_decoding_config(guided_decoding_backend: str,
@@ -623,6 +649,13 @@ def create_py_executor(
         model_engine_max_seq_len += get_num_extra_kv_tokens(spec_config)
         model_engine_max_seq_len += spec_config.tokens_per_gen_step - 1
 
+    _extend_full_attention_windows_for_spec_decode(
+        kv_cache_config=kv_cache_config,
+        spec_config=spec_config,
+        net_max_seq_len=net_max_seq_len,
+        model_engine_max_seq_len=model_engine_max_seq_len,
+    )
+
     if has_draft_model_engine and not llm_args.disable_overlap_scheduler:
         logger.warning(
             "Overlap scheduler is enabled for two-model speculative decoding. Rejection sampling will fallback to greedy sampling."
@@ -763,7 +796,6 @@ def create_py_executor(
             speculative_config=spec_config,
             decoding_config=decoding_config,
             kv_cache_config=kv_cache_config,
-            disable_flashinfer_sampling=llm_args.disable_flashinfer_sampling,
         )
         logger.info(f"Using Sampler: {type(sampler).__name__}")
 
@@ -849,17 +881,15 @@ def create_py_executor(
             # NOTE: TRTLLM_USE_PY_MAMBA is an agg-mode-only override and has
             # no effect in disagg. The disagg manager choice is driven solely
             # by transceiver_runtime: PYTHON => PythonMambaCacheManager,
-            # otherwise CppMambaCacheManager. Clear the var here so the
-            # mutual-exclusion check in use_cpp_mamba_cache_manager() does
-            # not fire after we force TRTLLM_USE_CPP_MAMBA=1 below.
-            if os.environ.pop("TRTLLM_USE_PY_MAMBA", "0") == "1":
+            # otherwise CppMambaHybridCacheManager (unified pool, default).
+            if os.environ.get("TRTLLM_USE_PY_MAMBA", "0") == "1":
                 logger.warning(
                     "TRTLLM_USE_PY_MAMBA is ignored in disaggregated serving; "
                     "use cache_transceiver_config.transceiver_runtime='PYTHON' "
                     "to select PythonMambaCacheManager.")
             else:
                 logger.info("Disaggregated serving with hybrid model detected. "
-                            "Enabling CppMambaHybridCacheManager.")
+                            "Using CppMambaHybridCacheManager.")
 
         # Get draft config for one-engine speculative decoding if available
         draft_config = getattr(model_engine.model, 'draft_config', None)

@@ -88,7 +88,8 @@ void tb::CacheTransceiverBindings::initBindings(nb::module_& m)
 {
     nb::class_<tb::BaseCacheTransceiver, PyCacheTransceiver>(m, "BaseCacheTransceiver")
         .def("respond_and_send_async", &BaseCacheTransceiver::respondAndSendAsync)
-        .def("request_and_receive_sync", &BaseCacheTransceiver::requestAndReceiveSync)
+        .def("request_and_receive_sync", &BaseCacheTransceiver::requestAndReceiveSync,
+            nb::call_guard<nb::gil_scoped_release>())
         .def("request_and_receive_async", &BaseCacheTransceiver::requestAndReceiveAsync)
         .def(
             "check_context_transfer_status",
@@ -120,11 +121,11 @@ void tb::CacheTransceiverBindings::initBindings(nb::module_& m)
         .def(nb::init<tb::kv_cache_manager::BaseKVCacheManager*, std::vector<SizeType32>, SizeType32, SizeType32,
                  runtime::WorldConfig, std::vector<SizeType32>, nvinfer1::DataType,
                  executor::kv_cache::CacheState::AttentionType, std::optional<executor::CacheTransceiverConfig>,
-                 tb::rnn_state_manager::RnnStateManager*, std::vector<SizeType32>>(),
+                 std::vector<SizeType32>>(),
             nb::arg("cache_manager"), nb::arg("num_kv_heads_per_layer"), nb::arg("size_per_head"),
             nb::arg("tokens_per_block"), nb::arg("world_config"), nb::arg("attention_layer_num_per_pp"),
             nb::arg("dtype"), nb::arg("attention_type"), nb::arg("cache_transceiver_config") = std::nullopt,
-            nb::arg("rnn_state_manager") = nullptr, nb::arg("rnn_layer_num_per_pp") = std::vector<SizeType32>{});
+            nb::arg("rnn_layer_num_per_pp") = std::vector<SizeType32>{});
 
     nb::class_<tb::CacheTransceiverComm>(m, "CacheTransceiverComm")
         .def(

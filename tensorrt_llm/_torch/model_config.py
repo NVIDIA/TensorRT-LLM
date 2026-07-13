@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import contextlib
 import errno
 import json
@@ -49,32 +64,6 @@ _MINIMAX_M3_ARCHITECTURES = {
     "MiniMaxM3SparseForCausalLM",
     "MiniMaxM3SparseForConditionalGeneration",
 }
-
-
-def _unified_kv_pool_includes_mamba(
-        is_disagg: bool, spec_config: Optional['SpeculativeConfig']) -> bool:
-    """Whether the KV cache pool will include mamba layers for a hybrid model.
-
-    True for the default Python ``MambaHybridCacheManager`` route, where
-    mamba state is allocated alongside attention KV inside one pool (with
-    zero KV heads on mamba layers). False for the V1-route managers used
-    when:
-
-      * disaggregated serving forces the C++ mamba manager
-        (``TRTLLM_USE_CPP_MAMBA=1`` enables the same path locally), or
-      * ``TRTLLM_USE_PY_MAMBA=1`` forces the Python mamba manager locally
-        (agg-mode override), or
-      * one-model speculative decoding splits mamba and attention into
-        separate caches.
-
-    Single source of truth for the binding-side layer-counting decision; do
-    not duplicate the predicate at call sites.
-    """
-    use_split_pool = is_disagg \
-        or os.environ.get('TRTLLM_USE_CPP_MAMBA', '0') == '1' \
-        or os.environ.get('TRTLLM_USE_PY_MAMBA', '0') == '1'
-    use_spec = spec_config is not None
-    return not (use_split_pool or use_spec)
 
 
 @contextlib.contextmanager
@@ -313,7 +302,8 @@ class ModelConfig(Generic[TConfig]):
             return False
         return model_architectures[0] not in [
             "BertForSequenceClassification", "Qwen2ForProcessRewardModel",
-            "Qwen2ForRewardModel", "LlamaForTextEmbedding"
+            "Qwen2ForRewardModel", "LlamaForTextEmbedding",
+            "Qwen3ForTextEmbedding"
         ]
         # TODO: should be 'not model_type == ModelType.ENCODER_ONLY'
         # once ModelType is used in pytorch flow.
@@ -429,6 +419,7 @@ class ModelConfig(Generic[TConfig]):
                 'group_size', quant_config.group_size)
             quant_config.exclude_modules = json_quant_configs.get(
                 'exclude_modules', quant_config.exclude_modules)
+
             for layer in mixed_quant_configs:
                 layer_cfg = mixed_quant_configs[layer]
                 config = QuantConfig()

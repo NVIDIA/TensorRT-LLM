@@ -1,4 +1,5 @@
 import gc
+import multiprocessing
 import sys
 import time
 import uuid
@@ -32,10 +33,14 @@ DEFAULT_KV_TRANSFER_TIMEOUT_S = (
 KV_TRANSFER_COMPLETION_MARGIN_S = 10.0
 
 
-def create_kv_cache_manager(mapping, dtype):
+def create_kv_cache_manager(mapping,
+                            dtype,
+                            max_tokens=256,
+                            max_seq_len=256,
+                            max_batch_size=1):
     return KVCacheManager(
         trtllm.KvCacheConfig(
-            max_tokens=256,
+            max_tokens=max_tokens,
             enable_block_reuse=False,
         ),
         tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
@@ -43,8 +48,8 @@ def create_kv_cache_manager(mapping, dtype):
         num_kv_heads=1,
         head_dim=1,
         tokens_per_block=8,
-        max_seq_len=256,
-        max_batch_size=1,
+        max_seq_len=max_seq_len,
+        max_batch_size=max_batch_size,
         mapping=mapping,
         dtype=dtype)
 
@@ -222,6 +227,121 @@ def test_kv_cache_transceiver_single_process(ctx_gen_kv_cache_dtype,
     finally:
         shutdown_transceivers(kv_cache_transceiver_gen,
                               kv_cache_transceiver_ctx)
+
+
+def _run_cpp_nixl_sync_transfer_stress():
+    """Exercise repeated empty-to-nonempty sender transitions in a child."""
+    request_count = 64
+    prompt_len = 16
+    mapping = Mapping(world_size=1, rank=0)
+    dist = Distributed.get(mapping)
+    manager_kwargs = {
+        "max_tokens": request_count * prompt_len * 2,
+        "max_seq_len": prompt_len,
+        "max_batch_size": request_count,
+    }
+    kv_cache_manager_ctx = create_kv_cache_manager(mapping, DataType.HALF,
+                                                   **manager_kwargs)
+    kv_cache_manager_gen = create_kv_cache_manager(mapping, DataType.HALF,
+                                                   **manager_kwargs)
+    cache_transceiver_config = CacheTransceiverConfig(backend="NIXL",
+                                                      transceiver_runtime="CPP",
+                                                      max_tokens_in_buffer=512)
+    transceiver_ctx = create_kv_cache_transceiver(mapping, dist,
+                                                  kv_cache_manager_ctx,
+                                                  AttentionTypeCpp.DEFAULT,
+                                                  cache_transceiver_config)
+    transceiver_gen = create_kv_cache_transceiver(mapping, dist,
+                                                  kv_cache_manager_gen,
+                                                  AttentionTypeCpp.DEFAULT,
+                                                  cache_transceiver_config)
+
+    try:
+        sampling_config = tensorrt_llm.bindings.SamplingConfig(
+            SamplingParams()._get_sampling_config())
+        ctx_requests = [
+            LlmRequest(
+                request_id=request_id,
+                max_new_tokens=1,
+                input_tokens=list(range(prompt_len)),
+                sampling_config=sampling_config,
+                is_streaming=False,
+                llm_request_type=LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY)
+            for request_id in range(request_count)
+        ]
+        kv_cache_manager_ctx.impl.add_sequence_batch(
+            [(request.py_request_id, request.prompt_len, 1)
+             for request in ctx_requests], ctx_requests)
+        fill_kv_cache_buffer(kv_cache_manager_ctx)
+
+        transceiver_ctx.respond_and_send_async(ctx_requests[0])
+        completed_ctx_ids = set()
+
+        def poll_context_transfers():
+            completed, failed = transceiver_ctx.check_context_transfer_status(1)
+            assert failed == []
+            completed_ctx_ids.update(completed)
+
+        for request_index, ctx_request in enumerate(ctx_requests):
+            gen_request = LlmRequest(
+                request_id=request_index,
+                max_new_tokens=1,
+                input_tokens=list(range(prompt_len)),
+                sampling_config=sampling_config,
+                is_streaming=False,
+                llm_request_type=LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY,
+                context_phase_params=ctx_request.context_phase_params)
+            kv_cache_manager_gen.impl.add_sequence_batch(
+                [(gen_request.py_request_id, gen_request.prompt_len, 1)],
+                [gen_request])
+
+            transceiver_gen.request_and_receive_sync(gen_request)
+
+            # Queue the next response immediately so its insertion can overlap
+            # the previous response's sender-side cleanup.
+            if request_index + 1 < request_count:
+                transceiver_ctx.respond_and_send_async(
+                    ctx_requests[request_index + 1])
+
+            assert (gen_request.state ==
+                    LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE)
+
+            ctx_block_ids = kv_cache_manager_ctx.get_cache_indices(ctx_request)
+            gen_block_ids = kv_cache_manager_gen.get_cache_indices(gen_request)
+            assert torch.equal(
+                kv_cache_manager_ctx.get_unique_primary_pool()[ctx_block_ids],
+                kv_cache_manager_gen.get_unique_primary_pool()[gen_block_ids],
+            ), f"different KV-cache values for request {request_index}"
+
+            expected_ctx_id = ctx_request.py_request_id
+            wait_for_transfer_completion(poll_context_transfers,
+                                         lambda request_id=expected_ctx_id:
+                                         request_id in completed_ctx_ids)
+    finally:
+        shutdown_transceivers(transceiver_gen, transceiver_ctx)
+
+
+@pytest.mark.timeout(150)
+def test_cpp_nixl_sync_transfer_stress():
+    """C++ NIXL sync transfers must not lose sender wakeups between requests."""
+    process = multiprocessing.get_context("spawn").Process(
+        target=_run_cpp_nixl_sync_transfer_stress,
+        name="cpp-nixl-sync-transfer-stress")
+    process.start()
+    process.join(timeout=120)
+    try:
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=5)
+            if process.is_alive():
+                process.kill()
+                process.join(timeout=5)
+            pytest.fail("C++ NIXL synchronous KV transfer stress test hung")
+        assert process.exitcode == 0, (
+            f"C++ NIXL synchronous KV transfer child exited with "
+            f"code {process.exitcode}")
+    finally:
+        process.close()
 
 
 @pytest.mark.timeout(120)
@@ -717,9 +837,7 @@ def hybrid_dtypes(request):
     ],
     indirect=["hybrid_dtypes"],
 )
-def test_hybrid_cache_transceiver_single_process(backend, hybrid_dtypes,
-                                                 monkeypatch):
-    monkeypatch.setenv("TRTLLM_USE_CPP_MAMBA", "1")
+def test_hybrid_cache_transceiver_single_process(backend, hybrid_dtypes):
     mapping = Mapping(world_size=1, rank=0)
     kv_dtype, mamba_conv_dtype, mamba_ssm_dtype = hybrid_dtypes
 
@@ -831,8 +949,7 @@ def test_hybrid_cache_transceiver_single_process(backend, hybrid_dtypes,
 
 @pytest.mark.timeout(120)
 @pytest.mark.parametrize("backend", ["NIXL", "UCX"], ids=["NIXL", "UCX"])
-def test_hybrid_cache_transceiver_cancel_request(backend, monkeypatch):
-    monkeypatch.setenv("TRTLLM_USE_CPP_MAMBA", "1")
+def test_hybrid_cache_transceiver_cancel_request(backend):
 
     mapping = Mapping(world_size=1, rank=0)
     dtype = DataType.HALF

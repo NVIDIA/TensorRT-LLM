@@ -20,7 +20,6 @@ from tensorrt_llm._torch.modules.fla.fused_sigmoid_gating_recurrent import (
     _flashinfer_gdn_verify,
     fused_sigmoid_gating_delta_rule_update,
 )
-from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import use_cpp_mamba_cache_manager
 from tensorrt_llm._utils import is_flashinfer_gdn_supported_arch
 from tensorrt_llm.mapping import Mapping
 
@@ -1107,14 +1106,9 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         batch_split_size = [num_prefills, num_decodes]
         has_initial_states = mamba_metadata.has_initial_states
         state_indices = mamba_metadata.state_indices[: num_prefills + num_decodes]
-        if use_cpp_mamba_cache_manager():
-            conv_states = attn_metadata.kv_cache_manager.get_conv_states(self.layer_idx)
-            ssm_states = attn_metadata.kv_cache_manager.get_ssm_states(self.layer_idx)
-            layer_cache = None
-        else:
-            layer_cache = attn_metadata.kv_cache_manager.mamba_layer_cache(self.layer_idx)
-            conv_states = layer_cache.conv
-            ssm_states = layer_cache.temporal
+        layer_cache = attn_metadata.kv_cache_manager.mamba_layer_cache(self.layer_idx)
+        conv_states = layer_cache.conv
+        ssm_states = layer_cache.temporal
 
         state_indices_p, state_indices_d = torch.split(state_indices, batch_split_size)
         if num_prefills > 0:
