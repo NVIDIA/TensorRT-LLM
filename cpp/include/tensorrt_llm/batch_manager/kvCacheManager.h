@@ -1252,6 +1252,11 @@ public:
     //! reference. This is the one canonical pinning primitive — all pin paths (storeBlocks,
     //! findBlocksInReuseTreeByBlockKey, pinBlocks) must go through it so a pinned block can
     //! neither be evicted nor handed out by the eviction policy while the pin is held.
+    //!
+    //! Thread safety: pin/unpin may be called from cache-transceiver threads (arbitrary
+    //! reuse-tree transfers), concurrently with the executor loop. All block bookkeeping —
+    //! eviction-policy free queues and refcount 0<->1 transitions — is serialized by the
+    //! lookup-tree mutex, which every mutating WindowBlockManager entry point acquires.
     void pinBlock(BlockPtr const& block);
 
     //! \brief Inverse of pinBlock: drop one reference and release the block back to the

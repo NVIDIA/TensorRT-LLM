@@ -936,6 +936,7 @@ bool BlockManager::verifyQueueIntegrity(SizeType32 windowSize) const
 
 bool WindowBlockManager::verifyQueueIntegrity() const
 {
+    std::lock_guard<std::recursive_mutex> lock(mLookupTree->getMutex());
     return mEvictionPolicy->verifyQueueIntegrity();
 }
 
@@ -1218,6 +1219,7 @@ void BlockManager::startScheduling()
 
 void WindowBlockManager::startScheduling()
 {
+    std::lock_guard<std::recursive_mutex> lock(mLookupTree->getMutex());
     mSchedulingNumFreeBlocks = mEvictionPolicy->getNumFreeBlocks(kPrimaryLevel);
     for (auto& [requestId, slotAllocatedBlocks] : mAllocatedBlocksPerSeq)
     {
@@ -1237,6 +1239,7 @@ void WindowBlockManager::freeLeafBlock(BlockPtr const& block)
 
 void WindowBlockManager::releaseSubtree(BlockPtr const& block)
 {
+    std::lock_guard<std::recursive_mutex> lock(mLookupTree->getMutex());
     // Iterative pre-order DFS over `block` and all its descendants.  Collect
     // first, then detach in reverse order: cascade-prune in freeLeafBlock()
     // removes empty parent nodes from the trie, so leaves must be detached
@@ -1274,6 +1277,7 @@ BlockPtr WindowBlockManager::getFreeBlock(GenerationRequest& sequence, executor:
     std::optional<std::chrono::milliseconds> durationMs, executor::KvCacheTransferMode mode,
     std::string const& directory, bool wantPlaceholder)
 {
+    std::lock_guard<std::recursive_mutex> lock(mLookupTree->getMutex());
     // eviction policy get free primary block
     auto [block, canOffload] = mEvictionPolicy->getFreeBlock(kPrimaryLevel, wantPlaceholder);
     if (block->getUniqueTokens().empty())
@@ -1397,6 +1401,7 @@ void BlockManager::onboardBlock(GenerationRequest& sequence, BlockPtr const& off
 void WindowBlockManager::onboardBlock(GenerationRequest& sequence, BlockPtr const& offloadBlock,
     executor::KvCacheTransferMode mode, std::string const& directory)
 {
+    std::lock_guard<std::recursive_mutex> lock(mLookupTree->getMutex());
     if (!offloadBlock->isPlaceholder() && !offloadBlock->isPrimary())
     {
         auto block = getFreeBlock(
@@ -1425,6 +1430,7 @@ void BlockManager::offloadBlock(
 void WindowBlockManager::offloadBlock(
     BlockPtr const& block, executor::KvCacheTransferMode mode, std::string const& directory)
 {
+    std::lock_guard<std::recursive_mutex> lock(mLookupTree->getMutex());
     // The current default behavior is to offload the out-of-window block
     // to secondary block pool to allow more free primary blocks for reuse.
     // However, such behavior does not take account whether the offloaded
@@ -2233,6 +2239,7 @@ void BlockManager::refreshBlocks()
 
 void WindowBlockManager::refreshBlocks()
 {
+    std::lock_guard<std::recursive_mutex> lock(mLookupTree->getMutex());
     mEvictionPolicy->refresh();
     mTransferManager->syncTransfers();
 }
@@ -2363,6 +2370,7 @@ bool BlockManager::copyLinearAttentionBlock(GenerationRequest& sequence, LlmRequ
 
 bool WindowBlockManager::tryAllocatePlaceholderForLinearAttention(GenerationRequest& sequence, bool shareAmongBeams)
 {
+    std::lock_guard<std::recursive_mutex> lock(mLookupTree->getMutex());
     auto const beamWidth = sequence.getBeamWidth();
     auto const newBlockIdx = sequence.getCacheBlockIds(mWindowSize).at(0).size();
     // The first block is not a placeholder.
@@ -2452,6 +2460,7 @@ bool WindowBlockManager::tryAllocatePlaceholderForLinearAttention(GenerationRequ
 
 void WindowBlockManager::allocateBlock(GenerationRequest& sequence, bool shareAmongBeams)
 {
+    std::lock_guard<std::recursive_mutex> lock(mLookupTree->getMutex());
     auto const beamWidth = sequence.getBeamWidth();
     auto const requiredBlocks = shareAmongBeams ? 1 : beamWidth;
 
@@ -2768,6 +2777,7 @@ void BlockManager::replaceSharedBlock(GenerationRequest& sequence, SizeType32 wi
 
 void WindowBlockManager::replaceSharedBlock(GenerationRequest& sequence, SizeType32 blockIdx)
 {
+    std::lock_guard<std::recursive_mutex> lock(mLookupTree->getMutex());
     auto const requestId = sequence.getRequestId();
     auto const beamWidth = sequence.getBeamWidth();
     auto& allocatedBlocks = mAllocatedBlocksPerSeq.at(requestId);
@@ -2819,6 +2829,7 @@ void BlockManager::releaseLastBlock(GenerationRequest& sequence, SizeType32 wind
 
 void WindowBlockManager::releaseLastBlock(GenerationRequest& sequence)
 {
+    std::lock_guard<std::recursive_mutex> lock(mLookupTree->getMutex());
     if (isRecurrentState())
     {
         // In recurrent state, the last block always contains the current state and should not be released.
@@ -2867,6 +2878,7 @@ void WindowBlockManager::releaseLastBlock(GenerationRequest& sequence)
 
 [[nodiscard]] SizeType32 WindowBlockManager::getNumFreeBlocks() const
 {
+    std::lock_guard<std::recursive_mutex> lock(mLookupTree->getMutex());
     auto const numFree = mEvictionPolicy->getNumFreeBlocks(kPrimaryLevel);
     TLLM_CHECK_WITH_INFO(numFree <= getMaxNumBlocks(),
         "%s::getNumFreeBlocks - primary free block count (%d) exceeds total block count (%d). "
@@ -2878,6 +2890,7 @@ void WindowBlockManager::releaseLastBlock(GenerationRequest& sequence)
 
 [[nodiscard]] SizeType32 WindowBlockManager::getNumFreeSecondaryBlocks() const noexcept
 {
+    std::lock_guard<std::recursive_mutex> lock(mLookupTree->getMutex());
     return mEvictionPolicy->getNumFreeBlocks(kSecondaryLevel);
 }
 
@@ -3010,6 +3023,7 @@ void BlockManager::unpinBlocksById(std::vector<KVCacheBlock::IdType> const& bloc
 
 void WindowBlockManager::pinBlock(BlockPtr const& block)
 {
+    std::lock_guard<std::recursive_mutex> lock(mLookupTree->getMutex());
     // If the block has no refs it sits in the eviction policy's free queue.
     // Claim it first so it cannot be handed out while pinned and so the later
     // unpin/release cycle does not create a duplicate queue entry. Pass the
@@ -3024,6 +3038,7 @@ void WindowBlockManager::pinBlock(BlockPtr const& block)
 
 void WindowBlockManager::unpinBlock(BlockPtr const& block)
 {
+    std::lock_guard<std::recursive_mutex> lock(mLookupTree->getMutex());
     block->decRefCount();
     if (!block->hasRefs())
     {
@@ -3033,6 +3048,7 @@ void WindowBlockManager::unpinBlock(BlockPtr const& block)
 
 void WindowBlockManager::pinBlocks(GenerationRequest& sequence)
 {
+    std::lock_guard<std::recursive_mutex> lock(mLookupTree->getMutex());
     auto const requestId = sequence.getRequestId();
     auto& allocatedBlocks = mAllocatedBlocksPerSeq.at(requestId);
     for (auto& block : allocatedBlocks)
@@ -3043,6 +3059,7 @@ void WindowBlockManager::pinBlocks(GenerationRequest& sequence)
 
 void WindowBlockManager::unpinBlocksById(std::vector<KVCacheBlock::IdType> const& blockIds)
 {
+    std::lock_guard<std::recursive_mutex> lock(mLookupTree->getMutex());
     if (blockIds.empty())
     {
         return;
@@ -3071,6 +3088,7 @@ void BlockManager::storeNewBlock(GenerationRequest& sequence, OptionalRef<LlmReq
 
 void WindowBlockManager::storeNewBlock(GenerationRequest& sequence, OptionalRef<LlmRequest const> llmRequest)
 {
+    std::lock_guard<std::recursive_mutex> lock(mLookupTree->getMutex());
     auto constexpr beamIdx = 0;
     auto const& uniqueTokens = llmRequest->getUniqueTokens(beamIdx);
 
@@ -3177,6 +3195,7 @@ std::vector<KVCacheBlock::IdType> WindowBlockManager::storeBlocksForReuse(
 std::optional<KVCacheBlock::IdType> WindowBlockManager::releaseBlocks(
     GenerationRequest& sequence, OptionalRef<LlmRequest const> llmRequest)
 {
+    std::lock_guard<std::recursive_mutex> lock(mLookupTree->getMutex());
     auto const requestId = sequence.getRequestId();
     TLLM_LOG_DEBUG("%s::releaseBlocks - requestId=%lu, llmRequest.id=%s", mLogPrefix.c_str(), requestId,
         llmRequest.has_value() ? std::to_string(llmRequest->mRequestId).c_str() : "null");
@@ -3756,6 +3775,7 @@ bool KVCacheManager::copyLinearAttentionBlockBatch(std::vector<std::shared_ptr<L
 
 void WindowBlockManager::detachFrontBlock(GenerationRequest& sequence)
 {
+    std::lock_guard<std::recursive_mutex> lock(mLookupTree->getMutex());
     // streamLLM is not supported at the moment. The out of window block will
     // always be the 0th block.
     TLLM_CHECK_WITH_INFO(
