@@ -42,9 +42,9 @@ struct BounceChunk
     // on the ACK critical path) by orders of magnitude. The per-desc arrays above stay as-is for the
     // gather (src layout is independent of dst).
     std::vector<BounceScatterRun> scatterRuns;
-    std::uint64_t totalBytes{0};              // sum of desc sizes (payload only, excludes padding)
-    std::uint64_t packedBytes{0};             // region extent to RDMA-write: last bounceOffset + its size
-    std::uint32_t dstDeviceId{0};             // receiver device id for this chunk (uniform per chunk)
+    std::uint64_t totalBytes{0};  // sum of desc sizes (payload only, excludes padding)
+    std::uint64_t packedBytes{0}; // region extent to RDMA-write: last bounceOffset + its size
+    std::uint32_t dstDeviceId{0}; // receiver device id for this chunk (uniform per chunk)
 };
 
 /// Pure bin-packing of a TransferRequest's (src,dst) descriptor pairs into chunks that each

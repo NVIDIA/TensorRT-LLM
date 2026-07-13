@@ -31,7 +31,7 @@ namespace tensorrt_llm::executor::kv_cache::bounce
 {
 
 NixlNotifControlChannel::NixlNotifControlChannel(nixlAgent* agent, std::string selfName)
-    : mAgent(agent)
+    : mAgent(agent) // codespell:ignore
     , mSelfName(std::move(selfName))
 {
 }
@@ -48,8 +48,9 @@ std::string NixlNotifControlChannel::localEndpoint() const
         nixl_status_t const st = mAgent->getLocalMD(blob);
         if (st != NIXL_SUCCESS)
         {
-            TLLM_LOG_WARNING("NixlNotifControlChannel(%s): getLocalMD failed: %s (reverse control path will not "
-                             "bootstrap; requests to us will lease-timeout)",
+            TLLM_LOG_WARNING(
+                "NixlNotifControlChannel(%s): getLocalMD failed: %s (reverse control path will not "
+                "bootstrap; requests to us will lease-timeout)",
                 mSelfName.c_str(), nixlEnumStrings::statusStr(st).c_str());
             return {};
         }
@@ -125,8 +126,8 @@ bool NixlNotifControlChannel::drainNotifs()
     nixl_status_t const st = mAgent->getNotifs(notifs);
     if (st != NIXL_SUCCESS)
     {
-        TLLM_LOG_WARNING(
-            "NixlNotifControlChannel(%s): getNotifs failed: %s", mSelfName.c_str(), nixlEnumStrings::statusStr(st).c_str());
+        TLLM_LOG_WARNING("NixlNotifControlChannel(%s): getNotifs failed: %s", mSelfName.c_str(),
+            nixlEnumStrings::statusStr(st).c_str());
         return false;
     }
     bool any = false;

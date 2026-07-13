@@ -281,7 +281,7 @@ private:
         std::uint64_t remoteAddr{};
         std::uint32_t remoteDevId{};
         std::uint32_t writeBytes{};
-        bool hasCredit{false};        // remote fields valid; a Gathered chunk without it waits in place
+        bool hasCredit{false}; // remote fields valid; a Gathered chunk without it waits in place
         PostState state{PostState::Gathering};
         // Cross-thread NVTX spans for this chunk's async legs (0 == none; ended on failure paths too).
         std::uint64_t nvtxGather{0};  // gather launched -> event signaled (in-flight incl. GPU queueing)
@@ -295,7 +295,7 @@ private:
         std::uint32_t numChunks{};
         BounceTransferPlan plan;
         std::uint32_t nextPost{0};
-        // Credits are granted strictly in chunk order (the receiver serves the WANT's size list
+        // Credits are granted strictly in chunk order (the receiver serves the WANT size list
         // FIFO), so credit k always belongs to chunk k. Chunks [0, nextCredit) have consumed their
         // credit (attached to a Posted, or popped at gather-launch time); pendingCredits.front()
         // is chunk `nextCredit`'s credit.

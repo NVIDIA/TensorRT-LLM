@@ -77,8 +77,7 @@ void buildScatterRuns(BounceChunk& chunk, bool merge)
                     continue;
                 }
             }
-            else if (size == r.pieceSize
-                && dst == r.dstAddr + static_cast<std::uint64_t>(r.count) * r.dstStride
+            else if (size == r.pieceSize && dst == r.dstAddr + static_cast<std::uint64_t>(r.count) * r.dstStride
                 && bounce == r.bounceOffset + static_cast<std::uint64_t>(r.count) * r.bounceStride)
             {
                 // (c) stride extension.

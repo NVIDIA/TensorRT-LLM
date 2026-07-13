@@ -71,7 +71,7 @@ private:
     /// anything (bounce or not) was drained. Caller must NOT hold mMu.
     bool drainNotifs();
 
-    nixlAgent* mAgent;
+    nixlAgent* mAgent; // codespell:ignore
     std::string mSelfName;
 
     // Local agent metadata (the WANT-carried "endpoint"), fetched lazily on first use — the arena
@@ -79,7 +79,7 @@ private:
     mutable std::mutex mMdMu;
     mutable std::string mLocalMd;
 
-    std::mutex mMu; // guards mPeers + mInbox
+    std::mutex mMu;                                         // guards mPeers + mInbox
     std::unordered_set<std::string> mPeers;
     std::deque<std::pair<std::string, std::string>> mInbox; // (peer, blob), FIFO
 };
