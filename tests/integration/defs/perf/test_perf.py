@@ -1466,6 +1466,21 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             client_cmd += ["--trust-remote-code"]
         return client_cmd
 
+    def _warmup_hf_remote_code(self):
+        """Pre-populate the HF dynamic-module cache once so concurrent ranks skip the cold remote-code copy under the global _remote_code.lock."""
+        model_dir = get_model_dir(self._config.model_name)
+        if not model_dir:
+            return
+        try:
+            from transformers import AutoConfig
+            AutoConfig.from_pretrained(model_dir, trust_remote_code=True)
+            print_info(
+                f"Warmed HF remote-code cache for {self._config.model_name}")
+        except Exception as e:
+            print_info(
+                f"HF remote-code warmup skipped for {self._config.model_name}: {e}"
+            )
+
     def get_commands(self):
         num_gpus = self._config.num_gpus
 
@@ -1474,6 +1489,10 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                 "multi-gpu not supported on Windows yet, skipped for now")
 
         engine_dir = self._get_engine_dir()
+
+        # Warm the HF dynamic-module cache before multi-rank load to avoid _remote_code.lock timeouts.
+        if self._config.model_name in TRUST_REMOTE_CODE_MODELS:
+            self._warmup_hf_remote_code()
 
         if self._config.runtime == "serve":
             server_cmd = self.get_trtllm_serve_server_command(engine_dir)
