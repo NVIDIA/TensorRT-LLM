@@ -1,0 +1,103 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: Guard Post-Merge Approval Label
+
+on:
+  pull_request_target:
+    types: [labeled]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  guard-post-merge-approval:
+    if: >-
+      github.repository == 'NVIDIA/TensorRT-LLM' &&
+      github.event.action == 'labeled' &&
+      github.event.label.name == 'ci: post-merge approved'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate post-merge approver
+        id: validate
+        if: github.event.action == 'labeled'
+        uses: actions/github-script@v8
+        with:
+          github-token: ${{ secrets.TENSORRT_CICD_TRTLLM_CI_TOKEN }}
+          result-encoding: string
+          script: |
+            const actor = context.payload.sender?.login || context.actor;
+            try {
+              const response = await github.request(
+                'GET /orgs/{org}/teams/{team_slug}/memberships/{username}',
+                {
+                  org: 'NVIDIA',
+                  team_slug: 'trt-llm-ci-approvers',
+                  username: actor,
+                }
+              );
+              const authorized = response.data.state === 'active';
+              console.log(
+                actor + ' active membership in NVIDIA/trt-llm-ci-approvers: ' + authorized
+              );
+              return authorized ? 'true' : 'false';
+            } catch (error) {
+              if (error.status === 404) {
+                console.log(
+                  actor + ' is not an active member of NVIDIA/trt-llm-ci-approvers.'
+                );
+              } else {
+                core.warning(
+                  'Could not verify post-merge approver ' + actor + ': ' + error.message
+                );
+              }
+              return 'false';
+            }
+
+      - name: Clear unauthorized post-merge approval
+        if: always() && steps.validate.outputs.result != 'true'
+        uses: actions/github-script@v8
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const approvalLabel = 'ci: post-merge approved';
+            const actor = context.payload.sender?.login || context.actor;
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const issueNumber = context.payload.pull_request.number;
+
+            try {
+              await github.rest.issues.removeLabel({
+                owner,
+                repo,
+                issue_number: issueNumber,
+                name: approvalLabel,
+              });
+            } catch (error) {
+              if (error.status !== 404) {
+                throw error;
+              }
+            }
+
+            await github.rest.issues.createComment({
+              owner,
+              repo,
+              issue_number: issueNumber,
+              body:
+                'Removed the "' + approvalLabel + '" label because @' + actor +
+                ' could not be verified as an active member of ' +
+                'NVIDIA/trt-llm-ci-approvers. Ask a member of that team to apply it.',
+            });

@@ -109,8 +109,15 @@ developers understand why the test is disabled.
 
 ### Triggering Post-merge tests
 
-When you only need to verify a handful of post-merge tests, avoid the heavy
-`/bot run --post-merge` command. Instead, specify exactly which stages to run:
+Full `/bot run --post-merge` runs require the `ci: post-merge approved` PR
+label because they can consume substantial shared GPU resources. The label must
+be applied by an active member of the `NVIDIA/trt-llm-ci-approvers` GitHub team.
+A GitHub workflow removes invalid approvals. The label remains in place when new
+commits are pushed and can be removed manually when the approval no longer
+applies.
+
+When you only need to verify a handful of post-merge tests, specify exactly
+which stages to run:
 
 ```bash
 /bot run --stage-list "stage-A,stage-B"
@@ -123,8 +130,14 @@ default pre-merge set:
 /bot run --extra-stage "stage-A,stage-B"
 ```
 
-Both options accept any stage name defined in `jenkins/L0_Test.groovy`. Being
-selective keeps CI turnaround fast and conserves hardware resources.
+Both options accept stage names and wildcard patterns defined in
+`jenkins/L0_Test.groovy`. The broad `"*"` and `"*Post-Merge*"` selectors
+require the same approval label, including when they appear in a comma-separated
+list. Equivalent escaped or repeated-star forms are treated the same. Other
+stage selectors, including explicit stage names and limited patterns such as
+`"*PerfSanity*"`, retain their existing behavior.
+
+Being selective keeps CI turnaround fast and conserves hardware resources.
 
 ### Avoiding unnecessary `--disable-fail-fast` usage
 
