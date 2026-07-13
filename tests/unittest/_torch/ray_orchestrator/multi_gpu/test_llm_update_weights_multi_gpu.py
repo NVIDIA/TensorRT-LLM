@@ -745,8 +745,23 @@ def test_llm_update_weights_nemotron_h(mamba_deps):
     queue = ctx.Queue()
     proc = ctx.Process(target=_nemotron_h_subprocess_entry, args=(queue,))
     proc.start()
-    proc.join()
+    # Bound the child wait well below the outer pytest thread-timeout (2400s)
+    # so a silent hang doesn't leak Ray workers and swallow the traceback.
+    child_timeout_s = 1800
+    proc.join(timeout=child_timeout_s)
+    timed_out = proc.is_alive()
+    if timed_out:
+        proc.terminate()
+        proc.join(30)
+        if proc.is_alive():
+            proc.kill()
+            proc.join()
     err = queue.get() if not queue.empty() else None
+    if timed_out:
+        pytest.fail(
+            f"Subprocess did not finish within {child_timeout_s}s and was killed.\n"
+            f"Partial traceback (if any):\n{err or '<none>'}"
+        )
     if proc.exitcode != 0:
         pytest.fail(f"Subprocess exited with code {proc.exitcode}\n{err or ''}")
     if err is not None:
