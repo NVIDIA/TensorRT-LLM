@@ -1153,11 +1153,23 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
         token_lists, block_hashes_by_algo = await asyncio.to_thread(
             self._tokenize_and_compute_block_hashes_by_algo, request,
             hash_algo_by_server.values(), cache_salt_id)
+        # The tokenize `await` above released `self._lock`, so a concurrent
+        # `_on_servers_updated` (e.g. a service-discovery heartbeat evicting a
+        # transiently-unresponsive worker at conc=512) can rebuild
+        # `self._server_state`. Snapshot the live state objects under the lock
+        # and use the snapshot below so unlocked reads never KeyError even if
+        # the dict has since been rebuilt.
+        async with self._lock:
+            server_states = {
+                s: self._server_state[s]
+                for s in servers if s in self._server_state
+            }
+        if not server_states:
+            raise ValueError(
+                "No available servers after service-discovery update")
+        servers = list(server_states)
         # select the server by (KV match - load), bounded by load_cap
-        workloads = [
-            self._server_state[server].num_active_requests()
-            for server in servers
-        ]
+        workloads = [server_states[s].num_active_requests() for s in servers]
         load_fractions = [
             workloads[i] / self._max_batch_size for i in range(len(servers))
         ]
@@ -1168,7 +1180,7 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
             hash_algo = hash_algo_by_server[server]
             block_hashes = block_hashes_by_algo[hash_algo]
             # https://github.com/ai-dynamo/dynamo/blob/main/docs/kv_cache_routing.md#kv-cache-routing-and-load-balancing
-            matches.append(await self._server_state[server].matched_tokens(
+            matches.append(await server_states[server].matched_tokens(
                 block_hashes, hash_algo))
             score = matches[-1] / self._tokens_per_block - self._load_weight * \
                 workloads[i]
@@ -1211,8 +1223,13 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
         hash_algo = hash_algo_by_server[server]
         block_hashes = block_hashes_by_algo[hash_algo]
         async with self._lock:
-            await self._register_request(server, request)
-            self._stash_routed_blocks_on_route(request, block_hashes, hash_algo)
+            # Winner may have been evicted since the pre-await snapshot; skip
+            # registration rather than KeyError. finish_request already tolerates
+            # a missing server, so this leaves the request routable.
+            if server in self._server_state:
+                await self._register_request(server, request)
+                self._stash_routed_blocks_on_route(request, block_hashes,
+                                                   hash_algo)
         return server, {
             "block_hashes": block_hashes,  # list[list[int | str]]
             "hash_algo": hash_algo,
