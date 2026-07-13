@@ -611,13 +611,24 @@ UcxConnection::ConnectionIdType UcxConnectionManager::getNewConnectionId(std::sh
 
 Connection const* UcxConnectionManager::recvConnect(DataContext const& ctx, void* data, size_t size)
 {
-    std::vector<char> buffer(size + sizeof(UcxConnection::ConnectionIdType));
-    std::promise<void> promise;
-    std::future<void> future = promise.get_future();
-    auto completionCallback = [&](ucs_status_t, ucxx::RequestCallbackUserData) -> void { promise.set_value(); };
+    // The receive state must outlive this stack frame: on the terminate path below we
+    // return while the (asynchronously cancelled) UCX request may still write into the
+    // buffer and will still fire the completion callback. The callback co-owns the
+    // heap-allocated state so both stay valid until UCX is done with them.
+    struct RecvState
+    {
+        std::vector<char> mBuffer;
+        std::promise<void> mPromise;
+    };
 
-    std::shared_ptr<ucxx::Request> req = mWorkersPool.front()->tagRecv(
-        buffer.data(), buffer.size(), ucxx::Tag(ctx.getTag()), ucxx::TagMask(0xFFFFFFFF), false, completionCallback);
+    auto state = std::make_shared<RecvState>();
+    state->mBuffer.resize(size + sizeof(UcxConnection::ConnectionIdType));
+    std::future<void> future = state->mPromise.get_future();
+    auto completionCallback
+        = [state](ucs_status_t, ucxx::RequestCallbackUserData) -> void { state->mPromise.set_value(); };
+
+    std::shared_ptr<ucxx::Request> req = mWorkersPool.front()->tagRecv(state->mBuffer.data(), state->mBuffer.size(),
+        ucxx::Tag(ctx.getTag()), ucxx::TagMask(0xFFFFFFFF), false, completionCallback);
     if (!req->isCompleted())
     {
         // Poll with timeout to allow checking the terminate flag
@@ -634,9 +645,9 @@ Connection const* UcxConnectionManager::recvConnect(DataContext const& ctx, void
     TLLM_CHECK_WITH_INFO(req->isCompleted(), "recv SendConnectionId should be completed");
     req->checkError();
 
-    memcpy(data, buffer.data(), size);
+    memcpy(data, state->mBuffer.data(), size);
     UcxConnection::ConnectionIdType connectionId
-        = *reinterpret_cast<UcxConnection::ConnectionIdType*>(buffer.data() + size);
+        = *reinterpret_cast<UcxConnection::ConnectionIdType*>(state->mBuffer.data() + size);
     std::scoped_lock lock(mConnectionsMutex, mConnectionFuturesMutex);
     TLLM_CHECK_WITH_INFO(mConnectionFutures.find(connectionId) != mConnectionFutures.end(),
         "connectionFuture not found In recvConnect connectionId : %lu , worldRank: %d", connectionId, mRank);
@@ -651,7 +662,7 @@ Connection const* UcxConnectionManager::recvConnect(DataContext const& ctx, void
     TLLM_CHECK(!mConnections[connectionId]->isFromRequester());
 
     TLLM_LOG_DEBUG(mRank, "recvConnect connectionId: %lu , sendIDData:%lu", connectionId,
-        *reinterpret_cast<uint64_t*>(buffer.data()));
+        *reinterpret_cast<uint64_t*>(state->mBuffer.data()));
 
     return mConnections[connectionId].get();
 }
