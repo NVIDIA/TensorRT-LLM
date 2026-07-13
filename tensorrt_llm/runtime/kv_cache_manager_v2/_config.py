@@ -255,8 +255,9 @@ class KVCacheManagerConfig:
     Only fully-orphaned stale pages are parked: uncommitted, with committing disallowed for
     the cache (so the radix tree cannot retain them) and resident on GPU. Committed pages
     kept for prefix reuse are never touched, so behavior is identical to the default
-    allocate-then-free path except for which physical slot backs the new block. The pocket
-    is drained on suspend()/close().
+    allocate-then-free path except for which physical slot backs the new block. Parked
+    pages are pinned against inter-level eviction (migrating them would waste bandwidth
+    on dead data) until consumed or drained; the pocket is drained on suspend()/close().
     """
 
     enable_stats: bool = True

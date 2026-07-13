@@ -767,15 +767,24 @@ class _KVCache:
             # resize() calls (freshly out-of-window, fully-orphaned pages -- see the refill
             # below) to back new blocks, instead of requesting slots from the allocator.
             # Scratch mode has its own slot machinery, so the pocket is bypassed there.
-            enable_ring_reuse = (
-                manager._init_config.enable_swa_ring_reuse and not enable_scratch
-            )
+            enable_ring_reuse = manager._init_config.enable_swa_ring_reuse and not enable_scratch
             num_pocket_slots = filled_list(0, num_life_cycles)
             if enable_ring_reuse:
                 for lc in typed_range(num_life_cycles):
-                    num_pocket_slots[lc] = min(
-                        len(self._swa_reuse_pocket[lc]), num_new_slots[lc]
-                    )
+                    # Re-validate parked pages before use. Parked pages are excluded from
+                    # eviction (see the refill below), so with the current eviction policy
+                    # this drops nothing; it keeps the consume path locally correct even if
+                    # a future policy migrates or invalidates held pages.
+                    pocket = self._swa_reuse_pocket[lc]
+                    if pocket:
+                        pocket[:] = [
+                            h
+                            for h in pocket
+                            if not h.page.is_committed()
+                            and h.page.has_valid_slot
+                            and h.page.cache_level == GPU_LEVEL
+                        ]
+                    num_pocket_slots[lc] = min(len(pocket), num_new_slots[lc])
 
             net_alloc_counts = make_typed(
                 lambda lc: num_new_slots[lc] - num_pocket_slots[lc] + delta_scratch_slots[lc],
@@ -903,6 +912,12 @@ class _KVCache:
                         or page.cache_level != GPU_LEVEL
                     ):
                         continue
+                    # Pin against eviction: unlocking (in _unlock_stale_blocks) scheduled
+                    # this held page for eviction when lower cache levels exist. Migrating
+                    # it would waste bandwidth on dead data and move it off GPU_LEVEL,
+                    # invalidating the park-time checks above before the page is consumed.
+                    if page.scheduled_for_eviction:
+                        storage.exclude_from_eviction(page)
                     self._swa_reuse_pocket[holder_lc].append(holder)
         self._capacity = capacity
         self._history_length = history_length
