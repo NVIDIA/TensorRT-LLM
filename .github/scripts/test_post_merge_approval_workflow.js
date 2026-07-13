@@ -64,7 +64,7 @@ async function main() {
     "pull-requests: write",
     "github.repository == 'NVIDIA/TensorRT-LLM'",
     "github.event.label.name == 'ci: post-merge approved'",
-    "secrets.TENSORRT_CICD_TRTLLM_CI_TOKEN",
+    "secrets.TRTLLM_AGENT_SHARED_TOKEN",
     "secrets.GITHUB_TOKEN",
   ]) {
     assert(workflowSource.includes(expected), "missing workflow contract: " + expected);
@@ -75,6 +75,7 @@ async function main() {
     "pull-requests: read",
     "synchronize",
     "AUTO_LABEL_COMMUNITY_TOKEN",
+    "TENSORRT_CICD_TRTLLM_CI_TOKEN",
   ]) {
     assert(!workflowSource.includes(forbidden), "unsafe workflow contract: " + forbidden);
   }

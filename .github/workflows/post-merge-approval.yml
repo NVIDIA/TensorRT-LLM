@@ -36,7 +36,7 @@ jobs:
         if: github.event.action == 'labeled'
         uses: actions/github-script@v8
         with:
-          github-token: ${{ secrets.TENSORRT_CICD_TRTLLM_CI_TOKEN }}
+          github-token: ${{ secrets.TRTLLM_AGENT_SHARED_TOKEN }}
           result-encoding: string
           script: |
             const actor = context.payload.sender?.login || context.actor;
