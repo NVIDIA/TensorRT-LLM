@@ -485,17 +485,14 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         self._send_reqs[rid] = req
 
     @property
-    def enable_pipelined_transfer(self) -> bool:
+    def pipeline_transfer_enabled(self) -> bool:
         """Whether pipelined prefill-transfer is enabled."""
         return self._enable_pipelined_transfer
 
-    def send_prefill_chunk(
+    def _build_prefill_chunk(
         self,
         req: LlmRequest,
-        chunk_start_block: int,
-        chunk_end_block: int,
-        is_last_chunk: bool,
-    ) -> None:
+    ) -> KVSlice:
         """Send one prefill chunk's KV data during ongoing prefill.
 
         Called after each prefill chunk completes, before the next chunk's
@@ -504,21 +501,19 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
 
         Args:
             req: The context-only request being prefilled.
-            chunk_start_block: First block index for this chunk
-                (across layer groups).
-            chunk_end_block: One-past-last block index for this chunk.
-            is_last_chunk: Whether this is the final prefill chunk.
-                When True, aux data is sent and context_phase_params
-                is populated.
         """
         assert req.py_beam_width == 1, "beam_width > 1 is not supported for chunked KV transfer"
         rid = get_unique_rid(req)
         assert rid is not None
-        cuda_event = torch.cuda.Event()
-        cuda_event.record(torch.cuda.current_stream())
-
-        session = self._get_or_create_send_session(req)
         self._send_reqs[rid] = req
+
+        chunk_start_pos, chunk_end_pos = req.py_last_context_chunk
+        tpb = self.kv_cache_manager.tokens_per_block
+
+        chunk_start_block = chunk_start_pos // tpb
+        chunk_end_block = (chunk_end_pos + tpb - 1) // tpb
+        is_last_chunk = req.context_remaining_length == 0
+
         base_slice = self._create_kv_slice(req)
         all_block_ids = base_slice.block_ids_per_layer_groups
         max_resident_blocks = max((len(ids) for ids in all_block_ids), default=0)
@@ -550,46 +545,36 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 end=(chunk_start + chunk_block_count) * tpb,
             )
 
-        kv_slice = KVSlice(
+        return KVSlice(
             is_last_slice=is_last_chunk,
             block_ids_per_layer_groups=chunk_block_ids,
             mamba_state_index=base_slice.mamba_state_index,
             token_range=chunk_token_range,
             total_blocks=total_blocks,
-            cuda_event=cuda_event,
         )
-        session.send(kv_slice)
-
-        if is_last_chunk:
-            req.state = LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
-
-    @nvtx_range("KvCacheTransceiverV2.finalize_pipelined_send")
-    def finalize_pipelined_send(self, req: LlmRequest) -> None:
-        """Finalize a pipelined send after the first generated token is ready."""
-        rid = get_unique_rid(req)
-        assert rid is not None
-        session = self._send_sessions.get(rid)
-        if session is None:
-            logger.warning(
-                f"finalize_pipelined_send: rid={rid} has no send session, skipping"
-            )
-            return
-
-        self._finalize_send(req, session)
 
     @nvtx_range("KvCacheTransceiverV2.respond_and_send_async")
     def respond_and_send_async(self, req: LlmRequest) -> None:
         """Start background KV cache transfer to the generation server.
 
-        Creates (or reuses) a ``TxSession`` and sends a monolithic KV slice for each request.
+        Creates (or reuses) a ``TxSession`` and sends a KV slice (monolithic or chunked) for each request.
 
         Args:
             req: The completed context request whose KV cache to transfer.
         """
+        if self.kv_transfer_timeout_ms is not None and req.py_kv_transfer_start_time is None:
+            req.py_kv_transfer_start_time = time.time()
+
         session = self._get_or_create_send_session(req)
-        req.state = LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
-        session.send(self._create_kv_slice(req))
-        self._finalize_send(req, session)
+        if self._enable_pipelined_transfer:
+            slice = self._build_prefill_chunk(req)
+        else:
+            slice = self._create_kv_slice(req)
+        session.send(slice)
+
+        if slice.is_last_slice:
+            self._finalize_send(req, session)
+            req.state = LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
 
     @nvtx_range("KvCacheTransceiverV2.request_and_receive_sync")
     def request_and_receive_sync(self, req: LlmRequest):
