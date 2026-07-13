@@ -183,16 +183,16 @@ jit::CubinObjKey DecoderXQARunner::getCubinObjKeyFromXQAParams(XQAParams const& 
     loadKey.sm = mSM;
 
     XQAKernelRuntimeHashKey runtimeKey = getRuntimeHashKeyFromXQAParams(xqaParams, mSM);
-    // Mirror the JIT compile-context inputs that runtimeKey does not capture
-    // (see CompileEngine::compile): generation_input_length feeds the kernel's
-    // q_seq_len compile parameter, and is_spec_dec_tree / skip-softmax select
-    // different kernel code. Without them, cubins compiled for a different
-    // spec-dec config could be fetched from the process-global registry.
-    unsigned int const qSeqLen
-        = xqaParams.multi_query_tokens ? static_cast<unsigned int>(xqaParams.generation_input_length) : 0U;
+    // Mirror the engine-level JIT compile-context switches that runtimeKey
+    // does not capture (see CompileEngine::compile): is_spec_dec_tree and
+    // skip-softmax select different kernel code, and both are prepare/run
+    // stable (copied from AttentionOp members in both phases). Fields that
+    // vary between prepare() and run() (such as the raw q_seq_len) must NOT
+    // be keyed: prepare inserts with configure-time params and run looks up
+    // with per-step params, so an unstable field breaks every lookup.
     bool const isSpecDecTree = xqaParams.multi_query_tokens && xqaParams.is_spec_dec_tree;
     bool const useSkipSoftmaxAttn = xqaParams.skip_softmax_threshold_scale_factor != 0;
-    return {loadKey, runtimeKey, qSeqLen, isSpecDecTree, useSkipSoftmaxAttn};
+    return {loadKey, runtimeKey, isSpecDecTree, useSkipSoftmaxAttn};
 }
 
 void DecoderXQARunner::prepareForActualXQAParams(XQAParams const& xqaParams)
