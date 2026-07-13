@@ -425,7 +425,12 @@ class SessionReuseCache:
             pools, self._pools = list(self._pools.values()), {}
         if not pools:
             return
-        threads = [threading.Thread(target=p.shutdown, name="session-reuse-drain") for p in pools]
+        threads = [
+            # daemon: a wedged pool shutdown must not keep the interpreter
+            # alive at exit (a non-daemon thread would hang the CI stage).
+            threading.Thread(target=p.shutdown, name="session-reuse-drain", daemon=True)
+            for p in pools
+        ]
         for t in threads:
             t.start()
         for t in threads:
