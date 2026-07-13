@@ -5104,7 +5104,9 @@ class TorchLlmArgs(BaseLlmArgs):
         "of a multimodal checkpoint and serve it text-only. Saves the "
         "encoder's GPU memory (enlarging the KV cache pool) for workloads "
         "that never send image/video/audio inputs; such requests are "
-        "rejected. Defaults to False.",
+        "rejected. Only takes effect for model implementations that support "
+        "it (currently the Qwen3-VL / Qwen3.5-VL family); a no-op otherwise. "
+        "Defaults to False.",
         status="prototype")
 
     encode_only: bool = Field(
