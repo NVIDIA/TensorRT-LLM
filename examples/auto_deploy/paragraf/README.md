@@ -1,8 +1,8 @@
-# 🔥🚀⚡ LLM Compiler
+# 🔥🚀⚡ Paragraf
 
-**LLM Compiler** (Python package: `llmc`) is the standalone, lightweight distribution of the AutoDeploy graph-transformation pipeline. It exposes the same `ModelFactory` and `InferenceOptimizer` building blocks as TensorRT-LLM's AutoDeploy backend, but with a minimal dependency footprint (PyTorch + Triton + FlashInfer), so you can prototype optimization pipelines or run inference without a full TRT-LLM install.
+**Paragraf** (Python package: `paragraf`) is the standalone, lightweight distribution of the AutoDeploy graph-transformation pipeline. It exposes the same `ModelFactory` and `InferenceOptimizer` building blocks as TensorRT-LLM's AutoDeploy backend, but with a minimal dependency footprint (PyTorch + Triton + FlashInfer), so you can prototype optimization pipelines or run inference without a full TRT-LLM install.
 
-The `llmc` package is **generated** from the AutoDeploy source tree inside the [TensorRT-LLM repo](https://github.com/NVIDIA/TensorRT-LLM). The standalone repo is **read-only** — see [`CONTRIBUTING.md`](./CONTRIBUTING.md) for how to land changes.
+The `paragraf` package is **generated** from the AutoDeploy source tree inside the [TensorRT-LLM repo](https://github.com/NVIDIA/TensorRT-LLM). The standalone repo is **read-only** — see [`CONTRIBUTING.md`](./CONTRIBUTING.md) for how to land changes.
 
 For general AutoDeploy documentation (motivation, support matrix, feature overview), see the [official docs](https://nvidia.github.io/TensorRT-LLM/features/auto_deploy/auto-deploy.html).
 
@@ -37,23 +37,23 @@ uv pip install -e ".[dev]"
 ### Sanity check
 
 ```python
-from llmc._compat import TRTLLM_AVAILABLE
+from paragraf._compat import TRTLLM_AVAILABLE
 print(f"TRT-LLM available: {TRTLLM_AVAILABLE}")  # False in standalone mode
 ```
 
 ### Use the TensorRT-LLM runtime
 
 TensorRT-LLM releases that still import their bundled AutoDeploy package can be redirected to use
-LLMC as the compiler implementation:
+Paragraf as the compiler implementation:
 
 ```bash
-TRTLLM_REDIRECT_AD_TO_LLMC=true \
-python runners/trtllm/build_and_run_llmc_trtllm.py ...
+TRTLLM_REDIRECT_AD_TO_PARAGRAF=true \
+python runners/trtllm/build_and_run_paragraf_trtllm.py ...
 ```
 
-The redirect is disabled by default and must be enabled before importing either LLMC or bundled
+The redirect is disabled by default and must be enabled before importing either Paragraf or bundled
 AutoDeploy. It maps `tensorrt_llm._torch.auto_deploy.*` imports to the corresponding canonical
-`llmc.*` modules in the parent process and TensorRT-LLM MPI workers.
+`paragraf.*` modules in the parent process and TensorRT-LLM MPI workers.
 
 In standalone mode the package uses the PyTorch, Triton, and FlashInfer kernel paths. TRT-LLM-only kernels (custom CUDA, optimized all-reduce, MoE fused kernels, the `pyexecutor` runtime) are skipped at registration time.
 
@@ -67,7 +67,7 @@ ______________________________________________________________________
 
 ## Building a custom inference pipeline
 
-The two core abstractions in `llmc` are:
+The two core abstractions in `paragraf` are:
 
 - **`ModelFactory`** — wraps a HuggingFace checkpoint (or any other source) and produces an initialized `nn.Module` plus dynamic-shape metadata for export.
 - **`InferenceOptimizer`** — runs a configured pipeline of graph transforms (export → fuse → quantize → shard → compile → cache) over a model produced by a factory, against a `CachedSequenceInterface` that defines the input contract.
@@ -77,10 +77,10 @@ The code below builds a custom optimization pipeline end-to-end, without going t
 ```python
 import torch
 
-from llmc.models.factory import ModelFactoryRegistry
-from llmc.shim.interface import CachedSequenceInterface
-from llmc.transform.optimizer import InferenceOptimizer
-from llmc.utils.dist_config import DistConfig
+from paragraf.models.factory import ModelFactoryRegistry
+from paragraf.shim.interface import CachedSequenceInterface
+from paragraf.transform.optimizer import InferenceOptimizer
+from paragraf.utils.dist_config import DistConfig
 
 # 1. Build a ModelFactory.
 #
@@ -108,7 +108,7 @@ cache_seq = CachedSequenceInterface(
     max_seq_len=2048,
     max_batch_size=4,
     device="cuda",
-    kv_cache_config=None,           # or llmc._compat.KvCacheConfig(...)
+    kv_cache_config=None,           # or paragraf._compat.KvCacheConfig(...)
     max_num_tokens=4 * 2048,
     vocab_size_padded=factory.vocab_size_padded,
 )
@@ -118,7 +118,7 @@ cache_seq = CachedSequenceInterface(
 #    Each entry maps a registered transform name to its config.
 #    `stage` controls ordering across the pipeline; transforms are
 #    re-sorted by stage at construction time. The names below are
-#    illustrative — see `llmc.transform.library` for the full set.
+#    illustrative — see `paragraf.transform.library` for the full set.
 transforms_config = {
     "export_to_gm":         {"stage": "export"},
     "fuse_gemms":           {"stage": "post_export"},
@@ -155,11 +155,11 @@ print(logits.shape)
 
 | Topic | Path |
 |-------|------|
-| Available transforms | `llmc/transform/library/` |
-| Available factories  | `llmc/models/`, `llmc/models/custom/` |
-| Custom ops & backends | `llmc/custom_ops/` |
-| Compile backends | `llmc/compile/backends/` |
-| Type compatibility shims | `llmc/_compat.py` |
-| Configuration data classes | `llmc/transform/interface.py`, `llmc/llm_args.py` |
+| Available transforms | `paragraf/transform/library/` |
+| Available factories  | `paragraf/models/`, `paragraf/models/custom/` |
+| Custom ops & backends | `paragraf/custom_ops/` |
+| Compile backends | `paragraf/compile/backends/` |
+| Type compatibility shims | `paragraf/_compat.py` |
+| Configuration data classes | `paragraf/transform/interface.py`, `paragraf/llm_args.py` |
 
-For higher-level usage, the `llmc.LLM` class (available when running inside TRT-LLM) wraps all of the above behind a familiar generate API. In pure-standalone mode use `InferenceOptimizer` directly as shown.
+For higher-level usage, the `paragraf.LLM` class (available when running inside TRT-LLM) wraps all of the above behind a familiar generate API. In pure-standalone mode use `InferenceOptimizer` directly as shown.

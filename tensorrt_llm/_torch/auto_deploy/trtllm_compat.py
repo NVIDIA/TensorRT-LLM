@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Compatibility redirect from TensorRT-LLM's bundled AutoDeploy namespace to LLMC."""
+"""Compatibility redirect from TensorRT-LLM's bundled AutoDeploy namespace to Paragraf."""
 
 from __future__ import annotations
 
@@ -26,7 +26,7 @@ import threading
 from collections.abc import Sequence
 from types import ModuleType
 
-REDIRECT_ENV_VAR = "TRTLLM_REDIRECT_AD_TO_LLMC"
+REDIRECT_ENV_VAR = "TRTLLM_REDIRECT_AD_TO_PARAGRAF"
 
 __all__ = [
     "REDIRECT_ENV_VAR",
@@ -35,15 +35,15 @@ __all__ = [
 ]
 
 _LEGACY_PACKAGE = "tensorrt_llm._torch.auto_deploy"
-_TARGET_PACKAGE = "llmc"
+_TARGET_PACKAGE = "paragraf"
 _FALSE_VALUES = frozenset({"", "0", "false", "no", "off"})
 _TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
-_FINDER_MARKER = "_is_llmc_autodeploy_redirect"
+_FINDER_MARKER = "_is_paragraf_autodeploy_redirect"
 _INSTALL_LOCK = threading.Lock()
 
 
 class _RedirectLoader(importlib.abc.Loader):
-    """Load an alias by returning its canonical LLMC module object."""
+    """Load an alias by returning its canonical Paragraf module object."""
 
     def __init__(self, target_name: str) -> None:
         self._target_name = target_name
@@ -72,15 +72,15 @@ class _RedirectLoader(importlib.abc.Loader):
             raise RuntimeError(f"Redirect loader for {self._target_name!r} was not initialized")
 
         # Import machinery temporarily applies the alias spec to the canonical
-        # module returned by create_module(). Restore its LLMC identity so
+        # module returned by create_module(). Restore its Paragraf identity so
         # introspection and pickling continue to use canonical module names.
         module.__dict__.update(self._canonical_attributes)
 
 
 class _AutoDeployRedirectFinder(importlib.abc.MetaPathFinder):
-    """Map the legacy AutoDeploy package prefix to the canonical LLMC prefix."""
+    """Map the legacy AutoDeploy package prefix to the canonical Paragraf prefix."""
 
-    _is_llmc_autodeploy_redirect = True
+    _is_paragraf_autodeploy_redirect = True
 
     def find_spec(
         self,
@@ -96,7 +96,7 @@ class _AutoDeployRedirectFinder(importlib.abc.MetaPathFinder):
         target_spec = importlib.util.find_spec(target_name)
         if target_spec is None:
             raise ModuleNotFoundError(
-                f"Cannot redirect {fullname!r}: LLMC module {target_name!r} does not exist",
+                f"Cannot redirect {fullname!r}: Paragraf module {target_name!r} does not exist",
                 name=target_name,
             )
 
@@ -122,7 +122,7 @@ def _redirect_is_enabled() -> bool:
 
 
 def install_autodeploy_redirect() -> None:
-    """Redirect legacy TensorRT-LLM AutoDeploy imports to canonical LLMC modules.
+    """Redirect legacy TensorRT-LLM AutoDeploy imports to canonical Paragraf modules.
 
     The redirect must be installed before any module in the legacy namespace is
     imported. Calling this function more than once is safe.
@@ -150,6 +150,6 @@ def install_autodeploy_redirect() -> None:
 
 
 def install_autodeploy_redirect_from_env() -> None:
-    """Install the AutoDeploy redirect when ``TRTLLM_REDIRECT_AD_TO_LLMC`` is enabled."""
+    """Install the AutoDeploy redirect when ``TRTLLM_REDIRECT_AD_TO_PARAGRAF`` is enabled."""
     if _redirect_is_enabled():
         install_autodeploy_redirect()

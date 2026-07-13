@@ -13,10 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# This source tree is copied verbatim to the standalone ``llmc`` package.
+# This source tree is copied verbatim to the standalone ``paragraf`` package.
 # Install the compatibility redirect before registration imports when running
 # from that generated package; bundled AutoDeploy must remain unchanged.
-if __name__ == "llmc":
+if __name__ == "paragraf":
     from . import trtllm_compat as _trtllm_compat
 
     _trtllm_compat.install_autodeploy_redirect_from_env()

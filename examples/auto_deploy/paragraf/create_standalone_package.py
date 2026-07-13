@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Create a standalone llmc package from the TensorRT-LLM source tree.
+"""Create a standalone paragraf package from the TensorRT-LLM source tree.
 
 This script copies the ``tensorrt_llm/_torch/auto_deploy`` source tree and
 tests into a standalone pip-installable package. The output directory can
@@ -23,17 +23,17 @@ be pushed directly to the read-only standalone repository.
 Usage:
     python create_standalone_package.py [--output-dir /path/to/output]
 
-The generated package uses ``llmc`` as the top-level Python package name and
-``nvidia-llmc`` as the distribution name:
+The generated package uses ``paragraf`` as the top-level Python package name and
+``nvidia-paragraf`` as the distribution name:
 
-    from llmc._compat import TRTLLM_AVAILABLE
-    from llmc.custom_ops.attention_interface import SequenceInfo
+    from paragraf._compat import TRTLLM_AVAILABLE
+    from paragraf.custom_ops.attention_interface import SequenceInfo
 
 The ``auto_deploy`` source tree itself is copied verbatim — internal imports
 must already be relative (enforced by the
 ``auto-deploy-import-discipline`` pre-commit hook), so no source rewriting
 is required. Test files use absolute ``tensorrt_llm._torch.auto_deploy``
-imports by design and ARE rewritten to ``llmc`` on copy.
+imports by design and ARE rewritten to ``paragraf`` on copy.
 """
 
 import argparse
@@ -59,8 +59,8 @@ TRTLLM_EDITORCONFIG = os.path.join(REPO_ROOT, ".editorconfig")
 TRTLLM_CODE_OF_CONDUCT = os.path.join(REPO_ROOT, "CODE_OF_CONDUCT.md")
 TRTLLM_SECURITY = os.path.join(REPO_ROOT, "SECURITY.md")
 TRTLLM_ATTRIBUTIONS_PYTHON = os.path.join(REPO_ROOT, "ATTRIBUTIONS-Python.md")
-LLMC_README = os.path.join(SCRIPT_DIR, "README.md")
-LLMC_CONTRIBUTING = os.path.join(SCRIPT_DIR, "CONTRIBUTING.md")
+PARAGRAF_README = os.path.join(SCRIPT_DIR, "README.md")
+PARAGRAF_CONTRIBUTING = os.path.join(SCRIPT_DIR, "CONTRIBUTING.md")
 
 # Test source directories
 AD_TESTS_DIR = os.path.join(REPO_ROOT, "tests", "unittest", "auto_deploy")
@@ -69,12 +69,12 @@ AD_TORCH_TESTS_DIR = os.path.join(REPO_ROOT, "tests", "unittest", "_torch", "aut
 
 # Example/e2e harness sources (Tier-1 e2e: build_and_run_ad.py + model registry).
 # These ship with the package so the standalone install can run e2e models via
-# the same entrypoint as TRT-LLM. Python is rewritten auto_deploy -> llmc; the
+# the same entrypoint as TRT-LLM. Python is rewritten auto_deploy -> paragraf; the
 # model_registry YAML is data and copied verbatim.
 AD_EXAMPLES_SRC = os.path.join(REPO_ROOT, "examples", "auto_deploy")
 # Source filename -> destination filename in the standalone package. The e2e
-# entrypoint is renamed to make its scope explicit in the llmc distribution.
-EXAMPLE_FILES = {"build_and_run_ad.py": "build_and_run_llmc_trtllm.py"}
+# entrypoint is renamed to make its scope explicit in the paragraf distribution.
+EXAMPLE_FILES = {"build_and_run_ad.py": "build_and_run_paragraf_trtllm.py"}
 EXAMPLE_DIRS = ["model_registry"]
 
 # ---------------------------------------------------------------------------
@@ -201,8 +201,8 @@ EXCLUDE_TEST_FILES = {
     "test_trtllm_quant_mxfp4_trtllm_gen_moe.py",
 }
 
-# Single-GPU smoke tests. Some run with LLMC alone; others exercise the optional
-# TensorRT-LLM wheel/CLI path and are gated by TRTLLM_REDIRECT_AD_TO_LLMC.
+# Single-GPU smoke tests. Some run with Paragraf alone; others exercise the optional
+# TensorRT-LLM wheel/CLI path and are gated by TRTLLM_REDIRECT_AD_TO_PARAGRAF.
 STANDALONE_SINGLEGPU_SMOKE_TEST_FILES = (
     "smoke/test_ad_build_small_single.py",
     "smoke/test_ad_guided_decoding_regex.py",
@@ -215,7 +215,7 @@ STANDALONE_SINGLEGPU_SMOKE_TEST_FILES = (
 
 # Multi-GPU tests that exercise only AutoDeploy and its standalone dependencies.
 # Keep this list explicit: the remaining multi-GPU tests depend on TensorRT-LLM
-# runtime components, kernels, or test infrastructure that LLMC does not ship.
+# runtime components, kernels, or test infrastructure that Paragraf does not ship.
 STANDALONE_MULTIGPU_TEST_FILES = (
     "custom_ops/test_dist.py",
     "custom_ops/test_sharded_rmsnorm.py",
@@ -233,34 +233,36 @@ STANDALONE_MULTIGPU_TEST_FILES = (
 STANDALONE_MULTIGPU_SUPPORT_FILES = ("transformations/library/conftest.py",)
 
 # Newer AD unit tests live under tests/unittest/_torch/auto_deploy. Copy only
-# tracked tests whose dependencies are available in LLMC plus the optional
+# tracked tests whose dependencies are available in Paragraf plus the optional
 # TensorRT-LLM wheel.
 STANDALONE_TORCH_UNIT_TEST_FILES = ("unit/singlegpu/models/test_gpt_oss_modeling.py",)
 
 # Import path rewrite: old -> new (applied to test files only).
 _IMPORT_REWRITE = "tensorrt_llm._torch.auto_deploy"
-_IMPORT_TARGET = "llmc"
+_IMPORT_TARGET = "paragraf"
 _BUILD_AND_RUN_AD_IMPORT = "from build_and_run_ad import ExperimentConfig, main"
 _TRTLLM_IMPORT_RE = re.compile(
     r"(?m)^(?:from|import) "
-    r"(?:tensorrt_llm(?:\.|\b)|llmc\.models\.custom\.modeling_gpt_oss(?:\.|\b))"
+    r"(?:tensorrt_llm(?:\.|\b)|paragraf\.models\.custom\.modeling_gpt_oss(?:\.|\b))"
 )
-_LLMC_OPTIONAL_TRTLLM_GUARD = """
-_trtllm_redirect_value = os.environ.get("TRTLLM_REDIRECT_AD_TO_LLMC", "").lower()
+_PARAGRAF_OPTIONAL_TRTLLM_GUARD = """
+_trtllm_redirect_value = os.environ.get("TRTLLM_REDIRECT_AD_TO_PARAGRAF", "").lower()
 if _trtllm_redirect_value not in {"1", "true", "yes", "on"}:
     pytest.skip(
-        "LLMC optional TRT-LLM tests require TRTLLM_REDIRECT_AD_TO_LLMC=true",
+        "Paragraf optional TRT-LLM tests require TRTLLM_REDIRECT_AD_TO_PARAGRAF=true",
         allow_module_level=True,
     )
 pytest.importorskip("tensorrt_llm")"""
-_LLMC_TRTLLM_RUNNER_IMPORT = (
-    "from runners.trtllm.build_and_run_llmc_trtllm import ExperimentConfig, main"
+_PARAGRAF_TRTLLM_RUNNER_IMPORT = (
+    "from runners.trtllm.build_and_run_paragraf_trtllm import ExperimentConfig, main"
 )
 
 # Paths that the script owns and regenerates on every run.
 # Everything else in the output directory (e.g., .git/, .github/) is preserved
 # and owned by the standalone repo itself.
 _MANAGED_PATHS = [
+    "paragraf",
+    # Remove the package directory produced before the Paragraf rename.
     "llmc",
     "tests",
     "runners",
@@ -313,7 +315,7 @@ def _rewrite_imports_in_file(filepath: str, *, optional_trtllm_guards: bool = Tr
     pre-commit hook), so no rewriting is needed for them. Tests, however,
     are written against the canonical absolute path
     ``tensorrt_llm._torch.auto_deploy`` and need to be rewritten to
-    ``llmc``. Cross-package types (e.g. ``KvCacheConfig``,
+    ``paragraf``. Cross-package types (e.g. ``KvCacheConfig``,
     ``ActivationType``) are sourced via ``..._torch.auto_deploy._compat``,
     so the primary rewrite handles them too.
 
@@ -345,14 +347,14 @@ def _rewrite_imports_in_file(filepath: str, *, optional_trtllm_guards: bool = Tr
 
     def insert_optional_trtllm_guard() -> None:
         nonlocal content
-        if _LLMC_OPTIONAL_TRTLLM_GUARD in content:
+        if _PARAGRAF_OPTIONAL_TRTLLM_GUARD in content:
             return
         pytest_import = re.search(r"(?m)^import pytest\n", content)
         if pytest_import is None:
             raise ValueError(f"No pytest import found in {filepath}")
         content = (
             content[: pytest_import.end()]
-            + _LLMC_OPTIONAL_TRTLLM_GUARD
+            + _PARAGRAF_OPTIONAL_TRTLLM_GUARD
             + "\n"
             + content[pytest_import.end() :]
         )
@@ -361,7 +363,7 @@ def _rewrite_imports_in_file(filepath: str, *, optional_trtllm_guards: bool = Tr
         build_import_pos = content.index(_BUILD_AND_RUN_AD_IMPORT)
         ensure_imports(build_import_pos, "os", "pytest")
         insert_optional_trtllm_guard()
-        content = content.replace(_BUILD_AND_RUN_AD_IMPORT, _LLMC_TRTLLM_RUNNER_IMPORT)
+        content = content.replace(_BUILD_AND_RUN_AD_IMPORT, _PARAGRAF_TRTLLM_RUNNER_IMPORT)
     elif optional_trtllm_guards:
         trtllm_import = _TRTLLM_IMPORT_RE.search(content)
         if trtllm_import is not None:
@@ -557,14 +559,14 @@ def _create_test_conftest(tests_dir: str) -> None:
         import pytest
 
         _allow_trtllm_redirect = (
-            os.environ.get("TRTLLM_REDIRECT_AD_TO_LLMC", "").lower()
+            os.environ.get("TRTLLM_REDIRECT_AD_TO_PARAGRAF", "").lower()
             in {"1", "true", "yes", "on"}
         )
         _trtllm_spec = importlib.util.find_spec("tensorrt_llm")
         if _trtllm_spec is not None and not _allow_trtllm_redirect:
             raise RuntimeError(
-                "Standalone llmc tests must not be able to import tensorrt_llm; "
-                "set TRTLLM_REDIRECT_AD_TO_LLMC=true only for optional TRT-LLM tests; "
+                "Standalone paragraf tests must not be able to import tensorrt_llm; "
+                "set TRTLLM_REDIRECT_AD_TO_PARAGRAF=true only for optional TRT-LLM tests; "
                 f"found {getattr(_trtllm_spec, 'origin', None)!r}"
             )
 
@@ -572,7 +574,7 @@ def _create_test_conftest(tests_dir: str) -> None:
         _package_root = os.path.dirname(_tests_dir)
 
         # Add generated package/test roots to the Python path so tests can import
-        # local llmc, runners, and _utils_test even under safe-path settings.
+        # local paragraf, runners, and _utils_test even under safe-path settings.
         sys.path.insert(0, _package_root)
         sys.path.insert(0, _tests_dir)
         sys.path.insert(0, os.path.join(_tests_dir, "_utils_test"))
@@ -679,7 +681,7 @@ def _create_test_utils_stub(tests_dir: str) -> None:
         # See the License for the specific language governing permissions and
         # limitations under the License.
 
-        \"\"\"Minimal unittest utility shims for standalone LLMC tests.\"\"\"
+        \"\"\"Minimal unittest utility shims for standalone Paragraf tests.\"\"\"
 
         import pytest
         import torch
@@ -708,11 +710,11 @@ def _copy_runners(output_dir: str) -> int:
     """Copy the Tier-1 e2e harness into the standalone package under ``runners/trtllm/``.
 
     ``examples/auto_deploy/build_and_run_ad.py`` is copied to
-    ``runners/trtllm/build_and_run_llmc_trtllm.py`` (see ``EXAMPLE_FILES``) together
+    ``runners/trtllm/build_and_run_paragraf_trtllm.py`` (see ``EXAMPLE_FILES``) together
     with its sibling ``model_registry/``. Because the script resolves the registry
     relative to its own location (``Path(__file__).parent / "model_registry"``),
     the rename + relocation are safe and ``--use-registry`` keeps working.
-    ``.py`` files get the usual ``auto_deploy -> llmc`` import rewrite (applied by
+    ``.py`` files get the usual ``auto_deploy -> paragraf`` import rewrite (applied by
     the caller); the ``model_registry`` YAML is data, copied verbatim.
     """
     runners_dst = os.path.join(output_dir, "runners", "trtllm")
@@ -744,9 +746,9 @@ def _create_pyproject_toml(output_dir: str, dependencies: list, dev_dependencies
         'build-backend = "setuptools.build_meta"\n'
         "\n"
         "[project]\n"
-        'name = "nvidia-llmc"\n'
+        'name = "nvidia-paragraf"\n'
         'version = "0.1.0"\n'
-        'description = "llmc: standalone LLM compiler — '
+        'description = "paragraf: standalone LLM compiler — '
         'automatic model optimization and deployment for LLM inference"\n'
         'readme = "README.md"\n'
         'license = {text = "Apache-2.0"}\n'
@@ -761,7 +763,7 @@ def _create_pyproject_toml(output_dir: str, dependencies: list, dev_dependencies
         "]\n"
         "\n"
         "[tool.setuptools.packages.find]\n"
-        'include = ["llmc*"]\n'
+        'include = ["paragraf*"]\n'
         "\n"
         "[tool.pytest.ini_options]\n"
         'testpaths = ["tests"]\n'
@@ -775,7 +777,7 @@ def _create_pyproject_toml(output_dir: str, dependencies: list, dev_dependencies
 
 
 def create_standalone_package(output_dir: str) -> None:
-    """Create the standalone llmc package at the given output directory.
+    """Create the standalone paragraf package at the given output directory.
 
     Safe to run against an existing git repository: only the managed paths
     (source, tests, and packaging files) are deleted and regenerated. The .git
@@ -798,20 +800,20 @@ def create_standalone_package(output_dir: str) -> None:
 
     print(f"Creating standalone package at: {output_dir}")
 
-    # 1. Copy auto_deploy source as top-level `llmc/` package. No import
+    # 1. Copy auto_deploy source as top-level `paragraf/` package. No import
     #    rewriting is needed: in-package imports are relative (enforced by
     #    the auto-deploy-import-discipline pre-commit hook).
-    ad_dst = os.path.join(output_dir, "llmc")
+    ad_dst = os.path.join(output_dir, "paragraf")
     count = _copy_tree(AUTO_DEPLOY_SRC, ad_dst)
-    print(f"  Copied {count} source files to llmc/")
+    print(f"  Copied {count} source files to paragraf/")
 
     # 2. Copy and rewrite tests (tests use absolute self-imports by design).
     test_count = _copy_tests(output_dir)
     rewrite_count = _rewrite_imports_in_dir(os.path.join(output_dir, "tests"))
     print(f"  Copied {test_count} test files to tests/ ({rewrite_count} import rewrites)")
 
-    # 2b. Copy the Tier-1 e2e harness into runners/ (build_and_run_llmc_trtllm.py
-    #     + model_registry) and rewrite its imports auto_deploy -> llmc. YAML is
+    # 2b. Copy the Tier-1 e2e harness into runners/ (build_and_run_paragraf_trtllm.py
+    #     + model_registry) and rewrite its imports auto_deploy -> paragraf. YAML is
     #     left untouched.
     runner_count = _copy_runners(output_dir)
     runner_rewrites = _rewrite_imports_in_dir(
@@ -841,13 +843,13 @@ def create_standalone_package(output_dir: str) -> None:
     print(f"  Generated ATTRIBUTIONS-Python.md ({len(dependencies)} direct deps)")
 
     # 6. Copy README
-    if os.path.exists(LLMC_README):
-        shutil.copy2(LLMC_README, os.path.join(output_dir, "README.md"))
+    if os.path.exists(PARAGRAF_README):
+        shutil.copy2(PARAGRAF_README, os.path.join(output_dir, "README.md"))
         print("  Copied README.md")
 
     # 7. Copy CONTRIBUTING.md
-    if os.path.exists(LLMC_CONTRIBUTING):
-        shutil.copy2(LLMC_CONTRIBUTING, os.path.join(output_dir, "CONTRIBUTING.md"))
+    if os.path.exists(PARAGRAF_CONTRIBUTING):
+        shutil.copy2(PARAGRAF_CONTRIBUTING, os.path.join(output_dir, "CONTRIBUTING.md"))
         print("  Copied CONTRIBUTING.md")
 
     # 8. Copy .gitignore
@@ -877,22 +879,22 @@ def create_standalone_package(output_dir: str) -> None:
     print("  uv pip install -e '.[dev]'")
     print("\nTo run tests:     pytest tests/")
     print(
-        'To verify:        python -c "from llmc._compat import TRTLLM_AVAILABLE; print(TRTLLM_AVAILABLE)"'
+        'To verify:        python -c "from paragraf._compat import TRTLLM_AVAILABLE; print(TRTLLM_AVAILABLE)"'
     )
     print(
-        "To run e2e:       python runners/trtllm/build_and_run_llmc_trtllm.py "
+        "To run e2e:       python runners/trtllm/build_and_run_paragraf_trtllm.py "
         "--model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --use-registry  (needs tensorrt-llm installed)"
     )
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Create a standalone llmc package from TensorRT-LLM source.",
+        description="Create a standalone paragraf package from TensorRT-LLM source.",
     )
     parser.add_argument(
         "--output-dir",
-        default=os.path.join(REPO_ROOT, "build", "llmc_standalone"),
-        help="Output directory for the standalone package (default: build/llmc_standalone)",
+        default=os.path.join(REPO_ROOT, "build", "paragraf_standalone"),
+        help="Output directory for the standalone package (default: build/paragraf_standalone)",
     )
     args = parser.parse_args()
     create_standalone_package(os.path.abspath(args.output_dir))
