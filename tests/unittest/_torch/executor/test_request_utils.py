@@ -6,6 +6,7 @@ This module tests:
 
 """
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -62,6 +63,13 @@ def create_mock_request_with_py_schedule_params(attention_dp_rank=None, attentio
     return mock_request
 
 
+def _request_broadcaster():
+    return RequestBroadcaster(
+        SimpleNamespace(rank=0, world_size=1),
+        SimpleNamespace(pause=lambda: nullcontext()),
+    )
+
+
 def test_request_broadcaster_collects_conversation_params_with_none():
     conversation_params = ConversationParams(conversation_id="conv")
     source_items = [
@@ -69,7 +77,7 @@ def test_request_broadcaster_collects_conversation_params_with_none():
         RequestQueueItem(2, SimpleNamespace(py_conversation_params=None)),
     ]
 
-    py_request_objects = RequestBroadcaster._collect_py_objects(None, source_items)
+    py_request_objects = _request_broadcaster()._collect_py_objects(source_items)
 
     py_objects = dict(py_request_objects)
     assert py_objects["py_conversation_params"] == {
@@ -92,7 +100,75 @@ def test_request_broadcaster_requires_conversation_params_attr():
     source_items = [RequestQueueItem(1, SimpleNamespace())]
 
     with pytest.raises(AttributeError):
-        RequestBroadcaster._collect_py_objects(None, source_items)
+        _request_broadcaster()._collect_py_objects(source_items)
+
+
+def test_request_broadcaster_disabled_path_does_not_scan_self_benchmark_markers():
+    class MarkerAccessTrap:
+        py_conversation_params = None
+
+        def __getattr__(self, name):
+            if name in {
+                "py_is_self_benchmark_request",
+                "py_self_benchmark_trial_id",
+            }:
+                raise AssertionError(f"disabled path read {name}")
+            return None
+
+    source_items = [RequestQueueItem(1, MarkerAccessTrap())]
+
+    broadcast_requests, py_request_objects = _request_broadcaster().broadcast(source_items)
+
+    assert broadcast_requests is source_items
+    assert "py_is_self_benchmark_request" not in dict(py_request_objects)
+    assert "py_self_benchmark_trial_id" not in dict(py_request_objects)
+
+
+def test_request_broadcaster_does_not_propagate_self_benchmark_markers():
+    source_items = [
+        RequestQueueItem(
+            1,
+            SimpleNamespace(
+                py_conversation_params=None,
+                py_is_self_benchmark_request=True,
+                py_self_benchmark_trial_id=17,
+            ),
+        )
+    ]
+
+    py_request_objects = _request_broadcaster()._collect_py_objects(source_items)
+
+    py_objects = dict(py_request_objects)
+    assert "py_is_self_benchmark_request" not in py_objects
+    assert "py_self_benchmark_trial_id" not in py_objects
+    target_items = [RequestQueueItem(1, SimpleNamespace())]
+    attach_py_objects_to_requests(target_items, py_request_objects)
+    assert not hasattr(target_items[0].request, "py_is_self_benchmark_request")
+    assert not hasattr(target_items[0].request, "py_self_benchmark_trial_id")
+
+
+def test_merge_requests_ignores_external_self_benchmark_markers():
+    executor_request = trtllm.Request(
+        input_token_ids=[1, 2, 3],
+        max_tokens=1,
+        streaming=False,
+        sampling_config=trtllm.SamplingConfig(),
+        output_config=trtllm.OutputConfig(),
+    )
+    executor_request.py_is_self_benchmark_request = True
+    executor_request.py_self_benchmark_trial_id = 17
+
+    requests = merge_requests(
+        [RequestQueueItem(1, executor_request)],
+        cp_config={},
+        cp_rank=0,
+        cp_size=1,
+        exclude_last_generation_logits=False,
+    )
+
+    assert not hasattr(requests[0], "is_self_benchmark_request")
+    assert not hasattr(requests[0], "py_self_benchmark_trial_id")
+    assert not hasattr(requests[0], "py_self_benchmark_point_id")
 
 
 def test_merge_helix_requests_with_padding():

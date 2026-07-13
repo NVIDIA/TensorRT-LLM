@@ -342,6 +342,22 @@ To configure the nested level arguments like ``moe_config.backend``, the yaml fi
    moe_config:
        backend: CUTLASS
 
+Startup self-benchmarking is also configured as a nested option. For example:
+
+.. code-block:: yaml
+
+   self_benchmark_config:
+       mode: agg
+       prefill_isl_granularity: 16
+       prefill_batch_granularity: 6
+       prefill_kv_read_granularity: 4
+       decode_context_granularity: 6
+       decode_batch_granularity: 6
+       warmup_iterations: 5
+       output_path: /tmp/trtllm_self_benchmark.json
+
+Run the server with this configuration using ``trtllm-serve MODEL --config config.yaml``.
+
 Syntax
 ------
 

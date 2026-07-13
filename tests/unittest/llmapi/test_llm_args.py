@@ -46,6 +46,7 @@ from tensorrt_llm.llmapi.llm_args import (BaseLlmArgs, CacheTransceiverConfig,
                                           MultimodalEncoderCudaGraphConfig,
                                           PeftCacheConfig, PybindMirror,
                                           RayPlacementConfig,
+                                          SelfBenchmarkConfig,
                                           SkipSoftmaxAttentionConfig,
                                           SleepConfig, SpeculativeConfig,
                                           StrictBaseModel, TorchCompileConfig,
@@ -2100,6 +2101,42 @@ class TestStrictBaseModelArbitraryArgs:
 
 
 class TestServeDefaults:
+
+    def test_self_benchmark_config_default_output_path_uses_tempdir(self):
+        config = SelfBenchmarkConfig()
+
+        assert config.output_path == str(
+            Path(tempfile.gettempdir()) / "trtllm_self_benchmark.json")
+
+    def test_serve_loads_self_benchmark_config_from_yaml(self):
+        llm_args, _ = get_llm_args(model="dummy",
+                                   backend="pytorch",
+                                   gpus_per_node=1)
+        assert "self_benchmark_config" not in llm_args
+
+        yaml_args = yaml.safe_load("""\
+self_benchmark_config:
+  mode: decode
+  prefill_batch_granularity: 4
+  decode_context_granularity: 3
+  decode_batch_granularity: 2
+  warmup_iterations: 0
+  output_path: /tmp/test-self-benchmark.json
+""")
+
+        merged = update_llm_args_with_extra_dict(llm_args, yaml_args)
+        parsed = TorchLlmArgs(**merged)
+
+        config = parsed.self_benchmark_config
+        assert isinstance(config, SelfBenchmarkConfig)
+        assert config.mode == "decode"
+        assert config.prefill_batch_granularity == 4
+        assert config.decode_context_granularity == 3
+        assert config.decode_batch_granularity == 2
+        assert config.prefill_isl_granularity == 16
+        assert config.warmup_iterations == 0
+        assert config.output_path == "/tmp/test-self-benchmark.json"
+        assert parsed.enable_iter_perf_stats is True
 
     def test_serve_get_llm_args_preserves_model_defaults(self):
         # No explicit CLI flags: only required params and serve-side defaults

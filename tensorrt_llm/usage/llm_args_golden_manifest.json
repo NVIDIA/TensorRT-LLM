@@ -1342,6 +1342,59 @@
     },
     {
       "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "self_benchmark_config.decode_batch_granularity"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "self_benchmark_config.decode_context_granularity"
+    },
+    {
+      "allowed_values": [
+        "prefill",
+        "decode",
+        "agg"
+      ],
+      "annotation": "Literal['prefill', 'decode', 'agg']",
+      "converter": "",
+      "kind": "categorical",
+      "path": "self_benchmark_config.mode"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "self_benchmark_config.prefill_batch_granularity"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "self_benchmark_config.prefill_isl_granularity"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "self_benchmark_config.prefill_kv_read_granularity"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "self_benchmark_config.warmup_iterations"
+    },
+    {
+      "allowed_values": [],
       "annotation": "<class 'bool'>",
       "converter": "",
       "kind": "value",

@@ -779,7 +779,7 @@ class TestKVCacheV2SchedulerCrossParam:
             ),
             patch(
                 "tensorrt_llm._torch.pyexecutor._util.PyExecutor",
-            ),
+            ) as py_executor_cls,
         ):
             scheduler_cls.return_value = Mock()
             create_py_executor_instance(
@@ -796,11 +796,13 @@ class TestKVCacheV2SchedulerCrossParam:
                 max_batch_size=8,
                 max_beam_width=1,
                 max_num_tokens=4096,
+                enable_self_benchmark=False,
             )
 
         kwargs = scheduler_cls.call_args.kwargs
         assert kwargs["cross_kv_cache_manager"] is cross_mgr
         assert kwargs["no_schedule_until_state"] == LlmRequestState.ENCODER_INIT
+        assert py_executor_cls.call_args.kwargs["enable_self_benchmark"] is False
 
 
 # ---------------------------------------------------------------------------
