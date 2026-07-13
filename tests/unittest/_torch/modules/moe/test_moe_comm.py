@@ -267,6 +267,7 @@ def _run_nvlink_rank_mask_dispatch(
     token_selected_experts: torch.Tensor,
     payload: torch.Tensor,
     runtime_max_tokens_per_rank: int,
+    enable_fault_tolerance: bool,
     active_rank_mask: Optional[torch.Tensor],
 ) -> Tuple[List[torch.Tensor], int, torch.Tensor, torch.Tensor]:
     """Run raw NVLink one-sided dispatch with an optional active rank mask."""
@@ -281,6 +282,7 @@ def _run_nvlink_rank_mask_dispatch(
         comm.top_k,
         comm.num_experts,
         None,  # eplb_local_stats
+        enable_fault_tolerance,
         active_rank_mask,
     )
 
@@ -303,6 +305,7 @@ def _run_nvlink_rank_mask_combine(
     local_num_tokens: int,
     runtime_max_tokens_per_rank: int,
     combine_payload_offset: int,
+    enable_fault_tolerance: bool,
     active_rank_mask: Optional[torch.Tensor],
 ) -> torch.Tensor:
     """Run raw NVLink one-sided combine with an optional active rank mask."""
@@ -318,6 +321,7 @@ def _run_nvlink_rank_mask_combine(
         combine_payload_offset,
         False,  # payload_in_workspace
         False,  # use_low_precision
+        enable_fault_tolerance,
         active_rank_mask,
     )
 
@@ -327,6 +331,7 @@ def _run_nvlink_rank_mask_dispatch_combine(
     token_selected_experts: torch.Tensor,
     payload: torch.Tensor,
     runtime_max_tokens_per_rank: int,
+    enable_fault_tolerance: bool,
     active_rank_mask: Optional[torch.Tensor],
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Run raw NVLink one-sided dispatch/combine with an optional active rank mask."""
@@ -335,6 +340,7 @@ def _run_nvlink_rank_mask_dispatch_combine(
         token_selected_experts,
         payload,
         runtime_max_tokens_per_rank,
+        enable_fault_tolerance,
         active_rank_mask,
     )
     combined = _run_nvlink_rank_mask_combine(
@@ -343,6 +349,7 @@ def _run_nvlink_rank_mask_dispatch_combine(
         token_selected_experts.size(0),
         runtime_max_tokens_per_rank,
         combine_payload_offset,
+        enable_fault_tolerance,
         active_rank_mask,
     )
     return combined.cpu(), topk_target_ranks
@@ -1214,6 +1221,7 @@ def _worker_rank_mask_all_active_matches_no_mask(config: CommTestConfig) -> dict
             token_selected_experts,
             payload,
             local_num_tokens,
+            enable_fault_tolerance=False,
             active_rank_mask=None,
         )
         out_all_active, topk_all_active = _run_nvlink_rank_mask_dispatch_combine(
@@ -1221,6 +1229,7 @@ def _worker_rank_mask_all_active_matches_no_mask(config: CommTestConfig) -> dict
             token_selected_experts,
             payload,
             local_num_tokens,
+            enable_fault_tolerance=True,
             active_rank_mask=_ep_mask_words(config.ep_size, dead_ranks=set()),
         )
 
@@ -1293,6 +1302,7 @@ def _worker_rank_mask_one_rank_masked(
             token_selected_experts,
             payload,
             local_num_tokens,
+            enable_fault_tolerance=True,
             active_rank_mask=mask,
         )
         expected_target_ranks = _expected_target_ranks(
@@ -1352,6 +1362,7 @@ def _worker_rank_mask_inactive_before_combine(
                 token_selected_experts,
                 payload,
                 local_num_tokens,
+                enable_fault_tolerance=True,
                 active_rank_mask=_ep_mask_words(config.ep_size, dead_ranks=set()),
             )
         )
@@ -1376,6 +1387,7 @@ def _worker_rank_mask_inactive_before_combine(
             local_num_tokens,
             local_num_tokens,
             combine_payload_offset,
+            enable_fault_tolerance=True,
             active_rank_mask=_ep_mask_words(config.ep_size, dead_ranks=dead_ranks),
         ).cpu()
 

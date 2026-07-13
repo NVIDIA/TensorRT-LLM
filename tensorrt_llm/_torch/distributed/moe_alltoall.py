@@ -322,6 +322,7 @@ class MoeAlltoAll:
             self.top_k,
             self.num_experts,
             eplb_local_stats,
+            self.ep_group_health is not None,
             active_rank_mask,
         )
         self._watchdog_coordinator.watch_collective(self._alltoall_watchdog,
@@ -384,7 +385,8 @@ class MoeAlltoAll:
             payload, self._state.local_num_tokens, self.workspace,
             self.metainfo, runtime_max_tokens_per_rank, self.ep_rank,
             self.ep_size, self.top_k, self._state.combine_payload_offset,
-            payload_in_workspace, use_low_precision_combine, active_rank_mask)
+            payload_in_workspace, use_low_precision_combine,
+            self.ep_group_health is not None, active_rank_mask)
         self._watchdog_coordinator.watch_collective(self._alltoall_watchdog,
                                                     "combine", active_rank_mask)
 
