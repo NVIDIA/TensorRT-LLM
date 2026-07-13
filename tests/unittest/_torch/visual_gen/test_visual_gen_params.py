@@ -224,6 +224,18 @@ class TestPipelineDefaults:
         assert d["num_frames"] == 121
         assert d["frame_rate"] == 24.0
 
+    def test_fastwan_defaults(self):
+        """FastWan 2.2 TI2V-5B (DMD distilled): wan22-5b defaults, 3-step, CFG-free."""
+        from tensorrt_llm._torch.visual_gen.models.wan.pipeline_fastwan import WanDMDPipeline
+
+        d = WanDMDPipeline.default_generation_params.fget(None)
+        assert d["height"] == 704
+        assert d["width"] == 1280
+        assert d["num_inference_steps"] == 3
+        assert d["guidance_scale"] == 1.0
+        assert d["num_frames"] == 121
+        assert d["frame_rate"] == 24.0
+
     def test_flux_defaults(self):
         from tensorrt_llm._torch.visual_gen.models.flux.pipeline_flux import FluxPipeline
 
@@ -514,6 +526,22 @@ class TestVisualGenDefaultParams:
         assert params.width == 1280
         assert params.num_inference_steps == 50
         assert params.guidance_scale == 5.0
+        assert params.num_frames == 121
+        assert params.frame_rate == 24.0
+        assert params.extra_params is None
+
+    def test_fastwan_default_params(self):
+        """FastWan 2.2 TI2V-5B (DMD distilled): 3-step, CFG-free, no extra params."""
+        from tensorrt_llm._torch.visual_gen.models.wan.pipeline_fastwan import WanDMDPipeline
+
+        vg = self._make_visual_gen(
+            WanDMDPipeline, _wan_mock(is_wan22_14b=False, is_wan22_5b=True, num_heads=24)
+        )
+        params = vg.default_params
+        assert params.height == 704
+        assert params.width == 1280
+        assert params.num_inference_steps == 3
+        assert params.guidance_scale == 1.0
         assert params.num_frames == 121
         assert params.frame_rate == 24.0
         assert params.extra_params is None
