@@ -111,7 +111,6 @@ pipeline {
     }
     environment {
         OPEN_SEARCH_DB_BASE_URL = credentials('open_search_db_base_url')
-        OPEN_SEARCH_DB_CREDENTIALS = credentials('open_search_db_credentials')
     }
     stages {
         stage('Setup') {
@@ -145,8 +144,6 @@ pipeline {
                         python3 jenkins/scripts/generate_duration.py \
                             --from-opensearch \
                             --days ${params.DAYS} \
-                            --opensearch-url "${OPEN_SEARCH_DB_BASE_URL}" \
-                            --opensearch-credentials "${OPEN_SEARCH_DB_CREDENTIALS}" \
                             --duration-file new_test_durations.json
                         echo "Generated file size: \$(wc -l < new_test_durations.json) lines"
                         echo "Sample output (first 5 lines):"

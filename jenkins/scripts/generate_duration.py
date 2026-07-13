@@ -75,17 +75,16 @@ def load_test_list_specs(test_list_dir):
     return specs, yml_files
 
 
-def query_opensearch_durations(url, credentials, days):
+def query_opensearch_durations(days):
+    import sys
+
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     import requests
-    from requests.auth import HTTPProxyAuth
+    from open_search_db import DEFAULT_RETRY_COUNT, OPEN_SEARCH_DB_BASE_URL, QUERY_TIMEOUT_SECONDS
 
     since_ms = int((time.time() - days * 86400) * 1000)
-    search_url = f"{url.rstrip('/')}/{OPENSEARCH_INDEX}/_search"
-
-    auth = None
-    if credentials and ":" in credentials:
-        user, password = credentials.split(":", 1)
-        auth = HTTPProxyAuth(user, password)
+    search_url = f"{OPEN_SEARCH_DB_BASE_URL}/opensearch/{OPENSEARCH_INDEX}/_search"
+    headers = {"Content-Type": "application/json", "Accept-Charset": "UTF-8"}
 
     test_durations = {}
     after_key = None
@@ -118,10 +117,24 @@ def query_opensearch_durations(url, credentials, days):
             },
         }
 
-        response = requests.post(search_url, json=query, auth=auth, timeout=60)
-        response.raise_for_status()
-        data = response.json()
+        query_str = json.dumps(query)
+        res = None
+        for attempt in range(DEFAULT_RETRY_COUNT):
+            res = requests.get(
+                search_url, data=query_str, headers=headers, timeout=QUERY_TIMEOUT_SECONDS
+            )
+            if res.status_code in (200, 201, 202):
+                break
+            print(
+                f"  Warning: OpenSearch returned {res.status_code}, attempt {attempt + 1}/{DEFAULT_RETRY_COUNT}"
+            )
+        else:
+            raise RuntimeError(
+                f"OpenSearch query failed after {DEFAULT_RETRY_COUNT} attempts: "
+                f"{res.status_code} {res.text[:200]}"
+            )
 
+        data = res.json()
         buckets = data["aggregations"]["by_test"]["buckets"]
         page += 1
         print(f"  Page {page}: got {len(buckets)} buckets")
@@ -165,18 +178,6 @@ parser.add_argument(
     "--days", type=int, default=3, help="Number of days to look back in OpenSearch (default: 3)."
 )
 parser.add_argument(
-    "--opensearch-url",
-    type=str,
-    default=None,
-    help="OpenSearch base URL. Defaults to OPEN_SEARCH_DB_BASE_URL env var or http://gpuwa.nvidia.com/opensearch.",
-)
-parser.add_argument(
-    "--opensearch-credentials",
-    type=str,
-    default=None,
-    help="OpenSearch credentials as 'user:password'. Defaults to OPEN_SEARCH_DB_CREDENTIALS env var.",
-)
-parser.add_argument(
     "--test-list-dir",
     type=str,
     default=DEFAULT_TEST_LIST_DIR,
@@ -201,17 +202,8 @@ else:
     NEW_TEST_DURATION = args.duration_file
 
 if args.from_opensearch:
-    opensearch_url = (
-        args.opensearch_url
-        or os.environ.get("OPEN_SEARCH_DB_BASE_URL")
-        or "http://gpuwa.nvidia.com/opensearch"
-    )
-    opensearch_creds = (
-        args.opensearch_credentials or os.environ.get("OPEN_SEARCH_DB_CREDENTIALS") or ""
-    )
-
-    print(f"Querying OpenSearch at {opensearch_url} for last {args.days} day(s)...")
-    test_durations = query_opensearch_durations(opensearch_url, opensearch_creds, args.days)
+    print(f"Querying OpenSearch for last {args.days} day(s)...")
+    test_durations = query_opensearch_durations(args.days)
     raw_count = len(test_durations)
 
     # Filter against the turtle test-db lists: an aggregated turtle name may be
@@ -241,7 +233,7 @@ if args.from_opensearch:
         json.dump(test_durations, file, indent=3)
 
     print("\nSummary:")
-    print(f"  OpenSearch URL         : {opensearch_url}")
+    print(f"  OpenSearch index       : {OPENSEARCH_INDEX}")
     print(f"  Days looked back       : {args.days}")
     print(f"  Turtle names from query: {raw_count}")
     print(f"  Dropped (not in lists) : {dropped}")
