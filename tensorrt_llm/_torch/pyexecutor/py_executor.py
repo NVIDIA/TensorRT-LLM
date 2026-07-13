@@ -5291,10 +5291,15 @@ class PyExecutor:
         """Count active requests that are ready for scheduling.
 
         In non-disaggregated mode, all active requests are schedulable.
-        In disaggregated mode, requests still waiting for KV cache
-        transfer (in INIT or transmission-in-progress state) are
-        excluded because they cannot participate in the forward pass
-        until transfer completes.
+        In disaggregated mode, only requests inside the scheduler's
+        schedulability window [CONTEXT_INIT, GENERATION_TO_COMPLETE) are
+        counted, mirroring the MicroBatchScheduler bounds
+        (no_schedule_until_state / no_schedule_after_state). States
+        outside the window — e.g. waiting for KV transfer (below) or
+        awaiting completion bookkeeping (at or above) — cannot produce
+        forward work, so counting them here would suppress the pad dummy
+        while the rank still schedules batch=0, turning can_queue False
+        fleet-wide and stalling every rank.
 
         Returns:
             The number of active requests eligible for scheduling.
@@ -5302,12 +5307,19 @@ class PyExecutor:
         if self.kv_cache_transceiver is None:
             return len(self.active_requests)
 
-        def _is_awaiting_kv_transfer(req) -> bool:
-            return (req.is_disagg_generation_init_state
-                    or req.is_disagg_generation_transmission_in_progress)
+        # Both bounds must match the scheduler exactly. The lower bound
+        # covers e.g. DISAGG_GENERATION_INIT / TRANS_IN_PROGRESS and
+        # DISAGG_CONTEXT_WAIT_SCHEDULER (gen-first mode on the context
+        # server); the upper bound covers GENERATION_TO_COMPLETE and the
+        # terminal / post-completion disagg states. Disaggregated serving
+        # is decoder-only, so the scheduler's until-state is CONTEXT_INIT
+        # here (the ENCODER_INIT variant only applies to encoder-decoder
+        # models, which have no disagg path).
+        context_init_value = LlmRequestState.CONTEXT_INIT.value
+        to_complete_value = LlmRequestState.GENERATION_TO_COMPLETE.value
 
         return sum(1 for req in self.active_requests
-                   if not _is_awaiting_kv_transfer(req))
+                   if context_init_value <= req.state_value < to_complete_value)
 
     def _should_skip_dummy_for_benchmark_disagg(
             self, num_schedulable_requests: int) -> bool:
@@ -5382,13 +5394,26 @@ class PyExecutor:
                     and self.max_num_tokens is not None):
                 token_nums = [self.max_num_tokens]
             dummy_request_ids = [ATTENTION_DP_DUMMY_REQUEST_ID]
-            llm_request = self.kv_cache_manager.add_dummy_requests(
+            dummy_requests = self.kv_cache_manager.add_dummy_requests(
                 request_ids=dummy_request_ids,
                 token_nums=token_nums,
                 is_gen=self._adp_dummy_is_gen,
                 prepare_resource=True,
                 max_num_draft_tokens=self.max_total_draft_tokens,
-            )[0]
+            )
+            if not dummy_requests:
+                # No free KV/mamba resources for even a 1-token dummy —
+                # possible while non-schedulable requests (e.g. awaiting
+                # completion bookkeeping or KV transfer) still hold theirs.
+                # Skip padding: this rank schedules an empty batch and the
+                # fleet skips one iteration; the resource-holding requests
+                # finish within an iteration or two and padding succeeds on
+                # the retry. Crashing here (the old unchecked [0]) is worse.
+                logger.warning(
+                    "Cannot allocate ADP pad dummy (no free cache resources);"
+                    " rank schedules an empty batch this iteration.")
+                return
+            llm_request = dummy_requests[0]
             llm_request.is_attention_dp_dummy = True
             spec_resource_manager = self.resource_manager.get_resource_manager(
                 ResourceManagerType.SPEC_RESOURCE_MANAGER)

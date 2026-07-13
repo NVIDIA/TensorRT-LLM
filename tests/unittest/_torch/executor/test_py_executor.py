@@ -1162,6 +1162,13 @@ _STATE_GENERATION_TO_COMPLETE = LlmRequestState.GENERATION_TO_COMPLETE
 _STATE_DISAGG_GENERATION_INIT = "_disagg_init_sentinel"
 _STATE_DISAGG_GENERATION_TRANS_IN_PROGRESS = "_disagg_trans_sentinel"
 
+# The sentinel mocks must expose the real state ints: the pad predicate
+# compares state_value against the scheduler window bounds.
+_SENTINEL_STATE_VALUES = {
+    _STATE_DISAGG_GENERATION_INIT: LlmRequestState.DISAGG_GENERATION_INIT.value,
+    _STATE_DISAGG_GENERATION_TRANS_IN_PROGRESS: LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS.value,
+}
+
 
 def _make_adp_request(
     state,
@@ -1174,6 +1181,11 @@ def _make_adp_request(
 ):
     req = Mock()
     req.state = state
+    req.state_value = (
+        state.value
+        if isinstance(state, LlmRequestState)
+        else _SENTINEL_STATE_VALUES.get(state, LlmRequestState.GENERATION_IN_PROGRESS.value)
+    )
     req.py_request_id = request_id
     req.is_child = is_child
     req.parent_request_id = parent_request_id
@@ -1318,6 +1330,54 @@ def test_pad_dummy_counts_generation_to_complete():
 
     assert stub.add_dummy_calls == []
     assert len(stub.active_requests) == 1
+
+
+def test_pad_dummy_added_when_only_to_complete_requests_disagg():
+    # In disaggregated mode a GENERATION_TO_COMPLETE request is refused by
+    # MicroBatchScheduler (no_schedule_after_state), so a rank holding only
+    # such requests schedules batch=0. It must receive a pad dummy, or
+    # can_queue goes False fleet-wide and pad dummies leak on other ranks.
+    stub = _StubADPExecutor()
+    stub.active_requests = [_make_adp_request(_STATE_GENERATION_TO_COMPLETE)]
+    stub.expected_num_active_requests = 2
+
+    _run_pad(stub)
+
+    assert len(stub.add_dummy_calls) == 1
+    assert len(stub.active_requests) == 2
+
+
+def test_pad_dummy_added_when_only_wait_scheduler_requests_disagg():
+    # Gen-first mode on the context server: DISAGG_CONTEXT_WAIT_SCHEDULER
+    # sits BELOW the scheduler's window [CONTEXT_INIT, GENERATION_TO_COMPLETE)
+    # (no_schedule_until_state), so a rank holding only such requests
+    # schedules batch=0 and must receive a pad dummy — the left-boundary
+    # mirror of the TO_COMPLETE case above.
+    stub = _StubADPExecutor()
+    stub.active_requests = [_make_adp_request(LlmRequestState.DISAGG_CONTEXT_WAIT_SCHEDULER)]
+    stub.expected_num_active_requests = 2
+
+    _run_pad(stub)
+
+    assert len(stub.add_dummy_calls) == 1
+    assert len(stub.active_requests) == 2
+
+
+def test_pad_dummy_allocation_failure_skips_padding():
+    # add_dummy_requests returns None when the rank has no free cache
+    # resources for even a 1-token dummy (possible while non-schedulable
+    # requests still hold theirs). Padding must degrade to a skipped
+    # iteration, not crash on an unchecked [0].
+    stub = _StubADPExecutor()
+    stub.active_requests = [_make_adp_request(_STATE_GENERATION_TO_COMPLETE)]
+    stub.expected_num_active_requests = 2
+    stub.kv_cache_manager.add_dummy_requests.side_effect = None
+    stub.kv_cache_manager.add_dummy_requests.return_value = None
+
+    _run_pad(stub)
+
+    assert len(stub.active_requests) == 1
+    assert not any(r.is_attention_dp_dummy for r in stub.active_requests)
 
 
 def test_pad_dummy_skips_when_active_request_present():
