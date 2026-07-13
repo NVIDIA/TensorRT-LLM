@@ -30,7 +30,7 @@ COSMOS3_720P_PARAMS = {
     "width": 1280,
     "num_inference_steps": 35,
     "guidance_scale": 6.0,
-    "max_sequence_length": 4096,
+    "max_sequence_length": 1024,
     "num_frames": 189,
     "frame_rate": 24.0,
 }
