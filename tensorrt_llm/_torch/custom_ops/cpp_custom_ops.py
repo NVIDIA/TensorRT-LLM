@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from typing import List, Optional, Tuple
 
 import torch
@@ -497,7 +512,11 @@ def _register_fake():
         num_experts: int,
         eplb_local_stats: Optional[torch.Tensor] = None,
         active_rank_mask: Optional[torch.Tensor] = None,
+        execution_control: Optional[torch.Tensor] = None,
+        expected_execution_epoch: int = 0,
     ) -> Tuple[List[torch.Tensor], int, torch.Tensor]:
+        if execution_control is None:
+            raise RuntimeError("execution_control is required")
         recv_tensors: List[torch.Tensor] = []
         for payload in input_payloads:
             elements_per_token = payload.shape[1]
@@ -528,7 +547,11 @@ def _register_fake():
         payload_in_workspace: bool,
         use_low_precision: bool = False,
         active_rank_mask: Optional[torch.Tensor] = None,
+        execution_control: Optional[torch.Tensor] = None,
+        expected_execution_epoch: int = 0,
     ) -> torch.Tensor:
+        if execution_control is None:
+            raise RuntimeError("execution_control is required")
         return payload.new_empty((local_num_tokens, payload.shape[2]))
 
     @torch.library.register_fake("trtllm::moe_a2a_initialize")
