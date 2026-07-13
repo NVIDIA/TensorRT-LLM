@@ -2544,31 +2544,6 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             return True
         return False
 
-    def _handle_finish_reasons(
-        self,
-        request: LlmRequest,
-        finish_reasons: torch.Tensor,
-        finish_reasons_list: list[list[list[int]]],
-    ) -> bool:
-        """Check if all beams of a request have finished and set the request state accordingly
-
-        Args:
-            request: LlmRequest. The request to check.
-            finish_reasons: torch.Tensor. Shape: (max_tokens, max_batch_size, max_beam_width)
-                            The finish reasons for each beam.
-            finish_reasons_list: list[list[list[int]]]. The finish reasons for each beam.
-        Returns:
-            True if all beams have finished, False otherwise.
-        """
-        assert request.py_seq_slot is not None
-        beam_width = request.py_beam_width
-        return self._handle_finish_reasons_impl(
-            request,
-            beam_width,
-            finish_reasons[DEFAULT_STEP_IDX, request.py_seq_slot],
-            finish_reasons_list[request.py_seq_slot][DEFAULT_STEP_IDX],
-        )
-
     def _handle_first_finish_reasons(
         self,
         request: LlmRequest,
@@ -4465,37 +4440,6 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             logits_cuda = raw_logits_cuda[logits_begin_offset:]
 
         return sampling_requests, sampling_requests_metadata, logits_cuda
-
-    @staticmethod
-    def _longest_stop_word_len(requests: Iterable[LlmRequest]) -> int:
-        max_stop_word_len = 0
-        for req in requests:
-            assert req.py_stop_words_list is not None
-            _, cumsum = req.py_stop_words_list
-            if -1 in cumsum:
-                cumsum = cumsum[: cumsum.index(-1)]
-            request_max_stop_word_len = np.max(np.diff(cumsum, prepend=0), initial=0).item()
-            max_stop_word_len = max(max_stop_word_len, request_max_stop_word_len)
-        return max_stop_word_len
-
-    @staticmethod
-    def _requests_with_stop_words(requests: list[LlmRequest]) -> list[LlmRequest]:
-        return [
-            r
-            for r in requests
-            if (r.py_stop_words_list is not None and len(r.py_stop_words_list[0]) > 0)
-        ]
-
-    def _request_indices_with_stop_words(self, requests: list[LlmRequest]) -> torch.Tensor:
-        return torch.tensor(
-            [
-                ridx
-                for ridx, r in enumerate(requests)
-                if (r.py_stop_words_list is not None and len(r.py_stop_words_list[0]) > 0)
-            ],
-            dtype=torch.int32,
-            pin_memory=prefer_pinned(),
-        ).to(device="cuda", non_blocking=True)
 
     @nvtx_range("_process_logprobs")
     def _process_logprobs(
