@@ -800,7 +800,7 @@ TEST_F(KVCacheManagerTest, FP4BlockScaleManagementTest)
     EXPECT_EQ(blockManager.getBlockSize(0) * numFp4EltsPerContainer / vectorSize, blockManager.getBlockSize(1));
 }
 
-TEST_F(KVCacheManagerTest, FP4AttentionWithInt8RecurrentStatesPoolTest)
+TEST_F(KVCacheManagerTest, FP4AttentionWithHalfRecurrentStatesPoolTest)
 {
     auto constexpr numKvHeads = 2;
     auto constexpr sizePerHead = 16;
@@ -823,7 +823,7 @@ TEST_F(KVCacheManagerTest, FP4AttentionWithInt8RecurrentStatesPoolTest)
         {maxAttentionWindow, {blocksInPrimaryPool, blocksInSecondaryPool}},
     };
     auto const poolConfigurations = std::vector<PoolConfiguration>{
-        {recurrentStatesWindow, sizePerHead, nvinfer1::DataType::kINT8},
+        {recurrentStatesWindow, sizePerHead, nvinfer1::DataType::kHALF},
         {maxAttentionWindow, sizePerHead, nvinfer1::DataType::kFP4},
     };
     auto const stream = std::make_shared<tr::CudaStream>();
@@ -838,13 +838,14 @@ TEST_F(KVCacheManagerTest, FP4AttentionWithInt8RecurrentStatesPoolTest)
     kvCacheManager.allocatePools(/*useUvm=*/false);
     auto const& blockManager = kvCacheManager.getBlockManager();
 
-    EXPECT_EQ(blockManager.getDataTypeForWindow(recurrentStatesWindow), nvinfer1::DataType::kINT8);
+    EXPECT_EQ(blockManager.getDataTypeForWindow(recurrentStatesWindow), nvinfer1::DataType::kHALF);
     EXPECT_EQ(blockManager.getDataTypeForWindow(maxAttentionWindow), nvinfer1::DataType::kFP4);
 
     auto const& recurrentStatesPool = blockManager.getRecurrentStatesPool();
     ASSERT_NE(recurrentStatesPool.primaryPtr, nullptr);
-    EXPECT_EQ(recurrentStatesPool.primaryPtr->getDataType(), nvinfer1::DataType::kINT8);
-    EXPECT_EQ(recurrentStatesPool.blockSize, recurrentStatesBytes);
+    EXPECT_EQ(recurrentStatesPool.primaryPtr->getDataType(), nvinfer1::DataType::kHALF);
+    auto const recurrentStatesElementsPerBlock = recurrentStatesBytes / tc::getDTypeSize(nvinfer1::DataType::kHALF);
+    EXPECT_EQ(recurrentStatesPool.blockSize, recurrentStatesElementsPerBlock);
 
     SizeType32 numRecurrentScalePools = 0;
     SizeType32 numAttentionScalePools = 0;
