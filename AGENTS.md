@@ -13,6 +13,8 @@ Python and C++ codebase supporting TensorRT engine-based and PyTorch-based execu
 - `git commit -s` (DCO sign-off required). Never attribute AI tools in sign-off line. Always rely on `git` to do the sign off instead of directly adding sign off in commit message.
 - Do not add co-authors to the git commit message unless explicitly instructed to do so by the user.
 - `pre-commit` hooks run on commit — if files are modified by hooks, re-stage and commit again
+- LLM args or nested-config changes must run `python3 scripts/generate_llm_args_golden_manifest.py` and commit
+  `tensorrt_llm/usage/llm_args_golden_manifest.json`; new fields require telemetry/privacy CODEOWNER approval
 - PR title format: `[JIRA/NVBUG/None][type] description` (e.g., `[TRTLLM-5516][perf] optimize cuda graph padding`)
 - Set `LLM_MODELS_ROOT` env var when running tests that need model weights
 
@@ -83,7 +85,7 @@ HuggingFace Model → LLM API → Executor (PyTorch/AutoDeploy/TensorRT)
 | `tensorrt_llm/executor/executor.py` | Execution abstraction (`GenerationExecutor`) |
 | `tensorrt_llm/models/automodel.py` | Auto-discovery and model registry |
 | `tensorrt_llm/_torch/models/` | PyTorch backend model implementations (distinct from `models/` used by TensorRT backend) |
-| `tensorrt_llm/_torch/modules/ATTENTION_DEVELOPER_GUIDE.md` | Attention, MLA, backend families, sparse backends, metadata contracts, and KV-cache behavior - **read before modifying `tensorrt_llm/_torch/modules/attention.py` or `tensorrt_llm/_torch/attention_backend/`** |
+| `tensorrt_llm/_torch/modules/ATTENTION_DEVELOPER_GUIDE.md` | Attention, MLA, backend families, sparse backends, metadata contracts, and KV-cache behavior - **read before modifying `tensorrt_llm/_torch/modules/attention.py`, `tensorrt_llm/_torch/modules/mla.py`, or `tensorrt_llm/_torch/attention_backend/`** |
 | `tensorrt_llm/_torch/modules/fused_moe/MOE_DEVELOPER_GUIDE.md` | MoE architecture, backends, communication, development patterns — **read before modifying MoE code** |
 | `CODING_GUIDELINES.md` | C++ and Python coding standards (referenced throughout, must read before contributing) |
 
@@ -110,6 +112,7 @@ Key entry points:
 - Serving CLI: `trtllm-serve --model <HF id> --visual_gen_args <YAML path>`.
 
 Key files:
+- `tensorrt_llm/_torch/visual_gen/ENGINEERING_CRITERIA.md`: **Engineering criteria for any change under `tensorrt_llm/visual_gen/` or `tensorrt_llm/_torch/visual_gen/`** — API discipline, feature/test/lossy-vs-lossless requirements, examples & docs rules. Read before modifying anything in those trees.
 - `tensorrt_llm/visual_gen/`: VisualGen public Python API. **User-facing surface — before modifying anything here, pause and confirm with the user that a public API change is actually intended; do not infer it from the surrounding task.**
 - `tensorrt_llm/_torch/visual_gen/`: VisualGen internal implementation. All non-user-facing code belongs here.
 
@@ -144,8 +147,9 @@ Key files:
 The `gh` CLI uses `~/.config/gh` by default for authentication. Different GitHub hosts or forks may require a different config directory. **Before running any `gh` command** (e.g., `gh pr create`, `gh api`, `gh pr comment`):
 
 1. Check if the user has specified a custom `GH_CONFIG_DIR` (e.g., in `CLAUDE.local.md` or environment). If so, use it.
-2. If not explicitly set, **ask the user** whether the default `~/.config/gh` is correct or if a different directory should be used. This is especially relevant when the PR target is a fork (e.g., `nv-auto-deploy/TensorRT-LLM`) rather than `NVIDIA/TensorRT-LLM`.
+2. If not explicitly set, default to `~/.config/gh`; do not ask for confirmation.
 3. Prefix all `gh` commands with the resolved config dir: `GH_CONFIG_DIR=<path> gh ...`
+4. If the command fails due to missing authentication or the wrong GitHub host/account, report the failure and ask for the correct `GH_CONFIG_DIR`.
 
 ## CI / Testing
 

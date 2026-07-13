@@ -1,8 +1,9 @@
 import transformers
 
 # Importing _torch.configs triggers AutoConfig registration for TRT-LLM-only
-# model_types (deepseek_v32, kimi_k2) so AutoTokenizer.from_pretrained works
-# under transformers >= 5.5; see _torch/configs/__init__.py.
+# model_types (deepseek_v32, kimi_k2, gemma4_unified) so AutoConfig /
+# AutoTokenizer.from_pretrained work under transformers >= 5.5; see
+# _torch/configs/__init__.py.
 import tensorrt_llm._torch.configs  # noqa: F401
 
 from .modeling_afmoe import AfmoeForCausalLM
@@ -12,12 +13,17 @@ from .modeling_bart import (BartForConditionalGeneration,
 from .modeling_bert import BertForSequenceClassification
 from .modeling_clip import CLIPVisionModel
 from .modeling_cohere2 import Cohere2ForCausalLM
+from .modeling_cosmos3 import Cosmos3Model
 from .modeling_deepseekv3 import DeepseekV3ForCausalLM
+from .modeling_deepseekv4 import DeepseekV4ForCausalLM
 from .modeling_exaone4 import Exaone4ForCausalLM
 from .modeling_exaone4_5 import Exaone4_5_ForConditionalGeneration
 from .modeling_exaone_moe import ExaoneMoeForCausalLM
 from .modeling_gemma3 import Gemma3ForCausalLM
 from .modeling_gemma3vl import Gemma3VLM
+from .modeling_gemma4 import Gemma4ForCausalLM
+from .modeling_gemma4_unified import Gemma4UnifiedForConditionalGeneration
+from .modeling_gemma4mm import Gemma4ForConditionalGeneration
 from .modeling_glm import Glm4MoeForCausalLM
 from .modeling_gpt_oss import GptOssForCausalLM
 from .modeling_hunyuan_dense import HunYuanDenseV1ForCausalLM
@@ -42,7 +48,8 @@ from .modeling_qwen import (Qwen2ForCausalLM, Qwen2ForProcessRewardModel,
                             Qwen2ForRewardModel)
 from .modeling_qwen2vl import Qwen2_5_VLModel, Qwen2VLModel
 from .modeling_qwen3 import Qwen3ForCausalLM
-from .modeling_qwen3_5 import Qwen3_5ForCausalLM, Qwen3_5MoeForCausalLM
+from .modeling_qwen3_5 import (Qwen3_5ForCausalLM, Qwen3_5MoeForCausalLM,
+                               Qwen3_5MoeVLModel, Qwen3_5VLModel)
 from .modeling_qwen3_moe import Qwen3MoeForCausalLM
 from .modeling_qwen3_next import Qwen3NextForCausalLM
 from .modeling_qwen3vl import Qwen3VLModel
@@ -65,12 +72,16 @@ __all__ = [
     "BartForConditionalGeneration",
     "BertForSequenceClassification",
     "CLIPVisionModel",
+    "Cosmos3Model",
     "DeepseekV3ForCausalLM",
     "Exaone4ForCausalLM",
     "Exaone4_5_ForConditionalGeneration",
     "ExaoneMoeForCausalLM",
     "Gemma3ForCausalLM",
     "Gemma3VLM",
+    "Gemma4ForCausalLM",
+    "Gemma4ForConditionalGeneration",
+    "Gemma4UnifiedForConditionalGeneration",
     "HCXVisionForCausalLM",
     "LagunaForCausalLM",
     "HunYuanDenseV1ForCausalLM",
@@ -81,6 +92,7 @@ __all__ = [
     "Mistral3VLM",
     "MistralForCausalLM",
     "MixtralForCausalLM",
+    "DeepseekV4ForCausalLM",
     "NemotronH_Nano_VL_V2",
     "NemotronForCausalLM",
     "NemotronHForCausalLM",
@@ -104,6 +116,8 @@ __all__ = [
     "Qwen3_5ForCausalLM",
     "Qwen3_5MoeForCausalLM",
     "QwenImageBenchModel",
+    "Qwen3_5MoeVLModel",
+    "Qwen3_5VLModel",
     "Qwen3NextForCausalLM",
     "Qwen3MoeVLModel",
     "GptOssForCausalLM",
@@ -126,15 +140,3 @@ else:
     print(
         f"Failed to import MllamaForConditionalGeneration as transformers.__version__ {transformers.__version__} < 4.45.1"
     )
-
-# Gemma4 requires transformers>=5.5.0 (native Gemma4 config/model classes).
-# Import silently on failure -- `get_model_architecture` in modeling_utils.py
-# raises a targeted "upgrade transformers" error only when the user actually
-# tries to load a Gemma4 model.
-try:
-    from .modeling_gemma4 import Gemma4ForCausalLM  # noqa
-    from .modeling_gemma4mm import Gemma4ForConditionalGeneration  # noqa
-
-    __all__.extend(["Gemma4ForCausalLM", "Gemma4ForConditionalGeneration"])
-except ImportError:
-    pass

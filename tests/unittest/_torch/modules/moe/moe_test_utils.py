@@ -691,19 +691,24 @@ def should_skip_cutlass(
     if backend_type != MoeBackendType.CUTLASS:
         return None
 
-    # TP per-shard alignment: W8A16, NVFP4, and W4A8_AWQ require 128-aligned
-    # per-shard intermediate_size. W8A16 fails in preprocess_weights_for_mixed_gemm
-    # (num_rows % rows_per_tile != 0). NVFP4 pads to 128-alignment
-    # (NVFP4_ROW_ALIGNMENT in quantization.py:2312) but zero-padding +
-    # blockwise quantization interaction causes ~6-7% mismatch.
+    # TP per-shard alignment: W8A16, NVFP4, W4A8_AWQ, and MXFP8 require
+    # 128-aligned per-shard intermediate_size. W8A16 fails in
+    # preprocess_weights_for_mixed_gemm (num_rows % rows_per_tile != 0). NVFP4
+    # pads to 128-alignment (NVFP4_ROW_ALIGNMENT in quantization.py:2312) but
+    # zero-padding + blockwise quantization interaction causes ~6-7% mismatch.
     # W4A8_AWQ (WInt4AFP8FusedMoEMethod) requires K dimensions to be multiples
     # of 128 on SM90 for interleave factor selection (quantization.py:1310-1324).
+    # MXFP8 (MXFP8CutlassFusedMoEMethod) hard-asserts
+    # intermediate_size_per_partition % 128 == 0 in create_weights for its
+    # int32 UE8M0 SF packing, so a non-128-aligned per-shard intermediate
+    # raises AssertionError.
     # W4A8_MXFP4_MXFP8 uses MXFP4 auto-padding that handles this correctly.
     if moe_tp_size > 1 and model_config is not None:
         tp_alignment_quants = {
             QuantAlgo.W8A16,
             QuantAlgo.NVFP4,
             QuantAlgo.W4A8_AWQ,
+            QuantAlgo.MXFP8,
         }
         # FP8_BLOCK_SCALES has this issue only on Hopper (SM90)
         if torch.cuda.get_device_capability(0) == (9, 0):

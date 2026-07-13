@@ -403,6 +403,7 @@ class ModelLoader:
             "fp8": QuantAlgo.FP8,
             "nvfp4": QuantAlgo.NVFP4,
         }.get(kv_cache_dtype)
+        requires_global_quant_config_fallback = False
 
         hf_quant_config_path = f"{self._model_dir}/hf_quant_config.json"
         if os.path.exists(hf_quant_config_path):
@@ -423,9 +424,20 @@ class ModelLoader:
                     )
             except FileNotFoundError:
                 pass
-            self._apply_modelopt_quant_config(normalized,
-                                              explicit_kv_cache_quant_algo)
-            return True
+            if normalized.get("quant_algo") is None:
+                if normalized.get("quantized_layers") is not None:
+                    requires_global_quant_config_fallback = True
+                    logger.info(
+                        "hf_quant_config.json does not set a global quant_algo; "
+                        "falling back to config.json or model_kwargs for global "
+                        "quantization.")
+                else:
+                    raise ValueError(
+                        "Pre-quantized checkpoint must have quant_algo.")
+            else:
+                self._apply_modelopt_quant_config(normalized,
+                                                  explicit_kv_cache_quant_algo)
+                return True
 
         hf_config_path = f"{self._model_dir}/config.json"
         hf_quant_config = None
@@ -447,6 +459,11 @@ class ModelLoader:
                 f"Use quantization_config from {hf_config_path}: quantization_config={hf_quant_config}"
             )
 
+        if requires_global_quant_config_fallback and hf_quant_config is None:
+            raise ValueError(
+                "hf_quant_config.json does not set a global quant_algo and no "
+                "quantization_config fallback was found.")
+
         if hf_quant_config is not None:
             if is_modelopt_quant_config(hf_quant_config):
                 self._apply_modelopt_quant_config(
@@ -458,6 +475,8 @@ class ModelLoader:
             if hf_quant_config.get("quant_method") == "fp8":
                 if hf_quant_config.get("weight_block_size") is not None:
                     quant_config.quant_algo = QuantAlgo.FP8_BLOCK_SCALES
+                    quant_config.group_size = hf_quant_config[
+                        "weight_block_size"][0]
                     quant_config.exclude_modules = ["*eh_proj"]
                 else:
                     # Ministral 3 static quant
@@ -682,15 +701,19 @@ class ModelLoader:
             trust_remote_code: bool = True,
             **kwargs) -> Optional[transformers.PretrainedConfig]:
         try:
-            # Route via AutoConfig so model_types registered through
-            # transformers.models.auto.configuration_auto.CONFIG_MAPPING
-            # (e.g. deepseek_v32 / kimi_k2 via tensorrt_llm/_torch/configs/)
-            # are dispatched to their TRT-LLM-local config class. Calling
-            # PretrainedConfig.from_pretrained directly bypasses CONFIG_MAPPING
-            # and on transformers 5.5.x returns a bare PretrainedConfig that
-            # lacks attributes like max_position_embeddings.
-            return transformers.AutoConfig.from_pretrained(
-                model_dir, trust_remote_code=trust_remote_code, **kwargs)
+            # Route via load_pretrained_config so model_types registered in
+            # TRT-LLM's _CONFIG_REGISTRY (e.g. deepseek_v32 / kimi_k2 /
+            # glm_moe_dsa) are dispatched to their TRT-LLM-local config class
+            # and get the same compat handling as the engine's own config load
+            # (e.g. dropping GLM-MoE-DSA's unsupported layer_types); it falls
+            # back to AutoConfig for everything else. Calling AutoConfig /
+            # PretrainedConfig.from_pretrained directly here would instead hit
+            # transformers' validate_layer_type and return None.
+            from tensorrt_llm._torch.pyexecutor.config_utils import \
+                load_pretrained_config
+            return load_pretrained_config(model_dir,
+                                          trust_remote_code=trust_remote_code,
+                                          **kwargs)
         except Exception as e:
             logger.warning(
                 f"Failed to load hf model config from {model_dir}, encountered error: {e}"
@@ -1107,3 +1130,24 @@ def apply_model_defaults_to_llm_args(
         return applied
 
     return _compute_applied(model_defaults_dict, user_overrides)
+
+
+def _resolve_kv_cache_manager_v2_auto(
+        llm_args: 'TorchLlmArgs', model_defaults_dict: Dict[str, Any]) -> bool:
+    """Resolve the KV cache manager auto setting after model defaults are applied."""
+    setting = llm_args.kv_cache_config.use_kv_cache_manager_v2
+    if setting != "auto":
+        return setting
+
+    kv_cache_defaults = model_defaults_dict.get("kv_cache_config", {})
+    model_default = (kv_cache_defaults.get("use_kv_cache_manager_v2", False)
+                     if isinstance(kv_cache_defaults, dict) else False)
+    if model_default == "auto":
+        model_default = False
+    if not isinstance(model_default, bool):
+        raise ValueError(
+            "Model default kv_cache_config.use_kv_cache_manager_v2 must be "
+            f"True, False, or 'auto', got {model_default!r}.")
+
+    llm_args.kv_cache_config.use_kv_cache_manager_v2 = model_default
+    return model_default
