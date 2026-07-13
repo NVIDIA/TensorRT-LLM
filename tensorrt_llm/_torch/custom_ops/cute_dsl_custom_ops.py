@@ -3947,6 +3947,297 @@ if IS_CUTLASS_DSL_AVAILABLE:
         ret = mat_a.new_empty(shape, dtype=torch.bfloat16)
         return ret
 
+    class CuteDSLFp8SplitKGemmRunner:
+        """DSV4-Pro O_b runner using native block-scaled tcgen05 MMA."""
+
+        kernel_class = Sm100BlockScaledPersistentDenseGemmKernel
+        kernel_cache = dict()
+        alpha_cache = dict()
+        active_clusters_cache = dict()
+        _TILE_M = 256
+        _CLUSTER_M = 2
+        _M_BUCKET = 64
+        _TILE_N_GRANULARITY = 16
+        _MAX_SWAPPED_TILE_N = 240
+        _SCALE_BLOCK_K = 128
+        _SCALES_PER_WORD = 4
+        _PACKED_SCALE_K = _SCALE_BLOCK_K * _SCALES_PER_WORD
+
+        def __init__(self, use_tvm_ffi: bool = True):
+            self.use_tvm_ffi = use_tvm_ffi
+
+        @classmethod
+        def _get_swapped_tile_n(cls, m: int, n: int,
+                                max_active_clusters: int) -> int:
+            bucket_m = pad_up(m, cls._M_BUCKET)
+            if bucket_m <= cls._TILE_M * cls._CLUSTER_M:
+                return pad_up(ceil_div(bucket_m, cls._CLUSTER_M),
+                              cls._TILE_N_GRANULARITY)
+
+            # Fill complete cluster waves within the tile-N cap.
+            clusters_per_n_tile = ceil_div(n, cls._TILE_M)
+            min_n_tiles = ceil_div(bucket_m, cls._MAX_SWAPPED_TILE_N)
+            waves = ceil_div(
+                min_n_tiles * clusters_per_n_tile,
+                max_active_clusters,
+            )
+            available_clusters = waves * max_active_clusters
+            n_tiles = max(
+                1,
+                available_clusters // clusters_per_n_tile,
+            )
+            return pad_up(ceil_div(bucket_m, n_tiles), cls._TILE_N_GRANULARITY)
+
+        @classmethod
+        def _get_no_swap_tile_n(cls, m: int, num_splits: int) -> Optional[int]:
+            if num_splits != 1:
+                return None
+            # Small-M no-swap cases avoid underfilled swapped tiles.
+            if (448 <= m <= cls._TILE_M * cls._CLUSTER_M
+                    and m % cls._M_BUCKET == 0):
+                return 208
+
+            # No-swap resonances repeat every seven M tiles from M=2304.
+            m_tiles = ceil_div(m, cls._TILE_M)
+            first_resonant_m_tiles = 9
+            resonance_period_m_tiles = 7
+            is_resonant = (m_tiles >= first_resonant_m_tiles
+                           and (m_tiles - first_resonant_m_tiles) %
+                           resonance_period_m_tiles == 0)
+            if m % cls._TILE_M == 0 and is_resonant:
+                return 224
+            return None
+
+        @classmethod
+        def _get_tactic(cls, m: int, n: int, num_splits: int,
+                        max_active_clusters: int):
+            if num_splits > 1 and m <= cls._M_BUCKET // 2:
+                # A 128x32 tile exposes more work at tiny M.
+                return ((cls._TILE_M // cls._CLUSTER_M,
+                         cls._M_BUCKET // cls._CLUSTER_M), (cls._CLUSTER_M, 1),
+                        True, None, True)
+            no_swap_tile_n = cls._get_no_swap_tile_n(m, num_splits)
+            if no_swap_tile_n is not None:
+                # Grouped L2 traversal regresses at the M=2304 resonance.
+                return ((cls._TILE_M, no_swap_tile_n), (cls._CLUSTER_M, 1),
+                        False, None, m != 2304)
+
+            tile_n = cls._get_swapped_tile_n(m, n, max_active_clusters)
+            if num_splits > 1 and m <= 2 * cls._M_BUCKET:
+                tile_n = cls._M_BUCKET if m <= cls._M_BUCKET else 2 * cls._M_BUCKET
+            max_ab_stages = 8 if m <= cls._M_BUCKET else None
+            return ((cls._TILE_M, tile_n), (cls._CLUSTER_M, 1), True,
+                    max_ab_stages, True)
+
+        def forward(self, inputs: List[torch.Tensor], num_splits: int) -> None:
+            a_tensor, a_sf_tensor, b_tensor, b_sf_tensor, partials = inputs
+            m, k = a_tensor.shape
+            n = b_tensor.shape[0]
+            c_tmp = partials.permute(1, 2, 0)
+
+            device_key = a_tensor.device
+            max_active_clusters = self.__class__.active_clusters_cache.get(
+                device_key)
+            if max_active_clusters is None:
+                max_active_clusters = cutlass.utils.HardwareInfo(
+                ).get_max_active_clusters(self._CLUSTER_M)
+                self.__class__.active_clusters_cache[
+                    device_key] = max_active_clusters
+            (mma_tiler_mn, cluster_shape_mn, swap_ab, max_ab_stages,
+             l2_swizzle) = self._get_tactic(m, n, num_splits,
+                                            max_active_clusters)
+            # Large M amortizes a dedicated scale-TMA warp.
+            tma_packed_scales = m >= 512
+            if swap_ab:
+                # Swap M/N to expose more output tiles.
+                kernel_m, kernel_n = n, m
+                kernel_a, kernel_b = b_tensor, a_tensor
+                kernel_sfa, kernel_sfb = b_sf_tensor, a_sf_tensor
+            else:
+                kernel_m, kernel_n = m, n
+                kernel_a, kernel_b = a_tensor, b_tensor
+                kernel_sfa, kernel_sfb = a_sf_tensor, b_sf_tensor
+            kernel_sfa_stride = kernel_sfa.stride(1)
+            kernel_sfb_stride = kernel_sfb.stride(1)
+            # Tail tiles require a runtime MMA-N descriptor.
+            dynamic_mma_n = kernel_n % mma_tiler_mn[1] != 0
+            cache_key = (kernel_m, kernel_n, k, num_splits, kernel_sfa_stride,
+                         kernel_sfb_stride, mma_tiler_mn, cluster_shape_mn,
+                         swap_ab, dynamic_mma_n, max_ab_stages, l2_swizzle,
+                         tma_packed_scales, self.use_tvm_ffi)
+
+            a_ptr = make_ptr(
+                cutlass.Float8E4M3FN,
+                kernel_a.data_ptr(),
+                cute.AddressSpace.gmem,
+                assumed_align=16,
+            )
+            b_ptr = make_ptr(
+                cutlass.Float8E4M3FN,
+                kernel_b.data_ptr(),
+                cute.AddressSpace.gmem,
+                assumed_align=16,
+            )
+            a_sf_ptr = make_ptr(
+                cutlass.Uint32,
+                kernel_sfa.data_ptr(),
+                cute.AddressSpace.gmem,
+                assumed_align=16,
+            )
+            b_sf_ptr = make_ptr(
+                cutlass.Uint32,
+                kernel_sfb.data_ptr(),
+                cute.AddressSpace.gmem,
+                assumed_align=16,
+            )
+            c_cute_tensor = cute.runtime.from_dlpack(c_tmp).mark_layout_dynamic(
+                leading_dim=1)
+            alpha = self.__class__.alpha_cache.get(device_key)
+            if alpha is None:
+                alpha = torch.ones((1, ),
+                                   device=device_key,
+                                   dtype=torch.float32)
+                self.__class__.alpha_cache[device_key] = alpha
+            alpha_cute_tensor = cute.runtime.from_dlpack(alpha)
+            stream = (cute.runtime.make_fake_stream(
+                use_tvm_ffi_env_stream=True) if self.use_tvm_ffi else
+                      cuda.CUstream(torch.cuda.current_stream().cuda_stream))
+
+            if cache_key not in self.__class__.kernel_cache:
+                gemm = self.__class__.kernel_class(
+                    32,
+                    mma_tiler_mn,
+                    cluster_shape_mn,
+                    False,
+                    packed_k128_scales=True,
+                    tma_packed_scales=tma_packed_scales,
+                    dynamic_mma_n=dynamic_mma_n,
+                    apply_alpha=False,
+                    max_ab_stages=max_ab_stages,
+                    l2_swizzle=l2_swizzle,
+                )
+                compiled_gemm = cute.compile(
+                    gemm.wrapper_dsv4_splitk_packed_ue8m0,
+                    kernel_m,
+                    kernel_n,
+                    k,
+                    num_splits,
+                    kernel_sfa_stride,
+                    kernel_sfb_stride,
+                    a_ptr,
+                    b_ptr,
+                    a_sf_ptr,
+                    b_sf_ptr,
+                    c_cute_tensor,
+                    alpha_cute_tensor,
+                    max_active_clusters,
+                    stream,
+                    swap_ab,
+                    options=("--opt-level 2 --enable-tvm-ffi"
+                             if self.use_tvm_ffi else "--opt-level 2"),
+                )
+                self.__class__.kernel_cache[cache_key] = compiled_gemm
+            else:
+                compiled_gemm = self.__class__.kernel_cache[cache_key]
+
+            if self.use_tvm_ffi:
+                compiled_gemm(
+                    kernel_a.data_ptr(),
+                    kernel_b.data_ptr(),
+                    kernel_sfa.data_ptr(),
+                    kernel_sfb.data_ptr(),
+                    c_tmp,
+                    alpha,
+                )
+            else:
+                compiled_gemm(
+                    a_ptr,
+                    b_ptr,
+                    a_sf_ptr,
+                    b_sf_ptr,
+                    c_cute_tensor,
+                    alpha_cute_tensor,
+                    stream=stream,
+                )
+
+    @torch.library.custom_op(
+        "trtllm::dsv4_fp8_splitk_gemm",
+        mutates_args=("partials", ),
+        device_types="cuda",
+    )
+    def dsv4_fp8_splitk_gemm(
+        a: torch.Tensor,
+        sfa: torch.Tensor,
+        b: torch.Tensor,
+        sfb: torch.Tensor,
+        partials: torch.Tensor,
+        num_splits: int,
+    ) -> None:
+        """Emit split-major BF16 partials for the DSV4 O_b FP8 GEMM."""
+        if not is_sm_100f():
+            raise ValueError(
+                f"dsv4_fp8_splitk_gemm requires the SM100 family, got {get_sm_version()}"
+            )
+        if num_splits not in (1, 2, 4):
+            raise ValueError(f"num_splits must be 1, 2, or 4, got {num_splits}")
+        if not all(t.is_cuda for t in (a, sfa, b, sfb, partials)):
+            raise ValueError(
+                "all dsv4_fp8_splitk_gemm tensors must be CUDA tensors")
+        if len({t.device for t in (a, sfa, b, sfb, partials)}) != 1:
+            raise ValueError(
+                "all dsv4_fp8_splitk_gemm tensors must be on the same device")
+        if a.dtype != torch.float8_e4m3fn or b.dtype != torch.float8_e4m3fn:
+            raise TypeError("A and B must have dtype torch.float8_e4m3fn")
+        if sfa.dtype != torch.int32 or sfb.dtype != torch.int32:
+            raise TypeError(
+                "SFA and SFB must contain packed int32 UE8M0 scales")
+        if partials.dtype != torch.bfloat16:
+            raise TypeError("partials must have dtype torch.bfloat16")
+        if a.dim() != 2 or b.dim(
+        ) != 2 or not a.is_contiguous() or not b.is_contiguous():
+            raise ValueError("A and B must be contiguous rank-2 tensors")
+
+        m, k = a.shape
+        n = b.shape[0]
+        if b.shape[1] != k:
+            raise ValueError("A and B K dimensions must match")
+        packed_scale_k = CuteDSLFp8SplitKGemmRunner._PACKED_SCALE_K
+        scale_block_k = CuteDSLFp8SplitKGemmRunner._SCALE_BLOCK_K
+        scales_per_word = CuteDSLFp8SplitKGemmRunner._SCALES_PER_WORD
+        if k % (packed_scale_k * num_splits) != 0:
+            raise ValueError(
+                f"K={k} must be divisible by {packed_scale_k}*num_splits")
+        if n % scale_block_k != 0:
+            raise ValueError(f"N={n} must be divisible by {scale_block_k}")
+        if partials.shape != (num_splits, m, n) or not partials.is_contiguous():
+            raise ValueError(
+                f"partials must be contiguous with shape {(num_splits, m, n)}")
+
+        packed_k = k // packed_scale_k
+        if (sfa.dim() != 2 or sfa.shape != (m, packed_k) or sfa.stride(0) != 1
+                or sfa.stride(1) < m or sfa.stride(1) % scales_per_word != 0):
+            raise ValueError(
+                f"SFA must be packed MN-major [M,K/{packed_scale_k}] with "
+                f"{scales_per_word}-aligned K stride")
+        if (sfb.dim() != 2 or sfb.shape != (n, packed_k) or sfb.stride(0) != 1
+                or sfb.stride(1) != n):
+            raise ValueError(
+                f"SFB must be packed MN-major [N,K/{packed_scale_k}]")
+
+        CuteDSLFp8SplitKGemmRunner(use_tvm_ffi=True).forward(
+            [a, sfa, b, sfb, partials], num_splits)
+
+    @torch.library.register_fake("trtllm::dsv4_fp8_splitk_gemm")
+    def _(
+        a: torch.Tensor,
+        sfa: torch.Tensor,
+        b: torch.Tensor,
+        sfb: torch.Tensor,
+        partials: torch.Tensor,
+        num_splits: int,
+    ) -> None:
+        return None
+
     class CuteDSLFp8BlackwellBmmRunner(TunableRunner):
         kernel_class = Sm100BlockwiseGemmKernel
         kernel_cache = dict()
@@ -4208,6 +4499,135 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     stream=stream,
                 )
 
+        def forward_fp8out(
+            self,
+            inputs: List[torch.Tensor],
+            tactic=None,
+        ) -> None:
+            """Run the fixed DSV4 o_a tactic with FP8 and packed-UE8M0 output."""
+            fixed_tactic = (False, (128, 128), (1, 1))
+            use_2cta_instrs, mma_tiler_mn, cluster_shape_mn = (
+                tactic if isinstance(tactic, tuple) else fixed_tactic)
+            if (use_2cta_instrs, mma_tiler_mn,
+                    cluster_shape_mn) != fixed_tactic:
+                raise ValueError("FP8-output BMM supports only the fixed "
+                                 "(1-CTA, 128x128, 1x1 cluster) tactic")
+            if not self.use_tvm_ffi:
+                raise ValueError("FP8-output BMM requires TVM FFI")
+
+            (a_tensor, b_tensor, a_sf_tensor, b_sf_tensor, c_tensor,
+             sf_out_tensor) = inputs
+            batch_size, m, k = a_tensor.shape
+            n = b_tensor.shape[1]
+            aligned_m = pad_up(m, 4)
+            sf_m = aligned_m
+            sf_k = ceil_div(k, 128)
+            sf_n = ceil_div(n, 128)
+            # SMEM cooperation wins through M=32.
+            use_fp8_smem_epilogue = m <= 32
+            fp8_smem_row_iters = ceil_div(m, 16) if use_fp8_smem_epilogue else 1
+
+            if c_tensor.dtype != torch.float8_e4m3fn or c_tensor.shape != (
+                    batch_size, m, n):
+                raise ValueError(
+                    "FP8-output BMM output must have shape [batch, M, N] "
+                    "and dtype float8_e4m3fn")
+            if sf_out_tensor.dtype != torch.int32 or sf_out_tensor.stride() != (
+                    1, aligned_m):
+                raise ValueError(
+                    "FP8-output BMM scales must be int32 with MN-major "
+                    f"stride (1, {aligned_m})")
+
+            c_tmp = c_tensor.permute(1, 2, 0)
+            cache_key = (
+                "fp8out",
+                use_2cta_instrs,
+                mma_tiler_mn,
+                cluster_shape_mn,
+                self.use_tvm_ffi,
+                fp8_smem_row_iters,
+                use_fp8_smem_epilogue,
+            )
+            if cache_key not in self.__class__.kernel_cache:
+                a_ptr = make_ptr(cutlass.Float8E4M3FN,
+                                 a_tensor.data_ptr(),
+                                 cute.AddressSpace.gmem,
+                                 assumed_align=16)
+                b_ptr = make_ptr(cutlass.Float8E4M3FN,
+                                 b_tensor.data_ptr(),
+                                 cute.AddressSpace.gmem,
+                                 assumed_align=16)
+                a_sf_ptr = make_ptr(cutlass.Float32,
+                                    a_sf_tensor.data_ptr(),
+                                    cute.AddressSpace.gmem,
+                                    assumed_align=16)
+                b_sf_ptr = make_ptr(cutlass.Float32,
+                                    b_sf_tensor.data_ptr(),
+                                    cute.AddressSpace.gmem,
+                                    assumed_align=16)
+                c_cute_tensor = cute.runtime.from_dlpack(
+                    c_tmp).mark_layout_dynamic(leading_dim=1)
+                sf_out_ptr = make_ptr(cutlass.Int32,
+                                      sf_out_tensor.data_ptr(),
+                                      cute.AddressSpace.gmem,
+                                      assumed_align=4)
+
+                gemm = self.__class__.kernel_class(
+                    cutlass.Float32,
+                    use_2cta_instrs=use_2cta_instrs,
+                    mma_tiler_mn=mma_tiler_mn,
+                    cluster_shape_mn=cluster_shape_mn,
+                )
+                cluster_size = cluster_shape_mn[0] * cluster_shape_mn[1]
+                max_active_clusters = cutlass.utils.HardwareInfo(
+                ).get_max_active_clusters(cluster_size)
+                stream = cute.runtime.make_fake_stream(
+                    use_tvm_ffi_env_stream=True)
+                compiled_gemm = cute.compile(
+                    gemm.wrapper_fp8sf,
+                    m,
+                    n,
+                    k,
+                    sf_m,
+                    sf_n,
+                    sf_k,
+                    batch_size,
+                    a_ptr,
+                    b_ptr,
+                    a_sf_ptr,
+                    b_sf_ptr,
+                    c_cute_tensor,
+                    max_active_clusters,
+                    stream,
+                    sf_out_ptr,
+                    aligned_m,
+                    sf_n,
+                    fp8_smem_row_iters,
+                    use_fp8_smem_epilogue,
+                    options="--opt-level 2 --enable-tvm-ffi",
+                )
+                self.__class__.kernel_cache[cache_key] = compiled_gemm
+            else:
+                compiled_gemm = self.__class__.kernel_cache[cache_key]
+
+            compiled_gemm(
+                m,
+                n,
+                k,
+                sf_m,
+                sf_n,
+                sf_k,
+                batch_size,
+                a_tensor.data_ptr(),
+                b_tensor.data_ptr(),
+                a_sf_tensor.data_ptr(),
+                b_sf_tensor.data_ptr(),
+                c_tmp,
+                sf_out_tensor.data_ptr(),
+                aligned_m,
+                sf_n,
+            )
+
     # a/b: fp8, scale: fp32, output: bf16
     @torch.library.custom_op("trtllm::cute_dsl_fp8_bmm_blackwell",
                              mutates_args=("output", ),
@@ -4261,6 +4681,42 @@ if IS_CUTLASS_DSL_AVAILABLE:
         assert output.dtype == torch.bfloat16, "CuTe DSL fp8 bmm output dtype must be bf16"
         assert output.shape == (batch_size, m,
                                 n), "CuTe DSL fp8 bmm output shape is incorrect"
+
+    # Emit FP8 O_a output and packed UE8M0 scales in one pass.
+    @torch.library.custom_op("trtllm::cute_dsl_fp8_bmm_blackwell_fp8out",
+                             mutates_args=("output_fp8", "sf_out"),
+                             device_types="cuda")
+    def cute_dsl_fp8_bmm_blackwell_fp8out(
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        input_scale: torch.Tensor,
+        weight_scale: torch.Tensor,
+        output_fp8: torch.Tensor,
+        sf_out: torch.Tensor,
+    ) -> None:
+        """Write [L,M,N] FP8 output and MN-major packed scales."""
+        if not is_sm_100f():
+            raise ValueError(
+                f"cute_dsl_fp8_bmm_blackwell_fp8out requires SM100 family, got {get_sm_version()}"
+            )
+        runner = CuteDSLFp8BlackwellBmmRunner(use_tvm_ffi=True)
+        runner.forward_fp8out(
+            [input, weight, input_scale, weight_scale, output_fp8, sf_out])
+
+    @torch.library.register_fake("trtllm::cute_dsl_fp8_bmm_blackwell_fp8out")
+    def _(
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        input_scale: torch.Tensor,
+        weight_scale: torch.Tensor,
+        output_fp8: torch.Tensor,
+        sf_out: torch.Tensor,
+    ) -> None:
+        L, M, K = input.shape
+        N = weight.shape[1]
+        assert output_fp8.dtype == torch.float8_e4m3fn and output_fp8.shape == (
+            L, M, N)
+        assert sf_out.dtype == torch.int32
 
     # =============================================================================
     # Dense GEMM with SwiGLU Fusion (FC1 Kernel for MoE as Dense GEMM)

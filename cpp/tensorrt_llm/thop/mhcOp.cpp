@@ -90,15 +90,25 @@ void mhcFusedHcOp(torch::Tensor x_prev, torch::Tensor residual_prev, torch::Tens
     torch::Tensor y_acc_workspace, torch::Tensor r_acc_workspace, torch::Tensor done_counter_workspace, int64_t M,
     int64_t hidden_size, int64_t hc_mult, double rms_eps, double hc_pre_eps, double hc_sinkhorn_eps,
     double hc_post_mult_value, int64_t sinkhorn_repeat, int64_t backend, int64_t tile_n, int64_t num_k_splits,
-    int64_t bigfuse_block_size, int64_t tile_m, c10::optional<torch::Tensor> norm_weight, double norm_eps)
+    int64_t bigfuse_block_size, int64_t tile_m, c10::optional<torch::Tensor> norm_weight, double norm_eps,
+    int64_t x_num_splits)
 {
     auto stream = at::cuda::getCurrentCUDAStream();
 
-    // Fused next-layer RMSNorm on layer_input_cur. All four backends (Path B/D
-    // for MMA and Path E/F for FMA) support it now: Path B/E fuse the norm into
-    // the bigfuse kernel's Phase 2 layer_input write; Path D/F fuse it into the
-    // single-kernel Phase 4 epilogue. When norm_weight is null, layer_input is
-    // left un-normalized (caller must run RMSNorm separately).
+    TORCH_CHECK(x_prev.dtype() == torch::kBFloat16, "mhc_fused_hc: x_prev must be bfloat16");
+    TORCH_CHECK(x_prev.is_contiguous(), "mhc_fused_hc: x_prev must be contiguous");
+    TORCH_CHECK(x_num_splits == 1 || x_num_splits == 2 || x_num_splits == 4,
+        "mhc_fused_hc: x_num_splits must be 1, 2, or 4, got ", x_num_splits);
+    TORCH_CHECK(x_prev.dim() == 2 && x_prev.size(0) == x_num_splits * M && x_prev.size(1) == hidden_size,
+        "mhc_fused_hc: x_prev must have shape [x_num_splits * M, hidden_size]");
+
+    auto const* x_prev_ptr = reinterpret_cast<__nv_bfloat16 const*>(x_prev.data_ptr<at::BFloat16>());
+    // Half-MMA uses an x-ring; half-FMA reduces in registers.
+    bool const fuse_x_reduction = x_num_splits > 1;
+    TORCH_CHECK(!fuse_x_reduction || backend == 0 || backend == 1,
+        "mhc_fused_hc: split x is supported only by fused_half_mma/fma");
+
+    // A null norm_weight leaves layer_input_cur unnormalized.
     __nv_bfloat16 const* norm_weight_ptr = nullptr;
     if (norm_weight.has_value() && norm_weight->defined())
     {
@@ -116,7 +126,7 @@ void mhcFusedHcOp(torch::Tensor x_prev, torch::Tensor residual_prev, torch::Tens
     //   3 = fused_all_fma  (1-kernel: fused_pmap_gemm_fma_allinone,            Path F)
     if (backend == 3)
     {
-        tk::mhcFusedHcFmaAllInOneLaunch(reinterpret_cast<__nv_bfloat16 const*>(x_prev.data_ptr<at::BFloat16>()),
+        tk::mhcFusedHcFmaAllInOneLaunch(x_prev_ptr,
             reinterpret_cast<__nv_bfloat16 const*>(residual_prev.data_ptr<at::BFloat16>()),
             post_mix_prev.data_ptr<float>(), comb_mix_prev.data_ptr<float>(), w.data_ptr<float>(),
             hc_scale.data_ptr<float>(), hc_base.data_ptr<float>(),
@@ -132,7 +142,7 @@ void mhcFusedHcOp(torch::Tensor x_prev, torch::Tensor residual_prev, torch::Tens
     }
     if (backend == 2)
     {
-        tk::mhcFusedHcAllInOneLaunch(reinterpret_cast<__nv_bfloat16 const*>(x_prev.data_ptr<at::BFloat16>()),
+        tk::mhcFusedHcAllInOneLaunch(x_prev_ptr,
             reinterpret_cast<__nv_bfloat16 const*>(residual_prev.data_ptr<at::BFloat16>()),
             post_mix_prev.data_ptr<float>(), comb_mix_prev.data_ptr<float>(), w.data_ptr<float>(),
             hc_scale.data_ptr<float>(), hc_base.data_ptr<float>(),
@@ -147,7 +157,7 @@ void mhcFusedHcOp(torch::Tensor x_prev, torch::Tensor residual_prev, torch::Tens
     }
     if (backend == 1)
     {
-        tk::mhcFusedHcFmaLaunch(reinterpret_cast<__nv_bfloat16 const*>(x_prev.data_ptr<at::BFloat16>()),
+        tk::mhcFusedHcFmaLaunch(x_prev_ptr,
             reinterpret_cast<__nv_bfloat16 const*>(residual_prev.data_ptr<at::BFloat16>()),
             post_mix_prev.data_ptr<float>(), comb_mix_prev.data_ptr<float>(), w.data_ptr<float>(),
             hc_scale.data_ptr<float>(), hc_base.data_ptr<float>(),
@@ -157,20 +167,21 @@ void mhcFusedHcOp(torch::Tensor x_prev, torch::Tensor residual_prev, torch::Tens
             static_cast<int>(hidden_size), static_cast<int>(hc_mult), static_cast<int>(tile_n),
             static_cast<int>(num_k_splits), static_cast<int>(bigfuse_block_size), static_cast<float>(rms_eps),
             static_cast<float>(hc_pre_eps), static_cast<float>(hc_sinkhorn_eps), static_cast<float>(hc_post_mult_value),
-            static_cast<int>(sinkhorn_repeat), norm_weight_ptr, static_cast<float>(norm_eps), stream);
+            static_cast<int>(sinkhorn_repeat), norm_weight_ptr, static_cast<float>(norm_eps), stream,
+            fuse_x_reduction ? static_cast<int>(x_num_splits) : 1);
         return;
     }
 
-    tk::mhcFusedHcLaunch(reinterpret_cast<__nv_bfloat16 const*>(x_prev.data_ptr<at::BFloat16>()),
-        reinterpret_cast<__nv_bfloat16 const*>(residual_prev.data_ptr<at::BFloat16>()), post_mix_prev.data_ptr<float>(),
-        comb_mix_prev.data_ptr<float>(), w.data_ptr<float>(), hc_scale.data_ptr<float>(), hc_base.data_ptr<float>(),
+    tk::mhcFusedHcLaunch(x_prev_ptr, reinterpret_cast<__nv_bfloat16 const*>(residual_prev.data_ptr<at::BFloat16>()),
+        post_mix_prev.data_ptr<float>(), comb_mix_prev.data_ptr<float>(), w.data_ptr<float>(),
+        hc_scale.data_ptr<float>(), hc_base.data_ptr<float>(),
         reinterpret_cast<__nv_bfloat16*>(residual_cur.data_ptr<at::BFloat16>()), post_mix_cur.data_ptr<float>(),
         comb_mix_cur.data_ptr<float>(), reinterpret_cast<__nv_bfloat16*>(layer_input_cur.data_ptr<at::BFloat16>()),
         y_acc_workspace.data_ptr<float>(), r_acc_workspace.data_ptr<float>(), static_cast<int>(M),
         static_cast<int>(hidden_size), static_cast<int>(hc_mult), static_cast<int>(num_k_splits),
         static_cast<int>(bigfuse_block_size), static_cast<float>(rms_eps), static_cast<float>(hc_pre_eps),
         static_cast<float>(hc_sinkhorn_eps), static_cast<float>(hc_post_mult_value), static_cast<int>(sinkhorn_repeat),
-        norm_weight_ptr, static_cast<float>(norm_eps), stream);
+        norm_weight_ptr, static_cast<float>(norm_eps), stream, fuse_x_reduction ? static_cast<int>(x_num_splits) : 1);
 }
 
 } // anonymous namespace
@@ -221,7 +232,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "float rms_eps, float hc_pre_eps, float hc_sinkhorn_eps, "
         "float hc_post_mult_value, int sinkhorn_repeat, "
         "int backend=0, int tile_n=0, int num_k_splits=0, int bigfuse_block_size=0, "
-        "int tile_m=1, Tensor? norm_weight=None, float norm_eps=0.0) -> ()");
+        "int tile_m=1, Tensor? norm_weight=None, float norm_eps=0.0, int x_num_splits=1) -> ()");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
