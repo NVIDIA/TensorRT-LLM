@@ -280,7 +280,7 @@ export TRTLLM_CUTEDSL_NVMMH_FIELDS=tile,cluster
 export TRTLLM_CUTEDSL_NVMMH_MAX_TACTICS=8
 ```
 
-The adapter and env helpers live in [`tensorrt_llm/_torch/cutedsl_matmul_heuristics.py`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/cutedsl_matmul_heuristics.py); the `get_valid_tactics` / `_rank_prune_tactics` pruning is in [`cute_dsl_custom_ops.py`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/custom_ops/cute_dsl_custom_ops.py).
+The adapter and env helpers live in [`tensorrt_llm/_torch/custom_ops/cutedsl_matmul_heuristics.py`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/custom_ops/cutedsl_matmul_heuristics.py); the `get_valid_tactics` / `_rank_prune_tactics` pruning is in [`cute_dsl_custom_ops.py`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/custom_ops/cute_dsl_custom_ops.py).
 
 ---
 

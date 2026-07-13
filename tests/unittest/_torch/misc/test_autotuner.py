@@ -1165,7 +1165,8 @@ def test_cutedsl_nvfp4_heuristic_matches_full_sweep(monkeypatch):
     if sm_version not in (100, 103):
         pytest.skip("CuteDSL NVFP4 requires SM100 (B200) / SM103 (B300)")
 
-    from tensorrt_llm._torch import cutedsl_matmul_heuristics as nvmmh
+    from tensorrt_llm._torch.custom_ops import \
+        cutedsl_matmul_heuristics as nvmmh
     if not nvmmh.IS_NVMMH_AVAILABLE:
         pytest.skip("nvMatmulHeuristics library not installed")
     from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import \

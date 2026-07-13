@@ -18,14 +18,14 @@ from ..autotuner import (AutoTuner, ConstraintSpec, DistributedTuningStrategy,
                          DynamicTensorSpec, OptimizationProfile, TunableRunner,
                          TuningConfig)
 from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
-from ..cutedsl_matmul_heuristics import (NVFP4_PRECISION,
-                                         nvmmh_enabled_for_nvfp4, nvmmh_fields,
-                                         nvmmh_max_tactics, rank_configs)
 from ..utils import (ActivationType, deep_gemm_gen_tuning_buckets,
                      fp4_scale_infer_shape, fp8_scale_infer_shape,
                      get_last_power_of_2_num_tokens_buckets,
                      is_gated_activation, last_positive_power_of_2,
                      next_positive_power_of_2)
+from .cutedsl_matmul_heuristics import (NVFP4_PRECISION,
+                                        nvmmh_enabled_for_nvfp4, nvmmh_fields,
+                                        nvmmh_max_tactics, rank_configs)
 
 try:
     from cuda.bindings import driver as cuda
@@ -957,7 +957,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     max_active_clusters,
                     stream,
                     swap_ab,
-                    options=f"--opt-level 2 --enable-tvm-ffi"
+                    options="--opt-level 2 --enable-tvm-ffi"
                     if self.use_tvm_ffi else "--opt-level 2",
                 )
 
@@ -1414,7 +1414,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     False,  # swap_ab=False for SwiGLU
                 ]
                 compile_kwargs = dict(
-                    options=f"--opt-level 2 --enable-tvm-ffi"
+                    options="--opt-level 2 --enable-tvm-ffi"
                     if self.use_tvm_ffi else "--opt-level 2", )
                 if has_bias:
                     compile_kwargs["bias_ptr"] = bias_ptr
@@ -1908,7 +1908,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
                 compiled_gemm = cute.compile(
                     *compile_args,
-                    options=f"--opt-level 2 --enable-tvm-ffi"
+                    options="--opt-level 2 --enable-tvm-ffi"
                     if self.use_tvm_ffi else "--opt-level 2",
                 )
 
@@ -3852,7 +3852,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     c_cute_tensor,
                     max_active_clusters=max_active_clusters,
                     stream=stream,
-                    options=f"--opt-level 2 --enable-tvm-ffi"
+                    options="--opt-level 2 --enable-tvm-ffi"
                     if self.use_tvm_ffi else "--opt-level 2",
                 )
                 self.__class__.kernel_cache[cache_key] = compiled_gemm
@@ -4166,7 +4166,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     c_cute_tensor,
                     max_active_clusters=max_active_clusters,
                     stream=stream,
-                    options=f"--opt-level 2 --enable-tvm-ffi"
+                    options="--opt-level 2 --enable-tvm-ffi"
                     if self.use_tvm_ffi else "--opt-level 2",
                 )
                 self.__class__.kernel_cache[cache_key] = compiled_gemm
