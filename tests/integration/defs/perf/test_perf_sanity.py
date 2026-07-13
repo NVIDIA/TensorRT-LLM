@@ -151,9 +151,7 @@ GEN_ONLY_PERF_METRIC_LOG_QUERIES = {
 # is not) so the scanner can bucket rows by ngen without silently dropping
 # any line whose states dict is printed before prev_device_step_time. See
 # _scan_gen_worker_device_step_time.
-_DEVICE_STEP_TIME_RE = re.compile(
-    r"iter\s*=\s*(\d+),.*?prev_device_step_time\s*=\s*([\d.]+)\s*ms"
-)
+_DEVICE_STEP_TIME_RE = re.compile(r"iter\s*=\s*(\d+),.*?prev_device_step_time\s*=\s*([\d.]+)\s*ms")
 _NUM_GEN_TOKENS_RE = re.compile(r"'num_generation_tokens':\s*(\d+)")
 
 
@@ -252,9 +250,7 @@ def _mean_at_mode_ngen(
     for by_ngen in per_file_by_ngen:
         if not by_ngen:
             continue
-        _mode_ngen, (_count, mean) = max(
-            by_ngen.items(), key=lambda kv: (kv[1][0], kv[0])
-        )
+        _mode_ngen, (_count, mean) = max(by_ngen.items(), key=lambda kv: (kv[1][0], kv[0]))
         means.append(mean)
     if not means:
         return None
