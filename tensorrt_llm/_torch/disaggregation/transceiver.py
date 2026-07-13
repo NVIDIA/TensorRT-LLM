@@ -508,7 +508,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         self._send_reqs[rid] = req
 
         chunk_start_pos, chunk_end_pos = req.py_last_context_chunk
-        tpb = self.kv_cache_manager.tokens_per_block
+        tpb = self._kv_cache_manager.tokens_per_block
 
         chunk_start_block = chunk_start_pos // tpb
         chunk_end_block = (chunk_end_pos + tpb - 1) // tpb
@@ -566,7 +566,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             req.py_kv_transfer_start_time = time.time()
 
         session = self._get_or_create_send_session(req)
-        if self._enable_pipelined_transfer:
+        if self.pipeline_transfer_enabled:
             slice = self._build_prefill_chunk(req)
         else:
             slice = self._create_kv_slice(req)

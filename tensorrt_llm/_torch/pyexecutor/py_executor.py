@@ -4747,7 +4747,7 @@ class PyExecutor:
         self._validate_token_id_range(request)
 
         if (not self.is_warmup and self.kv_cache_transceiver is not None
-                and self.kv_cache_transceiver.enable_pipelined_transfer):
+                and self.kv_cache_transceiver.pipeline_transfer_enabled):
             if request.py_beam_width != 1:
                 raise ValueError(
                     "beam_width > 1 is not supported when enable_pipelined_transfer is set.")
@@ -5711,14 +5711,18 @@ class PyExecutor:
                         if hasattr(self.kv_cache_manager, 'release_index_slot'):
                             self.kv_cache_manager.release_index_slot(
                                 req.py_request_id)
-                        # Order is important here: we need to start the transfer before responding
-                        # to make sure the blocks are stored for reuse before they are sent.
-                        self.async_transfer_manager.start_transfer(req) # TODO: not sure if this is valid for pipelined transfer
+                        # Order matters: start_transfer commits the request's blocks to the reuse
+                        # tree and pins them, and must run before respond_and_send_async sends the
+                        # final KV slice and (for the Python transceiver) transitions the request toward completion.
+                        self.async_transfer_manager.start_transfer(req)
 
                         # send KV slice for monolithic transfer or last chunk of pipelined transfer
                         self.kv_cache_transceiver.respond_and_send_async(req)
-                    elif self.kv_cache_transceiver.enable_pipelined_transfer:
-                        # send chunk for pipelined transfer
+
+                        if self.kv_cache_transceiver.kv_transfer_timeout_ms is not None and req.py_kv_transfer_start_time is None:
+                            req.py_kv_transfer_start_time = time.time()
+                    elif self.kv_cache_transceiver.pipeline_transfer_enabled:
+                        # send intermediate chunk for pipelined transfer
                         self.kv_cache_transceiver.respond_and_send_async(req)
 
         if self.kv_connector_manager:

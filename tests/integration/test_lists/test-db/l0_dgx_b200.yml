@@ -24,8 +24,10 @@ l0_dgx_b200:
   - llmapi/test_llm_api_pytorch_bart.py::test_bart_pytorch_generate_encoder_decoder_end_to_end[bf16-kv-v1-cuda-graph-on-greedy-tp2-bart-large-cnn]
   - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_chunked_kv_transfer_nixl_python_accuracy[enable_block_reuse=False-transfer_chunk_size=64]
   - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_chunked_kv_transfer_nixl_python_accuracy[enable_block_reuse=True-transfer_chunk_size=64]
-  - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_pipelined_kv_transfer_nixl_python_accuracy[enable_block_reuse=False]
-  - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_pipelined_kv_transfer_nixl_python_accuracy[enable_block_reuse=True]
+  - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_pipelined_kv_transfer_nixl_python_accuracy[enable_block_reuse=False-disable_overlap_scheduler=False]
+  - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_pipelined_kv_transfer_nixl_python_accuracy[enable_block_reuse=True-disable_overlap_scheduler=False]
+  - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_pipelined_kv_transfer_nixl_python_accuracy[enable_block_reuse=False-disable_overlap_scheduler=True]
+  - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_pipelined_kv_transfer_nixl_python_accuracy[enable_block_reuse=True-disable_overlap_scheduler=True]
   # ------------- KV Cache V2 Scheduler IT (multi-GPU) ---------------
   - kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2DSv3Lite::test_mtp_draft_tokens
   - kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2DSv3Lite::test_mtp_chunked_draft_tokens
