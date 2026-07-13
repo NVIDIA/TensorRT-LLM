@@ -680,7 +680,7 @@ class CudaCoreNVFP4Runner(TunableRunner):
 
     This runner is available on:
     - SM >= 100 (Blackwell)
-    - M <= 8 (small batch size limitation from kernel template)
+    - M <= 16 (small batch size limitation from kernel template)
     """
 
     # Shared tuning config (no tactics needed, single implementation)
@@ -689,7 +689,7 @@ class CudaCoreNVFP4Runner(TunableRunner):
     # Minimum supported architecture: SM100 (Blackwell)
     MIN_SM_VERSION = 100
     # Maximum M dimension (from cudaCoreGemmTemplateMaxM in C++ kernel)
-    MAX_M_DIMENSION = 8
+    MAX_M_DIMENSION = 16
 
     def __init__(self,
                  output_buffer_kind: int,
@@ -1213,7 +1213,7 @@ def nvfp4_gemm(
     - CUTLASS: Predefined CUTLASS configurations with auto-tuning
     - cuBLASLt: Heuristic-based algorithms from cuBLASLt library
     - CuteDSL: Blackwell-optimized persistent kernels (when available and inputs are valid)
-    - CUDA Core: CUDA Core implementation (requires SM >= 100 and M <= 8)
+    - CUDA Core: CUDA Core implementation (requires SM >= 100 and M <= 16)
     - Marlin: Hopper W4A16 NVFP4 implementation (requires SM 90-99)
 
     The AutoTuner profiles all available backends during the first run and caches
