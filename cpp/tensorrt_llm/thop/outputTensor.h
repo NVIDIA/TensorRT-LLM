@@ -70,7 +70,7 @@ inline std::pair<at::Tensor, BufferKind> allocate_output(std::vector<int64_t> co
             {
                 TLLM_LOG_DEBUG("[allocate_output] getComm threw (MPI disabled?): %s; fallback to default", e.what());
             }
-            if (commPtr && *commPtr != nullptr)
+            if (commPtr)
             {
                 auto [tensor, buffer]
                     = tensorrt_llm::common::nccl_util::createNCCLWindowTensor(commPtr, output_size, dtype);
