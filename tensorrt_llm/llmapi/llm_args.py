@@ -5166,12 +5166,6 @@ class TorchLlmArgs(BaseLlmArgs):
     # PrivateVars
     _quant_config: Optional[QuantConfig] = PrivateAttr(default=None)
 
-    disable_flashinfer_sampling: bool = Field(
-        default=False,
-        description=
-        "Disable the use of FlashInfer.sampling. This option is likely to be removed in the future.",
-        status="prototype")
-
     max_stats_len: int = Field(
         default=1000,
         ge=-1,
