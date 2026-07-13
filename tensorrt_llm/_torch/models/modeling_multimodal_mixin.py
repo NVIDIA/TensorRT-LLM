@@ -24,6 +24,7 @@ from typing import (
     Hashable,
     Iterable,
     Iterator,
+    List,
     Optional,
     Sequence,
 )
@@ -37,7 +38,10 @@ from tensorrt_llm.inputs.multimodal import MultimodalParams, MultimodalRuntimeDa
 from tensorrt_llm.logger import logger
 
 from .modeling_multimodal_utils import (
+    EncoderGroup,
     _cache_multimodal_embeddings,
+    _lengths_by_modality,
+    _reorder_embeds_by_manifest,
     find_input_mm_embeds,
     fuse_input_embeds,
     get_multimodal_embeddings,
@@ -153,6 +157,14 @@ class MultimodalModelMixin:
 
         return module._apply(convert)
 
+    #: Per-model registration of encoder-batching groups. Each
+    #: :class:`EncoderGroup` bundles a set of modalities that share one
+    #: encoder call. Set as a class attribute or on ``self`` in ``__init__``
+    #: (when ``encoder_fn`` binds to instance methods). When populated,
+    #: ``encode_multimodal_by_groups`` handles batching, splitting, and
+    #: prompt-order reordering generically.
+    mm_encoder_groups: Sequence[EncoderGroup] = ()
+
     def encode_multimodal_inputs(
         self,
         multimodal_params: Sequence[MultimodalParams],
@@ -164,6 +176,42 @@ class MultimodalModelMixin:
         positions but do not have rows here.
         """
         raise NotImplementedError
+
+    def encode_multimodal_by_groups(
+        self,
+        multimodal_params: List[MultimodalParams],
+    ) -> torch.Tensor:
+        """Generic encoder path for models that declare ``mm_encoder_groups``.
+
+        For each group present in the batch, one encoder call is issued over
+        all items across all requests belonging to that group's modalities
+        (arithmetic-intensity win). The output is split back per-modality
+        using the prompt-ordered ``multimodal_embedding_lengths`` already
+        stashed on ``multimodal_data``, then reordered into each request's
+        ``mm_item_order`` prompt sequence.
+        """
+        per_modality_embeds: Dict[str, torch.Tensor] = {}
+        per_modality_lengths: Dict[str, List[int]] = {}
+        for group in self.mm_encoder_groups:
+            group_params = [
+                mp
+                for mp in multimodal_params
+                if any(mp.multimodal_data.get(m) is not None for m in group.modalities)
+            ]
+            if not group_params:
+                continue
+            out = group.encoder_fn(**group.build_batched_input(group_params))
+            lengths = _lengths_by_modality(group_params, group.modalities)
+            cursor = 0
+            for m in group.modalities:
+                total = sum(lengths[m])
+                if total > 0:
+                    per_modality_embeds[m] = out[cursor : cursor + total]
+                    per_modality_lengths[m] = lengths[m]
+                    cursor += total
+        return _reorder_embeds_by_manifest(
+            multimodal_params, per_modality_embeds, per_modality_lengths
+        )
 
     @property
     def multimodal_token_ids(self) -> Optional[Sequence[int] | torch.Tensor]:

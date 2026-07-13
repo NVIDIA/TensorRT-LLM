@@ -19,6 +19,7 @@
 import functools
 import math
 import os
+from dataclasses import dataclass
 from typing import (Any, Callable, Dict, List, Optional, Tuple, TypedDict,
                     Union, cast)
 
@@ -220,6 +221,98 @@ def _cache_multimodal_embeddings(
     logger.debug(
         f"Cached {len(split_embeddings)} multimodal embedding chunks in this iteration"
     )
+
+
+@dataclass
+class EncoderGroup:
+    """Modalities that share a single encoder call.
+
+    Batching all items in a group into one encoder invocation amortizes
+    fixed costs (kernel launches, dispatch) across items. The framework
+    splits the output back per-modality and reorders it into prompt order
+    via each request's ``mm_item_order`` manifest.
+
+    ``modalities`` order is authoritative: ``build_batched_input`` must cat
+    items in that order so the framework can split the encoder output back
+    with the same layout.
+    """
+    modalities: Tuple[str, ...]
+    encoder_fn: Callable[..., torch.Tensor]
+    build_batched_input: Callable[[List[MultimodalParams]], Dict[str, Any]]
+
+
+def _lengths_by_modality(
+    multimodal_params: List[MultimodalParams],
+    modalities: Tuple[str, ...],
+) -> Dict[str, List[int]]:
+    """Invert prompt-ordered ``multimodal_embedding_lengths`` into per-modality
+    per-item lengths, matching the per-modality item order used by
+    :attr:`EncoderGroup.build_batched_input`."""
+    by_modality: Dict[str, List[int]] = {m: [] for m in modalities}
+    for mp in multimodal_params:
+        flat = mp.multimodal_data.get("multimodal_embedding_lengths") or []
+        if mp.mm_item_order:
+            for entry, length in zip(mp.mm_item_order, flat, strict=True):
+                if entry["modality"] in by_modality:
+                    by_modality[entry["modality"]].append(length)
+            continue
+        present = [
+            m for m in modalities if mp.multimodal_data.get(m) is not None
+        ]
+        if len(present) > 1:
+            raise ValueError(
+                "Request with multiple modalities present "
+                f"({present}) must carry mm_item_order on MultimodalParams.")
+        if present:
+            by_modality[present[0]].extend(flat)
+    return by_modality
+
+
+def _reorder_embeds_by_manifest(
+    multimodal_params: List[MultimodalParams],
+    per_modality_embeds: Dict[str, torch.Tensor],
+    per_modality_lengths: Dict[str, List[int]],
+) -> torch.Tensor:
+    """Slice per-modality tensors item-by-item and concat in prompt order."""
+    # Prefix sums for O(1) per-item row lookup.
+    per_modality_row_starts: Dict[str, List[int]] = {}
+    for m, lens in per_modality_lengths.items():
+        cum = [0]
+        for L in lens:
+            cum.append(cum[-1] + L)
+        per_modality_row_starts[m] = cum
+
+    slices: List[torch.Tensor] = []
+    # ``entry["index"]`` is per-request per-modality; advance a cursor to
+    # translate it into a global item index within ``per_modality_embeds``.
+    per_modality_cursor: Dict[str, int] = {m: 0 for m in per_modality_embeds}
+    for mp in multimodal_params:
+        manifest = mp.mm_item_order or _synthesize_single_modality_manifest(
+            mp, per_modality_embeds.keys())
+        req_counts: Dict[str, int] = {}
+        for entry in manifest:
+            m = entry["modality"]
+            if m not in per_modality_embeds:
+                continue
+            i = per_modality_cursor[m] + entry["index"]
+            starts = per_modality_row_starts[m]
+            slices.append(per_modality_embeds[m][starts[i]:starts[i + 1]])
+            req_counts[m] = req_counts.get(m, 0) + 1
+        for m, c in req_counts.items():
+            per_modality_cursor[m] += c
+    return torch.cat(slices, dim=0)
+
+
+def _synthesize_single_modality_manifest(
+    mp: MultimodalParams,
+    modalities,
+) -> List[Dict[str, Union[str, int]]]:
+    """Trivial manifest for requests with only one modality present."""
+    flat = mp.multimodal_data.get("multimodal_embedding_lengths") or []
+    for m in modalities:
+        if mp.multimodal_data.get(m) is not None:
+            return [{"modality": m, "index": i} for i in range(len(flat))]
+    return []
 
 
 def _normalize_encoder_embeddings(
