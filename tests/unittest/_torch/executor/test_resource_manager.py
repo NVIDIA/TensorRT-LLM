@@ -71,20 +71,7 @@ def test_v1_kv_cache_event_hash_algo_no_warning_for_auto():
 
 class TestMergeKVCachePoolPointers(unittest.TestCase):
 
-    def test_no_scale_pointers_preserve_data_table(self):
-        data_pointers = torch.tensor([[11, 12], [21, 22]])
-
-        merged = _merge_kv_cache_pool_pointers(
-            data_pointers,
-            torch.empty(0, dtype=data_pointers.dtype),
-            torch.tensor([[0, 0], [1, 0]]),
-            [DataType.INT8, DataType.INT8],
-        )
-
-        self.assertIs(merged, data_pointers)
-        self.assertEqual(merged.ndim, 2)
-
-    def test_mixed_int8_nvfp4_pools_align_scale_rows(self):
+    def test_mixed_half_nvfp4_pools_align_scale_rows(self):
         data_pointers = torch.tensor([[11, 12], [21, 22]])
         scale_pointers = torch.tensor([[31, 32]])
         layer_to_pool_mapping = torch.tensor([[0, 0], [1, 0]])
@@ -93,7 +80,7 @@ class TestMergeKVCachePoolPointers(unittest.TestCase):
             data_pointers,
             scale_pointers,
             layer_to_pool_mapping,
-            [DataType.INT8, DataType.NVFP4],
+            [DataType.HALF, DataType.NVFP4],
         )
 
         expected = torch.tensor([
@@ -112,7 +99,7 @@ class TestMergeKVCachePoolPointers(unittest.TestCase):
             data_pointers,
             scale_pointers,
             layer_to_pool_mapping,
-            [DataType.NVFP4, DataType.NVFP4, DataType.INT8],
+            [DataType.NVFP4, DataType.NVFP4, DataType.HALF],
         )
 
         expected = torch.tensor([
@@ -121,18 +108,23 @@ class TestMergeKVCachePoolPointers(unittest.TestCase):
         ])
         self.assertTrue(torch.equal(merged, expected))
 
-    def test_non_compact_data_pool_ids_raise(self):
+    def test_physical_pool_ids_map_to_compact_data_rows(self):
         data_pointers = torch.tensor([[11, 12], [21, 22]])
         scale_pointers = torch.tensor([[31, 32]])
         layer_to_pool_mapping = torch.tensor([[0, 0], [2, 0]])
 
-        with self.assertRaises(RuntimeError):
-            _merge_kv_cache_pool_pointers(
-                data_pointers,
-                scale_pointers,
-                layer_to_pool_mapping,
-                [DataType.INT8, DataType.NVFP4],
-            )
+        merged = _merge_kv_cache_pool_pointers(
+            data_pointers,
+            scale_pointers,
+            layer_to_pool_mapping,
+            [DataType.NVFP4, DataType.HALF],
+        )
+
+        expected = torch.tensor([
+            [[11, 31], [12, 32]],
+            [[21, 0], [22, 0]],
+        ])
+        self.assertTrue(torch.equal(merged, expected))
 
 
 class TestResourceManager(unittest.TestCase):

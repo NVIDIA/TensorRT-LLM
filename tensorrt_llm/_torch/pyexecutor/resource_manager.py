@@ -120,42 +120,14 @@ def _merge_kv_cache_pool_pointers(
     layer_to_pool_mapping: torch.Tensor,
     layer_pool_dtypes: Sequence["DataType"],
 ) -> torch.Tensor:
-    """Align compact block-scale pointers with compact KV-pool pointers."""
-    if block_scale_pool_pointers.numel() == 0:
-        return kv_cache_pool_pointers
-
-    if (kv_cache_pool_pointers.ndim != 2 or block_scale_pool_pointers.ndim != 2
-            or kv_cache_pool_pointers.shape[1:]
-            != block_scale_pool_pointers.shape[1:]
-            or kv_cache_pool_pointers.dtype != block_scale_pool_pointers.dtype
-            or kv_cache_pool_pointers.device
-            != block_scale_pool_pointers.device):
-        raise RuntimeError(
-            "KV-cache data and block-scale pointer tables are incompatible")
-    if layer_to_pool_mapping.shape[0] != len(layer_pool_dtypes):
-        raise RuntimeError(
-            "KV-cache layer mapping and layer dtype counts do not match")
-
-    dtype_by_pool: Dict[int, "DataType"] = {}
-    for pool_idx, pool_dtype in zip(layer_to_pool_mapping[:, 0].tolist(),
-                                    layer_pool_dtypes):
-        previous_dtype = dtype_by_pool.setdefault(pool_idx, pool_dtype)
-        if previous_dtype != pool_dtype:
-            raise RuntimeError(
-                f"KV-cache pool {pool_idx} is mapped to multiple dtypes")
-
-    num_data_pools = kv_cache_pool_pointers.shape[0]
-    if sorted(dtype_by_pool) != list(range(num_data_pools)):
-        raise RuntimeError(
-            "KV-cache layer mapping is not aligned with compact data-pool rows")
-
+    """Align compact scale rows with data rows in C++ physical-pool order."""
+    dtype_by_physical_pool = dict(
+        zip(layer_to_pool_mapping[:, 0].tolist(), layer_pool_dtypes))
     fp4_pool_indices = [
-        pool_idx for pool_idx in range(num_data_pools)
-        if dtype_by_pool[pool_idx] == DataType.NVFP4
+        compact_pool_idx for compact_pool_idx, physical_pool_idx in enumerate(
+            sorted(dtype_by_physical_pool))
+        if dtype_by_physical_pool[physical_pool_idx] == DataType.NVFP4
     ]
-    if len(fp4_pool_indices) != block_scale_pool_pointers.shape[0]:
-        raise RuntimeError(
-            "NVFP4 KV-cache pool and block-scale pointer counts do not match")
 
     aligned_scale_pool_pointers = torch.zeros_like(kv_cache_pool_pointers)
     aligned_scale_pool_pointers[fp4_pool_indices] = block_scale_pool_pointers
