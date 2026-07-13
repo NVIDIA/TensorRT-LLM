@@ -2169,7 +2169,12 @@ std::shared_ptr<KVCacheBlock> WindowBlockManager::findBlocksInReuseTreeByBlockKe
             ? searchRoot->findMatchingBlock(blockKey, true, true)
             : std::make_tuple(false, 0, nullptr);
 
-        if (matchingBlock == nullptr)
+        // Only blocks that match ALL requested tokens at this position are eligible: a
+        // partially matched block holds KV for fewer tokens than the requester assumes,
+        // so transferring it would silently hand out wrong cache content for the tail.
+        // (A block holding MORE tokens than a partial last key is fine — the requested
+        // prefix is fully covered.)
+        if (matchingBlock == nullptr || numMatched < static_cast<SizeType32>(blockKey.uniqueTokens.size()))
         {
             // Roll back any pins taken during this partial walk so callers see a
             // clean miss with no refcount or eviction-queue side-effects.
