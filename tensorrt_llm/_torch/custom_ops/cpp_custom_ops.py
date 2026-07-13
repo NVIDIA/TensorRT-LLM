@@ -1388,11 +1388,3 @@ def _register_fake():
         out_shape = shape if shape is not None else list(like.shape)
         dtype = out_dtype if out_dtype is not None else like.dtype
         return like.new_empty(out_shape, dtype=dtype), output_buffer_kind
-
-    @torch.library.register_fake("trtllm::compute_probs_from_logits_op")
-    def _(logits: torch.Tensor,
-          temperatures: torch.Tensor,
-          top_k: Optional[torch.Tensor] = None,
-          top_p: Optional[torch.Tensor] = None,
-          skip_temperature: bool = False) -> torch.Tensor:
-        return logits.new_empty(list(logits.shape), dtype=torch.float32)

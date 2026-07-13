@@ -16,9 +16,18 @@
 
 These ops depend on flashinfer; the import is guarded so the module stays
 importable without it.
+
+Randomness can be supplied either way (flashinfer accepts both in one
+signature; explicit ``seed``/``offset`` take precedence over ``generator``):
+
+- ``generator``: stateful host-side ``torch.Generator``, for eager paths.
+- ``seed``/``offset``: stateless device tensors, required under CUDA graph
+  capture (a ``torch.Generator`` advances host-side at launch time, so its
+  state would be frozen into the graph and every replay would reuse the same
+  random values).
 """
 
-from typing import Optional
+from typing import Optional, Union
 
 import torch
 
@@ -27,27 +36,90 @@ from tensorrt_llm._torch.flashinfer_utils import IS_FLASHINFER_AVAILABLE, get_en
 if IS_FLASHINFER_AVAILABLE:
     import flashinfer.sampling
 
+SeedOrTensor = Union[int, torch.Tensor]
+
 
 def top_k_top_p_sampling_from_logits_op(
     logits: torch.Tensor,
     top_k: torch.Tensor,
     top_p: torch.Tensor,
-    seed: Optional[int] = None,
-    offset: Optional[int] = None,
+    *,
+    generator: Optional[torch.Generator] = None,
+    seed: Optional[SeedOrTensor] = None,
+    offset: Optional[SeedOrTensor] = None,
+    check_nan: bool = False,
 ) -> torch.Tensor:
     tokens: torch.Tensor = flashinfer.sampling.top_k_top_p_sampling_from_logits(
-        logits, top_k, top_p, seed=seed, offset=offset
+        logits,
+        top_k=top_k,
+        top_p=top_p,
+        filter_apply_order="top_k_first",
+        deterministic=True,
+        check_nan=check_nan,
+        generator=generator,
+        seed=seed,
+        offset=offset,
     )
     return tokens
 
 
 def sampling_from_probs_op(
     probs: torch.Tensor,
-    seed: Optional[torch.Tensor] = None,
-    offset: Optional[torch.Tensor] = None,
+    *,
+    generator: Optional[torch.Generator] = None,
+    seed: Optional[SeedOrTensor] = None,
+    offset: Optional[SeedOrTensor] = None,
+    check_nan: bool = False,
 ) -> torch.Tensor:
     tokens: torch.Tensor = flashinfer.sampling.sampling_from_probs(
-        probs, deterministic=True, seed=seed, offset=offset
+        probs,
+        deterministic=True,
+        check_nan=check_nan,
+        generator=generator,
+        seed=seed,
+        offset=offset,
+    )
+    return tokens
+
+
+def top_k_sampling_from_probs_op(
+    probs: torch.Tensor,
+    top_k: torch.Tensor,
+    *,
+    generator: Optional[torch.Generator] = None,
+    seed: Optional[SeedOrTensor] = None,
+    offset: Optional[SeedOrTensor] = None,
+    check_nan: bool = False,
+) -> torch.Tensor:
+    tokens: torch.Tensor = flashinfer.sampling.top_k_sampling_from_probs(
+        probs,
+        top_k=top_k,
+        deterministic=True,
+        check_nan=check_nan,
+        generator=generator,
+        seed=seed,
+        offset=offset,
+    )
+    return tokens
+
+
+def top_p_sampling_from_probs_op(
+    probs: torch.Tensor,
+    top_p: torch.Tensor,
+    *,
+    generator: Optional[torch.Generator] = None,
+    seed: Optional[SeedOrTensor] = None,
+    offset: Optional[SeedOrTensor] = None,
+    check_nan: bool = False,
+) -> torch.Tensor:
+    tokens: torch.Tensor = flashinfer.sampling.top_p_sampling_from_probs(
+        probs,
+        top_p=top_p,
+        deterministic=True,
+        check_nan=check_nan,
+        generator=generator,
+        seed=seed,
+        offset=offset,
     )
     return tokens
 
@@ -76,68 +148,6 @@ def top_p_renorm_probs_op(
 ) -> torch.Tensor:
     renormed: torch.Tensor = flashinfer.sampling.top_p_renorm_probs(probs, top_p)
     return renormed
-
-
-def sampling_from_probs_generator_op(
-    probs: torch.Tensor,
-    generator: Optional[torch.Generator],
-    check_nan: bool = False,
-) -> torch.Tensor:
-    tokens: torch.Tensor = flashinfer.sampling.sampling_from_probs(
-        probs, deterministic=True, generator=generator, check_nan=check_nan
-    )
-    return tokens
-
-
-def top_k_top_p_sampling_from_logits_with_generator_op(
-    logits: torch.Tensor,
-    top_k: torch.Tensor,
-    top_p: torch.Tensor,
-    generator: Optional[torch.Generator],
-    check_nan: bool = False,
-) -> torch.Tensor:
-    tokens: torch.Tensor = flashinfer.sampling.top_k_top_p_sampling_from_logits(
-        logits,
-        top_k=top_k,
-        top_p=top_p,
-        filter_apply_order="top_k_first",
-        deterministic=True,
-        check_nan=check_nan,
-        generator=generator,
-    )
-    return tokens
-
-
-def top_k_sampling_from_probs_generator_op(
-    probs: torch.Tensor,
-    top_k: torch.Tensor,
-    generator: Optional[torch.Generator],
-    check_nan: bool = False,
-) -> torch.Tensor:
-    tokens: torch.Tensor = flashinfer.sampling.top_k_sampling_from_probs(
-        probs,
-        top_k=top_k,
-        deterministic=True,
-        check_nan=check_nan,
-        generator=generator,
-    )
-    return tokens
-
-
-def top_p_sampling_from_probs_generator_op(
-    probs: torch.Tensor,
-    top_p: torch.Tensor,
-    generator: Optional[torch.Generator],
-    check_nan: bool = False,
-) -> torch.Tensor:
-    tokens: torch.Tensor = flashinfer.sampling.top_p_sampling_from_probs(
-        probs,
-        top_p=top_p,
-        deterministic=True,
-        check_nan=check_nan,
-        generator=generator,
-    )
-    return tokens
 
 
 def compute_probs_from_logits_op(

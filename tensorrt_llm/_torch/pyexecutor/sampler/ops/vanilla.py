@@ -50,66 +50,27 @@ class BeamSearchMetadata(StrategyMetadata):
     beam_idx_arange: torch.Tensor
 
 
-def top_k_sampling_batch(
-    logits: torch.Tensor,
-    *,
-    top_k: int,
-    temperature: float,
-    generator: Optional[torch.Generator] = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    return top_k_top_p_sampling_batch(
-        logits,
-        top_k=top_k,
-        temperature=temperature,
-        generator=generator,
-        top_p=1,
-    )
-
-
-def top_p_sampling_batch(
-    logits: torch.Tensor,
-    *,
-    top_p: float,
-    temperature: float,
-    generator: Optional[torch.Generator] = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    return top_k_top_p_sampling_batch(
-        logits,
-        top_p=top_p,
-        top_k=logits.size(1),
-        temperature=temperature,
-        generator=generator,
-    )
-
-
-def temperature_sampling_batch(
-    logits: torch.Tensor,
-    *,
-    temperature: float,
-    generator: Optional[torch.Generator] = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    return top_k_top_p_sampling_batch(
-        logits,
-        top_p=1,
-        top_k=logits.size(1),
-        temperature=temperature,
-        generator=generator,
-    )
-
-
 def top_k_top_p_sampling_batch(
     logits: torch.Tensor,
     *,
-    top_k: int,
-    top_p: float,
     temperature: float,
+    top_k: Optional[int] = None,
+    top_p: float = 1.0,
     generator: Optional[torch.Generator] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Temperature + optional top-k / top-p filtering + multinomial sampling.
+
+    ``top_k=None`` (or ``vocab_size``) disables top-k filtering; ``top_p=1``
+    disables top-p filtering. With both disabled this is plain temperature
+    sampling.
+    """
     logits_dim = logits.dim()
     assert logits_dim == 2, "logits should be 2D: [batch_size, vocab_size]"
     assert temperature > 0, "non-greedy sampling requires valid temperature"
     logits = logits / max(temperature, 1e-5)
     batch_size, vocab_size = logits.size()
+    if top_k is None:
+        top_k = vocab_size
 
     assert top_k > 1, "non-greedy sampling requires valid top_k"
     need_top_k = top_k < vocab_size
@@ -323,15 +284,6 @@ def sample_rejected(
 
 
 _GREEDY_TEMPERATURE_THRESHOLD = 1e-4
-
-
-def greedy(
-    logits: torch.Tensor,
-    *,
-    return_probs: bool = True,
-) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-    """Greedy decoding; returns exact one-hot when return_probs=True."""
-    return greedy_search_sampling_batch(logits, return_probs=return_probs)
 
 
 def _safely_apply_temperature_inplace(
