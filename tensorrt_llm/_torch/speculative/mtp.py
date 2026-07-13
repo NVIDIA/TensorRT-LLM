@@ -437,68 +437,80 @@ class MTPWorker(SpecWorkerBase):
             spec_metadata=spec_metadata,
             attn_metadata=attn_metadata)
 
-        # update attn metadata
-        if attn_metadata is not None:
-            self.change_attn_metadata(num_accepted_tokens, attn_metadata,
-                                      spec_metadata)
+        # update attn metadata. change_attn_metadata saves the old attn
+        # metadata state and then mutates more of it, so the whole call must
+        # be inside the protected region. The save/restore pair must be
+        # exception-safe: a failure between them (e.g. an OOM during the
+        # max-shape general warmup, which model_engine tolerates and skips)
+        # would otherwise leave stale saved state on the persistent
+        # attn_metadata and fail every subsequent forward at the pairing
+        # assert in prepare_for_spec_dec.
+        # https://nvbugs/6442074
+        try:
+            if attn_metadata is not None:
+                self.change_attn_metadata(num_accepted_tokens, attn_metadata,
+                                          spec_metadata)
 
-        # Run MTP layers to predict draft tokens
-        next_draft_tokens = []
-        last_tokens_idx = torch.cumsum(
-            attn_metadata.seq_lens_cuda, dim=0, dtype=torch.long) - 1
+            # Run MTP layers to predict draft tokens
+            next_draft_tokens = []
+            last_tokens_idx = torch.cumsum(
+                attn_metadata.seq_lens_cuda, dim=0, dtype=torch.long) - 1
 
-        draft_kv_cache_manager = self.get_draft_kv_cache_manager(
-            resource_manager)
+            draft_kv_cache_manager = self.get_draft_kv_cache_manager(
+                resource_manager)
 
-        with self.draft_kv_cache_context(attn_metadata, draft_kv_cache_manager):
-            for i, mtp_layer in enumerate(
-                    draft_model.mtp_layers[:runtime_draft_len]):
-                if self.guided_decoder is not None:
-                    new_tokens = draft_inputs['input_ids'][last_tokens_idx]
-                    self.guided_decoder.add_draft_batch(new_tokens,
-                                                        num_accepted_tokens,
-                                                        draft_step=i)
-
-                hidden_states = mtp_layer(embed_tokens=draft_model.embed_tokens,
-                                          **draft_inputs)
-
-                logits = mtp_layer.shared_head(hidden_states,
-                                               draft_model.lm_head,
-                                               attn_metadata).float()
-                if self.guided_decoder is not None:
-                    self.guided_decoder.execute_draft_batch(logits,
+            with self.draft_kv_cache_context(attn_metadata,
+                                             draft_kv_cache_manager):
+                for i, mtp_layer in enumerate(
+                        draft_model.mtp_layers[:runtime_draft_len]):
+                    if self.guided_decoder is not None:
+                        new_tokens = draft_inputs['input_ids'][last_tokens_idx]
+                        self.guided_decoder.add_draft_batch(new_tokens,
+                                                            num_accepted_tokens,
                                                             draft_step=i)
 
-                new_draft_token = self.draft_sampler(logits)
-                next_draft_tokens.append(new_draft_token)
-                # shift input_ids and hidden_states
-                input_ids = draft_inputs["input_ids"]
-                input_ids[:-1] = input_ids[1:].clone()
-                input_ids[last_tokens_idx] = new_draft_token
-                draft_hidden_states = draft_inputs["hidden_states"]
-                draft_hidden_states[:-1] = draft_hidden_states[1:].clone()
-                draft_hidden_states[last_tokens_idx] = hidden_states[
-                    last_tokens_idx, :]
-                draft_inputs = {
-                    "input_ids": input_ids,
-                    "position_ids": draft_inputs["position_ids"],
-                    "hidden_states": draft_hidden_states,
-                    "attn_metadata": draft_inputs["attn_metadata"],
-                }
-            next_draft_tokens = torch.stack(next_draft_tokens, dim=1)
+                    hidden_states = mtp_layer(
+                        embed_tokens=draft_model.embed_tokens, **draft_inputs)
 
-        # Override with SA draft tokens after all MTP layers have run,
-        # so that MTP layers never see SA tokens in their inputs.
-        if self.sa_enhancer is not None:
-            num_contexts = attn_metadata.num_contexts
-            gen_draft_tokens = next_draft_tokens[num_contexts:]
-            gen_draft_tokens = self.sa_enhancer.maybe_override_all_draft_tokens(
-                gen_draft_tokens)
-            next_draft_tokens[num_contexts:] = gen_draft_tokens
+                    logits = mtp_layer.shared_head(hidden_states,
+                                                   draft_model.lm_head,
+                                                   attn_metadata).float()
+                    if self.guided_decoder is not None:
+                        self.guided_decoder.execute_draft_batch(logits,
+                                                                draft_step=i)
 
-        # restore attn metadata
-        if attn_metadata is not None:
-            self._restore_attn_metadata_from_spec_dec(attn_metadata)
+                    new_draft_token = self.draft_sampler(logits)
+                    next_draft_tokens.append(new_draft_token)
+                    # shift input_ids and hidden_states
+                    input_ids = draft_inputs["input_ids"]
+                    input_ids[:-1] = input_ids[1:].clone()
+                    input_ids[last_tokens_idx] = new_draft_token
+                    draft_hidden_states = draft_inputs["hidden_states"]
+                    draft_hidden_states[:-1] = draft_hidden_states[1:].clone()
+                    draft_hidden_states[last_tokens_idx] = hidden_states[
+                        last_tokens_idx, :]
+                    draft_inputs = {
+                        "input_ids": input_ids,
+                        "position_ids": draft_inputs["position_ids"],
+                        "hidden_states": draft_hidden_states,
+                        "attn_metadata": draft_inputs["attn_metadata"],
+                    }
+                next_draft_tokens = torch.stack(next_draft_tokens, dim=1)
+
+            # Override with SA draft tokens after all MTP layers have run,
+            # so that MTP layers never see SA tokens in their inputs.
+            if self.sa_enhancer is not None:
+                num_contexts = attn_metadata.num_contexts
+                gen_draft_tokens = next_draft_tokens[num_contexts:]
+                gen_draft_tokens = self.sa_enhancer.maybe_override_all_draft_tokens(
+                    gen_draft_tokens)
+                next_draft_tokens[num_contexts:] = gen_draft_tokens
+        finally:
+            # restore attn metadata. restore_from_spec_dec is safe on empty
+            # or partially saved state, so this is correct even if
+            # change_attn_metadata itself failed mid-save.
+            if attn_metadata is not None:
+                self._restore_attn_metadata_from_spec_dec(attn_metadata)
 
         # prepare next new tokens to support overlap scheduler
         next_new_tokens = self._prepare_next_new_tokens(
