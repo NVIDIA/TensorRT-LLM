@@ -15,6 +15,7 @@
 
 """Tests for exporting standalone-compatible AutoDeploy tests to Paragraf."""
 
+import os
 import re
 import subprocess
 import sys
@@ -24,6 +25,9 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 CREATE_SCRIPT = REPO_ROOT / "examples" / "auto_deploy" / "paragraf" / "create_standalone_package.py"
+LEGACY_CREATE_SCRIPT = (
+    REPO_ROOT / "examples" / "auto_deploy" / "llmc" / "create_standalone_package.py"
+)
 AD_SINGLEGPU_TESTS = REPO_ROOT / "tests" / "unittest" / "auto_deploy" / "singlegpu"
 AD_MULTIGPU_TESTS = REPO_ROOT / "tests" / "unittest" / "auto_deploy" / "multigpu"
 AD_TORCH_TESTS = REPO_ROOT / "tests" / "unittest" / "_torch" / "auto_deploy"
@@ -68,7 +72,10 @@ TRTLLM_IMPORT_RE = re.compile(
     r"(?:tensorrt_llm(?:\.|\b)|paragraf\.models\.custom\.modeling_gpt_oss(?:\.|\b))"
 )
 PARAGRAF_OPTIONAL_TRTLLM_GUARD = """
-_trtllm_redirect_value = os.environ.get("TRTLLM_REDIRECT_AD_TO_PARAGRAF", "").lower()
+_trtllm_redirect_value = os.environ.get("TRTLLM_REDIRECT_AD_TO_PARAGRAF")
+if _trtllm_redirect_value is None:
+    _trtllm_redirect_value = os.environ.get("TRTLLM_REDIRECT_AD_TO_LLMC", "")
+_trtllm_redirect_value = _trtllm_redirect_value.lower()
 if _trtllm_redirect_value not in {"1", "true", "yes", "on"}:
     pytest.skip(
         "Paragraf optional TRT-LLM tests require TRTLLM_REDIRECT_AD_TO_PARAGRAF=true",
@@ -142,7 +149,16 @@ def generated_package(tmp_path_factory: pytest.TempPathFactory) -> Path:
         text=True,
         timeout=60,
     )
-    assert not legacy_package_dir.exists()
+    assert legacy_package_dir.is_symlink()
+    assert os.readlink(legacy_package_dir) == "paragraf"
+    subprocess.run(
+        [sys.executable, str(CREATE_SCRIPT), "--output-dir", str(output_dir)],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert legacy_package_dir.is_symlink()
     return output_dir
 
 
@@ -166,9 +182,23 @@ def generated_torch_unit_tests(generated_package: Path) -> Path:
 
 def test_generates_paragraf_package_identity(generated_package: Path) -> None:
     assert (generated_package / "paragraf" / "__init__.py").is_file()
+    assert (generated_package / "llmc").is_symlink()
     pyproject = (generated_package / "pyproject.toml").read_text()
-    assert 'name = "nvidia-paragraf"' in pyproject
-    assert 'include = ["paragraf*"]' in pyproject
+    assert 'name = "nvidia-llmc"' in pyproject
+    assert 'include = ["paragraf*", "llmc"]' in pyproject
+
+
+def test_legacy_generator_entrypoint(tmp_path: Path) -> None:
+    output_dir = tmp_path / "legacy-generator-output"
+    subprocess.run(
+        [sys.executable, str(LEGACY_CREATE_SCRIPT), "--output-dir", str(output_dir)],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert (output_dir / "paragraf" / "__init__.py").is_file()
+    assert (output_dir / "llmc").is_symlink()
 
 
 def test_exports_exact_multigpu_allowlist(generated_multigpu_tests: Path) -> None:
@@ -204,6 +234,7 @@ def test_conftest_allows_explicit_redirect_mode(generated_multigpu_tests: Path) 
     conftest = generated_multigpu_tests.parent / "conftest.py"
     content = conftest.read_text()
     assert "TRTLLM_REDIRECT_AD_TO_PARAGRAF" in content
+    assert "TRTLLM_REDIRECT_AD_TO_LLMC" in content
     assert "set TRTLLM_REDIRECT_AD_TO_PARAGRAF=true only for optional TRT-LLM tests" in content
     assert "_package_root = os.path.dirname(_tests_dir)" in content
     assert "sys.path.insert(0, _package_root)" in content
@@ -222,6 +253,13 @@ def test_does_not_add_test_guards_to_runners(generated_package: Path) -> None:
     content = runner.read_text()
     assert "pytest.skip" not in content
     assert "pytest.importorskip" not in content
+
+
+def test_generates_legacy_runner_wrapper(generated_package: Path) -> None:
+    runner = generated_package / "runners" / "trtllm" / "build_and_run_llmc_trtllm.py"
+    content = runner.read_text()
+    assert "build_and_run_paragraf_trtllm" in content
+    assert "main()" in content
 
 
 @pytest.mark.parametrize("relative_path", sorted(EXPECTED_SINGLEGPU_SMOKE_FILES, key=str), ids=str)

@@ -127,6 +127,28 @@ class TestStandalonePackage:
         )
         assert result.returncode == 0, f"stdout: {result.stdout}\nstderr: {result.stderr}"
 
+    def test_import_llmc_alias(self, standalone_package):
+        """The installed wheel should preserve canonical identity for legacy imports."""
+        result = _run_isolated(
+            standalone_package,
+            """
+            import importlib
+            import importlib.metadata
+
+            import llmc
+            import paragraf
+
+            legacy_logger = importlib.import_module("llmc.utils.logger")
+            canonical_logger = importlib.import_module("paragraf.utils.logger")
+            assert llmc is paragraf
+            assert legacy_logger is canonical_logger
+            assert legacy_logger.__name__ == "paragraf.utils.logger"
+            assert importlib.metadata.version("nvidia-llmc") == "0.1.0"
+            print("OK")
+            """,
+        )
+        assert result.returncode == 0, f"stdout: {result.stdout}\nstderr: {result.stderr}"
+
     def test_ops_registered(self, standalone_package):
         """Custom ops should register under torch.ops.auto_deploy."""
         result = _run_isolated(

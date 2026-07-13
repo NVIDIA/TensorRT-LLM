@@ -13,27 +13,33 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# This source tree is copied verbatim to the standalone ``paragraf`` package.
-# Install the compatibility redirect before registration imports when running
-# from that generated package; bundled AutoDeploy must remain unchanged.
-if __name__ == "paragraf":
-    from . import trtllm_compat as _trtllm_compat
+# The generated ``llmc`` symlink bootstraps the canonical package. Paragraf's
+# redirect finder then ensures all legacy submodules share canonical identity.
+if __name__ == "llmc":
+    import paragraf as _paragraf  # noqa: F401
+else:
+    # This source tree is copied verbatim to the standalone ``paragraf`` package.
+    # Install compatibility redirects before registration imports when running
+    # from that generated package; bundled AutoDeploy must remain unchanged.
+    if __name__ == "paragraf":
+        from . import trtllm_compat as _trtllm_compat
 
-    _trtllm_compat.install_autodeploy_redirect_from_env()
+        _trtllm_compat.install_autodeploy_redirect_from_env()
+        _trtllm_compat.install_llmc_alias()
 
-# import submodules that require registration process
-from . import compile, custom_ops, export, models  # noqa: F401
-from ._compat import TRTLLM_AVAILABLE
+    # import submodules that require registration process
+    from . import compile, custom_ops, export, models  # noqa: F401
+    from ._compat import TRTLLM_AVAILABLE
 
-if TRTLLM_AVAILABLE:
-    from . import shim  # noqa: F401
+    if TRTLLM_AVAILABLE:
+        from . import shim  # noqa: F401
 
-    # import AutoDeploy LLM and LlmArgs (require TRT-LLM base classes)
-    from .llm import *
-    from .llm_args import *
+        # import AutoDeploy LLM and LlmArgs (require TRT-LLM base classes)
+        from .llm import *
+        from .llm_args import *
 
-try:
-    # This will overwrite the AutoModelForCausalLM.from_config to support modelopt quantization
-    import modelopt
-except ImportError:
-    pass
+    try:
+        # This will overwrite the AutoModelForCausalLM.from_config to support modelopt quantization
+        import modelopt
+    except ImportError:
+        pass

@@ -15,6 +15,7 @@
 
 """Tests for the generated Paragraf compatibility redirect."""
 
+import json
 import os
 import subprocess
 import sys
@@ -26,6 +27,7 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[4]
 CREATE_SCRIPT = REPO_ROOT / "examples" / "auto_deploy" / "paragraf" / "create_standalone_package.py"
 REDIRECT_ENV_VAR = "TRTLLM_REDIRECT_AD_TO_PARAGRAF"
+LEGACY_REDIRECT_ENV_VAR = "TRTLLM_REDIRECT_AD_TO_LLMC"
 
 
 def _stub_preamble(package_dir: Path) -> str:
@@ -75,6 +77,7 @@ def generated_package(tmp_path_factory: pytest.TempPathFactory) -> Path:
     )
 
     assert (package_dir / "paragraf" / "trtllm_compat.py").is_file()
+    assert (package_dir / "llmc").is_symlink()
     (package_dir / "paragraf" / "redirect_test_module.py").write_text(
         "class RedirectProbe:\n    pass\n\nVALUE = 42\n"
     )
@@ -109,13 +112,18 @@ def generated_package(tmp_path_factory: pytest.TempPathFactory) -> Path:
 
 
 def _run_generated(
-    package_dir: Path, script: str, env_value: str | None
+    package_dir: Path,
+    script: str,
+    env_value: str | None,
+    env_var: str = REDIRECT_ENV_VAR,
 ) -> subprocess.CompletedProcess:
     env = os.environ.copy()
+    env.pop(REDIRECT_ENV_VAR, None)
+    env.pop(LEGACY_REDIRECT_ENV_VAR, None)
     if env_value is None:
-        env.pop(REDIRECT_ENV_VAR, None)
+        env.pop(env_var, None)
     else:
-        env[REDIRECT_ENV_VAR] = env_value
+        env[env_var] = env_value
 
     return subprocess.run(
         [sys.executable, "-c", _stub_preamble(package_dir) + textwrap.dedent(script)],
@@ -153,8 +161,11 @@ def test_redirect_is_disabled_by_default(generated_package: Path, env_value: str
     _assert_success(result)
 
 
+@pytest.mark.parametrize("env_var", [REDIRECT_ENV_VAR, LEGACY_REDIRECT_ENV_VAR])
 @pytest.mark.parametrize("env_value", ["1", "true", "YES", "on"])
-def test_redirect_uses_canonical_paragraf_modules(generated_package: Path, env_value: str) -> None:
+def test_redirect_uses_canonical_paragraf_modules(
+    generated_package: Path, env_value: str, env_var: str
+) -> None:
     result = _run_generated(
         generated_package,
         """
@@ -180,8 +191,69 @@ def test_redirect_uses_canonical_paragraf_modules(generated_package: Path, env_v
         install_autodeploy_redirect()
         """,
         env_value=env_value,
+        env_var=env_var,
     )
     _assert_success(result)
+
+
+def test_llmc_imports_are_canonical_paragraf_modules(generated_package: Path) -> None:
+    result = _run_generated(
+        generated_package,
+        """
+        import importlib
+        import sys
+
+        import llmc
+        import paragraf
+
+        legacy_module = importlib.import_module('llmc.redirect_test_module')
+        canonical_module = importlib.import_module('paragraf.redirect_test_module')
+
+        assert llmc is paragraf
+        assert legacy_module is canonical_module
+        assert legacy_module.__name__ == 'paragraf.redirect_test_module'
+        assert sys.modules['llmc'] is paragraf
+        assert sys.modules['llmc.redirect_test_module'] is canonical_module
+        """,
+        env_value=None,
+    )
+    _assert_success(result)
+
+
+def test_legacy_coverage_target_measures_paragraf_source(generated_package: Path) -> None:
+    pytest.importorskip("coverage")
+    probe = generated_package / "coverage_probe.py"
+    probe.write_text(
+        _stub_preamble(generated_package)
+        + "\nfrom paragraf.redirect_test_module import RedirectProbe\nRedirectProbe()\n"
+    )
+    env = os.environ.copy()
+    env.pop(REDIRECT_ENV_VAR, None)
+    env.pop(LEGACY_REDIRECT_ENV_VAR, None)
+    run_result = subprocess.run(
+        [sys.executable, "-m", "coverage", "run", "--source=llmc", str(probe)],
+        check=False,
+        capture_output=True,
+        cwd=generated_package,
+        env=env,
+        text=True,
+        timeout=30,
+    )
+    _assert_success(run_result)
+
+    report = generated_package / "coverage.json"
+    json_result = subprocess.run(
+        [sys.executable, "-m", "coverage", "json", "-o", str(report)],
+        check=False,
+        capture_output=True,
+        cwd=generated_package,
+        env=env,
+        text=True,
+        timeout=30,
+    )
+    _assert_success(json_result)
+    measured_files = json.loads(report.read_text())["files"]
+    assert any(path.endswith("paragraf/redirect_test_module.py") for path in measured_files)
 
 
 def test_redirect_can_be_installed_explicitly(generated_package: Path) -> None:
@@ -233,9 +305,12 @@ def test_redirect_bootstraps_during_child_unpickle(generated_package: Path) -> N
     _assert_success(result)
 
 
-def test_redirects_real_trtllm_runtime_entrypoints(generated_package: Path) -> None:
+@pytest.mark.parametrize("env_var", [REDIRECT_ENV_VAR, LEGACY_REDIRECT_ENV_VAR])
+def test_redirects_real_trtllm_runtime_entrypoints(generated_package: Path, env_var: str) -> None:
     env = os.environ.copy()
-    env[REDIRECT_ENV_VAR] = "true"
+    env.pop(REDIRECT_ENV_VAR, None)
+    env.pop(LEGACY_REDIRECT_ENV_VAR, None)
+    env[env_var] = "true"
     script = textwrap.dedent(
         f"""
         import importlib
@@ -285,10 +360,16 @@ def test_redirects_real_trtllm_runtime_entrypoints(generated_package: Path) -> N
     _assert_success(result)
 
 
-def test_redirect_rejects_invalid_environment_value(generated_package: Path) -> None:
-    result = _run_generated(generated_package, "import paragraf", env_value="sometimes")
+@pytest.mark.parametrize("env_var", [REDIRECT_ENV_VAR, LEGACY_REDIRECT_ENV_VAR])
+def test_redirect_rejects_invalid_environment_value(generated_package: Path, env_var: str) -> None:
+    result = _run_generated(
+        generated_package,
+        "import paragraf",
+        env_value="sometimes",
+        env_var=env_var,
+    )
     assert result.returncode != 0
-    assert f"{REDIRECT_ENV_VAR} must be a boolean value" in result.stderr
+    assert f"{env_var} must be a boolean value" in result.stderr
 
 
 def test_redirect_rejects_preloaded_bundled_modules(generated_package: Path) -> None:

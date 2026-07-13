@@ -23,8 +23,9 @@ be pushed directly to the read-only standalone repository.
 Usage:
     python create_standalone_package.py [--output-dir /path/to/output]
 
-The generated package uses ``paragraf`` as the top-level Python package name and
-``nvidia-paragraf`` as the distribution name:
+The generated package uses ``paragraf`` as the canonical top-level Python package
+name. During the compatibility window, ``llmc`` remains an import alias and
+``nvidia-llmc`` remains the distribution name:
 
     from paragraf._compat import TRTLLM_AVAILABLE
     from paragraf.custom_ops.attention_interface import SequenceInfo
@@ -76,6 +77,32 @@ AD_EXAMPLES_SRC = os.path.join(REPO_ROOT, "examples", "auto_deploy")
 # entrypoint is renamed to make its scope explicit in the paragraf distribution.
 EXAMPLE_FILES = {"build_and_run_ad.py": "build_and_run_paragraf_trtllm.py"}
 EXAMPLE_DIRS = ["model_registry"]
+LEGACY_RUNNER_NAME = "build_and_run_llmc_trtllm.py"
+LEGACY_RUNNER_WRAPPER = textwrap.dedent("""\
+    #!/usr/bin/env python3
+    # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+    # SPDX-License-Identifier: Apache-2.0
+    #
+    # Licensed under the Apache License, Version 2.0 (the "License");
+    # you may not use this file except in compliance with the License.
+    # You may obtain a copy of the License at
+    #
+    # http://www.apache.org/licenses/LICENSE-2.0
+    #
+    # Unless required by applicable law or agreed to in writing, software
+    # distributed under the License is distributed on an "AS IS" BASIS,
+    # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+    # See the License for the specific language governing permissions and
+    # limitations under the License.
+
+    if __package__:
+        from .build_and_run_paragraf_trtllm import *
+    else:
+        from build_and_run_paragraf_trtllm import *
+
+    if __name__ == "__main__":
+        main()
+    """)
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -246,7 +273,10 @@ _TRTLLM_IMPORT_RE = re.compile(
     r"(?:tensorrt_llm(?:\.|\b)|paragraf\.models\.custom\.modeling_gpt_oss(?:\.|\b))"
 )
 _PARAGRAF_OPTIONAL_TRTLLM_GUARD = """
-_trtllm_redirect_value = os.environ.get("TRTLLM_REDIRECT_AD_TO_PARAGRAF", "").lower()
+_trtllm_redirect_value = os.environ.get("TRTLLM_REDIRECT_AD_TO_PARAGRAF")
+if _trtllm_redirect_value is None:
+    _trtllm_redirect_value = os.environ.get("TRTLLM_REDIRECT_AD_TO_LLMC", "")
+_trtllm_redirect_value = _trtllm_redirect_value.lower()
 if _trtllm_redirect_value not in {"1", "true", "yes", "on"}:
     pytest.skip(
         "Paragraf optional TRT-LLM tests require TRTLLM_REDIRECT_AD_TO_PARAGRAF=true",
@@ -558,10 +588,12 @@ def _create_test_conftest(tests_dir: str) -> None:
 
         import pytest
 
-        _allow_trtllm_redirect = (
-            os.environ.get("TRTLLM_REDIRECT_AD_TO_PARAGRAF", "").lower()
-            in {"1", "true", "yes", "on"}
-        )
+        _trtllm_redirect_value = os.environ.get("TRTLLM_REDIRECT_AD_TO_PARAGRAF")
+        if _trtllm_redirect_value is None:
+            _trtllm_redirect_value = os.environ.get("TRTLLM_REDIRECT_AD_TO_LLMC", "")
+        _allow_trtllm_redirect = _trtllm_redirect_value.lower() in {
+            "1", "true", "yes", "on"
+        }
         _trtllm_spec = importlib.util.find_spec("tensorrt_llm")
         if _trtllm_spec is not None and not _allow_trtllm_redirect:
             raise RuntimeError(
@@ -729,6 +761,10 @@ def _copy_runners(output_dir: str) -> int:
         src = os.path.join(AD_EXAMPLES_SRC, dname)
         if os.path.isdir(src):
             count += _copy_tree(src, os.path.join(runners_dst, dname))
+    if os.path.isdir(runners_dst):
+        with open(os.path.join(runners_dst, LEGACY_RUNNER_NAME), "w") as f:
+            f.write(LEGACY_RUNNER_WRAPPER)
+        count += 1
     return count
 
 
@@ -746,7 +782,7 @@ def _create_pyproject_toml(output_dir: str, dependencies: list, dev_dependencies
         'build-backend = "setuptools.build_meta"\n'
         "\n"
         "[project]\n"
-        'name = "nvidia-paragraf"\n'
+        'name = "nvidia-llmc"\n'
         'version = "0.1.0"\n'
         'description = "paragraf: standalone LLM compiler — '
         'automatic model optimization and deployment for LLM inference"\n'
@@ -763,7 +799,7 @@ def _create_pyproject_toml(output_dir: str, dependencies: list, dev_dependencies
         "]\n"
         "\n"
         "[tool.setuptools.packages.find]\n"
-        'include = ["paragraf*"]\n'
+        'include = ["paragraf*", "llmc"]\n'
         "\n"
         "[tool.pytest.ini_options]\n"
         'testpaths = ["tests"]\n'
@@ -793,7 +829,9 @@ def create_standalone_package(output_dir: str) -> None:
     # Clean only the paths this script manages, preserving .git and other repo files
     for name in _MANAGED_PATHS:
         target = os.path.join(output_dir, name)
-        if os.path.isdir(target):
+        if os.path.islink(target):
+            os.remove(target)
+        elif os.path.isdir(target):
             shutil.rmtree(target)
         elif os.path.isfile(target):
             os.remove(target)
@@ -806,6 +844,10 @@ def create_standalone_package(output_dir: str) -> None:
     ad_dst = os.path.join(output_dir, "paragraf")
     count = _copy_tree(AUTO_DEPLOY_SRC, ad_dst)
     print(f"  Copied {count} source files to paragraf/")
+
+    legacy_dst = os.path.join(output_dir, "llmc")
+    os.symlink("paragraf", legacy_dst, target_is_directory=True)
+    print("  Created legacy llmc -> paragraf package alias")
 
     # 2. Copy and rewrite tests (tests use absolute self-imports by design).
     test_count = _copy_tests(output_dir)

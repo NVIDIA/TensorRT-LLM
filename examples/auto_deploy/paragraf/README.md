@@ -4,6 +4,11 @@
 
 The `paragraf` package is **generated** from the AutoDeploy source tree inside the [TensorRT-LLM repo](https://github.com/NVIDIA/TensorRT-LLM). The standalone repo is **read-only** — see [`CONTRIBUTING.md`](./CONTRIBUTING.md) for how to land changes.
 
+During the rename transition, `llmc` remains a deprecated import alias for `paragraf`,
+the distribution metadata remains `nvidia-llmc`, and the legacy redirect environment
+variable and runner entry point remain supported. New code should use the Paragraf
+names shown below.
+
 For general AutoDeploy documentation (motivation, support matrix, feature overview), see the [official docs](https://nvidia.github.io/TensorRT-LLM/features/auto_deploy/auto-deploy.html).
 
 ______________________________________________________________________
