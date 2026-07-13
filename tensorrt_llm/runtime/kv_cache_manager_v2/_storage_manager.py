@@ -43,7 +43,7 @@ from ._config import (
     KVCacheDesc,
     SwaScratchReuseConfig,
 )
-from ._copy_engine import CopyTask, batched_copy
+from ._copy_engine import CopyTask, batched_copy, initialize_nixl_gds
 from ._event_manager import KVCacheEventDiff
 from ._eviction_controller import EvictablePage, PerLevelEvictionController
 from ._exceptions import OutOfPagesError
@@ -336,6 +336,8 @@ class StorageManager:
             assert isinstance(disk_config, DiskCacheTierConfig)
             self._disk_backend = disk_config.backend
             self._disk_gds_thread_count = disk_config.gds_thread_count
+            if self._disk_backend == "nixl_gds":
+                initialize_nixl_gds(self._disk_gds_thread_count)
         else:
             self._disk_backend = "posix"
             self._disk_gds_thread_count = 8

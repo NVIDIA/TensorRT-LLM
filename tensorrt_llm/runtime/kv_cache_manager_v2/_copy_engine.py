@@ -321,17 +321,38 @@ class StagingBufferManager:
 
 
 class CopyEngine:
-    __slots__ = ("_staging_buffer_manager", "_nixl_gds_engines")
+    __slots__ = ("_staging_buffer_manager", "_nixl_gds_engine", "_nixl_gds_thread_count")
     _staging_buffer_manager: StagingBufferManager | None
-    _nixl_gds_engines: dict[int, Any]
+    _nixl_gds_engine: Any | None
+    _nixl_gds_thread_count: int | None
 
     def __init__(self) -> None:
         self._staging_buffer_manager = None
-        self._nixl_gds_engines = {}
+        self._nixl_gds_engine = None
+        self._nixl_gds_thread_count = None
 
     def close(self) -> None:
         self._staging_buffer_manager = None
-        self._nixl_gds_engines.clear()
+        self._nixl_gds_engine = None
+        self._nixl_gds_thread_count = None
+
+    def initialize_nixl_gds(self, thread_count: int) -> Any:
+        """Create the one GDS_MT engine owned by this worker process."""
+        if thread_count <= 0:
+            raise ValueError("NIXL GDS_MT thread count must be positive")
+        if self._nixl_gds_engine is None:
+            if _NixlGdsCopyEngine is None:
+                raise RuntimeError(
+                    "NIXL GDS support is unavailable in the loaded TensorRT-LLM bindings"
+                )
+            self._nixl_gds_engine = _NixlGdsCopyEngine(thread_count)
+            self._nixl_gds_thread_count = thread_count
+        elif thread_count != self._nixl_gds_thread_count:
+            raise RuntimeError(
+                "NIXL GDS_MT is already initialized with thread_count="
+                f"{self._nixl_gds_thread_count}; cannot reconfigure it to {thread_count}"
+            )
+        return self._nixl_gds_engine
 
     @property
     def staging_buffer_manager(self) -> StagingBufferManager:
@@ -401,16 +422,7 @@ class CopyEngine:
         stream: CudaStream,
         thread_count: int,
     ) -> None:
-        if thread_count <= 0:
-            raise ValueError("NIXL GDS_MT thread count must be positive")
-        engine = self._nixl_gds_engines.get(thread_count)
-        if engine is None:
-            if _NixlGdsCopyEngine is None:
-                raise RuntimeError(
-                    "NIXL GDS support is unavailable in the loaded TensorRT-LLM bindings"
-                )
-            engine = _NixlGdsCopyEngine(thread_count)
-            self._nixl_gds_engines[thread_count] = engine
+        engine = self.initialize_nixl_gds(thread_count)
 
         if dst_cache_tier == CacheTier.DISK:
             disk_tasks = [
@@ -449,6 +461,10 @@ class CopyEngine:
 
 _copy_engine = CopyEngine()
 atexit.register(_copy_engine.close)
+
+
+def initialize_nixl_gds(thread_count: int) -> None:
+    _copy_engine.initialize_nixl_gds(thread_count)
 
 
 def batched_copy(
