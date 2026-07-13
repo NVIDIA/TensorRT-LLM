@@ -397,6 +397,44 @@ class TestGemma3_12BInstruct(LlmapiAccuracyTestHarness):
             task.evaluate(llm, sampling_params=self.sampling_params)
 
 
+@pytest.mark.skip_device_not_contain(["B200"])
+class TestGemma4_26B_A4B(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "google/gemma-4-26B-A4B-it"
+    MODEL_PATH = f"{llm_models_root()}/gemma/nvidia-Gemma-4-26B-A4B-NVFP4"
+    EXTRA_EVALUATOR_KWARGS = {
+        "chat_template_kwargs": {"enable_thinking": False},
+    }
+
+    # NOTE: MMMU adds <|endoftext|> to the stop token.
+    sampling_params = SamplingParams(
+        max_tokens=MMMU.MAX_OUTPUT_LEN,
+        truncate_prompt_tokens=MMMU.MAX_INPUT_LEN,
+        stop="<|endoftext|>",
+    )
+
+    kv_cache_config = KvCacheConfig(
+        enable_block_reuse=False,
+        enable_partial_reuse=False,
+        free_gpu_memory_fraction=0.6,
+        dtype="fp8",
+    )
+
+    def test_nvfp4(self):
+        with LLM(
+            self.MODEL_PATH,
+            max_batch_size=16,
+            kv_cache_config=self.kv_cache_config,
+            enable_chunked_prefill=True,
+        ) as llm:
+            assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
+            task = MMMU(self.MODEL_NAME)
+            task.evaluate(
+                llm,
+                sampling_params=self.sampling_params,
+                extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS,
+            )
+
+
 class TestQwen3VL_MOE(LlmapiAccuracyTestHarness):
     MODEL_NAME = "Qwen/Qwen3-VL-30B-A3B-Instruct"
     MODEL_PATH = f"{llm_models_root()}/Qwen3/Qwen3-VL-30B-A3B-Instruct"
@@ -475,6 +513,75 @@ class TestMistralLarge3_675B(LlmapiAccuracyTestHarness):
             enable_attention_dp=attention_dp,
             kv_cache_config=kv_cache_config,
         ) as llm:
+            task = MMMU(self.MODEL_NAME)
+            task.evaluate(llm, sampling_params=self.sampling_params)
+
+
+# Qwen3.5-MoE-VL is hybrid (Mamba + attention);
+# the FlashInfer GDN prefill kernel is sm90+ only.
+@skip_pre_hopper
+@pytest.mark.skip_less_device_memory(80000)
+class TestQwen3_5_35B_A3B_VL(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "Qwen/Qwen3.5-35B-A3B"
+    MODEL_PATH = f"{llm_models_root()}/Qwen3.5-35B-A3B"
+    MAX_NUM_TOKENS = 16384
+    MAX_BATCH_SIZE = 32
+
+    sampling_params = SamplingParams(
+        max_tokens=MAX_NUM_TOKENS,
+        truncate_prompt_tokens=MMMU.MAX_INPUT_LEN,
+        stop="<|endoftext|>",
+    )
+
+    kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6, enable_block_reuse=False)
+
+    def _make_llm(self, model_path: str) -> LLM:
+        return LLM(
+            model_path,
+            max_num_tokens=self.MAX_NUM_TOKENS,
+            max_batch_size=self.MAX_BATCH_SIZE,
+            kv_cache_config=self.kv_cache_config,
+        )
+
+    def test_auto_dtype(self) -> None:
+        with self._make_llm(self.MODEL_PATH) as llm:
+            task = MMMU(self.MODEL_NAME)
+            task.evaluate(llm, sampling_params=self.sampling_params)
+
+    def test_fp8_prequantized(self) -> None:
+        model_path = f"{llm_models_root()}/Qwen3.5-35B-A3B-FP8"
+        with self._make_llm(model_path) as llm:
+            assert llm.args.quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES
+            task = MMMU(self.MODEL_NAME)
+            task.evaluate(llm, sampling_params=self.sampling_params)
+
+
+@skip_pre_hopper
+@pytest.mark.skip_less_device_memory(80000)
+class TestQwen3_5_27B_VL(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "Qwen/Qwen3.5-27B"
+    MODEL_PATH = f"{llm_models_root()}/Qwen3.5-27B"
+    MAX_NUM_TOKENS = 16384
+    MAX_BATCH_SIZE = 32
+
+    sampling_params = SamplingParams(
+        max_tokens=MAX_NUM_TOKENS,
+        truncate_prompt_tokens=MMMU.MAX_INPUT_LEN,
+        stop="<|endoftext|>",
+    )
+
+    kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6, enable_block_reuse=False)
+
+    def _make_llm(self, model_path: str) -> LLM:
+        return LLM(
+            model_path,
+            max_num_tokens=self.MAX_NUM_TOKENS,
+            max_batch_size=self.MAX_BATCH_SIZE,
+            kv_cache_config=self.kv_cache_config,
+        )
+
+    def test_auto_dtype(self) -> None:
+        with self._make_llm(self.MODEL_PATH) as llm:
             task = MMMU(self.MODEL_NAME)
             task.evaluate(llm, sampling_params=self.sampling_params)
 

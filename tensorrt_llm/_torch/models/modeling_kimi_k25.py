@@ -73,6 +73,7 @@ from ..modules.linear import Linear, TensorParallelMode
 from ..modules.mlp import MLP
 from .checkpoints.base_weight_loader import ConsumableWeightsDict
 from .modeling_deepseekv3 import DeepseekV3ForCausalLM
+from .modeling_multimodal_encoder import MultimodalEncoderMixin
 from .modeling_multimodal_utils import (
     find_input_mm_embeds,
     fuse_input_embeds,
@@ -614,7 +615,7 @@ class EncoderLayer(nn.Module):
         return x
 
 
-class MoonViT3dEncoder(nn.Module):
+class MoonViT3dEncoder(nn.Module, MultimodalEncoderMixin):
     """Stack of MoonViT3d encoder layers + 2D RoPE + final LayerNorm."""
 
     def __init__(
@@ -649,12 +650,11 @@ class MoonViT3dEncoder(nn.Module):
             dtype=model_config.torch_dtype,
         )
 
+        # Context-only metadata (kv_cache_manager=None) built by the engine via
+        # ``MultimodalEncoderMixin.setup_attn_metadata`` at the encoder budget;
+        # filled per forward by ``prepare_attn_metadata``.
         self.metadata_cls = get_attention_backend(model_config.attn_backend).Metadata
-        self.attn_metadata = self.metadata_cls(
-            max_num_requests=8192,
-            max_num_tokens=8192,
-            kv_cache_manager=None,
-        )
+        self.attn_metadata: Optional[AttentionMetadata] = None
 
     def prepare_attn_metadata(
         self,
@@ -1581,6 +1581,9 @@ class KimiK25ForConditionalGeneration(PreTrainedModel):
         self._media_placeholder_token_id = getattr(
             config, "media_placeholder_token_id", _MEDIA_PLACEHOLDER_TOKEN_ID
         )
+        # Backing storage for the ``mm_token_ids`` property below — built once
+        # here so the executor doesn't re-allocate per step.
+        self._mm_token_ids = torch.tensor([self._media_placeholder_token_id], dtype=torch.int32)
 
         # Align model config with the LLM backbone's text_config.
         # The executor reads eos_token_id and other generation params from
@@ -1629,6 +1632,16 @@ class KimiK25ForConditionalGeneration(PreTrainedModel):
             "multimodal_embedding",
         ]
 
+    @property
+    def mm_token_ids(self) -> torch.Tensor:
+        """Surface the in-vocab media placeholder to the model engine so
+        ``_prepare_multimodal_indices`` selects the ``torch.isin`` predicate
+        instead of the OOV (``>= vocab_size``) fallback (which would miss
+        Kimi's placeholder and force ``fuse_input_embeds`` through the
+        ``torch.where`` host-sync path on GPU input_ids).
+        """
+        return self._mm_token_ids
+
     def load_weights(self, weights) -> None:
         """Load vision + projector + LLM weights from checkpoint."""
         # Create vision encoder if it was skipped during meta init.
@@ -1671,17 +1684,10 @@ class KimiK25ForConditionalGeneration(PreTrainedModel):
         multimodal_params = multimodal_params or []
         mm_embeds: List[torch.Tensor] = []
         mm_token_ids = None
-        fuse_kwargs = kwargs
 
         if len(multimodal_params) > 0:
             if DISAGG:
                 raise NotImplementedError("Disaggregated inference not yet supported for K2.5.")
-            # fuse_input_embeds doesn't accept the mm_*_indices kwargs.
-            fuse_kwargs = {
-                k: v
-                for k, v in kwargs.items()
-                if k not in ("mm_token_indices", "text_token_indices")
-            }
             mm_ctx_params = multimodal_params[: attn_metadata.num_contexts]
             mm_embeds = get_multimodal_embeddings(
                 encoder_forward_fn=self.mm_encoder.forward,
@@ -1689,27 +1695,23 @@ class KimiK25ForConditionalGeneration(PreTrainedModel):
             )
             mm_embeds = find_input_mm_embeds(mm_embeds, mm_ctx_params)
 
+            # The executor's ``_prepare_multimodal_indices`` now sees Kimi's
+            # in-vocab placeholder via ``self.mm_token_ids`` and emits indices
+            # that match ``find_input_mm_embeds``'s active-chunk slice. The
+            # previous ``(input_ids == placeholder).sum().item()`` guard was a
+            # host sync used to detect chunked-prefill / KV-reuse mismatches;
+            # that mismatch surfaces as a row-count error inside
+            # ``fuse_input_embeds`` itself, so the explicit check is no longer
+            # needed.
             if len(mm_embeds) > 0:
-                placeholder_id = self._media_placeholder_token_id
-                if int((input_ids == placeholder_id).sum().item()) == 0:
-                    logger.warning(
-                        "Vision embeddings computed but no placeholder tokens "
-                        "found in input_ids — embeddings discarded."
-                    )
-                    mm_embeds = []
-                else:
-                    mm_token_ids = torch.tensor(
-                        [placeholder_id],
-                        dtype=input_ids.dtype,
-                        device=input_ids.device,
-                    )
-
+                mm_token_ids = self.mm_token_ids.to(input_ids.device, dtype=input_ids.dtype)
         input_ids, inputs_embeds = fuse_input_embeds(
             self.llm.model.embed_tokens,
             input_ids,
             mm_embeds,
             mm_token_ids=mm_token_ids,
-            **fuse_kwargs,
+            mm_token_indices=kwargs.get("mm_token_indices"),
+            text_token_indices=kwargs.get("text_token_indices"),
         )
 
         return self.llm.forward(

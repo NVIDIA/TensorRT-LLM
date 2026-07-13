@@ -445,7 +445,10 @@ TrtGptModelInflightBatching::TrtGptModelInflightBatching(std::shared_ptr<nvinfer
 
     mCapacityScheduler = std::make_unique<CapacityScheduler>(getMaxNumSequences(),
         executorConfig.getSchedulerConfig().getCapacitySchedulerPolicy(), mKvCacheManager != nullptr,
-        mWorldConfig.isPipelineParallel());
+        /*twoStepsLookAhead=*/mWorldConfig.isPipelineParallel(),
+        /*noScheduleUntilState=*/LlmRequestState::kCONTEXT_INIT,
+        /*noScheduleAfterState=*/LlmRequestState::kGENERATION_COMPLETE,
+        /*enablePrefixAwareScheduling=*/executorConfig.getSchedulerConfig().getEnablePrefixAwareScheduling());
 
     mMicroBatchScheduler = std::make_unique<MicroBatchScheduler>(ctxChunkConfig, maxContextLength);
 
