@@ -102,19 +102,25 @@ TEST(BounceMessageCodec, GrantRoundTrip)
 
 TEST(BounceMessageCodec, DataRoundTrip)
 {
-    std::vector<b::BounceScatterEntry> entries{{0, 0xD000, 128, 0}, {128, 0xE000, 64, 1}};
+    // {bounceOffset, dstAddr, dstStride, bounceStride, pieceSize, count}: one plain extent + one
+    // 3-piece strided run.
+    std::vector<b::BounceScatterRun> entries{{0, 0xD000, 0, 0, 128, 1}, {128, 0xE000, 4096, 128, 64, 3}};
     auto blob = b::encodeData(/*rid=*/7, /*chunk=*/2, /*numChunks=*/5, /*regionHandle=*/4, entries);
     auto h = decodeOk(blob, b::BounceMsgType::kDATA);
     EXPECT_EQ(h.requestId, 7u);
     EXPECT_EQ(h.chunkIdx, 2u);
     EXPECT_EQ(h.numChunks, 5u);
     EXPECT_EQ(h.regionHandle, 4u);
-    std::vector<b::BounceScatterEntry> out;
+    std::vector<b::BounceScatterRun> out;
     ASSERT_TRUE(b::decodeScatter(blob, h, out));
     ASSERT_EQ(out.size(), 2u);
     EXPECT_EQ(out[0].dstAddr, 0xD000u);
+    EXPECT_EQ(out[0].count, 1u);
     EXPECT_EQ(out[1].bounceOffset, 128u);
-    EXPECT_EQ(out[1].deviceId, 1u);
+    EXPECT_EQ(out[1].dstStride, 4096u);
+    EXPECT_EQ(out[1].bounceStride, 128u);
+    EXPECT_EQ(out[1].pieceSize, 64u);
+    EXPECT_EQ(out[1].count, 3u);
 }
 
 TEST(BounceMessageCodec, AckRoundTrip)
@@ -142,24 +148,24 @@ TEST(BounceMessageCodec, LargeScatterCountRoundTrips)
     // A single DATA chunk can carry many small descriptors (the exact case bounce optimizes).
     // `count`/`payloadBytes` are 32-bit, so a count well past 65535 must round-trip intact —
     // guards against any accidental 16-bit truncation of the entry count.
-    constexpr std::uint32_t kN = 100000; // 100k * 24B = 2.4 MB payload
-    std::vector<b::BounceScatterEntry> entries(kN);
+    constexpr std::uint32_t kN = 100000; // 100k * 36B = 3.6 MB payload
+    std::vector<b::BounceScatterRun> entries(kN);
     for (std::uint32_t i = 0; i < kN; ++i)
     {
-        entries[i] = {static_cast<std::uint64_t>(i) * 64, 0x10000000ULL + i, 64, i & 1};
+        entries[i] = {static_cast<std::uint64_t>(i) * 64, 0x10000000ULL + i, 0, 0, 64, 1};
     }
     auto blob = b::encodeData(/*rid=*/1, /*chunk=*/0, /*numChunks=*/1, /*regionHandle=*/0, entries);
     auto h = decodeOk(blob, b::BounceMsgType::kDATA);
     EXPECT_EQ(h.count, kN);
-    EXPECT_EQ(h.payloadBytes, kN * sizeof(b::BounceScatterEntry));
-    std::vector<b::BounceScatterEntry> out;
+    EXPECT_EQ(h.payloadBytes, kN * sizeof(b::BounceScatterRun));
+    std::vector<b::BounceScatterRun> out;
     ASSERT_TRUE(b::decodeScatter(blob, h, out));
     ASSERT_EQ(out.size(), kN);
     // Spot-check the boundaries and the >16-bit index region.
     EXPECT_EQ(out[0].dstAddr, 0x10000000ULL);
     EXPECT_EQ(out[65535].bounceOffset, static_cast<std::uint64_t>(65535) * 64);
     EXPECT_EQ(out[kN - 1].dstAddr, 0x10000000ULL + (kN - 1));
-    EXPECT_EQ(out[kN - 1].deviceId, (kN - 1) & 1);
+    EXPECT_EQ(out[kN - 1].count, 1u);
 }
 
 TEST(BounceMessageCodec, LargeCreditCountRoundTrips)
