@@ -51,6 +51,7 @@ class FilteredTopKKernelVarlen:
         num_ctas_per_row: int = 1,
         merge_blocks: bool = False,
         overflow_policy: str = "REREAD",
+        num_threads_override: int = 0,
     ):
         """
         Args:
@@ -114,35 +115,26 @@ class FilteredTopKKernelVarlen:
 
         if cutlass.const_expr(self.per_row_max_num_cols <= 65536):
             self.index_type = cutlass.Uint16
-            if cutlass.const_expr(self.num_buffer_smem_input_idx == 2):
-                self.max_smem_input_size = 32 * 1024
-            else:
-                self.max_smem_input_size = 64 * 1024
+            # TODO: remove after perf validation (replaced by _compute_smem_input_size_for_occupancy)
+            # if cutlass.const_expr(self.num_buffer_smem_input_idx == 2):
+            #     self.max_smem_input_size = 32 * 1024
+            # else:
+            #     self.max_smem_input_size = 64 * 1024
         else:
             self.index_type = cutlass.Uint32
-            if cutlass.const_expr(self.num_buffer_smem_input_idx == 2):
-                self.max_smem_input_size = 16 * 1024
-            else:
-                self.max_smem_input_size = 32 * 1024
-
-        self.filtered_topk_smem_input_size = self._compute_smem_input_size()
-
-        _needs_extra = self.max_num_cols > self.filtered_topk_smem_input_size
-        self.enable_gmem_store = (overflow_policy == "GMEM_SPILL") and _needs_extra
-        self.enable_truncate = (overflow_policy == "TRUNCATE") and _needs_extra
-        self.enable_reread_always = (overflow_policy == "REREAD_ALWAYS") and _needs_extra
-        self.enable_reread = (overflow_policy == "REREAD") and _needs_extra
-
-        self.return_val = return_val
-        # Subclasses set to True to subtract row_start from absolute indices before
-        # writing output (used in prefill where row_start may be non-zero).
-        self.subtract_row_start_on_output = False
+            # TODO: remove after perf validation (replaced by _compute_smem_input_size_for_occupancy)
+            # if cutlass.const_expr(self.num_buffer_smem_input_idx == 2):
+            #     self.max_smem_input_size = 16 * 1024
+            # else:
+            #     self.max_smem_input_size = 32 * 1024
 
         self.vec_size = num_copy_bits // dtype.width
         if cutlass.const_expr(dtype not in [cutlass.Float32, cute.BFloat16, cutlass.Float16]):
             raise ValueError(f"Unsupported dtype: {dtype}")
 
-        if cutlass.const_expr(dtype == cutlass.Float32):
+        if num_threads_override > 0:
+            self.num_threads_per_cta = num_threads_override
+        elif cutlass.const_expr(dtype == cutlass.Float32):
             if self.max_num_cols >= self.vec_size * 1024:
                 self.num_threads_per_cta = 1024
             else:
@@ -159,6 +151,21 @@ class FilteredTopKKernelVarlen:
                 else:
                     self.num_threads_per_cta = 256
 
+        # num_threads_per_cta must be set before _compute_smem_input_size() since
+        # _compute_smem_input_size_for_occupancy() uses it to derive num_warps.
+        self.filtered_topk_smem_input_size = self._compute_smem_input_size()
+
+        _needs_extra = self.max_num_cols > self.filtered_topk_smem_input_size
+        self.enable_gmem_store = (overflow_policy == "GMEM_SPILL") and _needs_extra
+        self.enable_truncate = (overflow_policy == "TRUNCATE") and _needs_extra
+        self.enable_reread_always = (overflow_policy == "REREAD_ALWAYS") and _needs_extra
+        self.enable_reread = (overflow_policy == "REREAD") and _needs_extra
+
+        self.return_val = return_val
+        # Subclasses set to True to subtract row_start from absolute indices before
+        # writing output (used in prefill where row_start may be non-zero).
+        self.subtract_row_start_on_output = False
+
         # radix-based filter parameters.
         if cutlass.const_expr(dtype == cutlass.Float32):
             self.ordered_type = cute.Uint32
@@ -170,7 +177,29 @@ class FilteredTopKKernelVarlen:
             self.num_refine_rounds = 1
 
     def _compute_smem_input_size(self) -> int:
-        return min(self.max_smem_input_size, self.max_num_cols)
+        return self._compute_smem_input_size_for_occupancy(target_blocks_per_sm=1)
+
+    def _compute_smem_input_size_for_occupancy(self, target_blocks_per_sm: int) -> int:
+        """Compute max candidate-buffer size (S) for a given occupancy target.
+
+            input_idx_budget = 128 KB // target_blocks_per_sm
+            S = input_idx_budget // (num_buffer * idx_sz)
+
+        This keeps total SMEM ≈ 38 KB/block at 4 blocks/SM, preserving ~104 KB
+        of unified L1 per SM for LDG caching. Using the full per-block budget
+        (256 KB / 4 = 64 KB) shrinks L1 to ~32 KB and causes a ~5-10% regression.
+
+        Resulting S values (matches old hardcoded values):
+          4 blocks/SM: Uint16/nb=2→8192  Uint16/nb=1→16384
+                       Uint32/nb=2→4096  Uint32/nb=1→8192
+          1 block/SM:  Uint16/nb=2→32768 Uint16/nb=1→65536
+                       Uint32/nb=2→16384 Uint32/nb=1→32768
+        """
+        INPUT_IDX_BUDGET_BASE = 128 * 1024  # 128 KB at 1 block/SM
+        input_idx_budget = INPUT_IDX_BUDGET_BASE // target_blocks_per_sm
+        idx_sz = 2 if self.index_type == cutlass.Uint16 else 4
+        max_S = input_idx_budget // (self.num_buffer_smem_input_idx * idx_sz)
+        return min(max_S, self.max_num_cols)
 
     @cute.jit
     def to_coarse_key(self, x):

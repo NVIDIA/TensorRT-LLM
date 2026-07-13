@@ -187,6 +187,9 @@ class FilteredTopKKernelVarlenDecode(FilteredTopKKernelVarlen):
             num_ctas_per_row,
             merge_blocks,
             overflow_policy=overflow_policy,
+            # large_occupancy always uses 512 threads; pass it early so that
+            # _compute_smem_input_size_for_occupancy() sees the correct num_warps.
+            num_threads_override=512 if large_occupancy else 0,
         )
         self.next_n = next_n
         self.enable_multi_cta = enable_multi_cta
@@ -196,16 +199,11 @@ class FilteredTopKKernelVarlenDecode(FilteredTopKKernelVarlen):
         self.enable_dynamic_multi_cta = enable_dynamic_multi_cta
         self.varlen_merge_input = varlen_merge_input
 
+        # TODO: clean the code.
         if cutlass.const_expr(large_occupancy):
-            # set the number of threads per cta to 512.
-            if cutlass.const_expr(not self.merge_blocks):
-                self.num_threads_per_cta = 512
-            else:
-                # For merge_blocks keep num_threads_per_cta=512 so that the
-                # prefix sum stays single-pass (radix=256 <= 512).  Instead,
-                # cap vec_size so tile_width (512 * vec_size) <= max_num_cols,
-                # preventing OOB s_indices from _fill_oob padding positions.
-                self.num_threads_per_cta = 512
+            if cutlass.const_expr(self.merge_blocks):
+                # For merge_blocks cap vec_size so tile_width (512 * vec_size) <=
+                # max_num_cols, preventing OOB s_indices from _fill_oob padding.
                 _vec_cap = max(1, 2 ** int(math.log2(max(self.max_num_cols // 512, 1))))
                 self.num_copy_bits = min(self.num_copy_bits, _vec_cap * self.dtype.width)
                 self.vec_size = self.num_copy_bits // self.dtype.width
@@ -221,28 +219,8 @@ class FilteredTopKKernelVarlenDecode(FilteredTopKKernelVarlen):
 
     def _compute_smem_input_size(self) -> int:
         if cutlass.const_expr(self._large_occupancy):
-            # Clamp filtered_topk_smem_input_size so the kernel fits 4 blocks/SM
-            # on B200 (256 KB/SM ÷ 4 = 64 KB/block budget).
-            #
-            # SMEM layout per block (worst-case top_k=2048, 128-B alignment):
-            #   fixed overhead  ~2048 B  (histogram + scalars + warp_sums +
-            #                             g_num_input present when enable_gmem_store)
-            #   s_indices        top_k × sizeof(index_type)
-            #   s_input_idx      num_buffer × S × sizeof(index_type)
-            #
-            # Solving 2048 + 2048*idx_sz + num_buffer*S*idx_sz <= 65536:
-            #   fp32 / Uint16  (num_buffer=2, idx=2B): S <= 14848 → pow2 cap 8192
-            #   fp32 / Uint32  (num_buffer=2, idx=4B): S <=  6912 → pow2 cap 4096
-            #   bf16 / Uint16  (num_buffer=1, idx=2B): S <= 29696 → pow2 cap 16384
-            #   bf16 / Uint32  (num_buffer=1, idx=4B): S <= 13824 → pow2 cap 8192
-            #
-            # Verification bf16/Uint16 S=16384: 2048+4096+1*16384*2 = 38912 B < 64 KB ✓
-            if self.index_type == cutlass.Uint16:
-                max_S = 8192 if self.num_buffer_smem_input_idx == 2 else 16384
-            else:  # Uint32 (max_num_cols > 65536)
-                max_S = 4096 if self.num_buffer_smem_input_idx == 2 else 8192
-            return min(max_S, self.max_num_cols)
-        return min(self.max_smem_input_size, self.max_num_cols)
+            return self._compute_smem_input_size_for_occupancy(target_blocks_per_sm=4)
+        return self._compute_smem_input_size_for_occupancy(target_blocks_per_sm=1)
 
     @cute.kernel
     def filtered_topk_kernel(
@@ -594,6 +572,7 @@ def cute_dsl_topk_wrapper(
     return output_indices_torch, output_values_torch
 
 
+# TODO: add policy support.
 def cute_dsl_topk_multi_cta_wrapper(
     input_values,
     seq_lens,
