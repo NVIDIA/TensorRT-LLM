@@ -27,11 +27,10 @@ class _FakeVisual:
         self.hidden = hidden
         self.deepstack_layers = deepstack_layers
 
-    def __call__(self, pixel_values, grid_thw=None):
+    def __call__(self, pixel_values, grid_thw):
         # `pixel_values` is [P_total, marker_dim]; each row's first column
         # holds an integer identity marker. The "encoder" pools each item's
         # patches into a single row per item (grid_thw specifies item extent).
-        assert grid_thw is not None
         out_rows = []
         offset = 0
         markers = pixel_values[:, 0].tolist()
