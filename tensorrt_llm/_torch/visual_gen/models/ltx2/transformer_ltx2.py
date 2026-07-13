@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import fnmatch
+import os
 from dataclasses import dataclass, replace
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Optional
@@ -575,6 +576,13 @@ class AudioShardMode(Enum):
     FULL = "full"
 
 
+# TRTLLM_LTX2_AUDIO_CONDITIONAL_SHARD=true (default) replicates the audio stream
+# (CONDITIONAL); set false/0 to force the legacy full seq-shard (FULL).
+_LTX2_AUDIO_CONDITIONAL_SHARD = os.environ.get(
+    "TRTLLM_LTX2_AUDIO_CONDITIONAL_SHARD", "true"
+).strip().lower() not in ("0", "false", "no")
+
+
 class BasicAVTransformerBlock(nn.Module):
     """Dual-stream (Audio/Video) transformer block using TRT-LLM primitives.
 
@@ -600,10 +608,7 @@ class BasicAVTransformerBlock(nn.Module):
         # is checked once at the root model — skip num_heads here.
         vgm = config.visual_gen_mapping if config is not None else None
         self._sharder = SequenceSharder.from_vgm(vgm)
-        # False (default): audio replicated across Ulysses ranks — only v2a
-        # slices per rank; True: legacy full seq-shard. Consulted together with
-        # _sharder.is_active at each read-site.
-        self._audio_full_shard = False
+        self._audio_conditional_shard = _LTX2_AUDIO_CONDITIONAL_SHARD
 
         # Whether to dispatch AdaLN modulation to the fused CUDA kernels. Resolved
         # once at construction; call sites just consult the flag. The kernels are
@@ -624,11 +629,13 @@ class BasicAVTransformerBlock(nn.Module):
 
     @property
     def _audio_shard_mode(self) -> AudioShardMode:
-        # NONE when Ulysses is off; else CONDITIONAL (replicate, default) or FULL
-        # (legacy seq-shard) per _audio_full_shard.
+        # NONE when no sequence parallelism is active. Otherwise audio is replicated
+        # (CONDITIONAL) regardless of the parallelism kind — audio ops run on the full
+        # sequence and only v2a slices the audio Q per rank (+ an output all-gather).
+        # _audio_conditional_shard=False opts into the legacy full seq-shard.
         if not self._sharder.is_active:
             return AudioShardMode.NONE
-        return AudioShardMode.FULL if self._audio_full_shard else AudioShardMode.CONDITIONAL
+        return AudioShardMode.CONDITIONAL if self._audio_conditional_shard else AudioShardMode.FULL
 
     @staticmethod
     def _make_mlp(cfg, model_config, idx):
@@ -1221,6 +1228,15 @@ class BasicAVTransformerBlock(nn.Module):
                         k_v2a, v_v2a = self.video_to_audio_attn.project_kv(
                             vx_scaled_v2a, pe=video.cross_positional_embeddings
                         )
+                        if (
+                            not self.video_to_audio_attn.is_ulysses_active()
+                            and self._sharder.is_active
+                        ):
+                            # Wrapper inactive (e.g. Attention2D): all-gather the
+                            # seq-sharded video K/V to full so the plain backend sees
+                            # the whole sequence.
+                            k_v2a = self._sp_all_gather(k_v2a)
+                            v_v2a = self._sp_all_gather(v_v2a)
                         out_local = self.video_to_audio_attn(
                             ax_v2a_local,
                             pre_projected_kv=(k_v2a, v_v2a),
@@ -1557,10 +1573,7 @@ class LTXModel(BaseDiffusionModel):
         if self.model_config.mapping.tp_size > 1:
             raise ValueError("LTX2 does not currently support TP.")
 
-        # False (default): audio replicated across Ulysses ranks — only v2a
-        # slices per rank; True: legacy full seq-shard. Effective only when
-        # _sharder.is_active. Set True to restore the sharded path.
-        self._audio_full_shard = False
+        self._audio_conditional_shard = _LTX2_AUDIO_CONDITIONAL_SHARD
         self._audio_pad = 0  # set by configure_audio_ulysses
         self._cache_dit_video_args: Optional[TransformerArgs] = None
         self._cache_dit_audio_args: Optional[TransformerArgs] = None
@@ -1993,11 +2006,13 @@ class LTXModel(BaseDiffusionModel):
 
     @property
     def _audio_shard_mode(self) -> AudioShardMode:
-        # NONE when Ulysses is off; else CONDITIONAL (replicate, default) or FULL
-        # (legacy seq-shard) per _audio_full_shard.
+        # NONE when no sequence parallelism is active. Otherwise audio is replicated
+        # (CONDITIONAL) regardless of the parallelism kind — audio ops run on the full
+        # sequence and only v2a slices the audio Q per rank (+ an output all-gather).
+        # _audio_conditional_shard=False opts into the legacy full seq-shard.
         if not self._sharder.is_active:
             return AudioShardMode.NONE
-        return AudioShardMode.FULL if self._audio_full_shard else AudioShardMode.CONDITIONAL
+        return AudioShardMode.CONDITIONAL if self._audio_conditional_shard else AudioShardMode.FULL
 
     def configure_audio_ulysses(self, audio_seq_len: int) -> None:
         """Configure audio sharding + padding for Ulysses.
@@ -2024,10 +2039,10 @@ class LTXModel(BaseDiffusionModel):
         # per-rank slice of the replicated Q + an output all-gather (block forward).
         for block in self.transformer_blocks:
             target = block.inner if isinstance(block, LTX2CacheDiTPattern0BlockWrapper) else block
-            target._audio_full_shard = self._audio_full_shard
+            target._audio_conditional_shard = self._audio_conditional_shard
             if hasattr(target, "audio_attn1"):
                 # audio_self is Ulysses in SHARD, local in REPLICATE (no A2A).
-                target.audio_attn1.set_ulysses_active(self._audio_full_shard)
+                target.audio_attn1.set_ulysses_active(not self._audio_conditional_shard)
             # v2a needs the Ulysses wrapper in BOTH SHARD and REPLICATE (video K/V
             # A2A + head-split); the block forward routes REPLICATE through a
             # slice-in / gather-out around the unchanged driver.
