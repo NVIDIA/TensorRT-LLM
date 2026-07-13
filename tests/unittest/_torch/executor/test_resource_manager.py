@@ -994,5 +994,25 @@ class TestKVCacheManagerConfigForwarding(unittest.TestCase):
             kv_cache_manager.shutdown()
 
 
+class TestResolveWindowSize(unittest.TestCase):
+
+    @staticmethod
+    def _make_manager(max_attention_window_vec, is_vswa):
+        mgr = KVCacheManager.__new__(KVCacheManager)
+        mgr.max_attention_window_vec = max_attention_window_vec
+        mgr.is_vswa = is_vswa
+        return mgr
+
+    def test_uniform_multi_layer_vector_does_not_raise(self):
+        mgr = self._make_manager([4096, 4096, 4096], is_vswa=False)
+        self.assertEqual(mgr._resolve_window_size(None), 4096)
+
+    def test_genuine_vswa_requires_window_size(self):
+        mgr = self._make_manager([4096, 8192], is_vswa=True)
+        with self.assertRaises(ValueError):
+            mgr._resolve_window_size(None)
+        self.assertEqual(mgr._resolve_window_size(8192), 8192)
+
+
 if __name__ == "__main__":
     unittest.main()
