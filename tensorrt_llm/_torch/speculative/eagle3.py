@@ -737,35 +737,44 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                 max_draft_len=runtime_draft_len,
             )
 
-        # Save the old attn_metadata and spec_metadata
-        self._prepare_attn_metadata_for_spec_dec(attn_metadata)
+        # Save the old attn_metadata and spec_metadata. The save/restore
+        # pair must be exception-safe: a failure between them (e.g. an OOM
+        # during the max-shape general warmup, which model_engine tolerates
+        # and skips) would otherwise leave stale saved state on the
+        # persistent attn_metadata and fail every subsequent forward at
+        # the pairing assert in prepare_for_spec_dec.
+        # https://nvbugs/6442074
+        try:
+            self._prepare_attn_metadata_for_spec_dec(attn_metadata)
 
-        # Prepare inputs for the 1st draft model forward
-        position_ids = position_ids.squeeze(0)
-        inputs = self.prepare_1st_drafter_inputs(
-            input_ids=input_ids,
-            position_ids=position_ids,
-            hidden_states=hidden_states,
-            accepted_tokens=accepted_tokens,
-            attn_metadata=attn_metadata,
-            spec_metadata=spec_metadata,
-            draft_model=draft_model)
+            # Prepare inputs for the 1st draft model forward
+            position_ids = position_ids.squeeze(0)
+            inputs = self.prepare_1st_drafter_inputs(
+                input_ids=input_ids,
+                position_ids=position_ids,
+                hidden_states=hidden_states,
+                accepted_tokens=accepted_tokens,
+                attn_metadata=attn_metadata,
+                spec_metadata=spec_metadata,
+                draft_model=draft_model)
 
-        # Predict draft tokens. ``original_all_rank_num_tokens`` is saved here
-        # so the post-loop restore (below) can put attn_metadata back into a
-        # state the target model expects.
-        original_all_rank_num_tokens = attn_metadata.all_rank_num_tokens
+            # Predict draft tokens. ``original_all_rank_num_tokens`` is saved
+            # here so the post-loop restore (below) can put attn_metadata
+            # back into a state the target model expects.
+            original_all_rank_num_tokens = attn_metadata.all_rank_num_tokens
 
-        # Get the draft KV cache manager if using separate layouts
-        draft_kv_cache_manager = self.get_draft_kv_cache_manager(
-            resource_manager)
+            # Get the draft KV cache manager if using separate layouts
+            draft_kv_cache_manager = self.get_draft_kv_cache_manager(
+                resource_manager)
 
-        next_draft_tokens = self._forward_draft_loop(
-            inputs, attn_metadata, spec_metadata, draft_model,
-            draft_kv_cache_manager, num_contexts, num_gens, batch_size,
-            num_accepted_tokens, original_all_rank_num_tokens, resource_manager)
-        # restore attn_metadata to support cuda graph
-        self._restore_attn_metadata_from_spec_dec(attn_metadata)
+            next_draft_tokens = self._forward_draft_loop(
+                inputs, attn_metadata, spec_metadata, draft_model,
+                draft_kv_cache_manager, num_contexts, num_gens, batch_size,
+                num_accepted_tokens, original_all_rank_num_tokens,
+                resource_manager)
+        finally:
+            # restore attn_metadata to support cuda graph
+            self._restore_attn_metadata_from_spec_dec(attn_metadata)
         # restore all_rank_num_tokens for attention DP
         if original_all_rank_num_tokens is not None:
             attn_metadata.all_rank_num_tokens = original_all_rank_num_tokens
