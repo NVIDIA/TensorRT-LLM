@@ -1566,17 +1566,17 @@
     },
     {
       "allowed_values": [],
-      "annotation": "Optional[Annotated[float, Ge(ge=0)]]",
+      "annotation": "Optional[float]",
       "converter": "",
       "kind": "value",
-      "path": "speculative_config.acceptance_length_threshold"
+      "path": "speculative_config.acceptance_rate_threshold"
     },
     {
       "allowed_values": [],
       "annotation": "Optional[Annotated[int, Ge(ge=0)]]",
       "converter": "",
       "kind": "value",
-      "path": "speculative_config.acceptance_window"
+      "path": "speculative_config.acceptance_rate_window_size"
     },
     {
       "allowed_values": [],
@@ -3931,17 +3931,17 @@
     },
     {
       "allowed_values": [],
-      "annotation": "Optional[Annotated[float, Ge(ge=0)]]",
+      "annotation": "Optional[float]",
       "converter": "",
       "kind": "value",
-      "path": "speculative_config.acceptance_length_threshold"
+      "path": "speculative_config.acceptance_rate_threshold"
     },
     {
       "allowed_values": [],
       "annotation": "Optional[Annotated[int, Ge(ge=0)]]",
       "converter": "",
       "kind": "value",
-      "path": "speculative_config.acceptance_window"
+      "path": "speculative_config.acceptance_rate_window_size"
     },
     {
       "allowed_values": [],
