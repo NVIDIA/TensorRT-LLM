@@ -799,6 +799,87 @@ TEST_F(KVCacheManagerTest, FP4BlockScaleManagementTest)
     // The expected block size of pool 1 should be the number of FP4 elements / vectorSize.
     EXPECT_EQ(blockManager.getBlockSize(0) * numFp4EltsPerContainer / vectorSize, blockManager.getBlockSize(1));
 }
+
+TEST_F(KVCacheManagerTest, FP4AttentionWithInt8RecurrentStatesPoolTest)
+{
+    auto constexpr numKvHeads = 2;
+    auto constexpr sizePerHead = 16;
+    auto constexpr tokensPerBlock = 4;
+    auto constexpr blocksInPrimaryPool = 4;
+    auto constexpr blocksInSecondaryPool = 0;
+    auto constexpr maxNumSequences = 2;
+    auto constexpr maxBeamWidth = 1;
+    auto constexpr maxAttentionWindow = 16;
+    auto constexpr recurrentStatesBytes = 64;
+    SizeType32 constexpr recurrentStatesWindow = LinearAttentionMetadata::LinearCacheType::kRecurrentStates;
+
+    LinearAttentionMetadata const linearAttentionMetadata{
+        .linearLayerIndices = {0},
+        .cacheType = recurrentStatesWindow,
+        .allRecurrentStatesBytes = recurrentStatesBytes,
+    };
+    auto const blocksPerWindow = BlocksPerWindow{
+        {recurrentStatesWindow, {blocksInPrimaryPool, blocksInSecondaryPool}},
+        {maxAttentionWindow, {blocksInPrimaryPool, blocksInSecondaryPool}},
+    };
+    auto const stream = std::make_shared<tr::CudaStream>();
+
+    KVCacheManager kvCacheManager(std::vector<SizeType32>{0, numKvHeads}, sizePerHead, tokensPerBlock, blocksPerWindow,
+        maxNumSequences, maxBeamWidth, std::vector<SizeType32>{recurrentStatesWindow, maxAttentionWindow},
+        nvinfer1::DataType::kFP4,
+        /*sinkTokenLength=*/0, stream, maxAttentionWindow, /*chunkSize=*/0, /*enableBlockReuse=*/false,
+        CacheType::kSELF, std::nullopt, nullptr, /*enablePartialReuse=*/false, /*copyOnPartialReuse=*/true, nullptr,
+        /*enableIndexerKCache=*/false, /*indexerKCacheQuantBlockSize=*/128, /*indexerKCacheIndexHeadDim=*/0,
+        /*indexerKCacheUseFp4=*/false, linearAttentionMetadata);
+    kvCacheManager.allocatePools(/*useUvm=*/false);
+    auto const& blockManager = kvCacheManager.getBlockManager();
+
+    EXPECT_EQ(blockManager.getDataTypeForWindow(recurrentStatesWindow), nvinfer1::DataType::kINT8);
+    EXPECT_EQ(blockManager.getDataTypeForWindow(maxAttentionWindow), nvinfer1::DataType::kFP4);
+
+    auto const& recurrentStatesPool = blockManager.getRecurrentStatesPool();
+    ASSERT_NE(recurrentStatesPool.primaryPtr, nullptr);
+    EXPECT_EQ(recurrentStatesPool.primaryPtr->getDataType(), nvinfer1::DataType::kINT8);
+    EXPECT_EQ(recurrentStatesPool.blockSize, recurrentStatesBytes);
+
+    SizeType32 numRecurrentScalePools = 0;
+    SizeType32 numAttentionScalePools = 0;
+    for (SizeType32 poolIdx = 0; poolIdx < blockManager.getNumPools(); ++poolIdx)
+    {
+        if (!blockManager.containsBlockScales(poolIdx))
+        {
+            continue;
+        }
+        if (blockManager.getPoolWindowSize(poolIdx) == recurrentStatesWindow)
+        {
+            ++numRecurrentScalePools;
+        }
+        else if (blockManager.getPoolWindowSize(poolIdx) == maxAttentionWindow)
+        {
+            ++numAttentionScalePools;
+        }
+    }
+    EXPECT_EQ(numRecurrentScalePools, 0);
+    EXPECT_EQ(numAttentionScalePools, 1);
+
+    auto const blockPoolPointers = kvCacheManager.getBlockPoolPointers();
+    auto const blockScalePoolPointers = kvCacheManager.getBlockScalePoolPointers();
+    ASSERT_NE(blockPoolPointers, nullptr);
+    ASSERT_NE(blockScalePoolPointers, nullptr);
+    EXPECT_EQ(blockPoolPointers->getShape().d[0], 2);
+    EXPECT_EQ(blockScalePoolPointers->getShape().d[0], 2);
+    auto const blockScalePoolPointersRange = tr::BufferRange<void*>(*blockScalePoolPointers);
+    EXPECT_EQ(blockScalePoolPointersRange[0], nullptr);
+    EXPECT_EQ(blockScalePoolPointersRange[1], nullptr);
+    EXPECT_NE(blockScalePoolPointersRange[2], nullptr);
+    EXPECT_EQ(blockScalePoolPointersRange[3], nullptr);
+
+    auto const layerToPoolMapping = kvCacheManager.getLayerToPoolMapping();
+    ASSERT_NE(layerToPoolMapping, nullptr);
+    auto const layerToPoolMappingRange = tr::BufferRange<SizeType32>(*layerToPoolMapping);
+    EXPECT_EQ(layerToPoolMappingRange[0], 0);
+    EXPECT_EQ(layerToPoolMappingRange[2], 1);
+}
 #endif
 
 TEST_F(KVCacheManagerTest, BlockManagerReuseTest)
