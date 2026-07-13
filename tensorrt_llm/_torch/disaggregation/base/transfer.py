@@ -6,7 +6,6 @@ from enum import Enum
 from typing import List, Optional, cast
 
 import numpy as np
-import torch
 
 from tensorrt_llm import DisaggregatedParams
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
@@ -121,8 +120,6 @@ class KVSlice:
     is_last_slice: bool = False
     mamba_state_index: Optional[int] = None
     total_blocks: Optional[int] = None
-    cuda_event: Optional[torch.cuda.Event] = None
-
 
 class SessionStatus(Enum):
     """Status of a transfer session.
@@ -223,8 +220,6 @@ class TxSessionBase(_SessionBase):
                 For pipelined chunks, ``token_range`` is the shared sender-side
                 chunk cursor; each layer group projects it into its own
                 resident/windowed source and destination block ranges.
-                The slice's ``cuda_event`` is an optional CUDA event to
-                synchronize before initiating the RDMA transfer.
         """
         ...
 

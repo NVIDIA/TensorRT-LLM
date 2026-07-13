@@ -128,7 +128,7 @@ def create_kv_cache_transceiver(
 class KvCacheTransceiver(ABC):
 
     @property
-    def enable_pipelined_transfer(self) -> bool:
+    def pipeline_transfer_enabled(self) -> bool:
         """Whether pipelined prefill-transfer is enabled."""
         return False
 
@@ -180,9 +180,6 @@ class KvCacheTransceiver(ABC):
 
     def commit_blocks_for_reuse(self, req: LlmRequest) -> None:
         """Commit received KV blocks to the radix tree for prefix reuse. No-op by default."""
-
-    def finalize_pipelined_send(self, req: LlmRequest) -> None:
-        """Finalize a pipelined context-side send after sampling."""
 
     def shutdown(self):
         """Shut down the transceiver and release registered resources."""

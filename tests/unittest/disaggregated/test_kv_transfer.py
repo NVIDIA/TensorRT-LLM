@@ -4,7 +4,7 @@ import os
 import random
 import time
 import uuid
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 # Exclude IB (no fabric) and gdr_copy (UCX rcache SIGABRT at teardown).
 os.environ.setdefault("UCX_TLS", "^ib,gdr_copy")
@@ -21,7 +21,6 @@ import tensorrt_llm.bindings
 import tensorrt_llm.bindings.executor as trtllm
 import tensorrt_llm.tensorrt_llm_transfer_agent_binding  # TODO: remove it.  # noqa: F401
 from tensorrt_llm import DisaggregatedParams, Mapping, SamplingParams
-from tensorrt_llm._torch.disaggregation import transceiver as transceiver_mod
 from tensorrt_llm._torch.disaggregation.base.transfer import (
     KVSlice,
     LayerRange,
@@ -170,9 +169,15 @@ def _send_prefill_chunks(
     mamba_state_index=None,
     tokens_per_block=1,
     sender_session=None,
-    fake_cuda_events=True,
 ):
-    """Create/send chunks through the real pipelined send_prefill_chunk path."""
+    """Build (and optionally send) chunks through the real ``_build_prefill_chunk`` path.
+
+    ``_build_prefill_chunk`` derives the chunk bounds from ``req.py_last_context_chunk``
+    and ``req.context_remaining_length`` and returns a ``KVSlice`` (``respond_and_send_async``
+    is responsible for sending). This helper
+    drives one call per chunk, collecting the returned slices; when ``sender_session`` is
+    provided it forwards each built slice to the real session to mirror the send path.
+    """
     all_block_ids = [np.asarray(ids, dtype=np.int64) for ids in all_block_ids]
     total_blocks = max((len(ids) for ids in all_block_ids), default=0)
     base_slice = KVSlice(
@@ -185,6 +190,7 @@ def _send_prefill_chunks(
     transceiver._get_or_create_send_session.return_value = session
     transceiver._create_kv_slice = MagicMock(return_value=base_slice)
     transceiver._reuse_adapter.tokens_per_block = tokens_per_block
+    transceiver.kv_cache_manager.tokens_per_block = tokens_per_block
     transceiver._send_reqs = {}
 
     prompt_len = total_blocks * tokens_per_block
@@ -203,30 +209,24 @@ def _send_prefill_chunks(
     if not chunk_ranges:
         chunk_ranges = [(0, 0)]
 
-    def send_chunks():
-        for idx, (chunk_start, chunk_end) in enumerate(chunk_ranges):
-            KvCacheTransceiverV2.send_prefill_chunk(
-                transceiver,
-                req,
-                chunk_start_block=chunk_start,
-                chunk_end_block=chunk_end,
-                is_last_chunk=idx == len(chunk_ranges) - 1,
-            )
-
-    if fake_cuda_events:
-        event = MagicMock()
-        with patch.object(transceiver_mod.torch.cuda, "Event",
-                          lambda: event), patch.object(
-                              transceiver_mod.torch.cuda,
-                              "current_stream",
-                              MagicMock(return_value=MagicMock())):
-            send_chunks()
-    else:
-        send_chunks()
+    slices = []
+    for idx, (chunk_start, chunk_end) in enumerate(chunk_ranges):
+        is_last_chunk = idx == len(chunk_ranges) - 1
+        req.py_last_context_chunk = (
+            chunk_start * tokens_per_block,
+            chunk_end * tokens_per_block,
+        )
+        req.context_remaining_length = (
+            0 if is_last_chunk else (total_blocks - chunk_end) * tokens_per_block
+        )
+        kv_slice = KvCacheTransceiverV2._build_prefill_chunk(transceiver, req)
+        slices.append(kv_slice)
+        if sender_session is not None:
+            session.send(kv_slice)
 
     if sender_session is not None:
         return []
-    return [call.args[0] for call in session.send.call_args_list]
+    return slices
 
 
 @pytest.mark.parametrize(
@@ -1339,7 +1339,6 @@ def test_transfer_with_gen_prefix_offset(use_v2, chunk_size_blocks):
                 chunk_size_blocks=chunk_size_blocks,
                 tokens_per_block=tokens_per_block,
                 sender_session=tx,
-                fake_cuda_events=False,
             )
 
         result = tx.wait_complete()
@@ -1632,7 +1631,6 @@ def add_and_verify_chunked_request(
             chunk_size_blocks=chunk_size_blocks,
             tokens_per_block=setup["tokens_per_block"],
             sender_session=sender_session,
-            fake_cuda_events=False,
         )
 
     receiver_sessions = [
@@ -1833,7 +1831,7 @@ def add_and_verify_pipelined_request(
     request_len,
     chunk_size_blocks,
 ):
-    """Pipelined transfer: sender sends chunks with CUDA events, receiver sends 1."""
+    """Pipelined transfer: sender sends chunks incrementally, receiver sends 1."""
     ctx_transfer_workers = setup["ctx_transfer_workers"]
     gen_transfer_workers = setup["gen_transfer_workers"]
 
@@ -1848,7 +1846,6 @@ def add_and_verify_pipelined_request(
             chunk_size_blocks=chunk_size_blocks,
             tokens_per_block=setup["tokens_per_block"],
             sender_session=sender_session,
-            fake_cuda_events=False,
         )
 
     receiver_sessions = [
@@ -1886,7 +1883,7 @@ PIPELINED_TEST_CONFIGS = [
 def test_transfer_worker_pipelined(
     ctx_tp, ctx_pp, ctx_enable_dp, gen_tp, gen_pp, gen_enable_dp, is_mla, use_v2
 ):
-    """Test pipelined transfer: chunks sent with CUDA events for V1 and V2."""
+    """Test pipelined transfer: chunks sent incrementally for V1 and V2."""
     if not torch.cuda.is_available():
         pytest.skip("CUDA not available")
     tensorrt_llm.logger.set_level("info")
