@@ -29,11 +29,13 @@ CreditScheduler::CreditScheduler(
     : mArena(arenaBytes, minBlock)
     , mBaseAddr(baseAddr)
     , mMaxWindow(maxWindow == 0 ? 1 : maxWindow)
+    , mEagerBudgetBytes(mArena.capacity() / 2)
 {
 }
 
 std::size_t CreditScheduler::activeFlows() const
 {
+    std::lock_guard<std::mutex> lk(mMu);
     std::size_t n = 0;
     for (auto const& [_, st] : mFlows)
     {
@@ -47,6 +49,7 @@ std::size_t CreditScheduler::activeFlows() const
 
 std::size_t CreditScheduler::heldCount(std::string const& flow) const
 {
+    std::lock_guard<std::mutex> lk(mMu);
     auto it = mFlows.find(flow);
     return it == mFlows.end() ? 0 : it->second.held.size();
 }
@@ -151,6 +154,7 @@ void CreditScheduler::eraseIfDone(std::string const& flow)
 
 std::vector<Grant> CreditScheduler::onWant(std::string const& flow, std::vector<std::uint32_t> const& chunkBytes)
 {
+    std::lock_guard<std::mutex> lk(mMu);
     auto& st = mFlows[flow];
     st.pending.assign(chunkBytes.begin(), chunkBytes.end());
     if (!chunkBytes.empty())
@@ -167,6 +171,7 @@ std::vector<Grant> CreditScheduler::onWant(std::string const& flow, std::vector<
 
 std::vector<Grant> CreditScheduler::onScatterDone(std::string const& flow, std::uint64_t offset)
 {
+    std::lock_guard<std::mutex> lk(mMu);
     auto it = mFlows.find(flow);
     if (it != mFlows.end() && it->second.held.erase(offset) > 0)
     {
@@ -212,6 +217,7 @@ std::vector<Grant> CreditScheduler::reclaimByPrefix(
     {
         return {};
     }
+    std::lock_guard<std::mutex> lk(mMu);
     std::vector<std::string> victims;
     for (auto const& [key, st] : mFlows)
     {
@@ -230,18 +236,21 @@ std::vector<Grant> CreditScheduler::reclaimByPrefix(
 std::vector<Grant> CreditScheduler::reclaimFlow(
     std::string const& flow, std::unordered_set<std::uint64_t> const& busy, std::vector<std::uint64_t>& deferredOut)
 {
+    std::lock_guard<std::mutex> lk(mMu);
     dropFlow(flow, busy, deferredOut);
     return schedule();
 }
 
 bool CreditScheduler::heldByFlow(std::string const& flow, std::uint64_t offset) const
 {
+    std::lock_guard<std::mutex> lk(mMu);
     auto it = mFlows.find(flow);
     return it != mFlows.end() && it->second.held.count(offset) > 0;
 }
 
 std::vector<Grant> CreditScheduler::freeOrphanRegion(std::uint64_t offset)
 {
+    std::lock_guard<std::mutex> lk(mMu);
     // Only free a region we actually deferred as an orphan. Guards against a stray/duplicate call
     // freeing an offset that may since have been re-allocated to a live flow (defense in depth; the
     // transport already gates on its own mScattering orphaned-flag map).
@@ -252,21 +261,54 @@ std::vector<Grant> CreditScheduler::freeOrphanRegion(std::uint64_t offset)
     return schedule();
 }
 
-std::optional<std::uint64_t> CreditScheduler::acquireLocal(std::size_t bytes)
+std::optional<std::uint64_t> CreditScheduler::acquireLocal(std::size_t bytes, bool eager)
 {
+    std::lock_guard<std::mutex> lk(mMu);
     auto off = mArena.alloc(bytes);
     if (!off)
     {
         return std::nullopt; // arena full/fragmented -> caller parks + retries (never blocks)
     }
+    if (eager)
+    {
+        // Cap all eager (credit-less) staging at half the arena so incoming grants can always
+        // progress (see header). Budget accounting uses the ROUNDED buddy-block size — that is what
+        // the arena actually loses.
+        std::size_t const rounded = mArena.blockBytes(*off);
+        if (mEagerHeldBytes + rounded > mEagerBudgetBytes)
+        {
+            mArena.free(*off);
+            return std::nullopt; // over the eager budget -> caller parks; credit path unaffected
+        }
+        mEagerHeld.emplace(*off, rounded);
+        mEagerHeldBytes += rounded;
+    }
     mLocalHeld.insert(*off);
     return *off;
 }
 
+void CreditScheduler::promoteLocal(std::uint64_t offset)
+{
+    std::lock_guard<std::mutex> lk(mMu);
+    auto it = mEagerHeld.find(offset);
+    if (it != mEagerHeld.end())
+    {
+        mEagerHeldBytes -= it->second;
+        mEagerHeld.erase(it);
+    }
+}
+
 std::vector<Grant> CreditScheduler::releaseLocal(std::uint64_t offset)
 {
+    std::lock_guard<std::mutex> lk(mMu);
     if (mLocalHeld.erase(offset) > 0)
     {
+        auto it = mEagerHeld.find(offset);
+        if (it != mEagerHeld.end())
+        {
+            mEagerHeldBytes -= it->second;
+            mEagerHeld.erase(it);
+        }
         mArena.free(offset);
     }
     return schedule(); // freed bytes may now let a waiting remote flow alloc its next chunk

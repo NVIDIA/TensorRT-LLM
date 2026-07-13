@@ -17,6 +17,8 @@
 
 #include "tensorrt_llm/executor/cache_transmission/nixl_utils/bounce/ZmqControlChannel.h"
 
+#include "tensorrt_llm/executor/cache_transmission/nixl_utils/bounce/BounceNvtx.h"
+
 #include "tensorrt_llm/common/logger.h"
 
 #include <array>
@@ -97,6 +99,10 @@ void ZmqControlChannel::removePeer(std::string const& peer)
 
 void ZmqControlChannel::sendTo(std::string const& peer, std::string const& blob)
 {
+    // Starts BEFORE the lock: exposes cross-thread contention (IO thread vs scatter-worker ACKs)
+    // plus the message copy + enqueue cost. Large spans here mean the control channel itself is
+    // the bottleneck (message too big, or a stalled peer backing up the DEALER queue).
+    BounceNvtxScope sendScope(kNvtxZmqSend, "zmqSend bytes=%zu", blob.size());
     std::lock_guard<std::mutex> lk(mMu);
     auto it = mDealers.find(peer);
     if (it == mDealers.end())
@@ -135,7 +141,9 @@ bool ZmqControlChannel::recv(std::string& outPeer, std::string& outBlob, int tim
     {
         return false;
     }
-    // A DEALER->ROUTER message arrives as [identity, body].
+    // A DEALER->ROUTER message arrives as [identity, body]. The span excludes the poll wait above
+    // (that's idle time, not work): it measures the frame reads + the blob copy out to the caller.
+    BounceNvtxScope recvScope(kNvtxZmqRecv, "zmqRecv");
     zmq::message_t idFrame;
     auto r1 = mRouter.recv(idFrame, zmq::recv_flags::none);
     if (!r1.has_value())

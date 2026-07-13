@@ -125,9 +125,9 @@ std::string encodeGrant(std::uint64_t requestId, std::vector<BounceCreditEntry> 
 }
 
 std::string encodeData(std::uint64_t requestId, std::uint32_t chunkIdx, std::uint32_t numChunks,
-    std::uint64_t regionHandle, std::vector<BounceScatterEntry> const& entries)
+    std::uint64_t regionHandle, std::vector<BounceScatterRun> const& entries)
 {
-    auto const bytes = static_cast<std::uint32_t>(entries.size() * sizeof(BounceScatterEntry));
+    auto const bytes = static_cast<std::uint32_t>(entries.size() * sizeof(BounceScatterRun));
     auto h = makeHeader(BounceMsgType::kDATA, requestId, chunkIdx, numChunks, regionHandle,
         static_cast<std::uint32_t>(entries.size()), bytes, 0);
     return encodeWithEntries(h, entries);
@@ -173,7 +173,7 @@ bool decodeCredits(std::string const& blob, BounceMsgHeader const& header, std::
     return decodeEntries(blob, header, out);
 }
 
-bool decodeScatter(std::string const& blob, BounceMsgHeader const& header, std::vector<BounceScatterEntry>& out)
+bool decodeScatter(std::string const& blob, BounceMsgHeader const& header, std::vector<BounceScatterRun>& out)
 {
     return decodeEntries(blob, header, out);
 }

@@ -140,3 +140,95 @@ TEST(BounceTransferPlan, CountMismatchThrows)
 {
     EXPECT_ANY_THROW((void) b::BounceTransferPlan::build(makeDescs({{0x1000, 8, 0}}), makeDescs({}), 1024, 64));
 }
+
+TEST(BounceTransferPlan, ContiguousSrcAndDstDescsMergeInPlace)
+{
+    // Both src and dst advance contiguously (and 32 divides 32, so the bounce cursor has no align
+    // gap) -> the two descs collapse into ONE plan desc covering 64 bytes.
+    auto plan = b::BounceTransferPlan::build(
+        makeDescs({{0x1000, 32, 0}, {0x1020, 32, 0}}), makeDescs({{0x9000, 32, 0}, {0x9020, 32, 0}}), 1024, 64);
+    ASSERT_EQ(plan.numChunks(), 1u);
+    auto const& c = plan.chunks()[0];
+    ASSERT_EQ(c.srcPtrs.size(), 1u);
+    EXPECT_EQ(c.sizes[0], 64u);
+    EXPECT_EQ(c.totalBytes, 64u);
+    EXPECT_EQ(c.packedBytes, 64u);
+    EXPECT_EQ(plan.totalDescs(), 2u); // both input descs still counted as seen
+    EXPECT_EQ(plan.totalBytes(), 64u);
+}
+
+TEST(BounceTransferPlan, ContiguousSrcOnlyDoesNotMergeDescs)
+{
+    // src contiguous but dst jumps -> per-desc arrays must stay separate (the gather is strided).
+    auto plan = b::BounceTransferPlan::build(
+        makeDescs({{0x1000, 32, 0}, {0x1020, 32, 0}}), makeDescs({{0x9000, 32, 0}, {0xA000, 32, 0}}), 1024, 64);
+    ASSERT_EQ(plan.numChunks(), 1u);
+    EXPECT_EQ(plan.chunks()[0].srcPtrs.size(), 2u);
+}
+
+TEST(BounceTransferPlan, ScatterRunsCoalesceContiguousDst)
+{
+    // dst contiguous, src strided (e.g. ctx tp1 -> gen tp4: dst is the gen rank's dense head-slice
+    // pool): per-desc arrays keep 3 entries for the gather, but the scatter view collapses to ONE
+    // count==1 run whose pieceSize grew over the whole extent.
+    auto plan = b::BounceTransferPlan::build(makeDescs({{0x1000, 32, 0}, {0x3000, 32, 0}, {0x5000, 32, 0}}),
+        makeDescs({{0x9000, 32, 0}, {0x9020, 32, 0}, {0x9040, 32, 0}}), 1024, 64);
+    ASSERT_EQ(plan.numChunks(), 1u);
+    auto const& c = plan.chunks()[0];
+    EXPECT_EQ(c.srcPtrs.size(), 3u);
+    ASSERT_EQ(c.scatterRuns.size(), 1u);
+    EXPECT_EQ(c.scatterRuns[0].dstAddr, 0x9000u);
+    EXPECT_EQ(c.scatterRuns[0].bounceOffset, 0u);
+    EXPECT_EQ(c.scatterRuns[0].pieceSize, 96u);
+    EXPECT_EQ(c.scatterRuns[0].count, 1u);
+}
+
+TEST(BounceTransferPlan, ScatterRunsCoalesceUniformlyStridedDst)
+{
+    // dst uniformly strided (e.g. ctx tp-slice -> gen DP full-head pool: each 32B piece lands every
+    // 128B in the peer pool): ONE strided run of count 3. Bounce packing steps by exactly 32
+    // (aligned), so bounceStride == pieceSize.
+    auto plan = b::BounceTransferPlan::build(makeDescs({{0x1000, 32, 0}, {0x3000, 32, 0}, {0x5000, 32, 0}}),
+        makeDescs({{0x9000, 32, 0}, {0x9080, 32, 0}, {0x9100, 32, 0}}), 1024, 64);
+    ASSERT_EQ(plan.numChunks(), 1u);
+    auto const& c = plan.chunks()[0];
+    ASSERT_EQ(c.scatterRuns.size(), 1u);
+    EXPECT_EQ(c.scatterRuns[0].dstAddr, 0x9000u);
+    EXPECT_EQ(c.scatterRuns[0].dstStride, 0x80u);
+    EXPECT_EQ(c.scatterRuns[0].bounceStride, 32u);
+    EXPECT_EQ(c.scatterRuns[0].pieceSize, 32u);
+    EXPECT_EQ(c.scatterRuns[0].count, 3u);
+}
+
+TEST(BounceTransferPlan, ScatterRunsBreakOnDstHoleOrAlignGap)
+{
+    // First pair: dst steps forward but the second desc's SIZE differs -> no stride latch -> two
+    // runs. Second pair: dst contiguous but the 100-byte desc aligns the cursor up to 128, leaving a
+    // bounce gap -> contiguous growth fails; the stride latch still absorbs it ONLY if sizes match —
+    // they don't (100 vs 32) -> two runs.
+    auto planHole = b::BounceTransferPlan::build(
+        makeDescs({{0x1000, 32, 0}, {0x3000, 16, 0}}), makeDescs({{0x9000, 32, 0}, {0xA000, 16, 0}}), 1024, 64);
+    ASSERT_EQ(planHole.numChunks(), 1u);
+    EXPECT_EQ(planHole.chunks()[0].scatterRuns.size(), 2u);
+
+    auto planGap = b::BounceTransferPlan::build(
+        makeDescs({{0x1000, 100, 0}, {0x3000, 32, 0}}), makeDescs({{0x9000, 100, 0}, {0x9064, 32, 0}}), 1024, 64);
+    ASSERT_EQ(planGap.numChunks(), 1u);
+    auto const& c = planGap.chunks()[0];
+    ASSERT_EQ(c.scatterRuns.size(), 2u);
+    EXPECT_EQ(c.scatterRuns[1].bounceOffset, 128u); // alignUp(100,32)
+}
+
+TEST(BounceTransferPlan, ScatterRunsIrregularStrideBreaks)
+{
+    // Same sizes but NON-uniform dst steps (+0x80 then +0x40): the latch fixes stride 0x80 from the
+    // first pair; the third desc doesn't land on it -> it opens a new run (2 runs total, 3 pieces).
+    auto plan = b::BounceTransferPlan::build(makeDescs({{0x1000, 32, 0}, {0x3000, 32, 0}, {0x5000, 32, 0}}),
+        makeDescs({{0x9000, 32, 0}, {0x9080, 32, 0}, {0x90C0, 32, 0}}), 1024, 64);
+    ASSERT_EQ(plan.numChunks(), 1u);
+    auto const& c = plan.chunks()[0];
+    ASSERT_EQ(c.scatterRuns.size(), 2u);
+    EXPECT_EQ(c.scatterRuns[0].count, 2u);
+    EXPECT_EQ(c.scatterRuns[1].count, 1u);
+    EXPECT_EQ(c.scatterRuns[1].dstAddr, 0x90C0u);
+}

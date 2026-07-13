@@ -36,6 +36,78 @@ namespace
 {
 constexpr char kSep = '\x1f'; // unit separator: agent names won't contain it
 
+// Split large copy runs into pieces of this size when building the batched-copy plan arrays. The
+// copy kernel assigns ONE thread block per plan entry, so a plan of a few huge coalesced runs would
+// use only a few SMs; splitting restores the grid-level parallelism the pre-coalescing per-desc plan
+// had, without giving up the small wire messages.
+constexpr std::uint32_t kCopySplitBytes = 64U << 10;
+
+// This entry's split budget: the scratch slots still free after reserving ONE slot for every raw
+// entry not yet appended (each needs at least one). Never below 1.
+std::size_t splitBudget(std::size_t appended, std::size_t rawRemaining, std::size_t maxEntries)
+{
+    std::size_t const reserved = appended + rawRemaining;
+    return maxEntries > reserved ? maxEntries - reserved : 1;
+}
+
+// Number of pieces appendSplitInto() will emit for one raw entry under `maxPieces`: one per full
+// kCopySplitBytes piece up to the budget, the remainder as a single (possibly oversized) entry.
+// Used for the exact-count pass that lets callers write the plan arrays straight into the pinned
+// buffer (the [srcs|dsts|sizes] layout needs the total BEFORE the first write).
+std::size_t piecesFor(std::uint32_t size, std::size_t maxPieces)
+{
+    std::size_t const want = (static_cast<std::size_t>(size) + kCopySplitBytes - 1) / kCopySplitBytes;
+    return std::min(std::max<std::size_t>(want, 1), std::max<std::size_t>(maxPieces, 1));
+}
+
+// Plan-array views into an exec context's pinned buffer: [srcs(n) | dsts(n) | sizes(n)] — the
+// layout launchPrepared() consumes. Callers fill these IN PLACE: one write pass replaces the old
+// build-std::vectors-then-memcpy-into-pinned flow (two full passes over the plan arrays per chunk).
+struct PlanBufs
+{
+    std::uint64_t* srcs;
+    std::uint64_t* dsts;
+    std::uint32_t* sizes;
+};
+
+PlanBufs planBufs(ExecCtx* ctx, std::size_t n)
+{
+    auto* host = static_cast<std::uint8_t*>(ctx->hostPinned);
+    std::size_t const b64 = n * sizeof(std::uint64_t);
+    return {reinterpret_cast<std::uint64_t*>(host), reinterpret_cast<std::uint64_t*>(host + b64),
+        reinterpret_cast<std::uint32_t*>(host + 2 * b64)};
+}
+
+// Write (src, dst, size) into the plan buffers at `idx`, split into <= kCopySplitBytes pieces but
+// at most `maxPieces` entries (>= 1) — when the budget runs out the remainder goes in as ONE
+// oversized entry (the kernel's strided loop handles any size, so an unsplit entry only costs
+// parallelism, never correctness). Emits exactly piecesFor(size, maxPieces) entries.
+void appendSplitInto(PlanBufs const& bufs, std::size_t& idx, std::uint64_t src, std::uint64_t dst,
+    std::uint32_t size, std::size_t maxPieces)
+{
+    while (size > kCopySplitBytes && maxPieces > 1)
+    {
+        bufs.srcs[idx] = src;
+        bufs.dsts[idx] = dst;
+        bufs.sizes[idx] = kCopySplitBytes;
+        ++idx;
+        src += kCopySplitBytes;
+        dst += kCopySplitBytes;
+        size -= kCopySplitBytes;
+        --maxPieces;
+    }
+    bufs.srcs[idx] = src;
+    bufs.dsts[idx] = dst;
+    bufs.sizes[idx] = size;
+    ++idx;
+}
+
+// Number of plan entries an exec context's scratch can hold ([srcs|dsts|sizes] packed).
+std::size_t maxPlanEntries(ExecCtx const* ctx)
+{
+    return ctx->scratchBytes / (2 * sizeof(std::uint64_t) + sizeof(std::uint32_t));
+}
+
 std::string makeKey(std::string const& peer, std::uint64_t rid)
 {
     return peer + kSep + std::to_string(rid);
@@ -47,36 +119,29 @@ std::pair<std::string, std::uint64_t> splitKey(std::string const& key)
     return {key.substr(0, pos), std::strtoull(key.c_str() + pos + 1, nullptr, 10)};
 }
 
-// Lay out plan arrays [srcs|dsts|sizes] into the exec context's pinned host buffer, make them
-// device-accessible, then launch the batched copy. Direction-agnostic (gather or scatter); the data
-// region (arena offset) is encoded into hsrcs/hdsts by the caller. Two opt-in knobs (default off):
+// Launch the batched copy over plan arrays the CALLER already wrote into the exec context's pinned
+// host buffer (via planBufs()/appendSplitInto(): [srcs(n)|dsts(n)|sizes(n)]). Direction-agnostic
+// (gather or scatter); the data region (arena offset) is encoded into the srcs/dsts by the caller.
+// Two opt-in knobs (default off):
 //   - zeroCopy: skip the H2D of the plan arrays — the kernel reads them straight from pinned host via
 //     ctx->hostPinnedDev (saves a small copy; likely a loss for large n — PCIe reads in-kernel).
 //   - cub: use cub::DeviceMemcpy::Batched (ctx->cubTemp workspace) instead of the custom kernel.
 // The two compose: arg source (scratch H2D vs pinned) x copy backend (custom vs cub).
-cudaError_t launchPacked(ExecCtx* ctx, std::vector<std::uint64_t> const& hsrcs, std::vector<std::uint64_t> const& hdsts,
-    std::vector<std::uint32_t> const& hsizes, bool zeroCopy, bool cub)
+cudaError_t launchPrepared(ExecCtx* ctx, std::size_t n, bool zeroCopy, bool cub)
 {
-    auto const n = static_cast<std::uint32_t>(hsrcs.size());
     if (n == 0)
     {
         return cudaSuccess;
     }
-    std::size_t const b64 = static_cast<std::size_t>(n) * sizeof(std::uint64_t);
-    std::size_t const b32 = static_cast<std::size_t>(n) * sizeof(std::uint32_t);
+    std::size_t const b64 = n * sizeof(std::uint64_t);
+    std::size_t const b32 = n * sizeof(std::uint32_t);
     // The plan arrays must fit this context's scratch/hostPinned (both sized for maxDescsPerChunk).
-    // On the RECEIVER, `n` comes from the peer's DATA message — if that peer was built with a larger
-    // maxChunkBytes it can carry more entries than our scratch holds. Reject rather than overflow the
-    // host/device buffers (caller turns this into "no ACK" -> sender times out, never a false ACK).
+    // Callers bound n before writing (planBufs is capacity-unchecked), so this is defense in depth.
     if (2 * b64 + b32 > ctx->scratchBytes)
     {
         return cudaErrorInvalidValue;
     }
-    // Pack the plan into pinned host (the H2D source, and what the kernel reads under zeroCopy).
     auto* host = static_cast<std::uint8_t*>(ctx->hostPinned);
-    std::memcpy(host, hsrcs.data(), b64);
-    std::memcpy(host + b64, hdsts.data(), b64);
-    std::memcpy(host + 2 * b64, hsizes.data(), b32);
     // Pick the DEVICE-accessible base for the plan arrays: the pinned buffer's device alias (zeroCopy)
     // or the device scratch we H2D-copy into.
     std::uint8_t* base = nullptr;
@@ -96,10 +161,11 @@ cudaError_t launchPacked(ExecCtx* ctx, std::vector<std::uint64_t> const& hsrcs, 
     auto* dsrcs = reinterpret_cast<std::uint64_t*>(base);
     auto* ddsts = reinterpret_cast<std::uint64_t*>(base + b64);
     auto* dsizes = reinterpret_cast<std::uint32_t*>(base + 2 * b64);
+    auto const n32 = static_cast<std::uint32_t>(n); // n <= scratchBytes/20, far below u32 max
     if (cub && ctx->cubTemp != nullptr)
     {
         std::size_t need = 0;
-        cudaError_t const st = batchedCopyCubTempBytes(n, need);
+        cudaError_t const st = batchedCopyCubTempBytes(n32, need);
         if (st != cudaSuccess)
         {
             return st;
@@ -108,9 +174,9 @@ cudaError_t launchPacked(ExecCtx* ctx, std::vector<std::uint64_t> const& hsrcs, 
         {
             return cudaErrorMemoryAllocation; // shouldn't happen: n <= maxDescs the temp was sized for
         }
-        return launchBatchedCopyCub(dsrcs, ddsts, dsizes, n, ctx->stream, ctx->cubTemp, need);
+        return launchBatchedCopyCub(dsrcs, ddsts, dsizes, n32, ctx->stream, ctx->cubTemp, need);
     }
-    return launchBatchedCopy(dsrcs, ddsts, dsizes, n, ctx->stream);
+    return launchBatchedCopy(dsrcs, ddsts, dsizes, n32, ctx->stream);
 }
 } // namespace
 
@@ -218,7 +284,11 @@ void BounceReceiver::onWant(std::string const& peer, BounceMsgHeader const& h, s
 
 void BounceReceiver::onData(std::string const& peer, BounceMsgHeader const& h, std::string const& blob)
 {
-    std::vector<BounceScatterEntry> entries;
+    // Covers DATA decode + scatter-job enqueue on the receiver IO thread — the receiver-side
+    // software leg of the sender's ackWait (the message copy cost scales with the entry count).
+    BounceNvtxScope onDataScope(kNvtxOnData, "onData rid=%llu chunk=%u bytes=%zu",
+        static_cast<unsigned long long>(h.requestId), h.chunkIdx, blob.size());
+    std::vector<BounceScatterRun> entries;
     if (!decodeScatter(blob, h, entries))
     {
         return;
@@ -269,16 +339,17 @@ bool BounceReceiver::drainScatterDone()
         std::lock_guard<std::mutex> lk(mDoneMu);
         done.swap(mDone);
     }
-    bool const didWork = !done.empty();
+    if (done.empty())
+    {
+        return false;
+    }
+    bool const didWork = true;
+    // Bookkeeping only (the ACK itself was sent by the worker): region frees + re-grants.
+    BounceNvtxScope drainScope(kNvtxDoneDrain, "doneDrain n=%zu", done.size());
     for (auto& d : done)
     {
-        // Only ACK a SUCCESSFUL scatter — a false ACK would tell the sender corrupt/absent data
-        // landed. On failure (d.ok==false) we still free the region below (no leak) but send no ACK,
-        // so the sender's chunk stalls and the request fails via leaseTimeout instead of corrupting.
-        if (d.ok)
-        {
-            mCtx.channel->sendTo(d.peer, encodeAck(d.rid, d.chunkIdx, d.offset));
-        }
+        // The ACK was already sent by the scatter worker itself (latency: it is on the sender's
+        // ackWait critical path); only the region bookkeeping happens here, on the IO thread.
         // Worker finished reading this region. Was its flow reclaimed (peer gone / cancel) mid-scatter?
         auto it = mScattering.find(d.offset);
         bool const orphaned = (it != mScattering.end()) && it->second;
@@ -339,9 +410,6 @@ void BounceReceiver::scatterWorkerLoop()
     // Pin this worker to our device. Can't throw out of a thread fn -> warn-only (the loop's CUDA ops
     // would then target the wrong device, so this is a real fault, just non-recoverable here).
     TLLM_CUDA_CHECK_WARN(cudaSetDevice(mCtx.deviceId));
-    std::vector<std::uint64_t> hsrcs;
-    std::vector<std::uint64_t> hdsts;
-    std::vector<std::uint32_t> hsizes;
     while (true)
     {
         ScatterJob job;
@@ -381,9 +449,6 @@ void BounceReceiver::scatterWorkerLoop()
             break; // shutting down
         }
         auto const n = static_cast<std::uint32_t>(job.entries.size());
-        hsrcs.resize(n);
-        hdsts.resize(n);
-        hsizes.resize(n);
         // Validate every scatter SOURCE stays inside THIS flow's granted region before launching.
         // bounceOffset/size come from the peer's DATA message; a buggy/hostile peer (or a reordered
         // GRANT) could point them past the region and, if we only bounded against the whole arena,
@@ -396,22 +461,80 @@ void BounceReceiver::scatterWorkerLoop()
         auto const regionBase = arenaLo + job.offset;
         std::uint64_t const regionHi = regionBase + job.regionBytes;
         bool srcInBounds = (job.regionBytes > 0 && regionBase + job.regionBytes <= arenaLo + mCtx.arena->bytes());
-        for (std::uint32_t i = 0; i < n; ++i)
-        {
-            std::uint64_t const s = regionBase + job.entries[i].bounceOffset;
-            srcInBounds = srcInBounds && s >= regionBase && s + job.entries[i].size <= regionHi;
-            hsrcs[i] = s;
-            hdsts[i] = job.entries[i].dstAddr;
-            hsizes[i] = job.entries[i].size;
-        }
         // Scatter into the final dst, then wait so the data is at dst before we ACK. A bad source, a
         // failed launch, OR a stream error must NOT produce an ACK — an ACK tells the sender its KV
         // data landed, so a false ACK here is silent corruption. On error we still free the region
         // (below) but mark !ok so drainScatterDone skips the ACK; the sender then times out -> FAILURE.
-        cudaError_t const launchErr = srcInBounds
-            ? launchPacked(ctx, hsrcs, hdsts, hsizes, mCtx.cfg.zeroCopyArgs, mCtx.cfg.cubCopy)
-            : cudaErrorInvalidValue;
-        cudaError_t const syncErr = (launchErr == cudaSuccess) ? cudaStreamSynchronize(ctx->stream) : cudaSuccess;
+        cudaError_t launchErr = cudaErrorInvalidValue;
+        {
+            // Prep leg: bounds-check + plan-array build + kernel launch (host-side cost).
+            BounceNvtxScope prepScope(kNvtxScatterPrep, "scatterPrep rid=%llu chunk=%u n=%u",
+                static_cast<unsigned long long>(job.rid), job.chunkIdx, n);
+            // Entries arrive as COALESCED runs (contiguous or strided; see BounceScatterRun); expand
+            // them back to <= kCopySplitBytes pieces so the copy kernel keeps its grid-level
+            // parallelism. Exact-count pass first (it also validates every run stays inside THIS
+            // flow's granted region), then fill the pinned plan buffers DIRECTLY (no intermediate
+            // vectors). Piece counts come from the peer's DATA message — a peer built with a larger
+            // maxChunkBytes can carry more pieces than our pinned/scratch hold; reject rather than
+            // overflow (no launch -> no ACK -> the sender times out, never a false ACK).
+            std::size_t const maxEntries = maxPlanEntries(ctx);
+            std::uint64_t rawPieces = 0;
+            for (std::uint32_t i = 0; i < n; ++i)
+            {
+                auto const& e = job.entries[i];
+                // Run-level source bounds: every piece p reads region[bounceOffset + p*bounceStride
+                // .. +pieceSize). count-1 and bounceStride are both u32 so the span product cannot
+                // overflow u64. A count of 0 is malformed (a run always carries >= 1 piece).
+                std::uint64_t const span
+                    = static_cast<std::uint64_t>(e.count - 1) * e.bounceStride + e.pieceSize;
+                srcInBounds = srcInBounds && e.count >= 1 && e.bounceOffset <= job.regionBytes
+                    && span <= job.regionBytes - e.bounceOffset;
+                rawPieces += std::max<std::uint32_t>(e.count, 1);
+            }
+            std::size_t nTotal = 0;
+            std::uint64_t seen = 0;
+            for (std::uint32_t i = 0; i < n && srcInBounds; ++i)
+            {
+                auto const& e = job.entries[i];
+                for (std::uint32_t p = 0; p < e.count; ++p)
+                {
+                    ++seen;
+                    nTotal += piecesFor(
+                        e.pieceSize, splitBudget(nTotal, static_cast<std::size_t>(rawPieces - seen), maxEntries));
+                }
+            }
+            if (srcInBounds && nTotal > 0 && nTotal <= maxEntries)
+            {
+                auto const bufs = planBufs(ctx, nTotal);
+                std::size_t idx = 0;
+                seen = 0;
+                for (std::uint32_t i = 0; i < n; ++i)
+                {
+                    auto const& e = job.entries[i];
+                    for (std::uint32_t p = 0; p < e.count; ++p)
+                    {
+                        ++seen;
+                        appendSplitInto(bufs, idx,
+                            regionBase + e.bounceOffset + static_cast<std::uint64_t>(p) * e.bounceStride,
+                            e.dstAddr + static_cast<std::uint64_t>(p) * e.dstStride, e.pieceSize,
+                            splitBudget(idx, static_cast<std::size_t>(rawPieces - seen), maxEntries));
+                    }
+                }
+                launchErr = launchPrepared(ctx, nTotal, mCtx.cfg.zeroCopyArgs, mCtx.cfg.cubCopy);
+            }
+            else if (srcInBounds && nTotal == 0)
+            {
+                launchErr = cudaSuccess; // empty plan: nothing to scatter (0 runs) -> vacuous success
+            }
+        }
+        cudaError_t syncErr = cudaSuccess;
+        if (launchErr == cudaSuccess)
+        {
+            // Sync leg: the actual GPU wait (kernel queueing + run time on the exec stream).
+            BounceNvtxScope syncScope(kNvtxScatterSync, "scatterSync rid=%llu chunk=%u",
+                static_cast<unsigned long long>(job.rid), job.chunkIdx);
+            syncErr = cudaStreamSynchronize(ctx->stream);
+        }
         bool const ok = srcInBounds && launchErr == cudaSuccess && syncErr == cudaSuccess;
         if (!ok)
         {
@@ -422,6 +545,17 @@ void BounceReceiver::scatterWorkerLoop()
                 static_cast<int>(syncErr), static_cast<unsigned long long>(job.rid), job.chunkIdx);
         }
         mCtx.exec->release(ctx); // kernel done (or failed) -> return the context
+        // ACK straight from the worker (ControlChannel::sendTo is thread-safe): the data IS at its
+        // final dst here, and skipping the done-queue -> IO-thread hop shaves its drain latency off
+        // the sender's ackWait critical path. Region bookkeeping (scheduler free / re-grant) still
+        // goes through drainScatterDone on the IO thread. A failed scatter sends NO ACK — a false
+        // ACK would tell the sender corrupt/absent data landed; it must time out instead.
+        if (ok)
+        {
+            BounceNvtxScope ackScope(kNvtxAckSend, "ackSend rid=%llu chunk=%u",
+                static_cast<unsigned long long>(job.rid), job.chunkIdx);
+            mCtx.channel->sendTo(job.peer, encodeAck(job.rid, job.chunkIdx, job.offset));
+        }
         {
             std::lock_guard<std::mutex> lk(mDoneMu);
             mDone.push_back(ScatterDone{job.key, job.peer, job.rid, job.chunkIdx, job.offset, ok});
@@ -445,7 +579,7 @@ std::shared_future<TransferState> BounceSender::submit(
     {
         BounceNvtxScope planScope(kNvtxBuildPlan, "buildPlan nDesc=%zu", srcDescs.getDescs().size());
         plan = BounceTransferPlan::build(srcDescs, dstDescs, mCtx.cfg.maxChunkBytes,
-            std::max<std::size_t>(1024ULL, mCtx.cfg.maxChunkBytes / 256ULL));
+            std::max<std::size_t>(1024ULL, mCtx.cfg.maxChunkBytes / 256ULL), !mCtx.cfg.noRunMerge);
     }
     auto const numChunks = static_cast<std::uint32_t>(plan.numChunks());
 
@@ -485,6 +619,23 @@ std::shared_future<TransferState> BounceSender::submit(
     // Ask the receiver to grant a region for each chunk of this request flow. The WANT carries our
     // own control endpoint so the receiver can addPeer us and send GRANT/ACK back (self-bootstrap).
     mCtx.channel->sendTo(peer, encodeWant(rid, chunkBytes, mCtx.channel->localEndpoint()));
+    if (mCtx.cfg.eagerGather)
+    {
+        // Overlap the WANT->GRANT control round-trip with the gather: launch this request's first
+        // chunks NOW instead of waiting for the GRANT (they were measured back-to-back at roughly
+        // the same duration, so eager gather hides one of the two). Running the launch on the
+        // caller's thread also keeps its prep cost off the IO thread. The exec streams live on our
+        // device but the caller thread's current device is not guaranteed — pin it first (warn-only:
+        // on failure the pump's CUDA calls fail and the request degrades to the classic GRANT path
+        // or a deterministic failure, never a hang).
+        TLLM_CUDA_CHECK_WARN(cudaSetDevice(mCtx.deviceId));
+        std::lock_guard<std::mutex> lk(mReqMu);
+        auto it = mRequests.find(rid);
+        if (it != mRequests.end()) // a racing GRANT may have already pumped (or failed) the request
+        {
+            pumpRequest(rid, it->second);
+        }
+    }
     return fut;
 }
 
@@ -512,30 +663,99 @@ void BounceSender::onGrant(std::string const& peer, BounceMsgHeader const& h, st
     pumpRequest(h.requestId, req);
 }
 
+void BounceSender::attachCredits(std::uint64_t rid, Request& req)
+{
+    // Credits pair with chunks strictly in order (the receiver serves the WANT's size list FIFO), so
+    // pendingCredits.front() is always chunk `nextCredit`'s credit. Attach parked credits to chunks
+    // that eager gather already posted credit-less; chunks not yet posted keep their credit parked
+    // for pumpRequest to consume at gather-launch time.
+    while (!req.pendingCredits.empty() && req.nextCredit < req.nextPost)
+    {
+        BounceCreditEntry const& credit = req.pendingCredits.front();
+        Posted* target = nullptr;
+        for (auto& p : req.posted)
+        {
+            if (p.chunkIdx == req.nextCredit)
+            {
+                target = &p;
+                break;
+            }
+        }
+        if (target == nullptr || target->hasCredit)
+        {
+            // A posted chunk is only erased on ACK, and it can only be ACKed after consuming its
+            // credit (nextCredit already passed it) — so a missing or already-credited target is a
+            // protocol anomaly (dup GRANT after reconnect). Drop the credit, never mispair it.
+            TLLM_LOG_WARNING("BounceTransport(%s): rid=%llu chunk=%u unexpected credit (dup GRANT?); dropping",
+                mCtx.selfName.c_str(), static_cast<unsigned long long>(rid), req.nextCredit);
+            req.pendingCredits.pop_front();
+            req.nextCredit += 1;
+            continue;
+        }
+        auto const& chunk = req.plan.chunks()[target->chunkIdx];
+        // Same mispair guard as pumpRequest: a credit smaller than the chunk would make the RDMA
+        // write overflow the granted region into an adjacent flow's region on the peer. Abandon the
+        // flow (fails via checkTimeouts) rather than corrupt.
+        if (chunk.packedBytes > credit.len)
+        {
+            TLLM_LOG_WARNING(
+                "BounceTransport(%s): rid=%llu chunk=%u packedBytes=%zu > granted region len=%u (GRANT "
+                "mispair/reorder); abandoning flow",
+                mCtx.selfName.c_str(), static_cast<unsigned long long>(rid), target->chunkIdx,
+                static_cast<std::size_t>(chunk.packedBytes), static_cast<unsigned int>(credit.len));
+            req.pendingCredits.clear();
+            return;
+        }
+        target->remoteHandle = credit.regionHandle;
+        target->remoteAddr = credit.addr;
+        target->remoteDevId = credit.devId;
+        target->hasCredit = true;
+        // Now credit-backed: its staging region stops counting against the eager budget.
+        mCtx.scheduler.promoteLocal(target->localOffset);
+        req.pendingCredits.pop_front();
+        req.nextCredit += 1;
+        req.lastProgress = std::chrono::steady_clock::now(); // forward progress: a chunk got its credit
+    }
+    if (req.nextCredit >= req.numChunks && !req.pendingCredits.empty())
+    {
+        // Over-grant: receiver handed more credits than we have chunks. Shouldn't happen under
+        // the protocol (receiver grants at most numChunks). Log it — silently dropping would
+        // mask an upstream bug and leak the receiver-side regions backing these credits.
+        TLLM_LOG_WARNING("BounceTransport(%s): rid=%llu over-grant, dropping %zu extra credit(s)",
+            mCtx.selfName.c_str(), static_cast<unsigned long long>(rid), req.pendingCredits.size());
+        req.pendingCredits.clear();
+    }
+}
+
 void BounceSender::pumpRequest(std::uint64_t rid, Request& req)
 {
-    while (!req.pendingCredits.empty())
+    attachCredits(rid, req);
+    while (req.nextPost < req.numChunks)
     {
-        if (req.nextPost >= req.numChunks)
-        {
-            // Over-grant: receiver handed more credits than we have chunks. Shouldn't happen under
-            // the protocol (receiver grants at most numChunks). Log it — silently dropping would
-            // mask an upstream bug and leak the receiver-side regions backing these credits.
-            TLLM_LOG_WARNING("BounceTransport(%s): rid=%llu over-grant, dropping %zu extra credit(s)",
-                mCtx.selfName.c_str(), static_cast<unsigned long long>(rid), req.pendingCredits.size());
-            req.pendingCredits.clear();
-            break;
-        }
         std::uint32_t const chunkIdx = req.nextPost;
         auto const& chunk = req.plan.chunks()[chunkIdx];
+        // After attachCredits, a non-empty pendingCredits implies nextCredit == nextPost, i.e. the
+        // front credit is exactly THIS chunk's credit.
+        bool const haveCredit = !req.pendingCredits.empty();
+        if (!haveCredit)
+        {
+            if (!mCtx.cfg.eagerGather)
+            {
+                break; // classic path: a chunk's gather starts only once its GRANT arrived
+            }
+            if (req.posted.size() >= mCtx.cfg.effectiveWindow())
+            {
+                break; // eager depth cap: mirror the receiver's per-flow window
+            }
+        }
         // Defensive pairing check BEFORE committing resources. Credits pair with chunks by FIFO order,
         // and the receiver sizes each granted region to the chunkBytes[chunkIdx] in the WANT, so packedBytes
         // always fits. But the control channel does NOT guarantee GRANT ordering (a reconnect can
         // reorder messages), and a mispaired credit would make us RDMA-write packedBytes into a
         // smaller granted region — overflowing into an adjacent flow's region on the peer (silent
         // cross-flow corruption). Detect the mispair and abandon the flow (it then fails via
-        // checkTimeouts) rather than corrupt the peer. Mirrors the over-grant guard above.
-        if (chunk.packedBytes > req.pendingCredits.front().len)
+        // checkTimeouts) rather than corrupt the peer.
+        if (haveCredit && chunk.packedBytes > req.pendingCredits.front().len)
         {
             TLLM_LOG_WARNING(
                 "BounceTransport(%s): rid=%llu chunk=%u packedBytes=%zu > granted region len=%u (GRANT "
@@ -549,37 +769,52 @@ void BounceSender::pumpRequest(std::uint64_t rid, Request& req)
         // to this chunk from the SHARED arena. If either is unavailable, leave the credit parked and
         // bail; the IO loop retries via drainPendingPosts() once an ACK frees a region / context —
         // never blocks here, so an oversubscribed arena (many peers, or both roles) degrades to
-        // backpressure, not deadlock.
+        // backpressure, not deadlock. Credit-less (eager) staging is additionally capped by the
+        // scheduler's eager budget (half the arena) so it can never starve incoming grants.
         ExecCtx* ctx = mCtx.exec->tryAcquire();
         if (ctx == nullptr)
         {
             break;
         }
-        auto localOff = mCtx.scheduler.acquireLocal(chunk.packedBytes);
+        auto localOff = mCtx.scheduler.acquireLocal(chunk.packedBytes, /*eager=*/!haveCredit);
         if (!localOff)
         {
             mCtx.exec->release(ctx);
             break;
         }
-        BounceCreditEntry const credit = req.pendingCredits.front();
-        req.pendingCredits.pop_front();
+        BounceCreditEntry credit{};
+        if (haveCredit)
+        {
+            credit = req.pendingCredits.front();
+            req.pendingCredits.pop_front();
+            req.nextCredit += 1;
+        }
         auto const nDesc = static_cast<std::uint32_t>(chunk.srcPtrs.size());
         // Covers plan-array prep + gather launch + event record (the synchronous launch cost;
         // the gather's GPU time is the async `gather` span ended in drainGatherReady).
         BounceNvtxScope gatherLaunchScope(kNvtxGatherLaunch, "gatherLaunch rid=%llu chunk=%u n=%u bytes=%llu",
             static_cast<unsigned long long>(rid), chunkIdx, nDesc, static_cast<unsigned long long>(chunk.packedBytes));
-        std::vector<std::uint64_t> hsrcs(nDesc);
-        std::vector<std::uint64_t> hdsts(nDesc);
-        std::vector<std::uint32_t> hsizes(nDesc);
         auto const regionBase = mCtx.arena->baseAddr() + *localOff;
+        // Coalescing in the plan can leave very large per-desc runs; split them so the copy kernel
+        // keeps its one-thread-block-per-entry parallelism (bounded by the scratch capacity).
+        // Two passes: an exact piece count first (the packed [srcs|dsts|sizes] pinned layout needs
+        // the total before the first write), then fill the pinned buffer DIRECTLY — one write pass
+        // instead of building std::vectors and memcpy'ing them in.
+        std::size_t const maxEntries = maxPlanEntries(ctx);
+        std::size_t nTotal = 0;
         for (std::uint32_t i = 0; i < nDesc; ++i)
         {
-            hsrcs[i] = chunk.srcPtrs[i];
-            hdsts[i] = regionBase + chunk.bounceOffsets[i];
-            hsizes[i] = chunk.sizes[i];
+            nTotal += piecesFor(chunk.sizes[i], splitBudget(nTotal, nDesc - 1 - i, maxEntries));
+        }
+        auto const bufs = planBufs(ctx, nTotal);
+        std::size_t idx = 0;
+        for (std::uint32_t i = 0; i < nDesc; ++i)
+        {
+            appendSplitInto(bufs, idx, chunk.srcPtrs[i], regionBase + chunk.bounceOffsets[i], chunk.sizes[i],
+                splitBudget(idx, nDesc - 1 - i, maxEntries));
         }
         // gather into the region (cfg knobs select the H2D-vs-zero-copy arg path + custom-vs-cub copy)
-        cudaError_t const gatherErr = launchPacked(ctx, hsrcs, hdsts, hsizes, mCtx.cfg.zeroCopyArgs, mCtx.cfg.cubCopy);
+        cudaError_t const gatherErr = launchPrepared(ctx, nTotal, mCtx.cfg.zeroCopyArgs, mCtx.cfg.cubCopy);
         // Record an event for gather completion and DEFER the write. The gather must finish before
         // NIXL reads the region, but on a shared GPU the gather can be delayed behind model kernels
         // — blocking the IO thread on cudaStreamSynchronize here would stall the whole reactor
@@ -602,9 +837,13 @@ void BounceSender::pumpRequest(std::uint64_t rid, Request& req)
         p.chunkIdx = chunkIdx;
         p.localOffset = *localOff;
         p.ctx = ctx;
-        p.remoteHandle = credit.regionHandle;
-        p.remoteAddr = credit.addr;
-        p.remoteDevId = credit.devId;
+        p.hasCredit = haveCredit;
+        if (haveCredit)
+        {
+            p.remoteHandle = credit.regionHandle;
+            p.remoteAddr = credit.addr;
+            p.remoteDevId = credit.devId;
+        }
         p.writeBytes = static_cast<std::uint32_t>(chunk.packedBytes);
         // Gather in flight; the write is issued later by drainGatherReady once the event signals. If
         // the gather launch/record failed, go straight to GatherFailed so drainGatherReady fails the
@@ -620,15 +859,16 @@ void BounceSender::pumpRequest(std::uint64_t rid, Request& req)
         req.lastProgress = std::chrono::steady_clock::now(); // forward progress: a chunk's gather launched
     }
     // Reconcile the pipeline-starvation NVTX spans after every pump pass (perf visibility only):
-    // - creditStarved: every granted credit is consumed but chunks remain -> the flow is waiting on
-    //   the receiver's next re-GRANT. Ended in onGrant, so each wait period is its own range.
+    // - creditStarved: every granted credit is consumed but chunks still lack one -> the flow is
+    //   waiting on the receiver's next re-GRANT (with eager gather a chunk may be posted yet still
+    //   credit-less). Ended in onGrant, so each wait period is its own range.
     // - arenaStarved: exited the loop with credits still parked -> blocked on LOCAL resources (gather
     //   region / exec ctx). One continuous range per park period, ended here once the park drains.
     // Both are idempotent across repeated pump attempts (drainPendingPosts retries every IO pass).
     if (req.pendingCredits.empty())
     {
         bounceRangeEnd(req.nvtxArenaStarved);
-        if (req.nextPost < req.numChunks && req.nvtxCreditStarved == 0)
+        if (req.nextCredit < req.numChunks && req.nvtxCreditStarved == 0)
         {
             req.nvtxCreditStarved = bounceRangeStart(kNvtxCreditStarved, "creditStarved rid=%llu posted=%u/%u",
                 static_cast<unsigned long long>(rid), req.nextPost, req.numChunks);
@@ -646,7 +886,9 @@ void BounceSender::drainPendingPosts()
     std::lock_guard<std::mutex> lk(mReqMu);
     for (auto& [rid, req] : mRequests)
     {
-        if (!req.pendingCredits.empty())
+        // Retry parked credits, and (with eager gather) chunks that couldn't start earlier because
+        // the arena/ExecPool/eager budget was exhausted — ACKs may have freed resources since.
+        if (!req.pendingCredits.empty() || (mCtx.cfg.eagerGather && req.nextPost < req.numChunks))
         {
             pumpRequest(rid, req);
         }
@@ -672,30 +914,41 @@ bool BounceSender::drainGatherReady()
                 toFail.push_back(rid);
                 break;
             }
-            // state == Gathering: poll the gather event (non-blocking).
-            cudaError_t const ev = cudaEventQuery(p.ctx->event);
-            if (ev == cudaErrorNotReady)
+            if (p.state == PostState::Gathering)
             {
-                continue; // gather still running (possibly delayed behind other GPU work) — no block
+                // Poll the gather event (non-blocking).
+                cudaError_t const ev = cudaEventQuery(p.ctx->event);
+                if (ev == cudaErrorNotReady)
+                {
+                    continue; // gather still running (possibly delayed behind other GPU work) — no block
+                }
+                if (ev != cudaSuccess)
+                {
+                    // Gather kernel / stream error -> fail the request deterministically (never hang).
+                    (void) cudaGetLastError();
+                    toFail.push_back(rid);
+                    break;
+                }
+                // Gather done — return the exec context immediately for another chunk to reuse (the
+                // write path never needs it: postXferReq is not stream-ordered). The region stays
+                // held until ACK.
+                bounceRangeEnd(p.nvtxGather);
+                mCtx.exec->release(p.ctx);
+                p.ctx = nullptr;
+                p.state = PostState::Gathered;
+                didWork = true;
             }
-            if (ev != cudaSuccess)
+            // state == Gathered: issue the RDMA write once the credit is here (an eagerly-gathered
+            // chunk may finish before its GRANT arrives; it then waits in place until attachCredits
+            // fills in the remote target).
+            if (!p.hasCredit)
             {
-                // Gather kernel / stream error -> fail the request deterministically (never hang).
-                (void) cudaGetLastError();
-                toFail.push_back(rid);
-                break;
+                continue;
             }
-            // Gather done: NOW issue the RDMA write (postXferReq is not stream-ordered, so it was
-            // correct to wait for the gather before posting). The gather has completed, so the write
-            // no longer needs the gather stream's ordering — return the exec context immediately for
-            // another chunk to reuse (the region stays held until ACK).
-            bounceRangeEnd(p.nvtxGather);
             p.nvtxWrite = bounceRangeStart(kNvtxNixlWrite, "nixlWrite rid=%llu chunk=%u bytes=%u",
                 static_cast<unsigned long long>(rid), p.chunkIdx, p.writeBytes);
             p.xfer = mCtx.engine->postWrite(
-                req.peer, mCtx.arena->at(p.localOffset), p.remoteAddr, p.remoteDevId, p.writeBytes, p.ctx->stream);
-            mCtx.exec->release(p.ctx);
-            p.ctx = nullptr;
+                req.peer, mCtx.arena->at(p.localOffset), p.remoteAddr, p.remoteDevId, p.writeBytes, nullptr);
             p.state = PostState::Writing;
             didWork = true;
             req.lastProgress = std::chrono::steady_clock::now(); // forward progress: a chunk was posted
@@ -729,18 +982,22 @@ bool BounceSender::pollSenderHandles()
             XferState const st = mCtx.engine->poll(p.xfer);
             if (st == XferState::kDone)
             {
-                auto const& chunk = req.plan.chunks()[p.chunkIdx];
-                auto const nDesc = static_cast<std::uint32_t>(chunk.srcPtrs.size());
-                std::vector<BounceScatterEntry> entries(nDesc);
-                for (std::uint32_t i = 0; i < nDesc; ++i)
-                {
-                    entries[i].bounceOffset = chunk.bounceOffsets[i];
-                    entries[i].dstAddr = chunk.dstPtrs[i];
-                    entries[i].size = chunk.sizes[i];
-                    entries[i].deviceId = chunk.dstDeviceId;
-                }
+                // End the write span BEFORE building the DATA message so nixlWrite measures only the
+                // RDMA in-flight time; the DATA build/encode/enqueue cost gets its own span (it used
+                // to hide inside nixlWrite).
                 bounceRangeEnd(p.nvtxWrite);
-                mCtx.channel->sendTo(req.peer, encodeData(rid, p.chunkIdx, req.numChunks, p.remoteHandle, entries));
+                auto const& chunk = req.plan.chunks()[p.chunkIdx];
+                // The DATA scatter plan is the chunk's COALESCED run list (built once at plan time):
+                // same bytes, but typically orders of magnitude fewer entries than the per-desc view
+                // — this message sits on the ACK critical path. Sent as-is, no per-send rebuild.
+                auto const nRuns = static_cast<std::uint32_t>(chunk.scatterRuns.size());
+                {
+                    BounceNvtxScope dataScope(kNvtxDataSend, "dataSend rid=%llu chunk=%u n=%u bytes=%zu",
+                        static_cast<unsigned long long>(rid), p.chunkIdx, nRuns,
+                        static_cast<std::size_t>(nRuns) * sizeof(BounceScatterRun));
+                    mCtx.channel->sendTo(
+                        req.peer, encodeData(rid, p.chunkIdx, req.numChunks, p.remoteHandle, chunk.scatterRuns));
+                }
                 mCtx.engine->release(p.xfer);
                 p.state = PostState::Sent;
                 p.nvtxAckWait = bounceRangeStart(
@@ -769,6 +1026,11 @@ bool BounceSender::pollSenderHandles()
 void BounceSender::onAck(std::string const& peer, BounceMsgHeader const& h)
 {
     (void) peer;
+    // Starts BEFORE taking mReqMu: the span exposes ACK-processing latency INCLUDING lock wait —
+    // pumpRequest holds mReqMu during gather launches, so a long onAck here means the ACK stalled
+    // behind another flow's launch prep.
+    BounceNvtxScope ackScope(
+        kNvtxOnAck, "onAck rid=%llu chunk=%u", static_cast<unsigned long long>(h.requestId), h.chunkIdx);
     std::lock_guard<std::mutex> lk(mReqMu);
     auto it = mRequests.find(h.requestId);
     if (it == mRequests.end())
