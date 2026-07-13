@@ -2104,7 +2104,7 @@ class PyExecutor:
                                         micro_batch_id,
                                         batch_state.scheduled_batch_stats)
         benchmark = self.self_benchmark
-        if benchmark is not None and benchmark.sync_active:
+        if benchmark is not None and benchmark.active:
             stats_dict = json.loads(stats.to_json_str())
             if host_step_time_ms is not None:
                 stats_dict["hostStepTimeMS"] = host_step_time_ms
@@ -2671,7 +2671,7 @@ class PyExecutor:
                 self._flush_pending_transfer_responses()
                 self._handle_canceled_requests()
                 benchmark = self.self_benchmark
-                if benchmark is not None and benchmark.sync_active:
+                if benchmark is not None and benchmark.active:
                     self._observe_self_benchmark_finished(scheduled_requests)
 
                 finished_requests = self._handle_responses()
@@ -2992,14 +2992,14 @@ class PyExecutor:
         new_requests = self._fetch_and_activate_new_requests()
 
         benchmark = self.self_benchmark
-        if benchmark is not None and benchmark.sync_active:
+        if benchmark is not None and benchmark.active:
             if self.is_shutdown:
                 benchmark.request_interrupt()
             self._sync_self_benchmark_outcome()
             self._drain_self_benchmark_requests(
                 self._self_benchmark_protected_ids())
         if (self.should_stop_processing
-                and (benchmark is None or not benchmark.sync_active)):
+                and (benchmark is None or not benchmark.active)):
             return None, None
 
         self._handle_control_request()
@@ -3064,7 +3064,7 @@ class PyExecutor:
         scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs = self._schedule(
         )
 
-        if benchmark is not None and benchmark.sync_active:
+        if benchmark is not None and benchmark.active:
             benchmark.observe_scheduled_batch(scheduled_batch)
             self._sync_self_benchmark_outcome()
             protected_ids = self._self_benchmark_protected_ids()
@@ -3144,7 +3144,7 @@ class PyExecutor:
 
     def _sync_self_benchmark_outcome(self) -> None:
         benchmark = self.self_benchmark
-        if benchmark is None or not benchmark.sync_active:
+        if benchmark is None or not benchmark.active:
             return
 
         local_outcome = benchmark.local_outcome()
@@ -3217,7 +3217,7 @@ class PyExecutor:
     def _observe_self_benchmark_finished(
             self, scheduled_requests: ScheduledRequests) -> None:
         benchmark = self.self_benchmark
-        if benchmark is None or not benchmark.sync_active:
+        if benchmark is None or not benchmark.active:
             return
         benchmark.observe_finished_requests(scheduled_requests.all_requests())
 
@@ -3548,7 +3548,7 @@ class PyExecutor:
                     self._update_request_states(scheduled_batch)
                     self._update_requests(sample_state, self.resource_manager)
                     benchmark = self.self_benchmark
-                    if benchmark is not None and benchmark.sync_active:
+                    if benchmark is not None and benchmark.active:
                         self._observe_self_benchmark_finished(scheduled_batch)
 
                     if self._is_kv_manager_v2:
@@ -3560,12 +3560,12 @@ class PyExecutor:
                     self._flush_pending_transfer_responses()
 
                     self._handle_canceled_requests()
-                    benchmark_active = benchmark is not None and benchmark.sync_active
+                    benchmark_active = benchmark is not None and benchmark.active
+                    attn_metadata = getattr(self.model_engine, 'attn_metadata',
+                                            None)
+                    kv_cache_dtype_byte_size = getattr(
+                        self.model_engine, 'kv_cache_dtype_byte_size', None)
                     if benchmark_active:
-                        attn_metadata = getattr(self.model_engine,
-                                                'attn_metadata', None)
-                        kv_cache_dtype_byte_size = getattr(
-                            self.model_engine, 'kv_cache_dtype_byte_size', None)
                         self.resource_manager.update_resources(
                             scheduled_batch, attn_metadata,
                             kv_cache_dtype_byte_size)
@@ -3579,10 +3579,6 @@ class PyExecutor:
                     self.perf_manager.compute_batch_gpu_times(
                         scheduled_batch.all_requests())
                     if not benchmark_active:
-                        attn_metadata = getattr(self.model_engine,
-                                                'attn_metadata', None)
-                        kv_cache_dtype_byte_size = getattr(
-                            self.model_engine, 'kv_cache_dtype_byte_size', None)
                         self.resource_manager.update_resources(
                             scheduled_batch, attn_metadata,
                             kv_cache_dtype_byte_size)
@@ -4208,7 +4204,7 @@ class PyExecutor:
     def _process_previous_batch(self):
         self._handle_canceled_requests()
         benchmark = self.self_benchmark
-        if benchmark is not None and benchmark.sync_active:
+        if benchmark is not None and benchmark.active:
             self._observe_self_benchmark_finished(
                 self.previous_batch.scheduled_requests)
         # Skip iter-1 emission when `_emit_first_token_responses` already
@@ -4217,7 +4213,7 @@ class PyExecutor:
         attn_metadata = getattr(self.model_engine, 'attn_metadata', None)
         kv_cache_dtype_byte_size = getattr(self.model_engine,
                                            'kv_cache_dtype_byte_size', None)
-        benchmark_active = benchmark is not None and benchmark.sync_active
+        benchmark_active = benchmark is not None and benchmark.active
         if benchmark_active:
             self.resource_manager.update_resources(scheduled_requests,
                                                    attn_metadata,
@@ -4694,7 +4690,7 @@ class PyExecutor:
     @nvtx_range("_schedule")
     def _schedule(self):
         active_requests = self.active_requests
-        if self.self_benchmark is not None and self.self_benchmark.sync_active:
+        if self.self_benchmark is not None and self.self_benchmark.active:
             active_requests = [
                 request for request in active_requests
                 if not self.self_benchmark.should_hold_from_scheduler(request)

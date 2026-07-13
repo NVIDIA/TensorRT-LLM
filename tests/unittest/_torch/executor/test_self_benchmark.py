@@ -483,7 +483,7 @@ def _make_sync_executor(rank_values, diagnostics=None):
             )
             for rank, outcome in enumerate(rank_values)
         ]
-    benchmark = MagicMock(sync_active=True)
+    benchmark = MagicMock(active=True)
     benchmark.local_outcome.return_value = rank_values[0]
     benchmark.local_diagnostic.return_value = diagnostics[0]
     executor = object.__new__(PyExecutor)
@@ -1473,7 +1473,7 @@ def test_schedule_filters_held_requests_without_mutating_active_requests():
 
     user_request = _fake_requests([7], benchmark=False)[0]
     held_request = _fake_requests([900_000_000])[0]
-    benchmark = MagicMock(sync_active=True)
+    benchmark = MagicMock(active=True)
     benchmark.should_hold_from_scheduler.side_effect = lambda request: request is held_request
     scheduler_output = types.SimpleNamespace(
         context_requests=[],
@@ -1534,7 +1534,7 @@ def test_prepare_and_schedule_syncs_construction_and_final_shape_boundaries():
     previous_request, current_request = _fake_requests([900_000_000, 900_000_001])
     previous_ids = {previous_request.py_request_id}
     scheduled_batch = _FakeScheduledBatch(last_chunk=[current_request])
-    benchmark = MagicMock(sync_active=True)
+    benchmark = MagicMock(active=True)
     benchmark.observe_scheduled_batch.side_effect = lambda batch: events.append("observe_scheduled")
     executor = types.SimpleNamespace(
         _fetch_and_activate_new_requests=lambda: events.append("fetch") or [],
@@ -1608,7 +1608,7 @@ def test_prepare_and_schedule_defers_shutdown_until_interrupt_consensus():
 
     events = []
     scheduled_batch = _FakeScheduledBatch()
-    benchmark = MagicMock(sync_active=True)
+    benchmark = MagicMock(active=True)
     benchmark.request_interrupt.side_effect = lambda: events.append("interrupt")
     benchmark.observe_scheduled_batch.side_effect = lambda batch: events.append("observe_scheduled")
     executor = types.SimpleNamespace(
@@ -1682,7 +1682,7 @@ def test_process_previous_batch_commits_benchmark_resources_before_responses():
     request = _benchmark_request()
     scheduled = _FakeScheduledBatch(last_chunk=[request])
     benchmark = types.SimpleNamespace(
-        sync_active=True,
+        active=True,
         observe_finished_requests=lambda requests: events.append(("observe_finished", requests)),
     )
     executor = types.SimpleNamespace(
@@ -2222,7 +2222,7 @@ def test_process_iter_stats_propagates_gpu_forward_time_to_self_benchmark(
         enable_iter_perf_stats=True,
         _update_iter_stats=MagicMock(return_value=serialized_stats),
         self_benchmark=types.SimpleNamespace(
-            sync_active=True,
+            active=True,
             observe_executed_batch=observe_executed_batch,
         ),
         disable_overlap_scheduler=True,

@@ -119,7 +119,6 @@ class DrainTarget(str, Enum):
 
 @dataclass(frozen=True)
 class RequestScheduleSignature:
-    request_id: int
     phase: Literal["prefill", "decode"]
     total_tokens: int
     expected_cached_tokens: int
@@ -146,7 +145,6 @@ class BenchmarkTrial:
     observed_kv_read_tokens: Optional[int] = None
     cache_hit_validated: Optional[bool] = None
     scheduled_batch_size: Optional[int] = None
-    scheduled_total_batch_size: Optional[int] = None
     executed_batch_size: Optional[int] = None
     admission_reason: Optional[str] = None
     source_admission_reason: Optional[str] = None
@@ -175,7 +173,6 @@ class SelfBenchmark:
         self._axis_origin_ranks: dict[_AxisCoordinate, int] = {}
         self._planner_events: list[dict] = []
         self._planner_error: Optional[dict[str, str]] = None
-        self._planner_synchronized = False
         self._artifact_write_error: Optional[dict[str, str]] = None
         self._planning_request_id_cursor = 0
         self._cases: list[BenchmarkCase] = []
@@ -235,10 +232,6 @@ class SelfBenchmark:
     @property
     def active(self) -> bool:
         return self._run_state in (RunState.RUNNING, RunState.DRAINING)
-
-    @property
-    def sync_active(self) -> bool:
-        return self.active
 
     def local_planner_record(self, rank: int) -> dict:
         grid_config = self._grid_config_signature()
@@ -320,7 +313,6 @@ class SelfBenchmark:
             )
             return
 
-        self._planner_synchronized = True
         self._planner_events.append(
             {
                 "event": "tp_plan_consensus",
@@ -441,7 +433,6 @@ class SelfBenchmark:
         )
         expected_schedule = {
             request_id: RequestScheduleSignature(
-                request_id=request_id,
                 phase=phase,
                 total_tokens=total_tokens,
                 expected_cached_tokens=expected_cached_tokens,
@@ -476,7 +467,6 @@ class SelfBenchmark:
         ]
         actual_ids = {self._request_id_of(request) for request in benchmark_requests}
         trial.scheduled_batch_size = len(actual_ids)
-        trial.scheduled_total_batch_size = len(all_requests)
         mixed = any(
             not self._is_benchmark_request(request)
             and not bool(getattr(request, "is_dummy", False))
@@ -2021,14 +2011,6 @@ class SelfBenchmark:
         inflight_stats["numQueuedCtxTokens"] = 0
         inflight_stats["numQueuedGenRequests"] = 0
         inflight_stats["numQueuedGenKvTokens"] = 0
-
-    @staticmethod
-    def _num_context_requests(stats: dict) -> int:
-        return int(stats.get("inflightBatchingStats", {}).get("numContextRequests", 0))
-
-    @staticmethod
-    def _num_decode_requests(stats: dict) -> int:
-        return int(stats.get("inflightBatchingStats", {}).get("numGenRequests", 0))
 
     @staticmethod
     def _sample_values(max_value: int, granularity: int) -> list[int]:
