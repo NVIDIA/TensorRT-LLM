@@ -36,6 +36,7 @@ prometheus_client
 prometheus_fastapi_instrumentator
 pydantic>=2.9.1
 pydantic-settings[yaml]
+msgspec
 omegaconf
 pillow
 optimum
@@ -56,7 +57,6 @@ peft>=0.18.1,<0.19.0
 patchelf
 einops
 flashinfer-python==0.6.14
-opencv-python-headless
 xgrammar==0.1.32
 llguidance==0.7.29
 jsonschema

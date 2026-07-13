@@ -566,6 +566,8 @@ class KVCacheManager(BaseResourceManager):
             for pc in self.pool_configurations
         ]
 
+        self.enable_indexer_k_cache = enable_indexer_k_cache
+
         kwargs = {
             'num_kv_heads_per_layer': self.num_kv_heads_per_layer,
             'size_per_head': head_dim,
@@ -1368,6 +1370,26 @@ class KVCacheManager(BaseResourceManager):
             if num_blocks_per_seq is not None:
                 result[i] = result[i][:num_blocks_per_seq[i]]
         return result
+
+    def get_batch_cache_indices_flat(
+        self,
+        request_ids: List[int],
+        num_blocks: List[int],
+        layer_idx: Optional[int] = None,
+    ) -> torch.Tensor:
+        """Concatenated per-request block tables, trimmed to real widths.
+
+        Equivalent to concatenating
+        ``get_batch_cache_indices(request_ids, layer_idx)[i][:num_blocks[i]]``
+        over all requests into one CPU int32 tensor; matches the interface
+        of ``KVCacheManagerV2.get_batch_cache_indices_flat``.
+        """
+        block_ids_per_seq = self.get_batch_cache_indices(
+            request_ids, layer_idx=layer_idx, num_blocks_per_seq=num_blocks)
+        indices_list = []
+        for block_ids, n in zip(block_ids_per_seq, num_blocks):
+            indices_list.extend(block_ids[:n])
+        return torch.tensor(indices_list, dtype=torch.int32)
 
     @staticmethod
     def _pack_beam_cache_indices(beams: List[List[int]]) -> List[int]:

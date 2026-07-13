@@ -66,32 +66,6 @@ _MINIMAX_M3_ARCHITECTURES = {
 }
 
 
-def _unified_kv_pool_includes_mamba(
-        is_disagg: bool, spec_config: Optional['SpeculativeConfig']) -> bool:
-    """Whether the KV cache pool will include mamba layers for a hybrid model.
-
-    True for the default Python ``MambaHybridCacheManager`` route, where
-    mamba state is allocated alongside attention KV inside one pool (with
-    zero KV heads on mamba layers). False for the V1-route managers used
-    when:
-
-      * disaggregated serving forces the C++ mamba manager
-        (``TRTLLM_USE_CPP_MAMBA=1`` enables the same path locally), or
-      * ``TRTLLM_USE_PY_MAMBA=1`` forces the Python mamba manager locally
-        (agg-mode override), or
-      * one-model speculative decoding splits mamba and attention into
-        separate caches.
-
-    Single source of truth for the binding-side layer-counting decision; do
-    not duplicate the predicate at call sites.
-    """
-    use_split_pool = is_disagg \
-        or os.environ.get('TRTLLM_USE_CPP_MAMBA', '0') == '1' \
-        or os.environ.get('TRTLLM_USE_PY_MAMBA', '0') == '1'
-    use_spec = spec_config is not None
-    return not (use_split_pool or use_spec)
-
-
 @contextlib.contextmanager
 def config_file_lock(timeout: int = 10):
     """
@@ -328,7 +302,8 @@ class ModelConfig(Generic[TConfig]):
             return False
         return model_architectures[0] not in [
             "BertForSequenceClassification", "Qwen2ForProcessRewardModel",
-            "Qwen2ForRewardModel", "LlamaForTextEmbedding"
+            "Qwen2ForRewardModel", "LlamaForTextEmbedding",
+            "Qwen3ForTextEmbedding"
         ]
         # TODO: should be 'not model_type == ModelType.ENCODER_ONLY'
         # once ModelType is used in pytorch flow.

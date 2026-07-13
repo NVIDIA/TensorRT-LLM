@@ -87,6 +87,7 @@ class DSAMetadataParams(SparseMetadataParams):
 
     indexer_max_chunk_size: int
     max_sparse_topk: Optional[int]
+    index_head_dim: int
     enable_indexer_skip: bool
     enable_heuristic_topk: bool
     use_cute_dsl_paged_mqa_logits: bool
@@ -626,7 +627,6 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
     def __init__(self, *args, **kwargs):
         """Initialize DSA metadata with SM count and indexer chunk size."""
         sparse_attention_config = kwargs.pop("sparse_attention_config", None)
-        self.sparse_attention_config = sparse_attention_config
         if (kwargs.get("sparse_metadata_params") is None
                 and sparse_attention_config is not None and hasattr(
                     sparse_attention_config, "to_sparse_metadata_params")):
@@ -670,14 +670,13 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             raise ValueError("DSA sparse attention metadata params are not set")
         self.num_sparse_topk = sparse_metadata_params.max_sparse_topk
         self.sparse_mla_topk = self.num_sparse_topk
-        self.indexer_head_dim = getattr(self.sparse_attention_config,
-                                        "index_head_dim", 128)
+        self.indexer_head_dim = sparse_metadata_params.index_head_dim
         self.indexer_quant_block_size = 128
         self.enable_indexer_skip = (sparse_metadata_params.enable_indexer_skip)
         capture_graph = self.is_cuda_graph
-        # Get compression ratio from sparse attention config. Plain DSA has no
-        # compression and uses the default [1]; DeepSeek-V4 overrides this.
-        self.compress_ratios = getattr(self.sparse_attention_config,
+        # Plain DSA has no compression and uses the default [1]. DeepSeek-V4's
+        # metadata params carry the model-specific compression ratios.
+        self.compress_ratios = getattr(sparse_metadata_params,
                                        'compress_ratios', [1])
 
         # Effective tokens-per-block for the indexer k-cache slot mapping.
