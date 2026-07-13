@@ -25,6 +25,7 @@ from fastapi import Body, FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import (FileResponse, JSONResponse, Response,
                                StreamingResponse)
+from fastapi.routing import APIRoute
 from pydantic import ValidationError
 from starlette.routing import Mount
 from transformers import AutoProcessor
@@ -103,6 +104,55 @@ from .harmony_adapter import (HarmonyAdapter, get_harmony_adapter,
                               maybe_transform_reasoning_effort)
 
 # yapf: enable
+
+# msgspec msgpack is an opt-in transport for the disagg orchestrator->worker
+# request body: the large agentic chat body otherwise blocks the serving event
+# loop on stdlib json.loads. Enable with TRTLLM_SERVE_ENABLE_MSGSPEC=1 (must be
+# set on both orchestrator and worker). The worker decodes bodies flagged with
+# the X-TRTLLM-Msgpack header via msgspec and falls back to stdlib json for
+# everything else, so the JSON path is byte-for-byte unchanged when the flag is off.
+_MSGSPEC_ENABLED = os.getenv("TRTLLM_SERVE_ENABLE_MSGSPEC", "0") == "1"
+if _MSGSPEC_ENABLED:
+    try:
+        import msgspec
+    except ImportError as exc:
+        raise ImportError(
+            "TRTLLM_SERVE_ENABLE_MSGSPEC=1 requires the msgspec package "
+            "(listed in requirements.txt).") from exc
+    _msgpack_decoder = msgspec.msgpack.Decoder()
+
+    class _MsgspecRequest(Request):
+        """Request that decodes msgpack bodies (X-TRTLLM-Msgpack: 1) with msgspec.
+
+        The orchestrator sends Content-Type application/json (so FastAPI still
+        routes the body through Request.json()) with the X-TRTLLM-Msgpack header
+        flagging a msgspec-msgpack payload; everything else is stdlib json.
+        """
+
+        async def json(self):
+            if not hasattr(self, "_json_body"):
+                body = await self.body()
+                if not body:
+                    self._json_body = {}
+                elif self.headers.get("x-trtllm-msgpack") == "1":
+                    self._json_body = _msgpack_decoder.decode(body)
+                else:
+                    self._json_body = json.loads(body)
+            return self._json_body
+
+    class _MsgspecRoute(APIRoute):
+        """APIRoute that parses request bodies via :class:`_MsgspecRequest`."""
+
+        def get_route_handler(self):
+            original_route_handler = super().get_route_handler()
+
+            async def route_handler(request: Request):
+                return await original_route_handler(
+                    _MsgspecRequest(request.scope, request.receive))
+
+            return route_handler
+
+
 TIMEOUT_KEEP_ALIVE = 5  # seconds.
 
 
@@ -385,6 +435,8 @@ class OpenAIServer(_VideoRoutesMixin):
             self.generator.shutdown()
 
         self.app = FastAPI(lifespan=lifespan)
+        if _MSGSPEC_ENABLED:
+            self.app.router.route_class = _MsgspecRoute
 
         @self.app.exception_handler(RequestValidationError)
         async def validation_exception_handler(_, exc):

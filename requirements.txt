@@ -36,6 +36,7 @@ prometheus_client
 prometheus_fastapi_instrumentator
 pydantic>=2.9.1
 pydantic-settings[yaml]
+msgspec
 omegaconf
 pillow
 optimum

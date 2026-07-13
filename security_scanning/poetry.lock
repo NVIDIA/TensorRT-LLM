@@ -2538,13 +2538,14 @@ files = [
 
 [[package]]
 name = "meson"
-version = "1.11.1"
+version = "1.11.2"
 description = "A high performance build system"
 optional = false
 python-versions = ">=3.7"
 groups = ["main"]
 files = [
-    {file = "meson-1.11.1-py3-none-any.whl", hash = "sha256:9b3a023657e393dbc5335b95c561337d49b7a458f5541e47ec44f2cc566e0d80"},
+    {file = "meson-1.11.2-py3-none-any.whl", hash = "sha256:7e4f6e83fec83e3eaac928e058b073c7557b282c35b6a2024cea143a39926a39"},
+    {file = "meson-1.11.2.tar.gz", hash = "sha256:698feae069cef3ecd4d7aaf281d7df359bdfcf555a9a1564383d3b913fa8a736"},
 ]
 
 [package.extras]
@@ -6133,14 +6134,14 @@ files = [
 
 [[package]]
 name = "smg-grpc-proto"
-version = "0.4.13"
+version = "0.4.14"
 description = "SMG gRPC proto definitions for vLLM, TRT-LLM, MLX, TokenSpeed, and SGLang"
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "smg_grpc_proto-0.4.13-py3-none-any.whl", hash = "sha256:741b194a9fcb6166df7086c2b009679e79d1f3fe9f4d724c84c28ac3c53dfd3a"},
-    {file = "smg_grpc_proto-0.4.13.tar.gz", hash = "sha256:1df2b1fbfe2cee64a304edb7d32599f7bfdcba56568fe34d7fc9cd89960d3b6b"},
+    {file = "smg_grpc_proto-0.4.14-py3-none-any.whl", hash = "sha256:94ead6971aafbb24755ebcbd4fb680e38d067d3dc6bfeb2b5feeae3f2664da38"},
+    {file = "smg_grpc_proto-0.4.14.tar.gz", hash = "sha256:a8ea20872934472c94ffa192bafb2a4f71bc591ab4bfb240cb567801210fbc0f"},
 ]
 
 [package.dependencies]
@@ -7404,4 +7405,4 @@ type = ["pytest-mypy (>=1.0.1) ; platform_python_implementation != \"PyPy\""]
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.10,<3.13"
-content-hash = "87170fb049f423484cf1a4c5167a6853f1dd3d59b8022ad74fc7e39dadda2dd6"
+content-hash = "cd33f0f3c015a9d5e4f0f0ce2930551a992894758de30b93f0ce8b436c51d0c8"
