@@ -8,7 +8,7 @@ import os
 import weakref
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, Union
 
 import torch
 import torch._dynamo.config
@@ -701,6 +701,7 @@ class PyTorchModelEngine(ModelEngine):
             sparse_attention_config=self.sparse_attention_config,
         )
         self.cuda_graph_runner = CUDAGraphRunner(cuda_graph_runner_config)
+        self._cuda_graph_replay_enabled = True
 
         # Create Encoder CUDA graph config and runner.
         encoder_cuda_graph_runner_config = EncoderCUDAGraphRunnerConfig(
@@ -876,6 +877,15 @@ class PyTorchModelEngine(ModelEngine):
             yield
         finally:
             self.cuda_graph_runner.enabled = _run_cuda_graphs
+
+    @contextmanager
+    def no_cuda_graph_replay(self) -> Iterator[None]:
+        replay_enabled = self._cuda_graph_replay_enabled
+        self._cuda_graph_replay_enabled = False
+        try:
+            yield
+        finally:
+            self._cuda_graph_replay_enabled = replay_enabled
 
     def _pad_batch_seed_mrope_delta_cache(
             self, padded_requests: ScheduledRequests) -> None:
@@ -1082,6 +1092,12 @@ class PyTorchModelEngine(ModelEngine):
             gc.collect()
             torch.cuda.empty_cache()
         with self.cuda_graph_runner.allow_capture():
+            # Discover the maximum attention workspace across every graph
+            # shape before capturing the graphs used at runtime. Some kernels
+            # select a larger-workspace implementation for a smaller batch size.
+            with self.no_cuda_graph_replay():
+                self._run_cuda_graph_warmup(resource_manager)
+            self.cuda_graph_runner.clear_captured_graphs()
             self._run_cuda_graph_warmup(resource_manager)
         log_mem_snapshot("warmup/after_cuda_graph_capture")
         if can_run_general_warmup:
@@ -5461,7 +5477,8 @@ class PyTorchModelEngine(ModelEngine):
                             gather_ids=gather_ids,
                             gather_context_logits=gather_context_logits)
                 else:
-                    if self.cuda_graph_runner.needs_capture(key):
+                    needs_capture = self.cuda_graph_runner.needs_capture(key)
+                    if needs_capture:
 
                         def capture_forward_fn(inputs: Dict[str, Any]):
                             with MoeLoadBalancerIterContext(moe_load_balancer):
@@ -5480,6 +5497,9 @@ class PyTorchModelEngine(ModelEngine):
                             enable_spec_decode=self.enable_spec_decode,
                             postprocess_fn=capture_postprocess_fn)
 
+                    if not self._cuda_graph_replay_enabled:
+                        outputs = self.cuda_graph_runner.graph_outputs[key]
+                    elif needs_capture:
                         # Pre-replay: set DSA slot mappings for current batch's draft cache (fixes 2nd warmup)
                         saved_draft = prepare_attn_metadata_for_draft_replay(
                             attn_metadata, draft_kv_cache_manager)
