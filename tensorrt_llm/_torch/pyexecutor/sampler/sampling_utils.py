@@ -50,10 +50,13 @@ from tensorrt_llm._torch.pyexecutor.sampler.ops.flashinfer import (
     top_p_sampling_from_probs_op as top_p_sampling_from_probs_op,
 )
 from tensorrt_llm._torch.pyexecutor.sampler.ops.vanilla import (
+    GREEDY_TEMPERATURE_THRESHOLD as GREEDY_TEMPERATURE_THRESHOLD,
+)
+from tensorrt_llm._torch.pyexecutor.sampler.ops.vanilla import (
     BeamSearchMetadata as BeamSearchMetadata,
 )
+from tensorrt_llm._torch.pyexecutor.sampler.ops.vanilla import Fusions as Fusions
 from tensorrt_llm._torch.pyexecutor.sampler.ops.vanilla import StrategyMetadata as StrategyMetadata
-from tensorrt_llm._torch.pyexecutor.sampler.ops.vanilla import _Fusions as _Fusions
 from tensorrt_llm._torch.pyexecutor.sampler.ops.vanilla import (
     beam_search_sampling_batch as beam_search_sampling_batch,
 )
@@ -86,7 +89,8 @@ GREEDY: Greedy = ("greedy", None)
 
 Strategy: TypeAlias = TopK | TopP | Greedy | TopKTopP | TemperatureOnly | BeamSearch
 
-BEAM_SEARCH_PAD_TOKEN = -1
+# Re-exported from the beam-search op implementation (single source of truth).
+BEAM_SEARCH_PAD_TOKEN = vanilla.BEAM_SEARCH_PAD_TOKEN
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -861,13 +865,13 @@ def sampling_batch_spec_dec_one_model(
     top_k = sanitize_top_k(top_k, logits.shape[-1])
     # Greedy rows (temperature <= threshold) must return the argmax token, not a
     # sample from the temperature-scaled distribution. Capture the argmax from the
-    # *original* logits up front; _safely_apply_temperature_inplace then guards the division
+    # *original* logits up front; safely_apply_temperature_inplace then guards the division
     # against the greedy sentinel, and torch.where restores the greedy rows below.
     # All ops are branch-free (no data-dependent control flow), so this stays
     # CUDA-graph safe.
-    is_greedy = temperatures <= vanilla._GREEDY_TEMPERATURE_THRESHOLD
+    is_greedy = temperatures <= vanilla.GREEDY_TEMPERATURE_THRESHOLD
     greedy_tokens = logits.argmax(dim=-1)
-    logits = vanilla._safely_apply_temperature_inplace(logits, temperatures)
+    logits = vanilla.safely_apply_temperature_inplace(logits, temperatures)
     sampled = flashinfer.top_k_top_p_sampling_from_logits_op(
         logits, top_k, top_p, seed=seed, offset=offset
     )

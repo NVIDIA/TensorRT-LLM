@@ -93,11 +93,11 @@ from .sampling_utils import (
     GREEDY,
     BeamSearchMetadata,
     FlashInferGroupedStrategySampler,
+    Fusions,
     GenericStrategyKeyType,
     Strategy,
     StrategyMetadata,
     UtilsSamplingParams,
-    _Fusions,
     get_rejected_indices,
     resolve_sampling_strategy,
     sample,
@@ -4217,7 +4217,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 logit_indices_for_raw_logprobs_cuda += batch_next_tokens_offset_start
                 # NB: Copy could be avoided by storing logit indices (and temperature) instead (cf. comment on
                 #     processed logprobs above).
-                _Fusions.gather_scatter(
+                Fusions.gather_scatter(
                     batch_logits_for_logprobs_cuda,
                     logit_indices_for_raw_logprobs_cuda,
                     group_logits_cuda,
@@ -4563,7 +4563,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             )
 
             # (batch_size, vocab_size)
-            group_logprobs_cuda = _Fusions.gather_log_softmax(
+            group_logprobs_cuda = Fusions.gather_log_softmax(
                 batched_sampling_result.batch_logits_for_logprobs_cuda, group_logits_indices_cuda
             )
 
@@ -4603,7 +4603,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             # NB: Computation of sampled rank could be lowered into FlashInferGroupedStrategySampler, s.t., e.g., for
             #     greedy sampling, logits management and log_softmax could be completely skipped (sampled rank
             #     computation is trivial in this case).
-            sampled_rank_cuda = _Fusions.determine_sampled_rank(
+            sampled_rank_cuda = Fusions.determine_sampled_rank(
                 group_logprobs_cuda, sampled_vals_cuda
             )
 

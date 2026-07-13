@@ -26,7 +26,7 @@ import torch
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.bindings.executor import FinishReason
 
-_BEAM_SEARCH_PAD_TOKEN = -1
+BEAM_SEARCH_PAD_TOKEN = -1
 
 
 @dataclass(kw_only=True)
@@ -235,7 +235,7 @@ def beam_search_sampling_batch(
 
     next_tokens = next_tokens % vocab_size
     ended_predecessor_mask = torch.gather(dim=1, index=predecessor_beam, input=finished_beams_mask)
-    next_tokens = torch.where(ended_predecessor_mask, _BEAM_SEARCH_PAD_TOKEN, next_tokens)
+    next_tokens = torch.where(ended_predecessor_mask, BEAM_SEARCH_PAD_TOKEN, next_tokens)
 
     old_cum_log_probs = beam_search_args.cum_log_probs[beam_search_args.seq_slots].view(-1)
     beam_search_args.new_log_probs[beam_search_args.seq_slots, :beam_width_out] = (
@@ -283,15 +283,19 @@ def sample_rejected(
     return cast(int, new_token.item())
 
 
-_GREEDY_TEMPERATURE_THRESHOLD = 1e-4
+# Rows whose temperature is at or below this threshold are treated as greedy.
+# Contract with the spec-decoding metadata layer: greedy requests are
+# normalized to a sentinel temperature strictly below this threshold (see
+# DISABLE_TEMP_VAL in speculative/interface.py, which derives from it).
+GREEDY_TEMPERATURE_THRESHOLD = 1e-4
 
 
-def _safely_apply_temperature_inplace(
+def safely_apply_temperature_inplace(
     logits_inout: torch.Tensor, temp: torch.Tensor
 ) -> torch.Tensor:
     """Divide logits by per-row temperature in place, guarding the greedy sentinel.
 
-    Greedy requests carry a temperature of 0 / <= ``_GREEDY_TEMPERATURE_THRESHOLD``.
+    Greedy requests carry a temperature of 0 / <= ``GREEDY_TEMPERATURE_THRESHOLD``.
     Dividing by it would blow logits up to inf/nan and corrupt downstream sampling
     (argmax / softmax / multinomial). Those rows are clamped to a temperature of 1.0
     so the division is numerically safe; callers are expected to overwrite the greedy
@@ -301,11 +305,11 @@ def _safely_apply_temperature_inplace(
     ``logits_inout`` is modified in place (``div_``) and also returned for
     convenience; ``temp`` is left untouched.
     """
-    safe_temp = torch.where(temp <= _GREEDY_TEMPERATURE_THRESHOLD, torch.ones_like(temp), temp)
+    safe_temp = torch.where(temp <= GREEDY_TEMPERATURE_THRESHOLD, torch.ones_like(temp), temp)
     return logits_inout.div_(safe_temp.unsqueeze(dim=1))
 
 
-class _Fusions:
+class Fusions:
     @staticmethod
     @torch.compile(dynamic=None, fullgraph=True)
     def _gather_scatter_impl(
@@ -327,7 +331,7 @@ class _Fusions:
         torch._dynamo.mark_dynamic(dst_index_cuda, 0)
         torch._dynamo.mark_dynamic(src_cuda, 0)
         torch._dynamo.mark_dynamic(src_index_cuda, 0)
-        _Fusions._gather_scatter_impl(dst_cuda, dst_index_cuda, src_cuda, src_index_cuda)
+        Fusions._gather_scatter_impl(dst_cuda, dst_index_cuda, src_cuda, src_index_cuda)
 
     @staticmethod
     @torch.compile(dynamic=None, fullgraph=True)
@@ -345,7 +349,7 @@ class _Fusions:
     ) -> torch.Tensor:
         torch._dynamo.mark_dynamic(group_logprobs_cuda, 0)
         torch._dynamo.mark_dynamic(sampled_logprobs_cuda, 0)
-        return _Fusions._determine_sampled_rank_impl(group_logprobs_cuda, sampled_logprobs_cuda)
+        return Fusions._determine_sampled_rank_impl(group_logprobs_cuda, sampled_logprobs_cuda)
 
     @staticmethod
     @torch.compile(
@@ -368,4 +372,4 @@ class _Fusions:
     def gather_log_softmax(inputs_cuda: torch.Tensor, indices_cuda: torch.Tensor) -> torch.Tensor:
         torch._dynamo.mark_dynamic(inputs_cuda, 0)
         torch._dynamo.mark_dynamic(indices_cuda, 0)
-        return _Fusions._gather_log_softmax_impl(inputs_cuda, indices_cuda)
+        return Fusions._gather_log_softmax_impl(inputs_cuda, indices_cuda)
