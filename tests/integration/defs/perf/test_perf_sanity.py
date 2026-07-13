@@ -139,14 +139,20 @@ GEN_ONLY_PERF_METRIC_LOG_QUERIES = {
 
 # Per-iter prev_device_step_time logged by each gen worker. Example line:
 #   [TRT-LLM] [I] [_torch][RANK 0] iter = 5, global_rank = 0, ...,
-#   host_step_time = 6.79ms, prev_device_step_time = 6.94ms, ...
+#   host_step_time = 6.79ms, prev_device_step_time = 6.94ms, ...,
+#   states = {..., 'num_generation_tokens': 512, ...}
 # Only the gen worker (decode) emits this. The device value reported at iter N
 # is the device step time of iter N-1 (device runs async). Iters 0-4 are
 # skipped: iter 0/1 include KV-cache transfer wait time, and iters 2-4 are
 # warmup that has not yet reached steady state. prev_device_step_time may be
 # 'N/A' (e.g. iter 1); the regex requires a numeric value so those lines do
-# not match.
-_DEVICE_STEP_TIME_RE = re.compile(r"iter\s*=\s*(\d+),.*?prev_device_step_time\s*=\s*([\d.]+)\s*ms")
+# not match. num_generation_tokens is captured so the scanner can restrict
+# the mean to steady-state iters (see _scan_gen_worker_device_step_time).
+_DEVICE_STEP_TIME_RE = re.compile(
+    r"iter\s*=\s*(\d+),.*?"
+    r"prev_device_step_time\s*=\s*([\d.]+)\s*ms.*?"
+    r"'num_generation_tokens':\s*(\d+)"
+)
 
 
 def gen_worker_log_sizes(output_dir: str, num_gen_servers: int) -> List[int]:
@@ -168,12 +174,21 @@ def _scan_gen_worker_device_step_time(
     num_gen_servers: int,
     start_offsets: Optional[List[int]] = None,
 ) -> Tuple[List[float], int]:
-    """Single pass over the gen logs. Returns (per_file_means, total_count).
+    """Two-pass scan of the gen logs. Returns (per_file_means, total_count).
 
     per_file_means holds one mean per file that had >=1 usable line;
-    total_count is the number of usable (iter >= 5, numeric) lines across all
-    files, used by the caller to detect when the cross-node log flush has
-    settled. errors="replace" guards against invalid UTF-8: tqdm progress bars
+    total_count is the number of usable lines (iter >= 5, numeric device
+    time, and num_generation_tokens == that file's max) across all files,
+    used by the caller to detect when the cross-node log flush has settled.
+
+    Within each file the mean is restricted to iterations at the maximum
+    observed num_generation_tokens (over iter >= 5). The tail of a run has
+    a shrinking num_generation_tokens as sequences finish, which would
+    otherwise pull the mean away from the steady-state cost we want to
+    track. A two-pass approach — first pass finds the file's max, second
+    pass runs a Welford mean over matching rows — keeps memory O(1).
+
+    errors="replace" guards against invalid UTF-8: tqdm progress bars
     (model load) write partial multibyte sequences that would otherwise raise
     UnicodeDecodeError mid-scan.
     """
@@ -183,19 +198,41 @@ def _scan_gen_worker_device_step_time(
         log_path = os.path.join(output_dir, f"gen_server_{i}.log")
         if not os.path.isfile(log_path):
             continue
-        # Welford streaming mean: O(1) memory and numerically stable for
-        # large iteration counts.
-        count = 0
-        mean = 0.0
+
+        seek_to = (
+            start_offsets[i]
+            if start_offsets is not None and i < len(start_offsets) and start_offsets[i]
+            else 0
+        )
+
+        max_ngen = -1
         with open(log_path, errors="replace") as f:
-            if start_offsets is not None and i < len(start_offsets) and start_offsets[i]:
-                f.seek(start_offsets[i])
+            if seek_to:
+                f.seek(seek_to)
             for line in f:
                 m = _DEVICE_STEP_TIME_RE.search(line)
                 if m is None:
                     continue
-                iter_idx = int(m.group(1))
-                if iter_idx < 5:
+                if int(m.group(1)) < 5:
+                    continue
+                ngen = int(m.group(3))
+                if ngen > max_ngen:
+                    max_ngen = ngen
+        if max_ngen < 0:
+            continue
+
+        count = 0
+        mean = 0.0
+        with open(log_path, errors="replace") as f:
+            if seek_to:
+                f.seek(seek_to)
+            for line in f:
+                m = _DEVICE_STEP_TIME_RE.search(line)
+                if m is None:
+                    continue
+                if int(m.group(1)) < 5:
+                    continue
+                if int(m.group(3)) != max_ngen:
                     continue
                 count += 1
                 mean += (float(m.group(2)) - mean) / count
@@ -214,8 +251,12 @@ def parse_gen_worker_device_step_time(
 ) -> Optional[float]:
     """Mean per-iter prev_device_step_time (ms) across all gen workers.
 
-    For each gen_server_{i}.log, average prev_device_step_time over iters >= 5,
-    then average those per-file means across the num_gen_servers workers.
+    For each gen_server_{i}.log, average prev_device_step_time over iters
+    >= 5 restricted to the maximum observed num_generation_tokens in that
+    file (steady-state batch), then average those per-file means across the
+    num_gen_servers workers. Iterations near the end of a run have a
+    shrinking num_generation_tokens as sequences finish and are excluded
+    so they don't drag the mean below the steady-state cost.
     Returns None if no usable line is found in any file.
 
     When start_offsets is provided, only the bytes from start_offsets[i] to
