@@ -257,7 +257,13 @@ class OpenEngineServicer(openengine_pb2_grpc.OpenEngineServicer):
                             raise RuntimeError(
                                 "Context-only result did not return disaggregated parameters"
                             )
-                        handoff = replace(handoff, ctx_usage=self._usage_payload(current))
+                        handoff = replace(
+                            handoff,
+                            ctx_usage=self._usage_payload(current),
+                            ctx_info_endpoint=(
+                                handoff.ctx_info_endpoint or self._context_info_endpoint()
+                            ),
+                        )
                         session = encode_handoff(handoff, requires_decode_media=bool(request.media))
                         self._track_kv_session(session.session_id, request.request_id)
                         yield generation_pb2.GenerateResponse(
@@ -334,11 +340,38 @@ class OpenEngineServicer(openengine_pb2_grpc.OpenEngineServicer):
             timer.cancel()
         return released
 
+    def _context_info_endpoint(self) -> str | None:
+        """Return the context worker endpoint needed for direct NIXL discovery."""
+        params = getattr(self.llm, "disaggregated_params", None)
+        if not isinstance(params, dict):
+            return None
+        endpoint = params.get("ctx_info_endpoint")
+        if isinstance(endpoint, str):
+            return endpoint or None
+        if isinstance(endpoint, (list, tuple)):
+            return next(
+                (item for item in endpoint if isinstance(item, str) and item),
+                None,
+            )
+        return None
+
     def _release_all_kv_sessions(self) -> None:
         for timer in self._kv_session_timers.values():
             timer.cancel()
         self._kv_session_timers.clear()
         self._kv_session_requests.clear()
+
+    def _active_kv_session_count(self) -> int:
+        """Count sessions whose owning request is still engine-active.
+
+        Prefill handoff handles remain abortable until their TTL expires, but
+        their context request has already finished and must not inflate load.
+        Drain continues to report and release all open handles separately.
+        """
+        return sum(
+            request_id in self.tracker.active_requests
+            for request_id in self._kv_session_requests.values()
+        )
 
     def close(self) -> None:
         """Release protocol-owned timers without shutting down the shared LLM."""
@@ -771,7 +804,7 @@ class OpenEngineServicer(openengine_pb2_grpc.OpenEngineServicer):
             timestamp_unix_nanos=time.time_ns(),
             running_requests=running_requests,
             queued_requests=queued_requests,
-            active_kv_sessions=len(self._kv_session_requests),
+            active_kv_sessions=self._active_kv_session_count(),
             ranks=rank_infos,
             attributes=attributes,
         )

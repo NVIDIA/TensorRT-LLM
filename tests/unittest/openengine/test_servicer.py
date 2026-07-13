@@ -18,7 +18,7 @@ from openengine.v1 import (
 
 from tensorrt_llm.disaggregated_params import DisaggregatedParams, DisaggScheduleStyle
 from tensorrt_llm.inputs.registry import MultimodalLoraSpec
-from tensorrt_llm.openengine.converters import encode_handoff
+from tensorrt_llm.openengine.converters import decode_handoff, encode_handoff
 from tensorrt_llm.openengine.servicer import OpenEngineServicer
 from tensorrt_llm.serve.kv_event_fanout import KvEventFanout
 from tensorrt_llm.serve.request_tracker import RequestTracker
@@ -284,6 +284,10 @@ async def test_context_then_generation_round_trips_handoff() -> None:
     assert len(context_responses) == 1
     assert context_responses[0].WhichOneof("event") == "prefill_ready"
     assert len(context_service._kv_session_requests) == 1
+    context_load = await context_service.GetLoad(
+        observability_pb2.GetLoadRequest(), _Context()
+    )
+    assert context_load.active_kv_sessions == 0
 
     decode_llm = _Llm()
     decode_service = OpenEngineServicer(
@@ -323,6 +327,34 @@ async def test_context_then_generation_round_trips_handoff() -> None:
     )
     assert abort_response.status == lifecycle_pb2.ABORT_STATUS_ABORTED
     assert not context_service._kv_session_requests
+
+
+@pytest.mark.asyncio
+async def test_prefill_adds_context_endpoint_from_llm_discovery() -> None:
+    handoff = DisaggregatedParams(
+        request_type="context_only",
+        first_gen_tokens=[7],
+        disagg_request_id=101,
+        schedule_style=DisaggScheduleStyle.CONTEXT_FIRST,
+    )
+    llm = _Llm(handoff)
+    llm.disaggregated_params = {"ctx_info_endpoint": ["tcp://context:1234"]}
+    service = OpenEngineServicer(
+        llm,
+        "model",
+        engine_pb2.ENGINE_ROLE_PREFILL,
+        RequestTracker(llm),
+    )
+    request = generation_pb2.GenerateRequest(
+        request_id="prefill",
+        model="model",
+        token_ids=input_pb2.TokenIds(ids=[1, 2]),
+    )
+
+    responses = [response async for response in service.Generate(request, _Context())]
+    decoded = decode_handoff(responses[0].prefill_ready.kv_session)
+
+    assert decoded.ctx_info_endpoint == "tcp://context:1234"
 
 
 @pytest.mark.asyncio
