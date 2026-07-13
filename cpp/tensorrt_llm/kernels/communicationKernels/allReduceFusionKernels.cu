@@ -49,7 +49,6 @@ __device__ __forceinline__ float warpReduceSum(float val, uint32_t mask, int act
 
 __device__ __forceinline__ void blockReduceSum(float* val)
 {
-    __shared__ float shared[32];
     int const lane = threadIdx.x & (warpSize - 1);
     int const warpId = threadIdx.x / warpSize;
     int const warpStart = warpId * warpSize;
@@ -58,6 +57,20 @@ __device__ __forceinline__ void blockReduceSum(float* val)
     uint32_t const mask = getLaneMask(activeLanes);
 
     *val = warpReduceSum(*val, mask, activeLanes);
+
+    int const warpCount = (blockDim.x + warpSize - 1) / warpSize;
+    if (warpCount == 1)
+    {
+        // Single-warp block: the shuffle-based warp reduction above already reconverges every
+        // participating lane, so skip the block-wide barrier below. It matters here because this
+        // path also serves the oneshot Lamport all-reduce, whose per-thread busy-wait polling
+        // relies on threads making independent progress; an unconditional __syncthreads() would
+        // turn that into a per-token, block-wide synchronization point and inflate tail latency
+        // under contention (observed as a ~300s CI timeout for hidden_size=64/ONESHOT).
+        return;
+    }
+
+    __shared__ float shared[32];
     if (lane == 0)
     {
         shared[warpId] = *val;
@@ -65,8 +78,7 @@ __device__ __forceinline__ void blockReduceSum(float* val)
 
     __syncthreads();
 
-    int const warpCount = (blockDim.x + warpSize - 1) / warpSize;
-    if (warpCount > 1 && warpId == 0)
+    if (warpId == 0)
     {
         *val = lane < warpCount ? shared[lane] : 0.f;
         *val = warpReduceSum(*val, 0xffffffffU, warpSize);

@@ -623,8 +623,14 @@ TEST(Kernel, AllReduce)
 
     // Exercise the partial-warp RMSNorm reduction used by small AutoDeploy test models.
     // At hidden_size=64, a 16-bit dtype processes eight 128-bit accesses per token, so the
-    // all-reduce kernel launches fewer than one warp of threads.
+    // all-reduce kernel launches fewer than one warp of threads. Cover both ONESHOT and TWOSHOT:
+    // they share this reduction code but drive it through different communication paths (ONESHOT's
+    // Lamport buffers rely on per-thread busy-wait polling instead of TWOSHOT's barrier), so a
+    // regression can affect one strategy without the other.
     Workspace small_hidden_workspace(world_size, rank, 8192, 64);
+    pass = pass
+        && test(small_hidden_workspace, 8192, 64, false, true, 3, 3, AllReduceStrategyType::ONESHOT,
+            AllReduceStrategyConfig(0), AllReduceFusionOp::RESIDUAL_RMS_NORM);
     pass = pass
         && test(small_hidden_workspace, 8192, 64, false, true, 3, 3, AllReduceStrategyType::TWOSHOT,
             AllReduceStrategyConfig(0), AllReduceFusionOp::RESIDUAL_RMS_NORM);
