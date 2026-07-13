@@ -22,8 +22,9 @@ Eligibility is automatic:
 - use-count cap            -> pool retired after N handouts (default 16),
                               bounding worker state accumulation
 
-Between handouts every worker runs a torch.compile/Dynamo reset (rank-verified
-via ``grouped_test_utils.submit_sync_per_worker``) and the handover waits for
+Between handouts every worker runs a torch.compile/Dynamo reset (exactly once
+per worker, barrier-pinned: ``grouped_test_utils.submit_sync_per_worker``) and
+the handover waits for
 the previous worker's GPU memory to actually be released (NVML settle barrier)
 — both failure modes were observed in validation, not hypothetical.
 
@@ -186,24 +187,20 @@ def _get_worker_pid() -> tuple:
     return (pid, _proc_start_time(pid))
 
 
-def _collect_worker_pids(real, n_workers: int) -> tuple:
+def _collect_worker_pids(real) -> tuple:
     """Record the worker PIDs of a freshly spawned pool.
 
     ``_retire`` uses them to SIGKILL wedged workers: a graceful shutdown
     blocks forever on a broken pool and ``shutdown_abort`` would MPI_Abort
     the parent test process too. Records (pid, start_time) pairs so the kill
-    can verify the PID was not recycled. Best effort — a missing PID just
-    means that worker is left for the graceful-shutdown fallback.
+    can verify the PID was not recycled. ``submit_sync_per_worker`` runs the
+    collection exactly once per worker. Best effort — if it fails, the pool
+    just falls back to graceful shutdown.
     """
-    pids: set = set()
     try:
-        for _ in range(4):
-            pids.update(real.submit_sync(_get_worker_pid))
-            if len(pids) >= n_workers:
-                break
+        return tuple(sorted(submit_sync_per_worker(real, _get_worker_pid)))
     except Exception:
-        pass
-    return tuple(sorted(pids))
+        return ()
 
 
 def _describe_mismatch(spawn_snap, now_snap, uses, max_uses):
@@ -431,7 +428,7 @@ class SessionReuseCache:
                 os.environ.pop(k, None)
         real._reuse_uses = 0
         real._reuse_spawn_snapshot = snapshot
-        real._reuse_worker_pids = _collect_worker_pids(real, n_workers)
+        real._reuse_worker_pids = _collect_worker_pids(real)
         return real
 
     def _release(self, real):

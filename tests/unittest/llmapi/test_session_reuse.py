@@ -219,6 +219,63 @@ def test_failed_item_fences_cached_pools(reuse_cache, monkeypatch):
     assert s2._real is not real  # fresh pool, no reuse across the failure
 
 
+class _FakeBarrierSession:
+    """Fakes MpiPoolSession.submit for master-side submit_sync_per_worker tests.
+
+    Worker-side behaviour (the barrier itself) needs real MPI and is covered
+    by the multi-GPU validation runs; here each entry stands for one worker's
+    future: a (rank, result) tuple, an Exception, or None (never completes,
+    i.e. a wedged worker).
+    """
+
+    def __init__(self, outcomes):
+        import concurrent.futures
+
+        self.n_workers = len(outcomes)
+        self._futures = []
+        for outcome in outcomes:
+            f = concurrent.futures.Future()
+            if isinstance(outcome, Exception):
+                f.set_exception(outcome)
+            elif outcome is not None:
+                f.set_result(outcome)
+            self._futures.append(f)
+
+    def submit(self, task, *args):
+        return self._futures
+
+
+def test_probe_returns_results_ordered_by_rank():
+    from test_common.grouped_test_utils import submit_sync_per_worker
+
+    session = _FakeBarrierSession([(2, "c"), (0, "a"), (1, "b")])
+    assert submit_sync_per_worker(session, lambda: None) == ["a", "b", "c"]
+
+
+def test_probe_times_out_on_wedged_worker():
+    from test_common.grouped_test_utils import submit_sync_per_worker
+
+    session = _FakeBarrierSession([(0, "a"), None])  # rank 1 never returns
+    with pytest.raises(RuntimeError, match="timed out"):
+        submit_sync_per_worker(session, lambda: None, timeout=0.2)
+
+
+def test_probe_propagates_worker_exception():
+    from test_common.grouped_test_utils import submit_sync_per_worker
+
+    session = _FakeBarrierSession([(0, "a"), ValueError("worker died")])
+    with pytest.raises(ValueError, match="worker died"):
+        submit_sync_per_worker(session, lambda: None)
+
+
+def test_probe_flags_missing_rank():
+    from test_common.grouped_test_utils import submit_sync_per_worker
+
+    session = _FakeBarrierSession([(0, "a"), (0, "a")])  # rank 1 never covered
+    with pytest.raises(RuntimeError, match=r"ranks \[1\]"):
+        submit_sync_per_worker(session, lambda: None)
+
+
 def test_passing_item_keeps_reuse(reuse_cache, monkeypatch):
     """The fence must not fire for passing items; reuse stays intact."""
     from test_common import session_reuse_hooks as hooks
