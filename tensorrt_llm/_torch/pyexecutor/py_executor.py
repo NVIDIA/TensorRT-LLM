@@ -725,6 +725,9 @@ class PyExecutor:
         self.previous_batch: Optional[BatchState] = None
         self.has_previous_draft_tokens = False
         self.num_scheduled_requests: int = 0
+        # Populated at schedule time (see _prepare_and_schedule_batch).
+        self.num_dummy_requests: int = 0
+        self.num_unscheduled_requests: int = 0
         self.benchmark_req_queues_size = int(
             os.environ.get("TLLM_BENCHMARK_REQ_QUEUES_SIZE", 0))
 
@@ -1587,6 +1590,7 @@ class PyExecutor:
         start_event_2 = None
         end_event_2 = torch.cuda.Event(enable_timing=True)
         prev_device_step_time = None
+        prev_fetch_requests_cur_rank = 0
 
         torch_trace_path = os.environ.get(PROFILE_TRACE_ENV_VAR_NAME, None)
         if torch_trace_path is not None:
@@ -1628,7 +1632,7 @@ class PyExecutor:
         calibrator = get_calibrator()
 
         def profile_step():
-            nonlocal it, enabled, start_time, start_event_1, end_event_1, start_event_2, end_event_2, prev_device_step_time
+            nonlocal it, enabled, start_time, start_event_1, end_event_1, start_event_2, end_event_2, prev_device_step_time, prev_fetch_requests_cur_rank
             calibrator.post_step(it)
             if (self.iter_counter in self.profile_stop_iters
                     and not self.is_warmup):
@@ -1683,6 +1687,11 @@ class PyExecutor:
                             kv_util_str = f"{1.0 - kv_stats.free_num_blocks / kv_stats.max_num_blocks:.3f}"
                     formatted_timestamp = datetime.datetime.now().strftime(
                         "%Y-%m-%d %H:%M:%S")
+                    # num_dummy/num_unscheduled are sampled at schedule time,
+                    # so here they lag one iteration (like num_scheduled_requests).
+                    num_fetched = (self.num_fetch_requests_cur_rank -
+                                   prev_fetch_requests_cur_rank)
+                    prev_fetch_requests_cur_rank = self.num_fetch_requests_cur_rank
                     logger.info(
                         f"iter = {self.iter_counter}, "
                         f"global_rank = {self.global_rank}, "
@@ -1694,7 +1703,11 @@ class PyExecutor:
                         f"host_step_time = {host_step_time}ms, "
                         f"prev_device_step_time = {prev_device_step_time_str}, "
                         f"timestamp = {formatted_timestamp}, "
-                        f"states = {self.model_engine.iter_states}")
+                        f"states = {self.model_engine.iter_states}, "
+                        f"num_active = {len(self.active_requests)}, "
+                        f"num_fetched = {num_fetched}, "
+                        f"num_dummy = {self.num_dummy_requests}, "
+                        f"num_unscheduled = {self.num_unscheduled_requests}")
 
             it += 1
 
@@ -2510,6 +2523,11 @@ class PyExecutor:
                         wait_for_disagg_gen_transfer_progress, all_gen_first)
 
                 self.num_scheduled_requests = scheduled_batch.batch_size
+                self.num_dummy_requests = sum(
+                    1 for r in scheduled_batch.all_requests()
+                    if r.is_attention_dp_dummy)
+                self.num_unscheduled_requests = (
+                    len(self.active_requests) - scheduled_batch.batch_size)
 
                 logger.debug(
                     f'iteration {self.iter_counter}, microbatch {microbatch_id}, '
@@ -3521,6 +3539,11 @@ class PyExecutor:
                     return None, None
 
         self.num_scheduled_requests = scheduled_batch.batch_size
+        self.num_dummy_requests = sum(
+            1 for r in scheduled_batch.all_requests()
+            if r.is_attention_dp_dummy)
+        self.num_unscheduled_requests = (
+            len(self.active_requests) - scheduled_batch.batch_size)
         logger.debug(
             f'has {len(self.active_requests)} active_requests, '
             f'scheduled {scheduled_batch.num_encoder_requests} encoder requests, '
