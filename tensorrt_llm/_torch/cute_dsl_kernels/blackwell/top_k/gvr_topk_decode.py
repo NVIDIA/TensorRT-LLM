@@ -1494,6 +1494,113 @@ class GvrTopKKernel:
         cute.arch.barrier()
 
     # ------------------------------------------------------------------
+    # P4 helpers: histogram build + parallel k-th bin search. Factored
+    # out so the level-2 refinement can rerun both over a narrowed window.
+    # ------------------------------------------------------------------
+    @cute.jit
+    def _hist_build(self, keys_base, smem_hist, cand_count, lo, inv, tidx):
+        """Zero smem_hist[0:kBins], then histogram keys[0:cand_count] with
+        bin = clamp(int((v - lo) * inv), 0, kBins-1). Out-of-window values
+        clamp into the edge bins, which keeps cumulative counts from the
+        top exact for the k-th search (everything above the window lands
+        in the top bin). Barrier after the zero pass and after the build."""
+        kBins = cutlass.const_expr(self.kNumBins)
+        num_threads = cutlass.const_expr(self.num_threads)
+        i6 = tidx
+        while i6 < cutlass.Int32(kBins):
+            smem_hist[i6] = cutlass.Int32(0)
+            i6 = i6 + cutlass.Int32(num_threads)
+        cute.arch.barrier()
+        i7 = tidx
+        while i7 < cand_count:
+            vk = self._smem_ld_f32(keys_base, i7)
+            bin_f = (vk - lo) * inv
+            bin_i = cutlass.Int32(bin_f)
+            if bin_i < cutlass.Int32(0):
+                bin_i = cutlass.Int32(0)
+            if bin_i > cutlass.Int32(kBins - 1):
+                bin_i = cutlass.Int32(kBins - 1)
+            atomicAdd(smem_hist.iterator + bin_i, cutlass.Int32(1))
+            i7 = i7 + cutlass.Int32(num_threads)
+        cute.arch.barrier()
+
+    @cute.jit
+    def _kth_bin_search(
+        self, smem_hist, smem_wcnt, s_thr, s_iscalars, lo, binw, tidx, warp_id, lane
+    ):
+        """Parallel k-th bin search (3-step, high→low). Writes
+        s_thr[0] = lower edge of the selected bin (lo + bidx*binw) and
+        s_iscalars[4] = selected bin's count (gates the level-2 histogram
+        refinement). Clobbers s_iscalars[2]/[3] as staging (both are
+        rewritten by the snap loop before anyone else reads them).
+        Trailing barrier."""
+        kK = cutlass.const_expr(self.top_k)
+        kBins = cutlass.const_expr(self.kNumBins)
+        bins_per_warp = cutlass.const_expr(kBins // self.num_warps)
+
+        # Step 1: each warp sums BINS_PER_WARP bins (high→low slice)
+        warp_bin_sum = cutlass.Int32(0)
+        for jb in cutlass.range_constexpr(bins_per_warp):
+            bidx_s = (
+                cutlass.Int32(kBins - 1)
+                - warp_id * cutlass.Int32(bins_per_warp)
+                - cutlass.Int32(jb)
+            )
+            warp_bin_sum = warp_bin_sum + smem_hist[bidx_s]
+        if lane == 0:
+            smem_wcnt[warp_id] = warp_bin_sum
+        cute.arch.barrier()
+
+        # Step 2: tid==0 finds target warp; stores prefix-count + warp index
+        # into s_iscalars[2] (=cnt_lo: prefix before target warp)
+        # and s_iscalars[3] (=cnt_hi: target warp index)
+        if tidx == 0:
+            cum = cutlass.Int32(0)
+            tw = cutlass.Int32(self.num_warps - 1)
+            found = cutlass.Int32(0)
+            for w2 in cutlass.range_constexpr(self.num_warps):
+                cum = cum + smem_wcnt[w2]
+                if cum >= cutlass.Int32(kK) and found == cutlass.Int32(0):
+                    tw = cutlass.Int32(w2)
+                    found = cutlass.Int32(1)
+            # Recompute prefix BEFORE target warp
+            cum2 = cutlass.Int32(0)
+            for w3 in cutlass.range_constexpr(self.num_warps):
+                if cutlass.Int32(w3) < tw:
+                    cum2 = cum2 + smem_wcnt[w3]
+            s_iscalars[2] = cum2  # prefix
+            s_iscalars[3] = tw  # target warp index
+        cute.arch.barrier()
+
+        # Step 3: target warp's lane 0 scans BINS_PER_WARP bins →
+        # threshold. Single-thread serial; the unrolled
+        # range_constexpr beats a runtime `for+break` (tried it: -544
+        # SASS insts but -7pp fp32 / -14pp bf16, since the
+        # branch/counter overhead in a single thread dominates the
+        # static math).
+        target_warp = s_iscalars[3]
+        if warp_id == target_warp and lane == cutlass.Int32(0):
+            base_cum = s_iscalars[2]
+            thr_local = lo
+            sel_cnt = cutlass.Int32(0)
+            set_done = cutlass.Int32(0)
+            for jb2 in cutlass.range_constexpr(bins_per_warp):
+                bidx2 = (
+                    cutlass.Int32(kBins - 1)
+                    - target_warp * cutlass.Int32(bins_per_warp)
+                    - cutlass.Int32(jb2)
+                )
+                cnt_here = smem_hist[bidx2]
+                base_cum = base_cum + cnt_here
+                if base_cum >= cutlass.Int32(kK) and set_done == cutlass.Int32(0):
+                    thr_local = lo + cutlass.Float32(bidx2) * binw
+                    sel_cnt = cnt_here
+                    set_done = cutlass.Int32(1)
+            s_thr[0] = thr_local
+            s_iscalars[4] = sel_cnt
+        cute.arch.barrier()
+
+    # ------------------------------------------------------------------
     # Phase 4: Histogram-based k-th selection + two-pass writeback
     # ------------------------------------------------------------------
     @cute.jit
@@ -1586,93 +1693,43 @@ class GvrTopKKernel:
             # bin 0 (hit-rate-dependent race).
             cute.arch.barrier()
 
-            # Zero histogram (must zero ALL slots since smem_hist[0..NW-1] was
-            # used as cmax scratch above).
-            i6 = tidx
-            while i6 < cutlass.Int32(kBins):
-                smem_hist[i6] = cutlass.Int32(0)
-                i6 = i6 + cutlass.Int32(num_threads)
-            cute.arch.barrier()
-
             range1 = bmax_r - bmin_r
             # inv1 = (kBins - 1 + 0.99) / range1  (range1 > 0 guaranteed by 1e-6 patch)
             inv1 = (cutlass.Float32(kBins - 1) + cutlass.Float32(0.99)) / range1
+            binw1 = range1 / cutlass.Float32(kBins)
 
-            # Build histogram by atomicAdd.
-            i7 = tidx
-            while i7 < cand_count:
-                vk = self._smem_ld_f32(keys_base, i7)
-                bin_f = (vk - bmin_r) * inv1
-                bin_i = cutlass.Int32(bin_f)
-                if bin_i < cutlass.Int32(0):
-                    bin_i = cutlass.Int32(0)
-                if bin_i > cutlass.Int32(kBins - 1):
-                    bin_i = cutlass.Int32(kBins - 1)
-                atomicAdd(smem_hist.iterator + bin_i, cutlass.Int32(1))
-                i7 = i7 + cutlass.Int32(num_threads)
-            cute.arch.barrier()
+            # Level-1: histogram over [bmin, bmax] + k-th bin search.
+            self._hist_build(keys_base, smem_hist, cand_count, bmin_r, inv1, tidx)
+            self._kth_bin_search(
+                smem_hist, smem_wcnt, s_thr, s_iscalars, bmin_r, binw1, tidx, warp_id, lane
+            )
 
-            # ---- Parallel k-th bin search (3-step) ----
-            # Step 1: each warp sums BINS_PER_WARP bins (high→low slice)
-            warp_bin_sum = cutlass.Int32(0)
-            for jb in cutlass.range_constexpr(bins_per_warp):
-                bidx_s = (
-                    cutlass.Int32(kBins - 1)
-                    - warp_id * cutlass.Int32(bins_per_warp)
-                    - cutlass.Int32(jb)
+            # ---- Level-2 histogram refinement ----
+            # The snap loop below steps ONE distinct value per iteration
+            # (~0.45us each: full candidate re-scan + 2 barriers), and real
+            # logits concentrate count mass right at the k-th boundary, so
+            # the selected level-1 bin often holds tens of values → snap
+            # stragglers of 10+ us set the wall clock at N<=32K. When the
+            # selected bin is dense, re-histogram just that bin (bin width
+            # shrinks kBins x) for ~1us of extra scan, leaving the snap
+            # loop 0-2 steps. The snap loop converges monotonically from
+            # any starting threshold, so this only moves the start point —
+            # exactness is untouched (a level-2 edge-rounding error at
+            # worst costs one extra snap step). Uniform branch: everyone
+            # reads the same post-barrier SMEM scalar.
+            sel_cnt2 = s_iscalars[4]
+            if sel_cnt2 > cutlass.Int32(8):
+                thr_e1 = s_thr[0]
+                # 2% slop each side absorbs the inv1-vs-binw1 rounding
+                # difference in the level-1 lower-edge estimate.
+                lo2 = thr_e1 - cutlass.Float32(0.02) * binw1
+                range2 = cutlass.Float32(1.04) * binw1
+                inv2 = (cutlass.Float32(kBins - 1) + cutlass.Float32(0.99)) / range2
+                binw2 = range2 / cutlass.Float32(kBins)
+                self._hist_build(keys_base, smem_hist, cand_count, lo2, inv2, tidx)
+                self._kth_bin_search(
+                    smem_hist, smem_wcnt, s_thr, s_iscalars, lo2, binw2, tidx, warp_id, lane
                 )
-                warp_bin_sum = warp_bin_sum + smem_hist[bidx_s]
-            if lane == 0:
-                smem_wcnt[warp_id] = warp_bin_sum
-            cute.arch.barrier()
-
-            # Step 2: tid==0 finds target warp; stores prefix-count + warp index
-            # into s_iscalars[2] (=cnt_lo: prefix before target warp)
-            # and s_iscalars[3] (=cnt_hi: target warp index)
-            if tidx == 0:
-                cum = cutlass.Int32(0)
-                tw = cutlass.Int32(num_warps - 1)
-                found = cutlass.Int32(0)
-                for w2 in cutlass.range_constexpr(self.num_warps):
-                    cum = cum + smem_wcnt[w2]
-                    if cum >= cutlass.Int32(kK) and found == cutlass.Int32(0):
-                        tw = cutlass.Int32(w2)
-                        found = cutlass.Int32(1)
-                # Recompute prefix BEFORE target warp
-                cum2 = cutlass.Int32(0)
-                for w3 in cutlass.range_constexpr(self.num_warps):
-                    if cutlass.Int32(w3) < tw:
-                        cum2 = cum2 + smem_wcnt[w3]
-                s_iscalars[2] = cum2  # prefix
-                s_iscalars[3] = tw  # target warp index
-            cute.arch.barrier()
-
-            # Step 3: target warp's lane 0 scans BINS_PER_WARP bins →
-            # threshold. Single-thread serial; the unrolled
-            # range_constexpr beats a runtime `for+break` (tried it: -544
-            # SASS insts but -7pp fp32 / -14pp bf16, since the
-            # branch/counter overhead in a single thread dominates the
-            # static math).
-            target_warp = s_iscalars[3]
-            if warp_id == target_warp and lane == cutlass.Int32(0):
-                base_cum = s_iscalars[2]
-                thr_local = bmin_r
-                bmin_local = bmin_r
-                set_done = cutlass.Int32(0)
-                for jb2 in cutlass.range_constexpr(bins_per_warp):
-                    bidx2 = (
-                        cutlass.Int32(kBins - 1)
-                        - target_warp * cutlass.Int32(bins_per_warp)
-                        - cutlass.Int32(jb2)
-                    )
-                    base_cum = base_cum + smem_hist[bidx2]
-                    if base_cum >= cutlass.Int32(kK) and set_done == cutlass.Int32(0):
-                        thr_local = bmin_local + cutlass.Float32(bidx2) * range1 / cutlass.Float32(
-                            kBins
-                        )
-                        set_done = cutlass.Int32(1)
-                s_thr[0] = thr_local
-            cute.arch.barrier()
 
             # ---- Snap convergence loop ----
             # Upper bound = cand_count (matches CUDA heuristic_topk.cuh:985).
