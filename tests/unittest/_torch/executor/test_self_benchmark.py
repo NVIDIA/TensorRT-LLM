@@ -2545,7 +2545,15 @@ def test_schema_v2_output_uses_case_and_trial_id(tmp_path):
     assert data["limits"]["tokens_per_block"] == 32
     assert data["results"][0]["trial_id"] == 3
     assert data["results"][0]["case"]["isl"] == 8
-    assert "point" not in data["results"][0]
+    # `point` mirrors `case` in Dynamo's vocabulary so the TRT-LLM self-benchmark
+    # consumer (dynamo/trtllm/self_benchmark.py) can normalize results to FPM.
+    assert data["results"][0]["point"] == {
+        "point_type": "prefill",
+        "isl": 8,
+        "kv_read_tokens": 0,
+        "context_length": 0,
+        "batch_size": 1,
+    }
     assert data["results"][0]["observed_kv_read_tokens"] == 0
     assert data["results"][0]["cache_hit_validated"] is True
 
@@ -2617,3 +2625,6 @@ def test_skipped_case_is_diagnostic_not_result(tmp_path):
     }
     assert data["skipped_cases"][0]["origin_rank"] == 1
     assert data["skipped_cases"][0]["case"] not in [entry["case"] for entry in data["results"]]
+    # Skipped cases also carry the Dynamo-facing `point`/`skipped_reason` keys.
+    assert data["skipped_cases"][0]["point"]["point_type"] == "prefill"
+    assert data["skipped_cases"][0]["skipped_reason"] == "scheduled_batch_shape_mismatch"

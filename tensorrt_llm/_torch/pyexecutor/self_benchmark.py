@@ -932,10 +932,27 @@ class SelfBenchmark:
         }
 
     @staticmethod
+    def _point_from_case_dict(case: dict) -> dict:
+        # Project the internal `BenchmarkCase` onto Dynamo's `point` shape
+        # (point_type + dims). Dynamo's TRT-LLM self-benchmark consumer keys the
+        # emitted results by `point`/`point_type` (matching the vLLM instrumented
+        # scheduler payload), so we emit it alongside `case` to keep the JSON
+        # consumable by that normalizer without changing the engine's internals.
+        return {
+            "point_type": case.get("case_type"),
+            "isl": case.get("isl", 0),
+            "kv_read_tokens": case.get("kv_read_tokens", 0),
+            "context_length": case.get("context_length", 0),
+            "batch_size": case.get("batch_size", 1),
+        }
+
+    @staticmethod
     def _serialize_result(result: BenchmarkTrialResult) -> dict:
+        case = asdict(result.case)
         return {
             "trial_id": result.trial_id,
-            "case": asdict(result.case),
+            "case": case,
+            "point": SelfBenchmark._point_from_case_dict(case),
             "iteration_stats": list(result.iteration_stats),
             "observed_kv_read_tokens": result.observed_kv_read_tokens,
             "cache_hit_validated": result.cache_hit_validated,
@@ -950,6 +967,11 @@ class SelfBenchmark:
             self._normalize_admission_reason(skipped_case.get("reason")),
         )
         serialized["admission"] = admission
+        case = serialized.get("case")
+        if isinstance(case, dict):
+            serialized["point"] = self._point_from_case_dict(case)
+        # `skipped_reason` mirrors `reason` for the Dynamo consumer's vocabulary.
+        serialized.setdefault("skipped_reason", serialized.get("reason"))
         return serialized
 
     def _serialize_abort(self) -> Optional[dict]:
