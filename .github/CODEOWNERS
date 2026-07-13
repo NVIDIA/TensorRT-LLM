@@ -2,7 +2,7 @@
 # PRECEDENCE: last matching pattern wins — fallback first, module rules next, governance last.
 #
 #   Domain (in file order)   Handle
-#   Engineering basline/ fallback / untriaged     @NVIDIA/trt-llm-devs   (global `*`, declared FIRST; incl. deprecating TRT backend)
+#   Engineering baseline/ fallback / untriaged     @NVIDIA/trt-llm-devs   (global `*`, declared FIRST; incl. deprecating TRT backend)
 #   Multi-GPU CI gate        			  @NVIDIA/trt-llm-multi-gpu-ci-review
 #   Infra                    			  @NVIDIA/trt-llm-infra-devs
 #   Agent config             			  @NVIDIA/trt-llm-agent-devs
