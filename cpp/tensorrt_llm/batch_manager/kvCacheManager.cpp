@@ -3371,43 +3371,28 @@ void KVCacheManager::allocatePools(bool useUvm)
 
     // Code in the attention kernels is cleaner if we can access the KV values and block scales separately.
     mBlockPoolPointers = BufferManager::cpu(ITensor::makeShape({numKVPools, 2}), TRTDataType<void*>::value);
-    // Attention expects scale-pointer rows to align one-to-one with KV-pool rows. Pools without block scales use
-    // null pointers in those rows.
-    auto const numAlignedBlockScalePools = numBlockScalePools > 0 ? numKVPools : 0;
     mBlockScalePoolPointers
-        = BufferManager::cpu(ITensor::makeShape({numAlignedBlockScalePools, 2}), TRTDataType<void*>::value);
+        = BufferManager::cpu(ITensor::makeShape({numBlockScalePools, 2}), TRTDataType<void*>::value);
 
     auto poolPtrsRange = BufferRange<void*>(*mBlockPoolPointers);
     auto blockScalePtrsRange = BufferRange<void*>(*mBlockScalePoolPointers);
-    std::fill(blockScalePtrsRange.begin(), blockScalePtrsRange.end(), nullptr);
     SizeType32 kvPoolIdx = 0;
-    std::map<SizeType32, std::vector<SizeType32>> kvPoolIndicesByWindow;
-    std::map<SizeType32, SizeType32> numBlockScalePoolsByWindow;
+    SizeType32 blockScalePoolIdx = 0;
 
     for (SizeType32 poolIdx = 0; poolIdx < numPools; poolIdx++)
     {
         auto const& pool = mBlockManager.getPool(poolIdx);
+        auto& outIdx = pool.containsBlockScales ? blockScalePoolIdx : kvPoolIdx;
+        auto& outRange = pool.containsBlockScales ? blockScalePtrsRange : poolPtrsRange;
         if (pool.containsIndexerKCache)
         {
             mIndexerKCachePoolPointers = pool.primaryPtr;
         }
-        else if (pool.containsBlockScales)
-        {
-            auto const windowSize = mBlockManager.getPoolWindowSize(poolIdx);
-            auto const blockScalePoolIdx = numBlockScalePoolsByWindow[windowSize]++;
-            auto const& kvPoolIndices = kvPoolIndicesByWindow.at(windowSize);
-            TLLM_CHECK_WITH_INFO(blockScalePoolIdx < static_cast<SizeType32>(kvPoolIndices.size()),
-                "Block-scale pool %d for window size %d has no matching KV pool", blockScalePoolIdx, windowSize);
-            auto const outIdx = kvPoolIndices.at(blockScalePoolIdx);
-            blockScalePtrsRange[outIdx * 2] = pool.primaryPtr->data();
-            blockScalePtrsRange[outIdx * 2 + 1] = pool.secondaryPtr ? pool.secondaryPtr->data() : nullptr;
-        }
         else
         {
-            poolPtrsRange[kvPoolIdx * 2] = pool.primaryPtr->data();
-            poolPtrsRange[kvPoolIdx * 2 + 1] = pool.secondaryPtr ? pool.secondaryPtr->data() : nullptr;
-            kvPoolIndicesByWindow[mBlockManager.getPoolWindowSize(poolIdx)].push_back(kvPoolIdx);
-            ++kvPoolIdx;
+            outRange[outIdx * 2] = pool.primaryPtr->data();
+            outRange[outIdx * 2 + 1] = pool.secondaryPtr ? pool.secondaryPtr->data() : nullptr;
+            outIdx++;
         }
     }
 

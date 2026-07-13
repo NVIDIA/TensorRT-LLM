@@ -114,6 +114,55 @@ def _warn_if_unsupported_v1_kv_cache_event_hash_algo(hash_algo: str) -> None:
         "event hashes.")
 
 
+def _merge_kv_cache_pool_pointers(
+    kv_cache_pool_pointers: torch.Tensor,
+    block_scale_pool_pointers: torch.Tensor,
+    layer_to_pool_mapping: torch.Tensor,
+    layer_pool_dtypes: Sequence["DataType"],
+) -> torch.Tensor:
+    """Align compact block-scale pointers with compact KV-pool pointers."""
+    if block_scale_pool_pointers.numel() == 0:
+        return kv_cache_pool_pointers
+
+    if (kv_cache_pool_pointers.ndim != 2 or block_scale_pool_pointers.ndim != 2
+            or kv_cache_pool_pointers.shape[1:]
+            != block_scale_pool_pointers.shape[1:]
+            or kv_cache_pool_pointers.dtype != block_scale_pool_pointers.dtype
+            or kv_cache_pool_pointers.device
+            != block_scale_pool_pointers.device):
+        raise RuntimeError(
+            "KV-cache data and block-scale pointer tables are incompatible")
+    if layer_to_pool_mapping.shape[0] != len(layer_pool_dtypes):
+        raise RuntimeError(
+            "KV-cache layer mapping and layer dtype counts do not match")
+
+    dtype_by_pool: Dict[int, "DataType"] = {}
+    for pool_idx, pool_dtype in zip(layer_to_pool_mapping[:, 0].tolist(),
+                                    layer_pool_dtypes):
+        previous_dtype = dtype_by_pool.setdefault(pool_idx, pool_dtype)
+        if previous_dtype != pool_dtype:
+            raise RuntimeError(
+                f"KV-cache pool {pool_idx} is mapped to multiple dtypes")
+
+    num_data_pools = kv_cache_pool_pointers.shape[0]
+    if sorted(dtype_by_pool) != list(range(num_data_pools)):
+        raise RuntimeError(
+            "KV-cache layer mapping is not aligned with compact data-pool rows")
+
+    fp4_pool_indices = [
+        pool_idx for pool_idx in range(num_data_pools)
+        if dtype_by_pool[pool_idx] == DataType.NVFP4
+    ]
+    if len(fp4_pool_indices) != block_scale_pool_pointers.shape[0]:
+        raise RuntimeError(
+            "NVFP4 KV-cache pool and block-scale pointer counts do not match")
+
+    aligned_scale_pool_pointers = torch.zeros_like(kv_cache_pool_pointers)
+    aligned_scale_pool_pointers[fp4_pool_indices] = block_scale_pool_pointers
+    return torch.stack([kv_cache_pool_pointers, aligned_scale_pool_pointers],
+                       dim=-1)
+
+
 class BaseResourceManager(ABC):
 
     @abstractmethod
@@ -621,15 +670,29 @@ class KVCacheManager(BaseResourceManager):
 
         self.impl.allocate_pools(False)
         self.kv_cache_pool_pointers = self.impl.get_block_pool_pointers()
+        self.kv_cache_pool_mapping = self.impl.get_layer_to_pool_mapping()
         kv_cache_block_scale_pool_pointers = self.impl.get_block_scale_pool_pointers(
         )
         if kv_cache_block_scale_pool_pointers.numel() > 0:
-            self.kv_cache_pool_pointers = torch.stack([
-                self.kv_cache_pool_pointers, kv_cache_block_scale_pool_pointers
-            ],
-                                                      dim=-1)
+            dtype_by_window = {
+                config.window_size: config.dtype
+                for config in self.impl.pool_configurations
+            }
+            # Match the local layer order used by C++ to build the pointer
+            # mapping. The Python window helpers additionally account for
+            # global PP layer IDs and therefore do not describe these rows.
+            layer_pool_dtypes = [
+                dtype_by_window[self.max_attention_window_vec[
+                    layer_offset % len(self.max_attention_window_vec)]]
+                for layer_offset in range(self.num_local_layers)
+            ]
+            self.kv_cache_pool_pointers = _merge_kv_cache_pool_pointers(
+                self.kv_cache_pool_pointers,
+                kv_cache_block_scale_pool_pointers,
+                self.kv_cache_pool_mapping,
+                layer_pool_dtypes,
+            )
 
-        self.kv_cache_pool_mapping = self.impl.get_layer_to_pool_mapping()
         self.num_pools = self.impl.num_pools
         self.max_blocks_per_seq = self.impl.max_blocks_per_seq
         self.enable_block_reuse = kv_cache_config.enable_block_reuse

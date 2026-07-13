@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import os
 import pathlib
 import subprocess
@@ -13,7 +16,7 @@ import tensorrt_llm
 import tensorrt_llm.bindings
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
-    KVCacheManager, PeftCacheManager,
+    KVCacheManager, PeftCacheManager, _merge_kv_cache_pool_pointers,
     _warn_if_unsupported_v1_kv_cache_event_hash_algo)
 from tensorrt_llm.bindings import LayerType
 from tensorrt_llm.bindings import ModelConfig as ModelConfigCpp
@@ -64,6 +67,72 @@ def test_v1_kv_cache_event_hash_algo_no_warning_for_auto():
             KV_CACHE_HASH_ALGO_AUTO)
 
     warning.assert_not_called()
+
+
+class TestMergeKVCachePoolPointers(unittest.TestCase):
+
+    def test_no_scale_pointers_preserve_data_table(self):
+        data_pointers = torch.tensor([[11, 12], [21, 22]])
+
+        merged = _merge_kv_cache_pool_pointers(
+            data_pointers,
+            torch.empty(0, dtype=data_pointers.dtype),
+            torch.tensor([[0, 0], [1, 0]]),
+            [DataType.INT8, DataType.INT8],
+        )
+
+        self.assertIs(merged, data_pointers)
+        self.assertEqual(merged.ndim, 2)
+
+    def test_mixed_int8_nvfp4_pools_align_scale_rows(self):
+        data_pointers = torch.tensor([[11, 12], [21, 22]])
+        scale_pointers = torch.tensor([[31, 32]])
+        layer_to_pool_mapping = torch.tensor([[0, 0], [1, 0]])
+
+        merged = _merge_kv_cache_pool_pointers(
+            data_pointers,
+            scale_pointers,
+            layer_to_pool_mapping,
+            [DataType.INT8, DataType.NVFP4],
+        )
+
+        expected = torch.tensor([
+            [[11, 0], [12, 0]],
+            [[21, 31], [22, 32]],
+        ])
+        self.assertEqual(merged.shape, (2, 2, 2))
+        self.assertTrue(torch.equal(merged, expected))
+
+    def test_shared_nvfp4_pool_consumes_one_scale_row(self):
+        data_pointers = torch.tensor([[11, 12], [21, 22]])
+        scale_pointers = torch.tensor([[31, 32]])
+        layer_to_pool_mapping = torch.tensor([[0, 0], [0, 0], [1, 0]])
+
+        merged = _merge_kv_cache_pool_pointers(
+            data_pointers,
+            scale_pointers,
+            layer_to_pool_mapping,
+            [DataType.NVFP4, DataType.NVFP4, DataType.INT8],
+        )
+
+        expected = torch.tensor([
+            [[11, 31], [12, 32]],
+            [[21, 0], [22, 0]],
+        ])
+        self.assertTrue(torch.equal(merged, expected))
+
+    def test_non_compact_data_pool_ids_raise(self):
+        data_pointers = torch.tensor([[11, 12], [21, 22]])
+        scale_pointers = torch.tensor([[31, 32]])
+        layer_to_pool_mapping = torch.tensor([[0, 0], [2, 0]])
+
+        with self.assertRaises(RuntimeError):
+            _merge_kv_cache_pool_pointers(
+                data_pointers,
+                scale_pointers,
+                layer_to_pool_mapping,
+                [DataType.INT8, DataType.NVFP4],
+            )
 
 
 class TestResourceManager(unittest.TestCase):

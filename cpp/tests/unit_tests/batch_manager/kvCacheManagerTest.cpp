@@ -871,12 +871,10 @@ TEST_F(KVCacheManagerTest, FP4AttentionWithInt8RecurrentStatesPoolTest)
     ASSERT_NE(blockPoolPointers, nullptr);
     ASSERT_NE(blockScalePoolPointers, nullptr);
     EXPECT_EQ(blockPoolPointers->getShape().d[0], 2);
-    EXPECT_EQ(blockScalePoolPointers->getShape().d[0], 2);
+    EXPECT_EQ(blockScalePoolPointers->getShape().d[0], 1);
     auto const blockScalePoolPointersRange = tr::BufferRange<void*>(*blockScalePoolPointers);
-    EXPECT_EQ(blockScalePoolPointersRange[0], nullptr);
+    EXPECT_NE(blockScalePoolPointersRange[0], nullptr);
     EXPECT_EQ(blockScalePoolPointersRange[1], nullptr);
-    EXPECT_NE(blockScalePoolPointersRange[2], nullptr);
-    EXPECT_EQ(blockScalePoolPointersRange[3], nullptr);
 
     auto const layerToPoolMapping = kvCacheManager.getLayerToPoolMapping();
     ASSERT_NE(layerToPoolMapping, nullptr);
