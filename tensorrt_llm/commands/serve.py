@@ -386,8 +386,8 @@ def launch_server(
         multimodal_server_config: Optional[MultimodalServerConfig] = None,
         served_model_name: Optional[str] = None,
         allow_request_chat_template: bool = False,
-        input_processor_workers: int = 8,
-        media_load_workers: int = 8):
+        num_input_processor_workers: int = 8,
+        num_media_load_workers: int = 8):
 
     backend = llm_args["backend"]
     model = served_model_name or llm_args["model"]
@@ -437,8 +437,8 @@ def launch_server(
             multimodal_server_config=multimodal_server_config,
             chat_template=chat_template,
             allow_request_chat_template=allow_request_chat_template,
-            input_processor_workers=input_processor_workers,
-            media_load_workers=media_load_workers)
+            input_processor_workers=num_input_processor_workers,
+            media_load_workers=num_media_load_workers)
         _apply_fastapi_middlewares(server.app, middleware)
 
         # Optionally disable GC (default: not disabled)
@@ -595,6 +595,107 @@ def launch_mm_encoder_server(
     uvloop.run(server(host, port))
 
 
+# HF causal-LM architecture -> TRT-LLM text-embedding architecture. The embeddings
+# subcommand declares embedding intent (cf. SGLang --is-embedding); this maps known
+# sentence-transformers decoder backbones onto their pooling+normalize wrapper class.
+# To support another decoder embedder, add its HF architecture here and a matching
+# `*ForTextEmbedding` model class (see Qwen3ForTextEmbedding in modeling_qwen3.py).
+# Architectures absent from this map are left as declared (the model self-routes).
+_EMBEDDING_ARCH_MAP = {
+    "Qwen3ForCausalLM": "Qwen3ForTextEmbedding",
+}
+
+
+def _resolve_embedding_architecture_override(
+        model: str,
+        trust_remote_code: bool,
+        revision: Optional[str] = None) -> Optional[dict]:
+    """Return a `model_kwargs` architecture override for a known embedder.
+
+    Returns `None` to leave the model's declared architecture unchanged.
+    Qwen3-Embedding ships as `Qwen3ForCausalLM` (a causal decoder) plus a
+    sentence-transformers pooling/normalize pipeline. Overriding `architectures`
+    flips both the model-class selection (`get_model_architecture`) and the
+    encoder-vs-generation routing (`is_generation_model`) with one change.
+    """
+    try:
+        from transformers import AutoConfig
+        hf_config = AutoConfig.from_pretrained(
+            model, trust_remote_code=trust_remote_code, revision=revision)
+        architectures = getattr(hf_config, "architectures", None) or []
+    except Exception as e:  # noqa: BLE001 - config read is best-effort
+        logger.warning(
+            f"Could not read model config for embedding routing ({model}): {e}")
+        return None
+
+    if not architectures:
+        return None
+    target = _EMBEDDING_ARCH_MAP.get(architectures[0])
+    if target is None:
+        return None
+
+    # Best-effort sanity check on a local checkpoint: warn (don't fail) if the
+    # sentence-transformers pooling layout is absent. The subcommand is explicit
+    # embedding intent, so we still proceed with last-token pooling + L2 norm.
+    if os.path.isdir(model):
+        pooling_cfg = os.path.join(model, "1_Pooling", "config.json")
+        if not os.path.isfile(pooling_cfg):
+            logger.warning(
+                f"{model} maps to {target} but has no 1_Pooling/config.json; "
+                "proceeding with last-token pooling + L2 normalize.")
+
+    logger.info(f"Embedding routing: overriding architecture "
+                f"{architectures[0]} -> {target}")
+    return {"architectures": [target]}
+
+
+def launch_embedding_server(
+    host: str,
+    port: int,
+    llm_args: dict,
+    max_queue_delay: float,
+    max_queue_size: int,
+    metadata_server_cfg: Optional[MetadataServerConfig] = None,
+):
+    model = llm_args["model"]
+    llm_args.pop("build_config", None)
+    # encode_only is forced on below; drop any value coming from --config to avoid
+    # a duplicate keyword argument.
+    llm_args.pop("encode_only", None)
+
+    # Sentence-transformers decoder embedders (e.g. Qwen3-Embedding) declare a
+    # causal-LM architecture; remap it to the text-embedding model class so the
+    # forward returns pooled+normalized sentence embeddings instead of LM logits.
+    override = _resolve_embedding_architecture_override(
+        model, llm_args.get("trust_remote_code", False),
+        llm_args.get("revision"))
+    if override is not None:
+        model_kwargs = dict(llm_args.get("model_kwargs") or {})
+        if "architectures" in model_kwargs:
+            # A user-supplied model_kwargs.architectures (e.g. via --config) wins;
+            # log so the suppressed auto-remap isn't a silent surprise.
+            logger.info(
+                "Embedding routing: keeping user-supplied model_kwargs "
+                f"architectures={model_kwargs['architectures']} (auto-remap to "
+                f"{override['architectures']} suppressed).")
+        else:
+            model_kwargs["architectures"] = override["architectures"]
+        llm_args["model_kwargs"] = model_kwargs
+
+    # Encoder-only (embedding) serving uses the synchronous llm.encode() fast path
+    # (no KV cache / sampler / scheduler), coalesced behind the dynamic batcher.
+    llm = PyTorchLLM(encode_only=True, **llm_args)
+
+    server = OpenAIServer(generator=llm,
+                          model=model,
+                          server_role=ServerRole.EMBEDDING,
+                          metadata_server_cfg=metadata_server_cfg,
+                          tool_parser=None,
+                          embedding_max_queue_delay=max_queue_delay,
+                          embedding_max_queue_size=max_queue_size)
+    asyncio.run(server(host, port))
+
+
 def launch_visual_gen_server(
         host: str,
         port: int,
@@ -612,6 +713,16 @@ def launch_visual_gen_server(
         visual_gen_args: Optional validated VisualGenArgs for model configuration.
         metadata_server_cfg: Optional metadata server configuration.
     """
+    # Only global rank 0 serves HTTP; in external multi-rank launch ranks > 0
+    # must become workers before binding, else every rank on a multi-GPU node
+    # races the same port and all but one die EADDRINUSE. VisualGen() on a
+    # worker rank never returns (sys.exit in __init__).
+    from tensorrt_llm._torch.visual_gen.executor import _detect_external_launch
+    ext = _detect_external_launch()
+    if ext is not None and ext[0] != 0:
+        VisualGen(model=model, args=visual_gen_args)
+        return
+
     # Reserve the listening (host, port) by binding the socket *before*
     # constructing the VisualGen pipeline, then hand the bound socket to
     # uvicorn. VisualGen initialization can take many minutes; if we deferred
@@ -818,16 +929,14 @@ class ChoiceWithAlias(click.Choice):
                   help="Number of workers to postprocess raw responses "
                   "to comply with OpenAI protocol.",
                   status="prototype")
-@stability_option("--input-processor-workers",
-                  "input_processor_workers",
+@stability_option("--num_input_processor_workers",
                   type=click.IntRange(min=1),
                   default=8,
                   help="Size of the dedicated thread pool that runs the HF "
                   "input processor (multimodal preprocess) on the chat "
                   "and completion endpoints.",
                   status="prototype")
-@stability_option("--media-load-workers",
-                  "media_load_workers",
+@stability_option("--num_media_load_workers",
                   type=click.IntRange(min=1),
                   default=8,
                   help="Size of the dedicated thread pool that decodes media "
@@ -1010,8 +1119,8 @@ def serve(
         moe_expert_parallel_size: Optional[int],
         moe_cluster_parallel_size: Optional[int], gpus_per_node: Optional[int],
         free_gpu_memory_fraction: float, kv_cache_dtype: str,
-        num_postprocess_workers: int, input_processor_workers: int,
-        media_load_workers: int, trust_remote_code: bool,
+        num_postprocess_workers: int, num_input_processor_workers: int,
+        num_media_load_workers: int, trust_remote_code: bool,
         revision: Optional[str], extra_llm_api_options: Optional[str],
         reasoning_parser: Optional[str], tool_parser: Optional[str],
         metadata_server_config_file: Optional[str], server_role: Optional[str],
@@ -1213,8 +1322,8 @@ def serve(
                 multimodal_server_config,
                 served_model_name=served_model_name,
                 allow_request_chat_template=allow_request_chat_template,
-                input_processor_workers=input_processor_workers,
-                media_load_workers=media_load_workers)
+                num_input_processor_workers=num_input_processor_workers,
+                num_media_load_workers=num_media_load_workers)
 
     def _serve_visual_gen():
         parsed_visual_gen_args = (VisualGenArgs.from_yaml(visual_gen_args)
@@ -1379,6 +1488,123 @@ def serve_encoder(model: str, host: str, port: int, log_level: str,
         encoder_args,
         metadata_server_cfg,
         allow_request_chat_template=allow_request_chat_template)
+
+
+@click.command("embeddings")
+@click.argument("model", type=str)
+@click.option("--host",
+              type=str,
+              default="localhost",
+              help="Hostname of the server.")
+@click.option("--port", type=int, default=8000, help="Port of the server.")
+@click.option('--log_level',
+              type=click.Choice(severity_map.keys()),
+              default='info',
+              help="The logging level.")
+@click.option("--max_batch_size",
+              type=int,
+              default=BuildConfig.model_fields["max_batch_size"].default,
+              help="Maximum batch size coalesced into a single encode() call.")
+@click.option(
+    "--max_num_tokens",
+    type=int,
+    default=8192,
+    help="Maximum number of batched input tokens in each encode() call.")
+@click.option(
+    "--max_queue_delay",
+    type=click.FloatRange(min=0.0),
+    default=0.005,
+    help="Dynamic-batching hold window in seconds: how long an incoming request "
+    "waits for others to join its batch before being dispatched (mirrors Triton's "
+    "max_queue_delay_microseconds).")
+@click.option(
+    "--max_queue_size",
+    type=click.IntRange(min=1),
+    default=2048,
+    help="Maximum number of in-flight queued requests; further requests are "
+    "rejected with HTTP 429 (mirrors Triton's max_queue_size).")
+@click.option("--trust_remote_code",
+              is_flag=True,
+              default=False,
+              help="Flag for HF transformers.")
+@click.option(
+    "--config",
+    "--extra_llm_api_options",
+    "extra_llm_api_options",
+    type=str,
+    default=None,
+    help="Path to a YAML configuration file. Explicit CLI flags take precedence "
+    "over values in this file.")
+@click.option("--hf_revision",
+              "--revision",
+              "revision",
+              type=str,
+              default=None,
+              help="The revision to use for the HuggingFace model "
+              "(branch name, tag name, or commit id).")
+@click.option("--metadata_server_config_file",
+              type=str,
+              default=None,
+              help="Path to metadata server config file")
+@click.option("--telemetry/--no-telemetry",
+              default=True,
+              help="Enable or disable anonymous usage telemetry collection.")
+def serve_embedding(
+        model: str, host: str, port: int, log_level: str, max_batch_size: int,
+        max_num_tokens: int, max_queue_delay: float, max_queue_size: int,
+        trust_remote_code: bool, extra_llm_api_options: Optional[str],
+        revision: Optional[str], metadata_server_config_file: Optional[str],
+        telemetry: bool):
+    """Run an OpenAI-compatible /v1/embeddings server for encoder-only models.
+
+    Coalesces concurrent requests with a dynamic batcher and serves them through
+    the synchronous llm.encode() fast path (no KV cache / sampler / scheduler).
+    Single-GPU only: the command does not expose tensor/pipeline parallelism.
+
+    MODEL: model name | HF checkpoint path
+    """
+    logger.set_level(log_level)
+
+    explicit_cli_keys = collect_explicit_cli_keys(exclude=("config", ))
+
+    # Single-GPU, encode-only: tensor_parallel_size is fixed to 1 and not exposed as a
+    # flag (the in-process encode path has no multi-GPU worker proxy). gpus_per_node is
+    # auto-detected by get_llm_args; free_gpu_memory_fraction is omitted because the
+    # encode path allocates no KV cache. All remain settable via --config if needed.
+    llm_args, _ = get_llm_args(model=model,
+                               max_batch_size=max_batch_size,
+                               max_num_tokens=max_num_tokens,
+                               trust_remote_code=trust_remote_code,
+                               revision=revision,
+                               tensor_parallel_size=1,
+                               telemetry=telemetry,
+                               explicit_cli_keys=explicit_cli_keys)
+
+    extra_dict = {}
+    if extra_llm_api_options is not None:
+        with open(extra_llm_api_options, 'r') as f:
+            extra_dict = yaml.safe_load(f)
+    llm_args = update_llm_args_with_extra_dict(
+        llm_args, extra_dict, explicit_cli_keys=explicit_cli_keys)
+
+    # The CLI does not expose TP/PP/CP, but a --config YAML could still set them. Reject
+    # that explicitly rather than hang: the in-process encode-only path cannot shard.
+    effective_tp = llm_args.get("tensor_parallel_size") or 1
+    effective_pp = llm_args.get("pipeline_parallel_size") or 1
+    effective_cp = llm_args.get("context_parallel_size") or 1
+    if effective_tp > 1 or effective_pp > 1 or effective_cp > 1:
+        raise click.BadParameter(
+            "The embeddings server is single-GPU only; multi-GPU (TP/PP/CP) is not "
+            f"supported yet. Got tensor_parallel_size={effective_tp}, "
+            f"pipeline_parallel_size={effective_pp}, "
+            f"context_parallel_size={effective_cp} from --config.",
+            param_hint="config")
+
+    metadata_server_cfg = parse_metadata_server_config_file(
+        metadata_server_config_file)
+
+    launch_embedding_server(host, port, llm_args, max_queue_delay,
+                            max_queue_size, metadata_server_cfg)
 
 
 @click.command("disaggregated")
@@ -1752,7 +1978,8 @@ main = DefaultGroup(
         "serve": serve,
         "disaggregated": disaggregated,
         "disaggregated_mpi_worker": disaggregated_mpi_worker,
-        "mm_embedding_serve": serve_encoder
+        "mm_embedding_serve": serve_encoder,
+        "embeddings": serve_embedding
     })
 
 if __name__ == "__main__":

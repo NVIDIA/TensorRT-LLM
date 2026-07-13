@@ -930,6 +930,11 @@ class PyExecutor:
         # normal dummy add-forward-terminate lifecycle handles taper-down.
         # Only relevant in benchmark disagg mode; False otherwise.
         self._benchmark_fill_phase_active = self.is_benchmark_disagg
+        # Set when a blocking generation transfer returns during benchmark
+        # fill. The gate consumes this signal to retry immediately instead of
+        # adding an unnecessary polling delay after synchronous progress.
+        self._sync_disagg_transfer_made_progress = False
+        self._benchmark_sync_progress_global = False
         # Slow-start admission cap for benchmark disagg fill (see
         # _pop_from_waiting_queue).  0 = uninitialised; first throttled iter
         # seeds it to tp_size and each subsequent iter doubles it.
@@ -3247,6 +3252,16 @@ class PyExecutor:
             getattr(kv_cache_manager, "tokens_per_block", None),
         )
 
+    @staticmethod
+    def _is_disagg_gen_only_no_context_benchmark() -> bool:
+        """Return whether ``gen_only_no_context`` skips KV transfer."""
+        return os.getenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY") == "1"
+
+    def _uses_async_disagg_gen_transfer(self) -> bool:
+        """Return whether generation KV transfers can remain in flight."""
+        return (not self._is_disagg_gen_only_no_context_benchmark() and
+                os.getenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP") != "1")
+
     def _uses_kv_manager_v2(self) -> bool:
         explicit_flag = getattr(self, "_is_kv_manager_v2", None)
         if explicit_flag is not None:
@@ -3257,6 +3272,12 @@ class PyExecutor:
     def _apply_disagg_transfer_admission(
         self, fitting_disagg_gen_init_requests: List[LlmRequest]
     ) -> Tuple[List[LlmRequest], bool]:
+        # gen_only_no_context has no CTX worker and does not transfer data.
+        # Real synchronous gen_only transfers still honor the budget to bound
+        # the number of blocking transfers started in one executor iteration.
+        if self._is_disagg_gen_only_no_context_benchmark():
+            return fitting_disagg_gen_init_requests, False
+
         controller = self._get_disagg_transfer_admission_controller()
         if not (getattr(self, "kv_cache_transceiver", None)
                 and controller.enabled() and fitting_disagg_gen_init_requests):
@@ -3304,6 +3325,27 @@ class PyExecutor:
         except (AttributeError, TypeError, ValueError):
             return 1
 
+    def _allgather_model_parallel_status(
+            self, local_status: Tuple[int, bool]) -> List[Tuple[int, bool]]:
+        """Gather a status over the TP+CP scheduling group.
+
+        Args:
+            local_status: Caller-defined ``(state, flag)`` pair from this rank.
+                The fill gate uses ``(ready, synchronous_progress)`` and the
+                fail-fast path uses ``(all_fetched, terminal_no_fit)``.
+
+        Returns:
+            One status pair per TP+CP rank in the current pipeline-parallel
+            slice. A singleton group returns ``[local_status]``.
+        """
+        # CP may coexist with TP; tp_cp_allgather covers both CP-only and
+        # TP+CP configurations.
+        if self._dist_size(self.dist, "cp_size") > 1:
+            return self.dist.tp_cp_allgather(local_status)
+        if self._dist_size(self.dist, "tp_size") > 1:
+            return self.dist.tp_allgather(local_status)
+        return [local_status]
+
     def _sync_disagg_gen_status_entry(self, local_need_check: bool) -> int:
         if self._dist_size(self.dist, "world_size") > 1:
             return self.dist.allreduce(int(local_need_check), op=ReduceOp.MAX)
@@ -3324,6 +3366,13 @@ class PyExecutor:
             all_gen_first: bool) -> None:
         local_need_check = (num_fitting_reqs == 0
                             and not fitting_disagg_gen_init_requests)
+
+        # A synchronous GEN receive is rank-local and blocking. One rank can
+        # still be receiving while another is idle, so entering either the
+        # generation or context progress collective here is unsafe.
+        if not self._uses_async_disagg_gen_transfer():
+            return
+
         local_need_gen_check = (local_need_check
                                 and wait_for_disagg_gen_transfer_progress)
 
@@ -3332,8 +3381,8 @@ class PyExecutor:
         if any_need_gen_check > 0:
             if local_need_gen_check:
                 logger.debug(
-                    "Waiting for generation KV cache transfer progress to free "
-                    "disagg admission budget")
+                    "Waiting for generation KV cache transfer progress to "
+                    "free disagg admission budget")
             self._check_disagg_gen_cache_transfer_status(1)
             return
 
@@ -3355,7 +3404,51 @@ class PyExecutor:
                 # blocking on un-finished ones.
                 self._check_disagg_ctx_cache_transfer_status(0)
 
+    def _sync_gen_only_benchmark_has_insufficient_kv(
+            self, scheduler_fitting_disagg_gen_init_requests: List[LlmRequest],
+            wait_for_disagg_gen_transfer_progress: bool) -> bool:
+        """Return whether benchmark fill has terminal KV exhaustion.
+
+        Model-parallel ranks can make different local scheduling decisions.
+        Every rank must therefore vote before entering the collective error-
+        handling path. One terminal rank prevents the global benchmark fill
+        gate from opening. The vote is fill-only to avoid adding a collective
+        to every decode iteration after the gate opens.
+
+        Args:
+            scheduler_fitting_disagg_gen_init_requests: Generation INIT
+                requests that fit KV capacity before transfer admission. A
+                nonempty list means KV capacity exists even if transfer
+                admission temporarily defers every request.
+            wait_for_disagg_gen_transfer_progress: Whether active generation
+                transfers are consuming the admission budget and transfer
+                progress can unblock a deferred request.
+
+        Returns:
+            True when every TP+CP rank has fetched its full benchmark queue and
+            at least one rank has an INIT request that cannot fit KV capacity
+            and has no transfer progress that can unblock it; otherwise False.
+        """
+        if (self.benchmark_req_queues_size <= 0 or self.is_warmup
+                or not self._benchmark_fill_phase_active):
+            return False
+
+        local_has_stuck = any(req.is_disagg_generation_init_state
+                              for req in self.active_requests)
+        local_all_fetched = (self.num_fetch_requests
+                             >= self.benchmark_req_queues_size)
+        local_terminal_no_fit = (local_has_stuck and
+                                 not scheduler_fitting_disagg_gen_init_requests
+                                 and not wait_for_disagg_gen_transfer_progress)
+        local_status = (local_all_fetched, local_terminal_no_fit)
+
+        all_rank_status = self._allgather_model_parallel_status(local_status)
+        all_ranks_fetched = all(status[0] for status in all_rank_status)
+        any_rank_terminal_no_fit = any(status[1] for status in all_rank_status)
+        return all_ranks_fetched and any_rank_terminal_no_fit
+
     def _prepare_and_schedule_batch(self):
+        self._sync_disagg_transfer_made_progress = False
         new_requests = self._fetch_and_activate_new_requests()
         if self.should_stop_processing:
             return None, None
@@ -3418,8 +3511,27 @@ class PyExecutor:
             # with dummy draft tokens to make the scheduler aware of the fact
             # that speculation is about to happen.
             self._prepare_draft_requests()
+        elif (getattr(self, "model_engine", None) is not None
+              and self.model_engine.is_spec_decode
+              and self.max_total_draft_tokens > 0):
+            # One-model speculative decoding (MTP / Eagle3 one-model) has no separate
+            # drafter, so the block above is skipped -- but the model still verifies
+            # max_total_draft_tokens draft tokens per generation step. The C++ micro-batch
+            # scheduler budgets each gen request as beam_width + getNumDraftTokens(); without
+            # populating the draft-token count here it under-reserves and, under chunked
+            # prefill + overlap scheduler, the forward's uniform (1 + runtime_draft_len)
+            # build overshoots max_num_tokens (total_num_tokens > max_num_tokens). Mirror the
+            # two-model normalization so scheduling reserves the correct token budget.
+            # model_engine is guarded first so partially-constructed executors in unit tests
+            # (which may not set model_engine) do not raise AttributeError.
+            for request in self.active_requests:
+                if request.state not in (
+                        LlmRequestState.GENERATION_IN_PROGRESS,
+                        LlmRequestState.DISAGG_GENERATION_INIT):
+                    continue
+                request.draft_tokens = [0] * self.max_total_draft_tokens
 
-        scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs = self._schedule(
+        scheduled_batch, scheduler_fitting_disagg_gen_init_requests, num_fitting_reqs = self._schedule(
         )
 
         if self.drafter is not None and not self.use_spec_decode:
@@ -3428,18 +3540,19 @@ class PyExecutor:
 
         if self.kv_cache_transceiver:
             wait_for_disagg_gen_transfer_progress = False
-            fitting_disagg_gen_init_requests, wait_for_disagg_gen_transfer_progress = (
+            admitted_disagg_gen_init_requests, wait_for_disagg_gen_transfer_progress = (
                 self._apply_disagg_transfer_admission(
-                    fitting_disagg_gen_init_requests))
-            # For requests that are fitting disagg gen init, also prepare resources for KV cache manager
-            self._prepare_disagg_gen_init(fitting_disagg_gen_init_requests)
+                    scheduler_fitting_disagg_gen_init_requests))
+            # Prepare KV cache manager resources only for requests admitted
+            # into the transfer window this iteration.
+            self._prepare_disagg_gen_init(admitted_disagg_gen_init_requests)
 
             all_gen_first = self.active_requests and all(
                 req.py_disaggregated_params and req.py_disaggregated_params.
                 schedule_style == DisaggScheduleStyle.GENERATION_FIRST
                 for req in self.active_requests)
             self._check_disagg_transfer_progress_when_idle(
-                num_fitting_reqs, fitting_disagg_gen_init_requests,
+                num_fitting_reqs, admitted_disagg_gen_init_requests,
                 wait_for_disagg_gen_transfer_progress, all_gen_first)
 
             # In gen-only benchmark mode, all requests must fit in KV cache
@@ -3447,30 +3560,25 @@ class PyExecutor:
             # scheduler could not allocate KV for any of them, the benchmark
             # will hang forever because in-progress generation requests won't
             # release their KV cache.
-            if (self.benchmark_req_queues_size > 0 and not self.is_warmup
-                    and not fitting_disagg_gen_init_requests):
-                stuck_init_requests = [
-                    req for req in self.active_requests
-                    if req.is_disagg_generation_init_state
-                ]
-                # Only fail once all benchmark requests have been fetched
-                # so that _handle_errors covers every request and every
-                # client receives an error response.
-                if (stuck_init_requests and self.num_fetch_requests
-                        >= self.benchmark_req_queues_size):
-                    error_msg = (
-                        f"Insufficient KV cache for gen-only benchmark mode: "
-                        f"{len(stuck_init_requests)} request(s) are waiting for "
-                        f"KV cache allocation but the scheduler could not fit "
-                        f"any of them. Increase free_gpu_memory_fraction or "
-                        f"reduce TLLM_BENCHMARK_REQ_QUEUES_SIZE (currently "
-                        f"{self.benchmark_req_queues_size}).")
-                    logger.error(error_msg)
-                    # Fail all active and waiting requests so every
-                    # client receives an error instead of hanging.
-                    self._handle_errors(error_msg,
-                                        requests=self.active_requests)
-                    return None, None
+            # Check the scheduler result from before transfer admission. An
+            # empty admitted list can mean that active transfers are
+            # temporarily consuming the transfer budget.
+            has_insufficient_kv = self._sync_gen_only_benchmark_has_insufficient_kv(
+                scheduler_fitting_disagg_gen_init_requests,
+                wait_for_disagg_gen_transfer_progress)
+            if has_insufficient_kv:
+                error_msg = (
+                    f"Insufficient KV cache for gen-only benchmark mode: "
+                    f"one or more requests are waiting for KV cache allocation "
+                    f"on a model-parallel rank whose scheduler could not fit "
+                    f"any of them. Increase free_gpu_memory_fraction or reduce "
+                    f"TLLM_BENCHMARK_REQ_QUEUES_SIZE (currently "
+                    f"{self.benchmark_req_queues_size}).")
+                logger.error(error_msg)
+                # Fail all active and waiting requests on every rank so every
+                # client receives an error instead of hanging.
+                self._handle_errors(error_msg, requests=self.active_requests)
+                return None, None
 
         self.num_scheduled_requests = scheduled_batch.batch_size
         logger.debug(
@@ -3500,24 +3608,30 @@ class PyExecutor:
                 torch.cuda.current_stream())
 
     def _is_benchmark_disagg_fill_complete(
-            self, scheduled_batch: ScheduledRequests) -> bool:
+            self,
+            scheduled_batch: ScheduledRequests,
+            local_sync_progress: bool = False) -> bool:
         """State-based fill-complete predicate for benchmark disagg mode.
 
         The gate opens when all three conditions hold globally:
 
         (A) The executor has fetched at least ``benchmark_req_queues_size``
             requests cumulatively.
-        (B) Every request in ``active_requests`` on this rank is past the
-            KV-transfer phase (not in INIT or TRANS_IN_PROGRESS).
+        (B) Every request in ``active_requests`` on this rank completed the
+            KV-transfer phase (not in INIT, TRANS_IN_PROGRESS, or ERROR).
         (C) The KV cache transceiver has no pending receive sessions.
 
-        For ADP, (B) and (C) are AND-ed across TP ranks via allgather.
+        The conditions and synchronous-progress signal are gathered across the
+        TP+CP scheduling group so every model-parallel rank makes the same gate
+        and sleep decision.
 
         This method must only be called when ``is_benchmark_disagg`` is True.
 
         Args:
             scheduled_batch: Passed for API compatibility with callers
                 but no longer used by this predicate.
+            local_sync_progress: Whether this rank completed a synchronous KV
+                transfer in the current iteration.
 
         Returns:
             True when the fill phase is complete and the first forward
@@ -3528,19 +3642,23 @@ class PyExecutor:
                 "_is_benchmark_disagg_fill_complete() should not be called "
                 "outside benchmark disagg mode.")
 
-        # (A) All benchmark requests have been fetched from the queue.
-        if self.num_fetch_requests < self.benchmark_req_queues_size:
+        # (A) All benchmark requests have been fetched from the queue. Keep
+        # going to the shared allgather even when this rank is not done so
+        # model-parallel ranks cannot diverge in collective order.
+        local_all_fetched = (self.num_fetch_requests
+                             >= self.benchmark_req_queues_size)
+        if not local_all_fetched:
             if self.dist.rank == 0:
                 logger.debug(
                     f"Benchmark disagg fill: fetching "
                     f"{self.num_fetch_requests}/{self.benchmark_req_queues_size}"
                 )
-            return False
 
         # (B) Every active request on this rank is past KV-transfer states.
         local_all_past_transfer = not any(
             req.is_disagg_generation_init_state
             or req.is_disagg_generation_transmission_in_progress
+            or req.state == LlmRequestState.DISAGG_TRANS_ERROR
             for req in self.active_requests)
 
         # Also require the transceiver's async receive bookkeeping to be
@@ -3549,13 +3667,15 @@ class PyExecutor:
             self.kv_cache_transceiver is None
             or self.kv_cache_transceiver.check_gen_transfer_complete())
 
-        local_ok = int(local_all_past_transfer and local_no_inflight)
+        local_ok = int(local_all_fetched and local_all_past_transfer
+                       and local_no_inflight)
+        local_status = (local_ok, bool(local_sync_progress))
 
-        if self.enable_attention_dp:
-            all_ranks_ok = self.dist.tp_allgather(local_ok)
-        else:
-            all_ranks_ok = [local_ok]
+        all_rank_status = self._allgather_model_parallel_status(local_status)
+        all_ranks_ok = [status[0] for status in all_rank_status]
         global_ok = min(all_ranks_ok) == 1
+        self._benchmark_sync_progress_global = any(
+            status[1] for status in all_rank_status)
 
         if self.dist.rank == 0:
             if global_ok:
@@ -3572,10 +3692,13 @@ class PyExecutor:
                 num_in_progress = sum(
                     1 for req in self.active_requests
                     if req.is_disagg_generation_transmission_in_progress)
+                num_errors = sum(
+                    1 for req in self.active_requests
+                    if req.state == LlmRequestState.DISAGG_TRANS_ERROR)
                 logger.debug(
                     f"Benchmark disagg fill: blocked on ranks {blocked_ranks} "
                     f"(rank {self.dist.rank} local: {num_init} INIT, "
-                    f"{num_in_progress} in-progress, "
+                    f"{num_in_progress} in-progress, {num_errors} errors, "
                     f"inflight={not local_no_inflight})")
         return global_ok
 
@@ -3588,9 +3711,10 @@ class PyExecutor:
         consolidates the check used by both ``_executor_loop`` and
         ``_executor_loop_overlap``.
 
-        A short sleep (0.1s) yields the CPU between retries while
-        keeping the polling interval short enough to avoid KV transfer
-        backpressure on the CTX server.
+        A short sleep (0.1s) yields the CPU between retries that made no
+        transfer progress while keeping the polling interval short enough to
+        avoid KV transfer backpressure on the CTX server. Synchronous receives
+        already block until they make progress, so those retries do not sleep.
 
         Args:
             scheduled_batch: The current scheduled batch.
@@ -3601,35 +3725,59 @@ class PyExecutor:
             the caller should ``continue`` to the next loop iteration.
         """
         if not self.is_warmup and not can_forward:
+            sync_transfer_made_progress = getattr(
+                self, "_sync_disagg_transfer_made_progress", False)
+            self._sync_disagg_transfer_made_progress = False
             can_forward = self._is_benchmark_disagg_fill_complete(
-                scheduled_batch)
+                scheduled_batch, sync_transfer_made_progress)
+            sync_transfer_made_progress = self._benchmark_sync_progress_global
             if can_forward:
                 self._benchmark_fill_phase_active = False
                 self._fill_admit_cap = 0
-            else:
+            elif not sync_transfer_made_progress:
                 time.sleep(0.1)
+            if not can_forward:
                 return can_forward, True
         return can_forward, False
 
     def _handle_disagg_cache_errors_synced(self):
         """ADP-safe disagg cache error handler.
 
-        Called from the top of every executor iteration so all TP ranks
-        enter ``_handle_errors`` together; otherwise the downstream
-        ``tp_gather`` in ``_enqueue_responses`` deadlocks.
+        Called from the top of every executor iteration. TP ranks vote on
+        failed request IDs and fail matching local replicas together;
+        otherwise the downstream ``tp_gather`` in ``_enqueue_responses``
+        deadlocks or leaves peer replicas running.
         """
         if not (self.kv_cache_transceiver and self.enable_attention_dp
                 and self.dist.world_size != 1):
             return
+
+        def request_vote_id(request: LlmRequest) -> int:
+            return (request.parent_request_id
+                    if request.is_child else request.py_request_id)
+
         local_error_requests = self._get_disagg_reqs_in_error_state()
-        any_has_errors = any(self.dist.tp_allgather(bool(local_error_requests)))
-        if not any_has_errors:
+        local_error_ids = [
+            request_vote_id(request) for request in local_error_requests
+        ]
+        all_error_ids = self.dist.tp_allgather(local_error_ids)
+        voted_error_ids = {
+            request_id
+            for rank_error_ids in all_error_ids
+            for request_id in rank_error_ids
+        }
+        if not voted_error_ids:
             return
+        local_voted_error_requests = [
+            request for request in self.active_requests
+            if request_vote_id(request) in voted_error_ids
+        ]
         logger.warning(f"Disagg KV cache transfer error: rank={self.dist.rank} "
-                       f"local_err_count={len(local_error_requests)}")
+                       f"local_err_count={len(local_error_requests)}, "
+                       f"voted_err_count={len(voted_error_ids)}")
         self._handle_errors(
             "Disagg KV cache transfer error",
-            requests=local_error_requests,
+            requests=local_voted_error_requests,
             charge_budget=False,
         )
 
@@ -5082,6 +5230,9 @@ class PyExecutor:
 
     @nvtx_range("_check_disagg_gen_transfer_status")
     def _check_disagg_gen_transfer_status(self):
+        if not self._uses_async_disagg_gen_transfer():
+            return
+
         # Gen-transfer status performs cross-rank consensus internally.
         # Enter it symmetrically; ranks with no ready local future contribute
         # an empty ready set.
@@ -5436,18 +5587,26 @@ class PyExecutor:
     @nvtx_range("_recv_disagg_gen_cache")
     def _recv_disagg_gen_cache(self, new_gen_reqs):
 
-        # For gen-only benchmarking, mark new gen request as transmission complete right away
-        if os.getenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY") == "1":
+        # gen_only_no_context has no CTX worker, so mark each request as
+        # transmission-complete immediately.
+        if self._is_disagg_gen_only_no_context_benchmark():
             for req in new_gen_reqs:
                 req.state = LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
             return
 
-        if os.getenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP") == "1":
+        if not self._uses_async_disagg_gen_transfer():
+            # Resources have already been prepared for every request in this
+            # batch. Drain all synchronous receives even after one fails so no
+            # prepared request is left in DISAGG_GENERATION_INIT.
             for req in new_gen_reqs:
                 self.kv_cache_transceiver.request_and_receive_sync(req)
-        else:
-            for req in new_gen_reqs:
-                self.kv_cache_transceiver.request_and_receive_async(req)
+                if req.state == LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE:
+                    self._sync_disagg_transfer_made_progress = True
+            self._check_cache_transfer_errors("generation requests")
+            return
+
+        for req in new_gen_reqs:
+            self.kv_cache_transceiver.request_and_receive_async(req)
 
         if self.kv_cache_transceiver.kv_transfer_timeout_ms is not None:
             for req in new_gen_reqs:
