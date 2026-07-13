@@ -18,6 +18,7 @@ from pathlib import Path
 import pytest
 from transformers import AutoTokenizer
 
+from tensorrt_llm._torch.models.modeling_bart import MBartForConditionalGeneration
 from tensorrt_llm.llmapi import (
     LLM,
     CudaGraphConfig,
@@ -41,6 +42,10 @@ _MIXED_ENCODER_SOURCE_TEXTS = [
     ),
 ]
 _MODEL_NAME = "bart-large-cnn"
+_MBART_MODEL_NAME = "mbart-large-50-many-to-one-mmt"
+_MBART_SOURCE_LANG = "ro_RO"
+_MBART_TARGET_LANG = "en_XX"
+_MBART_SOURCE_TEXT = "Şeful ONU spune că nu există o soluţie militară în Siria."
 _MAX_NEW_TOKENS = 10
 _MAX_SEQUENCE_LENGTH = 128
 _MAX_KV_TOKENS = 384
@@ -49,6 +54,19 @@ _FREE_GPU_MEMORY_FRACTION = 0.2
 _CROSS_KV_CACHE_FRACTION = 0.5
 # "The update improves batching, lowers latency"
 _EXPECTED_GREEDY_OUTPUT_TOKEN_IDS = [0, 133, 2935, 15296, 14398, 154, 6, 32222, 35940, 2]
+_MBART_EXPECTED_GREEDY_OUTPUT_TOKEN_IDS = [
+    # "The UN chief says there is no military"
+    250004,
+    581,
+    8274,
+    185256,
+    17378,
+    2685,
+    83,
+    110,
+    116338,
+    2,
+]
 _EXPECTED_BEAM_OUTPUT_TOKEN_IDS_BY_BEAMS = {
     2: [
         # "The update improves batching, lowers latency"
@@ -196,6 +214,27 @@ _TEST_CASES = [
     ),
     _test_case(
         torch_dtype="bfloat16",
+        use_kv_cache_manager_v2=True,
+        enable_cuda_graph=False,
+        num_beams=1,
+        num_return_sequences=1,
+        exact_match=True,
+        disable_overlap_scheduler=False,
+        feature_id="bf16-kv-v2-cuda-graph-off-greedy-overlap",
+    ),
+    _test_case(
+        torch_dtype="bfloat16",
+        use_kv_cache_manager_v2=True,
+        enable_cuda_graph=True,
+        num_beams=1,
+        num_return_sequences=1,
+        exact_match=True,
+        cuda_graph_batch_sizes=[2],
+        disable_overlap_scheduler=False,
+        feature_id="bf16-kv-v2-cuda-graph-on-greedy-overlap",
+    ),
+    _test_case(
+        torch_dtype="bfloat16",
         use_kv_cache_manager_v2=False,
         enable_cuda_graph=False,
         num_beams=2,
@@ -281,15 +320,15 @@ pytestmark = [
 ]
 
 
-def _get_bart_model_path() -> str:
+def _get_model_path(model_name: str) -> str:
     try:
         models_root = Path(llm_models_root())
     except AssertionError as exc:
         pytest.skip(str(exc))
 
-    model_path = models_root / _MODEL_NAME
+    model_path = models_root / model_name
     if not model_path.exists():
-        pytest.skip(f"{_MODEL_NAME} is not available under {models_root}")
+        pytest.skip(f"{model_name} is not available under {models_root}")
     return str(model_path)
 
 
@@ -413,7 +452,7 @@ def _run_bart_pytorch_generate_encoder_decoder(
         monkeypatch.setenv("TLLM_WORKER_USE_SINGLE_PROCESS", "1")
     monkeypatch.setenv("TRTLLM_SKIP_KV_CACHE_ESTIMATION", "1")
 
-    model_path = _get_bart_model_path()
+    model_path = _get_model_path(_MODEL_NAME)
     tokenizer = AutoTokenizer.from_pretrained(model_path)
     case_id = (
         f"model={_MODEL_NAME}, dtype={torch_dtype}, kv_v2={use_kv_cache_manager_v2}, "
@@ -513,6 +552,77 @@ def test_bart_pytorch_generate_encoder_decoder_end_to_end(
     )
 
 
+def test_mbart_pytorch_generate_encoder_decoder_end_to_end(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TLLM_WORKER_USE_SINGLE_PROCESS", "1")
+    monkeypatch.setenv("TRTLLM_SKIP_KV_CACHE_ESTIMATION", "1")
+
+    model_path = _get_model_path(_MBART_MODEL_NAME)
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_path,
+        src_lang=_MBART_SOURCE_LANG,
+    )
+    source_lang_token_id = tokenizer.lang_code_to_id[_MBART_SOURCE_LANG]
+    assert tokenizer.encode(_MBART_SOURCE_TEXT)[0] == source_lang_token_id
+    sampling_params = SamplingParams(
+        max_tokens=_MAX_NEW_TOKENS,
+        temperature=0.0,
+    )
+
+    with LLM(
+        model_path,
+        tokenizer=tokenizer,
+        backend="pytorch",
+        attn_backend="TRTLLM",
+        disable_overlap_scheduler=True,
+        dtype="bfloat16",
+        enable_chunked_prefill=False,
+        kv_cache_config=KvCacheConfig(
+            enable_block_reuse=False,
+            max_tokens=_MAX_KV_TOKENS,
+            free_gpu_memory_fraction=_FREE_GPU_MEMORY_FRACTION,
+            cross_kv_cache_fraction=_CROSS_KV_CACHE_FRACTION,
+            use_kv_cache_manager_v2=False,
+        ),
+        max_batch_size=1,
+        max_beam_width=1,
+        max_input_len=_MAX_SEQUENCE_LENGTH,
+        max_num_tokens=_MAX_SEQUENCE_LENGTH,
+        max_seq_len=_MAX_SEQUENCE_LENGTH,
+        model_kwargs={"torch_dtype": "bfloat16"},
+        scheduler_config=SchedulerConfig(use_python_scheduler=True),
+    ) as llm:
+        model = llm._executor.engine.model_engine.model
+        assert isinstance(model, MBartForConditionalGeneration)
+
+        response = llm.generate(
+            _MBART_SOURCE_TEXT,
+            sampling_params=sampling_params,
+            use_tqdm=False,
+        )
+        token_ids_by_output = _assert_bart_response(
+            response,
+            num_return_sequences=1,
+        )
+        _print_generated_text(
+            tokenizer,
+            f"model={_MBART_MODEL_NAME}, src_lang={_MBART_SOURCE_LANG}",
+            "output",
+            token_ids_by_output,
+        )
+
+        token_ids = token_ids_by_output[0]
+        assert token_ids[0] == tokenizer.lang_code_to_id[_MBART_TARGET_LANG]
+        assert token_ids[-1] == tokenizer.eos_token_id
+        _assert_expected_generation(
+            tokenizer,
+            token_ids_by_output,
+            exact_match=True,
+            expected_token_ids_by_output=[_MBART_EXPECTED_GREEDY_OUTPUT_TOKEN_IDS],
+        )
+
+
 @pytest.mark.parametrize(
     "torch_dtype,use_kv_cache_manager_v2,num_beams,num_return_sequences",
     _MIXED_BATCH_TEST_CASES,
@@ -527,7 +637,7 @@ def test_bart_pytorch_generate_encoder_decoder_mixed_encoder_lengths_batch(
     monkeypatch.setenv("TLLM_WORKER_USE_SINGLE_PROCESS", "1")
     monkeypatch.setenv("TRTLLM_SKIP_KV_CACHE_ESTIMATION", "1")
 
-    model_path = _get_bart_model_path()
+    model_path = _get_model_path(_MODEL_NAME)
     tokenizer = AutoTokenizer.from_pretrained(model_path)
     sampling_params = _sampling_params(num_beams, num_return_sequences)
     case_id = (

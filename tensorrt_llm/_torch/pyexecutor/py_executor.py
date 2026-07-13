@@ -675,10 +675,9 @@ class PyExecutor:
         self.inflight_req_ids = ReqIdsSet()
 
         # Encoder-decoder models execute the encoder and decoder in separate
-        # iterations. The encoder branch lives in ``_executor_loop`` only;
-        # ``_executor_loop_overlap`` has not been threaded yet. Reject
-        # pp_size > 1 for parity with the legacy TRT path (Encoder PP support
-        # is intentionally out of scope for this port).
+        # iterations in both executor loops. Reject pp_size > 1 for parity
+        # with the legacy TRT path because encoder PP send/recv support is
+        # intentionally out of scope for this port.
         is_encoder_decoder = bool(
             getattr(getattr(self.model_engine.model, "model_config", None),
                     "is_encoder_decoder", False))

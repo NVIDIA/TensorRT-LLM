@@ -1324,7 +1324,8 @@ class BaseLLM:
             self, sampling_params: SamplingParams) -> None:
         if self.args.backend != "pytorch":
             return
-        if getattr(self._hf_model_config, "model_type", None) != "bart":
+        if getattr(self._hf_model_config, "model_type",
+                   None) not in ("bart", "mbart"):
             return
         if self._generation_config is None:
             return
