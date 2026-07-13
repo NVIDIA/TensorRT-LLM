@@ -7,7 +7,7 @@ import math
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import safetensors.torch
 import torch
@@ -49,6 +49,37 @@ from .pipeline_ltx2 import (
 )
 
 STAGE_2_DISTILLED_SIGMA_VALUES = [0.909375, 0.725, 0.421875, 0.0]
+
+
+class _GpuTimeline:
+    """Named ``torch.cuda.Event`` marks; consecutive deltas = per-phase GPU time.
+
+    Events complete in stream order, so deltas measure GPU-timeline distance
+    even when the host only enqueued the work (CUDA graphs, async kernels).
+    """
+
+    def __init__(self) -> None:
+        self._enabled = torch.cuda.is_available()
+        self._marks: List[Tuple[str, "torch.cuda.Event"]] = []
+
+    def mark(self, name: str) -> None:
+        if not self._enabled:
+            return
+        ev = torch.cuda.Event(enable_timing=True)
+        ev.record()
+        self._marks.append((name, ev))
+
+    def phases(self) -> List[Tuple[str, float]]:
+        """Return ``(phase_name, seconds)`` between consecutive marks."""
+        if len(self._marks) < 2:
+            return []
+        self._marks[-1][1].synchronize()
+        return [
+            (name, prev_ev.elapsed_time(ev) / 1000.0)
+            for (_, prev_ev), (name, ev) in zip(self._marks, self._marks[1:])
+        ]
+
+
 _FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
 # Baseline BF16 peak memory ~75 GiB, saving BF16 weights snapshot total ~108 GiB.
 _BF16_WEIGHTS_SNAPSHOT_FREE_MEMORY_THRESHOLD_GIB = 115.0
@@ -1196,6 +1227,8 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
         # Stage 1: denoise at half resolution
         # ================================================================
         timer.mark_denoise_start()
+        gpu_tl = _GpuTimeline()
+        gpu_tl.mark("start")
         out = super().forward(
             prompt=prompt,
             negative_prompt=negative_prompt,
@@ -1219,6 +1252,7 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
             enhance_prompt=enhance_prompt,
         )
 
+        gpu_tl.mark("stage1")
         video_latents = out.video  # (B, C, F_lat, H_lat_s1, W_lat_s1)
         audio_latents = out.audio  # (B, C, F_aud, M) or None
 
@@ -1241,6 +1275,7 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
         stage2_parallel = self._stage2_ulysses_active()
         if self.rank == 0 or stage2_parallel:
             video_latents, audio_latents = self._upsample_and_refine(
+                gpu_timeline=gpu_tl,
                 video_latents=video_latents,
                 audio_latents=audio_latents,
                 prompt=prompt,
@@ -1311,14 +1346,22 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
             )
             video = torch.cat(chunks, dim=2)
             video = postprocess_video_tensor(video)
+        gpu_tl.mark("video_decode")
 
         # Audio decode is rank-0 only (not tile-parallel).
         audio_out = None
         if self.rank == 0 and audio_latents is not None:
             audio_latents = audio_latents.to(self.dtype)
             audio_out = decode_audio(audio_latents, self.audio_decoder, self.vocoder)
+        gpu_tl.mark("audio_decode")
 
         if self.rank == 0:
+            phases = ", ".join(f"{name}={sec * 1000.0:.0f}ms" for name, sec in gpu_tl.phases())
+            logger.info(
+                f"GPU timeline: {phases} | stage1 breakdown: "
+                f"pre(text-encode+prep)={out.pre_denoise * 1000.0:.0f}ms "
+                f"denoise={out.denoise * 1000.0:.0f}ms post={out.post_denoise * 1000.0:.0f}ms"
+            )
             logger.info(f"Two-stage total time: {time.time() - pipeline_start:.2f}s")
         timer.mark_end()
         return timer.fill(
@@ -1353,6 +1396,7 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
         image: Optional[Union[str, torch.Tensor]] = None,
         image_cond_strength: float = 1.0,
         parallel: bool = False,
+        gpu_timeline: Optional[_GpuTimeline] = None,
     ) -> tuple:
         """Stage 2: learned 2x spatial upsample + refinement denoise.
 
@@ -1360,12 +1404,14 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
         it collectively with Ulysses enabled (identical inputs on all ranks).
         Returns the refined ``(video_latents, audio_latents)`` in 5-D form.
         """
+        gpu_tl = gpu_timeline if gpu_timeline is not None else _GpuTimeline()
         per_ch_stats = self._get_per_channel_statistics()
         video_latents = upsample_video(
             video_latents[:1],
             per_ch_stats,
             self.spatial_upsampler,
         )
+        gpu_tl.mark("upsample")
         logger.info("Upsampled video latents via learned upsampler")
 
         # The persistent cache owns original and merged tensors when it can be
@@ -1402,6 +1448,7 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
                 self._lora_cuda_graph_state = "merged"
                 logger.info(f"Merged distilled LoRA ({n} params) for stage 2 (BF16 weights)")
 
+            gpu_tl.mark("lora_bind")
             # Rank-0-only Stage 2 must disable Ulysses: cross-rank collectives
             # in the attention backend would hang.
             if not parallel:
@@ -1420,6 +1467,7 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
                 image_cond_strength=image_cond_strength,
             )
         finally:
+            gpu_tl.mark("stage2_denoise")
             stage2_denoise_time = time.time() - stage2_start
             logger.info(f"Stage 2 denoising time: {stage2_denoise_time:.2f}s (BF16 weights)")
             if not parallel:
@@ -1458,6 +1506,7 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
             else:
                 self._lora_cuda_graph_state = "original"
 
+        gpu_tl.mark("lora_restore")
         return video_latents, audio_latents
 
     def _stage2_ulysses_active(self) -> bool:
