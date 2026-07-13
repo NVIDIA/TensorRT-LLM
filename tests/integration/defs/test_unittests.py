@@ -63,6 +63,25 @@ def merge_report(base_file, extra_file, output_file, is_retry=False):
     base.write(output_file, encoding="UTF-8", xml_declaration=True)
 
 
+def _junit_culprits(xml_path):
+    """Names of failed/errored tests in a JUnit report, so a whole-case failure
+    still names the specific culprit test(s) for CI/triage attribution."""
+    import xml.etree.ElementTree as ElementTree
+    try:
+        root = ElementTree.parse(xml_path).getroot()
+    except (OSError, ElementTree.ParseError):
+        return []
+    culprits = []
+    for tc in root.iter('testcase'):
+        if not tc.get('name'):
+            continue
+        kind = 'FAILED' if tc.find('failure') is not None else (
+            'ERROR' if tc.find('error') is not None else None)
+        if kind:
+            culprits.append(f"{kind} {tc.get('classname', '')}::{tc.get('name')}")
+    return culprits
+
+
 def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
     import pandas as pd
     import pynvml
@@ -300,4 +319,13 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
                 os.rename(parallel_output_xml, output_xml)
                 assert False, "no report generated, fatal failure happened in unittests (retry phase)"
 
-    assert passed, "failure reported in unittests"
+    if not passed:
+        culprits = _junit_culprits(output_xml)
+        # Tests still running when a fatal OOM/timeout killed the run (nodeids
+        # left behind by --periodic-save-unfinished-test) — the likely culprit.
+        unfinished = os.path.join(output_dir, "unfinished_test.txt")
+        if os.path.exists(unfinished):
+            with open(unfinished, encoding="utf-8") as f:
+                culprits += [f"IN-FLIGHT {ln.strip()}" for ln in f if ln.strip()]
+        raise AssertionError("failure reported in unittests" + (
+            "; culprit test(s): " + ", ".join(culprits) if culprits else ""))
