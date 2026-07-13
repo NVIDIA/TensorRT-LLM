@@ -23,8 +23,6 @@ import torch
 import triton
 import triton.language as tl
 
-import tensorrt_llm.bindings
-
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention_backend.interface import AttentionMetadata
     from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
@@ -35,16 +33,12 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import (
     BaseResourceManager, CacheTypeCpp, DataType, KVCacheManager,
     PoolConfiguration, get_pp_layers)
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
-from tensorrt_llm._utils import (nvtx_range, prefer_pinned,
-                                 torch_dtype_to_binding)
+from tensorrt_llm._utils import nvtx_range, prefer_pinned
 from tensorrt_llm.bindings.internal.batch_manager import (
     LinearAttentionMetadata, LinearCacheType)
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
-
-RnnStateManagerCpp = tensorrt_llm.bindings.internal.batch_manager.RnnStateManager
-WorldConfig = tensorrt_llm.bindings.WorldConfig
 
 GB = 1 << 30
 
@@ -145,21 +139,6 @@ def _mamba_rank_offset(mapping: Mapping) -> int:
             mapping.rank * 1_009)
 
 
-def use_cpp_mamba_cache_manager() -> bool:
-    """Check if C++ MambaCacheManager should be used.
-
-    Returns True if TRTLLM_USE_CPP_MAMBA='1' is set, False otherwise.
-    By default, PythonMambaCacheManager is used.
-    """
-    cpp = os.environ.get('TRTLLM_USE_CPP_MAMBA', '0') == '1'
-    py = os.environ.get('TRTLLM_USE_PY_MAMBA', '0') == '1'
-    if cpp and py:
-        raise ValueError(
-            "TRTLLM_USE_CPP_MAMBA=1 and TRTLLM_USE_PY_MAMBA=1 are mutually "
-            "exclusive; unset one of them.")
-    return cpp
-
-
 def use_py_mamba_cache_manager() -> bool:
     """Check if PythonMambaCacheManager should be forced (agg mode override).
 
@@ -170,13 +149,7 @@ def use_py_mamba_cache_manager() -> bool:
     CppMambaHybridCacheManager. Disagg mode is unaffected — it already picks
     PythonMambaCacheManager when transceiver_runtime='PYTHON'.
     """
-    cpp = os.environ.get('TRTLLM_USE_CPP_MAMBA', '0') == '1'
-    py = os.environ.get('TRTLLM_USE_PY_MAMBA', '0') == '1'
-    if cpp and py:
-        raise ValueError(
-            "TRTLLM_USE_CPP_MAMBA=1 and TRTLLM_USE_PY_MAMBA=1 are mutually "
-            "exclusive; unset one of them.")
-    return py
+    return os.environ.get('TRTLLM_USE_PY_MAMBA', '0') == '1'
 
 
 class ReplayStateUpdateMetadata(NamedTuple):
@@ -233,114 +206,6 @@ class BaseMambaCacheManager(ABC):
     ) -> Union['PythonMambaCacheManager.State',
                'PythonMambaCacheManager.SpeculativeState', None]:
         ...
-
-
-class CppMambaCacheManager(BaseResourceManager):
-    """Mamba state manager backed by the C++ RnnStateManager bindings.
-
-    Manages only mamba states (conv + SSM). Used when TRTLLM_USE_CPP_MAMBA=1.
-    Supports disaggregated serving.
-    """
-
-    def __init__(
-        self,
-        d_state: int,
-        d_conv: int,
-        num_heads: int,
-        n_groups: int,
-        head_dim: int,
-        num_layers: int,
-        max_num_sequences: int,
-        mapping: Mapping,
-        dtype: torch.dtype,
-        ssm_cache_dtype: torch.dtype,
-        layer_mask: Optional[List[bool]] = None,
-        stream: Optional[torch.cuda.Stream] = None,
-    ) -> None:
-        self.mamba_ssm_cache_dtype = ssm_cache_dtype
-
-        # get tp size
-        tp_size = mapping.tp_size if not mapping.enable_attention_dp else 1
-        world_config = WorldConfig(
-            tensor_parallelism=tp_size,
-            pipeline_parallelism=mapping.pp_size,
-            rank=mapping.rank,
-            gpus_per_node=mapping.gpus_per_node,
-        )
-
-        dtype_binding = torch_dtype_to_binding(dtype)
-        ssm_cache_dtype_binding = torch_dtype_to_binding(
-            ssm_cache_dtype if ssm_cache_dtype is not None else dtype)
-
-        self._stream = stream if stream is not None else torch.cuda.current_stream(
-        )
-
-        pp_layers, _ = get_pp_layers(num_layers, mapping, layer_mask=layer_mask)
-
-        self.mamba_impl = RnnStateManagerCpp(
-            d_state=d_state,
-            d_conv=d_conv,
-            num_heads=num_heads,
-            n_groups=n_groups,
-            head_dim=head_dim,
-            max_batch_size=max_num_sequences,
-            world_config=world_config,
-            stream=self._stream.cuda_stream,
-            dtype=dtype_binding,
-            ssm_cache_dtype=ssm_cache_dtype_binding,
-            pp_layers=pp_layers,
-            num_layers=num_layers,
-        )
-        self._max_num_sequences = max_num_sequences
-
-    def get_max_resource_count(self) -> int:
-        # Return the maximum number of sequences that can be cached.
-        return self._max_num_sequences
-
-    def get_needed_resource_to_completion(self, request: LlmRequest) -> int:
-        # For Mamba cache manager, we always need one slot per request.
-        return 1
-
-    def is_speculative(self) -> bool:
-        # C++ MambaCacheManager does not support speculative decoding
-        return False
-
-    def prepare_resources(self, scheduled_batch: ScheduledRequests):
-        context_ids = [
-            i.py_request_id for i in scheduled_batch.context_requests
-        ]
-        generation_ids = [
-            i.py_request_id for i in scheduled_batch.generation_requests
-        ]
-        request_ids = context_ids + generation_ids
-        self.mamba_impl.allocate_cache_blocks(request_ids)
-
-    def free_resources(self, request: LlmRequest):
-        self.mamba_impl.free_cache_block(request.py_request_id)
-
-    def add_dummy_requests(self, request_ids: List[int], **kwargs):
-        # Allocate a permanent slot for every id, including CUDA-graph
-        # padding sentinels (matches PythonMambaCacheManager). Padding
-        # entries in get_state_indices then resolve via mCacheIndex to
-        # the sentinel's reserved slot and never alias a live request.
-        if request_ids:
-            self.mamba_impl.allocate_cache_blocks(request_ids)
-
-    def get_state_indices(self, request_ids: List[int],
-                          is_padding: List[bool]) -> List[int]:
-        return self.mamba_impl.get_state_indices(request_ids, is_padding)
-
-    def get_conv_states(self, layer_idx: int) -> torch.Tensor:
-        return self.mamba_impl.get_conv_states(layer_idx)
-
-    def get_ssm_states(self, layer_idx: int) -> torch.Tensor:
-        return self.mamba_impl.get_ssm_states(layer_idx)
-
-    def get_mamba_ssm_cache_dtype(self) -> torch.dtype:
-        return self.mamba_ssm_cache_dtype
-
-    def shutdown(self):
-        torch.cuda.empty_cache()
 
 
 class PythonMambaCacheManager(BaseResourceManager):
@@ -725,6 +590,7 @@ class PythonMambaCacheManager(BaseResourceManager):
         return (CUDA_GRAPH_DUMMY_REQUEST_ID - max_dl <= request_id <=
                 CUDA_GRAPH_DUMMY_REQUEST_ID)
 
+    @torch.inference_mode()
     def add_dummy_requests(self, request_ids: List[int], **kwargs):
         # Sentinels alias to the shared _padding_slot; non-sentinel
         # dummies (warmup, attention-DP idle padding) get their own
@@ -976,7 +842,7 @@ class PythonMambaCacheManager(BaseResourceManager):
 class MambaCacheManager(BaseResourceManager, BaseMambaCacheManager):
     """Facade for standalone mamba state management (no KV cache).
 
-    Delegates to CppMambaCacheManager (when TRTLLM_USE_CPP_MAMBA=1) or PythonMambaCacheManager.
+    Delegates to PythonMambaCacheManager.
     """
 
     def __init__(
@@ -1000,51 +866,30 @@ class MambaCacheManager(BaseResourceManager, BaseMambaCacheManager):
         mamba_ssm_stochastic_rounding: bool = False,
     ) -> None:
         max_num_sequences = max_batch_size * mapping.pp_size
-        self._use_cpp = use_cpp_mamba_cache_manager()
 
-        if self._use_cpp:
-            assert speculative_num_draft_tokens is None, \
-                "speculative_num_draft_tokens is not supported in CppMambaCacheManager"
-            self._impl = CppMambaCacheManager(
-                d_state=d_state,
-                d_conv=d_conv,
-                num_heads=num_heads,
-                n_groups=n_groups,
-                head_dim=head_dim,
-                num_layers=num_layers,
-                max_num_sequences=max_num_sequences,
-                mapping=mapping,
-                dtype=dtype,
-                ssm_cache_dtype=ssm_cache_dtype,
-                layer_mask=layer_mask,
-                stream=stream,
-            )
-        else:
-            self._impl = PythonMambaCacheManager(
-                d_state=d_state,
-                d_conv=d_conv,
-                num_heads=num_heads,
-                n_groups=n_groups,
-                head_dim=head_dim,
-                num_layers=num_layers,
-                max_batch_size=max_num_sequences,
-                spec_state_size=spec_state_size,
-                mapping=mapping,
-                dtype=dtype,
-                ssm_cache_dtype=ssm_cache_dtype,
-                layer_mask=layer_mask,
-                speculative_num_draft_tokens=speculative_num_draft_tokens,
-                model_type=model_type,
-                use_replay_state_update=use_replay_state_update,
-                mamba_ssm_stochastic_rounding=mamba_ssm_stochastic_rounding,
-            )
+        self._impl = PythonMambaCacheManager(
+            d_state=d_state,
+            d_conv=d_conv,
+            num_heads=num_heads,
+            n_groups=n_groups,
+            head_dim=head_dim,
+            num_layers=num_layers,
+            max_batch_size=max_num_sequences,
+            spec_state_size=spec_state_size,
+            mapping=mapping,
+            dtype=dtype,
+            ssm_cache_dtype=ssm_cache_dtype,
+            layer_mask=layer_mask,
+            speculative_num_draft_tokens=speculative_num_draft_tokens,
+            model_type=model_type,
+            use_replay_state_update=use_replay_state_update,
+            mamba_ssm_stochastic_rounding=mamba_ssm_stochastic_rounding,
+        )
 
     def get_max_resource_count(self) -> int:
         return self._impl.get_max_resource_count()
 
     def filter_ctx_requests_by_capacity(self, context_requests: list) -> list:
-        if self._use_cpp:
-            return context_requests
         return self._impl.filter_ctx_requests_by_capacity(context_requests)
 
     def get_needed_resource_to_completion(self, request: LlmRequest) -> int:
@@ -1068,12 +913,10 @@ class MambaCacheManager(BaseResourceManager, BaseMambaCacheManager):
 
     @property
     def mamba_cache_free_blocks(self) -> List[int]:
-        assert not self._use_cpp, "mamba_cache_free_blocks is not supported in CppMambaCacheManager"
         return self._impl.mamba_cache_free_blocks
 
     @property
     def mamba_cache_index(self) -> Dict[int, int]:
-        assert not self._use_cpp, "mamba_cache_index is not supported in CppMambaCacheManager"
         return self._impl.mamba_cache_index
 
     def get_conv_states(self, layer_idx: int) -> torch.Tensor:
@@ -1086,11 +929,8 @@ class MambaCacheManager(BaseResourceManager, BaseMambaCacheManager):
         return self._impl.get_mamba_ssm_cache_dtype()
 
     def get_mamba_ssm_rand_seed(self) -> Optional[torch.Tensor]:
-        """Delegate to the underlying Python manager.  The C++ manager does
-        not allocate this buffer because it does not support speculative
-        decoding (and the SR-on-non-replay bug only fires under MTP)."""
-        getter = getattr(self._impl, 'get_mamba_ssm_rand_seed', None)
-        return getter() if getter is not None else None
+        """Delegate to the underlying Python manager."""
+        return self._impl.get_mamba_ssm_rand_seed()
 
     @property
     def use_replay_state_update(self) -> bool:
@@ -1098,45 +938,33 @@ class MambaCacheManager(BaseResourceManager, BaseMambaCacheManager):
 
     def get_replay_state_update_metadata(
             self) -> Optional[ReplayStateUpdateMetadata]:
-        get_metadata = getattr(self._impl, 'get_replay_state_update_metadata',
-                               None)
-        if get_metadata is None:
-            return None
-        return get_metadata()
+        return self._impl.get_replay_state_update_metadata()
 
     def get_intermediate_ssm_states(self,
                                     layer_idx: int) -> Optional[torch.Tensor]:
-        assert not self._use_cpp, "get_intermediate_ssm_states is not supported in CppMambaCacheManager"
         return self._impl.get_intermediate_ssm_states(layer_idx)
 
     def get_intermediate_conv_states(self,
                                      layer_idx: int) -> Optional[torch.Tensor]:
-        assert not self._use_cpp, "get_intermediate_conv_states is not supported in CppMambaCacheManager"
         return self._impl.get_intermediate_conv_states(layer_idx)
 
     def get_replay_old_x(self, layer_idx: int) -> Optional[torch.Tensor]:
-        assert not self._use_cpp, "get_replay_old_x is not supported in CppMambaCacheManager"
         return self._impl.get_replay_old_x(layer_idx)
 
     def get_replay_old_B(self, layer_idx: int) -> Optional[torch.Tensor]:
-        assert not self._use_cpp, "get_replay_old_B is not supported in CppMambaCacheManager"
         return self._impl.get_replay_old_B(layer_idx)
 
     def get_replay_old_dt(self, layer_idx: int) -> Optional[torch.Tensor]:
-        assert not self._use_cpp, "get_replay_old_dt is not supported in CppMambaCacheManager"
         return self._impl.get_replay_old_dt(layer_idx)
 
     def get_replay_old_dA_cumsum(self,
                                  layer_idx: int) -> Optional[torch.Tensor]:
-        assert not self._use_cpp, "get_replay_old_dA_cumsum is not supported in CppMambaCacheManager"
         return self._impl.get_replay_old_dA_cumsum(layer_idx)
 
     def get_replay_cache_buf_idx(self) -> Optional[torch.Tensor]:
-        assert not self._use_cpp, "get_replay_cache_buf_idx is not supported in CppMambaCacheManager"
         return self._impl.get_replay_cache_buf_idx()
 
     def get_replay_prev_num_accepted_tokens(self) -> Optional[torch.Tensor]:
-        assert not self._use_cpp, "get_replay_prev_num_accepted_tokens is not supported in CppMambaCacheManager"
         return self._impl.get_replay_prev_num_accepted_tokens()
 
     def is_speculative(self) -> bool:
@@ -1146,7 +974,6 @@ class MambaCacheManager(BaseResourceManager, BaseMambaCacheManager):
         self, layer_idx: int
     ) -> Union[PythonMambaCacheManager.State,
                PythonMambaCacheManager.SpeculativeState, None]:
-        assert not self._use_cpp, "mamba_layer_cache is not supported in CppMambaCacheManager"
         return self._impl.mamba_layer_cache(layer_idx)
 
     def shutdown(self):
@@ -1159,10 +986,6 @@ class MambaCacheManager(BaseResourceManager, BaseMambaCacheManager):
         # promotion is a clean no-op.
         if not self._impl.is_speculative():
             return
-        # Belt-and-suspenders: C++ is non-speculative today so this is
-        # unreachable. Fires if C++ ever grows speculative support
-        # without also implementing the scatter there.
-        assert not self._use_cpp, "update_mamba_states is not supported in CppMambaCacheManager"
         self._impl.update_mamba_states(attn_metadata, num_accepted_tokens,
                                        state_indices)
 

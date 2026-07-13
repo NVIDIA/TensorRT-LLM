@@ -36,6 +36,7 @@ _THOP_EXCLUDED_FIELDS: frozenset = frozenset(
         "attention_mask_data",  # custom-mask code path
         "out_scale_sf",  # promoted into ``out_scale`` in ``TrtllmAttention.forward`` for NVFP4 path
         "skip_mla_rope_generation",  # handled in ``TrtllmAttention.forward`` for the test-only MLA path
+        "timestep",  # used to populate skip-softmax params in ``TrtllmAttention.forward``
     }
 )
 
@@ -128,6 +129,8 @@ class FallbackFmha(Fmha):
             mla_bmm2_scale=forward_args.mla_bmm2_scale,
             quant_q_buffer=forward_args.quant_q_buffer,
             quant_scale_qkv=forward_args.quant_scale_qkv,
+            dsv4_inv_rope_cos_sin_cache=forward_args.dsv4_inv_rope_cos_sin_cache,
+            enable_dsv4_epilogue_fusion=forward_args.enable_dsv4_epilogue_fusion,
             sage_attn_num_elts_per_blk_q=forward_args.sage_attn_num_elts_per_blk_q,
             sage_attn_num_elts_per_blk_k=forward_args.sage_attn_num_elts_per_blk_k,
             sage_attn_num_elts_per_blk_v=forward_args.sage_attn_num_elts_per_blk_v,
