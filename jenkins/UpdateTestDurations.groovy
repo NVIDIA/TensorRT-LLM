@@ -97,6 +97,10 @@ pipeline {
             defaultValue: '3',
             description: 'Number of days to look back in OpenSearch for test durations (e.g. 3, 5, 7).')
         string(
+            name: 'SOURCE_REPO',
+            defaultValue: 'NVIDIA/TensorRT-LLM',
+            description: 'GitHub repo to checkout scripts from (e.g. EmmaQiaoCh/TensorRT-LLM for testing).')
+        string(
             name: 'TARGET_BRANCH',
             defaultValue: 'main',
             description: 'Branch of the target repo to commit the updated duration file to.')
@@ -113,11 +117,11 @@ pipeline {
         stage('Setup') {
             steps {
                 container('trt-llm') {
-                    sh '''
-                        apt-get update -qq
-                        apt-get install -y -qq git python3-pip curl
-                        pip3 install --quiet requests pyyaml
-                    '''
+                    sh """
+                        apt-get update -qq && \
+                        apt-get install -y -qq git python3-pip curl && \
+                        pip3 install --quiet --break-system-packages requests pyyaml
+                    """
                 }
             }
         } // stage Setup
@@ -126,7 +130,8 @@ pipeline {
             steps {
                 container('trt-llm') {
                     script {
-                        trtllm_utils.checkoutSource(LLM_REPO, params.TARGET_BRANCH, LLM_ROOT, false, false)
+                        def sourceRepo = "https://github.com/${params.SOURCE_REPO}.git"
+                        trtllm_utils.checkoutSource(sourceRepo, params.TARGET_BRANCH, LLM_ROOT, false, false)
                     }
                 }
             }
