@@ -72,23 +72,34 @@ struct BounceCreditEntry
     std::uint64_t regionHandle; // 64-bit (was 32-bit + pad) -> arena offsets may exceed 4 GiB
 };
 
-/// One scatter target inside a DATA message: copy region[bounceOffset .. +size) -> dstAddr.
-struct BounceScatterEntry
+/// One scatter RUN inside a DATA message: `count` equal pieces of `pieceSize` bytes; piece p copies
+///   region[bounceOffset + p*bounceStride .. +pieceSize)  ->  dstAddr + p*dstStride.
+/// count==1 is a single plain extent (strides unused, 0). Runs compress BOTH dst layouts a KV
+/// transfer produces: a fully CONTIGUOUS dst (one count==1 run whose pieceSize covers the chunk —
+/// e.g. ctx tp1 -> gen tp4, the gen rank's head-slice pool is dense) and a uniformly STRIDED dst
+/// (one count==N run — e.g. ctx tp4 -> gen DP, each ctx rank's head slice lands every
+/// bytes-per-layer in the gen rank's full-head pool). Either way a whole chunk's scatter plan is a
+/// handful of runs instead of one entry per desc, keeping the DATA message (ACK critical path) tiny.
+struct BounceScatterRun
 {
-    std::uint64_t bounceOffset;
-    std::uint64_t dstAddr;
-    std::uint32_t size;
-    std::uint32_t deviceId;
+    std::uint64_t bounceOffset; // first piece's offset within the granted region
+    std::uint64_t dstAddr;      // first piece's destination address
+    std::uint64_t dstStride;    // dst step between pieces (0 when count==1)
+    std::uint32_t bounceStride; // region-offset step between pieces (0 when count==1)
+    std::uint32_t pieceSize;    // bytes per piece
+    std::uint32_t count;        // number of pieces (>= 1)
 };
 
 #pragma pack(pop)
 
 static_assert(sizeof(BounceMsgHeader) == 44, "BounceMsgHeader must be 44 bytes");
 static_assert(sizeof(BounceCreditEntry) == 24, "BounceCreditEntry must be 24 bytes");
-static_assert(sizeof(BounceScatterEntry) == 24, "BounceScatterEntry must be 24 bytes");
+static_assert(sizeof(BounceScatterRun) == 36, "BounceScatterRun must be 36 bytes");
 
 inline constexpr std::uint32_t kBounceMagic = 0x424E4332U; // 'B''N''C''2'
-inline constexpr std::uint16_t kBounceVersion = 1U;
+// v2: DATA scatter entries became strided RUNS (BounceScatterRun). decodeHeader rejects mismatched
+// versions, so a mixed-version pair degrades to leaseTimeout (deploy sender+receiver together).
+inline constexpr std::uint16_t kBounceVersion = 2U;
 
 // ---- encode (each returns a self-contained blob: header + payload) ----
 /// WANT carries the per-chunk byte sizes the sender will write (the receiver allocates a region of
@@ -108,7 +119,7 @@ inline constexpr std::uint16_t kBounceVersion = 1U;
 [[nodiscard]] std::string encodeCancel(std::uint64_t requestId, std::string const& endpoint);
 [[nodiscard]] std::string encodeGrant(std::uint64_t requestId, std::vector<BounceCreditEntry> const& credits);
 [[nodiscard]] std::string encodeData(std::uint64_t requestId, std::uint32_t chunkIdx, std::uint32_t numChunks,
-    std::uint64_t regionHandle, std::vector<BounceScatterEntry> const& entries);
+    std::uint64_t regionHandle, std::vector<BounceScatterRun> const& entries);
 [[nodiscard]] std::string encodeAck(std::uint64_t requestId, std::uint32_t chunkIdx, std::uint64_t regionHandle);
 
 // ---- decode ----
@@ -125,7 +136,7 @@ inline constexpr std::uint16_t kBounceVersion = 1U;
 
 /// Decode scatter entries (DATA payload). `header.count` entries expected.
 [[nodiscard]] bool decodeScatter(
-    std::string const& blob, BounceMsgHeader const& header, std::vector<BounceScatterEntry>& out);
+    std::string const& blob, BounceMsgHeader const& header, std::vector<BounceScatterRun>& out);
 
 /// Decode a WANT: its per-chunk byte sizes (`header.count` entries; empty == cancel) and the
 /// sender's bounce control endpoint. Returns false on a malformed/short blob.

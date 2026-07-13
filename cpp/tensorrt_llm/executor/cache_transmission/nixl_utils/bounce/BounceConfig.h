@@ -44,6 +44,22 @@ struct BounceConfig
     std::size_t maxAvgDescBytes{16ULL << 10}; // TRTLLM_NIXL_BOUNCE_MAX_AVG (16 KiB)
     int leaseTimeoutMs{30000};                // TRTLLM_NIXL_BOUNCE_LEASE_TIMEOUT_MS
     bool forceFallback{false};                // TRTLLM_NIXL_BOUNCE_FORCE_FALLBACK (no fabric mem; CI)
+    // TRTLLM_NIXL_BOUNCE_EAGER_GATHER: launch a chunk's gather at submit() time, before the
+    // receiver's GRANT arrives, overlapping the WANT->GRANT control round-trip with the gather
+    // kernel. Eager (credit-less) staging regions are capped at HALF the arena so that on a
+    // bidirectional deployment both sides can always still grant incoming regions (no mutual
+    // eager-starvation); the credit-backed path is unaffected by the cap.
+    bool eagerGather{true};
+    // TRTLLM_NIXL_BOUNCE_NIXL_CONTROL: carry the control messages (WANT/GRANT/DATA/ACK) over NIXL
+    // notifications (UCX active messages on the RDMA fabric) instead of ZMQ/TCP — a control hop
+    // drops from tens of microseconds to a few. Must be set identically on BOTH peers (the WANT
+    // bootstrap payload differs), and must stay OFF under transceiver_runtime=CPP (whose DataSender
+    // consumes the same agent notification queue).
+    bool nixlControl{false};
+    // TRTLLM_NIXL_BOUNCE_NO_RUN_MERGE: DEBUG ONLY — disable scatter-run coalescing so the DATA
+    // message carries one entry per desc (per-desc plan, hundreds of KB per chunk). Used to A/B the
+    // control transports under large-message load; never enable in production.
+    bool noRunMerge{false};
     // --- experimental gather/scatter copy backends (default OFF; benchmark before enabling) ---
     bool cubCopy{false};      // TRTLLM_NIXL_BOUNCE_CUB_COPY: use cub::DeviceMemcpy::Batched vs the custom kernel
     bool zeroCopyArgs{false}; // TRTLLM_NIXL_BOUNCE_ZEROCOPY_ARGS: kernel reads the [srcs|dsts|sizes] plan arrays
@@ -164,6 +180,9 @@ struct BounceConfig
         cfg.forceFallback = envBool("TRTLLM_NIXL_BOUNCE_FORCE_FALLBACK", false);
         cfg.cubCopy = envBool("TRTLLM_NIXL_BOUNCE_CUB_COPY", false);
         cfg.zeroCopyArgs = envBool("TRTLLM_NIXL_BOUNCE_ZEROCOPY_ARGS", false);
+        cfg.eagerGather = envBool("TRTLLM_NIXL_BOUNCE_EAGER_GATHER", cfg.eagerGather);
+        cfg.nixlControl = envBool("TRTLLM_NIXL_BOUNCE_NIXL_CONTROL", cfg.nixlControl);
+        cfg.noRunMerge = envBool("TRTLLM_NIXL_BOUNCE_NO_RUN_MERGE", cfg.noRunMerge);
         return cfg;
     }
 };

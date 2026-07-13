@@ -66,6 +66,7 @@ if(NIXL_ROOT)
               bounce/ExecPool.cpp
               bounce/GatherScatterKernel.cu
               bounce/ZmqControlChannel.cpp
+              bounce/NixlNotifControlChannel.cpp
               bounce/NixlTransferEngine.cpp
               bounce/BounceTransport.cpp)
     target_include_directories(

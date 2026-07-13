@@ -168,7 +168,7 @@ private:
         std::uint32_t chunkIdx{};
         std::uint64_t offset{};      // receiver arena region offset (the granted region handle) to scatter from
         std::uint64_t regionBytes{}; // byte size of the buddy block backing `offset` (bounds scatter reads)
-        std::vector<BounceScatterEntry> entries;
+        std::vector<BounceScatterRun> entries;
         std::uint64_t nvtxQueue{0};  // NVTX span: enqueued on the IO thread -> dequeued by a worker
     };
 
@@ -251,14 +251,17 @@ public:
 
 private:
     // A chunk's transfer state — the per-chunk view of the sender Request state machine.
-    // Linear progression Gathering -> Writing -> Sent, with GatherFailed as the one
+    // Linear progression Gathering -> Gathered -> Writing -> Sent, with GatherFailed as the one
     // off-ramp (a gather whose launch/event-record failed). Replaces a former trio of bools whose
     // illegal combinations (e.g. !writePosted && dataSent) were only ruled out by convention.
+    // With eager gather a chunk may sit in Gathered while its credit (GRANT) is still in flight;
+    // the write posts once BOTH the gather event has signalled AND the credit is attached.
     enum class PostState
     {
         Gathering,    // gather kernel launched + event recorded; write deferred until the event signals
         GatherFailed, // gather launch / event-record failed -> drainGatherReady fails the request
                       // (an unrecorded event queries as "complete", so its event must NOT be trusted)
+        Gathered,     // gather event signalled, exec ctx returned; waiting for the credit (eager gather)
         Writing,      // gather done; RDMA write issued (xfer valid); polling getXferStatus
         Sent,         // getXferStatus==Done -> DATA emitted; xfer released; awaiting ACK
     };
@@ -267,16 +270,18 @@ private:
     {
         std::uint32_t chunkIdx{};
         std::uint64_t localOffset{};  // shared-arena region held for gather/write until ACK (OUTGOING_HELD)
-        ExecCtx* ctx{nullptr};        // gather exec context, borrowed while the gather runs (until Writing)
+        ExecCtx* ctx{nullptr};        // gather exec context, borrowed while the gather runs (until Gathered)
         std::uint64_t xfer{};         // TransferEngine handle (valid once state == Writing)
         std::uint64_t remoteHandle{}; // receiver's region handle (its arena offset); echoed in DATA
         // Remote write target (from the GRANT), kept so postWrite can be issued LATER — after the
         // gather kernel completes — instead of blocking the IO thread on cudaStreamSynchronize.
         // The gather may be delayed behind unrelated GPU work (shared device), so we never sync;
         // drainGatherReady() polls ctx->event and posts the write only when the gather is done.
+        // With eager gather these fields are filled in later, by attachCredits() (hasCredit==true).
         std::uint64_t remoteAddr{};
         std::uint32_t remoteDevId{};
         std::uint32_t writeBytes{};
+        bool hasCredit{false};        // remote fields valid; a Gathered chunk without it waits in place
         PostState state{PostState::Gathering};
         // Cross-thread NVTX spans for this chunk's async legs (0 == none; ended on failure paths too).
         std::uint64_t nvtxGather{0};  // gather launched -> event signaled (in-flight incl. GPU queueing)
@@ -290,12 +295,18 @@ private:
         std::uint32_t numChunks{};
         BounceTransferPlan plan;
         std::uint32_t nextPost{0};
+        // Credits are granted strictly in chunk order (the receiver serves the WANT's size list
+        // FIFO), so credit k always belongs to chunk k. Chunks [0, nextCredit) have consumed their
+        // credit (attached to a Posted, or popped at gather-launch time); pendingCredits.front()
+        // is chunk `nextCredit`'s credit.
+        std::uint32_t nextCredit{0};
         std::uint32_t acked{0};
         std::vector<Posted> posted;
-        // Credits granted by the receiver but not yet posted because no gather region / exec context
-        // was free (the shared arena is used across peers and can be oversubscribed). The IO thread
-        // NEVER blocks on acquire; instead it parks the credit here and retries each loop iteration
-        // as ACKs free regions. FIFO: paired with chunk indices in order.
+        // Credits granted by the receiver but not yet consumed: either their chunk's gather couldn't
+        // start (no gather region / exec context free — the shared arena is used across peers and can
+        // be oversubscribed) or, with eager gather, the chunk posted before its GRANT arrived and the
+        // credit is about to be attached. The IO thread NEVER blocks on acquire; it parks the credit
+        // here and retries each loop iteration as ACKs free regions. FIFO: paired with chunks in order.
         std::deque<BounceCreditEntry> pendingCredits;
         std::shared_ptr<std::promise<TransferState>> promise;
         // Last time this request made forward progress (granted+posted a chunk, or got an ACK).
@@ -322,9 +333,15 @@ private:
         std::uint64_t rid{};
     };
 
-    /// Post as many of `req`'s parked credits as free regions + exec contexts allow (non-blocking).
-    /// Pairs each credit with the next chunk; stops when the arena/ExecPool is empty (rest parked).
+    /// Attach parked credits to already-posted chunks (eager gather posted them credit-less), in
+    /// strict chunk order, promoting their staging regions out of the eager budget. Also flags the
+    /// protocol anomalies (credit/chunk size mispair -> abandon flow; over-grant -> drop extras).
     /// Caller MUST hold mReqMu.
+    void attachCredits(std::uint64_t rid, Request& req);
+    /// Launch gathers for as many not-yet-posted chunks as resources allow (non-blocking): with a
+    /// parked credit when available, else eagerly (cfg.eagerGather, capped by the per-flow window +
+    /// the scheduler's eager budget). Stops when the arena/ExecPool is empty (rest parked/retried).
+    /// Caller MUST hold mReqMu. Runs attachCredits() first so credit pairing stays in chunk order.
     void pumpRequest(std::uint64_t rid, Request& req);
     void failRequest(std::uint64_t rid, Request& req);
 

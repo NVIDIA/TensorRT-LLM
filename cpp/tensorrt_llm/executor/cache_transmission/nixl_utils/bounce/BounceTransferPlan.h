@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include "tensorrt_llm/executor/cache_transmission/nixl_utils/bounce/BounceMessage.h"
 #include "tensorrt_llm/executor/transferAgent.h"
 
 #include <cstdint>
@@ -33,6 +34,14 @@ struct BounceChunk
     std::vector<std::uint64_t> dstPtrs;       // receiver-local final destination addresses
     std::vector<std::uint32_t> sizes;         // per-desc byte counts
     std::vector<std::uint64_t> bounceOffsets; // per-desc offset within the region
+    // Coalesced scatter view — what goes on the wire as the DATA scatter plan. Adjacent descs merge
+    // into one BounceScatterRun when (bounceOffset, dstPtr) advance contiguously (run grows its
+    // pieceSize; the fully-dense dst, e.g. ctx tp1 -> gen tp4) OR by a uniform stride (run grows its
+    // count; the strided dst, e.g. ctx tp-slice -> gen DP full-head pool). Either way thousands of
+    // per-desc entries collapse to a handful of runs, shrinking the DATA control message (which sits
+    // on the ACK critical path) by orders of magnitude. The per-desc arrays above stay as-is for the
+    // gather (src layout is independent of dst).
+    std::vector<BounceScatterRun> scatterRuns;
     std::uint64_t totalBytes{0};              // sum of desc sizes (payload only, excludes padding)
     std::uint64_t packedBytes{0};             // region extent to RDMA-write: last bounceOffset + its size
     std::uint32_t dstDeviceId{0};             // receiver device id for this chunk (uniform per chunk)
@@ -50,9 +59,11 @@ class BounceTransferPlan
 public:
     /// @param maxChunkBytes        per-chunk byte cap (one region holds at most this)
     /// @param maxDescsPerChunk  upper bound on descs per chunk (bounds scatter-plan size)
+    /// @param mergeScatterRuns  coalesce the scatter view into runs (default). false = one count==1
+    ///                          run per desc — DEBUG ONLY (large-message control-plane A/B).
     /// Throws (TLLM_CHECK) on src/dst count or length mismatch, or a single desc > maxChunkBytes.
     [[nodiscard]] static BounceTransferPlan build(TransferDescs const& srcDescs, TransferDescs const& dstDescs,
-        std::size_t maxChunkBytes, std::size_t maxDescsPerChunk);
+        std::size_t maxChunkBytes, std::size_t maxDescsPerChunk, bool mergeScatterRuns = true);
 
     [[nodiscard]] std::vector<BounceChunk> const& chunks() const noexcept
     {

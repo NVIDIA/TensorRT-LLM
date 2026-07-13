@@ -64,6 +64,20 @@ inline constexpr std::uint32_t kNvtxScatter = 0xFFFFEB3BU;       // yellow: scat
 inline constexpr std::uint32_t kNvtxCreditStarved = 0xFFFF5722U; // deep orange: out of credits -> next GRANT
 inline constexpr std::uint32_t kNvtxArenaStarved = 0xFF795548U;  // brown: credits parked on local arena/exec
 
+// Fine-grained control-path spans decomposing ackWait (DATA sent -> ACK received). Together with
+// the coarse spans these localize where the ACK round-trip actually goes: sender-side DATA
+// build/enqueue, wire+peer time (the ackWait residual), receiver decode, scatter prep vs the real
+// GPU wait, ACK enqueue, and the IO-thread bookkeeping drain.
+inline constexpr std::uint32_t kNvtxDataSend = 0xFF00BCD4U;    // cyan: build entries + encode + zmq enqueue of DATA
+inline constexpr std::uint32_t kNvtxOnData = 0xFF009688U;      // teal: DATA decode + scatter-job enqueue (receiver IO)
+inline constexpr std::uint32_t kNvtxScatterPrep = 0xFFCDDC39U; // lime: scatter plan-array build + kernel launch
+inline constexpr std::uint32_t kNvtxScatterSync = 0xFFB2A429U; // dark lime: cudaStreamSynchronize (the GPU wait)
+inline constexpr std::uint32_t kNvtxAckSend = 0xFFF06292U;     // light pink: encode + zmq enqueue of ACK (worker)
+inline constexpr std::uint32_t kNvtxOnAck = 0xFFAD1457U;       // dark pink: ACK dispatch incl. mReqMu wait (sender IO)
+inline constexpr std::uint32_t kNvtxDoneDrain = 0xFF607D8BU;   // blue gray: drainScatterDone region bookkeeping
+inline constexpr std::uint32_t kNvtxZmqSend = 0xFF9C27B0U;     // purple: zmq sendTo (lock + msg copy + enqueue)
+inline constexpr std::uint32_t kNvtxZmqRecv = 0xFF673AB7U;     // deep purple: zmq frame reads + blob copies
+
 /// Scoped range with a printf-formatted message, e.g.
 /// `BounceNvtxScope s(kNvtxScatter, "scatter rid=%llu chunk=%u", rid, chunk);`
 /// RAII (begins on construction, ends on destruction — early-exit safe), but implemented with
