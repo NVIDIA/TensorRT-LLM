@@ -687,12 +687,7 @@ BlockManager::BlockManager(std::vector<SizeType32> const& numKvHeadsPerLayer, Si
         // radix-tree / scheduler / disagg machinery that already iterates pools internally.
         auto const poolIt = poolByWindow.find(windowSize);
         auto const windowSizePerHead = (poolIt != poolByWindow.end()) ? poolIt->second->sizePerHead : sizePerHead;
-        // Python treats the recurrent-state pool as byte storage before viewing each state with its actual dtype.
-        // Keep its backing type independent of the attention KV-cache dtype.
-        auto const windowDtype = LinearAttentionMetadata::hasRecurrentStatesCache(windowSize)
-            ? nvinfer1::DataType::kINT8
-            : (poolIt != poolByWindow.end()) ? poolIt->second->dtype
-                                             : dtype;
+        auto const windowDtype = (poolIt != poolByWindow.end()) ? poolIt->second->dtype : dtype;
         mWindowBlockManagers.try_emplace(SizeType32(windowSize), windowDtype, windowSize, layersWithWindowSize,
             numKvHeadsPerLayer, windowSizePerHead, tokensPerBlock,
             /*isSWA=*/(windowSize < maxSequenceLength) && (windowSize >= 0), allottedPrimaryBlocks,

@@ -822,6 +822,10 @@ TEST_F(KVCacheManagerTest, FP4AttentionWithInt8RecurrentStatesPoolTest)
         {recurrentStatesWindow, {blocksInPrimaryPool, blocksInSecondaryPool}},
         {maxAttentionWindow, {blocksInPrimaryPool, blocksInSecondaryPool}},
     };
+    auto const poolConfigurations = std::vector<PoolConfiguration>{
+        {recurrentStatesWindow, sizePerHead, nvinfer1::DataType::kINT8},
+        {maxAttentionWindow, sizePerHead, nvinfer1::DataType::kFP4},
+    };
     auto const stream = std::make_shared<tr::CudaStream>();
 
     KVCacheManager kvCacheManager(std::vector<SizeType32>{0, numKvHeads}, sizePerHead, tokensPerBlock, blocksPerWindow,
@@ -830,7 +834,7 @@ TEST_F(KVCacheManagerTest, FP4AttentionWithInt8RecurrentStatesPoolTest)
         /*sinkTokenLength=*/0, stream, maxAttentionWindow, /*chunkSize=*/0, /*enableBlockReuse=*/false,
         CacheType::kSELF, std::nullopt, nullptr, /*enablePartialReuse=*/false, /*copyOnPartialReuse=*/true, nullptr,
         /*enableIndexerKCache=*/false, /*indexerKCacheQuantBlockSize=*/128, /*indexerKCacheIndexHeadDim=*/0,
-        /*indexerKCacheUseFp4=*/false, linearAttentionMetadata);
+        /*indexerKCacheUseFp4=*/false, linearAttentionMetadata, poolConfigurations);
     kvCacheManager.allocatePools(/*useUvm=*/false);
     auto const& blockManager = kvCacheManager.getBlockManager();
 

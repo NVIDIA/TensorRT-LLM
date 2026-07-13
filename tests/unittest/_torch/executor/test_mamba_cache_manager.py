@@ -19,7 +19,11 @@ from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import (
     PythonMambaCacheManager,
     _get_mamba_hybrid_pool_size,
 )
-from tensorrt_llm._torch.pyexecutor.resource_manager import CacheTypeCpp
+from tensorrt_llm._torch.pyexecutor.resource_manager import (
+    CacheTypeCpp,
+    DataType,
+    PoolConfiguration,
+)
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.bindings.internal.batch_manager import LinearCacheType
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig, MTPDecodingConfig
@@ -401,6 +405,8 @@ def _build_hybrid_with_mamba_layer(
     enable_block_reuse=False,
     mamba_state_cache_interval=256,
     is_estimating_kv_cache=False,
+    dtype=DataType.HALF,
+    pool_configurations=None,
 ):
     """Construct a real CppMambaHybridCacheManager with one mamba layer +
     one full-attention layer so the parent KVCacheManager goes through the
@@ -437,7 +443,41 @@ def _build_hybrid_with_mamba_layer(
         spec_config=spec_config,
         layer_mask=attn_mask,
         is_estimating_kv_cache=is_estimating_kv_cache,
+        dtype=dtype,
+        pool_configurations=pool_configurations,
     )
+
+
+@skip_no_cuda
+def test_cpp_hybrid_passes_per_window_pool_dtypes_for_nvfp4_kv_cache():
+    mgr = _build_hybrid_with_mamba_layer(dtype=DataType.NVFP4)
+
+    expected_dtypes = [
+        (LinearCacheType.RECURRENT_STATES.value, DataType.INT8),
+        (128, DataType.NVFP4),
+    ]
+    assert [
+        (config.window_size, config.dtype) for config in mgr.pool_configurations
+    ] == expected_dtypes
+    assert [
+        (config.window_size, config.dtype) for config in mgr.impl.pool_configurations
+    ] == expected_dtypes
+    assert mgr._layer_to_pool_idx == {0: 0, 1: 1}
+    assert mgr.recurrent_states_pool_index == 0
+    assert mgr.impl.get_recurrent_states_pool().dtype == torch.int8
+
+
+def test_cpp_hybrid_rejects_nvfp4_recurrent_states_pool():
+    with pytest.raises(ValueError, match="Recurrent states require an INT8 backing pool"):
+        _build_hybrid_with_mamba_layer(
+            pool_configurations=[
+                PoolConfiguration(
+                    window_size=LinearCacheType.RECURRENT_STATES.value,
+                    head_dim=64,
+                    dtype=DataType.NVFP4,
+                )
+            ]
+        )
 
 
 @skip_no_cuda
@@ -687,6 +727,14 @@ def test_cpp_hybrid_zero_local_mamba_layers():
     # On the early-exit branch, num_layers is forwarded as-is.
     assert mgr.num_layers == 4
     assert mgr.num_local_layers == 2
+    assert all(
+        config.window_size != LinearCacheType.RECURRENT_STATES.value
+        for config in mgr.pool_configurations
+    )
+    assert all(
+        config.window_size != LinearCacheType.RECURRENT_STATES.value
+        for config in mgr.impl.pool_configurations
+    )
 
     # No mamba-only state was allocated.
     for attr in (

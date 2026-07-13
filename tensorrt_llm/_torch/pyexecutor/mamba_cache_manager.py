@@ -1466,6 +1466,7 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         use_replay_state_update: bool = False,
         mamba_ssm_stochastic_rounding: bool = False,
         model_type: str = "nemotron_hybrid",
+        pool_configurations: Optional[List[PoolConfiguration]] = None,
         **kwargs,
     ) -> None:
         # 3 kinds of layers:
@@ -1539,6 +1540,7 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
                 layer_mask=full_attention_layer_mask,
                 is_estimating_kv_cache=is_estimating_kv_cache,
                 is_draft=is_draft,
+                pool_configurations=pool_configurations,
             )
             return
 
@@ -1626,6 +1628,65 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
                     LinearCacheType.RECURRENT_STATES.
                     value if mamba_layer_mask[i] else max_seq_len)
 
+        # Recurrent states are stored as bytes and cast to their actual SSM /
+        # convolution dtypes by this manager. They therefore need an INT8
+        # backing pool even when the attention KV cache uses NVFP4. Pass both
+        # window configurations so BlockManager::poolByWindow does not fall
+        # back to the manager-level attention dtype for recurrent states.
+        recurrent_states_window = LinearCacheType.RECURRENT_STATES.value
+        normalized_pool_configurations = [
+            PoolConfiguration(
+                window_size=min(config.window_size, max_seq_len),
+                head_dim=config.head_dim,
+                dtype=config.dtype,
+            ) for config in (pool_configurations or [])
+        ]
+        pool_by_window = {
+            pc.window_size: pc
+            for pc in normalized_pool_configurations
+        }
+        if len(pool_by_window) != len(normalized_pool_configurations):
+            raise ValueError(
+                "Multiple pool configurations share the same window size")
+        unexpected_windows = set(pool_by_window) - {
+            recurrent_states_window, max_seq_len
+        }
+        if unexpected_windows:
+            raise ValueError(
+                "CppMambaHybridCacheManager received pool configurations for "
+                f"unexpected window sizes: {sorted(unexpected_windows)}")
+        recurrent_pool = pool_by_window.get(recurrent_states_window)
+        if recurrent_pool is not None and recurrent_pool.dtype != DataType.INT8:
+            raise ValueError(
+                "Recurrent states require an INT8 backing pool, got "
+                f"{recurrent_pool.dtype}")
+        local_windows = {
+            recurrent_states_window
+            if mamba_layer_mask[layer_idx] else max_seq_len
+            for layer_idx in self.pp_layers
+        }
+        if recurrent_states_window in local_windows:
+            pool_by_window.setdefault(
+                recurrent_states_window,
+                PoolConfiguration(
+                    window_size=recurrent_states_window,
+                    head_dim=head_dim,
+                    dtype=DataType.INT8,
+                ),
+            )
+        if max_seq_len in local_windows:
+            pool_by_window.setdefault(
+                max_seq_len,
+                PoolConfiguration(
+                    window_size=max_seq_len,
+                    head_dim=head_dim,
+                    dtype=dtype,
+                ),
+            )
+        pool_configurations = [
+            pool_by_window[window_size] for window_size in sorted(local_windows)
+        ]
+
         # Normalize num_kv_heads to a per-layer list and zero out mamba
         # layer positions: those layers carry SSM/conv state instead of KV
         # heads, so the parent KV cache should not allocate KV head storage
@@ -1661,6 +1722,7 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
             is_estimating_kv_cache=is_estimating_kv_cache,
             is_draft=is_draft,
             linear_attention_metadata=self.linear_attention_metadata,
+            pool_configurations=pool_configurations,
             **kwargs,
         )
 
