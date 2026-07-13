@@ -26,6 +26,7 @@ import tensorrt_llm.quantization.utils.fp8_utils as fp8_utils
 from tensorrt_llm._utils import get_sm_version, is_sm_100f, nvtx_range, nvtx_range_debug
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.quantization.utils.fp4_utils import NVFP4_SF_VEC_SIZE
 
 from ..attention_backend import (
     AttentionForwardArgs,
@@ -47,13 +48,18 @@ from ..attention_backend.sparse.dsa import (
 from ..attention_backend.utils import create_attention
 from ..distributed import AllReduceParams
 from ..model_config import ModelConfig
-from ..utils import Fp4QuantizedTensor, is_torch_compiling, maybe_compiled_cat, maybe_compiled_copy_
+from ..utils import (
+    Fp4QuantizedTensor,
+    compute_swizzled_sf_shape,
+    is_torch_compiling,
+    maybe_compiled_cat,
+    maybe_compiled_copy_,
+)
 from .attention import (
     _helix_cp_allgather_input,
     _helix_cp_output_projection,
     _helix_post_process,
     _helix_zero_kv_mask,
-    _slice_hidden_states_to_num_tokens,
     extract_extra_attrs,
 )
 from .linear import Linear, TensorParallelMode, is_static_nvfp4_input_eligible
@@ -70,6 +76,55 @@ except ImportError:
 
 def _is_env_truthy(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() in ("1", "true", "on")
+
+
+def _slice_hidden_states_to_num_tokens(hidden_states, num_tokens: int):
+    """Drop CUDA-graph padding by slicing hidden_states to num_tokens rows.
+
+    For a plain tensor this is the usual row slice. For an Fp4QuantizedTensor
+    (produced when the previous layer's boundary fusion pre-quantized this
+    layer's input) the slice must act on the packed FP4 form:
+      - fp4_tensor: row-major [m, k//2], so [:num_tokens] is a plain row slice;
+      - scaling_factor: 1D swizzled buffer of padUp(m,128)*padUp(cols,4). NVFP4
+        quant is per-row independent and the swizzle is laid out in independent
+        128-row tiles, so the leading padUp(num_tokens,128)*padUp(cols,4) bytes
+        are exactly the scale factors for the first num_tokens rows (verified by
+        tests/unittest/_torch/modules/test_fp4_num_tokens_slice.py).
+      - unquantized_hidden_states (when present): plain row slice.
+    """
+    if not isinstance(hidden_states, Fp4QuantizedTensor):
+        return hidden_states[:num_tokens, ...]
+
+    fp4 = hidden_states.fp4_tensor
+    if fp4.shape[0] == num_tokens:
+        return hidden_states  # no padding to strip
+    # The row-slice math below relies on the swizzled 128-row-tile layout; a
+    # non-swizzled (linear) scale buffer would be sliced incorrectly and then
+    # silently relabeled as swizzled. Reject it rather than corrupt the SF.
+    if not hidden_states.is_sf_swizzled:
+        raise ValueError(
+            "_slice_hidden_states_to_num_tokens only supports swizzled FP4 scaling factors"
+        )
+    sf = hidden_states.scaling_factor
+    # fp4 packs 2 elements/byte, so the logical hidden dim is fp4_cols*2 and
+    # the scale-factor column count is that / NVFP4_SF_VEC_SIZE. The swizzled
+    # SF is laid out in independent 128-row tiles, so the leading num_tokens
+    # rows' scale factors occupy exactly the first padded_rows*padded_cols
+    # bytes.
+    sf_cols = fp4.shape[-1] * 2 // NVFP4_SF_VEC_SIZE
+    padded_rows, padded_cols = compute_swizzled_sf_shape(num_tokens, sf_cols)
+    sf_len = padded_rows * padded_cols
+    sliced_unquant = (
+        hidden_states.unquantized_hidden_states[:num_tokens]
+        if hidden_states.unquantized_hidden_states is not None
+        else None
+    )
+    return Fp4QuantizedTensor(
+        fp4_tensor=fp4[:num_tokens].contiguous(),
+        scaling_factor=sf.view(-1)[:sf_len].contiguous(),
+        is_sf_swizzled=True,
+        unquantized_hidden_states=sliced_unquant,
+    )
 
 
 def _extract_mla_extra_attrs(layer_idx: str):
@@ -120,7 +175,7 @@ def mla_custom_op_inplace(
     # When hidden_states_fp4/_sf are provided, the previous layer's boundary
     # fusion pre-quantized this layer's kv_a_proj NVFP4 input. Custom ops can't
     # take dataclasses, so the Fp4QuantizedTensor is passed as explicit tensors
-    # and reconstructed here (mirrors mla_dsa_proj). bf16_hidden_states carries
+    # and reconstructed here (mirrors mla_dsa_proj). unquantized_hidden_states carries
     # the un-quantized view for the o_proj output sizing in create_output.
     metadata, mla_layer = _extract_mla_extra_attrs(layer_idx)
     if hidden_states_fp4 is not None or hidden_states_sf is not None:
@@ -130,7 +185,7 @@ def mla_custom_op_inplace(
         hidden_states = Fp4QuantizedTensor(
             fp4_tensor=hidden_states_fp4,
             scaling_factor=hidden_states_sf,
-            bf16_hidden_states=hidden_states,
+            unquantized_hidden_states=hidden_states,
         )
     if mla_layer.is_deepseek_v4:
         # DeepSeek-V4 uses MQA mode and has no residual-less RMSNorm+quant
@@ -202,7 +257,7 @@ def mla_dsa_proj(
         hs = Fp4QuantizedTensor(
             fp4_tensor=hidden_states_fp4,
             scaling_factor=hidden_states_sf,
-            bf16_hidden_states=hidden_states,
+            unquantized_hidden_states=hidden_states,
         )
     else:
         hs = hidden_states
@@ -1080,12 +1135,12 @@ class MLA(nn.Module):
         # producing fold must have requested return_norm_out so the BF16 view
         # is present (folds feeding an MLA always do).
         if isinstance(hidden_states, Fp4QuantizedTensor):
-            assert hidden_states.bf16_hidden_states is not None, (
+            assert hidden_states.unquantized_hidden_states is not None, (
                 "MLA.create_output received an Fp4QuantizedTensor without a "
-                "bf16_hidden_states view; the producing fusion must use "
+                "unquantized_hidden_states view; the producing fusion must use "
                 "return_norm_out=True"
             )
-            hidden_states = hidden_states.bf16_hidden_states
+            hidden_states = hidden_states.unquantized_hidden_states
         num_tokens = hidden_states.shape[0]
         if self.is_deepseek_v4:
             hidden_size = self.num_heads_tp_cp * self.v_head_dim
@@ -3036,7 +3091,7 @@ class MLA(nn.Module):
                     # can't take dataclasses, so pass tensors explicitly.
                     if isinstance(hidden_states, Fp4QuantizedTensor):
                         proj_outputs = torch.ops.trtllm.mla_dsa_proj(
-                            hidden_states.bf16_hidden_states,
+                            hidden_states.unquantized_hidden_states,
                             position_ids,
                             self.layer_idx_str,
                             hidden_states.fp4_tensor,
@@ -3066,7 +3121,7 @@ class MLA(nn.Module):
                     # explicit tensors.
                     if isinstance(hidden_states, Fp4QuantizedTensor):
                         torch.ops.trtllm.mla_custom_op_inplace(
-                            hidden_states.bf16_hidden_states,
+                            hidden_states.unquantized_hidden_states,
                             position_ids,
                             self.layer_idx_str,
                             attn_output,

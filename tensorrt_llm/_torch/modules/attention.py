@@ -7,7 +7,6 @@ from torch import nn
 
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
-from tensorrt_llm.quantization.utils.fp4_utils import NVFP4_SF_VEC_SIZE
 
 from ..attention_backend import (AttentionForwardArgs, AttentionMetadata,
                                  FlashInferAttentionMetadata,
@@ -20,56 +19,11 @@ from ..distributed import (AllReduceParams, HelixAllToAllNative, alltoall_helix,
                            cp_allgather, reducescatter)
 from ..model_config import ModelConfig
 from ..peft.lora.layer import LoraLayer, LoraModuleType
-from ..utils import (Fp4QuantizedTensor, compute_swizzled_sf_shape,
-                     get_model_extra_attrs, is_nvfp4_marlin_enabled,
-                     is_torch_compiling)
+from ..utils import (Fp4QuantizedTensor, get_model_extra_attrs,
+                     is_nvfp4_marlin_enabled, is_torch_compiling)
 from .linear import Linear, TensorParallelMode, WeightMode, WeightsLoadingConfig
 from .multi_stream_utils import maybe_execute_in_parallel
 from .rotary_embedding import MRotaryEmbedding, RotaryEmbedding
-
-
-def _slice_hidden_states_to_num_tokens(hidden_states, num_tokens: int):
-    """Drop CUDA-graph padding by slicing hidden_states to num_tokens rows.
-
-    For a plain tensor this is the usual row slice. For an Fp4QuantizedTensor
-    (produced when the previous layer's boundary fusion pre-quantized this
-    layer's input) the slice must act on the packed FP4 form:
-      - fp4_tensor: row-major [m, k//2], so [:num_tokens] is a plain row slice;
-      - scaling_factor: 1D swizzled buffer of padUp(m,128)*padUp(cols,4). NVFP4
-        quant is per-row independent and the swizzle is laid out in independent
-        128-row tiles, so the leading padUp(num_tokens,128)*padUp(cols,4) bytes
-        are exactly the scale factors for the first num_tokens rows (verified by
-        tests/unittest/_torch/modules/test_fp4_num_tokens_slice.py).
-      - bf16_hidden_states (when present): plain row slice.
-    """
-    if not isinstance(hidden_states, Fp4QuantizedTensor):
-        return hidden_states[:num_tokens, ...]
-
-    fp4 = hidden_states.fp4_tensor
-    if fp4.shape[0] == num_tokens:
-        return hidden_states  # no padding to strip
-    # The row-slice math below relies on the swizzled 128-row-tile layout; a
-    # non-swizzled (linear) scale buffer would be sliced incorrectly and then
-    # silently relabeled as swizzled. Reject it rather than corrupt the SF.
-    if not hidden_states.is_sf_swizzled:
-        raise ValueError(
-            "_slice_hidden_states_to_num_tokens only supports swizzled FP4 "
-            "scaling factors")
-    sf = hidden_states.scaling_factor
-    # fp4 packs 2 elements/byte, so the logical hidden dim is fp4_cols*2 and
-    # the scale-factor column count is that / NVFP4_SF_VEC_SIZE. The swizzled
-    # SF is laid out in independent 128-row tiles, so the leading num_tokens
-    # rows' scale factors occupy exactly the first padded_rows*padded_cols
-    # bytes.
-    sf_cols = fp4.shape[-1] * 2 // NVFP4_SF_VEC_SIZE
-    padded_rows, padded_cols = compute_swizzled_sf_shape(num_tokens, sf_cols)
-    sf_len = padded_rows * padded_cols
-    sliced_bf16 = (hidden_states.bf16_hidden_states[:num_tokens]
-                   if hidden_states.bf16_hidden_states is not None else None)
-    return Fp4QuantizedTensor(fp4_tensor=fp4[:num_tokens].contiguous(),
-                              scaling_factor=sf.view(-1)[:sf_len].contiguous(),
-                              is_sf_swizzled=True,
-                              bf16_hidden_states=sliced_bf16)
 
 
 def extract_extra_attrs(layer_idx: str, attn_type: str):

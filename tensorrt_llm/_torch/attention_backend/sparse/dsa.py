@@ -2885,10 +2885,10 @@ class Indexer(nn.Module):
         # the BF16 post-RMSNorm value. Use that BF16 view here -- the indexer
         # weight is BF16 and the matmul needs a float input.
         if isinstance(hidden_states, Fp4QuantizedTensor):
-            assert hidden_states.bf16_hidden_states is not None, (
+            assert hidden_states.unquantized_hidden_states is not None, (
                 "pre_indexer_proj received Fp4QuantizedTensor without bf16 view; "
                 "the producer fusion must request return_norm_out=True")
-            hidden_states_bf = hidden_states.bf16_hidden_states
+            hidden_states_bf = hidden_states.unquantized_hidden_states
         else:
             hidden_states_bf = hidden_states
         hidden_float = _to_float(hidden_states_bf)

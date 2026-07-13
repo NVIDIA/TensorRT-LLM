@@ -94,10 +94,7 @@ class RMSNorm(nn.Module):
         # the downstream linear layer handle FP4 quantization.
         if self.is_nvfp4:
             sm_version = get_sm_version()
-            # SM range narrowed to 10.x by this PR: the reduce_fusion kernels
-            # use cvt_warp_fp16_to_fp4 (guarded by __CUDA_ARCH__ >= 1000),
-            # which silently emits zeros on SM 9.x. Marlin is also
-            # incompatible with the fused NVFP4 path.
+            # Marlin is also incompatible with the fused NVFP4 path.
             if not (100 <= sm_version < 120) or is_nvfp4_marlin_enabled():
                 self.is_nvfp4 = False
                 return_hp_output = False
@@ -257,7 +254,7 @@ class RMSNorm(nn.Module):
         With a residual: returns ``(Fp4QuantizedTensor, residual_out)``. Without:
         returns an ``Fp4QuantizedTensor`` (the residual-less q_a edge). When
         ``return_norm_out`` the BF16 post-RMSNorm view is stashed on the
-        Fp4QuantizedTensor's ``bf16_hidden_states`` (and, residual-less, returned
+        Fp4QuantizedTensor's ``unquantized_hidden_states`` (and, residual-less, returned
         alongside). When ``self.return_hp_output`` the BF16 normed value is
         appended as a trailing output for MoE-gate consumers."""
         # Either flag means "also produce the BF16 normed value".
@@ -283,7 +280,7 @@ class RMSNorm(nn.Module):
                 bf16_hs = None
             fp4 = Fp4QuantizedTensor(act_fp4,
                                      act_sf,
-                                     bf16_hidden_states=bf16_hs)
+                                     unquantized_hidden_states=bf16_hs)
             outputs = [fp4, residual_out]
             if self.return_hp_output:
                 outputs.append(bf16_hs)
@@ -307,7 +304,9 @@ class RMSNorm(nn.Module):
             norm_out = None
         if len(orig_shape) != 2:
             act_fp4 = act_fp4.reshape(*orig_shape[:-1], n // 2)
-        fp4 = Fp4QuantizedTensor(act_fp4, act_sf, bf16_hidden_states=norm_out)
+        fp4 = Fp4QuantizedTensor(act_fp4,
+                                 act_sf,
+                                 unquantized_hidden_states=norm_out)
         return (fp4, norm_out) if return_norm_out else fp4
 
     def _fused_nvfp4_quant_ws(
@@ -348,7 +347,7 @@ class RMSNorm(nn.Module):
         bf16_hs = results[3].reshape(orig_shape) if want_norm else None
         fp4 = Fp4QuantizedTensor(normed_fp4_u8,
                                  sf_fused,
-                                 bf16_hidden_states=bf16_hs)
+                                 unquantized_hidden_states=bf16_hs)
         outputs = [fp4, residual_out]
         if self.return_hp_output:
             outputs.append(bf16_hs)

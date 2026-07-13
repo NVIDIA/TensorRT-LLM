@@ -1451,7 +1451,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                 # NVFP4 kv_a_proj input-quant via its attached .nvfp4_scale
                 # (RMSNorm.forward), returning an Fp4QuantizedTensor.
                 # return_norm_out stashes the BF16 view DSA's pre_indexer_proj
-                # needs on that tensor's bf16_hidden_states.
+                # needs on that tensor's unquantized_hidden_states.
                 hidden_states = self.input_layernorm(hidden_states,
                                                      return_norm_out=True)[0]
             else:
