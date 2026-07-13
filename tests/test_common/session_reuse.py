@@ -160,6 +160,10 @@ def wait_gpu_memory_settle() -> None:
             pass
 
 
+_RETIRE_THREADS: list = []
+_RETIRE_LOCK = threading.Lock()
+
+
 def _proc_start_time(pid: int):
     """Kernel start time (jiffies since boot) of ``pid``, or None if gone.
 
@@ -312,7 +316,14 @@ class SessionReuseCache:
             except Exception:
                 pass
 
-        threading.Thread(target=_dispose, daemon=True, name="session-reuse-retire").start()
+        t = threading.Thread(target=_dispose, daemon=True, name="session-reuse-retire")
+        t.start()
+        # Track in-flight disposals so drain() can reap them at natural
+        # rendezvous points (failure fence / session finish) with a bounded
+        # join; the hot path stays non-blocking and daemon=True still
+        # guarantees a wedged disposal cannot hang interpreter exit.
+        with _RETIRE_LOCK:
+            _RETIRE_THREADS.append(t)
 
     # ---- factory installed at the pool-creation seam ----
 
@@ -442,7 +453,22 @@ class SessionReuseCache:
         self._suspended = suspended
 
     def drain(self) -> None:
-        """Shut down all cached pools in parallel (frees GPU/CPU footprint)."""
+        """Shut down all cached pools in parallel (frees GPU/CPU footprint).
+
+        Also reaps in-flight retire threads: drain runs at natural rendezvous
+        points (failure fence, opt-out, session finish), so waiting here keeps
+        disposals from leaking past the session without ever blocking the
+        per-test hot path. The join is bounded for the same reason as below.
+        """
+        with _RETIRE_LOCK:
+            in_flight, _RETIRE_THREADS[:] = list(_RETIRE_THREADS), []
+        for t in in_flight:
+            t.join(timeout=60)
+            if t.is_alive():
+                print(
+                    "[session-reuse] WARNING: pool retirement did not finish within 60s",
+                    flush=True,
+                )
         with self._lock:
             pools, self._pools = list(self._pools.values()), {}
         if not pools:
