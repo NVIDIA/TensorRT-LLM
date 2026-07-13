@@ -19,6 +19,7 @@ import contextlib
 import gc
 import glob
 import json
+import math
 import os
 import random
 import shutil
@@ -39,6 +40,7 @@ WAN22_A14B_FP8_MODEL_SUBPATH = "Wan2.2-T2V-A14B-Diffusers-FP8"
 WAN22_A14B_NVFP4_MODEL_SUBPATH = "Wan2.2-T2V-A14B-Diffusers-NVFP4"
 WAN22_I2V_A14B_NVFP4_MODEL_SUBPATH = "Wan2.2-I2V-A14B-Diffusers-NVFP4"
 QWEN_IMAGE_MODEL_SUBPATH = "qwen-image"
+QWEN_IMAGE_LAYERED_MODEL_SUBPATH = "qwen-image-layered"
 VISUAL_GEN_OUTPUT_VIDEO = "trtllm_output.mp4"
 DIFFUSERS_REFERENCE_VIDEO = "diffusers_reference.mp4"
 WAN_T2V_PROMPT = "A cute cat playing piano"
@@ -104,6 +106,14 @@ QWENIMAGE_LPIPS_NUM_INFERENCE_STEPS = 50
 QWENIMAGE_LPIPS_TRUE_CFG_SCALE = 4.0
 QWENIMAGE_LPIPS_SEED = 42
 QWENIMAGE_LPIPS_THRESHOLD = 0.05
+QWEN_IMAGE_LAYERED_LPIPS_PROMPT = ""
+QWEN_IMAGE_LAYERED_LPIPS_NEGATIVE_PROMPT = " "
+QWEN_IMAGE_LAYERED_LPIPS_NUM_INFERENCE_STEPS = 50
+QWEN_IMAGE_LAYERED_LPIPS_TRUE_CFG_SCALE = 4.0
+QWEN_IMAGE_LAYERED_LPIPS_LAYERS = 4
+QWEN_IMAGE_LAYERED_LPIPS_RESOLUTION = 640
+QWEN_IMAGE_LAYERED_LPIPS_SEED = 777
+QWEN_IMAGE_LAYERED_LPIPS_THRESHOLD = 0.05
 
 # Cosmos3-Nano (text-to-video + text-to-image) — default-setting LPIPS golden.
 # Params are the Cosmos3 720P defaults (cosmos3/defaults.py:COSMOS3_720P_PARAMS).
@@ -873,6 +883,97 @@ def _generate_qwenimage_lpips_image(model_path, output_path, *, enable_cuda_grap
     save_image(generated_image, output_path)
 
 
+def _copy_qwen_image_layered_lpips_input(tmp_path, input_path):
+    source = _golden_media_path(
+        tmp_path,
+        "qwen_image_layered_lpips_input.png",
+        "Qwen-Image-Layered LPIPS input image",
+    )
+    shutil.copyfile(source, input_path)
+
+
+def _qwen_image_layered_golden_layer_paths(tmp_path):
+    golden_dir = _golden_media_path(
+        tmp_path,
+        "qwen_image_layered_lpips_golden",
+        "Qwen-Image-Layered LPIPS golden layer directory",
+    )
+    layer_paths = sorted(
+        golden_dir.glob("layer_*.png"),
+        key=lambda path: int(path.stem.rsplit("_", 1)[1]),
+    )
+    assert layer_paths, f"Qwen-Image-Layered golden layer directory is empty: {golden_dir}"
+    return layer_paths
+
+
+def _write_qwen_image_layered_lpips_golden_grid(tmp_path, output_path):
+    from PIL import Image
+
+    layer_paths = _qwen_image_layered_golden_layer_paths(tmp_path)
+    layers = []
+    for path in layer_paths:
+        with Image.open(path) as image:
+            layers.append(image.convert("RGBA").copy())
+
+    width, height = layers[0].size
+    assert all(layer.size == (width, height) for layer in layers), (
+        "Qwen-Image-Layered golden layers must have identical sizes, got "
+        f"{[layer.size for layer in layers]}"
+    )
+    grid_cols = math.ceil(math.sqrt(len(layers)))
+    grid_rows = math.ceil(len(layers) / grid_cols)
+    grid = Image.new("RGBA", (grid_cols * width, grid_rows * height), (0, 0, 0, 0))
+    for index, layer in enumerate(layers):
+        row, col = divmod(index, grid_cols)
+        grid.alpha_composite(layer, dest=(col * width, row * height))
+    grid.save(output_path)
+
+
+def _flatten_qwen_image_layered_lpips_image(input_path, output_path):
+    from PIL import Image
+
+    with Image.open(input_path) as image:
+        rgba_image = image.convert("RGBA")
+        background = Image.new("RGBA", rgba_image.size, (255, 255, 255, 255))
+        background.alpha_composite(rgba_image)
+        background.convert("RGB").save(output_path)
+
+
+def _generate_qwen_image_layered_lpips_image(model_path, input_path, output_path):
+    """Generate the Qwen-Image-Layered LPIPS sample (default setting, compile-off)."""
+    from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
+    from tensorrt_llm.media.encoding import save_image
+    from tensorrt_llm.visual_gen.args import TorchCompileConfig, VisualGenArgs
+
+    _skip_if_missing(model_path, "Qwen-Image-Layered checkpoint", is_dir=True)
+    _disable_inductor_compile_worker_quiesce()
+    args = VisualGenArgs(
+        model=model_path,
+        torch_compile_config=TorchCompileConfig(enable=False),
+    )
+    pipeline = PipelineLoader(args).load(skip_warmup=True)
+    try:
+        with torch.no_grad():
+            result = pipeline.forward(
+                image=str(input_path),
+                prompt=QWEN_IMAGE_LAYERED_LPIPS_PROMPT,
+                negative_prompt=QWEN_IMAGE_LAYERED_LPIPS_NEGATIVE_PROMPT,
+                num_inference_steps=QWEN_IMAGE_LAYERED_LPIPS_NUM_INFERENCE_STEPS,
+                true_cfg_scale=QWEN_IMAGE_LAYERED_LPIPS_TRUE_CFG_SCALE,
+                layers=QWEN_IMAGE_LAYERED_LPIPS_LAYERS,
+                resolution=QWEN_IMAGE_LAYERED_LPIPS_RESOLUTION,
+                cfg_normalize=True,
+                use_en_prompt=True,
+                seed=QWEN_IMAGE_LAYERED_LPIPS_SEED,
+            )
+        generated_image = result.image[0].detach().cpu()
+    finally:
+        del pipeline
+        _cleanup_cuda()
+
+    save_image(generated_image, output_path)
+
+
 def _run_cosmos3_lpips_pipeline(num_frames):
     """Run the Cosmos3-Nano pipeline (default setting, VANILLA attn, compile-off).
 
@@ -1132,6 +1233,35 @@ def test_qwenimage_cuda_graph_lpips_against_golden(tmp_path):
         generated_path,
     )
     _assert_lpips_below_threshold(score, QWENIMAGE_LPIPS_THRESHOLD)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_qwen_image_layered_lpips_against_golden(tmp_path):
+    input_path = tmp_path / "qwen_image_layered_input.png"
+    generated_path = tmp_path / "qwen_image_layered_generated.png"
+    golden_path = tmp_path / "qwen_image_layered_golden_grid.png"
+    generated_lpips_path = tmp_path / "qwen_image_layered_generated_lpips.png"
+    golden_lpips_path = tmp_path / "qwen_image_layered_golden_grid_lpips.png"
+    _copy_qwen_image_layered_lpips_input(tmp_path, input_path)
+    _write_qwen_image_layered_lpips_golden_grid(tmp_path, golden_path)
+    _generate_qwen_image_layered_lpips_image(
+        _lpips_model_path(QWEN_IMAGE_LAYERED_MODEL_SUBPATH),
+        input_path,
+        generated_path,
+    )
+    # Ignore invisible RGB values under transparent pixels while preserving
+    # partially transparent layer edges.
+    _flatten_qwen_image_layered_lpips_image(generated_path, generated_lpips_path)
+    _flatten_qwen_image_layered_lpips_image(golden_path, golden_lpips_path)
+    score = _run_lpips_eval(
+        tmp_path,
+        "qwen_image_layered",
+        "image",
+        QWEN_IMAGE_LAYERED_LPIPS_PROMPT,
+        golden_lpips_path,
+        generated_lpips_path,
+    )
+    _assert_lpips_below_threshold(score, QWEN_IMAGE_LAYERED_LPIPS_THRESHOLD)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
@@ -1835,6 +1965,55 @@ def test_qwen_image_example(_visual_gen_deps, llm_root, llm_venv):
             model_path,
             "--visual_gen_args",
             config_path,
+            "--output_path",
+            output_path,
+        ],
+    )
+    assert os.path.isfile(output_path), f"Example did not produce output at {output_path}"
+
+
+def test_qwen_image_layered_example(_visual_gen_deps, tmp_path, llm_root, llm_venv):
+    """Run examples/visual_gen/models/qwen_image_layered.py end-to-end."""
+    scratch_space = _llm_models_root()
+    model_path = os.path.join(scratch_space, QWEN_IMAGE_LAYERED_MODEL_SUBPATH)
+    _skip_if_missing(model_path, "Qwen-Image-Layered checkpoint", is_dir=True)
+    model_index_path = os.path.join(model_path, "model_index.json")
+    if not os.path.isfile(model_index_path):
+        pytest.skip(
+            f"Qwen-Image-Layered checkpoint is incomplete: {model_path} "
+            f"(missing {model_index_path})"
+        )
+
+    input_path = tmp_path / "qwen_image_layered_input.png"
+    _copy_qwen_image_layered_lpips_input(tmp_path, input_path)
+
+    out_dir = os.path.join(
+        llm_venv.get_working_directory(), "visual_gen_output", "qwen_image_layered_example"
+    )
+    os.makedirs(out_dir, exist_ok=True)
+    output_path = os.path.join(out_dir, "qwen_image_layered_output.png")
+
+    script_path = os.path.join(
+        llm_root, "examples", "visual_gen", "models", "qwen_image_layered.py"
+    )
+    assert os.path.isfile(script_path), f"Example script not found: {script_path}"
+    config_path = os.path.join(
+        llm_root, "examples", "visual_gen", "configs", "qwen-image-layered-1gpu.yaml"
+    )
+    assert os.path.isfile(config_path), f"Config not found: {config_path}"
+
+    _venv_check_call(
+        llm_venv,
+        [
+            script_path,
+            "--model",
+            model_path,
+            "--visual_gen_args",
+            config_path,
+            "--image",
+            str(input_path),
+            "--prompt",
+            QWEN_IMAGE_LAYERED_LPIPS_PROMPT,
             "--output_path",
             output_path,
         ],
