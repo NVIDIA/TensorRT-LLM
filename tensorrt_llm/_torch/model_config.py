@@ -94,7 +94,6 @@ def _unified_kv_pool_includes_mamba(
 
 def _is_lock_infra_error(exc: BaseException) -> bool:
     """Whether exc indicates broken lock infrastructure (not mere contention)."""
-    # Callers pass only PermissionError/OSError; filelock.Timeout never reaches here.
     if isinstance(exc, PermissionError):
         return True
     if isinstance(exc, OSError):
