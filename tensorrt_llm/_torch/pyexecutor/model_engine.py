@@ -678,8 +678,10 @@ class PyTorchModelEngine(ModelEngine):
         # Steady-state generation-only prepare cache (non-speculative overlap
         # decode). Holds the per-request lists that are invariant while the
         # scheduled generation batch keeps the same composition, plus a pinned
-        # position/cached-token buffer advanced by one per step. Invalidated
-        # (set to None) by every full _prepare_tp_inputs pass.
+        # cached-token counter advanced by one per step (host-side bookkeeping
+        # only; the device position buffer is advanced in place and this
+        # buffer is never the source of an async H2D). Invalidated (set to
+        # None) by every full _prepare_tp_inputs pass.
         self._steady_gen_cache: Optional[Dict[str, Any]] = None
         self._steady_gen_positions_pinned = torch.empty(
             (self.max_num_tokens, ),
@@ -3317,18 +3319,37 @@ class PyTorchModelEngine(ModelEngine):
 
         Every request advanced by exactly one committed token since the last
         prepare, so instead of re-walking the batch in Python this advances
-        the cached positions with one vectorized op, reuses the seq-slot
-        buffer already on device, and refreshes only the per-step metadata.
+        the cached positions in place (device position buffer plus a pinned
+        host counter), reuses the seq-slot buffer already on device, and
+        refreshes only the per-step metadata. For mrope models (recorded only
+        for batches with no actual mrope work) the (3,1,N) broadcast buffer
+        the model reads is the one advanced.
         """
         cache = self._steady_gen_cache
         num_requests = cache['num_requests']
 
         # Positions and cached-token counts are the same values in this
-        # regime; advance both with a single in-place increment.
+        # regime; advance both by one. The device-side position buffer is
+        # advanced in place: it still holds the previous step's positions
+        # because only _prepare_tp_inputs writes it and the cache validity
+        # invariant guarantees the previous pass wrote these same rows. This
+        # avoids reusing a mutated pinned buffer as the source of an async
+        # H2D whose previous-step copy may still be pending under the overlap
+        # scheduler (the nvbug 6293536 hazard class; see
+        # KVCacheManager._stage_block_offsets_for_copy). The pinned buffer is
+        # host-side bookkeeping only.
+        use_mrope = cache['use_mrope']
         positions = self._steady_gen_positions_pinned[:num_requests]
         positions.add_(1)
-        self.position_ids_cuda[:num_requests].copy_(positions,
-                                                    non_blocking=True)
+        if use_mrope:
+            # Text-only batch on an mrope model: the recording pass broadcast
+            # the scalar positions onto all three axes of the (3,1,N) buffer,
+            # which is what the model (and any captured CUDA graph) reads, so
+            # advance it in place. position_ids_cuda is reseeded by the next
+            # full pass.
+            self.mrope_position_ids_cuda[:, :, :num_requests].add_(1)
+        else:
+            self.position_ids_cuda[:num_requests].add_(1)
         num_cached_tokens_per_seq = positions.tolist()
 
         # Gather this step's input tokens from the previous iteration's device
@@ -3367,7 +3388,13 @@ class PyTorchModelEngine(ModelEngine):
         virtual_num_tokens = num_requests
         if attn_metadata.padded_num_tokens is not None:
             self.input_ids_cuda[num_requests:padded_num_tokens].fill_(0)
-            self.position_ids_cuda[num_requests:padded_num_tokens].fill_(0)
+            # Zero-fill the padding tail of whichever position layout the
+            # model consumes, matching the full pass.
+            if use_mrope:
+                self.mrope_position_ids_cuda[:, :, num_requests:
+                                             padded_num_tokens].fill_(0)
+            else:
+                self.position_ids_cuda[num_requests:padded_num_tokens].fill_(0)
             virtual_num_tokens = padded_num_tokens
 
         self.iter_states['num_ctx_requests'] = 0
@@ -3375,11 +3402,16 @@ class PyTorchModelEngine(ModelEngine):
         self.iter_states['num_generation_tokens'] = num_requests
         self.iter_states['cached_kv_tokens'] = sum(num_cached_tokens_per_seq)
 
+        if use_mrope:
+            final_position_ids = \
+                self.mrope_position_ids_cuda[:, :, :virtual_num_tokens]
+        else:
+            final_position_ids = \
+                self.position_ids_cuda[:virtual_num_tokens].unsqueeze(0)
         inputs = {
             'attn_metadata': attn_metadata,
             'input_ids': self.input_ids_cuda[:virtual_num_tokens],
-            'position_ids':
-            self.position_ids_cuda[:virtual_num_tokens].unsqueeze(0),
+            'position_ids': final_position_ids,
             'inputs_embeds': None,
             'multimodal_params': [],
             'resource_manager': resource_manager,
@@ -3422,6 +3454,10 @@ class PyTorchModelEngine(ModelEngine):
         if self._can_use_incremental_update(scheduled_requests,
                                             new_tokens_device,
                                             next_draft_tokens_device):
+            # Spec engines never record the steady-gen cache, but invalidate
+            # defensively so the two fast paths can never interleave if the
+            # gates ever evolve.
+            self._steady_gen_cache = None
             return self._apply_incremental_update(
                 scheduled_requests, kv_cache_manager, attn_metadata,
                 spec_metadata, new_tensors_device, cache_indirection_buffer,
@@ -4355,6 +4391,12 @@ class PyTorchModelEngine(ModelEngine):
 
         if hasattr(self.model.model_config.pretrained_config, 'chunk_size'):
             attn_metadata.mamba_chunk_size = self.model.model_config.pretrained_config.chunk_size
+        # Some sparse backends (RocketKV) clamp
+        # kv_cache_params.num_cached_tokens_per_seq in place during prepare(),
+        # and KVCacheParams holds the list by reference. Snapshot the true
+        # pre-prepare counts so the steady-gen recording below stores values
+        # that the per-step prepare() can re-clamp from scratch.
+        num_cached_tokens_snapshot = list(num_cached_tokens_per_seq)
         attn_metadata.prepare()
         cross_attention_inputs = (self._prepare_enc_dec_cross_attn_inputs(
             cross_encoder_hidden_states,
@@ -4489,10 +4531,13 @@ class PyTorchModelEngine(ModelEngine):
             # every request took that branch and none appended input_ids).
             # While the batch composition holds, the next passes only need to
             # advance positions by one and refresh per-step metadata.
-            # An mrope-capable model still takes the plain position path when
-            # the batch carried no actual mrope work (text-only requests), so
-            # gate on the pass's mrope outputs being empty rather than on
-            # use_mrope itself.
+            # MRoPE models are supported only for batches with no actual mrope
+            # work (text-only requests, empty mrope lists below): the full
+            # pass routes use_mrope models through the (3,1,N)
+            # mrope_position_ids_cuda layout even then (to keep torch.compile
+            # guards stable), with all three axes equal to the scalar
+            # positions, so the fast path advances that buffer in place and
+            # returns the same layout (see _apply_steady_gen_fast_prepare).
             if (self.spec_config is None and not self.is_draft_model
                     and spec_metadata is None and new_tokens_device is not None
                     and self.guided_decoder is None
@@ -4509,7 +4554,8 @@ class PyTorchModelEngine(ModelEngine):
                     and attn_metadata.padded_num_tokens is None
                     and self._get_position_id_offset() == 0):
                 self._steady_gen_positions_pinned[:_n_gen].copy_(
-                    torch.as_tensor(num_cached_tokens_per_seq, dtype=torch.int))
+                    torch.as_tensor(num_cached_tokens_snapshot,
+                                    dtype=torch.int))
                 self._steady_gen_cache = {
                     'num_requests':
                     _n_gen,
@@ -4519,6 +4565,8 @@ class PyTorchModelEngine(ModelEngine):
                     prompt_lengths,
                     'seq_lens_ones':
                     maybe_pin_memory(torch.ones(_n_gen, dtype=torch.int)),
+                    'use_mrope':
+                    _use_mrope,
                 }
 
         return inputs, self.gather_ids_cuda[:len(
