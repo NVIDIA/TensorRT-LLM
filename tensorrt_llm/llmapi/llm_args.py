@@ -1412,6 +1412,21 @@ class AttentionDpConfig(StrictBaseModel):
         "routing. The oldest conversations are evicted once more than this many "
         "are tracked, bounding memory on long-running servers. Only used when "
         "kv_cache_routing_conversation_affinity is True.")
+    kv_cache_routing_new_conv_placement: Literal[
+        "round_robin", "least_queued"] = Field(
+            default="round_robin",
+            description=
+            "Placement policy in conversation-affinity routing for requests "
+            "with no pinned rank yet (first turn of a conversation, requests "
+            "without a conversation_id, sticky overflow). 'round_robin' "
+            "(default) equalizes per-rank conversation counts. 'least_queued' "
+            "places them on the rank with the fewest live requests instead: "
+            "per-conversation load (turn rate, fan-out, prefill length) is "
+            "not uniform, so count-uniform round-robin can leave some ranks "
+            "with deep queues while others idle; steering new conversations "
+            "by queue depth evens that out and cuts tail TTFT. Existing "
+            "conversation->rank pins are unaffected. Only used when "
+            "kv_cache_routing_conversation_affinity is True.")
 
     @model_validator(mode='after')
     def validate_attention_dp_config(self) -> 'AttentionDpConfig':
