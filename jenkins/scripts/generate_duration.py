@@ -77,6 +77,7 @@ def load_test_list_specs(test_list_dir):
 
 def query_opensearch_durations(url, credentials, days):
     import requests
+    from requests.auth import HTTPProxyAuth
 
     since_ms = int((time.time() - days * 86400) * 1000)
     search_url = f"{url.rstrip('/')}/{OPENSEARCH_INDEX}/_search"
@@ -84,7 +85,7 @@ def query_opensearch_durations(url, credentials, days):
     auth = None
     if credentials and ":" in credentials:
         user, password = credentials.split(":", 1)
-        auth = (user, password)
+        auth = HTTPProxyAuth(user, password)
 
     test_durations = {}
     after_key = None
