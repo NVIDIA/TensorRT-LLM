@@ -533,7 +533,7 @@ class QwenImagePipeline(BasePipeline):
 
         # Denoise loop.
         timer.mark_denoise_start()
-        logger.info("Denoising (%d steps)...", len(timesteps))
+        logger.info(f"Denoising ({len(timesteps)} steps)...")
 
         cache_acc = getattr(self, "cache_accelerator", None)
 
@@ -585,10 +585,8 @@ class QwenImagePipeline(BasePipeline):
                 stats = cache_acc.get_stats()
                 if stats and "hit_rate" in stats:
                     logger.info(
-                        "TeaCache: %.1f%% hit rate (%d/%d steps)",
-                        stats["hit_rate"] * 100,
-                        stats["cached"],
-                        stats["total"],
+                        f"TeaCache: {stats['hit_rate']:.1%} hit rate "
+                        f"({stats['cached']}/{stats['total']} steps)"
                     )
 
         timer.mark_post_start()
@@ -596,7 +594,7 @@ class QwenImagePipeline(BasePipeline):
         image = self._decode_latents(latents, height, width)
 
         if getattr(self, "rank", 0) == 0:
-            logger.info("Pipeline total: %.2fs", time.time() - pipeline_start)
+            logger.info(f"Pipeline total: {time.time() - pipeline_start:.2f}s")
 
         timer.mark_end()
         return timer.fill(PipelineOutput(image=image))
