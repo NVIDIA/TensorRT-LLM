@@ -5405,7 +5405,8 @@ class PyExecutor:
             for resource_mgr_type in (
                     ResourceManagerType.KV_CACHE_MANAGER,
                     ResourceManagerType.SPEC_RESOURCE_MANAGER,
-                    ResourceManagerType.DRAFT_KV_CACHE_MANAGER):
+                    ResourceManagerType.DRAFT_KV_CACHE_MANAGER,
+                    ResourceManagerType.PEFT_CACHE_MANAGER):
                 if (resource_mgr_type in self.resource_manager.resource_managers
                         and self.resource_manager.
                         resource_managers[resource_mgr_type] is not None):
