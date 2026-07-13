@@ -493,6 +493,60 @@ class GvrTopKKernel:
         return cute.arch.warp_redux_sync(val, "fmax")
 
     # ------------------------------------------------------------------
+    # Raw-address SMEM scalar access through a pre-hoisted window base.
+    #
+    # Tensor-indexed SMEM access (smem_keys[i]) makes the compiler
+    # re-derive the cluster SMEM window per access (S2R SR_CgaCtaId +
+    # LEA<<24) — ncu shows this as the top single-instruction stall in
+    # the P3 stream-write and P4 snap loops. Hoisting the base once via
+    # iterator.toint() (one S2R per call site) turns every subsequent
+    # access into plain integer addressing — the same pattern the P2
+    # scan loops already use for smem_input, whose SASS regions show no
+    # S2R at all.
+    # ------------------------------------------------------------------
+    @cute.jit
+    def _smem_ld_f32(self, base_addr, idx):
+        p = cute.make_ptr(
+            cutlass.Float32,
+            base_addr + cutlass.Int64(idx) * cutlass.Int64(4),
+            cute.AddressSpace.smem,
+            assumed_align=4,
+        )
+        return cute.make_tensor(p, cute.make_layout((1,)))[0]
+
+    @cute.jit
+    def _smem_ld_i32(self, base_addr, idx):
+        p = cute.make_ptr(
+            cutlass.Int32,
+            base_addr + cutlass.Int64(idx) * cutlass.Int64(4),
+            cute.AddressSpace.smem,
+            assumed_align=4,
+        )
+        return cute.make_tensor(p, cute.make_layout((1,)))[0]
+
+    @cute.jit
+    def _smem_st_f32(self, base_addr, idx, val):
+        p = cute.make_ptr(
+            cutlass.Float32,
+            base_addr + cutlass.Int64(idx) * cutlass.Int64(4),
+            cute.AddressSpace.smem,
+            assumed_align=4,
+        )
+        t = cute.make_tensor(p, cute.make_layout((1,)))
+        t[0] = val
+
+    @cute.jit
+    def _smem_st_i32(self, base_addr, idx, val):
+        p = cute.make_ptr(
+            cutlass.Int32,
+            base_addr + cutlass.Int64(idx) * cutlass.Int64(4),
+            cute.AddressSpace.smem,
+            assumed_align=4,
+        )
+        t = cute.make_tensor(p, cute.make_layout((1,)))
+        t[0] = val
+
+    # ------------------------------------------------------------------
     # Phase 1: preIdx Min/Max/Mean -> initial threshold
     # ------------------------------------------------------------------
     @cute.jit
@@ -1201,6 +1255,11 @@ class GvrTopKKernel:
         copy_atom = self._make_load_copy_atom()
         row_addr = input_row.iterator.toint()
         step_elem = cutlass.const_expr(num_threads * vec_w)
+        # Hoisted SMEM window bases (one S2R here vs one per emitted
+        # candidate below — this loop is the kernel's biggest instruction
+        # region at production shapes).
+        keys_base = smem_keys.iterator.toint()
+        vals_base = smem_vals.iterator.toint()
 
         slice_len = slice_end - slice_start
         # When reading from the cached slice, scan indices are slice-LOCAL;
@@ -1258,8 +1317,8 @@ class GvrTopKKernel:
                         else:
                             vj = cutlass.Float32(rng_frag[j])
                         if vj >= thr_final and wc < cutlass.Int32(kCC):
-                            smem_keys[wc] = vj
-                            smem_vals[wc] = global_base + cutlass.Int32(j)
+                            self._smem_st_f32(keys_base, wc, vj)
+                            self._smem_st_i32(vals_base, wc, global_base + cutlass.Int32(j))
                             wc = wc + cutlass.Int32(1)
                 # Advance ic past all consumed vec_w-aligned positions.
                 ic = ic + big_iters * cutlass.Int32(step_elem)
@@ -1291,8 +1350,8 @@ class GvrTopKKernel:
                 else:
                     vj = cutlass.Float32(tail_frag[j])
                 if vj >= thr_final and wc < cutlass.Int32(kCC):
-                    smem_keys[wc] = vj
-                    smem_vals[wc] = global_base_t + cutlass.Int32(j)
+                    self._smem_st_f32(keys_base, wc, vj)
+                    self._smem_st_i32(vals_base, wc, global_base_t + cutlass.Int32(j))
                     wc = wc + cutlass.Int32(1)
             ic = ic + step
 
@@ -1308,8 +1367,8 @@ class GvrTopKKernel:
                 v = self._load_fp32(input_row, it)
                 pos_global = it
             if v >= thr_final and wc < cutlass.Int32(kCC):
-                smem_keys[wc] = v
-                smem_vals[wc] = pos_global
+                self._smem_st_f32(keys_base, wc, v)
+                self._smem_st_i32(vals_base, wc, pos_global)
                 wc = wc + cutlass.Int32(1)
             it = it + cutlass.Int32(num_threads)
         cute.arch.barrier()
@@ -1320,7 +1379,7 @@ class GvrTopKKernel:
     @cute.jit
     def block_fused_snap_iter(
         self,
-        smem_keys,
+        keys_base,  # hoisted SMEM window base of smem_keys (iterator.toint())
         smem_wcnt,
         smem_hist,  # reused as scratch for s_up/s_down warp aggregates
         s_thr,
@@ -1345,7 +1404,7 @@ class GvrTopKKernel:
 
         isi = tidx
         while isi < count:
-            v = smem_keys[isi]
+            v = self._smem_ld_f32(keys_base, isi)
             if v >= thr:
                 lge = lge + cutlass.Int32(1)
             if v > thr:
@@ -1463,14 +1522,22 @@ class GvrTopKKernel:
         num_threads = cutlass.const_expr(self.num_threads)
         num_warps = cutlass.const_expr(self.num_warps)
         bins_per_warp = cutlass.const_expr(kBins // self.num_warps)
+        # Hoisted SMEM window bases: every keys/vals element access below
+        # goes through raw integer addressing (see _smem_ld_f32 rationale).
+        keys_base = smem_keys.iterator.toint()
+        vals_base = smem_vals.iterator.toint()
+        # Scalars base for the snap-loop convergence check (read by ALL
+        # threads once per snap iteration — the LDS.64 hotspot in ncu
+        # region #26).
+        isc_base = s_iscalars.iterator.toint()
 
         # ----- Branch A: cand_count == kK (fast path) -----
         if cand_count == cutlass.Int32(kK):
             i4 = tidx
             while i4 < cutlass.Int32(kK):
                 if cutlass.const_expr(self.return_output_values):
-                    output_values_row[i4] = self.dtype(smem_keys[i4])
-                output_indices_row[i4] = smem_vals[i4]
+                    output_values_row[i4] = self.dtype(self._smem_ld_f32(keys_base, i4))
+                output_indices_row[i4] = self._smem_ld_i32(vals_base, i4)
                 i4 = i4 + cutlass.Int32(num_threads)
         elif cand_count > cutlass.Int32(kK):
             # ----- Branch B: cand_count > kK → histogram snap -----
@@ -1480,7 +1547,7 @@ class GvrTopKKernel:
             local_cmax = cutlass.Float32(self.NEG_FLT_MAX)
             i5 = tidx
             while i5 < cand_count:
-                v = smem_keys[i5]
+                v = self._smem_ld_f32(keys_base, i5)
                 local_cmin = _fmin_f32_inline(local_cmin, v)
                 local_cmax = cute.arch.fmax(local_cmax, v)
                 i5 = i5 + cutlass.Int32(num_threads)
@@ -1534,7 +1601,7 @@ class GvrTopKKernel:
             # Build histogram by atomicAdd.
             i7 = tidx
             while i7 < cand_count:
-                vk = smem_keys[i7]
+                vk = self._smem_ld_f32(keys_base, i7)
                 bin_f = (vk - bmin_r) * inv1
                 bin_i = cutlass.Int32(bin_f)
                 if bin_i < cutlass.Int32(0):
@@ -1619,7 +1686,7 @@ class GvrTopKKernel:
             done_snap = cutlass.Int32(0)
             while si < snap_limit and done_snap == cutlass.Int32(0):
                 self.block_fused_snap_iter(
-                    smem_keys,
+                    keys_base,
                     smem_wcnt,
                     smem_hist,
                     s_thr,
@@ -1630,87 +1697,151 @@ class GvrTopKKernel:
                     lane,
                 )
                 # After block_fused_snap_iter, s_iscalars[2]=cge, s_iscalars[3]=cgt.
-                if s_iscalars[3] < cutlass.Int32(kK) and s_iscalars[2] >= cutlass.Int32(kK):
+                cgt_c = self._smem_ld_i32(isc_base, cutlass.Int32(3))
+                cge_c = self._smem_ld_i32(isc_base, cutlass.Int32(2))
+                if cgt_c < cutlass.Int32(kK) and cge_c >= cutlass.Int32(kK):
                     done_snap = cutlass.Int32(1)
                 si = si + cutlass.Int32(1)
 
-            # ---- Two-pass writeback (ballot + popc) ----
-            # Per-iter: ballot collects emit flags into a 32-bit mask;
-            # popc gives the within-warp count; lane 0 atomicAdds the
-            # output base; shuffle broadcasts it. One barrier between
-            # passes, none within a pass.
+            # ---- Writeback (ballot + popc) ----
+            # Converged snap (the overwhelmingly common case): SINGLE pass.
+            # The converged iteration's cgt (s_iscalars[3]) is the exact
+            # strictly-greater count at sel_thr (block_fused_snap_iter does
+            # not move the threshold when cgt < kK <= cge), so gt entries
+            # can pack into [0, cgt) via counter s_iscalars[4] while
+            # tie(==) entries start at offset cgt via counter s_iscalars[5]
+            # — same [gt | eq | pad] output partition as the two-pass
+            # original, one candidate sweep and one barrier fewer. The
+            # non-converged fallback keeps the original two-pass (its cgt
+            # would be stale: the last iter may have moved the threshold
+            # after counting).
             sel_thr = s_thr[0]
             if tidx == 0:
-                s_iscalars[4] = cutlass.Int32(0)  # out_count
+                s_iscalars[4] = cutlass.Int32(0)  # gt out_count
+                # s_iscalars[5] (cluster-local scratch, consumed before P4)
+                # is reused as the eq counter for the single-pass path.
+                s_iscalars[5] = cutlass.Int32(0)
             cute.arch.barrier()
 
-            # Pass 1: v > sel_thr, strided over (warp_id * WARP_SIZE, ...).
-            # The `if mask_gt != 0` guard skips popc + atomicAdd + shuffle
-            # when no lane in the warp emits — the SMEM atomicAdd alone is
-            # ~10-30 cycles.
-            base_w = warp_id * cutlass.Int32(self.WARP_SIZE)
-            while base_w < cand_count:
-                ix1 = base_w + lane
-                emit_gt = cutlass.Int32(0)
-                v_p1 = cutlass.Float32(self.NEG_FLT_MAX)
-                if ix1 < cand_count:
-                    v_p1 = smem_keys[ix1]
-                    if v_p1 > sel_thr:
-                        emit_gt = cutlass.Int32(1)
-                mask_gt = cute.arch.vote_ballot_sync(emit_gt != cutlass.Int32(0))
-                if mask_gt != cutlass.Uint32(0):
-                    cnt_gt = cutlass.Int32(cute.arch.popc(mask_gt))
-                    lane_mask_gt = (cutlass.Uint32(1) << cutlass.Uint32(lane)) - cutlass.Uint32(1)
-                    moff_gt = cutlass.Int32(cute.arch.popc(mask_gt & lane_mask_gt))
-                    bp_gt = cutlass.Int32(0)
-                    if lane == cutlass.Int32(0):
-                        bp_gt = atomicAdd(
-                            s_iscalars.iterator + cutlass.Int32(4),
-                            cnt_gt,
-                        )
-                    bp_gt = cute.arch.shuffle_sync(bp_gt, cutlass.Int32(0))
-                    wpos_p1 = bp_gt + moff_gt
-                    if emit_gt != cutlass.Int32(0) and wpos_p1 < cutlass.Int32(kK):
-                        if cutlass.const_expr(self.return_output_values):
-                            output_values_row[wpos_p1] = self.dtype(v_p1)
-                        output_indices_row[wpos_p1] = smem_vals[ix1]
-                base_w = base_w + cutlass.Int32(num_threads)
-            cute.arch.barrier()
+            if done_snap == cutlass.Int32(1):
+                cgt_base = s_iscalars[3]
+                base_w = warp_id * cutlass.Int32(self.WARP_SIZE)
+                while base_w < cand_count:
+                    ix1 = base_w + lane
+                    emit_gt = cutlass.Int32(0)
+                    emit_eq = cutlass.Int32(0)
+                    v_p1 = cutlass.Float32(self.NEG_FLT_MAX)
+                    if ix1 < cand_count:
+                        v_p1 = self._smem_ld_f32(keys_base, ix1)
+                        if v_p1 > sel_thr:
+                            emit_gt = cutlass.Int32(1)
+                        if v_p1 == sel_thr:
+                            emit_eq = cutlass.Int32(1)
+                    mask_gt = cute.arch.vote_ballot_sync(emit_gt != cutlass.Int32(0))
+                    if mask_gt != cutlass.Uint32(0):
+                        cnt_gt = cutlass.Int32(cute.arch.popc(mask_gt))
+                        lane_mask_gt = (cutlass.Uint32(1) << cutlass.Uint32(lane)) - cutlass.Uint32(1)
+                        moff_gt = cutlass.Int32(cute.arch.popc(mask_gt & lane_mask_gt))
+                        bp_gt = cutlass.Int32(0)
+                        if lane == cutlass.Int32(0):
+                            bp_gt = atomicAdd(
+                                s_iscalars.iterator + cutlass.Int32(4),
+                                cnt_gt,
+                            )
+                        bp_gt = cute.arch.shuffle_sync(bp_gt, cutlass.Int32(0))
+                        wpos_p1 = bp_gt + moff_gt
+                        if emit_gt != cutlass.Int32(0) and wpos_p1 < cutlass.Int32(kK):
+                            if cutlass.const_expr(self.return_output_values):
+                                output_values_row[wpos_p1] = self.dtype(v_p1)
+                            output_indices_row[wpos_p1] = self._smem_ld_i32(vals_base, ix1)
+                    mask_eq = cute.arch.vote_ballot_sync(emit_eq != cutlass.Int32(0))
+                    if mask_eq != cutlass.Uint32(0):
+                        cnt_eq = cutlass.Int32(cute.arch.popc(mask_eq))
+                        lane_mask_eq = (cutlass.Uint32(1) << cutlass.Uint32(lane)) - cutlass.Uint32(1)
+                        moff_eq = cutlass.Int32(cute.arch.popc(mask_eq & lane_mask_eq))
+                        bp_eq = cutlass.Int32(0)
+                        if lane == cutlass.Int32(0):
+                            bp_eq = atomicAdd(
+                                s_iscalars.iterator + cutlass.Int32(5),
+                                cnt_eq,
+                            )
+                        bp_eq = cute.arch.shuffle_sync(bp_eq, cutlass.Int32(0))
+                        wpos_p2 = cgt_base + bp_eq + moff_eq
+                        if emit_eq != cutlass.Int32(0) and wpos_p2 < cutlass.Int32(kK):
+                            if cutlass.const_expr(self.return_output_values):
+                                output_values_row[wpos_p2] = self.dtype(v_p1)
+                            output_indices_row[wpos_p2] = self._smem_ld_i32(vals_base, ix1)
+                    base_w = base_w + cutlass.Int32(num_threads)
+                cute.arch.barrier()
+            else:
+                # Pass 1: v > sel_thr, strided over (warp_id * WARP_SIZE, ...).
+                base_w = warp_id * cutlass.Int32(self.WARP_SIZE)
+                while base_w < cand_count:
+                    ix1 = base_w + lane
+                    emit_gt = cutlass.Int32(0)
+                    v_p1 = cutlass.Float32(self.NEG_FLT_MAX)
+                    if ix1 < cand_count:
+                        v_p1 = self._smem_ld_f32(keys_base, ix1)
+                        if v_p1 > sel_thr:
+                            emit_gt = cutlass.Int32(1)
+                    mask_gt = cute.arch.vote_ballot_sync(emit_gt != cutlass.Int32(0))
+                    if mask_gt != cutlass.Uint32(0):
+                        cnt_gt = cutlass.Int32(cute.arch.popc(mask_gt))
+                        lane_mask_gt = (cutlass.Uint32(1) << cutlass.Uint32(lane)) - cutlass.Uint32(1)
+                        moff_gt = cutlass.Int32(cute.arch.popc(mask_gt & lane_mask_gt))
+                        bp_gt = cutlass.Int32(0)
+                        if lane == cutlass.Int32(0):
+                            bp_gt = atomicAdd(
+                                s_iscalars.iterator + cutlass.Int32(4),
+                                cnt_gt,
+                            )
+                        bp_gt = cute.arch.shuffle_sync(bp_gt, cutlass.Int32(0))
+                        wpos_p1 = bp_gt + moff_gt
+                        if emit_gt != cutlass.Int32(0) and wpos_p1 < cutlass.Int32(kK):
+                            if cutlass.const_expr(self.return_output_values):
+                                output_values_row[wpos_p1] = self.dtype(v_p1)
+                            output_indices_row[wpos_p1] = self._smem_ld_i32(vals_base, ix1)
+                    base_w = base_w + cutlass.Int32(num_threads)
+                cute.arch.barrier()
 
-            # Pass 2: v == sel_thr (same pattern + guard as Pass 1). Empty
-            # iterations are much more common here since only tie-at-K
-            # values qualify.
-            base_w2 = warp_id * cutlass.Int32(self.WARP_SIZE)
-            while base_w2 < cand_count:
-                ix2 = base_w2 + lane
-                emit_eq = cutlass.Int32(0)
-                v_p2 = cutlass.Float32(self.NEG_FLT_MAX)
-                if ix2 < cand_count:
-                    v_p2 = smem_keys[ix2]
-                    if v_p2 == sel_thr:
-                        emit_eq = cutlass.Int32(1)
-                mask_eq = cute.arch.vote_ballot_sync(emit_eq != cutlass.Int32(0))
-                if mask_eq != cutlass.Uint32(0):
-                    cnt_eq = cutlass.Int32(cute.arch.popc(mask_eq))
-                    lane_mask_eq = (cutlass.Uint32(1) << cutlass.Uint32(lane)) - cutlass.Uint32(1)
-                    moff_eq = cutlass.Int32(cute.arch.popc(mask_eq & lane_mask_eq))
-                    bp_eq = cutlass.Int32(0)
-                    if lane == cutlass.Int32(0):
-                        bp_eq = atomicAdd(
-                            s_iscalars.iterator + cutlass.Int32(4),
-                            cnt_eq,
-                        )
-                    bp_eq = cute.arch.shuffle_sync(bp_eq, cutlass.Int32(0))
-                    wpos_p2 = bp_eq + moff_eq
-                    if emit_eq != cutlass.Int32(0) and wpos_p2 < cutlass.Int32(kK):
-                        if cutlass.const_expr(self.return_output_values):
-                            output_values_row[wpos_p2] = self.dtype(v_p2)
-                        output_indices_row[wpos_p2] = smem_vals[ix2]
-                base_w2 = base_w2 + cutlass.Int32(num_threads)
-            cute.arch.barrier()
+                # Pass 2: v == sel_thr (same pattern + guard as Pass 1).
+                base_w2 = warp_id * cutlass.Int32(self.WARP_SIZE)
+                while base_w2 < cand_count:
+                    ix2 = base_w2 + lane
+                    emit_eq = cutlass.Int32(0)
+                    v_p2 = cutlass.Float32(self.NEG_FLT_MAX)
+                    if ix2 < cand_count:
+                        v_p2 = self._smem_ld_f32(keys_base, ix2)
+                        if v_p2 == sel_thr:
+                            emit_eq = cutlass.Int32(1)
+                    mask_eq = cute.arch.vote_ballot_sync(emit_eq != cutlass.Int32(0))
+                    if mask_eq != cutlass.Uint32(0):
+                        cnt_eq = cutlass.Int32(cute.arch.popc(mask_eq))
+                        lane_mask_eq = (cutlass.Uint32(1) << cutlass.Uint32(lane)) - cutlass.Uint32(1)
+                        moff_eq = cutlass.Int32(cute.arch.popc(mask_eq & lane_mask_eq))
+                        bp_eq = cutlass.Int32(0)
+                        if lane == cutlass.Int32(0):
+                            bp_eq = atomicAdd(
+                                s_iscalars.iterator + cutlass.Int32(4),
+                                cnt_eq,
+                            )
+                        bp_eq = cute.arch.shuffle_sync(bp_eq, cutlass.Int32(0))
+                        wpos_p2 = bp_eq + moff_eq
+                        if emit_eq != cutlass.Int32(0) and wpos_p2 < cutlass.Int32(kK):
+                            if cutlass.const_expr(self.return_output_values):
+                                output_values_row[wpos_p2] = self.dtype(v_p2)
+                            output_indices_row[wpos_p2] = self._smem_ld_i32(vals_base, ix2)
+                    base_w2 = base_w2 + cutlass.Int32(num_threads)
+                cute.arch.barrier()
 
-            # Pad remainder with -self.FLT_MAX / -1
-            filled_par = s_iscalars[4]
+            # Pad remainder with -self.FLT_MAX / -1. Single-pass filled =
+            # cgt + eq_written (counters [4] is gt-only there); two-pass
+            # filled = counter [4] (gt + eq accumulated).
+            filled_par = cutlass.Int32(0)
+            if done_snap == cutlass.Int32(1):
+                filled_par = s_iscalars[3] + s_iscalars[5]
+            else:
+                filled_par = s_iscalars[4]
             if filled_par > cutlass.Int32(kK):
                 filled_par = cutlass.Int32(kK)
             ipad = filled_par + tidx
@@ -1725,8 +1856,8 @@ class GvrTopKKernel:
             i10 = tidx
             while i10 < cand_count:
                 if cutlass.const_expr(self.return_output_values):
-                    output_values_row[i10] = self.dtype(smem_keys[i10])
-                output_indices_row[i10] = smem_vals[i10]
+                    output_values_row[i10] = self.dtype(self._smem_ld_f32(keys_base, i10))
+                output_indices_row[i10] = self._smem_ld_i32(vals_base, i10)
                 i10 = i10 + cutlass.Int32(num_threads)
             i11 = cand_count + tidx
             while i11 < cutlass.Int32(kK):
