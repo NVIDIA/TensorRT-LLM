@@ -11,6 +11,7 @@ import pandas as pd
 from parser_utils import (
     kernel_short_name,
     lazy_convert_sqlite,
+    require_cuda_kernel_events,
     shortest_common_supersequence,
     warned_names,
 )
@@ -106,6 +107,8 @@ lazy_convert_sqlite(eager_nsys_rep_file_path, eager_sqlite_file_path)
 lazy_convert_sqlite(graph_nsys_rep_file_path, graph_sqlite_file_path)
 eager_conn = sqlite3.connect(f"file:{eager_sqlite_file_path}?mode=ro", uri=True)
 graph_conn = sqlite3.connect(f"file:{graph_sqlite_file_path}?mode=ro", uri=True)
+require_cuda_kernel_events(eager_conn, eager_sqlite_file_path)
+require_cuda_kernel_events(graph_conn, graph_sqlite_file_path)
 
 query = "SELECT * FROM ENUM_NSYS_EVENT_TYPE"
 df = pd.read_sql_query(query, eager_conn)
