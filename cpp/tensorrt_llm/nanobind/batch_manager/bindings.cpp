@@ -175,8 +175,6 @@ void initBindings(nb::module_& m)
             "estimated_reusable_tokens", &GenLlmReq::getEstimatedReusableTokens, &GenLlmReq::setEstimatedReusableTokens)
         .def_prop_rw("guided_decoding_params", &GenLlmReq::getGuidedDecodingParams, &GenLlmReq::setGuidedDecodingParams)
         .def_prop_rw("context_phase_params", &GenLlmReq::getContextPhaseParams, &GenLlmReq::setContextPhaseParams)
-        .def_prop_rw("is_arbitrary_kv_cache_transfer", &GenLlmReq::isArbitraryKvCacheTransfer,
-            &GenLlmReq::setIsArbitraryKvCacheTransfer)
         .def_prop_ro("is_context_only_request", &GenLlmReq::isContextOnlyRequest)
         .def_prop_ro("is_generation_only_request", &GenLlmReq::isGenerationOnlyRequest)
         .def_prop_ro("is_generation_to_complete_state", &GenLlmReq::isGenerationToCompleteState)

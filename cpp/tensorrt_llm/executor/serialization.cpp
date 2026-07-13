@@ -764,6 +764,8 @@ DataTransceiverState Serialization::deserializeDataTransceiverState(std::istream
     {
         state.setCacheState(std::move(cacheState).value());
     }
+    auto isArbitraryTransferState = su::deserialize<decltype(DataTransceiverState::mIsArbitraryTransferState)>(is);
+    state.setIsArbitraryTransferState(isArbitraryTransferState);
     return state;
 }
 
@@ -771,6 +773,7 @@ void Serialization::serialize(DataTransceiverState const& state, std::ostream& o
 {
     su::serialize(state.mCommState, os);
     su::serialize(state.mCacheState, os);
+    su::serialize(state.mIsArbitraryTransferState, os);
 }
 
 std::vector<char> Serialization::serialize(DataTransceiverState const& state)
@@ -789,6 +792,7 @@ size_t Serialization::serializedSize(DataTransceiverState const& state)
     size_t totalSize = 0;
     totalSize += su::serializedSize(state.mCommState);
     totalSize += su::serializedSize(state.mCacheState);
+    totalSize += su::serializedSize(state.mIsArbitraryTransferState);
     return totalSize;
 }
 

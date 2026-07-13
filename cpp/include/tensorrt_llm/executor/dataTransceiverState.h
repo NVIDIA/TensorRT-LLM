@@ -618,9 +618,25 @@ public:
         return mCacheState.has_value() && mCacheState->hasRnnConfig();
     }
 
+    /// @brief Whether this state was exported standalone (via
+    /// CacheTransceiver::getSerializedDataTransceiverState) for an arbitrary
+    /// (llmRequest-agnostic) KV cache transfer, as opposed to being produced by a
+    /// context response. Transfers driven by such a state have no LlmRequest on the
+    /// sender and are served from its reuse tree.
+    [[nodiscard]] bool isArbitraryTransferState() const noexcept
+    {
+        return mIsArbitraryTransferState;
+    }
+
+    void setIsArbitraryTransferState(bool isArbitraryTransferState) noexcept
+    {
+        mIsArbitraryTransferState = isArbitraryTransferState;
+    }
+
     [[nodiscard]] bool operator==(DataTransceiverState const& other) const noexcept
     {
-        return mCacheState == other.mCacheState && mCommState == other.mCommState;
+        return mCacheState == other.mCacheState && mCommState == other.mCommState
+            && mIsArbitraryTransferState == other.mIsArbitraryTransferState;
     }
 
     [[nodiscard]] std::string toString() const
@@ -641,6 +657,7 @@ private:
     friend class Serialization;
     std::optional<kv_cache::CacheState> mCacheState;
     std::optional<kv_cache::CommState> mCommState;
+    bool mIsArbitraryTransferState{false};
 };
 
 } // namespace tensorrt_llm::executor

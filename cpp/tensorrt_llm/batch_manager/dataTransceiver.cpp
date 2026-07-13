@@ -985,8 +985,10 @@ public:
         // Tell the sender whether this transfer is llmRequest-agnostic (served from the
         // sender's reuse tree) so it does not wait for a context request that will never
         // arrive — and, conversely, does wait for normal transfers whose context request
-        // has not reached the sender's send queue yet.
-        requestInfo.setIsArbitraryTransfer(llmRequest.isArbitraryKvCacheTransfer());
+        // has not reached the sender's send queue yet. The provenance of the request's
+        // DataTransceiverState carries this intent: it is marked when exported standalone
+        // via getSerializedDataTransceiverState, while context responses leave it unset.
+        requestInfo.setIsArbitraryTransfer(contextState.isArbitraryTransferState());
 
         auto* agentConnectionManager = dynamic_cast<executor::kv_cache::AgentConnectionManager*>(mManager);
         std::vector<std::optional<size_t>> cacheBufferIds;

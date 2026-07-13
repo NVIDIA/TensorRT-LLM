@@ -550,6 +550,10 @@ std::vector<char> CacheTransceiver::getSerializedDataTransceiverState() const
     executor::DataTransceiverState state;
     state.setCommState(*mCommState);
     state.setCacheState(*mCacheState);
+    // Mark the provenance: states exported through this API drive arbitrary
+    // (llmRequest-agnostic) transfers served from the sender's reuse tree, unlike
+    // states produced by context responses.
+    state.setIsArbitraryTransferState(true);
     return executor::Serialization::serialize(state);
 }
 
