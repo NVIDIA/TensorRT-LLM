@@ -27,6 +27,7 @@ from .._utils import nvtx_range_debug
 from ..bindings import executor as tllm
 from ..bindings import steady_clock_now
 from ..builder import EngineConfig
+from ..conversation_params import ConversationParams
 from ..disaggregated_params import DisaggregatedParams
 from ..executor import (DetokenizedGenerationResultBase, GenerationExecutor,
                         GenerationResult, IterationResult, LoRARequest,
@@ -313,6 +314,10 @@ class BaseLLM:
         logger_debug(f"LLM.args.mpi_session: {self.args.mpi_session}\n",
                      "yellow")
         self.mpi_session = self.args.mpi_session
+        # Keep the live session on LLM only. LLM args are passed to model-build
+        # tasks and executor workers, and MpiSession objects are not pickleable.
+        self.args.mpi_session = None
+        self._owns_mpi_session = self.mpi_session is None
 
         # Build this LLM's post-processing hook for the in-proxy detok path (each
         # postproc worker builds its own). Resolving here fails fast on a bad
@@ -332,6 +337,8 @@ class BaseLLM:
             logger.info(
                 f'start MpiSession with {self.args.parallel_config.world_size} workers'
             )
+            # _owns_mpi_session is already True here: this branch only runs
+            # when no external session was supplied.
             if not self.mpi_session:
                 mpi_process_pre_spawned: bool = get_spawn_proxy_process_env()
                 if not mpi_process_pre_spawned:
@@ -364,7 +371,9 @@ class BaseLLM:
             self._build_model()
 
         except Exception:
-            if self.mpi_session is not None:
+            # _owns_mpi_session is assigned before this try block, so it is
+            # always present here.
+            if self.mpi_session is not None and self._owns_mpi_session:
                 self.mpi_session.shutdown()
             raise
 
@@ -515,6 +524,8 @@ class BaseLLM:
             DisaggregatedParams, Sequence[DisaggregatedParams]]] = None,
         scheduling_params: Optional[Union[SchedulingParams,
                                           List[SchedulingParams]]] = None,
+        conversation_params: Optional[Union[ConversationParams,
+                                            List[ConversationParams]]] = None,
         cache_salt: Optional[Union[str, Sequence[str]]] = None,
         priority: Union[float, List[float]] = DEFAULT_REQUEST_PRIORITY,
     ) -> Union[RequestOutput, List[RequestOutput]]:
@@ -537,11 +548,13 @@ class BaseLLM:
                 Disaggregated parameters. Defaults to None.
             scheduling_params (tensorrt_llm.scheduling_params.SchedulingParams, List[tensorrt_llm.scheduling_params.SchedulingParams], optional):
                 Scheduling parameters. Defaults to None.
+            conversation_params (tensorrt_llm.conversation_params.ConversationParams, List[tensorrt_llm.conversation_params.ConversationParams], optional):
+                Conversation parameters. Defaults to None.
             cache_salt (str, Sequence[str], optional): If specified, KV cache will be salted with the provided string to limit the kv cache reuse to the requests with the same string. Defaults to None.
             priority (float, List[float]): The scheduling priority for the request(s), in the range [0, 1]. Higher values indicate higher priority. Defaults to 0.5.
 
         Returns:
-            Union[tensorrt_llm.llmapi.RequestOutput, List[tensorrt_llm.llmapi.RequestOutput]]: The output data of the completion request to the LLM.
+            Union[tensorrt_llm.llmapi.llm.RequestOutput, List[tensorrt_llm.llmapi.llm.RequestOutput]]: The output data of the completion request to the LLM.
         """
         unbatched = self._is_unbatched_optional_inputs(inputs)
         if inputs is not None and not unbatched:
@@ -581,6 +594,7 @@ class BaseLLM:
                     kv_cache_retention_config, i),
                 disaggregated_params=self._item_at(disaggregated_params, i),
                 scheduling_params=self._item_at(scheduling_params, i),
+                conversation_params=self._item_at(conversation_params, i),
                 cache_salt=self._item_at(cache_salt, i),
                 priority=self._item_at(priority, i),
                 streaming=False,
@@ -611,6 +625,7 @@ class BaseLLM:
         trace_headers: Optional[Mapping[str, str]] = None,
         _postproc_params: Optional[PostprocParams] = None,
         scheduling_params: Optional[SchedulingParams] = None,
+        conversation_params: Optional[ConversationParams] = None,
         cache_salt: Optional[str] = None,
         priority: float = DEFAULT_REQUEST_PRIORITY,
     ) -> RequestOutput:
@@ -628,11 +643,12 @@ class BaseLLM:
             disaggregated_params (tensorrt_llm.disaggregated_params.DisaggregatedParams, optional): Disaggregated parameters. Defaults to None.
             trace_headers (Mapping[str, str], optional): Trace headers. Defaults to None.
             scheduling_params (tensorrt_llm.scheduling_params.SchedulingParams, optional): Scheduling parameters. Defaults to None.
+            conversation_params (tensorrt_llm.conversation_params.ConversationParams, optional): Conversation parameters. Defaults to None.
             cache_salt (str, optional): If specified, KV cache will be salted with the provided string to limit the kv cache reuse to the requests with the same string. Defaults to None.
             priority (float): The scheduling priority for the request, in the range [0, 1]. Higher values indicate higher priority. Defaults to 0.5.
 
         Returns:
-            tensorrt_llm.llmapi.RequestOutput: The output data of the completion request to the LLM.
+            tensorrt_llm.llmapi.llm.RequestOutput: The output data of the completion request to the LLM.
         """
         if self._encode_only:
             raise RuntimeError(
@@ -697,6 +713,7 @@ class BaseLLM:
             postproc_params=_postproc_params,
             multimodal_params=multimodal_params,
             scheduling_params=scheduling_params,
+            conversation_params=conversation_params,
             cache_salt=cache_salt,
             arrival_time=arrival_time,
             encoder_input_token_ids=encoder_input_token_ids,
@@ -1175,6 +1192,25 @@ class BaseLLM:
         return self._executor.get_stats(timeout=timeout)
 
     @set_api_status("beta")
+    def get_kv_cache_capacity(self) -> dict:
+        """Get the runtime's static primary/GPU KV cache capacity.
+
+        Raises:
+            RuntimeError: If called when ``encode_only=True``.
+
+        Returns:
+            dict: KV cache capacity. The returned capacity covers the primary
+                GPU KV cache pool only; CPU/host offload capacity is not
+                included.
+                e.g., {"maxNumBlocks": ..., "tokensPerBlock": ..., "maxNumTokens": ...}
+        """
+        if self._encode_only:
+            raise RuntimeError(
+                "get_kv_cache_capacity() is not available when "
+                "encode_only=True. Use llm.encode() for encoder-only models.")
+        return self._executor.get_kv_cache_capacity()
+
+    @set_api_status("beta")
     def get_stats_async(self, timeout: Optional[float] = 2) -> IterationResult:
         """Get iteration statistics from the runtime.
         To collect statistics, you can call this function in an async coroutine or the /metrics endpoint (if you're using trtllm-serve)
@@ -1483,7 +1519,8 @@ class BaseLLM:
             self._encoder_executor.shutdown()
             self._encoder_executor = None
 
-        if hasattr(self, 'mpi_session') and self.mpi_session is not None:
+        if (hasattr(self, 'mpi_session') and self.mpi_session is not None
+                and getattr(self, "_owns_mpi_session", True)):
             self.mpi_session.shutdown()
             self.mpi_session = None
 
@@ -1807,9 +1844,9 @@ class _TorchLLM(BaseLLM):
         # 2. May need to modify model weights for MM (e.g., resize vocab embedding). We must do such operation via input processor's __init__
         checkpoint_format = getattr(self.args, "checkpoint_format", None)
         input_processor_kwargs = {}
-        if self.args.video_pruning_rate is not None:
-            input_processor_kwargs[
-                'video_pruning_rate'] = self.args.video_pruning_rate
+        video_pruning_rate = self.args.multimodal_config.video_pruning_rate
+        if video_pruning_rate is not None:
+            input_processor_kwargs['video_pruning_rate'] = video_pruning_rate
         self.input_processor = create_input_processor(
             self._hf_model_dir,
             self.tokenizer,

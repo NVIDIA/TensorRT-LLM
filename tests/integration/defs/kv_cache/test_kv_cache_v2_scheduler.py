@@ -253,7 +253,14 @@ class TestKVCacheV2Llama:
     # Chunked prefill multi-request — V2 matches V1
     def test_chunked_prefill_multi_request(self):
         self._compare(
-            MEDIUM_PROMPTS, max_tokens=64, enable_chunked_prefill=True, max_num_tokens=256
+            MEDIUM_PROMPTS,
+            max_tokens=64,
+            # V2 can commit partial source blocks, while V1 only commits full blocks.
+            # Disable reuse so both managers compute the same prompt tokens for this
+            # output comparison.
+            kv_extra={"enable_block_reuse": False},
+            enable_chunked_prefill=True,
+            max_num_tokens=256,
         )
 
     # Eviction — V2 matches V1 under tight memory

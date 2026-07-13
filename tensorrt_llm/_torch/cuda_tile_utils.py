@@ -50,7 +50,13 @@ if platform.system() != "Windows":
     except ImportError:
         logger.warning("cuda-tile package not found, TileIR kernels will not be available")
     else:
-        if (cc := torch.cuda.get_device_properties()) and (cc.major, cc.minor) < (10, 0):
+        # Guard the device-properties probe: with no visible GPU (e.g.
+        # CUDA_VISIBLE_DEVICES="" on a pure client) it would force a CUDA
+        # context just from `import tensorrt_llm`. TileIR stays unavailable,
+        # which is correct for a GPU-less process.
+        if not torch.cuda.is_available():
+            logger.warning("No CUDA device visible, TileIR kernels will not be available")
+        elif (cc := torch.cuda.get_device_properties()) and (cc.major, cc.minor) < (10, 0):
             logger.warning(
                 f"TileIR requires compute capability 10.0 or higher, but the current device has "
                 f"{cc.major}.{cc.minor}. TileIR kernels will not be available"

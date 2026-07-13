@@ -19,8 +19,8 @@ import os
 from abc import ABC, abstractmethod
 from collections import OrderedDict, defaultdict, deque
 from dataclasses import dataclass
-from typing import (TYPE_CHECKING, Dict, Iterable, List, Optional, Set, Tuple,
-                    Union)
+from typing import (TYPE_CHECKING, Dict, Iterable, List, Optional, Sequence,
+                    Set, Tuple, Union)
 
 import torch
 from mpi4py import MPI
@@ -566,6 +566,8 @@ class KVCacheManager(BaseResourceManager):
             for pc in self.pool_configurations
         ]
 
+        self.enable_indexer_k_cache = enable_indexer_k_cache
+
         kwargs = {
             'num_kv_heads_per_layer': self.num_kv_heads_per_layer,
             'size_per_head': head_dim,
@@ -643,11 +645,19 @@ class KVCacheManager(BaseResourceManager):
             device='cpu')
         self.blocks_per_window = blocks_per_window
 
-    def probe_prefix_match_length(self, input_tokens, lora_task_id=None):
+    def probe_prefix_match_length(self,
+                                  input_tokens,
+                                  lora_task_id=None,
+                                  cache_salt=None):
         """Probe the KV cache radix tree for prefix match length.
 
         Returns the number of prefix tokens already cached on this rank.
         Used by KVCacheAwareADPRouter for cache-aware routing.
+
+        ``cache_salt`` scopes the probe to the same per-request
+        namespace that ``_create_kv_cache`` uses; without it, salted
+        requests would be probed against the salt=None namespace and the
+        router would see the wrong match length.
         """
         if not self.enable_block_reuse:
             return 0
@@ -664,12 +674,16 @@ class KVCacheManager(BaseResourceManager):
             LlmRequest as CppLlmRequest
         block_key = BlockKey(tokens=input_tokens, lora_task_id=lora_task_id)
         unique_tokens = block_key.unique_tokens
+        # buildBlockKeys() on the C++ side derives the salt id from
+        # cache_salt, so the dummy request must carry the same string used by
+        # the real create_kv_cache path.
         dummy_req = CppLlmRequest(request_id=0,
                                   max_new_tokens=0,
                                   input_tokens=input_tokens,
                                   sampling_config=SamplingConfig(),
                                   is_streaming=False,
-                                  lora_task_id=lora_task_id)
+                                  lora_task_id=lora_task_id,
+                                  cache_salt=cache_salt)
         summary = self.impl.analyze_prefix_reuse(unique_tokens, dummy_req)
         return summary.reusable_blocks_all * self.tokens_per_block
 
@@ -848,6 +862,7 @@ class KVCacheManager(BaseResourceManager):
         kv_reserve_draft_tokens: Optional[int] = None,
         use_mrope: bool = False,
         max_beam_width: int = 1,
+        encoder_output_lens: Optional[List[int]] = None,
         # For capturable drafting loops. During normal inference, the draft model always
         # has enough KV cache space to fit all of our draft tokens. During warmup, however,
         # we need to make the KV cache manager aware that multiple autoregressive steps will
@@ -881,9 +896,10 @@ class KVCacheManager(BaseResourceManager):
             # in _prepare_tp_inputs; need token_num >= 2 so that doesn't go negative.
             if self.mapping.has_cp_helix():
                 token_num = max(token_num, 2)
-            encoder_input_tokens = [
-                1
-            ] * token_num if self.impl.cross_kv else None
+            encoder_output_len = (encoder_output_lens[i]
+                                  if encoder_output_lens is not None else None)
+            encoder_input_tokens = ([1] * encoder_output_len
+                                    if encoder_output_len is not None else None)
             # Using 1 instead of 0 prevents NaN during warmup in e.g. Deepseek
             req = LlmRequest(request_id=req_id,
                              max_new_tokens=1,
@@ -891,7 +907,8 @@ class KVCacheManager(BaseResourceManager):
                              sampling_config=SamplingConfig(
                                  sampling_params._get_sampling_config()),
                              is_streaming=False,
-                             encoder_input_tokens=encoder_input_tokens)
+                             encoder_input_tokens=encoder_input_tokens,
+                             encoder_output_len=encoder_output_len)
             req.is_dummy_request = True
             req.paged_kv_block_ids = []
             if prepare_resource:
@@ -1326,6 +1343,7 @@ class KVCacheManager(BaseResourceManager):
         layer_idx: Optional[int] = None,
         window_size: Optional[int] = None,
         beam_width: Optional[int] = 1,
+        num_blocks_per_seq: Optional[Sequence[int]] = None,
     ) -> List[List[int]]:
         beam_width = beam_width or 1
         if window_size is None:
@@ -1349,7 +1367,29 @@ class KVCacheManager(BaseResourceManager):
             )
             result[i] = beams[
                 0] if beam_width == 1 else self._pack_beam_cache_indices(beams)
+            if num_blocks_per_seq is not None:
+                result[i] = result[i][:num_blocks_per_seq[i]]
         return result
+
+    def get_batch_cache_indices_flat(
+        self,
+        request_ids: List[int],
+        num_blocks: List[int],
+        layer_idx: Optional[int] = None,
+    ) -> torch.Tensor:
+        """Concatenated per-request block tables, trimmed to real widths.
+
+        Equivalent to concatenating
+        ``get_batch_cache_indices(request_ids, layer_idx)[i][:num_blocks[i]]``
+        over all requests into one CPU int32 tensor; matches the interface
+        of ``KVCacheManagerV2.get_batch_cache_indices_flat``.
+        """
+        block_ids_per_seq = self.get_batch_cache_indices(
+            request_ids, layer_idx=layer_idx, num_blocks_per_seq=num_blocks)
+        indices_list = []
+        for block_ids, n in zip(block_ids_per_seq, num_blocks):
+            indices_list.extend(block_ids[:n])
+        return torch.tensor(indices_list, dtype=torch.int32)
 
     @staticmethod
     def _pack_beam_cache_indices(beams: List[List[int]]) -> List[int]:

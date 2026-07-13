@@ -22,7 +22,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import torch
 import torch.multiprocessing as mp
 
-from tensorrt_llm._torch.pyexecutor.sampling_utils import (
+from tensorrt_llm._torch.pyexecutor.sampler.sampling_utils import (
     greedy_search_sampling_batch,
     top_k_sampling_batch,
 )

@@ -16,13 +16,15 @@ import json
 import threading
 from typing import List, Optional, Union
 
-from ..llmapi.mpi_session import MpiPoolSession, MpiSession
+from ..llmapi.mpi_session import (MpiPoolSession, MpiSession,
+                                  validate_session_world_size)
 from ..llmapi.utils import logger_debug, print_colored
 from ..logger import logger
 from .executor import GenerationExecutor
 from .postproc_worker import PostprocWorkerConfig
 from .proxy import _check_collective_rpc_guard
 from .result import IterationResult
+from .rpc.rpc_common import RPCError
 from .rpc_proxy_mixin import RpcExecutorMixin
 from .rpc_worker import RpcWorker
 from .utils import create_mpi_comm_session, get_spawn_proxy_process_env
@@ -41,13 +43,12 @@ class GenerationExecutorRpcProxy(RpcExecutorMixin, GenerationExecutor):
         postproc_worker_config: Optional[PostprocWorkerConfig] = None,
         is_llm_executor: Optional[bool] = None,
     ):
-        """
-        Args:
-            worker_kwargs: kwargs for the rpc worker
-            model_world_size: the world size of the model
-            mpi_session: the mpi session to use
-            postproc_worker_config: the postproc worker config
-            is_llm_executor: whether this is an llm executor
+        """Args:
+        worker_kwargs: kwargs for the rpc worker
+        model_world_size: the world size of the model
+        mpi_session: the mpi session to use
+        postproc_worker_config: the postproc worker config
+        is_llm_executor: whether this is an llm executor
         """
         GenerationExecutorRpcProxy.INSTANCE_COUNTER += 1
         self.init_rpc_executor()
@@ -80,11 +81,13 @@ class GenerationExecutorRpcProxy(RpcExecutorMixin, GenerationExecutor):
         self._setup_mainloop_with_tasks()
 
     def launch_workers(self):
-        logger.debug(f"Launching workers")
+        logger.debug("Launching workers")
         assert self.mpi_session is not None
-        self.mpi_session.submit(RpcWorker.main_task,
-                                rpc_addr=self.rpc_addr,
-                                **self.worker_kwargs)
+        # Keep the futures: on an externally owned (shared) session, shutdown
+        # waits on them so worker teardown finishes before the pool is reused.
+        self.worker_futures = self.mpi_session.submit(RpcWorker.main_task,
+                                                      rpc_addr=self.rpc_addr,
+                                                      **self.worker_kwargs)
 
     def _setup_mainloop_with_tasks(self):
         """Setup mainloop with tasks needed for RpcProxy.
@@ -114,6 +117,17 @@ class GenerationExecutorRpcProxy(RpcExecutorMixin, GenerationExecutor):
         except Exception as e:
             logger.debug(f"Error fetching stats via RPC: {e}")
             return []
+
+    def get_kv_cache_capacity(self) -> dict:
+        """Get static primary/GPU KV cache capacity from the runtime via RPC."""
+        try:
+            capacity = self.rpc_client.fetch_kv_cache_capacity_async().remote()
+            if isinstance(capacity, str):
+                capacity = json.loads(capacity)
+            return capacity if isinstance(capacity, dict) else {}
+        except (RPCError, json.JSONDecodeError) as e:
+            logger.debug(f"Error fetching kv cache capacity via RPC: {e}")
+            return {}
 
     def aget_stats(self, timeout: float) -> IterationResult:
         """Get iteration statistics from the runtime via RPC (async).
@@ -203,8 +217,10 @@ class GenerationExecutorRpcProxy(RpcExecutorMixin, GenerationExecutor):
     ) -> List:
         """Execute a method call on the rank-0 RpcWorker via the RPC client.
 
-        Rank-0-only shim; only ``model_world_size == 1`` is supported.
-        See :meth:`~tensorrt_llm.executor.proxy.GenerationExecutorProxy.collective_rpc`
+        Rank-0 RPC shim.  ``sleep`` and ``wakeup`` are allowed for
+        ``model_world_size > 1``; all other methods require
+        ``model_world_size == 1``.  See
+        :meth:`~tensorrt_llm.executor.proxy.GenerationExecutorProxy.collective_rpc`
         for details.
 
         Args:
@@ -223,11 +239,15 @@ class GenerationExecutorRpcProxy(RpcExecutorMixin, GenerationExecutor):
             (non-blocking).
 
         Raises:
-            NotImplementedError: If ``model_world_size > 1``, or if
-                ``unique_reply_rank`` or ``target_ranks`` are provided.
+            NotImplementedError: If ``model_world_size > 1`` and the method
+                is not in the allowed-methods set (currently ``sleep`` and
+                ``wakeup``), or if ``unique_reply_rank`` or ``target_ranks``
+                are provided.
         """
-        _check_collective_rpc_guard(self.model_world_size, unique_reply_rank,
-                                    target_ranks)
+        _check_collective_rpc_guard(self.model_world_size,
+                                    unique_reply_rank,
+                                    target_ranks,
+                                    method=method)
         kwargs = kwargs or {}
         remote_call = getattr(self.rpc_client, method)(*args, **kwargs)
         if non_block:
@@ -242,7 +262,7 @@ class GenerationExecutorRpcProxy(RpcExecutorMixin, GenerationExecutor):
         return self.rpc_client.setup_engine().remote(need_response=True)
 
     def shutdown_remote(self):
-        logger_debug(f"Shutting down rpc remote", color="yellow")
+        logger_debug("Shutting down rpc remote", color="yellow")
         self.rpc_client.shutdown().remote(need_response=False)
 
     def abort_request(self, request_id: int) -> None:
@@ -252,8 +272,7 @@ class GenerationExecutorRpcProxy(RpcExecutorMixin, GenerationExecutor):
         if self._shutdown_event.is_set():
             return
         self._shutdown_event.set()
-        logger_debug(f"Shutting down GenerationExecutorRpcProxy",
-                     color="yellow")
+        logger_debug("Shutting down GenerationExecutorRpcProxy", color="yellow")
 
         # 1. shutdown the rpc server (PyExecutor Rank 0 + RPC server)
         self.shutdown_remote()
@@ -280,9 +299,24 @@ class GenerationExecutorRpcProxy(RpcExecutorMixin, GenerationExecutor):
         # 3. shutdown the mpi session, this should wait until all the PyExecutor
         # processes are shutdown
         if self.mpi_session is not None:
-            logger_debug(f"Shutting down mpi session", color="yellow")
-            self.mpi_session.shutdown()
-            logger_debug(f"Mpi session shutdown", color="yellow")
+            if self._owns_mpi_session:
+                logger_debug("Shutting down mpi session", color="yellow")
+                self.mpi_session.shutdown()
+            else:
+                # Externally owned (shared) session: leave the pool alive, but
+                # wait for this executor's worker tasks to finish so the next
+                # LLM on the pool doesn't race with PyExecutor teardown. Block
+                # without a timeout, mirroring the owned path above
+                # (mpi_session.shutdown() also waits indefinitely); a timeout
+                # that expires would just reintroduce the race it prevents.
+                for future in getattr(self, "worker_futures", []):
+                    try:
+                        future.result()
+                    except Exception as e:
+                        logger.warning(
+                            f"RPC worker task raised during shutdown on "
+                            f"shared MPI session: {e}")
+            logger_debug("Mpi session shutdown", color="yellow")
             self.mpi_session = None
 
         self.rpc_client.close()
@@ -295,8 +329,12 @@ class GenerationExecutorRpcProxy(RpcExecutorMixin, GenerationExecutor):
 
     def _create_mpi_session(self, model_world_size: int,
                             mpi_session: Optional[MpiSession]):
+        # Ownership is decided here, next to the create-vs-adopt branch: a
+        # session this proxy created is shut down by it; an external one is
+        # owned (and shut down) by the caller.
         mpi_process_pre_spawned: bool = get_spawn_proxy_process_env()
         if mpi_session is None:
+            self._owns_mpi_session = True
             if mpi_process_pre_spawned:
                 logger_debug('[proxy] create comm session ...\n', "yellow")
                 self.mpi_session = create_mpi_comm_session(model_world_size)
@@ -304,5 +342,7 @@ class GenerationExecutorRpcProxy(RpcExecutorMixin, GenerationExecutor):
                 logger_debug('[proxy] create pool session ...\n', "yellow")
                 self.mpi_session = MpiPoolSession(n_workers=model_world_size)
         else:
+            validate_session_world_size(mpi_session, model_world_size)
+            self._owns_mpi_session = False
             logger_debug('[proxy] using external mpi session ...\n', "yellow")
             self.mpi_session = mpi_session
