@@ -972,7 +972,7 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
         self,
         hidden_states: torch.Tensor,
         timestep: Optional[torch.Tensor] = None,
-        attention_timestep: Optional[torch.Tensor] = None,
+        raw_timestep: Optional[torch.Tensor] = None,
         text_ids: Optional[torch.Tensor] = None,
         text_mask: Optional[torch.Tensor] = None,
         video_shape: Optional[Tuple[int, int, int]] = None,
@@ -986,9 +986,9 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
 
         Args:
             hidden_states: [B, C, T, H, W] noisy latents
-            timestep: Raw scheduler diffusion timestep, shape [B]
-            attention_timestep: Normalized diffusion timestep in [0, 1], shape [B],
-                for attention backends that use timestep-dependent behavior.
+            timestep: Normalized diffusion timestep in [0, 1], shape [B].
+            raw_timestep: Raw scheduler diffusion timestep, shape [B], used by
+                the Cosmos3 time embedding path.
             text_ids: [B, S_text] tokenized text input
             text_mask: [B, S_text] attention mask for text (1=real, 0=pad)
             video_shape: (T, H, W) in latent space
@@ -1009,6 +1009,10 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
             provided; otherwise None.  action is always None for now.
         """
         del kwargs  # Kept for diffusers API compatibility.
+        if timestep is None:
+            raise ValueError("Cosmos3VFMTransformer.forward requires normalized timestep.")
+        if raw_timestep is None:
+            raise ValueError("Cosmos3VFMTransformer.forward requires raw_timestep.")
         T, H, W = video_shape
         Hp, Wp, _, _ = self._pad_to_patch_size(H, W)
         max_real_len = text_mask.sum(dim=1).max().item()
@@ -1017,7 +1021,7 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
         hidden_gen = self.vae2llm(self.patchify(hidden_states, T, H, W))
 
         with torch.autocast("cuda", enabled=True, dtype=torch.float32):
-            time_embed = self.time_embedder((timestep * self.timestep_scale))
+            time_embed = self.time_embedder((raw_timestep * self.timestep_scale))
         time_embed = time_embed.to(hidden_states.dtype)
 
         if noisy_frame_mask is not None:
@@ -1048,7 +1052,7 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
                 text_ids,
                 text_mask,
                 freqs_und,
-                timestep=attention_timestep,
+                timestep=timestep,
             )
             self.cached_freqs_gen = freqs_gen
 
@@ -1114,7 +1118,7 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
                     k_und,
                     v_und,
                     freqs_gen,
-                    timestep=attention_timestep,
+                    timestep=timestep,
                     real_text_lens=real_text_lens,
                 )
             else:
@@ -1123,7 +1127,7 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
                     k_und,
                     v_und,
                     freqs_gen,
-                    timestep=attention_timestep,
+                    timestep=timestep,
                 )
 
         hidden_gen = self.sharder.gather(hidden_gen, dim=1, unpad_to=S_gen)

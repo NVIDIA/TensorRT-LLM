@@ -553,6 +553,61 @@ class TestNoBatching(TestKVCacheManagerV2):
 
         self.manager.clear_reusable_blocks()
 
+    def test_commit_min_snapshot_reuses_swa_post_commit_prefix(self) -> None:
+        tokens_per_block = 32
+        window_size = 64
+        prompt = [TokenId(i) for i in range(tokens_per_block * 4)]
+        cfg = KVCacheManagerConfig(
+            tokens_per_block=tokens_per_block,
+            vocab_size=4096,
+            cache_tiers=[GpuCacheTierConfig(quota=16 << 20)],
+            layers=[
+                AttentionLayerConfig(
+                    layer_id=LayerId(0),
+                    buffers=[
+                        BufferConfig(role=Role.KEY, size=8192),
+                        BufferConfig(role=Role.VALUE, size=8192),
+                    ],
+                    sliding_window_size=window_size,
+                )
+            ],
+            commit_min_snapshot=True,
+        )
+        self.manager = KVCacheManager(cfg)
+
+        with TemporaryCudaStream([]) as stream_holder:
+            stream = cast(CudaStream, stream_holder.handle)
+            kv1 = self.manager.create_kv_cache()
+            self.assertTrue(kv1.resume(stream))
+            self.assertTrue(kv1.resize(len(prompt), len(prompt)))
+            kv1.commit(prompt)
+            kv1.close()
+        stream_holder.take_finish_event().synchronize()
+
+        match = self.manager._radix_tree.match(ReuseScope(), prompt)
+        self.assertEqual(match.num_tokens, len(prompt))
+        self.assertEqual(len(match.blocks), 4)
+
+        swa_lc_id = next(
+            lc_id
+            for lc_id, lc in self.manager._life_cycles.attention_life_cycles()
+            if lc.window_size is not None
+        )
+        # The committed snapshot is reusable at the post-commit token count, but
+        # old SWA blocks outside that window should not keep reusable pages.
+        self.assertIsNone(match.blocks[0].storage[swa_lc_id])
+        self.assertIsNone(match.blocks[1].storage[swa_lc_id])
+        self.assertIsNotNone(match.blocks[2].storage[swa_lc_id])
+        self.assertIsNotNone(match.blocks[3].storage[swa_lc_id])
+        self.assertEqual(
+            self.manager.probe_reuse(input_tokens=prompt[: tokens_per_block * 3]),
+            0,
+        )
+
+        kv2 = self.manager.create_kv_cache(input_tokens=prompt)
+        self.assertEqual(kv2.num_committed_tokens, len(prompt))
+        kv2.close()
+
     def test_reuse_scope_isolates_reuse(self) -> None:
         self.prepare(16 << 20, 0, 0, 2, None, 0, tokens_per_block=8)
         tokens = [TokenId(i) for i in range(64)]
@@ -1360,9 +1415,11 @@ class TestResizeQuota(TestKVCacheManagerV2):
         # Shrink the gpu quota
         success = self.manager.resize(GPU_LEVEL, 32 << 20)
         assert success and self.manager.get_quota(GPU_LEVEL) <= 32 << 20
-        # also shrink the host quota, this would evict some pages to disk
-        success = self.manager.resize(HOST_LEVEL, 4 << 20)
-        assert success and self.manager.get_quota(HOST_LEVEL) <= 4 << 20
+        # also shrink the host quota, this would evict some pages to disk.
+        # 16MB is the smallest shrink that still satisfies the SWA worst-case
+        # min_slots floor (sink + window blocks across all pool groups).
+        success = self.manager.resize(HOST_LEVEL, 16 << 20)
+        assert success and self.manager.get_quota(HOST_LEVEL) <= 16 << 20
         # also shrink the disk quota, this would drop some old pages
         success = self.manager.resize(DISK_LEVEL, 32 << 20)
         assert success and self.manager.get_quota(DISK_LEVEL) <= 32 << 20
@@ -1491,7 +1548,8 @@ class TestSSMSupport(unittest.TestCase):
         num_attn_layers: int = 2,
         num_ssm_layers: int = 2,
         window_size: SlidingWindowSize = None,
-        ssm_reuse_interval: int = 512,
+        commit_min_snapshot: bool = True,
+        enable_partial_reuse: bool = False,
     ) -> KVCacheManagerConfig:
         layers = []
         lid = 0
@@ -1522,8 +1580,8 @@ class TestSSMSupport(unittest.TestCase):
             vocab_size=1024,
             cache_tiers=[GpuCacheTierConfig(quota=gpu_quota)],
             layers=layers,
-            ssm_reuse_interval=ssm_reuse_interval,
-            enable_partial_reuse=False,
+            enable_partial_reuse=enable_partial_reuse,
+            commit_min_snapshot=commit_min_snapshot,
         )
 
     def test_suspend_and_resume_with_ssm(self) -> None:
@@ -1558,15 +1616,13 @@ class TestSSMSupport(unittest.TestCase):
         kv_cache.close()
 
     def test_no_reuse_with_ssm(self) -> None:
-        """input_tokens are accepted but no prefix reuse happens before first snapshot boundary."""
-        cfg = self._make_ssm_config(tokens_per_block=32, ssm_reuse_interval=512)
+        """input_tokens are accepted but no prefix reuse happens without a prior snapshot."""
+        cfg = self._make_ssm_config(tokens_per_block=32)
         self.manager = KVCacheManager(cfg)
-        # 64 tokens < ssm_reuse_interval=512, so no snapshot boundary reached → no SSM reuse
+        # No request has committed these tokens yet, so there is no SSM snapshot to reuse.
         tokens = [self.next_token() for _ in range(64)]
         kv_cache = self.manager.create_kv_cache(input_tokens=tokens)
-        self.assertEqual(
-            kv_cache.num_committed_tokens, 0, "No reuse before first snapshot boundary"
-        )
+        self.assertEqual(kv_cache.num_committed_tokens, 0, "No reuse before first snapshot")
         # Resume before close so cuda_stream is set
         stream_holder = CachedCudaStream()
         stream = cast(CudaStream, stream_holder.handle)
@@ -1603,7 +1659,6 @@ class TestSSMSupport(unittest.TestCase):
     def _make_ssm_reuse_config(
         self,
         tokens_per_block: int = 32,
-        ssm_reuse_interval: int = 64,
         gpu_quota: int = 32 << 20,
         num_attn_layers: int = 2,
         num_ssm_layers: int = 2,
@@ -1613,47 +1668,52 @@ class TestSSMSupport(unittest.TestCase):
             gpu_quota=gpu_quota,
             num_attn_layers=num_attn_layers,
             num_ssm_layers=num_ssm_layers,
-            ssm_reuse_interval=ssm_reuse_interval,
         )
 
-    def test_ssm_reuse_interval_boundary(self) -> None:
-        """Snapshots only happen at interval boundaries, not every block."""
-        tokens_per_block = 32
-        ssm_reuse_interval = 128  # snapshot every 4 blocks
-        cfg = self._make_ssm_reuse_config(
-            tokens_per_block=tokens_per_block,
-            ssm_reuse_interval=ssm_reuse_interval,
-        )
+    def test_ssm_reuse_snapshots_each_commit(self) -> None:
+        """SSM keeps reusable snapshots at committed prefix lengths."""
+        cfg = self._make_ssm_reuse_config(tokens_per_block=32)
         self.manager = KVCacheManager(cfg)
         stream_holder = CachedCudaStream()
         stream = cast(CudaStream, stream_holder.handle)
 
-        # Commit 96 tokens (3 blocks) — no snapshot at interval 128
-        prompt = [self.next_token() for _ in range(96)]
+        prompt = [self.next_token() for _ in range(128)]
+        early_prompt = prompt[:96]
         kv1 = self.manager.create_kv_cache()
         kv1.resume(stream)
-        kv1.capacity = len(prompt)
-        kv1.history_length = len(prompt)
-        kv1.commit(prompt)
+        kv1.capacity = len(early_prompt)
+        kv1.history_length = len(early_prompt)
+        kv1.commit(early_prompt)
         kv1.stop_committing()
         kv1.close()
 
-        # Try to reuse — should get 0 since no snapshot exists
-        kv2 = self.manager.create_kv_cache(input_tokens=prompt)
-        self.assertEqual(
-            kv2.num_committed_tokens, 0, "No reuse when no SSM snapshot at interval boundary"
-        )
+        kv2 = self.manager.create_kv_cache(input_tokens=early_prompt)
+        self.assertEqual(kv2.num_committed_tokens, len(early_prompt))
         kv2.resume(stream)
         kv2.close()
+
+        kv3 = self.manager.create_kv_cache()
+        kv3.resume(stream)
+        kv3.capacity = len(prompt)
+        kv3.history_length = len(prompt)
+        kv3.commit(prompt)
+        kv3.stop_committing()
+        kv3.close()
+
+        kv4 = self.manager.create_kv_cache(input_tokens=prompt)
+        self.assertEqual(kv4.num_committed_tokens, len(prompt))
+        kv4.resume(stream)
+        kv4.close()
+
+        kv5 = self.manager.create_kv_cache(input_tokens=early_prompt)
+        self.assertEqual(kv5.num_committed_tokens, len(early_prompt))
+        kv5.resume(stream)
+        kv5.close()
 
     def test_ssm_reuse_data_integrity(self) -> None:
         """After reuse, SSM data matches the snapshot (verified by FakeEngine)."""
         tokens_per_block = 32
-        ssm_reuse_interval = 64
-        cfg = self._make_ssm_reuse_config(
-            tokens_per_block=tokens_per_block,
-            ssm_reuse_interval=ssm_reuse_interval,
-        )
+        cfg = self._make_ssm_reuse_config(tokens_per_block=tokens_per_block)
         self.manager = KVCacheManager(cfg)
         engine = FakeEngine(cfg)
         stream_holder = CachedCudaStream()
@@ -1688,14 +1748,169 @@ class TestSSMSupport(unittest.TestCase):
             kv2.history_length = len(history)
         kv2.close()
 
+    def test_ssm_reuse_keeps_snapshots_from_multiple_commits(self) -> None:
+        """Multiple commit() calls keep independently reusable SSM snapshots."""
+        cfg = self._make_ssm_reuse_config(tokens_per_block=32)
+        self.manager = KVCacheManager(cfg)
+        stream_holder = CachedCudaStream()
+        stream = cast(CudaStream, stream_holder.handle)
+
+        prompt = [self.next_token() for _ in range(96)]
+        kv1 = self.manager.create_kv_cache()
+        kv1.resume(stream)
+        kv1.capacity = 32
+        kv1.commit(prompt[:32])
+
+        kv1.capacity = 64
+        kv1.commit(prompt[32:64])
+        kv1.close()
+
+        kv2 = self.manager.create_kv_cache(input_tokens=prompt[:32])
+        self.assertEqual(kv2.num_committed_tokens, 32)
+        kv2.resume(stream)
+        kv2.close()
+
+        kv3 = self.manager.create_kv_cache(input_tokens=prompt[:48])
+        self.assertEqual(kv3.num_committed_tokens, 32)
+        kv3.resume(stream)
+        kv3.close()
+
+        kv4 = self.manager.create_kv_cache(input_tokens=prompt)
+        self.assertEqual(kv4.num_committed_tokens, 64)
+        kv4.resume(stream)
+        kv4.close()
+
+    def test_ssm_partial_snapshot_respects_partial_reuse_setting(self) -> None:
+        """Partial SSM snapshots are created, but partial prompt reuse remains optional."""
+        tokens_per_block = 32
+        prompt = [self.next_token() for _ in range(64)]
+
+        for enable_partial_reuse, expected_long_match in ((False, 32), (True, 48)):
+            cfg = self._make_ssm_config(
+                tokens_per_block=tokens_per_block,
+                enable_partial_reuse=enable_partial_reuse,
+            )
+            self.manager = KVCacheManager(cfg)
+            stream_holder = CachedCudaStream()
+            stream = cast(CudaStream, stream_holder.handle)
+
+            kv1 = self.manager.create_kv_cache()
+            kv1.resume(stream)
+            kv1.capacity = 32
+            kv1.commit(prompt[:32])
+
+            kv1.capacity = 48
+            kv1.commit(prompt[32:48])
+            kv1.close()
+
+            longer = self.manager.create_kv_cache(input_tokens=prompt)
+            self.assertEqual(longer.num_committed_tokens, expected_long_match)
+            longer.resume(stream)
+            longer.close()
+
+            exact = self.manager.create_kv_cache(input_tokens=prompt[:48])
+            self.assertEqual(exact.num_committed_tokens, 48)
+            exact.resume(stream)
+            exact.close()
+
+            match = self.manager._radix_tree.match(
+                ReuseScope(), prompt[:48], self.manager.enable_partial_match
+            )
+            self.assertEqual(match.num_tokens, 48)
+            assert self.manager._life_cycles.ssm_life_cycle_id is not None
+            page_ref = match.blocks[-1].storage[self.manager._life_cycles.ssm_life_cycle_id]
+            assert page_ref is not None
+            page = unwrap_rawref(page_ref)
+            self.assertEqual(page.num_tokens_in_block, 16)
+
+            del exact, kv1, longer, match, page, page_ref
+            gc.collect()
+            stream_holder.synchronize()
+            self.manager.shutdown()
+            del self.manager
+
+    def test_commit_is_end_moves_partial_attention_and_ssm_pages(self) -> None:
+        """Final partial commits move live pages into the tree instead of copying them."""
+        tokens_per_block = 32
+        cfg = self._make_ssm_config(tokens_per_block=tokens_per_block, enable_partial_reuse=True)
+        self.manager = KVCacheManager(cfg)
+        stream_holder = CachedCudaStream()
+        stream = cast(CudaStream, stream_holder.handle)
+        prompt = [self.next_token() for _ in range(48)]
+
+        kv_cache = self.manager.create_kv_cache()
+        kv_cache.resume(stream)
+        kv_cache.capacity = len(prompt)
+        kv_cache.history_length = len(prompt)
+
+        attn_lc_id = next(iter(self.manager._life_cycles.attention_life_cycles()))[0]
+        assert self.manager._life_cycles.ssm_life_cycle_id is not None
+        ssm_lc_id = self.manager._life_cycles.ssm_life_cycle_id
+        attn_tail_slot = kv_cache.get_base_page_indices(LayerGroupId(attn_lc_id))[1]
+        ssm_slot = kv_cache.get_ssm_block_base_index(LayerGroupId(ssm_lc_id))
+
+        kv_cache.commit(prompt, is_end=True)
+        kv_cache.close()
+
+        match = self.manager._radix_tree.match(
+            ReuseScope(), prompt, self.manager.enable_partial_match
+        )
+        self.assertEqual(match.num_tokens, len(prompt))
+        tree_block = match.blocks[-1]
+
+        attn_ref = tree_block.storage[attn_lc_id]
+        ssm_ref = tree_block.storage[ssm_lc_id]
+        assert attn_ref is not None
+        assert ssm_ref is not None
+        attn_page = unwrap_rawref(attn_ref)
+        ssm_page = unwrap_rawref(ssm_ref)
+        self.assertEqual(attn_page.slot_id, attn_tail_slot)
+        self.assertEqual(ssm_page.slot_id, ssm_slot)
+        self.assertEqual(ssm_page.num_tokens_in_block, 16)
+
+    def test_commit_min_snapshot_requires_history_alignment(self) -> None:
+        """commit_min_snapshot requires commit() to start or end at history length."""
+        cfg = self._make_ssm_config(tokens_per_block=32)
+        self.manager = KVCacheManager(cfg)
+        stream_holder = CachedCudaStream()
+        stream = cast(CudaStream, stream_holder.handle)
+        prompt = [self.next_token() for _ in range(64)]
+
+        kv1 = self.manager.create_kv_cache()
+        kv1.resume(stream)
+        kv1.capacity = 32
+        kv1.commit(prompt[:32])
+        kv1.close()
+
+        kv2 = self.manager.create_kv_cache()
+        kv2.resume(stream)
+        kv2.capacity = 64
+        kv2.history_length = 32
+        kv2.commit(prompt[:32])
+        kv2.close()
+
+        kv3 = self.manager.create_kv_cache()
+        kv3.resume(stream)
+        kv3.capacity = 64
+        kv3.history_length = 48
+        with self.assertRaises(AssertionError):
+            kv3.commit(prompt[:32])
+        self.assertEqual(kv3.num_committed_tokens, 0)
+        kv3.close()
+
+        kv4 = self.manager.create_kv_cache()
+        kv4.resume(stream)
+        kv4.capacity = 48
+        kv4.history_length = 48
+        kv4.commit(prompt[:48])
+        self.assertEqual(kv4.num_committed_tokens, 48)
+        kv4.close()
+
     def test_ssm_reuse_config_validation(self) -> None:
-        """Invalid ssm_reuse_interval raises assertion."""
-        # Not divisible by tokens_per_block
+        """SSM reuse requires commit_min_snapshot."""
+        self._make_ssm_config(enable_partial_reuse=True)
         with self.assertRaises(AssertionError):
-            self._make_ssm_config(tokens_per_block=32, ssm_reuse_interval=50)
-        # Zero interval
-        with self.assertRaises(AssertionError):
-            self._make_ssm_config(tokens_per_block=32, ssm_reuse_interval=0)
+            self._make_ssm_config(commit_min_snapshot=False)
 
 
 class TestInitRatioConfig(unittest.TestCase):
@@ -2070,16 +2285,25 @@ class TestInitRatioConfig(unittest.TestCase):
         """With scratch reuse, windowed PG needs fewer slots during prefill.
 
         16 SWA layers (frac_max=1/16) + 16 full layers.
-        Typical step: 4 prefill requests (history=0, capacity=4096).
+        Typical step: 8 prefill requests (history=0, capacity=16384).
 
         Without scratch: both PGs need the same block count; ratio reflects
         the buffer-size difference only.
         With scratch: PG0 needs far fewer slots -> ratio shifts toward PG1.
+
+        The quota is deliberately large and the sequences long so the SWA
+        worst-case min_slots floor (sink + window blocks) is a negligible
+        fraction and does not clamp the scratch-reduced windowed ratio.
         """
-        step = BatchDesc(kv_caches=[KVCacheDesc(capacity=4096, history_length=0)] * 4)
+        step = BatchDesc(kv_caches=[KVCacheDesc(capacity=16384, history_length=0)] * 8)
         multi = dict(num_windowed_layers=16, num_full_layers=16)
-        cfg_no = self._make_config(typical_step=step, enable_swa_scratch_reuse=False, **multi)
-        cfg_yes = self._make_config(typical_step=step, enable_swa_scratch_reuse=True, **multi)
+        big_quota = 8 << 30
+        cfg_no = self._make_config(
+            gpu_quota=big_quota, typical_step=step, enable_swa_scratch_reuse=False, **multi
+        )
+        cfg_yes = self._make_config(
+            gpu_quota=big_quota, typical_step=step, enable_swa_scratch_reuse=True, **multi
+        )
         mgr_no = KVCacheManager(cfg_no)
         mgr_yes = KVCacheManager(cfg_yes)
         ratio_no = mgr_no._current_gpu_ratio
@@ -2572,6 +2796,91 @@ class TestScratchReuse(TestKVCacheManagerV2):
 
         s.take_finish_event().synchronize()
         kv.close()
+        self.manager.clear_reusable_blocks()
+
+    def test_reuse_across_prefill_turns_keeps_only_window_minus_one(self) -> None:
+        """SWA scratch reuse preserves winSize-1 history tokens across prefill turns.
+
+        Two prefill turns, window=64, tokens_per_block=32, scratch reuse ON,
+        commit_min_snapshot OFF:
+
+        Turn 1 commits a 127-token prompt (= 2*window - 1). With scratch reuse the
+        out-of-window input blocks share scratch slots, so after the turn the only
+        preserved KV data is the last winSize-1 = 63 tokens (blocks 2 and 3,
+        positions 64..126). Blocks 0 and 1 (positions 0..63) keep no page.
+
+        Turn 2's prompt shares those first 127 tokens. It must still reuse the whole
+        127-token committed prefix: for reuse at token 127, the first input token
+        (position 127) is itself in the window, so only winSize-1 = 63 history tokens
+        are required, and those are exactly the preserved blocks 2 and 3. The
+        out-of-window blocks 0 and 1 are not needed even though they hold no page.
+        """
+        tokens_per_block = 32
+        window_size = 64
+        self._prepare_scratch(
+            num_layers=1,
+            window_size=window_size,
+            tokens_per_block=tokens_per_block,
+            gpu_quota=64 << 20,
+        )
+        swa_lc_id = next(
+            lc_id
+            for lc_id, lc in self.manager._life_cycles.attention_life_cycles()
+            if lc.window_size is not None
+        )
+
+        prompt1 = [TokenId(i) for i in range(2 * window_size - 1)]  # 127 tokens
+        prompt2 = [TokenId(i) for i in range(200)]  # first 127 tokens identical to prompt1
+
+        # ---- Turn 1: prefill + commit 127 tokens with scratch reuse, then close. ----
+        with TemporaryCudaStream([]) as s:
+            stream = cast(CudaStream, s.handle)
+            kv1 = self.manager.create_kv_cache()
+            self.assertTrue(kv1.resume(stream))
+            # resize(capacity, history_length): scratch reuse forbids the capacity setter.
+            self.assertTrue(kv1.resize(len(prompt1), 0))
+            self.assertTrue(kv1.has_scratch_slots)
+            self.engine.execute([Step(kv1, prompt1, [])], stream)
+            kv1.commit(prompt1)
+            self.assertEqual(kv1.num_committed_tokens, len(prompt1))
+            kv1.close()  # close() -> stop_committing() commits the partial tail block.
+        s.take_finish_event().synchronize()
+
+        # Turn 1 kept KV data only for the last winSize-1 = 63 tokens (blocks 2 and 3).
+        # match() is documented volatile, so read what we need and drop the reference before
+        # mutating the tree again (holding live Block refs across a later clear would leave the
+        # eviction accounting inconsistent).
+        match1 = self.manager._radix_tree.match(ReuseScope(), prompt1)
+        self.assertEqual(match1.num_tokens, len(prompt1))
+        self.assertEqual(len(match1.blocks), 4)
+        has_page = [b.storage[swa_lc_id] is not None for b in match1.blocks]
+        del match1
+        self.assertEqual(
+            has_page,
+            [False, False, True, True],  # positions 0..63 out of window; 64..126 in window
+        )
+
+        # Turn 2 reuses the full 127-token committed prefix despite blocks 0,1 lacking pages.
+        self.assertEqual(self.manager.probe_reuse(input_tokens=prompt2), len(prompt1))
+
+        # ---- Turn 2: reuse, prefill the rest, and validate the reused KV data. ----
+        with TemporaryCudaStream([]) as s:
+            stream = cast(CudaStream, s.handle)
+            kv2 = self.manager.create_kv_cache(input_tokens=prompt2)
+            num_reused = kv2.num_committed_tokens
+            self.assertEqual(num_reused, len(prompt1))
+            self.assertTrue(kv2.resume(stream))
+            self.assertTrue(kv2.resize(len(prompt2), num_reused))
+            history = list(prompt2[:num_reused])
+            inp = list(prompt2[num_reused:])
+            # engine.execute checks the reused history KV against expected values, so a
+            # successful run proves the reused blocks 2,3 hold correct (not scratch) data.
+            self.engine.execute([Step(kv2, inp, history)], stream)
+            kv2.commit(inp)
+            kv2.stop_committing()
+            self.engine.execute([Step(kv2, [], list(prompt2))], stream)
+            kv2.close()
+        s.take_finish_event().synchronize()
         self.manager.clear_reusable_blocks()
 
 

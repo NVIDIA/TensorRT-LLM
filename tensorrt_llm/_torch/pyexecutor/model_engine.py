@@ -341,9 +341,9 @@ class PyTorchModelEngine(ModelEngine):
         )
 
         input_processor_kwargs = {}
-        if llm_args.video_pruning_rate is not None:
-            input_processor_kwargs[
-                'video_pruning_rate'] = llm_args.video_pruning_rate
+        video_pruning_rate = llm_args.multimodal_config.video_pruning_rate
+        if video_pruning_rate is not None:
+            input_processor_kwargs['video_pruning_rate'] = video_pruning_rate
         self.input_processor = create_input_processor(
             model_path,
             tokenizer=None,
@@ -532,9 +532,11 @@ class PyTorchModelEngine(ModelEngine):
                                                          dtype=torch.int,
                                                          device='cuda')
 
-        self.attn_backend = get_attention_backend(
-            self.llm_args.attn_backend,
-            sparse_attention_config=self.sparse_attention_config)
+        sparse_params = (self.sparse_attention_config.to_sparse_params(
+            pretrained_config=self.model.model_config.pretrained_config)
+                         if self.sparse_attention_config is not None else None)
+        self.attn_backend = get_attention_backend(self.llm_args.attn_backend,
+                                                  sparse_params=sparse_params)
 
         self.get_runtime_tokens_per_gen_step = spec_config.get_runtime_tokens_per_gen_step if spec_config is not None else lambda runtime_draft_len: 1
 
@@ -2072,7 +2074,7 @@ class PyTorchModelEngine(ModelEngine):
             # Cache the no-cache metadata.
             if self.encoder_attn_metadata is not None:
                 return self.encoder_attn_metadata
-            metadata_kwargs = dict(
+            self.encoder_attn_metadata = metadata_cls(
                 max_num_requests=self.batch_size,
                 max_num_tokens=self.max_num_tokens,
                 max_num_sequences=self.batch_size * self.max_beam_width,
@@ -2085,7 +2087,6 @@ class PyTorchModelEngine(ModelEngine):
                 cache_indirection=cache_indirection,
                 num_heads_per_kv=num_heads_per_kv,
                 sparse_metadata_params=sparse_metadata_params)
-            self.encoder_attn_metadata = metadata_cls(**metadata_kwargs)
             self.encoder_attn_metadata.block_ids_per_seq = None
             self.encoder_attn_metadata.kv_block_ids_per_seq = None
             return self.encoder_attn_metadata
@@ -2096,7 +2097,7 @@ class PyTorchModelEngine(ModelEngine):
             assert self.attn_metadata.kv_cache_manager is kv_cache_manager
             return self.attn_metadata
 
-        metadata_kwargs = dict(
+        self.attn_metadata = metadata_cls(
             max_num_requests=self.batch_size,
             max_num_tokens=self.max_num_tokens,
             max_num_sequences=self.batch_size * self.max_beam_width,
@@ -2110,7 +2111,6 @@ class PyTorchModelEngine(ModelEngine):
             num_heads_per_kv=num_heads_per_kv,
             sparse_metadata_params=sparse_metadata_params,
         )
-        self.attn_metadata = metadata_cls(**metadata_kwargs)
 
         return self.attn_metadata
 
@@ -2357,6 +2357,8 @@ class PyTorchModelEngine(ModelEngine):
         self._init_max_num_tokens()
 
     def _release_cuda_graphs(self):
+        if self._torch_compile_backend is not None:
+            self._torch_compile_backend.clear_piecewise_cuda_graphs()
         if hasattr(self,
                    'cuda_graph_runner') and self.cuda_graph_runner is not None:
             self.cuda_graph_runner.clear()
@@ -3993,7 +3995,11 @@ class PyTorchModelEngine(ModelEngine):
             self.previous_kv_lens_offsets_cuda *= 0
 
         position_ids = self._apply_position_id_offset(position_ids)
-        if self.use_mrope and mrope_position_ids:
+        # Use the (3,1,N) MRoPE layout whenever the model declares MRoPE, even
+        # for text-only batches: keeping position_ids rank-consistent between
+        # warmup and serving keeps torch.compile guards stable, so piecewise
+        # CUDA graphs captured at warmup remain usable at runtime.
+        if self.use_mrope:
             # Mixed batches may have only some requests with multimodal MRoPE
             # data. Seed the full (3,1,N) buffer from scalar position_ids
             # (text-only tokens get the same value on all 3 axes), then
@@ -4152,7 +4158,10 @@ class PyTorchModelEngine(ModelEngine):
         if attn_metadata.padded_num_tokens is not None:
             self.input_ids_cuda[total_num_tokens:padded_num_tokens].fill_(0)
             virtual_num_tokens = padded_num_tokens
-            if self.use_mrope and mrope_position_ids:
+            # Match the rank of the unpadded branch: MRoPE models always use
+            # the (3,1,N) layout (see the seeding block above), so the padded
+            # view must stay 3D as well to keep torch.compile guards stable.
+            if self.use_mrope:
                 # Zero-fill padding on dim 2 (token dim) of (3,1,N) buffer.
                 self.mrope_position_ids_cuda[:, :, total_num_tokens:
                                              padded_num_tokens].fill_(0)
@@ -5856,6 +5865,25 @@ class PyTorchModelEngine(ModelEngine):
         if callable(loader):
             loader(target_model)
 
+    @staticmethod
+    def _apply_logits_processors(request, logits_processors, logits_tensor,
+                                 beam_width, token_ids, logits_row_offset):
+        logits_rows = logits_tensor[logits_row_offset:logits_row_offset +
+                                    beam_width]
+        # Reshape to align w/ the shape used in the TRT backend,
+        # so the same logit processors can be used across both backends.
+        logits_rows = logits_rows.view(beam_width, 1, -1)
+        for lp in logits_processors:
+            lp_params = inspect.signature(lp).parameters
+
+            assert 4 <= len(lp_params) <= 5, (
+                "Logit post processor signature must match the `LogitsProcessor` interface "
+                "defined in `tensorrtllm.sampling_params`.")
+            lp(request.py_request_id, logits_rows, token_ids, None, None)
+
+        logits_tensor[logits_row_offset:logits_row_offset +
+                      beam_width] = logits_rows.view(beam_width, -1)
+
     def _execute_logit_post_processors(self,
                                        scheduled_requests: ScheduledRequests,
                                        outputs: dict):
@@ -5868,35 +5896,40 @@ class PyTorchModelEngine(ModelEngine):
             # TODO: support models that don't return outputs as dict
             return
 
-        num_ctx_req = scheduled_requests.num_context_requests
         logits_tensor = outputs["logits"]
 
-        for idx, request in enumerate(scheduled_requests.all_requests()):
-            logits_processors = getattr(request, "py_logits_post_processors",
-                                        None)
-            if not logits_processors:
-                continue
+        logits_row_offset = 0
+        request_groups = (
+            (scheduled_requests.context_requests, True),
+            (scheduled_requests.generation_requests, False),
+        )
 
-            token_ids = request.get_tokens(0)
-            if idx < num_ctx_req and request.py_orig_prompt_len < len(
-                    token_ids):
-                # Skip as we only need to apply logit processor on the last context request
-                continue
+        for requests, is_context_request in request_groups:
+            for request in requests:
+                if is_context_request:
+                    beam_width = 1
+                else:
+                    beam_width = request.get_beam_width_by_iter(
+                        for_next_iteration=False)
 
-            logits_row = logits_tensor[idx]
-            # Reshape to align w/ the shape used in the TRT backend,
-            # so the same logit processors can be used across both backends.
-            logits_row = logits_row.view(1, 1, -1)
-            token_ids = [token_ids]
-            for lp in logits_processors:
-                lp_params = inspect.signature(lp).parameters
+                logits_processors = getattr(request,
+                                            "py_logits_post_processors", None)
+                if logits_processors:
+                    token_ids = ([request.get_tokens(0)]
+                                 if is_context_request else [
+                                     request.get_tokens(beam_idx)
+                                     for beam_idx in range(beam_width)
+                                 ])
+                    if (is_context_request
+                            and request.py_orig_prompt_len < len(token_ids[0])):
+                        # Skip as we only need to apply logit processor on the last context request
+                        logits_row_offset += beam_width
+                        continue
 
-                assert 4 <= len(lp_params) <= 5, (
-                    "Logit post processor signature must match the `LogitsProcessor` interface "
-                    "defined in `tensorrtllm.sampling_params`.")
-                lp(request.py_request_id, logits_row, token_ids, None, None)
-
-            logits_tensor[idx] = logits_row.view(-1)
+                    self._apply_logits_processors(request, logits_processors,
+                                                  logits_tensor, beam_width,
+                                                  token_ids, logits_row_offset)
+                logits_row_offset += beam_width
 
     def wait_for_input_copy(self):
         """
