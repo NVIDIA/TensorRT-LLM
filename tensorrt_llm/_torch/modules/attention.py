@@ -705,24 +705,28 @@ class Attention(nn.Module):
     def _maybe_permute_gate_tail_layout(self):
         """Permute qkv_proj weight rows from [q0|g0|q1|g1|...|K|V] to [Q|K|V|G].
 
-        Load-time-only transform enabling the copy-free gate path in forward. Only
-        engaged for plain (unquantized) weights with a backend that supports the
-        strided [Q|K|V] view in both context and generation paths.
+        Load-time-only transform enabling the copy-free gate path in forward.
+        Engaged for plain weights and per-tensor FP8 QDQ weights with a backend
+        that supports the strided [Q|K|V] view in both context and generation
+        paths. The FP8 weight scale is scalar and does not need to be permuted.
         """
         if not self._gate_tail_layout_enabled or self._gate_tail_layout_active:
             return
-        has_quant = (self.quant_config is not None
-                     and self.quant_config.layer_quant_mode.has_any_quant(
-                         exclude_kv_cache=True))
+        has_quant = getattr(self.qkv_proj, "has_any_quant", False)
+        has_fp8_qdq = getattr(self.qkv_proj, "has_fp8_qdq", False)
+        weight_scale = getattr(self.qkv_proj, "weight_scale", None)
+        has_supported_weight = (
+            not has_quant and self.qkv_proj.weight.dtype
+            in (torch.bfloat16, torch.float16, torch.float32)
+        ) or (has_fp8_qdq and self.qkv_proj.weight.dtype == torch.float8_e4m3fn
+              and weight_scale is not None and weight_scale.numel() == 1)
         supports_strided_qkv = getattr(self.attn, "support_strided_fused_qkv",
                                        lambda: False)()
         supported = (self.attn_backend == "TRTLLM" and self.support_fused_qkv
                      and supports_strided_qkv
                      and getattr(self, "fuse_qk_norm_rope", False)
-                     and not getattr(self, "skip_rope", False) and not has_quant
-                     and self.mapping.cp_size == 1
-                     and self.qkv_proj.weight.dtype
-                     in (torch.bfloat16, torch.float16, torch.float32))
+                     and not getattr(self, "skip_rope", False)
+                     and self.mapping.cp_size == 1 and has_supported_weight)
         if not supported:
             logger.warning_once(
                 "Gate-tail QKV layout is not supported for this attention "

@@ -20,7 +20,11 @@ def test_strided_fused_qkv_backend_capability(monkeypatch, sm, expected):
     assert TrtllmAttention.support_strided_fused_qkv() is expected
 
 
-def _make_gate_tail_attention(support_strided_fused_qkv: bool) -> Attention:
+def _make_gate_tail_attention(
+    support_strided_fused_qkv: bool,
+    *,
+    quant_kind: str = "none",
+) -> Attention:
     attention = object.__new__(Attention)
     nn.Module.__init__(attention)
     attention._gate_tail_layout_enabled = True
@@ -40,6 +44,14 @@ def _make_gate_tail_attention(support_strided_fused_qkv: bool) -> Attention:
     attention.qkv_proj = nn.Linear(1, 12, bias=False)
     with torch.no_grad():
         attention.qkv_proj.weight.copy_(torch.arange(12).reshape(12, 1))
+    attention.qkv_proj.has_any_quant = quant_kind != "none"
+    attention.qkv_proj.has_fp8_qdq = quant_kind == "fp8_qdq"
+    if quant_kind == "fp8_qdq":
+        attention.qkv_proj.weight = nn.Parameter(
+            attention.qkv_proj.weight.to(torch.float8_e4m3fn),
+            requires_grad=False,
+        )
+        attention.qkv_proj.weight_scale = nn.Parameter(torch.tensor(0.125), requires_grad=False)
     return attention
 
 
@@ -53,3 +65,24 @@ def test_gate_tail_layout_respects_backend_capability(supported):
         attention.qkv_proj.weight[:, 0], torch.tensor(expected_rows, dtype=torch.float32)
     )
     assert attention._gate_tail_layout_active is supported
+
+
+def test_gate_tail_layout_supports_fp8_qdq():
+    attention = _make_gate_tail_attention(True, quant_kind="fp8_qdq")
+    original_weight_scale = attention.qkv_proj.weight_scale.clone()
+    attention._maybe_permute_gate_tail_layout()
+
+    expected_rows = torch.tensor([0, 1, 4, 5, 8, 9, 10, 11, 2, 3, 6, 7], dtype=torch.float32)
+    torch.testing.assert_close(attention.qkv_proj.weight[:, 0].float(), expected_rows)
+    torch.testing.assert_close(attention.qkv_proj.weight_scale, original_weight_scale)
+    assert attention._gate_tail_layout_active
+
+
+def test_gate_tail_layout_rejects_other_quantization():
+    attention = _make_gate_tail_attention(True, quant_kind="unsupported")
+    attention._maybe_permute_gate_tail_layout()
+
+    torch.testing.assert_close(
+        attention.qkv_proj.weight[:, 0], torch.arange(12, dtype=torch.float32)
+    )
+    assert not attention._gate_tail_layout_active

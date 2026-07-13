@@ -227,7 +227,7 @@ class QKNormRoPEAttention(Attention):
 
         supported = (self._gate_tail_layout_active and self.mapping.cp_size == 1
                      and self.head_dim == 256
-                     and self.qkv_proj.weight.dtype == torch.bfloat16
+                     and self.qkv_proj.dtype == torch.bfloat16
                      and self.q_norm.weight is not None
                      and self.k_norm.weight is not None
                      and self.q_norm.weight.dtype == torch.bfloat16
