@@ -18,6 +18,8 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
+#include <cstdint>
+
 #include "tensorrt_llm/common/config.h"
 
 TRTLLM_NAMESPACE_BEGIN
@@ -68,7 +70,7 @@ void mhcFusedHcLaunch(__nv_bfloat16 const* x_prev, __nv_bfloat16 const* residual
     __nv_bfloat16* residual_cur, float* post_mix_cur, float* comb_mix_cur, __nv_bfloat16* layer_input_cur,
     float* y_acc_workspace, float* r_acc_workspace, int M, int hidden_size, int hc_mult, int num_k_splits,
     int bigfuse_block_size, float rms_eps, float hc_pre_eps, float hc_sinkhorn_eps, float hc_post_mult_value,
-    int sinkhorn_repeat, __nv_bfloat16 const* norm_weight, float norm_eps, cudaStream_t stream);
+    int sinkhorn_repeat, __nv_bfloat16 const* norm_weight, float norm_eps, cudaStream_t stream, int x_num_splits = 1);
 
 // FMA-path fused hyper-connection boundary launcher.
 //
@@ -96,7 +98,7 @@ void mhcFusedHcFmaLaunch(__nv_bfloat16 const* x_prev, __nv_bfloat16 const* resid
     __nv_bfloat16* residual_cur, float* post_mix_cur, float* comb_mix_cur, __nv_bfloat16* layer_input_cur,
     float* y_acc_workspace, float* r_acc_workspace, int M, int hidden_size, int hc_mult, int tile_n, int num_k_splits,
     int bigfuse_block_size, float rms_eps, float hc_pre_eps, float hc_sinkhorn_eps, float hc_post_mult_value,
-    int sinkhorn_repeat, __nv_bfloat16 const* norm_weight, float norm_eps, cudaStream_t stream);
+    int sinkhorn_repeat, __nv_bfloat16 const* norm_weight, float norm_eps, cudaStream_t stream, int x_num_splits = 1);
 
 // Single-kernel all-in-one fused hyper-connection boundary launcher (TF32 tcgen05 path).
 //

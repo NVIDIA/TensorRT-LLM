@@ -664,6 +664,7 @@ def _fused_hc_call(
     sinkhorn_repeat: int,
     norm_weight: torch.Tensor | None = None,
     norm_eps: float = 0.0,
+    x_num_splits: int = 1,
 ):
     torch.ops.trtllm.mhc_fused_hc(
         x_prev,
@@ -695,6 +696,7 @@ def _fused_hc_call(
         tile_m,
         norm_weight,
         norm_eps,
+        x_num_splits,
     )
 
 
@@ -736,6 +738,7 @@ def _alloc_fused_hc_scratch(
 # valid everywhere.
 _FUSED_HC_FALLBACK_TACTIC_MMA = ("fused_half_mma", 0, 0, 0, 1)
 _FUSED_HC_FALLBACK_TACTIC_FMA = ("fused_half_fma", 2, 1, 256, 1)
+_FUSED_HC_SPLIT_X_FMA_TACTIC = ("fused_half_fma", 3, 2, 256, 1)
 
 
 def _get_fused_hc_fallback_tactic(hidden_size: int | None = None):
@@ -894,10 +897,23 @@ class MhcFusedHcRunner(TunableRunner):
             norm_weight = norm_weight.contiguous()
 
         B = residual_prev.shape[0]
+        if x_prev.ndim != 2 or x_prev.shape[1] != self.hidden_size:
+            raise ValueError(
+                f"x_prev must have shape [SK * B, {self.hidden_size}], got {tuple(x_prev.shape)}"
+            )
+        if B <= 0 or x_prev.shape[0] % B != 0:
+            raise ValueError(
+                f"x_prev rows ({x_prev.shape[0]}) must be an integer multiple of residual rows ({B})"
+            )
+        x_num_splits = x_prev.shape[0] // B
+        if x_num_splits not in (1, 2, 4):
+            raise ValueError(f"unsupported x_prev split count: {x_num_splits}")
         residual_cur = torch.empty_like(residual_prev)
         post_mix_cur = torch.empty((B, self.n), dtype=torch.float32, device=x_prev.device)
         comb_mix_cur = torch.empty((B, self.n * self.n), dtype=torch.float32, device=x_prev.device)
-        layer_input_cur = torch.empty_like(x_prev)
+        layer_input_cur = torch.empty(
+            (B, self.hidden_size), dtype=torch.bfloat16, device=x_prev.device
+        )
         y_acc_ws, r_acc_ws, done_counter_ws = _alloc_fused_hc_scratch(
             backend=backend,
             B=B,
@@ -937,6 +953,7 @@ class MhcFusedHcRunner(TunableRunner):
             self.sinkhorn_repeat,
             norm_weight=norm_weight,
             norm_eps=norm_eps,
+            x_num_splits=x_num_splits,
         )
         return residual_cur, post_mix_cur, comb_mix_cur, layer_input_cur
 
@@ -999,6 +1016,11 @@ def mhc_fused_hc(
 ):
     """Fuse the previous block's post_mapping with the current block's pre_mapping.
 
+    ``x_prev`` may be either reduced ``[B, hidden]`` or split-major O-projection
+    partials ``[SK * B, hidden]``. For SK2/SK4 the half-MMA path streams and
+    sums partials in its pmap x-ring, while half-FMA sums them at its register
+    x-load. Both accumulate in FP32.
+
     The autotuner chooses between four backends:
       * "fused_half_mma" — 2-kernel tcgen05 TF32 pmap+GEMM atomic + bigfuse.
       * "fused_half_fma" — 2-kernel pmap inline + FMA GEMM + sqrsum + bigfuse.
@@ -1030,15 +1052,40 @@ def mhc_fused_hc(
         sinkhorn_repeat=sinkhorn_repeat,
     )
 
-    tuner = AutoTuner.get()
-    _, best_tactic = tuner.choose_one(
-        "trtllm::mhc_fused_hc",
-        [runner],
-        MhcFusedHcRunner.tuning_config,
-        [x_prev, residual_prev, post_mix_prev, comb_mix_prev, w_t_cur, hc_scale_cur, hc_base_cur],
-        norm_weight=norm_weight,
-        norm_eps=norm_eps,
-    )
+    B = residual_prev.shape[0]
+    if x_prev.ndim != 2 or B <= 0 or x_prev.shape[0] % B != 0:
+        raise ValueError(
+            f"x_prev must have split-major shape [SK * B, hidden], got {tuple(x_prev.shape)} "
+            f"for B={B}"
+        )
+    x_num_splits = x_prev.shape[0] // B
+    if x_num_splits not in (1, 2, 4):
+        raise ValueError(f"unsupported x_prev split count: {x_num_splits}")
+    if x_num_splits in (2, 4):
+        if B <= 32:
+            # CUDA-core FMA wins at tiny M.
+            best_tactic = _FUSED_HC_SPLIT_X_FMA_TACTIC
+        else:
+            # C++ selects split-K and BigFuse geometry from M.
+            best_tactic = _FUSED_HC_FALLBACK_TACTIC_MMA
+    else:
+        tuner = AutoTuner.get()
+        _, best_tactic = tuner.choose_one(
+            "trtllm::mhc_fused_hc",
+            [runner],
+            MhcFusedHcRunner.tuning_config,
+            [
+                x_prev,
+                residual_prev,
+                post_mix_prev,
+                comb_mix_prev,
+                w_t_cur,
+                hc_scale_cur,
+                hc_base_cur,
+            ],
+            norm_weight=norm_weight,
+            norm_eps=norm_eps,
+        )
 
     return runner(
         inputs=[

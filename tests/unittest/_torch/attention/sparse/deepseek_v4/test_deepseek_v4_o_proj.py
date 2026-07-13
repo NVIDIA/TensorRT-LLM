@@ -24,10 +24,12 @@ import torch
 from _torch.helpers import per_block_cast_to_fp8_e8m0, per_token_cast_to_fp8_e8m0
 from utils.util import skip_pre_blackwell
 
+import tensorrt_llm._torch.modules.mla as mla_module
 from tensorrt_llm._torch.attention_backend.interface import PositionalEmbeddingParams, RopeParams
+from tensorrt_llm._torch.custom_ops import cute_dsl_custom_ops
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_deepseekv3 import weight_dequant
-from tensorrt_llm._torch.modules.mla import MLA
+from tensorrt_llm._torch.modules.mla import MLA, _select_dsv4_ob_split_k
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.llmapi.llm_args import DeepSeekV4SparseAttentionConfig
@@ -38,6 +40,280 @@ from tensorrt_llm.quantization.mode import QuantAlgo
 from ..test_sparse_mla_forward import RopeConfig, _calc_diff, apply_rotary_emb, precompute_freqs_cis
 
 FP8_O_PROJ_DIFF_TOL = 2e-3
+
+
+@pytest.mark.parametrize(
+    ("num_tokens", "expected_split"),
+    [(1, 2), (16, 2), (32, 2), (64, 2), (96, 2), (128, 2), (160, 1), (16384, 1)],
+)
+def test_select_dsv4_ob_split_k_auto_policy(num_tokens, expected_split, monkeypatch):
+    monkeypatch.delenv("TRTLLM_DSV4_OB_SPLIT_K", raising=False)
+    assert _select_dsv4_ob_split_k(num_tokens) == expected_split
+
+
+def test_select_dsv4_ob_split_k_overrides(monkeypatch):
+    monkeypatch.setenv("TRTLLM_DSV4_OB_SPLIT_K", "4")
+    assert _select_dsv4_ob_split_k(32) == 4
+    assert _select_dsv4_ob_split_k(32, configured_split=2) == 2
+    with pytest.raises(ValueError, match="unsupported.*split-K factor"):
+        _select_dsv4_ob_split_k(32, configured_split=3)
+
+
+def test_dsv4_fmha_epilogue_output_uses_fused_oproj():
+    attn_fp8 = torch.empty((16, 4, 4096), device="meta", dtype=torch.float8_e4m3fn)
+    attn_scale = torch.empty((16, 32, 4), device="meta")
+    expected = torch.empty((8, 7168), device="meta", dtype=torch.bfloat16)
+    calls = []
+    module = SimpleNamespace(
+        _should_use_fused_oproj=lambda: True,
+        _fused_oa_ob_proj=lambda fp8, scale, num_tokens: calls.append((fp8, scale, num_tokens))
+        or expected,
+    )
+
+    output = MLA._deepseek_v4_o_proj(module, (attn_fp8, attn_scale))
+
+    assert output is expected
+    assert calls == [(attn_fp8, attn_scale, 4)]
+
+
+@pytest.mark.parametrize(
+    ("num_tokens", "num_splits", "expected"),
+    [
+        (1, 2, ((128, 32), (2, 1), True, None, True)),
+        (32, 2, ((128, 32), (2, 1), True, None, True)),
+        (64, 2, ((256, 64), (2, 1), True, 8, True)),
+        (96, 2, ((256, 128), (2, 1), True, None, True)),
+        (128, 2, ((256, 128), (2, 1), True, None, True)),
+        (256, 1, ((256, 128), (2, 1), True, None, True)),
+        (448, 1, ((256, 208), (2, 1), False, None, True)),
+        (512, 1, ((256, 208), (2, 1), False, None, True)),
+        (704, 1, ((256, 144), (2, 1), True, None, True)),
+        (2240, 1, ((256, 224), (2, 1), True, None, True)),
+        (2304, 1, ((256, 224), (2, 1), False, None, False)),
+        (3776, 1, ((256, 224), (2, 1), True, None, True)),
+        (4096, 1, ((256, 224), (2, 1), False, None, True)),
+        (5888, 1, ((256, 224), (2, 1), False, None, True)),
+        (9472, 1, ((256, 224), (2, 1), False, None, True)),
+        (16384, 1, ((256, 240), (2, 1), True, None, True)),
+    ],
+)
+def test_dsv4_ob_cute_tactic(num_tokens, num_splits, expected):
+    runner = cute_dsl_custom_ops.CuteDSLFp8SplitKGemmRunner
+    assert runner._get_tactic(num_tokens, 7168, num_splits, 74) == expected
+
+
+def test_dsv4_ob_split_k_one_uses_cute_dsl_and_caches_weight_scale(monkeypatch):
+    from tensorrt_llm import deep_gemm
+    from tensorrt_llm.quantization.utils import fp8_utils
+
+    m, n, k = 256, 7168, 16384
+    packed_k = k // 512
+    weight_scale_storage = torch.empty((packed_k, n), device="meta", dtype=torch.int32)
+    transformed_scale = torch.as_strided(weight_scale_storage, (n, packed_k), (1, n))
+    module = SimpleNamespace(
+        hidden_size=n,
+        dtype=torch.bfloat16,
+        ob_split_k=1,
+        o_b_proj=SimpleNamespace(
+            weight=torch.empty((n, k), device="meta", dtype=torch.float8_e4m3fn),
+            weight_scale=torch.empty((n // 128, k // 128), device="meta"),
+        ),
+    )
+    activation = torch.empty((m, k), device="meta", dtype=torch.float8_e4m3fn)
+    activation_scale = torch.empty_strided((m, packed_k), (1, m), device="meta", dtype=torch.int32)
+    calls = []
+    transforms = []
+
+    def fail_deep_gemm(*args, **kwargs):
+        raise AssertionError("supported SK1 must not dispatch to DeepGEMM")
+
+    def splitk_gemm(a, sfa, b, sfb, partials, num_splits):
+        calls.append((a, sfa, b, sfb, partials, num_splits))
+
+    def transform_weight_scale(scale, **kwargs):
+        transforms.append((scale, kwargs))
+        return transformed_scale
+
+    monkeypatch.setattr(mla_module, "IS_CUTLASS_DSL_AVAILABLE", True)
+    monkeypatch.setattr(deep_gemm, "fp8_gemm_nt", fail_deep_gemm)
+    monkeypatch.setattr(fp8_utils, "transform_sf_into_required_layout", transform_weight_scale)
+    monkeypatch.setattr(torch.ops.trtllm, "dsv4_fp8_splitk_gemm", splitk_gemm)
+    output = MLA._fused_ob_gemm(module, activation, activation_scale, m)
+    cached_output = MLA._fused_ob_gemm(module, activation, activation_scale, m)
+
+    assert output.shape == (m, n)
+    assert cached_output.shape == (m, n)
+    assert output.device.type == "meta"
+    assert len(transforms) == 1
+    assert transforms[0][0] is module.o_b_proj.weight_scale
+    assert module.o_b_proj._ob_wsf_int is transformed_scale
+    assert len(calls) == 2
+    assert calls[0][0] is activation
+    assert calls[0][1] is activation_scale
+    assert calls[0][2] is module.o_b_proj.weight
+    assert calls[0][3] is transformed_scale
+    assert calls[0][4].shape == (1, m, n)
+    assert calls[0][5] == 1
+
+
+@pytest.mark.parametrize("m", [1, 32, 64, 128])
+def test_dsv4_ob_auto_split_through_m128_uses_cute_dsl(m, monkeypatch):
+    from tensorrt_llm import deep_gemm
+
+    n, k = 7168, 16384
+    packed_k = k // 512
+    weight_scale_storage = torch.empty((packed_k, n), device="meta", dtype=torch.int32)
+    module = SimpleNamespace(
+        hidden_size=n,
+        dtype=torch.bfloat16,
+        ob_split_k=None,
+        o_b_proj=SimpleNamespace(
+            weight=torch.empty((n, k), device="meta", dtype=torch.float8_e4m3fn),
+            weight_scale=torch.as_strided(weight_scale_storage, (n, packed_k), (1, n)),
+        ),
+    )
+    activation = torch.empty((m, k), device="meta", dtype=torch.float8_e4m3fn)
+    aligned_m = (m + 3) // 4 * 4
+    activation_scale = torch.empty_strided(
+        (m, packed_k), (1, aligned_m), device="meta", dtype=torch.int32
+    )
+    calls = []
+
+    def fail_deep_gemm(*args, **kwargs):
+        raise AssertionError("automatic M<=128 SK2 must not dispatch to DeepGEMM")
+
+    def splitk_gemm(a, sfa, b, sfb, partials, num_splits):
+        calls.append((a, sfa, b, sfb, partials, num_splits))
+
+    monkeypatch.setattr(mla_module, "IS_CUTLASS_DSL_AVAILABLE", True)
+    monkeypatch.setattr(deep_gemm, "fp8_gemm_nt", fail_deep_gemm)
+    monkeypatch.setattr(torch.ops.trtllm, "dsv4_fp8_splitk_gemm", splitk_gemm)
+    output = MLA._fused_ob_gemm(module, activation, activation_scale, m)
+
+    assert output.shape == (2 * m, n)
+    assert len(calls) == 1
+    assert calls[0][4].shape == (2, m, n)
+    assert calls[0][5] == 2
+
+
+@pytest.mark.parametrize("m", [160])
+def test_dsv4_ob_unsplit_mid_m_uses_deep_gemm(m, monkeypatch):
+    from tensorrt_llm import deep_gemm
+    from tensorrt_llm.quantization.utils import fp8_utils
+
+    n, k = 7168, 16384
+    packed_k = k // 512
+    module = SimpleNamespace(
+        hidden_size=n,
+        dtype=torch.bfloat16,
+        ob_split_k=None,
+        o_b_proj=SimpleNamespace(
+            weight=torch.empty((n, k), device="meta", dtype=torch.float8_e4m3fn),
+            weight_scale=torch.empty((n // 128, k // 128), device="meta"),
+        ),
+    )
+    activation = torch.empty((m, k), device="meta", dtype=torch.float8_e4m3fn)
+    activation_scale = torch.empty_strided((m, packed_k), (1, m), device="meta", dtype=torch.int32)
+    calls = []
+
+    def deep_gemm_nt(inputs, weights, output, **kwargs):
+        calls.append((inputs, weights, output, kwargs))
+
+    def fail_cute(*args, **kwargs):
+        raise AssertionError("default unsplit M below 256 must dispatch to DeepGEMM")
+
+    def fail_transform(*args, **kwargs):
+        raise AssertionError("DeepGEMM fallback must not transform the weight scale")
+
+    monkeypatch.setattr(mla_module, "IS_CUTLASS_DSL_AVAILABLE", True)
+    monkeypatch.setattr(deep_gemm, "fp8_gemm_nt", deep_gemm_nt)
+    monkeypatch.setattr(fp8_utils, "transform_sf_into_required_layout", fail_transform)
+    monkeypatch.setattr(torch.ops.trtllm, "dsv4_fp8_splitk_gemm", fail_cute)
+    output = MLA._fused_ob_gemm(module, activation, activation_scale, m)
+
+    assert output.shape == (m, n)
+    assert output.device.type == "meta"
+    assert len(calls) == 1
+    assert calls[0][0] == (activation, activation_scale)
+    assert calls[0][1] == (module.o_b_proj.weight, module.o_b_proj.weight_scale)
+    assert calls[0][2] is output
+
+
+@skip_pre_blackwell
+@pytest.mark.parametrize(
+    ("num_tokens", "num_splits"),
+    [(1, 2), (2, 2), (32, 2), (64, 2), (128, 2), (256, 1), (512, 1), (64, 4)],
+)
+def test_dsv4_pro_fp8_splitk_gemm_partials(num_tokens: int, num_splits: int):
+    if get_sm_version() // 10 != 10:
+        pytest.skip("dsv4_fp8_splitk_gemm requires the SM100 family")
+
+    n, k = 7168, 16384
+    aligned_m = (num_tokens + 3) // 4 * 4
+    packed_k = k // 512
+    a = torch.full((num_tokens, k), 0.03125, device="cuda", dtype=torch.float8_e4m3fn)
+    b = torch.full((n, k), 0.03125, device="cuda", dtype=torch.float8_e4m3fn)
+
+    # Pack four unit UE8M0 scales per int32.
+    sfa_storage = torch.full((aligned_m * packed_k,), 0x7F7F7F7F, device="cuda", dtype=torch.int32)
+    sfb_storage = torch.full((n * packed_k,), 0x7F7F7F7F, device="cuda", dtype=torch.int32)
+    sfa = torch.as_strided(sfa_storage, (num_tokens, packed_k), (1, aligned_m))
+    sfb = torch.as_strided(sfb_storage, (n, packed_k), (1, n))
+    partials = torch.empty((num_splits, num_tokens, n), device="cuda", dtype=torch.bfloat16)
+
+    torch.ops.trtllm.dsv4_fp8_splitk_gemm(a, sfa, b, sfb, partials, num_splits)
+    expected_partial = (k // num_splits) * 0.03125 * 0.03125
+    torch.testing.assert_close(
+        partials.float(), torch.full_like(partials, expected_partial, dtype=torch.float32)
+    )
+
+
+@skip_pre_blackwell
+def test_dsv4_pro_fp8_splitk_gemm_packed_scales():
+    if get_sm_version() // 10 != 10:
+        pytest.skip("dsv4_fp8_splitk_gemm requires the SM100 family")
+
+    m, n, k, num_splits = 64, 128, 2048, 4
+    k_blocks = k // 128
+    torch.manual_seed(1234)
+    a = (torch.randn((m, k), device="cuda") * 0.125).to(torch.float8_e4m3fn)
+    b = (torch.randn((n, k), device="cuda") * 0.125).to(torch.float8_e4m3fn)
+    exp_a = torch.randint(124, 131, (m, k_blocks), device="cuda")
+    exp_b = torch.randint(124, 131, (n // 128, k_blocks), device="cuda").repeat_interleave(
+        128, dim=0
+    )
+
+    def pack_scales(exponents: torch.Tensor, aligned_rows: int) -> torch.Tensor:
+        rows, num_blocks = exponents.shape
+        grouped = exponents.reshape(rows, num_blocks // 4, 4).to(torch.int32)
+        packed = (
+            grouped[..., 0]
+            | (grouped[..., 1] << 8)
+            | (grouped[..., 2] << 16)
+            | (grouped[..., 3] << 24)
+        )
+        storage = torch.zeros((num_blocks // 4, aligned_rows), device="cuda", dtype=torch.int32)
+        storage[:, :rows] = packed.transpose(0, 1)
+        return torch.as_strided(storage, packed.shape, (1, aligned_rows))
+
+    sfa = pack_scales(exp_a, m)
+    sfb = pack_scales(exp_b, n)
+    partials = torch.empty((num_splits, m, n), device="cuda", dtype=torch.bfloat16)
+    torch.ops.trtllm.dsv4_fp8_splitk_gemm(a, sfa, b, sfb, partials, num_splits)
+
+    scale_a = torch.exp2(exp_a.float() - 127.0)
+    scale_b = torch.exp2(exp_b.float() - 127.0)
+    a_dequant = (a.float().reshape(m, k_blocks, 128) * scale_a[..., None]).reshape(m, k)
+    b_dequant = (b.float().reshape(n, k_blocks, 128) * scale_b[..., None]).reshape(n, k)
+    split_k = k // num_splits
+    expected = torch.stack(
+        [
+            a_dequant[:, split * split_k : (split + 1) * split_k]
+            @ b_dequant[:, split * split_k : (split + 1) * split_k].T
+            for split in range(num_splits)
+        ]
+    )
+    torch.testing.assert_close(partials.float(), expected, rtol=0.02, atol=0.05)
 
 
 def _per_token_fp8_quant_dequant(x: torch.Tensor) -> torch.Tensor:
@@ -104,20 +380,16 @@ def calculate_reference_deepseek_v4_o_proj(
     return output
 
 
-@skip_pre_blackwell
-@pytest.mark.skip_less_device_memory(80000)
-@pytest.mark.parametrize("num_tokens", [1, 16, 128])
-@pytest.mark.parametrize("dtype_str", ["bf16", "fp8"])
-def test_deepseek_v4_o_proj(num_tokens: int, dtype_str: str):
-    """Test DeepSeek-V4 output projection (_deepseek_v4_o_proj)."""
-    print(
-        f"\n{'=' * 80}\nTesting: deepseek_v4_o_proj num_tokens={num_tokens} dtype={dtype_str}\n{'=' * 80}"
-    )
+def _build_dsv4_o_proj_case(num_tokens: int, dtype_str: str, device: torch.device):
+    """Build an MLA module, inputs, and reference-path tensors for the DeepSeek-V4
+    o_proj tests. Shared by the correctness test and the default fused
+    fp8-equivalence test so both exercise an identical setup.
 
-    if dtype_str == "fp8" and get_sm_version() < 100:
-        pytest.skip("FP8 is not supported on pre-Blackwell architectures")
-
-    device = torch.device("cuda")
+    Returns:
+        (mla, attn_out_latent, position_ids, refs) where ``refs`` is a namespace
+        carrying the dequantized weights / freqs_cis / dims the analytic
+        reference path consumes.
+    """
     dtype = torch.bfloat16
 
     # Model configuration matching the reference model
@@ -212,6 +484,7 @@ def test_deepseek_v4_o_proj(num_tokens: int, dtype_str: str):
 
     # Initialize weights
     nn_init_std = 0.02
+    fp8_a_weight = fp8_a_scale = o_a_proj_bf16 = fp8_b_weight_dequant = dim = None
     with torch.no_grad():
         # Initialize o_a_proj weights
         if dtype_str == "bf16":
@@ -236,12 +509,7 @@ def test_deepseek_v4_o_proj(num_tokens: int, dtype_str: str):
             fp8_a_weight = fp8_a_weight.reshape(n_local_groups, o_lora_rank, dim)
             mla.o_a_proj.data = fp8_a_weight
             mla.o_a_proj_scale.data = fp8_a_scale
-            # mla.o_a_proj_dequant is None for DSv4 on SM100: PR #14254
-            # decouples the FP8-native o_a_proj path from
-            # use_cute_dsl_blockscaling_bmm, so DSv4 unconditionally uses the
-            # fused inv-RoPE + FP8 quant + cute-dsl BMM chain and never needs
-            # the bf16-dequant fallback buffer. The reference path below uses
-            # o_a_proj_bf16 directly.
+            # SM100 keeps only the quantized O_a weights.
 
         # Initialize o_b_proj weights
         if dtype_str == "bf16":
@@ -269,17 +537,11 @@ def test_deepseek_v4_o_proj(num_tokens: int, dtype_str: str):
     attn_out_latent = torch.randn(num_tokens, num_heads, qk_head_dim, dtype=dtype, device=device)
     position_ids = torch.arange(num_tokens, dtype=torch.int32, device=device)
 
-    # Call the deepseek_v4 output projection (mla_rope_inplace modifies attn_out_latent
-    # in-place, so clone before passing to preserve original for reference)
-    output = mla._deepseek_v4_o_proj(attn_out_latent.clone(), position_ids)
-
-    # Calculate reference output
+    # Dequantize the weights actually consumed by the FP8 path.
     if dtype_str == "bf16":
         o_a_proj_ref = mla.o_a_proj.data
         o_b_proj_weight_ref = mla.o_b_proj.weight.data
     else:
-        # Match the FP8-native o_a_proj path: the runtime BMM consumes
-        # quantized o_a_proj plus block scales, not the original BF16 weight.
         o_a_proj_ref = (
             weight_dequant(
                 fp8_a_weight.reshape(-1, dim).contiguous(),
@@ -300,14 +562,47 @@ def test_deepseek_v4_o_proj(num_tokens: int, dtype_str: str):
         rope_config.rope_scaling["beta_slow"],
     ).to(device)
 
-    reference_output = calculate_reference_deepseek_v4_o_proj(
-        attn_out_latent=attn_out_latent,
+    refs = SimpleNamespace(
         o_a_proj=o_a_proj_ref,
         o_b_proj_weight=o_b_proj_weight_ref,
-        freqs_cis=freqs_cis[0:num_tokens],
+        freqs_cis=freqs_cis,
         n_local_groups=n_local_groups,
         qk_nope_head_dim=qk_nope_head_dim,
         qk_rope_head_dim=qk_rope_head_dim,
+    )
+    return mla, attn_out_latent, position_ids, refs
+
+
+@skip_pre_blackwell
+@pytest.mark.skip_less_device_memory(80000)
+@pytest.mark.parametrize("num_tokens", [1, 16, 128])
+@pytest.mark.parametrize("dtype_str", ["bf16", "fp8"])
+def test_deepseek_v4_o_proj(num_tokens: int, dtype_str: str):
+    """Test DeepSeek-V4 output projection (_deepseek_v4_o_proj)."""
+    print(
+        f"\n{'=' * 80}\nTesting: deepseek_v4_o_proj num_tokens={num_tokens} dtype={dtype_str}\n{'=' * 80}"
+    )
+
+    if dtype_str == "fp8" and get_sm_version() < 100:
+        pytest.skip("FP8 is not supported on pre-Blackwell architectures")
+
+    device = torch.device("cuda")
+
+    mla, attn_out_latent, position_ids, refs = _build_dsv4_o_proj_case(
+        num_tokens, dtype_str, device
+    )
+
+    # Preserve the input because inverse RoPE is in-place.
+    output = mla._deepseek_v4_o_proj(attn_out_latent.clone(), position_ids)
+
+    reference_output = calculate_reference_deepseek_v4_o_proj(
+        attn_out_latent=attn_out_latent,
+        o_a_proj=refs.o_a_proj,
+        o_b_proj_weight=refs.o_b_proj_weight,
+        freqs_cis=refs.freqs_cis[0:num_tokens],
+        n_local_groups=refs.n_local_groups,
+        qk_nope_head_dim=refs.qk_nope_head_dim,
+        qk_rope_head_dim=refs.qk_rope_head_dim,
         device=device,
         is_fp8=dtype_str == "fp8",
     )
@@ -336,3 +631,91 @@ def test_deepseek_v4_o_proj(num_tokens: int, dtype_str: str):
     else:
         torch.testing.assert_close(output, reference_output, rtol=0.1, atol=0.1)
         print(f"  ✓ Test passed for num_tokens={num_tokens}, dtype={dtype_str}\n")
+
+
+@skip_pre_blackwell
+@pytest.mark.skip_less_device_memory(80000)
+@pytest.mark.parametrize("num_tokens", [1, 16, 32, 128, 256])
+def test_deepseek_v4_o_proj_fused_fp8_equivalence(num_tokens: int, monkeypatch):
+    """The default fused FP8 epilogue must match the disabled baseline.
+
+    Fused (default): o_a's CuTe-DSL GEMM emits o_lora directly as fp8
+    e4m3 + packed-UE8M0 1x128 scale factors, fed straight to o_b.
+    Disabled: o_a emits bf16 o_lora, then ``o_b_proj`` runs the separate 1x128
+    quant + DeepGEMM. Since the fusion only folds the *same* quant into o_a's
+    epilogue, the two paths must match far tighter than the fp8-vs-bf16 reference.
+    """
+    if get_sm_version() < 100:
+        pytest.skip("fused DeepSeek-V4 FP8 O-projection requires Blackwell (SM100+)")
+
+    device = torch.device("cuda")
+    mla, attn_out_latent, position_ids, refs = _build_dsv4_o_proj_case(num_tokens, "fp8", device)
+
+    # Ensure the fused path is eligible.
+    assert mla.o_a_proj.dtype == torch.float8_e4m3fn
+    assert mla.n_local_groups == mla.num_groups
+    assert getattr(mla.o_b_proj, "tp_size", 1) == 1
+    assert mla.o_b_proj.has_fp8_block_scales
+    assert not getattr(mla.o_b_proj, "use_cute_dsl_blockscaling_mm", False)
+
+    # Explicit kill switch retains the unfused fallback.
+    monkeypatch.setenv("TRTLLM_DSV4_DISABLE_FUSED_OPROJ", "1")
+    out_unfused = mla._deepseek_v4_o_proj(attn_out_latent.clone(), position_ids)
+
+    # Unset is the production default and must take the fused path.
+    monkeypatch.delenv("TRTLLM_DSV4_DISABLE_FUSED_OPROJ", raising=False)
+    mla.ob_split_k = 1
+    out_fused = mla._deepseek_v4_o_proj(attn_out_latent.clone(), position_ids)
+
+    assert out_fused.shape == out_unfused.shape, (
+        f"Shape mismatch: fused {out_fused.shape} vs unfused {out_unfused.shape}"
+    )
+    assert out_fused.dtype == out_unfused.dtype, (
+        f"Dtype mismatch: fused {out_fused.dtype} vs unfused {out_unfused.dtype}"
+    )
+    assert torch.isfinite(out_fused).all(), "Fused output contains non-finite values"
+
+    # Analytic reference (same correctness bar as the unfused correctness test).
+    reference_output = calculate_reference_deepseek_v4_o_proj(
+        attn_out_latent=attn_out_latent.clone(),
+        o_a_proj=refs.o_a_proj,
+        o_b_proj_weight=refs.o_b_proj_weight,
+        freqs_cis=refs.freqs_cis[0:num_tokens],
+        n_local_groups=refs.n_local_groups,
+        qk_nope_head_dim=refs.qk_nope_head_dim,
+        qk_rope_head_dim=refs.qk_rope_head_dim,
+        device=device,
+        is_fp8=True,
+    )
+
+    diff_vs_ref = _calc_diff(out_fused, reference_output)
+    diff_vs_unfused = _calc_diff(out_fused, out_unfused)
+    print(
+        f"\n  num_tokens={num_tokens}  diff(fused,ref)={diff_vs_ref:.3e}  "
+        f"diff(fused,unfused)={diff_vs_unfused:.3e}"
+    )
+
+    assert diff_vs_ref < FP8_O_PROJ_DIFF_TOL, f"fused vs reference {diff_vs_ref=}"
+    assert diff_vs_unfused < 1e-3, f"fused vs unfused {diff_vs_unfused=}"
+
+    expected_smem_epilogue = num_tokens <= 32
+    expected_smem_row_iters = (num_tokens + 15) // 16 if expected_smem_epilogue else 1
+    fp8out_keys = [
+        key
+        for key in cute_dsl_custom_ops.CuteDSLFp8BlackwellBmmRunner.kernel_cache
+        if key[0] == "fp8out"
+        and key[-2] == expected_smem_row_iters
+        and key[-1] == expected_smem_epilogue
+    ]
+    assert len(fp8out_keys) == 1
+
+    if num_tokens == 16:
+        compiled_gemm = cute_dsl_custom_ops.CuteDSLFp8BlackwellBmmRunner.kernel_cache[
+            fp8out_keys[0]
+        ]
+        out_cached = mla._deepseek_v4_o_proj(attn_out_latent.clone(), position_ids)
+        assert (
+            cute_dsl_custom_ops.CuteDSLFp8BlackwellBmmRunner.kernel_cache[fp8out_keys[0]]
+            is compiled_gemm
+        )
+        torch.testing.assert_close(out_cached, out_unfused, rtol=0, atol=0)
