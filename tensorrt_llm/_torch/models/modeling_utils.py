@@ -85,14 +85,15 @@ class MetaInitMode(TorchDispatchMode):
     # process lifetime (measured 142 GiB/rank for a ~554 GB checkpoint at
     # TP4 on GB300). Their results are placeholders that are overwritten
     # after construction (dummy init or checkpoint load), so they are safe
-    # to skip on meta tensors. Do NOT add ops whose results are consumed
-    # (e.g. ops computing non-persistent buffers): the conservative
-    # MetaInitException fallback below still protects those.
-    deterministic_init_ops = {
+    # to run on meta tensors (their meta kernels are value-no-ops). Do NOT
+    # add ops whose results are consumed (e.g. ops computing non-persistent
+    # buffers): the conservative MetaInitException fallback below still
+    # protects those.
+    deterministic_init_ops = frozenset({
         aten.fill_.Scalar,
         aten.fill_.Tensor,
         aten.zero_.default,
-    }
+    })
 
     def _has_meta_tensor(self, args, kwargs):
         if kwargs is None:
@@ -108,14 +109,9 @@ class MetaInitMode(TorchDispatchMode):
                 kwargs = {}
             kwargs['device'] = torch.device('meta')
             return func(*args, **kwargs)
-        elif func in self.deterministic_init_ops and self._has_meta_tensor(
-                args, kwargs):
-            # In-place init on a meta tensor: the value is irrelevant (it is
-            # overwritten after construction), so skip the op and return the
-            # target tensor to keep in-place aliasing semantics.
-            return args[0]
-        elif func not in self.random_init_ops and self._has_meta_tensor(
-                args, kwargs):
+        elif func not in self.random_init_ops and \
+                func not in self.deterministic_init_ops and \
+                self._has_meta_tensor(args, kwargs):
             raise MetaInitException(
                 f"Meta tensor used in unsupported function: {func}")
         return func(*args, **kwargs)
