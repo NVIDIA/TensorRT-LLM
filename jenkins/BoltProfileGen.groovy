@@ -12,8 +12,11 @@
 // + packages the promotable bundle.
 //
 // Run on-demand today (manual / bot-triggered); there is no auto-trigger.
-// Promotion of the packaged bundle to the branch-keyed Artifactory path (and the
-// downstream apply/consume) is deferred to the follow-on deployment PR.
+// APPLY_PROFILES (default on) re-BOLTs the phase-1 tarball in the same run
+// ("consume immediately after generating"); PROMOTE (opt-in) publishes the
+// packaged bundle to the branch-keyed Artifactory path so premerge can pull
+// `latest` (apply_latest.sh). Wiring the postmerge trigger is the remaining
+// deployment step; see promoteBundle().
 // =============================================================================
 
 import groovy.transform.Field
@@ -42,6 +45,8 @@ AGENT_IMAGE = env.dockerImage ? env.dockerImage.replace("aarch64", "x86_64") : e
 // branch            : branch name for the branch-keyed promote path
 // slurmPlatform     : SlurmConfig platform string (GPU + multi-node for sbsa)
 // boltTarName       : phase-1 TARNAME to profile (e.g. TensorRT-LLM-GH200.tar.gz)
+// promote           : "true" to publish the bundle to the branch `latest` path
+// applyProfiles     : "true" to re-BOLT the phase-1 tarball in the same run
 TARGET_ARCH   = params.targetArch   ?: env.targetArch ?: AARCH64_TRIPLE
 BOLT_REF      = params.boltRef      ?: (env.artifactCommit ?: env.gitlabCommit ?: "unknown")
 BRANCH        = params.branch       ?: (env.gitlabTargetBranch ?: "main")
@@ -50,6 +55,15 @@ BRANCH        = params.branch       ?: (env.gitlabTargetBranch ?: "main")
 SLURM_PLATFORM= params.slurmPlatform?: (TARGET_ARCH == AARCH64_TRIPLE ? "auto:gb200-flex" : "")
 BOLT_TARNAME  = params.boltTarName  ?: (TARGET_ARCH == AARCH64_TRIPLE ? "TensorRT-LLM-GH200.tar.gz" : "TensorRT-LLM.tar.gz")
 NUM_NODES     = params.numNodes     ?: "2"   // legacy single-workload wiring (unused by fan-out)
+// promote: publish the packaged bundle to the branch-keyed Artifactory path
+// (PROFILE_PROMOTE_DIR) as both a versioned copy and latest.tar.gz. Default OFF
+// (opt-in): the postmerge trigger sets promote=true; the premerge "generate +
+// consume without promoting" override leaves it false. See promoteBundle().
+PROMOTE       = (params.promote ?: "false").toString()
+// applyProfiles: after merge, re-BOLT the phase-1 tarball with the just-generated
+// bundle -> bolted tarball on the cluster ("consume immediately after generating").
+// The merge job (slurm_merge.sh) runs apply_bolt.py when BOLT_APPLY=1.
+APPLY_PROFILES = (params.applyProfiles ?: "true").toString()
 
 TRIPLE = TARGET_ARCH
 
@@ -78,6 +92,9 @@ BOLT_WORKLOADS = [
     // [name: "dsr1_disagg_128k8k_c128",testId: "perf/test_perf_sanity.py::test_e2e[disagg-e2e-gb200_deepseek-r1-fp4_128k8k_con128_ctx1_pp8_gen1_dep16_eplb0_mtp1_ccb-NIXL]"],
     // [name: "dsv32_disagg_32k4k_c1",  testId: "perf/test_perf_sanity.py::test_e2e[disagg-e2e-gb200_deepseek-v32-fp4_32k4k_con1_ctx1_dep4_gen1_tep8_eplb0_mtp3_ccb-NIXL]"],
 ]
+
+// Branch-keyed promote path (matches internal/artifactory.sh conventions).
+PROFILE_PROMOTE_DIR = "sw-tensorrt-generic/llm-artifacts/bolt-profiles/${BRANCH}/${TRIPLE}"
 
 POD_TIMEOUT_SECONDS = env.podTimeoutSeconds ? env.podTimeoutSeconds : "43200"
 
@@ -296,8 +313,15 @@ def submitProfileGen(pipeline)
             pollSlurm(pipeline, remote, mid, "merge")
             pipeline.echo("Merge COMPLETED. Bundle: ${bundle}")
         }
-        // Promote of the packaged bundle to Artifactory is deferred to the
-        // follow-on deployment PR.
+        // 4) Promote (opt-in via PROMOTE): publish the profile bundle to the
+        //    branch-keyed Artifactory path so premerge can pull `latest`. Done
+        //    cluster-side (the bundle is on the frontend, which already reaches
+        //    Artifactory) using the urm-artifactory-creds Jenkins credential.
+        if (PROMOTE == "true") {
+            stage("Promote") { promoteBundle(pipeline, remote, bundle) }
+        } else {
+            pipeline.echo("PROMOTE=false -> bundle left un-promoted (${bundle}).")
+        }
     }
     return bundle
 }
@@ -371,7 +395,7 @@ def submitMerge(pipeline, remote, String ws, String fdataRoot, String outDir, St
         "CONTAINER_IMAGE=${LLM_DOCKER_IMAGE} " +
         "WORKSPACE=${ws} TOOLKIT_HOST=${ws}/toolkit BUILDS_HOST=${ws}/builds " +
         "BOLT_REF=${BOLT_REF} TRIPLE=${TRIPLE} TARBALL_NAME=${BOLT_TARNAME} " +
-        "FDATA_ROOT=${fdataRoot} OUT_DIR=${outDir} " +
+        "FDATA_ROOT=${fdataRoot} OUT_DIR=${outDir} BOLT_APPLY=${APPLY_PROFILES == 'true' ? '1' : '0'} " +
         "sbatch --parsable --nodes=1 ${partArgs} internal/slurm_merge.sh"
     return Utils.exec(pipeline, timeout: false, returnStdout: true, numRetries: 1,
                       script: Utils.sshUserCmd(remote, "\"${cmd}\"")).trim().tokenize(';')[0].trim()
@@ -392,6 +416,47 @@ def pollSlurm(pipeline, remote, String jobId, String label)
         }
         return true
     }
+}
+
+// ---------------------------------------------------------------------------
+// Promote the produced bundle to the branch-keyed Artifactory path so premerge
+// can pull `latest` (apply_latest.sh). Runs CLUSTER-SIDE: the frontend already
+// reaches Artifactory (it pulled the phase-1 tarball), and there is no BSL
+// remote->agent download primitive, so uploading in place avoids copying the
+// bundle back to the agent just to re-upload it.
+//
+// Auth: the urm-artifactory-creds Jenkins credential (username/password),
+// injected by withCredentials (masked in the console) and written to a mode-600
+// netrc via `printf` (a shell builtin, so no `ps` exposure) with curl reading
+// --netrc-file (creds never on curl's argv); the netrc is removed after.
+//
+// IMPORTANT quoting constraint: Utils.sshUserCmd wraps this script in "\"...\"",
+// so the AGENT's sh pre-expands $, $(...) and consumes inner double quotes before
+// the command is sent. Therefore the script must use ONLY Groovy-interpolated
+// values (no shell vars, no $(...), no heredoc, no inner double quotes). Assumes
+// the credential is shell-safe (no $ " ` ), which holds for the URM service creds.
+// ---------------------------------------------------------------------------
+def promoteBundle(pipeline, remote, String bundle)
+{
+    def bundleName = bundle.tokenize('/').last()
+    def base = "${URM_ARTIFACTORY_BASE}/${PROFILE_PROMOTE_DIR}"
+    def host = URM_ARTIFACTORY_BASE.replaceFirst(/^https?:\/\//, "").tokenize('/').first()
+    def netrc = "${bundle}.netrc"
+    pipeline.echo("Promoting ${bundleName} -> ${PROFILE_PROMOTE_DIR}/ (versioned + latest)")
+    pipeline.withCredentials([pipeline.usernamePassword(credentialsId: 'urm-artifactory-creds',
+            usernameVariable: 'ART_USER', passwordVariable: 'ART_PASS')]) {
+        def promote = """
+            set -e
+            printf 'machine ${host} login ${env.ART_USER} password ${env.ART_PASS}\\n' > ${netrc}
+            chmod 600 ${netrc}
+            curl -fsS --netrc-file ${netrc} --retry 5 --retry-all-errors -T ${bundle} ${base}/${bundleName}
+            curl -fsS --netrc-file ${netrc} --retry 5 --retry-all-errors -T ${bundle} ${base}/latest.tar.gz
+            rm -f ${netrc}
+        """.stripIndent()
+        Utils.exec(pipeline, timeout: false, numRetries: 2,
+            script: Utils.sshUserCmd(remote, "\"${promote}\""))
+    }
+    pipeline.echo("Promoted. latest = ${base}/latest.tar.gz")
 }
 
 

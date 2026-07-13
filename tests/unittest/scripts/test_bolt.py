@@ -17,6 +17,8 @@
 Covers the pure logic most likely to regress silently:
 - manifest.select_workloads: the manifest records the workloads ACTUALLY
   profiled (explicit list) rather than the full suite declaration.
+- apply_bolt.profile_for: ELF-basename -> profile-file mapping (.yaml preferred,
+  .fdata fallback, multi-dot names like the python bindings, empty/missing).
 """
 from __future__ import annotations
 
@@ -39,6 +41,11 @@ def _load(name: str):
 @pytest.fixture(scope="module")
 def manifest():
     return _load("manifest")
+
+
+@pytest.fixture(scope="module")
+def apply_bolt():
+    return _load("apply_bolt")
 
 
 # --------------------------- manifest.select_workloads ---------------------------
@@ -67,3 +74,34 @@ def test_select_workloads_falls_back_to_enabled_suite_entries(manifest, tmp_path
         "    enabled: false\n"
     )
     assert manifest.select_workloads(None, suite) == ["w_enabled"]
+
+
+# ------------------------------ apply_bolt.profile_for ---------------------------
+def test_profile_for_prefers_yaml_over_fdata(apply_bolt, tmp_path):
+    (tmp_path / "libtensorrt_llm.yaml").write_text("x")
+    (tmp_path / "libtensorrt_llm.fdata").write_text("y")
+    got = apply_bolt.profile_for("libtensorrt_llm.so", tmp_path)
+    assert got is not None and got.name == "libtensorrt_llm.yaml"
+
+
+def test_profile_for_falls_back_to_fdata(apply_bolt, tmp_path):
+    (tmp_path / "libth_common.fdata").write_text("y")
+    got = apply_bolt.profile_for("libth_common.so", tmp_path)
+    assert got is not None and got.name == "libth_common.fdata"
+
+
+def test_profile_for_strips_only_trailing_so(apply_bolt, tmp_path):
+    # Python bindings carry dots in the stem; only the final `.so` is stripped.
+    stem = "bindings.cpython-312-aarch64-linux-gnu"
+    (tmp_path / f"{stem}.yaml").write_text("x")
+    got = apply_bolt.profile_for(f"{stem}.so", tmp_path)
+    assert got is not None and got.name == f"{stem}.yaml"
+
+
+def test_profile_for_missing_returns_none(apply_bolt, tmp_path):
+    assert apply_bolt.profile_for("no_such_lib.so", tmp_path) is None
+
+
+def test_profile_for_ignores_empty_profile(apply_bolt, tmp_path):
+    (tmp_path / "lib.yaml").write_text("")  # zero-size is treated as absent
+    assert apply_bolt.profile_for("lib.so", tmp_path) is None

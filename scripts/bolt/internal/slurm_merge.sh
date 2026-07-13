@@ -25,13 +25,15 @@
 #   2. Gathers EVERY workload's per-host .fdata into one set, tagging the pid
 #      field with <workload>-<host> so cross-workload/-node PIDs never collide.
 #   3. Merges per-lib, builds the manifest, and packages the promotable bundle.
+#   4. (BOLT_APPLY=1) re-BOLTs the phase-1 tarball with the just-merged profiles
+#      into a bolted tarball -- postmerge "consume immediately after generating".
 #
 # Submit with: sbatch --nodes=1 scripts/bolt/internal/slurm_merge.sh
 #
 # Required env (set by BoltProfileGen):
 #   WORKSPACE CONTAINER_IMAGE FDATA_ROOT
 # Optional: TOOLKIT_HOST BUILDS_HOST MODELS_ROOT BOLT_REF TRIPLE TARBALL_NAME
-#           OUT_DIR LLVM_BOLT_VERSION
+#           OUT_DIR LLVM_BOLT_VERSION BOLT_APPLY
 
 # ====================== EDIT THESE (cluster specifics) ======================
 # NOTE: this merge job is 100% CPU
@@ -163,6 +165,20 @@ srun --ntasks=1 --ntasks-per-node=1 --nodes=1 \
             -o "$gathered/manifest.json"
         /workspace/bolt/internal/artifactory.sh package \
             "$gathered" "'"$BOLT_REF"'" "'"$TRIPLE"'" "'"$OUT_DIR"'"
+
+        # 5) APPLY (postmerge "consume immediately after generating", opt-in via
+        #    BOLT_APPLY=1): re-BOLT the phase-1 tarball with the just-merged
+        #    profiles into a bolted tarball. No recompile -- apply_bolt.py swaps the
+        #    bolted ELFs into the wheel + tree and repacks. Everything it needs (the
+        #    tarball, profiles, llvm-bolt) is already staged in this job.
+        if [ "'"${BOLT_APPLY:-0}"'" = "1" ]; then
+            echo "[INFO] apply: re-BOLT '"$TARBALL_NAME"' with merged profiles -> bolt-'"$TARBALL_NAME"'"
+            python3 /workspace/bolt/apply_bolt.py \
+                --tarball "/builds/'"$TARBALL_NAME"'" \
+                --profiles "$gathered" \
+                --manifest "$gathered/manifest.json" \
+                --output "'"$OUT_DIR"'/bolt-'"$TARBALL_NAME"'"
+        fi
      '
 
 BUNDLE="$OUT_DIR/bolt-profile-${BOLT_REF}-${TRIPLE}.tar.gz"
@@ -172,4 +188,13 @@ if [ -f "$BUNDLE" ]; then
 else
     echo "[ERROR] Bundle not produced ($BUNDLE) -- merge failed" >&2
     exit 1
+fi
+if [ "${BOLT_APPLY:-0}" = "1" ]; then
+    BOLTED="$OUT_DIR/bolt-$TARBALL_NAME"
+    if [ -f "$BOLTED" ]; then
+        echo "[INFO] Bolted tarball: $BOLTED"
+    else
+        echo "[ERROR] BOLT_APPLY=1 but bolted tarball not produced ($BOLTED)" >&2
+        exit 1
+    fi
 fi
