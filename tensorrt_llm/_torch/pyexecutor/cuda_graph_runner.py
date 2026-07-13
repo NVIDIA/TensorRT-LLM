@@ -663,17 +663,13 @@ class CUDAGraphRunner:
                 scheduled_requests.generation_requests = scheduled_requests.generation_requests[:
                                                                                                 -padding_size]
 
-    def clear_captured_graphs(self) -> None:
-        """Releases captured graphs while retaining the associated memory pool."""
+    def clear(self):
+        """Releases all captured graphs and the associated memory pool."""
         for graph in self.graphs.values():
             graph.reset()
         self.graphs.clear()
         self.graph_outputs.clear()
         self.graph_metadata.clear()
-
-    def clear(self):
-        """Releases all captured graphs and the associated memory pool."""
-        self.clear_captured_graphs()
         self.padding_dummy_requests = {}
         del self.memory_pool
         self.memory_pool = None

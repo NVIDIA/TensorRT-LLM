@@ -1096,9 +1096,12 @@ class PyTorchModelEngine(ModelEngine):
             # shape before capturing the graphs used at runtime. Some kernels
             # select a larger-workspace implementation for a smaller batch size.
             with self.no_cuda_graph_replay():
+                memory_pool = self.cuda_graph_runner.memory_pool
+                self.cuda_graph_runner.memory_pool = None
                 self._run_cuda_graph_warmup(resource_manager)
-            self.cuda_graph_runner.clear_captured_graphs()
-            self._run_cuda_graph_warmup(resource_manager)
+                self.cuda_graph_runner.clear()
+                self.cuda_graph_runner.memory_pool = memory_pool
+                self._run_cuda_graph_warmup(resource_manager)
         log_mem_snapshot("warmup/after_cuda_graph_capture")
         if can_run_general_warmup:
             # Pre-populate the memory pool with max-shape allocations to reduce
