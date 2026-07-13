@@ -760,8 +760,10 @@
       "path": "kv_cache_config.tokens_per_block"
     },
     {
-      "allowed_values": [],
-      "annotation": "<class 'bool'>",
+      "allowed_values": [
+        "auto"
+      ],
+      "annotation": "Union[bool, Literal['auto']]",
       "converter": "",
       "kind": "value",
       "path": "kv_cache_config.use_kv_cache_manager_v2"
@@ -3178,8 +3180,10 @@
       "path": "kv_cache_config.tokens_per_block"
     },
     {
-      "allowed_values": [],
-      "annotation": "<class 'bool'>",
+      "allowed_values": [
+        "auto"
+      ],
+      "annotation": "Union[bool, Literal['auto']]",
       "converter": "",
       "kind": "value",
       "path": "kv_cache_config.use_kv_cache_manager_v2"

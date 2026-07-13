@@ -3447,10 +3447,13 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         description=
         "The number of tokens between cache steps in the Mamba prefix cache.")
 
-    use_kv_cache_manager_v2: bool = Field(
-        default=False,
+    use_kv_cache_manager_v2: bool | Literal["auto"] = Field(
+        default="auto",
         status="prototype",
-        description="Whether to use the KV cache manager v2 (experimental).")
+        description=
+        "Whether to use the KV cache manager v2 (experimental). 'auto' uses "
+        "the model-specific default and falls back to False when the model "
+        "does not specify one.")
 
     # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
     enable_swa_scratch_reuse: bool = Field(
