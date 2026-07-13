@@ -887,7 +887,7 @@ private:
         }
         // Release any reuse-tree blocks pinned for this transfer so a failed or drained
         // response cannot leak pins; normal responses never populate mPinnedBlockIds.
-        if (\!response.mPinnedBlockIds.empty())
+        if (!response.mPinnedBlockIds.empty())
         {
             try
             {
