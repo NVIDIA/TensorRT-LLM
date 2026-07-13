@@ -174,6 +174,7 @@ class FilteredTopKKernelVarlenDecode(FilteredTopKKernelVarlen):
         enable_dynamic_multi_cta: bool = False,
         varlen_merge_input: bool = False,
         overflow_policy: str = "REREAD",
+        cache_smem_values: bool = False,
     ):
         self._large_occupancy = large_occupancy
         super().__init__(
@@ -190,6 +191,7 @@ class FilteredTopKKernelVarlenDecode(FilteredTopKKernelVarlen):
             # large_occupancy always uses 512 threads; pass it early so that
             # _compute_smem_input_size_for_occupancy() sees the correct num_warps.
             num_threads_override=512 if large_occupancy else 0,
+            cache_smem_values=cache_smem_values,
         )
         self.next_n = next_n
         self.enable_multi_cta = enable_multi_cta
@@ -276,6 +278,20 @@ class FilteredTopKKernelVarlenDecode(FilteredTopKKernelVarlen):
             )
         else:
             s_input_idx = None
+        if cutlass.const_expr(self.cache_smem_values and not self.enable_reread_always):
+            s_input_val = smem.allocate_tensor(
+                element_type=self.ordered_type,
+                layout=cute.make_ordered_layout(
+                    (
+                        self.num_buffer_smem_input_idx,
+                        self.filtered_topk_smem_input_size,
+                    ),
+                    order=(1, 0),
+                ),
+                byte_alignment=128,
+            )
+        else:
+            s_input_val = None
         if cutlass.const_expr(self.enable_reread):
             s_overflow_flag = smem.allocate_tensor(
                 element_type=cutlass.Int32,
@@ -373,6 +389,7 @@ class FilteredTopKKernelVarlenDecode(FilteredTopKKernelVarlen):
                 g_num_input,
                 s_indices,
                 s_input_idx,
+                s_input_val,
                 s_last_remain,
                 num_warps,
                 s_warp_sums,
@@ -451,6 +468,7 @@ def cute_dsl_topk_wrapper(
     return_val=True,
     num_copy_bits=256,
     overflow_policy: str = "REREAD",
+    cache_smem_values: bool = False,
 ):
     torch_dtype = input_values.dtype
     dtype = _TORCH_TO_CUTLASS_DTYPE[torch_dtype]
@@ -469,6 +487,7 @@ def cute_dsl_topk_wrapper(
         num_copy_bits,
         large_occupancy,
         overflow_policy,
+        cache_smem_values,
     )
     if key not in compiled_filter_topk_dict:
         # Create fake tensors for compilation
@@ -517,6 +536,7 @@ def cute_dsl_topk_wrapper(
             return_val=return_val,
             large_occupancy=large_occupancy,
             overflow_policy=overflow_policy,
+            cache_smem_values=cache_smem_values,
         )
 
         # Compile the kernel
@@ -572,6 +592,7 @@ def cute_dsl_topk_multi_cta_wrapper(
     num_copy_bits=256,
     chunk_size_per_cta=16384,
     overflow_policy: str = "REREAD",
+    cache_smem_values: bool = False,
 ):
     torch_dtype = input_values.dtype
     dtype = _TORCH_TO_CUTLASS_DTYPE[torch_dtype]
@@ -595,6 +616,7 @@ def cute_dsl_topk_multi_cta_wrapper(
         chunk_size_per_cta,
         num_ctas_per_row,
         overflow_policy,
+        cache_smem_values,
     )
     if key not in compiled_filter_topk_dict:
         # Create fake tensors for compilation
@@ -649,6 +671,7 @@ def cute_dsl_topk_multi_cta_wrapper(
             num_ctas_per_row=num_ctas_per_row,
             merge_blocks=False,
             overflow_policy=overflow_policy,
+            cache_smem_values=cache_smem_values,
         )
         # Compile the kernel
         compiled_kernel_first = cute.compile(
@@ -695,6 +718,7 @@ def cute_dsl_topk_multi_cta_wrapper(
             # num_ctas_per_row=1, # no use
             merge_blocks=True,
             overflow_policy=overflow_policy,
+            cache_smem_values=cache_smem_values,
         )
         # Compile the kernel
         compiled_kernel_second = cute.compile(
@@ -791,6 +815,7 @@ def run_filtered_topk_decode(
     use_cold_l2=True,
     print_verbose=True,
     overflow_policy: str = "GMEM_SPILL",
+    cache_smem_values: bool = False,
 ):
     """
     Prepare input tensors, launch GPU kernel, and reference checking.
@@ -875,6 +900,7 @@ def run_filtered_topk_decode(
         return_val=return_val,
         large_occupancy=large_occupancy,
         overflow_policy=overflow_policy,
+        cache_smem_values=cache_smem_values,
     )
 
     # Compile the kernel
@@ -962,6 +988,7 @@ def run_filtered_topk_decode(
             return_val,
             num_copy_bits,
             overflow_policy=overflow_policy,
+            cache_smem_values=cache_smem_values,
         )
         wrapper_output_val_sorted = torch.sort(
             wrapper_output_values.cpu(), dim=1, descending=True
@@ -985,6 +1012,7 @@ def run_filtered_topk_decode(
                 num_copy_bits,
                 chunk_size_per_cta=8192,
                 overflow_policy=overflow_policy,
+                cache_smem_values=cache_smem_values,
             )
         )
         wrapper_output_val_sorted_multi_cta = torch.sort(
@@ -1076,6 +1104,7 @@ def run_topk_decode(
     iterations: int = 10,
     use_cold_l2: bool = True,
     overflow_policy: str = "GMEM_SPILL",
+    cache_smem_values: bool = False,
 ):
     run_filtered_topk_decode(
         dtype,
@@ -1092,6 +1121,7 @@ def run_topk_decode(
         iterations,
         use_cold_l2,
         overflow_policy=overflow_policy,
+        cache_smem_values=cache_smem_values,
     )
 
 
@@ -1154,6 +1184,12 @@ if __name__ == "__main__":
         choices=["GMEM_SPILL", "TRUNCATE", "REREAD", "REREAD_ALWAYS"],
         help="Overflow policy when candidates exceed SMEM capacity",
     )
+    parser.add_argument(
+        "--cache_smem_values",
+        action="store_true",
+        default=False,
+        help="Cache ordered values alongside indices in SMEM to avoid re-reading from GMEM in refinement rounds",
+    )
 
     args = parser.parse_args()
     if args.top_k % 2 != 0:
@@ -1174,4 +1210,5 @@ if __name__ == "__main__":
         iterations=args.iterations,
         use_cold_l2=args.use_cold_l2,
         overflow_policy=args.overflow_policy,
+        cache_smem_values=args.cache_smem_values,
     )

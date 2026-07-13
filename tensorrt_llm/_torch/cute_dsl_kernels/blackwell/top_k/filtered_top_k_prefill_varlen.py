@@ -62,6 +62,7 @@ class FilteredTopKKernelVarlenPrefill(FilteredTopKKernelVarlen):
         num_copy_bits: int = 256,
         return_val: bool = False,
         overflow_policy: str = "REREAD",
+        cache_smem_values: bool = False,
     ):
         super().__init__(
             dtype,
@@ -75,6 +76,7 @@ class FilteredTopKKernelVarlenPrefill(FilteredTopKKernelVarlen):
             merge_blocks=False,
             overflow_policy=overflow_policy,
             num_threads_override=512,  # always 512 threads for large-occupancy path
+            cache_smem_values=cache_smem_values,
         )
 
         # Output local indices: subtract row_start before writing to output.
@@ -141,6 +143,20 @@ class FilteredTopKKernelVarlenPrefill(FilteredTopKKernelVarlen):
             )
         else:
             s_input_idx = None
+        if cutlass.const_expr(self.cache_smem_values and not self.enable_reread_always):
+            s_input_val = smem.allocate_tensor(
+                element_type=self.ordered_type,
+                layout=cute.make_ordered_layout(
+                    (
+                        self.num_buffer_smem_input_idx,
+                        self.filtered_topk_smem_input_size,
+                    ),
+                    order=(1, 0),
+                ),
+                byte_alignment=128,
+            )
+        else:
+            s_input_val = None
         if cutlass.const_expr(self.enable_reread):
             s_overflow_flag = smem.allocate_tensor(
                 element_type=cutlass.Int32,
@@ -184,6 +200,7 @@ class FilteredTopKKernelVarlenPrefill(FilteredTopKKernelVarlen):
             g_num_input,
             s_indices,
             s_input_idx,
+            s_input_val,
             s_last_remain,
             num_warps,
             s_warp_sums,
@@ -250,13 +267,22 @@ def cute_dsl_topk_prefill_wrapper(
     return_val=False,
     num_copy_bits=256,
     overflow_policy: str = "REREAD",
+    cache_smem_values: bool = False,
 ):
     torch_dtype_ = input_values.dtype
     dtype = _TORCH_TO_CUTLASS_DTYPE[torch_dtype_]
     num_rows, num_cols = input_values.shape
     bucketed_num_cols = _bucket_num_cols(num_cols)
 
-    key = (dtype, bucketed_num_cols, top_k, return_val, num_copy_bits, overflow_policy)
+    key = (
+        dtype,
+        bucketed_num_cols,
+        top_k,
+        return_val,
+        num_copy_bits,
+        overflow_policy,
+        cache_smem_values,
+    )
     if key not in compiled_filter_topk_prefill_dict:
         n_rows = cute.sym_int()
         n_cols = cute.sym_int()
@@ -296,6 +322,7 @@ def cute_dsl_topk_prefill_wrapper(
             num_copy_bits=num_copy_bits,
             return_val=return_val,
             overflow_policy=overflow_policy,
+            cache_smem_values=cache_smem_values,
         )
         compiled_kernel = cute.compile(
             filtered_topk_func,
@@ -352,6 +379,7 @@ def run_filtered_topk_prefill(
     use_cold_l2: bool = True,
     print_verbose: bool = True,
     overflow_policy: str = "REREAD",
+    cache_smem_values: bool = False,
 ):
     """Prepare input tensors, launch prefill top-k kernel, and check reference."""
     if print_verbose:
@@ -423,6 +451,7 @@ def run_filtered_topk_prefill(
         num_copy_bits=num_copy_bits,
         return_val=return_val,
         overflow_policy=overflow_policy,
+        cache_smem_values=cache_smem_values,
     )
     compiled_kernel = cute.compile(
         filtered_topk_func,
@@ -473,6 +502,7 @@ def run_filtered_topk_prefill(
             return_val,
             num_copy_bits,
             overflow_policy=overflow_policy,
+            cache_smem_values=cache_smem_values,
         )
         assert compare_top_k_results(
             input_torch, wrapper_indices, torch_indices, row_starts, row_ends, top_k
@@ -534,6 +564,7 @@ def run_topk_prefill(
     iterations: int = 10,
     use_cold_l2: bool = True,
     overflow_policy: str = "REREAD",
+    cache_smem_values: bool = False,
 ):
     run_filtered_topk_prefill(
         dtype,
@@ -548,6 +579,7 @@ def run_topk_prefill(
         iterations,
         use_cold_l2,
         overflow_policy=overflow_policy,
+        cache_smem_values=cache_smem_values,
     )
 
 
@@ -587,6 +619,12 @@ if __name__ == "__main__":
         choices=["GMEM_SPILL", "TRUNCATE", "REREAD", "REREAD_ALWAYS"],
         help="Overflow policy when candidates exceed SMEM capacity",
     )
+    parser.add_argument(
+        "--cache_smem_values",
+        action="store_true",
+        default=False,
+        help="Cache ordered values alongside indices in SMEM to avoid re-reading from GMEM in refinement rounds",
+    )
 
     args = parser.parse_args()
     if args.top_k % 2 != 0:
@@ -605,4 +643,5 @@ if __name__ == "__main__":
         iterations=args.iterations,
         use_cold_l2=args.use_cold_l2,
         overflow_policy=args.overflow_policy,
+        cache_smem_values=args.cache_smem_values,
     )

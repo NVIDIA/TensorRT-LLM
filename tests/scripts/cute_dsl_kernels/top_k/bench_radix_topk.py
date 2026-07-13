@@ -103,6 +103,7 @@ def bench_prefill_fixlen(
     warmup: int,
     iters: int,
     overflow_policies=("GMEM_SPILL",),
+    cache_smem_values: bool = False,
 ) -> dict:
     row_starts = torch.zeros(num_rows, dtype=torch.int32, device="cuda")
     row_ends = torch.full((num_rows,), num_cols, dtype=torch.int32, device="cuda")
@@ -135,6 +136,32 @@ def bench_prefill_fixlen(
 
             results[f"dsl_bf16{sfx}"] = cupti_timer(run_dsl_bf16, warmup, iters)
 
+            if cache_smem_values:
+
+                def run_dsl_fp32_csv(p=pol):
+                    torch.ops.trtllm.cute_dsl_indexer_topk_prefill_blackwell(
+                        logits_fp32,
+                        row_starts,
+                        row_ends,
+                        top_k,
+                        overflow_policy=p,
+                        cache_smem_values=True,
+                    )
+
+                results[f"dsl_fp32{sfx}_csv"] = cupti_timer(run_dsl_fp32_csv, warmup, iters)
+
+                def run_dsl_bf16_csv(p=pol):
+                    torch.ops.trtllm.cute_dsl_indexer_topk_prefill_blackwell(
+                        logits_bf16,
+                        row_starts,
+                        row_ends,
+                        top_k,
+                        overflow_policy=p,
+                        cache_smem_values=True,
+                    )
+
+                results[f"dsl_bf16{sfx}_csv"] = cupti_timer(run_dsl_bf16_csv, warmup, iters)
+
     return results
 
 
@@ -150,7 +177,13 @@ def _make_causal_varlen(isl: int, bs: int):
 
 
 def bench_prefill_varlen(
-    isl: int, bs: int, top_k: int, warmup: int, iters: int, overflow_policies=("GMEM_SPILL",)
+    isl: int,
+    bs: int,
+    top_k: int,
+    warmup: int,
+    iters: int,
+    overflow_policies=("GMEM_SPILL",),
+    cache_smem_values: bool = False,
 ) -> dict:
     num_rows = bs * isl
     row_starts, row_ends, total_kv = _make_causal_varlen(isl, bs)
@@ -183,6 +216,32 @@ def bench_prefill_varlen(
 
             results[f"dsl_bf16{sfx}"] = cupti_timer(run_dsl_bf16, warmup, iters)
 
+            if cache_smem_values:
+
+                def run_dsl_fp32_csv(p=pol):
+                    torch.ops.trtllm.cute_dsl_indexer_topk_prefill_blackwell(
+                        logits_fp32,
+                        row_starts,
+                        row_ends,
+                        top_k,
+                        overflow_policy=p,
+                        cache_smem_values=True,
+                    )
+
+                results[f"dsl_fp32{sfx}_csv"] = cupti_timer(run_dsl_fp32_csv, warmup, iters)
+
+                def run_dsl_bf16_csv(p=pol):
+                    torch.ops.trtllm.cute_dsl_indexer_topk_prefill_blackwell(
+                        logits_bf16,
+                        row_starts,
+                        row_ends,
+                        top_k,
+                        overflow_policy=p,
+                        cache_smem_values=True,
+                    )
+
+                results[f"dsl_bf16{sfx}_csv"] = cupti_timer(run_dsl_bf16_csv, warmup, iters)
+
     return results
 
 
@@ -197,6 +256,7 @@ def bench_decode_fixlen(
     warmup: int,
     iters: int,
     overflow_policies=("GMEM_SPILL",),
+    cache_smem_values: bool = False,
 ) -> dict:
     num_gen = batch_size * next_n
     seq_lens = torch.full((batch_size,), num_tokens, dtype=torch.int32, device="cuda")
@@ -255,6 +315,37 @@ def bench_decode_fixlen(
 
             results[f"dsl_bf16{sfx}"] = cupti_timer(run_dsl_bf16, warmup, iters)
 
+            if cache_smem_values:
+                out_fp32_csv = torch.empty((num_gen, top_k), dtype=torch.int32, device="cuda")
+
+                def run_dsl_fp32_csv(p=pol):
+                    torch.ops.trtllm.cute_dsl_indexer_topk_decode(
+                        input_values=logits_fp32,
+                        seq_lens=seq_lens,
+                        output_indices=out_fp32_csv,
+                        top_k=top_k,
+                        next_n=next_n,
+                        overflow_policy=p,
+                        cache_smem_values=True,
+                    )
+
+                results[f"dsl_fp32{sfx}_csv"] = cupti_timer(run_dsl_fp32_csv, warmup, iters)
+
+                out_bf16_csv = torch.empty((num_gen, top_k), dtype=torch.int32, device="cuda")
+
+                def run_dsl_bf16_csv(p=pol):
+                    torch.ops.trtllm.cute_dsl_indexer_topk_decode(
+                        input_values=logits_bf16,
+                        seq_lens=seq_lens,
+                        output_indices=out_bf16_csv,
+                        top_k=top_k,
+                        next_n=next_n,
+                        overflow_policy=p,
+                        cache_smem_values=True,
+                    )
+
+                results[f"dsl_bf16{sfx}_csv"] = cupti_timer(run_dsl_bf16_csv, warmup, iters)
+
     return results
 
 
@@ -269,6 +360,7 @@ def bench_decode_varlen(
     warmup: int,
     iters: int,
     overflow_policies=("GMEM_SPILL",),
+    cache_smem_values: bool = False,
 ) -> dict:
     num_gen = batch_size * next_n
     torch.manual_seed(42)
@@ -327,6 +419,37 @@ def bench_decode_varlen(
                 )
 
             results[f"dsl_bf16{sfx}"] = cupti_timer(run_dsl_bf16, warmup, iters)
+
+            if cache_smem_values:
+                out_fp32_csv = torch.empty((num_gen, top_k), dtype=torch.int32, device="cuda")
+
+                def run_dsl_fp32_csv(p=pol):
+                    torch.ops.trtllm.cute_dsl_indexer_topk_decode(
+                        input_values=logits_fp32,
+                        seq_lens=seq_lens,
+                        output_indices=out_fp32_csv,
+                        top_k=top_k,
+                        next_n=next_n,
+                        overflow_policy=p,
+                        cache_smem_values=True,
+                    )
+
+                results[f"dsl_fp32{sfx}_csv"] = cupti_timer(run_dsl_fp32_csv, warmup, iters)
+
+                out_bf16_csv = torch.empty((num_gen, top_k), dtype=torch.int32, device="cuda")
+
+                def run_dsl_bf16_csv(p=pol):
+                    torch.ops.trtllm.cute_dsl_indexer_topk_decode(
+                        input_values=logits_bf16,
+                        seq_lens=seq_lens,
+                        output_indices=out_bf16_csv,
+                        top_k=top_k,
+                        next_n=next_n,
+                        overflow_policy=p,
+                        cache_smem_values=True,
+                    )
+
+                results[f"dsl_bf16{sfx}_csv"] = cupti_timer(run_dsl_bf16_csv, warmup, iters)
 
     return results
 
@@ -399,11 +522,13 @@ def _make_variants_and_header_suffix(overflow_policies, col_w):
     return variants, hdr_suffix
 
 
-def sweep_prefill_fixlen(warmup, iters, overflow_policies=("GMEM_SPILL",)):
+def sweep_prefill_fixlen(warmup, iters, overflow_policies=("GMEM_SPILL",), cache_smem_values=False):
     col_w = 13
     extra = [p for p in overflow_policies if p != "GMEM_SPILL"]
     for nc in PREFILL_NC_LIST:
         variants, hdr_sfx = _make_variants_and_header_suffix(overflow_policies, col_w)
+        if cache_smem_values:
+            variants += [f"{v}_csv" for v in variants if v.startswith("dsl_")]
         print(f"\n=== mode=prefill style=fixlen num_cols={nc} ===")
         hdr = f"{'top_k':>6}  {'num_rows':>7}"
         for v in variants:
@@ -414,18 +539,28 @@ def sweep_prefill_fixlen(warmup, iters, overflow_policies=("GMEM_SPILL",)):
         for tk in TOP_K_LIST:
             for nr in PREFILL_NR_LIST:
                 try:
-                    res = bench_prefill_fixlen(nr, nc, tk, warmup, iters, overflow_policies)
+                    res = bench_prefill_fixlen(
+                        nr,
+                        nc,
+                        tk,
+                        warmup,
+                        iters,
+                        overflow_policies,
+                        cache_smem_values=cache_smem_values,
+                    )
                     _print_row(tk, nr, res, variants, col_w, extra)
                 except Exception as e:
                     print(f"{tk:>6}  {nr:>7}  ERROR: {e}")
             print()
 
 
-def sweep_prefill_varlen(warmup, iters, overflow_policies=("GMEM_SPILL",)):
+def sweep_prefill_varlen(warmup, iters, overflow_policies=("GMEM_SPILL",), cache_smem_values=False):
     col_w = 13
     extra = [p for p in overflow_policies if p != "GMEM_SPILL"]
     for isl in PREFILL_ISL_LIST:
         variants, hdr_sfx = _make_variants_and_header_suffix(overflow_policies, col_w)
+        if cache_smem_values:
+            variants += [f"{v}_csv" for v in variants if v.startswith("dsl_")]
         print(f"\n=== mode=prefill style=varlen isl={isl} ===")
         hdr = f"{'top_k':>6}  {'bs':>7}"
         for v in variants:
@@ -438,18 +573,30 @@ def sweep_prefill_varlen(warmup, iters, overflow_policies=("GMEM_SPILL",)):
                 if bs * isl > MAX_CHUNK_SIZE:
                     continue
                 try:
-                    res = bench_prefill_varlen(isl, bs, tk, warmup, iters, overflow_policies)
+                    res = bench_prefill_varlen(
+                        isl,
+                        bs,
+                        tk,
+                        warmup,
+                        iters,
+                        overflow_policies,
+                        cache_smem_values=cache_smem_values,
+                    )
                     _print_row(tk, bs, res, variants, col_w, extra)
                 except Exception as e:
                     print(f"{tk:>6}  {bs:>7}  ERROR: {e}")
             print()
 
 
-def sweep_decode_fixlen(warmup, iters, next_n=1, overflow_policies=("GMEM_SPILL",)):
+def sweep_decode_fixlen(
+    warmup, iters, next_n=1, overflow_policies=("GMEM_SPILL",), cache_smem_values=False
+):
     col_w = 13
     extra = [p for p in overflow_policies if p != "GMEM_SPILL"]
     for nt in DECODE_NT_LIST:
         variants, hdr_sfx = _make_variants_and_header_suffix(overflow_policies, col_w)
+        if cache_smem_values:
+            variants += [f"{v}_csv" for v in variants if v.startswith("dsl_")]
         print(f"\n=== mode=decode style=fixlen num_tokens={nt} next_n={next_n} ===")
         hdr = f"{'top_k':>6}  {'batch':>7}"
         for v in variants:
@@ -460,18 +607,31 @@ def sweep_decode_fixlen(warmup, iters, next_n=1, overflow_policies=("GMEM_SPILL"
         for tk in TOP_K_LIST:
             for bs in DECODE_BS_LIST:
                 try:
-                    res = bench_decode_fixlen(bs, nt, tk, next_n, warmup, iters, overflow_policies)
+                    res = bench_decode_fixlen(
+                        bs,
+                        nt,
+                        tk,
+                        next_n,
+                        warmup,
+                        iters,
+                        overflow_policies,
+                        cache_smem_values=cache_smem_values,
+                    )
                     _print_row(tk, bs, res, variants, col_w, extra)
                 except Exception as e:
                     print(f"{tk:>6}  {bs:>7}  ERROR: {e}")
             print()
 
 
-def sweep_decode_varlen(warmup, iters, next_n=1, overflow_policies=("GMEM_SPILL",)):
+def sweep_decode_varlen(
+    warmup, iters, next_n=1, overflow_policies=("GMEM_SPILL",), cache_smem_values=False
+):
     col_w = 13
     extra = [p for p in overflow_policies if p != "GMEM_SPILL"]
     for nt in DECODE_VNT_LIST:
         variants, hdr_sfx = _make_variants_and_header_suffix(overflow_policies, col_w)
+        if cache_smem_values:
+            variants += [f"{v}_csv" for v in variants if v.startswith("dsl_")]
         print(f"\n=== mode=decode style=varlen max_tokens={nt} next_n={next_n} ===")
         hdr = f"{'top_k':>6}  {'batch':>7}"
         for v in variants:
@@ -482,7 +642,16 @@ def sweep_decode_varlen(warmup, iters, next_n=1, overflow_policies=("GMEM_SPILL"
         for tk in TOP_K_LIST:
             for bs in DECODE_VBS_LIST:
                 try:
-                    res = bench_decode_varlen(bs, nt, tk, next_n, warmup, iters, overflow_policies)
+                    res = bench_decode_varlen(
+                        bs,
+                        nt,
+                        tk,
+                        next_n,
+                        warmup,
+                        iters,
+                        overflow_policies,
+                        cache_smem_values=cache_smem_values,
+                    )
                     _print_row(tk, bs, res, variants, col_w, extra)
                 except Exception as e:
                     print(f"{tk:>6}  {bs:>7}  ERROR: {e}")
@@ -512,6 +681,12 @@ def main():
         action="store_true",
         help="bench GMEM_SPILL, TRUNCATE, REREAD_ALWAYS, and REREAD side by side",
     )
+    parser.add_argument(
+        "--cache_smem_values",
+        action="store_true",
+        default=False,
+        help="also bench cache_smem_values=True variant alongside baseline (_csv suffix columns)",
+    )
     parser.add_argument("--sweep_all", action="store_true")
     parser.add_argument("--sweep_prefill", action="store_true")
     parser.add_argument("--sweep_decode", action="store_true")
@@ -531,6 +706,7 @@ def main():
     print(f"[TensorRT-LLM] Device: {torch.cuda.get_device_name(0)}  (sm_{cap[0]}{cap[1]})")
     print("Timing: CuptiProfiler (GPU kernel time only)")
     print(f"overflow_policies: {overflow_policies}")
+    print(f"cache_smem_values: {args.cache_smem_values}")
     if not IS_B200:
         print("DSL kernel requires Blackwell (sm100+); DSL columns will be absent.")
 
@@ -539,13 +715,29 @@ def main():
     do_df = args.sweep_all or args.sweep_decode or args.sweep_decode_fixlen
     do_dv = args.sweep_all or args.sweep_decode or args.sweep_decode_varlen
     if do_pf:
-        sweep_prefill_fixlen(args.warmup, args.iters, overflow_policies)
+        sweep_prefill_fixlen(
+            args.warmup, args.iters, overflow_policies, cache_smem_values=args.cache_smem_values
+        )
     if do_pv:
-        sweep_prefill_varlen(args.warmup, args.iters, overflow_policies)
+        sweep_prefill_varlen(
+            args.warmup, args.iters, overflow_policies, cache_smem_values=args.cache_smem_values
+        )
     if do_df:
-        sweep_decode_fixlen(args.warmup, args.iters, args.next_n, overflow_policies)
+        sweep_decode_fixlen(
+            args.warmup,
+            args.iters,
+            args.next_n,
+            overflow_policies,
+            cache_smem_values=args.cache_smem_values,
+        )
     if do_dv:
-        sweep_decode_varlen(args.warmup, args.iters, args.next_n, overflow_policies)
+        sweep_decode_varlen(
+            args.warmup,
+            args.iters,
+            args.next_n,
+            overflow_policies,
+            cache_smem_values=args.cache_smem_values,
+        )
 
     if not (args.sweep_all or args.sweep_prefill or args.sweep_decode):
         tk_list = [args.top_k] if args.top_k else TOP_K_LIST

@@ -52,6 +52,7 @@ class FilteredTopKKernelVarlen:
         merge_blocks: bool = False,
         overflow_policy: str = "REREAD",
         num_threads_override: int = 0,
+        cache_smem_values: bool = False,
     ):
         """
         Args:
@@ -141,22 +142,8 @@ class FilteredTopKKernelVarlen:
                 else:
                     self.num_threads_per_cta = 256
 
-        # num_threads_per_cta must be set before _compute_smem_input_size() since
-        # _compute_smem_input_size_for_occupancy() uses it to derive num_warps.
-        self.filtered_topk_smem_input_size = self._compute_smem_input_size()
-
-        _needs_extra = self.max_num_cols > self.filtered_topk_smem_input_size
-        self.enable_gmem_store = (overflow_policy == "GMEM_SPILL") and _needs_extra
-        self.enable_truncate = (overflow_policy == "TRUNCATE") and _needs_extra
-        self.enable_reread_always = (overflow_policy == "REREAD_ALWAYS") and _needs_extra
-        self.enable_reread = (overflow_policy == "REREAD") and _needs_extra
-
-        self.return_val = return_val
-        # Subclasses set to True to subtract row_start from absolute indices before
-        # writing output (used in prefill where row_start may be non-zero).
-        self.subtract_row_start_on_output = False
-
-        # radix-based filter parameters.
+        # radix-based filter parameters — set before _compute_smem_input_size() so
+        # ordered_type.width is available in the SMEM budget formula.
         if cutlass.const_expr(dtype == cutlass.Float32):
             self.ordered_type = cute.Uint32
             self.first_refine_shift = 24
@@ -165,6 +152,23 @@ class FilteredTopKKernelVarlen:
             self.ordered_type = cute.Uint16
             self.first_refine_shift = 0
             self.num_refine_rounds = 1
+
+        self.cache_smem_values = cache_smem_values
+
+        # num_threads_per_cta must be set before _compute_smem_input_size() since
+        # _compute_smem_input_size_for_occupancy() uses it to derive num_warps.
+        self.filtered_topk_smem_input_size = self._compute_smem_input_size()
+
+        _needs_extra = self.max_num_cols > self.filtered_topk_smem_input_size
+        self.enable_gmem_store = (overflow_policy == "GMEM_SPILL") and _needs_extra
+        self.enable_truncate = (overflow_policy == "TRUNCATE") and _needs_extra
+        self.enable_reread_always = overflow_policy == "REREAD_ALWAYS"
+        self.enable_reread = (overflow_policy == "REREAD") and _needs_extra
+
+        self.return_val = return_val
+        # Subclasses set to True to subtract row_start from absolute indices before
+        # writing output (used in prefill where row_start may be non-zero).
+        self.subtract_row_start_on_output = False
 
     def _compute_smem_input_size(self) -> int:
         return self._compute_smem_input_size_for_occupancy(target_blocks_per_sm=1)
@@ -185,10 +189,23 @@ class FilteredTopKKernelVarlen:
           1 block/SM:  Uint16/nb=2→32768 Uint16/nb=1→65536
                        Uint32/nb=2→16384 Uint32/nb=1→32768
         """
-        INPUT_IDX_BUDGET_BASE = 128 * 1024  # 128 KB at 1 block/SM
-        input_idx_budget = INPUT_IDX_BUDGET_BASE // target_blocks_per_sm
         idx_sz = 2 if self.index_type == cutlass.Uint16 else 4
-        max_S = input_idx_budget // (self.num_buffer_smem_input_idx * idx_sz)
+        if not self.cache_smem_values:
+            # cache_smem_values=False: reserve ~104 KB L1 for LDG caching.
+            INPUT_IDX_BUDGET_BASE = 128 * 1024  # 128 KB at 1 block/SM
+            input_idx_budget = INPUT_IDX_BUDGET_BASE // target_blocks_per_sm
+            max_S = input_idx_budget // (self.num_buffer_smem_input_idx * idx_sz)
+        else:
+            # cache_smem_values=True: same 128 KB budget as csv=False, with slot_sz
+            # = idx_sz + val_sz so SMEM per block stays ~38 KB at target=4 → L1
+            # unchanged. A device-budget formula that maximises S (→4864 for fp32)
+            # was tried but caused 5-9% regressions on large-num_tokens single-CTA
+            # configs; root cause not yet confirmed, kept in git history.
+            INPUT_IDX_BUDGET_BASE = 128 * 1024  # 128 KB at 1 block/SM
+            input_idx_budget = INPUT_IDX_BUDGET_BASE // target_blocks_per_sm
+            val_sz = self.ordered_type.width // 8  # fp32→Uint32=4B, fp16/bf16→Uint16=2B
+            slot_sz = idx_sz + val_sz
+            max_S = input_idx_budget // (self.num_buffer_smem_input_idx * slot_sz)
         return min(max_S, self.max_num_cols)
 
     @cute.jit
@@ -335,6 +352,7 @@ class FilteredTopKKernelVarlen:
         num_input,
         r_idx,
         s_input_idx,
+        s_input_val,
         score,
         s_counter,
         s_indices,
@@ -346,7 +364,10 @@ class FilteredTopKKernelVarlen:
         for i in range(tidx, num_input, self.num_threads_per_cta):
             idx = s_input_idx[r_idx, i]
             idx = cutlass.Int32(cutlass.Uint32(idx))
-            bin_val = (self.to_ordered(score[idx]) >> offset) & 0xFF
+            if cutlass.const_expr(self.cache_smem_values):
+                bin_val = (self.ordered_type(s_input_val[r_idx, i]) >> offset) & 0xFF
+            else:
+                bin_val = (self.to_ordered(score[idx]) >> offset) & 0xFF
             if bin_val < threshold:
                 pos = atomicAdd(s_counter.iterator, val_one)
                 s_indices[pos] = self.index_type(idx)
@@ -369,6 +390,7 @@ class FilteredTopKKernelVarlen:
         s_counter,
         s_indices,
         s_input_idx,
+        s_input_val,
         s_num_input,
         s_histogram,
         g_num_input,
@@ -387,13 +409,16 @@ class FilteredTopKKernelVarlen:
             s_indices[pos] = idx
         elif bin_val == threshold_bin:
             if cutlass.const_expr(self.enable_gmem_store):
+                # Hoist ordered before the pos < S check so s_input_val can be written inside it.
+                ordered = self.to_ordered(raw_input)
                 pos = atomicAdd(s_num_input.iterator, val_one)
                 if pos < self.filtered_topk_smem_input_size:
                     s_input_idx[0, pos] = idx
+                    if cutlass.const_expr(self.cache_smem_values):
+                        s_input_val[0, pos] = ordered
                 else:
                     buffer_pos = atomicAdd(g_num_input.iterator, val_one)
                     buffer[0, buffer_pos] = cutlass.Int32(cutlass.Uint32(idx))
-                ordered = self.to_ordered(raw_input)
                 sub_bin = (ordered >> self.first_refine_shift) & 0xFF
                 atomicAdd(s_histogram.iterator + cutlass.Int32(sub_bin), val_one)
             elif cutlass.const_expr(self.enable_truncate):
@@ -407,26 +432,34 @@ class FilteredTopKKernelVarlen:
                 if pos < self.filtered_topk_smem_input_size:
                     s_input_idx[0, pos] = idx
                     ordered = self.to_ordered(raw_input)
+                    if cutlass.const_expr(self.cache_smem_values):
+                        s_input_val[0, pos] = ordered
                     sub_bin = (ordered >> self.first_refine_shift) & 0xFF
                     atomicAdd(s_histogram.iterator + cutlass.Int32(sub_bin), val_one)
             elif cutlass.const_expr(self.enable_reread):
+                # Hoist ordered before the pos < S check so s_input_val can be written inside it.
+                ordered = self.to_ordered(raw_input)
                 pos = atomicAdd(s_num_input.iterator, val_one)
                 if pos < self.filtered_topk_smem_input_size:
                     s_input_idx[0, pos] = idx
+                    if cutlass.const_expr(self.cache_smem_values):
+                        s_input_val[0, pos] = ordered
                 else:
                     # Use atomicAdd (not plain store) to avoid concurrent non-atomic writes
                     # from multiple threads to the same SMEM address.  Any non-zero value
                     # means overflow; the did_overflow check uses != 0.
                     atomicAdd(s_overflow_flag.iterator, val_one)
-                ordered = self.to_ordered(raw_input)
                 sub_bin = (ordered >> self.first_refine_shift) & 0xFF
                 atomicAdd(s_histogram.iterator + cutlass.Int32(sub_bin), val_one)
             else:
+                # Hoist ordered before the pos < S check so s_input_val can be written inside it.
+                ordered = self.to_ordered(raw_input)
                 if cutlass.const_expr(not self.enable_reread_always):
                     pos = atomicAdd(s_num_input.iterator, val_one)
                     if pos < self.filtered_topk_smem_input_size:
                         s_input_idx[0, pos] = idx
-                ordered = self.to_ordered(raw_input)
+                        if cutlass.const_expr(self.cache_smem_values):
+                            s_input_val[0, pos] = ordered
                 sub_bin = (ordered >> self.first_refine_shift) & 0xFF
                 atomicAdd(s_histogram.iterator + cutlass.Int32(sub_bin), val_one)
 
@@ -443,6 +476,7 @@ class FilteredTopKKernelVarlen:
         s_counter,
         s_indices,
         s_input_idx,
+        s_input_val,
         s_num_input,
         s_histogram,
         s_last_remain,
@@ -476,6 +510,8 @@ class FilteredTopKKernelVarlen:
                 if cutlass.const_expr(self.enable_gmem_store):
                     if cur_pos < self.filtered_topk_smem_input_size:
                         s_input_idx[r_idx ^ 1, cur_pos] = idx
+                        if cutlass.const_expr(self.cache_smem_values):
+                            s_input_val[r_idx ^ 1, cur_pos] = ordered_val
                     else:
                         buffer_pos = atomicAdd(g_num_input.iterator + (r_idx ^ 1), val_one)
                         buffer[r_idx ^ 1, buffer_pos] = idx_int32
@@ -488,6 +524,8 @@ class FilteredTopKKernelVarlen:
                         sub_bin = cutlass.Int32(0)
                     if cur_pos < self.filtered_topk_smem_input_size:
                         s_input_idx[r_idx ^ 1, cur_pos] = idx
+                        if cutlass.const_expr(self.cache_smem_values):
+                            s_input_val[r_idx ^ 1, cur_pos] = ordered_val
                         sub_bin = (ordered_val >> (offset - 8)) & 0xFF
                         atomicAdd(s_histogram.iterator + cutlass.Int32(sub_bin), val_one)
 
@@ -499,6 +537,7 @@ class FilteredTopKKernelVarlen:
         s_counter,
         s_indices,
         s_input_idx,
+        s_input_val,
         s_num_input,
         s_histogram,
         g_num_input,
@@ -555,6 +594,7 @@ class FilteredTopKKernelVarlen:
                     s_counter,
                     s_indices,
                     s_input_idx,
+                    s_input_val,
                     s_num_input,
                     s_histogram,
                     g_num_input,
@@ -576,6 +616,7 @@ class FilteredTopKKernelVarlen:
                 s_counter,
                 s_indices,
                 s_input_idx,
+                s_input_val,
                 s_num_input,
                 s_histogram,
                 g_num_input,
@@ -596,6 +637,7 @@ class FilteredTopKKernelVarlen:
                 s_counter,
                 s_indices,
                 s_input_idx,
+                s_input_val,
                 s_num_input,
                 s_histogram,
                 g_num_input,
@@ -1012,6 +1054,7 @@ class FilteredTopKKernelVarlen:
         s_counter,
         s_indices,
         s_input_idx,
+        s_input_val,
         s_num_input,
         s_histogram,
         s_last_remain,
@@ -1030,8 +1073,11 @@ class FilteredTopKKernelVarlen:
         for i in range(tidx, num_input, self.num_threads_per_cta):
             idx_tmp = s_input_idx[r_idx, i]
             idx_int32 = cutlass.Int32(cutlass.Uint32(idx_tmp))
-            raw_input = score[idx_int32]
-            ordered_val = self.to_ordered(raw_input)
+            if cutlass.const_expr(self.cache_smem_values):
+                ordered_val = self.ordered_type(s_input_val[r_idx, i])
+            else:
+                raw_input = score[idx_int32]
+                ordered_val = self.to_ordered(raw_input)
             bin_val = (ordered_val >> offset) & 0xFF
             self._filter_and_histogram_per_elem_refine(
                 bin_val,
@@ -1044,6 +1090,7 @@ class FilteredTopKKernelVarlen:
                 s_counter,
                 s_indices,
                 s_input_idx,
+                s_input_val,
                 s_num_input,
                 s_histogram,
                 s_last_remain,
@@ -1069,6 +1116,7 @@ class FilteredTopKKernelVarlen:
                     s_counter,
                     s_indices,
                     s_input_idx,
+                    s_input_val,
                     s_num_input,
                     s_histogram,
                     s_last_remain,
@@ -1277,6 +1325,7 @@ class FilteredTopKKernelVarlen:
         g_num_input,
         s_indices,
         s_input_idx,
+        s_input_val,
         s_last_remain,
         num_warps,
         s_warp_sums,
@@ -1473,6 +1522,7 @@ class FilteredTopKKernelVarlen:
                     s_counter,
                     s_indices,
                     s_input_idx,
+                    s_input_val,
                     s_num_input,
                     s_histogram,
                     g_num_input,
@@ -1595,6 +1645,7 @@ class FilteredTopKKernelVarlen:
                                         num_input,
                                         r_idx,
                                         s_input_idx,
+                                        s_input_val,
                                         score,
                                         s_counter,
                                         s_indices,
@@ -1615,6 +1666,7 @@ class FilteredTopKKernelVarlen:
                                         s_counter,
                                         s_indices,
                                         s_input_idx,
+                                        s_input_val,
                                         s_num_input,
                                         s_histogram,
                                         s_last_remain,
@@ -1635,6 +1687,7 @@ class FilteredTopKKernelVarlen:
                                     num_input,
                                     r_idx,
                                     s_input_idx,
+                                    s_input_val,
                                     score,
                                     s_counter,
                                     s_indices,
@@ -1655,6 +1708,7 @@ class FilteredTopKKernelVarlen:
                                     s_counter,
                                     s_indices,
                                     s_input_idx,
+                                    s_input_val,
                                     s_num_input,
                                     s_histogram,
                                     s_last_remain,

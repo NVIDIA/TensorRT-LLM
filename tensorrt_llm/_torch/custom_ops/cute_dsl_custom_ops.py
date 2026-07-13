@@ -4833,8 +4833,16 @@ if IS_CUTLASS_DSL_AVAILABLE:
         buffers = get_memory_buffers()
 
         @classmethod
-        def _compile(cls, dtype, bucketed_num_cols, top_k, next_n, return_val,
-                     num_copy_bits, large_occupancy, overflow_policy):
+        def _compile(cls,
+                     dtype,
+                     bucketed_num_cols,
+                     top_k,
+                     next_n,
+                     return_val,
+                     num_copy_bits,
+                     large_occupancy,
+                     overflow_policy,
+                     cache_smem_values=False):
             """Compile and cache a single-CTA top-k kernel for the given config."""
             key = (
                 dtype,
@@ -4845,6 +4853,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 num_copy_bits,
                 large_occupancy,
                 overflow_policy,
+                cache_smem_values,
             )
             if key in cls.kernel_cache:
                 return
@@ -4895,6 +4904,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 return_val=return_val,
                 large_occupancy=large_occupancy,
                 overflow_policy=overflow_policy,
+                cache_smem_values=cache_smem_values,
             )
             compiled_kernel = cute.compile(
                 filtered_topk_func,
@@ -4921,6 +4931,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             num_copy_bits: int = 256,
             overflow_policy: str = "REREAD",
             output_indices: Optional[torch.Tensor] = None,
+            cache_smem_values: bool = False,
         ):
             """Execute filtered top-k selection on input logits."""
             torch_dtype = input_values.dtype
@@ -4940,6 +4951,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 num_copy_bits,
                 large_occupancy,
                 overflow_policy,
+                cache_smem_values,
             )
             cls._compile(*key)
             compiled_kernel = cls.kernel_cache[key]
@@ -5090,11 +5102,17 @@ if IS_CUTLASS_DSL_AVAILABLE:
         buffers = get_memory_buffers()
 
         @classmethod
-        def _compile(cls, dtype, bucketed_num_cols, top_k, return_val,
-                     num_copy_bits, overflow_policy):
+        def _compile(cls,
+                     dtype,
+                     bucketed_num_cols,
+                     top_k,
+                     return_val,
+                     num_copy_bits,
+                     overflow_policy,
+                     cache_smem_values=False):
             """Compile and cache a single-CTA prefill top-k kernel."""
             key = (dtype, bucketed_num_cols, top_k, return_val, num_copy_bits,
-                   overflow_policy)
+                   overflow_policy, cache_smem_values)
             if key in cls.kernel_cache:
                 return
             n_rows = cute.sym_int()
@@ -5147,6 +5165,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 num_copy_bits=num_copy_bits,
                 return_val=return_val,
                 overflow_policy=overflow_policy,
+                cache_smem_values=cache_smem_values,
             )
             compiled_kernel = cute.compile(
                 filtered_topk_func,
@@ -5173,6 +5192,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             num_copy_bits: int = 256,
             overflow_policy: str = "REREAD",
             output_indices: Optional[torch.Tensor] = None,
+            cache_smem_values: bool = False,
         ):
             """Execute filtered top-k selection for prefill rows."""
             torch_dtype = input_values.dtype
@@ -5181,7 +5201,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             bucketed_num_cols = next_positive_power_of_2(num_cols)
 
             key = (dtype, bucketed_num_cols, top_k, return_val, num_copy_bits,
-                   overflow_policy)
+                   overflow_policy, cache_smem_values)
             cls._compile(*key)
             compiled_kernel = cls.kernel_cache[key]
             reserve = torch.cuda.is_current_stream_capturing()
@@ -5239,6 +5259,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         top_k: int,
         num_copy_bits: int = 256,
         overflow_policy: str = "REREAD",
+        cache_smem_values: bool = False,
     ) -> torch.Tensor:
         """CuTE DSL radix-based top-k for prefill.
 
@@ -5251,6 +5272,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             overflow_policy: How to handle threshold-bucket SMEM overflow.
                              "GMEM_SPILL" (default, exact) or "TRUNCATE" (non-exact,
                              no extra buffer).
+            cache_smem_values: Cache ordered values in SMEM to avoid re-reading from
+                               GMEM in refinement rounds (reduces S by 2x).
 
         Returns:
             indices: Int32 tensor of shape (num_rows, top_k) with LOCAL indices
@@ -5265,6 +5288,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             return_val=False,
             num_copy_bits=num_copy_bits,
             overflow_policy=overflow_policy,
+            cache_smem_values=cache_smem_values,
         )
         return indices
 
@@ -5277,6 +5301,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         top_k: int,
         num_copy_bits: int = 256,
         overflow_policy: str = "REREAD",
+        cache_smem_values: bool = False,
     ):
         num_rows = input_values.shape[0]
         return input_values.new_empty((num_rows, top_k), dtype=torch.int32)
@@ -5326,7 +5351,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                      chunk_size_per_cta,
                      num_ctas_per_row,
                      overflow_policy="REREAD",
-                     dynamic=False):
+                     dynamic=False,
+                     cache_smem_values=False):
             """Compile and cache multi-CTA top-k kernels for the given config."""
             key = (
                 dtype,
@@ -5339,6 +5365,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 num_ctas_per_row,
                 overflow_policy,
                 dynamic,
+                cache_smem_values,
             )
             if key in cls.kernel_cache:
                 return
@@ -5396,6 +5423,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 merge_blocks=False,
                 enable_dynamic_multi_cta=dynamic,
                 overflow_policy=overflow_policy,
+                cache_smem_values=cache_smem_values,
             )
             compiled_kernel_first = cute.compile(
                 filtered_topk_func_first,
@@ -5443,6 +5471,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 merge_blocks=True,
                 varlen_merge_input=dynamic,
                 overflow_policy=overflow_policy,
+                cache_smem_values=cache_smem_values,
             )
             compiled_kernel_second = cute.compile(
                 filtered_topk_func_second,
@@ -5472,6 +5501,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             overflow_policy: str = "REREAD",
             dynamic: bool = True,
             output_indices: Optional[torch.Tensor] = None,
+            cache_smem_values: bool = False,
         ):
             """Execute multi-CTA filtered top-k selection on input logits."""
             torch_dtype = input_values.dtype
@@ -5495,6 +5525,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 num_ctas_per_row,
                 overflow_policy,
                 dynamic,
+                cache_smem_values,
             )
             cls._compile(*key)
             compiled_kernel_first, compiled_kernel_second = \
@@ -6037,6 +6068,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         single_pass_multi_cta: bool = False,
         single_pass_multi_cta_cluster: bool = False,
         overflow_policy: str = "REREAD",
+        cache_smem_values: bool = False,
     ) -> None:
         """Unified CuTE DSL Top-K that auto-selects single-CTA or multi-CTA (2-pass multi-CTA) or
         single-pass multi-CTA. When single_pass_multi_cta=True, it selects between single-CTA
@@ -6169,6 +6201,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     num_copy_bits=num_copy_bits,
                     overflow_policy=overflow_policy,
                     output_indices=output_indices,
+                    cache_smem_values=cache_smem_values,
                 )
         else:
             # --- 2-pass multi-CTA dispatch ---
@@ -6203,6 +6236,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     overflow_policy=overflow_policy,
                     dynamic=dynamic,
                     output_indices=output_indices,
+                    cache_smem_values=cache_smem_values,
                 )
             else:
                 CuteDSLTopKDecodeSingleCTARunner.forward(
@@ -6214,6 +6248,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     num_copy_bits=num_copy_bits,
                     overflow_policy=overflow_policy,
                     output_indices=output_indices,
+                    cache_smem_values=cache_smem_values,
                 )
 
     @torch.library.register_fake("trtllm::cute_dsl_indexer_topk_decode")
@@ -6228,6 +6263,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         single_pass_multi_cta: bool = False,
         single_pass_multi_cta_cluster: bool = False,
         overflow_policy: str = "REREAD",
+        cache_smem_values: bool = False,
     ) -> None:
         return None
 
