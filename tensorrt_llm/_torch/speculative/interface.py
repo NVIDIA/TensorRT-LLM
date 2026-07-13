@@ -617,6 +617,37 @@ class SpecMetadata:
                 dtype=torch.float32,
                 device='cuda')
 
+    def write_padding_onehot_draft_probs(self, padding_slot_ids, draft_len):
+        """Write a one-hot draft-prob row (prob 1.0 at draft-vocab token id 0,
+        the placeholder token) into each padding gen request's stable slot row.
+
+        Padding requests are gen requests that entered this iteration with 0 real
+        draft tokens (e.g. a runtime_draft_len K->0->K dynamic-draft-len toggle).
+        Their slot's draft_probs row was never scattered by the draft sampler, so
+        the next iteration's (possibly CUDA-graph-captured) rejection kernel would
+        read a stale/uninitialized distribution. Writing a legal one-hot row makes
+        acceptance reject the placeholder and resample from the target (equivalent
+        to strict acceptance) for those rows. Written eagerly before graph replay
+        into the stable draft_probs buffer, so the replayed kernel reads it.
+
+        Idempotent w.r.t. context->gen transitions whose row was already one-hot'd
+        by write_context_onehot_draft_probs. The width matches the value already
+        published in draft_probs_last_dim (what acceptance reads), so it is NOT
+        overwritten here. No-op unless rejection is enabled and slots exist.
+        Static shapes -> CUDA-graph safe.
+        """
+        if (not padding_slot_ids
+                or not getattr(self, "use_rejection_sampling", False)
+                or self.draft_probs is None):
+            return
+        onehot_vocab = (self.draft_probs_last_dim if self.draft_probs_last_dim
+                        > 0 else self.draft_probs_vocab_size)
+        slots = torch.tensor(padding_slot_ids,
+                             dtype=torch.long,
+                             device=self.draft_probs.device)
+        self.draft_probs[slots, :draft_len, :onehot_vocab] = 0.0
+        self.draft_probs[slots, :draft_len, 0] = 1.0
+
     def prepare(self):
         """
         Hook to be called before the forward step of the model.

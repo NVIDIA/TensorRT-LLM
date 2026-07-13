@@ -3194,8 +3194,17 @@ class PyExecutor:
                 scheduled_batch.batch_size, self.model_engine.max_draft_len)
             # 2. Pad or truncate draft tokens to the resolved length
             DRAFT_BUFFER_PAD = 0  # Buffer sentinel, not PARD mask_token_id.
+            rejection_on = getattr(self.model_engine.spec_config,
+                                   "use_rejection_sampling", False)
             for request in scheduled_batch.generation_requests:
                 current_num_draft_tokens = len(request.py_draft_tokens)
+                # One-model rejection: a gen request entering with 0 real draft
+                # tokens produced no draft-prob scatter for its slot last iter,
+                # so next iter's rejection kernel would read a stale draft_probs
+                # row. Mark it (pre-pad signal) so _prepare_tp_inputs writes a
+                # one-hot placeholder row after spec_metadata.prepare().
+                request.py_needs_onehot_draft_probs = (
+                    rejection_on and current_num_draft_tokens == 0)
                 if spec_dec_mode.is_pard():
                     # special case: PARD carries 2K-1 draft tokens per request
                     runtime_draft_token_buffer_width = (
