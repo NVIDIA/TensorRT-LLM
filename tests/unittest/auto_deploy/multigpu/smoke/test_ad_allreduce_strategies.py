@@ -217,7 +217,20 @@ def test_allreduce_strategies(llm_root, shared_dataset, allreduce_strategy):  # 
     TEST_TIMEOUT_SECONDS = 300
 
     model_name = "meta-llama/Meta-Llama-3.1-8B-Instruct"
-    config = get_small_model_config(model_name)
+    # Override hidden_size to a multiple of one warp's worth of 128-bit accesses (32 threads *
+    # 8 fp16 elements/access = 256) so the fused all-reduce/RMSNorm kernel never launches a
+    # partial-warp block. This isolates whether CI failures are specific to the partial-warp
+    # code path or are unrelated infra flakiness that also affects the full-warp path.
+    config = get_small_model_config(
+        model_name,
+        model_kwargs={
+            "num_hidden_layers": 1,
+            "hidden_size": 256,
+            "intermediate_size": 256,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 1,
+        },
+    )
     tp_size = 2
     max_batch_size = 256
     max_num_tokens = 8192
