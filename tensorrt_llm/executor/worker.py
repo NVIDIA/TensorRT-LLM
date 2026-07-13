@@ -28,6 +28,7 @@ from .request import CancellingRequest, GenerationRequest
 from .rpc_worker_mixin import RpcWorkerMixin
 from .utils import (ErrorResponse, IntraProcessQueue, RequestError,
                     WorkerCommIpcAddrs)
+from .worker_process_monitor import capture_worker_process_identity
 
 __all__ = [
     "GenerationExecutorWorker",
@@ -311,6 +312,8 @@ def worker_main(
     #         error to the error_queue in the main thread.
 
     mpi_comm().barrier()
+    worker_process_identities = mpi_comm().allgather(
+        capture_worker_process_identity(mpi_rank()))
     logger_debug(f"Worker {mpi_rank()} ready to setup backend...\n", "green")
 
     try:
@@ -351,7 +354,7 @@ def worker_main(
                     worker.set_result_queue(result_queue)
 
                 # Send ready signal with confirmation
-                ready_msg = (ready_signal, None)
+                ready_msg = (ready_signal, None, worker_process_identities)
                 if not worker_init_status_queue.notify_with_retry(ready_msg):
                     logger.warning(
                         "Failed to deliver ready signal to proxy, continuing anyway"
