@@ -1538,15 +1538,29 @@ class GvrTopKKernel:
         kBins = cutlass.const_expr(self.kNumBins)
         bins_per_warp = cutlass.const_expr(kBins // self.num_warps)
 
-        # Step 1: each warp sums BINS_PER_WARP bins (high→low slice)
+        # Step 1: each warp sums BINS_PER_WARP bins (high→low slice).
+        # Lane-parallel when the slice divides evenly across the warp:
+        # each lane sums bins_per_warp/32 bins + one warp reduce, instead
+        # of every lane redundantly walking a bins_per_warp-deep serial
+        # LDS+IADD dependency chain (~7% of stall samples at N=8K).
         warp_bin_sum = cutlass.Int32(0)
-        for jb in cutlass.range_constexpr(bins_per_warp):
-            bidx_s = (
-                cutlass.Int32(kBins - 1)
-                - warp_id * cutlass.Int32(bins_per_warp)
-                - cutlass.Int32(jb)
-            )
-            warp_bin_sum = warp_bin_sum + smem_hist[bidx_s]
+        if cutlass.const_expr(bins_per_warp % self.WARP_SIZE == 0):
+            for jm in cutlass.range_constexpr(bins_per_warp // self.WARP_SIZE):
+                bidx_s = (
+                    cutlass.Int32(kBins - 1)
+                    - warp_id * cutlass.Int32(bins_per_warp)
+                    - (lane + cutlass.Int32(jm * self.WARP_SIZE))
+                )
+                warp_bin_sum = warp_bin_sum + smem_hist[bidx_s]
+            warp_bin_sum = self.warp_reduce_sum_i32(warp_bin_sum)
+        else:
+            for jb in cutlass.range_constexpr(bins_per_warp):
+                bidx_s = (
+                    cutlass.Int32(kBins - 1)
+                    - warp_id * cutlass.Int32(bins_per_warp)
+                    - cutlass.Int32(jb)
+                )
+                warp_bin_sum = warp_bin_sum + smem_hist[bidx_s]
         if lane == 0:
             smem_wcnt[warp_id] = warp_bin_sum
         cute.arch.barrier()
@@ -1717,19 +1731,28 @@ class GvrTopKKernel:
             # exactness is untouched (a level-2 edge-rounding error at
             # worst costs one extra snap step). Uniform branch: everyone
             # reads the same post-barrier SMEM scalar.
-            sel_cnt2 = s_iscalars[4]
-            if sel_cnt2 > cutlass.Int32(8):
-                thr_e1 = s_thr[0]
-                # 2% slop each side absorbs the inv1-vs-binw1 rounding
-                # difference in the level-1 lower-edge estimate.
-                lo2 = thr_e1 - cutlass.Float32(0.02) * binw1
-                range2 = cutlass.Float32(1.04) * binw1
-                inv2 = (cutlass.Float32(kBins - 1) + cutlass.Float32(0.99)) / range2
-                binw2 = range2 / cutlass.Float32(kBins)
-                self._hist_build(keys_base, smem_hist, cand_count, lo2, inv2, tidx)
-                self._kth_bin_search(
-                    smem_hist, smem_wcnt, s_thr, s_iscalars, lo2, binw2, tidx, warp_id, lane
-                )
+            # Level 2 fires when a snap walk would cost more than one
+            # rebuild (~2 snap steps break even); level 3 only when level 2
+            # failed to split the bin (>8: heavy ties or a sub-ulp-wide
+            # window — both rare on real logits, where ties at the k-th
+            # are ~1 and the acceptance band spans >>1 ulp).
+            binw_cur = binw1
+            for _lvl in cutlass.range_constexpr(2):
+                sel_cnt_l = s_iscalars[4]
+                gate_l = cutlass.const_expr(2 if _lvl == 0 else 8)
+                if sel_cnt_l > cutlass.Int32(gate_l):
+                    thr_el = s_thr[0]
+                    # 2% slop each side absorbs the inv-vs-binw rounding
+                    # difference in the previous level's edge estimate.
+                    lo_l = thr_el - cutlass.Float32(0.02) * binw_cur
+                    range_l = cutlass.Float32(1.04) * binw_cur
+                    inv_l = (cutlass.Float32(kBins - 1) + cutlass.Float32(0.99)) / range_l
+                    binw_next = range_l / cutlass.Float32(kBins)
+                    self._hist_build(keys_base, smem_hist, cand_count, lo_l, inv_l, tidx)
+                    self._kth_bin_search(
+                        smem_hist, smem_wcnt, s_thr, s_iscalars, lo_l, binw_next, tidx, warp_id, lane
+                    )
+                    binw_cur = binw_next
 
             # ---- Snap convergence loop ----
             # Upper bound = cand_count (matches CUDA heuristic_topk.cuh:985).
