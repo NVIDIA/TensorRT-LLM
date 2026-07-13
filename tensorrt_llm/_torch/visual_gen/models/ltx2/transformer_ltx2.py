@@ -133,8 +133,11 @@ class LTX2Attention(Attention):
         # the plain backend + all-gather in the AV cross-attn forward path.
         ulysses_size = vgm.ulysses_size if vgm is not None else 1
         cp_size = vgm.cp_size if vgm is not None else 1
+        attn2d_active = vgm is not None and vgm.attn2d_row_size * vgm.attn2d_col_size > 1
         if self._is_cross_attn:
-            enable_sp = enable_sequence_parallel and cp_size == 1
+            # v2a (the only SP-enabled cross-attn) runs distributed Attention2D+Ulysses
+            # under attn2d instead of all-gathering the full video K/V; a2v/text keep SP off.
+            enable_sp = enable_sequence_parallel and (cp_size == 1 or attn2d_active)
         else:
             enable_sp = enable_sequence_parallel
 
@@ -186,7 +189,7 @@ class LTX2Attention(Attention):
         # UlyssesAttention(inner_backend=sharded_backend).
         if (
             enable_sequence_parallel
-            and (cp_size == 1 or not self._is_cross_attn)
+            and (cp_size == 1 or not self._is_cross_attn or attn2d_active)
             and ulysses_size > 1
         ):
             self._ulysses_attn = self.attn
