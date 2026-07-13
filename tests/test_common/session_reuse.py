@@ -160,9 +160,26 @@ def wait_gpu_memory_settle() -> None:
             pass
 
 
-def _get_worker_pid() -> int:
+def _proc_start_time(pid: int):
+    """Kernel start time (jiffies since boot) of ``pid``, or None if gone.
+
+    PIDs are recycled by the OS, but the (pid, start_time) pair is unique:
+    verifying it right before SIGKILL prevents killing an unrelated process
+    (e.g. a replacement pool's worker) that inherited a dead worker's PID.
+    """
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as f:
+            stat = f.read()
+        # Field 2 (comm) may contain spaces/parens; parse after the last ')'.
+        return stat.rsplit(b")", 1)[1].split()[19]  # field 22 overall
+    except OSError:
+        return None
+
+
+def _get_worker_pid() -> tuple:
     """Runs inside a worker; module-level so it is picklable."""
-    return os.getpid()
+    pid = os.getpid()
+    return (pid, _proc_start_time(pid))
 
 
 def _collect_worker_pids(real, n_workers: int) -> tuple:
@@ -170,8 +187,9 @@ def _collect_worker_pids(real, n_workers: int) -> tuple:
 
     ``_retire`` uses them to SIGKILL wedged workers: a graceful shutdown
     blocks forever on a broken pool and ``shutdown_abort`` would MPI_Abort
-    the parent test process too. Best effort — a missing PID just means that
-    worker is left for the graceful-shutdown fallback.
+    the parent test process too. Records (pid, start_time) pairs so the kill
+    can verify the PID was not recycled. Best effort — a missing PID just
+    means that worker is left for the graceful-shutdown fallback.
     """
     pids: set = set()
     try:
@@ -280,7 +298,11 @@ class SessionReuseCache:
         def _dispose():
             import signal
 
-            for pid in pids:
+            for pid, start_time in pids:
+                # Guard against PID recycling: only kill if the process at
+                # this PID is still the worker we recorded at spawn.
+                if start_time is None or _proc_start_time(pid) != start_time:
+                    continue
                 try:
                     os.kill(pid, signal.SIGKILL)
                 except (ProcessLookupError, PermissionError):
