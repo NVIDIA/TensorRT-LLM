@@ -314,6 +314,10 @@ class BaseLLM:
         logger_debug(f"LLM.args.mpi_session: {self.args.mpi_session}\n",
                      "yellow")
         self.mpi_session = self.args.mpi_session
+        # Keep the live session on LLM only. LLM args are passed to model-build
+        # tasks and executor workers, and MpiSession objects are not pickleable.
+        self.args.mpi_session = None
+        self._owns_mpi_session = self.mpi_session is None
 
         # Build this LLM's post-processing hook for the in-proxy detok path (each
         # postproc worker builds its own). Resolving here fails fast on a bad
@@ -333,6 +337,8 @@ class BaseLLM:
             logger.info(
                 f'start MpiSession with {self.args.parallel_config.world_size} workers'
             )
+            # _owns_mpi_session is already True here: this branch only runs
+            # when no external session was supplied.
             if not self.mpi_session:
                 mpi_process_pre_spawned: bool = get_spawn_proxy_process_env()
                 if not mpi_process_pre_spawned:
@@ -365,7 +371,9 @@ class BaseLLM:
             self._build_model()
 
         except Exception:
-            if self.mpi_session is not None:
+            # _owns_mpi_session is assigned before this try block, so it is
+            # always present here.
+            if self.mpi_session is not None and self._owns_mpi_session:
                 self.mpi_session.shutdown()
             raise
 
@@ -1500,7 +1508,8 @@ class BaseLLM:
             self._encoder_executor.shutdown()
             self._encoder_executor = None
 
-        if hasattr(self, 'mpi_session') and self.mpi_session is not None:
+        if (hasattr(self, 'mpi_session') and self.mpi_session is not None
+                and getattr(self, "_owns_mpi_session", True)):
             self.mpi_session.shutdown()
             self.mpi_session = None
 
