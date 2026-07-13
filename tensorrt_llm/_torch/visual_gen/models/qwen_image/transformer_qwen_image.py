@@ -911,19 +911,39 @@ class QwenImageTransformer2DModel(BaseDiffusionModel):
                         module._buffers.clear()
                         module.create_weights()
 
-    def _non_serialized_quant_parameter_names(self) -> set[str]:
-        """Return shared Linear parameters absent from ModelOpt checkpoints."""
-        non_serialized = set()
+    def _create_weights_for_loading(self) -> None:
+        device = self._weight_loading_device()
+        for _, module in self.named_modules():
+            if callable(getattr(module, "create_weights", None)):
+                module.create_weights()
+                module.to(device)
+
+    def _allowed_missing_checkpoint_parameter_names(self) -> set[str]:
+        """Return local-only parameters omitted by static ModelOpt checkpoints."""
+        allowed_missing = set()
         for module_name, module in self.named_modules():
             if not isinstance(module, Linear) or module.quant_config is None:
                 continue
             prefix = f"{module_name}." if module_name else ""
-            non_serialized.update(
+            allowed_missing.update(
                 f"{prefix}{param_name}"
                 for param_name in _NON_SERIALIZED_QUANT_PARAM_NAMES
                 if module._parameters.get(param_name) is not None
             )
-        return non_serialized
+        return allowed_missing
+
+    def _validate_checkpoint_keys(self, weights: Dict[str, torch.Tensor]) -> None:
+        expected = {name for name, _ in self.named_parameters()}
+        provided = set(weights)
+        missing = sorted((expected - provided) - self._allowed_missing_checkpoint_parameter_names())
+        unexpected = sorted(provided - expected)
+
+        # Dynamic quantization creates scale parameters while loading Linear
+        # modules, so those keys are expected to be absent from BF16 checkpoints.
+        if missing and not self.model_config.dynamic_weight_quant:
+            raise RuntimeError(f"Missing keys when loading transformer: {missing[:5]}...")
+        if unexpected:
+            raise RuntimeError(f"Unexpected keys when loading transformer: {unexpected[:5]}...")
 
     def load_weights(self, weights: Dict[str, torch.Tensor]) -> None:
         """Load HF ``transformer/*.safetensors`` state_dict.
@@ -933,25 +953,8 @@ class QwenImageTransformer2DModel(BaseDiffusionModel):
         """
         weights = _remap_checkpoint_keys(weights)
 
-        device = self._weight_loading_device()
-        for _, module in self.named_modules():
-            if callable(getattr(module, "create_weights", None)):
-                module.create_weights()
-                module.to(device)
-
-        expected = {name for name, _ in self.named_parameters()}
-        provided = set(weights)
-        # WAN uses the same shared Linear methods but does not perform this
-        # model-vs-checkpoint key check. Exempt only their known non-serialized
-        # parameters while retaining strict validation for real Qwen weights.
-        missing = sorted((expected - provided) - self._non_serialized_quant_parameter_names())
-        unexpected = sorted(provided - expected)
-        # Dynamic quantization creates scale parameters while loading Linear
-        # modules, so those keys are expected to be absent from BF16 checkpoints.
-        if missing and not self.model_config.dynamic_weight_quant:
-            raise RuntimeError(f"Missing keys when loading transformer: {missing[:5]}...")
-        if unexpected:
-            raise RuntimeError(f"Unexpected keys when loading transformer: {unexpected[:5]}...")
+        self._create_weights_for_loading()
+        self._validate_checkpoint_keys(weights)
 
         loader = DynamicLinearWeightLoader(self.model_config)
         for name, module in self.named_modules():

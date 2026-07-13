@@ -229,7 +229,7 @@ def test_static_quant_load_allows_only_missing_non_serialized_parameters(
         for module_name in quantized_module_names
         for suffix in non_serialized_suffixes
     }
-    assert model._non_serialized_quant_parameter_names() == non_serialized
+    assert model._allowed_missing_checkpoint_parameter_names() == non_serialized
     assert non_serialized <= expected.keys()
     if quant_algo == QuantAlgo.FP8:
         assert not any(name.endswith(".alpha") for name in expected)
@@ -268,7 +268,7 @@ def test_static_fp8_loads_serialized_weights_and_derives_inverse_scale() -> None
     """Static FP8 loading copies checkpoint tensors and derives inverse input scales."""
     model = _tiny_static_quant_model(QuantAlgo.FP8)
     expected = dict(model.named_parameters())
-    non_serialized = model._non_serialized_quant_parameter_names()
+    non_serialized = model._allowed_missing_checkpoint_parameter_names()
     checkpoint = {
         name: torch.zeros_like(param)
         for name, param in expected.items()
