@@ -3333,8 +3333,8 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
     disk_cache_gds_thread_count: PositiveInt = Field(
         default=8,
         description=
-        "Number of worker threads used by the NIXL GDS_MT backend for KV "
-        "cache disk transfers.")
+        "Number of NIXL GDS_MT Taskflow executor worker threads per TensorRT-LLM "
+        "rank for KV cache disk transfers.")
     cross_kv_cache_fraction: Optional[float] = Field(
         default=None,
         description=

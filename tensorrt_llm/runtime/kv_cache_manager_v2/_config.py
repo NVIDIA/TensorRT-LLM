@@ -84,7 +84,7 @@ class DiskCacheTierConfig:
         assert self.backend in ("posix", "nixl_gds"), (
             f"Unsupported disk cache backend: {self.backend}"
         )
-        assert self.gds_thread_count > 0, "GDS thread count must be positive"
+        assert self.gds_thread_count > 0, "GDS_MT thread count must be positive"
 
 
 @dataclass(slots=True)

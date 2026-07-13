@@ -402,7 +402,7 @@ class CopyEngine:
         thread_count: int,
     ) -> None:
         if thread_count <= 0:
-            raise ValueError("NIXL GDS thread count must be positive")
+            raise ValueError("NIXL GDS_MT thread count must be positive")
         engine = self._nixl_gds_engines.get(thread_count)
         if engine is None:
             if _NixlGdsCopyEngine is None:

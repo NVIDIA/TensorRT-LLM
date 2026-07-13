@@ -44,11 +44,12 @@ class NixlGdsCopyEngineImpl
 public:
     explicit NixlGdsCopyEngineImpl(SizeType32 threadCount)
     {
-        TLLM_CHECK_WITH_INFO(threadCount > 0, "NIXL GDS thread count must be positive");
+        TLLM_CHECK_WITH_INFO(threadCount > 0, "NIXL GDS_MT thread count must be positive");
         static std::atomic<uint64_t> nextAgentId{0};
         auto const agentId = nextAgentId.fetch_add(1);
         kvc::BaseAgentConfig config{std::string{"KVCacheManagerV2Gds"} + std::to_string(agentId), true, true, false,
             false, {{"thread_count", std::to_string(threadCount)}}};
+        TLLM_LOG_INFO("[KVCacheManagerV2] Creating NIXL GDS_MT backend with thread_count=%d", threadCount);
         mAgent = kvc::makeLoopbackAgent("nixl", &config);
     }
 
