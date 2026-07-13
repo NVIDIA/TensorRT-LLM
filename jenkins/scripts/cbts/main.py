@@ -259,6 +259,12 @@ def _load_pr_inputs(input_json_path: Path) -> PRInputs:
     )
 
 
+def _is_pure_perf_stage(stage_name: str) -> bool:
+    """True for pure `-Perf-` stages; mirrors Groovy Layer 2's `/-Perf-/` drop."""
+    # `-PerfSanity-` has no `-Perf-` substring, so it is intentionally not matched.
+    return "-Perf-" in stage_name
+
+
 # --- CLI --------------------------------------------------------------------
 
 
@@ -363,6 +369,11 @@ def main(argv: Optional[list[str]] = None) -> int:
             durations=durations,
         )
 
+    # Layer-2 alignment: drop pure `-Perf-` stages (Groovy `launchTestJobs`
+    # always excludes `-Perf-`; keeping them over-reports stages that never run).
+    perf_excluded = {s for s in result.affected_stages if _is_pure_perf_stage(s)}
+    result.affected_stages = set(result.affected_stages) - perf_excluded
+
     # Trigger-mode filter; recompute derived counts. pre-merge drops Post-Merge
     # stages; post-merge keeps both (adds Post-Merge on top, matching baseline).
     pre_filter_stages = set(result.affected_stages)
@@ -375,7 +386,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         k: v for k, v in result.affected_stage_split_counts.items() if k in result.affected_stages
     }
 
-    _log_decision_to_stderr(stages, result, pr, pre_filter_stages)
+    _log_decision_to_stderr(stages, result, pr, pre_filter_stages, perf_excluded)
     sys.stdout.write(result.to_json())
     return 0
 
@@ -385,6 +396,7 @@ def _log_decision_to_stderr(
     result: SelectionResult,
     pr: PRInputs,
     pre_filter_stages: set[str],
+    perf_excluded: set[str],
 ) -> None:
     """Print the CBTS decision to stderr for Jenkins console diagnostics."""
     out = sys.stderr
@@ -394,6 +406,10 @@ def _log_decision_to_stderr(
     print(f"CBTS decision (diagnostic; stderr only) [trigger mode: {mode}]:", file=out)
     print(f"  scope: {result.scope}", file=out)
     print(f"  test_db_dir_override: {result.test_db_dir_override}", file=out)
+    if perf_excluded:
+        print(f"  pure -Perf- stages excluded ({len(perf_excluded)}, own perf trigger):", file=out)
+        for s in sorted(perf_excluded):
+            print(f"    - {s}", file=out)
     if dropped:
         print(
             f"  stages dropped by trigger-mode filter ({len(dropped)}, would run if mode flipped):",
