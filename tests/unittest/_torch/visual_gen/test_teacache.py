@@ -301,6 +301,62 @@ class TestTeaCacheAcceleratorRefresh:
         acc.refresh(10)  # should not raise
 
 
+class TestQwenImageTeacacheTable:
+    """Qwen-Image built-in coefficient table resolves for any checkpoint path containing 'qwen'."""
+
+    def test_qwen_image_variant_resolves_from_checkpoint_path(self):
+        from tensorrt_llm._torch.visual_gen.models.qwen_image.pipeline_qwen_image import (
+            QWEN_IMAGE_TEACACHE_COEFFICIENTS,
+        )
+
+        pipeline = _PipelineTeacacheTestDouble(
+            DiffusionModelConfig(
+                pretrained_config=SimpleNamespace(_name_or_path="/weights/qwen-image/transformer"),
+                cache=TeaCacheConfig(teacache_thresh=0.2),
+                skip_create_weights_in_init=True,
+            )
+        )
+        with patch.object(TeaCacheBackend, "enable"):
+            BasePipeline._apply_teacache_coefficients(pipeline, QWEN_IMAGE_TEACACHE_COEFFICIENTS)
+            BasePipeline._setup_cache_acceleration(pipeline)
+        assert pipeline.model_config.teacache.coefficients is not None
+        assert len(pipeline.model_config.teacache.coefficients) == 5
+
+    def test_qwen_image_unrelated_path_raises_valueerror(self):
+        from tensorrt_llm._torch.visual_gen.models.qwen_image.pipeline_qwen_image import (
+            QWEN_IMAGE_TEACACHE_COEFFICIENTS,
+        )
+
+        pipeline = _PipelineTeacacheTestDouble(
+            DiffusionModelConfig(
+                pretrained_config=SimpleNamespace(
+                    _name_or_path="/weights/some-other-model/transformer"
+                ),
+                cache=TeaCacheConfig(teacache_thresh=0.2),
+                skip_create_weights_in_init=True,
+            )
+        )
+        with pytest.raises(ValueError, match="No coefficients found"):
+            BasePipeline._apply_teacache_coefficients(pipeline, QWEN_IMAGE_TEACACHE_COEFFICIENTS)
+
+    def test_user_coefficients_take_precedence_over_builtin_table(self):
+        from tensorrt_llm._torch.visual_gen.models.qwen_image.pipeline_qwen_image import (
+            QWEN_IMAGE_TEACACHE_COEFFICIENTS,
+        )
+
+        pipeline = _PipelineTeacacheTestDouble(
+            DiffusionModelConfig(
+                pretrained_config=SimpleNamespace(_name_or_path="/weights/qwen-image/transformer"),
+                cache=TeaCacheConfig(teacache_thresh=0.2, coefficients=[1.0, 2.0, 3.0]),
+                skip_create_weights_in_init=True,
+            )
+        )
+        with patch.object(TeaCacheBackend, "enable"):
+            BasePipeline._apply_teacache_coefficients(pipeline, QWEN_IMAGE_TEACACHE_COEFFICIENTS)
+            BasePipeline._setup_cache_acceleration(pipeline)
+        assert pipeline.model_config.teacache.coefficients == [1.0, 2.0, 3.0]
+
+
 class TestFlux2TeacacheTable:
     """FLUX.2 built-in coefficient table (dev variant)."""
 
