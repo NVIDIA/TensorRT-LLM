@@ -56,6 +56,7 @@ from .modeling_multimodal_utils import (
 from .modeling_qwen2vl import (
     Qwen2_5_VLVisionAttention,
     Qwen2VLInputProcessorBase,
+    _get_mrope_position_delta_cache_size,
     _prepare_qwen_vl_mrope_config,
     _prepare_qwen_vl_vision_attn_metadata,
 )
@@ -1206,7 +1207,7 @@ class Qwen3VLModelBase(PreTrainedModel, MultimodalModelMixin):
         if not disable_fuse_rope:
             self.init_mrope_embedding(model_config)
             # Extra slot is reserved for CUDA graph / warmup dummy requests.
-            max_mrope_delta_slots = model_config.max_num_tokens * model_config.mapping.pp_size + 1
+            max_mrope_delta_slots = _get_mrope_position_delta_cache_size(model_config)
             self.register_buffer(
                 "mrope_position_deltas_cache",
                 torch.zeros(

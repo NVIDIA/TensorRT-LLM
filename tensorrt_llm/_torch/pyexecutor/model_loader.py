@@ -310,7 +310,8 @@ class ModelLoader:
                  max_seq_len: Optional[int],
                  lora_config: Optional[LoraConfig] = None,
                  model_weights_memory_tag: Optional[ExecutorMemoryType] = None,
-                 model_weights_restore_mode: Optional[RestoreMode] = None):
+                 model_weights_restore_mode: Optional[RestoreMode] = None,
+                 max_num_seq_slots: Optional[int] = None):
         """
         Initializes the ModelLoader.
 
@@ -326,6 +327,9 @@ class ModelLoader:
                 they can be released/materialized independently of buffers.
             model_weights_restore_mode: RestoreMode for the model weights
                 virtual-memory scope.
+            max_num_seq_slots: Capacity of model buffers indexed by sequence
+                slot. This can exceed the scheduler admission batch size when
+                overlap scheduling is enabled.
         """
         self.llm_args = llm_args
         self.mapping = mapping
@@ -333,12 +337,18 @@ class ModelLoader:
         self.sparse_attention_config = sparse_attention_config
         self.max_num_tokens = max_num_tokens
         self.max_seq_len = max_seq_len
+        self.max_num_seq_slots = max_num_seq_slots
         self.lora_config = lora_config
         self.model_weights_memory_tag = model_weights_memory_tag
         self.model_weights_restore_mode = model_weights_restore_mode
         self.weight_mapper = None
         self._weight_pool_proxy = None
         self._gms_backend = None
+
+    def _set_runtime_model_config_attrs(self, config: ModelConfig) -> None:
+        """Attach executor-only allocation sizes before model construction."""
+        if self.max_num_seq_slots is not None:
+            config.extra_attrs['max_num_seq_slots'] = self.max_num_seq_slots
 
     @staticmethod
     def load_config_and_apply_defaults(
@@ -1208,6 +1218,7 @@ class ModelLoader:
             load_config_kwargs['model_kwargs'] = self.llm_args.model_kwargs
 
         config = checkpoint_loader.load_config(**load_config_kwargs)
+        self._set_runtime_model_config_attrs(config)
 
         # Store nvfp4 config in extra_attrs for Linear layer access
         config.extra_attrs[

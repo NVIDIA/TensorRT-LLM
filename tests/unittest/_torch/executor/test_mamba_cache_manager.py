@@ -5,6 +5,7 @@ CppMambaHybridCacheManager PP-sharding edge cases."""
 
 import os
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 import torch
@@ -14,10 +15,12 @@ from tensorrt_llm._torch.pyexecutor.llm_request import ATTENTION_DP_DUMMY_REQUES
 from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import (
     MIN_REPLAY_HISTORY_SIZE,
     CppMambaHybridCacheManager,
+    MambaCacheManager,
+    MixedMambaHybridCacheManager,
     PythonMambaCacheManager,
     _get_mamba_hybrid_pool_size,
 )
-from tensorrt_llm._torch.pyexecutor.resource_manager import CacheTypeCpp
+from tensorrt_llm._torch.pyexecutor.resource_manager import CacheTypeCpp, KVCacheManager
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.bindings.internal.batch_manager import LinearCacheType
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig, MTPDecodingConfig
@@ -360,6 +363,7 @@ def _build_hybrid_with_mamba_layer(
     enable_block_reuse=False,
     mamba_state_cache_interval=256,
     is_estimating_kv_cache=False,
+    use_replay_state_update=False,
 ):
     """Construct a real CppMambaHybridCacheManager with one mamba layer +
     one full-attention layer so the parent KVCacheManager goes through the
@@ -396,6 +400,7 @@ def _build_hybrid_with_mamba_layer(
         spec_config=spec_config,
         layer_mask=attn_mask,
         is_estimating_kv_cache=is_estimating_kv_cache,
+        use_replay_state_update=use_replay_state_update,
     )
 
 
@@ -431,6 +436,114 @@ def test_cpp_hybrid_recurrent_pool_reserves_draft_len_sentinel_slots():
         f"need >= max_batch_size + 1 + max_draft_len = {expected_min} so "
         f"per-draft-len sentinels don't collide with live state"
     )
+
+
+@skip_no_cuda
+def test_cpp_hybrid_adp_dummy_mask_excludes_stale_requests():
+    """The replay mask must describe the batch passed to state setup.
+
+    ADP dummy allocation happens before the previous overlap batch has been
+    released, so ``self.requests`` can contain a full stale batch in addition
+    to the newly allocated dummy. The dummy-only setup must not size its mask
+    from that combined lifecycle list.
+    """
+    max_batch_size = 2
+    mgr = _build_hybrid_with_mamba_layer(
+        spec_config=MTPDecodingConfig(max_draft_len=1),
+        max_batch_size=max_batch_size,
+        use_replay_state_update=True,
+    )
+    stale_requests = [SimpleNamespace(is_dummy=False) for _ in range(max_batch_size)]
+    mgr.requests = stale_requests.copy()
+
+    dummy_requests = mgr.add_dummy_requests([ATTENTION_DP_DUMMY_REQUEST_ID])
+
+    assert dummy_requests
+    assert mgr.requests == stale_requests + dummy_requests
+    assert mgr._dummy_request_mask_host.tolist() == [True, False]
+
+
+def test_mixed_hybrid_does_not_allocate_mamba_when_dummy_kv_fails(monkeypatch):
+    mgr = object.__new__(MixedMambaHybridCacheManager)
+    kv_add_dummy = MagicMock(return_value=None)
+    mamba_add_dummy = MagicMock()
+    monkeypatch.setattr(KVCacheManager, "add_dummy_requests", kv_add_dummy)
+    monkeypatch.setattr(MambaCacheManager, "add_dummy_requests", mamba_add_dummy)
+
+    requests = mgr.add_dummy_requests([ATTENTION_DP_DUMMY_REQUEST_ID])
+
+    assert requests is None
+    mamba_add_dummy.assert_not_called()
+
+
+def test_mixed_hybrid_rolls_back_kv_when_mamba_dummy_fails(monkeypatch):
+    mgr = object.__new__(MixedMambaHybridCacheManager)
+    dummy_request = SimpleNamespace(py_request_id=ATTENTION_DP_DUMMY_REQUEST_ID)
+    draft_kv_cache_manager = MagicMock()
+    kv_add_dummy = MagicMock(return_value=[dummy_request])
+    kv_free = MagicMock()
+    mamba_add_dummy = MagicMock(side_effect=RuntimeError("no mamba slot"))
+    monkeypatch.setattr(KVCacheManager, "add_dummy_requests", kv_add_dummy)
+    monkeypatch.setattr(KVCacheManager, "free_resources", kv_free)
+    monkeypatch.setattr(MambaCacheManager, "add_dummy_requests", mamba_add_dummy)
+
+    with pytest.raises(RuntimeError, match="no mamba slot"):
+        mgr.add_dummy_requests(
+            [ATTENTION_DP_DUMMY_REQUEST_ID], draft_kv_cache_manager=draft_kv_cache_manager
+        )
+
+    draft_kv_cache_manager.free_resources.assert_called_once_with(dummy_request)
+    kv_free.assert_called_once_with(mgr, dummy_request)
+
+
+def test_cpp_hybrid_available_tokens_reserves_extra_and_draft_tokens(monkeypatch):
+    mgr = object.__new__(CppMambaHybridCacheManager)
+    mgr.num_extra_kv_tokens = 1
+    mgr.linear_attention_metadata = SimpleNamespace(states_snapshot_interval=16)
+    mgr.impl = MagicMock()
+    mgr.impl.get_kv_cache_stats.return_value = SimpleNamespace(
+        num_free_blocks_per_window_size={LinearCacheType.RECURRENT_STATES.value: 3}
+    )
+    monkeypatch.setattr(KVCacheManager, "get_num_available_tokens", MagicMock(return_value=100))
+
+    available_tokens = mgr.get_num_available_tokens(
+        token_num_upper_bound=100, max_num_draft_tokens=2
+    )
+
+    # One recurrent block is reserved for the final live state. The remaining
+    # two cover 32 tokens, of which one extra KV token and two draft tokens are
+    # consumed immediately after the initial dummy allocation.
+    assert available_tokens == 29
+
+
+@pytest.mark.parametrize("rs_free, expected", [(0, 0), (1, 100)])
+def test_cpp_hybrid_available_tokens_requires_live_state_without_reuse(
+    monkeypatch, rs_free, expected
+):
+    mgr = object.__new__(CppMambaHybridCacheManager)
+    mgr.num_extra_kv_tokens = 1
+    mgr.linear_attention_metadata = SimpleNamespace(states_snapshot_interval=0)
+    mgr.impl = MagicMock()
+    mgr.impl.get_kv_cache_stats.return_value = SimpleNamespace(
+        num_free_blocks_per_window_size={LinearCacheType.RECURRENT_STATES.value: rs_free}
+    )
+    monkeypatch.setattr(KVCacheManager, "get_num_available_tokens", MagicMock(return_value=100))
+
+    available_tokens = mgr.get_num_available_tokens(token_num_upper_bound=100)
+
+    assert available_tokens == expected
+
+
+def test_cpp_hybrid_available_tokens_without_local_mamba_uses_attention_cap(monkeypatch):
+    mgr = object.__new__(CppMambaHybridCacheManager)
+    mgr.linear_attention_metadata = None
+    mgr.impl = MagicMock()
+    monkeypatch.setattr(KVCacheManager, "get_num_available_tokens", MagicMock(return_value=100))
+
+    available_tokens = mgr.get_num_available_tokens(token_num_upper_bound=100)
+
+    assert available_tokens == 100
+    mgr.impl.get_kv_cache_stats.assert_not_called()
 
 
 def _build_hybrid_with_mamba_layer_pp(

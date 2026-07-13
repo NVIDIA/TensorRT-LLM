@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import bisect
 import contextlib
 import functools
@@ -296,6 +299,12 @@ class PyTorchModelEngine(ModelEngine):
         self.mapping = mapping
         if mapping.has_pp():
             init_pp_comm(mapping)
+        # The overlap scheduler can hold two iterations' requests at once.
+        # Model-side buffers indexed by py_seq_slot must span that full pool,
+        # not the token budget or scheduler admission batch size.
+        from ._util import compute_max_num_sequences
+        self.max_num_seq_slots = compute_max_num_sequences(
+            mapping, self.batch_size, llm_args.disable_overlap_scheduler)
         self.dist = dist
         if dist is not None:
             ExpertStatistic.create(self.dist.rank)
@@ -363,6 +372,7 @@ class PyTorchModelEngine(ModelEngine):
                 sparse_attention_config=self.sparse_attention_config,
                 max_num_tokens=self.max_num_tokens,
                 max_seq_len=self.max_seq_len,
+                max_num_seq_slots=self.max_num_seq_slots,
                 lora_config=lora_config,
                 model_weights_memory_tag=model_weights_memory_tag,
                 model_weights_restore_mode=model_weights_restore_mode,
@@ -373,6 +383,7 @@ class PyTorchModelEngine(ModelEngine):
                 setattr(self, "moe_load_balancer", moe_load_balancer)
         else:
             self.model = model
+        self._validate_mrope_position_delta_cache_capacity()
         if drafting_loop_wrapper is not None:
             self.model = drafting_loop_wrapper(self.model)
             self.model_is_wrapped = True
@@ -876,6 +887,34 @@ class PyTorchModelEngine(ModelEngine):
             yield
         finally:
             self.cuda_graph_runner.enabled = _run_cuda_graphs
+
+    def _validate_mrope_position_delta_cache_capacity(self) -> None:
+        """Validate slot-indexed MRoPE state on preconstructed models.
+
+        Models created by ModelLoader receive ``max_num_seq_slots`` before
+        construction. A caller-supplied model bypasses that path, so fail
+        early instead of letting the overlap scheduler index past an old-sized
+        cache at runtime.
+        """
+        mrope_position_deltas_cache = getattr(self.model,
+                                              "mrope_position_deltas_cache",
+                                              None)
+        if mrope_position_deltas_cache is None:
+            mrope_position_deltas_cache = getattr(
+                getattr(self.model, "draft_model", None),
+                "mrope_position_deltas_cache", None)
+        if mrope_position_deltas_cache is None:
+            return
+
+        required_size = self.max_num_seq_slots + 1
+        actual_size = mrope_position_deltas_cache.shape[0]
+        if actual_size < required_size:
+            raise ValueError(
+                "The supplied model's MRoPE position-delta cache has "
+                f"{actual_size} slots, but this executor requires at least "
+                f"{required_size} ({self.max_num_seq_slots} runtime sequence "
+                "slots plus one reserved dummy slot). Rebuild the model with "
+                "the executor's sequence-slot capacity.")
 
     def _pad_batch_seed_mrope_delta_cache(
             self, padded_requests: ScheduledRequests) -> None:
@@ -2154,14 +2193,10 @@ class PyTorchModelEngine(ModelEngine):
             self,
             spec_resource_manager: Optional[BaseResourceManager],
             no_cache=False):
-        # Lazy import: _util imports model_engine at module level.
-        from ._util import compute_max_num_sequences
-
         spec_config = self.spec_config if self.enable_spec_decode else None
         # Slot-indexed metadata buffers must span the SeqSlotManager pool,
         # which exceeds batch_size under the overlap scheduler.
-        num_seq_slots = compute_max_num_sequences(
-            self.mapping, self.batch_size, self._disable_overlap_scheduler)
+        num_seq_slots = self.max_num_seq_slots
         if no_cache:
             return get_spec_metadata(
                 spec_config,
@@ -3260,7 +3295,9 @@ class PyTorchModelEngine(ModelEngine):
         mrope_delta_read_seq_slots = []
         # Extra model-side cache slot reserved for CUDA graph / warmup dummy
         # requests, whose outputs are discarded.
-        mrope_dummy_seq_slot = self.max_num_tokens * self.mapping.pp_size
+        mrope_dummy_seq_slot = getattr(
+            self, "max_num_seq_slots",
+            self.max_num_tokens * self.mapping.pp_size)
         num_accepted_draft_tokens = []  # per request
         is_enc_dec = self._is_encoder_decoder_model()
         cross_encoder_hidden_states: List[torch.Tensor] = []
