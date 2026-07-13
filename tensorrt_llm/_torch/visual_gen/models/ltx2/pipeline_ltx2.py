@@ -602,6 +602,7 @@ def _load_component_weights(
         "text_encoder_path": "google/gemma-3-12b-it",
         "spatial_upsampler_path": None,
         "distilled_lora_path": None,
+        "stage2_ulysses": False,
     },
     doc=(
         "Lightricks LTX-2 support. ``pipeline_config()`` returns the "

@@ -1231,11 +1231,15 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
             return timer.fill(PipelineOutput(video=None, audio=None, frame_rate=float(frame_rate)))
 
         # ================================================================
-        # Stage 2: spatial upsample + refinement denoise (rank-0 only)
+        # Stage 2: spatial upsample + refinement denoise
         # ================================================================
-        # Only rank 0 refines; other vae_ranks skip Stage 2 and rejoin at the
-        # collective decode below, receiving the refined latents via broadcast.
-        if self.rank == 0:
+        # Default: only rank 0 refines; other vae_ranks skip Stage 2 and rejoin
+        # at the collective decode below, receiving the refined latents via
+        # broadcast. With stage2_ulysses, every rank already holds the Stage-1
+        # latents (parallel-VAE decode_latents) and refines collectively with
+        # Ulysses kept enabled.
+        stage2_parallel = self._stage2_ulysses_active()
+        if self.rank == 0 or stage2_parallel:
             video_latents, audio_latents = self._upsample_and_refine(
                 video_latents=video_latents,
                 audio_latents=audio_latents,
@@ -1248,6 +1252,7 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
                 max_sequence_length=max_sequence_length,
                 image=image,
                 image_cond_strength=image_cond_strength,
+                parallel=stage2_parallel,
             )
         else:
             video_latents, audio_latents = None, None
@@ -1279,9 +1284,13 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
 
         if self._parallel_vae_enabled:
             # Broadcast rank-0's refined Stage-2 latents to every vae_rank, then
-            # decode collectively (tile-parallel over vgm.vae_group).
+            # decode collectively (tile-parallel over vgm.vae_group). Parallel
+            # Stage 2 already left identical refined latents on every rank.
             vgm = self.pipeline_config.visual_gen_mapping
-            video_latents = self._broadcast_video_latents(video_latents, vgm.vae_group)
+            if stage2_parallel:
+                video_latents = video_latents.to(self.dtype).contiguous()
+            else:
+                video_latents = self._broadcast_video_latents(video_latents, vgm.vae_group)
             logger.info("Decoding upsampled video (tile-parallel)...")
             video = tile_parallel_decode(
                 self.video_decoder,
@@ -1343,9 +1352,12 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
         max_sequence_length: int,
         image: Optional[Union[str, torch.Tensor]] = None,
         image_cond_strength: float = 1.0,
+        parallel: bool = False,
     ) -> tuple:
-        """Stage 2 (rank-0 only): learned 2x spatial upsample + refinement denoise.
+        """Stage 2: learned 2x spatial upsample + refinement denoise.
 
+        Runs on rank 0 only by default; with ``parallel=True`` every rank runs
+        it collectively with Ulysses enabled (identical inputs on all ranks).
         Returns the refined ``(video_latents, audio_latents)`` in 5-D form.
         """
         per_ch_stats = self._get_per_channel_statistics()
@@ -1390,9 +1402,10 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
                 self._lora_cuda_graph_state = "merged"
                 logger.info(f"Merged distilled LoRA ({n} params) for stage 2 (BF16 weights)")
 
-            # Disable Ulysses for Stage 2: only rank 0 is active, so
-            # cross-rank collectives in the attention backend would hang.
-            self.transformer.set_ulysses_enabled(False)
+            # Rank-0-only Stage 2 must disable Ulysses: cross-rank collectives
+            # in the attention backend would hang.
+            if not parallel:
+                self.transformer.set_ulysses_enabled(False)
             video_latents, audio_latents = self._refinement_denoise(
                 video_latents=video_latents,
                 audio_latents=audio_latents,
@@ -1409,7 +1422,8 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
         finally:
             stage2_denoise_time = time.time() - stage2_start
             logger.info(f"Stage 2 denoising time: {stage2_denoise_time:.2f}s (BF16 weights)")
-            self.transformer.set_ulysses_enabled(True)
+            if not parallel:
+                self.transformer.set_ulysses_enabled(True)
             if using_persistent_lora:
                 lora_cache.bind_original()
                 self._lora_cuda_graph_state = "original"
@@ -1445,6 +1459,30 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
                 self._lora_cuda_graph_state = "original"
 
         return video_latents, audio_latents
+
+    def _stage2_ulysses_active(self) -> bool:
+        """Whether Stage 2 runs collectively on all ranks with Ulysses.
+
+        Requires the ``stage2_ulysses`` pipeline_config knob plus parallel VAE
+        (so every rank holds the Stage-1 latents), ``cfg_size == 1`` (the
+        Ulysses group must span all ranks; Stage 2 has no CFG) and
+        ``ulysses_size > 1``.
+        """
+        if not bool(self.pipeline_config.extra_attrs.get("stage2_ulysses", False)):
+            return False
+        vgm = self.pipeline_config.visual_gen_mapping
+        if (
+            self._parallel_vae_enabled
+            and vgm is not None
+            and vgm.cfg_size == 1
+            and vgm.ulysses_size > 1
+        ):
+            return True
+        logger.warning(
+            "stage2_ulysses requires parallel VAE, cfg_size == 1 and ulysses_size > 1; "
+            "falling back to rank-0 Stage 2."
+        )
+        return False
 
     def _broadcast_video_latents(
         self, video_latents: Optional[torch.Tensor], vae_group
