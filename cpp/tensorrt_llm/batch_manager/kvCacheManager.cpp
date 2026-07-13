@@ -1268,11 +1268,7 @@ void WindowBlockManager::releaseSubtree(BlockPtr const& block)
     for (auto it = subtree.rbegin(); it != subtree.rend(); ++it)
     {
         auto const& b = *it;
-        if (mEventManager && blockInRadixTree(b))
-        {
-            mEventManager->enqueueRemovedEvent(b, mWindowSize);
-        }
-        b->freeLeafBlock();
+        freeLeafBlock(b);
         if (!b->hasRefs())
         {
             b->setPriority(executor::KvCacheRetentionConfig::kMinRetentionPriority);
