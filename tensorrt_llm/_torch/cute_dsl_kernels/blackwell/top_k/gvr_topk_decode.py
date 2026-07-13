@@ -746,8 +746,10 @@ class GvrTopKKernel:
         handles the remainder.
 
         Cluster aggregation (cluster_size > 1): every CTA stages its
-        slice-local count into ``s_cluster_partial[0]``, syncs the cluster,
-        then DSMEM-reads every peer's slot and sums into ``s_iscalars[0]``.
+        slice-local count into ``s_cluster_partial[call & 1]`` (parity
+        double-buffer; slot 2 is the tid0-private call counter), syncs the
+        cluster, then DSMEM-reads every peer's slot and sums into
+        ``s_iscalars[0]``.
         After this every CTA's ``s_iscalars[0]`` holds the same
         cluster-wide cand_count, so Phase 2's secant update stays a
         leader-only scalar op on a value all CTAs agree on.
@@ -915,8 +917,27 @@ class GvrTopKKernel:
         if cutlass.const_expr(cluster_size > 1):
             if do_cluster_sync:
                 cute.arch.barrier()  # publish s_iscalars[0] to all threads of this CTA
+                # Parity double-buffer (adversarial-review find; race predates
+                # this campaign): with a single slot and a single rendezvous
+                # per call, a straggler CTA's post-wait DSMEM read of a peer's
+                # slot is unfenced against that peer's NEXT-call overwrite — a
+                # PTX-model data race (counts diverge → thresholds diverge →
+                # peer under-collection or cluster-barrier phase mismatch).
+                # Writing call k into slot k&1 closes it with zero extra
+                # synchronization: the peer's call-(k+2) overwrite of the same
+                # slot is transitively ordered after my call-k reads by the
+                # call-(k+1) rendezvous (my arrive follows my reads in program
+                # order). Slot 2 is a tid0-private call counter, zeroed in
+                # run_one_row; CTAs call this function in lockstep, so parity
+                # stays aligned cluster-wide. Short-row degrade keeps the
+                # invariant: do_cluster_sync is per-row uniform across the
+                # cluster's CTAs, so peers skip (or run) the exchange — and
+                # its counter increment — together.
+                par = cutlass.Int32(0)
                 if tidx == cutlass.Int32(0):
-                    s_cluster_partial[0] = s_iscalars[0]
+                    par = s_cluster_partial[2]
+                    s_cluster_partial[par & cutlass.Int32(1)] = s_iscalars[0]
+                    s_cluster_partial[2] = par + cutlass.Int32(1)
                 # Non-relaxed arrive: pairs with the peer cluster_wait acquire
                 # to release s_cluster_partial writes so the DSMEM ld below
                 # observes them. cluster_arrive_relaxed would skip the release
@@ -926,7 +947,7 @@ class GvrTopKKernel:
                 cute.arch.cluster_wait()
                 if tidx == cutlass.Int32(0):
                     total = cutlass.Int32(0)
-                    local_ptr = s_cluster_partial.iterator + cutlass.Int32(0)
+                    local_ptr = s_cluster_partial.iterator + (par & cutlass.Int32(1))
                     for peer in cutlass.range_constexpr(cluster_size):
                         peer_addr = mapa_shared_cluster(local_ptr, cutlass.Int32(peer))
                         total = total + ld_shared_cluster_i32(peer_addr)
@@ -950,7 +971,7 @@ class GvrTopKKernel:
         smem_wcnt,
         s_thr,  # [threshold, val_lo, val_hi]
         s_iscalars,  # [cand_count, done, cnt_lo, cnt_hi, out_count]
-        s_cluster_partial,  # [1] int32 cluster scratch
+        s_cluster_partial,  # [3] int32 cluster scratch (parity slots + counter)
         tidx,
         warp_id,
         lane,
@@ -2207,17 +2228,26 @@ class GvrTopKKernel:
             layout=cute.make_ordered_layout((6,), order=(0,)),
             byte_alignment=16,
         )
-        # Per-CTA DSMEM scratch for the cluster all-reduce of cand_count.
-        # mapa.shared::cluster relies on every CTA holding this slot at the
-        # SAME SMEM offset, so it's allocated once here. Only needed at
-        # cs>1; skipped at cs=1 (all uses are gated by const_expr(cs>1) and
-        # None propagates harmlessly through the unused parameters).
+        # Per-CTA DSMEM scratch for the cluster all-reduce of cand_count:
+        # slots 0/1 = parity double-buffered count exchange (call k writes
+        # slot k&1 — closes the straggler-read-vs-next-write DSMEM race),
+        # slot 2 = tid0-private call counter. mapa.shared::cluster relies
+        # on every CTA holding this block at the SAME SMEM offset, so it's
+        # allocated once here. Only needed at cs>1; skipped at cs=1 (all
+        # uses are gated by const_expr(cs>1) and None propagates
+        # harmlessly through the unused parameters).
         if cutlass.const_expr(cluster_size > 1):
             s_cluster_partial = smem.allocate_tensor(
                 element_type=cutlass.Int32,
-                layout=cute.make_ordered_layout((1,), order=(0,)),
+                layout=cute.make_ordered_layout((3,), order=(0,)),
                 byte_alignment=16,
             )
+            # Zero the call counter before any block_count_ge call. tid0-
+            # private (same thread reads/increments it), so program order
+            # suffices — but parity must start at 0 on EVERY CTA of the
+            # cluster for lockstep alignment.
+            if tidx == cutlass.Int32(0):
+                s_cluster_partial[2] = cutlass.Int32(0)
         else:
             s_cluster_partial = None
 
