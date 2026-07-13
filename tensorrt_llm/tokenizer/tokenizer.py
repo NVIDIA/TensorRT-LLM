@@ -197,19 +197,8 @@ class TransformersTokenizer(TokenizerBase):
 
     def __init__(self, tokenizer):
         self.tokenizer = tokenizer
-        if hasattr(self.tokenizer, "all_special_tokens"):
-            self._all_special_tokens_set = set(
-                self.tokenizer.all_special_tokens)
-        else:
-            self._all_special_tokens_set = set()
-        # Cache of special-token ids used by convert_ids_to_tokens to work
-        # around an O(N*K) bug in transformers 5.x's slow tokenizer path
-        # (see convert_ids_to_tokens below).  Computed once here so we don't
-        # rebuild it on every per-token streaming call.
-        try:
-            self._all_special_ids_set = set(self.tokenizer.all_special_ids)
-        except (AttributeError, NotImplementedError):
-            self._all_special_ids_set = set()
+        # (ids, strings) special-token sets, computed lazily on first detok.
+        self._special_tokens_sets = None
 
     def __reduce__(self):
         # In multi-node scenarios, AutoTokenizer.from_pretrained with
@@ -334,23 +323,30 @@ class TransformersTokenizer(TokenizerBase):
         inner = self.tokenizer
         if (isinstance(ids, int) or not skip_special_tokens
                 or getattr(inner, "is_fast", False)):
-            # Single id: no loop.  Fast tokenizer: tokenization_utils_tokenizers
-            # already caches all_special_ids before the loop.  Without skip:
-            # the buggy branch is short-circuited.
+            # Fast / no-skip / single-id paths skip the slow O(N*K) branch below.
             return inner.convert_ids_to_tokens(
                 ids, skip_special_tokens=skip_special_tokens)
-        # Slow PreTrainedTokenizer.convert_ids_to_tokens in transformers 5.x
-        # tests `index in self.all_special_ids` inside the per-id loop, and
-        # `all_special_ids` is an @property that rebuilds the list on every
-        # access via convert_tokens_to_ids(self.all_special_tokens).  The fast
-        # subclass already hoists this out of the loop (see
-        # tokenization_utils_tokenizers.py), but the slow base class wasn't
-        # updated.  Mirror that fix using the set we cached in __init__,
-        # which keeps streaming detokenization at O(1) all-special-ids cost
-        # per call regardless of batch size or stream_interval.
+        # Slow path rebuilds all_special_ids per id; cache it: O(N*K) -> O(N).
         tokens = inner.convert_ids_to_tokens(ids, skip_special_tokens=False)
-        special_ids = self._all_special_ids_set
+        special_ids = self._special_tokens()[0]
         return [t for idx, t in zip(ids, tokens) if int(idx) not in special_ids]
+
+    def _special_tokens(self) -> Tuple[set, set]:
+        """(ids, strings) special-token sets, computed once on first detok.
+
+        Deferred from __init__, which is too early: an input processor may
+        register specials after wrapping but before serving (e.g. gemma4's
+        <|video|>). Detok starts later and nothing mutates specials mid-stream,
+        so a first-use cache is correct and O(1) per streamed token.
+        """
+        if self._special_tokens_sets is None:
+            inner = self.tokenizer
+            try:
+                self._special_tokens_sets = (set(inner.all_special_ids),
+                                             set(inner.all_special_tokens))
+            except (AttributeError, NotImplementedError):
+                self._special_tokens_sets = (set(), set())
+        return self._special_tokens_sets
 
     def convert_tokens_to_string(
             self,
@@ -362,10 +358,13 @@ class TransformersTokenizer(TokenizerBase):
         if self.is_fast or not self.get_added_vocab():
             return self.tokenizer.convert_tokens_to_string(tokens)
 
+        special_tokens = ()
+        if skip_special_tokens:
+            special_tokens = self._special_tokens()[1]
         sub_texts: List[str] = []
         current_sub_text: List[str] = []
         for token in tokens:
-            if skip_special_tokens and token in self._all_special_tokens_set:
+            if skip_special_tokens and token in special_tokens:
                 continue
             if token in self.get_added_vocab():
                 if current_sub_text:
