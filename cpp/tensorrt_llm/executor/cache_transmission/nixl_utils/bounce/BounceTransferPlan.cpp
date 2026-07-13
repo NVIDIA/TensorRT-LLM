@@ -34,10 +34,65 @@ constexpr std::uint64_t alignUp(std::uint64_t value, std::uint64_t align) noexce
 {
     return (value + align - 1ULL) / align * align;
 }
+
+// Build the chunk's coalesced scatter view (see BounceScatterRun). Greedy single pass; per desc,
+// try to extend the last run in one of three ways before opening a new one:
+//   (a) contiguous growth (count==1): bounce AND dst both continue exactly where the run ends ->
+//       grow pieceSize in place. Captures a fully-dense dst (whole chunk -> ONE run).
+//   (b) stride latch (count==1, same size): the second desc fixes (dstStride, bounceStride) and the
+//       run becomes count=2. Only forward, u32-representable bounce steps latch.
+//   (c) stride extension (count>=2): the desc lands exactly one stride past the run's last piece.
+//       Captures a uniformly-strided dst (e.g. a head slice into a wider pool -> ONE run).
+// Irregular layouts simply break runs (worst case: one count==1 run per desc == the old per-desc
+// plan). Correctness never depends on merging.
+void buildScatterRuns(BounceChunk& chunk, bool merge)
+{
+    auto const n = chunk.dstPtrs.size();
+    chunk.scatterRuns.clear();
+    for (std::size_t i = 0; i < n; ++i)
+    {
+        std::uint64_t const dst = chunk.dstPtrs[i];
+        std::uint64_t const bounce = chunk.bounceOffsets[i];
+        std::uint32_t const size = chunk.sizes[i];
+        if (merge && !chunk.scatterRuns.empty())
+        {
+            auto& r = chunk.scatterRuns.back();
+            if (r.count == 1)
+            {
+                // (a) contiguous growth. Piece size stays within u32 (packedBytes <= 4 GiB - 1 is
+                // enforced in build(), but guard the sum explicitly anyway).
+                if (dst == r.dstAddr + r.pieceSize && bounce == r.bounceOffset + r.pieceSize
+                    && static_cast<std::uint64_t>(r.pieceSize) + size <= std::numeric_limits<std::uint32_t>::max())
+                {
+                    r.pieceSize += size;
+                    continue;
+                }
+                // (b) stride latch.
+                if (size == r.pieceSize && dst > r.dstAddr && bounce > r.bounceOffset
+                    && bounce - r.bounceOffset <= std::numeric_limits<std::uint32_t>::max())
+                {
+                    r.dstStride = dst - r.dstAddr;
+                    r.bounceStride = static_cast<std::uint32_t>(bounce - r.bounceOffset);
+                    r.count = 2;
+                    continue;
+                }
+            }
+            else if (size == r.pieceSize
+                && dst == r.dstAddr + static_cast<std::uint64_t>(r.count) * r.dstStride
+                && bounce == r.bounceOffset + static_cast<std::uint64_t>(r.count) * r.bounceStride)
+            {
+                // (c) stride extension.
+                r.count += 1;
+                continue;
+            }
+        }
+        chunk.scatterRuns.push_back(BounceScatterRun{bounce, dst, 0, 0, size, 1});
+    }
+}
 } // namespace
 
 BounceTransferPlan BounceTransferPlan::build(TransferDescs const& srcDescs, TransferDescs const& dstDescs,
-    std::size_t maxChunkBytes, std::size_t maxDescsPerChunk)
+    std::size_t maxChunkBytes, std::size_t maxDescsPerChunk, bool mergeScatterRuns)
 {
     BounceTransferPlan plan;
 
@@ -66,6 +121,7 @@ BounceTransferPlan BounceTransferPlan::build(TransferDescs const& srcDescs, Tran
     {
         if (!current.srcPtrs.empty())
         {
+            buildScatterRuns(current, mergeScatterRuns);
             plan.mChunks.emplace_back(std::move(current));
             current = BounceChunk{};
             cursor = 0;
@@ -92,6 +148,27 @@ BounceTransferPlan BounceTransferPlan::build(TransferDescs const& srcDescs, Tran
         bool const overflow = (cursor + len > maxChunkBytes);
         bool const tooManyDescs = (current.srcPtrs.size() >= maxDescsPerChunk);
         bool const deviceMismatch = !current.srcPtrs.empty() && dst.getDeviceId() != current.dstDeviceId;
+
+        // Extend the previous desc in place when src, dst AND the bounce cursor all advance
+        // contiguously (the aligned cursor left no gap): one desc instead of two shrinks the gather
+        // plan, the scatter runs and the wire messages. Only within the current chunk (`!overflow`)
+        // and staying within the u32 per-desc size field.
+        bool const srcDstContig = !current.srcPtrs.empty() && !overflow && !deviceMismatch
+            && src.getAddr() == current.srcPtrs.back() + current.sizes.back()
+            && dst.getAddr() == current.dstPtrs.back() + current.sizes.back()
+            && cursor == current.bounceOffsets.back() + current.sizes.back()
+            && static_cast<std::uint64_t>(current.sizes.back()) + len <= std::numeric_limits<std::uint32_t>::max();
+        if (srcDstContig)
+        {
+            current.sizes.back() += static_cast<std::uint32_t>(len);
+            current.totalBytes += len;
+            current.packedBytes = current.bounceOffsets.back() + current.sizes.back();
+            cursor = alignUp(current.packedBytes, kAlignment);
+            plan.mTotalBytes += len;
+            plan.mTotalDescs += 1;
+            continue;
+        }
+
         if (overflow || tooManyDescs || deviceMismatch)
         {
             flush();

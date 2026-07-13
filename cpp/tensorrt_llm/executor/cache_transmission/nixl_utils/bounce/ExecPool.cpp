@@ -39,6 +39,13 @@ ExecPool::ExecPool(std::uint32_t count, std::size_t maxDescsPerChunk, int device
     {
         TLLM_CUDA_CHECK(batchedCopyCubTempBytes(static_cast<std::uint32_t>(maxDescsPerChunk), cubTempBytes));
     }
+    // Gather/scatter copies sit on the KV-transfer critical path but share the GPU with model
+    // kernels (prefill/decode). At default priority a copy kernel queues behind those (measured
+    // ~260us avg, >1ms tail, vs ~65us of actual copy time). Greatest priority lets its blocks be
+    // scheduled as soon as any SM frees up, without preempting running work.
+    int leastPriority = 0;
+    int greatestPriority = 0;
+    TLLM_CUDA_CHECK(cudaDeviceGetStreamPriorityRange(&leastPriority, &greatestPriority));
     mCtxs.resize(count);
     for (std::uint32_t i = 0; i < count; ++i)
     {
@@ -59,7 +66,7 @@ ExecPool::ExecPool(std::uint32_t count, std::size_t maxDescsPerChunk, int device
             TLLM_CUDA_CHECK(cudaMalloc(&c.cubTemp, cubTempBytes));
             c.cubTempBytes = cubTempBytes;
         }
-        TLLM_CUDA_CHECK(cudaStreamCreateWithFlags(&c.stream, cudaStreamNonBlocking));
+        TLLM_CUDA_CHECK(cudaStreamCreateWithPriority(&c.stream, cudaStreamNonBlocking, greatestPriority));
         TLLM_CUDA_CHECK(cudaEventCreateWithFlags(&c.event, cudaEventDisableTiming));
         mFree.push_back(i);
     }

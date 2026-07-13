@@ -21,6 +21,7 @@
 
 #include <cstdint>
 #include <deque>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -57,9 +58,9 @@ struct Grant
 ///
 /// Each event method mutates state and returns the GRANTs the caller should now send.
 ///
-/// THREADING CONTRACT: this class is NOT internally synchronized. ALL methods (events + inspectors)
-/// must be called from a single thread — the transport's IO thread, which owns the scheduler. The
-/// design relies on this to stay lock-free; do not call it from scatter workers or app threads.
+/// THREADING CONTRACT: every public method takes the internal mutex, so calls are safe from any
+/// thread. The IO thread remains the primary owner (all flow-state events happen there); the one
+/// cross-thread caller is acquireLocal() from submit() app threads (eager gather staging).
 class CreditScheduler
 {
 public:
@@ -98,19 +99,30 @@ public:
 
     // ---- local (sender) role: gather staging from the SAME arena ----
     /// Allocate a region of `bytes` for local gather staging (non-blocking). Returns its offset, or
-    /// nullopt if the arena can't fit it right now (caller parks and retries).
-    [[nodiscard]] std::optional<std::uint64_t> acquireLocal(std::size_t bytes);
+    /// nullopt if the arena can't fit it right now (caller parks and retries). With `eager` the
+    /// allocation is additionally capped so that all eager (credit-less) local regions together stay
+    /// under HALF the arena capacity — on a bidirectional deployment this guarantees each side can
+    /// always still grant incoming regions, so two eager senders can never starve each other into a
+    /// circular wait (chunk waits for a GRANT the peer can't give because ITS arena is full of eager
+    /// staging, and vice versa). Credit-backed (non-eager) acquisitions are not capped.
+    [[nodiscard]] std::optional<std::uint64_t> acquireLocal(std::size_t bytes, bool eager = false);
+    /// An eager region's credit arrived: it is now credit-backed, so stop counting it against the
+    /// eager budget (otherwise steady-state pipelining would be throttled to the eager cap even
+    /// though every in-flight chunk has its credit). No-op for non-eager offsets.
+    void promoteLocal(std::uint64_t offset);
     /// Return a locally-held region (its chunk was ACKed / failed) to the arena + re-schedule.
     [[nodiscard]] std::vector<Grant> releaseLocal(std::uint64_t offset);
 
-    [[nodiscard]] std::size_t localHeldCount() const noexcept
+    [[nodiscard]] std::size_t localHeldCount() const
     {
+        std::lock_guard<std::mutex> lk(mMu);
         return mLocalHeld.size();
     }
 
     // ---- inspectors (for tests / metrics) ----
-    [[nodiscard]] std::size_t freeBytes() noexcept
+    [[nodiscard]] std::size_t freeBytes()
     {
+        std::lock_guard<std::mutex> lk(mMu);
         return mArena.freeBytes();
     }
 
@@ -124,17 +136,19 @@ public:
 
     /// Byte size of the buddy block backing a granted region offset (0 if not allocated). The whole
     /// block belongs to one flow, so it bounds how far a scatter may read without touching another
-    /// flow's region. IO-thread only (mirrors the rest of the scheduler).
-    [[nodiscard]] std::size_t regionBytes(std::uint64_t offset) const noexcept
+    /// flow's region.
+    [[nodiscard]] std::size_t regionBytes(std::uint64_t offset) const
     {
+        std::lock_guard<std::mutex> lk(mMu);
         return mArena.blockBytes(offset);
     }
 
     [[nodiscard]] std::size_t heldCount(std::string const& flow) const;
     [[nodiscard]] std::size_t activeFlows() const;
 
-    [[nodiscard]] std::size_t trackedFlows() const noexcept
+    [[nodiscard]] std::size_t trackedFlows() const
     {
+        std::lock_guard<std::mutex> lk(mMu);
         return mFlows.size();
     }
 
@@ -154,12 +168,22 @@ private:
     void dropFlow(std::string const& flow, std::unordered_set<std::uint64_t> const& busy,
         std::vector<std::uint64_t>& deferredOut);
 
+    // Guards ALL mutable state below. Uncontended in practice: everything runs on the IO thread
+    // except acquireLocal() from submit() app threads (eager gather staging).
+    mutable std::mutex mMu;
+
     BuddyAllocator mArena;                             // the single shared region allocator (byte offsets)
     std::uint64_t mBaseAddr{};                         // device addr of offset 0
     std::uint32_t mMaxWindow{};                        // per-flow in-flight region cap (W)
 
     std::unordered_map<std::string, FlowState> mFlows; // per-flow state (opaque flow id, NOT agent name)
     std::unordered_set<std::uint64_t> mLocalHeld;      // regions taken for local gather staging
+    // Rounded (buddy-block) bytes of local regions acquired EAGERLY (before their credit arrived),
+    // and the cap they must stay under (half the arena) — see acquireLocal(). Offsets still tracked
+    // in mEagerHeld so releaseLocal() knows how much to subtract.
+    std::unordered_map<std::uint64_t, std::size_t> mEagerHeld;
+    std::size_t mEagerHeldBytes{0};
+    std::size_t mEagerBudgetBytes{0};
     std::unordered_set<std::uint64_t>
         mOrphans; // regions deferred by reclaimByPrefix (busy scatter), awaiting freeOrphanRegion
     // Round-robin ring of active flow keys (insertion order). NOTE: "ring" not "order" — distinct

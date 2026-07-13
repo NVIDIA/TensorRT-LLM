@@ -68,9 +68,11 @@ public:
     [[nodiscard]] virtual bool registerRegion(void* addr, std::size_t bytes) = 0;
 
     /// Post a write of `bytes` from local `src` to `peer`'s device address `dstAddr` on the peer's
-    /// GPU `remoteDevId` (carried in the credit; do NOT assume it equals the local device index),
-    /// ordered on `stream` (so it follows the gather kernel already enqueued there). Returns an
-    /// opaque handle to poll. The handle owns no slot — slot lifetime is the caller's.
+    /// GPU `remoteDevId` (carried in the credit; do NOT assume it equals the local device index).
+    /// `stream` is advisory and may be null: the reactor posts a write only AFTER the gather event
+    /// has signalled (postXferReq is not stream-ordered anyway), so implementations need no stream
+    /// ordering. Returns an opaque handle to poll. The handle owns no slot — slot lifetime is the
+    /// caller's.
     [[nodiscard]] virtual std::uint64_t postWrite(std::string const& peer, void const* src, std::uint64_t dstAddr,
         std::uint32_t remoteDevId, std::uint32_t bytes, cudaStream_t stream)
         = 0;
