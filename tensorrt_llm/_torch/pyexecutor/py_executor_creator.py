@@ -35,8 +35,8 @@ from ..speculative import (get_num_extra_kv_tokens, get_spec_drafter,
                            get_spec_resource_manager)
 from ..virtual_memory import scope as virtual_memory_scope
 from ._util import (KvCacheCreator, _adjust_torch_mem_fraction,
-                    create_py_executor_instance, instantiate_sampler, is_mla,
-                    validate_feature_combination)
+                    compute_max_num_sequences, create_py_executor_instance,
+                    instantiate_sampler, is_mla, validate_feature_combination)
 from .config_utils import is_hybrid_linear
 from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .dwdp import DwdpManager
@@ -757,10 +757,20 @@ def create_py_executor(
         with allocation_scope(ExecutorMemoryType.GUIDED_DECODER):
             if mapping.is_last_pp_rank():
                 kwargs = {
-                    "guided_decoding_config": guided_decoding_config,
-                    "max_num_sequences": max_batch_size,
-                    "vocab_size_padded": model_engine.model.vocab_size_padded,
-                    "rank": mapping.rank,
+                    "guided_decoding_config":
+                    guided_decoding_config,
+                    # Guided-decoder state is indexed by sequence slot; size
+                    # it to the SeqSlotManager pool (2x max_batch_size under
+                    # the overlap scheduler), matching the sampler's
+                    # new_tokens width.
+                    "max_num_sequences":
+                    compute_max_num_sequences(
+                        mapping, max_batch_size,
+                        llm_args.disable_overlap_scheduler),
+                    "vocab_size_padded":
+                    model_engine.model.vocab_size_padded,
+                    "rank":
+                    mapping.rank,
                 }
                 if spec_config is not None:
                     kwargs[

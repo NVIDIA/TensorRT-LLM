@@ -533,10 +533,16 @@ class SpecMetadata:
     use_sampling_params_for_draft_tokens: bool = False
     # Vocab size used for draft_probs buffer allocation.
     vocab_size: int = 0
+    # Size of the SeqSlotManager pool. py_seq_slot values range over
+    # [0, num_seq_slots); under the overlap scheduler this is
+    # 2 * max_batch_size, larger than max_num_requests (== max_batch_size).
+    # Slot-indexed buffers (draft_probs) must span this full range.
+    # 0 falls back to max_num_requests.
+    num_seq_slots: int = 0
     # Draft probabilities buffer for rejection sampling, indexed by py_seq_slot
     # so per-request data is stable across iterations regardless of batch
     # composition shifts (chunking ctx, gen completion, new ctx joining).
-    # Shape: [max_num_requests, max_draft_len, vocab_size].
+    # Shape: [num_seq_slots, max_draft_len, vocab_size].
     draft_probs: Optional[torch.Tensor] = None
     draft_probs_vocab_size: int = 0
     # Whether draft_probs contains valid data.
@@ -573,8 +579,9 @@ class SpecMetadata:
                 and self.vocab_size > 0):
             # 3D [slot, draft_step, vocab] so we can scatter/gather by slot id
             # and avoid the brittle "batch position == buffer position" mapping.
+            slot_capacity = self.num_seq_slots or self.max_num_requests
             self.draft_probs = torch.empty(
-                (self.max_num_requests, self.max_draft_len, self.vocab_size),
+                (slot_capacity, self.max_draft_len, self.vocab_size),
                 dtype=torch.float32,
                 device='cuda')
             self.draft_probs_vocab_size = self.vocab_size

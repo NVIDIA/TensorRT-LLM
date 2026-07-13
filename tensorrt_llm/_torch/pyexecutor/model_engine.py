@@ -2154,7 +2154,14 @@ class PyTorchModelEngine(ModelEngine):
             self,
             spec_resource_manager: Optional[BaseResourceManager],
             no_cache=False):
+        # Lazy import: _util imports model_engine at module level.
+        from ._util import compute_max_num_sequences
+
         spec_config = self.spec_config if self.enable_spec_decode else None
+        # Slot-indexed metadata buffers must span the SeqSlotManager pool,
+        # which exceeds batch_size under the overlap scheduler.
+        num_seq_slots = compute_max_num_sequences(
+            self.mapping, self.batch_size, self._disable_overlap_scheduler)
         if no_cache:
             return get_spec_metadata(
                 spec_config,
@@ -2163,7 +2170,8 @@ class PyTorchModelEngine(ModelEngine):
                 max_num_tokens=self.max_num_tokens,
                 spec_resource_manager=spec_resource_manager,
                 is_draft_model=self.is_draft_model,
-                max_seq_len=self.max_seq_len)
+                max_seq_len=self.max_seq_len,
+                num_seq_slots=num_seq_slots)
 
         if self.spec_metadata is not None:
             return self.spec_metadata
@@ -2174,7 +2182,8 @@ class PyTorchModelEngine(ModelEngine):
             max_num_tokens=self.max_num_tokens,
             spec_resource_manager=spec_resource_manager,
             is_draft_model=self.is_draft_model,
-            max_seq_len=self.max_seq_len)
+            max_seq_len=self.max_seq_len,
+            num_seq_slots=num_seq_slots)
         return self.spec_metadata
 
     def cleanup(self) -> None:

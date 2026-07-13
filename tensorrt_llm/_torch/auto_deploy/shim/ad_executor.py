@@ -1310,7 +1310,9 @@ def create_autodeploy_executor(
         )
         guided_decoder = GuidedDecoder(
             guided_decoding_config=guided_decoding_config,
-            max_num_sequences=ad_config.max_batch_size,
+            # Guided-decoder state is indexed by sequence slot; size it to the
+            # SeqSlotManager pool above (max_batch_size * pp_size).
+            max_num_sequences=max_num_sequences,
             vocab_size_padded=vocab_size_padded,
         )
 

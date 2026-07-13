@@ -4866,12 +4866,16 @@ class TRTLLMSampler(Sampler[SampleStateTRTLLM], AsyncWorkerMixin):
         )
         self.max_batch_size = max_batch_size
         self.max_beam_width = max_beam_width
-        self.max_num_sequences = mapping.pp_size * max_batch_size
         self.max_seq_idle_microseconds = 180 * 1000 * 1000
         self.is_trt_overlap = not disable_overlap_scheduler
         self.num_micro_batches = (
             mapping.pp_size if mapping.pp_size > 1 else (2 if self.is_trt_overlap else 1)
         )
+        # Decoder state is indexed by sequence slot; size it to the
+        # SeqSlotManager pool (max_batch_size * num_micro_batches, matching
+        # compute_max_num_sequences), not pp_size alone, so py_seq_slot
+        # values under the overlap scheduler stay in range.
+        self.max_num_sequences = max_batch_size * self.num_micro_batches
         self.micro_batch_idx = 0
 
         if mpi_disabled():
