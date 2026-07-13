@@ -271,6 +271,14 @@ class TestStandalonePackage:
             "pytest",
             os.path.join(tests_dir, "singlegpu"),
             "-q",
+            # loadfile: all tests in one file run on the same worker in
+            # file-declaration order. Without it xdist's default `load` mode
+            # dynamically interleaves tests across workers, so module-level
+            # torch.manual_seed(...) no longer produces a stable RNG state at
+            # each test entry — occasionally tripping tight numerical
+            # tolerances in flashinfer_mla / gemm_fusion. See the comment in
+            # tests/.../rope/test_rope_op_variants.py:28.
+            "--dist=loadfile",
             # Parallelize across CPU workers; pytest-xdist is in [dev] extras.
             "-n",
             "4",
