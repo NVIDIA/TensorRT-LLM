@@ -1010,12 +1010,12 @@ class Qwen3VisionModel(torch.nn.Module, MultimodalEncoderMixin):
 
 
 def _qwen3vl_build_batched_input(
-    multimodal_params: List[MultimodalParams],
-) -> Dict[str, Any]:
+    multimodal_params: list[MultimodalParams],
+) -> dict[str, Any]:
     """Cat image items then video items across requests (matching the
     ``EncoderGroup.modalities`` order) into one ViT input."""
-    pixels: List[torch.Tensor] = []
-    grids: List[torch.Tensor] = []
+    pixels: list[torch.Tensor] = []
+    grids: list[torch.Tensor] = []
     for m, pv_key, thw_key in (
         ("image", "pixel_values", "image_grid_thw"),
         ("video", "pixel_values_videos", "video_grid_thw"),
@@ -1383,7 +1383,7 @@ class Qwen3VLModelBase(PreTrainedModel, MultimodalModelMixin):
             # Raw image/video tensors: run local encoder.
             if has_raw_image_or_video_data and self.mm_encoder is not None:
                 mm_embeds = get_multimodal_embeddings(
-                    encoder_forward_fn=self.mm_encoder.forward,
+                    encoder_forward_fn=self.encode_multimodal_by_groups,
                     multimodal_params=mm_multimodal_params,
                 )
             # Raw image/video tensors on a worker with no encoder: bad route.

@@ -9,6 +9,7 @@ cross-request batching all produce prompt-order embeddings via one ViT call.
 """
 
 from types import SimpleNamespace
+from typing import Optional
 
 import pytest
 import torch
@@ -25,7 +26,7 @@ def _encode_batched(pixel_values: torch.Tensor, grid_thw: torch.Tensor) -> torch
 
 
 class _StubModel(MultimodalModelMixin):
-    def __init__(self):
+    def __init__(self) -> None:
         self.mm_encoder_groups = (
             EncoderGroup(
                 modalities=("image", "video"),
@@ -35,8 +36,13 @@ class _StubModel(MultimodalModelMixin):
         )
 
 
-def _param(image=None, video=None, order=None, lengths=None):
-    data = {}
+def _param(
+    image: Optional[dict] = None,
+    video: Optional[dict] = None,
+    order: Optional[list] = None,
+    lengths: Optional[list] = None,
+) -> SimpleNamespace:
+    data: dict = {}
     if image is not None:
         data["image"] = image
     if video is not None:
@@ -52,11 +58,11 @@ def _patches(marker: int, n: int, dim: int = 2) -> torch.Tensor:
     return t
 
 
-def _encode(params):
+def _encode(params: list) -> torch.Tensor:
     return _StubModel().encode_multimodal_by_groups(params)
 
 
-def test_image_only_request():
+def test_image_only_request() -> None:
     out = _encode(
         [
             _param(
@@ -71,7 +77,7 @@ def test_image_only_request():
     assert torch.equal(out[:, 0], torch.full((4,), 10.0))
 
 
-def test_mixed_image_video_image_prompt_order():
+def test_mixed_image_video_image_prompt_order() -> None:
     # Prompt: image#0 (4 rows), video#0 (6), image#1 (2).
     out = _encode(
         [
@@ -97,7 +103,7 @@ def test_mixed_image_video_image_prompt_order():
     assert torch.equal(out[:, 0], expected)
 
 
-def test_mixed_without_manifest_raises():
+def test_mixed_without_manifest_raises() -> None:
     """Mixed request must carry mm_item_order; the shared helper enforces this
     once for every model that registers a multi-modality EncoderGroup."""
     with pytest.raises(ValueError, match="mm_item_order"):
@@ -119,7 +125,7 @@ def test_mixed_without_manifest_raises():
         )
 
 
-def test_batch_of_two_image_only_requests():
+def test_batch_of_two_image_only_requests() -> None:
     out = _encode(
         [
             _param(
@@ -142,7 +148,7 @@ def test_batch_of_two_image_only_requests():
     assert torch.equal(out[:, 0], expected)
 
 
-def test_heterogeneous_batch_image_only_and_video_only():
+def test_heterogeneous_batch_image_only_and_video_only() -> None:
     """One image-only request + one video-only request go through the same
     modality-blind ViT via the generic path — no per-request manifest needed
     because neither individual request is mixed."""
@@ -168,7 +174,38 @@ def test_heterogeneous_batch_image_only_and_video_only():
     assert torch.equal(out[:, 0], expected)
 
 
-def test_mixed_request_alongside_ordered_one_still_rejects_unordered():
+def test_raw_inputs_route_through_encode_multimodal_by_groups() -> None:
+    """Regression: ``Qwen3VLModelBase.forward``'s raw image/video branch
+    routes through ``encode_multimodal_by_groups`` (via
+    ``get_multimodal_embeddings``). Confirms the callable used there
+    accepts a bare ``multimodal_params`` list and returns the same
+    prompt-order embedding tensor that direct invocation produces."""
+    stub = _StubModel()
+    params = [
+        _param(
+            image={
+                "pixel_values": _patches(11, 3),
+                "image_grid_thw": torch.tensor([[1, 1, 3]]),
+            },
+            video={
+                "pixel_values_videos": _patches(22, 5),
+                "video_grid_thw": torch.tensor([[1, 1, 5]]),
+            },
+            order=[
+                {"modality": "video", "index": 0},
+                {"modality": "image", "index": 0},
+            ],
+            lengths=[5, 3],
+        ),
+    ]
+    # Same callable signature `get_multimodal_embeddings` invokes at
+    # `modeling_qwen3vl.py`'s raw-MM branch.
+    out = stub.encode_multimodal_by_groups(params)
+    expected = torch.tensor([22.0] * 5 + [11.0] * 3)
+    assert torch.equal(out[:, 0], expected)
+
+
+def test_mixed_request_alongside_ordered_one_still_rejects_unordered() -> None:
     """Even when a sibling request carries a valid manifest, a mixed request
     without its own manifest must still raise — validation is per-request."""
     with pytest.raises(ValueError, match="mm_item_order"):

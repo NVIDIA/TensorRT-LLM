@@ -20,8 +20,8 @@ import functools
 import math
 import os
 from dataclasses import dataclass
-from typing import (Any, Callable, Dict, List, Optional, Tuple, TypedDict,
-                    Union, cast)
+from typing import (Any, Callable, Dict, Iterable, List, Optional, Tuple,
+                    TypedDict, Union, cast)
 
 import torch
 import torch.nn.functional as F
@@ -305,7 +305,7 @@ def _reorder_embeds_by_manifest(
 
 def _synthesize_single_modality_manifest(
     mp: MultimodalParams,
-    modalities,
+    modalities: Iterable[str],
 ) -> List[Dict[str, Union[str, int]]]:
     """Trivial manifest for requests with only one modality present."""
     flat = mp.multimodal_data.get("multimodal_embedding_lengths") or []
