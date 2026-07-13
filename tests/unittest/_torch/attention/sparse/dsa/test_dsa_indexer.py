@@ -3179,7 +3179,8 @@ def test_topk_indices_buffer_cuda_graph():
         enable_indexer_skip=True,
     )
     assert metadata.skip_indexer_for_gen_reqs, (
-        "test setup must hit the skip-indexer path (kv_len <= index_topk)")
+        "test setup must hit the skip-indexer path (kv_len <= index_topk)"
+    )
 
     metadata.is_cuda_graph = True
     metadata.cuda_graph_buffers = Buffers()
@@ -3206,6 +3207,8 @@ def test_topk_indices_buffer_cuda_graph():
     assert ptr1 == ptr2, (
         f"indexer topk-output buffer address changed across calls "
         f"({ptr1:#x} -> {ptr2:#x}); under CUDA-graph capture it must be a "
-        f"persistent reserved-arena buffer to avoid stale-pointer IMA")
+        f"persistent reserved-arena buffer to avoid stale-pointer IMA"
+    )
     assert "indexer_topk_out_buffer" in metadata.cuda_graph_buffers.buffers, (
-        "indexer topk-output buffer must be drawn from the cuda_graph_buffers arena")
+        "indexer topk-output buffer must be drawn from the cuda_graph_buffers arena"
+    )
