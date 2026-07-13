@@ -331,18 +331,27 @@ class TRTLLMGenFusedMoE(MoE):
             self.create_weights()
         self.layer_idx = layer_idx
 
-        # Set TLLM_MOE_DISABLE_SHARED_EXPERT_FUSION=1 to disable fusing the
-        # shared experts into the routed-expert grouped GEMM.
-        fusion_disabled = os.environ.get(
-            "TLLM_MOE_DISABLE_SHARED_EXPERT_FUSION", "0") == "1"
+        # Fusing the shared experts into the routed-expert grouped GEMM is opt-in:
+        # set TLLM_MOE_ENABLE_SHARED_EXPERT_FUSION=1 to enable it. The benefit is
+        # workload-dependent (small decode batches gain, large prefill chunks lose the
+        # aux-stream overlap of the unfused path), and the fused path additionally
+        # restricts tactics to tileN>=32 to avoid a small-tile dynB kernel defect.
+        fusion_enabled = os.environ.get("TLLM_MOE_ENABLE_SHARED_EXPERT_FUSION",
+                                        "0") == "1"
         # Only the trtllm op backend implements fused shared experts
         on_trtllm_backend = isinstance(self.op_backend, TRTLLMOpBackend)
-        if not fusion_disabled and on_trtllm_backend and model_config.mapping.dp_size == 1 and self.quant_config.layer_quant_mode.has_fp8_block_scales(
+        if fusion_enabled and on_trtllm_backend and model_config.mapping.dp_size == 1 and self.quant_config.layer_quant_mode.has_fp8_block_scales(
         ):
             # Not all models that use this backend define shared experts (e.g. non-DeepSeek
             # MoEs), so fall back to 0 when the config has no `n_shared_experts`.
             self.num_fused_shared_expert = getattr(
                 model_config.pretrained_config, "n_shared_experts", 0) or 0
+            if self.num_fused_shared_expert > 0:
+                logger.info_once(
+                    f"Shared-expert fusion enabled: folding "
+                    f"{self.num_fused_shared_expert} shared expert(s) into the "
+                    f"routed-expert grouped GEMM.",
+                    key="trtllm_gen_shared_expert_fusion")
 
     def _to_trtllm_gen_activation_type(self,
                                        activation_type: ActivationType) -> int:

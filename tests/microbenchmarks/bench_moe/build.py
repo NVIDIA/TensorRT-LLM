@@ -197,6 +197,13 @@ def _build_moe_module(
     else:
         os.environ.pop("ENABLE_PERFECT_ROUTER", None)
 
+    # Shared-expert fusion is opt-in in TRTLLMGenFusedMoE; "fused" cases must
+    # enable it explicitly or they would silently benchmark the unfused path.
+    if model.n_shared_experts > 0 and model.shared_expert_mode != "unfused":
+        os.environ["TLLM_MOE_ENABLE_SHARED_EXPERT_FUSION"] = "1"
+    else:
+        os.environ.pop("TLLM_MOE_ENABLE_SHARED_EXPERT_FUSION", None)
+
     mc = model.to_moe_model_config()
     swiglu_gptoss_style = model.swiglu_gptoss_style
 

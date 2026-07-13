@@ -1918,6 +1918,10 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         # TP from env TRTLLM_VALIDATE_TP (default 4). Run from tests/integration/defs:
         #   LLM_MODELS_ROOT=/llm-models TRTLLM_VALIDATE_TP=4 python3 -m pytest -s -v \
         #     accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_fp8_block_scales_fusion_tmp
+        # Shared-expert fusion is opt-in; this test exists to exercise the fused
+        # path, so enable it by default (spawned TP workers inherit the env).
+        # Export TLLM_MOE_ENABLE_SHARED_EXPERT_FUSION=0 to A/B the unfused path.
+        os.environ.setdefault("TLLM_MOE_ENABLE_SHARED_EXPERT_FUSION", "1")
         tp = int(os.environ.get("TRTLLM_VALIDATE_TP", "4"))
         # TRTLLM_VALIDATE_BACKEND: TRTLLM (fusion) | DEEPGEMM (stock, no fusion).
         # DEEPGEMM is used to prove the TP>1 tunable_allreduce hang is independent
