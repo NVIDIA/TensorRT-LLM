@@ -6,7 +6,7 @@
   "negative_prompt": "",
   "height": 704,
   "width": 1280,
-  "num_frames": 9,
+  "num_frames": 121,
   "num_inference_steps": 3,
   "guidance_scale": 1.0,
   "seed": 42,

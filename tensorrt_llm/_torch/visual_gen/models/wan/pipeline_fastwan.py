@@ -22,6 +22,7 @@ FastWan shares Wan 2.2 TI2V-5B's architecture exactly — only the weights
 import time
 from typing import List, Optional, Union
 
+import PIL.Image
 import torch
 from diffusers.utils.torch_utils import randn_tensor
 
@@ -41,7 +42,7 @@ from .pipeline_wan import WanPipeline
     ],
     doc="FastWan 2.2 distilled (DMD) — 3-step Wan 2.2 TI2V-5B text-to-video.",
 )
-class FastWanPipeline(WanPipeline):
+class WanDMDPipeline(WanPipeline):
     """Wan 2.2 TI2V-5B with the DMD 3-step sampling loop.
 
     DMD inference (Distribution Matching Distillation): at each step the model
@@ -58,7 +59,7 @@ class FastWanPipeline(WanPipeline):
     def default_generation_params(self):
         return get_fastwan_default_params()
 
-    @nvtx_range("FastWanPipeline.forward")
+    @nvtx_range("WanDMDPipeline.forward")
     @torch.no_grad()
     def forward(
         self,
@@ -70,13 +71,14 @@ class FastWanPipeline(WanPipeline):
         num_frames: int = 121,
         num_inference_steps: Optional[int] = None,
         guidance_scale: Optional[float] = None,
+        guidance_scale_2: Optional[float] = None,
+        boundary_ratio: Optional[float] = None,
         max_sequence_length: int = 512,
-        image=None,
-        **kwargs,
+        image: Optional[Union[PIL.Image.Image, torch.Tensor, str]] = None,
     ):
         # FastWan is text-to-video only for now; CFG-free, so guidance_scale and
-        # the Wan-2.2 two-stage knobs (guidance_scale_2/boundary_ratio in kwargs)
-        # are accepted for infer() compatibility but unused.
+        # the Wan-2.2 two-stage knobs (guidance_scale_2/boundary_ratio) are
+        # accepted for infer()/base-class compatibility but unused.
         if image is not None:
             raise NotImplementedError(
                 "FastWan currently supports text-to-video only (no image conditioning)."
@@ -92,9 +94,11 @@ class FastWanPipeline(WanPipeline):
         generator = torch.Generator(device=self.device).manual_seed(seed)
         self.validate_resolution(height, width, num_frames)
 
-        # FastWan is CFG-free: a single forward per step, negative prompt unused.
-        logger.info("Encoding prompt (FastWan is CFG-free; negative prompt unused)...")
-        prompt_embeds, _ = self._encode_prompt(prompt, negative_prompt or "", max_sequence_length)
+        if negative_prompt:
+            raise ValueError(
+                "FastWan is CFG-free and does not support negative prompts."
+            )
+        prompt_embeds, _ = self._encode_prompt(prompt, "", max_sequence_length)
 
         if self._fixed_latent is not None:
             latents = self._fixed_latent.to(device=self.device, dtype=self.dtype)
@@ -102,7 +106,7 @@ class FastWanPipeline(WanPipeline):
             latents = self._prepare_latents(batch_size, height, width, num_frames, generator)
 
         timer.mark_denoise_start()
-        latents = self._dmd_denoise(latents, prompt_embeds, generator)
+        latents = self._denoise(latents, prompt_embeds, generator)
         timer.mark_post_start()
 
         logger.info("Decoding video...")
@@ -116,8 +120,8 @@ class FastWanPipeline(WanPipeline):
         frame_rate = self.default_generation_params.get("frame_rate", 24.0)
         return timer.fill(PipelineOutput(video=video, frame_rate=frame_rate))
 
-    @nvtx_range("FastWanPipeline._dmd_denoise", color="blue")
-    def _dmd_denoise(self, latents, prompt_embeds, generator):
+    @nvtx_range("WanDMDPipeline._denoise", color="blue")
+    def _denoise(self, latents, prompt_embeds, generator):
         """3-step DMD loop: predict x0, then re-noise with fresh noise.
 
         The per-step sigma reduces to ``sigma = t / NUM_TRAIN_TIMESTEPS`` because
@@ -129,25 +133,24 @@ class FastWanPipeline(WanPipeline):
         num_steps = len(timesteps)
         _, ph, pw = self.transformer.config.patch_size
 
-        # DMD math runs in fp32 for stability; the transformer runs in its
-        # native (bf16) dtype.
-        latents = latents.to(torch.float32)
+        # The DMD ops are linear (mul/sub/add), so they run in the transformer's
+        # native (bf16) dtype to match the FastVideo reference; no fp32 needed.
+        latents = latents.to(self.dtype)
+        # Patch grid dimensions are fixed for the entire denoising loop.
+        nf = latents.shape[2]
+        nh = latents.shape[3] // ph
+        nw = latents.shape[4] // pw
         start = time.time()
         for i, t in enumerate(timesteps):
-            # Per-patch 2-D timestep for Wan 2.2 TI2V-5B; for T2V every patch
-            # shares the same scalar t.
-            nf = latents.shape[2]
-            nh = latents.shape[3] // ph
-            nw = latents.shape[4] // pw
             t_tensor = torch.full(
                 (latents.shape[0], nf * nh * nw), float(t), device=latents.device
             )
 
             pred_noise = self.transformer(
-                hidden_states=latents.to(self.dtype),
+                hidden_states=latents,
                 timestep=t_tensor / self.NUM_TRAIN_TIMESTEPS,
                 encoder_hidden_states=prompt_embeds,
-            ).to(torch.float32)
+            )
 
             sigma = t / self.NUM_TRAIN_TIMESTEPS
             pred_video = latents - sigma * pred_noise  # clean-video estimate (x0)
@@ -156,7 +159,7 @@ class FastWanPipeline(WanPipeline):
                 sigma_next = timesteps[i + 1] / self.NUM_TRAIN_TIMESTEPS
                 noise = randn_tensor(
                     latents.shape, generator=generator,
-                    device=latents.device, dtype=torch.float32,
+                    device=latents.device, dtype=self.dtype,
                 )
                 latents = (1.0 - sigma_next) * pred_video + sigma_next * noise
             else:
@@ -167,4 +170,4 @@ class FastWanPipeline(WanPipeline):
 
         if self.rank == 0:
             logger.info(f"DMD denoising done in {time.time() - start:.2f}s")
-        return latents.to(self.dtype)
+        return latents

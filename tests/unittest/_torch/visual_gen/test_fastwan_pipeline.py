@@ -12,14 +12,18 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Pipeline-level tests for FastWanPipeline requiring a real checkpoint.
+"""Pipeline-level tests for WanDMDPipeline.
 
 TestFastWanComponentAccuracy
     Verifies that the text encoder and VAE decoder load correctly and produce
     numerically stable output. Reference tensors were generated once from this
     pipeline and committed to golden/component_accuracy/. Future runs compare
     against them to catch weight-loading bugs, quantization changes, or
-    refactors that silently shift component outputs.
+    refactors that silently shift component outputs. Requires a real checkpoint.
+
+TestFastWanImageNotSupported
+    Verifies FastWan raises NotImplementedError on image input (text-to-video
+    only for now). No checkpoint required.
 
 Run:
     DIFFUSION_MODEL_PATH_FASTWAN=/path/to/checkpoint \\
@@ -38,8 +42,9 @@ os.environ["TLLM_DISABLE_MPI"] = "1"
 import pytest
 import torch
 
+from tensorrt_llm._torch.visual_gen.models.wan.pipeline_fastwan import WanDMDPipeline
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
-from tensorrt_llm.visual_gen.args import TorchCompileConfig, VisualGenArgs
+from tensorrt_llm.visual_gen.args import AttentionConfig, TorchCompileConfig, VisualGenArgs
 
 
 @pytest.fixture(autouse=True, scope="module")
@@ -116,3 +121,78 @@ class TestFastWanComponentAccuracy:
             f"(shape {output_cpu.shape})"
         )
 
+
+class TestFastWanImageNotSupported:
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="nvtx_range decorator needs CUDA")
+    def test_image_raises_not_implemented(self):
+        pipe = object.__new__(WanDMDPipeline)
+        with pytest.raises(NotImplementedError):
+            pipe.forward(prompt="test", seed=0, image=object())
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+class TestFastWanForward:
+    """Run the full forward() pass and validate the output video shape."""
+
+    def test_single_prompt_backward_compat(self, fastwan_pipeline):
+        """Single prompt returns (B, T, H, W, C) with B=1."""
+        result = fastwan_pipeline.forward(
+            prompt="A red fox walking through snow",
+            height=704,
+            width=1280,
+            num_frames=9,
+            seed=42,
+        )
+        assert result.video.dim() == 5, f"Expected 5D (B,T,H,W,C), got {result.video.dim()}D"
+        B, _T, H, W, C = result.video.shape
+        assert B == 1 and H == 704 and W == 1280 and C == 3
+
+    def test_batch_prompt_shape(self, fastwan_pipeline):
+        """List of prompts returns (B, T, H, W, C) with B=2."""
+        result = fastwan_pipeline.forward(
+            prompt=["A red fox walking through snow", "A cat on a roof"],
+            height=704,
+            width=1280,
+            num_frames=9,
+            seed=42,
+        )
+        assert result.video.dim() == 5, f"Expected 5D (B,T,H,W,C), got {result.video.dim()}D"
+        B, _T, H, W, C = result.video.shape
+        assert B == 2 and H == 704 and W == 1280 and C == 3
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+class TestFastWanFP8:
+    """Confirm FP8 + TRTLLM attention runs end-to-end on the FastWan checkpoint.
+
+    FastWan inherits FP8 support from WanPipeline.post_load_weights(), but that
+    method is only tested against the TI2V-5B checkpoint in CI. This test confirms
+    it also works with the FastWan distilled weights and the DMD denoising loop.
+    """
+
+    def test_fp8_trtllm(self):
+        if not os.path.exists(FASTWAN_PATH):
+            pytest.skip(f"Checkpoint not found: {FASTWAN_PATH}")
+        args = VisualGenArgs(
+            model=FASTWAN_PATH,
+            torch_compile_config=TorchCompileConfig(enable=False),
+            quant_config={"quant_algo": "FP8", "dynamic": True},
+            attention_config=AttentionConfig(backend="TRTLLM"),
+        )
+        pipeline = PipelineLoader(args).load(skip_warmup=True)
+        try:
+            with torch.no_grad():
+                result = pipeline.forward(
+                    prompt="A red fox walking through snow",
+                    height=704,
+                    width=1280,
+                    num_frames=9,
+                    seed=42,
+                )
+            assert result.video.dim() == 5
+            B, _T, H, W, C = result.video.shape
+            assert B == 1 and H == 704 and W == 1280 and C == 3
+        finally:
+            del pipeline
+            gc.collect()
+            torch.cuda.empty_cache()

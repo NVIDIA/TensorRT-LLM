@@ -12,9 +12,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""DMD denoising loop math tests for FastWanPipeline.
+"""DMD denoising loop math tests for WanDMDPipeline.
 
-Tests _dmd_denoise in isolation: no checkpoint, no text encoder, no VAE.
+Tests _denoise in isolation: no checkpoint, no text encoder, no VAE.
 A stub pipeline (object.__new__) with a fake transformer supplies controlled
 inputs so the DMD formulas can be verified numerically.
 
@@ -32,7 +32,7 @@ os.environ["TLLM_DISABLE_MPI"] = "1"
 import pytest
 import torch
 
-from tensorrt_llm._torch.visual_gen.models.wan.pipeline_fastwan import FastWanPipeline
+from tensorrt_llm._torch.visual_gen.models.wan.pipeline_fastwan import WanDMDPipeline
 
 
 @pytest.fixture(autouse=True, scope="module")
@@ -55,8 +55,8 @@ _NUM_PATCHES = 3 * 2 * 2  # 12
 # With pred_noise=0 and noise=0, re-noising reduces to:
 #   latents_{i+1} = (1 - sigma_next) * latents_i
 # So final output = (1-sigma_1)*(1-sigma_2)*initial  =  0.243*0.478*initial  ≈  0.1162
-_SIGMA_1 = FastWanPipeline.DMD_TIMESTEPS[1] / FastWanPipeline.NUM_TRAIN_TIMESTEPS  # 0.757
-_SIGMA_2 = FastWanPipeline.DMD_TIMESTEPS[2] / FastWanPipeline.NUM_TRAIN_TIMESTEPS  # 0.522
+_SIGMA_1 = WanDMDPipeline.DMD_TIMESTEPS[1] / WanDMDPipeline.NUM_TRAIN_TIMESTEPS  # 0.757
+_SIGMA_2 = WanDMDPipeline.DMD_TIMESTEPS[2] / WanDMDPipeline.NUM_TRAIN_TIMESTEPS  # 0.522
 _ZERO_NOISE_EXPECTED_SCALE = (1.0 - _SIGMA_1) * (1.0 - _SIGMA_2)                  # ≈ 0.1162
 
 _RANDN_PATH = "tensorrt_llm._torch.visual_gen.models.wan.pipeline_fastwan.randn_tensor"
@@ -96,14 +96,14 @@ class _RecordingTransformer:
 
 
 def _make_stub(transformer):
-    """FastWanPipeline shell — no weights, no __init__.
+    """WanDMDPipeline shell — no weights, no __init__.
 
     We bypass nn.Module.__setattr__ by writing directly into __dict__.
     - transformer: accessed via __dict__, so no nn.Module submodule registration
     - pipeline_config: WanPipeline.dtype reads self.pipeline_config.torch_dtype
     - rank: read-only property on BasePipeline — returns 0 when MPI is disabled
     """
-    pipe = object.__new__(FastWanPipeline)
+    pipe = object.__new__(WanDMDPipeline)
     pipe.__dict__["transformer"] = transformer
     pipe.__dict__["pipeline_config"] = type(
         "_Config", (), {"torch_dtype": torch.bfloat16}
@@ -117,8 +117,8 @@ def _run(pipe, latents, zero_noise=False):
     if zero_noise:
         zeros = torch.zeros(_LATENT_SHAPE, device=latents.device, dtype=torch.float32)
         with mock.patch(_RANDN_PATH, return_value=zeros):
-            return pipe._dmd_denoise(latents, embeds, gen)
-    return pipe._dmd_denoise(latents, embeds, gen)
+            return pipe._denoise(latents, embeds, gen)
+    return pipe._denoise(latents, embeds, gen)
 
 
 # ---------------------------------------------------------------------------
@@ -134,7 +134,7 @@ class TestDMDTimesteps:
         recorder = _RecordingTransformer()
         _run(_make_stub(recorder), torch.ones(_LATENT_SHAPE, device="cuda", dtype=torch.bfloat16))
 
-        expected = [t / 1000.0 for t in FastWanPipeline.DMD_TIMESTEPS]
+        expected = [t / 1000.0 for t in WanDMDPipeline.DMD_TIMESTEPS]
         for i, (captured, exp) in enumerate(zip(recorder.captured_timesteps, expected)):
             assert torch.allclose(captured, torch.full_like(captured, exp)), (
                 f"Step {i}: expected sigma {exp}, got {captured[0, 0].item():.6f}"
@@ -195,6 +195,6 @@ class TestDMDMath:
         latents = torch.ones(_LATENT_SHAPE, device="cuda", dtype=torch.bfloat16)
 
         with mock.patch(_RANDN_PATH, side_effect=_counting):
-            pipe._dmd_denoise(latents, embeds, gen)
+            pipe._denoise(latents, embeds, gen)
 
         assert call_count[0] == 2, f"Expected 2 randn_tensor calls, got {call_count[0]}"
