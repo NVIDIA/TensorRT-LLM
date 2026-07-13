@@ -961,7 +961,13 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
                     f"Selected server {server} is no longer available")
             await server_states[server].increment_load(request)
             self._req_routing_table[key] = server
-            self._apply_routed_blocks_on_route(server, block_hashes, hash_algo)
+            try:
+                self._apply_routed_blocks_on_route(server, block_hashes,
+                                                   hash_algo)
+            except Exception:
+                self._req_routing_table.pop(key, None)
+                await server_states[server].decrement_load(request)
+                raise
         return server, {
             "block_hashes": block_hashes,
             "hash_algo": hash_algo,

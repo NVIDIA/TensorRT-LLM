@@ -1777,13 +1777,21 @@ def _launch_disagg_fleet(disagg_cfg, config_file, metadata_server_config_file,
         for p in fleet:
             if p.poll() is None:
                 p.terminate()
+        deadline = time.monotonic() + 10
         for p in fleet:
             try:
-                p.wait(timeout=10)
+                p.wait(timeout=max(0, deadline - time.monotonic()))
             except Exception:
                 p.kill()
+                p.wait()
+
+    def _handle_signal(signum, _frame):
+        _cleanup()
+        raise SystemExit(128 + signum)
 
     atexit.register(_cleanup)
+    signal.signal(signal.SIGTERM, _handle_signal)
+    signal.signal(signal.SIGINT, _handle_signal)
     return fleet
 
 
@@ -1800,17 +1808,22 @@ def _serve_disagg_fleet(disagg_cfg, config_file, metadata_server_config_file,
                                  server_start_timeout, num_workers,
                                  coordinator_url)
     # Block until any worker exits; a nonzero exit from any worker is a failure.
-    while True:
-        for i, p in enumerate(fleet):
-            rc = p.poll()
-            if rc is not None:
-                if rc != 0:
-                    raise RuntimeError(
-                        f"Disagg fleet worker {i} (pid={p.pid}) exited with "
-                        f"code {rc}")
-                # A clean exit of one worker ends the fleet.
-                return
-        time.sleep(1)
+    try:
+        while True:
+            for i, p in enumerate(fleet):
+                rc = p.poll()
+                if rc is not None:
+                    if rc != 0:
+                        raise RuntimeError(
+                            f"Disagg fleet worker {i} (pid={p.pid}) exited with "
+                            f"code {rc}")
+                    # A clean exit of one worker ends the fleet.
+                    return
+            time.sleep(1)
+    finally:
+        for process in fleet:
+            if process.poll() is None:
+                process.terminate()
 
 
 def _serve_coordinator_and_fleet(disagg_cfg, config_file,
@@ -1891,7 +1904,12 @@ def _serve_coordinator_and_fleet(disagg_cfg, config_file,
         for task in done:
             task.result()
 
-    asyncio.run(_serve_and_monitor())
+    try:
+        asyncio.run(_serve_and_monitor())
+    finally:
+        for process in fleet:
+            if process.poll() is None:
+                process.terminate()
 
 
 def _init_fleet_worker_process():

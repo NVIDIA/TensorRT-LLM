@@ -35,7 +35,7 @@ from tensorrt_llm.serve.responses_utils import (
     UCompletionResponseOrGenerator,
     done_generator,
 )
-from tensorrt_llm.serve.router import KvCacheAwareRouter, Router
+from tensorrt_llm.serve.router import CoordinatorDelegatingRouter, KvCacheAwareRouter, Router
 
 # Finish reasons for which a GEN handoff is still pending; any other reason means
 # the CTX request already completed and the disagg KV-cache handoff was never set up.
@@ -122,30 +122,41 @@ class OpenAIDisaggregatedService(OpenAIService):
             hooks.on_req_begin(request)
         # empty server means client decides which server to use
         ctx_server = None
+        disagg_request_id = await self._coordinator.get_disagg_request_id()
+        if self.conditional_disagg_config:
+            if request.disaggregated_params is None:
+                self._get_gen_request(request, None, disagg_request_id)
+            else:
+                request.disaggregated_params.disagg_request_id = disagg_request_id
+                request.disaggregated_params.ctx_request_id = disagg_request_id
         # reserve a gen_server if conditional disagg is needed
         gen_server, need_ctx = await self._check_conditional_disagg(request)
         need_ctx = need_ctx and not await self._check_gen_only_disagg(request)
         ctx_response = None
         gen_req = request
-        disagg_request_id = await self._coordinator.get_disagg_request_id()
         if need_ctx:
-            # Mark ctx-dispatch start: arrival->here is the pre-ctx wait in the
-            # orchestrator/fleet (accept queue + event loop + pipeline).
-            if hooks:
-                hooks.on_ctx_dispatch(request)
-            ctx_req = self._get_ctx_request(request, disagg_request_id)
-            # ctx generator is empty
-            ctx_server, _ = await self._ctx_router.get_next_server(
-                ctx_req, exclude_server=gen_server
-            )
-            ctx_response = await self._ctx_client.send_request(
-                ctx_req, server=ctx_server, hooks=hooks
-            )
-            await self._verify_ctx_response(ctx_response)
-            ctx_response_disagg_params = ctx_response.choices[0].disaggregated_params
-            if ctx_response_disagg_params.disagg_request_id is not None:
-                disagg_request_id = ctx_response_disagg_params.disagg_request_id
-            gen_req = self._get_gen_request(request, ctx_response, disagg_request_id)
+            try:
+                # Mark ctx-dispatch start: arrival->here is the pre-ctx wait in the
+                # orchestrator/fleet (accept queue + event loop + pipeline).
+                if hooks:
+                    hooks.on_ctx_dispatch(request)
+                ctx_req = self._get_ctx_request(request, disagg_request_id)
+                # ctx generator is empty
+                ctx_server, _ = await self._ctx_router.get_next_server(
+                    ctx_req, exclude_server=gen_server
+                )
+                ctx_response = await self._ctx_client.send_request(
+                    ctx_req, server=ctx_server, hooks=hooks
+                )
+                await self._verify_ctx_response(ctx_response)
+                ctx_response_disagg_params = ctx_response.choices[0].disaggregated_params
+                if ctx_response_disagg_params.disagg_request_id is not None:
+                    disagg_request_id = ctx_response_disagg_params.disagg_request_id
+                gen_req = self._get_gen_request(request, ctx_response, disagg_request_id)
+            except Exception:
+                if gen_server:
+                    await self._gen_router.finish_request(request, success=False)
+                raise
         else:
             # When need_ctx=False the gen server handles full generation and
             # must not see a stale request_type="context_only".
@@ -166,6 +177,8 @@ class OpenAIDisaggregatedService(OpenAIService):
             )
             return gen_response
         else:
+            if gen_server:
+                await self._gen_router.finish_request(request)
             if request.stream:
                 # ctx client will never return a generator when streaming is requested
                 # make up for this by returning a done generator
@@ -266,7 +279,15 @@ class OpenAIDisaggregatedService(OpenAIService):
 
     async def _check_conditional_disagg(self, request: UCompletionRequest) -> bool:
         if self.conditional_disagg_config:
-            assert isinstance(self._gen_router, KvCacheAwareRouter)
+            local_gen_router = (
+                self._gen_router._local
+                if isinstance(self._gen_router, CoordinatorDelegatingRouter)
+                else self._gen_router
+            )
+            if not isinstance(local_gen_router, KvCacheAwareRouter):
+                raise TypeError(
+                    "conditional disaggregation requires a KV-cache-aware generation router"
+                )
             # Query kv cache status and select a best gen_server.
             # The server is reserved for generation request
             gen_server, info = await self._gen_router.get_next_server(request)

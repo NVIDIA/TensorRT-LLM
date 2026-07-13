@@ -84,15 +84,21 @@ class CoordinatorServer:
             body = msgpack.unpackb(await raw_req.body(), raw=False)
         except Exception as e:
             return self._response({"error": f"invalid MessagePack body: {e}"}, status_code=400)
-        if not isinstance(body, dict) or "role" not in body or "routing_key" not in body:
+        if (
+            not isinstance(body, dict)
+            or "role" not in body
+            or "routing_key" not in body
+            or "req_id" not in body
+        ):
             return self._response(
-                {"error": "body must include 'role' and 'routing_key'"}, status_code=400
+                {"error": "body must include 'role', 'routing_key', and 'req_id'"},
+                status_code=400,
             )
         role = body["role"]
         if role not in ("context", "ctx", "generation", "gen"):
             return self._response({"error": f"invalid role: {role}"}, status_code=400)
-        req_id = body.get("req_id")
-        if req_id is not None and (not isinstance(req_id, int) or isinstance(req_id, bool)):
+        req_id = body["req_id"]
+        if not isinstance(req_id, int) or isinstance(req_id, bool):
             return self._response({"error": "req_id must be an integer"}, status_code=400)
         exclude_server = body.get("exclude_server")
         if exclude_server is not None and not isinstance(exclude_server, str):

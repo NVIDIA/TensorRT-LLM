@@ -189,9 +189,6 @@ class DisaggCoordinatorService(DisaggCoordinator):
     ) -> Tuple[str, dict, Optional[str]]:
         _t0 = time.monotonic()
         router = self._router_for_role(role)
-        if req_id is None:
-            # The coordinator owns IDs absent from generation requests.
-            req_id = get_global_disagg_request_id(self._config.node_id)
         result = await router.get_next_server_by_key(
             routing_key, req_id=req_id, exclude_server=exclude_server
         )
