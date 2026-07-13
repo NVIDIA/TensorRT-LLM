@@ -58,7 +58,6 @@ from .llm_request import ExecutorResponse, LlmRequestState
 from .mamba_cache_manager import (BaseMambaCacheManager,
                                   CppMambaHybridCacheManager,
                                   MixedMambaHybridCacheManager,
-                                  use_cpp_mamba_cache_manager,
                                   use_py_mamba_cache_manager)
 from .model_engine import PyTorchModelEngine
 from .py_executor import PyExecutor
@@ -82,7 +81,7 @@ def ceil_div(a: int, b: int) -> int:
 def _non_hybrid_kv_cache_manager_cls(config, kv_cache_config: KvCacheConfig):
     # Models with per-layer head_dim (e.g., Gemma4 hybrid attention)
     # require KVCacheManagerV2 for per-layer buffer sizes.
-    needs_v2 = (kv_cache_config.use_kv_cache_manager_v2
+    needs_v2 = (kv_cache_config.use_kv_cache_manager_v2 is True
                 or is_gemma4_hybrid(config))
     return KVCacheManagerV2 if needs_v2 else KVCacheManager
 
@@ -94,13 +93,13 @@ def get_kv_cache_manager_cls(
         cache_transceiver_config: Optional[CacheTransceiverConfig] = None):
     """Resolve the concrete KV cache manager class for ``model_config``.
 
-    For hybrid mamba models the choice between ``Mixed`` ( TRTLLM_USE_CPP_MAMBA / TRTLLM_USE_PY_MAMBA) and
-    ``Cpp`` (unified pool with block reuse) is made here. Callers that don't
-    care about disagg can omit ``is_disagg`` and get the unified-pool default.
+    For hybrid mamba models the choice between ``Mixed`` (TRTLLM_USE_PY_MAMBA)
+    and ``Cpp`` (unified pool with block reuse) is made here. Callers that
+    don't care about disagg can omit ``is_disagg`` and get the unified-pool
+    default.
 
     Env-var overrides (agg mode only — disagg picks its inner impl via
     ``cache_transceiver_config.transceiver_runtime``):
-      * ``TRTLLM_USE_CPP_MAMBA=1`` — Mixed manager with CppMambaCacheManager.
       * ``TRTLLM_USE_PY_MAMBA=1``  — Mixed manager with PythonMambaCacheManager.
     """
     config = model_config.pretrained_config
@@ -136,10 +135,6 @@ def get_kv_cache_manager_cls(
             return MixedMambaHybridCacheManager
         if kv_cache_config.enable_block_reuse:
             return CppMambaHybridCacheManager
-        if use_cpp_mamba_cache_manager():
-            logger.info(
-                "Using MixedMambaHybridCacheManager for hybrid mamba model")
-            return MixedMambaHybridCacheManager
         if (cache_transceiver_config is not None
                 and cache_transceiver_config.transceiver_runtime == "PYTHON"):
             logger.info("Python transceiver detected; using "
@@ -417,9 +412,9 @@ class KvCacheCreator:
                         f"Gemma4 hybrid attention requires KVCacheManagerV2, "
                         f"which is not yet supported with {incompat_str}. "
                         f"Disable these features to run Gemma4 hybrid models.")
-                # Plain V2 (user opt-in via ``use_kv_cache_manager_v2=True``):
-                # V2 was a preference, not a structural requirement, so we
-                # can safely fall back to V1.
+                # Plain V2 (explicitly enabled or selected by a model default):
+                # V2 was a preference, not a structural requirement, so we can
+                # safely fall back to V1.
                 logger.warning(
                     "KVCacheManagerV2 is not supported with %s. "
                     "Falling back to KVCacheManager.", incompat_str)
@@ -2436,7 +2431,6 @@ def create_torch_sampler_args(
     speculative_config: SpeculativeConfig,
     max_beam_width: int,
     disable_overlap_scheduler: bool,
-    disable_flashinfer_sampling: bool,
     enable_async_worker: bool,
     enable_speculative_beam_history_d2h: bool,
 ):
@@ -2452,7 +2446,6 @@ def create_torch_sampler_args(
         max_total_draft_tokens=max_total_draft_tokens,
         max_num_sequences=max_num_sequences,
         max_beam_width=max_beam_width,
-        disable_flashinfer_sampling=disable_flashinfer_sampling,
         disable_overlap_scheduler=disable_overlap_scheduler,
         enable_async_worker=enable_async_worker,
         enable_speculative_beam_history_d2h=enable_speculative_beam_history_d2h,
@@ -2471,7 +2464,6 @@ def instantiate_sampler(
     speculative_config: SpeculativeConfig,
     decoding_config: trtllm.DecodingConfig,
     kv_cache_config: KvCacheConfig,
-    disable_flashinfer_sampling: bool,
 ):
     enable_async_worker = (confidential_compute_enabled()
                            or llm_args.sampler_force_async_worker)
@@ -2483,7 +2475,6 @@ def instantiate_sampler(
         speculative_config=speculative_config,
         max_beam_width=max_beam_width,
         disable_overlap_scheduler=llm_args.disable_overlap_scheduler,
-        disable_flashinfer_sampling=disable_flashinfer_sampling,
         enable_async_worker=enable_async_worker,
         enable_speculative_beam_history_d2h=llm_args.
         enable_speculative_beam_history_d2h,

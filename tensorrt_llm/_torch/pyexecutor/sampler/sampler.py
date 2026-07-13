@@ -38,6 +38,7 @@ from typing import (
 import numpy as np
 import torch
 
+from tensorrt_llm._torch.flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from tensorrt_llm._torch.pyexecutor.make_decoding_batch_input_output import (
     MakeDecodingBatchInputOutput,
 )
@@ -87,11 +88,11 @@ from ..finish_reason import FinishedState
 from ..llm_request import LlmRequest, LlmRequestState, get_draft_token_length
 from ..resource_manager import ResourceManager, ResourceManagerType
 from ..scheduler import ScheduledRequests
-from .ops.interface import SamplerConfig, resolve_sampling_backend
 from .sampling_utils import (
     BEAM_SEARCH_PAD_TOKEN,
     GREEDY,
     BeamSearchMetadata,
+    FlashInferGroupedStrategySampler,
     GenericStrategyKeyType,
     Strategy,
     StrategyMetadata,
@@ -2321,7 +2322,6 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         max_beam_width: int
         max_total_draft_tokens: int
         disable_overlap_scheduler: bool = False
-        disable_flashinfer_sampling: bool = False
         enable_async_worker: bool = False
         enable_speculative_beam_history_d2h: bool = False
 
@@ -2345,13 +2345,15 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         self.LOGPROBS_SHAPE = (self.max_num_sequences, self.max_beam_width, self.max_tokens)
         self.TOPK_LOGPROBS_SHAPE = (self.max_num_sequences, self.max_tokens, self.max_topk_logprobs)
 
-        self._grouped_sampler_cls = resolve_sampling_backend(
-            is_cuda=True,
-            config=SamplerConfig(
-                # IS_FLASHINFER_AVAILABLE is checked inside resolve_sampling_backend.
-                use_flashinfer=not args.disable_flashinfer_sampling,
-            ),
-        )
+        # The Torch sampler hard-depends on flashinfer. Enforce it once here, at
+        # construction, so the check stays out of the CUDA-graph-captured
+        # sampling loop.
+        if not IS_FLASHINFER_AVAILABLE:
+            raise ImportError(
+                "flashinfer is not available, please install the version pinned "
+                "in requirements.txt."
+            )
+        self._grouped_sampler_cls = FlashInferGroupedStrategySampler
 
         # AutoDeploy build creates the sampler in inference mode,
         # which would disallow in-place mutating of new_tokens.
@@ -4598,7 +4600,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             sampled_indices_cuda = group_next_tokens_cuda.squeeze(1)
 
             # sampled_rank_cuda contains the 0-based rank, it will be corrected to 1-based in handle_logprobs
-            # NB: Computation of sampled rank could be lowered into GroupedStrategySampler, s.t., e.g., for
+            # NB: Computation of sampled rank could be lowered into FlashInferGroupedStrategySampler, s.t., e.g., for
             #     greedy sampling, logits management and log_softmax could be completely skipped (sampled rank
             #     computation is trivial in this case).
             sampled_rank_cuda = _Fusions.determine_sampled_rank(

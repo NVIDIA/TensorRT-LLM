@@ -19,7 +19,8 @@ from tensorrt_llm.llmapi.llm_args import (DecodingBaseConfig,
                                           ExecutorMemoryType,
                                           ModelExpressConfig,
                                           SparseAttentionConfig, TorchLlmArgs)
-from tensorrt_llm.llmapi.llm_utils import apply_model_defaults_to_llm_args
+from tensorrt_llm.llmapi.llm_utils import (_resolve_kv_cache_manager_v2_auto,
+                                           apply_model_defaults_to_llm_args)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.lora_helper import LoraConfig
 from tensorrt_llm.mapping import Mapping
@@ -369,8 +370,9 @@ class ModelLoader:
         model_cls = AutoModelForCausalLM._resolve_class(config)
 
         # model_cls is None when the architecture is unknown/unsupported.
+        model_defaults = {}
         if model_cls and hasattr(model_cls, 'get_model_defaults'):
-            model_defaults = model_cls.get_model_defaults(llm_args)
+            model_defaults = model_cls.get_model_defaults(llm_args) or {}
             if model_defaults:
                 applied_defaults = apply_model_defaults_to_llm_args(
                     llm_args, model_defaults)
@@ -378,6 +380,15 @@ class ModelLoader:
                     logger.info(
                         f"Applied model defaults for {model_cls.__name__}: {applied_defaults}"
                     )
+
+        use_kv_cache_manager_v2 = llm_args.kv_cache_config.use_kv_cache_manager_v2
+        _resolve_kv_cache_manager_v2_auto(llm_args, model_defaults)
+        if use_kv_cache_manager_v2 == "auto":
+            logger.info(
+                "Resolved use_kv_cache_manager_v2='auto' to %s for %s",
+                llm_args.kv_cache_config.use_kv_cache_manager_v2,
+                model_cls.__name__
+                if model_cls is not None else "unknown model")
 
         return llm_args
 

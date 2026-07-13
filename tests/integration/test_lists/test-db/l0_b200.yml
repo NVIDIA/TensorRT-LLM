@@ -15,6 +15,7 @@ l0_b200:
       backend: pytorch
   tests:
   # ------------- PyTorch tests ---------------
+  - unittest/others/test_kv_cache_transceiver.py::test_cpp_nixl_sync_transfer_stress
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8B::test_nvfp4
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8B::test_nvfp4_streaming[stream_interval_4]
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8B::test_nvfp4_streaming[stream_interval_64]
@@ -123,6 +124,10 @@ l0_b200:
   - unittest/_torch/modules/test_mla_helix.py
   - unittest/_torch/modules/test_fused_add_rms_norm_quant.py
   - unittest/_torch/modules/test_fused_activation_quant.py
+  - unittest/_torch/modules/fused_ops/test_rmsnorm_fp4_quant.py
+  - unittest/_torch/modules/fused_ops/test_gelu_tanh_mul_fp4_quant.py
+  - unittest/_torch/modules/fused_ops/test_rmsnorm_residual_add.py
+  - unittest/_torch/modules/test_gemma4_fused_qkv_prep.py
   - unittest/_torch/modules/test_awq_quantization.py
   - unittest/_torch/modules/test_triton_linear.py
   - unittest/_torch/modules/test_group_rmn_norm.py
@@ -340,6 +345,7 @@ l0_b200:
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8B_Instruct_RocketKV::test_auto_dtype
   - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_1gpu[v1_kv_cache-True-True-trtllm-auto]
   - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_1gpu[v2_kv_cache-True-True-trtllm-auto]
+  - accuracy/test_llm_api_pytorch_multimodal.py::TestGemma4_26B_A4B::test_nvfp4
   - accuracy/test_llm_api_pytorch_multimodal.py::TestNanoV3Omni::test_auto_dtype[bf16]
   - accuracy/test_llm_api_pytorch_multimodal.py::TestNanoV3Omni::test_auto_dtype[nvfp4]
   # ------------- VisualGen single-GPU tests ---------------

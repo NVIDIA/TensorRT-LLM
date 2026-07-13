@@ -5469,7 +5469,9 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_device(4)
     @pytest.mark.parametrize("one_model", [True, False],
                              ids=["one_model", "two_model"])
-    def test_eagle3_vswa_reuse_4gpus(self, one_model, mocker):
+    @pytest.mark.parametrize("v2_kv_cache", [True, False],
+                             ids=["v2_kv_cache", "v1_kv_cache"])
+    def test_eagle3_vswa_reuse_4gpus(self, v2_kv_cache, one_model, mocker):
         MAX_OUTPUT_LEN = 128179
         MAX_INPUT_LEN = 32768
 
@@ -5480,11 +5482,17 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         mocker.patch.object(GPQADiamond, "MAX_OUTPUT_LEN", MAX_OUTPUT_LEN)
         mocker.patch.object(GPQADiamond, "MAX_INPUT_LEN", MAX_INPUT_LEN)
 
+        if v2_kv_cache and not one_model:
+            pytest.skip(
+                "KVCacheManagerV2 not compatible with two-model overlap scheduling"
+            )
+
         pytorch_config = dict(cuda_graph_config=CudaGraphConfig())
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.4,
                                         dtype="auto",
                                         enable_block_reuse=True,
-                                        max_attention_window=[128, 32768])
+                                        max_attention_window=[128, 32768],
+                                        use_kv_cache_manager_v2=v2_kv_cache)
 
         eagle_model_dir = f"{llm_models_root()}/gpt_oss/gpt-oss-120b-Eagle3"
         draft_len = 3
@@ -6837,8 +6845,8 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
         ],
     )
     def test_fp8_4gpus(self, attention_dp, use_cpp_mamba, monkeypatch):
-        monkeypatch.setenv("TRTLLM_USE_CPP_MAMBA",
-                           "1" if use_cpp_mamba else "0")
+        monkeypatch.setenv("TRTLLM_USE_PY_MAMBA",
+                           "1" if not use_cpp_mamba else "0")
 
         with LLM(
                 f"{llm_models_root()}/NVIDIA-Nemotron-3-Super-120B-A12B-FP8",

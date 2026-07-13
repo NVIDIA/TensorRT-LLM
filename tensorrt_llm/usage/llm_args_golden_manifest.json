@@ -151,6 +151,13 @@
     },
     {
       "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "cache_transceiver_config.kv_cache_bounce_size_mb"
+    },
+    {
+      "allowed_values": [],
       "annotation": "Optional[Annotated[int, Gt(gt=0)]]",
       "converter": "",
       "kind": "value",
@@ -305,13 +312,6 @@
       "annotation": "<class 'bool'>",
       "converter": "",
       "kind": "value",
-      "path": "disable_flashinfer_sampling"
-    },
-    {
-      "allowed_values": [],
-      "annotation": "<class 'bool'>",
-      "converter": "",
-      "kind": "value",
       "path": "disable_overlap_scheduler"
     },
     {
@@ -430,6 +430,13 @@
       "converter": "",
       "kind": "value",
       "path": "enable_lora"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "enable_low_latency_host_dispatch"
     },
     {
       "allowed_values": [],
@@ -753,8 +760,10 @@
       "path": "kv_cache_config.tokens_per_block"
     },
     {
-      "allowed_values": [],
-      "annotation": "<class 'bool'>",
+      "allowed_values": [
+        "auto"
+      ],
+      "annotation": "Union[bool, Literal['auto']]",
       "converter": "",
       "kind": "value",
       "path": "kv_cache_config.use_kv_cache_manager_v2"
@@ -954,6 +963,20 @@
       "converter": "",
       "kind": "value",
       "path": "moe_tensor_parallel_size"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "multimodal_config.encoder_side_stream_max_ahead"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[float]",
+      "converter": "",
+      "kind": "value",
+      "path": "multimodal_config.video_pruning_rate"
     },
     {
       "allowed_values": [
@@ -1972,13 +1995,6 @@
       "converter": "",
       "kind": "value",
       "path": "use_cute_dsl_blockscaling_mm"
-    },
-    {
-      "allowed_values": [],
-      "annotation": "Optional[float]",
-      "converter": "",
-      "kind": "value",
-      "path": "video_pruning_rate"
     }
   ],
   "TrtLlmArgs": [
@@ -2639,6 +2655,13 @@
     },
     {
       "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "cache_transceiver_config.kv_cache_bounce_size_mb"
+    },
+    {
+      "allowed_values": [],
       "annotation": "Optional[Annotated[int, Gt(gt=0)]]",
       "converter": "",
       "kind": "value",
@@ -3157,8 +3180,10 @@
       "path": "kv_cache_config.tokens_per_block"
     },
     {
-      "allowed_values": [],
-      "annotation": "<class 'bool'>",
+      "allowed_values": [
+        "auto"
+      ],
+      "annotation": "Union[bool, Literal['auto']]",
       "converter": "",
       "kind": "value",
       "path": "kv_cache_config.use_kv_cache_manager_v2"
@@ -3499,6 +3524,7 @@
         "W4A8_MXFP4_MXFP8",
         "W4A16_MXFP4",
         "MXFP8",
+        "W4A16_NVFP4",
         "NVFP4_AWQ",
         "NVFP4_ARC",
         "NO_QUANT"
@@ -3555,6 +3581,7 @@
         "W4A8_MXFP4_MXFP8",
         "W4A16_MXFP4",
         "MXFP8",
+        "W4A16_NVFP4",
         "NVFP4_AWQ",
         "NVFP4_ARC",
         "NO_QUANT"

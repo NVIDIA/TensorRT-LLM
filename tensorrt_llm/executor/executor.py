@@ -652,7 +652,7 @@ class GenerationExecutor(ABC):
             return GenerationExecutor._create_ipc_executor(
                 worker_kwargs,
                 model_world_size=model_world_size,
-                mpi_session=None,  # use mpi4py
+                mpi_session=mpi_session,
                 postproc_worker_config=postproc_worker_config,
                 is_llm_executor=is_llm_executor,
                 use_worker=False)
@@ -662,13 +662,17 @@ class GenerationExecutor(ABC):
             mpi_session = ProcessPoolExecutorSession(n_workers=1,
                                                      mp_context=ctx)
             # TODO: add rpc worker here
-            return GenerationExecutor._create_ipc_executor(
+            executor = GenerationExecutor._create_ipc_executor(
                 worker_kwargs,
                 model_world_size=model_world_size,
                 mpi_session=mpi_session,
                 postproc_worker_config=postproc_worker_config,
                 is_llm_executor=is_llm_executor,
                 use_worker=False)
+            # The session was created right here with no outer owner, so the
+            # proxy must shut it down despite it arriving as "external".
+            executor._owns_mpi_session = True
+            return executor
 
     def wait_first_completed(
         self, futures: List[GenerationResult]
