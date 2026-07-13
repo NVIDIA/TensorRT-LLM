@@ -533,7 +533,7 @@ class TestQwen3_5_35B_A3B_VL(LlmapiAccuracyTestHarness):
         stop="<|endoftext|>",
     )
 
-    kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6, enable_block_reuse=False)
+    kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.4, enable_block_reuse=False)
 
     def _make_llm(self, model_path: str) -> LLM:
         return LLM(
