@@ -1232,11 +1232,20 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 def makoOptsJson = transformMakoArgsToJson(["Mako options:"] + makoArgs)
                 String clusterNameForDurations = useClusterDurations ? partition.clusterName.replaceAll('[^a-zA-Z0-9]', '_') : null
                 def testListPathLocal = renderTestDB(pipeline, testList, llmSrcLocal, stageName, makoOptsJson, clusterNameForDurations)
+                // Copy the test list atomically. A retry that reuses a still-active job
+                // re-copies over ${testListPathNode} while that job may be reading it via
+                // --test-list; scp truncates-then-streams, so a concurrent read could see a
+                // partial list and silently run a subset. Stage to a temp path and mv into
+                // place (same-dir rename is atomic) so a reader sees the whole old or new file.
                 Utils.copyFileToRemoteHost(
                     pipeline,
                     remote,
                     testListPathLocal,
-                    testListPathNode
+                    "${testListPathNode}.tmp"
+                )
+                Utils.exec(
+                    pipeline,
+                    script: Utils.sshUserCmd(remote, "\"mv -f ${testListPathNode}.tmp ${testListPathNode}\"")
                 )
 
                 // Download and Merge waives.txt
