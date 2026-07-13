@@ -2,22 +2,22 @@
 # PRECEDENCE: last matching pattern wins — fallback first, module rules next, governance last.
 #
 #   Domain (in file order)   Handle
-#   fallback / untriaged     @NVIDIA/trt-llm-devs   (global `*`, declared FIRST; incl. deprecating TRT backend)
-#   Multi-GPU CI gate        @NVIDIA/trt-llm-multi-gpu-ci-review
-#   Infra                    @NVIDIA/trt-llm-infra-devs
-#   Agent config             @NVIDIA/trt-llm-agent-devs
-#   Docs / Examples          @NVIDIA/trt-llm-doc-devs
-#   QA                       @NVIDIA/trt-llm-qa
-#   Runtime                  @NVIDIA/trt-llm-runtime-devs
-#   Kernels - Misc           @NVIDIA/trt-llm-kernels-devs
-#   Models                   @NVIDIA/trt-llm-models-devs
-#   General Perf             @NVIDIA/trt-llm-perf-devs
-#   KV Cache Manager         @NVIDIA/trt-llm-kv-cache-manager-devs
-#   Disaggregated Serving    @NVIDIA/trt-llm-disagg-devs
-#   Attention                @NVIDIA/trt-llm-torch-attention-devs
-#   MoE                      @NVIDIA/trt-llm-moe-devs
-#   VisualGen (AIGV)         @NVIDIA/trt-llm-torch-visual-gen-devs
-#   Scaffolding              @WeiHaocheng
+#   Engineering basline/ fallback / untriaged     @NVIDIA/trt-llm-devs   (global `*`, declared FIRST; incl. deprecating TRT backend)
+#   Multi-GPU CI gate        			  @NVIDIA/trt-llm-multi-gpu-ci-review
+#   Infra                    			  @NVIDIA/trt-llm-infra-devs
+#   Agent config             			  @NVIDIA/trt-llm-agent-devs
+#   Docs / Examples          			  @NVIDIA/trt-llm-doc-owners
+#   QA                       			  @NVIDIA/trt-llm-qa
+#   Runtime                  			  @NVIDIA/trt-llm-runtime-devs
+#   Kernels - Misc           			  @NVIDIA/trt-llm-kernels-devs
+#   Models                   			  @NVIDIA/trt-llm-models-devs
+#   General Perf             			  @NVIDIA/trt-llm-perf-devs
+#   KV Cache Manager         			  @NVIDIA/trt-llm-kv-cache-manager-devs
+#   Disaggregated Serving    			  @NVIDIA/trt-llm-disagg-devs
+#   Attention                			  @NVIDIA/trt-llm-torch-attention-devs
+#   MoE                      			  @NVIDIA/trt-llm-moe-devs
+#   VisualGen (AIGV)         			  @NVIDIA/trt-llm-torch-visual-gen-devs
+#   Scaffolding              			  @WeiHaocheng
 #   Self-managed: AutoDeploy, Triton backend, Dynamo.  Governance/legal: unchanged.
 #
 # New handles (trt-llm-devs / doc / agent / runtime / models / perf / moe / kernels / multi-gpu-ci-review)
@@ -83,14 +83,14 @@
 /scripts/check_skill_naming_convention.py @NVIDIA/trt-llm-agent-devs
 
 # ===== DOCS / EXAMPLES =====
-/CODE_OF_CONDUCT.md @NVIDIA/trt-llm-doc-devs
-/CODING_GUIDELINES.md @NVIDIA/trt-llm-doc-devs
-/CONTAINER_SOURCE.md @NVIDIA/trt-llm-doc-devs
-/CONTRIBUTING.md @NVIDIA/trt-llm-doc-devs
-/README.md @NVIDIA/trt-llm-doc-devs
-/SECURITY.md @NVIDIA/trt-llm-doc-devs
-/docs @NVIDIA/trt-llm-doc-devs
-/examples @NVIDIA/trt-llm-doc-devs
+/CODE_OF_CONDUCT.md @NVIDIA/trt-llm-doc-owners
+/CODING_GUIDELINES.md @NVIDIA/trt-llm-doc-owners
+/CONTAINER_SOURCE.md @NVIDIA/trt-llm-doc-owners
+/CONTRIBUTING.md @NVIDIA/trt-llm-doc-owners
+/README.md @NVIDIA/trt-llm-doc-owners
+/SECURITY.md @NVIDIA/trt-llm-doc-owners
+/docs @NVIDIA/trt-llm-doc-owners
+/examples @NVIDIA/trt-llm-doc-owners
 
 # ===== QA =====
 /tests/integration/defs @NVIDIA/trt-llm-devs @NVIDIA/trt-llm-qa
@@ -165,13 +165,13 @@
 /tests/unittest/_torch/thop @NVIDIA/trt-llm-kernels-devs
 
 # ===== MODELS =====
-/docs/source/features/multi-modality.md @NVIDIA/trt-llm-models-devs @NVIDIA/trt-llm-doc-devs
-/examples/llm-api/quickstart_multimodal.py @NVIDIA/trt-llm-models-devs @NVIDIA/trt-llm-doc-devs
-/examples/models @NVIDIA/trt-llm-models-devs @NVIDIA/trt-llm-doc-devs
-/examples/serve/*multimodal* @NVIDIA/trt-llm-models-devs @NVIDIA/trt-llm-doc-devs
+/docs/source/features/multi-modality.md @NVIDIA/trt-llm-models-devs @NVIDIA/trt-llm-doc-owners
+/examples/llm-api/quickstart_multimodal.py @NVIDIA/trt-llm-models-devs @NVIDIA/trt-llm-doc-owners
+/examples/models @NVIDIA/trt-llm-models-devs @NVIDIA/trt-llm-doc-owners
+/examples/serve/*multimodal* @NVIDIA/trt-llm-models-devs @NVIDIA/trt-llm-doc-owners
 /scripts/build_cpp_examples.py @NVIDIA/trt-llm-models-devs
-/scripts/generate_config_database_tests.py @NVIDIA/trt-llm-models-devs @NVIDIA/trt-llm-doc-devs
-/scripts/generate_config_table.py @NVIDIA/trt-llm-models-devs @NVIDIA/trt-llm-doc-devs
+/scripts/generate_config_database_tests.py @NVIDIA/trt-llm-models-devs @NVIDIA/trt-llm-doc-owners
+/scripts/generate_config_table.py @NVIDIA/trt-llm-models-devs @NVIDIA/trt-llm-doc-owners
 /tensorrt_llm/_torch/models @NVIDIA/trt-llm-models-devs
 /tensorrt_llm/_torch/modules/mamba @NVIDIA/trt-llm-models-devs
 /tensorrt_llm/quantization @NVIDIA/trt-llm-models-devs
@@ -234,7 +234,7 @@
 /cpp/tensorrt_llm/batch_manager/*Transceiver* @NVIDIA/trt-llm-disagg-devs
 /cpp/tensorrt_llm/batch_manager/cacheTransferLayer* @NVIDIA/trt-llm-disagg-devs
 /cpp/tensorrt_llm/batch_manager/disagg* @NVIDIA/trt-llm-disagg-devs
-/examples/disaggregated @NVIDIA/trt-llm-disagg-devs @NVIDIA/trt-llm-doc-devs
+/examples/disaggregated @NVIDIA/trt-llm-disagg-devs @NVIDIA/trt-llm-doc-owners
 /examples/disaggregated/slurm/benchmark @NVIDIA/trt-llm-disagg-devs @NVIDIA/trt-llm-perf-devs
 /tensorrt_llm/_torch/disaggregation @NVIDIA/trt-llm-disagg-devs
 /tensorrt_llm/_torch/pyexecutor/kv_cache_transceiver.py @NVIDIA/trt-llm-disagg-devs
@@ -384,7 +384,7 @@
 /tests/unittest/scaffolding @WeiHaocheng
 
 # ===== SELF-MANAGED =====
-/docs/source/features/auto_deploy @NVIDIA/trt-llm-torch-autodeploy-devs @NVIDIA/trt-llm-doc-devs
+/docs/source/features/auto_deploy @NVIDIA/trt-llm-torch-autodeploy-devs @NVIDIA/trt-llm-doc-owners
 /examples/auto_deploy @NVIDIA/trt-llm-torch-autodeploy-devs
 /scripts/check_auto_deploy_imports.py @NVIDIA/trt-llm-torch-autodeploy-devs
 /scripts/check_model_registry.py @NVIDIA/trt-llm-torch-autodeploy-devs
