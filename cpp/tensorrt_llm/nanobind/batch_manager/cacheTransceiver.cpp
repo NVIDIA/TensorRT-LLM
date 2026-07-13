@@ -88,7 +88,8 @@ void tb::CacheTransceiverBindings::initBindings(nb::module_& m)
 {
     nb::class_<tb::BaseCacheTransceiver, PyCacheTransceiver>(m, "BaseCacheTransceiver")
         .def("respond_and_send_async", &BaseCacheTransceiver::respondAndSendAsync)
-        .def("request_and_receive_sync", &BaseCacheTransceiver::requestAndReceiveSync)
+        .def("request_and_receive_sync", &BaseCacheTransceiver::requestAndReceiveSync,
+            nb::call_guard<nb::gil_scoped_release>())
         .def("request_and_receive_async", &BaseCacheTransceiver::requestAndReceiveAsync)
         .def(
             "check_context_transfer_status",

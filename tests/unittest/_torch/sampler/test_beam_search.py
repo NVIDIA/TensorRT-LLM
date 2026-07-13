@@ -56,9 +56,7 @@ def fixed_params():
     return {"max_tokens": 8, "max_beam_width": 2}
 
 
-@pytest.fixture(scope="module",
-                params=[("TRTLLMSampler", False), ("TorchSampler", False),
-                        ("TorchSampler", True)])
+@pytest.fixture(scope="module", params=["TRTLLMSampler", "TorchSampler"])
 def sampling_information(request):
     return request.param
 
@@ -74,8 +72,7 @@ def model_kwargs(fixed_params, sampling_information) -> dict[str, Any]:
             weight_loader=DummyWeightLoader(),
             config_loader=DummyConfigLoader(),
         ),
-        sampler_type=sampling_information[0],
-        disable_flashinfer_sampling=sampling_information[1],
+        sampler_type=sampling_information,
     )
 
 
