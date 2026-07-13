@@ -39,6 +39,7 @@ requires_cuda = pytest.mark.skipif(
 
 _WAN_SUBPATH = "Wan2.1-T2V-1.3B-Diffusers"
 _FLUX_SUBPATH = "FLUX.1-dev"
+_QWEN_IMAGE_SUBPATH = "qwen-image"
 _LTX2_DIR = "LTX-2"
 _LTX2_WEIGHTS_FILE = "ltx-2-19b-dev.safetensors"
 _LTX2_TEXT_ENCODER_SUBPATH = "gemma-3-12b-it"
@@ -53,6 +54,22 @@ _DEFAULT_WAN_CHECKPOINT = os.path.join(_CI_DEFAULT_LLM_MODELS, _WAN_SUBPATH)
 _DEFAULT_FLUX_CHECKPOINT = os.path.join(_CI_DEFAULT_LLM_MODELS, _FLUX_SUBPATH)
 _DEFAULT_LTX2_CHECKPOINT = os.path.join(_CI_DEFAULT_LLM_MODELS, _LTX2_DIR, _LTX2_WEIGHTS_FILE)
 _DEFAULT_LTX2_TEXT_ENCODER = os.path.join(_CI_DEFAULT_LLM_MODELS, _LTX2_TEXT_ENCODER_SUBPATH)
+_DEFAULT_QWEN_IMAGE_CHECKPOINT = os.path.join(_CI_DEFAULT_LLM_MODELS, _QWEN_IMAGE_SUBPATH)
+
+
+def _resolve_qwen_image_checkpoint() -> str | None:
+    """Qwen-Image: explicit env, CI default tree, then LLM_MODELS_ROOT."""
+    explicit = os.environ.get("TRTLLM_CACHE_DIT_QWEN_IMAGE_CHECKPOINT", "").strip()
+    if explicit and os.path.isdir(explicit):
+        return os.path.abspath(explicit)
+    if os.path.isdir(_DEFAULT_QWEN_IMAGE_CHECKPOINT):
+        return os.path.abspath(_DEFAULT_QWEN_IMAGE_CHECKPOINT)
+    root = os.environ.get("LLM_MODELS_ROOT", "").strip()
+    if root:
+        cand = os.path.join(root, _QWEN_IMAGE_SUBPATH)
+        if os.path.isdir(cand):
+            return os.path.abspath(cand)
+    return None
 
 
 def _resolve_wan_checkpoint() -> str | None:
@@ -147,13 +164,20 @@ def _suppress_stdlib_logging_for_cache_dit():
 
 
 def _total_accumulated_cached_steps(stats: dict) -> int:
-    """Sum accumulated_cached_steps across CacheDiTAccelerator.get_stats() values."""
+    """Sum cached steps across CacheDiTAccelerator.get_stats() values.
+
+    Counts both accumulated_cached_steps (single-pass / batched-CFG models) and
+    cfg_accumulated_cached_steps (models with has_separate_cfg=True, e.g. Qwen-Image
+    which runs two separate forward passes per step for true CFG).
+    """
     total = 0
     for _key, val in stats.items():
         entries = val if isinstance(val, list) else [val]
         for entry in entries:
             if hasattr(entry, "accumulated_cached_steps"):
                 total += int(entry.accumulated_cached_steps)
+            if hasattr(entry, "cfg_accumulated_cached_steps"):
+                total += int(entry.cfg_accumulated_cached_steps)
     return total
 
 
@@ -399,6 +423,48 @@ class TestCacheDiTRealPipelineForward:
                         seed=0,
                         max_sequence_length=256,
                         frame_rate=24.0,
+                    )
+
+                stats = pipeline.cache_accelerator.get_stats()
+                cached = _total_accumulated_cached_steps(stats)
+                assert cached > 0, (
+                    "Expected Cache-DiT accumulated_cached_steps > 0 after forward; "
+                    f"stats={stats!r}. Try more steps or a looser residual_diff_threshold."
+                )
+            finally:
+                if pipeline is not None:
+                    self._teardown_cache_dit(pipeline)
+
+    def test_qwen_image_cache_dit_skips_blocks_after_forward(self):
+        ckpt = _resolve_qwen_image_checkpoint()
+        if ckpt is None:
+            pytest.skip(
+                "Qwen-Image not found: set TRTLLM_CACHE_DIT_QWEN_IMAGE_CHECKPOINT, "
+                f"install under {_DEFAULT_QWEN_IMAGE_CHECKPOINT}, "
+                f"or under $LLM_MODELS_ROOT/{_QWEN_IMAGE_SUBPATH}"
+            )
+
+        pipeline = None
+        with _suppress_stdlib_logging_for_cache_dit():
+            try:
+                pipeline = self._load_visual_gen_pipeline(ckpt)
+                name = pipeline.__class__.__name__
+                if name != "QwenImagePipeline":
+                    pytest.skip(f"Checkpoint resolved to {name}, not QwenImagePipeline")
+
+                assert pipeline.cache_accelerator is not None
+                assert pipeline.cache_accelerator.is_enabled()
+
+                with torch.inference_mode():
+                    pipeline.forward(
+                        prompt="cache dit validation",
+                        negative_prompt="",
+                        height=512,
+                        width=512,
+                        num_inference_steps=16,
+                        true_cfg_scale=4.0,
+                        seed=0,
+                        max_sequence_length=256,
                     )
 
                 stats = pipeline.cache_accelerator.get_stats()

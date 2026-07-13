@@ -18,12 +18,27 @@ from typing import List, Optional, Tuple, Union
 import numpy as np
 import torch
 
+from tensorrt_llm._torch.visual_gen.cache.teacache import (
+    ExtractorConfig,
+    register_extractor_from_config,
+)
 from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer, PipelineOutput
 from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent, register_pipeline
 from tensorrt_llm.logger import logger
 
 from .transformer_qwen_image import QwenImageTransformer2DModel
+
+# TeaCache polynomial coefficients for Qwen-Image.
+QWEN_IMAGE_TEACACHE_COEFFICIENTS = {
+    "qwen": [
+        -4.50000000e02,
+        2.80000000e02,
+        -4.50000000e01,
+        3.20000000e00,
+        -2.00000000e-02,
+    ],
+}
 
 # ``self.prompt_template_encode`` from diffusers.QwenImagePipeline.
 _PROMPT_TEMPLATE = (
@@ -233,6 +248,39 @@ class QwenImagePipeline(BasePipeline):
             # and FP32 scales keep the dtypes created by Linear.load_weights().
             self.transformer.to_inference_dtype().eval()
         self._target_dtype = self.pipeline_config.torch_dtype
+
+    @staticmethod
+    def _compute_qwen_image_timestep_embedding(module, hidden_states=None, timestep=None, **kwargs):
+        """Compute modulated timestep embedding for TeaCache distance calculation.
+
+        Mirrors the first three steps of QwenImageTransformer2DModel.forward():
+        project image tokens → cast dtype → compute time_text_embed (temb).
+        """
+        hidden_states = module.img_in(hidden_states)
+        timestep = timestep.to(hidden_states.dtype)
+        return module.time_text_embed(timestep, hidden_states)
+
+    def post_load_weights(self) -> None:
+        super().post_load_weights()
+        if self.transformer is not None:
+            register_extractor_from_config(
+                ExtractorConfig(
+                    model_class_name="QwenImageTransformer2DModel",
+                    timestep_embed_fn=self._compute_qwen_image_timestep_embedding,
+                    forward_params=[
+                        "hidden_states",
+                        "encoder_hidden_states",
+                        "encoder_hidden_states_mask",
+                        "timestep",
+                        "img_shapes",
+                        "txt_seq_lens",
+                        "return_dict",
+                    ],
+                    return_dict_default=False,
+                )
+            )
+            self._apply_teacache_coefficients(QWEN_IMAGE_TEACACHE_COEFFICIENTS)
+            self._setup_cache_acceleration()
 
     # ------------------------------------------------------------------
     # Prompt encoding (Qwen2.5-VL chat template).
@@ -486,8 +534,19 @@ class QwenImagePipeline(BasePipeline):
         # Denoise loop.
         timer.mark_denoise_start()
         logger.info("Denoising (%d steps)...", len(timesteps))
+
+        cache_acc = getattr(self, "cache_accelerator", None)
+
+        # Reset cache state for this generation (TeaCache / Cache-DiT).
+        if cache_acc is not None and cache_acc.is_enabled():
+            cache_acc.refresh(len(timesteps))
+
         for i, t in enumerate(timesteps):
             timestep = t.expand(latents.shape[0]).to(latents.dtype)
+
+            # Conditional (positive) branch.
+            if cache_acc is not None:
+                self.transformer._cache_branch = None
             noise_pred = self.transformer(
                 hidden_states=latents,
                 timestep=timestep / 1000,
@@ -498,6 +557,9 @@ class QwenImagePipeline(BasePipeline):
             )[0]
 
             if do_true_cfg:
+                # Unconditional (negative) branch — separate cache state.
+                if cache_acc is not None:
+                    self.transformer._cache_branch = "uncond"
                 neg_noise_pred = self.transformer(
                     hidden_states=latents,
                     timestep=timestep / 1000,
@@ -506,6 +568,8 @@ class QwenImagePipeline(BasePipeline):
                     img_shapes=img_shapes,
                     return_dict=False,
                 )[0]
+                if cache_acc is not None:
+                    self.transformer._cache_branch = None
                 comb = neg_noise_pred + true_cfg_scale * (noise_pred - neg_noise_pred)
                 cond_norm = torch.norm(noise_pred, dim=-1, keepdim=True)
                 noise_norm = torch.norm(comb, dim=-1, keepdim=True)
@@ -515,6 +579,17 @@ class QwenImagePipeline(BasePipeline):
             latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
             if latents.dtype != latents_dtype:
                 latents = latents.to(latents_dtype)
+
+        if getattr(self, "rank", 0) == 0:
+            if cache_acc is not None and cache_acc.is_enabled():
+                stats = cache_acc.get_stats()
+                if stats and "hit_rate" in stats:
+                    logger.info(
+                        "TeaCache: %.1f%% hit rate (%d/%d steps)",
+                        stats["hit_rate"] * 100,
+                        stats["cached"],
+                        stats["total"],
+                    )
 
         timer.mark_post_start()
         logger.info("Decoding...")
