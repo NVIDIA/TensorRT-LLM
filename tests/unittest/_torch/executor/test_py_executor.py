@@ -1165,10 +1165,8 @@ _STATE_DISAGG_GENERATION_TRANS_IN_PROGRESS = "_disagg_trans_sentinel"
 # The sentinel mocks must expose the real state ints: the pad predicate
 # compares state_value against the scheduler window bounds.
 _SENTINEL_STATE_VALUES = {
-    _STATE_DISAGG_GENERATION_INIT:
-    LlmRequestState.DISAGG_GENERATION_INIT.value,
-    _STATE_DISAGG_GENERATION_TRANS_IN_PROGRESS:
-    LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS.value,
+    _STATE_DISAGG_GENERATION_INIT: LlmRequestState.DISAGG_GENERATION_INIT.value,
+    _STATE_DISAGG_GENERATION_TRANS_IN_PROGRESS: LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS.value,
 }
 
 
@@ -1186,8 +1184,7 @@ def _make_adp_request(
     req.state_value = (
         state.value
         if isinstance(state, LlmRequestState)
-        else _SENTINEL_STATE_VALUES.get(
-            state, LlmRequestState.GENERATION_IN_PROGRESS.value)
+        else _SENTINEL_STATE_VALUES.get(state, LlmRequestState.GENERATION_IN_PROGRESS.value)
     )
     req.py_request_id = request_id
     req.is_child = is_child
@@ -1357,9 +1354,7 @@ def test_pad_dummy_added_when_only_wait_scheduler_requests_disagg():
     # schedules batch=0 and must receive a pad dummy — the left-boundary
     # mirror of the TO_COMPLETE case above.
     stub = _StubADPExecutor()
-    stub.active_requests = [
-        _make_adp_request(LlmRequestState.DISAGG_CONTEXT_WAIT_SCHEDULER)
-    ]
+    stub.active_requests = [_make_adp_request(LlmRequestState.DISAGG_CONTEXT_WAIT_SCHEDULER)]
     stub.expected_num_active_requests = 2
 
     _run_pad(stub)

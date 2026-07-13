@@ -5262,8 +5262,7 @@ class PyExecutor:
         to_complete_value = LlmRequestState.GENERATION_TO_COMPLETE.value
 
         return sum(1 for req in self.active_requests
-                   if context_init_value <= req.state_value <
-                   to_complete_value)
+                   if context_init_value <= req.state_value < to_complete_value)
 
     def _should_skip_dummy_for_benchmark_disagg(
             self, num_schedulable_requests: int) -> bool:
