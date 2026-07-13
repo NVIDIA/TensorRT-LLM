@@ -2672,6 +2672,55 @@ class PrometheusMetricsConfig(StrictBaseModel):
         return v
 
 
+class SelfBenchmarkConfig(StrictBaseModel):
+    """Configuration for startup self-benchmarking."""
+
+    mode: Literal["prefill", "decode", "agg"] = Field(
+        default="agg",
+        description=
+        "Self-benchmark mode. 'prefill' sweeps input sequence lengths, "
+        "'decode' sweeps decode context lengths and batch sizes, and 'agg' "
+        "runs both sweeps.",
+        status="prototype")
+
+    prefill_isl_granularity: PositiveInt = Field(
+        default=16,
+        description=
+        "Number of input sequence length sample points in the prefill sweep.",
+        status="prototype")
+
+    prefill_kv_read_granularity: PositiveInt = Field(
+        default=4,
+        description=
+        "Number of block-aligned KV-read sample points per input sequence "
+        "length in the prefill sweep.",
+        status="prototype")
+
+    decode_context_granularity: PositiveInt = Field(
+        default=6,
+        description=
+        "Number of context length sample points in the decode sweep.",
+        status="prototype")
+
+    decode_batch_granularity: PositiveInt = Field(
+        default=6,
+        description=
+        "Number of batch size sample points for each decode context length.",
+        status="prototype")
+
+    warmup_iterations: NonNegativeInt = Field(
+        default=5,
+        description=
+        "Number of synthetic warmup iterations to run before collecting "
+        "self-benchmark results.",
+        status="prototype")
+
+    output_path: str = Field(
+        default="/tmp/trtllm_self_benchmark.json",
+        description="Path to write self-benchmark results JSON.",
+        status="prototype")
+
+
 class RayPlacementConfig(StrictBaseModel):
     """Configuration for Ray GPU workers placement.
     Currently, this config is only used with AsyncLLM for RL scenarios.
@@ -4964,6 +5013,15 @@ class TorchLlmArgs(BaseLlmArgs):
         "one-time warning.",
         status="prototype")
 
+    self_benchmark_config: Optional[SelfBenchmarkConfig] = Field(
+        default=None,
+        description=
+        "Configuration for startup self-benchmarking. When set, the PyTorch "
+        "executor runs synthetic prefill and/or decode benchmark points before "
+        "serving normal requests and writes the collected iteration metrics to "
+        "the configured JSON output path.",
+        status="prototype")
+
     enable_iter_perf_stats: bool = Field(
         default=False,
         description="Enable iteration performance statistics.",
@@ -5405,6 +5463,58 @@ class TorchLlmArgs(BaseLlmArgs):
                 "aggregated workloads; disabling it because "
                 "cache_transceiver_config is configured.")
             self.enable_early_first_token_response = False
+        return self
+
+    @model_validator(mode="after")
+    def validate_self_benchmark_config(self) -> 'TorchLlmArgs':
+        if self.self_benchmark_config is None:
+            return self
+        if self.encode_only or self.mm_encoder_only:
+            raise ValueError(
+                "self_benchmark_config is only supported for decoder generation "
+                "workloads. Disable encode_only/mm_encoder_only to use "
+                "startup self-benchmarking.")
+        if self.enable_attention_dp:
+            raise ValueError(
+                "self_benchmark_config is not supported with attention data "
+                "parallelism yet. Disable enable_attention_dp to use startup "
+                "self-benchmarking.")
+        # Self-benchmark injection is per-rank deterministic and relies on every
+        # rank building an identical forward batch each iteration. Pure tensor
+        # parallelism preserves that invariant (active_requests / waiting_queue
+        # are mirrored across TP ranks and per-rank KV budgets are equal), so
+        # tensor_parallel_size > 1 is allowed. Pipeline/context/expert/data
+        # parallelism break the per-rank lockstep (uneven pipeline stages,
+        # partitioned context, asymmetric expert/DP routing) and are rejected
+        # until those paths are validated.
+        parallel = self.parallel_config
+        if parallel.pp_size > 1:
+            raise ValueError(
+                "self_benchmark_config is not supported with pipeline "
+                "parallelism yet (pipeline_parallel_size > 1). Only pure tensor "
+                "parallelism is supported.")
+        if parallel.cp_size > 1:
+            raise ValueError(
+                "self_benchmark_config is not supported with context "
+                "parallelism yet (cp_size > 1). Only pure tensor parallelism is "
+                "supported.")
+        if parallel.enable_attention_dp:
+            raise ValueError(
+                "self_benchmark_config is not supported with data/attention "
+                "parallelism yet. Only pure tensor parallelism is supported.")
+        if parallel.moe_ep_size > 1 or parallel.moe_cluster_size > 1:
+            raise ValueError(
+                "self_benchmark_config is not supported with expert "
+                "parallelism yet (moe_ep_size/moe_cluster_size > 1). Only pure "
+                "tensor parallelism is supported.")
+        # Any remaining world_size > 1 must be pure TP (tp_size == world_size).
+        if parallel.world_size != parallel.tp_size:
+            raise ValueError(
+                "self_benchmark_config only supports pure tensor parallelism; "
+                f"got world_size={parallel.world_size} with "
+                f"tp_size={parallel.tp_size}. Disable other forms of "
+                "parallelism to use startup self-benchmarking.")
+        self.enable_iter_perf_stats = True
         return self
 
     @model_validator(mode="after")

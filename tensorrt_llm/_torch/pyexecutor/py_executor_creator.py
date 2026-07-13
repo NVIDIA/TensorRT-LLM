@@ -959,6 +959,14 @@ def create_py_executor(
             if estimating_kv_cache else ExecutorMemoryType.EXTRA_RESOURCES):
         # run gc.collect() to free memory of the previous py_executor, avoid cudaFree overlap with cuda graph capture
         gc.collect()
+        if (estimating_kv_cache and getattr(llm_args, "self_benchmark_config",
+                                            None) is not None):
+            # The temporary KV-estimation executor disables iter stats, so
+            # self-benchmark points cannot observe completion there.
+            logger.debug(
+                "Skipping self-benchmark for temporary KV-cache estimation "
+                "executor")
+
         py_executor = create_py_executor_instance(
             dist=dist,
             resources=resources,
@@ -984,6 +992,7 @@ def create_py_executor(
             cache_transceiver_config=cache_transceiver_config,
             virtual_memory_pools=vm_pools if not estimating_kv_cache else None,
             execution_stream=execution_stream,
+            enable_self_benchmark=not estimating_kv_cache,
         )
 
         # Originally, peft_cache_config might be mutated inside

@@ -1,13 +1,14 @@
 import dataclasses
 import datetime
 import functools
+import json
 import os
 import threading
 import time
 import traceback
 from contextlib import contextmanager
 from enum import IntEnum
-from queue import Queue
+from queue import Empty, Queue
 from typing import (TYPE_CHECKING, Callable, Dict, Iterable, List, Optional,
                     Tuple, Union)
 
@@ -86,6 +87,7 @@ from .scheduler import (RequestScheduler, ScheduledRequests,
                         SerializableSchedulerOutput, WaitingQueue,
                         create_waiting_queue)
 from .scheduler.adp_router import ADPRouter
+from .self_benchmark import SelfBenchmark
 
 if TYPE_CHECKING:
     from ray.actor import ActorHandle
@@ -502,6 +504,12 @@ class PyExecutor:
     # 1024 in-flight micro batches can avoid synchronization in most cases and keep host memory usage low.
     MIN_ASYNC_MICRO_BATCH_NUM = 1024
 
+    def _create_self_benchmark(self, enabled: bool) -> Optional[SelfBenchmark]:
+        if (not enabled or getattr(self.llm_args, "self_benchmark_config", None)
+                is None):
+            return None
+        return SelfBenchmark(self)
+
     def __init__(
             self,
             resource_manager,
@@ -513,6 +521,7 @@ class PyExecutor:
             drafter: Optional[Drafter] = None,
             disable_overlap_scheduler: bool = False,
             enable_early_first_token_response: bool = False,
+            enable_self_benchmark: bool = True,
             max_input_len: int = 0x7fffffff,
             max_batch_size: int = 8,
             max_beam_width: int = 1,
@@ -875,6 +884,7 @@ class PyExecutor:
         # Waiting queue for requests that have been fetched but not yet scheduled
         self.waiting_queue: WaitingQueue = create_waiting_queue(
             waiting_queue_policy)
+        self.self_benchmark = self._create_self_benchmark(enable_self_benchmark)
 
         self.control_request_barrier = threading.Event()
         self.control_action_done = threading.Event()
@@ -1775,7 +1785,8 @@ class PyExecutor:
 
     @staticmethod
     def _is_stats_dummy_request(req) -> bool:
-        return bool(getattr(req, "is_dummy", False))
+        return bool(getattr(req, "is_dummy", False)) and not bool(
+            getattr(req, "is_self_benchmark_request", False))
 
     def _collect_scheduled_batch_stats(
             self, scheduled_batch: ScheduledRequests) -> ScheduledBatchStats:
@@ -2303,6 +2314,21 @@ class PyExecutor:
                                         batch_state.scheduled_requests,
                                         micro_batch_id,
                                         batch_state.scheduled_batch_stats)
+        if self.self_benchmark is not None and self.self_benchmark.active:
+            stats_dict = json.loads(stats.to_json_str())
+            if host_step_time_ms is not None:
+                stats_dict["hostStepTimeMS"] = host_step_time_ms
+            if prev_device_step_time_ms is not None:
+                stats_dict["prevDeviceStepTimeMS"] = prev_device_step_time_ms
+            if gpu_forward_time_ms is not None:
+                stats_dict["gpuForwardTimeMS"] = gpu_forward_time_ms
+            is_overlap_like = (not self.disable_overlap_scheduler
+                               or self.dist.pp_size > 1)
+            stats_dict["schedulerMode"] = ("overlap" if is_overlap_like else
+                                           "non_overlap")
+            if self.self_benchmark.observe_iteration(
+                    batch_state.scheduled_requests, stats_dict):
+                return
         if self.enable_attention_dp:
             self._adp_iter_stats.queue(
                 stats,
@@ -4710,18 +4736,48 @@ class PyExecutor:
         else:
             timeout = datetime.timedelta(0)
 
-        # Fetch requests from rank 0
         new_requests = []
+        benchmark_active = (self.self_benchmark is not None
+                            and self.self_benchmark.active)
+        # Fetch requests from rank 0
         if self.dist.rank == 0:
+            queued_requests = []
             # Process accumulated requests that were queued during control request handling.
             if len(self.request_accumulated) != 0:
-                new_requests.extend(self.request_accumulated)
+                queued_requests.extend(self.request_accumulated)
                 self.request_accumulated.clear()
                 # Reset timeout to 0 to avoid hanging when no new requests are available
                 timeout = datetime.timedelta(0)
             with self.hang_detector.pause():
-                new_requests.extend(
-                    self.executor_request_queue.get_from_request_queue(timeout))
+                if benchmark_active:
+                    request_queue = (
+                        self.executor_request_queue.get_request_queue())
+                    while True:
+                        try:
+                            queued_requests.append(request_queue.get_nowait())
+                        except Empty:
+                            break
+                else:
+                    queued_requests.extend(
+                        self.executor_request_queue.get_from_request_queue(
+                            timeout))
+
+            if benchmark_active:
+                # During self-benchmarking, defer real user requests
+                # (accumulate them) and forward only control/special items.
+                # Synthetic benchmark PREFILL requests are NOT injected here:
+                # they are built per-rank in _fetch_and_activate_new_requests so
+                # every TP rank deterministically produces the same forward
+                # batch. Injecting them into rank 0's broadcast queue would
+                # double-inject on non-rank-0 ranks (once via broadcast, once
+                # locally) and desync the per-rank state machine.
+                for req_item in queued_requests:
+                    if req_item.is_normal_request:
+                        self.request_accumulated.append(req_item)
+                    else:
+                        new_requests.append(req_item)
+            else:
+                new_requests.extend(queued_requests)
 
         # Broadcast requests and handle Python objects. RequestBroadcaster probes
         # the request count first and can skip the heavy payload broadcast on
@@ -4920,6 +4976,22 @@ class PyExecutor:
         ]
 
         self.active_requests.extend(validated_requests)
+        if self.self_benchmark is not None and self.self_benchmark.active:
+            # Self-benchmark injection runs identically on EVERY TP rank here
+            # (this method is invoked per-rank by the main loops). Both prefill
+            # and decode requests are constructed locally and deterministically
+            # from the grid point index, so each rank advances the same state
+            # machine and produces the same forward batch in lockstep -- no
+            # per-iteration broadcast/collective is needed. Prefill is attempted
+            # first; make_prefill_requests returns [] when the next point is a
+            # decode point (and vice versa), so at most one path injects.
+            benchmark_requests = self.self_benchmark.make_prefill_requests(
+                self.active_requests, self.waiting_queue)
+            benchmark_requests.extend(
+                self.self_benchmark.make_decode_requests(
+                    self.active_requests, self.waiting_queue))
+            self.active_requests.extend(benchmark_requests)
+            validated_requests.extend(benchmark_requests)
         return validated_requests
 
     def _add_kv_cache_events(self):
@@ -6300,6 +6372,13 @@ class PyExecutor:
             req_id = request.py_request_id
             # no responses for dummy request, and finish it
             if request.is_attention_dp_dummy:
+                requests_to_terminate.append(request)
+                continue
+            if getattr(request, "is_self_benchmark_request", False):
+                self.perf_manager.append_step_metrics(
+                    request,
+                    self.iter_counter,
+                    batch_token_time=batch_token_time)
                 requests_to_terminate.append(request)
                 continue
 
