@@ -15,24 +15,10 @@
 """Per-model default generation parameters for Cosmos3 pipelines.
 
 Shared by the Cosmos3 OmniMoT text-to-video and image-to-video generation paths.
-
-Action generation
------------------
-``COSMOS3_DOMAIN_PRESETS`` lists training-aligned defaults per embodiment. When
-``domain_name`` (or a uniquely mapped ``domain_id``) is set, the pipeline fills
-omitted ``raw_action_dim``, ``action_chunk_size``, ``num_frames``,
-``action_resolution``, and ``frame_rate`` from the preset and logs a warning if
-explicit values differ. See Cosmos3 omni ``action_*.json`` inputs for reference
-configs (bridge, av, droid, libero, etc.).
 """
 
-from typing import Any, Dict, List, Optional, TypedDict
+from typing import Dict
 
-from tensorrt_llm._torch.visual_gen.models.cosmos3.action import (
-    COSMOS3_ACTION_RESOLUTIONS,
-    EMBODIMENT_TO_DOMAIN_ID,
-    normalize_action_resolution,
-)
 from tensorrt_llm._torch.visual_gen.pipeline import ExtraParamSchema
 
 # ---------------------------------------------------------------------------
@@ -55,7 +41,7 @@ COSMOS3_DEFAULT_CONDITION_VIDEO_KEEP = "first"
 # Fields merged by the executor for every request. Modality-specific values
 # (height/width/num_frames/steps/guidance) are declared with ``None`` so the
 # executor accepts explicit overrides; ``forward()`` resolves unset fields from
-# T2V/T2I/action context.
+# T2V/T2I context.
 COSMOS3_PIPELINE_DEFAULTS = {
     "height": None,
     "width": None,
@@ -76,232 +62,6 @@ COSMOS3_T2I_PARAMS = {
     "flow_shift": 3.0,
     "guidance_interval": (400.0, 1000.0),
 }
-
-COSMOS3_ACTION_PARAMS = {
-    "action_chunk_size": 16,
-    "num_frames": 17,
-    "num_inference_steps": 30,
-    "guidance_scale": 1.0,
-    "flow_shift": 5.0,
-    "frame_rate": 24.0,
-}
-
-
-class Cosmos3DomainPreset(TypedDict, total=False):
-    """Recommended action-generation settings for a trained embodiment."""
-
-    raw_action_dim: int
-    action_chunk_size: int
-    num_frames: int
-    action_resolution: int
-    frame_rate: float
-
-
-# Training-aligned defaults. Values mirror Cosmos3 omni action JSON examples where available.
-COSMOS3_DOMAIN_PRESETS: Dict[str, Cosmos3DomainPreset] = {
-    # WidowX bridge; 7-DOF arm + gripper in 10-D state.
-    "bridge_orig_lerobot": {
-        "raw_action_dim": 10,
-        "action_chunk_size": 16,
-        "num_frames": 17,
-        "action_resolution": 480,
-        "frame_rate": 5.0,
-    },
-    # Autonomous-vehicle steering/throttle; longer action horizon.
-    "av": {
-        "raw_action_dim": 9,
-        "action_chunk_size": 60,
-        "num_frames": 61,
-        "action_resolution": 480,
-        "frame_rate": 10.0,
-    },
-    # 6-DoF camera pose + shutter; matches AV-style horizon.
-    "camera_pose": {
-        "raw_action_dim": 9,
-        "action_chunk_size": 60,
-        "num_frames": 61,
-        "action_resolution": 480,
-        "frame_rate": 30.0,
-    },
-    # Franka single-arm tabletop; same domain_id as robomind-franka.
-    "droid_lerobot": {
-        "raw_action_dim": 10,
-        "action_chunk_size": 16,
-        "num_frames": 17,
-        "action_resolution": 480,
-        "frame_rate": 15.0,
-    },
-    # LIBERO sim single-arm; lower action resolution bucket.
-    "libero": {
-        "raw_action_dim": 10,
-        "action_chunk_size": 16,
-        "num_frames": 17,
-        "action_resolution": 256,
-        "frame_rate": 10.0,
-    },
-    # MANO hand pose; high-DOF hand articulation.
-    "hand_pose": {
-        "raw_action_dim": 57,
-        "action_chunk_size": 16,
-        "num_frames": 17,
-        "action_resolution": 480,
-        "frame_rate": 24.0,
-    },
-    # AgiBot humanoid; shared domain_id with agibot_gear_gripper*.
-    "agibotworld": {
-        "raw_action_dim": 29,
-        "action_chunk_size": 16,
-        "num_frames": 17,
-        "action_resolution": 480,
-        "frame_rate": 10.0,
-    },
-    # Google Robot (RT-1 / fractal) single-arm.
-    "fractal": {
-        "raw_action_dim": 10,
-        "action_chunk_size": 16,
-        "num_frames": 17,
-        "action_resolution": 480,
-        "frame_rate": 5.0,
-    },
-    # 2-D planar push task.
-    "pusht": {
-        "raw_action_dim": 2,
-        "action_chunk_size": 16,
-        "num_frames": 17,
-        "action_resolution": 256,
-        "frame_rate": 10.0,
-    },
-    # UMI handheld gripper setup.
-    "umi": {
-        "raw_action_dim": 10,
-        "action_chunk_size": 16,
-        "num_frames": 17,
-        "action_resolution": 480,
-        "frame_rate": 10.0,
-    },
-}
-
-# Map alias domain_name keys to a canonical preset entry.
-COSMOS3_DOMAIN_PRESET_ALIASES: Dict[str, str] = {
-    "robomind-franka": "droid_lerobot",
-    "robomind-franka-dual": "droid_lerobot",
-    "robomind-ur": "droid_lerobot",
-    "agibot_gear_gripper": "agibotworld",
-    "agibot_gear_gripper_ext": "agibotworld",
-    "galbot": "agibotworld",
-}
-
-
-def canonical_domain_preset_key(
-    domain_name: Any = None,
-    domain_id: Any = None,
-) -> Optional[str]:
-    if domain_name is not None and str(domain_name).strip():
-        key = str(domain_name).strip().lower()
-        key = COSMOS3_DOMAIN_PRESET_ALIASES.get(key, key)
-        if key in COSMOS3_DOMAIN_PRESETS:
-            return key
-        return None
-
-    if domain_id is None:
-        return None
-
-    resolved_id = int(domain_id)
-    if resolved_id == 0:
-        return None
-
-    candidates: List[str] = []
-    for name, mapped_id in EMBODIMENT_TO_DOMAIN_ID.items():
-        if mapped_id != resolved_id:
-            continue
-        canon = COSMOS3_DOMAIN_PRESET_ALIASES.get(name, name)
-        if canon in COSMOS3_DOMAIN_PRESETS and canon not in candidates:
-            candidates.append(canon)
-
-    if len(candidates) == 1:
-        return candidates[0]
-    return None
-
-
-def get_domain_preset(
-    domain_name: Any = None,
-    domain_id: Any = None,
-) -> Optional[Cosmos3DomainPreset]:
-    key = canonical_domain_preset_key(domain_name, domain_id)
-    if key is None:
-        return None
-    return COSMOS3_DOMAIN_PRESETS[key]
-
-
-def resolve_domain_action_config(
-    *,
-    domain_name: Any = None,
-    domain_id: Any = None,
-    raw_action_dim: Optional[int] = None,
-    action_chunk_size: Optional[int] = None,
-    action_resolution: Optional[int] = None,
-    frame_rate: Optional[float] = None,
-    action_fps: Optional[float] = None,
-    num_frames: Optional[int] = None,
-) -> Dict[str, Any]:
-    """Merge user action params with domain presets and generic fallbacks."""
-    preset_key = canonical_domain_preset_key(domain_name, domain_id)
-    preset = COSMOS3_DOMAIN_PRESETS.get(preset_key) if preset_key else None
-    warnings: List[str] = []
-
-    def _resolve_field(
-        field: str,
-        current: Any,
-        *,
-        fallback: Any = None,
-    ) -> Any:
-        recommended = preset.get(field) if preset else None
-        if current is not None:
-            if recommended is not None and current != recommended:
-                warnings.append(
-                    f"Cosmos3 {field}={current} differs from recommended "
-                    f"{recommended} for domain {preset_key!r}."
-                )
-            return current
-        if recommended is not None:
-            return recommended
-        return fallback
-
-    resolved_raw_action_dim = _resolve_field("raw_action_dim", raw_action_dim)
-    resolved_chunk = _resolve_field(
-        "action_chunk_size",
-        action_chunk_size,
-        fallback=COSMOS3_ACTION_PARAMS["action_chunk_size"],
-    )
-    resolved_resolution = normalize_action_resolution(
-        _resolve_field(
-            "action_resolution",
-            action_resolution,
-            fallback=480,
-        )
-    )
-    resolved_frame_rate = _resolve_field(
-        "frame_rate",
-        frame_rate,
-        fallback=COSMOS3_ACTION_PARAMS["frame_rate"],
-    )
-    resolved_num_frames = _resolve_field("num_frames", num_frames)
-    if resolved_num_frames is None:
-        resolved_num_frames = int(resolved_chunk) + 1
-    resolved_action_fps = (
-        float(action_fps) if action_fps is not None else float(resolved_frame_rate)
-    )
-
-    return {
-        "raw_action_dim": resolved_raw_action_dim,
-        "action_chunk_size": int(resolved_chunk),
-        "action_resolution": resolved_resolution,
-        "frame_rate": float(resolved_frame_rate),
-        "action_fps": resolved_action_fps,
-        "num_frames": int(resolved_num_frames),
-        "preset_key": preset_key,
-        "warnings": warnings,
-    }
 
 
 COSMOS3_EXTRA_SPECS: Dict[str, ExtraParamSchema] = {
@@ -335,62 +95,6 @@ COSMOS3_EXTRA_SPECS: Dict[str, ExtraParamSchema] = {
         default="video",
         description="Output modality: 'video' (T2V/I2V) or 'image' (text-to-image).",
     ),
-    "action_mode": ExtraParamSchema(
-        type="str",
-        default=None,
-        description="Action generation mode: policy, forward_dynamics, or inverse_dynamics.",
-    ),
-    "domain_name": ExtraParamSchema(
-        type="str",
-        default=None,
-        description=(
-            "Embodiment domain name for action generation (e.g. bridge_orig_lerobot, av). "
-            "When set, omitted raw_action_dim/action_chunk_size/action_resolution/frame_rate "
-            "are filled from COSMOS3_DOMAIN_PRESETS; mismatches are logged as warnings."
-        ),
-    ),
-    "domain_id": ExtraParamSchema(
-        type="int",
-        default=None,
-        description="Embodiment domain id for action generation.",
-    ),
-    "raw_action_dim": ExtraParamSchema(
-        type="int",
-        default=None,
-        description=(
-            "Raw action DOF for policy/inverse_dynamics (e.g. 10 bridge, 9 av, 29 agibot). "
-            "Inferred from domain_name preset when omitted."
-        ),
-    ),
-    "action_chunk_size": ExtraParamSchema(
-        type="int",
-        default=COSMOS3_ACTION_PARAMS["action_chunk_size"],
-        description=(
-            "Number of action tokens to generate (16 for most robots, 60 for av/camera_pose). "
-            "Inferred from domain_name preset when omitted."
-        ),
-    ),
-    "action": ExtraParamSchema(
-        type="list",
-        default=None,
-        description="Action trajectory [T, D] for forward_dynamics mode.",
-    ),
-    "action_resolution": ExtraParamSchema(
-        type="int",
-        default=480,
-        description=(
-            "Resolution bucket for action image sizing. Must be one of "
-            f"{list(COSMOS3_ACTION_RESOLUTIONS)}. Inferred from domain_name preset when omitted."
-        ),
-        range=(min(COSMOS3_ACTION_RESOLUTIONS), max(COSMOS3_ACTION_RESOLUTIONS)),
-    ),
-    "action_fps": ExtraParamSchema(
-        type="float",
-        default=None,
-        description=(
-            "Action-token temporal rate for mRoPE (Hz). Defaults to frame_rate when omitted."
-        ),
-    ),
     "condition_frame_indexes_vision": ExtraParamSchema(
         type="list",
         default=list(COSMOS3_DEFAULT_CONDITION_FRAME_INDEXES_VISION),
@@ -410,7 +114,7 @@ COSMOS3_EXTRA_SPECS: Dict[str, ExtraParamSchema] = {
         type="path_or_list",
         default=None,
         description=(
-            "Video input for video-to-video generation or inverse_dynamics: "
+            "Video input for video-to-video generation: "
             ".mp4/.avi file, frame directory, image path, or list of PIL "
             "images / frame paths."
         ),
