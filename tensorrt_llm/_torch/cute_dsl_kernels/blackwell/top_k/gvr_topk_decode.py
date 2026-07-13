@@ -1735,6 +1735,16 @@ class GvrTopKKernel:
                 cute.arch.barrier()
 
             range1 = bmax_r - bmin_r
+            # Overflow hardening (adversarial-review find, pre-existing):
+            # a candidate span > FLT_MAX (needs |v| ~ 1.7e38; fuzz-only for
+            # real logits) overflows range1 to +inf → inv1 = +0 → every
+            # candidate lands in bin 0 → thr = lo + 0*inf = NaN → all snap
+            # comparisons false, the walk never moves, and the whole row
+            # writes as padding. Clamp to FLT_MAX: the start threshold
+            # stays ORDERED (±inf is fine — snap's monotone walk rescues
+            # any ordered start; only NaN breaks it).
+            if range1 > cutlass.Float32(self.FLT_MAX):
+                range1 = cutlass.Float32(self.FLT_MAX)
             # inv1 = (kBins - 1 + 0.99) / range1  (range1 > 0 guaranteed by 1e-6 patch)
             inv1 = (cutlass.Float32(kBins - 1) + cutlass.Float32(0.99)) / range1
             binw1 = range1 / cutlass.Float32(kBins)
