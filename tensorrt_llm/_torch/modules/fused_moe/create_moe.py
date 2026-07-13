@@ -340,7 +340,7 @@ def create_moe_backend(
     if swiglu_limit_scalar is not None:
         assert moe_cls in [
             CutlassFusedMoE, TRTLLMGenFusedMoE, WideEPMoE, DeepGemmFusedMoE,
-            MegaMoEDeepGemm
+            MegaMoEDeepGemm, CuteDslFusedMoE
         ], f"swiglu_limit_scalar is not supported in {moe_cls.__name__}."
 
     if moe_cls == TRTLLMGenFusedMoE:
@@ -438,6 +438,7 @@ def create_moe_backend(
             weight_loading_mode=weight_loading_mode,
             apply_router_weight_on_input=apply_router_weight_on_input,
             layer_idx=layer_idx,
+            swiglu_limit_scalar=swiglu_limit_scalar,
             init_load_balancer=init_load_balancer,
             without_comm=without_comm,
             activation_type=activation_type,

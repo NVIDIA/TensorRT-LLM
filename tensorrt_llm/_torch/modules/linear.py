@@ -382,15 +382,16 @@ class LinearMethodBase(ABC):
             self.process_weights_after_loading(module)
 
     def transform_weights(self, module: Linear) -> None:
-        ...
+        return None
 
     def post_load_weights(self, module: Linear) -> None:
         self.transform_weights(module)
 
-    def load_weight_scales(self, weights: List[Dict], *args, **kwargs):
+    def load_weight_scales(self, weights: List[Dict], *args, **kwargs) -> None:
         """
         Load quantized weight scales from the checkpoint.
         """
+        return None
 
     @abstractmethod
     def load_weights_vanilla(self,
@@ -424,7 +425,7 @@ class LinearMethodBase(ABC):
         """
         raise NotImplementedError
 
-    def process_weights_after_loading(self, module: Linear):
+    def process_weights_after_loading(self, module: Linear) -> None:
         """
         Process quantization weights and scales after loading weights.
         """
@@ -438,23 +439,27 @@ class LinearMethodBase(ABC):
         else:
             raise ValueError(f'unsupported weight mode: {weight_mode}')
 
-    def process_weights_after_loading_vanilla(self, module: Linear):
+    def process_weights_after_loading_vanilla(self, module: Linear) -> None:
         """
         Process quantization weights and scales after loading weights for vanilla linear layer.
         """
+        return None
 
-    def process_weights_after_loading_fused_qkv_linear(self, module: Linear):
+    def process_weights_after_loading_fused_qkv_linear(self,
+                                                       module: Linear) -> None:
         """
         Process quantization weights and scales after loading weights for fused QKV linear layer.
         """
+        return None
 
     def process_weights_after_loading_fused_gate_up_linear(
-            self, module: Linear):
+            self, module: Linear) -> None:
         """
         Process quantization weights and scales after loading weights for fused gate up linear layer.
         """
+        return None
 
-    def pre_reload_weights(self, module: Linear):
+    def pre_reload_weights(self, module: Linear) -> None:
         """
         Pre-reload weights for the linear layer.
         """
@@ -1010,7 +1015,12 @@ class FP8RowwiseLinearMethod(UnquantizedLinearMethod):
             weight_scale = load_weight_shard(weights[0][scale_name],
                                              module.tp_size, module.tp_rank,
                                              module.tp_mode)
-            copy_weight(module.weight_scale, weight_scale)
+            # compressed-tensors stores per-channel weight scales as [out, 1];
+            # the weight_scale buffer is 1-D [out] (ModelOpt/DS recipes store
+            # it 1-D). Flatten so copy_ does not broadcast to [out, out].
+            assert weight_scale.dim() != 2 or weight_scale.shape[1] == 1, \
+                f"expected per-channel weight_scale [out] or [out, 1], got {tuple(weight_scale.shape)}"
+            copy_weight(module.weight_scale, weight_scale.reshape(-1))
         if "input_scale" in weights[0]:
             copy_weight(module.input_scale, weights[0]["input_scale"])
             module.inv_input_scale.data = 1.0 / module.input_scale
@@ -1037,8 +1047,11 @@ class FP8RowwiseLinearMethod(UnquantizedLinearMethod):
             if scale is not None:
                 shard_offset, shard_size = module.fused_weight_shard_indices_mapping[
                     shard_key]
-                copy_weight_shard(module.weight_scale, scale, shard_offset,
-                                  shard_size)
+                # per-channel scale is [out, 1] in compressed-tensors; flatten to 1-D
+                assert scale.dim() != 2 or scale.shape[1] == 1, \
+                    f"expected per-channel weight_scale [out] or [out, 1], got {tuple(scale.shape)}"
+                copy_weight_shard(module.weight_scale, scale.reshape(-1),
+                                  shard_offset, shard_size)
 
     def load_weights_fused_gate_up_linear(
             self,
@@ -1060,8 +1073,11 @@ class FP8RowwiseLinearMethod(UnquantizedLinearMethod):
             if scale is not None:
                 shard_offset, shard_size = module.fused_weight_shard_indices_mapping[
                     shard_key]
-                copy_weight_shard(module.weight_scale, scale, shard_offset,
-                                  shard_size)
+                # per-channel scale is [out, 1] in compressed-tensors; flatten to 1-D
+                assert scale.dim() != 2 or scale.shape[1] == 1, \
+                    f"expected per-channel weight_scale [out] or [out, 1], got {tuple(scale.shape)}"
+                copy_weight_shard(module.weight_scale, scale.reshape(-1),
+                                  shard_offset, shard_size)
 
 
 class FP8BlockScalesLinearMethod(UnquantizedLinearMethod):

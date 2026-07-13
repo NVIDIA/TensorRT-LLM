@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -76,8 +76,11 @@ TrtEncoderModel::TrtEncoderModel(runtime::ModelConfig const& modelConfig, WorldC
     // handling of maximizing utilization or pause/evict
     // TODO: finer control on encoder requests scheduling
     mCapacityScheduler = std::make_unique<tensorrt_llm::batch_manager::CapacityScheduler>(
-        getMaxBatchSize() * mNumMicroBatches, executorConfig.getSchedulerConfig().getCapacitySchedulerPolicy(), false,
-        false, LlmRequestState::kENCODER_INIT, LlmRequestState::kCONTEXT_INIT);
+        getMaxBatchSize() * mNumMicroBatches, executorConfig.getSchedulerConfig().getCapacitySchedulerPolicy(),
+        /*hasKvCacheManager=*/false, /*twoStepsLookAhead=*/false,
+        /*noScheduleUntilState=*/LlmRequestState::kENCODER_INIT,
+        /*noScheduleAfterState=*/LlmRequestState::kCONTEXT_INIT,
+        /*enablePrefixAwareScheduling=*/executorConfig.getSchedulerConfig().getEnablePrefixAwareScheduling());
 
     mMicroBatchScheduler = std::make_unique<tensorrt_llm::batch_manager::MicroBatchScheduler>(
         std::nullopt, mModelConfig.getMaxInputLen(), LlmRequestState::kENCODER_INIT, LlmRequestState::kCONTEXT_INIT);

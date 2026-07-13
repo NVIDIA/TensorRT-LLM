@@ -74,6 +74,13 @@ void sendBuffer(TransferSession& session, int deviceId, size_t localIdx,
     size_t bufferIdx = computeBufferIdx(localIdx, targetInfo);
     size_t size = outputBuffers[bufferIdx]->getSizeInBytes();
 
+    // Skip Helix CP ranks that own no blocks for this sequence (num_total_blocks < cp_size).
+    // The matching gen rank skips its receive, so no 0-byte transfer is posted on either side.
+    if (size == 0)
+    {
+        return;
+    }
+
     if (bufferIdx < bufferCoverTargetNum)
     {
         TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), " send connIdx: %ld bufferIdx: %ld size:%ld", connIdx,
@@ -686,6 +693,13 @@ void CacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& sess
         "outputBuffersPerWindow size: %ld,blockNum: %d , kvWindowSizes: %ld", outputBuffersPerWindow.size(), blockNum,
         kvWindowSizes.size());
     TLLM_CHECK(!outputBuffersPerWindow.empty());
+
+    // An "empty" Helix CP rank owns no KV blocks for this sequence (num_total_blocks < cp_size).
+    // There is nothing to receive; the sender (context, CP=1) skips the matching 0-byte transfer.
+    if (blockNum == 0)
+    {
+        return;
+    }
     if (outputBuffersPerWindow.size() > 1)
     {
         // We only support limited case for VSWA.
