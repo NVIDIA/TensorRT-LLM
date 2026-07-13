@@ -107,6 +107,14 @@ if __name__ == "__main__":
     parser.add_argument("--pp_size", type=int, default=1)
     parser.add_argument("--cp_size", type=int, default=1)
     parser.add_argument("--awq_block_size", type=int, default=128)
+    parser.add_argument(
+        "--smoothquant_alpha",
+        type=float,
+        default=None,
+        help=
+        "SmoothQuant migration strength (alpha) in [0, 1]; effective for int8_sq qformat only. "
+        "When unset, keeps the ModelOpt built-in behavior (alpha=1.0, or 0.5 for Gemma)."
+    )
     parser.add_argument("--kv_cache_dtype",
                         help="KV Cache dtype.",
                         default=None,
@@ -156,6 +164,17 @@ if __name__ == "__main__":
             )
             args.auto_quantize_bits = lower_bound
 
+    # smoothquant_alpha check
+    if args.smoothquant_alpha is not None:
+        if not 0.0 <= args.smoothquant_alpha <= 1.0:
+            parser.error(
+                f"--smoothquant_alpha must be in [0, 1], got {args.smoothquant_alpha}"
+            )
+        if args.qformat != "int8_sq" or args.auto_quantize_bits is not None:
+            print(
+                "Warning: --smoothquant_alpha only takes effect for the int8_sq "
+                "qformat without auto quantization; it will be ignored.")
+
     if args.model_dir is not None:
         quantize_and_export(
             model_dir=args.model_dir,
@@ -169,6 +188,7 @@ if __name__ == "__main__":
             batch_size=args.batch_size,
             calib_max_seq_length=args.calib_max_seq_length,
             awq_block_size=args.awq_block_size,
+            smoothquant_alpha=args.smoothquant_alpha,
             output_dir=args.output_dir,
             tp_size=args.tp_size,
             pp_size=args.pp_size,

@@ -31,6 +31,11 @@ python quantize.py --model_dir $MODEL_PATH --qformat int4_awq --awq_block_size 6
 # INT8 SQ with INT8 kv cache.
 python quantize.py --model_dir $MODEL_PATH --qformat int8_sq --kv_cache_dtype int8 --output_dir $OUTPUT_PATH
 
+# INT8 SQ with a custom SmoothQuant migration strength (alpha). The default alpha=1.0 migrates
+# all quantization difficulty to the weights and can regress accuracy on some models; values
+# around 0.5-0.85 often work better (see the SmoothQuant paper).
+python quantize.py --model_dir $MODEL_PATH --qformat int8_sq --kv_cache_dtype int8 --smoothquant_alpha 0.85 --output_dir $OUTPUT_PATH
+
 # Auto quantization(e.g. fp8 + int4_awq + w4a8_awq) using average weights bits 5
 python quantize.py --model_dir $MODEL_PATH  --autoq_format fp8,int4_awq,w4a8_awq  --output_dir $OUTPUT_PATH --auto_quantize_bits 5 --tp_size 2
 
