@@ -49,7 +49,7 @@ RUN --mount=type=bind,source=docker/common,target=/opt/docker/common \
     NCCL_VER=${NCCL_VER} CUBLAS_VER=${CUBLAS_VER} \
     TORCH_INSTALL_TYPE=${TORCH_INSTALL_TYPE} \
     bash /opt/docker/common/install.sh --base --cmake --ccache --cuda_toolkit \
-         --tensorrt --polygraphy --mpi4py --pytorch --opencv
+         --tensorrt --polygraphy --mpi4py --pytorch
 
 # Install constraints after install.sh so cleanup() doesn't delete the file mid-RUN
 COPY constraints.txt /tmp/constraints.txt

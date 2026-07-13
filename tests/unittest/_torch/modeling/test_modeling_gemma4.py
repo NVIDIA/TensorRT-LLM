@@ -23,38 +23,21 @@ import unittest
 import unittest.mock
 from copy import deepcopy
 
-import pytest
 import torch
-import transformers
-from packaging.version import Version
+from transformers import Gemma4Config, Gemma4TextConfig
 
-# Gemma4 requires transformers>=5.5.0 (native Gemma4 config/model classes).
-# Use a module-level pytestmark.skipif (not pytest.importorskip) so collection
-# still picks up the test cases when the version gate fires. importorskip
-# causes pytest to report "collected 0 items / 1 skipped" with exit code 5
-# ("no tests collected"), which the CI test_unittests_v2 wrapper rejects.
-# With pytestmark.skipif, pytest reports "N collected, N skipped, exit 0".
-_HAS_GEMMA4 = Version(transformers.__version__) >= Version("5.5.0")
-
-pytestmark = pytest.mark.skipif(
-    not _HAS_GEMMA4,
-    reason=(f"Gemma4 requires transformers>=5.5.0 (installed: {transformers.__version__})"),
+from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.models.checkpoints.hf.gemma4_weight_mapper import Gemma4HfWeightMapper
+from tensorrt_llm._torch.models.modeling_gemma4 import (
+    Gemma4Attention,
+    Gemma4DecoderLayer,
+    Gemma4ForCausalLM,
+    Gemma4MoE,
+    Gemma4MoeRoutingMethod,
+    Gemma4TextModel,
+    Gemma4TextScaledWordEmbedding,
 )
-
-if _HAS_GEMMA4:
-    from transformers import Gemma4Config, Gemma4TextConfig  # noqa: E402
-
-    from tensorrt_llm._torch.model_config import ModelConfig  # noqa: E402
-    from tensorrt_llm._torch.models.modeling_gemma4 import (  # noqa: E402
-        Gemma4Attention,
-        Gemma4DecoderLayer,
-        Gemma4ForCausalLM,
-        Gemma4MoE,
-        Gemma4MoeRoutingMethod,
-        Gemma4TextModel,
-        Gemma4TextScaledWordEmbedding,
-    )
-    from tensorrt_llm.mapping import Mapping  # noqa: E402
+from tensorrt_llm.mapping import Mapping
 
 # ---------------------------------------------------------------------------
 # Small test configs
@@ -373,6 +356,84 @@ class TestGemma4ModelInstantiation(unittest.TestCase):
             self.assertEqual(
                 attn.num_key_value_heads, expected_kv_heads, f"Layer {i} kv_heads mismatch"
             )
+
+
+class TestGemma4HfWeightMapper(unittest.TestCase):
+    """Tests for Gemma4-specific checkpoint key transformations."""
+
+    def test_remap_modelopt_nvfp4_per_expert_weights(self):
+        """ModelOpt's split expert tensors should map to the VANILLA MoE layout."""
+        mapper = Gemma4HfWeightMapper()
+        projection_map = {
+            "gate_proj": "w1",
+            "up_proj": "w3",
+            "down_proj": "w2",
+        }
+        fields = ("weight", "weight_scale", "input_scale", "weight_scale_2")
+        weights = {}
+        expected = {}
+        for projection, trt_projection in projection_map.items():
+            for field in fields:
+                marker = object()
+                weights[f"model.layers.7.experts.13.{projection}.{field}"] = marker
+                expected[f"model.layers.7.moe.experts.13.{trt_projection}.{field}"] = marker
+
+        remapped = mapper._remap_moe_keys(weights)
+
+        self.assertEqual(set(remapped), set(expected))
+        for key, marker in expected.items():
+            self.assertIs(remapped[key], marker)
+
+    def test_remap_modelopt_nvfp4_vlm_prefix(self):
+        """The VLM preprocessing prefix should use the same expert translation."""
+        marker = object()
+        weights = {
+            "language_model.model.layers.2.experts.5.down_proj.weight": marker,
+        }
+
+        remapped = Gemma4HfWeightMapper()._remap_moe_keys(weights)
+
+        self.assertEqual(
+            remapped,
+            {"language_model.model.layers.2.moe.experts.5.w2.weight": marker},
+        )
+
+    def test_remap_fused_bf16_experts(self):
+        """The existing fused Hugging Face expert layout should remain supported."""
+        gate_up = torch.arange(24).reshape(2, 6, 2)
+        down = torch.arange(16).reshape(2, 4, 2)
+        weights = {
+            "model.layers.1.experts.gate_up_proj": gate_up,
+            "model.layers.1.experts.down_proj": down,
+        }
+
+        remapped = Gemma4HfWeightMapper()._remap_moe_keys(weights)
+
+        for expert_id in range(2):
+            gate, up = gate_up[expert_id].chunk(2, dim=0)
+            self.assertTrue(
+                torch.equal(remapped[f"model.layers.1.moe.experts.{expert_id}.w1.weight"], gate)
+            )
+            self.assertTrue(
+                torch.equal(remapped[f"model.layers.1.moe.experts.{expert_id}.w3.weight"], up)
+            )
+            self.assertTrue(
+                torch.equal(
+                    remapped[f"model.layers.1.moe.experts.{expert_id}.w2.weight"],
+                    down[expert_id],
+                )
+            )
+
+    def test_reject_unrecognized_expert_weights(self):
+        """Unknown expert layouts should fail instead of leaving MoE weights uninitialized."""
+        weights = {"model.layers.0.experts.0.unknown_proj.weight": object()}
+
+        with self.assertRaisesRegex(
+            ValueError,
+            r"Unsupported Gemma4 expert checkpoint tensor: "
+            r"model\.layers\.0\.experts\.0\.unknown_proj\.weight",
+        ):
+            Gemma4HfWeightMapper()._remap_moe_keys(weights)
 
 
 # ---------------------------------------------------------------------------

@@ -1130,3 +1130,24 @@ def apply_model_defaults_to_llm_args(
         return applied
 
     return _compute_applied(model_defaults_dict, user_overrides)
+
+
+def _resolve_kv_cache_manager_v2_auto(
+        llm_args: 'TorchLlmArgs', model_defaults_dict: Dict[str, Any]) -> bool:
+    """Resolve the KV cache manager auto setting after model defaults are applied."""
+    setting = llm_args.kv_cache_config.use_kv_cache_manager_v2
+    if setting != "auto":
+        return setting
+
+    kv_cache_defaults = model_defaults_dict.get("kv_cache_config", {})
+    model_default = (kv_cache_defaults.get("use_kv_cache_manager_v2", False)
+                     if isinstance(kv_cache_defaults, dict) else False)
+    if model_default == "auto":
+        model_default = False
+    if not isinstance(model_default, bool):
+        raise ValueError(
+            "Model default kv_cache_config.use_kv_cache_manager_v2 must be "
+            f"True, False, or 'auto', got {model_default!r}.")
+
+    llm_args.kv_cache_config.use_kv_cache_manager_v2 = model_default
+    return model_default
