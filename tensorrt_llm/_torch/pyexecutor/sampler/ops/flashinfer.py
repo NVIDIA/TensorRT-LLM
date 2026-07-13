@@ -14,9 +14,8 @@
 
 """FlashInfer-accelerated sampling kernels.
 
-Pure kernel functions with no dependency on the sampling_utils interface
-or other backend implementation modules. All flashinfer imports are guarded by
-IS_FLASHINFER_AVAILABLE. Beam search is excluded (torch-only per design).
+These ops depend on flashinfer; the import is guarded so the module stays
+importable without it.
 """
 
 from typing import Optional
