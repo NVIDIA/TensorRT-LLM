@@ -378,14 +378,15 @@ class Gemma3ForCausalLM(DecoderModelForCausalLM[Gemma3TextModel,
     # ASSUMPTIONS:
     # 1) Chunked prefill is disabled to avoid chunking image tokens as they need bidirectional attention.
     # 2) KV cache reuse is disabled to avoid partially matched image tokens (entire image must be reused to get things correct).
-    def get_flashinfer_attention_mask(
+    def get_attention_mask(
             self,
             image_token_mask: torch.BoolTensor,
             attn_metadata: AttentionMetadata,
             effective_sliding_window: Optional[int] = None) -> torch.Tensor:
         """
-        This is specifically needed for context phase requests. Currently, we don't create custom mask for generation requests because FlashInfer backend
-        doesn't use it anyway and there's nothing special we need to do for generation requests.
+        This is specifically needed for context phase requests. Generation
+        requests use the regular causal attention semantics and do not need a
+        custom mask.
         - This function will only be called for a batch when there's at least one context request in the batch with image tokens.
         - In context phase, each sample's input_ids may have a mix of image tokens and text tokens where tokens corresponding to an image
         appear as a contiguous blob. Example: torch.IntTensor([2, 3, 4, 5, img_idx, img_idx, img_idx, ..., img_idx, 100])
@@ -443,12 +444,12 @@ class Gemma3ForCausalLM(DecoderModelForCausalLM[Gemma3TextModel,
         local_attention_mask_data = None
         global_attention_mask_data = None
         if image_token_mask is not None:
-            global_attention_mask_data = self.get_flashinfer_attention_mask(
+            global_attention_mask_data = self.get_attention_mask(
                 image_token_mask=image_token_mask,
                 attn_metadata=attn_metadata,
                 effective_sliding_window=None,
             )
-            local_attention_mask_data = self.get_flashinfer_attention_mask(
+            local_attention_mask_data = self.get_attention_mask(
                 image_token_mask=image_token_mask,
                 attn_metadata=attn_metadata,
                 effective_sliding_window=self.config.sliding_window,

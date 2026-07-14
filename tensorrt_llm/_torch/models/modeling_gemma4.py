@@ -1023,13 +1023,13 @@ class Gemma4ForCausalLM(DecoderModelForCausalLM[Gemma4TextModel, Gemma4TextConfi
 
         return causal_mask
 
-    def get_flashinfer_attention_mask(
+    def get_attention_mask(
         self,
         mm_token_type_ids: torch.Tensor,
         attn_metadata: AttentionMetadata,
         effective_sliding_window: Optional[int] = None,
     ) -> torch.Tensor:
-        """Build FlashInfer custom mask for context requests."""
+        """Build a custom attention mask for context requests."""
         num_contexts = attn_metadata.num_contexts
         assert num_contexts > 0
 
@@ -1076,7 +1076,7 @@ class Gemma4ForCausalLM(DecoderModelForCausalLM[Gemma4TextModel, Gemma4TextConfi
         # full-attention layers retain their normal causal mask.
         use_bidir = getattr(self.config, "use_bidirectional_attention", None)
         if mm_token_type_ids is not None and use_bidir == "vision":
-            local_attention_mask_data = self.get_flashinfer_attention_mask(
+            local_attention_mask_data = self.get_attention_mask(
                 mm_token_type_ids=mm_token_type_ids,
                 attn_metadata=attn_metadata,
                 effective_sliding_window=self.config.sliding_window,
