@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -19,23 +19,27 @@ This module provides a lightweight periodic JUnit XML reporter that leverages
 pytest's built-in junitxml plugin for simplified test result handling.
 """
 
+import faulthandler
 import os
 import platform
 import signal
+import threading
 import time
 import xml.etree.ElementTree as ET
 from datetime import datetime
-from typing import Optional
+from typing import Optional, TextIO
 
 try:
     from _pytest.config import Config
     from _pytest.junitxml import LogXML
+    from _pytest.nodes import Item
     from _pytest.reports import TestReport
 except ImportError:
     # Fallback for different pytest versions
     Config = None  # type: ignore
     TestReport = None  # type: ignore
     LogXML = None  # type: ignore
+    Item = None  # type: ignore
 
 
 class PeriodicJUnitXML:
@@ -75,6 +79,10 @@ class PeriodicJUnitXML:
             logger=None,  # Optional logger (info, warning functions)
             save_unfinished_test:
         bool = False,  # Save unfinished test name in output-dir/unfinished_test.txt if True
+            dump_hang_traceback:
+        bool = False,  # Dump a thread traceback to output-dir/hang_traceback.txt on a hang if True
+            hang_dump_fraction:
+        float = 0.9,  # Fraction of a test's timeout after which to dump the hang traceback
     ):
         """
         Initialize periodic reporter.
@@ -88,12 +96,30 @@ class PeriodicJUnitXML:
             batch_size: Number of tests before triggering a save (default: 10)
             logger: Optional dictionary with 'info' and 'warning' functions for logging
             save_unfinished_test: If True, save unfinished test name in output-dir/unfinished_test.txt
+            dump_hang_traceback: If True, dump every thread's stack to
+                output-dir/hang_traceback.txt when a test overruns its timeout or the
+                process is signalled, so a hang leaves a diagnosable stack instead of an
+                empty "Test terminated unexpectedly" record.
+            hang_dump_fraction: Dump the traceback after this fraction of a test's
+                timeout elapses (default: 0.9), i.e. just before the test is killed.
         """
         self.xmlpath = os.path.abspath(xmlpath)
         self.time_interval = interval
         self.batch_size = batch_size
         self.logger = logger or {}
         self.save_unfinished_test = save_unfinished_test
+        self.dump_hang_traceback = dump_hang_traceback
+        self.hang_dump_fraction = hang_dump_fraction
+        # Kept open for the process lifetime so faulthandler can write to it from the
+        # watchdog thread or a signal handler (both need a valid, live file object).
+        self._hang_file: Optional[TextIO] = None
+        # Per-test watchdog timer. A private threading.Timer is used instead of
+        # faulthandler.dump_traceback_later() on purpose: the latter is a single
+        # process-global timer shared with pytest-timeout / pytest's own faulthandler
+        # plugin, so arming/cancelling it here could clobber (or be clobbered by)
+        # theirs. Our own timer owns no shared state.
+        self._hang_timer: Optional[threading.Timer] = None
+        self._hang_lock = threading.Lock()
 
         self.completed_tests = 0
         self.last_save_time = time.time()
@@ -136,6 +162,11 @@ class PeriodicJUnitXML:
 
         # Register signal handlers for graceful shutdown
         self._register_signal_handlers()
+
+        # Set up hang-traceback dumping (after signal handlers, so the handler can
+        # reuse the open file object).
+        if self.dump_hang_traceback:
+            self._setup_hang_dump()
 
         self._log_info(f"PeriodicJUnitXML: Initialized at {self.xmlpath} "
                        "(lightweight mode - fast collection, batch processing)")
@@ -221,6 +252,7 @@ class PeriodicJUnitXML:
 
     def pytest_sessionfinish(self):
         """Generate final report at session end."""
+        self._cancel_hang_timer()
         try:
             self._generate_report(is_final=True)
         except Exception as e:
@@ -327,6 +359,115 @@ class PeriodicJUnitXML:
                     pass
             raise
 
+    def _hang_traceback_path(self) -> str:
+        """Path of the sidecar file that captures thread stacks on a hang."""
+        return os.path.join(os.path.dirname(self.xmlpath), "hang_traceback.txt")
+
+    def _setup_hang_dump(self) -> None:
+        """Open the sidecar file and register a C-level dump on SIGINT/SIGTERM.
+
+        The file is kept open for the whole process lifetime because the watchdog
+        thread writes to it via ``faulthandler.dump_traceback(file=...)`` and needs
+        a live file object. ``faulthandler.register(..., chain=True)`` installs a
+        C-level handler that dumps every thread's stack on a wall-clock kill even
+        when the main thread is stuck in native C/CUDA code (a pure-Python signal
+        handler would be deferred until the interpreter regains control); chaining
+        keeps the existing Python handler that persists results. ``enable()`` is
+        deliberately NOT called -- it is a process-wide redirect of fatal-signal
+        dumps that would override pytest's own crash handling.
+        """
+        try:
+            os.makedirs(os.path.dirname(self.xmlpath), exist_ok=True)
+            self._hang_file = open(self._hang_traceback_path(),
+                                   "a",
+                                   encoding="utf-8")
+            for signum in (signal.SIGINT, signal.SIGTERM):
+                try:
+                    faulthandler.register(signum,
+                                          file=self._hang_file,
+                                          all_threads=True,
+                                          chain=True)
+                except (OSError, RuntimeError, ValueError):
+                    pass
+            self._log_info(
+                f"Hang-traceback dumping enabled -> {self._hang_traceback_path()}"
+            )
+        except OSError as e:
+            self._log_warning(f"Could not enable hang-traceback dumping: {e}")
+            self._hang_file = None
+
+    def _effective_timeout(self, item: "Item") -> Optional[float]:
+        """Resolve the timeout (seconds) in force for this test, or None.
+
+        Prefers a per-test ``@pytest.mark.timeout`` / test-list override (positional
+        or ``timeout=`` keyword form), then falls back to the global ``--timeout``.
+        """
+        marker = item.get_closest_marker("timeout")
+        if marker is not None:
+            candidate = marker.kwargs.get("timeout") if marker.kwargs else None
+            if candidate is None and marker.args:
+                candidate = marker.args[0]
+            try:
+                if candidate is not None:
+                    return float(candidate)
+            except (TypeError, ValueError):
+                pass
+        try:
+            value = item.config.getoption("timeout", default=None)
+        except (ValueError, KeyError):
+            value = None
+        try:
+            return float(value) if value else None
+        except (TypeError, ValueError):
+            return None
+
+    def _dump_hang(self, nodeid: str) -> None:
+        """Write every thread's stack to the sidecar file (called from the timer)."""
+        if self._hang_file is None:
+            return
+        try:
+            self._hang_file.write(
+                f"\n===== hang watchdog fired for {nodeid} =====\n")
+            faulthandler.dump_traceback(file=self._hang_file, all_threads=True)
+            self._hang_file.flush()
+        except (OSError, RuntimeError, ValueError):
+            pass
+
+    def _cancel_hang_timer(self) -> None:
+        """Cancel the pending watchdog timer, if any."""
+        with self._hang_lock:
+            timer = self._hang_timer
+            self._hang_timer = None
+        if timer is not None:
+            timer.cancel()
+
+    def pytest_runtest_setup(self, item: "Item") -> None:
+        """Arm a watchdog that dumps all thread stacks just before a hang is killed.
+
+        The timer is armed once for the whole item at setup and only cancelled when
+        the next test starts (or at session end), so a hang anywhere in setup, call,
+        or a fixture finalizer/teardown is captured. This also makes ``func_only``
+        irrelevant: any phase overrunning the timeout dumps.
+        """
+        if not self.dump_hang_traceback or self._hang_file is None:
+            return
+        self._cancel_hang_timer()  # never leave a stale timer armed
+        timeout = self._effective_timeout(item)
+        if not timeout or timeout <= 0:
+            return
+        # Dump slightly before the test is killed. The timer thread can still run
+        # while the main thread is blocked in a CUDA/NCCL call, since torch releases
+        # the GIL around those blocking calls -- which is exactly when the per-test
+        # timeout cannot unwind the hang.
+        dump_after = max(1.0, timeout * self.hang_dump_fraction)
+        timer = threading.Timer(dump_after,
+                                self._dump_hang,
+                                args=(item.nodeid, ))
+        timer.daemon = True
+        with self._hang_lock:
+            self._hang_timer = timer
+        timer.start()
+
     def _register_signal_handlers(self):
         """Register signal handlers for graceful shutdown on interruption."""
 
@@ -336,6 +477,13 @@ class PeriodicJUnitXML:
             self._log_warning(
                 f"\n\nReceived {signal_name} signal. Saving test results before exit..."
             )
+
+            # The stack dump for this signal is handled at C level by the
+            # faulthandler.register(..., chain=True) installed in _setup_hang_dump
+            # (which runs even if the main thread is stuck in native code); just
+            # cancel the watchdog so it cannot also fire and interleave output.
+            if self.dump_hang_traceback:
+                self._cancel_hang_timer()
 
             try:
                 # Process any pending reports first
