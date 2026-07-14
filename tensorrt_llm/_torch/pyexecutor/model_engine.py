@@ -1564,36 +1564,45 @@ class PyTorchModelEngine(ModelEngine):
                  force_init_i) in mamba_warmup_shapes:
                 init_ctx = (Mamba2Metadata.force_initial_states_for_warmup()
                             if force_init_i else contextlib.nullcontext())
-                with init_ctx:
-                    warmup_request = self._create_warmup_request(
-                        resource_manager,
-                        num_tokens_i,
-                        num_gen_requests_i,
-                        least_requests=least_req_i)
-                    with self._release_batch_context(warmup_request,
-                                                     resource_manager) as batch:
-                        if batch is None and self.mapping.tp_size <= 1:
-                            continue
-                        self._assert_all_tp_ranks_have_warmup_batch(
-                            batch, num_tokens_i)
-                        if batch is None:
-                            continue
-                        spec_resource_manager = resource_manager.get_resource_manager(
-                            ResourceManagerType.SPEC_RESOURCE_MANAGER)
-                        if self.is_draft_model and isinstance(
-                                spec_resource_manager, Eagle3ResourceManager):
-                            spec_resource_manager.is_first_draft = True
+                try:
+                    with init_ctx:
+                        warmup_request = self._create_warmup_request(
+                            resource_manager,
+                            num_tokens_i,
+                            num_gen_requests_i,
+                            least_requests=least_req_i)
+                        with self._release_batch_context(
+                                warmup_request, resource_manager) as batch:
+                            if batch is None and self.mapping.tp_size <= 1:
+                                continue
+                            self._assert_all_tp_ranks_have_warmup_batch(
+                                batch, num_tokens_i)
+                            if batch is None:
+                                continue
+                            spec_resource_manager = resource_manager.get_resource_manager(
+                                ResourceManagerType.SPEC_RESOURCE_MANAGER)
+                            if self.is_draft_model and isinstance(
+                                    spec_resource_manager,
+                                    Eagle3ResourceManager):
+                                spec_resource_manager.is_first_draft = True
 
-                        self.forward(batch,
-                                     new_tensors_device=None,
-                                     resource_manager=resource_manager)
+                            self.forward(batch,
+                                         new_tensors_device=None,
+                                         resource_manager=resource_manager)
 
-                        if autotuner_enabled:
-                            AutoTuner.get().cache_pp_recv()
-                            AutoTuner.get().cache_pp_send()
-                            AutoTuner.get().clean_pp_flag()
+                            if autotuner_enabled:
+                                AutoTuner.get().cache_pp_recv()
+                                AutoTuner.get().cache_pp_send()
+                                AutoTuner.get().clean_pp_flag()
 
-                        torch.cuda.synchronize()
+                            torch.cuda.synchronize()
+                except torch.OutOfMemoryError:
+                    logger.warning(
+                        f"OOM during Mamba hybrid warmup with "
+                        f"{num_tokens_i} tokens, {num_gen_requests_i} "
+                        f"generation requests, "
+                        f"force_initstates={force_init_i}. Skipping.")
+                    torch.cuda.empty_cache()
 
         clear_memory_buffers()
         torch.cuda.empty_cache()
