@@ -172,6 +172,16 @@ class DFlashWorker(SpecWorkerBase):
         # graph compatible.
         self._ctx_buf_inited = False
         self._ctx_len = None
+        # Snapshot for rolling back in-place _ctx_len updates when a forward
+        # fails (or after warmup). See _ensure_spec_dec_state_restored.
+        self._saved_ctx_len = None
+        self._ctx_len_restore_pending = False
+        # Deferred kv_lens_cuda rewind state (see _prepare_kv_for_draft_forward,
+        # _apply_kv_rewind_after_draft, _ensure_spec_dec_state_restored).
+        self._kv_rewind_pending = False
+        self._kv_rewind_amount = None
+        self._kv_rewind_nc = None
+        self._kv_rewind_bs = None
         self._batch_to_slot = None
         self._max_ctx = 0
         self._ctx_k_buf = None  # [max_batch, L, max_ctx+block, nkv, hd]
@@ -287,7 +297,7 @@ class DFlashWorker(SpecWorkerBase):
             # is restored wholesale, so no rewind is needed.
             return
 
-        if hasattr(self, "_kv_rewind_amount") and hasattr(attn_metadata, "kv_lens_cuda"):
+        if self._kv_rewind_amount is not None and hasattr(attn_metadata, "kv_lens_cuda"):
             nc = self._kv_rewind_nc
             bs = self._kv_rewind_bs
             attn_metadata.kv_lens_cuda[nc:bs] -= self._kv_rewind_amount
@@ -381,6 +391,15 @@ class DFlashWorker(SpecWorkerBase):
             and spec_metadata is not None
         ):
             self._apply_kv_rewind_after_draft(attn_metadata, spec_metadata)
+        if (
+            getattr(self, "_ctx_len_restore_pending", False)
+            and self._ctx_len is not None
+            and self._saved_ctx_len is not None
+        ):
+            # A failed forward must not keep this iteration's in-place
+            # _ctx_len updates: roll back to the pre-forward snapshot.
+            self._ctx_len.copy_(self._saved_ctx_len)
+            self._ctx_len_restore_pending = False
 
     def _forward_impl(
         self,
@@ -415,10 +434,11 @@ class DFlashWorker(SpecWorkerBase):
         self._lazy_init_ctx_buffers(draft_model, spec_metadata, attn_metadata)
         spec_metadata._dflash_worker = self
 
-        # Save context lengths before warmup to prevent accumulation
+        # Save context lengths so both warmup and a failed forward can roll
+        # back the in-place _ctx_len updates made during drafting.
         is_warmup = spec_metadata.is_cuda_graph and not torch.cuda.is_current_stream_capturing()
-        if is_warmup:
-            saved_ctx_len = self._ctx_len.clone()
+        self._saved_ctx_len = self._ctx_len.clone()
+        self._ctx_len_restore_pending = True
 
         self._execute_guided_decoder_if_present(logits)
 
@@ -543,9 +563,10 @@ class DFlashWorker(SpecWorkerBase):
             num_accepted_tokens,
         )
 
-        # Restore context lengths after warmup
+        # Restore context lengths after warmup; real runs keep the updates.
         if is_warmup:
-            self._ctx_len.copy_(saved_ctx_len)
+            self._ctx_len.copy_(self._saved_ctx_len)
+        self._ctx_len_restore_pending = False
 
         return {
             "logits": raw_logits,

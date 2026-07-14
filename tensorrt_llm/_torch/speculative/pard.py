@@ -91,6 +91,12 @@ class PARDWorker(SpecWorkerBase):
         self.sa_enhancer: Optional[SADraftEnhancer] = None
         if getattr(spec_config, "sa_config", None) is not None:
             self.sa_enhancer = SADraftEnhancer(spec_config.sa_config.threshold)
+        # Deferred kv_lens_cuda rewind state (see _prepare_kv_for_draft_forward,
+        # _apply_kv_rewind_after_draft, _ensure_spec_dec_state_restored).
+        self._kv_rewind_pending = False
+        self._kv_rewind_amount = None
+        self._kv_rewind_nc = None
+        self._kv_rewind_bs = None
         logger.info(
             f"PARDWorker initialized with use_separate_draft_kv_cache={use_separate_draft_kv_cache}"
         )
@@ -163,7 +169,7 @@ class PARDWorker(SpecWorkerBase):
             # is restored wholesale, so no rewind is needed.
             return
 
-        if hasattr(self, "_kv_rewind_amount") and hasattr(attn_metadata, "kv_lens_cuda"):
+        if self._kv_rewind_amount is not None and hasattr(attn_metadata, "kv_lens_cuda"):
             nc = self._kv_rewind_nc
             bs = self._kv_rewind_bs
             attn_metadata.kv_lens_cuda[nc:bs] -= self._kv_rewind_amount
