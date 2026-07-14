@@ -50,16 +50,10 @@ from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from typing import NamedTuple
 
-# Snapshot and GPU-settle mechanics are shared with the session-reuse layer
-# (both hand a live pool to a test that did not spawn it — same invariants:
-# workers freeze the FULL env + sys.path at spawn, and the previous worker's
-# CUDA memory must be released before the next model build). Policy — what to
-# do on mismatch or a still-busy GPU — stays here.
-from test_common._session_utils import (  # noqa: F401  (_spawn_snapshot re-exported for tests)
-    _SETTLE_TIMEOUT_S,
-    _settle_gpu_memory,
-    _spawn_snapshot,
-)
+# The spawn snapshot is shared with the session-reuse layer (both hand a
+# live pool to a test that did not spawn it — same invariant: workers freeze
+# the FULL env + sys.path at spawn).
+from test_common._session_utils import _spawn_snapshot
 
 # The only places in the library that construct MpiPoolSession for a bare
 # LLM(...); tests passing their own _mpi_session never reach these lines.
@@ -200,46 +194,6 @@ def _worker_import_report_cuda() -> bool:
     import tensorrt_llm  # noqa: F401
 
     return torch.cuda.is_initialized()
-
-
-# Below this free fraction a handover is refused outright (sync fallback):
-# flat-detection cannot distinguish "legitimately in use" from "dying worker
-# that has not started releasing yet", and handing over into a mostly-used
-# GPU just moves the OOM into the worker's model build (seen in pre-merge
-# CI). The ~50s synchronous spawn restores the natural release window.
-_SETTLE_HANDOVER_MIN_FREE_FRAC = 0.5
-
-
-def wait_gpu_memory_settle(timeout: float = _SETTLE_TIMEOUT_S) -> bool:
-    """Wait for a dying previous worker to release its GPU memory.
-
-    A handed-over live pool skips the ~50s synchronous spawn that used to
-    give the previous LLM's worker process time to exit: MPI pool shutdown
-    returns at disconnect, but the child's CUDA memory is only released when
-    the process actually exits. Building the next model into that race fails
-    with "Executor creation failed due to insufficient GPU memory" while the
-    previous model's weights are still resident (seen in pre-merge CI).
-
-    The primary protection is deterministic: every pool built by this layer
-    (and by session_reuse) is constructed with ``wait_shutdown=True``, so its
-    shutdown blocks until the workers actually exited. This barrier remains
-    as defense-in-depth for GPU memory the factories never saw — pools a
-    test constructs itself (explicit ``_mpi_session`` fixtures) and
-    in-process allocations — which also lose the implicit ~50s spawn window
-    on an instant handover. On a free GPU it costs a single NVML query.
-
-    The measurement (NVML polling until mostly-free / flat / timeout) lives
-    in ``_session_utils._settle_gpu_memory``, shared with the session-reuse
-    layer. The policy here: refuse the handover (False -> caller discards the
-    prefetched pool and builds synchronously) when the GPUs ended up still
-    mostly used (< _SETTLE_HANDOVER_MIN_FREE_FRAC free) — starting a model
-    build there is likely to OOM. Fail-open (True) when there is nothing to
-    measure. Never raises.
-    """
-    min_free_frac = _settle_gpu_memory("session-prefetch", timeout)
-    if min_free_frac is None:
-        return True  # no NVML / no visible GPUs: hand over as before
-    return min_free_frac >= _SETTLE_HANDOVER_MIN_FREE_FRAC
 
 
 class _Built(NamedTuple):
@@ -427,26 +381,16 @@ class SessionPrefetcher:
         if built is None:
             return None
         if built.spec == spec and built.snapshot == _spawn_snapshot():
-            # An instant handover skips the ~50s synchronous spawn that used
-            # to give the PREVIOUS LLM's worker time to exit and release its
-            # GPU memory; don't start the next model build into that race.
-            if wait_gpu_memory_settle():
-                self.stats["pools_handed_over"] += 1
-                print(f"[session-prefetch] handing over prefetched {spec}-worker pool", flush=True)
-                return built.session
-            # GPUs still mostly used after the wait: a handed-over build
-            # would likely OOM. The sync fallback's ~50s spawn restores the
-            # natural release window.
-            self.stats["pools_discarded_gpu_busy"] += 1
-            print(
-                "[session-prefetch] GPU memory still mostly used: discarding "
-                "prefetched pool, building synchronously",
-                flush=True,
-            )
-        else:
-            # Spec/env/sys.path mismatch (test skipped, reordered, or changed
-            # state the frozen workers would not see): discard.
-            self.stats["pools_discarded_stale"] += 1
+            # An instant handover is safe against the previous worker's GPU
+            # memory: every pool these layers hand out is built with
+            # wait_shutdown=True, so its shutdown() blocked until the workers
+            # actually exited (and released their memory).
+            self.stats["pools_handed_over"] += 1
+            print(f"[session-prefetch] handing over prefetched {spec}-worker pool", flush=True)
+            return built.session
+        # Spec/env/sys.path mismatch (test skipped, reordered, or changed
+        # state the frozen workers would not see): discard.
+        self.stats["pools_discarded_stale"] += 1
         threading.Thread(
             target=built.session.shutdown, daemon=True, name="session-prefetch-discard"
         ).start()

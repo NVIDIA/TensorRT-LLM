@@ -10,7 +10,7 @@ import types
 from pathlib import Path
 
 import pytest
-from test_common import _session_utils, session_prefetcher
+from test_common import session_prefetcher
 from test_common.session_prefetcher import SessionPrefetcher, warm_page_cache
 
 
@@ -57,8 +57,6 @@ def prefetcher(monkeypatch):
     built, warmed = [], []
     monkeypatch.setattr(SessionPrefetcher, "_build", lambda self, spec, gen: built.append(spec))
     monkeypatch.setattr(SessionPrefetcher, "_warm", lambda self, d: warmed.append(d))
-    # No real NVML polling in pure-logic tests (True = safe to hand over).
-    monkeypatch.setattr(session_prefetcher, "wait_gpu_memory_settle", lambda: True)
     p.built, p.warmed = built, warmed
     return p
 
@@ -225,21 +223,8 @@ def test_publish_never_overwrites_unconsumed_pool(prefetcher):
     assert second.shut and not first.shut  # newcomer discarded, not the slot
 
 
-def test_handover_waits_for_gpu_settle(prefetcher, monkeypatch):
-    # The instant handover must first let the previous test's dying worker
-    # release its GPU memory (insufficient-GPU-memory failure class).
-    pool = _FakePool(4)
-    _arm(prefetcher, pool, spec=4)
-    settled = []
-    monkeypatch.setattr(
-        session_prefetcher, "wait_gpu_memory_settle", lambda: settled.append(1) or True
-    )
-    assert prefetcher.take(4) is pool
-    assert settled == [1]
-
-
 def test_session_summary_counters_and_emission(prefetcher, capfd):
-    # Handover / stale-discard / busy-discard / superseded each count once;
+    # Handover / stale-discard / superseded each count once;
     # dispose() emits ONE summary line (outside pytest capture in real runs,
     # the only guaranteed console-visible record of prefetch activity).
     hit = _FakePool(4)
@@ -248,22 +233,10 @@ def test_session_summary_counters_and_emission(prefetcher, capfd):
     stale = _FakePool(4)
     _arm(prefetcher, stale, spec=4)
     assert prefetcher.take(2) is None  # spec mismatch -> stale discard
-    busy = _FakePool(4)
-    _arm(prefetcher, busy, spec=4)
-    prefetcher._build_gen += 0  # no-op, keep gen valid
-    import test_common.session_prefetcher as sp
-
-    orig = sp.wait_gpu_memory_settle
-    sp.wait_gpu_memory_settle = lambda: False
-    try:
-        assert prefetcher.take(4) is None  # busy refusal
-    finally:
-        sp.wait_gpu_memory_settle = orig
     late = _FakePool(4)
     prefetcher._publish(4, late, session_prefetcher._spawn_snapshot(), prefetcher._build_gen - 1)
     assert prefetcher.stats["pools_handed_over"] == 1
     assert prefetcher.stats["pools_discarded_stale"] == 1
-    assert prefetcher.stats["pools_discarded_gpu_busy"] == 1
     assert prefetcher.stats["pools_discarded_superseded"] == 1
     prefetcher.dispose()
     out = capfd.readouterr().out
@@ -444,111 +417,3 @@ def test_patch_targets_cover_all_library_construction_sites():
         "add the module(s) to _PATCH_TARGETS (or the exempt list above) so "
         "the prefetch factory keeps covering every bare-LLM() pool spawn"
     )
-
-
-_GIB = 1 << 30
-
-
-class _FakeMem:
-    def __init__(self, free, total):
-        self.free, self.total = free, total
-
-
-def _fake_pynvml(free_sequence, total):
-    """A pynvml stand-in whose reported free memory follows ``free_sequence``."""
-    mod = types.ModuleType("pynvml")
-    calls = {"n": 0}
-    mod.nvmlInit = lambda: None
-    mod.nvmlShutdown = lambda: None
-    mod.nvmlDeviceGetCount = lambda: 1
-    mod.nvmlDeviceGetHandleByIndex = lambda i: i
-
-    def _mem_info(handle):
-        free = free_sequence[min(calls["n"], len(free_sequence) - 1)]
-        calls["n"] += 1
-        return _FakeMem(free, total)
-
-    mod.nvmlDeviceGetMemoryInfo = _mem_info
-    mod.calls = calls
-    return mod
-
-
-@pytest.fixture
-def unset_cuda_visible_devices(monkeypatch):
-    # The settle helper resolves CUDA_VISIBLE_DEVICES; pin it unset so the
-    # fake single-GPU pynvml is used as-is.
-    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
-
-
-def test_settle_noop_when_gpu_free(monkeypatch, unset_cuda_visible_devices):
-    fake = _fake_pynvml([75 * _GIB], 80 * _GIB)
-    monkeypatch.setitem(sys.modules, "pynvml", fake)
-    t0 = time.monotonic()
-    assert session_prefetcher.wait_gpu_memory_settle() is True
-    assert time.monotonic() - t0 < 0.2  # no polling on an already-free GPU
-    assert fake.calls["n"] == 1
-
-
-def test_settle_waits_for_previous_worker_release(monkeypatch, unset_cuda_visible_devices):
-    # Free memory rising as the previous worker exits: 17 -> 40 -> 75 GiB.
-    fake = _fake_pynvml([17 * _GIB, 40 * _GIB, 75 * _GIB], 80 * _GIB)
-    monkeypatch.setitem(sys.modules, "pynvml", fake)
-    monkeypatch.setattr(_session_utils, "_SETTLE_POLL_S", 0.01)
-    assert session_prefetcher.wait_gpu_memory_settle() is True
-    assert fake.calls["n"] == 3  # polled until the release completed
-
-
-def test_settle_gives_up_when_memory_stays_in_use(monkeypatch, unset_cuda_visible_devices):
-    fake = _fake_pynvml([17 * _GIB], 80 * _GIB)  # flat: legitimately in use
-    monkeypatch.setitem(sys.modules, "pynvml", fake)
-    monkeypatch.setattr(_session_utils, "_SETTLE_POLL_S", 0.01)
-    t0 = time.monotonic()
-    # 17/80 GiB free (21%) is below the handover threshold: refuse.
-    assert session_prefetcher.wait_gpu_memory_settle(timeout=5) is False
-    assert time.monotonic() - t0 < 1.0  # flat-detection, not the full timeout
-
-
-def test_settle_flat_but_half_free_still_hands_over(monkeypatch, unset_cuda_visible_devices):
-    # Memory flat at 60% free (e.g. a small resident fixture): plenty of room
-    # for the next model — hand over rather than pay the sync spawn.
-    fake = _fake_pynvml([48 * _GIB], 80 * _GIB)
-    monkeypatch.setitem(sys.modules, "pynvml", fake)
-    monkeypatch.setattr(_session_utils, "_SETTLE_POLL_S", 0.01)
-    assert session_prefetcher.wait_gpu_memory_settle(timeout=5) is True
-
-
-def test_take_discards_pool_when_gpu_stays_busy(prefetcher, monkeypatch):
-    # When the settle wait gives up on a still-mostly-used GPU, the
-    # handed-over build would OOM in the worker. A busy GPU must force the
-    # sync fallback (whose ~50s spawn restores the release window) instead.
-    pool = _FakePool(4)
-    _arm(prefetcher, pool, spec=4)
-    monkeypatch.setattr(session_prefetcher, "wait_gpu_memory_settle", lambda: False)
-    assert prefetcher.take(4) is None
-    assert _wait_for(lambda: pool.shut)  # pool discarded in the background
-
-
-def test_settle_skips_when_no_gpus_visible(monkeypatch):
-    # CUDA_VISIBLE_DEVICES="" means NO GPUs are visible to this process:
-    # nothing to wait for (and no polling of other jobs' GPUs).
-    fake = _fake_pynvml([17 * _GIB], 80 * _GIB)
-    monkeypatch.setitem(sys.modules, "pynvml", fake)
-    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "")
-    assert session_prefetcher.wait_gpu_memory_settle() is True
-    assert fake.calls["n"] == 0  # no memory queries at all
-
-
-def test_settle_without_pynvml_is_noop(monkeypatch):
-    import builtins
-
-    monkeypatch.delitem(sys.modules, "pynvml", raising=False)
-    real_import = builtins.__import__
-
-    def _no_pynvml(name, *args, **kwargs):
-        if name == "pynvml":
-            raise ImportError("no pynvml")
-        return real_import(name, *args, **kwargs)
-
-    monkeypatch.setattr(builtins, "__import__", _no_pynvml)
-    # Must not raise, and must fail open (hand over as before the barrier).
-    assert session_prefetcher.wait_gpu_memory_settle() is True

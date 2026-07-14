@@ -31,7 +31,6 @@ def reuse_cache(monkeypatch):
     # No real MPI / NVML in pure-logic tests: record the calls instead.
     resets = []
     monkeypatch.setattr(session_reuse, "submit_sync_per_worker", lambda s, fn: resets.append(s))
-    monkeypatch.setattr(session_reuse, "wait_gpu_memory_settle", lambda: None)
     cache.resets = resets
     return cache
 

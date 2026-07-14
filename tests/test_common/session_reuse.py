@@ -23,10 +23,10 @@ Eligibility is automatic:
                               bounding worker state accumulation
 
 Between handouts every worker runs a torch.compile/Dynamo reset (exactly once
-per worker, barrier-pinned: ``grouped_test_utils.submit_sync_per_worker``) and
-the handover waits for
-the previous worker's GPU memory to actually be released (NVML settle barrier)
-— both failure modes were observed in validation, not hypothetical.
+per worker, barrier-pinned: ``grouped_test_utils.submit_sync_per_worker``).
+Handover cannot race the previous worker's GPU-memory release: every pool
+these layers build is constructed with ``wait_shutdown=True``, so its
+shutdown blocks until the workers actually exited.
 
 Enable/disable with ``TRTLLM_TEST_REUSE_SESSION`` (default on; ``0`` disables).
 Disabled under pytest-xdist workers (parallel tests would multiply live pools).
@@ -36,9 +36,9 @@ import os
 import sys
 import threading
 
-# Snapshot and GPU-settle mechanics are shared with the session-prefetch layer
-# (both hand a live pool to a test that did not spawn it — same invariants).
-from test_common._session_utils import _settle_gpu_memory, _spawn_snapshot  # noqa: F401
+# The spawn snapshot is shared with the session-prefetch layer (both hand a
+# live pool to a test that did not spawn it — same invariant).
+from test_common._session_utils import _spawn_snapshot  # noqa: F401
 from test_common.grouped_test_utils import reset_worker_torch_compile_state, submit_sync_per_worker
 
 # The only places in the library that construct MpiPoolSession for a bare
@@ -60,16 +60,6 @@ _WEIGHT_CACHE_ENV = {
     "TRTLLM_HF_WEIGHT_CACHE": "1",
     "TRTLLM_HF_WEIGHT_CACHE_MAX_ENTRIES": "1",
 }
-
-
-def wait_gpu_memory_settle() -> None:
-    """Wait until visible GPUs are mostly free or free memory stops rising.
-
-    Measurement lives in ``_session_utils._settle_gpu_memory`` (shared with
-    the session-prefetch layer). Never raises: on any NVML problem the
-    handover proceeds as before.
-    """
-    _settle_gpu_memory("session-reuse")
 
 
 _RETIRE_THREADS: list = []
@@ -294,7 +284,7 @@ class SessionReuseCache:
     # ---- cache operations ----
 
     def acquire(self, real_cls, n_workers):
-        """Hand out a cached same-size pool (reset + settled) or build one."""
+        """Hand out a cached same-size pool (workers reset) or build one."""
         if self._suspended or not self.enabled:
             # Opt-out test (private_mpi_session) or the kill switch flipped
             # after the seams were patched: untracked fresh pool that the LLM
@@ -320,8 +310,11 @@ class SessionReuseCache:
                 self._retire(real)  # stale worker state or lifetime cap
             else:
                 try:
+                    # No GPU-memory settle needed at handover: every pool
+                    # these layers build has wait_shutdown=True, so a dying
+                    # predecessor's shutdown() already blocked until its
+                    # workers exited and released their memory.
                     submit_sync_per_worker(real, reset_worker_torch_compile_state)
-                    wait_gpu_memory_settle()
                     print(
                         f"[session-reuse] reusing {n_workers}-worker pool "
                         f"(use #{real._reuse_uses + 1})",
