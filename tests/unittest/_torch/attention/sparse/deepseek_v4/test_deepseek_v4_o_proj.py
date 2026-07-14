@@ -44,7 +44,7 @@ FP8_O_PROJ_DIFF_TOL = 2e-3
 
 @pytest.mark.parametrize(
     ("num_tokens", "expected_split"),
-    [(1, 2), (16, 2), (32, 2), (64, 2), (96, 2), (128, 2), (160, 1), (16384, 1)],
+    [(1, 4), (16, 4), (32, 2), (64, 2), (96, 2), (128, 2), (160, 1), (16384, 1)],
 )
 def test_select_dsv4_ob_split_k_auto_policy(num_tokens, expected_split, monkeypatch):
     monkeypatch.delenv("TRTLLM_DSV4_OB_SPLIT_K", raising=False)
