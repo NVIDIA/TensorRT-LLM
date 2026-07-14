@@ -13,7 +13,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Generate a synthetic edge-map control video: a ball bouncing off walls.
+r"""Generate a synthetic edge-map control video: a ball bouncing off walls.
 
 Draws white outlines on black — a room border plus a ball following simple
 elastic-bounce physics — which is exactly what the Cosmos3 transfer ``edge``
@@ -25,11 +25,11 @@ Generate the control, then run transfer with it:
 
     python generate_bouncing_ball_control.py --out_dir ./ball_control
 
-    python cosmos3.py --model nvidia/Cosmos3-Nano \\
-        --visual_gen_args ../../configs/cosmos3-nano-1gpu.yaml \\
-        --prompt "A photorealistic beach ball with colorful panels bouncing \\
-                  between the walls of an enclosed room, studio lighting." \\
-        --extra_params '{"edge": {"control_path": "./ball_control/control.mp4"}}' \\
+    python cosmos3.py --model nvidia/Cosmos3-Nano \
+        --visual_gen_args ../../configs/cosmos3-nano-1gpu.yaml \
+        --prompt "A photorealistic beach ball with colorful panels bouncing \
+                  between the walls of an enclosed room, studio lighting." \
+        --extra_params '{"edge": {"control_path": "./ball_control/control.mp4"}}' \
         --output_path cosmos3_bouncing_ball.mp4
 
 Tip: keep synthetic controls edge-style. The ``blur`` hint expects the low
@@ -78,9 +78,7 @@ def draw_frame(args: argparse.Namespace, x: float, y: float) -> PIL.Image.Image:
         outline=(255, 255, 255),
         width=args.line_width,
     )
-    draw.ellipse(
-        [x - r, y - r, x + r, y + r], outline=(255, 255, 255), width=args.line_width
-    )
+    draw.ellipse([x - r, y - r, x + r, y + r], outline=(255, 255, 255), width=args.line_width)
     return image
 
 
@@ -119,10 +117,14 @@ def main() -> None:
         stream.pix_fmt = "yuv420p"
         stream.bit_rate = 8_000_000  # keep the thin white lines crisp
         for frame in frames:
-            container.mux(stream.encode(av.VideoFrame.from_ndarray(np.asarray(frame), format="rgb24")))
+            container.mux(
+                stream.encode(av.VideoFrame.from_ndarray(np.asarray(frame), format="rgb24"))
+            )
         container.mux(stream.encode())
 
-    print(f"Wrote {video_path}" + (f" and {args.num_frames} PNG frames" if args.save_frames else ""))
+    print(
+        f"Wrote {video_path}" + (f" and {args.num_frames} PNG frames" if args.save_frames else "")
+    )
 
 
 if __name__ == "__main__":

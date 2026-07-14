@@ -1105,7 +1105,7 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
                 hidden_states.device,
                 hidden_states.dtype,
                 num_vision_items=len(control_lantent_list) + 1,
-                share_vision_temporal_positions=transfer_share_vision_temporal_positions
+                share_vision_temporal_positions=transfer_share_vision_temporal_positions,
             )
             cached_kv_full = self.language_model(
                 text_ids,
@@ -1173,7 +1173,9 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
                         f"control[{idx}]={tuple(control.shape)}, target={tuple(hidden_states.shape)}."
                     )
                 hidden_control = self.vae2llm(
-                    self.patchify(control.to(device=hidden_gen.device, dtype=hidden_gen.dtype), T, H, W)
+                    self.patchify(
+                        control.to(device=hidden_gen.device, dtype=hidden_gen.dtype), T, H, W
+                    )
                 )
                 hidden_controls.append(hidden_control)
                 T_control += hidden_control.shape[1]
@@ -1217,7 +1219,9 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
         hidden_gen = self.norm_moe_gen(hidden_gen)
 
         # --- Decode video velocity ------------------------------------------------
-        video_vel = self.unpatchify(self.llm2vae(hidden_gen[:, T_control:T_control + T_vid_tokens]), T, H, W)
+        video_vel = self.unpatchify(
+            self.llm2vae(hidden_gen[:, T_control : T_control + T_vid_tokens]), T, H, W
+        )
 
         # --- Decode audio velocity (if requested) ---------------------------------
         # Control latents and audio are mutually exclusive (guarded above), so the
