@@ -174,17 +174,12 @@ ENABLE_NGC_RELEASE_IMAGE_TEST = params.enableNgcReleaseImageTest ?: false
 
 COMMON_SSH_OPTIONS = "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o TCPKeepAlive=no -o ServerAliveInterval=30 -o ServerAliveCountMax=20"
 
-// CBTS per-test coverage gate; official post-merge pipeline only, single-GPU stages only in Phase 1.
-ENABLE_CBTS_COVERAGE = true
+// Per-stage CBTS coverage exclusions applied on top of the upstream eligibility decision.
 CBTS_EXCLUDE_STAGES = [] as Set
-// Reassigned in the Setup Environment stage from the upstream post-merge flag.
-CBTS_PIPELINE_ELIGIBLE = false
 
 def isCbtsStage(String stageName) {
-    if (!ENABLE_CBTS_COVERAGE) {
-        return false
-    }
-    if (!CBTS_PIPELINE_ELIGIBLE) {
+    // Pipeline-level eligibility (post-merge gate + kill switch) is decided in L0_MergeRequest.groovy and propagated via testFilter.
+    if (!(testFilter[(CBTS_COVERAGE)] ?: false)) {
         return false
     }
     // Perf stages skip coverage to avoid skewing measurements (perfMode == stageName.contains("Perf")).
@@ -2066,6 +2061,9 @@ def DEBUG_MODE = "debug"
 def DETAILED_LOG = "detailed_log"
 @Field
 def CBTS_RESULT = "cbts_result"
+// Pipeline-level CBTS coverage eligibility, decided in L0_MergeRequest.groovy.
+@Field
+def CBTS_COVERAGE = "cbts_coverage"
 // Suffix for CBTS-narrowed stages so their results aren't reused by non-CBTS runs.
 // A suffix (not prefix) keeps the GPU type as the first '-' token for positional parsers.
 @Field
@@ -2089,6 +2087,7 @@ def testFilter = [
     (AUTO_TRIGGER_TAG_LIST): [],
     (DETAILED_LOG): false,
     (CBTS_RESULT): null,
+    (CBTS_COVERAGE): false,
 ]
 
 @Field
@@ -5720,9 +5719,6 @@ pipeline {
                     echo "env.testFilter is: ${env.testFilter}"
                     testFilter = trtllm_utils.updateMapWithJson(this, testFilter, env.testFilter, "testFilter")
                     println testFilter
-                    // CBTS coverage runs only on post-merge, per the upstream testFilter post_merge flag.
-                    CBTS_PIPELINE_ELIGIBLE = (testFilter[(IS_POST_MERGE)] ?: false)
-                    echo "CBTS_PIPELINE_ELIGIBLE is: ${CBTS_PIPELINE_ELIGIBLE}"
                     echo "env.globalVars is: ${env.globalVars}"
                     globalVars = trtllm_utils.updateMapWithJson(this, globalVars, env.globalVars, "globalVars")
                     globalVars = trtllm_utils.initializeCiBudget(this, globalVars, 24, 'HOURS', 'L0_Test')

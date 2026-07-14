@@ -22,12 +22,15 @@ not lines executed (far cheaper than line tracing).
 
 ## When it runs
 
-`isCbtsStage()` in `jenkins/L0_Test.groovy` gates each stage on:
+`jenkins/L0_MergeRequest.groovy` decides pipeline-level eligibility and propagates it to the runner via `testFilter[cbts_coverage]`:
 
-- `CBTS_PIPELINE_ELIGIBLE` — true only on the official post-merge pipeline (`JOB_NAME` carries `L0_PostMerge`)
+- `ENABLE_CBTS_COVERAGE` (global kill-switch) AND the post-merge gate — coverage runs only on the official post-merge pipeline
+
+`isCbtsStage()` in `jenkins/L0_Test.groovy` then gates each stage on that propagated flag plus:
+
 - not a perf stage, and not a TensorRT / CPP / AutoDeploy stage
 - single-GPU only — stages named with `-<N>_GPUs` or `-<N>_Nodes` (multi-GPU / multi-node) are disabled in phase 1 and enabled incrementally later
-- `ENABLE_CBTS_COVERAGE` (global kill-switch) and `CBTS_EXCLUDE_STAGES` (per-stage skip)
+- `CBTS_EXCLUDE_STAGES` (per-stage skip)
 
 Non-CBTS stages get an empty `.coveragerc` and run uninstrumented.
 
