@@ -954,10 +954,8 @@ def test_mhc_fused_hc_cuda_graph(n: int, hidden_size: int, hc_mult: int):
             cur_module.base,
         ]
 
-    # Eager reference — runner's workspace cache reuses output tensors across
-    # calls with matching shape, so eager_out and graph_out alias the same
-    # storage. Clone eager_out so we can compare after the graph replay
-    # overwrites the workspace.
+    # Clone the eager result into an immutable golden before warmup and graph
+    # capture exercise additional allocations.
     eager_raw = runner(inputs=_inputs(), tactic=tactic)
     eager_out = tuple(t.clone() for t in eager_raw)
 
@@ -1004,6 +1002,303 @@ def test_mhc_fused_hc_cuda_graph(n: int, hidden_size: int, hc_mult: int):
         torch.testing.assert_close(
             ge, ee, rtol=0, atol=0, msg=f"fused_hc CUDA-graph replay mismatch in {name}"
         )
+
+
+def _make_fused_hc_runner_case(n: int, hidden_size: int, hc_mult: int, seed: int):
+    from tensorrt_llm._torch.modules.mhc.mhc_cuda import MhcFusedHcRunner
+
+    pre_data = generate_pre_data(n=n, hc_mult=hc_mult, hidden_size=hidden_size)
+
+    torch.random.manual_seed(seed)
+    device = "cuda"
+    x_prev = torch.randn((n, hidden_size), dtype=torch.bfloat16, device=device) / hidden_size
+    residual_prev = (
+        torch.randn((n, hc_mult, hidden_size), dtype=torch.float, device=device) / hidden_size
+    ).bfloat16()
+    post_mix_prev = torch.randn((n, hc_mult, 1), dtype=torch.float32, device=device) * 0.1
+    comb_mix_prev = torch.randn((n, hc_mult, hc_mult), dtype=torch.float32, device=device) * 0.1
+
+    cur_module = mHC(
+        mult=hc_mult,
+        hidden_size=hidden_size,
+        sinkhorn_iters=pre_data["sinkhorn_repeat"],
+        dtype=None,
+        eps=pre_data["hc_pre_eps"],
+        norm_eps=pre_data["rms_eps"],
+        post_mult_value=pre_data["hc_post_mult_value"],
+    ).cuda()
+    cur_module.fn.copy_(pre_data["fn"])
+    cur_module.scale.copy_(pre_data["hc_scale"])
+    cur_module.base.copy_(pre_data["hc_base"])
+
+    runner = MhcFusedHcRunner(
+        n=hc_mult,
+        hidden_size=hidden_size,
+        rms_eps=pre_data["rms_eps"],
+        hc_pre_eps=pre_data["hc_pre_eps"],
+        hc_sinkhorn_eps=pre_data["hc_sinkhorn_eps"],
+        hc_post_mult_value=pre_data["hc_post_mult_value"],
+        sinkhorn_repeat=pre_data["sinkhorn_repeat"],
+    )
+
+    inputs = [
+        x_prev,
+        residual_prev.reshape(n, hc_mult, hidden_size).contiguous(),
+        post_mix_prev.reshape(n, hc_mult).contiguous(),
+        comb_mix_prev.reshape(n, hc_mult, hc_mult).contiguous(),
+        cur_module.fn,
+        cur_module.scale,
+        cur_module.base,
+    ]
+    return runner, inputs
+
+
+@pytest.mark.parametrize(
+    "backend,num_k_splits,tile_m,expected_shapes",
+    [
+        ("fused_half_mma", 56, 1, ((129, 24), (129,), (1,))),
+        ("fused_half_fma", 4, 1, ((4, 129, 24), (4, 129), (1,))),
+        ("fused_all_mma", 56, 1, ((129, 24), (129,), (3,))),
+        ("fused_all_fma", 2, 4, ((129, 24), (129,), (33,))),
+    ],
+)
+def test_mhc_fused_hc_allocates_minimal_scratch(
+    backend: str,
+    num_k_splits: int,
+    tile_m: int,
+    expected_shapes: tuple[tuple[int, ...], ...],
+) -> None:
+    from tensorrt_llm._torch.modules.mhc import mhc_cuda
+
+    alloc_scratch = mhc_cuda._alloc_fused_hc_scratch
+
+    scratch = alloc_scratch(
+        backend=backend,
+        B=129,
+        n=4,
+        num_k_splits=num_k_splits,
+        tile_m=tile_m,
+        device=torch.device("cpu"),
+    )
+
+    assert tuple(tuple(tensor.shape) for tensor in scratch) == expected_shapes
+
+
+def test_mhc_fused_hc_preserves_chained_inputs():
+    """A fused-HC call must not overwrite state returned by the previous call."""
+    runner, inputs = _make_fused_hc_runner_case(n=6, hidden_size=7168, hc_mult=4, seed=61)
+    tactic = ("fused_half_fma", 2, 4, 512, 1)
+
+    first_outputs = runner(inputs=inputs, tactic=tactic)
+    chained_inputs = [
+        inputs[0],
+        first_outputs[0],
+        first_outputs[1],
+        first_outputs[2],
+        *inputs[4:],
+    ]
+    saved_inputs = tuple(tensor.clone() for tensor in chained_inputs[1:4])
+
+    second_outputs = runner(inputs=chained_inputs, tactic=tactic)
+
+    for actual, expected, name in zip(
+        chained_inputs[1:4],
+        saved_inputs,
+        ("residual", "post_mix", "comb_mix"),
+    ):
+        torch.testing.assert_close(
+            actual,
+            expected,
+            rtol=0,
+            atol=0,
+            msg=f"fused_hc mutated its {name} input",
+        )
+
+    reference_inputs = [inputs[0].clone(), *saved_inputs, *inputs[4:]]
+    reference_outputs = runner(inputs=reference_inputs, tactic=tactic)
+    for actual, expected, name, tolerance in zip(
+        second_outputs,
+        reference_outputs,
+        ("residual", "post_mix", "comb_mix", "layer_input"),
+        (1e-2, 5e-3, 5e-3, 1e-2),
+    ):
+        torch.testing.assert_close(
+            actual,
+            expected,
+            rtol=tolerance,
+            atol=tolerance,
+            msg=f"chained fused_hc produced an incorrect {name}",
+        )
+
+
+def test_mhc_fused_hc_three_call_cuda_graph_replay():
+    """An odd-length fused-HC chain must remain stable across graph replays."""
+    runner, inputs = _make_fused_hc_runner_case(n=6, hidden_size=4096, hc_mult=4, seed=73)
+    tactic = ("fused_half_fma", 2, 1, 512, 1)
+
+    def run_chain():
+        first = runner(inputs=inputs, tactic=tactic)
+        second = runner(
+            inputs=[inputs[0], first[0], first[1], first[2], *inputs[4:]],
+            tactic=tactic,
+        )
+        return runner(
+            inputs=[inputs[0], second[0], second[1], second[2], *inputs[4:]],
+            tactic=tactic,
+        )
+
+    warmup_stream = torch.cuda.Stream()
+    warmup_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(warmup_stream):
+        for _ in range(3):
+            run_chain()
+    torch.cuda.current_stream().wait_stream(warmup_stream)
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_outputs = run_chain()
+
+    for scale in (1.0003, 1.0005, 1.0007):
+        for tensor in inputs[:4]:
+            tensor.mul_(scale)
+        expected = tuple(tensor.clone() for tensor in run_chain())
+        graph.replay()
+        torch.cuda.synchronize()
+        for actual, reference, name in zip(
+            graph_outputs,
+            expected,
+            ("residual", "post_mix", "comb_mix", "layer_input"),
+        ):
+            torch.testing.assert_close(
+                actual,
+                reference,
+                rtol=0,
+                atol=0,
+                msg=f"three-call CUDA graph replay mismatch in {name}",
+            )
+
+
+def test_mhc_fused_hc_concurrent_streams() -> None:
+    """Concurrent fused-HC calls on separate streams must remain independent."""
+    runner, first_inputs = _make_fused_hc_runner_case(n=6, hidden_size=4096, hc_mult=4, seed=79)
+    second_inputs = [tensor.clone() for tensor in first_inputs]
+    for tensor in second_inputs[:4]:
+        tensor.mul_(1.01)
+    tactic = ("fused_half_fma", 2, 1, 512, 1)
+
+    current_stream = torch.cuda.current_stream()
+    first_stream = torch.cuda.Stream()
+    second_stream = torch.cuda.Stream()
+    first_stream.wait_stream(current_stream)
+    second_stream.wait_stream(current_stream)
+
+    with torch.cuda.stream(first_stream):
+        first_outputs = runner(inputs=first_inputs, tactic=tactic)
+    with torch.cuda.stream(second_stream):
+        second_outputs = runner(inputs=second_inputs, tactic=tactic)
+
+    current_stream.wait_stream(first_stream)
+    current_stream.wait_stream(second_stream)
+    torch.cuda.synchronize()
+
+    first_reference = tuple(tensor.clone() for tensor in runner(inputs=first_inputs, tactic=tactic))
+    second_reference = tuple(
+        tensor.clone() for tensor in runner(inputs=second_inputs, tactic=tactic)
+    )
+    for actual_outputs, reference_outputs in (
+        (first_outputs, first_reference),
+        (second_outputs, second_reference),
+    ):
+        for actual, reference in zip(actual_outputs, reference_outputs):
+            torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+
+
+def _assert_graph_replay_matches_eager(runner, inputs, tactic):
+    runner(inputs=inputs, tactic=tactic)
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_out = runner(inputs=inputs, tactic=tactic)
+    graph.replay()
+    torch.cuda.synchronize()
+
+    for tensor in inputs[:4]:
+        tensor.mul_(1.0007)
+
+    eager_out = tuple(t.clone() for t in runner(inputs=inputs, tactic=tactic))
+    torch.cuda.synchronize()
+    graph.replay()
+    torch.cuda.synchronize()
+
+    for actual, expected, name in zip(
+        graph_out, eager_out, ("residual", "post_mix", "comb_mix", "layer_input")
+    ):
+        # splitK atomics are not bit-exact, but stale graph pointers or bad
+        # workspace reuse would diverge far beyond this bf16-scale tolerance.
+        torch.testing.assert_close(
+            actual,
+            expected,
+            rtol=3e-2,
+            atol=5e-2,
+            msg=f"fused_hc CUDA-graph replay mismatch in {name}; tactic={tactic}",
+        )
+
+
+@pytest.mark.parametrize("n", [64, 128])
+@pytest.mark.parametrize(
+    "tactic",
+    [
+        ("fused_half_mma", 0, 64, 512, 1),
+        ("fused_all_mma", 0, 64, 0, 1),
+    ],
+)
+def test_mhc_fused_hc_cuda_graph_high_splitk_tactics(n: int, tactic):
+    """Reduced autotune maps decode buckets to high-splitK MMA tactics.
+
+    Unlike the bit-exact ks=1 graph test above, this covers the actual
+    M=64/128 PR autotune path where splitK atomics and CUDA graph replay are
+    both active.
+    """
+    runner, inputs = _make_fused_hc_runner_case(n=n, hidden_size=4096, hc_mult=4, seed=41 + n)
+    _assert_graph_replay_matches_eager(runner, inputs, tactic)
+
+
+def test_mhc_fused_hc_cuda_graph_decode_buckets_then_prefill():
+    """Capture reduced-autotune decode buckets, then run the large prefill path.
+
+    The CI failure happened after CUDA graph warmup for decode buckets and on
+    the subsequent M=8192 warmup. This test keeps that ordering local to
+    fused_hc and covers both PR-selected M=8192 MMA tactics.
+    """
+    hidden_size = 4096
+    hc_mult = 4
+
+    for n in (128, 64):
+        for tactic in (
+            ("fused_half_mma", 0, 64, 512, 1),
+            ("fused_all_mma", 0, 64, 0, 1),
+        ):
+            runner, inputs = _make_fused_hc_runner_case(
+                n=n, hidden_size=hidden_size, hc_mult=hc_mult, seed=100 + n
+            )
+            _assert_graph_replay_matches_eager(runner, inputs, tactic)
+
+    runner, inputs = _make_fused_hc_runner_case(
+        n=8192, hidden_size=hidden_size, hc_mult=hc_mult, seed=8192
+    )
+    for tactic in (
+        ("fused_half_mma", 0, 1, 128, 1),
+        ("fused_half_mma", 0, 1, 256, 1),
+        ("fused_all_mma", 0, 1, 0, 1),
+    ):
+        outputs = runner(inputs=inputs, tactic=tactic)
+        torch.cuda.synchronize()
+        for output in outputs:
+            assert torch.isfinite(output.float()).all(), (
+                f"non-finite fused_hc output; tactic={tactic}"
+            )
 
 
 @pytest.mark.parametrize("m", [64, 128, 4096, 8192])

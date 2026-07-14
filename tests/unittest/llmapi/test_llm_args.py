@@ -8,6 +8,7 @@ from typing import Annotated, Any, ClassVar, Literal, get_args, get_origin
 
 import pydantic_core
 import pytest
+import torch
 import yaml
 from pydantic import BaseModel, TypeAdapter, ValidationError
 from utils.llm_data import llm_models_root
@@ -16,16 +17,13 @@ from utils.util import force_ampere
 import tensorrt_llm.bindings.executor as tle
 import tensorrt_llm.llmapi.llm_args as llm_args_mod
 from tensorrt_llm import LLM as TorchLLM
-from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm._torch.auto_deploy.llm_args import \
     LlmArgs as AutoDeployLlmArgs
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_llama import LlamaForCausalLM
 from tensorrt_llm._torch.virtual_memory import RestoreMode
-from tensorrt_llm.builder import LoraConfig
 from tensorrt_llm.commands.serve import get_llm_args, is_non_default_or_required
-from tensorrt_llm.llmapi import (BuildConfig, CapacitySchedulerPolicy,
-                                 SchedulerConfig)
+from tensorrt_llm.llmapi import CapacitySchedulerPolicy, SchedulerConfig
 # fmt: off
 from tensorrt_llm.llmapi.llm_args import (BaseLlmArgs, CacheTransceiverConfig,
                                           CalibConfig, ContextChunkingPolicy,
@@ -48,15 +46,16 @@ from tensorrt_llm.llmapi.llm_args import (BaseLlmArgs, CacheTransceiverConfig,
                                           SkipSoftmaxAttentionConfig,
                                           SleepConfig, SpeculativeConfig,
                                           StrictBaseModel, TorchCompileConfig,
-                                          TorchLlmArgs, TrtLlmArgs,
+                                          TorchLlmArgs,
                                           UserProvidedDecodingConfig,
                                           update_llm_args_with_extra_dict)
 # fmt: on
-from tensorrt_llm.llmapi.llm_utils import apply_model_defaults_to_llm_args
+from tensorrt_llm.llmapi.llm_utils import (_resolve_kv_cache_manager_v2_auto,
+                                           apply_model_defaults_to_llm_args)
 from tensorrt_llm.llmapi.mm_encoder import MultimodalEncoder
 from tensorrt_llm.llmapi.utils import print_traceback_on_error
+from tensorrt_llm.lora_helper import LoraConfig
 from tensorrt_llm.models.modeling_utils import LayerQuantConfig, QuantConfig
-from tensorrt_llm.plugin import PluginConfig
 
 from .test_llm import llama_model_path
 
@@ -113,45 +112,6 @@ class TestYaml:
             dict_content = yaml.safe_load(f)
         return dict_content
 
-    def test_llm_args_yaml_with_speculative_config(self):
-        yaml_content = """
-speculative_config:
-    decoding_type: Lookahead
-    max_window_size: 4
-    max_ngram_size: 3
-    """
-        llm_args_dict = self._yaml_to_dict(yaml_content)
-
-        llm_args = TrtLlmArgs(model=llama_model_path, **llm_args_dict)
-        assert llm_args.speculative_config.max_window_size == 4
-        assert llm_args.speculative_config.max_ngram_size == 3
-        assert llm_args.speculative_config.max_verification_set_size == 4
-
-    def test_llm_args_with_invalid_yaml(self):
-        yaml_content = """
-pytorch_backend_config: # this is deprecated
-    max_num_tokens: 1
-    max_seq_len: 1
-"""
-        llm_args_dict = self._yaml_to_dict(yaml_content)
-
-        with pytest.raises(ValueError):
-            llm_args = TrtLlmArgs(model=llama_model_path, **llm_args_dict)
-
-    def test_llm_args_with_build_config(self):
-        yaml_content = """
-build_config:
-    max_beam_width: 4
-    max_batch_size: 8
-    max_num_tokens: 256
-    """
-        llm_args_dict = self._yaml_to_dict(yaml_content)
-
-        llm_args = TrtLlmArgs(model=llama_model_path, **llm_args_dict)
-        assert llm_args.build_config.max_beam_width == 4
-        assert llm_args.build_config.max_batch_size == 8
-        assert llm_args.build_config.max_num_tokens == 256
-
     def test_llm_args_with_kvcache_config(self):
         yaml_content = """
 kv_cache_config:
@@ -161,7 +121,7 @@ kv_cache_config:
     """
         llm_args_dict = self._yaml_to_dict(yaml_content)
 
-        llm_args = TrtLlmArgs(model=llama_model_path, **llm_args_dict)
+        llm_args = TorchLlmArgs(model=llama_model_path, **llm_args_dict)
         assert llm_args.kv_cache_config.enable_block_reuse == True
         assert llm_args.kv_cache_config.max_tokens == 1024
         assert llm_args.kv_cache_config.max_attention_window == [
@@ -176,12 +136,12 @@ max_seq_len: 128
     """
         llm_args_dict = self._yaml_to_dict(yaml_content)
 
-        llm_args = TrtLlmArgs(model=llama_model_path, **llm_args_dict)
+        llm_args = TorchLlmArgs(model=llama_model_path, **llm_args_dict)
         assert llm_args.max_batch_size == 16
         assert llm_args.max_num_tokens == 256
         assert llm_args.max_seq_len == 128
 
-    @pytest.mark.parametrize("llm_args_cls", [TrtLlmArgs, TorchLlmArgs])
+    @pytest.mark.parametrize("llm_args_cls", [TorchLlmArgs])
     def test_llm_args_with_model_kwargs(self, llm_args_cls):
         yaml_content = """
 model_kwargs:
@@ -190,6 +150,63 @@ model_kwargs:
         llm_args_dict = self._yaml_to_dict(yaml_content)
         llm_args = llm_args_cls(model=llama_model_path, **llm_args_dict)
         assert llm_args.model_kwargs['num_hidden_layers'] == 2
+
+
+@pytest.mark.parametrize("llm_args_cls", [TorchLlmArgs])
+class TestEncoderRuntimeSizes:
+    """Cover encoder runtime size fields and fallback to LLM limits.
+
+    `encoder_max_batch_size` / `encoder_max_num_tokens` are user-facing
+    knobs that size multimodal encoder AttentionMetadata; when unset they
+    fall back to the LLM-side `max_batch_size` / `max_num_tokens`. They are
+    PyTorch-backend only (the multimodal encoder profiling path), so they
+    live on `TorchLlmArgs` rather than the shared `BaseLlmArgs`.
+    """
+
+    def test_defaults_are_none(self, llm_args_cls):
+        llm_args = llm_args_cls(model=llama_model_path)
+        assert llm_args.encoder_max_batch_size is None
+        assert llm_args.encoder_max_num_tokens is None
+
+    @pytest.mark.parametrize(
+        "kwargs, expected_runtime_sizes",
+        [
+            # Neither encoder knob set -- falls back to LLM limits.
+            (dict(max_batch_size=64, max_num_tokens=2048), (64, 2048)),
+            # Only encoder_max_batch_size overrides.
+            (dict(max_batch_size=64,
+                  max_num_tokens=2048,
+                  encoder_max_batch_size=512), (512, 2048)),
+            # Only encoder_max_num_tokens overrides.
+            (dict(max_batch_size=64,
+                  max_num_tokens=2048,
+                  encoder_max_num_tokens=32768), (64, 32768)),
+            # Both encoder knobs override.
+            (dict(max_batch_size=64,
+                  max_num_tokens=2048,
+                  encoder_max_batch_size=512,
+                  encoder_max_num_tokens=32768), (512, 32768)),
+        ],
+        ids=["fallback", "only_batch", "only_tokens", "both"],
+    )
+    def test_get_encoder_runtime_sizes(self, llm_args_cls, kwargs,
+                                       expected_runtime_sizes):
+        llm_args = llm_args_cls(model=llama_model_path, **kwargs)
+        assert llm_args.get_encoder_runtime_sizes() == expected_runtime_sizes
+
+    @pytest.mark.parametrize(
+        "field_name, invalid_value",
+        [
+            ("encoder_max_batch_size", 0),
+            ("encoder_max_batch_size", -1),
+            ("encoder_max_num_tokens", 0),
+            ("encoder_max_num_tokens", -1),
+        ],
+    )
+    def test_rejects_non_positive(self, llm_args_cls, field_name,
+                                  invalid_value):
+        with pytest.raises(ValidationError):
+            llm_args_cls(model=llama_model_path, **{field_name: invalid_value})
 
 
 def test_decoding_type_eagle3_parses_to_eagle3_decoding_config():
@@ -220,13 +237,18 @@ def test_decoding_type_eagle_warns_on_pytorch_backend(monkeypatch):
         for m in warnings_seen)
 
 
-def test_decoding_type_eagle3_errors_on_tensorrt_backend():
-    spec_cfg = Eagle3DecodingConfig(decoding_type="Eagle3",
-                                    max_draft_len=3,
-                                    speculative_model="/path/to/draft/model")
-    with pytest.raises(ValueError,
-                       match="only supported on the PyTorch backend"):
-        TrtLlmArgs(model=llama_model_path, speculative_config=spec_cfg)
+def test_post_processor_hook_rejected_with_skip_tokenizer_init():
+    """post_processor_hook + skip_tokenizer_init must fail fast.
+
+    The hook is a text-based guardrail; pairing it with skip_tokenizer_init (no
+    detokenized text) must be rejected rather than silently disabling it.
+    """
+    with pytest.raises(ValidationError, match="skip_tokenizer_init"):
+        TorchLlmArgs(model="/tmp/dummy_model",
+                     skip_tokenizer_init=True,
+                     post_processor_hook="my_pkg.guardrail.Hook")
+    # skip_tokenizer_init alone (no hook) is still fine.
+    TorchLlmArgs(model="/tmp/dummy_model", skip_tokenizer_init=True)
 
 
 class TestModelDefaults:
@@ -237,6 +259,43 @@ class TestModelDefaults:
         llm_args = TorchLlmArgs(model="/tmp/dummy_model")
         applied = apply_model_defaults_to_llm_args(llm_args, model_defaults)
         assert applied == model_defaults
+
+    @pytest.mark.parametrize("explicit_auto", [False, True])
+    def test_kv_cache_manager_v2_auto_uses_model_default(self, explicit_auto):
+        kv_cache_config = (KvCacheConfig(use_kv_cache_manager_v2="auto")
+                           if explicit_auto else KvCacheConfig())
+        llm_args = TorchLlmArgs(model="/tmp/dummy_model",
+                                kv_cache_config=kv_cache_config)
+        model_defaults = {"kv_cache_config": {"use_kv_cache_manager_v2": True}}
+
+        apply_model_defaults_to_llm_args(llm_args, model_defaults)
+        _resolve_kv_cache_manager_v2_auto(llm_args, model_defaults)
+
+        assert llm_args.kv_cache_config.use_kv_cache_manager_v2 is True
+
+    def test_kv_cache_manager_v2_auto_falls_back_to_false(self):
+        llm_args = TorchLlmArgs(model="/tmp/dummy_model")
+
+        _resolve_kv_cache_manager_v2_auto(llm_args, {})
+
+        assert llm_args.kv_cache_config.use_kv_cache_manager_v2 is False
+
+    @pytest.mark.parametrize("user_setting", [False, True])
+    def test_kv_cache_manager_v2_explicit_value_overrides_model_default(
+            self, user_setting):
+        llm_args = TorchLlmArgs(
+            model="/tmp/dummy_model",
+            kv_cache_config=KvCacheConfig(use_kv_cache_manager_v2=user_setting))
+        model_defaults = {
+            "kv_cache_config": {
+                "use_kv_cache_manager_v2": not user_setting
+            }
+        }
+
+        apply_model_defaults_to_llm_args(llm_args, model_defaults)
+        _resolve_kv_cache_manager_v2_auto(llm_args, model_defaults)
+
+        assert llm_args.kv_cache_config.use_kv_cache_manager_v2 is user_setting
 
     @pytest.mark.parametrize(
         "defaults_dict,should_raise,error_contains",
@@ -337,6 +396,15 @@ class TestModelDefaults:
 
 def test_KvCacheConfig_declaration():
     assert KvCacheConfig().kv_cache_event_hash_algo == "auto"
+    assert KvCacheConfig().block_reuse_policy == "all_reusable"
+    assert KvCacheConfig().enable_swa_scratch_reuse is False
+    assert KvCacheConfig().use_kv_cache_manager_v2 == "auto"
+    assert KvCacheConfig(
+        use_kv_cache_manager_v2=True).use_kv_cache_manager_v2 is True
+    assert KvCacheConfig(
+        use_kv_cache_manager_v2=False).use_kv_cache_manager_v2 is False
+    with pytest.raises(ValidationError, match="use_kv_cache_manager_v2"):
+        KvCacheConfig(use_kv_cache_manager_v2="invalid")
 
     config = KvCacheConfig(enable_block_reuse=True,
                            max_tokens=1024,
@@ -349,8 +417,12 @@ def test_KvCacheConfig_declaration():
                            secondary_offload_min_priority=1,
                            event_buffer_max_size=0,
                            kv_cache_event_hash_algo="v2_sha256_64",
+                           enable_swa_scratch_reuse=True,
                            enable_partial_reuse=True,
                            copy_on_partial_reuse=True,
+                           pool_ratio=[0.25, 0.75],
+                           avg_seq_len=2048,
+                           block_reuse_policy="per_request",
                            attention_dp_events_gather_period_ms=10)
 
     pybind_config = config._to_pybind()
@@ -361,10 +433,19 @@ def test_KvCacheConfig_declaration():
     assert pybind_config.host_cache_size == 1024
     assert config.disk_cache_size == 2048
     assert config.disk_cache_path == "/tmp"
+    assert config.enable_swa_scratch_reuse is True
+    assert KvCacheConfig().enable_swa_scratch_reuse is False
     assert pybind_config.cross_kv_cache_fraction == 0.5
     assert pybind_config.secondary_offload_min_priority == 1
     assert pybind_config.event_buffer_max_size == 0
     assert config.kv_cache_event_hash_algo == "v2_sha256_64"
+    assert config.pool_ratio == [0.25, 0.75]
+    assert config.avg_seq_len == 2048
+    assert config.block_reuse_policy == "per_request"
+    assert not hasattr(pybind_config, "pool_ratio")
+    assert not hasattr(pybind_config, "avg_seq_len")
+    assert not hasattr(pybind_config, "block_reuse_policy")
+    assert not hasattr(pybind_config, "enable_swa_scratch_reuse")
     assert KvCacheConfig(
         kv_cache_event_hash_algo="auto").kv_cache_event_hash_algo == "auto"
     assert KvCacheConfig(kv_cache_event_hash_algo="v1_block_key"
@@ -372,6 +453,8 @@ def test_KvCacheConfig_declaration():
     assert pybind_config.enable_partial_reuse == True
     assert pybind_config.copy_on_partial_reuse == True
     assert pybind_config.attention_dp_events_gather_period_ms == 10
+    with pytest.raises(ValidationError):
+        KvCacheConfig(block_reuse_policy="invalid")
 
 
 def test_KvCacheConfig_disk_cache_validation(tmp_path):
@@ -431,11 +514,27 @@ class TestMultimodalConfig:
 
     def test_default_encoder_cuda_graph_is_none(self):
         assert MultimodalConfig().encoder_cuda_graph is None
+        assert MultimodalConfig().encoder_side_stream_max_ahead == 0
+        assert MultimodalConfig().video_pruning_rate is None
 
     def test_torch_llm_args_default_multimodal_config(self):
         args = TorchLlmArgs(model=llama_model_path)
         assert isinstance(args.multimodal_config, MultimodalConfig)
         assert args.multimodal_config.encoder_cuda_graph is None
+        assert args.multimodal_config.encoder_side_stream_max_ahead == 0
+        assert args.multimodal_config.video_pruning_rate is None
+
+    def test_torch_llm_args_with_encoder_side_stream_max_ahead(self):
+        args = TorchLlmArgs(
+            model=llama_model_path,
+            multimodal_config=MultimodalConfig(encoder_side_stream_max_ahead=2))
+        assert args.multimodal_config.encoder_side_stream_max_ahead == 2
+
+    def test_torch_llm_args_with_multimodal_video_pruning_rate(self):
+        args = TorchLlmArgs(
+            model=llama_model_path,
+            multimodal_config=MultimodalConfig(video_pruning_rate=0.5))
+        assert args.multimodal_config.video_pruning_rate == 0.5
 
     def test_torch_llm_args_with_encoder_cuda_graph_buckets(self):
         args = TorchLlmArgs(
@@ -462,6 +561,50 @@ class TestMultimodalConfig:
         )
         encoder_graph = args.multimodal_config.encoder_cuda_graph
         assert encoder_graph["vision"].buckets == [(1035, 1), (2069, 2)]
+
+    def test_torch_llm_args_with_encoder_side_stream_max_ahead_yaml(self):
+        args = TorchLlmArgs(
+            model=llama_model_path,
+            multimodal_config={
+                "encoder_side_stream_max_ahead": 2,
+                "video_pruning_rate": 0.5,
+            },
+        )
+        assert args.multimodal_config.encoder_side_stream_max_ahead == 2
+        assert args.multimodal_config.video_pruning_rate == 0.5
+
+    def test_encoder_cuda_graph_and_side_stream_max_ahead_are_exclusive(self):
+        with pytest.raises(ValidationError, match="mutually exclusive"):
+            TorchLlmArgs(
+                model=llama_model_path,
+                multimodal_config={
+                    "encoder_cuda_graph": {
+                        "vision": {
+                            "buckets": [[1035, 1]]
+                        }
+                    },
+                    "encoder_side_stream_max_ahead": 1,
+                },
+            )
+
+
+@pytest.mark.parametrize("kwargs", [
+    {
+        "pool_ratio": []
+    },
+    {
+        "pool_ratio": [0.0, 1.0]
+    },
+    {
+        "pool_ratio": [0.25, 0.25]
+    },
+    {
+        "avg_seq_len": 0
+    },
+])
+def test_KvCacheConfig_pool_ratio_avg_seq_len_validation(kwargs):
+    with pytest.raises(ValidationError):
+        KvCacheConfig(**kwargs)
 
 
 def test_CapacitySchedulerPolicy():
@@ -570,20 +713,27 @@ def test_DynamicBatchConfig_declaration():
     assert pybind_config.dynamic_batch_moving_average_window == 10
 
 
-def test_SchedulerConfig_declaration():
+def test_SchedulerConfig_declaration() -> None:
+    default_config = SchedulerConfig()
+    default_pybind_config = PybindMirror.maybe_to_pybind(default_config)
+    assert default_config.enable_prefix_aware_scheduling is True
+    assert default_pybind_config.enable_prefix_aware_scheduling is True
+
     config = SchedulerConfig(
         capacity_scheduler_policy=CapacitySchedulerPolicy.MAX_UTILIZATION,
         context_chunking_policy=ContextChunkingPolicy.EQUAL_PROGRESS,
         dynamic_batch_config=DynamicBatchConfig(
             enable_batch_size_tuning=True,
             enable_max_num_tokens_tuning=True,
-            dynamic_batch_moving_average_window=10))
+            dynamic_batch_moving_average_window=10),
+        enable_prefix_aware_scheduling=False)
 
     pybind_config = PybindMirror.maybe_to_pybind(config)
     assert pybind_config.capacity_scheduler_policy == tle.CapacitySchedulerPolicy.MAX_UTILIZATION
     assert pybind_config.context_chunking_policy == tle.ContextChunkingPolicy.EQUAL_PROGRESS
     assert PybindMirror.pybind_equals(pybind_config.dynamic_batch_config,
                                       config.dynamic_batch_config._to_pybind())
+    assert pybind_config.enable_prefix_aware_scheduling is False
 
 
 def test_PeftCacheConfig_declaration():
@@ -674,54 +824,6 @@ def test_PeftCacheConfig_from_pybind_gets_python_only_default_values_when_none(
     assert config.host_cache_size == PeftCacheConfig.model_fields[
         "host_cache_size"].default
     assert config.lora_prefetch_dir == "."
-
-
-def test_update_llm_args_with_extra_dict_with_nested_dict():
-    llm_api_args_dict = {
-        "model":
-        "dummy-model",
-        "build_config":
-        None,  # Will override later.
-        "extended_runtime_perf_knob_config":
-        ExtendedRuntimePerfKnobConfig(multi_block_mode=True),
-        "kv_cache_config":
-        KvCacheConfig(enable_block_reuse=False),
-        "peft_cache_config":
-        PeftCacheConfig(num_host_module_layer=0),
-        "scheduler_config":
-        SchedulerConfig(capacity_scheduler_policy=CapacitySchedulerPolicy.
-                        GUARANTEED_NO_EVICT)
-    }
-    plugin_config = PluginConfig(dtype='float16', nccl_plugin=None)
-    build_config = BuildConfig(max_input_len=1024,
-                               lora_config=LoraConfig(lora_ckpt_source='hf'),
-                               plugin_config=plugin_config)
-    extra_llm_args_dict = {
-        "build_config": build_config.model_dump(mode="json"),
-    }
-
-    llm_api_args_dict = update_llm_args_with_extra_dict(llm_api_args_dict,
-                                                        extra_llm_args_dict,
-                                                        "build_config")
-    initialized_llm_args = TrtLlmArgs(**llm_api_args_dict)
-
-    def check_nested_dict_equality(dict1, dict2, path=""):
-        if not isinstance(dict1, dict) or not isinstance(dict2, dict):
-            if dict1 != dict2:
-                raise ValueError(f"Mismatch at {path}: {dict1} != {dict2}")
-            return True
-        if dict1.keys() != dict2.keys():
-            raise ValueError(f"Different keys at {path}:")
-        for key in dict1:
-            new_path = f"{path}.{key}" if path else key
-            if not check_nested_dict_equality(dict1[key], dict2[key], new_path):
-                raise ValueError(f"Mismatch at {path}: {dict1} != {dict2}")
-        return True
-
-    build_config_dict1 = build_config.model_dump(mode="json")
-    build_config_dict2 = initialized_llm_args.build_config.model_dump(
-        mode="json")
-    check_nested_dict_equality(build_config_dict1, build_config_dict2)
 
 
 class TestTelemetryConfigPrecedence:
@@ -893,46 +995,32 @@ class TestExplicitCliKeysPrecedence:
         assert kv.free_gpu_memory_fraction == 0.85
         assert kv.enable_block_reuse is False
 
-    def test_build_config_tier_cli_wins(self):
-        # Tier 1: explicit CLI scalar wins over both top-level YAML and nested.
+    def test_multimodal_config_yaml_siblings_preserved(self):
         base = {
             "model": "dummy",
-            "max_batch_size": 64,
-            "build_config": BuildConfig(max_batch_size=64),
+            "multimodal_config":
+            MultimodalConfig(encoder_side_stream_max_ahead=2),
         }
         yaml_dict = {
-            "max_batch_size": 256,
-            "build_config": {
-                "max_batch_size": 300
-            },
+            "multimodal_config": {
+                "video_pruning_rate": 0.5,
+            }
         }
-        merged = update_llm_args_with_extra_dict(
-            base, yaml_dict, explicit_cli_keys={"max_batch_size"})
-        assert merged["max_batch_size"] == 64
-        assert merged["build_config"].max_batch_size == 64
+        merged = update_llm_args_with_extra_dict(base, yaml_dict)
+        multimodal_config = merged["multimodal_config"]
+        assert multimodal_config.encoder_side_stream_max_ahead == 2
+        assert multimodal_config.video_pruning_rate == 0.5
 
-    def test_build_config_tier_yaml_top_level_wins(self):
-        # Tier 2: no explicit CLI, but YAML top-level scalar -> propagate to
-        # build_config (legacy behavior).
+    def test_multimodal_config_null_yaml_preserves_base_config(self):
         base = {
             "model": "dummy",
-            "build_config": BuildConfig(max_batch_size=8),
+            "multimodal_config":
+            MultimodalConfig(encoder_side_stream_max_ahead=2),
         }
-        yaml_dict = {"max_batch_size": 256}
+        yaml_dict = {"multimodal_config": None}
         merged = update_llm_args_with_extra_dict(base, yaml_dict)
-        assert merged["max_batch_size"] == 256
-        assert merged["build_config"].max_batch_size == 256
-
-    def test_build_config_tier_yaml_nested_only_leaves_alone(self):
-        # Tier 3: no explicit CLI, no top-level YAML scalar; nested YAML
-        # build_config is imported by the outer merge.
-        base = {
-            "model": "dummy",
-            "build_config": BuildConfig(max_batch_size=8),
-        }
-        yaml_dict = {"build_config": {"max_batch_size": 256}}
-        merged = update_llm_args_with_extra_dict(base, yaml_dict)
-        assert merged["build_config"].max_batch_size == 256
+        multimodal_config = merged["multimodal_config"]
+        assert multimodal_config.encoder_side_stream_max_ahead == 2
 
     def test_telemetry_explicit_disabled_wins_over_yaml(self):
         from tensorrt_llm.usage.config import TelemetryConfig, UsageContext
@@ -1443,17 +1531,6 @@ class TestPiecewiseCudaGraphCaptureDefaults:
         assert kept == [1, 2, 4, 8, 1016]
 
 
-class TestTrtLlmArgs:
-
-    def test_dynamic_setattr(self):
-        with pytest.raises(pydantic_core._pydantic_core.ValidationError):
-            args = TrtLlmArgs(model=llama_model_path, invalid_arg=1)
-
-        with pytest.raises(ValueError):
-            args = TrtLlmArgs(model=llama_model_path)
-            args.invalid_arg = 1
-
-
 class TestTorchLlmArgs:
 
     @print_traceback_on_error
@@ -1507,101 +1584,6 @@ class TestTorchLlmArgs:
             llama_model_path, model_kwargs=model_kwargs).pretrained_config
         assert config_no_kwargs.num_hidden_layers != config_with_kwargs.num_hidden_layers
         assert config_with_kwargs.num_hidden_layers == 2
-
-
-class TestTrtLlmArgs:
-
-    def test_build_config_default(self):
-        args = TrtLlmArgs(model=llama_model_path)
-        # It will create a default build_config
-        assert args.build_config
-        assert args.build_config.max_beam_width == 1
-
-    def test_build_config_change(self):
-        build_config = BuildConfig(
-            max_beam_width=4,
-            max_batch_size=8,
-            max_num_tokens=256,
-        )
-        args = TrtLlmArgs(model=llama_model_path, build_config=build_config)
-        assert args.build_config.max_beam_width == build_config.max_beam_width
-        assert args.build_config.max_batch_size == build_config.max_batch_size
-        assert args.build_config.max_num_tokens == build_config.max_num_tokens
-
-    def test_LLM_with_build_config(self):
-        build_config = BuildConfig(
-            max_beam_width=4,
-            max_batch_size=8,
-            max_num_tokens=256,
-        )
-        args = TrtLlmArgs(model=llama_model_path, build_config=build_config)
-
-        assert args.build_config.max_beam_width == build_config.max_beam_width
-        assert args.build_config.max_batch_size == build_config.max_batch_size
-        assert args.build_config.max_num_tokens == build_config.max_num_tokens
-
-        assert args.max_beam_width == build_config.max_beam_width
-
-    def test_to_dict_and_from_dict(self):
-        build_config = BuildConfig(
-            max_beam_width=4,
-            max_batch_size=8,
-            max_num_tokens=256,
-        )
-        args = TrtLlmArgs(model=llama_model_path, build_config=build_config)
-        args_dict = args.model_dump()
-
-        new_args = TrtLlmArgs(**args_dict)
-
-        assert new_args.model_dump() == args_dict
-
-    def test_build_config_from_engine(self):
-        build_config = BuildConfig(max_batch_size=8, max_num_tokens=256)
-        tmp_dir = tempfile.mkdtemp()
-        with LLM(model=llama_model_path, build_config=build_config) as llm:
-            llm.save(tmp_dir)
-
-        args = TrtLlmArgs(
-            model=tmp_dir,
-            # runtime values
-            max_num_tokens=16,
-            max_batch_size=4,
-        )
-        assert args.build_config.max_batch_size == build_config.max_batch_size
-        assert args.build_config.max_num_tokens == build_config.max_num_tokens
-
-        assert args.max_num_tokens == 16
-        assert args.max_batch_size == 4
-
-    def test_model_dump_does_not_mutate_original(self):
-        """Test that model_dump() and update_llm_args_with_extra_dict don't mutate the original."""
-        # Create args with specific build_config values
-        build_config = BuildConfig(
-            max_batch_size=8,
-            max_num_tokens=256,
-        )
-        args = TrtLlmArgs(model=llama_model_path, build_config=build_config)
-
-        # Store original values
-        original_max_batch_size = args.build_config.max_batch_size
-        original_max_num_tokens = args.build_config.max_num_tokens
-
-        # Convert to dict and pass through update_llm_args_with_extra_dict with overrides
-        args_dict = args.model_dump()
-        extra_dict = {
-            "max_batch_size": 128,
-            "max_num_tokens": 1024,
-        }
-        updated_dict = update_llm_args_with_extra_dict(args_dict, extra_dict)
-
-        # Verify original args was NOT mutated
-        assert args.build_config.max_batch_size == original_max_batch_size
-        assert args.build_config.max_num_tokens == original_max_num_tokens
-
-        # Verify updated dict has new values
-        new_args = TrtLlmArgs(**updated_dict)
-        assert new_args.build_config.max_batch_size == 128
-        assert new_args.build_config.max_num_tokens == 1024
 
 
 class TestStrictBaseModelArbitraryArgs:
@@ -1741,6 +1723,16 @@ class TestStrictBaseModelArbitraryArgs:
                                         max_tokens_in_buffer=1024)
         assert config.backend == "UCX"
         assert config.max_tokens_in_buffer == 1024
+        assert config.kv_transfer_poll_interval_ms == 5000
+
+        # The bounce on/off switch defaults to off (0), accepts a positive size, and rejects
+        # negatives at the Pydantic boundary (ge=0). It is a Python-only field consumed directly by
+        # the v2 transceiver, so it is intentionally not part of _to_pybind().
+        assert config.kv_cache_bounce_size_mb == 0
+        assert CacheTransceiverConfig(
+            kv_cache_bounce_size_mb=384).kv_cache_bounce_size_mb == 384
+        with pytest.raises(pydantic_core._pydantic_core.ValidationError):
+            CacheTransceiverConfig(kv_cache_bounce_size_mb=-1)
 
         # Arbitrary arguments should be rejected
         with pytest.raises(
@@ -1793,19 +1785,6 @@ class TestStrictBaseModelArbitraryArgs:
                 ValueError,
                 match="MultimodalEncoder does not support encode_only"):
             encoder._validate_mm_args_for_torch_backend({"encode_only": True})
-
-    def test_trt_llm_args_arbitrary_args(self):
-        """Test that TrtLlmArgs rejects arbitrary arguments."""
-        # Valid arguments should work
-        args = TrtLlmArgs(model=llama_model_path, max_batch_size=8)
-        assert args.model == llama_model_path
-        assert args.max_batch_size == 8
-
-        # Arbitrary arguments should be rejected
-        with pytest.raises(
-                pydantic_core._pydantic_core.ValidationError) as exc_info:
-            TrtLlmArgs(model=llama_model_path, invalid_setting="should_fail")
-        assert "invalid_setting" in str(exc_info.value)
 
     def test_torch_llm_args_arbitrary_args(self):
         """Test that TorchLlmArgs rejects arbitrary arguments."""
@@ -1915,6 +1894,17 @@ class TestServeDefaults:
         assert llm_args.get("max_batch_size") == 128
         assert llm_args.get("tensor_parallel_size") == 4
 
+    def test_serve_video_pruning_rate_maps_to_multimodal_config(self):
+        llm_args, _ = get_llm_args(
+            model=llama_model_path,
+            backend="pytorch",
+            video_pruning_rate=0.5,
+            explicit_cli_keys={"video_pruning_rate"},
+        )
+
+        assert "video_pruning_rate" not in llm_args
+        assert llm_args["multimodal_config"].video_pruning_rate == 0.5
+
     def test_serve_backend_specific_configs(self):
         # PyTorch backend: build_config / scheduler_config stay None and are
         # filtered out.
@@ -1922,13 +1912,6 @@ class TestServeDefaults:
                                            backend="pytorch")
         assert "build_config" not in llm_args_pytorch
         assert "scheduler_config" not in llm_args_pytorch
-
-        # TensorRT backend: both are non-None and differ from the LlmArgs
-        # class default, so the value-based filter keeps them.
-        llm_args_trt, _ = get_llm_args(model=llama_model_path,
-                                       backend="tensorrt")
-        assert "build_config" in llm_args_trt
-        assert "scheduler_config" in llm_args_trt
 
     def test_serve_explicit_cli_default_value_wins_over_yaml(self):
         """Typing --tensor_parallel_size 1 (the default) must beat YAML."""
@@ -2776,7 +2759,58 @@ class TestDeepSeekV4SparseAttentionConfig:
 
         assert config.compress_ratios == [1, 4, 128]
 
+    def test_default_fp4_falls_back_to_fp8_before_blackwell(self, monkeypatch):
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+        monkeypatch.setattr("tensorrt_llm._utils.get_sm_version", lambda: 90)
+
+        config = DeepSeekV4SparseAttentionConfig()
+
+        assert config.indexer_k_dtype == "fp8"
+
+    def test_explicit_fp4_is_rejected_before_blackwell(self, monkeypatch):
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+        monkeypatch.setattr("tensorrt_llm._utils.get_sm_version", lambda: 90)
+
+        with pytest.raises(ValidationError, match="requires SM>=100"):
+            DeepSeekV4SparseAttentionConfig(indexer_k_dtype="fp4")
+
+    def test_lowers_to_deepseek_v4_sparse_params(self):
+        config = DeepSeekV4SparseAttentionConfig(compress_ratios=[0, 4, 128])
+
+        sparse_params = config.to_sparse_params()
+        sparse_metadata_params = config.to_sparse_metadata_params()
+
+        assert sparse_params.algorithm == "deepseek_v4"
+        assert sparse_params.compress_ratios == [1, 4, 128]
+        assert sparse_metadata_params.compress_ratios == [1, 4, 128]
+        assert sparse_metadata_params.window_size == 128
+
     @pytest.mark.parametrize("compress_ratios", [[], [-1, 4, 128]])
     def test_invalid_compress_ratios_raise(self, compress_ratios):
         with pytest.raises(ValidationError, match="compress_ratios"):
             DeepSeekV4SparseAttentionConfig(compress_ratios=compress_ratios)
+
+
+class TestEnableLowLatencyHostDispatch:
+
+    def test_default_is_false(self):
+        args = TorchLlmArgs(model="gpt2")
+        assert args.enable_low_latency_host_dispatch is False
+
+    @pytest.mark.parametrize("value", [True, False])
+    def test_accepts_bool(self, value):
+        args = TorchLlmArgs(model="gpt2",
+                            enable_low_latency_host_dispatch=value)
+        assert args.enable_low_latency_host_dispatch is value
+
+    def test_yaml_round_trip(self):
+        args = TorchLlmArgs(model="gpt2", enable_low_latency_host_dispatch=True)
+        data = args.model_dump()
+        assert data["enable_low_latency_host_dispatch"] is True
+        restored = TorchLlmArgs(**data)
+        assert restored.enable_low_latency_host_dispatch is True
+
+    def test_rejects_non_bool(self):
+        with pytest.raises(ValidationError):
+            TorchLlmArgs(model="gpt2",
+                         enable_low_latency_host_dispatch={"val": 1})

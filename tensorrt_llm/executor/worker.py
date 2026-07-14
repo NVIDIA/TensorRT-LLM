@@ -5,7 +5,7 @@ import time
 import traceback
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
-from typing import List, Optional, Union
+from typing import List, Optional
 
 import zmq
 
@@ -13,7 +13,6 @@ from tensorrt_llm.logger import logger
 
 from .._utils import mpi_comm, mpi_rank, print_all_stacks
 from ..bindings import executor as tllm
-from ..builder import Engine
 from ..llmapi.llm_args import BaseLlmArgs
 from ..llmapi.mpi_session import set_mpi_session_cpp
 from ..llmapi.tokenizer import TokenizerBase
@@ -38,7 +37,7 @@ class GenerationExecutorWorker(RpcWorkerMixin, BaseWorker):
 
     def __init__(
         self,
-        engine: Union[Path, Engine],
+        engine: Path,
         executor_config: Optional[tllm.ExecutorConfig] = None,
         batched_logits_processor: Optional[BatchedLogitsProcessor] = None,
         postproc_worker_config: Optional[PostprocWorkerConfig] = None,
@@ -132,6 +131,20 @@ class GenerationExecutorWorker(RpcWorkerMixin, BaseWorker):
         if torch.distributed.is_initialized():
             torch.distributed.destroy_process_group()
 
+        # Return this rank's GPU memory to the driver. Under an external MPI
+        # launch (mpirun/srun, e.g. CI), the worker process is long-lived and
+        # shared across successive LLM instances: a new GenerationExecutorWorker
+        # is built for each LLM, but the OS process -- and with it the CUDA
+        # context and PyTorch caching allocator -- persists. Setting
+        # `self.engine = None` above is not enough to free the GPU: reference
+        # cycles keep the model tensors alive until a later GC, and the allocator
+        # holds freed blocks as "reserved" instead of returning them. Without
+        # this, the previous model's ~weights-sized reservation carries into the
+        # next LLM built in this process and can OOM its load (e.g. back-to-back
+        # tests in one CI shard).
+        gc.collect()
+        torch.cuda.empty_cache()
+
         # Check if there are any errors from the threads before shutdown.
         self._handle_background_error()
 
@@ -151,7 +164,7 @@ class GenerationExecutorWorker(RpcWorkerMixin, BaseWorker):
 
 @print_traceback_on_error
 def worker_main(
-    engine: Path | Engine,
+    engine: Path,
     worker_queues: WorkerCommIpcAddrs,
     log_level: str,
     executor_config: Optional[tllm.ExecutorConfig] = None,
@@ -281,6 +294,7 @@ def worker_main(
                 proxy_result_queue,
                 postproc_worker_config.postprocess_tokenizer_dir,
                 PostprocWorker.default_record_creator,
+                postproc_worker_config.post_processor_hook,
             )
             postprocess_worker_futures.append(fut)
 

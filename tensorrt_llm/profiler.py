@@ -12,14 +12,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import contextlib
 import time
 from functools import partial
 from typing import Literal, Optional, Tuple, Union
 
-# isort: off
 import torch
-import tensorrt as trt
-# isort: on
 
 try:
     import psutil
@@ -29,11 +27,8 @@ try:
     import pynvml
 except ImportError:
     pynvml = None
-import traceback
 
 from tensorrt_llm.logger import logger
-
-from ._common import _is_building
 
 if psutil is None:
     logger.warning(
@@ -110,18 +105,24 @@ def summary():
 MemUnitType = Literal["GiB", "MiB", "KiB"]
 
 
-class PyNVMLContext:
-    def __enter__(self):
-        if pynvml is not None:
+@contextlib.contextmanager
+def pynvml_context():
+    has_pynvml = pynvml is not None
+    if has_pynvml:
+        try:
             pynvml.nvmlInit()
+        except pynvml.NVMLError:
+            has_pynvml = False
 
-    def __exit__(self, type, value, traceback):
-        if pynvml is not None:
+    try:
+        yield
+    finally:
+        if has_pynvml:
             pynvml.nvmlShutdown()
 
 
 if pynvml is not None:
-    with PyNVMLContext():
+    with pynvml_context():
         _device_get_memory_info_fn = partial(
             pynvml.nvmlDeviceGetMemoryInfo,
             version=pynvml.nvmlMemory_v2,
@@ -147,7 +148,7 @@ def device_memory_info(device: Optional[Union[torch.device, int]] = None) -> Tup
         if device is None:
             device = torch.cuda.current_device()
         index = device.index if isinstance(device, torch.device) else device
-        with PyNVMLContext():
+        with pynvml_context():
             handle = pynvml.nvmlDeviceGetHandleByIndex(index)
             mem_info = _device_get_memory_info_fn(handle)
         return mem_info.used, mem_info.free, mem_info.total
@@ -203,76 +204,3 @@ def print_memory_usage(
         f"Device {_format(alloc_device_mem, unit)}"
     )
     _print_mem_message(msg, tag)
-
-
-@_is_building
-def check_gpt_mem_usage(
-    engine,
-    kv_dtype,
-    use_gpt_attention_plugin,
-    paged_kv_cache,
-    max_batch_size,
-    max_beam_width,
-    max_seq_len,
-    local_num_kv_heads,
-    head_size,
-    num_layers,
-) -> int:
-    # Get the amount of memory
-    runtime = trt.Runtime(logger.trt_logger)
-    # 1. TensorRT engine activation memory
-    activation_size = 0
-    try:
-        cuda_engine = runtime.deserialize_cuda_engine(engine)
-        assert cuda_engine is not None
-        activation_size = cuda_engine.device_memory_size_v2 / 1024 / 1024
-        del cuda_engine
-    except Exception:
-        logger.warning(f"Exception when deserializing engine: {traceback.format_exc()}")
-        logger.warning("Activation memory size will be regarded as 0.")
-    logger.info(f"Activation memory size: {activation_size:.2f} MiB")
-
-    # 2. Weights
-    weights_size = bytes_to_target_unit(engine.nbytes, "MiB")
-    logger.info(f"Weights memory size: {weights_size:.2f} MiB")
-
-    # 3. Estimated max KV Cache size
-    kv_cache_size = (
-        max_batch_size
-        * max_beam_width
-        * 2
-        * local_num_kv_heads
-        * max_seq_len
-        * head_size
-        * num_layers
-        * kv_dtype.itemsize
-    )
-    # without plugin, we need two set of kv cache buffers,
-    # one for inputs, and the other for outputs.
-    if not use_gpt_attention_plugin:
-        kv_cache_size *= 2
-    kv_cache_size = bytes_to_target_unit(kv_cache_size, "MiB")
-    logger.info(f"Max KV Cache memory size: {kv_cache_size:.2f} MiB")
-
-    # Estimated total amount of memory
-    est_memory_size = activation_size + weights_size + kv_cache_size
-    logger.info(f"Estimated max memory usage on runtime: {est_memory_size:.2f} MiB")
-    _, _, total_mem = device_memory_info(torch.cuda.current_device())
-    total_mem = bytes_to_target_unit(total_mem, "MiB")
-    if est_memory_size > total_mem:
-        logger.warning(
-            f"Engine is successfully built, but GPU Memory ({total_mem:.2f} MB)"
-            " may not be enough when running inference on max shape."
-        )
-        if paged_kv_cache:
-            logger.warning(
-                "Since paged_kv_cache is enabled, the max KV Cache "
-                "memory size is a estimate for very extreme cases, "
-                "it's possible that most cases won't meet OOM."
-            )
-        else:
-            logger.warning(
-                "Enabling `--paged_kv_cache` could help reduce the GPU memory usage on runtime."
-            )
-
-    return est_memory_size

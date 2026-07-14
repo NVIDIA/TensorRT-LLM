@@ -38,12 +38,15 @@ import numpy as np
 import nvtx
 from mpi4py import MPI
 from mpi4py.util import pkl5
-from packaging import version
 from typing_extensions import ParamSpec
 
 # isort: off
 import torch
-import tensorrt as trt
+
+try:
+    from cuda.bindings import runtime as cudart
+except ImportError:
+    from cuda import cudart
 
 try:
     from pynvml import (
@@ -107,6 +110,17 @@ def numpy_to_torch(x):
         return torch.from_numpy(x)
 
 
+def CUASSERT(cuda_ret):
+    err = cuda_ret[0]
+    if err != cudart.cudaError_t.cudaSuccess:
+        raise RuntimeError(
+            f"CUDA ERROR: {err}, error code reference: https://nvidia.github.io/cuda-python/module/cudart.html#cuda.cudart.cudaError_t"
+        )
+    if len(cuda_ret) > 1:
+        return cuda_ret[1:]
+    return None
+
+
 def numpy_to_dtype(x, dtype: str):
     if str_dtype_to_np(dtype) == x.dtype:
         return x
@@ -124,26 +138,10 @@ int64_array = partial(np.array, dtype=np.int64)
 bool_array = partial(np.array, dtype=np.bool_)
 
 
-def dims_array(x):
-    is_int64_dims = True
-    try:
-        trt.Dims([np.iinfo(np.int64).max])
-    except TypeError:
-        is_int64_dims = False
-    return int64_array(x) if is_int64_dims else int32_array(x)
-
-
 def bf16_array(x):
     x = torch.tensor(x, dtype=torch.bfloat16)
     x = torch_to_numpy(x)
     return x
-
-
-def numpy_array(data, trt_dtype):
-    # convenient wrapper due to numpy not support bf16 yet
-    if trt_dtype == trt.bfloat16:
-        return bf16_array(data)
-    return np.array(data, trt_dtype_to_np(trt_dtype))
 
 
 def copy_torch_to_numpy(x: torch.Tensor, ndarray: np.array):
@@ -156,18 +154,6 @@ def copy_torch_to_numpy(x: torch.Tensor, ndarray: np.array):
     return ndarray
 
 
-def trt_version():
-    return trt.__version__
-
-
-def trt_gte(major: int, minor: int = 0):
-    """
-    Check if TRT version is greater than or equal to major.minor
-    """
-    trt_ver = version.parse(trt_version())
-    return trt_ver.major >= major and trt_ver.minor >= minor
-
-
 def torch_version():
     return torch.__version__
 
@@ -178,6 +164,7 @@ _str_to_np_dict = dict(
     int64=np.int64,
     int32=np.int32,
     int8=np.int8,
+    uint8=np.uint8,
     bool=np.bool_,
     bfloat16=np_bfloat16,
     fp8=np_float8,
@@ -197,6 +184,7 @@ _str_to_torch_dtype_dict = dict(
     int64=torch.int64,
     int32=torch.int32,
     int8=torch.int8,
+    uint8=torch.uint8,
     bool=torch.bool,
     fp8=torch.float8_e4m3fn,
 )
@@ -215,6 +203,7 @@ _str_to_binding_dtype_dict = dict(
     int64=DataType.INT64,
     int32=DataType.INT32,
     int8=DataType.INT8,
+    uint8=DataType.UINT8,
     bool=DataType.BOOL,
     fp8=DataType.FP8,
 )
@@ -273,82 +262,6 @@ def torch_dtype_to_str(dtype):
     return _torch_dtype_to_str_dict[dtype]
 
 
-_str_to_trt_dtype_dict = dict(float16=trt.float16,
-                              float32=trt.float32,
-                              int64=trt.int64,
-                              int32=trt.int32,
-                              int8=trt.int8,
-                              bool=trt.bool,
-                              bfloat16=trt.bfloat16,
-                              fp8=trt.fp8,
-                              nvfp4=trt.fp4)
-
-
-def str_dtype_to_trt(dtype):
-    if dtype == "fp4":
-        # Special handling for FP4 since CI's trt version is not recent enough.
-        if not hasattr(trt, 'fp4'):
-            raise ValueError(
-                "fp4 unsupported, trt version needs to be upgraded.")
-        return trt.fp4
-
-    ret = _str_to_trt_dtype_dict.get(dtype)
-    assert ret is not None, f'Unsupported dtype: {dtype}'
-    return ret
-
-
-_trt_to_str_dtype_dict = {v: k for k, v in _str_to_trt_dtype_dict.items()}
-
-
-def trt_dtype_to_str(dtype: trt.DataType) -> str:
-    assert isinstance(dtype, trt.DataType)
-    return _trt_to_str_dtype_dict[dtype]
-
-
-_np_to_trt_dtype_dict = {
-    np.int8: trt.int8,
-    np.int32: trt.int32,
-    np.int64: trt.int64,
-    np.float16: trt.float16,
-    np.float32: trt.float32,
-    np.bool_: trt.bool,
-
-    # hash of np.dtype('int32') != np.int32
-    np.dtype('int8'): trt.int8,
-    np.dtype('int32'): trt.int32,
-    np.dtype('int64'): trt.int64,
-    np.dtype('float16'): trt.float16,
-    np.dtype('float32'): trt.float32,
-    np.dtype('bool'): trt.bool,
-    np_bfloat16: trt.bfloat16,
-    np_float8: trt.fp8,
-}
-
-
-def np_dtype_to_trt(dtype):
-    ret = _np_to_trt_dtype_dict.get(dtype)
-    assert ret is not None, f'Unsupported dtype: {dtype}'
-    return ret
-
-
-_trt_to_np_dtype_dict = {
-    trt.int8: np.int8,
-    trt.int32: np.int32,
-    trt.int64: np.int64,
-    trt.float16: np.float16,
-    trt.float32: np.float32,
-    trt.bool: np.bool_,
-    trt.bfloat16: np_bfloat16,
-    trt.fp8: np_float8,
-}
-
-
-def trt_dtype_to_np(dtype):
-    ret = _trt_to_np_dtype_dict.get(dtype)
-    assert ret is not None, f'Unsupported dtype: {dtype}'
-    return ret
-
-
 _torch_to_np_dtype_dict = {
     torch.bool: np.bool_,
     torch.uint8: np.uint8,
@@ -391,54 +304,6 @@ _np_to_torch_dtype_dict = {
 
 def np_dtype_to_torch(dtype):
     ret = _np_to_torch_dtype_dict.get(dtype)
-    assert ret is not None, f'Unsupported dtype: {dtype}'
-    return ret
-
-
-_trt_to_torch_dtype_dict = {
-    trt.float16: torch.float16,
-    trt.float32: torch.float32,
-    trt.int64: torch.int64,
-    trt.int32: torch.int32,
-    trt.int8: torch.int8,
-    trt.bool: torch.bool,
-    trt.bfloat16: torch.bfloat16,
-    trt.fp8: torch.float8_e4m3fn,
-}
-
-
-def trt_dtype_to_torch(dtype):
-    ret = _trt_to_torch_dtype_dict.get(dtype)
-    assert ret is not None, f'Unsupported dtype: {dtype}'
-    return ret
-
-
-def is_same_dtype(type_a: Union[str, trt.DataType],
-                  type_b: Union[str, trt.DataType]) -> bool:
-    if isinstance(type_a, str):
-        type_a = str_dtype_to_trt(type_a)
-
-    if isinstance(type_b, str):
-        type_b = str_dtype_to_trt(type_b)
-
-    return type_a == type_b
-
-
-_torch_to_trt_dtype_dict = {
-    torch.float16: trt.float16,
-    torch.float32: trt.float32,
-    torch.int64: trt.int64,
-    torch.int32: trt.int32,
-    torch.int8: trt.int8,
-    torch.float8_e4m3fn: trt.fp8,
-    torch.qint8: trt.int8,
-    torch.bool: trt.bool,
-    torch.bfloat16: trt.bfloat16
-}
-
-
-def torch_dtype_to_trt(dtype):
-    ret = _torch_to_trt_dtype_dict.get(dtype)
     assert ret is not None, f'Unsupported dtype: {dtype}'
     return ret
 
@@ -529,6 +394,9 @@ def get_free_ports(num=1) -> List[int]:
     ports = [s.getsockname()[1] for s in sockets]
     for s in sockets:
         s.close()
+    logger.info(
+        f"[get_free_ports] pid={os.getpid()} reserved ports={ports} via "
+        f"bind-then-close (subject to TOCTOU reuse before rebinding)")
     return ports
 
 
@@ -800,10 +668,16 @@ def release_gc():
         torch.cuda.ipc_collect()
 
 
-@lru_cache(maxsize=1)
-def get_sm_version():
-    prop = torch.cuda.get_device_properties(0)
-    return prop.major * 10 + prop.minor
+if torch.cuda.device_count() == 0:
+
+    def get_sm_version():
+        return -1
+else:
+
+    @lru_cache(maxsize=1)
+    def get_sm_version():
+        prop = torch.cuda.get_device_properties(0)
+        return prop.major * 10 + prop.minor
 
 
 @lru_cache(maxsize=1)
@@ -1056,7 +930,7 @@ class TensorWrapper:
     def __init__(
         self,
         data_ptr: int,
-        dtype: Union[torch.dtype, str, np.dtype, trt.DataType, DataType],
+        dtype: Union[torch.dtype, str, np.dtype, DataType],
         shape: Sequence[int],
         strides: Optional[Sequence[int]] = None,
     ):
@@ -1078,16 +952,13 @@ class TensorWrapper:
         return getattr(self, "_shape", None)
 
     @dtype.setter
-    def dtype(self, dtype: Union[torch.dtype, str, np.dtype, trt.DataType,
-                                 DataType]):
+    def dtype(self, dtype: Union[torch.dtype, str, np.dtype, DataType]):
         if isinstance(dtype, torch.dtype):
             self._dtype = dtype
         elif isinstance(dtype, str):
             self._dtype = str_dtype_to_torch(dtype)
         elif isinstance(dtype, np.dtype):
             self._dtype = np_dtype_to_torch(dtype)
-        elif isinstance(dtype, trt.DataType):
-            self._dtype = trt_dtype_to_torch(dtype)
         elif isinstance(dtype, DataType):
             self._dtype = binding_to_torch_dtype(dtype)
         else:
@@ -1115,10 +986,6 @@ class TensorWrapper:
             "version":
             3,
         }
-
-    @staticmethod
-    def from_trt_desc(desc: trt.PluginTensorDesc, pointer: int):
-        return TensorWrapper(pointer, trt_dtype_to_torch(desc.type), desc.dims)
 
 
 def convert_to_torch_tensor(
@@ -1373,7 +1240,7 @@ def prefer_pinned() -> bool:
     pageable (and not pinned) memory across the board is preferred in CC mode
     to maintain asynchronous execution.
     """
-    return not confidential_compute_enabled()
+    return torch.cuda.device_count() > 0 and not confidential_compute_enabled()
 
 
 def maybe_pin_memory(tensor: torch.Tensor) -> torch.Tensor:

@@ -70,12 +70,15 @@ add_library(
   fp8Quantize.cpp
   dsv3FusedAGemmOp.cpp
   deepseekV4QNormOp.cpp
+  deepseekV4BlockTableOp.cpp
+  inverseRopeFp8QuantOp.cpp
   fusedQKNormRopeOp.cpp
   fusedDiTQKNormRopeOp.cpp
   fusedDiTSplitQKNormRopeOp.cpp
   fusedDiTSplitNormOp.cpp
   ulyssesPostUnscatterOp.cpp
   ulyssesPermuteScatterOp.cpp
+  fusedDiTGateResidNormShiftScaleOp.cpp
   fusedAddRMSNormQuant.cpp
   fusedActivationQuant.cpp
   fusedGatedRMSNormQuant.cpp
@@ -93,8 +96,10 @@ add_library(
   moeAlltoAllOp.cpp
   moeLoadBalanceOp.cpp
   moeAlignOp.cpp
+  megaMoePrepareOp.cpp
   mxFp4BlockScaleMoe.cpp
   mxFp8Quantize.cpp
+  mxfp8Gemm.cpp
   fp8BlockScaleMoe.cpp
   fp8PerTensorScaleMoe.cpp
   fp4BlockScaleMoe.cpp

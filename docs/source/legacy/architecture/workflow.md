@@ -1,5 +1,9 @@
 # TensorRT-LLM Build Workflow
 
+```{caution}
+The legacy TensorRT backend has been removed and is no longer supported. This page is retained for cross-reference only.
+```
+
 > [!WARNING]
 > This page describes the **legacy** TensorRT engine-build workflow.
 > For new projects, use [`trtllm-serve`](https://nvidia.github.io/TensorRT-LLM/quick-start-guide.html)

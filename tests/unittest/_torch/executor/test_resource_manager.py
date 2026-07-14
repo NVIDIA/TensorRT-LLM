@@ -825,6 +825,42 @@ class TestResourceManager(unittest.TestCase):
         simulate_prefill_completion_only_use_for_testing(req3)
         kv_cache_manager.free_resources(req3)
 
+    def test_batch_cache_indices_honor_requested_blocks_with_beams(self):
+        """V1 truncates packed beam cache indices to the requested blocks."""
+        kv_cache_manager = KVCacheManager(
+            kv_cache_config=KvCacheConfig(max_tokens=256,
+                                          enable_block_reuse=False),
+            kv_cache_type=tensorrt_llm.bindings.internal.batch_manager.
+            CacheType.SELF,
+            num_layers=2,
+            num_kv_heads=2,
+            head_dim=128,
+            tokens_per_block=8,
+            max_seq_len=64,
+            max_batch_size=1,
+            max_beam_width=2,
+            mapping=Mapping(),
+        )
+        try:
+            request_id = 7
+            kv_cache_manager.add_dummy_requests([request_id], [64],
+                                                max_beam_width=2)
+
+            full_indices = kv_cache_manager.get_batch_cache_indices(
+                [request_id], beam_width=2)
+            requested_blocks = 4
+            truncated_indices = kv_cache_manager.get_batch_cache_indices(
+                [request_id],
+                beam_width=2,
+                num_blocks_per_seq=[requested_blocks],
+            )
+
+            self.assertGreater(len(full_indices[0]), requested_blocks)
+            self.assertEqual(truncated_indices,
+                             [full_indices[0][:requested_blocks]])
+        finally:
+            kv_cache_manager.shutdown()
+
     def test_kv_cache_manager_with_execution_stream(self):
         """
         Test that KVCacheManager uses the provided execution_stream.
@@ -956,6 +992,26 @@ class TestKVCacheManagerConfigForwarding(unittest.TestCase):
                 kwargs["secondary_offload_min_priority"], 0)
         finally:
             kv_cache_manager.shutdown()
+
+
+class TestResolveWindowSize(unittest.TestCase):
+
+    @staticmethod
+    def _make_manager(max_attention_window_vec, is_vswa):
+        mgr = KVCacheManager.__new__(KVCacheManager)
+        mgr.max_attention_window_vec = max_attention_window_vec
+        mgr.is_vswa = is_vswa
+        return mgr
+
+    def test_uniform_multi_layer_vector_does_not_raise(self):
+        mgr = self._make_manager([4096, 4096, 4096], is_vswa=False)
+        self.assertEqual(mgr._resolve_window_size(None), 4096)
+
+    def test_genuine_vswa_requires_window_size(self):
+        mgr = self._make_manager([4096, 8192], is_vswa=True)
+        with self.assertRaises(ValueError):
+            mgr._resolve_window_size(None)
+        self.assertEqual(mgr._resolve_window_size(8192), 8192)
 
 
 if __name__ == "__main__":

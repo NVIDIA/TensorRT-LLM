@@ -67,6 +67,16 @@ AD_TESTS_DIR = os.path.join(REPO_ROOT, "tests", "unittest", "auto_deploy")
 AD_UTILS_TEST_DIR = os.path.join(AD_TESTS_DIR, "_utils_test")
 AD_TORCH_TESTS_DIR = os.path.join(REPO_ROOT, "tests", "unittest", "_torch", "auto_deploy")
 
+# Example/e2e harness sources (Tier-1 e2e: build_and_run_ad.py + model registry).
+# These ship with the package so the standalone install can run e2e models via
+# the same entrypoint as TRT-LLM. Python is rewritten auto_deploy -> llmc; the
+# model_registry YAML is data and copied verbatim.
+AD_EXAMPLES_SRC = os.path.join(REPO_ROOT, "examples", "auto_deploy")
+# Source filename -> destination filename in the standalone package. The e2e
+# entrypoint is renamed to make its scope explicit in the llmc distribution.
+EXAMPLE_FILES = {"build_and_run_ad.py": "build_and_run_llmc_trtllm.py"}
+EXAMPLE_DIRS = ["model_registry"]
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -191,9 +201,61 @@ EXCLUDE_TEST_FILES = {
     "test_trtllm_quant_mxfp4_trtllm_gen_moe.py",
 }
 
+# Single-GPU smoke tests. Some run with LLMC alone; others exercise the optional
+# TensorRT-LLM wheel/CLI path and are gated by TRTLLM_REDIRECT_AD_TO_LLMC.
+STANDALONE_SINGLEGPU_SMOKE_TEST_FILES = (
+    "smoke/test_ad_build_small_single.py",
+    "smoke/test_ad_guided_decoding_regex.py",
+    "smoke/test_ad_speculative_decoding.py",
+    "smoke/test_ad_trtllm_bench.py",
+    "smoke/test_ad_trtllm_sampler.py",
+    "smoke/test_ad_trtllm_serve.py",
+    "smoke/test_disagg.py",
+)
+
+# Multi-GPU tests that exercise only AutoDeploy and its standalone dependencies.
+# Keep this list explicit: the remaining multi-GPU tests depend on TensorRT-LLM
+# runtime components, kernels, or test infrastructure that LLMC does not ship.
+STANDALONE_MULTIGPU_TEST_FILES = (
+    "custom_ops/test_dist.py",
+    "custom_ops/test_sharded_rmsnorm.py",
+    "smoke/test_ad_build_small_multi.py",
+    "transformations/library/test_apply_sharding_hints.py",
+    "transformations/library/test_bmm_sharding.py",
+    "transformations/library/test_ep_sharding.py",
+    "transformations/library/test_rmsnorm_sharding.py",
+    "transformations/library/test_sharding_num_correctness.py",
+    "transformations/library/test_step3p7_sharding_ir.py",
+    "transformations/library/test_tp_sharding.py",
+)
+
+# Pytest support files required by the allowlisted multi-GPU tests.
+STANDALONE_MULTIGPU_SUPPORT_FILES = ("transformations/library/conftest.py",)
+
+# Newer AD unit tests live under tests/unittest/_torch/auto_deploy. Copy only
+# tracked tests whose dependencies are available in LLMC plus the optional
+# TensorRT-LLM wheel.
+STANDALONE_TORCH_UNIT_TEST_FILES = ("unit/singlegpu/models/test_gpt_oss_modeling.py",)
+
 # Import path rewrite: old -> new (applied to test files only).
 _IMPORT_REWRITE = "tensorrt_llm._torch.auto_deploy"
 _IMPORT_TARGET = "llmc"
+_BUILD_AND_RUN_AD_IMPORT = "from build_and_run_ad import ExperimentConfig, main"
+_TRTLLM_IMPORT_RE = re.compile(
+    r"(?m)^(?:from|import) "
+    r"(?:tensorrt_llm(?:\.|\b)|llmc\.models\.custom\.modeling_gpt_oss(?:\.|\b))"
+)
+_LLMC_OPTIONAL_TRTLLM_GUARD = """
+_trtllm_redirect_value = os.environ.get("TRTLLM_REDIRECT_AD_TO_LLMC", "").lower()
+if _trtllm_redirect_value not in {"1", "true", "yes", "on"}:
+    pytest.skip(
+        "LLMC optional TRT-LLM tests require TRTLLM_REDIRECT_AD_TO_LLMC=true",
+        allow_module_level=True,
+    )
+pytest.importorskip("tensorrt_llm")"""
+_LLMC_TRTLLM_RUNNER_IMPORT = (
+    "from runners.trtllm.build_and_run_llmc_trtllm import ExperimentConfig, main"
+)
 
 # Paths that the script owns and regenerates on every run.
 # Everything else in the output directory (e.g., .git/, .github/) is preserved
@@ -201,6 +263,7 @@ _IMPORT_TARGET = "llmc"
 _MANAGED_PATHS = [
     "llmc",
     "tests",
+    "runners",
     "pyproject.toml",
     "README.md",
     "LICENSE",
@@ -242,7 +305,7 @@ def _copy_tree(src_dir: str, dst_dir: str) -> int:
     return count
 
 
-def _rewrite_imports_in_file(filepath: str) -> int:
+def _rewrite_imports_in_file(filepath: str, *, optional_trtllm_guards: bool = True) -> int:
     """Rewrite imports in a copied test file for standalone mode.
 
     Source files inside ``tensorrt_llm/_torch/auto_deploy`` already use
@@ -262,6 +325,57 @@ def _rewrite_imports_in_file(filepath: str) -> int:
     original = content
     content = content.replace(_IMPORT_REWRITE, _IMPORT_TARGET)
 
+    def ensure_imports(before_pos: int, *imports: str) -> None:
+        nonlocal content
+        prefix = content[:before_pos]
+        missing_imports = [
+            import_name for import_name in imports if f"import {import_name}\n" not in prefix
+        ]
+        if not missing_imports:
+            return
+        first_import = re.search(r"(?m)^(?:import|from) ", content)
+        if first_import is None:
+            raise ValueError(f"No import block found in {filepath}")
+        content = (
+            content[: first_import.start()]
+            + "\n".join(f"import {import_name}" for import_name in missing_imports)
+            + "\n"
+            + content[first_import.start() :]
+        )
+
+    def insert_optional_trtllm_guard() -> None:
+        nonlocal content
+        if _LLMC_OPTIONAL_TRTLLM_GUARD in content:
+            return
+        pytest_import = re.search(r"(?m)^import pytest\n", content)
+        if pytest_import is None:
+            raise ValueError(f"No pytest import found in {filepath}")
+        content = (
+            content[: pytest_import.end()]
+            + _LLMC_OPTIONAL_TRTLLM_GUARD
+            + "\n"
+            + content[pytest_import.end() :]
+        )
+
+    if optional_trtllm_guards and _BUILD_AND_RUN_AD_IMPORT in content:
+        build_import_pos = content.index(_BUILD_AND_RUN_AD_IMPORT)
+        ensure_imports(build_import_pos, "os", "pytest")
+        insert_optional_trtllm_guard()
+        content = content.replace(_BUILD_AND_RUN_AD_IMPORT, _LLMC_TRTLLM_RUNNER_IMPORT)
+    elif optional_trtllm_guards:
+        trtllm_import = _TRTLLM_IMPORT_RE.search(content)
+        if trtllm_import is not None:
+            ensure_imports(trtllm_import.start(), "os", "pytest")
+            insert_optional_trtllm_guard()
+
+    if optional_trtllm_guards:
+        # The standalone package can rely on the installed trtllm-bench entrypoint,
+        # but it does not ship TensorRT-LLM's source-tree benchmarks/cpp directory.
+        content = content.replace(
+            '    script_dir = Path(root_dir, "benchmarks", "cpp")\n',
+            "    script_dir = Path(temp_dir)\n",
+        )
+
     replacements = sum(1 for a, b in zip(original, content) if a != b)  # rough count
     if content != original:
         with open(filepath, "w") as f:
@@ -272,13 +386,16 @@ def _rewrite_imports_in_file(filepath: str) -> int:
     return replacements
 
 
-def _rewrite_imports_in_dir(directory: str) -> int:
+def _rewrite_imports_in_dir(directory: str, *, optional_trtllm_guards: bool = True) -> int:
     """Rewrite imports in all .py files in a directory tree."""
     total = 0
     for root, _, files in os.walk(directory):
         for filename in files:
             if filename.endswith(".py"):
-                total += _rewrite_imports_in_file(os.path.join(root, filename))
+                total += _rewrite_imports_in_file(
+                    os.path.join(root, filename),
+                    optional_trtllm_guards=optional_trtllm_guards,
+                )
     return total
 
 
@@ -353,6 +470,45 @@ def _copy_tests(output_dir: str) -> int:
                 shutil.copy2(src_path, dst_path)
                 count += 1
 
+    # Copy all single-GPU smoke tests. Tests that require the optional
+    # TensorRT-LLM wheel are guarded during import rewriting.
+    singlegpu_smoke_files = STANDALONE_SINGLEGPU_SMOKE_TEST_FILES
+    for rel_path in singlegpu_smoke_files:
+        src_path = os.path.join(singlegpu_src, rel_path)
+        if not os.path.isfile(src_path):
+            raise FileNotFoundError(
+                f"Allowlisted single-GPU smoke test file does not exist: {src_path}"
+            )
+        dst_path = os.path.join(tests_dst, "singlegpu", rel_path)
+        os.makedirs(os.path.dirname(dst_path), exist_ok=True)
+        shutil.copy2(src_path, dst_path)
+        count += 1
+
+    # Copy only the explicitly standalone-compatible multi-GPU tests. Unlike
+    # singlegpu/, this tree contains several tests that require TensorRT-LLM.
+    multigpu_src = os.path.join(AD_TESTS_DIR, "multigpu")
+    multigpu_files = STANDALONE_MULTIGPU_TEST_FILES + STANDALONE_MULTIGPU_SUPPORT_FILES
+    for rel_path in multigpu_files:
+        src_path = os.path.join(multigpu_src, rel_path)
+        if not os.path.isfile(src_path):
+            raise FileNotFoundError(f"Allowlisted multi-GPU test file does not exist: {src_path}")
+        dst_path = os.path.join(tests_dst, "multigpu", rel_path)
+        os.makedirs(os.path.dirname(dst_path), exist_ok=True)
+        shutil.copy2(src_path, dst_path)
+        count += 1
+
+    # Copy standalone-compatible tests from the newer _torch/auto_deploy unit tree.
+    for rel_path in STANDALONE_TORCH_UNIT_TEST_FILES:
+        src_path = os.path.join(AD_TORCH_TESTS_DIR, rel_path)
+        if not os.path.isfile(src_path):
+            raise FileNotFoundError(
+                f"Allowlisted _torch AutoDeploy unit test does not exist: {src_path}"
+            )
+        dst_path = os.path.join(tests_dst, "_torch", "auto_deploy", rel_path)
+        os.makedirs(os.path.dirname(dst_path), exist_ok=True)
+        shutil.copy2(src_path, dst_path)
+        count += 1
+
     # Copy test utilities
     if os.path.isdir(AD_UTILS_TEST_DIR):
         utils_dst = os.path.join(tests_dst, "_utils_test")
@@ -369,6 +525,7 @@ def _copy_tests(output_dir: str) -> int:
 
     # Create a stub for test_common.llm_data (used by some model tests)
     _create_test_common_stub(tests_dst)
+    _create_test_utils_stub(tests_dst)
 
     return count
 
@@ -395,19 +552,38 @@ def _create_test_conftest(tests_dir: str) -> None:
         import importlib.util
         import os
         import sys
+        from pathlib import Path
 
+        import pytest
+
+        _allow_trtllm_redirect = (
+            os.environ.get("TRTLLM_REDIRECT_AD_TO_LLMC", "").lower()
+            in {"1", "true", "yes", "on"}
+        )
         _trtllm_spec = importlib.util.find_spec("tensorrt_llm")
-        if _trtllm_spec is not None:
+        if _trtllm_spec is not None and not _allow_trtllm_redirect:
             raise RuntimeError(
                 "Standalone llmc tests must not be able to import tensorrt_llm; "
+                "set TRTLLM_REDIRECT_AD_TO_LLMC=true only for optional TRT-LLM tests; "
                 f"found {getattr(_trtllm_spec, 'origin', None)!r}"
             )
 
-        # Add _utils_test to the Python path so test files can import from it
-        sys.path.insert(0, os.path.join(os.path.dirname(__file__), "_utils_test"))
+        _tests_dir = os.path.dirname(__file__)
+        _package_root = os.path.dirname(_tests_dir)
 
-        # Add the tests directory itself to the path for cross-test imports
-        sys.path.insert(0, os.path.dirname(__file__))
+        # Add generated package/test roots to the Python path so tests can import
+        # local llmc, runners, and _utils_test even under safe-path settings.
+        sys.path.insert(0, _package_root)
+        sys.path.insert(0, _tests_dir)
+        sys.path.insert(0, os.path.join(_tests_dir, "_utils_test"))
+
+
+        @pytest.fixture(scope="module")
+        def llm_root():
+            env_root = os.environ.get("LLM_ROOT")
+            if env_root:
+                return Path(env_root)
+            return Path(_package_root)
     """)
     with open(os.path.join(tests_dir, "conftest.py"), "w") as f:
         f.write(content)
@@ -475,6 +651,85 @@ def _create_test_common_stub(tests_dir: str) -> None:
         f.write(content)
 
 
+def _create_test_utils_stub(tests_dir: str) -> None:
+    """Create minimal TensorRT-LLM unittest utility shims used by copied tests."""
+    utils_dir = os.path.join(tests_dir, "utils")
+    os.makedirs(utils_dir, exist_ok=True)
+
+    with open(os.path.join(utils_dir, "__init__.py"), "w") as f:
+        f.write(
+            "# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION"
+            " & AFFILIATES. All rights reserved.\n"
+            "# SPDX-License-Identifier: Apache-2.0\n"
+        )
+
+    content = textwrap.dedent("""\
+        # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+        # SPDX-License-Identifier: Apache-2.0
+        #
+        # Licensed under the Apache License, Version 2.0 (the "License");
+        # you may not use this file except in compliance with the License.
+        # You may obtain a copy of the License at
+        #
+        # http://www.apache.org/licenses/LICENSE-2.0
+        #
+        # Unless required by applicable law or agreed to in writing, software
+        # distributed under the License is distributed on an "AS IS" BASIS,
+        # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+        # See the License for the specific language governing permissions and
+        # limitations under the License.
+
+        \"\"\"Minimal unittest utility shims for standalone LLMC tests.\"\"\"
+
+        import pytest
+        import torch
+
+
+        def _sm_version() -> int:
+            if not torch.cuda.is_available():
+                return 0
+            major, minor = torch.cuda.get_device_capability(0)
+            return major * 10 + minor
+
+
+        skip_pre_hopper = pytest.mark.skipif(
+            _sm_version() < 90,
+            reason="This test is not supported in pre-Hopper architecture",
+        )
+    """)
+    with open(os.path.join(utils_dir, "util.py"), "w") as f:
+        f.write(content)
+
+
+# ---------------------------------------------------------------------------
+# Example / e2e harness copying
+# ---------------------------------------------------------------------------
+def _copy_runners(output_dir: str) -> int:
+    """Copy the Tier-1 e2e harness into the standalone package under ``runners/trtllm/``.
+
+    ``examples/auto_deploy/build_and_run_ad.py`` is copied to
+    ``runners/trtllm/build_and_run_llmc_trtllm.py`` (see ``EXAMPLE_FILES``) together
+    with its sibling ``model_registry/``. Because the script resolves the registry
+    relative to its own location (``Path(__file__).parent / "model_registry"``),
+    the rename + relocation are safe and ``--use-registry`` keeps working.
+    ``.py`` files get the usual ``auto_deploy -> llmc`` import rewrite (applied by
+    the caller); the ``model_registry`` YAML is data, copied verbatim.
+    """
+    runners_dst = os.path.join(output_dir, "runners", "trtllm")
+    count = 0
+    for src_name, dst_name in EXAMPLE_FILES.items():
+        src = os.path.join(AD_EXAMPLES_SRC, src_name)
+        if os.path.isfile(src):
+            os.makedirs(runners_dst, exist_ok=True)
+            shutil.copy2(src, os.path.join(runners_dst, dst_name))
+            count += 1
+    for dname in EXAMPLE_DIRS:
+        src = os.path.join(AD_EXAMPLES_SRC, dname)
+        if os.path.isdir(src):
+            count += _copy_tree(src, os.path.join(runners_dst, dname))
+    return count
+
+
 # ---------------------------------------------------------------------------
 # Package generation
 # ---------------------------------------------------------------------------
@@ -510,6 +765,9 @@ def _create_pyproject_toml(output_dir: str, dependencies: list, dev_dependencies
         "\n"
         "[tool.pytest.ini_options]\n"
         'testpaths = ["tests"]\n'
+        "markers = [\n"
+        '    "threadleak(enabled): configure thread-leak checks (inert in standalone tests)",\n'
+        "]\n"
     )
 
     with open(os.path.join(output_dir, "pyproject.toml"), "w") as f:
@@ -551,6 +809,18 @@ def create_standalone_package(output_dir: str) -> None:
     test_count = _copy_tests(output_dir)
     rewrite_count = _rewrite_imports_in_dir(os.path.join(output_dir, "tests"))
     print(f"  Copied {test_count} test files to tests/ ({rewrite_count} import rewrites)")
+
+    # 2b. Copy the Tier-1 e2e harness into runners/ (build_and_run_llmc_trtllm.py
+    #     + model_registry) and rewrite its imports auto_deploy -> llmc. YAML is
+    #     left untouched.
+    runner_count = _copy_runners(output_dir)
+    runner_rewrites = _rewrite_imports_in_dir(
+        os.path.join(output_dir, "runners"),
+        optional_trtllm_guards=False,
+    )
+    print(
+        f"  Copied {runner_count} runner files to runners/trtllm/ ({runner_rewrites} import rewrites)"
+    )
 
     # 3. Resolve dependencies and create pyproject.toml
     pinned = _read_pinned_versions(TRTLLM_REQUIREMENTS)
@@ -608,6 +878,10 @@ def create_standalone_package(output_dir: str) -> None:
     print("\nTo run tests:     pytest tests/")
     print(
         'To verify:        python -c "from llmc._compat import TRTLLM_AVAILABLE; print(TRTLLM_AVAILABLE)"'
+    )
+    print(
+        "To run e2e:       python runners/trtllm/build_and_run_llmc_trtllm.py "
+        "--model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --use-registry  (needs tensorrt-llm installed)"
     )
 
 

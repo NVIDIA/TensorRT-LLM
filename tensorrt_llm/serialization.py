@@ -85,9 +85,9 @@ BASE_EXAMPLE_CLASSES = {
     "tensorrt_llm.executor.utils": ["ErrorResponse", "WorkerCommIpcAddrs"],
     "tensorrt_llm.executor.worker": ["GenerationExecutorWorker", "worker_main"],
     "tensorrt_llm.llmapi.llm_args": [
-        "_ModelFormatKind", "_ParallelConfig", "CalibConfig",
-        "CapacitySchedulerPolicy", "KvCacheConfig", "LookaheadDecodingConfig",
-        "TrtLlmArgs", "SchedulerConfig", "LoadFormat", "DynamicBatchConfig"
+        "_ParallelConfig", "CalibConfig", "CapacitySchedulerPolicy",
+        "KvCacheConfig", "LookaheadDecodingConfig", "SchedulerConfig",
+        "LoadFormat", "DynamicBatchConfig"
     ],
     "tensorrt_llm.llmapi.mpi_session": ["RemoteTask"],
     "tensorrt_llm.llmapi.llm_utils":
@@ -97,7 +97,6 @@ BASE_EXAMPLE_CLASSES = {
     "tensorrt_llm.mapping": ["Mapping"],
     "tensorrt_llm.models.modeling_utils":
     ["QuantConfig", "SpeculativeDecodingMode"],
-    "tensorrt_llm.plugin.plugin": ["PluginConfig"],
     "tensorrt_llm.sampling_params":
     ["SamplingParams", "GuidedDecodingParams", "GreedyDecodingParams"],
     "tensorrt_llm.serve.postprocess_handlers": [
