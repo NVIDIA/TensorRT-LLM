@@ -28,6 +28,11 @@ Handover cannot race the previous worker's GPU-memory release: every pool
 these layers build is constructed with ``wait_shutdown=True``, so its
 shutdown blocks until the workers actually exited.
 
+Cache misses (first pool of a size, post-drain rebuild, post-retire
+replacement) take a shadow pool pre-spawned by the session-prefetch layer
+when it is wired (``_prefetcher``), hiding the ~50s spawn; each miss restocks
+one shadow for the next.
+
 Enable/disable with ``TRTLLM_TEST_REUSE_SESSION`` (default on; ``0`` disables).
 Disabled under pytest-xdist workers (parallel tests would multiply live pools).
 """
@@ -87,6 +92,19 @@ def _reap_retires(timeout: float = 60.0) -> None:
                 "[session-reuse] WARNING: pool retirement did not finish within 60s",
                 flush=True,
             )
+
+
+def _prefetcher():
+    """The session-prefetch singleton when that layer is wired, else None.
+
+    Mirror of the prefetcher's own reuse probe: coordination goes through
+    sys.modules so neither layer imports the other at module load (a suite
+    wired with only one layer pays nothing for the other). The prefetcher
+    yields the pool SEAMS to reuse; reuse in turn consumes prefetched
+    shadows on its cache misses — the two layers compose, not compete.
+    """
+    mod = sys.modules.get("test_common.session_prefetcher")
+    return getattr(mod, "PREFETCHER", None)
 
 
 def _describe_mismatch(spawn_snap, now_snap, uses, max_uses):
@@ -322,27 +340,42 @@ class SessionReuseCache:
         return _ReusableSession(self._spawn_fresh(real_cls, n_workers), self)
 
     def _spawn_fresh(self, real_cls, n_workers):
-        """Spawn a cache-managed pool with the worker-side HF weight cache on.
+        """Obtain a cache-managed pool: prefetched if one is armed, else spawn.
 
-        The cache env vars must be visible at spawn (workers freeze the env)
-        and are removed right after, so non-managed pools (private/RPC) and
-        the rest of the suite keep the production default. The spawn snapshot
-        is taken BEFORE adding them so later acquire-time comparisons (which
-        see the restored env) still match. An explicit user setting of either
-        var is respected and left untouched.
+        Every cache miss lands here (first pool of a size, post-drain
+        rebuild, post-retire replacement). When the session-prefetch layer is
+        wired, a shadow pool armed at the PREVIOUS miss is taken instantly —
+        hiding the ~50s spawn the miss would otherwise pay — and a
+        replacement shadow is armed for the next miss of this size. Without
+        the prefetch layer (or on a shadow miss) the synchronous spawn is
+        unchanged.
+
+        The worker-side HF weight cache env is frozen into the workers via
+        the library's ``env_overrides`` channel (parent env untouched, so
+        acquire-time snapshot comparisons still match); an explicit user
+        setting of either var is respected and left untouched. Prefetched
+        shadows were armed with the same overlay. wait_shutdown: shutdown of
+        this pool blocks until its workers exited, so a successor cannot
+        race the GPU-memory release.
         """
         snapshot = _spawn_snapshot()
-        added = [k for k in _WEIGHT_CACHE_ENV if k not in os.environ]
-        for k in added:
-            os.environ[k] = _WEIGHT_CACHE_ENV[k]
-        try:
-            # wait_shutdown: retire()'s graceful shutdown then blocks (in its
-            # background thread) until the workers exited — a replacement pool
-            # spawned right after a retire cannot race the GPU release.
-            real = real_cls(n_workers=n_workers, wait_shutdown=True)
-        finally:
-            for k in added:
-                os.environ.pop(k, None)
+        overrides = {k: v for k, v in _WEIGHT_CACHE_ENV.items() if k not in os.environ}
+        real = None
+        prefetcher = _prefetcher()
+        if prefetcher is not None:
+            try:
+                real = prefetcher.take(n_workers)
+            except Exception as e:  # prefetch is an optimization: fall back
+                print(f"[session-reuse] prefetched-pool take failed: {e}", flush=True)
+                real = None
+            try:
+                # Restock ONE shadow for the next miss of this size (no-op if
+                # one is already armed/building, or prefetch is disabled).
+                prefetcher.schedule_shadow(n_workers, env_overlay=overrides)
+            except Exception:
+                pass
+        if real is None:
+            real = real_cls(n_workers=n_workers, wait_shutdown=True, env_overrides=overrides)
         real._reuse_uses = 0
         real._reuse_spawn_snapshot = snapshot
         # (pid, start_time) per worker, recorded by the library at spawn

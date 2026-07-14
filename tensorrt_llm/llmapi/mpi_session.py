@@ -187,7 +187,10 @@ def _worker_identity_barrier():
 
 class MpiPoolSession(MpiSession):
 
-    def __init__(self, n_workers: int, wait_shutdown: bool = False):
+    def __init__(self,
+                 n_workers: int,
+                 wait_shutdown: bool = False,
+                 env_overrides: Optional[Dict[str, str]] = None):
         """Args:
         n_workers: number of MPI workers to spawn.
         wait_shutdown: when True, ``shutdown()`` blocks until the spawned
@@ -198,9 +201,15 @@ class MpiPoolSession(MpiSession):
             pre-spawned pool to the next test) race that release and can OOM.
             Off by default: production teardown does not need the barrier and
             keeps its current latency.
+        env_overrides: extra environment variables to set in the WORKERS at
+            spawn, on top of the TRTLLM*/TLLM* variables forwarded from the
+            parent. The parent process environment is never touched — this
+            replaces the racy "set os.environ around the spawn, then restore"
+            pattern for callers that spawn pools from background threads.
         """
         self.n_workers = n_workers
         self._wait_shutdown = wait_shutdown
+        self._env_overrides = dict(env_overrides) if env_overrides else {}
         self._worker_identities: Tuple = ()
         self.mpi_pool: Optional[MPIPoolExecutor] = None
         self._start_mpi_pool()
@@ -298,6 +307,7 @@ class MpiPoolSession(MpiSession):
             for key, value in os.environ.items()
             if key.startswith("TRTLLM") or key.startswith("TLLM")
         }
+        env.update(self._env_overrides)
         self.mpi_pool = MPIPoolExecutor(max_workers=self.n_workers,
                                         path=sys.path,
                                         env=env)

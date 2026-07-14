@@ -54,10 +54,15 @@ def prefetcher(monkeypatch):
     monkeypatch.delenv("PYTEST_XDIST_WORKER", raising=False)
     p = SessionPrefetcher()
     # Record build/warm triggers instead of spawning MPI pools/reading weights.
-    built, warmed = [], []
-    monkeypatch.setattr(SessionPrefetcher, "_build", lambda self, spec, gen: built.append(spec))
+    built, warmed, overlays = [], [], []
+
+    def _fake_build(self, spec, gen, env_overlay=None):
+        built.append(spec)
+        overlays.append(env_overlay)
+
+    monkeypatch.setattr(SessionPrefetcher, "_build", _fake_build)
     monkeypatch.setattr(SessionPrefetcher, "_warm", lambda self, d: warmed.append(d))
-    p.built, p.warmed = built, warmed
+    p.built, p.warmed, p.overlays = built, warmed, overlays
     return p
 
 
@@ -119,6 +124,16 @@ def test_factory_single_worker_also_prefetches(prefetcher):
     assert isinstance(session, _FakePool)
     prefetcher._thread.join(timeout=10)
     assert prefetcher.built == [1]  # shadow armed for the next 1-GPU test
+
+
+def test_schedule_shadow_passes_env_overlay_to_build(prefetcher):
+    # session_reuse restocks shadows with its worker-side weight-cache env;
+    # the overlay must reach the build (frozen into workers via the library's
+    # env_overrides channel — the parent env is never touched).
+    prefetcher.schedule_shadow(2, env_overlay={"TRTLLM_HF_WEIGHT_CACHE": "1"})
+    prefetcher._thread.join(timeout=10)
+    assert prefetcher.built == [2]
+    assert prefetcher.overlays == [{"TRTLLM_HF_WEIGHT_CACHE": "1"}]
 
 
 def test_factory_hit_hands_over_shadow(prefetcher):

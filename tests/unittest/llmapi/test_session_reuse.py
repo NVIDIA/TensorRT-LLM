@@ -8,13 +8,18 @@ from test_common.session_reuse import SessionReuseCache
 
 
 class _FakePool:
-    def __init__(self, n_workers, wait_shutdown=False):
+    def __init__(self, n_workers, wait_shutdown=False, env_overrides=None):
         self.n_workers = n_workers
         self.wait_shutdown = wait_shutdown
+        self.env_overrides = dict(env_overrides or {})
         self.shut = False
         import os
 
-        self.spawn_env_weight_cache = os.environ.get("TRTLLM_HF_WEIGHT_CACHE")
+        # What the workers freeze at spawn: TRTLLM* forwarded from the parent
+        # env plus explicit overrides (mirrors MpiPoolSession._start_mpi_pool).
+        self.spawn_env_weight_cache = self.env_overrides.get(
+            "TRTLLM_HF_WEIGHT_CACHE", os.environ.get("TRTLLM_HF_WEIGHT_CACHE")
+        )
 
     def shutdown(self):
         self.shut = True
@@ -32,6 +37,23 @@ def reuse_cache(monkeypatch):
     resets = []
     monkeypatch.setattr(session_reuse, "submit_sync_per_worker", lambda s, fn: resets.append(s))
     cache.resets = resets
+
+    # Hermetic: the REAL prefetcher singleton must not start background MPI
+    # builds from these tests; vend/record through a fake instead.
+    class _FakePrefetcher:
+        def __init__(self):
+            self.shadow = None  # pool vended on the next take()
+            self.restocks = []
+
+        def take(self, n):
+            pool, self.shadow = self.shadow, None
+            return pool
+
+        def schedule_shadow(self, n, env_overlay=None):
+            self.restocks.append((n, env_overlay))
+
+    cache.prefetch = _FakePrefetcher()
+    monkeypatch.setattr(session_reuse, "_prefetcher", lambda: cache.prefetch)
     return cache
 
 
@@ -75,6 +97,26 @@ def test_cached_handover_reaps_in_flight_retires(reuse_cache):
     assert s3._real is kept
     assert not session_reuse._RETIRE_THREADS  # handover joined the retire
     assert dup.shut  # corpse fully disposed before the handover returned
+
+
+def test_cache_miss_takes_prefetched_shadow(reuse_cache):
+    # A shadow armed at the PREVIOUS miss is consumed instantly on this one
+    # (no synchronous spawn), and a replacement is restocked for the next
+    # miss with the worker-side weight-cache overlay.
+    shadow = _FakePool(2, wait_shutdown=True, env_overrides={"TRTLLM_HF_WEIGHT_CACHE": "1"})
+    reuse_cache.prefetch.shadow = shadow
+    s = reuse_cache.acquire(_FakePool, 2)
+    assert s._real is shadow
+    assert s._real._reuse_uses == 0  # adopted as a cache-managed pool
+    n, overlay = reuse_cache.prefetch.restocks[-1]
+    assert n == 2 and overlay.get("TRTLLM_HF_WEIGHT_CACHE") == "1"
+
+
+def test_cache_miss_falls_back_to_sync_spawn_and_restocks(reuse_cache):
+    s = reuse_cache.acquire(_FakePool, 2)  # nothing armed: sync spawn
+    assert isinstance(s._real, _FakePool) and s._real.wait_shutdown
+    assert s._real.env_overrides.get("TRTLLM_HF_WEIGHT_CACHE") == "1"
+    assert reuse_cache.prefetch.restocks  # shadow armed for the NEXT miss
 
 
 def test_reuse_size_mismatch_builds_new(reuse_cache):

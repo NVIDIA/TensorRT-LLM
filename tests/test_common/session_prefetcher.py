@@ -32,8 +32,12 @@ skipped or reordered) costs only IO bandwidth.
 
 Coexistence with MPI session reuse: when ``test_common/session_reuse.py`` is
 wired and enabled it owns the same pool-creation seams and eliminates the
-respawn outright, so the prefetcher automatically stays off the seams and
-only weight warming remains active (see ``_reuse_layer_active``).
+respawn outright, so the prefetcher automatically stays off the seams (see
+``_reuse_layer_active``). Weight warming stays active, and reuse consumes
+this layer's shadow pools on its cache misses (first pool of a size,
+post-drain rebuild, post-retire replacement) via ``take``/``schedule_shadow``
+— the two layers compose: reuse covers the steady state, prefetch covers the
+misses.
 
 Enabled by default; ``TRTLLM_TEST_PREFETCH_SESSION=0`` disables BOTH pool
 prefetch and weight warming (one kill switch for the whole plugin). Suites
@@ -288,12 +292,18 @@ class SessionPrefetcher:
         except Exception as e:  # warming must never break the tests
             print(f"[session-prefetch] page-cache warm failed (harmless): {e}", flush=True)
 
-    def schedule_shadow(self, spec: int) -> None:
+    def schedule_shadow(self, spec: int, env_overlay=None) -> None:
         """Start building a spare ``spec``-worker pool in the background.
 
         Heuristic: the next test most likely needs a pool of the same size as
         the current one. A miss is discarded at ``take()`` and the sync build
         is no slower than without prefetch.
+
+        ``env_overlay``: extra env vars to freeze into the WORKERS at spawn
+        (session_reuse restocks shadows with its worker-side weight cache
+        on). Passed through the library's worker-env channel, so the parent
+        process environment — and therefore the take()-time snapshot
+        comparison — is never touched.
         """
         if not self.enabled or spec < 1:
             return
@@ -302,13 +312,13 @@ class SessionPrefetcher:
                 return  # already building / built
             self._thread = threading.Thread(
                 target=self._build,
-                args=(spec, self._build_gen),
+                args=(spec, self._build_gen, env_overlay),
                 daemon=True,
                 name="session-prefetch-build",
             )
             self._thread.start()
 
-    def _build(self, spec: int, gen: int) -> None:
+    def _build(self, spec: int, gen: int, env_overlay=None) -> None:
         try:
             from tensorrt_llm._utils import mpi_disabled
 
@@ -319,7 +329,7 @@ class SessionPrefetcher:
             snapshot = _spawn_snapshot()  # workers freeze env+sys.path at spawn
             # wait_shutdown: see _make_factory — every pool this layer hands
             # out blocks its shutdown on actual worker exit.
-            session = MpiPoolSession(n_workers=spec, wait_shutdown=True)
+            session = MpiPoolSession(n_workers=spec, wait_shutdown=True, env_overrides=env_overlay)
             if any(session.submit_sync(_worker_import_report_cuda)):
                 print(
                     "[session-prefetch] note: tensorrt_llm import initialized an idle "
