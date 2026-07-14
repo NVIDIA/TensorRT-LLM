@@ -57,8 +57,7 @@ _EXPECTED_GREEDY_OUTPUT_TOKEN_IDS = [
 ]
 # Half precision (both HF and TRT-LLM) flips the first token " yet" (1939)
 # to " Yet" (10890); the rest of the sequence is unchanged.
-_EXPECTED_GREEDY_OUTPUT_TOKEN_IDS_HALF = [10890
-                                          ] + _EXPECTED_GREEDY_OUTPUT_TOKEN_IDS[1:]
+_EXPECTED_GREEDY_OUTPUT_TOKEN_IDS_HALF = [10890] + _EXPECTED_GREEDY_OUTPUT_TOKEN_IDS[1:]
 _EXPECTED_TRANSCRIPT_FRAGMENT = "thoughts affected hester"
 
 pytestmark = [
@@ -263,8 +262,11 @@ def test_whisper_pytorch_feature_combinations(
     """
     if tp_size == 1:
         monkeypatch.setenv("TLLM_WORKER_USE_SINGLE_PROCESS", "1")
-    expected_token_ids = (_EXPECTED_GREEDY_OUTPUT_TOKEN_IDS if torch_dtype is None
-                          else _EXPECTED_GREEDY_OUTPUT_TOKEN_IDS_HALF)
+    expected_token_ids = (
+        _EXPECTED_GREEDY_OUTPUT_TOKEN_IDS
+        if torch_dtype is None
+        else _EXPECTED_GREEDY_OUTPUT_TOKEN_IDS_HALF
+    )
 
     model_path = _get_whisper_model_path()
     wave, sample_rate = soundfile.read(_get_audio_path())
