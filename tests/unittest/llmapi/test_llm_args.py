@@ -1318,18 +1318,19 @@ class TestPiecewiseCudaGraphCaptureDefaults:
        powers-of-2 + 256-stride list when `enable_piecewise_cuda_graph`
        is True (and stays `None` otherwise). The fixed list keeps the
        capture set small to bound startup time and CUDA graph memory;
-       the model-engine filter (invariants 2 and 3) ensures the largest
-       reachable size is always captured even when it is not in this
-       default list.
+       the model-engine filter (invariants 2 and 3) clamps out-of-range
+       entries to the reachable ceiling and never invents sizes beyond
+       this list.
     2. `_filter_piecewise_capture_num_tokens` caps the candidate list at
        `max_batch_size * (max_seq_len - 1 - num_extra_decoding_steps)` --
        the largest forward-pass `num_tokens` the warmup builder can
        construct, since every in-flight request must leave room for at
        least one decode token.
-    3. The reachable ceiling itself is always present in the returned
-       capture set (when positive), so runtime ISLs in the gap between
-       the next-largest candidate and the ceiling get a graph rather
-       than falling back to eager.
+    3. Candidates above the reachable ceiling are clamped down to the
+       ceiling (a requested 128 becomes 127), and no size beyond the
+       user's list is ever invented (an appended far ceiling would make
+       runtime padding execute the full ceiling shape for every
+       iteration in the gap).
     """
 
     _EXPECTED_DEFAULT_CAPTURE_NUM_TOKENS = [2**i for i in range(8)] + list(
@@ -1386,14 +1387,50 @@ class TestPiecewiseCudaGraphCaptureDefaults:
         )
         assert args.torch_compile_config.capture_num_tokens == self._EXPECTED_DEFAULT_CAPTURE_NUM_TOKENS
 
-    def test_piecewise_filter_drops_entries_above_reachable_ceiling(self):
-        """Drop candidates above `max_batch_size * (max_seq_len - 1)`.
+    def test_piecewise_filter_never_invents_far_ceiling(self):
+        """A ceiling far above the largest candidate is NOT added.
 
-        Without the cap, the warmup loop would silently skip these entries
-        and the outer padding logic would pad to a target with no captured
-        graph. They must be removed from `kept` and surfaced in
-        `unrecordable` so the warning fires. The ceiling itself is then
-        appended so ISLs in the gap still get a graph.
+        Runtime padding rounds each iteration up to the nearest captured
+        size, so an invented far ceiling (e.g. 65536 over a list topping
+        out at 13914) would make every iteration in the gap execute the
+        full ceiling shape. The filter must never invent sizes the user
+        did not request.
+        """
+        from tensorrt_llm._torch.pyexecutor.model_engine import \
+            _filter_piecewise_capture_num_tokens
+
+        candidates = [512, 1024, 2048, 4096, 8192, 13914]
+        kept, unrecordable = _filter_piecewise_capture_num_tokens(
+            candidates,
+            max_num_tokens=65536,
+            max_batch_size=896,
+            max_seq_len=32768,
+        )
+        assert kept == candidates
+        assert unrecordable == []
+
+    def test_piecewise_filter_clamps_multiple_oversized_candidates(self):
+        """All above-ceiling candidates collapse to one ceiling entry."""
+        from tensorrt_llm._torch.pyexecutor.model_engine import \
+            _filter_piecewise_capture_num_tokens
+
+        kept, unrecordable = _filter_piecewise_capture_num_tokens(
+            [64, 120, 128, 200, 256],
+            max_num_tokens=256,
+            max_batch_size=1,
+            max_seq_len=128,
+        )
+        # Ceiling: 1 * (128 - 1) = 127; 128/200/256 clamp to 127, deduped.
+        assert kept == [64, 120, 127]
+        assert unrecordable == [128, 200, 256]
+
+    def test_piecewise_filter_clamps_entries_above_reachable_ceiling(self):
+        """Clamp candidates above `max_batch_size * (max_seq_len - 1)`.
+
+        Entries above the ceiling cannot be recorded by the warmup loop;
+        they are clamped down to the ceiling and surfaced in
+        `unrecordable` so the warning fires. ISLs in the gap still get a
+        graph at the nearest recordable size.
         """
         from tensorrt_llm._torch.pyexecutor.model_engine import \
             _filter_piecewise_capture_num_tokens
@@ -1451,9 +1488,8 @@ class TestPiecewiseCudaGraphCaptureDefaults:
 
         Drafting loops consume extra decode steps; the filter must mirror
         the `max_seq_len - 1 - num_extra_decoding_steps` constraint
-        applied when warmup requests are built. The ceiling is appended
-        whenever it is strictly greater than the largest surviving
-        candidate.
+        applied when warmup requests are built. Candidates above the
+        reduced ceiling are clamped down to it; nothing is appended.
         """
         from tensorrt_llm._torch.pyexecutor.model_engine import \
             _filter_piecewise_capture_num_tokens
@@ -1467,7 +1503,7 @@ class TestPiecewiseCudaGraphCaptureDefaults:
             max_seq_len=128,
             num_extra_decoding_steps=5,
         )
-        assert kept[-1] == 122
+        assert kept[-1] == 120  # nothing above the 122 ceiling to clamp
         assert 120 in kept
         assert unrecordable == []
         # Same setup with 9 extra decoding steps -> ceiling 118; 120 drops.
@@ -1515,9 +1551,12 @@ class TestPiecewiseCudaGraphCaptureDefaults:
         assert kept == []
         assert unrecordable == [1, 2, 4]
 
-    def test_piecewise_filter_appends_ceiling_when_only_smaller_candidates(
-            self):
-        """No candidate near the ceiling -> ceiling still appended."""
+    def test_piecewise_filter_keeps_small_candidates_unchanged(self):
+        """No candidate above the ceiling -> the list is used as-is.
+
+        The ceiling (1016 here) is not appended; iterations above the
+        largest candidate run eagerly at their true size.
+        """
         from tensorrt_llm._torch.pyexecutor.model_engine import \
             _filter_piecewise_capture_num_tokens
 
@@ -1527,8 +1566,8 @@ class TestPiecewiseCudaGraphCaptureDefaults:
             max_batch_size=8,
             max_seq_len=128,
         )
-        # Ceiling: 8 * (128 - 1) = 1016.
-        assert kept == [1, 2, 4, 8, 1016]
+        # Ceiling: 8 * (128 - 1) = 1016 -- far above max candidate 8.
+        assert kept == [1, 2, 4, 8]
 
 
 class TestTorchLlmArgs:

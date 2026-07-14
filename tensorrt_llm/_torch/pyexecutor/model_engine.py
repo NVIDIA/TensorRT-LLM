@@ -125,29 +125,35 @@ def _filter_piecewise_capture_num_tokens(
 ) -> Tuple[list[int], list[int]]:
     """Cap piecewise CUDA graph capture candidates at the engine's reachable
     `num_tokens` ceiling `max_batch_size * (max_seq_len - 1 - num_extra_decoding_steps)`
-    and ensure the ceiling itself is captured.
+    clamping user-requested sizes above it down to the ceiling.
 
     Each in-flight request must leave room for at least one decode token,
     so the ceiling is the largest forward-pass `num_tokens` the warmup
-    builder can construct. Including it in the capture set closes the
-    runtime padding gap between the next-largest candidate and the ceiling
-    (otherwise ISLs in that gap have no graph >= them and fall back to
-    eager).
+    builder can construct. Candidates above the ceiling cannot be
+    recorded; clamping them down to the ceiling preserves the user's
+    intent (a requested 128 becomes 127 when only 127 is recordable)
+    without inventing capture sizes the user never asked
+    for. Appending sizes beyond the user's list is harmful: runtime
+    padding rounds iterations up to the nearest captured size, so a far
+    appended ceiling (e.g. 65536 over a list topping at 13914) would
+    make every iteration in the gap execute the full ceiling shape.
 
-    Returns `(kept, unrecordable)` where `kept` is sorted ascending,
-    deduped, and contains the ceiling whenever it is positive.
+    Returns `(kept, unrecordable)` where `kept` is sorted ascending and
+    deduped, with above-ceiling candidates clamped to the ceiling.
     `unrecordable` is the sorted unique set of input entries above the
-    ceiling but within `max_num_tokens`.
+    ceiling but within `max_num_tokens` (the clamped ones, reported so
+    the caller's warning fires).
     """
     max_capturable_num_tokens = max(
         0, max_batch_size * (max_seq_len - 1 - num_extra_decoding_steps))
     piecewise_capacity_limit = min(max_num_tokens, max_capturable_num_tokens)
-    kept = sorted(
-        {i
-         for i in candidate_num_tokens if 0 < i <= piecewise_capacity_limit})
-    if piecewise_capacity_limit > 0 and (not kept or kept[-1]
-                                         < piecewise_capacity_limit):
-        kept.append(piecewise_capacity_limit)
+    if piecewise_capacity_limit > 0:
+        kept = sorted({
+            min(i, piecewise_capacity_limit)
+            for i in candidate_num_tokens if 0 < i <= max_num_tokens
+        })
+    else:
+        kept = []
     unrecordable = sorted({
         i
         for i in candidate_num_tokens
@@ -501,7 +507,7 @@ class PyTorchModelEngine(ModelEngine):
                 f"{unrecordable}: exceeds reachable ceiling "
                 f"max_batch_size*(max_seq_len-1-num_extra_decoding_steps)="
                 f"{max(0, self.batch_size * (self.max_seq_len - 1 - num_extra_decoding_steps))}. "
-                f"Capturing the ceiling itself; raise max_seq_len for larger graphs."
+                f"Clamping them to the ceiling; raise max_seq_len for larger graphs."
             )
 
         try:
