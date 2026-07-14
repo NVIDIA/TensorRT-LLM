@@ -142,6 +142,38 @@ def test_transformer_applies_quant_config_ignore_list() -> None:
     assert isinstance(model.transformer_blocks[1].attn.add_q_proj.quant_method, NVFP4LinearMethod)
 
 
+def test_dynamic_quant_load_rejects_missing_serialized_parameters() -> None:
+    """Dynamic loading still rejects missing real checkpoint tensors."""
+    model_config = DiffusionModelConfig(
+        quant_config=QuantConfig(
+            quant_algo=QuantAlgo.NVFP4,
+            exclude_modules=[
+                "transformer_blocks.0*",
+                "img_in",
+                "proj_out",
+            ],
+        ),
+        dynamic_weight_quant=True,
+        force_dynamic_quantization=True,
+    )
+    model = QwenImageTransformer2DModel(model_config=model_config, num_layers=2)
+    expected = dict(model.named_parameters())
+    non_serialized = model._allowed_missing_checkpoint_parameter_names()
+    required_key = "transformer_blocks.1.attn.to_q.weight"
+    assert required_key in expected
+    assert required_key not in non_serialized
+
+    checkpoint = {
+        name: param.detach() for name, param in expected.items() if name not in non_serialized
+    }
+    model._validate_checkpoint_keys(checkpoint)
+
+    checkpoint.pop(required_key)
+    with pytest.raises(RuntimeError, match="Missing keys") as exc_info:
+        model._validate_checkpoint_keys(checkpoint)
+    assert required_key in str(exc_info.value)
+
+
 @pytest.mark.parametrize("quant_algo", [QuantAlgo.NVFP4, QuantAlgo.FP8], ids=["nvfp4", "fp8"])
 def test_static_quant_excludes_high_precision_layers(quant_algo: QuantAlgo) -> None:
     """Layers in the checkpoint's ``ignore`` list build as unquantized.

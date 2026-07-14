@@ -919,7 +919,7 @@ class QwenImageTransformer2DModel(BaseDiffusionModel):
                 module.to(device)
 
     def _allowed_missing_checkpoint_parameter_names(self) -> set[str]:
-        """Return local-only parameters omitted by static ModelOpt checkpoints."""
+        """Return local-only parameters omitted by checkpoints."""
         allowed_missing = set()
         for module_name, module in self.named_modules():
             if not isinstance(module, Linear) or module.quant_config is None:
@@ -935,12 +935,11 @@ class QwenImageTransformer2DModel(BaseDiffusionModel):
     def _validate_checkpoint_keys(self, weights: Dict[str, torch.Tensor]) -> None:
         expected = {name for name, _ in self.named_parameters()}
         provided = set(weights)
-        missing = sorted((expected - provided) - self._allowed_missing_checkpoint_parameter_names())
+        allowed_missing = self._allowed_missing_checkpoint_parameter_names()
+        missing = sorted((expected - provided) - allowed_missing)
         unexpected = sorted(provided - expected)
 
-        # Dynamic quantization creates scale parameters while loading Linear
-        # modules, so those keys are expected to be absent from BF16 checkpoints.
-        if missing and not self.model_config.dynamic_weight_quant:
+        if missing:
             raise RuntimeError(f"Missing keys when loading transformer: {missing[:5]}...")
         if unexpected:
             raise RuntimeError(f"Unexpected keys when loading transformer: {unexpected[:5]}...")
