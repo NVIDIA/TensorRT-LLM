@@ -96,24 +96,16 @@ def _quant_scatter_kernel(
             max_abs = tl.maximum(tl.max(tl.abs(x)), EPS)
             ceil_log2 = tl.math.ceil(tl.log2(max_abs / FP8_MAX))
             scale_inv = tl.exp2(-ceil_log2)
-            x_fp8 = tl.clamp(x * scale_inv, FP8_MIN, FP8_MAX).to(
-                pool_fp8_ptr.dtype.element_ty
-            )
+            x_fp8 = tl.clamp(x * scale_inv, FP8_MIN, FP8_MAX).to(pool_fp8_ptr.dtype.element_ty)
 
             out_offsets = (
-                loc_page * PAGE_BYTES_C
-                + loc_off * DATA_ROW_BYTES_C
-                + tile_id * TILE
-                + tile_range
+                loc_page * PAGE_BYTES_C + loc_off * DATA_ROW_BYTES_C + tile_id * TILE + tile_range
             )
             tl.store(pool_fp8_ptr + out_offsets, x_fp8)
 
             scale_u8 = (ceil_log2.to(tl.int32) + 127).to(tl.uint8)
             scale_offset = (
-                loc_page * PAGE_BYTES_C
-                + FOOTER_OFFSET
-                + loc_off * FOOTER_ROW_BYTES_C
-                + tile_id
+                loc_page * PAGE_BYTES_C + FOOTER_OFFSET + loc_off * FOOTER_ROW_BYTES_C + tile_id
             )
             tl.store(pool_u8_ptr + scale_offset, scale_u8)
 
@@ -198,9 +190,7 @@ def dequant_gather(
             + NUM_NOPE_TILES,
         ]
         nope = row[:DIM_NOPE].view(_FP8_DTYPE).to(torch.float32)
-        tile_scales = torch.pow(
-            2.0, scales.to(torch.float32) - 127.0
-        ).repeat_interleave(QUANT_TILE)
+        tile_scales = torch.pow(2.0, scales.to(torch.float32) - 127.0).repeat_interleave(QUANT_TILE)
         rows[i, :DIM_NOPE] = (nope * tile_scales).to(torch.bfloat16)
         rows[i, DIM_NOPE:] = row[DIM_NOPE:].view(torch.bfloat16)
     return rows

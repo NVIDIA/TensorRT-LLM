@@ -408,10 +408,12 @@ def create_py_executor(
     if llm_args.attn_backend == "VANILLA":
         tokens_per_block = max_num_tokens
 
-    # The FLASHINFER block-reuse workaround is applied after model-engine
-    # creation (below), where the sparse-attention config is known: models
-    # whose attention routes through a dedicated sparse backend (DeepSeek-V4)
-    # do not share the dense wrapper's limitation and keep block reuse.
+    if llm_args.attn_backend in ["FLASHINFER", "FLASHINFER_STAR_ATTENTION"]:
+        # Workaround for flashinfer and star attention
+        if kv_cache_config.enable_block_reuse:
+            logger.warning(
+                f"Disabling block reuse for {llm_args.attn_backend} backend")
+            kv_cache_config.enable_block_reuse = False
 
     if llm_args.attn_backend == "FLASHINFER_STAR_ATTENTION" and enable_chunked_context:
         logger.warning(
@@ -678,25 +680,6 @@ def create_py_executor(
         kv_cache_config.enable_block_reuse = False
         _set_model_engines_cache_reuse([model_engine, draft_model_engine],
                                        False)
-
-    if (llm_args.attn_backend in ["FLASHINFER", "FLASHINFER_STAR_ATTENTION"]
-            and kv_cache_config.enable_block_reuse):
-        # Workaround for the dense flashinfer wrapper and star attention.
-        # DeepSeek-V4 and DSA route attention through dedicated sparse
-        # backends: reused blocks reach their kernels through the same
-        # position-based block tables as fresh ones, and the indexer K-cache
-        # stride defect that used to fault under reuse retention is fixed at
-        # Indexer.build_indexer_params, so they keep prefix caching.
-        routes_to_sparse_backend = (
-            sparse_attention_config is not None
-            and getattr(sparse_attention_config, "algorithm",
-                        None) in ("deepseek_v4", "dsa"))
-        if not routes_to_sparse_backend:
-            logger.warning(
-                f"Disabling block reuse for {llm_args.attn_backend} backend")
-            kv_cache_config.enable_block_reuse = False
-            _set_model_engines_cache_reuse([model_engine, draft_model_engine],
-                                           False)
 
     if is_mla(config):
         if model_engine.model.model_config.enable_flash_mla:

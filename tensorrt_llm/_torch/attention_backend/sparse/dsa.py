@@ -1006,7 +1006,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         # token_positions_cuda: absolute position (cached + offset) per token,
         # refreshed in on_update_kv_lens() alongside the indexer slot mappings
         # (same source values, runtime-corrected under overlap scheduling).
-        # The FlashInfer backend consumes it for latent-pool append slots.
+        # The FlashInfer sparse-MLA FMHA consumes it for latent-pool append slots.
         self.token_positions_cuda = self.get_empty(
             self.cuda_graph_buffers,
             (self.max_num_tokens, ),
@@ -3003,6 +3003,12 @@ class DSATrtllmAttention(TrtllmAttention):
             attention_chunk_size=attention_chunk_size,
             **kwargs)
 
+        from ..fmha.flashinfer_sparse_mla import \
+            is_flashinfer_sparse_mla_enabled
+
+        self.kv_layout = ("inline_scale" if
+                          is_flashinfer_sparse_mla_enabled("dsa") else "native")
+
         # Cross-layer indexer sharing: only "full" layers own an indexer;
         # "shared" layers reuse the previous full layer's top-k (see
         # MLA.forward_dsa_*). Resolved per-layer in to_sparse_params; defaults to
@@ -3022,6 +3028,11 @@ class DSATrtllmAttention(TrtllmAttention):
         else:
             self.indexer = None
 
+    def support_fused_rope(self) -> bool:
+        # FlashInfer writes inline-scale pages after Python-side RoPE. This
+        # also disables the short-sequence dense-MHA bypass for that FMHA.
+        return self.kv_layout == "native"
+
     def sparse_attn_predict(
         self,
         q: torch.Tensor,
@@ -3030,6 +3041,8 @@ class DSATrtllmAttention(TrtllmAttention):
         forward_args: AttentionForwardArgs,
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         """Transform local TopK indices to global paged KV cache indices."""
+        if forward_args.topk_indices is None:
+            raise RuntimeError("DSA sparse attention requires top-k indices.")
         # Transform the local topk indices to global topk indices in paged kv cache
         is_generation = forward_args.attention_input_type == AttentionInputType.generation_only
         topk_indices_global, _ = transform_local_topk_and_prepare_pool_view(
@@ -3147,18 +3160,20 @@ class DSACacheManager(KVCacheManager):
         # allocates the pool with this smaller stride when the flag is set.
         self.use_fp4 = sparse_params.indexer_k_dtype == "fp4"
 
-        # The FlashInfer backend reads the main latent pool as inline-scale
-        # pages (inline_scale_kv.py): a fixed 656 bytes per token regardless
-        # of the declared KV dtype, carried through head_dim as a byte
-        # budget. The creation site passes `attn_backend` explicitly
-        # (`model_config` is the base manager's C++ ModelConfig parameter).
+        # TRTLLM's FlashInfer sparse-MLA FMHA reads the latent pool as packed
+        # inline-scale pages. Cache allocation and FMHA dispatch use the same
+        # registry/environment helper so fallback never sees this layout.
         attn_backend = kwargs.pop("attn_backend", None)
-        self._kv_token_layout = ("inline_scale"
-                                 if attn_backend == "FLASHINFER" else "native")
-        if self._kv_token_layout == "inline_scale":
+        from ..fmha.flashinfer_sparse_mla import \
+            is_flashinfer_sparse_mla_enabled
+
+        self._kv_layout = ("inline_scale" if attn_backend == "TRTLLM"
+                           and is_flashinfer_sparse_mla_enabled("dsa") else
+                           "native")
+        if self._kv_layout == "inline_scale":
             from .inline_scale_kv import PAGE_SIZE, TOKEN_BYTES
             assert tokens_per_block == PAGE_SIZE, (
-                f"The FlashInfer DSA backend requires tokens_per_block="
+                f"The FlashInfer DSA FMHA requires tokens_per_block="
                 f"{PAGE_SIZE}: its SM120 kernels are instantiated for "
                 f"{PAGE_SIZE}-token inline-scale pages. Set "
                 f"kv_cache_config.tokens_per_block accordingly.")
@@ -3264,7 +3279,11 @@ class DSACacheManager(KVCacheManager):
 
         num_attention_layers = KVCacheManager._resolve_num_attention_layers(
             model_config, mapping, num_layers)
-        if getattr(model_config, "attn_backend", None) == "FLASHINFER":
+        from ..fmha.flashinfer_sparse_mla import \
+            is_flashinfer_sparse_mla_enabled
+
+        if (getattr(model_config, "attn_backend", None) == "TRTLLM"
+                and is_flashinfer_sparse_mla_enabled("dsa")):
             # FlashInfer serves the latent pool as inline-scale pages
             # (inline_scale_kv.py): a fixed 656 bytes per token regardless of
             # the KV cache dtype.

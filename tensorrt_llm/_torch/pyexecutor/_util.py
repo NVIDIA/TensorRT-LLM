@@ -1806,8 +1806,7 @@ def _create_kv_cache_manager(
         manager_extra_kwargs["enable_stats"] = enable_kv_cache_stats
 
     # The DeepSeek-V4 and DSA managers derive their pool token layout from
-    # the attention backend selection (FlashInfer reads footer-scale /
-    # inline-scale pages respectively); the base managers ignore the kwarg.
+    # TRTLLM's selected FMHA library; the base managers ignore the kwarg.
     # Imported lazily like the sparse manager factory to avoid the
     # resource_manager import cycle.
     from ..attention_backend.sparse.deepseek_v4.cache_manager import \

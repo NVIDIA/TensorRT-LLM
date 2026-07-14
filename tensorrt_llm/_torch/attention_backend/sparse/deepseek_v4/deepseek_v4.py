@@ -150,7 +150,7 @@ def get_token_bytes(
     attn_type: DeepseekV4AttentionType,
     has_fp8_kv_cache: bool,
     indexer_k_dtype: str = "fp8",
-    kv_token_layout: str = "native",
+    kv_layout: str = "native",
 ) -> int:
     if not compress_ratio_has_attention(compress_ratio, attn_type):
         raise ValueError(
@@ -160,7 +160,7 @@ def get_token_bytes(
     # The FlashInfer SM120 sparse-MLA kernels read SWA and COMPRESS tokens as
     # footer-scale pages (see footer_scale_kv.py) regardless of the kv-cache
     # quant mode; every other attention type keeps its native layout.
-    if kv_token_layout == "footer_scale" and attn_type in (
+    if kv_layout == "footer_scale" and attn_type in (
         DeepseekV4AttentionType.SWA,
         DeepseekV4AttentionType.COMPRESS,
     ):
@@ -172,8 +172,8 @@ def get_token_bytes(
                 f"{footer_scale_kv.DIM_NOPE + footer_scale_kv.DIM_ROPE}, got {head_dim}"
             )
         return footer_scale_kv.TOKEN_BYTES
-    if kv_token_layout not in ("native", "footer_scale"):
-        raise ValueError(f"Unsupported kv_token_layout: {kv_token_layout!r}")
+    if kv_layout not in ("native", "footer_scale"):
+        raise ValueError(f"Unsupported kv_layout: {kv_layout!r}")
 
     attn_dim = get_attn_dim(head_dim, index_head_dim, compress_ratio, attn_type)
 
@@ -532,7 +532,7 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         )
 
         # token_positions_cuda: absolute position (cached + offset) per token.
-        # The FlashInfer backend consumes it for SWA append slots and the
+        # The FlashInfer sparse-MLA FMHA consumes it for SWA append slots and the
         # per-token valid-SWA lengths; kept as a graph-stable buffer.
         self.token_positions_cuda = self.get_empty(
             self.cuda_graph_buffers,
@@ -1371,11 +1371,6 @@ class DeepseekV4Indexer(Indexer):
 class DeepseekV4TrtllmAttention(TrtllmAttention):
     Metadata = DeepseekV4TrtllmAttentionMetadata
 
-    # SWA/COMPRESS pool token layout this backend reads and writes; the
-    # FlashInfer subclass overrides it with the footer-scale layout and the
-    # cache manager derives the same value from the attn-backend selection.
-    kv_token_layout = "native"
-
     def __init__(
         self,
         layer_idx: int,
@@ -1422,6 +1417,11 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
 
         self.sparse_attention_config = sparse_attention_config
         self.compress_ratio = sparse_attention_config.compress_ratios[layer_idx]
+        from ...fmha.flashinfer_sparse_mla import is_flashinfer_sparse_mla_enabled
+
+        self.kv_layout = (
+            "footer_scale" if is_flashinfer_sparse_mla_enabled("deepseek_v4") else "native"
+        )
 
         if self.compress_ratio == 4:
             self.indexer = DeepseekV4Indexer(
@@ -1453,6 +1453,13 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
                 dtype=dtype,
                 rotate_activation=False,
             )
+            if self.kv_layout == "footer_scale":
+                self.compressor.enable_footer_scale_cache()
+
+    def support_fused_rope(self) -> bool:
+        # The packed FlashInfer cache is written after Python-side RoPE; the
+        # native TRTLLM path keeps the fused C++ RoPE implementation.
+        return self.kv_layout == "native"
 
     def _prepare_sparse_forward_args(
         self,
@@ -1510,14 +1517,13 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
         k: Optional[torch.Tensor],
         metadata: DeepseekV4TrtllmAttentionMetadata,
         forward_args: AttentionForwardArgs,
-        split_extra: bool = False,
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         """Convert local indices (SWA + compressed) to global pool indices.
 
-        Returns ``(combined_indices, None)`` by default (the C++ FMHA kernel
-        takes one table whose tile index selects the TMA descriptor); with
-        ``split_extra`` the two regions come back as separate contiguous
-        tensors ``(swa_indices, compressed_indices_or_None)``.
+        The C++ fallback consumes one combined table. The FlashInfer FMHA
+        consumes separate SWA and compressed tables, carried through the
+        generic ``(indices, offsets)`` pair because fallback is incompatible
+        with that FMHA's packed cache layout.
         """
         layer_idx = self.layer_idx
         kv_cache_manager = metadata.kv_cache_manager
@@ -1539,7 +1545,7 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
             self.compress_ratio,
             DeepseekV4AttentionType.SWA,
             has_fp8_kv_cache,
-            kv_token_layout=self.kv_token_layout,
+            kv_layout=self.kv_layout,
         )
 
         # Select token range based on phase
@@ -1591,10 +1597,10 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
             compressed_buffer_ptr=compressed_buffer_ptr,
             compress_ratio=self.compress_ratio,
             num_compressed_indices=metadata.max_compressed_indices[self.compress_ratio],
-            split_extra=split_extra,
+            split_extra=self.kv_layout == "footer_scale",
         )
 
-        if split_extra:
+        if self.kv_layout == "footer_scale":
             return result
         return result, None
 

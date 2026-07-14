@@ -17,12 +17,14 @@ import os
 from typing import TypeAlias
 
 from .fallback import FallbackFmha
+from .flashinfer_sparse_mla import FMHA_NAME, FlashInferSparseMlaFmha
 from .flashinfer_trtllm_gen import FlashInferTrtllmGenFmha
 from .interface import Fmha
 
 FmhaCls: TypeAlias = type[Fmha]
 
 FMHA_LIBS: dict[str, FmhaCls] = {
+    FMHA_NAME: FlashInferSparseMlaFmha,
     "flashinfer_trtllm_gen": FlashInferTrtllmGenFmha,
     "fallback": FallbackFmha,
 }
@@ -69,8 +71,12 @@ def _parse_fmha_libs_env() -> tuple[str, ...]:
     return tuple(names)
 
 
+def get_enabled_fmha_lib_names() -> tuple[str, ...]:
+    return _parse_fmha_libs_env()
+
+
 def get_enabled_fmha_lib_classes() -> list[FmhaCls]:
-    return [FMHA_LIBS[name] for name in _parse_fmha_libs_env()]
+    return [FMHA_LIBS[name] for name in get_enabled_fmha_lib_names()]
 
 
 __all__ = [
@@ -78,4 +84,5 @@ __all__ = [
     "FMHA_LIBS",
     "FmhaCls",
     "get_enabled_fmha_lib_classes",
+    "get_enabled_fmha_lib_names",
 ]
