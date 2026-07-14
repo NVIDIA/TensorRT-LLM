@@ -288,22 +288,6 @@ class OpenAIServer(_VideoRoutesMixin):
                     merged.setdefault(modality, {}).update(kw)
                 cfg.media_io_kwargs = merged
                 self.multimodal_server_config = cfg
-
-        # Source-anchor video hashing is only worth the load-time BLAKE3 when a
-        # downstream consumer will read it — that's ``enable_block_reuse``.
-        # Inject as a server-managed ``media_io_kwargs`` default so ``VideoMediaIO``
-        # picks it up through the framework's existing kwarg chain.
-        kv = getattr(getattr(self.generator, "args", None), "kv_cache_config",
-                     None)
-        if kv is not None and getattr(kv, "enable_block_reuse", False):
-            cfg = self.multimodal_server_config or MultimodalServerConfig()
-            merged = {
-                m: dict(kw)
-                for m, kw in (cfg.media_io_kwargs or {}).items()
-            }
-            merged.setdefault("video", {}).setdefault("hash_source", True)
-            cfg.media_io_kwargs = merged
-            self.multimodal_server_config = cfg
         self.allow_request_chat_template = allow_request_chat_template
         self.server_role = server_role
         # Will be set in __call__

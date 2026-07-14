@@ -156,9 +156,9 @@ class VideoData(BaseModalityData):
         audio: Structured audio payload from the video, when extracted.
         raw_bytes_hash: BLAKE3 hex digest of the source video bytes when
             available. Populated by media loaders that hold the source
-            (e.g. ``VideoMediaIO``); ``None`` when the ``VideoData`` is
+            (e.g. `VideoMediaIO`); `None` when the `VideoData` is
             constructed from a frame list directly. When set, it acts as
-            the source anchor in ``update_hash`` — combined with the
+            the source anchor in `update_hash` — combined with the
             sampling metadata, it uniquely identifies the decoded frame
             content without walking pixels.
     """
@@ -177,15 +177,15 @@ class VideoData(BaseModalityData):
     def update_hash(self, hasher: ContentHasher) -> None:
         hasher.update(b"<video>")
         # Sampling metadata is part of the model-visible cache identity.
-        # ``frames_indices`` is a deterministic function of source bytes plus
-        # media IO ``num_frames``/``fps`` kwargs, so per-request kwarg
+        # `frames_indices` is a deterministic function of source bytes plus
+        # media IO `num_frames`/`fps` kwargs, so per-request kwarg
         # overrides land here implicitly.
         meta = {k: self.metadata[k] for k in _VIDEO_HASH_METADATA_FIELDS if k in self.metadata}
         hasher.update(serialize_item(meta))
         if self.raw_bytes_hash is not None:
             # Source anchor: metadata + source digest is equivalent to
             # hashing decoded frames, since cv2 decoding is deterministic
-            # given source bytes and sampling is captured in ``meta``.
+            # given source bytes and sampling is captured in `meta`.
             hasher.update(b"<raw_bytes>")
             hasher.update(self.raw_bytes_hash.encode("utf-8"))
         else:

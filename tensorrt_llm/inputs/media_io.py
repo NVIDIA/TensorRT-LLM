@@ -36,6 +36,7 @@ import numpy as np
 import requests
 import soundfile
 import torch
+from blake3 import blake3
 from packaging.version import Version
 from PIL import Image
 
@@ -401,24 +402,6 @@ _VIDEO_TEMPFILE_DIR: Optional[str] = (  # nosec B108
 )
 
 
-def _blake3_hex_stream(source: Union[bytes, bytearray, memoryview, str]) -> str:
-    """BLAKE3 hex digest of raw bytes or a file path (streamed).
-
-    Streams the file so large videos don't force a full-file memory load
-    just to compute the digest.
-    """
-    from blake3 import blake3
-
-    hasher = blake3()
-    if isinstance(source, (bytes, bytearray, memoryview)):
-        hasher.update(source)
-    else:
-        with open(source, "rb") as f:
-            for chunk in iter(lambda: f.read(65536), b""):
-                hasher.update(chunk)
-    return hasher.hexdigest()
-
-
 def _load_video_by_cv2(
     video: Union[str, bytes],
     num_frames: int = 10,
@@ -747,7 +730,6 @@ class VideoMediaIO(BaseMediaIO[VideoData]):
         format: str = "pt",
         device: str = "cpu",
         extract_audio: bool = False,
-        hash_source: bool = False,
     ) -> None:
         # `"pt"` is the safe default every video model handles; models tuned
         # for the uint8-HWC path opt into `"np"` via
@@ -759,13 +741,6 @@ class VideoMediaIO(BaseMediaIO[VideoData]):
         self._format = format
         self._device = device
         self._extract_audio = extract_audio
-        # Server-managed: enable eager BLAKE3 of the source bytes so
-        # ``VideoData.update_hash`` can take the source-anchor fast path
-        # instead of walking decoded frames. The server injects this when
-        # a downstream consumer (KV cache block reuse) actually needs the
-        # digest; default ``False`` matches pre-patch behavior for callers
-        # that don't opt in.
-        self._hash_source = hash_source
 
     @classmethod
     def merge_kwargs(
@@ -792,7 +767,7 @@ class VideoMediaIO(BaseMediaIO[VideoData]):
         # is unlinked on context exit; the inode survives until cv2 closes
         # its own fd (Linux semantics), so the decode inside the `with`
         # block reads safely.
-        raw_bytes_hash = _blake3_hex_stream(data) if self._hash_source else None
+        raw_bytes_hash = blake3(data).hexdigest()
         cv2_backend = _select_cv2_stream_buffered_backend()
         if cv2_backend is not None:
             return _load_video_by_cv2(
@@ -822,17 +797,7 @@ class VideoMediaIO(BaseMediaIO[VideoData]):
         return self.load_bytes(base64.b64decode(data))
 
     def load_file(self, url: str) -> VideoData:
-        path = _normalize_file_uri(url)
-        raw_bytes_hash = _blake3_hex_stream(path) if self._hash_source else None
-        return _load_video_by_cv2(
-            path,
-            self._num_frames,
-            self._fps,
-            self._format,
-            self._device,
-            extract_audio=self._extract_audio,
-            raw_bytes_hash=raw_bytes_hash,
-        )
+        return self.load_bytes(Path(_normalize_file_uri(url)).read_bytes())
 
 
 MEDIA_IO_REGISTRY: Mapping[MediaModality, Type[BaseMediaIO]] = MappingProxyType(
