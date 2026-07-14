@@ -28,20 +28,20 @@ before a connector or merger reduces the representation. This cost is intentiona
 the number of placeholder embeddings inserted into the LLM prompt.
 
 The default admission policy follows the vLLM model: an MM request rejected by LLM capacity does not
-run its encoder independently. An opt-in environment variable enables an experimental independent
+run its encoder independently. An opt-in environment variable enables an experimental eager encoder
 policy for A/B testing. That policy lets an already-admitted request make encoder progress before the
 current iteration's LLM-capacity filtering; it does not pre-encode waiting requests.
 
 This document is implementation-oriented: statements in the present tense describe the current
 branch. Sections explicitly marked as deferred or required testing are not implemented yet. In
-particular, this implementation does not reuse the native encoder-decoder request state or stream,
+particular, this implementation does not reuse the native encoder-decoder request state or execution path,
 does not split an original MM item, and does not create a separate encoder-only request queue.
 
 ## Implementation diagram
 
 The diagram below follows the current code from engine initialization through waiting admission,
 per-iteration scheduling, selected-item execution, request-local commit, and conditional LLM forward.
-It also shows PP/stream behavior, the boundary from native encoder-decoder scheduling, and a concrete
+It also shows PP behavior, the boundary from native encoder-decoder scheduling, and a concrete
 two-iteration packing trace.
 
 [Open the editable Excalidraw source](../../../mm_encoder_scheduling.excalidraw) or
@@ -82,7 +82,7 @@ boundaries. The scheduler therefore needs an MM-specific unit of work and budget
 5. Reuse existing request metadata, schedule distribution, and model-specific input processors where
    practical.
 6. Support Qwen2-VL/Qwen2.5-VL, Qwen3-VL, and Mistral3/Pixtral in the initial implementation.
-7. Provide a controlled experiment for encoder-independent admission without making it the default.
+7. Provide a controlled experiment for eager encoder scheduling without making it the default.
 
 ## Non-goals
 
@@ -91,7 +91,7 @@ boundaries. The scheduler therefore needs an MM-specific unit of work and budget
 - Implementing cross-request MM encoder output caching. The design reserves stable item identities and
   lifecycle hooks so a separate cache effort can integrate later.
 - Bounding, evicting, or offloading request-local encoder outputs in the first implementation.
-- Changing native encoder-decoder scheduling or its encoder stream.
+- Changing native encoder-decoder scheduling or execution.
 - Supporting MM tower LoRA. The target encoders currently do not accept request-level LoRA parameters.
 - Redesigning overlap scheduler or MM prefetch compatibility in the first implementation.
 - Extending the new scheduler to models that do not inherit `MultimodalModelMixin`.
@@ -105,7 +105,7 @@ following explicit terms.
 | --- | --- | --- |
 | MM item | One original user-visible input, such as one image or one video | The second image in a prompt |
 | Encoder attention token | One row participating in the encoder's attention before a merger or connector | A Qwen-VL pre-merger vision patch |
-| Encoder output embedding | One row emitted after the encoder connector/merger | A row inserted into the LLM embedding stream |
+| Encoder output embedding | One row emitted after the encoder connector/merger | A row inserted into the LLM embedding sequence |
 | Placeholder token | A position or run in the text prompt replaced by MM output embeddings | Image placeholder positions |
 | Internal encoder sequence | A sequence/window/segment represented in encoder `AttentionMetadata` | One temporal or window-attention sequence |
 
@@ -121,36 +121,38 @@ that identity.
 
 ### Configuration semantics
 
-`None` means fallback to the resolved LLM value, not unlimited or legacy behavior:
+An explicit encoder token budget is a strict user contract. `None` selects a
+compatibility policy that starts from the resolved LLM value and may raise it
+to keep the model's largest valid atomic item schedulable:
 
 ```text
 resolved_encoder_max_batch_size =
     encoder_max_batch_size if encoder_max_batch_size is not None else max_batch_size
 
-configured_encoder_token_budget =
-    encoder_max_num_tokens if encoder_max_num_tokens is not None else max_num_tokens
+base_encoder_token_budget =
+    encoder_max_num_tokens if explicitly set else max_num_tokens
 
-effective_encoder_token_budget = max(
-    configured_encoder_token_budget,
-    model_max_atomic_item_tokens,
-)
+effective_encoder_token_budget =
+    base_encoder_token_budget                         # explicit, strict
+    max(base_encoder_token_budget,
+        model_max_atomic_item_tokens)                 # unset, compatibility
 ```
 
 The item-count budget counts original MM items. It does not count requests, internal attention
 sequences, video frames, temporal units, or physical encoder forwards.
 
-The effective token budget is raised when a valid atomic item can be larger than the configured
-budget. This is necessary because the current scope does not split an item. The implementation must:
+The implementation must:
 
-1. retain both configured and effective values;
-2. log a warning once when it raises the value;
+1. retain the optional configured value plus the base and effective values;
+2. log the configured/base/effective values and warn once when compatibility mode raises the value;
 3. use the effective value consistently for scheduling, profiling, attention metadata, and workspace
    sizing; and
 4. not raise `encoder_max_batch_size` except to enforce the existing positive-value validation.
 
-An individual request whose item exceeds the model's startup-declared maximum is invalid. Input
-processing should normally resize or sample the media to remain within model limits. A defensive
-runtime check fails only that request; it must not dynamically resize metadata or abort the server.
+With an explicit token budget, an individual request containing an item above that budget is invalid.
+In compatibility mode, an item above the model's startup-declared maximum is invalid. Input processing
+should normally resize or sample media to remain within model limits. A defensive runtime check fails
+only that request; it must not dynamically resize metadata or abort the server.
 
 ## Scope and model gating
 
@@ -165,10 +167,9 @@ supports_mm_encoder_item_scheduling = (
 )
 ```
 
-`TLLM_MM_ENCODER_RUNTIME_SCHEDULING=0` disables the runtime feature for A/B comparison. Otherwise,
-the executor installs `MultimodalScheduler` only when the combined capability is true. Models outside
-the mixin and processors without complete item metadata continue through the legacy path. There is no
-per-iteration `model.modules()` scan for scheduler gating.
+The executor installs the MM scheduler only when the combined capability is true. Models outside the
+mixin and processors without complete item metadata continue through the legacy path. There is no
+runtime kill switch and no per-iteration `model.modules()` scan for scheduler gating.
 
 The initial implementation requires complete item-level support for:
 
@@ -223,17 +224,14 @@ MM item scheduling and native encoder-decoder scheduling are separate executor p
 | Request state | Remains `CONTEXT_INIT` | Starts in `ENCODER_INIT` |
 | Scheduled output | `scheduled_mm_encoder_items` | `encoder_requests` |
 | Request-local output | MM item slots and contiguous `multimodal_embedding` buffer | `py_encoder_output` |
-| Executor entry | `_execute_scheduled_mm_encoder_items` | `_run_encoder_step` |
-| CUDA stream | Existing `execution_stream` | Dedicated `encoder_stream` |
+| Executor entry | `_forward_multimodal_encoder_step` | `_run_encoder_step` |
 | Decoder timing | May run in the same iteration | Re-enters decoder scheduling on a later iteration |
 
-`MultimodalScheduler` does call
-`drop_decoder_context_requests_waiting_for_encoder_output()` before invoking the wrapped scheduler's
-capacity and microbatch stages directly. This does not turn MM requests into encoder-decoder requests.
-It preserves the prefilter that `SimpleScheduler.schedule_request()` would otherwise have applied for
-real encoder-decoder requests. MM requests have no `py_encoder_output_ready_event`, so the helper is a
-no-op for them. The MM path never inserts requests into `encoder_requests`, never calls
-`forward_encoder()`, and never uses `encoder_stream`.
+`MultimodalScheduler` does not run native encoder-decoder readiness filtering. The currently supported
+Qwen and Mistral/Pixtral models are decoder-only VLMs, and MM readiness comes exclusively from the
+Python item progress described above. Native encoder-decoder schedulers retain their own
+`drop_decoder_context_requests_waiting_for_encoder_output()` calls. The MM path never inserts requests
+into `encoder_requests` and never calls `forward_encoder()`.
 
 ## Static request metadata
 
@@ -348,16 +346,14 @@ contract in this order:
 2. Set `supports_mm_encoder_item_scheduling` only when the model inherits `MultimodalModelMixin` and
    the processor explicitly advertises complete item metadata support.
 3. Require a nonempty `get_mm_max_tokens_per_item()` result with positive per-modality values.
-4. Preserve `configured_encoder_max_num_tokens`, then raise the effective
-   `encoder_max_num_tokens` to the largest valid atomic item when necessary.
+4. Preserve whether `encoder_max_num_tokens` was explicit. Keep an explicit
+   value strict; when it is unset, raise the effective fallback to the largest
+   valid atomic item when necessary.
 5. Initialize `MultimodalEncoderMixin` attention metadata and direct encoder profiling with the
    effective budget.
-6. If runtime scheduling is enabled, reject MM side-stream prefetch and install
-   `MultimodalScheduler`. Independent mode additionally rejects attention DP and a disaggregated KV
-   cache transceiver.
-
-Disabling `TLLM_MM_ENCODER_RUNTIME_SCHEDULING` skips the wrapper and request-local item initialization,
-leaving the existing full-request MM encoder path intact for A/B comparison.
+6. Reject existing asynchronous MM prefetch and install `MultimodalScheduler` for the default coupled
+   policy or `MultimodalEagerEncoderScheduler` when eager scheduling is enabled. Eager mode
+   additionally rejects attention DP and a disaggregated KV cache transceiver.
 
 ### Request and iteration path
 
@@ -374,8 +370,9 @@ The current request path is:
 4. **Request attachment.** `merge_requests()` creates `LlmRequest`; validation calls
    `initialize_multimodal_encoder_request()`, which classifies the request, validates the startup item
    maximum, and creates item slots and output offsets. The state stays `CONTEXT_INIT`.
-5. **Scheduling.** `MultimodalScheduler` runs the coupled or independent policy and returns an optional
-   `request_id -> item_indices` map. The existing schedule serialization propagates this map.
+5. **Scheduling.** `MultimodalScheduler` runs the default coupled policy;
+   `MultimodalEagerEncoderScheduler` runs the opt-in eager policy. Either scheduler returns an
+   optional `request_id -> item_indices` map, which the existing schedule serialization propagates.
 6. **Item execution.** Every participating executor reconstructs the same selection, resolves active
    requests, slices selected items on CPU, transfers those slices, runs consecutive modality groups,
    and commits one output per item into the request's final buffer.
@@ -406,7 +403,7 @@ waiting admission:
 per-iteration scheduling:
     reset encoder item/token budget again
     default mode: select only from CapacityScheduler-fitting requests
-    independent mode: select from all already-active requests before capacity
+    eager mode: select from all already-active requests before capacity
     emit scheduled_mm_encoder_items without mutating request item state
 ```
 
@@ -456,13 +453,12 @@ MM encoder forward(s) -> assemble embeddings -> LLM forward, same iteration
 
 The actual default path for one scheduling call is:
 
-1. Preserve the native encoder-decoder readiness prefilter.
-2. Run the existing LLM CapacityScheduler over the active requests.
-3. Scan the fitting requests with `_can_schedule_full_request_mm_batch()`.
-4. If every pending MM request is pristine and the whole fitting set fits both encoder budgets, return
+1. Run the existing LLM CapacityScheduler over the active requests.
+2. Scan the fitting requests with `_can_schedule_full_request_mm_batch()`.
+3. If every pending MM request is pristine and the whole fitting set fits both encoder budgets, return
    the original scheduler result unchanged. The existing full-request MM encoder path then runs inside
    the model forward.
-5. Otherwise select atomic items from the capacity-fitting list, withhold MM requests that will remain
+4. Otherwise select atomic items from the capacity-fitting list, withhold MM requests that will remain
    partial, and run the existing MicroBatchScheduler on the remaining LLM-eligible requests.
 
 The wrapper also supports scheduler implementations without separately exposed capacity and
@@ -527,7 +523,7 @@ rejection does not leave behind speculative encoder output.
 
 An encoder-only progress iteration is valid. If a lone request needs multiple MM iterations, an
 intermediate `ScheduledRequests` can have selected MM items and zero context/generation requests. The
-executor runs `_execute_scheduled_mm_encoder_items()` before its empty-batch `_can_queue()` check; the
+executor runs `_forward_multimodal_encoder_step()` before its empty-batch `_can_queue()` check; the
 empty LLM batch is then skipped without running forward, sampling, or per-batch statistics. A local
 single-request, 32-image test with an item budget of 16 exercised this two-iteration shape, but this is
 not yet a committed integration test.
@@ -561,38 +557,37 @@ This gate controls active-set admission, while the existing CapacityScheduler re
 that reserves LLM resources. In default mode, item selection occurs only after that capacity result,
 which avoids encoding a capacity-rejected request.
 
-### Experimental: independent encoder admission
+### Eager encoder scheduling
 
-The following process environment variable enables an A/B experiment:
+The following public argument enables the eager policy:
 
-```text
-TLLM_MM_ENCODER_INDEPENDENT_SCHEDULING=1
+```yaml
+multimodal_config:
+  enable_eager_encoder_scheduling: true
 ```
 
-The default is `0`. This is intentionally not a public `LlmArgs` field in the initial experiment.
+The default is `false`, which selects the coupled policy.
 
-The implementation also has two diagnostic/rollout environment variables:
+The implementation retains one diagnostic environment variable:
 
 ```text
-TLLM_MM_ENCODER_RUNTIME_SCHEDULING=0  # disable item scheduling; default is 1
-TLLM_MM_ENCODER_FORWARD_LOG=1         # log Qwen-style grid item/token counts
+TLLM_MM_ENCODER_FORWARD_LOG=1  # log Qwen-style grid item/token counts
 ```
 
-Independent mode selects encoder items from the existing `active_requests` before LLM capacity
+Eager mode selects encoder items from the existing `active_requests` before LLM capacity
 filtering. It lets an already-admitted request continue encoder progress in an iteration where LLM
 capacity rejects it; it does not create a separate pre-admission collection or increase the active
 request limit. Completed outputs stay request-local until normal LLM scheduling.
 
-Independent mode changes only where item selection occurs relative to LLM capacity. Both policies use
+Eager mode changes only where item selection occurs relative to LLM capacity. Both policies use
 the same active set, serial execution order, model hooks, output validation, and output assembly, which
 makes throughput and latency comparisons meaningful.
 
-Independent mode raises `NotImplementedError` when attention data parallelism or a disaggregated KV
+Eager mode raises `NotImplementedError` when attention data parallelism or a disaggregated KV
 cache transceiver is enabled. The default coupled policy does not have that explicit rejection. Any
-item-scheduled mode also rejects `TLLM_MM_SIDE_STREAM_MAX_AHEAD > 0` at executor initialization because
-MM side-stream prefetch has not been integrated with request-local item state. The ordinary executor
-overlap loop remains enabled, but scheduled MM work is synchronized on the execution stream as
-described below.
+item-scheduled mode also rejects `multimodal_config.encoder_side_stream_max_ahead > 0` at executor
+initialization because the existing asynchronous MM prefetch path has not been integrated with
+request-local item state. The ordinary executor overlap loop remains enabled.
 
 ## Schedule distribution
 
@@ -632,23 +627,23 @@ It is not the actual scheduled LLM batch size and is not rewritten by the MM wra
 `MultimodalModelMixin` exposes a two-stage internal item API:
 
 ```python
-def prepare_multimodal_items(
+def prepare_multimodal_encoder_inputs(
     self,
     selected_items: Sequence[tuple[MultimodalParams, int]],
 ) -> list[tuple[MultimodalParams, int, str]]:
-    """Slice selected items on CPU and retain output length and modality."""
+    """Build selected item encoder inputs on CPU."""
 
-def encode_prepared_multimodal_items(
+def forward_multimodal_encoder_items(
     self,
-    prepared_items: Sequence[tuple[MultimodalParams, int, str]],
+    encoder_inputs: Sequence[tuple[MultimodalParams, int, str]],
 ) -> list[torch.Tensor]:
-    """Encode prepared items and return one tensor per item in input order."""
+    """Forward encoder inputs and return one tensor per item in input order."""
 ```
 
 The previously proposed single `encode_multimodal_items()` hook is not part of the implementation. The
 scheduler knows only request IDs, item indices, and costs. The model engine resolves selected
-request/item pairs, calls `prepare_multimodal_items()` while the original payload is still on CPU,
-transfers only the prepared microbatch, and then calls `encode_prepared_multimodal_items()`.
+request/item pairs, calls `prepare_multimodal_encoder_inputs()` while the original payload is still on
+CPU, transfers only the prepared microbatch, and then calls `forward_multimodal_encoder_items()`.
 
 The mixin owns:
 
@@ -673,7 +668,7 @@ behavior.
 Scheduler packing is modality- and shape-agnostic. Current supported models group **consecutive**
 selected items by modality; their preparation contracts produce compatible fields, dtype/device, and
 shapes within each run. A future model that cannot guarantee this must override
-`encode_prepared_multimodal_items()` or use a stricter compatibility key. All physical forwards share
+`forward_multimodal_encoder_items()` or use a stricter compatibility key. All physical forwards share
 one per-iteration budget.
 
 Nonconsecutive items are not reordered to make a larger batch. Reordering would require an additional
@@ -750,10 +745,15 @@ runtime item scheduling or have not supplied a model-specific conversion. Their 
 yet governed by this feature, so sizing fixed per-segment buffers from a configured runtime budget
 would be unsafe.
 
-The effective token budget, including any startup raise for the largest atomic item, is passed to
-attention metadata setup and direct encoder profiling.
+The effective token budget is passed to attention metadata setup and direct encoder profiling. Direct
+profiling executes two feasible boundary shapes sequentially: one longest item and up to
+`encoder_max_num_items` equal shorter items sharing the same aggregate token budget. Inputs from one
+shape are released before the next, and only the final output remains live for the subsequent LLM
+dummy forward. This covers both maximum context length and maximum item/sequence pressure without
+adding two dummy batches together into an impossible peak. In strict mode both shapes stay within the
+explicit budget; in compatibility mode they use the auto-raised effective budget.
 
-## Execution ordering and streams
+## Execution ordering
 
 The first implementation is serial from the scheduler's perspective:
 
@@ -763,21 +763,16 @@ selected MM encoder forward group(s)
     -> selected LLM forward
 ```
 
-This ordering is required for same-step consumption. MM item execution uses the executor's existing
-`execution_stream`, not the native encoder-decoder `encoder_stream`:
+Scheduling itself does not launch MM GPU work. `_prepare_and_schedule_batch()` fetches requests and
+returns `ScheduledRequests`; after the benchmark/disaggregated-serving retry gate accepts that result,
+the non-PP and overlap executor loops call `_forward_multimodal_encoder_step()`. That phase runs before
+`_can_queue()` and `resource_manager.prepare_resources()`, and it is not conditional on a nonempty LLM
+batch. The PP loop calls the same phase after schedule propagation and local reconstruction, also
+before `_can_queue()`.
 
-```python
-execution_stream.wait_stream(torch.cuda.current_stream())
-with torch.cuda.stream(execution_stream):
-    model_engine.execute_multimodal_encoder_items(...)
-torch.cuda.current_stream().wait_stream(execution_stream)
-```
-
-The two waits serialize selected MM work after previously enqueued current-stream work and serialize
-the following LLM work after MM completion. Correctness is explicit, but an MM arrival can reduce the
-benefit of the ordinary overlap executor by inserting a synchronization bubble. The overlap control
-flow itself remains enabled. The separate MM side-stream prefetch mode is rejected at initialization,
-as described above, rather than silently combined with item scheduling.
+This executor ordering is required for same-step consumption. The existing asynchronous MM prefetch
+mode remains rejected at initialization, as described above, rather than being silently combined with
+item scheduling.
 
 ## Error handling and cancellation
 
@@ -800,14 +795,14 @@ to roll back when a schedule result is discarded. A selected request that is no 
 
 The initial implementation intentionally has no separate byte or item limit for accumulated
 request-local outputs. This is acceptable for the first correctness/performance evaluation but is a
-known risk, especially in independent mode where an already-active request can finish encoding while
+known risk, especially in eager mode where an already-active request can finish encoding while
 it is repeatedly rejected by the current iteration's LLM capacity decision.
 
-The following follow-up is required before independent mode becomes a supported default:
+The following follow-up is required before eager mode becomes a supported default:
 
 1. Track resident MM output embeddings by items and bytes.
 2. Reserve resident capacity before scheduling an item, not after its forward.
-3. Stop independent selection when the resident budget is exhausted.
+3. Stop eager selection when the resident budget is exhausted.
 4. Release capacity on LLM consumption, cancellation, validation failure, and executor error.
 5. Define whether completed outputs remain on GPU, move to pinned CPU memory, or are evicted.
 6. Define per-DP-replica ownership and distributed accounting.
@@ -838,7 +833,7 @@ Required comparisons include:
 6. Complete precomputed embeddings bypassing the encoder budget.
 7. Cancellation while an item is pending and while it is in flight.
 8. Distributed schedule serialization and reconstruction.
-9. Default versus independent admission with identical encoder output and final greedy tokens.
+9. Default versus eager admission with identical encoder output and final greedy tokens.
 
 Tests compare encoder outputs using dtype-appropriate numerical tolerances. Bitwise equality is not
 always possible when a kernel sees a different physical batch, but deterministic greedy generation
@@ -851,7 +846,7 @@ model-level proof and accuracy suite.
 ### Current validation status
 
 Committed unit tests cover atomic packing and cross-request backfill, full-request path selection,
-independent selection after LLM-capacity rejection, ready-request admission accounting, oversized-item
+eager selection after LLM-capacity rejection, ready-request admission accounting, oversized-item
 admission into validation, CPU item slicing, selected output assembly into one buffer, raw-input
 cleanup, prompt-order metadata, original-video item identity, and Qwen/Mistral token-unit calculations.
 They also cover typed processor metadata materialization and validation.
@@ -868,8 +863,9 @@ is not a checked-in regression test. The following material gaps remain:
 
 ## Performance and observability
 
-Current observability is intentionally narrow. Startup logs warn when the configured token budget is
-raised to the effective atomic-item budget and report when independent scheduling is enabled. Setting
+Current observability is intentionally narrow. Startup logs report configured, base, effective, model
+atomic-maximum, and strict/auto policy values; compatibility-mode raises also produce a warning.
+Startup also reports when eager scheduling is enabled. Setting
 `TLLM_MM_ENCODER_FORWARD_LOG=1` logs Qwen-style grid-derived item/token counts at encoder forward time;
 it is a diagnostic for Qwen-like inputs and can report zero for Mistral inputs. The normal scheduler
 does not log each item.
@@ -878,7 +874,7 @@ The following desired metrics are not yet implemented as stable counters:
 
 - per-step selected item count, physical token count, and physical forward-group count;
 - requests blocked by the item or token budget;
-- request-local ready bytes, especially in independent mode;
+- request-local ready bytes, especially in eager mode;
 - selected H2D bytes and peak allocated memory around each encoder forward;
 - waiting time to first encoder item and time from final item to first LLM prefill; and
 - cache hits/misses when cache integration lands.
@@ -887,12 +883,12 @@ Performance evaluation should compare at least:
 
 - non-MM throughput and latency before/after, which should be statistically unchanged;
 - current full MM batch behavior against default item scheduling;
-- default coupled admission against independent admission;
+- default coupled admission against eager admission;
 - single-item and multi-item prompts;
 - compatible and incompatible item shapes; and
 - encoder-heavy workloads mixed with long LLM prefill/decode workloads.
 
-The primary A/B question is not only encoder utilization. It is whether independent encoder progress
+The primary A/B question is not only encoder utilization. It is whether eager encoder progress
 improves end-to-end latency or throughput after accounting for resident-output memory and contention
 with LLM work.
 
@@ -909,8 +905,9 @@ error, and full-request path completion.
 
 1. Qwen2/2.5-VL, Qwen3-VL, and Mistral3/Pixtral processors emit typed physical-cost, output-length,
    and prompt-ordered item-reference metadata.
-2. Startup validates the model's maximum atomic item cost, retains configured and effective token
-   budgets, and feeds the effective value to encoder metadata setup and profiling.
+2. Startup retains configured, base, and effective token budgets. Explicit configuration is strict;
+   an unset value may auto-raise for the model atomic maximum. The effective value feeds encoder
+   metadata setup and long-item/many-item profiling.
 3. Request attachment creates the immutable MM request-kind flag, fixed output slots, and output
    offsets while keeping the request in `CONTEXT_INIT`.
 4. `ScheduledRequests` and `SerializableSchedulerOutput` carry selected item IDs through the existing
@@ -924,16 +921,16 @@ error, and full-request path completion.
    outputs directly into one contiguous request-local buffer without `torch.cat`.
 8. Completed raw encoder payloads are stripped while scheduler metadata and the final embedding are
    retained.
-9. Experimental independent scheduling selects from the existing active set before LLM capacity and
+9. Experimental eager scheduling selects from the existing active set before LLM capacity and
    is gated by an environment variable that defaults off.
-10. The feature rejects MM side-stream prefetch, and independent mode rejects attention DP and
+10. The feature rejects asynchronous MM prefetch, and eager mode rejects attention DP and
     disaggregated serving, rather than silently combining unvalidated paths.
 
 ### Deferred or incomplete
 
 1. Resident-output memory budgeting and eviction. Offload is not part of this implementation.
 2. Cross-request encoder cache integration.
-3. MM side-stream prefetch and a dedicated overlap/concurrency design.
+3. Asynchronous MM prefetch and a dedicated overlap/concurrency design.
 4. A constant-time text-only fast path for supported MM models.
 5. First-PP-stage-only encoder ownership and embedding distribution.
 6. Model-specific attention-sequence capacity hooks for the remaining legacy encoders, allowing the
@@ -975,7 +972,7 @@ atomic.
 ### Add a separate encoder-only request collection
 
 Deferred because it would add another ownership and lifecycle domain to an already complex executor.
-The experimental independent mode instead operates only on requests already present in
+The experimental eager mode instead operates only on requests already present in
 `active_requests`; it does not pre-encode waiting requests, exceed the active-request limit, or require
 a second cancellation path. The tradeoff is that an MM request can occupy an active slot across several
 encoder iterations.
@@ -997,9 +994,9 @@ minimum for models without an override.
 
 The following are intentionally not required to land the first runtime-enforcement change:
 
-1. What resident-output byte limit and eviction policy should independent mode use? GPU-to-host offload
+1. What resident-output byte limit and eviction policy should eager mode use? GPU-to-host offload
    is not planned for the current work.
-2. How should MM prefetch and the overlap scheduler coordinate item ownership and CUDA streams?
+2. How should MM prefetch and the overlap scheduler coordinate item ownership and execution ordering?
 3. Should a later public configuration replace the experimental environment variable?
 4. Is strict FCFS waiting admission preferable after production traces, or should a bounded bypass or
    best-fit policy be added?
