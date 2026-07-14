@@ -29,7 +29,7 @@ from tensorrt_llm._torch.attention_backend.interface import PositionalEmbeddingP
 from tensorrt_llm._torch.custom_ops import cute_dsl_custom_ops
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_deepseekv3 import weight_dequant
-from tensorrt_llm._torch.modules.mla import MLA, _select_dsv4_ob_split_k
+from tensorrt_llm._torch.modules.mla import MLA
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.llmapi.llm_args import DeepSeekV4SparseAttentionConfig
@@ -50,15 +50,18 @@ def test_select_dsv4_ob_split_k_auto_policy(
     num_tokens: int, expected_split: int, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.delenv("TRTLLM_DSV4_OB_SPLIT_K", raising=False)
-    assert _select_dsv4_ob_split_k(num_tokens) == expected_split
+    assert (
+        cute_dsl_custom_ops.CuteDSLFp8SplitKGemmRunner._select_num_splits(num_tokens)
+        == expected_split
+    )
 
 
 def test_select_dsv4_ob_split_k_overrides(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("TRTLLM_DSV4_OB_SPLIT_K", "4")
-    assert _select_dsv4_ob_split_k(32) == 4
-    assert _select_dsv4_ob_split_k(32, configured_split=2) == 2
+    assert cute_dsl_custom_ops.CuteDSLFp8SplitKGemmRunner._select_num_splits(32) == 4
+    monkeypatch.setenv("TRTLLM_DSV4_OB_SPLIT_K", "3")
     with pytest.raises(ValueError, match="unsupported.*split-K factor"):
-        _select_dsv4_ob_split_k(32, configured_split=3)
+        cute_dsl_custom_ops.CuteDSLFp8SplitKGemmRunner._select_num_splits(32)
 
 
 def test_dsv4_fmha_epilogue_output_uses_fused_oproj() -> None:
@@ -166,7 +169,6 @@ def test_dsv4_ob_split_k_one_uses_cute_dsl_and_caches_weight_scale(
     module = SimpleNamespace(
         hidden_size=n,
         dtype=torch.bfloat16,
-        ob_split_k=1,
         o_b_proj=SimpleNamespace(
             weight=torch.empty((n, k), device="meta", dtype=torch.float8_e4m3fn),
             weight_scale=torch.empty((n // 128, k // 128), device="meta"),
@@ -180,14 +182,16 @@ def test_dsv4_ob_split_k_one_uses_cute_dsl_and_caches_weight_scale(
     def fail_deep_gemm(*args, **kwargs):
         raise AssertionError("supported SK1 must not dispatch to DeepGEMM")
 
-    def splitk_gemm(a, sfa, b, sfb, partials, num_splits):
-        calls.append((a, sfa, b, sfb, partials, num_splits))
+    def splitk_gemm(a, sfa, b, sfb):
+        calls.append((a, sfa, b, sfb))
+        return torch.empty((m, n), device=a.device, dtype=torch.bfloat16)
 
     def transform_weight_scale(scale, **kwargs):
         transforms.append((scale, kwargs))
         return transformed_scale
 
     monkeypatch.setattr(mla_module, "IS_CUTLASS_DSL_AVAILABLE", True)
+    monkeypatch.setenv("TRTLLM_DSV4_OB_SPLIT_K", "1")
     monkeypatch.setattr(deep_gemm, "fp8_gemm_nt", fail_deep_gemm)
     monkeypatch.setattr(fp8_utils, "transform_sf_into_required_layout", transform_weight_scale)
     monkeypatch.setattr(torch.ops.trtllm, "dsv4_fp8_splitk_gemm", splitk_gemm)
@@ -205,8 +209,6 @@ def test_dsv4_ob_split_k_one_uses_cute_dsl_and_caches_weight_scale(
     assert calls[0][1] is activation_scale
     assert calls[0][2] is module.o_b_proj.weight
     assert calls[0][3] is transformed_scale
-    assert calls[0][4].shape == (1, m, n)
-    assert calls[0][5] == 1
 
 
 @pytest.mark.parametrize(("m", "expected_split"), [(1, 4), (32, 2), (64, 2), (128, 2), (160, 1)])
@@ -221,7 +223,6 @@ def test_dsv4_ob_auto_split_uses_cute_dsl(
     module = SimpleNamespace(
         hidden_size=n,
         dtype=torch.bfloat16,
-        ob_split_k=None,
         o_b_proj=SimpleNamespace(
             weight=torch.empty((n, k), device="meta", dtype=torch.float8_e4m3fn),
             weight_scale=torch.as_strided(weight_scale_storage, (n, packed_k), (1, n)),
@@ -237,8 +238,9 @@ def test_dsv4_ob_auto_split_uses_cute_dsl(
     def fail_deep_gemm(*args, **kwargs):
         raise AssertionError("automatic O_b must not dispatch to DeepGEMM")
 
-    def splitk_gemm(a, sfa, b, sfb, partials, num_splits):
-        calls.append((a, sfa, b, sfb, partials, num_splits))
+    def splitk_gemm(a, sfa, b, sfb):
+        calls.append((a, sfa, b, sfb))
+        return torch.empty((expected_split * m, n), device=a.device, dtype=torch.bfloat16)
 
     monkeypatch.setattr(mla_module, "IS_CUTLASS_DSL_AVAILABLE", True)
     monkeypatch.setattr(deep_gemm, "fp8_gemm_nt", fail_deep_gemm)
@@ -247,8 +249,6 @@ def test_dsv4_ob_auto_split_uses_cute_dsl(
 
     assert output.shape == (expected_split * m, n)
     assert len(calls) == 1
-    assert calls[0][4].shape == (expected_split, m, n)
-    assert calls[0][5] == expected_split
 
 
 @pytest.mark.parametrize("m", [160])
@@ -261,7 +261,6 @@ def test_dsv4_ob_disable_cute_env_uses_deep_gemm(m: int, monkeypatch: pytest.Mon
     module = SimpleNamespace(
         hidden_size=n,
         dtype=torch.bfloat16,
-        ob_split_k=None,
         o_b_proj=SimpleNamespace(
             weight=torch.empty((n, k), device="meta", dtype=torch.float8_e4m3fn),
             weight_scale=torch.empty((n // 128, k // 128), device="meta"),
@@ -300,7 +299,9 @@ def test_dsv4_ob_disable_cute_env_uses_deep_gemm(m: int, monkeypatch: pytest.Mon
     ("num_tokens", "num_splits"),
     [(1, 2), (2, 2), (32, 2), (64, 2), (128, 2), (256, 1), (512, 1), (64, 4)],
 )
-def test_dsv4_pro_fp8_splitk_gemm_partials(num_tokens: int, num_splits: int) -> None:
+def test_dsv4_pro_fp8_splitk_gemm_partials(
+    num_tokens: int, num_splits: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
     if get_sm_version() // 10 != 10:
         pytest.skip("dsv4_fp8_splitk_gemm requires the SM100 family")
 
@@ -315,9 +316,9 @@ def test_dsv4_pro_fp8_splitk_gemm_partials(num_tokens: int, num_splits: int) -> 
     sfb_storage = torch.full((n * packed_k,), 0x7F7F7F7F, device="cuda", dtype=torch.int32)
     sfa = torch.as_strided(sfa_storage, (num_tokens, packed_k), (1, aligned_m))
     sfb = torch.as_strided(sfb_storage, (n, packed_k), (1, n))
-    partials = torch.empty((num_splits, num_tokens, n), device="cuda", dtype=torch.bfloat16)
-
-    torch.ops.trtllm.dsv4_fp8_splitk_gemm(a, sfa, b, sfb, partials, num_splits)
+    monkeypatch.setenv("TRTLLM_DSV4_OB_SPLIT_K", str(num_splits))
+    output = torch.ops.trtllm.dsv4_fp8_splitk_gemm(a, sfa, b, sfb)
+    partials = output.view(num_splits, num_tokens, n)
     expected_partial = (k // num_splits) * 0.03125 * 0.03125
     torch.testing.assert_close(
         partials.float(), torch.full_like(partials, expected_partial, dtype=torch.float32)
@@ -325,7 +326,7 @@ def test_dsv4_pro_fp8_splitk_gemm_partials(num_tokens: int, num_splits: int) -> 
 
 
 @skip_pre_blackwell
-def test_dsv4_pro_fp8_splitk_gemm_packed_scales() -> None:
+def test_dsv4_pro_fp8_splitk_gemm_packed_scales(monkeypatch: pytest.MonkeyPatch) -> None:
     if get_sm_version() // 10 != 10:
         pytest.skip("dsv4_fp8_splitk_gemm requires the SM100 family")
 
@@ -354,8 +355,9 @@ def test_dsv4_pro_fp8_splitk_gemm_packed_scales() -> None:
 
     sfa = pack_scales(exp_a, m)
     sfb = pack_scales(exp_b, n)
-    partials = torch.empty((num_splits, m, n), device="cuda", dtype=torch.bfloat16)
-    torch.ops.trtllm.dsv4_fp8_splitk_gemm(a, sfa, b, sfb, partials, num_splits)
+    monkeypatch.setenv("TRTLLM_DSV4_OB_SPLIT_K", str(num_splits))
+    output = torch.ops.trtllm.dsv4_fp8_splitk_gemm(a, sfa, b, sfb)
+    partials = output.view(num_splits, m, n)
 
     scale_a = torch.exp2(exp_a.float() - 127.0)
     scale_b = torch.exp2(exp_b.float() - 127.0)
@@ -596,6 +598,9 @@ def _build_dsv4_o_proj_case(
             fp8_b_weight_dequant = weight_dequant(fp8_b_weight, fp8_b_scale).bfloat16()
             mla.o_b_proj.weight.data = fp8_b_weight
             mla.o_b_proj.weight_scale.data = fp8_b_scale
+            if not use_cute_dsl_blockscaling_mm:
+                # Match the post-load layout consumed by DeepGEMM.
+                mla.o_b_proj.transform_weights()
 
     # Generate test inputs
     # Note: for deepseek_v4, kv_lora_rank equals qk_head_dim
@@ -734,9 +739,9 @@ def test_deepseek_v4_o_proj_fused_fp8_equivalence(
     monkeypatch.setenv("TRTLLM_DSV4_DISABLE_FUSED_OPROJ", "1")
     out_unfused = mla._deepseek_v4_o_proj(attn_out_latent.clone(), position_ids)
 
-    # Unset is the production default and must take the fused path.
+    # Keep O_b unsplit so this standalone test returns model-shaped output.
     monkeypatch.delenv("TRTLLM_DSV4_DISABLE_FUSED_OPROJ", raising=False)
-    mla.ob_split_k = 1
+    monkeypatch.setenv("TRTLLM_DSV4_OB_SPLIT_K", "1")
     out_fused = mla._deepseek_v4_o_proj(attn_out_latent.clone(), position_ids)
 
     assert out_fused.shape == out_unfused.shape, (
