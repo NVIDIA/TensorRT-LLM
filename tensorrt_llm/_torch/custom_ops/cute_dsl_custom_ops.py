@@ -4508,6 +4508,99 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     stream=stream,
                 )
 
+        @staticmethod
+        def _validate_fp8out_inputs(
+            inputs: List[torch.Tensor],
+        ) -> Tuple[int, int, int, int, int, int, int]:
+            if len(inputs) != 6:
+                raise ValueError(
+                    f"FP8-output BMM expects 6 tensors, got {len(inputs)}")
+
+            a, b, a_sf, b_sf, output, sf_out = inputs
+            tensors = (a, b, a_sf, b_sf, output, sf_out)
+            if not all(t.is_cuda for t in tensors):
+                raise ValueError(
+                    "all FP8-output BMM tensors must be CUDA tensors")
+            if len({t.device for t in tensors}) != 1:
+                raise ValueError(
+                    "all FP8-output BMM tensors must be on the same device")
+
+            expected_dtypes = (
+                ("input", a, torch.float8_e4m3fn),
+                ("weight", b, torch.float8_e4m3fn),
+                ("input_scale", a_sf, torch.float32),
+                ("weight_scale", b_sf, torch.float32),
+                ("output_fp8", output, torch.float8_e4m3fn),
+                ("sf_out", sf_out, torch.int32),
+            )
+            for name, tensor, dtype in expected_dtypes:
+                if tensor.dtype != dtype:
+                    raise TypeError(
+                        f"{name} must have dtype {dtype}, got {tensor.dtype}")
+
+            if any(t.dim() != 3
+                   for t in (a, b, a_sf, b_sf, output)) or sf_out.dim() != 2:
+                raise ValueError(
+                    "FP8-output BMM inputs must have ranks [3, 3, 3, 3, 3, 2]")
+
+            batch_size, m, k = a.shape
+            if min(batch_size, m, k) <= 0:
+                raise ValueError(
+                    f"FP8-output BMM dimensions must be positive, got {tuple(a.shape)}"
+                )
+            if b.shape[0] != batch_size or b.shape[2] != k:
+                raise ValueError(
+                    "input and weight batch/K dimensions must match")
+            n = b.shape[1]
+            if n <= 0 or n % 128 != 0 or k % 128 != 0:
+                raise ValueError(
+                    f"FP8-output BMM requires N and K divisible by 128, got N={n}, K={k}"
+                )
+
+            sf_m = pad_up(m, 4)
+            sf_k = ceil_div(k, 128)
+            sf_n = ceil_div(n, 128)
+            packed_sf_n = ceil_div(batch_size * sf_n, 4)
+            expected_shapes = (
+                ("weight", b, (batch_size, n, k)),
+                ("input_scale", a_sf, (batch_size, sf_k, sf_m)),
+                ("weight_scale", b_sf, (batch_size, sf_n, sf_k)),
+                ("output_fp8", output, (batch_size, m, n)),
+                ("sf_out", sf_out, (m, packed_sf_n)),
+            )
+            for name, tensor, shape in expected_shapes:
+                if tensor.shape != shape:
+                    raise ValueError(
+                        f"{name} must have shape {shape}, got {tuple(tensor.shape)}"
+                    )
+
+            for name, tensor in (
+                ("input", a),
+                ("weight", b),
+                ("input_scale", a_sf),
+                ("weight_scale", b_sf),
+            ):
+                if not tensor.is_contiguous():
+                    raise ValueError(f"{name} must be contiguous")
+                if tensor.data_ptr() % 16 != 0:
+                    raise ValueError(f"{name} must be 16-byte aligned")
+
+            output_strides = {
+                (m * n, n, 1),
+                (n, batch_size * n, 1),
+            }
+            if output.stride() not in output_strides:
+                raise ValueError(
+                    "output_fp8 must be contiguous or an [M,batch,N] batch-transpose view"
+                )
+            if output.data_ptr() % 16 != 0:
+                raise ValueError("output_fp8 must be 16-byte aligned")
+            if sf_out.stride() != (1, sf_m):
+                raise ValueError(
+                    f"sf_out must have MN-major stride (1, {sf_m})")
+
+            return batch_size, m, n, k, sf_m, sf_n, sf_k
+
         def forward_fp8out(
             self,
             inputs: List[torch.Tensor],
@@ -4526,26 +4619,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
             (a_tensor, b_tensor, a_sf_tensor, b_sf_tensor, c_tensor,
              sf_out_tensor) = inputs
-            batch_size, m, k = a_tensor.shape
-            n = b_tensor.shape[1]
-            aligned_m = pad_up(m, 4)
+            batch_size, m, n, k, aligned_m, sf_n, sf_k = self._validate_fp8out_inputs(
+                inputs)
             sf_m = aligned_m
-            sf_k = ceil_div(k, 128)
-            sf_n = ceil_div(n, 128)
             # SMEM cooperation wins through M=32.
             use_fp8_smem_epilogue = m <= 32
             fp8_smem_row_iters = ceil_div(m, 16) if use_fp8_smem_epilogue else 1
-
-            if c_tensor.dtype != torch.float8_e4m3fn or c_tensor.shape != (
-                    batch_size, m, n):
-                raise ValueError(
-                    "FP8-output BMM output must have shape [batch, M, N] "
-                    "and dtype float8_e4m3fn")
-            if sf_out_tensor.dtype != torch.int32 or sf_out_tensor.stride() != (
-                    1, aligned_m):
-                raise ValueError(
-                    "FP8-output BMM scales must be int32 with MN-major "
-                    f"stride (1, {aligned_m})")
 
             c_tmp = c_tensor.permute(1, 2, 0)
             cache_key = (

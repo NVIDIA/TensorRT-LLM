@@ -133,7 +133,6 @@ _UE8M0_SCALES_PER_WORD = 4
 _DSV4_OB_PACKED_SCALE_K = _DSV4_OB_SCALE_BLOCK_K * _UE8M0_SCALES_PER_WORD
 _DSV4_OB_SPLIT_K4_MAX_M = 16
 _DSV4_OB_SPLIT_K2_MAX_M = 128
-_DSV4_OB_CUTE_SK1_MIN_M = 256
 _DSV4_PRO_OB_N = 7168
 _DSV4_PRO_OB_K = 16384
 
@@ -1263,6 +1262,7 @@ class MLA(nn.Module):
             and getattr(self.o_b_proj, "tp_size", 1) == 1
             and self.o_a_proj.dtype == torch.float8_e4m3fn
             and self.o_b_proj.has_fp8_block_scales
+            and self.dtype == torch.bfloat16
             and not getattr(self.o_b_proj, "use_cute_dsl_blockscaling_mm", False)
         )
 
@@ -1296,17 +1296,15 @@ class MLA(nn.Module):
         self, o_lora_fp8: torch.Tensor, sf_out: torch.Tensor, num_tokens: int
     ) -> torch.Tensor:
         """Run the DSV4-Pro O_b FP8 GEMM and emit mHC-ready split partials."""
-        from tensorrt_llm import deep_gemm
-
         m, n = num_tokens, self.hidden_size
         k_ob = o_lora_fp8.shape[1]
         weight, weight_scale = self.o_b_proj.weight, self.o_b_proj.weight_scale
         split_k = _select_dsv4_ob_split_k(m, getattr(self, "ob_split_k", None))
         packed_k = k_ob // _DSV4_OB_PACKED_SCALE_K
         use_cute_tactic = (
-            IS_CUTLASS_DSL_AVAILABLE
+            not _is_env_truthy("TRTLLM_DSV4_DISABLE_CUTE_DSL_OB_PROJ")
+            and IS_CUTLASS_DSL_AVAILABLE
             and m > 0
-            and (m >= _DSV4_OB_CUTE_SK1_MIN_M or split_k > 1)
             and n == _DSV4_PRO_OB_N
             and k_ob == _DSV4_PRO_OB_K
             and k_ob % (_DSV4_OB_PACKED_SCALE_K * split_k) == 0
@@ -1347,7 +1345,8 @@ class MLA(nn.Module):
             raise RuntimeError("DSV4-Pro O_b CuTe tactic requires packed weight scales.")
 
         if not use_cute_tactic:
-            # Keep DeepGEMM for shapes outside the tuned CuTe buckets.
+            from tensorrt_llm import deep_gemm
+
             hidden = torch.empty([m, n], device=o_lora_fp8.device, dtype=self.dtype)
             deep_gemm.fp8_gemm_nt(
                 (o_lora_fp8, sf_out),
