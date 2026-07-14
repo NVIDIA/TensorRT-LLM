@@ -1710,10 +1710,12 @@ def _shard_parameter_node(
     # `strategy` is required on the trtllm op (no default) so the caller cannot
     # accidentally drop the AD-config-selected strategy. The torch op is a plain
     # torch.distributed all_gather and intentionally has no strategy/symm_mem.
-    if all_gather_op is torch.ops.auto_deploy.trtllm_dist_all_gather.default:
-        allgather_args = (config.allgather_strategy.name, -1, None)
-    else:
+    # Compare against the always-registered torch op so standalone mode never
+    # probes the optional TRT-LLM op merely to determine the call signature.
+    if all_gather_op is torch.ops.auto_deploy.torch_dist_all_gather.default:
         allgather_args = (-1,)
+    else:
+        allgather_args = (config.allgather_strategy.name, -1, None)
     dist_lookup = {
         0: (all_gather_op, *allgather_args),
         1: (all_reduce_op, allreduce_strategy),
@@ -2708,7 +2710,7 @@ def _process_mla_sharding(
 
 def _determine_fused_weight_dims(
     linear_nodes: List[Node],
-) -> None:
+) -> Optional[list]:
     """
     Determine the fused weight dims for the given linear nodes and subgraph nodes.
     """
@@ -2752,6 +2754,8 @@ def _determine_fused_weight_dims(
             num_chunks = linear_chunk_users[0].args[1]
             weight_dim = linear_node.meta["val"].shape[2]
             fused_weight_dims = [weight_dim // num_chunks] * num_chunks
+
+    return fused_weight_dims
 
 
 def _find_upstream_qk_proj(node: Node, gm: GraphModule) -> Optional[str]:

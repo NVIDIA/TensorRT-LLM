@@ -1,0 +1,16 @@
+version: 0.0.1
+l0_cpu_arm:
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 0
+        lte: 0
+    wildcards:
+      linux_distribution_name: ubuntu*
+      cpu: aarch64
+    terms:
+      stage: pre_merge
+      backend: generic
+      orchestrator: mpi
+  tests:
+  - unittest/executor/test_rpc.py

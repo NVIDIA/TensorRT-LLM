@@ -19,6 +19,7 @@ from collections import OrderedDict, defaultdict
 from dataclasses import fields
 from typing import TYPE_CHECKING, Dict, Iterable, List, NamedTuple, Optional, Sequence, Tuple, Union
 
+import numpy as np
 import torch
 from strenum import StrEnum
 
@@ -280,9 +281,19 @@ def _ensure_int64_cpu_tensor(values: Sequence[int] | torch.Tensor) -> torch.Tens
     return torch.as_tensor(values, dtype=torch.int64)
 
 
+_MM_RUN_METADATA_UNSET = object()
+
+
 def _resolve_multimodal_run_metadata(req: LlmRequest) -> Optional[_MmRunMetadata]:
-    # TODO(perf): cache per request; block-reuse invokes this once per block,
-    # repeatedly rebuilding identical tensors for the same request metadata.
+    # Memoize on the request. Block reuse resolves this on the first context
+    # chunk, again on every commit during chunked prefill, and on prefetch, yet
+    # the result is a pure function of the request's immutable multimodal run
+    # layout. Caching on the request bounds the cache to the request lifetime,
+    # so no separate teardown is needed.
+    cached = getattr(req, "py_mm_run_metadata", _MM_RUN_METADATA_UNSET)
+    if cached is not _MM_RUN_METADATA_UNSET:
+        return cached
+
     # Worked example for one logical multimodal item split by text:
     #
     #   prompt index: 0    1      2      3    4      5
@@ -315,6 +326,7 @@ def _resolve_multimodal_run_metadata(req: LlmRequest) -> Optional[_MmRunMetadata
     run_lengths = req.multimodal_run_lengths
 
     if all(field is None for field in (item_run_cu_offsets, run_positions, run_lengths)):
+        req.py_mm_run_metadata = None
         return None
 
     if item_run_cu_offsets is None or run_positions is None or run_lengths is None:
@@ -349,12 +361,14 @@ def _resolve_multimodal_run_metadata(req: LlmRequest) -> Optional[_MmRunMetadata
     # Shape [num_runs]; one-past-last full-prompt index for each flat run.
     run_ends = run_positions + run_lengths
 
-    return _MmRunMetadata(
+    metadata = _MmRunMetadata(
         run_positions=run_positions,
         run_ends=run_ends,
         run_item_indices=run_item_indices,
         run_item_offsets=run_item_offsets,
     )
+    req.py_mm_run_metadata = metadata
+    return metadata
 
 
 def _augment_tokens_with_mm_run_metadata(
@@ -823,7 +837,11 @@ class KVCacheManagerV2(BaseResourceManager):
             # inf max_tokens means all layers are SWA and every rank quota can
             # fit all SWA fixed cache.
             if not math.isinf(max_tokens):
-                quota = self._get_quota_from_max_tokens(max_tokens)
+                # allreduce(MIN) must never increase the local quota. The
+                # token↔quota round-trip is not identity when SWA layers
+                # dominate (full_attn_size_per_token==0), so clamp to guard
+                # against a bogus inflation (nvbugs/6418103).
+                quota = min(quota, self._get_quota_from_max_tokens(max_tokens))
 
         logger.info(f"KV cache manager v2 device quota set to {quota / (1 << 30)}GiB")
 
@@ -1123,6 +1141,9 @@ class KVCacheManagerV2(BaseResourceManager):
                 )
             else:
                 self.kv_offset[pool_id] = 0
+        # Plain-int mirror of index_scales so the per-step block-table build
+        # does not index a tensor per request (see get_batch_cache_indices*).
+        self._index_scale_ints: List[int] = self.index_scales.tolist()
 
         # Keep unused block offsets as safe block index 0.
         self.host_kv_cache_block_offsets = torch.zeros(
@@ -2829,6 +2850,50 @@ class KVCacheManagerV2(BaseResourceManager):
             )
 
         return res
+
+    def get_batch_cache_indices_flat(
+        self,
+        request_ids: List[int],
+        num_blocks: List[int],
+        layer_idx: Optional[int] = None,
+    ) -> torch.Tensor:
+        """Concatenated per-request block tables, trimmed to real widths.
+
+        Equivalent to concatenating
+        ``get_batch_cache_indices(request_ids, layer_idx)[i][:num_blocks[i]]``
+        over all requests, but never materializes the padded-to-capacity
+        per-request lists: the page indices are host data maintained in place
+        by the KV cache, so only ``num_blocks[i]`` entries per request are
+        gathered and a single vectorized transform runs over the result.
+
+        Returns a CPU int32 tensor (pinned when supported) ready for an
+        async H2D copy.
+        """
+        if layer_idx is None:
+            pool_id = 0
+        else:
+            pool_id = self.layer_to_pool_mapping_dict[self.layer_offsets[layer_idx]]
+
+        scale = self._index_scale_ints[pool_id]
+        div_factor = self.kv_factor
+
+        out_tensor = torch.empty(sum(num_blocks), dtype=torch.int32, pin_memory=prefer_pinned())
+        out = out_tensor.numpy()
+        offset = 0
+        for req_id, n in zip(request_ids, num_blocks):
+            out[offset : offset + n] = np.frombuffer(
+                self.kv_cache_map[req_id].get_base_page_indices(pool_id),
+                dtype=np.int32,
+                count=n,
+            )
+            offset += n
+
+        # One batched transform over the real widths; BAD_PAGE_INDEX entries
+        # (e.g. evicted out-of-window SWA blocks) stay untouched, matching
+        # get_batch_cache_indices.
+        valid = out != BAD_PAGE_INDEX
+        np.copyto(out, out * scale // div_factor, where=valid)
+        return out_tensor
 
     def get_cache_bytes_per_token(self) -> int:
         data_roles = [Role.KEY]
