@@ -175,6 +175,7 @@ class FilteredTopKKernelVarlenDecode(FilteredTopKKernelVarlen):
         varlen_merge_input: bool = False,
         overflow_policy: str = "REREAD",
         cache_smem_values: bool = False,
+        single_pass_multi_cta: bool = False,
     ):
         self._large_occupancy = large_occupancy
         super().__init__(
@@ -192,6 +193,7 @@ class FilteredTopKKernelVarlenDecode(FilteredTopKKernelVarlen):
             # _compute_smem_input_size_for_occupancy() sees the correct num_warps.
             num_threads_override=512 if large_occupancy else 0,
             cache_smem_values=cache_smem_values,
+            single_pass_multi_cta=single_pass_multi_cta,
         )
         self.next_n = next_n
         self.enable_multi_cta = enable_multi_cta
@@ -313,26 +315,61 @@ class FilteredTopKKernelVarlenDecode(FilteredTopKKernelVarlen):
             layout=cute.make_ordered_layout((num_warps,), order=(0,)),
             byte_alignment=128,
         )
+        # SP multi-CTA (radix-filter cluster): separate DSMEM merge target so the
+        # local s_histogram is never written in-place while peers read it.
+        # (The collection prefix-scan scratch reuses s_histogram, not this buffer.)
+        if cutlass.const_expr(self.single_pass_multi_cta):
+            s_hist_merged = smem.allocate_tensor(
+                element_type=cutlass.Int32,
+                layout=cute.make_ordered_layout((self.radix + 1), order=(0)),
+                byte_alignment=128,
+            )
+        else:
+            s_hist_merged = None
 
         # Thread and block indexing
         bidx, bidy, _ = cute.arch.block_idx()
 
-        if cutlass.const_expr(self.enable_dynamic_multi_cta):
-            # 2D grid with early exit: bidx = row_id, bidy = chunk_id.
-            # Each CTA computes how many chunks its row actually needs
-            # from seqlen and exits early if bidy >= num_needed_ctas.
-            # This avoids prefix sum + binary search overhead entirely.
-            num_rows_val = seqlen.shape[0] * self.next_n
-
-        row_start = 0
-        row_end = 0
-        length = 0
-        seq_len = 0
-
-        if not cutlass.const_expr(self.merge_blocks):
-            seq_len = seqlen[bidx // self.next_n]
-            row_end = seq_len - self.next_n + (bidx % self.next_n) + 1
+        # ---- SP multi-CTA (radix-filter cluster) block indexing + dispatch ----
+        # 1D grid = (num_rows * ctas_per_group,), cluster = (ctas_per_group,1,1).
+        # row_id / cta_in_group derived from the global block index; needed_ctas
+        # from seqlen decides solo (needed_ctas==1) vs cluster (>=2) at runtime.
+        need_cluster_sync = False
+        cta_in_group = 0
+        if cutlass.const_expr(self.single_pass_multi_cta):
+            row_id = bidx // self.num_ctas_per_row
+            cta_in_group = bidx % self.num_ctas_per_row
+            _batch = row_id // self.next_n
+            _off = row_id % self.next_n
+            _eff = seqlen[_batch] - self.next_n + _off + 1
+            chunk_start = self.chunk_size_per_cta * cta_in_group
+            row_start = chunk_start
+            row_end = min(_eff, chunk_start + self.chunk_size_per_cta)
             length = row_end - row_start
+            _needed = (_eff + self.chunk_size_per_cta - 1) // self.chunk_size_per_cta
+            if _needed < 1:
+                _needed = 1
+            need_cluster_sync = _needed >= 2
+            # score/dst index the row (not the global block).
+            bidx = row_id
+
+        if cutlass.const_expr(not self.single_pass_multi_cta):
+            if cutlass.const_expr(self.enable_dynamic_multi_cta):
+                # 2D grid with early exit: bidx = row_id, bidy = chunk_id.
+                # Each CTA computes how many chunks its row actually needs
+                # from seqlen and exits early if bidy >= num_needed_ctas.
+                # This avoids prefix sum + binary search overhead entirely.
+                num_rows_val = seqlen.shape[0] * self.next_n
+
+            row_start = 0
+            row_end = 0
+            length = 0
+            seq_len = 0
+
+            if not cutlass.const_expr(self.merge_blocks):
+                seq_len = seqlen[bidx // self.next_n]
+                row_end = seq_len - self.next_n + (bidx % self.next_n) + 1
+                length = row_end - row_start
 
         if cutlass.const_expr(self.enable_multi_cta):
             # update row_start and row_end.
@@ -371,6 +408,14 @@ class FilteredTopKKernelVarlenDecode(FilteredTopKKernelVarlen):
             if _needed_ctas < 1:
                 _needed_ctas = 1
             _should_run = (bidx < num_rows_val) and (bidy < _needed_ctas)
+        if cutlass.const_expr(self.single_pass_multi_cta):
+            # Solo fast path (needed_ctas == 1): only cta_in_group 0 has data;
+            # the rest exit silently. Because the branch is cluster-uniform
+            # (all CTAs of a cluster compute the same need_cluster_sync) no CTA
+            # waits on a cluster barrier, so this cannot deadlock. In cluster
+            # mode (need_cluster_sync) every CTA must run (no early exit).
+            if (not need_cluster_sync) and cta_in_group != 0:
+                _should_run = False
 
         if _should_run:
             self.filtered_topk_kernel_per_row(
@@ -394,6 +439,9 @@ class FilteredTopKKernelVarlenDecode(FilteredTopKKernelVarlen):
                 num_warps,
                 s_warp_sums,
                 s_overflow_flag,
+                need_cluster_sync,
+                s_hist_merged,
+                cta_in_group,
             )
 
         griddepcontrol_launch_dependents()
@@ -412,7 +460,13 @@ class FilteredTopKKernelVarlenDecode(FilteredTopKKernelVarlen):
     ):
         """Host function for the filtered topk kernel"""
         num_rows = input_values.shape[0]
-        blocks = (num_rows, self.num_ctas_per_row, 1)
+        if cutlass.const_expr(self.single_pass_multi_cta):
+            # 1D grid = num_rows * ctas_per_group; each cluster owns one row.
+            blocks = (num_rows * self.num_ctas_per_row, 1, 1)
+            cluster = (self.num_ctas_per_row, 1, 1)
+        else:
+            blocks = (num_rows, self.num_ctas_per_row, 1)
+            cluster = None
 
         self.filtered_topk_kernel(
             input_values,
@@ -424,6 +478,7 @@ class FilteredTopKKernelVarlenDecode(FilteredTopKKernelVarlen):
         ).launch(
             grid=blocks,
             block=(self.num_threads_per_cta, 1, 1),
+            cluster=cluster,
             stream=stream,
             use_pdl=TRTLLM_ENABLE_PDL,
             min_blocks_per_mp=min_blocks_per_mp,

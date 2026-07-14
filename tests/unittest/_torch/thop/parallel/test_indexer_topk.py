@@ -1353,6 +1353,117 @@ def test_cute_dsl_radix_topk_decode_single_pass_multi_cta_cluster(
     )
 
 
+@pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE, reason="CuTE DSL not available")
+@skip_pre_blackwell
+@pytest.mark.parametrize("batch_size", [1, 16])
+@pytest.mark.parametrize("next_n", [1, 3])
+@pytest.mark.parametrize("index_topk", [512, 1024, 2048])
+@pytest.mark.parametrize("num_tokens", [32768, 131072])
+# fp32 (4 refine rounds -> 5 histogram merges) MUST be covered; the
+# merge-placement path only fully exercises on fp32.
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("cluster_size", [2, 4])
+def test_cute_dsl_radix_filter_topk_decode_single_pass_multi_cta(
+    batch_size, next_n, index_topk, num_tokens, dtype, cluster_size
+):
+    """Correctness test for the radix-FILTER single-pass multi-CTA (cluster)
+    decode top-k. num_tokens is large enough that ceil(seq/chunk) >= 2 for the
+    longer rows, exercising the DSMEM histogram-merge + prefix-scan collection.
+    """
+    _run_cute_dsl_topk_test(
+        batch_size,
+        next_n,
+        index_topk,
+        num_tokens,
+        dtype,
+        lambda logits,
+        seq_lens: cute_dsl_custom_ops.CuteDSLTopKDecodeRadixFilterSPMultiCTARunner.forward(
+            input_values=logits,
+            seq_lens=seq_lens,
+            top_k=index_topk,
+            next_n=next_n,
+            cluster_size=cluster_size,
+            return_val=False,
+            num_copy_bits=256,
+        )[0],
+    )
+
+
+def _rf_sp_check(logits, seq_lens, top_k, next_n, cluster_size):
+    """Value-based correctness check for radix-filter SP multi-CTA on custom
+    inputs (controls the value distribution for edge cases).
+    """
+    idx, _ = cute_dsl_custom_ops.CuteDSLTopKDecodeRadixFilterSPMultiCTARunner.forward(
+        input_values=logits,
+        seq_lens=seq_lens,
+        top_k=top_k,
+        next_n=next_n,
+        cluster_size=cluster_size,
+        return_val=False,
+        num_copy_bits=256,
+    )
+    torch.cuda.synchronize()
+    num_rows = logits.shape[0]
+    for r in range(num_rows):
+        b = r // next_n
+        off = r % next_n
+        eff = int(seq_lens[b].item()) - next_n + off + 1
+        k = min(top_k, eff)
+        row = logits[r, :eff]
+        ref = row.topk(k)[0].sort(descending=True)[0].float()
+        gi = idx[r, :k].long()
+        gi = gi[(gi >= 0) & (gi < eff)]
+        got = row[gi].sort(descending=True)[0].float()
+        assert got.numel() == ref.numel() and torch.allclose(got, ref, atol=1e-3), (
+            f"row {r}: mismatch (got {got.numel()} vs ref {ref.numel()})"
+        )
+
+
+@pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE, reason="CuTE DSL not available")
+@skip_pre_blackwell
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("cluster_size", [2, 4])
+@pytest.mark.parametrize("index_topk", [512, 1024])
+def test_cute_dsl_radix_filter_sp_multi_cta_group2_heavy(dtype, cluster_size, index_topk):
+    """Group-2-heavy: quantized logits create many exact ties at the threshold
+    bin, spread across CTAs -> exercises per-CTA s_last_remain, exclusive_offset_2
+    and the pos<top_k truncation in the DSMEM collection.
+    """
+    torch.manual_seed(7)
+    torch.cuda.manual_seed(7)
+    num_tokens = 16384
+    batch = 4
+    seq_lens = torch.full((batch,), num_tokens, dtype=torch.int32, device="cuda")
+    # Few distinct levels -> heavy ties.
+    logits = ((torch.randn(batch, num_tokens, device="cuda") * 4).round() / 4).to(dtype)
+    _rf_sp_check(logits, seq_lens, index_topk, 1, cluster_size)
+
+
+@pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE, reason="CuTE DSL not available")
+@skip_pre_blackwell
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("cluster_size", [2, 4])
+def test_cute_dsl_radix_filter_sp_multi_cta_solo_and_degrade(dtype, cluster_size):
+    """Short rows: needed_ctas==1 (solo fast path, extra CTAs exit -> no cluster
+    sync, no deadlock) and 2<=needed<cluster_size (degrade: some CTAs get an
+    empty chunk but must still join every cluster barrier). Also mixes both in
+    one launch (cluster-uniform branch keeps it deadlock-safe).
+    """
+    torch.manual_seed(11)
+    torch.cuda.manual_seed(11)
+    num_tokens = 8192  # bucketed 8192; chunk = ceil(8192/cluster_size)
+    top_k = 512
+    chunk = -(-num_tokens // cluster_size)
+    # solo: seq just under one chunk; degrade: needs 2..cluster_size chunks; full.
+    solo_len = max(top_k + 1, chunk - 1)
+    degrade_len = min(num_tokens, 2 * chunk + chunk // 2)
+    seq_lens = torch.tensor(
+        [solo_len, degrade_len, num_tokens, solo_len], dtype=torch.int32, device="cuda"
+    )
+    logits = torch.randn(4, num_tokens, device="cuda").to(dtype)
+    _rf_sp_check(logits, seq_lens, top_k, 1, cluster_size)
+
+
 # ============================================================================
 # Heuristic Decode Distribution-Parameterised Tests
 # ============================================================================

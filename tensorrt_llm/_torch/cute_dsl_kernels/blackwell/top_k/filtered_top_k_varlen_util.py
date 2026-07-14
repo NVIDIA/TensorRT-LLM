@@ -19,9 +19,75 @@ import cutlass
 import cutlass.cute as cute
 import torch
 from cutlass._mlir.dialects import llvm
+from cutlass.cute.typing import Int32 as CuteInt32
+from cutlass.cute.typing import Pointer as CutePointer
+from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass.utils.distributed import atomicAdd
 
 from .block_scan import block_prefix_sum_kernel, fence_acq_rel_cta
+
+
+# ---------------------------------------------------------------------------
+# Cluster DSMEM primitives (inline PTX) — used only by the single-pass
+# multi-CTA (radix-filter) path. Defined locally to avoid a circular import
+# with single_pass_multi_cta_radix_topk_cluster (which imports this module).
+# ---------------------------------------------------------------------------
+@dsl_user_op
+def _mapa_shared_cluster(
+    smem_ptr: CutePointer, peer_rank: CuteInt32, *, loc=None, ip=None
+) -> CuteInt32:
+    """Map a local SMEM address to a peer CTA's SMEM in cluster address space.
+
+    PTX: mapa.shared::cluster.u32 $0, $1, $2;
+    """
+    smem_ptr_i32 = smem_ptr.toint(loc=loc, ip=ip).ir_value()
+    return cutlass.Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [smem_ptr_i32, peer_rank.ir_value(loc=loc, ip=ip)],
+            "mapa.shared::cluster.u32 $0, $1, $2;",
+            "=r,r,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@cute.jit
+def mapa_shared_cluster(smem_ptr, peer_rank):
+    """Map a local SMEM address to a peer CTA's SMEM in cluster address space."""
+    return _mapa_shared_cluster(smem_ptr, peer_rank)
+
+
+@dsl_user_op
+def _ld_shared_cluster_i32(mapped_addr: CuteInt32, *, loc=None, ip=None) -> CuteInt32:
+    """Load an int32 from a cluster SMEM address.
+
+    PTX: ld.shared::cluster.u32 $0, [$1];
+    """
+    return cutlass.Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [mapped_addr.ir_value(loc=loc, ip=ip)],
+            "ld.shared::cluster.u32 $0, [$1];",
+            "=r,r",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@cute.jit
+def ld_shared_cluster_i32(mapped_addr):
+    """Load an int32 from a cluster SMEM address."""
+    return _ld_shared_cluster_i32(mapped_addr)
+
 
 """
 top-k varlen utils. could be used by prefill and decode phase.
@@ -53,6 +119,7 @@ class FilteredTopKKernelVarlen:
         overflow_policy: str = "REREAD",
         num_threads_override: int = 0,
         cache_smem_values: bool = False,
+        single_pass_multi_cta: bool = False,
     ):
         """
         Args:
@@ -91,6 +158,11 @@ class FilteredTopKKernelVarlen:
         self.num_ctas_per_row = num_ctas_per_row
         self.merge_blocks = merge_blocks
         self.overflow_policy = overflow_policy
+        # Single-pass multi-CTA (radix-filter cluster) mode. Compile-time flag;
+        # when False all cluster branches are const-folded away (single-CTA path
+        # keeps identical SASS). Reuses chunk_size_per_cta / num_ctas_per_row for
+        # chunk partitioning (num_ctas_per_row == ctas_per_group / cluster size).
+        self.single_pass_multi_cta = single_pass_multi_cta
         assert overflow_policy in ("GMEM_SPILL", "TRUNCATE", "REREAD_ALWAYS", "REREAD"), (
             f"Unknown overflow_policy: {overflow_policy}"
         )
@@ -109,7 +181,8 @@ class FilteredTopKKernelVarlen:
             self.num_buffer_smem_input_idx = 1
 
         # 65536 is the max index value for uint16.
-        if cutlass.const_expr(enable_multi_cta):
+        # SP multi-CTA reuses the same chunk partitioning as 2-pass multi-CTA.
+        if cutlass.const_expr(enable_multi_cta or single_pass_multi_cta):
             self.per_row_max_num_cols = chunk_size_per_cta * num_ctas_per_row
         else:
             self.per_row_max_num_cols = self.max_num_cols
@@ -1307,6 +1380,106 @@ class FilteredTopKKernelVarlen:
             cute.arch.barrier()
 
     @cute.jit
+    def _cluster_reduce_histogram(self, tidx, s_histogram, s_hist_merged):
+        """DSMEM histogram reduction for the single-pass multi-CTA path.
+
+        Each thread sums bin ``my_bin`` across all peer CTAs' LOCAL
+        ``s_histogram`` (including self) via cluster DSMEM and writes the total
+        to the SEPARATE ``s_hist_merged`` buffer.  Never writes in-place: a peer
+        may still be reading our ``s_histogram`` via DSMEM.
+
+        The caller owns the surrounding barriers::
+
+            cluster_arrive_relaxed(); cluster_wait()   # publish local histograms
+            _cluster_reduce_histogram(...)
+            cute.arch.barrier()                        # s_hist_merged ready (intra-CTA)
+            <prefix sum on s_hist_merged>
+            cluster_arrive_relaxed(); cluster_wait()   # peers done reading before rebuild
+
+        Only bins ``0 .. radix-1`` are merged; the ``radix`` guard slot is not
+        read by the prefix-sum helpers.
+        """
+        for my_bin in range(tidx, self.radix, self.num_threads_per_cta):
+            acc = cutlass.Int32(0)
+            local_ptr = s_histogram.iterator + cutlass.Int32(my_bin)
+            for peer in cutlass.range_constexpr(self.num_ctas_per_row):
+                remote = mapa_shared_cluster(local_ptr, cutlass.Int32(peer))
+                acc = acc + ld_shared_cluster_i32(remote)
+            s_hist_merged[my_bin] = acc
+
+    @cute.jit
+    def _cluster_collect(
+        self,
+        tidx,
+        s_indices,
+        s_counter,
+        s_last_remain,
+        s_prefix,
+        cta_in_group,
+        topk_remaining,
+        output_indices_row,
+    ):
+        """Unified DSMEM prefix-scan output collection (Path A + Path B).
+
+        ``s_prefix`` is a per-CTA scratch (reuses ``s_histogram``; needs >= 4
+        int32 slots): [0]=group-1 count, [1]=group-2 count, [2]/[3]=computed
+        exclusive offsets.  ``s_indices`` already holds this CTA's local
+        group-1 at [0, s_counter) and group-2 at [top_k-topk_remaining, ...),
+        filled by the reused Path A/B collection.
+
+        Decode-only: indices are absolute column indices, written directly.
+        """
+        num_threads = self.num_threads_per_cta
+        # 1. Publish this CTA's group-1 / group-2 counts.
+        #    group-2 count = topk_remaining - max(0, s_last_remain[0]); s_last_remain
+        #    starts at the final topk_remaining and is decremented per group-2 write.
+        if tidx == 0:
+            s_prefix[0] = s_counter[0]
+            slr = s_last_remain[0]
+            if slr < cutlass.Int32(0):
+                slr = cutlass.Int32(0)
+            s_prefix[1] = topk_remaining - slr
+        cute.arch.cluster_arrive_relaxed()
+        cute.arch.cluster_wait()
+
+        # 2. Exclusive prefix over peers p < cta_in_group (thread 0 computes).
+        if tidx == 0:
+            eo1 = cutlass.Int32(0)
+            eo2 = cutlass.Int32(0)
+            p0 = s_prefix.iterator + cutlass.Int32(0)
+            p1 = s_prefix.iterator + cutlass.Int32(1)
+            for peer in cutlass.range_constexpr(self.num_ctas_per_row):
+                if cutlass.Int32(peer) < cta_in_group:
+                    eo1 = eo1 + ld_shared_cluster_i32(mapa_shared_cluster(p0, cutlass.Int32(peer)))
+                    eo2 = eo2 + ld_shared_cluster_i32(mapa_shared_cluster(p1, cutlass.Int32(peer)))
+            s_prefix[2] = eo1
+            s_prefix[3] = eo2
+        cute.arch.barrier()
+        # All CTAs finished reading peer s_prefix before anyone exits (SMEM lifetime).
+        cute.arch.cluster_arrive_relaxed()
+        cute.arch.cluster_wait()
+
+        exclusive_offset_1 = s_prefix[2]
+        exclusive_offset_2 = s_prefix[3]
+        group1_total = self.top_k - topk_remaining
+        group2_count = s_prefix[1]
+        local_g1 = s_counter[0]
+
+        # 3. group-1: s_indices[0 .. s_counter-1] -> output[exclusive_offset_1 + i]
+        for i in range(tidx, local_g1, num_threads):
+            idx = cutlass.Int32(cutlass.Uint32(s_indices[i]))
+            output_indices_row[exclusive_offset_1 + i] = idx
+
+        # 4. group-2: s_indices[top_k-topk_remaining + i] -> output[group1_total + eo2 + i]
+        #    (Path A: group2_count == 0, loop is a no-op)
+        for i in range(tidx, group2_count, num_threads):
+            pos = group1_total + exclusive_offset_2 + i
+            if pos < self.top_k:
+                src = self.top_k - topk_remaining + i
+                idx = cutlass.Int32(cutlass.Uint32(s_indices[src]))
+                output_indices_row[pos] = idx
+
+    @cute.jit
     def _phase3_writeback(self, tidx, row_start, s_indices, score, indices, dst, dst_values):
         """Write the selected top-k from s_indices (+ values) back to GMEM output.
 
@@ -1382,8 +1555,19 @@ class FilteredTopKKernelVarlen:
         num_warps,
         s_warp_sums,
         s_overflow_flag,
+        need_cluster_sync=False,
+        s_hist_merged=None,
+        cta_in_group=0,
     ):
-        """CuTe DSL implementation of TopK kernel based on radix-based filter algorithm."""
+        """CuTe DSL implementation of TopK kernel based on radix-based filter algorithm.
+
+        Single-pass multi-CTA (radix-filter cluster) extras — only live when
+        ``self.single_pass_multi_cta`` is True (const-folded away otherwise):
+          - ``need_cluster_sync`` (runtime): True for cluster cooperation
+            (needed_ctas >= 2), False for the solo fast path.
+          - ``s_hist_merged``: separate DSMEM merge target (radix+1 int32).
+          - ``cta_in_group``: this CTA's rank within its cluster.
+        """
         # # Thread and block indexing
         tidx, _, _ = cute.arch.thread_idx()
 
@@ -1407,7 +1591,11 @@ class FilteredTopKKernelVarlen:
         # Note, for multi-cta version, each ctas must have its own extra_buffer.
         buffer = None
         if cutlass.const_expr(self.enable_gmem_store):
-            if cutlass.const_expr(self.enable_multi_cta):
+            if cutlass.const_expr(self.single_pass_multi_cta):
+                # Per-CTA spill buffer: (num_rows * ctas_per_group, ...). bidx has
+                # already been set to row_id by the decode kernel.
+                buffer = extra_buffer[bidx * self.num_ctas_per_row + cta_in_group, None, None]
+            elif cutlass.const_expr(self.enable_multi_cta):
                 grid_dim_x, grid_dim_y, _ = cute.arch.grid_dim()
                 bidx_val, bidy_val, _ = cute.arch.block_idx()
                 buffer_row_id = bidx_val * grid_dim_y + bidy_val
@@ -1431,7 +1619,21 @@ class FilteredTopKKernelVarlen:
 
         prologue_elems = cutlass.Int32(fix_bytes // elem_bytes)
 
-        remaining = length - prologue_elems
+        # SP multi-CTA cluster mode: an empty chunk (chunk_start >= eff_len ->
+        # length <= 0) must scan NOTHING. Otherwise the prologue/left loops
+        # (bounded by alignment, not length) would read -inf padding past the
+        # row end and corrupt the DSMEM-merged histogram. Clamp so the total
+        # scanned == max(length, 0). Guarded under const_expr so single-CTA /
+        # 2-pass codegen is unchanged (there length > top_k in this branch).
+        if cutlass.const_expr(self.single_pass_multi_cta):
+            _len_nonneg = length
+            if _len_nonneg < 0:
+                _len_nonneg = cutlass.Int32(0)
+            if prologue_elems > _len_nonneg:
+                prologue_elems = _len_nonneg
+            remaining = _len_nonneg - prologue_elems
+        else:
+            remaining = length - prologue_elems
         aligned_size = (remaining // self.vec_size) * self.vec_size
         left_size = remaining - aligned_size
 
@@ -1456,8 +1658,15 @@ class FilteredTopKKernelVarlen:
 
         scan_frag = cute.make_fragment((vec_size,), self.dtype)
 
-        # Trivial case: length <= top_k
-        if length <= self.top_k:
+        # Trivial case: length <= top_k. In SP multi-CTA cluster mode this
+        # per-chunk shortcut is unsafe (a CTA taking it would skip the cluster
+        # barriers -> deadlock, and emit its whole chunk as the row's top-k);
+        # force the full radix path so every CTA cooperates.
+        take_trivial = length <= self.top_k
+        if cutlass.const_expr(self.single_pass_multi_cta):
+            if need_cluster_sync:
+                take_trivial = False
+        if take_trivial:
             for i in range(tidx, self.top_k, self.num_threads_per_cta):
                 # TODO: add multi-cta version support here.
                 if i < length:
@@ -1536,24 +1745,72 @@ class FilteredTopKKernelVarlen:
 
             cute.arch.barrier()
 
-            # 1.2 and 1.3  Suffix sum to find threshold and find threshold bin
-            self.prefix_sum_and_find_threshold_coarse(
-                tidx,
-                s_histogram,
-                s_warp_sums,
-                num_warps,
-                s_threshold_bin_id,
-                s_num_input,
-                s_counter,
-                s_last_remain,
-                topk_remaining,
-                g_num_input,
-                s_num_input_idx=0,
-            )
+            # 1.2 and 1.3  Suffix sum to find threshold and find threshold bin.
+            # SP multi-CTA cluster: DSMEM-merge peer histograms into s_hist_merged
+            # first, then prefix-sum the merged buffer. The prefix-sum / threshold
+            # subtraction are duplicated per branch (rather than selecting the
+            # buffer into a variable) because the DSL cannot phi-merge two distinct
+            # tensors across a runtime `if`. threshold_bin (a shared SMEM scalar)
+            # is read straight-line; only the buffer read in the -= differs.
+            if cutlass.const_expr(self.single_pass_multi_cta):
+                if need_cluster_sync:
+                    cute.arch.cluster_arrive_relaxed()
+                    cute.arch.cluster_wait()
+                    self._cluster_reduce_histogram(tidx, s_histogram, s_hist_merged)
+                    cute.arch.barrier()
+                    self.prefix_sum_and_find_threshold_coarse(
+                        tidx,
+                        s_hist_merged,
+                        s_warp_sums,
+                        num_warps,
+                        s_threshold_bin_id,
+                        s_num_input,
+                        s_counter,
+                        s_last_remain,
+                        topk_remaining,
+                        g_num_input,
+                        s_num_input_idx=0,
+                    )
+                    cute.arch.cluster_arrive_relaxed()
+                    cute.arch.cluster_wait()
+                else:
+                    self.prefix_sum_and_find_threshold_coarse(
+                        tidx,
+                        s_histogram,
+                        s_warp_sums,
+                        num_warps,
+                        s_threshold_bin_id,
+                        s_num_input,
+                        s_counter,
+                        s_last_remain,
+                        topk_remaining,
+                        g_num_input,
+                        s_num_input_idx=0,
+                    )
+            else:
+                self.prefix_sum_and_find_threshold_coarse(
+                    tidx,
+                    s_histogram,
+                    s_warp_sums,
+                    num_warps,
+                    s_threshold_bin_id,
+                    s_num_input,
+                    s_counter,
+                    s_last_remain,
+                    topk_remaining,
+                    g_num_input,
+                    s_num_input_idx=0,
+                )
 
             threshold_bin = s_threshold_bin_id[0]
             if threshold_bin > 0:
-                topk_remaining -= s_histogram[threshold_bin - 1]
+                if cutlass.const_expr(self.single_pass_multi_cta):
+                    if need_cluster_sync:
+                        topk_remaining -= s_hist_merged[threshold_bin - 1]
+                    else:
+                        topk_remaining -= s_histogram[threshold_bin - 1]
+                else:
+                    topk_remaining -= s_histogram[threshold_bin - 1]
 
             # 1.4 Collect indices
             if topk_remaining == 0:
@@ -1618,22 +1875,67 @@ class FilteredTopKKernelVarlen:
                     if run_next_round:
                         r_idx = round % 2
 
-                        self.prefix_sum_and_find_threshold_fine_grained(
-                            tidx,
-                            s_histogram,
-                            s_warp_sums,
-                            num_warps,
-                            s_threshold_bin_id,
-                            s_num_input,
-                            s_counter,
-                            s_last_remain,
-                            topk_remaining,
-                            g_num_input,
-                            s_num_input_idx=r_idx ^ 1,
-                        )
+                        # SP multi-CTA cluster: DSMEM-merge peer histograms before
+                        # the per-round prefix sum (same shape as the coarse site;
+                        # duplicated per branch to avoid a tensor phi-merge).
+                        if cutlass.const_expr(self.single_pass_multi_cta):
+                            if need_cluster_sync:
+                                cute.arch.cluster_arrive_relaxed()
+                                cute.arch.cluster_wait()
+                                self._cluster_reduce_histogram(tidx, s_histogram, s_hist_merged)
+                                cute.arch.barrier()
+                                self.prefix_sum_and_find_threshold_fine_grained(
+                                    tidx,
+                                    s_hist_merged,
+                                    s_warp_sums,
+                                    num_warps,
+                                    s_threshold_bin_id,
+                                    s_num_input,
+                                    s_counter,
+                                    s_last_remain,
+                                    topk_remaining,
+                                    g_num_input,
+                                    s_num_input_idx=r_idx ^ 1,
+                                )
+                                cute.arch.cluster_arrive_relaxed()
+                                cute.arch.cluster_wait()
+                            else:
+                                self.prefix_sum_and_find_threshold_fine_grained(
+                                    tidx,
+                                    s_histogram,
+                                    s_warp_sums,
+                                    num_warps,
+                                    s_threshold_bin_id,
+                                    s_num_input,
+                                    s_counter,
+                                    s_last_remain,
+                                    topk_remaining,
+                                    g_num_input,
+                                    s_num_input_idx=r_idx ^ 1,
+                                )
+                        else:
+                            self.prefix_sum_and_find_threshold_fine_grained(
+                                tidx,
+                                s_histogram,
+                                s_warp_sums,
+                                num_warps,
+                                s_threshold_bin_id,
+                                s_num_input,
+                                s_counter,
+                                s_last_remain,
+                                topk_remaining,
+                                g_num_input,
+                                s_num_input_idx=r_idx ^ 1,
+                            )
                         threshold = s_threshold_bin_id[0]
                         if threshold > 0:
-                            topk_remaining -= s_histogram[threshold - 1]
+                            if cutlass.const_expr(self.single_pass_multi_cta):
+                                if need_cluster_sync:
+                                    topk_remaining -= s_hist_merged[threshold - 1]
+                                else:
+                                    topk_remaining -= s_histogram[threshold - 1]
+                            else:
+                                topk_remaining -= s_histogram[threshold - 1]
                         offset = self.first_refine_shift - round * 8
                         is_last_round = round == self.num_refine_rounds - 1
 
@@ -1774,8 +2076,27 @@ class FilteredTopKKernelVarlen:
                                     buffer,
                                 )
 
-            # Phase 3: Output phase
-            self._phase3_writeback(tidx, row_start, s_indices, score, indices, dst, dst_values)
+            # Phase 3: Output phase.
+            # SP multi-CTA cluster: collect via DSMEM prefix scan (each CTA
+            # writes only its slice). Solo / single-CTA: full-row writeback.
+            if cutlass.const_expr(self.single_pass_multi_cta):
+                if need_cluster_sync:
+                    self._cluster_collect(
+                        tidx,
+                        s_indices,
+                        s_counter,
+                        s_last_remain,
+                        s_histogram,
+                        cta_in_group,
+                        topk_remaining,
+                        dst,
+                    )
+                else:
+                    self._phase3_writeback(
+                        tidx, row_start, s_indices, score, indices, dst, dst_values
+                    )
+            else:
+                self._phase3_writeback(tidx, row_start, s_indices, score, indices, dst, dst_values)
 
 
 def create_random_logits(
