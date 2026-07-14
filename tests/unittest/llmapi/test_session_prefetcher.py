@@ -136,6 +136,29 @@ def test_schedule_shadow_passes_env_overlay_to_build(prefetcher):
     assert prefetcher.overlays == [{"TRTLLM_HF_WEIGHT_CACHE": "1"}]
 
 
+def test_take_wrong_size_in_flight_does_not_wait(prefetcher, monkeypatch):
+    # A miss must not stall behind an in-flight build of ANOTHER size only to
+    # discard the result — that is slower than no prefetch at all (wait ~one
+    # spawn, then spawn again). It falls back to sync immediately, and the
+    # build still lands for a later take of its own size.
+    release = threading.Event()
+
+    def _slow_build(self, spec, gen, env_overlay=None):
+        release.wait(5)
+        self._publish(spec, _FakePool(spec), session_prefetcher._spawn_snapshot(), gen)
+
+    monkeypatch.setattr(SessionPrefetcher, "_build", _slow_build)
+    prefetcher.schedule_shadow(2)
+    t0 = time.monotonic()
+    assert prefetcher.take(4) is None  # wrong size in flight: no join
+    assert time.monotonic() - t0 < 1.0
+    assert prefetcher.stats["pools_skipped_size_in_flight"] == 1
+    release.set()
+    prefetcher._thread.join(timeout=10)
+    taken = prefetcher.take(2)  # the undisturbed build landed for its size
+    assert isinstance(taken, _FakePool) and taken.n_workers == 2
+
+
 def test_factory_hit_hands_over_shadow(prefetcher):
     pool = _FakePool(4)
     _arm(prefetcher, pool, spec=4)

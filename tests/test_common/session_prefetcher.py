@@ -212,6 +212,7 @@ class SessionPrefetcher:
     def __init__(self):
         self._lock = threading.Lock()
         self._thread = None
+        self._building_spec = None  # spec of the in-flight build, while _thread is set
         self._build_gen = 0  # bumped when a pending build is abandoned
         self._built = None  # Optional[_Built], set only by _publish()
         self._patched = set()
@@ -310,6 +311,7 @@ class SessionPrefetcher:
         with self._lock:
             if self._thread is not None or (self._built is not None and self._built.spec == spec):
                 return  # already building / built
+            self._building_spec = spec
             self._thread = threading.Thread(
                 target=self._build,
                 args=(spec, self._build_gen, env_overlay),
@@ -383,6 +385,17 @@ class SessionPrefetcher:
     def take(self, spec: int):
         """Return a prefetched session for ``spec``, or None to build sync."""
         if not self.enabled:
+            return None
+        with self._lock:
+            wrong_size_in_flight = (
+                self._thread is not None and self._built is None and self._building_spec != spec
+            )
+        if wrong_size_in_flight:
+            # Joining would stall this caller for most of a spawn only to
+            # discard the mismatched result — slower than no prefetch at all.
+            # Fall back to the synchronous spawn now and leave the build to
+            # land for a later take of its own size.
+            self.stats["pools_skipped_size_in_flight"] += 1
             return None
         # Slowest legitimate build measured is ~117s (busy node); 180s gives
         # 1.5x margin. On a genuine hang we give up and fall back to a
