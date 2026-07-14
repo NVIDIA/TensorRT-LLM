@@ -141,6 +141,7 @@ class Cosmos3TransferHint:
     preset_edge_threshold: str = "medium"
     preset_blur_strength: str = "medium"
 
+
 @dataclass
 class Cosmos3TransferConfig:
     hints: dict[str, Cosmos3TransferHint] = field(default_factory=dict)
@@ -163,24 +164,32 @@ class Cosmos3TransferConfig:
     def ordered_hints(self) -> list[Cosmos3TransferHint]:
         return [self.hints[key] for key in TRANSFER_HINT_KEYS if key in self.hints]
 
+
 def _as_interval(value: Any) -> tuple[float, float] | None:
     if value is None:
         return None
     if isinstance(value, str):
         value = [item.strip() for item in value.split(",") if item.strip()]
     if not isinstance(value, (list, tuple)) or len(value) != 2:
-        raise ValueError("Cosmos3 transfer control_guidance_interval must contain exactly two values.")
+        raise ValueError(
+            "Cosmos3 transfer control_guidance_interval must contain exactly two values."
+        )
     lo, hi = float(value[0]), float(value[1])
     if lo > hi:
-        raise ValueError(f"Cosmos3 transfer control_guidance_interval must be ordered as [lo, hi], got {(lo, hi)}.")
+        raise ValueError(
+            f"Cosmos3 transfer control_guidance_interval must be ordered as [lo, hi], got {(lo, hi)}."
+        )
     return lo, hi
+
 
 def _extra_or_default(extra_params: dict, key: str, default: Any = None) -> Any:
     value = extra_params.get(key, None)
     return default if value is None else value
 
 
-def resolve_transfer_config(extra_params: dict, req_params: Any, prompt_data: Any = None) -> Cosmos3TransferConfig | None:
+def resolve_transfer_config(
+    extra_params: dict, req_params: Any, prompt_data: Any = None
+) -> Cosmos3TransferConfig | None:
     hints: dict[str, Cosmos3TransferHint] = {}
     for key in TRANSFER_HINT_KEYS:
         raw = extra_params.get(key, None)
@@ -215,7 +224,9 @@ def resolve_transfer_config(extra_params: dict, req_params: Any, prompt_data: An
             "share_vision_temporal_positions",
         )
         if any(extra_params.get(key, None) for key in transfer_only):
-            raise ValueError("Cosmos3 transfer options were provided, but no transfer hint was selected.")
+            raise ValueError(
+                "Cosmos3 transfer options were provided, but no transfer hint was selected."
+            )
         return None
 
     request_guidance_scale = getattr(req_params, "guidance_scale", None)
@@ -229,26 +240,58 @@ def resolve_transfer_config(extra_params: dict, req_params: Any, prompt_data: An
         hints=hints,
         guidance_scale=request_guidance_scale,
         control_guidance=_extra_or_default(extra_params, "control_guidance", 1.0),
-        control_guidance_interval=_as_interval(_extra_or_default(extra_params, "control_guidance_interval", None)),
+        control_guidance_interval=_as_interval(
+            _extra_or_default(extra_params, "control_guidance_interval", None)
+        ),
         flow_shift=_extra_or_default(extra_params, "flow_shift", None),
-        num_video_frames_per_chunk=_extra_or_default(extra_params, "num_video_frames_per_chunk", TRANSFER_SAMPLE_DEFAULTS["num_video_frames_per_chunk"]),
-        num_conditional_frames=_extra_or_default(extra_params, "num_conditional_frames", TRANSFER_SAMPLE_DEFAULTS["num_conditional_frames"]),
-        max_frames=_extra_or_default(extra_params, "max_frames", TRANSFER_SAMPLE_DEFAULTS["max_frames"]),
-        show_control_condition=_extra_or_default(extra_params, "show_control_condition", TRANSFER_SAMPLE_DEFAULTS["show_control_condition"]),
-        show_input=_extra_or_default(extra_params, "show_input", TRANSFER_SAMPLE_DEFAULTS["show_input"]),
-        num_first_chunk_conditional_frames=_extra_or_default(extra_params, "num_first_chunk_conditional_frames", TRANSFER_SAMPLE_DEFAULTS["num_first_chunk_conditional_frames"]),
-        share_vision_temporal_positions=_extra_or_default(extra_params, "share_vision_temporal_positions", TRANSFER_SAMPLE_DEFAULTS["share_vision_temporal_positions"]),
-        num_frames=_extra_or_default(extra_params, "num_frames", getattr(req_params, "num_frames", None)),
+        num_video_frames_per_chunk=_extra_or_default(
+            extra_params,
+            "num_video_frames_per_chunk",
+            TRANSFER_SAMPLE_DEFAULTS["num_video_frames_per_chunk"],
+        ),
+        num_conditional_frames=_extra_or_default(
+            extra_params,
+            "num_conditional_frames",
+            TRANSFER_SAMPLE_DEFAULTS["num_conditional_frames"],
+        ),
+        max_frames=_extra_or_default(
+            extra_params, "max_frames", TRANSFER_SAMPLE_DEFAULTS["max_frames"]
+        ),
+        show_control_condition=_extra_or_default(
+            extra_params,
+            "show_control_condition",
+            TRANSFER_SAMPLE_DEFAULTS["show_control_condition"],
+        ),
+        show_input=_extra_or_default(
+            extra_params, "show_input", TRANSFER_SAMPLE_DEFAULTS["show_input"]
+        ),
+        num_first_chunk_conditional_frames=_extra_or_default(
+            extra_params,
+            "num_first_chunk_conditional_frames",
+            TRANSFER_SAMPLE_DEFAULTS["num_first_chunk_conditional_frames"],
+        ),
+        share_vision_temporal_positions=_extra_or_default(
+            extra_params,
+            "share_vision_temporal_positions",
+            TRANSFER_SAMPLE_DEFAULTS["share_vision_temporal_positions"],
+        ),
+        num_frames=_extra_or_default(
+            extra_params, "num_frames", getattr(req_params, "num_frames", None)
+        ),
         fps=_extra_or_default(
             extra_params,
             "fps",
             _extra_or_default(
                 extra_params,
                 "frame_rate",
-                _extra_or_default(extra_params, "resolved_frame_rate", getattr(req_params, "frame_rate", None)),
+                _extra_or_default(
+                    extra_params, "resolved_frame_rate", getattr(req_params, "frame_rate", None)
+                ),
             ),
         ),
-        resolution=_extra_or_default(extra_params, "resolution", _extra_or_default(extra_params, "image_size", 720)),
+        resolution=_extra_or_default(
+            extra_params, "resolution", _extra_or_default(extra_params, "image_size", 720)
+        ),
     )
 
     if len(hints) == 1:
@@ -266,7 +309,10 @@ def resolve_transfer_config(extra_params: dict, req_params: Any, prompt_data: An
                     or getattr(req_params, "frame_rate", None) is not None
                 )
             elif field_name == "num_frames":
-                user_set = extra_params.get("num_frames", None) is not None or getattr(req_params, "num_frames", None) is not None
+                user_set = (
+                    extra_params.get("num_frames", None) is not None
+                    or getattr(req_params, "num_frames", None) is not None
+                )
             else:
                 user_set = extra_params.get(field_name, None) is not None
             if not user_set:
@@ -279,13 +325,16 @@ def resolve_transfer_config(extra_params: dict, req_params: Any, prompt_data: An
     if config.max_frames <= 0:
         raise ValueError("Cosmos3 transfer max_frames must be positive.")
     if config.num_first_chunk_conditional_frames < 0:
-        raise ValueError("Cosmos3 transfer num_first_chunk_conditional_frames must be non-negative.")
+        raise ValueError(
+            "Cosmos3 transfer num_first_chunk_conditional_frames must be non-negative."
+        )
     for hint in hints.values():
         if hint.key == "edge" and hint.preset_edge_threshold not in EDGE_PRESETS:
             raise ValueError(f"Unsupported Cosmos3 edge preset: {hint.preset_edge_threshold!r}.")
         if hint.key == "blur" and hint.preset_blur_strength not in BLUR_DOWNUP_PRESETS:
             raise ValueError(f"Unsupported Cosmos3 blur preset: {hint.preset_blur_strength!r}.")
     return config
+
 
 def media_hw(value: Any) -> tuple[int, int] | None:
     if isinstance(value, PIL.Image.Image):
@@ -347,15 +396,20 @@ def media_hw(value: Any) -> tuple[int, int] | None:
         return media_hw(value[0])
     return None
 
+
 def resize_center_crop_uint8_cthw(frames: torch.Tensor, height: int, width: int) -> torch.Tensor:
     if frames.ndim != 4 or frames.shape[0] != 3:
-        raise ValueError(f"Cosmos3 transfer frames must have shape [3, T, H, W], got {tuple(frames.shape)}.")
+        raise ValueError(
+            f"Cosmos3 transfer frames must have shape [3, T, H, W], got {tuple(frames.shape)}."
+        )
     orig_h, orig_w = int(frames.shape[2]), int(frames.shape[3])
     scale = max(width / orig_w, height / orig_h)
     resize_h = int(np.ceil(scale * orig_h))
     resize_w = int(np.ceil(scale * orig_w))
     frames_tchw = frames.permute(1, 0, 2, 3).to(dtype=torch.float32)
-    resized = F.interpolate(frames_tchw, size=(resize_h, resize_w), mode="bilinear", align_corners=False)
+    resized = F.interpolate(
+        frames_tchw, size=(resize_h, resize_w), mode="bilinear", align_corners=False
+    )
     top = (resize_h - height) // 2
     left = (resize_w - width) // 2
     cropped = resized[:, :, top : top + height, left : left + width]
@@ -402,7 +456,9 @@ def _path_media_to_uint8_cthw(path: str | Path, max_frames: int | None) -> torch
     return frames_thwc[..., :3].permute(3, 0, 1, 2).contiguous()
 
 
-def media_to_uint8_cthw(value: Any, *, height: int, width: int, max_frames: int | None = None) -> torch.Tensor:
+def media_to_uint8_cthw(
+    value: Any, *, height: int, width: int, max_frames: int | None = None
+) -> torch.Tensor:
     if isinstance(value, str | Path):
         frames = _path_media_to_uint8_cthw(value, max_frames=max_frames)
     elif isinstance(value, torch.Tensor):
@@ -413,13 +469,16 @@ def media_to_uint8_cthw(value: Any, *, height: int, width: int, max_frames: int 
         if not value:
             raise ValueError("Cosmos3 transfer control frames cannot be empty.")
         selected = value[:max_frames] if max_frames is not None else value
-        tensors = [torch.from_numpy(_pil_to_uint8_rgb(frame)).permute(2, 0, 1) for frame in selected]
+        tensors = [
+            torch.from_numpy(_pil_to_uint8_rgb(frame)).permute(2, 0, 1) for frame in selected
+        ]
         frames = torch.stack(tensors, dim=1).contiguous()
     else:
         raise TypeError(f"Unsupported Cosmos3 transfer control payload type: {type(value)!r}.")
     if max_frames is not None:
         frames = frames[:, : int(max_frames)]
     return resize_center_crop_uint8_cthw(frames, int(height), int(width))
+
 
 def normalized_video_to_uint8_cthw(video: torch.Tensor) -> torch.Tensor:
     tensor = video.detach().cpu()
@@ -435,7 +494,9 @@ def normalized_video_to_uint8_cthw(video: torch.Tensor) -> torch.Tensor:
         if tensor.shape[-1] in (3, 4):
             tensor = tensor[..., :3].permute(3, 0, 1, 2)
         else:
-            raise ValueError(f"Cosmos3 transfer video must have 3 RGB channels, got {tuple(video.shape)}.")
+            raise ValueError(
+                f"Cosmos3 transfer video must have 3 RGB channels, got {tuple(video.shape)}."
+            )
     if tensor.is_floating_point():
         if tensor.numel() and (tensor.min().item() < 0.0 or tensor.max().item() > 1.0):
             tensor = tensor.clamp(-1.0, 1.0).mul(0.5).add(0.5)
@@ -447,7 +508,9 @@ def normalized_video_to_uint8_cthw(video: torch.Tensor) -> torch.Tensor:
 
 def uint8_cthw_to_normalized_5d(frames: torch.Tensor, *, dtype: torch.dtype) -> torch.Tensor:
     if frames.ndim != 4 or frames.shape[0] != 3:
-        raise ValueError(f"Cosmos3 transfer frames must have shape [3, T, H, W], got {tuple(frames.shape)}.")
+        raise ValueError(
+            f"Cosmos3 transfer frames must have shape [3, T, H, W], got {tuple(frames.shape)}."
+        )
     return frames.to(dtype=dtype).div(127.5).sub(1.0).unsqueeze(0).contiguous()
 
 
@@ -477,10 +540,13 @@ def _scaled_bilateral_params(height: int, width: int) -> tuple[int, float, float
     diameter = max(1, int(round(_scale_for_bilateral_resolution(float(BILATERAL_D), longest_side))))
     if diameter % 2 == 0:
         diameter += 1
-    sigma_color = max(1.0, _scale_for_bilateral_resolution(float(BILATERAL_SIGMA_COLOR), longest_side))
-    sigma_space = max(1.0, _scale_for_bilateral_resolution(float(BILATERAL_SIGMA_SPACE), longest_side))
+    sigma_color = max(
+        1.0, _scale_for_bilateral_resolution(float(BILATERAL_SIGMA_COLOR), longest_side)
+    )
+    sigma_space = max(
+        1.0, _scale_for_bilateral_resolution(float(BILATERAL_SIGMA_SPACE), longest_side)
+    )
     return diameter, sigma_color, sigma_space
-
 
 
 def _import_cv2(hint_key: str):
@@ -491,7 +557,6 @@ def _import_cv2(hint_key: str):
             f"Cosmos3 transfer hint '{hint_key}' requires opencv-python for on-the-fly control generation. "
             "Install opencv-python in the environment, or provide a precomputed control_path for this hint."
         ) from exc
-
 
 
 def make_blur_control(frames: torch.Tensor, preset: str) -> torch.Tensor:
@@ -513,7 +578,9 @@ def make_blur_control(frames: torch.Tensor, preset: str) -> torch.Tensor:
             small_w = max(1, w // pre_blur_factor)
             small_h = max(1, h // pre_blur_factor)
             frame = cv2.resize(frame, (small_w, small_h), interpolation=cv2.INTER_AREA)
-        diameter, sigma_color, sigma_space = _scaled_bilateral_params(frame.shape[0], frame.shape[1])
+        diameter, sigma_color, sigma_space = _scaled_bilateral_params(
+            frame.shape[0], frame.shape[1]
+        )
         for _ in range(BILATERAL_ITERATIONS):
             frame = cv2.bilateralFilter(frame, diameter, sigma_color, sigma_space)
         if pre_blur_factor > 1:
@@ -538,7 +605,9 @@ def load_or_compute_control_frames(
     if hint.control is not None:
         return media_to_uint8_cthw(hint.control, height=height, width=width, max_frames=max_frames)
     if hint.control_path is not None:
-        return media_to_uint8_cthw(hint.control_path, height=height, width=width, max_frames=max_frames)
+        return media_to_uint8_cthw(
+            hint.control_path, height=height, width=width, max_frames=max_frames
+        )
     if hint.key == "edge":
         if input_frames is None:
             raise ValueError(
@@ -559,10 +628,11 @@ def load_or_compute_control_frames(
     )
 
 
-
 def pad_temporal_frames(frames: torch.Tensor, target_frames: int) -> torch.Tensor:
     if frames.ndim != 4:
-        raise ValueError(f"Cosmos3 transfer frames must have shape [C, T, H, W], got {tuple(frames.shape)}.")
+        raise ValueError(
+            f"Cosmos3 transfer frames must have shape [C, T, H, W], got {tuple(frames.shape)}."
+        )
     target_frames = int(target_frames)
     if target_frames <= 0:
         raise ValueError("Cosmos3 transfer target frame count must be positive.")
