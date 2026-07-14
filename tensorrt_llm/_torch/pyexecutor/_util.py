@@ -1952,6 +1952,30 @@ def _create_kv_cache_manager(
             spec_config=spec_config,
             quant_config=quant_config,
         )
+
+        # GDN replay state update kernel for MTP: default on for sm >= 80.
+        # bf16 recurrent state only; stochastic rounding is not supported on
+        # this path, so (unlike Nemotron) there is no fp16/Philox gate here.
+        sm = get_sm_version()
+        use_replay = spec_config is not None and sm >= 80
+        if spec_config is None:
+            logger.info(
+                "GDN replay kernel requires speculative decoding; using "
+                "non-replay path")
+
+        # Tree attention: replay assumes a linear token sequence.
+        if (spec_config is not None
+                and (getattr(spec_config, 'eagle_choices', None) is not None
+                     or getattr(spec_config, 'use_dynamic_tree', False))):
+            logger.info("GDN replay kernel incompatible with tree attention; "
+                        "using legacy MTP path")
+            use_replay = False
+
+        if os.environ.get('TRTLLM_USE_MAMBA_REPLAY', '1') == '0':
+            logger.info(
+                "GDN replay kernel is disabled by TRTLLM_USE_MAMBA_REPLAY=0")
+            use_replay = False
+
         kv_cache_manager = kv_cache_manager_cls(
             # mamba cache parameters
             mamba_params.state_size,
@@ -1980,6 +2004,7 @@ def _create_kv_cache_manager(
             is_estimating_kv_cache=estimating_kv_cache,
             execution_stream=execution_stream,
             model_type="qwen3_next",
+            use_replay_state_update=use_replay,
             **manager_extra_kwargs,
         )
     else:

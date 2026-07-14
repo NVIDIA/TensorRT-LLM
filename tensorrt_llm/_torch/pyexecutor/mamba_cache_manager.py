@@ -377,7 +377,9 @@ class PythonMambaCacheManager(BaseResourceManager):
 
         Supports two SSM update paths (only one set of tensors is allocated):
         - Legacy: caches full intermediate SSM states (intermediate_ssm)
-        - Replay: compact double-buffered cache (old_x, old_B, old_dt, old_dA_cumsum)
+        - Replay: compact double-buffered history cache. The Mamba2 selective
+          scan stores (old_x, old_B, old_dt, old_dA_cumsum); the GDN gated
+          delta rule stores (old_k, old_v, old_g, old_beta).
         """
         _SHARED_FIELDS = frozenset({
             "prev_num_accepted_tokens", "cache_buf_idx", "mamba_ssm_rand_seed"
@@ -397,11 +399,17 @@ class PythonMambaCacheManager(BaseResourceManager):
         # CUDA graph replay uses fresh SR draws without allocating RNG tensors.
         # (cache,) int64 - shared across layers
         mamba_ssm_rand_seed: torch.Tensor | None = None
+        # Mamba2 selective-scan replay history.
         old_x: torch.Tensor | None = None  # (layers, cache, 2, history, nheads, dim)
         old_B: torch.Tensor | None = None  # (layers, cache, 2, history, ngroups, dstate)
         # Processed dt: softplus(raw_dt + dt_bias), clamped to dt_limit.
         old_dt: torch.Tensor | None = None  # (layers, cache, 2, nheads, history) fp32
         old_dA_cumsum: torch.Tensor | None = None  # (layers, cache, 2, nheads, history) fp32
+        # GDN gated-delta-rule replay history (raw per-token inputs).
+        old_k: torch.Tensor | None = None  # (layers, cache, 2, history, num_k_heads, head_k_dim)
+        old_v: torch.Tensor | None = None  # (layers, cache, 2, history, num_v_heads, head_v_dim)
+        old_g: torch.Tensor | None = None  # (layers, cache, 2, history, num_v_heads) fp32
+        old_beta: torch.Tensor | None = None  # (layers, cache, 2, history, num_v_heads) fp32
 
     def __init__(
         self,
@@ -426,6 +434,7 @@ class PythonMambaCacheManager(BaseResourceManager):
         self.mamba_ssm_cache_dtype = ssm_cache_dtype
         self.speculative_num_draft_tokens = speculative_num_draft_tokens
         self.spec_state_size = spec_state_size
+        self._model_type = model_type
         self._use_replay_state_update = use_replay_state_update
         self.replay_history_size: Optional[int] = None
         self.replay_step_width: Optional[int] = None
@@ -535,47 +544,95 @@ class PythonMambaCacheManager(BaseResourceManager):
                 n_groups_per_rank = n_groups // tp_size
                 self.replay_history_size = max(MIN_REPLAY_HISTORY_SIZE, T)
 
-                # Compact replay cache.
+                # Shared double-buffering bookkeeping (both architectures).
                 spec_kwargs['prev_num_accepted_tokens'] = torch.zeros(
                     max_batch_size, dtype=torch.int32, device=device)
                 spec_kwargs['cache_buf_idx'] = torch.zeros(max_batch_size,
                                                            dtype=torch.int32,
                                                            device=device)
-                spec_kwargs['old_x'] = torch.zeros(num_local_layers,
-                                                   max_batch_size,
-                                                   2,
-                                                   self.replay_history_size,
-                                                   nheads,
-                                                   head_dim,
-                                                   dtype=dtype,
-                                                   device=device)
-                spec_kwargs['old_B'] = torch.zeros(num_local_layers,
-                                                   max_batch_size,
-                                                   2,
-                                                   self.replay_history_size,
-                                                   n_groups_per_rank,
-                                                   d_state,
-                                                   dtype=dtype,
-                                                   device=device)
-                spec_kwargs['old_dt'] = torch.zeros(num_local_layers,
-                                                    max_batch_size,
-                                                    2,
-                                                    nheads,
-                                                    self.replay_history_size,
-                                                    dtype=torch.float32,
-                                                    device=device)
-                spec_kwargs['old_dA_cumsum'] = torch.zeros(
-                    num_local_layers,
-                    max_batch_size,
-                    2,
-                    nheads,
-                    self.replay_history_size,
-                    dtype=torch.float32,
-                    device=device)
-                ssm_spec_cache = [
-                    spec_kwargs['old_x'], spec_kwargs['old_B'],
-                    spec_kwargs['old_dt'], spec_kwargs['old_dA_cumsum']
-                ]
+
+                if model_type == "qwen3_next":
+                    # GDN gated-delta-rule history: raw per-token k/v/g/beta.
+                    # Here nheads == num_v_heads (HV), n_groups == num_k_heads
+                    # (H), head_dim == head_v_dim (V), d_state == head_k_dim (K).
+                    spec_kwargs['old_k'] = torch.zeros(
+                        num_local_layers,
+                        max_batch_size,
+                        2,
+                        self.replay_history_size,
+                        n_groups_per_rank,
+                        d_state,
+                        dtype=dtype,
+                        device=device)
+                    spec_kwargs['old_v'] = torch.zeros(
+                        num_local_layers,
+                        max_batch_size,
+                        2,
+                        self.replay_history_size,
+                        nheads,
+                        head_dim,
+                        dtype=dtype,
+                        device=device)
+                    spec_kwargs['old_g'] = torch.zeros(
+                        num_local_layers,
+                        max_batch_size,
+                        2,
+                        self.replay_history_size,
+                        nheads,
+                        dtype=torch.float32,
+                        device=device)
+                    spec_kwargs['old_beta'] = torch.zeros(
+                        num_local_layers,
+                        max_batch_size,
+                        2,
+                        self.replay_history_size,
+                        nheads,
+                        dtype=torch.float32,
+                        device=device)
+                    ssm_spec_cache = [
+                        spec_kwargs['old_k'], spec_kwargs['old_v'],
+                        spec_kwargs['old_g'], spec_kwargs['old_beta']
+                    ]
+                else:
+                    # Mamba2 selective-scan history.
+                    spec_kwargs['old_x'] = torch.zeros(
+                        num_local_layers,
+                        max_batch_size,
+                        2,
+                        self.replay_history_size,
+                        nheads,
+                        head_dim,
+                        dtype=dtype,
+                        device=device)
+                    spec_kwargs['old_B'] = torch.zeros(
+                        num_local_layers,
+                        max_batch_size,
+                        2,
+                        self.replay_history_size,
+                        n_groups_per_rank,
+                        d_state,
+                        dtype=dtype,
+                        device=device)
+                    spec_kwargs['old_dt'] = torch.zeros(
+                        num_local_layers,
+                        max_batch_size,
+                        2,
+                        nheads,
+                        self.replay_history_size,
+                        dtype=torch.float32,
+                        device=device)
+                    spec_kwargs['old_dA_cumsum'] = torch.zeros(
+                        num_local_layers,
+                        max_batch_size,
+                        2,
+                        nheads,
+                        self.replay_history_size,
+                        dtype=torch.float32,
+                        device=device)
+                    ssm_spec_cache = [
+                        spec_kwargs['old_x'], spec_kwargs['old_B'],
+                        spec_kwargs['old_dt'], spec_kwargs['old_dA_cumsum']
+                    ]
                 spec_path_label = "replay"
             else:
                 # Legacy: full intermediate SSM states at each step
@@ -838,6 +895,30 @@ class PythonMambaCacheManager(BaseResourceManager):
         layer_offset = self.mamba_layer_offsets[layer_idx]
         return self.mamba_cache.old_dA_cumsum[layer_offset]
 
+    def get_replay_old_k(self, layer_idx: int) -> Optional[torch.Tensor]:
+        if not self._use_replay_state_update:
+            return None
+        layer_offset = self.mamba_layer_offsets[layer_idx]
+        return self.mamba_cache.old_k[layer_offset]
+
+    def get_replay_old_v(self, layer_idx: int) -> Optional[torch.Tensor]:
+        if not self._use_replay_state_update:
+            return None
+        layer_offset = self.mamba_layer_offsets[layer_idx]
+        return self.mamba_cache.old_v[layer_offset]
+
+    def get_replay_old_g(self, layer_idx: int) -> Optional[torch.Tensor]:
+        if not self._use_replay_state_update:
+            return None
+        layer_offset = self.mamba_layer_offsets[layer_idx]
+        return self.mamba_cache.old_g[layer_offset]
+
+    def get_replay_old_beta(self, layer_idx: int) -> Optional[torch.Tensor]:
+        if not self._use_replay_state_update:
+            return None
+        layer_offset = self.mamba_layer_offsets[layer_idx]
+        return self.mamba_cache.old_beta[layer_offset]
+
     def get_replay_cache_buf_idx(self) -> Optional[torch.Tensor]:
         if not self._use_replay_state_update:
             return None
@@ -911,6 +992,10 @@ class PythonMambaCacheManager(BaseResourceManager):
                 old_B=_drop(self.mamba_cache.old_B),
                 old_dt=_drop(self.mamba_cache.old_dt),
                 old_dA_cumsum=_drop(self.mamba_cache.old_dA_cumsum),
+                old_k=_drop(self.mamba_cache.old_k),
+                old_v=_drop(self.mamba_cache.old_v),
+                old_g=_drop(self.mamba_cache.old_g),
+                old_beta=_drop(self.mamba_cache.old_beta),
             )
         else:
             self.mamba_cache = self.State(conv=empty, temporal=empty)
@@ -1131,6 +1216,22 @@ class MambaCacheManager(BaseResourceManager, BaseMambaCacheManager):
                                  layer_idx: int) -> Optional[torch.Tensor]:
         assert not self._use_cpp, "get_replay_old_dA_cumsum is not supported in CppMambaCacheManager"
         return self._impl.get_replay_old_dA_cumsum(layer_idx)
+
+    def get_replay_old_k(self, layer_idx: int) -> Optional[torch.Tensor]:
+        assert not self._use_cpp, "get_replay_old_k is not supported in CppMambaCacheManager"
+        return self._impl.get_replay_old_k(layer_idx)
+
+    def get_replay_old_v(self, layer_idx: int) -> Optional[torch.Tensor]:
+        assert not self._use_cpp, "get_replay_old_v is not supported in CppMambaCacheManager"
+        return self._impl.get_replay_old_v(layer_idx)
+
+    def get_replay_old_g(self, layer_idx: int) -> Optional[torch.Tensor]:
+        assert not self._use_cpp, "get_replay_old_g is not supported in CppMambaCacheManager"
+        return self._impl.get_replay_old_g(layer_idx)
+
+    def get_replay_old_beta(self, layer_idx: int) -> Optional[torch.Tensor]:
+        assert not self._use_cpp, "get_replay_old_beta is not supported in CppMambaCacheManager"
+        return self._impl.get_replay_old_beta(layer_idx)
 
     def get_replay_cache_buf_idx(self) -> Optional[torch.Tensor]:
         assert not self._use_cpp, "get_replay_cache_buf_idx is not supported in CppMambaCacheManager"
@@ -1875,6 +1976,14 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
                     self.old_dt[:, ctx_slots] = 0
                 if self.old_dA_cumsum is not None:
                     self.old_dA_cumsum[:, ctx_slots] = 0
+                if self.old_k is not None:
+                    self.old_k[:, ctx_slots] = 0
+                if self.old_v is not None:
+                    self.old_v[:, ctx_slots] = 0
+                if self.old_g is not None:
+                    self.old_g[:, ctx_slots] = 0
+                if self.old_beta is not None:
+                    self.old_beta[:, ctx_slots] = 0
             # Deterministic per-context-slot seed rotation.  Runs whenever
             # the seed buffer exists, including the non-replay SR path.
             # Bump the host counter once per batch and write one new seed
@@ -2067,10 +2176,17 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
                 # Per-layer slices for the replay kernel; shared 1D tensors
                 # (cache_buf_idx, prev_num_accepted_tokens) are passed
                 # untouched via the SpeculativeState._SHARED_FIELDS contract.
-                spec_kwargs['old_x'] = self.old_x[layer_offset]
-                spec_kwargs['old_B'] = self.old_B[layer_offset]
-                spec_kwargs['old_dt'] = self.old_dt[layer_offset]
-                spec_kwargs['old_dA_cumsum'] = self.old_dA_cumsum[layer_offset]
+                if self._rnn_conv_section_layout == "qwen3_next":
+                    spec_kwargs['old_k'] = self.old_k[layer_offset]
+                    spec_kwargs['old_v'] = self.old_v[layer_offset]
+                    spec_kwargs['old_g'] = self.old_g[layer_offset]
+                    spec_kwargs['old_beta'] = self.old_beta[layer_offset]
+                else:
+                    spec_kwargs['old_x'] = self.old_x[layer_offset]
+                    spec_kwargs['old_B'] = self.old_B[layer_offset]
+                    spec_kwargs['old_dt'] = self.old_dt[layer_offset]
+                    spec_kwargs['old_dA_cumsum'] = self.old_dA_cumsum[
+                        layer_offset]
                 spec_kwargs['cache_buf_idx'] = self.cache_buf_idx
                 spec_kwargs['prev_num_accepted_tokens'] = (
                     self.prev_num_accepted_tokens)
@@ -2287,6 +2403,10 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         self.old_B = None
         self.old_dt = None
         self.old_dA_cumsum = None
+        self.old_k = None
+        self.old_v = None
+        self.old_g = None
+        self.old_beta = None
 
         if (not self._use_replay_state_update
                 and not self._mamba_ssm_stochastic_rounding):
@@ -2310,6 +2430,10 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
             self.old_B = None
             self.old_dt = None
             self.old_dA_cumsum = None
+            self.old_k = None
+            self.old_v = None
+            self.old_g = None
+            self.old_beta = None
             self._dummy_request_mask = None
             self._dummy_request_mask_host = None
             return
@@ -2332,37 +2456,72 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         self._dummy_request_mask_host = torch.zeros(self.max_batch_size,
                                                     dtype=torch.bool,
                                                     pin_memory=prefer_pinned())
-        self.old_x = torch.zeros(num_local_mamba_layers,
-                                 cache_size,
-                                 2,
-                                 history_size,
-                                 nheads,
-                                 head_dim,
-                                 dtype=self.conv_state_dtype,
-                                 device=device)
-        # Per-layer double-buffered caches.
-        self.old_B = torch.zeros(num_local_mamba_layers,
-                                 cache_size,
-                                 2,
-                                 history_size,
-                                 n_groups_per_rank,
-                                 d_state,
-                                 dtype=self.conv_state_dtype,
-                                 device=device)
-        self.old_dt = torch.zeros(num_local_mamba_layers,
-                                  cache_size,
-                                  2,
-                                  nheads,
-                                  history_size,
-                                  dtype=torch.float32,
-                                  device=device)
-        self.old_dA_cumsum = torch.zeros(num_local_mamba_layers,
-                                         cache_size,
-                                         2,
-                                         nheads,
-                                         history_size,
-                                         dtype=torch.float32,
-                                         device=device)
+        if self._rnn_conv_section_layout == "qwen3_next":
+            # GDN gated-delta-rule history: raw per-token k/v/g/beta. Here
+            # nheads == num_v_heads (HV), n_groups == num_k_heads (H),
+            # head_dim == head_v_dim (V), d_state == head_k_dim (K).
+            self.old_k = torch.zeros(num_local_mamba_layers,
+                                     cache_size,
+                                     2,
+                                     history_size,
+                                     n_groups_per_rank,
+                                     d_state,
+                                     dtype=self.conv_state_dtype,
+                                     device=device)
+            self.old_v = torch.zeros(num_local_mamba_layers,
+                                     cache_size,
+                                     2,
+                                     history_size,
+                                     nheads,
+                                     head_dim,
+                                     dtype=self.conv_state_dtype,
+                                     device=device)
+            self.old_g = torch.zeros(num_local_mamba_layers,
+                                     cache_size,
+                                     2,
+                                     history_size,
+                                     nheads,
+                                     dtype=torch.float32,
+                                     device=device)
+            self.old_beta = torch.zeros(num_local_mamba_layers,
+                                        cache_size,
+                                        2,
+                                        history_size,
+                                        nheads,
+                                        dtype=torch.float32,
+                                        device=device)
+        else:
+            self.old_x = torch.zeros(num_local_mamba_layers,
+                                     cache_size,
+                                     2,
+                                     history_size,
+                                     nheads,
+                                     head_dim,
+                                     dtype=self.conv_state_dtype,
+                                     device=device)
+            # Per-layer double-buffered caches.
+            self.old_B = torch.zeros(num_local_mamba_layers,
+                                     cache_size,
+                                     2,
+                                     history_size,
+                                     n_groups_per_rank,
+                                     d_state,
+                                     dtype=self.conv_state_dtype,
+                                     device=device)
+            self.old_dt = torch.zeros(num_local_mamba_layers,
+                                      cache_size,
+                                      2,
+                                      nheads,
+                                      history_size,
+                                      dtype=torch.float32,
+                                      device=device)
+            self.old_dA_cumsum = torch.zeros(num_local_mamba_layers,
+                                             cache_size,
+                                             2,
+                                             nheads,
+                                             history_size,
+                                             dtype=torch.float32,
+                                             device=device)
 
     @property
     def use_replay_state_update(self) -> bool:
