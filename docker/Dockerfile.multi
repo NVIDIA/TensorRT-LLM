@@ -128,7 +128,9 @@ FROM ${DEVEL_IMAGE} AS release
 
 WORKDIR /app/tensorrt_llm
 RUN --mount=type=cache,target=/root/.cache/pip --mount=type=bind,from=wheel,source=/src/tensorrt_llm/build,target=/tmp/wheel \
-    pip install /tmp/wheel/tensorrt_llm*.whl
+    TRTLLM_WHEEL=$(find /tmp/wheel -maxdepth 1 -name 'tensorrt_llm*.whl' -print -quit) && \
+    test -n "${TRTLLM_WHEEL}" && \
+    pip install "${TRTLLM_WHEEL}[mx]"
 
 RUN --mount=type=bind,source=README.md,target=/mnt/ctx/README.md \
     --mount=type=bind,source=docs,target=/mnt/ctx/docs \

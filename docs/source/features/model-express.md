@@ -54,7 +54,14 @@ Support for another model family requires a focused qualification change:
 
 ## Installation
 
-MX support is optional. Install the MX Python client through the `mx` extra:
+The official TensorRT-LLM release container includes the MX Python client. No
+additional Python package installation is required in that container. MX
+remains opt-in at runtime: TensorRT-LLM uses the client only when the MX
+checkpoint-loading path and a server URL are configured. Installing the client
+does not expand the model support scope described above.
+
+For pip installations outside the official release container, install the MX
+Python client through the optional `mx` extra:
 
 ```bash
 pip install "tensorrt_llm[mx]"
