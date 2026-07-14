@@ -109,8 +109,18 @@ def _make_loader(monkeypatch, *, events, spec_config=None):
     # These tests stub ModelConfig, while SourceIdentity has dedicated
     # coverage. Keep this file focused on ModelLoader GMS branch behavior.
 
+    def _build_artifact_identity(_cls, checkpoint_dir):
+        assert checkpoint_dir == "/ckpt"
+        return _SOURCE_IDENTITY.artifact_identity
+
+    monkeypatch.setattr(
+        model_loader_mod.ArtifactIdentity,
+        "from_checkpoint",
+        classmethod(_build_artifact_identity),
+    )
+
     def _build_source_identity(_cls, *_args, **kwargs):
-        assert kwargs["checkpoint_dir"] == "/ckpt"
+        assert kwargs["artifact_identity"] is _SOURCE_IDENTITY.artifact_identity
         return _SOURCE_IDENTITY
 
     monkeypatch.setattr(
@@ -192,6 +202,31 @@ def _tiny_profile_registry() -> PostTransformProfileRegistry:
             ),
         )
     )
+
+
+def test_gms_artifact_identity_failure_remains_fatal(monkeypatch):
+    loader = _make_loader(monkeypatch, events=[])
+    artifact_error = ValueError(
+        "Checkpoint manifests do not support nested symlinked directories: /ckpt/shards"
+    )
+    monkeypatch.setattr(
+        model_loader_mod.ArtifactIdentity,
+        "from_checkpoint",
+        MagicMock(side_effect=artifact_error),
+    )
+    source_identity_factory = MagicMock()
+    monkeypatch.setattr(
+        model_loader_mod.SourceIdentity,
+        "from_model_config",
+        source_identity_factory,
+    )
+    checkpoint_loader = MagicMock(name="checkpoint_loader")
+    checkpoint_loader.checkpoint_format = "MX"
+
+    with pytest.raises(ValueError, match="nested symlinked directories"):
+        loader.load("/ckpt", checkpoint_loader)
+
+    source_identity_factory.assert_not_called()
 
 
 @pytest.mark.parametrize(

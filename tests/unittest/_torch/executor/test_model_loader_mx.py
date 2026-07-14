@@ -197,8 +197,18 @@ def _make_loader(monkeypatch, *, events, spec_config=None):
     # These tests stub ModelConfig, while SourceIdentity has dedicated
     # coverage. Keep this file focused on ModelLoader MX branch behavior.
 
+    def _build_artifact_identity(_cls, checkpoint_dir):
+        assert checkpoint_dir == "/ckpt"
+        return _SOURCE_IDENTITY.artifact_identity
+
+    monkeypatch.setattr(
+        model_loader_mod.ArtifactIdentity,
+        "from_checkpoint",
+        classmethod(_build_artifact_identity),
+    )
+
     def _build_source_identity(_cls, *_args, **kwargs):
-        assert kwargs["checkpoint_dir"] == "/ckpt"
+        assert kwargs["artifact_identity"] is _SOURCE_IDENTITY.artifact_identity
         return _SOURCE_IDENTITY
 
     monkeypatch.setattr(
@@ -494,6 +504,48 @@ def test_mx_fallback_runs_standard_weight_mapping(monkeypatch):
         checkpoint_dir="/ckpt",
         weights_preloaded=False,
         source_identity=loader._source_identity,
+    )
+
+
+def test_mx_artifact_identity_failure_falls_back_to_disk(monkeypatch):
+    events = []
+    loader = _make_loader(monkeypatch, events=events)
+    artifact_error = ValueError(
+        "Checkpoint manifests do not support nested symlinked directories: /ckpt/shards"
+    )
+    monkeypatch.setattr(
+        model_loader_mod.ArtifactIdentity,
+        "from_checkpoint",
+        MagicMock(side_effect=artifact_error),
+    )
+    source_identity_factory = MagicMock()
+    monkeypatch.setattr(
+        model_loader_mod.SourceIdentity,
+        "from_model_config",
+        source_identity_factory,
+    )
+    warning = MagicMock()
+    monkeypatch.setattr(model_loader_mod.logger, "warning", warning)
+
+    checkpoint_loader = MagicMock(name="checkpoint_loader")
+    checkpoint_loader.checkpoint_format = "MX"
+    checkpoint_loader.is_weights_preloaded.return_value = False
+    checkpoint_loader.load_weights.return_value = {"weight": MagicMock()}
+    checkpoint_loader.get_initialized_weight_mapper.return_value = MagicMock()
+
+    model, _ = loader.load("/ckpt", checkpoint_loader)
+
+    assert loader._source_identity is None
+    source_identity_factory.assert_not_called()
+    warning.assert_called_once()
+    assert "falling back to regular checkpoint loading" in warning.call_args.args[0]
+    _args, kwargs = checkpoint_loader.load_weights.call_args
+    assert kwargs["source_identity"] is None
+    checkpoint_loader.post_load_publish.assert_called_once_with(
+        model,
+        checkpoint_dir="/ckpt",
+        weights_preloaded=False,
+        source_identity=None,
     )
 
 
