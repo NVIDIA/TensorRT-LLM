@@ -1,14 +1,27 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+from dataclasses import dataclass, field
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import BlockReusePolicy, KVCacheManagerV2
-from tensorrt_llm.bindings.internal.batch_manager import CacheType as CacheTypeCpp
+from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
+from tensorrt_llm.bindings import DataType
+from tensorrt_llm.bindings.internal.batch_manager import CacheType
+from tensorrt_llm.conversation_params import ConversationParams
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
-from tensorrt_llm.runtime.kv_cache_manager_v2 import GpuCacheTierConfig, KVCacheManagerConfig
+from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.runtime.kv_cache_manager_v2 import (
+    DEFAULT_BEAM_INDEX,
+    GpuCacheTierConfig,
+    KVCacheManagerConfig,
+)
+from tensorrt_llm.runtime.kv_cache_manager_v2._utils import init_cuda_once
+
+TOKENS_PER_BLOCK = 4
 
 
 class _FakeKVCache:
@@ -29,7 +42,7 @@ def _build_cache_config_for_test(
     kv_cache_config: KvCacheConfig, *, is_draft: bool = False
 ) -> KVCacheManagerConfig:
     cache_manager = object.__new__(KVCacheManagerV2)
-    cache_manager.kv_cache_type = CacheTypeCpp.SELFKONLY
+    cache_manager.kv_cache_type = CacheType.SELFKONLY
     cache_manager.head_dim_per_layer = [128]
     cache_manager.enable_swa_scratch_reuse = False
     cache_manager.num_extra_kv_tokens = 0
@@ -104,3 +117,251 @@ def test_try_commit_blocks_commits_partial_block_at_context_end() -> None:
     assert kv_cache.committed_tokens == [4, 5, 6, 7, 8, 9]
     assert kv_cache.num_committed_tokens == 10
     assert kv_cache.stopped_committing
+
+
+@dataclass
+class _ContextRequest:
+    request_id: int
+    tokens: list[int]
+    context_remaining_length: int
+    conversation_id: str
+    py_request_id: int = field(init=False)
+    py_conversation_params: ConversationParams | None = field(init=False)
+    use_conversation_params: bool = True
+    lora_task_id: int | None = None
+    cache_salt_id: int | None = None
+    is_first_context_chunk: bool = True
+    is_last_context_chunk: bool = True
+    is_disagg_generation_init_state: bool = False
+    is_dummy_request: bool = False
+    context_current_position: int = 0
+    prepopulated_prompt: tuple[int, int] | None = None
+    multimodal_hashes: None = None
+    multimodal_positions: None = None
+    multimodal_lengths: None = None
+
+    def __post_init__(self) -> None:
+        self.py_request_id = self.request_id
+        if not self.use_conversation_params:
+            self.py_conversation_params = None
+            return
+        self.py_conversation_params = ConversationParams(conversation_id=self.conversation_id)
+
+    @property
+    def prompt_len(self) -> int:
+        return len(self.tokens)
+
+    @property
+    def is_dummy(self) -> bool:
+        return self.is_dummy_request
+
+    @property
+    def prepopulated_prompt_len(self) -> int:
+        if self.prepopulated_prompt is None:
+            return 0
+        return self.prepopulated_prompt[0]
+
+    def get_tokens(self, beam_id: int = DEFAULT_BEAM_INDEX) -> list[int]:
+        assert beam_id == DEFAULT_BEAM_INDEX
+        return self.tokens
+
+    def set_prepopulated_prompt_len(self, length: int, tokens_per_block: int) -> None:
+        self.prepopulated_prompt = (length, tokens_per_block)
+
+
+@pytest.fixture
+def manager() -> KVCacheManagerV2:
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    init_cuda_once()
+    manager = KVCacheManagerV2(
+        KvCacheConfig(
+            enable_block_reuse=True,
+            enable_partial_reuse=True,
+            max_gpu_total_bytes=8 << 20,
+            max_util_for_resume=1.0,
+            block_reuse_policy="per_conversation",
+        ),
+        CacheType.SELF,
+        num_layers=1,
+        num_kv_heads=128,
+        head_dim=1024,
+        tokens_per_block=TOKENS_PER_BLOCK,
+        max_seq_len=16,
+        max_batch_size=2,
+        mapping=Mapping(world_size=1, rank=0, tp_size=1, pp_size=1),
+        dtype=DataType.HALF,
+        vocab_size=4096,
+        enable_stats=False,
+    )
+    try:
+        yield manager
+    finally:
+        manager.shutdown()
+
+
+def _context_batch(*requests: _ContextRequest) -> ScheduledRequests:
+    batch = ScheduledRequests()
+    for request in requests:
+        batch.append_context_request(request)
+    return batch
+
+
+def _prepare_context_resources(
+    manager: KVCacheManagerV2,
+    *requests: _ContextRequest,
+) -> ScheduledRequests:
+    batch = _context_batch(*requests)
+    manager.prepare_resources(batch)
+    return batch
+
+
+def _update_context_resources(
+    manager: KVCacheManagerV2,
+    batch: ScheduledRequests,
+) -> None:
+    manager.update_context_resources(batch)
+
+
+def _free_if_active(
+    manager: KVCacheManagerV2,
+    request: _ContextRequest,
+) -> None:
+    manager.free_resources(request)
+
+
+def _run_context(
+    manager: KVCacheManagerV2,
+    request: _ContextRequest,
+) -> None:
+    batch = _prepare_context_resources(manager, request)
+    assert manager.prepare_context(request)
+    request.context_remaining_length = request.prompt_len - request.context_current_position
+    assert manager.resize_context(request, num_tokens=request.context_remaining_length)
+    request.context_current_position = request.prompt_len
+    request.context_remaining_length = 0
+    _update_context_resources(manager, batch)
+
+
+def test_per_conversation_policy_delays_commit_until_last_context_chunk(
+    manager: KVCacheManagerV2,
+) -> None:
+    request = _ContextRequest(1, list(range(8)), 8, "conv-1")
+
+    try:
+        batch = _prepare_context_resources(manager, request)
+        assert manager.prepare_context(request)
+        assert manager.resize_context(request, num_tokens=4)
+        request.context_current_position = 4
+        request.context_remaining_length = 4
+        _update_context_resources(manager, batch)
+
+        kv_cache = manager.kv_cache_map[request.py_request_id]
+        assert kv_cache.num_committed_tokens == 0
+        assert kv_cache.history_length == 4
+
+        request.is_first_context_chunk = False
+        batch = _prepare_context_resources(manager, request)
+        assert manager.prepare_context(request)
+        assert manager.resize_context(request, num_tokens=4)
+        request.context_current_position = 8
+        request.context_remaining_length = 0
+        _update_context_resources(manager, batch)
+
+        assert kv_cache.num_committed_tokens == 8
+        assert kv_cache.history_length == 8
+    finally:
+        _free_if_active(manager, request)
+
+
+def test_per_conversation_policy_without_params_uses_per_request_commit(
+    manager: KVCacheManagerV2,
+) -> None:
+    request = _ContextRequest(
+        1,
+        list(range(8)),
+        8,
+        "conv-1",
+        use_conversation_params=False,
+    )
+    batch = _context_batch(request)
+
+    try:
+        assert manager.prepare_context(request)
+        assert manager.resize_context(request, num_tokens=4)
+        request.context_current_position = 4
+        request.context_remaining_length = 4
+        _update_context_resources(manager, batch)
+
+        kv_cache = manager.kv_cache_map[request.py_request_id]
+        assert kv_cache.num_committed_tokens == 0
+        assert kv_cache.history_length == 4
+    finally:
+        if request.py_request_id in manager.kv_cache_map:
+            manager.free_resources(request)
+
+
+def test_per_conversation_policy_drops_previous_divergent_blocks(
+    manager: KVCacheManagerV2,
+) -> None:
+    request_a = _ContextRequest(1, list(range(8)), 8, "conv-1")
+    request_b = _ContextRequest(2, [0, 1, 2, 3, 100, 101, 102, 103], 8, "conv-1")
+    request_old_prompt = _ContextRequest(3, list(range(8)), 8, "conv-2")
+    try:
+        _run_context(manager, request_a)
+        _free_if_active(manager, request_a)
+
+        _run_context(manager, request_b)
+        assert request_b.prepopulated_prompt_len == TOKENS_PER_BLOCK
+        _free_if_active(manager, request_b)
+
+        assert manager.prepare_context(request_old_prompt)
+        assert request_old_prompt.prepopulated_prompt_len == TOKENS_PER_BLOCK
+    finally:
+        _free_if_active(manager, request_old_prompt)
+        _free_if_active(manager, request_b)
+        _free_if_active(manager, request_a)
+
+
+def test_per_conversation_policy_ignores_overlapping_request(
+    caplog: pytest.LogCaptureFixture,
+    manager: KVCacheManagerV2,
+) -> None:
+    request_a = _ContextRequest(1, list(range(8)), 8, "conv-1")
+    request_b = _ContextRequest(2, [0, 1, 2, 3, 100, 101, 102, 103], 8, "conv-1")
+    request_old_prompt = _ContextRequest(3, list(range(8)), 8, "conv-2")
+    conversation_params = request_b.py_conversation_params
+
+    try:
+        batch_a = _prepare_context_resources(manager, request_a)
+        assert manager.prepare_context(request_a)
+        assert manager.resize_context(request_a, num_tokens=4)
+        request_a.context_current_position = 4
+        request_a.context_remaining_length = 4
+        _update_context_resources(manager, batch_a)
+
+        batch_b = _prepare_context_resources(manager, request_b)
+        assert request_b.py_conversation_params is conversation_params
+        assert "already has current request" in caplog.text
+        assert manager.prepare_context(request_b)
+        assert manager.resize_context(request_b, num_tokens=request_b.prompt_len)
+        request_b.context_current_position = request_b.prompt_len
+        request_b.context_remaining_length = 0
+        _update_context_resources(manager, batch_b)
+        _free_if_active(manager, request_b)
+
+        request_a.is_first_context_chunk = False
+        batch_a = _prepare_context_resources(manager, request_a)
+        assert manager.prepare_context(request_a)
+        assert manager.resize_context(request_a, num_tokens=4)
+        request_a.context_current_position = 8
+        request_a.context_remaining_length = 0
+        _update_context_resources(manager, batch_a)
+        _free_if_active(manager, request_a)
+
+        assert manager.prepare_context(request_old_prompt)
+        assert request_old_prompt.prepopulated_prompt_len == 8
+    finally:
+        _free_if_active(manager, request_old_prompt)
+        _free_if_active(manager, request_b)
+        _free_if_active(manager, request_a)

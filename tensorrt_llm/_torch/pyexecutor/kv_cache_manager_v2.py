@@ -17,6 +17,7 @@ import math
 import os
 import sys
 from collections import OrderedDict, defaultdict
+from dataclasses import dataclass, fields
 from typing import TYPE_CHECKING, Dict, Iterable, List, NamedTuple, Optional, Sequence, Tuple, Union
 
 import numpy as np
@@ -58,6 +59,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     LayerId,
     LifeCycleId,
     PageIndexMode,
+    PlannedDropHandle,
     PoolGroupPeakBlockStats,
     ReuseScope,
     SwaScratchReuseConfig,
@@ -130,6 +132,77 @@ class Role:
 class BlockReusePolicy(StrEnum):
     ALL_REUSABLE = "all_reusable"
     PER_REQUEST = "per_request"
+    PER_CONVERSATION = "per_conversation"
+
+
+def _request_conversation_id(request: LlmRequest) -> Optional[str]:
+    if request.is_dummy_request:
+        return None
+    conversation_params = request.py_conversation_params
+    if conversation_params is None:
+        return None
+    conversation_id = conversation_params.conversation_id.strip()
+    return conversation_id or None
+
+
+@dataclass(slots=True)
+class _ConversationState:
+    current_request_id: Optional[int] = None
+    planned_drop_handle: Optional[PlannedDropHandle] = None
+
+
+class ConversationManager:
+    """Track the current request and drop plan for each conversation."""
+
+    def __init__(self) -> None:
+        self._conversation_states: Dict[str, _ConversationState] = {}
+
+    def save_drop_plan(self, request: LlmRequest, kv_cache: _KVCache) -> None:
+        """Save a completed context's drop plan and apply the preceding plan on success."""
+        request_id = request.py_request_id
+        conversation_id = _request_conversation_id(request)
+        if conversation_id is None:
+            return
+
+        state = self._conversation_states[conversation_id]
+        if state.current_request_id != request_id:
+            return
+
+        drop_handle = kv_cache.plan_committed_block_drop()
+        if drop_handle is None:
+            logger.warning(
+                f"Committed blocks for request {request_id} in conversation "
+                f"{conversation_id} have been dropped."
+            )
+        else:
+            previous_handle = state.planned_drop_handle
+            state.planned_drop_handle = drop_handle
+            if previous_handle is not None:
+                previous_handle.drop()
+
+        state.current_request_id = None
+
+    def update_conversation(self, request: LlmRequest) -> None:
+        """Register a context request unless its conversation has another active one."""
+        conversation_id = _request_conversation_id(request)
+        if conversation_id is None:
+            return
+        request_id = request.py_request_id
+        state = self._conversation_states.setdefault(conversation_id, _ConversationState())
+        current_request_id = state.current_request_id
+        if current_request_id is not None and current_request_id != request_id:
+            logger.warning(
+                f"Conversation {conversation_id} already has current request "
+                f"{current_request_id}. Request {request_id} will ignore "
+                "conversation params."
+            )
+            return
+
+        state.current_request_id = request_id
+
+    def clear(self) -> None:
+        """Clear state after reusable KV-cache blocks have been cleared."""
+        self._conversation_states.clear()
 
 
 def _estimate_full_attn_size_per_token(
@@ -990,6 +1063,12 @@ class KVCacheManagerV2(BaseResourceManager):
         self.enable_block_reuse = kv_cache_config.enable_block_reuse
         self.enable_partial_reuse = kv_cache_config.enable_partial_reuse
         self.disk_prefetch_num_reqs = kv_cache_config.disk_prefetch_num_reqs
+        enable_conversation_manager = (
+            self.enable_block_reuse
+            and self.block_reuse_policy == BlockReusePolicy.PER_CONVERSATION
+            and not self.is_draft
+        )
+        self.conversation_manager = ConversationManager() if enable_conversation_manager else None
 
         # With pipeline parallelism, multiple microbatches can be in-flight
         # simultaneously, so we need slots for all concurrent sequences.
@@ -1954,6 +2033,8 @@ class KVCacheManagerV2(BaseResourceManager):
 
     def _prepare_context_impl(self, req: LlmRequest) -> bool:
         if req.is_first_context_chunk:
+            if self.conversation_manager is not None:
+                self.conversation_manager.update_conversation(req)
             kv_cache = self.kv_cache_map.get(req.py_request_id)
             if kv_cache is None:
                 all_tokens = req.get_tokens(DEFAULT_BEAM_INDEX)
@@ -3065,6 +3146,8 @@ class KVCacheManagerV2(BaseResourceManager):
             kv_cache.close()
         self.kv_cache_map.clear()
         self.impl.shutdown()
+        if self.conversation_manager is not None:
+            self.conversation_manager.clear()
 
     def get_max_resource_count(self) -> int:
         # TODO: implement this
@@ -3146,6 +3229,8 @@ class KVCacheManagerV2(BaseResourceManager):
             if should_commit:
                 self.try_commit_blocks(req)
             if req.context_remaining_length == 0:
+                if self.conversation_manager is not None:
+                    self.conversation_manager.save_drop_plan(req, kv_cache)
                 # Scratch blocks are only for prefill chunks. Disable them at
                 # the context/generation boundary so generation uses normal KV
                 # pages before the first generation allocation.
@@ -3325,3 +3410,5 @@ class KVCacheManagerV2(BaseResourceManager):
 
     def reset_reuse_state(self):
         self.impl.clear_reusable_blocks()
+        if self.conversation_manager is not None:
+            self.conversation_manager.clear()
