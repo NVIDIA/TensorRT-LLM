@@ -59,7 +59,9 @@ def _req(**overrides):
 class StubScheduler:
     def __init__(self, timesteps=None):
         self.timesteps = torch.tensor(timesteps or [9, 3], dtype=torch.int64)
-        self.config = SimpleNamespace(num_train_timesteps=1000, flow_shift=1.0, use_karras_sigmas=True)
+        self.config = SimpleNamespace(
+            num_train_timesteps=1000, flow_shift=1.0, use_karras_sigmas=True
+        )
         self.set_timesteps_calls = []
 
     def set_timesteps(self, num_steps, device=None):
@@ -142,7 +144,9 @@ class TestTransferConfig:
         # mirrors vllm-omni's *serving* behavior where an omitted value
         # materializes to 1.0 before resolve, leaving the preset unapplied.
         assert cfg.guidance_scale == 1.0
-        assert resolve_transfer_config({"edge": True}, _req(guidance_scale=6.0)).guidance_scale == 6.0
+        assert (
+            resolve_transfer_config({"edge": True}, _req(guidance_scale=6.0)).guidance_scale == 6.0
+        )
         assert cfg.control_guidance == 1.5
         assert cfg.flow_shift == 10.0
         assert cfg.num_video_frames_per_chunk == 93
@@ -297,7 +301,11 @@ class TestDiffuseTransferCFG:
             control_guidance=control_guidance,
             control_guidance_interval=None,
             control_latents=[torch.zeros_like(latents)],
-            shared_kwargs={"video_shape": (1, 1, 1), "fps": 24.0, "noisy_frame_mask": velocity_mask},
+            shared_kwargs={
+                "video_shape": (1, 1, 1),
+                "fps": 24.0,
+                "noisy_frame_mask": velocity_mask,
+            },
             velocity_mask=velocity_mask,
             condition_latents=torch.zeros_like(latents),
         )
@@ -306,7 +314,9 @@ class TestDiffuseTransferCFG:
 
     def test_applies_control_and_text_cfg(self):
         pipeline = _make_pipeline()
-        result, latents = self._run(pipeline, timesteps=[7], guidance_scale=3.0, control_guidance=1.5)
+        result, latents = self._run(
+            pipeline, timesteps=[7], guidance_scale=3.0, control_guidance=1.5
+        )
         # cond_full=102, no_control=2, uncond=101:
         # control_cond = 2 + 1.5*(102-2) = 152; 101 + 3*(152-101) = 254
         assert [(c["token"], c["has_control"]) for c in pipeline.transformer.calls] == [
@@ -318,7 +328,9 @@ class TestDiffuseTransferCFG:
 
     def test_skips_idle_cfg_branches(self):
         control_only = _make_pipeline()
-        result, latents = self._run(control_only, timesteps=[7], guidance_scale=1.0, control_guidance=1.5)
+        result, latents = self._run(
+            control_only, timesteps=[7], guidance_scale=1.0, control_guidance=1.5
+        )
         assert [(c["token"], c["has_control"]) for c in control_only.transformer.calls] == [
             (2, True),
             (2, False),
@@ -326,7 +338,9 @@ class TestDiffuseTransferCFG:
         torch.testing.assert_close(result, torch.full_like(latents, 152.0))
 
         text_only = _make_pipeline()
-        result, latents = self._run(text_only, timesteps=[7], guidance_scale=3.0, control_guidance=1.0)
+        result, latents = self._run(
+            text_only, timesteps=[7], guidance_scale=3.0, control_guidance=1.0
+        )
         assert [(c["token"], c["has_control"]) for c in text_only.transformer.calls] == [
             (2, True),
             (1, True),
@@ -374,7 +388,7 @@ class TestForwardTransferChunks:
         captured = {"targets": [], "conditional_frames": [], "decode_calls": [], "flow_shifts": []}
 
         pipeline._transfer_bucket_size = lambda cfg, source_hw: (16, 16)
-        tokenized = iter([( _ids(2), _mask()), (_ids(1), _mask())])
+        tokenized = iter([(_ids(2), _mask()), (_ids(1), _mask())])
         pipeline._tokenize_prompt = lambda *args, **kwargs: next(tokenized)
         pipeline._set_flow_shift = lambda target, **kwargs: captured["flow_shifts"].append(target)
 
@@ -444,9 +458,13 @@ class TestForwardTransferChunks:
         )
         # First chunk target: frame0 = normalized black input, frame1 = white,
         # remainder filled by repeating the last conditional frame.
-        torch.testing.assert_close(captured["targets"][0][:, :, 0], torch.full((1, 3, 16, 16), -1.0))
+        torch.testing.assert_close(
+            captured["targets"][0][:, :, 0], torch.full((1, 3, 16, 16), -1.0)
+        )
         torch.testing.assert_close(captured["targets"][0][:, :, 1], torch.full((1, 3, 16, 16), 1.0))
-        torch.testing.assert_close(captured["targets"][0][:, :, 2:], torch.full((1, 3, 3, 16, 16), 1.0))
+        torch.testing.assert_close(
+            captured["targets"][0][:, :, 2:], torch.full((1, 3, 3, 16, 16), 1.0)
+        )
 
 
 class TestFindClosestTargetSize:
@@ -483,7 +501,9 @@ class TestFindClosestTargetSize:
         assert find_closest_target_size(500, 1000, 720) == (1280, 720)
 
     def test_resolution_accepts_int_or_str(self):
-        assert find_closest_target_size(720, 1280, 720) == find_closest_target_size(720, 1280, "720")
+        assert find_closest_target_size(720, 1280, 720) == find_closest_target_size(
+            720, 1280, "720"
+        )
 
     def test_unknown_resolution_raises(self):
         with pytest.raises(ValueError, match="Unknown Cosmos3 transfer resolution"):

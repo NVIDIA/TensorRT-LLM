@@ -30,8 +30,10 @@ from transformers import Qwen2Tokenizer
 try:
     from tqdm.auto import tqdm
 except ImportError:  # pragma: no cover - tqdm is optional at runtime.
+
     def tqdm(iterable, **kwargs):
         return iterable
+
 
 from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer, PipelineOutput
 from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
@@ -417,7 +419,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             condition_video_latent_indexes=extra_params.get("condition_video_latent_indexes"),
             condition_video_keep=extra_params.get("condition_video_keep"),
             flow_shift=extra_params.get("flow_shift"),
-            transfer_config=transfer_config
+            transfer_config=transfer_config,
         )
 
     def _apply_metadata_templates(
@@ -886,7 +888,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         condition_video_latent_indexes: Any = None,
         condition_video_keep: Any = None,
         flow_shift: Optional[float] = None,
-        transfer_config: Optional[Cosmos3TransferConfig] = None
+        transfer_config: Optional[Cosmos3TransferConfig] = None,
     ):
         pipeline_start = time.time()
         timer = CudaPhaseTimer()
@@ -918,7 +920,9 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             if is_t2i:
                 raise ValueError("Cosmos3 transfer inference is supported only for video outputs.")
             if enable_audio:
-                raise ValueError("Cosmos3 transfer inference cannot be combined with sound generation.")
+                raise ValueError(
+                    "Cosmos3 transfer inference cannot be combined with sound generation."
+                )
         guidance_interval = None
         if is_t2i:
             if image is not None:
@@ -1296,7 +1300,9 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         )
 
     @staticmethod
-    def _first_transfer_control_hw(transfer_config: Cosmos3TransferConfig) -> tuple[int, int] | None:
+    def _first_transfer_control_hw(
+        transfer_config: Cosmos3TransferConfig,
+    ) -> tuple[int, int] | None:
         for hint in transfer_config.ordered_hints:
             if hint.control is not None:
                 detected = media_hw(hint.control)
@@ -1320,7 +1326,9 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             return 1, frames_per_chunk
         stride = frames_per_chunk - conditional_frames
         if stride <= 0:
-            raise ValueError("Cosmos3 transfer num_conditional_frames must be smaller than num_video_frames_per_chunk.")
+            raise ValueError(
+                "Cosmos3 transfer num_conditional_frames must be smaller than num_video_frames_per_chunk."
+            )
         remaining = total_frames - frames_per_chunk
         extra_chunks = remaining // stride + (1 if remaining % stride else 0)
         return 1 + extra_chunks, stride
@@ -1432,9 +1440,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             for t in transfer_steps:
                 timestep = t.expand(latents.shape[0])
                 step_guidance = (
-                    float(guidance_scale)
-                    if self._transfer_active_at(t, guidance_interval)
-                    else 1.0
+                    float(guidance_scale) if self._transfer_active_at(t, guidance_interval) else 1.0
                 )
                 step_control = (
                     float(control_guidance)
@@ -1484,25 +1490,30 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
 
         return latents
 
-    def _forward_transfer(self,
-                          *,
-                          prompt: str,
-                          negative_prompt: str,
-                          height: int,
-                          width: int,
-                          max_frames: int,
-                          num_inference_steps: int,
-                          max_sequence_length,
-                          use_system_prompt,
-                          use_duration_template: str,
-                          use_resolution_template: str,
-                          seed,
-                          transfer_config: Cosmos3TransferConfig,
-                          video: Any
+    def _forward_transfer(
+        self,
+        *,
+        prompt: str,
+        negative_prompt: str,
+        height: int,
+        width: int,
+        max_frames: int,
+        num_inference_steps: int,
+        max_sequence_length,
+        use_system_prompt,
+        use_duration_template: str,
+        use_resolution_template: str,
+        seed,
+        transfer_config: Cosmos3TransferConfig,
+        video: Any,
     ) -> PipelineOutput:
         input_frames = None
         transfer_input_fps = self._video_payload_fps(video) if video is not None else None
-        source_hw = media_hw(video) if video is not None else self._first_transfer_control_hw(transfer_config)
+        source_hw = (
+            media_hw(video)
+            if video is not None
+            else self._first_transfer_control_hw(transfer_config)
+        )
         height, width = self._transfer_bucket_size(transfer_config, source_hw)
         if self.rank == 0:
             logger.info(
@@ -1538,20 +1549,28 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         if transfer_config.num_frames is not None:
             total_frames = min(total_frames, int(transfer_config.num_frames))
         total_frames = max(1, total_frames)
-        per_hint_frames = {key: pad_temporal_frames(frames, total_frames) for key, frames in per_hint_frames.items()}
+        per_hint_frames = {
+            key: pad_temporal_frames(frames, total_frames)
+            for key, frames in per_hint_frames.items()
+        }
         if input_frames is not None:
             input_frames = pad_temporal_frames(input_frames, total_frames)
 
         temporal_compression = self.vae_scale_factor_temporal
         chunk_frames = 1 if total_frames == 1 else transfer_config.num_video_frames_per_chunk
-        chunk_frames = math.ceil((chunk_frames - 1) / temporal_compression) * temporal_compression + 1
+        chunk_frames = (
+            math.ceil((chunk_frames - 1) / temporal_compression) * temporal_compression + 1
+        )
         num_chunks, stride = self._get_transfer_num_chunks(
             total_frames,
             chunk_frames,
             transfer_config.num_conditional_frames,
         )
         padded_frames = max(total_frames, chunk_frames)
-        per_hint_frames = {key: pad_temporal_frames(frames, padded_frames) for key, frames in per_hint_frames.items()}
+        per_hint_frames = {
+            key: pad_temporal_frames(frames, padded_frames)
+            for key, frames in per_hint_frames.items()
+        }
         if input_frames is not None:
             input_frames = pad_temporal_frames(input_frames, padded_frames)
 
@@ -1574,10 +1593,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             if transfer_config.flow_shift is not None
             else COSMOS3_V2V_DEFAULT_FLOW_SHIFT
         )
-        max_sequence_length = (
-            max_sequence_length
-            or COSMOS3_720P_PARAMS["max_sequence_length"]
-        )
+        max_sequence_length = max_sequence_length or COSMOS3_720P_PARAMS["max_sequence_length"]
         self._guidance_scale = guidance_scale
         self._num_timesteps = num_inference_steps
         self._set_flow_shift(flow_shift_target, use_karras_sigmas=False)
@@ -1604,9 +1620,10 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         )
 
         output_chunks: list[torch.Tensor] = []
-        control_chunks_per_hint: dict[str, list[torch.Tensor]] = {key: [] for key in per_hint_frames}
+        control_chunks_per_hint: dict[str, list[torch.Tensor]] = {
+            key: [] for key in per_hint_frames
+        }
         previous_output: torch.Tensor | None = None
-
 
         for chunk_id in range(num_chunks):
             start_frame = chunk_id * stride
@@ -1623,7 +1640,9 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
 
             if chunk_id == 0 and transfer_config.num_first_chunk_conditional_frames > 0:
                 if input_frames is None:
-                    raise ValueError("Cosmos3 transfer num_first_chunk_conditional_frames > 0 requires a video input.")
+                    raise ValueError(
+                        "Cosmos3 transfer num_first_chunk_conditional_frames > 0 requires a video input."
+                    )
                 current_conditional_frames = min(
                     transfer_config.num_first_chunk_conditional_frames,
                     input_frames.shape[1],
@@ -1636,7 +1655,9 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                     )
                     target_norm[:, :, :current_conditional_frames] = input_cond
                     if current_conditional_frames < chunk_frames:
-                        fill = target_norm[:, :, current_conditional_frames - 1 : current_conditional_frames]
+                        fill = target_norm[
+                            :, :, current_conditional_frames - 1 : current_conditional_frames
+                        ]
                         target_norm[:, :, current_conditional_frames:] = fill.expand(
                             -1,
                             -1,
@@ -1655,7 +1676,9 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                         :, :, -current_conditional_frames:
                     ].to(target_norm)
                     if current_conditional_frames < chunk_frames:
-                        fill = target_norm[:, :, current_conditional_frames - 1 : current_conditional_frames]
+                        fill = target_norm[
+                            :, :, current_conditional_frames - 1 : current_conditional_frames
+                        ]
                         target_norm[:, :, current_conditional_frames:] = fill.expand(
                             -1,
                             -1,
@@ -1708,7 +1731,8 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
 
         full_output = torch.cat(output_chunks, dim=2)[:, :, :total_frames]
         full_controls = {
-            key: torch.cat(chunks, dim=2)[:, :, :total_frames] for key, chunks in control_chunks_per_hint.items()
+            key: torch.cat(chunks, dim=2)[:, :, :total_frames]
+            for key, chunks in control_chunks_per_hint.items()
         }
 
         if transfer_config.show_control_condition:
@@ -1716,7 +1740,9 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             all_controls = all_controls.to(full_output)
             full_output = torch.cat([all_controls, full_output], dim=-1)
         if transfer_config.show_input and input_frames is not None:
-            normalized_input = uint8_cthw_to_normalized_5d(input_frames[:, :total_frames], dtype=torch.float32)
+            normalized_input = uint8_cthw_to_normalized_5d(
+                input_frames[:, :total_frames], dtype=torch.float32
+            )
             full_output = torch.cat([normalized_input.to(full_output), full_output], dim=-1)
         video = postprocess_video_tensor(full_output)
         return PipelineOutput(
