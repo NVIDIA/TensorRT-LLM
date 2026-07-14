@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -19,6 +19,7 @@ import sys
 import traceback
 import warnings
 from functools import partial
+from pathlib import Path
 from typing import Any, Generator
 
 try:
@@ -38,6 +39,7 @@ from tensorrt_llm._utils import print_all_stacks
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from integration.defs import test_list_parser
+from test_common import s3_output
 
 
 def dump_threads(signum, frame):
@@ -91,6 +93,8 @@ def pytest_configure(config):
         print_info(f"  XML path: {periodic_junit_xmlpath}")
         print_info(f"  Batch size: {periodic_batch_size}")
 
+    s3_output.register_plugin(config)
+
 
 @pytest.hookimpl(wrapper=True)
 def pytest_runtest_protocol(item, nextitem):
@@ -103,6 +107,9 @@ def pytest_runtest_protocol(item, nextitem):
             import os
 
             import torch
+            if torch.cuda.device_count() == 0:
+                return
+
             worker_count = int(os.environ.get('PYTEST_XDIST_WORKER_COUNT', 1))
 
             if (torch.cuda.memory_reserved(0) + torch.cuda.memory_allocated(0)
@@ -197,6 +204,34 @@ def pytest_addoption(parser):
         help=
         "Save unfinished test name to unfinished_test.txt. Only used with --periodic-junit.",
     )
+    # S3 upload options — must be registered here so they are recognized when
+    # pytest is run with unittest paths (integration test_unittests.py spawns such a run).
+    parser.addoption("--output-dir",
+                     action="store",
+                     default=None,
+                     help="output directory for test logs")
+    s3_output.add_options(parser)
+
+
+def _is_cpu_only_markexpr(config) -> bool:
+    markexpr = getattr(config.option, "markexpr", "") or ""
+    return "cpu_only" in markexpr and "not cpu_only" not in markexpr
+
+
+def pytest_ignore_collect(collection_path, config):
+    if not _is_cpu_only_markexpr(config):
+        return None
+
+    path = Path(str(collection_path))
+    if path.name == "conftest.py" or path.suffix != ".py":
+        return None
+    if not (path.name.startswith("test_") or path.name.endswith("_test.py")):
+        return None
+
+    try:
+        return "pytest.mark.cpu_only" not in path.read_text()
+    except OSError:
+        return None
 
 
 def apply_waives_ut(waives_file, items: list[pytest.Item], config):

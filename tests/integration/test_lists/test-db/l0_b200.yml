@@ -15,6 +15,7 @@ l0_b200:
       backend: pytorch
   tests:
   # ------------- PyTorch tests ---------------
+  - unittest/others/test_kv_cache_transceiver.py::test_cpp_nixl_sync_transfer_stress
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8B::test_nvfp4
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8B::test_nvfp4_streaming[stream_interval_4]
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8B::test_nvfp4_streaming[stream_interval_64]
@@ -54,6 +55,7 @@ l0_b200:
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_w4a16_mxfp4[latency-TRTLLM]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B_Instruct_2507::test_skip_softmax_attention[target_sparsity_0.9-fp8kv=True]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_5_35B_A3B::test_fp8[enable_block_reuse=True]
+  - accuracy/test_llm_api_pytorch.py::TestQwen3_6_35B_A3B::test_nvfp4[TRTLLM]
   - accuracy/test_llm_api_pytorch_multimodal.py::TestNanoV3Omni::test_auto_dtype[fp8_mmmu_encoder_cuda_graph]
   - accuracy/test_epd_disagg_multimodal.py::TestVideoMMEEPD::test_disaggregated_videomme[qwen3vl_2b_instruct]
   - accuracy/test_epd_disagg_multimodal.py::TestVideoMMEEPD::test_disaggregated_videomme[nemotron_nano_v3_omni_nvfp4]
@@ -122,6 +124,10 @@ l0_b200:
   - unittest/_torch/modules/test_mla_helix.py
   - unittest/_torch/modules/test_fused_add_rms_norm_quant.py
   - unittest/_torch/modules/test_fused_activation_quant.py
+  - unittest/_torch/modules/fused_ops/test_rmsnorm_fp4_quant.py
+  - unittest/_torch/modules/fused_ops/test_gelu_tanh_mul_fp4_quant.py
+  - unittest/_torch/modules/fused_ops/test_rmsnorm_residual_add.py
+  - unittest/_torch/modules/test_gemma4_fused_qkv_prep.py
   - unittest/_torch/modules/test_awq_quantization.py
   - unittest/_torch/modules/test_triton_linear.py
   - unittest/_torch/modules/test_group_rmn_norm.py
@@ -221,6 +227,7 @@ l0_b200:
   - unittest/_torch/visual_gen/test_cache_dit.py
   - unittest/_torch/visual_gen/test_quant_ops.py
   - unittest/_torch/visual_gen/test_attention_cute_dsl.py
+  - unittest/_torch/visual_gen/test_attention_cute_dsl_vsa.py
   - unittest/_torch/visual_gen/test_attention_trtllm_sage.py
   - unittest/_torch/visual_gen/test_attention_integration.py
   - unittest/_torch/visual_gen/test_attention_perf.py
@@ -238,6 +245,7 @@ l0_b200:
   - unittest/_torch/visual_gen/test_wan22_i2v_pipeline.py
   - unittest/_torch/visual_gen/test_wan22_t2v_pipeline.py
   - unittest/_torch/visual_gen/test_wan22_ti2v_5b_pipeline.py
+  - unittest/_torch/visual_gen/test_wan_vsa_pipeline.py
   - unittest/_torch/visual_gen/test_wan_vae.py
   - unittest/_torch/visual_gen/test_wan21_i2v_teacache.py
   - unittest/_torch/visual_gen/test_wan21_t2v_teacache.py
@@ -339,6 +347,7 @@ l0_b200:
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8B_Instruct_RocketKV::test_auto_dtype
   - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_1gpu[v1_kv_cache-True-True-trtllm-auto]
   - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_1gpu[v2_kv_cache-True-True-trtllm-auto]
+  - accuracy/test_llm_api_pytorch_multimodal.py::TestGemma4_26B_A4B::test_nvfp4
   - accuracy/test_llm_api_pytorch_multimodal.py::TestNanoV3Omni::test_auto_dtype[bf16]
   - accuracy/test_llm_api_pytorch_multimodal.py::TestNanoV3Omni::test_auto_dtype[nvfp4]
   # ------------- VisualGen single-GPU tests ---------------
@@ -348,6 +357,7 @@ l0_b200:
   - examples/visual_gen/test_visual_gen.py::test_flux2_lpips_against_golden
   - examples/visual_gen/test_visual_gen.py::test_ltx2_lpips_against_golden
   - examples/visual_gen/test_visual_gen.py::test_ltx2_cuda_graph_lpips_matches_eager
+  - examples/visual_gen/test_visual_gen.py::test_ltx2_cuda_graph_trtllm_backend
   - examples/visual_gen/test_visual_gen.py::test_wan21_t2v_lpips_against_golden
   - examples/visual_gen/test_visual_gen.py::test_wan22_t2v_lpips_against_golden
   # Measured on B200 with TRT-LLM commit 85665f5f from the staging main image:

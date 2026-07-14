@@ -8,8 +8,10 @@ from unittest.mock import MagicMock
 
 import torch
 from torch import nn
+from transformers import LlamaConfig
 
 from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.models import modeling_llama as modeling_llama_mod
 from tensorrt_llm._torch.modules import mla as mla_mod
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.modules.mla import MLA
@@ -93,6 +95,54 @@ def _moe_context(config, mapping):
     yield None
 
 
+def _tiny_llama_model(monkeypatch):
+    monkeypatch.setattr(modeling_llama_mod, "get_sm_version", lambda: 90)
+    llama_config = LlamaConfig(
+        architectures=["LlamaForCausalLM"],
+        attention_bias=False,
+        hidden_act="silu",
+        hidden_size=16,
+        intermediate_size=32,
+        max_position_embeddings=16,
+        mlp_bias=False,
+        num_attention_heads=2,
+        num_hidden_layers=2,
+        num_key_value_heads=2,
+        rms_norm_eps=1e-5,
+        tie_word_embeddings=False,
+        torch_dtype=torch.float32,
+        vocab_size=32,
+    )
+    return model_loader_mod.LlamaForCausalLM(
+        ModelConfig(
+            pretrained_config=llama_config,
+            max_num_tokens=16,
+            max_seq_len=16,
+        )
+    )
+
+
+def _llama_alias_state(model):
+    layers = model.model.layers
+    return {
+        "skip_norm": model.model.skip_norm,
+        "layer0_next_norm": layers[0].next_layer_layernorm is layers[1].input_layernorm,
+        "layer0_next_attn": layers[0].next_attn is layers[1].self_attn,
+        "layer1_skip_input_norm": layers[1].skip_input_layernorm,
+        "layer1_next_norm": layers[1].next_layer_layernorm is model.model.norm,
+        "layer1_next_attn": layers[1].next_attn is None,
+    }
+
+
+def _transform_guard_state(model):
+    return {
+        name: module._weights_transformed
+        for name, module in model.named_modules()
+        if hasattr(module, "_weights_transformed")
+        and not getattr(module, "_weights_removed", False)
+    }
+
+
 def _make_loader(monkeypatch, *, events, spec_config=None):
     llm_args = SimpleNamespace(load_format=LoadFormat.AUTO)
     loader = ModelLoader(
@@ -149,11 +199,15 @@ def test_mx_success_initializes_mapper_skips_weight_mapping_and_reload_works(mon
     assert kwargs["mapping"] is loader.mapping
     assert kwargs["model"] is model
     assert kwargs["source_identity"] is loader._source_identity
+    assert kwargs["allow_post_transform_weights"] is False
     assert loader._call_load_weights.call_count == 0
     checkpoint_loader.get_initialized_weight_mapper.assert_called_once()
     assert loader.weight_mapper is checkpoint_loader.get_initialized_weight_mapper.return_value
     checkpoint_loader.post_load_publish.assert_called_once_with(
-        model, checkpoint_dir="/ckpt", weights_preloaded=True
+        model,
+        checkpoint_dir="/ckpt",
+        weights_preloaded=True,
+        source_identity=loader._source_identity,
     )
 
     # reload() uses self.weight_mapper unconditionally; MX success must
@@ -201,7 +255,10 @@ def test_mx_partial_fallback_merges_returned_weights(monkeypatch):
     assert weights is fallback_weights
     assert mapper is loader.weight_mapper
     checkpoint_loader.post_load_publish.assert_called_once_with(
-        model, checkpoint_dir="/ckpt", weights_preloaded=True
+        model,
+        checkpoint_dir="/ckpt",
+        weights_preloaded=True,
+        source_identity=loader._source_identity,
     )
 
 
@@ -211,6 +268,7 @@ class _PostTransformMxLoader:
     def __init__(self, *, post_transform: bool) -> None:
         self._post_transform = post_transform
         self._weights_preloaded = True
+        self._disk_weight = MagicMock()
         self.load_weights = MagicMock(side_effect=self._load_weights)
         self.is_weights_preloaded = MagicMock(side_effect=lambda: self._weights_preloaded)
         self.get_initialized_weight_mapper = MagicMock(return_value=MagicMock())
@@ -221,18 +279,11 @@ class _PostTransformMxLoader:
         if self._post_transform and kwargs.get("allow_post_transform_weights") is False:
             self._post_transform = False
             self._weights_preloaded = False
-            return {"disk.weight": MagicMock()}
+            return {"disk.weight": self._disk_weight}
         return {}
 
     def is_post_transform_weights_preloaded(self) -> bool:
         return self._post_transform
-
-
-def _spec_config_needing_draft_weights():
-    return SimpleNamespace(
-        spec_dec_mode=SimpleNamespace(need_load_draft_weights=lambda: True),
-        speculative_model="/draft",
-    )
 
 
 def test_mx_post_transform_receiver_uses_staged_path_when_allowlisted(monkeypatch):
@@ -248,9 +299,13 @@ def test_mx_post_transform_receiver_uses_staged_path_when_allowlisted(monkeypatc
     model, _ = loader.load("/ckpt", checkpoint_loader)
 
     loader._call_load_weights.assert_not_called()
-    assert checkpoint_loader.load_weights.call_args.kwargs["allow_post_transform_weights"] is True
+    _args, kwargs = checkpoint_loader.load_weights.call_args
+    assert kwargs["allow_post_transform_weights"] is True
     checkpoint_loader.post_load_publish.assert_called_once_with(
-        model, checkpoint_dir="/ckpt", weights_preloaded=True
+        model,
+        checkpoint_dir="/ckpt",
+        weights_preloaded=True,
+        source_identity=loader._source_identity,
     )
     # Post-transform receivers skip transform_weights(), but the accepted
     # tensors are already in final layout. Keep the transform guard in sync so
@@ -261,41 +316,57 @@ def test_mx_post_transform_receiver_uses_staged_path_when_allowlisted(monkeypatc
     assert events == ["setup_aliases", "cache_derived_state"]
 
 
-def test_mx_post_transform_receiver_with_draft_weights_forces_disk_fallback(monkeypatch):
-    events = []
-    loader = _make_loader(
-        monkeypatch,
-        events=events,
-        spec_config=_spec_config_needing_draft_weights(),
-    )
-    monkeypatch.setattr(
-        ModelLoader,
-        "_MX_STAGED_RECEIVER_ALLOWLIST",
-        frozenset({(_TinyModel, ModelLoader._MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION)}),
-    )
+def test_default_mx_staged_receiver_allowlist_matches_real_tiny_llama(monkeypatch):
+    full_model = _tiny_llama_model(monkeypatch)
+    staged_model = _tiny_llama_model(monkeypatch)
     checkpoint_loader = _PostTransformMxLoader(post_transform=True)
 
-    model, _ = loader.load("/ckpt", checkpoint_loader)
-
-    primary_kwargs = checkpoint_loader.load_weights.call_args_list[0].kwargs
-    assert primary_kwargs["allow_post_transform_weights"] is False
-    assert loader._call_load_weights.call_count == 2
-    checkpoint_loader.post_load_publish.assert_called_once_with(
-        model, checkpoint_dir="/ckpt", weights_preloaded=False
+    ModelLoader._walk_full_post_load(full_model)
+    assert (
+        ModelLoader._should_run_mx_staged_receiver_path(
+            checkpoint_loader,
+            staged_model,
+            weights_preloaded=True,
+        )
+        is True
     )
-    assert model._weights_transformed is False
-    assert model.linear._weights_transformed is False
-    assert events == ["load_weights", "load_draft_weights", "post_load_weights"]
+
+    transform_weights_calls = []
+    for module in staged_model.modules():
+        transform_weights = getattr(module, "transform_weights", None)
+        if transform_weights is None:
+            continue
+
+        def _record_transform_weights(*_args, module=module, **_kwargs):
+            transform_weights_calls.append(type(module).__name__)
+
+        module.transform_weights = _record_transform_weights
+
+    ModelLoader._setup_aliases(staged_model)
+    ModelLoader._mark_weights_transformed(staged_model)
+    ModelLoader._walk_cache_state(staged_model)
+
+    assert transform_weights_calls == []
+    assert _llama_alias_state(staged_model) == _llama_alias_state(full_model)
+    assert _transform_guard_state(staged_model) == _transform_guard_state(full_model)
 
 
-def test_mx_post_transform_receiver_falls_back_when_allowlist_empty(monkeypatch):
+def test_mx_post_transform_receiver_falls_back_for_non_allowlisted_model(monkeypatch):
     events = []
     loader = _make_loader(monkeypatch, events=events)
     checkpoint_loader = _PostTransformMxLoader(post_transform=True)
 
-    loader.load("/ckpt", checkpoint_loader)
+    model, _ = loader.load("/ckpt", checkpoint_loader)
 
-    assert events == ["post_load_weights"]
+    _args, kwargs = checkpoint_loader.load_weights.call_args
+    assert kwargs["allow_post_transform_weights"] is False
+    assert checkpoint_loader.is_weights_preloaded() is False
+    assert loader._call_load_weights.call_count == 1
+    load_fn, weights, mapper = loader._call_load_weights.call_args.args
+    assert load_fn == model.load_weights
+    assert weights == {"disk.weight": checkpoint_loader._disk_weight}
+    assert mapper is loader.weight_mapper
+    assert events == ["load_weights", "post_load_weights"]
 
 
 def test_mx_fallback_runs_standard_weight_mapping(monkeypatch):
@@ -313,7 +384,10 @@ def test_mx_fallback_runs_standard_weight_mapping(monkeypatch):
     assert events[0] == "load_weights"
     assert "post_load_weights" in events
     checkpoint_loader.post_load_publish.assert_called_once_with(
-        model, checkpoint_dir="/ckpt", weights_preloaded=False
+        model,
+        checkpoint_dir="/ckpt",
+        weights_preloaded=False,
+        source_identity=loader._source_identity,
     )
 
 

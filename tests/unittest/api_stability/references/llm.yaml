@@ -135,10 +135,6 @@ methods:
         annotation: bool
         default: False
         status: beta
-      disable_flashinfer_sampling:
-        annotation: bool
-        default: False
-        status: prototype
       moe_config:
         annotation: tensorrt_llm.llmapi.llm_args.MoeConfig
         status: beta
@@ -164,6 +160,10 @@ methods:
         default: False
         status: prototype
       enable_early_first_token_response:
+        annotation: bool
+        default: False
+        status: prototype
+      enable_low_latency_host_dispatch:
         annotation: bool
         default: False
         status: prototype
@@ -295,10 +295,6 @@ methods:
         annotation: tensorrt_llm.llmapi.llm_args.LayerwiseBenchmarksConfig
         default: null
         status: prototype
-      video_pruning_rate:
-        annotation: Optional[float]
-        default: null
-        status: prototype
       model_kwargs:
         annotation: Optional[Dict[str, Any]]
         default: null
@@ -411,6 +407,10 @@ methods:
         annotation: Optional[float]
         default: 2
     return_annotation: List[dict]
+    status: beta
+  get_kv_cache_capacity:
+    parameters: {}
+    return_annotation: dict
     status: beta
   get_kv_cache_events_async:
     parameters:

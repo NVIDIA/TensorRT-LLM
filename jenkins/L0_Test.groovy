@@ -46,6 +46,8 @@ LLM_ROOT = "llm"
 ARTIFACT_PATH = env.artifactPath ? env.artifactPath : "sw-tensorrt-generic/llm-artifacts/${JOB_NAME}/${BUILD_NUMBER}"
 UPLOAD_PATH = env.uploadPath ? env.uploadPath : "sw-tensorrt-generic/llm-artifacts/${JOB_NAME}/${BUILD_NUMBER}"
 URM_ARTIFACTORY_BASE = "https://urm.nvidia.com/artifactory"
+ENABLE_UPLOAD_TEST_RESULTS = params.enableUploadTestResults != null ? params.enableUploadTestResults : true
+ENABLE_S3_ECHO_STDOUT = params.enableS3EchoStdout != null ? params.enableS3EchoStdout : false
 
 X86_64_TRIPLE = "x86_64-linux-gnu"
 AARCH64_TRIPLE = "aarch64-linux-gnu"
@@ -651,6 +653,12 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
     SlurmPartition partition = SlurmConfig.resolvePlatform(platform)
     SlurmCluster cluster = SlurmConfig.clusterConfig[partition.clusterName]
 
+    // Record which cluster this attempt ran on so a failed node is remembered
+    // against its own cluster (auto: platforms pick a cluster at random per attempt).
+    if (placementContext != null) {
+        placementContext.lastSlurmClusterName = partition.clusterName
+    }
+
     def entrypoint = SlurmConfig.containerRuntimeToEntrypoint[cluster.containerRuntime]
 
     // Create a unique suffix for the node name and workspace
@@ -678,8 +686,9 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
 
                 def mounts = getMountListForSlurmTest(cluster, false).join(",")
                 def slurmCommand = SlurmConfig.generateCommand(cluster, partition, nodeSecret, nodeName, Jenkins.instance.rootUrl, LLM_DOCKER_IMAGE, mounts)
-                def slurmCommandWithExclusion = trtllm_utils.addSlurmExcludeToCommand(slurmCommand, placementContext?.excludedSlurmNodeLists)
-                def slurmExcludeArg = trtllm_utils.buildSlurmExcludeArg(placementContext?.excludedSlurmNodeLists)
+                def clusterExcludes = placementContext?.excludedSlurmNodeListsByCluster?.get(partition.clusterName)
+                def slurmCommandWithExclusion = trtllm_utils.addSlurmExcludeToCommand(slurmCommand, clusterExcludes)
+                def slurmExcludeArg = trtllm_utils.buildSlurmExcludeArg(clusterExcludes)
                 if (slurmExcludeArg) {
                     if (slurmCommandWithExclusion != slurmCommand) {
                         echo "[INFRA-RETRY] ${stageName}: requesting SLURM retry placement exclusion: ${slurmExcludeArg}"
@@ -1039,6 +1048,11 @@ def getPytestBaseCommandLine(
         portEnvVars = "CONTAINER_PORT_START=${containerPortStart} CONTAINER_PORT_NUM=${containerPortNum}"
     }
 
+    def jUnitLogging = "out-err"
+    if (ENABLE_UPLOAD_TEST_RESULTS) {
+        jUnitLogging = "all"
+    }
+
     def testCmdLine = [
         "LLM_ROOT=${llmSrc}",
         "LLM_BACKEND_ROOT=${llmSrc}/triton_backend",
@@ -1059,7 +1073,7 @@ def getPytestBaseCommandLine(
         "--waives-file=${waivesFilePath}",
         "--output-dir=${outputPath}/",
         "--csv=${outputPath}/report.csv",
-        "-o junit_logging=out-err",
+        "-o junit_logging=${jUnitLogging}",
         "--cov=${llmSrc}/examples/",
         "--cov=${llmSrc}/tensorrt_llm/",
         "--cov=${trtllmWheelPath}/tensorrt_llm/",
@@ -1082,6 +1096,8 @@ def getPytestBaseCommandLine(
     if (stageName.contains("-Ray-")) {
         testCmdLine += ["--run-ray"]
     }
+    def unittestMarkExpr = (stageName.startsWith("CPU-")) ? "cpu_only and not disabled" : "not cpu_only"
+    testCmdLine += ["--unittest-markexpr='${unittestMarkExpr}'"]
     if (extraArgs) {
         testCmdLine += extraArgs
     }
@@ -1130,6 +1146,12 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
     SlurmPartition partition = SlurmConfig.resolvePlatform(platform)
     SlurmCluster cluster = SlurmConfig.clusterConfig[partition.clusterName]
 
+    // Record which cluster this attempt ran on so a failed node is remembered
+    // against its own cluster (auto: platforms pick a cluster at random per attempt).
+    if (placementContext != null) {
+        placementContext.lastSlurmClusterName = partition.clusterName
+    }
+
     // Create a unique suffix for the job name
     String customSuffix = "${env.BUILD_TAG}-${UUID.randomUUID().toString().replaceAll("-", "").substring(0, 6)}".toLowerCase()
     def jobUID = "${cluster.host}-multi_node_test-${customSuffix}"
@@ -1143,7 +1165,10 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
 
     try {
         // Run ssh command to start node in desired cluster via SLURM
-        withCredentials([string(credentialsId: 'TRTLLM_HF_TOKEN', variable: 'HF_TOKEN')]) {
+        withCredentials([
+            string(credentialsId: 'TRTLLM_HF_TOKEN', variable: 'HF_TOKEN'),
+            string(credentialsId: 'svc_tensorrt-swift-stack-key', variable: 'S3_SECRET_KEY'),
+        ]) {
             CloudManager.withSlurmSshCredentials(pipeline, partition.clusterName, cluster) { remote ->
             def tarName = BUILD_CONFIGS[config][TARNAME]
             def llmTarfile = "https://urm.nvidia.com/artifactory/${ARTIFACT_PATH}/${tarName}"
@@ -1166,19 +1191,20 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
             def scriptSubmitPathNode = "${jobWorkspace}/${jobUID}-slurm_submit.sh"
             def scriptTrackPathLocal = Utils.createTempLocation(pipeline, "./slurm_track.sh")
             def scriptTrackPathNode = "${jobWorkspace}/${jobUID}-slurm_track.sh"
+            def s3SecretKeyPathLocal = Utils.createTempLocation(pipeline, "./s3_secret_key")
+            def s3SecretKeyPathNode = "${jobWorkspace}/s3_secret_key"
             def coverageConfigFile = "${jobWorkspace}/.coveragerc"
 
             stage("Initialize Test") {
-                timeout(time: 30, unit: 'MINUTES') {
                 println("Selected Cluster: ${cluster.name}")
                 // Create Job Workspace folder in Frontend Node
                 Utils.exec(pipeline, script: Utils.sshUserCmd(remote, "\"mkdir -p ${jobWorkspace}\""), numRetries: 3)
 
                 // Download and Unzip Tar File
-                timeout(time: 15, unit: 'MINUTES') {
+                timeout(time: 30, unit: 'MINUTES') {
                     trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmPath} && wget -nv ${llmTarfile}")
-                    sh "cd ${llmPath} && tar -zxf ${BUILD_CONFIGS[config][TARNAME]}"
                 }
+                sh "cd ${llmPath} && tar -zxf ${BUILD_CONFIGS[config][TARNAME]}"
 
                 Utils.exec(pipeline, script: "echo \"Script for Slurm srun job to submit: \" && cat ${scriptRunLocalPath}")
                 Utils.copyFileToRemoteHost(
@@ -1236,6 +1262,19 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     waivesListPathNode
                 )
 
+                if (ENABLE_UPLOAD_TEST_RESULTS) {
+                    pipeline.writeFile(file: s3SecretKeyPathLocal, text: S3_SECRET_KEY)
+                    // Preserve the secret file mode through scp -p instead of issuing
+                    // an extra remote chmod, which adds another flaky SSH round trip.
+                    Utils.exec(pipeline, script: "chmod 600 ${s3SecretKeyPathLocal}")
+                    Utils.copyFileToRemoteHost(
+                        pipeline,
+                        remote,
+                        s3SecretKeyPathLocal,
+                        s3SecretKeyPathNode
+                    )
+                }
+
                 // generate .coveragerc in workspace and add file path to pytest command
                 sh """
                     touch ./.coveragerc
@@ -1259,12 +1298,29 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 if (nodeCount > 1) {
                     pytestUtil = "$llmSrcNode/tensorrt_llm/llmapi/trtllm-llmapi-launch"
                 }
+                def uploadPath = "${env.JOB_NAME}/${env.BUILD_NUMBER}"
 
                 def clusterDurationsArgsNode = []
                 if (useClusterDurations) {
                     def clusterKey = partition.clusterName.replaceAll('[^a-zA-Z0-9]', '_')
                     def clusterDurationsPathNode = "${llmSrcNode}/tests/integration/defs/.test_durations_${clusterKey}"
                     clusterDurationsArgsNode = ["--durations-path ${clusterDurationsPathNode}"]
+                }
+                def extraArgs = [
+                    "--test-list=$testListPathNode",
+                    "--splitting-algorithm least_duration",
+                    "--splits $splits",
+                    "--group $splitId",
+                    *clusterDurationsArgsNode,
+                ]
+                if (ENABLE_UPLOAD_TEST_RESULTS) {
+                    extraArgs += [
+                        "-s",
+                        "--s3-upload-path=${uploadPath}/${stageName}",
+                    ]
+                    if (ENABLE_S3_ECHO_STDOUT) {
+                        extraArgs += ["--s3-echo-stdout"]
+                    }
                 }
                 def pytestCommand = getPytestBaseCommandLine(
                     llmSrcNode,
@@ -1275,13 +1331,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     "__PLACEHOLDER_TRTLLM_WHL_PATH__",
                     "$jobWorkspace/.coveragerc",
                     pytestUtil,
-                    [
-                      "--test-list=$testListPathNode",
-                      "--splitting-algorithm least_duration",
-                      "--splits $splits",
-                      "--group $splitId",
-                      *clusterDurationsArgsNode,
-                    ]
+                    extraArgs,
                 ).join(" ")
 
                 // Generate Job Launch Script
@@ -1397,6 +1447,9 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     "--no-container-mount-home",
                     "--container-env=NVIDIA_IMEX_CHANNELS"
                 ]
+                if (ENABLE_UPLOAD_TEST_RESULTS) {
+                    srunArgs.add("--container-env=S3_SECRET_KEY")
+                }
                 envVarsToExport.each { varName, varValue ->
                     srunArgs.add("--container-env=${varName}")
                 }
@@ -1405,7 +1458,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 if (SlurmConfig.needsIdleGpuExemption(cluster)) {
                     exemptionComment = "--comment='${SlurmConfig.IDLE_GPU_EXEMPTION_PAYLOAD}'"
                 }
-                def slurmExcludeArg = trtllm_utils.buildSlurmExcludeArg(placementContext?.excludedSlurmNodeLists)
+                def slurmExcludeArg = trtllm_utils.buildSlurmExcludeArg(placementContext?.excludedSlurmNodeListsByCluster?.get(partition.clusterName))
                 def slurmExcludeDirective = slurmExcludeArg ? "#SBATCH ${slurmExcludeArg}" : ""
                 if (slurmExcludeArg) {
                     echo "[INFRA-RETRY] ${stageName}: requesting SLURM retry placement exclusion: ${slurmExcludeArg}"
@@ -1445,6 +1498,11 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     export pytestCommand="$pytestCommand"
                     export coverageConfigFile="$coverageConfigFile"
                     export HF_TOKEN=$HF_TOKEN
+                    if [ -f "${s3SecretKeyPathNode}" ]; then
+                        set +x
+                        export S3_SECRET_KEY="\$(cat "${s3SecretKeyPathNode}")"
+                        set -x
+                    fi
                     export NVIDIA_IMEX_CHANNELS=\${NVIDIA_IMEX_CHANNELS:-0}
                     export NVIDIA_VISIBLE_DEVICES=\${NVIDIA_VISIBLE_DEVICES:-\$(seq -s, 0 \$((\$(nvidia-smi --query-gpu=count -i 0 --format=csv,noheader)-1)))}
                     ${envExportStatements}
@@ -1516,6 +1574,11 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     waivesListPathNode,
                     coverageConfigFile
                 ]
+                if (ENABLE_UPLOAD_TEST_RESULTS) {
+                    filesToKeepWhenRetry += [
+                        s3SecretKeyPathNode
+                    ]
+                }
                 def findKeepWhenRetryArgs = filesToKeepWhenRetry.collect { " ! -name \"\$(basename \"${it}\")\"" }.join("")
 
                 def scriptSubmit = """#!/bin/bash
@@ -1554,7 +1617,6 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     scriptSubmitPathNode,
                     true
                 )
-                } // timeout 30 min
             }
 
             stage("[${stageName}] Run Pytest") {
@@ -1764,18 +1826,25 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
   echo "Run Slurm job with native sbatch: $runWithSbatch"
 
   def attempt = 0
-  def avoidedSlurmNodeLists = []
+  // Avoided SLURM nodes keyed by cluster. The platform can resolve to a
+  // different cluster on each attempt (auto: platforms pick one at random), and
+  // a node name from one cluster is unknown to another's controller -- passing
+  // it to --exclude makes sbatch hard-fail with "Invalid node name specified".
+  // Keying by cluster lets each attempt exclude only nodes that belong to the
+  // cluster it actually submits to.
+  def avoidedSlurmNodeListsByCluster = [:]
 
   while (true) {
     attempt++
     Map attemptPlacementContext = [
-      excludedSlurmNodeLists: avoidedSlurmNodeLists.collect()
+      excludedSlurmNodeListsByCluster: avoidedSlurmNodeListsByCluster.collectEntries { c, ns -> [(c): ns.collect()] }
     ]
     try {
       if (attempt > 1) {
         echo "[INFRA-RETRY] ${stageName}: Starting attempt ${attempt} of ${SLURM_INFRA_RETRY_MAX + 1}"
-        if (!avoidedSlurmNodeLists.isEmpty()) {
-          echo "[INFRA-RETRY] ${stageName}: avoiding prior SLURM node list(s): ${avoidedSlurmNodeLists.join(', ')}"
+        if (!avoidedSlurmNodeListsByCluster.isEmpty()) {
+          echo "[INFRA-RETRY] ${stageName}: avoiding prior SLURM node list(s): " +
+               avoidedSlurmNodeListsByCluster.collect { c, ns -> "${c}: ${ns.join(' ')}" }.join('; ')
         }
       }
 
@@ -1817,7 +1886,7 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
       if (c instanceof PipelineInterruption) throw e
       if (!(c instanceof InfraFailure))      throw e   // UserFailure -> don't retry
 
-      rememberAvoidedSlurmNodeLists(avoidedSlurmNodeLists, attemptPlacementContext.lastSlurmNodeList, stageName)
+      rememberAvoidedSlurmNodeLists(avoidedSlurmNodeListsByCluster, attemptPlacementContext.lastSlurmClusterName, attemptPlacementContext.lastSlurmNodeList, stageName)
 
       def effectiveMax = (c.severity == InfraFailure.PERSISTENT) ? 1 : SLURM_INFRA_RETRY_MAX
 
@@ -2054,17 +2123,29 @@ def rememberAvoidedKubernetesHostNodes(List avoidedNodes, def nodes, String stag
     }
 }
 
-def rememberAvoidedSlurmNodeLists(List avoidedNodeLists, def nodes, String stageName)
+def rememberAvoidedSlurmNodeLists(Map avoidedNodeListsByCluster, String clusterName, def nodes, String stageName)
 {
+    // Without the cluster the node ran on we can't safely exclude it (a node name
+    // is only valid on its own cluster's controller), so skip -- degrading to no
+    // avoidance rather than risking a cross-cluster "Invalid node name" submit.
+    if (!clusterName) {
+        return
+    }
     def nodeLists = trtllm_utils.normalizeSlurmNodeLists(nodes)
+    if (nodeLists.isEmpty()) {
+        return
+    }
+    def clusterNodeLists = avoidedNodeListsByCluster.get(clusterName)
+    if (clusterNodeLists == null) {
+        clusterNodeLists = []
+        avoidedNodeListsByCluster.put(clusterName, clusterNodeLists)
+    }
     nodeLists.each { nodeList ->
-        if (!avoidedNodeLists.contains(nodeList)) {
-            avoidedNodeLists << nodeList
+        if (!clusterNodeLists.contains(nodeList)) {
+            clusterNodeLists << nodeList
         }
     }
-    if (!nodeLists.isEmpty()) {
-        echo "[INFRA-RETRY] ${stageName}: recorded SLURM node list(s) for retry avoidance: ${nodeLists.join(', ')}"
-    }
+    echo "[INFRA-RETRY] ${stageName}: recorded SLURM node list(s) for retry avoidance on ${clusterName}: ${nodeLists.join(', ')}"
 }
 
 def readSlurmWorkspaceFile(def pipeline, Map remote, String path, String stageName, int numRetries=1)
@@ -2396,6 +2477,37 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                         memory: ${BUILD_MEMORY_LIMIT}
                         ephemeral-storage: 200Gi
                     imagePullPolicy: Always"""
+        nodeLabelPrefix = "cpu"
+        break
+    case "cpu":
+        containerConfig = """
+                  - name: trt-llm
+                    image: ${image}
+                    command: ['sleep', ${POD_TIMEOUT_SECONDS_TEST}]
+                    tty: true
+                    resources:
+                      requests:
+                        cpu: ${TESTER_CORES}
+                        memory: ${TESTER_MEMORY}
+                        ephemeral-storage: 300Gi
+                      limits:
+                        cpu: ${TESTER_CORES}
+                        memory: ${TESTER_MEMORY}
+                        ephemeral-storage: 300Gi
+                    imagePullPolicy: Always
+                    volumeMounts:
+                    - name: dshm
+                      mountPath: /dev/shm
+                    - name: scratch-trt-llm-data
+                      mountPath: /scratch.trt_llm_data
+                      readOnly: true
+                    - name: sw-tensorrt-pvc
+                      mountPath: "/mnt/sw-tensorrt-pvc"
+                      readOnly: false
+                    securityContext:
+                      capabilities:
+                        add:
+                        - SYS_ADMIN"""
         nodeLabelPrefix = "cpu"
         break
     default:
@@ -2846,6 +2958,9 @@ def getMakoArgsFromStageName(stageName, parseSysinfo=false) {
         // If stageName contains "-AutoDeploy-", add "backend=autodeploy" to makoArgs
         // At this point, only tests with backend=autodeploy or unspecified backend will be run
         makoArgs += ["backend=autodeploy"]
+    } else if (stageName.contains("-Generic-")) {
+        // Generic stages select tests by marker expression rather than backend ownership.
+        makoArgs += ["backend=generic"]
     } else if (stageName.contains("-Verl-")) {
         // If stageName contains "-Verl-", add "backend=verl" to makoArgs
         // At this point, only tests with backend=verl or unspecified backend will be run
@@ -2889,9 +3004,19 @@ def renderTestDB(pipeline, testContext, llmSrc, stageName, preDefinedMakoOpts=nu
     def makoOpts = preDefinedMakoOpts
 
     if (!makoOpts) {
-        def scriptPath = "${llmSrc}/tests/integration/defs/sysinfo/get_sysinfo.py"
         def makoArgs = getMakoArgsFromStageName(stageName)
-        makoOpts = getMakoOpts(scriptPath, makoArgs)
+        if (stageName.startsWith("CPU-")) {
+            def cpuName = env.targetArch == AARCH64_TRIPLE ? "aarch64" : "x86_64"
+            makoOpts = transformMakoArgsToJson(
+                ["Mako options:"] + makoArgs + [
+                    "system_gpu_count=0",
+                    "cpu=${cpuName}",
+                    "linux_distribution_name=ubuntu"
+                ])
+        } else {
+            def scriptPath = "${llmSrc}/tests/integration/defs/sysinfo/get_sysinfo.py"
+            makoOpts = getMakoOpts(scriptPath, makoArgs)
+        }
     }
 
     sh "pip3 install --extra-index-url https://urm.nvidia.com/artifactory/api/pypi/sw-tensorrt-pypi/simple --ignore-installed trt-test-db==1.8.5+bc6df7"
@@ -3480,14 +3605,17 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
     // Step 2: run tests
     stage ("Setup Environment")
     {
-        timeout(time: 45, unit: 'MINUTES') {
         // Random sleep to avoid resource contention
         sleep(10 * Math.random())
         sh "curl ifconfig.me || true"
         sh "nproc && free -g && hostname"
         echoNodeAndGpuInfo(pipeline, stageName)
         sh "cat ${MODEL_CACHE_DIR}/README"
-        sh "nvidia-smi && nvidia-smi -q && nvidia-smi topo -m"
+        if (stageName.startsWith("CPU-")) {
+            sh "ln -s /usr/local/cuda/compat/lib.real /usr/local/cuda/compat/lib"
+        } else {
+            sh "nvidia-smi && nvidia-smi -q && nvidia-smi topo -m"
+        }
         sh "df -h"
 
         // setup HF_HOME to cache model and datasets
@@ -3505,17 +3633,18 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         // download TRT-LLM tarfile
         def tarName = BUILD_CONFIGS[config][TARNAME]
         def llmTarfile = "https://urm.nvidia.com/artifactory/${ARTIFACT_PATH}/${tarName}"
-        timeout(time: 15, unit: 'MINUTES') {
+        timeout(time: 30, unit: 'MINUTES') {
             trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmPath} && wget -nv ${llmTarfile}")
-            sh "cd ${llmPath} && tar -zxf ${tarName}"
         }
+        sh "cd ${llmPath} && tar -zxf ${tarName}"
 
         // install python package
-        timeout(time: 30, unit: 'MINUTES') {
+        timeout(time: 45, unit: 'MINUTES') {
             if (env.alternativeTRT) {
                 sh "cd ${llmSrc} && sed -i 's#tensorrt~=.*\$#tensorrt#g' requirements.txt && cat requirements.txt"
             }
             trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmSrc} && pip3 install -r requirements-dev.txt")
+            trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install opencv-python-headless")
             if (stageName.contains("-Ray-")) {
                 trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install ray[default]==2.55.1")
             }
@@ -3524,14 +3653,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             }
         }
 
-        trtllm_utils.llmExecStepWithRetry(pipeline, script: "mkdir -p /opt/tritonserver/backends/tensorrtllm")
-        def isAarch64 = config.contains("aarch64")
-        if (!isAarch64) {
-            trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmPath} && cp TensorRT-LLM/triton_backend/inflight_batcher_llm/libtriton_tensorrtllm.so /opt/tritonserver/backends/tensorrtllm/")
-            trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmPath} && cp TensorRT-LLM/triton_backend/inflight_batcher_llm/trtllmExecutorWorker /opt/tritonserver/backends/tensorrtllm/")
-        }
         trtllm_utils.llmExecStepWithRetry(pipeline, script: "git config --global --add safe.directory \"*\"")
-        } // timeout 45 min
     }
 
     if (testFilter[(DEBUG_MODE)]) {
@@ -3658,10 +3780,21 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         def hostNodeName = getHostNodeName()
         def containerPortStart = getStartingPortForHost(hostNodeName, stageName)
         def containerPortNum = GlobalState.PORT_SECTION_SIZE
+        def uploadPath = UPLOAD_PATH.replaceFirst("sw-tensorrt-generic/llm-artifacts/LLM/", "")
 
         // Some clusters do not allow dmesg -C so we add || true
         // Temporarily disable to reduce the log size
         // sh 'if [ "$(id -u)" -eq 0 ]; then dmesg -C || true; fi'
+        def extraArgs = [*clusterDurationsArgs]
+        if (ENABLE_UPLOAD_TEST_RESULTS) {
+            extraArgs += [
+                "-s",
+                "--s3-upload-path=${uploadPath}/${stageName}",
+            ]
+            if (ENABLE_S3_ECHO_STDOUT) {
+                extraArgs += ["--s3-echo-stdout"]
+            }
+        }
         def pytestCommand = getPytestBaseCommandLine(
             llmSrc,
             stageName,
@@ -3671,7 +3804,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             TRTLLM_WHL_PATH,
             coverageConfigFile,
             "",  // pytestUtil
-            clusterDurationsArgs,
+            extraArgs,  // extraArgs
             containerPortStart,
             containerPortNum
         )
@@ -3696,6 +3829,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                     usernameVariable: 'GITLAB_API_USER',
                     passwordVariable: 'GITLAB_API_TOKEN'
                 ),
+                string(credentialsId: 'svc_tensorrt-swift-stack-key', variable: 'S3_SECRET_KEY'),
                 string(credentialsId: 'llm_evaltool_repo_url', variable: 'EVALTOOL_REPO_URL')
             ]) {
                 sh "env | sort"
@@ -4045,7 +4179,7 @@ def runLLMBuild(
     }
 
     withCredentials([usernamePassword(credentialsId: "urm-artifactory-creds", usernameVariable: 'CONAN_LOGIN_USERNAME', passwordVariable: 'CONAN_PASSWORD')]) {
-        trtllm_utils.llmExecStepWithRetry(pipeline, script: "#!/bin/bash \n" + "cd tensorrt_llm/ && python3 scripts/build_wheel.py --use_ccache -G Ninja -j ${BUILD_JOBS} -D 'WARNING_IS_ERROR=ON' ${buildArgs}${platNameArg}")
+        trtllm_utils.llmExecStepWithRetry(pipeline, script: "#!/bin/bash \n" + "cd tensorrt_llm/ && python3 scripts/build_wheel.py --use_ccache -G Ninja -j ${BUILD_JOBS} -D 'WARNING_IS_ERROR=ON' --extra-cmake-vars ENABLE_BOLT_COMPATIBLE=ON ${buildArgs}${platNameArg}")
     }
     if (env.alternativeTRT) {
         sh "bash -c 'pip3 show tensorrt || true'"
@@ -4268,12 +4402,66 @@ def runKubernetesPodWithInfraRetry(Map opts = [:], pipeline, podSpec, containerN
 
     // DEBUG_MODE preserves the existing 2-hour-input human-inspection workflow
     // inside runLLMTestlistOnPlatform's finallyRunner: a single attempt only.
-    // singleAttempt (per-call opt) opts out of the retry loop for the same
-    // reason at the call site -- e.g. SLURM dispatcher pods rely on their
-    // inner SLURM retry and don't want an outer pod-level retry budget.
-    if (singleAttempt || testFilter[(DEBUG_MODE)]) {
+    if (testFilter[(DEBUG_MODE)]) {
         trtllm_utils.launchKubernetesPod(pipeline, podSpec, containerName, { runner("", true, null) })
         return
+    }
+
+    // singleAttempt opts out of the outer pod-level *execution* retry: the inner
+    // retry (e.g. SLURM) owns re-runs, and re-running after work has started
+    // could double-submit. But a failure *before* the runner body begins is a
+    // pod/agent launch failure (the JNLP agent never came online, the node was
+    // pulled during provisioning, etc.): nothing has been dispatched yet, so
+    // relaunching a fresh pod -- steered off the bad node by host-node avoidance
+    // -- is safe and is the only way these recover. Retry launch failures only;
+    // once the runner starts (runnerStarted), honor singleAttempt and rethrow.
+    if (singleAttempt) {
+        def avoidedKubernetesHostNodes = []
+        def launchAttempt = 0
+        while (true) {
+            launchAttempt++
+            Map attemptPlacementContext = [runnerStarted: false]
+            try {
+                if (launchAttempt > 1 && !avoidedKubernetesHostNodes.isEmpty()) {
+                    echo "[INFRA-RETRY] ${stageName}: relaunching pod (attempt ${launchAttempt}), avoiding prior host node(s): ${avoidedKubernetesHostNodes.join(', ')}"
+                }
+                def attemptPodSpec = trtllm_utils.withKubernetesHostNodeExclusion(podSpec, avoidedKubernetesHostNodes)
+                trtllm_utils.launchKubernetesPodWithPlacement(pipeline, attemptPodSpec, containerName, attemptPlacementContext, {
+                    attemptPlacementContext.runnerStarted = true
+                    runner("", true, null)
+                })
+                return
+            } catch (InterruptedException e) {
+                throw e
+            } catch (Exception e) {
+                // Once the runner has started, this is an execution failure the
+                // inner retry owns -- honor singleAttempt and do not re-run.
+                if (attemptPlacementContext.runnerStarted) {
+                    throw e
+                }
+                def c = FailureClassifier.classify(e, InfraFailure.K8S)
+                if (c instanceof PipelineInterruption) throw e
+                if (!(c instanceof InfraFailure))      throw e   // UserFailure -> don't retry
+
+                rememberAvoidedKubernetesHostNodes(avoidedKubernetesHostNodes, attemptPlacementContext.lastHostNode, stageName)
+
+                if (launchAttempt > K8S_INFRA_RETRY_MAX) {
+                    echo "[INFRA-RETRY] ${stageName}: pod launch failed before execution (${c.detectedPattern}), " +
+                         "but max launch retries (${K8S_INFRA_RETRY_MAX}) exhausted after ${launchAttempt} attempts. Failing."
+                    throw e
+                }
+                if (!hasBudgetForInfraRetry(pipeline, stageName, InfraFailure.K8S, c, launchAttempt, K8S_INFRA_RETRY_MAX, 60L * 1000L, true)) {
+                    echo "[INFRA-RETRY] ${stageName}: pod launch failed (${c.detectedPattern}) is retryable, " +
+                         "but remaining CI timeout budget is too small for a relaunch. Failing without retry."
+                    throw e
+                }
+
+                echo "[INFRA-RETRY] ${stageName}: pod/agent launch failed before execution on attempt ${launchAttempt}: ${c.detectedPattern}"
+                echo "[INFRA-RETRY] ${stageName}: Exception: ${e.toString()}"
+                echo "[INFRA-RETRY] ${stageName}: Will relaunch (attempt ${launchAttempt + 1} of ${K8S_INFRA_RETRY_MAX + 1}) after 60s cooldown."
+                sleep(60)
+            }
+        }
     }
 
     def attempt = 0
@@ -4395,6 +4583,7 @@ def launchTestJobs(pipeline, testFilter)
     // may break the mapping functionality.
 
     x86TestConfigs = [
+        "CPU-Generic-x86-1": ["cpu", "l0_cpu_x86", 1, 1],
         "DGX_H100-4_GPUs-CPP-1": ["dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
         "A10-PyTorch-1": ["a10", "l0_a10", 1, 2],
         "A10-PyTorch-2": ["a10", "l0_a10", 2, 2],
@@ -4402,6 +4591,7 @@ def launchTestJobs(pipeline, testFilter)
         "A30-PyTorch-1": ["a30", "l0_a30", 1, 2],
         "A30-PyTorch-2": ["a30", "l0_a30", 2, 2],
         "A10-CPP-1": ["a10", "l0_a10", 1, 1],
+        "A30-CPP-1": ["a30", "l0_a30", 1, 1],
         "A30-AutoDeploy-1": ["a30", "l0_a30", 1, 1],
         "A100X-PyTorch-1": ["a100x", "l0_a100", 1, 1],
         "L40S-PyTorch-1": ["l40s", "l0_l40s", 1, 2],
@@ -4428,8 +4618,8 @@ def launchTestJobs(pipeline, testFilter)
         // "A30-TensorRT-Post-Merge-6": ["a30", "l0_a30", 6, 6],
         "A30-CPP-Post-Merge-1": ["a30", "l0_a30", 1, 2],
         "A30-CPP-Post-Merge-2": ["a30", "l0_a30", 2, 2],
-        "A30-Triton-Post-Merge-1": ["a30", "l0_a30", 1, 2],
-        "A30-Triton-Post-Merge-2": ["a30", "l0_a30", 2, 2],
+        // "A30-Triton-Post-Merge-1": ["a30", "l0_a30", 1, 2],
+        // "A30-Triton-Post-Merge-2": ["a30", "l0_a30", 2, 2],
         // "A100X-TensorRT-Post-Merge-1": ["a100x", "l0_a100", 1, 6],
         // "A100X-TensorRT-Post-Merge-2": ["a100x", "l0_a100", 2, 6],
         // "A100X-TensorRT-Post-Merge-3": ["a100x", "l0_a100", 3, 6],
@@ -4534,15 +4724,13 @@ def launchTestJobs(pipeline, testFilter)
         "DGX_B200-8_GPUs-PyTorch-3": ["auto:dgx-b200-flex", "l0_dgx_b200", 3, 4, 8, 1, true],
         "DGX_B200-8_GPUs-PyTorch-4": ["auto:dgx-b200-flex", "l0_dgx_b200", 4, 4, 8, 1, true],
         "DGX_B200-8_GPUs-AutoDeploy-Post-Merge-1": ["auto:dgx-b200-flex", "l0_dgx_b200", 1, 1, 8, 1, true],
-        // Disable Verl stage due to https://nvbugs/6236818.
-        // Please re-enable it after the bug is fixed.
-        // "DGX_B200-4_GPUs-Verl-Post-Merge-1": ["auto:dgx-b200-flex", "l0_verl", 1, 1, 4, 1, true],
-        "B300-PyTorch-1": ["auto:dgx-b300-flex", "l0_b300", 1, 2, 1, 1, true],
-        "B300-PyTorch-2": ["auto:dgx-b300-flex", "l0_b300", 2, 2, 1, 1, true],
-        "B300-PyTorch-Post-Merge-1": ["auto:dgx-b300-flex", "l0_b300", 1, 1, 1, 1, true],
-        "DGX_B300-4_GPUs-PyTorch-1": ["auto:dgx-b300-flex", "l0_dgx_b300", 1, 1, 4, 1, true],
-        "DGX_B300-4_GPUs-PyTorch-Post-Merge-1": ["auto:dgx-b300-flex", "l0_dgx_b300", 1, 2, 4, 1, true],
-        "DGX_B300-4_GPUs-PyTorch-Post-Merge-2": ["auto:dgx-b300-flex", "l0_dgx_b300", 2, 2, 4, 1, true],
+        "DGX_B200-4_GPUs-Verl-Post-Merge-1": ["auto:dgx-b200-flex", "l0_verl", 1, 1, 4, 1, true],
+        // "B300-PyTorch-1": ["auto:dgx-b300-flex", "l0_b300", 1, 2, 1, 1, true],
+        // "B300-PyTorch-2": ["auto:dgx-b300-flex", "l0_b300", 2, 2, 1, 1, true],
+        // "B300-PyTorch-Post-Merge-1": ["auto:dgx-b300-flex", "l0_b300", 1, 1, 1, 1, true],
+        // "DGX_B300-4_GPUs-PyTorch-1": ["auto:dgx-b300-flex", "l0_dgx_b300", 1, 1, 4, 1, true],
+        // "DGX_B300-4_GPUs-PyTorch-Post-Merge-1": ["auto:dgx-b300-flex", "l0_dgx_b300", 1, 2, 4, 1, true],
+        // "DGX_B300-4_GPUs-PyTorch-Post-Merge-2": ["auto:dgx-b300-flex", "l0_dgx_b300", 2, 2, 4, 1, true],
         // VisualGen PerfSanity post-merge test
         "DGX_B200-8_GPUs-PyTorch-VisualGen-PerfSanity-Post-Merge-1": ["auto:dgx-b200-flex", "l0_b200_visual_gen_perf_sanity", 1, 1, 8, 1, true],
         // PerfSanity post-merge tests
@@ -4594,6 +4782,7 @@ def launchTestJobs(pipeline, testFilter)
 
     // SBSA machines from the Blossom machine pool
     SBSATestConfigs = [
+        "CPU-Generic-arm-1": ["cpu", "l0_cpu_arm", 1, 1],
         "GH200-TensorRT-Post-Merge-1": ["gh200", "l0_gh200", 1, 1],
         // DGX Spark is also named as GB10 Grace Blackwell Superchip.
         "GB10-PyTorch-1": ["gb10x", "l0_gb10", 1, 1],

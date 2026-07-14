@@ -16,12 +16,14 @@
 
 import datetime
 import gc
+import importlib
 import logging
 import os
 import platform
 import re
 import shutil
 import subprocess as sp
+import sys
 import tempfile
 import time
 import urllib.request
@@ -63,6 +65,14 @@ logger = logging.getLogger(__name__)
 DEBUG_CI_STORAGE = os.environ.get("DEBUG_CI_STORAGE", False)
 GITLAB_API_USER = os.environ.get("GITLAB_API_USER")
 GITLAB_API_TOKEN = os.environ.get("GITLAB_API_TOKEN")
+
+
+def _get_s3_output():
+    tests_root = Path(__file__).resolve().parents[2]
+    tests_root_str = str(tests_root)
+    if tests_root_str not in sys.path:
+        sys.path.append(tests_root_str)
+    return importlib.import_module("test_common.s3_output")
 
 
 def print_storage_usage(path, tag, capfd):
@@ -1797,13 +1807,17 @@ def get_gpu_device_list():
         suffix = ".exe" if is_windows() else ""
         # TODO: Use NRSU because we can't assume nvidia-smi across all platforms.
         cmd = " ".join(["nvidia-smi" + suffix, "-L"])
-        output = check_output(cmd, shell=True, cwd=temp_dirname)
+        try:
+            output = check_output(cmd, shell=True, cwd=temp_dirname)
+        except sp.CalledProcessError:
+            return []
     return [l.strip() for l in output.strip().split("\n")]
 
 
 def check_device_contain(keyword_list):
     "check device not contain keyword"
-    device = get_gpu_device_list()[0]
+    devices = get_gpu_device_list()
+    device = devices[0] if devices else ""
     return any(keyword in device for keyword in keyword_list)
 
 
@@ -1933,6 +1947,7 @@ def get_device_memory():
 
 
 def pytest_addoption(parser):
+    _get_s3_output().add_options(parser)
     parser.addoption(
         "--test-list",
         "-F",
@@ -1996,6 +2011,12 @@ def pytest_addoption(parser):
         default=False,
         help=
         "Enable Ray orchestrator path for integration tests (disables MPI).",
+    )
+    parser.addoption(
+        "--unittest-markexpr",
+        action="store",
+        default=None,
+        help="Marker expression forwarded to nested unittest pytest runs.",
     )
     parser.addoption(
         "--perf-log-formats",
@@ -2225,6 +2246,8 @@ def pytest_configure(config):
         print_warning(
             "Warning: --periodic-junit requires --output-dir to be set. "
             "Periodic reporting disabled.")
+
+    _get_s3_output().register_plugin(config)
 
 
 def deselect_by_test_model_suites(test_model_suites, items, test_prefix,

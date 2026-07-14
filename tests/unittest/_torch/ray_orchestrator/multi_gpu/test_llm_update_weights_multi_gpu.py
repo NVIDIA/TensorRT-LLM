@@ -29,6 +29,12 @@ from tensorrt_llm._torch.auto_deploy.custom_ops.quantization.torch_quant import 
 from tensorrt_llm._torch.utils import get_device_uuid
 from tensorrt_llm.llmapi import KvCacheConfig, MoeConfig, SamplingParams
 
+# Ray-backed LLM teardown only fires from RayExecutor.shutdown(), which runs
+# after pytest-threadleak's per-test snapshot — see the matching docstring in
+# tests/unittest/_torch/ray_orchestrator/single_gpu/test_llm_update_weights.py
+# (the parent test module this file imports from).
+pytestmark = pytest.mark.threadleak(enabled=False)
+
 
 @pytest.mark.part0
 @skip_pre_blackwell
@@ -51,7 +57,7 @@ def test_llm_update_weights_fp8(model_dir, fp8_model_dir):
     hf_model = RefHFModelWithIPCHandles(fp8_model_dir, num_hidden_layers=num_hidden_layers)
     tokenizer = AutoTokenizer.from_pretrained(fp8_model_dir)
     kv_cache_config = KvCacheConfig(enable_block_reuse=True, free_gpu_memory_fraction=0.1)
-    llm = LLM(
+    with LLM(
         model=model_dir,
         ray_worker_extension_cls="tensorrt_llm.llmapi.rlhf_utils.WorkerExtension",
         tensor_parallel_size=2,
@@ -68,27 +74,28 @@ def test_llm_update_weights_fp8(model_dir, fp8_model_dir):
             },
         },
         **additional_kwargs,
-    )
+    ) as llm:
+        # Generate texts from the prompts.
+        prompts_texts = [
+            "Hello, my name is",
+            "The president of the United States is",
+            "The capital of France is",
+            "The future of AI is",
+        ]
+        prompts = [tokenizer.encode(prompt) for prompt in prompts_texts]
+        del tokenizer
+        sampling_params = SamplingParams(
+            temperature=0, return_generation_logits=True, max_tokens=1024
+        )
 
-    # Generate texts from the prompts.
-    prompts_texts = [
-        "Hello, my name is",
-        "The president of the United States is",
-        "The capital of France is",
-        "The future of AI is",
-    ]
-    prompts = [tokenizer.encode(prompt) for prompt in prompts_texts]
-    del tokenizer
-    sampling_params = SamplingParams(temperature=0, return_generation_logits=True, max_tokens=1024)
+        ipc_handles = hf_model.get_weight_ipc_handles_serialized([0, 1])
 
-    ipc_handles = hf_model.get_weight_ipc_handles_serialized([0, 1])
+        llm._collective_rpc("update_weights", (ipc_handles,))
+        # Finalize the update weights
+        llm._collective_rpc("update_weights", (None,))
 
-    llm._collective_rpc("update_weights", (ipc_handles,))
-    # Finalize the update weights
-    llm._collective_rpc("update_weights", (None,))
-
-    llm_logits, ref_logits = run_generate(llm, hf_model, prompts, sampling_params)
-    compare_logits(llm_logits, ref_logits)
+        llm_logits, ref_logits = run_generate(llm, hf_model, prompts, sampling_params)
+        compare_logits(llm_logits, ref_logits)
 
 
 @pytest.mark.part1
@@ -112,7 +119,7 @@ def test_llm_partial_update_weights_fp8(model_dir, fp8_model_dir):
     hf_model = RefHFModelWithIPCHandles(fp8_model_dir, num_hidden_layers=num_hidden_layers)
     tokenizer = AutoTokenizer.from_pretrained(fp8_model_dir)
     kv_cache_config = KvCacheConfig(enable_block_reuse=True, free_gpu_memory_fraction=0.1)
-    llm = LLM(
+    with LLM(
         model=model_dir,
         ray_worker_extension_cls="tensorrt_llm.llmapi.rlhf_utils.WorkerExtension",
         tensor_parallel_size=2,
@@ -129,46 +136,47 @@ def test_llm_partial_update_weights_fp8(model_dir, fp8_model_dir):
             },
         },
         **additional_kwargs,
-    )
+    ) as llm:
+        # Generate texts from the prompts.
+        prompts_texts = [
+            "Hello, my name is",
+            "The president of the United States is",
+            "The capital of France is",
+            "The future of AI is",
+        ]
+        prompts = [tokenizer.encode(prompt) for prompt in prompts_texts]
+        del tokenizer
 
-    # Generate texts from the prompts.
-    prompts_texts = [
-        "Hello, my name is",
-        "The president of the United States is",
-        "The capital of France is",
-        "The future of AI is",
-    ]
-    prompts = [tokenizer.encode(prompt) for prompt in prompts_texts]
-    del tokenizer
-
-    sampling_params = SamplingParams(temperature=0, return_generation_logits=True, max_tokens=1024)
-
-    def common_filter(filter_name: str) -> Callable[[str], bool]:
-        def filter_fn(name: str) -> bool:
-            return name.endswith(filter_name)
-
-        return filter_fn
-
-    # Generate filter_list from model weight keys by removing layer prefix
-    # e.g., "model.layers.41.input_layernorm.weight" -> "input_layernorm.weight"
-    layer_prefix_pattern = re.compile(r"^model\.layers\.\d+\.")
-    filter_set = set()
-    for name, _ in hf_model.all_weights[hf_model.device_id]:
-        suffix = layer_prefix_pattern.sub("", name)
-        filter_set.add(suffix)
-    filter_list = list(filter_set)
-
-    for filter_name in filter_list:
-        weight_filter = common_filter(filter_name=filter_name)
-        ipc_handles = hf_model.get_weight_ipc_handles_serialized(
-            [0, 1], weight_filter=weight_filter
+        sampling_params = SamplingParams(
+            temperature=0, return_generation_logits=True, max_tokens=1024
         )
-        llm._collective_rpc("update_weights", (ipc_handles,))
-    # Finalize the update weights
-    llm._collective_rpc("update_weights", (None,))
 
-    llm_logits, ref_logits = run_generate(llm, hf_model, prompts, sampling_params)
-    compare_logits(llm_logits, ref_logits)
+        def common_filter(filter_name: str) -> Callable[[str], bool]:
+            def filter_fn(name: str) -> bool:
+                return name.endswith(filter_name)
+
+            return filter_fn
+
+        # Generate filter_list from model weight keys by removing layer prefix
+        # e.g., "model.layers.41.input_layernorm.weight" -> "input_layernorm.weight"
+        layer_prefix_pattern = re.compile(r"^model\.layers\.\d+\.")
+        filter_set = set()
+        for name, _ in hf_model.all_weights[hf_model.device_id]:
+            suffix = layer_prefix_pattern.sub("", name)
+            filter_set.add(suffix)
+        filter_list = list(filter_set)
+
+        for filter_name in filter_list:
+            weight_filter = common_filter(filter_name=filter_name)
+            ipc_handles = hf_model.get_weight_ipc_handles_serialized(
+                [0, 1], weight_filter=weight_filter
+            )
+            llm._collective_rpc("update_weights", (ipc_handles,))
+        # Finalize the update weights
+        llm._collective_rpc("update_weights", (None,))
+
+        llm_logits, ref_logits = run_generate(llm, hf_model, prompts, sampling_params)
+        compare_logits(llm_logits, ref_logits)
 
 
 class RefNVFP4ModelWithIPCHandles(RefHFModel):
@@ -465,7 +473,7 @@ def test_llm_update_weights_nvfp4(model_dir, kv_cache_dtype):
     kv_cache_config = KvCacheConfig(
         enable_block_reuse=True, free_gpu_memory_fraction=0.1, dtype=kv_cache_dtype
     )
-    llm = LLM(
+    with LLM(
         model=model_dir,
         ray_worker_extension_cls="tensorrt_llm.llmapi.rlhf_utils.WorkerExtension",
         tensor_parallel_size=2,
@@ -480,9 +488,7 @@ def test_llm_update_weights_nvfp4(model_dir, kv_cache_dtype):
                 "group_size": 16,
             },
         },
-    )
-
-    with llm:
+    ) as llm:
         prompts_texts = [
             "Hello, my name is",
             "The president of the United States is",
@@ -528,7 +534,7 @@ def test_llm_partial_update_weights_nvfp4(model_dir, kv_cache_dtype):
     kv_cache_config = KvCacheConfig(
         enable_block_reuse=True, free_gpu_memory_fraction=0.1, dtype=kv_cache_dtype
     )
-    llm = LLM(
+    with LLM(
         model=model_dir,
         ray_worker_extension_cls="tensorrt_llm.llmapi.rlhf_utils.WorkerExtension",
         tensor_parallel_size=2,
@@ -543,9 +549,7 @@ def test_llm_partial_update_weights_nvfp4(model_dir, kv_cache_dtype):
                 "group_size": 16,
             },
         },
-    )
-
-    with llm:
+    ) as llm:
         prompts_texts = [
             "Hello, my name is",
             "The president of the United States is",

@@ -63,6 +63,8 @@ def ASSERT_DRV(err):
 def getSMVersion():
     # Init
     err, = cuda.cuInit(0)
+    if err == cuda.CUresult.CUDA_ERROR_NO_DEVICE:
+        return -1
     ASSERT_DRV(err)
 
     # Device

@@ -614,6 +614,15 @@ class BaseMultimodalDummyInputsBuilder(ABC):
         """
         return {}
 
+    def get_preferred_media_io_kwargs(self) -> Dict[str, Dict[str, Any]]:
+        """Per-modality media-IO decode defaults for this model.
+
+        Applied under the server's ``--media_io_kwargs`` and any per-request
+        override, so a model can opt into a decode format it was tuned for
+        (e.g. ``{"video": {"format": "np"}}``) without operator config.
+        """
+        return {}
+
     def get_dummy_mm_data_for_tokens(
         self,
         *,
