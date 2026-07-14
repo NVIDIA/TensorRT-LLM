@@ -161,7 +161,10 @@ class OpenAIHttpClient(OpenAIClient):
         req_id: Optional[int] = None,
     ) -> UCompletionResponseOrGenerator:
         if server is None:
-            server, _ = await self._router.get_next_server(request, req_id=req_id)
+            if req_id is None:
+                server, _ = await self._router.get_next_server(request)
+            else:
+                server, _ = await self._router.get_next_server(request, req_id=req_id)
         url = f"http://{server}/{endpoint}"
         # disaggregated_params is None when conditional_disagg bypasses ctx.
         _dp = request.disaggregated_params
@@ -364,7 +367,12 @@ class OpenAIHttpClient(OpenAIClient):
         req_id: Optional[int] = None,
     ) -> None:
         self._metrics_collector.completed_requests.inc()
-        await self._router.finish_request(request, self._session, success=success, req_id=req_id)
+        if req_id is None:
+            await self._router.finish_request(request, self._session, success=success)
+        else:
+            await self._router.finish_request(
+                request, self._session, success=success, req_id=req_id
+            )
 
     async def collect_metrics(self) -> Dict[str, Any]:
         metrics = {}
