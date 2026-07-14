@@ -24,7 +24,8 @@ Weight page-cache warming: when the NEXT test's model differs from the
 current one, its weight files are read in a background thread so the kernel
 page cache is hot by the time that test loads weights. The next model is
 discovered automatically from the accuracy-harness ``MODEL_PATH`` class
-attribute, or declared explicitly with
+attribute or a ``model_folder``-style test parameter (modeling unit tests),
+or declared explicitly with
 ``@pytest.mark.prefetch_model_dir("/path/to/model")``. This complements
 pool prefetch (pool reuse does not cover model IO). Page cache is
 reclaimable memory, so warming cannot OOM the host; a wasted warm (test
@@ -124,20 +125,53 @@ def _available_host_memory():
     return None
 
 
-def _model_dir_of(item):
-    """A test item's model dir: explicit marker, else the class convention.
+# Parametrized-test convention: the model lives in a parameter with one of
+# these names (e.g. test_modeling_* files), holding either an absolute path
+# or a directory name under LLM_MODELS_ROOT.
+_MODEL_PARAM_NAMES = ("model_folder", "model_dir", "model_path")
 
-    The accuracy-test harness declares the model as a ``MODEL_PATH`` class
-    attribute (120+ classes across tests/integration/defs/accuracy), so those
-    suites get weight warming automatically, with the marker as the explicit
-    override for everything else. A value that is not a real directory of
-    weight files makes ``warm_page_cache`` a silent no-op.
+
+def _models_root():
+    """The models root the tests themselves resolve against, or None."""
+    root = os.environ.get("LLM_MODELS_ROOT")
+    if root:
+        return root
+    try:  # same fallback the test suites use (CI default scratch path)
+        from test_common.llm_data import llm_models_root
+
+        root = llm_models_root()
+        return str(root) if root else None
+    except Exception:
+        return None
+
+
+def _model_dir_of(item):
+    """A test item's model dir: marker, else class or parameter convention.
+
+    Discovery order: the explicit ``prefetch_model_dir`` marker; the accuracy
+    harness's ``MODEL_PATH`` class attribute (120+ classes across
+    tests/integration/defs/accuracy); a ``model_folder``-style test parameter
+    (modeling unit tests), resolved under LLM_MODELS_ROOT unless absolute.
+    All of it is guess-tolerant: a value that is not a real directory of
+    weight files (e.g. an HF model id) makes ``warm_page_cache`` a silent
+    no-op, so a wrong guess costs nothing.
     """
     marker = item.get_closest_marker("prefetch_model_dir")
     if marker is not None and marker.args:
         return marker.args[0]
     model_path = getattr(getattr(item, "cls", None), "MODEL_PATH", None)
-    return model_path if isinstance(model_path, str) else None
+    if isinstance(model_path, str):
+        return model_path
+    params = getattr(getattr(item, "callspec", None), "params", None) or {}
+    for name in _MODEL_PARAM_NAMES:
+        value = params.get(name)
+        if isinstance(value, str) and value:
+            if os.path.isabs(value):
+                return value
+            root = _models_root()
+            if root:
+                return os.path.join(root, value)
+    return None
 
 
 def warm_page_cache(model_dir: str) -> float:

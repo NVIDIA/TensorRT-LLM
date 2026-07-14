@@ -20,9 +20,11 @@ class _FakeMarker:
 
 
 class _FakeItem:
-    def __init__(self, model_dir=None, cls=None):
+    def __init__(self, model_dir=None, cls=None, params=None):
         self._marker = _FakeMarker(model_dir) if model_dir else None
         self.cls = cls
+        if params is not None:
+            self.callspec = types.SimpleNamespace(params=params)
 
     def get_closest_marker(self, name):
         return self._marker if name == "prefetch_model_dir" else None
@@ -338,6 +340,19 @@ def test_auto_model_dir_from_accuracy_class_attr(prefetcher):
     prefetcher.on_test_setup(items[0])
     assert _wait_for(lambda: prefetcher.warmed)
     assert prefetcher.warmed == ["/models/qwen"]
+
+
+def test_model_param_discovery(monkeypatch):
+    # Modeling unit tests carry the model as a `model_folder`-style parameter
+    # (a name under LLM_MODELS_ROOT, or an absolute path) — discovered
+    # without any test-file changes.
+    monkeypatch.setenv("LLM_MODELS_ROOT", "/models-root")
+    item = _FakeItem(params={"model_folder": "Nemotron-H-8B-Base-8K"})
+    assert session_prefetcher._model_dir_of(item) == "/models-root/Nemotron-H-8B-Base-8K"
+    item = _FakeItem(params={"model_dir": "/abs/path/model"})
+    assert session_prefetcher._model_dir_of(item) == "/abs/path/model"
+    # Non-model params never produce a guess.
+    assert session_prefetcher._model_dir_of(_FakeItem(params={"dtype": "fp8"})) is None
 
 
 def test_marker_overrides_class_model_path():
