@@ -37,7 +37,8 @@ def create_kv_cache_transceiver(
         kv_cache_manager: KVCacheManager,
         attention_type: AttentionTypeCpp,
         cache_transceiver_config: CacheTransceiverConfig,
-        mamba_cache_manager: Optional[BaseMambaCacheManager] = None):
+        mamba_cache_manager: Optional[BaseMambaCacheManager] = None,
+        enable_chunked_prefill: bool = False):
     if cache_transceiver_config is None or cache_transceiver_config.backend is None:
         logger.info("cache_transceiver is disabled")
         return None
@@ -66,16 +67,47 @@ def create_kv_cache_transceiver(
             "MPI CacheTransceiver is deprecated, UCX or NIXL is recommended")
     elif cache_transceiver_config.backend == "UCX":
         logger.info(
-            f"Using UCX kv-cache transceiver. If your devices are not in the same domain, please consider setting "
-            f"UCX_CUDA_IPC_ENABLE_MNNVL=n, UCX_RNDV_SCHEME=put_zcopy and/or unset UCX_NET_DEVICES upon server "
-            f"hangs or lower-than-expected performance.")
+            "Using UCX kv-cache transceiver. If your devices are not in the same domain, please consider setting "
+            "UCX_CUDA_IPC_ENABLE_MNNVL=n, UCX_RNDV_SCHEME=put_zcopy and/or unset UCX_NET_DEVICES upon server "
+            "hangs or lower-than-expected performance.")
+
+    if (cache_transceiver_config.enable_pipelined_transfer
+            and not enable_chunked_prefill):
+        raise ValueError(
+            "enable_chunked_prefill is required when enable_pipelined_transfer is set.")
+    # Auto-select Python transceiver when enable_pipelined_transfer is set,
+    # since the C++ transceiver does not support pipelined transfer.
+    # Only applies to NIXL/DEFAULT backends (the Python transceiver
+    # does not support UCX, MPI, or MOONCAKE).
+    runtime = cache_transceiver_config.transceiver_runtime
+    use_python = runtime == "PYTHON"
+    if (runtime is None
+            and cache_transceiver_config.enable_pipelined_transfer):
+        if cache_transceiver_config.backend in (None, "DEFAULT", "NIXL"):
+            logger.warning(
+                "enable_pipelined_transfer is set; auto-selecting the Python "
+                "transceiver instead of the C++ transceiver to enable "
+                "pipelined KV cache transfer. "
+                "Set transceiver_runtime='CPP' to disable this auto-selection.")
+            use_python = True
+        else:
+            raise ValueError(
+                f"enable_pipelined_transfer is set but backend "
+                f"'{cache_transceiver_config.backend}' requires the C++ "
+                f"transceiver, which does not support pipelined transfer. Use NIXL backend to "
+                f"enable pipelined transfer.")
+    elif (runtime == "CPP"
+          and cache_transceiver_config.enable_pipelined_transfer):
+        raise ValueError(
+            "enable_pipelined_transfer is set but transceiver_runtime='CPP' "
+            "explicitly disables Python auto-selection. Use transceiver_runtime='PYTHON' to enable pipelined transfer.")
 
     # Select transceiver implementation based on transceiver_runtime
     # transceiver_runtime == None or "CPP" -> use C++ transceiver (default)
     # transceiver_runtime == "PYTHON" -> use Python transceiver
-    if cache_transceiver_config.transceiver_runtime == "PYTHON":
+    if use_python:
         # Python transceiver currently only supports NIXL and DEFAULT backend
-        if cache_transceiver_config.backend not in ("DEFAULT", "NIXL"):
+        if cache_transceiver_config.backend not in (None, "DEFAULT", "NIXL"):
             raise ValueError(
                 f"Python transceiver currently only supports NIXL or DEFAULT backend, "
                 f"got {cache_transceiver_config.backend}. "
@@ -94,6 +126,11 @@ def create_kv_cache_transceiver(
 
 
 class KvCacheTransceiver(ABC):
+
+    @property
+    def enable_pipelined_transfer(self) -> bool:
+        """Whether pipelined prefill-transfer is enabled."""
+        return False
 
     @abstractmethod
     def respond_and_send_async(self, req: LlmRequest):
@@ -143,6 +180,9 @@ class KvCacheTransceiver(ABC):
 
     def commit_blocks_for_reuse(self, req: LlmRequest) -> None:
         """Commit received KV blocks to the radix tree for prefix reuse. No-op by default."""
+
+    def finalize_pipelined_send(self, req: LlmRequest) -> None:
+        """Finalize a pipelined context-side send after sampling."""
 
     def shutdown(self):
         """Shut down the transceiver and release registered resources."""

@@ -4806,6 +4806,19 @@ class PyExecutor:
         # Check token ID ranges
         self._validate_token_id_range(request)
 
+        if (not self.is_warmup and self.kv_cache_transceiver is not None
+                and self.kv_cache_transceiver.pipeline_transfer_enabled):
+            if request.py_beam_width != 1:
+                raise ValueError(
+                    "beam_width > 1 is not supported when enable_pipelined_transfer is set.")
+
+            disagg_params = request.py_disaggregated_params
+            if (disagg_params is None or disagg_params.schedule_style
+                    != DisaggScheduleStyle.GENERATION_FIRST):
+                raise ValueError(
+                    "schedule_style must be generation_first when "
+                    "enable_pipelined_transfer is set.")
+
         # Perform sampler-specific validation
         self.sampler.validate_request(request)
 
@@ -5822,22 +5835,27 @@ class PyExecutor:
 
         if self.kv_cache_transceiver:
             for req in scheduled_requests:
-                if req.is_context_only_request and (
-                        req.is_context_finished or req.is_finished_due_to_length
-                ) and not req.is_finished_due_to_cancellation:
-                    # Forward is done for this request — release the
-                    # IndexMapper slot so new requests can reuse it.
-                    # KV blocks stay allocated for the upcoming transfer.
-                    if hasattr(self.kv_cache_manager, 'release_index_slot'):
-                        self.kv_cache_manager.release_index_slot(
-                            req.py_request_id)
-                    # Order is important here: we need to start the transfer before responding
-                    # to make sure the blocks are stored for reuse before they are sent.
-                    self.async_transfer_manager.start_transfer(req)
-                    self.kv_cache_transceiver.respond_and_send_async(req)
+                if req.is_context_only_request and not req.is_finished_due_to_cancellation:
+                    if req.is_context_finished or req.is_finished_due_to_length:   # noqa: E501
+                        # Forward is done for this request — release the
+                        # IndexMapper slot so new requests can reuse it.
+                        # KV blocks stay allocated for the upcoming transfer.
+                        if hasattr(self.kv_cache_manager, 'release_index_slot'):
+                            self.kv_cache_manager.release_index_slot(
+                                req.py_request_id)
+                        # Order matters: start_transfer commits the request's blocks to the reuse
+                        # tree and pins them, and must run before respond_and_send_async sends the
+                        # final KV slice and (for the Python transceiver) transitions the request toward completion.
+                        self.async_transfer_manager.start_transfer(req)
 
-                    if self.kv_cache_transceiver.kv_transfer_timeout_ms is not None:
-                        req.py_kv_transfer_start_time = time.time()
+                        # send KV slice for monolithic transfer or last chunk of pipelined transfer
+                        self.kv_cache_transceiver.respond_and_send_async(req)
+
+                        if self.kv_cache_transceiver.kv_transfer_timeout_ms is not None and req.py_kv_transfer_start_time is None:
+                            req.py_kv_transfer_start_time = time.time()
+                    elif self.kv_cache_transceiver.pipeline_transfer_enabled:
+                        # send intermediate chunk for pipelined transfer
+                        self.kv_cache_transceiver.respond_and_send_async(req)
 
         if self.kv_connector_manager:
             if not self.disable_overlap_scheduler:
