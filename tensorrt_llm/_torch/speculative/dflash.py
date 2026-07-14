@@ -181,8 +181,20 @@ class DFlashWorker(SpecWorkerBase):
         self._req_to_slot = {}  # request_id -> slot index
         self._free_slots = deque()  # available slot indices
 
+        # Hybrid ctx: draft K/V lives in the target manager as spec layers.
+        self._use_hybrid_context = getattr(spec_config, "use_hybrid_context", False)
+        self._hybrid_inited = False
+        self._hybrid_pool_idx = 0
+        self._hybrid_blk_divisor = 1
+        self._hybrid_tpb = 0
+        self._hybrid_k_bufs = None  # per draft layer [pages, tpb, nkv, hd]
+        self._hybrid_v_bufs = None
+        self._kv_cache_manager = None
+        self._cur_block_idx = None  # decoded page ids, per batch row
+
         logger.info(
-            f"DFlashWorker initialized with use_separate_draft_kv_cache={use_separate_draft_kv_cache}"
+            f"DFlashWorker initialized with use_separate_draft_kv_cache={use_separate_draft_kv_cache}, "
+            f"use_hybrid_context={self._use_hybrid_context}"
         )
 
     @property
@@ -200,7 +212,82 @@ class DFlashWorker(SpecWorkerBase):
         """
         return self.max_draft_len + 1
 
+    def _lazy_init_hybrid_ctx(self, draft_model, spec_metadata, attn_metadata):
+        mgr = getattr(attn_metadata, "kv_cache_manager", None)
+        if mgr is None or not hasattr(mgr, "get_buffers"):
+            raise RuntimeError("DFlash use_hybrid_context requires a block-based KV cache manager.")
+        if not hasattr(attn_metadata, "kv_cache_block_offsets"):
+            raise RuntimeError(
+                "DFlash use_hybrid_context requires the TRTLLM attention backend "
+                "(kv_cache_block_offsets not found on attn metadata)."
+            )
+        if self._hybrid_inited and self._kv_cache_manager is mgr:
+            return
+
+        draft_model._build_fused_kv_buffers()
+        num_layers = draft_model._num_attn_layers
+
+        # Draft spec layers are appended after the target layers.
+        layer_ids = sorted(mgr.layer_offsets.keys())[-num_layers:]
+        bufs = [mgr.get_buffers(lid) for lid in layer_ids]  # NHD [P, 2, tpb, nkv, hd]
+
+        # The manager sizes spec layers in target-head_dim units, so when the draft head_dim differs
+        # from the pool's, view each [P, tpb, nkv_pool, hd_pool] buffer back
+        # to the draft's per-rank [P, tpb, nkv_draft, hd_draft] geometry.
+        nkv_draft = draft_model._num_kv_heads
+        hd_draft = draft_model._head_dim
+
+        def _as_draft_geometry(t: torch.Tensor) -> torch.Tensor:
+            if t.shape[-2] == nkv_draft and t.shape[-1] == hd_draft:
+                return t
+            if t.shape[-2] * t.shape[-1] != nkv_draft * hd_draft:
+                raise RuntimeError(
+                    f"DFlash hybrid ctx: pool row {tuple(t.shape[-2:])} does "
+                    f"not match draft KV geometry ({nkv_draft}, {hd_draft}) "
+                    f"per rank; check per-layer KV head registration."
+                )
+            return t.flatten(-2).unflatten(-1, (nkv_draft, hd_draft))
+
+        self._hybrid_k_bufs = [_as_draft_geometry(b[:, 0]) for b in bufs]
+        self._hybrid_v_bufs = [_as_draft_geometry(b[:, 1]) for b in bufs]
+
+        # Pool of the draft layers + its offsets-decode divisor
+        # (encoded = block_idx * layers_in_pool * kv_factor).
+        pm = mgr.kv_cache_pool_mapping.view(len(mgr.layer_offsets), -1)
+        pool_idx = int(pm[mgr.layer_offsets[layer_ids[0]], 0])
+        layers_in_pool = int((pm[:, 0] == pool_idx).sum())
+        self._hybrid_pool_idx = pool_idx
+        self._hybrid_blk_divisor = layers_in_pool * mgr.kv_factor
+        self._hybrid_tpb = mgr.tokens_per_block
+        self._resolved_block_size = getattr(draft_model, "block_size", None) or (
+            self.max_draft_len + 1
+        )
+        self._max_ctx = mgr.max_blocks_per_seq * mgr.tokens_per_block
+        self._kv_cache_manager = mgr
+
+        max_batch = spec_metadata.max_num_requests
+        self._ctx_len = torch.zeros(max_batch, dtype=torch.long, device="cuda")
+        self._batch_to_slot = torch.zeros(max_batch, dtype=torch.long, device="cuda")
+        self._free_slots = deque(range(max_batch))
+        self._req_to_slot = {}
+        self._ctx_buf_inited = True
+        self._hybrid_inited = True
+
+        logger.info(
+            f"DFlash: hybrid ctx in target manager pool {pool_idx}: "
+            f"layers={layer_ids}, dtype={bufs[0].dtype}, "
+            f"tokens_per_block={mgr.tokens_per_block}"
+        )
+
+    def _hybrid_block_idx(self, attn_metadata):
+        """Decode per-batch-row page ids for the draft pool (device, in-graph)."""
+        enc = attn_metadata.kv_cache_block_offsets[self._hybrid_pool_idx, :, 0, :]
+        return enc // self._hybrid_blk_divisor
+
     def _lazy_init_ctx_buffers(self, draft_model, spec_metadata, attn_metadata):
+        if self._use_hybrid_context:
+            self._lazy_init_hybrid_ctx(draft_model, spec_metadata, attn_metadata)
+            return
         if self._ctx_buf_inited:
             return
 
@@ -348,14 +435,19 @@ class DFlashWorker(SpecWorkerBase):
                     continue
                 slot = self._free_slots.popleft()
                 self._req_to_slot[req_id] = slot
-                self._ctx_len[slot] = 0
+                # Hybrid: reused blocks already hold ctx for [0, first_pos).
+                self._ctx_len[slot] = first_pos if self._use_hybrid_context else 0
 
             slot = self._req_to_slot[req_id]
             cur = int(self._ctx_len[slot].item())
             end = min(cur + slen, self._max_ctx)
             actual = end - cur
             if actual > 0:
-                chunk_proj_cast = chunk_proj[:actual].to(self._ctx_k_buf.dtype)
+                if self._use_hybrid_context:
+                    # Cast to the pool dtype at write.
+                    chunk_proj_cast = chunk_proj[:actual]
+                else:
+                    chunk_proj_cast = chunk_proj[:actual].to(self._ctx_k_buf.dtype)
                 self._ctx_len[slot] = end
                 # Precompute post-norm/post-RoPE K,V for this prefill chunk
                 # so decode iters can read without re-projecting.
@@ -363,8 +455,20 @@ class DFlashWorker(SpecWorkerBase):
                     chunk_proj_cast, chunk_pos[:actual]
                 )
                 # chunk_k/v: [actual, L, nkv, hd] → [L, actual, nkv, hd]
-                self._ctx_k_buf[slot, :, cur:end] = chunk_k.permute(1, 0, 2, 3)
-                self._ctx_v_buf[slot, :, cur:end] = chunk_v.permute(1, 0, 2, 3)
+                if self._use_hybrid_context:
+                    # Position-aligned: token p -> manager block p // tpb of
+                    # this batch row.
+                    tpb = self._hybrid_tpb
+                    pos = torch.arange(cur, end, dtype=torch.long, device="cuda")
+                    blk = self._cur_block_idx[i, pos // tpb].long()
+                    off = pos % tpb
+                    dt = self._hybrid_k_bufs[0].dtype
+                    for li, (kb, vb) in enumerate(zip(self._hybrid_k_bufs, self._hybrid_v_bufs)):
+                        kb[blk, off] = chunk_k[:, li].to(dt)
+                        vb[blk, off] = chunk_v[:, li].to(dt)
+                else:
+                    self._ctx_k_buf[slot, :, cur:end] = chunk_k.permute(1, 0, 2, 3)
+                    self._ctx_v_buf[slot, :, cur:end] = chunk_v.permute(1, 0, 2, 3)
             offset += slen
 
     def forward(
@@ -399,6 +503,9 @@ class DFlashWorker(SpecWorkerBase):
         # Lazy init buffers and attach worker reference for prepare()
         self._lazy_init_ctx_buffers(draft_model, spec_metadata, attn_metadata)
         spec_metadata._dflash_worker = self
+
+        if self._use_hybrid_context:
+            self._cur_block_idx = self._hybrid_block_idx(attn_metadata)
 
         # Save context lengths before warmup to prevent accumulation
         is_warmup = spec_metadata.is_cuda_graph and not torch.cuda.is_current_stream_capturing()
@@ -480,6 +587,9 @@ class DFlashWorker(SpecWorkerBase):
                     ctx_k_cache=inputs["ctx_k_cache"],
                     ctx_v_cache=inputs["ctx_v_cache"],
                     ctx_cache_batch_idx=inputs["ctx_cache_batch_idx"],
+                    hybrid_k_bufs=inputs["hybrid_k_bufs"],
+                    hybrid_v_bufs=inputs["hybrid_v_bufs"],
+                    hybrid_block_idx=inputs["hybrid_block_idx"],
                 )
 
                 # Gather K logits per gen request from mask positions (1..K).
@@ -664,16 +774,33 @@ class DFlashWorker(SpecWorkerBase):
 
                 # Fast path: store the pre-projected/pre-RoPE'd K/V.
                 # dflash_forward reads these directly via cache_batch_idx.
-                k_new, v_new = draft_model.precompute_context_kv(
-                    proj_flat.to(self._ctx_k_buf.dtype), pos_flat
-                )
+                if self._use_hybrid_context:
+                    proj_cast = proj_flat  # cast to pool dtype at write
+                else:
+                    proj_cast = proj_flat.to(self._ctx_k_buf.dtype)
+                k_new, v_new = draft_model.precompute_context_kv(proj_cast, pos_flat)
                 mask_bc = mask_1d.view(-1, 1, 1, 1).to(k_new.dtype)
                 k_new.mul_(mask_bc)
                 v_new.mul_(mask_bc)
                 slot_long = slot_flat.long()
                 col_long = col_flat.long()
-                self._ctx_k_buf[slot_long, :, col_long] = k_new
-                self._ctx_v_buf[slot_long, :, col_long] = v_new
+                if self._use_hybrid_context:
+                    tpb = self._hybrid_tpb
+                    row_flat = (
+                        torch.arange(num_contexts, num_contexts + num_gens, device="cuda")
+                        .unsqueeze(1)
+                        .expand(-1, K_plus_1)
+                        .reshape(-1)
+                    )
+                    blk = self._cur_block_idx[row_flat, col_long // tpb].long()
+                    off = col_long % tpb
+                    dt = self._hybrid_k_bufs[0].dtype
+                    for li, (kb, vb) in enumerate(zip(self._hybrid_k_bufs, self._hybrid_v_bufs)):
+                        kb[blk, off] = k_new[:, li].to(dt)
+                        vb[blk, off] = v_new[:, li].to(dt)
+                else:
+                    self._ctx_k_buf[slot_long, :, col_long] = k_new
+                    self._ctx_v_buf[slot_long, :, col_long] = v_new
 
                 self._ctx_len[slots] += gen_num_accepted_long
                 self._ctx_len.clamp_(max=self._max_ctx)
@@ -701,4 +828,11 @@ class DFlashWorker(SpecWorkerBase):
             "ctx_k_cache": self._ctx_k_buf,
             "ctx_v_cache": self._ctx_v_buf,
             "ctx_cache_batch_idx": slots,
+            "hybrid_k_bufs": self._hybrid_k_bufs if self._use_hybrid_context else None,
+            "hybrid_v_bufs": self._hybrid_v_bufs if self._use_hybrid_context else None,
+            "hybrid_block_idx": (
+                self._cur_block_idx[num_contexts : num_contexts + num_gens]
+                if self._use_hybrid_context
+                else None
+            ),
         }

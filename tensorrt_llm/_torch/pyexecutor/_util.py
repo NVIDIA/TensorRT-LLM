@@ -341,6 +341,18 @@ class KvCacheCreator:
                                                   KVCacheManagerV2)
         self._draft_config = draft_config
         self._skip_est = skip_est
+        # Hybrid DFlash ctx: resolve the draft layer count before any manager
+        # is created (get_num_spec_layers reads it via get_pp_layers).
+        if (self._is_dflash_hybrid_ctx()
+                and self._speculative_config._num_draft_layers is None
+                and draft_config is not None):
+            self._speculative_config._num_draft_layers = (
+                draft_config.pretrained_config.num_hidden_layers)
+
+    def _is_dflash_hybrid_ctx(self) -> bool:
+        sc = self._speculative_config
+        return (sc is not None and sc.spec_dec_mode.is_dflash()
+                and getattr(sc, 'use_hybrid_context', False))
 
     def _get_model_kv_cache_manager_cls(
         self,
@@ -493,6 +505,19 @@ class KvCacheCreator:
                     effective_draft_config,
                     kv_cache_config,
                     num_layers=self._get_num_draft_layers())
+        if self._is_dflash_hybrid_ctx() and self._mapping.is_last_pp_rank():
+            # Hybrid ctx: draft layers live in the target manager, so their
+            # per-token cost adds to the same budget.
+            effective_draft_config = self._get_effective_draft_config()
+            draft_kv_cache_manager_cls = get_kv_cache_manager_cls(
+                effective_draft_config,
+                kv_cache_config,
+                is_disagg=self._is_disagg)
+            total += self._per_manager_cache_cost(
+                draft_kv_cache_manager_cls,
+                effective_draft_config,
+                kv_cache_config,
+                num_layers=self._get_num_draft_layers())
         return total
 
     def _cal_max_memory(self, peak_memory, total_gpu_memory, fraction,
@@ -1640,6 +1665,7 @@ def _build_per_layer_num_kv_heads(
     num_hidden_layers: int,
     spec_config: Optional[SpeculativeConfig] = None,
     draft_config: Optional[ModelConfig] = None,
+    target_head_dim: Optional[int] = None,
 ) -> Union[int, List[int]]:
     """
     Returns:
@@ -1655,6 +1681,22 @@ def _build_per_layer_num_kv_heads(
     draft_num_kv_heads = getattr(
         draft_pretrained, 'num_key_value_heads',
         getattr(draft_pretrained, 'num_attention_heads', None))
+
+    # The manager has a single head_dim shared by all layers in a pool.
+    # When the draft's head_dim differs from the target's, express the
+    # draft layers' KV bytes in target-head_dim units.
+    draft_head_dim = getattr(draft_pretrained, 'head_dim', None)
+    if (draft_num_kv_heads is not None and target_head_dim is not None
+            and draft_head_dim is not None
+            and draft_head_dim != target_head_dim):
+        draft_kv_elems = draft_num_kv_heads * draft_head_dim
+        if draft_kv_elems % target_head_dim != 0:
+            raise ValueError(
+                f"Draft KV row ({draft_num_kv_heads} heads x "
+                f"{draft_head_dim}) is not expressible in target head_dim "
+                f"({target_head_dim}) units; cannot place draft context in "
+                f"the target KV cache manager.")
+        draft_num_kv_heads = draft_kv_elems // target_head_dim
 
     if draft_num_kv_heads is None or draft_num_kv_heads == num_key_value_heads:
         return num_key_value_heads
@@ -1806,8 +1848,11 @@ def _create_kv_cache_manager(
         per_layer_num_kv_heads = num_key_value_heads
     else:
         per_layer_num_kv_heads = _build_per_layer_num_kv_heads(
-            num_key_value_heads, num_hidden_layers, spec_config,
-            draft_config_for_kv)
+            num_key_value_heads,
+            num_hidden_layers,
+            spec_config,
+            draft_config_for_kv,
+            target_head_dim=head_dim if isinstance(head_dim, int) else None)
     manager_extra_kwargs = {}
     if issubclass(kv_cache_manager_cls, KVCacheManagerV2):
         manager_extra_kwargs["enable_stats"] = enable_kv_cache_stats
