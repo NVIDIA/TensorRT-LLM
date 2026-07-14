@@ -534,8 +534,8 @@ class SpecMetadata:
     # Vocab size used for draft_probs buffer allocation.
     vocab_size: int = 0
     # Size of the SeqSlotManager pool. py_seq_slot values range over
-    # [0, num_seq_slots); under the overlap scheduler this is
-    # 2 * max_batch_size, larger than max_num_requests (== max_batch_size).
+    # [0, num_seq_slots); DeepSeek-V4 overlap can use 2 * max_batch_size,
+    # larger than max_num_requests (== max_batch_size).
     # Slot-indexed buffers (draft_probs) must span this full range.
     # 0 falls back to max_num_requests.
     num_seq_slots: int = 0

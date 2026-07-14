@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 from bisect import bisect_left
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, Optional
@@ -49,8 +52,8 @@ def get_spec_metadata(spec_config,
                       num_seq_slots=None):
     use_rejection_sampling = getattr(spec_config, "use_rejection_sampling",
                                      False)
-    # Slot-indexed buffers (draft_probs) must span the SeqSlotManager pool,
-    # which exceeds max_num_requests under the overlap scheduler.
+    # Slot-indexed buffers (draft_probs) must span the SeqSlotManager pool;
+    # DeepSeek-V4 overlap can exceed max_num_requests.
     num_seq_slots = (num_seq_slots
                      if num_seq_slots is not None else max_num_requests)
     vocab_size = getattr(model_config, "vocab_size", 0)
@@ -131,7 +134,6 @@ def get_spec_metadata(spec_config,
             layers_to_capture=spec_config.eagle3_layers_to_capture,
             use_rejection_sampling=use_rejection_sampling,
             vocab_size=vocab_size,
-            num_seq_slots=num_seq_slots,
             spec_resource_manager=spec_resource_manager,
             use_dynamic_tree=_is_effective_dynamic_tree(spec_config),
             eagle_choices=spec_config.eagle_choices,
@@ -209,9 +211,6 @@ def get_mtp_hidden_size(model_config) -> int:
 
 
 def get_spec_resource_manager(model_engine, draft_model_engine=None):
-    # Lazy import: _util imports model_engine, which imports this module.
-    from ..pyexecutor._util import compute_max_num_sequences
-
     spec_config = model_engine.spec_config
     if spec_config is None:
         return None
@@ -219,11 +218,6 @@ def get_spec_resource_manager(model_engine, draft_model_engine=None):
     max_num_requests = model_engine.batch_size
     max_seq_len = model_engine.max_seq_len
     max_num_tokens = model_engine.max_num_tokens
-    # Slot-indexed storage must span the SeqSlotManager pool, which exceeds
-    # max_num_requests under the overlap scheduler.
-    max_num_seq_slots = compute_max_num_sequences(
-        model_engine.mapping, model_engine.batch_size,
-        model_engine._disable_overlap_scheduler)
     spec_dec_mode = spec_config.spec_dec_mode
     if spec_dec_mode.is_mtp_eagle_one_model():
         sa_manager = None
@@ -261,8 +255,8 @@ def get_spec_resource_manager(model_engine, draft_model_engine=None):
         )
     if spec_dec_mode.is_eagle3_one_model() and _is_effective_dynamic_tree(
             spec_config):
-        return Eagle3OneModelDynamicTreeResourceManager(
-            spec_config, max_num_requests, max_num_seq_slots=max_num_seq_slots)
+        return Eagle3OneModelDynamicTreeResourceManager(spec_config,
+                                                        max_num_requests)
     if spec_dec_mode.is_eagle3_one_model():
         sa_manager = None
         sa_cfg = getattr(spec_config, 'sa_config', None)
@@ -287,7 +281,6 @@ def get_spec_resource_manager(model_engine, draft_model_engine=None):
             max_num_requests,
             max_seq_len,
             max_num_tokens,
-            max_num_seq_slots=max_num_seq_slots,
         )
     if spec_dec_mode.is_save_hidden_states():
         return SaveHiddenStatesResourceManager(

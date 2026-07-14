@@ -89,8 +89,6 @@ from .scheduler import (RequestScheduler, ScheduledRequests,
                         SerializableSchedulerOutput, WaitingQueue,
                         create_waiting_queue)
 from .scheduler.adp_router import ADPRouter
-from .scheduler.scheduler import \
-    is_decoder_context_request_waiting_for_encoder_output
 
 if TYPE_CHECKING:
     from ray.actor import ActorHandle
@@ -567,6 +565,8 @@ class PyExecutor:
         self.resource_manager = resource_manager
         self.scheduler = scheduler
         self.model_engine = model_engine
+        self._enable_dsv4_adp_dummy_fixes = getattr(
+            model_engine, "_enable_dsv4_adp_dummy_fixes", False)
         self.enable_attention_dp = model_engine.enable_attention_dp
         self.dist = dist
         self.sampler = sampler
@@ -2531,7 +2531,6 @@ class PyExecutor:
                 can_queue, _ = self._can_queue(scheduled_batch)
                 if not can_queue:
                     self._revert_gen_alloc(scheduled_batch)
-                self._finalize_adp_dummy_allocation(can_queue)
                 if not can_queue:
                     logger.debug(
                         f"microbatch {microbatch_id} cannot be queued, skipping"
@@ -3221,6 +3220,9 @@ class PyExecutor:
         must release theirs before retrying or the fixed dummy request ID leaks
         cache resources on every skipped iteration.
         """
+        if not self._enable_dsv4_adp_dummy_fixes:
+            return
+
         dummy_request = self._pending_adp_dummy_request
         self._pending_adp_dummy_request = None
         if dummy_request is None or can_queue:
@@ -5336,36 +5338,31 @@ class PyExecutor:
     def _count_schedulable_active_requests(self) -> int:
         """Count active requests that are ready for scheduling.
 
-        Both scheduler implementations exclude requests already in the PP
-        inflight set and requests waiting for encoder output. They also apply
-        the schedulability window [CONTEXT_INIT, GENERATION_TO_COMPLETE), or
-        [ENCODER_INIT, GENERATION_TO_COMPLETE) for encoder-decoder models.
-        States outside that window — e.g. waiting for KV transfer (below) or
-        awaiting completion bookkeeping (at or above) — cannot produce forward
-        work. Counting any of these categories here would suppress the pad
-        dummy while the rank still schedules batch=0, turning can_queue False
-        fleet-wide and stalling every rank.
+        The non-PP DeepSeek-V4 disaggregated ADP path mirrors the decoder
+        scheduler's state window [CONTEXT_INIT, GENERATION_TO_COMPLETE). This
+        covers generation-first context requests below the lower bound and
+        terminal requests at the upper bound. Other configurations retain the
+        established ADP behavior; PP eligibility remains follow-up scope.
 
         Returns:
             The number of active requests eligible for scheduling.
         """
-        # Both bounds must match the scheduler exactly. The decoder-only lower
-        # covers e.g. DISAGG_GENERATION_INIT / TRANS_IN_PROGRESS and
-        # DISAGG_CONTEXT_WAIT_SCHEDULER (gen-first mode on the context
-        # server); encoder-decoder widens it to ENCODER_INIT. The upper bound
-        # covers GENERATION_TO_COMPLETE and all terminal/post-completion states.
-        cross_kv_cache_manager = self.resource_manager.get_resource_manager(
-            ResourceManagerType.CROSS_KV_CACHE_MANAGER)
-        schedule_from_value = (LlmRequestState.ENCODER_INIT.value
-                               if cross_kv_cache_manager is not None else
-                               LlmRequestState.CONTEXT_INIT.value)
+        if (not self._enable_dsv4_adp_dummy_fixes
+                or self.kv_cache_transceiver is None):
+            if self.kv_cache_transceiver is None:
+                return len(self.active_requests)
+
+            return sum(
+                1 for req in self.active_requests
+                if not (req.is_disagg_generation_init_state
+                        or req.is_disagg_generation_transmission_in_progress))
+
+        schedule_from_value = LlmRequestState.CONTEXT_INIT.value
         to_complete_value = LlmRequestState.GENERATION_TO_COMPLETE.value
 
         return sum(
             1 for req in self.active_requests
-            if req.request_id not in self.inflight_req_ids
-            and not is_decoder_context_request_waiting_for_encoder_output(req)
-            and schedule_from_value <= req.state_value < to_complete_value)
+            if schedule_from_value <= req.state_value < to_complete_value)
 
     def _has_adp_dummy_kv_capacity(self,
                                    token_nums: Optional[List[int]]) -> bool:
@@ -5374,7 +5371,7 @@ class PyExecutor:
         V1's dummy allocator historically checked only that one block was
         free. A context-side ADP dummy can be ``max_num_tokens`` long, while a
         generation dummy also reserves draft tokens, so that check can still
-        let the C++ batch allocation throw before PP/CP peers reach their vote.
+        let the C++ batch allocation fail after a peer rank has succeeded.
         """
         token_num = (token_nums[0] if token_nums is not None else 1 +
                      self.max_total_draft_tokens)
@@ -5438,33 +5435,6 @@ class PyExecutor:
         elif has_gen:
             self._adp_dummy_is_gen = True
 
-    def _can_commit_adp_dummy_candidate(
-            self, needs_dummy: bool,
-            dummy_candidate: Optional[LlmRequest]) -> bool:
-        """Agree on dummy creation across one PP/CP scheduling lane.
-
-        The first PP stage propagates request IDs to later stages, so a dummy
-        may only enter ``active_requests`` when every stage (and every CP shard)
-        needs it and allocated its local cache resources. TP/ADP lanes remain
-        independent here; their existing ``_can_queue`` vote decides whether
-        the fleet can run and finalizes or rolls back the committed candidate.
-        """
-        local_status = (needs_dummy, not needs_dummy
-                        or dummy_candidate is not None)
-        lane_statuses = [local_status]
-
-        if self._dist_size(self.dist, "cp_size") > 1:
-            lane_statuses = self.dist.cp_allgather(local_status)
-        if self._dist_size(self.dist, "pp_size") > 1:
-            lane_statuses = [
-                status
-                for stage_statuses in self.dist.pp_allgather(lane_statuses)
-                for status in stage_statuses
-            ]
-
-        return (all(status[0] for status in lane_statuses)
-                and all(status[1] for status in lane_statuses))
-
     @nvtx_range("_pad_attention_dp_dummy_request")
     def _pad_attention_dp_dummy_request(self):
         """
@@ -5473,74 +5443,73 @@ class PyExecutor:
         if not self.enable_attention_dp:
             return
 
-        assert self._pending_adp_dummy_request is None
         assert self.expected_num_active_requests >= len(self.active_requests)
         num_active_request = self._count_schedulable_active_requests()
 
-        skip_dummy = self._should_skip_dummy_for_benchmark_disagg(
-            num_active_request)
+        if self._should_skip_dummy_for_benchmark_disagg(num_active_request):
+            return
 
-        # Allocate tentatively. PP/CP peers must agree before the request ID is
-        # exposed to scheduling; otherwise schedule propagation can reference a
-        # dummy that a later stage failed to create.
-        # Every stage/shard must enter the vote, including ranks that expect no
-        # active requests or suppress padding during benchmark fill. Returning
-        # early on those ranks would leave a peer blocked in pp/cp_allgather.
-        needs_dummy = (not skip_dummy and self.expected_num_active_requests > 0
+        needs_dummy = (self.expected_num_active_requests > 0
                        and num_active_request == 0)
-        dummy_request = None
+        if not needs_dummy:
+            return
+
         dummy_request_ids = [ATTENTION_DP_DUMMY_REQUEST_ID]
+        token_nums = None
+        if (not self._adp_dummy_is_gen and self.kv_cache_transceiver is not None
+                and self.max_num_tokens is not None):
+            token_nums = [self.max_num_tokens]
+
+        if (not self._enable_dsv4_adp_dummy_fixes
+                or self.kv_cache_transceiver is None):
+            llm_request = self.kv_cache_manager.add_dummy_requests(
+                request_ids=dummy_request_ids,
+                token_nums=token_nums,
+                is_gen=self._adp_dummy_is_gen,
+                prepare_resource=True,
+                max_num_draft_tokens=self.max_total_draft_tokens,
+            )[0]
+            llm_request.is_attention_dp_dummy = True
+            spec_resource_manager = self.resource_manager.get_resource_manager(
+                ResourceManagerType.SPEC_RESOURCE_MANAGER)
+            if spec_resource_manager is not None:
+                spec_resource_manager.add_dummy_requests(dummy_request_ids)
+            self.active_requests.append(llm_request)
+            return
+
+        assert self._pending_adp_dummy_request is None
         has_live_adp_dummy = any(
             request.py_request_id == ATTENTION_DP_DUMMY_REQUEST_ID
             for request in self.active_requests)
-        spec_resource_manager = None
-        if needs_dummy and not has_live_adp_dummy:
-            token_nums = None
-            if (not self._adp_dummy_is_gen
-                    and self.kv_cache_transceiver is not None
-                    and self.max_num_tokens is not None):
-                token_nums = [self.max_num_tokens]
-            dummy_requests = None
-            if self._has_adp_dummy_kv_capacity(token_nums):
-                try:
-                    dummy_requests = self.kv_cache_manager.add_dummy_requests(
-                        request_ids=dummy_request_ids,
-                        token_nums=token_nums,
-                        is_gen=self._adp_dummy_is_gen,
-                        prepare_resource=True,
-                        max_num_draft_tokens=self.max_total_draft_tokens,
-                    )
-                except OutOfPagesError:
-                    # V2 can lose a capacity race between its estimate and
-                    # resize. Treat that known resource condition exactly like
-                    # its normal ``None`` result and join the lane vote.
-                    dummy_requests = None
-            if dummy_requests:
-                dummy_request = dummy_requests[0]
-                spec_resource_manager = self.resource_manager.get_resource_manager(
-                    ResourceManagerType.SPEC_RESOURCE_MANAGER)
-                if spec_resource_manager is not None:
-                    try:
-                        spec_resource_manager.add_dummy_requests(
-                            dummy_request_ids)
-                    except NoFreeSlotsError:
-                        # SlotManager checks capacity before inserting the one
-                        # ADP ID, so this specific built-in failure has no
-                        # partial speculative state to unwind. Unexpected
-                        # ValueErrors and all RuntimeErrors remain fatal.
-                        self.kv_cache_manager.free_resources(dummy_request)
-                        dummy_request = None
-
-        if not self._can_commit_adp_dummy_candidate(needs_dummy, dummy_request):
-            if dummy_request is not None:
-                if spec_resource_manager is not None:
-                    spec_resource_manager.free_resources(dummy_request)
-                self.kv_cache_manager.free_resources(dummy_request)
-            if needs_dummy:
-                logger.warning(
-                    "Cannot commit ADP pad dummy on every PP/CP lane rank; "
-                    "rolled back local allocation and will retry.")
+        if has_live_adp_dummy or not self._has_adp_dummy_kv_capacity(
+                token_nums):
             return
+
+        try:
+            dummy_requests = self.kv_cache_manager.add_dummy_requests(
+                request_ids=dummy_request_ids,
+                token_nums=token_nums,
+                is_gen=self._adp_dummy_is_gen,
+                prepare_resource=True,
+                max_num_draft_tokens=self.max_total_draft_tokens,
+            )
+        except OutOfPagesError:
+            dummy_requests = None
+        if not dummy_requests:
+            logger.warning(
+                "Cannot allocate DeepSeek-V4 ADP pad dummy; rank schedules "
+                "an empty batch and the fleet will retry.")
+            return
+
+        dummy_request = dummy_requests[0]
+        spec_resource_manager = self.resource_manager.get_resource_manager(
+            ResourceManagerType.SPEC_RESOURCE_MANAGER)
+        if spec_resource_manager is not None:
+            try:
+                spec_resource_manager.add_dummy_requests(dummy_request_ids)
+            except NoFreeSlotsError:
+                self.kv_cache_manager.free_resources(dummy_request)
+                return
 
         assert dummy_request is not None
         dummy_request.is_attention_dp_dummy = True

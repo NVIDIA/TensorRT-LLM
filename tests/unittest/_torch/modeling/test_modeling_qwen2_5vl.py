@@ -24,8 +24,7 @@ from tensorrt_llm._torch.models.checkpoints.hf.qwen2vl_weight_mapper import \
     Qwen2VLHfWeightMapper
 from tensorrt_llm._torch.models.modeling_qwen2vl import (
     Qwen2_5_VLModel, Qwen2VisionModelBase, Qwen2VLInputProcessorBase,
-    Qwen2VLModel, _get_mrope_position_delta_cache_size,
-    _prepare_qwen_vl_mrope_config)
+    Qwen2VLModel, _prepare_qwen_vl_mrope_config)
 from tensorrt_llm._torch.models.modeling_qwen3vl import \
     Qwen3VLInputProcessorBase
 from tensorrt_llm._utils import get_sm_version
@@ -427,20 +426,13 @@ def _mrope_param(delta: int) -> MultimodalParams:
         })
 
 
-def test_mrope_delta_cache_size_uses_runtime_seq_slot_capacity():
-    model_config = ModelConfig(max_num_tokens=32)
-    model_config.extra_attrs['max_num_seq_slots'] = 8
-
-    assert _get_mrope_position_delta_cache_size(model_config) == 9
-
-
 def test_prepare_qwen_vl_mrope_config_mixed_context_generation():
     rotary_dim = 2
     num_tokens = 5
     position_ids = torch.arange(3 * num_tokens,
                                 device="cuda",
                                 dtype=torch.int32).reshape(3, 1, num_tokens)
-    mrope_position_deltas_cache = torch.zeros(9,
+    mrope_position_deltas_cache = torch.zeros(8,
                                               device="cuda",
                                               dtype=torch.int32)
     mrope_rotary_cos_sin_workspace = torch.empty((1, 8 * rotary_dim * 2),
@@ -449,25 +441,24 @@ def test_prepare_qwen_vl_mrope_config_mixed_context_generation():
 
     config = _prepare_qwen_vl_mrope_config(
         multimodal_params=[_mrope_param(11), _mrope_param(22)],
-        num_generation_requests=3,
+        num_generation_requests=2,
         position_ids=position_ids,
         rotary_emb=_FakeRotaryEmbedding(rotary_dim),
         mrope_position_deltas_cache=mrope_position_deltas_cache,
         mrope_rotary_cos_sin_workspace=mrope_rotary_cos_sin_workspace,
-        mrope_delta_write_seq_slots=torch.tensor([4, 7],
+        mrope_delta_write_seq_slots=torch.tensor([2, 5],
                                                  device="cuda",
                                                  dtype=torch.long),
-        mrope_delta_read_seq_slots=torch.tensor([4, 7, 8],
+        mrope_delta_read_seq_slots=torch.tensor([2, 5],
                                                 device="cuda",
                                                 dtype=torch.long))
 
     torch.testing.assert_close(
-        mrope_position_deltas_cache[[4, 7]],
+        mrope_position_deltas_cache[[2, 5]],
         torch.tensor([11, 22], device="cuda", dtype=torch.int32))
-    assert mrope_position_deltas_cache[8].item() == 0
     torch.testing.assert_close(
         config["mrope_position_deltas"],
-        torch.tensor([[11], [22], [0]], device="cuda", dtype=torch.int32))
+        torch.tensor([[11], [22]], device="cuda", dtype=torch.int32))
 
     packed = config["mrope_rotary_cos_sin"].view(1, num_tokens, rotary_dim, 2)
     cos, sin = _FakeRotaryEmbedding(rotary_dim).get_cos_sin(position_ids)

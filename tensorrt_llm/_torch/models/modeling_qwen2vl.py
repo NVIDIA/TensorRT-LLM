@@ -180,15 +180,6 @@ def _prepare_qwen_vl_mrope_config(
 _MAX_PIXELS_TOKEN_PROBE = 1 << 31
 
 
-def _get_mrope_position_delta_cache_size(
-        model_config: ModelConfig[PretrainedConfig]) -> int:
-    """Return real sequence-slot capacity plus one reserved dummy slot."""
-    max_num_seq_slots = model_config.extra_attrs.get(
-        'max_num_seq_slots',
-        model_config.max_num_tokens * model_config.mapping.pp_size)
-    return max_num_seq_slots + 1
-
-
 class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
                                 BaseMultimodalDummyInputsBuilder):
 
@@ -1714,8 +1705,8 @@ class Qwen2VLModelBase(PreTrainedModel, MultimodalModelMixin):
         if not disable_fuse_rope:
             self.init_mrope_embedding(model_config)
             # Extra slot is reserved for CUDA graph / warmup dummy requests.
-            max_mrope_delta_slots = _get_mrope_position_delta_cache_size(
-                model_config)
+            max_mrope_delta_slots = (
+                model_config.max_num_tokens * model_config.mapping.pp_size + 1)
             self.register_buffer('mrope_position_deltas_cache',
                                  torch.zeros(max_mrope_delta_slots,
                                              dtype=torch.int32,

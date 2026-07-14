@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Unit tests for ``ModelLoader`` configuration and GMS-specific branches."""
+"""Unit tests for GMS-specific branches in ``ModelLoader``."""
 
 from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
@@ -110,52 +110,6 @@ def _make_loader(monkeypatch, *, events, spec_config=None):
         lambda: SimpleNamespace(synchronize=lambda: None),
     )
     return loader
-
-
-def test_load_config_propagates_runtime_seq_slot_capacity(monkeypatch):
-    llm_args = MagicMock()
-    llm_args.model_kwargs = None
-    llm_args.cuda_graph_config = None
-    llm_args.moe_config = MagicMock()
-    llm_args.nvfp4_gemm_config = MagicMock()
-    llm_args.multimodal_config = MagicMock()
-    llm_args.kv_cache_config = MagicMock()
-    loader = ModelLoader(
-        llm_args=llm_args,
-        mapping=MagicMock(),
-        spec_config=None,
-        sparse_attention_config=None,
-        max_num_tokens=128,
-        max_seq_len=128,
-        max_num_seq_slots=16,
-    )
-    text_config = SimpleNamespace(hidden_size=64)
-    pretrained_config = SimpleNamespace(
-        get_text_config=lambda: text_config,
-        torch_dtype=torch.float16,
-        model_type="test",
-    )
-    config = SimpleNamespace(
-        extra_attrs={},
-        nvfp4_gemm_allowed_backends=None,
-        max_num_tokens=128,
-        pretrained_config=pretrained_config,
-    )
-    checkpoint_loader = MagicMock()
-    checkpoint_loader.load_config.return_value = config
-    monkeypatch.setattr(model_loader_mod, "validate_encoder_decoder_tp_scope", lambda *_args: None)
-    monkeypatch.setattr(
-        model_loader_mod, "validate_encoder_decoder_kv_cache_config", lambda *_args: None
-    )
-    monkeypatch.setattr(model_loader_mod, "validate_and_set_kv_cache_quant", lambda *_args: None)
-    monkeypatch.setattr(
-        model_loader_mod, "validate_and_set_mamba_ssm_cache_dtype", lambda *_args: None
-    )
-
-    loaded_config = loader._load_and_validate_config("/ckpt", checkpoint_loader)
-
-    assert loaded_config is config
-    assert config.extra_attrs["max_num_seq_slots"] == 16
 
 
 def _build_gms_backend(*, is_rw, events):

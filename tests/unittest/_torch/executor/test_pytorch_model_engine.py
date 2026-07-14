@@ -3,7 +3,6 @@
 
 import unittest
 from dataclasses import dataclass
-from types import SimpleNamespace
 from unittest.mock import Mock
 
 import torch
@@ -595,7 +594,6 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         attn_metadata.is_cuda_graph = False
 
         model_engine.max_num_tokens = 32
-        model_engine.max_num_seq_slots = 8
         model_engine.input_ids_cuda = torch.zeros(32,
                                                   dtype=torch.int32,
                                                   device='cuda')
@@ -627,9 +625,6 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         dummy_request.sampling_config.beam_width = 1
         dummy_request.py_multimodal_data = {}
         dummy_request.is_cuda_graph_dummy = True
-        dummy_request.py_mrope_position_delta = torch.tensor([[0]],
-                                                             dtype=torch.int32,
-                                                             device='cuda')
 
         scheduled_requests = ScheduledRequests()
         scheduled_requests.context_requests_last_chunk = []
@@ -651,20 +646,10 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         self.assertEqual(result["mrope_delta_write_seq_slots"].cpu().tolist(),
                          [0])
         self.assertEqual(result["mrope_delta_read_seq_slots"].cpu().tolist(),
-                         [0, model_engine.max_num_seq_slots])
+                         [0])
         self.assertNotIn("multimodal_embedding",
                          multimodal_request.py_multimodal_data)
         kv_cache_manager.shutdown()
-
-    def test_preconstructed_mrope_model_requires_runtime_seq_slot_capacity(
-            self) -> None:
-        model_engine = object.__new__(PyTorchModelEngine)
-        model_engine.max_num_seq_slots = 8
-        model_engine.model = SimpleNamespace(
-            mrope_position_deltas_cache=torch.zeros(8, dtype=torch.int32))
-
-        with self.assertRaisesRegex(ValueError, "requires at least 9"):
-            model_engine._validate_mrope_position_delta_cache_capacity()
 
     def test_kv_cache_manager_with_execution_stream(self):
         """Test that KVCacheManager uses the provided execution_stream.

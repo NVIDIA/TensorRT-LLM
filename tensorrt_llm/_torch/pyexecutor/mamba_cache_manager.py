@@ -1120,22 +1120,8 @@ class MixedMambaHybridCacheManager(KVCacheManager, MambaCacheManager,
         KVCacheManager.free_resources(self, request, pin_on_release)
 
     def add_dummy_requests(self, request_ids: List[int], **kwargs):
-        requests = KVCacheManager.add_dummy_requests(self, request_ids,
-                                                     **kwargs)
-        if not requests:
-            return requests
-        try:
-            MambaCacheManager.add_dummy_requests(self, request_ids)
-        except RuntimeError:
-            # KV allocation completed first; restore it if the independent
-            # Mamba pool cannot reserve the matching dummy slot.
-            draft_kv_cache_manager = kwargs.get('draft_kv_cache_manager')
-            for request in requests:
-                if draft_kv_cache_manager is not None:
-                    draft_kv_cache_manager.free_resources(request)
-                KVCacheManager.free_resources(self, request)
-            raise
-        return requests
+        MambaCacheManager.add_dummy_requests(self, request_ids)
+        return KVCacheManager.add_dummy_requests(self, request_ids, **kwargs)
 
     def shutdown(self):
         MambaCacheManager.shutdown(self)
@@ -1845,29 +1831,23 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         result = super().get_num_available_tokens(token_num_upper_bound,
                                                   max_num_draft_tokens,
                                                   **kwargs)
-        # Also bound by the recurrent-state pool capacity. With block reuse,
-        # each request needs roughly ceil(N / states_snapshot_interval) blocks
-        # (+1 for the final live state). Without reuse, it still needs one live
-        # recurrent-state block, so an exhausted pool must fail preflight.
-        if self.linear_attention_metadata is None:
-            # A PP rank with no local Mamba layers has no recurrent-state pool.
-            return max(result, 0)
-
-        interval = self.linear_attention_metadata.states_snapshot_interval
-        stats = self.impl.get_kv_cache_stats()
-        rs_free = stats.num_free_blocks_per_window_size.get(
-            LinearCacheType.RECURRENT_STATES.value, 0)
+        # Also bound by the recurrent-state pool capacity: each request needs
+        # roughly ceil(N / states_snapshot_interval) recurrent-state blocks
+        # (+1 for the corner case where N is a multiple of tokens_per_block).
+        # When block reuse is disabled, only one snapshot is needed per
+        # request, so no additional capping is required here.
+        interval = (self.linear_attention_metadata.states_snapshot_interval
+                    if self.linear_attention_metadata is not None else 0)
         if interval and interval > 0:
+            stats = self.impl.get_kv_cache_stats()
+            rs_free = stats.num_free_blocks_per_window_size.get(
+                LinearCacheType.RECURRENT_STATES.value, 0)
             # Reserve 1 block for the always-allocated last block (corner case
             # / final live state) so we don't promise more tokens than the
             # pool can actually back at allocation time.
             usable_rs_blocks = max(0, rs_free - 1)
-            rs_token_cap = max(
-                0, usable_rs_blocks * interval - self.num_extra_kv_tokens -
-                max_num_draft_tokens)
+            rs_token_cap = usable_rs_blocks * interval
             result = min(result, rs_token_cap)
-        elif rs_free == 0:
-            result = 0
         return max(result, 0)
 
     def get_ssm_states(self, layer_idx: int) -> torch.Tensor:
@@ -1988,7 +1968,8 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
 
         self.cuda_state_indices.copy_(self._host_state_indices,
                                       non_blocking=True)
-        self._refresh_dummy_request_mask([req.is_dummy for req in requests])
+        self._refresh_dummy_request_mask(
+            [req.is_dummy for req in self.requests])
 
         # Build request_id → pool block offset mapping so that
         # get_state_indices can return indices in arbitrary request order.

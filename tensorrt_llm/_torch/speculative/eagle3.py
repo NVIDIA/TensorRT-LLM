@@ -40,8 +40,7 @@ class Eagle3ResourceManager(BaseResourceManager):
                  max_num_requests: int,
                  max_seq_len: int,
                  max_num_tokens: int,
-                 sa_manager=None,
-                 max_num_seq_slots: int | None = None):
+                 sa_manager=None):
         self.dtype = dtype
         self.max_draft_len = config.max_draft_len
         self.hidden_size = hidden_size
@@ -102,7 +101,6 @@ class Eagle3ResourceManager(BaseResourceManager):
                 max_total_draft_tokens=self.max_total_draft_tokens,
                 eagle_choices=config.eagle_choices,
                 dynamic_tree_max_topK=config.dynamic_tree_max_topK,
-                max_num_seq_slots=max_num_seq_slots,
             )
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
@@ -158,10 +156,7 @@ class Eagle3OneModelDynamicTreeResourceManager(BaseResourceManager):
     hidden_states: Optional[torch.Tensor] = None
     batch_indices_cuda: Optional[torch.Tensor] = None
 
-    def __init__(self,
-                 config: "EagleDecodingConfig",
-                 max_num_requests: int,
-                 max_num_seq_slots: int | None = None):
+    def __init__(self, config: "EagleDecodingConfig", max_num_requests: int):
         self.max_num_requests = max_num_requests
         self.batch_indices_cuda = torch.empty(
             [max_num_requests],
@@ -175,7 +170,6 @@ class Eagle3OneModelDynamicTreeResourceManager(BaseResourceManager):
             max_total_draft_tokens=config.tokens_per_gen_step - 1,
             eagle_choices=config.eagle_choices,
             dynamic_tree_max_topK=config.dynamic_tree_max_topK,
-            max_num_seq_slots=max_num_seq_slots,
         )
 
     def free_resources(self, request: LlmRequest):
