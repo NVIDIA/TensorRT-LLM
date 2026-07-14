@@ -19,7 +19,7 @@ from tensorrt_llm._torch.alltoall_watchdog import (
     DEFAULT_ALLTOALL_WATCHDOG_POLL_INTERVAL_S,
     DEFAULT_ALLTOALL_WATCHDOG_TIMEOUT_S, ActiveRankMaskSnapshot,
     AlltoAllWatchdog, AlltoAllWatchdogCoordinator, AlltoAllWatchdogTimeout,
-    EPGroupHealthLike)
+    EPGroupHealthLike, reject_rank_mask_cuda_graph_capture)
 from tensorrt_llm.bindings import internal as _tllm_internal
 from tensorrt_llm.logger import logger as tllm_logger
 from tensorrt_llm.mapping import Mapping
@@ -151,8 +151,9 @@ class MoeAlltoAll:
                 Note: The terminology is mapped to `num_experts` in this class and the kernels.
             num_experts: (Optional) Number of experts for EPLB stats (must be <= num_slots). DO NOT provide this parameter if EPLB is not enabled.
                 Note: The terminology is mapped to `eplb_stats_num_experts` in this class and the kernels.
-            ep_group_health: Optional read-only committed EP membership. When present, its mask is passed to the
-                CUDA kernels and defines the peers expected by the watchdog. Timeout detection never mutates it.
+            ep_group_health: Optional read-only committed EP membership. When present, rank-mask handling is
+                enabled in the CUDA kernels, and its mask defines the peers expected by the watchdog. Timeout
+                detection never mutates it. CUDA graphs are rejected until membership-scoped recapture lands.
             alltoall_watchdog_timeout_s: Optional timeout for the host-side AlltoAll watchdog. If None, the
                 watchdog is disabled.
             alltoall_watchdog_poll_interval_s: Poll interval for the watchdog thread.
@@ -234,6 +235,8 @@ class MoeAlltoAll:
         # Internal state
         self._state: _A2AState = _A2AState()
         self.ep_group_health = ep_group_health
+        # Keep the kernel specialization stable for this communicator's lifetime.
+        self._rank_mask_enabled = ep_group_health is not None
         workspace_state = self._WORKSPACE
         assert workspace_state is not None
         metainfo_index = self._METAINFO_INDEX
@@ -291,14 +294,16 @@ class MoeAlltoAll:
             invalid_token_expert_id: If not None, set the token_selected_experts of the invalid tokens to this expert id. This is used to notify the MoE to skip these tokens for GroupGEMM.
             expert_id_payload_index: The index of token_selected_experts in the input_payloads. Must be provided if invalid_token_expert_id is not None.
             eplb_local_stats: (Optional) [num_experts] tensor containing local statistics for EPLB
-            active_rank_mask: Optional uint64 CPU tensor overriding committed membership for this dispatch. When
+            active_rank_mask: Optional uint64 CPU tensor overriding committed membership in rank-mask mode. When
                 omitted, the committed mask and generation are captured together. Combine reuses that mask and
-                fails closed if the committed generation changes first.
+                fails closed if the committed generation changes first. The masked kernel rejects inactive routes
+                before remote access; that sentinel is an internal abort artifact, not valid model output.
 
         Returns:
             recv_tensors: List of tensors received, each has shape [ep_size, max_tokens_per_rank, payload_num_elements_per_token]
         """
         assert self._state.phase == "idle", "dispatch called twice without an intervening combine"
+        reject_rank_mask_cuda_graph_capture(self._rank_mask_enabled)
         assert runtime_max_tokens_per_rank <= self.max_num_tokens, "runtime_max_tokens_per_rank must not exceed max_num_tokens"
         if eplb_local_stats is not None:
             assert self.enable_eplb, "eplb_local_stats provided but enable_eplb is False"
@@ -308,8 +313,13 @@ class MoeAlltoAll:
                 0
             ) == self.eplb_stats_num_experts, "eplb_local_stats size must match eplb_stats_num_experts"
 
+        requested_active_rank_mask = active_rank_mask
+        if (not self._rank_mask_enabled
+                and requested_active_rank_mask is not None):
+            raise ValueError(
+                "active_rank_mask requires committed EP group health")
         active_rank_mask_snapshot = self._watchdog_coordinator.capture_active_rank_mask(
-            active_rank_mask)
+            requested_active_rank_mask)
         active_rank_mask = active_rank_mask_snapshot.active_rank_mask
         recv_tensors, combine_payload_offset, eplb_gathered_stats = torch.ops.trtllm.moe_a2a_dispatch(
             token_selected_experts,
@@ -322,6 +332,7 @@ class MoeAlltoAll:
             self.top_k,
             self.num_experts,
             eplb_local_stats,
+            self._rank_mask_enabled,
             active_rank_mask,
         )
         self._watchdog_coordinator.watch_collective(self._alltoall_watchdog,
@@ -367,24 +378,32 @@ class MoeAlltoAll:
             runtime_max_tokens_per_rank: Maximum of the number of tokens of each DP rank's local batch.
             payload_in_workspace: If True, 'payload' is a view into 'workspace' at 'combine_payload_offset' and no staging copy is needed. If False, the op stages 'payload' into the workspace region before combining.
             use_low_precision_combine: If True, quantize the combine payload to FP8 for NVLink transfer (halves NVLink bandwidth usage, output precision is preserved).
-            active_rank_mask: Optional uint64 CPU tensor. If supplied, it must match the mask captured by dispatch
-                for this collective. A committed-generation change since dispatch aborts the collective epoch.
+            active_rank_mask: Optional uint64 CPU tensor. In rank-mask mode, it must match the mask captured by
+                dispatch for this collective when supplied. A committed-generation change since dispatch aborts
+                the collective epoch.
 
         Returns:
             combined_output: [local_num_tokens, num_elements_per_token] tensor of combined results
         """
         assert self._state.phase == "dispatched", "combine called before a successful dispatch"
+        reject_rank_mask_cuda_graph_capture(self._rank_mask_enabled)
         assert runtime_max_tokens_per_rank <= self.max_num_tokens, "runtime_max_tokens_per_rank must not exceed max_num_tokens"
 
         active_rank_mask_snapshot = self._state.active_rank_mask_snapshot
         assert active_rank_mask_snapshot is not None
+        requested_active_rank_mask = active_rank_mask
+        if (not self._rank_mask_enabled
+                and requested_active_rank_mask is not None):
+            raise ValueError(
+                "active_rank_mask requires committed EP group health")
         active_rank_mask = self._watchdog_coordinator.active_rank_mask_for_combine(
-            active_rank_mask_snapshot, active_rank_mask)
+            active_rank_mask_snapshot, requested_active_rank_mask)
         output = torch.ops.trtllm.moe_a2a_combine(
             payload, self._state.local_num_tokens, self.workspace,
             self.metainfo, runtime_max_tokens_per_rank, self.ep_rank,
             self.ep_size, self.top_k, self._state.combine_payload_offset,
-            payload_in_workspace, use_low_precision_combine, active_rank_mask)
+            payload_in_workspace, use_low_precision_combine,
+            self._rank_mask_enabled, active_rank_mask)
         self._watchdog_coordinator.watch_collective(self._alltoall_watchdog,
                                                     "combine", active_rank_mask)
 
