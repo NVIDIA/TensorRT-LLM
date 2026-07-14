@@ -585,9 +585,7 @@ class QwenImagePipeline(BasePipeline):
                 )[0].contiguous()
                 gather_list = [torch.empty_like(noise_pred_local) for _ in range(cfg_size)]
                 dist.all_gather(gather_list, noise_pred_local, group=cfg_pg)
-                noise_pred = self._combine_true_cfg(
-                    gather_list[0], gather_list[1], true_cfg_scale
-                )
+                noise_pred = self._combine_true_cfg(gather_list[0], gather_list[1], true_cfg_scale)
             else:
                 noise_pred = self.transformer(
                     hidden_states=latents,

@@ -159,15 +159,11 @@ def test_qwen_image_selects_cfg_inputs_by_rank():
     negative = torch.tensor([3])
     negative_mask = torch.tensor([4])
 
-    selected = QwenImagePipeline._select_cfg_inputs(
-        0, prompt, prompt_mask, negative, negative_mask
-    )
+    selected = QwenImagePipeline._select_cfg_inputs(0, prompt, prompt_mask, negative, negative_mask)
     assert selected[0] is prompt
     assert selected[1] is prompt_mask
 
-    selected = QwenImagePipeline._select_cfg_inputs(
-        1, prompt, prompt_mask, negative, negative_mask
-    )
+    selected = QwenImagePipeline._select_cfg_inputs(1, prompt, prompt_mask, negative, negative_mask)
     assert selected[0] is negative
     assert selected[1] is negative_mask
 
