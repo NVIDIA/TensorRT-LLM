@@ -647,13 +647,17 @@ class MistralNativeInputProcessor(BaseMultimodalInputProcessor,
         self, inputs: TextPrompt, sampling_params: SamplingParams
     ) -> Tuple[List[int], ExtraProcessedInputs | None]:
         images = inputs.get("multi_modal_data", {}).get("image")
-        # MistralCommonImageProcessor builds the full conversation and applies
-        # the mistral-common chat template internally.
+        if not images:
+            # Text-only: tokenize directly without wrapping in a chat template.
+            # The chat template is either already applied by the caller (serve
+            # path) or intentionally absent (e.g. raw few-shot eval like MMLU).
+            input_ids = self.tokenizer.transformers_tokenizer.encode(
+                inputs["prompt"])
+            return input_ids, None
+        # Multimodal: MistralCommonImageProcessor builds the full conversation
+        # and applies the mistral-common chat template with image tokens.
         processed = self.processor(text=inputs["prompt"], images=images)
         input_ids = processed.pop("input_ids").tolist()[0]
-        pixel_values = processed.get("pixel_values")
-        if pixel_values is None:
-            return input_ids, None
         processed.pop("attention_mask", None)
         processed["image_sizes"] = processed["image_sizes"].tolist()
         return input_ids, {"multimodal_data": {"image": {**processed}}}
