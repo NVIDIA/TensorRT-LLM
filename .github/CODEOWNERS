@@ -443,7 +443,6 @@
 # ===== DISAGG BLAST-RADIUS CO-OWNS (Tier-1) =====
 # Last-match cross-cutting: adds disagg-devs to shared files that can silently break disagg e2e.
 /tensorrt_llm/_torch/pyexecutor/resource_manager.py @NVIDIA/trt-llm-kv-cache-manager-devs @NVIDIA/trt-llm-disagg-devs
-/tensorrt_llm/_torch/modules/mla.py @NVIDIA/trt-llm-torch-attention-devs @NVIDIA/trt-llm-disagg-devs
 /tensorrt_llm/_torch/pyexecutor/py_executor.py @NVIDIA/trt-llm-runtime-devs @NVIDIA/trt-llm-disagg-devs
 /tensorrt_llm/_torch/pyexecutor/model_engine.py @NVIDIA/trt-llm-runtime-devs @NVIDIA/trt-llm-disagg-devs
 
