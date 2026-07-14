@@ -5105,6 +5105,69 @@ class PyExecutor:
         self.batch_wait_iters_count = 0
         return context_requests
 
+    def _get_ctx_mla_kv_len_cap(self):
+        """Cap on the summed context attended-KV length (total_kv_len) per forward step.
+
+        Equals the KV pool's primary-pool token capacity, which is exactly what the estimator reserved the
+        fp8 context-MLA attention workspace for (`max_tokens = budget / (k + w)`). Returns None (no cap) for
+        non-fp8-MLA models — those reserved no workspace, so this per-forward constraint must not alter their
+        scheduling. Computed once and cached.
+        """
+        cap = getattr(self, "_ctx_mla_kv_len_cap", "unset")
+        if cap != "unset":
+            return cap
+        # Lazy import: _util imports py_executor at module scope, so a top-level import here is circular.
+        from ._util import get_mla_context_workspace_bytes_per_token
+        cap = None
+        w = get_mla_context_workspace_bytes_per_token(
+            self.model_engine.model.model_config, self.dist.mapping)
+        if w > 0:
+            blocks = getattr(self.kv_cache_manager, "blocks_in_primary_pool",
+                             None)
+            tokens_per_block = getattr(self.kv_cache_manager,
+                                       "tokens_per_block", None)
+            if blocks and tokens_per_block:
+                cap = int(blocks) * int(tokens_per_block)
+        self._ctx_mla_kv_len_cap = cap
+        return cap
+
+    @staticmethod
+    def _context_attended_kv_len(ctx_req) -> int:
+        """Attended KV length a context request contributes to host_total_kv_lens[0] this step.
+
+        That is the cached prefix (post-reuse begin position) plus this chunk's new tokens, clamped to the
+        prompt length. Mirrors the V1/V2 reuse-timing handling of `_compute_scheduled_tokens`: V1 leaves
+        `context_current_position` at 0 at schedule time with the reuse credit in `estimated_reusable_tokens`
+        (only on the first chunk), while V2 has already advanced `context_current_position`.
+        """
+        begin = ctx_req.context_current_position
+        if ctx_req.is_first_context_chunk:
+            begin = max(begin, ctx_req.estimated_reusable_tokens)
+        attended = begin + ctx_req.context_chunk_size
+        return min(attended, ctx_req.orig_prompt_len)
+
+    def _cap_context_by_total_kv_len(self, context_requests):
+        """Trim scheduled context requests so their summed attended KV length fits the fp8 context-MLA
+        attention-workspace reservation, preventing a mid-forward OOM when the workspace resizes to the
+        summed attended KV (which KV-cache reuse can push far past `max_num_tokens`). The first request is
+        always kept: a single request's attended length is bounded by the pool it lives in, so it fits the
+        reservation, and keeping it guarantees forward progress (no livelock). Deferred requests stay active
+        and are retried next iteration, mirroring `_waiting_requests`.
+        """
+        cap = self._get_ctx_mla_kv_len_cap()
+        if cap is None or len(context_requests) <= 1:
+            return context_requests
+        cumulative = 0
+        for i, ctx_req in enumerate(context_requests):
+            cumulative += self._context_attended_kv_len(ctx_req)
+            if i > 0 and cumulative > cap:
+                logger.debug(
+                    f"Deferring {len(context_requests) - i} context request(s): summed attended "
+                    f"KV length {cumulative} would exceed the fp8 context-MLA workspace cap {cap}."
+                )
+                return context_requests[:i]
+        return context_requests
+
     @nvtx_range("_schedule")
     def _schedule(self):
         scheduler_output = self.scheduler.schedule_request(
@@ -5136,6 +5199,11 @@ class PyExecutor:
                 scheduled_context_requests = self.kv_cache_manager.filter_ctx_requests_by_capacity(
                     scheduled_context_requests)
                 num_fitting = len(scheduled_context_requests)
+
+        # Cap summed context attended-KV length so the fp8 context-MLA attention workspace stays within the
+        # headroom the estimator reserved for it (no-op for non-fp8-MLA models).
+        scheduled_context_requests = self._cap_context_by_total_kv_len(
+            scheduled_context_requests)
 
         scheduled_requests = ScheduledRequests()
         scheduled_requests.encoder_requests = scheduler_output.encoder_requests

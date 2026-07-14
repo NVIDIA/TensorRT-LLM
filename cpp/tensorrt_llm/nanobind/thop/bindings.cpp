@@ -19,6 +19,7 @@
 #include <nanobind/stl/optional.h>
 #include <nanobind/stl/tuple.h>
 #include <nanobind/stl/vector.h>
+#include <tensorrt_llm/common/attentionOp.h>
 #include <tensorrt_llm/kernels/helixAllToAll.h>
 #include <tensorrt_llm/thop/attentionOp.h>
 #include <tensorrt_llm/thop/moeAlltoAllMeta.h>
@@ -185,6 +186,14 @@ void initBindings(nb::module_& m)
         "get_helix_workspace_size_per_rank",
         [](int cp_size) { return tensorrt_llm::kernels::computeHelixWorkspaceSizePerRank(cp_size); },
         nb::arg("cp_size"), "Get helix all-to-all workspace size per rank in bytes");
+
+    m.def("get_context_mla_workspace_bytes_per_token",
+        &tensorrt_llm::common::op::AttentionOp::contextMlaWorkspaceBytesPerToken, nb::arg("num_attn_heads"),
+        nb::arg("qk_rope_head_dim"), nb::arg("qk_nope_head_dim"), nb::arg("v_head_dim"), nb::arg("fp8_context_mla"),
+        nb::arg("separate_q_and_kv_input"), nb::arg("sparse_mla"),
+        "Per-token byte cost of the context-MLA K/V dequant staging buffers (scales with summed attended KV "
+        "length). Returns 0 outside the fp8 context-MLA separate-Q/KV path. Used by the KV-cache estimator to "
+        "reserve workspace headroom before sizing the KV pool.");
 
     m.def("compute_flash_mla_metadata", &tensorrt_llm::computeFlashMlaMetadata, nb::arg("seqlens_k"),
         nb::arg("tile_scheduler_metadata"), nb::arg("num_splits"), nb::arg("batch_size"), nb::arg("s_q"),
