@@ -428,16 +428,10 @@ def _maybe_force_ray(request, monkeypatch, ray_mode):
 
     # Only patch the torch LLM class
     if hasattr(test_mod, 'LLM'):
-        try:
-            from tensorrt_llm._tensorrt_engine import LLM as LLM_legacy
-            is_trtllm_backend = (test_mod.LLM is LLM_legacy)
-        except Exception:
-            is_trtllm_backend = False
-        if not is_trtllm_backend:
-            monkeypatch.setattr(test_mod,
-                                'LLM',
-                                wrap_llm(test_mod.LLM),
-                                raising=False)
+        monkeypatch.setattr(test_mod,
+                            'LLM',
+                            wrap_llm(test_mod.LLM),
+                            raising=False)
     if hasattr(test_mod, 'LLM_torch'):
         monkeypatch.setattr(test_mod,
                             'LLM_torch',
