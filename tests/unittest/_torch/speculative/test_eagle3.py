@@ -939,6 +939,12 @@ def test_eagle3_cdl_sampling(disable_overlap_scheduler: bool):
 @pytest.mark.parametrize("use_cuda_graph", [False, True])
 @pytest.mark.high_cuda_memory
 @skip_blackwell
+# Opt out of MPI session reuse: the XQA JIT cubin registry is process-global
+# (DecoderXQARunner::getResourceGlobal) and its lookup key does not include
+# q_seq_len / is_spec_dec_tree, so running the dynamic-tree and non-dynamic-tree
+# variants in one worker process launches a cubin compiled for the other
+# config's q_seq_len -> CUDA_ERROR_INVALID_VALUE on Hopper.
+@pytest.mark.private_mpi_session
 @with_mocked_hf_download_for_single_gpu
 def test_llama_eagle3_rejection_sampling_modes(use_dynamic_tree: bool,
                                                use_cuda_graph: bool):
