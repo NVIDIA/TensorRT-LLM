@@ -295,20 +295,24 @@ def media_hw(value: Any) -> tuple[int, int] | None:
         if media_path.suffix.lower() in IMAGE_EXTENSIONS:
             with PIL.Image.open(media_path) as image:
                 return image.height, image.width
-        # Probe the container header via PyAV (the declared media dep) —
-        # no frame decode needed for dimensions.
+        # Read dimensions from the container header via OpenCV (the shared media
+        # decoder) — no frame decode needed. A missing decoder yields no
+        # dimensions here; the actual decode raises the clear install hint.
         try:
-            import av
+            from tensorrt_llm.inputs.media_io import _get_cv2
+
+            cv2 = _get_cv2()
         except ImportError:
             return None
+        capture = cv2.VideoCapture(str(media_path))
         try:
-            with av.open(str(media_path)) as container:
-                if container.streams.video:
-                    stream = container.streams.video[0]
-                    return int(stream.height), int(stream.width)
-        except av.FFmpegError:
-            return None
-        return None
+            if not capture.isOpened():
+                return None
+            width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
+            height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        finally:
+            capture.release()
+        return (height, width) if width > 0 and height > 0 else None
     if isinstance(value, torch.Tensor):
         tensor = value.detach()
         if tensor.ndim == 5:

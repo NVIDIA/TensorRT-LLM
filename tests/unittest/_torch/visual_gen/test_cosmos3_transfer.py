@@ -27,13 +27,14 @@ from tensorrt_llm._torch.visual_gen.models.cosmos3 import pipeline_cosmos3 as pi
 from tensorrt_llm._torch.visual_gen.models.cosmos3 import transfer as transfer_module
 from tensorrt_llm._torch.visual_gen.models.cosmos3.pipeline_cosmos3 import Cosmos3OmniMoTPipeline
 from tensorrt_llm._torch.visual_gen.models.cosmos3.transfer import (
+    _path_media_to_uint8_cthw,
+    find_closest_target_size,
     load_or_compute_control_frames,
     make_blur_control,
     make_edge_control,
     media_hw,
     pad_temporal_frames,
     resolve_transfer_config,
-    _path_media_to_uint8_cthw,
 )
 from tensorrt_llm._torch.visual_gen.models.cosmos3.transformer_cosmos3 import TransformerOutput
 from tensorrt_llm._torch.visual_gen.models.cosmos3.utils import read_video_tensor
@@ -247,18 +248,13 @@ class TestTransferMediaHelpers:
 
     @staticmethod
     def _write_mp4(path, num_frames=5, size=16):
-        av = pytest.importorskip("av")
-        with av.open(str(path), "w") as container:
-            stream = container.add_stream("mpeg4", rate=4)
-            stream.width = size
-            stream.height = size
-            stream.pix_fmt = "yuv420p"
+        cv2 = pytest.importorskip("cv2")
+        writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"mp4v"), 4.0, (size, size))
+        try:
             for _ in range(num_frames):
-                frame = av.VideoFrame.from_ndarray(
-                    np.zeros((size, size, 3), dtype=np.uint8), format="rgb24"
-                )
-                container.mux(stream.encode(frame))
-            container.mux(stream.encode())
+                writer.write(np.zeros((size, size, 3), dtype=np.uint8))
+        finally:
+            writer.release()
 
     def test_video_decode_paths(self, tmp_path):
         clip = tmp_path / "clip.mp4"
@@ -451,3 +447,44 @@ class TestForwardTransferChunks:
         torch.testing.assert_close(captured["targets"][0][:, :, 0], torch.full((1, 3, 16, 16), -1.0))
         torch.testing.assert_close(captured["targets"][0][:, :, 1], torch.full((1, 3, 16, 16), 1.0))
         torch.testing.assert_close(captured["targets"][0][:, :, 2:], torch.full((1, 3, 3, 16, 16), 1.0))
+
+
+class TestFindClosestTargetSize:
+    """Maps a source frame onto the aspect-ratio-closest output bucket for a
+    resolution level, returning ``(width, height)``."""
+
+    @pytest.mark.parametrize(
+        "h, w, resolution, expected",
+        [
+            # Exact aspect ratios at the 720 level resolve to their own bucket.
+            (720, 1280, 720, (1280, 720)),  # 16:9 landscape
+            (1280, 720, 720, (720, 1280)),  # 9:16 portrait
+            (512, 512, 720, (960, 960)),  # 1:1 square
+            (768, 1024, 720, (1104, 832)),  # 4:3 landscape
+            (1024, 768, 720, (832, 1104)),  # 3:4 portrait
+            # Other levels select from that level's own table.
+            (720, 1280, 480, (832, 480)),
+            (256, 256, 256, (256, 256)),
+        ],
+    )
+    def test_maps_to_matching_bucket(self, h, w, resolution, expected):
+        assert find_closest_target_size(h, w, resolution) == expected
+
+    def test_returns_width_height_order(self):
+        # A landscape source (w > h) must yield a landscape bucket (target_w >
+        # target_h); guards against an (h, w) transposition of the return value.
+        target_w, target_h = find_closest_target_size(720, 1280, 720)
+        assert (target_w, target_h) == (1280, 720)
+        assert target_w > target_h
+
+    def test_picks_nearest_when_no_exact_match(self):
+        # A 2:1 ultra-wide source has no exact bucket; the closest ratio at the
+        # 720 level is 16:9 (1280x720).
+        assert find_closest_target_size(500, 1000, 720) == (1280, 720)
+
+    def test_resolution_accepts_int_or_str(self):
+        assert find_closest_target_size(720, 1280, 720) == find_closest_target_size(720, 1280, "720")
+
+    def test_unknown_resolution_raises(self):
+        with pytest.raises(ValueError, match="Unknown Cosmos3 transfer resolution"):
+            find_closest_target_size(720, 1280, 1080)
