@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import time
 import uuid
 from collections import defaultdict
@@ -254,8 +269,11 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             n = int((block_ids >= 0).sum())
             if n == 0:
                 continue
-            for pv in lg.pool_views:
-                pool = get_physical_pool(pt, lg_id, pv.pool_idx)
+            # Logical views can share one physical pool (e.g. K/V and a
+            # replicated side cache split out of the same slot); count each
+            # physical pool once.
+            for pool_idx in sorted({pv.pool_idx for pv in lg.pool_views}):
+                pool = get_physical_pool(pt, lg_id, pool_idx)
                 total += n * pool.slot_bytes
         return total
 
@@ -370,10 +388,15 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
     def _consensus_outcome(
         self, to_process, cancelled, failed, completed, allgather: Callable, need_sync: bool
     ):
-        # CANCELLED/FAILED on any rank → global; COMPLETED only when ALL ranks agree.
-        all_c = self._allgather_or_passthrough(cancelled, allgather, need_sync)
-        all_f = self._allgather_or_passthrough(failed, allgather, need_sync)
-        all_done = self._allgather_or_passthrough(completed, allgather, need_sync)
+        # CANCELLED/FAILED on any rank → global; COMPLETED only when ALL ranks
+        # agree. The three id lists travel in ONE allgather (packed as a
+        # list-of-lists) instead of three collectives.
+        per_rank = self._allgather_or_passthrough(
+            [list(cancelled), list(failed), list(completed)], allgather, need_sync
+        )
+        all_c = [rank_lists[0] for rank_lists in per_rank]
+        all_f = [rank_lists[1] for rank_lists in per_rank]
+        all_done = [rank_lists[2] for rank_lists in per_rank]
         n = len(all_c)
         global_cancelled = self._union(all_c)
         global_failed = self._union(all_f)
@@ -552,6 +575,17 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         wait_num = at_least_request_num if not block_all else 0
 
         local_completed, local_failed = self._collect_done(self._send_sessions, self._send_reqs)
+
+        # TODO: support a ctx consensus fast-path in a follow-up PR: gate the
+        # variable-length consensus allgathers below with a fixed-size integer
+        # reduction of the local terminal-session count, so idle executor
+        # polls (wait_num == 0, nothing finished anywhere) return early. The
+        # reduction must mirror _ctx_consensus()'s communicator scope (TP
+        # group, then PP group; TP skipped under attention DP) — a
+        # WORLD-scoped collective would mismatch ordering or hang under
+        # ADP+PP, where independent attention-DP lanes poll on their own
+        # schedules. See the skipped test
+        # test_ctx_consensus_fastpath_skips_when_idle.
         to_process = self._build_to_process(
             self._send_sessions,
             self._ctx_consensus(local_completed + local_failed),

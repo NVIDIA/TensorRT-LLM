@@ -177,13 +177,19 @@ def test_fanin_bounce_safe_gate():
     expected_transfers) must fall back to the per-fragment path.
     """
     tfr = pytest.importorskip("tensorrt_llm._torch.disaggregation.native.transfer")
+    from tensorrt_llm._torch.disaggregation.resource.page import MapperKind
+
     safe = tfr.Receiver._fanin_bounce_safe
 
-    def ov(dup, pp):
-        return SimpleNamespace(duplicate_head_factor=dup, overlap_pp_size=pp)
+    def ov(dup, pp, ranks=(0,)):
+        return SimpleNamespace(duplicate_head_factor=dup, overlap_pp_size=pp, ranks=list(ranks))
 
-    def ri(lpp):
-        return SimpleNamespace(layer_num_per_pp=lpp)
+    def ri(lpp, page_table=None):
+        return SimpleNamespace(layer_num_per_pp=lpp, page_table=page_table)
+
+    def pt(mapper_kind):
+        view = SimpleNamespace(mapper_kind=mapper_kind)
+        return SimpleNamespace(layer_groups=[SimpleNamespace(pool_views=[view])])
 
     # single PP stage (overlap_pp_size <= 1): only duplicate_head_factor matters
     assert safe(ov(1, 1), ri([24])) is True
@@ -197,6 +203,12 @@ def test_fanin_bounce_safe_gate():
     assert safe(ov(1, 4), ri([20])) is False
     # duplicate heads blocks even an otherwise-even PP split
     assert safe(ov(2, 4), ri([20, 20, 20, 20])) is False
+    # replicated views (one elected sender per destination) make multi-writer
+    # contributions unequal -> fall back; single-writer overlap stays safe,
+    # and sharded-only view schemes are unaffected
+    assert safe(ov(1, 1, ranks=(0, 1)), ri([24], pt(MapperKind.REPLICATED))) is False
+    assert safe(ov(1, 1, ranks=(0,)), ri([24], pt(MapperKind.REPLICATED))) is True
+    assert safe(ov(1, 1, ranks=(0, 1)), ri([24], pt(MapperKind.NHD))) is True
 
 
 # --------------------------------------------------------------------------- #
