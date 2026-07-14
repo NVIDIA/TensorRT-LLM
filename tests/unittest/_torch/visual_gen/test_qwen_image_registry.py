@@ -133,6 +133,25 @@ def test_qwen_image_cfg_parallel_state(monkeypatch):
     assert pipeline._cfg_parallel_state(True) == (True, 2, 1, "cfg_pg")
     assert pipeline._cfg_parallel_state(False) == (False, 2, 1, "cfg_pg")
 
+    pipeline.pipeline_config = SimpleNamespace(visual_gen_mapping=None)
+    assert pipeline._cfg_parallel_state(True) == (False, 1, 0, None)
+
+    pipeline.pipeline_config = SimpleNamespace(
+        visual_gen_mapping=SimpleNamespace(cfg_size=3, cfg_rank=0, cfg_group="cfg_pg")
+    )
+    with pytest.raises(ValueError, match="cfg_size=3"):
+        pipeline._cfg_parallel_state(True)
+
+    pipeline.pipeline_config = SimpleNamespace(
+        visual_gen_mapping=SimpleNamespace(cfg_size=2, cfg_rank=0, cfg_group="cfg_pg")
+    )
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.visual_gen.models.qwen_image.pipeline_qwen_image.dist.is_initialized",
+        lambda: False,
+    )
+    with pytest.raises(RuntimeError, match="torch.distributed"):
+        pipeline._cfg_parallel_state(True)
+
 
 def test_qwen_image_selects_cfg_inputs_by_rank():
     prompt = torch.tensor([1])

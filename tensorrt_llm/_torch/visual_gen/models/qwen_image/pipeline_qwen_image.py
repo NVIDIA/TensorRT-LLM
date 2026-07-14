@@ -18,6 +18,7 @@ from typing import List, Optional, Tuple, Union
 import numpy as np
 import torch
 import torch.distributed as dist
+from torch.distributed import ProcessGroup
 
 from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer, PipelineOutput
 from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
@@ -85,6 +86,7 @@ class QwenImagePipeline(BasePipeline):
         # load_standard_components() once the VAE is loaded.
         self.vae_scale_factor = 8
         self.tokenizer_max_length = 1024
+        self._logged_cfg_disabled_parallel_warning = False
 
     @property
     def dtype(self):
@@ -155,13 +157,16 @@ class QwenImagePipeline(BasePipeline):
         ``forward`` path so CUDA graphs / torch.compile / VAE kernels
         all get triggered with the runtime shape.
         """
+        vgm = self.pipeline_config.visual_gen_mapping
+        cfg_size = vgm.cfg_size if vgm else 1
+        warmup_true_cfg_scale = 4.0 if cfg_size > 1 else 1.0
         with torch.no_grad():
             self.forward(
                 prompt="warmup",
                 height=height,
                 width=width,
                 num_inference_steps=max(steps, 2),
-                true_cfg_scale=1.0,
+                true_cfg_scale=warmup_true_cfg_scale,
                 seed=42,
                 max_sequence_length=64,
             )
@@ -410,12 +415,26 @@ class QwenImagePipeline(BasePipeline):
         noise_norm = torch.norm(comb, dim=-1, keepdim=True)
         return comb * (cond_norm / noise_norm)
 
-    def _cfg_parallel_state(self, do_true_cfg: bool) -> Tuple[bool, int, int, object]:
+    def _cfg_parallel_state(
+        self, do_true_cfg: bool
+    ) -> Tuple[bool, int, int, Optional[ProcessGroup]]:
         vgm = self.pipeline_config.visual_gen_mapping
         cfg_size = vgm.cfg_size if vgm else 1
         cfg_rank = vgm.cfg_rank if vgm else 0
         cfg_pg = vgm.cfg_group if vgm else None
         do_cfg_parallel = do_true_cfg and cfg_size > 1
+        if (
+            cfg_size > 1
+            and not do_true_cfg
+            and cfg_rank == 0
+            and not getattr(self, "_logged_cfg_disabled_parallel_warning", False)
+        ):
+            logger.warning(
+                "Qwen-Image configured with cfg_size=%d but true CFG is disabled; "
+                "CFG-parallel ranks will redundantly compute the same request path.",
+                cfg_size,
+            )
+            self._logged_cfg_disabled_parallel_warning = True
         if do_cfg_parallel:
             if cfg_size != 2:
                 raise ValueError(
