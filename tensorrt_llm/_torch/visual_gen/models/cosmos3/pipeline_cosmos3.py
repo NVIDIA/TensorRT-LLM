@@ -528,28 +528,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         # Build pixel-space video: repeat the conditioning image across all frames
         # image_tensor: [1, 3, H, W] -> [1, 3, 1, H, W] -> [1, 3, num_frames, H, W]
         video = image_tensor.unsqueeze(2).expand(-1, -1, num_frames, -1, -1).contiguous()
-        video = video.to(device=self.device, dtype=self.vae.dtype)
-
-        latent = self.vae.encode(video).latent_dist.mode()
-
-        # Normalize (inverse of _decode_latents denormalization)
-        if hasattr(self.vae.config, "latents_mean") and hasattr(self.vae.config, "latents_std"):
-            latents_mean = (
-                torch.tensor(self.vae.config.latents_mean)
-                .view(1, -1, 1, 1, 1)
-                .to(latent.device, latent.dtype)
-            )
-            latents_std = (
-                torch.tensor(self.vae.config.latents_std)
-                .view(1, -1, 1, 1, 1)
-                .to(latent.device, latent.dtype)
-            )
-            latent = (latent - latents_mean) / latents_std
-        else:
-            scaling_factor = getattr(self.vae.config, "scaling_factor", 1.0)
-            latent = latent * scaling_factor
-
-        return latent.to(self.dtype)
+        return self._encode_video_tensor(video)
 
     def _prepare_latents_i2v(
         self,
