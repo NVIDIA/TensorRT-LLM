@@ -1085,12 +1085,14 @@ class PyTorchModelEngine(ModelEngine):
             self._run_cuda_graph_warmup(resource_manager)
         log_mem_snapshot("warmup/after_cuda_graph_capture")
         # Pre-compile DeepGEMM paged_mqa_logits_metadata for every 32-aligned
-        # batch bucket up to max_batch_size. CUDA-graph warmup only exercises
-        # the batch sizes in cuda_graph_batch_sizes, which round up to a
-        # subset of buckets; any inference iter whose num_generations lands
-        # on an uncovered bucket triggers an nvcc-driven JIT compile
-        # (~3s stall inside _prepare_inputs) on first touch. Pre-touching
-        # every bucket funnels that cost into warmup. No-op on non-DSA models.
+        # batch bucket the runtime can produce (max_batch_size scaled by the
+        # MTP / DSL expansion factor when applicable). CUDA-graph warmup only
+        # exercises the batch sizes in cuda_graph_batch_sizes, which round
+        # up to a subset of buckets; any inference iter whose
+        # context_lens.size(0) lands on an uncovered bucket triggers an
+        # nvcc-driven JIT compile (~3s stall inside _prepare_inputs) on
+        # first touch. Pre-touching every bucket funnels that cost into
+        # warmup. No-op on non-DSA models.
         self._warmup_dg_paged_mqa_logits_metadata()
         log_mem_snapshot("warmup/after_dg_paged_mqa_logits_metadata")
         if can_run_general_warmup:
@@ -1103,14 +1105,16 @@ class PyTorchModelEngine(ModelEngine):
 
     def _warmup_dg_paged_mqa_logits_metadata(self) -> None:
         """Pre-compile DeepGEMM's `get_paged_mqa_logits_metadata` helper for
-        every 32-aligned batch bucket up to `max_batch_size`.
+        every 32-aligned batch bucket the runtime can produce.
 
         DSA's `Indexer.prepare_scheduler_metadata` calls
         `deep_gemm.get_paged_mqa_logits_metadata(context_lens, block_kv,
         num_sms)` inside `_prepare_inputs` every iteration. The underlying
-        kernel is templated on `kAlignedBatchSize = ceil(num_generations,
-        32)`, and deep_gemm's Python-side JIT compiles a fresh cubin
-        (spawning nvcc/cicc/ptxas, ~3s on GB300) the first time any bucket
+        kernel is templated on `<kAlignedBatchSize, split_kv, num_sms>`
+        where `kAlignedBatchSize = align(context_lens.size(0), 32)` and
+        `split_kv` / `num_sms` are fixed for a given (block_kv, device).
+        deep_gemm's Python-side JIT compiles a fresh cubin (spawning
+        nvcc/cicc/ptxas, ~3s on GB300) the first time each `aligned_bs`
         is requested. CUDA-graph warmup exercises only the batch sizes in
         `cuda_graph_batch_sizes`, which round up to a subset of the 32-
         aligned buckets; every uncovered bucket that the inference
@@ -1118,12 +1122,15 @@ class PyTorchModelEngine(ModelEngine):
         Pre-touching every bucket here funnels those compiles into the
         deterministic warmup phase.
 
+        `context_lens.size(0)` is not always `num_generations`. For MTP
+        with `use_expanded_buffers_for_mtp=True` the expanded call passes
+        `num_generations * (1 + max_draft_tokens)`, and for DSL expansion
+        it passes `num_generations * dsl_expand_factor`. Bucket range is
+        scaled by the max of these expansion factors so the expanded
+        paths are covered too. No-op on non-DSA models.
+
         Best-effort: per-bucket JIT failures are logged and skipped so a
         single broken bucket does not abort PyExecutor startup.
-
-        Cost: one nvcc invocation per bucket the CUDA-graph warmup didn't
-        already trigger (typically 5-6 extra compiles for max_batch_size
-        512). No-op on non-DSA models.
         """
         attn_meta = getattr(self, "attn_metadata", None)
         if attn_meta is None:
@@ -1145,11 +1152,26 @@ class PyTorchModelEngine(ModelEngine):
 
         num_sms = attn_meta.num_sms
         max_bs = max(1, int(self.batch_size))
-        max_aligned = ((max_bs + 31) // 32) * 32
+        # Cover the two paths whose `context_lens.size(0)` exceeds
+        # `num_generations`: MTP-expanded (`num_generations * (1 +
+        # max_draft_tokens)`) and DSL-expanded (`num_generations *
+        # dsl_expand_factor`). Both fields are only meaningful on the DSA
+        # metadata; default to 1 when the attribute is missing / disabled.
+        expand_factor = 1
+        if getattr(attn_meta, "use_expanded_buffers_for_mtp", False):
+            expand_factor = max(
+                expand_factor,
+                1 + int(getattr(attn_meta, "max_draft_tokens", 0) or 0))
+        if getattr(attn_meta, "expand_for_dsl", False):
+            expand_factor = max(
+                expand_factor,
+                int(getattr(attn_meta, "dsl_expand_factor", 1) or 1))
+        max_aligned = ((max_bs * expand_factor + 31) // 32) * 32
         buckets = list(range(32, max_aligned + 32, 32))
         logger.info(f"[DG warmup] Pre-compiling paged_mqa_logits_metadata for "
                     f"{len(buckets)} aligned batch buckets up to {max_aligned} "
-                    f"(block_kv={_DG_SCHEDULE_BLOCK_KV}, num_sms={num_sms})")
+                    f"(block_kv={_DG_SCHEDULE_BLOCK_KV}, num_sms={num_sms}, "
+                    f"max_bs={max_bs}, expand_factor={expand_factor})")
         for aligned_bs in buckets:
             # Kernel scans `context_lens` and prefix-sums schedules; a
             # zero-filled 2D tensor of shape (aligned_bs, 1) is enough to
