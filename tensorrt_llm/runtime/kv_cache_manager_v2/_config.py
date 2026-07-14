@@ -242,6 +242,24 @@ class KVCacheManagerConfig:
     Required when SSM layers are present.
     """
 
+    enable_swa_ring_reuse: bool = False
+    """
+    When True, a sequence's freshly out-of-window (stale) SWA pages are parked in a small
+    per-sequence pocket and recycled in place to back the new blocks allocated by upcoming
+    resize() calls -- the steady state of decode with a sliding window, where each block
+    boundary crossing retires one block and adds one. This makes the window's storage behave
+    as a ring buffer (the same few physical blocks in rotation) and skips the allocator
+    free-list round-trip; on the same CUDA stream the recycled slot is immediately safe to
+    overwrite.
+
+    Only fully-orphaned stale pages are parked: uncommitted, with committing disallowed for
+    the cache (so the radix tree cannot retain them) and resident on GPU. Committed pages
+    kept for prefix reuse are never touched, so behavior is identical to the default
+    allocate-then-free path except for which physical slot backs the new block. Parked
+    pages are pinned against inter-level eviction (migrating them would waste bandwidth
+    on dead data) until consumed or drained; the pocket is drained on suspend()/close().
+    """
+
     enable_stats: bool = True
     """
     Collect V2 KV cache allocation, reuse, and transfer statistics.

@@ -175,6 +175,7 @@ class KVCacheManagerConfig:
     initial_pool_ratio: list[float] | None = None
     swa_scratch_reuse: SwaScratchReuseConfig | None = None
     commit_min_snapshot: bool = False
+    enable_swa_ring_reuse: bool = False
     enable_stats: bool = True
     @property
     def enable_swa_scratch_reuse(self) -> bool: ...
