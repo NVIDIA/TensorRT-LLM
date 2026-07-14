@@ -608,6 +608,25 @@ class FP4GemmRunner(TunableRunner):
         )
         return out
 
+    def forward_out(
+        self,
+        inputs: List[torch.Tensor],
+        output: torch.Tensor,
+        tactic: int = -1,
+        bias: Optional[torch.Tensor] = None,
+    ) -> None:
+        mat1, mat2, mat1_scale, mat2_scale, global_scale = inputs
+        self.fp4_gemm_runner.run_gemm_out(
+            mat1,
+            mat2,
+            mat1_scale,
+            mat2_scale,
+            global_scale,
+            output,
+            tactic,
+            bias,
+        )
+
 
 class CublasLtFP4GemmRunner(TunableRunner):
     """CublasLt-based FP4 GEMM runner with auto-tuning support.
@@ -1195,6 +1214,21 @@ class NVFP4GemmUnifiedRunner(TunableRunner):
             raise ValueError(f"Invalid tactic: {tactic}")
 
 
+@lru_cache(maxsize=None)
+def _get_nvfp4_gemm_out_runners(
+    output_dtype: torch.dtype,
+) -> Tuple[NVFP4GemmUnifiedRunner, FP4GemmRunner]:
+    return (
+        NVFP4GemmUnifiedRunner(int(BufferKind.DEFAULT), output_dtype,
+                               ["cutlass"]),
+        FP4GemmRunner(
+            fp4_utils.FP4GemmType.W4A4_NVFP4_NVFP4,
+            int(BufferKind.DEFAULT),
+            output_dtype,
+        ),
+    )
+
+
 @fast_custom_op("trtllm::nvfp4_gemm", mutates_args=())
 def nvfp4_gemm(
     act_fp4: torch.Tensor,
@@ -1296,6 +1330,57 @@ def nvfp4_gemm(
         tactic=best_tactic,
         bias=bias,
     )
+
+
+@fast_custom_op("trtllm::nvfp4_gemm_out", mutates_args=("output", ))
+def nvfp4_gemm_out(
+    act_fp4: torch.Tensor,
+    weight: torch.Tensor,
+    act_sf: torch.Tensor,
+    weight_scale: torch.Tensor,
+    alpha: torch.Tensor,
+    output: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
+) -> None:
+    """Run the tuned CUTLASS NVFP4 GEMM into caller-owned storage."""
+    runner, output_runner = _get_nvfp4_gemm_out_runners(output.dtype)
+    inputs = [act_fp4, weight, act_sf, weight_scale, alpha]
+    tuner = AutoTuner.get()
+    try:
+        _, best_tactic = tuner.choose_one(
+            "trtllm::nvfp4_gemm::gemm",
+            [runner],
+            NVFP4GemmUnifiedRunner.tuning_config,
+            inputs,
+            bias=bias,
+        )
+    except IndexError as e:
+        raise RuntimeError(
+            "AutoTuner failed to find a CUTLASS tactic for caller-owned "
+            f"NVFP4 output with M={act_fp4.shape[0]}, "
+            f"K={act_fp4.shape[1] * 2}, N={weight.shape[0]}") from e
+
+    if best_tactic == -1:
+        best_tactic = ("cutlass", -1)
+    backend, sub_tactic = best_tactic
+    if backend != "cutlass":
+        raise RuntimeError(
+            f"caller-owned NVFP4 output requires CUTLASS, got {backend}")
+    output_runner.forward_out(
+        inputs, output, tactic=sub_tactic, bias=bias)
+
+
+@nvfp4_gemm_out.register_fake
+def _(
+    act_fp4: torch.Tensor,
+    weight: torch.Tensor,
+    act_sf: torch.Tensor,
+    weight_scale: torch.Tensor,
+    alpha: torch.Tensor,
+    output: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
+) -> None:
+    return None
 
 
 @nvfp4_gemm.register_fake
@@ -2081,9 +2166,13 @@ def _(
     return x.new_empty((b, d), dtype=o_dtype)
 
 
+_NcclWindowKey = Tuple[Tuple[int, ...], str, int, torch.dtype, int]
+
+
 class AllReduceRunner(TunableRunner):
     _prealloc_lock: ClassVar[threading.Lock] = threading.Lock()
     _prealloc_done: ClassVar[set] = set()
+    _preallocated_windows: ClassVar[dict[_NcclWindowKey, int]] = {}
     # Set from AllReduce.__init__ via extra_attrs when the model is built.
     _prealloc_max_num_tokens: ClassVar[Optional[int]] = None
     _prealloc_hidden_size: ClassVar[Optional[int]] = None
@@ -2119,6 +2208,58 @@ class AllReduceRunner(TunableRunner):
             self.input_uses_nccl_window,
         )
 
+    @staticmethod
+    def _nccl_window_key(
+        group: List[int],
+        device: torch.device,
+        dtype: torch.dtype,
+        hidden_size: int,
+    ) -> _NcclWindowKey:
+        return (
+            tuple(sorted(int(rank) for rank in group)),
+            device.type,
+            -1 if device.index is None else int(device.index),
+            dtype,
+            int(hidden_size),
+        )
+
+    @classmethod
+    def has_reserved_nccl_window(cls, input: torch.Tensor,
+                                 group: List[int]) -> bool:
+        key = cls._nccl_window_key(group, input.device, input.dtype,
+                                   input.size(-1))
+        with cls._prealloc_lock:
+            return bool(cls._preallocated_windows.get(key, 0))
+
+    @classmethod
+    def mark_nccl_window_preallocated(
+        cls, group: List[int], buffers: List[torch.Tensor]
+    ) -> Tuple[_NcclWindowKey, ...]:
+        """Suppress model-maximum preallocation for reserved signatures."""
+        keys = tuple(
+            dict.fromkeys(
+                cls._nccl_window_key(group, buffer.device, buffer.dtype,
+                                     buffer.size(-1))
+                for buffer in buffers))
+        with cls._prealloc_lock:
+            for key in keys:
+                cls._preallocated_windows[key] = (
+                    cls._preallocated_windows.get(key, 0) + 1)
+        return keys
+
+    @classmethod
+    def unmark_nccl_window_preallocated(
+        cls, keys: Tuple[_NcclWindowKey, ...]
+    ) -> None:
+        """Release signature markers owned by one engine pool."""
+        with cls._prealloc_lock:
+            for key in keys:
+                count = cls._preallocated_windows.get(key, 0)
+                if count <= 1:
+                    cls._preallocated_windows.pop(key, None)
+                else:
+                    cls._preallocated_windows[key] = count - 1
+
     @classmethod
     def _maybe_preallocate_buffers(cls,
                                    input_tensor: torch.Tensor,
@@ -2141,6 +2282,15 @@ class AllReduceRunner(TunableRunner):
                 # If capture status can't be queried, avoid prealloc to be safe.
                 return
 
+        prealloc_hidden_size = (
+            hidden_size if hidden_size is not None else input_tensor.size(-1))
+        prealloc_dtype = dtype if dtype is not None else input_tensor.dtype
+        preallocated_key = cls._nccl_window_key(
+            group, input_tensor.device, prealloc_dtype, prealloc_hidden_size)
+        with cls._prealloc_lock:
+            if cls._preallocated_windows.get(preallocated_key, 0):
+                return
+
         # If max_num_tokens and hidden_size are provided, pre-allocate at 2x
         # the model-configured size to give the NCCL window allocator extra
         # headroom beyond the nominal max shape.  dtype comes from the model
@@ -2151,7 +2301,7 @@ class AllReduceRunner(TunableRunner):
         if max_num_tokens is not None and hidden_size is not None:
             prealloc_input = torch.empty(
                 [2 * max_num_tokens, hidden_size],
-                dtype=dtype if dtype is not None else input_tensor.dtype,
+                dtype=prealloc_dtype,
                 device=input_tensor.device)
         else:
             prealloc_input = input_tensor
@@ -2159,8 +2309,7 @@ class AllReduceRunner(TunableRunner):
         num_tokens = int(prealloc_input.size(0))
         if num_tokens <= 0:
             return
-        group_key = tuple(group)
-        cache_key = (group_key, num_tokens)
+        cache_key = (preallocated_key, num_tokens)
         with cls._prealloc_lock:
             if cache_key in cls._prealloc_done:
                 return
@@ -2308,6 +2457,8 @@ def tunable_allreduce(
             return inputs
         if not isinstance(input_tensor,
                           torch.Tensor) or not input_tensor.is_cuda:
+            return inputs
+        if AllReduceRunner.has_reserved_nccl_window(input_tensor, group):
             return inputs
         nccl_symmetric_memory_window_tensor, actual_kind = torch.ops.trtllm.allocate_output(
             input_tensor, int(BufferKind.NCCL_WINDOW), group_list)

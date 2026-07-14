@@ -49,8 +49,10 @@ from ..compilation.backend import Backend
 from ..compilation.utils import capture_piecewise_cuda_graph
 from ..distributed import Distributed
 from ..distributed.communicator import init_pp_comm
+from ..distributed.nccl_window_tensor_pool import NCCLWindowTensorPool
 from ..expert_statistic import ExpertStatistic
 from ..memory_buffer_utils import clear_memory_buffers, with_shared_pool
+from ..modules.linear import Linear
 from ..metadata import KVCacheParams
 from ..models.checkpoints.base_checkpoint_loader import BaseCheckpointLoader
 from ..models.modeling_multimodal_encoder import MultimodalEncoderMixin
@@ -297,6 +299,7 @@ class PyTorchModelEngine(ModelEngine):
             )
 
         self.mapping = mapping
+        self.nccl_window_tensor_pool = NCCLWindowTensorPool(mapping)
         if mapping.has_pp():
             init_pp_comm(mapping)
         # Start with the established pool size. Once the model is loaded we
@@ -405,6 +408,14 @@ class PyTorchModelEngine(ModelEngine):
             self.model_is_wrapped = True
         else:
             self.model_is_wrapped = False
+        if self.llm_args.lora_config is None:
+            for module in self.model.modules():
+                if (isinstance(module, Linear)
+                        and module._can_use_nccl_window_output()
+                        and module.mapping.tp_group
+                        == self.mapping.tp_group):
+                    self.nccl_window_tensor_pool.register(
+                        module, module.weight, module.out_features, module.dtype)
         self.sparse_attention_config = self.model.model_config.sparse_attention_config
         # In case that some tests use stub models and override `_load_model`.
         if not hasattr(self.model, 'extra_attrs'):
@@ -478,6 +489,9 @@ class PyTorchModelEngine(ModelEngine):
             'enable_userbuffers'].default
         torch_compile_max_num_streams = self.torch_compile_config.max_num_streams if self.torch_compile_config is not None else TorchCompileConfig.model_fields[
             'max_num_streams'].default
+        if torch_compile_enabled and torch_compile_max_num_streams > 1:
+            # One shared address requires serialized producer/consumer use.
+            self.nccl_window_tensor_pool.disable()
 
         self._torch_compile_enabled = torch_compile_enabled
         self._torch_compile_piecewise_cuda_graph = torch_compile_piecewise_cuda_graph
@@ -1067,15 +1081,22 @@ class PyTorchModelEngine(ModelEngine):
                 )
                 return
 
-        # Create AutoTuner singleton in eager context before any compiled forward.
-        # Otherwise the first get() can happen inside torch.compile tracing and
-        # trigger non-traceable code (time.time(), torch.cuda.*) in the cache.
-        AutoTuner.get()
-
         can_run_general_warmup = (
             not is_enc_dec and not self.is_draft_model
             and not self.mapping.has_cp_helix() and self.guided_decoder is None
             and not isinstance(kv_cache_manager, MambaHybridCacheManager))
+
+        # Reserve exactly the largest output requested by the warmup/capture
+        # plan. This avoids coupling the pool to max_num_tokens while still
+        # binding one stable address before torch.compile or CUDA graph capture.
+        requested_capacity = self._get_nccl_window_tensor_capacity(
+            resource_manager, can_run_general_warmup)
+        self.nccl_window_tensor_pool.reserve(requested_capacity)
+
+        # Create AutoTuner singleton in eager context before any compiled forward.
+        # Otherwise the first get() can happen inside torch.compile tracing and
+        # trigger non-traceable code (time.time(), torch.cuda.*) in the cache.
+        AutoTuner.get()
 
         log_mem_snapshot("warmup/before_warmup")
         if not is_enc_dec:
@@ -1367,6 +1388,40 @@ class PyTorchModelEngine(ModelEngine):
                 draft_len = 0
             mapping[graph_bs] = draft_len
         return mapping
+
+    def _get_nccl_window_tensor_capacity(
+            self, resource_manager: ResourceManager,
+            include_general_warmup: bool) -> int:
+        """Return the largest output shape requested before runtime.
+
+        General warmups cover eager context/chunked-prefill shapes; CUDA graph
+        captures cover generation shapes.  Deriving capacity from those actual
+        requests keeps the pool independent of the configured token ceiling.
+        """
+        requested_tokens: List[int] = []
+        if include_general_warmup:
+            requested_tokens.extend(
+                num_tokens for num_tokens, _ in
+                self._get_full_general_warmup_requests(resource_manager))
+
+        if self.cuda_graph_runner.enabled:
+            spec_resource_manager = resource_manager.get_resource_manager(
+                ResourceManagerType.SPEC_RESOURCE_MANAGER)
+            graphs_to_capture = self._get_graphs_to_capture(
+                self._cuda_graph_batch_sizes, spec_resource_manager)
+            if (self.is_draft_model and self.model_is_wrapped
+                    and isinstance(spec_resource_manager,
+                                   Eagle3ResourceManager)):
+                graphs_to_capture = [
+                    (batch_size, self.original_max_draft_len)
+                    for batch_size, _ in graphs_to_capture
+                ]
+            requested_tokens.extend(
+                batch_size * self.max_beam_width * (draft_len + 1)
+                for batch_size, draft_len in graphs_to_capture
+                if batch_size <= self.batch_size)
+
+        return max(requested_tokens, default=0)
 
     def _get_graphs_to_capture(
         self, cuda_graph_batch_sizes: list[int],
@@ -2275,6 +2330,10 @@ class PyTorchModelEngine(ModelEngine):
         self.model = None
 
         self._release_cuda_graphs()
+        nccl_window_tensor_pool = getattr(self, 'nccl_window_tensor_pool', None)
+        if nccl_window_tensor_pool is not None:
+            nccl_window_tensor_pool.clear()
+            self.nccl_window_tensor_pool = None
         self.input_processor = None
         self.input_processor_with_hash = None
 
