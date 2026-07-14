@@ -10,7 +10,7 @@ import types
 from pathlib import Path
 
 import pytest
-from test_common import session_prefetcher
+from test_common import _session_utils, session_prefetcher
 from test_common.session_prefetcher import SessionPrefetcher, warm_page_cache
 
 
@@ -388,7 +388,7 @@ def test_warm_io_thread_names_covered_by_threadleak_exclude():
 
 
 def _fake_reuse_module(enabled):
-    return types.SimpleNamespace(REUSE=types.SimpleNamespace(enabled=enabled))
+    return types.SimpleNamespace(REUSE=types.SimpleNamespace(is_active=lambda: enabled))
 
 
 def test_yields_mpi_seams_to_active_session_reuse(monkeypatch):
@@ -488,7 +488,7 @@ def test_settle_waits_for_previous_worker_release(monkeypatch, unset_cuda_visibl
     # Free memory rising as the previous worker exits: 17 -> 40 -> 75 GiB.
     fake = _fake_pynvml([17 * _GIB, 40 * _GIB, 75 * _GIB], 80 * _GIB)
     monkeypatch.setitem(sys.modules, "pynvml", fake)
-    monkeypatch.setattr(session_prefetcher, "_SETTLE_POLL_S", 0.01)
+    monkeypatch.setattr(_session_utils, "_SETTLE_POLL_S", 0.01)
     assert session_prefetcher.wait_gpu_memory_settle() is True
     assert fake.calls["n"] == 3  # polled until the release completed
 
@@ -496,7 +496,7 @@ def test_settle_waits_for_previous_worker_release(monkeypatch, unset_cuda_visibl
 def test_settle_gives_up_when_memory_stays_in_use(monkeypatch, unset_cuda_visible_devices):
     fake = _fake_pynvml([17 * _GIB], 80 * _GIB)  # flat: legitimately in use
     monkeypatch.setitem(sys.modules, "pynvml", fake)
-    monkeypatch.setattr(session_prefetcher, "_SETTLE_POLL_S", 0.01)
+    monkeypatch.setattr(_session_utils, "_SETTLE_POLL_S", 0.01)
     t0 = time.monotonic()
     # 17/80 GiB free (21%) is below the handover threshold: refuse.
     assert session_prefetcher.wait_gpu_memory_settle(timeout=5) is False
@@ -508,7 +508,7 @@ def test_settle_flat_but_half_free_still_hands_over(monkeypatch, unset_cuda_visi
     # for the next model — hand over rather than pay the sync spawn.
     fake = _fake_pynvml([48 * _GIB], 80 * _GIB)
     monkeypatch.setitem(sys.modules, "pynvml", fake)
-    monkeypatch.setattr(session_prefetcher, "_SETTLE_POLL_S", 0.01)
+    monkeypatch.setattr(_session_utils, "_SETTLE_POLL_S", 0.01)
     assert session_prefetcher.wait_gpu_memory_settle(timeout=5) is True
 
 

@@ -50,6 +50,17 @@ from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from typing import NamedTuple
 
+# Snapshot and GPU-settle mechanics are shared with the session-reuse layer
+# (both hand a live pool to a test that did not spawn it — same invariants:
+# workers freeze the FULL env + sys.path at spawn, and the previous worker's
+# CUDA memory must be released before the next model build). Policy — what to
+# do on mismatch or a still-busy GPU — stays here.
+from test_common._session_utils import (  # noqa: F401  (_spawn_snapshot re-exported for tests)
+    _SETTLE_TIMEOUT_S,
+    _settle_gpu_memory,
+    _spawn_snapshot,
+)
+
 # The only places in the library that construct MpiPoolSession for a bare
 # LLM(...); tests passing their own _mpi_session never reach these lines.
 # test_patch_targets_cover_all_library_construction_sites keeps this list
@@ -73,43 +84,11 @@ def _reuse_layer_active() -> bool:
     """
     mod = sys.modules.get("test_common.session_reuse")
     if mod is None:
-        return False
+        return False  # not wired into this suite: seams are ours to patch
     try:
-        return bool(mod.REUSE.enabled)
+        return bool(mod.REUSE.is_active())
     except Exception:
         return True  # loaded but unreadable: err on staying out of the way
-
-
-# MpiPoolSession workers freeze their environment AND sys.path at spawn time
-# (they inherit the whole parent env at MPI spawn, plus MPIPoolExecutor's
-# explicit TRTLLM*/TLLM* overrides and path=sys.path), so a pool prefetched
-# during test A must not be handed to test B if B changed ANY env var (proven
-# silent-failure class: OVERRIDE_QUANT_ALGO and other non-prefixed test knobs
-# are read inside workers) or prepended to sys.path (proven hard-failure
-# class: test_modeling_out_of_tree monkeypatches sys.path before LLM(); a
-# pool spawned earlier dies during worker initialization).
-# The snapshot therefore covers the FULL environment, minus process
-# bookkeeping that legitimately drifts between tests without affecting
-# workers. A false mismatch only costs a synchronous rebuild.
-_ENV_IGNORE = frozenset(
-    {
-        "PYTEST_CURRENT_TEST",  # changes every test phase by design
-        "COLUMNS",
-        "LINES",
-        "PWD",
-        "OLDPWD",
-        "SHLVL",
-        "_",
-    }
-)
-
-
-def _spawn_snapshot():
-    """The worker-visible state a pool freezes at spawn: env + sys.path."""
-    return (
-        {k: v for k, v in os.environ.items() if k not in _ENV_IGNORE},
-        list(sys.path),
-    )
 
 
 _READ_CHUNK = 64 << 20  # 64MB
@@ -223,53 +202,12 @@ def _worker_import_report_cuda() -> bool:
     return torch.cuda.is_initialized()
 
 
-# GPU-memory settle barrier at handover (see wait_gpu_memory_settle).
-_SETTLE_MIN_FREE_FRAC = 0.85  # "GPU is essentially free" — stop waiting
 # Below this free fraction a handover is refused outright (sync fallback):
 # flat-detection cannot distinguish "legitimately in use" from "dying worker
 # that has not started releasing yet", and handing over into a mostly-used
 # GPU just moves the OOM into the worker's model build (seen in pre-merge
 # CI). The ~50s synchronous spawn restores the natural release window.
 _SETTLE_HANDOVER_MIN_FREE_FRAC = 0.5
-_SETTLE_POLL_S = 0.5
-_SETTLE_FLAT_POLLS = 3  # consecutive non-increasing polls => memory is in use
-_SETTLE_EPSILON = 256 << 20  # free-memory delta below this counts as flat
-# Hard cap. A dying worker's release completes in a few seconds; 30s is far
-# above that while still bounding a pathological slow-release to a fraction
-# of the ~50s the handover saves.
-_SETTLE_TIMEOUT_S = 30.0
-
-
-def _visible_gpu_handles(pynvml):
-    """NVML handles of the GPUs this process may touch (CUDA_VISIBLE_DEVICES).
-
-    Handles both the index form ("0,1") and the UUID form ("GPU-..."/"MIG-...")
-    used on shared CI nodes — falling back to all devices there would make the
-    settle barrier poll GPUs owned by other jobs. An explicitly EMPTY value
-    means no GPUs are visible: nothing to wait for.
-    """
-    visible = os.environ.get("CUDA_VISIBLE_DEVICES")
-    if visible is not None and not visible.strip():
-        return []
-    count = pynvml.nvmlDeviceGetCount()
-    if visible is None:
-        return [pynvml.nvmlDeviceGetHandleByIndex(i) for i in range(count)]
-    handles = []
-    for token in visible.split(","):
-        token = token.strip()
-        try:
-            if token.startswith(("GPU-", "MIG-")):
-                handles.append(pynvml.nvmlDeviceGetHandleByUUID(token))
-            else:
-                index = int(token)
-                if index >= count:
-                    raise ValueError(token)
-                handles.append(pynvml.nvmlDeviceGetHandleByIndex(index))
-        except Exception:
-            # Unparsable or out-of-range form: fall back to all GPUs (the
-            # caller's flat-detection keeps a too-wide scan bounded).
-            return [pynvml.nvmlDeviceGetHandleByIndex(i) for i in range(count)]
-    return handles
 
 
 def wait_gpu_memory_settle(timeout: float = _SETTLE_TIMEOUT_S) -> bool:
@@ -288,64 +226,18 @@ def wait_gpu_memory_settle(timeout: float = _SETTLE_TIMEOUT_S) -> bool:
     retire this heuristic. Needs a library-behavior change (blocking
     shutdown affects all callers), so it belongs in a follow-up PR.
 
-    Polls NVML (context-free) until every visible GPU is mostly free, or its
-    free memory stops increasing (memory legitimately in use — e.g. another
-    fixture's live LLM), or ``timeout``. Fast no-op on an already-free GPU.
-    Never raises: on any NVML problem the handover proceeds as before.
-
-    Returns False when the GPUs ended up still mostly used
-    (< _SETTLE_HANDOVER_MIN_FREE_FRAC free) — the caller must then discard
-    the prefetched pool and build synchronously rather than start a model
-    build that is likely to OOM.
+    The measurement (NVML polling until mostly-free / flat / timeout) lives
+    in ``_session_utils._settle_gpu_memory``, shared with the session-reuse
+    layer. The policy here: refuse the handover (False -> caller discards the
+    prefetched pool and builds synchronously) when the GPUs ended up still
+    mostly used (< _SETTLE_HANDOVER_MIN_FREE_FRAC free) — starting a model
+    build there is likely to OOM. Fail-open (True) when there is nothing to
+    measure. Never raises.
     """
-    try:
-        import pynvml
-
-        pynvml.nvmlInit()
-    except Exception:
-        return True  # no NVML: hand over as before (fail-open)
-    try:
-        handles = _visible_gpu_handles(pynvml)
-        if not handles:
-            return True  # no GPUs visible: nothing to wait for
-
-        def _free_total():
-            infos = [pynvml.nvmlDeviceGetMemoryInfo(h) for h in handles]
-            return [i.free for i in infos], [i.total for i in infos]
-
-        t0 = time.monotonic()
-        flat, prev = 0, None
-        while True:
-            free, total = _free_total()
-            if all(f >= _SETTLE_MIN_FREE_FRAC * t for f, t in zip(free, total)):
-                break
-            if prev is not None and all(f - p < _SETTLE_EPSILON for f, p in zip(free, prev)):
-                flat += 1
-                if flat >= _SETTLE_FLAT_POLLS:
-                    break  # not increasing: that memory is legitimately in use
-            else:
-                flat = 0
-            if time.monotonic() - t0 >= timeout:
-                break
-            prev = free
-            time.sleep(_SETTLE_POLL_S)
-        waited = time.monotonic() - t0
-        min_free_frac = min(f / t for f, t in zip(free, total))
-        if waited >= _SETTLE_POLL_S:
-            print(
-                f"[session-prefetch] waited {waited:.1f}s before handover for GPU "
-                f"memory release (free {min_free_frac:.0%})",
-                flush=True,
-            )
-        return min_free_frac >= _SETTLE_HANDOVER_MIN_FREE_FRAC
-    except Exception as e:
-        print(f"[session-prefetch] GPU settle check skipped: {e}", flush=True)
-        return True  # fail-open: behave as before the barrier existed
-    finally:
-        try:
-            pynvml.nvmlShutdown()
-        except Exception:
-            pass
+    min_free_frac = _settle_gpu_memory("session-prefetch", timeout)
+    if min_free_frac is None:
+        return True  # no NVML / no visible GPUs: hand over as before
+    return min_free_frac >= _SETTLE_HANDOVER_MIN_FREE_FRAC
 
 
 class _Built(NamedTuple):

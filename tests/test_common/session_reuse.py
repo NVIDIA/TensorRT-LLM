@@ -35,8 +35,10 @@ Disabled under pytest-xdist workers (parallel tests would multiply live pools).
 import os
 import sys
 import threading
-import time
 
+# Snapshot and GPU-settle mechanics are shared with the session-prefetch layer
+# (both hand a live pool to a test that did not spawn it — same invariants).
+from test_common._session_utils import _settle_gpu_memory, _spawn_snapshot  # noqa: F401
 from test_common.grouped_test_utils import reset_worker_torch_compile_state, submit_sync_per_worker
 
 # The only places in the library that construct MpiPoolSession for a bare
@@ -59,106 +61,15 @@ _WEIGHT_CACHE_ENV = {
     "TRTLLM_HF_WEIGHT_CACHE_MAX_ENTRIES": "1",
 }
 
-# Workers freeze the parent environment AND sys.path at spawn time, so a
-# cached pool must not be handed to a test that changed either (silently
-# stale env / unimportable monkeypatched modules). Process bookkeeping that
-# legitimately drifts between tests is ignored; a false mismatch only costs
-# one synchronous rebuild.
-_ENV_IGNORE = frozenset(
-    {
-        "PYTEST_CURRENT_TEST",
-        "COLUMNS",
-        "LINES",
-        "PWD",
-        "OLDPWD",
-        "SHLVL",
-        "_",
-    }
-)
-
-
-def _spawn_snapshot():
-    """The worker-visible state a pool freezes at spawn: env + sys.path."""
-    return (
-        {k: v for k, v in os.environ.items() if k not in _ENV_IGNORE},
-        list(sys.path),
-    )
-
-
-# GPU-memory settle barrier at handover: a reused live pool skips the ~50s
-# synchronous spawn that used to give the previous LLM's worker time to exit;
-# its CUDA memory is only released when the process actually exits. Building
-# the next model into that race fails with "insufficient GPU memory".
-_SETTLE_MIN_FREE_FRAC = 0.85
-_SETTLE_POLL_S = 0.5
-_SETTLE_FLAT_POLLS = 3
-_SETTLE_EPSILON = 256 << 20
-_SETTLE_TIMEOUT_S = 30.0
-
-
-def _visible_gpu_indices(count: int):
-    visible = os.environ.get("CUDA_VISIBLE_DEVICES")
-    if not visible:
-        return list(range(count))
-    indices = []
-    for token in visible.split(","):
-        token = token.strip()
-        if not token.isdigit() or int(token) >= count:
-            return list(range(count))  # UUID/MIG form: fall back to all GPUs
-        indices.append(int(token))
-    return indices or list(range(count))
-
 
 def wait_gpu_memory_settle() -> None:
     """Wait until visible GPUs are mostly free or free memory stops rising.
 
-    Never raises: on any NVML problem the handover proceeds as before.
+    Measurement lives in ``_session_utils._settle_gpu_memory`` (shared with
+    the session-prefetch layer). Never raises: on any NVML problem the
+    handover proceeds as before.
     """
-    try:
-        import pynvml
-
-        pynvml.nvmlInit()
-    except Exception:
-        return
-    try:
-        handles = [
-            pynvml.nvmlDeviceGetHandleByIndex(i)
-            for i in _visible_gpu_indices(pynvml.nvmlDeviceGetCount())
-        ]
-
-        def _free_total():
-            infos = [pynvml.nvmlDeviceGetMemoryInfo(h) for h in handles]
-            return [i.free for i in infos], [i.total for i in infos]
-
-        t0 = time.monotonic()
-        flat, prev = 0, None
-        while True:
-            free, total = _free_total()
-            if all(f >= _SETTLE_MIN_FREE_FRAC * t for f, t in zip(free, total)):
-                break
-            if prev is not None and all(f - p < _SETTLE_EPSILON for f, p in zip(free, prev)):
-                flat += 1
-                if flat >= _SETTLE_FLAT_POLLS:
-                    break  # not increasing: that memory is legitimately in use
-            else:
-                flat = 0
-            if time.monotonic() - t0 >= _SETTLE_TIMEOUT_S:
-                break
-            prev = free
-            time.sleep(_SETTLE_POLL_S)
-        waited = time.monotonic() - t0
-        if waited >= _SETTLE_POLL_S:
-            print(
-                f"[session-reuse] waited {waited:.1f}s before handover for GPU memory release",
-                flush=True,
-            )
-    except Exception:
-        pass
-    finally:
-        try:
-            pynvml.nvmlShutdown()
-        except Exception:
-            pass
+    _settle_gpu_memory("session-reuse")
 
 
 _RETIRE_THREADS: list = []
@@ -272,6 +183,17 @@ class SessionReuseCache:
             "yes",
             "on",
         )
+
+    def is_active(self) -> bool:
+        """Public probe for sibling layers: does reuse own the pool seams?
+
+        The session prefetcher yields the ``MpiPoolSession`` seams when this
+        returns True (reuse eliminates the respawn outright; prefetch could
+        only hide it). Deliberately ignores ``_suspended``: a per-test
+        cache bypass (``private_mpi_session``) does not change seam
+        ownership.
+        """
+        return self.enabled
 
     @property
     def max_uses(self) -> int:
