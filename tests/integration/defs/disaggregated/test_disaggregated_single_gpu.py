@@ -393,6 +393,7 @@ def test_disaggregated_simple_qwen3(model, generation_overlap,
         ])
 
 
+@skip_no_hopper
 @pytest.mark.parametrize("model", ["DeepSeek-V3-Lite-fp8/fp8"])
 @pytest.mark.parametrize("enable_cuda_graph", [False])
 @pytest.mark.parametrize("generation_overlap", [False])
