@@ -97,11 +97,7 @@ def read_workloads(suite: Path | None) -> list[str]:
         print("[WARNING] PyYAML unavailable; workload list omitted", file=sys.stderr)
         return []
     doc = yaml.safe_load(suite.read_text()) or {}
-    return [
-        wl.get("name", "")
-        for wl in doc.get("workloads", []) or []
-        if wl.get("enabled", True)
-    ]
+    return [wl.get("name", "") for wl in doc.get("workloads", []) or [] if wl.get("enabled", True)]
 
 
 def select_workloads(workloads_arg: str | None, suite: Path | None) -> list[str]:
@@ -123,9 +119,7 @@ def hash_originals(work_dir: Path) -> dict[str, str]:
     if not original.is_dir():
         return {}
     return {
-        p.name: sha256(p)
-        for p in sorted(original.iterdir())
-        if p.is_file() and ".so" in p.name
+        p.name: sha256(p) for p in sorted(original.iterdir()) if p.is_file() and ".so" in p.name
     }
 
 
@@ -219,9 +213,12 @@ def main() -> int:
     b.add_argument("--profiles", required=True, help="dir with .yaml/.fdata profiles")
     b.add_argument("--ref", default=None, help="source ref/commit (default: git HEAD)")
     b.add_argument("--suite", default=None, help="workload suite YAML (fallback for workload list)")
-    b.add_argument("--workloads", default=None,
-                   help="comma-separated names of workloads actually profiled "
-                        "(overrides --suite; use for CI to record the real fan-out set)")
+    b.add_argument(
+        "--workloads",
+        default=None,
+        help="comma-separated names of workloads actually profiled "
+        "(overrides --suite; use for CI to record the real fan-out set)",
+    )
     b.add_argument("-o", "--output", default="manifest.json")
     b.set_defaults(func=cmd_build)
 

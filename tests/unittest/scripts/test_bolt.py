@@ -18,6 +18,7 @@ Covers the pure logic most likely to regress silently:
 - manifest.select_workloads: the manifest records the workloads ACTUALLY
   profiled (explicit list) rather than the full suite declaration.
 """
+
 from __future__ import annotations
 
 import importlib.util
@@ -61,9 +62,6 @@ def test_select_workloads_falls_back_to_enabled_suite_entries(manifest, tmp_path
     pytest.importorskip("yaml")
     suite = tmp_path / "suite.yaml"
     suite.write_text(
-        "workloads:\n"
-        "  - name: w_enabled\n"
-        "  - name: w_disabled\n"
-        "    enabled: false\n"
+        "workloads:\n" "  - name: w_enabled\n" "  - name: w_disabled\n" "    enabled: false\n"
     )
     assert manifest.select_workloads(None, suite) == ["w_enabled"]
