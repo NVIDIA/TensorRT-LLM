@@ -28,7 +28,7 @@ from pathlib import Path
 import pytest
 import soundfile
 
-from tensorrt_llm.llmapi import LLM, KvCacheConfig, SamplingParams, SchedulerConfig
+from tensorrt_llm.llmapi import LLM, CudaGraphConfig, KvCacheConfig, SamplingParams, SchedulerConfig
 
 from ..conftest import llm_models_root
 
@@ -69,6 +69,8 @@ def _get_whisper_model_path() -> str:
     # reachable, so no None check is needed here.
     models_root = llm_models_root()
     candidates = [
+        # HF-format snapshot in the CI share (next to the legacy checkpoints).
+        Path(models_root) / "whisper-models" / "whisper-tiny",
         Path(models_root) / "whisper" / "whisper-tiny",
         Path(models_root) / "whisper-tiny",
     ]
@@ -90,18 +92,38 @@ def _get_audio_path() -> str:
     pytest.skip(f"1221-135766-0002.wav not found under {models_root}/whisper-models.")
 
 
-def _make_llm(model_path: str, max_beam_width: int = 1) -> LLM:
+def _make_llm(
+    model_path: str,
+    max_beam_width: int = 1,
+    use_kv_cache_manager_v2: bool = False,
+    torch_dtype: str | None = None,
+    cuda_graph_batch_sizes: list[int] | None = None,
+    tensor_parallel_size: int = 1,
+) -> LLM:
+    # CudaGraphConfig captures the decode step only; fp32 enc-dec declines
+    # graphs at engine init (workspace-sizing guard), so requesting them must
+    # still work for every dtype.
+    cuda_graph_config = (
+        CudaGraphConfig(batch_sizes=cuda_graph_batch_sizes, enable_padding=True)
+        if cuda_graph_batch_sizes is not None
+        else None
+    )
+    dtype_kwargs = {}
+    if torch_dtype is not None:
+        # The checkpoint's torch_dtype wins over `dtype` in the PyTorch
+        # backend; model_kwargs is the effective override (same as T5/BART).
+        dtype_kwargs = {"dtype": torch_dtype, "model_kwargs": {"torch_dtype": torch_dtype}}
     return LLM(
         model_path,
         attn_backend="TRTLLM",
-        cuda_graph_config=None,  # CUDA graphs are rejected for enc-dec
+        cuda_graph_config=cuda_graph_config,
         disable_overlap_scheduler=True,  # overlap scheduler unsupported
         enable_chunked_prefill=False,
         kv_cache_config=KvCacheConfig(
             enable_block_reuse=False,
             free_gpu_memory_fraction=_FREE_GPU_MEMORY_FRACTION,
             cross_kv_cache_fraction=_CROSS_KV_CACHE_FRACTION,
-            use_kv_cache_manager_v2=False,
+            use_kv_cache_manager_v2=use_kv_cache_manager_v2,
         ),
         max_batch_size=2,
         max_beam_width=max_beam_width,
@@ -110,6 +132,8 @@ def _make_llm(model_path: str, max_beam_width: int = 1) -> LLM:
         max_input_len=1500,
         max_num_tokens=3000,
         scheduler_config=SchedulerConfig(use_python_scheduler=True),
+        tensor_parallel_size=tensor_parallel_size,
+        **dtype_kwargs,
     )
 
 
@@ -118,9 +142,12 @@ def _audio_prompt(wave, sample_rate, prompt: str = ""):
 
 
 def test_whisper_pytorch_transcribe_end_to_end(monkeypatch):
-    """Greedy transcription: exact pinned token ids, single + batch-2."""
+    """Greedy transcription: exact pinned token ids, single + batch-2.
+
+    Deliberately no TRTLLM_SKIP_KV_CACHE_ESTIMATION: the engine must gate
+    estimation off for enc-dec itself, so the default config is what's tested.
+    """
     monkeypatch.setenv("TLLM_WORKER_USE_SINGLE_PROCESS", "1")
-    monkeypatch.setenv("TRTLLM_SKIP_KV_CACHE_ESTIMATION", "1")
 
     model_path = _get_whisper_model_path()
     wave, sample_rate = soundfile.read(_get_audio_path())
@@ -166,7 +193,6 @@ def test_whisper_pytorch_transcribe_end_to_end(monkeypatch):
 def test_whisper_pytorch_beam_search(monkeypatch):
     """Beam-2 transcription (cross-KV shared across beams)."""
     monkeypatch.setenv("TLLM_WORKER_USE_SINGLE_PROCESS", "1")
-    monkeypatch.setenv("TRTLLM_SKIP_KV_CACHE_ESTIMATION", "1")
 
     model_path = _get_whisper_model_path()
     wave, sample_rate = soundfile.read(_get_audio_path())
@@ -177,3 +203,84 @@ def test_whisper_pytorch_beam_search(monkeypatch):
         )
         outputs = llm.generate([_audio_prompt(wave, sample_rate)], beam_params)
         assert _EXPECTED_TRANSCRIPT_FRAGMENT in outputs[0].outputs[0].text.lower()
+
+
+def _assert_decoder_cuda_graph_state(llm: LLM, captured: bool) -> None:
+    """Introspect the in-process engine (single-process mode only).
+
+    Decoder graphs captured (or not); the enc-dec encoder step stays eager.
+    """
+    model_engine = llm._executor.engine.model_engine
+    assert not model_engine.encoder_cuda_graph_runner.enabled
+    assert not model_engine.encoder_cuda_graph_runner.graphs
+    assert model_engine.cuda_graph_runner.enabled == captured
+    assert bool(model_engine.cuda_graph_runner.graphs) == captured
+
+
+# Feature-combination matrix mirroring the T5/BART enc-dec coverage. Cases:
+# (torch_dtype override or None for checkpoint fp32, kv manager v2, decoder
+# cuda-graph batch sizes, graphs must capture, TP size). KVCacheManagerV2
+# requires beam width 1, so v2 rides greedy; the fp32+graphs-requested case
+# asserts the engine declines graphs (fp32 enc-dec guard) yet stays exact.
+_FEATURE_COMBINATION_CASES = [
+    pytest.param(None, True, None, False, 1, id="fp32-kv-v2-graphs-off-greedy"),
+    pytest.param(None, False, [1, 2], False, 1, id="fp32-kv-v1-graphs-requested-greedy"),
+    pytest.param("bfloat16", False, [1, 2], True, 1, id="bf16-kv-v1-decoder-graphs-on-greedy"),
+    pytest.param("bfloat16", True, None, False, 1, id="bf16-kv-v2-graphs-off-greedy"),
+    pytest.param("float16", False, None, False, 1, id="fp16-kv-v1-graphs-off-greedy"),
+    pytest.param(
+        None,
+        False,
+        None,
+        False,
+        2,
+        id="fp32-kv-v1-graphs-off-greedy-tp2",
+        marks=pytest.mark.skip_less_device(2),
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    "torch_dtype,use_kv_cache_manager_v2,cuda_graph_batch_sizes,graphs_captured,tp_size",
+    _FEATURE_COMBINATION_CASES,
+)
+def test_whisper_pytorch_feature_combinations(
+    monkeypatch,
+    torch_dtype,
+    use_kv_cache_manager_v2,
+    cuda_graph_batch_sizes,
+    graphs_captured,
+    tp_size,
+):
+    """Greedy transcription across dtype/kv-cache-manager/CUDA-graph/TP combos.
+
+    Batch-1 and batch-2 must both reproduce the pinned fp32 token ids
+    (whisper-tiny greedy is dtype-stable on this clip).
+    """
+    if tp_size == 1:
+        monkeypatch.setenv("TLLM_WORKER_USE_SINGLE_PROCESS", "1")
+
+    model_path = _get_whisper_model_path()
+    wave, sample_rate = soundfile.read(_get_audio_path())
+    sampling_params = SamplingParams(temperature=0.0, max_tokens=_MAX_NEW_TOKENS)
+
+    llm = _make_llm(
+        model_path,
+        use_kv_cache_manager_v2=use_kv_cache_manager_v2,
+        torch_dtype=torch_dtype,
+        cuda_graph_batch_sizes=cuda_graph_batch_sizes,
+        tensor_parallel_size=tp_size,
+    )
+    with llm:
+        for batch_size in (1, 2):
+            outputs = llm.generate(
+                [_audio_prompt(wave, sample_rate) for _ in range(batch_size)],
+                sampling_params,
+            )
+            for output in outputs:
+                completion = output.outputs[0]
+                assert list(completion.token_ids) == _EXPECTED_GREEDY_OUTPUT_TOKEN_IDS
+                assert _EXPECTED_TRANSCRIPT_FRAGMENT in completion.text.lower()
+
+        if tp_size == 1:
+            _assert_decoder_cuda_graph_state(llm, captured=graphs_captured)
