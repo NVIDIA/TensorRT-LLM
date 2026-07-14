@@ -670,21 +670,21 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             # is_vswa is False. Guarded on V2-specific attributes (V1 managers
             # lack the per-pool infrastructure).
             mgr = self.kv_cache_manager
-            _get_scale = getattr(mgr, 'get_layer_page_index_scale', None)
-            _layer_space: Dict[int, int] = {}
-            if hasattr(mgr, 'layer_to_pool_mapping_dict') and _get_scale:
-                _space_ids = {}
+            get_scale = getattr(mgr, 'get_layer_page_index_scale', None)
+            layer_space: Dict[int, int] = {}
+            if hasattr(mgr, 'layer_to_pool_mapping_dict') and get_scale:
+                space_ids = {}
                 for layer_idx in getattr(mgr, 'layer_offsets', {}):
                     layer_offset = mgr.layer_offsets[layer_idx]
                     key = (mgr.layer_to_pool_mapping_dict[layer_offset],
-                           _get_scale(layer_idx))
-                    _space_ids.setdefault(key, len(_space_ids))
-                    _layer_space[layer_idx] = _space_ids[key]
-            if _layer_space and (getattr(mgr, 'is_vswa', False)
-                                 or len(set(_layer_space.values())) > 1):
+                           get_scale(layer_idx))
+                    space_ids.setdefault(key, len(space_ids))
+                    layer_space[layer_idx] = space_ids[key]
+            if layer_space and (getattr(mgr, 'is_vswa', False)
+                                or len(set(layer_space.values())) > 1):
                 self._vswa_layer_to_pool = {}
                 self._vswa_pool_to_rep_layer: Dict[int, int] = {}
-                for layer_idx, pool_id in _layer_space.items():
+                for layer_idx, pool_id in layer_space.items():
                     self._vswa_layer_to_pool[layer_idx] = pool_id
                     if pool_id not in self._vswa_pool_to_rep_layer:
                         self._vswa_pool_to_rep_layer[pool_id] = layer_idx
