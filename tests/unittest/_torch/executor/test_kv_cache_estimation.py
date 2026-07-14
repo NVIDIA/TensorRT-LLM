@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Tests for KV cache token estimation in KvCacheCreator._get_token_num_for_estimation.
 
 Guards the ADP (Attention Data Parallelism) cache-block reduction: when
@@ -11,11 +14,13 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
+import torch
 
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import MultimodalModelMixin
 from tensorrt_llm._torch.pyexecutor._util import CacheCost, KvCacheCreator
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
+from tensorrt_llm.inputs.multimodal import MultimodalParams
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig, MultimodalConfig
 
 # ---------------------------------------------------------------------------
@@ -47,6 +52,56 @@ class _MultimodalModel(MultimodalModelMixin):
 
 class _EncoderCacheMultimodalModel(_MultimodalModel):
     supports_encoder_cache = True
+
+
+def test_encoder_profiling_builds_and_runs_long_and_many_item_boundaries(
+    monkeypatch,
+):
+    class _InputProcessor:
+        def get_mm_max_tokens_per_item(self):
+            return {"image": 65536}
+
+        def get_dummy_mm_data_for_tokens(
+            self,
+            *,
+            max_tokens_per_modality,
+            max_items_per_modality,
+            dtype,
+        ):
+            del max_tokens_per_modality, dtype
+            return {"image": {"num_items": max_items_per_modality["image"]}}
+
+    class _Model(MultimodalModelMixin):
+        dtype = torch.float32
+
+        def __init__(self):
+            self.forwarded_item_counts = []
+
+        def encode_multimodal_inputs(self, multimodal_params):
+            count = multimodal_params[0].multimodal_data["image"]["num_items"]
+            self.forwarded_item_counts.append(count)
+            return torch.tensor([count])
+
+    model = _Model()
+    creator = object.__new__(KvCacheCreator)
+    creator._model_engine = SimpleNamespace(
+        model=model,
+        input_processor=_InputProcessor(),
+        encoder_max_num_items=8,
+        encoder_max_num_tokens=8192,
+    )
+    creator._profiling_stage_data = {"enable_mm_reqs": True}
+
+    batches = creator._create_dummy_encoder_inputs()
+    assert [batch[0].multimodal_data["image"]["num_items"] for batch in batches] == [1, 8]
+
+    monkeypatch.setattr(MultimodalParams, "to_device", lambda self, *args, **kwargs: self)
+    creator._dummy_encoder_inputs = batches
+    output = creator._encode_dummy_inputs()
+
+    assert model.forwarded_item_counts == [1, 8]
+    assert output.tolist() == [8]
+    assert all(not batch for batch in creator._dummy_encoder_inputs)
 
 
 def _make_creator(

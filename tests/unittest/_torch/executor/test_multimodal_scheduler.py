@@ -15,8 +15,12 @@ from tensorrt_llm._torch.pyexecutor.llm_request import (
     MultimodalEncoderProgress,
     get_multimodal_encoder_progress,
     get_multimodal_encoder_token_lengths,
+    initialize_multimodal_encoder_request,
 )
-from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
+from tensorrt_llm._torch.pyexecutor.model_engine import (
+    PyTorchModelEngine,
+    _resolve_mm_encoder_token_budget,
+)
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm._torch.pyexecutor.scheduler.scheduler import (
     MultimodalEagerEncoderScheduler,
@@ -163,6 +167,22 @@ def test_multimodal_scheduler_preserves_non_multimodal_requests():
 
     assert output.scheduled_mm_encoder_items is None
     assert output.context_requests == [request]
+
+
+def test_unset_encoder_token_budget_auto_raises_for_atomic_item():
+    assert _resolve_mm_encoder_token_budget(None, 8192, 65536) == 65536
+
+
+def test_explicit_encoder_token_budget_remains_strict():
+    assert _resolve_mm_encoder_token_budget(8192, 8192, 65536) == 8192
+
+
+def test_explicit_encoder_token_budget_rejects_oversized_item():
+    request = _request(1, [9])
+    request.py_multimodal_data["image"] = {"pixel_values": torch.empty(1)}
+
+    with pytest.raises(ValueError, match="exceeding encoder_max_num_tokens=8"):
+        initialize_multimodal_encoder_request(request, max_num_tokens=8)
 
 
 def test_eager_scheduler_encodes_request_rejected_by_llm_capacity():

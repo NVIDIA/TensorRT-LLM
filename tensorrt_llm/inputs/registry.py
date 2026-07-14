@@ -697,12 +697,17 @@ class BaseMultimodalDummyInputsBuilder(ABC):
         self,
         *,
         max_tokens_per_modality: Dict[str, int],
+        max_items_per_modality: Optional[Dict[str, int]] = None,
         dtype: Optional[torch.dtype] = None,
     ) -> Dict[str, Any]:
         """Build the worst-case dummy ``multimodal_data`` per modality budget.
 
         The modality-agnostic entry the KV-cache encoder profiler calls, sizing
-        each modality to saturate its share of the token budget.
+        each modality to saturate its share of the token budget. When
+        ``max_items_per_modality`` is provided, concrete builders should spread
+        that budget across up to the requested number of equal-sized items;
+        this lets profiling cover the many-item boundary in addition to the
+        longest-item boundary.
 
         Returns the ``multimodal_data`` dict the model's encoder consumes (e.g.
         ``{"image": {"pixel_values": ..., "image_grid_thw": ...}}`` for Qwen-VL).

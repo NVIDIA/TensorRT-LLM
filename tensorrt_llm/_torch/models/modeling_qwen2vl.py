@@ -541,26 +541,36 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
         self,
         *,
         max_tokens_per_modality: Dict[str, int],
+        max_items_per_modality: Optional[Dict[str, int]] = None,
         dtype: Optional[torch.dtype] = None,
     ) -> Dict[str, Any]:
         """Vision implementation of the modality-agnostic profiler entry: for the
         ``"image"`` budget, pick the worst-case image size, fill it with identical
         copies, and materialize the encoder tensors.
 
+        ``max_items_per_modality`` selects the many-item profiling boundary.
         ``num_images`` is computed from the *realized* token count of the chosen
-        size (which the ``max_pixels`` cap may make smaller than the budget), so
-        the batch saturates the budget rather than assuming one image fills it.
+        size (which processor pixel bounds may clamp), so the batch stays within
+        both the item and token budgets.
         """
         max_tokens = max_tokens_per_modality.get("image")
         if not max_tokens:
             return {}
-        size = self.get_size_for_max_tokens(max_tokens=max_tokens)
+        target_num_images = (None if max_items_per_modality is None else max(
+            1, max_items_per_modality.get("image", 1)))
+        per_image_budget = (max_tokens if target_num_images is None else max(
+            1, max_tokens // target_num_images))
+        size = self.get_size_for_max_tokens(max_tokens=per_image_budget)
         tokens_per_image = max(
             1,
             self._num_vision_tokens(width=size["width"],
                                     height=size["height"],
                                     num_frames=size.get("num_frames", 1)))
+        if tokens_per_image > max_tokens:
+            return {}
         num_images = max(1, max_tokens // tokens_per_image)
+        if target_num_images is not None:
+            num_images = min(target_num_images, num_images)
         return self.get_dummy_mm_data_for_size(width=size["width"],
                                                height=size["height"],
                                                num_frames=size.get(

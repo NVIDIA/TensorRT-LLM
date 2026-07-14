@@ -1149,7 +1149,7 @@ def initialize_multimodal_encoder_request(request: LlmRequest,
         largest = max(token_lengths)
         raise ValueError(
             f"Multimodal item requires {largest} encoder tokens, exceeding "
-            f"the startup maximum {max_num_tokens}")
+            f"encoder_max_num_tokens={max_num_tokens}")
 
     request.py_is_multimodal_encoder_request = token_lengths is not None
     request.py_mm_encoder_outputs = ([None] * len(token_lengths)

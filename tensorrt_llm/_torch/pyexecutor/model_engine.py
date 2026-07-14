@@ -93,6 +93,15 @@ from .scheduler import ScheduledRequests
 from .trace_log_utils import log_mem_snapshot
 
 
+def _resolve_mm_encoder_token_budget(configured_budget: Optional[int],
+                                     base_budget: int,
+                                     model_max_atomic_item_tokens: int) -> int:
+    """Resolve the encoder token budget without weakening an explicit limit."""
+    if configured_budget is not None:
+        return base_budget
+    return max(base_budget, model_max_atomic_item_tokens)
+
+
 class ModelEngine(ABC):
 
     @abstractmethod
@@ -313,7 +322,12 @@ class PyTorchModelEngine(ModelEngine):
             self.encoder_max_num_items,
             self.encoder_max_num_tokens,
         ) = llm_args.get_encoder_runtime_sizes()
-        self.configured_encoder_max_num_tokens = self.encoder_max_num_tokens
+        # Preserve whether the encoder-specific limit was explicitly set. An
+        # explicit value is a hard user contract; an unset value inherits the
+        # LLM token budget and may be raised later for compatibility with the
+        # model's largest atomic MM item.
+        self.configured_encoder_max_num_tokens = llm_args.encoder_max_num_tokens
+        self.encoder_token_budget_base = self.encoder_max_num_tokens
 
         if checkpoint_loader is None:
             checkpoint_loader = _construct_checkpoint_loader(
@@ -458,16 +472,43 @@ class PyTorchModelEngine(ModelEngine):
                     "counts")
             model_max_atomic_item_tokens = max(max_tokens_per_item.values())
             self.model_max_mm_encoder_item_tokens = model_max_atomic_item_tokens
-            if model_max_atomic_item_tokens > self.encoder_max_num_tokens:
+            effective_encoder_token_budget = _resolve_mm_encoder_token_budget(
+                self.configured_encoder_max_num_tokens,
+                self.encoder_max_num_tokens,
+                model_max_atomic_item_tokens,
+            )
+            if effective_encoder_token_budget > self.encoder_max_num_tokens:
                 logger.warning_once(
-                    f"encoder_max_num_tokens={self.encoder_max_num_tokens} "
-                    "is smaller than the model's largest atomic "
+                    "encoder_max_num_tokens is unset and its resolved LLM "
+                    f"fallback ({self.encoder_max_num_tokens}) is smaller "
+                    "than the model's largest atomic "
                     f"multimodal item ({model_max_atomic_item_tokens}); "
                     f"using {model_max_atomic_item_tokens} as the "
-                    "effective runtime budget.",
+                    "effective encoder runtime budget.",
                     key="raise_encoder_max_num_tokens_for_atomic_item",
                 )
-                self.encoder_max_num_tokens = model_max_atomic_item_tokens
+                self.encoder_max_num_tokens = effective_encoder_token_budget
+            elif (self.configured_encoder_max_num_tokens is not None and
+                  model_max_atomic_item_tokens > self.encoder_max_num_tokens):
+                logger.info(
+                    "Using explicit encoder_max_num_tokens=%d as a strict "
+                    "runtime limit; multimodal items above this limit will "
+                    "be rejected (model atomic maximum=%d).",
+                    self.encoder_max_num_tokens,
+                    model_max_atomic_item_tokens,
+                )
+        self.effective_encoder_max_num_tokens = self.encoder_max_num_tokens
+        if self.supports_mm_encoder_item_scheduling:
+            logger.info(
+                "Multimodal encoder token budget: configured=%s, base=%d, "
+                "effective=%d, model_atomic_max=%d, policy=%s.",
+                self.configured_encoder_max_num_tokens,
+                self.encoder_token_budget_base,
+                self.effective_encoder_max_num_tokens,
+                self.model_max_mm_encoder_item_tokens,
+                ("strict" if self.configured_encoder_max_num_tokens is not None
+                 else "auto"),
+            )
         self._set_up_multimodal_encoder_attn_metadata()
         if self.llm_args.enable_layerwise_nvtx_marker:
             layerwise_nvtx_marker = LayerwiseNvtxMarker()

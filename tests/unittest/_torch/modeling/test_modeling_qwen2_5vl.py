@@ -709,3 +709,19 @@ def test_get_dummy_mm_data_for_tokens_saturates_budget(processor_cls, budget):
     # Saturates: within the budget, and adding one more image would exceed it.
     assert total_patches <= budget
     assert total_patches + per_image > budget
+
+
+@pytest.mark.parametrize("processor_cls", _DUMMY_PROCESSORS)
+def test_get_dummy_mm_data_for_tokens_covers_many_item_boundary(processor_cls):
+    proc = _make_dummy_processor(processor_cls)
+    data = proc.get_dummy_mm_data_for_tokens(
+        max_tokens_per_modality={"image": 8192},
+        max_items_per_modality={"image": 8},
+        dtype=torch.float32,
+    )
+
+    grid = data["image"]["image_grid_thw"]
+    token_lengths = grid.prod(dim=1)
+    assert grid.shape[0] == 8
+    assert token_lengths.tolist() == [1024] * 8
+    assert int(token_lengths.sum().item()) == 8192

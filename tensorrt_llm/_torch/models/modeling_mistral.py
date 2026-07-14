@@ -580,23 +580,33 @@ class Mistral3InputProcessor(BaseMultimodalInputProcessor,
         self,
         *,
         max_tokens_per_modality: Dict[str, int],
+        max_items_per_modality: Optional[Dict[str, int]] = None,
         dtype: torch.dtype | None = None,
     ) -> Dict[str, Any]:
         """Vision implementation of the agnostic profiler entry: fill the
         ``"image"`` budget with identical worst-case images. ``num_images`` is
-        derived from the realized patch count so the batch saturates the
-        budget."""
+        derived from the realized patch count so the batch stays within the
+        token budget. ``max_items_per_modality`` selects the many-item
+        profiling boundary when provided."""
         budget = max_tokens_per_modality.get("image")
         if not budget:
             return {}
+        target_num_images = (None if max_items_per_modality is None else max(
+            1, max_items_per_modality.get("image", 1)))
+        per_image_budget = (budget if target_num_images is None else max(
+            1, budget // target_num_images))
         patch, _, _, _ = self._vision_geometry()
-        size = self.get_size_for_max_tokens(max_tokens=budget)
+        size = self.get_size_for_max_tokens(max_tokens=per_image_budget)
         tokens_per_image = max(
             1,
             self._vit_tokens(width=size["width"],
                              height=size["height"],
                              patch=patch))
+        if tokens_per_image > budget:
+            return {}
         num_images = max(1, budget // tokens_per_image)
+        if target_num_images is not None:
+            num_images = min(target_num_images, num_images)
         return self.get_dummy_mm_data_for_size(width=size["width"],
                                                height=size["height"],
                                                num_images=num_images,
