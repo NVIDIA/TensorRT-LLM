@@ -19,7 +19,11 @@ from typing import Dict, List, Optional, Tuple
 import torch
 
 from tensorrt_llm._torch.pyexecutor import llm_request
-from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import GPU_LEVEL, KVCacheManagerV2
+from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import (
+    GPU_LEVEL,
+    BlockReusePolicy,
+    KVCacheManagerV2,
+)
 from tensorrt_llm._utils import (
     TensorWrapper,
     convert_to_torch_tensor,
@@ -937,7 +941,12 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
             vocab_size=vocab_size,
             cache_tiers=cache_tiers,
             max_util_for_resume=kv_cache_config.max_util_for_resume,
+            enable_partial_reuse=kv_cache_config.enable_partial_reuse,
             swa_scratch_reuse=scratch_reuse_config,
+            commit_min_snapshot=(
+                kv_cache_config.enable_block_reuse
+                and self.block_reuse_policy != BlockReusePolicy.ALL_REUSABLE
+            ),
             layers=layers,
             typical_step=typical_step,
             constraints=constraints,

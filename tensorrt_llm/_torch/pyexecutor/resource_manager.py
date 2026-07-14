@@ -2223,6 +2223,10 @@ class KVCacheManager(BaseResourceManager):
         self.impl.reset_reuse_state()
 
 
+class NoFreeSlotsError(ValueError):
+    """A slot-backed resource manager has no capacity for another request."""
+
+
 class SlotManager:
 
     def __init__(self, max_num_requests: int):
@@ -2251,7 +2255,7 @@ class SlotManager:
             return self.slot_mapping[request_id]
 
         if len(self.free_slots) == 0:
-            raise ValueError("No free slots")
+            raise NoFreeSlotsError("No free slots")
         slot = self.free_slots.pop()
         self.slot_mapping[request_id] = slot
         return slot
@@ -2276,10 +2280,6 @@ class BlockManager:
         self.tokens_per_block = tokens_per_block
         self.max_blocks_per_seq = self.num_blocks
 
-        self.base_block_offsets = torch.arange(self.num_blocks,
-                                               device="cpu",
-                                               dtype=torch.int32)
-
         self.block_ids = dict()
         self.num_sequences = dict()
         self.free_blocks = deque(range(self.num_blocks))
@@ -2303,10 +2303,9 @@ class BlockManager:
         for i in range(len(request_ids)):
             block_ids = self.block_ids[request_ids[i]]
             block_num = len(block_ids)
+            # Block ids are the page offsets directly; no lookup table needed.
             block_offsets[i, 0:block_num].copy_(
-                self.base_block_offsets[torch.tensor(block_ids,
-                                                     dtype=torch.int32,
-                                                     device="cpu")])
+                torch.tensor(block_ids, dtype=torch.int32, device="cpu"))
 
     def compute_block_count(self, token_count: int,
                             tokens_per_page: int) -> int:

@@ -3163,3 +3163,85 @@ class TestPrepareRestoreAttnMetadataForDraftReplay:
         assert meta.kv_cache_manager is original_kv_mgr
         torch.testing.assert_close(meta.kv_cache_block_offsets, original_offsets)
         torch.testing.assert_close(meta.host_kv_cache_block_offsets, original_host_offsets)
+
+
+@pytest.mark.skipif(not has_deep_gemm(), reason="DeepGEMM not available")
+@skip_pre_hopper
+def test_topk_indices_buffer_cuda_graph():
+    from tensorrt_llm._torch.memory_buffer_utils import Buffers
+
+    batch_size, next_n = 4, 3
+    head_dim, block_size = 128, 64
+    index_topk = 2048
+    kv_len = 512
+    layer_idx = 0
+    num_tokens = batch_size * next_n
+
+    cache_manager, sparse_attn_config = create_dsa_cache_manager(
+        batch_size=batch_size,
+        head_dim=head_dim,
+        tokens_per_block=block_size,
+        max_seq_len=kv_len,
+        num_layers=1,
+        index_topk=index_topk,
+    )
+    indexer = create_indexer(sparse_attn_config, layer_idx=layer_idx)
+
+    request_ids = list(range(batch_size))
+    kv_lens = torch.tensor([kv_len] * batch_size, dtype=torch.int32)
+    cache_manager.add_dummy_requests(
+        request_ids=request_ids,
+        token_nums=kv_lens.tolist(),
+        is_gen=False,
+        prepare_resource=True,
+    )
+
+    metadata = _create_mock_metadata(
+        request_ids,
+        batch_size,
+        num_contexts=0,
+        num_generations=batch_size,
+        seq_lens=torch.tensor([next_n] * batch_size, dtype=torch.int32),
+        kv_lens=kv_lens.clone(),
+        num_cached_tokens=[kv_len - next_n] * batch_size,
+        cache_manager=cache_manager,
+        num_ctx_tokens=0,
+        num_tokens=num_tokens,
+        max_draft_tokens=next_n - 1,
+        index_topk=index_topk,
+        enable_indexer_skip=True,
+    )
+    assert metadata.skip_indexer_for_gen_reqs, (
+        "test setup must hit the skip-indexer path (kv_len <= index_topk)"
+    )
+
+    metadata.is_cuda_graph = True
+    metadata.cuda_graph_buffers = Buffers()
+
+    hidden_states = torch.zeros((num_tokens, 1), device="cuda", dtype=torch.bfloat16)
+    dummy = torch.zeros((num_tokens, 1), device="cuda", dtype=torch.bfloat16)
+
+    def _run_indexer():
+        return indexer.sparse_attn_indexer(
+            metadata,
+            hidden_states,
+            q_fp8=dummy,
+            k_fp8=dummy,
+            k_scale=dummy,
+            weights=dummy,
+            update_k_cache=False,
+        )
+
+    out1 = _run_indexer()
+    ptr1 = out1.data_ptr()
+    out2 = _run_indexer()
+    ptr2 = out2.data_ptr()
+
+    assert ptr1 == ptr2, (
+        f"indexer topk-output buffer address changed across calls "
+        f"({ptr1:#x} -> {ptr2:#x}); under CUDA-graph capture it must be a "
+        f"persistent reserved-arena buffer to avoid stale-pointer IMA"
+    )
+    assert "indexer_topk_out_buffer" in metadata.cuda_graph_buffers.buffers, (
+        "indexer topk-output buffer must be drawn from the cuda_graph_buffers arena"
+    )
