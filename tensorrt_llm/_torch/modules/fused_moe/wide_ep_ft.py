@@ -60,12 +60,19 @@ def get_wide_ep_ft_options(
     one process-local membership object shared by all MoE communication layers.
     The AlltoAll watchdog reads this object to determine expected peers and
     reports suspects through its ``on_timeout`` seam; it never mutates the
-    committed membership directly.
+    committed membership directly. Rank-mask mode rejects CUDA graphs until
+    generation-scoped invalidation and recapture are implemented.
     """
 
     extra_attrs = getattr(model_config, "extra_attrs", {})
     health = extra_attrs.get(_HEALTH_KEY) or extra_attrs.get("ep_group_health")
-    if health is None and _env_enabled():
+    rank_mask_enabled = health is not None or _env_enabled()
+    if rank_mask_enabled and getattr(model_config, "use_cuda_graph", False):
+        raise ValueError(
+            "WideEP fault tolerance does not support CUDA graphs until generation-scoped "
+            "invalidation and recapture are implemented"
+        )
+    if health is None and rank_mask_enabled:
         health = EPGroupHealth(model_config.mapping.moe_ep_size)
         extra_attrs[_HEALTH_KEY] = health
 

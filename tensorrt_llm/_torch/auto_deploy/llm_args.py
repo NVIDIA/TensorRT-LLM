@@ -16,7 +16,6 @@ from importlib.resources import files
 from pathlib import Path
 from typing import Any, Dict, Literal, Optional, Type, Union
 
-import torch
 from pydantic import Field, ValidationInfo, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -27,6 +26,7 @@ from tensorrt_llm.llmapi.llm_args import (
     TorchLlmArgs,
     _ParallelConfig,
 )
+from tensorrt_llm.llmapi.utils import get_device_count
 
 from . import config as _ad_config_pkg
 from .models import ModelFactory, ModelFactoryRegistry
@@ -89,7 +89,7 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
     )
 
     gpus_per_node: int = Field(
-        default=torch.cuda.device_count(),
+        default=get_device_count(),
         description="The number of GPUs per node.",
         frozen=True,
     )

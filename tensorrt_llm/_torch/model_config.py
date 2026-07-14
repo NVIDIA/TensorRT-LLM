@@ -66,30 +66,14 @@ _MINIMAX_M3_ARCHITECTURES = {
 }
 
 
-def _unified_kv_pool_includes_mamba(
-        is_disagg: bool, spec_config: Optional['SpeculativeConfig']) -> bool:
-    """Whether the KV cache pool will include mamba layers for a hybrid model.
-
-    True for the default Python ``MambaHybridCacheManager`` route, where
-    mamba state is allocated alongside attention KV inside one pool (with
-    zero KV heads on mamba layers). False for the V1-route managers used
-    when:
-
-      * disaggregated serving forces the C++ mamba manager
-        (``TRTLLM_USE_CPP_MAMBA=1`` enables the same path locally), or
-      * ``TRTLLM_USE_PY_MAMBA=1`` forces the Python mamba manager locally
-        (agg-mode override), or
-      * one-model speculative decoding splits mamba and attention into
-        separate caches.
-
-    Single source of truth for the binding-side layer-counting decision; do
-    not duplicate the predicate at call sites.
-    """
-    use_split_pool = is_disagg \
-        or os.environ.get('TRTLLM_USE_CPP_MAMBA', '0') == '1' \
-        or os.environ.get('TRTLLM_USE_PY_MAMBA', '0') == '1'
-    use_spec = spec_config is not None
-    return not (use_split_pool or use_spec)
+def _is_lock_infra_error(exc: BaseException) -> bool:
+    """Whether exc indicates broken lock infrastructure (not mere contention)."""
+    if isinstance(exc, PermissionError):
+        return True
+    if isinstance(exc, OSError):
+        return exc.errno in (errno.EACCES, errno.EPERM, errno.ENOLCK,
+                             errno.ESTALE)
+    return False
 
 
 @contextlib.contextmanager
@@ -103,47 +87,44 @@ def config_file_lock(timeout: int = 10):
     Args:
         timeout: Maximum time to wait for lock acquisition in seconds
     """
-    # Use a single global lock file in HF cache directory
-    # This serializes all model loading operations to prevent race conditions
+    # Use a single global lock file in HF cache directory to serialize loads.
     lock_path = Path(HF_MODULES_CACHE) / "_remote_code.lock"
-
-    # Create and acquire the lock
     lock = filelock.FileLock(str(lock_path), timeout=timeout)
 
+    # Guard only acquisition so caller-body exceptions propagate (single-yield).
     try:
-        with lock:
-            yield
-    except (PermissionError, OSError, filelock.Timeout) as e:
-        # Fallback to tempdir when primary lock path is unusable (e.g.,
-        # NFS locking failures like ENOLCK/ESTALE, permission issues,
-        # or lock acquisition timeouts)
-        if isinstance(e,
-                      OSError) and e.errno not in (errno.EACCES, errno.EPERM,
-                                                   errno.ENOLCK, errno.ESTALE):
+        lock.acquire(timeout=timeout)
+    except filelock.Timeout:
+        # Contention, not broken infra: a tempdir lock can't serialize against
+        # the holder, so degrade to no lock instead of crashing the process.
+        logger.warning(
+            f"could not acquire config lock within {timeout}s, proceeding without lock"
+        )
+        yield
+    except (PermissionError, OSError) as e:
+        # Broken lock infra (perms / NFS ENOLCK/ESTALE): retry on a tempdir lock.
+        if not _is_lock_infra_error(e):
             raise
         tmp_dir = Path(tempfile.gettempdir())
         tmp_dir.mkdir(parents=True, exist_ok=True)
-        tmp_lock_path = tmp_dir / "_remote_code.lock"
-        tmp_lock = filelock.FileLock(str(tmp_lock_path), timeout=timeout)
+        tmp_lock = filelock.FileLock(str(tmp_dir / "_remote_code.lock"),
+                                     timeout=timeout)
         try:
-            with tmp_lock:
+            tmp_lock.acquire(timeout=timeout)
+        except (PermissionError, OSError, filelock.Timeout):
+            logger.warning(
+                "tempdir config lock unavailable, proceeding without lock")
+            yield
+        else:
+            try:
                 yield
-        except filelock.Timeout:
-            logger.warning(
-                f"failed to acquire tempdir config lock within {timeout} seconds, proceeding without lock"
-            )
-            # proceed without lock
+            finally:
+                tmp_lock.release()
+    else:
+        try:
             yield
-        except (PermissionError, OSError) as e:
-            if isinstance(
-                    e, OSError) and e.errno not in (errno.EACCES, errno.EPERM,
-                                                    errno.ENOLCK, errno.ESTALE):
-                raise
-            logger.warning(
-                f"tempdir config lock unavailable due to OS/permission issue: {e}, proceeding without lock"
-            )
-            # proceed without lock
-            yield
+        finally:
+            lock.release()
 
 
 @dataclass(kw_only=True)
@@ -328,7 +309,8 @@ class ModelConfig(Generic[TConfig]):
             return False
         return model_architectures[0] not in [
             "BertForSequenceClassification", "Qwen2ForProcessRewardModel",
-            "Qwen2ForRewardModel", "LlamaForTextEmbedding"
+            "Qwen2ForRewardModel", "LlamaForTextEmbedding",
+            "Qwen3ForTextEmbedding"
         ]
         # TODO: should be 'not model_type == ModelType.ENCODER_ONLY'
         # once ModelType is used in pytorch flow.

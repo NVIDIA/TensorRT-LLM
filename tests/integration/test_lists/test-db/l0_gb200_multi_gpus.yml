@@ -30,14 +30,8 @@ l0_gb200_multi_gpus:
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4_4gpus[moe_backend=CUTLASS-mtp_nextn=2-pp4-fp8kv=True-attention_dp=True-cuda_graph=True-overlap_scheduler=True-low_precision_combine=False-torch_compile=False]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4_4gpus[moe_backend=CUTLASS-mtp_nextn=0-tp4-fp8kv=True-attention_dp=True-cuda_graph=True-overlap_scheduler=True-low_precision_combine=True-torch_compile=False]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4_4gpus_online_eplb[fp8kv=True-moe_backend=TRTLLM]
-  - accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_nvfp4_4gpus_online_eplb[moe_backend=TRTLLM]
-  - accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_nvfp4_4gpus_block_reuse[TEP4]
-  - accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_nvfp4_4gpus_block_reuse[TEP4_ADP]
-  - accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_nvfp4_4gpus_block_reuse[TEP4_ADP_MTP]
-  - accuracy/test_llm_api_pytorch.py::TestNemotronV3Ultra::test_nvfp4_4gpus_online_eplb[moe_backend=CUTEDSL]
+  - accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_nvfp4_4gpus_block_reuse[DEP4_MTP_ON]
   - accuracy/test_llm_api_pytorch.py::TestNemotronV3Ultra::test_nvfp4_4gpus_block_reuse[ADP4_MTP]
-  - accuracy/test_llm_api_pytorch.py::TestNemotronV3Ultra::test_nvfp4_parallelism[ADP2_PP2]
-  - accuracy/test_llm_api_pytorch.py::TestNemotronV3Ultra::test_nvfp4_4gpu_mtp_ar
   - accuracy/test_llm_api_pytorch.py::TestQwen3_5_397B_A17B::test_nvfp4_4gpus_online_eplb[moe_backend=CUTEDSL]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_5_397B_A17B::test_nvfp4_4gpus_online_eplb[moe_backend=TRTLLM]
   - accuracy/test_llm_api_pytorch.py::TestLlama3_3_70BInstruct::test_fp8_tp4[torch_compile=False]
@@ -60,6 +54,7 @@ l0_gb200_multi_gpus:
   - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3_4gpus[v1_kv_cache-trtllm-one_model-overlap_scheduler]
   - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3_4gpus[v2_kv_cache-trtllm-one_model-overlap_scheduler]
   - accuracy/test_llm_api_pytorch_multimodal.py::TestMistralLarge3_675B::test_nvfp4_4gpus[latency_moe_trtllm] TIMEOUT (90)
+  - accuracy/test_disaggregated_serving.py::TestDeepSeekV4Flash::test_auto_dtype TIMEOUT (60)
   - accuracy/test_dwdp_disaggregated_serving.py::TestDwdpDeepSeekV3Lite::test_dwdp_accuracy
   - accuracy/test_dwdp_disaggregated_serving.py::TestDwdpDeepSeekV3Lite::test_dwdp_accuracy_contention_opt
   - accuracy/test_dwdp_disaggregated_serving.py::TestDwdpDeepSeekV3Lite::test_dwdp_accuracy_mode_b_overlap
@@ -82,6 +77,11 @@ l0_gb200_multi_gpus:
       stage: post_merge
       backend: pytorch
   tests:
+  - accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_nvfp4_4gpus_online_eplb[moe_backend=TRTLLM]
+  - accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_nvfp4_4gpus_block_reuse[TEP4]
+  - accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_nvfp4_4gpus_block_reuse[DEP4_MTP_OFF]
+  - accuracy/test_llm_api_pytorch.py::TestNemotronV3Ultra::test_nvfp4_4gpus_online_eplb[moe_backend=CUTEDSL]
+  - accuracy/test_llm_api_pytorch.py::TestNemotronV3Ultra::test_nvfp4_parallelism[ADP2_PP2]
   - accuracy/test_llm_api_pytorch.py::TestQwen3NextInstruct::test_bf16_4gpu[tep4]
   - accuracy/test_llm_api_pytorch.py::TestQwen3NextInstruct::test_bf16_4gpu[dep4]
   - accuracy/test_llm_api_pytorch.py::TestQwen3NextInstruct::test_nvfp4[dep4-cutlass]
@@ -128,6 +128,4 @@ l0_gb200_multi_gpus:
   - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_4gpus[v2_kv_cache-dp4-trtllm-auto]
   - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4a16[dp4-auto]
   # ---- moved to post-merge (MoE CI optimization) ----
-  - accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_bf16_trtllm_gen_moe_backend[attention_dp=True]
-  - accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_bf16_trtllm_gen_moe_backend[attention_dp=False]
   - unittest/_torch/modules/moe/test_moe_comm.py::TestMoEComm::test_moe_comm_boundary

@@ -53,7 +53,8 @@ from tensorrt_llm.llmapi.llm_args import (BaseLlmArgs, CacheTransceiverConfig,
                                           UserProvidedDecodingConfig,
                                           update_llm_args_with_extra_dict)
 # fmt: on
-from tensorrt_llm.llmapi.llm_utils import apply_model_defaults_to_llm_args
+from tensorrt_llm.llmapi.llm_utils import (_resolve_kv_cache_manager_v2_auto,
+                                           apply_model_defaults_to_llm_args)
 from tensorrt_llm.llmapi.mm_encoder import MultimodalEncoder
 from tensorrt_llm.llmapi.utils import print_traceback_on_error
 from tensorrt_llm.models.modeling_utils import LayerQuantConfig, QuantConfig
@@ -310,6 +311,43 @@ class TestModelDefaults:
         applied = apply_model_defaults_to_llm_args(llm_args, model_defaults)
         assert applied == model_defaults
 
+    @pytest.mark.parametrize("explicit_auto", [False, True])
+    def test_kv_cache_manager_v2_auto_uses_model_default(self, explicit_auto):
+        kv_cache_config = (KvCacheConfig(use_kv_cache_manager_v2="auto")
+                           if explicit_auto else KvCacheConfig())
+        llm_args = TorchLlmArgs(model="/tmp/dummy_model",
+                                kv_cache_config=kv_cache_config)
+        model_defaults = {"kv_cache_config": {"use_kv_cache_manager_v2": True}}
+
+        apply_model_defaults_to_llm_args(llm_args, model_defaults)
+        _resolve_kv_cache_manager_v2_auto(llm_args, model_defaults)
+
+        assert llm_args.kv_cache_config.use_kv_cache_manager_v2 is True
+
+    def test_kv_cache_manager_v2_auto_falls_back_to_false(self):
+        llm_args = TorchLlmArgs(model="/tmp/dummy_model")
+
+        _resolve_kv_cache_manager_v2_auto(llm_args, {})
+
+        assert llm_args.kv_cache_config.use_kv_cache_manager_v2 is False
+
+    @pytest.mark.parametrize("user_setting", [False, True])
+    def test_kv_cache_manager_v2_explicit_value_overrides_model_default(
+            self, user_setting):
+        llm_args = TorchLlmArgs(
+            model="/tmp/dummy_model",
+            kv_cache_config=KvCacheConfig(use_kv_cache_manager_v2=user_setting))
+        model_defaults = {
+            "kv_cache_config": {
+                "use_kv_cache_manager_v2": not user_setting
+            }
+        }
+
+        apply_model_defaults_to_llm_args(llm_args, model_defaults)
+        _resolve_kv_cache_manager_v2_auto(llm_args, model_defaults)
+
+        assert llm_args.kv_cache_config.use_kv_cache_manager_v2 is user_setting
+
     @pytest.mark.parametrize(
         "defaults_dict,should_raise,error_contains",
         [
@@ -411,6 +449,13 @@ def test_KvCacheConfig_declaration():
     assert KvCacheConfig().kv_cache_event_hash_algo == "auto"
     assert KvCacheConfig().block_reuse_policy == "all_reusable"
     assert KvCacheConfig().enable_swa_scratch_reuse is False
+    assert KvCacheConfig().use_kv_cache_manager_v2 == "auto"
+    assert KvCacheConfig(
+        use_kv_cache_manager_v2=True).use_kv_cache_manager_v2 is True
+    assert KvCacheConfig(
+        use_kv_cache_manager_v2=False).use_kv_cache_manager_v2 is False
+    with pytest.raises(ValidationError, match="use_kv_cache_manager_v2"):
+        KvCacheConfig(use_kv_cache_manager_v2="invalid")
 
     config = KvCacheConfig(enable_block_reuse=True,
                            max_tokens=1024,

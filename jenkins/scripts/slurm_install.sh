@@ -20,7 +20,8 @@ slurm_install_setup() {
             rm -f "$lock_file"
         fi
 
-        retry_command bash -c "wget -nv $llmTarfile && tar -zxf $tarName"
+        retry_command --timeout 1800 bash -c "wget -nv $llmTarfile"
+        tar -zxf $tarName
         which python3
         python3 --version
         retry_command apt-get install -y libffi-dev
@@ -28,11 +29,12 @@ slurm_install_setup() {
         if [[ "${SKIP_INSTALL:-0}" == "1" ]]; then
             echo "SKIP_INSTALL=1: skipping pip installs (packages pre-installed in fat sqsh)"
         else
-            if [[ ${pytestCommand:-} == *--run-ray* ]]; then
-                retry_command pip3 install --retries 10 "ray[default]==2.55.1"
+            if [[ $pytestCommand == *--run-ray* ]]; then
+                retry_command --timeout 2700 pip3 install --retries 10 "ray[default]==2.55.1"
             fi
-            retry_command bash -c "cd $llmSrcNode && pip3 install --retries 10 -r requirements-dev.txt"
-            retry_command bash -c "cd $resourcePathNode && pip3 install --retries 10 --force-reinstall --no-deps TensorRT-LLM/tensorrt_llm-*.whl"
+            retry_command --timeout 2700 bash -c "pip3 install --retries 10 opencv-python-headless"
+            retry_command --timeout 2700 bash -c "cd $llmSrcNode && pip3 install --retries 10 -r requirements-dev.txt"
+            retry_command --timeout 2700 bash -c "cd $resourcePathNode && pip3 install --retries 10 --force-reinstall --no-deps TensorRT-LLM/tensorrt_llm-*.whl"
         fi
         gpuUuids=$(nvidia-smi -q | grep "GPU UUID" | awk '{print $4}' | tr '\n' ',' || true)
         hostNodeName="${HOST_NODE_NAME:-$(hostname -f || hostname)}"

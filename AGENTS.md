@@ -147,8 +147,9 @@ Key files:
 The `gh` CLI uses `~/.config/gh` by default for authentication. Different GitHub hosts or forks may require a different config directory. **Before running any `gh` command** (e.g., `gh pr create`, `gh api`, `gh pr comment`):
 
 1. Check if the user has specified a custom `GH_CONFIG_DIR` (e.g., in `CLAUDE.local.md` or environment). If so, use it.
-2. If not explicitly set, **ask the user** whether the default `~/.config/gh` is correct or if a different directory should be used. This is especially relevant when the PR target is a fork (e.g., `nv-auto-deploy/TensorRT-LLM`) rather than `NVIDIA/TensorRT-LLM`.
+2. If not explicitly set, default to `~/.config/gh`; do not ask for confirmation.
 3. Prefix all `gh` commands with the resolved config dir: `GH_CONFIG_DIR=<path> gh ...`
+4. If the command fails due to missing authentication or the wrong GitHub host/account, report the failure and ask for the correct `GH_CONFIG_DIR`.
 
 ## CI / Testing
 

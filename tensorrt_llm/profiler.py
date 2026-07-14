@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import contextlib
 import time
 from functools import partial
 from typing import Literal, Optional, Tuple, Union
@@ -110,18 +111,24 @@ def summary():
 MemUnitType = Literal["GiB", "MiB", "KiB"]
 
 
-class PyNVMLContext:
-    def __enter__(self):
-        if pynvml is not None:
+@contextlib.contextmanager
+def pynvml_context():
+    has_pynvml = pynvml is not None
+    if has_pynvml:
+        try:
             pynvml.nvmlInit()
+        except pynvml.NVMLError:
+            has_pynvml = False
 
-    def __exit__(self, type, value, traceback):
-        if pynvml is not None:
+    try:
+        yield
+    finally:
+        if has_pynvml:
             pynvml.nvmlShutdown()
 
 
 if pynvml is not None:
-    with PyNVMLContext():
+    with pynvml_context():
         _device_get_memory_info_fn = partial(
             pynvml.nvmlDeviceGetMemoryInfo,
             version=pynvml.nvmlMemory_v2,
@@ -147,7 +154,7 @@ def device_memory_info(device: Optional[Union[torch.device, int]] = None) -> Tup
         if device is None:
             device = torch.cuda.current_device()
         index = device.index if isinstance(device, torch.device) else device
-        with PyNVMLContext():
+        with pynvml_context():
             handle = pynvml.nvmlDeviceGetHandleByIndex(index)
             mem_info = _device_get_memory_info_fn(handle)
         return mem_info.used, mem_info.free, mem_info.total
