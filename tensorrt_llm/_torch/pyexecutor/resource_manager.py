@@ -286,6 +286,9 @@ class KVCacheManager(BaseResourceManager):
         self.mapping = mapping
         self.dtype = dtype
         self.kv_cache_type = kv_cache_type
+        # Consumed by the disaggregation page-table builder to expose the DSA
+        # indexer K cache pool as a REPLICATED pool view.
+        self.enable_indexer_k_cache = enable_indexer_k_cache
         self.spec_config = spec_config
         self.pp_layers, self.num_layers = get_pp_layers(
             num_layers,
