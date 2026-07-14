@@ -93,7 +93,12 @@ inline CUresult launchKernelFlexibleCgaSizes(void* kernelParams, void* cudaStrea
 }
 
 inline CUresult launchKernel(void* kernelParams, void* cudaStream, int32_t smemSize, CUfunction kernel, dim3 block3,
-    dim3 grid3, dim3 cluster3, bool enablesPdl)
+    dim3 grid3, dim3 cluster3, bool enablesPdl
+#ifdef TLLM_TEST
+    ,
+    void* dependencyEvent = nullptr
+#endif // TLLM_TEST
+)
 {
     // Make sure we can launch with that much shared memory.
     // Note: those function-level settings are actually ignored as we use per-launch attributes.
@@ -119,7 +124,11 @@ inline CUresult launchKernel(void* kernelParams, void* cudaStream, int32_t smemS
     launchConfig.hStream = reinterpret_cast<CUstream>(cudaStream);
     launchConfig.sharedMemBytes = smemSize;
 
+#if defined(TLLM_TEST)
+    CUlaunchAttribute launchAttrs[4];
+#else
     CUlaunchAttribute launchAttrs[3];
+#endif // TLLM_TEST
     launchAttrs[0].id = CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION;
     launchAttrs[0].value.clusterDim.x = cluster3.x;
     launchAttrs[0].value.clusterDim.y = cluster3.y;
@@ -130,6 +139,15 @@ inline CUresult launchKernel(void* kernelParams, void* cudaStream, int32_t smemS
     launchAttrs[2].id = CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION;
     launchAttrs[2].value.programmaticStreamSerializationAllowed = enablesPdl;
     launchConfig.numAttrs = 3;
+#ifdef TLLM_TEST
+    if (dependencyEvent)
+    {
+        launchAttrs[launchConfig.numAttrs].id = CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_EVENT;
+        launchAttrs[launchConfig.numAttrs].value.programmaticEvent.triggerAtBlockStart = 1;
+        launchAttrs[launchConfig.numAttrs].value.programmaticEvent.event = reinterpret_cast<CUevent>(dependencyEvent);
+        launchConfig.numAttrs++;
+    }
+#endif // TLLM_TEST
     launchConfig.attrs = launchAttrs;
 
     // Add setting for non-portable cluster size.

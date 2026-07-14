@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Tests for async media loading in tensorrt_llm.inputs.utils.
+"""Tests for async media loading in tensorrt_llm.inputs.media_io and utils.
 
 Covers:
 - async_load_image / async_load_audio with data URLs and file paths
@@ -22,13 +22,10 @@ import soundfile
 import torch
 from PIL import Image
 
+import tensorrt_llm.inputs.media_io as media_io_module
 import tensorrt_llm.inputs.utils as utils_module
-from tensorrt_llm.inputs.utils import (
-    MultimodalDataTracker,
-    _get_aiohttp_session,
-    async_load_audio,
-    async_load_image,
-)
+from tensorrt_llm.inputs.media_io import _get_aiohttp_session
+from tensorrt_llm.inputs.utils import MultimodalDataTracker, async_load_audio, async_load_image
 
 # ──────────────────────────────────────────────────────────────
 # Helpers
@@ -148,11 +145,11 @@ class TestAsyncLoadAudio:
 class TestSessionReuse:
     @pytest_asyncio.fixture(autouse=True)
     async def reset_global_session(self):
-        utils_module._global_aiohttp_session = None
+        media_io_module._global_aiohttp_session = None
         yield
-        if utils_module._global_aiohttp_session is not None:
-            await utils_module._global_aiohttp_session.close()
-        utils_module._global_aiohttp_session = None
+        if media_io_module._global_aiohttp_session is not None:
+            await media_io_module._global_aiohttp_session.close()
+        media_io_module._global_aiohttp_session = None
 
     @pytest.mark.asyncio
     async def test_same_session_returned_on_repeated_calls(self):

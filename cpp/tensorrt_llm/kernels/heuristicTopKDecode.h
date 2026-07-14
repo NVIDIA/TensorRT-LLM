@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2019-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,6 +18,8 @@
 
 #include "tensorrt_llm/common/config.h"
 #include <cstdint>
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
 TRTLLM_NAMESPACE_BEGIN
@@ -28,12 +30,31 @@ namespace kernels
 inline constexpr int kHeuristicTopK = 2048;
 inline constexpr int kHeuristicSize = 2048;
 
-/// Launch heuristic TopK decode kernel.
+/// Launch heuristic TopK decode kernel — fp32 input.
 /// @param scratchValues Caller-owned buffer of size [numRows * topK] floats.
 ///        Required for CUDA Graph compatibility — must have a stable device address.
+/// @param compressRatio  KV compression ratio (1 = V3.2 indexer; 4 = V4 indexer
+///        whose logits/preIdx live in compressed-token-index space). For
+///        compressRatio != 1, preIdxOffset is forced to 0 (append-at-end in
+///        compressed space → prev-step indices remain valid as-is); the
+///        existing (rowIdx % next_n)+1 shift is used only when compressRatio==1.
 void launchHeuristicTopKDecode(float const* logits, int const* seqLens, int const* preIdx, int* outIndices,
     float* scratchValues, int stride0, int next_n, int topK, int preIdxStride, int preIdxCount, int numRows,
-    cudaStream_t stream);
+    int compressRatio, cudaStream_t stream);
+
+/// Launch heuristic TopK decode kernel — bf16 input.
+/// scratchValues is [numRows * topK] of bf16 (matches input dtype).
+/// @param compressRatio  See fp32 overload.
+void launchHeuristicTopKDecode(__nv_bfloat16 const* logits, int const* seqLens, int const* preIdx, int* outIndices,
+    __nv_bfloat16* scratchValues, int stride0, int next_n, int topK, int preIdxStride, int preIdxCount, int numRows,
+    int compressRatio, cudaStream_t stream);
+
+/// Launch heuristic TopK decode kernel — fp16 input.
+/// scratchValues is [numRows * topK] of fp16 (matches input dtype).
+/// @param compressRatio  See fp32 overload.
+void launchHeuristicTopKDecode(__half const* logits, int const* seqLens, int const* preIdx, int* outIndices,
+    __half* scratchValues, int stride0, int next_n, int topK, int preIdxStride, int preIdxCount, int numRows,
+    int compressRatio, cudaStream_t stream);
 
 } // namespace kernels
 

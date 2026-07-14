@@ -45,7 +45,8 @@ If you are having trouble, check:
 
    machine <your-registry> login <your-id> password <your-registry-read-token>
    machine nvcr.io login \$oauthtoken password <your-ngc-token>
-   machine authn.nvidia.com login \$oauthtoken password <your-ngc-token>
+   (and one line per additional auth host the registry redirects to, e.g.
+    \"machine <your-auth-host> login \$oauthtoken password <your-ngc-token>\")
 "
 
 getopt --test

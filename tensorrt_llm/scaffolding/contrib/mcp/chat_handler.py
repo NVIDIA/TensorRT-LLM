@@ -1,3 +1,5 @@
+import os
+
 import openai
 
 from tensorrt_llm.executor import GenerationExecutor
@@ -5,6 +7,11 @@ from tensorrt_llm.scaffolding import TaskStatus
 from tensorrt_llm.scaffolding.contrib.mcp.chat_task import ChatTask
 
 ExecutorCls = GenerationExecutor
+
+
+def is_deterministic_mode():
+    """Check if SCAFFOLDING_DETERMINISTIC environment variable is set to enable deterministic inference."""
+    return int(os.environ.get("SCAFFOLDING_DETERMINISTIC", 0)) == 1
 
 
 # helper function
@@ -24,6 +31,14 @@ def combine_params_with_chat_task(worker, params: dict, task: ChatTask):
     add_param_if_not_none(params, "top_p", [task.top_p])
 
     add_param_if_not_none(params, "tools", [task.tools])
+
+    # Override parameters for deterministic inference
+    if is_deterministic_mode():
+        params["temperature"] = 0.0  # Deterministic sampling
+        params["top_p"] = 1.0  # Disable nucleus sampling
+        params["n"] = 1  # Only return one result
+        if "seed" not in params or params["seed"] is None:
+            params["seed"] = 42  # Fixed seed for reproducibility
 
 
 def fill_chat_task_with_response(task: ChatTask, response: openai.Completion):

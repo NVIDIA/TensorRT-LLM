@@ -1,10 +1,26 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Transformations to support graph sharding.
 
-.. deprecated::
-    The heuristic-based sharding infrastructure in this module (``detect_sharding``,
-    ``sharding_transform_executor``, and all ``ShardingInfo`` classes) is being replaced
-    by the hint-driven IR sharding system in ``sharding_ir.py``.  New development should
-    target ``sharding_ir.py``; this module will be removed once the transition is complete.
+Heuristic-detection fallback for modeling files not yet ported to sharding IR.
+The auto-detect dispatcher in ``sharding_ir.py::is_shardingIR_enabled`` routes
+FX graphs without ``torch.ops.auto_deploy.all_reduce`` markers here; graphs
+authored against the sharding IR are handled by ``apply_sharding_hints`` instead.
+New modeling-file work should target the sharding IR (see
+``.claude/skills/ad-sharding-ir-port``); this module remains the fallback while
+the long-tail of unported modeling files is brought across.
 
 Our sharding algorithm for tensor parallelism (TP) is based on the following steps:
 
@@ -85,6 +101,18 @@ from ..interface import (
     TransformConfig,
     TransformInfo,
     TransformRegistry,
+)
+
+# Shared sharding primitives now live in the default IR pipeline (sharding_ir.py).
+# The dependency points legacy -> IR; sharding_ir.py never imports from sharding.py.
+from .sharding_ir import (
+    SplitDimension,
+    _get_dist_ops,
+    _load_hook,
+    _shard_fp4_weight_scale,
+    _split_tensor_for_tp,
+    shard_weight_tensor,
+    validate_allreduce_strategy,
 )
 
 ########################################################
@@ -178,23 +206,24 @@ class ShardingDim(Enum):
     BMM = "bmm"
 
 
-class SplitDimension(IntEnum):
-    """Enum for tensor split dimensions in sharding."""
-
-    # NOTE: The names COLUMN/ROW reflect the hugging face
-    # base_tp_plan sharding notation, but since we assume Y = W @ X^T,
-    # when splitting weight matrix W^T across columns, the actual split
-    # is over dimension 0
-    COLUMN = 0
-    ROW = 1
-
-
 class DistBackend(Enum):
     """Enum for distributed backend."""
 
     AUTO = "auto"
     TRTLLM = "trtllm"
     TORCH = "torch"
+
+
+class AllGatherStrategy(Enum):
+    """Enum for AllGather strategy.
+
+    AUTO: Use NCCL AllGather (default).
+    SYMM_MEM: Use PyTorch symmetric memory with MULTIMEM hardware instructions.
+              Falls back to NCCL for unsupported cases (variable sizes, dim!=0, large tensors).
+    """
+
+    AUTO = "AUTO"
+    SYMM_MEM = "SYMM_MEM"
 
 
 class MLPType(Enum):
@@ -244,11 +273,30 @@ class ShardingTransformConfig(TransformConfig):
         "Only effective when shard_all_unprocessed is True. "
         "When None, all unprocessed linear nodes are sharded.",
     )
+    exclude_shard_node_filter: Optional[str] = Field(
+        default=None,
+        description="Comma-separated list of substrings. Linear nodes whose name contains "
+        "ANY of the listed substrings are kept TP-replicated across all ranks "
+        "(no column-shard / row-shard / AllGather / AllReduce added) regardless of which "
+        "sharding path (heuristic catch-all, MHA, MLA, MoE, MLP) selected them. "
+        "Other sharding for the same layer (e.g. q_b_proj head-shard, o_proj row-shard) is "
+        "unaffected. Use to match PT-style replicated patterns -- for example, DeepseekV3 "
+        "keeps q_a_proj + kv_a_proj_with_mqa replicated (TP-unsharded, no AllGather) while "
+        "still column-sharding q_b/kv_b by heads. Example: "
+        "'q_a_proj,kv_a_proj_with_mqa'. When None (default), all sharding paths run as-is.",
+    )
     allreduce_strategy: AllReduceStrategy = Field(
         default=AllReduceStrategy.AUTO,
         description="AllReduce strategy for distributed operations. "
         "Options: AUTO (automatic selection), NCCL, ONESHOT, TWOSHOT, MIN_LATENCY, "
         "LOWPRECISION, UB, MNNVL, NCCL_SYMMETRIC",
+    )
+
+    allgather_strategy: AllGatherStrategy = Field(
+        default=AllGatherStrategy.AUTO,
+        description="AllGather strategy for distributed operations. "
+        "Options: AUTO (NCCL AllGather), SYMM_MEM (symmetric memory with MULTIMEM, "
+        "falls back to NCCL for unsupported cases).",
     )
 
     dist_backend: DistBackend = Field(default=DistBackend.AUTO)
@@ -271,20 +319,17 @@ class ShardingTransformConfig(TransformConfig):
     dist_config: DistConfig = Field(default_factory=DistConfig)
 
     def _init_mapping(self):
-        """Initialize DistConfig from dist_mapping config.
+        """Initialize ``self.dist_config`` from ``dist_mapping`` (test-only fallback).
 
-        NOTE: This method is now primarily a fallback. The preferred flow is:
-        1. DistConfig is constructed in ad_executor.py from the Mapping object
-        2. Passed through SharedConfig.dist_config to the sharding transform
-        3. Only if SharedConfig.dist_config is None, this fallback is used
+        Production path builds ``DistConfig`` in ``LlmArgs.init_dist_config`` and
+        passes it through ``SharedConfig.dist_config``.  This fallback is only
+        entered when ``shared_config.dist_config is None`` (tests constructing
+        ``InferenceOptimizer`` directly without a ``dist_config`` kwarg).
         """
-        self.dist_config = DistConfig(
-            world_size=self.world_size,
+        self.dist_config = DistConfig.from_sharding_params(
             rank=self.rank,
-            tp_size=self.dist_mapping.get("tp", self.world_size),
-            moe_tp_size=self.dist_mapping.get("moe_tp", 1),
-            moe_ep_size=self.dist_mapping.get("moe_ep", self.world_size),
-            moe_cluster_size=self.dist_mapping.get("moe_cluster", 1),
+            world_size=self.world_size,
+            dist_mapping=self.dist_mapping,
             enable_attention_dp=self.enable_attention_dp,
             allreduce_strategy=self.allreduce_strategy.name,
         )
@@ -345,12 +390,33 @@ class ShardingTransformConfig(TransformConfig):
         """Convert string names like 'AUTO' to AllReduceStrategy enum."""
         return validate_allreduce_strategy(v)
 
+    @field_validator("allgather_strategy", mode="before")
+    @classmethod
+    def _validate_allgather_strategy(cls, v):
+        """Convert string names like 'AUTO' or 'SYMM_MEM' to AllGatherStrategy enum."""
+        if isinstance(v, AllGatherStrategy):
+            return v
+        if isinstance(v, str):
+            try:
+                return AllGatherStrategy(v.upper())
+            except (ValueError, KeyError):
+                raise ValueError(
+                    f"Invalid allgather strategy: {v}. "
+                    f"Valid options: {', '.join(s.value for s in AllGatherStrategy)}"
+                )
+        return v
+
 
 class ShardingTransformInfo(BaseModel, ABC):
     """Abstract base class for transformation configurations."""
 
     target_node: str
     config: ShardingTransformConfig
+    # Weight/param name (e.g. "...self_attn.q_a_proj.weight") resolved at from_node()
+    # time, where the FX node is available. exclude_shard_node_filter is documented in
+    # weight-name terms, so the central exclusion check matches against this (falling
+    # back to target_node). None when the node has no extractable weight.
+    weight_name: Optional[str] = None
 
     def validate(self, gm: GraphModule = None, node: Node = None) -> bool:
         """
@@ -379,16 +445,17 @@ class ShardingTransformInfo(BaseModel, ABC):
         return True
 
     def __hash__(self) -> int:
-        """Make the transform info hashable by excluding the config field.
+        """Make the transform info hashable by excluding non-identity fields.
 
-        The config field is excluded because:
-        1. It may not be hashable (ShardingTransformConfig is mutable)
-        2. Tests set config=None before comparison anyway
+        Excluded:
+        - config: may not be hashable (ShardingTransformConfig is mutable); tests
+          set config=None before comparison anyway.
+        - weight_name: derived from the node (hence from target_node), so it is
+          redundant for identity; tests construct expected transforms without it.
         """
-        # Get all fields except 'config' for hashing
         field_values = []
         for field_name, field_info in self.model_fields.items():
-            if field_name != "config":
+            if field_name not in ("config", "weight_name"):
                 value = getattr(self, field_name)
                 # Handle enums
                 if isinstance(value, (Enum, IntEnum)):
@@ -430,7 +497,12 @@ class WeightShardingInfo(ShardingTransformInfo):
         Create the correct TPShardingInfo subclass (FP8/FP4/base) based on `node`.
         """
         subcls = _resolve_tp_cls_from_node(node)
-        return subcls(target_node=node.name, **kwargs)
+        wname = extract_weight_name(node)
+        return subcls(
+            target_node=node.name,
+            weight_name=wname if isinstance(wname, str) else None,
+            **kwargs,
+        )
 
     def validate(self, gm: GraphModule = None, node: Node = None) -> bool:
         """Validate the transformation configuration."""
@@ -541,17 +613,16 @@ class QuantizationShardingMixin(ABC):
         for k, v in sharded_scales.items():
             submod.register_buffer(k, v)
 
-        gm._register_load_state_dict_pre_hook(
-            partial(
-                self.shard_load_hook,
-                weight_name=weight_key,
-                weight_original_shape=weight_original_shape,
-                dim=dim,
-                rank=rank,
-                world_size=world_size,
-                min_local_shape=min_local_shape,
-            )
+        hook = partial(
+            self.shard_load_hook,
+            weight_name=weight_key,
+            weight_original_shape=weight_original_shape,
+            dim=dim,
+            rank=rank,
+            world_size=world_size,
+            min_local_shape=min_local_shape,
         )
+        gm._register_load_state_dict_pre_hook(hook)
 
 
 class FP8WeightShardingInfo(QuantizationShardingMixin, WeightShardingInfo):
@@ -715,38 +786,6 @@ class FineGrainedFP8WeightShardingInfo(QuantizationShardingMixin, WeightSharding
             )
 
 
-def _shard_fp4_weight_scale(
-    weight_scale,
-    original_uint8_weight_shape,
-    dim,
-    rank,
-    world_size,
-    min_local_shape=1,
-    fused_weight_dims=None,
-):
-    # Convert original uint8 shape to element shape (FP4 packs 2 elements per byte)
-    weight_shape_elements = list(original_uint8_weight_shape)
-    weight_shape_elements[-1] *= 2
-    modelopt_weight_scale = cutlass_fp4_scale_to_modelopt_fp4_scale(
-        weight_scale, tuple(weight_shape_elements)
-    )
-    if fused_weight_dims is not None:
-        # Fused weights (e.g. Mamba in_proj) are split per-component then sharded.
-        # The scale must follow the same per-component splitting to stay aligned.
-        sharded_scale = torch.cat(
-            [
-                _split_tensor_for_tp(chunk, dim, rank, world_size, min_local_shape)
-                for chunk in torch.split(modelopt_weight_scale, list(fused_weight_dims), dim=dim)
-            ],
-            dim=dim,
-        )
-    else:
-        sharded_scale = _split_tensor_for_tp(
-            modelopt_weight_scale, dim, rank, world_size, min_local_shape
-        )
-    return modelopt_fp4_scale_to_cutlass_fp4_scale(sharded_scale)
-
-
 class FP4WeightShardingInfo(QuantizationShardingMixin, WeightShardingInfo):
     """Tensor-parallel sharding for FP4-quantized linears."""
 
@@ -872,14 +911,13 @@ class BMMShardingInfo(ShardingTransformInfo):
                 gm.get_submodule(modname).register_parameter(param_name, param_new)
 
                 # Register load state dict hook
-                gm._register_load_state_dict_pre_hook(
-                    partial(
-                        _load_hook,
-                        f_split=slice_tensor,
-                        param_key=weight_key,
-                        param_shape=param_new.shape,
-                    )
+                hook = partial(
+                    _load_hook,
+                    f_split=slice_tensor,
+                    param_key=weight_key,
+                    param_shape=param_new.shape,
                 )
+                gm._register_load_state_dict_pre_hook(hook)
             else:
                 # Handle dynamic tensor
                 with gm.graph.inserting_before(bmm_node):
@@ -896,7 +934,11 @@ class BMMShardingInfo(ShardingTransformInfo):
         handle_tensor(node, lhs_tensor, 0, self.start_idx, self.end_idx)
         handle_tensor(node, rhs_tensor, 1, self.start_idx, self.end_idx)
 
-        # Add all_gather node after BMM to collect results
+        # Add all_gather node after BMM to collect results.
+        # BMM sharding always uses the torch (demollm) backend, which is a
+        # plain torch.distributed all_gather and has no strategy/symm_mem
+        # knobs. Op signature is (tensor, dim=0, sizes=None); `sizes` is
+        # unused on the torch backend (kept only for parity with trtllm).
         with gm.graph.inserting_after(node):
             gather_node = gm.graph.call_function(
                 torch.ops.auto_deploy.torch_dist_all_gather.default,
@@ -915,7 +957,12 @@ class EPShardingInfo(ShardingTransformInfo):
         Create the correct EPShardingInfo subclass (FP8/NVFP4/base) based on `node`.
         """
         subcls = _resolve_ep_cls_from_node(node)
-        return subcls(target_node=node.name, **kwargs)
+        wname = extract_weight_name(node)
+        return subcls(
+            target_node=node.name,
+            weight_name=wname if isinstance(wname, str) else None,
+            **kwargs,
+        )
 
     def validate(self, gm: GraphModule = None, node: Node = None) -> bool:
         """Validate the transformation configuration."""
@@ -1137,6 +1184,19 @@ class Sharding(BaseTransform):
     ) -> Tuple[GraphModule, TransformInfo]:
         local_rank, world_size = shared_config.local_rank, shared_config.world_size
         assert isinstance(gm, GraphModule), "Expecting GraphModule"
+
+        # Honor the auto-detect dispatcher in apply_sharding_hints. When the
+        # IR pipeline has already sharded this graph, the heuristic-detection
+        # fallback would either re-shard the same nodes or build a stale plan.
+        if gm.meta.get("sharding_ir_applied"):
+            ad_logger.info(
+                "detect_sharding: sharding IR already applied to this graph; "
+                "skipping heuristic-detection fallback."
+            )
+            return gm, TransformInfo(
+                skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
+            )
+
         _is_draft = getattr(gm, "is_draft", False)
         config = self.config
         config.factory_config = factory.get_sharding_config() if factory else {}
@@ -1182,6 +1242,28 @@ class Sharding(BaseTransform):
             if ShardingDim.EP in config.sharding_dims:
                 ad_logger.info("Running autodeploy EP sharding heuristics")
                 info += detect_ep_shard(gm, transform_container)
+                # Under attention-DP, EP-sharding the draft submodel forces its
+                # MoE op into the alltoall path. Target and draft share a
+                # single process-wide MoeAlltoAll workspace + flag_val counter
+                # (singleton in MoeAlltoAll._WORKSPACE), so a misconfigured
+                # draft alltoall corrupts the workspace and the subsequent
+                # target alltoall calls hang or fault. Replicating the draft
+                # (no EP sharding, no alltoall) is the safe choice: the draft
+                # is small enough that the 4x weight memory is negligible,
+                # and each rank computes its local-batch slice locally with no
+                # cross-rank communication needed.
+                # TODO: https://github.com/NVIDIA/TensorRT-LLM/issues/15168
+                if (
+                    _is_draft
+                    and config.dist_config.enable_attention_dp
+                    and transform_container.ep_transforms
+                ):
+                    ad_logger.info(
+                        "Reverting %d EP sharding transform(s) on draft submodel "
+                        "under attention_dp (replicating instead).",
+                        len(transform_container.ep_transforms),
+                    )
+                    transform_container.ep_transforms.clear()
             if ShardingDim.BMM in config.sharding_dims:
                 # While BMM nodes are most likely used for MoE (e.g. LLama4),
                 # technically, this is a different transformation.
@@ -1258,6 +1340,19 @@ class ShardingTransformExecutor(BaseTransform):
         factory: ModelFactory,
         shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
+        # Honor the auto-detect dispatcher: when apply_sharding_hints handled
+        # this graph, detect_sharding was skipped and no transform plan was
+        # built. Mirror that here so we don't attempt to read an absent
+        # _sharding_transform_container.
+        if gm.meta.get("sharding_ir_applied"):
+            ad_logger.info(
+                "sharding_transform_executor: sharding IR already applied; "
+                "no heuristic plan to execute."
+            )
+            return gm, TransformInfo(
+                skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
+            )
+
         # create a node dict for faster lookup
         node_dict = {n.name: n for n in gm.graph.nodes}
 
@@ -1282,6 +1377,7 @@ class ShardingTransformExecutor(BaseTransform):
             f"BMM={len(transforms.bmm_transforms)}, "
             f"RMSNorm={len(transforms.rmsnorm_transforms)}"
         )
+
         with WeightBiasInfoCache():
             for tp_transform in transforms.weight_sharding_transforms:
                 if check_and_apply(tp_transform):
@@ -1333,6 +1429,12 @@ class ShardingTransformContainer(BaseModel):
     def add(self, transform: ShardingTransformInfo) -> bool:
         """Append a transform only if that node was
         not sharded before. Do not overwrite existing transforms.
+
+        Honors ``ShardingTransformConfig.exclude_shard_node_filter``: nodes whose
+        name matches any of the configured substrings are kept replicated across
+        TP ranks (the transform is silently dropped). The exclusion applies to
+        all weight/EP sharding paths so callers do not need to thread the filter
+        through every heuristic.
         """
         # Find the appropriate list by checking inheritance
         transform_list = None
@@ -1343,6 +1445,17 @@ class ShardingTransformContainer(BaseModel):
 
         if transform_list is None:
             raise ValueError(f"Unknown transform type: {type(transform)}")
+
+        # Global node-exclusion filter -- keeps matching nodes replicated
+        # regardless of which sharding heuristic picked them up.
+        if isinstance(transform, (WeightShardingInfo, EPShardingInfo)) and _is_node_excluded(
+            transform.weight_name or transform.target_node, self.config
+        ):
+            ad_logger.info(
+                f"Skipping sharding for node {transform.target_node!r} "
+                f"due to exclude_shard_node_filter"
+            )
+            return False
 
         # Check if node already has a transform
         for existing_transform in transform_list:
@@ -1357,26 +1470,19 @@ class ShardingTransformContainer(BaseModel):
 ########################################################
 
 
-def _load_hook(
-    state_dict,
-    prefix,
-    *args,
-    f_split: Callable[[torch.Tensor, int], torch.Tensor],
-    param_key: str,
-    param_shape: torch.Size,
-):
-    # TODO: we need to support loading either a sharded or unsharded checkpoint.
-    # Otherwise, basic workflows like
-    # model.load_state_dict(model.state_dict()) will fail.
-    # This is quite a hacky solution. A better solution would be to store extra_state in
-    # the state_dict to identify whether the state_dict is sharded or not.
-    key = prefix + param_key
-    if key not in state_dict:
-        return
-    p_to_load = state_dict[key]
-    did_split = param_shape != p_to_load.shape
-    p_to_load = p_to_load if not did_split else f_split(p_to_load)
-    state_dict[key] = p_to_load
+def _is_node_excluded(node_name: str, config: "ShardingTransformConfig") -> bool:
+    """Return True if ``node_name`` matches any keyword in
+    ``ShardingTransformConfig.exclude_shard_node_filter``.
+
+    The filter is a comma-separated list of substrings; a node is excluded if its
+    name contains ANY of the listed substrings. Used to keep selected linears
+    replicated across TP ranks (no sharding/AllGather/AllReduce inserted).
+    """
+    pattern = getattr(config, "exclude_shard_node_filter", None)
+    if not pattern:
+        return False
+    keywords = [k.strip() for k in pattern.split(",") if k.strip()]
+    return any(kw in node_name for kw in keywords)
 
 
 def _load_hook_remove(
@@ -1388,77 +1494,6 @@ def _load_hook_remove(
     key = prefix + param_key
     ad_logger.debug(f"Sharder LOAD hook is called for '{key}'")
     state_dict.pop(key, None)
-
-
-def validate_allreduce_strategy(v):
-    """Convert string names like 'AUTO' to AllReduceStrategy enum.
-
-    This is a shared validator for allreduce_strategy fields across all config classes.
-
-    Args:
-        v: Value to validate - can be AllReduceStrategy enum, string name, or integer value
-
-    Returns:
-        AllReduceStrategy enum value
-
-    Raises:
-        ValueError: If the input is an invalid strategy string
-    """
-    if isinstance(v, AllReduceStrategy):
-        return v
-    if isinstance(v, str):
-        # Try to get enum by name
-        try:
-            return AllReduceStrategy[v]
-        except KeyError:
-            raise ValueError(
-                f"Invalid allreduce strategy: {v}. "
-                f"Valid options: {', '.join(s.name for s in AllReduceStrategy)}"
-            )
-    if isinstance(v, int):
-        return AllReduceStrategy(v)
-    return v  # Let Pydantic handle other types
-
-
-def _get_dist_ops(backend: str):
-    """Get the appropriate distributed ops based on backend availability.
-
-    Args:
-        backend: The distributed backend to use. Can be 'auto', 'trtllm', or 'torch'.
-                 'auto' will automatically select based on availability.
-
-    Returns tuple of (all_gather_op, all_reduce_op) for the current backend.
-    """
-    # Handle DistBackend enum or string
-    if hasattr(backend, "value"):
-        backend = backend.value
-
-    if backend == "trtllm":
-        # Force TRT-LLM ops
-        return (
-            torch.ops.auto_deploy.trtllm_dist_all_gather.default,
-            torch.ops.auto_deploy.trtllm_dist_all_reduce.default,
-        )
-    elif backend == "torch":
-        # Force PyTorch distributed ops
-        return (
-            torch.ops.auto_deploy.torch_dist_all_gather.default,
-            torch.ops.auto_deploy.torch_dist_all_reduce.default,
-        )
-    else:  # auto
-        # Automatically select based on availability
-        if is_trtllm_op_available():
-            # Use TRT-LLM optimized ops in MPI mode
-            return (
-                torch.ops.auto_deploy.trtllm_dist_all_gather.default,
-                torch.ops.auto_deploy.trtllm_dist_all_reduce.default,
-            )
-        else:
-            # Use PyTorch distributed ops in demollm mode
-            return (
-                torch.ops.auto_deploy.torch_dist_all_gather.default,
-                torch.ops.auto_deploy.torch_dist_all_reduce.default,
-            )
 
 
 def _validate_sharded_shapes(
@@ -1538,6 +1573,10 @@ TP_SHARDING_RULES = [
         lambda n: is_op(n, torch.ops.auto_deploy.trtllm_finegrained_fp8_linear),
         FineGrainedFP8WeightShardingInfo,
     ),
+    (
+        lambda n: is_op(n, torch.ops.auto_deploy.trtllm_fp8_deepgemm),
+        FineGrainedFP8WeightShardingInfo,
+    ),
 ]
 
 
@@ -1554,130 +1593,6 @@ def _resolve_tp_cls_from_node(node: Node):
 ########################################################
 #  Sharding transform functions
 ########################################################
-
-
-def _split_tensor_for_tp(
-    t: torch.Tensor,
-    dim: int,
-    rank: int,
-    world_size: int,
-    min_local_shape: int = 1,
-) -> torch.Tensor:
-    """Split a tensor for tensor-parallelism, respecting min_local_shape.
-
-    When world_size exceeds the maximum number of even splits (e.g. GQA with
-    num_kv_heads < world_size), multiple ranks share the same shard.
-
-    TODO: support num_units % world_size != 0 via GCD-based partial replication.
-    When num_heads doesn't divide by world_size (e.g. 28 Q heads at tp_size=8),
-    use effective_splits = gcd(num_heads, world_size) to split at head
-    boundaries and replicate each shard across world_size // effective_splits
-    ranks. To compensate the duplication in all_reduce, scale rowwise weights
-    by 1 / replication_factor during sharding (baked into the weight tensor,
-    no changes to all_reduce or the graph needed).
-    """
-    max_split_size = t.shape[dim] // min_local_shape
-    if world_size > max_split_size:
-        assert world_size % max_split_size == 0, (
-            f"world_size ({world_size}) must be divisible by max_split_size ({max_split_size}). "
-            f"GQA with num_kv_heads not dividing world_size is not supported."
-        )
-        num_groups = world_size // max_split_size
-        ad_logger.debug(
-            f"World size {world_size} is greater than the max split size {max_split_size}. "
-            f"Splitting tensor to {num_groups} chunks"
-        )
-        return torch.tensor_split(t, max_split_size, dim=dim)[rank // num_groups]
-
-    assert max_split_size % world_size == 0, (
-        f"Number of units ({max_split_size}, dim {dim} size {t.shape[dim]} / "
-        f"min_local_shape {min_local_shape}) must be divisible by world_size "
-        f"({world_size}). For attention heads, use a world_size that divides "
-        f"num_heads evenly (e.g. for {max_split_size} heads, try world_size in "
-        f"{[d for d in range(2, max_split_size + 1) if max_split_size % d == 0]})."
-    )
-    return torch.tensor_split(t, world_size, dim=dim)[rank]
-
-
-def shard_weight_tensor(
-    gm: GraphModule,
-    weight_tensor: torch.Tensor,
-    param_key: str,
-    dim: int,
-    rank: int,
-    world_size: int,
-    min_local_shape: int = 1,
-    fused_weight_dims: Optional[list] = None,
-    requires_grad: bool = False,
-    custom_shard_fn: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
-) -> Tuple[torch.Tensor, torch.Size]:
-    """Shard a weight tensor across ranks and register load hook.
-
-    Args:
-        gm: GraphModule containing the weight
-        weight_tensor: The weight tensor to shard
-        param_key: Parameter key for registering load hook
-        dim: Dimension to shard along
-        rank: Current rank
-        world_size: Total number of ranks
-        min_local_shape: Minimum local shape constraint (for GQA)
-        fused_weight_dims: List of dimensions for fused weights
-        custom_shard_fn: Optional custom function to shard the tensor
-        requires_grad: Whether the parameter should require gradients
-
-    Returns:
-        Tuple of (sharded_tensor, sharded_shape)
-    """
-
-    # Handle fused weights
-    if fused_weight_dims is not None:
-
-        def f_split(
-            t: torch.Tensor,
-            fused_dims: list = fused_weight_dims,
-            d: int = dim,
-        ) -> torch.Tensor:
-            return torch.cat(
-                [
-                    _split_tensor_for_tp(w, dim, rank, world_size, min_local_shape)
-                    for w in torch.split(t, fused_dims, dim=d)
-                ],
-                dim=d,
-            )
-
-    else:
-        f_split = partial(
-            _split_tensor_for_tp,
-            dim=dim,
-            rank=rank,
-            world_size=world_size,
-            min_local_shape=min_local_shape,
-        )
-
-    sharded_weight = f_split(weight_tensor)
-    sharded_shape = sharded_weight.shape
-
-    # Update the parameter in the module
-    modname, _, param_name = param_key.rpartition(".")
-    submod = gm.get_submodule(modname)
-
-    # Register load hook on the owning submodule (not the top-level gm).
-    # This ensures the hook runs *after* any parent-level hooks that transform
-    # the state_dict (e.g., unfusing fused MoE checkpoint weights into
-    # individual expert keys). With the hook on gm, it would run before
-    # unfusing and fail to find the individual expert keys.
-    submod._register_load_state_dict_pre_hook(
-        partial(
-            _load_hook,
-            f_split=f_split,
-            param_key=param_name,
-            param_shape=sharded_shape,
-        )
-    )
-    param_new = nn.Parameter(sharded_weight.detach().clone(), requires_grad=requires_grad)
-    setattr(submod, param_name, param_new)
-
-    return sharded_weight, sharded_shape
 
 
 def _shard_parameter_node(
@@ -1787,10 +1702,22 @@ def _shard_parameter_node(
     if not add_dist:
         return
 
-    # figure out the right dist op (backend-aware)
+    # figure out the right dist op (backend-aware) — strategies flow as op args
     all_gather_op, all_reduce_op = _get_dist_ops(config.dist_backend)
+    # Per-backend allgather op signatures:
+    #   trtllm_dist_all_gather(tensor, strategy, dim=0, sizes=None, workspace_id=0)
+    #   torch_dist_all_gather(tensor, dim=0, sizes=None)   # demollm only, no strategy
+    # `strategy` is required on the trtllm op (no default) so the caller cannot
+    # accidentally drop the AD-config-selected strategy. The torch op is a plain
+    # torch.distributed all_gather and intentionally has no strategy/symm_mem.
+    # Compare against the always-registered torch op so standalone mode never
+    # probes the optional TRT-LLM op merely to determine the call signature.
+    if all_gather_op is torch.ops.auto_deploy.torch_dist_all_gather.default:
+        allgather_args = (-1,)
+    else:
+        allgather_args = (config.allgather_strategy.name, -1, None)
     dist_lookup = {
-        0: (all_gather_op, -1),
+        0: (all_gather_op, *allgather_args),
         1: (all_reduce_op, allreduce_strategy),
     }
     fn_dist, *dist_args = dist_lookup[dim]
@@ -1909,14 +1836,13 @@ def _tp_shard_moe_scale(
 
     # Register load hook on the owning submodule so it runs after any
     # parent-level checkpoint format conversion hooks (e.g., fused MoE unfusing).
-    submod._register_load_state_dict_pre_hook(
-        partial(
-            _load_hook,
-            f_split=f_split,
-            param_key=attr_name,
-            param_shape=sharded_scale.shape,
-        )
+    hook = partial(
+        _load_hook,
+        f_split=f_split,
+        param_key=attr_name,
+        param_shape=sharded_scale.shape,
     )
+    submod._register_load_state_dict_pre_hook(hook)
 
 
 def _insert_sharded_moe(
@@ -2096,7 +2022,11 @@ def _insert_sharded_moe(
     # set_op_args uses the op schema to place values into kwargs or the correct
     # positional slot, avoiding manual index arithmetic.
     node.args = tuple(args)
-    set_op_args(node, mapping_config=mapping_config, max_num_tokens=config.max_num_tokens)
+    set_op_args(
+        node,
+        mapping_config=mapping_config,
+        max_num_tokens=config.max_num_tokens,
+    )
 
     if not enable_alltoall:
         # =====================================================================================
@@ -2689,13 +2619,19 @@ def _process_mla_sharding(
     # extract o_proj node
     o_proj = layer_subgraph.terminating_node
 
-    # add the sharding strategies for the q_a_proj and kv_a_proj nodes
-    num_simple_shards = _process_simple_shard(
-        [q_a_proj, kv_a_proj], transform_container, layer_type=LayerType.MLA
-    )
-    if num_simple_shards < 2:
-        # it means that "someone else" already sharded these nodes. Skipping.
-        return 0
+    # Simple-shard the q_a_proj/kv_a_proj opening linears (replicated output).
+    # Nodes excluded via exclude_shard_node_filter stay replicated. add() dedups
+    # nodes an earlier sharding source already touched, so we always continue to
+    # q_b/kv_b/o_proj instead of aborting the layer. The filter matches the WEIGHT
+    # name (e.g. "q_a_proj"), not the FX linear-node name, so resolve it.
+    def _excl_name(n):
+        w = extract_weight_name(n)
+        return w if isinstance(w, str) else n.name
+
+    a_proj_candidates = [q_a_proj, kv_a_proj]
+    a_proj_to_shard = [n for n in a_proj_candidates if not _is_node_excluded(_excl_name(n), config)]
+    if a_proj_to_shard:
+        _process_simple_shard(a_proj_to_shard, transform_container, layer_type=LayerType.MLA)
 
     # extract the sub-subgraph from q_b_proj and kv_b_proj to o_proj
     sub_subgraph = subgraph(
@@ -2774,7 +2710,7 @@ def _process_mla_sharding(
 
 def _determine_fused_weight_dims(
     linear_nodes: List[Node],
-) -> None:
+) -> Optional[list]:
     """
     Determine the fused weight dims for the given linear nodes and subgraph nodes.
     """
@@ -2818,6 +2754,8 @@ def _determine_fused_weight_dims(
             num_chunks = linear_chunk_users[0].args[1]
             weight_dim = linear_node.meta["val"].shape[2]
             fused_weight_dims = [weight_dim // num_chunks] * num_chunks
+
+    return fused_weight_dims
 
 
 def _find_upstream_qk_proj(node: Node, gm: GraphModule) -> Optional[str]:

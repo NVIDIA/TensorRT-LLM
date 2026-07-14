@@ -132,22 +132,18 @@ Functions
 
     filter_source_cuda_architectures(
       SOURCE_LIST <variable>
-      TARGET <target>
       ARCHS <arch1> [<arch2> ...]
       [IMPLICIT_FAMILY]
     )
 
   Removes source files targeting disabled CUDA architectures from the
   source list. Files are matched by patterns like ``sm80``, ``sm_80``,
-  ``SM80``, etc. in their filenames (for ``.cu`` and ``cubin.cpp`` files).
+  ``SM80``, etc. in their filenames (for ``.cu``, ``.cubin.cpp``, and
+  ``.cubin.tar.zst`` files).
 
   ``SOURCE_LIST <variable>``
     Name of the variable containing the list of source files.
     Modified in place to remove filtered files.
-
-  ``TARGET <target>``
-    Target to add compile definitions to. If the target does not exist,
-    an INTERFACE library will be created.
 
   ``ARCHS <arch1> [<arch2> ...]``
     List of architectures to check. May include ``f`` suffix.
@@ -155,11 +151,6 @@ Functions
   ``IMPLICIT_FAMILY``
     When set, treats architectures >= ``CMAKE_CUDA_MIN_ARCHITECTURE_HAS_FAMILY``
     as implicitly family-enabled.
-
-  **Defined Macros:**
-
-  For each filtered architecture, a compile definition ``EXCLUDE_SM_<ARCH>``
-  (or ``EXCLUDE_SM_<ARCH>F`` for family architectures) is added to ``<target>``.
 
 Example
 ^^^^^^^
@@ -202,11 +193,8 @@ Example
   )
   filter_source_cuda_architectures(
     SOURCE_LIST KERNEL_SOURCES
-    TARGET my_kernel_interface
     ARCHS 80 90 100
   )
-  # ``my_kernel_interface`` target is created with definitions to exclude
-  # disabled architectures.
 
 #]=======================================================================]
 
@@ -371,20 +359,19 @@ function(setup_cuda_architectures)
   # -f suffix supported from Blackwell (100) starting from CUDA 12.9.
   if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL "12.9")
     set(CMAKE_CUDA_MIN_ARCHITECTURE_HAS_FAMILY 100)
-    set(CMAKE_CUDA_ARCHITECTURES_HAS_FAMILIES
-        ON
-        PARENT_SCOPE)
+    set(CMAKE_CUDA_ARCHITECTURES_HAS_FAMILIES ON)
   else()
     # -a provides no cross architecture compatibility, but luckily until CUDA
     # 12.8 We have only one architecture within each family >= 9.
     set(CMAKE_CUDA_MIN_ARCHITECTURE_HAS_FAMILY 9999) # Effectively exclude all
                                                      # architectures
-    set(CMAKE_CUDA_ARCHITECTURES_HAS_FAMILIES
-        OFF
-        PARENT_SCOPE)
+    set(CMAKE_CUDA_ARCHITECTURES_HAS_FAMILIES OFF)
   endif()
   set(CMAKE_CUDA_MIN_ARCHITECTURE_HAS_FAMILY
       ${CMAKE_CUDA_MIN_ARCHITECTURE_HAS_FAMILY}
+      PARENT_SCOPE)
+  set(CMAKE_CUDA_ARCHITECTURES_HAS_FAMILIES
+      ${CMAKE_CUDA_ARCHITECTURES_HAS_FAMILIES}
       PARENT_SCOPE)
 
   # Compatibility low bounds: Always compile kernels for these architectures. 86
@@ -446,8 +433,7 @@ function(setup_cuda_architectures)
       103
       120)
   foreach(CUDA_ARCH IN LISTS ARCHITECTURES_WITH_KERNELS)
-    if(NOT ${CUDA_ARCH} IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG
-       AND NOT ${CUDA_ARCH} IN_LIST CMAKE_CUDA_ARCHITECTURES_NORMALIZED_LIST)
+    if(NOT ${CUDA_ARCH} IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG)
       add_definitions("-DEXCLUDE_SM_${CUDA_ARCH}")
       message(STATUS "Excluding SM ${CUDA_ARCH}")
     endif()
@@ -465,6 +451,25 @@ function(setup_cuda_architectures)
       list(APPEND CMAKE_CUDA_ARCHITECTURES_NORMALIZED "${CUDA_ARCH}a-real")
     else()
       list(APPEND CMAKE_CUDA_ARCHITECTURES_NORMALIZED "${CUDA_ARCH}-real")
+    endif()
+  endforeach()
+
+  set(ARCHITECTURE_FAMILIES_WITH_KERNELS 100 120)
+  foreach(FAMILY_ARCH IN LISTS ARCHITECTURE_FAMILIES_WITH_KERNELS)
+    set(FAMILY_ARCH_ENABLED FALSE)
+    if(CMAKE_CUDA_ARCHITECTURES_HAS_FAMILIES)
+      if("${FAMILY_ARCH}f" IN_LIST CMAKE_CUDA_ARCHITECTURES_FAMILIES)
+        set(FAMILY_ARCH_ENABLED TRUE)
+      endif()
+    elseif(${FAMILY_ARCH} IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG)
+      # CUDA 12.8 cannot compile -f targets, but 100 and 120 are the only
+      # supported architectures in those families.
+      set(FAMILY_ARCH_ENABLED TRUE)
+    endif()
+
+    if(NOT FAMILY_ARCH_ENABLED)
+      add_definitions("-DEXCLUDE_SM_${FAMILY_ARCH}F")
+      message(STATUS "Excluding SM ${FAMILY_ARCH}F")
     endif()
   endforeach()
 
@@ -565,47 +570,32 @@ For each ARCH passed in:
     but not "sm${ARCH}f" (case insensitive) will be excluded
     Macro "EXCLUDE_SM_${ARCH}" will be defined on TARGET
   - if ARCH is suffixed by f, NARCH is ARCH without f suffix:
-    if ARCH is not in CMAKE_CUDA_ARCHITECTURES_FAMILIES, source files containing
-    "sm${NARCH}f" (case insensitive) will be excluded
-    Macro "EXCLUDE_SM_${NARCH}F" will be defined on TARGET
+    if ARCH is not enabled as a family architecture or, for CUDA versions without
+    family target support, NARCH is not enabled as a numeric architecture, source
+    files containing "sm${NARCH}f" (case insensitive) will be excluded
 
 - if IMPLICIT_FAMILY is set:
   ARCH shall not suffixed by f.
   - if ARCH >= CMAKE_CUDA_MIN_ARCHITECTURE_HAS_FAMILY:
     if "${ARCH}f" is not in CMAKE_CUDA_ARCHITECTURES_FAMILIES,
     source files containing "sm${ARCH}" but not "sm${ARCH}a" (case insensitive) will be excluded
-    Macro "EXCLUDE_SM_${ARCH}" (no F) will be defined on TARGET
   - else:
     if "${ARCH}" is not in CMAKE_CUDA_ARCHITECTURES_ORIG,
     source files containing "sm${ARCH}" (case insensitive) will be excluded
-    Macro "EXCLUDE_SM_${ARCH}" will be defined on TARGET
 #]]
 function(filter_source_cuda_architectures)
   set(options IMPLICIT_FAMILY)
-  set(oneValueArgs SOURCE_LIST TARGET)
+  set(oneValueArgs SOURCE_LIST)
   set(multiValueArgs ARCHS)
 
   cmake_parse_arguments(PARSE_ARGV 0 arg "${options}" "${oneValueArgs}"
                         "${multiValueArgs}")
   set(SOURCES "${${arg_SOURCE_LIST}}")
 
-  if(NOT TARGET ${arg_TARGET})
-    add_library(${arg_TARGET} INTERFACE)
-  endif()
-
-  # Determine if target is INTERFACE library to use correct visibility
-  get_target_property(_target_type ${arg_TARGET} TYPE)
-  if(_target_type STREQUAL "INTERFACE_LIBRARY")
-    set(_compile_def_visibility INTERFACE)
-  else()
-    set(_compile_def_visibility PUBLIC)
-  endif()
-
   foreach(ARCH IN LISTS arg_ARCHS)
     set(SHOULD_FILTER FALSE)
     set(MATCH_PATTERN "")
     set(EXCLUDE_PATTERN "")
-    set(ARCH_FOR_DEFINE "")
 
     if(NOT arg_IMPLICIT_FAMILY)
       # Check if ARCH ends with 'f'
@@ -614,21 +604,31 @@ function(filter_source_cuda_architectures)
       if(_has_f_suffix)
         # ARCH is suffixed by 'f' (e.g., "100f")
         set(BASE_ARCH "${CMAKE_MATCH_1}")
-        if(NOT "${ARCH}" IN_LIST CMAKE_CUDA_ARCHITECTURES_FAMILIES)
+        set(FAMILY_ARCH_ENABLED FALSE)
+        if(CMAKE_CUDA_ARCHITECTURES_HAS_FAMILIES)
+          if("${ARCH}" IN_LIST CMAKE_CUDA_ARCHITECTURES_FAMILIES)
+            set(FAMILY_ARCH_ENABLED TRUE)
+          endif()
+        elseif("${BASE_ARCH}" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG)
+          set(FAMILY_ARCH_ENABLED TRUE)
+        endif()
+
+        if(NOT FAMILY_ARCH_ENABLED)
           set(SHOULD_FILTER TRUE)
-          set(ARCH_FOR_DEFINE "${BASE_ARCH}F")
           # Match "sm${BASE_ARCH}f" - straightforward match, no exclusion
           # pattern needed
-          set(MATCH_PATTERN ".*[Ss][Mm]_?${BASE_ARCH}f.*(cubin\.cpp|\.cu)$")
+          set(MATCH_PATTERN
+              ".*[Ss][Mm]_?${BASE_ARCH}f.*(cubin\.cpp|\.cu|cubin\.tar\.zst)$")
         endif()
       else()
         # ARCH is NOT suffixed by 'f' (e.g., "80")
         if(NOT "${ARCH}" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG)
           set(SHOULD_FILTER TRUE)
-          set(ARCH_FOR_DEFINE "${ARCH}")
           # Match "sm${ARCH}" but NOT "sm${ARCH}f"
-          set(MATCH_PATTERN ".*[Ss][Mm]_?${ARCH}.*(cubin\.cpp|\.cu)$")
-          set(EXCLUDE_PATTERN ".*[Ss][Mm]_?${ARCH}f.*(cubin\.cpp|\.cu)$")
+          set(MATCH_PATTERN
+              ".*[Ss][Mm]_?${ARCH}.*(cubin\.cpp|\.cu|cubin\.tar\.zst)$")
+          set(EXCLUDE_PATTERN
+              ".*[Ss][Mm]_?${ARCH}f.*(cubin\.cpp|\.cu|cubin\.tar\.zst)$")
         endif()
       endif()
     else()
@@ -637,18 +637,19 @@ function(filter_source_cuda_architectures)
         # ARCH >= CMAKE_CUDA_MIN_ARCHITECTURE_HAS_FAMILY
         if(NOT "${ARCH}f" IN_LIST CMAKE_CUDA_ARCHITECTURES_FAMILIES)
           set(SHOULD_FILTER TRUE)
-          set(ARCH_FOR_DEFINE "${ARCH}")
           # Match "sm${ARCH}" but NOT "sm${ARCH}a"
-          set(MATCH_PATTERN ".*[Ss][Mm]_?${ARCH}.*(cubin\.cpp|\.cu)$")
-          set(EXCLUDE_PATTERN ".*[Ss][Mm]_?${ARCH}a.*(cubin\.cpp|\.cu)$")
+          set(MATCH_PATTERN
+              ".*[Ss][Mm]_?${ARCH}.*(cubin\.cpp|\.cu|cubin\.tar\.zst)$")
+          set(EXCLUDE_PATTERN
+              ".*[Ss][Mm]_?${ARCH}a.*(cubin\.cpp|\.cu|cubin\.tar\.zst)$")
         endif()
       else()
         # ARCH < CMAKE_CUDA_MIN_ARCHITECTURE_HAS_FAMILY
         if(NOT "${ARCH}" IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG)
           set(SHOULD_FILTER TRUE)
-          set(ARCH_FOR_DEFINE "${ARCH}")
           # Match "sm${ARCH}" - no exclusion pattern needed
-          set(MATCH_PATTERN ".*[Ss][Mm]_?${ARCH}.*(cubin\.cpp|\.cu)$")
+          set(MATCH_PATTERN
+              ".*[Ss][Mm]_?${ARCH}.*(cubin\.cpp|\.cu|cubin\.tar\.zst)$")
         endif()
       endif()
     endif()
@@ -683,12 +684,6 @@ function(filter_source_cuda_architectures)
       if(SOURCES_FILTERED)
         list(REMOVE_ITEM SOURCES ${SOURCES_FILTERED})
       endif()
-
-      # Add compile definition to target
-      target_compile_definitions(
-        ${arg_TARGET}
-        ${_compile_def_visibility}
-        "EXCLUDE_SM_${ARCH_FOR_DEFINE}")
     endif()
   endforeach()
 

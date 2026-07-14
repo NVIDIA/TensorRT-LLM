@@ -3,6 +3,8 @@
 Tests for:
 - RankState serialization/deserialization
 - ADPRouter interface and DefaultADPRouter
+- Piggybacking per-rank iter-stats payloads on the existing ADP allgather
+- Strict/relaxed attention-DP request routing while respecting rank capacity
 """
 
 from unittest.mock import MagicMock, Mock
@@ -14,10 +16,26 @@ from tensorrt_llm._torch.pyexecutor.request_utils import get_from_waiting_queue
 from tensorrt_llm._torch.pyexecutor.scheduler import FCFSWaitingQueue
 from tensorrt_llm._torch.pyexecutor.scheduler.adp_router import (
     ADPRouter,
+    ConversationAwareADPRouter,
     DefaultADPRouter,
     KVCacheAwareADPRouter,
+    RankIterStatsPayload,
     RankState,
+    _num_input_tokens,
 )
+from tensorrt_llm.conversation_params import ConversationParams
+from tensorrt_llm.scheduling_params import SchedulingParams
+
+
+class _MockRequest(MagicMock):
+    """Mock executor Request whose ``num_input_tokens`` mirrors the real binding
+    (it equals ``len(input_token_ids)``) instead of an auto-generated child mock,
+    so the routers' cheap token-count reads work without setting it per call site.
+    """
+
+    @property
+    def num_input_tokens(self):
+        return len(self.input_token_ids)
 
 
 def _mock_dist(tp_rank=0, tp_size=1, has_cp_helix=False):
@@ -30,7 +48,7 @@ def _mock_dist(tp_rank=0, tp_size=1, has_cp_helix=False):
 
 
 def create_mock_request_with_py_schedule_params(attention_dp_rank=None, attention_dp_relax=False):
-    mock_request = Mock()
+    mock_request = _MockRequest()
     if attention_dp_rank is not None:
         mock_schedule_params = Mock()
         mock_schedule_params.attention_dp_rank = attention_dp_rank
@@ -42,6 +60,7 @@ def create_mock_request_with_py_schedule_params(attention_dp_rank=None, attentio
         mock_request.py_scheduling_params = mock_schedule_params
     else:
         mock_request.py_scheduling_params = None
+    mock_request.py_conversation_params = None
     mock_request.input_token_ids = [1, 2, 3]
     return mock_request
 
@@ -54,8 +73,9 @@ def _make_request_item(req_id, num_tokens=10, target_dp_rank=None, attention_dp_
     scheduling_params = MagicMock()
     scheduling_params.attention_dp_rank = target_dp_rank
     scheduling_params.attention_dp_relax = attention_dp_relax
-    item.request = MagicMock()
+    item.request = _MockRequest()
     item.request.py_scheduling_params = scheduling_params
+    item.request.py_conversation_params = None
     item.request.input_token_ids = list(range(num_tokens))
     return item
 
@@ -109,6 +129,8 @@ def all_ranks_num_active_tokens():
 
 
 class TestRankState:
+    # RankState is the wire payload shared across attention-DP ranks. Keep its
+    # serialization stable because iter-stats now ride on the same allgather.
     def test_creation(self):
         state = RankState(rank=0, num_active_requests=5, num_active_tokens=100)
         assert state.rank == 0
@@ -117,7 +139,7 @@ class TestRankState:
 
     def test_serialize(self):
         state = RankState(rank=0, num_active_requests=5, num_active_tokens=100)
-        assert state.serialize() == [0, 5, 100]
+        assert state.serialize() == [0, 5, 100, 0, -1, 0, 0, 0, 0, 0, 0, 0]
 
     def test_deserialize(self):
         state = RankState.deserialize(data=[2, 3, 50])
@@ -134,9 +156,22 @@ class TestRankState:
         state = RankState(rank=0)
         assert state.num_active_requests == 0
         assert state.num_active_tokens == 0
+        assert state.iter_stats.has_iter_stats == 0
+        assert state.iter_stats.iter_stats_iter == -1
+
+    def test_copy_iter_stats_from_clones_payload(self):
+        state = RankState(rank=0)
+        payload = RankIterStatsPayload(has_iter_stats=1, iter_stats_iter=7)
+
+        state.copy_iter_stats_from(payload)
+
+        assert state.iter_stats == payload
+        assert state.iter_stats is not payload
 
 
 class TestDefaultADPRouter:
+    # Router tests model strict placement, relaxed placement, and capacity
+    # handling so ADP ranks report consistent load and iter-stats state.
     def test_interface_compliance(self):
         router = DefaultADPRouter(dist=_mock_dist())
         assert isinstance(router, ADPRouter)
@@ -184,6 +219,23 @@ class TestDefaultADPRouter:
         result, _ = router.route_requests(states, [req], max_num_active_requests=2)
         assert len(result[0]) == 1
         assert len(result[1]) == 0
+
+    def test_default_attention_dp_relax_is_relaxed(self):
+        router = DefaultADPRouter(dist=_mock_dist())
+        states = [
+            RankState(rank=0, num_active_requests=0, num_active_tokens=0),
+            RankState(rank=1, num_active_requests=0, num_active_tokens=0),
+        ]
+        req_relax = _make_request_item(1, target_dp_rank=0)
+        req_relax.request.py_scheduling_params = SchedulingParams(attention_dp_rank=0)
+        req_strict = _make_request_item(2, target_dp_rank=0, attention_dp_relax=False)
+
+        result, _ = router.route_requests(
+            states, [req_relax, req_strict], max_num_active_requests=1
+        )
+
+        assert result[0] == [req_strict]
+        assert req_relax in result[1]
 
     def test_favors_less_loaded_rank(self):
         router = DefaultADPRouter(dist=_mock_dist())
@@ -243,7 +295,39 @@ class TestDefaultADPRouter:
         assert len(states) == 2
         assert states[0] == RankState(rank=0, num_active_requests=1, num_active_tokens=10)
         assert states[1] == RankState(rank=1, num_active_requests=2, num_active_tokens=20)
-        dist.tp_allgather.assert_called_once_with([0, 1, 10])
+        dist.tp_allgather.assert_called_once_with(
+            RankState(rank=0, num_active_requests=1, num_active_tokens=10).serialize()
+        )
+
+    def test_gather_all_rank_states_piggybacks_iter_stats(self):
+        dist = _mock_dist(tp_rank=0, tp_size=2, has_cp_helix=False)
+        pending = RankIterStatsPayload(
+            has_iter_stats=1,
+            iter_stats_iter=7,
+            num_context_requests=2,
+            num_ctx_tokens=128,
+            num_ctx_kv_tokens=16,
+            num_gen_requests=3,
+            num_gen_kv_tokens=1024,
+            num_paused_requests=1,
+            num_paused_kv_tokens=256,
+        )
+        expected_local = RankState(
+            rank=0,
+            num_active_requests=1,
+            num_active_tokens=10,
+            iter_stats=pending,
+        )
+        rank1 = RankState(rank=1, num_active_requests=2, num_active_tokens=20)
+        dist.tp_allgather.return_value = [expected_local.serialize(), rank1.serialize()]
+
+        router = DefaultADPRouter(dist=dist)
+        req = Mock(py_orig_prompt_len=10)
+        states = router.gather_all_rank_states([req], iter_stats_payload=pending)
+
+        assert states[0] == expected_local
+        assert states[1] == rank1
+        dist.tp_allgather.assert_called_once_with(expected_local.serialize())
 
 
 def test_schedule_attention_dp_requests_scheduled_requests(
@@ -393,6 +477,53 @@ def test_schedule_attention_dp_requests_empty_lists(
     )
     result = all_ranks_new_requests[0]
     assert len(result) == 0
+
+
+def test_schedule_attention_dp_requests_serve_default_relax_None_does_not_crash(
+    attention_dp_config, all_ranks_num_active_requests, all_ranks_num_active_tokens
+):
+    """Regression: trtllm-serve produces SchedulingParams with attention_dp_relax=None.
+
+    openai_server.py builds ``SchedulingParams(agent_hierarchy=...)`` on every
+    chat request, leaving ``attention_dp_rank`` and ``attention_dp_relax`` at
+    their dataclass default of None. With >=2 such requests in one scheduling
+    iteration, ``sorted(new_requests, key=get_relax_value)`` previously raised
+    ``TypeError: '<' not supported between instances of 'NoneType' and
+    'NoneType'`` because the key returned None for every item.
+
+    Why prior coverage missed it:
+      * Every ADP CI E2E test calls ``LLM(...).generate`` where
+        ``request.scheduling_params`` is None, so ``base_worker`` leaves
+        ``py_scheduling_params=None`` and ``get_relax_value`` short-circuits
+        on the ``if scheduling_params is None`` branch.
+      * The mock factory in this file defaults ``attention_dp_relax=False``,
+        not None, so existing unit tests never construct the buggy shape.
+
+    Use the real ``SchedulingParams`` dataclass so the test tracks the actual
+    production default — if it ever flips back to None this stays accurate.
+    """
+    from tensorrt_llm.scheduling_params import SchedulingParams
+
+    def _make_serve_shaped_request(req_id):
+        mock_request = Mock()
+        mock_request.py_scheduling_params = SchedulingParams()
+        mock_request.input_token_ids = [1, 2, 3]
+        return RequestQueueItem(req_id, mock_request)
+
+    new_requests = [_make_serve_shaped_request(i) for i in range(4)]
+
+    # No raise = sort key is None-safe. All four items have
+    # attention_dp_rank=None so they fall into remaining_unscheduled and
+    # then balance across ranks; with capacity 8 per rank they all land.
+    all_ranks_new_requests, _ = _assign(
+        all_ranks_num_active_requests,
+        all_ranks_num_active_tokens,
+        new_requests,
+        attention_dp_config["max_num_active_requests"],
+    )
+
+    total_assigned = sum(len(reqs) for reqs in all_ranks_new_requests.values())
+    assert total_assigned == 4
 
 
 def test_schedule_attention_dp_requests_expected_num_active_calculation(
@@ -876,6 +1007,19 @@ class TestKVCacheAwareADPRouterRouting:
         assert result[0] == []
         assert result[1] == [req]
 
+    def test_default_attention_dp_relax_is_relaxed(self):
+        router = self._make_router(tp_size=2)
+        req_relax = _make_request_item(1, target_dp_rank=0)
+        req_relax.request.py_scheduling_params = SchedulingParams(attention_dp_rank=0)
+        req_strict = _make_request_item(2, target_dp_rank=0, attention_dp_relax=False)
+
+        result, _ = router.route_requests(
+            self._rank_states(2), [req_relax, req_strict], max_num_active_requests=1
+        )
+
+        assert result[0] == [req_strict]
+        assert req_relax in result[1]
+
     def test_match_rate_threshold_gates_cache_affinity(self):
         """With rank 0 loaded but holding cache, and rank 1 idle with no
         cache:
@@ -957,3 +1101,195 @@ class TestKVCacheAwareADPRouterRouting:
         )
         assert len(result_strict[0]) == 2
         assert sum(len(result_strict[r]) for r in range(1, tp_size)) == 6
+
+
+def _make_conv_request_item(
+    req_id,
+    conversation_id,
+    target_dp_rank=None,
+    attention_dp_relax=True,
+    num_tokens=10,
+):
+    """Mock RequestQueueItem carrying conversation params."""
+    item = MagicMock()
+    item.id = req_id
+    item.child_req_ids = None
+    scheduling_params = MagicMock()
+    scheduling_params.attention_dp_rank = target_dp_rank
+    scheduling_params.attention_dp_relax = attention_dp_relax
+    item.request = _MockRequest()
+    item.request.py_scheduling_params = scheduling_params
+    item.request.py_conversation_params = None
+    if conversation_id is not None:
+        item.request.py_conversation_params = ConversationParams(conversation_id=conversation_id)
+    item.request.input_token_ids = list(range(num_tokens))
+    item.request.py_orig_prompt_len = num_tokens
+    item.request.py_disaggregated_params = None
+    return item
+
+
+class TestConversationAwareADPRouter:
+    """Routing behavior of ConversationAwareADPRouter (explicit conv->rank)."""
+
+    @staticmethod
+    def _router(tp_size=4, max_sessions=1 << 16):
+        return ConversationAwareADPRouter(
+            dist=_mock_dist(tp_size=tp_size), max_sessions=max_sessions
+        )
+
+    @staticmethod
+    def _states(tp_size, active=None):
+        active = active or [0] * tp_size
+        return [
+            RankState(rank=r, num_active_requests=active[r], num_active_tokens=active[r] * 10)
+            for r in range(tp_size)
+        ]
+
+    @staticmethod
+    def _route(router, states, items, cap=1000):
+        assign, _ = router.route_requests(states, items, max_num_active_requests=cap)
+        pos = {}
+        for rank, lst in assign.items():
+            for it in lst:
+                pos[it.id] = rank
+        return pos
+
+    def test_interface_compliance(self):
+        assert isinstance(self._router(), ADPRouter)
+
+    def test_first_turn_round_robin(self):
+        """First request of each conversation spreads one-per-rank (RR)."""
+        router = self._router(tp_size=4)
+        items = [_make_conv_request_item(i, f"conv{i}") for i in range(4)]
+        pos = self._route(router, self._states(4), items)
+        assert sorted(pos.values()) == [0, 1, 2, 3]
+
+    def test_subsequent_turns_are_sticky(self):
+        """Later turns of a conversation return to its first-turn rank."""
+        router = self._router(tp_size=4)
+        convs = ["A", "B", "C", "D"]
+        first = [_make_conv_request_item(i, convs[i]) for i in range(4)]
+        pos1 = self._route(router, self._states(4), first)
+        home = {convs[i]: pos1[i] for i in range(4)}
+        # A new batch of second turns (fresh ids) for the same conversations.
+        second = [_make_conv_request_item(100 + i, convs[i]) for i in range(4)]
+        pos2 = self._route(router, self._states(4), second)
+        for i in range(4):
+            assert pos2[100 + i] == home[convs[i]]
+
+    def test_no_conversation_id_falls_back_and_is_not_recorded(self):
+        router = self._router(tp_size=4)
+        items = [_make_conv_request_item(i, None) for i in range(8)]
+        pos = self._route(router, self._states(4), items)
+        assert len(pos) == 8
+        # Nothing recorded for conversation-less requests.
+        assert dict(router._conv_to_rank) == {}
+        # Round-robin spread keeps ranks within one of each other.
+        counts = [sum(1 for v in pos.values() if v == r) for r in range(4)]
+        assert max(counts) - min(counts) <= 1
+
+    def test_routing_is_deterministic_across_ranks(self):
+        """Two independent instances (= two TP ranks) must agree exactly, or
+        the no-broadcast allgather protocol would deadlock."""
+        convs = ["A", "B", "C", None, "A", "B", "E", None, "C"]
+
+        def run():
+            router = self._router(tp_size=4)
+            items = [_make_conv_request_item(i, convs[i]) for i in range(len(convs))]
+            return self._route(router, self._states(4), items)
+
+        assert run() == run()
+
+    def test_lru_eviction_bounds_map(self):
+        router = self._router(tp_size=2, max_sessions=2)
+        items = [_make_conv_request_item(i, f"c{i}") for i in range(5)]
+        self._route(router, self._states(2), items)
+        assert len(router._conv_to_rank) == 2
+        assert set(router._conv_to_rank) == {"c3", "c4"}
+
+    def test_explicit_target_dp_rank_respected(self):
+        router = self._router(tp_size=4)
+        item = _make_conv_request_item(1, "A", target_dp_rank=2, attention_dp_relax=False)
+        pos = self._route(router, self._states(4), [item])
+        assert pos[1] == 2
+
+    def test_sticky_overflow_keeps_mapping(self):
+        """When the home rank is saturated at the HARD cap (max_num_active_requests),
+        the turn overflows off home but the conversation stays mapped home (so it
+        returns home next batch once that rank has capacity). Stickiness uses the
+        hard cap -- not the soft fair-share -- so a conversation's KV prefix stays
+        resident on one rank in the common case."""
+        router = ConversationAwareADPRouter(dist=_mock_dist(tp_size=2))
+        # Seed conv A -> rank 0.
+        self._route(router, self._states(2), [_make_conv_request_item(1, "A")])
+        home = router._conv_to_rank["A"]
+        # Fill the home rank to the hard cap, route A again -> must overflow off home...
+        states = self._states(2)
+        states[home] = RankState(rank=home, num_active_requests=5, num_active_tokens=50)
+        pos = self._route(router, states, [_make_conv_request_item(2, "A")], cap=5)
+        assert pos[2] != home
+        # ...but the mapping is unchanged so it can return home later.
+        assert router._conv_to_rank["A"] == home
+
+    def test_create_rank_state(self):
+        router = ConversationAwareADPRouter(dist=_mock_dist(tp_rank=2))
+        req1 = Mock(py_orig_prompt_len=100)
+        req2 = Mock(py_orig_prompt_len=50)
+        state = router.create_rank_state(active_requests=[req1, req2], new_requests=[])
+        assert state.rank == 2
+        assert state.num_active_requests == 2
+        assert state.num_active_tokens == 150
+
+    def test_factory_selects_conversation_router(self):
+        cfg = MagicMock()
+        cfg.kv_cache_routing_conversation_affinity = True
+        cfg.kv_cache_routing_max_sessions = 8
+        router = ADPRouter.create(dist=_mock_dist(), kv_cache_manager=None, attention_dp_config=cfg)
+        assert isinstance(router, ConversationAwareADPRouter)
+        assert router._max_sessions == 8
+
+    def test_factory_default_when_disabled(self):
+        cfg = MagicMock()
+        cfg.kv_cache_routing_conversation_affinity = False
+        cfg.enable_kv_cache_aware_routing = False
+        router = ADPRouter.create(dist=_mock_dist(), kv_cache_manager=None, attention_dp_config=cfg)
+        assert isinstance(router, DefaultADPRouter)
+
+    def test_returned_expected_covers_every_rank(self):
+        """Regression: returned expected_num_active_requests must be >= every
+        rank's post-assignment active count, else
+        py_executor._pad_attention_dp_dummy_request asserts and the executor
+        hangs. A sticky storm (one conversation hammered) must not push its home
+        rank past expected."""
+        router = self._router(tp_size=8)
+        states = self._states(8)
+        # 40 requests for the SAME conversation: hard-cap stickiness concentrates
+        # all of them on the home rank, pushing it well past the pre-loop soft
+        # `expected`. The post-loop re-bump must lift `expected` to cover the home
+        # rank's actual count, else _pad_attention_dp_dummy_request asserts.
+        items = [_make_conv_request_item(i, "A") for i in range(40)]
+        assign, expected = router.route_requests(states, items, max_num_active_requests=256)
+        final = [states[r].num_active_requests + len(assign[r]) for r in range(8)]
+        assert all(expected >= f for f in final), (expected, final)
+        assert sum(len(v) for v in assign.values()) == 40  # nothing dropped
+
+
+class TestNumInputTokens:
+    """The cheap token-count accessor used by the routers (avoids copying the
+    full input_token_ids list just to count it)."""
+
+    def test_none_request(self):
+        assert _num_input_tokens(None) == 0
+
+    def test_prefers_num_input_tokens_without_touching_token_list(self):
+        """When num_input_tokens is available it must be used, and the heavy
+        input_token_ids getter must NOT be accessed."""
+
+        class _Req:
+            num_input_tokens = 1234
+
+            @property
+            def input_token_ids(self):  # materializing it would be a regression
+                raise AssertionError("input_token_ids must not be materialized")
+
+        assert _num_input_tokens(_Req()) == 1234

@@ -1,0 +1,22 @@
+version: 0.0.1
+l0_b200_multi_nodes_perf_sanity_node2_gpu16:
+- condition:
+    ranges:
+      # 2 nodes with each node has 8 GPUs
+      system_gpu_count:
+        gte: 16
+        lte: 16
+    wildcards:
+      gpu:
+      - '*b200*'
+      linux_distribution_name: ubuntu*
+      cpu: x86_64
+    terms:
+      stage: post_merge
+      backend: pytorch
+      orchestrator: mpi
+  tests:
+  # deepseek-r1-fp4-v2 aggregated 2-nodes
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-deepseek_r1_fp4_v2_2_nodes_blackwell-r1_fp4_v2_dep16_mtp1_1k1k] TIMEOUT (90)
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-deepseek_r1_fp4_v2_2_nodes_blackwell-r1_fp4_v2_dep16_mtp1_8k1k] TIMEOUT (90)
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-deepseek_r1_fp4_v2_2_nodes_blackwell-r1_fp4_v2_tep16_mtp3] TIMEOUT (90)

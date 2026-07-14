@@ -2,8 +2,6 @@ from typing import Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
-from transformers.modeling_utils import (get_parameter_device,
-                                         get_parameter_dtype)
 from transformers.models.siglip.configuration_siglip import SiglipVisionConfig
 from transformers.models.siglip.modeling_siglip import (SiglipVisionConfig,
                                                         SiglipVisionEmbeddings)
@@ -13,7 +11,9 @@ from tensorrt_llm._utils import prefer_pinned
 from ..attention_backend.interface import AttentionMetadata
 from ..attention_backend.utils import get_attention_backend
 from ..model_config import ModelConfig
+from .hf_parameter_utils import get_parameter_device, get_parameter_dtype
 from .modeling_clip import CLIPEncoder
+from .modeling_multimodal_encoder import MultimodalEncoderMixin
 from .modeling_utils import _load_weights_impl, register_auto_model
 
 SiglipEncoder = CLIPEncoder
@@ -67,7 +67,7 @@ class SiglipVisionTransformer(nn.Module):
 
 
 @register_auto_model("SiglipVisionModel")
-class SiglipVisionModel(nn.Module):
+class SiglipVisionModel(nn.Module, MultimodalEncoderMixin):
 
     def __init__(self,
                  model_config: ModelConfig[SiglipVisionConfig],
@@ -84,12 +84,6 @@ class SiglipVisionModel(nn.Module):
 
         self.metadata_cls = get_attention_backend(
             model_config.attn_backend).Metadata
-        self.attn_metadata = self.metadata_cls(
-            max_num_requests=
-            8192,  #TODO(yechank-nvidia): Make this along with the LLM's max_num_requests
-            max_num_tokens=model_config.max_num_tokens,
-            kv_cache_manager=None,
-        )
 
     def prepare_attn_metadata(self, batch_size):
         """

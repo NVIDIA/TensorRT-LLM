@@ -2,6 +2,7 @@ import json
 import pickle
 import tempfile
 import time
+from datetime import timedelta
 from pathlib import Path
 
 import numpy as np
@@ -416,6 +417,28 @@ def test_llm_request():
     assert torch.equal(llm_request.draft_logits, logits)
 
 
+def test_llm_request_kv_cache_transfer_metric_bindings():
+    request = _tb.internal.batch_manager.LlmRequest(
+        request_id=0,
+        max_new_tokens=5,
+        sampling_config=_tb.SamplingConfig(1),
+        input_tokens=[0, 1, 2],
+        is_streaming=True,
+    )
+    offset = _tb.internal.batch_manager.LlmRequest.global_steady_clock_offset
+    offset = offset if offset is not None else timedelta()
+    start = timedelta(seconds=1.25)
+    end = timedelta(seconds=2.5)
+
+    request.set_kv_cache_transfer_start(start)
+    request.set_kv_cache_transfer_end(end)
+    request.set_kv_cache_size(128)
+
+    assert request.kv_cache_transfer_start == start + offset
+    assert request.kv_cache_transfer_end == end + offset
+    assert request.kv_cache_size == 128
+
+
 def test_Mpicomm():
     size1 = _tb.MpiComm.size()
     rank1 = _tb.MpiComm.rank()
@@ -476,8 +499,6 @@ def test_KvCache_events_binding():
         'max_beam_width':
         1,
         'max_attention_window_vec': [max_sequence_length],
-        'temp_attention_window_inputs':
-        None,
         'dtype':
         _tb.DataType.FLOAT,
         'sink_token_length':
@@ -485,6 +506,8 @@ def test_KvCache_events_binding():
         'stream':
         stream.cuda_stream,
         'max_sequence_length':
+        max_sequence_length,
+        'chunk_size':
         max_sequence_length,
         'enable_block_reuse':
         True,

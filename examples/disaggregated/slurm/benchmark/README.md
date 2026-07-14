@@ -54,7 +54,18 @@ hardware:
   gpus_per_node: 4  # GPUs per node in your cluster
   num_ctx_servers: 1  # Number of context processing servers
   num_gen_servers: 1  # Number of generation servers
+  # compact_packing: false  # Opt-in; see note below
 ```
+
+By default each worker owns whole nodes (round-robin), so cross-worker
+traffic never crosses a node boundary. Set `compact_packing: true` to pack
+all workers into `ceil(total_gpus / gpus_per_node)` nodes, allowing two
+workers to share a physical node when their GPU counts don't align with
+node boundaries (e.g. two TP=6 ctx workers fit in 3 four-GPU nodes via
+4+2 / 2+4). This is **only recommended on full-mesh NVLink fabrics like
+GB200/GB300 NVL72**, where the cross-worker NVLink traffic on the shared
+node is free; on PCIe or partitioned-NVLink hosts the shared node will
+become a bottleneck and you should leave it off.
 
 ### 4. Environment Configuration
 ```yaml

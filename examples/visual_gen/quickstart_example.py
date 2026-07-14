@@ -3,7 +3,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from tensorrt_llm import VisualGen, VisualGenParams
-from tensorrt_llm.serve.media_storage import MediaStorage
 
 
 def main():
@@ -20,7 +19,7 @@ def main():
         inputs="A cat sitting on a windowsill",
         params=params,
     )
-    MediaStorage.save_video(output.video, "output.avi", frame_rate=16.0)
+    output.save("output.avi")
 
 
 if __name__ == "__main__":

@@ -235,6 +235,7 @@ def _torch_context_mha(
     seq_start: torch.Tensor,
     scale: float,
     out: torch.Tensor,
+    custom_attn_mask: Optional[torch.Tensor] = None,
     logit_cap: Optional[float] = None,
     sliding_window_size: Optional[int] = None,
     sinks: Optional[torch.Tensor] = None,
@@ -306,14 +307,23 @@ def _torch_context_mha(
             )  # [seq_len_i, kv_seq_len]
 
             # Sliding window mask: allow attention only if 0 <= pos_diff < sliding_window_size
-            sliding_window_mask = pos_diff >= sliding_window_size
+            sliding_window_mask = (pos_diff < 0) | (pos_diff >= sliding_window_size)
 
             # Combine causal and sliding window masks
             combined_mask = causal_mask | sliding_window_mask
         else:
             combined_mask = causal_mask
 
-        attn_scores.masked_fill_(combined_mask.unsqueeze(0).unsqueeze(0), float("-inf"))
+        if custom_attn_mask is not None and custom_attn_mask.numel() > 0:
+            custom_mask = ~custom_attn_mask[idx, :, :seq_len_i, :kv_seq_len]
+            if sliding_window_size is not None and sliding_window_size > 0:
+                combined_mask = sliding_window_mask.unsqueeze(0) | custom_mask
+            else:
+                combined_mask = custom_mask
+        else:
+            combined_mask = combined_mask.unsqueeze(0)
+
+        attn_scores.masked_fill_(combined_mask.unsqueeze(0), float("-inf"))
 
         # Apply logit softcapping if enabled
         attn_scores = _apply_logit_softcapping(attn_scores, logit_cap)
@@ -361,6 +371,7 @@ def _torch_context_mha_readonly(
     seq_start: torch.Tensor,
     scale: float,
     out: torch.Tensor,
+    custom_attn_mask: Optional[torch.Tensor] = None,
     logit_cap: Optional[float] = None,
     sliding_window_size: Optional[int] = None,
     sinks: Optional[torch.Tensor] = None,
@@ -399,14 +410,28 @@ def _torch_context_mha_readonly(
             torch.ones(seq_len_i, kv_seq_len, device=q.device, dtype=torch.bool),
             diagonal=1 + input_pos_i,
         )
-        attn_scores.masked_fill_(causal_mask.unsqueeze(0).unsqueeze(0), float("-inf"))
+        base_mask = causal_mask
 
         if sliding_window_size is not None and sliding_window_size > 0:
             query_positions = torch.arange(input_pos_i, input_pos_i + seq_len_i, device=q.device)
             key_positions = torch.arange(kv_seq_len, device=q.device)
             pos_diff = query_positions.unsqueeze(1) - key_positions.unsqueeze(0)
             sliding_window_mask = (pos_diff < 0) | (pos_diff >= sliding_window_size)
-            attn_scores.masked_fill_(sliding_window_mask.unsqueeze(0).unsqueeze(0), float("-inf"))
+            base_mask = base_mask | sliding_window_mask
+
+        if (
+            custom_attn_mask is not None
+            and custom_attn_mask.numel() > 0
+            and idx < custom_attn_mask.shape[0]
+        ):
+            custom_mask = ~custom_attn_mask[idx, :, :seq_len_i, :kv_seq_len]
+            combined_mask = custom_mask
+            if sliding_window_size is not None and sliding_window_size > 0:
+                combined_mask = sliding_window_mask.unsqueeze(0) | combined_mask
+        else:
+            combined_mask = base_mask.unsqueeze(0)
+
+        attn_scores.masked_fill_(combined_mask.unsqueeze(0), float("-inf"))
 
         attn_scores = _apply_logit_softcapping(attn_scores, logit_cap)
 
@@ -429,7 +454,9 @@ def _torch_context_mha_readonly(
         out.copy_(torch.cat(attn_outputs, dim=0))
 
 
-@torch.library.custom_op("auto_deploy::torch_cached_attention_with_cache", mutates_args=())
+@torch.library.custom_op(
+    "auto_deploy::torch_cached_attention_with_cache", mutates_args=("k_cache", "v_cache")
+)
 def torch_backend_mha_with_cache(
     # Q, K, V
     q: torch.Tensor,
@@ -454,6 +481,8 @@ def torch_backend_mha_with_cache(
     sliding_window_size: Optional[int] = None,
     logit_cap: Optional[float] = None,
     read_cache_only: bool = False,
+    # OPTIONAL INPUTS
+    custom_attn_mask: Optional[torch.Tensor] = None,
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Torch backend MHA with cache that takes q, k, v in BSND layout."""
@@ -523,6 +552,7 @@ def torch_backend_mha_with_cache(
             seq_start,
             scale,
             y,
+            custom_attn_mask,
             logit_cap,
             sliding_window_size,
             sinks,
@@ -570,6 +600,7 @@ def torch_backend_mha_with_cache_fake(
     sliding_window_size: Optional[int] = None,
     logit_cap: Optional[float] = None,
     read_cache_only: bool = False,
+    custom_attn_mask: Optional[torch.Tensor] = None,
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     if out is not None:
@@ -643,10 +674,9 @@ class TorchBackendAttention(AttentionDescriptor):
         attn_mask, dropout_p, is_causal = extract_op_args(
             source_attn_node, "attn_mask", "dropout_p", "is_causal"
         )
-        if attn_mask is not None or dropout_p != 0.0 or not is_causal:
+        if dropout_p != 0.0:
             ad_logger.debug(
-                "Unsupported attention arguments for "
-                f"{source_attn_node=}: {attn_mask=}, {dropout_p=}, {is_causal=}"
+                f"Unsupported attention arguments for {source_attn_node=}: {dropout_p=}"
             )
 
         # Get scale from args or kwargs

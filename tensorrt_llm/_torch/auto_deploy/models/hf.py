@@ -341,7 +341,15 @@ class AutoModelForCausalLMFactory(AutoModelFactory):
         """Initialize the tokenizer—either a custom name or the model's default."""
         if self.tokenizer is None:
             return None
-        return AutoTokenizer.from_pretrained(self.tokenizer, **self.tokenizer_kwargs)
+        tokenizer = AutoTokenizer.from_pretrained(self.tokenizer, **self.tokenizer_kwargs)
+        # Transformers 5.x: LlamaTokenizer forces a Metaspace pre-tokenizer over
+        # the ByteLevel one declared in tokenizer.json for repos like
+        # DeepSeek-V3/R1 that set tokenizer_class="LlamaTokenizer" but ship a
+        # ByteLevel BPE.  Mirror the fix the pytorch backend applies inside
+        # TransformersTokenizer.from_pretrained.
+        from tensorrt_llm.tokenizer import maybe_fix_byte_level_tokenizer
+
+        return maybe_fix_byte_level_tokenizer(tokenizer, self.tokenizer, **self.tokenizer_kwargs)
 
     def build_and_load_model(self, device: DeviceLikeType) -> nn.Module:
         """Automatically build the model from_pretrained and load the weights.

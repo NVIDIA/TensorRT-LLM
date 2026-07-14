@@ -4,7 +4,7 @@ l0_gb300:
     ranges:
       system_gpu_count:
         gte: 1
-        lte: 1
+        lte: 4
     wildcards:
       gpu:
       - '*gb110*'

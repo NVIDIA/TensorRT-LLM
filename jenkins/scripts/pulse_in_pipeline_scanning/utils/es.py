@@ -1,5 +1,8 @@
 import json
 import os
+import sys
+from datetime import datetime, timezone
+from urllib.parse import quote
 
 import requests
 from elasticsearch import Elasticsearch, RequestsHttpConnection
@@ -45,9 +48,9 @@ def es_post(url, documents):
         failed = [
             item["index"] for item in result.get("items", []) if item.get("index", {}).get("error")
         ]
-        print(f"Indexing errors ({len(failed)}):")
+        print(f"Indexing errors ({len(failed)}):", file=sys.stderr)
         for f in failed:
-            print(f"  {f.get('_id')}: {f.get('error', {}).get('reason')}")
+            print(f"  {f.get('_id')}: {f.get('error', {}).get('reason')}", file=sys.stderr)
     return indexed, errors
 
 
@@ -111,12 +114,37 @@ def get_last_scan_results(report_type: str, branch: str):
     return detected_dependencies
 
 
-def get_latest_license_preapproved_container_deps():
+def get_latest_license_preapproved_container_deps(scan_type: str):
     data = ES_CLIENT.search(
         index=ES_INDEX_PREAPPROVED_BASE + "-*",
-        body={"size": 1, "sort": [{"ts_created": "desc"}], "_source": ["preapproved_deps"]},
+        body={
+            "size": 1,
+            "sort": [{"ts_created": "desc"}],
+            "query": {
+                "bool": {
+                    "should": [
+                        {"match": {"s_scan_type": scan_type}},
+                    ],
+                    "minimum_should_match": 1,
+                }
+            },
+            "_source": ["nested_preapproved_deps"],
+        },
     )
     data_source = data["hits"]["hits"][0]["_source"]
     if not data_source:
         return []
-    return data_source["preapproved_deps"]
+    return data_source["nested_preapproved_deps"]
+
+
+def get_dashboard_url(build_number, branch):
+    starttime = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    base = (
+        "https://gpuwa.nvidia.com/kibana/s/tensorrt/app/dashboards"
+        "#/view/f90d586c-553a-468e-b064-48e846e983a2"
+    )
+    start_iso = starttime.replace(tzinfo=None).isoformat()
+    g = f"(filters:!(),refreshInterval:(pause:!t,value:60000),time:(from:'{start_iso}Z',to:now))"
+    a = f"(query:(language:kuery,query:'s_build_number:{build_number} and s_branch:\"{branch}\"'))"
+    dashboard_link = f"{base}?_g={quote(g)}&_a={quote(a)}"
+    return dashboard_link

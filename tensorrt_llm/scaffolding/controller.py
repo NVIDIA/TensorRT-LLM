@@ -1,7 +1,7 @@
 import copy
 from abc import ABC
 from enum import Enum
-from typing import Any, List, Mapping, Tuple
+from typing import Any, Generator, List, Mapping, Optional, Sequence, Tuple
 
 import torch
 from torch.nn import functional as F
@@ -9,7 +9,9 @@ from torch.nn import functional as F
 from tensorrt_llm.executor.result import GenerationResult
 from tensorrt_llm.logger import logger
 from tensorrt_llm.scaffolding.math_utils import get_digit_majority_vote_result
-from tensorrt_llm.scaffolding.task import GenerationTask, Task
+from tensorrt_llm.scaffolding.task import (AssistantMessage, ChatTask,
+                                           GenerationTask, MCPCallTask, Task,
+                                           ToolMessage)
 
 
 class Controller(ABC):
@@ -33,14 +35,45 @@ class Controller(ABC):
 
 class ParallelProcess:
 
-    def __init__(self, controllers: List[Controller],
-                 tasks_list: List[List[Task]], kwargs_list: List[Mapping[str,
-                                                                         Any]]):
+    def __init__(self,
+                 controllers: List[Controller],
+                 tasks_list: List[List[Task]],
+                 kwargs_list: List[Mapping[str, Any]],
+                 branch_paths: Optional[Sequence[Sequence[int]]] = None):
         self.sub_gens = []
         for controller, tasks, kwargs in zip(controllers, tasks_list,
                                              kwargs_list):
             gen = controller.process(tasks, **kwargs)
             self.sub_gens.append(gen)
+        self.branch_paths = self._normalize_branch_paths(branch_paths)
+        self._validate_branch_paths()
+
+    # updated for tree_of_thought branching tracing
+    @classmethod
+    def from_generators(
+        cls,
+        sub_gens: Sequence[Generator],
+        branch_paths: Optional[Sequence[Sequence[int]]] = None,
+    ) -> "ParallelProcess":
+        obj = cls.__new__(cls)
+        obj.sub_gens = list(sub_gens)
+        obj.branch_paths = cls._normalize_branch_paths(branch_paths)
+        obj._validate_branch_paths()
+        return obj
+
+    @staticmethod
+    def _normalize_branch_paths(
+        branch_paths: Optional[Sequence[Sequence[int]]],
+    ) -> Optional[List[Tuple[int, ...]]]:
+        if branch_paths is None:
+            return None
+        return [tuple(branch_path) for branch_path in branch_paths]
+
+    def _validate_branch_paths(self):
+        if self.branch_paths is not None and len(self.branch_paths) != len(
+                self.sub_gens):
+            raise ValueError(
+                "branch_paths must match the number of parallel branches")
 
 
 # Controller runs multiple generation tasks.
@@ -61,15 +94,29 @@ class NativeGenerationController(Controller):
         self.sampling_params = sampling_params
         self.streaming = streaming
 
+    # [GenerationTask] -> [GenerationTask] | [ChatTask] -> [ChatTask]
     def process(self, tasks: List[Task], **kwargs):
         for task in tasks:
             task.worker_tag = self.WorkerTag.GENERATION
             for key, value in self.sampling_params.items():
                 if getattr(task, key) is None:
                     setattr(task, key, value)
+
             task.streaming_output_flag = self.streaming
 
         yield tasks
+
+
+class NativeChatController(NativeGenerationController):
+
+    def __init__(self, sampling_params: dict = None, streaming: bool = False):
+        super().__init__(sampling_params, streaming)
+
+    def process(self, tasks: List[Task], **kwargs):
+        chat_tasks = [
+            ChatTask.create_from_prompt(task.input_str) for task in tasks
+        ]
+        yield from super().process(chat_tasks, **kwargs)
 
 
 class NativeRewardController(Controller):
@@ -196,6 +243,72 @@ class PRMController(NativeRewardController):
         self.scores = scores
 
 
+class ChatWithMCPController(Controller):
+
+    class WorkerTag(Enum):
+        TOOLCALL = "tool_call"
+
+    def __init__(self,
+                 generation_controller: Controller,
+                 system_prompts=None,
+                 max_iterations: int = 3,
+                 tools: Any = None):
+        super().__init__()
+        self.generation_controller = generation_controller
+        self.system_prompts = system_prompts
+        self.tools = tools
+        self.max_iterations = max_iterations
+
+    def generate(self, prompt: str, **kwargs) -> GenerationResult:
+        chat_task = ChatTask.create_from_prompt(prompt, self.system_prompts,
+                                                self.tools)
+
+        yield from self.process([chat_task], **kwargs)
+        chat_task.output_str = chat_task.messages[-1].content
+
+        return chat_task.create_scaffolding_output()
+
+    # [ChatTask] -> [ChatTask]
+    def process(self, tasks: List[Task], **kwargs):
+        assert len(tasks) == 1, "ChatWithMCPController only supports one task"
+        chat_task = tasks[0]
+        for _ in range(self.max_iterations):
+            yield from self.generation_controller.process([chat_task])
+            response_message = chat_task.messages[-1]
+            if not isinstance(response_message, AssistantMessage):
+                logger.warning(
+                    "Stopping ChatWithMCP tool loop: expected AssistantMessage "
+                    "after generation, got %s",
+                    type(response_message).__name__,
+                )
+                break
+            if response_message.tool_calls:
+                tool_calls = response_message.tool_calls
+                mcp_tasks = [
+                    MCPCallTask.create_mcptask(tool_call.id,
+                                               tool_call.function.name,
+                                               tool_call.function.arguments,
+                                               self.WorkerTag.TOOLCALL)
+                    for tool_call in tool_calls
+                ]
+                yield mcp_tasks
+                for mcp_task in mcp_tasks:
+                    if mcp_task.result_str is not None:
+                        chat_task.add_message(
+                            ToolMessage(
+                                mcp_task.result_str,
+                                mcp_task.tool_call_id,
+                                trace_stdout=mcp_task.result_stdout,
+                                trace_stderr=mcp_task.result_stderr,
+                            ))
+                # TODO: this is currently specified for swebench agent
+                if any(tc.function.name == "complete_task"
+                       for tc in tool_calls):
+                    break
+            else:
+                break
+
+
 # Controller runs a single generation task with majority vote.
 class MajorityVoteController(Controller):
 
@@ -235,7 +348,7 @@ class MajorityVoteController(Controller):
 
         assert isinstance(majority_answer, str), "majority_vote failed"
         # The task returned by majority vote does not have output_tokens and logits.
-        tasks[0].result = tasks_list[majority_index][0].result
+        tasks[0].output_str = tasks_list[majority_index][0].output_str
 
     def majority_vote(self, candidates_tasks: List[List[Task]],
                       **kwargs) -> Tuple[int, str]:

@@ -230,6 +230,7 @@ void initBindings(nb::module_& m)
         .def_ro("lora_id", &tle::KVCacheStoredBlockData::loraId)
         .def_ro("cache_level", &tle::KVCacheStoredBlockData::cacheLevel)
         .def_ro("priority", &tle::KVCacheStoredBlockData::priority)
+        .def_ro("cache_salt", &tle::KVCacheStoredBlockData::cacheSalt)
         .def_prop_ro("mm_keys",
             [](tle::KVCacheStoredBlockData const& self)
             {

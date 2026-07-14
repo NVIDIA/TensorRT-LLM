@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-# Copyright 2024, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright 2024-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # Redistribution and use in source and binary forms, with or without
 # modification, are permitted provided that the following conditions
@@ -43,12 +43,33 @@ def prepare_tensor(name, input):
     return t
 
 
-def _prepare_inputs(prompt, output_len):
+def _prepare_inputs(prompt,
+                    output_len,
+                    lora_id=None,
+                    lora_name=None,
+                    lora_path=None,
+                    lora_ckpt_source=None):
     inputs = [
         prepare_tensor("text_input", prompt),
         prepare_tensor("sampling_param_max_tokens",
                        np.array([output_len], dtype=np.int32)),
     ]
+    if lora_id is not None:
+        inputs.append(
+            prepare_tensor("lora_id", np.array([lora_id], dtype=np.uint64)))
+    if lora_name is not None:
+        inputs.append(
+            prepare_tensor("lora_name",
+                           np.array([lora_name.encode("utf-8")], dtype=object)))
+    if lora_path is not None:
+        inputs.append(
+            prepare_tensor("lora_path",
+                           np.array([lora_path.encode("utf-8")], dtype=object)))
+    if lora_ckpt_source is not None:
+        inputs.append(
+            prepare_tensor(
+                "lora_ckpt_source",
+                np.array([lora_ckpt_source.encode("utf-8")], dtype=object)))
     return inputs
 
 
@@ -196,14 +217,61 @@ if __name__ == "__main__":
                         required=False,
                         default='tensorrt_llm',
                         help='Specify model name')
+    parser.add_argument(
+        '--lora-id',
+        type=int,
+        required=False,
+        default=None,
+        help='LoRA adapter integer id (matches `lora_id` input on the model).',
+    )
+    parser.add_argument(
+        '--lora-name',
+        type=str,
+        required=False,
+        default=None,
+        help='LoRA adapter name (matches `lora_name` input on the model).',
+    )
+    parser.add_argument(
+        '--lora-path',
+        type=str,
+        required=False,
+        default=None,
+        help=
+        'Filesystem path to the LoRA adapter checkpoint readable by the Triton server.',
+    )
+    parser.add_argument(
+        '--lora-ckpt-source',
+        type=str,
+        required=False,
+        default=None,
+        choices=("hf", "nemo"),
+        help='LoRA checkpoint format. Defaults to "hf" on the server side.',
+    )
 
     FLAGS = parser.parse_args()
+
+    # The llmapi triton backend requires lora_id, lora_name, and lora_path
+    # to be sent together (lora_ckpt_source is optional with default "hf").
+    # Fail fast on partial input instead of letting the server return a
+    # cryptic error response.
+    lora_triplet = (FLAGS.lora_id, FLAGS.lora_name, FLAGS.lora_path)
+    if any(v is not None
+           for v in lora_triplet) and not all(v is not None
+                                              for v in lora_triplet):
+        parser.error(
+            "--lora-id, --lora-name, and --lora-path must be provided together."
+        )
 
     input_data = np.array([FLAGS.text], dtype=object)
 
     output_len = FLAGS.request_output_len
 
-    inputs = _prepare_inputs(input_data, output_len)
+    inputs = _prepare_inputs(input_data,
+                             output_len,
+                             lora_id=FLAGS.lora_id,
+                             lora_name=FLAGS.lora_name,
+                             lora_path=FLAGS.lora_path,
+                             lora_ckpt_source=FLAGS.lora_ckpt_source)
 
     stop_inputs = None
     if FLAGS.stop_after_ms > 0 and not FLAGS.stop_via_request_cancel:
@@ -220,14 +288,29 @@ if __name__ == "__main__":
             certificate_chain=FLAGS.certificate_chain,
     ) as triton_client:
         try:
-            # Send request
-            infer_future = triton_client.async_infer(
-                FLAGS.model_name,
-                inputs,
-                outputs=None,
-                request_id=request_id,
-                callback=partial(callback, user_data),
-                parameters={'Streaming': FLAGS.streaming})
+            # Triton rejects ModelInfer RPC (used by async_infer) on
+            # decoupled models. Streaming requests must use the
+            # bidirectional stream RPC. Cancellation (via either stop
+            # tensor or request-cancel) also needs the stream path when
+            # the server is decoupled.
+            use_stream_rpc = bool(FLAGS.streaming) or FLAGS.stop_after_ms > 0
+            infer_future = None
+            if use_stream_rpc:
+                triton_client.start_stream(
+                    callback=partial(callback, user_data))
+                triton_client.async_stream_infer(
+                    FLAGS.model_name,
+                    inputs,
+                    request_id=request_id,
+                    parameters={'Streaming': FLAGS.streaming})
+            else:
+                infer_future = triton_client.async_infer(
+                    FLAGS.model_name,
+                    inputs,
+                    outputs=None,
+                    request_id=request_id,
+                    callback=partial(callback, user_data),
+                    parameters={'Streaming': FLAGS.streaming})
 
             expected_responses = 1
 
@@ -236,14 +319,30 @@ if __name__ == "__main__":
                 time.sleep(FLAGS.stop_after_ms / 1000.0)
 
                 if FLAGS.stop_via_request_cancel:
-                    infer_future.cancel()
+                    if use_stream_rpc:
+                        # cancel_requests=True closes the bidi stream
+                        # AND cancels in-flight infers, which the
+                        # cancellation_loop in model.py picks up via
+                        # request.is_cancelled() and reports back as
+                        # StatusCode.CANCELLED. Without the flag,
+                        # stop_stream waits for completion instead.
+                        triton_client.stop_stream(cancel_requests=True)
+                    else:
+                        infer_future.cancel()
                 else:
-                    triton_client.async_infer(
-                        FLAGS.model_name,
-                        stop_inputs,
-                        request_id=request_id,
-                        callback=partial(callback, user_data),
-                        parameters={'Streaming': FLAGS.streaming})
+                    if use_stream_rpc:
+                        triton_client.async_stream_infer(
+                            FLAGS.model_name,
+                            stop_inputs,
+                            request_id=request_id,
+                            parameters={'Streaming': FLAGS.streaming})
+                    else:
+                        triton_client.async_infer(
+                            FLAGS.model_name,
+                            stop_inputs,
+                            request_id=request_id,
+                            callback=partial(callback, user_data),
+                            parameters={'Streaming': FLAGS.streaming})
 
             processed_count = 0
             while processed_count < expected_responses:
@@ -254,7 +353,19 @@ if __name__ == "__main__":
                     break
 
                 if type(result) == InferenceServerException:
-                    if result.status() == "StatusCode.CANCELLED":
+                    # async_infer surfaces cancellation as a real gRPC
+                    # status `StatusCode.CANCELLED`, but the bidi stream
+                    # RPC delivers cancellation as an
+                    # InferenceServerException whose status is None and
+                    # whose message is the one model.py's
+                    # cancellation_loop/handle_stop_request set on the
+                    # TritonError (`Request cancelled by client`).
+                    status = result.status()
+                    msg = str(result).lower()
+                    is_cancelled = (status == "StatusCode.CANCELLED"
+                                    or "cancelled by client" in msg
+                                    or "request cancelled" in msg)
+                    if is_cancelled:
                         print("Request is cancelled")
                     else:
                         print("Received an error from server:")

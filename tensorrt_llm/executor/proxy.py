@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 import atexit
 import concurrent.futures
 import json
@@ -5,7 +19,7 @@ import os
 import threading
 import weakref
 from queue import Empty
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Union
 
 import torch
 import zmq
@@ -15,7 +29,8 @@ from tensorrt_llm.logger import logger
 
 from .._utils import customized_gc_thresholds, mpi_rank, nvtx_range_debug
 from ..llmapi.mpi_session import (MpiCommSession, MpiPoolSession, MpiSession,
-                                  RemoteMpiCommSessionClient)
+                                  RemoteMpiCommSessionClient,
+                                  validate_session_world_size)
 from ..llmapi.tracer import enable_llm_tracer, get_tracer, global_tracer
 from ..llmapi.utils import (AsyncQueue, ManagedThread, _SyncQueue,
                             enable_llm_debug, logger_debug, print_colored)
@@ -26,14 +41,54 @@ from .request import CancellingRequest, GenerationRequest
 from .result import GenerationResult, IterationResult
 from .rpc import RPCClient
 from .rpc.rpc_common import RPCError, get_unique_ipc_addr
-from .utils import (ErrorResponse, RequestError, WorkerCommIpcAddrs,
-                    create_mpi_comm_session, get_spawn_proxy_process_env,
-                    is_llm_response, print_alive_threads)
+from .utils import (EngineDeadError, ErrorResponse, RequestError,
+                    WorkerCommIpcAddrs, create_mpi_comm_session,
+                    get_spawn_proxy_process_env, is_llm_response,
+                    print_alive_threads)
 from .worker import GenerationExecutorWorker, worker_main
 
 __all__ = [
     "GenerationExecutorProxy",
 ]
+
+# Methods that are explicitly implemented for multi-rank MPI/IPC executor
+# deployments and may be called via collective_rpc even when world_size > 1.
+# sleep() and wakeup() coordinate across all ranks via a dedicated control
+# communicator started in PyExecutor.start_worker(); rank-0 is the entry
+# point, so routing through the rank-0 RPC shim is correct.
+_MULTI_RANK_ALLOWED_METHODS: frozenset[str] = frozenset({"sleep", "wakeup"})
+
+
+def _check_collective_rpc_guard(
+    model_world_size: int,
+    unique_reply_rank: Optional[int],
+    target_ranks: Optional[Union[int, List[int]]],
+    method: str = "",
+) -> None:
+    """Validate collective_rpc preconditions shared by IPC and RPC proxies.
+
+    Args:
+        model_world_size: Total number of GPU worker processes.
+        unique_reply_rank: Must be ``None`` for this shim.
+        target_ranks: Must be ``None`` for this shim.
+        method: Name of the method being invoked; used to allow selected
+            multi-rank-capable methods past the world_size guard.
+
+    Raises:
+        NotImplementedError: If ``model_world_size > 1`` and ``method`` is not
+            in :data:`_MULTI_RANK_ALLOWED_METHODS`, or if
+            ``unique_reply_rank`` or ``target_ranks`` are provided.
+    """
+    if model_world_size > 1 and method not in _MULTI_RANK_ALLOWED_METHODS:
+        raise NotImplementedError(
+            f"MPI collective_rpc does not support model_world_size > 1 for "
+            f"method '{method}'; use the Ray executor for general multi-rank "
+            "deployments, or use sleep()/wakeup() which handle multi-rank "
+            "coordination internally.")
+    if unique_reply_rank is not None or target_ranks is not None:
+        raise NotImplementedError(
+            "unique_reply_rank and target_ranks are not supported; "
+            "this shim only reaches rank-0.")
 
 
 class GenerationExecutorProxy(GenerationExecutor):
@@ -63,6 +118,7 @@ class GenerationExecutorProxy(GenerationExecutor):
         self.worker_cls = worker_cls
 
         mpi_process_pre_spawned: bool = get_spawn_proxy_process_env()
+        self._owns_mpi_session = mpi_session is None
 
         if mpi_session is None:
             if mpi_process_pre_spawned:
@@ -72,6 +128,10 @@ class GenerationExecutorProxy(GenerationExecutor):
                 logger_debug('create pool session ...\n', "yellow")
                 self.mpi_session = MpiPoolSession(n_workers=model_world_size)
         else:
+            # submit() launches one worker task per pool worker, so an
+            # external session must match the model's world size exactly;
+            # fail loudly instead of starting the wrong number of executors.
+            validate_session_world_size(mpi_session, model_world_size)
             logger_debug('using external mpi session ...\n', "yellow")
             self.mpi_session = mpi_session
 
@@ -86,12 +146,19 @@ class GenerationExecutorProxy(GenerationExecutor):
                 "yellow")
 
         self._results: Dict[int, GenerationResult] = {}
+        # Sticky engine-dead flag: once a worker death is recorded, pending and
+        # new requests fail fast with EngineDeadError instead of blocking on a
+        # response queue whose producer is gone.
+        self._engine_dead = False
 
         self.model_world_size = model_world_size
 
-        self.garbage_collection_gen0_threshold = worker_kwargs[
-            "llm_args"].garbage_collection_gen0_threshold if worker_kwargs.get(
-                "llm_args", None) is not None else None
+        _llm_args = worker_kwargs.get("llm_args", None)
+        self.garbage_collection_gen0_threshold = _llm_args.garbage_collection_gen0_threshold if _llm_args is not None else None
+        _backend = None if _llm_args is None else _llm_args.backend
+        self._is_pytorch_backend = _backend in ["pytorch", "_autodeploy"]
+        self._enable_resource_governor = bool(
+            getattr(_llm_args, "enable_resource_governor", False))
 
         # Generate RPC address and key for stats RPC
         self.rpc_addr = get_unique_ipc_addr()
@@ -204,21 +271,99 @@ class GenerationExecutorProxy(GenerationExecutor):
 
         return True
 
+    def _set_fatal_error(self, error: BaseException) -> None:
+        """Record the fatal error, then unblock every pending request.
+
+        Extends the base behavior so that the instant a worker death is
+        recorded (from the error monitor, a health check, or a crashed future),
+        all pending GenerationResults fail fast with EngineDeadError rather than
+        blocking forever on a response queue whose producer is gone.
+        """
+        super()._set_fatal_error(error)
+        self._mark_engine_dead(error)
+
+    def _mark_engine_dead(self, error: Optional[BaseException] = None) -> None:
+        """Set the sticky flag and push EngineDeadError onto pending results."""
+        if self._engine_dead:
+            return
+        self._engine_dead = True
+        dead_error = EngineDeadError(error)
+        # Snapshot to avoid mutation-during-iteration; best-effort per result.
+        # Use put() (not put_nowait()) so the async _SyncQueue path also wakes
+        # the awaiting event loop, not just the sync Queue path.
+        for result in list(self._results.values()):
+            try:
+                result.queue.put(dead_error)
+            except Exception:  # noqa: BLE001 - a full/closed queue must not stop the sweep
+                pass
+
+    def _handle_worker_death(self, error: BaseException) -> None:
+        """Event-driven worker-death handler.
+
+        Runs from the MPI future's done-callback thread the instant a worker
+        process exits. Enqueues the error for the monitor loop to record (which
+        drives pre_shutdown) and immediately broadcasts EngineDeadError to
+        pending requests, so they fail fast without waiting for the next poll
+        tick. Propagation is therefore no longer gated by the poll interval.
+        """
+        self._error_queue.put_nowait(error)
+        self._mark_engine_dead(error)
+
+    def _check_remote_worker_death(self) -> bool:
+        """Poll a remote (pre-spawned) MPI session for forwarded worker deaths.
+
+        Under ``TLLM_SPAWN_PROXY_PROCESS=1`` / ``trtllm-llmapi-launch`` the
+        session is a ``RemoteMpiCommSessionClient`` whose ``submit()`` returns
+        no futures, so the ``mpi_done_callback`` path never fires and
+        ``_check_mpi_futures()`` has nothing to watch. The remote server
+        forwards worker exceptions over its control socket instead
+        (``RemoteWorkerDeath``); surface them here into the same fast-death
+        path so this deployment mode gets identical EngineDeadError behavior.
+
+        Returns:
+            True if a dead worker was detected.
+        """
+        check = getattr(self.mpi_session, "check_worker_error", None)
+        if check is None:
+            return False
+        try:
+            error = check()
+        except Exception as exc:  # noqa: BLE001 - monitor must not die
+            logger.debug(f"check_worker_error failed (ignored): {exc!r}")
+            return False
+        if error is None:
+            return False
+        logger.error(f"Remote MPI worker death reported: {error!r}")
+        self._handle_worker_death(error)
+        self._set_fatal_error(error)
+        if not self.doing_shutdown:
+            self.pre_shutdown()
+        return True
+
     def _error_monitor_loop(self) -> None:
-        """Background thread that polls for fatal errors every ~5 seconds.
+        """Background thread that reaps a dead engine and drives pre_shutdown.
 
-        Checks MPI worker futures and drains the error queue using
-        the shared ``_check_mpi_futures()`` and ``_drain_error_queue()``
-        helpers.
+        Checks MPI worker futures, remote-session worker-death notifications,
+        and the error queue using the shared ``_check_mpi_futures()``,
+        ``_check_remote_worker_death()`` and ``_drain_error_queue()`` helpers.
 
-        Uses ``_shutdown_event`` for clean wakeup instead of a sleep loop,
-        so shutdown is immediate rather than waiting up to 5 seconds.
+        Propagation to pending requests is event-driven via
+        ``_handle_worker_death`` (the MPI future done-callback) where futures
+        exist; for remote sessions it is bounded by this loop's poll interval.
+        Uses ``_shutdown_event`` for clean wakeup instead of a sleep loop, so
+        shutdown is immediate.
         """
         while not self.doing_shutdown and self._fatal_error is None:
             try:
                 if self._check_mpi_futures():
                     logger.error("Error monitor: MPI worker crash detected, "
                                  "shutting down")
+                    return
+
+                if self._check_remote_worker_death():
+                    logger.error(
+                        "Error monitor: remote MPI worker death detected, "
+                        "shutting down")
                     return
 
                 self._drain_error_queue()
@@ -228,7 +373,9 @@ class GenerationExecutorProxy(GenerationExecutor):
                 logger.debug(f"Error monitor: unexpected exception (ignored): "
                              f"{exc!r}")
 
-            # Wait up to 5s, but wake immediately if _shutdown_event is set
+            # Backstop poll only; the latency-sensitive propagation path is
+            # event-driven (see _handle_worker_death), so a coarse interval is
+            # fine. Wakes immediately if _shutdown_event is set.
             self._shutdown_event.wait(timeout=5.0)
 
     def _setup_queues(self) -> WorkerCommIpcAddrs:
@@ -248,19 +395,28 @@ class GenerationExecutorProxy(GenerationExecutor):
             socket_type=zmq.PULL
             if self.enable_postprocess_parallel else zmq.PAIR,
             name="proxy_result_queue")
+        self._resource_governor_queue = IpcQueue(
+            is_server=True, name="proxy_resource_governor_queue"
+        ) if self._enable_resource_governor else None
         # Stats and KV events are now fetched via RPC, not IPC queues.
         return WorkerCommIpcAddrs(
             request_queue_addr=self.request_queue.address,
             worker_init_status_queue_addr=self.worker_init_status_queue.address,
             result_queue_addr=self.result_queue.address,
+            resource_governor_queue_addr=self._resource_governor_queue.address
+            if self._resource_governor_queue is not None else None,
         )
 
+    @property
+    def resource_governor_queue(self):
+        return self._resource_governor_queue
+
     def abort_request(self, request_id: int) -> None:
-        ''' Abort a request by sending a cancelling request to the request queue.
+        """Abort a request by sending a cancelling request to the request queue.
 
         Args:
             request_id (int): The id of the request to abort.
-        '''
+        """
         # NOTE, it just sends a cancelling request to the request queue, but it
         # may take a while for the request to be cancelled in the worker and
         # send back a finished result.
@@ -269,9 +425,8 @@ class GenerationExecutorProxy(GenerationExecutor):
     def dispatch_result_task(self) -> bool:
         # TODO[chunweiy]: convert the dispatch_result_task to async, that should
         # benefit from zmq.asyncio.Context
-        with customized_gc_thresholds(self.garbage_collection_gen0_threshold):
-            if (res := self.result_queue.get()) is None:
-                return False  # shutdown the thread
+        if (res := self.result_queue.get()) is None:
+            return False  # shutdown the thread
 
         async_queues = []
         event_loop = None
@@ -281,7 +436,14 @@ class GenerationExecutorProxy(GenerationExecutor):
             nonlocal event_loop
             nonlocal async_queues
 
-            queue = self._results[client_id].queue
+            # The result may already be finalized and popped below — e.g. a
+            # `terminate` verdict sent a final Output while the
+            # engine still has in-flight responses (abort is async). Drop such
+            # late responses instead of crashing with a KeyError.
+            result = self._results.get(client_id)
+            if result is None:
+                return
+            queue = result.queue
             if isinstance(queue, _SyncQueue):
                 queue.put_nowait(res)
                 async_queues.append(queue)
@@ -296,7 +458,7 @@ class GenerationExecutorProxy(GenerationExecutor):
                     res,
                     ErrorResponse) or (isinstance(res, PostprocWorker.Output)
                                        and res.is_final):
-                self._results.pop(client_id)
+                self._results.pop(client_id, None)
 
         res = res if isinstance(res, list) else [res]
 
@@ -325,7 +487,10 @@ class GenerationExecutorProxy(GenerationExecutor):
             self.dispatch_result_thread = ManagedThread(
                 weakref.WeakMethod(self.dispatch_result_task),
                 error_queue=self._error_queue,
-                name="proxy_dispatch_result_thread")
+                name="proxy_dispatch_result_thread",
+                context=customized_gc_thresholds(
+                    self.garbage_collection_gen0_threshold),
+            )
 
             self.dispatch_result_thread.start()
 
@@ -340,7 +505,7 @@ class GenerationExecutorProxy(GenerationExecutor):
             # will not block.
             if future.exception() is not None:
                 if self_ := self_ref():
-                    self_._error_queue.put_nowait(future.exception())
+                    self_._handle_worker_death(future.exception())
 
         tracer_init_kwargs = get_tracer().init_kwargs if enable_llm_tracer(
         ) else None
@@ -384,7 +549,10 @@ class GenerationExecutorProxy(GenerationExecutor):
 
         if ready_signal != GenerationExecutorProxy.READY_SIGNAL:
             logger.error(f"Executor worker initialization error: {error_trace}")
-            self.mpi_session.shutdown_abort(reason=ready_signal)
+            # Only abort a session this proxy created; an externally owned
+            # (shared) session must stay alive for its owner to tear down.
+            if self._owns_mpi_session:
+                self.mpi_session.shutdown_abort(reason=ready_signal)
             raise RuntimeError(
                 "Executor worker returned error") from ready_signal
 
@@ -467,9 +635,12 @@ class GenerationExecutorProxy(GenerationExecutor):
         self.request_queue.close()
         self.worker_init_status_queue.close()
         self.result_queue.close()
+        if self._resource_governor_queue is not None:
+            self._resource_governor_queue.close()
 
         self.workers_started = False
-        self.mpi_session.shutdown()
+        if self._owns_mpi_session:
+            self.mpi_session.shutdown()
 
         # Process the errors in-case error during shutting down the threads
         self._handle_background_error()
@@ -484,6 +655,10 @@ class GenerationExecutorProxy(GenerationExecutor):
             Forwards the request to the workers through the request queue.
         """
 
+        # Sticky fast-fail: don't accept new work once the engine is known dead.
+        if self._engine_dead or self._fatal_error is not None:
+            raise EngineDeadError(self._fatal_error)
+
         self._start_dispatch_threads()
 
         request.set_id(self._get_next_client_id())
@@ -497,12 +672,74 @@ class GenerationExecutorProxy(GenerationExecutor):
             logprob_params=logprob_params)
         self._results[request.id] = result
 
+        # Close the submit-vs-death race: _mark_engine_dead() runs on the
+        # error-monitor thread and its one-shot sweep snapshots _results, so a
+        # result registered just after that snapshot would never be unblocked
+        # and would hang forever on a dead worker. Re-check after registering
+        # and fail fast if the engine died in that window.
+        if self._engine_dead or self._fatal_error is not None:
+            self._results.pop(request.id, None)
+            raise EngineDeadError(self._fatal_error)
+
         with nvtx_range_debug("request_queue.put"):
             self.request_queue.put(request)
 
         self._handle_background_error()
 
         return result
+
+    def collective_rpc(
+        self,
+        method: str,
+        args: tuple = (),
+        kwargs: Optional[dict] = None,
+        non_block: bool = False,
+        unique_reply_rank: Optional[int] = None,
+        target_ranks: Optional[Union[int, List[int]]] = None,
+    ) -> List:
+        """Execute a method call on the rank-0 GPU worker via the RPC client.
+
+        Rank-0 RPC shim used for uniform dispatch from
+        :meth:`~tensorrt_llm.llmapi.llm.LLM._collective_rpc`.  Most methods
+        require ``model_world_size == 1``; ``sleep`` and ``wakeup`` are
+        explicitly allowed for multi-rank deployments because
+        :meth:`~tensorrt_llm.executor.base_worker.BaseWorker.sleep` and
+        :meth:`~tensorrt_llm.executor.base_worker.BaseWorker.wakeup` handle
+        cross-rank coordination internally via the control communicator.
+
+        Args:
+            method: Name of the worker method to invoke.
+            args: Positional arguments forwarded to the worker method.
+            kwargs: Keyword arguments forwarded to the worker method.
+            non_block: If ``True``, return a ``Future`` without waiting.
+            unique_reply_rank: Must be ``None``.
+            target_ranks: Must be ``None``.
+
+        Returns:
+            A list containing the single return value when ``non_block=False``,
+            or a list containing the pending
+            :class:`~concurrent.futures.Future` when ``non_block=True``.
+
+        Raises:
+            RuntimeError: If the RPC client has not been initialised yet.
+            NotImplementedError: If ``model_world_size > 1`` and the method
+                is not in the allowed-methods set (currently ``sleep`` and
+                ``wakeup``), or if ``unique_reply_rank`` or ``target_ranks``
+                are provided.
+        """
+        if self.rpc_client is None:
+            raise RuntimeError(
+                "RPC client is not initialised — collective_rpc() cannot be "
+                "called before the executor workers have started.")
+        _check_collective_rpc_guard(self.model_world_size,
+                                    unique_reply_rank,
+                                    target_ranks,
+                                    method=method)
+        kwargs = kwargs or {}
+        remote_call = getattr(self.rpc_client, method)(*args, **kwargs)
+        if non_block:
+            return [remote_call.remote_future()]
+        return [remote_call.remote()]
 
     def get_stats(self, timeout: float) -> List[dict]:
         """Get iteration statistics from the runtime via RPC.
@@ -519,6 +756,22 @@ class GenerationExecutorProxy(GenerationExecutor):
 
         stats = self.rpc_client.fetch_stats_wait_async(timeout=timeout).remote()
         return [json.loads(s) if isinstance(s, str) else s for s in stats]
+
+    def get_kv_cache_capacity(self) -> dict:
+        """Get static primary/GPU KV cache capacity from the runtime via RPC."""
+        if self.rpc_client is None:
+            logger.warning(
+                "RPC client not initialized, cannot get kv cache capacity")
+            return {}
+
+        try:
+            capacity = self.rpc_client.fetch_kv_cache_capacity_async().remote()
+            if isinstance(capacity, str):
+                capacity = json.loads(capacity)
+            return capacity if isinstance(capacity, dict) else {}
+        except (RPCError, json.JSONDecodeError) as e:
+            logger.debug(f"Error fetching kv cache capacity via RPC: {e}")
+            return {}
 
     def get_disaggregated_params(self) -> dict:
         """Get disaggregated params from worker runtime via RPC."""

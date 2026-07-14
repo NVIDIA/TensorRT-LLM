@@ -2,6 +2,7 @@ import abc
 import asyncio
 import importlib.metadata as importlib_metadata
 import importlib.util
+import ipaddress
 import sys
 import time
 from dataclasses import dataclass
@@ -16,6 +17,30 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from tensorrt_llm.logger import logger
+
+
+def is_loopback_host(host: Optional[str]) -> bool:
+    if not isinstance(host, str) or not host:
+        return False
+    if host.lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def validate_http_cluster_storage_scope(cluster_uri: str,
+                                        server_host: str) -> None:
+    parsed_uri = urlparse(cluster_uri)
+    if parsed_uri.scheme not in ("http", "https"):
+        return
+    if is_loopback_host(parsed_uri.hostname) and is_loopback_host(server_host):
+        return
+    raise ValueError(
+        "HTTP cluster storage is only supported for loopback-only "
+        "disaggregated serving. Use a loopback disagg_cluster.cluster_uri and "
+        "hostname, or use etcd for cluster storage.")
 
 
 def _find_module_file_in_distribution(dist, module_name: str):

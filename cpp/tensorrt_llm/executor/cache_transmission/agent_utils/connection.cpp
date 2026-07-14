@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -18,6 +18,7 @@
 #include "connection.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/executor/cache_transmission/cacheSplitConcat.h"
+#include <limits>
 #include <random>
 #include <string>
 #include <unistd.h>
@@ -54,11 +55,8 @@ std::string genUniqueAgentName()
 // layer num, since the buffer size is ratio is equal to the layer num ratio
 // except the VSWA case.
 
-template <typename CacheStateT>
-auto computeSendOffsetRatio(
-    CacheStateT const& peerCacheState, int peerIdx, CacheStateT const& selfCacheState, int connectionIdx)
+auto computeSendOffsetRatio(TargetRanksInfo const& peerTargetInfo, int connectionIdx)
 {
-    auto peerTargetInfo = targetIRanks(selfCacheState, peerCacheState, peerIdx);
     size_t offsetLayer = 0;
     for (int i = 0; i < connectionIdx; i++)
     {
@@ -68,6 +66,46 @@ auto computeSendOffsetRatio(
     size_t selfSendLayer = peerTargetInfo.getPeerPPDomainLayerNum(connectionIdx);
     return std::make_pair(offsetLayer, selfSendLayer);
 }
+
+namespace
+{
+
+bool isValidBufferKind(uint8_t kind)
+{
+    switch (static_cast<batch_manager::BufferKind>(kind))
+    {
+    case batch_manager::BufferKind::kKV:
+    case batch_manager::BufferKind::kKV_INDEXER:
+    case batch_manager::BufferKind::kRNN: return true;
+    }
+    return false;
+}
+
+AgentState const* findAgentState(CommState const& commState, std::string const& agentName)
+{
+    if (!commState.isAgentState())
+    {
+        return nullptr;
+    }
+    for (auto const& agentState : commState.getAgentState())
+    {
+        if (agentState.mAgentName == agentName)
+        {
+            return &agentState;
+        }
+    }
+    return nullptr;
+}
+
+void validateConnectionIdx(
+    int connectionIdx, TargetRanksInfo const& targetInfo, char const* bufferKind, std::string const& remoteAgentName)
+{
+    TLLM_CHECK_WITH_INFO(static_cast<size_t>(connectionIdx) < targetInfo.mIRanks.size(),
+        "AgentConnectionManager received %s connection index %d outside target rank count %zu from agent '%s'",
+        bufferKind, connectionIdx, targetInfo.mIRanks.size(), remoteAgentName.c_str());
+}
+
+} // namespace
 
 AgentConnection::AgentConnection(
     std::string mAgentName, std::string mRemoteAgentName, AgentConnectionManager* mAgentConnectionManager)
@@ -132,7 +170,15 @@ void AgentConnection::send(DataContext const& ctx, void const* data, size_t size
     MemoryDescs srcDescs{MemoryType::kVRAM, {srcDesc}};
     auto const& dstBaseDesc = mSenderState.activeBufferDesc();
     auto const& offsetRatio = mSenderState.activeOffsetRatio();
-    auto offset = size / offsetRatio.second * offsetRatio.first;
+    TLLM_CHECK_WITH_INFO(offsetRatio.second != 0, "AgentConnection::send offset ratio denominator cannot be 0");
+    TLLM_CHECK_WITH_INFO(size <= dstBaseDesc.getLen(), "AgentConnection::send size exceeds destination buffer");
+    auto const chunkSize = size / offsetRatio.second;
+    TLLM_CHECK_WITH_INFO(offsetRatio.first == 0 || chunkSize <= std::numeric_limits<size_t>::max() / offsetRatio.first,
+        "AgentConnection::send offset calculation overflow");
+    auto const offset = chunkSize * offsetRatio.first;
+    TLLM_CHECK_WITH_INFO(offset <= dstBaseDesc.getLen() - size, "AgentConnection::send destination out of bounds");
+    TLLM_CHECK_WITH_INFO(dstBaseDesc.getAddr() <= std::numeric_limits<uintptr_t>::max() - offset,
+        "AgentConnection::send destination address overflow");
     MemoryDesc dstDesc{dstBaseDesc.getAddr() + offset, size, dstBaseDesc.getDeviceId()};
     TLLM_LOG_DEBUG(
         "send dstDesc: %p, size: %ld ,validSegmentIdx: %ld", dstDesc.getAddr(), size, mSenderState.validSegmentIdx);
@@ -386,13 +432,75 @@ AgentConnection const* AgentConnectionManager::recvConnectionAndRequestInfo(
 
                     erase = true;
                     requestInfo = requestAndBufferInfo.mRequestInfo;
-                    auto address = requestAndBufferInfo.mAddress;
-                    auto bufferDescs = std::move(requestAndBufferInfo.mBufferDescs);
+                    auto const& address = requestAndBufferInfo.mAddress;
+                    auto const& bufferDescsRef = requestAndBufferInfo.mBufferDescs;
                     auto metadataOpt = requestAndBufferInfo.mMetadata;
-                    auto connectionIdx = requestAndBufferInfo.mValidConnectionIdx;
-                    auto remoteAgentName = requestAndBufferInfo.mAgentName;
+                    auto const connectionIdx = requestAndBufferInfo.mValidConnectionIdx;
+                    auto const& remoteAgentName = requestAndBufferInfo.mAgentName;
+                    auto const& bufferKindsRef = requestAndBufferInfo.mBufferKinds;
+
+                    TLLM_CHECK_WITH_INFO(agent == remoteAgentName,
+                        "AgentConnectionManager received RequestAndBufferInfo from '%s' with embedded agent '%s'",
+                        agent.c_str(), remoteAgentName.c_str());
+                    auto const* expectedAgentState = findAgentState(mCommState, remoteAgentName);
+                    if (expectedAgentState != nullptr)
+                    {
+                        TLLM_CHECK_WITH_INFO(address == expectedAgentState->mConnectionInfo,
+                            "AgentConnectionManager received mismatched connection info for agent '%s'",
+                            remoteAgentName.c_str());
+                    }
+                    else
+                    {
+                        std::scoped_lock remoteInfoLock(mRemoteConnectionInfoMutex);
+                        auto [remoteInfoIt, inserted] = mRemoteConnectionInfo.emplace(remoteAgentName, address);
+                        TLLM_CHECK_WITH_INFO(inserted || remoteInfoIt->second == address,
+                            "AgentConnectionManager received mismatched connection info for dynamic agent '%s'",
+                            remoteAgentName.c_str());
+                    }
+                    TLLM_CHECK_WITH_INFO(connectionIdx >= 0,
+                        "AgentConnectionManager received negative connection index for agent '%s'",
+                        remoteAgentName.c_str());
+                    TLLM_CHECK_WITH_INFO(!bufferDescsRef.empty(),
+                        "AgentConnectionManager received empty destination descriptors from agent '%s'",
+                        remoteAgentName.c_str());
+                    TLLM_CHECK_WITH_INFO(bufferDescsRef.size() == bufferKindsRef.size(),
+                        "AgentConnectionManager received %zu descriptors but %zu buffer kinds from agent '%s'",
+                        bufferDescsRef.size(), bufferKindsRef.size(), remoteAgentName.c_str());
+                    TLLM_CHECK_WITH_INFO(bufferDescsRef.size() <= mCacheTransBufferManagers.size(),
+                        "AgentConnectionManager received too many destination descriptors from agent '%s'",
+                        remoteAgentName.c_str());
+                    for (auto const kind : bufferKindsRef)
+                    {
+                        TLLM_CHECK_WITH_INFO(isValidBufferKind(kind),
+                            "AgentConnectionManager received invalid buffer kind %u from agent '%s'",
+                            static_cast<unsigned>(kind), remoteAgentName.c_str());
+                        bool isConfiguredKind = false;
+                        for (auto const configuredKind : mBufferKinds)
+                        {
+                            if (configuredKind == kind)
+                            {
+                                isConfiguredKind = true;
+                                break;
+                            }
+                        }
+                        TLLM_CHECK_WITH_INFO(isConfiguredKind,
+                            "AgentConnectionManager received unconfigured buffer kind %u from agent '%s'",
+                            static_cast<unsigned>(kind), remoteAgentName.c_str());
+                    }
+                    TLLM_CHECK_WITH_INFO(requestInfo.getTransState().getCacheState().has_value(),
+                        "AgentConnectionManager received request without cache state from agent '%s'",
+                        remoteAgentName.c_str());
+                    TLLM_CHECK_WITH_INFO(requestInfo.getTransState().getCommState().has_value(),
+                        "AgentConnectionManager received request without comm state from agent '%s'",
+                        remoteAgentName.c_str());
+
                     TLLM_LOG_DEBUG(" recv Address:%s", address.c_str());
                     auto connection = connect(remoteAgentName, address, metadataOpt, true);
+                    TLLM_CHECK_WITH_INFO(
+                        m_Agent->checkRemoteDescs(remoteAgentName, MemoryDescs{MemoryType::kVRAM, bufferDescsRef}),
+                        "AgentConnectionManager received unregistered destination descriptors from agent '%s'",
+                        remoteAgentName.c_str());
+                    auto bufferDescs = std::move(requestAndBufferInfo.mBufferDescs);
                     auto bufferKinds = std::move(requestAndBufferInfo.mBufferKinds);
 
                     std::optional<std::pair<size_t, size_t>> kvOffsetRatio;
@@ -410,10 +518,11 @@ AgentConnection const* AgentConnectionManager::recvConnectionAndRequestInfo(
                         {
                             if (!kvOffsetRatio)
                             {
-                                kvOffsetRatio
-                                    = computeSendOffsetRatio(requestInfo.getTransState().getCacheState().value(),
-                                        requestInfo.getTransState().getCommState()->getSelfIdx(), mCacheState,
-                                        connectionIdx);
+                                auto kvTargetInfo
+                                    = targetIRanks(mCacheState, requestInfo.getTransState().getCacheState().value(),
+                                        requestInfo.getTransState().getCommState()->getSelfIdx());
+                                validateConnectionIdx(connectionIdx, kvTargetInfo, "KV", remoteAgentName);
+                                kvOffsetRatio = computeSendOffsetRatio(kvTargetInfo, connectionIdx);
                             }
                             offsetRatios.push_back(*kvOffsetRatio);
                             break;
@@ -425,6 +534,7 @@ AgentConnection const* AgentConnectionManager::recvConnectionAndRequestInfo(
                                 auto rnnTargetInfo = targetIRanksForRnn(mCacheState,
                                     requestInfo.getTransState().getCacheState().value(),
                                     requestInfo.getTransState().getCommState()->getSelfIdx());
+                                validateConnectionIdx(connectionIdx, rnnTargetInfo, "RNN", remoteAgentName);
                                 size_t rnnOffsetLayer = 0;
                                 for (int ri = 0; ri < connectionIdx; ri++)
                                 {

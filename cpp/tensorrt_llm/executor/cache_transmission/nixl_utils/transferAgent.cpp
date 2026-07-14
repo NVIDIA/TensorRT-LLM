@@ -29,11 +29,13 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <ifaddrs.h>
+#include <mutex>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <nixl_types.h>
 #include <numeric>
 #include <set>
+#include <shared_mutex>
 #include <sys/file.h>
 #include <sys/stat.h>
 #include <thread>
@@ -316,12 +318,38 @@ void NixlHelper::posixFileToGpuFallback(MemoryDescs const& memoryDescs, FileDesc
     }
 }
 
-NixlTransferStatus::NixlTransferStatus(nixlAgent* agent, nixlXferReqH* handle)
-    : mRawAgent{agent}
+NixlTransferStatus::NixlTransferStatus(std::weak_ptr<nixlAgent> agent, nixlXferReqH* handle)
+    : mWeakAgent{std::move(agent)}
     , mHandle{handle}
 {
-    TLLM_CHECK(mRawAgent);
+    TLLM_CHECK(!mWeakAgent.expired());
     TLLM_CHECK(mHandle);
+}
+
+NixlTransferStatus::~NixlTransferStatus() noexcept
+{
+    if (mHandle == nullptr)
+    {
+        return;
+    }
+    // Skip release if the owning agent was reset; the underlying nixlXferReqH is already gone.
+    auto agent = mWeakAgent.lock();
+    if (!agent)
+    {
+        return;
+    }
+    try
+    {
+        agent->releaseXferReq(mHandle);
+    }
+    catch (std::exception const& e)
+    {
+        TLLM_LOG_WARNING("~NixlTransferStatus: releaseXferReq threw: %s", e.what());
+    }
+    catch (...)
+    {
+        TLLM_LOG_WARNING("~NixlTransferStatus: releaseXferReq threw unknown exception");
+    }
 }
 
 [[nodiscard]] MemoryDescs NixlHelper::coalesceMemoryDescs(MemoryDescs const& descs)
@@ -488,7 +516,15 @@ TransferState NixlTransferStatus::wait(int64_t timeout_ms) const
 
     while (true)
     {
-        auto status = mRawAgent->getXferStatus(mHandle);
+        auto agent = mWeakAgent.lock();
+        if (!agent)
+        {
+            // Owning agent was reset; report failure so callers don't deref a null status.
+            mLastStatus.store(static_cast<int>(NIXL_ERR_INVALID_PARAM), std::memory_order_relaxed);
+            return TransferState::kFAILURE;
+        }
+        auto status = agent->getXferStatus(mHandle);
+        mLastStatus.store(static_cast<int>(status), std::memory_order_relaxed);
         if (status == NIXL_SUCCESS)
         {
             return TransferState::kSUCCESS;
@@ -518,88 +554,27 @@ TransferState NixlTransferStatus::wait(int64_t timeout_ms) const
     }
 }
 
-[[nodiscard]] bool NixlTransferStatus::isCompleted() const
+int NixlTransferStatus::getLastStatus() const noexcept
 {
-    return mRawAgent->getXferStatus(mHandle) == NIXL_SUCCESS;
+    return mLastStatus.load(std::memory_order_relaxed);
 }
 
-[[nodiscard]] MemoryDescs NixlHelper::splitVmmDescs(MemoryDescs const& descs, size_t& detectedChunkSize)
+std::string NixlTransferStatus::getLastStatusStr() const
 {
-    detectedChunkSize = 0;
-    auto const& descVec = descs.getDescs();
-    if (descVec.empty() || descs.getType() != MemoryType::kVRAM)
-        return descs;
+    return nixlEnumStrings::statusStr(static_cast<nixl_status_t>(getLastStatus()));
+}
 
-    std::vector<MemoryDesc> result;
-    result.reserve(descVec.size());
-
-    for (auto const& desc : descVec)
+[[nodiscard]] bool NixlTransferStatus::isCompleted() const
+{
+    auto agent = mWeakAgent.lock();
+    if (!agent)
     {
-        uintptr_t addr = desc.getAddr();
-        size_t len = desc.getLen();
-        uint32_t deviceId = desc.getDeviceId();
-
-        if (len == 0)
-            continue;
-
-        // Query start and end of the descriptor
-        CUdeviceptr startBase = 0;
-        size_t startSize = 0;
-        CUresult startErr = cuMemGetAddressRange(&startBase, &startSize, static_cast<CUdeviceptr>(addr));
-
-        CUdeviceptr endBase = 0;
-        size_t endSize = 0;
-        CUresult endErr = cuMemGetAddressRange(&endBase, &endSize, static_cast<CUdeviceptr>(addr + len - 1));
-
-        // If either query fails, or both are in the same allocation -> no split needed
-        if (startErr != CUDA_SUCCESS || endErr != CUDA_SUCCESS || startBase == endBase)
-        {
-            result.emplace_back(addr, len, deviceId);
-            continue;
-        }
-
-        // Multi-chunk VMM detected: use first chunk's size as uniform chunk size
-        size_t chunkSize = startSize;
-
-        TLLM_CHECK_WITH_INFO(endSize == chunkSize,
-            "VMM chunk size mismatch: first chunk %zu bytes, last chunk %zu bytes. "
-            "All VMM chunks must be the same size.",
-            chunkSize, endSize);
-
-        TLLM_CHECK_WITH_INFO(addr % chunkSize == 0,
-            "VMM descriptor start address 0x%lx is not aligned to chunk size %zu. "
-            "Pool base address must be chunk-aligned.",
-            static_cast<unsigned long>(addr), chunkSize);
-
-        if (detectedChunkSize > 0)
-        {
-            TLLM_CHECK_WITH_INFO(chunkSize == detectedChunkSize,
-                "Inconsistent VMM chunk sizes across descriptors: %zu vs %zu. "
-                "All VMM pools must use the same chunk size.",
-                chunkSize, detectedChunkSize);
-        }
-        detectedChunkSize = chunkSize;
-
-        uintptr_t current = addr;
-        size_t remaining = len;
-
-        while (remaining > 0)
-        {
-            size_t offsetInChunk = static_cast<size_t>(current % chunkSize);
-            size_t pieceSize = std::min(remaining, chunkSize - offsetInChunk);
-            result.emplace_back(current, pieceSize, deviceId);
-            current += pieceSize;
-            remaining -= pieceSize;
-        }
+        mLastStatus.store(static_cast<int>(NIXL_ERR_INVALID_PARAM), std::memory_order_relaxed);
+        return false;
     }
-
-    if (result.size() != descVec.size())
-    {
-        TLLM_LOG_DEBUG("NixlHelper::splitVmmDescs: split %zu -> %zu VRAM entries (chunkSize=%zu)", descVec.size(),
-            result.size(), detectedChunkSize);
-    }
-
-    return MemoryDescs{descs.getType(), std::move(result)};
+    auto status = agent->getXferStatus(mHandle);
+    mLastStatus.store(static_cast<int>(status), std::memory_order_relaxed);
+    return status == NIXL_SUCCESS;
 }
 
 NixlTransferAgent::NixlTransferAgent(BaseAgentConfig const& config)
@@ -621,7 +596,7 @@ NixlTransferAgent::NixlTransferAgent(BaseAgentConfig const& config)
         nixlAgentConfig nixlConfig{config.useProgThread, true, port, nixl_thread_sync_t::NIXL_THREAD_SYNC_DEFAULT,
             numWorker, 0, 10000, config.enableTelemetry};
         mAddress = getAvailableIP() + ":" + std::to_string(port);
-        mRawAgent = std::make_unique<nixlAgent>(config.mName, std::move(nixlConfig));
+        mRawAgent = std::make_shared<nixlAgent>(config.mName, std::move(nixlConfig));
     }
     else
     {
@@ -631,7 +606,7 @@ NixlTransferAgent::NixlTransferAgent(BaseAgentConfig const& config)
         mAddress.clear();
         nixlAgentConfig nixlConfig{config.useProgThread, false, 0, nixl_thread_sync_t::NIXL_THREAD_SYNC_DEFAULT,
             numWorker, 0, 10000, config.enableTelemetry};
-        mRawAgent = std::make_unique<nixlAgent>(config.mName, std::move(nixlConfig));
+        mRawAgent = std::make_shared<nixlAgent>(config.mName, std::move(nixlConfig));
     }
 
     std::string nixlBackend = common::getEnvNixlBackend();
@@ -667,44 +642,20 @@ NixlTransferAgent::NixlTransferAgent(BaseAgentConfig const& config)
     }
     mExtraParams.backends.push_back(mRawBackend);
     TLLM_LOG_INFO("NixlTransferAgent::NixlTransferAgent mAddress: %s", mAddress.c_str());
-    mDRamSrcBuffer.resize(16);
-    mDRamDstBuffer.resize(16);
-    MemoryDescs descs{MemoryType::kDRAM, {MemoryDesc{mDRamSrcBuffer}, MemoryDesc{mDRamDstBuffer}}};
-    registerMemory(descs);
 }
 
 void NixlTransferAgent::registerMemory(RegisterDescs const& descs)
 {
+    std::unique_lock<std::shared_mutex> lock(mLock);
+    TLLM_CHECK_WITH_INFO(!mShutdown.load(), "NixlTransferAgent::registerMemory called after shutdown");
     // Split VRAM descriptors at VMM chunk boundaries so each sub-descriptor
     // falls within a single cuMemCreate allocation (required by gdr_copy / cuda_ipc).
     size_t detectedChunkSize = 0;
-    auto splitDescs = NixlHelper::splitVmmDescs(descs, detectedChunkSize);
+    auto splitDescs = VmmDescSplitter::splitVmmDescs(descs, detectedChunkSize);
 
     // Record per-desc VMM chunk info for use in deregisterMemory / submitTransferRequests
-    if (descs.getType() == MemoryType::kVRAM)
-    {
-        for (auto const& desc : descs.getDescs())
-        {
-            // Detect VMM chunk size for this specific descriptor
-            uintptr_t addr = desc.getAddr();
-            size_t len = desc.getLen();
-            size_t chunkSize = 0;
-
-            if (len > 1)
-            {
-                CUdeviceptr startBase = 0, endBase = 0;
-                size_t startSize = 0, endSize = 0;
-                CUresult startErr = cuMemGetAddressRange(&startBase, &startSize, static_cast<CUdeviceptr>(addr));
-                CUresult endErr = cuMemGetAddressRange(&endBase, &endSize, static_cast<CUdeviceptr>(addr + len - 1));
-                if (startErr == CUDA_SUCCESS && endErr == CUDA_SUCCESS && startBase != endBase)
-                {
-                    chunkSize = startSize;
-                }
-            }
-
-            mVramRegionInfo[addr] = {len, chunkSize};
-        }
-    }
+    auto detectedRegionMap = VmmDescSplitter::detectVramRegionMap(descs);
+    mLocalVramRegionInfo.merge(detectedRegionMap);
 
     // Coalesce contiguous memory regions to reduce registration overhead (disabled by default)
     // Set TRTLLM_NIXL_ENABLE_COALESCE=1 to enable this optimization
@@ -721,8 +672,10 @@ void NixlTransferAgent::registerMemory(RegisterDescs const& descs)
 
 void NixlTransferAgent::deregisterMemory(RegisterDescs const& descs)
 {
+    std::unique_lock<std::shared_mutex> lock(mLock);
+    TLLM_CHECK_WITH_INFO(!mShutdown.load(), "NixlTransferAgent::deregisterMemory called after shutdown");
     // Split using per-region registry info to match what was registered
-    auto splitDescs = splitDescsFromRegistry(descs);
+    auto splitDescs = VmmDescSplitter::splitDescsWithRegionMap(descs, mLocalVramRegionInfo);
 
     // Coalesce contiguous memory regions to match what was registered (disabled by default)
     // Set TRTLLM_NIXL_ENABLE_COALESCE=1 to enable this optimization
@@ -737,53 +690,99 @@ void NixlTransferAgent::deregisterMemory(RegisterDescs const& descs)
     {
         for (auto const& desc : descs.getDescs())
         {
-            mVramRegionInfo.erase(desc.getAddr());
+            mLocalVramRegionInfo.erase(desc.getAddr());
         }
     }
 }
 
 void NixlTransferAgent::loadRemoteAgent(std::string const& name, AgentDesc const& agentDesc)
 {
+    std::unique_lock<std::shared_mutex> lock(mLock);
+    TLLM_CHECK_WITH_INFO(!mShutdown.load(), "NixlTransferAgent::loadRemoteAgent called after shutdown");
     nixl_status_t status;
     std::string remoteName;
     status = mRawAgent->loadRemoteMD(agentDesc.getBackendAgentDesc(), remoteName);
     TLLM_CHECK(status == NIXL_SUCCESS);
     TLLM_CHECK_WITH_INFO(
         name == remoteName, "loadRemoteAgent gets error agent name: %s != %s", name.c_str(), remoteName.c_str());
+
+    // Store remote VMM region info for chunk boundary calculations in
+    // VmmDescSplitter::splitTransferDescsWithRegionMaps. Per-agent map because different remote agents may have
+    // overlapping virtual addresses.
+    auto const& regions = agentDesc.getVramRegions();
+    if (!regions.empty())
+    {
+        auto& remoteMap = mRemoteVramRegionInfo[name];
+        for (auto const& r : regions)
+        {
+            remoteMap[r.baseAddr] = {r.totalLen, r.chunkSize};
+        }
+    }
 }
 
 AgentDesc NixlTransferAgent::getLocalAgentDesc()
 {
-    nixl_blob_t desc;
-    nixl_status_t status = mRawAgent->getLocalMD(desc);
+    std::shared_lock<std::shared_mutex> lock(mLock);
+    TLLM_CHECK_WITH_INFO(!mShutdown.load(), "NixlTransferAgent::getLocalAgentDesc called after shutdown");
+    nixl_blob_t nixlBlob;
+    nixl_status_t status = mRawAgent->getLocalMD(nixlBlob);
     TLLM_CHECK(status == NIXL_SUCCESS);
-    return AgentDesc{desc};
+
+    // Pack local VMM region info so remote agents can compute chunk boundaries.
+    std::vector<VramRegionMeta> regions;
+    for (auto const& [base, info] : mLocalVramRegionInfo)
+    {
+        if (info.chunkSize > 0)
+        {
+            regions.push_back({base, info.totalLen, info.chunkSize});
+        }
+    }
+
+    return AgentDesc{nixlBlob, std::move(regions)};
 }
 
 void NixlTransferAgent::invalidateRemoteAgent(std::string const& name)
 {
+    std::unique_lock<std::shared_mutex> lock(mLock);
+    if (mShutdown.load())
+    {
+        // shutdown() already cleaned everything; treat as no-op for late callers.
+        return;
+    }
+    // Clean up remote VMM region info before invalidating the remote agent.
+    mRemoteVramRegionInfo.erase(name);
     mRawAgent->invalidateRemoteMD(name);
 }
 
 [[nodiscard]] std::unique_ptr<TransferStatus> NixlTransferAgent::submitTransferRequests(TransferRequest const& request)
 {
+    std::shared_lock<std::shared_mutex> lock(mLock);
+    TLLM_CHECK_WITH_INFO(!mShutdown.load(), "NixlTransferAgent::submitTransferRequests called after shutdown");
     nixl_status_t status;
     nixlXferReqH* handle;
 
+    // Local per-request copy: hasNotif / notifMsg vary per call; a shared mExtraParams
+    // would race between concurrent submits even under shared_lock.
+    nixl_opt_args_t reqParams = mExtraParams;
     if (request.getSyncMessage().has_value())
     {
-        mExtraParams.hasNotif = true;
-
-        mExtraParams.notifMsg = request.getSyncMessage().value();
+        reqParams.hasNotif = true;
+        reqParams.notifMsg = request.getSyncMessage().value();
     }
     else
     {
-        mExtraParams.hasNotif = false;
+        reqParams.hasNotif = false;
     }
     // Split transfer descriptors at VMM chunk boundaries to match registered memory.
     // Both src and dst are split at chunk boundaries to ensure each descriptor
     // falls within a single registered memory region on both local and remote sides.
-    auto [splitSrc, splitDst] = splitTransferDescsFromRegistry(request.getSrcDescs(), request.getDstDescs());
+    // Find remote agent's VMM region map (empty map if not found).
+    static VramRegionMap const kEmptyMap;
+    auto remoteIt = mRemoteVramRegionInfo.find(request.getRemoteName());
+    auto const& remoteRegionMap = (remoteIt != mRemoteVramRegionInfo.end()) ? remoteIt->second : kEmptyMap;
+
+    auto [splitSrc, splitDst] = VmmDescSplitter::splitTransferDescsWithRegionMaps(
+        request.getSrcDescs(), request.getDstDescs(), mLocalVramRegionInfo, remoteRegionMap);
 
     // Coalesce contiguous memory regions to reduce transfer count (disabled by default)
     // This matches the coalescing done during registerMemory()
@@ -794,13 +793,12 @@ void NixlTransferAgent::invalidateRemoteAgent(std::string const& name)
         auto [coalescedSrc, coalescedDst] = NixlHelper::coalesceTransferDescs(splitSrc, splitDst);
         status
             = mRawAgent->createXferReq(NixlHelper::convert(request.getOp()), NixlHelper::convertXferDist(coalescedSrc),
-                NixlHelper::convertXferDist(coalescedDst), request.getRemoteName(), handle, &mExtraParams);
+                NixlHelper::convertXferDist(coalescedDst), request.getRemoteName(), handle, &reqParams);
     }
     else
     {
-        NVTX3_SCOPED_RANGE(createXferReq);
         status = mRawAgent->createXferReq(NixlHelper::convert(request.getOp()), NixlHelper::convertXferDist(splitSrc),
-            NixlHelper::convertXferDist(splitDst), request.getRemoteName(), handle, &mExtraParams);
+            NixlHelper::convertXferDist(splitDst), request.getRemoteName(), handle, &reqParams);
     }
 
     TLLM_CHECK_WITH_INFO(status == NIXL_SUCCESS,
@@ -809,14 +807,15 @@ void NixlTransferAgent::invalidateRemoteAgent(std::string const& name)
         request.getRemoteName().c_str());
     {
         NVTX3_SCOPED_RANGE(postXferReq);
-        status = mRawAgent->postXferReq(handle, &mExtraParams);
+        status = mRawAgent->postXferReq(handle, &reqParams);
     }
-    return std::make_unique<NixlTransferStatus>(mRawAgent.get(), handle);
+    return std::make_unique<NixlTransferStatus>(std::weak_ptr<nixlAgent>(mRawAgent), handle);
 }
 
 void NixlTransferAgent::notifySyncMessage(std::string const& name, SyncMessage const& syncMessage)
 {
-
+    std::shared_lock<std::shared_mutex> lock(mLock);
+    TLLM_CHECK_WITH_INFO(!mShutdown.load(), "NixlTransferAgent::notifySyncMessage called after shutdown");
     auto status = mRawAgent->genNotif(name, syncMessage);
     TLLM_CHECK_WITH_INFO(
         status == NIXL_SUCCESS, "genNotif failed with status: %s", nixlEnumStrings::statusStr(status).c_str());
@@ -824,7 +823,8 @@ void NixlTransferAgent::notifySyncMessage(std::string const& name, SyncMessage c
 
 [[nodiscard]] std::unordered_map<std::string, std::vector<SyncMessage>> NixlTransferAgent::getNotifiedSyncMessages()
 {
-
+    std::shared_lock<std::shared_mutex> lock(mLock);
+    TLLM_CHECK_WITH_INFO(!mShutdown.load(), "NixlTransferAgent::getNotifiedSyncMessages called after shutdown");
     nixl_notifs_t notifs;
     auto status = mRawAgent->getNotifs(notifs);
     TLLM_CHECK_WITH_INFO(
@@ -835,11 +835,14 @@ void NixlTransferAgent::notifySyncMessage(std::string const& name, SyncMessage c
 
 ConnectionInfoType NixlTransferAgent::getLocalConnectionInfo()
 {
+    // mAddress is set in ctor and never mutated; no lock needed.
     return mAddress;
 }
 
 void NixlTransferAgent::loadRemoteAgent(std::string const& name, ConnectionInfoType const& connectionInfo)
 {
+    std::unique_lock<std::shared_mutex> lock(mLock);
+    TLLM_CHECK_WITH_INFO(!mShutdown.load(), "NixlTransferAgent::loadRemoteAgent called after shutdown");
     std::string ip = connectionInfo.substr(0, connectionInfo.find(":"));
     std::string port = connectionInfo.substr(connectionInfo.find(":") + 1);
     TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
@@ -876,116 +879,67 @@ void NixlTransferAgent::loadRemoteAgent(std::string const& name, ConnectionInfoT
 
 bool NixlTransferAgent::checkRemoteDescs(std::string const& name, MemoryDescs const& memoryDescs)
 {
+    std::shared_lock<std::shared_mutex> lock(mLock);
+    TLLM_CHECK_WITH_INFO(!mShutdown.load(), "NixlTransferAgent::checkRemoteDescs called after shutdown");
     auto status = mRawAgent->checkRemoteMD(name, NixlHelper::convertXferDist(memoryDescs));
     TLLM_CHECK_WITH_INFO(status == NIXL_SUCCESS || status == NIXL_ERR_NOT_FOUND, "checkRemoteMD failed with status: %s",
         nixlEnumStrings::statusStr(status).c_str());
     return status == NIXL_SUCCESS;
 }
 
-size_t NixlTransferAgent::lookupChunkSize(uintptr_t addr) const
+void NixlTransferAgent::shutdown() noexcept
 {
-    auto it = mVramRegionInfo.upper_bound(addr);
-    if (it != mVramRegionInfo.begin())
+    // unique_lock drains all in-flight shared_lock holders (submit / getDesc / etc.).
+    // A concurrent second shutdown() blocks here, then sees mShutdown=true and returns.
+    std::unique_lock<std::shared_mutex> lock(mLock);
+    if (mShutdown.exchange(true))
     {
-        --it;
-        if (addr >= it->first && addr < it->first + it->second.totalLen)
-        {
-            return it->second.chunkSize;
-        }
+        return;
     }
-    return 0;
-}
+    TLLM_LOG_DEBUG("NixlTransferAgent::shutdown");
 
-MemoryDescs NixlTransferAgent::splitDescsFromRegistry(MemoryDescs const& descs) const
-{
-    if (descs.getType() != MemoryType::kVRAM)
-        return descs;
-
-    auto const& descVec = descs.getDescs();
-    if (descVec.empty())
-        return descs;
-
-    std::vector<MemoryDesc> result;
-    result.reserve(descVec.size());
-
-    for (auto const& desc : descVec)
+    if (mRawAgent)
     {
-        size_t chunkSize = lookupChunkSize(desc.getAddr());
-        if (chunkSize == 0)
+        // Inline invalidate: invalidateRemoteAgent() would re-enter the non-recursive lock.
+        for (auto const& [name, _] : mRemoteVramRegionInfo)
         {
-            result.push_back(desc);
-            continue;
-        }
-
-        uintptr_t addr = desc.getAddr();
-        size_t remaining = desc.getLen();
-        uint32_t deviceId = desc.getDeviceId();
-
-        while (remaining > 0)
-        {
-            size_t offsetInChunk = static_cast<size_t>(addr % chunkSize);
-            size_t pieceSize = std::min(remaining, chunkSize - offsetInChunk);
-            result.emplace_back(addr, pieceSize, deviceId);
-            addr += pieceSize;
-            remaining -= pieceSize;
+            try
+            {
+                mRawAgent->invalidateRemoteMD(name);
+            }
+            catch (std::exception const& e)
+            {
+                TLLM_LOG_WARNING(
+                    "NixlTransferAgent::shutdown: invalidateRemoteMD(%s) threw: %s", name.c_str(), e.what());
+            }
+            catch (...)
+            {
+            }
         }
     }
 
-    return MemoryDescs{descs.getType(), std::move(result)};
-}
-
-std::pair<MemoryDescs, MemoryDescs> NixlTransferAgent::splitTransferDescsFromRegistry(
-    MemoryDescs const& srcDescs, MemoryDescs const& dstDescs) const
-{
-    NVTX3_SCOPED_RANGE(splitTransferDescsFromRegistry);
-    if (srcDescs.getType() != MemoryType::kVRAM)
-        return {srcDescs, dstDescs};
-
-    auto const& srcVec = srcDescs.getDescs();
-    auto const& dstVec = dstDescs.getDescs();
-    TLLM_CHECK(srcVec.size() == dstVec.size());
-
-    std::vector<MemoryDesc> splitSrc, splitDst;
-    splitSrc.reserve(srcVec.size());
-    splitDst.reserve(dstVec.size());
-
-    for (size_t i = 0; i < srcVec.size(); ++i)
+    mExtraParams.backends.clear();
+    mRawBackend = nullptr;
+    try
     {
-        size_t chunkSize = lookupChunkSize(srcVec[i].getAddr());
-        if (chunkSize == 0)
-        {
-            splitSrc.push_back(srcVec[i]);
-            splitDst.push_back(dstVec[i]);
-            continue;
-        }
-
-        // Split at chunk boundaries for BOTH src and dst.
-        // Both sides may have VMM chunk boundaries that NIXL requires descriptors to respect.
-        uintptr_t srcAddr = srcVec[i].getAddr();
-        uintptr_t dstAddr = dstVec[i].getAddr();
-        size_t remaining = srcVec[i].getLen();
-
-        while (remaining > 0)
-        {
-            size_t srcOffsetInChunk = static_cast<size_t>(srcAddr % chunkSize);
-            size_t srcPieceSize = chunkSize - srcOffsetInChunk;
-            size_t dstOffsetInChunk = static_cast<size_t>(dstAddr % chunkSize);
-            size_t dstPieceSize = chunkSize - dstOffsetInChunk;
-            size_t pieceSize = std::min({remaining, srcPieceSize, dstPieceSize});
-            splitSrc.emplace_back(srcAddr, pieceSize, srcVec[i].getDeviceId());
-            splitDst.emplace_back(dstAddr, pieceSize, dstVec[i].getDeviceId());
-            srcAddr += pieceSize;
-            dstAddr += pieceSize;
-            remaining -= pieceSize;
-        }
+        mRawAgent.reset();
     }
-
-    return {MemoryDescs{srcDescs.getType(), std::move(splitSrc)}, MemoryDescs{dstDescs.getType(), std::move(splitDst)}};
+    catch (std::exception const& e)
+    {
+        TLLM_LOG_WARNING("NixlTransferAgent::shutdown: ~nixlAgent threw: %s", e.what());
+    }
+    catch (...)
+    {
+        TLLM_LOG_WARNING("NixlTransferAgent::shutdown: ~nixlAgent threw unknown exception");
+    }
+    mLocalVramRegionInfo.clear();
+    mRemoteVramRegionInfo.clear();
 }
 
 NixlTransferAgent::~NixlTransferAgent()
 {
     TLLM_LOG_DEBUG("NixlTransferAgent::~NixlTransferAgent");
+    shutdown();
 }
 
 NixlLoopbackAgent::NixlLoopbackAgent(BaseAgentConfig const& config)
@@ -996,7 +950,7 @@ NixlLoopbackAgent::NixlLoopbackAgent(BaseAgentConfig const& config)
     nixl_status_t status;
     nixl_b_params_t init;
 
-    mRawAgent = std::make_unique<nixlAgent>(config.mName, std::move(nixlConfig));
+    mRawAgent = std::make_shared<nixlAgent>(config.mName, std::move(nixlConfig));
     init["batch_pool_size"] = std::to_string(8);
     init["batch_limit"] = std::to_string(128);
     init["max_request_size"] = std::to_string(16 * 1024 * 1024);
@@ -1013,6 +967,33 @@ NixlLoopbackAgent::NixlLoopbackAgent(BaseAgentConfig const& config)
         if (status != NIXL_SUCCESS || !backend)
             TLLM_THROW("Failed to create NIXL GDS backend, status = %d", status);
     }
+}
+
+void NixlLoopbackAgent::shutdown() noexcept
+{
+    // unique_lock drains all in-flight shared_lock holders before destroying the agent.
+    std::unique_lock<std::shared_mutex> lock(mLock);
+    if (mShutdown.exchange(true))
+    {
+        return;
+    }
+    try
+    {
+        mRawAgent.reset();
+    }
+    catch (std::exception const& e)
+    {
+        TLLM_LOG_WARNING("NixlLoopbackAgent::shutdown: ~nixlAgent threw: %s", e.what());
+    }
+    catch (...)
+    {
+        TLLM_LOG_WARNING("NixlLoopbackAgent::shutdown: ~nixlAgent threw unknown exception");
+    }
+}
+
+NixlLoopbackAgent::~NixlLoopbackAgent()
+{
+    shutdown();
 }
 
 int NixlLoopbackAgent::registerMemory(MemoryDescs const& descs)
@@ -1066,12 +1047,14 @@ std::unique_ptr<TransferStatus> NixlLoopbackAgent::submitLoopbackRequests(
     status = mRawAgent->postXferReq(handle);
     TLLM_CHECK(status == NIXL_IN_PROG);
 
-    return std::make_unique<NixlTransferStatus>(mRawAgent.get(), handle);
+    return std::make_unique<NixlTransferStatus>(std::weak_ptr<nixlAgent>(mRawAgent), handle);
 }
 
 void NixlLoopbackAgent::executeLoopbackRequest(
     MemoryDescs const& memoryDescs, FileDescs const& fileDescs, bool isOffload)
 {
+    std::shared_lock<std::shared_mutex> lock(mLock);
+    TLLM_CHECK_WITH_INFO(!mShutdown.load(), "NixlLoopbackAgent::executeLoopbackRequest called after shutdown");
     bool fallback = false;
     int ret;
 

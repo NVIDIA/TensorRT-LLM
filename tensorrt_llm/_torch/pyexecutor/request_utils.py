@@ -33,13 +33,15 @@ def get_num_child_requests(request: ExecutorRequest) -> int:
 
 
 def collect_py_objects_from_requests(
-    requests: List, attribute_name: str
+    requests: List, attribute_name: str, include_none: bool = False
 ) -> Optional[Tuple[str, Dict]]:
     """Collect Python-only objects from requests.
 
     Args:
         requests: List of RequestQueueItem objects.
         attribute_name: Name of the attribute to collect.
+        include_none: Include requests whose attribute value is None. When
+            enabled, the source request must have the attribute.
 
     Returns:
         Tuple of (attribute_name, dict mapping request_id to object) or None if empty.
@@ -49,9 +51,12 @@ def collect_py_objects_from_requests(
         if not item.is_normal_request:
             continue
         if item.request:
-            obj = getattr(item.request, attribute_name, None)
-            if obj is not None:
-                req_id_to_obj[item.id] = obj
+            if include_none:
+                req_id_to_obj[item.id] = getattr(item.request, attribute_name)
+            else:
+                obj = getattr(item.request, attribute_name, None)
+                if obj is not None:
+                    req_id_to_obj[item.id] = obj
     return None if not req_id_to_obj else (attribute_name, req_id_to_obj)
 
 
@@ -65,9 +70,35 @@ def attach_py_objects_to_requests(requests: List, py_request_objects: Tuple) -> 
     for attr_name, req_obj_dict in py_request_objects:
         for item in requests:
             if item.request:
-                py_obj = req_obj_dict.get(item.id)
-                if py_obj is not None:
-                    setattr(item.request, attr_name, py_obj)
+                if item.id in req_obj_dict:
+                    setattr(item.request, attr_name, req_obj_dict[item.id])
+
+
+def derive_attention_dp_per_rank_request_cap(
+    base_cap: int,
+    max_num_tokens: Optional[int],
+    max_total_draft_tokens: int,
+) -> int:
+    """Cap per-rank requests at ``max_num_tokens // (1 + max_total_draft_tokens)``
+    so gen-phase per-step token load cannot exceed ``max_num_tokens`` under
+    attention DP, where no component otherwise enforces a per-rank token cap
+    (nvbug-6133201). Each gen request occupies ``1 + max_total_draft_tokens``
+    token slots per step. Mirrors the CUDA graph batch-size cap at
+    ``model_engine._filter_cuda_graph_batch_sizes``.
+
+    Args:
+        base_cap: Per-rank request cap from ``get_max_num_sequences()``.
+        max_num_tokens: ``LlmArgs.max_num_tokens``; ``None`` disables tightening.
+        max_total_draft_tokens: Draft tokens per gen request (0 without spec
+            decoding); negative values are clamped to 0.
+
+    Returns:
+        The tighter of ``base_cap`` and ``max_num_tokens // step_tokens``.
+    """
+    if max_num_tokens is None:
+        return base_cap
+    step_tokens_per_req = 1 + max(max_total_draft_tokens, 0)
+    return min(base_cap, max_num_tokens // step_tokens_per_req)
 
 
 def can_process_attention_dp_request(
@@ -225,19 +256,25 @@ def partition_context_for_helix(
     Returns:
         Tuple of (input_ids_this_rank, position_ids_this_rank, input_len, padding_len).
 
+        When num_total_blocks < cp_size, the highest-indexed CP ranks own no blocks
+        for this sequence; those empty ranks return empty token and position lists.
+        input_len still reflects the full prompt length so global position ids stay
+        correct.
+
     Raises:
-        ValueError: If there aren't enough tokens for at least one block per CP rank.
+        ValueError: If the prompt is empty (no blocks to distribute).
     """
     all_input_ids = torch.tensor(input_token_ids, dtype=torch.int64).unsqueeze(0)
     input_len = all_input_ids.shape[-1]
 
     num_total_blocks = (input_len + tokens_per_block - 1) // tokens_per_block
-    if num_total_blocks < cp_size:
-        raise ValueError(
-            f"There aren't enough tokens to get at least one block per CP rank. "
-            f"num_total_blocks {num_total_blocks} < num_cp_ranks {cp_size}. "
-            f"Please use smaller tokens_per_block for KV cache or reduce the number of CP ranks."
-        )
+    if num_total_blocks == 0:
+        raise ValueError("Cannot partition an empty prompt for Helix CP: num_total_blocks == 0.")
+    # NOTE: When num_total_blocks < cp_size, CP ranks in [num_total_blocks, cp_size)
+    # own zero blocks ("empty" ranks). This is supported: such ranks contribute a
+    # no-op (-inf, 0) to the Helix attention combine and receive zero KV blocks
+    # during cache transmission. Rank 0 always owns global block 0, so the combine
+    # denominator is never zero.
 
     # Pad the last (partial) block so every block has exactly tokens_per_block tokens.
     padding_len = 0
@@ -253,10 +290,14 @@ def partition_context_for_helix(
     input_id_blocks = list(all_input_ids.split(tokens_per_block, dim=-1))
     position_id_blocks = list(all_position_ids.split(tokens_per_block, dim=-1))
 
-    input_ids_this_rank = torch.cat(input_id_blocks[cp_rank::cp_size], dim=-1).flatten().tolist()
-    position_ids_this_rank = (
-        torch.cat(position_id_blocks[cp_rank::cp_size], dim=-1).flatten().tolist()
-    )
+    curank_input_blocks = input_id_blocks[cp_rank::cp_size]
+    curank_position_blocks = position_id_blocks[cp_rank::cp_size]
+    # Empty rank: this CP rank owns no blocks for this sequence (num_total_blocks < cp_size).
+    if len(curank_input_blocks) == 0:
+        return [], [], input_len, padding_len
+
+    input_ids_this_rank = torch.cat(curank_input_blocks, dim=-1).flatten().tolist()
+    position_ids_this_rank = torch.cat(curank_position_blocks, dim=-1).flatten().tolist()
 
     # The (single) padded block is the global last block; under round-robin it is owned by rank
     # (num_total_blocks - 1) % cp_size, and is the last local block on that rank. Strip its padding.
@@ -471,6 +512,15 @@ class RequestBroadcaster:
 
     def broadcast(self, new_requests: List) -> Tuple[List, Optional[Tuple]]:
         """Broadcast requests and Python objects across ranks."""
+        request_count = len(new_requests) if self.dist.rank == 0 else 0
+        # Idle non-root ranks can wait here while rank 0 blocks in the
+        # pause-wrapped request queue fetch, so keep the probe pause-wrapped too.
+        with self.hang_detector.pause():
+            request_count = self._broadcast_request_count(request_count)
+
+        if request_count == 0:
+            return [], None
+
         if self.dist.rank == 0:
             py_request_objects = self._collect_py_objects(new_requests)
         else:
@@ -487,6 +537,30 @@ class RequestBroadcaster:
 
         return new_requests, py_request_objects
 
+    def _broadcast_request_count(self, request_count: int) -> int:
+        """Broadcast rank 0's request count using the same PP route as requests."""
+        if self.dist.world_size == 1:
+            return request_count
+
+        if not self.dist.has_pp:
+            return self.dist.broadcast(request_count, root=0)
+
+        if self.dist.is_first_pp_rank:
+            with nvtx_range("tp_broadcast_request_count"):
+                request_count = self.dist.tp_cp_broadcast(request_count, root=0)
+
+        tag = self.dist.pp_size + 1  # Avoid the heavy request payload tag.
+
+        if not self.dist.is_first_pp_rank:
+            with nvtx_range("recv_request_count_from_prev_pp"):
+                request_count = self.dist.recv_object(self.dist.prev_pp_rank, tag)
+
+        if not self.dist.is_last_pp_rank:
+            with nvtx_range("send_request_count_to_next_pp"):
+                self.dist.send_object(request_count, self.dist.next_pp_rank, tag)
+
+        return request_count
+
     def _collect_py_objects(self, new_requests: List) -> Tuple:
         """Collect Python-only objects from requests."""
         py_logits_post_processors = collect_py_objects_from_requests(
@@ -500,6 +574,10 @@ class RequestBroadcaster:
         py_disaggregated_params = collect_py_objects_from_requests(
             new_requests, "py_disaggregated_params"
         )
+        py_conversation_params = collect_py_objects_from_requests(
+            new_requests, "py_conversation_params", include_none=True
+        )
+        py_lora_path = collect_py_objects_from_requests(new_requests, "py_lora_path")
 
         return tuple(
             filter(
@@ -510,6 +588,8 @@ class RequestBroadcaster:
                     py_scheduling_params,
                     py_num_logprobs,
                     py_disaggregated_params,
+                    py_conversation_params,
+                    py_lora_path,
                 ],
             )
         )

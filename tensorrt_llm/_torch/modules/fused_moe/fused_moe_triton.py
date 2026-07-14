@@ -27,7 +27,10 @@ from triton_kernels.matmul_ogs import (FlexCtx, FnSpecs, FusedActivation,
                                        PrecisionConfig, matmul_ogs)
 from triton_kernels.numerics import InFlexData
 from triton_kernels.numerics_details.mxfp import downcast_to_mxfp_torch
-from triton_kernels.tensor import FP4, convert_layout, wrap_torch_tensor
+from triton_kernels.tensor import FP4
+from triton_kernels.tensor import Storage as TritonStorage
+from triton_kernels.tensor import Tensor as TritonTensor
+from triton_kernels.tensor import convert_layout, wrap_torch_tensor
 from triton_kernels.tensor_details import layout
 
 from ...model_config import ModelConfig
@@ -366,8 +369,11 @@ class TritonUnquantizedFusedMoEMethod(FusedMoEMethodBase):
             module.w3_w1_weight.data)
         module.w2_weight.data = update_weight_stride(module.w2_weight.data)
 
-    def apply(self, module: torch.nn.Module, x: torch.Tensor,
-              router_logits: torch.Tensor) -> torch.Tensor:
+    def apply(self,
+              module: torch.nn.Module,
+              x: torch.Tensor,
+              router_logits: torch.Tensor,
+              input_ids: Optional[torch.IntTensor] = None) -> torch.Tensor:
         # Fetch all the data needed for the Triton kernel
         hidden_states = x
         expert_logits = router_logits
@@ -592,8 +598,11 @@ class TritonFP8QDQFusedMoEMethod(TritonUnquantizedFusedMoEMethod):
             module.w3_w1_weight.data)
         module.w2_weight.data = update_weight_stride(module.w2_weight.data)
 
-    def apply(self, module: torch.nn.Module, x: torch.Tensor,
-              router_logits: torch.Tensor) -> torch.Tensor:
+    def apply(self,
+              module: torch.nn.Module,
+              x: torch.Tensor,
+              router_logits: torch.Tensor,
+              input_ids: Optional[torch.IntTensor] = None) -> torch.Tensor:
         # Fetch all the data needed for the Triton kernel
         hidden_states, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
             x, module.fc31_input_dequant)
@@ -690,6 +699,70 @@ class TritonMXFP4FusedMoEQuantScales(NamedTuple):
     fc2_input_dequant: torch.Tensor
 
 
+def is_swizzling_supported() -> bool:
+    """Return whether the MXFP4 swizzled value/scale layouts work on the current CUDA device.
+
+    The swizzled layouts produced by ``make_default_matmul_mxfp4_w_layout`` /
+    ``make_default_matmul_mxfp4_w_scale_layout`` are broken on the H20 family
+    (e.g. ``NVIDIA H20``, ``NVIDIA H20-3e``), so callers must fall back to
+    ``StridedLayout`` there. H200 uses substring exclusion because its device
+    name also contains ``H20``. This is a WAR. For proper fix, see nvbugs/6026676.
+    """
+    name = torch.cuda.get_device_name()
+    is_h20_family = "H20" in name and "H200" not in name
+    return not is_h20_family
+
+
+# Swizzling a full MoE weight tensor in one shot materializes several int32
+# temporaries of the full tensor size inside HopperMXValueLayout.swizzle_data
+# (~8x the packed weight bytes; the padded/permuted copies come on top). For
+# gpt-oss-120b that is a >8 GiB transient per MoE layer on top of the nearly
+# fully resident model, which OOMs 80GB GPUs during weight loading
+# (nvbugs/6384375). The expert dim is a pure batch dim for these layouts, so
+# swizzling expert chunks of at most this many source bytes is bit-identical
+# while capping the transient.
+MXFP4_SWIZZLE_CHUNK_BYTES = 64 * 1024 * 1024
+
+
+def convert_layout_expert_chunked(t: torch.Tensor,
+                                  dtype,
+                                  layout_cls,
+                                  layout_opts: dict,
+                                  max_chunk_bytes=MXFP4_SWIZZLE_CHUNK_BYTES):
+    """Memory-frugal equivalent of
+    ``convert_layout(wrap_torch_tensor(t, dtype=dtype), layout_cls, **layout_opts)``
+    for 3D ``(num_experts, K, N)`` tensors and layouts that treat the leading
+    dim as a batch dim (Hopper MXFP4 value/scale layouts).
+    """
+    assert t.dim() == 3
+    wrapped = wrap_torch_tensor(t, dtype=dtype) if dtype is not None \
+        else wrap_torch_tensor(t)
+    new_layout = layout_cls(t.shape, **layout_opts)
+    num_experts = t.shape[0]
+    bytes_per_expert = t[:1].numel() * t.element_size()
+    chunk = min(num_experts,
+                max(1,
+                    int(max_chunk_bytes) // max(bytes_per_expert, 1)))
+    new_data = None
+    for i in range(0, num_experts, chunk):
+        piece = new_layout.swizzle_data(t[i:i + chunk])
+        # Expert blocks must be dense and independent in storage for the
+        # chunked reassembly to be equivalent to the one-shot swizzle.
+        assert piece.stride(0) == piece[0].numel()
+        if new_data is None:
+            new_data = torch.empty_strided(
+                (num_experts, ) + tuple(piece.shape[1:]),
+                (piece.stride(0), ) + tuple(piece.stride()[1:]),
+                dtype=piece.dtype,
+                device=piece.device)
+        new_data[i:i + piece.shape[0]].copy_(piece)
+        del piece
+    return TritonTensor(TritonStorage(new_data, new_layout),
+                        dtype=wrapped.dtype,
+                        shape=wrapped.shape,
+                        shape_max=wrapped.shape_max)
+
+
 def swizzle_weight_and_scale(w: torch.Tensor, w_scale: torch.Tensor):
     # (num_experts, in_dim//2, out_dim)
     w_shape = w.shape
@@ -717,8 +790,7 @@ def swizzle_weight_and_scale(w: torch.Tensor, w_scale: torch.Tensor):
         mx_axis=1)
     scale_layout, scale_layout_opts = layout.make_default_matmul_mxfp4_w_scale_layout(
         mx_axis=1, num_warps=num_warps)
-    # swizzling path is broken for H20
-    if torch.cuda.get_device_name() == "NVIDIA H20":
+    if not is_swizzling_supported():
         from triton_kernels.tensor_details.layout_details.strided import \
             StridedLayout
         value_layout = StridedLayout
@@ -730,10 +802,23 @@ def swizzle_weight_and_scale(w: torch.Tensor, w_scale: torch.Tensor):
             "scale_layout": scale_layout, "scale_layout_opts": scale_layout_opts}
 
     # w, w_scale = downcast_to_mxfp(tensor.to(torch.bfloat16), torch.uint8, axis=1)
-    w = convert_layout(wrap_torch_tensor(w, dtype=FP4), opt["value_layout"],
-                       **opt["value_layout_opts"])
-    w_scale = convert_layout(wrap_torch_tensor(w_scale), opt["scale_layout"],
-                             **opt["scale_layout_opts"])
+    # The Hopper layouts are the ones whose one-shot swizzle needs several
+    # times the tensor size in temporaries; other layouts (Strided alias,
+    # Blackwell pad-only) are kept on the one-shot path to preserve their
+    # storage-aliasing behavior.
+    if value_layout is layout.HopperMXValueLayout:
+        w = convert_layout_expert_chunked(w, FP4, value_layout,
+                                          value_layout_opts)
+    else:
+        w = convert_layout(wrap_torch_tensor(w, dtype=FP4), opt["value_layout"],
+                           **opt["value_layout_opts"])
+    if scale_layout is layout.HopperMXScaleLayout:
+        w_scale = convert_layout_expert_chunked(w_scale, None, scale_layout,
+                                                scale_layout_opts)
+    else:
+        w_scale = convert_layout(wrap_torch_tensor(w_scale),
+                                 opt["scale_layout"],
+                                 **opt["scale_layout_opts"])
     return w, w_scale
 
 
@@ -1121,6 +1206,32 @@ class TritonMXFP4FusedMoEMethod(TritonUnquantizedFusedMoEMethod):
 
         dst_w2_weight_scale.copy_(w2_weight_scale, non_blocking=True)
 
+    @staticmethod
+    def _swizzle_and_replace(module, weight_name, scale_name, weight_data,
+                             scale_data):
+        new_weight, new_scale = swizzle_weight_and_scale(
+            weight_data, scale_data)
+        replacement_storage_ptrs = {
+            new_weight.data.untyped_storage().data_ptr(),
+            new_scale.data.untyped_storage().data_ptr(),
+        }
+        for name in (weight_name, scale_name):
+            old_param = module._parameters.pop(name, None)
+            assert old_param is not None, \
+                f"Expected {name} to be a registered parameter before swizzling MXFP4 weights."
+            old_storage = old_param.data.untyped_storage()
+            # H20 uses StridedLayout as an MXFP4 swizzle fallback. That
+            # conversion can alias the original scale storage, unlike the
+            # Hopper swizzled layout path, so only release storage that is no
+            # longer backing the replacement tensor.
+            old_storage_ptr = old_storage.data_ptr()
+            if (old_storage.nbytes() > 0
+                    and old_storage_ptr not in replacement_storage_ptrs):
+                old_storage.resize_(0)
+        torch.cuda.empty_cache()
+        setattr(module, weight_name, new_weight)
+        setattr(module, scale_name, new_scale)
+
     def load_quant_scales(self, module: torch.nn.Module, weights: Dict):
         # Step1: Load input scales.
         if self.activation_dtype == torch.float8_e4m3fn:
@@ -1187,33 +1298,11 @@ class TritonMXFP4FusedMoEMethod(TritonUnquantizedFusedMoEMethod):
         tmp_w3_w1_weight_scale = shuffle_weight_for_activation_kernel(
             tmp_w3_w1_weight_scale)
 
-        # Handle w3_w1_weight
-        tmp_w3_w1_weight, tmp_w3_w1_weight_scale = swizzle_weight_and_scale(
-            module.w3_w1_weight.data, tmp_w3_w1_weight_scale)
-
-        # Instantly release memory by resizing storage to 0 to avoid OOM
-        _popped = module._parameters.pop('w3_w1_weight', None)
-        _popped.data.storage().resize_(0)
-        _popped = module._parameters.pop('fc31_dequant', None)
-        _popped.data.storage().resize_(0)
-        torch.cuda.empty_cache()
-
-        module.w3_w1_weight = tmp_w3_w1_weight
-        module.fc31_dequant = tmp_w3_w1_weight_scale
-
-        # Handle w2_weight
-        tmp_w2_weight, tmp_w2_weight_scale = swizzle_weight_and_scale(
-            module.w2_weight.data, tmp_w2_weight_scale)
-
-        # Instantly release memory by resizing storage to 0 to avoid OOM
-        _popped = module._parameters.pop('w2_weight', None)
-        _popped.data.storage().resize_(0)
-        _popped = module._parameters.pop('fc2_dequant', None)
-        _popped.data.storage().resize_(0)
-        torch.cuda.empty_cache()
-
-        module.w2_weight = tmp_w2_weight
-        module.fc2_dequant = tmp_w2_weight_scale
+        self._swizzle_and_replace(module, 'w3_w1_weight', 'fc31_dequant',
+                                  module.w3_w1_weight.data,
+                                  tmp_w3_w1_weight_scale)
+        self._swizzle_and_replace(module, 'w2_weight', 'fc2_dequant',
+                                  module.w2_weight.data, tmp_w2_weight_scale)
 
         if self.activation_dtype == torch.float8_e4m3fn:
             if max_fc31_input_scale is None or max_fc2_input_scale is None:
@@ -1225,8 +1314,11 @@ class TritonMXFP4FusedMoEMethod(TritonUnquantizedFusedMoEMethod):
                 module.fc2_input_dequant.data.copy_(max_fc2_input_scale,
                                                     non_blocking=True)
 
-    def apply(self, module: torch.nn.Module, x: torch.Tensor,
-              router_logits: torch.Tensor) -> torch.Tensor:
+    def apply(self,
+              module: torch.nn.Module,
+              x: torch.Tensor,
+              router_logits: torch.Tensor,
+              input_ids: Optional[torch.IntTensor] = None) -> torch.Tensor:
         # Fetch all the data needed for the Triton kernel
         if self.activation_dtype == torch.float8_e4m3fn:
             if module.fc31_input_dequant is None:
@@ -1350,6 +1442,22 @@ class TritonMXFP4FusedMoEMethod(TritonUnquantizedFusedMoEMethod):
         gemm2_output = _maybe_remove_padding(gemm2_output, module.hidden_size)
 
         return gemm2_output
+
+    def transform_weights(self, module: torch.nn.Module) -> None:
+        if 'w3_w1_weight' in module._parameters:
+            w31_scale = shuffle_weight_for_activation_kernel(
+                module.fc31_dequant.data)
+            self._swizzle_and_replace(module, 'w3_w1_weight', 'fc31_dequant',
+                                      module.w3_w1_weight.data, w31_scale)
+            self._swizzle_and_replace(module, 'w2_weight', 'fc2_dequant',
+                                      module.w2_weight.data,
+                                      module.fc2_dequant.data)
+
+            if self.activation_dtype == torch.float8_e4m3fn:
+                module.fc31_input_dequant = None
+                module.fc2_input_dequant = None
+
+        super().transform_weights(module)
 
 
 class TritonFusedMoE(MoE):
@@ -1524,6 +1632,7 @@ class TritonFusedMoE(MoE):
         x: torch.Tensor,
         router_logits: torch.Tensor,
         *,
+        input_ids: Optional[torch.IntTensor] = None,
         do_finalize: bool = True,
         all_rank_num_tokens: Optional[List[int]] = None,
         use_dp_padding: Optional[bool] = None,
@@ -1533,7 +1642,8 @@ class TritonFusedMoE(MoE):
         assert use_dp_padding is None or not use_dp_padding, \
             "TritonFusedMoE does not support use_dp_padding=True"
 
-        hidden_states = self.quant_method.apply(self, x, router_logits)
+        hidden_states = self.quant_method.apply(self, x, router_logits,
+                                                input_ids)
 
         final_hidden_states = self.reducescatter_or_allreduce(
             hidden_states,
@@ -1551,6 +1661,3 @@ class TritonFusedMoE(MoE):
         weights = weights[0]
 
         self.quant_method.load_weights(self, weights, self.weight_loading_mode)
-
-    def post_load_weights(self):
-        self.quant_method.post_load_weights(self)

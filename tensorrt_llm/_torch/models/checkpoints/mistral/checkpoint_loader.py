@@ -64,7 +64,10 @@ class MistralCheckpointLoader(HfCheckpointLoader):
                 weights[key] = 1.0 / weights[key]
 
     def load_weights(self, checkpoint_dir: str, **kwargs):
-        weights = super().weight_loader.load_weights(checkpoint_dir, **kwargs)
+        # Mistral native weight mapping is different from HF and stored in the .consolidated tensor
+        weights = super().weight_loader.load_weights(
+            checkpoint_dir, use_consolidated=True, **kwargs
+        )
         weights = self.preprocess_weights(weights)
         self.broadcast_per_tensor_scales(weights)
         # The definition of global_scale is different in Mistral, need to inverse the scale

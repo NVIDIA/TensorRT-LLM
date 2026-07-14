@@ -67,7 +67,7 @@ _SMALL_GEN_PARAMS = {
 def _make_visual_gen_options(**extra) -> dict:
     """Build a minimal VisualGen YAML config dict."""
     config = {
-        "parallel": {"dit_cfg_size": 1, "dit_ulysses_size": 1},
+        "parallel_config": {"cfg_size": 1, "ulysses_size": 1},
     }
     config.update(extra)
     return config
@@ -92,7 +92,7 @@ class RemoteVisualGenServer:
     def __init__(
         self,
         model: str,
-        extra_visual_gen_options: Optional[dict] = None,
+        visual_gen_args: Optional[dict] = None,
         cli_args: Optional[List[str]] = None,
         host: str = "localhost",
         port: Optional[int] = None,
@@ -106,11 +106,11 @@ class RemoteVisualGenServer:
         if cli_args:
             args += cli_args
 
-        if extra_visual_gen_options:
+        if visual_gen_args is not None:
             fd, self._config_file = tempfile.mkstemp(suffix=".yml", prefix="vg_bench_cfg_")
             with os.fdopen(fd, "w") as f:
-                yaml.dump(extra_visual_gen_options, f)
-            args += ["--extra_visual_gen_options", self._config_file]
+                yaml.dump(visual_gen_args, f)
+            args += ["--visual_gen_args", self._config_file]
 
         launch_cmd = ["trtllm-serve", model] + args
         self.proc = subprocess.Popen(
@@ -171,7 +171,7 @@ def server():
     model_path = _wan_t2v_path()
     with RemoteVisualGenServer(
         model=str(model_path),
-        extra_visual_gen_options=_make_visual_gen_options(),
+        visual_gen_args=_make_visual_gen_options(),
     ) as srv:
         yield srv
 
@@ -255,7 +255,8 @@ def test_online_benchmark(
         data = json.load(f)
     assert "completed" in data
     assert data["completed"] >= 1
-    assert "mean_e2e_latency_ms" in data
+    assert "mean_latency" in data
+    assert "mean_generation" in data
 
 
 # ===========================================================================
@@ -276,7 +277,7 @@ def test_offline_benchmark(tmp_path):
         "--model_path",
         str(model_path),
         "visual-gen",
-        "--extra_visual_gen_options",
+        "--visual_gen_args",
         config_file,
         "--prompt",
         "A bird flying over the ocean",
@@ -319,4 +320,5 @@ def test_offline_benchmark(tmp_path):
         data = json.load(f)
     assert "completed" in data
     assert data["completed"] >= 1
-    assert "mean_e2e_latency_ms" in data
+    assert "mean_latency" in data
+    assert "mean_generation" in data

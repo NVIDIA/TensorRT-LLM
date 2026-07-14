@@ -43,10 +43,9 @@ EOF
 TLLM_PROFILE_START_STOP=$((BATCH_SIZE + 10))-$((BATCH_SIZE + 35)) \
 NP=$NP ./mpi_launch.sh middleware/mpi_env_from_ompi \
 nsys profile \
-    -t cuda,nvtx \
+    -t cuda,nvtx -s none \
     --cpuctxsw none --cuda-event-trace false \
     --cuda-graph-trace node \
-    -c cudaProfilerApi --capture-range-end stop \
     -o "$PROFILE_DIR/report_e2e_collect_rank%q{RANK}.nsys-rep" \
     --force-overwrite true \
 trtllm-llmapi-launch \
@@ -59,7 +58,7 @@ trtllm-bench \
     --warmup 0 \
     --dataset /tmp/dataset.jsonl \
     --max_batch_size $BATCH_SIZE \
-    --max_num_tokens 3072 \
+    --max_num_tokens $((BATCH_SIZE * 2048)) \
     --disable_chunked_context \
     --num_requests $((BATCH_SIZE * NP)) \
     --concurrency $((BATCH_SIZE * NP)) \
@@ -80,10 +79,9 @@ EOF
 TLLM_PROFILE_START_STOP=$((BATCH_SIZE + 10))-$((BATCH_SIZE + 35)) \
 NP=$NP ./mpi_launch.sh middleware/mpi_env_from_ompi \
 nsys profile \
-    -t cuda,nvtx \
+    -t cuda,nvtx -s none \
     --cpuctxsw none --cuda-event-trace false \
     --cuda-graph-trace node \
-    -c cudaProfilerApi --capture-range-end stop \
     -o "$PROFILE_DIR/report_e2e_mark_rank%q{RANK}.nsys-rep" \
     --force-overwrite true \
 trtllm-llmapi-launch \
@@ -96,7 +94,7 @@ trtllm-bench \
     --warmup 0 \
     --dataset /tmp/dataset.jsonl \
     --max_batch_size $BATCH_SIZE \
-    --max_num_tokens 3072 \
+    --max_num_tokens $((BATCH_SIZE * 2048)) \
     --disable_chunked_context \
     --num_requests $((BATCH_SIZE * NP)) \
     --concurrency $((BATCH_SIZE * NP)) \
@@ -110,11 +108,11 @@ NP=$NP ./mpi_launch.sh ./run.sh config_gen.yaml \
     --layer-indices 5,6,7 \
     --batch-size $BATCH_SIZE \
     --seq-len-q 1 \
-    --seq-len-kv-cache $((2049 + (BATCH_SIZE / 2 + 25) * 1)) \
+    --seq-len-kv-cache $((2048 + BATCH_SIZE + 22)) \
     --balance-method NotModified \
     --replay-file-path "$PROFILE_DIR/calibration_data.json" \
-    --replay-start $((BATCH_SIZE + 10 + 5)) \
-    --replay-stop $((BATCH_SIZE + 35))
+    --replay-start-iter $((BATCH_SIZE + 10 + 5)) \
+    --replay-stop-iter $((BATCH_SIZE + 34))
 
 # Step 4
 
@@ -123,6 +121,8 @@ seq 0 $((NP - 1)) | xargs -I% python3 parse_e2e.py \
     --graph-trace "$PROFILE_DIR/report_e2e_collect_rank%.nsys-rep" \
     --layer-indices 5,6,7 \
     --warmup-times 5 \
+    --start-iter $((BATCH_SIZE + 10)) \
+    --stop-iter $((BATCH_SIZE + 34)) \
     -o "$PROFILE_DIR/report_e2e_collect_rank%.json"
 seq 0 $((NP - 1)) | xargs -I% python3 parse.py \
     --profile-dir "$PROFILE_DIR" \

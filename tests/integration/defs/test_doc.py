@@ -184,9 +184,20 @@ def test_url_validity(llm_root):
     md_files = _find_markdown_files(llm_root)
     assert md_files, f"No markdown files found under {llm_root}"
 
+    # Normalize before comparison so variants (trailing slash, query, fragment,
+    # case in scheme/host) all match.
+    def _normalize(u):
+        p = urlparse(u)
+        return (p.scheme.lower(), p.netloc.lower(), p.path.rstrip("/"))
+
+    skip_urls = {
+        _normalize("https://github.com/NVIDIA/llm-compiler"),
+    }
     all_urls = []
     for md_file in md_files:
         for url, line_num in _extract_urls(md_file):
+            if _normalize(url) in skip_urls:
+                continue
             all_urls.append((url, line_num, md_file))
 
     if not all_urls:

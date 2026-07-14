@@ -22,14 +22,14 @@ import sys
 import sysconfig
 import tempfile
 import warnings
-from argparse import ArgumentParser
+from argparse import ArgumentParser, ArgumentTypeError
 from contextlib import contextmanager
 from functools import partial
 from multiprocessing import cpu_count
 from pathlib import Path
 from shutil import copy, copytree, rmtree
 from subprocess import DEVNULL, CalledProcessError, check_output, run
-from typing import Sequence
+from typing import Optional, Sequence
 
 try:
     from packaging.requirements import Requirement
@@ -135,8 +135,10 @@ def create_venv(project_dir: Path):
     return venv_prefix
 
 
-def setup_venv(project_dir: Path, requirements_file: Path,
-               no_venv: bool) -> tuple[Path, Path]:
+def setup_venv(project_dir: Path,
+               requirements_file: Path,
+               no_venv: bool,
+               yes: bool = False) -> tuple[Path, Path]:
     """Creates/updates a venv and installs requirements.
 
     Args:
@@ -170,7 +172,8 @@ def setup_venv(project_dir: Path, requirements_file: Path,
                 f"`build_wheel.py` can recreate a virtual environment using container-provided PyTorch installation."
             )
             print("^^^^^^^^^^ IMPORTANT WARNING ^^^^^^^^^^", file=sys.stderr)
-            input("Press Ctrl+C to stop, any key to continue...\n")
+            if not yes:
+                input("Press Ctrl+C to stop, any key to continue...\n")
 
         # Ensure inherited PyTorch version is compatible
         try:
@@ -404,8 +407,11 @@ def generate_python_stubs_linux(venv_python: Path, deep_ep: bool,
     try:
         build_run(f"\"{venv_python}\" -m nanobind.stubgen -m bindings -r -O .",
                   env=env_stub_gen)
+        # Pre-import torch so deep_gemm_cpp_tllm's FP4 scalar-type registration
+        # succeeds; CLI args after `-c ...` land in sys.argv[1:] for argparse.
         build_run(
-            f"\"{venv_python}\" -m pybind11_stubgen -o . deep_gemm_cpp_tllm --exit-code",
+            f"\"{venv_python}\" -c 'import torch; from pybind11_stubgen import main; main()' "
+            "-o . deep_gemm_cpp_tllm --exit-code",
             env=env_stub_gen)
         if flash_mla:
             build_run(
@@ -491,7 +497,9 @@ def main(*,
          clean: bool = False,
          clean_wheel: bool = False,
          configure_cmake: bool = False,
+         configure_only: bool = False,
          use_ccache: bool = False,
+         use_3rdparty_cache: bool = False,
          fast_build: bool = False,
          cpp_only: bool = False,
          install: bool = False,
@@ -505,7 +513,9 @@ def main(*,
          no_venv: bool = False,
          nvrtc_dynamic_linking: bool = False,
          mypyc: bool = False,
-         require_dynamic_attributions: bool = False):
+         require_dynamic_attributions: bool = False,
+         plat_name: Optional[str] = None,
+         yes: bool = False):
 
     if clean:
         clean_wheel = True
@@ -529,7 +539,8 @@ def main(*,
     # Setup venv and install requirements
     venv_python, venv_conan = setup_venv(project_dir,
                                          project_dir / requirements_filename,
-                                         no_venv)
+                                         no_venv,
+                                         yes=yes)
 
     # Ensure base TRT is installed (check inside the venv)
     try:
@@ -630,6 +641,20 @@ def main(*,
     if fast_build:
         cmake_def_args.append(f"-DFAST_BUILD=ON")
 
+    # FetchContent bare-repo cache (see 3rdparty/CMakeLists.txt).  Forwarded
+    # as -D vars so the configuration is reproducible from CMakeCache.txt
+    # alone and doesn't depend on the caller's env.  The env var hand-off
+    # lets a wrapping agent point at a shared cache without patching
+    # build_wheel.py.
+    if use_3rdparty_cache:
+        cache_dir = os.environ.get("TRTLLM_FETCHCONTENT_CACHE") or str(
+            project_dir / "3rdparty" / ".cache_3rdparty")
+        cmake_def_args.append(f"-DTRTLLM_FETCHCONTENT_CACHE={cache_dir}")
+        update_cmd = os.environ.get("TRTLLM_FETCHCONTENT_UPDATE_CMD", "")
+        if update_cmd:
+            cmake_def_args.append(
+                f"-DTRTLLM_FETCHCONTENT_UPDATE_CMD={update_cmd}")
+
     if nvrtc_dynamic_linking:
         cmake_def_args.append(f"-DNVRTC_DYNAMIC_LINKING=ON")
 
@@ -683,7 +708,7 @@ def main(*,
         generate_fmha_cu(project_dir, venv_python)
 
     with working_directory(build_dir):
-        if clean or first_build or configure_cmake:
+        if clean or first_build or configure_cmake or configure_only:
             build_run(
                 f"\"{venv_conan}\" install --build=missing --no-remote --output-folder={build_dir}/conan -s 'build_type={build_type}' {source_dir}"
             )
@@ -705,6 +730,9 @@ def main(*,
             print("CMake Configure command: ")
             print(cmake_configure_command)
             build_run(cmake_configure_command)
+
+        if configure_only:
+            return
 
         maybe_keep_depfile = " -- -d keepdepfile" if generator == "Ninja" else ""
         cmake_build_command = (
@@ -799,18 +827,47 @@ def main(*,
 
         # Helper function to resolve symlinks and copy actual content
         def copy_resolving_symlink(src_path, dst_path):
-            """Copy file or directory, resolving symlinks to copy actual content."""
+            """Copy file or directory, resolving symlinks to copy actual content.
+
+            Skips the copy when dst already exists and a stamp file confirms the
+            previous copy completed successfully, and the stamp is at least as new
+            as src.  Using a stamp (rather than dst mtime) avoids two pitfalls:
+            - Directory mtime on Linux only reflects direct-child changes, not
+              deeply nested ones, so a modified source file may not update it.
+            - An interrupted copy leaves dst with a fresh mtime that would
+              incorrectly satisfy an mtime check, causing the next build to skip.
+            """
             if src_path.is_symlink():
                 resolved_src = src_path.resolve()
             else:
                 resolved_src = src_path
 
             if resolved_src.is_dir():
-                if dst_path.exists():
+                stamp = dst_path.parent / f".{dst_path.name}.stamp"
+                if dst_path.exists() and stamp.exists():
+                    if stamp.stat().st_mtime >= resolved_src.stat().st_mtime:
+                        return  # destination is up to date
                     rmtree(dst_path)
-                # Use symlinks=False (default) to follow symlinks and copy actual content
-                # This ensures nested symlinks are also resolved
-                copytree(resolved_src, dst_path, symlinks=False)
+                elif dst_path.exists():
+                    rmtree(
+                        dst_path)  # dst exists but no stamp — interrupted copy
+                stamp.unlink(missing_ok=True)
+                # Shell out to cp -rL: dereferences symlinks like copytree(symlinks=False)
+                # but uses kernel-level copy primitives, which is significantly faster
+                # than Python's file-by-file copytree on network-mounted filesystems.
+                # Fall back to copytree if cp is unavailable (non-Linux or minimal containers).
+                cp_bin = shutil.which("cp")
+                if cp_bin is not None:
+                    try:
+                        run([cp_bin, "-rL",
+                             str(resolved_src),
+                             str(dst_path)],
+                            check=True)
+                    except FileNotFoundError:
+                        copytree(resolved_src, dst_path, symlinks=False)
+                else:
+                    copytree(resolved_src, dst_path, symlinks=False)
+                stamp.touch()
             else:
                 if dst_path.is_dir():
                     dst_path = dst_path / src_path.name
@@ -1079,6 +1136,11 @@ def main(*,
             clear_folder(dist_dir)
 
         extra_wheel_build_args = os.getenv("EXTRA_WHEEL_BUILD_ARGS", "")
+        plat_name_arg = ""
+        if plat_name:
+            plat_name_arg = f'--config-setting="--build-option=--plat-name={plat_name}"'
+            extra_wheel_build_args = " ".join(
+                arg for arg in (extra_wheel_build_args, plat_name_arg) if arg)
 
         # Attempt to generate attributions using the dependency database
         # Skip if output already exists and the build system hasn't changed
@@ -1121,7 +1183,7 @@ def main(*,
             env["TRTLLM_ENABLE_MYPYC"] = "0"
 
         build_run(
-            f'\"{venv_python}\" -m build {project_dir} --skip-dependency-check --no-isolation --wheel --outdir "{dist_dir}"',
+            f'\"{venv_python}\" -m build {project_dir} --skip-dependency-check {plat_name_arg} --no-isolation --wheel --outdir "{dist_dir}"',
             env=env)
 
     if install:
@@ -1163,10 +1225,21 @@ def add_arguments(parser: ArgumentParser):
     parser.add_argument("--configure_cmake",
                         action="store_true",
                         help="Always configure cmake before building")
+    parser.add_argument(
+        "--configure-only",
+        action="store_true",
+        help="Run cmake configure and exit, skipping build and wheel packaging")
     parser.add_argument("--use_ccache",
                         default=False,
                         action="store_true",
                         help="Use ccache compiler driver for faster rebuilds")
+    parser.add_argument(
+        "--use-3rdparty-cache",
+        default=False,
+        action="store_true",
+        help="Accelerate FetchContent git clones via bare reference "
+        "repos under $TRTLLM_FETCHCONTENT_CACHE "
+        "(default: <project>/3rdparty/.cache_3rdparty).")
     parser.add_argument(
         "--fast_build",
         "-f",
@@ -1271,6 +1344,29 @@ def add_arguments(parser: ArgumentParser):
     parser.add_argument("--require_dynamic_attributions",
                         action="store_true",
                         help="Fail the build if attribution generation fails")
+
+    def _plat_name_type(value):
+        import re
+        if not re.fullmatch(r'[a-zA-Z0-9_]+', value):
+            raise ArgumentTypeError(
+                f"Invalid plat name '{value}': only alphanumerics and underscores are allowed"
+            )
+        return value
+
+    parser.add_argument(
+        "--plat-name",
+        type=_plat_name_type,
+        help=
+        "Wheel platform tag passed to bdist_wheel --plat-name (e.g. linux_x86_64, manylinux_2_28_x86_64)"
+    )
+    parser.add_argument(
+        "--yes",
+        "-y",
+        action="store_true",
+        default=False,
+        help=
+        "Skip interactive confirmation prompts (useful for non-interactive builds)",
+    )
 
 
 if __name__ == "__main__":

@@ -17,7 +17,17 @@ __all__ = [
     'parse_disagg_config_file',
     'extract_server_configs',
     'split_world_comm',
+    'get_usage_tokens_from_ctx',
+    'rewrite_usage_info_from_ctx',
+    'rewrite_usage_response_from_ctx',
 ]
+
+
+def validate_config_bool(value: Any, field_name: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    raise ValueError(
+        f"{field_name} must be a boolean, got {type(value).__name__}")
 
 
 class ServerRole(IntEnum):
@@ -25,6 +35,7 @@ class ServerRole(IntEnum):
     GENERATION = 1
     MM_ENCODER = 2
     VISUAL_GEN = 3
+    EMBEDDING = 4
 
 
 @dataclass
@@ -86,6 +97,15 @@ class DisaggServerConfig():
     # If this causes collisions, users can set node_id manually within range [0, 1023] in config
     schedule_style: Literal['context_first',
                             'generation_first'] = 'context_first'
+    allow_request_chat_template: bool = False
+    # Drop conversation history from generation_only requests to shrink the gen
+    # worker's request body / JSON-parse GIL cost at high concurrency. Enable
+    # ONLY for text-only, non-harmony deployments (see _get_gen_request).
+    gen_strip_message_history: bool = False
+    # Ask context workers to return prompt_token_ids as a base64 int32 buffer so
+    # the orchestrator relays a string instead of materializing the token-id list
+    # on its event loop. Text-only, non-harmony deployments (see _get_ctx_request).
+    gen_tokids_ctxbytes: bool = False
 
 
 @dataclass
@@ -95,6 +115,40 @@ class MetadataServerConfig():
     port: int = 2379
     health_check_timeout: float = 5.0
     refresh_interval: float = 10.0
+
+
+def get_usage_tokens_from_ctx(
+        ctx_usage: Optional[Any]) -> tuple[Optional[int], int]:
+    if ctx_usage is None:
+        return None, 0
+
+    prompt_tokens = ctx_usage.prompt_tokens
+    cached_tokens = 0
+    prompt_tokens_details = ctx_usage.prompt_tokens_details
+    if prompt_tokens_details is not None:
+        cached_tokens = prompt_tokens_details.cached_tokens
+    return prompt_tokens, cached_tokens
+
+
+def rewrite_usage_info_from_ctx(usage: Optional[Any],
+                                ctx_usage: Optional[Any]) -> Optional[Any]:
+    prompt_tokens, cached_tokens = get_usage_tokens_from_ctx(ctx_usage)
+    if prompt_tokens is None or usage is None:
+        return usage
+
+    from tensorrt_llm.serve.openai_protocol import PromptTokensDetails
+
+    usage.prompt_tokens = prompt_tokens
+    usage.total_tokens = prompt_tokens + (usage.completion_tokens or 0)
+    usage.prompt_tokens_details = PromptTokensDetails(
+        cached_tokens=cached_tokens)
+    return usage
+
+
+def rewrite_usage_response_from_ctx(response: Any,
+                                    ctx_usage: Optional[Any]) -> Any:
+    rewrite_usage_info_from_ctx(response.usage, ctx_usage)
+    return response
 
 
 def get_ctx_gen_server_addrs(
@@ -135,6 +189,9 @@ def extract_disagg_cfg(hostname: str = 'localhost',
                        schedule_style: Literal[
                            'context_first',
                            'generation_first'] = 'context_first',
+                       allow_request_chat_template: bool = False,
+                       gen_strip_message_history: bool = False,
+                       gen_tokids_ctxbytes: bool = False,
                        **kwargs: Any) -> DisaggServerConfig:
     context_servers = context_servers or {}
     generation_servers = generation_servers or {}
@@ -182,6 +239,10 @@ def extract_disagg_cfg(hostname: str = 'localhost',
         config.node_id = node_id
     if schedule_style:
         config.schedule_style = schedule_style
+    config.allow_request_chat_template = validate_config_bool(
+        allow_request_chat_template, "allow_request_chat_template")
+    config.gen_strip_message_history = gen_strip_message_history
+    config.gen_tokids_ctxbytes = gen_tokids_ctxbytes
     return config
 
 
@@ -238,6 +299,13 @@ def extract_router_config(server_cfg: dict) -> RouterConfig:
     for key in extract_keys:
         if key in server_cfg:
             args[key] = server_cfg[key]
+
+    # tokens_per_block lives under kv_cache_config; the cache-aware router must
+    # use the same block size as the worker or block hashes never match. Carry
+    # the explicit server value over unless the router block already set it.
+    kv_cache_config = server_cfg.get("kv_cache_config") or {}
+    if "tokens_per_block" not in args and "tokens_per_block" in kv_cache_config:
+        args["tokens_per_block"] = kv_cache_config["tokens_per_block"]
 
     return RouterConfig(type=router_type, args=args)
 

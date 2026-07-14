@@ -1,0 +1,3 @@
+include: _template_yaml
+task: mmmu_pro_standard_4
+dataset_name: "standard (4 options)"

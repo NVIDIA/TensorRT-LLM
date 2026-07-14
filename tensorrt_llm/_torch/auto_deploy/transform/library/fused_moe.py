@@ -1,4 +1,19 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 import math
+import operator
 from collections import defaultdict
 from functools import partial
 from typing import Dict, List, Literal, Optional, Tuple, Type
@@ -33,6 +48,7 @@ from ...utils._graph import (
     get_attr_by_name,
 )
 from ...utils.cuda_mem_tracker import cuda_memory_tracker
+from ...utils.dist_config import DistConfig
 from ...utils.logger import ad_logger
 from ...utils.module import get_submodule_of_param
 from ...utils.node_utils import (
@@ -1577,17 +1593,19 @@ def remove_original_experts(gm: GraphModule, weight_lists: List[List[Node]]) -> 
     weight_lists_flat = [w for weights in weight_lists for w in weights]
 
     for w in weight_lists_flat:
-        w_param = get_attr_by_name(gm, w.target)
-        if w_param is not None:
-            owner_module, owner_module_path, param_name = get_submodule_of_param(gm, w.target)
-            owner_param = get_attr_by_name(owner_module, param_name)
-            if owner_param is w_param:
-                gm.delete_submodule(owner_module_path)
-            else:
-                # param w is not owned by owner_module, skip
-                continue
-        else:
+        # Experts may share an owning container (e.g. nn.ParameterList): deleting it for the
+        # first expert removes its siblings too, so later targets resolve to a missing attr.
+        try:
+            w_param = get_attr_by_name(gm, w.target)
+        except AttributeError:
             continue
+        if w_param is None:
+            continue
+        owner_module, owner_module_path, param_name = get_submodule_of_param(gm, w.target)
+        owner_param = get_attr_by_name(owner_module, param_name)
+        # delete_submodule requires a non-empty submodule path; root params can't be dropped this way.
+        if owner_param is w_param and owner_module_path:
+            gm.delete_submodule(owner_module_path)
 
 
 def _stack_fp8_moe_weights(
@@ -2281,7 +2299,15 @@ def _stack_nvfp4_cutlass_moe_weights(
             )
 
         node.replace_all_uses_with(new_node)
+        input_nodes = node.all_input_nodes
         graph.erase_node(node)
+        for input_node in input_nodes:
+            if input_node.op == "get_attr" and len(input_node.users) == 0:
+                graph.erase_node(input_node)
+        # Free per-layer to avoid accumulating ~ per_layer_weight_bytes across all MoE layers.
+        # Only pass weight lists; scales/alphas live as buffers under the same submodules and
+        # are removed together when delete_submodule(...) drops the owning module.
+        remove_original_experts(gm, [w1_list, w2_list, w3_list])
 
     # Clean up after processing all nodes
     # eliminate_dead_code will remove unused get_attr nodes, then delete_all_unused_submodules
@@ -2291,10 +2317,148 @@ def _stack_nvfp4_cutlass_moe_weights(
     return fused_key_counter
 
 
+def _direct_noaux_getitem(node, expected_index: int) -> Optional[Node]:
+    """Return the noaux_tc_op tuple source for direct getitem(noaux, expected_index)."""
+    if (
+        isinstance(node, Node)
+        and node.target is operator.getitem
+        and len(node.args) >= 2
+        and node.args[1] == expected_index
+        and is_op(node.args[0], torch.ops.trtllm.noaux_tc_op)
+    ):
+        return node.args[0]
+    return None
+
+
+def _find_selected_experts_noaux(node) -> Optional[Node]:
+    """Trace selected_experts back to noaux_tc_op.
+
+    Non-EP uses getitem(noaux, 1) directly. EP all-reduce sharding localizes global expert
+    IDs by subtracting a rank offset, so peel off that integer subtraction before matching.
+    """
+    noaux = _direct_noaux_getitem(node, expected_index=1)
+    if noaux is not None:
+        return noaux
+
+    if (
+        isinstance(node, Node)
+        and node.target is operator.sub
+        and len(node.args) == 2
+        and isinstance(node.args[1], int)
+    ):
+        return _find_selected_experts_noaux(node.args[0])
+    return None
+
+
+def _find_ep_rank_mask_noaux(node) -> Optional[Node]:
+    """Trace an EP rank mask back to the noaux selected_experts output.
+
+    This matches the mask introduced by EP all-reduce sharding:
+    selected_experts // experts_per_rank == ep_rank. Non-EP graphs do not have this
+    mask, and callers only use this helper after the direct non-EP routing match fails.
+    """
+    if not (
+        isinstance(node, Node)
+        and node.target in (torch.eq, torch.ge)
+        and len(node.args) == 2
+        and isinstance(node.args[1], int)
+    ):
+        return None
+
+    floordiv_node = node.args[0]
+    if not (
+        isinstance(floordiv_node, Node)
+        and floordiv_node.target is operator.floordiv
+        and len(floordiv_node.args) == 2
+        and isinstance(floordiv_node.args[1], int)
+    ):
+        return None
+    return _direct_noaux_getitem(floordiv_node.args[0], expected_index=1)
+
+
+def _find_routing_weights_noaux(node) -> Optional[Node]:
+    """Trace routing_weights back to noaux_tc_op.
+
+    Non-EP uses getitem(noaux, 0) directly. EP all-reduce sharding masks routing
+    weights by rank, so also match routing_weights * rank_mask when both sides
+    originate from the same noaux_tc_op.
+    """
+    noaux = _direct_noaux_getitem(node, expected_index=0)
+    if noaux is not None:
+        return noaux
+
+    if not (isinstance(node, Node) and node.target is operator.mul and len(node.args) == 2):
+        return None
+
+    lhs_noaux = _find_routing_weights_noaux(node.args[0])
+    rhs_mask_noaux = _find_ep_rank_mask_noaux(node.args[1])
+    if lhs_noaux is not None and lhs_noaux is rhs_mask_noaux:
+        return lhs_noaux
+
+    rhs_noaux = _find_routing_weights_noaux(node.args[1])
+    lhs_mask_noaux = _find_ep_rank_mask_noaux(node.args[0])
+    if rhs_noaux is not None and rhs_noaux is lhs_mask_noaux:
+        return rhs_noaux
+    return None
+
+
+def _extract_noaux_internal_routing(
+    selected_experts: Node, routing_weights: Node
+) -> Optional[Tuple[Node, Node, int, int, int, float]]:
+    """Extract TRTLLM-Gen internal-routing inputs from matching noaux routing tensors.
+
+    Internal routing is safe only when selected_experts and routing_weights come from the
+    same noaux_tc_op. If either tensor has an unrecognized producer, return None and keep
+    the external-routing fused MoE path.
+    """
+    selected_noaux = _find_selected_experts_noaux(selected_experts)
+    weights_noaux = _find_routing_weights_noaux(routing_weights)
+    if selected_noaux is None or selected_noaux is not weights_noaux:
+        return None
+
+    if len(selected_noaux.args) < 6:
+        return None
+
+    router_logits, routing_bias, n_group, topk_group, top_k, routed_scaling_factor = (
+        selected_noaux.args[:6]
+    )
+    if not isinstance(router_logits, Node) or not isinstance(routing_bias, Node):
+        return None
+    if not all(isinstance(v, int) for v in (n_group, topk_group, top_k)):
+        return None
+    if not isinstance(routed_scaling_factor, (float, int)):
+        return None
+
+    return (
+        router_logits,
+        routing_bias,
+        int(top_k),
+        int(n_group),
+        int(topk_group),
+        float(routed_scaling_factor),
+    )
+
+
+def _node_uses_moe_alltoall(node: Node) -> bool:
+    mapping_config = node.kwargs.get("mapping_config", "") if node.kwargs else ""
+    if not mapping_config:
+        return False
+    try:
+        mapping = DistConfig.deserialize(mapping_config)
+    except (TypeError, ValueError):
+        ad_logger.debug_once(
+            "Skip TRTLLM-Gen internal routing: unable to parse MoE mapping config.",
+            key="trtllm_gen_nvfp4_internal_routing_skip_mapping_parse",
+        )
+        return True
+    return mapping.enable_attention_dp and mapping.moe_ep_size > 1
+
+
 def _stack_nvfp4_trtllm_gen_moe_weights(
     gm: GraphModule,
     allow_different_input_scales: bool = False,
     reverse_interleaved_input_scales: bool = True,
+    enable_trtllm_gen_internal_routing: bool = True,
 ) -> int:
     def _register_parameter(target, value):
         gm.register_parameter(target, torch.nn.Parameter(value, requires_grad=False))
@@ -2637,19 +2801,6 @@ def _stack_nvfp4_trtllm_gen_moe_weights(
         _register_parameter(new_key_fc2_alpha, fc2_alpha)
 
         with graph.inserting_before(node):
-            args = (
-                hidden_states,
-                selected_experts,
-                routing_weights,
-                graph.get_attr(new_key_fc1),
-                graph.get_attr(new_key_fc2),
-                graph.get_attr(new_key_fc1_scale),
-                graph.get_attr(new_key_fc2_scale),
-                graph.get_attr(new_key_fc1_act_scale),
-                graph.get_attr(new_key_fc1_scale_c),
-                graph.get_attr(new_key_fc1_alpha),
-                graph.get_attr(new_key_fc2_alpha),
-            )
             kwargs = dict(node.kwargs) if node.kwargs else {}
             kwargs.update(
                 {
@@ -2657,6 +2808,55 @@ def _stack_nvfp4_trtllm_gen_moe_weights(
                     "act_fn": act_fn,
                 }
             )
+            internal_routing_args = None
+            if enable_trtllm_gen_internal_routing and not _node_uses_moe_alltoall(node):
+                internal_routing_args = _extract_noaux_internal_routing(
+                    selected_experts, routing_weights
+                )
+
+            use_internal_routing = internal_routing_args is not None
+            if use_internal_routing:
+                router_logits, routing_bias, top_k, n_group, topk_group, routed_scaling_factor = (
+                    internal_routing_args
+                )
+                args = (
+                    hidden_states,
+                    None,
+                    None,
+                    graph.get_attr(new_key_fc1),
+                    graph.get_attr(new_key_fc2),
+                    graph.get_attr(new_key_fc1_scale),
+                    graph.get_attr(new_key_fc2_scale),
+                    graph.get_attr(new_key_fc1_act_scale),
+                    graph.get_attr(new_key_fc1_scale_c),
+                    graph.get_attr(new_key_fc1_alpha),
+                    graph.get_attr(new_key_fc2_alpha),
+                )
+                kwargs.update(
+                    {
+                        "router_logits": router_logits,
+                        "routing_bias": routing_bias,
+                        "top_k": top_k,
+                        "n_group": n_group,
+                        "topk_group": topk_group,
+                        "routed_scaling_factor": routed_scaling_factor,
+                    }
+                )
+            else:
+                args = (
+                    hidden_states,
+                    selected_experts,
+                    routing_weights,
+                    graph.get_attr(new_key_fc1),
+                    graph.get_attr(new_key_fc2),
+                    graph.get_attr(new_key_fc1_scale),
+                    graph.get_attr(new_key_fc2_scale),
+                    graph.get_attr(new_key_fc1_act_scale),
+                    graph.get_attr(new_key_fc1_scale_c),
+                    graph.get_attr(new_key_fc1_alpha),
+                    graph.get_attr(new_key_fc2_alpha),
+                )
+
             new_node = graph.call_function(
                 replacement_op,
                 args=args,
@@ -2664,7 +2864,15 @@ def _stack_nvfp4_trtllm_gen_moe_weights(
             )
 
         node.replace_all_uses_with(new_node)
+        input_nodes = node.all_input_nodes
         graph.erase_node(node)
+        for input_node in input_nodes:
+            if input_node.op == "get_attr" and len(input_node.users) == 0:
+                graph.erase_node(input_node)
+        # Free per-layer to avoid accumulating ~ per_layer_weight_bytes across all MoE layers.
+        # Only pass weight lists; scales/alphas live as buffers under the same submodules and
+        # are removed together when delete_submodule(...) drops the owning module.
+        remove_original_experts(gm, [w1_list, w2_list, w3_list])
         fused_key_counter += 1
 
     eliminate_dead_code(gm)
@@ -2697,6 +2905,13 @@ class FuseNVFP4MoeConfig(TransformConfig):
             "before TRTLLM-Gen shuffle+interleave. Only used when backend='trtllm_gen'."
         ),
     )
+    enable_trtllm_gen_internal_routing: bool = Field(
+        default=True,
+        description=(
+            "If True and backend='trtllm_gen', pass router logits and routing bias "
+            "directly to TRTLLM-Gen MoE when the routing tensors come from trtllm.noaux_tc_op."
+        ),
+    )
 
 
 @TransformRegistry.register("fuse_nvfp4_moe")
@@ -2717,7 +2932,11 @@ class FuseNVFP4Moe(BaseTransform):
         factory: ModelFactory,
         shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
-        ad_logger.info(f"FuseNVFP4Moe: backend={self.config.backend}")
+        ad_logger.info(
+            f"FuseNVFP4Moe: backend={self.config.backend}, "
+            "enable_trtllm_gen_internal_routing="
+            f"{self.config.enable_trtllm_gen_internal_routing}"
+        )
         with cuda_memory_tracker():
             if self.config.backend == "cutlass":
                 fused_key_counter = _stack_nvfp4_cutlass_moe_weights(
@@ -2729,6 +2948,9 @@ class FuseNVFP4Moe(BaseTransform):
                     gm,
                     allow_different_input_scales=self.config.allow_different_input_scales,
                     reverse_interleaved_input_scales=self.config.reverse_interleaved_input_scales,
+                    enable_trtllm_gen_internal_routing=(
+                        self.config.enable_trtllm_gen_internal_routing
+                    ),
                 )
 
         info = TransformInfo(

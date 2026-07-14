@@ -11,6 +11,8 @@ class ExaoneMoeWeightMapper(HfWeightMapper):
         super().__init__()
 
         # MoE expert weights: gate_proj->w1, up_proj->w3, down_proj->w2
+        # (used for per-expert checkpoint layouts; upstream HF transformers
+        # >=5.3 stores fused 3D tensors instead, handled below.)
         # e_score_correction_bias: move into gate module
         self.params_map = {
             r"(.*experts\.\d+\.)gate_proj(.*)": r"\1w1\2",
@@ -56,8 +58,29 @@ class ExaoneMoeWeightMapper(HfWeightMapper):
         allow_partial_loading: bool = False,
     ) -> None:
         if isinstance(module, MoE):
+            config = self.config.pretrained_config
             updated_module_weights = {}
             for weight_name, weight_value in module_weights.items():
+                # Upstream HF ExaoneMoeExperts (transformers >=5.3) stores fused
+                # 3D tensors: gate_up_proj [E, 2*I, H], down_proj [E, H, I].
+                # Expand into per-expert views (zero-copy) so VANILLA loading
+                # can handle them without the peak GPU memory of a full transpose.
+                if weight_name == "gate_up_proj" and weight_value.ndim == 3:
+                    if weight_value.shape[-2] == 2 * config.moe_intermediate_size and (
+                        weight_value.shape[-1] == config.hidden_size
+                    ):
+                        half = weight_value.shape[-2] // 2
+                        for i in range(weight_value.shape[0]):
+                            updated_module_weights[f"{i}.w1.weight"] = weight_value[i, :half, :]
+                            updated_module_weights[f"{i}.w3.weight"] = weight_value[i, half:, :]
+                        continue
+                elif weight_name == "down_proj" and weight_value.ndim == 3:
+                    if weight_value.shape[-2] == config.hidden_size and (
+                        weight_value.shape[-1] == config.moe_intermediate_size
+                    ):
+                        for i in range(weight_value.shape[0]):
+                            updated_module_weights[f"{i}.w2.weight"] = weight_value[i]
+                        continue
                 new_weight_name = weight_name.replace("weight_scale", "weight_scale_inv")
                 if new_weight_name.endswith(".weight_scale_inv"):
                     weight_value = weight_value.squeeze()

@@ -18,10 +18,12 @@ from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 )
 def test_w4a8_linear(dtype, weights_dtype, has_zero=False):
 
-    if get_sm_version() > FinegrainedMixedDtypeGemm.MAX_SUPPORTED_SM_VERSION:
+    # W4A8 requires an FP8-capable mixed-dtype dispatch; SM120/121 fall back
+    # to the Sm80 MMA path which has no FP8, so W4A8 stays gated on SM>103.
+    if get_sm_version(
+    ) > FinegrainedMixedDtypeGemm.MAX_SUPPORTED_SM_VERSION_W4A8:
         pytest.skip(
-            f"W4A16/W4A8 is not supported in this SM version {get_sm_version()}"
-        )
+            f"W4A8 is not supported in this SM version {get_sm_version()}")
 
     SEQ_LEN = 10
     HIDDEN_SIZE = 128

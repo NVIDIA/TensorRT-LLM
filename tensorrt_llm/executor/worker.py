@@ -5,7 +5,7 @@ import time
 import traceback
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
-from typing import List, Optional, Union
+from typing import List, Optional
 
 import zmq
 
@@ -13,7 +13,6 @@ from tensorrt_llm.logger import logger
 
 from .._utils import mpi_comm, mpi_rank, print_all_stacks
 from ..bindings import executor as tllm
-from ..builder import Engine
 from ..llmapi.llm_args import BaseLlmArgs
 from ..llmapi.mpi_session import set_mpi_session_cpp
 from ..llmapi.tokenizer import TokenizerBase
@@ -26,7 +25,8 @@ from .postproc_worker import (PostprocWorker, PostprocWorkerConfig,
                               postproc_worker_main)
 from .request import CancellingRequest, GenerationRequest
 from .rpc_worker_mixin import RpcWorkerMixin
-from .utils import ErrorResponse, RequestError, WorkerCommIpcAddrs
+from .utils import (ErrorResponse, IntraProcessQueue, RequestError,
+                    WorkerCommIpcAddrs)
 
 __all__ = [
     "GenerationExecutorWorker",
@@ -37,7 +37,7 @@ class GenerationExecutorWorker(RpcWorkerMixin, BaseWorker):
 
     def __init__(
         self,
-        engine: Union[Path, Engine],
+        engine: Path,
         executor_config: Optional[tllm.ExecutorConfig] = None,
         batched_logits_processor: Optional[BatchedLogitsProcessor] = None,
         postproc_worker_config: Optional[PostprocWorkerConfig] = None,
@@ -58,6 +58,10 @@ class GenerationExecutorWorker(RpcWorkerMixin, BaseWorker):
             tokenizer=tokenizer,
             llm_args=llm_args,
         )
+
+        if (self.llm_args is not None
+                and getattr(self.llm_args, "enable_resource_governor", False)):
+            self._resource_governor_queue = IntraProcessQueue()
 
         self.setup_engine()
 
@@ -118,6 +122,29 @@ class GenerationExecutorWorker(RpcWorkerMixin, BaseWorker):
                     self._executor_config.checkpoint_loader.cleanup()
                     self._executor_config.checkpoint_loader = None
 
+        # Destroy torch distributed process groups so that NCCL communicators
+        # are torn down cleanly before MPI session shutdown and process exit.
+        # This is done here (not in PyExecutor.shutdown()) because the MPI
+        # worker owns the process group.  In the Ray path the process group
+        # belongs to RayWorkerWrapper and must not be destroyed by the engine.
+        import torch.distributed
+        if torch.distributed.is_initialized():
+            torch.distributed.destroy_process_group()
+
+        # Return this rank's GPU memory to the driver. Under an external MPI
+        # launch (mpirun/srun, e.g. CI), the worker process is long-lived and
+        # shared across successive LLM instances: a new GenerationExecutorWorker
+        # is built for each LLM, but the OS process -- and with it the CUDA
+        # context and PyTorch caching allocator -- persists. Setting
+        # `self.engine = None` above is not enough to free the GPU: reference
+        # cycles keep the model tensors alive until a later GC, and the allocator
+        # holds freed blocks as "reserved" instead of returning them. Without
+        # this, the previous model's ~weights-sized reservation carries into the
+        # next LLM built in this process and can OOM its load (e.g. back-to-back
+        # tests in one CI shard).
+        gc.collect()
+        torch.cuda.empty_cache()
+
         # Check if there are any errors from the threads before shutdown.
         self._handle_background_error()
 
@@ -137,7 +164,7 @@ class GenerationExecutorWorker(RpcWorkerMixin, BaseWorker):
 
 @print_traceback_on_error
 def worker_main(
-    engine: Path | Engine,
+    engine: Path,
     worker_queues: WorkerCommIpcAddrs,
     log_level: str,
     executor_config: Optional[tllm.ExecutorConfig] = None,
@@ -188,6 +215,7 @@ def worker_main(
 
     result_queue: Optional[IpcQueue] = None
     result_queues: Optional[List[IpcQueue]] = None
+    resource_governor_queue: Optional[IpcQueue] = None
 
     postproc_worker_config = postproc_worker_config or PostprocWorkerConfig()
 
@@ -216,6 +244,11 @@ def worker_main(
             is_server=False,
             socket_type=zmq.DEALER,
             name="worker_init_status_queue")
+        resource_governor_queue = IpcQueue(
+            worker_queues.resource_governor_queue_addr,
+            is_server=False,
+            name="worker_resource_governor_queue"
+        ) if worker_queues.resource_governor_queue_addr else None
 
         if postproc_worker_config.enabled:
             # IPC queues for sending inputs to the postprocess parallel
@@ -261,6 +294,7 @@ def worker_main(
                 proxy_result_queue,
                 postproc_worker_config.postprocess_tokenizer_dir,
                 PostprocWorker.default_record_creator,
+                postproc_worker_config.post_processor_hook,
             )
             postprocess_worker_futures.append(fut)
 
@@ -321,6 +355,13 @@ def worker_main(
                     logger.warning(
                         "Failed to deliver ready signal to proxy, continuing anyway"
                     )
+                if resource_governor_queue is not None:
+                    # Swap rank 0 to the proxy IPC queue after construction.
+                    # The resource-governor flag is already enabled on all
+                    # ranks.
+                    worker.engine.set_resource_governor_queue(
+                        resource_governor_queue)
+
                 while (req := request_queue.get()) is not None:
                     if isinstance(req, CancellingRequest):
                         worker.abort_request(req.id)

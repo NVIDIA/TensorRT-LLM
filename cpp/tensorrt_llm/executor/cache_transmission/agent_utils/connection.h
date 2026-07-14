@@ -331,6 +331,9 @@ public:
 private:
     std::map<std::string, std::shared_ptr<AgentConnection>> mConnections;
     std::mutex mConnectionsMutex;
+    /// Connection info for dynamically discovered agents that are not listed in mCommState.
+    std::map<std::string, std::string> mRemoteConnectionInfo;
+    std::mutex mRemoteConnectionInfoMutex;
     CommState mCommState;
     CacheState mCacheState;
     std::optional<CacheState::RnnCacheState> mRnnCacheState;

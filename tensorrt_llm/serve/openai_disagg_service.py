@@ -13,9 +13,7 @@
 # limitations under the License.
 
 import asyncio
-import json
 import os
-from collections.abc import AsyncIterator
 from typing import Any, Callable, Dict, Optional
 
 from tensorrt_llm.llmapi.disagg_utils import (
@@ -36,7 +34,6 @@ from tensorrt_llm.serve.openai_protocol import (
     CompletionRequest,
     DisaggregatedParams,
     DisaggScheduleStyle,
-    PromptTokensDetails,
     UCompletionRequest,
     UCompletionResponse,
 )
@@ -48,6 +45,10 @@ from tensorrt_llm.serve.responses_utils import (
     done_generator,
 )
 from tensorrt_llm.serve.router import KvCacheAwareRouter, Router
+
+# Finish reasons for which a GEN handoff is still pending; any other reason means
+# the CTX request already completed and the disagg KV-cache handoff was never set up.
+_GEN_PENDING_FINISH_REASONS = ("length", "not_finished")
 
 
 class OpenAIDisaggregatedService(OpenAIService):
@@ -76,6 +77,10 @@ class OpenAIDisaggregatedService(OpenAIService):
         self._perf_metrics_collector = perf_metrics_collector
         self._cluster_storage = disagg_cluster_storage
         self._health_check_interval_secs = health_check_interval_secs
+        # Opt-in body-shrink for generation_only requests; see _get_gen_request.
+        self._strip_gen_message_history = config.gen_strip_message_history
+        # Opt-in: ask context workers to return prompt_token_ids as base64 int32.
+        self._tokids_ctxbytes = config.gen_tokids_ctxbytes
 
         self._ctx_client = None
         self._gen_client = None
@@ -102,6 +107,10 @@ class OpenAIDisaggregatedService(OpenAIService):
         if not await self.is_ready():
             raise RuntimeError("Cluster is not ready")
         if not isinstance(request.prompt, str):
+            # Reject empty prompt lists explicitly so the router does not
+            # index prompt[0] on an empty list.
+            if isinstance(request.prompt, list) and len(request.prompt) == 0:
+                raise ValueError("Disaggregated server does not support empty prompt list")
             # Check if it's a list and contains integers
             if type(request.prompt) is list and len(request.prompt) == 1:
                 request.prompt = request.prompt[0]
@@ -146,15 +155,15 @@ class OpenAIDisaggregatedService(OpenAIService):
                 ctx_req, server=ctx_server, hooks=hooks
             )
             await self._verify_ctx_response(ctx_response)
+            ctx_response_disagg_params = ctx_response.choices[0].disaggregated_params
+            if ctx_response_disagg_params.disagg_request_id is not None:
+                disagg_request_id = ctx_response_disagg_params.disagg_request_id
             gen_req = self._get_gen_request(request, ctx_response, disagg_request_id)
         else:
-            # Clear synthetic disaggregated_params that may have been
-            # injected by _extract_conversation_id (e.g. from the
-            # X-Correlation-ID header).  When need_ctx=False the gen
-            # server handles full generation and must not see a stale
-            # request_type="context_only".
+            # When need_ctx=False the gen server handles full generation and
+            # must not see a stale request_type="context_only".
             # _check_gen_only_disagg already sets proper generation_only
-            # params when applicable, so only clear the synthetic ones.
+            # params when applicable.
             if (
                 gen_req.disaggregated_params is not None
                 and gen_req.disaggregated_params.request_type == "context_only"
@@ -168,7 +177,7 @@ class OpenAIDisaggregatedService(OpenAIService):
             gen_response = await self._gen_client.send_request(
                 gen_req, server=gen_server, hooks=hooks
             )
-            return self._rewrite_disagg_usage(gen_response, ctx_response)
+            return gen_response
         else:
             if request.stream:
                 # ctx client will never return a generator when streaming is requested
@@ -176,136 +185,16 @@ class OpenAIDisaggregatedService(OpenAIService):
                 return done_generator()
             return ctx_response
 
-    def _ctx_usage_for_client(
-        self, ctx_response: Optional[UCompletionResponse]
-    ) -> tuple[Optional[int], int]:
-        if ctx_response is None or ctx_response.usage is None:
-            return None, 0
-
-        prompt_tokens = ctx_response.usage.prompt_tokens
-        cached_tokens = 0
-        prompt_tokens_details = ctx_response.usage.prompt_tokens_details
-        if prompt_tokens_details is not None:
-            cached_tokens = prompt_tokens_details.cached_tokens
-        return prompt_tokens, cached_tokens
-
-    def _rewrite_usage_payload_from_ctx(
-        self,
-        usage: dict[str, Any],
-        ctx_response: Optional[UCompletionResponse],
-    ) -> None:
-        prompt_tokens, cached_tokens = self._ctx_usage_for_client(ctx_response)
-        if prompt_tokens is None:
-            return
-
-        usage["prompt_tokens"] = prompt_tokens
-        usage["total_tokens"] = prompt_tokens + (usage.get("completion_tokens") or 0)
-        prompt_tokens_details = usage.get("prompt_tokens_details")
-        if not isinstance(prompt_tokens_details, dict):
-            prompt_tokens_details = {}
-            usage["prompt_tokens_details"] = prompt_tokens_details
-        prompt_tokens_details["cached_tokens"] = cached_tokens
-
-    def _rewrite_usage_response_from_ctx(
-        self,
-        response: UCompletionResponse,
-        ctx_response: Optional[UCompletionResponse],
-    ) -> UCompletionResponse:
-        prompt_tokens, cached_tokens = self._ctx_usage_for_client(ctx_response)
-        if prompt_tokens is None or response.usage is None:
-            return response
-
-        response.usage.prompt_tokens = prompt_tokens
-        response.usage.total_tokens = prompt_tokens + (response.usage.completion_tokens or 0)
-        response.usage.prompt_tokens_details = PromptTokensDetails(cached_tokens=cached_tokens)
-        return response
-
-    @staticmethod
-    def _sse_separator_index(data: bytes) -> tuple[int, bytes] | None:
-        indexes = [(data.find(sep), sep) for sep in (b"\n\n", b"\r\n\r\n")]
-        indexes = [(idx, sep) for idx, sep in indexes if idx >= 0]
-        if not indexes:
-            return None
-        return min(indexes, key=lambda item: item[0])
-
-    def _rewrite_usage_sse_event_from_ctx(
-        self,
-        event: bytes,
-        ctx_response: Optional[UCompletionResponse],
-    ) -> bytes:
-        separator_match = self._sse_separator_index(event)
-        separator = separator_match[1] if separator_match else b""
-        event_body = event[: -len(separator)] if separator else event
-        data_lines = [
-            line.removeprefix(b"data:").strip()
-            for line in event_body.splitlines()
-            if line.startswith(b"data:")
-        ]
-        if len(data_lines) != 1 or data_lines[0] == b"[DONE]":
-            return event
-
-        try:
-            payload = json.loads(data_lines[0])
-        except json.JSONDecodeError:
-            return event
-
-        usage = payload.get("usage") if isinstance(payload, dict) else None
-        if not isinstance(usage, dict):
-            return event
-
-        self._rewrite_usage_payload_from_ctx(usage, ctx_response)
-        return b"data: " + json.dumps(payload, separators=(",", ":")).encode("utf-8") + separator
-
-    async def _rewrite_streaming_usage_from_ctx(
-        self,
-        response: AsyncIterator[Any],
-        ctx_response: Optional[UCompletionResponse],
-    ) -> AsyncIterator[Any]:
-        pending = b""
-        pending_is_str = False
-        async for chunk in response:
-            is_str = isinstance(chunk, str)
-            chunk_bytes = chunk.encode("utf-8") if is_str else chunk
-            if not isinstance(chunk_bytes, bytes):
-                yield chunk
-                continue
-
-            if not pending:
-                pending_is_str = is_str
-            pending += chunk_bytes
-            while separator_match := self._sse_separator_index(pending):
-                separator_index, separator = separator_match
-                event_end = separator_index + len(separator)
-                event = pending[:event_end]
-                pending = pending[event_end:]
-                event = self._rewrite_usage_sse_event_from_ctx(event, ctx_response)
-                yield event.decode("utf-8") if pending_is_str else event
-                if not pending:
-                    pending_is_str = False
-
-        if pending:
-            event = self._rewrite_usage_sse_event_from_ctx(pending, ctx_response)
-            yield event.decode("utf-8") if pending_is_str else event
-
-    def _rewrite_disagg_usage(
-        self,
-        response: UCompletionResponseOrGenerator,
-        ctx_response: Optional[UCompletionResponse],
-    ) -> UCompletionResponseOrGenerator:
-        if ctx_response is None:
-            return response
-        if hasattr(response, "__aiter__"):
-            return self._rewrite_streaming_usage_from_ctx(response, ctx_response)
-        return self._rewrite_usage_response_from_ctx(response, ctx_response)
-
     def _need_gen(self, response: UCompletionResponse) -> bool:
-        if response and response.choices[0].finish_reason not in ["length", "not_finished"]:
+        if response and response.choices[0].finish_reason not in _GEN_PENDING_FINISH_REASONS:
             del response.choices[0].disaggregated_params
             return False
         return True
 
     @staticmethod
     def _get_conversation_id(request: UCompletionRequest) -> Optional[str]:
+        if request.conversation_params is not None:
+            return request.conversation_params.conversation_id
         if request.disaggregated_params is not None:
             return request.disaggregated_params.conversation_id
         return None
@@ -313,13 +202,15 @@ class OpenAIDisaggregatedService(OpenAIService):
     def _get_ctx_request(
         self, request: UCompletionRequest, disagg_request_id: Optional[int]
     ) -> UCompletionRequest:
+        conversation_id = self._get_conversation_id(request)
         ctx_request = request.model_copy(
             update={
                 "disaggregated_params": DisaggregatedParams(
                     request_type="context_only",
                     disagg_request_id=disagg_request_id,
                     schedule_style=self._schedule_style,
-                    conversation_id=self._get_conversation_id(request),
+                    conversation_id=conversation_id,
+                    return_prompt_token_ids_b64=self._tokids_ctxbytes,
                 ),
                 "stream": False,
                 "stream_options": None,
@@ -340,11 +231,28 @@ class OpenAIDisaggregatedService(OpenAIService):
             request.disaggregated_params.request_type = "generation_only"
             request.disaggregated_params.schedule_style = self._schedule_style
             request.disaggregated_params.conversation_id = conversation_id
+            request.disaggregated_params.ctx_usage = ctx_response.usage
             # Replace the string prompt with prompt_tokens_ids
             if isinstance(request, CompletionRequest):
                 request.prompt = ctx_response.prompt_token_ids
             elif isinstance(request, ChatCompletionRequest):
-                request.prompt_token_ids = ctx_response.prompt_token_ids
+                # Relay the base64 token-id string verbatim (no int-list
+                # materialization on the orchestrator loop), else the int array.
+                if ctx_response.prompt_token_ids_b64 is not None:
+                    request.prompt_token_ids_b64 = ctx_response.prompt_token_ids_b64
+                else:
+                    request.prompt_token_ids = ctx_response.prompt_token_ids
+                # Opt-in: drop conversation history so the gen worker doesn't
+                # re-parse the full conversation JSON (dominates its GIL at high
+                # concurrency). It uses prompt_token_ids and only reads the last
+                # message; tools are preserved. Config-gated because it's unsafe
+                # for harmony/multimodal workers (model type is fixed per deploy).
+                if (
+                    self._strip_gen_message_history
+                    and request.messages
+                    and len(request.messages) > 1
+                ):
+                    request.messages = request.messages[-1:]
         else:
             # no ctx response, it's either a generation-only request or a generation-first disagg request
             request.disaggregated_params = DisaggregatedParams(
@@ -377,13 +285,20 @@ class OpenAIDisaggregatedService(OpenAIService):
             gen_server, info = await self._gen_router.get_next_server(request)
             match_length = sum(info["matches"])
             total_length = sum(len(token_list) for token_list in info["token_lists"])
-            if (
+            need_ctx_decision = (
                 match_length == 0
                 or total_length - match_length
                 > self.conditional_disagg_config.max_local_prefill_length
-            ):
-                return gen_server, True
-            return gen_server, False
+            )
+            # Visibility hook for verifying bypass triggers in disagg deployments.
+            logger.debug(
+                f"[conditional_disagg] gen={gen_server} match={match_length} "
+                f"total={total_length} residual={total_length - match_length} "
+                f"max_local_prefill_length="
+                f"{self.conditional_disagg_config.max_local_prefill_length} "
+                f"→ need_ctx={need_ctx_decision}"
+            )
+            return gen_server, need_ctx_decision
         return None, True
 
     async def _check_gen_only_disagg(self, request: UCompletionRequest) -> bool:
@@ -408,7 +323,10 @@ class OpenAIDisaggregatedService(OpenAIService):
 
     async def is_ready(self) -> bool:
         if self._disagg_cluster_manager:
-            return await self._disagg_cluster_manager.is_ready()
+            return await self._disagg_cluster_manager.is_ready_with_router(
+                self._ctx_router.num_prepared_servers,
+                self._gen_router.num_prepared_servers,
+            )
         return True
 
     @property
@@ -504,28 +422,29 @@ class OpenAIDisaggregatedService(OpenAIService):
 
     async def _verify_ctx_response(self, ctx_response: UCompletionResponse) -> None:
         if ctx_response:
-            if len(ctx_response.choices) != 1:
-                raise ValueError(
-                    f"Context server returned {len(ctx_response.choices)} choices, expecting 1."
-                )
-            choice = ctx_response.choices[0]
-            if choice.disaggregated_params is None:
-                raise ValueError(
-                    f"Context server did not return disaggregated params."
-                    f" finish_reason={choice.finish_reason!r}"
-                )
-            if choice.disaggregated_params.ctx_request_id is None:
-                raise ValueError(
-                    f"Invalid disaggregated params: ctx_request_id is None."
-                    f" finish_reason={choice.finish_reason!r},"
-                    f" disagg_request_id={choice.disaggregated_params.disagg_request_id!r}"
-                )
-            if choice.disaggregated_params.disagg_request_id is None:
-                raise ValueError(
-                    f"Invalid disaggregated params: disagg_request_id is None."
-                    f" finish_reason={choice.finish_reason!r},"
-                    f" ctx_request_id={choice.disaggregated_params.ctx_request_id!r}"
-                )
+            for idx, choice in enumerate(ctx_response.choices):
+                if choice.disaggregated_params is None:
+                    raise ValueError(
+                        f"Context server choice {idx} did not return disaggregated params."
+                        f" finish_reason={choice.finish_reason!r}"
+                    )
+                # A CTX request that finished early (e.g. EOS during prefill) never
+                # sets up the KV-cache handoff, so ctx_request_id/disagg_request_id
+                # stay None. Only enforce them when a GEN handoff is still pending --
+                # mirroring _need_gen, which skips the handoff for these responses.
+                if choice.finish_reason in _GEN_PENDING_FINISH_REASONS:
+                    if choice.disaggregated_params.ctx_request_id is None:
+                        raise ValueError(
+                            f"Invalid disaggregated params: ctx_request_id is None for choice {idx}."
+                            f" finish_reason={choice.finish_reason!r},"
+                            f" disagg_request_id={choice.disaggregated_params.disagg_request_id!r}"
+                        )
+                    if choice.disaggregated_params.disagg_request_id is None:
+                        raise ValueError(
+                            f"Invalid disaggregated params: disagg_request_id is None for choice {idx}."
+                            f" finish_reason={choice.finish_reason!r},"
+                            f" ctx_request_id={choice.disaggregated_params.ctx_request_id!r}"
+                        )
             return ctx_response
 
     async def _send_disagg_request_gen_first(
@@ -577,9 +496,7 @@ class OpenAIDisaggregatedService(OpenAIService):
 
             # Now send ctx request — gen server has received its request
             try:
-                ctx_response = await self._ctx_client.send_request(
-                    ctx_req, server=ctx_server, hooks=hooks
-                )
+                await self._ctx_client.send_request(ctx_req, server=ctx_server, hooks=hooks)
             except Exception:
                 consume_task.cancel()
                 try:
@@ -605,7 +522,7 @@ class OpenAIDisaggregatedService(OpenAIService):
                     except asyncio.CancelledError:
                         pass
 
-            return self._rewrite_disagg_usage(_yield_from_queue(), ctx_response)
+            return _yield_from_queue()
         else:
             # Non-streaming or no ctx needed: both HTTP POSTs fire eagerly
             # through generator consumption, so asyncio.gather works fine.
@@ -622,5 +539,4 @@ class OpenAIDisaggregatedService(OpenAIService):
                 )
             )
             responses = await asyncio.gather(*tasks)
-            ctx_response = responses[0] if need_ctx else None
-            return self._rewrite_disagg_usage(responses[-1], ctx_response)
+            return responses[-1]

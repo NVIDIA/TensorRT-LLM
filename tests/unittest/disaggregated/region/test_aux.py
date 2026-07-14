@@ -78,9 +78,9 @@ def test_aux_buffer_meta_property():
     buf = AuxBuffer(max_slot_num=4, beam_width=2, max_draft_len=8, device="cpu")
     meta = buf.meta
     assert isinstance(meta, AuxBufferMeta)
-    assert len(meta.ptrs) == 3  # first_tokens_buffer + draft_tokens_buffer + token_counts_buffer
-    assert len(meta.size) == 3
-    assert len(meta.item_sizes) == 3
+    assert len(meta.ptrs) == 4
+    assert len(meta.size) == 4
+    assert len(meta.item_sizes) == 4
     assert meta.device == "cpu"
     # Verify sizes are positive
     assert all(s > 0 for s in meta.size)
@@ -95,12 +95,26 @@ def test_fill_slot_get_slot_tokens_round_trip():
     mock_request = MagicMock()
     mock_request.get_last_tokens.return_value = [42, 7]
     mock_request.py_draft_tokens = [10, 20, 30]
+    mock_request.prompt_len = 128
+    mock_request.cached_tokens = 9
+    mock_request.py_disaggregated_params = None
 
     buf.fill_slot(slot.id, mock_request)
     first_tokens, draft_tokens = buf.get_slot_tokens(slot.id)
+    first_tokens_with_usage, draft_tokens_with_usage, (prompt_tokens, cached_tokens) = (
+        buf.get_slot_data(slot.id)
+    )
 
+    print(
+        f"[usage_check] aux_buffer get_slot_data: "
+        f"prompt_tokens={prompt_tokens}, cached_tokens={cached_tokens}"
+    )
     assert first_tokens == [42, 7]
     assert draft_tokens == [10, 20, 30]
+    assert first_tokens_with_usage == [42, 7]
+    assert draft_tokens_with_usage == [10, 20, 30]
+    assert prompt_tokens == 128
+    assert cached_tokens == 9
 
 
 def test_fill_slot_unallocated_raises():

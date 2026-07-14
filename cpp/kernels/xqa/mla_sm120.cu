@@ -536,7 +536,12 @@ struct Producer
 #endif
         if (threadIdx.x == 0)
         {
-            smem.qkScaleLog2e = args.qScale * args.kvCacheScale[0] * log2e;
+            // ``kvCacheScale`` is the device-memory fp8 dequant scale. Callers
+            // may pass nullptr when scales are unset (e.g. unit tests, or
+            // scale=1.0 paths); default to 1.0 in that case to keep the kernel
+            // crash-safe.
+            float const kvScale = (args.kvCacheScale != nullptr) ? args.kvCacheScale[0] : 1.0f;
+            smem.qkScaleLog2e = args.qScale * kvScale * log2e;
         }
 
         if (threadIdx.x < headGrpSize)
@@ -1444,7 +1449,8 @@ __device__ inline void Consumer::compute()
     smem.mathWarpsBar.arrive();
 
     ThrdRegRowMax const accRowSum = loadShmRowMax<warpTile.y>(smem.accRowSum[tileIdx.x], tileBase.y, lane);
-    float const xvScale = computeRowSumFromF8 ? args.kvCacheScale[0] : args.kvCacheScale[0] * xScale;
+    float const kvScale = (args.kvCacheScale != nullptr) ? args.kvCacheScale[0] : 1.0f;
+    float const xvScale = computeRowSumFromF8 ? kvScale : kvScale * xScale;
     WarpOutputTile const output = finalize(acc, accRowSum, xvScale, lane);
 
     bool const isMultiBlockMode = (nbSubSeq != 1);

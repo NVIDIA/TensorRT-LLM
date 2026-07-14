@@ -162,13 +162,20 @@ class BatchDesc:
 
 
 @dataclass(slots=True)
-class HelixConfig:
-    helix_group_size: int
-    helix_gpu_rank: int
-    # number of tokens in one helix shard
-    helix_shard_size: int
-    # must be the same for all ranks in the same helix group and different for different helix groups.
-    shared_comm_port: int
+class SwaScratchReuseConfig:
+    """
+    Configuration for SWA scratch reuse.
+
+    Args:
+        max_rewind_len: Maximum number of tail tokens that can be rewound after
+            scratch-enabled allocation. Scratch reuse will not cover blocks that
+            may be needed to preserve those tokens.
+    """
+
+    max_rewind_len: int = 0
+
+    def __post_init__(self) -> None:
+        assert self.max_rewind_len >= 0, "max_rewind_len must be non-negative"
 
 
 @dataclass(slots=True)
@@ -206,14 +213,43 @@ class KVCacheManagerConfig:
     layer groups.
     """
 
-    ssm_reuse_interval: int = 512
+    initial_pool_ratio: list[float] | None = None
     """
-    Interval (in tokens) at which SSM state is snapshotted for prefix reuse.
-    Must be a positive multiple of tokens_per_block. Only takes effect when SSM layers are present.
+    User-provided initial memory partitioning between pool groups. When set, this
+    takes precedence over typical_step and constraints for initial sizing.
     """
 
-    # unsupported yet
-    helix_config: HelixConfig | None = None
+    swa_scratch_reuse: SwaScratchReuseConfig | None = None
+    """
+    When set, SWA layers reuse physical pages for out-of-window blocks during prefill.
+    Scratch blocks share coalesced slot sub-pages across blocks for the currently executing
+    layer, reducing peak memory. Trade-off: KV cache reuse is degraded because scratch blocks
+    have no preserved data after the step.
+
+    If max_rewind_len is non-zero, the rewindable tail is excluded from scratch reuse so
+    draft/target shared KV cache can preserve tokens that may survive speculative rewind.
+
+    Most useful for disaggregated prefill servers handling long prompts or long prompt chunks,
+    where the number of out-of-window blocks dominates memory usage.
+    """
+
+    commit_min_snapshot: bool = False
+    """
+    If True, commit() records only the minimum cache snapshot reusable at the post-call
+    num_committed_tokens. Only the minimum amount of pages required for such reuse will
+    be preserved.
+
+    Required when SSM layers are present.
+    """
+
+    enable_stats: bool = True
+    """
+    Collect V2 KV cache allocation, reuse, and transfer statistics.
+    """
+
+    @property
+    def enable_swa_scratch_reuse(self) -> bool:
+        return self.swa_scratch_reuse is not None
 
     def __post_init__(self) -> None:
         assert self.cache_tiers and self.cache_tiers[0].tier == CacheTier.GPU_MEM
@@ -227,11 +263,6 @@ class KVCacheManagerConfig:
             for buffer in layer.buffers
         )
         if any(layer.type == LayerType.SSM for layer in self.layers):
-            assert self.ssm_reuse_interval > 0, "ssm_reuse_interval must be positive"
-            assert self.ssm_reuse_interval % self.tokens_per_block == 0, (
-                f"ssm_reuse_interval ({self.ssm_reuse_interval}) must be a multiple of "
-                f"tokens_per_block ({self.tokens_per_block})"
-            )
-            assert not self.enable_partial_reuse, (
-                "enable_partial_reuse must be False when SSM layers are present"
+            assert self.commit_min_snapshot, (
+                "commit_min_snapshot must be True when SSM layers are present"
             )

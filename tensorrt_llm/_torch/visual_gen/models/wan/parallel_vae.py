@@ -119,6 +119,7 @@ class ParallelVAE_Wan(ParallelVAEBase):
                     self.spec.attn_dim,
                     self.rank,
                     self.world_size,
+                    self.pg,
                 ),
             )
 

@@ -408,32 +408,65 @@ std::vector<CutlassGemmConfig> get_candidate_configs_sm100_dynamic_cluster_shape
         return candidate_configs;
     }
 
-    std::vector<std::pair<CutlassTileConfigSM100, ClusterShape>> tile_configs{
-        {CutlassTileConfigSM100::CtaShape64x32x128B, cluster1sm},
-        {CutlassTileConfigSM100::CtaShape64x64x128B, cluster1sm},
-        {CutlassTileConfigSM100::CtaShape64x128x128B, cluster1sm},
-        {CutlassTileConfigSM100::CtaShape64x256x128B, cluster1sm},
-        {CutlassTileConfigSM100::CtaShape128x32x128B, cluster1sm},
-        {CutlassTileConfigSM100::CtaShape128x64x128B, cluster1sm},
-        {CutlassTileConfigSM100::CtaShape128x128x128B, cluster1sm},
-        {CutlassTileConfigSM100::CtaShape128x256x128B, cluster1sm},
-    };
-
-    if (supports_2sm)
+    std::vector<std::pair<CutlassTileConfigSM100, ClusterShape>> tile_configs;
+    if ((config & CutlassGemmConfig::MXFP8_MXFP8) != 0)
     {
-        tile_configs.push_back({CutlassTileConfigSM100::CtaShape64x128x128B, cluster2sm});
-        tile_configs.push_back({CutlassTileConfigSM100::CtaShape64x256x128B, cluster2sm});
-        tile_configs.push_back({CutlassTileConfigSM100::CtaShape64x64x128B, cluster2sm});
-        tile_configs.push_back({CutlassTileConfigSM100::CtaShape128x64x128B, cluster2sm});
-        tile_configs.push_back({CutlassTileConfigSM100::CtaShape128x128x128B, cluster2sm});
-        tile_configs.push_back({CutlassTileConfigSM100::CtaShape128x256x128B, cluster2sm});
+        // MXFP8xMXFP8 always instantiates the Mxf8f6f4 block-scaled tensor-op
+        // with cutlass::arch::Sm100, even on SM103 (the SM103 dispatch case in
+        // dispatchMoeGemmSelectTileShapeTmaWarpSpecialized only handles FP4xFP4;
+        // MXFP8 falls through to the sm_version>=100 && <120 branch which
+        // instantiates Arch=Sm100). Therefore the TMA-only constraint enforced
+        // by getDispatchFunctionForSM100 (Arch::kMinComputeCapability==103 is
+        // false for Sm100) applies on both SM100 and SM103, so we filter out
+        // non-TMA epilogue candidates unconditionally here.
+        if (schedule != EpilogueScheduleType::TMA)
+            return {};
+        // MXFP8xMXFP8 uses the Mxf8f6f4 block-scaled tensor-op; only TileM=128
+        // and TileN in {64,128,256} are valid (kept in sync with the IsMXFPX
+        // branch in are_tile_shapes_supported_sm100). Returning the broader FP8
+        // tile list would crash autotuning with "Unsupported tile shape" since
+        // the runtime dispatcher rejects the unsupported combinations.
+        tile_configs = {
+            {CutlassTileConfigSM100::CtaShape128x64x128B, cluster1sm},
+            {CutlassTileConfigSM100::CtaShape128x128x128B, cluster1sm},
+            {CutlassTileConfigSM100::CtaShape128x256x128B, cluster1sm},
+        };
+        if (supports_2sm)
+        {
+            tile_configs.push_back({CutlassTileConfigSM100::CtaShape128x64x128B, cluster2sm});
+            tile_configs.push_back({CutlassTileConfigSM100::CtaShape128x128x128B, cluster2sm});
+            tile_configs.push_back({CutlassTileConfigSM100::CtaShape128x256x128B, cluster2sm});
+        }
     }
-
-    if (config & CutlassGemmConfig::FP8_ONLY)
+    else
     {
-        tile_configs.push_back({CutlassTileConfigSM100::CtaShape128x16x128B, cluster1sm});
-        // TODO: re-enable when handled by the MoE GEMM dispatch
-        // tile_configs.push_back({ CutlassTileConfigSM100::CtaShape128x8x256B, ClusterShape::ClusterShape_1x1x1 });
+        tile_configs = {
+            {CutlassTileConfigSM100::CtaShape64x32x128B, cluster1sm},
+            {CutlassTileConfigSM100::CtaShape64x64x128B, cluster1sm},
+            {CutlassTileConfigSM100::CtaShape64x128x128B, cluster1sm},
+            {CutlassTileConfigSM100::CtaShape64x256x128B, cluster1sm},
+            {CutlassTileConfigSM100::CtaShape128x32x128B, cluster1sm},
+            {CutlassTileConfigSM100::CtaShape128x64x128B, cluster1sm},
+            {CutlassTileConfigSM100::CtaShape128x128x128B, cluster1sm},
+            {CutlassTileConfigSM100::CtaShape128x256x128B, cluster1sm},
+        };
+
+        if (supports_2sm)
+        {
+            tile_configs.push_back({CutlassTileConfigSM100::CtaShape64x128x128B, cluster2sm});
+            tile_configs.push_back({CutlassTileConfigSM100::CtaShape64x256x128B, cluster2sm});
+            tile_configs.push_back({CutlassTileConfigSM100::CtaShape64x64x128B, cluster2sm});
+            tile_configs.push_back({CutlassTileConfigSM100::CtaShape128x64x128B, cluster2sm});
+            tile_configs.push_back({CutlassTileConfigSM100::CtaShape128x128x128B, cluster2sm});
+            tile_configs.push_back({CutlassTileConfigSM100::CtaShape128x256x128B, cluster2sm});
+        }
+
+        if (config & CutlassGemmConfig::FP8_ONLY)
+        {
+            tile_configs.push_back({CutlassTileConfigSM100::CtaShape128x16x128B, cluster1sm});
+            // TODO: re-enable when handled by the MoE GEMM dispatch
+            // tile_configs.push_back({ CutlassTileConfigSM100::CtaShape128x8x256B, ClusterShape::ClusterShape_1x1x1 });
+        }
     }
 
     for (auto [tile, cluster] : tile_configs)
@@ -449,10 +482,20 @@ std::vector<CutlassGemmConfig> get_candidate_configs_sm100(
     CutlassGemmConfig::CandidateConfigTypeParam const config, int sm)
 {
 #ifdef FAST_BUILD
-    // Fast build disables all configs except this one for SM100
-    return {CutlassGemmConfig{CutlassTileConfigSM100::CtaShape128x128x128B, MainloopScheduleType::AUTO,
-        EpilogueScheduleType::TMA, ClusterShape::ClusterShape_1x1x1, ClusterShape::Undefined, ClusterShape::Undefined,
-        sm}};
+    // Fast build limits the candidate set to a single CTA tile shape but
+    // keeps both 1SM (cluster 1x1x1) and 2SM (cluster 2x1x1) variants so
+    // the autotuner can profile both. Block-scaled paths (MXFP8xMXFP8,
+    // NVFP4) accept both; the 2SM variant is required as a candidate so
+    // FAST_BUILD doesn't accidentally exclude all 2SM kernels (needed for
+    // MMA M=256 configurations of the Mxf8f6f4 tensor-op).
+    return {
+        CutlassGemmConfig{CutlassTileConfigSM100::CtaShape128x128x128B, MainloopScheduleType::AUTO,
+            EpilogueScheduleType::TMA, ClusterShape::ClusterShape_1x1x1, ClusterShape::Undefined,
+            ClusterShape::Undefined, sm},
+        CutlassGemmConfig{CutlassTileConfigSM100::CtaShape128x128x128B, MainloopScheduleType::AUTO,
+            EpilogueScheduleType::TMA, ClusterShape::ClusterShape_2x1x1, ClusterShape::Undefined,
+            ClusterShape::Undefined, sm},
+    };
 #else
     if (config & CutlassGemmConfig::GROUPED_GEMM)
     {
@@ -587,7 +630,12 @@ std::vector<CutlassGemmConfig> get_candidate_configs(
     {
         return get_candidate_configs_sm100(config_type_param, sm);
     }
-    if (sm >= 120 && (config_type_param & CutlassGemmConfig::BLACKWELL))
+    // Use the Blackwell (SM120+) specialized candidate list only for these cases:
+    //   - FP4 dense GEMM (FP4_ONLY)
+    //   - Mixed FP8/FP4 (FP8FP4_MIXED, e.g., W4A8_MXFP4_*)
+    // If neither applies, fall through (e.g. pure int W4A16/W8A16 handled elsewhere).
+    if (sm >= 120 && (config_type_param & CutlassGemmConfig::BLACKWELL)
+        && ((config_type_param & CutlassGemmConfig::FP4_ONLY) || (config_type_param & CutlassGemmConfig::FP8FP4_MIXED)))
     {
         return get_candidate_configs_sm120(config_type_param);
     }

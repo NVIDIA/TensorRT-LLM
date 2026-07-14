@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -39,11 +39,6 @@ bool getBoolEnv(char const* name);
 // XQA kernels (optimized kernels for generation phase).
 bool forceXQAKernels();
 
-// Whether XQA JIT is enabled.
-//
-// Returns the value of TRTLLM_ENABLE_XQA_JIT env var. If such env var doesn't exist, std::nullopt is returned.
-std::optional<bool> getEnvEnableXQAJIT();
-
 // 0 means to use heuristics.
 std::optional<int32_t> getEnvXqaBlocksPerSequence();
 
@@ -59,6 +54,11 @@ int getEnvMmhaKernelBlockSize();
 
 // Whether PDL is enabled.
 bool getEnvEnablePDL();
+
+// Whether the experimental cascade attention kernel is enabled (replaces
+// masked_multihead_attention_kernel for beam-search decoding).
+// Controlled by env var TRTLLM_ENABLE_CASCADE_MMHA (default: false).
+bool getEnvEnableCascadeMmha();
 
 // Whether PDL is enabled for MoE Renormalize routing kernel.
 // Disabled by default to avoid NaN corruption (https://nvbugs/5955170).
@@ -144,6 +144,8 @@ size_t getEnvKVCacheSendMaxConcurrenceNum();
 
 size_t getEnvMemSizeForKVCacheTransferBuffer();
 
+bool getEnvKVCachePoolUseFabricMemory();
+
 uint16_t getEnvNixlPort();
 
 bool getEnvNixlEnableCoalesce();
@@ -152,9 +154,6 @@ bool getEnvDisaggBenchmarkGenOnly();
 
 // Whether to disable the chunked-attention in the generation phase.
 bool getEnvDisableChunkedAttentionInGenPhase();
-
-// Whether to use one block per token for MoE A2A kernels (default true).
-bool getEnvMoeA2AOneBlockPerToken();
 
 // TODO: For DEV purpose temporarily.
 // Block size (threads per block) for MoE A2A Dispatch kernels (default 256 if unset or invalid)

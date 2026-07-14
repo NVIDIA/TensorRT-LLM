@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 from typing import List, Literal, Optional, Tuple, Type
 
 import torch.nn as nn
@@ -56,8 +70,13 @@ class CompileModelConfig(TransformConfig):
     cuda_graph_batch_sizes: Optional[List[int]] = Field(
         default=None, description="The batch sizes to use for CUDA graphs."
     )
-    num_batched_inputs: int = Field(
-        default=2, description="The number of batched inputs to use for CUDA graphs."
+    num_batched_inputs: Optional[int] = Field(
+        default=None,
+        ge=1,
+        description=(
+            "The number of batched inputs to use for CUDA graphs. If unset, infer it "
+            "from runtime inputs by excluding explicit cache/resource inputs."
+        ),
     )
     backend: Literal["torch-simple", "torch-compile", "torch-cudagraph", "torch-opt"] = Field(
         description="The backend to use for compiling the model."
@@ -111,7 +130,10 @@ class CompileModel(BaseTransform):
             cm.info.set_capture_batch(batch_size=bs)
             return (), cm.named_args
 
-        extra_kwargs = {}
+        resource_input_names = list(cm.resource_names)
+        if spec_config is not None and "cache_seq_interface" not in resource_input_names:
+            resource_input_names.append("cache_seq_interface")
+        extra_kwargs = {"resource_input_names": tuple(resource_input_names)}
         config_overrides = {}
         if self.config.piecewise_enabled:
             extra_kwargs["piecewise_seq_info"] = cm.info

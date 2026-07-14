@@ -28,6 +28,7 @@ import torch
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm.logger import logger
 
+from ..wide_ep_ft import get_wide_ep_ft_options
 from .allgather_reducescatter import AllGatherReduceScatter
 from .base import Communication
 from .deep_ep import DeepEP
@@ -133,6 +134,9 @@ class CommunicationFactory:
 
         try:
             enable_eplb = model_config.moe_load_balancer is not None
+            ep_group_health, watchdog_timeout_s, watchdog_poll_interval_s = get_wide_ep_ft_options(
+                model_config
+            )
             strategy = NVLinkOneSided(
                 mapping,
                 num_slots,
@@ -143,11 +147,22 @@ class CommunicationFactory:
                 dtype=act_dtype,
                 num_experts=num_experts if enable_eplb else None,
                 use_low_precision_combine=use_low_precision_combine,
+                ep_group_health=ep_group_health,
+                alltoall_watchdog_timeout_s=watchdog_timeout_s,
+                alltoall_watchdog_poll_interval_s=watchdog_poll_interval_s,
             )
             logger.info("Selected communication strategy: NVLinkOneSided")
             return strategy
-        except RuntimeError as e:
-            logger.debug(f"NVLinkOneSided not available: {e}")
+        except Exception as e:
+            logger.info(f"NVLinkOneSided not available: {e}")
+
+        # Non-divisible EP: NVLinkTwoSided and DeepEP require num_experts % ep_size == 0.
+        if num_experts % mapping.moe_ep_size != 0:
+            logger.info(
+                f"Non-divisible EP (num_experts={num_experts}, ep_size={mapping.moe_ep_size}): "
+                "falling back to AllGatherReduceScatter"
+            )
+            return AllGatherReduceScatter(mapping)
 
         try:
             if use_flashinfer:
@@ -170,8 +185,8 @@ class CommunicationFactory:
                 )
             logger.info("Selected communication strategy: NVLinkTwoSided")
             return strategy
-        except RuntimeError as e:
-            logger.debug(f"NVLinkTwoSided not available: {e}")
+        except Exception as e:
+            logger.info(f"NVLinkTwoSided not available: {e}")
 
         # Try DeepEP (if enabled and weight dtype is bfloat16)
         if os.environ.get("TRTLLM_CAN_USE_DEEP_EP", "1") == "1" and act_dtype == torch.bfloat16:
@@ -187,8 +202,8 @@ class CommunicationFactory:
                 )
                 logger.info("Selected communication strategy: DeepEP")
                 return strategy
-            except RuntimeError as e:
-                logger.debug(f"DeepEP not available: {e}")
+            except Exception as e:
+                logger.info(f"DeepEP not available: {e}")
 
             # Try DeepEPLowLatency as fallback when DeepEP is not available
             try:
@@ -205,8 +220,8 @@ class CommunicationFactory:
                 )
                 logger.info("Selected communication strategy: DeepEPLowLatency")
                 return strategy
-            except RuntimeError as e:
-                logger.debug(f"DeepEPLowLatency not available: {e}")
+            except Exception as e:
+                logger.info(f"DeepEPLowLatency not available: {e}")
 
         # Fallback to AllGather + ReduceScatter (always works)
         strategy = AllGatherReduceScatter(mapping)
@@ -246,6 +261,15 @@ class CommunicationFactory:
 
         method = method.upper()
 
+        # Whitelist check: non-divisible EP only supports NVLinkOneSided and AllGather.
+        _NONDIVISIBLE_EP_ALLOWED = {"NVLINK_ONE_SIDED", "ALLGATHER"}
+        if num_experts % mapping.moe_ep_size != 0 and method not in _NONDIVISIBLE_EP_ALLOWED:
+            raise ValueError(
+                f"Communication method '{method}' requires num_experts % ep_size == 0, "
+                f"but got num_experts={num_experts}, ep_size={mapping.moe_ep_size}. "
+                f"Allowed methods for non-divisible EP: {sorted(_NONDIVISIBLE_EP_ALLOWED)}"
+            )
+
         # Create strategy - will raise RuntimeError if platform not supported
         if method in ["NVLINK_TWO_SIDED"]:
             if use_flashinfer:
@@ -268,6 +292,9 @@ class CommunicationFactory:
                 )
         elif method in ["NVLINK_ONE_SIDED"]:
             enable_eplb = model_config.moe_load_balancer is not None
+            ep_group_health, watchdog_timeout_s, watchdog_poll_interval_s = get_wide_ep_ft_options(
+                model_config
+            )
             return NVLinkOneSided(
                 mapping,
                 num_slots,
@@ -278,6 +305,9 @@ class CommunicationFactory:
                 dtype=act_dtype,
                 num_experts=num_experts if enable_eplb else None,
                 use_low_precision_combine=use_low_precision_combine,
+                ep_group_health=ep_group_health,
+                alltoall_watchdog_timeout_s=watchdog_timeout_s,
+                alltoall_watchdog_poll_interval_s=watchdog_poll_interval_s,
             )
         elif method == "DEEPEP":
             return DeepEP(

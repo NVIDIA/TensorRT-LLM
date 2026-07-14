@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 import subprocess
 import tempfile
 from pathlib import Path
@@ -8,6 +22,8 @@ from _model_test_utils import get_small_model_config
 from click.testing import CliRunner
 
 from tensorrt_llm.commands.bench import main
+
+_PIECEWISE_COMPILE_BACKENDS = {"torch-cudagraph", "torch-opt"}
 
 
 def run_benchmark(
@@ -88,6 +104,14 @@ def test_trtllm_bench(llm_root, compile_backend, model_name):  # noqa: F811
     # remove kv_cache_config and max_batch_size to avoid conflicts with trtllm-bench
     args.pop("kv_cache_config", None)
     args.pop("max_batch_size", None)
+    compile_model_config = {
+        "stage": "compile",
+        "cuda_graph_batch_sizes": [1, 2, 4, 8, 16, 32, 64, 128],
+        "backend": compile_backend,
+    }
+    if compile_backend not in _PIECEWISE_COMPILE_BACKENDS:
+        compile_model_config["piecewise_enabled"] = False
+
     with tempfile.TemporaryDirectory() as temp_dir:
         extra_llm_api_options_path = f"{temp_dir}/extra_llm_api_options.yaml"
         with open(extra_llm_api_options_path, "w") as f:
@@ -96,11 +120,7 @@ def test_trtllm_bench(llm_root, compile_backend, model_name):  # noqa: F811
                     **args,
                     "transforms": {
                         "resize_kv_cache": {"enabled": False},  # rely on default estimation
-                        "compile_model": {
-                            "stage": "compile",
-                            "cuda_graph_batch_sizes": [1, 2, 4, 8, 16, 32, 64, 128],
-                            "backend": compile_backend,
-                        },
+                        "compile_model": compile_model_config,
                     },
                 },
                 f,

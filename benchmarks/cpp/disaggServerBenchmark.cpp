@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -543,7 +543,7 @@ texec::Request makeExecutorContextRequest(Sample const& sample, SizeType32 const
             std::nullopt,    // logitsPostProcessorName
             std::nullopt,    // logitsPostProcessor
             encoderInputTokenIds.has_value() ? encoderInputTokenIds : std::nullopt,
-            std::nullopt);   // cacheSaltID
+            std::nullopt);   // cacheSalt
     request.setRequestType(tensorrt_llm::executor::RequestType::REQUEST_TYPE_CONTEXT_ONLY);
     return request;
 }

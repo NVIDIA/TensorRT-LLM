@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Transform for multi-stream execution of MoE layers that have shared experts and routed experts."""
 
 from typing import Callable, List, Optional, Set, Tuple
@@ -11,10 +26,11 @@ from ...utils.logger import ad_logger
 from ...utils.multi_stream_utils import (
     begin_aux_stream_passthrough,
     cuda_stream_manager,
+    dsv3_moe_shared_mlp_in_aux_wrapped,
     end_aux_stream_passthrough,
     wait_aux_stream_passthrough,
 )
-from ...utils.node_utils import has_shape, is_op
+from ...utils.node_utils import all_reduce_ops, has_shape, is_op
 from ..interface import BaseTransform, SharedConfig, TransformInfo, TransformRegistry
 
 
@@ -179,7 +195,32 @@ def _execute_shared_expert_in_aux_stream(
 
         # Order shared nodes by their position in the graph.
         shared_nodes.sort(key=lambda n: node_order.get(n, 0))
-        first_shared = shared_nodes[0]
+
+        # Collectives (all-reduce) in the shared-expert branch must stay on the
+        # MAIN stream.  A collective synchronizes across ranks, and that
+        # rendezvous does not compose with per-rank aux-stream overlap: when the
+        # shared-expert all-reduce is captured on the aux stream while the
+        # routed-expert all-reduce runs on the main stream, the two symm-mem
+        # MULTIMEM collectives (world_size >= 6 on SM100) interleave across ranks
+        # under monolithic CUDA-graph replay and silently corrupt the output.
+        # We therefore overlap only the shared-expert GEMMs on the aux stream and
+        # run the trailing all-reduce on the main stream.
+        ar_ops = all_reduce_ops()
+        collective_node = shared_output if is_op(shared_output, ar_ops) else None
+        aux_region = [n for n in shared_nodes if n is not collective_node]
+
+        # The aux-stream region must contain compute and must not itself contain
+        # a collective (only a trailing shared-output collective can be split
+        # off safely).
+        if not aux_region or any(is_op(n, ar_ops) for n in aux_region):
+            ad_logger.warning(
+                f"Shared-expert branch of MoE node {moe_node.name} has no aux-stream "
+                "compute outside of a collective; skipping multi-stream transform for "
+                "this node."
+            )
+            continue
+
+        first_shared = aux_region[0]
 
         # Sanity check: the first shared op must directly consume the fork
         # point so we can wire begin_aux_stream_passthrough into it.
@@ -190,6 +231,62 @@ def _execute_shared_expert_in_aux_stream(
             )
             continue
 
+        # ---- V19: Try the single-fx-node wrap pattern first. ----
+        # If shared subgraph is exactly one fused_nvfp4_swiglu_mlp call that
+        # directly consumes fork_point, collapse begin_aux + mlp + end_aux into
+        # a single @torch._dynamo.disable wrapper fx node.  This avoids the
+        # cuda-graph-capture-time per-fork dedicated stream allocation triggered
+        # when set_stream() appears as a separate fx graph node.
+        # DISABLED 2026-05-28: revert V19 to original 3-fx-node pattern (V8 baseline)
+        # to cleanly isolate V21.  Set _V19_ENABLE_WRAP = True to restore.
+        _V19_ENABLE_WRAP = False
+        v19_target = torch.ops.auto_deploy.fused_nvfp4_swiglu_mlp.default
+        if _V19_ENABLE_WRAP and (
+            len(shared_nodes) == 1
+            and shared_nodes[0] is shared_output
+            and getattr(shared_output, "target", None) is v19_target
+            and fork_point in shared_output.all_input_nodes
+        ):
+            ad_logger.info(
+                f"[V19] Wrapping shared MLP {shared_output.name} (MoE={moe_node.name}) "
+                f"into single dynamo-disabled fx node"
+            )
+            # Build wrapper call BEFORE shared_output, with same args.
+            mlp_args = tuple(shared_output.args)
+            with graph.inserting_before(shared_output):
+                wrap_call = graph.call_function(
+                    dsv3_moe_shared_mlp_in_aux_wrapped,
+                    args=mlp_args,
+                )
+
+            # Replace merge_node's reference to shared_output with wrap_call.
+            merge_node.args = tuple(
+                wrap_call if arg is shared_output else arg for arg in merge_node.args
+            )
+
+            # Erase old fused_mlp node (wrap_call replaces its single use).
+            if len(shared_output.users) == 0:
+                graph.erase_node(shared_output)
+            else:
+                # Some other use — fall back to replace_all_uses.
+                shared_output.replace_all_uses_with(wrap_call)
+                graph.erase_node(shared_output)
+
+            # wait_aux remains separate (does not call set_stream, so it does
+            # not split capture).
+            with graph.inserting_before(merge_node):
+                wait_aux_node = graph.call_function(
+                    wait_aux_stream_passthrough,
+                    args=(routed_output,),
+                )
+            merge_node.args = tuple(
+                wait_aux_node if arg is routed_output else arg for arg in merge_node.args
+            )
+
+            num_replaced += 1
+            continue
+
+        # ---- Fall back to original 3-fx-node pattern. ----
         # ---- Step 4: Insert begin_aux before the first shared-expert op. ----
         # NOTE: do NOT bake ``torch.cuda.current_device()`` into the graph —
         # that would hard-code device 0 and break on other ranks in a
@@ -207,28 +304,67 @@ def _execute_shared_expert_in_aux_stream(
             begin_aux_node if arg is fork_point else arg for arg in first_shared.args
         )
 
-        # ---- Step 5: Insert end_aux after the last shared-expert op. ----
-        with graph.inserting_after(shared_output):
-            end_aux_node = graph.call_function(
-                end_aux_stream_passthrough,
-                args=(shared_output,),
+        if collective_node is None:
+            # ---- Step 5: Insert end_aux after the last shared-expert op. ----
+            with graph.inserting_after(shared_output):
+                end_aux_node = graph.call_function(
+                    end_aux_stream_passthrough,
+                    args=(shared_output,),
+                )
+
+            # Replace shared-expert input to the merge node with end_aux output.
+            merge_node.args = tuple(
+                end_aux_node if arg is shared_output else arg for arg in merge_node.args
             )
 
-        # Replace shared-expert input to the merge node with end_aux output.
-        merge_node.args = tuple(
-            end_aux_node if arg is shared_output else arg for arg in merge_node.args
-        )
+            # ---- Step 6: Insert wait_aux before the merge node. ----
+            with graph.inserting_before(merge_node):
+                wait_aux_node = graph.call_function(
+                    wait_aux_stream_passthrough,
+                    args=(routed_output,),
+                )
 
-        # ---- Step 6: Insert wait_aux before the merge node. ----
-        with graph.inserting_before(merge_node):
-            wait_aux_node = graph.call_function(
-                wait_aux_stream_passthrough,
-                args=(routed_output,),
+            merge_node.args = tuple(
+                wait_aux_node if arg is routed_output else arg for arg in merge_node.args
             )
+        else:
+            # The trailing all-reduce stays on the main stream.  End the aux
+            # region after the last aux-stream compute op (e.g. the rowwise
+            # down-projection) and make the main stream wait for it before the
+            # collective consumes the result.
+            aux_boundary = max(
+                (a for a in collective_node.all_input_nodes if a in aux_region),
+                key=lambda n: node_order.get(n, 0),
+                default=None,
+            )
+            if aux_boundary is None:
+                ad_logger.warning(
+                    f"Could not find aux-stream input to the shared-expert collective "
+                    f"for MoE node {moe_node.name}; skipping multi-stream transform."
+                )
+                continue
 
-        merge_node.args = tuple(
-            wait_aux_node if arg is routed_output else arg for arg in merge_node.args
-        )
+            # ---- Step 5: end_aux after the last aux-stream op, switching the
+            # current stream back to main before the collective. ----
+            with graph.inserting_after(aux_boundary):
+                end_aux_node = graph.call_function(
+                    end_aux_stream_passthrough,
+                    args=(aux_boundary,),
+                )
+
+            # ---- Step 6: wait_aux so the main stream waits for the aux compute
+            # before running the collective on the main stream. ----
+            with graph.inserting_after(end_aux_node):
+                wait_aux_node = graph.call_function(
+                    wait_aux_stream_passthrough,
+                    args=(end_aux_node,),
+                )
+
+            # The collective now consumes the synced aux output and runs on the
+            # main stream; the merge node continues to consume the collective.
+            collective_node.args = tuple(
+                wait_aux_node if arg is aux_boundary else arg for arg in collective_node.args
+            )
 
         num_replaced += 1
 

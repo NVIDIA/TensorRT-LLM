@@ -96,15 +96,54 @@ class TestParakeetExtractor:
         total = sum(c.shape[0] for c in clips)
         assert total >= audio.shape[0]
 
+    # `torch.compile` uses a thread pool to compile.
+    @pytest.mark.threadleak(enabled=False)
     def test_call_returns_expected_keys(self):
         ext = _make_extractor()
         audios = [np.random.randn(16000).astype(np.float32)]
-        result = ext(audios, sampling_rate=16000, return_tensors="pt")
-        assert "input_features" in result
-        assert "attention_mask" in result
+        result = ext(audios)
+        assert "input_audio_features" in result
+        assert "feature_attention_mask" in result
         assert "audio_num_clips" in result
+        assert result["input_audio_features"].ndim == 3
+        assert result["input_audio_features"].shape[0] == 1
+        assert result["input_audio_features"].shape[2] == ext.config.feature_size
+        assert result["feature_attention_mask"].shape == result["input_audio_features"].shape[:2]
         assert result["audio_num_clips"].shape == (1,)
         assert result["audio_num_clips"].item() >= 1
+
+    def test_call_accepts_stereo_audio(self):
+        ext = _make_extractor()
+        audio = np.random.randn(16000, 2).astype(np.float32)
+        result = ext([audio])
+        assert result["input_audio_features"].shape[0] == 1
+        assert result["audio_num_clips"].item() == 1
+
+    def test_config_overrides(self):
+        hop_length = 80
+        win_length = 320
+        preemphasis = 0.5
+        n_fft = 256
+        padding_value = -1.0
+
+        ext = _make_extractor(
+            hop_length=hop_length,
+            win_length=win_length,
+            preemphasis=preemphasis,
+            n_fft=n_fft,
+            padding_value=padding_value,
+        )
+        assert ext.config.hop_length == hop_length
+        assert ext.config.win_length == win_length
+        assert ext.config.preemphasis == preemphasis
+        assert ext.config.n_fft == n_fft
+        assert ext.config.padding_value == padding_value
+
+    def test_sampling_rate_property(self):
+        ext = _make_extractor(sampling_rate=8000)
+        assert ext.sampling_rate == 8000
+        with pytest.raises(AttributeError):
+            ext.sampling_rate = 16000
 
 
 class TestProjectedParakeet:

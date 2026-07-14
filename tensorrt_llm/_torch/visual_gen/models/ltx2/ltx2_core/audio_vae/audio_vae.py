@@ -218,6 +218,6 @@ class AudioDecoder(torch.nn.Module):
 def decode_audio(
     latent: torch.Tensor, audio_decoder: AudioDecoder, vocoder: Vocoder
 ) -> torch.Tensor:
+    """Decode audio latents into waveform tensor of shape ``(B, channels, T_audio)``."""
     decoded_audio = audio_decoder(latent)
-    decoded_audio = vocoder(decoded_audio).squeeze(0).float()
-    return decoded_audio
+    return vocoder(decoded_audio).float()

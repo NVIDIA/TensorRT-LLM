@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 # This is the set of transforms running in "graph" mode. In this mode, we capture the full graph
 # of the model and optimize it for inference.
 transforms:
@@ -106,6 +121,20 @@ transforms:
   detect_hidden_states_for_capture:
     stage: pattern_matcher
     enabled: false
+  # Sharding pipeline. `apply_sharding_hints` is the default IR pipeline;
+  # `detect_sharding` + `sharding_transform_executor` is the heuristic-
+  # detection fallback for modeling files not yet ported to the sharding IR.
+  # `apply_sharding_hints` runs first; it self-detects the presence of
+  # `torch.ops.auto_deploy.all_reduce` markers and either consumes them or
+  # leaves the graph untouched. When it consumes them, it sets the meta flag
+  # `sharding_ir_applied` on the graph module, which `detect_sharding` and
+  # `sharding_transform_executor` honor by short-circuiting themselves. To
+  # force the heuristic-detection pipeline (e.g. for an IR-marked model whose
+  # port is known to be broken) use the `enable_legacy_sharding.yaml` override.
+  apply_sharding_hints:
+    stage: sharding
+    run_shape_prop: true
+    allreduce_strategy: NCCL
   detect_sharding:
     stage: sharding
     simple_shard_only: false
@@ -122,11 +151,10 @@ transforms:
   sharding_transform_executor:
     stage: sharding
     run_shape_prop: true
-  apply_sharding_hints:
-    enabled: false
+  pipeline_cache:
     stage: sharding
-    run_shape_prop: true
-    allreduce_strategy: NCCL
+    enabled: false
+    root: null
   ############################################################################################
   # MOVE MODEL AND LOAD WEIGHTS
   ############################################################################################
@@ -156,9 +184,6 @@ transforms:
   fuse_fp8_gemms:
     stage: post_load_fusion
     enabled: false # TODO: https://github.com/NVIDIA/TensorRT-LLM/issues/4674 this is causing OOMs
-  fuse_silu_mul:
-    stage: post_load_fusion
-    enabled: true
   fuse_fp8_linear:
     stage: post_load_fusion
     backend: trtllm
@@ -179,6 +204,9 @@ transforms:
   fuse_finegrained_fp8_linear:
     stage: post_load_fusion
     backend: trtllm
+  fuse_mxfp4_moe:
+    stage: post_load_fusion
+    expect_mem_change: true  # adds padding for trtllm-gen kernel alignment during weight repack
   fuse_moe:
     stage: post_load_fusion
     expect_mem_change: true
@@ -205,11 +233,18 @@ transforms:
     rmsnorm_backend: flashinfer
     gated_rmsnorm_backend: triton
     requires_shape_prop: true
+  fuse_rmsnorm_quant_nvfp4:
+    stage: post_load_fusion
+    enabled: true
   fuse_gdn_gating:
     stage: post_load_fusion
   fuse_l2norm:
     stage: post_load_fusion
     backend: fla
+  fuse_silu_mul:
+    stage: post_load_fusion
+    enabled: true
+    backend: flashinfer
   fuse_swiglu:
     stage: post_load_fusion
     enabled: false
@@ -219,11 +254,6 @@ transforms:
   fuse_rmsnorm_quant_fp8:
     stage: post_load_fusion
     enabled: false
-  mlir_elementwise_fusion:
-    stage: post_load_fusion
-    enabled: false
-    run_shape_prop: false
-    bypass_ops: []
   gather_logits_before_lm_head:
     stage: post_load_fusion
     # TODO: fix https://github.com/NVIDIA/TensorRT-LLM/issues/9878 to enable by default
@@ -241,6 +271,11 @@ transforms:
     enabled: false
   optimize_rope:
     stage: post_load_fusion
+  mlir_elementwise_fusion:
+    stage: post_load_fusion
+    enabled: false
+    run_shape_prop: false
+    bypass_ops: []
   ############################################################################################
   # VISUALIZE GRAPH
   ############################################################################################
@@ -299,10 +334,13 @@ transforms:
   multi_stream_gemm:
     stage: compile
     enabled: false
+  cleanup_identity_dtype_cast:
+    stage: compile
+    enabled: false
   compile_model:
     stage: compile
     expect_mem_change: true
     run_per_gm: false
     backend: torch-cudagraph
-    piecewise_enabled: false
+    piecewise_enabled: true
     piecewise_num_tokens: null

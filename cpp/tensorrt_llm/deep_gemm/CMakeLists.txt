@@ -40,12 +40,25 @@ foreach(SOURCE_FILE ${DEEP_GEMM_ALL_FILES})
     file(READ ${SOURCE_FILE} _content)
     string(REPLACE "from . import _C" "import tensorrt_llm.deep_gemm_cpp_tllm"
                    _content "${_content}")
+    string(REPLACE "from .. import _C" "import tensorrt_llm.deep_gemm_cpp_tllm"
+                   _content "${_content}")
     string(REPLACE ".._C" "tensorrt_llm.deep_gemm_cpp_tllm" _content
                    "${_content}")
     string(REPLACE "._C" "tensorrt_llm.deep_gemm_cpp_tllm" _content
                    "${_content}")
     string(REPLACE "_C." "tensorrt_llm.deep_gemm_cpp_tllm." _content
                    "${_content}")
+
+    if(REL_PATH STREQUAL "__init__.py")
+      string(
+        PREPEND
+        _content
+        "# Use the PyTorch-owned cuBLASLt handle by default. DeepGEMM's\n"
+        "# standalone handle destructor can run after PyTorch/cuBLASLt teardown\n"
+        "# in MPI worker shutdown and trigger a double free.\n"
+        "import os\n"
+        "os.environ.setdefault(\"DG_USE_PYTORCH_CUBLASLT_HANDLE\", \"1\")\n")
+    endif()
 
     # Add adaptation header
     string(

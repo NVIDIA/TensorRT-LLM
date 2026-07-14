@@ -777,7 +777,17 @@ void moefinalize_allreduce_fusion_op(MoeFinalizeAllReduceFusionParams const& par
         MOE_FINALIZE_DISPATCH0(8, true, true, true);
         MOE_FINALIZE_DISPATCH0(16, true, true, true);
     }
-    TLLM_CHECK_WITH_INFO(false, "moefinalize_allreduce_fusion_op: unsupported pattern!");
+    // Reaching here means none of the above branches dispatched. Spell out the actual params so
+    // a future dtype/scale_dtype mismatch (e.g. bf16 hidden + fp32 expert weights, see PR #13328)
+    // is debuggable from the assert message alone.
+    TLLM_CHECK_WITH_INFO(false,
+        "moefinalize_allreduce_fusion_op: unsupported pattern! "
+        "nranks=%d, dtype=%d, scale_dtype=%d, "
+        "residual_out=%d, norm_out=%d, quant_out=%d. "
+        "Supported dispatch requires nranks in {2,4,8,16}, dtype==scale_dtype in {kHALF, kBF16}, "
+        "and (residual_out, norm_out, quant_out) in {(1,0,1),(0,1,0),(1,1,0),(1,1,1)}.",
+        params.nranks, static_cast<int>(params.dtype), static_cast<int>(params.scale_dtype),
+        params.residual_out != nullptr, params.norm_out != nullptr, params.quant_out != nullptr);
 #undef MOE_FINALIZE_DISPATCH0
 #undef MOE_FINALIZE_DISPATCH1
 }

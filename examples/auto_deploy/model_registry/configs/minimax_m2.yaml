@@ -1,0 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# MiniMax-M2 uses BF16 weights and flashinfer attention for AutoDeploy.
+attn_backend: flashinfer
+model_kwargs:
+  torch_dtype: bfloat16

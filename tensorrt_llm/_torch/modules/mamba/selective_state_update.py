@@ -532,8 +532,14 @@ def selective_state_update_mtp_ssm_cache_trtllm(
         retrieve_parent_token: (batch, cache_steps) int32 optional
         intermediate_state_indices: (batch,) int32 optional
     """
+    # The CUDA op hardcodes the SSM state's batch stride to nheads*head_dim*ssm_dim,
+    # so it requires `state` to be 4D contiguous. The unified hybrid KV pool
+    # (CppMambaHybridCacheManager) packs SSM + conv state into each block, giving
+    # `ssm_states` a non-contiguous batch stride. Stage through a contiguous copy
+    # and write the updated slots back when the kernel mutates the state.
+    state_in = state.contiguous()
     torch.ops.trtllm.mamba2_mtp_ssm_cache_update(
-        state,
+        state_in,
         x,
         dt,
         A,
@@ -552,4 +558,6 @@ def selective_state_update_mtp_ssm_cache_trtllm(
         pad_slot_id,
         disable_state_update,
     )
+    if state_in is not state and not disable_state_update:
+        state.copy_(state_in)
     return out, intermediate_states_buffer

@@ -125,7 +125,7 @@ def test_llmapi_launch_multiple_tasks(task_script: str):
     Test that the trtllm-llmapi-launch can run multiple tasks.
     """
     cur_dir = os.path.dirname(os.path.abspath(__file__))
-    test_file = os.path.join(cur_dir, "_run_multi_llm_tasks.py")
+    test_file = os.path.join(cur_dir, task_script)
     assert os.path.exists(test_file), f"Test file {test_file} does not exist"
     command = [
         "mpirun", "-n", "2", "--allow-run-as-root", "trtllm-llmapi-launch",

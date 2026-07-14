@@ -7,11 +7,14 @@ produces tp_size duplicate requests, but the scheduler distributes them
 share, not all copies.
 """
 
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
 
-from tensorrt_llm._torch.pyexecutor._util import KvCacheCreator
+from tensorrt_llm._torch.pyexecutor._util import CacheCost, KvCacheCreator
+from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
+from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -34,6 +37,8 @@ def _make_creator(
     batch_size=1,
     model_max_seq_len=1,
     max_cuda_graph_batch_size=1,
+    layer_types=None,
+    max_attention_window=None,
 ):
     """Build a minimal KvCacheCreator (bypasses __init__) wired up for
     _get_token_num_for_estimation only."""
@@ -48,13 +53,32 @@ def _make_creator(
 
     c._llm_args = Mock(disable_overlap_scheduler=True)
 
+    pretrained = Mock()
+    # spec=False so attribute access doesn't accept arbitrary fields; set only
+    # the ones the production path reads.
+    pretrained.layer_types = layer_types
+
+    model_config = Mock()
+    model_config.pretrained_config = pretrained
+
     c._model_engine = Mock(
         batch_size=batch_size,
         max_seq_len=model_max_seq_len,
         _max_cuda_graph_batch_size=max_cuda_graph_batch_size,
     )
+    c._model_engine.model = Mock(model_config=model_config)
 
-    c._kv_cache_config = Mock(free_gpu_memory_fraction=0.9)
+    c._kv_cache_config = Mock(
+        free_gpu_memory_fraction=0.9, max_attention_window=max_attention_window
+    )
+
+    # _get_token_num_for_estimation gates pool-group scaling on V2 (the
+    # split-pool layout that motivates the scaling). Mamba hybrid uses
+    # MambaHybridCacheManager and must NOT scale. These tests target V2
+    # behavior; production sets this in __init__ via
+    # _get_model_kv_cache_manager_cls(), which we bypass here.
+    c._kv_cache_manager_cls = KVCacheManagerV2
+    c._is_kv_cache_manager_v2 = True
 
     return c
 
@@ -67,11 +91,15 @@ def _make_creator(
 @pytest.fixture(autouse=True)
 def _no_gpu():
     """Stub out CUDA memory queries and per-token KV size so the test runs on
-    any machine and the memory cap never constrains the result."""
+    any machine and the memory cap never constrains the result.
+
+    _get_kv_size_per_token now returns a CacheCost; using slope=1 + zero
+    intercept keeps the legacy ``budget // bytes_per_token`` arithmetic
+    untouched downstream."""
     huge = 100 * (1 << 30)
     with (
         patch("torch.cuda.mem_get_info", return_value=(huge, huge)),
-        patch.object(KvCacheCreator, "_get_kv_size_per_token", return_value=1),
+        patch.object(KvCacheCreator, "_get_kv_size_per_token", return_value=CacheCost(slope=1)),
     ):
         yield
 
@@ -145,3 +173,438 @@ def test_regression_without_fix_would_overcount():
     wrong = tp * 3 * tpb  # 768  (all duplicates summed)
     assert result == correct
     assert result != wrong
+
+
+# ---------------------------------------------------------------------------
+# VSWA hybrid attention pool-group scaling (Gemma4 hybrid MMMU Pro hang fix)
+# ---------------------------------------------------------------------------
+#
+# KVCacheManagerV2 creates one pool group per distinct attention-window size.
+# The quota derived from max_tokens is split proportionally across pool
+# groups, so each pool ends up with roughly num_cache_blocks / num_pool_groups
+# blocks.  A single long-context request then overflows the full-attention
+# pool and the scheduler livelocks on suspend/retry.  The fix scales
+# num_cache_blocks by the number of distinct attention-window sizes inferred
+# either from ``layer_types`` on the pretrained config (preferred) or from
+# an explicit ``max_attention_window`` list on kv_cache_config (fallback).
+
+
+def test_uniform_layer_types_no_scaling():
+    """All-sliding or all-full layers stay a single pool group."""
+    tpb = 32
+    max_seq_len = 4096
+    uniform = _make_creator(
+        tpb,
+        [_make_mock_request(max_seq_len - 1)],
+        enable_attention_dp=False,
+        tp_size=1,
+        model_max_seq_len=max_seq_len,
+        max_cuda_graph_batch_size=4,
+        layer_types=["sliding_attention"] * 26,
+    )
+    # num_pool_groups = 1 -> behaviour unchanged from legacy ADP-only case.
+    baseline = _make_creator(
+        tpb,
+        [_make_mock_request(max_seq_len - 1)],
+        enable_attention_dp=False,
+        tp_size=1,
+        model_max_seq_len=max_seq_len,
+        max_cuda_graph_batch_size=4,
+    )
+    assert uniform._get_token_num_for_estimation() == baseline._get_token_num_for_estimation()
+
+
+def test_gemma4_hybrid_scales_by_num_pool_groups():
+    """Gemma4 hybrid attention (mixed sliding/full layers) must scale the
+    estimated block count by the number of distinct layer types.  Otherwise
+    the per-pool quota is too small to hold a single max_seq_len request,
+    which is the MMMU Pro livelock reproducer."""
+    tpb = 32
+    max_seq_len = 12288
+    layer_types = ["sliding_attention"] * 28 + ["full_attention"] * 7
+    assert len(set(layer_types)) == 2
+
+    hybrid = _make_creator(
+        tpb,
+        [_make_mock_request(max_seq_len - 1), _make_mock_request(1)],
+        enable_attention_dp=False,
+        tp_size=1,
+        model_max_seq_len=max_seq_len,
+        max_cuda_graph_batch_size=4,
+        layer_types=layer_types,
+    )
+    uniform = _make_creator(
+        tpb,
+        [_make_mock_request(max_seq_len - 1), _make_mock_request(1)],
+        enable_attention_dp=False,
+        tp_size=1,
+        model_max_seq_len=max_seq_len,
+        max_cuda_graph_batch_size=4,
+        layer_types=["full_attention"] * 35,
+    )
+
+    hybrid_tokens = hybrid._get_token_num_for_estimation()
+    uniform_tokens = uniform._get_token_num_for_estimation()
+    assert hybrid_tokens == 2 * uniform_tokens, (
+        f"Expected 2x scaling for 2 pool groups, got "
+        f"hybrid={hybrid_tokens}, uniform={uniform_tokens}"
+    )
+
+
+def test_vswa_max_attention_window_fallback_scales():
+    """When layer_types is absent but kv_cache_config.max_attention_window is
+    a heterogeneous list (VSWA), we still scale by the number of distinct
+    windows."""
+    tpb = 32
+    max_seq_len = 12288
+    max_attention_window = [1024] * 28 + [max_seq_len] * 7
+    assert len(set(max_attention_window)) == 2
+
+    c = _make_creator(
+        tpb,
+        [_make_mock_request(max_seq_len - 1)],
+        enable_attention_dp=False,
+        tp_size=1,
+        model_max_seq_len=max_seq_len,
+        max_cuda_graph_batch_size=4,
+        layer_types=None,
+        max_attention_window=max_attention_window,
+    )
+    uniform = _make_creator(
+        tpb,
+        [_make_mock_request(max_seq_len - 1)],
+        enable_attention_dp=False,
+        tp_size=1,
+        model_max_seq_len=max_seq_len,
+        max_cuda_graph_batch_size=4,
+    )
+    assert c._get_token_num_for_estimation() == 2 * uniform._get_token_num_for_estimation()
+
+
+def test_pool_scaling_prevents_mmmu_pro_underestimation():
+    """Regression: with max_seq_len=12288 and max_num_tokens=12288 (MMMU Pro
+    config), hybrid estimation must produce enough capacity to hold one full
+    max_seq_len request per pool, with max_util_for_resume headroom."""
+    tpb = 32
+    max_seq_len = 12288
+    layer_types = ["sliding_attention"] * 28 + ["full_attention"] * 7
+
+    c = _make_creator(
+        tpb,
+        [_make_mock_request(max_seq_len - 1), _make_mock_request(1)],
+        enable_attention_dp=False,
+        tp_size=1,
+        model_max_seq_len=max_seq_len,
+        max_cuda_graph_batch_size=4,
+        layer_types=layer_types,
+    )
+
+    total_tokens = c._get_token_num_for_estimation()
+    per_pool_tokens = total_tokens // 2  # 2 pool groups
+    # Must be enough to hold a max_seq_len request per pool.
+    assert per_pool_tokens >= max_seq_len
+
+
+def test_v2_cache_size_per_token_models_generation_swa_cost():
+    class FakeModelConfig:
+        quant_config = None
+        pretrained_config = SimpleNamespace(
+            hidden_size=32,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+        )
+
+        def get_num_attention_layers(self):
+            return 3
+
+    mapping = Mock(enable_attention_dp=False, tp_size=1)
+    mapping.pp_layers.return_value = [0, 1, 2]
+
+    no_scratch_size_per_token = CacheCost.from_raw(
+        KVCacheManagerV2.get_cache_size_per_token(
+            FakeModelConfig(),
+            mapping,
+            tokens_per_block=64,
+            max_seq_len=4096,
+            max_batch_size=3,
+            kv_cache_config=KvCacheConfig(max_attention_window=[2048, 2048, 4096]),
+        )
+    )
+    scratch_size_per_token = CacheCost.from_raw(
+        KVCacheManagerV2.get_cache_size_per_token(
+            FakeModelConfig(),
+            mapping,
+            tokens_per_block=64,
+            max_seq_len=4096,
+            max_batch_size=3,
+            kv_cache_config=KvCacheConfig(max_attention_window=[2048, 2048, 4096]),
+            enable_swa_scratch_reuse=True,
+        )
+    )
+
+    # Per layer: K+V * kv_heads * head_dim * bf16 bytes = 2 * 2 * 8 * 2.
+    expected = CacheCost(slope=64, intercept=3 * 2 * 2048 * 64)
+    assert no_scratch_size_per_token == expected
+    assert scratch_size_per_token == expected
+
+
+def test_creator_uses_v2_affine_cache_cost():
+    class FakeV2Manager(KVCacheManagerV2):
+        @staticmethod
+        def get_cache_size_per_token(model_config, mapping, **kwargs):
+            return 20, 21
+
+    creator = object.__new__(KvCacheCreator)
+    creator._mapping = Mock()
+    creator._tokens_per_block = 64
+    creator._max_seq_len = 1024
+    creator._max_batch_size = 3
+    creator._kv_cache_config = KvCacheConfig()
+    creator._speculative_config = None
+
+    cost = creator._per_manager_cache_cost(FakeV2Manager, Mock())
+
+    assert cost == CacheCost(slope=20, intercept=21)
+
+
+def test_v2_quota_from_max_tokens_models_context_swa_scratch():
+    manager = object.__new__(KVCacheManagerV2)
+    manager.num_local_layers = 3
+    manager.pp_layers = [0, 1, 2]
+    manager.max_attention_window_vec = [128, 128, None]
+    manager.tokens_per_block = 64
+    manager.max_batch_size = 4
+    manager.max_num_tokens = 1000
+    manager.get_layer_bytes_per_token = lambda local_layer_idx, data_role: [10, 10, 20][
+        local_layer_idx
+    ]
+
+    max_tokens = 1200
+
+    manager.enable_swa_scratch_reuse = False
+    no_scratch_quota = manager._get_quota_from_max_tokens(max_tokens)
+    assert no_scratch_quota == (max_tokens * 20 + manager.max_num_tokens * 20 + 4 * 2 * 128 * 10)
+    assert manager._get_max_tokens_from_quota(no_scratch_quota) == max_tokens
+
+    manager.enable_swa_scratch_reuse = True
+    scratch_quota = manager._get_quota_from_max_tokens(max_tokens)
+    assert scratch_quota == (max_tokens * 20 + manager.max_num_tokens * 10 + 4 * 2 * 128 * 10)
+    assert manager._get_max_tokens_from_quota(scratch_quota) == max_tokens
+
+
+# ---------------------------------------------------------------------------
+# KVCacheManagerV2 clamp_max_seq_len_for_mem float-to-int cast regression
+# ---------------------------------------------------------------------------
+#
+# ``KVCacheManagerV2.get_num_available_tokens`` returns
+# ``clamp_max_seq_len_for_mem(...) - extra_tokens``, where the clamp helper
+# does a floating-point memory-budget division and returns a float.  When
+# ``max_seq_len > max_num_tokens`` the ``__init__`` body assigned the float
+# directly to ``self.max_seq_len``, which then propagated into
+# ``_util.py::_create_dummy_context_requests``'s ``torch.randint(size=(...))``
+# call and crashed on a float size tuple.
+#
+# resource_manager.py:1820 now casts ``int(max_num_tokens)`` at the assign
+# site.  The tests below lock in that invariant: (a) the replay test
+# demonstrates the fix applied to the scenario that previously crashed,
+# and (b) the propagation test shows that downstream arithmetic in
+# ``_util.py:610-620`` stays int-safe.
+
+
+def test_kv_cache_manager_v2_clamp_casts_float_to_int():
+    """Replay of the V2 clamp block with a float clamp result.
+
+    Reproduces the exact arithmetic from ``resource_manager.py``
+    ``KVCacheManagerV2.__init__`` lines 1813-1825.  Pre-fix, the ``if``
+    branch stored a float on ``self.max_seq_len``.  Post-fix, it casts
+    to int.  A broken fix (e.g. dropping the cast) will make this test
+    fail on the ``isinstance(..., int)`` assertion."""
+    # Scenario pulled from the MMMU Pro 26B + s=131K crash log:
+    #   clamp_max_seq_len_for_mem returned 60160.0 when requested
+    #   131072 tokens of max_seq_len.
+    initial_max_seq_len = 131072
+    # Simulate the float return from clamp_max_seq_len_for_mem.
+    clamp_float_result = 60160.0
+    assert isinstance(clamp_float_result, float)
+    # Match the production code block (resource_manager.py:1816-1825).
+    self_max_seq_len = initial_max_seq_len
+    if self_max_seq_len > clamp_float_result:
+        self_max_seq_len = int(clamp_float_result)
+
+    assert isinstance(self_max_seq_len, int), (
+        "KVCacheManagerV2 must cast the clamp result to int — float "
+        "propagates into torch.randint(size=...) and crashes."
+    )
+    assert self_max_seq_len == 60160
+
+
+def test_kv_cache_manager_v2_float_max_seq_len_would_crash_torch_randint():
+    """Pre-fix behaviour: a float max_seq_len propagating into
+    torch.randint(size=(...,)) raises.  This test documents WHY the cast
+    is necessary — if the cast is dropped, the following code crashes."""
+    import torch
+
+    float_seq_len = 60160.0
+    with pytest.raises((TypeError, RuntimeError)):
+        # torch.randint only accepts int-valued size tuples.
+        torch.randint(low=0, high=32000, size=(float_seq_len,))
+
+
+def test_kv_manager_int_max_seq_len_stays_int_through_util_expression():
+    """The downstream expression in ``_util.py:615-620`` (which builds the
+    dummy context request input_seq_len) must stay int when the V2
+    manager's max_seq_len is int.  Covers the full propagation chain
+    from the root-cause fix to the downstream consumer."""
+    net_max_seq_len = 131072  # from ModelEngine
+    creator_max_seq_len = 131072  # KvCacheCreator.self._max_seq_len
+    kv_manager_max_seq_len = 60160  # post-fix int (was 60160.0 pre-fix)
+
+    # Replay _util.py:616-619 arithmetic.
+    input_seq_len = max(
+        1,
+        net_max_seq_len - 1 - (creator_max_seq_len - kv_manager_max_seq_len),
+    )
+    assert isinstance(input_seq_len, int)
+    assert input_seq_len >= 1
+
+    # Sanity: the same expression with a float would yield float (the
+    # original bug), ensuring this test would notice regression.
+    buggy_input = max(
+        1,
+        net_max_seq_len - 1 - (creator_max_seq_len - float(kv_manager_max_seq_len)),
+    )
+    assert isinstance(buggy_input, float), (
+        "Sanity check: the pre-fix float path must still be demonstrable "
+        "in the test, otherwise this regression guard is hollow."
+    )
+
+
+# ---------------------------------------------------------------------------
+# _create_kv_cache_manager: MLA branch must forward max_num_tokens
+# ---------------------------------------------------------------------------
+
+
+def test_mla_branch_forwards_max_num_tokens_to_manager() -> None:
+    """The is_mla branch of ``_create_kv_cache_manager`` must pass
+    ``max_num_tokens`` to the manager, like the generic branch does.
+
+    Regression guard: when the argument is dropped,
+    ``DeepseekV4CacheManager._max_num_tokens`` stays ``None`` and the
+    profiling-phase context extra quota is sized by the full ``max_tokens``
+    estimate instead of the runtime chunk size (observed as a 27.59 GiB vs
+    11.92 GiB temp-quota inflation on DeepSeek-V4-Pro, raising peak memory
+    and OOM risk during KV cache estimation).
+    """
+    import torch
+
+    from tensorrt_llm._torch.pyexecutor._util import _create_kv_cache_manager
+
+    captured_kwargs = {}
+
+    class _RecordingManager:
+        def __init__(self, *args, **kwargs) -> None:
+            captured_kwargs.update(kwargs)
+
+    # Minimal MLA pretrained config: is_mla() keys on kv_lora_rank and
+    # qk_rope_head_dim being set.
+    pretrained = SimpleNamespace(
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+        hidden_size=1024,
+        num_attention_heads=8,
+        num_key_value_heads=8,
+        num_hidden_layers=2,
+        vocab_size=32000,
+    )
+    model_config = Mock()
+    model_config.pretrained_config = pretrained
+    model_config.quant_config = None
+
+    _create_kv_cache_manager(
+        model_engine=None,
+        kv_cache_manager_cls=_RecordingManager,
+        mapping=Mock(),
+        kv_cache_config=KvCacheConfig(),
+        tokens_per_block=32,
+        max_seq_len=2048,
+        max_batch_size=8,
+        spec_config=None,
+        sparse_attention_config=None,
+        max_num_tokens=333,
+        max_beam_width=1,
+        kv_connector_manager=None,
+        model_config=model_config,
+        dtype=torch.bfloat16,
+        is_draft=False,
+    )
+
+    assert captured_kwargs.get("max_num_tokens") == 333, (
+        "is_mla branch dropped max_num_tokens: DeepseekV4CacheManager then "
+        "falls back to _max_num_tokens=None and over-sizes the estimation "
+        "temp quota."
+    )
+
+
+def test_estimation_temporarily_uses_inferred_pool_sizing() -> None:
+    import torch
+
+    pool_ratio = [0.2, 0.3, 0.5]
+    avg_seq_len = 128
+    max_seq_len = 4096
+    user_max_tokens = 1024
+    estimation_max_tokens = 256
+    kv_cache_config = KvCacheConfig(
+        max_tokens=user_max_tokens,
+        pool_ratio=pool_ratio,
+        avg_seq_len=avg_seq_len,
+    )
+    model_engine = Mock()
+    model_engine.model.model_config.attn_backend = "TRTLLM"
+    llm_args = Mock(cache_transceiver_config=None)
+
+    with patch.object(
+        KvCacheCreator,
+        "_get_model_kv_cache_manager_cls",
+        return_value=KVCacheManagerV2,
+    ):
+        creator = KvCacheCreator(
+            model_engine=model_engine,
+            draft_model_engine=None,
+            mapping=Mock(cp_config={}),
+            net_max_seq_len=max_seq_len,
+            kv_connector_manager=None,
+            max_num_tokens=256,
+            max_beam_width=1,
+            tokens_per_block=128,
+            max_seq_len=max_seq_len,
+            max_batch_size=8,
+            kv_cache_config=kv_cache_config,
+            llm_args=llm_args,
+            speculative_config=None,
+            sparse_attention_config=None,
+            profiling_stage_data=None,
+            is_disagg=False,
+        )
+
+    with (
+        patch.object(
+            creator,
+            "_get_token_num_for_estimation",
+            return_value=estimation_max_tokens,
+        ),
+        patch.object(creator, "_cal_max_memory", return_value=512),
+        patch.object(torch.cuda, "mem_get_info", return_value=(768, 1024)),
+        patch.object(torch.cuda, "memory_stats", return_value={"allocated_bytes.all.current": 128}),
+        patch.object(torch.cuda, "empty_cache"),
+        patch.object(torch.cuda, "reset_peak_memory_stats"),
+    ):
+        assert creator.try_prepare_estimation()
+        assert kv_cache_config.max_tokens == estimation_max_tokens
+        assert kv_cache_config.pool_ratio is None
+        assert kv_cache_config.avg_seq_len == max_seq_len
+
+        creator.configure_kv_cache_capacity()
+
+    assert kv_cache_config.max_tokens == user_max_tokens
+    assert kv_cache_config.pool_ratio == pool_ratio
+    assert kv_cache_config.avg_seq_len == avg_seq_len

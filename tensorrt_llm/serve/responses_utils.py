@@ -42,15 +42,18 @@ from transformers import AutoProcessor, PretrainedConfig
 
 from tensorrt_llm.bindings import steady_clock_now
 from tensorrt_llm.executor import GenerationResult
-from tensorrt_llm.inputs.utils import apply_chat_template
+from tensorrt_llm.inputs.utils import async_apply_chat_template
 from tensorrt_llm.llmapi import SamplingParams
 from tensorrt_llm.llmapi.llm import RequestOutput
 from tensorrt_llm.llmapi.reasoning_parser import (BaseReasoningParser,
                                                   ReasoningParserFactory,
                                                   ReasoningParserResult)
+from tensorrt_llm.llmapi.thinking_budget import \
+    add_thinking_budget_logits_processor
 from tensorrt_llm.llmapi.tokenizer import TokenizerBase, TransformersTokenizer
 from tensorrt_llm.logger import logger
-from tensorrt_llm.serve.chat_utils import parse_chat_messages_coroutines
+from tensorrt_llm.serve.chat_utils import (parse_chat_messages_coroutines,
+                                           resolve_top_level_model_type)
 from tensorrt_llm.serve.openai_protocol import (ChatCompletionMessageParam,
                                                 ChatCompletionToolsParam,
                                                 FunctionDefinition,
@@ -660,16 +663,17 @@ def _response_output_item_to_chat_completion_message(
                 return item
             else:
                 raise ValueError(f"Invalid input message item: {item}")
-        case "message":
-            return {
-                "role": "assistant",
-                "content": item["content"][0]["text"],
-            }
-        case "reasoning":
-            return {
-                "role": "assistant",
-                "reasoning": item["content"][0]["text"],
-            }
+        case "message" | "reasoning":
+            content = item.get("content") or []
+            if not content:
+                raise ValueError(
+                    f"Input item of type {item_type!r} has empty or missing 'content'"
+                )
+            first = content[0]
+            text = first.get("text", "") if isinstance(
+                first, dict) else getattr(first, "text", "")
+            key = "content" if item_type == "message" else "reasoning"
+            return {"role": "assistant", key: text}
         case "function_call":
             return {
                 "role": "function",
@@ -818,14 +822,12 @@ async def _create_input_tokens(
 
     conversation, mm_coroutines, mm_placeholder_counts = parse_chat_messages_coroutines(
         messages, model_config)
-    mm_data = await mm_coroutines
-
     tools_dict = [
         tool.model_dump()
         for tool in _get_chat_completion_function_tools(request.tools)
     ]
-    token_ids = apply_chat_template(
-        model_type=model_config.model_type,
+    token_task = async_apply_chat_template(
+        model_type=resolve_top_level_model_type(model_config),
         tokenizer=tokenizer,
         processor=processor,
         conversation=conversation,
@@ -834,6 +836,9 @@ async def _create_input_tokens(
         mm_placeholder_counts=mm_placeholder_counts,
         enable_tokenize=True,
     )
+    token_ids, (mm_data,
+                _mm_embeddings) = await asyncio.gather(token_task,
+                                                       mm_coroutines)
 
     return token_ids, mm_data
 
@@ -918,6 +923,11 @@ async def request_preprocess(
     _responses_debug_log("======= Complete Inputs to model =======")
     _responses_debug_log(_decode_tokens(input_tokens, tokenizer))
     _responses_debug_log("========================================")
+    add_thinking_budget_logits_processor(
+        sampling_params,
+        reasoning_parser=reasoning_parser,
+        tokenizer=tokenizer,
+    )
     return input_tokens, sampling_params
 
 

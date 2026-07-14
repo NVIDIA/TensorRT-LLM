@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import json
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -80,8 +95,31 @@ class BaseReasoningParser(ABC):
         return ReasoningParserResult()
 
 
+class IdentityReasoningParser(BaseReasoningParser):
+    """Reasoning parser that treats all model output as visible content."""
+
+    reasoning_start = "<think>"
+    reasoning_end = "</think>"
+
+    def parse(self, text: str) -> ReasoningParserResult:
+        return ReasoningParserResult(content=text)
+
+    def parse_delta(self, delta_text: str) -> ReasoningParserResult:
+        return ReasoningParserResult(content=delta_text)
+
+
 @register_reasoning_parser("deepseek-r1", reasoning_at_start=True)
+@register_reasoning_parser("laguna")
 @register_reasoning_parser("qwen3")
+# Qwen3.5 (and forced-thinking Qwen3 variants) use a chat template that
+# pre-injects `<think>\n` into the assistant prompt prefix, so the model
+# output begins inside the reasoning block with no opening tag to search
+# for. That requires `reasoning_at_start=True`. The existing `qwen3` key
+# keeps `reasoning_at_start=False` for back-compat, and `parse()` is
+# binary on this flag (it either requires `<think>` to be present in the
+# output, or assumes the output begins at the start of reasoning) - so
+# the two behaviors must be registered under separate keys.
+@register_reasoning_parser("qwen3_5", reasoning_at_start=True)
 @register_reasoning_parser("minimax_m2", reasoning_at_start=True)
 @register_reasoning_parser("minimax_m2_append_think", reasoning_at_start=True)
 class DeepSeekR1Parser(BaseReasoningParser):
@@ -173,6 +211,89 @@ class DeepSeekR1Parser(BaseReasoningParser):
             "Unreachable code reached in `DeepSeekR1Parser.parse_delta`")
 
 
+@register_reasoning_parser("deepseek_v4")
+class DeepSeekV4ReasoningParser(BaseReasoningParser):
+    """DeepSeek-V4 parser selected by thinking-mode chat template kwargs."""
+
+    reasoning_start = "<think>"
+    reasoning_end = "</think>"
+
+    def __init__(
+        self,
+        *,
+        chat_template_kwargs: Optional[dict[str, Any]] = None,
+    ) -> None:
+        super().__init__(chat_template_kwargs=chat_template_kwargs)
+        chat_template_kwargs = chat_template_kwargs or {}
+        thinking = bool(
+            chat_template_kwargs.get("thinking", False)
+            or chat_template_kwargs.get("enable_thinking", False))
+        if thinking:
+            self._parser = DeepSeekR1Parser(
+                reasoning_at_start=True,
+                chat_template_kwargs=chat_template_kwargs,
+            )
+        else:
+            self._parser = IdentityReasoningParser(
+                chat_template_kwargs=chat_template_kwargs)
+
+    def parse(self, text: str) -> ReasoningParserResult:
+        return self._parser.parse(text)
+
+    def parse_delta(self, delta_text: str) -> ReasoningParserResult:
+        return self._parser.parse_delta(delta_text)
+
+    def finish(self) -> ReasoningParserResult:
+        return self._parser.finish()
+
+
+@register_reasoning_parser("minimax_m3")
+class MiniMaxM3ReasoningParser(DeepSeekR1Parser):
+    """Reasoning parser for MiniMax-M3.
+
+    The M3 chat template (``]<]minimax[>[`` family) renders the assistant
+    turn in one of two shapes:
+
+    * With reasoning::
+
+          <mm:think>{reasoning}</mm:think>{content}
+
+    * Without reasoning (the template still emits a bare ``</mm:think>``
+      as a sentinel so the model knows where the visible content starts)::
+
+          </mm:think>{content}
+
+    M3 is therefore not strictly ``reasoning_at_start`` — the leading
+    ``<mm:think>`` may or may not be present — so we partition on the
+    closing tag first and then strip an optional leading opening tag
+    from the reasoning portion. This keeps streaming behavior identical
+    to :class:`DeepSeekR1Parser` for the common (``<mm:think>...``) case
+    while also handling the bare-sentinel form.
+    """
+
+    def __init__(self,
+                 *,
+                 chat_template_kwargs: Optional[dict[str, Any]] = None) -> None:
+        super().__init__(reasoning_at_start=False,
+                         chat_template_kwargs=chat_template_kwargs)
+        self.reasoning_start = "<mm:think>"
+        self.reasoning_end = "</mm:think>"
+
+    def parse(self, text: str) -> ReasoningParserResult:
+        end_idx = text.find(self.reasoning_end)
+        if end_idx == -1:
+            # No closing tag → no reasoning block in this response.
+            return ReasoningParserResult(content=text)
+        reasoning_content = text[:end_idx]
+        content = text[end_idx + len(self.reasoning_end):]
+        # Strip an optional leading <mm:think> from the reasoning portion
+        # so the sentinel-only shape (no opening tag) reduces to
+        # reasoning_content="".
+        if reasoning_content.startswith(self.reasoning_start):
+            reasoning_content = reasoning_content[len(self.reasoning_start):]
+        return self._create_reasoning_end_result(content, reasoning_content)
+
+
 MODEL_TYPE_TO_REASONING_PARSER: dict[str, str] = {
     "qwen3": "qwen3",
     "qwen3_moe": "qwen3",
@@ -181,8 +302,15 @@ MODEL_TYPE_TO_REASONING_PARSER: dict[str, str] = {
     "qwen3_next": "qwen3",
     "deepseek_v3": "deepseek-r1",
     "deepseek_v32": "deepseek-r1",
-    "nemotron_h": "nano-v3",
+    "laguna": "laguna",
+    "deepseek_v4": "deepseek_v4",
+    "nemotron_h": "nemotron-v3",
+    "nemotron_h_puzzle": "nemotron-v3",
     "gemma4": "gemma4",
+    "kimi_k2": "kimi_k2",
+    "kimi_k25": "kimi_k25",
+    "minimax_m3": "minimax_m3",
+    "minimax_m3_vl": "minimax_m3",
 }
 
 _QWEN3_MODEL_TYPES = frozenset({
@@ -272,6 +400,7 @@ def resolve_auto_reasoning_parser(model: str) -> Optional[str]:
     return MODEL_TYPE_TO_REASONING_PARSER.get(model_type)
 
 
+@register_reasoning_parser("nemotron-v3")
 @register_reasoning_parser("nano-v3")
 class NemotronV3ReasoningParser(DeepSeekR1Parser):
     """Reasoning parser for Nemotron Nano v3.
@@ -296,6 +425,7 @@ class NemotronV3ReasoningParser(DeepSeekR1Parser):
                 "force_nonempty_content", False) is True
         super().__init__(reasoning_at_start=reasoning_at_start,
                          chat_template_kwargs=chat_template_kwargs)
+        self._tool_call_start = "<tool_call>"
         # Workaround: the model sometimes does not send closing think tags
         # which affects downstream applications. This is addressed by
         # optionally accumulating reasoning tokens and returning them as
@@ -318,10 +448,30 @@ class NemotronV3ReasoningParser(DeepSeekR1Parser):
         return result
 
     def parse_delta(self, delta_text: str) -> ReasoningParserResult:
-        """Wraps the parent parse_delta to track accumulated reasoning when
-        force_nonempty_content is set. When the closing tag is found
-        (in_reasoning transitions from True to False), the accumulation
-        is cleared to free memory."""
+        """Wraps the parent parse_delta to also treat `<tool_call>` as an
+        implicit end-of-reasoning marker.  When the model omits `</think>`
+        before generating a tool call, the tag would otherwise be absorbed
+        into reasoning_content and the downstream tool parser would never
+        see it (NVBug 6082303).
+
+        `<tool_call>` is a special token that always arrives as a single
+        atomic delta, so we only need to check `delta_text` (not the
+        parent's internal buffer)."""
+        if (self.in_reasoning and self._tool_call_start in delta_text
+                and self.reasoning_end not in self._buffer):
+            remaining = self._buffer
+            self._buffer = ""
+            self.in_reasoning = False
+            # Guaranteed non-negative: guarded by `in delta_text` above.
+            tool_idx = delta_text.find(self._tool_call_start)
+            reasoning = remaining + delta_text[:tool_idx]
+            content = delta_text[tool_idx:]
+            if self._force_nonempty_content:
+                self._found_closing_tag = True
+                self._accumulated_reasoning = ""
+            return ReasoningParserResult(content=content,
+                                         reasoning_content=reasoning)
+
         was_in_reasoning = self.in_reasoning
         result = super().parse_delta(delta_text)
         if self._force_nonempty_content:
@@ -363,7 +513,14 @@ class NemotronV3ReasoningParser(DeepSeekR1Parser):
         return ReasoningParserResult()
 
     def parse(self, text: str) -> ReasoningParserResult:
-        return self._maybe_swap_content(super().parse(text))
+        result = super().parse(text)
+        tc = (result.reasoning_content.find(self._tool_call_start)
+              if result.reasoning_content else -1)
+        if tc != -1:
+            result = ReasoningParserResult(
+                content=result.reasoning_content[tc:] + result.content,
+                reasoning_content=result.reasoning_content[:tc])
+        return self._maybe_swap_content(result)
 
 
 @register_reasoning_parser("gemma4")
@@ -480,8 +637,9 @@ class Gemma4ReasoningParser(BaseReasoningParser):
 
 
 @register_reasoning_parser("kimi_k2")
+@register_reasoning_parser("kimi_k25", reasoning_at_start=True)
 class KimiK2ReasoningParser(DeepSeekR1Parser):
-    """Reasoning parser for Kimi-K2-Thinking model.
+    """Reasoning parser for Kimi-K2 and Kimi-K2.5 models.
 
     Extends DeepSeekR1Parser to support interleaved thinking where reasoning
     content may be implicitly ended by a tool call section. The model uses
@@ -495,6 +653,12 @@ class KimiK2ReasoningParser(DeepSeekR1Parser):
       thinking (reasoning interrupted by tool call)
     * ``content`` (no ``<think>``) – no reasoning
 
+    For Kimi-K2.5, the chat template defaults to thinking mode (appends
+    ``<think>`` to prompt). When ``thinking=False`` is passed via
+    ``chat_template_kwargs``, the template appends ``<think></think>``
+    instead, and the model output has no thinking tags — this parser
+    dynamically adjusts ``reasoning_at_start`` accordingly.
+
     Adapted from:
     * vLLM ``vllm/reasoning/kimi_k2_reasoning_parser.py``
     * sglang ``sglang/srt/parser/reasoning_parser.py``
@@ -504,6 +668,13 @@ class KimiK2ReasoningParser(DeepSeekR1Parser):
                  *,
                  reasoning_at_start: bool = False,
                  chat_template_kwargs: Optional[dict[str, Any]] = None) -> None:
+        # For Kimi-K2.5: chat template defaults to thinking mode unless
+        # thinking=False is explicitly passed. Override reasoning_at_start
+        # based on the actual thinking state.
+        if chat_template_kwargs is not None:
+            thinking = chat_template_kwargs.get("thinking")
+            if thinking is False:
+                reasoning_at_start = False
         super().__init__(reasoning_at_start=reasoning_at_start,
                          chat_template_kwargs=chat_template_kwargs)
         self.tool_section_start = "<|tool_calls_section_begin|>"
@@ -530,9 +701,19 @@ class KimiK2ReasoningParser(DeepSeekR1Parser):
             reasoning_content = text[:tool_idx]
             content = text[tool_idx:]
         else:
-            # No end marker found – everything is reasoning.
-            reasoning_content = text
-            content = ""
+            # No end marker found.
+            if self.reasoning_at_start:
+                # reasoning_at_start=True but no </think>: this is
+                # instant mode (thinking=False) where the model output
+                # has no thinking tags — treat everything as content.
+                reasoning_content = ""
+                content = text
+            else:
+                # reasoning_at_start=False and we already stripped
+                # <think>: text is incomplete reasoning (e.g. truncated
+                # output) — treat everything as reasoning.
+                reasoning_content = text
+                content = ""
 
         return ReasoningParserResult(content=content,
                                      reasoning_content=reasoning_content)

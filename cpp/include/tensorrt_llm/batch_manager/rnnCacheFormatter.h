@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -34,11 +34,11 @@ class TransferSession;
 
 namespace rnn_state_manager
 {
-class RnnStateManager;
 class RnnCacheTransBufferManager;
 } // namespace rnn_state_manager
 
 /// @brief RNN Cache Formatter for formatting/unformatting RNN states during transfer.
+/// Uses unified pool mode via BaseKVCacheManager (for CppMambaHybridCacheManager, block-indexed pool).
 class RnnCacheFormatter : public kv_cache_manager::BaseCacheFormatter
 {
 public:
@@ -46,10 +46,10 @@ public:
     using CacheState = executor::kv_cache::CacheState;
     using RequestIdType = tensorrt_llm::batch_manager::RequestIdType;
 
-    /// @brief Constructor.
-    /// @param rnnStateManager Pointer to the RNN state manager.
+    /// @brief Constructor for unified pool mode (CppMambaHybridCacheManager).
+    /// @param kvCacheManager Pointer to the KV cache manager with unified pool.
     /// @param rnnCacheTransBufferManager Pointer to the RNN cache transfer buffer manager.
-    RnnCacheFormatter(rnn_state_manager::RnnStateManager* rnnStateManager,
+    RnnCacheFormatter(kv_cache_manager::BaseKVCacheManager* kvCacheManager,
         rnn_state_manager::RnnCacheTransBufferManager* rnnCacheTransBufferManager);
 
     /// @brief Format RNN states for sending.
@@ -72,22 +72,15 @@ public:
         CacheState const& selfConfig, SizeType32 selfIdx, CacheState const& destConfig,
         std::vector<SizeType32> const& counterPartRanks) const override;
 
-    /// @brief Returns nullptr since RNN cache formatter doesn't use KV cache manager.
+    /// @brief Returns the KV cache manager.
     [[nodiscard]] kv_cache_manager::BaseKVCacheManager* getCacheManager() const noexcept override
     {
-        return nullptr;
-    }
-
-    /// @brief Get the RNN state manager.
-    /// @return Pointer to the RNN state manager.
-    [[nodiscard]] rnn_state_manager::RnnStateManager* getRnnStateManager() const noexcept
-    {
-        return mRnnStateManager;
+        return mKvCacheManager;
     }
 
 private:
-    rnn_state_manager::RnnStateManager* mRnnStateManager;
     rnn_state_manager::RnnCacheTransBufferManager* mRnnCacheTransBufferManager;
+    kv_cache_manager::BaseKVCacheManager* mKvCacheManager{nullptr};
 };
 
 } // namespace tensorrt_llm::batch_manager

@@ -14,7 +14,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
 """Verify a CuTe DSL kernel against its reference using the fixed-name contract.
 
 Standalone script -- only Python stdlib required (torch/triton needed at

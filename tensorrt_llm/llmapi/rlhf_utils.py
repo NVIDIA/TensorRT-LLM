@@ -73,7 +73,15 @@ class WorkerExtension:
                     # using restricted unpickler from tensorrt_llm.serialization
                     logger.info("Deserializing base64-encoded weight handles")
                     decoded_data = base64.b64decode(serialized_handles)
-                    # Allow basic builtins and all torch modules
+                    disallowed_imports = {
+                        "torch.storage": ["_load_from_bytes"],
+                        "torch.hub": ["_load_local"],
+                        "torch": ["save"],
+                    }
+                    # CUDA IPC tensor handles serialize torch rebuild helpers.
+                    # Keep deserialization default-deny by allowing only this
+                    # call site to import torch symbols, with disallowed imports
+                    # still taking precedence in serialization.Unpickler.
                     approved_imports = {
                         "builtins": [
                             "list",
@@ -92,6 +100,7 @@ class WorkerExtension:
                         decoded_data,
                         approved_imports=approved_imports,
                         approved_module_patterns=[r"^torch.*"],
+                        disallowed_imports=disallowed_imports,
                     )
 
                     # Verify the result is a list as expected
@@ -149,6 +158,11 @@ class WorkerExtension:
     def reset_prefix_cache(self) -> None:
         """Invalidate the KV cache prefix reuse state after weight updates."""
         self.engine.reset_prefix_cache()
+
+    @control_action_decorator
+    def wait_for_engine_idle(self) -> None:
+        """Block until the engine has no active or queued requests."""
+        pass
 
     def check_weights_updated(self) -> bool:
         """Check if the weights are updated to 0."""

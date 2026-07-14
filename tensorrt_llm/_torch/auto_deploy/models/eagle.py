@@ -32,7 +32,8 @@ from torch._prims_common import DeviceLikeType
 from torch.export import Dim
 from torch.fx import GraphModule
 
-from ....llmapi.llm_args import MTPDecodingConfig
+from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
+
 from ..utils.logger import ad_logger
 from .custom.modeling_eagle import (
     EagleConfig,
@@ -65,7 +66,7 @@ class EagleDrafterFactory(AutoModelForCausalLMFactory):
 
         # Convert base config to EagleConfig, preserving existing values
         # and applying model-specific defaults based on model_type
-        model_config = EagleConfig(model_config, model_type)
+        model_config = EagleConfig.from_base_config(model_config, model_type)
 
         with (init_empty_weights if device == "meta" else nullcontext)():
             model = EagleDrafterForCausalLM._from_config(model_config, **unused_kwargs)
@@ -286,6 +287,9 @@ class EagleOneModelFactory(ModelFactory):
         self.sync_before_hidden_state_capture = kwargs.get(
             "sync_before_hidden_state_capture", False
         )
+        # Plumbed from LlmArgs.create_factory(); informs EagleWrapper whether
+        # to skip the TP-replication token broadcast in sample_greedy.
+        self.enable_attention_dp = kwargs.get("enable_attention_dp", False)
         # For MTP, derive Eagle-pipeline fields from MTP-specific fields.
         if isinstance(speculative_config, MTPDecodingConfig):
             draft_model_path = speculative_config.speculative_model or model
@@ -334,6 +338,7 @@ class EagleOneModelFactory(ModelFactory):
                 draft_config, "normalize_target_hidden_state", False
             ),
             sync_before_hidden_state_capture=self.sync_before_hidden_state_capture,
+            enable_attention_dp=self.enable_attention_dp,
         )
 
         return EagleWrapper(

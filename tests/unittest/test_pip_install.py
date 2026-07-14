@@ -101,7 +101,7 @@ def get_cpython_version():
     return "cp{}{}".format(python_version[0], python_version[1])
 
 
-def get_wheel_url(wheel_path):
+def get_wheel_url(wheel_path, version_local, cpython_version):
     """Get direct wheel URL from wheel_path (directory listing or direct URL)."""
     if not wheel_path.startswith(("http://", "https://")):
         wheel_path = "https://" + wheel_path
@@ -117,12 +117,29 @@ def get_wheel_url(wheel_path):
     for line in res.text.split("\n"):
         if not line.startswith('<a href="'):
             continue
-        name = line.split('"')[1]
-        if not name.endswith(".whl"):
+        filename = line.split('"')[1]
+        if not filename.endswith(".whl"):
             continue
-        if get_cpython_version() not in name:
+        try:
+            from packaging.utils import parse_wheel_filename
+            name, ver, build, tags = parse_wheel_filename(filename)
+        except Exception as e:
+            print(f"error: {e}")
             continue
-        wheel_name = name
+        if name != "tensorrt-llm":
+            continue
+        if not ver.local and not version_local:
+            pass
+        elif ver.local == version_local or ver.local and version_local and ver.local.startswith(
+                version_local):
+            pass
+        else:
+            continue
+
+        (tag, ) = tags
+        if tag.abi != cpython_version or tag.interpreter != cpython_version:
+            continue
+        wheel_name = filename
         break
     if not wheel_name:
         print(f"Fail to get the wheel name of {wheel_path}")
@@ -133,7 +150,8 @@ def get_wheel_url(wheel_path):
 
 
 def download_wheel(args):
-    wheel_url = get_wheel_url(args.wheel_path)
+    wheel_url = get_wheel_url(args.wheel_path, args.version_local,
+                              args.cpython_version)
     subprocess.check_call("rm *.whl || true", shell=True)
     subprocess.check_call(f"apt-get install -y wget && wget -q {wheel_url}",
                           shell=True)
@@ -160,11 +178,18 @@ def get_torch_constraint_file(constraint_dir="."):
         torch_version = torch_version_result.stdout.strip()
         if torch_version:
             print(f"Found installed torch version: {torch_version}")
+            # Strip the local version label (e.g. +5aff3928d8.nv26.05) so the
+            # constraint satisfies PEP 440 ordered-comparison specifiers like
+            # ">=2.11.0,<=2.13.0a0" — local versions are excluded from such
+            # comparisons and would cause a pip conflict.
+            from packaging.version import Version
+            torch_version_public = Version(torch_version).public
             constraint_file = os.path.join(constraint_dir,
                                            "torch-constraint.txt")
             with open(constraint_file, "w") as f:
-                f.write(f"torch=={torch_version}\n")
-            print(f"Created {constraint_file} to constrain torch version.")
+                f.write(f"torch=={torch_version_public}\n")
+            print(f"Created {constraint_file} to constrain torch version "
+                  f"(public: {torch_version_public}, full: {torch_version}).")
             return constraint_file
     except (subprocess.CalledProcessError, FileNotFoundError):
         print("Torch is not installed. Proceeding without constraint.")
@@ -258,7 +283,8 @@ def test_python_builds(args):
 
     install_system_libs()
 
-    wheel_url = get_wheel_url(args.wheel_path)
+    wheel_url = get_wheel_url(args.wheel_path, args.version_local,
+                              args.cpython_version)
     print(f"Using precompiled wheel: {wheel_url}")
 
     repo_root = os.path.abspath(
@@ -291,6 +317,14 @@ if __name__ == "__main__":
                         type=str,
                         required=True,
                         help="The wheel path")
+    parser.add_argument("--version_local",
+                        type=str,
+                        required=False,
+                        help="The local version prefix. e.g. ngcpytorch")
+    parser.add_argument("--cpython_version",
+                        type=str,
+                        default=get_cpython_version(),
+                        help="The CPython version. e.g. cp312")
     args = parser.parse_args()
     test_python_builds(args)
     test_pip_install(args)

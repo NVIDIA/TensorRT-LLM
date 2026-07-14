@@ -31,9 +31,10 @@ are NOT duplicated.
 import os
 import socket
 from contextlib import contextmanager
+from dataclasses import dataclass
 from enum import IntEnum
 from functools import lru_cache
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 import torch
 
@@ -49,6 +50,72 @@ try:
     TRTLLM_AVAILABLE = True
 except (ImportError, ModuleNotFoundError):
     TRTLLM_AVAILABLE = False
+
+# ---------------------------------------------------------------------------
+# ModelOpt quant config helpers  (used by standalone model factories)
+# ---------------------------------------------------------------------------
+if TRTLLM_AVAILABLE:
+    from tensorrt_llm.quantization.modelopt_config import (
+        is_modelopt_quant_config,
+        read_modelopt_quant_config,
+    )
+else:
+
+    def is_modelopt_quant_config(raw: Any) -> bool:
+        """Return True if ``raw`` looks like a ModelOpt quantization config."""
+        if not isinstance(raw, dict):
+            return False
+        if str(raw.get("quant_method", "")).lower().startswith("modelopt"):
+            return True
+        return (raw.get("producer") or {}).get("name") == "modelopt"
+
+    _KV_SCHEME_DICT_MAP = {
+        ("float", 8): "FP8",
+        ("float", 4): "NVFP4",
+        ("int", 8): "INT8",
+    }
+    _KV_SCHEME_STRING_ALGOS = {"FP8", "NVFP4", "INT8"}
+
+    def _kv_cache_scheme_to_algo(scheme: Any) -> Optional[str]:
+        if scheme is None:
+            return None
+        if isinstance(scheme, str):
+            algo = scheme.upper()
+            if algo in _KV_SCHEME_STRING_ALGOS:
+                return algo
+        elif isinstance(scheme, dict):
+            return _KV_SCHEME_DICT_MAP.get((scheme.get("type"), scheme.get("num_bits")))
+        return None
+
+    def read_modelopt_quant_config(raw: Dict[str, Any]) -> Dict[str, Any]:
+        """Normalize supported ModelOpt quant config shapes for standalone use."""
+        if not isinstance(raw, dict):
+            raise ValueError(f"Expected dict for modelopt quant config, got {type(raw).__name__}")
+        if "quantization" in raw:
+            quantization = raw["quantization"]
+            if not isinstance(quantization, dict):
+                raise ValueError(
+                    f"'quantization' must be a dict, got {type(quantization).__name__}"
+                )
+            result = dict(quantization)
+        elif is_modelopt_quant_config(raw):
+            skip_keys = {"producer", "quant_method", "ignore", "kv_cache_scheme", "config_groups"}
+            result = {key: value for key, value in raw.items() if key not in skip_keys}
+            if "ignore" in raw:
+                result["exclude_modules"] = raw["ignore"]
+            if "kv_cache_scheme" in raw:
+                algo = _kv_cache_scheme_to_algo(raw["kv_cache_scheme"])
+                if algo is not None:
+                    result["kv_cache_quant_algo"] = algo
+        else:
+            raise ValueError(
+                f"Not a modelopt quant config (producer={raw.get('producer')!r}, "
+                f"quant_method={raw.get('quant_method')!r})"
+            )
+        if result.get("quant_algo") == "fp8_pb_wo":
+            result["quant_algo"] = "FP8_BLOCK_SCALES"
+        return result
+
 
 # ---------------------------------------------------------------------------
 # ActivationType  (used by 11 standalone files)
@@ -67,6 +134,36 @@ else:
         Geglu = 6
         SwigluBias = 7
         Relu2 = 8
+
+
+# ---------------------------------------------------------------------------
+# MultimodalInput  (used by standalone multimodal input processors)
+# ---------------------------------------------------------------------------
+if TRTLLM_AVAILABLE:
+    from tensorrt_llm.inputs.multimodal import MultimodalInput
+else:
+
+    @dataclass
+    class MultimodalInput:
+        """Standalone subset of TensorRT-LLM's multimodal request metadata."""
+
+        multimodal_hashes: List[List[int]]
+        multimodal_positions: List[int]
+        multimodal_lengths: List[int]
+
+        @classmethod
+        def from_components(
+            cls,
+            mm_hashes: List[List[int]],
+            mm_positions: List[int],
+            mm_lengths: List[int],
+            **_: object,
+        ) -> "MultimodalInput":
+            return cls(
+                multimodal_hashes=mm_hashes,
+                multimodal_positions=mm_positions,
+                multimodal_lengths=mm_lengths,
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -110,6 +207,7 @@ else:
         cross_kv_cache_fraction: Optional[float] = None
         secondary_offload_min_priority: Optional[int] = None
         event_buffer_max_size: int = 0
+        kv_cache_event_hash_algo: str = "auto"
         enable_partial_reuse: bool = True
         copy_on_partial_reuse: bool = True
         use_uvm: bool = False

@@ -88,6 +88,7 @@ class TrtGptModelTest;
 
 // Algorithms
 class CapacityScheduler;
+class DisaggTransferAdmissionController;
 class MicroBatchScheduler;
 class PauseRequests;
 class AssignReqSeqSlots;
@@ -600,6 +601,7 @@ private:
 
     /******************** Cache transceiver ********************/
     std::unique_ptr<BaseCacheTransceiver> mCacheTransceiver;
+    std::unique_ptr<DisaggTransferAdmissionController> mDisaggTransferAdmissionController;
 
     /******************** Spec dec ***********************/
     std::unique_ptr<std::thread> mDraftModelSendLogitsThread;
@@ -607,7 +609,12 @@ private:
     std::atomic<bool> mDraftModelThreadShouldExit{false};
     bool mIsLeaderInOrchMode{false};
     // List of completed draft requests which logits will need to be sent to the target model.
+    // Guarded by mDraftRequestsMtx (shared with the background logits sender thread).
     RequestVector mDraftRequestsWaitingToSendLogits;
+    // Draft requests whose logits have been sent — pending termination by main thread.
+    // Guarded by mDraftRequestsMtx.
+    RequestVector mDraftRequestsDoneSendingLogits;
+    std::mutex mDraftRequestsMtx;
     SizeType32 mSeamlessLADMaxDraftLen{0};
     bool mUseSeamlessLookahead{false};
     RewindInputs mRewindInputs;

@@ -17,6 +17,13 @@ from tensorrt_llm._torch.attention_backend.interface import AttentionRuntimeFeat
 from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.models.modeling_multimodal_encoder import MultimodalEncoderMixin
+from tensorrt_llm._torch.pyexecutor.config_utils import (
+    extract_mamba_kv_cache_params,
+    is_nemotron_hybrid,
+    is_qwen3_hybrid,
+)
+from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import CppMambaHybridCacheManager
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import str_dtype_to_torch
 from tensorrt_llm.bindings.executor import KvCacheConfig
@@ -27,6 +34,7 @@ from tensorrt_llm.inputs import (
     prompt_inputs,
 )
 from tensorrt_llm.inputs.multimodal import MultimodalParams, MultimodalRuntimeData
+from tensorrt_llm.llmapi.llm_args import KvCacheConfig as PyKvCacheConfig
 from tensorrt_llm.mapping import Mapping
 
 
@@ -167,12 +175,20 @@ class TestModelingMultimodal(unittest.TestCase, ABC):
         hf_config = config_class.from_dict(config_dict)
         return hf_config
 
+    def get_trtllm_pretrained_config(self) -> PretrainedConfig:
+        """Return the pretrained config used to construct the TRT-LLM model."""
+        return self.hf_config
+
     def create_trtllm_model(
         self, load_weights: bool = False, hf_model_state_dict: Optional[Dict] = None, **kwargs
     ) -> Tuple[PreTrainedModel, ModelConfig]:
         """Create a TensorRT-LLM model instance."""
 
-        model_config = ModelConfig(pretrained_config=self.hf_config)
+        pretrained_config = self.get_trtllm_pretrained_config()
+        model_config = ModelConfig(pretrained_config=pretrained_config)
+        model_config.max_num_tokens = max(
+            self.get_max_num_tokens(scenario) for scenario in self.get_scenarios()
+        )
         model_class = self.get_trtllm_model_class()
         model = model_class(model_config, **kwargs).to("cuda")
 
@@ -180,7 +196,7 @@ class TestModelingMultimodal(unittest.TestCase, ABC):
             weight_mapper_class = self.get_weight_mapper_class()
             if weight_mapper_class is not None:
                 weight_mapper = weight_mapper_class()
-                weight_mapper.init_model_and_config(model, self.hf_config)
+                weight_mapper.init_model_and_config(model, pretrained_config)
                 model.load_weights(hf_model_state_dict, weight_mapper)
             else:
                 model.load_weights(hf_model_state_dict)
@@ -190,6 +206,21 @@ class TestModelingMultimodal(unittest.TestCase, ABC):
                     module, "_weights_removed", False
                 ):
                     module.post_load_weights()
+
+        # PyTorchModelEngine builds the vision encoders' AttentionMetadata after
+        # load via `_set_up_multimodal_encoder_attn_metadata`. These standalone
+        # model tests don't go through the engine, so mirror that walk here --
+        # otherwise the encoder forward raises on an uninitialized attn_metadata.
+        for module in model.modules():
+            if isinstance(module, MultimodalEncoderMixin):
+                module.setup_attn_metadata(
+                    # Encoder batch axis (image/sequence count) is a distinct
+                    # budget from the token axis; mirror the engine's
+                    # max_batch_size default. Qwen-family subclasses floor this
+                    # up to max_num_tokens internally for windowed fan-out.
+                    max_num_requests=2048,
+                    max_num_tokens=model_config.max_num_tokens,
+                )
 
         return model, model_config
 
@@ -271,12 +302,15 @@ class TestModelingMultimodal(unittest.TestCase, ABC):
         mapping = Mapping(world_size=1, tp_size=1, rank=0)
         kv_cache_config = KvCacheConfig(max_tokens=num_blocks * tokens_per_block)
 
+        # VL configs (e.g. Qwen2_5_VLConfig) in transformers 5.x no longer
+        # proxy text_config attributes to the outer config level.
+        text_config = getattr(config, "text_config", config)
         kv_cache_manager = KVCacheManager(
             kv_cache_config,
             tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
-            num_layers=config.num_hidden_layers,
-            num_kv_heads=config.num_key_value_heads,
-            head_dim=config.hidden_size // config.num_attention_heads,
+            num_layers=text_config.num_hidden_layers,
+            num_kv_heads=text_config.num_key_value_heads,
+            head_dim=text_config.hidden_size // text_config.num_attention_heads,
             tokens_per_block=tokens_per_block,
             max_seq_len=max_seq_len,
             max_batch_size=batch_size,
@@ -457,6 +491,14 @@ class TestModelingMultimodal(unittest.TestCase, ABC):
             pass
         else:
             raise ValueError(f"Invalid modality: {modality}")
+        # transformers 5.x's ``ProcessorMixin._merge_kwargs`` strictly
+        # validates per-modality kwargs against a TypedDict, and some
+        # Qwen2/3-VL checkpoints leak processor *output* keys (e.g.
+        # ``video_grid_thw``) into ``output_kwargs[<modality>]`` via the
+        # tokenizer's ``init_kwargs`` / ``model_input_names``, tripping
+        # validation. The Qwen VL input processor's ``__init__`` installs a
+        # process-wide filter that drops those keys before the validator sees
+        # them.
         processor_inputs = hf_processor(
             text=[input["prompt"] for input in inputs],
             images=images,
@@ -465,6 +507,10 @@ class TestModelingMultimodal(unittest.TestCase, ABC):
             return_tensors="pt",
             do_rescale=False,
         ).to(self.device)
+        # Transformers 5.5.x's `compute_3d_position_ids` raises a ValueError when
+        # multimodal grids are passed without `mm_token_type_ids`. The processor
+        # already returns this tensor for both image and video modalities, so
+        # keep it in the inputs to satisfy the new HF reference path.
         return processor_inputs
 
     def run_trtllm_forward(self, trtllm_inputs, use_cuda_graph: bool = False):
@@ -502,6 +548,13 @@ class TestModelingMultimodal(unittest.TestCase, ABC):
         Note:
             This method uses get_kv_cache_config() to obtain configuration.
             Override get_kv_cache_config() to customize cache settings.
+
+            For hybrid linear-attention models (Qwen3Next, Qwen3.5,
+            Nemotron-Hybrid) this dispatches to
+            `get_hybrid_kv_cache_manager` so the linear-attention layers
+            get a `CppMambaHybridCacheManager` for SSM/conv state.
+            Mirrors the production dispatch in
+            `_util.py:_create_kv_cache_manager`.
         """
         # Get cache configuration from the configurable method
         cache_config = self.get_kv_cache_config(scenario)
@@ -511,16 +564,113 @@ class TestModelingMultimodal(unittest.TestCase, ABC):
 
         num_blocks = (max_seq_len + tokens_per_block - 1) // tokens_per_block
 
-        self.kv_cache_manager = self.get_kv_cache_manager(
-            dtype=self.model_config.pretrained_config.torch_dtype,
-            config=self.model_config.pretrained_config,
-            tokens_per_block=tokens_per_block,
-            max_seq_len=max_seq_len,
-            batch_size=batch_size,
-            num_blocks=num_blocks,
+        config = self.model_config.pretrained_config
+        text_config = getattr(config, "text_config", config)
+
+        if is_qwen3_hybrid(text_config) or is_nemotron_hybrid(text_config):
+            self.kv_cache_manager = self.get_hybrid_kv_cache_manager(
+                text_config=text_config,
+                tokens_per_block=tokens_per_block,
+                max_seq_len=max_seq_len,
+                batch_size=batch_size,
+                num_blocks=num_blocks,
+            )
+        else:
+            self.kv_cache_manager = self.get_kv_cache_manager(
+                dtype=self.model_config.pretrained_config.torch_dtype,
+                config=self.model_config.pretrained_config,
+                tokens_per_block=tokens_per_block,
+                max_seq_len=max_seq_len,
+                batch_size=batch_size,
+                num_blocks=num_blocks,
+            )
+
+        self.kv_cache_manager.add_dummy_requests(
+            request_ids=[1],
+            token_nums=[max_seq_len],
+            **self._dummy_request_kwargs(scenario),
         )
 
-        self.kv_cache_manager.add_dummy_requests(request_ids=[1], token_nums=[max_seq_len])
+    def _dummy_request_kwargs(self, scenario: MultimodalScenario) -> Dict:
+        """Optional override hook for extra kwargs to `add_dummy_requests`.
+
+        Subclasses for mRoPE-using models (Qwen2.5-VL, Qwen3-VL, Qwen3.5-VL,
+        …) should return `{"use_mrope": True}` here so the cache manager
+        allocates the mRoPE position-id buffer at dummy-request time.
+        Defaults to an empty dict, preserving existing behavior for tests
+        that don't care.
+        """
+        return {}
+
+    def get_hybrid_kv_cache_manager(
+        self,
+        text_config: PretrainedConfig,
+        tokens_per_block: int,
+        max_seq_len: int,
+        batch_size: int,
+        num_blocks: int,
+    ):
+        """Build a `CppMambaHybridCacheManager` for hybrid linear-attention
+        models (Qwen3Next, Qwen3.5, Nemotron-Hybrid).
+
+        Mirrors the production construction in
+        `_util.py:_create_kv_cache_manager` for `is_qwen3_hybrid` /
+        `is_nemotron_hybrid` configs: pulls the state-shape / dtype /
+        layer-mask parameters from `extract_mamba_kv_cache_params` and
+        threads them through the constructor. Tests that need a different
+        concrete manager (e.g. `MixedMambaHybridCacheManager` for
+        disagg-style coverage) should override this method.
+        """
+        dtype_map = {
+            torch.half: tensorrt_llm.bindings.DataType.HALF,
+            torch.float16: tensorrt_llm.bindings.DataType.HALF,
+            torch.bfloat16: tensorrt_llm.bindings.DataType.BF16,
+        }
+
+        mamba_params = extract_mamba_kv_cache_params(text_config)
+        if mamba_params.dtype not in dtype_map:
+            raise ValueError(
+                f"Unsupported dtype for hybrid cache manager: "
+                f"{mamba_params.dtype}. Supported: {list(dtype_map.keys())}"
+            )
+        kv_cache_dtype = dtype_map[mamba_params.dtype]
+
+        head_dim = getattr(text_config, "head_dim", None)
+        if not isinstance(head_dim, int):
+            head_dim = text_config.hidden_size // text_config.num_attention_heads
+
+        # CppMambaHybridCacheManager reads Pydantic-only fields
+        # (mamba_state_cache_interval, enable_block_reuse) so we have to
+        # construct the llmapi.llm_args.KvCacheConfig here, not the C++
+        # bindings KvCacheConfig that the standard KVCacheManager path uses.
+        kv_cache_config = PyKvCacheConfig(max_tokens=num_blocks * tokens_per_block)
+        mapping = Mapping(world_size=1, tp_size=1, rank=0)
+
+        return CppMambaHybridCacheManager(
+            # mamba cache parameters (positional)
+            mamba_params.state_size,
+            mamba_params.conv_kernel,
+            mamba_params.num_heads,
+            mamba_params.n_groups,
+            mamba_params.head_dim,
+            mamba_params.num_mamba_layers,
+            mamba_params.mamba_layer_mask,
+            mamba_params.dtype,
+            mamba_params.mamba_ssm_cache_dtype,
+            # kv cache parameters (positional)
+            kv_cache_config,
+            tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
+            # kw-only
+            num_layers=mamba_params.num_full_attention_layers,
+            layer_mask=mamba_params.full_attention_layer_mask,
+            num_kv_heads=text_config.num_key_value_heads,
+            head_dim=head_dim,
+            tokens_per_block=tokens_per_block,
+            max_seq_len=max_seq_len,
+            max_batch_size=batch_size,
+            mapping=mapping,
+            dtype=kv_cache_dtype,
+        )
 
     def get_max_num_tokens(self, scenario: MultimodalScenario) -> int:
         """Get maximum number of tokens for attention metadata."""
@@ -678,6 +828,14 @@ class TestModelingMultimodal(unittest.TestCase, ABC):
 
         # TODO: Add multi-GPU support
         self.device = torch.device("cuda:0")
+
+        # Pre-initialize fields that tearDown / setup_scenario expect to
+        # exist. Without this, a test method that doesn't run
+        # setup_scenario (e.g. a setUp-only smoke test) leaves
+        # self.kv_cache_manager unset and tearDown errors with
+        # AttributeError on the ``is not None`` check.
+        self.kv_cache_manager = None
+        self.attn_metadata = None
 
         self.hf_config = self.create_hf_config()
         if self.skip_hf_inference:

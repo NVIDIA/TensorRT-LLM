@@ -256,10 +256,10 @@ public:
     CacheSender() = default;
 
     /// @brief Asynchronously respond to the request and send data.
-    /// @param llmRequest Request object. Its data should be ready when called, and the data for this request
-    /// should remain valid until future synchronization.
+    /// @param llmRequest Request object. Its data should be ready when called. shared_ptr so the async send
+    /// worker can extend the request's lifetime past the caller's reference.
     /// @return Once the data is fully sent, the future object will become valid.
-    [[nodiscard]] virtual std::future<void> sendAsync(LlmRequest& llmRequest) const;
+    [[nodiscard]] virtual std::future<void> sendAsync(std::shared_ptr<LlmRequest> const& llmRequest) const;
 
     /// @brief Return the internal communicator status.
     /// @return The communicator status.
@@ -287,6 +287,12 @@ public:
     /// @param isReady Whether the request is ready to be received.
     virtual void sendReadySignal(LlmRequest::RequestIdType requestId, bool isReady);
 
+    /// @brief Update the RNN config on the internal CacheState copies.
+    /// Used by CppMambaHybridCacheManager path where RNN config is set after construction.
+    void setRnnConfig(executor::kv_cache::CacheState::RnnModelConfig rnnModelConfig,
+        std::vector<SizeType32> rnnLayerNumPerPP, nvinfer1::DataType convStateDataType,
+        nvinfer1::DataType ssmStateDataType);
+
     /// @brief Destructor.
     virtual ~CacheSender();
 
@@ -313,10 +319,10 @@ public:
     CacheReceiver() = default;
 
     /// @brief Asynchronously send a request to receive data.
-    /// @param llmRequest Request object. Its data should be in an allocated but unwritten state when called, and the
-    /// data for this request should remain intact only after future synchronization.
+    /// @param llmRequest Request object. Its data should be in an allocated but unwritten state when called.
+    /// shared_ptr so the async receive worker can extend the request's lifetime past the caller's reference.
     /// @return Once the data is fully received, the future object will become valid.
-    [[nodiscard]] virtual std::future<void> receiveAsync(LlmRequest& llmRequest) const;
+    [[nodiscard]] virtual std::future<void> receiveAsync(std::shared_ptr<LlmRequest> const& llmRequest) const;
 
     virtual TransferSession sendRequestInfo(LlmRequest const& llmRequest);
 
@@ -331,6 +337,12 @@ public:
     /// @param session The session object.
     /// @return Whether the request is ready to be received.
     virtual bool receiveReadySignal(TransferSession& session);
+
+    /// @brief Update the RNN config on the internal CacheState copies.
+    /// Used by CppMambaHybridCacheManager path where RNN config is set after construction.
+    void setRnnConfig(executor::kv_cache::CacheState::RnnModelConfig rnnModelConfig,
+        std::vector<SizeType32> rnnLayerNumPerPP, nvinfer1::DataType convStateDataType,
+        nvinfer1::DataType ssmStateDataType);
 
     /// @brief Destructor.
     virtual ~CacheReceiver();

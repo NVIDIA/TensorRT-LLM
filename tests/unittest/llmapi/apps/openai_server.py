@@ -164,6 +164,7 @@ class RemoteDisaggOpenAIServer(RemoteOpenAIServer):
         self.disagg_config = self._get_extra_config()
         if disagg_config:
             self.disagg_config.update(disagg_config)
+            self.host = self.disagg_config.get("hostname", self.host)
         self.log_path = log_path
         self.log_file = None
         self.extra_config_file = os.path.join(
@@ -228,6 +229,36 @@ class RemoteMMEncoderServer(RemoteOpenAIServer):
 
         # Use mm_embedding_serve command instead of regular serve
         launch_cmd = ["trtllm-serve", "mm_embedding_serve"] + [model] + args
+
+        self.proc = subprocess.Popen(launch_cmd,
+                                     stdout=self._get_output(),
+                                     stderr=self._get_output())
+        self._wait_for_server(url=self.url_for("health"),
+                              timeout=self.MAX_SERVER_START_WAIT_S)
+
+
+class RemoteEmbeddingServer(RemoteOpenAIServer):
+    """Remote server for testing the /v1/embeddings endpoint (encoder-only)."""
+
+    def __init__(self,
+                 model: str,
+                 cli_args: List[str] = None,
+                 port: int = None,
+                 log_path: Optional[str] = None) -> None:
+        self.host = "localhost"
+        self.port = port if port is not None else get_free_port()
+        self.rank = int(os.environ.get("SLURM_PROCID", 0))
+        self.log_path = log_path
+        self.log_file = None
+        self.role = None
+        self.extra_config_file = None
+
+        args = ["--host", f"{self.host}", "--port", f"{self.port}"]
+        if cli_args:
+            args += cli_args
+
+        # Use the `embeddings` subcommand instead of the regular `serve`.
+        launch_cmd = ["trtllm-serve", "embeddings"] + [model] + args
 
         self.proc = subprocess.Popen(launch_cmd,
                                      stdout=self._get_output(),

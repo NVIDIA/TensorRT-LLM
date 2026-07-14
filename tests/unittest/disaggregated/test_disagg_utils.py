@@ -142,6 +142,41 @@ def test_extract_router_config(sample_yaml_config):
     assert "max_num_tokens" not in gen_router_config.args
 
 
+def test_extract_router_config_propagates_tokens_per_block():
+    # tokens_per_block lives under kv_cache_config and must reach the router so
+    # block hashes match the worker's KV cache.
+    cfg = {
+        "router": {
+            "type": "kv_cache_aware"
+        },
+        "max_batch_size": 8,
+        "kv_cache_config": {
+            "tokens_per_block": 128
+        },
+    }
+    router_config = extract_router_config(cfg)
+    assert router_config.args["tokens_per_block"] == 128
+
+    # An explicit router-level value is not overwritten.
+    cfg2 = {
+        "router": {
+            "type": "kv_cache_aware",
+            "tokens_per_block": 64
+        },
+        "kv_cache_config": {
+            "tokens_per_block": 128
+        },
+    }
+    assert extract_router_config(cfg2).args["tokens_per_block"] == 64
+
+    # No kv_cache_config -> nothing propagated.
+    assert "tokens_per_block" not in extract_router_config({
+        "router": {
+            "type": "kv_cache_aware"
+        }
+    }).args
+
+
 def test_get_server_configs_dict():
     server_configs = [
         CtxGenServerConfig(type="ctx",

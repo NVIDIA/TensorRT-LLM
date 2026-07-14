@@ -34,7 +34,7 @@ namespace common
 
 /// Map a raw module directory name to a short display abbreviation.
 /// Every known module gets an explicit entry; unknown modules fall through as-is.
-/// Display padding to 8 characters is handled by getPrefix() via printf %-8s formatting.
+/// getPrefix() prints the module name with no padding.
 constexpr std::string_view formatModule(std::string_view module)
 {
     // Source modules (cpp/tensorrt_llm/*)
@@ -117,7 +117,7 @@ public:
                 return formatModule(path.substr(moduleStart, slashPos - moduleStart));
             }
         }
-        return "  others";
+        return "others";
     }
 
     Logger(Logger const&) = delete;
@@ -296,17 +296,17 @@ private:
     {
         if (rank_ >= 0)
         {
-            return tensorrt_llm::common::fmtstr("%s [%s] [%-8.*s] [RANK %d] ", kPREFIX, getLevelName(level),
+            return tensorrt_llm::common::fmtstr("%s [%s] [%.*s][RANK %d] ", kPREFIX, getLevelName(level),
                 static_cast<int>(module.size()), module.data(), rank_);
         }
         return tensorrt_llm::common::fmtstr(
-            "%s [%s] [%-8.*s] ", kPREFIX, getLevelName(level), static_cast<int>(module.size()), module.data());
+            "%s [%s] [%.*s] ", kPREFIX, getLevelName(level), static_cast<int>(module.size()), module.data());
     }
 
     // With module, explicit rank
     static inline std::string getPrefix(Level const level, std::string_view module, int const rank)
     {
-        return tensorrt_llm::common::fmtstr("%s [%s] [%-8.*s] [RANK %d] ", kPREFIX, getLevelName(level),
+        return tensorrt_llm::common::fmtstr("%s [%s] [%.*s][RANK %d] ", kPREFIX, getLevelName(level),
             static_cast<int>(module.size()), module.data(), rank);
     }
 };

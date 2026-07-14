@@ -184,12 +184,42 @@ inline __device__ void dequantCopy(
     }
 }
 
-template <typename T, int BLOCK_SIZE, int K_DIM, int ROPE_DIM, typename KVCacheBuffer>
+// `kOutputFp8Q`: when true, write the rotated Q rope segment directly to
+// `quant_q_buf` as FP8 (scaled by `*quant_scale_qkv`) and skip the bf16 STG to
+// `q_ptr`. Companion: `deepseek_v4_q_norm_fused_fp8` pre-fills the nope segment
+// of `quant_q_buf`, so the standalone quantizeCopyInputToFp8Kernel can be
+// dropped. `quant_q_buf`/`quant_scale_qkv`/bmm_scale outputs are unused when
+// `kOutputFp8Q == false`.
+template <typename T, int BLOCK_SIZE, int K_DIM, int ROPE_DIM, typename KVCacheBuffer, bool kOutputFp8Q = false>
 __global__ void applyMLARopeAndAssignQKVKernelOptContext(T* q_ptr, T* q_pe, T* k_ptr, T const* fuse_buf,
     KVCacheBuffer kv_cache, int q_pe_ld, int q_pe_stride, float2 const* cos_sin_cache, size_t head_num, int head_size,
     int c_k, int* cu_q_seqlens, int32_t const* kv_cache_lengths, uint32_t max_input_seq_len, KvCacheDataType cache_type,
-    float const* quant_scale_kv, int32_t const* helix_position_offsets, bool absorption_mode)
+    float const* quant_scale_kv, int32_t const* helix_position_offsets, bool absorption_mode,
+    __nv_fp8_e4m3* quant_q_buf = nullptr, float const* quant_scale_qkv = nullptr, float* bmm1_scale_out = nullptr,
+    float* bmm2_scale_out = nullptr, float const* dequant_scale_q = nullptr, float const* dequant_scale_kv = nullptr,
+    float const* quant_scale_o = nullptr, float host_bmm1_scale = 1.0f)
 {
+    // bmm scales — single thread emits them when we skip quantizeCopyInputToFp8Kernel.
+    if constexpr (kOutputFp8Q)
+    {
+        if (blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 && threadIdx.x == 0)
+        {
+            float const dq_q = dequant_scale_q ? dequant_scale_q[0] : 1.f;
+            float const dq_kv = dequant_scale_kv ? dequant_scale_kv[0] : 1.f;
+            float const q_o = quant_scale_o ? quant_scale_o[0] : 1.f;
+            if (bmm1_scale_out)
+            {
+                constexpr float kLog2e = 1.4426950408889634074f;
+                float const bmm1 = dq_q * dq_kv * host_bmm1_scale;
+                bmm1_scale_out[0] = bmm1;
+                bmm1_scale_out[1] = bmm1 * kLog2e;
+            }
+            if (bmm2_scale_out)
+            {
+                bmm2_scale_out[0] = q_o * dq_kv;
+            }
+        }
+    }
 
     // Constants.
     using VecT = typename VecType<T>::Type;
@@ -223,6 +253,7 @@ __global__ void applyMLARopeAndAssignQKVKernelOptContext(T* q_ptr, T* q_pe, T* k
         size_t const seq_len_loop_end
             = size_t((max_input_seq_len + TOKENS_PER_BLOCK - 1) / TOKENS_PER_BLOCK) * TOKENS_PER_BLOCK;
         float quant_scale_kv_val = quant_scale_kv ? quant_scale_kv[0] : 1.f;
+        float quant_scale_qkv_val = (kOutputFp8Q && quant_scale_qkv) ? quant_scale_qkv[0] : 1.f;
 
         // Mainloop.
         for (int local_token_idx = (threadIdx.x / VECS_PER_HEAD) + blockIdx.x * TOKENS_PER_BLOCK;
@@ -297,7 +328,15 @@ __global__ void applyMLARopeAndAssignQKVKernelOptContext(T* q_ptr, T* q_pe, T* k
                     + head_idx * (nope_head_size_q + ROPE_DIM) + nope_head_size_q + head_dim_idx;
                 auto const dst_k_idx = static_cast<size_t>(global_token_idx) * head_num * (head_size + ROPE_DIM)
                     + head_idx * (head_size + ROPE_DIM) + head_size + head_dim_idx;
-                reinterpret_cast<VecT*>(q_ptr)[dst_q_idx / ELTS_PER_VEC] = q;
+                if constexpr (kOutputFp8Q)
+                {
+                    quantCopy<T, ELTS_PER_VEC>(
+                        quant_q_buf + dst_q_idx, reinterpret_cast<T const*>(&q), quant_scale_qkv_val);
+                }
+                else
+                {
+                    reinterpret_cast<VecT*>(q_ptr)[dst_q_idx / ELTS_PER_VEC] = q;
+                }
                 // Only write to k_pe to k_buf in the non-absorption mode.
                 if (!absorption_mode)
                 {
@@ -970,11 +1009,55 @@ void invokeMLARopeContext(MlaParams<T>& params, KVCacheBuffer kv_cache_buffer, c
 {
     dim3 grid(int(tensorrt_llm::common::divUp(params.max_input_seq_len, 32)), params.batch_size, params.head_num + 8);
     auto head_size = params.meta.qk_nope_head_dim;
-    applyMLARopeAndAssignQKVKernelOptContext<T, 256, 512, 64, KVCacheBuffer><<<grid, 256, 0, stream>>>(params.q_buf,
-        params.q_pe, params.k_buf, params.latent_cache, kv_cache_buffer, params.q_pe_ld, params.q_pe_stride,
-        params.cos_sin_cache, params.head_num, head_size, params.meta.kv_lora_rank, params.cu_q_seqlens,
-        params.cache_seq_lens, params.max_input_seq_len, params.cache_type, params.quant_scale_kv,
-        params.helix_position_offsets, params.absorption_mode);
+    // Fused FP8-Q path: write the rotated Q rope segment directly to quant_q_buf
+    // as FP8 so the caller can drop the standalone quantizeCopyInputToFp8Kernel.
+    bool const useFusedFp8Q = params.fuse_q_fp8_in_rope && params.absorption_mode
+        && params.cache_type == KvCacheDataType::FP8 && params.quant_q_buf != nullptr
+        && params.quant_scale_qkv != nullptr;
+
+    auto* quant_q_fp8 = useFusedFp8Q ? static_cast<__nv_fp8_e4m3*>(params.quant_q_buf) : nullptr;
+    if (params.meta.rope_append)
+    {
+        if (useFusedFp8Q)
+        {
+            applyMLARopeAndAssignQKVKernelOptContext<T, 256, 512, 64, KVCacheBuffer, true>
+                <<<grid, 256, 0, stream>>>(params.q_buf, params.q_pe, params.k_buf, params.latent_cache,
+                    kv_cache_buffer, params.q_pe_ld, params.q_pe_stride, params.cos_sin_cache, params.head_num,
+                    head_size, params.meta.kv_lora_rank, params.cu_q_seqlens, params.cache_seq_lens,
+                    params.max_input_seq_len, params.cache_type, params.quant_scale_kv, params.helix_position_offsets,
+                    params.absorption_mode, quant_q_fp8, params.quant_scale_qkv, params.bmm1_scale, params.bmm2_scale,
+                    params.dequant_scale_q, params.dequant_scale_kv, params.quant_scale_o, params.host_bmm1_scale);
+        }
+        else
+        {
+            applyMLARopeAndAssignQKVKernelOptContext<T, 256, 512, 64, KVCacheBuffer, false><<<grid, 256, 0, stream>>>(
+                params.q_buf, params.q_pe, params.k_buf, params.latent_cache, kv_cache_buffer, params.q_pe_ld,
+                params.q_pe_stride, params.cos_sin_cache, params.head_num, head_size, params.meta.kv_lora_rank,
+                params.cu_q_seqlens, params.cache_seq_lens, params.max_input_seq_len, params.cache_type,
+                params.quant_scale_kv, params.helix_position_offsets, params.absorption_mode);
+        }
+    }
+    else
+    {
+        if (useFusedFp8Q)
+        {
+            applyMLARopeAndAssignQKVKernelOptContext<T, 256, 448, 64, KVCacheBuffer, true>
+                <<<grid, 256, 0, stream>>>(params.q_buf, params.q_pe, params.k_buf, params.latent_cache,
+                    kv_cache_buffer, params.q_pe_ld, params.q_pe_stride, params.cos_sin_cache, params.head_num,
+                    head_size, params.meta.kv_lora_rank, params.cu_q_seqlens, params.cache_seq_lens,
+                    params.max_input_seq_len, params.cache_type, params.quant_scale_kv, params.helix_position_offsets,
+                    params.absorption_mode, quant_q_fp8, params.quant_scale_qkv, params.bmm1_scale, params.bmm2_scale,
+                    params.dequant_scale_q, params.dequant_scale_kv, params.quant_scale_o, params.host_bmm1_scale);
+        }
+        else
+        {
+            applyMLARopeAndAssignQKVKernelOptContext<T, 256, 448, 64, KVCacheBuffer, false><<<grid, 256, 0, stream>>>(
+                params.q_buf, params.q_pe, params.k_buf, params.latent_cache, kv_cache_buffer, params.q_pe_ld,
+                params.q_pe_stride, params.cos_sin_cache, params.head_num, head_size, params.meta.kv_lora_rank,
+                params.cu_q_seqlens, params.cache_seq_lens, params.max_input_seq_len, params.cache_type,
+                params.quant_scale_kv, params.helix_position_offsets, params.absorption_mode);
+        }
+    }
 }
 
 template <typename T>
@@ -1000,21 +1083,45 @@ void invokeMLAContextFp8Quantize(MlaParams<T>& params, int total_kv_len, cudaStr
         // Convert Q to FP8 in absorption mode.
         if (params.absorption_mode)
         {
-            constexpr int threads_per_block = 288;
-            constexpr int num_tokens_per_block = threads_per_block * 16 / 576 * sizeof(T);
-            dim3 grid(int(tensorrt_llm::common::divUp(total_kv_len, num_tokens_per_block)), 1, params.head_num);
 
-            TLLM_LOG_DEBUG(
-                "Launching quantizeCopyInputToFp8Kernel with grid_size: (%d, %d, %d), threads_per_block: %d, "
-                "total_kv_len: %d, acc_q_len: %d, absorption_mode: %d",
-                grid.x, grid.y, grid.z, threads_per_block, total_kv_len, params.acc_q_len, params.absorption_mode);
+            if (params.meta.rope_append)
+            {
+                constexpr int threads_per_block = 288;
+                constexpr int num_tokens_per_block = threads_per_block * 16 / 576 * sizeof(T);
+                dim3 grid(int(tensorrt_llm::common::divUp(total_kv_len, num_tokens_per_block)), 1, params.head_num);
 
-            quantizeCopyInputToFp8Kernel<T, threads_per_block, 512, 64, 512, true>
-                <<<grid, threads_per_block, 0, stream>>>(params.q_buf, static_cast<__nv_fp8_e4m3*>(params.quant_q_buf),
-                    params.k_buf, static_cast<__nv_fp8_e4m3*>(params.quant_k_buf), params.v_buf,
-                    static_cast<__nv_fp8_e4m3*>(params.quant_v_buf), params.acc_q_len, total_kv_len,
-                    params.quant_scale_qkv, params.bmm1_scale, params.bmm2_scale, params.quant_scale_o,
-                    params.dequant_scale_q, params.dequant_scale_kv, params.host_bmm1_scale);
+                TLLM_LOG_DEBUG(
+                    "Launching quantizeCopyInputToFp8Kernel with grid_size: (%d, %d, %d), threads_per_block: %d, "
+                    "total_kv_len: %d, acc_q_len: %d, absorption_mode: %d",
+                    grid.x, grid.y, grid.z, threads_per_block, total_kv_len, params.acc_q_len, params.absorption_mode);
+
+                quantizeCopyInputToFp8Kernel<T, threads_per_block, 512, 64, 512, true>
+                    <<<grid, threads_per_block, 0, stream>>>(params.q_buf,
+                        static_cast<__nv_fp8_e4m3*>(params.quant_q_buf), params.k_buf,
+                        static_cast<__nv_fp8_e4m3*>(params.quant_k_buf), params.v_buf,
+                        static_cast<__nv_fp8_e4m3*>(params.quant_v_buf), params.acc_q_len, total_kv_len,
+                        params.quant_scale_qkv, params.bmm1_scale, params.bmm2_scale, params.quant_scale_o,
+                        params.dequant_scale_q, params.dequant_scale_kv, params.host_bmm1_scale);
+            }
+            else
+            {
+                constexpr int threads_per_block = 256;
+                constexpr int num_tokens_per_block = threads_per_block * 16 / 512 * sizeof(T);
+                dim3 grid(int(tensorrt_llm::common::divUp(total_kv_len, num_tokens_per_block)), 1, params.head_num);
+
+                TLLM_LOG_DEBUG(
+                    "Launching quantizeCopyInputToFp8Kernel with grid_size: (%d, %d, %d), threads_per_block: %d, "
+                    "total_kv_len: %d, acc_q_len: %d, absorption_mode: %d",
+                    grid.x, grid.y, grid.z, threads_per_block, total_kv_len, params.acc_q_len, params.absorption_mode);
+
+                quantizeCopyInputToFp8Kernel<T, threads_per_block, 448, 64, 512, true>
+                    <<<grid, threads_per_block, 0, stream>>>(params.q_buf,
+                        static_cast<__nv_fp8_e4m3*>(params.quant_q_buf), params.k_buf,
+                        static_cast<__nv_fp8_e4m3*>(params.quant_k_buf), params.v_buf,
+                        static_cast<__nv_fp8_e4m3*>(params.quant_v_buf), params.acc_q_len, total_kv_len,
+                        params.quant_scale_qkv, params.bmm1_scale, params.bmm2_scale, params.quant_scale_o,
+                        params.dequant_scale_q, params.dequant_scale_kv, params.host_bmm1_scale);
+            }
         }
         else
         {
@@ -1056,6 +1163,10 @@ void invokeMLARopeGeneration(MlaParams<T>& params, KVCacheBuffer kv_cache_buffer
     auto seq_len = params.acc_q_len / params.batch_size;
 
     auto* kernel_instance = &applyMLARopeAndAssignQKVKernelGeneration<T, 256, 512, 64, KVCacheBuffer>;
+    if (!params.meta.rope_append)
+    {
+        kernel_instance = &applyMLARopeAndAssignQKVKernelGeneration<T, 256, 448, 64, KVCacheBuffer>;
+    }
     cudaLaunchConfig_t config;
     config.gridDim = grid;
     config.blockDim = 256;
@@ -1096,11 +1207,20 @@ void invokeMLARopeAppendPagedKVAssignQ(KVBlockArray& kv_cache, T* q_ptr, T* late
     float const* kv_scale_orig_quant_ptr, cudaStream_t stream)
 {
     dim3 grid(int(tensorrt_llm::common::divUp(max_input_uncached_seq_len, 32)), num_requests, head_num + 1 + 8);
-    TLLM_CHECK_WITH_INFO(lora_size == 512, "lora_size should be equal to %d", 512);
+    TLLM_CHECK_WITH_INFO(lora_size == 512 || lora_size == 448, "lora_size should be equal to %d or %d", 512, 448);
     TLLM_CHECK_WITH_INFO(rope_size == 64, "rope_size should be equal to %d", 64);
-    applyMLARopeAppendPagedKVAssignQKernel<T, TCache, 256, 512, 64><<<grid, 256, 0, stream>>>(kv_cache, q_ptr,
-        latent_cache_ptr, cu_ctx_cached_kv_lens, cu_seq_lens, max_input_uncached_seq_len, cos_sin_cache, head_num,
-        nope_size, kv_scale_orig_quant_ptr);
+    if (lora_size == 512)
+    {
+        applyMLARopeAppendPagedKVAssignQKernel<T, TCache, 256, 512, 64><<<grid, 256, 0, stream>>>(kv_cache, q_ptr,
+            latent_cache_ptr, cu_ctx_cached_kv_lens, cu_seq_lens, max_input_uncached_seq_len, cos_sin_cache, head_num,
+            nope_size, kv_scale_orig_quant_ptr);
+    }
+    else
+    {
+        applyMLARopeAppendPagedKVAssignQKernel<T, TCache, 256, 448, 64><<<grid, 256, 0, stream>>>(kv_cache, q_ptr,
+            latent_cache_ptr, cu_ctx_cached_kv_lens, cu_seq_lens, max_input_uncached_seq_len, cos_sin_cache, head_num,
+            nope_size, kv_scale_orig_quant_ptr);
+    }
 }
 
 #define INSTANTIATE_MLA_ROPE(T, KVCacheBuffer)                                                                         \
@@ -1137,6 +1257,151 @@ INSTANTIATE_RW_KVCACHE_MLA(half, half);
 INSTANTIATE_RW_KVCACHE_MLA(half, __nv_fp8_e4m3);
 INSTANTIATE_RW_KVCACHE_MLA(__nv_bfloat16, __nv_bfloat16);
 INSTANTIATE_RW_KVCACHE_MLA(__nv_bfloat16, __nv_fp8_e4m3);
+
+// In-place MLA RoPE: apply RoPE to the last rope_dim elements of each [nope_dim + rope_dim] head.
+// Uses 16-byte vectorized load/store (VecType) and mmha::rotary_embedding_transform for the
+// interleaved path. Each thread handles ELTS_PER_VEC elements (8 bf16 = 4 rotation pairs).
+// Grid: (num_tokens, ceil(num_heads / HPB)), Block: (VECS_PER_ROPE, HPB)
+// cos_sin_cache layout: [max_positions, 2, half_rope] float (cos block then sin block)
+template <typename T, bool IS_INVERSE, bool IS_NEOX, int HEADS_PER_BLOCK>
+__global__ void mlaRoPEInplaceKernel(T* __restrict__ data, int32_t const* __restrict__ position_ids,
+    float const* __restrict__ cos_sin_cache, int num_heads, int nope_dim, int rope_dim)
+{
+    using VecT = typename VecType<T>::Type;
+    using GPTJEltT = typename VecType<T>::GPTJEltType;
+    constexpr int BYTES_PER_ELT = sizeof(T);
+    constexpr int BYTES_PER_LOAD = 16;
+    constexpr int ELTS_PER_VEC = BYTES_PER_LOAD / BYTES_PER_ELT;
+
+    int const tid = threadIdx.x;
+    int const half_rope = rope_dim / 2;
+    // Neox: each thread handles one VecT from each half → half_rope elements per half
+    // Interleaved: each thread handles one VecT of interleaved pairs → rope_dim elements
+    int const vecs_per_rope
+        = IS_NEOX ? (half_rope * BYTES_PER_ELT / BYTES_PER_LOAD) : (rope_dim * BYTES_PER_ELT / BYTES_PER_LOAD);
+    int const head_idx = blockIdx.y * HEADS_PER_BLOCK + threadIdx.y;
+    if (head_idx >= num_heads || tid >= vecs_per_rope)
+        return;
+
+    int const head_size = nope_dim + rope_dim;
+    T* head_ptr = data + (static_cast<int64_t>(blockIdx.x) * num_heads + head_idx) * head_size;
+
+    int const pos = position_ids[blockIdx.x];
+    int const elem_offset = tid * ELTS_PER_VEC;
+    // cos at [pos, 0, ...], sin at [pos, 1, ...]
+    float const* cos_ptr = cos_sin_cache + pos * 2 * half_rope + elem_offset;
+    float const* sin_ptr = cos_ptr + half_rope;
+
+    if constexpr (IS_NEOX)
+    {
+        // Neox: first half = x1[0..half), second half = x2[0..half) — two separate 16-byte loads
+        VecT v1 = *reinterpret_cast<VecT const*>(&head_ptr[nope_dim + elem_offset]);
+        VecT v2 = *reinterpret_cast<VecT const*>(&head_ptr[nope_dim + half_rope + elem_offset]);
+
+        // Each GPTJEltT holds 2 consecutive elements from the same half.
+        // For neox, we rotate (v1[j], v2[j]) independently for each element j.
+#pragma unroll
+        for (int i = 0; i < ELTS_PER_VEC / 2; i++)
+        {
+            GPTJEltT& e1 = reinterpret_cast<GPTJEltT*>(&v1)[i];
+            GPTJEltT& e2 = reinterpret_cast<GPTJEltT*>(&v2)[i];
+
+            // Construct (x1, x2) pairs and rotate — 2 pairs per GPTJElt
+            float2 coef0{cos_ptr[i * 2], IS_INVERSE ? -sin_ptr[i * 2] : sin_ptr[i * 2]};
+            float2 coef1{cos_ptr[i * 2 + 1], IS_INVERSE ? -sin_ptr[i * 2 + 1] : sin_ptr[i * 2 + 1]};
+
+            float2 p1 = mmha::rotary_embedding_transform(float2{static_cast<float>(reinterpret_cast<T*>(&e1)[0]),
+                                                             static_cast<float>(reinterpret_cast<T*>(&e2)[0])},
+                coef0);
+            float2 p2 = mmha::rotary_embedding_transform(float2{static_cast<float>(reinterpret_cast<T*>(&e1)[1]),
+                                                             static_cast<float>(reinterpret_cast<T*>(&e2)[1])},
+                coef1);
+
+            reinterpret_cast<T*>(&e1)[0] = static_cast<T>(p1.x);
+            reinterpret_cast<T*>(&e1)[1] = static_cast<T>(p2.x);
+            reinterpret_cast<T*>(&e2)[0] = static_cast<T>(p1.y);
+            reinterpret_cast<T*>(&e2)[1] = static_cast<T>(p2.y);
+        }
+
+        *reinterpret_cast<VecT*>(&head_ptr[nope_dim + elem_offset]) = v1;
+        *reinterpret_cast<VecT*>(&head_ptr[nope_dim + half_rope + elem_offset]) = v2;
+    }
+    else
+    {
+        // Interleaved: (x1, x2) adjacent pairs — matches GPTJ layout, single 16-byte load
+        VecT v = *reinterpret_cast<VecT const*>(&head_ptr[nope_dim + elem_offset]);
+
+        // For interleaved, cos_ptr/sin_ptr index by pair (half the element count)
+        float const* cos_pair = cos_sin_cache + pos * 2 * half_rope + (elem_offset / 2);
+        float const* sin_pair = cos_pair + half_rope;
+
+#pragma unroll
+        for (int i = 0; i < ELTS_PER_VEC / 2; i++)
+        {
+            GPTJEltT& elt = reinterpret_cast<GPTJEltT*>(&v)[i];
+            float2 coef{cos_pair[i], IS_INVERSE ? -sin_pair[i] : sin_pair[i]};
+            elt = mmha::rotary_embedding_transform(elt, coef);
+        }
+
+        *reinterpret_cast<VecT*>(&head_ptr[nope_dim + elem_offset]) = v;
+    }
+}
+
+template <typename T>
+void invokeMLARoPEInplace(T* data, int32_t const* position_ids, float const* cos_sin_cache, int num_tokens,
+    int num_heads, int nope_dim, int rope_dim, bool inverse, bool is_neox, cudaStream_t stream)
+{
+    TLLM_CHECK_WITH_INFO(rope_dim % 4 == 0, "rope_dim must be divisible by 4");
+    constexpr int BYTES_PER_LOAD = 16;
+    int const elt_size = static_cast<int>(sizeof(T));
+
+    auto launch = [&](auto inverse_tag, auto neox_tag)
+    {
+        constexpr bool INV = decltype(inverse_tag)::value;
+        constexpr bool NEOX = decltype(neox_tag)::value;
+        // Neox loads from two halves → threads = half_rope elements / ELTS_PER_VEC
+        // Interleaved loads contiguous → threads = rope_dim elements / ELTS_PER_VEC
+        int const active_elts = NEOX ? (rope_dim / 2) : rope_dim;
+        int const vecs_per_rope = active_elts * elt_size / BYTES_PER_LOAD;
+
+        constexpr int kMaxBlockSize = 256;
+        constexpr int kMaxHeadsPerBlock = 16;
+        int const hpb = std::max(1, std::min({kMaxBlockSize / vecs_per_rope, num_heads, kMaxHeadsPerBlock}));
+        dim3 grid(num_tokens, (num_heads + hpb - 1) / hpb);
+
+        if (hpb <= 4)
+        {
+            mlaRoPEInplaceKernel<T, INV, NEOX, 4><<<grid, dim3(vecs_per_rope, 4), 0, stream>>>(
+                data, position_ids, cos_sin_cache, num_heads, nope_dim, rope_dim);
+        }
+        else if (hpb <= 8)
+        {
+            mlaRoPEInplaceKernel<T, INV, NEOX, 8><<<grid, dim3(vecs_per_rope, 8), 0, stream>>>(
+                data, position_ids, cos_sin_cache, num_heads, nope_dim, rope_dim);
+        }
+        else
+        {
+            mlaRoPEInplaceKernel<T, INV, NEOX, 16><<<grid, dim3(vecs_per_rope, 16), 0, stream>>>(
+                data, position_ids, cos_sin_cache, num_heads, nope_dim, rope_dim);
+        }
+    };
+
+    if (inverse && is_neox)
+        launch(std::true_type{}, std::true_type{});
+    else if (inverse && !is_neox)
+        launch(std::true_type{}, std::false_type{});
+    else if (!inverse && is_neox)
+        launch(std::false_type{}, std::true_type{});
+    else
+        launch(std::false_type{}, std::false_type{});
+}
+
+#define INSTANTIATE_MLA_ROPE_INPLACE(T)                                                                                \
+    template void invokeMLARoPEInplace<T>(T * data, int32_t const* position_ids, float const* cos_sin_cache,           \
+        int num_tokens, int num_heads, int nope_dim, int rope_dim, bool inverse, bool is_neox, cudaStream_t stream);
+
+INSTANTIATE_MLA_ROPE_INPLACE(__nv_bfloat16);
+INSTANTIATE_MLA_ROPE_INPLACE(half);
 
 } // namespace kernels
 

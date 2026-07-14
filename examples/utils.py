@@ -23,12 +23,82 @@ from pathlib import Path
 from typing import List, Optional
 
 import torch
-from transformers import AutoTokenizer, LlamaTokenizer, T5Tokenizer
+from transformers import AutoTokenizer, LlamaTokenizer
 
 from tensorrt_llm._utils import supports_inflight_batching  # noqa
 from tensorrt_llm._utils import (mpi_barrier, mpi_rank, mpi_world_size,
                                  str_dtype_to_torch)
 from tensorrt_llm.builder import get_engine_version
+
+
+class SentencePieceTokenizer:
+    """Minimal SentencePiece-backed tokenizer with a transformers-like API.
+
+    transformers v5 replaced the pure-Python SentencePiece backend of
+    ``T5Tokenizer`` / ``LlamaTokenizer`` with the Rust ``tokenizers`` backend,
+    so instantiating them with a raw SentencePiece ``.model`` vocab file no
+    longer reads the underlying vocabulary. This wrapper preserves the old
+    behavior for NEMO-style checkpoints (e.g. gpt-next) by delegating to
+    ``sentencepiece.SentencePieceProcessor`` directly.
+    """
+
+    def __init__(self,
+                 vocab_file: str,
+                 padding_side: str = 'left',
+                 truncation_side: str = 'left'):
+        import sentencepiece as spm
+        sp = spm.SentencePieceProcessor()
+        sp.Load(vocab_file)
+        self.sp_model = sp
+        self.padding_side = padding_side
+        self.truncation_side = truncation_side
+        self.vocab_size = sp.GetPieceSize()
+
+        def _opt(i: int) -> int | None:
+            return i if i >= 0 else None
+
+        self.pad_token_id = _opt(sp.pad_id())
+        self.eos_token_id = _opt(sp.eos_id())
+        self.bos_token_id = _opt(sp.bos_id())
+        self.unk_token_id = _opt(sp.unk_id())
+
+    def encode(self,
+               text: str,
+               return_tensors: Optional[str] = None,
+               add_special_tokens: bool = True,
+               truncation: bool = False,
+               max_length: Optional[int] = None,
+               **kwargs):
+        ids = self.sp_model.EncodeAsIds(text)
+        if add_special_tokens and self.bos_token_id is not None:
+            ids = [self.bos_token_id] + ids
+        if truncation and max_length is not None and len(ids) > max_length:
+            ids = ids[
+                -max_length:] if self.truncation_side == 'left' else ids[:
+                                                                         max_length]
+        if return_tensors == 'pt':
+            return torch.tensor([ids], dtype=torch.long)
+        return ids
+
+    def decode(self, ids, skip_special_tokens: bool = False, **kwargs) -> str:
+        if isinstance(ids, torch.Tensor):
+            ids = ids.tolist()
+        if skip_special_tokens:
+            special = {self.pad_token_id, self.eos_token_id, self.bos_token_id}
+            ids = [t for t in ids if t not in special]
+        return self.sp_model.DecodeIds(list(ids))
+
+    def batch_decode(self,
+                     sequences,
+                     skip_special_tokens: bool = False,
+                     **kwargs) -> List[str]:
+        if isinstance(sequences, torch.Tensor):
+            sequences = sequences.tolist()
+        return [
+            self.decode(seq, skip_special_tokens=skip_special_tokens)
+            for seq in sequences
+        ]
+
 
 DEFAULT_HF_MODEL_DIRS = {
     'BaichuanForCausalLM': 'baichuan-inc/Baichuan-13B-Chat',
@@ -171,11 +241,13 @@ def _load_tokenizer(tokenizer_dir: Optional[str] = None,
                                    legacy=False,
                                    use_fast=False)
     else:
-        # For gpt-next, directly load from tokenizer.model
-        tokenizer = T5Tokenizer(vocab_file=vocab_file,
-                                padding_side='left',
-                                truncation_side='left',
-                                legacy=False)
+        # For gpt-next, directly load from the SentencePiece ``tokenizer.model``
+        # file. transformers v5 removed the pure-Python SentencePiece backend,
+        # so ``T5Tokenizer(vocab_file=...)`` no longer reads the vocabulary and
+        # reports vocab_size=104 with all tokens decoding to <unk>.
+        tokenizer = SentencePieceTokenizer(vocab_file=vocab_file,
+                                           padding_side='left',
+                                           truncation_side='left')
     if 'qwen' in model_name.lower() and model_version == 'qwen':
         with open(Path(tokenizer_dir) / "generation_config.json") as f:
             gen_config = json.load(f)

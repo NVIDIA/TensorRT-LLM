@@ -16,6 +16,8 @@ def createKubernetesPodConfig()
             kind: Pod
             spec:
                 nodeSelector: ${selectors}
+                imagePullSecrets:
+                  - name: svc-tensorrt.gitlab-registry
                 containers:
                   - name: cpu
                     image: ${image}
@@ -31,24 +33,40 @@ def createKubernetesPodConfig()
                         memory: 32Gi
                         ephemeral-storage: 200Gi
                     imagePullPolicy: Always
-                  - name: docker
-                    image: urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:202505221445_docker_dind_withbash
+                  - name: pulse-container-scanner
+                    image: gitlab-master.nvidia.com:5005/pstooling/pulse-group/pulse-container-scanner:6.2.1
+                    command: ['sleep', '7200']
                     tty: true
                     resources:
                       requests:
-                        cpu: 16
-                        memory: 72Gi
+                        cpu: '16'
+                        memory: 64Gi
                         ephemeral-storage: 200Gi
                       limits:
-                        cpu: 16
-                        memory: 256Gi
+                        cpu: '16'
+                        memory: 64Gi
                         ephemeral-storage: 200Gi
                     imagePullPolicy: Always
                     securityContext:
-                      privileged: true
-                      capabilities:
-                        add:
-                        - SYS_ADMIN
+                      runAsUser: 0
+                      runAsGroup: 0
+                  - name: pulse-oss-scanner
+                    image: gitlab-master.nvidia.com:5005/pstooling/pulse-group/pulse-open-source-scanner/pulse-oss-cli:stable
+                    command: ['sleep', '7200']
+                    tty: true
+                    resources:
+                      requests:
+                        cpu: '16'
+                        memory: 64Gi
+                        ephemeral-storage: 200Gi
+                      limits:
+                        cpu: '16'
+                        memory: 64Gi
+                        ephemeral-storage: 200Gi
+                    imagePullPolicy: Always
+                    securityContext:
+                      runAsUser: 0
+                      runAsGroup: 0
                 qosClass: Guaranteed
         """.stripIndent(),
     ]
@@ -67,6 +85,11 @@ def getLLMRepo () {
             LLM_REPO = DEFAULT_LLM_REPO
         }
     }
+    if (params.repoUrlKey == "tensorrt_llm_github_sync") {
+        withCredentials([string(credentialsId: 'github-llm-repo-sync', variable: 'GITHUB_LLM_REPO_SYNC')]) {
+            LLM_REPO = GITHUB_LLM_REPO_SYNC
+        }
+    }
     if (params.repoUrlKey == "github_fork") {
         if (!isValidGithubUser(params.forkOwner)) {
             throw new Exception("Invalid fork owner provided")
@@ -77,32 +100,52 @@ def getLLMRepo () {
 }
 
 def installTools() {
-    container("cpu") {
-        sh "apt update"
-        sh "apt install -y git git-lfs openjdk-17-jdk python3-dev python3-venv curl zip unzip wget"
-    }
+    sh "apt update"
+    sh "apt install -y git git-lfs openjdk-17-jdk python3-dev python3-venv curl zip unzip wget jq"
 }
 
-def validateBranchName(String branch) {
-    container("cpu") {
-        def rc = sh(script: "git check-ref-format --branch '${branch}'", returnStatus: true)
-        if (rc != 0) {
-            error("Invalid branch name: '${branch}'")
+boolean isCommitId(String ref) {
+    return ref ==~ /^[0-9a-f]{7,40}$/
+}
+
+def validateRef() {
+    def ref = params.ref
+    // Basic sanity check before shell execution
+    if (ref.contains("'") || ref.contains('"') || ref.contains('$') || ref.contains('`')) {
+        error("Invalid characters in ref: '${ref}'")
+    }
+    if (isCommitId(ref)) {
+        echo "Detected commit SHA: ${ref}"
+    } else {
+        container("cpu") {
+            def rc = sh(script: "git check-ref-format --branch '${ref}'", returnStatus: true)
+            if (rc != 0) {
+                error("Invalid branch name: '${ref}'")
+            }
         }
     }
 }
 
+def savePipelineScripts() {
+    // Capture the pipeline's own version of the scan scripts before the workspace
+    // is overwritten by checkoutSource() with params.ref. This ensures the script
+    // logic always matches the Groovy that is actually running.
+    checkout scm
+    sh "cp -r jenkins/scripts/pulse_in_pipeline_scanning /tmp/pulse_in_pipeline_scanning"
+}
+
 def checkoutSource ()
 {
-    container("cpu") {
-        trtllm_utils.setupGitMirror()
-        def LLM_REPO = getLLMRepo()
-        sh "git config --global --add safe.directory ${env.WORKSPACE}"
-        trtllm_utils.checkoutSource(LLM_REPO, params.branchName, env.WORKSPACE, false, true)
-    }
+    trtllm_utils.setupGitMirror()
+    def LLM_REPO = getLLMRepo()
+    sh "git config --global --add safe.directory ${env.WORKSPACE}"
+    def ref = params.ref
+    trtllm_utils.checkoutSource(LLM_REPO, ref, env.WORKSPACE, false, true)
 }
 
 def getPulseToken(serviceId, scopes) {
+    def maxRetries = 3
+    def retryDelaySec = 10
     def token
     //Configure credential 'starfleet-client-id' under Jenkins Credential Manager
     withCredentials([usernamePassword(
@@ -110,17 +153,34 @@ def getPulseToken(serviceId, scopes) {
         usernameVariable: 'SF_CLIENT_ID',
         passwordVariable: 'SF_CLIENT_SECRET'
     )]) {
-        // Do not save AUTH_HEADER to a groovy variable since that
-        // will expose the auth_header without being masked
-        token= sh(script: """
-            AUTH_HEADER=\$(echo -n \$SF_CLIENT_ID:\$SF_CLIENT_SECRET | base64 -w0)
-            curl -s --request POST --header "Authorization: Basic \$AUTH_HEADER" --header "Content-Type: application/x-www-form-urlencoded" "https://${serviceId}.ssa.nvidia.com/token?grant_type=client_credentials&scope=${scopes}" | jq ".access_token" |  tr -d '"'
-        """, returnStdout: true).trim()
+        for (int attempt = 1; attempt <= maxRetries; attempt++) {
+            try {
+                // Do not save AUTH_HEADER to a groovy variable since that
+                // will expose the auth_header without being masked
+                token = sh(script: """
+                    AUTH_HEADER=\$(echo -n \$SF_CLIENT_ID:\$SF_CLIENT_SECRET | base64 -w0)
+                    curl -s --request POST --header "Authorization: Basic \$AUTH_HEADER" --header "Content-Type: application/x-www-form-urlencoded" "https://${serviceId}.ssa.nvidia.com/token?grant_type=client_credentials&scope=${scopes}" | jq ".access_token" |  tr -d '"'
+                """, returnStdout: true).trim()
+            } catch (Exception e) {
+                echo "getPulseToken attempt ${attempt}/${maxRetries} failed: ${e.getMessage()}"
+                token = ""
+            }
+            if (token && token != "null") {
+                break
+            }
+            if (attempt < maxRetries) {
+                echo "getPulseToken returned an empty token (attempt ${attempt}/${maxRetries}), retrying in ${retryDelaySec}s..."
+                sleep(retryDelaySec)
+            }
+        }
+    }
+    if (!token || token == "null") {
+        error("getPulseToken failed to obtain a valid token after ${maxRetries} attempts")
     }
     return token
 }
 
-def generateLockFiles(llmRepo, branchName)
+def generateLockFiles(llmRepo, ref)
 {
     container("cpu") {
         sh "python3 --version"
@@ -134,6 +194,10 @@ def generateLockFiles(llmRepo, branchName)
         echo "Changed/untracked file count: ${count}"
         if (count == "0") {
             echo "No update that needs to be checked in"
+        } else if (isCommitId(ref)) {
+            echo "Running from specific commit '${ref}', skipping lock file push to branch"
+        } else if (params.repoUrlKey == "github_fork") {
+            echo "Running against a fork repo, skipping lock file push to branch"
         } else {
             sh "git status"
             sh "git add -u security_scanning/"
@@ -154,10 +218,10 @@ def generateLockFiles(llmRepo, branchName)
                     authedUrl = llmRepo.replaceFirst('https://', "https://svc_tensorrt:${GITHUB_API_TOKEN}@")
                 }
                 sh "git remote set-url origin ${authedUrl}"
-                sh "git fetch origin ${branchName}"
+                sh "git fetch origin ${ref}"
                 sh "git status"
-                sh "git rebase origin/${branchName}"
-                sh "git push origin HEAD:${branchName}"
+                sh "git rebase origin/${ref}"
+                sh "git push origin HEAD:${ref}"
             }
         }
     }
@@ -167,51 +231,35 @@ def sonarScan()
 {
     container("cpu") {
         def sonarScannerCliVer = "8.0.0.6341"
-        sh "wget https://repo1.maven.org/maven2/org/sonarsource/scanner/cli/sonar-scanner-cli/${sonarScannerCliVer}/sonar-scanner-cli-${sonarScannerCliVer}.zip"
+        sh "wget https://maven-central.storage-download.googleapis.com/maven2/org/sonarsource/scanner/cli/sonar-scanner-cli/${sonarScannerCliVer}/sonar-scanner-cli-${sonarScannerCliVer}.zip"
         sh "unzip sonar-scanner-cli-${sonarScannerCliVer}.zip"
         sh "mv sonar-scanner-${sonarScannerCliVer} ../sonar-scanner"
         sh "rm sonar-scanner-cli-${sonarScannerCliVer}.zip"
         withSonarQubeEnv() {
-          sh "../sonar-scanner/bin/sonar-scanner -Dsonar.projectKey=GPUSW_TensorRT-LLM-Team_TensorRT-LLM_tensorrt-llm -Dsonar.sources=. -Dsonar.branch.name=${params.branchName}"
+          sh "../sonar-scanner/bin/sonar-scanner -Dsonar.projectKey=GPUSW_TensorRT-LLM-Team_TensorRT-LLM_tensorrt-llm -Dsonar.sources=. -Dsonar.branch.name=${params.ref}"
         }
     }
 }
 
-def pulseScanSourceCode(llmRepo, branchName) {
-    container("docker") {
-        sh "apk add jq curl"
+def pulseScanSourceCode(llmRepo, ref) {
+    container("pulse-oss-scanner") {
+        sh "apt install jq curl"
         def token = getPulseToken("4ubglassowmtsi7ogqwarmut7msn1q5ynts62fwnr1i", "verify:nspectid%20sourcecode:blackduck%20update:report")
         if (!token) {
             throw new Exception("Invalid token get")
         }
-        withCredentials([
-            usernamePassword(
-                credentialsId: "svc_tensorrt_gitlab_read_api_token",
-                usernameVariable: 'GITLAB_USERNAME',
-                passwordVariable: 'GITLAB_PASSWORD'
-            ),
-            string(credentialsId: 'default-git-url', variable: 'DEFAULT_GIT_URL')
+        def versionMatcher = ref =~ /^release\/(\d+\.\d+)$/
+        def version = versionMatcher ? "${versionMatcher[0][1]}.0" : ref
+        withEnv([
+            "PULSE_NSPECT_ID=NSPECT-95LK-6FZF",
+            "PULSE_BEARER_TOKEN=${token}",
+            "PULSE_REPO_URL=${llmRepo}",
+            "PULSE_SCAN_PROJECT=TRT-LLM",
+            "PULSE_SCAN_PROJECT_VERSION=${version}",
+            "PULSE_SCAN_VULNERABILITY_REPORT=nspect_scan_report.json",
+            "PULSE_SCAN_OVERRIDE=false"
         ]) {
-            trtllm_utils.llmExecStepWithRetry(this, script: "docker login ${DEFAULT_GIT_URL}:5005 -u ${GITLAB_USERNAME} -p ${GITLAB_PASSWORD}")
-            docker.withRegistry("https://${DEFAULT_GIT_URL}:5005") {
-                docker.image("pstooling/pulse-group/pulse-open-source-scanner/pulse-oss-cli:stable")
-                  .inside("--user 0 --privileged -v /var/run/docker.sock:/var/run/docker.sock") {
-                    def versionMatcher = branchName =~ /^release\/(\d+\.\d+)$/
-                    def version = versionMatcher ? "${versionMatcher[0][1]}.0" : branchName
-                    withEnv([
-                        "PULSE_NSPECT_ID=NSPECT-95LK-6FZF",
-                        "PULSE_BEARER_TOKEN=${token}",
-                        "PULSE_REPO_URL=${llmRepo}",
-                        "PULSE_REPO_BRANCH=${(params.repoUrlKey == "github_fork") ? "" : branchName}",
-                        "PULSE_SCAN_PROJECT=TRT-LLM",
-                        "PULSE_SCAN_PROJECT_VERSION=${version}",
-                        "PULSE_SCAN_VULNERABILITY_REPORT=nspect_scan_report.json",
-                        "PULSE_SCAN_OVERRIDE=false"
-                    ]) {
-                        sh 'pulse scan --no-fail --exclude-detectors PIP --sbom .'
-                    }
-                  }
-            }
+            sh 'pulse scan --no-fail --exclude-detectors PIP --sbom .'
         }
     }
     container("cpu") {
@@ -221,15 +269,18 @@ def pulseScanSourceCode(llmRepo, branchName) {
         sh "mv nspect_scan_report.json ${outputDir}/vulns.json"
     }
 }
-def pulseScanContainer(llmRepo, branchName) {
+def pulseScanContainer(llmRepo, ref) {
     // imageTags: key -> [image: <full image:tag>, platform: <platform or empty>]
     def imageTags = [:]
     container("cpu") {
+        def imageScriptArgs = (params.postMergePipelineName?.trim() && params.postMergeBuildNumber?.trim())
+            ? "${params.postMergePipelineName} ${params.postMergeBuildNumber}"
+            : "${params.ref}"
         def output = sh(
-            script: "python3 ./jenkins/scripts/get_image_key_to_tag.py ${params.branchName}",
+            script: "python3 ./jenkins/scripts/get_image_key_to_tag.py ${imageScriptArgs}",
             returnStdout: true
         ).trim()
-        println("Container image key-to-tag mapping for branch '${params.branchName}':\n${output}")
+        println("Container image key-to-tag mapping for branch '${params.ref}':\n${output}")
         def containerTagMap = new JsonSlurper().parseText(output)
         imageTags["release_amd64"] = [image: containerTagMap["NGC Release Image amd64"], platform: "linux/amd64"]
         imageTags["release_arm64"] = [image: containerTagMap["NGC Release Image arm64"], platform: "linux/arm64"]
@@ -239,49 +290,31 @@ def pulseScanContainer(llmRepo, branchName) {
         imageTags["base_amd64"] = [image: "${baseImage}:${baseTag}", platform: "linux/amd64"]
         imageTags["base_arm64"] = [image: "${baseImage}:${baseTag}", platform: "linux/arm64"]
     }
-    container("docker") {
+    container("pulse-container-scanner") {
         sh "apk add jq curl"
         def token = getPulseToken("x9thwm-cootr2q1jdv5p7b8iw4fs4ob3x6nqqsoznyk", "nspect.verify%20scan.anchore")
         if (!token) {
             throw new Exception("Invalid token get")
         }
-        withCredentials([
-            usernamePassword(
-                credentialsId: "svc_tensorrt_gitlab_read_api_token",
-                usernameVariable: 'GITLAB_USERNAME',
-                passwordVariable: 'GITLAB_PASSWORD'
-            ),
-            usernamePassword(
-                credentialsId: "urm-artifactory-creds",
-                usernameVariable: 'URM_USERNAME',
-                passwordVariable: 'URM_PASSWORD'
-            ),
-            string(credentialsId: 'default-git-url', variable: 'DEFAULT_GIT_URL'),
+        withEnv([
+            "NSPECT_ID=NSPECT-95LK-6FZF",
+            "SSA_TOKEN=${token}",
         ]) {
-            trtllm_utils.llmExecStepWithRetry(this, script: "docker login ${DEFAULT_GIT_URL}:5005 -u ${GITLAB_USERNAME} -p ${GITLAB_PASSWORD}")
-            trtllm_utils.llmExecStepWithRetry(this, script: "docker login urm.nvidia.com -u ${URM_USERNAME} -p ${URM_PASSWORD}")
-            docker.withRegistry("https://${DEFAULT_GIT_URL}:5005") {
-                docker.image("gitlab-master.nvidia.com:5005/pstooling/pulse-group/pulse-container-scanner/pulse-cli:5.1.0")
-                .inside("--user 0 --privileged -v /var/run/docker.sock:/var/run/docker.sock") {
-                    withEnv([
-                        "NSPECT_ID=NSPECT-95LK-6FZF",
-                        "SSA_TOKEN=${token}",
-                    ]) {
-                        imageTags.each { key, entry ->
-                            def platform = entry.platform.replace("linux/", "")
-                            def outputDir = "scan_report/${key}"
-                            sh "mkdir -p ${outputDir}"
-                            echo "Scanning ${key}: ${entry.image} (${entry.platform}) -> ${outputDir}"
-                            sh "pulse-cli -n \$NSPECT_ID --ssa \$SSA_TOKEN scan-image -i ${entry.image} --platform ${entry.platform} --sbom=cyclonedx-json --output-dir=${outputDir} -o"
-                        }
-                    }
-                }
+            imageTags.each { key, entry ->
+                def platform = entry.platform.replace("linux/", "")
+                def outputDir = "scan_report/${key}"
+                sh "mkdir -p ${outputDir}"
+                echo "Scanning ${key}: ${entry.image} (${entry.platform}) -> ${outputDir}"
+                sh(
+                    script: "pulse-cli -n \$NSPECT_ID scan-image -i ${entry.image} --platform ${entry.platform} --sbom=cyclonedx-json --output-dir=${outputDir} -o",
+                    label: "Scan ${entry.image}"
+                )
             }
         }
     }
 }
 
-def processScanResults(branchName) {
+def processScanResults(ref) {
     container("cpu") {
         def ELASTICSEARCH_POST_URL = "http://nvdataflow.nvidia.com/dataflow/swdl-tensorrt-infra-plc-scan/posting"
         def ELASTICSEARCH_QUERY_URL = "https://gpuwa.nvidia.com/elasticsearch"
@@ -289,6 +322,13 @@ def processScanResults(branchName) {
         def TRTLLM_ES_INDEX_PREAPPROVED_BASE = "df-swdl-tensorrt-infra-plc-container-pre-approve"
         def jobPath = env.JOB_NAME.replaceAll("/", "%2F")
         def pipelineUrl = "${env.JENKINS_URL}blue/organizations/jenkins/${jobPath}/detail/${jobPath}/${env.BUILD_NUMBER}/pipeline"
+        def postMergeArgs = ""
+        if (params.postMergePipelineName?.trim()) {
+            postMergeArgs += " --post-merge-pipeline-name ${params.postMergePipelineName}"
+        }
+        if (params.postMergeBuildNumber?.trim()) {
+            postMergeArgs += " --post-merge-build-number ${params.postMergeBuildNumber}"
+        }
         withCredentials([string(credentialsId: 'trtllm_plc_slack_webhook', variable: 'PLC_SLACK_WEBHOOK')]) {
             withEnv([
                 "TRTLLM_ES_POST_URL=${ELASTICSEARCH_POST_URL}",
@@ -300,12 +340,36 @@ def processScanResults(branchName) {
                 sh """
                     python3 -m venv venv
                     venv/bin/pip install requests elasticsearch==7.13.4
-                    venv/bin/python ./jenkins/scripts/pulse_in_pipeline_scanning/main.py \
-                        --build-url ${pipelineUrl} \
-                        --build-number ${env.BUILD_NUMBER} \
-                        --branch ${branchName} \
-                        --report-directory ${pwd()}/scan_report
                 """
+                def skipArgs = ""
+                if (!params.runSourceCodeScanning) {
+                    skipArgs += " --skip-source-code"
+                }
+                if (!params.runContainerScanning) {
+                    skipArgs += " --skip-container"
+                }
+                def token = getPulseToken("4ubglassowmtsi7ogqwarmut7msn1q5ynts62fwnr1i", "public.api:read")
+                def output = withEnv(["LICENSE_CHECK_TOKEN=${token}"]) {
+                    sh(script: """
+                        venv/bin/python /tmp/pulse_in_pipeline_scanning/main.py \
+                            --build-url ${pipelineUrl} \
+                            --build-number ${env.BUILD_NUMBER} \
+                            --ref ${ref} \
+                            --report-directory ${pwd()}/scan_report \
+                            --scan-mode ${params.scanMode}${skipArgs}
+                    """, returnStdout: true).trim()
+                }
+                echo "Scan result: ${output}"
+                def result = new JsonSlurper().parseText(output)
+                if (result.status == "unstable") {
+                    echo "New risks detected: ${result.detail}"
+                    if (result.dashboard_url) {
+                        echo "Dashboard: ${result.dashboard_url}"
+                    }
+                    currentBuild.result = 'UNSTABLE'
+                } else {
+                    echo "No new risks detected."
+                }
             }
         }
     }
@@ -316,9 +380,15 @@ pipeline {
         kubernetes createKubernetesPodConfig()
     }
     parameters {
-        string(name: 'branchName', defaultValue: 'main', description: 'the branch to generate the lock files')
-        choice(name: 'repoUrlKey', choices: ['tensorrt_llm_github','tensorrt_llm_internal', 'github_fork'], description: "The repo url to process")
+        string(name: 'ref', defaultValue: 'main', description: 'Branch name or commit SHA (7–40 hex chars) to check out; branch push steps are skipped when a commit SHA is provided')
+        choice(name: 'repoUrlKey', choices: ['tensorrt_llm_github','tensorrt_llm_internal', 'tensorrt_llm_github_sync', 'github_fork'], description: "The repo url to process")
         string(name: 'forkOwner', defaultValue: '', description: 'Name of the fork owner, need to select \"github_fork\" for repoUrlKey, otherwise it will be ignored')
+        string(name: 'postMergePipelineName', defaultValue: '', description: 'Optional: post-merge pipeline job name to associate with this scan')
+        string(name: 'postMergeBuildNumber', defaultValue: '', description: 'Optional: post-merge pipeline build number to associate with this scan')
+        choice(name: 'scanMode', choices: ['monitor','release','pre_merge'], description: "When set to monitor, only report newly introduced dependencies. When set to release, will report all detected risks")
+        booleanParam(name: 'runSourceCodeScanning', defaultValue: true, description: 'Run Source Code OSS Scanning (lock file generation + Pulse OSS scan)')
+        booleanParam(name: 'runContainerScanning', defaultValue: true, description: 'Run Container Scanning (Pulse container scan)')
+        booleanParam(name: 'runSonarQube', defaultValue: true, description: 'Run SonarQube Code Analysis')
     }
     options {
         skipDefaultCheckout()
@@ -327,44 +397,56 @@ pipeline {
     }
     environment {
         LLM_REPO = getLLMRepo()
-        BRANCH_NAME = "${params.branchName}"
+        REF = "${params.ref}"
     }
 
     triggers {
         // Schedule is only active when running from the official pipeline folder.
         // Jobs in other folders (e.g. personal/dev pipelines) will have no cron trigger.
         parameterizedCron(env.JOB_NAME.startsWith('LLM/helpers/') ? '''
-            H 2 * * * %branchName=main;repoUrlKey=tensorrt_llm_github
+            H 2 * * * %ref=main;repoUrlKey=tensorrt_llm_github;scanMode=monitor
         ''' : '')
     }
     stages {
         stage("Prepare Environment"){
             steps {
                 script {
-                    installTools()
-                    checkoutSource()
-                    validateBranchName(params.branchName)
+                    container("cpu") {
+                        savePipelineScripts()
+                        installTools()
+                        checkoutSource()
+                        validateRef()
+                    }
                 }
             }
         }
         stage('Run TRT-LLM PLC Jobs') {
             parallel {
                 stage("Source Code OSS Scanning") {
+                    when {
+                        expression { return params.runSourceCodeScanning }
+                    }
                     steps {
                         script {
-                            generateLockFiles(env.LLM_REPO, env.BRANCH_NAME)
-                            pulseScanSourceCode(env.LLM_REPO, env.BRANCH_NAME)
+                            generateLockFiles(env.LLM_REPO, env.REF)
+                            pulseScanSourceCode(env.LLM_REPO, env.REF)
                         }
                     }
                 }
-                stage("Run Container Scanning") {
+                stage("Container Scanning") {
+                    when {
+                        expression { return params.runContainerScanning }
+                    }
                     steps {
                         script {
-                            pulseScanContainer(env.LLM_REPO, env.BRANCH_NAME)
+                            pulseScanContainer(env.LLM_REPO, env.REF)
                         }
                     }
                 }
                 stage("SonarQube Code Analysis") {
+                    when {
+                        expression { return params.runSonarQube }
+                    }
                     steps {
                         script {
                             sonarScan()
@@ -373,10 +455,10 @@ pipeline {
                 }
             }
         }
-        stage("Process Scan Result") {
+        stage("Process In Pipeline Scan Result") {
             steps {
                 script {
-                    processScanResults(env.BRANCH_NAME)
+                    processScanResults(env.REF)
                 }
             }
         }

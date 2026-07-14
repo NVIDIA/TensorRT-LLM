@@ -80,6 +80,23 @@ if [[ "$containerLDLibPath" != *"$containerPipLLMLibPath"* ]]; then
   containerLDLibPath="${containerLDLibPath%:}"
 fi
 export LD_LIBRARY_PATH=$containerLDLibPath
+
+# Slurm ENROOT/pyxis may inject UCX_TLS=tcp from the host MPI stack (intended for
+# host-only MPI jobs). That disables CUDA transports and breaks NIXL GPU memory
+# registration. Unset it so UCX can auto-select.
+if [ "${UCX_TLS:-}" = "tcp" ]; then
+    unset UCX_TLS
+    echo "Unset UCX_TLS (cluster injected UCX_TLS=tcp)"
+fi
+
+# Force PMIx to use the in-memory hash GDS instead of ds12/ds21 shared-memory.
+# Under `srun --mpi=pmix` with the DLFW 26.04 OpenMPI build, the shared-memory
+# GDS modes can fail to publish UCX worker addresses across nodes, producing:
+#   pml_ucx.c:178  Error: Failed to receive UCX worker address: Not found (-13)
+#   pml_ucx.c:482  Error: Failed to resolve UCX endpoint for rank N
+# See https://github.com/open-mpi/ompi/issues/6981. Setting this is a no-op
+# when PMIx isn't used.
+export PMIX_MCA_gds=hash
 echo "Library Path:"
 echo "$LD_LIBRARY_PATH"
 env | sort
@@ -133,11 +150,8 @@ if [ $pytest_exit_code -eq 4 ]; then
 fi
 
 if [ $SLURM_PROCID -eq 0 ] && [ "$perfMode" = "true" ]; then
-    if [[ "$stageName" == *PyTorch* ]]; then
-        basePerfFilename="base_perf_pytorch.csv"
-    else
-        basePerfFilename="base_perf.csv"
-    fi
+    # Only PyTorch perf stages remain; the TensorRT perf baseline was removed.
+    basePerfFilename="base_perf_pytorch.csv"
     basePerfPath="$llmSrcNode/tests/integration/defs/perf/$basePerfFilename"
     echo "Check Perf Result"
     python3 $llmSrcNode/tests/integration/defs/perf/sanity_perf_check.py \

@@ -16,11 +16,14 @@
 """Unit tests for Eagle3 model with AutoDeploy."""
 
 from pathlib import Path
+from typing import Any, ClassVar, Dict
+from unittest.mock import patch
 
 import pytest
 import torch
 from _model_test_utils import get_small_model_config
 from build_and_run_ad import ExperimentConfig, main
+from test_common.llm_data import hf_id_to_local_model_dir
 
 import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
@@ -29,6 +32,7 @@ from tensorrt_llm._torch.auto_deploy.models.custom.modeling_eagle import (
     EagleConfig,
     EagleDrafterForCausalLM,
     EagleRMSNorm,
+    EagleWrapper,
 )
 from tensorrt_llm._torch.auto_deploy.models.eagle import EagleDrafterFactory
 from tensorrt_llm._torch.auto_deploy.models.factory import ModelFactoryRegistry
@@ -37,7 +41,6 @@ from tensorrt_llm._torch.auto_deploy.utils.node_utils import (
     infer_draft_embedding_size,
     is_any_lin_op,
 )
-from tests.test_common.llm_data import hf_id_to_local_model_dir
 
 EAGLE_MODEL_HUB_ID = "yuhuili/EAGLE3-LLaMA3.1-Instruct-8B"
 NEMOTRON_SUPER_MODEL_HUB_ID = "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16"
@@ -79,7 +82,7 @@ class MockEagleConfig(EagleConfig):
     For standalone testing, we need to load these from the checkpoint.
     """
 
-    _drafter_defaults = {
+    _drafter_defaults: ClassVar[Dict[str, Dict[str, Any]]] = {
         "llama": {
             "load_embedding_from_target": False,
             "load_lm_head_from_target": False,
@@ -137,7 +140,9 @@ class MockEagleDrafterFactory(EagleDrafterFactory):
         from accelerate import init_empty_weights
 
         model_config, unused_kwargs = self._get_model_config()
-        model_config = MockEagleConfig(model_config, model_config.model_type)
+        # transformers>=5.5 applies @dataclass(kw_only=True) to PretrainedConfig
+        # subclasses, overriding EagleConfig.__init__. Use the factory classmethod.
+        model_config = MockEagleConfig.from_base_config(model_config, model_config.model_type)
 
         with (init_empty_weights if device == "meta" else nullcontext)():
             model = MockEagle3ModelForCausalLM._from_config(model_config, **unused_kwargs)
@@ -200,7 +205,10 @@ def test_build_ad_eagle(register_mock_eagle_factory):
         "model_factory": "MockEagleDrafter",
         "transforms": {
             "insert_cached_attention": {"backend": "trtllm"},
-            "compile_model": {"backend": "torch-simple"},
+            "compile_model": {
+                "backend": "torch-simple",
+                "piecewise_enabled": False,
+            },
         },
     }
     experiment_config = get_small_model_config(EAGLE_MODEL_HUB_ID, **llm_extra_args)
@@ -236,7 +244,7 @@ def test_eagle_model_torch_export():
     eagle_path = Path(eagle_model_path)
 
     # Setup
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda")
     dtype = torch.float16
 
     # Create model via EagleDrafterFactory (creates EagleDrafterForCausalLM)
@@ -318,3 +326,51 @@ def test_infer_draft_hidden_size_from_exported_draft_graph(
     embd, in_eagle_drafter = infer_draft_embedding_size(gm, linear_nodes)
     assert embd == hidden_size
     assert in_eagle_drafter is expected_is_eagle
+
+
+###############################################################################
+# sample_greedy broadcast gating (regression for #13134 + attention-DP fix).
+#
+# - TP replication: argmax across ranks can diverge due to FP noise; the
+#   broadcast keeps acceptance patterns consistent.
+# - Attention-DP: each rank holds a different slice of the global batch, so
+#   per-rank tokens are legitimately different and the broadcast would
+#   corrupt peers' state. The gate is `EagleWrapperConfig.enable_attention_dp`,
+#   plumbed through to `EagleWrapper.enable_attention_dp`.
+###############################################################################
+
+
+def _make_bare_wrapper(enable_attention_dp: bool) -> EagleWrapper:
+    """Construct a minimally-initialized EagleWrapper for testing sample_greedy.
+
+    sample_greedy only reads self.enable_attention_dp; bypass __init__ to avoid
+    requiring a real target/draft submodule pair.
+    """
+    wrapper = EagleWrapper.__new__(EagleWrapper)
+    wrapper.enable_attention_dp = enable_attention_dp
+    return wrapper
+
+
+def test_sample_greedy_skips_broadcast_under_attention_dp():
+    wrapper = _make_bare_wrapper(enable_attention_dp=True)
+    logits = torch.tensor([[0.1, 0.9], [0.8, 0.2]])
+    with patch("tensorrt_llm._torch.auto_deploy.models.custom.modeling_eagle.broadcast") as mock_bc:
+        ret = wrapper.sample_greedy(logits)
+
+    mock_bc.assert_not_called()
+    assert ret.tolist() == [1, 0]
+
+
+def test_sample_greedy_broadcasts_under_tp_replication():
+    wrapper = _make_bare_wrapper(enable_attention_dp=False)
+    logits = torch.tensor([[0.1, 0.9], [0.8, 0.2]])
+    with patch("tensorrt_llm._torch.auto_deploy.models.custom.modeling_eagle.broadcast") as mock_bc:
+        ret = wrapper.sample_greedy(logits)
+
+    mock_bc.assert_called_once()
+    args, kwargs = mock_bc.call_args
+    # `broadcast(ret, src=0)` -- positional ret, src may be kwarg or positional.
+    assert args[0] is ret
+    src = kwargs.get("src", args[1] if len(args) > 1 else None)
+    assert src == 0
+    assert ret.tolist() == [1, 0]

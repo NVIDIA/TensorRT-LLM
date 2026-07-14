@@ -26,7 +26,7 @@ following the same design pattern as the FlashInfer backend:
 """
 
 import math
-from typing import Any, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 from torch._ops import OpOverloadPacket
@@ -45,6 +45,7 @@ from ..attention_interface import (
     AttentionDescriptor,
     AttentionLayout,
     AttentionRegistry,
+    AttentionType,
     BatchInfo,
     Constant,
     KVPagedResourceHandler,
@@ -94,7 +95,19 @@ class _TrtllmPlanner:
         self.context_lengths_gpu: Optional[torch.Tensor] = None  # [max_batch] int32 device
         # Persistent block_offsets buffer for CUDA graph compatibility.
         # Pre-allocated to max size so the tensor address is stable across replays.
+        # ``self.block_offsets`` is the group-0 buffer (kept for the spec-dec
+        # scratch path and backward compatibility); additional KV window groups
+        # (VSWA / non-uniform sliding window, e.g. gpt-oss) get their own
+        # persistent buffer keyed by the group's ``cache_loc`` input pointer in
+        # ``_block_offsets_by_cache_loc``. The transform invokes
+        # ``prepare_trtllm_metadata`` once per group with that group's
+        # ``cache_loc_g{i}`` / ``cu_num_pages_g{i}`` inputs, so without per-group
+        # buffers the groups would clobber a single shared buffer.
         self.block_offsets: Optional[torch.Tensor] = None
+        self._block_offsets_by_cache_loc: dict[int, torch.Tensor] = {}
+        # Shapes for lazy per-group buffer allocation (set in ``reset``).
+        self._max_batch: int = 0
+        self._max_blocks_per_seq: int = 0
         # Per-layer cache for tensors that must survive CUDA graph replay.
         # Keyed by kv_cache.data_ptr() (stable and unique per layer).
         self._layer_cache: dict[
@@ -107,10 +120,10 @@ class _TrtllmPlanner:
         #   - ``is_spec_dec_active``: spec-dec has been initialized for this planner.
         #     Used as the idempotency guard for ``init_spec_decoding`` and gates
         #     planner-level per-graph work (see use sites for why).
-        #   - ``is_spec_decoding_enabled``: the attention kernel uses spec-dec mode (i.e.
-        #     ``spec_decoding_bool_params[0]`` is True). Mirrors the PyTorch backend's
-        #     ``is_spec_decoding_enabled`` (see ``tensorrt_llm/_torch/attention_backend/
-        #     trtllm.py:1567-1570``). Forced False on Blackwell (SM100+, except 120/121)
+        #   - ``is_spec_decoding_enabled``: the attention kernel uses spec-dec mode
+        #     (passed as the ``is_spec_decoding_enabled`` kwarg to thop.attention).
+        #     Mirrors the PyTorch backend's ``is_spec_decoding_enabled``.
+        #     Forced False on Blackwell (SM100+, except 120/121)
         #     because thop.attention routes through a trtllm-Gen FMHA spec-dec branch
         #     (``cpp/tensorrt_llm/thop/attentionOp.cpp:499-526``) that requires extra
         #     bl_tree mask tensors AutoDeploy does not produce for Eagle linear chains.
@@ -119,22 +132,13 @@ class _TrtllmPlanner:
         self.spec_decoding_generation_lengths: Optional[torch.Tensor] = None
         self.spec_decoding_position_offsets: Optional[torch.Tensor] = None
         self.spec_decoding_packed_mask: Optional[torch.Tensor] = None
-        # Pre-packed arg lists for thop.attention's spec-dec parameters. Sized in ``reset()``
-        # based on SM version and populated in ``init_spec_decoding`` / per-graph in
-        # ``prepare_trtllm_metadata``. The attention op reads these directly to avoid the
-        # per-layer list-building overhead.
-        #
-        # spec_decoding_bool_params:
-        #   [0] is_spec_decoding_enabled: kernel enters spec-dec branch (False on Blackwell)
-        #   [1] use_spec_decoding: use spec-dec THIS forward
-        #   [2] is_spec_dec_tree: draft is a tree structure (False for linear Eagle chain)
-        #
-        # spec_decoding_tensor_params (first 3 slots; Blackwell+ adds 3 trailing None tree-mask slots):
-        #   [0] generation_lengths: [max_requests] tokens per request this step
-        #   [1] position_offsets: [max_requests, draft_len+1] position offsets per token
-        #   [2] packed_mask: [max_requests, draft_len+1, ceil((draft_len+1)/32)] causal mask
-        self.spec_decoding_bool_params: List[Any] = [False, False, False]
-        self.spec_decoding_tensor_params: List[Optional[torch.Tensor]] = []
+        # Spec-dec scalars passed directly as thop.attention kwargs.
+        # - use_spec_decoding gates use of spec-dec THIS forward; set per-batch
+        #   in ``prepare_trtllm_metadata``.
+        # - The trtllm-Gen FMHA bl_tree mask tensors (last 3 spec_decoding_*
+        #   slots in thop.attention) are always None for AutoDeploy linear
+        #   Eagle chains.
+        self.use_spec_decoding: bool = False
 
     def reset(self, device: torch.device, max_batch: int, max_blocks_per_seq: int) -> None:
         """One-time allocation of ALL persistent buffers.
@@ -157,9 +161,13 @@ class _TrtllmPlanner:
         self.host_request_types = torch.zeros(
             max_batch, dtype=torch.int32, device="cpu", pin_memory=prefer_pinned()
         )
+        self._max_batch = max_batch
+        self._max_blocks_per_seq = max_blocks_per_seq
         self.block_offsets = torch.zeros(
             1, max_batch, 2, max_blocks_per_seq, dtype=torch.int32, device=device
         )
+        # Group 0 reuses ``self.block_offsets``; it is registered under its
+        # ``cache_loc`` pointer on first use in ``_get_block_offsets_buffer``.
         self.host_past_kv_lengths = torch.zeros(
             max_batch, dtype=torch.int32, device="cpu", pin_memory=prefer_pinned()
         )
@@ -167,13 +175,6 @@ class _TrtllmPlanner:
             max_batch, dtype=torch.int32, device="cpu", pin_memory=prefer_pinned()
         )
         self.context_lengths_gpu = torch.zeros(max_batch, dtype=torch.int32, device=device)
-
-        # Blackwell+ SMs (excluding 120/121 consumer variants) expect an extended spec-dec tensor
-        # list with three trailing tree-mask Nones. Size the list accordingly. Contents stay as
-        # Nones until init_spec_decoding populates the first three entries.
-        self.spec_decoding_tensor_params = [None] * (
-            6 if _is_blackwell_trtllm_gen_kernel(get_sm_version()) else 3
-        )
 
     def init_spec_decoding(self, max_batch: int, max_draft_len: int) -> None:
         """Initialize persistent spec-decoding tensors once when configured.
@@ -204,19 +205,12 @@ class _TrtllmPlanner:
         )
         self.spec_decoding_packed_mask = _generate_spec_decoding_packed_mask(max_batch, draft_len)
 
-        # Populate the pre-packed spec-dec params (static references). Only do this when
-        # the kernel actually enters the spec-dec branch; on Blackwell we leave the bools
-        # False and the tensor slots None so attentionOp.cpp's spec-dec block is skipped.
+        # On Blackwell, ``is_spec_decoding_enabled`` stays False so attentionOp.cpp's
+        # spec-dec block is skipped (the trtllm-Gen FMHA path requires bl_tree mask
+        # tensors AutoDeploy does not produce). ``use_spec_decoding`` is flipped to
+        # True per-batch during target model forward to match the PyTorch backend.
         if self.is_spec_decoding_enabled:
-            # spec_decoding_bool_params[0] gates the C++ spec-dec branch.
-            # spec_decoding_bool_params[1] is set to True during target model forward to
-            # match the PyTorch backend.
-            self.spec_decoding_bool_params[0] = True
-            self.spec_decoding_bool_params[1] = True
-
-            self.spec_decoding_tensor_params[0] = self.spec_decoding_generation_lengths
-            self.spec_decoding_tensor_params[1] = self.spec_decoding_position_offsets
-            self.spec_decoding_tensor_params[2] = self.spec_decoding_packed_mask
+            self.use_spec_decoding = True
 
     def get_layer_tensors(
         self,
@@ -313,29 +307,78 @@ class _TrtllmPlanner:
         self.num_contexts = num_prefill
         self.num_ctx_tokens = batch_info.get_num_tokens()[0]
 
+    def _get_block_offsets_buffer(self, cache_loc: torch.Tensor) -> torch.Tensor:
+        """Return the persistent block_offsets buffer for this KV window group.
+
+        Each KV window group is driven by its own ``cache_loc`` input tensor
+        (group 0 uses ``cache_loc``; groups 1..N-1 use ``cache_loc_g{i}``), which
+        are persistent buffers with stable ``data_ptr()`` across CUDA-graph
+        replays. Keying by that pointer (same pattern as ``_layer_cache`` keyed
+        by ``kv_cache.data_ptr()``) gives each group an independent, address-stable
+        block_offsets buffer so per-group ``prepare_trtllm_metadata`` invocations
+        do not clobber each other.
+
+        Lazily allocates a buffer on first sight of a group's ``cache_loc``. This
+        must happen during warm-up (never mid-capture) so the tensor address is
+        stable for graph replay; group 0's buffer reuses the one already
+        allocated in ``reset``.
+        """
+        key = cache_loc.data_ptr()
+        buf = self._block_offsets_by_cache_loc.get(key)
+        if buf is None:
+            assert self.block_offsets is not None, (
+                "planner.reset() must run before _get_block_offsets_buffer()"
+            )
+            if not self._block_offsets_by_cache_loc:
+                # First group seen this run is group 0: reuse the reset() buffer.
+                buf = self.block_offsets
+            else:
+                assert (
+                    not torch.cuda.is_current_stream_capturing()
+                ) or cuda_graph_state.in_warm_up(), (
+                    "block_offsets buffer for a new KV window group must be "
+                    "allocated during warm-up, not during CUDA graph capture. "
+                    "Ensure warm-up exercises every KV pool."
+                )
+                buf = torch.zeros(
+                    1,
+                    self._max_batch,
+                    2,
+                    self._max_blocks_per_seq,
+                    dtype=torch.int32,
+                    device=self.block_offsets.device,
+                )
+            self._block_offsets_by_cache_loc[key] = buf
+        return buf
+
     def plan_device(
         self,
         num_seq: int,
         block_offset_multiplier: int,
         cu_num_pages: torch.Tensor,
         cache_loc: torch.Tensor,
-    ) -> None:
+    ) -> torch.Tensor:
         """Per-forward DEVICE metadata: block_offsets via Triton kernel (pure GPU).
 
         Called from the ``prepare_trtllm_metadata`` custom op (in the graph).
+        Returns the per-group block_offsets buffer that was populated, so the op
+        can flow it through the graph to that group's attention layers.
         """
-        k_slice = self.block_offsets[0, :, 0, :]  # [max_batch, M], stride [2*M, 1]
+        block_offsets = self._get_block_offsets_buffer(cache_loc)
+        k_slice = block_offsets[0, :, 0, :]  # [max_batch, M], stride [2*M, 1]
         torch.ops.auto_deploy.ragged_to_block_table_triton(
             cache_loc, cu_num_pages, k_slice, num_seq
         )
-        self.block_offsets[0, :num_seq, 0, :].mul_(block_offset_multiplier)
-        self.block_offsets[0, :num_seq, 1, :] = self.block_offsets[0, :num_seq, 0, :] + 1
+        block_offsets[0, :num_seq, 0, :].mul_(block_offset_multiplier)
+        block_offsets[0, :num_seq, 1, :] = block_offsets[0, :num_seq, 0, :] + 1
+        return block_offsets
 
 
 _GlobalTrtllmPlanner = _TrtllmPlanner()
 _TRTLLM_ATTN_FP8_INPUT_SCALE_KEY = "trtllm_attention_input_scale"
 _TRTLLM_ATTN_OUT_SCALE_KEY = "trtllm_attention_out_scale"
 _TRTLLM_ROPE_INFO_KEY = "_trtllm_rope_info"
+_TRTLLM_ATTN_SINKS_F32_KEY = "_trtllm_attention_sinks_f32"
 
 
 def set_trtllm_attention_fp8_input_scale(attn_node: Node, input_scale: Node) -> None:
@@ -354,6 +397,30 @@ def clear_trtllm_attention_fp8_input_scale(attn_node: Node) -> None:
 def get_trtllm_rope_info(attn_node: Node) -> Optional[dict]:
     """Retrieve RoPE fusion info stored on an attention node, if any."""
     return attn_node.meta.get(_TRTLLM_ROPE_INFO_KEY)
+
+
+def _materialize_out_scale(gm: GraphModule, input_scale: Node, attn_node: Node) -> Node:
+    """Build the ``out_scale = 1/input_scale`` node used by ``thop.attention``.
+
+    For static ``get_attr`` scales, pre-compute the reciprocal once at graph
+    construction and emit a fresh ``get_attr`` for the result.  For anything
+    else (e.g. dynamic compute), emit a per-step ``aten.reciprocal``.
+    """
+    if input_scale.op == "get_attr":
+        try:
+            obj = gm
+            for atom in input_scale.target.split("."):
+                obj = getattr(obj, atom)
+        except AttributeError:
+            obj = None
+        if obj is not None and not obj.is_meta:
+            recip_attr = "_trtllm_recip_" + input_scale.target.replace(".", "_")
+            if not hasattr(gm, recip_attr):
+                gm.register_buffer(recip_attr, torch.reciprocal(obj), persistent=False)
+            with gm.graph.inserting_before(attn_node):
+                return gm.graph.create_node("get_attr", recip_attr)
+    with gm.graph.inserting_before(attn_node):
+        return gm.graph.call_function(torch.ops.aten.reciprocal.default, args=(input_scale,))
 
 
 # Mirrors tensorrt_llm/_torch/attention_backend/trtllm.py::TrtllmAttention.is_sm_version_trtllm_gen_kernel
@@ -475,19 +542,19 @@ def prepare_trtllm_metadata(
     if _GlobalTrtllmPlanner.is_spec_dec_active:
         _GlobalTrtllmPlanner.refresh_batch_state(batch_info)
         if _GlobalTrtllmPlanner.is_spec_decoding_enabled:
-            _GlobalTrtllmPlanner.spec_decoding_bool_params[1] = (
-                batch_info.get_num_sequences()[2] == 0
-            )
+            _GlobalTrtllmPlanner.use_spec_decoding = batch_info.get_num_sequences()[2] == 0
     block_offset_multiplier = batch_info.get_block_offset_multiplier()
 
-    _GlobalTrtllmPlanner.plan_device(
+    block_offsets = _GlobalTrtllmPlanner.plan_device(
         num_seq=batch_info.get_total_num_sequences(),
         block_offset_multiplier=block_offset_multiplier,
         cu_num_pages=cu_num_pages,
         cache_loc=cache_loc,
     )
 
-    return [_GlobalTrtllmPlanner.block_offsets]
+    # Return this group's buffer (keyed by ``cache_loc``) so multi-pool
+    # (VSWA) deployments flow the correct block_offsets to each group's layers.
+    return [block_offsets]
 
 
 @prepare_trtllm_metadata.register_fake
@@ -532,10 +599,17 @@ def trtllm_mha_with_cache(
     kv_scale_orig_quant: float = 1.0,
     kv_scale_quant_orig: float = 1.0,
     out_scale: Optional[torch.Tensor] = None,
-    out: Optional[torch.Tensor] = None,
     rotary_cos_sin: Optional[torch.Tensor] = None,
     position_embedding_type: int = 0,
     rotary_embedding_dim: int = 0,
+    attention_sinks: Optional[torch.Tensor] = None,
+    num_heads_hint: int = 0,
+    num_kv_heads_hint: int = 0,
+    head_dim_hint: int = 0,
+    # OPTIONAL PRE-ALLOCATED OUTPUT — kept last so it stays unfilled in
+    # ``get_constants`` and ``_inject_out_param`` can wire it as a kwarg
+    # (mirrors FlashInfer's signature layout).
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """TRT-LLM attention with paged KV cache for Auto-Deploy.
 
@@ -547,24 +621,29 @@ def trtllm_mha_with_cache(
     ``kv_cache_block_offsets`` is computed by the ``prepare_trtllm_metadata`` device-side
     op and flows through the graph to create an explicit data dependency.
 
+    When ``num_heads_hint``, ``num_kv_heads_hint``, and ``head_dim_hint`` are all non-zero,
+    the op operates in **fused QKV mode**: ``q`` is expected to be the flat fused QKV tensor
+    of shape ``(B, S, total_qkv_dim)`` (K and V args are ignored).  This bypasses the
+    zero-copy check and cat fallback, eliminating 2 copy + 1 cat kernel per layer.
+
     Note: layer_idx is always passed as 0 to thop.attention because
     the kv_cache tensor is already a strided view for the correct layer,
     pool_pointers encodes kv_cache.data_ptr() (layer-specific), and
     pool_mapping is all zeros. See module docstring for details.
     """
-    # Infer dimensions from tensor shapes (bsnd layout)
-    num_heads = q.shape[2]
-    num_kv_heads = k.shape[2]
-    head_dim = q.shape[3]
     tokens_per_block = kv_cache.shape[3]  # HND: [blocks, 2, heads, tpb, head_dim]
 
     # Get batch dimensions and model-level constants from host tensors (no device sync)
     batch_info = BatchInfo(batch_info_host)
     num_seq = batch_info.get_total_num_sequences()
     num_tokens = batch_info.get_total_num_tokens()
+    max_seq_len = batch_info.get_max_seq_len()
     max_context_length = batch_info.get_max_context_length()
     max_num_requests = batch_info.get_max_batch_size()
-    # Use sliding_window for attention_window_size if provided, else full context length
+    # Use sliding_window for attention_window_size if provided, else full context length.
+    # The mask stays ``causal`` (matching the PyTorch backend, which never uses
+    # sliding_window_causal): the kernel honors the window via the cyclic
+    # attention-window handling driven by ``attention_window_size``.
     attention_window_size = (
         sliding_window
         if isinstance(sliding_window, int) and sliding_window > 0
@@ -577,16 +656,34 @@ def trtllm_mha_with_cache(
         _GlobalTrtllmPlanner.get_layer_tensors(kv_cache, kv_scale_orig_quant, kv_scale_quant_orig)
     )
 
-    # Reshape Q, K, V to [num_tokens, num_heads * head_dim] and fuse.
-    # Input is [bs, 1] (generate-only) or [1, total_seq_len] (prefill/mixed).
-    # With piecewise CUDA graphs the tensor may be padded to a bucket size
-    # (b*s > num_tokens), so flatten first and slice to the real token count.
-    q_shape_og = q.shape
-    q_flat = q.reshape(-1, num_heads * head_dim)[:num_tokens]
-    k_flat = k.reshape(-1, num_kv_heads * head_dim)[:num_tokens]
-    v_flat = v.reshape(-1, num_kv_heads * head_dim)[:num_tokens]
+    # Fused-QKV mode: when ``fuse_rope_into_trtllm_attention`` traces back to a
+    # single fused QKV GEMM output, ``q`` is the flat ``(B, S, total_qkv_dim)``
+    # tensor and the K/V args are aliases of it; skip split + reshape + cat.
+    if num_heads_hint > 0 and num_kv_heads_hint > 0 and head_dim_hint > 0:
+        num_heads = num_heads_hint
+        num_kv_heads = num_kv_heads_hint
+        head_dim = head_dim_hint
+        total_qkv_dim = (num_heads + 2 * num_kv_heads) * head_dim
+        q_shape_og = (q.shape[0], q.shape[1], num_heads, head_dim)
+        qkv_fused = q.reshape(-1, total_qkv_dim)[:num_tokens]
+    else:
+        # Standard path: infer dimensions from tensor shapes (bsnd layout) and
+        # build the fused QKV via reshape + cat.
+        num_heads = q.shape[2]
+        num_kv_heads = k.shape[2]
+        head_dim = q.shape[3]
+        q_shape_og = q.shape
 
-    qkv_fused = torch.cat([q_flat, k_flat, v_flat], dim=-1).contiguous()
+        q_flat = q.reshape(-1, num_heads * head_dim)[:num_tokens]
+        k_flat = k.reshape(-1, num_kv_heads * head_dim)[:num_tokens]
+        v_flat = v.reshape(-1, num_kv_heads * head_dim)[:num_tokens]
+        qkv_fused = torch.cat([q_flat, k_flat, v_flat], dim=-1).contiguous()
+
+    # The thop.attention C++ kernel expects attention_sinks in float32 (see
+    # attentionOp.cpp:365). Models typically hold sinks at the same dtype as
+    # the rest of the parameters (e.g. bf16 for GPT-OSS), so cast here.
+    if attention_sinks is not None and attention_sinks.dtype != torch.float32:
+        attention_sinks = attention_sinks.to(torch.float32)
 
     # Prepare output: if caller provided an `out` buffer, write directly into it
     total_padded_tokens = q_shape_og[0] * q_shape_og[1]
@@ -609,12 +706,6 @@ def trtllm_mha_with_cache(
     # Pool mapping (shared, always zeros since layer offset is in pool_pointers)
     host_kv_cache_pool_mapping = _GlobalTrtllmPlanner.host_pool_mapping
 
-    # Pack parameters for thop.attention
-    rotary_embedding_scales = [1.0, 1.0, 1.0]
-    rotary_embedding_max_position_info = [max_context_length, max_context_length]
-
-    mla_tensor_params = [None, None]
-
     # For Llama + Eagle3 + torch-cudagraph, we observe a crash without the following
     # use of _scratch_block_offsets. See:
     # https://github.com/NVIDIA/TensorRT-LLM/issues/13100
@@ -636,6 +727,7 @@ def trtllm_mha_with_cache(
         context_lengths,  # context_lengths
         _GlobalTrtllmPlanner.host_context_lengths[:num_seq],  # host_context_lengths
         host_request_types,  # host_request_types
+        None,  # max_context_q_len_override
         kv_cache_block_offsets,  # kv_cache_block_offsets
         host_kv_cache_pool_pointers,  # host_kv_cache_pool_pointers
         host_kv_cache_pool_mapping,  # host_kv_cache_pool_mapping
@@ -648,29 +740,32 @@ def trtllm_mha_with_cache(
         None,  # latent_cache (MLA)
         None,  # q_pe (MLA)
         None,  # block_ids_per_seq
-        None,  # attention_sinks
+        attention_sinks,  # attention_sinks (per-head learnable scalar, e.g. GPT-OSS)
         True,  # is_fused_qkv
         True,  # update_kv_cache
         1,  # predicted_tokens_per_seq (always 1 except for MLA kernel)
-        0,  # layer_idx (always 0; pool_pointers already encodes the layer offset)
+        0,  # local_layer_idx (always 0; pool_pointers already encodes the layer offset)
         num_heads,  # num_heads
         num_kv_heads,  # num_kv_heads
         head_dim,  # head_size
         tokens_per_block,  # tokens_per_block
         max_num_requests,  # max_num_requests
         max_context_length,  # max_context_length
+        max_seq_len,  # max_seq_len
         attention_window_size,  # attention_window_size
-        0,  # sink_token_length
         1,  # beam_width
         int(AttentionMaskType.causal),  # mask_type
         quant_mode,  # quant_mode
         scale * math.sqrt(head_dim) if scale is not None else 1.0,  # q_scaling
         position_embedding_type,  # position_embedding_type
-        rotary_embedding_dim,  # rotary_embedding_dim
-        10000.0,  # rotary_embedding_base
-        0,  # rotary_embedding_scale_type
-        rotary_embedding_scales,  # rotary_embedding_scales
-        rotary_embedding_max_position_info,  # rotary_embedding_max_position_info
+        rotary_embedding_dim,  # rope_dim
+        10000.0,  # rope_base
+        0,  # rope_scale_type
+        1.0,  # rope_scale
+        1.0,  # rope_short_m_scale
+        1.0,  # rope_long_m_scale
+        max_context_length,  # rope_max_positions
+        max_context_length,  # rope_original_max_positions
         True,  # use_paged_context_fmha
         0,  # attention_input_type
         False,  # is_mla_enable
@@ -680,19 +775,29 @@ def trtllm_mha_with_cache(
         None,  # qk_nope_head_dim (MLA)
         None,  # qk_rope_head_dim (MLA)
         None,  # v_head_dim (MLA)
+        None,  # rope_append
         None,  # mrope_rotary_cos_sin
         None,  # mrope_position_deltas
-        mla_tensor_params,  # mla_tensor_params
+        None,  # helix_position_offsets
+        None,  # helix_is_inactive_rank
         None,  # attention_chunk_size
         None,  # softmax_stats_tensor
-        _GlobalTrtllmPlanner.spec_decoding_bool_params,  # spec_decoding_bool_params
-        _GlobalTrtllmPlanner.spec_decoding_tensor_params,  # spec_decoding_tensor_params
+        _GlobalTrtllmPlanner.is_spec_decoding_enabled,  # is_spec_decoding_enabled
+        _GlobalTrtllmPlanner.use_spec_decoding,  # use_spec_decoding
+        False,  # is_spec_dec_tree (always False for AutoDeploy linear Eagle chains)
+        _GlobalTrtllmPlanner.spec_decoding_generation_lengths,
+        _GlobalTrtllmPlanner.spec_decoding_position_offsets,
+        _GlobalTrtllmPlanner.spec_decoding_packed_mask,
+        None,  # spec_decoding_bl_tree_mask_offset (None for AutoDeploy linear Eagle chains)
+        None,  # spec_decoding_bl_tree_mask
+        None,  # spec_bl_tree_first_sparse_mask_offset_kv
         None,  # sparse_kv_indices
         None,  # sparse_kv_offsets
         None,  # sparse_attn_indices
         None,  # sparse_attn_offsets
         1,  # sparse_attn_indices_block_size
         0,  # num_sparse_topk
+        None,  # sparse_mla_topk_lens
         None,  # skip_softmax_threshold_scale_factor_prefill
         None,  # skip_softmax_threshold_scale_factor_decode
         None,  # skip_softmax_stat
@@ -736,15 +841,23 @@ def trtllm_mha_with_cache_fake(
     kv_scale_orig_quant: float = 1.0,
     kv_scale_quant_orig: float = 1.0,
     out_scale: Optional[torch.Tensor] = None,
-    out: Optional[torch.Tensor] = None,
     rotary_cos_sin: Optional[torch.Tensor] = None,
     position_embedding_type: int = 0,
     rotary_embedding_dim: int = 0,
+    attention_sinks: Optional[torch.Tensor] = None,
+    num_heads_hint: int = 0,
+    num_kv_heads_hint: int = 0,
+    head_dim_hint: int = 0,
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Fake implementation for torch.compile tracing."""
     if out is not None:
         return out.new_empty(0)
     out_dtype = torch.float8_e4m3fn if out_scale is not None else q.dtype
+    if num_heads_hint > 0 and head_dim_hint > 0:
+        # Fused QKV mode: q is (B, S, total_qkv_dim), output should be (B, S, num_heads, head_dim)
+        out_shape = (q.shape[0], q.shape[1], num_heads_hint, head_dim_hint)
+        return q.new_empty(out_shape, dtype=out_dtype)
     return torch.empty_like(q.contiguous(), dtype=out_dtype)
 
 
@@ -759,6 +872,13 @@ class TrtllmAttention(AttentionDescriptor):
 
     Follows the same stateless descriptor pattern as ``FlashInferAttention``.
     """
+
+    @classmethod
+    def kernel_handles_cyclic_swa(cls) -> bool:
+        """thop.attention applies the sliding-window mask internally via cyclic
+        KV indexing, so the executor passes the full per-window block table and
+        global KV lengths (no host-side window slicing). See base class."""
+        return True
 
     @classmethod
     def get_attention_layout(cls) -> AttentionLayout:
@@ -793,18 +913,44 @@ class TrtllmAttention(AttentionDescriptor):
     def get_cache_initializers(
         cls, source_attn_node: Node, cache_config: KvCacheConfig
     ) -> ResourceHandlerDict:
-        """Return only KV cache handler (no workspace handler, managed like flashinfer)."""
-        k_fake: FakeTensor = source_attn_node.args[1].meta["val"]
-        num_kv_heads = k_fake.shape[2]
-        head_dim = k_fake.shape[3]
+        """Return only the KV cache handler (no workspace handler; managed like flashinfer)."""
+        # In fused QKV mode, K arg is the same as Q (flat fused tensor), so use hints.
+        if source_attn_node.meta.get("_trtllm_fused_qkv"):
+            num_kv_heads = source_attn_node.meta["_trtllm_num_kv_heads"]
+            head_dim = source_attn_node.meta["_trtllm_head_dim"]
+            # KV dtype is captured by ``fuse_rope_into_trtllm_attention`` at
+            # fusion time (when V's meta is still trustworthy).  Fall back to
+            # reading the fused-QKV node's ``meta['val']`` only if it survived
+            # later transforms; otherwise fail loudly so the bug is visible.
+            kv_dtype = source_attn_node.meta.get("_trtllm_kv_dtype")
+            if kv_dtype is None:
+                q_node = source_attn_node.args[0]
+                q_meta = q_node.meta.get("val")
+                assert q_meta is not None, (
+                    f"fused-QKV attention node is missing both _trtllm_kv_dtype "
+                    f"and meta['val'] on its first input "
+                    f"({q_node.op}:{q_node.target}); cannot infer KV cache dtype"
+                )
+                kv_dtype = q_meta.dtype
+        else:
+            k_fake: FakeTensor = source_attn_node.args[1].meta["val"]
+            num_kv_heads = k_fake.shape[2]
+            head_dim = k_fake.shape[3]
+            kv_dtype = k_fake.dtype
+        # ``sliding_window`` is propagated into the handler so layers
+        # with different windows land in separate pools.
+        (sw,) = extract_op_args(source_attn_node, "sliding_window")
+        sliding_window = sw if isinstance(sw, int) and sw > 0 else 0
 
         return {
             "kv_cache": KVPagedResourceHandler(
                 num_kv_heads,
                 head_dim,
-                dtype=cls.resolve_cache_dtype(cache_config.dtype, k_fake.dtype),
+                dtype=cls.resolve_cache_dtype(cache_config.dtype, kv_dtype),
                 kv_factor=2,
                 kv_layout="HND",
+                sliding_window=sliding_window,
+                attention_type=AttentionType.mha,
             )
         }
 
@@ -823,15 +969,15 @@ class TrtllmAttention(AttentionDescriptor):
     @classmethod
     def prepare_node_for_cache_insertion(cls, gm: GraphModule, attn_node: Node) -> None:
         """Materialize optional out_scale and rope cos_sin nodes before cache insertion."""
-        # FP8 output scale
+        # FP8 output scale: thop.attention needs ``1/input_scale`` as out_scale.
+        # When input_scale is a static buffer (``get_attr``), pre-compute the
+        # reciprocal and register it as a fresh buffer so the per-step graph
+        # only does a get_attr instead of launching ``aten.reciprocal``.
         input_scale = get_trtllm_attention_fp8_input_scale(attn_node)
         if input_scale is not None:
             existing_out_scale = attn_node.meta.get(_TRTLLM_ATTN_OUT_SCALE_KEY)
             if not isinstance(existing_out_scale, Node):
-                with gm.graph.inserting_before(attn_node):
-                    out_scale = gm.graph.call_function(
-                        torch.ops.aten.reciprocal.default, args=(input_scale,)
-                    )
+                out_scale = _materialize_out_scale(gm, input_scale, attn_node)
                 attn_node.meta[_TRTLLM_ATTN_OUT_SCALE_KEY] = out_scale
         else:
             attn_node.meta.pop(_TRTLLM_ATTN_OUT_SCALE_KEY, None)
@@ -859,6 +1005,26 @@ class TrtllmAttention(AttentionDescriptor):
                 cos_sin_node = gm.graph.create_node("get_attr", attr_name)
             cos_sin_node.meta["val"] = cos_sin_tensor
             rope_info["cos_sin_node"] = cos_sin_node
+
+        # Attention sinks: the thop kernel needs fp32, but models store them at
+        # param dtype (e.g. bf16). Pre-cast once here (post weight-load) so the
+        # per-call ``.to(float32)`` is not captured into the CUDA graph — one cast
+        # kernel per layer/token removed. Value is bit-identical to the runtime cast.
+        sinks_node = extract_op_args(attn_node, "sinks")[0]
+        if isinstance(sinks_node, Node) and sinks_node.op == "get_attr":
+            sinks_val = gm
+            for atom in sinks_node.target.split("."):
+                sinks_val = getattr(sinks_val, atom)
+            if isinstance(sinks_val, torch.Tensor) and sinks_val.dtype != torch.float32:
+                f32_name = f"{sinks_node.target.replace('.', '_')}_f32"
+                if not hasattr(gm, f32_name):
+                    gm.register_buffer(
+                        f32_name, sinks_val.detach().to(torch.float32), persistent=False
+                    )
+                with gm.graph.inserting_before(attn_node):
+                    sinks_f32_node = gm.graph.create_node("get_attr", f32_name)
+                sinks_f32_node.meta["val"] = getattr(gm, f32_name)
+                attn_node.meta[_TRTLLM_ATTN_SINKS_F32_KEY] = sinks_f32_node
 
     @classmethod
     def get_constants(cls, source_attn_node: Node) -> List[Constant]:
@@ -895,6 +1061,14 @@ class TrtllmAttention(AttentionDescriptor):
         # Get sliding_window from source attention node
         sliding_window = extract_op_args(source_attn_node, "sliding_window")[0]
 
+        # Forward optional attention sinks (per-head learnable scalar) — used by
+        # GPT-OSS-style models. Stored as an FX get_attr Node when present and
+        # bound to the actual nn.Parameter at runtime. Prefer the fp32-precast
+        # buffer (prepare_node_for_cache_insertion) to avoid a per-call cast.
+        sinks_node = source_attn_node.meta.get(_TRTLLM_ATTN_SINKS_F32_KEY)
+        if not isinstance(sinks_node, Node):
+            sinks_node = extract_op_args(source_attn_node, "sinks")[0]
+
         # Optional out_scale is injected by prepare_node_for_cache_insertion when available.
         out_scale = source_attn_node.meta.get(_TRTLLM_ATTN_OUT_SCALE_KEY)
         if not isinstance(out_scale, Node):
@@ -905,11 +1079,17 @@ class TrtllmAttention(AttentionDescriptor):
         if rope_info is not None:
             rope_cos_sin = rope_info["cos_sin_node"]
             pos_emb_type = rope_info["position_embedding_type"]
-            rot_emb_dim = rope_info["rotary_embedding_dim"]
+            rot_emb_dim = rope_info["rope_dim"]
         else:
             rope_cos_sin = None
             pos_emb_type = 0
             rot_emb_dim = 0
+
+        # Fused QKV hints (non-zero when the rope transform traced back to a flat
+        # fused QKV GEMM output, bypassing the zero-copy check + cat fallback).
+        num_heads_hint = source_attn_node.meta.get("_trtllm_num_heads", 0)
+        num_kv_heads_hint = source_attn_node.meta.get("_trtllm_num_kv_heads", 0)
+        head_dim_hint = source_attn_node.meta.get("_trtllm_head_dim", 0)
 
         return [
             scale,
@@ -917,8 +1097,13 @@ class TrtllmAttention(AttentionDescriptor):
             1.0,  # kv_scale_orig_quant (hard-coded, same as FlashInfer)
             1.0,  # kv_scale_quant_orig (hard-coded, same as FlashInfer)
             out_scale,
-            None,  # out (pre-allocated output buffer, not used here)
             rope_cos_sin,
             pos_emb_type,
             rot_emb_dim,
+            sinks_node,
+            num_heads_hint,
+            num_kv_heads_hint,
+            head_dim_hint,
+            # ``out`` is intentionally omitted — it stays unfilled positionally so
+            # ``_inject_out_param`` can wire a pre-allocated buffer as a kwarg.
         ]

@@ -36,15 +36,17 @@ from tensorrt_llm.llmapi.disagg_utils import (DisaggServerConfig,
                                               get_ctx_gen_server_addrs,
                                               get_global_disagg_request_id)
 from tensorrt_llm.logger import logger
-from tensorrt_llm.serve.cluster_storage import (HttpClusterStorageServer,
-                                                create_cluster_storage)
+from tensorrt_llm.serve.cluster_storage import (
+    HttpClusterStorageServer, create_cluster_storage,
+    validate_http_cluster_storage_scope)
+from tensorrt_llm.serve.conversation_id import resolve_request_conversation_id
 from tensorrt_llm.serve.metadata_server import create_metadata_server
 from tensorrt_llm.serve.openai_client import OpenAIClient, OpenAIHttpClient
 from tensorrt_llm.serve.openai_disagg_service import (
     OpenAIDisaggregatedService, ResponseHooks)
-from tensorrt_llm.serve.openai_protocol import (DisaggregatedParams,
-                                                UCompletionRequest,
-                                                UCompletionResponse)
+from tensorrt_llm.serve.openai_protocol import (
+    UCompletionRequest, UCompletionResponse,
+    ensure_request_chat_template_allowed)
 from tensorrt_llm.serve.perf_metrics import DisaggPerfMetricsCollector
 from tensorrt_llm.serve.responses_utils import (ServerArrivalTimeMiddleware,
                                                 get_steady_clock_now_in_seconds)
@@ -80,7 +82,6 @@ class RawRequestResponseHooks(ResponseHooks):
 
 
 class OpenAIDisaggServer:
-
     def __init__(self,
                  config: DisaggServerConfig,
                  req_timeout_secs: int = 180,
@@ -92,6 +93,8 @@ class OpenAIDisaggServer:
         self._server_start_timeout_secs = server_start_timeout_secs
         self._metadata_server_cfg = metadata_server_cfg
         self._metrics_interval_secs = metrics_interval_secs
+        self._allow_request_chat_template = getattr(
+            config, "allow_request_chat_template", False)
 
         self._ctx_servers, self._gen_servers = get_ctx_gen_server_addrs(config.server_configs)
         self._ctx_router = create_router(config.ctx_router_config, self._ctx_servers, metadata_server_cfg, create_metadata_server(metadata_server_cfg), self._sync_server_clock, disagg_node_id=config.node_id)
@@ -99,7 +102,13 @@ class OpenAIDisaggServer:
         self._metadata_server = create_metadata_server(metadata_server_cfg)
         self._perf_metrics_collector = DisaggPerfMetricsCollector(config.perf_metrics_max_requests)
 
-        self._disagg_cluster_storage = create_cluster_storage(config.disagg_cluster_config.cluster_uri, config.disagg_cluster_config.cluster_name) if config.disagg_cluster_config else None
+        self._disagg_cluster_storage = None
+        if config.disagg_cluster_config:
+            validate_http_cluster_storage_scope(
+                config.disagg_cluster_config.cluster_uri, config.hostname)
+            self._disagg_cluster_storage = create_cluster_storage(
+                config.disagg_cluster_config.cluster_uri,
+                config.disagg_cluster_config.cluster_name)
 
         self._service = OpenAIDisaggregatedService(
             self._config, self._ctx_router, self._gen_router, self._create_client,
@@ -164,32 +173,12 @@ class OpenAIDisaggServer:
 
     @staticmethod
     def _extract_conversation_id(req: UCompletionRequest, raw_req: Request):
-        """Populate conversation_id from the X-Correlation-ID header.
+        """Populate conversation_params.conversation_id from supported headers.
 
-        When not already set in the request body, copies the header value
-        into ``disaggregated_params.conversation_id``.
-
-        aiperf sends multi-turn session IDs via the ``X-Correlation-ID``
-        header (see aiperf ``base_transports.build_headers``).  We mirror
-        that convention so the ConversationRouter can provide session
-        affinity without requiring clients to set the body field.
-
-        When ``disaggregated_params`` is ``None`` (standard OpenAI
-        requests without disagg fields), a minimal instance is created
-        to carry the conversation_id.  The service layer always rebuilds
-        ``disaggregated_params`` in ``_get_ctx_request`` /
-        ``_get_gen_request`` before forwarding to workers.
+        Body ``conversation_params.conversation_id`` is canonical. Headers are
+        used only when the body does not provide an id.
         """
-        header_conv_id = raw_req.headers.get("x-correlation-id")
-        if header_conv_id is None:
-            return
-        if req.disaggregated_params is None:
-            req.disaggregated_params = DisaggregatedParams(
-                request_type="context_only",
-                conversation_id=header_conv_id,
-            )
-        elif req.disaggregated_params.conversation_id is None:
-            req.disaggregated_params.conversation_id = header_conv_id
+        resolve_request_conversation_id(req, raw_req.headers)
 
     def _wrap_entry_point(self, entry_point: Callable) -> Callable:
         async def wrapper(req: UCompletionRequest, raw_req: Request) -> Response:
@@ -199,6 +188,11 @@ class OpenAIDisaggServer:
                     self._perf_metrics_collector.stream_requests.inc()
                 else:
                     self._perf_metrics_collector.nonstream_requests.inc()
+                try:
+                    ensure_request_chat_template_allowed(
+                        req, self._allow_request_chat_template)
+                except ValueError as e:
+                    raise HTTPException(status_code=400, detail=str(e)) from e
                 self._extract_conversation_id(req, raw_req)
                 hooks = RawRequestResponseHooks(raw_req, self._perf_metrics_collector)
                 response_or_generator = await entry_point(req, hooks)

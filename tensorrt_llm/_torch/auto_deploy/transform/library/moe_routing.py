@@ -37,8 +37,7 @@ import torch
 from torch.fx import GraphModule, Node
 
 # Importing this module registers the torch.ops.auto_deploy.triton_fused_topk_softmax op.
-import tensorrt_llm._torch.auto_deploy.custom_ops.fused_moe.triton_routing  # noqa: F401
-
+from ...custom_ops.fused_moe import triton_routing  # noqa: F401
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
 from ...utils._graph import eliminate_dead_code

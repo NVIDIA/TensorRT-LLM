@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -35,6 +35,7 @@
 #include <nanobind/stl/chrono.h>
 #include <nanobind/stl/optional.h>
 #include <nanobind/stl/shared_ptr.h>
+#include <nanobind/stl/string.h>
 #include <nanobind/stl/tuple.h>
 #include <nanobind/stl/unique_ptr.h>
 #include <nanobind/stl/vector.h>
@@ -190,18 +191,26 @@ void initBindings(nb::module_& m)
         .def_prop_ro("is_disagg_context_complete_state", &GenLlmReq::isDisaggContextCompleteState)
         .def_prop_ro("stage", &GenLlmReq::getRequestStage)
         .def_prop_ro("kv_cache_transfer_time_ms", &GenLlmReq::getKvCacheTransferTimeMS)
+        .def_prop_ro("kv_cache_transfer_start", &GenLlmReq::getKvCacheTransferStart)
+        .def_prop_ro("kv_cache_transfer_end", &GenLlmReq::getKvCacheTransferEnd)
         .def_prop_ro("kv_cache_size", &GenLlmReq::getKvCacheSize)
+        .def("set_kv_cache_transfer_start", &GenLlmReq::setKvCacheTransferStart, nb::arg("time"))
+        .def("set_kv_cache_transfer_end", &GenLlmReq::setKvCacheTransferEnd, nb::arg("time"))
+        .def("set_kv_cache_size", &GenLlmReq::setKvCacheSize, nb::arg("target_buffer_size"))
+        .def("update_kv_cache_size", &GenLlmReq::updateKvCacheSize, nb::arg("target_buffer_size"))
         .def_prop_ro("avg_decoded_tokens_per_iter", &GenLlmReq::getAvgDecodedTokensPerIter)
         .def_prop_ro("alloc_total_blocks", &GenLlmReq::getAllocTotalBlocksPerRequest)
         .def_prop_ro("alloc_new_blocks", &GenLlmReq::getAllocNewBlocksPerRequest)
         .def("alloc_context_logits", &GenLlmReq::allocContextLogitsHost, nb::arg("vocab_size"), nb::arg("logit_dtype"))
+        .def("update_kv_cache_perf_metrics", &GenLlmReq::updateKvCachePerfMetrics, nb::arg("alloc_total_blocks"),
+            nb::arg("alloc_new_blocks"), nb::arg("reused_blocks"), nb::arg("missed_blocks"))
         .def_prop_ro("reused_blocks", &GenLlmReq::getReusedBlocksPerRequest)
         .def_prop_ro("missed_blocks", &GenLlmReq::getMissedBlocksPerRequest)
         .def_prop_ro("kv_cache_hit_rate", &GenLlmReq::getKVCacheHitRatePerRequest)
         .def_prop_ro("llm_request_type", &GenLlmReq::getLlmRequestType)
         .def_prop_ro("parent_request_id", &GenLlmReq::getParentRequestId)
         .def_prop_ro("is_child", &GenLlmReq::isChild)
-        .def_prop_ro("cache_salt_id", &GenLlmReq::getCacheSaltID)
+        .def_prop_ro("cache_salt", &GenLlmReq::getCacheSalt)
         .def_prop_ro("kv_cache_retention_config", &GenLlmReq::getKvCacheRetentionConfig)
         .def_prop_ro("multimodal_hashes",
             [](GenLlmReq& self)
@@ -230,6 +239,36 @@ void initBindings(nb::module_& m)
                 if (self.getMultimodalLengths())
                 {
                     lengths = *self.getMultimodalLengths().value();
+                }
+                return lengths;
+            })
+        .def_prop_ro("multimodal_item_run_cu_offsets",
+            [](GenLlmReq& self)
+            {
+                std::optional<std::vector<GenLlmReq::SizeType32>> offsets = std::nullopt;
+                if (self.getMultimodalItemRunCuOffsets())
+                {
+                    offsets = *self.getMultimodalItemRunCuOffsets().value();
+                }
+                return offsets;
+            })
+        .def_prop_ro("multimodal_run_positions",
+            [](GenLlmReq& self)
+            {
+                std::optional<std::vector<GenLlmReq::SizeType32>> positions = std::nullopt;
+                if (self.getMultimodalRunPositions())
+                {
+                    positions = *self.getMultimodalRunPositions().value();
+                }
+                return positions;
+            })
+        .def_prop_ro("multimodal_run_lengths",
+            [](GenLlmReq& self)
+            {
+                std::optional<std::vector<GenLlmReq::SizeType32>> lengths = std::nullopt;
+                if (self.getMultimodalRunLengths())
+                {
+                    lengths = *self.getMultimodalRunLengths().value();
                 }
                 return lengths;
             })
@@ -276,7 +315,27 @@ void initBindings(nb::module_& m)
                     return std::optional<GenLlmReq::VecUniqueTokens>(*encoderUniqueTokens.value());
                 }
                 return std::optional<GenLlmReq::VecUniqueTokens>(std::nullopt);
-            });
+            })
+        // Encoder-decoder accessors for PyExecutor encoder iteration.
+        // ``encoder_tokens`` returns the source-side tokens used to drive the
+        // encoder forward.  ``encoder_output_len`` is the cross-KV capacity
+        // for the request (number of encoder hidden states the decoder
+        // cross-attention will read), which mirrors the C++
+        // ``getEncoderOutputLen`` contract.
+        // ``try_get_encoder_output_len`` exposes the same value as an
+        // optional probe for decoder-only scheduler paths.
+        .def_prop_ro("encoder_tokens",
+            [](GenLlmReq& self) -> std::optional<GenLlmReq::VecTokens>
+            {
+                auto const& encoderTokens = self.getEncoderTokens();
+                if (encoderTokens.has_value() && encoderTokens.value())
+                {
+                    return std::optional<GenLlmReq::VecTokens>(*encoderTokens.value());
+                }
+                return std::nullopt;
+            })
+        .def("try_get_encoder_output_len", &GenLlmReq::tryGetEncoderOutputLen)
+        .def_prop_ro("encoder_output_len", &GenLlmReq::getEncoderOutputLen);
 
     nb::class_<tb::LlmRequest, GenLlmReq>(m, "LlmRequest", nb::dynamic_attr())
         .def(
@@ -316,8 +375,12 @@ void initBindings(nb::module_& m)
                 std::optional<tb::LlmRequest::SizeType32> language_adapter_uid,
                 std::optional<tb::LlmRequest::MillisecondsType> allotted_time_ms,
                 std::optional<executor::ContextPhaseParams> context_phase_params,
-                std::optional<tb::LlmRequest::CacheSaltIDType> cache_salt_id,
-                std::optional<tb::LlmRequest::TimePoint> arrival_time)
+                std::optional<tb::LlmRequest::TimePoint> arrival_time,
+                std::optional<std::vector<std::tuple<std::string, int>>> agent_hierarchy,
+                std::optional<std::vector<tb::LlmRequest::SizeType32>> multimodal_item_run_cu_offsets,
+                std::optional<std::vector<tb::LlmRequest::SizeType32>> multimodal_run_positions,
+                std::optional<std::vector<tb::LlmRequest::SizeType32>> multimodal_run_lengths,
+                std::optional<std::string> cache_salt)
             {
                 auto makeOptionalTensor = [](std::optional<at::Tensor> const& atTensor, bool unsqueeze = false)
                 {
@@ -357,8 +420,9 @@ void initBindings(nb::module_& m)
                     encoder_input_tokens, return_encoder_output, client_id, priority, encoder_input_features_tensor_ptr,
                     encoder_output_length, cross_attention_mask_tensor_ptr, llm_request_type, input_token_extra_ids,
                     num_return_sequences, eagle_config, skip_cross_attn_blocks_tensor_ptr, return_perf_metrics,
-                    guided_decoding_params, language_adapter_uid, allotted_time_ms, context_phase_params, cache_salt_id,
-                    arrival_time};
+                    guided_decoding_params, language_adapter_uid, allotted_time_ms, context_phase_params, arrival_time,
+                    std::move(agent_hierarchy), multimodal_item_run_cu_offsets, multimodal_run_positions,
+                    multimodal_run_lengths, std::move(cache_salt)};
             },
             nb::arg("request_id"), nb::arg("max_new_tokens"), nb::arg("input_tokens"), nb::arg("sampling_config"),
             nb::arg("is_streaming"), nb::arg("end_id") = std::nullopt, nb::arg("pad_id") = std::nullopt,
@@ -384,8 +448,10 @@ void initBindings(nb::module_& m)
             nb::arg("eagle_config") = std::nullopt, nb::arg("skip_cross_attn_blocks") = std::nullopt,
             nb::arg("return_perf_metrics") = false, nb::arg("guided_decoding_params") = std::nullopt,
             nb::arg("language_adapter_uid") = std::nullopt, nb::arg("allotted_time_ms") = std::nullopt,
-            nb::arg("context_phase_params") = std::nullopt, nb::arg("cache_salt_id") = std::nullopt,
-            nb::arg("arrival_time") = std::nullopt)
+            nb::arg("context_phase_params") = std::nullopt, nb::arg("arrival_time") = std::nullopt,
+            nb::arg("agent_hierarchy") = std::nullopt, nb::arg("multimodal_item_run_cu_offsets") = std::nullopt,
+            nb::arg("multimodal_run_positions") = std::nullopt, nb::arg("multimodal_run_lengths") = std::nullopt,
+            nb::arg("cache_salt") = std::nullopt)
         .def("check_token_id_range", &tb::LlmRequest::checkTokenIdRange, nb::arg("vocab_size"))
         .def(nb::init<tb::LlmRequest const&>())
         .def("validate", &tb::LlmRequest::validate, nb::arg("max_input_len"), nb::arg("max_seq_len"),

@@ -45,7 +45,11 @@ void launchFusedQKNormRope(
     float high,   // threshold for low frequency
     float attention_factor, // attention_factor applied on cos and sin
     cudaStream_t stream,    // CUDA stream
-    bool is_qk_norm);
+    bool is_qk_norm,        // Whether to apply QK norm
+    bool use_gemma,         // Whether QK norm uses Gemma-style RMSNorm (scale by (1 + weight))
+    bool use_mrope,         // Whether to use interleaved mRoPE position selection
+    int mrope_section1,     // mrope_section[1] (height)
+    int mrope_section2);    // mrope_section[2] (width)
 
 } // namespace kernels
 

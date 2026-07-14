@@ -20,10 +20,11 @@ that safely handle large serialized objects by avoiding MPI's 32-bit
 count/displacement limits.
 
 Run with mpirun:
-    mpirun -n 2 python -m pytest tests/unittest/_torch/distributed/test_safe_allgather.py -v
+    mpirun -n 2 python -m pytest tests/unittest/_torch/distributed/test_safe_mpi_comm.py -v
 """
 
 import pickle
+from unittest.mock import patch
 
 import numpy as np
 import pytest
@@ -50,6 +51,56 @@ def get_mpi_comm():
     from mpi4py import MPI
 
     return MPI.COMM_WORLD
+
+
+# ---------------------------------------------------------------------------
+# CommSpy: transparent wrapper that counts MPI entry points while
+# forwarding all calls to the real communicator.
+# ---------------------------------------------------------------------------
+
+
+class CommSpy:
+    """Transparent MPI communicator wrapper that counts collective calls.
+
+    Every call is forwarded to the real communicator — this is
+    instrumentation, not mocking.  After calling safe_allgather /
+    safe_gather with a CommSpy, inspect the counters to verify the
+    exact number of MPI collectives used.
+    """
+
+    def __init__(self, comm):
+        self._comm = comm
+        # Buffer-based (uppercase) — expected entry points.
+        self.Allgather_count = 0
+        self.Allgatherv_count = 0
+        self.Gatherv_count = 0
+        # Python-level (lowercase) — should never be called by the
+        # new implementation.
+        self.allgather_count = 0
+        self.gather_count = 0
+
+    def Allgather(self, sendbuf, recvbuf):
+        self.Allgather_count += 1
+        return self._comm.Allgather(sendbuf, recvbuf)
+
+    def Allgatherv(self, sendbuf, recvbuf):
+        self.Allgatherv_count += 1
+        return self._comm.Allgatherv(sendbuf, recvbuf)
+
+    def Gatherv(self, sendbuf, recvbuf, root=0):
+        self.Gatherv_count += 1
+        return self._comm.Gatherv(sendbuf, recvbuf, root=root)
+
+    def allgather(self, obj):
+        self.allgather_count += 1
+        return self._comm.allgather(obj)
+
+    def gather(self, obj, root=0):
+        self.gather_count += 1
+        return self._comm.gather(obj, root=root)
+
+    def __getattr__(self, name):
+        return getattr(self._comm, name)
 
 
 # ---------------------------------------------------------------------------
@@ -272,6 +323,52 @@ class TestSafeAllgather:
             assert result[i]["rank"] == i
             assert result[i]["values"] == list(range(100))
 
+    def test_allgather_uses_exactly_two_collectives(self):
+        """Verify that safe_allgather uses exactly 2 MPI collectives for
+        small objects: 1 buffer-based Allgather (length exchange) +
+        1 Allgatherv (data transfer).  No Python-level (lowercase)
+        allgather should be called."""
+        spy = CommSpy(self.comm)
+        obj = {"rank": self.rank, "value": self.rank * 100}
+
+        result = communicator.safe_allgather(spy, obj)
+
+        # Correctness.
+        assert len(result) == self.world_size
+        for i in range(self.world_size):
+            assert result[i]["rank"] == i
+
+        # Exactly 2 buffer-based collectives.
+        assert spy.Allgather_count == 1, (
+            f"Expected 1 Allgather (lengths), got {spy.Allgather_count}"
+        )
+        assert spy.Allgatherv_count == 1, (
+            f"Expected 1 Allgatherv (data), got {spy.Allgatherv_count}"
+        )
+
+        # No Python-level (lowercase) collectives — these would mean
+        # redundant serialization and extra MPI ops.
+        assert spy.allgather_count == 0, (
+            f"Python-level allgather should not be called, got {spy.allgather_count}"
+        )
+
+    def test_allgather_serializes_once(self):
+        """Verify that safe_allgather calls pickle.dumps exactly once
+        (inside _serialize_and_exchange_lengths), not twice."""
+        spy = CommSpy(self.comm)
+        obj = {"rank": self.rank, "data": list(range(100))}
+
+        with patch(
+            "tensorrt_llm._torch.distributed.communicator.pickle.dumps",
+            wraps=pickle.dumps,
+        ) as mock_dumps:
+            result = communicator.safe_allgather(spy, obj)
+
+        assert len(result) == self.world_size
+        assert mock_dumps.call_count == 1, (
+            f"Expected 1 pickle.dumps call, got {mock_dumps.call_count}"
+        )
+
 
 # ---------------------------------------------------------------------------
 # Tests for the safe_gather free function
@@ -407,6 +504,58 @@ class TestSafeGather:
                 assert result[i] == expected
         else:
             assert result is None
+
+    def test_gather_uses_exactly_two_collectives(self):
+        """Verify that safe_gather uses exactly 2 MPI collectives for
+        small objects: 1 buffer-based Allgather (length exchange) +
+        1 Gatherv (data transfer).  No Python-level (lowercase)
+        gather/allgather should be called."""
+        spy = CommSpy(self.comm)
+        obj = {"rank": self.rank, "value": self.rank * 100}
+
+        result = communicator.safe_gather(spy, obj, root=0)
+
+        # Correctness.
+        if self.rank == 0:
+            assert len(result) == self.world_size
+            for i in range(self.world_size):
+                assert result[i]["rank"] == i
+        else:
+            assert result is None
+
+        # Exactly 2 buffer-based collectives.
+        assert spy.Allgather_count == 1, (
+            f"Expected 1 Allgather (lengths), got {spy.Allgather_count}"
+        )
+        assert spy.Gatherv_count == 1, f"Expected 1 Gatherv (data), got {spy.Gatherv_count}"
+
+        # No Python-level (lowercase) collectives.
+        assert spy.allgather_count == 0, (
+            f"Python-level allgather should not be called, got {spy.allgather_count}"
+        )
+        assert spy.gather_count == 0, (
+            f"Python-level gather should not be called, got {spy.gather_count}"
+        )
+
+    def test_gather_serializes_once(self):
+        """Verify that safe_gather calls pickle.dumps exactly once
+        (inside _serialize_and_exchange_lengths), not twice."""
+        spy = CommSpy(self.comm)
+        obj = {"rank": self.rank, "data": list(range(100))}
+
+        with patch(
+            "tensorrt_llm._torch.distributed.communicator.pickle.dumps",
+            wraps=pickle.dumps,
+        ) as mock_dumps:
+            result = communicator.safe_gather(spy, obj, root=0)
+
+        if self.rank == 0:
+            assert len(result) == self.world_size
+        else:
+            assert result is None
+        assert mock_dumps.call_count == 1, (
+            f"Expected 1 pickle.dumps call, got {mock_dumps.call_count}"
+        )
 
 
 # ---------------------------------------------------------------------------

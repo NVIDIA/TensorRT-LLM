@@ -1,9 +1,9 @@
 from copy import deepcopy
 
 import torch
+from _torch.helpers import make_hf_hybrid_cache_for_tests
 from transformers import Cohere2Config
 from transformers import Cohere2ForCausalLM as HFCohere2ForCausalLM
-from transformers.cache_utils import HybridCache
 
 import tensorrt_llm
 from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
@@ -161,8 +161,8 @@ class TestCohere2:
 
         # Initialize the hugging face model
         hf_cohere2 = HFCohere2ForCausalLM(cohere2_config).to(dtype).to(device).eval()
-        hf_cache = HybridCache(
-            config=cohere2_config,
+        hf_cache = make_hf_hybrid_cache_for_tests(
+            cohere2_config,
             max_batch_size=batch_size,
             max_cache_len=10,
             device=device,

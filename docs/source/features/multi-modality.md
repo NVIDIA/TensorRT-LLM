@@ -26,6 +26,16 @@ Further optimizations are under development and will be updated as they become a
 
 Please refer to the latest multimodal [support matrix](../models/supported-models.md#multimodal-feature-support-matrix-pytorch-backend).
 
+## Optional dependencies
+
+Video input decoding uses OpenCV (`cv2`) and is not installed by default. Install it only for models with video inputs:
+
+```bash
+pip install opencv-python-headless
+```
+
+Image-only and text-only workflows do not require this package.
+
 ## Examples
 
 The following examples demonstrate how to use TensorRT LLM's multimodal support in various scenarios, including quick run examples, serving endpoints, and performance benchmarking.

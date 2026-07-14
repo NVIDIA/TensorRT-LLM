@@ -91,6 +91,7 @@ _TORCH_TO_MLIR_DTYPE = {
     torch.float8_e4m3fn: Float8E4M3FNType,
     torch.float8_e5m2: Float8E5M2Type,
     torch.int8: lambda: IntegerType(8),
+    torch.uint8: lambda: IntegerType(8),  # NVFP4 packs FP4 into uint8 buffers
     torch.int16: lambda: IntegerType(16),
     torch.int32: lambda: IntegerType(32),
     torch.int64: lambda: IntegerType(64),
@@ -409,6 +410,26 @@ class AdCast(IRDLOperation):
 
 
 @irdl_op_definition
+class AdFloorDiv(IRDLOperation):
+    """Elementwise integer floor division by scalar — mirrors ``operator.floordiv``."""
+
+    name = "ad.floordiv"
+    input = operand_def(AnyAttr())
+    divisor = attr_def(IntegerAttr)
+    output = result_def(AnyAttr())
+
+
+@irdl_op_definition
+class AdEq(IRDLOperation):
+    """Elementwise equality comparison with scalar — mirrors ``operator.eq`` / ``torch.eq``."""
+
+    name = "ad.eq"
+    input = operand_def(AnyAttr())
+    value = attr_def(IntegerAttr)
+    output = result_def(AnyAttr())
+
+
+@irdl_op_definition
 class AdSplat(IRDLOperation):
     """Constant splat — creates a tensor filled with a scalar value."""
 
@@ -448,6 +469,8 @@ AD_OPS = [
     AdReduceSum,
     AdReduceMean,
     AdCast,
+    AdFloorDiv,
+    AdEq,
     AdSplat,
 ]
 

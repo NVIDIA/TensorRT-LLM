@@ -1,9 +1,26 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+import math
+
 import pytest
 import torch
 import torch.nn.functional as F
 from _torch_test_utils import fp4_compatible, fp8_compatible, trtllm_ops_available
 
 import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401
+from tensorrt_llm._torch.auto_deploy.utils.fp8_dequant import dequant_fp8_weight_two_dim_block_grid
 from tensorrt_llm._torch.auto_deploy.utils.quantization_utils import (
     fp4_global_scale,
     pack_int4_in_uint8,
@@ -452,3 +469,70 @@ def test_nvfp4_prequant_linear_wrapper_matches_direct_gemm(use_bias, input_dtype
     assert out_wrapped.shape == out_ref.shape
     assert out_wrapped.dtype == input_dtype
     torch.testing.assert_close(out_wrapped, out_ref, rtol=1e-3, atol=5e-3)
+
+
+# ---------------------------------------------------------------------------
+# FineGrained FP8 BF16-fallback dequant (dequant_fp8_weight_two_dim_block_grid)
+#
+# Regression coverage for the block-alignment bug: a coarse 128-block scale whose
+# weight dim is NOT a multiple of 128 (e.g. kv_a N=576) was expanded by
+# ceil(N/scale_n) (=116) instead of the canonical 128, mapping scales onto the
+# wrong rows. These are pure-tensor (CPU-ok) reference comparisons.
+# ---------------------------------------------------------------------------
+_FG_BLOCK = 128
+
+
+def _fg_make_block_scaled_weight(n, k):
+    """Random FP8 weight + a coarse 128-block scale of shape [ceil(N/128), ceil(K/128)]."""
+    weight = (torch.randn(n, k) * 0.1).to(torch.float8_e4m3fn)
+    scale = (torch.rand(math.ceil(n / _FG_BLOCK), math.ceil(k / _FG_BLOCK)) + 0.5).to(
+        torch.bfloat16
+    )
+    return weight, scale
+
+
+def _fg_reference_128_block(weight, scale):
+    """Ground truth: expand the block scale by the canonical 128 and clip to [N, K]."""
+    n, k = weight.shape
+    expanded = scale.repeat_interleave(_FG_BLOCK, dim=0).repeat_interleave(_FG_BLOCK, dim=1)[:n, :k]
+    return weight.to(torch.bfloat16) * expanded.to(torch.bfloat16)
+
+
+@pytest.mark.parametrize(
+    "n,k",
+    [
+        (576, 7168),  # kv_a: N not a 128-multiple (the regressing shape)
+        (192, 256),  # N not a 128-multiple
+        (256, 192),  # K not a 128-multiple
+        (256, 256),  # fully aligned (must stay correct)
+    ],
+)
+def test_finegrained_fp8_dequant_coarse_block_uses_canonical_128(n, k):
+    """A coarse 128-block scale must dequant exactly, even when N/K aren't 128-multiples."""
+    weight, scale = _fg_make_block_scaled_weight(n, k)
+    out = dequant_fp8_weight_two_dim_block_grid(weight, scale, _FG_BLOCK, _FG_BLOCK)
+    torch.testing.assert_close(out, _fg_reference_128_block(weight, scale), atol=0.0, rtol=0.0)
+
+
+def test_finegrained_fp8_dequant_differs_from_buggy_ceil_expansion():
+    """Lock in the fix: canonical-128 expansion must differ from the old ceil(N/scale_n) one."""
+    n, k = 576, 256  # ceil(576/5) = 116 != 128 -> old behavior was wrong
+    weight, scale = _fg_make_block_scaled_weight(n, k)
+    correct = dequant_fp8_weight_two_dim_block_grid(weight, scale, _FG_BLOCK, _FG_BLOCK)
+
+    buggy_block_n = math.ceil(n / scale.shape[0])
+    assert buggy_block_n != _FG_BLOCK
+    buggy_scale = scale.repeat_interleave(buggy_block_n, dim=0).repeat_interleave(_FG_BLOCK, dim=1)
+    buggy = weight.to(torch.bfloat16) * buggy_scale[:n, :k].to(torch.bfloat16)
+    assert not torch.allclose(correct, buggy), "fix must not reproduce the misaligned expansion"
+
+
+def test_finegrained_fp8_dequant_per_row_scale_expands_by_one():
+    """A per-row scale (scale_n == N) keeps the ceil path -> block_n == 1 (each row its own scale)."""
+    n, k = 72, 256
+    weight = (torch.randn(n, k) * 0.1).to(torch.float8_e4m3fn)
+    scale = (torch.rand(n, math.ceil(k / _FG_BLOCK)) + 0.5).to(torch.bfloat16)  # per-row along N
+    out = dequant_fp8_weight_two_dim_block_grid(weight, scale, _FG_BLOCK, _FG_BLOCK)
+    expanded = scale.repeat_interleave(1, dim=0).repeat_interleave(_FG_BLOCK, dim=1)[:n, :k]
+    expected = weight.to(torch.bfloat16) * expanded.to(torch.bfloat16)
+    torch.testing.assert_close(out, expected, atol=0.0, rtol=0.0)

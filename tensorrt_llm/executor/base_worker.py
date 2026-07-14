@@ -1,32 +1,45 @@
-import copy
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 import datetime
 import enum
+import gc
 import json
-import os
+import time
+import traceback
+import uuid
 import weakref
 from pathlib import Path
 from queue import Queue
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 
-import psutil
 import torch
 
 from tensorrt_llm.logger import logger
 
+from .._torch.pyexecutor.kv_cache_stats import append_kv_cache_iteration_stats
 from .._torch.pyexecutor.llm_request import LlmResponse
 from .._utils import (global_mpi_rank, global_mpi_size, mpi_comm, mpi_rank,
                       nvtx_range_debug)
 from ..bindings import executor as tllm
-from ..builder import ConfigEncoder, Engine, EngineConfig
-from ..llmapi.llm_args import BaseLlmArgs, PybindMirror
+from ..llmapi.llm_args import BaseLlmArgs, ExecutorMemoryType, PybindMirror
 from ..llmapi.tokenizer import TokenizerBase
 from ..llmapi.tracer import global_tracer
-from ..llmapi.utils import _SyncQueue, get_numa_aware_cpu_affinity, logger_debug
+from ..llmapi.utils import _SyncQueue, configure_cpu_affinity, logger_debug
 from ..lora_manager import LoraManager
-from ..metrics import RequestEventTiming
 from ..prompt_adapter_manager import PromptAdapterManager
 from ..runtime import ModelConfig
-from ..runtime.model_runner import _engine_config_to_model_config
 from ..sampling_params import BatchedLogitsProcessor, SamplingParams
 from .executor import GenerationExecutor, IterationResultQueue
 from .ipc import FusedIpcQueue, IpcQueue
@@ -34,7 +47,7 @@ from .postproc_worker import (PostprocParams, PostprocWorker,
                               PostprocWorkerConfig)
 from .request import GenerationRequest, LoRARequest, PromptAdapterRequest
 from .result import (GenerationResult, LogProbsResult, ResponseWrapper,
-                     compute_logprobs)
+                     compute_logprobs, get_metrics_dict)
 from .utils import (ErrorResponse, IntraProcessQueue, RequestError,
                     is_llm_response)
 
@@ -76,7 +89,7 @@ class BaseWorker(GenerationExecutor):
 
     def __init__(
         self,
-        engine: Union[Path, Engine],
+        engine: Path,
         executor_config: Optional[tllm.ExecutorConfig] = None,
         batched_logits_processor: Optional[BatchedLogitsProcessor] = None,
         postproc_worker_config: Optional[PostprocWorkerConfig] = None,
@@ -115,61 +128,14 @@ class BaseWorker(GenerationExecutor):
         self._backend = None if llm_args is None else llm_args.backend
         self._is_pytorch_backend = self._backend in ["pytorch", "_autodeploy"]
         self._lora_config = llm_args.lora_config if self._is_pytorch_backend else None
+        self._resource_governor_queue = None
 
         if global_mpi_size() > 1:
             logger.set_rank(self.global_rank)
 
-    def _configure_affinity(self, device_id):
-        '''Probe and configure the CPU affinity of the worker based on NUMA topology.
-
-        Args:
-            device_id: The CUDA device ID to determine optimal CPU affinity.
-
-        Note:
-            If the process already has constrained affinity, a warning is logged.
-            Configuration is handled as follows:
-                TLLM_NUMA_AWARE_WORKER_AFFINITY = <unset>
-                    -> Affinity is automatically configured if it is unconstrained,
-                       and deleted if it is constrained externally by the user.
-                TLLM_NUMA_AWARE_WORKER_AFFINITY = 1
-                    -> Affinity is unconditionally auto-configured.
-                TLLM_NUMA_AWARE_WORKER_AFFINITY = 0 or any other value
-                    -> Affinity is unconditionally _not_ auto-configured.
-        '''
-
-        # Get the current affinity setting
-        pid = os.getpid()
-        process = psutil.Process(pid)
-        cpu_affinity = process.cpu_affinity()
-
-        all_cpus = list(range(psutil.cpu_count()))
-
-        constrained_affinity = (cpu_affinity != all_cpus)
-        numa_aware_affinity = os.environ.get("TLLM_NUMA_AWARE_WORKER_AFFINITY")
-
-        # If affinity is constrained but the user hasn't explicitly
-        # requested NUMA-aware affinity, remove the constraints.
-        if constrained_affinity:
-            logger.warning(
-                f"Worker process {pid} is affined to run on the following CPUs: "
-                f"{cpu_affinity} (subset of all logical CPUs). This may harm "
-                f"performance if set incorrectly.")
-            if numa_aware_affinity is None:
-                logger.warning(
-                    f"Worker process {pid} has constrained CPU affinity "
-                    f"but `TLLM_NUMA_AWARE_WORKER_AFFINITY` is not set. "
-                    f"Removing CPU affinity constraints.")
-                process.cpu_affinity(all_cpus)
-
-        # If affinity is unconstrained and the user hasn't explicitly
-        # prohibited it or the user has explicitly requested it, choose the
-        # optimal affinity based upon the NUMA topology
-        if ((numa_aware_affinity is None and not constrained_affinity)
-                or (numa_aware_affinity == "1")):
-            process.cpu_affinity(get_numa_aware_cpu_affinity(device_id))
-            logger.info(
-                f"Worker process {pid} CPU affinity set to "
-                f"{process.cpu_affinity()} for optimal NUMA-aware scheduling.")
+    @property
+    def resource_governor_queue(self):
+        return self._resource_governor_queue
 
     def _get_comm_ranks_device_id(self):
         device_id = self.global_rank % torch.cuda.device_count()
@@ -179,7 +145,7 @@ class BaseWorker(GenerationExecutor):
         comm_ranks = mpi_comm().allgather(global_rank)
         device_ids = mpi_comm().allgather(device_id)
 
-        self._configure_affinity(device_id)
+        configure_cpu_affinity(device_id)
 
         return comm_ranks, device_ids
 
@@ -216,6 +182,9 @@ class BaseWorker(GenerationExecutor):
             else:
                 raise ValueError(f"Unsupported backend config: {self._backend}")
 
+            if self._resource_governor_queue is not None:
+                args["resource_governor_queue"] = self._resource_governor_queue
+
             # Define additional attributes that can be used later, such as in _deduce_max_tokens
             self.mapping = self.llm_args.parallel_config.to_mapping()
             self.checkpoint_loader = None
@@ -223,8 +192,12 @@ class BaseWorker(GenerationExecutor):
                 from tensorrt_llm._torch.pyexecutor.model_loader import \
                     _construct_checkpoint_loader
                 self.checkpoint_loader = _construct_checkpoint_loader(
-                    self.llm_args.backend, self.llm_args.checkpoint_loader,
-                    self.llm_args.checkpoint_format)
+                    self.llm_args.backend,
+                    self.llm_args.checkpoint_loader,
+                    self.llm_args.checkpoint_format,
+                    mx_config=self.llm_args.mx_config,
+                    mx_model_name=self.llm_args.model,
+                )
 
             self.max_seq_len = self.llm_args.max_seq_len
             # creare_py_executor may change some fields of llm_args
@@ -245,14 +218,6 @@ class BaseWorker(GenerationExecutor):
             executor_config.parallel_config = tllm.ParallelConfig(
                 participant_ids=comm_ranks, device_ids=device_ids)
 
-            if isinstance(engine, Engine):
-                return tllm.Executor(engine.engine,
-                                     json.dumps(engine.config.to_dict(),
-                                                cls=ConfigEncoder),
-                                     tllm.ModelType.DECODER_ONLY,
-                                     executor_config=executor_config,
-                                     managed_weights=engine.managed_weights)
-
             assert not hasattr(executor_config, "backend")
             return tllm.Executor(engine, tllm.ModelType.DECODER_ONLY,
                                  executor_config)
@@ -264,26 +229,6 @@ class BaseWorker(GenerationExecutor):
         self._lora_manager: Optional[LoraManager] = None
         self._prompt_adapter_manager: Optional[PromptAdapterManager] = None
         self._runtime_model_config: Optional[ModelConfig] = None
-        if self.rank == 0 and isinstance(self.engine, tllm.Executor):
-            if isinstance(self.engine, Engine):
-                engine_config = self.engine.config
-            else:
-                engine_config = EngineConfig.from_json_file(
-                    f"{self._engine}/config.json")
-            self._runtime_model_config = _engine_config_to_model_config(
-                engine_config)
-            if engine_config.build_config.plugin_config.lora_plugin:
-                # TODO(azuker): Passing peft cache manager to LoraManager is used for LoRA optimization
-                # (see LoraManager constructor docstring). Getting the peft cache manager from this
-                # point in the TRT flow is currently not supported (it's at the CPP
-                # Executor->ExecutorImpl->TrtGptModel->mPeftCacheManager) therefore for now this LoRA
-                # optimization is not available in TRT-python flow.
-                self._lora_manager = LoraManager(
-                    mapping=engine_config.pretrained_config.mapping,
-                    model_config=self._runtime_model_config,
-                    cpp_peft_cache_manager=None)
-            if engine_config.build_config.max_prompt_embedding_table_size > 0:
-                self._prompt_adapter_manager = PromptAdapterManager()
 
         if self._backend == "pytorch" and self._lora_config is not None:
             from tensorrt_llm._torch.pyexecutor.resource_manager import \
@@ -307,6 +252,16 @@ class BaseWorker(GenerationExecutor):
             return [(iter_stat, None, None) for iter_stat in iter_stats]
         else:
             return self.engine.get_latest_iteration_stats()
+
+    def fetch_kv_cache_capacity(self) -> dict:
+        if self.engine is None or isinstance(self.engine, tllm.Executor):
+            return {}
+
+        from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+        if isinstance(self.engine, PyExecutor):
+            return self.engine.get_kv_cache_capacity()
+
+        return {}
 
     def fetch_kv_cache_events(self) -> list:
         if isinstance(self.engine, tllm.Executor):
@@ -333,9 +288,11 @@ class BaseWorker(GenerationExecutor):
         it_result_queue.aqueue = None
 
     def return_queue(self, client_id: int):
-        """ If a centralized result queue is registered (used for communication with the proxy)
-            send the message there.
-            Otherwise, push the result directly in the GenerationResult queue.
+        """Return the queue used to deliver responses for ``client_id``.
+
+        If a centralized result queue is registered (used for communication
+        with the proxy) send the message there. Otherwise, push the result
+        directly in the GenerationResult queue.
         """
         if self.result_queue is not None:
             return self.result_queue
@@ -392,20 +349,47 @@ class BaseWorker(GenerationExecutor):
         assert request.id is not None
         py_lora_path = None
         if self._lora_manager is not None and request.lora_request is not None:
-            adapter_in_cache = self._lora_manager.is_adapter_in_cpu_cache(
-                request.lora_request.adapter_id)
-            self._load_lora_adapter(request.lora_request)
-            uid = str(request.lora_request.adapter_id)
-            lora_config = tllm.LoraConfig(
-                task_id=request.lora_request.adapter_id,
-                weights=self._lora_manager.cpp_lora_weights[uid]
-                if not adapter_in_cache else None,
-                config=self._lora_manager.cpp_lora_config[uid])
-            py_lora_path = request.lora_request.lora_path
+            try:
+                if self._is_pytorch_backend:
+                    # PyTorch backend: don't embed weights in the request.
+                    # Each rank loads independently from disk via py_lora_path
+                    # in PeftCacheManager.add_request_peft().
+                    # Pre-load on rank 0 to warm the LoRA manager cache so that
+                    # add_request_peft finds the adapter already loaded.
+                    self._load_lora_adapter(request.lora_request)
+                    uid = str(request.lora_request.adapter_id)
+                    lora_config = tllm.LoraConfig(
+                        task_id=request.lora_request.adapter_id,
+                        weights=None,
+                        config=self._lora_manager.cpp_lora_config[uid])
+                else:
+                    adapter_in_cache = self._lora_manager.is_adapter_in_cpu_cache(
+                        request.lora_request.adapter_id)
+                    self._load_lora_adapter(request.lora_request)
+                    uid = str(request.lora_request.adapter_id)
+                    lora_config = tllm.LoraConfig(
+                        task_id=request.lora_request.adapter_id,
+                        weights=self._lora_manager.cpp_lora_weights[uid]
+                        if not adapter_in_cache else None,
+                        config=self._lora_manager.cpp_lora_config[uid])
+                py_lora_path = request.lora_request.lora_path
+            except Exception as e:
+                raise RequestError(f"Failed to load LoRA adapter: {e}") from e
         else:
             lora_config = None
 
-        prompt_token_ids = copy.deepcopy(request.prompt_token_ids)
+        # prompt_token_ids stays list[int] for all consumers. If an int32 buffer
+        # rode along on the wire (GenerationRequest._prompt_token_ids_i32), hand
+        # THAT to the C++ Request ctor (memcpy) instead of the list -- this avoids
+        # the O(ISL) list copy + element-wise nanobind cast on the GIL-held submit
+        # thread. No buffer (in-process, or prompt-adapter prepend) -> list path.
+        # If both forms exist, they are assumed to describe the same token ids;
+        # in-place mutations of request.prompt_token_ids must clear the i32 buffer.
+        i32_buf = getattr(request, "_prompt_token_ids_i32", None)
+        if i32_buf is not None and request.prompt_adapter_request is None:
+            prompt_token_ids = i32_buf
+        else:
+            prompt_token_ids = list(request.prompt_token_ids)
         prompt_tuning_config = None
         if request.prompt_adapter_request is not None:
             self._load_prompt_adapter(request.prompt_adapter_request)
@@ -424,15 +408,8 @@ class BaseWorker(GenerationExecutor):
         if request.multimodal_params is not None and request.multimodal_params.has_content(
         ):
             if request.multimodal_params.multimodal_input is not None:
-                multimodal_input = tllm.MultimodalInput(
-                    multimodal_hashes=request.multimodal_params.
-                    multimodal_input.multimodal_hashes,
-                    multimodal_positions=request.multimodal_params.
-                    multimodal_input.multimodal_positions,
-                    multimodal_lengths=request.multimodal_params.
-                    multimodal_input.multimodal_lengths,
-                    multimodal_uuids=request.multimodal_params.multimodal_input.
-                    multimodal_uuids)
+                multimodal_input = request.multimodal_params.multimodal_input.to_binding(
+                    tllm)
             # NOTE: Setting to None here to avoid sending multimodal_input again through the 'py_multimodal_data' field
             request.multimodal_params.multimodal_input = None
 
@@ -556,21 +533,25 @@ class BaseWorker(GenerationExecutor):
                 request.sampling_params.logits_processor,
                 kv_cache_retention_config=request.kv_cache_retention_config,
                 context_phase_params=context_phase_params,
+                encoder_input_token_ids=request.encoder_input_token_ids,
                 type=request_type,
-                cache_salt_id=request.cache_salt_id,
                 disagg_request_id=disagg_request_id,
+                cache_salt=request.cache_salt,
                 priority=request.priority)
             executor_request.py_original_end_id = request.sampling_params.end_id
             executor_request.py_num_logprobs = request.sampling_params.logprobs
             executor_request.py_lora_path = py_lora_path
             executor_request.py_logprobs_mode = request.sampling_params.logprobs_mode
+            executor_request.py_logprobs_simple_format = (
+                request.sampling_params.logprobs_simple_format)
 
             # here we add executor_request.py_disaggregated_params= request.disaggregated_params for python cache transceiver
             if self._is_pytorch_backend and request.disaggregated_params is not None:
                 executor_request.py_disaggregated_params = request.disaggregated_params
             if self._is_pytorch_backend and request.multimodal_params is not None:
                 if request.multimodal_params.multimodal_data is not None:
-                    # NOTE: Deserialize SharedTensor handle to actual tensor
+                    # Resolve SharedTensorContainer dicts inside multimodal_data, including
+                    # E/P handoff embedding handles parked under "multimodal_embedding".
                     request.multimodal_params.to_tensor("multimodal_data")
                     executor_request.py_multimodal_data = request.multimodal_params.multimodal_data
 
@@ -584,6 +565,10 @@ class BaseWorker(GenerationExecutor):
             executor_request.py_scheduling_params = None
             if self._is_pytorch_backend and request.scheduling_params is not None:
                 executor_request.py_scheduling_params = request.scheduling_params
+
+            executor_request.py_conversation_params = None
+            if self._is_pytorch_backend and request.conversation_params is not None:
+                executor_request.py_conversation_params = request.conversation_params
 
             if request.arrival_time is not None:
                 executor_request.py_arrival_time = request.arrival_time
@@ -643,6 +628,341 @@ class BaseWorker(GenerationExecutor):
 
         return result
 
+    def _check_sleep_wakeup_preconditions(self, method: str) -> None:
+        """Validate preconditions shared by sleep() and wakeup().
+
+        Args:
+            method: Name of the calling method (``"sleep"`` or ``"wakeup"``)
+                used in error messages.
+
+        Raises:
+            ValueError: If the backend is not ``"pytorch"`` or
+                ``sleep_config`` is not set.
+        """
+        # _autodeploy is intentionally excluded: its allocations are not tagged
+        # under sleep_config VMM scopes, so release_with_tag would silently
+        # no-op instead of actually freeing GPU memory.  Use _backend directly
+        # rather than _is_pytorch_backend, which also covers _autodeploy.
+        if self._backend != "pytorch":
+            raise ValueError(
+                f"{method}() is only available for the PyTorch (TorchLLM) "
+                "backend.")
+        if self.llm_args is None or self.llm_args.sleep_config is None:
+            raise ValueError(
+                "Sleep feature is not enabled, please set sleep_config in "
+                "the LLM arguments.")
+
+    def _multi_rank_sleep_wakeup(
+        self,
+        action: str,
+        tags: list[ExecutorMemoryType],
+    ) -> None:
+        """Coordinate a sleep or wakeup operation across all MPI ranks.
+
+        Called on rank-0 only for ``world_size > 1`` deployments.
+
+        Sequence:
+        1. Enter ``control_action()`` to drain in-flight requests and pause
+           rank-0's event loop.  Non-rank-0 event loops become idle (starved
+           of NCCL collectives from rank-0) once the current iteration drains.
+        2. Send PREPARE to every non-rank-0 rank via the dedicated
+           ``_sleep_wakeup_comm`` communicator.  Peers quiesce and ACK without
+           changing VMM state.
+        3. Execute the VMM operation (``release_with_tag`` or
+           ``materialize_with_tag``) locally on rank-0.
+        4. Send COMMIT to prepared peers and collect ACKs after their local VMM
+           operations.  If PREPARE or rank-0 local execution fails, send ABORT
+           so peers leave the control barrier without changing VMM state.
+        5. Exit ``control_action()``, resuming rank-0's event loop.
+
+        Args:
+            action: ``"sleep"`` or ``"wakeup"``.
+            tags: Parsed :class:`~tensorrt_llm.llmapi.llm_args.ExecutorMemoryType`
+                values; forwarded verbatim to each rank's VMM call.
+        """
+        from tensorrt_llm._torch.pyexecutor.py_executor import (
+            _SLEEP_WAKEUP_ACK_TIMEOUT_S, _recv_sleep_wakeup_ack_until,
+            _SleepWakeupAction, _SleepWakeupTag)
+        from tensorrt_llm._torch.virtual_memory import (materialize_with_tag,
+                                                        release_with_tag)
+
+        if self.rank != 0:
+            raise RuntimeError(
+                "_multi_rank_sleep_wakeup must only be called on rank 0")
+
+        sleep_wakeup_comm = self.engine._sleep_wakeup_comm
+        if sleep_wakeup_comm is None:
+            raise RuntimeError(
+                "_sleep_wakeup_comm not initialised; was start_worker() called?"
+            )
+
+        world_size = self.llm_args.parallel_config.world_size
+        if world_size <= 1:
+            raise ValueError(
+                "_multi_rank_sleep_wakeup requires world_size greater than 1")
+
+        tag_strings = [t.value for t in tags]
+        op_id = uuid.uuid4().hex
+        target_action = _SleepWakeupAction(action)
+        prepare_msg = {
+            "action": _SleepWakeupAction.PREPARE,
+            "target_action": target_action,
+            "tags": tag_strings,
+            "op_id": op_id,
+        }
+        commit_msg = {
+            "action": _SleepWakeupAction.COMMIT,
+            "target_action": target_action,
+            "tags": tag_strings,
+            "op_id": op_id,
+        }
+
+        # Serialise concurrent sleep/wakeup calls.  control_action() uses an
+        # Event-based barrier, not a mutex, so two concurrent callers can both
+        # pass the barrier and then interleave sends/recvs on _sleep_wakeup_comm,
+        # consuming the wrong ACKs or resuming the event loop prematurely.
+        # _sleep_wakeup_lock turns the whole sequence into a critical section.
+        with self.engine._sleep_wakeup_lock, self.engine.control_action(
+                control_id=op_id):
+            prepared_ranks = []
+            errors = []
+            local_error = None
+            abort_sent = False
+
+            def send_abort(reason: str,
+                           ranks: Optional[list[int]] = None) -> list[int]:
+                abort_ranks = []
+                abort_dests = ranks if ranks is not None else range(
+                    1, world_size)
+                abort_msg = {
+                    "action": _SleepWakeupAction.ABORT,
+                    "tags": [],
+                    "op_id": op_id,
+                    "reason": reason,
+                }
+                for abort_dest in abort_dests:
+                    try:
+                        sleep_wakeup_comm.send(
+                            abort_msg,
+                            dest=abort_dest,
+                            tag=_SleepWakeupTag.ACTION,
+                        )
+                        abort_ranks.append(abort_dest)
+                    except Exception as abort_exc:
+                        abort_error = (
+                            "rank 0 failed to send sleep/wakeup abort "
+                            f"to rank {abort_dest}: {abort_exc}")
+                        errors.append(abort_error)
+                        logger.error(
+                            "_multi_rank_sleep_wakeup: %s",
+                            abort_error,
+                            exc_info=True,
+                        )
+                return abort_ranks
+
+            def drain_acks(ranks: list[int], phase: _SleepWakeupAction) -> None:
+                ack_deadline = time.monotonic() + _SLEEP_WAKEUP_ACK_TIMEOUT_S
+                for src in ranks:
+                    try:
+                        ack = _recv_sleep_wakeup_ack_until(sleep_wakeup_comm,
+                                                           src,
+                                                           ack_deadline,
+                                                           expected_op_id=op_id,
+                                                           expected_phase=phase)
+                    except Exception as exc:
+                        errors.append(
+                            f"rank 0 failed to receive {phase} ACK from "
+                            f"rank {src}: {exc}")
+                        logger.error(
+                            "_multi_rank_sleep_wakeup: failed to receive %s "
+                            "ACK from rank %d",
+                            phase,
+                            src,
+                            exc_info=True,
+                        )
+                        continue
+                    if ack.get("status") != "ok":
+                        errors.append(
+                            ack.get("error")
+                            or f"rank {src} returned unknown {phase} ACK")
+
+            try:
+                # Phase 1: prepare peers.  A prepared peer has reached the
+                # control barrier and synchronized CUDA, but has not modified
+                # VMM state yet.  This keeps send/local failures from leaving
+                # a subset of ranks slept/woken while rank 0 did not commit.
+                for dest in range(1, world_size):
+                    try:
+                        sleep_wakeup_comm.send(prepare_msg,
+                                               dest=dest,
+                                               tag=_SleepWakeupTag.ACTION)
+                        prepared_ranks.append(dest)
+                    except Exception as exc:
+                        send_error = (
+                            f"rank 0 failed to send '{action}' prepare to rank "
+                            f"{dest}: {exc}")
+                        errors.append(send_error)
+                        logger.error(
+                            "_multi_rank_sleep_wakeup: %s",
+                            send_error,
+                            exc_info=True,
+                        )
+                        abort_ranks = send_abort(send_error)
+                        abort_sent = True
+                        drain_acks(prepared_ranks, _SleepWakeupAction.PREPARE)
+                        drain_acks(abort_ranks, _SleepWakeupAction.ABORT)
+                        break
+
+                if not errors:
+                    drain_acks(prepared_ranks, _SleepWakeupAction.PREPARE)
+
+                if not errors:
+                    # Execute locally on rank-0.  Only CUDA/VMM errors are
+                    # captured as local_error. Peers are still prepared but
+                    # uncommitted, so local failure can abort them without
+                    # changing their VMM state.
+                    torch.cuda.synchronize()
+                    if action == _SleepWakeupAction.SLEEP:
+                        release_with_tag(*tags)
+                        torch.cuda.synchronize()
+                        gc.collect()
+                        torch.cuda.empty_cache()
+                    else:
+                        materialize_with_tag(*tags)
+                        torch.cuda.synchronize()
+            except (RuntimeError, torch.OutOfMemoryError) as exc:
+                local_error = (f"rank 0 '{action}' failed: {exc}\n"
+                               f"{traceback.format_exc()}")
+                logger.error(
+                    "_multi_rank_sleep_wakeup: rank-0 local %s failed:",
+                    action,
+                    exc_info=True,
+                )
+            finally:
+                if local_error:
+                    errors.append(local_error)
+
+                if errors and prepared_ranks and not abort_sent:
+                    abort_ranks = send_abort("\n".join(errors))
+                    drain_acks(abort_ranks, _SleepWakeupAction.ABORT)
+                elif not errors:
+                    commit_ranks = []
+                    commit_failed_ranks = []
+                    for dest in prepared_ranks:
+                        try:
+                            sleep_wakeup_comm.send(
+                                commit_msg,
+                                dest=dest,
+                                tag=_SleepWakeupTag.ACTION,
+                            )
+                            commit_ranks.append(dest)
+                        except Exception as exc:
+                            commit_error = (
+                                f"rank 0 failed to send '{action}' commit to "
+                                f"rank {dest}: {exc}")
+                            errors.append(commit_error)
+                            commit_failed_ranks.append(dest)
+                            logger.error(
+                                "_multi_rank_sleep_wakeup: %s",
+                                commit_error,
+                                exc_info=True,
+                            )
+                    if commit_failed_ranks:
+                        abort_ranks = send_abort("\n".join(errors),
+                                                 ranks=commit_failed_ranks)
+                        drain_acks(abort_ranks, _SleepWakeupAction.ABORT)
+                    drain_acks(commit_ranks, _SleepWakeupAction.COMMIT)
+
+                if errors:
+                    raise RuntimeError(
+                        f"{action}() failed on {len(errors)} rank(s):\n" +
+                        "\n".join(errors))
+
+    def sleep(self, sleep_tags: list[str]) -> None:
+        """Release GPU virtual memory for the specified memory type tags.
+
+        Supports both single-rank (``world_size == 1``) and multi-rank
+        (TP/PP > 1) MPI executor deployments.  For multi-rank, a lightweight
+        control-listener thread on each non-rank-0 worker handles the local
+        ``release_with_tag()`` call while rank-0 coordinates via a dedicated
+        secondary MPI communicator.
+
+        Uses ``PyExecutor.control_action()`` to drain in-flight requests and
+        pause rank-0's event loop, matching the ``@control_action_decorator``
+        behaviour used in the Ray executor.
+
+        Only allocations backed by virtual memory (VMM) and registered under
+        the active :class:`~tensorrt_llm.llmapi.llm_args.SleepConfig` are
+        released.  Components using alternative memory management (e.g.
+        ``LoadFormat.GMS``-managed weights) are not VMM-tagged and will be
+        silently skipped by ``release_with_tag``.
+
+        Args:
+            sleep_tags: List of
+                :class:`~tensorrt_llm.llmapi.llm_args.ExecutorMemoryType`
+                value strings (e.g. ``["kv_cache"]``).
+
+        Returns:
+            None.  The call is synchronous; when it returns all requested
+            VMM-tagged allocations have been released on every rank and the
+            event loop has been resumed.
+
+        Raises:
+            ValueError: If the backend is not ``"pytorch"`` or
+                ``sleep_config`` is not set.
+        """
+        self._check_sleep_wakeup_preconditions("sleep")
+
+        from tensorrt_llm._torch.virtual_memory import release_with_tag
+
+        tags = [ExecutorMemoryType(tag) for tag in sleep_tags]
+        logger.info(f"Sleep: {tags}")
+        if self.llm_args.parallel_config.world_size > 1:
+            self._multi_rank_sleep_wakeup("sleep", tags)
+        else:
+            with self.engine._sleep_wakeup_lock, self.engine.control_action():
+                torch.cuda.synchronize()
+                release_with_tag(*tags)
+                torch.cuda.synchronize()
+                gc.collect()
+                torch.cuda.empty_cache()
+
+    def wakeup(self, wakeup_tags: list[str]) -> None:
+        """Materialize GPU virtual memory for the specified memory type tags.
+
+        Supports both single-rank (``world_size == 1``) and multi-rank
+        (TP/PP > 1) MPI executor deployments.  See :meth:`sleep` for details
+        on VMM scope restrictions, backend prerequisites, and multi-rank
+        coordination.
+
+        Args:
+            wakeup_tags: List of
+                :class:`~tensorrt_llm.llmapi.llm_args.ExecutorMemoryType`
+                value strings (e.g. ``["kv_cache"]``).
+
+        Returns:
+            None.  The call is synchronous; when it returns all requested
+            VMM-tagged allocations have been materialized on every rank and the
+            event loop has been resumed.
+
+        Raises:
+            ValueError: If the backend is not ``"pytorch"`` or
+                ``sleep_config`` is not set.
+        """
+        self._check_sleep_wakeup_preconditions("wakeup")
+
+        from tensorrt_llm._torch.virtual_memory import materialize_with_tag
+
+        tags = [ExecutorMemoryType(tag) for tag in wakeup_tags]
+        logger.info(f"Wakeup: {tags}")
+        if self.llm_args.parallel_config.world_size > 1:
+            self._multi_rank_sleep_wakeup("wakeup", tags)
+        else:
+            with self.engine._sleep_wakeup_lock, self.engine.control_action():
+                torch.cuda.synchronize()
+                materialize_with_tag(*tags)
+                torch.cuda.synchronize()
+
     def shutdown(self):
         if self.doing_shutdown:
             return
@@ -659,20 +979,30 @@ class BaseWorker(GenerationExecutor):
             return {}
         return self.engine.kv_cache_transceiver.get_disaggregated_params()
 
-    # Define a Callable to join iteration and request stats
     @staticmethod
     def _stats_serializer(stats) -> str:
+        # Per-rank path: stats is ("per_rank_dict", {..., "rank": N}).
+        # Already serialized on the producing rank via allgather — just emit.
+        if (isinstance(stats, tuple) and len(stats) == 2
+                and stats[0] == "per_rank_dict"):
+            return json.dumps(stats[1])
+
         iteration_stats, req_stats = stats[0], stats[1]
         kv_iter_stats = stats[2] if len(stats) > 2 else None
+        attention_dp_rank = stats[3] if len(stats) > 3 else None
+        # Newer slots — guarded with len() checks so historical 4-tuples and
+        # any external code still appending the legacy shape keep working.
+        host_step_time_ms = stats[4] if len(stats) > 4 else None
+        prev_device_step_time_ms = stats[5] if len(stats) > 5 else None
+        scheduler_mode = stats[6] if len(stats) > 6 else None
+        gpu_forward_time_ms = stats[7] if len(stats) > 7 else None
 
         stats_dict = json.loads(iteration_stats.to_json_str())
-        # Tag with dp_rank=0 so Dynamo's adapter can always read
-        # stat["attentionDpRank"] without a missing-key branch. Attention-DP
-        # per-rank emission is a follow-up; today FPM only flows under
-        # non-attention-DP.
-        # TODO(https://jirasw.nvidia.com/browse/TRTLLM-12123): implement
-        # per-rank IterationStats delivery under attention-DP.
-        stats_dict.setdefault("attentionDpRank", 0)
+        # Always tag the row so Dynamo's adapter can read
+        # stat["attentionDpRank"] without a missing-key branch. Non-ADP stats
+        # default to rank 0; ADP stats carry the rank supplied by PyExecutor.
+        stats_dict["attentionDpRank"] = (0 if attention_dp_rank is None else
+                                         attention_dp_rank)
 
         if req_stats is not None and len(req_stats) > 0:
             stats_dict["requestStats"] = []
@@ -680,37 +1010,41 @@ class BaseWorker(GenerationExecutor):
                 stats_dict["requestStats"].append(
                     json.loads(req_stat.to_json_str()))
 
-        # Inject per-iteration KV cache stats (keyed by window size)
-        if kv_iter_stats is not None:
-            stats_dict["kvCacheIterationStats"] = {
-                str(window_size): {
-                    "primaryMaxNumBlocks": s.primary_max_num_blocks,
-                    "primaryFreeNumBlocks": s.primary_free_num_blocks,
-                    "primaryUsedNumBlocks": s.primary_used_num_blocks,
-                    "secondaryMaxNumBlocks": s.secondary_max_num_blocks,
-                    "secondaryFreeNumBlocks": s.secondary_free_num_blocks,
-                    "secondaryUsedNumBlocks": s.secondary_used_num_blocks,
-                    "iterAllocTotalBlocks": s.iter_alloc_total_blocks,
-                    "iterAllocNewBlocks": s.iter_alloc_new_blocks,
-                    "iterReusedBlocks": s.iter_reused_blocks,
-                    "iterFullReusedBlocks": s.iter_full_reused_blocks,
-                    "iterPartialReusedBlocks": s.iter_partial_reused_blocks,
-                    "iterMissedBlocks": s.iter_missed_blocks,
-                    "iterCacheHitRate": s.iter_cache_hit_rate,
-                    "iterGenAllocBlocks": s.iter_gen_alloc_blocks,
-                    "iterOnboardBlocks": s.iter_onboard_blocks,
-                    "iterOnboardBytes": s.iter_onboard_bytes,
-                    "iterOffloadBlocks": s.iter_offload_blocks,
-                    "iterOffloadBytes": s.iter_offload_bytes,
-                    "iterIntraDeviceCopyBlocks":
-                    s.iter_intra_device_copy_blocks,
-                    "iterIntraDeviceCopyBytes": s.iter_intra_device_copy_bytes,
-                }
-                for window_size, s in kv_iter_stats.items()
-            }
+        append_kv_cache_iteration_stats(stats_dict, kv_iter_stats)
+
+        # Per-loop CPU wall captured by profile_step() — always a clean
+        # single-loop measurement, matching the log line's `host_step_time`.
+        # Prefer this over iterLatencyMS when you need absolute per-loop
+        # CPU cost, especially under the overlap scheduler where
+        # iterLatencyMS measures the batch's full lifecycle (~2 loops).
+        if host_step_time_ms is not None:
+            stats_dict["hostStepTimeMS"] = host_step_time_ms
+        # GPU forward time read via the ping-pong CUDA event pair in
+        # profile_step(). Note the "prev" in the name: under steady state
+        # the value lags its sibling host_step_time on the same record by
+        # one loop (the event-pair being read corresponds to the loop
+        # before the one host_step_time describes). See the ping-pong
+        # comment in PyExecutor._profiler for the design rationale.
+        if prev_device_step_time_ms is not None:
+            stats_dict["prevDeviceStepTimeMS"] = prev_device_step_time_ms
+        # Batch-matched GPU forward time measured from the CUDA events around
+        # this record's _forward_step. This is the preferred field for
+        # ForwardPassMetrics wall_time.
+        if gpu_forward_time_ms is not None:
+            stats_dict["gpuForwardTimeMS"] = gpu_forward_time_ms
+        # Scheduler mode for this record. "overlap" means iterLatencyMS
+        # spans ~2 loops (use hostStepTimeMS for clean per-loop cost);
+        # "non_overlap" means iterLatencyMS is itself the clean per-loop
+        # CPU wall. Set per-record so consumers do not need server config.
+        if scheduler_mode is not None:
+            stats_dict["schedulerMode"] = scheduler_mode
 
         # Convert back to JSON string
         return json.dumps(stats_dict)
+
+    @staticmethod
+    def _kv_cache_capacity_serializer(capacity) -> str:
+        return json.dumps(capacity)
 
     # Define a Callable to serialize KV cache events
     @staticmethod
@@ -779,8 +1113,19 @@ class AwaitResponseHelper:
     def __call__(self, timeout: Optional[float] = None) -> bool:
         ''' This method should be called by a ManagedThread. '''
         timeout = timeout or 0.1
-        responses = self.worker.engine.await_responses(
-            timeout=datetime.timedelta(seconds=timeout))
+        try:
+            responses = self.worker.engine.await_responses(
+                timeout=datetime.timedelta(seconds=timeout))
+        except Exception as e:
+            # Defensive: with id=None, PyExecutor.await_responses routes
+            # to _await_any_response, which does not raise on event-loop
+            # crash — it returns [] silently and we detect the crash
+            # via engine._event_loop_error after this block. But any
+            # unexpected exception out of await_responses (e.g. from a
+            # different engine implementation, or a future change to
+            # _await_any_response) is also a clear signal to broadcast
+            # and stop the thread.
+            return self._broadcast_event_loop_error(e)
         # filter since The _engine_response_callback may return None
         responses = list(
             filter(
@@ -795,7 +1140,80 @@ class AwaitResponseHelper:
                               color="red",
                               category="Worker"):
             self.responses_handler(responses)
+
+        # Even when await_responses returned normally (e.g. via
+        # _await_any_response, whose predicate already includes
+        # is_shutdown but does not raise), an event-loop crash leaves
+        # _event_loop_error stashed on the engine. Broadcast and stop the
+        # thread in that case too — see nvbug 6038228.
+        error = getattr(self.worker.engine, "_event_loop_error", None)
+        if error is not None:
+            return self._broadcast_event_loop_error(error)
         return True
+
+    def _broadcast_event_loop_error(self, error: BaseException) -> bool:
+        """Wake every pending ``GenerationResult`` after an event-loop crash.
+
+        Inject an ``ErrorResponse`` into every pending ``GenerationResult``
+        queue so callers parked in ``queue.get()`` / ``aqueue.get()``
+        (``LLM.generate``, ``generate_async`` + ``aresult``,
+        ``trtllm-bench``) wake up with a meaningful error instead of
+        hanging when the PyExecutor event loop dies.
+
+        Returns ``False`` so the calling ``ManagedThread`` exits — there
+        is no point polling a dead engine.
+
+        Scope: single-process worker (the path that backs ``LLM.generate``
+        and the bench async client). The IPC / proxy path tracks pending
+        results on a different side of the boundary and would need a
+        separate poison-pill on ``self.worker.result_queue``; that is left
+        as a follow-up consistent with the PyExecutor-side fix.
+        """
+        error_msg = f"Event loop terminated with error: {error}"
+        pending_client_ids = list(self.worker._results.keys())
+        if not pending_client_ids:
+            logger.error(
+                f"Event-loop error with no pending results to wake: {error}")
+            return False
+
+        logger.error(
+            f"Broadcasting event-loop error to {len(pending_client_ids)} "
+            f"pending request(s): {error}")
+
+        event_loop = None
+        async_queues: List[_SyncQueue] = []
+        for client_id in pending_client_ids:
+            try:
+                queue = self.worker.return_queue(client_id)
+            except KeyError:
+                continue
+            err_resp = ErrorResponse(
+                client_id=client_id,
+                error_msg=error_msg,
+                request_id=client_id,
+            )
+            try:
+                if isinstance(queue, _SyncQueue):
+                    queue.put_nowait(err_resp)
+                    async_queues.append(queue)
+                    event_loop = event_loop or queue.loop
+                else:
+                    queue.put(err_resp)
+            except Exception as put_error:
+                logger.error(f"Failed to push ErrorResponse for client_id="
+                             f"{client_id}: {put_error}")
+                continue
+            self.worker._pop_result(client_id)
+
+        if async_queues:
+            try:
+                _SyncQueue.notify_many(event_loop, async_queues)
+            except Exception as notify_error:
+                logger.error(
+                    f"Failed to notify async queues on event-loop error: "
+                    f"{notify_error}")
+
+        return False
 
     def handle_for_worker(self, responses: List[tllm.Response]) -> None:
         ''' Return the responses to asyncio.event_loop. '''
@@ -899,9 +1317,15 @@ def _compute_pytorch_prompt_logprobs(
     prompt_token_ids = generation_result._generation_request.prompt_token_ids[
         1:] + first_generation_token
 
-    logprobs_result = compute_logprobs(logprob_params.prompt_logprobs, None,
-                                       context_logits, None, None,
-                                       prompt_token_ids)
+    logprobs_result = compute_logprobs(
+        logprob_params.prompt_logprobs,
+        None,
+        context_logits,
+        None,
+        None,
+        prompt_token_ids,
+        simple_prompt_logprobs=logprob_params.prompt_logprobs_simple_format,
+    )
     if generation_result._streaming:
         generation_result._cached_prompt_logprobs = logprobs_result.prompt
 
@@ -940,11 +1364,15 @@ def _get_logprobs(worker,
                 return logprobs_result
 
         # TRT backend: compute both prompt and generation logprobs from logits
-        logprobs_result = compute_logprobs(logprob_params.prompt_logprobs,
-                                           logprob_params.logprobs,
-                                           response.result.context_logits,
-                                           response.result.generation_logits,
-                                           response.result.output_token_ids[0])
+        logprobs_result = compute_logprobs(
+            logprob_params.prompt_logprobs,
+            logprob_params.logprobs,
+            response.result.context_logits,
+            response.result.generation_logits,
+            response.result.output_token_ids[0],
+            simple_prompt_logprobs=logprob_params.prompt_logprobs_simple_format,
+            simple_logprobs=logprob_params.logprobs_simple_format,
+        )
 
         if logprob_params.drop_context_logits:
             response.clear_context_logits()
@@ -1006,47 +1434,13 @@ def _send_rsp(
         raise ValueError(f"Unknown response type: {response}")
 
 
-def _get_metrics_dict(
-        response: tllm.Response) -> dict[RequestEventTiming, float]:
-    req_perf_metrics, metrics_dict = None, {}
-    res = response.result
-    if res:
-        if hasattr(res, '_result'):
-            if result := res.get_result():
-                req_perf_metrics = result.request_perf_metrics
-        else:
-            req_perf_metrics = res.request_perf_metrics
-        if req_perf_metrics and req_perf_metrics.timing_metrics:
-            metrics_dict = {
-                RequestEventTiming.ARRIVAL_TIME:
-                req_perf_metrics.timing_metrics.arrival_time.total_seconds(),
-                RequestEventTiming.FIRST_TOKEN_TIME:
-                req_perf_metrics.timing_metrics.first_token_time.total_seconds(
-                ),
-                RequestEventTiming.FIRST_SCHEDULED_TIME:
-                req_perf_metrics.timing_metrics.first_scheduled_time.
-                total_seconds(),
-                RequestEventTiming.LAST_TOKEN_TIME:
-                req_perf_metrics.timing_metrics.last_token_time.total_seconds(),
-                RequestEventTiming.KV_CACHE_TRANSFER_START:
-                req_perf_metrics.timing_metrics.kv_cache_transfer_start.
-                total_seconds(),
-                RequestEventTiming.KV_CACHE_TRANSFER_END:
-                req_perf_metrics.timing_metrics.kv_cache_transfer_end.
-                total_seconds(),
-                RequestEventTiming.KV_CACHE_SIZE:
-                req_perf_metrics.timing_metrics.kv_cache_size,
-            }
-    return metrics_dict
-
-
 def _maybe_wrap_response(
         worker,
         response: tllm.Response,
         is_pytorch_backend=False) -> Union[tllm.Response, ResponseWrapper]:
 
     logprobs_result = _get_logprobs(worker, response, is_pytorch_backend)
-    req_perf_metrics = _get_metrics_dict(response)
+    req_perf_metrics = get_metrics_dict(response)
     if logprobs_result or req_perf_metrics:
         response = ResponseWrapper(response, logprobs_result, req_perf_metrics)
     return response

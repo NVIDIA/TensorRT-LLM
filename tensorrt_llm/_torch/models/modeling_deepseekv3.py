@@ -53,13 +53,14 @@ from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
 from ..distributed import (AllReduce, AllReduceFusionOp, AllReduceParams,
                            MoEAllReduce, MoEAllReduceParams, allgather)
 from ..model_config import ModelConfig
-from ..modules.attention import (MLA, maybe_allgather_for_helix_cp,
+from ..modules.attention import (maybe_allgather_for_helix_cp,
                                  maybe_slice_for_helix_cp)
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.fused_moe import (DeepSeekV3MoeRoutingMethod, MoE,
                                  MoEWeightLoadingMode, create_moe)
 from ..modules.fused_moe.fused_moe_wide_ep import WideEPMoE
+from ..modules.mla import MLA
 
 # isort: off
 from ..modules.fused_moe.routing import Deepseekv3RoutingImpl
@@ -334,6 +335,26 @@ class DeepseekV3WeightLoader:
         # Check if weights supports mark_consumed (ConsumableWeightsDict)
         can_mark_consumed = hasattr(weights, 'mark_consumed')
 
+        # The pretrained_config's num_nextn_predict_layers may have been expanded
+        # by ModelLoader._load_and_validate_config to match user max_draft_len.
+        # The original checkpoint MTP layer count (used for mod-indexing) is
+        # preserved as `_ckpt_num_nextn_predict_layers`.
+        ckpt_num_nextn_predict_layers = (
+            getattr(self.config, '_ckpt_num_nextn_predict_layers', None)
+            or getattr(self.config, 'num_nextn_predict_layers', None))
+
+        def detect_shared_mtp_weights() -> bool:
+            # Detect if MTP layers share checkpoint weights (model has more MTP
+            # layer instances than the checkpoint provides). In this case,
+            # multiple model MTP layers map to the same checkpoint layer via
+            # modulo, and mark_consumed must be skipped to avoid deleting
+            # weights that later MTP layers still need.
+            model_nextn = getattr(self.config, 'num_nextn_predict_layers',
+                                  None) or 0
+            return model_nextn > (ckpt_num_nextn_predict_layers or 0) > 0
+
+        has_shared_mtp_weights = detect_shared_mtp_weights()
+
         for name, module in tqdm(all_named_modules.items(),
                                  desc="Loading weights"):
             if len(module._parameters) <= 0 or name.startswith("draft_model"):
@@ -343,14 +364,17 @@ class DeepseekV3WeightLoader:
             else:
                 names = name.split('.')
                 parent_module_name = '.'.join(names[:-1])
+                is_shared_mtp_layer = False
                 if "model.layers" in name and int(
                         names[2]) >= self.config.num_hidden_layers:
+                    is_shared_mtp_layer = has_shared_mtp_weights
                     mtp_layer_idx = int(
                         names[2]) - self.config.num_hidden_layers
                     names[2] = str(mtp_layer_idx %
-                                   self.config.num_nextn_predict_layers +
+                                   ckpt_num_nextn_predict_layers +
                                    self.config.num_hidden_layers)
                     name = '.'.join(names)
+                mark_consumed = can_mark_consumed and not is_shared_mtp_layer
                 if names[-1] == "kv_b_proj":
                     # TODO: remove weight_dequant after enabling fp8_bmm
                     dequant_kv_b_proj = self.model_config.quant_config.is_module_excluded_from_quantization(
@@ -410,7 +434,7 @@ class DeepseekV3WeightLoader:
                                 ).view(*attn_module.v_b_proj_dequant.shape).to(
                                     attn_module.v_b_proj_dequant.dtype))
                     # Mark consumed kv_b_proj weights
-                    if can_mark_consumed:
+                    if mark_consumed:
                         weights.mark_consumed(name)
                 elif names[-1] == "kv_a_proj_with_mqa":
                     nvfp4_fused_a = self.model_config.get_quant_config(
@@ -419,8 +443,8 @@ class DeepseekV3WeightLoader:
                     # Non-lite models (V3, R1, V3.2) fuse q_a_proj into
                     # kv_a_proj_with_mqa, so both must be NVFP4 for the fused
                     # path. Lite models (V3-Lite) have no q_a_proj.
-                    if not is_lite:
-                        nvfp4_fused_a &= weights[
+                    if not is_lite and nvfp4_fused_a:
+                        nvfp4_fused_a = weights[
                             f"{'.'.join(names[:-1])}.q_a_proj.weight"].dtype == fp4_utils.float4_e2m1x2
                     if nvfp4_fused_a:
                         ########### input_scale
@@ -535,7 +559,7 @@ class DeepseekV3WeightLoader:
                                 0:fused_a_scale.shape[0]].copy_(fused_a_scale)
                         module.weight.data[0:fused_a.shape[0]].copy_(fused_a)
                     # Mark consumed kv_a_proj_with_mqa and q_a_proj weights
-                    if can_mark_consumed:
+                    if mark_consumed:
                         parent_prefix = '.'.join(names[:-1])
                         weights.mark_consumed(
                             f"{parent_prefix}.kv_a_proj_with_mqa")
@@ -549,7 +573,7 @@ class DeepseekV3WeightLoader:
                                            weights))
                     module.load_weights(weights=module_weights)
                     # Mark consumed source weights (e.g., gate_proj, up_proj)
-                    if can_mark_consumed:
+                    if mark_consumed:
                         for src_name in params_map[names[-1]]:
                             weights.mark_consumed('.'.join(names[:-1] +
                                                            [src_name]))
@@ -562,7 +586,7 @@ class DeepseekV3WeightLoader:
                     })
                     module.load_weights(weights=[module_weights])
                     # Mark consumed experts weights
-                    if can_mark_consumed:
+                    if mark_consumed:
                         weights.mark_consumed(name)
                 elif names[-1] == "backend" and isinstance(module, MoE):
                     # Special case: ConfigurableMoE.backend (TRTLLMGenFusedMoE)
@@ -580,7 +604,7 @@ class DeepseekV3WeightLoader:
                     })
                     module.load_weights(weights=[module_weights])
                     # Mark consumed MoE weights using parent name
-                    if can_mark_consumed:
+                    if mark_consumed:
                         weights.mark_consumed(parent_name)
                 elif names[-1] == "self_attn":
                     continue
@@ -594,7 +618,7 @@ class DeepseekV3WeightLoader:
                         for n, p in module.named_parameters():
                             p.data.copy_(module_weights[n][:])
                     # Mark consumed weights
-                    if can_mark_consumed:
+                    if mark_consumed:
                         weights.mark_consumed(name)
 
 
@@ -833,7 +857,6 @@ class DeepseekV3Gate(nn.Module):
             bias_dtype = torch.bfloat16
         else:
             bias_dtype = torch.float32
-
         self.e_score_correction_bias = nn.Parameter(torch.empty(
             (num_experts), dtype=bias_dtype),
                                                     requires_grad=False)
@@ -869,13 +892,20 @@ class DeepseekV3Gate(nn.Module):
                 out_dtype=torch.float32)
         return logits
 
-    def load_weights(self, weights: List[Dict]):
+    def load_weights(self,
+                     weights: List[Dict],
+                     allow_partial_loading: bool = False):
         assert len(weights) == 1
-
-        self.weight.copy_(weights[0]["weight"][:])
-
-        self.e_score_correction_bias.copy_(
-            weights[0]["e_score_correction_bias"][:].to(
+        w = weights[0].get("weight")
+        bias = weights[0].get("e_score_correction_bias")
+        if not allow_partial_loading:
+            assert w is not None and bias is not None, (
+                "DeepseekV3Gate expects 'weight' and 'e_score_correction_bias' "
+                "when partial loading is disabled")
+        if w is not None:
+            self.weight.copy_(w[:])
+        if bias is not None:
+            self.e_score_correction_bias.copy_(bias[:].to(
                 self.e_score_correction_bias.dtype))
 
     @property
@@ -1520,17 +1550,29 @@ class DeepseekV3DecoderLayer(DecoderLayer):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
 
         if self.fusion_config.PRE_MLP_FUSION:
-            act_fp4, act_sf, residual = self.allreduce(
-                hidden_states,
-                all_reduce_params=AllReduceParams(
-                    fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4,
-                    residual=residual,
-                    norm_weight=self.post_attention_layernorm.weight,
-                    scale=self.mlp.gate_up_proj.input_scale,
-                    eps=self.post_attention_layernorm.variance_epsilon,
-                ),
-            )
-            hidden_states = Fp4QuantizedTensor(act_fp4, act_sf)
+            if self.mlp.gate_up_proj.has_nvfp4:
+                act_fp4, act_sf, residual = self.allreduce(
+                    hidden_states,
+                    all_reduce_params=AllReduceParams(
+                        fusion_op=AllReduceFusionOp.
+                        RESIDUAL_RMS_NORM_QUANT_NVFP4,
+                        residual=residual,
+                        norm_weight=self.post_attention_layernorm.weight,
+                        scale=self.mlp.gate_up_proj.input_scale,
+                        eps=self.post_attention_layernorm.variance_epsilon,
+                    ),
+                )
+                hidden_states = Fp4QuantizedTensor(act_fp4, act_sf)
+            else:
+                hidden_states, residual = self.allreduce(
+                    hidden_states,
+                    all_reduce_params=AllReduceParams(
+                        fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
+                        residual=residual,
+                        norm_weight=self.post_attention_layernorm.weight,
+                        eps=self.post_attention_layernorm.variance_epsilon,
+                    ),
+                )
         else:
             # No fusion
             # We need to add twoshot allreduce here to avoid modifying MLA logic
@@ -1836,8 +1878,12 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
         self.model_nextn = 0
         if model_config.spec_config is not None and model_config.spec_config.spec_dec_mode.is_mtp_one_model(
         ):
-            model_nextn = model_config.spec_config.num_nextn_predict_layers
-            ckpt_nextn = self.config.num_nextn_predict_layers
+            model_nextn = self.config.num_nextn_predict_layers
+            # When MTP layers share checkpoint weights (vanilla MTP with
+            # max_draft_len > ckpt MTP count), the original checkpoint count is
+            # preserved on pretrained_config; otherwise it equals num_nextn.
+            ckpt_nextn = (getattr(self.config, '_ckpt_num_nextn_predict_layers',
+                                  None) or self.config.num_nextn_predict_layers)
             self.num_hidden_layers = self.config.num_hidden_layers
             assert ckpt_nextn > 0, "There is not MTP modules in the checkpoint."
             if ckpt_nextn == 1 and not model_config.spec_config.use_mtp_vanilla:
@@ -1895,7 +1941,7 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
         weight_loader = DeepseekV3WeightLoader(self)
         weight_loader.load_weights(weights)
 
-    def post_load_weights(self):
+    def setup_aliases(self) -> None:
         for idx, layer in enumerate(
                 self.model.layers[:self.config.num_hidden_layers]):
             if idx == self.config.num_hidden_layers - 1:
@@ -1903,47 +1949,3 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
             else:
                 layer.next_layer_layernorm = self.model.layers[
                     idx + 1].input_layernorm
-
-
-@register_auto_model("KimiK25ForConditionalGeneration")
-class KimiK25ForConditionalGeneration(DeepseekV3ForCausalLM):
-    """Kimi-K2.5 multimodal model (text-only path).
-
-    Extracts the DeepSeek-V3 text backbone from the composite config
-    and strips the ``language_model.`` weight prefix so that the
-    standard DeepseekV3ForCausalLM loading path works unchanged.
-
-    NOTE: Kimi-K2.5's text backbone sets ``num_nextn_predict_layers = 0``,
-    so MTP-based speculative decoding is not applicable to this model.
-    """
-
-    _LANG_PREFIX = "language_model."
-
-    def __init__(self, model_config: ModelConfig[PretrainedConfig]):
-        model_config = copy.copy(model_config)
-        assert hasattr(model_config.pretrained_config, 'text_config'), \
-            "Kimi K2.5 config must have text_config"
-        model_config._frozen = False
-        model_config.pretrained_config = model_config.pretrained_config.text_config
-        if model_config.quant_config.exclude_modules:
-            model_config.quant_config = copy.copy(model_config.quant_config)
-            p = self._LANG_PREFIX
-            mapped = []
-            for m in model_config.quant_config.exclude_modules:
-                if m.startswith(p):
-                    rest = m[len(p):]
-                    if rest.startswith('layers.'):
-                        rest = 'model.' + rest
-                    mapped.append(rest)
-                else:
-                    mapped.append(m)
-            model_config.quant_config.exclude_modules = mapped
-        model_config._frozen = True
-        super().__init__(model_config)
-
-    def load_weights(self, weights: ConsumableWeightsDict):
-        has_prefix = any(k.startswith("language_model.") for k in weights)
-        if has_prefix:
-            weights = filter_weights("language_model", weights)
-            weights = ConsumableWeightsDict(weights)
-        super().load_weights(weights)

@@ -44,8 +44,6 @@ environment:
   server_env_var: "TRTLLM_SERVER_DISABLE_GC=1"
 profiling:
   nsys_on: false
-accuracy:
-  enable_accuracy_test: false
 worker_config:
   gen:
     print_iter_log: true
@@ -72,6 +70,7 @@ worker_config:
     cache_transceiver_config:
       max_tokens_in_buffer: 120000
       backend: NIXL
+      kv_transfer_timeout_ms: 600000
     num_postprocess_workers: 8
     stream_interval: 10
   ctx:
@@ -99,3 +98,4 @@ worker_config:
     cache_transceiver_config:
       max_tokens_in_buffer: 120000
       backend: NIXL
+      kv_transfer_timeout_ms: 600000

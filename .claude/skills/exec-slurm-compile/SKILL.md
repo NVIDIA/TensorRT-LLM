@@ -25,7 +25,7 @@ The official Docker image tag for a given TensorRT-LLM version is recorded in th
 <repo_dir>/jenkins/current_image_tags.properties
 ```
 
-Read this file to find the current image URL (e.g., `urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:pytorch-25.12-py3-aarch64-ubuntu24.04-trt10.14.1.48-skip-tritondevel-202602011118-10901`).
+Read this file to find the current image URL. The format is `<registry-host>/<namespace>/tensorrt-llm:<tag>`, for example `<your-registry>/<your-namespace>/tensorrt-llm:pytorch-25.12-py3-aarch64-ubuntu24.04-trt10.14.1.48-skip-tritondevel-202602011118-10901`. Substitute `<your-registry>` and `<your-namespace>` with your own container registry coordinates.
 
 
 ## Pre-dumping the Container Image (enroot import)
@@ -59,7 +59,7 @@ The script submits an `sbatch` job that runs `enroot import docker://<image_url>
    cd <directory_where_sqsh_should_be_stored>
    <path_to>/enroot-import --partition cpu_datamover --debug <image_url>
    ```
-   **IMPORTANT:** Convert `urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:xxx` to `urm.nvidia.com#sw-tensorrt-docker/tensorrt-llm:xxx` to avoid credential issues.
+   **IMPORTANT:** Replace the first `/` after the registry host with `#` to avoid credential issues. For example, `<your-registry>/<your-namespace>/tensorrt-llm:xxx` becomes `<your-registry>#<your-namespace>/tensorrt-llm:xxx`.
 3. Wait for the import job to complete (`squeue -j <job_id>`).
 4. The resulting `.sqsh` file is the `container_image` used in the compile step.
 
@@ -209,7 +209,7 @@ A successful build ends with a message like `Successfully built tensorrt_llm` or
 | `-a "100-real"` | Target architecture — `100` for Blackwell, `90` for Hopper, etc. |
 | `--nvtx` | Enable NVTX markers for profiling |
 | `--no-venv` | Skip virtual environment creation |
-| `-ccache` | Use ccache to speed up recompilation |
+| `--use_ccache` | Use ccache to speed up recompilation |
 | `--skip_building_wheel` | Build in-place without creating a wheel file |
 | `-f` | Fast build — skip some kernels for faster dev compilation |
 | `-c` | Clean build — wipe build directory before building |

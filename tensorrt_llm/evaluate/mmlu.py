@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2020 Dan Hendrycks
 # SPDX-FileCopyrightText: Copyright (c) 2023 Deep Cognition and Language Research (DeCLaRe) Lab
-# SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0 and MIT
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -17,14 +17,13 @@
 
 import json
 import math
-from typing import Any, Iterable, List, Optional, Union
+from typing import Any, Iterable, List, Optional
 
 import click
 import numpy as np
 import pandas as pd
 
 from .. import LLM as PyTorchLLM
-from .._tensorrt_engine import LLM
 from ..llmapi import RequestOutput
 from ..logger import logger
 from ..sampling_params import SamplingParams
@@ -163,11 +162,7 @@ class MMLU(Evaluator):
         return f"{workspace}/data"
 
     def format_subject(self, subject):
-        line = subject.split("_")
-        s = ""
-        for entry in line:
-            s += " " + entry
-        return s
+        return subject.replace("_", " ")
 
     def format_example(self, df, idx, include_answer=True):
         prompt = df.iloc[idx, 0]
@@ -316,7 +311,7 @@ class MMLU(Evaluator):
                 system_prompt: Optional[str], max_input_length: int,
                 max_output_length: int, check_accuracy: bool,
                 accuracy_threshold: float, output_dir: Optional[str]) -> None:
-        llm: Union[LLM, PyTorchLLM] = ctx.obj
+        llm: PyTorchLLM = ctx.obj
         sampling_params = SamplingParams(
             max_tokens=max_output_length,
             truncate_prompt_tokens=max_input_length)

@@ -3,6 +3,7 @@ import unittest
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import List, Optional, Union
+from unittest import mock
 
 import torch
 from parameterized import parameterized
@@ -10,12 +11,16 @@ from parameterized import parameterized
 import tensorrt_llm
 from tensorrt_llm._torch.attention_backend import (FlashInferAttention,
                                                    FlashInferAttentionMetadata)
+from tensorrt_llm._torch.attention_backend import \
+    flashinfer as flashinfer_backend
+from tensorrt_llm._torch.attention_backend.flashinfer import PlanParams
 from tensorrt_llm._torch.attention_backend.interface import \
     PredefinedAttentionMask
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.bindings.executor import KvCacheConfig
+from tensorrt_llm.functional import AttentionMaskType
 from tensorrt_llm.mapping import Mapping
 
 
@@ -28,10 +33,10 @@ class TestingFlashInferAttentionMetadata(FlashInferAttentionMetadata):
     def get_num_plans(self, plan_params) -> int:
         return self._num_times_planned[plan_params]
 
-    def _plan_with_params(self, plan_params):
+    def _plan_with_params(self, plan_params, flashinfer_backend: str = "fa2"):
         if self.needs_plan(plan_params):
             self._num_times_planned[plan_params] += 1
-        return super()._plan_with_params(plan_params)
+        return super()._plan_with_params(plan_params, flashinfer_backend)
 
 
 @dataclass(repr=False)
@@ -60,6 +65,45 @@ class CUDAGraphTestScenario:
 
 
 class TestFlashInferAttention(unittest.TestCase):
+
+    def test_ragged_no_kv_cuda_graph_uses_stable_indptr_aliases(self):
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA is required for FlashInfer metadata")
+
+        class FakeRaggedWrapper:
+
+            def plan(self, **kwargs):
+                self.plan_kwargs = kwargs
+
+        metadata = FlashInferAttentionMetadata(
+            seq_lens=torch.tensor([3, 5], dtype=torch.int32),
+            num_contexts=2,
+            kv_cache_manager=None,
+            request_ids=[0, 1],
+            max_num_requests=2,
+            max_num_tokens=8,
+        )
+        metadata.is_cuda_graph = True
+        plan_params = PlanParams(
+            num_heads=2,
+            num_kv_heads=2,
+            head_dim=4,
+            q_dtype=torch.float16,
+            kv_dtype=torch.float16,
+            attention_mask_type=AttentionMaskType.padding,
+        )
+        wrapper = FakeRaggedWrapper()
+
+        with mock.patch.object(
+                flashinfer_backend.flashinfer,
+                "BatchPrefillWithRaggedKVCacheWrapper",
+                FakeRaggedWrapper,
+        ):
+            metadata._plan_ragged_no_kv(plan_params, wrapper, "cudnn")
+
+        self.assertIn("kv_indptr", wrapper.plan_kwargs)
+        self.assertNotIn("v_indptr", wrapper.plan_kwargs)
+        self.assertNotIn("o_indptr", wrapper.plan_kwargs)
 
     @parameterized.expand([
         Scenario(num_layers=1,
@@ -280,10 +324,13 @@ class TestFlashInferAttention(unittest.TestCase):
         for plan_params in attn_metadata._plan_params_to_wrappers.keys():
             self.assertEqual(attn_metadata.get_num_plans(plan_params), 1)
 
-        # Make sure prepare() re-planned all params.
+        # prepare() defers re-planning to forward_impl only when multiple
+        # wrappers share one workspace_buffer (hybrid attention); for the
+        # single-wrapper case it re-plans eagerly so cuda-graph capture works.
         attn_metadata.prepare()
-        for plan_params in attn_metadata._plan_params_to_wrappers.keys():
-            self.assertEqual(attn_metadata.get_num_plans(plan_params), 2)
+        defer_plan = len(attn_metadata._plan_params_to_wrappers) > 1
+        for wrappers in attn_metadata._plan_params_to_wrappers.values():
+            self.assertEqual(wrappers.is_planned, not defer_plan)
 
         # [context_1, gen_1]
         results_2 = []
@@ -326,10 +373,13 @@ class TestFlashInferAttention(unittest.TestCase):
         for plan_params in attn_metadata._plan_params_to_wrappers.keys():
             self.assertEqual(attn_metadata.get_num_plans(plan_params), 1)
 
-        # Make sure prepare() re-planned all params.
+        # prepare() defers re-planning to forward_impl only when multiple
+        # wrappers share one workspace_buffer (hybrid attention); for the
+        # single-wrapper case it re-plans eagerly so cuda-graph capture works.
         attn_metadata.prepare()
-        for plan_params in attn_metadata._plan_params_to_wrappers.keys():
-            self.assertEqual(attn_metadata.get_num_plans(plan_params), 2)
+        defer_plan = len(attn_metadata._plan_params_to_wrappers) > 1
+        for wrappers in attn_metadata._plan_params_to_wrappers.values():
+            self.assertEqual(wrappers.is_planned, not defer_plan)
 
         # [context_2, gen_2]
         results_3 = []
@@ -371,10 +421,13 @@ class TestFlashInferAttention(unittest.TestCase):
         for plan_params in attn_metadata._plan_params_to_wrappers.keys():
             self.assertEqual(attn_metadata.get_num_plans(plan_params), 1)
 
-        # Make sure prepare() re-planned all params.
+        # prepare() defers re-planning to forward_impl only when multiple
+        # wrappers share one workspace_buffer (hybrid attention); for the
+        # single-wrapper case it re-plans eagerly so cuda-graph capture works.
         attn_metadata.prepare()
-        for plan_params in attn_metadata._plan_params_to_wrappers.keys():
-            self.assertEqual(attn_metadata.get_num_plans(plan_params), 2)
+        defer_plan = len(attn_metadata._plan_params_to_wrappers) > 1
+        for wrappers in attn_metadata._plan_params_to_wrappers.values():
+            self.assertEqual(wrappers.is_planned, not defer_plan)
 
         # assert value
 
@@ -657,3 +710,108 @@ class TestFlashInferAttention(unittest.TestCase):
                 "cudnn",
                 msg="No-KV ragged prefill should use FlashInfer's cudnn backend",
             )
+
+    def test_ragged_prefill_no_kv_cache_with_cuda_graphs(self) -> None:
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA is required")
+
+        device = torch.device("cuda")
+        num_heads = 8
+        num_kv_heads = 8
+        head_dim = 80
+        hidden_size = num_heads * head_dim
+        dtype = torch.bfloat16
+        per_sequence_token_counts = [24, 56]
+        num_context_sequences = len(per_sequence_token_counts)
+        total_tokens = sum(per_sequence_token_counts)
+        max_num_requests = 8
+
+        seq_lens = torch.tensor(
+            per_sequence_token_counts,
+            dtype=torch.int,
+            pin_memory=prefer_pinned(),
+        )
+        request_ids = list(range(1, num_context_sequences + 1))
+
+        attn_metadata_ref = TestingFlashInferAttentionMetadata(
+            seq_lens=seq_lens,
+            num_contexts=num_context_sequences,
+            max_num_requests=max_num_requests,
+            max_num_tokens=max(total_tokens * 2, 8192),
+            kv_cache_manager=None,
+            request_ids=request_ids,
+        )
+        attn_metadata_cuda_graph = TestingFlashInferAttentionMetadata(
+            seq_lens=seq_lens,
+            num_contexts=num_context_sequences,
+            is_cuda_graph=True,
+            max_num_requests=max_num_requests,
+            max_num_tokens=max(total_tokens * 2, 8192),
+            kv_cache_manager=None,
+            request_ids=request_ids,
+        )
+        attn_metadata_ref.prompt_lens = list(per_sequence_token_counts)
+        attn_metadata_cuda_graph.prompt_lens = list(per_sequence_token_counts)
+        attn_metadata_ref.prepare()
+        attn_metadata_cuda_graph.prepare()
+
+        layer = FlashInferAttention(
+            layer_idx=0,
+            num_heads=num_heads,
+            head_dim=head_dim,
+            num_kv_heads=num_kv_heads,
+        )
+
+        generator = torch.Generator(device=device)
+        generator.manual_seed(0)
+        query_states = torch.randn(
+            total_tokens,
+            hidden_size,
+            dtype=dtype,
+            device=device,
+            generator=generator,
+        )
+        key_states = torch.randn(
+            total_tokens,
+            num_kv_heads * head_dim,
+            dtype=dtype,
+            device=device,
+            generator=generator,
+        )
+        value_states = torch.randn(
+            total_tokens,
+            num_kv_heads * head_dim,
+            dtype=dtype,
+            device=device,
+            generator=generator,
+        )
+
+        result_ref = layer.forward(
+            query_states,
+            key_states,
+            value_states,
+            attn_metadata_ref,
+            attention_mask=PredefinedAttentionMask.FULL,
+        )
+
+        graph = torch.cuda.CUDAGraph()
+        for _ in range(2):
+            layer.forward(
+                query_states,
+                key_states,
+                value_states,
+                attn_metadata_cuda_graph,
+                attention_mask=PredefinedAttentionMask.FULL,
+            )
+
+        with torch.cuda.graph(graph):
+            result_actual = layer.forward(
+                query_states,
+                key_states,
+                value_states,
+                attn_metadata_cuda_graph,
+                attention_mask=PredefinedAttentionMask.FULL,
+            )
+
+        graph.replay()
+        torch.testing.assert_close(result_actual, result_ref, atol=1e-2, rtol=0)

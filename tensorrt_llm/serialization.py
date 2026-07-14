@@ -85,9 +85,9 @@ BASE_EXAMPLE_CLASSES = {
     "tensorrt_llm.executor.utils": ["ErrorResponse", "WorkerCommIpcAddrs"],
     "tensorrt_llm.executor.worker": ["GenerationExecutorWorker", "worker_main"],
     "tensorrt_llm.llmapi.llm_args": [
-        "_ModelFormatKind", "_ParallelConfig", "CalibConfig",
-        "CapacitySchedulerPolicy", "KvCacheConfig", "LookaheadDecodingConfig",
-        "TrtLlmArgs", "SchedulerConfig", "LoadFormat", "DynamicBatchConfig"
+        "_ParallelConfig", "CalibConfig", "CapacitySchedulerPolicy",
+        "KvCacheConfig", "LookaheadDecodingConfig", "SchedulerConfig",
+        "LoadFormat", "DynamicBatchConfig"
     ],
     "tensorrt_llm.llmapi.mpi_session": ["RemoteTask"],
     "tensorrt_llm.llmapi.llm_utils":
@@ -97,7 +97,6 @@ BASE_EXAMPLE_CLASSES = {
     "tensorrt_llm.mapping": ["Mapping"],
     "tensorrt_llm.models.modeling_utils":
     ["QuantConfig", "SpeculativeDecodingMode"],
-    "tensorrt_llm.plugin.plugin": ["PluginConfig"],
     "tensorrt_llm.sampling_params":
     ["SamplingParams", "GuidedDecodingParams", "GreedyDecodingParams"],
     "tensorrt_llm.serve.postprocess_handlers": [
@@ -131,13 +130,19 @@ class Unpickler(pickle.Unpickler):
                  *args,
                  approved_imports={},
                  approved_module_patterns=None,
+                 disallowed_imports=None,
                  **kwargs):
         super().__init__(*args, **kwargs)
         self.approved_imports = approved_imports
         self.approved_module_patterns = approved_module_patterns or []
+        self.disallowed_imports = disallowed_imports or {}
 
     # only import approved classes, this is the security boundary.
     def find_class(self, module, name):
+        # Check blocklist first — always reject disallowed imports
+        if name in self.disallowed_imports.get(module, []):
+            raise ValueError(f"Import {module} | {name} is not allowed")
+
         # Check exact match in approved_imports
         if name in self.approved_imports.get(module, []):
             return super().find_class(module, name)
@@ -170,14 +175,16 @@ def load(file,
          errors="strict",
          buffers=None,
          approved_imports={},
-         approved_module_patterns=None):
+         approved_module_patterns=None,
+         disallowed_imports=None):
     return Unpickler(file,
                      fix_imports=fix_imports,
                      buffers=buffers,
                      encoding=encoding,
                      errors=errors,
                      approved_imports=approved_imports,
-                     approved_module_patterns=approved_module_patterns).load()
+                     approved_module_patterns=approved_module_patterns,
+                     disallowed_imports=disallowed_imports).load()
 
 
 def loads(s,
@@ -188,7 +195,8 @@ def loads(s,
           errors="strict",
           buffers=None,
           approved_imports={},
-          approved_module_patterns=None):
+          approved_module_patterns=None,
+          disallowed_imports=None):
     if isinstance(s, str):
         raise TypeError("Can't load pickle from unicode string")
     file = io.BytesIO(s)
@@ -198,4 +206,5 @@ def loads(s,
                      encoding=encoding,
                      errors=errors,
                      approved_imports=approved_imports,
-                     approved_module_patterns=approved_module_patterns).load()
+                     approved_module_patterns=approved_module_patterns,
+                     disallowed_imports=disallowed_imports).load()

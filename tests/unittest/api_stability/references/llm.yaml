@@ -64,6 +64,10 @@ methods:
         annotation: Optional[str]
         default: null
         status: prototype
+      post_processor_hook:
+        annotation: Optional[str]
+        default: null
+        status: prototype
       # reasoning
       reasoning_parser:
         annotation: Optional[str]
@@ -80,9 +84,13 @@ methods:
         default: pytorch
         status: deprecated
       cuda_graph_config:
-        annotation: Optional[tensorrt_llm.llmapi.llm_args.CudaGraphConfig]
+        annotation: Union[tensorrt_llm.llmapi.llm_args.DecodeCudaGraphConfig, tensorrt_llm.llmapi.llm_args.EncodeCudaGraphConfig, NoneType]
         default: null
         status: beta
+      multimodal_config:
+        annotation: tensorrt_llm.llmapi.llm_args.MultimodalConfig
+        default: null
+        status: prototype
       attention_dp_config:
         annotation: Optional[tensorrt_llm.llmapi.llm_args.AttentionDpConfig]
         default: null
@@ -99,6 +107,14 @@ methods:
         annotation: Optional[str]
         default: null
         status: prototype
+      mx_config:
+        annotation: tensorrt_llm.llmapi.llm_args.ModelExpressConfig
+        default: null
+        status: prototype
+      gms_config:
+        annotation: tensorrt_llm.llmapi.llm_args.GmsConfig
+        default: null
+        status: prototype
       mm_encoder_only:
         annotation: bool
         default: False
@@ -107,14 +123,18 @@ methods:
         annotation: bool
         default: False
         status: prototype
+      encoder_max_batch_size:
+        annotation: Optional[int]
+        default: null
+        status: prototype
+      encoder_max_num_tokens:
+        annotation: Optional[int]
+        default: null
+        status: prototype
       disable_overlap_scheduler:
         annotation: bool
         default: False
         status: beta
-      disable_flashinfer_sampling:
-        annotation: bool
-        default: False
-        status: prototype
       moe_config:
         annotation: tensorrt_llm.llmapi.llm_args.MoeConfig
         status: beta
@@ -132,6 +152,18 @@ methods:
         default: auto
         status: deprecated
       sampler_force_async_worker:
+        annotation: bool
+        default: False
+        status: prototype
+      enable_speculative_beam_history_d2h:
+        annotation: bool
+        default: False
+        status: prototype
+      enable_early_first_token_response:
+        annotation: bool
+        default: False
+        status: prototype
+      enable_low_latency_host_dispatch:
         annotation: bool
         default: False
         status: prototype
@@ -212,7 +244,11 @@ methods:
         default: null
         status: prototype
       sparse_attention_config:
-        annotation: Union[tensorrt_llm.llmapi.llm_args.RocketSparseAttentionConfig, tensorrt_llm.llmapi.llm_args.DeepSeekSparseAttentionConfig, tensorrt_llm.llmapi.llm_args.SkipSoftmaxAttentionConfig, NoneType]
+        annotation: Union[tensorrt_llm.llmapi.llm_args.RocketSparseAttentionConfig, tensorrt_llm.llmapi.llm_args.DeepSeekSparseAttentionConfig, tensorrt_llm.llmapi.llm_args.DeepSeekV4SparseAttentionConfig, tensorrt_llm.llmapi.llm_args.SkipSoftmaxAttentionConfig, tensorrt_llm.llmapi.llm_args.MiniMaxM3SparseAttentionConfig, NoneType]
+        default: null
+        status: prototype
+      kv_cache_compression_config:
+        annotation: Optional[tensorrt_llm.llmapi.llm_args.KvCacheCompressionConfig]
         default: null
         status: prototype
       otlp_traces_endpoint:
@@ -235,6 +271,14 @@ methods:
         annotation: Optional[tensorrt_llm.llmapi.llm_args.SleepConfig]
         default: null
         status: prototype
+      reorder_policy_config:
+        annotation: Optional[tensorrt_llm.llmapi.llm_args.ReorderRequestPolicyConfig]
+        default: null
+        status: prototype
+      enable_resource_governor:
+        annotation: bool
+        default: False
+        status: prototype
       env_overrides:
         annotation: Optional[Dict[str, str]]
         default: null
@@ -249,10 +293,6 @@ methods:
         status: prototype
       layer_wise_benchmarks_config:
         annotation: tensorrt_llm.llmapi.llm_args.LayerwiseBenchmarksConfig
-        default: null
-        status: prototype
-      video_pruning_rate:
-        annotation: Optional[float]
         default: null
         status: prototype
       model_kwargs:
@@ -287,6 +327,9 @@ methods:
       scheduling_params:
         annotation: Union[tensorrt_llm.scheduling_params.SchedulingParams, List[tensorrt_llm.scheduling_params.SchedulingParams], NoneType]
         default: null
+      conversation_params:
+        annotation: Union[tensorrt_llm.conversation_params.ConversationParams, List[tensorrt_llm.conversation_params.ConversationParams], NoneType]
+        default: null
       cache_salt:
         annotation: Union[str, Sequence[str], NoneType]
         default: null
@@ -307,6 +350,9 @@ methods:
         annotation: Optional[tensorrt_llm.scheduling_params.SchedulingParams]
         default: null
         status: prototype
+      conversation_params:
+        annotation: Optional[tensorrt_llm.conversation_params.ConversationParams]
+        default: null
       cache_salt:
         annotation: Optional[str]
         default: null
@@ -328,10 +374,19 @@ methods:
       add_special_tokens:
         annotation: bool
         default: True
+      return_raw_logits:
+        annotation: bool
+        default: False
       model_kwargs:
         annotation: Any
         default: inspect._empty
-    return_annotation: Union[tensorrt_llm.llmapi.llm.EncoderOutput, List[tensorrt_llm.llmapi.llm.EncoderOutput]]
+      batch_indexed_model_output:
+        annotation: bool
+        default: True
+      copy_logits_to_host:
+        annotation: bool
+        default: True
+    return_annotation: Union[tensorrt_llm.llmapi.llm.EncoderOutput, List[tensorrt_llm.llmapi.llm.EncoderOutput], torch.Tensor]
     status: prototype
   preprocess:
     parameters:
@@ -352,6 +407,10 @@ methods:
         annotation: Optional[float]
         default: 2
     return_annotation: List[dict]
+    status: beta
+  get_kv_cache_capacity:
+    parameters: {}
+    return_annotation: dict
     status: beta
   get_kv_cache_events_async:
     parameters:

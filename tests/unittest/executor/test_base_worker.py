@@ -16,11 +16,35 @@ from utils.util import skip_single_gpu
 
 from tensorrt_llm.executor.base_worker import BaseWorker
 from tensorrt_llm.executor.request import GenerationRequest
+from tensorrt_llm.executor.utils import RequestError
 from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 from tensorrt_llm.sampling_params import SamplingParams
 
 default_model_name = "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
 model_path = llm_models_root() / default_model_name
+
+
+def test_enqueue_request_wraps_lora_load_error():
+
+    class LoraManager:
+
+        def is_adapter_in_cpu_cache(self, adapter_id):
+            return False
+
+    def raise_load_error(lora_request):
+        raise RuntimeError("bad adapter")
+
+    worker = object.__new__(BaseWorker)
+    worker._lora_manager = LoraManager()
+    worker._load_lora_adapter = raise_load_error
+    request = type(
+        "Request", (), {
+            "id": 1,
+            "lora_request": type("LoraRequest", (), {"adapter_id": 999})(),
+        })()
+
+    with pytest.raises(RequestError, match="Failed to load LoRA adapter"):
+        worker._enqueue_request(request)
 
 
 def create_fake_executor_config(engine_path, tp_size: int = 1):

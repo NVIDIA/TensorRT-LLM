@@ -1,3 +1,7 @@
+# Copyright 2018 The HuggingFace Team
+# Licensed under the Apache License, Version 2.0.
+# Original source: https://github.com/huggingface/transformers
+#
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
@@ -29,7 +33,7 @@ respective model files and registered via get_eagle_layers().
 
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Any, Dict, Optional, Union
+from typing import Any, ClassVar, Dict, Optional, Set, Union
 
 import torch
 import torch.nn as nn
@@ -37,7 +41,8 @@ from transformers import PretrainedConfig, PreTrainedModel
 from transformers.activations import ACT2FN
 from transformers.utils import ModelOutput
 
-from ....pyexecutor.mamba_cache_manager import MambaHybridCacheManager
+from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import MambaHybridCacheManager
+
 from ...distributed.common import broadcast
 from ...shim.interface import CachedSequenceInterface
 from ...utils._config import deep_merge_dicts
@@ -103,9 +108,11 @@ class EagleConfig(PretrainedConfig):
         model_type: The base model type (e.g., "llama", "nemotron_h") used to look up defaults.
     """
 
-    # Map model_type -> default Eagle config values
-    # Includes _checkpoint_conversion_mapping for model-specific weight key transformations
-    _drafter_defaults: Dict[str, Dict[str, Any]] = {
+    # Map model_type -> default Eagle config values.
+    # Annotated as ClassVar so transformers 5.5.x's @dataclass(kw_only=True)
+    # treatment of PretrainedConfig subclasses skips this (otherwise the
+    # mutable-dict default is rejected at class-creation time).
+    _drafter_defaults: ClassVar[Dict[str, Dict[str, Any]]] = {
         "llama": {
             "load_embedding_from_target": True,
             "load_lm_head_from_target": False,
@@ -139,24 +146,31 @@ class EagleConfig(PretrainedConfig):
     # Some custom HF config classes expose backward-compatibility fields as properties instead of
     # storing them directly in __dict__. Those values do not survive config.to_dict(), so carry
     # them over explicitly before rebuilding a generic EagleConfig.
-    _preserved_config_attrs: Dict[str, tuple[str, ...]] = {
+    _preserved_config_attrs: ClassVar[Dict[str, tuple[str, ...]]] = {
         "nemotron_h": ("mtp_hybrid_override_pattern",),
     }
 
-    def __init__(
-        self,
+    @classmethod
+    def from_base_config(
+        cls,
         config: PretrainedConfig,
         model_type: str,
     ):
-        if model_type not in self._drafter_defaults:
+        """Build an EagleConfig by merging a base model's config with type-specific defaults.
+
+        Use this factory instead of constructing ``EagleConfig`` directly: transformers>=5.5
+        applies ``@dataclass(kw_only=True)`` to ``PretrainedConfig`` subclasses, which
+        overrides any manually defined ``__init__``.
+        """
+        if model_type not in cls._drafter_defaults:
             raise ValueError(
                 f"Unsupported model_type '{model_type}' for EagleConfig. "
-                f"Supported types: {list(self._drafter_defaults.keys())}"
+                f"Supported types: {list(cls._drafter_defaults.keys())}"
             )
 
-        defaults = self._drafter_defaults[model_type]
+        defaults = cls._drafter_defaults[model_type]
         config_dict = config.to_dict()
-        for key in self._preserved_config_attrs.get(model_type, ()):
+        for key in cls._preserved_config_attrs.get(model_type, ()):
             if key not in config_dict and hasattr(config, key):
                 config_dict[key] = getattr(config, key)
 
@@ -169,7 +183,7 @@ class EagleConfig(PretrainedConfig):
                 )
 
         merged = deep_merge_dicts(defaults, config_dict)
-        super().__init__(**merged)
+        return cls(**merged)
 
 
 class LlamaRotaryEmbedding(nn.Module):
@@ -309,8 +323,22 @@ class EagleMLP(nn.Module):
         self.act_fn = ACT2FN[config.hidden_act]
 
     def forward(self, x):
-        down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
-        return down_proj
+        # Sharding IR (SwiGLU MLP): gate/up colwise, down rowwise + all_reduce.
+        gate = torch.ops.auto_deploy.torch_linear_simple(
+            x, self.gate_proj.weight, self.gate_proj.bias, tp_mode="colwise", layer_type="mlp"
+        )
+        up = torch.ops.auto_deploy.torch_linear_simple(
+            x, self.up_proj.weight, self.up_proj.bias, tp_mode="colwise", layer_type="mlp"
+        )
+        down = torch.ops.auto_deploy.torch_linear_simple(
+            self.act_fn(gate) * up,
+            self.down_proj.weight,
+            self.down_proj.bias,
+            tp_mode="rowwise",
+            layer_type="mlp",
+        )
+        down = torch.ops.auto_deploy.all_reduce(down, layer_type="mlp")
+        return down
 
 
 class Eagle3Attention(nn.Module):
@@ -364,15 +392,54 @@ class Eagle3Attention(nn.Module):
         bsz, q_len, _ = hidden_states.size()
         cos, sin = position_embeddings
 
-        # Projections
-        query_states = self.q_proj(hidden_states)
-        key_states = self.k_proj(hidden_states)
-        value_states = self.v_proj(hidden_states)
+        # Sharding IR (MHA): q/k/v colwise (the 2*hidden_size input is the replicated
+        # concat of normed embeds + hidden; only the head output dim is sharded, so the
+        # colwise rule is unchanged), o_proj rowwise + all_reduce. tp_min_local_shape keeps
+        # whole heads together when num_heads is not divisible by world_size.
+        query_states = torch.ops.auto_deploy.torch_linear_simple(
+            hidden_states,
+            self.q_proj.weight,
+            self.q_proj.bias,
+            tp_mode="colwise",
+            tp_min_local_shape=self.head_dim,
+            layer_type="mha",
+        )
+        key_states = torch.ops.auto_deploy.torch_linear_simple(
+            hidden_states,
+            self.k_proj.weight,
+            self.k_proj.bias,
+            tp_mode="colwise",
+            tp_min_local_shape=self.head_dim,
+            layer_type="mha",
+        )
+        value_states = torch.ops.auto_deploy.torch_linear_simple(
+            hidden_states,
+            self.v_proj.weight,
+            self.v_proj.bias,
+            tp_mode="colwise",
+            tp_min_local_shape=self.head_dim,
+            layer_type="mha",
+        )
 
-        # Reshape to [Batch, Seq, Heads, Dim]
-        query_states = query_states.view(bsz, q_len, -1, self.head_dim)
-        key_states = key_states.view(bsz, q_len, -1, self.head_dim)
-        value_states = value_states.view(bsz, q_len, -1, self.head_dim)
+        # Reshape to [Batch, Seq, Heads, Dim] -- head-count dim scales with TP.
+        query_states = torch.ops.auto_deploy.view(
+            query_states,
+            [bsz, q_len, self.num_attention_heads, self.head_dim],
+            tp_scaled_dim=2,
+            layer_type="mha",
+        )
+        key_states = torch.ops.auto_deploy.view(
+            key_states,
+            [bsz, q_len, self.num_key_value_heads, self.head_dim],
+            tp_scaled_dim=2,
+            layer_type="mha",
+        )
+        value_states = torch.ops.auto_deploy.view(
+            value_states,
+            [bsz, q_len, self.num_key_value_heads, self.head_dim],
+            tp_scaled_dim=2,
+            layer_type="mha",
+        )
 
         query_states, key_states = apply_rotary_pos_emb(
             query_states, key_states, cos, sin, unsqueeze_dim=2
@@ -388,9 +455,21 @@ class Eagle3Attention(nn.Module):
             layout="bsnd",
         )
 
-        attn_output = attn_output.view(bsz, q_len, self.num_attention_heads * self.head_dim)
+        attn_output = torch.ops.auto_deploy.view(
+            attn_output,
+            [bsz, q_len, self.num_attention_heads * self.head_dim],
+            tp_scaled_dim=2,
+            layer_type="mha",
+        )
 
-        attn_output = self.o_proj(attn_output)
+        attn_output = torch.ops.auto_deploy.torch_linear_simple(
+            attn_output,
+            self.o_proj.weight,
+            self.o_proj.bias,
+            tp_mode="rowwise",
+            layer_type="mha",
+        )
+        attn_output = torch.ops.auto_deploy.all_reduce(attn_output, layer_type="mha")
 
         return attn_output
 
@@ -732,6 +811,12 @@ class EagleWrapperConfig:
     load_lm_head_from_target: bool
     normalize_target_hidden_state: bool = False
     sync_before_hidden_state_capture: bool = False
+    # When attention-DP is enabled, each rank holds a different slice of the
+    # global batch and produces legitimately different per-rank tokens. The
+    # rank-0 token broadcast applied for TP-replication consistency (see
+    # `sample_greedy`) must be skipped in that mode to avoid overwriting
+    # peers' real samples.
+    enable_attention_dp: bool = False
 
 
 class EagleWrapper(nn.Module):
@@ -753,6 +838,7 @@ class EagleWrapper(nn.Module):
         self.load_lm_head_from_target = config.load_lm_head_from_target
         self.normalize_target_hidden_state = config.normalize_target_hidden_state
         self.sync_before_hidden_state_capture = config.sync_before_hidden_state_capture
+        self.enable_attention_dp = config.enable_attention_dp
 
     @property
     def _draft_inner_model(self):
@@ -818,12 +904,19 @@ class EagleWrapper(nn.Module):
 
     def sample_greedy(self, logits: torch.Tensor) -> torch.Tensor:
         ret = torch.argmax(logits, dim=-1)
-        # Broadcast rank 0's sampled tokens to all ranks. We have observed slight
-        # differences in logits across ranks. This can cause different acceptance patterns,
-        # inconsistent input_pos, and a hang. This synchronizes every
-        # validation step to prevent this. See:
+        # Under TP-replication, all ranks compute the same logits but small
+        # floating-point differences can drive different argmax results,
+        # producing divergent acceptance patterns / input_pos and an
+        # eventual hang. The broadcast below synchronizes rank 0's tokens
+        # to all ranks each validation step. See:
         # https://github.com/NVIDIA/TensorRT-LLM/issues/13134
-        broadcast(ret, src=0)
+        #
+        # Under attention-DP, each rank holds a *different* slice of the
+        # global batch so per-rank tokens are legitimately different;
+        # broadcasting would overwrite peers' real samples with rank 0's
+        # values and corrupt per-request state.
+        if not self.enable_attention_dp:
+            broadcast(ret, src=0)
         return ret
 
     def forward(self, cache_seq_interface: Optional[CachedSequenceInterface] = None, **kwargs):
@@ -899,9 +992,13 @@ class EagleWrapper(nn.Module):
     # ================================================================== #
 
     @staticmethod
+    def _submodule_placeholder_names(submodule: nn.Module) -> Set[str]:
+        return {node.name for node in submodule.graph.nodes if node.op == "placeholder"}
+
+    @staticmethod
     def _filter_kwargs_for_submodule(kwargs: dict, submodule: nn.Module) -> dict:
         """Filter kwargs to only include those accepted by submodule's forward (GraphModule)."""
-        expected_names = {node.name for node in submodule.graph.nodes if node.op == "placeholder"}
+        expected_names = EagleWrapper._submodule_placeholder_names(submodule)
         return {k: v for k, v in kwargs.items() if k in expected_names}
 
     @staticmethod
@@ -1082,6 +1179,7 @@ class EagleWrapper(nn.Module):
         next_new_tokens[:, 0] = csi.info.maybe_gather_and_squeeze(csi.get_arg("input_ids"))
 
         # ---- Phase 5: Draft loop ----
+        draft_arg_names = self._submodule_placeholder_names(self.draft_model)
         for draft_idx in range(self.max_draft_len):
             # run forward pass on the draft model in shape [num_sequences, 1]
             draft_output = self.draft_model(
@@ -1109,9 +1207,9 @@ class EagleWrapper(nn.Module):
             # switch to generate (if not done already), store new tokens, and offset cache
             # can be skipped for last iteration since after we return metadata will be reset
             if draft_idx < self.max_draft_len - 1:
-                csi.info.switch_to_generate_()
+                csi.info.switch_to_generate_(active_args_override=draft_arg_names)
                 csi.info.copy_("input_ids", draft_tokens)
-                csi.info.offset_pos_and_cache_(c_offset)
+                csi.info.offset_pos_and_cache_(c_offset, active_args_override=draft_arg_names)
 
         # ---- Phase 6: Package output ----
         return EagleWrapperOutput(

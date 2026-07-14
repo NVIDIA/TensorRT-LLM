@@ -39,6 +39,7 @@ from ..attention_interface import (
     AttentionDescriptor,
     AttentionLayout,
     AttentionRegistry,
+    AttentionType,
     BatchInfo,
     Constant,
     MHACallable,
@@ -67,6 +68,7 @@ class _CombinedMLAPagedResourceHandler(ResourceHandler):
     def __init__(self, *token_shape: int, dtype: torch.dtype) -> None:
         self.token_shape = token_shape
         self.dtype = dtype
+        self.attention_type = AttentionType.mla
 
     def allocate(self, sequence_info: SequenceInfo) -> torch.Tensor:
         return torch.empty(
