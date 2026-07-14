@@ -165,6 +165,65 @@ if [[ "$pytestCommand" == *"l0_b200_nvbug_6336747.txt"* ]]; then
     export TLLM_SHM_EVENT_TRACER="$shmEventTraceBinary"
     export TLLM_SHM_EVENT_TRACE_FILE="$TLLM_SHM_TRACE_DIR/shm_namespace_events.${SLURM_PROCID}.log"
 
+    # inotify names the removed file but not the remover. fanotify directory-entry
+    # events are delivered with the actor's pid, so this tracer records who removes
+    # each /dev/shm/torch_* entry (pid/ppid/uid/comm/exe + mnt/ipc namespace),
+    # including processes outside the pytest tree. Best-effort: it needs
+    # CAP_SYS_ADMIN and tmpfs file-handle support, so degrade quietly (the required
+    # tracers above still run) if it cannot build or start.
+    actorTraceBinary="/tmp/nvbug6336747_shm_actor_trace_${SLURM_JOB_ID}_${SLURM_PROCID}"
+    actorTraceReady=0
+    actorTraceBuildLog="$TLLM_SHM_TRACE_DIR/shm_actor_build.${SLURM_PROCID}.log"
+    if gcc -std=c11 -Wall -Wextra -Werror -o "$actorTraceBinary" \
+            "$llmSrcNode/tests/integration/defs/shared_tensor_shm_actor_trace.c" \
+            2>"$actorTraceBuildLog"; then
+        actorTraceProbeLog="$TLLM_SHM_TRACE_DIR/shm_delete_actors_probe.${SLURM_PROCID}.log"
+        "$actorTraceBinary" "$actorTraceProbeLog" /dev/shm &
+        actorTraceProbePid=$!
+        actorTraceProbeStarted=0
+        for _ in {1..50}; do
+            if grep -Fq -- "event=watch_start" "$actorTraceProbeLog" 2>/dev/null; then
+                actorTraceProbeStarted=1
+                break
+            fi
+            if grep -Fq -- "event=watch_error" "$actorTraceProbeLog" 2>/dev/null; then
+                break
+            fi
+            if ! kill -0 "$actorTraceProbePid" 2>/dev/null; then
+                break
+            fi
+            sleep 0.1
+        done
+        if [[ $actorTraceProbeStarted -eq 1 ]]; then
+            actorTraceProbe="/dev/shm/torch_nvbug6336747_actor_probe_${SLURM_JOB_ID}_${SLURM_PROCID}"
+            : > "$actorTraceProbe" || true
+            rm -f "$actorTraceProbe" || true
+            sleep 0.2
+            kill -TERM "$actorTraceProbePid" 2>/dev/null || true
+            wait "$actorTraceProbePid" 2>/dev/null || true
+            actorTraceProbeName=$(basename "$actorTraceProbe")
+            if awk -v name="$actorTraceProbeName" \
+                'index($0, "event=removal op=delete name=" name " ") && \
+                 match($0, /actor_pid=[1-9][0-9]*/) {found=1} END {exit !found}' \
+                "$actorTraceProbeLog"; then
+                actorTraceReady=1
+            else
+                echo "NVBug 6336747 actor tracer self-test saw no delete record with a usable actor PID; " \
+                    "disabling (non-fatal)" >&2
+            fi
+        else
+            kill -TERM "$actorTraceProbePid" 2>/dev/null || true
+            wait "$actorTraceProbePid" 2>/dev/null || true
+            echo "NVBug 6336747 actor tracer could not start (needs CAP_SYS_ADMIN + tmpfs FID support); disabling (non-fatal)" >&2
+        fi
+    else
+        echo "NVBug 6336747 actor tracer failed to build; disabling (non-fatal). See $(basename "$actorTraceBuildLog")" >&2
+    fi
+    if [[ $actorTraceReady -eq 1 ]]; then
+        export TLLM_SHM_ACTOR_TRACER="$actorTraceBinary"
+        export TLLM_SHM_ACTOR_TRACE_FILE="$TLLM_SHM_TRACE_DIR/shm_delete_actors.${SLURM_PROCID}.log"
+    fi
+
     export TLLM_SHUTDOWN_TRACE_DIR="$TLLM_SHM_TRACE_DIR"
     export TLLM_SHUTDOWN_TRACE_TIMEOUT_SEC=60
     export TLLM_SHUTDOWN_FORCE_EXIT=1
@@ -277,6 +336,55 @@ pytest_exit_code=0
 perf_check_exit_code=0
 perf_report_exit_code=0
 
+# Best-effort node-level removers (NVBug 6336747), started outside the ptrace
+# wrapper so they keep observing if pytest or the wrapper aborts. Neither is
+# allowed to fail the run.
+shmActorTracePid=""
+if [[ -n "${TLLM_SHM_ACTOR_TRACE_FILE:-}" ]]; then
+    "$TLLM_SHM_ACTOR_TRACER" "$TLLM_SHM_ACTOR_TRACE_FILE" /dev/shm &
+    shmActorTracePid=$!
+    for _ in {1..50}; do
+        if grep -Fq -- "event=watch_start" "$TLLM_SHM_ACTOR_TRACE_FILE" 2>/dev/null; then
+            break
+        fi
+        if ! kill -0 "$shmActorTracePid" 2>/dev/null; then
+            shmActorTracePid=""
+            break
+        fi
+        sleep 0.1
+    done
+fi
+
+# Optional bpftrace call-path tracer: only where bpftrace + BTF + CAP_BPF exist.
+vfsUnlinkTracePid=""
+if [[ -n "${TLLM_SHM_TRACE_DIR:-}" ]] && command -v bpftrace >/dev/null 2>&1; then
+    vfsUnlinkTraceLog="$TLLM_SHM_TRACE_DIR/vfs_unlink.${SLURM_PROCID}.log"
+    bpftrace "$llmSrcNode/tests/integration/defs/shared_tensor_vfs_unlink.bt" \
+        >"$vfsUnlinkTraceLog" 2>&1 &
+    vfsUnlinkTraceCandidatePid=$!
+    vfsUnlinkTraceReady=0
+    for _ in {1..50}; do
+        if grep -Fq -- "vfs_unlink actor/call-path tracer started" "$vfsUnlinkTraceLog" 2>/dev/null; then
+            if kill -0 "$vfsUnlinkTraceCandidatePid" 2>/dev/null; then
+                vfsUnlinkTraceReady=1
+            fi
+            break
+        fi
+        if ! kill -0 "$vfsUnlinkTraceCandidatePid" 2>/dev/null; then
+            break
+        fi
+        sleep 0.1
+    done
+    if [[ $vfsUnlinkTraceReady -eq 1 ]]; then
+        vfsUnlinkTracePid=$vfsUnlinkTraceCandidatePid
+    else
+        kill -INT "$vfsUnlinkTraceCandidatePid" 2>/dev/null || true
+        wait "$vfsUnlinkTraceCandidatePid" 2>/dev/null || true
+        echo "NVBug 6336747 vfs_unlink bpftrace failed to become ready; skipping stack tracer (non-fatal). " \
+            "See $(basename "$vfsUnlinkTraceLog")" >&2
+    fi
+fi
+
 if [[ -n "${TLLM_UNLINK_SYSCALL_TRACE_FILE:-}" ]]; then
     "$TLLM_UNLINK_SYSCALL_TRACER" "$TLLM_UNLINK_SYSCALL_TRACE_FILE" -- bash -c "$pytestCommand"
 else
@@ -297,6 +405,17 @@ if [[ -n "$shmEventTracePid" ]]; then
             pytest_exit_code=1
         fi
     fi
+fi
+
+# Stop the best-effort node-level removers. Failures here never affect the run.
+if [[ -n "$shmActorTracePid" ]]; then
+    kill -TERM "$shmActorTracePid" 2>/dev/null || true
+    wait "$shmActorTracePid" 2>/dev/null || true
+fi
+if [[ -n "$vfsUnlinkTracePid" ]]; then
+    # SIGINT so bpftrace runs its END probes and flushes the aggregation maps.
+    kill -INT "$vfsUnlinkTracePid" 2>/dev/null || true
+    wait "$vfsUnlinkTracePid" 2>/dev/null || true
 fi
 
 # DEBUG: Diagnose intermittent "unrecognized arguments" failure (Exit Code 4)

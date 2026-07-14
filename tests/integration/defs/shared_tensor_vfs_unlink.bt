@@ -1,0 +1,93 @@
+#!/usr/bin/env bpftrace
+/*
+ * Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+/*
+ * Node-level unlink-CALL-PATH tracer for NVBug 6336747 (companion to the
+ * fanotify actor tracer shared_tensor_shm_actor_trace.c).
+ *
+ * The fanotify tracer answers "who" (pid/comm/namespace) removed a
+ * /dev/shm/torch_* file. This answers "how": it aggregates every removal of a
+ * torch_* dentry by (comm, mount-namespace, pid-namespace) and by
+ * kernel+user call stack, so the removal code path is visible -- e.g. torch
+ * libshm RefcountedMapAllocator::close / a torch_shm_manager sweep versus a
+ * plain rm / systemd-tmpfiles / another container. The anomalous out-of-tree
+ * remover appears as a bucket with an unexpected comm, a foreign namespace id,
+ * or a non-torch call stack.
+ *
+ * Aggregation (not per-event printing) keeps overhead bounded under the ~10^5
+ * torch unlinks a VideoMME run produces; the maps are printed on exit.
+ *
+ * Hook: security_inode_unlink(struct inode *dir, struct dentry *dentry) has a
+ * stable (dir, dentry) signature across kernels, so the dentry is always arg1.
+ * vfs_unlink is avoided because its leading mnt_idmap/user_namespace argument
+ * (added in 5.12) shifts the dentry to arg2 and makes the probe kernel-version
+ * dependent; a vfs_unlink variant is left commented below for kernels built
+ * without CONFIG_SECURITY.
+ *
+ * Requires bpftrace + kernel BTF + CAP_BPF/CAP_SYS_ADMIN. Stop with SIGINT/
+ * SIGTERM to flush the END maps.
+ */
+
+BEGIN
+{
+    printf("vfs_unlink actor/call-path tracer started; torch_* removals only\n");
+}
+
+kprobe:security_inode_unlink
+{
+    $dentry = (struct dentry *) arg1;
+    $name = $dentry->d_name.name;
+    if (str($name, 6) == "torch_")
+    {
+        @removers[comm,
+                  curtask->nsproxy->mnt_ns->ns.inum,
+                  curtask->nsproxy->pid_ns_for_children->ns.inum] = count();
+        @by_kstack[comm, kstack] = count();
+        @by_ustack[comm, ustack] = count();
+    }
+}
+
+END
+{
+    printf("=== torch_* removers by (comm, mntns, pidns) ===\n");
+    print(@removers);
+    printf("=== torch_* removal kernel stacks by comm ===\n");
+    print(@by_kstack);
+    printf("=== torch_* removal user stacks by comm ===\n");
+    print(@by_ustack);
+}
+
+/*
+ * Fallback for kernels without CONFIG_SECURITY (no security_inode_unlink).
+ * Uncomment and pick the dentry argument for the target kernel:
+ *   >= 5.12 : vfs_unlink(idmap/userns, dir, dentry, ...) -> arg2
+ *   <  5.12 : vfs_unlink(dir, dentry, ...)               -> arg1
+ *
+ * kprobe:vfs_unlink
+ * {
+ *     $dentry = (struct dentry *) arg2;   // arg1 on kernels < 5.12
+ *     $name = $dentry->d_name.name;
+ *     if (str($name, 6) == "torch_")
+ *     {
+ *         @removers[comm,
+ *                   curtask->nsproxy->mnt_ns->ns.inum,
+ *                   curtask->nsproxy->pid_ns_for_children->ns.inum] = count();
+ *         @by_kstack[comm, kstack] = count();
+ *         @by_ustack[comm, ustack] = count();
+ *     }
+ * }
+ */
