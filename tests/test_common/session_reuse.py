@@ -38,7 +38,7 @@ import threading
 
 # The spawn snapshot is shared with the session-prefetch layer (both hand a
 # live pool to a test that did not spawn it — same invariant).
-from test_common._session_utils import _spawn_snapshot  # noqa: F401
+from test_common._session_utils import _spawn_snapshot
 from test_common.grouped_test_utils import reset_worker_torch_compile_state, submit_sync_per_worker
 
 # The only places in the library that construct MpiPoolSession for a bare
@@ -64,44 +64,6 @@ _WEIGHT_CACHE_ENV = {
 
 _RETIRE_THREADS: list = []
 _RETIRE_LOCK = threading.Lock()
-
-
-def _proc_start_time(pid: int):
-    """Kernel start time (jiffies since boot) of ``pid``, or None if gone.
-
-    PIDs are recycled by the OS, but the (pid, start_time) pair is unique:
-    verifying it right before SIGKILL prevents killing an unrelated process
-    (e.g. a replacement pool's worker) that inherited a dead worker's PID.
-    """
-    try:
-        with open(f"/proc/{pid}/stat", "rb") as f:
-            stat = f.read()
-        # Field 2 (comm) may contain spaces/parens; parse after the last ')'.
-        return stat.rsplit(b")", 1)[1].split()[19]  # field 22 overall
-    except OSError:
-        return None
-
-
-def _get_worker_pid() -> tuple:
-    """Runs inside a worker; module-level so it is picklable."""
-    pid = os.getpid()
-    return (pid, _proc_start_time(pid))
-
-
-def _collect_worker_pids(real) -> tuple:
-    """Record the worker PIDs of a freshly spawned pool.
-
-    ``_retire`` uses them to SIGKILL wedged workers: a graceful shutdown
-    blocks forever on a broken pool and ``shutdown_abort`` would MPI_Abort
-    the parent test process too. Records (pid, start_time) pairs so the kill
-    can verify the PID was not recycled. ``submit_sync_per_worker`` runs the
-    collection exactly once per worker. Best effort — if it fails, the pool
-    just falls back to graceful shutdown.
-    """
-    try:
-        return tuple(sorted(submit_sync_per_worker(real, _get_worker_pid)))
-    except Exception:
-        return ()
 
 
 def _describe_mismatch(spawn_snap, now_snap, uses, max_uses):
@@ -211,10 +173,13 @@ class SessionReuseCache:
         def _dispose():
             import signal
 
+            # Lazy: only runs when a pool exists, so tensorrt_llm is loaded.
+            from tensorrt_llm.llmapi.mpi_session import _process_start_time
+
             for pid, start_time in pids:
                 # Guard against PID recycling: only kill if the process at
                 # this PID is still the worker we recorded at spawn.
-                if start_time is None or _proc_start_time(pid) != start_time:
+                if start_time is None or _process_start_time(pid) != start_time:
                     continue
                 try:
                     os.kill(pid, signal.SIGKILL)
@@ -353,7 +318,10 @@ class SessionReuseCache:
                 os.environ.pop(k, None)
         real._reuse_uses = 0
         real._reuse_spawn_snapshot = snapshot
-        real._reuse_worker_pids = _collect_worker_pids(real)
+        # (pid, start_time) per worker, recorded by the library at spawn
+        # (wait_shutdown=True above). _retire uses them to SIGKILL wedged
+        # workers; best effort — empty means graceful shutdown only.
+        real._reuse_worker_pids = getattr(real, "_worker_identities", ())
         return real
 
     def _release(self, real):
