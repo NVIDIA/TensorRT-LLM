@@ -17,6 +17,7 @@ import argparse
 import ast
 import glob
 import gzip
+import hashlib
 import json
 import os
 import re
@@ -49,6 +50,15 @@ def _iter_rows(fp):
                 yield ctx, file, qual
 
 
+def _safe_rows(fp):
+    """Yield canon'd (test, file, qualname) rows from one input file; stop early on a corrupt/unreadable input."""
+    try:
+        for test, file, qual in _iter_rows(fp):
+            yield test, canon(file), qual
+    except (OSError, ValueError, sqlite3.Error):
+        return
+
+
 def merge_to_sqlite(pattern, out_path):
     """Stream every per-process file into a deduped touch DB. Returns (connection, n_data_files)."""
     files = sorted(glob.glob(pattern))
@@ -63,21 +73,35 @@ def merge_to_sqlite(pattern, out_path):
     con.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT)")
     for fp in files:
         batch = []
-        try:
-            for test, file, qual in _iter_rows(fp):
-                batch.append((test, canon(file), qual))
-                if len(batch) >= 20000:
-                    con.executemany("INSERT OR IGNORE INTO touch VALUES (?, ?, ?)", batch)
-                    batch = []
-            if batch:
+        # Input errors are recovered in _safe_rows; destination writes stay
+        # unguarded so a broken output DB aborts the merge.
+        for row in _safe_rows(fp):
+            batch.append(row)
+            if len(batch) >= 20000:
                 con.executemany("INSERT OR IGNORE INTO touch VALUES (?, ?, ?)", batch)
-        except (OSError, ValueError, sqlite3.Error):
-            continue
+                batch = []
+        if batch:
+            con.executemany("INSERT OR IGNORE INTO touch VALUES (?, ?, ?)", batch)
     con.execute("CREATE INDEX ix_file ON touch(file)")
     con.execute("CREATE INDEX ix_func ON touch(file, qualname)")
     con.execute("CREATE INDEX ix_test ON touch(test)")
     con.commit()
     return con, len(files)
+
+
+def _collect_defs(node, prefix, rel, funcs):
+    """Add every function/method reachable through class and control-flow nesting (no function scope crossed).
+
+    Mirrors co_qualname: control-flow blocks leave the prefix unchanged, classes prepend ``ClassName.``,
+    and function bodies are not descended (their nested defs carry ``<locals>``, which the tracker skips).
+    """
+    for child in ast.iter_child_nodes(node):
+        if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            funcs.add((rel, prefix + child.name))
+        elif isinstance(child, ast.ClassDef):
+            _collect_defs(child, f"{prefix}{child.name}.", rel, funcs)
+        else:
+            _collect_defs(child, prefix, rel, funcs)
 
 
 def enumerate_defs(source_root):
@@ -93,17 +117,7 @@ def enumerate_defs(source_root):
                 tree = ast.parse(open(full, encoding="utf-8").read())
             except (OSError, SyntaxError):
                 continue
-
-            def visit(node, prefix):
-                for child in node.body:
-                    if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                        funcs.add((rel, prefix + child.name))
-                    elif isinstance(child, ast.ClassDef):
-                        for m in child.body:
-                            if isinstance(m, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                                funcs.add((rel, f"{prefix}{child.name}.{m.name}"))
-
-            visit(tree, "")
+            _collect_defs(tree, "", rel, funcs)
     return {f for f, _q in funcs}, funcs
 
 
@@ -118,7 +132,9 @@ _CSS = (
 
 
 def _page_name(file):
-    return re.sub(r"[^A-Za-z0-9]", "_", file) + ".html"
+    # Readable slug plus a path digest so distinct files (a-b.py vs a_b.py) never share a page.
+    slug = re.sub(r"[^A-Za-z0-9]", "_", file)
+    return f"{slug}-{hashlib.sha1(file.encode('utf-8')).hexdigest()[:10]}.html"
 
 
 def write_html_tree(out_dir, con, rate_line, n_tests, n_data_files):
@@ -243,9 +259,14 @@ def main():
     )
     a = ap.parse_args()
 
-    # Merge streams into a SQLite DB (bounded memory). Use --out-sqlite as that DB directly, else a temp file.
+    # Merge streams into a SQLite DB (bounded memory). Use --out-sqlite as that DB directly,
+    # else a unique per-invocation temp file so concurrent jobs never share one path.
     keep = a.out_sqlite is not None
-    db_path = a.out_sqlite if keep else os.path.join(tempfile.gettempdir(), "cbts_merge_tmp.sqlite")
+    if keep:
+        db_path = a.out_sqlite
+    else:
+        fd, db_path = tempfile.mkstemp(prefix="cbts_merge_", suffix=".sqlite")
+        os.close(fd)
     con, n_data_files = merge_to_sqlite(a.glob, db_path)
 
     n_tests = con.execute("SELECT COUNT(DISTINCT test) FROM touch WHERE test != ''").fetchone()[0]
