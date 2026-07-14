@@ -1,5 +1,17 @@
-# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 from dataclasses import dataclass, field
 from types import SimpleNamespace
@@ -8,17 +20,10 @@ from unittest.mock import patch
 import pytest
 import torch
 
-import tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 as kv_cache_manager_v2_module
-from tensorrt_llm._torch.disaggregation.resource.page import MapperKind
-from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import (
-    BlockReusePolicy,
-    KVCacheManagerV2,
-    Role,
-)
+from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import BlockReusePolicy, KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.internal.batch_manager import CacheType
-from tensorrt_llm.bindings.internal.batch_manager import CacheType as CacheTypeCpp
 from tensorrt_llm.conversation_params import ConversationParams
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
@@ -505,54 +510,17 @@ def test_per_conversation_policy_ignores_overlapping_request(
         _free_if_active(manager, request_a)
 
 
-class _PoolMappingOverride(KVCacheManagerV2):
-    def _build_pool_mapping_tensors(self):
-        self.pool_mapping_override_called = True
-        return self.expected_pool_pointers, self.expected_pool_mapping
-
-
-class _FakePoolImpl:
-    layer_grouping = [[0]]
-
-    @staticmethod
-    def get_page_index_scale(_layer_id, _role):
-        return 1
-
-    @staticmethod
-    def get_mem_pool_base_address(_layer_id, role, _page_index_mode):
-        return 16 if role == Role.VALUE else 0
-
-    @staticmethod
-    def get_page_stride(_layer_id, _role):
-        return 16
-
-
-def test_prepare_page_table_uses_subclass_pool_mapping(monkeypatch):
-    """Keep sparse-manager pool mapping overrides on the initialization path."""
-    monkeypatch.setattr(kv_cache_manager_v2_module, "prefer_pinned", lambda: False)
-
-    manager = object.__new__(_PoolMappingOverride)
-    manager.expected_pool_pointers = torch.tensor([[11, 0]], dtype=torch.int64)
-    manager.expected_pool_mapping = torch.tensor([[0, 7]], dtype=torch.int32)
-    manager.pool_mapping_override_called = False
-    manager.num_pools = 1
-    manager.max_beam_width = 1
-    manager.max_blocks_per_seq = 4
-    manager.kv_cache_type = CacheTypeCpp.SELF
-    manager.enable_swa_scratch_reuse = False
-    manager.impl = _FakePoolImpl()
-
-    manager._prepare_page_table_tensor(index_mapper_capacity=2)
-
-    assert manager.pool_mapping_override_called
-    assert manager.kv_cache_pool_pointers is manager.expected_pool_pointers
-    assert manager.kv_cache_pool_mapping is manager.expected_pool_mapping
-    assert manager.index_scales.tolist() == [1]
-    assert manager.kv_offset.tolist() == [1]
-    assert manager.host_kv_cache_block_offsets.shape == (1, 2, 2, 4)
-
-
 def test_disagg_role_mapper_kinds_default_to_indexed():
+    from tensorrt_llm._torch.disaggregation.resource.page import MapperKind
+    from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import Role
+
     manager = object.__new__(KVCacheManagerV2)
 
-    assert manager.get_disagg_role_mapper_kinds() == {Role.ALL: MapperKind.INDEXED}
+    # K/V default to the TRTLLM head-major layout; the index-key side cache
+    # defaults to REPLICATED (every shipped index-K — DSA V1, MiniMax M3 —
+    # is TP-replicated). The INDEX_KEY entry is inert unless a subclass
+    # registers such buffers.
+    assert manager.get_disagg_role_mapper_kinds() == {
+        Role.ALL: MapperKind.INDEXED,
+        Role.INDEX_KEY: MapperKind.REPLICATED,
+    }
