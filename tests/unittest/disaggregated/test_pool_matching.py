@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Golden tests for ``PeerRegistrar.get_pool_mapping``.
 
 Covers pool-level and legacy disagg matching across representative scenarios:
@@ -5,7 +20,7 @@ Covers pool-level and legacy disagg matching across representative scenarios:
   * single KV pool, full layer overlap (basic MHA)
   * MLA (kv_factor=1, KEY-only pool)
   * KV + block-scale pools coexisting in one LG
-  * KV + FLAT pools coexisting in one LG (FLAT has empty buffer_entries)
+  * KV + REPLICATED indexer pools coexisting in one LG
   * PP partial layer overlap (Step-1 LG match by global_layer_id)
   * Two pools with same role but different layer sets within a peer LG
     (DSv4 virtual-layer scenario, exercises ``best_overlap``)
@@ -70,13 +85,13 @@ def _pool_view(pool_idx, layer_role_pairs, *, pool_role=None, mapper_kind=Mapper
     )
 
 
-def _empty_pool_view(pool_idx, *, pool_role=frozenset({"indexer_k"})):
-    """Pool view with no buffer entries — FLAT pool convention."""
-    return PoolView(
-        pool_idx=pool_idx,
-        buffer_entries=np.array([], dtype=BUFFER_ENTRY_DTYPE),
+def _indexer_pool_view(pool_idx, local_layer_ids, *, pool_role=frozenset({"indexer_k"})):
+    """Replicated indexer pool view: one synthesized entry per local layer."""
+    return _pool_view(
+        pool_idx,
+        [(lid, "indexer_k") for lid in local_layer_ids],
         pool_role=pool_role,
-        mapper_kind=MapperKind.FLAT,
+        mapper_kind=MapperKind.REPLICATED,
     )
 
 
@@ -229,16 +244,16 @@ def test_kv_and_block_scale_in_same_lg():
 
 
 def test_kv_and_indexer_in_same_lg():
-    """KV pool + FLAT pool. FLAT has empty buffer_entries; matches by role."""
+    """KV pool + replicated indexer pool match independently by role."""
     self_lg = _attn_lg(
         0,
         [(0, 0), (1, 1)],
-        [_kv_pool_view(0, [0, 1]), _empty_pool_view(1)],
+        [_kv_pool_view(0, [0, 1]), _indexer_pool_view(1, [0, 1])],
     )
     peer_lg = _attn_lg(
         0,
         [(0, 0), (1, 1)],
-        [_kv_pool_view(0, [0, 1]), _empty_pool_view(1)],
+        [_kv_pool_view(0, [0, 1]), _indexer_pool_view(1, [0, 1])],
     )
 
     self_pt = _page_table([self_lg], pool_specs={0: [(1024, 64, 0x1000), (512, 64, 0x2000)]})
@@ -292,6 +307,58 @@ def test_minimax_pool_views_match_across_physical_coalescing():
     ]
 
 
+def test_minimax_split_kv_and_replicated_index_pools_match():
+    """MiniMax M3 shape: NHD KV pool + REPLICATED index-key pool.
+
+    coalescing_group derivation keeps INDEX_KEY in its own pool on every
+    topology, so both sides always present the same two role sets and
+    role-set matching pairs them 1:1 with kinds intact.
+    """
+
+    def _lg():
+        return _attn_lg(
+            0,
+            [(0, 0), (1, 1)],
+            [
+                _pool_view(
+                    0,
+                    [(lid, role) for lid in (0, 1) for role in ("key", "value")],
+                    mapper_kind=MapperKind.NHD,
+                ),
+                _pool_view(
+                    1, [(0, "index_key"), (1, "index_key")], mapper_kind=MapperKind.REPLICATED
+                ),
+            ],
+        )
+
+    self_pt = _page_table([_lg()], pool_specs={0: [(512, 64, 0x1000), (256, 64, 0x2000)]})
+    peer_pt = _page_table([_lg()], pool_specs={0: [(512, 64, 0x3000), (256, 64, 0x4000)]})
+
+    reg = _registrar(self_pt)
+    peer_ri = _rank_info(name="peer", rank=1, page_table=peer_pt)
+
+    mapping = reg.get_pool_mapping(peer_ri)
+    assert mapping == {(0, 0): (0, 0), (0, 1): (0, 1)}
+
+
+def test_mismatched_view_kinds_raise():
+    """Kind disagreement on one role set must fail loudly.
+
+    Same role set but different kinds on the two sides is a version or
+    configuration inconsistency.
+    """
+    self_lg = _attn_lg(
+        0, [(0, 0)], [_pool_view(0, [(0, "index_key")], mapper_kind=MapperKind.REPLICATED)]
+    )
+    peer_lg = _attn_lg(0, [(0, 0)], [_pool_view(0, [(0, "index_key")], mapper_kind=MapperKind.NHD)])
+
+    reg = _registrar(_page_table([self_lg]))
+    peer_ri = _rank_info(name="peer", rank=1, page_table=_page_table([peer_lg]))
+
+    with pytest.raises(ValueError, match="incompatible mapper"):
+        reg.get_pool_mapping(peer_ri)
+
+
 def test_pp_partial_layer_overlap():
     """Self covers global layers {10,11}, peer covers {11,12}. Match via overlap on layer 11."""
     self_lg = _attn_lg(0, [(0, 10), (1, 11)], [_kv_pool_view(0, [0, 1])])
@@ -335,11 +402,11 @@ def test_two_pools_distinct_roles_in_same_lg():
     pool with the same pool_role.
     """
     self_kv = _kv_pool_view(0, [0, 1])
-    self_indexer = _empty_pool_view(1)
+    self_indexer = _indexer_pool_view(1, [0, 1])
     self_lg = _attn_lg(0, [(0, 10), (1, 11)], [self_kv, self_indexer])
 
     peer_kv = _kv_pool_view(0, [0, 1])
-    peer_indexer = _empty_pool_view(1)
+    peer_indexer = _indexer_pool_view(1, [0, 1])
     peer_lg = _attn_lg(0, [(0, 10), (1, 11)], [peer_kv, peer_indexer])
 
     self_pt = _page_table([self_lg], pool_specs={0: [(1024, 64, 0x1000), (512, 64, 0x2000)]})
@@ -384,20 +451,19 @@ def test_same_role_pools_disambiguated_by_layer_overlap():
 @pytest.mark.parametrize(
     ("self_mapper_kind", "peer_mapper_kind"),
     [
-        (MapperKind.FLAT, MapperKind.INDEXED),
-        (MapperKind.INDEXED, MapperKind.FLAT),
+        (MapperKind.REPLICATED, MapperKind.INDEXED),
+        (MapperKind.INDEXED, MapperKind.REPLICATED),
     ],
 )
 def test_mixed_mapper_kinds_are_rejected(self_mapper_kind, peer_mapper_kind):
     """Pool layouts must use the same mapper kind on both peers."""
 
     def _indexer_view(mapper_kind):
-        if mapper_kind == MapperKind.FLAT:
-            return _empty_pool_view(0)
         return _pool_view(
             0,
             [(0, "indexer_k"), (1, "indexer_k")],
             pool_role=frozenset({"indexer_k"}),
+            mapper_kind=mapper_kind,
         )
 
     self_lg = _attn_lg(0, [(0, 10), (1, 11)], [_indexer_view(self_mapper_kind)])

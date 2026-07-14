@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import numpy as np
 
 from tensorrt_llm._torch.disaggregation.resource.page import (
@@ -50,39 +65,22 @@ def test_pool_view_roundtrip():
     assert restored.buffer_entries[1]["offset"] == 128
 
 
-def test_logical_pool_view_roundtrip_and_legacy_defaults():
+def test_pool_view_kind_roundtrip():
+    """REPLICATED / NHD kinds survive serialization; default stays INDEXED."""
     entries = _make_buffer_entries()
-    view = PoolView(
-        pool_idx=2,
-        buffer_entries=entries,
-        pool_role=frozenset({"index_key"}),
-        mapper_kind=MapperKind.REPLICATED,
-        buffer_roles=("index_key", "index_key"),
-        buffer_mapper_kinds=(MapperKind.REPLICATED, MapperKind.REPLICATED),
-        byte_offset=768,
-        bytes_per_region=256,
-    )
+    for kind in (MapperKind.REPLICATED, MapperKind.NHD):
+        view = PoolView(
+            pool_idx=2,
+            buffer_entries=entries,
+            pool_role=frozenset({"index_key"}),
+            mapper_kind=kind,
+        )
+        restored = PoolView.from_dict(view.to_dict())
+        assert restored.mapper_kind == kind
+        assert restored.pool_role == frozenset({"index_key"})
 
-    restored = PoolView.from_dict(view.to_dict())
-    assert restored.mapper_kind == MapperKind.REPLICATED
-    assert restored.buffer_roles == ("index_key", "index_key")
-    assert restored.buffer_mapper_kinds == (
-        MapperKind.REPLICATED,
-        MapperKind.REPLICATED,
-    )
-    assert restored.byte_offset == 768
-    assert restored.bytes_per_region == 256
-
-    legacy = view.to_dict()
-    del legacy["byte_offset"]
-    del legacy["bytes_per_region"]
-    del legacy["buffer_roles"]
-    del legacy["buffer_mapper_kinds"]
-    restored_legacy = PoolView.from_dict(legacy)
-    assert restored_legacy.byte_offset == 0
-    assert restored_legacy.bytes_per_region is None
-    assert restored_legacy.buffer_roles == ()
-    assert restored_legacy.buffer_mapper_kinds == ()
+    legacy = PoolView(pool_idx=0, buffer_entries=entries).to_dict()
+    assert PoolView.from_dict(legacy).mapper_kind == MapperKind.INDEXED
 
 
 def test_local_layer_roundtrip():
@@ -136,3 +134,94 @@ def test_kv_cache_page_table_roundtrip():
     assert len(restored.layer_groups) == 1
     assert len(restored.pool_groups) == 1
     assert restored.pool_groups[0].pools[0].base_address == 0x10000
+
+
+# ---------------------------------------------------------------------------
+# bytes_per_layer serialization and get_layer_byte_ranges geometry
+# ---------------------------------------------------------------------------
+
+
+def test_pool_view_bytes_per_layer_roundtrip():
+    entries = _make_buffer_entries()
+    view = PoolView(
+        pool_idx=1,
+        buffer_entries=entries,
+        pool_role=frozenset({"key", "value"}),
+        mapper_kind=MapperKind.NHD,
+        bytes_per_layer=256,
+    )
+    restored = PoolView.from_dict(view.to_dict())
+    assert restored.bytes_per_layer == 256
+
+    # None (INDEXED views) survives the roundtrip too.
+    legacyless = PoolView(pool_idx=0, buffer_entries=entries)
+    assert PoolView.from_dict(legacyless.to_dict()).bytes_per_layer is None
+
+
+def _view(entries, bytes_per_layer=None):
+    return PoolView(
+        pool_idx=0,
+        buffer_entries=np.array(entries, dtype=BUFFER_ENTRY_DTYPE),
+        pool_role=frozenset({"key", "value"}),
+        mapper_kind=MapperKind.NHD,
+        bytes_per_layer=bytes_per_layer,
+    )
+
+
+def test_layer_byte_ranges_uniform_stride():
+    from tensorrt_llm._torch.disaggregation.resource.utils import get_layer_byte_ranges
+
+    # Dedicated K/V pool: dense layers, uniform stride.
+    starts, bytes_per_layer = get_layer_byte_ranges(
+        _view([(0, 0, 128), (0, 128, 128), (1, 256, 128), (1, 384, 128)])
+    )
+    assert starts == {0: 0, 1: 256}
+    assert bytes_per_layer == 256
+
+
+def test_layer_byte_ranges_non_uniform_stride():
+    from tensorrt_llm._torch.disaggregation.resource.utils import get_layer_byte_ranges
+
+    # Coalesced slot: another role class interleaves 64B after layer 0,
+    # so the layer stride is non-uniform while sizes stay uniform.
+    starts, bytes_per_layer = get_layer_byte_ranges(
+        _view([(0, 0, 128), (0, 128, 128), (1, 320, 128), (1, 448, 128)])
+    )
+    assert starts == {0: 0, 1: 320}
+    assert bytes_per_layer == 256
+
+
+def test_layer_byte_ranges_noncontiguous_layer_raises():
+    import pytest
+
+    from tensorrt_llm._torch.disaggregation.resource.utils import get_layer_byte_ranges
+
+    with pytest.raises(ValueError, match="not contiguous"):
+        get_layer_byte_ranges(_view([(0, 0, 128), (0, 192, 128)]))
+
+
+def test_layer_byte_ranges_nonuniform_size_raises():
+    import pytest
+
+    from tensorrt_llm._torch.disaggregation.resource.utils import get_layer_byte_ranges
+
+    with pytest.raises(ValueError, match="not uniform"):
+        get_layer_byte_ranges(_view([(0, 0, 128), (1, 128, 64)]))
+
+
+def test_layer_byte_ranges_declared_size_mismatch_raises():
+    import pytest
+
+    from tensorrt_llm._torch.disaggregation.resource.utils import get_layer_byte_ranges
+
+    with pytest.raises(ValueError, match="declares bytes_per_layer"):
+        get_layer_byte_ranges(_view([(0, 0, 128)], bytes_per_layer=256))
+
+
+def test_layer_byte_ranges_empty_view_raises():
+    import pytest
+
+    from tensorrt_llm._torch.disaggregation.resource.utils import get_layer_byte_ranges
+
+    with pytest.raises(ValueError, match="no buffer entries"):
+        get_layer_byte_ranges(_view([]))

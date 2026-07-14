@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import numpy as np
 import pytest
 
@@ -10,6 +25,7 @@ from tensorrt_llm._torch.disaggregation.resource.kv_extractor import (
 from tensorrt_llm._torch.disaggregation.resource.page import MapperKind
 from tensorrt_llm._torch.disaggregation.resource.utils import (
     get_global_layer_ids,
+    get_layer_byte_ranges,
     get_layer_to_layer_group,
     get_num_layer_groups,
     get_num_layers,
@@ -189,6 +205,142 @@ def test_build_page_table():
     manager.shutdown()
 
 
+def _make_v1_dsa_manager(pp_size: int = 1, pp_rank: int = 0) -> KVCacheManager:
+    """V1 KVCacheManager with the DSA indexer K cache enabled (MLA-style)."""
+    return KVCacheManager(
+        kv_cache_config=KvCacheConfig(
+            max_tokens=512,
+            enable_block_reuse=False,
+            event_buffer_max_size=0,
+        ),
+        kv_cache_type=CacheTypeCpp.SELFKONLY,
+        num_layers=4,
+        num_kv_heads=1,
+        head_dim=64,
+        tokens_per_block=32,
+        max_seq_len=256,
+        max_batch_size=2,
+        mapping=Mapping(world_size=pp_size, rank=pp_rank, tp_size=1, pp_size=pp_size),
+        dtype=DataType.HALF,
+        enable_indexer_k_cache=True,
+        indexer_k_cache_quant_block_size=128,
+        indexer_k_cache_index_head_dim=128,
+    )
+
+
+def _byte_view(ptr: int, nbytes: int):
+    from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor
+
+    return convert_to_torch_tensor(TensorWrapper(int(ptr), DataType.INT8, [int(nbytes)]))
+
+
+@pytest.mark.cuda
+def test_v1_dsa_indexer_page_table_is_replicated_with_per_layer_entries():
+    manager = _make_v1_dsa_manager()
+    try:
+        page_table = build_page_table(manager)
+        lg = page_table.layer_groups[0]
+        assert len(lg.pool_views) == 2
+
+        kv_view, idx_view = lg.pool_views
+        assert kv_view.mapper_kind == MapperKind.INDEXED
+        assert idx_view.mapper_kind == MapperKind.REPLICATED
+        assert idx_view.pool_role == frozenset({"indexer_k"})
+
+        # One synthesized entry per LG layer, equal-sized, contiguous from 0.
+        assert get_unique_layers(idx_view) == get_unique_layers(kv_view)
+        idx_pool = get_physical_pool(page_table, 0, idx_view.pool_idx)
+        sizes = {int(entry["size"]) for entry in idx_view.buffer_entries}
+        assert len(sizes) == 1
+        per_layer = sizes.pop()
+        assert per_layer * len(idx_view.buffer_entries) == idx_pool.slot_bytes
+        offsets = sorted(int(entry["offset"]) for entry in idx_view.buffer_entries)
+        assert offsets == [i * per_layer for i in range(len(offsets))]
+    finally:
+        manager.shutdown()
+
+
+@pytest.mark.cuda
+def test_v1_dsa_indexer_replicated_transfer_across_pp():
+    """PP1 ctx sends the DSA indexer K cache into two PP2 gen ranks.
+
+    Exercises the full python path on real V1 managers: page-table build,
+    role-set matching, ReplicatedMapper layer-strided offsets, and a
+    byte-level copy that must land each gen rank's layer subset at the
+    right offsets.
+    """
+    import torch
+
+    from tensorrt_llm._torch.disaggregation.native.mixers.attention.peer import ReplicatedMapper
+    from tensorrt_llm._torch.disaggregation.native.peer import PeerRegistrar
+    from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
+
+    ctx = _make_v1_dsa_manager()
+    gens = [_make_v1_dsa_manager(pp_size=2, pp_rank=r) for r in range(2)]
+    try:
+        ctx_extractor = KVRegionExtractorV1(ctx)
+        ctx_ri = RankInfo.from_kv_cache_manager("ctx", ctx, device_id=0)
+        registrar = PeerRegistrar(ctx_ri, ctx_extractor)
+
+        # Fill ctx indexer pool with position-dependent bytes; zero gen pools.
+        ctx_pool_tensor = ctx.impl.get_indexer_k_cache_pool()
+        flat = ctx_pool_tensor.view(torch.uint8).flatten()
+        flat.copy_(torch.arange(flat.numel(), dtype=torch.int64, device=flat.device) % 251)
+        for gen in gens:
+            gen.impl.get_indexer_k_cache_pool().view(torch.uint8).zero_()
+
+        block_ids = np.array([0, 2, 3], dtype=np.int64)
+        ctx_pt = ctx_extractor.page_table
+        idx_pool = get_physical_pool(ctx_pt, 0, 1)
+        layers_per_gen = 2
+        per_layer = idx_pool.slot_bytes // 4
+
+        for gen_pp_rank, gen in enumerate(gens):
+            gen_ri = RankInfo.from_kv_cache_manager("gen", gen, device_id=0)
+            registrar.register("gen", gen_ri.instance_rank, gen_ri)
+            mapping = registrar.get_pool_mapping(gen_ri)
+            # KV pool and indexer pool each match 1:1.
+            assert mapping == {(0, 0): (0, 0), (0, 1): (0, 1)}
+
+            mapper = registrar.get_kv_map(gen_ri, (0, 1), (0, 1))
+            assert isinstance(mapper, ReplicatedMapper)
+
+            gen_extractor = registrar.peer_extractor("gen", gen_ri.instance_rank)
+            pair = mapper.map(
+                ctx_extractor.extract(block_ids, layer_group_id=0, pool_idx=1),
+                gen_extractor.extract(block_ids, layer_group_id=0, pool_idx=1),
+            )
+            # This gen rank holds 2 of the 4 layers; the fragment is the
+            # contiguous 2-layer range at this PP stage's offset within
+            # the ctx slot.
+            assert pair.src.memory.bytes_per_region == layers_per_gen * per_layer
+            expected_src_off = gen_pp_rank * layers_per_gen * per_layer
+            base_ptrs = idx_pool.base_address + block_ids * idx_pool.slot_bytes
+            np.testing.assert_array_equal(pair.src.memory.ptrs, base_ptrs + expected_src_off)
+
+            # Emulate the transfer with raw byte copies, then verify content.
+            for src_ptr, dst_ptr in zip(pair.src.memory.ptrs, pair.dst.memory.ptrs):
+                _byte_view(dst_ptr, pair.dst.memory.bytes_per_region).copy_(
+                    _byte_view(src_ptr, pair.src.memory.bytes_per_region)
+                )
+
+            gen_pool_tensor = gen.impl.get_indexer_k_cache_pool()
+            gen_bytes = gen_pool_tensor.view(torch.uint8).reshape(gen_pool_tensor.shape[0], -1)
+            ctx_bytes = ctx_pool_tensor.view(torch.uint8).reshape(ctx_pool_tensor.shape[0], -1)
+            src_lo = gen_pp_rank * layers_per_gen * per_layer
+            src_hi = src_lo + layers_per_gen * per_layer
+            torch.testing.assert_close(
+                gen_bytes[block_ids],
+                ctx_bytes[block_ids, src_lo:src_hi],
+                rtol=0,
+                atol=0,
+            )
+    finally:
+        ctx.shutdown()
+        for gen in gens:
+            gen.shutdown()
+
+
 def test_layer_group_meta_serialization():
     import numpy as np
 
@@ -234,57 +386,93 @@ def test_layer_group_meta_serialization():
     assert len(restored_lg.pool_views[0].buffer_entries) == 2
 
 
-@pytest.mark.parametrize(
-    ("bytes_per_region", "expected_region_size"),
-    [(128, 128), (0, 0), (None, 384)],
-)
-def test_extract_logical_pool_view_uses_physical_stride(bytes_per_region, expected_region_size):
-    from tensorrt_llm._torch.disaggregation.resource.page import (
-        BUFFER_ENTRY_DTYPE,
-        AttentionLayerGroup,
-        KVCachePageTable,
-        LocalLayer,
-        PhysicalPool,
-        PhysicalPoolGroup,
-        PoolView,
-    )
-
-    page_table = KVCachePageTable(
-        tokens_per_block=16,
-        layer_groups=[
-            AttentionLayerGroup(
-                pool_group_idx=0,
-                kv_head_num_per_rank=1,
-                local_layers=[LocalLayer(0, 0)],
-                pool_views=[
-                    PoolView(
-                        pool_idx=0,
-                        buffer_entries=np.array([(0, 256, 128)], dtype=BUFFER_ENTRY_DTYPE),
-                        pool_role=frozenset({"index_key"}),
-                        mapper_kind=MapperKind.REPLICATED,
-                        byte_offset=256,
-                        bytes_per_region=bytes_per_region,
-                    )
-                ],
-            )
-        ],
-        pool_groups=[
-            PhysicalPoolGroup(pools=[PhysicalPool(base_address=1000, slot_bytes=384, num_slots=4)])
-        ],
-    )
-
-    region = KVRegionExtractorV1(page_table).extract(np.array([0, -1, 2], dtype=np.int64))
-    np.testing.assert_array_equal(region.memory.ptrs, np.array([1256, 2024]))
-    assert region.memory.bytes_per_region == expected_region_size
-
-
-def test_v2_index_key_builder_keeps_pool_level_view():
+def _make_fake_v2_manager(attrs, role_mapper_kinds, *, num_pools=1, slot_bytes_list=(640,)):
+    """Build a minimal duck-typed KVCacheManagerV2 for _build_page_table_v2."""
     from types import SimpleNamespace
 
     from tensorrt_llm.runtime.kv_cache_manager_v2 import CacheTier
 
     base = 0x1000
-    slot_bytes = 640
+
+    def _make_pool(slot_bytes):
+        return SimpleNamespace(
+            slot_size=slot_bytes,
+            num_slots=4,
+            slot_address=lambda slot, _sb=slot_bytes: base + slot * _sb,
+        )
+
+    impl = SimpleNamespace(
+        layer_grouping=((0, 1),),
+        _life_cycles=[SimpleNamespace(window_size=None)],
+        _init_config=SimpleNamespace(
+            cache_tiers=[SimpleNamespace(tier=CacheTier.GPU_MEM)], tokens_per_block=16
+        ),
+        _storage=SimpleNamespace(
+            _buffer_attr=attrs,
+            num_life_cycles=1,
+            get_pool_group_index=lambda _lc: 0,
+            _levels=[
+                SimpleNamespace(
+                    storage=SimpleNamespace(
+                        _pool_groups=[
+                            SimpleNamespace(
+                                num_pools=num_pools,
+                                _pools=[_make_pool(sb) for sb in slot_bytes_list],
+                            )
+                        ]
+                    )
+                )
+            ],
+        ),
+    )
+    return SimpleNamespace(
+        impl=impl,
+        pp_layers=[0, 1],
+        num_kv_heads_per_layer=[1, 1],
+        get_disagg_role_mapper_kinds=lambda: role_mapper_kinds,
+    )
+
+
+def test_v2_builder_stamps_homogeneous_pool_kinds():
+    """Split KV / INDEX_KEY pools get NHD and REPLICATED views respectively."""
+    from types import SimpleNamespace
+
+    attrs = {
+        (0, Role.KEY): SimpleNamespace(life_cycle_id=0, pool_index=0, offset=0, size=128),
+        (0, Role.VALUE): SimpleNamespace(life_cycle_id=0, pool_index=0, offset=128, size=128),
+        (1, Role.KEY): SimpleNamespace(life_cycle_id=0, pool_index=0, offset=256, size=128),
+        (1, Role.VALUE): SimpleNamespace(life_cycle_id=0, pool_index=0, offset=384, size=128),
+        (1, Role.INDEX_KEY): SimpleNamespace(life_cycle_id=0, pool_index=1, offset=0, size=128),
+    }
+    manager = _make_fake_v2_manager(
+        attrs,
+        {Role.ALL: MapperKind.NHD, Role.INDEX_KEY: MapperKind.REPLICATED},
+        num_pools=2,
+        slot_bytes_list=(512, 128),
+    )
+
+    views = build_page_table_from_manager(manager).layer_groups[0].pool_views
+    assert len(views) == 2
+    assert views[0].pool_role == frozenset({"key", "value"})
+    assert views[0].mapper_kind == MapperKind.NHD
+    assert get_unique_layers(views[0]) == {0, 1}
+    assert views[1].pool_role == frozenset({"index_key"})
+    assert views[1].mapper_kind == MapperKind.REPLICATED
+    assert get_unique_layers(views[1]) == {1}
+
+
+def test_v2_builder_splits_mixed_kind_pool_into_per_class_views():
+    """A pool coalescing several role classes yields one view per class.
+
+    Miniature of the MiniMax M3 layout at TP degrees where
+    K == V == INDEX_KEY bytes per block: V2 storage coalesces all three
+    into one pool and the slot interleaves the sparse layer's INDEX_KEY
+    between the layers' K/V regions. The builder must split the pool into
+    a NHD K/V view (non-uniform layer offsets, uniform per-layer size)
+    and a REPLICATED INDEX_KEY view covering only the sparse layer.
+    """
+    from types import SimpleNamespace
+
     attrs = {
         (0, Role.KEY): SimpleNamespace(life_cycle_id=0, pool_index=0, offset=0, size=128),
         (0, Role.VALUE): SimpleNamespace(life_cycle_id=0, pool_index=0, offset=128, size=128),
@@ -292,142 +480,87 @@ def test_v2_index_key_builder_keeps_pool_level_view():
         (1, Role.KEY): SimpleNamespace(life_cycle_id=0, pool_index=0, offset=384, size=128),
         (1, Role.VALUE): SimpleNamespace(life_cycle_id=0, pool_index=0, offset=512, size=128),
     }
-
-    class FakePool:
-        slot_size = slot_bytes
-        num_slots = 4
-
-        @staticmethod
-        def slot_address(slot):
-            return base + slot * slot_bytes
-
-    class FakeImpl:
-        layer_grouping = ((0, 1),)
-        _life_cycles = [SimpleNamespace(window_size=None)]
-        _init_config = SimpleNamespace(
-            cache_tiers=[SimpleNamespace(tier=CacheTier.GPU_MEM)], tokens_per_block=16
-        )
-        _storage = SimpleNamespace(
-            _buffer_attr=attrs,
-            num_life_cycles=1,
-            get_pool_group_index=lambda _lc: 0,
-            _levels=[
-                SimpleNamespace(
-                    storage=SimpleNamespace(
-                        _pool_groups=[SimpleNamespace(num_pools=1, _pools=[FakePool()])]
-                    )
-                )
-            ],
-        )
-
-    manager = SimpleNamespace(
-        impl=FakeImpl(),
-        pp_layers=[0, 1],
-        num_kv_heads_per_layer=[1, 1],
-        get_disagg_role_mapper_kinds=lambda: {
-            Role.ALL: MapperKind.NHD,
-            Role.INDEX_KEY: MapperKind.REPLICATED,
-        },
+    manager = _make_fake_v2_manager(
+        attrs,
+        {Role.ALL: MapperKind.NHD, Role.INDEX_KEY: MapperKind.REPLICATED},
     )
 
-    page_table = build_page_table_from_manager(manager)
-    views = page_table.layer_groups[0].pool_views
+    views = build_page_table_from_manager(manager).layer_groups[0].pool_views
+    assert len(views) == 2
+    kv_view, idx_view = views
+    # Both views address the same physical pool.
+    assert kv_view.pool_idx == idx_view.pool_idx == 0
+
+    assert kv_view.pool_role == frozenset({"key", "value"})
+    assert kv_view.mapper_kind == MapperKind.NHD
+    assert get_unique_layers(kv_view) == {0, 1}
+    assert kv_view.bytes_per_layer == 256
+    kv_starts, kv_bytes_per_layer = get_layer_byte_ranges(kv_view)
+    # Layer stride is non-uniform: INDEX_KEY interleaves after layer 0.
+    assert kv_starts == {0: 0, 1: 384}
+    assert kv_bytes_per_layer == 256
+
+    assert idx_view.pool_role == frozenset({"index_key"})
+    assert idx_view.mapper_kind == MapperKind.REPLICATED
+    assert get_unique_layers(idx_view) == {0}
+    assert idx_view.bytes_per_layer == 128
+    idx_starts, _ = get_layer_byte_ranges(idx_view)
+    assert idx_starts == {0: 256}
+
+
+def test_v2_builder_validates_role_mapper_declaration():
+    from types import SimpleNamespace
+
+    attrs = {
+        (0, Role.KEY): SimpleNamespace(life_cycle_id=0, pool_index=0, offset=0, size=128),
+        (0, Role.VALUE): SimpleNamespace(life_cycle_id=0, pool_index=0, offset=128, size=128),
+        (1, Role.KEY): SimpleNamespace(life_cycle_id=0, pool_index=0, offset=256, size=128),
+        (1, Role.VALUE): SimpleNamespace(life_cycle_id=0, pool_index=0, offset=384, size=128),
+    }
+
+    # Default INDEXED declaration keeps the whole-slot HND view.
+    views = (
+        build_page_table_from_manager(_make_fake_v2_manager(attrs, {Role.ALL: MapperKind.INDEXED}))
+        .layer_groups[0]
+        .pool_views
+    )
     assert len(views) == 1
-    assert views[0].pool_role == frozenset({"key", "value", "index_key"})
-    assert views[0].mapper_kind == MapperKind.MIXED
-    assert views[0].buffer_roles == ("key", "value", "index_key", "key", "value")
-    assert views[0].buffer_mapper_kinds == (
-        MapperKind.NHD,
-        MapperKind.NHD,
-        MapperKind.REPLICATED,
-        MapperKind.NHD,
-        MapperKind.NHD,
-    )
-    assert views[0].byte_offset == 0
-    assert views[0].bytes_per_region is None
+    assert views[0].mapper_kind == MapperKind.INDEXED
 
-    # A dense-only PP rank has no local INDEX_KEY entry, so its one physical
-    # pool view is homogeneous NHD.
-    dense_impl = FakeImpl()
-    dense_impl._storage = SimpleNamespace(
-        _buffer_attr={key: attr for key, attr in attrs.items() if key[1] != Role.INDEX_KEY},
-        num_life_cycles=1,
-        get_pool_group_index=lambda _lc: 0,
-        _levels=FakeImpl._storage._levels,
-    )
-    dense_manager = SimpleNamespace(
-        impl=dense_impl,
-        pp_layers=[0, 1],
-        num_kv_heads_per_layer=[1, 1],
-        get_disagg_role_mapper_kinds=manager.get_disagg_role_mapper_kinds,
-    )
-    dense_views = build_page_table_from_manager(dense_manager).layer_groups[0].pool_views
-    assert len(dense_views) == 1
-    assert get_unique_layers(dense_views[0]) == {0, 1}
-    assert dense_views[0].mapper_kind == MapperKind.NHD
-
-    # A private attribute with a coincidental name must not opt a manager into
-    # model-specific logical views.
-    accidental_manager = SimpleNamespace(
-        impl=FakeImpl(),
-        pp_layers=[0, 1],
-        num_kv_heads_per_layer=[1, 1],
-        sparse_layer_ids=[3],
-        get_disagg_role_mapper_kinds=lambda: {Role.ALL: MapperKind.INDEXED},
-    )
-    accidental_views = build_page_table_from_manager(accidental_manager).layer_groups[0].pool_views
-    assert len(accidental_views) == 1
-    assert accidental_views[0].mapper_kind == MapperKind.INDEXED
-
-    # V2 managers must expose the capability method explicitly. A missing
-    # method is a programming error rather than an invitation to guess from
-    # private attributes.
-    missing_capability_manager = SimpleNamespace(
-        impl=FakeImpl(),
-        pp_layers=[0, 1],
-        num_kv_heads_per_layer=[1, 1],
-    )
+    # V2 managers must expose the capability method explicitly.
+    missing_capability = _make_fake_v2_manager(attrs, {Role.ALL: MapperKind.INDEXED})
+    del missing_capability.get_disagg_role_mapper_kinds
     with pytest.raises(AttributeError, match="get_disagg_role_mapper_kinds"):
-        build_page_table_from_manager(missing_capability_manager)
+        build_page_table_from_manager(missing_capability)
 
-    missing_default_manager = SimpleNamespace(
-        impl=FakeImpl(),
-        pp_layers=[0, 1],
-        num_kv_heads_per_layer=[1, 1],
-        get_disagg_role_mapper_kinds=lambda: {Role.INDEX_KEY: MapperKind.REPLICATED},
-    )
     with pytest.raises(ValueError, match="must define Role.ALL"):
-        build_page_table_from_manager(missing_default_manager)
+        build_page_table_from_manager(
+            _make_fake_v2_manager(attrs, {Role.INDEX_KEY: MapperKind.REPLICATED})
+        )
 
-    invalid_mapper_manager = SimpleNamespace(
-        impl=FakeImpl(),
-        pp_layers=[0, 1],
-        num_kv_heads_per_layer=[1, 1],
-        get_disagg_role_mapper_kinds=lambda: {Role.ALL: "HND"},
-    )
     with pytest.raises(ValueError, match="Invalid disaggregation mapper kind 'HND'"):
-        build_page_table_from_manager(invalid_mapper_manager)
+        build_page_table_from_manager(_make_fake_v2_manager(attrs, {Role.ALL: "HND"}))
 
-    unsupported_mapper_manager = SimpleNamespace(
-        impl=FakeImpl(),
-        pp_layers=[0, 1],
-        num_kv_heads_per_layer=[1, 1],
-        get_disagg_role_mapper_kinds=lambda: {Role.ALL: MapperKind.FLAT},
-    )
-    with pytest.raises(ValueError, match="Unsupported V2 disaggregation mapper kind FLAT"):
-        build_page_table_from_manager(unsupported_mapper_manager)
+    with pytest.raises(ValueError, match="INDEXED is only valid as the Role.ALL mapping"):
+        build_page_table_from_manager(
+            _make_fake_v2_manager(attrs, {Role.ALL: MapperKind.NHD, Role.KEY: MapperKind.INDEXED})
+        )
 
-    mixed_indexed_manager = SimpleNamespace(
-        impl=FakeImpl(),
-        pp_layers=[0, 1],
-        num_kv_heads_per_layer=[1, 1],
-        get_disagg_role_mapper_kinds=lambda: {
-            Role.ALL: MapperKind.NHD,
-            Role.KEY: MapperKind.INDEXED,
-        },
+    # INDEXED as the Role.ALL fallback coexists with side-cache roles that
+    # declare their own kind (the base-manager default for INDEX_KEY); with
+    # no INDEX_KEY buffers registered the declaration is inert.
+    views = (
+        build_page_table_from_manager(
+            _make_fake_v2_manager(
+                attrs,
+                {Role.ALL: MapperKind.INDEXED, Role.INDEX_KEY: MapperKind.REPLICATED},
+            )
+        )
+        .layer_groups[0]
+        .pool_views
     )
-    with pytest.raises(ValueError, match="INDEXED is only valid as the sole Role.ALL mapping"):
-        build_page_table_from_manager(mixed_indexed_manager)
+    assert len(views) == 1
+    assert views[0].mapper_kind == MapperKind.INDEXED
 
 
 def test_mamba_layer_group_serialization():
