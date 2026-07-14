@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Single-process test for KVCacheManager (V1/V2) + KvCacheTransceiverV2.
 
 Uses threading + ThreadSafeDistributed to create KvCacheTransceiverV2 instances
@@ -47,6 +62,7 @@ os.environ.setdefault("TRTLLM_NIXL_NUM_THREADS", "0")
 # Constants
 # ---------------------------------------------------------------------------
 NUM_LAYERS = 4
+INDEXER_HEAD_DIM = 128
 NUM_KV_HEADS = 4  # 1 for MLA
 HEAD_DIM = 128
 TOKENS_PER_BLOCK = 8
@@ -303,8 +319,10 @@ def _create_cache_manager(
     max_attention_window_vec: Optional[List[int]] = None,
     num_layers: int = NUM_LAYERS,
     max_batch_size: int = MAX_BATCH_SIZE,
+    enable_indexer_k_cache: bool = False,
 ) -> "KVCacheManager | KVCacheManagerV2":
     """Create a KVCacheManager (V1) or KVCacheManagerV2 for the given mapping."""
+    assert not (enable_indexer_k_cache and use_v2), "DSA indexer K cache is V1-only"
     num_kv_heads = 1 if is_mla else NUM_KV_HEADS
     cache_type = CacheTypeCpp.SELFKONLY if is_mla else CacheTypeCpp.SELF
 
@@ -371,6 +389,9 @@ def _create_cache_manager(
             mapping=mapping,
             dtype=DataType.FLOAT,
             model_config=model_config,
+            enable_indexer_k_cache=enable_indexer_k_cache,
+            indexer_k_cache_quant_block_size=128,
+            indexer_k_cache_index_head_dim=INDEXER_HEAD_DIM if enable_indexer_k_cache else 0,
         )
 
 
@@ -383,6 +404,7 @@ def _create_managers_for_instance(
     max_attention_window_vec: Optional[List[int]] = None,
     num_layers: int = NUM_LAYERS,
     max_batch_size: int = MAX_BATCH_SIZE,
+    enable_indexer_k_cache: bool = False,
 ) -> List:
     """Create cache managers for all ranks in an instance."""
     managers = []
@@ -398,7 +420,13 @@ def _create_managers_for_instance(
             )
             managers.append(
                 _create_cache_manager(
-                    mapping, is_mla, use_v2, max_attention_window_vec, num_layers, max_batch_size
+                    mapping,
+                    is_mla,
+                    use_v2,
+                    max_attention_window_vec,
+                    num_layers,
+                    max_batch_size,
+                    enable_indexer_k_cache,
                 )
             )
     return managers
@@ -432,6 +460,27 @@ def _init_pool_data_v1(
             pool_tensor.copy_(random_values)
         else:
             pool_tensor.zero_()
+
+        if getattr(mgr, "enable_indexer_k_cache", False):
+            # DSA indexer K is TP-replicated: seed by PP stage only so every
+            # TP rank of a stage holds identical bytes.
+            indexer_pool = mgr.impl.get_indexer_k_cache_pool().view(torch.uint8)
+            if fill_random:
+                generator = torch.Generator(device=indexer_pool.device).manual_seed(
+                    seed_base + 7000 + pp_rank
+                )
+                indexer_pool.copy_(
+                    torch.randint(
+                        0,
+                        256,
+                        indexer_pool.shape,
+                        dtype=torch.uint8,
+                        device=indexer_pool.device,
+                        generator=generator,
+                    )
+                )
+            else:
+                indexer_pool.zero_()
 
 
 def _init_pool_data_v2(
@@ -802,6 +851,77 @@ def verify_all_requests(
             )
 
 
+def _get_indexer_block_data(mgr, request_id, layer_idx, num_layers, pp, tp, enable_dp, req_idx):
+    """Per-request indexer-K bytes for one global layer on the owning rank.
+
+    Indexer K is TP-replicated, so any TP rank of the layer's PP stage works;
+    with attention DP only the request's DP group holds the request.
+    """
+    pp_rank = _pp_rank_of_layer(layer_idx, num_layers, pp)
+    tp_rank = req_idx % tp if enable_dp else 0
+    owner = mgr[pp_rank * tp + tp_rank]
+    block_indices = owner.get_batch_cache_indices([request_id], layer_idx)[0]
+    valid = [idx for idx in block_indices if idx >= 0]
+    if not valid:
+        return None
+    local_layer = layer_idx - _pp_layer_start(pp_rank, num_layers, pp)
+    # Pool shape: (numBlocks, numLayers, kvFactor, blockSize), dtype uint8.
+    pool = owner.impl.get_indexer_k_cache_pool().view(torch.uint8)
+    return pool[valid, local_layer]
+
+
+def _verify_indexer_k_all_requests(
+    request_lengths: List[int],
+    ctx_managers: List,
+    gen_managers: List,
+    ctx_tp: int,
+    ctx_pp: int,
+    gen_tp: int,
+    gen_pp: int,
+    ctx_enable_dp: bool,
+    gen_enable_dp: bool,
+    ctx_request_ids: List[int],
+    gen_request_ids: List[int],
+    num_layers: int,
+):
+    """Compare the transferred DSA indexer K bytes for every request/layer."""
+    for req_idx, _req_len in enumerate(request_lengths):
+        for layer_idx in range(num_layers):
+            ctx_data = _get_indexer_block_data(
+                ctx_managers,
+                ctx_request_ids[req_idx],
+                layer_idx,
+                num_layers,
+                ctx_pp,
+                ctx_tp,
+                ctx_enable_dp,
+                req_idx,
+            )
+            gen_data = _get_indexer_block_data(
+                gen_managers,
+                gen_request_ids[req_idx],
+                layer_idx,
+                num_layers,
+                gen_pp,
+                gen_tp,
+                gen_enable_dp,
+                req_idx,
+            )
+            if ctx_data is None or gen_data is None:
+                continue
+            assert ctx_data.shape == gen_data.shape, (
+                f"Indexer shape mismatch at req={req_idx} layer={layer_idx}: "
+                f"ctx={ctx_data.shape} gen={gen_data.shape}"
+            )
+            torch.testing.assert_close(
+                gen_data,
+                ctx_data,
+                rtol=0,
+                atol=0,
+                msg=lambda m: (f"Indexer data mismatch at req={req_idx} layer={layer_idx}: {m}"),
+            )
+
+
 # ---------------------------------------------------------------------------
 # Main test orchestrator
 # ---------------------------------------------------------------------------
@@ -817,6 +937,7 @@ def run_transfer_test(
     max_attention_window_vec: Optional[List[int]] = None,
     num_layers: int = NUM_LAYERS,
     request_lengths: Optional[List[int]] = None,
+    enable_indexer_k_cache: bool = False,
 ):
     """Run a full KV transfer test using KvCacheTransceiverV2."""
     if request_lengths is None:
@@ -835,6 +956,7 @@ def run_transfer_test(
         max_attention_window_vec,
         num_layers,
         max_batch_size,
+        enable_indexer_k_cache,
     )
     gen_managers = _create_managers_for_instance(
         gen_tp,
@@ -845,6 +967,7 @@ def run_transfer_test(
         max_attention_window_vec,
         num_layers,
         max_batch_size,
+        enable_indexer_k_cache,
     )
 
     # 2. Initialize data: random for ctx, zeros for gen
@@ -973,6 +1096,21 @@ def run_transfer_test(
             max_attention_window_vec=max_attention_window_vec,
             num_layers=num_layers,
         )
+        if enable_indexer_k_cache:
+            _verify_indexer_k_all_requests(
+                request_lengths=request_lengths,
+                ctx_managers=ctx_managers,
+                gen_managers=gen_managers,
+                ctx_tp=ctx_tp,
+                ctx_pp=ctx_pp,
+                gen_tp=gen_tp,
+                gen_pp=gen_pp,
+                ctx_enable_dp=ctx_enable_dp,
+                gen_enable_dp=gen_enable_dp,
+                ctx_request_ids=ctx_request_ids,
+                gen_request_ids=gen_request_ids,
+                num_layers=num_layers,
+            )
 
         # 9. Cleanup
         if use_v2:
@@ -1295,6 +1433,50 @@ def test_cache_transceiver_boundary_lengths(
     )
 
     print("PASSED")
+
+
+# DSA (DeepSeek V3.2) indexer K cache: V1-only, MLA, TP-replicated single
+# index head. Covers the REPLICATED pool view end to end through the real
+# python transceiver: fan-in owner election, fan-out, and PP layer subsets
+# (layer-strided ReplicatedMapper offsets).
+DSA_INDEXER_CONFIGS = [
+    # (ctx_tp, ctx_pp, gen_tp, gen_pp, ctx_dp, gen_dp, test_id)
+    (1, 1, 1, 1, False, False, "tp1_to_tp1"),
+    (2, 1, 1, 1, False, False, "tp2_to_tp1_fanin"),
+    (1, 1, 2, 1, False, False, "tp1_to_tp2_fanout"),
+    (1, 2, 1, 1, False, False, "pp2_to_pp1"),
+    (1, 1, 1, 2, False, False, "pp1_to_pp2"),
+    (2, 2, 1, 1, False, False, "tp2pp2_to_tp1"),
+    (2, 1, 2, 1, False, True, "tp2_to_dep2"),
+]
+
+
+@pytest.mark.timeout(180)
+@pytest.mark.parametrize(
+    "ctx_tp,ctx_pp,gen_tp,gen_pp,ctx_enable_dp,gen_enable_dp",
+    [c[:6] for c in DSA_INDEXER_CONFIGS],
+    ids=[c[6] for c in DSA_INDEXER_CONFIGS],
+)
+def test_cache_transceiver_v1_dsa_indexer(
+    ctx_tp,
+    ctx_pp,
+    gen_tp,
+    gen_pp,
+    ctx_enable_dp,
+    gen_enable_dp,
+):
+    """V1 KVCacheManager + DSA indexer K cache through KvCacheTransceiverV2."""
+    run_transfer_test(
+        ctx_tp=ctx_tp,
+        ctx_pp=ctx_pp,
+        gen_tp=gen_tp,
+        gen_pp=gen_pp,
+        ctx_enable_dp=ctx_enable_dp,
+        gen_enable_dp=gen_enable_dp,
+        is_mla=True,
+        use_v2=False,
+        enable_indexer_k_cache=True,
+    )
 
 
 if __name__ == "__main__":
