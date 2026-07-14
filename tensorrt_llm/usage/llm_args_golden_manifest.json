@@ -658,6 +658,13 @@
     },
     {
       "allowed_values": [],
+      "annotation": "Optional[int]",
+      "converter": "",
+      "kind": "value",
+      "path": "kv_cache_config.fp8_context_mla_kv_len_cap"
+    },
+    {
+      "allowed_values": [],
       "annotation": "Optional[float]",
       "converter": "",
       "kind": "value",

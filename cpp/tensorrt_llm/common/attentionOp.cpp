@@ -760,6 +760,24 @@ size_t AttentionOp::getFmhaMultiCtasKvScratchSize() const noexcept
     return partialStatsSize + partialOSize;
 }
 
+size_t AttentionOp::contextMlaWorkspaceBytesPerToken(int32_t numAttnHeads, int32_t qkRopeHeadDim, int32_t qkNopeHeadDim,
+    int32_t vHeadDim, bool fp8ContextMla, bool separateQAndKvInput, bool sparseMla) noexcept
+{
+    // Only the fp8 context-MLA separate-Q/KV path stages total_kv_len-scaled K/V dequant buffers.
+    // Sparse MLA reads K/V directly from the paged KV cache (no staging), so its per-token cost is 0.
+    if (!fp8ContextMla || !separateQAndKvInput || sparseMla)
+    {
+        return 0;
+    }
+    // Mirror getWorkspaceSizeForContext's dim layout for the non-sparse fp8 branch:
+    //   total_k_dim_all_heads = numAttnHeads * (qk_rope_head_dim + qk_nope_head_dim)
+    //   total_v_dim_all_heads = numAttnHeads * v_head_dim
+    // The buffers are fp8 (1 byte/element), so bytes/token == element count.
+    int const dimKPerHead = qkRopeHeadDim + qkNopeHeadDim;
+    int const dimVPerHead = vHeadDim;
+    return static_cast<size_t>(numAttnHeads) * static_cast<size_t>(dimKPerHead + dimVPerHead);
+}
+
 size_t AttentionOp::getWorkspaceSizeForContext(tensorrt_llm::DataType type, int32_t max_num_seq,
     int32_t input_seq_length, int32_t cross_kv_length, int32_t max_num_tokens, int32_t total_kv_len) const noexcept
 {
@@ -843,10 +861,17 @@ size_t AttentionOp::getWorkspaceSizeForContext(tensorrt_llm::DataType type, int3
         {
             // Use total_kv_len when available (KV cache reuse causes total_kv_len >> max_num_tokens).
             // enqueueContext sizes these buffers by total_kv_len, so workspace must match.
+            // NOTE: the per-token cost of these two buffers (total_k_dim_all_heads + total_v_dim_all_heads) is
+            // the single source of truth exposed via contextMlaWorkspaceBytesPerToken() for the KV-cache
+            // estimator's workspace reserve. Keep the two in sync if this dim layout changes.
             size_t const kv_buf_tokens = std::max(
                 static_cast<size_t>(total_kv_len), static_cast<size_t>(mChunkPrefillBufferBatchSize) * max_num_tokens);
             fp8_k_buf_size = kv_buf_tokens * static_cast<size_t>(total_k_dim_all_heads);
             fp8_v_buf_size = kv_buf_tokens * static_cast<size_t>(total_v_dim_all_heads);
+            TLLM_CHECK(static_cast<size_t>(total_k_dim_all_heads + total_v_dim_all_heads)
+                == contextMlaWorkspaceBytesPerToken(mNumAttnHeads, mMLAParams.qk_rope_head_dim,
+                    mMLAParams.qk_nope_head_dim, mMLAParams.v_head_dim, mFP8ContextMLA,
+                    /*separateQAndKvInput=*/true, useSparseMLA()));
         }
     }
     else if (useSageAttnSeparateQkv)
