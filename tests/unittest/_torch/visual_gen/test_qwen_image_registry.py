@@ -9,6 +9,7 @@ registry detection.
 """
 
 import json
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -105,6 +106,59 @@ def test_transformer_load_weights_detects_mismatch():
     model = QwenImageTransformer2DModel(model_config=None, num_layers=2)
     with pytest.raises(RuntimeError, match=r"Missing keys|Unexpected keys"):
         model.load_weights({})
+
+
+def test_qwen_image_defaults_missing_negative_prompt_to_empty_string():
+    assert QwenImagePipeline._normalize_negative_prompt(None, 2) == ["", ""]
+    assert QwenImagePipeline._normalize_negative_prompt("low quality", 2) == [
+        "low quality",
+        "low quality",
+    ]
+    assert QwenImagePipeline._normalize_negative_prompt(["blur"], 2) == ["blur", "blur"]
+    assert QwenImagePipeline._normalize_negative_prompt(["a", "b"], 2) == ["a", "b"]
+    with pytest.raises(ValueError, match="negative_prompt"):
+        QwenImagePipeline._normalize_negative_prompt(["a", "b", "c"], 2)
+
+
+def test_qwen_image_cfg_parallel_state(monkeypatch):
+    pipeline = object.__new__(QwenImagePipeline)
+    pipeline.pipeline_config = SimpleNamespace(
+        visual_gen_mapping=SimpleNamespace(cfg_size=2, cfg_rank=1, cfg_group="cfg_pg")
+    )
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.visual_gen.models.qwen_image.pipeline_qwen_image.dist.is_initialized",
+        lambda: True,
+    )
+
+    assert pipeline._cfg_parallel_state(True) == (True, 2, 1, "cfg_pg")
+    assert pipeline._cfg_parallel_state(False) == (False, 2, 1, "cfg_pg")
+
+
+def test_qwen_image_selects_cfg_inputs_by_rank():
+    prompt = torch.tensor([1])
+    prompt_mask = torch.tensor([2])
+    negative = torch.tensor([3])
+    negative_mask = torch.tensor([4])
+
+    selected = QwenImagePipeline._select_cfg_inputs(
+        0, prompt, prompt_mask, negative, negative_mask
+    )
+    assert selected[0] is prompt
+    assert selected[1] is prompt_mask
+
+    selected = QwenImagePipeline._select_cfg_inputs(
+        1, prompt, prompt_mask, negative, negative_mask
+    )
+    assert selected[0] is negative
+    assert selected[1] is negative_mask
+
+
+def test_qwen_image_true_cfg_combination_keeps_reference_formula():
+    noise_pred = torch.tensor([[[2.0, 0.0]]])
+    neg_noise_pred = torch.tensor([[[1.0, 0.0]]])
+    combined = QwenImagePipeline._combine_true_cfg(noise_pred, neg_noise_pred, 4.0)
+    assert combined.shape == noise_pred.shape
+    assert torch.allclose(combined, torch.tensor([[[2.0, 0.0]]]))
 
 
 def test_transformer_applies_quant_config_ignore_list() -> None:
