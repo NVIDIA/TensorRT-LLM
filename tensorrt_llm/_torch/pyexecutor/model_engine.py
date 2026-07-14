@@ -8,7 +8,7 @@ import os
 import weakref
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
-from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch._dynamo.config
@@ -701,7 +701,6 @@ class PyTorchModelEngine(ModelEngine):
             sparse_attention_config=self.sparse_attention_config,
         )
         self.cuda_graph_runner = CUDAGraphRunner(cuda_graph_runner_config)
-        self._cuda_graph_replay_enabled = True
 
         # Create Encoder CUDA graph config and runner.
         encoder_cuda_graph_runner_config = EncoderCUDAGraphRunnerConfig(
@@ -877,15 +876,6 @@ class PyTorchModelEngine(ModelEngine):
             yield
         finally:
             self.cuda_graph_runner.enabled = _run_cuda_graphs
-
-    @contextmanager
-    def no_cuda_graph_replay(self) -> Iterator[None]:
-        replay_enabled = self._cuda_graph_replay_enabled
-        self._cuda_graph_replay_enabled = False
-        try:
-            yield
-        finally:
-            self._cuda_graph_replay_enabled = replay_enabled
 
     def _pad_batch_seed_mrope_delta_cache(
             self, padded_requests: ScheduledRequests) -> None:
@@ -1091,18 +1081,15 @@ class PyTorchModelEngine(ModelEngine):
             # NVSHMEM).
             gc.collect()
             torch.cuda.empty_cache()
-        # Capture twice without replay. The first pass uses a disposable pool
-        # to discover the maximum attention workspace across every graph shape.
-        # Some kernels need more workspace for smaller shapes. Discard those
-        # graphs and pool, then capture the runtime graphs after the workspace
-        # is fully sized.
+        # Warm up every graph shape before capturing any graph. Attention
+        # kernels can switch implementations at smaller batch sizes and require
+        # a larger workspace, so the first pass grows the workspace to its
+        # maximum size. The second pass captures without resizing it.
         with self.cuda_graph_runner.allow_capture():
-            with self.no_cuda_graph_replay():
-                memory_pool = self.cuda_graph_runner.memory_pool
-                self.cuda_graph_runner.memory_pool = None
+            with self.cuda_graph_runner.warmup_only():
                 self._run_cuda_graph_warmup(resource_manager)
-                self.cuda_graph_runner.clear()
-                self.cuda_graph_runner.memory_pool = memory_pool
+            self.cuda_graph_runner.padding_dummy_requests = {}
+            with self.cuda_graph_runner.capture_only():
                 self._run_cuda_graph_warmup(resource_manager)
         log_mem_snapshot("warmup/after_cuda_graph_capture")
         if can_run_general_warmup:
@@ -1430,23 +1417,27 @@ class PyTorchModelEngine(ModelEngine):
                 for draft_len in draft_lengths]
 
     def _run_cuda_graph_warmup(self, resource_manager: ResourceManager):
-        """Captures CUDA graphs for various batch sizes and draft lengths."""
+        """Warm up or capture CUDA graphs for the configured graph shapes."""
         if not (self.cuda_graph_runner.enabled
                 or self._torch_compile_piecewise_cuda_graph):
             return
 
         self._capture_generation_cuda_graphs(resource_manager)
-        self._capture_piecewise_cuda_graphs(resource_manager)
+        # Piecewise graphs have separate capture machinery and do not use the
+        # whole-model attention workspace. Capture them only on the second pass.
+        if not self.cuda_graph_runner.is_warmup_only:
+            self._capture_piecewise_cuda_graphs(resource_manager)
 
     def _capture_generation_cuda_graphs(self,
                                         resource_manager: ResourceManager):
-        """Captures CUDA graphs for pure generation steps."""
+        """Warm up or capture pure-generation CUDA graph shapes."""
         if not self.cuda_graph_runner.enabled:
             return
 
-        logger.info(
-            f"Creating CUDA graph instances for {len(self._cuda_graph_batch_sizes)} batch sizes."
-        )
+        operation = ("warmup"
+                     if self.cuda_graph_runner.is_warmup_only else "capture")
+        logger.info(f"Running CUDA graph {operation} for "
+                    f"{len(self._cuda_graph_batch_sizes)} batch sizes.")
         spec_resource_manager = resource_manager.get_resource_manager(
             ResourceManagerType.SPEC_RESOURCE_MANAGER)
 
@@ -1454,7 +1445,7 @@ class PyTorchModelEngine(ModelEngine):
         cuda_graph_batch_sizes = sorted(self._cuda_graph_batch_sizes,
                                         reverse=True)
 
-        # Determine which graphs to capture
+        # Determine which graph shapes to process.
         graphs_to_capture = self._get_graphs_to_capture(cuda_graph_batch_sizes,
                                                         spec_resource_manager)
         graphs_to_capture = sorted(graphs_to_capture, reverse=True)
@@ -1581,7 +1572,7 @@ class PyTorchModelEngine(ModelEngine):
                                     f"not enough KV cache space.")
                                 continue
                             logger.info(
-                                f"Run generation-only CUDA graph warmup ({label}) "
+                                f"Run generation-only CUDA graph {operation} ({label}) "
                                 f"for batch size={bs}, draft_len={draft_len}, "
                                 f"max_seq_len={max_seq_len}")
                             self.enable_spec_decode = draft_len > 0 or self.is_draft_model or (
@@ -5137,17 +5128,14 @@ class PyTorchModelEngine(ModelEngine):
             torch.cuda.empty_cache()
 
         self._run_autotuner_warmup_encoder()
-        # Capture once with a disposable pool to discover the maximum encoder
-        # attention workspace across every graph shape. Some kernels need more
-        # workspace for smaller shapes. Discard those graphs and pool, then
-        # capture the runtime graphs after the workspace is fully sized.
+        # Warm up every encoder graph shape before capturing any graph. Some
+        # attention kernels switch implementations at smaller shapes and need
+        # a larger workspace, so the capture pass can only start after the
+        # workspace has reached its maximum size.
         with self.encoder_cuda_graph_runner.allow_capture():
-            with self.no_cuda_graph_replay():
-                memory_pool = self.encoder_cuda_graph_runner.memory_pool
-                self.encoder_cuda_graph_runner.memory_pool = None
+            with self.encoder_cuda_graph_runner.warmup_only():
                 self._run_cuda_graph_warmup_encoder()
-                self.encoder_cuda_graph_runner.clear()
-                self.encoder_cuda_graph_runner.memory_pool = memory_pool
+            with self.encoder_cuda_graph_runner.capture_only():
                 self._run_cuda_graph_warmup_encoder()
 
         # Pre-populate the memory pool with max-shape allocations to reduce
@@ -5197,14 +5185,14 @@ class PyTorchModelEngine(ModelEngine):
         AutoTuner.get().print_profiling_cache()
 
     def _run_cuda_graph_warmup_encoder(self) -> None:
-        """Captures whole-model CUDA graphs for the encode-only path."""
+        """Warm up or capture whole-model encode-only CUDA graphs."""
         if not self.encoder_cuda_graph_runner.enabled:
             return
 
         self._capture_encoder_cuda_graphs()
 
     def _capture_encoder_cuda_graphs(self) -> None:
-        """Capture whole-model encoder CUDA graphs for all feasible keys.
+        """Warm up or capture encoder CUDA graphs for all feasible keys.
 
         Feasibility filter (also used in source):
           nt >= prev_sl + bs   (enough tokens for this sl bucket)
@@ -5220,8 +5208,9 @@ class PyTorchModelEngine(ModelEngine):
         num_tokens_list = sorted(self._cuda_graph_num_tokens)
         seq_lens_list = sorted(self._cuda_graph_seq_lens)
 
-        num_captured = 0
-        logger.info("Capturing encoder CUDA graphs ...")
+        operation = "warmup" if runner.is_warmup_only else "capture"
+        num_processed = 0
+        logger.info(f"Running encoder CUDA graph {operation} ...")
         for bs in batch_sizes:
             if bs > self.batch_size:
                 continue
@@ -5240,13 +5229,14 @@ class PyTorchModelEngine(ModelEngine):
                     if inputs is None:
                         continue
 
-                    logger.info(f"Encoder CUDA graph capture: "
+                    logger.info(f"Encoder CUDA graph {operation}: "
                                 f"bs={bs}, nt={nt}, sl={sl}")
                     self.encoder_forward(inputs)
                     torch.cuda.synchronize()
-                    num_captured += 1
+                    num_processed += 1
 
-        logger.info(f"Captured {num_captured} encoder CUDA graph(s).")
+        logger.info(f"Completed encoder CUDA graph {operation} for "
+                    f"{num_processed} graph shape(s).")
 
     @torch.inference_mode()
     @with_model_extra_attrs(lambda self: self.model.extra_attrs)
@@ -5311,14 +5301,13 @@ class PyTorchModelEngine(ModelEngine):
                             return self._forward_step(capture_inputs,
                                                       **forward_kwargs)
 
-                    self.encoder_cuda_graph_runner.capture(
+                    capture_outputs = self.encoder_cuda_graph_runner.capture(
                         key, forward_fn, {
                             **model_inputs, "_forward_kwargs": forward_kwargs
                         })
 
-                if not self._cuda_graph_replay_enabled:
-                    graph_outputs = self.encoder_cuda_graph_runner.graph_outputs[
-                        key]
+                if self.encoder_cuda_graph_runner.is_warmup_only:
+                    graph_outputs = capture_outputs
                 else:
                     with MoeLoadBalancerIterContext(moe_load_balancer):
                         graph_outputs = self.encoder_cuda_graph_runner.replay(
@@ -5512,15 +5501,15 @@ class PyTorchModelEngine(ModelEngine):
                         def capture_postprocess_fn(inputs: Dict[str, Any]):
                             self._postprocess_inputs(inputs)
 
-                        self.cuda_graph_runner.capture(
+                        capture_outputs = self.cuda_graph_runner.capture(
                             key,
                             capture_forward_fn,
                             inputs,
                             enable_spec_decode=self.enable_spec_decode,
                             postprocess_fn=capture_postprocess_fn)
 
-                    if not self._cuda_graph_replay_enabled:
-                        outputs = self.cuda_graph_runner.graph_outputs[key]
+                    if self.cuda_graph_runner.is_warmup_only:
+                        outputs = capture_outputs
                     elif needs_capture:
                         # Pre-replay: set DSA slot mappings for current batch's draft cache (fixes 2nd warmup)
                         saved_draft = prepare_attn_metadata_for_draft_replay(
