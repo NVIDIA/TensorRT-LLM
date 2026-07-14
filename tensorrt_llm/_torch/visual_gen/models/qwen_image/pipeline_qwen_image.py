@@ -497,6 +497,11 @@ class QwenImagePipeline(BasePipeline):
                 return_dict=False,
             )[0]
 
+            if do_true_cfg and self.pipeline_config.cuda_graph.enable:
+                # CUDA graph outputs are graph-owned buffers; the negative CFG
+                # replay may reuse the same pool before guidance consumes this one.
+                noise_pred = noise_pred.clone()
+
             if do_true_cfg:
                 neg_noise_pred = self.transformer(
                     hidden_states=latents,
