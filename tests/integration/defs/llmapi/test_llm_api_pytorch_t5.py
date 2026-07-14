@@ -507,6 +507,15 @@ _MIXED_BATCH_TEST_CASES = [
     ),
     _mixed_batch_test_case(
         model_name="t5-small",
+        torch_dtype="float32",
+        use_kv_cache_manager_v2=False,
+        num_beams=1,
+        num_return_sequences=1,
+        exact_match=True,
+        feature_id="fp32-kv-v1-decoder-cuda-graph-on-greedy-batch2",
+    ),
+    _mixed_batch_test_case(
+        model_name="t5-small",
         torch_dtype="bfloat16",
         use_kv_cache_manager_v2=True,
         num_beams=1,

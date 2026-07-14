@@ -105,9 +105,8 @@ def _make_llm(
     cuda_graph_batch_sizes: list[int] | None = None,
     tensor_parallel_size: int = 1,
 ) -> LLM:
-    # CudaGraphConfig captures the decode step only; fp32 enc-dec declines
-    # graphs at engine init (workspace-sizing guard), so requesting them must
-    # still work for every dtype.
+    # CudaGraphConfig captures the decode step only; requesting graphs must
+    # work for every dtype.
     cuda_graph_config = (
         CudaGraphConfig(batch_sizes=cuda_graph_batch_sizes, enable_padding=True)
         if cuda_graph_batch_sizes is not None
@@ -259,10 +258,10 @@ def _assert_decoder_cuda_graph_state(llm: LLM, captured: bool) -> None:
 # (torch_dtype override or None for checkpoint fp32, kv manager v2, decoder
 # cuda-graph batch sizes, graphs must capture, TP size). KVCacheManagerV2
 # requires beam width 1, so v2 rides greedy; the fp32+graphs-requested case
-# asserts the engine declines graphs (fp32 enc-dec guard) yet stays exact.
+# covers fp32 enc-dec capturing decoder graphs.
 _FEATURE_COMBINATION_CASES = [
     pytest.param(None, True, None, False, 1, id="fp32-kv-v2-graphs-off-greedy"),
-    pytest.param(None, False, [1, 2], False, 1, id="fp32-kv-v1-graphs-requested-greedy"),
+    pytest.param(None, False, [1, 2], True, 1, id="fp32-kv-v1-graphs-requested-greedy"),
     pytest.param("bfloat16", False, [1, 2], True, 1, id="bf16-kv-v1-decoder-graphs-on-greedy"),
     pytest.param("bfloat16", True, [1, 2], True, 1, id="bf16-kv-v2-decoder-graphs-on-greedy"),
     pytest.param("float16", False, None, False, 1, id="fp16-kv-v1-graphs-off-greedy"),

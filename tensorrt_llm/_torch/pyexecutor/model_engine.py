@@ -466,21 +466,6 @@ class PyTorchModelEngine(ModelEngine):
                 "decoder CUDA graphs. CUDA graphs will be disabled.")
             self.cuda_graph_config = None
 
-        if (self.cuda_graph_config is not None and self.dtype == torch.float32
-                and self._is_encoder_decoder_model()):
-            # fp32 enc-dec runs unfused cross-attention, whose thop workspace
-            # size query hardcodes cross_kv_length=0 (attentionOp.cpp,
-            # Runner::getWorkspaceSize) and undersizes the workspace. The
-            # graph-capture warmup runs cross_attn in isolation, so the carve
-            # overruns the allocation (surfaces as cublas EXECUTION_FAILED).
-            # Keep eager until the upstream size query is fixed.
-            logger.warning(
-                "CUDA graphs are not supported for float32 encoder-decoder "
-                "models. CUDA graphs will be disabled; use a half-precision "
-                "checkpoint or model_kwargs={'torch_dtype': ...} to enable "
-                "them.")
-            self.cuda_graph_config = None
-
         cuda_graph_batch_sizes = self.cuda_graph_config.batch_sizes if self.cuda_graph_config else CudaGraphConfig.model_fields[
             'batch_sizes'].default
         cuda_graph_padding_enabled = self.cuda_graph_config.enable_padding if self.cuda_graph_config else CudaGraphConfig.model_fields[
