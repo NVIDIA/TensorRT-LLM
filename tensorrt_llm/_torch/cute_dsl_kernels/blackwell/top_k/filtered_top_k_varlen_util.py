@@ -1307,6 +1307,58 @@ class FilteredTopKKernelVarlen:
             cute.arch.barrier()
 
     @cute.jit
+    def _phase3_writeback(self, tidx, row_start, s_indices, score, indices, dst, dst_values):
+        """Write the selected top-k from s_indices (+ values) back to GMEM output.
+
+        Extracted verbatim from filtered_topk_kernel_per_row (no logic change) so the
+        single-pass multi-CTA path can dispatch between this and a cluster collector.
+        """
+        # Phase 3: Output phase
+        vecsize_out = cutlass.const_expr(
+            min(
+                self.top_k,
+                cute.ceil_div(self.top_k, self.num_threads_per_cta),
+                self.num_copy_bits // self.dtype.width,
+                # TODO: only tested for float32. need to check for other dtypes.
+                2,
+            )
+        )
+        assert self.top_k % vecsize_out == 0
+
+        nvec_per_thread = cutlass.const_expr(
+            cute.ceil_div(self.top_k, vecsize_out * self.num_threads_per_cta)
+        )
+        topk_vals = cute.make_fragment((vecsize_out, nvec_per_thread), self.dtype)
+        topk_indices = cute.make_fragment((vecsize_out, nvec_per_thread), cutlass.Int32)
+
+        stride = self.num_threads_per_cta * vecsize_out
+        for i in cutlass.range(nvec_per_thread, unroll_full=True):
+            idx = i * stride + tidx % self.num_threads_per_cta * vecsize_out
+            if idx < self.top_k:
+                for v in cutlass.range(vecsize_out, unroll_full=True):
+                    index_raw = s_indices[idx + v]
+                    index = cutlass.Int32(cutlass.Uint32(index_raw))
+                    if cutlass.const_expr(self.return_val):
+                        topk_vals[v, i] = score[index]
+                    if cutlass.const_expr(self.merge_blocks):
+                        topk_indices[v, i] = indices[index]
+                    elif cutlass.const_expr(self.subtract_row_start_on_output):
+                        topk_indices[v, i] = index - cutlass.Int32(row_start)
+                    else:
+                        topk_indices[v, i] = index
+        # [atom, rest_vec]
+        mIndices_store = cute.tiled_divide(dst, (vecsize_out,))
+        if cutlass.const_expr(self.return_val):
+            mValues_store = cute.tiled_divide(dst_values, (vecsize_out,))
+        # i represents the index of the vector in the output.
+        for i in cutlass.range(cute.size(topk_vals.shape, [1]), unroll_full=True):
+            col = i * self.num_threads_per_cta + tidx % self.num_threads_per_cta
+            if col < self.top_k // vecsize_out:
+                cute.autovec_copy(topk_indices[None, i], mIndices_store[None, col])
+                if cutlass.const_expr(self.return_val):
+                    cute.autovec_copy(topk_vals[None, i], mValues_store[None, col])
+
+    @cute.jit
     def filtered_topk_kernel_per_row(
         self,
         input: cute.Tensor,
@@ -1338,14 +1390,20 @@ class FilteredTopKKernelVarlen:
         score = input[bidx, None]
         if cutlass.const_expr(self.merge_blocks):
             indices = input_indices[bidx, None]
+        else:
+            indices = None
         if cutlass.const_expr(self.enable_multi_cta):
             dst = output_indices
             if cutlass.const_expr(self.return_val):
                 dst_values = output_values
+            else:
+                dst_values = None
         else:
             dst = output_indices[bidx, None]
             if cutlass.const_expr(self.return_val):
                 dst_values = output_values[bidx, None]
+            else:
+                dst_values = None
         # Note, for multi-cta version, each ctas must have its own extra_buffer.
         buffer = None
         if cutlass.const_expr(self.enable_gmem_store):
@@ -1717,49 +1775,7 @@ class FilteredTopKKernelVarlen:
                                 )
 
             # Phase 3: Output phase
-            vecsize_out = cutlass.const_expr(
-                min(
-                    self.top_k,
-                    cute.ceil_div(self.top_k, self.num_threads_per_cta),
-                    self.num_copy_bits // self.dtype.width,
-                    # TODO: only tested for float32. need to check for other dtypes.
-                    2,
-                )
-            )
-            assert self.top_k % vecsize_out == 0
-
-            nvec_per_thread = cutlass.const_expr(
-                cute.ceil_div(self.top_k, vecsize_out * self.num_threads_per_cta)
-            )
-            topk_vals = cute.make_fragment((vecsize_out, nvec_per_thread), self.dtype)
-            topk_indices = cute.make_fragment((vecsize_out, nvec_per_thread), cutlass.Int32)
-
-            stride = self.num_threads_per_cta * vecsize_out
-            for i in cutlass.range(nvec_per_thread, unroll_full=True):
-                idx = i * stride + tidx % self.num_threads_per_cta * vecsize_out
-                if idx < self.top_k:
-                    for v in cutlass.range(vecsize_out, unroll_full=True):
-                        index_raw = s_indices[idx + v]
-                        index = cutlass.Int32(cutlass.Uint32(index_raw))
-                        if cutlass.const_expr(self.return_val):
-                            topk_vals[v, i] = score[index]
-                        if cutlass.const_expr(self.merge_blocks):
-                            topk_indices[v, i] = indices[index]
-                        elif cutlass.const_expr(self.subtract_row_start_on_output):
-                            topk_indices[v, i] = index - cutlass.Int32(row_start)
-                        else:
-                            topk_indices[v, i] = index
-            # [atom, rest_vec]
-            mIndices_store = cute.tiled_divide(dst, (vecsize_out,))
-            if cutlass.const_expr(self.return_val):
-                mValues_store = cute.tiled_divide(dst_values, (vecsize_out,))
-            # i represents the index of the vector in the output.
-            for i in cutlass.range(cute.size(topk_vals.shape, [1]), unroll_full=True):
-                col = i * self.num_threads_per_cta + tidx % self.num_threads_per_cta
-                if col < self.top_k // vecsize_out:
-                    cute.autovec_copy(topk_indices[None, i], mIndices_store[None, col])
-                    if cutlass.const_expr(self.return_val):
-                        cute.autovec_copy(topk_vals[None, i], mValues_store[None, col])
+            self._phase3_writeback(tidx, row_start, s_indices, score, indices, dst, dst_values)
 
 
 def create_random_logits(
