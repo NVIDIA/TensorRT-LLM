@@ -131,8 +131,8 @@ public:
         return mAsyncDiskStore;
     }
 
-    //! \brief True if the async write queue is at capacity. Used to shed best-effort (non-retained) spills under
-    //! writer saturation; retained spills bypass the cap and are never shed.
+    //! \brief True if the async write queue is at capacity. The eviction gate (reclaimSecondaryBlock) checks it
+    //! to shed best-effort spills under writer saturation; retained spills are never shed -- they backpressure.
     [[nodiscard]] bool diskWriteQueueFull();
 
     void syncTransfers();
@@ -201,7 +201,6 @@ private:
         std::vector<std::uint8_t> staged; // staged-memcpy path (used when src == nullptr)
         void const* src{nullptr};         // unstaged path: writer reads this pinned host pointer directly
         std::uint64_t spillId{0};         // >0 => track per-spill completion for the reserved-pool reap
-        bool retained{false};             // retained spill: bypasses the queue cap, never dropped
     };
 
     std::vector<std::thread> mDiskWriters;
@@ -229,9 +228,9 @@ private:
         }()};
 
     void diskWriterLoop();
-    void enqueueDiskWrite(std::string filename, void const* src, std::size_t bytes, bool retained);
+    void enqueueDiskWrite(std::string filename, void const* src, std::size_t bytes);
     void enqueueDiskWriteUnstaged(
-        std::string filename, void const* src, std::size_t bytes, std::uint64_t spillId, bool retained);
+        std::string filename, void const* src, std::size_t bytes, std::uint64_t spillId);
     void waitForDiskSlotWrites(std::string const& filename);
 
     // ---- Disk-tier async ONBOARD: read slot files disk->GPU OFF the scheduler thread ----

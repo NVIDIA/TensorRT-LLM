@@ -92,6 +92,34 @@ public:
         return transferManager.mPendingWrites.find(tbk::KVCacheTransferManager::getPendingTransferIndex(block))
             != transferManager.mPendingWrites.end();
     }
+
+    [[nodiscard]] static std::size_t writeQueueSize(tbk::KVCacheTransferManager& transferManager)
+    {
+        std::lock_guard<std::mutex> lock(transferManager.mDiskMutex);
+        return transferManager.mDiskWriteQueue.size();
+    }
+
+    static void enqueueWrite(
+        tbk::KVCacheTransferManager& transferManager, std::string filename, void const* src, std::size_t bytes)
+    {
+        transferManager.enqueueDiskWrite(std::move(filename), src, bytes);
+    }
+
+    static void enqueueWriteUnstaged(tbk::KVCacheTransferManager& transferManager, std::string filename,
+        void const* src, std::size_t bytes, std::uint64_t spillId)
+    {
+        transferManager.enqueueDiskWriteUnstaged(std::move(filename), src, bytes, spillId);
+    }
+
+    // Unblock a producer parked in the enqueue backpressure wait, so the test can join it before teardown.
+    static void requestWriterStop(tbk::KVCacheTransferManager& transferManager)
+    {
+        {
+            std::lock_guard<std::mutex> lock(transferManager.mDiskMutex);
+            transferManager.mDiskWriterStop = true;
+        }
+        transferManager.mDiskQueueCv.notify_all();
+    }
 };
 } // namespace tensorrt_llm::testing
 
@@ -11111,4 +11139,77 @@ TEST_F(KVCacheManagerTest, DiskTierShutdownWithQueuedWorkTest)
     unsetenv("TLLM_KV_DISK_READERS");
     unsetenv("TLLM_KV_DISK_WRITERS");
     unsetenv("TLLM_KV_DISK_ASYNC_STORE");
+}
+
+// The disk write queue must stay bounded by mDiskWriteQueueMax under sustained spill load: with the retained
+// bypass removed, a producer facing a full queue backpressures instead of growing RAM. Covers staged + unstaged.
+namespace
+{
+void runWriteQueueBoundedTest(bool unstaged)
+{
+    using tensorrt_llm::testing::KVCacheTransferManagerTestAccess;
+    setenv("TLLM_KV_DISK_ASYNC_STORE", "1", /*overwrite=*/1);
+    setenv("TLLM_KV_DISK_WRITERS", "1", /*overwrite=*/1); // one writer drains; the cap must still bound the backlog
+    setenv("TLLM_KV_DISK_WRITE_QUEUE", "4", /*overwrite=*/1);
+    std::size_t constexpr cap = 4;
+    std::size_t constexpr burst = 200; // far more than the cap: the producer must block once the queue is full
+
+    DiskTierDir dir;                                 // real directory for the writer to drain into (cleaned on exit)
+    std::vector<std::uint8_t> src(256 * 1024, 0xAB); // large enough that the single writer lags the producer
+    auto bufferManager = tr::BufferManager(std::make_shared<tr::CudaStream>());
+    auto transferManager = KVCacheTransferManager(bufferManager);
+
+    // Continuously sample the queue depth while the burst runs and record the peak.
+    std::atomic<std::size_t> observedMax{0};
+    std::atomic<bool> producing{true};
+    std::thread monitor(
+        [&]
+        {
+            while (producing.load())
+            {
+                auto const sz = KVCacheTransferManagerTestAccess::writeQueueSize(transferManager);
+                auto prev = observedMax.load();
+                while (sz > prev && !observedMax.compare_exchange_weak(prev, sz))
+                {
+                }
+                std::this_thread::sleep_for(std::chrono::microseconds(200));
+            }
+        });
+
+    // Burst far more spills than the cap. Each enqueue blocks while the queue is full, so the backlog can never
+    // exceed mDiskWriteQueueMax no matter how far the single writer falls behind -- the bound the reviewer wants.
+    for (std::size_t k = 0; k < burst; ++k)
+    {
+        auto const fn = dir.str() + "/slot" + std::to_string(k);
+        if (unstaged)
+        {
+            KVCacheTransferManagerTestAccess::enqueueWriteUnstaged(transferManager, fn, src.data(), src.size(), k + 1);
+        }
+        else
+        {
+            KVCacheTransferManagerTestAccess::enqueueWrite(transferManager, fn, src.data(), src.size());
+        }
+    }
+    producing.store(false);
+    monitor.join();
+
+    EXPECT_LE(observedMax.load(), cap) << "write queue exceeded its cap -- spills not backpressured";
+    EXPECT_GT(observedMax.load(), 0u) << "queue never filled -- the burst did not actually stress the cap";
+
+    unsetenv("TLLM_KV_DISK_WRITE_QUEUE");
+    unsetenv("TLLM_KV_DISK_WRITERS");
+    unsetenv("TLLM_KV_DISK_ASYNC_STORE");
+}
+} // namespace
+
+// Staged path: a full write queue backpressures the producer instead of growing RAM without bound.
+TEST_F(KVCacheManagerTest, DiskTierWriteQueueBoundedStagedTest)
+{
+    runWriteQueueBoundedTest(/*unstaged=*/false);
+}
+
+// Unstaged path: same bound.
+TEST_F(KVCacheManagerTest, DiskTierWriteQueueBoundedUnstagedTest)
+{
+    runWriteQueueBoundedTest(/*unstaged=*/true);
 }
