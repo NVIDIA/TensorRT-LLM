@@ -166,3 +166,51 @@ def test_llmapi_launch_multiple_tasks(task_script: str):
 
         if return_code != 0:
             raise subprocess.CalledProcessError(return_code, command)
+
+
+# ---- wait_shutdown: shutdown blocks until worker processes actually exit ----
+
+
+def _wait_workers_exit(identities, timeout: float) -> None:
+    """Call the unbound method on an inert stand-in (no MPI spawn).
+
+    ``_wait_workers_exit`` only reads ``self._worker_identities``; a real
+    ``MpiPoolSession`` shell would trigger the base class's abort machinery
+    at garbage collection.
+    """
+    import types
+
+    stand_in = types.SimpleNamespace(_worker_identities=identities)
+    MpiPoolSession._wait_workers_exit(stand_in, timeout=timeout)
+
+
+def test_process_start_time_live_and_gone():
+    from tensorrt_llm.llmapi.mpi_session import _process_start_time
+
+    assert _process_start_time(os.getpid()) is not None
+    child = Popen(["true"])  # nosec B603, B607
+    child.wait()
+    assert _process_start_time(child.pid) is None  # reaped: /proc entry gone
+
+
+def test_wait_workers_exit_returns_once_workers_are_gone():
+    from tensorrt_llm.llmapi.mpi_session import _process_start_time
+
+    child = Popen(["true"])  # nosec B603, B607
+    identity = (child.pid, _process_start_time(child.pid))
+    child.wait()
+    # Dead worker -> returns immediately; a None start_time is skipped
+    # (identity collection failed for that worker: nothing to wait on).
+    _wait_workers_exit((identity, (os.getpid(), None)), timeout=5.0)
+
+
+def test_wait_workers_exit_bounded_by_timeout_on_live_worker():
+    import time as _time
+
+    from tensorrt_llm.llmapi.mpi_session import _process_start_time
+
+    me = (os.getpid(), _process_start_time(os.getpid()))
+    t0 = _time.monotonic()
+    _wait_workers_exit((me, ), timeout=0.2)  # this process will not exit
+    waited = _time.monotonic() - t0
+    assert 0.2 <= waited < 2.0  # bounded: a wedged worker cannot hang teardown

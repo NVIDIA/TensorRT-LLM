@@ -64,8 +64,9 @@ def prefetcher(monkeypatch):
 
 
 class _FakePool:
-    def __init__(self, n_workers):
+    def __init__(self, n_workers, wait_shutdown=False):
         self.n_workers = n_workers
+        self.wait_shutdown = wait_shutdown
         self.shut = False
 
     def shutdown(self):
@@ -104,6 +105,10 @@ def test_factory_miss_builds_sync_and_arms_shadow(prefetcher):
     factory = prefetcher._make_factory(_FakePool)
     session = factory(4)  # nothing prefetched yet -> sync build
     assert isinstance(session, _FakePool) and session.n_workers == 4
+    # Every pool this layer hands out must block its shutdown on worker
+    # exit: the NEXT pool is handed over instantly, without the ~50s sync
+    # spawn that used to hide the GPU-memory release window.
+    assert session.wait_shutdown
     prefetcher._thread.join(timeout=10)
     assert prefetcher.built == [4]  # shadow armed for the next test
 

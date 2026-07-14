@@ -8,8 +8,9 @@ from test_common.session_reuse import SessionReuseCache
 
 
 class _FakePool:
-    def __init__(self, n_workers):
+    def __init__(self, n_workers, wait_shutdown=False):
         self.n_workers = n_workers
+        self.wait_shutdown = wait_shutdown
         self.shut = False
         import os
 
@@ -49,6 +50,9 @@ def _wait(pred, timeout=5.0):
 def test_reuse_hands_back_same_pool(reuse_cache):
     s1 = reuse_cache.acquire(_FakePool, 2)
     real = s1._real
+    # Cache-managed pools block their (real) shutdown on worker exit, so a
+    # replacement spawned right after a retire cannot race the GPU release.
+    assert real.wait_shutdown
     s1.shutdown()  # released to cache, not killed
     assert not real.shut
     s2 = reuse_cache.acquire(_FakePool, 2)

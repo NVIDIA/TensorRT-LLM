@@ -278,7 +278,12 @@ class SessionReuseCache:
             # Fires exactly when an RPC executor is constructed, whatever the
             # test is named — no name heuristics.
             cache.drain()
-            return real_cls(n_workers, *args, **kwargs)
+            if args or kwargs:
+                return real_cls(n_workers, *args, **kwargs)
+            # wait_shutdown: the private pool dies at LLM shutdown; block
+            # there until its workers exited so the next pool (often handed
+            # over instantly from the cache) cannot race the GPU release.
+            return real_cls(n_workers=n_workers, wait_shutdown=True)
 
         for name in pending:
             mod = sys.modules[name]
@@ -293,8 +298,10 @@ class SessionReuseCache:
         if self._suspended or not self.enabled:
             # Opt-out test (private_mpi_session) or the kill switch flipped
             # after the seams were patched: untracked fresh pool that the LLM
-            # owns and destroys normally.
-            return real_cls(n_workers=n_workers)
+            # owns and destroys normally (wait_shutdown: its shutdown blocks
+            # until the workers exited, so the next handover cannot race the
+            # GPU-memory release).
+            return real_cls(n_workers=n_workers, wait_shutdown=True)
         with self._lock:
             real = self._pools.pop(n_workers, None)
         if real is not None:
@@ -344,7 +351,10 @@ class SessionReuseCache:
         for k in added:
             os.environ[k] = _WEIGHT_CACHE_ENV[k]
         try:
-            real = real_cls(n_workers=n_workers)
+            # wait_shutdown: retire()'s graceful shutdown then blocks (in its
+            # background thread) until the workers exited — a replacement pool
+            # spawned right after a retire cannot race the GPU release.
+            real = real_cls(n_workers=n_workers, wait_shutdown=True)
         finally:
             for k in added:
                 os.environ.pop(k, None)

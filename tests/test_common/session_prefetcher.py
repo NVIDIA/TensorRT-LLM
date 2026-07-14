@@ -220,11 +220,13 @@ def wait_gpu_memory_settle(timeout: float = _SETTLE_TIMEOUT_S) -> bool:
     with "Executor creation failed due to insufficient GPU memory" while the
     previous model's weights are still resident (seen in pre-merge CI).
 
-    TODO: the deeper fix is MpiPoolSession.shutdown(wait=True) not returning
-    until the spawned worker processes have exited — that would close the
-    race for every consumer (back-to-back LLM() creations included) and
-    retire this heuristic. Needs a library-behavior change (blocking
-    shutdown affects all callers), so it belongs in a follow-up PR.
+    The primary protection is deterministic: every pool built by this layer
+    (and by session_reuse) is constructed with ``wait_shutdown=True``, so its
+    shutdown blocks until the workers actually exited. This barrier remains
+    as defense-in-depth for GPU memory the factories never saw — pools a
+    test constructs itself (explicit ``_mpi_session`` fixtures) and
+    in-process allocations — which also lose the implicit ~50s spawn window
+    on an instant handover. On a free GPU it costs a single NVML query.
 
     The measurement (NVML polling until mostly-free / flat / timeout) lives
     in ``_session_utils._settle_gpu_memory``, shared with the session-reuse
@@ -361,7 +363,9 @@ class SessionPrefetcher:
             from tensorrt_llm.llmapi.mpi_session import MpiPoolSession
 
             snapshot = _spawn_snapshot()  # workers freeze env+sys.path at spawn
-            session = MpiPoolSession(n_workers=spec)
+            # wait_shutdown: see _make_factory — every pool this layer hands
+            # out blocks its shutdown on actual worker exit.
+            session = MpiPoolSession(n_workers=spec, wait_shutdown=True)
             if any(session.submit_sync(_worker_import_report_cuda)):
                 print(
                     "[session-prefetch] note: tensorrt_llm import initialized an idle "
@@ -457,7 +461,11 @@ class SessionPrefetcher:
             # n_workers == 1 included: the default single-GPU path also spawns
             # a 1-worker pool (executor.py -> proxy.py) costing ~50s of
             # spawn+import, the same as multi-GPU pools.
-            session = self.take(n_workers) or real_cls(n_workers=n_workers)
+            # wait_shutdown: this pool's shutdown must not return until its
+            # workers exited (and released GPU memory) — the NEXT pool is
+            # handed over instantly, without the ~50s sync spawn that used to
+            # hide the release window.
+            session = self.take(n_workers) or real_cls(n_workers=n_workers, wait_shutdown=True)
             self.schedule_shadow(n_workers)  # re-arm for the NEXT test
             return session
 
