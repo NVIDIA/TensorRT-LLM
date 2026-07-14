@@ -5,7 +5,6 @@ from typing import Callable, Dict, Optional, Set
 from pydantic import AliasChoices, BaseModel, Field
 
 from tensorrt_llm import LLM as PyTorchLLM
-from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm.bench.benchmark.utils.processes import IterationWriter
 from tensorrt_llm.bench.build.build import get_model_config
 from tensorrt_llm.bench.dataclasses.configuration import RuntimeConfig
@@ -128,7 +127,7 @@ def get_llm(runtime_config: RuntimeConfig, kwargs: dict):
     Returns:
         An instance of the appropriate LLM class for the specified backend.
     """
-    llm_cls = LLM
+    llm_cls = PyTorchLLM
 
     if runtime_config.backend != None:
         ignore_trt_only_args(kwargs, runtime_config.backend)
