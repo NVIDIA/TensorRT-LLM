@@ -2083,6 +2083,16 @@ def pytest_addoption(parser):
         "This helps identify which test was running when a timeout or crash occurs. "
         "Only used with --periodic-junit.",
     )
+    parser.addoption(
+        "--periodic-hang-traceback",
+        action="store_true",
+        default=False,
+        help=
+        "Dump every thread's stack to hang_traceback.txt when a test overruns its "
+        "timeout or the process is signalled (default: False). This turns an empty "
+        "'Test terminated unexpectedly' record into a diagnosable hang stack. "
+        "Only used with --periodic-junit.",
+    )
 
 
 @pytest.hookimpl(trylast=True)
@@ -2213,6 +2223,8 @@ def pytest_configure(config):
         periodic_batch_size = config.getoption("--periodic-batch-size")
         periodic_save_unfinished_test = config.getoption(
             "--periodic-save-unfinished-test", default=False)
+        periodic_hang_traceback = config.getoption("--periodic-hang-traceback",
+                                                   default=False)
 
         # Create output directory early (like --junitxml does) to avoid conflicts with other plugins
         # that may need to write to the same directory (e.g., pytest-split)
@@ -2230,6 +2242,7 @@ def pytest_configure(config):
                 'warning': print_warning
             },
             save_unfinished_test=periodic_save_unfinished_test,
+            dump_hang_traceback=periodic_hang_traceback,
         )
 
         # Configure and register the reporter
@@ -2242,6 +2255,7 @@ def pytest_configure(config):
         )
         print_info(f"  Batch size: {periodic_batch_size} tests")
         print_info(f"  Save unfinished test: {periodic_save_unfinished_test}")
+        print_info(f"  Hang traceback: {periodic_hang_traceback}")
     elif periodic and not output_dir:
         print_warning(
             "Warning: --periodic-junit requires --output-dir to be set. "
