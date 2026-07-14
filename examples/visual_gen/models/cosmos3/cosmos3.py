@@ -229,7 +229,7 @@ def main():
         "--video_path",
         type=str,
         default=None,
-        help="Reference video for V2V: a local frame directory, .mp4/.avi file, or image path",
+        help="Reference video for V2V: a local frame directory or .mp4/.avi file",
     )
     parser.add_argument(
         "--output_type", type=str, default="video", help="Output type (video, image)"
