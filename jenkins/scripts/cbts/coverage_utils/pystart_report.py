@@ -73,8 +73,7 @@ def merge_to_sqlite(pattern, out_path):
     con.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT)")
     for fp in files:
         batch = []
-        # Input errors are recovered in _safe_rows; destination writes stay
-        # unguarded so a broken output DB aborts the merge.
+        # Input errors are recovered in _safe_rows; destination-write errors abort the merge.
         for row in _safe_rows(fp):
             batch.append(row)
             if len(batch) >= 20000:
@@ -90,11 +89,7 @@ def merge_to_sqlite(pattern, out_path):
 
 
 def _collect_defs(node, prefix, rel, funcs):
-    """Add every function/method reachable through class and control-flow nesting (no function scope crossed).
-
-    Mirrors co_qualname: control-flow blocks leave the prefix unchanged, classes prepend ``ClassName.``,
-    and function bodies are not descended (their nested defs carry ``<locals>``, which the tracker skips).
-    """
+    """Record functions/methods reachable through class and control-flow nesting (matches PY_START co_qualname)."""
     for child in ast.iter_child_nodes(node):
         if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
             funcs.add((rel, prefix + child.name))
@@ -259,8 +254,7 @@ def main():
     )
     a = ap.parse_args()
 
-    # Merge streams into a SQLite DB (bounded memory). Use --out-sqlite as that DB directly,
-    # else a unique per-invocation temp file so concurrent jobs never share one path.
+    # Merge into a SQLite DB (bounded memory): --out-sqlite directly, else a unique per-invocation temp file.
     keep = a.out_sqlite is not None
     if keep:
         db_path = a.out_sqlite

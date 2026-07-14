@@ -5720,8 +5720,7 @@ pipeline {
                     echo "env.testFilter is: ${env.testFilter}"
                     testFilter = trtllm_utils.updateMapWithJson(this, testFilter, env.testFilter, "testFilter")
                     println testFilter
-                    // CBTS coverage runs only on post-merge, per the upstream testFilter post_merge flag
-                    // (this downstream L0_Test job's own JOB_NAME does not carry PostMerge).
+                    // CBTS coverage runs only on post-merge, per the upstream testFilter post_merge flag.
                     CBTS_PIPELINE_ELIGIBLE = (testFilter[(IS_POST_MERGE)] ?: false)
                     echo "CBTS_PIPELINE_ELIGIBLE is: ${CBTS_PIPELINE_ELIGIBLE}"
                     echo "env.globalVars is: ${env.globalVars}"
