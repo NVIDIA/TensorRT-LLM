@@ -1,9 +1,7 @@
 import asyncio
 import base64
-import json
 import os
 import shutil
-import subprocess
 from typing import Any, Dict, List, Optional
 
 from PIL import Image, UnidentifiedImageError
@@ -103,41 +101,37 @@ def _reference_is_image(path: str) -> bool:
 
 
 def _reference_is_video(path: str) -> bool:
-    """True when ``path`` holds video content (a stream ffprobe recognizes).
+    """True when ``path`` holds video content (a PyAV-openable video stream).
 
-    Total predicate: False for images, audio, and undecodable content alike.
-    Images must be excluded explicitly because FFmpeg demuxes a still image as
-    a single-frame video stream, so the ffprobe check must be gated by the PIL
-    probe. ``ffprobe`` (part of the ffmpeg CLI, a documented system dependency)
-    absent → the probe returns False rather than raising.
+    Total predicate over *content*: False for images, audio, and undecodable
+    content alike. Images must be excluded explicitly because FFmpeg demuxes a
+    still image as a valid single-frame video stream, so an av probe alone would
+    claim every PNG/JPEG.
+
+    PyAV is gated behind ``TRTLLM_ENABLE_PYAV=1`` (the same opt-in the audio
+    extraction path uses) and is also required to decode ``.mp4``/``.avi``
+    references through ``torchvision``. A disabled gate or a missing package is
+    a deployment problem, not a content verdict, so it raises rather than
+    masquerading as "not video".
     """
     if _reference_is_image(path):
         return False
-    try:
-        result = subprocess.run(
-            [
-                "ffprobe",
-                "-v",
-                "error",
-                "-select_streams",
-                "v",
-                "-show_entries",
-                "stream=codec_type",
-                "-of",
-                "json",
-                path,
-            ],
-            capture_output=True,
-            text=True,
-            check=True,
+    if os.environ.get("TRTLLM_ENABLE_PYAV", "0") != "1":
+        raise RuntimeError(
+            "PyAV is required to detect and decode video references. "
+            "Set the environment variable TRTLLM_ENABLE_PYAV=1 to enable it."
         )
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        return False
     try:
-        streams = json.loads(result.stdout).get("streams", [])
-    except json.JSONDecodeError:
+        import av
+    except ImportError:
+        raise ImportError(
+            "PyAV is required to detect and decode video references but is not installed."
+        )
+    try:
+        with av.open(path) as container:
+            return bool(container.streams.video)
+    except av.FFmpegError:
         return False
-    return any(s.get("codec_type") == "video" for s in streams)
 
 
 def parse_visual_gen_params(
