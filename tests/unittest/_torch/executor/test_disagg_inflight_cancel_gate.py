@@ -407,6 +407,22 @@ def test_feature_opt_in_rejects_unqualified_config(monkeypatch, backend, runtime
         transceiver_module.create_kv_cache_transceiver(Mock(), Mock(), Mock(), Mock(), config)
 
 
+def test_feature_opt_in_rejects_v2_effective_python_runtime(monkeypatch):
+    monkeypatch.setenv(transceiver_module._DISAGG_INFLIGHT_CANCEL_ENABLED_ENV, "1")
+    config = CacheTransceiverConfig(backend="NIXL", transceiver_runtime=None)
+    mamba_manager = object.__new__(transceiver_module.V2MambaHybridCacheManager)
+
+    with pytest.raises(ValueError, match="currently supported only"):
+        transceiver_module.create_kv_cache_transceiver(
+            Mock(),
+            Mock(),
+            Mock(),
+            Mock(),
+            config,
+            mamba_cache_manager=mamba_manager,
+        )
+
+
 @pytest.mark.parametrize("nixl_backend", [None, "UCX"])
 def test_feature_opt_in_accepts_cpp_nixl_ucx(monkeypatch, nixl_backend):
     monkeypatch.setenv(transceiver_module._DISAGG_INFLIGHT_CANCEL_ENABLED_ENV, "1")

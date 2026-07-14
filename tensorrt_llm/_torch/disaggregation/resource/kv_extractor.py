@@ -21,7 +21,10 @@ from tensorrt_llm._torch.disaggregation.resource.page import (
     PoolView,
 )
 from tensorrt_llm._torch.disaggregation.resource.utils import get_physical_pool
-from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import MambaHybridCacheManager
+from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import (
+    MambaHybridCacheManager,
+    V2MambaHybridCacheManager,
+)
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import get_size_in_bytes, nvtx_range
 from tensorrt_llm.bindings import DataType
@@ -129,6 +132,65 @@ def _build_layer_group_for_mamba(
         ssm_states=ssm_pool,
         conv_section_bytes=conv_section_bytes,
         ssm_bytes_per_head=ssm_bytes_per_head,
+    )
+
+
+def _physical_slot_stride_bytes(tensor) -> int:
+    return int(tensor.stride(0) * tensor.element_size())
+
+
+def _build_layer_group_for_v2_mamba(
+    manager: V2MambaHybridCacheManager, pool_group_idx: int
+) -> MambaLayerGroup:
+    mamba_layer_offsets = {
+        int(global_layer_id): int(local_layer_id)
+        for global_layer_id, local_layer_id in manager.mamba_layer_offsets.items()
+    }
+
+    first_conv_state = manager.all_conv_states[0]
+    first_ssm_state = manager.all_ssm_states[0]
+    conv_physical_slot_stride_bytes = _physical_slot_stride_bytes(first_conv_state)
+    ssm_physical_slot_stride_bytes = _physical_slot_stride_bytes(first_ssm_state)
+    conv_slot_bytes = int(first_conv_state[0].numel() * first_conv_state.element_size())
+    ssm_slot_bytes = int(first_ssm_state[0].numel() * first_ssm_state.element_size())
+    num_slots = int(first_ssm_state.shape[0])
+
+    conv_layer_slot0_addresses = {
+        int(global_layer_id): int(manager.all_conv_states[offset].data_ptr())
+        for global_layer_id, offset in mamba_layer_offsets.items()
+    }
+    ssm_layer_slot0_addresses = {
+        int(global_layer_id): int(manager.all_ssm_states[offset].data_ptr())
+        for global_layer_id, offset in mamba_layer_offsets.items()
+    }
+
+    d_conv_m1 = manager.conv_state_shape[1]
+    conv_elem_size = first_conv_state.element_size()
+    nheads, head_dim, d_state = manager.ssm_state_shape
+    conv_section_bytes = [dim * d_conv_m1 * conv_elem_size for dim in manager.conv_section_dims]
+
+    ssm_elem_size = first_ssm_state.element_size()
+    ssm_bytes_per_head = head_dim * d_state * ssm_elem_size
+
+    return MambaLayerGroup(
+        pool_group_idx=pool_group_idx,
+        mamba_layer_offsets=mamba_layer_offsets,
+        conv_states=PhysicalPool(
+            base_address=int(first_conv_state.data_ptr()),
+            slot_bytes=conv_slot_bytes,
+            num_slots=num_slots,
+        ),
+        ssm_states=PhysicalPool(
+            base_address=int(first_ssm_state.data_ptr()),
+            slot_bytes=ssm_slot_bytes,
+            num_slots=num_slots,
+        ),
+        conv_section_bytes=conv_section_bytes,
+        ssm_bytes_per_head=ssm_bytes_per_head,
+        conv_layer_slot0_addresses=conv_layer_slot0_addresses,
+        ssm_layer_slot0_addresses=ssm_layer_slot0_addresses,
+        conv_physical_slot_stride_bytes=conv_physical_slot_stride_bytes,
+        ssm_physical_slot_stride_bytes=ssm_physical_slot_stride_bytes,
     )
 
 
@@ -344,6 +406,7 @@ def _build_page_table_v2(manager) -> KVCachePageTable:
     pool_groups: List[PhysicalPoolGroup] = []
     storage_pg_to_list_idx: Dict[int, int] = {}
     layer_groups: List[LayerGroup] = []
+    v2_mamba_layer_group_added = False
 
     for lc_idx in range(num_life_cycles):
         # Resolve the storage pool group for this life cycle.
@@ -351,6 +414,24 @@ def _build_page_table_v2(manager) -> KVCachePageTable:
         storage_pg_idx = storage.get_pool_group_index(lc_idx)
         pool_group = pool_group_storage[storage_pg_idx]
         num_pools = pool_group.num_pools
+
+        # V2 Mamba state life cycles are transferred through MambaPolicy below,
+        # not through the attention block mapper. Treating SSM/conv state pools
+        # as attention KV pools would use token-block arithmetic and corrupt the
+        # state transfer.
+        all_internal_layer_ids = list(manager.impl.layer_grouping[lc_idx])
+        if isinstance(manager, V2MambaHybridCacheManager) and any(
+            manager._is_local_mamba_layer(int(layer_id)) for layer_id in all_internal_layer_ids
+        ):
+            # Preserve page-table index == V2 life_cycle_id.  The V2 cache
+            # adapter uses the layer-group index to fetch aggregated page
+            # indices, so dropping this entry would shift all following
+            # attention layer groups onto the wrong lifecycle.
+            if manager.local_num_mamba_layers > 0 and not v2_mamba_layer_group_added:
+                mamba_layer_group = _build_layer_group_for_v2_mamba(manager, len(pool_groups))
+                layer_groups.append(mamba_layer_group)
+                v2_mamba_layer_group_added = True
+            continue
 
         # Build PhysicalPoolGroup once per unique storage pool group.
         if storage_pg_idx not in storage_pg_to_list_idx:
@@ -369,7 +450,6 @@ def _build_page_table_v2(manager) -> KVCachePageTable:
             )
 
         # Compute group-level global layer IDs and internal layer IDs
-        all_internal_layer_ids = list(manager.impl.layer_grouping[lc_idx])
         all_global_layer_ids = _compute_global_layer_ids(manager, lc_idx)
 
         local_layers = [
@@ -419,7 +499,9 @@ def _build_page_table_v2(manager) -> KVCachePageTable:
             )
         )
 
-    if isinstance(manager, MambaHybridCacheManager):
+    if isinstance(manager, MambaHybridCacheManager) and not isinstance(
+        manager, V2MambaHybridCacheManager
+    ):
         mamba_layer_group_idx = len(pool_groups)
         mamba_layer_group = _build_layer_group_for_mamba(manager, mamba_layer_group_idx)
         layer_groups.append(mamba_layer_group)

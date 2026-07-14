@@ -11,7 +11,9 @@ from tensorrt_llm.mapping import Mapping
 
 from .llm_request import LlmRequest
 from .mamba_cache_manager import (BaseMambaCacheManager,
-                                  CppMambaHybridCacheManager)
+                                  CppMambaHybridCacheManager,
+                                  MixedMambaHybridCacheManager,
+                                  V2MambaHybridCacheManager)
 from .resource_manager import KVCacheManager
 
 CacheTransceiverCpp = tensorrt_llm.bindings.internal.batch_manager.CacheTransceiver
@@ -34,6 +36,20 @@ _CACHE_TRANSCEIVER_BACKEND_ENV_VARS = (
 _disagg_inflight_cancel_enabled_cache: Optional[bool] = None
 
 
+def get_effective_cache_transceiver_backend(
+    cache_transceiver_config: Optional[CacheTransceiverConfig]
+) -> Optional[str]:
+    if cache_transceiver_config is None:
+        return None
+    backend = cache_transceiver_config.backend
+    if backend != "DEFAULT":
+        return backend
+    for env_var, env_backend in _CACHE_TRANSCEIVER_BACKEND_ENV_VARS:
+        if getenv(env_var) == "1":
+            return env_backend
+    return "NIXL"
+
+
 def is_disagg_inflight_cancel_enabled() -> bool:
     """Return whether disaggregated in-flight KV transfer cancellation is enabled."""
     global _disagg_inflight_cancel_enabled_cache
@@ -49,8 +65,10 @@ def is_disagg_inflight_cancel_enabled() -> bool:
 
 
 def _is_disagg_inflight_cancel_config_supported(
-        cache_transceiver_config: CacheTransceiverConfig) -> bool:
-    runtime = cache_transceiver_config.transceiver_runtime or "CPP"
+        cache_transceiver_config: CacheTransceiverConfig,
+        effective_runtime: Optional[str] = None) -> bool:
+    runtime = (effective_runtime
+               or cache_transceiver_config.transceiver_runtime or "CPP")
     nixl_backend = getenv(_NIXL_KVCACHE_BACKEND_ENV,
                           _SUPPORTED_INFLIGHT_CANCEL_NIXL_BACKEND)
     return (runtime == "CPP" and cache_transceiver_config.backend == "NIXL"
@@ -62,7 +80,8 @@ def _is_disagg_inflight_cancel_config_supported(
 
 
 def _validate_disagg_inflight_cancel_config(
-        cache_transceiver_config: CacheTransceiverConfig) -> None:
+        cache_transceiver_config: CacheTransceiverConfig,
+        effective_runtime: Optional[str] = None) -> None:
     if not is_disagg_inflight_cancel_enabled():
         return
 
@@ -77,10 +96,12 @@ def _validate_disagg_inflight_cancel_config(
             "unambiguous cache transceiver backend, but multiple legacy "
             f"backend selectors are enabled: {enabled_backend_env_vars}.")
 
-    if _is_disagg_inflight_cancel_config_supported(cache_transceiver_config):
+    if _is_disagg_inflight_cancel_config_supported(cache_transceiver_config,
+                                                    effective_runtime):
         return
 
-    runtime = cache_transceiver_config.transceiver_runtime or "CPP"
+    runtime = (effective_runtime
+               or cache_transceiver_config.transceiver_runtime or "CPP")
     nixl_backend = getenv(_NIXL_KVCACHE_BACKEND_ENV,
                           _SUPPORTED_INFLIGHT_CANCEL_NIXL_BACKEND)
     disable_overlap = getenv(_DISABLE_KV_CACHE_TRANSFER_OVERLAP_ENV)
@@ -122,20 +143,34 @@ def create_kv_cache_transceiver(
         logger.info("cache_transceiver is disabled")
         return None
 
-    _validate_disagg_inflight_cancel_config(cache_transceiver_config)
+    # V2 Mamba state is owned by the Python KVCacheManagerV2 core, so its
+    # effective transceiver runtime is Python even when the runtime is unset.
+    is_v2_mamba_hybrid = isinstance(mamba_cache_manager,
+                                    V2MambaHybridCacheManager)
+    use_python_transceiver = (cache_transceiver_config.transceiver_runtime
+                              == "PYTHON" or is_v2_mamba_hybrid)
+    if is_v2_mamba_hybrid and cache_transceiver_config.transceiver_runtime == "CPP":
+        raise ValueError(
+            "V2MambaHybridCacheManager requires transceiver_runtime='PYTHON' "
+            "or the default Python/NIXL route; it cannot use the C++ "
+            "transceiver.")
+
+    effective_runtime = "PYTHON" if use_python_transceiver else "CPP"
+    _validate_disagg_inflight_cancel_config(cache_transceiver_config,
+                                            effective_runtime)
 
     if cache_transceiver_config.backend == "DEFAULT":
         # When cache_transceiver_config.backend is not set, fallback to env_vars settings
         # NIXL is the default backend for non hybrid models
-        cache_transceiver_config.backend = "NIXL"
-        # Ordered by priority
-        for env_var, be_type in _CACHE_TRANSCEIVER_BACKEND_ENV_VARS:
+        effective_backend = get_effective_cache_transceiver_backend(
+            cache_transceiver_config)
+        for env_var, _ in _CACHE_TRANSCEIVER_BACKEND_ENV_VARS:
             if getenv(env_var) == "1":
                 logger.warning(
                     f"{env_var}=1 is set, but it's recommended to set cache_transceiver_config.backend in yaml config"
                 )
-                cache_transceiver_config.backend = be_type
                 break
+        cache_transceiver_config.backend = effective_backend
 
     if cache_transceiver_config.backend == "MPI":
         logger.warning(
@@ -146,10 +181,17 @@ def create_kv_cache_transceiver(
             f"UCX_CUDA_IPC_ENABLE_MNNVL=n, UCX_RNDV_SCHEME=put_zcopy and/or unset UCX_NET_DEVICES upon server "
             f"hangs or lower-than-expected performance.")
 
-    # Select transceiver implementation based on transceiver_runtime
+    # Select transceiver implementation based on transceiver_runtime.
     # transceiver_runtime == None or "CPP" -> use C++ transceiver (default)
-    # transceiver_runtime == "PYTHON" -> use Python transceiver
-    if cache_transceiver_config.transceiver_runtime == "PYTHON":
+    # transceiver_runtime == "PYTHON" -> use Python transceiver.
+    #
+    if use_python_transceiver:
+        if isinstance(mamba_cache_manager, CppMambaHybridCacheManager):
+            raise ValueError(
+                "transceiver_runtime='PYTHON' cannot drive "
+                "CppMambaHybridCacheManager (C++ pool backed). Use "
+                "transceiver_runtime='CPP', or select the V2 manager "
+                "(TLLM_MAMBA_MANAGER_PREFERENCE=V2).")
         # Python transceiver currently only supports NIXL and DEFAULT backend
         if cache_transceiver_config.backend not in ("DEFAULT", "NIXL"):
             raise ValueError(
@@ -162,6 +204,11 @@ def create_kv_cache_transceiver(
         logger.info("Using KvCacheTransceiverV2")
         return KvCacheTransceiverV2(mapping, dist, kv_cache_manager,
                                     cache_transceiver_config)
+
+    if isinstance(mamba_cache_manager, MixedMambaHybridCacheManager):
+        raise ValueError(
+            "MixedMambaHybridCacheManager requires the Python transceiver "
+            "runtime with the NIXL backend in disaggregated serving.")
 
     # Default: use C++ transceiver (transceiver_runtime is None or "CPP")
     return BindKvCacheTransceiver(mapping, dist, kv_cache_manager,

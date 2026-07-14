@@ -204,6 +204,10 @@ class MambaLayerGroup(LayerGroup):
     ssm_states: Optional[PhysicalPool] = None
     conv_section_bytes: Optional[List[int]] = None
     ssm_bytes_per_head: Optional[int] = None
+    conv_layer_slot0_addresses: Optional[Dict[int, int]] = None
+    ssm_layer_slot0_addresses: Optional[Dict[int, int]] = None
+    conv_physical_slot_stride_bytes: Optional[int] = None
+    ssm_physical_slot_stride_bytes: Optional[int] = None
 
     def to_dict(self) -> dict:
         return {
@@ -213,12 +217,26 @@ class MambaLayerGroup(LayerGroup):
             "ssm_states": self.ssm_states.to_dict(),
             "conv_section_bytes": self.conv_section_bytes,
             "ssm_bytes_per_head": self.ssm_bytes_per_head,
+            "conv_layer_slot0_addresses": {
+                int(k): int(v) for k, v in (self.conv_layer_slot0_addresses or {}).items()
+            }
+            if self.conv_layer_slot0_addresses is not None
+            else None,
+            "ssm_layer_slot0_addresses": {
+                int(k): int(v) for k, v in (self.ssm_layer_slot0_addresses or {}).items()
+            }
+            if self.ssm_layer_slot0_addresses is not None
+            else None,
+            "conv_physical_slot_stride_bytes": self.conv_physical_slot_stride_bytes,
+            "ssm_physical_slot_stride_bytes": self.ssm_physical_slot_stride_bytes,
         }
 
     @classmethod
     def from_dict(cls, data: dict) -> "MambaLayerGroup":
         conv_section_bytes = data.get("conv_section_bytes")
         ssm_bytes_per_head = data.get("ssm_bytes_per_head")
+        conv_layer_slot0_addresses = data.get("conv_layer_slot0_addresses")
+        ssm_layer_slot0_addresses = data.get("ssm_layer_slot0_addresses")
         return cls(
             pool_group_idx=int(data["pool_group_idx"]),
             mamba_layer_offsets={int(k): int(v) for k, v in data["mamba_layer_offsets"].items()},
@@ -228,6 +246,16 @@ class MambaLayerGroup(LayerGroup):
             if conv_section_bytes is not None
             else None,
             ssm_bytes_per_head=int(ssm_bytes_per_head) if ssm_bytes_per_head is not None else None,
+            conv_layer_slot0_addresses={
+                int(k): int(v) for k, v in conv_layer_slot0_addresses.items()
+            }
+            if conv_layer_slot0_addresses is not None
+            else None,
+            ssm_layer_slot0_addresses={int(k): int(v) for k, v in ssm_layer_slot0_addresses.items()}
+            if ssm_layer_slot0_addresses is not None
+            else None,
+            conv_physical_slot_stride_bytes=data.get("conv_physical_slot_stride_bytes"),
+            ssm_physical_slot_stride_bytes=data.get("ssm_physical_slot_stride_bytes"),
         )
 
 

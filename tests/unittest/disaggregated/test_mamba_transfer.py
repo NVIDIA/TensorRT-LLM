@@ -23,6 +23,9 @@ import tensorrt_llm
 import tensorrt_llm.bindings
 import tensorrt_llm.tensorrt_llm_transfer_agent_binding  # noqa: F401
 from tensorrt_llm import DisaggregatedParams, Mapping, SamplingParams
+from tensorrt_llm._torch.disaggregation.native import rank_info
+from tensorrt_llm._torch.disaggregation.native.mixers.ssm import peer
+from tensorrt_llm._torch.disaggregation.resource import page
 from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
 from tensorrt_llm._torch.pyexecutor.llm_request import (
     ATTENTION_DP_DUMMY_REQUEST_ID,
@@ -223,6 +226,73 @@ def _create_managers(tp, max_batch_size=MAX_BATCH_SIZE, enable_attention_dp=Fals
         )
         managers.append(mgr)
     return managers
+
+
+def test_mamba_policy_slot_major_layer_ptrs():
+    """V2 Mamba state tensors are slot-major, not layer-major."""
+    self_mlg = page.MambaLayerGroup(
+        pool_group_idx=0,
+        mamba_layer_offsets={1: 0, 2: 1},
+        conv_states=page.PhysicalPool(base_address=100, slot_bytes=10, num_slots=8),
+        ssm_states=page.PhysicalPool(base_address=200, slot_bytes=20, num_slots=8),
+        conv_section_bytes=[10],
+        ssm_bytes_per_head=10,
+        conv_layer_slot0_addresses={1: 1000, 2: 2000},
+        ssm_layer_slot0_addresses={1: 3000, 2: 4000},
+        conv_physical_slot_stride_bytes=64,
+        ssm_physical_slot_stride_bytes=128,
+    )
+    peer_mlg = page.MambaLayerGroup(
+        pool_group_idx=0,
+        mamba_layer_offsets={1: 0, 2: 1},
+        conv_states=page.PhysicalPool(base_address=500, slot_bytes=10, num_slots=8),
+        ssm_states=page.PhysicalPool(base_address=600, slot_bytes=20, num_slots=8),
+        conv_section_bytes=[10],
+        ssm_bytes_per_head=10,
+        conv_layer_slot0_addresses={1: 5000, 2: 6000},
+        ssm_layer_slot0_addresses={1: 7000, 2: 8000},
+        conv_physical_slot_stride_bytes=64,
+        ssm_physical_slot_stride_bytes=128,
+    )
+    self_ri = rank_info.RankInfo(
+        instance_name="self",
+        instance_rank=0,
+        tp_size=1,
+        tp_rank=0,
+        pp_size=1,
+        pp_rank=0,
+        layer_num_per_pp=[2],
+        sender_endpoints=[],
+        server_endpoint="",
+        self_endpoint="",
+        transfer_engine_info=bytes(),
+    )
+    peer_ri = rank_info.RankInfo(
+        instance_name="peer",
+        instance_rank=0,
+        tp_size=1,
+        tp_rank=0,
+        pp_size=1,
+        pp_rank=0,
+        layer_num_per_pp=[2],
+        sender_endpoints=[],
+        server_endpoint="",
+        self_endpoint="",
+        transfer_engine_info=bytes(),
+    )
+
+    src_frags, dst_frags, kv_sizes = peer.MambaPolicy.build_mamba_frags(
+        self_mlg=self_mlg,
+        peer_mlg=peer_mlg,
+        src_slot=3,
+        dst_slot=5,
+        self_ri=self_ri,
+        peer_ri=peer_ri,
+    )
+
+    assert src_frags == [1192, 2192, 3384, 4384]
+    assert dst_frags == [5320, 6320, 7640, 8640]
+    assert kv_sizes == [10, 10, 20, 20]
 
 
 # ---------------------------------------------------------------------------
