@@ -437,8 +437,15 @@ class DFlashWorker(SpecWorkerBase):
         # Save context lengths so both warmup and a failed forward can roll
         # back the in-place _ctx_len updates made during drafting.
         is_warmup = spec_metadata.is_cuda_graph and not torch.cuda.is_current_stream_capturing()
-        self._saved_ctx_len = self._ctx_len.clone()
-        self._ctx_len_restore_pending = True
+        if not torch.cuda.is_current_stream_capturing():
+            # Never allocate the snapshot while capturing a CUDA graph: the
+            # clone would live in the graph memory pool, and its replay-time
+            # writes could alias blocks reused by later captures. Rollback is
+            # only meaningful for eager/warmup forwards anyway; a failure
+            # during capture aborts the graph itself, and captured ops do not
+            # mutate _ctx_len until replay.
+            self._saved_ctx_len = self._ctx_len.clone()
+            self._ctx_len_restore_pending = True
 
         self._execute_guided_decoder_if_present(logits)
 
