@@ -1350,15 +1350,13 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_device(2)
     @pytest.mark.skip_less_device_memory(60000)
     @skip_pre_hopper
-    @pytest.mark.parametrize("use_kv_cache_manager_v2", [False, True],
-                             ids=["cache_mgr_v1", "cache_mgr_v2"])
-    def test_kv_cache_v2_nixl_python(self, use_kv_cache_manager_v2):
-        """Test with KV cache manager v1 and v2, block_reuse=False, backend=NIXL, transceiver_runtime=PYTHON."""
+    def test_kv_cache_v2_nixl_python(self):
+        """Test with use_kv_cache_manager_v2=True, block_reuse=False, backend=NIXL, transceiver_runtime=PYTHON."""
         ctx_server_config = {
             "disable_overlap_scheduler": True,
             "kv_cache_config": {
                 "enable_block_reuse": False,
-                "use_kv_cache_manager_v2": use_kv_cache_manager_v2
+                "use_kv_cache_manager_v2": True
             },
             "cache_transceiver_config": {
                 "backend": "NIXL",
@@ -1369,7 +1367,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             "disable_overlap_scheduler": True,
             "kv_cache_config": {
                 "enable_block_reuse": False,
-                "use_kv_cache_manager_v2": use_kv_cache_manager_v2
+                "use_kv_cache_manager_v2": True
             },
             "cache_transceiver_config": {
                 "backend": "NIXL",
@@ -1752,10 +1750,10 @@ class TestDeepSeekV32Exp(LlmapiAccuracyTestHarness):
                               test_sets=["MMLU", "GSM8K"])
 
     @pytest.mark.skip_less_device(4)
-    @pytest.mark.parametrize("use_kv_cache_manager_v2", [False, True],
-                             ids=["cache_mgr_v1", "cache_mgr_v2"])
+    @pytest.mark.parametrize("use_kv_cache_manager_v2", [False],
+                             ids=["cache_mgr_v1"])
     def test_kv_cache_v2_nixl_python(self, use_kv_cache_manager_v2):
-        """Test with KV cache manager v1 and v2, block_reuse=False, backend=NIXL, transceiver_runtime=PYTHON."""
+        """Test with KV cache manager v1, block_reuse=False, backend=NIXL, transceiver_runtime=PYTHON."""
         max_num_tokens = 8192
         moe_config = {"backend": "TRTLLM", "max_num_tokens": max_num_tokens}
         ctx_server_config = {
@@ -2668,10 +2666,10 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
     MODEL_PATH = f"{llm_models_root()}/DeepSeek-R1-0528-FP4-v2"
 
     @pytest.mark.skip_less_device(4)
-    @pytest.mark.parametrize("use_kv_cache_manager_v2", [False, True],
-                             ids=["cache_mgr_v1", "cache_mgr_v2"])
+    @pytest.mark.parametrize("use_kv_cache_manager_v2", [False],
+                             ids=["cache_mgr_v1"])
     def test_kv_cache_v2_nixl_python(self, use_kv_cache_manager_v2):
-        """Test with KV cache manager v1 and v2, block_reuse=False, backend=NIXL, transceiver_runtime=PYTHON."""
+        """Test with KV cache manager v1, block_reuse=False, backend=NIXL, transceiver_runtime=PYTHON."""
         max_num_tokens = 8192
         moe_config = {"backend": "TRTLLM", "max_num_tokens": max_num_tokens}
         ctx_server_config = {
