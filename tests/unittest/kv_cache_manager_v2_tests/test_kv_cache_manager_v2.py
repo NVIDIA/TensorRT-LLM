@@ -325,7 +325,7 @@ class TestKVCacheManagerV2(unittest.TestCase):
         tokens_per_block: int = 32,
         kv_buf_size: int = 8192,
         block_quant_buf_size: int | None = None,
-    ):
+    ) -> None:
         self.cfg = create_config(
             tokens_per_block,
             gpu_quota,
@@ -1905,6 +1905,10 @@ class TestSSMSupport(unittest.TestCase):
         kv4.commit(prompt[:48])
         self.assertEqual(kv4.num_committed_tokens, 48)
         kv4.close()
+
+    def test_ssm_reuse_config_allows_partial_reuse(self) -> None:
+        config = self._make_ssm_config(enable_partial_reuse=True)
+        self.assertTrue(config.enable_partial_reuse)
 
     def test_ssm_reuse_config_validation(self) -> None:
         """SSM reuse requires commit_min_snapshot."""

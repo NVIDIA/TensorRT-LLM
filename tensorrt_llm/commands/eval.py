@@ -19,17 +19,21 @@ import click
 import tensorrt_llm.profiler as profiler
 
 from .. import LLM as PyTorchLLM
-from .._tensorrt_engine import LLM
 from ..evaluate import (AALCR, AIME2025, AIME2026, GSM8K, HLE, MMLU, MMMU,
                         ArenaHard, CnnDailymail, CoVoST2, GPQADiamond,
                         GPQAExtended, GPQAMain, GPQANemoSkills, IFBench,
                         JsonModeEval, LongBenchV1, LongBenchV2, MMMUPro,
                         SciCode)
-from ..llmapi import BuildConfig, KvCacheConfig
+from ..llmapi import KvCacheConfig
+from ..llmapi.llm_args import TorchLlmArgs
 from ..llmapi.llm_utils import update_llm_args_with_extra_options
 from ..logger import logger, severity_map
 from ..usage import config as _telemetry_config
 from .utils import collect_explicit_cli_keys
+
+# CLI defaults are sourced from the TorchLlmArgs field defaults so they stay in
+# lock-step with the args class and can't drift.
+_LLM_ARGS_FIELDS = TorchLlmArgs.model_fields
 
 # Map Click parameter names to the LlmArgs field name (or merge-function CLI
 # scalar name) used by `update_llm_args_with_extra_options`.
@@ -64,7 +68,7 @@ _CLICK_TO_LLM_ARG = {
 )
 @click.option(
     "--backend",
-    type=click.Choice(["pytorch", "tensorrt"]),
+    type=click.Choice(["pytorch"]),
     default="pytorch",
     help="The backend to use for evaluation. Default is pytorch backend.")
 @click.option('--log_level',
@@ -73,23 +77,23 @@ _CLICK_TO_LLM_ARG = {
               help="The logging level.")
 @click.option("--max_beam_width",
               type=int,
-              default=BuildConfig.model_fields["max_beam_width"].default,
+              default=_LLM_ARGS_FIELDS["max_beam_width"].default,
               help="Maximum number of beams for beam search decoding.")
 @click.option("--max_batch_size",
               type=int,
-              default=BuildConfig.model_fields["max_batch_size"].default,
+              default=_LLM_ARGS_FIELDS["max_batch_size"].default,
               help="Maximum number of requests that the engine can schedule.")
 @click.option(
     "--max_num_tokens",
     type=int,
-    default=BuildConfig.model_fields["max_num_tokens"].default,
+    default=_LLM_ARGS_FIELDS["max_num_tokens"].default,
     help=
     "Maximum number of batched input tokens after padding is removed in each batch."
 )
 @click.option(
     "--max_seq_len",
     type=int,
-    default=BuildConfig.model_fields["max_seq_len"].default,
+    default=None,
     help="Maximum total length of one request, including prompt and outputs. "
     "If unspecified, the value is deduced from the model config.")
 @click.option("--tp_size", type=int, default=1, help='Tensor parallelism size.')
@@ -187,13 +191,6 @@ def main(ctx, model: str, tokenizer: Optional[str],
                         max_num_tokens=max_num_tokens,
                         max_beam_width=max_beam_width,
                         max_seq_len=max_seq_len)
-    elif backend == 'tensorrt':
-        llm_cls = LLM
-        build_config = BuildConfig(max_batch_size=max_batch_size,
-                                   max_num_tokens=max_num_tokens,
-                                   max_beam_width=max_beam_width,
-                                   max_seq_len=max_seq_len)
-        llm_args.update(build_config=build_config)
     else:
         raise click.BadParameter(
             f"{backend} is not a known backend, check help for available options.",
