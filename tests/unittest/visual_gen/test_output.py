@@ -32,8 +32,12 @@ def test_visual_gen_output_is_dataclass():
         "image",
         "video",
         "audio",
+        "action",
         "frame_rate",
         "audio_sample_rate",
+        "raw_action_dim",
+        "action_mode",
+        "domain_id",
         "error",
         "metrics",
     }
@@ -60,6 +64,10 @@ def test_minimal_construction_defaults():
     assert out.image is not None
     assert out.video is None
     assert out.audio is None
+    assert out.action is None
+    assert out.raw_action_dim is None
+    assert out.action_mode is None
+    assert out.domain_id is None
     assert out.frame_rate is None
     assert out.audio_sample_rate is None
     assert out.error is None
