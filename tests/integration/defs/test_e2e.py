@@ -1009,7 +1009,6 @@ def test_ptp_quickstart_advanced_mtp(llm_root, llm_venv, model_name,
         "MTP",
         "--model_dir",
         f"{llm_models_root()}/{model_path}",
-        "--use_one_model",
     ])
 
 
@@ -1289,7 +1288,6 @@ def test_relaxed_acceptance_quickstart_advanced_deepseek_r1_8gpus(
         "--relaxed_topk=10",
         "--relaxed_delta=0.5",
         "--enable_attention_dp",
-        "--use_one_model",
         "--moe_backend",
         "DEEPGEMM" if is_blackwell else "CUTLASS",
     ])
@@ -2036,7 +2034,6 @@ def test_eagle3_output_repetition_4gpus(model_dir: str, draft_model_dir: str):
     spec_config = Eagle3DecodingConfig(
         max_draft_len=3,
         speculative_model=eagle_model_dir,
-        eagle3_one_model=True,
     )
     with LLM(**llm_common_config, speculative_config=spec_config) as llm_spec:
         results_spec = llm_spec.generate([prompt], sampling_params)

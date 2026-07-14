@@ -2517,11 +2517,10 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
     def _is_draft_batch(requests: list[LlmRequest]) -> bool:
         """Whether this batch belongs to the draft model.
 
-        Batches are homogeneous by construction: ModelDrafter builds all-draft
-        batches for its sample_async/update_requests calls on this shared
-        sampler, and PyExecutor's batches are all-target. The pending-steps
-        accounting relies on this to skip draft batches wholesale; assert it so
-        a mixed batch fails loudly instead of silently corrupting the counters.
+        Callers provide homogeneous all-draft or all-target batches. The
+        pending-steps accounting relies on this to skip draft batches
+        wholesale; assert it so a mixed batch fails loudly instead of silently
+        corrupting the counters.
         """
         is_draft: bool = requests[0].py_is_draft
         assert all(r.py_is_draft == is_draft for r in requests), (
@@ -4095,11 +4094,8 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         num_context_logits_prefix_sum: list[int],
         resource_manager: Optional[ResourceManager] = None,
     ) -> SampleStateTorch:
-        # NB: The sampler is either called directly by PyExecutor, for the target model,
-        #     or by ModelDrafter.prepare_draft_tokens(), for the draft model. In the former
-        #     case there are 1 + get_draft_token_length(request) tokens per request. In the
-        #     latter case, there is always only 1 token per request because draft
-        #     tokens are sampled one-by-one.
+        # NB: The sampler is called directly by PyExecutor for the target model.
+        #     There are 1 + get_draft_token_length(request) tokens per request.
         self.setup_sampler_step(scheduled_requests)
         new_tokens = self.store.new_tokens
 

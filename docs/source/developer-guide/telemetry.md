@@ -242,7 +242,6 @@ unset or when the safety sanitizer rejects the runtime value.
 | `speculative_config.dynamic_tree_max_topK` | `Optional[int]` | `value` |  |  |
 | `speculative_config.eagle3_layers_to_capture` | `Optional[Set[int]]` | `value` |  |  |
 | `speculative_config.eagle3_model_arch` | `Literal['llama3', 'mistral_large3']` | `categorical` |  | `llama3`, `mistral_large3` |
-| `speculative_config.eagle3_one_model` | `Optional[bool]` | `value` |  |  |
 | `speculative_config.eagle_choices` | `Optional[List[List[int]]]` | `value` |  |  |
 | `speculative_config.enable_global_pool` | `<class 'bool'>` | `value` |  |  |
 | `speculative_config.end_thinking_phase_token` | `<class 'int'>` | `value` |  |  |
@@ -261,7 +260,6 @@ unset or when the safety sanitizer rejects the runtime value.
 | `speculative_config.max_verification_set_size` | `<class 'int'>` | `value` |  |  |
 | `speculative_config.max_window_size` | `<class 'int'>` | `value` |  |  |
 | `speculative_config.medusa_choices` | `Optional[List[List[int]]]` | `value` |  |  |
-| `speculative_config.mtp_eagle_one_model` | `<class 'bool'>` | `value` |  |  |
 | `speculative_config.num_eagle_layers` | `Optional[int]` | `value` |  |  |
 | `speculative_config.num_medusa_heads` | `Optional[int]` | `value` |  |  |
 | `speculative_config.num_nextn_predict_layers` | `Optional[int]` | `value` |  |  |
@@ -540,7 +538,6 @@ unset or when the safety sanitizer rejects the runtime value.
 | `speculative_config.dynamic_tree_max_topK` | `Optional[int]` | `value` |  |  |
 | `speculative_config.eagle3_layers_to_capture` | `Optional[Set[int]]` | `value` |  |  |
 | `speculative_config.eagle3_model_arch` | `Literal['llama3', 'mistral_large3']` | `categorical` |  | `llama3`, `mistral_large3` |
-| `speculative_config.eagle3_one_model` | `Optional[bool]` | `value` |  |  |
 | `speculative_config.eagle_choices` | `Optional[List[List[int]]]` | `value` |  |  |
 | `speculative_config.enable_global_pool` | `<class 'bool'>` | `value` |  |  |
 | `speculative_config.end_thinking_phase_token` | `<class 'int'>` | `value` |  |  |
@@ -559,7 +556,6 @@ unset or when the safety sanitizer rejects the runtime value.
 | `speculative_config.max_verification_set_size` | `<class 'int'>` | `value` |  |  |
 | `speculative_config.max_window_size` | `<class 'int'>` | `value` |  |  |
 | `speculative_config.medusa_choices` | `Optional[List[List[int]]]` | `value` |  |  |
-| `speculative_config.mtp_eagle_one_model` | `<class 'bool'>` | `value` |  |  |
 | `speculative_config.num_eagle_layers` | `Optional[int]` | `value` |  |  |
 | `speculative_config.num_medusa_heads` | `Optional[int]` | `value` |  |  |
 | `speculative_config.num_nextn_predict_layers` | `Optional[int]` | `value` |  |  |

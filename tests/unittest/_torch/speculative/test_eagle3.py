@@ -96,7 +96,7 @@ def test_eagle3_target_kv_cache_extends_full_window_for_spec_decode() -> None:
 
 
 @skip_num_gpus_less_than(1)
-def test_eagle3_one_model_capture_uses_real_token_count() -> None:
+def test_eagle3_capture_uses_real_token_count() -> None:
     # maybe_capture_hidden_states routes through inplace_slice_copy, a CUDA-only
     # custom op, so this test runs on GPU. It verifies that the capture is bounded
     # by the real scheduled token count (num_capture_tokens) and not self.num_tokens.
@@ -141,10 +141,10 @@ def enforce_single_worker(monkeypatch):
     yield
 
 
-def test_kv_lens_runtime_with_eagle3_one_model():
+def test_kv_lens_runtime_with_eagle3():
     """
     Validates that kv_lens_runtime correctly excludes num_extra_kv_tokens when
-    preparing attention metadata during EAGLE3 one-model speculative decoding.
+    preparing attention metadata during EAGLE3 speculative decoding.
 
     Background:
     - EAGLE3 reserves num_extra_kv_tokens = max_draft_len - 1 in KV cache for draft token management
@@ -284,72 +284,19 @@ def test_block_offsets_staging_width_spec_gate(spec_signal):
 
 
 @pytest.mark.parametrize(
-    "use_cuda_graph,attn_backend,disable_overlap_scheduler,enable_block_reuse,use_one_model,enable_chunked_prefill,use_chain_drafter,multi_batch,attention_dp,use_hf_speculative_model",
+    "use_cuda_graph,attn_backend,disable_overlap_scheduler,enable_block_reuse,enable_chunked_prefill,multi_batch,attention_dp,use_hf_speculative_model",
     [
-        [True, "TRTLLM", True, False, False, False, True, False, False, False],
-        [True, "TRTLLM", True, False, False, False, False, False, False, False],
-        [False, "TRTLLM", True, False, False, False, True, False, False, False],
-        [
-            False, "TRTLLM", True, False, False, False, False, False, False,
-            False
-        ],
-        [
-            True, "FLASHINFER", True, False, False, False, True, False, False,
-            False
-        ],
-        [
-            False, "FLASHINFER", True, False, False, False, True, False, False,
-            False
-        ],
-        [False, "TRTLLM", False, True, True, False, True, False, False, False],
-        [True, "TRTLLM", False, True, True, False, True, False, False, False],
-        [True, "TRTLLM", True, False, True, True, True, False, False, False],
-        [True, "TRTLLM", True, False, True, False, True, False, False, False],
-        [True, "TRTLLM", True, False, False, True, True, False, False, False],
-        [True, "TRTLLM", False, False, False, False, True, False, False, False],
-        [
-            False, "TRTLLM", False, False, False, False, True, False, False,
-            False
-        ],
-        [True, "TRTLLM", False, False, False, False, False, True, False, False],
-        [True, "TRTLLM", False, False, False, False, False, True, True, False],
-        [
-            False, "TRTLLM", False, False, False, False, False, True, False,
-            False
-        ],
-        [True, "TRTLLM", False, False, False, False, True, True, False, False],
-        [False, "TRTLLM", False, False, False, False, True, True, False, False],
-        [
-            True, "TRTLLM", False, False, False, False, False, False, False,
-            False
-        ],
-        [
-            False, "TRTLLM", False, False, False, False, False, False, False,
-            False
-        ],
-        [True, "TRTLLM", False, False, False, True, True, False, False, False],
-        [True, "TRTLLM", False, False, False, True, False, False, False, False],
-        [
-            True, "FLASHINFER", False, False, False, False, True, False, False,
-            False
-        ],
-        [
-            False, "FLASHINFER", False, False, False, False, True, False, False,
-            False
-        ],
-        # Tests (mocked) speculative model auto-download from HuggingFace
-        [False, "TRTLLM", True, False, False, False, True, False, False, True],
+        [False, "TRTLLM", False, True, False, False, False, False],
+        [True, "TRTLLM", False, True, False, False, False, False],
+        [True, "TRTLLM", True, False, True, False, False, False],
+        [True, "TRTLLM", True, False, False, False, False, False],
     ])
 @pytest.mark.high_cuda_memory
 @with_mocked_hf_download_for_single_gpu
 def test_llama_eagle3(use_cuda_graph: bool, attn_backend: str,
                       disable_overlap_scheduler: bool, enable_block_reuse: bool,
-                      use_one_model: bool, enable_chunked_prefill: bool,
-                      use_chain_drafter: bool, multi_batch: bool,
+                      enable_chunked_prefill: bool, multi_batch: bool,
                       attention_dp: bool, use_hf_speculative_model: bool):
-    if not use_one_model:
-        pytest.skip("Two model Eagle3 is deprecated")
-
     # Eagle3 one model works with overlap scheduler and block reuse.
     total_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
     if total_mem_gb < 35:
@@ -395,10 +342,7 @@ def test_llama_eagle3(use_cuda_graph: bool, attn_backend: str,
     spec_config = Eagle3DecodingConfig(
         max_draft_len=max_draft_len,
         speculative_model=eagle_model,
-        # Llama 3 does not support one model eagle.
-        eagle3_one_model=use_one_model,
     )
-    spec_config._allow_chain_drafter = use_chain_drafter
 
     # Create the LLM instance
     llm_spec = LLM(**llm_common_config, speculative_config=spec_config)
@@ -457,8 +401,7 @@ def test_llama_eagle3(use_cuda_graph: bool, attn_backend: str,
         assert text_spec == text_ref
 
 
-@pytest.mark.parametrize("eagle3_one_model", [True, False])
-def test_eagle3_spec_decoding_stats(eagle3_one_model):
+def test_eagle3_spec_decoding_stats():
     """Test that specDecodingStats are correctly populated in metrics endpoint"""
     models_path = llm_models_root()
     eagle_model_dir = f"{models_path}/EAGLE3-LLaMA3.1-Instruct-8B"
@@ -474,14 +417,12 @@ def test_eagle3_spec_decoding_stats(eagle3_one_model):
     spec_config = Eagle3DecodingConfig(
         max_draft_len=3,
         speculative_model=eagle_model_dir,
-        eagle3_one_model=eagle3_one_model,
     )
 
     with LLM(
             model=target_model_dir,
             speculative_config=spec_config,
             kv_cache_config=kv_cache_config,
-            disable_overlap_scheduler=not eagle3_one_model,
             enable_iter_perf_stats=True,
             max_batch_size=4,
     ) as llm:
@@ -554,7 +495,6 @@ def test_llama_eagle3_long_prompt(use_cuda_graph):
     spec_config = Eagle3DecodingConfig(
         max_draft_len=3,
         speculative_model=eagle_model_dir,
-        eagle3_one_model=False,
     )
 
     if use_cuda_graph:
@@ -597,7 +537,6 @@ def test_deepseek_eagle3():
     attn_backend = "TRTLLM"
     disable_overlap_scheduler = False
     enable_block_reuse = False
-    use_one_model = False
     enable_chunked_prefill = False
 
     # Eagle3 one model works with overlap scheduler and block reuse.
@@ -675,13 +614,10 @@ def test_deepseek_eagle3():
             enable_chunked_prefill=enable_chunked_prefill,
         )
 
-        spec_config = Eagle3DecodingConfig(
-            max_draft_len=max_draft_len,
-            speculative_model=eagle_model_dir,
-            # Llama 3 does not support one model eagle.
-            eagle3_one_model=use_one_model,
-            eagle3_layers_to_capture={29},
-            load_format="dummy")
+        spec_config = Eagle3DecodingConfig(max_draft_len=max_draft_len,
+                                           speculative_model=eagle_model_dir,
+                                           eagle3_layers_to_capture={29},
+                                           load_format="dummy")
 
         llm_spec = LLM(**llm_common_config, speculative_config=spec_config)
 
@@ -699,7 +635,6 @@ def test_deepseek_mla_eagle3():
     attn_backend = "TRTLLM"
     disable_overlap_scheduler = False
     enable_block_reuse = False
-    use_one_model = True
     enable_chunked_prefill = False
 
     # Eagle3 one model works with overlap scheduler and block reuse.
@@ -788,7 +723,6 @@ def test_deepseek_mla_eagle3():
 
         spec_config = Eagle3DecodingConfig(max_draft_len=max_draft_len,
                                            speculative_model=eagle_model_dir,
-                                           eagle3_one_model=use_one_model,
                                            load_format="dummy")
 
         llm_spec = LLM(**llm_common_config, speculative_config=spec_config)
@@ -802,8 +736,7 @@ def test_deepseek_mla_eagle3():
             pass
 
 
-@pytest.mark.parametrize("use_one_model", [True, False])
-def test_multi_eagle3(use_one_model: bool):
+def test_multi_eagle3():
     use_cuda_graph = True
     attn_backend = "TRTLLM"
     disable_overlap_scheduler = False
@@ -886,7 +819,6 @@ def test_multi_eagle3(use_one_model: bool):
 
         spec_config = Eagle3DecodingConfig(max_draft_len=max_draft_len,
                                            speculative_model=eagle_model_dir,
-                                           eagle3_one_model=use_one_model,
                                            load_format="dummy")
 
         llm_spec = LLM(**llm_common_config, speculative_config=spec_config)
@@ -910,7 +842,6 @@ def test_eagle3_cuda_graph_padding(disable_overlap_scheduler: bool):
     """
     attn_backend = "TRTLLM"
     enable_block_reuse = False
-    use_one_model = False
     enable_chunked_prefill = False
 
     total_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
@@ -943,7 +874,6 @@ def test_eagle3_cuda_graph_padding(disable_overlap_scheduler: bool):
     spec_config = Eagle3DecodingConfig(
         max_draft_len=max_draft_len,
         speculative_model=eagle_model_dir,
-        eagle3_one_model=use_one_model,
     )
 
     # Create the LLM instance
@@ -965,7 +895,6 @@ def test_eagle3_cdl_sampling(disable_overlap_scheduler: bool):
     """Test CDL sampling with 2 requests and max_batch_size=2."""
     attn_backend = "TRTLLM"
     enable_block_reuse = False
-    use_one_model = False
     enable_chunked_prefill = False
 
     total_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
@@ -997,7 +926,6 @@ def test_eagle3_cdl_sampling(disable_overlap_scheduler: bool):
     spec_config = Eagle3DecodingConfig(
         max_draft_len=max_draft_len,
         speculative_model=eagle_model_dir,
-        eagle3_one_model=use_one_model,
     )
 
     # Create the LLM instance
@@ -1054,7 +982,6 @@ def test_llama_eagle3_rejection_sampling_modes(use_dynamic_tree: bool,
     spec_config_kwargs = dict(
         max_draft_len=max_draft_len,
         speculative_model=eagle_model,
-        eagle3_one_model=True,
         use_rejection_sampling=True,
     )
     if use_dynamic_tree:
@@ -1165,7 +1092,6 @@ def test_eagle3_lora(use_cuda_graph: bool):
     """
     attn_backend = "TRTLLM"
     enable_block_reuse = False
-    use_one_model = True
     enable_chunked_prefill = False
 
     total_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
@@ -1201,7 +1127,6 @@ def test_eagle3_lora(use_cuda_graph: bool):
     spec_config = Eagle3DecodingConfig(
         max_draft_len=max_draft_len,
         speculative_model=eagle_model_dir,
-        eagle3_one_model=use_one_model,
     )
 
     # Create the LLM instance
@@ -1258,7 +1183,6 @@ def test_llama_eagle3_dynamic_tree(use_cuda_graph: bool,
     spec_config = Eagle3DecodingConfig(
         max_draft_len=max_draft_len,
         speculative_model=eagle_model,
-        eagle3_one_model=True,
         use_dynamic_tree=True,
         dynamic_tree_max_topK=dynamic_tree_max_topK,
         max_total_draft_tokens=max_total_draft_tokens,

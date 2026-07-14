@@ -796,14 +796,12 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_device(2)
     @skip_pre_hopper
     @parametrize_with_ids("overlap_scheduler", [True, False])
-    @parametrize_with_ids("eagle3_one_model", [True, False])
-    def test_eagle3(self, overlap_scheduler, eagle3_one_model):
+    def test_eagle3(self, overlap_scheduler):
         speculative_decoding_config = {
             "decoding_type": "Eagle",
             "max_draft_len": 4,
             "speculative_model":
             f"{llm_models_root()}/EAGLE3-LLaMA3.1-Instruct-8B",
-            "eagle3_one_model": eagle3_one_model
         }
         ctx_server_config = {
             "disable_overlap_scheduler":
@@ -859,7 +857,6 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             "max_draft_len": 4,
             "speculative_model":
             f"{llm_models_root()}/EAGLE3-LLaMA3.1-Instruct-8B",
-            "eagle3_one_model": True,
         }
         ctx_server_config = {
             "disable_overlap_scheduler":
@@ -945,17 +942,14 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_device(2)
     @pytest.mark.skip_less_device_memory(48000)
-    @parametrize_with_ids("eagle3_one_model", [True, False])
     @pytest.mark.parametrize("backend", ["xgrammar", "llguidance"])
-    def test_guided_decoding_with_eagle3(self, backend: str,
-                                         eagle3_one_model: bool, mocker):
+    def test_guided_decoding_with_eagle3(self, backend: str, mocker):
         mocker.patch.dict(os.environ, {"TRTLLM_XGUIDANCE_LENIENT": "1"})
         speculative_decoding_config = {
             "decoding_type": "Eagle",
             "max_draft_len": 3,
             "speculative_model":
             f"{llm_models_root()}/EAGLE3-LLaMA3.1-Instruct-8B",
-            "eagle3_one_model": eagle3_one_model
         }
 
         ctx_server_config = {
@@ -971,8 +965,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             }
         }
         gen_server_config = {
-            # Two-model eagle3 does not support overlap scheduler
-            "disable_overlap_scheduler": not eagle3_one_model,
+            "disable_overlap_scheduler": False,
             "speculative_config": speculative_decoding_config,
             "kv_cache_config": {
                 "free_gpu_memory_fraction": 0.8,

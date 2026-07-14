@@ -293,7 +293,6 @@ class KvCacheCreator:
         self,
         *,
         model_engine: PyTorchModelEngine,
-        draft_model_engine: Optional[PyTorchModelEngine],
         mapping: Mapping,
         net_max_seq_len: int,
         kv_connector_manager: Optional[KvCacheConnectorManager],
@@ -313,7 +312,6 @@ class KvCacheCreator:
         skip_est: bool = False,
     ):
         self._model_engine = model_engine
-        self._draft_model_engine = draft_model_engine
         self._mapping = mapping
         self._kv_cache_config = kv_cache_config
         self._max_kv_tokens_in = self._kv_cache_config.max_tokens
@@ -461,14 +459,7 @@ class KvCacheCreator:
                                              model_config, kv_cache_config)
         if self._is_encoder_decoder():
             total += CacheCost.from_raw(self._get_cross_kv_size_per_token())
-        if self._draft_model_engine is not None:
-            draft_model_config = self._draft_model_engine.model.model_config
-            draft_kv_cache_manager_cls = self._get_model_kv_cache_manager_cls(
-                self._draft_model_engine, kv_cache_config)
-            total += self._per_manager_cache_cost(draft_kv_cache_manager_cls,
-                                                  draft_model_config,
-                                                  kv_cache_config)
-        elif self._should_create_separate_draft_kv_cache():
+        if self._should_create_separate_draft_kv_cache():
             # One-model draft with separate KV cache layout.
             # Pass num_layers explicitly since the HF config may report a
             # different layer count than what is actually used at runtime
@@ -864,8 +855,7 @@ class KvCacheCreator:
                 # get kv cache stats for both model and draft model
                 kv_stats = py_executor.resource_manager.resource_managers.get(
                     ResourceManagerType.KV_CACHE_MANAGER).get_kv_cache_stats()
-                # Get draft KV cache stats if present (either from two-model mode or one-model
-                # mode with separate draft KV cache)
+                # Get draft KV cache stats if present (one-model separate draft pool)
                 draft_kv_cache_manager = py_executor.resource_manager.resource_managers.get(
                     ResourceManagerType.DRAFT_KV_CACHE_MANAGER)
                 kv_stats_draft = draft_kv_cache_manager.get_kv_cache_stats(
@@ -1580,9 +1570,7 @@ class KvCacheCreator:
         # Split combined KV cache budgets before creating managers. Skip during
         # estimation — estimation uses max_tokens-based logic and must not
         # mutate the config.
-        has_draft = (
-            self._draft_model_engine is not None  # two-model
-            or self._should_create_separate_draft_kv_cache())  # one-model
+        has_draft = self._should_create_separate_draft_kv_cache()
         draft_kv_cache_config = None
         if not estimating_kv_cache and has_draft:
             # Used when each manager sizes pools from max_gpu_total_bytes (V2
@@ -1592,43 +1580,23 @@ class KvCacheCreator:
                     self._split_kv_cache_budget_for_draft(
                         "max_gpu_total_bytes", self_kv_cache_config,
                         draft_kv_cache_config))
-            # KVCacheManagerV2 does not support two-model draft budget splitting.
-            v2_two_model = (self._is_kv_cache_manager_v2
-                            and self._draft_model_engine is not None)
-            if not v2_two_model:
-                # Each manager sizes its host pool from host_cache_size directly.
-                self_kv_cache_config, draft_kv_cache_config = (
-                    self._split_kv_cache_budget_for_draft(
-                        "host_cache_size", self_kv_cache_config,
-                        draft_kv_cache_config))
+            # Each manager sizes its host pool from host_cache_size directly.
+            self_kv_cache_config, draft_kv_cache_config = (
+                self._split_kv_cache_budget_for_draft("host_cache_size",
+                                                      self_kv_cache_config,
+                                                      draft_kv_cache_config))
 
         kv_cache_manager = self._create_kv_cache_manager(
             self._model_engine,
             estimating_kv_cache,
             kv_cache_config_override=self_kv_cache_config)
 
-        if (not estimating_kv_cache and self._kv_connector_manager is not None
-                and self._draft_model_engine is not None):
-            raise NotImplementedError(
-                "Connector manager is not supported for draft model.")
-
         draft_kv_cache_manager = None
         draft_build_kv_cache_config = (draft_kv_cache_config
                                        if draft_kv_cache_config is not None else
                                        self_kv_cache_config)
 
-        # Two-model speculative decoding: draft model has separate engine
-        if self._draft_model_engine is not None:
-            if self._is_kv_cache_manager_v2:
-                assert draft_kv_cache_config is None, (
-                    "KVCacheManagerV2 does not support two-model speculative "
-                    "decoding with separate draft KV cache budget splitting.")
-            draft_kv_cache_manager = self._create_kv_cache_manager(
-                self._draft_model_engine,
-                estimating_kv_cache,
-                kv_cache_config_override=draft_build_kv_cache_config)
-        # One-model speculative decoding with different KV layouts
-        elif self._should_create_separate_draft_kv_cache():
+        if self._should_create_separate_draft_kv_cache():
             draft_kv_cache_manager = self._create_one_model_draft_kv_cache_manager(
                 estimating_kv_cache,
                 kv_cache_config_override=draft_build_kv_cache_config)
@@ -1740,7 +1708,7 @@ def _create_kv_cache_manager(
         dtype = model_engine.dtype
 
     if is_draft is None:
-        is_draft = model_engine.is_draft_model
+        is_draft = False
 
     if kv_cache_type is None:
         kv_cache_type = tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF
@@ -2122,7 +2090,7 @@ def validate_kv_cache_compression_with_spec(
     # Evicting methods co-compact the draft KV, so the draft must be a
     # standard paged cache in the same forward (one-model speculation).
     mode = spec_config.spec_dec_mode
-    if not (mode.is_mtp_one_model() or mode.is_eagle3_one_model()):
+    if not (mode.is_mtp_one_model() or mode.is_eagle3()):
         raise ValueError(
             f"KV-cache compression algorithm {config.algorithm!r} does not "
             f"support speculative decoding mode {mode.name}: the draft KV "
@@ -2184,7 +2152,7 @@ def should_enable_dsv4_overlap_headroom(
     """Gate extra sequence slots to the validated DSv4 MTP overlap path."""
     return (should_enable_dsv4_adp_dummy_fixes(model_type, mapping)
             and spec_config is not None
-            and spec_config.spec_dec_mode.is_mtp_eagle_one_model()
+            and spec_config.spec_dec_mode.is_mtp_eagle()
             and not disable_overlap_scheduler)
 
 
@@ -2880,8 +2848,7 @@ def validate_feature_combination(llm_args, model_engine, sampler_type):
             "disaggregated_serving",
             "chunked_prefill",
             "mtp",
-            "eagle3_one_model",
-            "eagle3_two_model",
+            "eagle3",
             "torch_sampler",
             "trtllm_sampler",
             "kv_cache_reuse",
@@ -2898,12 +2865,8 @@ def validate_feature_combination(llm_args, model_engine, sampler_type):
         feature_status["chunked_prefill"] = llm_args.enable_chunked_prefill
         feature_status["mtp"] = isinstance(llm_args.speculative_config,
                                            MTPDecodingConfig)
-        feature_status["eagle3_one_model"] = (
-            isinstance(llm_args.speculative_config, EagleDecodingConfig)
-            and llm_args.speculative_config.eagle3_one_model)
-        feature_status["eagle3_two_model"] = (
-            isinstance(llm_args.speculative_config, EagleDecodingConfig)
-            and not llm_args.speculative_config.eagle3_one_model)
+        feature_status["eagle3"] = isinstance(llm_args.speculative_config,
+                                              EagleDecodingConfig)
         feature_status[
             "torch_sampler"] = sampler_type == SamplerType.TorchSampler
         feature_status[
@@ -2936,17 +2899,9 @@ def validate_feature_combination(llm_args, model_engine, sampler_type):
             " Please use sampler type auto instead."
         },
         {
-            "features": ["trtllm_sampler", "eagle3_one_model"],
+            "features": ["trtllm_sampler", "eagle3"],
             "message":
-            ERR_MSG_TMPL.format(feature1="trtllm_sampler",
-                                feature2="eagle3_one_model") +
-            " Please use sampler type auto instead."
-        },
-        {
-            "features": ["trtllm_sampler", "eagle3_two_model"],
-            "message":
-            ERR_MSG_TMPL.format(feature1="trtllm_sampler",
-                                feature2="eagle3_two_model") +
+            ERR_MSG_TMPL.format(feature1="trtllm_sampler", feature2="eagle3") +
             " Please use sampler type auto instead."
         },
         # Add new conflict rules here in the future

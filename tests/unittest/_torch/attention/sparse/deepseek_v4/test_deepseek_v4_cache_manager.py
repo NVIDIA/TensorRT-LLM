@@ -1721,8 +1721,8 @@ class TestDeepseekV4CacheManager:
             max_draft_len=7,
             max_total_draft_tokens=7,
             spec_dec_mode=SimpleNamespace(
-                is_eagle3_one_model=lambda: False,
-                is_mtp_eagle_one_model=lambda: False,
+                is_eagle3=lambda: False,
+                is_mtp_eagle=lambda: False,
                 is_mtp_one_model=lambda: False,
                 is_mtp_vanilla=lambda: False,
                 use_one_engine=lambda: True,

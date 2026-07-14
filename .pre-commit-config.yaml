@@ -455,10 +455,8 @@ common-files: &common_files |
         tensorrt_llm/_torch/speculative/__init__.py |
         tensorrt_llm/_torch/speculative/auto_heuristic.py |
         tensorrt_llm/_torch/speculative/drafter.py |
-        tensorrt_llm/_torch/speculative/drafting_loops.py |
         tensorrt_llm/_torch/speculative/eagle3.py |
         tensorrt_llm/_torch/speculative/interface.py |
-        tensorrt_llm/_torch/speculative/model_drafter.py |
         tensorrt_llm/_torch/speculative/mtp.py |
         tensorrt_llm/_torch/speculative/ngram.py |
         tensorrt_llm/_torch/speculative/save_hidden_state.py |
@@ -1762,10 +1760,8 @@ legacy-files: &legacy_files |
         tensorrt_llm/_torch/speculative/__init__.py |
         tensorrt_llm/_torch/speculative/auto_heuristic.py |
         tensorrt_llm/_torch/speculative/drafter.py |
-        tensorrt_llm/_torch/speculative/drafting_loops.py |
         tensorrt_llm/_torch/speculative/eagle3.py |
         tensorrt_llm/_torch/speculative/interface.py |
-        tensorrt_llm/_torch/speculative/model_drafter.py |
         tensorrt_llm/_torch/speculative/mtp.py |
         tensorrt_llm/_torch/speculative/ngram.py |
         tensorrt_llm/_torch/speculative/save_hidden_state.py |

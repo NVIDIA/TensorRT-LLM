@@ -32,8 +32,7 @@ from ..attention_backend.interface import AttentionMetadata
 from ..attention_backend.trtllm import (AttentionBackend, TrtllmAttention,
                                         TrtllmAttentionMetadata)
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
-from ..pyexecutor.resource_manager import (BaseResourceManager,
-                                           ResourceManagerType)
+from ..pyexecutor.resource_manager import ResourceManagerType
 
 if TYPE_CHECKING:
     from ..pyexecutor.guided_decoder import CapturableGuidedDecoder
@@ -271,13 +270,10 @@ def get_force_num_accepted_tokens_float() -> float:
 class SpeculativeDecodingMode(IntEnum):
     MTP = auto()
     MTP_EAGLE = auto()
-    MTP_EAGLE_ONE_MODEL = auto()
     EAGLE3 = auto()
-    EAGLE3_ONE_MODEL = auto()
     NGRAM = auto()
     SA = auto()
     DRAFT_TARGET = auto()
-    DRAFT_TARGET_ONE_MODEL = auto()
     USER_PROVIDED = auto()
     SAVE_HIDDEN_STATES = auto()
     PARD = auto()
@@ -287,13 +283,10 @@ class SpeculativeDecodingMode(IntEnum):
     AUTO = auto()
 
     def is_mtp_one_model(self):
-        # Union: covers vanilla MTP and MTP_EAGLE_ONE_MODEL. Use is_mtp_vanilla()
+        # Union: covers vanilla MTP and MTP_EAGLE. Use is_mtp_vanilla()
         # when only the vanilla MTP variant should match.
         return (self == SpeculativeDecodingMode.MTP
-                or self == SpeculativeDecodingMode.MTP_EAGLE_ONE_MODEL)
-
-    def is_mtp_eagle_one_model(self):
-        return self == SpeculativeDecodingMode.MTP_EAGLE_ONE_MODEL
+                or self == SpeculativeDecodingMode.MTP_EAGLE)
 
     def is_mtp_vanilla(self):
         return self == SpeculativeDecodingMode.MTP
@@ -305,11 +298,8 @@ class SpeculativeDecodingMode(IntEnum):
         return self == SpeculativeDecodingMode.EAGLE3
 
     def use_one_engine(self):
-        return self.is_eagle3_one_model() or self.is_mtp_one_model(
+        return self.is_eagle3() or self.is_mtp_one_model(
         ) or self.is_external_drafter() or self.is_sa()
-
-    def is_eagle3_one_model(self):
-        return self == SpeculativeDecodingMode.EAGLE3_ONE_MODEL
 
     def is_pard(self):
         return self == SpeculativeDecodingMode.PARD
@@ -338,66 +328,48 @@ class SpeculativeDecodingMode(IntEnum):
     def is_draft_target(self):
         return self == SpeculativeDecodingMode.DRAFT_TARGET
 
-    def is_draft_target_one_model(self):
-        return self == SpeculativeDecodingMode.DRAFT_TARGET_ONE_MODEL
-
     def is_save_hidden_states(self):
         return self == SpeculativeDecodingMode.SAVE_HIDDEN_STATES
 
     def is_external_drafter(self):
-        return self.is_parallel_draft() or self.is_draft_target_one_model()
+        return self.is_parallel_draft() or self.is_draft_target()
 
     def without_logits(self):
-        return self.is_mtp_one_model() or self.is_eagle3_one_model(
+        return self.is_mtp_one_model() or self.is_eagle3(
         ) or self.is_external_drafter() or self.is_sa()
 
     def needs_kv_cache_rewind(self):
-        return self.is_mtp_one_model() or self.is_eagle3_one_model(
-        ) or self.is_ngram() or self.is_sa() or self.is_external_drafter()
+        return self.is_mtp_one_model() or self.is_eagle3() or self.is_ngram(
+        ) or self.is_sa() or self.is_external_drafter()
 
     def support_overlap_scheduler(self):
-        return self.is_mtp_one_model() or self.is_eagle3_one_model(
-        ) or self.is_sa() or self.has_draft_model() or self.is_external_drafter(
-        )
+        return self.is_mtp_one_model() or self.is_eagle3() or self.is_sa(
+        ) or self.is_external_drafter()
 
     def support_guided_decoder(self):
         return self.is_none() or self.has_spec_drafter()
 
     def support_capturable_guided_decoder(self):
-        return self.is_mtp_one_model() or self.is_eagle3_one_model(
+        return self.is_mtp_one_model() or self.is_eagle3(
         ) or self.is_external_drafter() or self.is_sa()
 
     def support_dynamic_draft_len(self):
-        return self.is_mtp_one_model() or self.is_eagle3_one_model(
-        ) or self.is_mtp_eagle_one_model() or self.is_pard() or self.is_dflash(
-        ) or self.is_draft_target_one_model() or self.is_sa()
-
-    def has_draft_model(self):
-        return self.is_eagle3() or self.is_draft_target() or self.is_mtp_eagle()
-
-    def needs_kv_cache_recompute(self):
-        """
-        Whether the draft model needs to recompute the kv cache.
-        If true, the 1st draft model forward will recompute the kv cache for
-        the accepted draft tokens.
-        """
-        return self.is_eagle3() or self.is_mtp_eagle()
+        return self.is_mtp_one_model() or self.is_eagle3() or self.is_pard(
+        ) or self.is_dflash() or self.is_draft_target() or self.is_sa()
 
     def need_load_draft_weights(self):
         """
         Whether the draft model and target model are in the same model engine,
         and the draft model needs to load weights from the separate checkpoint.
         """
-        return self.is_eagle3_one_model() or self.is_external_drafter()
+        return self.is_eagle3() or self.is_external_drafter()
 
     def has_spec_decoder(self):
-        return self.is_mtp_one_model() or self.is_mtp_eagle() or self.is_eagle3(
-        ) or self.is_eagle3_one_model() or self.is_external_drafter(
-        ) or self.is_sa()
+        return self.is_mtp_one_model() or self.is_eagle3(
+        ) or self.is_external_drafter() or self.is_sa()
 
     def has_spec_drafter(self):
-        return self.is_eagle3() or self.is_draft_target() or self.is_ngram(
-        ) or self.is_user_provided() or self.is_mtp_eagle()
+        return self.is_ngram() or self.is_user_provided()
 
     def extend_ctx(self, attention_backend: Type[AttentionBackend]):
         """
@@ -414,31 +386,21 @@ class SpeculativeDecodingMode(IntEnum):
                               TrtllmAttention) or not xqa_supported
 
     def attention_need_spec_dec_mode(
-            self,
-            spec_resource_manager: Optional[BaseResourceManager],
-            is_draft_model: bool,
-            attention_backend: Type[AttentionBackend],
-            use_chain_drafter: bool,  # CDL
+        self,
+        attention_backend: Type[AttentionBackend],
     ):
         """
         If true, the attention backend kernel needs to run in spec-dec mode (multi-token query mode).
         Args:
-            spec_resource_manager: the resource manager for the spec-dec mode.
-            is_draft_model: whether the model is a draft model.
             attention_backend: the attention backend.
-            use_chain_drafter: whether to use capturable drafting loops (CDL). For the target model, it is always False.
         """
         is_trtllm_attention = issubclass(attention_backend, TrtllmAttention)
 
-        # Always use the multi-token query mode for 1-model if the kernels are available.
+        # Always use the multi-token query mode for one-engine modes if the kernels are available.
         use_case_1 = self.use_one_engine()
-        # For 2-model, we need to enable it when we process multiple tokens at once. This occurs with
-        # the target model (verification) or on the first draft for CDL based speculation.
-        use_case_2 = not self.use_one_engine() and (
-            not is_draft_model or
-            (spec_resource_manager is not None
-             and spec_resource_manager.is_first_draft
-             and use_chain_drafter)) and is_trtllm_attention
+        # For drafter-loop modes (ngram/user-provided), the target model verifies
+        # multiple draft tokens at once and needs spec-dec mode on TRTLLM attention.
+        use_case_2 = not self.use_one_engine() and is_trtllm_attention
 
         return use_case_1 or use_case_2
 

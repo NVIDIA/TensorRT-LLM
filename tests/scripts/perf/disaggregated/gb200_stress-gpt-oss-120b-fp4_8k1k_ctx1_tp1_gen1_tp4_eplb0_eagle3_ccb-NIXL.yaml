@@ -84,7 +84,6 @@ worker_config:
     speculative_config: &id001
       decoding_type: Eagle
       max_draft_len: 3
-      eagle3_one_model: true
       speculative_model: "gpt_oss/gpt-oss-120b-Eagle3"
     num_postprocess_workers: 4
     stream_interval: 20

@@ -210,9 +210,6 @@ def add_llm_args(parser):
     parser.add_argument('--spec_decode_max_draft_len', type=int, default=1)
     parser.add_argument('--draft_model_dir', type=str, default=None)
     parser.add_argument('--max_matching_ngram_size', type=int, default=5)
-    parser.add_argument('--use_one_model',
-                        default=True,
-                        action=argparse.BooleanOptionalAction)
     parser.add_argument('--eagle_choices', type=str, default=None)
     parser.add_argument('--use_dynamic_tree',
                         default=False,
@@ -301,15 +298,12 @@ def setup_llm(args, **kwargs):
     ) if args.spec_decode_algo is not None else None
 
     if spec_decode_algo == 'MTP':
-        if not args.use_one_model:
-            print("Running MTP eagle with two model style.")
         spec_config = MTPDecodingConfig(
             max_draft_len=args.spec_decode_max_draft_len,
             use_relaxed_acceptance_for_thinking=args.
             use_relaxed_acceptance_for_thinking,
             relaxed_topk=args.relaxed_topk,
             relaxed_delta=args.relaxed_delta,
-            mtp_eagle_one_model=args.use_one_model,
             use_dynamic_tree=args.use_dynamic_tree,
             dynamic_tree_max_topK=args.dynamic_tree_max_topK,
             max_total_draft_tokens=args.max_total_draft_tokens,
@@ -318,7 +312,6 @@ def setup_llm(args, **kwargs):
         spec_config = Eagle3DecodingConfig(
             max_draft_len=args.spec_decode_max_draft_len,
             speculative_model=args.draft_model_dir,
-            eagle3_one_model=args.use_one_model,
             eagle_choices=args.eagle_choices,
             use_dynamic_tree=args.use_dynamic_tree,
             dynamic_tree_max_topK=args.dynamic_tree_max_topK,

@@ -1,6 +1,6 @@
 import inspect
 from dataclasses import replace
-from typing import Dict, Generic, List, Optional, Tuple
+from typing import Dict, Generic, List, Optional
 
 import torch
 import torch.nn.functional as F
@@ -1672,7 +1672,7 @@ class MTPForCausalLM(nn.Module):
         spec_dec_mode = model_config.spec_config.spec_dec_mode
         assert spec_dec_mode.is_mtp_one_model()
         checkpoint_mtp_num_layers = model_config.pretrained_config.num_nextn_predict_layers
-        if spec_dec_mode.is_mtp_eagle_one_model():
+        if spec_dec_mode.is_mtp_eagle():
             mtp_num_layers = 1
             mtp_repeat_count = model_config.spec_config.max_draft_len
         else:
@@ -1691,151 +1691,13 @@ class MTPForCausalLM(nn.Module):
         self.embed_tokens = model.embed_tokens
 
 
-class MTPDraftModel(nn.Module):
-
-    def __init__(self, model_config: ModelConfig[PretrainedConfig],
-                 layer_idx: int, aux_stream_dict: Dict[AuxStreamType,
-                                                       torch.cuda.Stream]):
-        super().__init__()
-        # Import here to avoid circular import
-        model_type = model_config.pretrained_config.model_type
-        if model_type == "glm4_moe":
-            from .modeling_glm import Glm4MTP
-            mtp_layer = Glm4MTP(model_config,
-                                layer_idx,
-                                aux_stream_dict,
-                                is_separate_draft_engine=True)
-        elif model_type in ["deepseek_v3", "deepseek_v32", "glm_moe_dsa"]:
-            from .modeling_deepseekv3 import DeepseekV3MTP
-            mtp_layer = DeepseekV3MTP(model_config,
-                                      layer_idx,
-                                      aux_stream_dict,
-                                      is_separate_draft_engine=True)
-        elif model_type in ["exaone_moe"]:
-            from .modeling_exaone_moe import ExaoneMoeMTP
-            mtp_layer = ExaoneMoeMTP(model_config, layer_idx, aux_stream_dict)
-        else:
-            raise ValueError(
-                f"MTPDraftModel does not support model_type: {model_type}")
-        setattr(self, f"layers.{layer_idx}", mtp_layer)
-        self.layers = mtp_layer
-        self.layer_idx = layer_idx
-        self.config = model_config.pretrained_config
-        self.embed_tokens = Embedding(
-            self.config.vocab_size,
-            self.config.hidden_size,
-            dtype=self.config.torch_dtype,
-        )
-
-    def __repr__(self):
-        """Custom string representation to display layer index"""
-        return f"(layers): ({self.layer_idx}): {repr(self.layers)}"
-
-    def forward(
-        self,
-        input_ids: torch.IntTensor,
-        position_ids: torch.IntTensor,
-        hidden_states: torch.Tensor,
-        attn_metadata: AttentionMetadata,
-        all_rank_num_tokens: Optional[List[int]] = None,
-        spec_metadata: Optional[SpecMetadata] = None,
-        **kwargs,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        hidden_states = self.layers(
-            input_ids,
-            position_ids,
-            hidden_states,
-            embed_tokens=self.embed_tokens,
-            attn_metadata=attn_metadata,
-            all_rank_num_tokens=all_rank_num_tokens,
-            spec_metadata=spec_metadata,
-        )
-
-        return hidden_states
-
-
-@register_auto_model("MTPDraftModelForCausalLM")
-class MTPDraftModelForCausalLM(DecoderModelForCausalLM[MTPDraftModel,
-                                                       PretrainedConfig]):
-
-    def __init__(self, model_config: ModelConfig[PretrainedConfig]):
-        self.model_config = model_config
-        aux_stream_list = [torch.cuda.Stream() for _ in range(4)]
-        self.aux_stream_dict = {
-            AuxStreamType.Attention: aux_stream_list[0],
-            AuxStreamType.MoeShared: aux_stream_list[0],
-            AuxStreamType.MoeChunkingOverlap: aux_stream_list[1],
-            AuxStreamType.MoeBalancer: aux_stream_list[2],
-            AuxStreamType.MoeOutputMemset: aux_stream_list[3],
-        }
-        super().__init__(
-            MTPDraftModel(self.model_config,
-                          self.model_config.pretrained_config.num_hidden_layers,
-                          self.aux_stream_dict),
-            config=self.model_config,
-            hidden_size=self.model_config.pretrained_config.hidden_size,
-            vocab_size=self.model_config.pretrained_config.vocab_size)
-
-    def load_weights(self, weights: Dict):
-        # Import here to avoid circular import
-        model_type = self.model_config.pretrained_config.model_type
-        match model_type:
-            case "glm4_moe":
-                from .modeling_glm import Glm4WeightLoader
-                weight_loader = Glm4WeightLoader(self, is_draft_model=True)
-            case "deepseek_v3" | "deepseek_v32" | "glm_moe_dsa":
-                from .modeling_deepseekv3 import DeepseekV3WeightLoader
-                weight_loader = DeepseekV3WeightLoader(self,
-                                                       is_draft_model=True)
-            case "exaone_moe":
-                raise ValueError(
-                    f"Model type {model_type} not supported for MTP for two engine mode. Please use one engine mode instead."
-                )
-            case _:
-                raise ValueError(
-                    f"Model type {model_type} not supported for MTP")
-        weight_loader.load_weights(weights)
-
-    def load_weights_from_target_model(self,
-                                       target_model: torch.nn.Module) -> None:
-        if self.model.embed_tokens is None:
-            self.model.embed_tokens = target_model.model.embed_tokens
-        self.lm_head = target_model.lm_head
-
-    def forward(self,
-                attn_metadata: AttentionMetadata,
-                input_ids: torch.IntTensor = None,
-                position_ids: torch.IntTensor = None,
-                inputs_embeds: Optional[torch.FloatTensor] = None,
-                return_context_logits: bool = False,
-                spec_metadata: Optional[SpecMetadata] = None,
-                hidden_states: torch.Tensor = None,
-                **kwargs) -> torch.Tensor:
-
-        hidden_states = spec_metadata.get_hidden_states()
-        output = self.model(
-            input_ids=input_ids,
-            position_ids=position_ids,
-            hidden_states=hidden_states,
-            attn_metadata=attn_metadata,
-            all_rank_num_tokens=attn_metadata.all_rank_num_tokens,
-            spec_metadata=spec_metadata,
-            **kwargs)
-        return self.logits_processor.forward(
-            output,
-            self.lm_head,
-            attn_metadata,
-            return_context_logits,
-        )
-
-
 def get_draft_model(model_config, draft_config, lm_head, model):
     """Construct the draft model for the configured speculative-decoding mode
     (EAGLE3 / MTP / PARD / DFlash). The DFlash branch selects the Laguna drafter
     by detecting its architecture in the draft checkpoint's own config."""
     assert getattr(model_config, 'spec_config', None) is not None
     spec_dec_mode = model_config.spec_config.spec_dec_mode
-    if spec_dec_mode.is_eagle3_one_model():
+    if spec_dec_mode.is_eagle3():
         if model_config.spec_config.eagle3_model_arch == "llama3":
             # Eagle3ForCausalLM handles both Llama3 and DeepSeekV3 architectures
             return Eagle3ForCausalLM(
@@ -1853,8 +1715,6 @@ def get_draft_model(model_config, draft_config, lm_head, model):
         return MTPForCausalLM(model_config,
                               model_config.pretrained_config.num_hidden_layers,
                               lm_head, model)
-    elif spec_dec_mode.is_mtp_eagle():
-        return MTPDraftModelForCausalLM(model_config)
     elif spec_dec_mode.is_pard():
         return PARDForCausalLM(draft_config)
     elif spec_dec_mode.is_dflash():
@@ -1877,7 +1737,7 @@ def get_draft_model(model_config, draft_config, lm_head, model):
             num_stages=num_stages,
             block_size=model_config.spec_config.block_size,
         )
-    elif spec_dec_mode.is_draft_target_one_model():
+    elif spec_dec_mode.is_draft_target():
         # Keep the draft LM head vocab-sharded so greedy draft sampling uses the
         # lighter TP gather (see SpecWorkerBase.greedy_sample_draft_with_tp_gather).
         was_frozen = draft_config._frozen
@@ -1908,7 +1768,7 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
         if spec_config and spec_config.spec_dec_mode.use_one_engine():
             # Only create draft_model for modes MTP, Eagle3 (not SA)
             if not spec_config.spec_dec_mode.is_sa():
-                if spec_config.spec_dec_mode.is_eagle3_one_model():
+                if spec_config.spec_dec_mode.is_eagle3():
                     if spec_config.eagle3_model_arch == "mistral_large3":
                         from tensorrt_llm._torch.models.checkpoints.mistral.config_loader import \
                             MistralConfigLoader

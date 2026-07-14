@@ -18,7 +18,6 @@ from ..distributed import Distributed
 from ..expert_statistic import ExpertStatistic
 from ..memory_buffer_utils import get_memory_buffers
 from ..modules.multi_stream_utils import with_multi_stream
-from ..speculative.eagle3 import Eagle3ResourceManager
 from ..speculative.interface import SpecMetadata
 from ..speculative.spec_sampler_base import SampleStateTensorsSpec
 from ..speculative.utils import get_draft_kv_cache_manager
@@ -102,7 +101,6 @@ class CUDAGraphRunnerConfig:
     use_mrope: bool
     original_max_draft_len: int
     original_max_total_draft_tokens: int
-    is_draft_model: bool
     enable_attention_dp: bool
     is_encoder_decoder: bool
     batch_size: int
@@ -245,24 +243,16 @@ class CUDAGraphRunner:
         is_all_greedy_sample = bool(
             getattr(spec_metadata, "is_all_greedy_sample", True))
 
-        if self.config.is_draft_model and spec_resource_manager is not None and isinstance(
-                spec_resource_manager, Eagle3ResourceManager):
-            # If 'is_first_draft' is True, even with tree decoding, the length of draft_len will only be 'max_draft_len', not 'max_total_draft_token'.
-            # Because we will pad the input to 'max_draft_len' length for the first draft layer.
-            draft_len = self.config.original_max_draft_len if spec_resource_manager.is_first_draft else 0
-            key = (batch_size, draft_len, spec_resource_manager.is_first_draft,
-                   short_seq_len_mode, is_all_greedy_sample)
-        else:
-            # With dynamic spec decode, the draft length may be zero even when enable_spec_decode is True,
-            # so we need to get the draft length from the batch instead of using enable_spec_decode.
-            draft_len_list = []
-            for request in batch.generation_requests:
-                draft_len_list.append(len(request.py_draft_tokens))
-            draft_len = max(draft_len_list)
-            assert len(
-                set(draft_len_list)) == 1, "All draft lengths must be the same"
-            key = (batch_size, draft_len, False, short_seq_len_mode,
-                   is_all_greedy_sample)
+        # With dynamic spec decode, the draft length may be zero even when enable_spec_decode is True,
+        # so we need to get the draft length from the batch instead of using enable_spec_decode.
+        draft_len_list = []
+        for request in batch.generation_requests:
+            draft_len_list.append(len(request.py_draft_tokens))
+        draft_len = max(draft_len_list)
+        assert len(
+            set(draft_len_list)) == 1, "All draft lengths must be the same"
+        key = (batch_size, draft_len, False, short_seq_len_mode,
+               is_all_greedy_sample)
         return key
 
     @staticmethod
@@ -440,11 +430,6 @@ class CUDAGraphRunner:
 
         def _setup_spec_decoding_and_forward(key: KeyType, forward_fn: Callable,
                                              capture_inputs: Dict[str, Any]):
-            is_first_draft = key[2]
-            needs_kv_cache_recompute = True if enable_spec_decode and self.config.spec_config.spec_dec_mode.needs_kv_cache_recompute(
-            ) else False
-            if is_first_draft and self.config.is_draft_model and needs_kv_cache_recompute:
-                capture_inputs['attn_metadata'].use_spec_decoding = True
             return forward_fn(capture_inputs)
 
         output = None

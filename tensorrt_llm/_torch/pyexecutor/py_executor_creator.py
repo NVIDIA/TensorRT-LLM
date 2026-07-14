@@ -21,8 +21,7 @@ from tensorrt_llm.llmapi.llm_args import (CapacitySchedulerPolicy,
                                           ContextChunkingPolicy,
                                           ExecutorMemoryType,
                                           GuidedDecodingConfig, KvCacheConfig,
-                                          LoadFormat, SpeculativeConfig,
-                                          TorchLlmArgs)
+                                          SpeculativeConfig, TorchLlmArgs)
 from tensorrt_llm.llmapi.tokenizer import (TokenizerBase,
                                            _llguidance_tokenizer_info,
                                            _xgrammar_tokenizer_info)
@@ -32,7 +31,6 @@ from tensorrt_llm.quantization import QuantAlgo
 from tensorrt_llm.tools.layer_wise_benchmarks import get_calibrator
 
 from ..attention_backend.interface import AttentionRuntimeFeatures
-from ..attention_backend.trtllm import TrtllmAttention
 from ..distributed import Distributed
 from ..speculative import (get_num_extra_kv_tokens, get_spec_drafter,
                            get_spec_resource_manager)
@@ -497,10 +495,8 @@ def create_py_executor(
 
     cache_transceiver_config = llm_args.cache_transceiver_config
 
-    has_draft_model_engine = False
     has_spec_drafter = False
     if spec_config is not None:
-        has_draft_model_engine = spec_config.spec_dec_mode.has_draft_model()
         has_spec_drafter = spec_config.spec_dec_mode.has_spec_drafter()
 
         # Eagle3DecodingConfig._max_batch_size is internally managed: the
@@ -521,7 +517,7 @@ def create_py_executor(
     attn_runtime_features = AttentionRuntimeFeatures(
         chunked_prefill=enable_chunked_context,
         cache_reuse=kv_cache_config.enable_block_reuse,
-        has_speculative_draft_tokens=has_draft_model_engine or has_spec_drafter,
+        has_speculative_draft_tokens=has_spec_drafter,
         chunk_size=max_num_tokens,
     )
     logger.info("ATTENTION RUNTIME FEATURES: ", attn_runtime_features)
@@ -581,82 +577,9 @@ def create_py_executor(
                     dist=dist)
     model_engine.model = calibrator.maybe_wrap_model(model_engine.model)
 
-    if has_draft_model_engine:
-        with allocation_scope(ExecutorMemoryType.MODEL_ENGINE_DRAFT):
-            draft_spec_config = copy.copy(spec_config)
-
-            use_chain_drafter = (
-                guided_decoding_config is None
-                and draft_spec_config._allow_chain_drafter
-                and draft_spec_config._allow_greedy_draft_tokens
-                and llm_args.attn_backend == "TRTLLM"
-                and draft_spec_config.draft_len_schedule is None)
-
-            logger.debug(f"USE CHAIN DRAFTER: {use_chain_drafter}")
-            if use_chain_drafter:
-
-                def drafting_loop_wrapper(model):
-                    from tensorrt_llm._torch.speculative.drafting_loops import (
-                        LinearDraftingLoopWrapper,
-                        StaticTreeDraftingLoopWrapper)
-                    from tensorrt_llm.llmapi import EagleDecodingConfig
-
-                    static_tree_drafter = isinstance(
-                        draft_spec_config, EagleDecodingConfig
-                    ) and draft_spec_config.eagle_choices is not None
-
-                    if static_tree_drafter:
-                        return StaticTreeDraftingLoopWrapper(
-                            spec_config.max_draft_len,
-                            spec_config.tokens_per_gen_step - 1, max_batch_size,
-                            model)
-                    else:
-                        return LinearDraftingLoopWrapper(
-                            spec_config.max_draft_len,
-                            spec_config.tokens_per_gen_step - 1, model)
-            else:
-                drafting_loop_wrapper = None
-
-            draft_llm_args = copy.copy(llm_args)
-            if spec_config.load_format == "dummy":
-                draft_llm_args.load_format = LoadFormat.DUMMY
-
-            model_weights_memory_tag = None
-            model_weights_restore_mode = None
-            if enable_sleep:
-                model_weights_memory_tag = ExecutorMemoryType.MODEL_WEIGHTS_DRAFT
-                model_weights_restore_mode = sleep_config.restore_modes[
-                    ExecutorMemoryType.MODEL_WEIGHTS_DRAFT]
-
-            draft_model_engine = PyTorchModelEngine(
-                model_path=spec_config.speculative_model,
-                llm_args=draft_llm_args,
-                mapping=mapping,
-                attn_runtime_features=attn_runtime_features,
-                dist=dist,
-                spec_config=draft_spec_config,
-                is_draft_model=True,
-                drafting_loop_wrapper=drafting_loop_wrapper,
-                model_weights_memory_tag=model_weights_memory_tag,
-                model_weights_restore_mode=model_weights_restore_mode,
-            )
-            # For DeepseekV3 MTP, we need to set the num_hidden_layers to 1 for the draft model
-            if spec_config.spec_dec_mode.is_mtp_eagle():
-                draft_model_engine.model.model_config.pretrained_config.num_hidden_layers = 1
-            draft_model_engine.load_weights_from_target_model(
-                model_engine.model)
-    else:
-        draft_model_engine = None
-
-    # TODO: Overlap scheduler is not supported for below cases:
-    # 1. non-CDL is used
-    # 2. non-TrtllmAttention attention backend is used
-    if has_draft_model_engine and (not use_chain_drafter or not issubclass(
-            draft_model_engine.attn_backend, TrtllmAttention)):
-        logger.warning(
-            "Overlap scheduler is not supported for non-CDL or non-TrtllmAttention backend."
-        )
-        llm_args.disable_overlap_scheduler = True
+    # Two-model speculative decoding (separate draft model engine) has been
+    # removed. All neural speculation runs inside the target model engine
+    # (one-engine); ngram / user-provided speculation use the drafter loop.
 
     # PyTorchModelEngine modifies these fields, update them
     model_engine_max_seq_len = model_engine.max_seq_len
@@ -675,11 +598,6 @@ def create_py_executor(
         model_engine_max_seq_len=model_engine_max_seq_len,
     )
 
-    if has_draft_model_engine and not llm_args.disable_overlap_scheduler:
-        logger.warning(
-            "Overlap scheduler is enabled for two-model speculative decoding. Rejection sampling will fallback to greedy sampling."
-        )
-
     max_seq_len = model_engine_max_seq_len
     max_num_tokens = model_engine.max_num_tokens
     sparse_attention_config = model_engine.sparse_attention_config
@@ -695,8 +613,7 @@ def create_py_executor(
             "Disabling block reuse for MambaHybridCacheManager-based models when disagg + Python transceiver enabled"
         )
         kv_cache_config.enable_block_reuse = False
-        _set_model_engines_cache_reuse([model_engine, draft_model_engine],
-                                       False)
+        _set_model_engines_cache_reuse([model_engine], False)
     if is_mla(config):
         if model_engine.model.model_config.enable_flash_mla:
             tokens_per_block = 64
@@ -722,8 +639,7 @@ def create_py_executor(
                            f"{_MLA_KV_CACHE_REUSE_SUPPORTED_SM_VERSIONS_STR}, "
                            f"disable enable_block_reuse for SM{sm_version}")
             kv_cache_config.enable_block_reuse = False
-            _set_model_engines_cache_reuse([model_engine, draft_model_engine],
-                                           False)
+            _set_model_engines_cache_reuse([model_engine], False)
 
         kv_cache_quant_algo = model_engine.model.model_config.quant_config.kv_cache_quant_algo
         if kv_cache_config.enable_block_reuse and not (
@@ -734,8 +650,7 @@ def create_py_executor(
                 f"disable enable_block_reuse for KV cache quant algorithm: {kv_cache_quant_algo}"
             )
             kv_cache_config.enable_block_reuse = False
-            _set_model_engines_cache_reuse([model_engine, draft_model_engine],
-                                           False)
+            _set_model_engines_cache_reuse([model_engine], False)
         if (enable_chunked_context and sm_version
                 not in _MLA_CHUNKED_PREFILL_SUPPORTED_SM_VERSIONS):
             logger.warning("Chunked Prefill for MLA can only be enabled on "
@@ -743,8 +658,6 @@ def create_py_executor(
                            f"disable enable_chunked_context for SM{sm_version}")
             enable_chunked_context = False
             model_engine.attn_runtime_features.chunked_prefill = False
-            if draft_model_engine is not None:
-                draft_model_engine.attn_runtime_features.chunked_prefill = False
 
     # Set default value for cache_transceiver_config.max_tokens_in_buffer.
     # Placed after the FlashMLA tokens_per_block override and rounded up to a
@@ -801,11 +714,11 @@ def create_py_executor(
 
                 if spec_config is None or spec_config.spec_dec_mode.support_guided_decoder(
                 ):
-                    # GuidedDecoder is applicable to non-speculative decoding and two-model speculative decoding.
+                    # GuidedDecoder is applicable to non-speculative decoding and drafter-loop speculative decoding (ngram / user-provided).
                     guided_decoder = GuidedDecoder(**kwargs)
                 elif spec_config.spec_dec_mode.support_capturable_guided_decoder(
                 ):
-                    # CapturableGuidedDecoder is applicable to one-model speculative decoding.
+                    # CapturableGuidedDecoder is applicable to one-engine speculative decoding.
                     success = model_engine.set_guided_decoder(
                         CapturableGuidedDecoder(**kwargs))
                     if not success:
@@ -930,7 +843,6 @@ def create_py_executor(
 
         kv_cache_creator = KvCacheCreator(
             model_engine=model_engine,
-            draft_model_engine=draft_model_engine,
             mapping=mapping,
             net_max_seq_len=net_max_seq_len,
             kv_connector_manager=kv_connector_manager,
@@ -974,8 +886,7 @@ def create_py_executor(
     # to provide a resource manager if required.
 
     with allocation_scope(ExecutorMemoryType.SPEC_RESOURCES):
-        spec_resource_manager = get_spec_resource_manager(
-            model_engine, draft_model_engine)
+        spec_resource_manager = get_spec_resource_manager(model_engine)
     if spec_resource_manager is not None:
         resources[
             ResourceManagerType.SPEC_RESOURCE_MANAGER] = spec_resource_manager
@@ -983,7 +894,6 @@ def create_py_executor(
     # Drafter for speculative decoding
     with allocation_scope(ExecutorMemoryType.DRAFTER):
         drafter = get_spec_drafter(model_engine,
-                                   draft_model_engine,
                                    sampler,
                                    spec_resource_manager=spec_resource_manager,
                                    guided_decoder=guided_decoder)
@@ -1041,13 +951,10 @@ def create_py_executor(
             kv_cache_creator.teardown_managers(resources)
 
         # Release Phase-1 CUDA graph pools before final KV allocation to avoid overshoot.
-        for eng in [model_engine, draft_model_engine]:
-            if eng is None:
-                continue
-            if eng.attn_metadata is not None:
-                if llm_args.cuda_graph_config is not None:
-                    eng._release_cuda_graphs()
-                eng.attn_metadata = None
+        if model_engine.attn_metadata is not None:
+            if llm_args.cuda_graph_config is not None:
+                model_engine._release_cuda_graphs()
+            model_engine.attn_metadata = None
 
         del py_executor  # free before constructing new
         gc.collect()

@@ -54,7 +54,6 @@ def test_kv_cache_reuse(use_cuda_graph: bool, attn_backend: str):
     spec_config = Eagle3DecodingConfig(
         max_draft_len=max_draft_len,
         speculative_model=eagle_model_dir,
-        eagle3_one_model=False,
     )
 
     llm_spec = LLM(**llm_common_config, speculative_config=spec_config)

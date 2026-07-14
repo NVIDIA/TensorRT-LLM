@@ -1704,13 +1704,6 @@
     },
     {
       "allowed_values": [],
-      "annotation": "Optional[bool]",
-      "converter": "",
-      "kind": "value",
-      "path": "speculative_config.eagle3_one_model"
-    },
-    {
-      "allowed_values": [],
       "annotation": "Optional[List[List[int]]]",
       "converter": "",
       "kind": "value",
@@ -1852,13 +1845,6 @@
       "converter": "",
       "kind": "value",
       "path": "speculative_config.medusa_choices"
-    },
-    {
-      "allowed_values": [],
-      "annotation": "<class 'bool'>",
-      "converter": "",
-      "kind": "value",
-      "path": "speculative_config.mtp_eagle_one_model"
     },
     {
       "allowed_values": [],

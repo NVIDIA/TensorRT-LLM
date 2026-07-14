@@ -71,7 +71,7 @@ def get_model_paths():
         ("flashinfer", "torch-simple"),
     ],
 )
-def test_autodeploy_eagle3_one_model_acceptance_rate(attn_backend: str, compile_backend: str):
+def test_autodeploy_eagle3_acceptance_rate(attn_backend: str, compile_backend: str):
     """Test Eagle3 one-model acceptance rate with AutoDeploy engine.
 
     Runs Eagle3 one-model speculative decoding with streaming and verifies
@@ -95,7 +95,6 @@ def test_autodeploy_eagle3_one_model_acceptance_rate(attn_backend: str, compile_
     speculative_config = Eagle3DecodingConfig(
         max_draft_len=max_draft_len,
         speculative_model=eagle_model,
-        eagle3_one_model=True,
         eagle3_layers_to_capture={1, 15, 28},
     )
 
