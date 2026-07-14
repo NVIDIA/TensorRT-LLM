@@ -883,25 +883,38 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
             if capacity is not None:
                 current_compute_capacity -= actual_model_cost
 
-    def _chunk_forced(self, requests: RequestList, capacity: Optional[int], unit_size: int):
+    @staticmethod
+    def _force_chunk_size(req: LlmRequest, tokens_per_block: int) -> int:
+        assert isinstance(req.expect_snapshot_points, list)
+        return req.get_forced_context_chunk_size(tokens_per_block)
+
+    def _chunk_forced(self, requests: RequestList, capacity: Optional[int], tokens_per_block: int):
         """Mirrors the kFORCE_CHUNK specialization of setCtxRequestsChunkSize (microBatchScheduler.cpp).
 
-        Every request is assigned exactly min(context_remaining_length, unit_size) tokens.
-        Requests that would exceed the capacity budget are zeroed out.
+        Requests use expect_snapshot_points when present; otherwise each request
+        gets min(context_remaining_length, tokens_per_block). Requests that
+        would exceed the capacity budget are rounded down to the nearest lower
+        tokens_per_block multiple.
 
         This policy is designed for linear attention / Mamba2 state caching, which doesn't support
         estimating reusable tokens, so we don't subtract them from the budget.
         """
-        if self.max_context_length is not None and self.max_context_length < unit_size:
+        if self.max_context_length is not None and self.max_context_length < tokens_per_block:
             raise ValueError(
-                f"The forced chunk size ({unit_size}) exceeds the "
+                f"The forced chunk size ({tokens_per_block}) exceeds the "
                 f"max context length ({self.max_context_length})"
             )
         total_tokens = 0
         for req in requests:
-            req.context_chunk_size = min(req.context_remaining_length, unit_size)
-            if capacity is not None and total_tokens + req.context_chunk_size > capacity:
-                req.context_chunk_size = 0
+            chunk_size = self._force_chunk_size(req, tokens_per_block)
+            if self.max_context_length is not None and chunk_size > self.max_context_length:
+                chunk_size = (self.max_context_length // tokens_per_block) * tokens_per_block
+            if capacity is not None and total_tokens + chunk_size > capacity:
+                remaining_capacity = max(0, capacity - total_tokens)
+                chunk_size = (
+                    min(chunk_size, remaining_capacity) // tokens_per_block
+                ) * tokens_per_block
+            req.context_chunk_size = int(chunk_size)
             total_tokens += req.context_chunk_size
         assert capacity is None or total_tokens <= capacity
 
