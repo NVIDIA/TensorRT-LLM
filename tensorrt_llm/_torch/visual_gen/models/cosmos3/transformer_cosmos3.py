@@ -1154,7 +1154,13 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
         Maps UND vs GEN blocks into this module's layout (causal self-attn vs cross-attn + MLPs).
         """
         remapped = {}
-        skip_prefixes = ("lm_head.",)
+        # The Cosmos3 checkpoint ships action modules (action_gen=true), but this
+        # transformer no longer builds them — skip their weights explicitly so the
+        # load stays quiet instead of warning on each as an unknown key.
+        skip_prefixes = (
+            "lm_head.",
+            "action_",
+        )
 
         for key, value in weights.items():
             k = key
