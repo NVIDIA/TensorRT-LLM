@@ -4046,8 +4046,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
             (mma_tiler_mn, cluster_shape_mn, swap_ab, max_ab_stages,
              l2_swizzle) = self._get_tactic(m, n, num_splits,
                                             max_active_clusters)
-            # Large M amortizes a dedicated scale-TMA warp.
-            tma_packed_scales = m >= 512
             if swap_ab:
                 # Swap M/N to expose more output tiles.
                 kernel_m, kernel_n = n, m
@@ -4057,6 +4055,15 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 kernel_m, kernel_n = m, n
                 kernel_a, kernel_b = a_tensor, b_tensor
                 kernel_sfa, kernel_sfb = a_sf_tensor, b_sf_tensor
+            ctas_per_mma = 2 if mma_tiler_mn[0] == 256 else 1
+            cta_tile_m = mma_tiler_mn[0] // ctas_per_mma
+            cluster_tile_m = cta_tile_m * cluster_shape_mn[0]
+            cluster_tile_n = mma_tiler_mn[1] * cluster_shape_mn[1]
+            work_clusters = (ceil_div(kernel_m, cluster_tile_m) *
+                             ceil_div(kernel_n, cluster_tile_n))
+            # TMA hides scale latency when all work fits one cluster wave.
+            tma_packed_scales = (m >= 512
+                                 and work_clusters <= max_active_clusters)
             kernel_sfa_stride = kernel_sfa.stride(1)
             kernel_sfb_stride = kernel_sfb.stride(1)
             # Tail tiles require a runtime MMA-N descriptor.
@@ -4115,6 +4122,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     apply_alpha=False,
                     max_ab_stages=max_ab_stages,
                     l2_swizzle=l2_swizzle,
+                    # PDL contends with the following full-SM mHC kernel.
+                    use_pdl=False,
                 )
                 compiled_gemm = cute.compile(
                     gemm.wrapper_dsv4_splitk_packed_ue8m0,

@@ -113,6 +113,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         apply_alpha: bool = True,
         max_ab_stages: Optional[int] = None,
         l2_swizzle: bool = False,
+        use_pdl: bool = TRTLLM_ENABLE_PDL,
     ):
         """Initializes the configuration for a Blackwell dense GEMM kernel.
 
@@ -153,6 +154,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         self.dynamic_mma_n = dynamic_mma_n
         self.apply_alpha = apply_alpha
         self.l2_swizzle = l2_swizzle
+        self.use_pdl = use_pdl
         self.cta_group = (tcgen05.CtaGroup.TWO
                           if self.use_2cta_instrs else tcgen05.CtaGroup.ONE)
 
@@ -309,8 +311,10 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             self.num_c_stage = 2
         self.num_scale_stage = self.num_ab_stage
         if self.packed_k128_scales:
+            # Direct loads need one more stage to hide L1 latency.
+            min_scale_stages = 2 if self.tma_packed_scales else 3
             self.num_scale_stage = max(
-                2,
+                min_scale_stages,
                 (self.num_ab_stage + _SCALES_PER_WORD - 1) // _SCALES_PER_WORD,
             )
 
@@ -801,7 +805,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             smem=self.shared_storage.size_in_bytes(),
             min_blocks_per_mp=1,
             stream=stream,
-            use_pdl=TRTLLM_ENABLE_PDL,
+            use_pdl=self.use_pdl,
         )
         return
 
@@ -1187,7 +1191,8 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             cute.arch.barrier(barrier_id=self.cta_sync_bar_id,
                               number_of_threads=self.threads_per_cta)
 
-        griddepcontrol_wait()
+        if cutlass.const_expr(self.use_pdl):
+            griddepcontrol_wait()
 
         #
         # Specialized TMA load warp
@@ -2167,7 +2172,8 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             #
             c_pipeline.producer_tail()
 
-        griddepcontrol_launch_dependents()
+        if cutlass.const_expr(self.use_pdl):
+            griddepcontrol_launch_dependents()
 
     def mainloop_s2t_copy_and_partition(
         self,
