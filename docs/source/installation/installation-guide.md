@@ -75,7 +75,7 @@ pip3 uninstall nvidia-cutlass-dsl nvidia-cutlass-dsl-libs-base nvidia-cutlass-ds
 pip3 install --ignore-installed pip setuptools wheel && pip3 install tensorrt_llm
 ```
 
-> **Note:** The TensorRT LLM wheel on PyPI is built with a public torch python package. This version may be incompatible with the NVIDIA NGC PyTorch container, which uses a different PyTorch build. If you are using the NGC PyTorch container, install the wheel built specifically for that container using the `+ngcpytorch{YYMM}` local version suffix, where `YYMM` is derived from the container tag (e.g., `pytorch:26.02` → `ngcpytorch2602`):
+> **Note:** The TensorRT LLM wheel on PyPI is built with the [public PyTorch package](https://pypi.org/project/torch/). This version may be incompatible with the NVIDIA NGC PyTorch container, which uses a different PyTorch build. If you are using the NGC PyTorch container, install the wheel built specifically for that container using the `+ngcpytorch{YYMM}` local version suffix, where `YYMM` is derived from the container tag (e.g., `pytorch:26.02` → `ngcpytorch2602`):
 >
 > ```bash
 > # Example: install TensorRT LLM 1.3.0rc16 inside the pytorch:26.02 NGC container
