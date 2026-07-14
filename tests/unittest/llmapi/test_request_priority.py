@@ -62,6 +62,18 @@ class TestGenerationRequestPriority:
         req = self._make_request(priority=DEFAULT_REQUEST_PRIORITY)
         assert req.priority == DEFAULT_REQUEST_PRIORITY
 
+    def test_reusable_prompt_len_stored_correctly(self):
+        req = self._make_request(reusable_prompt_len=2)
+        assert req.reusable_prompt_len == 2
+
+    def test_non_positive_reusable_prompt_len_normalizes_to_none(self):
+        req = self._make_request(reusable_prompt_len=0)
+        assert req.reusable_prompt_len is None
+
+    def test_invalid_reusable_prompt_len_raises(self):
+        with pytest.raises(TypeError):
+            self._make_request(reusable_prompt_len="2")
+
     @pytest.mark.parametrize("bad_priority", [-0.1, 1.1, float("nan"), float("inf"), -float("inf")])
     def test_invalid_priority_raises(self, bad_priority):
         with pytest.raises(ValueError):
@@ -128,6 +140,15 @@ class TestGenerationExecutorPriorityPropagation:
             priority=0.0,
         )
         assert executor.submitted[0].priority == 0.0
+
+    def test_reusable_prompt_len_propagated_to_request(self):
+        executor = self._make_executor()
+        executor.generate_async(
+            prompt_token_ids=[1, 2, 3],
+            sampling_params=SamplingParams(max_tokens=5),
+            reusable_prompt_len=2,
+        )
+        assert executor.submitted[0].reusable_prompt_len == 2
 
 
 # ---------------------------------------------------------------------------

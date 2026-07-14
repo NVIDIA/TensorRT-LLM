@@ -464,10 +464,13 @@ class KVCacheManager(BaseResourceManager):
                 pp_size = self.mapping.pp_size if self.mapping is not None else 1
                 live_state_slots = self.max_batch_size * pp_size
                 max_snapshots = live_state_slots
-                if kv_cache_config.enable_block_reuse:
-                    max_snapshots += (
-                        kv_cache_config.max_tokens //
-                        linear_attention_metadata.states_snapshot_interval)
+                snapshot_interval = (
+                    linear_attention_metadata.states_snapshot_interval)
+                if (kv_cache_config.enable_block_reuse
+                        and snapshot_interval is not None
+                        and snapshot_interval > 0):
+                    max_snapshots += (kv_cache_config.max_tokens //
+                                      snapshot_interval)
 
                 blocks_per_window[LinearCacheType.RECURRENT_STATES.value] = (
                     int(max_snapshots), 0)

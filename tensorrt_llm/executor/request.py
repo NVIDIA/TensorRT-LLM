@@ -113,6 +113,7 @@ class GenerationRequest:
         arrival_time: Optional[float] = None,
         encoder_input_token_ids: Optional[Union[torch.Tensor, np.ndarray,
                                                 list]] = None,
+        reusable_prompt_len: Optional[int] = None,
         priority: float = DEFAULT_REQUEST_PRIORITY,
     ):
         if isinstance(prompt_token_ids, list):
@@ -159,6 +160,13 @@ class GenerationRequest:
         self.arrival_time = arrival_time
         self.encoder_input_token_ids = self._normalize_optional_token_ids(
             encoder_input_token_ids, "encoder_input_token_ids")
+        if reusable_prompt_len is not None:
+            if not isinstance(reusable_prompt_len, int):
+                raise TypeError("reusable_prompt_len must be int or None, got "
+                                f"{type(reusable_prompt_len).__name__}")
+            if reusable_prompt_len <= 0:
+                reusable_prompt_len = None
+        self.reusable_prompt_len = reusable_prompt_len
         if not (0.0 <= priority <= 1.0):
             raise ValueError(
                 f"priority must be a float in [0.0, 1.0], got {priority}")

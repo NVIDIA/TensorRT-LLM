@@ -671,6 +671,13 @@
       "path": "kv_cache_config.kv_cache_event_hash_algo"
     },
     {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "kv_cache_config.mamba_save_last_snapshot"
+    },
+    {
       "allowed_values": [
         "auto",
         "float16",

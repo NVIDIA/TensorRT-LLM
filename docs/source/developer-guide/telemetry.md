@@ -28,7 +28,7 @@ unset or when the safety sanitizer rejects the runtime value.
 
 ### `TorchLlmArgs`
 
-261 captured fields.
+262 captured fields.
 
 | Captured key | Annotation | Kind | Converter | Allowed values |
 |--------------|------------|------|-----------|----------------|
@@ -119,6 +119,7 @@ unset or when the safety sanitizer rejects the runtime value.
 | `kv_cache_config.host_cache_size` | `Optional[int]` | `value` |  |  |
 | `kv_cache_config.iteration_stats_interval` | `<class 'int'>` | `value` |  |  |
 | `kv_cache_config.kv_cache_event_hash_algo` | `Literal['auto', 'v1_block_key', 'v2_sha256', 'v2_sha256_64']` | `categorical` |  | `auto`, `v1_block_key`, `v2_sha256`, `v2_sha256_64` |
+| `kv_cache_config.mamba_save_last_snapshot` | `<class 'bool'>` | `value` |  |  |
 | `kv_cache_config.mamba_ssm_cache_dtype` | `Literal['auto', 'float16', 'bfloat16', 'float32']` | `categorical` |  | `auto`, `float16`, `bfloat16`, `float32` |
 | `kv_cache_config.mamba_ssm_philox_rounds` | `<class 'int'>` | `value` |  |  |
 | `kv_cache_config.mamba_ssm_stochastic_rounding` | `<class 'bool'>` | `value` |  |  |
@@ -295,7 +296,7 @@ unset or when the safety sanitizer rejects the runtime value.
 
 ### `TrtLlmArgs`
 
-280 captured fields.
+281 captured fields.
 
 | Captured key | Annotation | Kind | Converter | Allowed values |
 |--------------|------------|------|-----------|----------------|
@@ -428,6 +429,7 @@ unset or when the safety sanitizer rejects the runtime value.
 | `kv_cache_config.host_cache_size` | `Optional[int]` | `value` |  |  |
 | `kv_cache_config.iteration_stats_interval` | `<class 'int'>` | `value` |  |  |
 | `kv_cache_config.kv_cache_event_hash_algo` | `Literal['auto', 'v1_block_key', 'v2_sha256', 'v2_sha256_64']` | `categorical` |  | `auto`, `v1_block_key`, `v2_sha256`, `v2_sha256_64` |
+| `kv_cache_config.mamba_save_last_snapshot` | `<class 'bool'>` | `value` |  |  |
 | `kv_cache_config.mamba_ssm_cache_dtype` | `Literal['auto', 'float16', 'bfloat16', 'float32']` | `categorical` |  | `auto`, `float16`, `bfloat16`, `float32` |
 | `kv_cache_config.mamba_ssm_philox_rounds` | `<class 'int'>` | `value` |  |  |
 | `kv_cache_config.mamba_ssm_stochastic_rounding` | `<class 'bool'>` | `value` |  |  |

@@ -544,6 +544,8 @@ class BaseWorker(GenerationExecutor):
             executor_request.py_logprobs_mode = request.sampling_params.logprobs_mode
             executor_request.py_logprobs_simple_format = (
                 request.sampling_params.logprobs_simple_format)
+            if request.reusable_prompt_len is not None:
+                executor_request.py_reusable_prompt_len = request.reusable_prompt_len
 
             # here we add executor_request.py_disaggregated_params= request.disaggregated_params for python cache transceiver
             if self._is_pytorch_backend and request.disaggregated_params is not None:

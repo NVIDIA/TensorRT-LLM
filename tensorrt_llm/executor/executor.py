@@ -139,6 +139,7 @@ class GenerationExecutor(ABC):
         arrival_time: Optional[float] = None,
         encoder_input_token_ids: Optional[Union[torch.Tensor, np.ndarray,
                                                 list]] = None,
+        reusable_prompt_len: Optional[int] = None,
         priority: float = DEFAULT_REQUEST_PRIORITY,
     ) -> GenerationResult:
         """Generate output for the given prompt token ids in the asynchronous mode.
@@ -169,6 +170,7 @@ class GenerationExecutor(ABC):
             cache_salt=cache_salt,
             arrival_time=arrival_time,
             encoder_input_token_ids=encoder_input_token_ids,
+            reusable_prompt_len=reusable_prompt_len,
             priority=priority)
         result = self.submit(request)
         # release memory in time
