@@ -15,7 +15,6 @@ kv_cache_config:
 speculative_config:
   decoding_type: MTP
   num_nextn_predict_layers: 6
-  mtp_eagle_one_model: true
 attention_dp_config:
   enable_balance: true
   batching_wait_iters: 10

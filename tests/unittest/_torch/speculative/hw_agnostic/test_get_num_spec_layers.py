@@ -11,7 +11,7 @@ class _DraftPretrainedConfig:
         self.num_hidden_layers = num_hidden_layers
 
 
-def test_get_num_spec_layers_eagle3_one_model_uses_draft_hidden_layers():
+def test_get_num_spec_layers_eagle3_uses_draft_hidden_layers():
     spec_config = Eagle3DecodingConfig(
         max_draft_len=8,
         speculative_model="/path/to/draft",
@@ -22,7 +22,7 @@ def test_get_num_spec_layers_eagle3_one_model_uses_draft_hidden_layers():
     assert get_num_spec_layers(spec_config) == 1
 
 
-def test_get_num_spec_layers_eagle3_one_model_defaults_to_one():
+def test_get_num_spec_layers_eagle3_defaults_to_one():
     spec_config = Eagle3DecodingConfig(
         max_draft_len=8,
         speculative_model="/path/to/draft",
@@ -32,7 +32,7 @@ def test_get_num_spec_layers_eagle3_one_model_defaults_to_one():
     assert get_num_spec_layers(spec_config) == 1
 
 
-def test_get_num_spec_layers_mtp_eagle_one_model():
+def test_get_num_spec_layers_mtp_eagle():
     spec_config = MTPDecodingConfig(max_draft_len=1)
     assert get_num_spec_layers(spec_config) == 1
 

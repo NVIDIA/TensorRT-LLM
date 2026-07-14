@@ -661,7 +661,6 @@ def llama_eagle3_config():
         "speculative_config": Eagle3DecodingConfig(
             max_draft_len=3,
             speculative_model=model_path("EAGLE3-LLaMA3.1-Instruct-8B"),
-            eagle3_one_model=True,
             eagle3_layers_to_capture={1, 15, 28},
         ),
         # Force the Eagle3 draft to match the BF16 Llama 3.1 target. Shared KV

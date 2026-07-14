@@ -133,7 +133,6 @@ def _make_mock_model_engine(model_config):
     engine = Mock()
     engine.model.model_config = model_config
     engine.dtype = torch.bfloat16
-    engine.is_draft_model = False
     engine.kv_cache_manager_key = ResourceManagerType.KV_CACHE_MANAGER
     return engine
 
@@ -169,7 +168,6 @@ def _make_creator(
 
     creator = KvCacheCreator.__new__(KvCacheCreator)
     creator._model_engine = model_engine
-    creator._draft_model_engine = None
     creator._mapping = mapping if mapping is not None else Mapping()
     creator._kv_cache_config = kv_cache_config
     creator._max_kv_tokens_in = kv_cache_config.max_tokens

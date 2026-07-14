@@ -2,7 +2,7 @@ from .auto_heuristic import suggest_spec_config
 from .dflash import DFlashSpecMetadata, DFlashWorker
 from .draft_target import (DraftTargetOneModelSpecMetadata,
                            DraftTargetOneModelWorker)
-from .eagle3 import Eagle3SpecMetadata, MTPEagleWorker
+from .eagle3 import MTPEagleWorker
 from .interface import (SpecMetadata, SpecWorkerBase,
                         prepare_attn_metadata_for_draft_replay,
                         restore_attn_metadata_after_draft_replay,
@@ -30,7 +30,6 @@ __all__ = [
     "DFlashWorker",
     "DraftTargetOneModelSpecMetadata",
     "DraftTargetOneModelWorker",
-    "Eagle3SpecMetadata",
     "MTPEagleWorker",
     "MTPSampler",
     "MTPSpecMetadata",

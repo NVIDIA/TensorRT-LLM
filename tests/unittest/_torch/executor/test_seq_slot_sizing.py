@@ -56,7 +56,7 @@ def test_dsv4_overlap_headroom_gate(
     spec_config = None
     if has_spec:
         spec_config = Mock()
-        spec_config.spec_dec_mode.is_mtp_eagle_one_model.return_value = is_mtp_one_model
+        spec_config.spec_dec_mode.is_mtp_eagle.return_value = is_mtp_one_model
     mapping = Mapping(world_size=pp_size, tp_size=1, pp_size=pp_size)
 
     assert (

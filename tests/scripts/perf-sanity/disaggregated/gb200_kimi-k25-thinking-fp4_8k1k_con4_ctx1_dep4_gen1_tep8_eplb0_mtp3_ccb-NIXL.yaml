@@ -66,7 +66,6 @@ worker_config:
     speculative_config: &id001
       decoding_type: Eagle
       max_draft_len: 3
-      eagle3_one_model: true
       speculative_model: Kimi-K2.5-Thinking-Eagle3
     trust_remote_code: true
     num_postprocess_workers: 4

@@ -56,7 +56,6 @@ def test_dynamic_draft_len(enforce_single_worker):
     spec_config = Eagle3DecodingConfig(
         max_draft_len=4,
         speculative_model=eagle_model_dir,
-        eagle3_one_model=True,
         draft_len_schedule={
             1: 4
         },  # It doesn't matter which value is used here, as the draft length will be controlled by the mock function.
