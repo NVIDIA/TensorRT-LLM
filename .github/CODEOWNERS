@@ -398,12 +398,6 @@
 /tensorrt_llm/_torch/attention_backend @NVIDIA/trt-llm-torch-attention-devs
 /tensorrt_llm/_torch/modules/attention.py @NVIDIA/trt-llm-torch-attention-devs
 
-## TensorRT-LLM LLM API
-/tensorrt_llm/llmapi @NVIDIA/trt-llm-llmapi-devs
-/tensorrt_llm/executor @NVIDIA/trt-llm-llmapi-devs
-/tensorrt_llm/serve @NVIDIA/trt-llm-llmapi-devs
-/tensorrt_llm/commands @NVIDIA/trt-llm-llmapi-devs
-
 ## TensorRT-LLM LLM Disaggregated
 /examples/disaggregated @NVIDIA/trt-llm-disagg-devs @NVIDIA/trt-llm-doc-owners
 /examples/disaggregated/slurm/benchmark @NVIDIA/trt-llm-disagg-devs @NVIDIA/trtllm-bench-reviewers
