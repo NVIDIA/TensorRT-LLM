@@ -5220,8 +5220,12 @@ class TorchLlmArgs(BaseLlmArgs):
         description=(
             "Maximum number of encoder tokens. For encoder-decoder models, this "
             "limits encoder CUDA graph total-token buckets. For multimodal "
-            "models, this is the shared AttentionMetadata budget across all "
-            "encoded modalities. Falls back to `max_num_tokens` when unset."),
+            "models, it limits encoder attention tokens scheduled in one "
+            "iteration and is shared across all encoded modalities. An "
+            "explicit value is a strict limit, and requests containing a "
+            "larger atomic item are rejected. When unset, the limit falls back "
+            "to `max_num_tokens` and may be raised to the model's largest "
+            "atomic item for compatibility."),
         status="prototype")
 
     @field_validator("encoder_max_batch_size", "encoder_max_num_tokens")
