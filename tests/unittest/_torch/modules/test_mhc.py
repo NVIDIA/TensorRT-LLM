@@ -810,11 +810,14 @@ def test_mhc_fused_hc_backends(n: int, hidden_size: int, hc_mult: int):
         ("fused_half_fma", 3, 2, 256, 1),
     ],
 )
-def test_mhc_fused_hc_reduces_split_x_for_production_backends(tactic):
+@pytest.mark.parametrize("x_splits", [2, 4])
+def test_mhc_fused_hc_reduces_split_x_for_production_backends(
+    tactic: tuple[str, int, int, int, int], x_splits: int
+) -> None:
     """Production half backends consume split-major O_b partials correctly."""
     from tensorrt_llm._torch.modules.mhc.mhc_cuda import MhcFusedHcRunner
 
-    n, hidden_size, hc_mult, x_splits = 32, 7168, 4, 4
+    n, hidden_size, hc_mult = 32, 7168, 4
     pre_data = generate_realistic_pre_data(n=n, hc_mult=hc_mult, hidden_size=hidden_size)
     torch.random.manual_seed(23)
 
@@ -838,7 +841,7 @@ def test_mhc_fused_hc_reduces_split_x_for_production_backends(tactic):
         sinkhorn_repeat=pre_data["sinkhorn_repeat"],
     )
 
-    def inputs(x_prev):
+    def inputs(x_prev: torch.Tensor) -> list[torch.Tensor]:
         return [
             x_prev.contiguous(),
             residual_prev,

@@ -1066,8 +1066,7 @@ def mhc_fused_hc(
             # CUDA-core FMA wins at tiny M.
             best_tactic = _FUSED_HC_SPLIT_X_FMA_TACTIC
         else:
-            # C++ selects split-K and BigFuse geometry from M.
-            best_tactic = _FUSED_HC_FALLBACK_TACTIC_MMA
+            best_tactic = _get_fused_hc_fallback_tactic(hidden_size)
     else:
         tuner = AutoTuner.get()
         _, best_tactic = tuner.choose_one(
