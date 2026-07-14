@@ -6,7 +6,7 @@ import sys
 
 import cloudpickle
 import pytest
-from defs.conftest import get_sm_version, skip_no_hopper
+from defs.conftest import get_sm_version, skip_no_hopper, skip_pre_hopper
 from mpi4py import MPI
 from mpi4py.futures import MPIPoolExecutor
 
