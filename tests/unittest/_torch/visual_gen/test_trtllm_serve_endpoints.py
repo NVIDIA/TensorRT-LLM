@@ -60,6 +60,20 @@ def _assert_llm_envelope(
         assert message_contains in body["message"], body["message"]
 
 
+def _require_pyav_optin():
+    """Skip unless PyAV is installed and opted into via ``TRTLLM_ENABLE_PYAV=1``.
+
+    These tests drive ``_reference_is_video``, which gates PyAV behind the same
+    opt-in ``media_io`` uses. ``av`` ships in no CI image, so this both
+    ``importorskip``-s the package and skips when the gate is disabled; it
+    returns the ``av`` module for tests that build fixtures with it.
+    """
+    av = pytest.importorskip("av")
+    if os.environ.get("TRTLLM_ENABLE_PYAV", "0") != "1":
+        pytest.skip("requires the PyAV opt-in (TRTLLM_ENABLE_PYAV=1)")
+    return av
+
+
 def _make_dummy_image_tensor(height: int = 64, width: int = 64) -> torch.Tensor:
     """Create a small dummy uint8 image tensor (H, W, C)."""
     return torch.randint(0, 256, (height, width, 3), dtype=torch.uint8)
@@ -848,7 +862,7 @@ class TestVideoGenerationSync:
         The reference is classified by decoding its content, so the clip is
         synthesized in-test with PyAV — no video asset ships with the repo.
         """
-        av = pytest.importorskip("av")
+        av = _require_pyav_optin()
         np = pytest.importorskip("numpy")
         ref_path = tmp_path / "ref.mp4"
         with av.open(str(ref_path), "w") as container:
@@ -891,7 +905,7 @@ class TestVideoGenerationSync:
 
     def test_sync_video_generation_undecodable_reference_400(self, video_client):
         """Content neither PIL nor PyAV can decode is rejected at the boundary."""
-        pytest.importorskip("av")
+        _require_pyav_optin()
         resp = video_client.post(
             "/v1/videos/generations",
             data={"prompt": "x"},
