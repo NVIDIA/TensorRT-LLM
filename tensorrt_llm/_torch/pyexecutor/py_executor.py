@@ -22,9 +22,10 @@ try:
 except ImportError:
     from cuda import cudart
 
-from tensorrt_llm._utils import (customized_gc_thresholds, is_trace_enabled,
-                                 mpi_comm, mpi_disabled, nvtx_range,
-                                 set_thread_local_mpi_comm, trace_func)
+from tensorrt_llm._utils import (CUASSERT, customized_gc_thresholds,
+                                 is_trace_enabled, mpi_comm, mpi_disabled,
+                                 nvtx_range, set_thread_local_mpi_comm,
+                                 trace_func)
 from tensorrt_llm.bindings.executor import (DisServingRequestStats,
                                             FinishReason, InflightBatchingStats,
                                             IterationStats, KvCacheStats,
@@ -38,7 +39,6 @@ from tensorrt_llm.inputs.multimodal import strip_mm_data_for_generation
 from tensorrt_llm.llmapi.llm_args import PeftCacheConfig, WaitingQueuePolicy
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import CpType
-from tensorrt_llm.runtime.generation import CUASSERT
 from tensorrt_llm.runtime.kv_cache_manager_v2._exceptions import OutOfPagesError
 from tensorrt_llm.tools.layer_wise_benchmarks import get_calibrator
 from tensorrt_llm.tools.profiler.host_profile_tools.host_profiler import (
@@ -1636,8 +1636,16 @@ class PyExecutor:
                     logger.info(
                         f"Profiling stopped at iteration {self.iter_counter}, "
                         f"trace saved to {torch_trace_path}")
-                torch.cuda.cudart().cudaProfilerStop()
+                # Persist calibration data and quiesce the device before
+                # cudaProfilerStop(): profiling tools may stop collecting or
+                # even end the process (e.g. nsys with
+                # --capture-range-end=stop-shutdown) as soon as the capture
+                # range closes, so the calibration file dump must happen
+                # before the stop, and the capture should end on an idle
+                # device with no in-flight async copies.
                 calibrator.stop()
+                torch.cuda.synchronize()
+                torch.cuda.cudart().cudaProfilerStop()
                 enabled = False
 
             # Capture per-loop timing whenever stats or the iter log are
@@ -1732,8 +1740,10 @@ class PyExecutor:
                     torch_profiler.export_chrome_trace(torch_trace_path)
                     logger.info(f"Profiling stopped at iteration {it}, "
                                 f"trace saved to {torch_trace_path}")
-                torch.cuda.cudart().cudaProfilerStop()
+                # See the ordering rationale at the in-loop cudaProfilerStop().
                 calibrator.stop()
+                torch.cuda.synchronize()
+                torch.cuda.cudart().cudaProfilerStop()
 
     def _get_init_iter_stats(self, num_new_active_requests,
                              new_active_requests_queue_latency_ms):
