@@ -5857,16 +5857,12 @@ class PyTorchModelEngine(ModelEngine):
                 "models must define a top-level `encoder` (or `model.encoder`) "
                 "stack to participate in the encoder iteration.")
 
-        # Feature-driven audio encoders (Whisper): the "embedding" is the
-        # encoder's own downsampling stem + positional table, so the feature
-        # tensor is passed straight through — no token embedding, no
-        # driver-side position ids.
+        # Feature-driven encoders (Whisper): the feature tensor is opaque to
+        # the engine — no token embedding, no position ids, no dtype cast.
+        # The model's forward casts internally (Whisper's raw waveforms must
+        # reach the log-mel STFT in fp32).
         input_features = inputs.get('input_features')
         if input_features is not None:
-            encoder_param = next(encoder.parameters(), None)
-            if (encoder_param is not None
-                    and input_features.dtype != encoder_param.dtype):
-                input_features = input_features.to(encoder_param.dtype)
             return encoder(
                 input_features=input_features,
                 attn_metadata=inputs['encoder_attn_metadata'],

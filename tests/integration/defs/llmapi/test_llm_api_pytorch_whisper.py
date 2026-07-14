@@ -55,6 +55,10 @@ _EXPECTED_GREEDY_OUTPUT_TOKEN_IDS = [
     13,
     50257,
 ]
+# Half precision (both HF and TRT-LLM) flips the first token " yet" (1939)
+# to " Yet" (10890); the rest of the sequence is unchanged.
+_EXPECTED_GREEDY_OUTPUT_TOKEN_IDS_HALF = [10890
+                                          ] + _EXPECTED_GREEDY_OUTPUT_TOKEN_IDS[1:]
 _EXPECTED_TRANSCRIPT_FRAGMENT = "thoughts affected hester"
 
 pytestmark = [
@@ -254,11 +258,13 @@ def test_whisper_pytorch_feature_combinations(
 ):
     """Greedy transcription across dtype/kv-cache-manager/CUDA-graph/TP combos.
 
-    Batch-1 and batch-2 must both reproduce the pinned fp32 token ids
-    (whisper-tiny greedy is dtype-stable on this clip).
+    Batch-1 and batch-2 must both reproduce the pinned per-dtype token ids
+    (fp32 exact; fp16/bf16 differ only in the borderline first token).
     """
     if tp_size == 1:
         monkeypatch.setenv("TLLM_WORKER_USE_SINGLE_PROCESS", "1")
+    expected_token_ids = (_EXPECTED_GREEDY_OUTPUT_TOKEN_IDS if torch_dtype is None
+                          else _EXPECTED_GREEDY_OUTPUT_TOKEN_IDS_HALF)
 
     model_path = _get_whisper_model_path()
     wave, sample_rate = soundfile.read(_get_audio_path())
@@ -279,7 +285,7 @@ def test_whisper_pytorch_feature_combinations(
             )
             for output in outputs:
                 completion = output.outputs[0]
-                assert list(completion.token_ids) == _EXPECTED_GREEDY_OUTPUT_TOKEN_IDS
+                assert list(completion.token_ids) == expected_token_ids
                 assert _EXPECTED_TRANSCRIPT_FRAGMENT in completion.text.lower()
 
         if tp_size == 1:
