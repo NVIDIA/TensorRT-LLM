@@ -250,10 +250,15 @@ class MpiPoolSession(MpiSession):
             ]
             done, not_done = futures_wait(futures, timeout=60.0)
             if not_done:
+                # A worker that never picked up its barrier task leaves the
+                # others blocked in the barrier: the pool itself is likely
+                # broken (a worker died during spawn) and later submits may
+                # hang — name that here so the eventual hang is attributable.
                 logger.warning(
                     "MpiPoolSession(wait_shutdown=True): worker identity "
-                    "collection timed out; shutdown will not wait for "
-                    "worker exit")
+                    "collection timed out; shutdown will not wait for worker "
+                    "exit, and the pool may be unusable (workers can be stuck "
+                    "in the collection barrier if one died during spawn)")
                 return ()
             return tuple(f.result() for f in done)
         except Exception as e:

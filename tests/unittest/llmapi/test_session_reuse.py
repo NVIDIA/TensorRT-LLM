@@ -59,6 +59,24 @@ def test_reuse_hands_back_same_pool(reuse_cache):
     assert reuse_cache.resets  # workers were reset between handouts
 
 
+def test_cached_handover_reaps_in_flight_retires(reuse_cache):
+    # Two same-size pools released back-to-back (concurrent LLMs in one
+    # test): the duplicate is retired in a BACKGROUND thread while holding
+    # full model GPU memory until its workers exit. The next instant
+    # cached-pool handover must join that retire first — the corpse race the
+    # deleted NVML settle barrier used to cover.
+    s1 = reuse_cache.acquire(_FakePool, 2)
+    s2 = reuse_cache.acquire(_FakePool, 2)  # cache miss: second pool
+    kept, dup = s1._real, s2._real
+    s1.shutdown()  # released: cached
+    s2.shutdown()  # duplicate slot: retired in background
+    assert session_reuse._RETIRE_THREADS  # retire in flight (or just done)
+    s3 = reuse_cache.acquire(_FakePool, 2)
+    assert s3._real is kept
+    assert not session_reuse._RETIRE_THREADS  # handover joined the retire
+    assert dup.shut  # corpse fully disposed before the handover returned
+
+
 def test_reuse_size_mismatch_builds_new(reuse_cache):
     s1 = reuse_cache.acquire(_FakePool, 2)
     s1.shutdown()

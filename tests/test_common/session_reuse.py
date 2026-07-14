@@ -66,6 +66,29 @@ _RETIRE_THREADS: list = []
 _RETIRE_LOCK = threading.Lock()
 
 
+def _reap_retires(timeout: float = 60.0) -> None:
+    """Join in-flight retire threads (bounded); no-op when none are running.
+
+    A retired pool's workers hold their (full-model) GPU memory until they
+    exit; the retire thread blocks on that exit (``wait_shutdown=True``), but
+    it is a BACKGROUND thread — the test hot path never waits on it. Before
+    an instant cached-pool handover, joining in-flight retires is what makes
+    the handover safe against a corpse still releasing (e.g. the duplicate
+    retired by ``_release`` moments earlier); every other path spawns fresh
+    (~50s), which outlasts the release naturally. Also called at drain
+    rendezvous points so disposals cannot leak past the session.
+    """
+    with _RETIRE_LOCK:
+        in_flight, _RETIRE_THREADS[:] = list(_RETIRE_THREADS), []
+    for t in in_flight:
+        t.join(timeout=timeout)
+        if t.is_alive():
+            print(
+                "[session-reuse] WARNING: pool retirement did not finish within 60s",
+                flush=True,
+            )
+
+
 def _describe_mismatch(spawn_snap, now_snap, uses, max_uses):
     """One line naming WHY a cached pool cannot be handed out (observability)."""
     if uses >= max_uses:
@@ -275,10 +298,14 @@ class SessionReuseCache:
                 self._retire(real)  # stale worker state or lifetime cap
             else:
                 try:
-                    # No GPU-memory settle needed at handover: every pool
-                    # these layers build has wait_shutdown=True, so a dying
-                    # predecessor's shutdown() already blocked until its
-                    # workers exited and released their memory.
+                    # An instant handover must not race a corpse still
+                    # releasing its GPU memory. Retire threads block on the
+                    # workers' exit (wait_shutdown=True) but run in the
+                    # BACKGROUND, so join any in flight (a duplicate retired
+                    # by _release moments ago held full model memory). No-op
+                    # on the common path; every non-cached path spawns fresh
+                    # (~50s), which outlasts the release naturally.
+                    _reap_retires()
                     submit_sync_per_worker(real, reset_worker_torch_compile_state)
                     print(
                         f"[session-reuse] reusing {n_workers}-worker pool "
@@ -350,15 +377,7 @@ class SessionReuseCache:
         disposals from leaking past the session without ever blocking the
         per-test hot path. The join is bounded for the same reason as below.
         """
-        with _RETIRE_LOCK:
-            in_flight, _RETIRE_THREADS[:] = list(_RETIRE_THREADS), []
-        for t in in_flight:
-            t.join(timeout=60)
-            if t.is_alive():
-                print(
-                    "[session-reuse] WARNING: pool retirement did not finish within 60s",
-                    flush=True,
-                )
+        _reap_retires()
         with self._lock:
             pools, self._pools = list(self._pools.values()), {}
         if not pools:
