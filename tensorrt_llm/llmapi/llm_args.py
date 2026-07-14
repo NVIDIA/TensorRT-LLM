@@ -1971,8 +1971,10 @@ class EagleDecodingConfig(DecodingBaseConfig):
     )
     dynamic_tree_max_topK: Optional[int] = Field(
         default=None,
-        description="The topK value for each layer when dynamic tree is enabled."
-    )
+        description=
+        "The topK value for each layer when dynamic tree is enabled. Required "
+        "when use_dynamic_tree is True; ignored (with a warning) when "
+        "use_dynamic_tree is False.")
     num_eagle_layers: Optional[int] = Field(
         default=None,
         description=
@@ -2048,9 +2050,17 @@ class EagleDecodingConfig(DecodingBaseConfig):
             # So the number of choices also represents the number of max draft nodes.
             self.max_total_draft_tokens = len(self.eagle_choices)
 
+        # Dynamic tree is enabled only by an explicit use_dynamic_tree=True;
+        # dynamic_tree_max_topK alone does not turn it on.
+        if not self.use_dynamic_tree and self.dynamic_tree_max_topK is not None:
+            logger.warning(
+                "dynamic_tree_max_topK is set but use_dynamic_tree is False; "
+                "ignoring dynamic_tree_max_topK and using the linear draft path."
+            )
+            self.dynamic_tree_max_topK = None
+
         # Dynamic tree logic
-        if self.use_dynamic_tree or self.dynamic_tree_max_topK is not None:
-            self.use_dynamic_tree = True
+        if self.use_dynamic_tree:
             if self.eagle_choices is not None:
                 raise ValueError(
                     "If use_dynamic_tree is True, eagle_choices should be None")
@@ -2435,7 +2445,8 @@ class MTPDecodingConfig(DecodingBaseConfig):
         default=None,
         description=
         "Top-K candidates expanded per node per draft layer when use_dynamic_tree "
-        "is enabled. Required when use_dynamic_tree is True.")
+        "is enabled. Required when use_dynamic_tree is True; ignored (with a "
+        "warning) when use_dynamic_tree is False.")
 
     # Internal max batch size for dynamic-tree worker buffers.
     _max_batch_size: Optional[int] = PrivateAttr(default=None)
@@ -2489,9 +2500,17 @@ class MTPDecodingConfig(DecodingBaseConfig):
             if self.max_draft_len <= 0:
                 raise ValueError("max_draft_len must be > 0 for MTP")
 
+        # Dynamic tree is enabled only by an explicit use_dynamic_tree=True;
+        # dynamic_tree_max_topK alone does not turn it on.
+        if not self.use_dynamic_tree and self.dynamic_tree_max_topK is not None:
+            logger.warning(
+                "dynamic_tree_max_topK is set but use_dynamic_tree is False; "
+                "ignoring dynamic_tree_max_topK and using the linear draft path."
+            )
+            self.dynamic_tree_max_topK = None
+
         # Dynamic tree defaults max_total_draft_tokens to topK * max_draft_len.
-        if self.use_dynamic_tree or self.dynamic_tree_max_topK is not None:
-            self.use_dynamic_tree = True
+        if self.use_dynamic_tree:
             if self.max_draft_len is None:
                 raise ValueError(
                     "max_draft_len must be set when use_dynamic_tree is True")
