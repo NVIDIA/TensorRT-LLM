@@ -582,6 +582,15 @@ class MultimodalConfig(StrictBaseModel):
         status="prototype",
     )
 
+    enable_eager_encoder_scheduling: bool = Field(
+        default=False,
+        description=(
+            "Schedule encoder work for active multimodal requests before LLM "
+            "capacity filtering. This may advance encoder work for requests "
+            "that are not selected for the current LLM batch."),
+        status="prototype",
+    )
+
     video_pruning_rate: Optional[float] = Field(
         default=None,
         ge=0.0,

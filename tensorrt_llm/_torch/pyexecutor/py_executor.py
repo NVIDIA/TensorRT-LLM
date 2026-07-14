@@ -89,9 +89,10 @@ from .resource_manager import (NoFreeSlotsError, ResourceManager,
                                ResourceManagerType, request_context)
 from .sampler import (AsyncWorkerMixin, Sampler, SamplerEvent, SampleState,
                       SampleStateTensors, TRTLLMSampler)
-from .scheduler import (MultimodalScheduler, RequestScheduler,
-                        ScheduledRequests, SerializableSchedulerOutput,
-                        WaitingQueue, create_waiting_queue)
+from .scheduler import (MultimodalEagerEncoderScheduler, MultimodalScheduler,
+                        RequestScheduler, ScheduledRequests,
+                        SerializableSchedulerOutput, WaitingQueue,
+                        create_waiting_queue)
 from .scheduler.adp_router import ADPRouter
 
 if TYPE_CHECKING:
@@ -111,10 +112,6 @@ PROFILE_START_STOP_ENV_VAR_NAME = "TLLM_PROFILE_START_STOP"
 # Environment variable to enable PyTorch profiler tracing.
 # Set to a path to save detailed tracing of PyTorch operations.
 PROFILE_TRACE_ENV_VAR_NAME = "TLLM_TORCH_PROFILE_TRACE"
-MM_ENCODER_INDEPENDENT_SCHEDULING_ENV_VAR_NAME = (
-    "TLLM_MM_ENCODER_INDEPENDENT_SCHEDULING")
-MM_ENCODER_RUNTIME_SCHEDULING_ENV_VAR_NAME = (
-    "TLLM_MM_ENCODER_RUNTIME_SCHEDULING")
 
 # Environment variable to control which ranks print step logging.
 # Format: comma-separated rank IDs, e.g. "0,1,3", or "all" for all ranks.
@@ -579,45 +576,31 @@ class PyExecutor:
             model_engine, "_enable_dsv4_adp_dummy_fixes", False)
         supports_mm_encoder_item_scheduling = getattr(
             model_engine, "supports_mm_encoder_item_scheduling", False)
-        mm_encoder_runtime_scheduling_enabled = os.environ.get(
-            MM_ENCODER_RUNTIME_SCHEDULING_ENV_VAR_NAME, "1") != "0"
-        self.is_multimodal_model = (supports_mm_encoder_item_scheduling
-                                    and mm_encoder_runtime_scheduling_enabled)
-        self.independent_mm_scheduling = False
-        if (supports_mm_encoder_item_scheduling
-                and not mm_encoder_runtime_scheduling_enabled):
-            logger.warning(
-                "Multimodal encoder runtime scheduling is disabled by "
-                f"{MM_ENCODER_RUNTIME_SCHEDULING_ENV_VAR_NAME}=0; using the "
-                "legacy all-items encoder path. This mode is intended for "
-                "performance comparison only.")
+        self.is_multimodal_model = supports_mm_encoder_item_scheduling
         if self.is_multimodal_model:
-            mm_side_stream_max_ahead = os.environ.get(
-                "TLLM_MM_SIDE_STREAM_MAX_AHEAD", "0")
-            try:
-                mm_side_stream_enabled = int(mm_side_stream_max_ahead) > 0
-            except ValueError:
-                mm_side_stream_enabled = False
-            if mm_side_stream_enabled:
+            multimodal_config = model_engine.llm_args.multimodal_config
+            if multimodal_config.encoder_side_stream_max_ahead > 0:
                 raise NotImplementedError(
                     "MM side-stream prefetch is not yet compatible with "
-                    "item-level encoder scheduling; unset "
-                    "TLLM_MM_SIDE_STREAM_MAX_AHEAD")
-            self.independent_mm_scheduling = os.environ.get(
-                MM_ENCODER_INDEPENDENT_SCHEDULING_ENV_VAR_NAME, "0") == "1"
-            if self.independent_mm_scheduling and (
-                    model_engine.enable_attention_dp or kv_cache_transceiver):
+                    "item-level encoder scheduling; set "
+                    "multimodal_config.encoder_side_stream_max_ahead to 0")
+            eager_mm_encoder_scheduling = (
+                multimodal_config.enable_eager_encoder_scheduling)
+            if eager_mm_encoder_scheduling and (model_engine.enable_attention_dp
+                                                or kv_cache_transceiver):
                 raise NotImplementedError(
-                    "Independent MM encoder scheduling does not yet support "
+                    "Eager MM encoder scheduling does not yet support "
                     "attention DP or disaggregated serving")
-            if self.independent_mm_scheduling:
-                logger.info("Independent multimodal encoder scheduling is "
-                            "enabled for capacity-rejected active requests.")
-            scheduler = MultimodalScheduler(
+            scheduler_cls = MultimodalScheduler
+            if eager_mm_encoder_scheduling:
+                logger.info(
+                    "Eager multimodal encoder scheduling is enabled for "
+                    "capacity-rejected active requests.")
+                scheduler_cls = MultimodalEagerEncoderScheduler
+            scheduler = scheduler_cls(
                 scheduler,
                 max_num_items=model_engine.encoder_max_num_items,
                 max_num_tokens=model_engine.encoder_max_num_tokens,
-                independent=self.independent_mm_scheduling,
             )
         self.scheduler = scheduler
         self.enable_attention_dp = model_engine.enable_attention_dp

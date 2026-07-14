@@ -18,7 +18,10 @@ from tensorrt_llm._torch.pyexecutor.llm_request import (
 )
 from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
-from tensorrt_llm._torch.pyexecutor.scheduler.scheduler import MultimodalScheduler
+from tensorrt_llm._torch.pyexecutor.scheduler.scheduler import (
+    MultimodalEagerEncoderScheduler,
+    MultimodalScheduler,
+)
 from tensorrt_llm._torch.pyexecutor.scheduler.waiting_queue import FCFSWaitingQueue
 from tensorrt_llm.inputs.multimodal import (
     MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
@@ -162,12 +165,10 @@ def test_multimodal_scheduler_preserves_non_multimodal_requests():
     assert output.context_requests == [request]
 
 
-def test_independent_mode_encodes_request_rejected_by_llm_capacity():
+def test_eager_scheduler_encodes_request_rejected_by_llm_capacity():
     base_scheduler = _BaseScheduler()
     base_scheduler.capacity_scheduler = _RejectMultimodalCapacityScheduler()
-    scheduler = MultimodalScheduler(
-        base_scheduler, max_num_items=1, max_num_tokens=8, independent=True
-    )
+    scheduler = MultimodalEagerEncoderScheduler(base_scheduler, max_num_items=1, max_num_tokens=8)
     multimodal_request = _request(1, [8])
     text_request = SimpleNamespace(
         request_id=2,

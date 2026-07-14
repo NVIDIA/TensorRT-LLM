@@ -713,6 +713,7 @@ class TestMultimodalConfig:
         assert MultimodalConfig().encoder_cuda_graph is None
         assert MultimodalConfig().encoder_side_stream_max_ahead == 0
         assert MultimodalConfig().encoder_cache_max_bytes == 128 * 1024**2
+        assert not MultimodalConfig().enable_eager_encoder_scheduling
         assert MultimodalConfig().video_pruning_rate is None
 
     def test_torch_llm_args_default_multimodal_config(self):
@@ -721,6 +722,7 @@ class TestMultimodalConfig:
         assert args.multimodal_config.encoder_cuda_graph is None
         assert args.multimodal_config.encoder_side_stream_max_ahead == 0
         assert args.multimodal_config.encoder_cache_max_bytes == 128 * 1024**2
+        assert not args.multimodal_config.enable_eager_encoder_scheduling
         assert args.multimodal_config.video_pruning_rate is None
 
     @pytest.mark.parametrize(
@@ -751,6 +753,12 @@ class TestMultimodalConfig:
                                 encoder_cache_max_bytes=0,
                             ))
         assert args.multimodal_config.encoder_side_stream_max_ahead == 2
+
+    def test_torch_llm_args_with_eager_encoder_scheduling(self):
+        args = TorchLlmArgs(model=llama_model_path,
+                            multimodal_config=MultimodalConfig(
+                                enable_eager_encoder_scheduling=True))
+        assert args.multimodal_config.enable_eager_encoder_scheduling
 
     def test_torch_llm_args_with_multimodal_video_pruning_rate(self):
         args = TorchLlmArgs(
@@ -790,10 +798,12 @@ class TestMultimodalConfig:
             multimodal_config={
                 "encoder_side_stream_max_ahead": 2,
                 "encoder_cache_max_bytes": 0,
+                "enable_eager_encoder_scheduling": True,
                 "video_pruning_rate": 0.5,
             },
         )
         assert args.multimodal_config.encoder_side_stream_max_ahead == 2
+        assert args.multimodal_config.enable_eager_encoder_scheduling
         assert args.multimodal_config.video_pruning_rate == 0.5
 
     def test_encoder_cuda_graph_and_side_stream_max_ahead_are_exclusive(self):
