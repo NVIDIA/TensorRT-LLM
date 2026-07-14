@@ -186,7 +186,8 @@ class TestEmitHelpers:
 # ---------------------------------------------------------------------------
 class TestParseCppRecvCsvs:
     def test_basic(self, tmp_path):
-        csv_path = tmp_path / "rank_0_recv.csv"
+        # C++ names files "<instanceId>_<rank>_recv.csv" (instanceId is a UUID).
+        csv_path = tmp_path / "3c9f0e2a-1111-2222-3333-444455556666_0_recv.csv"
         with open(csv_path, "w", newline="") as f:
             w = csv.writer(f)
             w.writerow(["RequestID", "Bandwidth(Gbps)", "Bandwidth(Gbps)"])
@@ -199,6 +200,7 @@ class TestParseCppRecvCsvs:
         assert abs(bws[0] - 15.0) < 0.01
 
     def test_renamed_pattern(self, tmp_path):
+        # Legacy "rank_*" prefix must still parse (backward compatibility).
         csv_path = tmp_path / "rank_0_recv__c0.csv"
         with open(csv_path, "w", newline="") as f:
             w = csv.writer(f)
@@ -466,7 +468,9 @@ class TestAggregate:
         # Create CSV for gen side (C++ recv)
         gen_csv = work / "csv" / "0" / "gen"
         gen_csv.mkdir(parents=True)
-        with open(gen_csv / "rank_0_recv.csv", "w", newline="") as f:
+        with open(
+            gen_csv / "5d7b1f80-aaaa-bbbb-cccc-ddddeeeeffff_0_recv.csv", "w", newline=""
+        ) as f:
             w = csv.writer(f)
             w.writerow(["RequestID", "Bandwidth(Gbps)"])
             # warmup rid (r=0) should be excluded
