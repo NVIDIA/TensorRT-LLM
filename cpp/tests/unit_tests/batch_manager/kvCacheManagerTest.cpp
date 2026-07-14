@@ -11043,3 +11043,72 @@ TEST_F(KVCacheManagerTest, DiskTierSyncOnboardByteExactTest)
 {
     runDiskOnboardByteRoundTrip(/*readers=*/"0", /*nSlots=*/4);
 }
+
+// shutdownDiskWorkers() must stop+join every disk worker while reads are queued (holding raw GPU dst
+// pointers) and unstaged writes are queued (holding raw host src pointers), so releasePools() can free
+// the pools with no use-after-free -- and it must be idempotent. Passing == no hang/crash reaching the
+// end (and, under ASAN, no worker access to the released pool). Regression test for the shutdown-order
+// bug where workers stopped only in the destructor, after releasePools() had already freed the pools.
+TEST_F(KVCacheManagerTest, DiskTierShutdownWithQueuedWorkTest)
+{
+    setenv("TLLM_KV_DISK_READERS", "4", /*overwrite=*/1);
+    setenv("TLLM_KV_DISK_WRITERS", "4", /*overwrite=*/1);
+    setenv("TLLM_KV_DISK_ASYNC_STORE", "1", /*overwrite=*/1);
+    DiskTierDir dir;
+    int constexpr blockSize = 2048; // floats per slot
+    int constexpr nSlots = 8;
+
+    auto bufferManager = tr::BufferManager(std::make_shared<tr::CudaStream>());
+    auto transferManager = KVCacheTransferManager(bufferManager); // spawns readers + writers from the env above
+
+    auto pool = KVCacheBlockPool(0, /*kvFactor=*/2, 0, 0, 0);
+    pool.primaryPtr = bufferManager.gpu(tr::ITensor::makeShape({2 * nSlots, blockSize}), nvinfer1::DataType::kFLOAT);
+    bufferManager.setZero(*pool.primaryPtr);
+    pool.secondaryPtr
+        = tr::BufferManager::pinned(tr::ITensor::makeShape({2 * nSlots, blockSize}), nvinfer1::DataType::kFLOAT);
+
+    // Seed host slots and write them to disk (synchronous) so the queued reads below have files to read.
+    float* secBase = tr::bufferCast<float>(*pool.secondaryPtr);
+    for (int k = 0; k < nSlots; ++k)
+    {
+        for (int i = 0; i < blockSize; ++i)
+        {
+            secBase[static_cast<std::size_t>(k) * blockSize + i] = diskPatternValue(k, i);
+        }
+        auto seed = std::make_shared<KVCacheBlock>(k, tk::KVCacheIndex(k, /*isSecondary=*/true));
+        transferManager.spillToFile(seed, /*diskSlot=*/k, {pool}, dir.str());
+    }
+    bufferManager.getStream().synchronize();
+
+    // Queue detached onboard reads: each holds raw GPU dst pointers into the primary pool.
+    std::vector<BlockPtr> reads;
+    for (int k = 0; k < nSlots; ++k)
+    {
+        auto d = std::make_shared<KVCacheBlock>(nSlots + k, tk::KVCacheIndex(nSlots + k, /*isSecondary=*/false));
+        transferManager.loadFromFile(d, /*diskSlot=*/k, {pool}, dir.str(), /*trackBlockId=*/nSlots + k);
+        reads.push_back(d);
+    }
+    // Queue unstaged writes (distinct disk slots): each holds raw host src pointers into the secondary pool.
+    std::vector<BlockPtr> writes;
+    for (int k = 0; k < nSlots; ++k)
+    {
+        auto s = std::make_shared<KVCacheBlock>(2 * nSlots + k, tk::KVCacheIndex(k, /*isSecondary=*/true));
+        transferManager.spillToFileUnstaged(
+            s, /*diskSlot=*/nSlots + k, {pool}, dir.str(), /*spillId=*/static_cast<std::uint64_t>(k + 1));
+        writes.push_back(s);
+    }
+
+    // Stop+join all workers while that work is outstanding. join() waits out any in-flight job against the
+    // still-valid pools; queued jobs are abandoned. After this, no worker can touch pool memory.
+    transferManager.shutdownDiskWorkers();
+    transferManager.shutdownDiskWorkers(); // idempotent: second call is a no-op
+
+    // Safe to free the pools now (the releasePools() order). No worker is mid-transfer into them.
+    pool.primaryPtr->release();
+    pool.secondaryPtr->release();
+
+    // The transfer-manager destructor (at scope end) calls shutdownDiskWorkers() once more -- also a no-op.
+    unsetenv("TLLM_KV_DISK_READERS");
+    unsetenv("TLLM_KV_DISK_WRITERS");
+    unsetenv("TLLM_KV_DISK_ASYNC_STORE");
+}

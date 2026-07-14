@@ -111,6 +111,10 @@ public:
         return mNumDiskReaders >= 1;
     }
 
+    //! \brief Idempotently stop+join all disk workers. MUST run before the pools are released: queued
+    //! reads hold raw GPU dst and unstaged writes raw host src pointers into them (else use-after-free).
+    void shutdownDiskWorkers();
+
     //! \brief Disk tier (unstaged async): spill a host block's bytes by handing the writer the source
     //! pointers directly (no staging memcpy). The caller MUST keep the source host slot pinned until
     //! \p spillId appears in drainCompletedSpills().
@@ -259,6 +263,9 @@ private:
     // areBlocksReady() can skip its per-block scan + the mutex when nothing is in flight (common case).
     std::atomic<std::size_t> mReadInflightCount{0};
     bool mDiskReaderStop{false};
+    // Set once shutdownDiskWorkers() has stopped+joined the disk workers, so releasePools() and the
+    // destructor do not repeat the work. Only touched on the owning thread.
+    bool mDiskWorkersShutdown{false};
 
     void diskReaderLoop();
     void enqueueDiskRead(DiskReadJob job);

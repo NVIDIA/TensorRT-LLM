@@ -1240,6 +1240,9 @@ void WindowBlockManager::releasePools()
 {
     if (mTransferManager)
     {
+        // Stop the disk workers before freeing the pools: queued reads / unstaged writes hold raw
+        // GPU dst / host src pointers into them, so a worker running after release is a use-after-free.
+        mTransferManager->shutdownDiskWorkers();
         mTransferManager->syncTransfers();
     }
     mBufferManager.getStream().synchronize();

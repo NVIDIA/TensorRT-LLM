@@ -104,8 +104,15 @@ KVCacheTransferManager::KVCacheTransferManager(
     }
 }
 
-KVCacheTransferManager::~KVCacheTransferManager()
+void KVCacheTransferManager::shutdownDiskWorkers()
 {
+    // Idempotent stop+join of all disk workers. Queued reads hold raw GPU dst pointers and unstaged
+    // writes hold raw host src pointers into the pools, so this must run before the pools are freed.
+    if (mDiskWorkersShutdown)
+    {
+        return;
+    }
+    mDiskWorkersShutdown = true;
     if (!mDiskWriters.empty())
     {
         {
@@ -136,6 +143,11 @@ KVCacheTransferManager::~KVCacheTransferManager()
             }
         }
     }
+}
+
+KVCacheTransferManager::~KVCacheTransferManager()
+{
+    shutdownDiskWorkers();
 }
 
 tr::ITensor::SharedPtr KVCacheTransferManager::computeBlockPointer(
