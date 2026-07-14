@@ -372,9 +372,7 @@ class Compressor(nn.Module):
 
         token_idx = torch.arange(total_tokens, dtype=torch.int32, device=device)
         cu = cu_new_comp_kv[: batch_size + 1].to(torch.int32)
-        batch_idx = torch.searchsorted(cu[1:], token_idx, right=True).clamp(
-            max=batch_size - 1
-        )
+        batch_idx = torch.searchsorted(cu[1:], token_idx, right=True).clamp(max=batch_size - 1)
         local_idx = token_idx - cu[batch_idx]
         valid = compressed_mask.to(torch.bool) & (local_idx < num_comp_tokens[batch_idx])
 

@@ -247,12 +247,14 @@ The main differences across backends:
 #### 3.2.2 `TRTLLM` internal FMHA libraries
 
 `TrtllmAttention` dispatches attention through an ordered list of internal FMHA
-libraries. `FlashInferTrtllmGenFmha` integrates trtllm-gen kernels from
-FlashInfer into the `TRTLLM` backend, and `FallbackFmha` calls the regular
+libraries. `FlashInferSparseMlaFmha` integrates FlashInfer's SM120 sparse-MLA
+kernels for DSA and DeepSeek-V4, `FlashInferTrtllmGenFmha` integrates
+trtllm-gen kernels from FlashInfer, and `FallbackFmha` calls the regular
 `thop.attention` runtime path. These are not separate attention backends.
 
 `TLLM_FMHA_LIBS` controls the ordered list. Unset means
-`flashinfer_trtllm_gen,fallback`; use `TLLM_FMHA_LIBS=fallback` or
+`flashinfer_sparse_mla,flashinfer_trtllm_gen,fallback`; use
+`TLLM_FMHA_LIBS=fallback` or
 `TLLM_FMHA_LIBS=-flashinfer_trtllm_gen` to force the fallback path. Each FMHA
 library exposes `is_available()` for module/static environment checks and
 `is_supported()` for per-forward request checks.

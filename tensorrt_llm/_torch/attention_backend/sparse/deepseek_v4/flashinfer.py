@@ -1,14 +1,14 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""FlashInfer sparse-MLA attention backend for DeepSeek-V4 on SM120/SM121.
+"""FlashInfer sparse-MLA FMHA helpers for DeepSeek-V4 on SM120/SM121.
 
 On SM120 the C++ attention op compiles out the trtllm-gen sparse-MLA kernels
 for both phases (``attentionOp.h`` excludes SM120 from ``mUseTllmGen``), so
-this backend routes DeepSeek-V4 attention through flashinfer's packed sparse
-MLA kernels instead. It reuses the whole DeepSeek-V4 prediction stack from the
-TRTLLM backend — metadata, indexer, compressor, and the local→global index
-conversion — and replaces only the attention call and the KV append:
+the TRTLLM backend routes DeepSeek-V4 attention through flashinfer's packed
+sparse MLA FMHA library. The existing backend keeps ownership of metadata,
+indexing, compression, and local-to-global conversion; this module implements
+the packed-cache append and kernel launch.
 
 * both pools hold footer-scale pages (``footer_scale_kv``);
 * RoPE runs in Python (``support_fused_rope() -> False``), and the roped
@@ -21,26 +21,16 @@ conversion — and replaces only the attention call and the KV append:
 """
 
 import math
-from typing import Optional
 
 import torch
 
 from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor
 from tensorrt_llm.bindings import DataType
 
-from ...interface import (
-    AttentionForwardArgs,
-    AttentionInputType,
-    merge_attention_forward_args,
-)
+from ...interface import AttentionForwardArgs, AttentionInputType
 from ..kernel import deepseek_v4_local_to_global_indices
-from .deepseek_v4 import (
-    DeepseekV4AttentionType,
-    DeepseekV4TrtllmAttention,
-    DeepseekV4TrtllmAttentionMetadata,
-    get_token_bytes,
-)
 from . import footer_scale_kv
+from .deepseek_v4 import DeepseekV4AttentionType, DeepseekV4TrtllmAttentionMetadata, get_token_bytes
 
 _KV_SPLIT_TILE = 64  # BLOCK_SIZE_N of the SM120 kernels; sizes split-K scratch
 
@@ -111,192 +101,157 @@ def _footer_scale_pool_2d(
     return pool
 
 
-class DeepseekV4FlashInferAttention(DeepseekV4TrtllmAttention):
-    """DeepSeek-V4 sparse MLA served by flashinfer's SM120 packed kernels."""
+def _swa_append(attn, metadata, latent_rows, start_idx: int, end_idx: int) -> None:
+    """Quantize the new latent rows and scatter them into the SWA pool."""
+    positions = metadata.token_positions_cuda[start_idx:end_idx]
+    req_id = metadata.req_idx_per_token[start_idx:end_idx]
+    local_layer_idx = metadata.kv_cache_manager.layer_offsets[attn.layer_idx]
+    block_table_swa = metadata.sliding_block_tables[
+        local_layer_idx, DeepseekV4AttentionType.SWA.value
+    ]
+    token_stride = get_token_bytes(
+        attn.head_dim,
+        attn.sparse_attention_config.index_head_dim,
+        attn.compress_ratio,
+        DeepseekV4AttentionType.SWA,
+        False,
+        kv_layout="footer_scale",
+    )
+    loc = deepseek_v4_local_to_global_indices(
+        req_id=req_id,
+        block_table_swa=block_table_swa,
+        swa_local_indices=positions.unsqueeze(1).contiguous(),
+        swa_pool_base_ptr=metadata.sparse_mla_base_ptrs[1],
+        swa_buffer_ptr=metadata.swa_buffer_ptrs[attn.layer_idx],
+        tokens_per_block=metadata.kv_cache_manager.tokens_per_block,
+        token_stride=token_stride,
+    ).view(-1)
+    swa_pool = _footer_scale_pool_2d(metadata, DeepseekV4AttentionType.SWA, 1)
+    footer_scale_kv.quant_scatter(swa_pool, loc, latent_rows)
 
-    Metadata = DeepseekV4TrtllmAttentionMetadata
-    kv_token_layout = "footer_scale"
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        if getattr(self, "compressor", None) is not None:
-            self.compressor.enable_footer_scale_cache()
-
-    def support_fused_rope(self) -> bool:
-        # RoPE runs in mla.py; this backend receives roped q and a latent
-        # cache whose rope half the model layer has already resynced.
-        return False
-
-    def _swa_append(
-        self,
-        metadata: DeepseekV4TrtllmAttentionMetadata,
-        latent_rows: torch.Tensor,
-        start_idx: int,
-        end_idx: int,
-    ) -> None:
-        """Quantize the new latent rows and scatter them into the SWA pool."""
-        positions = metadata.token_positions_cuda[start_idx:end_idx]
-        req_id = metadata.req_idx_per_token[start_idx:end_idx]
-        local_layer_idx = metadata.kv_cache_manager.layer_offsets[self.layer_idx]
-        block_table_swa = metadata.sliding_block_tables[
-            local_layer_idx, DeepseekV4AttentionType.SWA.value
-        ]
-        # has_fp8_kv_cache is irrelevant here: the footer-scale layout branch
-        # returns its fixed token stride before any dtype sizing applies.
-        token_stride = get_token_bytes(
-            self.head_dim,
-            self.sparse_attention_config.index_head_dim,
-            self.compress_ratio,
-            DeepseekV4AttentionType.SWA,
-            False,
-            kv_token_layout=self.kv_token_layout,
+def run_flashinfer_sparse_mla(
+    attn,
+    q: torch.Tensor,
+    metadata: DeepseekV4TrtllmAttentionMetadata,
+    forward_args: AttentionForwardArgs,
+) -> None:
+    """Run DeepSeek-V4 attention for ``FlashInferSparseMlaFmha``."""
+    if forward_args.enable_dsv4_epilogue_fusion:
+        raise NotImplementedError(
+            "DSv4 epilogue fusion is fused into the C++ attention op; the "
+            "FlashInfer SM120 FMHA does not provide it."
         )
-        loc = deepseek_v4_local_to_global_indices(
-            req_id=req_id,
-            block_table_swa=block_table_swa,
-            swa_local_indices=positions.unsqueeze(1).contiguous(),
-            swa_pool_base_ptr=metadata.sparse_mla_base_ptrs[1],
-            swa_buffer_ptr=metadata.swa_buffer_ptrs[self.layer_idx],
-            tokens_per_block=metadata.kv_cache_manager.tokens_per_block,
-            token_stride=token_stride,
-        ).view(-1)
-        swa_pool = _footer_scale_pool_2d(metadata, DeepseekV4AttentionType.SWA, 1)
-        footer_scale_kv.quant_scatter(swa_pool, loc, latent_rows)
-
-    def forward(
-        self,
-        q: torch.Tensor,
-        k: Optional[torch.Tensor],
-        v: Optional[torch.Tensor],
-        metadata: DeepseekV4TrtllmAttentionMetadata,
-        forward_args: Optional[AttentionForwardArgs] = None,
-        **kwargs,
-    ):
-        forward_args = merge_attention_forward_args(forward_args, kwargs)
-        if forward_args.enable_dsv4_epilogue_fusion:
-            raise NotImplementedError(
-                "DSv4 epilogue fusion is fused into the C++ attention op; the "
-                "FlashInfer SM120 backend does not provide it."
-            )
-        if metadata.max_draft_tokens > 0:
-            raise NotImplementedError(
-                "MTP / speculative decoding is not supported by the FlashInfer "
-                "DSv4 backend yet."
-            )
-
-        attn_sink = getattr(self, "attn_sink", None)
-        sinks = forward_args.attention_sinks
-        if sinks is None and attn_sink is not None:
-            sinks = attn_sink.data
-        if sinks is not None:
-            sinks = sinks.to(torch.float32)
-
-        attention_input_type = forward_args.attention_input_type
-        if attention_input_type == AttentionInputType.context_only:
-            start_idx, end_idx = 0, metadata.num_ctx_tokens
-        elif attention_input_type == AttentionInputType.generation_only:
-            start_idx, end_idx = metadata.num_ctx_tokens, metadata.num_tokens
-        else:
-            start_idx, end_idx = 0, metadata.num_tokens
-        num_tokens = end_idx - start_idx
-
-        output = forward_args.output
-        assert output is not None, "FlashInfer DSv4 backend needs a preallocated output"
-        if num_tokens == 0:
-            return output
-
-        q_view = q.view(num_tokens, self.num_heads, self.head_dim)
-        if q_view.dtype != torch.bfloat16:
-            raise NotImplementedError(
-                "FlashInfer SM120 sparse MLA takes bf16 queries; the fused "
-                "FP8-Q path must stay disabled for this backend."
-            )
-
-        # Append the new latent rows before predicting indices: each token's
-        # SWA window includes itself.
-        latent_cache = forward_args.latent_cache
-        if latent_cache is not None and forward_args.update_kv_cache:
-            self._swa_append(
-                metadata, latent_cache.view(num_tokens, self.head_dim), start_idx, end_idx
-            )
-
-        swa_indices, extra_indices = self.sparse_attn_predict(
-            q, k, metadata, forward_args, split_extra=True
+    if metadata.max_draft_tokens > 0:
+        raise NotImplementedError(
+            "MTP / speculative decoding is not supported by the FlashInfer DSv4 FMHA yet."
         )
-        window = self.sparse_attention_config.window_size
-        positions = metadata.token_positions_cuda[start_idx:end_idx]
-        swa_lens = (positions + 1).clamp(max=window).to(torch.int32)
 
-        if self.compress_ratio > 1:
-            assert extra_indices is not None
-            extra_lens = (
-                metadata.sparse_mla_topk_lens[self.compress_ratio][start_idx:end_idx] - window
-            ).clamp(min=0)
-            extra_pool = _footer_scale_pool_2d(
-                metadata, DeepseekV4AttentionType.COMPRESS, self.compress_ratio
-            )
-            num_splits = (window + _KV_SPLIT_TILE - 1) // _KV_SPLIT_TILE + (
-                extra_indices.shape[1] + _KV_SPLIT_TILE - 1
-            ) // _KV_SPLIT_TILE
-        else:
-            extra_indices = None
-            extra_lens = None
-            extra_pool = None
-            num_splits = (window + _KV_SPLIT_TILE - 1) // _KV_SPLIT_TILE
+    sinks = forward_args.attention_sinks
+    if sinks is not None:
+        sinks = sinks.to(torch.float32)
 
-        out_view = output.view(num_tokens, self.num_heads, self.head_dim)
-        out_lse = torch.zeros(
-            num_tokens, self.num_heads, dtype=torch.float32, device=q.device
+    attention_input_type = forward_args.attention_input_type
+    if attention_input_type == AttentionInputType.context_only:
+        start_idx, end_idx = 0, metadata.num_ctx_tokens
+    elif attention_input_type == AttentionInputType.generation_only:
+        start_idx, end_idx = metadata.num_ctx_tokens, metadata.num_tokens
+    else:
+        start_idx, end_idx = 0, metadata.num_tokens
+    num_tokens = end_idx - start_idx
+
+    output = forward_args.output
+    if output is None:
+        raise RuntimeError("FlashInfer DSv4 FMHA requires a preallocated output.")
+    if num_tokens == 0:
+        return
+
+    q_view = q.view(num_tokens, attn.num_heads, attn.head_dim)
+    if q_view.dtype != torch.bfloat16:
+        raise NotImplementedError(
+            "FlashInfer SM120 sparse MLA takes bf16 queries; the fused "
+            "FP8-Q path must stay disabled for this FMHA."
         )
-        if num_tokens <= 64:
-            # Split-K scratch must be initialized: per-token top-k truncation
-            # can leave splits the kernel never writes, and the merge reads
-            # every split slot. A -inf LSE makes an unwritten split
-            # weightless; uninitialized scratch here was a decode
-            # nondeterminism source.
-            mid_out = torch.zeros(
-                num_tokens,
-                self.num_heads,
-                num_splits,
-                self.head_dim,
-                dtype=torch.bfloat16,
-                device=q.device,
-            )
-            mid_lse = torch.full(
-                (num_tokens, self.num_heads, num_splits),
-                float("-inf"),
-                dtype=torch.float32,
-                device=q.device,
-            )
-        else:
-            mid_out = None
-            mid_lse = None
 
-        sm_scale = 1.0 / (self.q_scaling * math.sqrt(self.head_dim))
-        swa_pool = _footer_scale_pool_2d(metadata, DeepseekV4AttentionType.SWA, 1)
-        swa_pool_paged = swa_pool.view(
-            -1, footer_scale_kv.PAGE_SIZE, footer_scale_kv.TOKEN_BYTES
+    latent_cache = forward_args.latent_cache
+    if latent_cache is not None and forward_args.update_kv_cache:
+        _swa_append(
+            attn,
+            metadata,
+            latent_cache.view(num_tokens, attn.head_dim),
+            start_idx,
+            end_idx,
         )
-        extra_pool_paged = None
-        if extra_pool is not None:
-            extra_pool_paged = extra_pool.view(
-                extra_pool.shape[0], -1, footer_scale_kv.TOKEN_BYTES
-            )
 
-        _sparse_mla_op()(
-            q_view.contiguous(),
-            swa_pool_paged,
-            swa_indices,
-            out_view,
-            out_lse,
-            sm_scale,
-            d_v=self.head_dim,
-            topk_length=swa_lens,
-            attn_sink=sinks,
-            extra_kv_cache=extra_pool_paged,
-            extra_indices=extra_indices,
-            extra_topk_length=extra_lens,
-            mid_out=mid_out,
-            mid_lse=mid_lse,
+    sparse_prediction = forward_args.sparse_prediction
+    swa_indices = sparse_prediction.sparse_attn_indices
+    extra_indices = sparse_prediction.sparse_attn_offsets
+    if swa_indices is None:
+        raise RuntimeError("FlashInfer DSv4 FMHA requires sparse attention indices.")
+
+    window = attn.sparse_attention_config.window_size
+    positions = metadata.token_positions_cuda[start_idx:end_idx]
+    swa_lens = (positions + 1).clamp(max=window).to(torch.int32)
+
+    if attn.compress_ratio > 1:
+        if extra_indices is None:
+            raise RuntimeError("Compressed DeepSeek-V4 layers require extra sparse indices.")
+        extra_lens = (
+            metadata.sparse_mla_topk_lens[attn.compress_ratio][start_idx:end_idx] - window
+        ).clamp(min=0)
+        extra_pool = _footer_scale_pool_2d(
+            metadata, DeepseekV4AttentionType.COMPRESS, attn.compress_ratio
         )
-        return output
+        num_splits = (window + _KV_SPLIT_TILE - 1) // _KV_SPLIT_TILE + (
+            extra_indices.shape[1] + _KV_SPLIT_TILE - 1
+        ) // _KV_SPLIT_TILE
+    else:
+        extra_indices = None
+        extra_lens = None
+        extra_pool = None
+        num_splits = (window + _KV_SPLIT_TILE - 1) // _KV_SPLIT_TILE
+
+    out_view = output.view(num_tokens, attn.num_heads, attn.head_dim)
+    out_lse = torch.zeros(num_tokens, attn.num_heads, dtype=torch.float32, device=q.device)
+    if num_tokens <= 64:
+        mid_out = torch.zeros(
+            num_tokens,
+            attn.num_heads,
+            num_splits,
+            attn.head_dim,
+            dtype=torch.bfloat16,
+            device=q.device,
+        )
+        mid_lse = torch.full(
+            (num_tokens, attn.num_heads, num_splits),
+            float("-inf"),
+            dtype=torch.float32,
+            device=q.device,
+        )
+    else:
+        mid_out = None
+        mid_lse = None
+
+    sm_scale = 1.0 / (attn.q_scaling * math.sqrt(attn.head_dim))
+    swa_pool = _footer_scale_pool_2d(metadata, DeepseekV4AttentionType.SWA, 1)
+    swa_pool_paged = swa_pool.view(-1, footer_scale_kv.PAGE_SIZE, footer_scale_kv.TOKEN_BYTES)
+    extra_pool_paged = None
+    if extra_pool is not None:
+        extra_pool_paged = extra_pool.view(extra_pool.shape[0], -1, footer_scale_kv.TOKEN_BYTES)
+
+    _sparse_mla_op()(
+        q_view.contiguous(),
+        swa_pool_paged,
+        swa_indices,
+        out_view,
+        out_lse,
+        sm_scale,
+        d_v=attn.head_dim,
+        topk_length=swa_lens,
+        attn_sink=sinks,
+        extra_kv_cache=extra_pool_paged,
+        extra_indices=extra_indices,
+        extra_topk_length=extra_lens,
+        mid_out=mid_out,
+        mid_lse=mid_lse,
+    )

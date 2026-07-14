@@ -104,21 +104,6 @@ def get_flashinfer_sparse_attn_attention_backend(
         sparse_params: "SparseParams") -> Type["AttentionBackend"]:
     if sparse_params.algorithm == "minimax_m3":
         return _resolve_minimax_m3_backend_cls(sparse_params)
-    if sparse_params.algorithm == "deepseek_v4":
-        from .deepseek_v4.flashinfer import DeepseekV4FlashInferAttention
-        return DeepseekV4FlashInferAttention
-    if sparse_params.algorithm == "dsa":
-        from tensorrt_llm._utils import get_sm_version
-        if get_sm_version() not in (120, 121):
-            # Fail at selection time with a clear message: the backend's
-            # flashinfer kernels and inline-scale pool layout are
-            # SM120/SM121-only, and the DSA cache manager would already have
-            # switched layouts by the first forward.
-            raise ValueError(
-                "The FlashInfer DSA backend requires SM120/SM121; use the "
-                "TRTLLM attention backend on other architectures.")
-        from .dsa_flashinfer import DSAFlashInferAttention
-        return DSAFlashInferAttention
     raise ValueError(
         f"Unsupported sparse attention algorithm in flashinfer attention backend: {sparse_params.algorithm}"
     )

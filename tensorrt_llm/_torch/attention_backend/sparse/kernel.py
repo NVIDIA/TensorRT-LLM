@@ -2210,21 +2210,21 @@ def _deepseek_v4_local_to_global_kernel(
 
 
 def deepseek_v4_local_to_global_indices(
-        req_id: torch.Tensor,  # int32 [num_tokens]
-        block_table_swa: torch.Tensor,  # int32 [num_requests, max_blocks_swa]
-        swa_local_indices: torch.Tensor,  # int32 [num_tokens, num_swa_indices]
-        swa_pool_base_ptr: int,  # int64: base address of SWA pool
-        swa_buffer_ptr: int,  # int64: base address of SWA buffer
-        tokens_per_block: int,  # tokens per block for SWA
-        token_stride: int,  # bytes per token (use SWA token stride)
-        # Optional compressed arguments (for compress_ratio > 1)
+    req_id: torch.Tensor,  # int32 [num_tokens]
+    block_table_swa: torch.Tensor,  # int32 [num_requests, max_blocks_swa]
+    swa_local_indices: torch.Tensor,  # int32 [num_tokens, num_swa_indices]
+    swa_pool_base_ptr: int,  # int64: base address of SWA pool
+    swa_buffer_ptr: int,  # int64: base address of SWA buffer
+    tokens_per_block: int,  # tokens per block for SWA
+    token_stride: int,  # bytes per token (use SWA token stride)
+    # Optional compressed arguments (for compress_ratio > 1)
     block_table_compressed: torch.Tensor | None = None,
-        compressed_local_indices: torch.Tensor | None = None,
-        compress_pool_base_ptr: int = 0,  # int64: base address of compress pool
-        compressed_buffer_ptr: int = 0,
-        compress_ratio: int = 1,
-        num_compressed_indices: int = 0,  # max number of compressed indices
-        split_extra: bool = False,
+    compressed_local_indices: torch.Tensor | None = None,
+    compress_pool_base_ptr: int = 0,  # int64: base address of compress pool
+    compressed_buffer_ptr: int = 0,
+    compress_ratio: int = 1,
+    num_compressed_indices: int = 0,  # max number of compressed indices
+    split_extra: bool = False,
 ) -> torch.Tensor | Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """
     Convert local token indices to global KV cache pool indices.

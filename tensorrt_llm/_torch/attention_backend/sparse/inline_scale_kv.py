@@ -99,9 +99,7 @@ def _quant_scatter_kernel(
 
             y_s = tl.max(tl.abs(x)) / FP8_MAX
             y_s_inv = 1.0 / y_s
-            x_fp8 = tl.clamp(x * y_s_inv, FP8_MIN, FP8_MAX).to(
-                pool_fp8_ptr.dtype.element_ty
-            )
+            x_fp8 = tl.clamp(x * y_s_inv, FP8_MIN, FP8_MAX).to(pool_fp8_ptr.dtype.element_ty)
 
             tile_out_offsets = row_base + tile_id * TILE + tile_range
             tl.store(pool_fp8_ptr + tile_out_offsets, x_fp8)
