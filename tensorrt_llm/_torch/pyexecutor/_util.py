@@ -317,6 +317,8 @@ class KvCacheCreator:
         self._kv_cache_config = kv_cache_config
         self._max_kv_tokens_in = self._kv_cache_config.max_tokens
         self._max_gpu_total_bytes_in = self._kv_cache_config.max_gpu_total_bytes
+        self._pool_ratio_in = self._kv_cache_config.pool_ratio
+        self._avg_seq_len_in = self._kv_cache_config.avg_seq_len
         self._max_num_tokens = max_num_tokens
         self._max_beam_width = max_beam_width
         self._kv_connector_manager = kv_connector_manager
@@ -750,6 +752,11 @@ class KvCacheCreator:
             max_tokens = min(
                 estimate_max_tokens, self._kv_cache_config.max_tokens
             ) if self._kv_cache_config.max_tokens is not None else estimate_max_tokens
+            # User-provided pool sizing can underprovision the temporary
+            # estimation cache and cause warmup to hang or fail. Override it
+            # for estimation, then restore it in configure_kv_cache_capacity().
+            self._kv_cache_config.pool_ratio = None
+            self._kv_cache_config.avg_seq_len = self._max_seq_len
             if self._is_kv_cache_manager_v2:
                 free_mem, _ = torch.cuda.mem_get_info()
                 max_gpu_total_bytes = int(
@@ -873,6 +880,11 @@ class KvCacheCreator:
         kv_cache_max_memory = self._cal_max_memory(peak_memory,
                                                    total_gpu_memory, fraction,
                                                    allocated_bytes)
+
+        # Estimation uses inferred pool sizing; the final manager uses the
+        # user-provided configuration.
+        self._kv_cache_config.pool_ratio = self._pool_ratio_in
+        self._kv_cache_config.avg_seq_len = self._avg_seq_len_in
 
         # NOTE:
         # For KVCacheManager, KvCacheCreator currently controls capacity using two parameters in KVCacheConfig:
@@ -1814,6 +1826,7 @@ def _create_kv_cache_manager(
             dtype=kv_cache_dtype,
             spec_config=spec_config,
             vocab_size=config.vocab_size,
+            max_num_tokens=max_num_tokens,
             max_beam_width=max_beam_width,
             is_draft=is_draft,
             kv_connector_manager=kv_connector_manager

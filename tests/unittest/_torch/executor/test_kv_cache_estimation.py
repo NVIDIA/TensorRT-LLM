@@ -477,3 +477,134 @@ def test_kv_manager_int_max_seq_len_stays_int_through_util_expression():
         "Sanity check: the pre-fix float path must still be demonstrable "
         "in the test, otherwise this regression guard is hollow."
     )
+
+
+# ---------------------------------------------------------------------------
+# _create_kv_cache_manager: MLA branch must forward max_num_tokens
+# ---------------------------------------------------------------------------
+
+
+def test_mla_branch_forwards_max_num_tokens_to_manager() -> None:
+    """The is_mla branch of ``_create_kv_cache_manager`` must pass
+    ``max_num_tokens`` to the manager, like the generic branch does.
+
+    Regression guard: when the argument is dropped,
+    ``DeepseekV4CacheManager._max_num_tokens`` stays ``None`` and the
+    profiling-phase context extra quota is sized by the full ``max_tokens``
+    estimate instead of the runtime chunk size (observed as a 27.59 GiB vs
+    11.92 GiB temp-quota inflation on DeepSeek-V4-Pro, raising peak memory
+    and OOM risk during KV cache estimation).
+    """
+    import torch
+
+    from tensorrt_llm._torch.pyexecutor._util import _create_kv_cache_manager
+
+    captured_kwargs = {}
+
+    class _RecordingManager:
+        def __init__(self, *args, **kwargs) -> None:
+            captured_kwargs.update(kwargs)
+
+    # Minimal MLA pretrained config: is_mla() keys on kv_lora_rank and
+    # qk_rope_head_dim being set.
+    pretrained = SimpleNamespace(
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+        hidden_size=1024,
+        num_attention_heads=8,
+        num_key_value_heads=8,
+        num_hidden_layers=2,
+        vocab_size=32000,
+    )
+    model_config = Mock()
+    model_config.pretrained_config = pretrained
+    model_config.quant_config = None
+
+    _create_kv_cache_manager(
+        model_engine=None,
+        kv_cache_manager_cls=_RecordingManager,
+        mapping=Mock(),
+        kv_cache_config=KvCacheConfig(),
+        tokens_per_block=32,
+        max_seq_len=2048,
+        max_batch_size=8,
+        spec_config=None,
+        sparse_attention_config=None,
+        max_num_tokens=333,
+        max_beam_width=1,
+        kv_connector_manager=None,
+        model_config=model_config,
+        dtype=torch.bfloat16,
+        is_draft=False,
+    )
+
+    assert captured_kwargs.get("max_num_tokens") == 333, (
+        "is_mla branch dropped max_num_tokens: DeepseekV4CacheManager then "
+        "falls back to _max_num_tokens=None and over-sizes the estimation "
+        "temp quota."
+    )
+
+
+def test_estimation_temporarily_uses_inferred_pool_sizing() -> None:
+    import torch
+
+    pool_ratio = [0.2, 0.3, 0.5]
+    avg_seq_len = 128
+    max_seq_len = 4096
+    user_max_tokens = 1024
+    estimation_max_tokens = 256
+    kv_cache_config = KvCacheConfig(
+        max_tokens=user_max_tokens,
+        pool_ratio=pool_ratio,
+        avg_seq_len=avg_seq_len,
+    )
+    model_engine = Mock()
+    model_engine.model.model_config.attn_backend = "TRTLLM"
+    llm_args = Mock(cache_transceiver_config=None)
+
+    with patch.object(
+        KvCacheCreator,
+        "_get_model_kv_cache_manager_cls",
+        return_value=KVCacheManagerV2,
+    ):
+        creator = KvCacheCreator(
+            model_engine=model_engine,
+            draft_model_engine=None,
+            mapping=Mock(cp_config={}),
+            net_max_seq_len=max_seq_len,
+            kv_connector_manager=None,
+            max_num_tokens=256,
+            max_beam_width=1,
+            tokens_per_block=128,
+            max_seq_len=max_seq_len,
+            max_batch_size=8,
+            kv_cache_config=kv_cache_config,
+            llm_args=llm_args,
+            speculative_config=None,
+            sparse_attention_config=None,
+            profiling_stage_data=None,
+            is_disagg=False,
+        )
+
+    with (
+        patch.object(
+            creator,
+            "_get_token_num_for_estimation",
+            return_value=estimation_max_tokens,
+        ),
+        patch.object(creator, "_cal_max_memory", return_value=512),
+        patch.object(torch.cuda, "mem_get_info", return_value=(768, 1024)),
+        patch.object(torch.cuda, "memory_stats", return_value={"allocated_bytes.all.current": 128}),
+        patch.object(torch.cuda, "empty_cache"),
+        patch.object(torch.cuda, "reset_peak_memory_stats"),
+    ):
+        assert creator.try_prepare_estimation()
+        assert kv_cache_config.max_tokens == estimation_max_tokens
+        assert kv_cache_config.pool_ratio is None
+        assert kv_cache_config.avg_seq_len == max_seq_len
+
+        creator.configure_kv_cache_capacity()
+
+    assert kv_cache_config.max_tokens == user_max_tokens
+    assert kv_cache_config.pool_ratio == pool_ratio
+    assert kv_cache_config.avg_seq_len == avg_seq_len
