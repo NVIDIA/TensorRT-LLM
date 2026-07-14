@@ -235,7 +235,6 @@ full:B300/accuracy/test_llm_api_pytorch.py::TestDeepSeekV32::test_nvfp4_multi_gp
 full:B300/accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16[mtp_nextn=2-attention_dp=True-cuda_graph=True-overlap_scheduler=True-torch_compile=True-enable_chunked_prefill=True-v2_kv_cache=True] SKIP (https://nvbugs/6422343)
 full:B300/accuracy/test_llm_api_pytorch.py::TestMiniMaxM3::test_auto_dtype[tp_size=8-ep_size=8] SKIP (https://nvbugs/6445375)
 full:B300/accuracy/test_llm_api_pytorch.py::TestMiniMaxM3::test_mxfp8[tp_size=4-ep_size=4] SKIP (https://nvbugs/6424188)
-full:B300/accuracy/test_llm_api_pytorch.py::TestMiniMaxM3::test_mxfp8_piecewise_cuda_graph[tp_size=8-ep_size=8] SKIP (https://nvbugs/6442594)
 full:B300/accuracy/test_llm_api_pytorch.py::TestMiniMaxM3::test_nvfp4[tp_size=4-ep_size=4] SKIP (https://nvbugs/6445375)
 full:B300/accuracy/test_llm_api_pytorch_multimodal.py::TestExaone4_5_33B::test_auto_dtype[forced_chunked_prefill] SKIP (https://nvbugs/6422318)
 full:B300/accuracy/test_llm_api_pytorch_multimodal.py::TestExaone4_5_33B::test_auto_dtype[full_budget] SKIP (https://nvbugs/6422318)
