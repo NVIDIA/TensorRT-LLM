@@ -22,6 +22,7 @@ cover:
 - ADP dummy suppression during fill vs taper-down
 - ADP router imbalance regression (nvbug 6071070)
 - Non-blocking behaviour of `_prepare_and_schedule_batch`
+- Insufficient-KV fail-fast vs transfer-admission backpressure
 """
 
 from unittest.mock import Mock, patch
@@ -43,6 +44,7 @@ def _make_active_request(
 ) -> Mock:
     """Create an active request stub with disagg state flags."""
     req = Mock()
+    req.state_value = LlmRequestState.GENERATION_IN_PROGRESS.value
     req.is_disagg_generation_init_state = in_init
     req.is_disagg_generation_transmission_in_progress = in_transfer
     req.state = (
@@ -100,6 +102,8 @@ class MockBenchmarkExecutor:
 
     from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 
+    _dist_size = staticmethod(PyExecutor._dist_size)
+    _allgather_model_parallel_status = PyExecutor._allgather_model_parallel_status
     _is_benchmark_disagg_fill_complete = PyExecutor._is_benchmark_disagg_fill_complete
     _check_benchmark_disagg_gate = PyExecutor._check_benchmark_disagg_gate
 
@@ -227,7 +231,8 @@ class TestFillCompleteADP:
         ex._is_benchmark_disagg_fill_complete(ScheduledRequests())
         ex.dist.tp_allgather.assert_called_once_with((1, False))
 
-    def test_no_allgather_without_adp(self):
+    def test_single_rank_skips_model_parallel_allgather(self):
+        """A singleton group returns local status without a collective."""
         reqs = [_make_active_request() for _ in range(4)]
         ex = MockBenchmarkExecutor(
             benchmark_req_queues_size=4,
@@ -236,8 +241,12 @@ class TestFillCompleteADP:
             num_fetch_requests=4,
             active_requests=reqs,
         )
+        ex.dist.tp_size = 1
+        ex.dist.cp_size = 1
+        ex.dist.world_size = 1
         ex._is_benchmark_disagg_fill_complete(ScheduledRequests())
         ex.dist.tp_allgather.assert_not_called()
+        ex.dist.tp_cp_allgather.assert_not_called()
 
 
 class TestFillCompleteADPRouterImbalance:
@@ -392,6 +401,52 @@ class TestCheckBenchmarkDisaggGate:
         mock_time.sleep.assert_not_called()
 
     @pytest.mark.parametrize(
+        "enable_attention_dp, tp_size, cp_size, gather_name",
+        [
+            pytest.param(False, 2, 1, "tp_allgather", id="tensor_parallel"),
+            pytest.param(False, 1, 2, "tp_cp_allgather", id="context_parallel"),
+            pytest.param(True, 2, 2, "tp_cp_allgather", id="attention_dp_with_cp"),
+        ],
+    )
+    def test_gate_waits_for_blocked_model_parallel_peer(
+        self, enable_attention_dp, tp_size, cp_size, gather_name
+    ):
+        """A ready local slice cannot open the gate ahead of a peer.
+
+        Args:
+            enable_attention_dp: Whether to simulate attention data parallelism.
+            tp_size: Tensor-parallel group size.
+            cp_size: Context-parallel group size.
+            gather_name: Expected model-parallel allgather method.
+        """
+        reqs = [_make_active_request() for _ in range(4)]
+        ex = MockBenchmarkExecutor(
+            benchmark_req_queues_size=4,
+            kv_cache_transceiver=_make_transceiver(transfer_complete=True),
+            enable_attention_dp=enable_attention_dp,
+            tp_size=tp_size,
+            num_fetch_requests=4,
+            active_requests=reqs,
+        )
+        ex.dist.cp_size = cp_size
+        ex.dist.world_size = tp_size * cp_size
+        all_rank_status = [(1, False)] * (tp_size * cp_size)
+        all_rank_status[-1] = (0, False)
+        gather = getattr(ex.dist, gather_name)
+        gather.return_value = all_rank_status
+
+        with patch("tensorrt_llm._torch.pyexecutor.py_executor.time") as mock_time:
+            can_forward, should_retry = ex._check_benchmark_disagg_gate(ScheduledRequests(), False)
+
+        assert can_forward is False
+        assert should_retry is True
+        assert ex._benchmark_fill_phase_active is True
+        gather.assert_called_once_with((1, False))
+        if gather_name == "tp_cp_allgather":
+            ex.dist.tp_allgather.assert_not_called()
+        mock_time.sleep.assert_called_once_with(0.1)
+
+    @pytest.mark.parametrize(
         "is_warmup, can_forward_in",
         [
             pytest.param(True, False, id="warmup_bypasses_gate"),
@@ -454,12 +509,17 @@ class MockPadDummyExecutor:
         self.benchmark_req_queues_size = benchmark_req_queues_size
         self.max_total_draft_tokens = 0
         self._adp_dummy_is_gen = True
+        self._pending_adp_dummy_request = None
+        self._enable_dsv4_adp_dummy_fixes = True
         self.max_num_tokens = None
 
         self.dist = Mock()
         self.dist.tp_size = tp_size
+        self.dist.tp_allgather.side_effect = lambda value: [value]
 
         self.kv_cache_manager = Mock()
+        self.kv_cache_manager.mapping.has_cp_helix.return_value = False
+        self.kv_cache_manager.get_num_available_tokens.return_value = 1 << 30
         dummy_req = Mock()
         dummy_req.is_attention_dp_dummy = True
         self.kv_cache_manager.add_dummy_requests.return_value = [dummy_req]
@@ -471,6 +531,7 @@ class MockPadDummyExecutor:
 
     _pad_attention_dp_dummy_request = PyExecutor._pad_attention_dp_dummy_request
     _count_schedulable_active_requests = PyExecutor._count_schedulable_active_requests
+    _has_adp_dummy_kv_capacity = PyExecutor._has_adp_dummy_kv_capacity
     _should_skip_dummy_for_benchmark_disagg = PyExecutor._should_skip_dummy_for_benchmark_disagg
 
 
@@ -957,7 +1018,7 @@ class TestFailFastDuringBenchmarkFill:
         ex._fill_admit_cap = 0
         ex.enable_attention_dp = False
         ex.num_fetch_requests = num_fetch_requests
-        ex.dist = Mock(rank=0, tp_size=1)
+        ex.dist = Mock(rank=0, tp_size=1, cp_size=1, world_size=1)
         ex.dist.allreduce.return_value = 0
         ex.is_shutdown = False
         ex._is_warmup = False
@@ -976,6 +1037,7 @@ class TestFailFastDuringBenchmarkFill:
         ex._fetch_and_activate_new_requests = Mock(return_value=[])
         ex._check_disagg_ctx_schedulable_status = Mock()
         ex._check_disagg_gen_transfer_status = Mock()
+        ex._check_disagg_gen_cache_transfer_status = Mock()
         ex._check_kv_transfer_timeout = Mock()
         ex._check_disagg_ctx_cache_transfer_status = Mock()
         ex._pad_attention_dp_dummy_request = Mock()
@@ -1014,6 +1076,137 @@ class TestFailFastDuringBenchmarkFill:
         )
         ex._handle_errors.assert_not_called()
 
+    def test_partial_transfer_admission_uses_only_admitted_requests(self):
+        """The admitted subset is prepared and passed to the idle check."""
+        admitted_req = _make_active_request(in_init=True)
+        deferred_req = _make_active_request(in_init=True)
+        candidates = [admitted_req, deferred_req]
+        ex = self._make_executor(fill_phase_active=True, fitting_init_requests=candidates)
+        ex._apply_disagg_transfer_admission = Mock(return_value=([admitted_req], False))
+        ex._check_disagg_transfer_progress_when_idle = Mock()
+
+        result, _ = ex._prepare_and_schedule_batch()
+
+        assert result is not None
+        ex._apply_disagg_transfer_admission.assert_called_once_with(candidates)
+        ex._prepare_disagg_gen_init.assert_called_once_with([admitted_req])
+        ex._check_disagg_transfer_progress_when_idle.assert_called_once_with(
+            0, [admitted_req], False, False
+        )
+        ex._handle_errors.assert_not_called()
+
+    def test_fill_with_no_init_requests_does_not_kill(self):
+        """The final fill iteration is ready for the gate, not terminal."""
+        ex = self._make_executor(fill_phase_active=True, num_init_requests=0)
+
+        result, _ = ex._prepare_and_schedule_batch()
+
+        assert result is not None
+        ex._handle_errors.assert_not_called()
+
+    def test_transfer_admission_backpressure_does_not_kill(self, monkeypatch):
+        """NVBug 6438658: admission backpressure is not KV exhaustion.
+
+        Args:
+            monkeypatch: Pytest fixture used to select asynchronous transfer
+                behavior.
+        """
+        monkeypatch.delenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY", raising=False)
+        monkeypatch.delenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP", raising=False)
+        fitting_req = _make_active_request(in_init=True)
+        ex = self._make_executor(fill_phase_active=True, fitting_init_requests=[fitting_req])
+        ex._apply_disagg_transfer_admission = Mock(return_value=([], True))
+
+        result, _ = ex._prepare_and_schedule_batch()
+
+        assert result is not None, (
+            "Fail-fast should NOT fire when the scheduler fit an INIT request "
+            "that transfer admission temporarily deferred"
+        )
+        ex._apply_disagg_transfer_admission.assert_called_once_with([fitting_req])
+        ex._prepare_disagg_gen_init.assert_called_once_with([])
+        ex._check_disagg_gen_cache_transfer_status.assert_called_once_with(1)
+        ex._check_disagg_ctx_cache_transfer_status.assert_not_called()
+        ex._handle_errors.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "enable_attention_dp, tp_size, cp_size, gather_name",
+        [
+            pytest.param(False, 2, 1, "tp_allgather", id="tensor_parallel"),
+            pytest.param(False, 1, 2, "tp_cp_allgather", id="context_parallel"),
+            pytest.param(True, 2, 2, "tp_cp_allgather", id="attention_dp_with_cp"),
+        ],
+    )
+    def test_model_parallel_peer_terminal_no_fit_kills_all_ranks(
+        self, enable_attention_dp, tp_size, cp_size, gather_name
+    ):
+        """A terminal peer makes every model-parallel rank fail together.
+
+        Args:
+            enable_attention_dp: Whether to simulate attention data parallelism.
+            tp_size: Tensor-parallel group size.
+            cp_size: Context-parallel group size.
+            gather_name: Expected model-parallel allgather method.
+        """
+        fitting_req = _make_active_request(in_init=True)
+        ex = self._make_executor(fill_phase_active=True, fitting_init_requests=[fitting_req])
+        ex.enable_attention_dp = enable_attention_dp
+        ex.dist.tp_size = tp_size
+        ex.dist.cp_size = cp_size
+        ex.dist.world_size = tp_size * cp_size
+        all_rank_status = [(True, False)] * (tp_size * cp_size)
+        all_rank_status[-1] = (True, True)
+        gather = getattr(ex.dist, gather_name)
+        gather.return_value = all_rank_status
+        ex._apply_disagg_transfer_admission = Mock(return_value=([], True))
+        ex._check_disagg_transfer_progress_when_idle = Mock()
+
+        result, _ = ex._prepare_and_schedule_batch()
+
+        assert result is None
+        gather.assert_called_once_with((True, False))
+        if gather_name == "tp_cp_allgather":
+            ex.dist.tp_allgather.assert_not_called()
+        ex._handle_errors.assert_called_once()
+        assert "one or more requests" in ex._handle_errors.call_args.args[0]
+
+    def test_attention_dp_backpressure_without_terminal_peer_does_not_kill(self):
+        """Admission backpressure stays non-terminal on every rank."""
+        fitting_req = _make_active_request(in_init=True)
+        ex = self._make_executor(fill_phase_active=True, fitting_init_requests=[fitting_req])
+        ex.enable_attention_dp = True
+        ex.dist.tp_size = 2
+        ex.dist.world_size = 2
+        ex.dist.tp_allgather.return_value = [
+            (True, False),
+            (True, False),
+        ]
+        ex._apply_disagg_transfer_admission = Mock(return_value=([], True))
+        ex._check_disagg_transfer_progress_when_idle = Mock()
+
+        result, _ = ex._prepare_and_schedule_batch()
+
+        assert result is not None
+        ex.dist.tp_allgather.assert_called_once_with((True, False))
+        ex._handle_errors.assert_not_called()
+
+    def test_model_parallel_waits_until_all_ranks_have_fetched(self):
+        """A terminal rank cannot fail peers that are still fetching."""
+        ex = self._make_executor(fill_phase_active=True)
+        ex.dist.tp_size = 2
+        ex.dist.world_size = 2
+        ex.dist.tp_allgather.return_value = [
+            (True, True),
+            (False, False),
+        ]
+        ex._check_disagg_transfer_progress_when_idle = Mock()
+
+        result, _ = ex._prepare_and_schedule_batch()
+
+        assert result is not None
+        ex.dist.tp_allgather.assert_called_once_with((True, True))
+        ex._handle_errors.assert_not_called()
+
     def test_mid_fetch_does_not_kill(self):
         """Before all benchmark requests are fetched, keep filling."""
         ex = self._make_executor(fill_phase_active=True, num_fetch_requests=4)
@@ -1025,23 +1218,25 @@ class TestFailFastDuringBenchmarkFill:
         )
         ex._handle_errors.assert_not_called()
 
-    def test_kills_after_fill_phase(self):
-        """After fill phase completes, stuck INIT requests trigger fail-fast."""
+    def test_post_fill_skips_fail_fast_vote(self):
+        """Decode iterations must not pay for the fill-only collective."""
         ex = self._make_executor(fill_phase_active=False)
+        ex.enable_attention_dp = True
+        ex.dist.tp_size = 2
+        ex.dist.world_size = 2
+        ex._check_disagg_transfer_progress_when_idle = Mock()
 
         result, _ = ex._prepare_and_schedule_batch()
 
-        assert result is None, (
-            "Fail-fast SHOULD fire after fill phase — "
-            "stuck INIT requests indicate genuine KV insufficiency"
-        )
-        ex._handle_errors.assert_called_once()
+        assert result is not None
+        ex.dist.tp_allgather.assert_not_called()
+        ex._handle_errors.assert_not_called()
 
     @pytest.mark.parametrize(
         "fill_active, is_warmup, expected_alive",
         [
             pytest.param(True, False, False, id="stalled_fill_kills"),
-            pytest.param(False, False, False, id="post_fill_kills"),
+            pytest.param(False, False, True, id="post_fill_suppresses"),
             pytest.param(False, True, True, id="warmup_suppresses"),
             pytest.param(True, True, True, id="both_suppress"),
         ],
@@ -1080,7 +1275,7 @@ class TestFillPhaseEndToEnd:
     3. Scheduler can't fit INIT requests
     4. Verify: fail-fast does NOT fire while scheduler fits INIT requests
     5. Transfers complete, gate opens, fill phase clears
-    6. Verify: fail-fast DOES fire if INIT requests remain after fill
+    6. Verify: the fill-only fail-fast vote stops after the gate opens
 
     This test catches all three bugs we found iteratively:
     - Bug 1: Count-based gate unsatisfiable under ADP router skew
@@ -1172,6 +1367,7 @@ class TestFillPhaseEndToEnd:
         # Phase 2b: Healthy fill keeps making progress, so fail-fast must not
         # fire even though some active requests remain in INIT.
         ex._schedule = Mock(return_value=(ScheduledRequests(), [init_reqs[0]], 0))
+        ex.dist.tp_allgather = Mock(return_value=[(True, False), (True, False)])
         result, _ = ex._prepare_and_schedule_batch()
         assert result is not None, (
             "Fail-fast must not kill requests while the scheduler can still fit INIT requests"
@@ -1190,16 +1386,13 @@ class TestFillPhaseEndToEnd:
         # Phase 4: Gate opens, fill phase clears
         ex._benchmark_fill_phase_active = False
 
-        # Phase 5: After fill, if new INIT requests appear and the scheduler
-        # cannot fit any of them, fail-fast fires.  Reset _schedule from
-        # Phase 2b's healthy-fill mock so it once again returns no fitting
-        # INIT requests, mirroring genuine insufficient-KV conditions.
+        # Phase 5: Decode iterations do not re-enter the fill-only vote.
         ex._schedule = Mock(return_value=(ScheduledRequests(), [], 0))
-        stuck_req = _make_active_request(in_init=True)
-        ex.active_requests = [stuck_req] + ready_reqs
+        ex.active_requests = ready_reqs
+        ex.dist.tp_allgather = Mock()
+        ex._check_disagg_transfer_progress_when_idle = Mock()
 
         result, _ = ex._prepare_and_schedule_batch()
-        assert result is None, (
-            "Fail-fast SHOULD fire after fill phase completes — "
-            "stuck INIT requests now indicate genuine KV insufficiency"
-        )
+        assert result is not None
+        ex.dist.tp_allgather.assert_not_called()
+        ex._handle_errors.assert_not_called()

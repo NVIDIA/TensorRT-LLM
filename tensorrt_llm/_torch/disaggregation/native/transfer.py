@@ -51,9 +51,8 @@ from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExt
 from tensorrt_llm._torch.disaggregation.resource.utils import get_unique_pool_memory_descs
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
-from tensorrt_llm._utils import nvtx_range
+from tensorrt_llm._utils import CUASSERT, nvtx_range
 from tensorrt_llm.disaggregated_params import DisaggregatedParams, DisaggScheduleStyle
-from tensorrt_llm.runtime.generation import CUASSERT
 
 if TYPE_CHECKING:
     from .bounce import Config

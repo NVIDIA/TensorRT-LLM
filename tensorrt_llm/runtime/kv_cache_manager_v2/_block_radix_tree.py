@@ -20,7 +20,16 @@ from typing import TYPE_CHECKING, Iterable, Iterator, NamedTuple, Sequence, Type
 from . import rawref
 from ._common import NDEBUG, BlockOrdinal, PageStatus, TokenId, TokenIdExt
 from ._life_cycle_registry import AttnLifeCycle, LifeCycle, LifeCycleId, LifeCycleRegistry
-from ._utils import TypedIndexList, chunked, div_up, filled_list, find_index, unwrap_rawref
+from ._utils import (
+    TypedIndexList,
+    chunked,
+    div_up,
+    expect_type,
+    filled_list,
+    find_index,
+    map_optional,
+    unwrap_rawref,
+)
 
 if TYPE_CHECKING:
     from ._event_manager import KVCacheEventManager
@@ -377,8 +386,13 @@ class Block:
     def prev(self) -> "Block | RootBlock":
         return unwrap_rawref(self._prev)
 
-    def unset_page(self, lc_idx: LifeCycleId, lc: LifeCycle) -> None:
-        if self.storage[lc_idx] is None:
+    def unset_page(
+        self, lc_idx: LifeCycleId, lc: LifeCycle, expected_page: "CommittedPage | None" = None
+    ) -> None:
+        ref = self.storage[lc_idx]
+        if ref is None:
+            return
+        if expected_page is not None and ref() is not expected_page:
             return
         ordinal = self.ordinal
         self.storage[lc_idx] = None
@@ -556,24 +570,32 @@ class BlockRadixTree:
             n = find_index(matched[: lc.num_sink_blocks], check_no_page_lc)
             if n < lc.num_sink_blocks:
                 matched = matched[:n]
-        # Check SWA window and SSM snapshot constraints together,
-        # since SSM truncation can invalidate SWA invariants.
-        # SSM is checked first (intervals are large, so it prunes more).
+        # Check SSM snapshot availability before SWA window constraints.
+        # Truncating to the last reusable SSM snapshot can change the matched
+        # length used by the SWA check.
         ssm_lc_id = life_cycles.ssm_life_cycle_id
+        if ssm_lc_id is not None:
+            from ._page import SsmCommittedPage
+
         while matched:
-            # SSM truncation: truncate to the last block with an SSM snapshot
             if ssm_lc_id is not None:
                 ssm_trunc = 0
+                ssm_match_len = 0
                 for i in reversed(range(len(matched))):
-                    if matched[i][0].storage[ssm_lc_id] is not None:
-                        assert NDEBUG or matched[i][1] == self._tokens_per_block, (
-                            "SSM reuse snapshot must only be selected from a fully matched block"
-                        )
+                    block = matched[i][0]
+                    page = map_optional(block.storage[ssm_lc_id], lambda f: f())
+                    if page is None:
+                        continue
+                    page = expect_type(SsmCommittedPage, page)
+                    snapshot_len = page.num_tokens_in_block
+                    if matched[i][1] >= snapshot_len:
                         ssm_trunc = i + 1
+                        ssm_match_len = snapshot_len
                         break
                 matched = matched[:ssm_trunc]
                 if not matched:
                     break
+                matched[-1] = (matched[-1][0], ssm_match_len)
             # SWA window check
             num_tokens = self._num_matched_tokens(matched)
             for lc_idx, lc in swa_life_cycles:

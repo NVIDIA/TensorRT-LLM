@@ -55,9 +55,9 @@ def rejection_sampling_one_model(
     offset: Optional[int] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     # chain_speculative_sampling requires flashinfer>=0.6.4. This entry point can
-    # be reached independently of SpecWorkerBase.__init__'s use_flashinfer gate
-    # (e.g. via _can_use_rejection_sampling), so re-check the version here to fail
-    # with a clear message instead of a cryptic flashinfer error.
+    # be reached independently of SpecWorkerBase.__init__ (e.g. via
+    # _can_use_rejection_sampling), so re-check here to fail with a clear message
+    # instead of a cryptic flashinfer error.
     if not IS_FLASHINFER_AVAILABLE or Version(
             flashinfer.__version__) < Version("0.6.4"):
         raise RuntimeError(
@@ -533,10 +533,16 @@ class SpecMetadata:
     use_sampling_params_for_draft_tokens: bool = False
     # Vocab size used for draft_probs buffer allocation.
     vocab_size: int = 0
+    # Size of the SeqSlotManager pool. py_seq_slot values range over
+    # [0, num_seq_slots); DeepSeek-V4 overlap can use 2 * max_batch_size,
+    # larger than max_num_requests (== max_batch_size).
+    # Slot-indexed buffers (draft_probs) must span this full range.
+    # 0 falls back to max_num_requests.
+    num_seq_slots: int = 0
     # Draft probabilities buffer for rejection sampling, indexed by py_seq_slot
     # so per-request data is stable across iterations regardless of batch
     # composition shifts (chunking ctx, gen completion, new ctx joining).
-    # Shape: [max_num_requests, max_draft_len, vocab_size].
+    # Shape: [num_seq_slots, max_draft_len, vocab_size].
     draft_probs: Optional[torch.Tensor] = None
     draft_probs_vocab_size: int = 0
     # Whether draft_probs contains valid data.
@@ -573,8 +579,9 @@ class SpecMetadata:
                 and self.vocab_size > 0):
             # 3D [slot, draft_step, vocab] so we can scatter/gather by slot id
             # and avoid the brittle "batch position == buffer position" mapping.
+            slot_capacity = self.num_seq_slots or self.max_num_requests
             self.draft_probs = torch.empty(
-                (self.max_num_requests, self.max_draft_len, self.vocab_size),
+                (slot_capacity, self.max_draft_len, self.vocab_size),
                 dtype=torch.float32,
                 device='cuda')
             self.draft_probs_vocab_size = self.vocab_size
@@ -898,8 +905,15 @@ class SpecWorkerBase(nn.Module, ABC):
         self.guided_decoder: Optional["CapturableGuidedDecoder"] = None
         self.force_num_accepted_tokens: float = get_force_num_accepted_tokens_float(
         )
-        self.use_flashinfer = IS_FLASHINFER_AVAILABLE and Version(
-            flashinfer.__version__) >= Version("0.6.4")
+        # One-model speculative sampling goes through flashinfer unconditionally
+        # (sampling_batch_spec_dec_one_model), so flashinfer>=0.6.4 is a hard
+        # dependency here. Fail at construction with a clear error instead of
+        # crashing mid-inference on the first non-greedy sampling step.
+        if not IS_FLASHINFER_AVAILABLE or Version(
+                flashinfer.__version__) < Version("0.6.4"):
+            raise ImportError(
+                "Speculative decoding requires flashinfer>=0.6.4, please install "
+                "the version pinned in requirements.txt.")
         self.seed: Optional[torch.Tensor] = None
         self.offset: Optional[torch.Tensor] = None
         self.use_separate_draft_kv_cache = use_separate_draft_kv_cache
@@ -1454,16 +1468,15 @@ class SpecWorkerBase(nn.Module, ABC):
         top_ks = spec_metadata.request_top_ks[:batch_size]
         top_ps = spec_metadata.request_top_ps[:batch_size]
 
-        if self.use_flashinfer:
-            if self.seed is None:
-                self.seed = torch.tensor([0],
-                                         dtype=torch.int64,
-                                         device=logits.device)
-                self.offset = torch.tensor([0],
-                                           dtype=torch.int64,
-                                           device=logits.device)
-            self.seed += 1
-            self.seed %= (2**31)
+        if self.seed is None:
+            self.seed = torch.tensor([0],
+                                     dtype=torch.int64,
+                                     device=logits.device)
+            self.offset = torch.tensor([0],
+                                       dtype=torch.int64,
+                                       device=logits.device)
+        self.seed += 1
+        self.seed %= (2**31)
 
         draft_tokens = sampling_batch_spec_dec_one_model(logits,
                                                          temperatures,
@@ -1687,17 +1700,16 @@ class SpecWorkerBase(nn.Module, ABC):
             top_ks = spec_metadata.top_ks[:num_tokens]
             top_ps = spec_metadata.top_ps[:num_tokens]
 
-            if self.use_flashinfer:
-                # Lazily initialize seed/offset tensors on correct device
-                if self.seed is None:
-                    self.seed = torch.tensor([0],
-                                             dtype=torch.int64,
-                                             device=logits.device)
-                    self.offset = torch.tensor([0],
-                                               dtype=torch.int64,
-                                               device=logits.device)
-                self.seed += 1
-                self.seed %= (2**31)
+            # Lazily initialize seed/offset tensors on correct device
+            if self.seed is None:
+                self.seed = torch.tensor([0],
+                                         dtype=torch.int64,
+                                         device=logits.device)
+                self.offset = torch.tensor([0],
+                                           dtype=torch.int64,
+                                           device=logits.device)
+            self.seed += 1
+            self.seed %= (2**31)
 
             sampled_tokens = sampling_batch_spec_dec_one_model(
                 logits,
