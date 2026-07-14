@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import dataclasses
 import datetime
 import functools
@@ -22,9 +25,10 @@ try:
 except ImportError:
     from cuda import cudart
 
-from tensorrt_llm._utils import (customized_gc_thresholds, is_trace_enabled,
-                                 mpi_comm, mpi_disabled, nvtx_range,
-                                 set_thread_local_mpi_comm, trace_func)
+from tensorrt_llm._utils import (CUASSERT, customized_gc_thresholds,
+                                 is_trace_enabled, mpi_comm, mpi_disabled,
+                                 nvtx_range, set_thread_local_mpi_comm,
+                                 trace_func)
 from tensorrt_llm.bindings.executor import (DisServingRequestStats,
                                             FinishReason, InflightBatchingStats,
                                             IterationStats, KvCacheStats,
@@ -38,7 +42,6 @@ from tensorrt_llm.inputs.multimodal import strip_mm_data_for_generation
 from tensorrt_llm.llmapi.llm_args import PeftCacheConfig, WaitingQueuePolicy
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import CpType
-from tensorrt_llm.runtime.generation import CUASSERT
 from tensorrt_llm.runtime.kv_cache_manager_v2._exceptions import OutOfPagesError
 from tensorrt_llm.tools.layer_wise_benchmarks import get_calibrator
 from tensorrt_llm.tools.profiler.host_profile_tools.host_profiler import (
@@ -78,8 +81,8 @@ from .perf_metrics_manager import PerfMetricsManager
 from .request_utils import (RequestBroadcaster, attach_py_objects_to_requests,
                             derive_attention_dp_per_rank_request_cap,
                             get_from_waiting_queue, merge_requests)
-from .resource_manager import (ResourceManager, ResourceManagerType,
-                               request_context)
+from .resource_manager import (NoFreeSlotsError, ResourceManager,
+                               ResourceManagerType, request_context)
 from .sampler import (AsyncWorkerMixin, Sampler, SamplerEvent, SampleState,
                       SampleStateTensors, TRTLLMSampler)
 from .scheduler import (RequestScheduler, ScheduledRequests,
@@ -562,6 +565,8 @@ class PyExecutor:
         self.resource_manager = resource_manager
         self.scheduler = scheduler
         self.model_engine = model_engine
+        self._enable_dsv4_adp_dummy_fixes = getattr(
+            model_engine, "_enable_dsv4_adp_dummy_fixes", False)
         self.enable_attention_dp = model_engine.enable_attention_dp
         self.dist = dist
         self.sampler = sampler
@@ -706,6 +711,10 @@ class PyExecutor:
         # ADP dummy role for _pad_attention_dp_dummy_request. Default is gen;
         # updated from observed request types.
         self._adp_dummy_is_gen: bool = True
+        # Dummy allocated by the current scheduling iteration. It is committed
+        # to the normal forward/termination lifecycle only after every ADP rank
+        # can queue; otherwise only this exact allocation is rolled back.
+        self._pending_adp_dummy_request: Optional[LlmRequest] = None
         self.async_transfer_manager = AsyncTransferManager(
             self.resource_manager,
             should_store_blocks=self.enable_disagg_partial_reuse_store)
@@ -1636,8 +1645,16 @@ class PyExecutor:
                     logger.info(
                         f"Profiling stopped at iteration {self.iter_counter}, "
                         f"trace saved to {torch_trace_path}")
-                torch.cuda.cudart().cudaProfilerStop()
+                # Persist calibration data and quiesce the device before
+                # cudaProfilerStop(): profiling tools may stop collecting or
+                # even end the process (e.g. nsys with
+                # --capture-range-end=stop-shutdown) as soon as the capture
+                # range closes, so the calibration file dump must happen
+                # before the stop, and the capture should end on an idle
+                # device with no in-flight async copies.
                 calibrator.stop()
+                torch.cuda.synchronize()
+                torch.cuda.cudart().cudaProfilerStop()
                 enabled = False
 
             # Capture per-loop timing whenever stats or the iter log are
@@ -1732,8 +1749,10 @@ class PyExecutor:
                     torch_profiler.export_chrome_trace(torch_trace_path)
                     logger.info(f"Profiling stopped at iteration {it}, "
                                 f"trace saved to {torch_trace_path}")
-                torch.cuda.cudart().cudaProfilerStop()
+                # See the ordering rationale at the in-loop cudaProfilerStop().
                 calibrator.stop()
+                torch.cuda.synchronize()
+                torch.cuda.cudart().cudaProfilerStop()
 
     def _get_init_iter_stats(self, num_new_active_requests,
                              new_active_requests_queue_latency_ms):
@@ -2555,6 +2574,7 @@ class PyExecutor:
                 can_queue, _ = self._can_queue(scheduled_batch)
                 if not can_queue:
                     self._revert_gen_alloc(scheduled_batch)
+                if not can_queue:
                     logger.debug(
                         f"microbatch {microbatch_id} cannot be queued, skipping"
                     )
@@ -3246,6 +3266,40 @@ class PyExecutor:
             for req in scheduled_batch.generation_requests:
                 self.kv_cache_manager.revert_allocate_generation(req)
 
+    def _finalize_adp_dummy_allocation(self, can_queue: bool) -> None:
+        """Commit or roll back this iteration's tentative ADP dummy.
+
+        Dummy allocation is rank-local, while ``can_queue`` is a TP-wide
+        decision. If one rank cannot allocate its dummy, peers that succeeded
+        must release theirs before retrying or the fixed dummy request ID leaks
+        cache resources on every skipped iteration.
+        """
+        if not self._enable_dsv4_adp_dummy_fixes:
+            return
+
+        dummy_request = self._pending_adp_dummy_request
+        self._pending_adp_dummy_request = None
+        if dummy_request is None or can_queue:
+            return
+
+        dummy_request.state = LlmRequestState.GENERATION_COMPLETE
+        if getattr(dummy_request, "py_seq_slot", None) is not None:
+            # Full resource preparation already ran before a connector changed
+            # the final queue decision. Every manager can use normal teardown.
+            self._terminate_request(dummy_request)
+            self.active_requests.remove(dummy_request)
+            return
+
+        # Before prepare_resources(), only the KV and speculative managers have
+        # allocated anything for the dummy. Do not run the full teardown path:
+        # other resource managers may require a prior prepare call.
+        spec_resource_manager = self.resource_manager.get_resource_manager(
+            ResourceManagerType.SPEC_RESOURCE_MANAGER)
+        if spec_resource_manager is not None:
+            spec_resource_manager.free_resources(dummy_request)
+        self.kv_cache_manager.free_resources(dummy_request)
+        self.active_requests.remove(dummy_request)
+
     def _revert_ctx_alloc(self, dropped_context_requests):
         """Revert V2 context KV growth for requests deferred after scheduling."""
         for req in dropped_context_requests:
@@ -3860,6 +3914,7 @@ class PyExecutor:
                         for req in scheduled_batch.generation_requests:
                             self.kv_cache_manager.revert_allocate_generation(
                                 req)
+                    self._finalize_adp_dummy_allocation(False)
                     continue
 
                 if not self._is_kv_manager_v2:
@@ -3909,6 +3964,7 @@ class PyExecutor:
 
                 if not can_queue:
                     self._revert_gen_alloc(scheduled_batch)
+                self._finalize_adp_dummy_allocation(can_queue)
 
                 if can_queue:
                     # init_disagg_gen_requests must be before drafter loop, otherwise draft requests do not have initialized matchers.
@@ -4334,6 +4390,7 @@ class PyExecutor:
                         for req in scheduled_batch.generation_requests:
                             self.kv_cache_manager.revert_allocate_generation(
                                 req)
+                    self._finalize_adp_dummy_allocation(False)
                     continue
 
                 if not self._is_kv_manager_v2:
@@ -4382,6 +4439,7 @@ class PyExecutor:
 
                 if not can_queue:
                     self._revert_gen_alloc(scheduled_batch)
+                self._finalize_adp_dummy_allocation(can_queue)
 
                 # If the batch is not empty on this rank, but empty on other ranks,
                 # we need to delay the update of the previous batch's sample state,
@@ -5348,24 +5406,52 @@ class PyExecutor:
     def _count_schedulable_active_requests(self) -> int:
         """Count active requests that are ready for scheduling.
 
-        In non-disaggregated mode, all active requests are schedulable.
-        In disaggregated mode, requests still waiting for KV cache
-        transfer (in INIT or transmission-in-progress state) are
-        excluded because they cannot participate in the forward pass
-        until transfer completes.
+        The non-PP DeepSeek-V4 disaggregated ADP path mirrors the decoder
+        scheduler's state window [CONTEXT_INIT, GENERATION_TO_COMPLETE). This
+        covers generation-first context requests below the lower bound and
+        terminal requests at the upper bound. Other configurations retain the
+        established ADP behavior; PP eligibility remains follow-up scope.
 
         Returns:
             The number of active requests eligible for scheduling.
         """
-        if self.kv_cache_transceiver is None:
-            return len(self.active_requests)
+        if (not self._enable_dsv4_adp_dummy_fixes
+                or self.kv_cache_transceiver is None):
+            if self.kv_cache_transceiver is None:
+                return len(self.active_requests)
 
-        def _is_awaiting_kv_transfer(req) -> bool:
-            return (req.is_disagg_generation_init_state
-                    or req.is_disagg_generation_transmission_in_progress)
+            return sum(
+                1 for req in self.active_requests
+                if not (req.is_disagg_generation_init_state
+                        or req.is_disagg_generation_transmission_in_progress))
 
-        return sum(1 for req in self.active_requests
-                   if not _is_awaiting_kv_transfer(req))
+        schedule_from_value = LlmRequestState.CONTEXT_INIT.value
+        to_complete_value = LlmRequestState.GENERATION_TO_COMPLETE.value
+
+        return sum(
+            1 for req in self.active_requests
+            if schedule_from_value <= req.state_value < to_complete_value)
+
+    def _has_adp_dummy_kv_capacity(self,
+                                   token_nums: Optional[List[int]]) -> bool:
+        """Check the full dummy allocation before entering rank-local code.
+
+        V1's dummy allocator historically checked only that one block was
+        free. A context-side ADP dummy can be ``max_num_tokens`` long, while a
+        generation dummy also reserves draft tokens, so that check can still
+        let the C++ batch allocation fail after a peer rank has succeeded.
+        """
+        token_num = (token_nums[0] if token_nums is not None else 1 +
+                     self.max_total_draft_tokens)
+        mapping = getattr(self.kv_cache_manager, "mapping", None)
+        has_cp_helix = getattr(mapping, "has_cp_helix", None)
+        if callable(has_cp_helix) and has_cp_helix():
+            token_num = max(token_num, 2)
+        draft_reserve = (self.max_total_draft_tokens
+                         if self._adp_dummy_is_gen else 0)
+        available_tokens = self.kv_cache_manager.get_num_available_tokens(
+            token_num_upper_bound=token_num, max_num_draft_tokens=draft_reserve)
+        return available_tokens >= token_num
 
     def _should_skip_dummy_for_benchmark_disagg(
             self, num_schedulable_requests: int) -> bool:
@@ -5431,15 +5517,19 @@ class PyExecutor:
         if self._should_skip_dummy_for_benchmark_disagg(num_active_request):
             return
 
-        # Other ranks have work but this rank is idle — insert a dummy so
-        # it can participate in collective operations during the forward pass.
-        if num_active_request == 0 and self.expected_num_active_requests > 0:
-            token_nums = None
-            if (not self._adp_dummy_is_gen
-                    and self.kv_cache_transceiver is not None
-                    and self.max_num_tokens is not None):
-                token_nums = [self.max_num_tokens]
-            dummy_request_ids = [ATTENTION_DP_DUMMY_REQUEST_ID]
+        needs_dummy = (self.expected_num_active_requests > 0
+                       and num_active_request == 0)
+        if not needs_dummy:
+            return
+
+        dummy_request_ids = [ATTENTION_DP_DUMMY_REQUEST_ID]
+        token_nums = None
+        if (not self._adp_dummy_is_gen and self.kv_cache_transceiver is not None
+                and self.max_num_tokens is not None):
+            token_nums = [self.max_num_tokens]
+
+        if (not self._enable_dsv4_adp_dummy_fixes
+                or self.kv_cache_transceiver is None):
             llm_request = self.kv_cache_manager.add_dummy_requests(
                 request_ids=dummy_request_ids,
                 token_nums=token_nums,
@@ -5453,6 +5543,46 @@ class PyExecutor:
             if spec_resource_manager is not None:
                 spec_resource_manager.add_dummy_requests(dummy_request_ids)
             self.active_requests.append(llm_request)
+            return
+
+        assert self._pending_adp_dummy_request is None
+        has_live_adp_dummy = any(
+            request.py_request_id == ATTENTION_DP_DUMMY_REQUEST_ID
+            for request in self.active_requests)
+        if has_live_adp_dummy or not self._has_adp_dummy_kv_capacity(
+                token_nums):
+            return
+
+        try:
+            dummy_requests = self.kv_cache_manager.add_dummy_requests(
+                request_ids=dummy_request_ids,
+                token_nums=token_nums,
+                is_gen=self._adp_dummy_is_gen,
+                prepare_resource=True,
+                max_num_draft_tokens=self.max_total_draft_tokens,
+            )
+        except OutOfPagesError:
+            dummy_requests = None
+        if not dummy_requests:
+            logger.warning(
+                "Cannot allocate DeepSeek-V4 ADP pad dummy; rank schedules "
+                "an empty batch and the fleet will retry.")
+            return
+
+        dummy_request = dummy_requests[0]
+        spec_resource_manager = self.resource_manager.get_resource_manager(
+            ResourceManagerType.SPEC_RESOURCE_MANAGER)
+        if spec_resource_manager is not None:
+            try:
+                spec_resource_manager.add_dummy_requests(dummy_request_ids)
+            except NoFreeSlotsError:
+                self.kv_cache_manager.free_resources(dummy_request)
+                return
+
+        assert dummy_request is not None
+        dummy_request.is_attention_dp_dummy = True
+        self.active_requests.append(dummy_request)
+        self._pending_adp_dummy_request = dummy_request
 
     @nvtx_range("_prepare_disagg_gen_init")
     def _prepare_disagg_gen_init(self, fitting_disagg_gen_init_requests):
