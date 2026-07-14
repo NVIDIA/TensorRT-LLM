@@ -177,7 +177,7 @@ COMMON_SSH_OPTIONS = "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/nul
 // CBTS per-test coverage gate; official post-merge pipeline only, single-GPU stages only in Phase 1.
 ENABLE_CBTS_COVERAGE = true
 CBTS_EXCLUDE_STAGES = [] as Set
-// Reassigned in the Setup Environment stage: true only on the official L0_PostMerge job.
+// Reassigned in the Setup Environment stage from the upstream post-merge flag.
 CBTS_PIPELINE_ELIGIBLE = false
 
 def isCbtsStage(String stageName) {
@@ -5720,8 +5720,9 @@ pipeline {
                     echo "env.testFilter is: ${env.testFilter}"
                     testFilter = trtllm_utils.updateMapWithJson(this, testFilter, env.testFilter, "testFilter")
                     println testFilter
-                    // CBTS coverage runs only on the official post-merge pipeline (JOB_NAME carries L0_PostMerge).
-                    CBTS_PIPELINE_ELIGIBLE = (env.JOB_NAME ?: "").contains("L0_PostMerge")
+                    // CBTS coverage runs only on post-merge, per the upstream testFilter post_merge flag
+                    // (this downstream L0_Test job's own JOB_NAME does not carry PostMerge).
+                    CBTS_PIPELINE_ELIGIBLE = (testFilter[(IS_POST_MERGE)] ?: false)
                     echo "CBTS_PIPELINE_ELIGIBLE is: ${CBTS_PIPELINE_ELIGIBLE}"
                     echo "env.globalVars is: ${env.globalVars}"
                     globalVars = trtllm_utils.updateMapWithJson(this, globalVars, env.globalVars, "globalVars")
