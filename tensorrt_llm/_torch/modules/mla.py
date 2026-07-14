@@ -130,27 +130,8 @@ def _slice_hidden_states_to_num_tokens(hidden_states, num_tokens: int):
 
 _DSV4_OB_SCALE_BLOCK_K = 128
 _UE8M0_SCALES_PER_WORD = 4
-_DSV4_OB_PACKED_SCALE_K = _DSV4_OB_SCALE_BLOCK_K * _UE8M0_SCALES_PER_WORD
-_DSV4_OB_SPLIT_K4_MAX_M = 16
-_DSV4_OB_SPLIT_K2_MAX_M = 128
 _DSV4_PRO_OB_N = 7168
 _DSV4_PRO_OB_K = 16384
-
-
-def _select_dsv4_ob_split_k(num_tokens: int, configured_split: Optional[int] = None) -> int:
-    if configured_split is None:
-        env_split = int(os.environ.get("TRTLLM_DSV4_OB_SPLIT_K", "0"))
-        if env_split:
-            split_k = env_split
-        elif 0 < num_tokens <= _DSV4_OB_SPLIT_K4_MAX_M:
-            split_k = 4
-        else:
-            split_k = 2 if 0 < num_tokens <= _DSV4_OB_SPLIT_K2_MAX_M else 1
-    else:
-        split_k = configured_split
-    if split_k not in (1, 2, 4):
-        raise ValueError(f"unsupported DeepSeek-V4 O_b split-K factor: {split_k}")
-    return split_k
 
 
 def _extract_mla_extra_attrs(layer_idx: str):
@@ -1299,26 +1280,11 @@ class MLA(nn.Module):
         m, n = num_tokens, self.hidden_size
         k_ob = o_lora_fp8.shape[1]
         weight, weight_scale = self.o_b_proj.weight, self.o_b_proj.weight_scale
-        split_k = _select_dsv4_ob_split_k(m, getattr(self, "ob_split_k", None))
-        packed_k = k_ob // _DSV4_OB_PACKED_SCALE_K
         use_cute_tactic = (
             not _is_env_truthy("TRTLLM_DSV4_DISABLE_CUTE_DSL_OB_PROJ")
-            and IS_CUTLASS_DSL_AVAILABLE
-            and m > 0
             and n == _DSV4_PRO_OB_N
             and k_ob == _DSV4_PRO_OB_K
-            and k_ob % (_DSV4_OB_PACKED_SCALE_K * split_k) == 0
         )
-        activation_layout_ok = (
-            sf_out.dtype == torch.int32
-            and sf_out.dim() == 2
-            and sf_out.shape == (m, packed_k)
-            and sf_out.stride(0) == 1
-            and sf_out.stride(1) >= m
-            and sf_out.stride(1) % _UE8M0_SCALES_PER_WORD == 0
-        )
-        if use_cute_tactic and not activation_layout_ok:
-            raise RuntimeError("DSV4-Pro O_b CuTe tactic requires packed activation scales.")
 
         cute_weight_scale = weight_scale
         if use_cute_tactic and cute_weight_scale.dtype != torch.int32:
@@ -1334,16 +1300,6 @@ class MLA(nn.Module):
                 )
                 self.o_b_proj._ob_wsf_int = cute_weight_scale
 
-        weight_layout_ok = (
-            cute_weight_scale.dtype == torch.int32
-            and cute_weight_scale.dim() == 2
-            and cute_weight_scale.shape == (n, packed_k)
-            and cute_weight_scale.stride(0) == 1
-            and cute_weight_scale.stride(1) == n
-        )
-        if use_cute_tactic and not weight_layout_ok:
-            raise RuntimeError("DSV4-Pro O_b CuTe tactic requires packed weight scales.")
-
         if not use_cute_tactic:
             from tensorrt_llm import deep_gemm
 
@@ -1357,18 +1313,7 @@ class MLA(nn.Module):
             )
             return hidden
 
-        logger.info_once(
-            f"[obsk-fused] O_b CuTe DSL ENGAGED: SK={split_k} M={m} K={k_ob} N={n}",
-            key="obsk_fused_engaged",
-        )
-        # mHC consumes split-major rows directly.
-        partials = torch.empty([split_k, m, n], device=o_lora_fp8.device, dtype=self.dtype)
-        torch.ops.trtllm.dsv4_fp8_splitk_gemm(
-            o_lora_fp8, sf_out, weight, cute_weight_scale, partials, split_k
-        )
-        if split_k == 1:
-            return partials[0]
-        return partials.reshape(split_k * m, n)
+        return torch.ops.trtllm.dsv4_fp8_splitk_gemm(o_lora_fp8, sf_out, weight, cute_weight_scale)
 
     def _deepseek_v4_o_proj(
         self,

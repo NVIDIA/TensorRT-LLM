@@ -4,6 +4,7 @@
 import functools
 import itertools
 import math
+import os
 from typing import List, Optional, Tuple
 
 import torch
@@ -3962,6 +3963,23 @@ if IS_CUTLASS_DSL_AVAILABLE:
         _SCALE_BLOCK_K = 128
         _SCALES_PER_WORD = 4
         _PACKED_SCALE_K = _SCALE_BLOCK_K * _SCALES_PER_WORD
+        _SPLIT_K4_MAX_M = 16
+        _SPLIT_K2_MAX_M = 128
+
+        @staticmethod
+        def _select_num_splits(num_tokens: int) -> int:
+            env_split = int(os.environ.get("TRTLLM_DSV4_OB_SPLIT_K", "0"))
+            if env_split:
+                num_splits = env_split
+            elif 0 < num_tokens <= CuteDSLFp8SplitKGemmRunner._SPLIT_K4_MAX_M:
+                num_splits = 4
+            else:
+                num_splits = (2 if 0 < num_tokens <=
+                              CuteDSLFp8SplitKGemmRunner._SPLIT_K2_MAX_M else 1)
+            if num_splits not in (1, 2, 4):
+                raise ValueError(
+                    f"unsupported DeepSeek-V4 O_b split-K factor: {num_splits}")
+            return num_splits
 
         def __init__(self, use_tvm_ffi: bool = True):
             self.use_tvm_ffi = use_tvm_ffi
@@ -4171,7 +4189,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
     @torch.library.custom_op(
         "trtllm::dsv4_fp8_splitk_gemm",
-        mutates_args=("partials", ),
+        mutates_args=(),
         device_types="cuda",
     )
     def dsv4_fp8_splitk_gemm(
@@ -4179,20 +4197,16 @@ if IS_CUTLASS_DSL_AVAILABLE:
         sfa: torch.Tensor,
         b: torch.Tensor,
         sfb: torch.Tensor,
-        partials: torch.Tensor,
-        num_splits: int,
-    ) -> None:
-        """Emit split-major BF16 partials for the DSV4 O_b FP8 GEMM."""
+    ) -> torch.Tensor:
+        """Emit mHC-ready split-major BF16 output for the DSV4 O_b GEMM."""
         if not is_sm_100f():
             raise ValueError(
                 f"dsv4_fp8_splitk_gemm requires the SM100 family, got {get_sm_version()}"
             )
-        if num_splits not in (1, 2, 4):
-            raise ValueError(f"num_splits must be 1, 2, or 4, got {num_splits}")
-        if not all(t.is_cuda for t in (a, sfa, b, sfb, partials)):
+        if not all(t.is_cuda for t in (a, sfa, b, sfb)):
             raise ValueError(
                 "all dsv4_fp8_splitk_gemm tensors must be CUDA tensors")
-        if len({t.device for t in (a, sfa, b, sfb, partials)}) != 1:
+        if len({t.device for t in (a, sfa, b, sfb)}) != 1:
             raise ValueError(
                 "all dsv4_fp8_splitk_gemm tensors must be on the same device")
         if a.dtype != torch.float8_e4m3fn or b.dtype != torch.float8_e4m3fn:
@@ -4200,14 +4214,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
         if sfa.dtype != torch.int32 or sfb.dtype != torch.int32:
             raise TypeError(
                 "SFA and SFB must contain packed int32 UE8M0 scales")
-        if partials.dtype != torch.bfloat16:
-            raise TypeError("partials must have dtype torch.bfloat16")
         if a.dim() != 2 or b.dim(
         ) != 2 or not a.is_contiguous() or not b.is_contiguous():
             raise ValueError("A and B must be contiguous rank-2 tensors")
 
         m, k = a.shape
         n = b.shape[0]
+        num_splits = CuteDSLFp8SplitKGemmRunner._select_num_splits(m)
         if b.shape[1] != k:
             raise ValueError("A and B K dimensions must match")
         packed_scale_k = CuteDSLFp8SplitKGemmRunner._PACKED_SCALE_K
@@ -4218,10 +4231,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 f"K={k} must be divisible by {packed_scale_k}*num_splits")
         if n % scale_block_k != 0:
             raise ValueError(f"N={n} must be divisible by {scale_block_k}")
-        if partials.shape != (num_splits, m, n) or not partials.is_contiguous():
-            raise ValueError(
-                f"partials must be contiguous with shape {(num_splits, m, n)}")
-
         packed_k = k // packed_scale_k
         if (sfa.dim() != 2 or sfa.shape != (m, packed_k) or sfa.stride(0) != 1
                 or sfa.stride(1) < m or sfa.stride(1) % scales_per_word != 0):
@@ -4233,8 +4242,17 @@ if IS_CUTLASS_DSL_AVAILABLE:
             raise ValueError(
                 f"SFB must be packed MN-major [N,K/{packed_scale_k}]")
 
+        output = torch.empty((num_splits * m, n),
+                             device=a.device,
+                             dtype=torch.bfloat16)
+        partials = output.view(num_splits, m, n)
         CuteDSLFp8SplitKGemmRunner(use_tvm_ffi=True).forward(
             [a, sfa, b, sfb, partials], num_splits)
+        logger.info_once(
+            f"[obsk-fused] O_b CuTe DSL ENGAGED: SK={num_splits} M={m} K={k} N={n}",
+            key="obsk_fused_engaged",
+        )
+        return output
 
     @torch.library.register_fake("trtllm::dsv4_fp8_splitk_gemm")
     def _(
@@ -4242,10 +4260,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
         sfa: torch.Tensor,
         b: torch.Tensor,
         sfb: torch.Tensor,
-        partials: torch.Tensor,
-        num_splits: int,
-    ) -> None:
-        return None
+    ) -> torch.Tensor:
+        num_splits = CuteDSLFp8SplitKGemmRunner._select_num_splits(a.shape[0])
+        return a.new_empty((num_splits * a.shape[0], b.shape[0]),
+                           dtype=torch.bfloat16)
 
     class CuteDSLFp8BlackwellBmmRunner(TunableRunner):
         kernel_class = Sm100BlockwiseGemmKernel
@@ -4800,11 +4818,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         output_fp8: torch.Tensor,
         sf_out: torch.Tensor,
     ) -> None:
-        L, M, K = input.shape
-        N = weight.shape[1]
-        assert output_fp8.dtype == torch.float8_e4m3fn and output_fp8.shape == (
-            L, M, N)
-        assert sf_out.dtype == torch.int32
+        return None
 
     # =============================================================================
     # Dense GEMM with SwiGLU Fusion (FC1 Kernel for MoE as Dense GEMM)
