@@ -1142,11 +1142,22 @@ class PyTorchModelEngine(ModelEngine):
                                                     num_tokens, num_gen_tokens),
                         resource_manager) as batch:
                     if batch is None and self.mapping.tp_size <= 1:
-                        continue  # Not enough KV cache space (single rank, safe to skip)
+                        # Safe to skip, but never silently: a skip during KV
+                        # cache estimation makes the profiling peak
+                        # unrepresentative of this shape.
+                        logger.warning(
+                            f"Skipping general warmup with {num_tokens} tokens "
+                            f"({num_gen_tokens} generation): not enough KV "
+                            f"cache space.")
+                        continue
                     self._assert_all_tp_ranks_have_warmup_batch(
                         batch, num_tokens)
                     if batch is None:
-                        continue  # All ranks agree: not enough space
+                        logger.warning(
+                            f"Skipping general warmup with {num_tokens} tokens "
+                            f"({num_gen_tokens} generation): not enough KV "
+                            f"cache space on any TP rank.")
+                        continue
                     logger.info(
                         f"Run warmup with {num_tokens} tokens, include {num_gen_tokens} generation tokens"
                     )
@@ -1539,7 +1550,14 @@ class PyTorchModelEngine(ModelEngine):
                         with self._release_batch_context(
                                 warmup_request, resource_manager) as batch:
                             if batch is None:
-                                # No KV cache space, cannot continue capturing graphs
+                                # No KV cache space for this batch size. During KV
+                                # cache estimation this makes the profiling peak
+                                # unrepresentative (the final executor still
+                                # captures this graph), so don't skip silently.
+                                logger.warning(
+                                    f"Skipping CUDA graph warmup ({label}) for "
+                                    f"batch size={bs}, draft_len={draft_len}: "
+                                    f"not enough KV cache space.")
                                 continue
                             logger.info(
                                 f"Run generation-only CUDA graph warmup ({label}) "

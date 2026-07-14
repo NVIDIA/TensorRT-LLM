@@ -5,7 +5,7 @@ import time
 import traceback
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
-from typing import List, Optional, Union
+from typing import List, Optional
 
 import zmq
 
@@ -13,7 +13,6 @@ from tensorrt_llm.logger import logger
 
 from .._utils import mpi_comm, mpi_rank, print_all_stacks
 from ..bindings import executor as tllm
-from ..builder import Engine
 from ..llmapi.llm_args import BaseLlmArgs
 from ..llmapi.mpi_session import set_mpi_session_cpp
 from ..llmapi.tokenizer import TokenizerBase
@@ -38,7 +37,7 @@ class GenerationExecutorWorker(RpcWorkerMixin, BaseWorker):
 
     def __init__(
         self,
-        engine: Union[Path, Engine],
+        engine: Path,
         executor_config: Optional[tllm.ExecutorConfig] = None,
         batched_logits_processor: Optional[BatchedLogitsProcessor] = None,
         postproc_worker_config: Optional[PostprocWorkerConfig] = None,
@@ -165,7 +164,7 @@ class GenerationExecutorWorker(RpcWorkerMixin, BaseWorker):
 
 @print_traceback_on_error
 def worker_main(
-    engine: Path | Engine,
+    engine: Path,
     worker_queues: WorkerCommIpcAddrs,
     log_level: str,
     executor_config: Optional[tllm.ExecutorConfig] = None,
