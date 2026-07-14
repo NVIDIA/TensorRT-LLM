@@ -891,10 +891,12 @@ def test_disaggregated_tinyllama_multi_orchestrator(disaggregated_test_root,
     setup_model_symlink(llm_venv, llama_model_root,
                         "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
 
+    env = llm_venv._new_env.copy()
+    env["CUDA_VISIBLE_DEVICES"] = "0"
     run_disaggregated_test(disaggregated_example_root,
                            "multi_orchestrator",
                            num_iters=1,
-                           env=llm_venv._new_env,
+                           env=env,
                            model_path=llama_model_root,
                            cwd=llm_venv.get_working_directory())
 
