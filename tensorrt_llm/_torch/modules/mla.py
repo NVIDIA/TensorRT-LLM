@@ -131,7 +131,8 @@ def _slice_hidden_states_to_num_tokens(hidden_states, num_tokens: int):
 _DSV4_OB_SCALE_BLOCK_K = 128
 _UE8M0_SCALES_PER_WORD = 4
 _DSV4_OB_PACKED_SCALE_K = _DSV4_OB_SCALE_BLOCK_K * _UE8M0_SCALES_PER_WORD
-_DSV4_OB_SPLIT_K_MAX_M = 128
+_DSV4_OB_SPLIT_K4_MAX_M = 16
+_DSV4_OB_SPLIT_K2_MAX_M = 128
 _DSV4_OB_CUTE_SK1_MIN_M = 256
 _DSV4_PRO_OB_N = 7168
 _DSV4_PRO_OB_K = 16384
@@ -140,7 +141,12 @@ _DSV4_PRO_OB_K = 16384
 def _select_dsv4_ob_split_k(num_tokens: int, configured_split: Optional[int] = None) -> int:
     if configured_split is None:
         env_split = int(os.environ.get("TRTLLM_DSV4_OB_SPLIT_K", "0"))
-        split_k = env_split if env_split else (2 if 0 < num_tokens <= _DSV4_OB_SPLIT_K_MAX_M else 1)
+        if env_split:
+            split_k = env_split
+        elif 0 < num_tokens <= _DSV4_OB_SPLIT_K4_MAX_M:
+            split_k = 4
+        else:
+            split_k = 2 if 0 < num_tokens <= _DSV4_OB_SPLIT_K2_MAX_M else 1
     else:
         split_k = configured_split
     if split_k not in (1, 2, 4):
