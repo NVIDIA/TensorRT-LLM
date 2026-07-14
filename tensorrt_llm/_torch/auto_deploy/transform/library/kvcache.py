@@ -773,7 +773,14 @@ class ResizeKVCache(BaseTransform):
             )
 
         # Run a forward pass to get the extra memory usage
-        cm.info.set_max_num_tokens_sample()
+        if cm._spec_config is not None:
+            # Spec-dec resize must use the same extend-only shape the runtime captures
+            # (matching compile_model's InsertCachedAttention/cudagraph path). Otherwise a
+            # max_num_tokens // max_batch_size == 1 sample is classified decode-only and the
+            # eagle wrapper rejects it (decode without drafting is not supported).
+            cm.info.set_capture_batch(max_draft_len=cm._spec_config.max_draft_len)
+        else:
+            cm.info.set_max_num_tokens_sample()
         try:
             if cm._spec_config is not None:
                 mod(**cm.named_args, cache_seq_interface=cm)
