@@ -213,52 +213,48 @@ class CuteDslMlaFmha(PhasedFmha):
             logger.info_once(f"CuTe DSL MLA FMHA does not support request: {reason}", key=reason)
         return supported
 
-    # Minimum per-rank decode batch size at which the CuteDSL kernel beats the
-    # default TRTLLM path, keyed by (num_heads, seq_len_q). Derived from a
-    # layer-wise DeepSeek-V3 A/B sweep (8xB200, fp8 KV, CUDA graph; MLA-module
-    # time across KV in {1024, 2048, 8192}): the threshold is the smallest
-    # batch whose row -- and every larger batch -- is at or above parity in
-    # ALL KV columns. (16, 1) is absent because it has no such region: it is
-    # non-monotonic (batch 64 wins but 128/256 regress).
-    # (128, 1) is set below its strict-parity batch (64): the 1-2% module
-    # dips at batch 8-32 are measurement noise (the kernel itself is at or
-    # above parity from batch 8 up), and an end-to-end A/B that admitted
-    # (128, 1) at every batch measured a net +1.5% win.
-    # For H=16 the thresholds line up with batch*seq_len_q >= 128, i.e. enough
-    # rows to fill the kernel's M-tile of 128; H=128 fills the tile at any
-    # batch, so its small-batch losses (and threshold) come from parallelism,
-    # not tile occupancy.
-    _PERF_MIN_BATCH = {
-        (16, 2): 64,
-        (16, 4): 32,
-        (16, 8): 16,
-        (128, 1): 8,
-        (128, 2): 32,
-        (128, 4): 32,
-        (128, 8): 16,
-    }
-
     @staticmethod
     def _is_perf_favorable(
-        num_heads: int, batch_size: int, seq_len_q: int, predicted_tokens_per_seq: int
+        num_heads: int,
+        batch_size: int,
+        seq_len_q: int,
+        predicted_tokens_per_seq: int,
+        kernel_dtype: Optional[torch.dtype],
     ) -> tuple[bool, str]:
-        """Perf-only gate, separate from the correctness checks: admit a
-        (num_heads, seq_len_q) shape only above its measured critical batch
-        size (``_PERF_MIN_BATCH``); everything else falls back to the next
-        FMHA library.
+        """Perf-only gate, separate from the correctness checks, split by the
+        kernel input dtype because the measured win regions differ.
 
-        The (128, 1) entry additionally requires spec-decode OFF
-        (``predicted_tokens_per_seq == 1``): with MTP enabled, seq_len_q == 1
-        requests are the draft-step forwards, which are a steady-state E2E
-        loss (ADP+MTP3 measured about -13%) even at batch sizes where the
-        MTP-off main decode wins."""
-        min_batch = CuteDslMlaFmha._PERF_MIN_BATCH.get((num_heads, seq_len_q))
+        fp8 KV: admit a (num_heads, seq_len_q) shape only above its measured
+        critical batch size (``_PERF_MIN_BATCH_FP8``); everything else falls
+        back to the next FMHA library.
+
+        bf16/fp16 KV: only num_heads == 16 is admitted."""
+        if kernel_dtype != torch.float8_e4m3fn:
+            if num_heads == 16:
+                return True, ""
+            return False, (
+                f"CuTe DSL MLA decode on {kernel_dtype} KV is only a perf win "
+                f"for num_heads=16, got num_heads={num_heads}."
+            )
+        # Minimum per-rank decode batch size at which the CuteDSL kernel beats
+        # the default TRTLLM path on the FP8-KV path, keyed by
+        # (num_heads, seq_len_q).
+        _PERF_MIN_BATCH_FP8 = {
+            (16, 2): 64,
+            (16, 4): 32,
+            (16, 8): 16,
+            (128, 1): 8,
+            (128, 2): 32,
+            (128, 4): 32,
+            (128, 8): 16,
+        }
+        min_batch = _PERF_MIN_BATCH_FP8.get((num_heads, seq_len_q))
         if min_batch is None:
             return False, (
                 f"CuTe DSL MLA decode is not a perf win for "
                 f"num_heads={num_heads}, seq_len_q={seq_len_q}; allowed "
                 f"(num_heads, seq_len_q): "
-                f"{sorted(CuteDslMlaFmha._PERF_MIN_BATCH)}."
+                f"{sorted(_PERF_MIN_BATCH_FP8)}."
             )
         if batch_size < min_batch:
             return False, (
@@ -315,18 +311,19 @@ class CuteDslMlaFmha(PhasedFmha):
         if seq_len_q < 1:
             return False, f"Query length must be >= 1, got {seq_len_q}."
         batch_size = meta.num_generations
+
         # Perf gate (NOT a correctness limit): only admit shapes where CuteDSL
         # beats the default path E2E; everything else falls back. Skipped
-        # entirely while the AutoTuner is tuning: the autotuner warmup's
-        # generation forward carries a single request (batch 1), which every
-        # batch floor would reject, yet it must reach the CuteDSL op so the
-        # op's max-batch bucket ladder gets profiled. Runtime dispatch
-        # (tuning mode off) honors the gate as usual.
+        # entirely while the AutoTuner is tuning.
         from tensorrt_llm._torch.autotuner import AutoTuner
 
         if not AutoTuner.get().is_tuning_mode:
             favorable, reason = self._is_perf_favorable(
-                attn.num_heads, batch_size, seq_len_q, attn.predicted_tokens_per_seq
+                attn.num_heads,
+                batch_size,
+                seq_len_q,
+                attn.predicted_tokens_per_seq,
+                self._get_kernel_dtype(attn, q),
             )
             if not favorable:
                 return False, reason
