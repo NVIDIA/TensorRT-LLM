@@ -488,12 +488,10 @@ class MultimodalScheduler(RequestScheduler):
         scheduler: SimpleScheduler,
         max_num_items: int,
         max_num_tokens: int,
-        independent: bool = False,
     ) -> None:
         self.scheduler = scheduler
         self.max_num_items = max_num_items
         self.max_num_tokens = max_num_tokens
-        self.independent = independent
         self.has_separate_stages = hasattr(scheduler, "capacity_scheduler") and hasattr(
             scheduler, "micro_batch_scheduler"
         )
@@ -521,7 +519,7 @@ class MultimodalScheduler(RequestScheduler):
 
             request_items: list[int] = []
             for item_idx, (cost, output) in enumerate(
-                zip(token_lengths, request.py_mm_encoder_outputs)
+                zip(token_lengths, request.py_mm_encoder_outputs, strict=True)
             ):
                 if output is not None:
                     continue
@@ -573,46 +571,16 @@ class MultimodalScheduler(RequestScheduler):
 
         return True
 
-    def schedule_request(
-        self, active_requests: RequestList, inflight_request_ids: set[int]
+    def _schedule_micro_batch(
+        self,
+        fitting_requests: RequestList,
+        fitting_disagg_gen_init_requests: RequestList,
+        paused_requests: RequestList,
+        inflight_request_ids: set[int],
+        *,
+        llm_eligible: RequestList,
+        selected_items: dict[int, list[int]] | None = None,
     ) -> SchedulerOutput:
-        if not self.has_separate_stages:
-            if self.independent:
-                selected_items, llm_eligible = self._select_items(active_requests)
-                scheduler_output = self.scheduler.schedule_request(
-                    llm_eligible, inflight_request_ids
-                )
-                return scheduler_output._replace(scheduled_mm_encoder_items=selected_items or None)
-            scheduler_output = self.scheduler.schedule_request(
-                active_requests, inflight_request_ids
-            )
-            if self._can_schedule_full_request_mm_batch(list(scheduler_output.context_requests)):
-                return scheduler_output
-            selected_items, llm_eligible = self._select_items(
-                list(scheduler_output.context_requests)
-            )
-            return scheduler_output._replace(
-                context_requests=llm_eligible,
-                scheduled_mm_encoder_items=selected_items or None,
-            )
-
-        active_requests = drop_decoder_context_requests_waiting_for_encoder_output(active_requests)
-        selected_items = None
-        llm_eligible_ids = None
-        if self.independent:
-            selected_items, llm_eligible = self._select_items(active_requests)
-            llm_eligible_ids = {request.request_id for request in llm_eligible}
-        fitting_requests, fitting_disagg_gen_init_requests, paused_requests = (
-            self.scheduler.capacity_scheduler.schedule_request(active_requests)
-        )
-        if self.independent:
-            llm_eligible = [
-                request for request in fitting_requests if request.request_id in llm_eligible_ids
-            ]
-        elif self._can_schedule_full_request_mm_batch(list(fitting_requests)):
-            llm_eligible = fitting_requests
-        else:
-            selected_items, llm_eligible = self._select_items(list(fitting_requests))
         encoder_requests, context_requests, generation_requests = (
             self.scheduler.micro_batch_scheduler.schedule(llm_eligible, inflight_request_ids)
         )
@@ -626,8 +594,77 @@ class MultimodalScheduler(RequestScheduler):
             scheduled_mm_encoder_items=selected_items or None,
         )
 
+    def schedule_request(
+        self, active_requests: RequestList, inflight_request_ids: set[int]
+    ) -> SchedulerOutput:
+        if not self.has_separate_stages:
+            scheduler_output = self.scheduler.schedule_request(
+                active_requests, inflight_request_ids
+            )
+            if self._can_schedule_full_request_mm_batch(list(scheduler_output.context_requests)):
+                return scheduler_output
+            selected_items, llm_eligible = self._select_items(
+                list(scheduler_output.context_requests)
+            )
+            return scheduler_output._replace(
+                context_requests=llm_eligible,
+                scheduled_mm_encoder_items=selected_items or None,
+            )
+
+        fitting_requests, fitting_disagg_gen_init_requests, paused_requests = (
+            self.scheduler.capacity_scheduler.schedule_request(active_requests)
+        )
+        selected_items = None
+        if self._can_schedule_full_request_mm_batch(list(fitting_requests)):
+            llm_eligible = fitting_requests
+        else:
+            selected_items, llm_eligible = self._select_items(list(fitting_requests))
+        return self._schedule_micro_batch(
+            fitting_requests,
+            fitting_disagg_gen_init_requests,
+            paused_requests,
+            inflight_request_ids,
+            llm_eligible=llm_eligible,
+            selected_items=selected_items,
+        )
+
     def can_schedule(self, requests: RequestList) -> bool:
         return self.scheduler.can_schedule(requests)
+
+
+class MultimodalEagerEncoderScheduler(MultimodalScheduler):
+    """Eagerly schedule encoder work for already-active MM requests.
+
+    Unlike the default coupled policy, this policy selects encoder items before
+    LLM capacity scheduling. An active request may therefore make encoder
+    progress even when it is not selected for the current LLM batch. It does
+    not admit waiting requests or bypass LLM capacity for decoder execution.
+    """
+
+    def schedule_request(
+        self, active_requests: RequestList, inflight_request_ids: set[int]
+    ) -> SchedulerOutput:
+        selected_items, llm_eligible = self._select_items(active_requests)
+
+        if not self.has_separate_stages:
+            scheduler_output = self.scheduler.schedule_request(llm_eligible, inflight_request_ids)
+            return scheduler_output._replace(scheduled_mm_encoder_items=selected_items or None)
+
+        llm_eligible_ids = {request.request_id for request in llm_eligible}
+        fitting_requests, fitting_disagg_gen_init_requests, paused_requests = (
+            self.scheduler.capacity_scheduler.schedule_request(active_requests)
+        )
+        fitting_llm_eligible = [
+            request for request in fitting_requests if request.request_id in llm_eligible_ids
+        ]
+        return self._schedule_micro_batch(
+            fitting_requests,
+            fitting_disagg_gen_init_requests,
+            paused_requests,
+            inflight_request_ids,
+            llm_eligible=fitting_llm_eligible,
+            selected_items=selected_items,
+        )
 
 
 class ChunkingPolicy(Enum):
