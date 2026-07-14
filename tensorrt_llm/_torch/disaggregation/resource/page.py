@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -16,23 +31,38 @@ BUFFER_ENTRY_DTYPE = np.dtype(
 
 
 class MapperKind(IntEnum):
-    """Slot metadata shape — selects how disagg derives the pool's layer set.
+    """Transfer semantics of one physical pool's bytes.
 
-    INDEXED: PoolView.buffer_entries lists ``(local_layer_id, offset, size)``
-        per buffer. Disagg reads ``local_layer_id`` to know *which* layers
-        from the LG live in this pool (a pool may cover a subset when V2
-        splits an LG into multiple pools by buffer-size class). The
-        ``offset`` / ``size`` columns are carried for future use but are not
-        currently consumed at byte-transfer time.
-    FLAT:    PoolView.buffer_entries is empty. Disagg assumes the pool
-        covers *all* layers of the LG, packed equal-sized in
-        ``local_layers`` order. Used today by the DSA (DeepSeek Sparse
-        Attention, v3.2) indexer K cache pool, whose slot layout is a dense
-        ``(numLayers, kvFactor, blockSize)`` array.
+    Every PoolView carries ``buffer_entries`` listing
+    ``(local_layer_id, offset, size)`` per buffer; the view's exact layer
+    set always comes from those entries (a view may cover a subset of the
+    LG when V2 splits an LG into multiple pools by buffer-size class, or
+    when a role class exists only on some layers). The kind selects how
+    bytes move between heterogeneous topologies:
 
-    Byte arithmetic is the same for both kinds: per-layer stride is
-    ``slot_bytes // num_layers``. The kind only affects how disagg discovers
-    the pool's layer set during pool matching.
+    INDEXED: Head-major (HND) K/V — the layout written by the TRTLLM
+        attention kernels and the default for V1 and standard V2 managers.
+        Heterogeneous-head transfer selects one contiguous head-major range
+        per K/V buffer.
+    REPLICATED: The pool holds bytes that are identical on every TP rank
+        (MiniMax M3 index-key, DSA indexer K). Copied without KV-head
+        remapping using per-layer strides; fan-in routing elects one owning
+        sender per destination so each peer receives exactly one copy.
+    NHD: Ordinary K/V whose per-buffer storage is token-major
+        ``[token, head, dim]``. Heterogeneous-head transfer must select the
+        corresponding head slice inside every token rather than a single
+        contiguous head-major range.
+
+    A physical pool may hold roles of different kinds: V2 storage coalesces
+    buffers purely by ``(life_cycle, buffer size)``, so e.g. MiniMax M3's
+    replicated index-K shares the K/V pool at TP degrees where their
+    per-block sizes coincide. The page-table builder therefore emits one
+    PoolView per ``(physical pool, mapper kind)`` — a view covers exactly
+    the bytes of one role class, and its per-layer byte ranges come from
+    ``buffer_entries`` (offsets are per layer because another class may
+    interleave between layers; only the per-layer size is uniform, recorded
+    in ``bytes_per_layer``). View count per layer group is bounded by the
+    number of role classes, never by layer count.
 
     Mamba state pools do not use this enum: Mamba's transfer is dispatched
     through :class:`MambaPolicy` which hard-codes the ``is_conv`` switch and
@@ -40,7 +70,8 @@ class MapperKind(IntEnum):
     """
 
     INDEXED = 0
-    FLAT = 1
+    REPLICATED = 1
+    NHD = 2
 
 
 @dataclass
@@ -107,7 +138,7 @@ class PoolView:
         pool_idx: Index of the physical pool within its pool group.
         buffer_entries: Structured array using ``BUFFER_ENTRY_DTYPE``. Each
             entry records a buffer's ``local_layer_id`` and its byte ``offset``
-            and ``size`` within the pool slot. FLAT pools have no entries.
+            and ``size`` within the pool slot.
         pool_role: Set of native role-name strings (whatever the cache manager
             uses, e.g. ``"key"`` / ``"value"`` / ``"deepseek_v4_swa"``) that
             live in this pool. Used as the *equivalence label* for peer-to-peer
@@ -115,12 +146,19 @@ class PoolView:
             are equal. Disagg never enumerates the role-name vocabulary —
             adding a new role on the manager side requires no disagg change.
         mapper_kind: Closed-set discriminator for picking the Mapper family.
+        bytes_per_layer: Uniform byte size of one layer's region within the
+            slot. The per-layer *offsets* live in ``buffer_entries``; only
+            the size is uniform, because a slot may interleave other role
+            classes between layers, making the layer stride non-uniform.
+            Set for every kind; ``None`` only in tables serialized by older
+            builders, where consumers re-derive it from the entries.
     """
 
     pool_idx: int
     buffer_entries: np.ndarray  # dtype=BUFFER_ENTRY_DTYPE
     pool_role: FrozenSet[str] = field(default_factory=frozenset)
     mapper_kind: MapperKind = MapperKind.INDEXED
+    bytes_per_layer: Optional[int] = None
 
     def to_dict(self) -> dict:
         return {
@@ -128,6 +166,9 @@ class PoolView:
             "buffer_entries": self.buffer_entries.tolist(),
             "pool_role": sorted(self.pool_role),
             "mapper_kind": int(self.mapper_kind),
+            "bytes_per_layer": (
+                int(self.bytes_per_layer) if self.bytes_per_layer is not None else None
+            ),
         }
 
     @staticmethod
@@ -143,6 +184,9 @@ class PoolView:
             ),
             pool_role=frozenset(data["pool_role"]),
             mapper_kind=MapperKind(int(data["mapper_kind"])),
+            bytes_per_layer=(
+                int(data["bytes_per_layer"]) if data.get("bytes_per_layer") is not None else None
+            ),
         )
 
 
