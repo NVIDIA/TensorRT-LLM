@@ -12,6 +12,7 @@ Plus sampling-metadata and audio contributions to cache identity.
 import torch
 from blake3 import blake3
 
+from tensorrt_llm.inputs import multimodal_data as md
 from tensorrt_llm.inputs.multimodal_data import AudioData, VideoData
 
 
@@ -32,38 +33,22 @@ def _make_video(raw_bytes_hash=None, audio=None, frames=None, meta=None):
     return VideoData(frames=frames, metadata=meta, audio=audio, raw_bytes_hash=raw_bytes_hash)
 
 
-def test_source_anchor_skips_frame_walk(monkeypatch):
+def _tensor_serialize_calls(spy) -> int:
+    return sum(1 for call in spy.call_args_list if isinstance(call.args[0], torch.Tensor))
+
+
+def test_source_anchor_skips_frame_walk(mocker):
     """When `raw_bytes_hash` is set the frames must not be serialized."""
-    calls = []
-    from tensorrt_llm.inputs import multimodal_data as md
-
-    real_serialize = md.serialize_item
-
-    def spy(obj):
-        calls.append(type(obj).__name__)
-        return real_serialize(obj)
-
-    monkeypatch.setattr(md, "serialize_item", spy)
+    spy = mocker.spy(md, "serialize_item")
     _hex(_make_video(raw_bytes_hash="a" * 64))
-    # metadata dict is serialized once; individual frame tensors must not appear.
-    assert "Tensor" not in calls
+    assert _tensor_serialize_calls(spy) == 0
 
 
-def test_frame_walk_fallback_serializes_every_frame(monkeypatch):
+def test_frame_walk_fallback_serializes_every_frame(mocker):
     """When `raw_bytes_hash` is None the fallback hashes each frame."""
-    calls = []
-    from tensorrt_llm.inputs import multimodal_data as md
-
-    real_serialize = md.serialize_item
-
-    def spy(obj):
-        calls.append(type(obj).__name__)
-        return real_serialize(obj)
-
-    monkeypatch.setattr(md, "serialize_item", spy)
+    spy = mocker.spy(md, "serialize_item")
     _hex(_make_video(raw_bytes_hash=None))
-    # 3 frames -> 3 Tensor serializations.
-    assert calls.count("Tensor") == 3
+    assert _tensor_serialize_calls(spy) == 3
 
 
 def test_source_anchor_hash_stable_across_frame_content():
