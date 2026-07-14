@@ -1061,7 +1061,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                 return video_noise_pred, {"audio": audio_noise_pred}
             return video_noise_pred
 
-        def post_step_fn(step_latents, step_extra_stream_latents):
+        def post_step_fn(step_latents):
             if velocity_mask is not None and condition_latents is not None:
                 step_latents = (
                     velocity_mask * step_latents + (1.0 - velocity_mask) * condition_latents
@@ -1071,7 +1071,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                 step_latents[:, :, 0:1, :, :] = image_latent.to(
                     device=step_latents.device, dtype=step_latents.dtype
                 )
-            return step_latents, step_extra_stream_latents
+            return step_latents
 
         # 5. Build CFG tensors — text_ids and text_mask need to be split for CFG
         #    BasePipeline.denoise batches [uncond, cond] when guidance_scale > 1
