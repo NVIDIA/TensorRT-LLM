@@ -249,8 +249,19 @@ class _StrategyImpls:
         ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
             pass
 
+        # TODO: Revisit this after determining performance impact
+        #
+        # NB: NaN logits can lead to crashes, see
+        #     https://github.com/flashinfer-ai/flashinfer/issues/1575
+        #
         @staticmethod
         def _flashinfer_check_nans(inputs: torch.Tensor) -> bool:
+            # Deliberately returns False to keep FlashInfer's own 'check_nan' path
+            # disabled: that path is a host-side `if torch.any(torch.isnan(...))`,
+            # which forces a device sync on every call. The explicit async
+            # device-side assert below provides the same protection without
+            # stalling the pipeline.
+            # https://github.com/pytorch/pytorch/issues/36853
             torch._assert_async(~torch.any(torch.isnan(inputs)))
             return False
 

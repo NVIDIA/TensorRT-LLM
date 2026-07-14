@@ -49,6 +49,11 @@ def top_k_top_p_sampling_from_logits_op(
     offset: Optional[SeedOrTensor] = None,
     check_nan: bool = False,
 ) -> torch.Tensor:
+    """Fused top-k + top-p sampling from pre-softmax logits.
+
+    Randomness: pass ``generator`` (eager) or ``seed``/``offset`` (CUDA graph);
+    see module docstring for the full contract.
+    """
     tokens: torch.Tensor = flashinfer.sampling.top_k_top_p_sampling_from_logits(
         logits,
         top_k=top_k,
@@ -71,6 +76,11 @@ def sampling_from_probs_op(
     offset: Optional[SeedOrTensor] = None,
     check_nan: bool = False,
 ) -> torch.Tensor:
+    """Categorical sampling from probabilities.
+
+    Randomness: pass ``generator`` (eager) or ``seed``/``offset`` (CUDA graph);
+    see module docstring for the full contract.
+    """
     tokens: torch.Tensor = flashinfer.sampling.sampling_from_probs(
         probs,
         deterministic=True,
@@ -91,6 +101,11 @@ def top_k_sampling_from_probs_op(
     offset: Optional[SeedOrTensor] = None,
     check_nan: bool = False,
 ) -> torch.Tensor:
+    """Top-k filtered sampling from probabilities.
+
+    Randomness: pass ``generator`` (eager) or ``seed``/``offset`` (CUDA graph);
+    see module docstring for the full contract.
+    """
     tokens: torch.Tensor = flashinfer.sampling.top_k_sampling_from_probs(
         probs,
         top_k=top_k,
@@ -112,6 +127,11 @@ def top_p_sampling_from_probs_op(
     offset: Optional[SeedOrTensor] = None,
     check_nan: bool = False,
 ) -> torch.Tensor:
+    """Top-p filtered sampling from probabilities.
+
+    Randomness: pass ``generator`` (eager) or ``seed``/``offset`` (CUDA graph);
+    see module docstring for the full contract.
+    """
     tokens: torch.Tensor = flashinfer.sampling.top_p_sampling_from_probs(
         probs,
         top_p=top_p,
@@ -122,6 +142,12 @@ def top_p_sampling_from_probs_op(
         offset=offset,
     )
     return tokens
+
+
+# The three ops below wrap the mask -> softmax -> renorm pipeline stages 1:1.
+# The wrappers exist so callers stay importable without flashinfer installed
+# (the flashinfer import above is guarded); softmax_op additionally centralizes
+# the PDL env decision.
 
 
 def softmax_op(

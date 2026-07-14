@@ -3174,8 +3174,10 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             pin_memory=pin_memory,
             dtype=torch.int32,
         )
-        logprobs_tensor = logprobs_tensor_full[:, :-preallocate_extra_steps, :]
-        logprobs_indices_tensor = logprobs_indices_tensor_full[:, :-preallocate_extra_steps, :]
+        # NB: forward slicing, because [:, :-0, :] would yield an empty view
+        #     instead of the full history when preallocate_extra_steps == 0.
+        logprobs_tensor = logprobs_tensor_full[:, :num_generated_tokens, :]
+        logprobs_indices_tensor = logprobs_indices_tensor_full[:, :num_generated_tokens, :]
         if logprobs_tensor.numel() > 0:
             logprobs_list = request.py_result.log_probs
             assert logprobs_list is not None
@@ -4278,44 +4280,53 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
     def _apply_min_length_penalty(
         logits: torch.Tensor,
         requests: list[LlmRequest],
-        num_steps: list[int],
-        num_beams: list[int],
-    ) -> torch.Tensor:
-        """Inplace apply min_length_penalty to logits.
+        num_steps_tensor: torch.Tensor,
+        num_beams_tensor: torch.Tensor,
+    ) -> None:
+        """Apply min_length_penalty to logits, mutating ``logits`` in place.
 
         Args:
             logits: The logits to apply min length penalty to
             requests: The requests to apply min length penalty to
-            num_steps: The number of steps per request
-
-        Returns:
-            The logits with min length penalty applied
+            num_steps_tensor: The number of steps per request (host tensor)
+            num_beams_tensor: The number of beams per request (host tensor)
         """
         if not any(
             r.py_min_length and (r.max_beam_num_tokens - r.py_orig_prompt_len) < r.py_min_length[0]
             for r in requests
         ):
-            return logits
+            return
+
+        # Deferred host conversion: only needed on the (rare) penalty path.
+        num_steps = num_steps_tensor.tolist()
+        num_beams = num_beams_tensor.tolist()
 
         rows: list[int] = []
         cols: list[int] = []
         current_offset = 0
         for index, r in enumerate(requests):
-            if r.py_min_length:
-                # Use the original end_id (before ignore_eos override)
-                # so we suppress the real EOS token, not token -1.
-                end_id = getattr(r, "py_original_end_id", r.py_end_id)
-                if end_id is not None and end_id > -1:
-                    for beam_idx in range(num_beams[index]):
-                        for step in range(num_steps[index]):
-                            if (
-                                r.get_num_tokens(beam_idx) - r.py_orig_prompt_len
-                            ) + step < r.py_min_length[0]:
-                                rows.append(current_offset + num_steps[index] * beam_idx + step)
-                                cols.append(end_id)
-                            else:
-                                break
+            # Advance the offset before any guard below can skip the request:
+            # every request occupies its logits rows, penalized or not.
+            req_offset = current_offset
             current_offset += num_steps[index] * num_beams[index]
+
+            if not r.py_min_length:
+                continue
+            # Use the original end_id (before ignore_eos override)
+            # so we suppress the real EOS token, not token -1.
+            end_id = getattr(r, "py_original_end_id", r.py_end_id)
+            if end_id is None or end_id <= -1:
+                continue
+
+            for beam_idx in range(num_beams[index]):
+                for step in range(num_steps[index]):
+                    if (r.get_num_tokens(beam_idx) - r.py_orig_prompt_len) + step < r.py_min_length[
+                        0
+                    ]:
+                        rows.append(req_offset + num_steps[index] * beam_idx + step)
+                        cols.append(end_id)
+                    else:
+                        break
 
         if rows:
             neg_inf = torch.full((), float("-inf"), dtype=logits.dtype, device=logits.device)
@@ -4326,8 +4337,6 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 logits.device, non_blocking=True
             )
             logits.index_put_((row_idx, col_idx), neg_inf, accumulate=False)
-
-        return logits
 
     @staticmethod
     def _select_generated_logits(
@@ -4634,11 +4643,11 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             logits_cuda, sampling_requests, sampling_requests_metadata.req_num_steps
         )
 
-        logits_cuda = self._apply_min_length_penalty(
+        self._apply_min_length_penalty(
             logits_cuda,
             sampling_requests,
-            sampling_requests_metadata.req_num_steps.tolist(),
-            sampling_requests_metadata.req_num_beams.tolist(),
+            sampling_requests_metadata.req_num_steps,
+            sampling_requests_metadata.req_num_beams,
         )
 
         # Fast path for greedy sampling
