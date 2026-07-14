@@ -18,6 +18,65 @@ import torch.nn.functional as F
 
 from .utils import read_video_tensor
 
+# Cosmos3 output resolution buckets keyed by target level, then aspect ratio;
+# each value is (width, height). A source frame maps onto the bucket whose
+# aspect ratio is closest (see ``find_closest_target_size``).
+VIDEO_RES_SIZE_INFO: dict[str, dict[str, tuple[int, int]]] = {
+    "256": {
+        "1,1": (256, 256),
+        "4,3": (320, 256),
+        "3,4": (256, 320),
+        "16,9": (320, 192),
+        "9,16": (192, 320),
+    },
+    "480": {
+        "1,1": (640, 640),
+        "4,3": (736, 544),
+        "3,4": (544, 736),
+        "16,9": (832, 480),
+        "9,16": (480, 832),
+    },
+    "704": {
+        "1,1": (960, 960),
+        "4,3": (1088, 832),
+        "3,4": (832, 1088),
+        "16,9": (1280, 704),
+        "9,16": (704, 1280),
+    },
+    "720": {
+        "1,1": (960, 960),
+        "4,3": (1104, 832),
+        "3,4": (832, 1104),
+        "16,9": (1280, 720),
+        "9,16": (720, 1280),
+    },
+}
+
+
+def find_closest_target_size(h: int, w: int, resolution: str | int) -> tuple[int, int]:
+    """Pick the ``resolution`` bucket whose aspect ratio best matches ``h/w``.
+
+    Returns ``(target_w, target_h)`` so a source frame maps onto a supported
+    output size without distorting its aspect ratio.
+    """
+    key = str(resolution)
+    if key not in VIDEO_RES_SIZE_INFO:
+        raise ValueError(
+            f"Unknown Cosmos3 transfer resolution={resolution!r}; "
+            f"expected one of {sorted(VIDEO_RES_SIZE_INFO)}."
+        )
+    input_ratio = h / w
+    best_size = None
+    best_diff = float("inf")
+    for cand_w, cand_h in VIDEO_RES_SIZE_INFO[key].values():
+        diff = abs(input_ratio - cand_h / cand_w)
+        if diff < best_diff:
+            best_diff = diff
+            best_size = (cand_w, cand_h)
+    assert best_size is not None
+    return best_size
+
+
 TRANSFER_HINT_KEYS: tuple[str, ...] = ("edge", "blur", "depth", "seg", "wsm")
 TRANSFER_SAMPLE_DEFAULTS: dict[str, Any] = {
     "num_video_frames_per_chunk": 93,

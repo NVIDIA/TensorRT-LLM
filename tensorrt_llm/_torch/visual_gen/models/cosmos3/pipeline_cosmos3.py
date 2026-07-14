@@ -54,6 +54,7 @@ from .guardrails import check_video_safety, download_guardrail_checkpoint
 from .sound_tokenizer import LatentAutoEncoderV2
 from .transfer import (
     Cosmos3TransferConfig,
+    find_closest_target_size,
     load_or_compute_control_frames,
     media_hw,
     media_to_uint8_cthw,
@@ -916,8 +917,6 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         if transfer_config is not None:
             if is_t2i:
                 raise ValueError("Cosmos3 transfer inference is supported only for video outputs.")
-            if do_action:
-                raise ValueError("Cosmos3 transfer inference cannot be combined with action generation.")
             if enable_audio:
                 raise ValueError("Cosmos3 transfer inference cannot be combined with sound generation.")
         guidance_interval = None
