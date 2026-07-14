@@ -44,7 +44,7 @@ from tensorrt_llm._torch.speculative.interface import (
 
 
 class _StubSpecWorker(SpecWorkerBase):
-    """Concrete ``SpecWorkerBase`` that stubs out the only abstract API.
+    """Concrete ``SpecWorkerBase`` that stubs out the abstract API.
 
     Used purely to drive ``_apply_force_accepted_tokens`` in isolation.
     """
@@ -52,6 +52,9 @@ class _StubSpecWorker(SpecWorkerBase):
     @property
     def max_draft_len(self) -> int:
         return 8
+
+    def _forward_impl(self, *args, **kwargs):
+        raise NotImplementedError
 
 
 def _make_worker(value: Optional[float] = None) -> _StubSpecWorker:

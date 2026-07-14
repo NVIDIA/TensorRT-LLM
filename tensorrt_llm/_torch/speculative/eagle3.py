@@ -625,6 +625,14 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         # MTP Eagle: lazily-resolved flag for Mamba hybrid cache support
         self._is_mamba_hybrid_cache = None
 
+        # Worker-side saved spec-dec params; initialized so that a failure
+        # inside _prepare_attn_metadata_for_spec_dec (e.g. an OOM in the
+        # clone calls) cannot turn the cleanup restore into AttributeError.
+        self._saved_packed_mask = None
+        self._saved_position_offsets = None
+        self._saved_position_offsets_cpp = None
+        self._saved_generation_lengths = None
+
     @property
     def max_draft_len(self) -> int:
         return self.spec_config.max_draft_len
@@ -680,15 +688,15 @@ class Eagle3OneModelWorker(SpecWorkerBase):
     # Skip torch.compile for now since current Torch is not compatible with Triton 3.4
     # @torch.compile(options={"max-autotune": True})
 
-    def forward(self,
-                input_ids,
-                position_ids,
-                hidden_states,
-                logits,
-                attn_metadata,
-                spec_metadata,
-                draft_model,
-                resource_manager=None):
+    def _forward_impl(self,
+                      input_ids,
+                      position_ids,
+                      hidden_states,
+                      logits,
+                      attn_metadata,
+                      spec_metadata,
+                      draft_model,
+                      resource_manager=None):
 
         runtime_draft_len = spec_metadata.runtime_draft_len
         # skip the draft forward if the runtime draft length is 0
@@ -737,44 +745,35 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                 max_draft_len=runtime_draft_len,
             )
 
-        # Save the old attn_metadata and spec_metadata. The save/restore
-        # pair must be exception-safe: a failure between them (e.g. an OOM
-        # during the max-shape general warmup, which model_engine tolerates
-        # and skips) would otherwise leave stale saved state on the
-        # persistent attn_metadata and fail every subsequent forward at
-        # the pairing assert in prepare_for_spec_dec.
-        # https://nvbugs/6442074
-        try:
-            self._prepare_attn_metadata_for_spec_dec(attn_metadata)
+        # Save the old attn_metadata and spec_metadata
+        self._prepare_attn_metadata_for_spec_dec(attn_metadata)
 
-            # Prepare inputs for the 1st draft model forward
-            position_ids = position_ids.squeeze(0)
-            inputs = self.prepare_1st_drafter_inputs(
-                input_ids=input_ids,
-                position_ids=position_ids,
-                hidden_states=hidden_states,
-                accepted_tokens=accepted_tokens,
-                attn_metadata=attn_metadata,
-                spec_metadata=spec_metadata,
-                draft_model=draft_model)
+        # Prepare inputs for the 1st draft model forward
+        position_ids = position_ids.squeeze(0)
+        inputs = self.prepare_1st_drafter_inputs(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            hidden_states=hidden_states,
+            accepted_tokens=accepted_tokens,
+            attn_metadata=attn_metadata,
+            spec_metadata=spec_metadata,
+            draft_model=draft_model)
 
-            # Predict draft tokens. ``original_all_rank_num_tokens`` is saved
-            # here so the post-loop restore (below) can put attn_metadata
-            # back into a state the target model expects.
-            original_all_rank_num_tokens = attn_metadata.all_rank_num_tokens
+        # Predict draft tokens. ``original_all_rank_num_tokens`` is saved here
+        # so the post-loop restore (below) can put attn_metadata back into a
+        # state the target model expects.
+        original_all_rank_num_tokens = attn_metadata.all_rank_num_tokens
 
-            # Get the draft KV cache manager if using separate layouts
-            draft_kv_cache_manager = self.get_draft_kv_cache_manager(
-                resource_manager)
+        # Get the draft KV cache manager if using separate layouts
+        draft_kv_cache_manager = self.get_draft_kv_cache_manager(
+            resource_manager)
 
-            next_draft_tokens = self._forward_draft_loop(
-                inputs, attn_metadata, spec_metadata, draft_model,
-                draft_kv_cache_manager, num_contexts, num_gens, batch_size,
-                num_accepted_tokens, original_all_rank_num_tokens,
-                resource_manager)
-        finally:
-            # restore attn_metadata to support cuda graph
-            self._restore_attn_metadata_from_spec_dec(attn_metadata)
+        next_draft_tokens = self._forward_draft_loop(
+            inputs, attn_metadata, spec_metadata, draft_model,
+            draft_kv_cache_manager, num_contexts, num_gens, batch_size,
+            num_accepted_tokens, original_all_rank_num_tokens, resource_manager)
+        # restore attn_metadata to support cuda graph
+        self._restore_attn_metadata_from_spec_dec(attn_metadata)
         # restore all_rank_num_tokens for attention DP
         if original_all_rank_num_tokens is not None:
             attn_metadata.all_rank_num_tokens = original_all_rank_num_tokens
