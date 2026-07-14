@@ -502,8 +502,6 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         self,
         image_tensor: torch.Tensor,
         num_frames: int,
-        height: int,
-        width: int,
     ) -> torch.Tensor:
         """VAE-encode a conditioning image as a full-length video.
 
@@ -518,8 +516,6 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         Args:
             image_tensor: [1, 3, H, W] in [-1, 1]
             num_frames: total pixel frames for the video
-            height: pixel height
-            width: pixel width
 
         Returns:
             [1, C, T_latent, H_latent, W_latent] normalized latent of the
@@ -572,8 +568,6 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         cond_latent = self._encode_conditioning_video(
             image_tensor,
             num_frames,
-            height,
-            width,
         )  # [1, C, T_lat, H_lat, W_lat]
 
         # Keep only frame 0 for conditioning; replace rest with noise
