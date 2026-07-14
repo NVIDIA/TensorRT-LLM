@@ -144,6 +144,7 @@ class PARDWorker(SpecWorkerBase):
 
             if batch_size > num_contexts:
                 attn_metadata.kv_lens_cuda[num_contexts:batch_size] += 1
+            self._kv_rewind_pending = True
 
             attn_metadata.update_for_spec_dec()
 
@@ -155,8 +156,11 @@ class PARDWorker(SpecWorkerBase):
         by prepare_for_spec_dec) to avoid cumulative shrinkage.  Applied during
         capture and normal inference.
         """
+        self._kv_rewind_pending = False
         is_warmup = spec_metadata.is_cuda_graph and not torch.cuda.is_current_stream_capturing()
         if is_warmup:
+            # kv_lens_cuda was saved by prepare_for_spec_dec in this mode and
+            # is restored wholesale, so no rewind is needed.
             return
 
         if hasattr(self, "_kv_rewind_amount") and hasattr(attn_metadata, "kv_lens_cuda"):
@@ -165,7 +169,19 @@ class PARDWorker(SpecWorkerBase):
             attn_metadata.kv_lens_cuda[nc:bs] -= self._kv_rewind_amount
             attn_metadata.kv_lens_cuda[nc:bs].clamp_(min=0)
 
-    def forward(
+    def _ensure_spec_dec_state_restored(self, attn_metadata, spec_metadata):
+        # Restore first (in warmup mode kv_lens_cuda was saved and comes back
+        # wholesale), then apply any pending rewind for the other modes so a
+        # failed draft forward does not leave kv_lens_cuda incremented.
+        super()._ensure_spec_dec_state_restored(attn_metadata, spec_metadata)
+        if (
+            getattr(self, "_kv_rewind_pending", False)
+            and attn_metadata is not None
+            and spec_metadata is not None
+        ):
+            self._apply_kv_rewind_after_draft(attn_metadata, spec_metadata)
+
+    def _forward_impl(
         self,
         input_ids,
         position_ids,
@@ -236,120 +252,100 @@ class PARDWorker(SpecWorkerBase):
                 max_draft_len=K,
             )
 
-        # Save attn_metadata state and adjust kv_lens for the draft forward.
-        # The save/restore pair must be exception-safe: a failure between them
-        # (e.g. an OOM during the max-shape general warmup, which model_engine
-        # tolerates and skips) would otherwise leave stale saved state on the
-        # persistent attn_metadata and fail every subsequent forward at the
-        # pairing assert in prepare_for_spec_dec.
-        # https://nvbugs/6442074
-        #
-        # Drop any rewind state left over from a previous call first, so a
-        # failure before _prepare_kv_for_draft_forward runs cannot make the
-        # finally block below re-apply a stale rewind.
-        if hasattr(self, "_kv_rewind_amount"):
-            del self._kv_rewind_amount
-        try:
-            self._prepare_attn_metadata_for_pard(attn_metadata, spec_metadata)
-            self._prepare_kv_for_draft_forward(
-                attn_metadata, num_accepted_tokens, num_contexts, batch_size
-            )
+        self._prepare_attn_metadata_for_pard(attn_metadata, spec_metadata)
+        self._prepare_kv_for_draft_forward(
+            attn_metadata, num_accepted_tokens, num_contexts, batch_size
+        )
 
-            position_ids = position_ids.squeeze(0)
-            inputs = self.prepare_1st_drafter_inputs(
-                input_ids=input_ids,
-                position_ids=position_ids,
-                hidden_states=hidden_states,
-                accepted_tokens=accepted_tokens,
-                num_accepted_tokens=num_accepted_tokens,
-                attn_metadata=attn_metadata,
-                spec_metadata=spec_metadata,
-                draft_model=draft_model,
-            )
+        position_ids = position_ids.squeeze(0)
+        inputs = self.prepare_1st_drafter_inputs(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            hidden_states=hidden_states,
+            accepted_tokens=accepted_tokens,
+            num_accepted_tokens=num_accepted_tokens,
+            attn_metadata=attn_metadata,
+            spec_metadata=spec_metadata,
+            draft_model=draft_model,
+        )
 
-            draft_kv_cache_manager = self.get_draft_kv_cache_manager(resource_manager)
+        draft_kv_cache_manager = self.get_draft_kv_cache_manager(resource_manager)
 
-            if num_gens > 0:
-                with self.draft_kv_cache_context(attn_metadata, draft_kv_cache_manager):
-                    hidden_states_out = draft_model.model(**inputs)
+        if num_gens > 0:
+            with self.draft_kv_cache_context(attn_metadata, draft_kv_cache_manager):
+                hidden_states_out = draft_model.model(**inputs)
 
-                    # Gather K logits per gen request starting at the bonus position.
-                    # Layout: [acc_0..acc_M, masks] (2K total). Positions M..M+K-1
-                    # produce K unique draft predictions (bonus + K-1 masks).
-                    gen_start_idx = attn_metadata.num_ctx_tokens
+                # Gather K logits per gen request starting at the bonus position.
+                # Layout: [acc_0..acc_M, masks] (2K total). Positions M..M+K-1
+                # produce K unique draft predictions (bonus + K-1 masks).
+                gen_start_idx = attn_metadata.num_ctx_tokens
 
-                    request_bases = (
-                        torch.arange(num_gens, dtype=torch.long, device="cuda") * (2 * K)
-                        + gen_start_idx
+                request_bases = (
+                    torch.arange(num_gens, dtype=torch.long, device="cuda") * (2 * K)
+                    + gen_start_idx
+                )
+
+                gen_num_accepted = num_accepted_tokens[num_contexts:batch_size].long()
+                base_offsets = gen_num_accepted - 1  # M = bonus position
+                offsets = torch.arange(K, dtype=torch.long, device="cuda")
+
+                gen_gather_ids = (
+                    request_bases.unsqueeze(1) + base_offsets.unsqueeze(1) + offsets.unsqueeze(0)
+                ).flatten()
+                gen_gather_ids = gen_gather_ids.clamp(max=hidden_states_out.shape[0] - 1)
+
+                gen_logits = draft_model.logits_processor(
+                    hidden_states_out[gen_gather_ids], draft_model.lm_head, attn_metadata, True
+                )
+
+                vocab_size = gen_logits.shape[-1]
+                gen_logits = gen_logits.reshape(num_gens, K, vocab_size)
+
+                # Use torch.argmax directly to avoid cute_argmax stride issues
+                d2t = getattr(draft_model.model, "d2t", None)
+                gen_draft_tokens = torch.argmax(gen_logits, dim=-1, keepdim=False).long()
+
+                if d2t is not None:
+                    gen_draft_tokens = d2t[gen_draft_tokens] + gen_draft_tokens
+
+                gen_draft_tokens = gen_draft_tokens.type(torch.int32)
+
+                if self.sa_enhancer is not None and sa_manager is not None:
+                    gen_draft_tokens = self.sa_enhancer.maybe_override_all_draft_tokens(
+                        gen_draft_tokens
                     )
 
-                    gen_num_accepted = num_accepted_tokens[num_contexts:batch_size].long()
-                    base_offsets = gen_num_accepted - 1  # M = bonus position
-                    offsets = torch.arange(K, dtype=torch.long, device="cuda")
+                # Pad from (num_gens, K) to (num_gens, 2K-1).
+                if K > 1:
+                    pad = torch.zeros((num_gens, K - 1), dtype=torch.int32, device="cuda")
+                    gen_draft_tokens = torch.cat([gen_draft_tokens, pad], dim=1)
 
-                    gen_gather_ids = (
-                        request_bases.unsqueeze(1)
-                        + base_offsets.unsqueeze(1)
-                        + offsets.unsqueeze(0)
-                    ).flatten()
-                    gen_gather_ids = gen_gather_ids.clamp(max=hidden_states_out.shape[0] - 1)
+        elif num_contexts > 0 and self.use_separate_draft_kv_cache:
+            # Pure context batch: populate the draft KV cache so it's
+            # ready when generation starts.
+            with self.draft_kv_cache_context(attn_metadata, draft_kv_cache_manager):
+                draft_model.model(**inputs)
+            gen_draft_tokens = torch.empty((0, 2 * K - 1), dtype=torch.int32, device="cuda")
 
-                    gen_logits = draft_model.logits_processor(
-                        hidden_states_out[gen_gather_ids], draft_model.lm_head, attn_metadata, True
-                    )
+        else:
+            gen_draft_tokens = torch.empty((0, 2 * K - 1), dtype=torch.int32, device="cuda")
 
-                    vocab_size = gen_logits.shape[-1]
-                    gen_logits = gen_logits.reshape(num_gens, K, vocab_size)
+        if num_contexts > 0 and num_gens > 0:
+            ctx_draft_tokens = torch.zeros(
+                (num_contexts, 2 * K - 1), dtype=torch.int32, device="cuda"
+            )
+            next_draft_tokens = torch.cat([ctx_draft_tokens, gen_draft_tokens], dim=0)
+        elif num_contexts > 0:
+            next_draft_tokens = torch.zeros(
+                (num_contexts, 2 * K - 1), dtype=torch.int32, device="cuda"
+            )
+        else:
+            next_draft_tokens = gen_draft_tokens
 
-                    # Use torch.argmax directly to avoid cute_argmax stride issues
-                    d2t = getattr(draft_model.model, "d2t", None)
-                    gen_draft_tokens = torch.argmax(gen_logits, dim=-1, keepdim=False).long()
+        self._restore_attn_metadata_from_spec_dec(attn_metadata)
 
-                    if d2t is not None:
-                        gen_draft_tokens = d2t[gen_draft_tokens] + gen_draft_tokens
-
-                    gen_draft_tokens = gen_draft_tokens.type(torch.int32)
-
-                    if self.sa_enhancer is not None and sa_manager is not None:
-                        gen_draft_tokens = self.sa_enhancer.maybe_override_all_draft_tokens(
-                            gen_draft_tokens
-                        )
-
-                    # Pad from (num_gens, K) to (num_gens, 2K-1).
-                    if K > 1:
-                        pad = torch.zeros((num_gens, K - 1), dtype=torch.int32, device="cuda")
-                        gen_draft_tokens = torch.cat([gen_draft_tokens, pad], dim=1)
-
-            elif num_contexts > 0 and self.use_separate_draft_kv_cache:
-                # Pure context batch: populate the draft KV cache so it's
-                # ready when generation starts.
-                with self.draft_kv_cache_context(attn_metadata, draft_kv_cache_manager):
-                    draft_model.model(**inputs)
-                gen_draft_tokens = torch.empty((0, 2 * K - 1), dtype=torch.int32, device="cuda")
-
-            else:
-                gen_draft_tokens = torch.empty((0, 2 * K - 1), dtype=torch.int32, device="cuda")
-
-            if num_contexts > 0 and num_gens > 0:
-                ctx_draft_tokens = torch.zeros(
-                    (num_contexts, 2 * K - 1), dtype=torch.int32, device="cuda"
-                )
-                next_draft_tokens = torch.cat([ctx_draft_tokens, gen_draft_tokens], dim=0)
-            elif num_contexts > 0:
-                next_draft_tokens = torch.zeros(
-                    (num_contexts, 2 * K - 1), dtype=torch.int32, device="cuda"
-                )
-            else:
-                next_draft_tokens = gen_draft_tokens
-        finally:
-            self._restore_attn_metadata_from_spec_dec(attn_metadata)
-
-            # Deferred kv_lens rewind (must happen after restore so it persists).
-            # Kept inside the finally, ordered after the restore: if the draft
-            # forward fails after _prepare_kv_for_draft_forward incremented
-            # kv_lens_cuda, the rewind must still be applied or the next
-            # iteration sees wrong KV lengths.
-            self._apply_kv_rewind_after_draft(attn_metadata, spec_metadata)
+        # Deferred kv_lens rewind (must happen after restore so it persists).
+        self._apply_kv_rewind_after_draft(attn_metadata, spec_metadata)
 
         next_new_tokens = self._prepare_next_new_tokens(
             accepted_tokens,

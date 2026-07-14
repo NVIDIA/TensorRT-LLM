@@ -427,6 +427,11 @@ class AttentionMetadata:
             setattr(self, f, v)
         self._saved_tensors.clear()
 
+    @property
+    def has_spec_dec_saved_state(self) -> bool:
+        """True when prepare_for_spec_dec state has not been restored yet."""
+        return bool(self._saved_tensors)
+
     def update_spec_dec_param(
             self,
             batch_size,
