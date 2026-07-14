@@ -190,6 +190,7 @@ def _make_creator(
     creator._execution_stream = None
     creator._draft_config = None
     creator._skip_est = True
+    creator._fp8_ctx_mla_kv_len_cap = None
     return creator
 
 
