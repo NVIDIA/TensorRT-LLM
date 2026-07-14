@@ -70,7 +70,7 @@ def _checkpoint_files(path: Path) -> tuple[Path, list[Path]]:
     files = []
     for directory, directory_names, file_names in os.walk(path, onerror=_raise_walk_error):
         retained_directories = []
-        for directory_name in sorted(directory_names):
+        for directory_name in directory_names:
             if directory_name in _IGNORED_DIRECTORY_NAMES:
                 continue
             nested_directory = Path(directory) / directory_name
@@ -81,7 +81,7 @@ def _checkpoint_files(path: Path) -> tuple[Path, list[Path]]:
                 )
             retained_directories.append(directory_name)
         directory_names[:] = retained_directories
-        for file_name in sorted(file_names):
+        for file_name in file_names:
             if file_name in _IGNORED_FILE_NAMES:
                 continue
             candidate = Path(directory) / file_name
