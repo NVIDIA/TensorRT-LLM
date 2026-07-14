@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Tests for PyExecutor request handling functionality.
 
 This module tests the request handling logic that was moved from ExecutorRequestQueue
@@ -24,7 +27,7 @@ from tensorrt_llm._torch.pyexecutor.executor_request_queue import (
 )
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState, SamplingConfig
 from tensorrt_llm._torch.pyexecutor.py_executor import DisaggTransferAdmissionController, PyExecutor
-from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
+from tensorrt_llm._torch.pyexecutor.resource_manager import NoFreeSlotsError, ResourceManagerType
 from tensorrt_llm._torch.pyexecutor.scheduler import (
     FCFSWaitingQueue,
     ScheduledRequests,
@@ -1162,6 +1165,13 @@ _STATE_GENERATION_TO_COMPLETE = LlmRequestState.GENERATION_TO_COMPLETE
 _STATE_DISAGG_GENERATION_INIT = "_disagg_init_sentinel"
 _STATE_DISAGG_GENERATION_TRANS_IN_PROGRESS = "_disagg_trans_sentinel"
 
+# The sentinel mocks must expose the real state ints: the pad predicate
+# compares state_value against the scheduler window bounds.
+_SENTINEL_STATE_VALUES = {
+    _STATE_DISAGG_GENERATION_INIT: LlmRequestState.DISAGG_GENERATION_INIT.value,
+    _STATE_DISAGG_GENERATION_TRANS_IN_PROGRESS: LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS.value,
+}
+
 
 def _make_adp_request(
     state,
@@ -1174,6 +1184,11 @@ def _make_adp_request(
 ):
     req = Mock()
     req.state = state
+    req.state_value = (
+        state.value
+        if isinstance(state, LlmRequestState)
+        else _SENTINEL_STATE_VALUES.get(state, LlmRequestState.GENERATION_IN_PROGRESS.value)
+    )
     req.py_request_id = request_id
     req.is_child = is_child
     req.parent_request_id = parent_request_id
@@ -1184,6 +1199,7 @@ def _make_adp_request(
     req.is_dummy_request = is_dummy_request
     req.is_attention_dp_dummy = False
     req.llm_request_type = llm_request_type
+    req.py_seq_slot = None
     return req
 
 
@@ -1196,6 +1212,7 @@ class _StubADPExecutor:
         max_num_tokens=8192,
         is_warmup=False,
         benchmark_req_queues_size=0,
+        enable_dsv4_adp_dummy_fixes=True,
     ):
         self.enable_attention_dp = enable_attention_dp
         self.kv_cache_transceiver = kv_cache_transceiver
@@ -1208,13 +1225,25 @@ class _StubADPExecutor:
         self.max_total_draft_tokens = 0
         self.max_num_tokens = max_num_tokens
         self._adp_dummy_is_gen = True
+        self._pending_adp_dummy_request = None
+        self._enable_dsv4_adp_dummy_fixes = enable_dsv4_adp_dummy_fixes
         self.add_dummy_calls = []
 
+        self.dist = Mock()
+        self.dist.tp_size = 1
+        self.dist.tp_allgather.side_effect = lambda value: [value]
+
         kv_cache_manager = Mock()
+        kv_cache_manager.mapping.has_cp_helix.return_value = False
+        kv_cache_manager.get_num_available_tokens.return_value = 1 << 30
 
         def _add_dummy(**kwargs):
             self.add_dummy_calls.append(kwargs)
-            req = _make_adp_request(_STATE_GENERATION_IN_PROGRESS, is_dummy_request=True)
+            req = _make_adp_request(
+                _STATE_GENERATION_IN_PROGRESS,
+                request_id=kwargs["request_ids"][0],
+                is_dummy_request=True,
+            )
             return [req]
 
         kv_cache_manager.add_dummy_requests.side_effect = _add_dummy
@@ -1225,7 +1254,11 @@ class _StubADPExecutor:
 
 
 def _run_pad(stub):
-    for helper in ("_count_schedulable_active_requests", "_should_skip_dummy_for_benchmark_disagg"):
+    for helper in (
+        "_count_schedulable_active_requests",
+        "_has_adp_dummy_kv_capacity",
+        "_should_skip_dummy_for_benchmark_disagg",
+    ):
         setattr(stub, helper, types.MethodType(getattr(PyExecutor, helper), stub))
     PyExecutor._pad_attention_dp_dummy_request(stub)
 
@@ -1306,18 +1339,202 @@ def test_adp_dummy_role_unchanged_when_attention_dp_disabled():
     assert stub._adp_dummy_is_gen is True
 
 
-def test_pad_dummy_counts_generation_to_complete():
-    # Regression for test_ptp_quickstart_advanced_deepseek_v3_lite_4gpus_adp_balance:
-    # a GENERATION_TO_COMPLETE request still counts as active, so no dummy is added
-    # on top of it (which would overflow max_batch_size=1).
-    stub = _StubADPExecutor(kv_cache_transceiver=None)
-    stub.active_requests = [_make_adp_request(_STATE_GENERATION_TO_COMPLETE)]
+@pytest.mark.parametrize(
+    "state",
+    [
+        _STATE_GENERATION_TO_COMPLETE,
+        LlmRequestState.DISAGG_CONTEXT_WAIT_SCHEDULER,
+    ],
+)
+def test_disabled_dsv4_gate_preserves_existing_disagg_behavior(state):
+    # The disabled gate covers non-DSv4 and PP configurations.
+    stub = _StubADPExecutor(enable_dsv4_adp_dummy_fixes=False)
+    stub.active_requests = [_make_adp_request(state)]
     stub.expected_num_active_requests = 1
 
     _run_pad(stub)
 
     assert stub.add_dummy_calls == []
     assert len(stub.active_requests) == 1
+
+
+def test_pad_dummy_added_when_only_to_complete_requests_disagg():
+    # In disaggregated mode a GENERATION_TO_COMPLETE request is refused by
+    # MicroBatchScheduler (no_schedule_after_state), so a rank holding only
+    # such requests schedules batch=0. It must receive a pad dummy, or
+    # can_queue goes False fleet-wide and pad dummies leak on other ranks.
+    stub = _StubADPExecutor()
+    stub.active_requests = [_make_adp_request(_STATE_GENERATION_TO_COMPLETE)]
+    stub.expected_num_active_requests = 2
+
+    _run_pad(stub)
+
+    assert len(stub.add_dummy_calls) == 1
+    assert len(stub.active_requests) == 2
+
+
+def test_pad_dummy_added_when_only_wait_scheduler_requests_disagg():
+    # Gen-first mode on the context server: DISAGG_CONTEXT_WAIT_SCHEDULER
+    # sits BELOW the scheduler's window [CONTEXT_INIT, GENERATION_TO_COMPLETE)
+    # (no_schedule_until_state), so a rank holding only such requests
+    # schedules batch=0 and must receive a pad dummy — the left-boundary
+    # mirror of the TO_COMPLETE case above.
+    stub = _StubADPExecutor()
+    stub.active_requests = [_make_adp_request(LlmRequestState.DISAGG_CONTEXT_WAIT_SCHEDULER)]
+    stub.expected_num_active_requests = 2
+
+    _run_pad(stub)
+
+    assert len(stub.add_dummy_calls) == 1
+    assert len(stub.active_requests) == 2
+
+
+def test_pad_dummy_allocation_failure_skips_padding():
+    # add_dummy_requests returns None when the rank has no free cache
+    # resources for even a 1-token dummy (possible while non-schedulable
+    # requests still hold theirs). Padding must degrade to a skipped
+    # iteration, not crash on an unchecked [0].
+    stub = _StubADPExecutor()
+    stub.active_requests = [_make_adp_request(_STATE_GENERATION_TO_COMPLETE)]
+    stub.expected_num_active_requests = 2
+    stub.kv_cache_manager.add_dummy_requests.side_effect = None
+    stub.kv_cache_manager.add_dummy_requests.return_value = None
+
+    _run_pad(stub)
+
+    assert len(stub.active_requests) == 1
+    assert not any(r.is_attention_dp_dummy for r in stub.active_requests)
+
+
+def test_dsv4_pad_dummy_checks_full_context_capacity():
+    stub = _StubADPExecutor(max_num_tokens=4096)
+    stub._adp_dummy_is_gen = False
+    stub.kv_cache_manager.get_num_available_tokens.return_value = 1024
+
+    _run_pad(stub)
+
+    stub.kv_cache_manager.get_num_available_tokens.assert_called_once_with(
+        token_num_upper_bound=4096, max_num_draft_tokens=0
+    )
+    stub.kv_cache_manager.add_dummy_requests.assert_not_called()
+    assert stub._pending_adp_dummy_request is None
+
+
+def test_dsv4_pad_dummy_checks_full_generation_capacity():
+    stub = _StubADPExecutor()
+    stub.kv_cache_manager.get_num_available_tokens.return_value = 0
+
+    _run_pad(stub)
+
+    stub.kv_cache_manager.get_num_available_tokens.assert_called_once_with(
+        token_num_upper_bound=1, max_num_draft_tokens=0
+    )
+    stub.kv_cache_manager.add_dummy_requests.assert_not_called()
+    assert stub._pending_adp_dummy_request is None
+
+
+def test_dsv4_pad_dummy_capacity_includes_draft_reserve():
+    stub = _StubADPExecutor()
+    stub.max_total_draft_tokens = 3
+    stub.kv_cache_manager.get_num_available_tokens.return_value = 3
+
+    _run_pad(stub)
+
+    stub.kv_cache_manager.get_num_available_tokens.assert_called_once_with(
+        token_num_upper_bound=4, max_num_draft_tokens=3
+    )
+    stub.kv_cache_manager.add_dummy_requests.assert_not_called()
+    assert stub._pending_adp_dummy_request is None
+
+
+def test_pad_dummy_spec_allocation_failure_rolls_back_kv_candidate():
+    stub = _StubADPExecutor()
+    terminal_request = _make_adp_request(_STATE_GENERATION_TO_COMPLETE)
+    stub.active_requests = [terminal_request]
+    stub.expected_num_active_requests = 2
+    spec_resource_manager = Mock()
+    spec_resource_manager.add_dummy_requests.side_effect = NoFreeSlotsError("No free slots")
+    stub.resource_manager.get_resource_manager.return_value = spec_resource_manager
+
+    _run_pad(stub)
+
+    assert stub.active_requests == [terminal_request]
+    assert stub._pending_adp_dummy_request is None
+    stub.kv_cache_manager.free_resources.assert_called_once()
+
+
+def test_adp_dummy_peer_empty_rolls_back_and_retry_succeeds():
+    stub = _StubADPExecutor()
+    spec_resource_manager = Mock()
+    stub.resource_manager.get_resource_manager.return_value = spec_resource_manager
+    terminal_request = _make_adp_request(_STATE_GENERATION_TO_COMPLETE)
+    stub.active_requests = [terminal_request]
+    stub.expected_num_active_requests = 2
+
+    _run_pad(stub)
+    first_dummy = stub._pending_adp_dummy_request
+    assert first_dummy is not None
+
+    stub.dist.tp_allgather.side_effect = None
+    stub.dist.tp_allgather.return_value = [1, 0]
+    can_queue, _ = PyExecutor._can_queue(stub, types.SimpleNamespace(batch_size=1))
+    assert can_queue is False
+    PyExecutor._finalize_adp_dummy_allocation(stub, can_queue)
+
+    assert stub.active_requests == [terminal_request]
+    spec_resource_manager.free_resources.assert_called_once_with(first_dummy)
+    stub.kv_cache_manager.free_resources.assert_called_once_with(first_dummy)
+
+    stub.dist.tp_allgather.return_value = [1, 1]
+    _run_pad(stub)
+    second_dummy = stub._pending_adp_dummy_request
+    assert second_dummy is not None
+    assert second_dummy is not first_dummy
+
+    can_queue, _ = PyExecutor._can_queue(stub, types.SimpleNamespace(batch_size=1))
+    assert can_queue is True
+    PyExecutor._finalize_adp_dummy_allocation(stub, can_queue)
+
+    assert stub._pending_adp_dummy_request is None
+    assert stub.active_requests == [terminal_request, second_dummy]
+    assert spec_resource_manager.add_dummy_requests.call_count == 2
+    spec_resource_manager.free_resources.assert_called_once_with(first_dummy)
+    stub.kv_cache_manager.free_resources.assert_called_once_with(first_dummy)
+
+
+def test_adp_dummy_rollback_only_frees_pending_candidate():
+    stub = _StubADPExecutor()
+    prior_dummy = _make_adp_request(
+        _STATE_GENERATION_IN_PROGRESS, request_id=10, is_dummy_request=True
+    )
+    prior_dummy.is_attention_dp_dummy = True
+    current_dummy = _make_adp_request(
+        _STATE_GENERATION_IN_PROGRESS, request_id=11, is_dummy_request=True
+    )
+    current_dummy.is_attention_dp_dummy = True
+    stub.active_requests = [prior_dummy, current_dummy]
+    stub._pending_adp_dummy_request = current_dummy
+
+    PyExecutor._finalize_adp_dummy_allocation(stub, can_queue=False)
+
+    assert stub.active_requests == [prior_dummy]
+    stub.kv_cache_manager.free_resources.assert_called_once_with(current_dummy)
+
+
+def test_adp_dummy_post_prepare_rollback_uses_normal_termination():
+    stub = _StubADPExecutor()
+    dummy_request = _make_adp_request(_STATE_GENERATION_IN_PROGRESS, is_dummy_request=True)
+    dummy_request.is_attention_dp_dummy = True
+    dummy_request.py_seq_slot = 3
+    stub.active_requests = [dummy_request]
+    stub._pending_adp_dummy_request = dummy_request
+    stub._terminate_request = Mock()
+
+    PyExecutor._finalize_adp_dummy_allocation(stub, can_queue=False)
+
+    stub._terminate_request.assert_called_once_with(dummy_request)
+    stub.kv_cache_manager.free_resources.assert_not_called()
+    assert stub.active_requests == []
 
 
 def test_pad_dummy_skips_when_active_request_present():

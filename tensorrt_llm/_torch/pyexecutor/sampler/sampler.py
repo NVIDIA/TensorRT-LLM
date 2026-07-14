@@ -4848,6 +4848,7 @@ class TRTLLMSampler(Sampler[SampleStateTRTLLM], AsyncWorkerMixin):
         decoding_config: Optional[DecodingConfig] = None,
         kv_cache_config: Optional[KvCacheConfig] = None,
         enable_async_worker: bool = False,
+        max_num_sequences: Optional[int] = None,
     ):
         assert model.config is not None
         vocab_size = model.config.vocab_size
@@ -4866,11 +4867,16 @@ class TRTLLMSampler(Sampler[SampleStateTRTLLM], AsyncWorkerMixin):
         )
         self.max_batch_size = max_batch_size
         self.max_beam_width = max_beam_width
-        self.max_num_sequences = mapping.pp_size * max_batch_size
         self.max_seq_idle_microseconds = 180 * 1000 * 1000
         self.is_trt_overlap = not disable_overlap_scheduler
         self.num_micro_batches = (
             mapping.pp_size if mapping.pp_size > 1 else (2 if self.is_trt_overlap else 1)
+        )
+        # Decoder state is indexed by sequence slot and must match the
+        # executor's SeqSlotManager. The fallback preserves the established
+        # sizing for direct callers outside the PyExecutor creator.
+        self.max_num_sequences = (
+            max_num_sequences if max_num_sequences is not None else mapping.pp_size * max_batch_size
         )
         self.micro_batch_idx = 0
 
