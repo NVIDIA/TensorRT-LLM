@@ -408,6 +408,9 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         (320, 256),
         (576, 512),
     }
+    SLOWER_MLA_GENERATION_KERNELS = {
+        (576, 512, 32),
+    }
 
     def __init__(self, attn: "TrtllmAttention"):
         super().__init__(attn)
@@ -526,6 +529,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
     def _check_mla_generation_support(
         cls,
         head_size: int,
+        tokens_per_block: int,
         kv_lora_rank: Optional[int],
         qk_rope_head_dim: Optional[int],
     ) -> Tuple[bool, str]:
@@ -540,7 +544,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         if missing_params:
             return (
                 False,
-                "[Generation][MLA] Missing required MLA parameter(s): "
+                "[Generation][MLA] missing required MLA parameter(s): "
                 f"{', '.join(missing_params)}.",
             )
 
@@ -551,7 +555,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         if head_size != head_dim_qk:
             return (
                 False,
-                f"[Generation][MLA] head_size ({head_size}) must match "
+                f"[Generation][MLA] head_size ({head_size}) that does not match "
                 f"kv_lora_rank + qk_rope_head_dim ({head_dim_qk}).",
             )
 
@@ -559,8 +563,16 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             supported = sorted(cls.SUPPORTED_MLA_GENERATION_HEAD_DIMS)
             return (
                 False,
-                f"[Generation][MLA] Unsupported head dimensions: "
+                f"[Generation][MLA] head dimensions "
                 f"headDimQk={head_dim_qk}, headDimV={head_dim_v}. Supported: {supported}.",
+            )
+
+        if (head_dim_qk, head_dim_v, tokens_per_block) in cls.SLOWER_MLA_GENERATION_KERNELS:
+            return (
+                False,
+                f"[Generation][MLA] slower TRTLLM-GEN decode kernel for "
+                f"headDimQk={head_dim_qk}, headDimV={head_dim_v}, "
+                f"tokens_per_block={tokens_per_block}.",
             )
 
         return True, ""
@@ -582,7 +594,7 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             forward_args,
         )
         if not supported:
-            logger.debug(f"FlashInfer TRTLLM-Gen FMHA does not support request: {reason}")
+            logger.debug(f"FlashInfer trtllm-gen fmha library does not support {reason}")
         return supported
 
     def _is_supported_with_reason(
@@ -605,9 +617,9 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             or fwd.sage_attn_num_elts_per_blk_k > 0
             or fwd.sage_attn_num_elts_per_blk_v > 0
         ):
-            return False, "trtllm-gen does not support sage attention."
+            return False, "sage attention."
         if meta.helix_position_offsets is not None:
-            return False, "trtllm-gen does not support helix parallelism."
+            return False, "helix parallelism."
         sparse_kv_indices = fwd.sparse_prediction.sparse_kv_indices
         sparse_attn_indices = fwd.sparse_prediction.sparse_attn_indices
         if (
@@ -616,34 +628,29 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             or meta.num_sparse_topk > 0
             or has_sparse_attention
         ):
-            return False, "trtllm-gen does not support sparse attention."
+            return False, "sparse attention."
         if has_skip_softmax:
-            return False, "trtllm-gen does not support skip-softmax attention."
+            return False, "skip-softmax attention."
         if fwd.relative_attention_bias is not None:
-            return False, "Relative attention bias is not supported by trtllm-gen backend."
+            return False, "relative attention bias."
         if meta.use_spec_decoding and meta.is_spec_dec_tree:
-            return (
-                False,
-                "FlashInfer trtllm-gen does not support spec-dec tree/custom masks.",
-            )
+            return False, "spec-dec tree/custom masks."
         if is_mla_enable and fwd.attention_input_type != AttentionInputType.generation_only:
-            return False, "trtllm-gen MLA supports generation-only attention."
+            return False, "MLA with non-generation-only attention."
 
         if meta.kv_cache_block_offsets is None:
-            return False, "trtllm-gen requires paged KV cache."
+            return False, "non-paged KV cache; paged KV cache is required."
 
         num_pages_in_mem_pool = self._get_total_num_blocks(meta)
         if num_pages_in_mem_pool > self.MAX_NUM_PAGES_IN_MEM_POOL:
-            return (
-                False,
-                f"TRTLLM-Gen FMHA supports at most {self.MAX_NUM_PAGES_IN_MEM_POOL} "
-                f"flattened KV-cache pages, but this pool requires "
-                f"{num_pages_in_mem_pool}.",
+            return False, (
+                f"more than {self.MAX_NUM_PAGES_IN_MEM_POOL} flattened KV-cache "
+                f"pages, but this pool requires {num_pages_in_mem_pool}."
             )
 
         output = fwd.output
         if output is None:
-            return False, "trtllm-gen requires output."
+            return False, "a missing output tensor; output is required."
 
         tokens_per_block = meta.tokens_per_block
         if tokens_per_block is None:
@@ -656,32 +663,20 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
         o_dtype = output.dtype
 
         if q_dtype not in self.SUPPORTED_INPUT_DTYPES:
-            return False, (
-                f"Input dtype {q_dtype} not supported. Supported: FP16, BF16, FP8 (E4M3)."
-            )
+            return False, f"input dtype {q_dtype}. Supported: FP16, BF16, FP8 (E4M3)."
 
         kv_cache_dtype = self._get_kv_cache_dtype(meta)
         if kv_cache_dtype is None:
             kv_cache_dtype = torch_dtype_to_binding(q_dtype)
         if meta.is_cross:
             if kv_cache_dtype == DataType.NVFP4:
-                return (
-                    False,
-                    "Cross attention with NVFP4 KV cache is not supported by trtllm-gen backend.",
-                )
+                return False, "cross attention with NVFP4 KV cache."
             if is_mla_enable:
-                return False, "Cross attention with MLA is not supported by trtllm-gen backend."
+                return False, "cross attention with MLA."
             if meta.is_spec_decoding_enabled or meta.use_spec_decoding:
-                return (
-                    False,
-                    "Cross attention with speculative decoding is not supported by "
-                    "trtllm-gen backend.",
-                )
+                return False, "cross attention with speculative decoding."
             if fwd.update_kv_cache and fwd.cross_kv is None:
-                return (
-                    False,
-                    "trtllm-gen cross attention requires cross_kv when update_kv_cache=True.",
-                )
+                return False, "cross attention with a missing cross_kv when update_kv_cache=True."
 
         is_fp8_out = output.dtype == torch.float8_e4m3fn
         is_fp4_out = output.dtype == torch.uint8
@@ -694,67 +689,59 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
             q_dtype = torch.float8_e4m3fn
 
         if kv_cache_dtype not in self.SUPPORTED_KV_CACHE_DTYPES:
-            return False, (
-                f"KV cache dtype {kv_cache_dtype} not supported. Supported: FP16, BF16, FP8, NVFP4."
-            )
+            return False, f"KV cache dtype {kv_cache_dtype}. Supported: FP16, BF16, FP8, NVFP4."
         if o_dtype not in self.SUPPORTED_OUT_DTYPES:
-            return False, f"Output dtype {o_dtype} not supported. Supported: FP16, BF16, FP8."
+            return False, f"output dtype {o_dtype}. Supported: FP16, BF16, FP8."
 
         has_alibi = attn.position_embedding_type in (4, 5)
         check_context_phase = has_context_phase and not is_mla_enable
         if check_context_phase:
             if attn.head_dim in self.UNSUPPORTED_HEAD_SIZES_CONTEXT:
-                return False, f"[Context] Head size {attn.head_dim} is not supported."
+                return False, f"[Context] head size {attn.head_dim}."
             try:
                 if AttentionMaskType(fwd.mask_type) == AttentionMaskType.custom_mask:
-                    return False, "[Context] Custom mask is not supported."
+                    return False, "[Context] custom mask."
             except ValueError:
-                return False, f"[Context] Invalid mask_type: {fwd.mask_type}."
+                return False, f"[Context] invalid mask_type: {fwd.mask_type}."
             if has_alibi:
-                return False, "[Context] ALiBi is not supported."
+                return False, "[Context] ALiBi."
             if (q_dtype, kv_cache_dtype, o_dtype) not in self.SUPPORTED_DTYPE_COMBOS_CONTEXT:
                 return False, (
-                    f"[Context] Unsupported dtype combination: "
-                    f"Q={q_dtype}, KV={kv_cache_dtype}, O={o_dtype}."
+                    f"[Context] dtype combination: Q={q_dtype}, KV={kv_cache_dtype}, O={o_dtype}."
                 )
 
         if has_generation_phase:
             if meta.beam_width != 1 and not meta.is_cross:
-                return (
-                    False,
-                    f"[Generation] Beam search (beam_width={meta.beam_width}) "
-                    "is not supported. Must be 1.",
+                return False, (
+                    f"[Generation] beam search (beam_width={meta.beam_width}); must be 1."
                 )
             sink_token_length = 0
             if sink_token_length != 0:
-                return (
-                    False,
-                    f"[Generation] StreamingLLM "
-                    f"(sink_token_length={sink_token_length}) is not supported.",
+                return False, (
+                    f"[Generation] StreamingLLM (sink_token_length={sink_token_length})."
                 )
             if tokens_per_block < self.MIN_TOKENS_PER_BLOCK:
-                return (
-                    False,
-                    f"[Generation] tokens_per_block ({tokens_per_block}) "
-                    f"must be >= {self.MIN_TOKENS_PER_BLOCK}.",
+                return False, (
+                    f"[Generation] tokens_per_block ({tokens_per_block}); "
+                    f"must be >= {self.MIN_TOKENS_PER_BLOCK}."
                 )
             heads_ratio = attn.num_heads // attn.num_kv_heads
             if not is_mla_enable and heads_ratio > self.MAX_HEADS_RATIO_GENERATION:
-                return (
-                    False,
-                    f"[Generation] heads ratio ({heads_ratio}) exceeds maximum "
-                    f"({self.MAX_HEADS_RATIO_GENERATION}).",
+                return False, (
+                    f"[Generation] heads ratio ({heads_ratio}) exceeding maximum "
+                    f"({self.MAX_HEADS_RATIO_GENERATION})."
                 )
             if has_alibi:
-                return False, "[Generation] ALiBi is not supported."
+                return False, "[Generation] ALiBi."
             if (q_dtype, kv_cache_dtype, o_dtype) not in self.SUPPORTED_DTYPE_COMBOS_GENERATION:
                 return False, (
-                    f"[Generation] Unsupported dtype combination: "
+                    f"[Generation] dtype combination: "
                     f"Q={q_dtype}, KV={kv_cache_dtype}, O={o_dtype}."
                 )
             if is_mla_enable:
                 supported, reason = self._check_mla_generation_support(
                     head_size=attn.head_dim,
+                    tokens_per_block=tokens_per_block,
                     kv_lora_rank=attn.kv_lora_rank,
                     qk_rope_head_dim=attn.qk_rope_head_dim,
                 )
@@ -762,16 +749,12 @@ class FlashInferTrtllmGenFmha(PhasedFmha):
                     return False, reason
 
         if tokens_per_block <= 0:
-            return False, "tokens_per_block must be positive."
+            return False, f"non-positive tokens_per_block ({tokens_per_block})."
         if tokens_per_block & (tokens_per_block - 1) != 0:
-            return False, f"tokens_per_block ({tokens_per_block}) must be power of 2."
+            return False, f"tokens_per_block ({tokens_per_block}) that is not a power of 2."
         if tokens_per_block not in self.SUPPORTED_TOKENS_PER_BLOCK:
             supported = sorted(self.SUPPORTED_TOKENS_PER_BLOCK)
-            return (
-                False,
-                f"tokens_per_block ({tokens_per_block}) is not supported "
-                f"by trtllm-gen kernels. Supported: {supported}.",
-            )
+            return False, f"tokens_per_block ({tokens_per_block}). Supported: {supported}."
 
         return True, ""
 

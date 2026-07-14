@@ -435,6 +435,24 @@ class UploadLogPlugin:
             content = f.read().decode("utf-8", errors="replace")
         report.sections.append((section_name, content))
 
+    def _remove_local_log_file(self, filepath):
+        try:
+            os.remove(filepath)
+        except FileNotFoundError:
+            return
+        except OSError as e:
+            logger.warning("Failed to remove local S3 log file %s: %s", filepath, e)
+            return
+
+        output_root = os.path.abspath(self.output_path)
+        parent = os.path.abspath(os.path.dirname(filepath))
+        while parent != output_root and os.path.commonpath([output_root, parent]) == output_root:
+            try:
+                os.rmdir(parent)
+            except OSError:
+                break
+            parent = os.path.dirname(parent)
+
     def upload_and_report(self, report, test_name, filename, section_name):
         filepath = os.path.join(self.output_path, test_name, filename)
         if not os.path.exists(filepath):
@@ -443,9 +461,11 @@ class UploadLogPlugin:
         filesize = os.path.getsize(filepath)
         if filesize == 0:
             report.sections.append((section_name, "<empty>"))
+            self._remove_local_log_file(filepath)
             return
         if self._should_inline_output(filename, filesize):
             self._append_inline_output(report, section_name, filepath)
+            self._remove_local_log_file(filepath)
             return
         object_key = self._object_key(test_name, filename)
         fileurl = self._file_url(object_key)
@@ -476,6 +496,7 @@ class UploadLogPlugin:
                     f"{filesize} bytes uploaded to {fileurl}",
                 )
             )
+            self._remove_local_log_file(filepath)
         except Exception as e:
             logger.warning(
                 f"Upload failed. test_name: {test_name}, filename: {filename}, error: {e}"
@@ -517,6 +538,7 @@ class UploadLogPlugin:
                 filepath, object_key, test_name, filename = futures[future]
                 try:
                     future.result()
+                    self._remove_local_log_file(filepath)
                 except Exception as e:
                     logger.warning(
                         "Deferred upload failed. test_name: %s, filename: %s, "

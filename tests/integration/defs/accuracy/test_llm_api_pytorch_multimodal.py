@@ -397,6 +397,44 @@ class TestGemma3_12BInstruct(LlmapiAccuracyTestHarness):
             task.evaluate(llm, sampling_params=self.sampling_params)
 
 
+@pytest.mark.skip_device_not_contain(["B200"])
+class TestGemma4_26B_A4B(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "google/gemma-4-26B-A4B-it"
+    MODEL_PATH = f"{llm_models_root()}/gemma/nvidia-Gemma-4-26B-A4B-NVFP4"
+    EXTRA_EVALUATOR_KWARGS = {
+        "chat_template_kwargs": {"enable_thinking": False},
+    }
+
+    # NOTE: MMMU adds <|endoftext|> to the stop token.
+    sampling_params = SamplingParams(
+        max_tokens=MMMU.MAX_OUTPUT_LEN,
+        truncate_prompt_tokens=MMMU.MAX_INPUT_LEN,
+        stop="<|endoftext|>",
+    )
+
+    kv_cache_config = KvCacheConfig(
+        enable_block_reuse=False,
+        enable_partial_reuse=False,
+        free_gpu_memory_fraction=0.6,
+        dtype="fp8",
+    )
+
+    def test_nvfp4(self):
+        with LLM(
+            self.MODEL_PATH,
+            max_batch_size=16,
+            kv_cache_config=self.kv_cache_config,
+            enable_chunked_prefill=True,
+        ) as llm:
+            assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
+            task = MMMU(self.MODEL_NAME)
+            task.evaluate(
+                llm,
+                sampling_params=self.sampling_params,
+                extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS,
+            )
+
+
 class TestQwen3VL_MOE(LlmapiAccuracyTestHarness):
     MODEL_NAME = "Qwen/Qwen3-VL-30B-A3B-Instruct"
     MODEL_PATH = f"{llm_models_root()}/Qwen3/Qwen3-VL-30B-A3B-Instruct"

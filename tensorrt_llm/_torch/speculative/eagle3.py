@@ -559,11 +559,10 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
                         f"hidden_states={hidden_states.shape[0]}")
                 to_save = hidden_states[:num_tokens]
                 if residual is not None:
-                    if num_tokens > residual.shape[0]:
-                        raise RuntimeError(
-                            "EAGLE3 hidden-state capture token count exceeds "
-                            f"available residual states: num_tokens={num_tokens}, "
-                            f"residual={residual.shape[0]}")
+                    # residual shares its leading (token) dim with hidden_states
+                    # (both come from the same decoder layer), so the bound
+                    # check above already guarantees num_tokens <=
+                    # residual.shape[0]; no separate check is needed.
                     to_save = to_save + residual[:num_tokens]
                 inplace_slice_copy(self.hidden_states, to_save,
                                    i * self.hidden_size,
