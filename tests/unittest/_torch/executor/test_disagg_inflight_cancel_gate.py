@@ -39,6 +39,15 @@ def _reset_inflight_cancel_env_cache(monkeypatch):
     monkeypatch.setattr(transceiver_module, "_disagg_inflight_cancel_enabled_cache", None)
 
 
+def _make_mapping(*, world_size=1, pp_size=1, cp_size=1, enable_attention_dp=False):
+    return SimpleNamespace(
+        world_size=world_size,
+        pp_size=pp_size,
+        cp_size=cp_size,
+        enable_attention_dp=enable_attention_dp,
+    )
+
+
 def _make_timeout_request(request_id=7, in_progress=False):
     return SimpleNamespace(
         is_attention_dp_dummy=False,
@@ -404,7 +413,9 @@ def test_feature_opt_in_rejects_unqualified_config(monkeypatch, backend, runtime
     config = CacheTransceiverConfig(backend=backend, transceiver_runtime=runtime)
 
     with pytest.raises(ValueError, match="currently supported only"):
-        transceiver_module.create_kv_cache_transceiver(Mock(), Mock(), Mock(), Mock(), config)
+        transceiver_module.create_kv_cache_transceiver(
+            _make_mapping(), Mock(), Mock(), Mock(), config
+        )
 
 
 @pytest.mark.parametrize("nixl_backend", [None, "UCX"])
@@ -417,11 +428,13 @@ def test_feature_opt_in_accepts_cpp_nixl_ucx(monkeypatch, nixl_backend):
     constructor = Mock(return_value=expected)
     monkeypatch.setattr(transceiver_module, "BindKvCacheTransceiver", constructor)
 
-    result = transceiver_module.create_kv_cache_transceiver(Mock(), Mock(), Mock(), Mock(), config)
+    mapping = _make_mapping()
+    result = transceiver_module.create_kv_cache_transceiver(mapping, Mock(), Mock(), Mock(), config)
 
     assert result is expected
     assert config.backend == "NIXL"
     constructor.assert_called_once()
+    assert constructor.call_args.kwargs["_inflight_cancel_effective"] is True
 
 
 @pytest.mark.parametrize(
@@ -438,26 +451,38 @@ def test_feature_opt_in_rejects_unsupported_transfer_mode(monkeypatch, unsupport
     config = CacheTransceiverConfig(backend="NIXL", transceiver_runtime="CPP")
 
     with pytest.raises(ValueError, match="currently supported only"):
-        transceiver_module.create_kv_cache_transceiver(Mock(), Mock(), Mock(), Mock(), config)
+        transceiver_module.create_kv_cache_transceiver(
+            _make_mapping(), Mock(), Mock(), Mock(), config
+        )
 
 
-def test_feature_opt_in_requires_finite_transfer_timeout(monkeypatch):
+def test_feature_opt_in_requires_positive_transfer_timeout(monkeypatch):
     monkeypatch.setenv(transceiver_module._DISAGG_INFLIGHT_CANCEL_ENABLED_ENV, "1")
     config = CacheTransceiverConfig(
         backend="NIXL", transceiver_runtime="CPP", kv_transfer_timeout_ms=None
     )
 
-    with pytest.raises(ValueError, match="finite kv_transfer_timeout_ms"):
-        transceiver_module.create_kv_cache_transceiver(Mock(), Mock(), Mock(), Mock(), config)
+    with pytest.raises(ValueError, match="positive kv_transfer_timeout_ms"):
+        transceiver_module.create_kv_cache_transceiver(
+            _make_mapping(), Mock(), Mock(), Mock(), config
+        )
 
 
-def test_feature_opt_in_rejects_default_backend(monkeypatch):
+def test_feature_opt_in_resolves_default_backend_before_preflight(monkeypatch):
     monkeypatch.setenv(transceiver_module._DISAGG_INFLIGHT_CANCEL_ENABLED_ENV, "1")
     monkeypatch.setenv(transceiver_module._NIXL_KVCACHE_BACKEND_ENV, "UCX")
     config = CacheTransceiverConfig(backend="DEFAULT")
+    expected = object()
+    constructor = Mock(return_value=expected)
+    monkeypatch.setattr(transceiver_module, "BindKvCacheTransceiver", constructor)
 
-    with pytest.raises(ValueError, match="backend='DEFAULT'"):
-        transceiver_module.create_kv_cache_transceiver(Mock(), Mock(), Mock(), Mock(), config)
+    result = transceiver_module.create_kv_cache_transceiver(
+        _make_mapping(), Mock(), Mock(), Mock(), config
+    )
+
+    assert result is expected
+    assert config.backend == "NIXL"
+    assert constructor.call_args.kwargs["_inflight_cancel_effective"] is True
 
 
 def test_feature_opt_in_rejects_ambiguous_legacy_backend_env(monkeypatch):
@@ -469,6 +494,8 @@ def test_feature_opt_in_rejects_ambiguous_legacy_backend_env(monkeypatch):
     with pytest.raises(ValueError, match="multiple legacy backend selectors"):
         transceiver_module.create_kv_cache_transceiver(Mock(), Mock(), Mock(), Mock(), config)
 
+    assert config.backend == "DEFAULT"
+
 
 def test_feature_opt_in_explicit_backend_ignores_legacy_selectors(monkeypatch):
     monkeypatch.setenv(transceiver_module._DISAGG_INFLIGHT_CANCEL_ENABLED_ENV, "1")
@@ -479,10 +506,13 @@ def test_feature_opt_in_explicit_backend_ignores_legacy_selectors(monkeypatch):
     constructor = Mock(return_value=expected)
     monkeypatch.setattr(transceiver_module, "BindKvCacheTransceiver", constructor)
 
-    result = transceiver_module.create_kv_cache_transceiver(Mock(), Mock(), Mock(), Mock(), config)
+    result = transceiver_module.create_kv_cache_transceiver(
+        _make_mapping(), Mock(), Mock(), Mock(), config
+    )
 
     assert result is expected
     constructor.assert_called_once()
+    assert constructor.call_args.kwargs["_inflight_cancel_effective"] is True
 
 
 def test_direct_cpp_wrapper_rejects_python_runtime_opt_in(monkeypatch):
@@ -490,7 +520,7 @@ def test_direct_cpp_wrapper_rejects_python_runtime_opt_in(monkeypatch):
     config = CacheTransceiverConfig(backend="NIXL", transceiver_runtime="PYTHON")
 
     with pytest.raises(ValueError, match="currently supported only"):
-        BindKvCacheTransceiver(Mock(), Mock(), Mock(), Mock(), config)
+        BindKvCacheTransceiver(_make_mapping(), Mock(), Mock(), Mock(), config)
 
 
 def test_flag_unset_preserves_existing_backend_selection(monkeypatch):
@@ -570,6 +600,86 @@ def test_flag_unset_preserves_legacy_backend_env_precedence(monkeypatch):
 
 
 @pytest.mark.parametrize(
+    "mapping",
+    [
+        _make_mapping(pp_size=2),
+        _make_mapping(cp_size=2),
+        _make_mapping(enable_attention_dp=True),
+    ],
+)
+def test_feature_opt_in_rejects_unsupported_topology(monkeypatch, mapping):
+    monkeypatch.setenv(transceiver_module._DISAGG_INFLIGHT_CANCEL_ENABLED_ENV, "1")
+    config = CacheTransceiverConfig(backend="NIXL", transceiver_runtime="CPP")
+
+    with pytest.raises(ValueError, match="ordinary TP topology"):
+        transceiver_module.create_kv_cache_transceiver(mapping, Mock(), Mock(), Mock(), config)
+
+
+def test_dynamic_transfer_buffer_remains_supported():
+    config = CacheTransceiverConfig(
+        backend="NIXL", transceiver_runtime="CPP", max_tokens_in_buffer=None
+    )
+
+    assert transceiver_module._is_disagg_inflight_cancel_config_supported(config, _make_mapping())
+
+
+def test_disabled_rank_enters_preflight_and_rejects_enabled_peer():
+    mapping = _make_mapping(world_size=2)
+    dist = SimpleNamespace(allgather=Mock(return_value=[(False, None), (True, None)]))
+
+    with pytest.raises(ValueError, match="must resolve identically"):
+        transceiver_module.create_kv_cache_transceiver(mapping, dist, Mock(), Mock(), None)
+
+    dist.allgather.assert_called_once_with((False, None))
+
+
+def test_preflight_reports_peer_capability_error(monkeypatch):
+    monkeypatch.setenv(transceiver_module._DISAGG_INFLIGHT_CANCEL_ENABLED_ENV, "1")
+    mapping = _make_mapping(world_size=2)
+    dist = SimpleNamespace(
+        allgather=Mock(return_value=[(True, None), (True, "peer config is unsupported")])
+    )
+    config = CacheTransceiverConfig(backend="NIXL", transceiver_runtime="CPP")
+
+    with pytest.raises(ValueError, match="rank 1: peer config is unsupported"):
+        transceiver_module.create_kv_cache_transceiver(mapping, dist, Mock(), Mock(), config)
+
+
+def test_disabled_transceiver_still_completes_world_preflight():
+    mapping = _make_mapping(world_size=2)
+    dist = SimpleNamespace(allgather=Mock(return_value=[(False, None), (False, None)]))
+
+    assert (
+        transceiver_module.create_kv_cache_transceiver(mapping, dist, Mock(), Mock(), None) is None
+    )
+    dist.allgather.assert_called_once_with((False, None))
+
+
+def test_effective_mode_is_forwarded_to_native_constructor(monkeypatch):
+    monkeypatch.setenv(transceiver_module._DISAGG_INFLIGHT_CANCEL_ENABLED_ENV, "1")
+    monkeypatch.setattr(transceiver_module, "mapping_to_world_config", lambda mapping: object())
+    constructor = Mock(return_value=Mock())
+    monkeypatch.setattr(transceiver_module, "CacheTransceiverCpp", constructor)
+    monkeypatch.setattr(CacheTransceiverConfig, "_to_pybind", lambda config: object())
+    config = CacheTransceiverConfig(backend="NIXL", transceiver_runtime="CPP")
+    dist = Mock()
+    dist.pp_allgather.return_value = [1]
+    kv_cache_manager = SimpleNamespace(
+        total_num_kv_heads_per_layer=[1],
+        head_dim=64,
+        tokens_per_block=32,
+        dtype=object(),
+        num_kv_heads_per_layer=[1],
+        impl=object(),
+    )
+
+    transceiver = BindKvCacheTransceiver(_make_mapping(), dist, kv_cache_manager, Mock(), config)
+
+    assert transceiver._inflight_request_cancellation_enabled
+    assert constructor.call_args.args[-1] is True
+
+
+@pytest.mark.parametrize(
     "backend,runtime,nixl_backend,expected",
     [
         ("NIXL", "CPP", None, True),
@@ -585,7 +695,10 @@ def test_cpp_capability_is_config_scoped(monkeypatch, backend, runtime, nixl_bac
         monkeypatch.setenv(transceiver_module._NIXL_KVCACHE_BACKEND_ENV, nixl_backend)
     config = CacheTransceiverConfig(backend=backend, transceiver_runtime=runtime)
 
-    assert transceiver_module._is_disagg_inflight_cancel_config_supported(config) is expected
+    mapping = _make_mapping()
+    assert (
+        transceiver_module._is_disagg_inflight_cancel_config_supported(config, mapping) is expected
+    )
 
     monkeypatch.setattr(transceiver_module, "mapping_to_world_config", lambda mapping: object())
     constructor = Mock(return_value=Mock())
@@ -602,10 +715,11 @@ def test_cpp_capability_is_config_scoped(monkeypatch, backend, runtime, nixl_bac
         impl=object(),
     )
 
-    transceiver = BindKvCacheTransceiver(Mock(), dist, kv_cache_manager, Mock(), config)
+    transceiver = BindKvCacheTransceiver(mapping, dist, kv_cache_manager, Mock(), config)
 
     assert transceiver.supports_inflight_request_cancellation() is expected
     constructor.assert_called_once()
+    assert constructor.call_args.args[-1] is False
 
 
 def test_python_transceiver_capability_defaults_to_unsupported():
@@ -618,7 +732,7 @@ def test_python_transceiver_capability_defaults_to_unsupported():
 
 
 def test_flag_unset_skips_cpp_poison_query():
-    transceiver = SimpleNamespace(impl=Mock())
+    transceiver = SimpleNamespace(impl=Mock(), _inflight_request_cancellation_enabled=False)
 
     assert not BindKvCacheTransceiver.has_poisoned_transfer_buffer(transceiver)
     transceiver.impl.has_poisoned_transfer_buffer.assert_not_called()

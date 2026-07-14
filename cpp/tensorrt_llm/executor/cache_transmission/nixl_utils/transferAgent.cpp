@@ -318,10 +318,11 @@ void NixlHelper::posixFileToGpuFallback(MemoryDescs const& memoryDescs, FileDesc
     }
 }
 
-NixlTransferStatus::NixlTransferStatus(std::weak_ptr<nixlAgent> agent, nixlXferReqH* handle)
+NixlTransferStatus::NixlTransferStatus(
+    std::weak_ptr<nixlAgent> agent, nixlXferReqH* handle, bool const synchronizeHandleAccess)
     : mWeakAgent{std::move(agent)}
     , mHandle{handle}
-    , mSynchronizeHandleAccess{common::getEnvDisaggEnableInflightCancel()}
+    , mSynchronizeHandleAccess{synchronizeHandleAccess}
 {
     TLLM_CHECK(!mWeakAgent.expired());
     TLLM_CHECK(mHandle);
@@ -845,7 +846,8 @@ void NixlTransferAgent::invalidateRemoteAgent(std::string const& name)
         NVTX3_SCOPED_RANGE(postXferReq);
         status = mRawAgent->postXferReq(handle, &reqParams);
     }
-    return std::make_unique<NixlTransferStatus>(std::weak_ptr<nixlAgent>(mRawAgent), handle);
+    return std::make_unique<NixlTransferStatus>(
+        std::weak_ptr<nixlAgent>(mRawAgent), handle, request.synchronizeStatusAccess());
 }
 
 void NixlTransferAgent::notifySyncMessage(std::string const& name, SyncMessage const& syncMessage)

@@ -26,6 +26,7 @@
 #include "tensorrt_llm/executor/dataTransceiverState.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include "tensorrt_llm/runtime/utils/pgUtils.h"
+#include <atomic>
 #include <future>
 #include <memory>
 #include <mutex>
@@ -244,6 +245,13 @@ public:
         std::optional<executor::CacheTransceiverConfig> cacheTransceiverConfig = std::nullopt,
         std::vector<SizeType32> const& rnnLayerNumPerPP = {});
 
+    CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheManager,
+        executor::kv_cache::CacheState::ModelConfig const& cacheStateModelCfg, runtime::WorldConfig const& worldConfig,
+        std::vector<SizeType32> const& attentionLayerNumPerPP, nvinfer1::DataType dataType,
+        executor::kv_cache::CacheState::AttentionType attentionType,
+        std::optional<executor::CacheTransceiverConfig> cacheTransceiverConfig,
+        std::vector<SizeType32> const& rnnLayerNumPerPP, bool enableInflightCancel);
+
     CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheManager, std::vector<SizeType32> numKvHeadsPerLayer,
         SizeType32 sizePerHead, SizeType32 tokensPerBlock, runtime::WorldConfig const& worldConfig,
         std::vector<SizeType32> const& attentionLayerNumPerPP, nvinfer1::DataType dataType,
@@ -254,6 +262,19 @@ public:
         : CacheTransceiver(cacheManager,
             executor::kv_cache::CacheState::ModelConfig{numKvHeadsPerLayer, sizePerHead, tokensPerBlock}, worldConfig,
             attentionLayerNumPerPP, dataType, attentionType, cacheTransceiverConfig, rnnLayerNumPerPP)
+    {
+    }
+
+    CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheManager, std::vector<SizeType32> numKvHeadsPerLayer,
+        SizeType32 sizePerHead, SizeType32 tokensPerBlock, runtime::WorldConfig const& worldConfig,
+        std::vector<SizeType32> const& attentionLayerNumPerPP, nvinfer1::DataType dataType,
+        executor::kv_cache::CacheState::AttentionType attentionType,
+        std::optional<executor::CacheTransceiverConfig> cacheTransceiverConfig,
+        std::vector<SizeType32> const& rnnLayerNumPerPP, bool enableInflightCancel)
+        : CacheTransceiver(cacheManager,
+            executor::kv_cache::CacheState::ModelConfig{numKvHeadsPerLayer, sizePerHead, tokensPerBlock}, worldConfig,
+            attentionLayerNumPerPP, dataType, attentionType, cacheTransceiverConfig, rnnLayerNumPerPP,
+            enableInflightCancel)
     {
     }
 
@@ -283,6 +304,11 @@ private:
 
     void setContextState(LlmRequest* llmRequest);
 
+    RequestStatuses checkContextTransferStatusWithInflightCancel(
+        std::optional<int> const& atLeastRequestNum, bool markComplete);
+
+    void checkGenTransferStatusWithInflightCancel(std::optional<int> const& atLeastRequestNum);
+
     std::unique_ptr<CacheSender> mCacheSender;
     std::unique_ptr<CacheReceiver> mCacheReceiver;
     // shared_ptr (not raw LlmRequest*) so the futures hold a strong reference for
@@ -311,6 +337,8 @@ private:
     std::unique_ptr<executor::kv_cache::CacheState> mCacheState;
     std::unique_ptr<executor::kv_cache::ConnectionManager> mManager;
     std::optional<executor::CacheTransceiverConfig> mCacheTransceiverConfig;
+    bool mInflightCancelEnabled{false};
+    std::atomic<bool> mTopologyTransferBufferPoisoned{false};
     std::vector<std::unique_ptr<kv_cache_manager::CacheTransBufferManager>> mCacheTransBufferManagers;
     std::vector<BaseTransBufferManager*> mCacheTransBufferManagerPtrs;
 

@@ -59,7 +59,7 @@ struct NixlHelper
 class NixlTransferStatus final : public TransferStatus
 {
 public:
-    NixlTransferStatus(std::weak_ptr<nixlAgent> agent, nixlXferReqH* handle);
+    NixlTransferStatus(std::weak_ptr<nixlAgent> agent, nixlXferReqH* handle, bool synchronizeHandleAccess = false);
     ~NixlTransferStatus() noexcept override;
 
     NixlTransferStatus(NixlTransferStatus const&) = delete;

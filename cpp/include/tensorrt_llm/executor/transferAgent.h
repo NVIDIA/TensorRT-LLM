@@ -299,13 +299,15 @@ public:
     /// @param dstDescs Description of the destination memory region.
     /// @param remoteName Name of the remote counterpart.
     /// @param syncMessage Synchronization information for the end of the transfer.
+    /// @param synchronizeStatusAccess Whether status queries can race explicit handle release.
     TransferRequest(TransferOp op, TransferDescs srcDescs, TransferDescs dstDescs, std::string const& remoteName,
-        std::optional<SyncMessage> syncMessage = std::nullopt)
+        std::optional<SyncMessage> syncMessage = std::nullopt, bool synchronizeStatusAccess = false)
         : mOp{op}
         , mSrcDescs{std::move(srcDescs)}
         , mDstDescs{std::move(dstDescs)}
         , mRemoteName{remoteName}
         , mSyncMessage{std::move(syncMessage)}
+        , mSynchronizeStatusAccess{synchronizeStatusAccess}
     {
     }
 
@@ -334,12 +336,18 @@ public:
         return mSyncMessage;
     }
 
+    [[nodiscard]] bool synchronizeStatusAccess() const noexcept
+    {
+        return mSynchronizeStatusAccess;
+    }
+
 private:
     TransferOp mOp;
     TransferDescs mSrcDescs;
     TransferDescs mDstDescs;
     std::string mRemoteName;
     std::optional<SyncMessage> mSyncMessage;
+    bool mSynchronizeStatusAccess{false};
 };
 
 enum class TransferState : uint8_t

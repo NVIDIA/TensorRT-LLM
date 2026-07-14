@@ -103,6 +103,19 @@ public:
         }
     }
 
+    TransferSession(TransferSession const&) = delete;
+    TransferSession& operator=(TransferSession const&) = delete;
+    TransferSession(TransferSession&&) noexcept = default;
+    TransferSession& operator=(TransferSession&&) noexcept = delete;
+
+    ~TransferSession()
+    {
+        if (mDataContext.isInflightCancelEnabled())
+        {
+            poisonReservedRecvBuffers();
+        }
+    }
+
     [[nodiscard]] std::vector<Connection const*> const& getConnections() const;
 
     // should be called only during the initialization of the TransferSession
@@ -164,6 +177,11 @@ public:
     void setCounterPartRanks(std::vector<SizeType32> ranks)
     {
         mCounterPartRanks = std::move(ranks);
+    }
+
+    [[nodiscard]] bool isInflightCancelEnabled() const noexcept
+    {
+        return mDataContext.isInflightCancelEnabled();
     }
 
 private:

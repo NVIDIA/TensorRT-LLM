@@ -183,13 +183,14 @@ void AgentConnection::send(DataContext const& ctx, void const* data, size_t size
     TLLM_LOG_DEBUG(
         "send dstDesc: %p, size: %ld ,validSegmentIdx: %ld", dstDesc.getAddr(), size, mSenderState.validSegmentIdx);
     MemoryDescs dstDescs{MemoryType::kVRAM, {dstDesc}};
-    TransferRequest request{TransferOp::kWRITE, srcDescs, dstDescs, mRemoteAgentName};
+    TransferRequest request{
+        TransferOp::kWRITE, srcDescs, dstDescs, mRemoteAgentName, std::nullopt, ctx.isInflightCancelEnabled()};
     auto status = mAgentConnectionManager->getAgent()->submitTransferRequests(request);
     NotificationSyncInfo syncInfo{mRemoteAgentName, ctx};
     NotificationInfo notificationInfo{syncInfo};
     std::stringstream ss;
     NotificationInfo::serialize(notificationInfo, ss);
-    bool const inflightCancelEnabled = common::getEnvDisaggEnableInflightCancel();
+    bool const inflightCancelEnabled = ctx.isInflightCancelEnabled();
     TransferState transferState;
     if (!inflightCancelEnabled)
     {
@@ -238,7 +239,7 @@ void AgentConnection::recv(DataContext const& ctx, void* data, size_t size) cons
     NotificationSyncInfo syncInfo{mAgentName, ctx};
     bool const received
         = mAgentConnectionManager->waitForSyncInfo(mRemoteAgentName, syncInfo, ctx.getTransferTerminate());
-    if (common::getEnvDisaggEnableInflightCancel())
+    if (ctx.isInflightCancelEnabled())
     {
         TLLM_CHECK_WITH_INFO(received,
             "AgentConnection::recv ended before receiving sync notification (ctx tag=%d, remote=%s)", ctx.getTag(),
@@ -292,7 +293,6 @@ void AgentConnection::sendRequestAndBufferInfo(batch_manager::RequestInfo& reque
     {
         auto metadata = mAgentConnectionManager->getAgent()->getLocalAgentDesc().getBackendAgentDesc();
         metadataOpt = metadata;
-        mNeedSendMetadata = false;
     }
 
     RequestAndBufferInfo requestAndBufferInfo{
@@ -300,12 +300,17 @@ void AgentConnection::sendRequestAndBufferInfo(batch_manager::RequestInfo& reque
     std::stringstream ss;
     NotificationInfo notificationInfo{requestAndBufferInfo};
     NotificationInfo::serialize(notificationInfo, ss);
-    if (common::getEnvDisaggEnableInflightCancel() && perRequestCancel != nullptr
-        && perRequestCancel->load(std::memory_order_relaxed))
+    if (perRequestCancel != nullptr && perRequestCancel->load(std::memory_order_relaxed))
     {
         TLLM_THROW("sendRequestAndBufferInfo cancelled before notify");
     }
     mAgentConnectionManager->getAgent()->notifySyncMessage(mRemoteAgentName, ss.str());
+    // A cancelled or failed first notification never reached the peer, so the
+    // next request must retry the metadata needed to load this agent.
+    if (metadataOpt.has_value())
+    {
+        mNeedSendMetadata = false;
+    }
 }
 
 void AgentConnection::setSenderState(std::vector<MemoryDesc> cacheReceiverBufferDescs, int validSegmentIdx,
