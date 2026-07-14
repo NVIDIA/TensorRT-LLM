@@ -1280,7 +1280,7 @@ class TestDeepseekV4CacheManager:
 
             pool_mapping = registrar.get_pool_mapping(ctx_rank_info)
             assert pool_mapping
-            for self_pool_key, peer_pool_key in pool_mapping:
+            for self_pool_key, peer_pool_key in pool_mapping.items():
                 registrar.get_kv_map(ctx_rank_info, self_pool_key, peer_pool_key)
         finally:
             ctx_cache_manager.shutdown()

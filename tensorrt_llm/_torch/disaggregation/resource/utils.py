@@ -17,14 +17,7 @@ from __future__ import annotations
 
 from typing import Dict, List, Set
 
-from .page import (
-    AttentionLayerGroup,
-    KVCachePageTable,
-    MambaLayerGroup,
-    MapperKind,
-    PhysicalPool,
-    PoolView,
-)
+from .page import AttentionLayerGroup, KVCachePageTable, MambaLayerGroup, PhysicalPool, PoolView
 
 # -------------------------------------------------------------------------
 # PhysicalPool helpers
@@ -114,23 +107,6 @@ def get_unique_layers(pool_view: PoolView) -> Set[int]:
 def get_num_buffer_entries(pool_view: PoolView) -> int:
     """Number of buffer entries."""
     return len(pool_view.buffer_entries)
-
-
-def get_buffer_mapper_kinds(pool_view: PoolView) -> tuple[MapperKind, ...]:
-    """Return one mapper kind per buffer entry.
-
-    Legacy page tables omit ``buffer_mapper_kinds`` and use the view-level
-    ``mapper_kind`` for every entry.
-    """
-    if pool_view.buffer_mapper_kinds:
-        return pool_view.buffer_mapper_kinds
-    return (pool_view.mapper_kind,) * len(pool_view.buffer_entries)
-
-
-def get_pool_view_mapper_kinds(pool_view: PoolView) -> frozenset[MapperKind]:
-    """Return all mapper kinds represented by a pool view."""
-    kinds = get_buffer_mapper_kinds(pool_view)
-    return frozenset(kinds) if kinds else frozenset({pool_view.mapper_kind})
 
 
 def get_pool_view_num_layers(pool_view: PoolView) -> int:
