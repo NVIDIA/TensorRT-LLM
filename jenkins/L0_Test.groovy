@@ -1459,11 +1459,27 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     export TLLM_HOST_SHM_STAT=$(stat -Lc '%d:%i' /dev/shm)
                     export TLLM_HOST_MNTNS=$(readlink /proc/self/ns/mnt)
 
-                    cleanupNvbug6336747HostCanary() {
+                    # Present a job-specific directory from the host tmpfs as this
+                    # container's /dev/shm. This isolates the stress test from
+                    # node-wide top-level /dev/shm/torch_* cleanup without changing
+                    # the tmpfs capacity or requiring mount privileges in the job.
+                    TLLM_PRIVATE_SHM_DIR=$(mktemp -d "/dev/shm/trtllm-ci_${UID}_${SLURM_JOB_ID}.XXXXXX")
+                    chmod 1777 "$TLLM_PRIVATE_SHM_DIR"
+
+                    cleanupNvbug6336747HostShm() {
                         rm -f "$TLLM_HOST_SHM_CANARY_PATH"
+                        if [[ -n "${TLLM_PRIVATE_SHM_DIR:-}" && \
+                              "$TLLM_PRIVATE_SHM_DIR" == /dev/shm/trtllm-ci_* ]]; then
+                            rm -rf -- "$TLLM_PRIVATE_SHM_DIR"
+                        fi
                     }
-                    trap cleanupNvbug6336747HostCanary EXIT
+                    trap cleanupNvbug6336747HostShm EXIT
                     '''.replaceAll("(?m)^\\s*", "")
+
+                    // Keep this A/B isolated to the dedicated single-node NVBug
+                    // stage. The shell expands TLLM_PRIVATE_SHM_DIR immediately
+                    // before srun invokes the Pyxis/Enroot container runtime.
+                    mounts += ',${TLLM_PRIVATE_SHM_DIR}:/dev/shm'
                 }
 
                 def srunArgs = [

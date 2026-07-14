@@ -63,6 +63,11 @@ if [[ "$pytestCommand" == *"l0_b200_nvbug_6336747.txt"* ]]; then
         echo "shared_host_dev_shm=$sharedHostShm"
         awk '$5 == "/dev/shm" {print "inner_mountinfo=" $0}' /proc/self/mountinfo
     } > "$TLLM_SHM_TRACE_DIR/shm_mount_topology.${SLURM_PROCID}.log"
+
+    if [[ "$sharedHostShm" != "no" || "$innerShmStat" == "${TLLM_HOST_SHM_STAT:-}" ]]; then
+        echo "NVBug 6336747 private /dev/shm mount is not isolated from the host" >&2
+        exit 1
+    fi
 fi
 
 # Only the first process will set the git config
