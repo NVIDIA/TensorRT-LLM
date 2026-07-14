@@ -16,8 +16,9 @@
 name: Guard Post-Merge Approval Label
 
 on:
-  # Intentional: this runs only static default-branch API logic. It never checks
-  # out or executes PR code and reads only PR timeline and label metadata.
+  # Intentional: this runs static default-branch API logic only. It never checks
+  # out or executes PR code; it uses GitHub APIs to validate membership and
+  # manage this PR's approval label/comment.
   pull_request_target:
     types: [labeled]
 
