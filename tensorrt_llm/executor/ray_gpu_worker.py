@@ -5,7 +5,7 @@ import tempfile
 from functools import wraps
 from pathlib import Path
 from queue import Queue
-from typing import Any, List, Optional, Type, Union
+from typing import Any, List, Optional, Type
 
 import ray
 import torch
@@ -17,7 +17,6 @@ from tensorrt_llm._torch.virtual_memory import (materialize_with_tag,
 
 from .. import TorchLlmArgs
 from ..bindings import executor as tllm
-from ..builder import Engine
 from ..llmapi.llm_args import BaseLlmArgs, ExecutorMemoryType
 from ..llmapi.tokenizer import TokenizerBase
 from ..llmapi.utils import configure_cpu_affinity
@@ -214,7 +213,7 @@ class RayGPUWorker(RpcWorkerMixin, BaseWorker):
     def __init__(
         self,
         device_id: int,
-        engine: Union[Path, Engine],
+        engine: Path,
         executor_config: Optional[tllm.ExecutorConfig] = None,
         batched_logits_processor: Optional[BatchedLogitsProcessor] = None,
         postproc_worker_config: Optional[PostprocWorkerConfig] = None,
