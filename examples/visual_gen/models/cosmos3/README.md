@@ -34,7 +34,7 @@ export TRTLLM_DISABLE_COSMOS3_GUARDRAILS=1
 ## Media I/O dependencies
 
 - Saving `.mp4` output requires the `ffmpeg` CLI on `PATH` (`apt-get install -y ffmpeg`); without it the encoder falls back to `.avi`.
-- Decoding `.mp4`/`.avi` reference videos (V2V, inverse dynamics) uses the `av` (PyAV) package. It is **not** bundled with TensorRT-LLM — install it yourself: `pip install av`. Frame directories and single-image references work without it.
+- Decoding `.mp4`/`.avi` reference videos (V2V) uses the `av` (PyAV) package. It is **not** bundled with TensorRT-LLM — install it yourself: `pip install av`. Frame directories work without it.
 
 ## Deployment configs
 
