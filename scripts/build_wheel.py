@@ -776,7 +776,21 @@ def main(*,
     if cache_dir.exists():
         clear_folder(cache_dir)
 
-    install_file = copy
+    def install_file(src, dst):
+        # shutil.copy opens dst with "wb", which truncates the file in place.
+        # When dst is a shared library that a parent process (e.g. the pytest
+        # driver running build_wheel.main from a fixture) already has mmap'd,
+        # that truncation invalidates the mapped pages and the parent SIGBUSes
+        # on next access. Unlink first so the mapped inode stays alive while
+        # the new file is created with a fresh inode.
+        dst_path = Path(dst)
+        if dst_path.is_dir():
+            dst_path = dst_path / Path(src).name
+        try:
+            dst_path.unlink()
+        except FileNotFoundError:
+            pass
+        return copy(src, dst_path)
 
     # Wrapper for copytree that checks if source and destination are the same
     def safe_copytree(src, dst, dirs_exist_ok=True):
