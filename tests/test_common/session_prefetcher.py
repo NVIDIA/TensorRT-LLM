@@ -30,6 +30,11 @@ pool prefetch (pool reuse does not cover model IO). Page cache is
 reclaimable memory, so warming cannot OOM the host; a wasted warm (test
 skipped or reordered) costs only IO bandwidth.
 
+Coexistence with MPI session reuse: when ``test_common/session_reuse.py`` is
+wired and enabled it owns the same pool-creation seams and eliminates the
+respawn outright, so the prefetcher automatically stays off the seams and
+only weight warming remains active (see ``_reuse_layer_active``).
+
 Enabled by default; ``TRTLLM_TEST_PREFETCH_SESSION=0`` disables BOTH pool
 prefetch and weight warming (one kill switch for the whole plugin). Suites
 that never import tensorrt_llm's executor modules pay nothing — not even
@@ -54,6 +59,26 @@ _PATCH_TARGETS = (
     "tensorrt_llm.executor.rpc_proxy",
     "tensorrt_llm.llmapi.llm",
 )
+
+
+def _reuse_layer_active() -> bool:
+    """True when the MPI session-reuse layer owns the pool-creation seams.
+
+    ``test_common.session_reuse`` keeps pools alive across tests at the SAME
+    seams this module would patch, and saves the whole respawn rather than
+    just hiding it — strictly better where it applies. When it is wired and
+    enabled, the prefetcher must stay off the seams so the two factories
+    don't fight over them (whoever patches first would silently disable the
+    other). Weight page-cache warming is orthogonal and stays on either way.
+    """
+    mod = sys.modules.get("test_common.session_reuse")
+    if mod is None:
+        return False
+    try:
+        return bool(mod.REUSE.enabled)
+    except Exception:
+        return True  # loaded but unreadable: err on staying out of the way
+
 
 # MpiPoolSession workers freeze their environment AND sys.path at spawn time
 # (they inherit the whole parent env at MPI spawn, plus MPIPoolExecutor's
@@ -560,6 +585,11 @@ class SessionPrefetcher:
             return
         if len(self._patched) == len(_PATCH_TARGETS):
             return  # everything already patched: per-test fast path
+        if _reuse_layer_active():
+            # session_reuse owns the seams: skip MPI-pool prefetch entirely
+            # (reuse eliminates the respawn; prefetch could only hide it).
+            self.stats["mpi_yielded_to_reuse"] = 1
+            return
         pending = [n for n in _PATCH_TARGETS if n in sys.modules and n not in self._patched]
         if not pending:
             return

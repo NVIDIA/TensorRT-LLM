@@ -387,6 +387,36 @@ def test_warm_io_thread_names_covered_by_threadleak_exclude():
     assert re.fullmatch(r"session-prefetch-\w+", "session-prefetch-io_0")
 
 
+def _fake_reuse_module(enabled):
+    return types.SimpleNamespace(REUSE=types.SimpleNamespace(enabled=enabled))
+
+
+def test_yields_mpi_seams_to_active_session_reuse(monkeypatch):
+    # session_reuse owns the same seams and saves the whole respawn; when it
+    # is enabled the prefetcher must not install its factory (whoever patched
+    # first would silently disable the other layer).
+    monkeypatch.setenv("TRTLLM_TEST_PREFETCH_SESSION", "1")
+    monkeypatch.delenv("PYTEST_XDIST_WORKER", raising=False)
+    monkeypatch.setitem(sys.modules, "test_common.session_reuse", _fake_reuse_module(enabled=True))
+    p = SessionPrefetcher()
+    p.install_pool_factory_if_loaded()
+    assert not p._patched
+    assert p.stats["mpi_yielded_to_reuse"] == 1
+
+
+def test_reuse_layer_inactive_or_absent_does_not_block_prefetch(monkeypatch):
+    monkeypatch.setitem(sys.modules, "test_common.session_reuse", _fake_reuse_module(enabled=False))
+    assert not session_prefetcher._reuse_layer_active()
+    monkeypatch.delitem(sys.modules, "test_common.session_reuse")
+    assert not session_prefetcher._reuse_layer_active()
+
+
+def test_unreadable_reuse_module_errs_on_yielding(monkeypatch):
+    # Module present but attribute layout changed: stay out of the way.
+    monkeypatch.setitem(sys.modules, "test_common.session_reuse", types.SimpleNamespace())
+    assert session_prefetcher._reuse_layer_active()
+
+
 def test_patch_targets_cover_all_library_construction_sites():
     # The factory only intercepts the modules listed in _PATCH_TARGETS. If the
     # library grows another MpiPoolSession(...) construction site, prefetch
