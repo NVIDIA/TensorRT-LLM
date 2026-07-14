@@ -64,14 +64,20 @@ class OpenAIClient(ABC):
         request: UCompletionRequest,
         server: Optional[str] = None,
         hooks: Optional[ResponseHooks] = None,
+        req_id: Optional[int] = None,
     ) -> UCompletionResponseOrGenerator:
         if isinstance(request, CompletionRequest):
             return await self._send_request(
-                "v1/completions", request, CompletionResponse, server, hooks
+                "v1/completions", request, CompletionResponse, server, hooks, req_id
             )
         elif isinstance(request, ChatCompletionRequest):
             return await self._send_request(
-                "v1/chat/completions", request, ChatCompletionResponse, server, hooks
+                "v1/chat/completions",
+                request,
+                ChatCompletionResponse,
+                server,
+                hooks,
+                req_id,
             )
         else:
             raise ValueError(f"Invalid request type: {type(request)}")
@@ -84,6 +90,7 @@ class OpenAIClient(ABC):
         response_type: Type[UCompletionResponse],
         server: Optional[str] = None,
         hooks: Optional[ResponseHooks] = None,
+        req_id: Optional[int] = None,
     ) -> UCompletionResponseOrGenerator:
         """Send a request to the server and return the response and the body generator.
 
@@ -102,7 +109,12 @@ class OpenAIClient(ABC):
     async def shutdown(self) -> None: ...
 
     @abstractmethod
-    async def _finish_request(self, request: UCompletionRequest, success: bool = True) -> None:
+    async def _finish_request(
+        self,
+        request: UCompletionRequest,
+        success: bool = True,
+        req_id: Optional[int] = None,
+    ) -> None:
         """Finish the request in the router.
 
         ``success`` lets the router distinguish completed vs failed requests
@@ -146,9 +158,10 @@ class OpenAIHttpClient(OpenAIClient):
         response_type: Type[UCompletionResponse],
         server: Optional[str] = None,
         hooks: Optional[ResponseHooks] = None,
+        req_id: Optional[int] = None,
     ) -> UCompletionResponseOrGenerator:
         if server is None:
-            server, _ = await self._router.get_next_server(request)
+            server, _ = await self._router.get_next_server(request, req_id=req_id)
         url = f"http://{server}/{endpoint}"
         # disaggregated_params is None when conditional_disagg bypasses ctx.
         _dp = request.disaggregated_params
@@ -156,7 +169,7 @@ class OpenAIHttpClient(OpenAIClient):
         logger.debug(f"Sending {self._role} request {_ctx_rid} to {url}")
         try:
             self._metrics_collector.total_requests.inc()
-            resp_generator = self._post_with_retry(server, url, request, hooks)
+            resp_generator = self._post_with_retry(server, url, request, hooks, req_id)
             if request.stream:
                 # return the response generator, the request is not done yet
                 return resp_generator
@@ -175,7 +188,7 @@ class OpenAIHttpClient(OpenAIClient):
         except Exception:
             self._metrics_collector.error_requests.inc()
             # finish the request upon error
-            await self._finish_request(request, success=False)
+            await self._finish_request(request, success=False, req_id=req_id)
             raise
 
     async def _post_with_retry(
@@ -184,6 +197,7 @@ class OpenAIHttpClient(OpenAIClient):
         url: str,
         request: UCompletionRequest,
         hooks: Optional[ResponseHooks] = None,
+        req_id: Optional[int] = None,
     ) -> AsyncGenerator[Any, None]:
         is_stream = request.stream
         # Loop range must cover the transient-TCP extended budget (up to 5)
@@ -227,7 +241,7 @@ class OpenAIHttpClient(OpenAIClient):
                         # do NOT return generator directly here or the response will go
                         # out of scope and get destroyed
                         async for line in self._response_generator(
-                            request, http_response, start_time, server, hooks
+                            request, http_response, start_time, server, hooks, req_id
                         ):
                             lines_yielded += 1
                             yield line
@@ -246,7 +260,7 @@ class OpenAIHttpClient(OpenAIClient):
                         # yield here since python forbids return statements in async generators
                         yield response_dict
                         # finish the request after the successful response
-                        await self._finish_request(request)
+                        await self._finish_request(request, req_id=req_id)
                         self._metrics_collector.complete_latency_seconds.observe(
                             get_steady_clock_now_in_seconds() - start_time
                         )
@@ -296,6 +310,7 @@ class OpenAIHttpClient(OpenAIClient):
         start_time: float,
         server: str,
         hooks: Optional[ResponseHooks] = None,
+        req_id: Optional[int] = None,
     ) -> AsyncGenerator[Any, None]:
         assert request.stream, "Request is not streaming"
         assert "text/event-stream" in http_response.headers.get("Content-Type", ""), (
@@ -340,11 +355,16 @@ class OpenAIHttpClient(OpenAIClient):
             raise
         finally:
             # finish the request after streaming response is done or error is raised
-            await self._finish_request(request, success=success)
+            await self._finish_request(request, success=success, req_id=req_id)
 
-    async def _finish_request(self, request: UCompletionRequest, success: bool = True) -> None:
+    async def _finish_request(
+        self,
+        request: UCompletionRequest,
+        success: bool = True,
+        req_id: Optional[int] = None,
+    ) -> None:
         self._metrics_collector.completed_requests.inc()
-        await self._router.finish_request(request, self._session, success=success)
+        await self._router.finish_request(request, self._session, success=success, req_id=req_id)
 
     async def collect_metrics(self) -> Dict[str, Any]:
         metrics = {}

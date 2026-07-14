@@ -427,17 +427,18 @@ class Router(ABC):
             f"Removed server {server}, current server list: {self._servers}")
 
     @abstractmethod
-    async def get_next_server(
-            self,
-            request: OpenAIRequest,
-            exclude_server: Optional[str] = None) -> tuple[str, dict]:
+    async def get_next_server(self,
+                              request: OpenAIRequest,
+                              exclude_server: Optional[str] = None,
+                              req_id: Optional[int] = None) -> tuple[str, dict]:
         """Select server by request and return some intermediate information"""
 
     @abstractmethod
     async def finish_request(self,
                              request: OpenAIRequest,
                              session: Optional[aiohttp.ClientSession] = None,
-                             success: bool = True):
+                             success: bool = True,
+                             req_id: Optional[int] = None):
         pass
 
     @property
@@ -660,10 +661,11 @@ class RoundRobinRouter(Router):
         self._server_idx += 1
         return server
 
-    async def get_next_server(
-            self,
-            request: OpenAIRequest,
-            exclude_server: Optional[str] = None) -> tuple[str, dict]:
+    async def get_next_server(self,
+                              request: OpenAIRequest,
+                              exclude_server: Optional[str] = None,
+                              req_id: Optional[int] = None) -> tuple[str, dict]:
+        del req_id
         if not self._servers:
             if self._metadata_server:
                 raise ValueError(
@@ -685,8 +687,9 @@ class RoundRobinRouter(Router):
     async def finish_request(self,
                              request: OpenAIRequest,
                              session: Optional[aiohttp.ClientSession] = None,
-                             success: bool = True):
-        del request, session, success
+                             success: bool = True,
+                             req_id: Optional[int] = None):
+        del request, session, success, req_id
 
 
 class LoadBalancingRouter(LoadBalancingMixin, Router):
@@ -709,10 +712,11 @@ class LoadBalancingRouter(LoadBalancingMixin, Router):
                                  or self._create_server_state(server))
         self._server_state = new_state
 
-    async def get_next_server(
-            self,
-            request: OpenAIRequest,
-            exclude_server: Optional[str] = None) -> tuple[str, dict]:
+    async def get_next_server(self,
+                              request: OpenAIRequest,
+                              exclude_server: Optional[str] = None,
+                              req_id: Optional[int] = None) -> tuple[str, dict]:
+        del req_id
         self._validate_servers_available()
 
         async with self._lock:
@@ -727,8 +731,9 @@ class LoadBalancingRouter(LoadBalancingMixin, Router):
     async def finish_request(self,
                              request: OpenAIRequest,
                              session: Optional[aiohttp.ClientSession] = None,
-                             success: bool = True):
-        del session, success
+                             success: bool = True,
+                             req_id: Optional[int] = None):
+        del session, success, req_id
         async with self._lock:
             await self._unregister_request(request)
 
@@ -855,10 +860,11 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
             parts.append(str(list(token_ids[:ROUTE_AFFINITY_TOKEN_PREFIX])))
         return hash("".join(parts))
 
-    async def get_next_server(
-            self,
-            request: OpenAIRequest,
-            exclude_server: Optional[str] = None) -> tuple[str, dict]:
+    async def get_next_server(self,
+                              request: OpenAIRequest,
+                              exclude_server: Optional[str] = None,
+                              req_id: Optional[int] = None) -> tuple[str, dict]:
+        del req_id
         # Standalone (in-process) entry point = routing_key(tokenize+hash) then
         # the shared _route core -- the SAME core the coordinator path uses.
         key = await asyncio.to_thread(self._routing_key_sync, request)
@@ -979,7 +985,9 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
     async def finish_request(self,
                              request: OpenAIRequest,
                              session: Optional[aiohttp.ClientSession] = None,
-                             success: bool = True):
+                             success: bool = True,
+                             req_id: Optional[int] = None):
+        del req_id
         # Standalone entry point: key by id(request); pass request so token-load
         # accounting matches the increment_load(request) done at route time.
         await self._finish(id(request),
@@ -1406,10 +1414,11 @@ class ConversationRouter(BlockHashMixin, LoadBalancingMixin, Router):
 
     # ── public interface ──
 
-    async def get_next_server(
-            self,
-            request: OpenAIRequest,
-            exclude_server: Optional[str] = None) -> tuple[str, dict]:
+    async def get_next_server(self,
+                              request: OpenAIRequest,
+                              exclude_server: Optional[str] = None,
+                              req_id: Optional[int] = None) -> tuple[str, dict]:
+        del req_id
         self._validate_servers_available()
 
         conv_id = self._get_conversation_id(request)
@@ -1481,8 +1490,9 @@ class ConversationRouter(BlockHashMixin, LoadBalancingMixin, Router):
     async def finish_request(self,
                              request: OpenAIRequest,
                              session: Optional[aiohttp.ClientSession] = None,
-                             success: bool = True):
-        del session, success
+                             success: bool = True,
+                             req_id: Optional[int] = None):
+        del session, success, req_id
         async with self._lock:
             server = await self._unregister_request(request)
             self._remove_content_load(server, request)
@@ -1599,7 +1609,9 @@ class CoordinatorDelegatingRouter(Router):
     def _on_servers_updated(self, old_servers, new_servers):
         pass
 
-    def _request_id(self, request: OpenAIRequest) -> int:
+    def _request_id(self,
+                    request: OpenAIRequest,
+                    req_id: Optional[int] = None) -> int:
         """The request's disagg id -- the sole cross-process key for select/finish.
 
         Context requests carry disagg_request_id; generation requests inherit the
@@ -1610,6 +1622,8 @@ class CoordinatorDelegatingRouter(Router):
         registered (transfer never completes -> DISAGG_GENERATION_TRANS_IN_PROGRESS
         fills the gen IndexMapper and throughput collapses).
         """
+        if req_id is not None:
+            return req_id
         dp = request.disaggregated_params
         if dp is None:
             raise ValueError("delegated routing requires disaggregated_params")
@@ -1621,10 +1635,10 @@ class CoordinatorDelegatingRouter(Router):
                 "(disagg_request_id/ctx_request_id) on the request")
         return rid
 
-    async def get_next_server(
-            self,
-            request: OpenAIRequest,
-            exclude_server: Optional[str] = None) -> tuple[str, dict]:
+    async def get_next_server(self,
+                              request: OpenAIRequest,
+                              exclude_server: Optional[str] = None,
+                              req_id: Optional[int] = None) -> tuple[str, dict]:
         # routing_key() tokenizes + block-hashes the prompt (CPU-bound for
         # kv_cache_aware); run it in a thread so it doesn't block the fleet worker
         # event loop driving the concurrent streams.
@@ -1635,7 +1649,7 @@ class CoordinatorDelegatingRouter(Router):
         payload = {
             "role": self._role,
             "routing_key": key,
-            "req_id": self._request_id(request),
+            "req_id": self._request_id(request, req_id),
             "exclude_server": exclude_server
         }
         _t0 = time.monotonic()
@@ -1655,13 +1669,14 @@ class CoordinatorDelegatingRouter(Router):
     async def finish_request(self,
                              request: OpenAIRequest,
                              session: Optional[aiohttp.ClientSession] = None,
-                             success: bool = True):
+                             success: bool = True,
+                             req_id: Optional[int] = None):
         # Fire-and-forget: /finish only releases the coordinator's routed-load
         # bookkeeping, so run it as a background task instead of awaiting the HTTP
         # round trip on every request's critical path. Capture req_id first (the
         # request may be freed after return); errors are logged, not propagated.
         del session
-        req_id = self._request_id(request)
+        req_id = self._request_id(request, req_id)
         task = asyncio.create_task(self._finish_async(req_id, success))
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)

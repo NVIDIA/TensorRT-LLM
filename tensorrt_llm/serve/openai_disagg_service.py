@@ -123,14 +123,8 @@ class OpenAIDisaggregatedService(OpenAIService):
         # empty server means client decides which server to use
         ctx_server = None
         disagg_request_id = await self._coordinator.get_disagg_request_id()
-        if self.conditional_disagg_config:
-            if request.disaggregated_params is None:
-                self._get_gen_request(request, None, disagg_request_id)
-            else:
-                request.disaggregated_params.disagg_request_id = disagg_request_id
-                request.disaggregated_params.ctx_request_id = disagg_request_id
         # reserve a gen_server if conditional disagg is needed
-        gen_server, need_ctx = await self._check_conditional_disagg(request)
+        gen_server, need_ctx = await self._check_conditional_disagg(request, disagg_request_id)
         need_ctx = need_ctx and not await self._check_gen_only_disagg(request)
         ctx_response = None
         gen_req = request
@@ -143,10 +137,10 @@ class OpenAIDisaggregatedService(OpenAIService):
                 ctx_req = self._get_ctx_request(request, disagg_request_id)
                 # ctx generator is empty
                 ctx_server, _ = await self._ctx_router.get_next_server(
-                    ctx_req, exclude_server=gen_server
+                    ctx_req, exclude_server=gen_server, req_id=disagg_request_id
                 )
                 ctx_response = await self._ctx_client.send_request(
-                    ctx_req, server=ctx_server, hooks=hooks
+                    ctx_req, server=ctx_server, hooks=hooks, req_id=disagg_request_id
                 )
                 await self._verify_ctx_response(ctx_response)
                 ctx_response_disagg_params = ctx_response.choices[0].disaggregated_params
@@ -155,7 +149,9 @@ class OpenAIDisaggregatedService(OpenAIService):
                 gen_req = self._get_gen_request(request, ctx_response, disagg_request_id)
             except Exception:
                 if gen_server:
-                    await self._gen_router.finish_request(request, success=False)
+                    await self._gen_router.finish_request(
+                        request, success=False, req_id=disagg_request_id
+                    )
                 raise
         else:
             # When need_ctx=False the gen server handles full generation and
@@ -170,15 +166,15 @@ class OpenAIDisaggregatedService(OpenAIService):
         if ctx_response is None or self._need_gen(ctx_response):
             if not gen_server:
                 gen_server, _ = await self._gen_router.get_next_server(
-                    gen_req, exclude_server=ctx_server
+                    gen_req, exclude_server=ctx_server, req_id=disagg_request_id
                 )
             gen_response = await self._gen_client.send_request(
-                gen_req, server=gen_server, hooks=hooks
+                gen_req, server=gen_server, hooks=hooks, req_id=disagg_request_id
             )
             return gen_response
         else:
             if gen_server:
-                await self._gen_router.finish_request(request)
+                await self._gen_router.finish_request(request, req_id=disagg_request_id)
             if request.stream:
                 # ctx client will never return a generator when streaming is requested
                 # make up for this by returning a done generator
@@ -277,7 +273,7 @@ class OpenAIDisaggregatedService(OpenAIService):
         request.disaggregated_params.disagg_request_id = disagg_request_id
         return request
 
-    async def _check_conditional_disagg(self, request: UCompletionRequest) -> bool:
+    async def _check_conditional_disagg(self, request: UCompletionRequest, req_id: int) -> bool:
         if self.conditional_disagg_config:
             local_gen_router = (
                 self._gen_router._local
@@ -290,7 +286,7 @@ class OpenAIDisaggregatedService(OpenAIService):
                 )
             # Query kv cache status and select a best gen_server.
             # The server is reserved for generation request
-            gen_server, info = await self._gen_router.get_next_server(request)
+            gen_server, info = await self._gen_router.get_next_server(request, req_id=req_id)
             match_length = sum(info["matches"])
             total_length = sum(len(token_list) for token_list in info["token_lists"])
             need_ctx_decision = (
@@ -395,7 +391,9 @@ class OpenAIDisaggregatedService(OpenAIService):
             # arrival->here = pre-ctx wait in the orchestrator/fleet.
             if hooks:
                 hooks.on_ctx_dispatch(request)
-            ctx_server, ctx_server_info = await self._ctx_router.get_next_server(request)
+            ctx_server, ctx_server_info = await self._ctx_router.get_next_server(
+                request, req_id=disagg_request_id
+            )
             ctx_req = self._get_ctx_request(request, disagg_request_id)
         gen_req = self._get_gen_request(
             request,
@@ -415,7 +413,7 @@ class OpenAIDisaggregatedService(OpenAIService):
             # Fix: eagerly start consuming the gen generator in a background
             # task so the HTTP POST fires, then pipe chunks through a queue.
             gen_response = await self._gen_client.send_request(
-                gen_req, server=gen_server, hooks=hooks
+                gen_req, server=gen_server, hooks=hooks, req_id=disagg_request_id
             )
 
             queue: asyncio.Queue = asyncio.Queue()
@@ -432,7 +430,12 @@ class OpenAIDisaggregatedService(OpenAIService):
 
             # Now send ctx request — gen server has received its request
             try:
-                await self._ctx_client.send_request(ctx_req, server=ctx_server, hooks=hooks)
+                await self._ctx_client.send_request(
+                    ctx_req,
+                    server=ctx_server,
+                    hooks=hooks,
+                    req_id=disagg_request_id,
+                )
             except Exception:
                 consume_task.cancel()
                 try:
@@ -466,12 +469,22 @@ class OpenAIDisaggregatedService(OpenAIService):
             if need_ctx:
                 tasks.append(
                     asyncio.create_task(
-                        self._ctx_client.send_request(ctx_req, server=ctx_server, hooks=hooks)
+                        self._ctx_client.send_request(
+                            ctx_req,
+                            server=ctx_server,
+                            hooks=hooks,
+                            req_id=disagg_request_id,
+                        )
                     )
                 )
             tasks.append(
                 asyncio.create_task(
-                    self._gen_client.send_request(gen_req, server=gen_server, hooks=hooks)
+                    self._gen_client.send_request(
+                        gen_req,
+                        server=gen_server,
+                        hooks=hooks,
+                        req_id=disagg_request_id,
+                    )
                 )
             )
             responses = await asyncio.gather(*tasks)
