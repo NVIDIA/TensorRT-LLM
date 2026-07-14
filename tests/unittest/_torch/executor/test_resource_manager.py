@@ -17,6 +17,7 @@ import tensorrt_llm.bindings
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
     KVCacheManager, PeftCacheManager, _merge_kv_cache_pool_pointers,
+    ResourceManager, ResourceManagerType,
     _warn_if_unsupported_v1_kv_cache_event_hash_algo)
 from tensorrt_llm.bindings import LayerType
 from tensorrt_llm.bindings import ModelConfig as ModelConfigCpp
@@ -162,6 +163,29 @@ class TestKVCacheManagerPoolPointers(unittest.TestCase):
                             scale_pointers))
         finally:
             manager.shutdown()
+
+
+def test_resource_manager_updates_context_resources_before_generation_resources(
+):
+    scheduled_batch = object()
+    calls = []
+
+    class MockResourceManager:
+
+        def update_context_resources(self, batch):
+            assert batch is scheduled_batch
+            calls.append("context")
+
+        def update_resources(self, batch):
+            assert batch is scheduled_batch
+            calls.append("generation")
+
+    manager = ResourceManager(
+        {ResourceManagerType.KV_CACHE_MANAGER: MockResourceManager()})
+
+    manager.update_resources(scheduled_batch)
+
+    assert calls == ["context", "generation"]
 
 
 class TestResourceManager(unittest.TestCase):
