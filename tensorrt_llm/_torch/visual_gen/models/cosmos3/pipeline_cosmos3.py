@@ -41,16 +41,6 @@ from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.inputs.utils import load_image
 from tensorrt_llm.logger import logger
 
-from .transfer import (
-    Cosmos3TransferConfig,
-    load_or_compute_control_frames,
-    media_hw,
-    media_to_uint8_cthw,
-    pad_temporal_frames,
-    resize_center_crop_uint8_cthw,
-    resolve_transfer_config,
-    uint8_cthw_to_normalized_5d,
-)
 from .defaults import (
     COSMOS3_720P_PARAMS,
     COSMOS3_DEFAULT_CONDITION_VIDEO_KEEP,
@@ -62,6 +52,15 @@ from .defaults import (
 )
 from .guardrails import check_video_safety, download_guardrail_checkpoint
 from .sound_tokenizer import LatentAutoEncoderV2
+from .transfer import (
+    Cosmos3TransferConfig,
+    load_or_compute_control_frames,
+    media_hw,
+    media_to_uint8_cthw,
+    pad_temporal_frames,
+    resolve_transfer_config,
+    uint8_cthw_to_normalized_5d,
+)
 from .transformer_cosmos3 import Cosmos3VFMTransformer
 from .utils import normalize_video_input, pil_to_rgb
 
@@ -1309,7 +1308,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                 if detected is not None:
                     return detected
         return None
-    
+
     @staticmethod
     def _get_transfer_num_chunks(
         total_frames: int,
@@ -1535,7 +1534,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             per_hint_frames[hint.key] = frames
         if not per_hint_frames:
             raise ValueError("Cosmos3 transfer requires at least one control hint.")
-        
+
         total_frames = next(iter(per_hint_frames.values())).shape[1]
         if transfer_config.num_frames is not None:
             total_frames = min(total_frames, int(transfer_config.num_frames))

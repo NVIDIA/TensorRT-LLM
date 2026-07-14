@@ -158,7 +158,7 @@ def resolve_transfer_config(extra_params: dict, req_params: Any, prompt_data: An
         if any(extra_params.get(key, None) for key in transfer_only):
             raise ValueError("Cosmos3 transfer options were provided, but no transfer hint was selected.")
         return None
-    
+
     request_guidance_scale = getattr(req_params, "guidance_scale", None)
     if request_guidance_scale is None:
         # vLLM-compatible transfer guidance default: OmniDiffusionRequest
