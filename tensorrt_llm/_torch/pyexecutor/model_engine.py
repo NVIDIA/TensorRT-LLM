@@ -2516,12 +2516,12 @@ class PyTorchModelEngine(ModelEngine):
         return isinstance(self.input_processor, BaseMultimodalInputProcessor)
 
     @torch.inference_mode()
-    def execute_multimodal_encoder_items(
+    def forward_multimodal_encoder_items(
         self,
         requests: List[LlmRequest],
         scheduled_items: Dict[int, List[int]],
     ) -> None:
-        """Execute selected atomic MM items and commit request-local outputs."""
+        """Forward selected MM encoder items and commit request-local outputs."""
         if not scheduled_items:
             return
         if not isinstance(self.model, MultimodalModelMixin):
@@ -2529,7 +2529,7 @@ class PyTorchModelEngine(ModelEngine):
                 "Item-level MM scheduling requires MultimodalModelMixin")
 
         request_by_id = {request.request_id: request for request in requests}
-        selected = []
+        selected_items = []
         selected_owners: List[Tuple[LlmRequest, int]] = []
         for request_id, item_indices in scheduled_items.items():
             request = request_by_id.get(request_id)
@@ -2539,12 +2539,13 @@ class PyTorchModelEngine(ModelEngine):
             multimodal_param = MultimodalParams(
                 multimodal_data=request.py_multimodal_data)
             for item_idx in item_indices:
-                selected.append((multimodal_param, item_idx))
+                selected_items.append((multimodal_param, item_idx))
                 selected_owners.append((request, item_idx))
 
-        prepared_items = self.model.prepare_multimodal_items(selected)
-        for item_param, _, _ in prepared_items:
-            item_param.to_device(
+        encoder_inputs = self.model.prepare_multimodal_encoder_inputs(
+            selected_items)
+        for encoder_input, _, _ in encoder_inputs:
+            encoder_input.to_device(
                 "multimodal_data",
                 "cuda",
                 pin_memory=prefer_pinned(),
@@ -2552,7 +2553,7 @@ class PyTorchModelEngine(ModelEngine):
                                         "multimodal_data_device_paths", None),
             )
 
-        outputs = self.model.encode_prepared_multimodal_items(prepared_items)
+        outputs = self.model.forward_multimodal_encoder_items(encoder_inputs)
         if len(outputs) != len(selected_owners):
             raise RuntimeError(
                 "MM item encoder must return one output per item")

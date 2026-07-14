@@ -167,7 +167,7 @@ class MultimodalModelMixin:
         raise NotImplementedError
 
     @staticmethod
-    def _select_multimodal_item(
+    def _build_multimodal_encoder_input(
         multimodal_param: MultimodalParams,
         item_idx: int,
     ) -> MultimodalParams:
@@ -227,11 +227,11 @@ class MultimodalModelMixin:
 
         return MultimodalParams(multimodal_data={modality: selected_data})
 
-    def prepare_multimodal_items(
+    def prepare_multimodal_encoder_inputs(
         self,
         selected_items: Sequence[tuple[MultimodalParams, int]],
     ) -> list[tuple[MultimodalParams, int, str]]:
-        """Slice selected items before any caller performs H2D transfer.
+        """Build selected item encoder inputs before the caller performs H2D.
 
         Args:
             selected_items: ``(request params, item index)`` pairs in
@@ -239,10 +239,10 @@ class MultimodalModelMixin:
                 parallel item references and embedding lengths.
 
         Returns:
-            Tuples containing the sliced single-item params, its expected
+            Tuples containing the single-item encoder params, its expected
             encoder output row count, and its modality, in input order.
         """
-        prepared_items: list[tuple[MultimodalParams, int, str]] = []
+        encoder_inputs: list[tuple[MultimodalParams, int, str]] = []
         for multimodal_param, item_idx in selected_items:
             multimodal_data = multimodal_param.multimodal_data or {}
             item_metadata = get_multimodal_encoder_item_metadata(multimodal_data)
@@ -253,25 +253,25 @@ class MultimodalModelMixin:
             if not isinstance(item_refs, list) or not isinstance(embedding_lengths, list):
                 raise TypeError("MM item metadata must contain lists")
             modality = item_refs[item_idx][0]
-            prepared_items.append(
+            encoder_inputs.append(
                 (
-                    self._select_multimodal_item(multimodal_param, item_idx),
+                    self._build_multimodal_encoder_input(multimodal_param, item_idx),
                     embedding_lengths[item_idx],
                     modality,
                 )
             )
-        return prepared_items
+        return encoder_inputs
 
-    def encode_prepared_multimodal_items(
+    def forward_multimodal_encoder_items(
         self,
-        prepared_items: Sequence[tuple[MultimodalParams, int, str]],
+        encoder_inputs: Sequence[tuple[MultimodalParams, int, str]],
     ) -> list[torch.Tensor]:
-        """Encode already-sliced items in scheduler order.
+        """Forward prepared MM encoder inputs in scheduler item order.
 
         Args:
-            prepared_items: Tuples returned by
-                :meth:`prepare_multimodal_items`. Consecutive items with the
-                same modality must be batch-compatible.
+            encoder_inputs: Tuples returned by
+                :meth:`prepare_multimodal_encoder_inputs`. Consecutive inputs
+                with the same modality must be batch-compatible.
 
         Returns:
             One encoder output tensor per prepared item. Each tensor has the
@@ -292,7 +292,7 @@ class MultimodalModelMixin:
             group_params.clear()
             group_lengths.clear()
 
-        for multimodal_param, embedding_length, modality in prepared_items:
+        for multimodal_param, embedding_length, modality in encoder_inputs:
             if group_modality is not None and modality != group_modality:
                 flush_group()
             group_modality = modality

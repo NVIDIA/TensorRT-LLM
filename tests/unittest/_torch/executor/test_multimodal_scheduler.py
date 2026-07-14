@@ -182,6 +182,21 @@ def test_independent_mode_encodes_request_rejected_by_llm_capacity():
     assert output.context_requests == [text_request]
 
 
+def test_forward_multimodal_encoder_step_delegates_to_model_engine():
+    calls = []
+    executor = object.__new__(PyExecutor)
+    executor.active_requests = [SimpleNamespace(request_id=1)]
+    executor.model_engine = SimpleNamespace(
+        forward_multimodal_encoder_items=lambda requests, items: calls.append((requests, items))
+    )
+    scheduled_items = {1: [0]}
+    scheduled_requests = SimpleNamespace(scheduled_mm_encoder_items=scheduled_items)
+
+    executor._forward_multimodal_encoder_step(scheduled_requests)
+
+    assert calls == [(executor.active_requests, scheduled_items)]
+
+
 def _executor_for_mm_admission(active_requests, *, max_num_tokens=8):
     executor = object.__new__(PyExecutor)
     executor.enable_attention_dp = False
@@ -259,8 +274,10 @@ def test_item_encoder_slices_and_restores_selected_item_order():
     )
 
     model = _Model()
-    prepared_items = model.prepare_multimodal_items([(multimodal_param, 1), (multimodal_param, 0)])
-    outputs = model.encode_prepared_multimodal_items(prepared_items)
+    encoder_inputs = model.prepare_multimodal_encoder_inputs(
+        [(multimodal_param, 1), (multimodal_param, 0)]
+    )
+    outputs = model.forward_multimodal_encoder_items(encoder_inputs)
 
     assert [output.squeeze(1).tolist() for output in outputs] == [
         [2, 3, 4],
@@ -268,7 +285,7 @@ def test_item_encoder_slices_and_restores_selected_item_order():
     ]
 
 
-def test_prepare_multimodal_items_slices_before_device_transfer():
+def test_prepare_multimodal_encoder_inputs_slices_before_device_transfer():
     multimodal_param = MultimodalParams(
         multimodal_data={
             "image": {
@@ -284,18 +301,18 @@ def test_prepare_multimodal_items_slices_before_device_transfer():
         }
     )
 
-    prepared = MultimodalModelMixin.prepare_multimodal_items(
+    encoder_inputs = MultimodalModelMixin.prepare_multimodal_encoder_inputs(
         MultimodalModelMixin(), [(multimodal_param, 1)]
     )
 
-    item_param, embedding_length, modality = prepared[0]
+    item_param, embedding_length, modality = encoder_inputs[0]
     assert modality == "image"
     assert embedding_length == 3
     assert item_param.multimodal_data["image"]["pixel_values"].squeeze(1).tolist() == [2, 3, 4]
     assert multimodal_param.multimodal_data["image"]["pixel_values"].shape[0] == 5
 
 
-def test_prepare_multimodal_items_rejects_invalid_metadata_types():
+def test_prepare_multimodal_encoder_inputs_rejects_invalid_metadata_types():
     multimodal_param = MultimodalParams(
         multimodal_data={
             MULTIMODAL_ENCODER_ITEM_METADATA_KEY: ("image", 0),
@@ -304,7 +321,7 @@ def test_prepare_multimodal_items_rejects_invalid_metadata_types():
     )
 
     with pytest.raises(TypeError, match="must be a MultimodalEncoderItemMetadata"):
-        MultimodalModelMixin().prepare_multimodal_items([(multimodal_param, 0)])
+        MultimodalModelMixin().prepare_multimodal_encoder_inputs([(multimodal_param, 0)])
 
 
 def test_strip_mm_encoder_inputs_preserves_embedding_and_runtime_metadata():
@@ -326,10 +343,10 @@ def test_strip_mm_encoder_inputs_preserves_embedding_and_runtime_metadata():
 
 def test_item_outputs_fill_one_contiguous_buffer_and_release_raw_data(monkeypatch):
     class _Model(MultimodalModelMixin):
-        def encode_prepared_multimodal_items(self, prepared_items):
+        def forward_multimodal_encoder_items(self, encoder_inputs):
             return [
                 torch.full((embedding_length, 2), float(embedding_length))
-                for _, embedding_length, _ in prepared_items
+                for _, embedding_length, _ in encoder_inputs
             ]
 
     monkeypatch.setattr(MultimodalParams, "to_device", lambda self, *args, **kwargs: self)
@@ -356,7 +373,7 @@ def test_item_outputs_fill_one_contiguous_buffer_and_release_raw_data(monkeypatc
         multimodal_lengths=None,
     )
 
-    engine.execute_multimodal_encoder_items([request], {1: [0]})
+    engine.forward_multimodal_encoder_items([request], {1: [0]})
 
     output_buffer = request.py_mm_encoder_output_buffer
     assert output_buffer.shape == (5, 2)
@@ -364,7 +381,7 @@ def test_item_outputs_fill_one_contiguous_buffer_and_release_raw_data(monkeypatc
     assert request.py_mm_encoder_outputs[1] is None
     assert "image" in request.py_multimodal_data
 
-    engine.execute_multimodal_encoder_items([request], {1: [1]})
+    engine.forward_multimodal_encoder_items([request], {1: [1]})
 
     assert request.py_multimodal_data["multimodal_embedding"] is output_buffer
     assert (
