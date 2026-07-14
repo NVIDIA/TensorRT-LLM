@@ -93,6 +93,21 @@ def test_model(client: openai.OpenAI, model_name: str):
     assert model.id == model_name.split('/')[-1]
 
 
+def test_tokenize(server: RemoteOpenAIServer):
+    tokenize_url = server.url_for("_internal", "tokenize")
+
+    # prompt path: encode raw text directly.
+    prompt_resp = requests.post(tokenize_url, json={"prompt": "Hello, world!"})
+    assert prompt_resp.status_code == 200
+    prompt_body = prompt_resp.json()
+    assert prompt_body["count"] == len(prompt_body["tokens"]) > 0
+
+    # prompt is required; an empty body fails request-model validation. The
+    # server's RequestValidationError handler renders that as 400 (not the
+    # FastAPI default 422) to match the shared {"error": ...} envelope.
+    assert requests.post(tokenize_url, json={}).status_code == 400
+
+
 @pytest.mark.parametrize("use_beam_search", [False, True])
 # reference: https://github.com/vllm-project/vllm/blob/44f990515b124272f87954fc763d90697d8aa1db/tests/entrypoints/openai/test_basic.py#L123
 @pytest.mark.asyncio
