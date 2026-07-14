@@ -360,6 +360,11 @@ public:
     float constantThreshold{};
     bool useRandomAcceptanceThreshold{};
 
+    //! FSD divergence threshold (0 = disabled, no extra computation)
+    float fsdThreshold{};
+    //! FSD divergence type (0=JS, 1=KL, 2=TV, 3=ReverseKL)
+    runtime::SizeType32 fsdDivergenceType{};
+
     //! optional parameters
     curandState_t* curandStates{}; // [localBatchSize]
 

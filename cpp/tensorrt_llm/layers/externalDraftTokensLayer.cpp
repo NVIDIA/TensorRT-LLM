@@ -403,7 +403,8 @@ void ExternalDraftTokensLayer<T>::acceptDraftTokens(std::shared_ptr<BaseDecoding
         bufferCast<TokenIdType>(*inputs->draftTokenIds), finishedInput, finishedOutput, inputs->curandStates,
         workspace->getDeviceBatchSlotsPtr(), maxTokensPerStep, beamWidth, mDecoderDomain.getVocabSizePadded(),
         inputs->useRandomAcceptanceThreshold, inputs->constantThreshold, inputs->step,
-        bufferCast<bool>(*mBatchIsAccepted), bufferCast<SizeType32>(*mTargetOutputIds), getStream());
+        bufferCast<bool>(*mBatchIsAccepted), bufferCast<SizeType32>(*mTargetOutputIds), inputs->fsdThreshold,
+        inputs->fsdDivergenceType, getStream());
 
     sync_check_cuda_error(getStream());
 

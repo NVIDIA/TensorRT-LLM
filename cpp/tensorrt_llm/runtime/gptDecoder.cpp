@@ -340,6 +340,8 @@ void prepareExternalDraftTokensInputs(DecodingInput const& inputs, std::shared_p
     inputParams->draftTokenIds = externalDraftTokensInputs.draftTokenIds;
     inputParams->constantThreshold = externalDraftTokensInputs.constantThreshold;
     inputParams->useRandomAcceptanceThreshold = externalDraftTokensInputs.useRandomAcceptanceThreshold;
+    inputParams->fsdThreshold = externalDraftTokensInputs.fsdThreshold;
+    inputParams->fsdDivergenceType = externalDraftTokensInputs.fsdDivergenceType;
     inputParams->step = externalDraftTokensInputs.step;
     inputParams->useDraftLogits = externalDraftTokensInputs.useDraftLogits;
     inputParams->useDraftLogitsHost = externalDraftTokensInputs.useDraftLogitsHost;

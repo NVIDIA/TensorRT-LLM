@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -47,6 +47,8 @@ protected:
     TensorPtr mUseDraftLogitsHost;
     float mConstantThreshold = 1.0f;
     bool mUseRandomAcceptanceThreshold = true;
+    float mFsdThreshold = 0.0f;
+    runtime::SizeType32 mFsdDivergenceType = 0; // JS
 
     std::vector<T>* mTestDraftLogitsInit;
     std::vector<T> mTestDraftLogitsAccept = {
@@ -133,6 +135,8 @@ protected:
         decodeInputTensors->draftTokenIds = mDraftTokenIds;
         decodeInputTensors->constantThreshold = mConstantThreshold;
         decodeInputTensors->useRandomAcceptanceThreshold = mUseRandomAcceptanceThreshold;
+        decodeInputTensors->fsdThreshold = mFsdThreshold;
+        decodeInputTensors->fsdDivergenceType = mFsdDivergenceType;
         decodeInputTensors->step = step;
         decodeInputTensors->useDraftLogits = mUseDraftLogits;
         decodeInputTensors->useDraftLogitsHost = mUseDraftLogitsHost;
@@ -1400,6 +1404,135 @@ TYPED_TEST(ExternalDraftTokensLayerTest, BatchTopKBatchTopP)
         {0}, {0, 1}, {0}, {0}, {0}, {0},       // step 1
         {0}, {0, 1}, {0}, {0}, {0}, {0},       // step 2
         {0}, {0, 1}, {0}, {0}, {0}, {0},       // step 3
+    };
+    this->runTest(expectedOutputIds, params);
+}
+
+// ── Fuzzy Speculative Decoding (FSD) tests ───────────────────────────────────
+//
+// All three tests use topK=1, useDraftLogits=true, and mTestDraftLogitsReject.
+//
+// The "reject" draft distribution shifts its mass one step compared to the
+// target, producing two distinct divergence regimes when measured against the
+// post-topK=1 target distribution:
+//
+//   step 0 / step 2:  draft ≈ target (full dist)  →  JS_normalised ≈ 0.40
+//   step 1:           draft entirely disjoint from topK-1 target  →  JS ≈ 1.0
+//
+// FSD test 1 — T=0 recovers exact standard SD
+// FSD test 2 — T=100 (>>any JS) fuzzy-accepts every SD rejection
+// FSD test 3 — T=0.5 fuzzy-accepts only the low-divergence rejections
+//              (step-0 and step-2) while leaving the high-divergence
+//              step-1 rejection unchanged.
+
+TYPED_TEST(ExternalDraftTokensLayerTest, FsdDisabledMatchesStandardSD)
+{
+    // T=0 disables FSD entirely; results must be identical to standard SD.
+    SizeType32 topK = 1;
+    float topP = 0.0f;
+    TestSamplingParams params;
+    params.topKs = {topK};
+    params.topPs = {topP};
+    params.isExternalDraftTokensLayerTest = true;
+    params.useDraftLogits = true;
+    this->mFsdThreshold = 0.0f;
+    this->mFsdDivergenceType = 0; // JS (irrelevant when threshold == 0)
+
+    this->mTestDraftLogitsInit = &this->mTestDraftLogitsReject;
+    this->mTestDraftTokenIdsInit = {
+        {4, 0, 2}, // accept, accept, accept
+        {4, 0, 3}, // accept, accept, reject
+        {4, 1, 2}, // accept, reject, –
+        {4, 1, 2}, // accept, reject, –
+        {5, 0, 2}, // reject, –, –
+        {},        // no draft tokens — sampled from target
+    };
+
+    // Expected: identical to AcceptByLogitsTopK1TopP0Reject
+    std::vector<std::set<int32_t>> expectedOutputIds{
+        {4}, {4}, {4}, {4}, {4}, {4}, // step 0
+        {0}, {0}, {0}, {0}, {0}, {0}, // step 1
+        {2}, {2}, {0}, {0}, {0}, {0}, // step 2
+        {0}, {0}, {0}, {0}, {0}, {0}, // step 3
+    };
+    this->runTest(expectedOutputIds, params);
+}
+
+TYPED_TEST(ExternalDraftTokensLayerTest, FsdHighThresholdAcceptsAllRejections)
+{
+    // T=100 >> any JS value, so every SD-rejected token is fuzzy-accepted.
+    // Every draft token in the sequence is therefore accepted, giving the same
+    // token sequence as if the draft and target distributions agreed exactly.
+    SizeType32 topK = 1;
+    float topP = 0.0f;
+    TestSamplingParams params;
+    params.topKs = {topK};
+    params.topPs = {topP};
+    params.isExternalDraftTokensLayerTest = true;
+    params.useDraftLogits = true;
+    this->mFsdThreshold = 100.0f;
+    this->mFsdDivergenceType = 0; // JS
+
+    this->mTestDraftLogitsInit = &this->mTestDraftLogitsReject;
+    this->mTestDraftTokenIdsInit = {
+        {4, 0, 2}, // all accepted
+        {4, 0, 3}, // token 3 at step 2: fuzzy-accepted
+        {4, 1, 2}, // token 1 at step 1: fuzzy-accepted; step 2 continues
+        {4, 1, 2}, // same
+        {5, 0, 2}, // token 5 at step 0: fuzzy-accepted; steps 1–2 continue
+        {},        // no draft tokens — sampled from target
+    };
+
+    // All three draft positions are now accepted (or fuzzy-accepted), so the
+    // outputs follow the draft token ids exactly, with a bonus step at step 3
+    // sampling from the topK-1 target (always token 0 at that position).
+    std::vector<std::set<int32_t>> expectedOutputIds{
+        {4}, {4}, {4}, {4}, {5}, {4}, // step 0: batch 4 fuzzy-accepts token 5
+        {0}, {0}, {1}, {1}, {0}, {0}, // step 1: batches 2–3 fuzzy-accept token 1
+        {2}, {3}, {2}, {2}, {2}, {0}, // step 2: batch 1 fuzzy-accepts token 3
+        {0}, {0}, {0}, {0}, {0}, {0}, // step 3: bonus step, topK-1 samples token 0
+    };
+    this->runTest(expectedOutputIds, params);
+}
+
+TYPED_TEST(ExternalDraftTokensLayerTest, FsdPartialThresholdSelectiveAcceptance)
+{
+    // T=0.5 sits between the two JS regimes:
+    //   JS(step-0 / step-2 rejections) ≈ 0.40  <  0.5  →  fuzzy-accepted
+    //   JS(step-1 rejections)           ≈ 1.00  >  0.5  →  not fuzzy-accepted
+    //
+    // Step-0 and step-2 rejections are overridden by FSD; the step-1
+    // rejection is left to standard SD correction.
+    SizeType32 topK = 1;
+    float topP = 0.0f;
+    TestSamplingParams params;
+    params.topKs = {topK};
+    params.topPs = {topP};
+    params.isExternalDraftTokensLayerTest = true;
+    params.useDraftLogits = true;
+    this->mFsdThreshold = 0.5f;
+    this->mFsdDivergenceType = 0; // JS
+
+    this->mTestDraftLogitsInit = &this->mTestDraftLogitsReject;
+    this->mTestDraftTokenIdsInit = {
+        {4, 0, 2}, // all accepted normally
+        {4, 0, 3}, // token 3 at step 2: JS≈0.40 < 0.5 → fuzzy-accepted
+        {4, 1, 2}, // token 1 at step 1: JS≈1.00 > 0.5 → not fuzzy-accepted
+        {4, 1, 2}, // same
+        {5, 0, 2}, // token 5 at step 0: JS≈0.40 < 0.5 → fuzzy-accepted; steps 1–2 continue
+        {},        // no draft tokens — sampled from target
+    };
+
+    // Batch 1 (draft={4,0,3}): step 2 rejection fuzzy-accepted → outputs token 3
+    // Batches 2–3 (draft={4,1,2}): step 1 rejection NOT fuzzy-accepted → SD
+    //     correction applies; processing stops; steps 2–3 output default {0}
+    // Batch 4 (draft={5,0,2}): step 0 rejection fuzzy-accepted → outputs token 5,
+    //     then draft tokens 0 and 2 at steps 1–2 are accepted normally
+    std::vector<std::set<int32_t>> expectedOutputIds{
+        {4}, {4}, {4}, {4}, {5}, {4}, // step 0: batch 4 fuzzy-accepts token 5
+        {0}, {0}, {0}, {0}, {0}, {0}, // step 1: batches 2–3 rejected by SD (not fuzzy-accepted)
+        {2}, {3}, {0}, {0}, {2}, {0}, // step 2: batch 1 fuzzy-accepts token 3; batches 2–3 stopped
+        {0}, {0}, {0}, {0}, {0}, {0}, // step 3: bonus/stopped → all {0}
     };
     this->runTest(expectedOutputIds, params);
 }

@@ -27,11 +27,14 @@ namespace tensorrt_llm::executor
 
 // Constructor for ExternalDraftTokensConfig
 ExternalDraftTokensConfig::ExternalDraftTokensConfig(VecTokens tokens, std::optional<Tensor> logits,
-    std::optional<FloatType> const& acceptanceThreshold, std::optional<bool> const& fastLogits)
+    std::optional<FloatType> const& acceptanceThreshold, std::optional<bool> const& fastLogits,
+    std::optional<FloatType> const& fsdThreshold, std::optional<SizeType32> const& fsdDivergenceType)
     : mTokens(std::move(tokens))
     , mLogits(std::move(logits))
     , mAcceptanceThreshold(acceptanceThreshold)
     , mFastLogits(fastLogits)
+    , mFsdThreshold(fsdThreshold)
+    , mFsdDivergenceType(fsdDivergenceType)
 {
     TLLM_CHECK(!mTokens.empty());
     if (mLogits)
@@ -54,6 +57,22 @@ ExternalDraftTokensConfig::ExternalDraftTokensConfig(VecTokens tokens, std::opti
         TLLM_CHECK(mAcceptanceThreshold.value() > 0.f);
         TLLM_CHECK(mAcceptanceThreshold.value() <= 1.f);
     }
+    if (mFsdThreshold)
+    {
+        TLLM_CHECK(mFsdThreshold.value() >= 0.F);
+        // Materialize the documented default (JS=0) so callers never see nullopt
+        // when a threshold is active.
+        if (!mFsdDivergenceType)
+        {
+            mFsdDivergenceType = 0;
+        }
+    }
+    if (mFsdDivergenceType)
+    {
+        constexpr SizeType32 kMAX_FSD_DIVERGENCE_TYPE = 3;
+        TLLM_CHECK(mFsdDivergenceType.value() >= 0);
+        TLLM_CHECK(mFsdDivergenceType.value() <= kMAX_FSD_DIVERGENCE_TYPE);
+    }
 }
 
 VecTokens ExternalDraftTokensConfig::getTokens() const
@@ -74,6 +93,16 @@ std::optional<FloatType> ExternalDraftTokensConfig::getAcceptanceThreshold() con
 std::optional<bool> ExternalDraftTokensConfig::getFastLogits() const
 {
     return mFastLogits;
+}
+
+std::optional<FloatType> ExternalDraftTokensConfig::getFsdThreshold() const
+{
+    return mFsdThreshold;
+}
+
+std::optional<SizeType32> ExternalDraftTokensConfig::getFsdDivergenceType() const
+{
+    return mFsdDivergenceType;
 }
 
 LookaheadDecodingConfig::LookaheadDecodingConfig(

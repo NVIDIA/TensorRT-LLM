@@ -933,12 +933,18 @@ def test_external_draft_tokens_config():
     logits = torch.ones(3, 1)
     acceptance_threshold = 1.0
     fast_logits = False
+    fsd_threshold = 0.25
+    fsd_divergence_type = 3
     config = trtllm.ExternalDraftTokensConfig(tokens, logits,
-                                              acceptance_threshold, fast_logits)
+                                              acceptance_threshold, fast_logits,
+                                              fsd_threshold,
+                                              fsd_divergence_type)
     assert config.tokens == tokens
     assert (config.logits == logits).all()
     assert config.acceptance_threshold == acceptance_threshold
     assert config.fast_logits == fast_logits
+    assert config.fsd_threshold == fsd_threshold
+    assert config.fsd_divergence_type == fsd_divergence_type
 
 
 def test_prompt_tuning_config():

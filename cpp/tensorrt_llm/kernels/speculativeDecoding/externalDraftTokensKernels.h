@@ -29,9 +29,23 @@ TRTLLM_NAMESPACE_BEGIN
 namespace kernels::speculative_decoding
 {
 
+//! \brief Divergence types for Fuzzy Speculative Decoding (FSD).
+//! Used to select which divergence measure to compute when FSD is enabled.
+enum class FsdDivergenceType : runtime::SizeType32
+{
+    kJS_DIVERGENCE = 0,         //!< Jensen-Shannon divergence
+    kKL_DIVERGENCE = 1,         //!< Kullback-Leibler divergence (forward: PMT || PMD)
+    kTV_DISTANCE = 2,           //!< Total Variation distance
+    kREVERSE_KL_DIVERGENCE = 3, //!< Reverse KL divergence (PMD || PMT)
+};
+
 //! \brief Accepts or rejects draft tokens based on their probability distributions or the equality of draft and target
 //! tokens. Corrects targetLogits for the last accepted token
 //! according to https://openreview.net/pdf?id=C9NEblP8vS
+//!
+//! Optionally supports Fuzzy Speculative Decoding (FSD): when a token is rejected by standard SD and fsdThreshold > 0,
+//! the divergence between target and draft distributions is computed. If the divergence is below fsdThreshold, the
+//! rejection is overridden and the token is accepted. If still rejected, standard SD correction is applied.
 //!
 //! \param batchSize current batch size
 //! \param draftProbs output buffer [maxDraftTokens, batchSize, beamWidth, vocabSize].
@@ -58,6 +72,9 @@ namespace kernels::speculative_decoding
 //! forwarding next step.
 //! \param targetOutputIds input/output buffer [batchSize]. Stores target sampling output ids for acceptById
 //! logics.
+//! \param fsdThreshold FSD divergence threshold. When > 0 and SD rejects a token, the divergence between target
+//! and draft distributions is computed. If below this threshold, the token is accepted. 0 disables FSD.
+//! \param fsdDivergenceType FSD divergence type (0=JS, 1=KL, 2=TV, 3=ReverseKL). Only used when fsdThreshold > 0.
 //! \param stream stream
 template <typename T>
 void invokeAcceptDraftTokens(runtime::SizeType32 batchSize, T* draftProbs, T* targetProbs,
@@ -65,7 +82,8 @@ void invokeAcceptDraftTokens(runtime::SizeType32 batchSize, T* draftProbs, T* ta
     FinishedState const* finishedInput, FinishedState* finishedOutput, curandState_t* curandState,
     runtime::SizeType32 const* batchSlots, runtime::SizeType32 maxDraftTokens, runtime::SizeType32 beamWidth,
     runtime::SizeType32 vocabSizePadded, bool randomThreshold, float constantThreshold, runtime::SizeType32 step,
-    bool* batchIsAccepted, runtime::SizeType32* targetOutputIds, cudaStream_t stream);
+    bool* batchIsAccepted, runtime::SizeType32* targetOutputIds, float fsdThreshold,
+    runtime::SizeType32 fsdDivergenceType, cudaStream_t stream);
 
 //! \brief Mask the target logits with -inf for unselected topK/topP token ids.
 //! according to
