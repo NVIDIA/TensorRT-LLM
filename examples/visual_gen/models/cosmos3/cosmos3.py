@@ -26,7 +26,7 @@ Cosmos3 supports the following generation modes from a single checkpoint:
 - **V2V** — video-conditioned video (``prompts/v2v.json``). Condition on the
   first (or last, per ``condition_video_keep``) frames of a reference video
   via ``--video_path`` (a local frame directory, ``.mp4``/``.avi`` file, or
-  single image; ``.mp4``/``.avi`` decode requires the ``av`` package).
+  single image; ``.mp4``/``.avi`` decode requires OpenCV).
 - **T2AV** — text-to-video with synchronized audio (``prompts/t2av.json`` with
   ``enable_audio: true``, or pass ``--enable_audio``). Combine with a
   ``vision_path`` for image-conditioned audio-video (TI2AV).

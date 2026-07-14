@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional
 
 from PIL import Image, UnidentifiedImageError
 
+from tensorrt_llm.inputs.media_io import _get_cv2
 from tensorrt_llm.logger import logger
 from tensorrt_llm.serve.openai_protocol import ImageGenerationRequest, VideoGenerationRequest
 from tensorrt_llm.visual_gen import VisualGen, VisualGenParams
@@ -101,37 +102,22 @@ def _reference_is_image(path: str) -> bool:
 
 
 def _reference_is_video(path: str) -> bool:
-    """True when ``path`` holds video content (a PyAV-openable video stream).
+    """True when ``path`` holds video content (an OpenCV-decodable video stream).
 
     Total predicate over *content*: False for images, audio, and undecodable
     content alike. Images must be excluded explicitly because FFmpeg demuxes a
-    still image as a valid single-frame video stream, so an av probe alone would
-    claim every PNG/JPEG.
-
-    PyAV is gated behind ``TRTLLM_ENABLE_PYAV=1`` (the same opt-in the audio
-    extraction path uses) and is also required to decode ``.mp4``/``.avi``
-    references through ``torchvision``. A disabled gate or a missing package is
-    a deployment problem, not a content verdict, so it raises rather than
-    masquerading as "not video".
+    still image as a valid single-frame video stream, so a video probe alone
+    would claim every PNG/JPEG. OpenCV is the optional decoder shared with the
+    multimodal video path; ``_get_cv2`` raises a clear install hint if missing.
     """
     if _reference_is_image(path):
         return False
-    if os.environ.get("TRTLLM_ENABLE_PYAV", "0") != "1":
-        raise RuntimeError(
-            "PyAV is required to detect and decode video references. "
-            "Set the environment variable TRTLLM_ENABLE_PYAV=1 to enable it."
-        )
+    cv2 = _get_cv2()
+    capture = cv2.VideoCapture(path)
     try:
-        import av
-    except ImportError:
-        raise ImportError(
-            "PyAV is required to detect and decode video references but is not installed."
-        )
-    try:
-        with av.open(path) as container:
-            return bool(container.streams.video)
-    except av.FFmpegError:
-        return False
+        return bool(capture.isOpened() and capture.read()[0])
+    finally:
+        capture.release()
 
 
 def parse_visual_gen_params(

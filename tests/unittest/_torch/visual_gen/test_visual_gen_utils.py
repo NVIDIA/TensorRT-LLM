@@ -12,6 +12,8 @@ table plus the field-by-field overlay contract.
 from __future__ import annotations
 
 import base64
+import os
+import tempfile
 from io import BytesIO
 from typing import Any, Dict, Optional
 
@@ -293,25 +295,23 @@ class TestInputReferenceMaterialization:
 
     @staticmethod
     def _mp4_bytes() -> bytes:
-        """Encode a 2-frame 16x16 mpeg4-in-mp4 clip in memory.
+        """Encode a 2-frame 16x16 mp4v-in-mp4 clip and return its bytes.
 
-        ``mpeg4`` is a built-in FFmpeg encoder, so this works on any
-        PyAV wheel (h264 may be absent from LGPL builds).
+        ``mp4v`` is a built-in FFmpeg mpeg4 encoder present in the opencv wheel.
+        OpenCV writes only to a path, so encode to a tempfile and read it back.
         """
-        av = pytest.importorskip("av")
-        buf = BytesIO()
-        with av.open(buf, "w", format="mp4") as container:
-            stream = container.add_stream("mpeg4", rate=4)
-            stream.width = 16
-            stream.height = 16
-            stream.pix_fmt = "yuv420p"
+        cv2 = pytest.importorskip("cv2")
+        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
+            path = tmp.name
+        try:
+            writer = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*"mp4v"), 4.0, (16, 16))
             for _ in range(2):
-                frame = av.VideoFrame.from_ndarray(
-                    np.zeros((16, 16, 3), dtype=np.uint8), format="rgb24"
-                )
-                container.mux(stream.encode(frame))
-            container.mux(stream.encode())
-        return buf.getvalue()
+                writer.write(np.zeros((16, 16, 3), dtype=np.uint8))
+            writer.release()
+            with open(path, "rb") as f:
+                return f.read()
+        finally:
+            os.remove(path)
 
     def test_multipart_video_reference_routes_to_extra_params(self, tmp_path):
         generator = _StubVisualGen()
@@ -357,7 +357,7 @@ class TestInputReferenceMaterialization:
         assert str(params.image).endswith("vid-5_reference.png")
 
     def test_undecodable_reference_raises_and_cleans_up(self, tmp_path):
-        pytest.importorskip("av")
+        pytest.importorskip("cv2")
         generator = _StubVisualGen()
         b64 = base64.b64encode(b"neither an image nor a video").decode()
         request = VideoGenerationRequest(prompt="x", input_reference=b64)

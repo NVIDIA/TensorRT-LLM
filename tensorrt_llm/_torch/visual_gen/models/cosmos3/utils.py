@@ -23,14 +23,26 @@ def pil_to_rgb(value: Any) -> PIL.Image.Image:
 
 
 def decode_video_file(path: Path, max_frames: Optional[int] = None) -> List[PIL.Image.Image]:
-    import torchvision.io as io
+    # OpenCV is the shared multimodal video decoder; ``_get_cv2`` raises a clear
+    # ``pip install opencv-python-headless`` hint when it is not installed.
+    from tensorrt_llm.inputs.media_io import _get_cv2
 
-    frames, _, _ = io.read_video(str(path), pts_unit="sec")
-    if frames.numel() == 0:
+    cv2 = _get_cv2()
+    capture = cv2.VideoCapture(str(path))
+    try:
+        if not capture.isOpened():
+            raise ValueError(f"Cosmos3 could not open video file: {path}")
+        frames: List[PIL.Image.Image] = []
+        while max_frames is None or len(frames) < max_frames:
+            ok, frame = capture.read()
+            if not ok:
+                break
+            frames.append(PIL.Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)))
+    finally:
+        capture.release()
+    if not frames:
         raise ValueError(f"Cosmos3 video file contains no frames: {path}")
-    if max_frames is not None:
-        frames = frames[:max_frames]
-    return [PIL.Image.fromarray(frames[i].numpy()) for i in range(frames.shape[0])]
+    return frames
 
 
 def normalize_video_input_path(path: Path, max_frames: Optional[int] = None) -> List[Any]:

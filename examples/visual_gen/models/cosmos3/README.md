@@ -5,7 +5,7 @@ Cosmos3 supports the following generation modes from a single checkpoint:
 - **T2V** — text-to-video (`prompts/t2v.json`).
 - **T2I** — text-to-image (`prompts/t2i.json`); emits a still frame (use `--output_type image` / a non-video `--output_path`).
 - **I2V / TI2V** — image-conditioned video (`prompts/i2v.json`). Condition on a reference frame via the prompt file's `vision_path` or `--image_path`. The image may be a local path, a `file://` / `http(s)://` URL, or a `data:` URI.
-- **V2V** — video-conditioned video (`prompts/v2v.json`). Condition on a reference video via `--video_path` (a local frame directory or `.mp4`/`.avi` file). Only the first (or last, per `condition_video_keep`) `max(condition_frame_indexes_vision) * 4 + 1` input frames condition the output (5 by default); `.mp4`/`.avi` decode uses the `av` package (see [Media I/O dependencies](#media-io-dependencies)).
+- **V2V** — video-conditioned video (`prompts/v2v.json`). Condition on a reference video via `--video_path` (a local frame directory or `.mp4`/`.avi` file). Only the first (or last, per `condition_video_keep`) `max(condition_frame_indexes_vision) * 4 + 1` input frames condition the output (5 by default); `.mp4`/`.avi` decode uses OpenCV (see [Media I/O dependencies](#media-io-dependencies)).
 - **T2AV** — text-to-video with synchronized audio (`prompts/t2av.json` with `enable_audio: true`, or pass `--enable_audio`). Combine with a `vision_path` for image-conditioned audio-video (TI2AV).
 
 ## Checkpoints
@@ -34,7 +34,7 @@ export TRTLLM_DISABLE_COSMOS3_GUARDRAILS=1
 ## Media I/O dependencies
 
 - Saving `.mp4` output requires the `ffmpeg` CLI on `PATH` (`apt-get install -y ffmpeg`); without it the encoder falls back to `.avi`.
-- Decoding `.mp4`/`.avi` reference videos (V2V) uses the `av` (PyAV) package. It is **not** bundled with TensorRT-LLM — install it yourself: `pip install av`. Frame directories work without it.
+- Decoding `.mp4`/`.avi` reference videos (V2V) uses OpenCV — the same optional decoder as the multimodal video path. It is **not** bundled with TensorRT-LLM — install it yourself: `pip install opencv-python-headless`. Frame directories work without it.
 
 ## Deployment configs
 

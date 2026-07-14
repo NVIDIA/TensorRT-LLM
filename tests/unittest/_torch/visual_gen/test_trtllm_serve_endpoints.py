@@ -60,18 +60,15 @@ def _assert_llm_envelope(
         assert message_contains in body["message"], body["message"]
 
 
-def _require_pyav_optin():
-    """Skip unless PyAV is installed and opted into via ``TRTLLM_ENABLE_PYAV=1``.
+def _require_opencv():
+    """Skip unless OpenCV is installed (the shared optional video decoder).
 
-    These tests drive ``_reference_is_video``, which gates PyAV behind the same
-    opt-in ``media_io`` uses. ``av`` ships in no CI image, so this both
-    ``importorskip``-s the package and skips when the gate is disabled; it
-    returns the ``av`` module for tests that build fixtures with it.
+    These tests drive ``_reference_is_video``, which decodes references via
+    OpenCV (the same optional dep the multimodal video path uses). ``cv2`` ships
+    in no CI image, so this ``importorskip``-s it and returns the module for
+    tests that synthesize a clip with ``cv2.VideoWriter``.
     """
-    av = pytest.importorskip("av")
-    if os.environ.get("TRTLLM_ENABLE_PYAV", "0") != "1":
-        pytest.skip("requires the PyAV opt-in (TRTLLM_ENABLE_PYAV=1)")
-    return av
+    return pytest.importorskip("cv2")
 
 
 def _make_dummy_image_tensor(height: int = 64, width: int = 64) -> torch.Tensor:
@@ -860,24 +857,19 @@ class TestVideoGenerationSync:
         """A video ``input_reference`` routes to ``extra_params["video"]`` (V2V).
 
         The reference is classified by decoding its content, so the clip is
-        synthesized in-test with PyAV — no video asset ships with the repo.
+        synthesized in-test with OpenCV — no video asset ships with the repo.
         """
-        av = _require_pyav_optin()
+        cv2 = _require_opencv()
         np = pytest.importorskip("numpy")
         ref_path = tmp_path / "ref.mp4"
-        with av.open(str(ref_path), "w") as container:
-            # mpeg4 is a built-in FFmpeg encoder (h264 may be absent from
-            # LGPL PyAV wheels).
-            stream = container.add_stream("mpeg4", rate=4)
-            stream.width = 16
-            stream.height = 16
-            stream.pix_fmt = "yuv420p"
+        # mp4v is a built-in FFmpeg mpeg4 encoder present in the opencv wheel.
+        writer = cv2.VideoWriter(str(ref_path), cv2.VideoWriter_fourcc(*"mp4v"), 4.0, (16, 16))
+        try:
             for _ in range(2):
-                frame = av.VideoFrame.from_ndarray(
-                    np.zeros((16, 16, 3), dtype=np.uint8), format="rgb24"
-                )
-                container.mux(stream.encode(frame))
-            container.mux(stream.encode())
+                writer.write(np.zeros((16, 16, 3), dtype=np.uint8))
+        finally:
+            writer.release()
+        assert ref_path.exists() and ref_path.stat().st_size > 0
 
         with open(ref_path, "rb") as f:
             resp = video_client.post(
@@ -904,8 +896,8 @@ class TestVideoGenerationSync:
         assert os.path.exists(video_ref)
 
     def test_sync_video_generation_undecodable_reference_400(self, video_client):
-        """Content neither PIL nor PyAV can decode is rejected at the boundary."""
-        _require_pyav_optin()
+        """Content neither PIL nor OpenCV can decode is rejected at the boundary."""
+        _require_opencv()
         resp = video_client.post(
             "/v1/videos/generations",
             data={"prompt": "x"},
