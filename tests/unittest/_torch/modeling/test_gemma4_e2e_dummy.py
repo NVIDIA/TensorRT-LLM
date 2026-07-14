@@ -42,11 +42,19 @@ requires_gemma4_transformers = pytest.mark.skipif(
 _LLM_MODELS_ROOT = os.environ.get("LLM_MODELS_ROOT")
 if _LLM_MODELS_ROOT is None:
     pytest.skip("LLM_MODELS_ROOT not set", allow_module_level=True)
-_GEMMA4_MODELS = os.path.join(_LLM_MODELS_ROOT, "gemma4")
+# Canonical model root subdir is "gemma" (see tests/test_common/llm_data.py:
+# "google/gemma-4-E2B-it" -> "gemma/gemma-4-E2B-it"), not "gemma4".
+_GEMMA4_MODELS = os.path.join(_LLM_MODELS_ROOT, "gemma")
 
 # Imported after the module-level skip guard so that collecting this module on
 # a machine without LLM_MODELS_ROOT does not pull in the runtime import.
-from tensorrt_llm.llmapi import LLM, SamplingParams  # noqa: E402
+from tensorrt_llm.llmapi import LLM, KvCacheConfig, SamplingParams  # noqa: E402
+
+# These dummy models are tiny, but the default KV-cache fraction sizes the pool
+# to most of the (very large B200) device memory, leaving nothing for the other
+# executor components -> OOM at executor creation. Cap it so the whole pipeline
+# fits regardless of card size.
+_KV_CACHE_CONFIG = KvCacheConfig(free_gpu_memory_fraction=0.5)
 
 # Real model paths — used for tokenizer + base config
 MODEL_PATHS = {
@@ -79,7 +87,7 @@ def _make_dummy_config_dir(
     if not os.path.isfile(config_path):
         raise FileNotFoundError(
             f"Gemma4 test checkpoint not found: {config_path}. These E2E tests "
-            f"require the real gemma4 models under $LLM_MODELS_ROOT/gemma4."
+            f"require the real gemma-4 models under $LLM_MODELS_ROOT/gemma."
         )
 
     tmp_dir = tempfile.mkdtemp(prefix="gemma4_dummy_")
@@ -189,7 +197,13 @@ def test_e2e_text_26b_dummy():
     """E2E text generation for 26B-A4B (MoE + K=V + softcap + hybrid attn)."""
     dummy_dir = _make_dummy_config_dir(MODEL_PATHS["26B"])
     try:
-        llm = LLM(dummy_dir, load_format="dummy", attn_backend="FLASHINFER", dtype="bfloat16")
+        llm = LLM(
+            dummy_dir,
+            load_format="dummy",
+            attn_backend="FLASHINFER",
+            dtype="bfloat16",
+            kv_cache_config=_KV_CACHE_CONFIG,
+        )
         with llm:
             output = llm.generate(["Hello"], SamplingParams(max_tokens=4))
             assert len(output) == 1
@@ -203,7 +217,13 @@ def test_e2e_text_e2b_dummy():
     """E2E text generation for E2B (KV sharing + PLE + double-wide MLP)."""
     dummy_dir = _make_dummy_config_dir(MODEL_PATHS["E2B"])
     try:
-        llm = LLM(dummy_dir, load_format="dummy", attn_backend="FLASHINFER", dtype="bfloat16")
+        llm = LLM(
+            dummy_dir,
+            load_format="dummy",
+            attn_backend="FLASHINFER",
+            dtype="bfloat16",
+            kv_cache_config=_KV_CACHE_CONFIG,
+        )
         with llm:
             output = llm.generate(["Hello"], SamplingParams(max_tokens=4))
             assert len(output) == 1
@@ -217,7 +237,13 @@ def test_e2e_text_31b_dummy():
     """E2E text generation for 31B (K=V + hybrid attn + softcap)."""
     dummy_dir = _make_dummy_config_dir(MODEL_PATHS["31B"])
     try:
-        llm = LLM(dummy_dir, load_format="dummy", attn_backend="FLASHINFER", dtype="bfloat16")
+        llm = LLM(
+            dummy_dir,
+            load_format="dummy",
+            attn_backend="FLASHINFER",
+            dtype="bfloat16",
+            kv_cache_config=_KV_CACHE_CONFIG,
+        )
         with llm:
             output = llm.generate(["Hello"], SamplingParams(max_tokens=4))
             assert len(output) == 1
@@ -256,6 +282,7 @@ def test_e2e_text_e2b_dummy_small_max_seq_len(max_seq_len):
             attn_backend="FLASHINFER",
             dtype="bfloat16",
             max_seq_len=max_seq_len,
+            kv_cache_config=_KV_CACHE_CONFIG,
         )
         with llm:
             output = llm.generate(["Hello"], SamplingParams(max_tokens=4))
@@ -270,7 +297,13 @@ def test_e2e_text_e4b_dummy():
     """E2E text generation for E4B (KV sharing + hybrid attn)."""
     dummy_dir = _make_dummy_config_dir(MODEL_PATHS["E4B"])
     try:
-        llm = LLM(dummy_dir, load_format="dummy", attn_backend="FLASHINFER", dtype="bfloat16")
+        llm = LLM(
+            dummy_dir,
+            load_format="dummy",
+            attn_backend="FLASHINFER",
+            dtype="bfloat16",
+            kv_cache_config=_KV_CACHE_CONFIG,
+        )
         with llm:
             output = llm.generate(["Hello"], SamplingParams(max_tokens=4))
             assert len(output) == 1
@@ -310,7 +343,13 @@ def test_e2e_multimodal_26b_dummy():
             tokenize=False,
         )
 
-        llm = LLM(dummy_dir, load_format="dummy", attn_backend="FLASHINFER", dtype="bfloat16")
+        llm = LLM(
+            dummy_dir,
+            load_format="dummy",
+            attn_backend="FLASHINFER",
+            dtype="bfloat16",
+            kv_cache_config=_KV_CACHE_CONFIG,
+        )
         with llm:
             img = Image.fromarray(np.random.randint(0, 255, (224, 224, 3), dtype=np.uint8))
             prompt = {

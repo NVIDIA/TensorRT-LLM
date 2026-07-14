@@ -2882,10 +2882,14 @@ class KVCacheManagerV2(BaseResourceManager):
         """
         if layer_idx is None:
             pool_id = 0
+            scale = self._index_scale_ints[pool_id]
         else:
             pool_id = self.layer_to_pool_mapping_dict[self.layer_offsets[layer_idx]]
-
-        scale = self._index_scale_ints[pool_id]
+            # Layers sharing a pool can still require different page-index
+            # scales (e.g. Gemma4 sliding/global head_dim). Use the per-layer
+            # scale so this flat block table matches get_batch_cache_indices()
+            # and never feeds out-of-range page ids to FlashInfer.
+            scale = self.get_layer_page_index_scale(layer_idx)
         div_factor = self.kv_factor
 
         out_tensor = torch.empty(sum(num_blocks), dtype=torch.int32, pin_memory=prefer_pinned())
