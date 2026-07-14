@@ -68,6 +68,7 @@ from tensorrt_llm._torch.modules.fused_moe.communication.allgather_reducescatter
 )
 from tensorrt_llm._torch.modules.fused_moe.communication.deep_ep import DeepEP
 from tensorrt_llm._torch.modules.fused_moe.communication.deep_ep_low_latency import DeepEPLowLatency
+from tensorrt_llm._torch.modules.fused_moe.communication.nccl_ep import NcclEP
 from tensorrt_llm._torch.modules.fused_moe.communication.nvlink_one_sided import NVLinkOneSided
 from tensorrt_llm._torch.modules.fused_moe.communication.nvlink_two_sided import NVLinkTwoSided
 from tensorrt_llm._torch.modules.fused_moe.communication.nvlink_two_sided_flashinfer import (
@@ -75,6 +76,7 @@ from tensorrt_llm._torch.modules.fused_moe.communication.nvlink_two_sided_flashi
 )
 from tensorrt_llm._torch.modules.fused_moe.deep_ep_utils import deep_ep_installed
 from tensorrt_llm._torch.modules.fused_moe.ep_group_health import EPGroupHealth
+from tensorrt_llm._torch.modules.fused_moe.nccl_ep_utils import is_nccl_ep_installed
 from tensorrt_llm.deep_ep.buffer import Buffer
 from tensorrt_llm.mapping import Mapping
 
@@ -95,6 +97,7 @@ COMM_DEEP_EP_LL = "DeepEPLowLatency"
 COMM_NVLINK_ONE_SIDED = "NVLinkOneSided"
 COMM_NVLINK_TWO_SIDED = "NVLinkTwoSided"
 COMM_NVLINK_TWO_SIDED_FLASHINFER = "NVLinkTwoSidedFlashinfer"
+COMM_NCCL_EP = "NcclEP"
 
 ALL_COMM_TYPES = [
     COMM_ALLGATHER_RS,
@@ -103,6 +106,7 @@ ALL_COMM_TYPES = [
     COMM_NVLINK_ONE_SIDED,
     COMM_NVLINK_TWO_SIDED,
     COMM_NVLINK_TWO_SIDED_FLASHINFER,
+    COMM_NCCL_EP,
 ]
 
 # Must be in DeepEPLowLatency.SUPPORTED_HIDDEN_SIZES
@@ -602,6 +606,16 @@ def create_comm_object(
             alltoall_result_do_sum=True,
         )
 
+    elif comm_type == COMM_NCCL_EP:
+        return NcclEP(
+            mapping=mapping,
+            num_slots=num_slots,
+            hidden_size=config.hidden_size,
+            max_num_tokens=max_num_tokens,
+            moe_max_num_tokens=max_num_tokens,
+            top_k=config.top_k,
+        )
+
     else:
         raise ValueError(f"Unknown comm type: {comm_type}")
 
@@ -740,6 +754,11 @@ def check_platform_support(comm_type: str) -> Optional[str]:
     if comm_type == COMM_NVLINK_TWO_SIDED_FLASHINFER:
         return _check_flashinfer_mnnvl_support()
 
+    if comm_type == COMM_NCCL_EP:
+        if not is_nccl_ep_installed():
+            return "NCCL EP not available (install the nccl4py wheel)"
+        return None
+
     return f"Unknown comm type: {comm_type}"
 
 
@@ -789,6 +808,10 @@ def check_feasibility(comm_type: str, config: CommTestConfig) -> Optional[str]:
     if comm_type == COMM_NVLINK_ONE_SIDED:
         if config.top_k > NVLinkOneSided.MAX_TOP_K:
             return f"NVLinkOneSided MAX_TOP_K={NVLinkOneSided.MAX_TOP_K}, got top_k={config.top_k}"
+
+    if comm_type == COMM_NCCL_EP:
+        if config.quant_mode != "none":
+            return f"NcclEP does not support quant_mode={config.quant_mode}"
 
     if comm_type == COMM_NVLINK_TWO_SIDED_FLASHINFER:
         # FlashInfer alltoallv requires every 2D payload row to be 16-byte aligned.
