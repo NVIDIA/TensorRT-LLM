@@ -29,7 +29,8 @@ from tensorrt_llm.logger import logger
 
 from .._utils import customized_gc_thresholds, mpi_rank, nvtx_range_debug
 from ..llmapi.mpi_session import (MpiCommSession, MpiPoolSession, MpiSession,
-                                  RemoteMpiCommSessionClient)
+                                  RemoteMpiCommSessionClient,
+                                  validate_session_world_size)
 from ..llmapi.tracer import enable_llm_tracer, get_tracer, global_tracer
 from ..llmapi.utils import (AsyncQueue, ManagedThread, _SyncQueue,
                             enable_llm_debug, logger_debug, print_colored)
@@ -117,6 +118,7 @@ class GenerationExecutorProxy(GenerationExecutor):
         self.worker_cls = worker_cls
 
         mpi_process_pre_spawned: bool = get_spawn_proxy_process_env()
+        self._owns_mpi_session = mpi_session is None
 
         if mpi_session is None:
             if mpi_process_pre_spawned:
@@ -126,6 +128,10 @@ class GenerationExecutorProxy(GenerationExecutor):
                 logger_debug('create pool session ...\n', "yellow")
                 self.mpi_session = MpiPoolSession(n_workers=model_world_size)
         else:
+            # submit() launches one worker task per pool worker, so an
+            # external session must match the model's world size exactly;
+            # fail loudly instead of starting the wrong number of executors.
+            validate_session_world_size(mpi_session, model_world_size)
             logger_debug('using external mpi session ...\n', "yellow")
             self.mpi_session = mpi_session
 
@@ -406,11 +412,11 @@ class GenerationExecutorProxy(GenerationExecutor):
         return self._resource_governor_queue
 
     def abort_request(self, request_id: int) -> None:
-        ''' Abort a request by sending a cancelling request to the request queue.
+        """Abort a request by sending a cancelling request to the request queue.
 
         Args:
             request_id (int): The id of the request to abort.
-        '''
+        """
         # NOTE, it just sends a cancelling request to the request queue, but it
         # may take a while for the request to be cancelled in the worker and
         # send back a finished result.
@@ -543,7 +549,10 @@ class GenerationExecutorProxy(GenerationExecutor):
 
         if ready_signal != GenerationExecutorProxy.READY_SIGNAL:
             logger.error(f"Executor worker initialization error: {error_trace}")
-            self.mpi_session.shutdown_abort(reason=ready_signal)
+            # Only abort a session this proxy created; an externally owned
+            # (shared) session must stay alive for its owner to tear down.
+            if self._owns_mpi_session:
+                self.mpi_session.shutdown_abort(reason=ready_signal)
             raise RuntimeError(
                 "Executor worker returned error") from ready_signal
 
@@ -630,7 +639,8 @@ class GenerationExecutorProxy(GenerationExecutor):
             self._resource_governor_queue.close()
 
         self.workers_started = False
-        self.mpi_session.shutdown()
+        if self._owns_mpi_session:
+            self.mpi_session.shutdown()
 
         # Process the errors in-case error during shutting down the threads
         self._handle_background_error()

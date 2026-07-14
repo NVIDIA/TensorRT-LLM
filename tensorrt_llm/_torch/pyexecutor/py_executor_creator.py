@@ -796,7 +796,6 @@ def create_py_executor(
             speculative_config=spec_config,
             decoding_config=decoding_config,
             kv_cache_config=kv_cache_config,
-            disable_flashinfer_sampling=llm_args.disable_flashinfer_sampling,
         )
         logger.info(f"Using Sampler: {type(sampler).__name__}")
 
@@ -882,17 +881,15 @@ def create_py_executor(
             # NOTE: TRTLLM_USE_PY_MAMBA is an agg-mode-only override and has
             # no effect in disagg. The disagg manager choice is driven solely
             # by transceiver_runtime: PYTHON => PythonMambaCacheManager,
-            # otherwise CppMambaCacheManager. Clear the var here so the
-            # mutual-exclusion check in use_cpp_mamba_cache_manager() does
-            # not fire after we force TRTLLM_USE_CPP_MAMBA=1 below.
-            if os.environ.pop("TRTLLM_USE_PY_MAMBA", "0") == "1":
+            # otherwise CppMambaHybridCacheManager (unified pool, default).
+            if os.environ.get("TRTLLM_USE_PY_MAMBA", "0") == "1":
                 logger.warning(
                     "TRTLLM_USE_PY_MAMBA is ignored in disaggregated serving; "
                     "use cache_transceiver_config.transceiver_runtime='PYTHON' "
                     "to select PythonMambaCacheManager.")
             else:
                 logger.info("Disaggregated serving with hybrid model detected. "
-                            "Enabling CppMambaHybridCacheManager.")
+                            "Using CppMambaHybridCacheManager.")
 
         # Get draft config for one-engine speculative decoding if available
         draft_config = getattr(model_engine.model, 'draft_config', None)
