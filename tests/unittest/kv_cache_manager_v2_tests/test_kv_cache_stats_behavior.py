@@ -60,6 +60,7 @@ class _StatsRequest:
     state: LlmRequestState = LlmRequestState.GENERATION_IN_PROGRESS
     context_current_position: int = 0
     context_chunk_size: int = 0
+    expect_snapshot_points: set[int] = field(default_factory=set)
     prepopulated_prompt: tuple[int, int] | None = None
     kv_cache_perf_metric_calls: list[dict[str, int]] = field(default_factory=list)
     multimodal_hashes: None = None
@@ -81,6 +82,24 @@ class _StatsRequest:
     def get_tokens(self, beam_id: int = DEFAULT_BEAM_INDEX) -> list[int]:
         assert beam_id == DEFAULT_BEAM_INDEX
         return self.tokens
+
+    def block_reuse_commit_limit(self) -> int:
+        if not self.expect_snapshot_points:
+            return self.prompt_len
+        return min(max(self.expect_snapshot_points), self.prompt_len)
+
+    def should_save_ssm_snapshot(self, commit_end: int) -> bool:
+        return commit_end in self.expect_snapshot_points
+
+    def next_expected_snapshot_point(self) -> int | None:
+        return min(
+            (
+                point
+                for point in self.expect_snapshot_points
+                if point > self.context_current_position
+            ),
+            default=None,
+        )
 
     def set_prepopulated_prompt_len(self, length: int, tokens_per_block: int) -> None:
         self.prepopulated_prompt = (length, tokens_per_block)

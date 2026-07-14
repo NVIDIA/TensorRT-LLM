@@ -58,6 +58,7 @@ from .llm_request import ExecutorResponse, LlmRequestState
 from .mamba_cache_manager import (BaseMambaCacheManager,
                                   CppMambaHybridCacheManager,
                                   MixedMambaHybridCacheManager,
+                                  V2MambaHybridCacheManager,
                                   use_py_mamba_cache_manager)
 from .model_engine import PyTorchModelEngine
 from .py_executor import PyExecutor
@@ -93,14 +94,13 @@ def get_kv_cache_manager_cls(
         cache_transceiver_config: Optional[CacheTransceiverConfig] = None):
     """Resolve the concrete KV cache manager class for ``model_config``.
 
-    For hybrid mamba models the choice between ``Mixed`` (TRTLLM_USE_PY_MAMBA)
-    and ``Cpp`` (unified pool with block reuse) is made here. Callers that
-    don't care about disagg can omit ``is_disagg`` and get the unified-pool
-    default.
+    For hybrid mamba models the choice between the default
+    ``V2MambaHybridCacheManager`` and compatibility managers is made here.
+    Callers that don't care about disagg can omit ``is_disagg`` and get the
+    unified-pool default.
 
-    Env-var overrides (agg mode only — disagg picks its inner impl via
-    ``cache_transceiver_config.transceiver_runtime``):
-      * ``TRTLLM_USE_PY_MAMBA=1``  — Mixed manager with PythonMambaCacheManager.
+    Aggregated serving defaults to V2. Disaggregated serving keeps the legacy
+    manager routing until the V2 transceiver/page-table adapter is enabled.
     """
     config = model_config.pretrained_config
     sparse_attn_config = model_config.sparse_attention_config
@@ -123,41 +123,64 @@ def get_kv_cache_manager_cls(
 
         # Skip Softmax only changes attention kernels. Hybrid models still
         # need a Mamba-capable cache manager for recurrent state.
-        if use_py_mamba_cache_manager():
+        if is_disagg:
+            if kv_cache_config.enable_block_reuse:
+                return CppMambaHybridCacheManager
+            if (cache_transceiver_config is not None and
+                    cache_transceiver_config.transceiver_runtime == "PYTHON"):
+                logger.info("Python transceiver detected; using "
+                            "MixedMambaHybridCacheManager for hybrid model")
+                return MixedMambaHybridCacheManager
+            return CppMambaHybridCacheManager
+
+        if use_py_mamba_cache_manager() and not is_disagg:
             if kv_cache_config.enable_block_reuse:
                 raise ValueError(
                     "TRTLLM_USE_PY_MAMBA=1 forces "
                     "MixedMambaHybridCacheManager, which does not support "
                     "block reuse. Disable block reuse or unset "
-                    "TRTLLM_USE_PY_MAMBA to use CppMambaHybridCacheManager.")
+                    "TRTLLM_USE_PY_MAMBA to use V2MambaHybridCacheManager.")
             logger.info(
                 "Using MixedMambaHybridCacheManager for hybrid mamba model")
             return MixedMambaHybridCacheManager
-        if kv_cache_config.enable_block_reuse:
-            return CppMambaHybridCacheManager
-        if (cache_transceiver_config is not None
-                and cache_transceiver_config.transceiver_runtime == "PYTHON"):
-            logger.info("Python transceiver detected; using "
-                        "MixedMambaHybridCacheManager for hybrid mamba model")
-            return MixedMambaHybridCacheManager
-        default_cls = CppMambaHybridCacheManager
+        default_cls = V2MambaHybridCacheManager
         env_override = os.environ.get('TLLM_MAMBA_MANAGER_PREFERENCE', None)
         if env_override is not None:
-            if env_override.upper() == 'MIXED':
+            env_override = env_override.upper()
+            if env_override == 'MIXED':
+                if kv_cache_config.enable_block_reuse:
+                    raise ValueError(
+                        "TLLM_MAMBA_MANAGER_PREFERENCE=MIXED forces "
+                        "MixedMambaHybridCacheManager, which does not support "
+                        "block reuse. Disable block reuse or use "
+                        "TLLM_MAMBA_MANAGER_PREFERENCE=V2/CPP.")
                 logger.warning(
-                    "Environment variable TLLM_MAMBA_MANAGER_PREFERENCE=MIXED overrides the default Mamba cache manager to MixedMambaHybridCacheManager. This may lead to increased memory usage due to lack of block reuse, but can be necessary for disaggregated setups or to avoid potential issues with the C++ manager. Set TLLM_MAMBA_MANAGER_PREFERENCE=CPP to use the CppMambaHybridCacheManager instead, which is the default for non-disaggregated setups without block reuse explicitly disabled."
-                )
+                    "Environment variable TLLM_MAMBA_MANAGER_PREFERENCE=MIXED "
+                    "overrides the default Mamba cache manager to "
+                    "MixedMambaHybridCacheManager.")
                 return MixedMambaHybridCacheManager
-            elif env_override.upper() == 'CPP':
+            if env_override == 'CPP':
                 logger.warning(
-                    "Environment variable TLLM_MAMBA_MANAGER_PREFERENCE=CPP overrides the default Mamba cache manager to CppMambaHybridCacheManager. This enables block reuse and can reduce memory usage, but may not be compatible with disaggregated setups. Set TLLM_MAMBA_MANAGER_PREFERENCE=MIXED to use the MixedMambaHybridCacheManager instead if you encounter issues with the C++ manager or are running in a disaggregated environment."
-                )
+                    "Environment variable TLLM_MAMBA_MANAGER_PREFERENCE=CPP "
+                    "overrides the default Mamba cache manager to "
+                    "CppMambaHybridCacheManager.")
                 return CppMambaHybridCacheManager
-            else:
+            if env_override == 'V2':
                 logger.warning(
-                    f"Unrecognized value for TLLM_MAMBA_MANAGER_PREFERENCE: {env_override}. "
-                    f"Expected 'CPP' or 'MIXED'. Using default {default_cls.__name__}."
-                )
+                    "Environment variable TLLM_MAMBA_MANAGER_PREFERENCE=V2 "
+                    "overrides the default Mamba cache manager to "
+                    "V2MambaHybridCacheManager.")
+                return V2MambaHybridCacheManager
+            logger.warning(
+                f"Unrecognized value for TLLM_MAMBA_MANAGER_PREFERENCE: {env_override}. "
+                f"Expected 'CPP', 'MIXED', or 'V2'. Using default {default_cls.__name__}."
+            )
+        if kv_cache_config.enable_block_reuse:
+            return V2MambaHybridCacheManager
+        # transceiver_runtime == "PYTHON" needs no manager override: the
+        # Python transceiver (KvCacheTransceiverV2) drives the default
+        # V2MambaHybridCacheManager natively. Mixed remains available via
+        # TLLM_MAMBA_MANAGER_PREFERENCE=MIXED.
         return default_cls
     elif sparse_attn_config is not None:
         return get_sparse_attn_kv_cache_manager(sparse_attn_config)
@@ -357,22 +380,21 @@ class KvCacheCreator:
             cache_transceiver_config=self._cache_transceiver_config)
         cls = self._fallback_if_unsupported_kv_cache_manager_v2(
             cls, model_config, kv_cache_config)
-        # The V1-route hybrid mamba managers (disagg, TRTLLM_USE_CPP_MAMBA,
-        # TRTLLM_USE_PY_MAMBA, or one-model speculative decoding) keep mamba
+        # The V1-route hybrid mamba managers (disagg, TRTLLM_USE_PY_MAMBA, or
+        # one-model speculative decoding) keep mamba
         # state in a separate cache that doesn't honor block reuse. Warn at
         # the routing site so users see the warning where the decision is
         # actually made.
         if is_hybrid_linear(model_engine.model.model_config.pretrained_config) \
                 and kv_cache_config.enable_block_reuse:
             uses_v1_mamba_route = self._is_disagg \
-                or os.environ.get('TRTLLM_USE_CPP_MAMBA', '0') == '1' \
                 or os.environ.get('TRTLLM_USE_PY_MAMBA', '0') == '1' \
                 or self._speculative_config is not None
-            if uses_v1_mamba_route:
+            if uses_v1_mamba_route and not issubclass(
+                    cls, V2MambaHybridCacheManager):
                 logger.warning(
                     "Block reuse does not work with MTP for hybrid linear models "
-                    "when using the legacy MambaCacheManager (TRTLLM_USE_CPP_MAMBA=1)"
-                )
+                    f"when using non-V2 Mamba cache manager {cls.__name__}")
         return cls
 
     def _fallback_if_unsupported_kv_cache_manager_v2(
@@ -414,6 +436,12 @@ class KvCacheCreator:
                         f"Gemma4 hybrid attention requires KVCacheManagerV2, "
                         f"which is not yet supported with {incompat_str}. "
                         f"Disable these features to run Gemma4 hybrid models.")
+                if is_hybrid_linear(config):
+                    logger.warning(
+                        "KVCacheManagerV2-backed MambaHybridCacheManager is "
+                        "not supported with %s. Falling back to "
+                        "CppMambaHybridCacheManager.", incompat_str)
+                    return CppMambaHybridCacheManager
                 # Plain V2 (explicitly enabled or selected by a model default):
                 # V2 was a preference, not a structural requirement, so we can
                 # safely fall back to V1.

@@ -5,17 +5,27 @@ CppMambaHybridCacheManager PP-sharding edge cases."""
 
 import os
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 import torch
 
+from tensorrt_llm._torch.pyexecutor._util import KvCacheCreator, get_kv_cache_manager_cls
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDA_GRAPH_DUMMY_REQUEST_ID
-from tensorrt_llm._torch.pyexecutor.llm_request import ATTENTION_DP_DUMMY_REQUEST_ID
+from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import (
+    BlockReusePolicy,
+    KVCacheManagerV2,
+    Role,
+)
+from tensorrt_llm._torch.pyexecutor.llm_request import ATTENTION_DP_DUMMY_REQUEST_ID, LlmRequest
 from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import (
     MIN_REPLAY_HISTORY_SIZE,
     CppMambaHybridCacheManager,
+    MixedMambaHybridCacheManager,
     PythonMambaCacheManager,
+    V2MambaHybridCacheManager,
     _get_mamba_hybrid_pool_size,
+    calc_context_stop_positions,
 )
 from tensorrt_llm._torch.pyexecutor.resource_manager import CacheTypeCpp, DataType
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
@@ -23,8 +33,111 @@ from tensorrt_llm._utils import torch_dtype_to_binding
 from tensorrt_llm.bindings.internal.batch_manager import LinearCacheType
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig, MTPDecodingConfig
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.runtime.kv_cache_manager_v2 import GpuCacheTierConfig, LayerId
+from tensorrt_llm.runtime.kv_cache_manager_v2 import KVCacheManager as RuntimeKVCacheManager
 
 skip_no_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+
+
+def test_hybrid_cache_manager_factory_defaults_to_v2(monkeypatch):
+    monkeypatch.delenv("TRTLLM_USE_CPP_MAMBA", raising=False)
+    monkeypatch.delenv("TRTLLM_USE_PY_MAMBA", raising=False)
+    monkeypatch.delenv("TLLM_MAMBA_MANAGER_PREFERENCE", raising=False)
+    config = SimpleNamespace(
+        architectures=["Qwen3_5MoeForCausalLM"],
+        num_hidden_layers=2,
+        layer_types=["linear_attention", "full_attention"],
+    )
+    model_config = SimpleNamespace(
+        pretrained_config=config,
+        sparse_attention_config=None,
+        get_num_mamba_layers=lambda: 1,
+    )
+
+    assert (
+        get_kv_cache_manager_cls(model_config, KvCacheConfig(enable_block_reuse=False))
+        is V2MambaHybridCacheManager
+    )
+    assert (
+        get_kv_cache_manager_cls(model_config, KvCacheConfig(enable_block_reuse=True))
+        is V2MambaHybridCacheManager
+    )
+
+
+def test_hybrid_cache_manager_factory_honors_cpp_preference_with_block_reuse(monkeypatch):
+    monkeypatch.delenv("TRTLLM_USE_CPP_MAMBA", raising=False)
+    monkeypatch.delenv("TRTLLM_USE_PY_MAMBA", raising=False)
+    monkeypatch.setenv("TLLM_MAMBA_MANAGER_PREFERENCE", "CPP")
+    config = SimpleNamespace(
+        architectures=["Qwen3_5MoeForCausalLM"],
+        num_hidden_layers=2,
+        layer_types=["linear_attention", "full_attention"],
+    )
+    model_config = SimpleNamespace(
+        pretrained_config=config,
+        sparse_attention_config=None,
+        get_num_mamba_layers=lambda: 1,
+    )
+
+    assert (
+        get_kv_cache_manager_cls(model_config, KvCacheConfig(enable_block_reuse=True))
+        is CppMambaHybridCacheManager
+    )
+
+
+def test_hybrid_cache_manager_factory_keeps_legacy_disagg_route(monkeypatch):
+    monkeypatch.delenv("TRTLLM_USE_PY_MAMBA", raising=False)
+    monkeypatch.delenv("TLLM_MAMBA_MANAGER_PREFERENCE", raising=False)
+    config = SimpleNamespace(
+        architectures=["Qwen3_5MoeForCausalLM"],
+        num_hidden_layers=2,
+        layer_types=["linear_attention", "full_attention"],
+    )
+    model_config = SimpleNamespace(
+        pretrained_config=config,
+        sparse_attention_config=None,
+        get_num_mamba_layers=lambda: 1,
+    )
+
+    assert (
+        get_kv_cache_manager_cls(
+            model_config,
+            KvCacheConfig(enable_block_reuse=False),
+            is_disagg=True,
+        )
+        is CppMambaHybridCacheManager
+    )
+    assert (
+        get_kv_cache_manager_cls(
+            model_config,
+            KvCacheConfig(enable_block_reuse=False),
+            is_disagg=True,
+            cache_transceiver_config=SimpleNamespace(transceiver_runtime="PYTHON"),
+        )
+        is MixedMambaHybridCacheManager
+    )
+
+
+def test_v2_hybrid_incompatibility_falls_back_to_cpp_manager():
+    config = SimpleNamespace(
+        architectures=["Qwen3_5MoeForCausalLM"],
+        num_hidden_layers=2,
+        layer_types=["linear_attention", "full_attention"],
+    )
+    model_config = SimpleNamespace(
+        pretrained_config=config,
+        sparse_attention_config=None,
+    )
+    creator = object.__new__(KvCacheCreator)
+    creator._kv_connector_manager = None
+    creator._max_beam_width = 2
+
+    assert (
+        creator._fallback_if_unsupported_kv_cache_manager_v2(
+            V2MambaHybridCacheManager, model_config, KvCacheConfig()
+        )
+        is CppMambaHybridCacheManager
+    )
 
 
 def _make_mgr(
@@ -342,6 +455,140 @@ def test_non_mtp_pytorch_prepare_and_get_state_indices_flow():
     ]
 
 
+def test_calc_context_stop_positions_returns_snapshot_points():
+    assert calc_context_stop_positions(128, 32, 64) == [64, 128]
+    assert calc_context_stop_positions(70, 32, 256) == []
+    assert calc_context_stop_positions(70, 32, 0) == []
+    assert calc_context_stop_positions(70, 32, None) == []
+
+
+def test_v2_hybrid_prepare_expect_snapshot_points():
+    mgr = object.__new__(V2MambaHybridCacheManager)
+    mgr.kv_cache_config = KvCacheConfig(
+        enable_block_reuse=True,
+        mamba_state_cache_interval=64,
+    )
+    mgr.tokens_per_block = 32
+    mgr._mamba_state_cache_interval = 64
+    request = SimpleNamespace(prompt_len=150)
+
+    mgr.prepare_expect_snapshot_points([request])
+
+    assert request.expect_snapshot_points == [64, 128]
+
+
+def test_request_block_reuse_commit_limit_uses_snapshot_points():
+    request = SimpleNamespace(prompt_len=150, expect_snapshot_points=[137])
+
+    assert LlmRequest.block_reuse_commit_limit(request) == 137
+
+
+def test_request_block_reuse_commit_limit_defaults_to_prompt_len():
+    request = SimpleNamespace(prompt_len=150, expect_snapshot_points=[])
+
+    assert LlmRequest.block_reuse_commit_limit(request) == 150
+
+
+def test_v2_block_reuse_commit_saves_ssm_snapshot_at_snapshot_point():
+    mgr = object.__new__(KVCacheManagerV2)
+    mgr.enable_block_reuse = True
+    mgr.is_draft = False
+    mgr._augment_tokens_for_block_reuse = lambda tokens, request, start, end: tokens[start:end]
+    mgr._mark_context_position_as_history = MagicMock()
+
+    token_ids = list(range(150))
+    request = SimpleNamespace(
+        prompt_len=150,
+        context_current_position=137,
+        context_remaining_length=13,
+        expect_snapshot_points=[137],
+        is_dummy_request=False,
+        is_dummy=False,
+        py_request_id=0,
+        get_tokens=lambda beam_idx: token_ids,
+        block_reuse_commit_limit=lambda: 137,
+    )
+    kv_cache = SimpleNamespace(
+        num_committed_tokens=0,
+        commit=MagicMock(),
+        stop_committing=MagicMock(),
+    )
+
+    mgr.try_commit_blocks(request, kv_cache)
+
+    kv_cache.commit.assert_called_once_with(token_ids[:137])
+    kv_cache.stop_committing.assert_not_called()
+    mgr._mark_context_position_as_history.assert_called_once_with(request, kv_cache)
+
+
+def test_v2_hybrid_add_dummy_requests_forwards_encoder_output_lens(mocker):
+    mgr = object.__new__(V2MambaHybridCacheManager)
+    base_add_dummy_requests = mocker.patch.object(
+        KVCacheManagerV2, "add_dummy_requests", return_value=[]
+    )
+
+    mgr.add_dummy_requests([123], encoder_output_lens=[17])
+
+    assert base_add_dummy_requests.call_args.kwargs["encoder_output_lens"] == [17]
+
+
+def test_v2_hybrid_prepare_expect_snapshot_points_clears_when_reuse_disabled():
+    mgr = object.__new__(V2MambaHybridCacheManager)
+    mgr.kv_cache_config = KvCacheConfig(enable_block_reuse=False)
+    mgr.tokens_per_block = 32
+    mgr._mamba_state_cache_interval = 64
+    request = SimpleNamespace(prompt_len=150)
+
+    mgr.prepare_expect_snapshot_points([request])
+
+    assert request.expect_snapshot_points == []
+
+
+@skip_no_cuda
+def test_v2_hybrid_pool_ratio_controls_allocated_memory():
+    def allocated_memory(pool_ratio):
+        mgr = object.__new__(V2MambaHybridCacheManager)
+        mgr.kv_cache_type = CacheTypeCpp.SELF
+        mgr.head_dim_per_layer = [64, 64]
+        mgr.pp_layers = [0, 1]
+        mgr._mamba_layer_mask = [True, False]
+        mgr.ssm_bytes = 64
+        mgr.conv_bytes = 32
+        mgr.max_attention_window_vec = [128, 128]
+        mgr.max_batch_size = 2
+        mgr.max_seq_len = 128
+        mgr._mamba_state_cache_interval = 64
+        mgr.get_layer_bytes_per_token = lambda **kwargs: 8
+
+        config = mgr._build_cache_config(
+            KvCacheConfig(
+                pool_ratio=pool_ratio,
+                enable_partial_reuse=False,
+            ),
+            tokens_per_block=32,
+            vocab_size=1024,
+            cache_tiers=[GpuCacheTierConfig(quota=64 << 20)],
+        )
+        runtime_manager = RuntimeKVCacheManager(config)
+        try:
+            statistics = runtime_manager._storage.get_statistics()
+            allocated_bytes = [
+                int(stats.total) * sum(int(size) for size in stats.slot_size)
+                for stats in statistics
+            ]
+            return allocated_bytes, list(runtime_manager._current_gpu_ratio)
+        finally:
+            runtime_manager.shutdown()
+
+    low_mamba_allocation, low_actual_ratio = allocated_memory([0.25, 0.75])
+    high_mamba_allocation, high_actual_ratio = allocated_memory([0.75, 0.25])
+
+    assert low_actual_ratio == pytest.approx([0.25, 0.75])
+    assert high_actual_ratio == pytest.approx([0.75, 0.25])
+    assert high_mamba_allocation[0] > low_mamba_allocation[0]
+    assert high_mamba_allocation[1] < low_mamba_allocation[1]
+
+
 # ---------------------------------------------------------------------------
 # CppMambaHybridCacheManager: recurrent-state snapshot pool sizing
 #
@@ -365,6 +612,7 @@ def _build_hybrid_with_mamba_layer(
     mamba_layer_mask=None,
     attention_layer_mask=None,
     mamba_ssm_cache_dtype=torch.float16,
+    use_replay_state_update=False,
 ):
     """Construct a real CppMambaHybridCacheManager with one mamba layer +
     one full-attention layer so the parent KVCacheManager goes through the
@@ -402,7 +650,297 @@ def _build_hybrid_with_mamba_layer(
         layer_mask=attn_mask,
         is_estimating_kv_cache=is_estimating_kv_cache,
         dtype=dtype,
+        use_replay_state_update=use_replay_state_update,
     )
+
+
+def _build_v2_hybrid_with_mamba_layer(
+    max_batch_size=4,
+    num_mamba_layers=1,
+    spec_config=None,
+    use_replay_state_update=False,
+    model_type="nemotron_hybrid",
+    enable_block_reuse=False,
+    enable_partial_reuse=True,
+    enable_attention_dp=False,
+):
+    """Construct a real V2MambaHybridCacheManager."""
+    num_attention_layers = 1
+    mamba_mask = [True] * num_mamba_layers + [False] * num_attention_layers
+    attn_mask = [False] * num_mamba_layers + [True] * num_attention_layers
+    mapping = Mapping(
+        world_size=1,
+        rank=0,
+        tp_size=1,
+        pp_size=1,
+        enable_attention_dp=enable_attention_dp,
+    )
+    kv_cache_config = KvCacheConfig(
+        max_tokens=512,
+        enable_block_reuse=enable_block_reuse,
+        enable_partial_reuse=enable_partial_reuse,
+    )
+    return V2MambaHybridCacheManager(
+        mamba_d_state=8,
+        mamba_d_conv=4,
+        mamba_num_heads=4,
+        mamba_n_groups=1,
+        mamba_head_dim=8,
+        mamba_num_layers=num_mamba_layers,
+        mamba_layer_mask=mamba_mask,
+        mamba_cache_dtype=torch.float16,
+        mamba_ssm_cache_dtype=torch.float16,
+        kv_cache_config=kv_cache_config,
+        kv_cache_type=CacheTypeCpp.SELF,
+        num_layers=num_attention_layers,
+        num_kv_heads=4,
+        head_dim=64,
+        tokens_per_block=32,
+        max_seq_len=128,
+        max_batch_size=max_batch_size,
+        mapping=mapping,
+        spec_config=spec_config,
+        layer_mask=attn_mask,
+        vocab_size=1024,
+        use_replay_state_update=use_replay_state_update,
+        model_type=model_type,
+    )
+
+
+def _make_wide_spec_config(max_draft_len=2, tokens_per_gen_step=5):
+    """Spec config whose per-step token width is wider than draft depth.
+
+    This mirrors parallel-draft style metadata closely enough for cache-manager
+    sizing without constructing the full speculative worker stack.
+    """
+    return SimpleNamespace(
+        max_draft_len=max_draft_len,
+        max_total_draft_tokens=tokens_per_gen_step - 1,
+        tokens_per_gen_step=tokens_per_gen_step,
+        spec_dec_mode=SimpleNamespace(use_one_engine=lambda: False),
+    )
+
+
+def _assert_replay_layer_cache_uses_history_size(layer_cache, history_size):
+    assert layer_cache.old_x is not None
+    assert layer_cache.old_B is not None
+    assert layer_cache.old_dt is not None
+    assert layer_cache.old_dA_cumsum is not None
+    assert layer_cache.cache_buf_idx is not None
+    assert layer_cache.prev_num_accepted_tokens is not None
+    assert layer_cache.old_x.dim() == 5
+    cache_size = layer_cache.temporal.shape[0]
+    assert layer_cache.old_x.shape[0] == cache_size
+    assert layer_cache.old_B.shape[0] == cache_size
+    assert layer_cache.old_dt.shape[0] == cache_size
+    assert layer_cache.old_dA_cumsum.shape[0] == cache_size
+    assert layer_cache.cache_buf_idx.shape[0] == cache_size
+    assert layer_cache.prev_num_accepted_tokens.shape[0] == cache_size
+    assert layer_cache.old_x.shape[1] == 2
+    assert layer_cache.old_B.shape[1] == 2
+    assert layer_cache.old_dt.shape[1] == 2
+    assert layer_cache.old_dA_cumsum.shape[1] == 2
+    assert layer_cache.old_x.shape[2] == history_size
+    assert layer_cache.old_B.shape[2] == history_size
+    assert layer_cache.old_dt.shape[-1] == history_size
+    assert layer_cache.old_dA_cumsum.shape[-1] == history_size
+
+
+@skip_no_cuda
+def test_v2_hybrid_allocates_mamba_state_and_dummy_indices():
+    mgr = _build_v2_hybrid_with_mamba_layer(max_batch_size=4)
+    try:
+        assert mgr.local_num_mamba_layers == 1
+        assert len(mgr.all_ssm_states) == 1
+        assert len(mgr.all_conv_states) == 1
+        assert mgr.all_ssm_states[0].shape[1:] == torch.Size([4, 8, 8])
+        assert mgr.all_conv_states[0].shape[1:] == torch.Size([48, 3])
+        assert mgr.get_max_resource_count() == 4
+        assert mgr.blocks_in_primary_pool > 0
+        assert isinstance(mgr.check_invalid_values_in_kv_cache(), bool)
+
+        requests = mgr.add_dummy_requests([123], token_nums=[8], is_gen=False)
+
+        assert len(requests) == 1
+        indices = mgr.get_state_indices([123], [False])
+        assert len(indices) == 1
+        assert indices[0] >= 0
+        assert mgr.cuda_state_indices[0].item() == indices[0]
+        assert mgr.get_ssm_states(0).data_ptr() == mgr.all_ssm_states[0].data_ptr()
+        assert mgr.get_conv_states(0).data_ptr() == mgr.all_conv_states[0].data_ptr()
+    finally:
+        mgr.shutdown()
+
+
+@skip_no_cuda
+def test_v2_hybrid_dummy_indices_keep_cuda_buffer_address():
+    max_batch_size = 4
+    mgr = _build_v2_hybrid_with_mamba_layer(max_batch_size=max_batch_size, enable_attention_dp=True)
+    try:
+        stale_request = mgr.add_dummy_requests([123], token_nums=[8], is_gen=False)[0]
+        state_indices_ptr = mgr.cuda_state_indices.data_ptr()
+
+        # Model a transfer-pending prior batch. The new ADP dummy is the only
+        # request participating in the next forward pass.
+        mgr.requests = [stale_request] * max_batch_size
+        new_requests = mgr.add_dummy_requests([456], token_nums=[8], is_gen=False)
+
+        assert len(new_requests) == 1
+        assert len(mgr.requests) == max_batch_size + 1
+        assert mgr.cuda_state_indices.data_ptr() == state_indices_ptr
+        assert mgr.cuda_state_indices[0].item() == mgr.get_state_indices([456], [False])[0]
+    finally:
+        mgr.shutdown()
+
+
+@skip_no_cuda
+def test_v2_hybrid_free_resources_drops_stale_state_index_mapping():
+    mgr = _build_v2_hybrid_with_mamba_layer()
+    try:
+        request = mgr.add_dummy_requests([123], token_nums=[8], is_gen=False)[0]
+        request_id = request.py_request_id
+        assert request_id in mgr._request_id_to_state_index
+
+        mgr.requests.clear()
+        mgr.free_resources(request)
+
+        assert request_id not in mgr._request_id_to_state_index
+    finally:
+        mgr.shutdown()
+
+
+@skip_no_cuda
+def test_v2_hybrid_uses_upstream_min_snapshot_policy():
+    mgr = _build_v2_hybrid_with_mamba_layer(
+        enable_block_reuse=True,
+        enable_partial_reuse=True,
+    )
+    try:
+        assert mgr.block_reuse_policy is BlockReusePolicy.PER_REQUEST
+        assert mgr.kv_cache_config.enable_partial_reuse
+        assert mgr.kv_cache_manager_py_config.commit_min_snapshot
+    finally:
+        mgr.shutdown()
+
+
+@skip_no_cuda
+def test_v2_hybrid_mamba_state_views_use_logical_slots():
+    mgr = _build_v2_hybrid_with_mamba_layer(max_batch_size=4, num_mamba_layers=2)
+    try:
+        assert len(mgr.all_ssm_states) == 2
+        assert len(mgr.all_conv_states) == 2
+
+        ssm_slots = mgr.all_ssm_states[0].shape[0]
+        conv_slots = mgr.all_conv_states[0].shape[0]
+        assert all(t.shape[0] == ssm_slots for t in mgr.all_ssm_states)
+        assert all(t.shape[0] == conv_slots for t in mgr.all_conv_states)
+        assert ssm_slots == conv_slots
+
+        for local_layer_idx, ssm_state, conv_state in zip(
+            mgr.mamba_local_layer_ids, mgr.all_ssm_states, mgr.all_conv_states
+        ):
+            layer_id = LayerId(local_layer_idx)
+            ssm_scale = mgr.impl.get_page_index_scale(layer_id, Role.SSM_STATE)
+            conv_scale = mgr.impl.get_page_index_scale(layer_id, Role.CONV_STATE)
+            assert ssm_state.stride(0) == mgr.ssm_count * ssm_scale
+            assert conv_state.stride(0) == mgr.conv_count * conv_scale
+            assert (
+                ssm_state.shape[0]
+                == (mgr.impl.get_page_index_upper_bound(layer_id, Role.SSM_STATE) + ssm_scale - 1)
+                // ssm_scale
+            )
+            assert (
+                conv_state.shape[0]
+                == (mgr.impl.get_page_index_upper_bound(layer_id, Role.CONV_STATE) + conv_scale - 1)
+                // conv_scale
+            )
+
+        mgr.add_dummy_requests([123, 456], token_nums=[8, 8], is_gen=False)
+        indices = mgr.get_state_indices([123, 456], [False, False])
+        assert all(0 <= index < ssm_slots for index in indices)
+    finally:
+        mgr.shutdown()
+
+
+@skip_no_cuda
+def test_cpp_hybrid_replay_buffers_size_by_tokens_per_gen_step():
+    spec_config = _make_wide_spec_config(max_draft_len=2, tokens_per_gen_step=5)
+    mgr = _build_hybrid_with_mamba_layer(
+        spec_config=spec_config,
+        max_batch_size=4,
+        use_replay_state_update=True,
+    )
+    try:
+        replay_metadata = mgr.get_replay_state_update_metadata()
+        assert mgr.use_replay_state_update is True
+        assert replay_metadata is not None
+        assert replay_metadata.replay_step_width == spec_config.tokens_per_gen_step
+        assert replay_metadata.replay_history_size == max(
+            MIN_REPLAY_HISTORY_SIZE, spec_config.tokens_per_gen_step
+        )
+        layer_cache = mgr.mamba_layer_cache(0)
+        _assert_replay_layer_cache_uses_history_size(
+            layer_cache, replay_metadata.replay_history_size
+        )
+    finally:
+        mgr.shutdown()
+
+
+@skip_no_cuda
+def test_v2_hybrid_replay_buffers_size_by_tokens_per_gen_step():
+    spec_config = _make_wide_spec_config(max_draft_len=2, tokens_per_gen_step=5)
+    mgr = _build_v2_hybrid_with_mamba_layer(
+        max_batch_size=4,
+        spec_config=spec_config,
+        use_replay_state_update=True,
+    )
+    try:
+        replay_metadata = mgr.get_replay_state_update_metadata()
+        assert mgr.use_replay_state_update is True
+        assert replay_metadata is not None
+        assert replay_metadata.replay_step_width == spec_config.tokens_per_gen_step
+        assert replay_metadata.replay_history_size == spec_config.tokens_per_gen_step
+        layer_cache = mgr.mamba_layer_cache(0)
+        _assert_replay_layer_cache_uses_history_size(
+            layer_cache, replay_metadata.replay_history_size
+        )
+    finally:
+        mgr.shutdown()
+
+
+@skip_no_cuda
+def test_v2_hybrid_replay_bookkeeping_matches_checkpoint_predicate(monkeypatch):
+    spec_config = _make_wide_spec_config(max_draft_len=2, tokens_per_gen_step=5)
+    mgr = _build_v2_hybrid_with_mamba_layer(
+        max_batch_size=4,
+        spec_config=spec_config,
+        use_replay_state_update=True,
+    )
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.pyexecutor.mamba_cache_manager._promote_mamba_state_triton",
+        lambda *args, **kwargs: None,
+    )
+    try:
+        slot = torch.tensor([0], dtype=torch.int32, device="cuda")
+        attn_metadata = SimpleNamespace(num_seqs=1, num_contexts=0)
+
+        mgr.update_mamba_states(
+            attn_metadata,
+            torch.tensor([3], dtype=torch.int32, device="cuda"),
+            state_indices=slot,
+        )
+        assert mgr.prev_num_accepted_tokens[0].item() == 3
+        assert mgr.cache_buf_idx[0].item() == 0
+
+        mgr.update_mamba_states(
+            attn_metadata,
+            torch.tensor([2], dtype=torch.int32, device="cuda"),
+            state_indices=slot,
+        )
+        assert mgr.prev_num_accepted_tokens[0].item() == 2
+        assert mgr.cache_buf_idx[0].item() == 1
+    finally:
+        mgr.shutdown()
 
 
 @skip_no_cuda

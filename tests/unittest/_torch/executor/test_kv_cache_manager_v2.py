@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -15,11 +16,18 @@ class _FakeKVCache:
     def __init__(self, num_committed_tokens: int) -> None:
         self.num_committed_tokens = num_committed_tokens
         self.committed_tokens: list[int] | None = None
+        self.history_length = 0
+        self.capacity = num_committed_tokens
         self.stopped_committing = False
 
     def commit(self, tokens: list[int]) -> None:
         self.committed_tokens = tokens
         self.num_committed_tokens += len(tokens)
+
+    def resize(self, capacity: int, history_length: int | None = None) -> bool:
+        self.capacity = capacity
+        self.history_length = history_length
+        return True
 
     def stop_committing(self) -> None:
         self.stopped_committing = True
@@ -87,9 +95,11 @@ def test_propagates_partial_reuse_config(enable_partial_reuse: bool) -> None:
 def test_try_commit_blocks_commits_partial_block_at_context_end() -> None:
     request = SimpleNamespace(
         py_request_id=1,
+        is_dummy=False,
         is_dummy_request=False,
         context_current_position=10,
         context_remaining_length=0,
+        block_reuse_commit_limit=lambda: 10,
         get_tokens=lambda beam_id: list(range(10)),
     )
     kv_cache = _FakeKVCache(num_committed_tokens=4)
@@ -103,4 +113,63 @@ def test_try_commit_blocks_commits_partial_block_at_context_end() -> None:
 
     assert kv_cache.committed_tokens == [4, 5, 6, 7, 8, 9]
     assert kv_cache.num_committed_tokens == 10
+    assert kv_cache.history_length == 10
     assert kv_cache.stopped_committing
+
+
+def test_try_commit_blocks_stops_at_reusable_prompt_boundary() -> None:
+    request = SimpleNamespace(
+        py_request_id=1,
+        is_dummy=False,
+        is_dummy_request=False,
+        context_current_position=10,
+        context_remaining_length=0,
+        block_reuse_commit_limit=lambda: 8,
+        get_tokens=lambda beam_id: list(range(10)),
+    )
+    kv_cache = _FakeKVCache(num_committed_tokens=4)
+    manager = object.__new__(KVCacheManagerV2)
+    manager.enable_block_reuse = True
+    manager.is_draft = False
+    manager.kv_cache_map = {request.py_request_id: kv_cache}
+    manager._augment_tokens_for_block_reuse = lambda tokens, request, start, end: tokens[start:end]
+
+    manager.try_commit_blocks(request)
+
+    assert kv_cache.committed_tokens == [4, 5, 6, 7]
+    assert kv_cache.num_committed_tokens == 8
+    assert kv_cache.history_length == 10
+    assert kv_cache.stopped_committing
+
+
+@pytest.mark.parametrize(("position", "should_commit"), [(32, False), (64, True)])
+def test_update_context_resources_commits_only_at_snapshot_boundary(
+    position: int, should_commit: bool
+) -> None:
+    request = SimpleNamespace(
+        py_request_id=1,
+        is_dummy_request=False,
+        context_current_position=position,
+        context_remaining_length=128 - position,
+        should_save_ssm_snapshot=lambda commit_end: commit_end == 64,
+        next_expected_snapshot_point=lambda: 64 if position < 64 else 128,
+    )
+    kv_cache = SimpleNamespace(
+        is_active=True,
+        resize=MagicMock(return_value=True),
+        enable_swa_scratch_reuse=True,
+    )
+    manager = object.__new__(KVCacheManagerV2)
+    manager.enable_block_reuse = True
+    manager.is_draft = False
+    manager.block_reuse_policy = BlockReusePolicy.PER_REQUEST
+    manager.kv_cache_map = {request.py_request_id: kv_cache}
+    manager.try_commit_blocks = MagicMock()
+
+    manager.update_context_resources(SimpleNamespace(context_requests=[request]))
+
+    kv_cache.resize.assert_not_called()
+    if should_commit:
+        manager.try_commit_blocks.assert_called_once_with(request)
+    else:
+        manager.try_commit_blocks.assert_not_called()

@@ -1935,6 +1935,9 @@ class TestInitRatioConfig(unittest.TestCase):
     # Non-power-of-2 sizes so granularity rounding is non-trivial.
     PG0_SLOT_SIZE = 786432  # 768KB (windowed)
     PG1_SLOT_SIZE = 1310720  # 1280KB (non-windowed)
+    SSM_STATE_SLOT_SIZE = 23592960
+    SSM_CONV_SLOT_SIZE = 829440
+    ATTN_SLOT_SIZE = 245760
 
     def _make_config(
         self,
@@ -1990,6 +1993,39 @@ class TestInitRatioConfig(unittest.TestCase):
             swa_scratch_reuse=(SwaScratchReuseConfig() if enable_swa_scratch_reuse else None),
         )
 
+    def _make_hybrid_config(self, gpu_quota: int = 128 << 20) -> KVCacheManagerConfig:
+        return KVCacheManagerConfig(
+            tokens_per_block=self.TOKENS_PER_BLOCK,
+            vocab_size=4096,
+            cache_tiers=[GpuCacheTierConfig(quota=gpu_quota)],
+            layers=[
+                SsmLayerConfig(
+                    layer_id=LayerId(0),
+                    buffers=[
+                        BufferConfig(
+                            role=DataRole("ssm_state"),
+                            size=self.SSM_STATE_SLOT_SIZE,
+                        ),
+                        BufferConfig(
+                            role=DataRole("conv_state"),
+                            size=self.SSM_CONV_SLOT_SIZE,
+                        ),
+                    ],
+                ),
+                AttentionLayerConfig(
+                    layer_id=LayerId(1),
+                    buffers=[
+                        BufferConfig(
+                            role=DataRole("key"),
+                            size=self.ATTN_SLOT_SIZE,
+                        ),
+                    ],
+                ),
+            ],
+            enable_partial_reuse=False,
+            commit_min_snapshot=True,
+        )
+
     def test_default_init_ratio(self):
         """Without typical_step or constraints, uses hardcoded fallback."""
         cfg = self._make_config()
@@ -2025,6 +2061,35 @@ class TestInitRatioConfig(unittest.TestCase):
         # Windowed layers (window=128) have many stale blocks, non-windowed keep all.
         self.assertLess(ratio[0], ratio[1])
         self.assertLess(ratio[0], 0.15)
+        manager.shutdown()
+
+    def test_ssm_snapshots_control_ssm_slot_count(self):
+        """SSM sizing uses explicit state-slot count, not token capacity."""
+        manager = KVCacheManager(self._make_hybrid_config())
+        ssm_lc = manager._life_cycles.ssm_life_cycle_id
+        assert ssm_lc is not None
+        ssm_pg = manager._storage.get_pool_group_index(ssm_lc)
+        attn_pg = 1 - ssm_pg
+
+        batch = BatchDesc(
+            kv_caches=[
+                KVCacheDesc(
+                    capacity=1024,
+                    history_length=1023,
+                    ssm_snapshots=3,
+                )
+            ]
+            * 2
+        )
+        slots = manager._storage._compute_slots_for_batch(batch, self.TOKENS_PER_BLOCK, None)
+        self.assertEqual(slots[ssm_pg], 6)
+        self.assertEqual(slots[attn_pg], 2 * div_up(1024, self.TOKENS_PER_BLOCK))
+
+        default_batch = BatchDesc(kv_caches=[KVCacheDesc(capacity=4096, history_length=4095)] * 2)
+        default_slots = manager._storage._compute_slots_for_batch(
+            default_batch, self.TOKENS_PER_BLOCK, None
+        )
+        self.assertEqual(default_slots[ssm_pg], 2)
         manager.shutdown()
 
     def test_constraints_floor_typical_step(self):
