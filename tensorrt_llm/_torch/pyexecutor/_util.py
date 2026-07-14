@@ -689,6 +689,17 @@ class KvCacheCreator:
             logger.info(
                 "KV cache size estimation is not supported for Vanilla attention backend, disable it."
             )
+        if getattr(model_config, "is_encoder_decoder", False):
+            # The estimation dummies are text-only, and the cross-KV block
+            # accounting needs an encoder length (getEncoderOutputLen throws).
+            # _skip_est (not just the local flag) so build_managers runs
+            # configure_kv_cache_capacity(), which KVCacheManagerV2 needs for
+            # its memory quota — the TRTLLM_SKIP_KV_CACHE_ESTIMATION=1 path.
+            self._skip_est = True
+            estimating_kv_cache = False
+            logger.info(
+                "KV cache size estimation is not supported for encoder-decoder "
+                "models, disable it.")
 
         if estimating_kv_cache:
             estimate_max_tokens = self._get_token_num_for_estimation()

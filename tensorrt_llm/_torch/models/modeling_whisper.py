@@ -324,15 +324,50 @@ class WhisperDecoderLayer(nn.Module):
 # ---------------------------------------------------------------------------
 
 
+def _load_hf_feature_extractor(config: WhisperConfig):
+    """The checkpoint's ``WhisperFeatureExtractor`` (``preprocessor_config.json``).
+
+    STFT/mel parameters live there, not in the model config, so they are
+    re-loaded from ``config._name_or_path``. Falls back to Whisper defaults
+    with ``config.num_mel_bins`` filters when the checkpoint ships no
+    preprocessor config or its ``feature_size`` contradicts the model config.
+    """
+    from transformers import WhisperFeatureExtractor
+
+    extractor = None
+    name_or_path = getattr(config, "_name_or_path", None)
+    if name_or_path:
+        try:
+            extractor = WhisperFeatureExtractor.from_pretrained(name_or_path)
+        except (OSError, ValueError) as e:
+            logger.warning(
+                f"Could not load a Whisper feature-extractor config from "
+                f"{name_or_path!r} ({e}); using Whisper default STFT/mel parameters."
+            )
+    if extractor is not None and int(extractor.feature_size) != int(config.num_mel_bins):
+        logger.warning(
+            f"preprocessor_config.json feature_size ({extractor.feature_size}) "
+            f"contradicts config.num_mel_bins ({config.num_mel_bins}); using "
+            f"Whisper default STFT/mel parameters with {config.num_mel_bins} mel bins."
+        )
+        extractor = None
+    if extractor is None:
+        extractor = WhisperFeatureExtractor(feature_size=config.num_mel_bins)
+    return extractor
+
+
 class WhisperLogMelFrontend(nn.Module):
     """GPU log-mel spectrogram front-end, numerics-identical to the HF
     ``WhisperFeatureExtractor`` torch path (``_torch_extract_fbank_features``).
 
-    Consumes the raw 30 s zero-padded waveform batch shipped by
-    :class:`WhisperInputProcessor` and produces ``[batch, num_mel_bins, 3000]``
+    Consumes the raw zero-padded waveform batch shipped by
+    :class:`WhisperInputProcessor` and produces ``[batch, num_mel_bins, frames]``
     in fp32 (STFT precision; the caller casts to the model dtype). Kept as a
     separate module so a future encoder CUDA-graph capture can choose to keep
     the STFT outside the graphed region.
+
+    STFT/mel parameters and the filterbank come from the checkpoint's feature
+    extractor; the class attributes below are the Whisper-family defaults.
     """
 
     N_FFT = 400
@@ -341,19 +376,13 @@ class WhisperLogMelFrontend(nn.Module):
 
     def __init__(self, config: WhisperConfig):
         super().__init__()
-        from transformers.audio_utils import mel_filter_bank
-
-        # Same construction as WhisperFeatureExtractor.__init__ (slaney-norm
-        # slaney-scale bank over 201 frequency bins, 0-8 kHz).
-        self._mel_filters_np = mel_filter_bank(
-            num_frequency_bins=1 + self.N_FFT // 2,
-            num_mel_filters=config.num_mel_bins,
-            min_frequency=0.0,
-            max_frequency=8000.0,
-            sampling_rate=self.SAMPLING_RATE,
-            norm="slaney",
-            mel_scale="slaney",
-        )
+        extractor = _load_hf_feature_extractor(config)
+        self.n_fft = int(extractor.n_fft)
+        self.hop_length = int(extractor.hop_length)
+        # Pre-STFT Gaussian noise, applied where HF applies it; 0.0 (all
+        # official checkpoints) disables it.
+        self.dither = float(getattr(extractor, "dither", 0.0))
+        self._mel_filters_np = extractor.mel_filters
         # Materialized lazily on the input device (NOT register_buffer: these
         # are derived constants that must stay fp32 and out of the state dict,
         # and lazy creation sidesteps meta-device module initialization).
@@ -361,18 +390,21 @@ class WhisperLogMelFrontend(nn.Module):
         self._window: Optional[torch.Tensor] = None
 
     def forward(self, waveforms: torch.Tensor) -> torch.Tensor:
-        # waveforms: [batch, n_samples] fp32, zero-padded to exactly 30 s.
+        # waveforms: [batch, n_samples] fp32, zero-padded to the fixed window.
         if self._mel_filters is None or self._mel_filters.device != waveforms.device:
             self._mel_filters = torch.from_numpy(self._mel_filters_np).to(
                 waveforms.device, torch.float32
             )
-            self._window = torch.hann_window(self.N_FFT, device=waveforms.device)
+            self._window = torch.hann_window(self.n_fft, device=waveforms.device)
 
         waveforms = waveforms.to(torch.float32)
+        if self.dither != 0.0:
+            # Out-of-place: the input tensor is the request's feature buffer.
+            waveforms = waveforms + self.dither * torch.randn_like(waveforms)
         stft = torch.stft(
             waveforms,
-            self.N_FFT,
-            self.HOP_LENGTH,
+            self.n_fft,
+            self.hop_length,
             window=self._window,
             return_complex=True,
         )
@@ -550,8 +582,8 @@ class WhisperInputProcessor(InputProcessor):
     # without audio cannot be served and are rejected at submission.
     requires_encoder_features = True
 
-    # Whisper checkpoints are trained on 30 s windows at 16 kHz; the waveform
-    # is always zero-padded to exactly 30 s (3000 mel frames). Longer audio
+    # Whisper-family defaults (30 s at 16 kHz); the effective window comes
+    # from the checkpoint's feature extractor in ``__init__``. Longer audio
     # is rejected instead of silently truncated (long-form chunking is a
     # separate feature).
     MAX_AUDIO_SECONDS = 30.0
@@ -571,6 +603,26 @@ class WhisperInputProcessor(InputProcessor):
         self.processor = AutoProcessor.from_pretrained(
             model_path, trust_remote_code=trust_remote_code
         )
+        # Audio window/sampling rate from the checkpoint's feature extractor
+        # (WhisperLogMelFrontend reads the same config engine-side).
+        extractor = getattr(self.processor, "feature_extractor", None)
+        self.sampling_rate = int(getattr(extractor, "sampling_rate", None) or self.SAMPLING_RATE)
+        self.n_samples = int(
+            getattr(extractor, "n_samples", None) or self.MAX_AUDIO_SECONDS * self.sampling_rate
+        )
+        self.max_audio_seconds = self.n_samples / float(self.sampling_rate)
+        # The mel frames halved by the conv stem must fill the encoder
+        # position table exactly, or every downstream cross-KV size is wrong.
+        hop_length = int(getattr(extractor, "hop_length", None) or WhisperLogMelFrontend.HOP_LENGTH)
+        encoder_positions = self.n_samples // hop_length // 2
+        if encoder_positions != int(self.config.max_source_positions):
+            raise ValueError(
+                f"Inconsistent Whisper checkpoint: the feature extractor's "
+                f"{self.max_audio_seconds:.1f}s window at {self.sampling_rate} Hz "
+                f"(hop {hop_length}) yields {encoder_positions} encoder "
+                f"positions, but config.max_source_positions is "
+                f"{self.config.max_source_positions}."
+            )
         self._decoder_prompt = self._build_decoder_prompt()
 
     # The decoder prompt contains no multimodal placeholder tokens (the audio
@@ -639,7 +691,7 @@ class WhisperInputProcessor(InputProcessor):
         elif isinstance(item, dict) and "array" in item:
             # HF datasets audio format: {"array": ..., "sampling_rate": ...}
             waveform = item["array"]
-            sample_rate = item.get("sampling_rate", self.SAMPLING_RATE)
+            sample_rate = item.get("sampling_rate", self.sampling_rate)
         elif isinstance(item, (tuple, list)) and len(item) == 2:
             waveform, sample_rate = item
         else:
@@ -649,9 +701,9 @@ class WhisperInputProcessor(InputProcessor):
                 f"'array'/'sampling_rate'; got {type(item).__name__}."
             )
 
-        if int(sample_rate) != self.SAMPLING_RATE:
+        if int(sample_rate) != self.sampling_rate:
             raise ValueError(
-                f"Whisper expects {self.SAMPLING_RATE} Hz audio; got "
+                f"Whisper expects {self.sampling_rate} Hz audio; got "
                 f"{sample_rate} Hz. Resample on the client side."
             )
 
@@ -659,11 +711,11 @@ class WhisperInputProcessor(InputProcessor):
         if waveform.ndim == 2:
             # soundfile returns [frames, channels]; downmix to mono.
             waveform = waveform.mean(axis=1)
-        duration = waveform.shape[0] / float(self.SAMPLING_RATE)
-        if duration > self.MAX_AUDIO_SECONDS:
+        if waveform.shape[0] > self.n_samples:
+            duration = waveform.shape[0] / float(self.sampling_rate)
             raise ValueError(
                 f"Audio is {duration:.2f}s long, but Whisper supports at "
-                f"most {self.MAX_AUDIO_SECONDS:.0f}s per request; chunk the "
+                f"most {self.max_audio_seconds:.1f}s per request; chunk the "
                 "input on the client side."
             )
         return waveform
@@ -703,12 +755,10 @@ class WhisperInputProcessor(InputProcessor):
             sampling_params.max_tokens = decoder_budget
 
         waveform = self._load_waveform(audio_items[0])
-        # Zero-pad to the fixed 30 s window (same padding the HF feature
-        # extractor applies). Shipped as fp32 [1, n_samples]: the STFT needs
-        # fp32 precision, and the leading dim of 1 keeps the C++ request's
-        # encoder-input-length bookkeeping unchanged. The GPU mel front-end in
-        # the encoder does the rest.
-        n_samples = int(self.MAX_AUDIO_SECONDS * self.SAMPLING_RATE)
+        # Zero-pad to the fixed window, as the HF extractor does. Shipped as
+        # fp32 [1, n_samples]: the STFT needs fp32, and the leading dim of 1
+        # keeps the C++ request's encoder-input-length bookkeeping unchanged.
+        n_samples = self.n_samples
         padded = np.zeros((1, n_samples), dtype=np.float32)
         padded[0, : waveform.shape[0]] = waveform
         input_features = torch.from_numpy(padded)

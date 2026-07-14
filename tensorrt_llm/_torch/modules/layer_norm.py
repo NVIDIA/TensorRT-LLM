@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -89,11 +89,13 @@ class LayerNorm(nn.Module):
             hidden_states = hidden_states + residual.to(torch.float32)
             residual = hidden_states.to(input_dtype)
 
+        # Eager torch.layer_norm needs weight/bias in the fp32 compute dtype;
+        # torch.compile does this promotion implicitly (bitwise-identical).
         hidden_states = nn.functional.layer_norm(
             hidden_states,
             (hidden_states.shape[-1], ),
-            weight=self.weight,
-            bias=self.bias,
+            weight=self.weight.to(torch.float32),
+            bias=self.bias.to(torch.float32),
             eps=self.variance_epsilon,
         ).to(input_dtype)
 
