@@ -143,6 +143,44 @@ class ModelList(OpenAIBaseModel):
     data: List[ModelCard] = Field(default_factory=list)
 
 
+class TokenizeRequest(OpenAIBaseModel):
+    """Request body for the ``POST /_internal/tokenize`` endpoint.
+
+    Asks the server to encode some text into the token-id sequence its
+    loaded tokenizer would produce, without running any generation.
+
+    Only plain-text ``prompt`` tokenization is supported. A ``messages``
+    path was intentionally left out: to be meaningful it must reuse the full
+    ``/v1/chat/completions`` preprocessing (server chat template, tools,
+    documents, template kwargs, model-type resolution, multimodal handling),
+    otherwise the returned token ids would silently diverge from the actual
+    inference prompt. It can be added once that path is shared.
+
+    Fields:
+        model: Target model name. Accepted for compatibility with
+            multi-model routers but ignored -- the server always tokenizes
+            against its own loaded model.
+        prompt: Plain text to tokenize directly via ``tokenizer.encode``.
+    """
+
+    model: Optional[str] = None
+    prompt: str
+
+
+class TokenizeResponse(OpenAIBaseModel):
+    """Response body for the ``POST /_internal/tokenize`` endpoint.
+
+    Fields:
+        count: Number of tokens in the encoded sequence. Always populated;
+            clients needing only the length can ignore ``tokens``.
+        tokens: The encoded token ids. Kept ``Optional`` so future
+            count-only variants can omit it without breaking the schema.
+    """
+
+    count: int
+    tokens: Optional[List[int]] = None
+
+
 class ResponseFormat(OpenAIBaseModel):
     type: Literal["text", "json", "json_schema", "json_object", "regex", "ebnf",
                   "structural_tag"]
@@ -1071,6 +1109,36 @@ class KVCacheTruncateRequest(OpenAIBaseModel):
     chat_template_kwargs: Optional[dict] = None
     reasoning_effort: Optional[str] = None
     tool_choice: Optional[str] = None
+
+
+class KVCacheTruncateTokensRequest(OpenAIBaseModel):
+    """Token-level analog of :class:`KVCacheTruncateRequest`.
+
+    Posted to the ``/_control/kv_cache/truncate_tokens`` endpoint. Bypasses
+    the chat-template tokenization path entirely: callers (e.g.
+    trace replay) that already operate on raw token ids hand the server a
+    batch of full token-id sequences plus the prefix length to retain for
+    each, and the server trims the corresponding KV-cache blocks in the
+    radix tree. Each ``prefixes[i]`` becomes one
+    :class:`tensorrt_llm.executor.request.TruncateKVCacheRequest` on the
+    executor's KV-cache control queue, so one batched HTTP request fans out
+    into N atomic per-prefix radix-tree mutations while paying a single
+    network round-trip.
+
+    Fields:
+        model: Target model name. Accepted for router compatibility but
+            ignored -- the server uses its own loaded model.
+        prefixes: Batch of full token-id sequences. Each entry is one
+            cached prefix whose KV-cache blocks should be truncated.
+        num_tokens_to_keep: Per-prefix number of leading tokens to retain,
+            parallel to ``prefixes`` (``num_tokens_to_keep[i]`` applies to
+            ``prefixes[i]``). Blocks beyond this length are dropped from the
+            radix tree.
+    """
+
+    model: Optional[str] = None
+    prefixes: List[List[int]]
+    num_tokens_to_keep: List[int]
 
 
 ResponseInputOutputItem: TypeAlias = Union[ResponseInputItemParam,

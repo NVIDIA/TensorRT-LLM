@@ -23,6 +23,8 @@ l0_b200:
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_nvfp4_kv[v2_kv_cache=False-attn_backend=TRTLLM-torch_compile=True]
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_nvfp4_kv[v2_kv_cache=True-attn_backend=TRTLLM-torch_compile=True]
   - accuracy/test_llm_api_pytorch.py::TestLagunaXS::test_nvfp4
+  - accuracy/test_llm_api_pytorch.py::TestLagunaXS_2_1::test_bf16_dflash
+  - accuracy/test_llm_api_pytorch.py::TestLagunaXS_2_1::test_nvfp4_dflash
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16[mtp_nextn=0-attention_dp=True-cuda_graph=True-overlap_scheduler=True-torch_compile=False-enable_chunked_prefill=False-v2_kv_cache=False]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16[mtp_nextn=0-attention_dp=True-cuda_graph=True-overlap_scheduler=True-torch_compile=False-enable_chunked_prefill=False-v2_kv_cache=True]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16[mtp_nextn=2-attention_dp=True-cuda_graph=True-overlap_scheduler=True-torch_compile=False-enable_chunked_prefill=False-v2_kv_cache=False]
@@ -355,6 +357,7 @@ l0_b200:
   - examples/visual_gen/test_visual_gen.py::test_flux2_lpips_against_golden
   - examples/visual_gen/test_visual_gen.py::test_ltx2_lpips_against_golden
   - examples/visual_gen/test_visual_gen.py::test_ltx2_cuda_graph_lpips_matches_eager
+  - examples/visual_gen/test_visual_gen.py::test_ltx2_cuda_graph_trtllm_backend
   - examples/visual_gen/test_visual_gen.py::test_wan21_t2v_lpips_against_golden
   - examples/visual_gen/test_visual_gen.py::test_wan22_t2v_lpips_against_golden
   # Measured on B200 with TRT-LLM commit 85665f5f from the staging main image:
