@@ -592,11 +592,23 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 f"exceeds the KV cache manager's maximum supported length "
                 f"({self.kv_cache_manager.max_seq_len}).")
 
-            # Kernels only read each sequence's allocated block prefix, so cap
-            # the staged/H2D block-table width at the batch's maximum instead
-            # of max_seq_len's worth of columns.
-            max_blocks = -(-max_kv_len // self.kv_cache_manager.tokens_per_block
-                           ) if self.kv_cache_manager.tokens_per_block else None
+            # On the non-speculative path the host kv_lens snapshot bounds
+            # every block-table access, so the staged/H2D width can be capped
+            # at the batch's maximum instead of max_seq_len's worth of
+            # columns. Speculative decoding must stage the full width:
+            # draft/tree sub-steps and the overlap scheduler advance
+            # kv_lens_cuda on device past the host snapshot, and their
+            # kernels dereference block columns a host-derived cap would
+            # leave unstaged (uninitialized in this buffer).
+            spec_active = (self.draft_kv_cache_manager is not None
+                           or self.is_spec_decoding_enabled
+                           or bool(self.kv_cache_params.num_extra_kv_tokens) or
+                           (self.runtime_features is not None and
+                            self.runtime_features.has_speculative_draft_tokens))
+            max_blocks = None
+            if not spec_active and self.kv_cache_manager.tokens_per_block:
+                max_blocks = -(-max_kv_len //
+                               self.kv_cache_manager.tokens_per_block)
             self.kv_cache_manager.copy_batch_block_offsets(
                 self.kv_cache_block_offsets,
                 self.request_ids,
