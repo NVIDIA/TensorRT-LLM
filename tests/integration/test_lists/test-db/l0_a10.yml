@@ -139,7 +139,6 @@ l0_a10:
   - unittest/llmapi/test_additional_model_outputs.py -m "gpu1"
   - unittest/llmapi/test_request_priority.py
   # executor
-  - unittest/executor/test_rpc.py
   - unittest/executor/test_ipc.py
   - unittest/executor/test_fatal_error_health_check.py
   - unittest/executor/test_postprocessor_hook.py

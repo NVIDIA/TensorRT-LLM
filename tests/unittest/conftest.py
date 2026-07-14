@@ -19,6 +19,7 @@ import sys
 import traceback
 import warnings
 from functools import partial
+from pathlib import Path
 from typing import Any, Generator
 
 try:
@@ -106,6 +107,9 @@ def pytest_runtest_protocol(item, nextitem):
             import os
 
             import torch
+            if torch.cuda.device_count() == 0:
+                return
+
             worker_count = int(os.environ.get('PYTEST_XDIST_WORKER_COUNT', 1))
 
             if (torch.cuda.memory_reserved(0) + torch.cuda.memory_allocated(0)
@@ -207,6 +211,27 @@ def pytest_addoption(parser):
                      default=None,
                      help="output directory for test logs")
     s3_output.add_options(parser)
+
+
+def _is_cpu_only_markexpr(config) -> bool:
+    markexpr = getattr(config.option, "markexpr", "") or ""
+    return "cpu_only" in markexpr and "not cpu_only" not in markexpr
+
+
+def pytest_ignore_collect(collection_path, config):
+    if not _is_cpu_only_markexpr(config):
+        return None
+
+    path = Path(str(collection_path))
+    if path.name == "conftest.py" or path.suffix != ".py":
+        return None
+    if not (path.name.startswith("test_") or path.name.endswith("_test.py")):
+        return None
+
+    try:
+        return "pytest.mark.cpu_only" not in path.read_text()
+    except OSError:
+        return None
 
 
 def apply_waives_ut(waives_file, items: list[pytest.Item], config):
