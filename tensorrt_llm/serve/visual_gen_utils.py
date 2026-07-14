@@ -1,7 +1,9 @@
 import asyncio
 import base64
+import json
 import os
 import shutil
+import subprocess
 from typing import Any, Dict, List, Optional
 
 from PIL import Image, UnidentifiedImageError
@@ -101,24 +103,41 @@ def _reference_is_image(path: str) -> bool:
 
 
 def _reference_is_video(path: str) -> bool:
-    """True when ``path`` holds video content (a PyAV-openable video stream).
+    """True when ``path`` holds video content (a stream ffprobe recognizes).
 
-    Total predicate: False for images, audio, and undecodable content
-    alike. Images must be excluded explicitly because FFmpeg demuxes a
-    still image as a valid single-frame video stream, so an av probe
-    alone would claim every PNG/JPEG. A missing ``av`` package raises
-    ``ImportError`` — that is a deployment problem, not a content
-    verdict.
+    Total predicate: False for images, audio, and undecodable content alike.
+    Images must be excluded explicitly because FFmpeg demuxes a still image as
+    a single-frame video stream, so the ffprobe check must be gated by the PIL
+    probe. ``ffprobe`` (part of the ffmpeg CLI, a documented system dependency)
+    absent → the probe returns False rather than raising.
     """
     if _reference_is_image(path):
         return False
-    import av
-
     try:
-        with av.open(path) as container:
-            return bool(container.streams.video)
-    except av.FFmpegError:
+        result = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-select_streams",
+                "v",
+                "-show_entries",
+                "stream=codec_type",
+                "-of",
+                "json",
+                path,
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError):
         return False
+    try:
+        streams = json.loads(result.stdout).get("streams", [])
+    except json.JSONDecodeError:
+        return False
+    return any(s.get("codec_type") == "video" for s in streams)
 
 
 def parse_visual_gen_params(
