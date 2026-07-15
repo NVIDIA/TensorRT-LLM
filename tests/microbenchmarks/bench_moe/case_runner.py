@@ -710,7 +710,7 @@ def _run_one_candidate(
             )
         except Exception as exc:
             reason = f"build error: {type(exc).__name__}: {exc}"
-            _maybe_print_rank0(f"[bench_moe] build failed: {reason}")
+            _maybe_print_rank0(f"[bench_moe] build failed: {reason}\n{traceback.format_exc()}")
             return _short_circuit(result, "failed", reason)
 
         result.actual_backend = _backend_name_from_module(moe)
