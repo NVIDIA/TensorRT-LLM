@@ -633,6 +633,27 @@ class Attention(nn.Module):
                                     key="disable_rope_fusion_for_rocketkv")
                 self.rope_fusion = False
 
+        if config.kv_cache_compression_config is not None:
+            from tensorrt_llm._torch.kv_cache_compression import \
+                compression_manager_class
+            manager_class = compression_manager_class(
+                config.kv_cache_compression_config.algorithm)
+            if (manager_class is not None
+                    and manager_class.physically_evicts_cached_tokens):
+                # The configured manager physically evicts cached tokens, so
+                # the KV length no longer equals the logical sequence length.
+                # The fused path derives each new token's rotary position from
+                # the KV length inside the kernel; the unfused path consumes
+                # the engine's logical position_ids, so surviving keys retain
+                # their original phases.
+                logger.warning_once(
+                    "disable rope_fusion for KV-cache compression "
+                    f"({config.kv_cache_compression_config.algorithm}): "
+                    "rotary positions must come from logical position_ids, "
+                    "not the compression-shortened KV length.",
+                    key="disable_rope_fusion_for_kv_cache_compression")
+                self.rope_fusion = False
+
         if self.rope_fusion and not attn_cls.support_fused_rope():
             logger.warning_once(
                 "rope_fusion is true but the attention backend does not support it. Will disable rope_fusion.",
