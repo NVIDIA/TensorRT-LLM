@@ -212,6 +212,10 @@ class DisaggregatedParams(OpenAIBaseModel):
     # Orchestrator -> context-worker instruction: return prompt_token_ids as a
     # base64 int32 buffer (prompt_token_ids_b64) instead of a JSON int array.
     return_prompt_token_ids_b64: bool = False
+    # Orchestrator -> GEN metadata: prompt length only (gen_tokids_metadata_only).
+    # The GEN worker builds a length-only placeholder instead of receiving the
+    # ∝ISL token array; generation uses the transferred KV.
+    prompt_len: Optional[int] = None
 
 
 class ConversationParams(OpenAIBaseModel):
@@ -770,6 +774,9 @@ class ChatCompletionResponse(OpenAIBaseModel):
     # base64 int32 buffer alternative to prompt_token_ids; set by the context
     # worker so the orchestrator can relay a string instead of the int list.
     prompt_token_ids_b64: Optional[str] = None
+    # B2 metadata-only: prompt length reported by the context worker, so the
+    # orchestrator can send only the length to GEN (no token array/b64).
+    prompt_len: Optional[int] = None
 
 
 class DeltaMessage(OpenAIBaseModel):
@@ -830,6 +837,9 @@ class ChatCompletionRequest(OpenAIBaseModel):
     # base64 int32 buffer relayed by the orchestrator from the ctx response;
     # decoded back to prompt_token_ids on the generation worker. Not for clients.
     prompt_token_ids_b64: Optional[str] = None
+    # B2 metadata-only: prompt length relayed by the orchestrator; the GEN worker
+    # builds a length-only placeholder and generation uses the transferred KV.
+    prompt_len: Optional[int] = None
     model: str
     frequency_penalty: Optional[float] = 0.0
     logit_bias: Optional[Dict[str, float]] = None

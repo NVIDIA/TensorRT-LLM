@@ -51,6 +51,32 @@ from tensorrt_llm.serve.router import KvCacheAwareRouter, Router
 _GEN_PENDING_FINISH_REASONS = ("length", "not_finished")
 
 
+def _chat_request_reads_prompt_token_values(request) -> bool:
+    """Whether a chat request has features that read the prompt token VALUES.
+
+    The ``gen_tokids_metadata_only`` fast path replaces the prompt with a
+    length-only placeholder on the GEN worker (the forward path uses the
+    transferred KV and never dereferences prompt token values). That is only
+    correct when nothing reads the prompt token VALUES. Features that DO read
+    them -- sampling penalties applied over the prompt (frequency / presence /
+    repetition) and prompt echo -- would be silently corrupted by the
+    placeholder, so such requests must receive the real ``prompt_token_ids``.
+
+    Output-only features (output logprobs, stop / bad words matched on generated
+    tokens) do not read prompt values and remain on the fast path.
+    """
+    if getattr(request, "echo", False):
+        return True
+    if getattr(request, "frequency_penalty", 0.0):
+        return True
+    if getattr(request, "presence_penalty", 0.0):
+        return True
+    repetition_penalty = getattr(request, "repetition_penalty", 1.0)
+    if repetition_penalty is not None and repetition_penalty != 1.0:
+        return True
+    return False
+
+
 class OpenAIDisaggregatedService(OpenAIService):
     def __init__(
         self,
@@ -81,6 +107,8 @@ class OpenAIDisaggregatedService(OpenAIService):
         self._strip_gen_message_history = config.gen_strip_message_history
         # Opt-in: ask context workers to return prompt_token_ids as base64 int32.
         self._tokids_ctxbytes = config.gen_tokids_ctxbytes
+        # Opt-in B2: send GEN only prompt_len (no token array); GEN placeholders.
+        self._tokids_metadata_only = getattr(config, "gen_tokids_metadata_only", False)
 
         self._ctx_client = None
         self._gen_client = None
@@ -236,9 +264,26 @@ class OpenAIDisaggregatedService(OpenAIService):
             if isinstance(request, CompletionRequest):
                 request.prompt = ctx_response.prompt_token_ids
             elif isinstance(request, ChatCompletionRequest):
+                _ctx_prompt_len = getattr(ctx_response, "prompt_len", None)
+                if (
+                    self._tokids_metadata_only
+                    and _ctx_prompt_len is not None
+                    and request.disaggregated_params is not None
+                    and not _chat_request_reads_prompt_token_values(request)
+                ):
+                    # B2: send GEN only the prompt length; the GEN worker builds a
+                    # length-only placeholder and generation uses the transferred
+                    # KV, so the ∝ISL token array never touches the GEN event loop.
+                    # GUARDRAIL: this fast path is taken ONLY when (a) the context
+                    # worker reported a prompt_len, (b) disaggregated_params exists
+                    # to carry it, and (c) the request does not read prompt token
+                    # VALUES (sampling penalties / echo). Otherwise fall through to
+                    # relay the real tokens (b64/list), because the placeholder
+                    # would break those. See _chat_request_reads_prompt_token_values.
+                    request.disaggregated_params.prompt_len = _ctx_prompt_len
                 # Relay the base64 token-id string verbatim (no int-list
                 # materialization on the orchestrator loop), else the int array.
-                if ctx_response.prompt_token_ids_b64 is not None:
+                elif ctx_response.prompt_token_ids_b64 is not None:
                     request.prompt_token_ids_b64 = ctx_response.prompt_token_ids_b64
                 else:
                     request.prompt_token_ids = ctx_response.prompt_token_ids

@@ -144,7 +144,10 @@ class GenerationExecutor(ABC):
         """Generate output for the given prompt token ids in the asynchronous mode.
         Asynchronous generation accepts single prompt only.
         """
-        assert isinstance(prompt_token_ids[0], int)
+        # Accept a Python int (list path) or a numpy integer (int32 ndarray path:
+        # GenerationRequest stashes it as a lazy `_prompt_token_ids_i32` buffer to
+        # avoid the O(ISL) `.tolist()` on the GIL-held submit thread).
+        assert isinstance(prompt_token_ids[0], (int, np.integer))
         assert isinstance(sampling_params, SamplingParams)
 
         self._maybe_initialize_iteration_results()

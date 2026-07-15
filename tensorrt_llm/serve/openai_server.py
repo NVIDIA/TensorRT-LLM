@@ -1385,6 +1385,11 @@ class OpenAIServer(_VideoRoutesMixin):
 
         if disaggregated_params is not None and disaggregated_params.request_type == "context_only":
             chat_response.prompt_token_ids = promise.prompt_token_ids
+            # B2 (gen_tokids_metadata_only): report prompt_len so the orchestrator
+            # can send only the length to the GEN worker (cheap len() here on the
+            # context worker) instead of relaying the ∝ISL token array.
+            if chat_response.prompt_token_ids is not None:
+                chat_response.prompt_len = len(chat_response.prompt_token_ids)
 
         if disaggregated_params is not None and chat_response.choices[
                 0].disaggregated_params is None:
@@ -1539,11 +1544,37 @@ class OpenAIServer(_VideoRoutesMixin):
                     request_media_io_kwargs=request.media_io_kwargs)
 
             # Decode base64 int32 prompt_token_ids relayed by the orchestrator.
+            # Keep the int32 ndarray (NO .tolist()): it flows through prompt_inputs
+            # / _preprocess / GenerationRequest as a LAZY int32 buffer
+            # (_prompt_token_ids_i32) that base_worker memcpy's into the C++ Request
+            # ctor, so the O(ISL) Python list is never built on the single GEN
+            # asyncio event loop -- the dominant gen_preprocessing/TTFT cost at high
+            # concurrency. The plain disagg-gen forward path never reads the values;
+            # a consumer that does (prompt logprobs) triggers a one-time .tolist().
             if request.prompt_token_ids is None and request.prompt_token_ids_b64:
                 import numpy as np
-                request.prompt_token_ids = np.frombuffer(
-                    base64.b64decode(request.prompt_token_ids_b64),
-                    dtype=np.int32).tolist()
+                request.prompt_token_ids = np.frombuffer(base64.b64decode(
+                    request.prompt_token_ids_b64),
+                                                         dtype=np.int32)
+            # B2 (gen_tokids_metadata_only): the body carries only prompt_len, not
+            # the token array. Build a length-only placeholder; generation uses the
+            # KV transferred from the context worker and never dereferences prompt
+            # token VALUES on the forward path, so the placeholder is correct for
+            # the disagg-gen path (requires GEN block reuse off; the orchestrator
+            # guardrail keeps requests that read prompt values off this path).
+            # np.full is a single C-level fill, not an O(ISL) Python list build.
+            elif (request.prompt_token_ids is None
+                  and request.prompt_token_ids_b64 is None
+                  and request.disaggregated_params is not None and getattr(
+                      request.disaggregated_params, "prompt_len", None)):
+                import numpy as np
+                _pad = getattr(
+                    getattr(self.tokenizer, "tokenizer", self.tokenizer),
+                    "pad_token_id", None) or 0
+                request.prompt_token_ids = np.full(int(
+                    request.disaggregated_params.prompt_len),
+                                                   int(_pad),
+                                                   dtype=np.int32)
 
             if request.prompt_token_ids is not None:
                 prompt = request.prompt_token_ids

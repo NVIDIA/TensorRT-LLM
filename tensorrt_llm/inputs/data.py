@@ -2,6 +2,7 @@
 # https://github.com/vllm-project/vllm/blob/2e33fe419186c65a18da6668972d61d7bbc31564/vllm/inputs/data.py
 from typing import Any, Dict, List, Union
 
+import numpy as np
 from typing_extensions import NotRequired, TypedDict
 
 
@@ -93,6 +94,12 @@ def prompt_inputs(inputs: PromptInputs, ) -> Union[TextPrompt, TokensPrompt]:
         prompt_inputs = TextPrompt(prompt=inputs)
     elif isinstance(inputs, list):
         assert len(inputs) == 0 or isinstance(inputs[0], int)
+        prompt_inputs = TokensPrompt(prompt_token_ids=inputs)
+    elif isinstance(inputs, np.ndarray):
+        # 1-D int token-id buffer (e.g. base64-decoded disagg-gen prompt). Kept
+        # as an ndarray (no O(ISL) .tolist()) -- GenerationRequest stashes it as a
+        # lazy int32 buffer for the C++ Request ctor memcpy.
+        assert inputs.ndim == 1
         prompt_inputs = TokensPrompt(prompt_token_ids=inputs)
     elif isinstance(inputs, dict):
         assert inputs.get("prompt") is not None \

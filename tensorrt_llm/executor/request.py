@@ -118,6 +118,20 @@ class GenerationRequest:
         if isinstance(prompt_token_ids, list):
             self.prompt_token_ids = prompt_token_ids
             self.query_token_ids = query_token_ids
+        elif isinstance(prompt_token_ids,
+                        np.ndarray) and prompt_token_ids.dtype == np.int32:
+            # int32 ndarray: stash for LAZY list materialization (the
+            # `prompt_token_ids` property builds the list only on first read) and
+            # for the C++ Request ctor memcpy (base_worker._enqueue_request),
+            # avoiding the O(ISL) `.tolist()` on the GIL-held submit path. The list
+            # is built only if a consumer actually reads the values (e.g. prompt
+            # logprobs); the plain disagg-gen path never reads it. See __getstate__
+            # (encodes the int32 buffer bytes directly).
+            self._prompt_token_ids = None
+            self._prompt_token_ids_i32 = prompt_token_ids
+            self.query_token_ids = (query_token_ids.tolist() if isinstance(
+                query_token_ids,
+                (torch.Tensor, np.ndarray)) else query_token_ids)
         elif isinstance(prompt_token_ids, (torch.Tensor, np.ndarray)):
             self.prompt_token_ids = prompt_token_ids.tolist()
             if query_token_ids:
