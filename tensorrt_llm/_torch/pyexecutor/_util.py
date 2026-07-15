@@ -32,7 +32,7 @@ from tensorrt_llm.llmapi.llm_args import (
     CacheTransceiverConfig, CapacitySchedulerPolicy, EagleDecodingConfig,
     KvCacheCompressionConfig, KvCacheConfig, MTPDecodingConfig, PeftCacheConfig,
     SamplerType, SchedulerConfig, SparseAttentionConfig, SpeculativeConfig,
-    TorchLlmArgs, WaitingQueuePolicy)
+    TorchLlmArgs, TriAttentionKvCacheCompressionConfig, WaitingQueuePolicy)
 # isort: on
 from tensorrt_llm.logger import logger
 from tensorrt_llm.lora_helper import (LoraConfig,
@@ -2043,15 +2043,82 @@ def create_kv_cache_compression_manager(
 
     Called from ``create_py_executor`` and registered as a resource manager,
     like the KV cache manager itself. Concrete algorithms add a dispatch branch
-    here; the framework ships none. Speculative-decoding compatibility is also
-    decided here: a compression manager is only created when the speculative
-    mode supports it, otherwise the run stays uncompressed.
+    here; the framework ships none. Speculative-decoding compatibility is
+    decided here: evicting methods only accept modes whose draft KV is a
+    standard paged cache compacted with the target.
     """
-    logger.warning(
-        "KV-cache compression algorithm '%s' is not registered; running without "
-        "a compression manager.",
-        config.algorithm,
-    )
+    manager_class = None
+    if config.algorithm == "triattention":
+        from tensorrt_llm._torch.kv_cache_compression.triattention import \
+            TriAttention
+        manager_class = TriAttention
+
+    if manager_class is None:
+        logger.warning(
+            "KV-cache compression algorithm '%s' is not registered; running without "
+            "a compression manager.",
+            config.algorithm,
+        )
+        return None
+
+    # Evicting methods co-compact the draft KV, so they only support spec
+    # modes whose draft KV is a standard paged cache in the same forward
+    # (one-model speculation). For any other mode, no compression manager
+    # is created and the run stays uncompressed.
+    if (manager_class.is_eviction_method() and spec_config is not None
+            and not (spec_config.spec_dec_mode.is_mtp_one_model()
+                     or spec_config.spec_dec_mode.is_eagle3_one_model())):
+        logger.warning(
+            "KV-cache compression algorithm '%s' evicts cached tokens and does "
+            "not support speculative decoding mode %s (the draft KV must be a "
+            "standard paged cache compacted together with the target); running "
+            "without a compression manager.",
+            config.algorithm,
+            spec_config.spec_dec_mode.name,
+        )
+        return None
+
+    if config.algorithm == "triattention":
+        if spec_config is not None:
+            if spec_config.max_draft_len is None:
+                raise ValueError(
+                    "TriAttention speculative compatibility requires a "
+                    "resolved max_draft_len")
+            if not spec_config.is_linear_tree:
+                raise ValueError(
+                    "TriAttention speculative compatibility requires linear "
+                    "drafting")
+            if spec_config.draft_len_schedule is not None:
+                raise ValueError(
+                    "TriAttention does not yet support dynamic speculative "
+                    "draft lengths")
+            if (spec_config.acceptance_window is not None
+                    or spec_config.acceptance_length_threshold is not None):
+                raise ValueError(
+                    "TriAttention does not support runtime speculative "
+                    "acceptance gating")
+            if draft_kv_cache_manager is None:
+                raise ValueError(
+                    "TriAttention speculative compatibility requires a "
+                    "separate draft KV cache; shared target/draft pools "
+                    "cannot be compacted safely")
+        triattention_config = (
+            config if isinstance(config, TriAttentionKvCacheCompressionConfig)
+            else TriAttentionKvCacheCompressionConfig.model_validate(
+                config.model_dump()))
+        return TriAttention(
+            kv_cache_manager,
+            draft_kv_cache_manager=draft_kv_cache_manager,
+            top_B=triattention_config.top_B,
+            beta=triattention_config.beta,
+            model_path=triattention_config.model_path,
+            calibration_path=triattention_config.calibration_path,
+            eviction_mode=triattention_config.eviction_mode,
+            normalize_scores=triattention_config.normalize_scores,
+            pin_prefill=triattention_config.pin_prefill,
+            count_prompt_tokens=triattention_config.count_prompt_tokens,
+        )
+
     return None
 
 

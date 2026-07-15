@@ -3269,6 +3269,78 @@ class KvCacheCompressionConfig(StrictBaseModel):
         "and set the value.")
 
 
+class TriAttentionKvCacheCompressionConfig(KvCacheCompressionConfig):
+    """KV-cache compression config for TriAttention.
+
+    TriAttention periodically evicts cached tokens during generation, guided by
+    an offline-calibrated trigonometric importance score
+    (github.com/WeianMao/triattention). It runs on the KV-cache compression
+    framework with the standard ``KVCacheManagerV2``, whose ``update_resources``
+    returns eviction-freed blocks to the pool for the capacity gain. TRT-LLM does
+    not compute calibration: supply the official tool's ``.pt`` via ``calibration_path`` and
+    it is converted to the runtime schema at load. TriAttention is a pure
+    compression method: it has no sparse-attention config and no attention
+    backend of its own -- decode runs the model's standard attention over the
+    compacted cache, and the manager reconciles the cached-token count via the
+    framework's ``adjust_attention_metadata`` hook.
+    """
+    algorithm: Literal["triattention"] = "triattention"
+    eviction_mode: Literal["union", "per_head", "per_layer_perhead"] = Field(
+        default="union",
+        description=
+        "Which token set each eviction round keeps. `union` (default) takes "
+        "the union of each KV head's top-B and re-ranks it by the per-token max "
+        "score; it matches the official base setting (per-head and "
+        "per-layer-per-head pruning both off). `per_head` keeps a per-KV-head "
+        "set shared across layers (mean of per-layer max); `per_layer_perhead` "
+        "keeps a fully independent set per (layer, KV head).")
+    normalize_scores: bool = Field(
+        default=True,
+        description="Z-normalize each head's scores over the decode region "
+        "before selection (upstream default).")
+    pin_prefill: bool = Field(
+        default=True,
+        description="Always preserve the prompt (prefill) tokens; only decode "
+        "tokens compete for the budget (upstream behaviour).")
+    top_B: int = Field(
+        default=2048,
+        description="Tokens kept at each periodic eviction (upstream `budget`; "
+        "prompt tokens are always preserved on top).")
+    beta: int = Field(
+        default=128,
+        description="Eviction period in confirmed generation tokens (upstream "
+        "`divide_length`): one speculative iteration may advance the counter "
+        "by multiple accepted tokens; at most one eviction is coalesced per update."
+    )
+    model_path: Optional[str] = Field(
+        default=None,
+        description="Checkpoint path used to derive RoPE tables when converting "
+        "the official calibration and to classify kernel-masked sliding-attention "
+        "layers. Required by TriAttention.")
+    calibration_path: Optional[str] = Field(
+        default=None,
+        description="Path to the official TriAttention calibration `.pt` "
+        "(produced by github.com/WeianMao/triattention). TRT-LLM does not "
+        "compute calibration; it converts this file to the runtime schema at "
+        "load.")
+    window_size: int = Field(
+        default=128,
+        description="Compatibility field retained for existing configs. The "
+        "implemented calibration-based selection does not use a separate "
+        "recency window.")
+    count_prompt_tokens: bool = Field(
+        default=False,
+        description="If False (default), the KV budget counts only DECODE tokens "
+        "(the pinned prompt is kept on top). Physical capacity reclaim currently "
+        "requires False.")
+
+
+KvCacheCompressionConfigType: TypeAlias = Union[
+    TriAttentionKvCacheCompressionConfig,
+    KvCacheCompressionConfig,
+]
+
+
 @PybindMirror.mirror_pybind_fields(_AgentTreeConfig)
 class AgentTreeConfig(StrictBaseModel, PybindMirror):
     """Configuration for agent tree scheduling.
@@ -3987,7 +4059,7 @@ class BaseLlmArgs(StrictBaseModel):
 
     # KV cache compression config (separate from sparse attention: changes which
     # KV is stored, not the attention computation)
-    kv_cache_compression_config: Optional[KvCacheCompressionConfig] = Field(
+    kv_cache_compression_config: Optional[KvCacheCompressionConfigType] = Field(
         default=None,
         description="KV-cache compression config; None disables compression.",
         status="prototype")

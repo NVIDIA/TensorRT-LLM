@@ -24,7 +24,8 @@ from .llm_args import (AttentionDpConfig, AutoDecodingConfig, BatchingType,
                        SADecodingConfig, SAEnhancerConfig,
                        SaveHiddenStatesDecodingConfig, SchedulerConfig,
                        SkipSoftmaxAttentionConfig, TorchCompileConfig,
-                       TorchLlmArgs, TrtLlmArgs, UserProvidedDecodingConfig)
+                       TorchLlmArgs, TriAttentionKvCacheCompressionConfig,
+                       TrtLlmArgs, UserProvidedDecodingConfig)
 from .llm_utils import (BuildConfig, KvCacheRetentionConfig, QuantAlgo,
                         QuantConfig)
 from .mm_encoder import MultimodalEncoder
@@ -90,6 +91,7 @@ __all__ = [
     'MiniMaxM3SparseAttentionConfig',
     'SchedulingParams',
     'SkipSoftmaxAttentionConfig',
+    'TriAttentionKvCacheCompressionConfig',
     'PrometheusMetricsConfig',
     'ThinkingBudgetLogitsProcessor',
     'add_thinking_budget_logits_processor',

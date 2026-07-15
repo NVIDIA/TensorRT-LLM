@@ -544,6 +544,68 @@
       "path": "iter_stats_max_iterations"
     },
     {
+      "allowed_values": [
+        "triattention"
+      ],
+      "annotation": "Literal['triattention']",
+      "converter": "",
+      "kind": "categorical",
+      "path": "kv_cache_compression_config.algorithm"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "kv_cache_compression_config.beta"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "kv_cache_compression_config.count_prompt_tokens"
+    },
+    {
+      "allowed_values": [
+        "union",
+        "per_head",
+        "per_layer_perhead"
+      ],
+      "annotation": "Literal['union', 'per_head', 'per_layer_perhead']",
+      "converter": "",
+      "kind": "categorical",
+      "path": "kv_cache_compression_config.eviction_mode"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "kv_cache_compression_config.normalize_scores"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "kv_cache_compression_config.pin_prefill"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "kv_cache_compression_config.top_B"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "kv_cache_compression_config.window_size"
+    },
+    {
       "allowed_values": [],
       "annotation": "<class 'int'>",
       "converter": "",
@@ -2960,6 +3022,68 @@
       "converter": "",
       "kind": "value",
       "path": "iter_stats_max_iterations"
+    },
+    {
+      "allowed_values": [
+        "triattention"
+      ],
+      "annotation": "Literal['triattention']",
+      "converter": "",
+      "kind": "categorical",
+      "path": "kv_cache_compression_config.algorithm"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "kv_cache_compression_config.beta"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "kv_cache_compression_config.count_prompt_tokens"
+    },
+    {
+      "allowed_values": [
+        "union",
+        "per_head",
+        "per_layer_perhead"
+      ],
+      "annotation": "Literal['union', 'per_head', 'per_layer_perhead']",
+      "converter": "",
+      "kind": "categorical",
+      "path": "kv_cache_compression_config.eviction_mode"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "kv_cache_compression_config.normalize_scores"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "kv_cache_compression_config.pin_prefill"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "kv_cache_compression_config.top_B"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "kv_cache_compression_config.window_size"
     },
     {
       "allowed_values": [],
