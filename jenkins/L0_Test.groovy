@@ -1700,11 +1700,25 @@ if [ ! -f "\$fatSqshPath" ]; then
     EXISTING=\$(squeue -h -n "fat_build_\${fatHash}" -o "%i" 2>/dev/null | head -1 || true)
     if [ -n "\$EXISTING" ]; then
         echo "Fat sqsh builder already running as job \$EXISTING, adding dependency"
-        SBATCH_DEPENDENCY="--dependency=afterok:\$EXISTING"
+        # afterany (not afterok): the builder is best-effort. A failed build must not
+        # deadlock the GPU job as DependencyNeverSatisfied; it falls back to base sqsh.
+        SBATCH_DEPENDENCY="--dependency=afterany:\$EXISTING"
     else
-        BUILDER_ID=\$(sbatch --parsable --job-name="fat_build_\${fatHash}" "${scriptFatBuildSbatchPathNode}" | head -1)
-        echo "Submitted fat sqsh builder as job \$BUILDER_ID"
-        SBATCH_DEPENDENCY="--dependency=afterok:\$BUILDER_ID"
+        # Submit the CPU builder. Best-effort: any submission failure must NOT block the
+        # GPU test job -- it just runs without a dependency (base sqsh + full install).
+        set +e
+        BUILDER_OUT=\$(sbatch --parsable --job-name="fat_build_\${fatHash}" "${scriptFatBuildSbatchPathNode}" 2>&1)
+        BUILDER_RC=\$?
+        set -e
+        BUILDER_ID=\$(printf '%s' "\$BUILDER_OUT" | head -1 | cut -d';' -f1)
+        if [ "\$BUILDER_RC" -eq 0 ] && [ -n "\$BUILDER_ID" ]; then
+            echo "Submitted fat sqsh builder as job \$BUILDER_ID"
+            SBATCH_DEPENDENCY="--dependency=afterany:\$BUILDER_ID"
+        else
+            echo "Fat sqsh builder submission failed (rc=\$BUILDER_RC): \$BUILDER_OUT"
+            echo "Falling back: GPU test job will run without dependency (base sqsh + full install)"
+            SBATCH_DEPENDENCY=""
+        fi
     fi
 fi
 """.replaceAll("(?m)^\\s{20}", "")
