@@ -2195,6 +2195,46 @@ class GvrTopKKernel:
         else:
             smem_input = None
 
+        # op#26 R0 admission scratch (single-CTA fast path). Allocated only
+        # when enable_r0; None otherwise so the base SMEM layout is byte-for-
+        # byte unchanged and these propagate harmlessly through _run_phases'
+        # const_expr(enable_r0)-gated branch (same idiom as s_cluster_partial
+        # / smem_input above). smem_ptcnt_multi caches M per-thread count
+        # columns; s_r0col carries the accepted rung index tid0 -> all.
+        if cutlass.const_expr(self.enable_r0):
+            M_r0 = cutlass.const_expr(self.M_thr)
+            s_mt_thr = smem.allocate_tensor(
+                element_type=cutlass.Float32,
+                layout=cute.make_ordered_layout((M_r0,), order=(0,)),
+                byte_alignment=16,
+            )
+            smem_ptcnt_multi = smem.allocate_tensor(
+                element_type=cutlass.Int32,
+                layout=cute.make_ordered_layout((M_r0 * num_threads,), order=(0,)),
+                byte_alignment=128,
+            )
+            smem_wcnt_multi = smem.allocate_tensor(
+                element_type=cutlass.Int32,
+                layout=cute.make_ordered_layout((M_r0 * num_warps,), order=(0,)),
+                byte_alignment=64,
+            )
+            s_mt_cnt = smem.allocate_tensor(
+                element_type=cutlass.Int32,
+                layout=cute.make_ordered_layout((M_r0,), order=(0,)),
+                byte_alignment=16,
+            )
+            s_r0col = smem.allocate_tensor(
+                element_type=cutlass.Int32,
+                layout=cute.make_ordered_layout((1,), order=(0,)),
+                byte_alignment=16,
+            )
+        else:
+            s_mt_thr = None
+            smem_ptcnt_multi = None
+            smem_wcnt_multi = None
+            s_mt_cnt = None
+            s_r0col = None
+
         # ---- Per-row dispatch ----
         # Three branches:
         #   1. Degenerate (N <= top_k): no GVR work, leader emits identity.
@@ -2269,6 +2309,11 @@ class GvrTopKKernel:
                         s_iscalars,
                         s_cluster_partial,
                         smem_input,
+                        s_mt_thr,
+                        smem_ptcnt_multi,
+                        smem_wcnt_multi,
+                        s_mt_cnt,
+                        s_r0col,
                         tidx,
                         warp_id,
                         lane,
@@ -2303,6 +2348,11 @@ class GvrTopKKernel:
                             s_iscalars,
                             s_cluster_partial,
                             smem_input,
+                            s_mt_thr,
+                            smem_ptcnt_multi,
+                            smem_wcnt_multi,
+                            s_mt_cnt,
+                            s_r0col,
                             tidx,
                             warp_id,
                             lane,
@@ -2334,6 +2384,11 @@ class GvrTopKKernel:
                     s_iscalars,
                     s_cluster_partial,
                     smem_input,
+                    s_mt_thr,
+                    smem_ptcnt_multi,
+                    smem_wcnt_multi,
+                    s_mt_cnt,
+                    s_r0col,
                     tidx,
                     warp_id,
                     lane,
@@ -2368,6 +2423,11 @@ class GvrTopKKernel:
         s_iscalars,
         s_cluster_partial,
         smem_input,
+        s_mt_thr,
+        smem_ptcnt_multi,
+        smem_wcnt_multi,
+        s_mt_cnt,
+        s_r0col,
         tidx,
         warp_id,
         lane,
@@ -2445,23 +2505,69 @@ class GvrTopKKernel:
                     tidx,
                 )
 
-            # ---- Phase 2: secant threshold search ----
-            self.phase2_secant_search(
-                input_row,
-                N,
-                slice_start,
-                slice_end,
-                smem_ptcnt,
-                smem_wcnt,
-                s_thr,
-                s_iscalars,
-                s_cluster_partial,
-                tidx,
-                warp_id,
-                lane,
-                do_cluster_sync=do_cluster_sync,
-                smem_input=smem_input,
-            )
+            # ---- Phase 2: R0 histogram-ladder admission (single-CTA fast
+            # path) or the secant threshold search ----
+            # enable_r0 gates to cluster_size==1 for now: op#26's R0 scans the
+            # full row in one CTA. The slice-parallel + cluster count-merge
+            # variant that lets R0 cover the cs>1 long-row branch lands in a
+            # later commit; until then cs>1 keeps the secant path.
+            if cutlass.const_expr(self.enable_r0 and cluster_size == 1):
+                # P1b rung placement -> ONE M-ary R0 count pass -> accept the
+                # tightest rung with count in [K, kC]. On a miss, fall back to
+                # the existing secant search (a later commit replaces this
+                # fallback with the inline log-falsi refine).
+                self.phase1b_hspace_rungs(
+                    input_row, N, pre_idx_row, pre_idx_count, pre_idx_offset,
+                    smem_hist, s_thr, s_mt_thr, tidx, warp_id, lane)
+                self.block_count_ge_multi(
+                    input_row, N, s_mt_thr, smem_ptcnt_multi, smem_wcnt_multi,
+                    s_mt_cnt, tidx, warp_id, lane)
+                cute.arch.barrier()
+                if tidx == 0:
+                    # tightest admissible rung = LAST m with count in [K, kC]
+                    # (ascending thresholds => non-increasing counts in m).
+                    best_m = cutlass.Int32(-1)
+                    for m in cutlass.range_constexpr(cutlass.const_expr(self.M_thr)):
+                        cm = s_mt_cnt[m]
+                        if (cm >= cutlass.Int32(self.top_k)
+                                and cm <= cutlass.Int32(self.kC)):
+                            best_m = cutlass.Int32(m)
+                    s_r0col[0] = best_m
+                    if best_m >= cutlass.Int32(0):
+                        s_thr[0] = s_mt_thr[best_m]
+                        s_iscalars[0] = s_mt_cnt[best_m]
+                cute.arch.barrier()
+                bc = s_r0col[0]
+                if bc >= cutlass.Int32(0):
+                    # accepted: seed Phase 3 with the rung's cached per-thread
+                    # count column (zero rescan; matches secant's smem_ptcnt
+                    # hand-off contract).
+                    smem_ptcnt[tidx] = smem_ptcnt_multi[
+                        bc * cutlass.Int32(num_threads) + tidx]
+                cute.arch.barrier()
+                if bc < cutlass.Int32(0):
+                    self.phase2_secant_search(
+                        input_row, N, slice_start, slice_end, smem_ptcnt,
+                        smem_wcnt, s_thr, s_iscalars, s_cluster_partial, tidx,
+                        warp_id, lane, do_cluster_sync=do_cluster_sync,
+                        smem_input=smem_input)
+            else:
+                self.phase2_secant_search(
+                    input_row,
+                    N,
+                    slice_start,
+                    slice_end,
+                    smem_ptcnt,
+                    smem_wcnt,
+                    s_thr,
+                    s_iscalars,
+                    s_cluster_partial,
+                    tidx,
+                    warp_id,
+                    lane,
+                    do_cluster_sync=do_cluster_sync,
+                    smem_input=smem_input,
+                )
 
             # Cluster handoff #1 (end of Phase 2). Skipped when
             # do_cluster_sync is False (cs=1 or short-row degrade).
