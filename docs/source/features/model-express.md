@@ -5,23 +5,23 @@ SPDX-License-Identifier: Apache-2.0
 
 # ModelExpress (MX) Checkpoint Loading
 
-TensorRT-LLM can use ModelExpress (MX) as a checkpoint-loading path for
+The MX checkpoint-loading integration is intended to reduce repeated disk
+reads when multiple TensorRT LLM workers load the same model. A worker that
+loads from disk can publish its weights as an MX source, and later workers can
+receive those weights directly through MX.
+
+TensorRT LLM can use ModelExpress (MX) as a checkpoint-loading path for
 PyTorch backend deployments. `checkpoint_format="MX"` selects this loading
 path; it does not identify an MX-specific on-disk checkpoint format, and no
-checkpoint conversion is required. TensorRT-LLM attempts to fetch compatible
-weights from another running TensorRT-LLM instance through the MX server. If
+checkpoint conversion is required. TensorRT LLM attempts to fetch compatible
+weights from another running TensorRT LLM instance through the MX server. If
 no compatible source is available, or if MX transfer fails, loading falls back
 to the provided Hugging Face checkpoint.
-
-This integration is intended to reduce repeated disk reads when multiple
-TensorRT-LLM workers load the same model. A worker that loads from disk can
-publish its weights as an MX source, and later workers can receive those
-weights directly through MX.
 
 ## Current Support Scope
 
 The post-transform MX receive path currently supports only
-`LlamaForCausalLM` with transform protocol version 1. TensorRT-LLM publishes
+`LlamaForCausalLM` with transform protocol version 1. TensorRT LLM publishes
 post-transform weights together with source-identity and layout metadata. A
 receiver whose model family is not allow-listed does not consume those bytes;
 it falls back to the standard Hugging Face checkpoint path.
@@ -54,9 +54,9 @@ Support for another model family requires a focused qualification change:
 
 ## Installation
 
-The official TensorRT-LLM release container includes the MX Python client. No
+The official TensorRT LLM release container includes the MX Python client. No
 additional Python package installation is required in that container. MX
-remains opt-in at runtime: TensorRT-LLM uses the client only when the MX
+remains opt-in at runtime: TensorRT LLM uses the client only when the MX
 checkpoint-loading path and a server URL are configured. Installing the client
 does not expand the model support scope described above.
 
@@ -73,8 +73,8 @@ API qualified by this integration. Deploy a compatible MX server version.
 ## Deploy the MX Service
 
 Deploy the MX server and its Redis metadata backend independently of
-TensorRT-LLM. One MX service can be shared by multiple TensorRT-LLM launches,
-provided every instance can reach the MX endpoint. TensorRT-LLM does not start,
+TensorRT LLM. One MX service can be shared by multiple TensorRT LLM launches,
+provided every instance can reach the MX endpoint. TensorRT LLM does not start,
 stop, or otherwise manage either service.
 
 The following commands illustrate a standalone Docker deployment. Production
@@ -96,7 +96,7 @@ docker run -d --name modelexpress-server \
   nvcr.io/nvidia/ai-dynamo/modelexpress-server:0.4.1
 ```
 
-## Configure TensorRT-LLM
+## Configure TensorRT LLM
 
 Select the MX checkpoint-loading path and provide the MX server URL in a
 `trtllm-serve` config. The model argument remains a standard Hugging Face model
@@ -115,7 +115,7 @@ trtllm-serve /path/to/model --config config.yaml
 The `MODEL_EXPRESS_URL` environment variable can also provide the server URL
 when `mx_config.server_url` is not set.
 
-Multiple TensorRT-LLM launches can use the same configuration. A worker that
+Multiple TensorRT LLM launches can use the same configuration. A worker that
 does not find a compatible source loads from Hugging Face storage and publishes
 its weights through MX. Later compatible workers can receive those weights by
 P2P transfer.
@@ -129,17 +129,17 @@ path.
 | Field | Default | Description |
 |-------|---------|-------------|
 | `mx_config.server_url` | `null` | URL of the separately managed MX server. |
-| `mx_config.server_query_timeout_s` | `null` | Timeout for MX source discovery. When unset, TensorRT-LLM uses a short fallback cap when no source exists and otherwise lets MX wait for long donor loads. |
+| `mx_config.server_query_timeout_s` | `null` | Timeout for MX source discovery. When unset, TensorRT LLM uses a short fallback cap when no source exists and otherwise lets MX wait for long donor loads. |
 
 ## Notes and Limitations
 
 - Post-transform MX reception is currently limited to the Llama model family.
   Other model families safely fall back to Hugging Face loading until they are
   explicitly qualified and added to the staged-receiver allow-list.
-- The MX server and Redis lifecycle is external to TensorRT-LLM. Every
-  TensorRT-LLM instance must be able to reach the configured MX server URL.
+- The MX server and Redis lifecycle is external to TensorRT LLM. Every
+  TensorRT LLM instance must be able to reach the configured MX server URL.
 - The MX server coordinates source discovery but does not store model weights.
-  A source TensorRT-LLM process must remain running and network-reachable until
+  A source TensorRT LLM process must remain running and network-reachable until
   receiver transfers finish.
 - The first worker may still load weights from disk if no compatible MX source
   is already registered.
