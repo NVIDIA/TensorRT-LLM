@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Test KV Transfer with KVCacheManager (V1) and KVCacheManagerV2 (V2)."""
 
 import os
@@ -27,7 +42,11 @@ from tensorrt_llm._torch.disaggregation.base.transfer import (
     TokenRange,
     WaitResult,
 )
-from tensorrt_llm._torch.disaggregation.native.transfer import TransferWorker, TransferWorkerConfig
+from tensorrt_llm._torch.disaggregation.native.transfer import (
+    TaskStatus,
+    TransferWorker,
+    TransferWorkerConfig,
+)
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestType
@@ -1328,16 +1347,17 @@ def test_session_cancel_after_send():
         page_table = ctx_transfer_worker._rank_info.page_table
         block_ids_per_groups = [np.array([], dtype=np.int64) for _ in page_table.layer_groups]
         kv_slice = KVSlice(is_last_slice=True, block_ids_per_layer_groups=block_ids_per_groups)
-        future = tx_session.send(kv_slice)
+        tx_session.send(kv_slice)
+        task = tx_session.kv_tasks[0]
 
         # No receiver registered yet; task is INIT.
         tx_session.cancel()
 
         assert tx_session.status == SessionStatus.CANCELLED
         assert tx_session.has_failed()
-        # Future for the cancelled INIT task must raise.
-        with pytest.raises(Exception):
-            future.result(timeout=5.0)
+        assert task.wait(timeout=5.0)
+        assert task.status == TaskStatus.ERROR
+        assert tx_session.wait_complete() == WaitResult.FAILED
         tx_session.close()
     finally:
         ctx_transfer_worker.shutdown()
@@ -1347,7 +1367,7 @@ def test_session_cancel_after_send():
 
 @pytest.mark.timeout(60)
 def test_session_cancel_twice():
-    """cancel() called twice must be a no-op on the second call."""
+    """Repeated cancel() calls stay safe and retry terminal settlement."""
     setup = create_transfer_worker_setup(
         ctx_tp=1,
         ctx_pp=1,
@@ -1388,14 +1408,14 @@ def test_session_cancel_twice():
     try:
         tx_session = ctx_transfer_worker.create_tx_session(ctx_request)
         tx_session.cancel()
-        tx_session.cancel()  # Second call must be a no-op
+        tx_session.cancel()  # Replays any terminal result whose first send failed.
         assert tx_session.status == SessionStatus.CANCELLED
         assert not tx_session.has_transferring_tasks()
         tx_session.close()
 
         rx_session = gen_transfer_worker.create_rx_session(gen_request)
         rx_session.cancel()
-        rx_session.cancel()  # Second call must be a no-op
+        rx_session.cancel()  # Receiver cancellation remains idempotent.
         assert rx_session.status == SessionStatus.CANCELLED
         assert not rx_session.has_transferring_tasks()
         rx_session.close()
@@ -1460,6 +1480,7 @@ def test_session_has_transferring_tasks_false():
         kv_slice = KVSlice(is_last_slice=True, block_ids_per_layer_groups=block_ids_per_groups)
         tx_session.send(kv_slice)
         assert not tx_session.has_transferring_tasks()
+        tx_session.cancel()
         tx_session.close()
 
         # RxSession: no tasks yet

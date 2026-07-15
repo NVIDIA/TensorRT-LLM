@@ -1,3 +1,19 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import threading
 import time
 import uuid
 from collections import defaultdict
@@ -39,6 +55,11 @@ from tensorrt_llm.disaggregated_params import DisaggScheduleStyle
 from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig
 from tensorrt_llm.mapping import Mapping
 
+# A non-drained transceiver is deliberately retained even if its caller drops
+# the last reference. It owns the LlmRequest/session objects that keep receive
+# targets from being reclaimed before terminal transport evidence arrives.
+_NON_DRAINED_TRANSCEIVERS: set["KvCacheTransceiverV2"] = set()
+
 
 def _find_consensus_request_ids(request_ids_all_ranks, sync_size):
     frequency_map = defaultdict(int)
@@ -54,6 +75,10 @@ def _find_consensus_request_ids(request_ids_all_ranks, sync_size):
 
 
 class KvCacheTransceiverV2(KvCacheTransceiver):
+    @property
+    def requires_physical_drain_before_request_release(self) -> bool:
+        return True
+
     def __init__(
         self,
         mapping: Mapping,
@@ -61,6 +86,9 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         kv_cache_manager: KVCacheManager,
         cache_transceiver_config: CacheTransceiverConfig,
     ):
+        self._session_admission_lock = threading.RLock()
+        self._shutdown_started = False
+        self._shutdown = False
         self._dist: Distributed = dist
         self._kv_cache_manager = kv_cache_manager
         self._mapping = mapping
@@ -147,25 +175,105 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         logger.info(f"layer_num_per_pp: {layer_num_per_pp}")
         logger.info(f"self._context_info_endpoint: {self._context_info_endpoint}")
 
-    def shutdown(self):
-        if getattr(self, "_shutdown", False):
-            return
-        self._shutdown = True
-        for session in list(self._send_sessions.values()):
-            session.close()
-        for session in list(self._recv_sessions.values()):
-            session.close()
-        self._send_sessions.clear()
-        self._send_reqs.clear()
-        self._recv_sessions.clear()
-        self._recv_reqs.clear()
-        self._transfer_worker.shutdown()
+    def _get_session_admission_lock(self):
+        """Return the launch/shutdown gate, including partial-init cleanup."""
+        admission_lock = getattr(self, "_session_admission_lock", None)
+        if admission_lock is None:
+            admission_lock = threading.RLock()
+            self._session_admission_lock = admission_lock
+        return admission_lock
+
+    def shutdown(self) -> bool:
+        admission_lock = self._get_session_admission_lock()
+        with admission_lock:
+            if getattr(self, "_shutdown", False):
+                return True
+            # Retain the ownership root before any fallible cancellation or
+            # cleanup. A failed shutdown must remain retryable even when the
+            # caller releases its last reference after this attempt.
+            _NON_DRAINED_TRANSCEIVERS.add(self)
+            # Close admission before taking any session snapshot. The same lock
+            # covers owner enrollment through publication/worker enqueue, so a
+            # launch cannot resume against a worker that shutdown just destroyed.
+            self._shutdown_started = True
+            cancel_failed_session_ids: set[int] = set()
+            for direction, sessions in (
+                ("send", self._send_sessions),
+                ("receive", self._recv_sessions),
+            ):
+                for session in list(sessions.values()):
+                    try:
+                        # Cancellation closes future publication but leaves
+                        # already-exposed resources owned until terminal
+                        # results arrive.
+                        session.cancel()
+                    except Exception as e:
+                        cancel_failed_session_ids.add(id(session))
+                        logger.error(
+                            f"KvCacheTransceiverV2 shutdown failed to cancel {direction} "
+                            f"session {session.disagg_request_id}: {e}"
+                        )
+            try:
+                worker_drained = self._transfer_worker.shutdown()
+            except Exception as e:
+                logger.error(
+                    "KvCacheTransceiverV2 worker shutdown did not drain; retaining "
+                    f"sessions and request resources for retry: {e}"
+                )
+                return False
+            if not worker_drained:
+                return False
+
+            close_failed = False
+            for direction, sessions, requests in (
+                ("send", self._send_sessions, self._send_reqs),
+                ("receive", self._recv_sessions, self._recv_reqs),
+            ):
+                for rid, session in list(sessions.items()):
+                    if id(session) in cancel_failed_session_ids:
+                        continue
+                    try:
+                        session.close()
+                    except Exception as e:
+                        close_failed = True
+                        logger.error(
+                            f"KvCacheTransceiverV2 shutdown failed to close {direction} "
+                            f"session {session.disagg_request_id}: {e}"
+                        )
+                        continue
+                    if sessions.get(rid) is session:
+                        sessions.pop(rid, None)
+                    requests.pop(rid, None)
+
+            if cancel_failed_session_ids or close_failed:
+                return False
+            getattr(self, "_wait_reqs", {}).clear()
+            self._shutdown = True
+            _NON_DRAINED_TRANSCEIVERS.discard(self)
+            return True
 
     def __enter__(self):
         return self
 
     def __exit__(self, _exc_type, _exc_val, _exc_tb):
-        self.shutdown()
+        try:
+            drained = self.shutdown()
+        except Exception as shutdown_error:
+            if _exc_type is None:
+                raise
+            logger.error(
+                "KvCacheTransceiverV2 shutdown also failed while propagating "
+                f"{_exc_type.__name__}: {shutdown_error}"
+            )
+            return False
+        if not drained:
+            if _exc_type is None:
+                raise RuntimeError("KV cache transceiver shutdown did not drain")
+            logger.error(
+                "KV cache transceiver shutdown did not drain while propagating "
+                f"{_exc_type.__name__}"
+            )
+        return False
 
     def _create_kv_slice(self, req: LlmRequest) -> KVSlice:
         adapter = self._reuse_adapter
@@ -345,6 +453,12 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         return _find_consensus_request_ids(all_ranks, sync_size)
 
     @staticmethod
+    def _allgather_or_passthrough(local_value: list, allgather: Callable, need_sync: bool) -> list:
+        if not need_sync:
+            return [list(local_value)]
+        return list(allgather(list(local_value)))
+
+    @staticmethod
     def _union(all_lists: List[List[int]]) -> set:
         merged: set = set()
         for ids in all_lists:
@@ -362,48 +476,92 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         return {rid for rid, c in cnt.items() if c == n_ranks}
 
     def _consensus_outcome(
-        self, to_process, cancelled, failed, completed, allgather: Callable, need_sync: bool
+        self,
+        to_process,
+        cancelled,
+        failed,
+        completed,
+        cleanup_ready,
+        allgather: Callable,
+        need_sync: bool,
     ):
-        # CANCELLED/FAILED on any rank → global; COMPLETED only when ALL ranks agree.
-        # Batch the three id lists into one allgather to cut the per-step collective count.
-        if not need_sync:
-            all_c, all_f, all_done = [list(cancelled)], [list(failed)], [list(completed)]
-        else:
-            packed = list(allgather([list(cancelled), list(failed), list(completed)]))
-            all_c = [p[0] for p in packed]
-            all_f = [p[1] for p in packed]
-            all_done = [p[2] for p in packed]
-        n = len(all_c)
+        """Agree on logical outcome without outrunning local physical drain.
+
+        Cancellation/failure is a union because one rank's logical failure must
+        fail the distributed request. Cleanup readiness is an intersection:
+        every rank must independently prove its local source/target accessors
+        terminal before any rank removes its request owner.
+        """
+        payload = [
+            list(cancelled),
+            list(failed),
+            list(completed),
+            list(cleanup_ready),
+        ]
+        gathered = self._allgather_or_passthrough(payload, allgather, need_sync)
+        all_c = [rank_payload[0] for rank_payload in gathered]
+        all_f = [rank_payload[1] for rank_payload in gathered]
+        all_done = [rank_payload[2] for rank_payload in gathered]
+        all_ready = [rank_payload[3] for rank_payload in gathered]
+        n = len(gathered)
         global_cancelled = self._union(all_c)
         global_failed = self._union(all_f)
         global_completed = self._intersection(all_done, n)
-        new_cancelled = [rid for rid in to_process if rid in global_cancelled]
+        globally_ready = self._intersection(all_ready, n)
+        new_cancelled = [
+            rid for rid in to_process if rid in global_cancelled and rid in globally_ready
+        ]
         cancel_set = set(new_cancelled)
-        new_failed = [rid for rid in to_process if rid in global_failed and rid not in cancel_set]
+        new_failed = [
+            rid
+            for rid in to_process
+            if rid in global_failed and rid in globally_ready and rid not in cancel_set
+        ]
         terminal = cancel_set | set(new_failed)
         new_completed = [
-            rid for rid in to_process if rid in global_completed and rid not in terminal
+            rid
+            for rid in to_process
+            if rid in global_completed and rid in globally_ready and rid not in terminal
         ]
         return new_cancelled, new_failed, new_completed
 
-    def _gen_consensus_outcome(self, to_process, cancelled, failed, completed):
+    def _gen_consensus_outcome(self, to_process, cancelled, failed, completed, cleanup_ready):
         return self._consensus_outcome(
-            to_process, cancelled, failed, completed, self._gen_allgather, self._gen_need_sync
+            to_process,
+            cancelled,
+            failed,
+            completed,
+            cleanup_ready,
+            self._gen_allgather,
+            self._gen_need_sync,
         )
 
-    def _ctx_consensus_outcome(self, to_process, cancelled, failed, completed, timed_out):
+    def _ctx_consensus_outcome(
+        self, to_process, cancelled, failed, completed, timed_out, cleanup_ready
+    ):
         # TP first, then PP.  timed_out is local-only (back-off signal).
         c, f, d = self._consensus_outcome(
             to_process,
             cancelled,
             failed,
             completed,
+            cleanup_ready,
             self._dist.tp_allgather,
             self._ctx_need_tp_sync,
         )
         if self._ctx_need_pp_sync:
             pp_allgather: Callable = getattr(self._dist, "pp_allgather")
-            c, f, d = self._consensus_outcome(to_process, c, f, d, pp_allgather, True)
+            # A TP group appears ready to the PP stage only after the first
+            # consensus admitted one terminal outcome for that request.
+            c, f, d = self._consensus_outcome(
+                to_process,
+                c,
+                f,
+                d,
+                c + f + d,
+                pp_allgather,
+                True,
+            )
         return c, f, d, timed_out
 
     def _collect_done(self, sessions: dict, reqs: dict):
@@ -429,12 +587,29 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 to_process.append(rid)
         return to_process
 
-    def _close_failed_sessions(self, sessions: dict, reqs: dict, failed: list):
-        for rid in failed:
-            reqs[rid].state = LlmRequestState.DISAGG_TRANS_ERROR
-            sessions[rid].close()
-            del reqs[rid]
-            del sessions[rid]
+    def _close_failed_sessions(
+        self,
+        sessions: dict,
+        reqs: dict,
+        failed: list,
+        expected_sessions: dict,
+        expected_reqs: dict,
+    ) -> list:
+        """Retire only the exact failed owners observed by one status poll."""
+        retired = []
+        with self._get_session_admission_lock():
+            for rid in failed:
+                session = expected_sessions.get(rid)
+                req = expected_reqs.get(rid)
+                if sessions.get(rid) is not session or reqs.get(rid) is not req:
+                    continue
+                session.close()
+                if sessions.get(rid) is session and reqs.get(rid) is req:
+                    req.state = LlmRequestState.DISAGG_TRANS_ERROR
+                    reqs.pop(rid, None)
+                    sessions.pop(rid, None)
+                    retired.append(rid)
+        return retired
 
     def _apply_aux(self, session, req: LlmRequest):
         """Unpack aux tokens from session into request's context_phase_params."""
@@ -481,97 +656,232 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
 
     @nvtx_range("KvCacheTransceiverV2.respond_and_send_async")
     def respond_and_send_async(self, req: LlmRequest):
-        self._ever_had_send_session = True
-        session = self._get_or_create_send_session(req)
-        req.state = LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
-        session.send(self._create_kv_slice(req))
-        self._finalize_send(req, session)
+        with self._get_session_admission_lock():
+            if getattr(self, "_shutdown_started", False):
+                raise RuntimeError("KV cache transceiver is shutting down")
+            rid = get_unique_rid(req)
+            assert rid is not None
+            existing_owner = self._send_reqs.get(rid)
+            if existing_owner is not None and existing_owner is not req:
+                raise RuntimeError(f"send request {rid} already has a different live source owner")
+            owner_newly_enrolled = existing_owner is None
+            self._ever_had_send_session = True
+            # Enroll the source owner before a worker can launch gather/NIXL.
+            self._send_reqs[rid] = req
+            session = None
+            try:
+                session = self._get_or_create_send_session(req)
+                req.state = LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
+                session.send(self._create_kv_slice(req))
+                self._finalize_send(req, session)
+            except Exception:
+                if session is None:
+                    if owner_newly_enrolled:
+                        self._send_reqs.pop(rid, None)
+                else:
+                    try:
+                        session.cancel()
+                        if not session.has_transferring_tasks():
+                            session.close()
+                            self._send_sessions.pop(rid, None)
+                            self._send_reqs.pop(rid, None)
+                    except Exception as cleanup_error:
+                        logger.warning(
+                            f"respond_and_send_async: retaining rid={rid} after "
+                            f"exception-path cleanup could not prove drain: {cleanup_error}"
+                        )
+                raise
 
     @nvtx_range("KvCacheTransceiverV2.request_and_receive_sync")
     def request_and_receive_sync(self, req: LlmRequest):
+        admission_lock = self._get_session_admission_lock()
+        with admission_lock:
+            if getattr(self, "_shutdown_started", False):
+                raise RuntimeError("KV cache transceiver is shutting down")
+            admitted = self._request_and_receive_sync_admitted(req)
+
+        if admitted is None:
+            return
+        session, kv_slice = admitted
         rid = get_unique_rid(req)
+        assert rid is not None
+
+        try:
+            result = session.wait_complete(blocking=True)
+        except Exception:
+            with admission_lock:
+                if self._recv_sessions.get(rid) is session and self._recv_reqs.get(rid) is req:
+                    req.state = LlmRequestState.DISAGG_TRANS_ERROR
+                    session.cancel()
+                    if not session.has_transferring_tasks():
+                        session.close()
+                        self._recv_sessions.pop(rid, None)
+                        self._recv_reqs.pop(rid, None)
+            raise
+
+        # Cancellation and shutdown use the same gate. They may have retired
+        # this session while wait_complete() was blocked, so only the exact
+        # enrolled owner may consume AUX data or remove the map entries.
+        with admission_lock:
+            owns_session = (
+                self._recv_sessions.get(rid) is session and self._recv_reqs.get(rid) is req
+            )
+            if not owns_session:
+                if result != WaitResult.COMPLETED or session.status == SessionStatus.CANCELLED:
+                    req.state = LlmRequestState.DISAGG_TRANS_ERROR
+                return
+            try:
+                if result == WaitResult.COMPLETED:
+                    # KV-transfer timing setters deferred to #15871 (clock-source consistency);
+                    # size only.
+                    req.set_kv_cache_size(
+                        self._slice_num_bytes(kv_slice) * self._kv_size_rank_factor
+                    )
+                    if self._need_aux_transfer(req):
+                        self._apply_aux(session, req)
+                    self._assert_disagg_history_declared(req)
+                    req.state = LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
+                else:
+                    req.state = LlmRequestState.DISAGG_TRANS_ERROR
+            except Exception:
+                req.state = LlmRequestState.DISAGG_TRANS_ERROR
+                raise
+            finally:
+                session.close()
+                if self._recv_sessions.get(rid) is session and self._recv_reqs.get(rid) is req:
+                    self._recv_sessions.pop(rid, None)
+                    self._recv_reqs.pop(rid, None)
+
+    def _request_and_receive_sync_admitted(self, req: LlmRequest):
+        rid = get_unique_rid(req)
+        assert rid is not None
         if rid in self._recv_sessions:
+            if self._recv_reqs.get(rid) is not req:
+                raise RuntimeError(
+                    f"receive request {rid} already has a different live destination owner"
+                )
             logger.warning(
                 f"request_and_receive_sync: rid={rid} already has a recv session, skipping"
             )
             return
         req.state = LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
+        self._recv_reqs[rid] = req
         session = None
         try:
             session = self._transfer_worker.create_rx_session(req)
             self._recv_sessions[rid] = session
-            self._recv_reqs[rid] = req
             kv_slice = self._create_kv_slice(req)
             session.receive(kv_slice)
-            result = session.wait_complete(blocking=True)
-
-            if result == WaitResult.COMPLETED:
-                # KV-transfer timing setters deferred to #15871 (clock-source consistency); size only.
-                req.set_kv_cache_size(self._slice_num_bytes(kv_slice) * self._kv_size_rank_factor)
-                if self._need_aux_transfer(req):
-                    self._apply_aux(session, req)
-                self._assert_disagg_history_declared(req)
-                req.state = LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
-            else:
-                req.state = LlmRequestState.DISAGG_TRANS_ERROR
+            return session, kv_slice
         except Exception:
             req.state = LlmRequestState.DISAGG_TRANS_ERROR
+            if session is None:
+                if self._recv_reqs.get(rid) is req:
+                    self._recv_reqs.pop(rid, None)
+            else:
+                session.cancel()
+                if not session.has_transferring_tasks():
+                    session.close()
+                    if self._recv_sessions.get(rid) is session:
+                        self._recv_sessions.pop(rid, None)
+                    if self._recv_reqs.get(rid) is req:
+                        self._recv_reqs.pop(rid, None)
             raise
-        finally:
-            if session is not None:
-                session.close()
-            self._recv_sessions.pop(rid, None)
-            self._recv_reqs.pop(rid, None)
 
     @nvtx_range("KvCacheTransceiverV2.request_and_receive_async")
     def request_and_receive_async(self, req: LlmRequest):
-        self._ever_had_recv_session = True
-        rid = get_unique_rid(req)
-        if rid in self._recv_sessions:
-            logger.warning(
-                f"request_and_receive_async: rid={rid} already has a recv session, skipping"
-            )
-            return
-        req.state = LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
-        session = self._transfer_worker.create_rx_session(req)
-        self._recv_sessions[rid] = session
-        kv_slice = self._create_kv_slice(req)
-        req.py_kv_cache_xfer_bytes = self._slice_num_bytes(kv_slice) * self._kv_size_rank_factor
-        session.receive(kv_slice)
-        self._recv_reqs[rid] = req
+        with self._get_session_admission_lock():
+            if getattr(self, "_shutdown_started", False):
+                raise RuntimeError("KV cache transceiver is shutting down")
+            self._ever_had_recv_session = True
+            rid = get_unique_rid(req)
+            assert rid is not None
+            if rid in self._recv_sessions:
+                if self._recv_reqs.get(rid) is not req:
+                    raise RuntimeError(
+                        f"receive request {rid} already has a different live destination owner"
+                    )
+                logger.warning(
+                    f"request_and_receive_async: rid={rid} already has a recv session, skipping"
+                )
+                return
+            req.state = LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
+            # Enroll the request owner before session construction can allocate an
+            # AUX slot and before receive() can publish KV/AUX target addresses.
+            # If either step raises, keep every owner enrolled so cleanup continues
+            # through the normal physical-drain gate rather than dropping the only
+            # Python-level owner during exception unwinding.
+            self._recv_reqs[rid] = req
+            session = None
+            try:
+                session = self._transfer_worker.create_rx_session(req)
+                self._recv_sessions[rid] = session
+                kv_slice = self._create_kv_slice(req)
+                req.py_kv_cache_xfer_bytes = (
+                    self._slice_num_bytes(kv_slice) * self._kv_size_rank_factor
+                )
+                session.receive(kv_slice)
+            except Exception:
+                if session is None:
+                    # Constructor rollback owns any pre-publication allocation.
+                    self._recv_reqs.pop(rid, None)
+                else:
+                    try:
+                        session.cancel()
+                        drained = not session.has_transferring_tasks()
+                        if drained:
+                            session.close()
+                            self._recv_sessions.pop(rid, None)
+                            self._recv_reqs.pop(rid, None)
+                    except Exception as cleanup_error:
+                        logger.warning(
+                            f"request_and_receive_async: retaining rid={rid} after "
+                            f"exception-path cleanup could not prove drain: {cleanup_error}"
+                        )
+                raise
 
     def check_context_transfer_status(
-        self, at_least_request_num: Optional[int], mark_complete: bool = False
+        self,
+        at_least_request_num: Optional[int],
+        mark_complete: bool = False,
     ):
-        # A worker that never sends KV has nothing to reconcile here, so skip the consensus. Safe
-        # because the flag flips together on every rank and never resets, so they all skip in step;
-        # gating on the live session dict instead would not be, since a cancel clears it per-rank.
-        # Keep the original sweep (only when tp/pp sync is on) so nothing is leaked.
-        if not self._ever_had_send_session:
-            if self._ctx_need_tp_sync or self._ctx_need_pp_sync:
-                self._transfer_worker.sweep_stale_req_infos()
-            return [], []
+        # This is also the native sender's periodic control-result progress
+        # hook. Run it before the idle fast path so cancel-before-session
+        # failures are retried even when no TxSession is ever created.
+        with self._get_session_admission_lock():
+            if getattr(self, "_shutdown_started", False):
+                return [], []
+            self._transfer_worker.sweep_stale_req_infos()
+            if not self._ever_had_send_session:
+                return [], []
+            send_sessions = dict(self._send_sessions)
+            send_reqs = {rid: self._send_reqs[rid] for rid in send_sessions}
         block_all = at_least_request_num is None
         wait_num = at_least_request_num if not block_all else 0
 
-        local_completed, local_failed = self._collect_done(self._send_sessions, self._send_reqs)
+        local_completed, local_failed = self._collect_done(send_sessions, send_reqs)
         to_process = self._build_to_process(
-            self._send_sessions,
+            send_sessions,
             self._ctx_consensus(local_completed + local_failed),
             wait_num,
             block_all,
         )
 
-        completed, timed_out, failed, cancelled = [], [], [], []
+        completed, timed_out, failed, cancelled, cleanup_ready = [], [], [], [], []
         for rid in to_process:
-            session = self._send_sessions[rid]
+            session = send_sessions[rid]
             result = session.wait_complete(blocking=block_all)
+            if result is None:
+                # Logical cancellation can precede source gather/NIXL drain.
+                # Keep the source owner until wait_complete reports a terminal
+                # physical state.
+                continue
             if session.status == SessionStatus.CANCELLED:
                 cancelled.append(rid)
+                cleanup_ready.append(rid)
             elif result == WaitResult.COMPLETED:
                 completed.append(rid)
-            elif result is None:
-                continue
+                cleanup_ready.append(rid)
             elif result == WaitResult.TIMEOUT:
                 logger.warning(
                     f"TxSession rid={session.disagg_request_id} timed out after {self._sender_future_timeout_ms}ms"
@@ -580,52 +890,81 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             else:
                 logger.warning(f"TxSession rid={session.disagg_request_id} failed")
                 failed.append(rid)
+                cleanup_ready.append(rid)
 
         # All ranks must agree on per-rid outcome to avoid req.state divergence.
         cancelled, failed, completed, timed_out = self._ctx_consensus_outcome(
-            to_process, cancelled, failed, completed, timed_out
+            to_process,
+            cancelled,
+            failed,
+            completed,
+            timed_out,
+            cleanup_ready,
         )
 
-        for rid in cancelled:
-            self._send_sessions[rid].close()
-            del self._send_reqs[rid]
-            del self._send_sessions[rid]
+        retired_completed = []
+        with self._get_session_admission_lock():
+            for rid in completed:
+                session = send_sessions.get(rid)
+                req = send_reqs.get(rid)
+                if (
+                    self._send_sessions.get(rid) is not session
+                    or self._send_reqs.get(rid) is not req
+                ):
+                    continue
+                session.close()
+                if mark_complete:
+                    req.state = LlmRequestState.DISAGG_CONTEXT_COMPLETE
+                if self._send_sessions.get(rid) is session and self._send_reqs.get(rid) is req:
+                    self._send_reqs.pop(rid, None)
+                    self._send_sessions.pop(rid, None)
+                    retired_completed.append(rid)
+        # A remotely cancelled context transfer is terminal for its local
+        # AsyncTransferManager entry. Report it as an error so PyExecutor can
+        # unpin the request instead of silently losing the transceiver session.
+        terminal_failed = failed + cancelled
+        retired_failed = self._close_failed_sessions(
+            self._send_sessions,
+            self._send_reqs,
+            terminal_failed,
+            send_sessions,
+            send_reqs,
+        )
 
-        for rid in completed:
-            if mark_complete:
-                self._send_reqs[rid].state = LlmRequestState.DISAGG_CONTEXT_COMPLETE
-            self._send_sessions[rid].close()
-            del self._send_reqs[rid]
-            del self._send_sessions[rid]
-        self._close_failed_sessions(self._send_sessions, self._send_reqs, failed)
-
-        # Sweep orphaned RecvReqInfo entries from ADP broadcast on non-assigned
-        # DP ranks (entries that will never have a TxSession created for them).
-        self._transfer_worker.sweep_stale_req_infos()
-
-        return completed, failed
+        return retired_completed, retired_failed
 
     def check_gen_transfer_status(self, at_least_request_num: Optional[int]):
-        if not self._ever_had_recv_session and not self._gen_need_sync:
-            return [], [], []
+        with self._get_session_admission_lock():
+            if getattr(self, "_shutdown_started", False):
+                return [], [], []
+            if not self._ever_had_recv_session and not self._gen_need_sync:
+                return [], [], []
+            recv_sessions = dict(self._recv_sessions)
+            recv_reqs = {rid: self._recv_reqs[rid] for rid in recv_sessions}
         block_all = at_least_request_num is None
         wait_num = at_least_request_num if not block_all else 0
         need_progress = wait_num > 0
         if need_progress:
-            self._poll_gen_sessions_for_poll_interval(wait_num)
+            self._poll_gen_sessions_for_poll_interval(wait_num, recv_sessions, recv_reqs)
 
-        local_completed, local_failed = self._collect_done(self._recv_sessions, self._recv_reqs)
+        local_completed, local_failed = self._collect_done(recv_sessions, recv_reqs)
         to_process = self._build_to_process(
-            self._recv_sessions,
+            recv_sessions,
             self._gen_consensus(local_completed + local_failed),
             0 if need_progress else wait_num,
             block_all,
         )
 
-        completed, failed, cancelled = [], [], []
+        completed, failed, cancelled, cleanup_ready = [], [], [], []
         for rid in to_process:
-            session = self._recv_sessions[rid]
+            session = recv_sessions[rid]
             result = session.wait_complete(blocking=block_all)
+            if result not in (WaitResult.COMPLETED, WaitResult.FAILED):
+                # Logical cancellation/failure may precede physical drain.
+                # Neither a non-blocking miss nor a timeout proves that request
+                # cleanup can no longer race a transfer accessor.
+                continue
+            cleanup_ready.append(rid)
             if session.status == SessionStatus.CANCELLED:
                 # Session cancelled — either by local cancel_request() (user
                 # cancel) or by a remote CANCEL_SESSION message (e.g. CTX
@@ -636,57 +975,82 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 completed.append(rid)
             elif result == WaitResult.FAILED:
                 failed.append(rid)
-            # else: None — KV done but aux still in flight; re-poll next cycle
 
         # All ranks must agree on per-rid outcome to avoid req.state divergence.
         cancelled, failed, completed = self._gen_consensus_outcome(
-            to_process, cancelled, failed, completed
+            to_process, cancelled, failed, completed, cleanup_ready
         )
 
+        retired_completed = []
         cancelled_reqs = []
-        for rid in cancelled:
-            cancelled_reqs.append(self._recv_reqs[rid])
-            self._recv_sessions[rid].close()
-            del self._recv_reqs[rid]
-            del self._recv_sessions[rid]
+        with self._get_session_admission_lock():
+            for rid in cancelled:
+                session = recv_sessions.get(rid)
+                req = recv_reqs.get(rid)
+                if (
+                    self._recv_sessions.get(rid) is not session
+                    or self._recv_reqs.get(rid) is not req
+                ):
+                    continue
+                session.close()
+                if self._recv_sessions.get(rid) is session and self._recv_reqs.get(rid) is req:
+                    self._recv_reqs.pop(rid, None)
+                    self._recv_sessions.pop(rid, None)
+                    cancelled_reqs.append(req)
 
-        for rid in completed:
-            session = self._recv_sessions[rid]
-            req = self._recv_reqs[rid]
-            # transfer_end already stamped at completion detection above.
-            req.set_kv_cache_size(getattr(req, "py_kv_cache_xfer_bytes", 0))
-            if self._need_aux_transfer(req):
-                self._apply_aux(session, req)
-            self._assert_disagg_history_declared(req)
-            req.state = LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
-            session.close()
-            del self._recv_reqs[rid]
-            del self._recv_sessions[rid]
-        if failed:
+            for rid in completed:
+                session = recv_sessions.get(rid)
+                req = recv_reqs.get(rid)
+                if (
+                    self._recv_sessions.get(rid) is not session
+                    or self._recv_reqs.get(rid) is not req
+                ):
+                    continue
+                # transfer_end already stamped at completion detection above.
+                req.set_kv_cache_size(getattr(req, "py_kv_cache_xfer_bytes", 0))
+                if self._need_aux_transfer(req):
+                    self._apply_aux(session, req)
+                self._assert_disagg_history_declared(req)
+                session.close()
+                req.state = LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
+                if self._recv_sessions.get(rid) is session and self._recv_reqs.get(rid) is req:
+                    self._recv_reqs.pop(rid, None)
+                    self._recv_sessions.pop(rid, None)
+                    retired_completed.append(rid)
+        retired_failed = self._close_failed_sessions(
+            self._recv_sessions,
+            self._recv_reqs,
+            failed,
+            recv_sessions,
+            recv_reqs,
+        )
+        if retired_failed:
             logger.warning(
                 f"Disagg gen transfer FAILED rank={self._dist.rank} "
-                f"rids={failed} gen_need_sync={self._gen_need_sync}"
+                f"rids={retired_failed} gen_need_sync={self._gen_need_sync}"
             )
-        self._close_failed_sessions(self._recv_sessions, self._recv_reqs, failed)
 
-        return completed, failed, cancelled_reqs
+        return retired_completed, retired_failed, cancelled_reqs
 
-    def _poll_gen_sessions_for_poll_interval(self, wait_num: int) -> None:
+    def _poll_gen_sessions_for_poll_interval(
+        self, wait_num: int, sessions: dict, reqs: dict
+    ) -> None:
         poll_interval_s = (self.kv_transfer_poll_interval_ms or 0) / 1000.0
         deadline = time.monotonic() + poll_interval_s
         while True:
-            completed, failed = self._collect_done(self._recv_sessions, self._recv_reqs)
+            completed, failed = self._collect_done(sessions, reqs)
             if len(completed) + len(failed) >= wait_num:
                 return
             remaining_s = deadline - time.monotonic()
             if remaining_s <= 0:
                 return
-            for session in self._recv_sessions.values():
+            for session in sessions.values():
                 session.wait_complete(blocking=False)
             time.sleep(min(0.001, remaining_s))
 
     def check_gen_transfer_complete(self):
-        return len(self._recv_sessions) == 0
+        with self._get_session_admission_lock():
+            return len(self._recv_sessions) == 0
 
     def _assert_disagg_history_declared(self, req: LlmRequest) -> None:
         """Verify the V2 scheduler pre-declared prompt_len as history.
@@ -729,33 +1093,39 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         retry next iteration. Returns True when safe to free KV memory.
         """
         rid = get_unique_rid(req)
+        assert rid is not None
+        with self._get_session_admission_lock():
+            # A stale cancellation must not remove a replacement request that
+            # happens to reuse the same integer request ID.
+            if self._wait_reqs.get(rid) is req:
+                self._wait_reqs.pop(rid, None)
 
-        # Not yet started (generation-first wait queue).
-        self._wait_reqs.pop(rid, None)
+            cleanup_pending = False
+            for direction, sessions, reqs in (
+                ("send", self._send_sessions, self._send_reqs),
+                ("receive", self._recv_sessions, self._recv_reqs),
+            ):
+                session = sessions.get(rid)
+                if session is None or reqs.get(rid) is not req:
+                    continue
+                try:
+                    session.cancel()
+                    if session.has_transferring_tasks():
+                        cleanup_pending = True
+                        continue
+                    session.close()
+                except Exception as error:
+                    cleanup_pending = True
+                    logger.error(
+                        f"Failed to cancel {direction} KV transfer for request {rid}; "
+                        f"retaining its owner for retry: {error}"
+                    )
+                    continue
+                if sessions.get(rid) is session and reqs.get(rid) is req:
+                    reqs.pop(rid, None)
+                    sessions.pop(rid, None)
 
-        has_transferring = False
-
-        if rid in self._send_sessions:
-            self._send_sessions[rid].cancel()
-            if self._send_sessions[rid].has_transferring_tasks():
-                has_transferring = True
-            else:
-                self._send_sessions[rid].close()
-                del self._send_reqs[rid]
-                del self._send_sessions[rid]
-
-        if rid in self._recv_sessions:
-            self._recv_sessions[rid].cancel()
-            if self._recv_sessions[rid].has_transferring_tasks():
-                has_transferring = True
-            else:
-                self._recv_sessions[rid].close()
-                del self._recv_reqs[rid]
-                del self._recv_sessions[rid]
-
-        if has_transferring:
-            return False
-        return True
+            return not cleanup_pending
 
     def get_disaggregated_params(self) -> Dict[str, Any]:
         # Keep this aligned with fields populated in respond_and_send_async().
@@ -779,29 +1149,63 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
     def prepare_context_requests(self, requests: List[LlmRequest]):
         # Place new generation-first context requests into wait state, then
         # use allgather consensus to promote ready requests to CONTEXT_INIT.
-        for req in requests:
-            rid = get_unique_rid(req)
-            if rid not in self._send_sessions:
+        with self._get_session_admission_lock():
+            if getattr(self, "_shutdown_started", False):
+                raise RuntimeError("KV cache transceiver is shutting down")
+            pending_admissions = {}
+            planned_wait_owners = dict(self._wait_reqs)
+            for req in requests:
+                rid = get_unique_rid(req)
+                assert rid is not None
+                send_owner = self._send_reqs.get(rid)
+                if rid in self._send_sessions:
+                    if send_owner is not req:
+                        raise RuntimeError(
+                            f"send request {rid} already has a different live source owner"
+                        )
+                    continue
+                if send_owner is not None and send_owner is not req:
+                    raise RuntimeError(
+                        f"send request {rid} already has a different live source owner"
+                    )
+                wait_owner = planned_wait_owners.get(rid)
+                if wait_owner is not None and wait_owner is not req:
+                    raise RuntimeError(
+                        f"waiting request {rid} already has a different live source owner"
+                    )
+                planned_wait_owners[rid] = req
+                pending_admissions[rid] = req
+
+            # Validate the full batch before publishing any owner. A collision
+            # must not leave an earlier request stranded in the wait ledger.
+            for rid, req in pending_admissions.items():
                 self._wait_reqs[rid] = req
                 req.state = LlmRequestState.DISAGG_CONTEXT_WAIT_SCHEDULER
 
-        # Nothing waiting on any rank, so skip the consensus. The waiting set is the same on every
-        # rank, so they all skip together.
-        if not self._wait_reqs:
-            return
+            if not self._wait_reqs:
+                return
 
-        # Check which waiting requests have peer info locally, then allgather
-        # consensus so all TP/PP ranks agree before promoting.
+            # Check which waiting requests have peer info while the worker is
+            # protected from concurrent shutdown. Promotion happens after the
+            # collective and therefore revalidates each exact owner below.
+            ready_owners = {
+                rid: owner
+                for rid, owner in self._wait_reqs.items()
+                if self._transfer_worker.has_all_peer_req_infos_for_send(rid)
+            }
+
         # Without consensus, background peer info arriving at different times on
-        # different ranks causes scheduling mismatches → hang.
-        local_ready = [
-            rid
-            for rid in self._wait_reqs
-            if self._transfer_worker.has_all_peer_req_infos_for_send(rid)
-        ]
-        for rid in self._ctx_consensus(local_ready):
-            self._wait_reqs[rid].state = LlmRequestState.CONTEXT_INIT
-            del self._wait_reqs[rid]
+        # different ranks causes scheduling mismatches → hang. Do not hold the
+        # local admission lock across the distributed collective.
+        ready_ids = self._ctx_consensus(list(ready_owners))
+        with self._get_session_admission_lock():
+            if getattr(self, "_shutdown_started", False):
+                return
+            for rid in ready_ids:
+                owner = ready_owners.get(rid)
+                if owner is not None and self._wait_reqs.get(rid) is owner:
+                    owner.state = LlmRequestState.CONTEXT_INIT
+                    self._wait_reqs.pop(rid, None)
 
     def _check_compatible(self):
         if self._mapping.cp_size != 1:

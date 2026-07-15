@@ -379,6 +379,37 @@ class BatchStatePP(BatchState):
     microbatch_id: int = -1
 
 
+_PYTHON_NATIVE_TRANSCEIVER_OWNER = "python_native_transceiver"
+
+
+@dataclasses.dataclass
+class _RequestCancellationProgress:
+    """Exact-request progress through user-cancellation ownership phases."""
+
+    request: LlmRequest
+    cancel_id: int
+    transport_drained: bool = False
+    transceiver_release_resolved: bool = False
+    all_transfers_complete: Optional[bool] = None
+    logical_cancelled: bool = False
+    decoding_iter_updated: bool = False
+    terminate_on_completion: bool = False
+    termination_handoff_complete: bool = False
+
+
+@dataclasses.dataclass
+class _ConnectorCompletionProgress:
+    """Retry state after a connector consumes its sole completion notice."""
+
+    request: LlmRequest
+    was_active: bool
+    response_prepared: bool = False
+    owner_released: bool = False
+    all_transfers_complete: Optional[bool] = None
+    active_request_removed: bool = False
+    request_terminated: bool = False
+
+
 class AsyncTransferManager:
     """
     Handle asynchronous transfer of KV cache after a request has completed.
@@ -393,20 +424,76 @@ class AsyncTransferManager:
 
     class RequestTransferMetadata:
 
-        def __init__(self, block_id: Optional[int]):
-            self.block_id = block_id
+        def __init__(self, pinned_block_ids: Optional[List[int]]):
+            self.pinned_block_ids = pinned_block_ids
             self.counter = 0
+            # Named owners make one provider's completion independently
+            # retireable without guessing which anonymous counter belongs to
+            # another provider. Existing callers remain anonymous.
+            self.owners: set[str] = set()
 
-        def start_transfer(self):
+        def start_transfer(self, owner: Optional[str] = None):
+            if owner is not None:
+                if owner in self.owners:
+                    raise RuntimeError(
+                        f"transfer owner {owner!r} is already active")
+                self.owners.add(owner)
             self.counter += 1
 
-        def end_transfer(self) -> bool:
+        def will_end_all_transfers(self, owner: Optional[str] = None) -> bool:
+            """Validate one owner retirement without mutating the ledger."""
+            if owner is not None:
+                if owner not in self.owners:
+                    raise RuntimeError(
+                        f"transfer owner {owner!r} is not active")
+            elif self.counter <= len(self.owners):
+                raise RuntimeError("no anonymous transfer owner is active")
+            return self.counter == 1
+
+        def end_transfer(self, owner: Optional[str] = None) -> bool:
             """
             Returns:
                 bool: True if there are no more transfers for this request
             """
+            self.will_end_all_transfers(owner)
+            if owner is not None:
+                self.owners.remove(owner)
             self.counter -= 1
             return self.counter == 0
+
+        def has_owner(self, owner: str) -> bool:
+            return owner in self.owners
+
+    @dataclasses.dataclass
+    class TransferAdmissionProgress:
+        """Durable first-owner admission before any external mutation."""
+
+        request: LlmRequest
+        owner: Optional[str]
+        manager_plan: Tuple[ResourceManagerType, ...]
+        completed_managers: set[ResourceManagerType] = dataclasses.field(
+            default_factory=set)
+        manager_in_doubt: Optional[ResourceManagerType] = None
+        state_updated: bool = False
+        state_update_in_doubt: bool = False
+        pin_started: bool = False
+        pin_complete: bool = False
+        pin_in_doubt: bool = False
+        pinned_block_ids: Optional[List[int]] = None
+        metadata: Optional[
+            "AsyncTransferManager.RequestTransferMetadata"] = None
+        owner_enrolled: bool = False
+        metadata_published: bool = False
+        request_published: bool = False
+
+        def in_doubt_reason(self) -> Optional[str]:
+            if self.manager_in_doubt is not None:
+                return f"resource manager {self.manager_in_doubt.value}"
+            if self.state_update_in_doubt:
+                return "request state update"
+            if self.pin_in_doubt:
+                return "KV block pin"
+            return None
 
     def __init__(self,
                  resource_manager: "ResourceManager",
@@ -424,10 +511,90 @@ class AsyncTransferManager:
         self._request_transfer_metadata: Dict[
             int, self.RequestTransferMetadata] = dict()
 
+        # Published before first-owner setup mutates any external manager,
+        # request state, or KV pin. An exception therefore retains the exact
+        # request and the last potentially ambiguous phase for fail-closed
+        # response handling and shutdown veto.
+        self._transfer_admission_progress: Dict[
+            int, self.TransferAdmissionProgress] = dict()
+        self._admission_closed = False
+
     def requests_in_transfer(self) -> Dict[int, LlmRequest]:
         return self._requests_in_transfer
 
-    def start_transfer(self, request: LlmRequest):
+    def requests_in_admission(self) -> Dict[int, LlmRequest]:
+        return {
+            req_id: progress.request
+            for req_id, progress in self._transfer_admission_progress.items()
+        }
+
+    def has_pending_admission(self, request: LlmRequest) -> bool:
+        progress = self._transfer_admission_progress.get(request.py_request_id)
+        return progress is not None and progress.request is request
+
+    def has_in_doubt_admissions(self) -> bool:
+        return any(progress.in_doubt_reason() is not None
+                   for progress in self._transfer_admission_progress.values())
+
+    def begin_shutdown(self) -> None:
+        """Close first/subsequent-owner admission before teardown checks."""
+        self._admission_closed = True
+
+    def _resume_first_transfer_admission(
+            self, progress: TransferAdmissionProgress) -> None:
+        request = progress.request
+        req_id = request.py_request_id
+        in_doubt_reason = progress.in_doubt_reason()
+        if in_doubt_reason is not None:
+            raise RuntimeError(
+                f"transfer admission for request {req_id} is in doubt after "
+                f"{in_doubt_reason}; refusing to replay the phase")
+
+        for resource_mgr_type in progress.manager_plan:
+            if resource_mgr_type in progress.completed_managers:
+                continue
+            progress.manager_in_doubt = resource_mgr_type
+            self.resource_manager.release_resource_for_transfer(
+                request, resource_mgr_type)
+            progress.completed_managers.add(resource_mgr_type)
+            progress.manager_in_doubt = None
+
+        if not progress.state_updated:
+            try:
+                request.state = LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
+            except Exception:
+                progress.state_update_in_doubt = True
+                raise
+            progress.state_updated = True
+
+        if not progress.pin_complete:
+            if self.should_store_blocks:
+                progress.pin_started = True
+                try:
+                    progress.pinned_block_ids = (
+                        self.kv_cache_manager.store_blocks_for_reuse(
+                            request, True))
+                except Exception:
+                    progress.pin_in_doubt = True
+                    raise
+            progress.pin_complete = True
+
+        if progress.metadata is None:
+            progress.metadata = self.RequestTransferMetadata(
+                progress.pinned_block_ids)
+        if not progress.owner_enrolled:
+            progress.metadata.start_transfer(progress.owner)
+            progress.owner_enrolled = True
+        if not progress.metadata_published:
+            self._request_transfer_metadata[req_id] = progress.metadata
+            progress.metadata_published = True
+        if not progress.request_published:
+            self._requests_in_transfer[req_id] = request
+            progress.request_published = True
+        if self._transfer_admission_progress.get(req_id) is progress:
+            self._transfer_admission_progress.pop(req_id)
+
+    def start_transfer(self, request: LlmRequest, owner: Optional[str] = None):
         """
         Called when a Cache transceiver or connector transfer is started.
         1. Increment the counter for the request.
@@ -437,30 +604,53 @@ class AsyncTransferManager:
 
         req_id = request.py_request_id
 
-        if req_id not in self._requests_in_transfer:
-            for resource_mgr_type in (
-                    ResourceManagerType.SEQ_SLOT_MANAGER,
-                    ResourceManagerType.SPEC_RESOURCE_MANAGER):
-                if resource_mgr_type in self.resource_manager.resource_managers and self.resource_manager.resource_managers[
-                        resource_mgr_type] is not None:
-                    self.resource_manager.resource_managers[
-                        resource_mgr_type].free_resources(request)
+        if self._admission_closed:
+            raise RuntimeError(
+                f"transfer admission is closed for request {req_id}")
 
-            request.state = LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
+        # Prefer the durable admission record over partially published commit
+        # maps so retry can finish metadata/request publication without
+        # replaying manager release, state mutation, pinning, or owner enroll.
+        progress = self._transfer_admission_progress.get(req_id)
+        if progress is not None:
+            if progress.request is not request:
+                raise RuntimeError(
+                    f"request {req_id} already has a different transfer "
+                    "admission")
+            if progress.owner != owner:
+                raise RuntimeError(
+                    f"request {req_id} transfer admission belongs to owner "
+                    f"{progress.owner!r}, not {owner!r}")
+            self._resume_first_transfer_admission(progress)
+            return
 
-            if self.should_store_blocks:
-                block_id = self.kv_cache_manager.store_blocks_for_reuse(
-                    request, True)
-            else:
-                block_id = None
+        existing_request = self._requests_in_transfer.get(req_id)
+        if existing_request is not None and existing_request is not request:
+            raise RuntimeError(
+                f"request {req_id} already has a different transfer owner")
 
-            self._requests_in_transfer[req_id] = request
-            self._request_transfer_metadata[
-                req_id] = self.RequestTransferMetadata(block_id)
+        if existing_request is not None:
+            self._request_transfer_metadata[req_id].start_transfer(owner)
+            return
 
-        self._request_transfer_metadata[req_id].start_transfer()
+        manager_plan = tuple(
+            resource_mgr_type
+            for resource_mgr_type in (ResourceManagerType.SEQ_SLOT_MANAGER,
+                                      ResourceManagerType.SPEC_RESOURCE_MANAGER)
+            if self.resource_manager.resource_managers.get(
+                resource_mgr_type) is not None)
+        progress = self.TransferAdmissionProgress(
+            request=request,
+            owner=owner,
+            manager_plan=manager_plan,
+        )
+        self._transfer_admission_progress[req_id] = progress
 
-    def end_transfer(self, request: LlmRequest) -> bool:
+        self._resume_first_transfer_admission(progress)
+
+    def end_transfer(self,
+                     request: LlmRequest,
+                     owner: Optional[str] = None) -> bool:
         """
         Called after a send of KV cache is complete.
         1. Decrements counter for request.
@@ -469,22 +659,38 @@ class AsyncTransferManager:
         Returns:
             bool: True if the request should be terminated after call to end_transfer
         """
-        try:
-            transfer_metadata = self._request_transfer_metadata[
-                request.py_request_id]
-        except KeyError:
-            logger.warning(
-                f"Request {request.py_request_id} not found in transfer manager"
-            )
+        req_id = request.py_request_id
+        admission = self._transfer_admission_progress.get(req_id)
+        if admission is not None:
+            if admission.request is not request:
+                raise RuntimeError(
+                    f"request {req_id} has a different active transfer "
+                    "admission")
+            reason = admission.in_doubt_reason()
+            detail = f"; {reason} outcome is in doubt" if reason else ""
+            raise RuntimeError(
+                f"request {req_id} transfer admission is incomplete{detail}")
+        existing_request = self._requests_in_transfer.get(req_id)
+        if existing_request is None:
+            logger.warning(f"Request {req_id} not found in transfer manager")
             return False
+        if existing_request is not request:
+            raise RuntimeError(
+                f"request {req_id} has a different active transfer owner")
 
-        if transfer_metadata.end_transfer():
-            self._requests_in_transfer.pop(request.py_request_id)
-            self._request_transfer_metadata.pop(request.py_request_id)
+        transfer_metadata = self._request_transfer_metadata[req_id]
+        final_transfer = transfer_metadata.will_end_all_transfers(owner)
 
-            if self.should_store_blocks:
-                self.kv_cache_manager.unpin_blocks_by_id(
-                    transfer_metadata.block_id)
+        # Keep the exact owner and request root enrolled until final unpin
+        # succeeds. A failed unpin is retryable without reconstructing which
+        # provider contribution or request allocation it belonged to.
+        if final_transfer and self.should_store_blocks:
+            self.kv_cache_manager.unpin_blocks_by_id(
+                transfer_metadata.pinned_block_ids)
+
+        if transfer_metadata.end_transfer(owner):
+            self._requests_in_transfer.pop(req_id)
+            self._request_transfer_metadata.pop(req_id)
 
             # We don't want to overwrite any error state.
             if request.state != LlmRequestState.DISAGG_TRANS_ERROR:
@@ -494,8 +700,30 @@ class AsyncTransferManager:
 
         return False
 
+    def has_transfer_owner(self, request: LlmRequest, owner: str) -> bool:
+        """Whether the exact request still has the named provider owner."""
+        if self._requests_in_transfer.get(request.py_request_id) is not request:
+            return False
+        transfer_metadata = self._request_transfer_metadata.get(
+            request.py_request_id)
+        return (transfer_metadata is not None
+                and transfer_metadata.has_owner(owner))
+
+    def has_any_transfer_owner(self, request: LlmRequest) -> bool:
+        """Whether the exact request still has any enrolled provider owner."""
+        return self._requests_in_transfer.get(request.py_request_id) is request
+
+    def requests_with_owner(self, owner: str) -> Dict[int, LlmRequest]:
+        """Snapshot requests whose transfer count includes ``owner``."""
+        return {
+            req_id: request
+            for req_id, request in self._requests_in_transfer.items()
+            if self._request_transfer_metadata[req_id].has_owner(owner)
+        }
+
     def has_any_inflight_requests(self) -> bool:
-        return len(self._requests_in_transfer) > 0
+        return bool(self._requests_in_transfer
+                    or self._transfer_admission_progress)
 
 
 class PyExecutor:
@@ -708,6 +936,35 @@ class PyExecutor:
         # per-rank-divergent gates, so their tp_allgather collectives are
         # lifted to _handle_kv_transfer_timeouts_synced / _flush_iter_stats_synced.
         self._pending_timed_out_requests: List[LlmRequest] = []
+        # Requests may become logically terminal while a transceiver still
+        # owns their memory. Keep a strong root until runtime cancellation or
+        # post-loop shutdown satisfies that implementation's drain contract.
+        self._deferred_transfer_terminations: Dict[int, LlmRequest] = {}
+        # PP=1 partial-reuse requests can be freed before their asynchronous
+        # transfer owner retires. Shutdown still retains those request objects
+        # for owner retirement, but must not free their resources a second time.
+        self._deferred_transfer_terminations_already_terminated: set[int] = set(
+        )
+        # Requests whose normal resource termination completed while any
+        # AsyncTransferManager provider still held a lease. This exact marker
+        # prevents the last provider from terminating the request twice.
+        self._terminated_transfer_requests: Dict[int, LlmRequest] = {}
+        # A request remains here after its ResourceManager release succeeds
+        # until all remaining PyExecutor bookkeeping also completes. This
+        # makes a retry resume after resource release instead of freeing the
+        # same exact request twice.
+        self._request_resource_termination_progress: Dict[int, LlmRequest] = {}
+        # A user-cancel attempt can drain its transport and then fail while
+        # releasing the transceiver owner. Retain the exact
+        # request and resume at the failed phase instead of relying on the
+        # request to remain in active_requests.
+        self._pending_request_cancellations: Dict[
+            int, _RequestCancellationProgress] = {}
+        # Connector completion notifications are one-shot. Keep phase-aware
+        # progress so unpin or request-termination failures can be retried
+        # without recreating a response or releasing the owner twice.
+        self._pending_connector_completions: Dict[
+            int, _ConnectorCompletionProgress] = {}
         self._pending_iter_stats_dict: Optional[Dict] = None
         # ADP dummy role for _pad_attention_dp_dummy_request. Default is gen;
         # updated from observed request types.
@@ -1075,43 +1332,94 @@ class PyExecutor:
 
             self.kv_connector_manager.wait_for_initialization()
 
-    def _end_transfer_and_maybe_terminate(self, request: LlmRequest):
+    def _release_transfer_owner(self,
+                                request: LlmRequest,
+                                transfer_owner: Optional[str] = None) -> bool:
+        """Release one transfer owner without changing a cancelled outcome."""
+        # AsyncTransferManager maps a final successful owner retirement to
+        # CONTEXT_COMPLETE. A connector may be the last sibling owner of a
+        # request that the user already cancelled; keep that terminal state
+        # stable across both successful and retryable owner release.
+        preserve_cancelled_state = (getattr(request,
+                                            "is_finished_due_to_cancellation",
+                                            False) is True)
+        original_state = request.state
+        if preserve_cancelled_state:
+            request.state = LlmRequestState.DISAGG_TRANS_ERROR
+        try:
+            if transfer_owner is None:
+                all_transfers_complete = (
+                    self.async_transfer_manager.end_transfer(request))
+            else:
+                all_transfers_complete = self.async_transfer_manager.end_transfer(
+                    request, owner=transfer_owner)
+        finally:
+            if preserve_cancelled_state:
+                request.state = original_state
+        return all_transfers_complete
+
+    def _prepare_transfer_completion_response(self,
+                                              request: LlmRequest) -> None:
+        """Create and buffer the response needed before owner retirement."""
+        response = request.create_response(False, self.dist.rank)
+        if response:
+            response.result.cached_tokens = request.cached_tokens
+            self._maybe_attach_ctx_usage(request, response)
+            # With ADP, _enqueue_responses does a tp_gather collective. Calling
+            # it from a completion callback would deadlock because only the
+            # owning DP rank reaches that callback.
+            self._pending_transfer_responses.append(
+                (request.py_request_id, response))
+
+    def _end_transfer_and_maybe_terminate(self,
+                                          request: LlmRequest,
+                                          transfer_owner: Optional[str] = None):
         transfer_failed = request.state == LlmRequestState.DISAGG_TRANS_ERROR
-        if self.kv_cache_transceiver and request in self.active_requests:
+        request_was_active = (self.kv_cache_transceiver
+                              and request in self.active_requests)
+        request_was_already_terminated = (
+            PyExecutor._was_transfer_request_terminated(self, request))
+        if request_was_active:
             if transfer_failed:
-                # End only the transfer that just became terminal. Keep the
-                # request active so the synchronized error path can emit an
-                # error response after every async transfer releases ownership.
-                self.async_transfer_manager.end_transfer(request)
+                # Keep the request active so the synchronized error path can
+                # emit its response after every sibling owner retires.
+                PyExecutor._release_transfer_owner(self, request,
+                                                   transfer_owner)
                 return
             # Fast-transfer: KV transfer completed in the same iteration
             # before _handle_responses could run. Create the response now
             # while state is still TRANS_IN_PROGRESS (required by C++
             # createResult). Then proceed with end_transfer + termination.
-            response = request.create_response(False, self.dist.rank)
-            if response:
-                response.result.cached_tokens = request.cached_tokens
-                self._maybe_attach_ctx_usage(request, response)
-                # Buffer the response instead of enqueueing immediately.
-                # With ADP, _enqueue_responses does a tp_gather collective.
-                # Calling it here would deadlock because only the owning DP
-                # rank reaches this point; the other DP rank never enters
-                # the matching collective.  The buffer is flushed later at
-                # _flush_pending_transfer_responses where all ranks
-                # participate.
-                self._pending_transfer_responses.append(
-                    (request.py_request_id, response))
-            if self.async_transfer_manager.end_transfer(request):
+            PyExecutor._prepare_transfer_completion_response(self, request)
+            if PyExecutor._release_transfer_owner(self, request,
+                                                  transfer_owner):
                 self.active_requests.remove(request)
-                self._terminate_request(request)
+                if not request_was_already_terminated:
+                    self._terminate_request(request)
+                if hasattr(self, "_terminated_transfer_requests"):
+                    PyExecutor._forget_terminated_transfer_request_if_unowned(
+                        self, request)
             return
-        if self.async_transfer_manager.end_transfer(request):
+        if PyExecutor._release_transfer_owner(self, request, transfer_owner):
             if transfer_failed:
+                if (request_was_already_terminated
+                        and hasattr(self, "_terminated_transfer_requests")):
+                    PyExecutor._forget_terminated_transfer_request_if_unowned(
+                        self, request)
                 return
-            # Skip if the PP=1 early path already terminated this request;
-            # under PP>1 that path is off, so terminate here on transfer-complete.
-            if not self.force_terminate_ctx_for_partial_reuse:
+            # The PP=1 partial-reuse path may have released request resources
+            # while the transfer lease remained live. The exact-request marker
+            # distinguishes that case from an inactive request which still
+            # needs its one final teardown.
+            legacy_pp1_already_terminated = (
+                not hasattr(self, "_terminated_transfer_requests") and getattr(
+                    self, "force_terminate_ctx_for_partial_reuse", False))
+            if (not request_was_already_terminated
+                    and not legacy_pp1_already_terminated):
                 self._terminate_request(request)
+            if hasattr(self, "_terminated_transfer_requests"):
+                PyExecutor._forget_terminated_transfer_request_if_unowned(
+                    self, request)
 
     def _flush_pending_transfer_responses(self):
         """Enqueue buffered transfer-completion responses.
@@ -1466,6 +1774,107 @@ class PyExecutor:
         # resource managers start freeing GPU-backed workspaces.
         if torch.cuda.is_available():
             torch.cuda.synchronize()
+        transfer_manager = getattr(self, "async_transfer_manager", None)
+        if transfer_manager is not None:
+            transfer_manager.begin_shutdown()
+        is_python_native_transceiver = (
+            self.kv_cache_transceiver is not None
+            and self._requires_physical_transfer_drain())
+        if is_python_native_transceiver:
+            # The executor loop can stop before its final status poll. Capture
+            # every still-enrolled Python-native owner before transport
+            # shutdown so a proven drain can retire that exact contribution.
+            # The default C++ transceiver keeps its legacy shutdown behavior
+            # and never enters this lifecycle-capable path.
+            defer_transceiver_owners = getattr(
+                self, "_defer_transceiver_owners_for_shutdown", None)
+            if defer_transceiver_owners is not None:
+                defer_transceiver_owners()
+            transceiver_shutdown_result = self.kv_cache_transceiver.shutdown()
+            if transceiver_shutdown_result is False:
+                raise RuntimeError(
+                    "KV cache transceiver still owns active transfer targets; "
+                    "refusing to shut down resource managers")
+            if transceiver_shutdown_result is not True:
+                raise RuntimeError(
+                    "Python-native KV cache transceiver did not prove physical "
+                    "drain; refusing to shut down resource managers")
+            # Native shutdown closes admission and proves physical drain. Re-run
+            # cancellation through the same safe-to-free gate before retiring
+            # request ownership.
+            drain_deferred_terminations = getattr(
+                self, "_drain_deferred_transfer_terminations", None)
+            if drain_deferred_terminations is not None:
+                drain_deferred_terminations(
+                    terminate_after_worker_shutdown=True)
+        drain_pending_cancellations = getattr(
+            self, "_drain_pending_request_cancellations_after_shutdown", None)
+        if drain_pending_cancellations is not None:
+            drain_pending_cancellations()
+        if getattr(self, "_pending_request_cancellations", None):
+            raise RuntimeError(
+                "User cancellation ownership is still incomplete after "
+                "transceiver shutdown; refusing to shut down resource managers")
+        if getattr(self, "_deferred_transfer_terminations", None):
+            raise RuntimeError(
+                "KV transfer request ownership is still active after "
+                "transceiver shutdown; refusing to shut down resource managers")
+        if getattr(self, "kv_connector_manager", None) is not None:
+            self._kv_connector_terminate_requests(
+                terminate_after_worker_shutdown=True)
+        else:
+            drain_connector_completions = getattr(
+                self, "_drain_pending_connector_completions", None)
+            if drain_connector_completions is not None:
+                drain_connector_completions(
+                    terminate_after_worker_shutdown=True)
+        if getattr(self, "_pending_connector_completions", None):
+            raise RuntimeError(
+                "Connector completion ownership is still incomplete after "
+                "executor shutdown; refusing to shut down resource managers")
+        transceiver_transfer_owners = (transfer_manager.requests_with_owner(
+            _PYTHON_NATIVE_TRANSCEIVER_OWNER)
+                                       if transfer_manager is not None else {})
+        if transceiver_transfer_owners:
+            raise RuntimeError(
+                "KV cache transceiver still owns active request resources; "
+                "refusing to shut down resource managers")
+        if (transfer_manager is not None
+                and transfer_manager.has_any_inflight_requests()):
+            raise RuntimeError(
+                "Asynchronous transfer ownership is still active after "
+                "executor shutdown; refusing to shut down resource managers")
+        termination_handler = getattr(self, "_disagg_pp_termination_handler",
+                                      None)
+        if termination_handler is not None:
+            termination_handler.terminate_all_after_shutdown()
+            if termination_handler.has_pending_terminations():
+                raise RuntimeError(
+                    "PP request termination is still pending after executor "
+                    "shutdown; refusing to shut down resource managers")
+
+        termination_progress = getattr(
+            self, "_request_resource_termination_progress", {})
+        for request_key, request in list(termination_progress.items()):
+            if termination_progress.get(request_key) is request:
+                self._do_terminate_request(request)
+        if termination_progress:
+            raise RuntimeError(
+                "Request resource termination is still incomplete; refusing "
+                "to shut down resource managers")
+
+        has_in_doubt_releases = getattr(self.resource_manager,
+                                        "has_in_doubt_resource_releases", None)
+        if (has_in_doubt_releases is not None and has_in_doubt_releases()):
+            raise RuntimeError(
+                "Request resource release outcome is in doubt; refusing to "
+                "shut down resource managers")
+        has_pending_releases = getattr(self.resource_manager,
+                                       "has_pending_resource_releases", None)
+        if (has_pending_releases is not None and has_pending_releases()):
+            raise RuntimeError(
+                "Request resource release is still pending; refusing to shut "
+                "down resource managers")
         for manager in self.resource_manager.resource_managers.values():
             if manager:
                 manager.shutdown()
@@ -2837,7 +3246,6 @@ class PyExecutor:
                 # Do not wait for PP send handles here. The next
                 # _ring_broadcast_sample_state call drains the previous isend
                 # for the same microbatch_id before reusing that slot.
-                #
                 # Waiting here can hang during shutdown. Peer ranks may have
                 # left this loop and moved to the next executor setup, so no
                 # rank is polling the broadcast communicator. In that state,
@@ -3384,6 +3792,108 @@ class PyExecutor:
         return (not self._is_disagg_gen_only_no_context_benchmark() and
                 os.getenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP") != "1")
 
+    def _requires_physical_transfer_drain(self) -> bool:
+        transceiver = getattr(self, "kv_cache_transceiver", None)
+        return (getattr(transceiver,
+                        "requires_physical_drain_before_request_release", False)
+                is True)
+
+    def _has_async_transfer_owner(self, request: LlmRequest) -> bool:
+        """Whether any provider owns the exact request's transfer lease."""
+        transfer_manager = getattr(self, "async_transfer_manager", None)
+        if transfer_manager is None:
+            return False
+        has_any_transfer_owner = getattr(transfer_manager,
+                                         "has_any_transfer_owner", None)
+        if has_any_transfer_owner is not None:
+            result = has_any_transfer_owner(request)
+            # Some unit-test executors use an incompletely configured Mock.
+            # Accept only the real manager's concrete bool, then fall back to
+            # the exact-request map instead of treating a Mock as truthy.
+            if result is True or result is False:
+                return result
+        requests_in_transfer = getattr(transfer_manager, "requests_in_transfer",
+                                       None)
+        if requests_in_transfer is None:
+            return False
+        return (requests_in_transfer().get(request.py_request_id) is request)
+
+    def _has_transceiver_transfer_owner(self, request: LlmRequest) -> bool:
+        """Whether the Python-native transceiver owns the exact request."""
+        transfer_manager = getattr(self, "async_transfer_manager", None)
+        if transfer_manager is None:
+            return False
+        has_transfer_owner = getattr(transfer_manager, "has_transfer_owner",
+                                     None)
+        return (has_transfer_owner is not None and has_transfer_owner(
+            request, _PYTHON_NATIVE_TRANSCEIVER_OWNER) is True)
+
+    def _was_transfer_request_terminated(self, request: LlmRequest) -> bool:
+        """Whether normal teardown ran while a transfer lease stayed live."""
+        terminated_requests = getattr(self, "_terminated_transfer_requests", {})
+        return terminated_requests.get(id(request)) is request
+
+    def _record_terminated_transfer_request(self, request: LlmRequest) -> None:
+        """Remember exact resources freed before the final transfer owner."""
+        if not self._has_async_transfer_owner(request):
+            return
+        terminated_requests = getattr(self, "_terminated_transfer_requests",
+                                      None)
+        if terminated_requests is None:
+            terminated_requests = {}
+            self._terminated_transfer_requests = terminated_requests
+        terminated_requests[id(request)] = request
+
+    def _forget_terminated_transfer_request_if_unowned(
+            self, request: LlmRequest) -> None:
+        """Drop the early-teardown root only after every owner is retired."""
+        if self._has_async_transfer_owner(request):
+            return
+        terminated_requests = getattr(self, "_terminated_transfer_requests",
+                                      None)
+        request_key = id(request)
+        if (terminated_requests is not None
+                and terminated_requests.get(request_key) is request):
+            terminated_requests.pop(request_key)
+
+    def _defer_transceiver_owners_for_shutdown(self) -> None:
+        """Keep Python-native owners rooted through post-loop shutdown."""
+        transfer_manager = getattr(self, "async_transfer_manager", None)
+        if transfer_manager is None:
+            return
+
+        deferred_terminations = getattr(self, "_deferred_transfer_terminations",
+                                        None)
+        if deferred_terminations is None:
+            deferred_terminations = {}
+            self._deferred_transfer_terminations = deferred_terminations
+        already_terminated = getattr(
+            self, "_deferred_transfer_terminations_already_terminated", None)
+        if already_terminated is None:
+            already_terminated = set()
+            self._deferred_transfer_terminations_already_terminated = already_terminated
+        terminated_requests = getattr(self, "_terminated_transfer_requests", {})
+        pending_cancellations = getattr(self, "_pending_request_cancellations",
+                                        {})
+        for request in transfer_manager.requests_with_owner(
+                _PYTHON_NATIVE_TRANSCEIVER_OWNER).values():
+            request_key = id(request)
+            cancellation_progress = pending_cancellations.get(request_key)
+            if (cancellation_progress is not None
+                    and cancellation_progress.request is request):
+                # The cancellation ledger already owns the exact transport
+                # drain -> transceiver release -> logical termination sequence.
+                continue
+            if deferred_terminations.get(request_key) is request:
+                # Preserve whether an earlier error path still needs normal
+                # request termination; a shutdown retry must not reclassify it.
+                continue
+            deferred_terminations[request_key] = request
+            if terminated_requests.get(request_key) is request:
+                already_terminated.add(request_key)
+            else:
+                already_terminated.discard(request_key)
+
     def _uses_kv_manager_v2(self) -> bool:
         explicit_flag = getattr(self, "_is_kv_manager_v2", None)
         if explicit_flag is not None:
@@ -3718,11 +4228,91 @@ class PyExecutor:
             self.kv_connector_manager.worker.start_load_kv(
                 torch.cuda.current_stream())
 
-    def _kv_connector_terminate_requests(self):
+    def _get_pending_connector_completions(
+            self) -> Dict[int, _ConnectorCompletionProgress]:
+        pending = getattr(self, "_pending_connector_completions", None)
+        if pending is None:
+            pending = {}
+            self._pending_connector_completions = pending
+        return pending
+
+    def _advance_connector_completion(
+            self,
+            progress: _ConnectorCompletionProgress,
+            *,
+            terminate_after_worker_shutdown: bool = False) -> bool:
+        """Advance one consumed connector notification without replay."""
+        request = progress.request
+        request_was_already_terminated = (
+            self._was_transfer_request_terminated(request))
+        if not progress.response_prepared:
+            if progress.was_active:
+                PyExecutor._prepare_transfer_completion_response(self, request)
+            progress.response_prepared = True
+
+        if not progress.owner_released:
+            progress.all_transfers_complete = (
+                PyExecutor._release_transfer_owner(self, request))
+            progress.owner_released = True
+
+        if not progress.all_transfers_complete:
+            return True
+
+        if not progress.active_request_removed:
+            if request in self.active_requests:
+                self.active_requests.remove(request)
+            progress.active_request_removed = True
+
+        if not progress.request_terminated:
+            if not request_was_already_terminated:
+                if terminate_after_worker_shutdown:
+                    self._terminate_request_after_worker_shutdown(request)
+                else:
+                    self._terminate_request(request)
+            progress.request_terminated = True
+            self._forget_terminated_transfer_request_if_unowned(request)
+        return True
+
+    def _drain_pending_connector_completions(
+            self, *, terminate_after_worker_shutdown: bool = False) -> None:
+        pending = self._get_pending_connector_completions()
+        for request_key, progress in list(pending.items()):
+            if pending.get(request_key) is not progress:
+                continue
+            try:
+                completed = self._advance_connector_completion(
+                    progress,
+                    terminate_after_worker_shutdown=
+                    terminate_after_worker_shutdown)
+            except Exception as e:
+                logger.error(
+                    "Failed to finish connector ownership for request "
+                    f"{progress.request.py_request_id}; retaining exact progress "
+                    f"for retry: {e}")
+                continue
+            if completed and pending.get(request_key) is progress:
+                pending.pop(request_key)
+
+    def _kv_connector_terminate_requests(
+            self, *, terminate_after_worker_shutdown: bool = False):
         if self.kv_connector_manager:
-            reqs_to_terminate = self.kv_connector_manager.get_finished()
-            for req in reqs_to_terminate:
-                self._end_transfer_and_maybe_terminate(req)
+            pending = self._get_pending_connector_completions()
+            for request in self.kv_connector_manager.get_finished():
+                request_key = id(request)
+                existing = pending.get(request_key)
+                if existing is not None and existing.request is not request:
+                    raise RuntimeError(
+                        "connector completion identity collision for request "
+                        f"{request.py_request_id}")
+                if existing is None:
+                    pending[request_key] = _ConnectorCompletionProgress(
+                        request=request,
+                        was_active=bool(self.kv_cache_transceiver
+                                        and request in self.active_requests),
+                    )
+
+            self._drain_pending_connector_completions(
+                terminate_after_worker_shutdown=terminate_after_worker_shutdown)
 
     def _kv_connector_wait_for_save(self):
         if self.kv_connector_manager is not None:
@@ -3872,6 +4462,11 @@ class PyExecutor:
         otherwise the downstream ``tp_gather`` in ``_enqueue_responses``
         deadlocks or leaves peer replicas running.
         """
+        # Error responses remove requests from active_requests immediately,
+        # but physical transfer cancellation may need more than one bounded
+        # poll. Retry those ownership releases once per executor iteration.
+        PyExecutor._drain_deferred_transfer_terminations(self)
+
         if not self.kv_cache_transceiver:
             return
 
@@ -6042,8 +6637,21 @@ class PyExecutor:
                             req.py_request_id)
                     # Order is important here: we need to start the transfer before responding
                     # to make sure the blocks are stored for reuse before they are sent.
-                    self.async_transfer_manager.start_transfer(req)
-                    self.kv_cache_transceiver.respond_and_send_async(req)
+                    # Python native gets an exact named contribution so it can
+                    # retire independently from an anonymous connector save.
+                    # The default C++ transceiver keeps its legacy anonymous
+                    # counter contract.
+                    if self._requires_physical_transfer_drain():
+                        self.async_transfer_manager.start_transfer(
+                            req, owner=_PYTHON_NATIVE_TRANSCEIVER_OWNER)
+                    else:
+                        self.async_transfer_manager.start_transfer(req)
+                    try:
+                        self.kv_cache_transceiver.respond_and_send_async(req)
+                    except Exception:
+                        if self._requires_physical_transfer_drain():
+                            self._reconcile_failed_native_transfer_launch(req)
+                        raise
 
                     if self.kv_cache_transceiver.kv_transfer_timeout_ms is not None:
                         req.py_kv_transfer_start_time = time.monotonic()
@@ -6078,6 +6686,41 @@ class PyExecutor:
             return True
         return False
 
+    def _reconcile_failed_native_transfer_launch(self,
+                                                 request: LlmRequest) -> None:
+        """Fail closed after native owner enrollment but failed launch."""
+        request.state = LlmRequestState.DISAGG_TRANS_ERROR
+        deferred = getattr(self, "_deferred_transfer_terminations", None)
+        if deferred is None:
+            deferred = {}
+            self._deferred_transfer_terminations = deferred
+        request_key = id(request)
+        existing = deferred.get(request_key)
+        if existing is not None and existing is not request:
+            raise RuntimeError(
+                "failed native launch identity collision for request "
+                f"{request.py_request_id}")
+        deferred[request_key] = request
+
+        try:
+            is_drained = self.kv_cache_transceiver.cancel_request(request)
+        except Exception as e:
+            logger.error(
+                "Failed to cancel native transfer after launch error for "
+                f"request {request.py_request_id}; retaining exact request for "
+                f"shutdown retry: {e}")
+            return
+        if not is_drained:
+            return
+
+        try:
+            self._finalize_deferred_transfer_termination(request)
+        except Exception as e:
+            logger.error(
+                "Failed to retire native transfer owner after launch error "
+                f"for request {request.py_request_id}; retaining exact request "
+                f"for retry: {e}")
+
     def _get_disagg_reqs_in_error_state(self):
         return [
             req for req in self.active_requests
@@ -6104,6 +6747,8 @@ class PyExecutor:
     def _check_disagg_ctx_cache_transfer_status(self, atLeastNum: int = 0):
         finished_requests, error_requests = self.kv_cache_transceiver.check_context_transfer_status(
             atLeastNum)
+        transfer_owner = (_PYTHON_NATIVE_TRANSCEIVER_OWNER
+                          if self._requires_physical_transfer_drain() else None)
 
         completed_req_ids = set(finished_requests + error_requests)
 
@@ -6119,7 +6764,9 @@ class PyExecutor:
 
             request = requests_in_transfer[request_id]
 
-            self._end_transfer_and_maybe_terminate(request)
+            if not self._finalize_deferred_transfer_termination(request):
+                self._end_transfer_and_maybe_terminate(
+                    request, transfer_owner=transfer_owner)
 
         # The set of requests in transfer may have changed since we terminated some requests.
         requests_in_transfer = self.async_transfer_manager.requests_in_transfer(
@@ -6130,6 +6777,17 @@ class PyExecutor:
             if (not request.py_kv_transfer_timed_out
                     or request_id in completed_req_ids
                     or request_id in self._disagg_timed_out_ctx_cancelled_ids):
+                continue
+
+            if self._requires_physical_transfer_drain():
+                is_cancelled = self._request_kv_transfer_cancellation(request)
+                if not is_cancelled:
+                    continue
+                request.py_kv_transfer_start_time = None
+                request.state = LlmRequestState.DISAGG_CONTEXT_COMPLETE
+                if not self._finalize_deferred_transfer_termination(request):
+                    self._end_transfer_and_maybe_terminate(
+                        request, transfer_owner=transfer_owner)
                 continue
 
             is_cancelled = self._request_kv_transfer_cancellation(request)
@@ -6510,6 +7168,75 @@ class PyExecutor:
 
         failed_requests = (list(self.active_requests)
                            if requests is None else requests)
+        pending_ownership_request_keys = set()
+        deferred_request_keys = set()
+        drained_deferred_request_keys = set()
+        provider_delegated_request_keys = set()
+        deferred_terminations = getattr(self, "_deferred_transfer_terminations",
+                                        None)
+        if deferred_terminations is None:
+            deferred_terminations = {}
+            self._deferred_transfer_terminations = deferred_terminations
+        already_terminated = getattr(
+            self, "_deferred_transfer_terminations_already_terminated", None)
+        if already_terminated is None:
+            already_terminated = set()
+            self._deferred_transfer_terminations_already_terminated = already_terminated
+        context_transfer_state = LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
+        for request in failed_requests:
+            request_key = id(request)
+            if self._has_pending_ownership_transition(request):
+                pending_cancellations = getattr(
+                    self, "_pending_request_cancellations", {})
+                cancellation_progress = pending_cancellations.get(request_key)
+                if (cancellation_progress is not None
+                        and cancellation_progress.request is request):
+                    # _handle_errors removes the request from active_requests,
+                    # so the cancellation ledger must either perform final
+                    # teardown or hand it to a remaining provider owner.
+                    cancellation_progress.terminate_on_completion = True
+                pending_ownership_request_keys.add(request_key)
+                continue
+            already_deferred = deferred_terminations.get(request_key) is request
+            is_context_transfer = request.state == context_transfer_state
+            has_transceiver_owner = self._has_transceiver_transfer_owner(
+                request)
+            if not self._requires_physical_transfer_drain():
+                continue
+            try:
+                is_drained = self.kv_cache_transceiver.cancel_request(request)
+            except Exception as e:
+                logger.error(
+                    f"Failed to cancel KV transfer for request "
+                    f"{request.py_request_id}; retaining request resources until "
+                    f"drain can be retried: {e}")
+                is_drained = False
+            if not is_drained:
+                deferred_terminations[request_key] = request
+                already_terminated.discard(request_key)
+                deferred_request_keys.add(request_key)
+            elif (already_deferred or is_context_transfer
+                  or has_transceiver_owner):
+                # Context transfers also hold an AsyncTransferManager entry.
+                # Keep the request in the map through logical error handling
+                # so finalization releases that entry exactly once.
+                deferred_terminations[request_key] = request
+                already_terminated.discard(request_key)
+                drained_deferred_request_keys.add(request_key)
+
+        force_terminate = getattr(self, "force_terminate_ctx_for_partial_reuse",
+                                  False)
+        for request in failed_requests:
+            request_key = id(request)
+            if (request_key in pending_ownership_request_keys
+                    or request_key in deferred_request_keys
+                    or request_key in drained_deferred_request_keys):
+                continue
+            if self._has_async_transfer_owner(request) and not force_terminate:
+                # Provider completion is the only path that can prove the
+                # shared transfer lease is final. Keep resources until then.
+                provider_delegated_request_keys.add(request_key)
+
         for request in failed_requests:
             req_id = request.py_request_id
             request.state = LlmRequestState.GENERATION_COMPLETE
@@ -6517,6 +7244,10 @@ class PyExecutor:
                 request_id=req_id,
                 error_msg=error_msg,
                 client_id=request.py_client_id)
+            if self._has_async_transfer_owner(request):
+                # Prevent a later final owner retirement from translating the
+                # failed request into CONTEXT_COMPLETE.
+                request.state = LlmRequestState.DISAGG_TRANS_ERROR
         if requests is None:
             self.active_requests.clear()
         else:
@@ -6526,7 +7257,15 @@ class PyExecutor:
             ]
         self._enqueue_responses(list(error_responses.items()))
         for request in failed_requests:
-            self._terminate_request(request)
+            request_key = id(request)
+            if (request_key in pending_ownership_request_keys
+                    or request_key in deferred_request_keys
+                    or request_key in provider_delegated_request_keys):
+                continue
+            if request_key in drained_deferred_request_keys:
+                self._finalize_deferred_transfer_termination(request)
+            else:
+                self._terminate_request(request)
 
         if self._fatal_error is not None:
             self.executor_request_queue.enqueue_shutdown_request()
@@ -6543,13 +7282,37 @@ class PyExecutor:
             self._do_terminate_request(request)
 
     def _do_terminate_request(self, request: LlmRequest):
-        self.resource_manager.free_resources(request)
+        transfer_manager = getattr(self, "async_transfer_manager", None)
+        if (transfer_manager is not None
+                and transfer_manager.has_pending_admission(request) is True):
+            raise RuntimeError(
+                "transfer admission is incomplete for request "
+                f"{request.py_request_id}; refusing to release resources")
+
+        request_key = id(request)
+        termination_progress = getattr(
+            self, "_request_resource_termination_progress", None)
+        if termination_progress is None:
+            termination_progress = {}
+            self._request_resource_termination_progress = termination_progress
+        released_request = termination_progress.get(request_key)
+        if released_request is not None and released_request is not request:
+            raise RuntimeError(
+                "request resource termination identity collision for request "
+                f"{request.py_request_id}")
+        if released_request is None:
+            self.resource_manager.free_resources(request)
+            termination_progress[request_key] = request
+
         self._prefetched_request_ids.discard(request.py_request_id)
         self._disagg_timed_out_ctx_cancelled_ids.discard(request.py_request_id)
         self._disagg_timed_out_gen_cancelled_ids.discard(request.py_request_id)
 
         if self.gather_all_responses or self.dist.rank == 0:
             self.result_wait_queues.pop(request.py_request_id, None)
+        self._record_terminated_transfer_request(request)
+        if termination_progress.get(request_key) is request:
+            termination_progress.pop(request_key)
 
     def _is_request_in_transmission(self, request) -> bool:
         """Check if a request is currently in transmission state."""
@@ -6566,6 +7329,12 @@ class PyExecutor:
         """
         if self.kv_cache_transceiver is None:
             return True
+
+        # The Python-native transceiver can still own a live send/receive
+        # session after another path has moved the request out of a TRANS
+        # state. Its cancellation result is the physical-drain proof.
+        if self._requires_physical_transfer_drain():
+            return self._request_kv_transfer_cancellation(request)
 
         async_transfer_manager = getattr(self, "async_transfer_manager", None)
         if (getattr(request, "is_context_only_request", False) is True
@@ -6584,9 +7353,216 @@ class PyExecutor:
 
         return self._request_kv_transfer_cancellation(request)
 
+    def _resolve_cancelled_context_transceiver_owner(
+            self, request: LlmRequest) -> bool:
+        """Retire a drained Python-native owner or await another provider."""
+        transfer_manager = getattr(self, "async_transfer_manager", None)
+        if (request.is_generation_only_request() or transfer_manager is None
+                or not self._has_transceiver_transfer_owner(request)):
+            return not self._has_async_transfer_owner(request)
+
+        # AsyncTransferManager normally maps its final successful owner to
+        # CONTEXT_COMPLETE. User cancellation must remain cancellation/error,
+        # including when owner release raises and is retried next iteration.
+        original_state = request.state
+        request.state = LlmRequestState.DISAGG_TRANS_ERROR
+        try:
+            return transfer_manager.end_transfer(
+                request, owner=_PYTHON_NATIVE_TRANSCEIVER_OWNER)
+        except Exception:
+            request.state = original_state
+            raise
+
+    def _get_pending_request_cancellations(
+            self) -> Dict[int, _RequestCancellationProgress]:
+        pending = getattr(self, "_pending_request_cancellations", None)
+        if pending is None:
+            pending = {}
+            self._pending_request_cancellations = pending
+        return pending
+
+    def _advance_request_cancellation(
+            self, progress: _RequestCancellationProgress) -> bool:
+        """Advance one exact request through cancellation ownership phases."""
+        request = progress.request
+        if not progress.transport_drained:
+            if not self._try_cancel_request(request):
+                return False
+            progress.transport_drained = True
+
+        if not progress.transceiver_release_resolved:
+            progress.all_transfers_complete = (
+                self._resolve_cancelled_context_transceiver_owner(request))
+            progress.transceiver_release_resolved = True
+
+        if not progress.logical_cancelled:
+            request.py_kv_transfer_timed_out = False
+            request.finish_by_reason(FinishReason.CANCELLED)
+            progress.logical_cancelled = True
+
+        if not progress.decoding_iter_updated:
+            request.decoding_iter = request.py_decoding_iter
+            progress.decoding_iter_updated = True
+        return True
+
+    def _complete_request_cancellation_termination(
+            self,
+            progress: _RequestCancellationProgress,
+            *,
+            terminate_after_worker_shutdown: bool = False) -> None:
+        """Terminate, or hand teardown to the last remaining provider."""
+        if progress.termination_handoff_complete:
+            return
+
+        request = progress.request
+        if progress.all_transfers_complete:
+            if not self._was_transfer_request_terminated(request):
+                if terminate_after_worker_shutdown:
+                    self._terminate_request_after_worker_shutdown(request)
+                else:
+                    self._terminate_request(request)
+            self._forget_terminated_transfer_request_if_unowned(request)
+
+        # When another owner remains, its completion path owns final teardown.
+        progress.termination_handoff_complete = True
+
+    def _drain_pending_request_cancellations_after_shutdown(self) -> None:
+        """Finish exact pending cancellations after executor loops stop."""
+        pending = self._get_pending_request_cancellations()
+        for request_key, progress in list(pending.items()):
+            if pending.get(request_key) is not progress:
+                continue
+            try:
+                completed = self._advance_request_cancellation(progress)
+                if completed and not progress.termination_handoff_complete:
+                    self._complete_request_cancellation_termination(
+                        progress, terminate_after_worker_shutdown=True)
+            except Exception as e:
+                logger.error(
+                    "Failed to finish cancellation ownership for request "
+                    f"{progress.cancel_id} after shutdown; retaining exact "
+                    f"progress for retry: {e}")
+                continue
+            if (progress.termination_handoff_complete
+                    and pending.get(request_key) is progress):
+                pending.pop(request_key)
+
+    def _has_pending_ownership_transition(self, request: LlmRequest) -> bool:
+        """Whether response/resource cleanup must wait for a retry phase."""
+        transfer_manager = getattr(self, "async_transfer_manager", None)
+        if (transfer_manager is not None
+                and transfer_manager.has_pending_admission(request) is True):
+            return True
+        request_key = id(request)
+        pending_cancellations = getattr(self, "_pending_request_cancellations",
+                                        {})
+        if (pending_cancellations.get(request_key) is not None
+                and pending_cancellations[request_key].request is request):
+            return True
+        pending_connector = getattr(self, "_pending_connector_completions", {})
+        return (pending_connector.get(request_key) is not None
+                and pending_connector[request_key].request is request)
+
+    def _has_pending_cancelled_transfer_owner(self,
+                                              request: LlmRequest) -> bool:
+        """Whether a cancelled request still has a provider owner."""
+        if not request.is_finished_due_to_cancellation:
+            return False
+        return self._has_async_transfer_owner(request)
+
+    def _finalize_deferred_transfer_termination(
+            self,
+            request: LlmRequest,
+            *,
+            terminate_after_worker_shutdown: bool = False) -> bool:
+        """Release a drained Python-native owner and terminate if appropriate."""
+        deferred_terminations = getattr(self, "_deferred_transfer_terminations",
+                                        None)
+        request_key = id(request)
+        if (not deferred_terminations
+                or deferred_terminations.get(request_key) is not request):
+            return False
+        already_terminated = getattr(
+            self, "_deferred_transfer_terminations_already_terminated", set())
+        request_was_already_terminated = (
+            request_key in already_terminated
+            or self._was_transfer_request_terminated(request))
+
+        should_terminate = True
+        if self._has_async_transfer_owner(request):
+            # AsyncTransferManager normally transitions a successful context
+            # send to CONTEXT_COMPLETE. Latch the error before releasing the
+            # transceiver contribution so a sibling provider cannot resurrect
+            # it.
+            request.state = LlmRequestState.DISAGG_TRANS_ERROR
+            force_terminate = getattr(self,
+                                      "force_terminate_ctx_for_partial_reuse",
+                                      False)
+            if self._has_transceiver_transfer_owner(request):
+                transfer_manager = self.async_transfer_manager
+                all_transfers_complete = transfer_manager.end_transfer(
+                    request, owner=_PYTHON_NATIVE_TRANSCEIVER_OWNER)
+                should_terminate = all_transfers_complete or force_terminate
+            else:
+                # Transceiver ownership may have been retired by an earlier
+                # retry; a remaining provider owns final teardown.
+                should_terminate = force_terminate
+
+        if should_terminate and not request_was_already_terminated:
+            if terminate_after_worker_shutdown:
+                self._terminate_request_after_worker_shutdown(request)
+            else:
+                self._terminate_request(request)
+        deferred_terminations.pop(request_key)
+        already_terminated.discard(request_key)
+        self._forget_terminated_transfer_request_if_unowned(request)
+        return True
+
+    def _terminate_request_after_worker_shutdown(self,
+                                                 request: LlmRequest) -> None:
+        """Terminate directly when no executor iteration can run PP consensus."""
+        termination_handler = getattr(self, "_disagg_pp_termination_handler",
+                                      None)
+        if termination_handler is not None and not request.is_dummy_request:
+            termination_handler.terminate_after_shutdown(request)
+        else:
+            self._terminate_request(request)
+
+    def _drain_deferred_transfer_terminations(
+            self, *, terminate_after_worker_shutdown: bool = False) -> None:
+        """Drain transport, then retire exact deferred native owners."""
+        deferred_terminations = getattr(self, "_deferred_transfer_terminations",
+                                        None)
+        if not deferred_terminations or self.kv_cache_transceiver is None:
+            return
+
+        for request_key, request in list(deferred_terminations.items()):
+            try:
+                is_drained = self.kv_cache_transceiver.cancel_request(request)
+            except Exception as e:
+                logger.error(
+                    "Failed to retry KV transfer cancellation for request "
+                    f"{request.py_request_id}; retaining request resources: {e}")
+                continue
+            if not is_drained:
+                continue
+            if deferred_terminations.get(request_key) is not request:
+                continue
+            try:
+                self._finalize_deferred_transfer_termination(
+                    request,
+                    terminate_after_worker_shutdown=
+                    terminate_after_worker_shutdown)
+            except Exception as e:
+                logger.error(
+                    "Failed to retire deferred KV transceiver owner for request "
+                    f"{request.py_request_id}; retaining exact request for "
+                    f"retry: {e}")
+
     @nvtx_range("_handle_canceled_requests")
     def _handle_canceled_requests(self):
-        if len(self.canceled_req_ids) == 0:
+        pending = self._get_pending_request_cancellations()
+        if len(self.canceled_req_ids) == 0 and not pending:
             return
 
         # Create set from list of canceled request ids to speed up canceled test
@@ -6595,23 +7571,54 @@ class PyExecutor:
         # Remove canceled requests from the waiting queue
         self.waiting_queue.remove_by_ids(canceled_req_ids_set)
 
-        still_pending_canceled_ids = []
         for request in self.active_requests:
             req_id = request.py_request_id if not request.is_child else request.parent_request_id
             if req_id not in canceled_req_ids_set:
                 continue
+            request_key = id(request)
+            existing = pending.get(request_key)
+            if existing is not None and existing.request is not request:
+                raise RuntimeError(
+                    "request cancellation identity collision for request "
+                    f"{request.py_request_id}")
+            if existing is None:
+                pending[request_key] = _RequestCancellationProgress(
+                    request=request, cancel_id=req_id)
 
-            is_cancelled = self._try_cancel_request(request)
-            if is_cancelled:
-                # Mark requests as finished, then, we reuse all existing code
-                # to clean up the KV cache resources.
-                request.py_kv_transfer_timed_out = False
-                request.finish_by_reason(FinishReason.CANCELLED)
-                request.decoding_iter = request.py_decoding_iter
-            else:
-                still_pending_canceled_ids.append(req_id)
+        for request_key, progress in list(pending.items()):
+            if pending.get(request_key) is not progress:
+                continue
+            try:
+                completed = self._advance_request_cancellation(progress)
+            except Exception as e:
+                logger.error(
+                    f"Failed to cancel request {progress.cancel_id}; retaining "
+                    f"cancellation for retry: {e}")
+                continue
+            if completed and progress.terminate_on_completion:
+                try:
+                    self._complete_request_cancellation_termination(progress)
+                except Exception as e:
+                    logger.error(
+                        f"Failed to terminate cancelled request "
+                        f"{progress.cancel_id}; retaining cancellation for "
+                        f"retry: {e}")
+                    continue
+            if (completed and (not progress.terminate_on_completion
+                               or progress.termination_handoff_complete)
+                    and pending.get(request_key) is progress):
+                pending.pop(request_key)
 
-        # Clear list of requests marked for cancellation and add back those that failed to cancel.
+        # Keep one ID while any exact child/request cancellation still has an
+        # incomplete phase. IDs with no active request retain legacy behavior
+        # and are cleared after waiting-queue removal.
+        still_pending_canceled_ids = []
+        seen_cancel_ids = set()
+        for progress in pending.values():
+            if progress.cancel_id in seen_cancel_ids:
+                continue
+            seen_cancel_ids.add(progress.cancel_id)
+            still_pending_canceled_ids.append(progress.cancel_id)
         self.canceled_req_ids.clear()
         self.canceled_req_ids.extend(still_pending_canceled_ids)
 
@@ -6753,7 +7760,14 @@ class PyExecutor:
                 requests_to_terminate.append(request)
                 continue
 
-            # Check if a generation request needs cleanup due to KV cache transfer timeout.
+            if self._has_pending_ownership_transition(request):
+                # A retry ledger is the exact owner while a one-way transport,
+                # owner-release, or termination phase is incomplete. Do not
+                # emit a competing terminal response or drop the active root.
+                new_active_requests.append(request)
+                continue
+
+            # Check if generation request needs cleanup due to KV cache transfer timeout
             if request.py_kv_transfer_timed_out:
                 if self._is_disagg_inflight_cancel_active():
                     if (request.is_disagg_generation_transmission_in_progress
@@ -6773,9 +7787,9 @@ class PyExecutor:
                     # Defer it until the rank-uniform vote below.
                     timed_out_requests.append(request)
                 else:
-                    # Legacy transceivers cannot cancel every in-flight
-                    # transfer. Keep polling instead of dropping ownership of
-                    # the request and its KV resources.
+                    # Ownership-safe cancellation is retryable: keep the
+                    # request visible to the next iteration until every
+                    # receive target is physically drained.
                     new_active_requests.append(request)
                 continue
 
@@ -6848,6 +7862,12 @@ class PyExecutor:
                     requests_finished_by_transfer.append(request)
                 elif force_terminate_for_partial_reuse:
                     requests_to_terminate.append(request)
+                elif self._has_pending_cancelled_transfer_owner(request):
+                    # A provider still holds the shared transfer lease. Its
+                    # completion path performs the one remaining termination.
+                    # The request is already logically finished, so report it
+                    # once for iteration completion and request stats now.
+                    requests_finished_by_transfer.append(request)
                 elif not request.is_disagg_context_transmission_state:
                     requests_to_terminate.append(request)
             else:
@@ -7031,6 +8051,39 @@ class DisaggPPTerminationHandler:
 
     def terminate(self, request: LlmRequest):
         self._pending_termination[request.py_request_id] = request
+
+    def terminate_after_shutdown(self, request: LlmRequest):
+        """Free a request after the executor loop can no longer run consensus."""
+        self._terminator_func(request)
+        if self._pending_termination.get(request.py_request_id) is request:
+            self._pending_termination.pop(request.py_request_id)
+
+    def terminate_all_after_shutdown(self) -> None:
+        """Finish locally pending requests after all executor loops stop."""
+        errors = []
+        # Do not wait for the ring's final control send here. Its matching
+        # next-iteration receive may never be posted after executor loops stop.
+        # The handle carries request IDs only and owns no request/KV resource;
+        # retaining it on this handler is safer than blocking teardown.
+
+        for request_id, request in list(self._pending_termination.items()):
+            if self._pending_termination.get(request_id) is not request:
+                continue
+            try:
+                self._terminator_func(request)
+            except Exception as error:
+                errors.append(f"request {request_id}: {error}")
+                continue
+            if self._pending_termination.get(request_id) is request:
+                self._pending_termination.pop(request_id)
+
+        if errors:
+            raise RuntimeError(
+                "PP request termination did not drain after shutdown: " +
+                "; ".join(errors))
+
+    def has_pending_terminations(self) -> bool:
+        return bool(self._pending_termination)
 
     @nvtx_range("_disagg_pp_termination_handler_sync")
     def terminate_pending_requests(self):

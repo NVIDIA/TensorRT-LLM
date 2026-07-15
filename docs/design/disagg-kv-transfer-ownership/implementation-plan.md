@@ -12,7 +12,7 @@ SPDX-License-Identifier: Apache-2.0
 | **Owner** | Chien-Chun Hung |
 | **Status** | Draft implementation plan |
 | **Created** | 2026-07-08 |
-| **Last updated** | 2026-07-13 |
+| **Last updated** | 2026-07-14 |
 
 ## Performance and Capacity Contract
 
@@ -51,6 +51,21 @@ unchanged. The owner adds host metadata, lookup, and state transitions, but no
 new direct-path CUDA copy, kernel, synchronization, or device arena. When the
 requested bounce transport is active, the configured send/receive arenas
 introduced by PR #15618 remain the only preallocated bounce storage.
+
+For the initial containment implementation specifically, no TTFT, throughput,
+or NIXL bandwidth improvement should be claimed. The healthy sender adds an O(1)
+operation-ledger lookup plus small state/counter transitions, exact-session
+queue binding, and serialized socket access; the receiver adds registry
+transitions and bounds checks. Duplicate request delivery is cheaper because it
+replays or joins the existing operation instead of launching another transfer.
+Lazy destination-manifest construction can reduce host allocation/CPU work when
+a bounce slot is unavailable and the operation falls back to direct transfer,
+but it does not change transferred bytes. The slice allocates no additional
+device arena beyond the opt-in bound buffers from PR #15618. Under cancellation,
+missing results, or ambiguous NIXL status, retained Python owners and bounce/KV
+capacity can increase memory residence and reduce admission throughput; that is
+the intended fail-closed result. The detailed metrics below are the target
+instrumentation contract and are not all exported by this first slice.
 
 | Scenario | Expected impact |
 |---|---|
@@ -228,7 +243,9 @@ rollout-safe until the full Phase 1 gate passes.
   export configured/used/remaining capacity plus count/age/rejection metrics.
 - Drain late sibling results after logical failure/session removal.
 - Replace timed bounce reuse with indefinite in-doubt retention.
-- Rename or narrow the current bounce-only `TransferContext`.
+- Keep the initial containment's renamed `RecvBounceContext` narrow and local
+  to the bounce package; optionally reduce it further to `RecvBounceLease`
+  state rather than promoting it into the general owner.
 - Add an allocator-atomic `snapshot_and_lease(request, slice_spec)` operation for
   destination KV before copying block IDs, resolving pointers, or publishing
   addresses. Construct the receive context and wire slice from the immutable,
@@ -239,7 +256,9 @@ rollout-safe until the full Phase 1 gate passes.
   without changing the C++ transceiver's boolean contract. Let PyExecutor drop
   destination-KV ownership while the lease makes it pending-free, but preserve
   independent session/auxiliary cleanup gates; retain the sender-side legacy
-  gate until Phase 2.
+  gate until Phase 2. Shared manager accounting may veto teardown for a live
+  generic owner or release, but the adapter must not retire a C++ transport
+  owner or treat local C++ object destruction as quiescence evidence.
 - Make receiver context insertion and `TransferHandle` enrollment atomic with
   respect to handle abort/sealing. Gate every access boundary on the durable
   gate before taking the context lock, abort the gate on first failure,
@@ -298,8 +317,10 @@ validation scope would otherwise become too broad.
   managers.
 - Support atomic pending-free and overlapping reference-counted slice leases.
 - Acquire source leases before gather or direct submission.
-- Add `SendTransferContext` and track gather, NIXL, send-bounce, descriptor, and
-  result-delivery state independently.
+- Promote the initial in-doubt `SendTransferContext` containment record into a
+  canonical registry-owned context, backed by allocator-issued source leases,
+  and track gather, NIXL, send-bounce, descriptor, and result-delivery state
+  independently through normal as well as ambiguous completion.
 - Extend atomic `TransferHandle` enrollment to sender contexts and reject a
   losing preparation before gather or NIXL launch.
 - Retain the sender's canonical record/gate independently of its request-facing
@@ -381,9 +402,12 @@ adapters in `tensorrt_llm/_torch/pyexecutor/_util.py`.
   access after acknowledgement.
 
 The core effort is approximately 4,000–7,300 production lines plus substantial
-concurrency and integration tests. The C++ `CacheTransceiver` remains untouched;
-cross-language work is limited to shared KV-manager or NIXL binding contracts
-that the Python runtime consumes.
+concurrency and integration tests. The C++ `CacheTransceiver` implementation,
+data path, and wire protocol remain outside this scope. Cross-language work is
+limited to shared KV-manager or NIXL binding contracts that the Python runtime
+consumes. Shared `AsyncTransferManager`/`ResourceManager` accounting may observe
+live generic ownership and fail closed, but it does not implement or retire the
+C++ transport lifecycle.
 
 ## Rollout and Rollback
 
@@ -895,12 +919,13 @@ The design is implemented only when all of the following are true:
 
 ## Alternatives Considered
 
-### Expand the current bounce `TransferContext`
+### Expand the PR #15618 bounce `TransferContext`
 
-Rejected as the general architecture. That object is naturally scoped to a
-receive bounce slot. Making it own direct writers, source KV, sender status,
-request aggregation, and KV-manager leases would invert module boundaries and
-make ownership disappear when bounce is disabled.
+Rejected as the general architecture. The initial containment has since renamed
+that object to `RecvBounceContext`, but it remains naturally scoped to a receive
+bounce slot. Making it own direct writers, source KV, sender status, request
+aggregation, and KV-manager leases would invert module boundaries and make
+ownership disappear when bounce is disabled.
 
 ### Make `LlmRequest` the owner
 

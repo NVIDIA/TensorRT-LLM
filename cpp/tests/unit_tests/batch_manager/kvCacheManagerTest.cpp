@@ -4903,12 +4903,32 @@ TEST_F(KVCacheManagerTest, PinAndUnpinBlocksById)
     ASSERT_TRUE(lastBlockIdOpt.has_value());
     auto const& allBlockIds = kvCacheManager.getCacheBlockIds(requestId, maxAttentionWindow)[0];
     std::vector<SizeType32> pinnedBlockIds(allBlockIds.begin(), allBlockIds.end());
+    ASSERT_FALSE(pinnedBlockIds.empty());
     tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*llmRequest);
     (void) kvCacheManager.removeSequence(requestId, llmRequest);
     auto const freeAfterRemovePinned = kvCacheManager.getNumFreeBlocks();
     EXPECT_LT(freeAfterRemovePinned, totalBlocks);
 
-    kvCacheManager.unpinBlocksById(pinnedBlockIds);
+    auto invalidBlockIds = pinnedBlockIds;
+    invalidBlockIds.push_back(totalBlocks);
+    EXPECT_THROW(kvCacheManager.unpinBlocksById(invalidBlockIds), std::runtime_error);
+
+    auto const freeBlockId = [&]() -> SizeType32
+    {
+        for (SizeType32 blockId = 0; blockId < totalBlocks; ++blockId)
+        {
+            if (std::find(pinnedBlockIds.begin(), pinnedBlockIds.end(), blockId) == pinnedBlockIds.end())
+            {
+                return blockId;
+            }
+        }
+        return totalBlocks;
+    }();
+    ASSERT_LT(freeBlockId, totalBlocks);
+    EXPECT_THROW(kvCacheManager.unpinBlocksById({pinnedBlockIds.front(), freeBlockId}), std::runtime_error);
+    EXPECT_THROW(kvCacheManager.unpinBlocksById({pinnedBlockIds.front(), pinnedBlockIds.front()}), std::runtime_error);
+
+    EXPECT_NO_THROW(kvCacheManager.unpinBlocksById(pinnedBlockIds));
     auto const freeAfterUnpin = kvCacheManager.getNumFreeBlocks();
     EXPECT_EQ(freeAfterUnpin, totalBlocks);
 }

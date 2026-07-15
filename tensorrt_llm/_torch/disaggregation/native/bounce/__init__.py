@@ -19,7 +19,15 @@ unchanged when no Config is given. config_from_size() is the on/off switch."""
 
 from .buffer import Buffer, SlotAllocator
 from .config import Config, FixedSizing, Sizing, SizingContext, config_from_size
-from .core import BounceTransport, Disposition, ScatterState, TransferContext, TransferState
+from .core import (
+    BounceTransport,
+    Disposition,
+    GatherSourceInDoubtError,
+    RecvBounceContext,
+    ScatterState,
+    TransferState,
+    WriterState,
+)
 from .gather_scatter import Plan
 from .impl import (
     NoBounceTransport,
@@ -37,15 +45,17 @@ __all__ = [
     "Config",
     "Disposition",
     "FixedSizing",
+    "GatherSourceInDoubtError",
     "NoBounceTransport",
     "Plan",
+    "RecvBounceContext",
     "ScatterState",
     "Sizing",
     "SizingContext",
     "SlotAllocator",
-    "TransferContext",
     "TransferState",
     "VmmBounceTransport",
+    "WriterState",
     "build_send_request",
     "config_from_size",
     "create_bounce",

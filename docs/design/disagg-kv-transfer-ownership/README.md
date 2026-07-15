@@ -10,7 +10,7 @@ SPDX-License-Identifier: Apache-2.0
 | **Owner** | Chien-Chun Hung |
 | **Status** | Draft design contract |
 | **Created** | 2026-07-08 |
-| **Last updated** | 2026-07-13 |
+| **Last updated** | 2026-07-14 |
 | **Implementation baseline** | [PR #15618](https://github.com/NVIDIA/TensorRT-LLM/pull/15618), merged as [`3bf37d2`](https://github.com/NVIDIA/TensorRT-LLM/commit/3bf37d25387c2b99ef6dba4555ed432bcedfcf4d) |
 | **Primary target** | Python native KV cache transceiver with NIXL, direct and bounce paths |
 | **Detailed plan** | [`implementation-plan.md`](implementation-plan.md) |
@@ -47,14 +47,139 @@ transceiver:
 - Cancellation, timeout, session destruction, elapsed quarantine time, and an
   ambiguous transport failure are not proof of quiescence.
 - Direct, bounce, and mixed fan-in paths follow the same contract.
-- In-doubt memory remains unavailable for reuse until terminal evidence or
-  backend-wide quiescence exists. The initial implementation chooses safety over
-  bounded reclamation.
+- In-doubt memory remains unavailable for reuse until terminal evidence or an
+  externally established remote/global quiescence fence exists. The initial
+  implementation chooses safety over bounded reclamation.
 
 The functional scope is the Python transceiver. This is not necessarily a
 Python-files-only change: allocator-enforced KV leases or definitive NIXL status
 may require small C++/nanobind extensions. The separate C++
-`CacheTransceiver` is not an implementation target.
+`CacheTransceiver` implementation, data path, and wire protocol are not
+implementation targets. Shared `AsyncTransferManager`/`ResourceManager`
+accounting may still fail closed while any registered owner or release is live,
+but that accounting neither retires a C++ transport owner nor makes local C++
+object destruction evidence of remote/global quiescence.
+
+## Initial Containment Implementation
+
+This follow-up implements the first Python-runtime containment slice of the
+design documented by
+[PR #16347](https://github.com/NVIDIA/TensorRT-LLM/pull/16347). It is
+intentionally smaller than the complete allocator- and protocol-backed
+contract below.
+
+For the supported Python-native cohorts, this containment is always active when
+`transceiver_runtime="PYTHON"` explicitly selects that transceiver; the default
+C++ transceiver implementation, data path, and wire protocol are unchanged.
+Shared manager accounting may nevertheless veto teardown for a live owner or
+release; the Python-native lifecycle does not retire a C++ transport owner.
+Within the Python runtime it is not gated by `kv_cache_bounce_size_mb` or a
+second ownership feature flag. It applies to direct transfers and eligible
+bounce transfers while preserving the #15618 wire format. This coarse runtime
+selection is not the gated rollout of the complete protocol: generation
+identity, capability negotiation, allocator-enforced leases, and the
+configuration exclusions documented below remain follow-up work.
+
+Implemented in this slice:
+
+- a receiver registry that survives `RxSession` lookup/removal and tracks the
+  exact expected rank set for each `(request, slice)`;
+- one cancellation/publication gate that marks a writer possibly exposed before
+  the ZMQ address send;
+- registry-first result routing, duplicate/conflict handling, and separate
+  logical and physical drain states for known writer cohorts;
+- direct-path cleanup gating: Python keeps the request and its destination
+  allocation owned until every published writer is terminal;
+- an exact sender-operation ledger keyed by session, channel, slice, and
+  receiver identity; claim and source-owner enrollment are atomic before
+  descriptor construction, duplicate target requests cannot launch a second
+  write, and terminal frames are retained for idempotent replay;
+- `SendTransferContext` retains the exact session, `LlmRequest`, operation
+  identity, and every descriptor request, NIXL status object, or send-bounce
+  slot that was returned before NIXL quiescence became ambiguous. If gather
+  fails before those values can be returned, the bounce allocator separately
+  owns the quarantined slot while the context retains the source request;
+  either owner vetoes sender teardown;
+- `RecvBounceContext` with exact rank-to-subrange mapping, evidence-based slot
+  retirement, explicit slot-settlement acknowledgement, no time-based
+  quarantine reuse, scatter-aware close, validated non-overlapping result
+  metadata, and lazy construction of destination manifests after slot
+  reservation succeeds;
+- transactional sender cancellation sealing and durable tombstones that cover
+  local and remote cancellation before or after `TxSession`, task, or request
+  metadata creation, including explicit no-access results for published KV and
+  auxiliary targets;
+- serialized ZMQ socket I/O and close, bounded listener shutdown, and admission
+  gates that prevent launch/cancel/shutdown races;
+- error cleanup and retryable, fail-closed shutdown keep request resources and
+  manager allocations alive until the transceiver reports physical drain; a
+  non-drained attempt returns `False` and retains sessions, requests, result
+  ingress, registrations, and mappings. Nested cancellation, worker, or session
+  cleanup failures also retain the transceiver ownership root for retry, and
+  `PyExecutor` refuses resource-manager teardown while its asynchronous transfer
+  manager still reports an owner.
+
+This slice does **not** claim the complete ownership contract. It has no
+allocator-enforced destination KV lease, transfer generation/endpoint epochs,
+replay window, negotiated wire capability, allocator-issued source lease, or
+structured shutdown diagnostics beyond the boolean drained result. A missing
+result or ambiguous local operation therefore retains the whole Python request
+and transport mappings indefinitely; destroying the local NIXL agent is not
+treated as proof that a remote process can no longer submit a one-sided write.
+Most current cohorts protect KV through strong `LlmRequest`/manager-allocation
+retention. The V1 PP=1 partial-reuse cohort is the exception: after early
+request teardown, `AsyncTransferManager` retains request-wide block-ID refcount
+pins acquired by `store_blocks_for_reuse(..., pin_blocks=True)`, and the last
+provider retires them through the transactional `unpinBlocksById` operation.
+V2 retains its cache allocation through the request/cache-object ownership path
+instead of that V1 pin API. Neither mechanism is an allocation-generation-
+bearing source or destination lease; the common allocator lease remains
+follow-up work.
+
+The exact writer registry is enabled only when `ctx_dp_rank` selects a
+deterministic cohort. Generation-first attention-DP broadcast remains on the
+pre-existing compatibility path, which assumes exactly one enumerated
+candidate cohort performs the transfer. This initial slice deliberately adds no
+unnegotiated wire message to close non-participants: doing so would create an
+independent rolling-upgrade hang and would still lack generation-safe replay.
+Consequently attention-DP broadcast and its auxiliary fan-out are not covered
+by the ownership rollout until an address-free cohort selection or negotiated
+`NO_REMOTE_ACCESS` protocol satisfies the normative contract below.
+
+Cancellation tombstones are also keyed by the existing request ID and retained
+without a bounded replay window. This prevents cancel-before-create from
+stranding a currently published receiver, but endpoint epochs, capacity bounds,
+acknowledged retirement, and ABA protection remain follow-up work.
+
+Receive bounce is also disabled for PP fan-in (`overlap_pp_size > 1`) in this
+slice. Equal PP layer counts do not prove equal byte contributions when layer
+groups have different block sizes, and a divisibility check after summing bytes
+cannot prevent a writer from overflowing its assigned subrange. PP fan-in uses
+the direct path until the receiver can authorize byte-accurate per-writer
+extents and offsets before publishing any bounce address.
+
+For compatibility with the #15618 wire format, successful mode is inferred from
+the optional bounce result tail: a complete tail means bounce and no tail means
+direct fallback. A failed result is conservatively accounted as bounce when a
+bounce target was offered because the old frame does not encode the attempted
+mode. Transfer generations and explicit mode fields require negotiated protocol
+hardening.
+
+Synchronous receive timeout is intentionally fail-closed in this slice. The
+timeout latches logical failure and sends cancellation, but the call cannot
+return while a published target remains in doubt because there is not yet a
+detached allocator lease. The allocator-backed follow-up is required to
+preserve prompt timeout return semantics while safely retaining only the
+affected KV allocation.
+
+Focused CPU unit tests cover the registry state machine, exact candidate-cohort
+reconciliation, cancel-before-create replay, duplicate sender-operation
+admission, multi-operation sender retention, mixed direct/bounce accounting,
+socket serialization, deferred executor cleanup, and fail-closed shutdown
+gates. They do not establish active-bounce engagement on fabric hardware,
+attention-DP containment, mixed-version protocol liveness, or an
+allocator-enforced KV lease. Those configurations remain outside a production
+ownership rollout until their corresponding validation gates pass.
 
 ## Design Decisions
 
@@ -135,9 +260,9 @@ The merged
 [`bounce.TransferContext`](https://github.com/NVIDIA/TensorRT-LLM/blob/3bf37d25387c2b99ef6dba4555ed432bcedfcf4d/tensorrt_llm/_torch/disaggregation/native/bounce/core.py#L61-L175)
 tracks a receive bounce slot, writer results, scatter state, and settlement. It
 does not hold source or destination KV leases, the sender bounce lease, the NIXL
-operation, or the publication identity. In this design, that class is treated as
-an internal receive-bounce state object and should be renamed accordingly when
-the general context is introduced.
+operation, or the publication identity. The initial containment renames that
+class to `RecvBounceContext` and keeps it as an internal receive-bounce state
+object; the future general context remains separate.
 
 ### Related work
 
@@ -165,11 +290,15 @@ This note owns the physical resource-lifetime contract for the Python native
 transfer path. Cancellation intent enters this design as a logical event; it
 never authorizes physical release by itself.
 
-## Problem Statement
+## Pinned-Baseline Problem Statement and Residual Gaps
 
-### Current ownership is fragmented
+The concrete hazards in this section are anchored to the merged PR #15618
+baseline (`3bf37d2`). Each subsection states what the initial containment now
+closes and what remains for the complete ownership contract.
 
-The present path has several partial owners:
+### Baseline and residual ownership are fragmented
+
+At the pinned baseline, the path has several partial owners:
 
 - `LlmRequest` carries request state and allocated block identifiers.
 - `AsyncTransferManager` retains context-side requests during asynchronous send
@@ -181,14 +310,17 @@ The present path has several partial owners:
   receive bounce contexts.
 - KV managers remain the authority that can return blocks to their pools.
 
-No object has both the information and authority to answer: **which asynchronous
-accessors can still touch which allocation generation?**
+The initial containment adds registry-owned receive state, exact sender
+operation owners, request retention, and V1 pin tokens. It still has no common
+allocator-generation-bearing lease, so no single object has both the
+information and allocator authority to answer: **which asynchronous accessors
+can still touch which allocation generation?**
 
-### Concrete remaining hazards
+### Concrete baseline hazards and containment status
 
 #### Released bounce address can still be advertised
 
-The current
+At the pinned baseline, the
 [`dispatch_task()` sequence](https://github.com/NVIDIA/TensorRT-LLM/blob/3bf37d25387c2b99ef6dba4555ed432bcedfcf4d/tensorrt_llm/_torch/disaggregation/native/transfer.py#L1522-L1589)
 reserves a receive slot, then separately finds the session, changes task state,
 and publishes the address. Concurrent
@@ -198,9 +330,14 @@ those steps. Dispatch may then advertise an address that has already returned to
 the allocator, creating a potential cross-request overwrite if a remote writer
 uses the stale address after the slot is reused.
 
+**Initial-containment status:** closed for the supported deterministic writer
+cohorts. Registry admission, publication gating, and cancellation are one
+lifecycle transaction, and a possibly published slot remains owned until its
+writers and scatter settle.
+
 #### First fan-in failure can outlive its session
 
-The first failed writer currently
+At the pinned baseline, the first failed writer
 [`fail()`s the task immediately](https://github.com/NVIDIA/TensorRT-LLM/blob/3bf37d25387c2b99ef6dba4555ed432bcedfcf4d/tensorrt_llm/_torch/disaggregation/native/transfer.py#L1898-L1912).
 Failed-session cleanup can remove the `RxSession`, while
 [`_process_kv_agent_result()`](https://github.com/NVIDIA/TensorRT-LLM/blob/3bf37d25387c2b99ef6dba4555ed432bcedfcf4d/tensorrt_llm/_torch/disaggregation/native/transfer.py#L1684-L1710)
@@ -211,6 +348,10 @@ direct transfer, a sibling writer may still be writing destination KV. If
 request cleanup recycles those blocks before that sibling is quiescent, this
 creates a potential physical GPU memory use-after-release/ABA hazard, not merely
 a Python object-lifetime issue.
+
+**Initial-containment status:** closed for supported cohorts. Results route
+through a registry that outlives `RxSession`, tracks the exact writer set, and
+keeps the destination owner until every possibly exposed writer is terminal.
 
 #### Timeout and quarantine do not prove retirement
 
@@ -225,26 +366,40 @@ The allocator's fixed-duration quarantine, if wired into production, would also
 not be a transport guarantee. An elapsed grace period cannot prove that a
 one-sided operation will not access the region later.
 
+**Initial-containment status:** timed reuse is removed. Ambiguous operations are
+retained indefinitely and shutdown reports non-drained instead of reclaiming
+their memory. Bounded recovery still requires generation-safe replay,
+acknowledgement, and allocator-enforced leases.
+
 #### Shutdown order can destroy live memory
 
-Sender workers use an unbounded transfer wait but are joined with a finite
-deadline. The enclosing
+At the pinned baseline, sender workers use an unbounded transfer wait but are
+joined with a finite deadline. The enclosing
 [`TransferWorker.shutdown()`](https://github.com/NVIDIA/TensorRT-LLM/blob/3bf37d25387c2b99ef6dba4555ed432bcedfcf4d/tensorrt_llm/_torch/disaggregation/native/transfer.py#L2297-L2339)
 invokes the current
 [`VmmBounceTransport.close()`](https://github.com/NVIDIA/TensorRT-LLM/blob/3bf37d25387c2b99ef6dba4555ed432bcedfcf4d/tensorrt_llm/_torch/disaggregation/native/bounce/impl.py#L382-L394)
 which stops the scatter worker, deregisters arenas, and destroys their mappings.
-This occurs before the
-[`BaseTransferAgent.shutdown()` quiescence contract](https://github.com/NVIDIA/TensorRT-LLM/blob/3bf37d25387c2b99ef6dba4555ed432bcedfcf4d/tensorrt_llm/_torch/disaggregation/base/agent.py#L85-L121)
+This occurs before local
+[`BaseTransferAgent.shutdown()`](https://github.com/NVIDIA/TensorRT-LLM/blob/3bf37d25387c2b99ef6dba4555ed432bcedfcf4d/tensorrt_llm/_torch/disaggregation/base/agent.py#L85-L121)
 is invoked. A sender worker, remote RMA, or queued scatter may still reference
-those ranges.
+those ranges. Invoking local agent shutdown first would not repair the contract:
+destroying the local handle is not an external fence preventing a remote peer
+from submitting a later one-sided write to an address it already received.
+
+**Initial-containment status:** shutdown now closes admission and refuses to
+deregister or destroy mappings while any sender, receiver, result-delivery, or
+bounce owner remains. A non-drained attempt retains the transceiver for retry;
+an externally established remote/global quiescence fence remains future work.
 
 #### Count-based fan-in is not identity-safe
 
-The current receive context records distinct peer ranks until
-`len(_writer_ok) >= num_writers`. It does not retain the exact advertised writer
-set or a transfer generation. An unexpected distinct writer can count toward
-completion, and a stale result can collide with a later reuse of the same
-`(request_id, slice_id)` key.
+At the pinned PR #15618 baseline, the receive context records distinct peer
+ranks until `len(_writer_ok) >= num_writers`. It does not retain the exact
+advertised writer set or a transfer generation. An unexpected distinct writer
+can count toward completion, and a stale result can collide with a later reuse
+of the same `(request_id, slice_id)` key. The initial containment implemented
+in this follow-up closes the first gap with an exact writer ledger; transfer
+generation and endpoint-epoch identity remain future work.
 
 ## Scope and Applicability
 
@@ -269,7 +424,8 @@ safety applies.
 
 ### Non-goals
 
-- Replacing or porting the design into the separate C++ `CacheTransceiver`.
+- Replacing or porting the design into the separate C++ `CacheTransceiver`, or
+  treating destruction of its local object as transport quiescence evidence.
 - Unifying the Python bounce implementation with the independent C++ bounce
   implementation in PR #15780.
 - Redesigning rank consensus, scheduler cancellation, or request admission.
@@ -295,7 +451,7 @@ safety applies.
 | **Admission control** | An address-free protocol record that admits, rejects, skips, or creation-closes one transfer generation. Sending it is not address publication. |
 | **Generation skip** | An authenticated admission control used only when local state positively proves normal admission never became observable and no address can be published; the peer must acknowledge it before replay floors advance. |
 | **Terminal evidence** | Positive evidence, defined by the backend contract, that a specific operation cannot perform later memory access. |
-| **Quiescence** | A per-operation or backend-wide guarantee that no relevant asynchronous access can occur later. |
+| **Quiescence** | Positive per-operation evidence or an externally established remote/global fence covering every relevant peer, submission path, and fabric operation. Local agent shutdown alone is not quiescence. |
 | **Quarantine** | Removal from reuse while quiescence is unknown. It does not become safe through elapsed time. |
 | **Transfer generation** | A strictly increasing admission sequence allocated by the admission initiator within its endpoint epoch. Every slice in that attempt and every request-level lifecycle control share it. |
 | **Allocation generation** | An allocator-issued incarnation of a KV block or bounce slot. It is carried by the resource lease and is independent of the transfer generation. |
@@ -432,10 +588,12 @@ is forbidden.
 
 **O10 — Drain before teardown.** A KV or bounce registration/mapping MUST NOT be
 destroyed until every relevant network accessor is quiescent (or backend-wide
-quiescence substitutes for missing per-operation evidence) **and** all local
-CUDA work that can touch it is complete. If shutdown also removes registrations
-used by auxiliary transfers, those independent owners MUST drain as an external
-precondition; draining only the KV registry is insufficient.
+quiescence established by an external remote/global fence substitutes for
+missing per-operation evidence) **and** all local CUDA work that can touch it is
+complete. Shutting down the receiver's local agent is not such a fence. If
+shutdown also removes registrations used by auxiliary transfers, those
+independent owners MUST drain as an external precondition; draining only the KV
+registry is insufficient.
 
 **O11 — No blocking under lifecycle locks.** The only permitted nested
 lifecycle-lock order is admission token, then registry, then handle, then
@@ -713,10 +871,12 @@ completion before a later chunk enrolls.
 | KV manager | Underlying KV allocation; atomic allocation-generation-bearing snapshot/lease issuance; enforcement of active transfer leases. | Network completion inference. |
 | NIXL agent | Submission/progress and documented quiescence evidence. | KV block reuse. |
 
-The current `bounce.TransferContext` should become an implementation detail such
-as `RecvBounceContext` or be replaced by `RecvBounceLease` state. Expanding it
-into the general owner would couple direct transfer, request notification, KV
-allocation, and transport arena internals into the bounce package.
+The initial containment has renamed the PR #15618 bounce-only
+`bounce.TransferContext` to `RecvBounceContext` and kept it an implementation
+detail. It may eventually be narrowed further to `RecvBounceLease` state, but
+it must not become the general owner: doing so would couple direct transfer,
+request notification, KV allocation, and transport arena internals into the
+bounce package.
 
 Before admission, the request/session holds a one-shot
 `TransferAdmissionToken`; after atomic binding it exposes only a
@@ -843,7 +1003,10 @@ The structured lifecycle result is a Python-native integration, not a required
 behavior change for the C++ transceiver. PyExecutor selects a lifecycle-capable
 adapter when constructing `KvCacheTransceiverV2`; other implementations keep the
 existing boolean contract. The selection is explicit per transceiver instance,
-not a runtime union inferred from a returned value.
+not a runtime union inferred from a returned value. Shared teardown accounting
+may still fail closed for a live owner or release, but this adapter neither
+retires a C++ transport owner nor interprets local C++ object destruction as
+physical drain.
 
 Phase 1 applies this behavior to the receive side only after the destination KV
 lease exists. The context-side sender retains the legacy cleanup gate until the
@@ -1089,12 +1252,14 @@ report that the request was cancelled or that a bounded wait elapsed.
 
 ### Lost results and quarantine
 
-In the first implementation, a receive context whose quiescence-bearing result is lost
-remains in doubt until backend-wide or driver-level teardown explicitly revokes
-the relevant registrations and prevents later DMA. Merely losing Python objects,
-running destructors, or entering generic process-control teardown is not
-evidence. The memory is not reused. This can reduce capacity and eventually
-reject admission, but it does not trade memory safety for a timer.
+In the first implementation, a receive context whose quiescence-bearing result
+is lost remains in doubt until an externally established remote/global fence or
+driver/fabric-level revocation explicitly prevents every relevant peer from
+submitting or completing later DMA. Shutting down only the receiver's local
+agent, losing Python objects, running destructors, or entering generic
+process-control teardown is not evidence. The memory is not reused. This can
+reduce capacity and eventually reject admission, but it does not trade memory
+safety for a timer.
 
 Bounded in-process reclamation requires one of:
 
@@ -1102,7 +1267,7 @@ Bounded in-process reclamation requires one of:
 - a receiver query that obtains per-operation quiescence evidence;
 - a peer/session epoch transition with a backend guarantee that old operations
   cannot access current registrations; or
-- backend-wide quiescence.
+- backend-wide quiescence backed by an external remote/global fence.
 
 Those are liveness improvements, not permission to weaken the baseline safety
 contract.
@@ -1289,12 +1454,15 @@ per-operation cancel/recovery API may remain a later liveness improvement.
 
 ## Shutdown Contract
 
-`KvCacheTransceiverV2` is the top-level owner of shutdown progress. Its
-`shutdown(deadline)` returns a `ShutdownResult` rather than treating initiation
-as finalization. `DRAINED` permits dependent teardown. `RETRYABLE_IN_DOUBT`
-requires the caller to retain the transceiver, worker, registry, KV managers,
-and registrations and to retry drain or escalate process health; it does not
-permit resource-manager teardown.
+When the Python-native lifecycle adapter is selected, `KvCacheTransceiverV2` is
+the top-level owner of shutdown progress. Its `shutdown(deadline)` returns a
+`ShutdownResult` rather than treating initiation as finalization. `DRAINED`
+permits dependent teardown. `RETRYABLE_IN_DOUBT` requires the caller to retain
+the transceiver, worker, registry, KV managers, and registrations and to retry
+drain or escalate process health; it does not permit resource-manager teardown.
+For other transceivers, shared teardown accounting may veto destruction while a
+generic owner or release remains live, but it cannot derive quiescence or retire
+a C++ transport owner from local object destruction.
 
 Shutdown follows this order:
 
@@ -1314,9 +1482,10 @@ Shutdown follows this order:
    result closes its fixed operation; authenticated end-of-stream closes future
    enrollment/submission for a dynamic stream, but neither substitutes for
    quiescence of already-submitted work.
-5. For submitted or still-in-doubt network operations, request per-operation or
-   backend-wide quiescence through a documented `quiesce()`/drain operation
-   before the deadline.
+5. For submitted or still-in-doubt network operations, request per-operation
+   evidence or backend-wide quiescence through a documented external
+   remote/global `quiesce()`/drain fence before the deadline. Local agent
+   shutdown cannot satisfy this step.
 6. If the deadline expires without the required operation/stream closure or
    submission fence and quiescence evidence, return a non-drained result and
    stop teardown at this point.

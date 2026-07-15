@@ -42,6 +42,7 @@
 #include <map>
 #include <optional>
 #include <sstream>
+#include <unordered_map>
 #include <utility>
 
 namespace tc = tensorrt_llm::common;
@@ -271,6 +272,11 @@ void KVCacheBlock::decSchedulingRefCount()
 {
     TLLM_CHECK_WITH_INFO(hasSchedulingRefs(), "Can't remove link from block that is not allocated");
     mSchedulingRefCount--;
+}
+
+SizeType32 KVCacheBlock::getRefCount() const
+{
+    return mRefCount;
 }
 
 bool KVCacheBlock::hasRefs() const
@@ -2993,6 +2999,15 @@ void WindowBlockManager::unpinBlocksById(std::vector<KVCacheBlock::IdType> const
         return;
     }
 
+    std::lock_guard<std::recursive_mutex> lock(mLookupTree->getMutex());
+
+    // Validate the complete operation before changing any refcount. Repeated
+    // IDs represent multiple pin tokens, so aggregate their decrements and
+    // prove that the block has enough references for the entire batch.
+    std::unordered_map<KVCacheBlock::IdType, SizeType32> decrementCounts;
+    std::vector<BlockPtr> blocksToUnpin;
+    decrementCounts.reserve(blockIds.size());
+    blocksToUnpin.reserve(blockIds.size());
     for (auto const& blockId : blockIds)
     {
         TLLM_CHECK_WITH_INFO(blockId >= 0 && static_cast<size_t>(blockId) < mAllBlocksById.size(),
@@ -3000,11 +3015,20 @@ void WindowBlockManager::unpinBlocksById(std::vector<KVCacheBlock::IdType> const
         auto block = mAllBlocksById[blockId];
         if (block && block->getBlockId() != KVCacheBlock::kCachedBlocksRootId)
         {
-            block->decRefCount();
-            if (!block->hasRefs())
-            {
-                mEvictionPolicy->releaseBlock(block);
-            }
+            auto const decrementCount = ++decrementCounts[blockId];
+            TLLM_CHECK_WITH_INFO(block->getRefCount() >= decrementCount,
+                "Can't unpin block (id=%d) %d time(s) with refcount %d", static_cast<int>(blockId), decrementCount,
+                block->getRefCount());
+            blocksToUnpin.push_back(block);
+        }
+    }
+
+    for (auto const& block : blocksToUnpin)
+    {
+        block->decRefCount();
+        if (!block->hasRefs())
+        {
+            mEvictionPolicy->releaseBlock(block);
         }
     }
 }

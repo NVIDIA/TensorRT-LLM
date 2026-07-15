@@ -182,6 +182,11 @@ def create_kv_cache_transceiver(
 
 class KvCacheTransceiver(ABC):
 
+    @property
+    def requires_physical_drain_before_request_release(self) -> bool:
+        """Whether request resources must remain owned until cancel drains."""
+        return False
+
     @abstractmethod
     def respond_and_send_async(self, req: LlmRequest):
         raise NotImplementedError
@@ -237,8 +242,15 @@ class KvCacheTransceiver(ABC):
     def commit_blocks_for_reuse(self, req: LlmRequest) -> None:
         """Commit received KV blocks to the radix tree for prefix reuse. No-op by default."""
 
-    def shutdown(self):
-        """Shut down the transceiver and release registered resources."""
+    def shutdown(self) -> Optional[bool]:
+        """Shut down the transceiver and release registered resources.
+
+        Returns:
+            Lifecycle-capable implementations return ``True`` only after a
+            complete drain and ``False`` while resources remain owned. Legacy
+            implementations may return ``None``; callers must not interpret it
+            as transport-quiescence evidence.
+        """
 
 
 class BindKvCacheTransceiver(KvCacheTransceiver):

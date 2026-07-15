@@ -442,6 +442,8 @@ public:
 
     void decSchedulingRefCount();
 
+    [[nodiscard]] SizeType32 getRefCount() const;
+
     [[nodiscard]] bool hasRefs() const;
 
     [[nodiscard]] bool hasSchedulingRefs() const;
