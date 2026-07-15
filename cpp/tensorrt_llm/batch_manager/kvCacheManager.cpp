@@ -1757,8 +1757,9 @@ bool WindowBlockManager::areBlocksReady(LlmRequest::RequestIdType requestId)
     // the reader thread already logged the details.
     if (mTransferManager->anyReadFailed())
     {
-        TLLM_THROW("disk tier: async onboard read failed (see [disk-tier] error log); failing rather than "
-                   "serving never-filled KV");
+        TLLM_THROW(
+            "disk tier: async onboard read failed (see [disk-tier] error log); failing rather than "
+            "serving never-filled KV");
     }
     // Fast path: with no disk read in flight (the common case) every block is trivially ready, so skip the
     // per-block scan and its mutex entirely. Without this the park scans every block of every context

@@ -496,8 +496,8 @@ void KVCacheTransferManager::diskWriterLoop()
             auto const written = ::pwrite(fd, data, job.bytes, 0);
             ::close(fd);
             TLLM_CHECK_WITH_INFO(written == static_cast<ssize_t>(job.bytes),
-                "[disk-tier] short async write to %s (%zd/%zu)", job.filename.c_str(),
-                static_cast<ssize_t>(written), job.bytes);
+                "[disk-tier] short async write to %s (%zd/%zu)", job.filename.c_str(), static_cast<ssize_t>(written),
+                job.bytes);
         }
         catch (std::exception const& e)
         {

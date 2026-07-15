@@ -11290,7 +11290,7 @@ void runWriteQueueBoundedTest(bool unstaged)
     std::size_t constexpr cap = 4;
     std::size_t constexpr burst = 200; // far more than the cap: the producer must block once the queue is full
 
-    DiskTierDir dir;                                 // real directory for the writer to drain into (cleaned on exit)
+    DiskTierDir dir;                   // real directory for the writer to drain into (cleaned on exit)
     std::vector<std::uint8_t> src(256 * 1024, 0xAB); // large enough that the single writer lags the producer
     auto bufferManager = tr::BufferManager(std::make_shared<tr::CudaStream>());
     auto transferManager = KVCacheTransferManager(bufferManager);
