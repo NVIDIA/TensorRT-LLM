@@ -127,6 +127,12 @@ def test_extract_disagg_cfg(sample_yaml_config):
     assert config.disagg_coordinator_url == "http://coordinator:7999"
 
 
+@pytest.mark.parametrize("node_id", [-1, 256])
+def test_extract_disagg_cfg_rejects_out_of_range_node_id(node_id):
+    with pytest.raises(ValueError, match="node_id must be in range"):
+        extract_disagg_cfg(node_id=node_id)
+
+
 def test_extract_ctx_gen_cfgs():
     configs = extract_ctx_gen_cfgs(
         type="ctx",

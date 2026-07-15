@@ -247,6 +247,10 @@ def extract_disagg_cfg(hostname: str = 'localhost',
                                 max_retries, perf_metrics_max_requests,
                                 disagg_cluster_config)
     if node_id is not None:
+        node_id_space = 1 << DISAGG_NODE_ID_BITS
+        if not 0 <= node_id < node_id_space:
+            raise ValueError(
+                f"node_id must be in range [0, {node_id_space}), got {node_id}")
         config.node_id = node_id
     if schedule_style:
         config.schedule_style = schedule_style

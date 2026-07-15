@@ -95,6 +95,8 @@ async def test_coordinator_finish_retries_failed_release():
     session = mock.MagicMock()
     session.post = mock.MagicMock(side_effect=[
         _response(503, {"error": "temporarily unavailable"}),
+        _response(503, {"error": "temporarily unavailable"}),
+        _response(503, {"error": "temporarily unavailable"}),
         _response(200, {}),
     ])
     session.close = mock.AsyncMock()
@@ -104,8 +106,8 @@ async def test_coordinator_finish_retries_failed_release():
                     new_callable=mock.AsyncMock) as sleep:
         await router._finish_async(123, True)
 
-    assert session.post.call_count == 2
-    sleep.assert_awaited_once()
+    assert session.post.call_count == 4
+    assert sleep.await_count == 3
 
 
 @pytest.fixture(autouse=True)

@@ -38,8 +38,8 @@ from tensorrt_llm.serve.router_utils import (  # noqa: F401
     v2_sha256_block_hasher)
 
 _MSGPACK_HEADERS = {"Content-Type": "application/msgpack"}
-COORDINATOR_FINISH_MAX_ATTEMPTS = 3
 COORDINATOR_FINISH_RETRY_DELAY_S = 0.1
+COORDINATOR_FINISH_MAX_RETRY_DELAY_S = 5.0
 
 # Max number of conversations whose home-server pin is retained (LRU).
 ROUTE_AFFINITY_CACHE_SIZE = 50000
@@ -1725,7 +1725,10 @@ class CoordinatorDelegatingRouter(Router):
 
     async def _finish_async(self, req_id: int, success: bool):
         _t0 = time.monotonic()
-        for attempt in range(1, COORDINATOR_FINISH_MAX_ATTEMPTS + 1):
+        attempt = 0
+        delay = COORDINATOR_FINISH_RETRY_DELAY_S
+        while True:
+            attempt += 1
             try:
                 async with self.session.post(
                         f"{self._coordinator_url}/finish",
@@ -1752,16 +1755,11 @@ class CoordinatorDelegatingRouter(Router):
                 self._finish_lat.record(time.monotonic() - _t0)
                 return
             except Exception as e:  # noqa: BLE001
-                if attempt == COORDINATOR_FINISH_MAX_ATTEMPTS:
-                    logger.warning(
-                        f"CoordinatorDelegatingRouter finish failed after "
-                        f"{attempt} attempts: {e}")
-                    return
                 logger.warning(
                     f"CoordinatorDelegatingRouter finish attempt {attempt} "
-                    f"failed: {e}; retrying")
-                await asyncio.sleep(COORDINATOR_FINISH_RETRY_DELAY_S *
-                                    (2**(attempt - 1)))
+                    f"failed: {e}; retrying in {delay:.1f}s")
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, COORDINATOR_FINISH_MAX_RETRY_DELAY_S)
 
     async def close(self):
         if self._background_tasks:
