@@ -121,6 +121,7 @@ def _pipeline_with_test_doubles():
     pipe._encode_prompt = _encode_prompt
     pipe._prepare_latents = _prepare_latents
     pipe._decode_latents = _decode_latents
+    pipe.cache_accelerator = None
     return pipe, captured
 
 

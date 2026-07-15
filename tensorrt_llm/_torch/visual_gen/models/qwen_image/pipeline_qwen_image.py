@@ -415,6 +415,10 @@ class QwenImagePipeline(BasePipeline):
     # Inference entry points.
     # ------------------------------------------------------------------
     @property
+    def cache_enabled(self) -> bool:
+        return self.cache_accelerator is not None and self.cache_accelerator.is_enabled()
+
+    @property
     def default_generation_params(self) -> dict:
         return dict(_DEFAULT_GENERATION_PARAMS)
 
