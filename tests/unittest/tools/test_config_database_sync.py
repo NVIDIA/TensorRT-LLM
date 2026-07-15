@@ -237,12 +237,26 @@ class TestConfigDatabaseSync(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "profile is only allowed"):
             RecipeList.model_validate([{**base, "profile": "balanced"}])
 
-        incomplete_conflict = [
+        endpoint_conflict = [
             {**base, "config_path": "latency.yaml", "profile": "latency"},
             {**base, "config_path": "throughput.yaml", "profile": "throughput"},
         ]
-        with self.assertRaisesRegex(ValueError, "exactly one latency, balanced, and throughput"):
-            RecipeList.model_validate(incomplete_conflict)
+        parsed = RecipeList.model_validate(endpoint_conflict)
+        self.assertEqual([recipe.profile for recipe in parsed], ["latency", "throughput"])
+
+        missing_endpoint = [
+            {**base, "config_path": "latency.yaml", "profile": "latency"},
+            {**base, "config_path": "balanced.yaml", "profile": "balanced"},
+        ]
+        with self.assertRaisesRegex(ValueError, "exactly one latency and throughput"):
+            RecipeList.model_validate(missing_endpoint)
+
+        duplicate_profile = [
+            {**base, "config_path": "latency-a.yaml", "profile": "latency"},
+            {**base, "config_path": "latency-b.yaml", "profile": "latency"},
+        ]
+        with self.assertRaisesRegex(ValueError, "exactly one latency and throughput"):
+            RecipeList.model_validate(duplicate_profile)
 
     @pytest.mark.skip(reason="https://nvbugs/6337224")
     def test_config_database_tests_sync(self):

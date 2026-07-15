@@ -174,17 +174,23 @@ class RecipeList(RootModel[list[Recipe]]):
             )
             groups[key].append(recipe)
 
-        expected_profiles = set(PROFILE_DISPLAY_NAMES)
+        required_profiles = {"latency", "throughput"}
         for key, recipes in groups.items():
             profiles = [recipe.profile for recipe in recipes]
             if len(recipes) == 1:
                 if profiles[0] is not None:
                     raise ValueError(f"profile is only allowed for conflicting workload key {key}")
                 continue
-            if len(recipes) != len(expected_profiles) or set(profiles) != expected_profiles:
+            profile_set = set(profiles)
+            if (
+                None in profile_set
+                or len(profile_set) != len(profiles)
+                or not required_profiles.issubset(profile_set)
+            ):
                 raise ValueError(
                     "conflicting workload key "
-                    f"{key} must have exactly one latency, balanced, and throughput profile"
+                    f"{key} must have exactly one latency and throughput profile, "
+                    "with an optional balanced profile"
                 )
         return self
 
