@@ -28,8 +28,8 @@
   </noscript>
   
   <!-- Loaded before other Sphinx assets -->
-  <link href="../_static/styles/theme.css?digest=a95f357e85573c9b56d5" rel="stylesheet" />
-<link href="../_static/styles/pydata-sphinx-theme.css?digest=a95f357e85573c9b56d5" rel="stylesheet" />
+  <link href="../_static/styles/theme.css?digest=90905a2f556bf617f1a9" rel="stylesheet" />
+<link href="../_static/styles/pydata-sphinx-theme.css?digest=90905a2f556bf617f1a9" rel="stylesheet" />
 
     <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=8f2a1f02" />
     <link rel="stylesheet" type="text/css" href="../_static/styles/nvidia-sphinx-theme.css?v=933278ad" />
@@ -40,10 +40,10 @@
     <link rel="stylesheet" type="text/css" href="../_static/custom.css?v=19d20f17" />
   
   <!-- So that users can add custom icons -->
-  <script defer src="../_static/scripts/fontawesome.js?digest=a95f357e85573c9b56d5"></script>
+  <script defer src="../_static/scripts/fontawesome.js?digest=90905a2f556bf617f1a9"></script>
   <!-- Pre-loaded scripts that we'll load fully later -->
-  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=a95f357e85573c9b56d5" />
-<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=a95f357e85573c9b56d5" />
+  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=90905a2f556bf617f1a9" />
+<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=90905a2f556bf617f1a9" />
 
 
 
@@ -61,9 +61,9 @@
     <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
     <script>DOCUMENTATION_OPTIONS.pagename = 'models/visual-generation';</script>
     <script>
-        DOCUMENTATION_OPTIONS.theme_version = '0.19.0';
+        DOCUMENTATION_OPTIONS.theme_version = '0.20.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc20';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc21';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc20" />
+  <meta name="docsearch:version" content="1.3.0rc21" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -446,6 +446,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../features/feature-combination-matrix.html">Feature Combination Matrix</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/disagg-serving.html">Disaggregated Serving</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/embeddings.html">Embeddings (Encoder-Only Models)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/kvcache.html">KV Cache System</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/long-sequence.html">Long Sequences</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/lora.html">LoRA (Low-Rank Adaptation)</a></li>
@@ -456,6 +457,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../features/quantization.html">Quantization</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/sampling.html">Sampling</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/additional-outputs.html">Additional Outputs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/post-processor-hook.html">Post-Processing Hook</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/guided-decoding.html">Guided Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/speculative-decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/checkpoint-loading.html">Checkpoint Loading</a></li>
@@ -495,6 +497,7 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog25_Scaling_Video_Generation_Across_NVL72_Rack_with_TensorRT-LLM.html">Scaling Video Generation Across NVL72 rack with TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog24_MoE_as_Dense_GEMM.html">MoE as Dense GEMM: Optimizing Low-Latency MoE Inference on NVIDIA Blackwell</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog23_Joint_Optimization_of_Agent_Applications_and_TensorRT-LLM.html">Joint Optimization of Agent Applications and TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog22_Helix_Parallelism_Scaling_Multi_Million_Token_Decoding_with_KV_Cache_Sharding.html">Helix Parallelism in TensorRT-LLM: Scaling Multi-Million-Token Decoding with KV Cache Sharding</a></li>
@@ -532,9 +535,9 @@
 <li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM">Github Code</a></li>
 <li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/issues?q=is%3Aissue%20state%3Aopen%20label%3Aroadmap">Roadmap</a></li>
 </ul>
-<p aria-level="2" class="caption" role="heading"><span class="caption-text">Use TensorRT Engine</span></p>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Migration</span></p>
 <ul class="nav bd-sidenav">
-<li class="toctree-l1"><a class="reference internal" href="../legacy/tensorrt_quickstart.html">LLM API with TensorRT Engine</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../legacy/tensorrt-backend-removal.html">Migration Guide: TensorRT Backend Removed</a></li>
 </ul>
 </div>
 </nav></div>
@@ -586,7 +589,7 @@
 <div id="searchbox"></div>
                 <article class="bd-article">
                   
-  <section class="tex2jax_ignore mathjax_ignore" id="visual-generation-beta">
+  <section id="visual-generation-beta">
 <h1>Visual Generation (Beta)<a class="headerlink" href="#visual-generation-beta" title="Link to this heading">#</a></h1>
 <div class="admonition note">
 <p class="admonition-title">Note</p>
@@ -629,34 +632,37 @@ actively evolving and may change in future releases.</p>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">Wan-AI/Wan2.1-T2V-14B-Diffusers</span></code></p></td>
 <td><p>Text-to-Video</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">Wan-AI/Wan2.1-I2V-14B-480P-Diffusers</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">FastVideo/Wan2.1-VSA-T2V-14B-720P-Diffusers</span></code></p></td>
+<td><p>Text-to-Video (VSA)</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">Wan-AI/Wan2.1-I2V-14B-480P-Diffusers</span></code></p></td>
 <td><p>Image-to-Video</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">Wan-AI/Wan2.1-I2V-14B-720P-Diffusers</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">Wan-AI/Wan2.1-I2V-14B-720P-Diffusers</span></code></p></td>
 <td><p>Image-to-Video</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">Wan-AI/Wan2.2-T2V-A14B-Diffusers</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">Wan-AI/Wan2.2-T2V-A14B-Diffusers</span></code></p></td>
 <td><p>Text-to-Video</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">Wan-AI/Wan2.2-I2V-A14B-Diffusers</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">Wan-AI/Wan2.2-I2V-A14B-Diffusers</span></code></p></td>
 <td><p>Image-to-Video</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">Wan-AI/Wan2.2-TI2V-5B-Diffusers</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">Wan-AI/Wan2.2-TI2V-5B-Diffusers</span></code></p></td>
 <td><p>Text-to-Video, Image-to-Video</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">Lightricks/LTX-2</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">Lightricks/LTX-2</span></code></p></td>
 <td><p>Text-to-Video (with Audio), Image-to-Video (with Audio)</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">Qwen/Qwen-Image</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">Qwen/Qwen-Image</span></code></p></td>
 <td><p>Text-to-Image</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">Qwen/Qwen-Image-2512</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">Qwen/Qwen-Image-2512</span></code></p></td>
 <td><p>Text-to-Image</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">nvidia/Cosmos3-Nano</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">nvidia/Cosmos3-Nano</span></code></p></td>
 <td><p>Text-to-Image, Text-to-Video, Image-to-Video</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">nvidia/Cosmos3-Super</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">nvidia/Cosmos3-Super</span></code></p></td>
 <td><p>Text-to-Image, Text-to-Video, Image-to-Video</p></td>
 </tr>
 </tbody>
@@ -681,6 +687,7 @@ actively evolving and may change in future releases.</p>
 <th class="head"><p>Attention2D</p></th>
 <th class="head"><p>Ring Attention</p></th>
 <th class="head"><p>Tensor Parallelism</p></th>
+<th class="head"><p>VSA</p></th>
 </tr>
 </thead>
 <tbody>
@@ -689,7 +696,7 @@ actively evolving and may change in future releases.</p>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
-<td><p>No <a class="footnote-reference brackets" href="#id6" id="id1" role="doc-noteref"><span class="fn-bracket">[</span>1<span class="fn-bracket">]</span></a></p></td>
+<td><p>No <a class="footnote-reference brackets" href="#id7" id="id1" role="doc-noteref"><span class="fn-bracket">[</span>1<span class="fn-bracket">]</span></a></p></td>
 <td><p>Yes</p></td>
 <td><p>No</p></td>
 <td><p>Yes</p></td>
@@ -698,13 +705,14 @@ actively evolving and may change in future releases.</p>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
+<td><p>No</p></td>
 </tr>
 <tr class="row-odd"><td><p><strong>FLUX.2</strong></p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
-<td><p>No <a class="footnote-reference brackets" href="#id6" id="id2" role="doc-noteref"><span class="fn-bracket">[</span>1<span class="fn-bracket">]</span></a></p></td>
+<td><p>No <a class="footnote-reference brackets" href="#id7" id="id2" role="doc-noteref"><span class="fn-bracket">[</span>1<span class="fn-bracket">]</span></a></p></td>
 <td><p>Yes</p></td>
 <td><p>No</p></td>
 <td><p>Yes</p></td>
@@ -713,6 +721,7 @@ actively evolving and may change in future releases.</p>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
+<td><p>No</p></td>
 </tr>
 <tr class="row-even"><td><p><strong>Wan 2.1</strong></p></td>
 <td><p>Yes</p></td>
@@ -728,45 +737,33 @@ actively evolving and may change in future releases.</p>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
-</tr>
-<tr class="row-odd"><td><p><strong>Wan 2.2</strong></p></td>
-<td><p>Yes</p></td>
-<td><p>Yes</p></td>
-<td><p>Yes <a class="footnote-reference brackets" href="#id7" id="id3" role="doc-noteref"><span class="fn-bracket">[</span>2<span class="fn-bracket">]</span></a></p></td>
-<td><p>Yes</p></td>
-<td><p>Yes</p></td>
-<td><p>Yes</p></td>
-<td><p>Yes</p></td>
-<td><p>Yes</p></td>
-<td><p>Yes</p></td>
-<td><p>Yes</p></td>
-<td><p>Yes</p></td>
-<td><p>Yes</p></td>
-<td><p>Yes</p></td>
-</tr>
-<tr class="row-even"><td><p><strong>LTX-2</strong></p></td>
-<td><p>Yes</p></td>
-<td><p>Yes</p></td>
-<td><p>Yes <a class="footnote-reference brackets" href="#id8" id="id4" role="doc-noteref"><span class="fn-bracket">[</span>3<span class="fn-bracket">]</span></a></p></td>
-<td><p>Yes</p></td>
-<td><p>Yes</p></td>
-<td><p>Yes</p></td>
-<td><p>No</p></td>
-<td><p>No</p></td>
-<td><p>Yes</p></td>
-<td><p>Yes</p></td>
-<td><p>Yes</p></td>
-<td><p>Yes</p></td>
 <td><p>No</p></td>
 </tr>
-<tr class="row-odd"><td><p><strong>Qwen-Image</strong> <a class="footnote-reference brackets" href="#id9" id="id5" role="doc-noteref"><span class="fn-bracket">[</span>4<span class="fn-bracket">]</span></a></p></td>
+<tr class="row-odd"><td><p><strong>Wan 2.1 VSA</strong> <a class="footnote-reference brackets" href="#id8" id="id3" role="doc-noteref"><span class="fn-bracket">[</span>2<span class="fn-bracket">]</span></a></p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>No</p></td>
 <td><p>No</p></td>
-<td><p>No</p></td>
 <td><p>Yes</p></td>
-<td><p>No</p></td>
+<td><p>Yes</p></td>
+</tr>
+<tr class="row-even"><td><p><strong>Wan 2.2</strong></p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
+<td><p>Yes <a class="footnote-reference brackets" href="#id9" id="id4" role="doc-noteref"><span class="fn-bracket">[</span>3<span class="fn-bracket">]</span></a></p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
@@ -774,7 +771,39 @@ actively evolving and may change in future releases.</p>
 <td><p>Yes</p></td>
 <td><p>No</p></td>
 </tr>
-<tr class="row-even"><td><p><strong>Cosmos3</strong></p></td>
+<tr class="row-odd"><td><p><strong>LTX-2</strong></p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
+<td><p>Yes <a class="footnote-reference brackets" href="#id10" id="id5" role="doc-noteref"><span class="fn-bracket">[</span>4<span class="fn-bracket">]</span></a></p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
+<td><p>No</p></td>
+<td><p>No</p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
+<td><p>No</p></td>
+<td><p>No</p></td>
+</tr>
+<tr class="row-even"><td><p><strong>Qwen-Image</strong> <a class="footnote-reference brackets" href="#id11" id="id6" role="doc-noteref"><span class="fn-bracket">[</span>5<span class="fn-bracket">]</span></a></p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
+<td><p>No</p></td>
+<td><p>No</p></td>
+<td><p>No</p></td>
+<td><p>Yes</p></td>
+<td><p>No</p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
+<td><p>Yes</p></td>
+<td><p>No</p></td>
+<td><p>No</p></td>
+</tr>
+<tr class="row-odd"><td><p><strong>Cosmos3</strong></p></td>
 <td><p>Yes</p></td>
 <td><p>Yes</p></td>
 <td><p>No</p></td>
@@ -788,6 +817,7 @@ actively evolving and may change in future releases.</p>
 <td><p>No</p></td>
 <td><p>No</p></td>
 <td><p>Yes</p></td>
+<td><p>No</p></td>
 </tr>
 </tbody>
 </table>
@@ -1052,6 +1082,39 @@ actively evolving and may change in future releases.</p>
 <p><strong>Wan 2.2 dual-transformer note:</strong> Wan 2.2 uses two expert transformers (high-noise and low-noise stacks). All <code class="docutils literal notranslate"><span class="pre">CacheDiTConfig</span></code> parameters apply to both stacks, except <code class="docutils literal notranslate"><span class="pre">max_warmup_steps</span></code> and <code class="docutils literal notranslate"><span class="pre">max_cached_steps</span></code>: the low-noise stack always uses fixed internal caps (<code class="docutils literal notranslate"><span class="pre">max_warmup_steps=2</span></code>, <code class="docutils literal notranslate"><span class="pre">max_cached_steps=20</span></code>) regardless of user config.</p>
 </section>
 </section>
+<section id="video-sparse-attention-vsa">
+<h3>Video Sparse Attention (VSA)<a class="headerlink" href="#video-sparse-attention-vsa" title="Link to this heading">#</a></h3>
+<p>VSA reduces the compute cost of self-attention in video diffusion models by selectively attending to only the most relevant spatial-temporal blocks. It uses a two-branch design: a lightweight coarse mean-pool branch computes block-level attention scores to identify the top-K most relevant token blocks, then a fine branch runs a block-sparse CuTe kernel over only those blocks. The two outputs are blended with learned gates.</p>
+<p><strong>Requirements:</strong></p>
+<ul class="simple">
+<li><p>VSA-fine-tuned checkpoint: <a class="reference external" href="https://huggingface.co/FastVideo/Wan2.1-VSA-T2V-14B-720P-Diffusers"><code class="docutils literal notranslate"><span class="pre">FastVideo/Wan2.1-VSA-T2V-14B-720P-Diffusers</span></code></a>. Standard Wan checkpoints do not have the learned VSA gates.</p></li>
+<li><p>Blackwell GPU (sm_100+) for the CuTe JIT kernel. Falls back to dense SDPA on older hardware with no accuracy loss.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">CUTEDSL</span></code> attention backend.</p></li>
+<li><p>Not compatible with Ring attention or Attention2D (VSA does not produce per-split LSE). Ulysses is supported.</p></li>
+</ul>
+<p><strong><code class="docutils literal notranslate"><span class="pre">vsa_sparsity</span></code></strong> controls the fraction of K/V blocks skipped in the fine branch (0.0 = dense, 0.9 = 90% blocks skipped). Higher sparsity gives more speedup at the cost of some quality.</p>
+<p>Python API:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm</span><span class="w"> </span><span class="kn">import</span> <span class="n">VisualGenArgs</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.visual_gen.args</span><span class="w"> </span><span class="kn">import</span> <span class="n">AttentionConfig</span><span class="p">,</span> <span class="n">VideoSparseAttentionConfig</span>
+
+<span class="n">args</span> <span class="o">=</span> <span class="n">VisualGenArgs</span><span class="p">(</span>
+    <span class="n">model</span><span class="o">=</span><span class="s2">&quot;FastVideo/Wan2.1-VSA-T2V-14B-720P-Diffusers&quot;</span><span class="p">,</span>
+    <span class="n">attention_config</span><span class="o">=</span><span class="n">AttentionConfig</span><span class="p">(</span>
+        <span class="n">backend</span><span class="o">=</span><span class="s2">&quot;CUTEDSL&quot;</span><span class="p">,</span>
+        <span class="n">sparse_attention_config</span><span class="o">=</span><span class="n">VideoSparseAttentionConfig</span><span class="p">(</span><span class="n">vsa_sparsity</span><span class="o">=</span><span class="mf">0.9</span><span class="p">),</span>
+    <span class="p">),</span>
+<span class="p">)</span>
+</pre></div>
+</div>
+<p>YAML (for use with <code class="docutils literal notranslate"><span class="pre">--visual_gen_args</span></code> or <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code>):</p>
+<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">attention_config</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">backend</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">CUTEDSL</span>
+<span class="w">  </span><span class="nt">sparse_attention_config</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">algorithm</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">vsa</span>
+<span class="w">    </span><span class="nt">vsa_sparsity</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">0.90</span>
+</pre></div>
+</div>
+</section>
 <section id="multi-gpu-parallelism">
 <h3>Multi-GPU Parallelism<a class="headerlink" href="#multi-gpu-parallelism" title="Link to this heading">#</a></h3>
 <p>Configured under <code class="docutils literal notranslate"><span class="pre">VisualGenArgs.parallel_config</span></code>. Modes can be combined:</p>
@@ -1160,22 +1223,26 @@ actively evolving and may change in future releases.</p>
 </section>
 <hr class="footnotes docutils" />
 <aside class="footnote-list brackets">
-<aside class="footnote brackets" id="id6" role="doc-footnote">
+<aside class="footnote brackets" id="id7" role="doc-footnote">
 <span class="label"><span class="fn-bracket">[</span>1<span class="fn-bracket">]</span></span>
 <span class="backrefs">(<a role="doc-backlink" href="#id1">1</a>,<a role="doc-backlink" href="#id2">2</a>)</span>
 <p>FLUX models use embedded guidance and do not have a separate negative prompt path, so CFG parallelism is not applicable.</p>
 </aside>
-<aside class="footnote brackets" id="id7" role="doc-footnote">
-<span class="label"><span class="fn-bracket">[</span><a role="doc-backlink" href="#id3">2</a><span class="fn-bracket">]</span></span>
-<p>Wan 2.2 has two stage transformers; TeaCache requires explicit <code class="docutils literal notranslate"><span class="pre">teacache.coefficients</span></code> (high-noise) and <code class="docutils literal notranslate"><span class="pre">teacache.coefficients_2</span></code> (low-noise). There is no built-in coefficient table for Wan 2.2.</p>
-</aside>
 <aside class="footnote brackets" id="id8" role="doc-footnote">
-<span class="label"><span class="fn-bracket">[</span><a role="doc-backlink" href="#id4">3</a><span class="fn-bracket">]</span></span>
-<p>LTX-2 has no built-in TeaCache coefficient table in TRT-LLM; set <code class="docutils literal notranslate"><span class="pre">teacache.coefficients</span></code> explicitly when enabling TeaCache.</p>
+<span class="label"><span class="fn-bracket">[</span><a role="doc-backlink" href="#id3">2</a><span class="fn-bracket">]</span></span>
+<p><code class="docutils literal notranslate"><span class="pre">FastVideo/Wan2.1-VSA-T2V-14B-720P-Diffusers</span></code> — VSA-fine-tuned checkpoint with learned sparse-attention gates. Requires <code class="docutils literal notranslate"><span class="pre">CUTEDSL</span></code> on Blackwell sm_100+ (falls back to dense SDPA on older hardware). Ring and Attention2D not supported (no LSE output); Ulysses supported.</p>
 </aside>
 <aside class="footnote brackets" id="id9" role="doc-footnote">
+<span class="label"><span class="fn-bracket">[</span><a role="doc-backlink" href="#id4">3</a><span class="fn-bracket">]</span></span>
+<p>Wan 2.2 has two stage transformers; TeaCache requires explicit <code class="docutils literal notranslate"><span class="pre">teacache.coefficients</span></code> (high-noise) and <code class="docutils literal notranslate"><span class="pre">teacache.coefficients_2</span></code> (low-noise). There is no built-in coefficient table for Wan 2.2.</p>
+</aside>
+<aside class="footnote brackets" id="id10" role="doc-footnote">
 <span class="label"><span class="fn-bracket">[</span><a role="doc-backlink" href="#id5">4</a><span class="fn-bracket">]</span></span>
-<p>Qwen-Image ships a native BF16 implementation with per-module numerical parity vs <code class="docutils literal notranslate"><span class="pre">diffusers.QwenImagePipeline</span></code> (cosine &gt;= 0.999 on the full 20B transformer) and <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code> / <code class="docutils literal notranslate"><span class="pre">/v1/images/generations</span></code> support. FP8 blockwise and NVFP4 use VisualGen dynamic quantization from BF16 checkpoints; no pre-quantized checkpoint is required.</p>
+<p>LTX-2 has no built-in TeaCache coefficient table in TRT-LLM; set <code class="docutils literal notranslate"><span class="pre">teacache.coefficients</span></code> explicitly when enabling TeaCache.</p>
+</aside>
+<aside class="footnote brackets" id="id11" role="doc-footnote">
+<span class="label"><span class="fn-bracket">[</span><a role="doc-backlink" href="#id6">5</a><span class="fn-bracket">]</span></span>
+<p>Qwen-Image ships a native BF16 implementation with per-module numerical parity against <code class="docutils literal notranslate"><span class="pre">diffusers.QwenImagePipeline</span></code> (cosine similarity &gt;= 0.999 on the full 20B transformer) and supports <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code> / <code class="docutils literal notranslate"><span class="pre">/v1/images/generations</span></code>. VisualGen supports FP8 blockwise and NVFP4 dynamic quantization from BF16 checkpoints, as well as direct loading of statically quantized FP8 and NVFP4 ModelOpt checkpoints.</p>
 </aside>
 </aside>
 
@@ -1247,6 +1314,7 @@ actively evolving and may change in future releases.</p>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#cache-dit">Cache-DiT</a></li>
 </ul>
 </li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#video-sparse-attention-vsa">Video Sparse Attention (VSA)</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#multi-gpu-parallelism">Multi-GPU Parallelism</a></li>
 </ul>
 </li>
@@ -1279,8 +1347,8 @@ actively evolving and may change in future releases.</p>
   
 
   <!-- Scripts loaded after <body> so the DOM is not blocked -->
-  <script defer src="../_static/scripts/bootstrap.js?digest=a95f357e85573c9b56d5"></script>
-<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=a95f357e85573c9b56d5"></script>
+  <script defer src="../_static/scripts/bootstrap.js?digest=90905a2f556bf617f1a9"></script>
+<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=90905a2f556bf617f1a9"></script>
 
 
   <footer class="bd-footer">
@@ -1352,9 +1420,9 @@ actively evolving and may change in future releases.</p>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on June 27, 2026.</p>
+  <p>Last updated on July 14, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/c25c23f">c25c23f</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/1662a87">1662a87</a>.</p>
   
 </div></div>
       

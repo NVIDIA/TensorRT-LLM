@@ -28,8 +28,8 @@
   </noscript>
   
   <!-- Loaded before other Sphinx assets -->
-  <link href="../_static/styles/theme.css?digest=a95f357e85573c9b56d5" rel="stylesheet" />
-<link href="../_static/styles/pydata-sphinx-theme.css?digest=a95f357e85573c9b56d5" rel="stylesheet" />
+  <link href="../_static/styles/theme.css?digest=90905a2f556bf617f1a9" rel="stylesheet" />
+<link href="../_static/styles/pydata-sphinx-theme.css?digest=90905a2f556bf617f1a9" rel="stylesheet" />
 
     <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=8f2a1f02" />
     <link rel="stylesheet" type="text/css" href="../_static/styles/nvidia-sphinx-theme.css?v=933278ad" />
@@ -40,10 +40,10 @@
     <link rel="stylesheet" type="text/css" href="../_static/custom.css?v=19d20f17" />
   
   <!-- So that users can add custom icons -->
-  <script defer src="../_static/scripts/fontawesome.js?digest=a95f357e85573c9b56d5"></script>
+  <script defer src="../_static/scripts/fontawesome.js?digest=90905a2f556bf617f1a9"></script>
   <!-- Pre-loaded scripts that we'll load fully later -->
-  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=a95f357e85573c9b56d5" />
-<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=a95f357e85573c9b56d5" />
+  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=90905a2f556bf617f1a9" />
+<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=90905a2f556bf617f1a9" />
 
 
 
@@ -61,9 +61,9 @@
     <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
     <script>DOCUMENTATION_OPTIONS.pagename = '_cpp_gen/executor';</script>
     <script>
-        DOCUMENTATION_OPTIONS.theme_version = '0.19.0';
+        DOCUMENTATION_OPTIONS.theme_version = '0.20.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc20';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc21';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -77,7 +77,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc20" />
+  <meta name="docsearch:version" content="1.3.0rc21" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -444,6 +444,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../features/feature-combination-matrix.html">Feature Combination Matrix</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/disagg-serving.html">Disaggregated Serving</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/embeddings.html">Embeddings (Encoder-Only Models)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/kvcache.html">KV Cache System</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/long-sequence.html">Long Sequences</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/lora.html">LoRA (Low-Rank Adaptation)</a></li>
@@ -454,6 +455,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../features/quantization.html">Quantization</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/sampling.html">Sampling</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/additional-outputs.html">Additional Outputs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/post-processor-hook.html">Post-Processing Hook</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/guided-decoding.html">Guided Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/speculative-decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/checkpoint-loading.html">Checkpoint Loading</a></li>
@@ -493,6 +495,7 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog25_Scaling_Video_Generation_Across_NVL72_Rack_with_TensorRT-LLM.html">Scaling Video Generation Across NVL72 rack with TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog24_MoE_as_Dense_GEMM.html">MoE as Dense GEMM: Optimizing Low-Latency MoE Inference on NVIDIA Blackwell</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog23_Joint_Optimization_of_Agent_Applications_and_TensorRT-LLM.html">Joint Optimization of Agent Applications and TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog22_Helix_Parallelism_Scaling_Multi_Million_Token_Decoding_with_KV_Cache_Sharding.html">Helix Parallelism in TensorRT-LLM: Scaling Multi-Million-Token Decoding with KV Cache Sharding</a></li>
@@ -530,9 +533,9 @@
 <li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM">Github Code</a></li>
 <li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/issues?q=is%3Aissue%20state%3Aopen%20label%3Aroadmap">Roadmap</a></li>
 </ul>
-<p aria-level="2" class="caption" role="heading"><span class="caption-text">Use TensorRT Engine</span></p>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Migration</span></p>
 <ul class="nav bd-sidenav">
-<li class="toctree-l1"><a class="reference internal" href="../legacy/tensorrt_quickstart.html">LLM API with TensorRT Engine</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../legacy/tensorrt-backend-removal.html">Migration Guide: TensorRT Backend Removed</a></li>
 </ul>
 </div>
 </nav></div>
@@ -4537,17 +4540,18 @@
 <div class="breathe-sectiondef docutils container">
 <p class="breathe-sectiondef-title rubric" id="breathe-section-title-public-functions">Public Functions</p>
 <dl class="cpp function">
-<dt class="sig sig-object cpp" id="_CPPv4N12tensorrt_llm8executor22CacheTransceiverConfig22CacheTransceiverConfigENSt8optionalI11BackendTypeEENSt8optionalI6size_tEENSt8optionalIiEENSt8optionalIiEE">
-<span id="_CPPv3N12tensorrt_llm8executor22CacheTransceiverConfig22CacheTransceiverConfigENSt8optionalI11BackendTypeEENSt8optionalI6size_tEENSt8optionalIiEENSt8optionalIiEE"></span><span id="_CPPv2N12tensorrt_llm8executor22CacheTransceiverConfig22CacheTransceiverConfigENSt8optionalI11BackendTypeEENSt8optionalI6size_tEENSt8optionalIiEENSt8optionalIiEE"></span><span id="tensorrt_llm::executor::CacheTransceiverConfig::CacheTransceiverConfig__std::optional:BackendType:.std::optional:s:.std::optional:i:.std::optional:i:"></span><span class="target" id="classtensorrt__llm_1_1executor_1_1CacheTransceiverConfig_1a8a50c689ed554d8dad7c781115310af4"></span><span class="k"><span class="pre">explicit</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">CacheTransceiverConfig</span></span></span><span class="sig-paren">(</span>
+<dt class="sig sig-object cpp" id="_CPPv4N12tensorrt_llm8executor22CacheTransceiverConfig22CacheTransceiverConfigENSt8optionalI11BackendTypeEENSt8optionalI6size_tEENSt8optionalIiEENSt8optionalIiEENSt8optionalIiEE">
+<span id="_CPPv3N12tensorrt_llm8executor22CacheTransceiverConfig22CacheTransceiverConfigENSt8optionalI11BackendTypeEENSt8optionalI6size_tEENSt8optionalIiEENSt8optionalIiEENSt8optionalIiEE"></span><span id="_CPPv2N12tensorrt_llm8executor22CacheTransceiverConfig22CacheTransceiverConfigENSt8optionalI11BackendTypeEENSt8optionalI6size_tEENSt8optionalIiEENSt8optionalIiEENSt8optionalIiEE"></span><span id="tensorrt_llm::executor::CacheTransceiverConfig::CacheTransceiverConfig__std::optional:BackendType:.std::optional:s:.std::optional:i:.std::optional:i:.std::optional:i:"></span><span class="target" id="classtensorrt__llm_1_1executor_1_1CacheTransceiverConfig_1a3ca82c01a0c67b512cee8467ac4a7aac"></span><span class="k"><span class="pre">explicit</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">CacheTransceiverConfig</span></span></span><span class="sig-paren">(</span>
 
 <dl>
 <dd><em class="sig-param"><span class="n"><span class="pre">std</span></span><span class="p"><span class="pre">::</span></span><span class="n"><span class="pre">optional</span></span><span class="p"><span class="pre">&lt;</span></span><a class="reference internal" href="#_CPPv4N12tensorrt_llm8executor22CacheTransceiverConfig11BackendTypeE" title="tensorrt_llm::executor::CacheTransceiverConfig::BackendType"><span class="n"><span class="pre">BackendType</span></span></a><span class="p"><span class="pre">&gt;</span></span><span class="w"> </span><span class="n sig-param"><span class="pre">backendType</span></span><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="n"><span class="pre">std</span></span><span class="p"><span class="pre">::</span></span><span class="n"><span class="pre">nullopt</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">std</span></span><span class="p"><span class="pre">::</span></span><span class="n"><span class="pre">optional</span></span><span class="p"><span class="pre">&lt;</span></span><span class="n"><span class="pre">size_t</span></span><span class="p"><span class="pre">&gt;</span></span><span class="w"> </span><span class="n sig-param"><span class="pre">maxNumTokens</span></span><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="n"><span class="pre">std</span></span><span class="p"><span class="pre">::</span></span><span class="n"><span class="pre">nullopt</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">std</span></span><span class="p"><span class="pre">::</span></span><span class="n"><span class="pre">optional</span></span><span class="p"><span class="pre">&lt;</span></span><span class="kt"><span class="pre">int</span></span><span class="p"><span class="pre">&gt;</span></span><span class="w"> </span><span class="n sig-param"><span class="pre">kvTransferTimeoutMs</span></span><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="n"><span class="pre">std</span></span><span class="p"><span class="pre">::</span></span><span class="n"><span class="pre">nullopt</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">std</span></span><span class="p"><span class="pre">::</span></span><span class="n"><span class="pre">optional</span></span><span class="p"><span class="pre">&lt;</span></span><span class="kt"><span class="pre">int</span></span><span class="p"><span class="pre">&gt;</span></span><span class="w"> </span><span class="n sig-param"><span class="pre">kvTransferSenderFutureTimeoutMs</span></span><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="n"><span class="pre">std</span></span><span class="p"><span class="pre">::</span></span><span class="n"><span class="pre">nullopt</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">std</span></span><span class="p"><span class="pre">::</span></span><span class="n"><span class="pre">optional</span></span><span class="p"><span class="pre">&lt;</span></span><span class="kt"><span class="pre">int</span></span><span class="p"><span class="pre">&gt;</span></span><span class="w"> </span><span class="n sig-param"><span class="pre">kvTransferPollIntervalMs</span></span><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><a class="reference internal" href="#_CPPv4N12tensorrt_llm8executor22CacheTransceiverConfig32kDefaultKvTransferPollIntervalMsE" title="tensorrt_llm::executor::CacheTransceiverConfig::kDefaultKvTransferPollIntervalMs"><span class="n"><span class="pre">kDefaultKvTransferPollIntervalMs</span></span></a></em>,</dd>
 </dl>
 
-<span class="sig-paren">)</span><a class="headerlink" href="#_CPPv4N12tensorrt_llm8executor22CacheTransceiverConfig22CacheTransceiverConfigENSt8optionalI11BackendTypeEENSt8optionalI6size_tEENSt8optionalIiEENSt8optionalIiEE" title="Link to this definition">#</a><br /></dt>
+<span class="sig-paren">)</span><a class="headerlink" href="#_CPPv4N12tensorrt_llm8executor22CacheTransceiverConfig22CacheTransceiverConfigENSt8optionalI11BackendTypeEENSt8optionalI6size_tEENSt8optionalIiEENSt8optionalIiEENSt8optionalIiEE" title="Link to this definition">#</a><br /></dt>
 <dd></dd></dl>
 
 <dl class="cpp function">
@@ -4582,6 +4586,17 @@
 <dd></dd></dl>
 
 <dl class="cpp function">
+<dt class="sig sig-object cpp" id="_CPPv4N12tensorrt_llm8executor22CacheTransceiverConfig27setKvTransferPollIntervalMsENSt8optionalIiEE">
+<span id="_CPPv3N12tensorrt_llm8executor22CacheTransceiverConfig27setKvTransferPollIntervalMsENSt8optionalIiEE"></span><span id="_CPPv2N12tensorrt_llm8executor22CacheTransceiverConfig27setKvTransferPollIntervalMsENSt8optionalIiEE"></span><span id="tensorrt_llm::executor::CacheTransceiverConfig::setKvTransferPollIntervalMs__std::optional:i:"></span><span class="target" id="classtensorrt__llm_1_1executor_1_1CacheTransceiverConfig_1a813544ad97258f024a81775749d34cc3"></span><span class="kt"><span class="pre">void</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">setKvTransferPollIntervalMs</span></span></span><span class="sig-paren">(</span>
+
+<dl>
+<dd><em class="sig-param"><span class="n"><span class="pre">std</span></span><span class="p"><span class="pre">::</span></span><span class="n"><span class="pre">optional</span></span><span class="p"><span class="pre">&lt;</span></span><span class="kt"><span class="pre">int</span></span><span class="p"><span class="pre">&gt;</span></span><span class="w"> </span><span class="n sig-param"><span class="pre">kvTransferPollIntervalMs</span></span></em>,</dd>
+</dl>
+
+<span class="sig-paren">)</span><a class="headerlink" href="#_CPPv4N12tensorrt_llm8executor22CacheTransceiverConfig27setKvTransferPollIntervalMsENSt8optionalIiEE" title="Link to this definition">#</a><br /></dt>
+<dd></dd></dl>
+
+<dl class="cpp function">
 <dt class="sig sig-object cpp" id="_CPPv4NK12tensorrt_llm8executor22CacheTransceiverConfig20getMaxTokensInBufferEv">
 <span id="_CPPv3NK12tensorrt_llm8executor22CacheTransceiverConfig20getMaxTokensInBufferEv"></span><span id="_CPPv2NK12tensorrt_llm8executor22CacheTransceiverConfig20getMaxTokensInBufferEv"></span><span id="tensorrt_llm::executor::CacheTransceiverConfig::getMaxTokensInBufferC"></span><span class="target" id="classtensorrt__llm_1_1executor_1_1CacheTransceiverConfig_1a4b14a01d128996da784a03f9014093a7"></span><span class="n"><span class="pre">std</span></span><span class="p"><span class="pre">::</span></span><span class="n"><span class="pre">optional</span></span><span class="p"><span class="pre">&lt;</span></span><span class="n"><span class="pre">size_t</span></span><span class="p"><span class="pre">&gt;</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">getMaxTokensInBuffer</span></span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><span class="w"> </span><span class="k"><span class="pre">const</span></span><a class="headerlink" href="#_CPPv4NK12tensorrt_llm8executor22CacheTransceiverConfig20getMaxTokensInBufferEv" title="Link to this definition">#</a><br /></dt>
 <dd></dd></dl>
@@ -4599,6 +4614,19 @@
 <dl class="cpp function">
 <dt class="sig sig-object cpp" id="_CPPv4NK12tensorrt_llm8executor22CacheTransceiverConfig34getKvTransferSenderFutureTimeoutMsEv">
 <span id="_CPPv3NK12tensorrt_llm8executor22CacheTransceiverConfig34getKvTransferSenderFutureTimeoutMsEv"></span><span id="_CPPv2NK12tensorrt_llm8executor22CacheTransceiverConfig34getKvTransferSenderFutureTimeoutMsEv"></span><span id="tensorrt_llm::executor::CacheTransceiverConfig::getKvTransferSenderFutureTimeoutMsC"></span><span class="target" id="classtensorrt__llm_1_1executor_1_1CacheTransceiverConfig_1a086ae3cf227271c65c2e411ce57412da"></span><span class="n"><span class="pre">std</span></span><span class="p"><span class="pre">::</span></span><span class="n"><span class="pre">optional</span></span><span class="p"><span class="pre">&lt;</span></span><span class="kt"><span class="pre">int</span></span><span class="p"><span class="pre">&gt;</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">getKvTransferSenderFutureTimeoutMs</span></span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><span class="w"> </span><span class="k"><span class="pre">const</span></span><a class="headerlink" href="#_CPPv4NK12tensorrt_llm8executor22CacheTransceiverConfig34getKvTransferSenderFutureTimeoutMsEv" title="Link to this definition">#</a><br /></dt>
+<dd></dd></dl>
+
+<dl class="cpp function">
+<dt class="sig sig-object cpp" id="_CPPv4NK12tensorrt_llm8executor22CacheTransceiverConfig27getKvTransferPollIntervalMsEv">
+<span id="_CPPv3NK12tensorrt_llm8executor22CacheTransceiverConfig27getKvTransferPollIntervalMsEv"></span><span id="_CPPv2NK12tensorrt_llm8executor22CacheTransceiverConfig27getKvTransferPollIntervalMsEv"></span><span id="tensorrt_llm::executor::CacheTransceiverConfig::getKvTransferPollIntervalMsC"></span><span class="target" id="classtensorrt__llm_1_1executor_1_1CacheTransceiverConfig_1aaa3b51ee32c13b1d0a0290181246bb00"></span><span class="n"><span class="pre">std</span></span><span class="p"><span class="pre">::</span></span><span class="n"><span class="pre">optional</span></span><span class="p"><span class="pre">&lt;</span></span><span class="kt"><span class="pre">int</span></span><span class="p"><span class="pre">&gt;</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">getKvTransferPollIntervalMs</span></span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><span class="w"> </span><span class="k"><span class="pre">const</span></span><a class="headerlink" href="#_CPPv4NK12tensorrt_llm8executor22CacheTransceiverConfig27getKvTransferPollIntervalMsEv" title="Link to this definition">#</a><br /></dt>
+<dd></dd></dl>
+
+</div>
+<div class="breathe-sectiondef docutils container">
+<p class="breathe-sectiondef-title rubric" id="breathe-section-title-public-static-attributes">Public Static Attributes</p>
+<dl class="cpp var">
+<dt class="sig sig-object cpp" id="_CPPv4N12tensorrt_llm8executor22CacheTransceiverConfig32kDefaultKvTransferPollIntervalMsE">
+<span id="_CPPv3N12tensorrt_llm8executor22CacheTransceiverConfig32kDefaultKvTransferPollIntervalMsE"></span><span id="_CPPv2N12tensorrt_llm8executor22CacheTransceiverConfig32kDefaultKvTransferPollIntervalMsE"></span><span id="tensorrt_llm::executor::CacheTransceiverConfig::kDefaultKvTransferPollIntervalMs__i"></span><span class="target" id="classtensorrt__llm_1_1executor_1_1CacheTransceiverConfig_1a0b6a75776a330b6ad666fb6bd470ecce"></span><span class="k"><span class="pre">static</span></span><span class="w"> </span><span class="k"><span class="pre">constexpr</span></span><span class="w"> </span><span class="kt"><span class="pre">int</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">kDefaultKvTransferPollIntervalMs</span></span></span><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="m"><span class="pre">5000</span></span><a class="headerlink" href="#_CPPv4N12tensorrt_llm8executor22CacheTransceiverConfig32kDefaultKvTransferPollIntervalMsE" title="Link to this definition">#</a><br /></dt>
 <dd></dd></dl>
 
 </div>
@@ -4623,6 +4651,11 @@
 <dl class="cpp var">
 <dt class="sig sig-object cpp" id="_CPPv4N12tensorrt_llm8executor22CacheTransceiverConfig32mKvTransferSenderFutureTimeoutMsE">
 <span id="_CPPv3N12tensorrt_llm8executor22CacheTransceiverConfig32mKvTransferSenderFutureTimeoutMsE"></span><span id="_CPPv2N12tensorrt_llm8executor22CacheTransceiverConfig32mKvTransferSenderFutureTimeoutMsE"></span><span id="tensorrt_llm::executor::CacheTransceiverConfig::mKvTransferSenderFutureTimeoutMs__std::optional:i:"></span><span class="target" id="classtensorrt__llm_1_1executor_1_1CacheTransceiverConfig_1a0a06b3ce7e520f77419d0c7aa4e6de1d"></span><span class="n"><span class="pre">std</span></span><span class="p"><span class="pre">::</span></span><span class="n"><span class="pre">optional</span></span><span class="p"><span class="pre">&lt;</span></span><span class="kt"><span class="pre">int</span></span><span class="p"><span class="pre">&gt;</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">mKvTransferSenderFutureTimeoutMs</span></span></span><a class="headerlink" href="#_CPPv4N12tensorrt_llm8executor22CacheTransceiverConfig32mKvTransferSenderFutureTimeoutMsE" title="Link to this definition">#</a><br /></dt>
+<dd></dd></dl>
+
+<dl class="cpp var">
+<dt class="sig sig-object cpp" id="_CPPv4N12tensorrt_llm8executor22CacheTransceiverConfig25mKvTransferPollIntervalMsE">
+<span id="_CPPv3N12tensorrt_llm8executor22CacheTransceiverConfig25mKvTransferPollIntervalMsE"></span><span id="_CPPv2N12tensorrt_llm8executor22CacheTransceiverConfig25mKvTransferPollIntervalMsE"></span><span id="tensorrt_llm::executor::CacheTransceiverConfig::mKvTransferPollIntervalMs__std::optional:i:"></span><span class="target" id="classtensorrt__llm_1_1executor_1_1CacheTransceiverConfig_1a975c8a7b337c6abaa8d4e8162aaa64af"></span><span class="n"><span class="pre">std</span></span><span class="p"><span class="pre">::</span></span><span class="n"><span class="pre">optional</span></span><span class="p"><span class="pre">&lt;</span></span><span class="kt"><span class="pre">int</span></span><span class="p"><span class="pre">&gt;</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">mKvTransferPollIntervalMs</span></span></span><a class="headerlink" href="#_CPPv4N12tensorrt_llm8executor22CacheTransceiverConfig25mKvTransferPollIntervalMsE" title="Link to this definition">#</a><br /></dt>
 <dd></dd></dl>
 
 </div>
@@ -5182,6 +5215,11 @@
 <span class="sig-paren">)</span><span class="w"> </span><span class="k"><span class="pre">const</span></span><a class="headerlink" href="#_CPPv4NK12tensorrt_llm8executor18DynamicBatchConfig17getBatchSizeTableEv" title="Link to this definition">#</a><br /></dt>
 <dd></dd></dl>
 
+<dl class="cpp function">
+<dt class="sig sig-object cpp" id="_CPPv4NK12tensorrt_llm8executor18DynamicBatchConfigeqERK18DynamicBatchConfig">
+<span id="_CPPv3NK12tensorrt_llm8executor18DynamicBatchConfigeqERK18DynamicBatchConfig"></span><span id="_CPPv2NK12tensorrt_llm8executor18DynamicBatchConfigeqERK18DynamicBatchConfig"></span><span id="tensorrt_llm::executor::DynamicBatchConfig::eq-operator__DynamicBatchConfigCRC"></span><span class="target" id="classtensorrt__llm_1_1executor_1_1DynamicBatchConfig_1addf07ccbc0ace7efa2253cef8324e70e"></span><span class="kt"><span class="pre">bool</span></span><span class="w"> </span><span class="sig-name descname"><span class="k"><span class="pre">operator</span></span><span class="o"><span class="pre">==</span></span></span><span class="sig-paren">(</span><em class="sig-param"><a class="reference internal" href="#_CPPv4N12tensorrt_llm8executor18DynamicBatchConfigE" title="tensorrt_llm::executor::DynamicBatchConfig"><span class="n"><span class="pre">DynamicBatchConfig</span></span></a><span class="w"> </span><span class="k"><span class="pre">const</span></span><span class="w"> </span><span class="p"><span class="pre">&amp;</span></span><span class="n sig-param"><span class="pre">other</span></span></em><span class="sig-paren">)</span><span class="w"> </span><span class="k"><span class="pre">const</span></span><a class="headerlink" href="#_CPPv4NK12tensorrt_llm8executor18DynamicBatchConfigeqERK18DynamicBatchConfig" title="Link to this definition">#</a><br /></dt>
+<dd></dd></dl>
+
 </div>
 <div class="breathe-sectiondef docutils container">
 <p class="breathe-sectiondef-title rubric" id="breathe-section-title-public-static-attributes">Public Static Attributes</p>
@@ -5618,7 +5656,7 @@
 <dl class="cpp function">
 <dt class="sig sig-object cpp" id="_CPPv4N12tensorrt_llm8executor8Executor23getLatestIterationStatsEv">
 <span id="_CPPv3N12tensorrt_llm8executor8Executor23getLatestIterationStatsEv"></span><span id="_CPPv2N12tensorrt_llm8executor8Executor23getLatestIterationStatsEv"></span><span id="tensorrt_llm::executor::Executor::getLatestIterationStats"></span><span class="target" id="classtensorrt__llm_1_1executor_1_1Executor_1a86d2af2924046fdff9fb70a9e86159bd"></span><span class="n"><span class="pre">std</span></span><span class="p"><span class="pre">::</span></span><span class="n"><span class="pre">deque</span></span><span class="p"><span class="pre">&lt;</span></span><a class="reference internal" href="#_CPPv4N12tensorrt_llm8executor14IterationStatsE" title="tensorrt_llm::executor::IterationStats"><span class="n"><span class="pre">IterationStats</span></span></a><span class="p"><span class="pre">&gt;</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">getLatestIterationStats</span></span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="headerlink" href="#_CPPv4N12tensorrt_llm8executor8Executor23getLatestIterationStatsEv" title="Link to this definition">#</a><br /></dt>
-<dd><p>Returns the per-iterations statistics computed since last call to getLatestIterationStats. Contains at most iterStatsMaxIterations iterations. </p>
+<dd><p>Returns the per-iterations statistics computed since last call to getLatestIterationStats. Contains at most iterStatsMaxIterations iterations, or all iterations when set to -1. </p>
 <dl class="field-list simple">
 <dt class="field-odd">Returns<span class="colon">:</span></dt>
 <dd class="field-odd"><p>Iteration stats </p>
@@ -5629,7 +5667,7 @@
 <dl class="cpp function">
 <dt class="sig sig-object cpp" id="_CPPv4N12tensorrt_llm8executor8Executor21getLatestRequestStatsEv">
 <span id="_CPPv3N12tensorrt_llm8executor8Executor21getLatestRequestStatsEv"></span><span id="_CPPv2N12tensorrt_llm8executor8Executor21getLatestRequestStatsEv"></span><span id="tensorrt_llm::executor::Executor::getLatestRequestStats"></span><span class="target" id="classtensorrt__llm_1_1executor_1_1Executor_1ab75ad0e4223d528aa87fdd18d1caeec0"></span><span class="n"><span class="pre">std</span></span><span class="p"><span class="pre">::</span></span><span class="n"><span class="pre">deque</span></span><span class="p"><span class="pre">&lt;</span></span><a class="reference internal" href="#_CPPv4N12tensorrt_llm8executor24RequestStatsPerIterationE" title="tensorrt_llm::executor::RequestStatsPerIteration"><span class="n"><span class="pre">RequestStatsPerIteration</span></span></a><span class="p"><span class="pre">&gt;</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">getLatestRequestStats</span></span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="headerlink" href="#_CPPv4N12tensorrt_llm8executor8Executor21getLatestRequestStatsEv" title="Link to this definition">#</a><br /></dt>
-<dd><p>Returns the request stats of each iteration computed since last call to getLatestRequestStats. Contains at most requestStatsMaxIterations iterations. </p>
+<dd><p>Returns the request stats of each iteration computed since last call to getLatestRequestStats. Contains at most requestStatsMaxIterations iterations, or all iterations when set to -1. </p>
 <dl class="field-list simple">
 <dt class="field-odd">Returns<span class="colon">:</span></dt>
 <dd class="field-odd"><p><a class="reference internal" href="#classtensorrt__llm_1_1executor_1_1Request"><span class="std std-ref">Request</span></a> stats grouped by iterations </p>
@@ -6108,6 +6146,11 @@
 <span id="_CPPv3N12tensorrt_llm8executor14ExecutorConfig33kDefaultRequestStatsMaxIterationsE"></span><span id="_CPPv2N12tensorrt_llm8executor14ExecutorConfig33kDefaultRequestStatsMaxIterationsE"></span><span id="tensorrt_llm::executor::ExecutorConfig::kDefaultRequestStatsMaxIterations__SizeType32"></span><span class="target" id="classtensorrt__llm_1_1executor_1_1ExecutorConfig_1a4f8c59a591914a7df498b1964606bb57"></span><span class="k"><span class="pre">static</span></span><span class="w"> </span><span class="k"><span class="pre">constexpr</span></span><span class="w"> </span><a class="reference internal" href="#_CPPv4N12tensorrt_llm8executor10SizeType32E" title="tensorrt_llm::executor::SizeType32"><span class="n"><span class="pre">SizeType32</span></span></a><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">kDefaultRequestStatsMaxIterations</span></span></span><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="m"><span class="pre">0</span></span><a class="headerlink" href="#_CPPv4N12tensorrt_llm8executor14ExecutorConfig33kDefaultRequestStatsMaxIterationsE" title="Link to this definition">#</a><br /></dt>
 <dd></dd></dl>
 
+<dl class="cpp var">
+<dt class="sig sig-object cpp" id="_CPPv4N12tensorrt_llm8executor14ExecutorConfig28kUnlimitedStatsMaxIterationsE">
+<span id="_CPPv3N12tensorrt_llm8executor14ExecutorConfig28kUnlimitedStatsMaxIterationsE"></span><span id="_CPPv2N12tensorrt_llm8executor14ExecutorConfig28kUnlimitedStatsMaxIterationsE"></span><span id="tensorrt_llm::executor::ExecutorConfig::kUnlimitedStatsMaxIterations__SizeType32"></span><span class="target" id="classtensorrt__llm_1_1executor_1_1ExecutorConfig_1a201c8bc6ff42f4f43e86906443ef49b4"></span><span class="k"><span class="pre">static</span></span><span class="w"> </span><span class="k"><span class="pre">constexpr</span></span><span class="w"> </span><a class="reference internal" href="#_CPPv4N12tensorrt_llm8executor10SizeType32E" title="tensorrt_llm::executor::SizeType32"><span class="n"><span class="pre">SizeType32</span></span></a><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">kUnlimitedStatsMaxIterations</span></span></span><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="o"><span class="pre">-</span></span><span class="m"><span class="pre">1</span></span><a class="headerlink" href="#_CPPv4N12tensorrt_llm8executor14ExecutorConfig28kUnlimitedStatsMaxIterationsE" title="Link to this definition">#</a><br /></dt>
+<dd></dd></dl>
+
 </div>
 <div class="breathe-sectiondef docutils container">
 <p class="breathe-sectiondef-title rubric" id="breathe-section-title-private-members">Private Members</p>
@@ -6144,13 +6187,13 @@
 <dl class="cpp var">
 <dt class="sig sig-object cpp" id="_CPPv4N12tensorrt_llm8executor14ExecutorConfig23mIterStatsMaxIterationsE">
 <span id="_CPPv3N12tensorrt_llm8executor14ExecutorConfig23mIterStatsMaxIterationsE"></span><span id="_CPPv2N12tensorrt_llm8executor14ExecutorConfig23mIterStatsMaxIterationsE"></span><span id="tensorrt_llm::executor::ExecutorConfig::mIterStatsMaxIterations__SizeType32"></span><span class="target" id="classtensorrt__llm_1_1executor_1_1ExecutorConfig_1a201b184dee2e18455e22f45e645ac113"></span><a class="reference internal" href="#_CPPv4N12tensorrt_llm8executor10SizeType32E" title="tensorrt_llm::executor::SizeType32"><span class="n"><span class="pre">SizeType32</span></span></a><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">mIterStatsMaxIterations</span></span></span><a class="headerlink" href="#_CPPv4N12tensorrt_llm8executor14ExecutorConfig23mIterStatsMaxIterationsE" title="Link to this definition">#</a><br /></dt>
-<dd><p>Controls the maximum number of iterations for which to keep statistics. </p>
+<dd><p>Controls the maximum number of iterations for which to keep statistics. Set to -1 to keep all iteration statistics. Set to 0 to disable iteration statistics. </p>
 </dd></dl>
 
 <dl class="cpp var">
 <dt class="sig sig-object cpp" id="_CPPv4N12tensorrt_llm8executor14ExecutorConfig26mRequestStatsMaxIterationsE">
 <span id="_CPPv3N12tensorrt_llm8executor14ExecutorConfig26mRequestStatsMaxIterationsE"></span><span id="_CPPv2N12tensorrt_llm8executor14ExecutorConfig26mRequestStatsMaxIterationsE"></span><span id="tensorrt_llm::executor::ExecutorConfig::mRequestStatsMaxIterations__SizeType32"></span><span class="target" id="classtensorrt__llm_1_1executor_1_1ExecutorConfig_1a185a12d03febdc22bf56aedb1b05a80b"></span><a class="reference internal" href="#_CPPv4N12tensorrt_llm8executor10SizeType32E" title="tensorrt_llm::executor::SizeType32"><span class="n"><span class="pre">SizeType32</span></span></a><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">mRequestStatsMaxIterations</span></span></span><a class="headerlink" href="#_CPPv4N12tensorrt_llm8executor14ExecutorConfig26mRequestStatsMaxIterationsE" title="Link to this definition">#</a><br /></dt>
-<dd><p>Controls the maximum number of iterations for which to keep per-request statistics. </p>
+<dd><p>Controls the maximum number of iterations for which to keep per-request statistics. Set to -1 to keep all per-request statistics. Set to 0 to disable per-request statistics. </p>
 </dd></dl>
 
 <dl class="cpp var">
@@ -8771,6 +8814,11 @@
 <dd></dd></dl>
 
 <dl class="cpp function">
+<dt class="sig sig-object cpp" id="_CPPv4NK12tensorrt_llm8executor7Request17getNumInputTokensEv">
+<span id="_CPPv3NK12tensorrt_llm8executor7Request17getNumInputTokensEv"></span><span id="_CPPv2NK12tensorrt_llm8executor7Request17getNumInputTokensEv"></span><span id="tensorrt_llm::executor::Request::getNumInputTokensC"></span><span class="target" id="classtensorrt__llm_1_1executor_1_1Request_1ad974378fe5a1138794101e1ec0188eb4"></span><a class="reference internal" href="#_CPPv4N12tensorrt_llm8executor10SizeType32E" title="tensorrt_llm::executor::SizeType32"><span class="n"><span class="pre">SizeType32</span></span></a><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">getNumInputTokens</span></span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><span class="w"> </span><span class="k"><span class="pre">const</span></span><a class="headerlink" href="#_CPPv4NK12tensorrt_llm8executor7Request17getNumInputTokensEv" title="Link to this definition">#</a><br /></dt>
+<dd></dd></dl>
+
+<dl class="cpp function">
 <dt class="sig sig-object cpp" id="_CPPv4NK12tensorrt_llm8executor7Request12getMaxTokensEv">
 <span id="_CPPv3NK12tensorrt_llm8executor7Request12getMaxTokensEv"></span><span id="_CPPv2NK12tensorrt_llm8executor7Request12getMaxTokensEv"></span><span id="tensorrt_llm::executor::Request::getMaxTokensC"></span><span class="target" id="classtensorrt__llm_1_1executor_1_1Request_1a20edd026c107c8e66ba8e44b141cf8f1"></span><a class="reference internal" href="#_CPPv4N12tensorrt_llm8executor10SizeType32E" title="tensorrt_llm::executor::SizeType32"><span class="n"><span class="pre">SizeType32</span></span></a><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">getMaxTokens</span></span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><span class="w"> </span><span class="k"><span class="pre">const</span></span><a class="headerlink" href="#_CPPv4NK12tensorrt_llm8executor7Request12getMaxTokensEv" title="Link to this definition">#</a><br /></dt>
 <dd></dd></dl>
@@ -10131,16 +10179,17 @@
 <div class="breathe-sectiondef docutils container">
 <p class="breathe-sectiondef-title rubric" id="breathe-section-title-public-functions">Public Functions</p>
 <dl class="cpp function">
-<dt class="sig sig-object cpp" id="_CPPv4N12tensorrt_llm8executor15SchedulerConfig15SchedulerConfigE23CapacitySchedulerPolicyNSt8optionalI21ContextChunkingPolicyEENSt8optionalI18DynamicBatchConfigEE">
-<span id="_CPPv3N12tensorrt_llm8executor15SchedulerConfig15SchedulerConfigE23CapacitySchedulerPolicyNSt8optionalI21ContextChunkingPolicyEENSt8optionalI18DynamicBatchConfigEE"></span><span id="_CPPv2N12tensorrt_llm8executor15SchedulerConfig15SchedulerConfigE23CapacitySchedulerPolicyNSt8optionalI21ContextChunkingPolicyEENSt8optionalI18DynamicBatchConfigEE"></span><span id="tensorrt_llm::executor::SchedulerConfig::SchedulerConfig__CapacitySchedulerPolicy.std::optional:ContextChunkingPolicy:.std::optional:DynamicBatchConfig:"></span><span class="target" id="classtensorrt__llm_1_1executor_1_1SchedulerConfig_1abe564b1c96406b37274f08781d30b1d1"></span><span class="k"><span class="pre">explicit</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">SchedulerConfig</span></span></span><span class="sig-paren">(</span>
+<dt class="sig sig-object cpp" id="_CPPv4N12tensorrt_llm8executor15SchedulerConfig15SchedulerConfigE23CapacitySchedulerPolicyNSt8optionalI21ContextChunkingPolicyEENSt8optionalI18DynamicBatchConfigEEb">
+<span id="_CPPv3N12tensorrt_llm8executor15SchedulerConfig15SchedulerConfigE23CapacitySchedulerPolicyNSt8optionalI21ContextChunkingPolicyEENSt8optionalI18DynamicBatchConfigEEb"></span><span id="_CPPv2N12tensorrt_llm8executor15SchedulerConfig15SchedulerConfigE23CapacitySchedulerPolicyNSt8optionalI21ContextChunkingPolicyEENSt8optionalI18DynamicBatchConfigEEb"></span><span id="tensorrt_llm::executor::SchedulerConfig::SchedulerConfig__CapacitySchedulerPolicy.std::optional:ContextChunkingPolicy:.std::optional:DynamicBatchConfig:.b"></span><span class="target" id="classtensorrt__llm_1_1executor_1_1SchedulerConfig_1a7796f3ec07ecedafe789af4d01485314"></span><span class="k"><span class="pre">explicit</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">SchedulerConfig</span></span></span><span class="sig-paren">(</span>
 
 <dl>
 <dd><em class="sig-param"><a class="reference internal" href="#_CPPv4N12tensorrt_llm8executor23CapacitySchedulerPolicyE" title="tensorrt_llm::executor::CapacitySchedulerPolicy"><span class="n"><span class="pre">CapacitySchedulerPolicy</span></span></a><span class="w"> </span><span class="n sig-param"><span class="pre">capacitySchedulerPolicy</span></span><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><a class="reference internal" href="#_CPPv4N12tensorrt_llm8executor23CapacitySchedulerPolicyE" title="tensorrt_llm::executor::CapacitySchedulerPolicy"><span class="n"><span class="pre">CapacitySchedulerPolicy</span></span></a><span class="p"><span class="pre">::</span></span><a class="reference internal" href="#_CPPv4N12tensorrt_llm8executor23CapacitySchedulerPolicy20kGUARANTEED_NO_EVICTE" title="tensorrt_llm::executor::CapacitySchedulerPolicy::kGUARANTEED_NO_EVICT"><span class="n"><span class="pre">kGUARANTEED_NO_EVICT</span></span></a></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">std</span></span><span class="p"><span class="pre">::</span></span><span class="n"><span class="pre">optional</span></span><span class="p"><span class="pre">&lt;</span></span><a class="reference internal" href="#_CPPv4N12tensorrt_llm8executor21ContextChunkingPolicyE" title="tensorrt_llm::executor::ContextChunkingPolicy"><span class="n"><span class="pre">ContextChunkingPolicy</span></span></a><span class="p"><span class="pre">&gt;</span></span><span class="w"> </span><span class="n sig-param"><span class="pre">contextChunkingPolicy</span></span><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="n"><span class="pre">std</span></span><span class="p"><span class="pre">::</span></span><span class="n"><span class="pre">nullopt</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">std</span></span><span class="p"><span class="pre">::</span></span><span class="n"><span class="pre">optional</span></span><span class="p"><span class="pre">&lt;</span></span><a class="reference internal" href="#_CPPv4N12tensorrt_llm8executor18DynamicBatchConfigE" title="tensorrt_llm::executor::DynamicBatchConfig"><span class="n"><span class="pre">DynamicBatchConfig</span></span></a><span class="p"><span class="pre">&gt;</span></span><span class="w"> </span><span class="n sig-param"><span class="pre">dynamicBatchConfig</span></span><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="n"><span class="pre">std</span></span><span class="p"><span class="pre">::</span></span><span class="n"><span class="pre">nullopt</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="kt"><span class="pre">bool</span></span><span class="w"> </span><span class="n sig-param"><span class="pre">enablePrefixAwareScheduling</span></span><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="k"><span class="pre">true</span></span></em>,</dd>
 </dl>
 
-<span class="sig-paren">)</span><a class="headerlink" href="#_CPPv4N12tensorrt_llm8executor15SchedulerConfig15SchedulerConfigE23CapacitySchedulerPolicyNSt8optionalI21ContextChunkingPolicyEENSt8optionalI18DynamicBatchConfigEE" title="Link to this definition">#</a><br /></dt>
+<span class="sig-paren">)</span><a class="headerlink" href="#_CPPv4N12tensorrt_llm8executor15SchedulerConfig15SchedulerConfigE23CapacitySchedulerPolicyNSt8optionalI21ContextChunkingPolicyEENSt8optionalI18DynamicBatchConfigEEb" title="Link to this definition">#</a><br /></dt>
 <dd></dd></dl>
 
 <dl class="cpp function">
@@ -10168,6 +10217,11 @@
 <span id="_CPPv3NK12tensorrt_llm8executor15SchedulerConfig21getDynamicBatchConfigEv"></span><span id="_CPPv2NK12tensorrt_llm8executor15SchedulerConfig21getDynamicBatchConfigEv"></span><span id="tensorrt_llm::executor::SchedulerConfig::getDynamicBatchConfigC"></span><span class="target" id="classtensorrt__llm_1_1executor_1_1SchedulerConfig_1a88b50045152cc75c4c036a989bded5bf"></span><span class="n"><span class="pre">std</span></span><span class="p"><span class="pre">::</span></span><span class="n"><span class="pre">optional</span></span><span class="p"><span class="pre">&lt;</span></span><a class="reference internal" href="#_CPPv4N12tensorrt_llm8executor18DynamicBatchConfigE" title="tensorrt_llm::executor::DynamicBatchConfig"><span class="n"><span class="pre">DynamicBatchConfig</span></span></a><span class="p"><span class="pre">&gt;</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">getDynamicBatchConfig</span></span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><span class="w"> </span><span class="k"><span class="pre">const</span></span><a class="headerlink" href="#_CPPv4NK12tensorrt_llm8executor15SchedulerConfig21getDynamicBatchConfigEv" title="Link to this definition">#</a><br /></dt>
 <dd></dd></dl>
 
+<dl class="cpp function">
+<dt class="sig sig-object cpp" id="_CPPv4NK12tensorrt_llm8executor15SchedulerConfig30getEnablePrefixAwareSchedulingEv">
+<span id="_CPPv3NK12tensorrt_llm8executor15SchedulerConfig30getEnablePrefixAwareSchedulingEv"></span><span id="_CPPv2NK12tensorrt_llm8executor15SchedulerConfig30getEnablePrefixAwareSchedulingEv"></span><span id="tensorrt_llm::executor::SchedulerConfig::getEnablePrefixAwareSchedulingC"></span><span class="target" id="classtensorrt__llm_1_1executor_1_1SchedulerConfig_1a23da63948ddb2c93ebbfcb5c07602b51"></span><span class="kt"><span class="pre">bool</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">getEnablePrefixAwareScheduling</span></span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><span class="w"> </span><span class="k"><span class="pre">const</span></span><a class="headerlink" href="#_CPPv4NK12tensorrt_llm8executor15SchedulerConfig30getEnablePrefixAwareSchedulingEv" title="Link to this definition">#</a><br /></dt>
+<dd></dd></dl>
+
 </div>
 <div class="breathe-sectiondef docutils container">
 <p class="breathe-sectiondef-title rubric" id="breathe-section-title-private-members">Private Members</p>
@@ -10187,6 +10241,12 @@
 <dt class="sig sig-object cpp" id="_CPPv4N12tensorrt_llm8executor15SchedulerConfig19mDynamicBatchConfigE">
 <span id="_CPPv3N12tensorrt_llm8executor15SchedulerConfig19mDynamicBatchConfigE"></span><span id="_CPPv2N12tensorrt_llm8executor15SchedulerConfig19mDynamicBatchConfigE"></span><span id="tensorrt_llm::executor::SchedulerConfig::mDynamicBatchConfig__std::optional:DynamicBatchConfig:"></span><span class="target" id="classtensorrt__llm_1_1executor_1_1SchedulerConfig_1aaf3ec00bf67afe2ff3f0a7bb8268b6d8"></span><span class="n"><span class="pre">std</span></span><span class="p"><span class="pre">::</span></span><span class="n"><span class="pre">optional</span></span><span class="p"><span class="pre">&lt;</span></span><a class="reference internal" href="#_CPPv4N12tensorrt_llm8executor18DynamicBatchConfigE" title="tensorrt_llm::executor::DynamicBatchConfig"><span class="n"><span class="pre">DynamicBatchConfig</span></span></a><span class="p"><span class="pre">&gt;</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">mDynamicBatchConfig</span></span></span><a class="headerlink" href="#_CPPv4N12tensorrt_llm8executor15SchedulerConfig19mDynamicBatchConfigE" title="Link to this definition">#</a><br /></dt>
 <dd><p>The config for tuning batch size dynamically. See DynamicBatchSizeConfig. </p>
+</dd></dl>
+
+<dl class="cpp var">
+<dt class="sig sig-object cpp" id="_CPPv4N12tensorrt_llm8executor15SchedulerConfig28mEnablePrefixAwareSchedulingE">
+<span id="_CPPv3N12tensorrt_llm8executor15SchedulerConfig28mEnablePrefixAwareSchedulingE"></span><span id="_CPPv2N12tensorrt_llm8executor15SchedulerConfig28mEnablePrefixAwareSchedulingE"></span><span id="tensorrt_llm::executor::SchedulerConfig::mEnablePrefixAwareScheduling__b"></span><span class="target" id="classtensorrt__llm_1_1executor_1_1SchedulerConfig_1a7bc01257d72a0cf138c035879fc6ba77"></span><span class="kt"><span class="pre">bool</span></span><span class="w"> </span><span class="sig-name descname"><span class="n"><span class="pre">mEnablePrefixAwareScheduling</span></span></span><a class="headerlink" href="#_CPPv4N12tensorrt_llm8executor15SchedulerConfig28mEnablePrefixAwareSchedulingE" title="Link to this definition">#</a><br /></dt>
+<dd><p>Whether schedulers use KV prefix-reuse estimates for admission and token-budget decisions. </p>
 </dd></dl>
 
 </div>
@@ -13649,20 +13709,24 @@
 <li class="toc-h5 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm8executor22CacheTransceiverConfig11BackendType8MOONCAKEE"><code class="docutils literal notranslate"><span class="pre">MOONCAKE</span></code></a></li>
 </ul>
 </li>
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm8executor22CacheTransceiverConfig22CacheTransceiverConfigENSt8optionalI11BackendTypeEENSt8optionalI6size_tEENSt8optionalIiEENSt8optionalIiEE"><code class="docutils literal notranslate"><span class="pre">CacheTransceiverConfig()</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm8executor22CacheTransceiverConfig22CacheTransceiverConfigENSt8optionalI11BackendTypeEENSt8optionalI6size_tEENSt8optionalIiEENSt8optionalIiEENSt8optionalIiEE"><code class="docutils literal notranslate"><span class="pre">CacheTransceiverConfig()</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm8executor22CacheTransceiverConfigeqERK22CacheTransceiverConfig"><code class="docutils literal notranslate"><span class="pre">operator==()</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm8executor22CacheTransceiverConfig14setBackendTypeENSt8optionalI11BackendTypeEE"><code class="docutils literal notranslate"><span class="pre">setBackendType()</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm8executor22CacheTransceiverConfig20setMaxTokensInBufferENSt8optionalI6size_tEE"><code class="docutils literal notranslate"><span class="pre">setMaxTokensInBuffer()</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm8executor22CacheTransceiverConfig22setKvTransferTimeoutMsENSt8optionalIiEE"><code class="docutils literal notranslate"><span class="pre">setKvTransferTimeoutMs()</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm8executor22CacheTransceiverConfig34setKvTransferSenderFutureTimeoutMsENSt8optionalIiEE"><code class="docutils literal notranslate"><span class="pre">setKvTransferSenderFutureTimeoutMs()</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm8executor22CacheTransceiverConfig27setKvTransferPollIntervalMsENSt8optionalIiEE"><code class="docutils literal notranslate"><span class="pre">setKvTransferPollIntervalMs()</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm8executor22CacheTransceiverConfig20getMaxTokensInBufferEv"><code class="docutils literal notranslate"><span class="pre">getMaxTokensInBuffer()</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm8executor22CacheTransceiverConfig14getBackendTypeEv"><code class="docutils literal notranslate"><span class="pre">getBackendType()</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm8executor22CacheTransceiverConfig22getKvTransferTimeoutMsEv"><code class="docutils literal notranslate"><span class="pre">getKvTransferTimeoutMs()</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm8executor22CacheTransceiverConfig34getKvTransferSenderFutureTimeoutMsEv"><code class="docutils literal notranslate"><span class="pre">getKvTransferSenderFutureTimeoutMs()</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm8executor22CacheTransceiverConfig27getKvTransferPollIntervalMsEv"><code class="docutils literal notranslate"><span class="pre">getKvTransferPollIntervalMs()</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm8executor22CacheTransceiverConfig32kDefaultKvTransferPollIntervalMsE"><code class="docutils literal notranslate"><span class="pre">kDefaultKvTransferPollIntervalMs</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm8executor22CacheTransceiverConfig12mBackendTypeE"><code class="docutils literal notranslate"><span class="pre">mBackendType</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm8executor22CacheTransceiverConfig18mMaxTokensInBufferE"><code class="docutils literal notranslate"><span class="pre">mMaxTokensInBuffer</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm8executor22CacheTransceiverConfig20mKvTransferTimeoutMsE"><code class="docutils literal notranslate"><span class="pre">mKvTransferTimeoutMs</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm8executor22CacheTransceiverConfig32mKvTransferSenderFutureTimeoutMsE"><code class="docutils literal notranslate"><span class="pre">mKvTransferSenderFutureTimeoutMs</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm8executor22CacheTransceiverConfig25mKvTransferPollIntervalMsE"><code class="docutils literal notranslate"><span class="pre">mKvTransferPollIntervalMs</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm8executor18ContextPhaseParamsE"><code class="docutils literal notranslate"><span class="pre">tensorrt_llm::executor::ContextPhaseParams</span></code></a><ul class="nav section-nav flex-column">
@@ -13745,6 +13809,7 @@
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm8executor18DynamicBatchConfig24getEnableBatchSizeTuningEv"><code class="docutils literal notranslate"><span class="pre">getEnableBatchSizeTuning()</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm8executor18DynamicBatchConfig27getEnableMaxNumTokensTuningEv"><code class="docutils literal notranslate"><span class="pre">getEnableMaxNumTokensTuning()</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm8executor18DynamicBatchConfig17getBatchSizeTableEv"><code class="docutils literal notranslate"><span class="pre">getBatchSizeTable()</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm8executor18DynamicBatchConfigeqERK18DynamicBatchConfig"><code class="docutils literal notranslate"><span class="pre">operator==()</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm8executor18DynamicBatchConfig39kDefaultDynamicBatchMovingAverageWindowE"><code class="docutils literal notranslate"><span class="pre">kDefaultDynamicBatchMovingAverageWindow</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm8executor18DynamicBatchConfig22kDefaultBatchSizeTableE"><code class="docutils literal notranslate"><span class="pre">kDefaultBatchSizeTable</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm8executor18DynamicBatchConfig22mEnableBatchSizeTuningE"><code class="docutils literal notranslate"><span class="pre">mEnableBatchSizeTuning</span></code></a></li>
@@ -13863,6 +13928,7 @@
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm8executor14ExecutorConfig30kDefaultMaxSeqIdleMicrosecondsE"><code class="docutils literal notranslate"><span class="pre">kDefaultMaxSeqIdleMicroseconds</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm8executor14ExecutorConfig30kDefaultIterStatsMaxIterationsE"><code class="docutils literal notranslate"><span class="pre">kDefaultIterStatsMaxIterations</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm8executor14ExecutorConfig33kDefaultRequestStatsMaxIterationsE"><code class="docutils literal notranslate"><span class="pre">kDefaultRequestStatsMaxIterations</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm8executor14ExecutorConfig28kUnlimitedStatsMaxIterationsE"><code class="docutils literal notranslate"><span class="pre">kUnlimitedStatsMaxIterations</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm8executor14ExecutorConfig13mMaxBeamWidthE"><code class="docutils literal notranslate"><span class="pre">mMaxBeamWidth</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm8executor14ExecutorConfig16mSchedulerConfigE"><code class="docutils literal notranslate"><span class="pre">mSchedulerConfig</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm8executor14ExecutorConfig14mKvCacheConfigE"><code class="docutils literal notranslate"><span class="pre">mKvCacheConfig</span></code></a></li>
@@ -14266,6 +14332,7 @@
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm8executor7RequestaSERR7Request"><code class="docutils literal notranslate"><span class="pre">operator=()</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm8executor7RequestD0Ev"><code class="docutils literal notranslate"><span class="pre">~Request()</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm8executor7Request16getInputTokenIdsEv"><code class="docutils literal notranslate"><span class="pre">getInputTokenIds()</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm8executor7Request17getNumInputTokensEv"><code class="docutils literal notranslate"><span class="pre">getNumInputTokens()</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm8executor7Request12getMaxTokensEv"><code class="docutils literal notranslate"><span class="pre">getMaxTokens()</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm8executor7Request12getStreamingEv"><code class="docutils literal notranslate"><span class="pre">getStreaming()</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm8executor7Request17getSamplingConfigEv"><code class="docutils literal notranslate"><span class="pre">getSamplingConfig()</span></code></a></li>
@@ -14471,14 +14538,16 @@
 </ul>
 </li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm8executor15SchedulerConfigE"><code class="docutils literal notranslate"><span class="pre">tensorrt_llm::executor::SchedulerConfig</span></code></a><ul class="nav section-nav flex-column">
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm8executor15SchedulerConfig15SchedulerConfigE23CapacitySchedulerPolicyNSt8optionalI21ContextChunkingPolicyEENSt8optionalI18DynamicBatchConfigEE"><code class="docutils literal notranslate"><span class="pre">SchedulerConfig()</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm8executor15SchedulerConfig15SchedulerConfigE23CapacitySchedulerPolicyNSt8optionalI21ContextChunkingPolicyEENSt8optionalI18DynamicBatchConfigEEb"><code class="docutils literal notranslate"><span class="pre">SchedulerConfig()</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm8executor15SchedulerConfigeqERK15SchedulerConfig"><code class="docutils literal notranslate"><span class="pre">operator==()</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm8executor15SchedulerConfig26getCapacitySchedulerPolicyEv"><code class="docutils literal notranslate"><span class="pre">getCapacitySchedulerPolicy()</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm8executor15SchedulerConfig24getContextChunkingPolicyEv"><code class="docutils literal notranslate"><span class="pre">getContextChunkingPolicy()</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm8executor15SchedulerConfig21getDynamicBatchConfigEv"><code class="docutils literal notranslate"><span class="pre">getDynamicBatchConfig()</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4NK12tensorrt_llm8executor15SchedulerConfig30getEnablePrefixAwareSchedulingEv"><code class="docutils literal notranslate"><span class="pre">getEnablePrefixAwareScheduling()</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm8executor15SchedulerConfig24mCapacitySchedulerPolicyE"><code class="docutils literal notranslate"><span class="pre">mCapacitySchedulerPolicy</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm8executor15SchedulerConfig22mContextChunkingPolicyE"><code class="docutils literal notranslate"><span class="pre">mContextChunkingPolicy</span></code></a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm8executor15SchedulerConfig19mDynamicBatchConfigE"><code class="docutils literal notranslate"><span class="pre">mDynamicBatchConfig</span></code></a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm8executor15SchedulerConfig28mEnablePrefixAwareSchedulingE"><code class="docutils literal notranslate"><span class="pre">mEnablePrefixAwareScheduling</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#_CPPv4N12tensorrt_llm8executor25SpeculativeDecodingConfigE"><code class="docutils literal notranslate"><span class="pre">tensorrt_llm::executor::SpeculativeDecodingConfig</span></code></a><ul class="nav section-nav flex-column">
@@ -14870,8 +14939,8 @@
   
 
   <!-- Scripts loaded after <body> so the DOM is not blocked -->
-  <script defer src="../_static/scripts/bootstrap.js?digest=a95f357e85573c9b56d5"></script>
-<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=a95f357e85573c9b56d5"></script>
+  <script defer src="../_static/scripts/bootstrap.js?digest=90905a2f556bf617f1a9"></script>
+<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=90905a2f556bf617f1a9"></script>
 
 
   <footer class="bd-footer">
@@ -14943,9 +15012,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on June 27, 2026.</p>
+  <p>Last updated on July 14, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/c25c23f">c25c23f</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/1662a87">1662a87</a>.</p>
   
 </div></div>
       

@@ -28,8 +28,8 @@
   </noscript>
   
   <!-- Loaded before other Sphinx assets -->
-  <link href="../../_static/styles/theme.css?digest=a95f357e85573c9b56d5" rel="stylesheet" />
-<link href="../../_static/styles/pydata-sphinx-theme.css?digest=a95f357e85573c9b56d5" rel="stylesheet" />
+  <link href="../../_static/styles/theme.css?digest=90905a2f556bf617f1a9" rel="stylesheet" />
+<link href="../../_static/styles/pydata-sphinx-theme.css?digest=90905a2f556bf617f1a9" rel="stylesheet" />
 
     <link rel="stylesheet" type="text/css" href="../../_static/pygments.css?v=8f2a1f02" />
     <link rel="stylesheet" type="text/css" href="../../_static/styles/nvidia-sphinx-theme.css?v=933278ad" />
@@ -40,10 +40,10 @@
     <link rel="stylesheet" type="text/css" href="../../_static/custom.css?v=19d20f17" />
   
   <!-- So that users can add custom icons -->
-  <script defer src="../../_static/scripts/fontawesome.js?digest=a95f357e85573c9b56d5"></script>
+  <script defer src="../../_static/scripts/fontawesome.js?digest=90905a2f556bf617f1a9"></script>
   <!-- Pre-loaded scripts that we'll load fully later -->
-  <link rel="preload" as="script" href="../../_static/scripts/bootstrap.js?digest=a95f357e85573c9b56d5" />
-<link rel="preload" as="script" href="../../_static/scripts/pydata-sphinx-theme.js?digest=a95f357e85573c9b56d5" />
+  <link rel="preload" as="script" href="../../_static/scripts/bootstrap.js?digest=90905a2f556bf617f1a9" />
+<link rel="preload" as="script" href="../../_static/scripts/pydata-sphinx-theme.js?digest=90905a2f556bf617f1a9" />
 
 
 
@@ -59,13 +59,11 @@
     <script src="../../_static/togglebutton.js?v=b8b12719"></script>
     <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
     <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
-    <script>window.MathJax = {"options": {"processHtmlClass": "tex2jax_process|mathjax_process|math|output_area"}}</script>
-    <script defer="defer" src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
     <script>DOCUMENTATION_OPTIONS.pagename = 'blogs/tech_blog/blog16_Accelerating_Long_Context_Inference_with_Skip_Softmax_Attention';</script>
     <script>
-        DOCUMENTATION_OPTIONS.theme_version = '0.19.0';
+        DOCUMENTATION_OPTIONS.theme_version = '0.20.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc20';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc21';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -81,7 +79,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc20" />
+  <meta name="docsearch:version" content="1.3.0rc21" />
   
     
     <script src="../../_static/searchtools.js"></script>
@@ -448,6 +446,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../../features/feature-combination-matrix.html">Feature Combination Matrix</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/disagg-serving.html">Disaggregated Serving</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/embeddings.html">Embeddings (Encoder-Only Models)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/kvcache.html">KV Cache System</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/long-sequence.html">Long Sequences</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/lora.html">LoRA (Low-Rank Adaptation)</a></li>
@@ -458,6 +457,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../../features/quantization.html">Quantization</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/sampling.html">Sampling</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/additional-outputs.html">Additional Outputs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/post-processor-hook.html">Post-Processing Hook</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/guided-decoding.html">Guided Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/speculative-decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/checkpoint-loading.html">Checkpoint Loading</a></li>
@@ -497,6 +497,7 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="current nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="blog25_Scaling_Video_Generation_Across_NVL72_Rack_with_TensorRT-LLM.html">Scaling Video Generation Across NVL72 rack with TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blog24_MoE_as_Dense_GEMM.html">MoE as Dense GEMM: Optimizing Low-Latency MoE Inference on NVIDIA Blackwell</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blog23_Joint_Optimization_of_Agent_Applications_and_TensorRT-LLM.html">Joint Optimization of Agent Applications and TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blog22_Helix_Parallelism_Scaling_Multi_Million_Token_Decoding_with_KV_Cache_Sharding.html">Helix Parallelism in TensorRT-LLM: Scaling Multi-Million-Token Decoding with KV Cache Sharding</a></li>
@@ -534,9 +535,9 @@
 <li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM">Github Code</a></li>
 <li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/issues?q=is%3Aissue%20state%3Aopen%20label%3Aroadmap">Roadmap</a></li>
 </ul>
-<p aria-level="2" class="caption" role="heading"><span class="caption-text">Use TensorRT Engine</span></p>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Migration</span></p>
 <ul class="nav bd-sidenav">
-<li class="toctree-l1"><a class="reference internal" href="../../legacy/tensorrt_quickstart.html">LLM API with TensorRT Engine</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../legacy/tensorrt-backend-removal.html">Migration Guide: TensorRT Backend Removed</a></li>
 </ul>
 </div>
 </nav></div>
@@ -588,41 +589,40 @@
 <div id="searchbox"></div>
                 <article class="bd-article">
                   
-  <section class="tex2jax_ignore mathjax_ignore" id="accelerating-long-context-inference-with-skip-softmax-attention">
+  <section id="accelerating-long-context-inference-with-skip-softmax-attention">
 <h1>Accelerating Long-Context Inference with Skip Softmax Attention<a class="headerlink" href="#accelerating-long-context-inference-with-skip-softmax-attention" title="Link to this heading">#</a></h1>
 <p>As context lengths grow from thousands to hundreds of thousands of tokens, attention computation becomes a major bottleneck in long-context LLM inference. TensorRT-LLM provides a <a class="reference internal" href="../../features/sparse-attention.html#framework-level-sparse-attention"><span class="std std-ref">sparse attention framework</span></a> that supports techniques like KV cache compression and sparse pattern prediction, featured in <a class="reference external" href="https://arxiv.org/pdf/2502.14051">RocketKV</a> and <a class="reference external" href="https://github.com/deepseek-ai/DeepSeek-V3.2-Exp/blob/main/DeepSeek_V3_2.pdf">DSA</a>. However, these require framework-level support—additional token selection steps, auxiliary data structures, and kernel modifications are required, compared to the vanilla attention architecture. This complexity introduces <strong>runtime overhead</strong> that can offset performance gains, particularly when context lengths are not long enough to amortize the extra work.</p>
 <p>In this blog, we introduce <strong>Skip Softmax Attention</strong>, a drop-in sparse attention technique that is designed to accelerate the existing pretrained models that use standard attention mechanisms like MHA, GQA, or MLA. Skip Softmax Attention is built on top of the Flash Attention algorithm and only requires modifying the existing <strong>attention kernels</strong>. Due to this simplicity, the end-to-end performance gain is more predictable. In addition, it is only an approximation method of the attention kernel computation, making it compatible with nearly all the other features, such as FP8 attention, KV cache reuse, chunked prefill etc.</p>
 <section id="table-of-contents">
 <h2>Table of Contents<a class="headerlink" href="#table-of-contents" title="Link to this heading">#</a></h2>
 <ul class="simple">
-<li><p><a class="reference internal" href="#accelerating-long-context-inference-with-skip-softmax-attention">Accelerating Long-Context Inference with Skip Softmax Attention</a></p>
+<li><p><a class="reference internal" href="#accelerating-long-context-inference-with-skip-softmax-attention"><span class="xref myst">Accelerating Long-Context Inference with Skip Softmax Attention</span></a></p>
 <ul>
-<li><p><a class="reference internal" href="#table-of-contents">Table of Contents</a></p></li>
-<li><p><a class="reference internal" href="#method-overview">Method Overview</a></p></li>
-<li><p><a class="reference internal" href="#example-usage">Example Usage</a></p></li>
-<li><p><a class="reference internal" href="#accuracy-evaluation">Accuracy Evaluation</a></p></li>
-<li><p><a class="reference internal" href="#performance-benchmark">Performance Benchmark</a></p>
+<li><p><a class="reference internal" href="#table-of-contents"><span class="xref myst">Table of Contents</span></a></p></li>
+<li><p><a class="reference internal" href="#method-overview"><span class="xref myst">Method Overview</span></a></p></li>
+<li><p><a class="reference internal" href="#example-usage"><span class="xref myst">Example Usage</span></a></p></li>
+<li><p><a class="reference internal" href="#accuracy-evaluation"><span class="xref myst">Accuracy Evaluation</span></a></p></li>
+<li><p><a class="reference internal" href="#performance-benchmark"><span class="xref myst">Performance Benchmark</span></a></p>
 <ul>
-<li><p><a class="reference internal" href="#kernel-performance">Kernel Performance</a></p></li>
-<li><p><a class="reference internal" href="#end-to-end-performance">End-to-end Performance</a></p></li>
+<li><p><a class="reference internal" href="#kernel-performance"><span class="xref myst">Kernel Performance</span></a></p></li>
+<li><p><a class="reference internal" href="#end-to-end-performance"><span class="xref myst">End-to-end Performance</span></a></p></li>
 </ul>
 </li>
-<li><p><a class="reference internal" href="#reproduction">Reproduction</a></p>
+<li><p><a class="reference internal" href="blog18_Optimizing_MoE_Communication_with_One_Sided_AlltoAll_Over_NVLink.html#reproduction"><span class="std std-ref">Reproduction</span></a></p>
 <ul>
-<li><p><a class="reference internal" href="#accuracy-evaluation-longbench-v1-v2">Accuracy evaluation (LongBench V1/V2)</a></p></li>
-<li><p><a class="reference internal" href="#end-to-end-performance-ttft-tpot">End-to-end performance (TTFT/TPOT)</a></p></li>
+<li><p><a class="reference internal" href="#accuracy-evaluation-longbench-v1v2"><span class="xref myst">Accuracy evaluation (LongBench V1/V2)</span></a></p></li>
+<li><p><a class="reference internal" href="#end-to-end-performance-ttfttpot"><span class="xref myst">End-to-end performance (TTFT/TPOT)</span></a></p></li>
 </ul>
 </li>
-<li><p><a class="reference internal" href="#conclusion">Conclusion</a></p></li>
+<li><p><a class="reference internal" href="../../legacy/performance/performance-tuning-guide/tuning-max-batch-size-and-max-num-tokens.html#conclusion"><span class="std std-ref">Conclusion</span></a></p></li>
 </ul>
 </li>
 </ul>
 </section>
 <section id="method-overview">
 <h2>Method Overview<a class="headerlink" href="#method-overview" title="Link to this heading">#</a></h2>
-<p>The idea of Skip Softmax Attention is to compare the local maximum <span class="math notranslate nohighlight">\(\tilde{m}_i^{(j)}\)</span> of <span class="math notranslate nohighlight">\(Q \cdot K^T\)</span> with the running global maximum <span class="math notranslate nohighlight">\(m_i^{(j)}\)</span>, and skip the softmax (exp) and BMM2 calculation for blocks that are below a certain threshold <span class="math notranslate nohighlight">\(\lambda\)</span>:</p>
-<div class="math notranslate nohighlight">
-\[\exp(\tilde{m}_i^{(j)} - m_i^{(j)}) &lt; \lambda\]</div>
+<p>The idea of Skip Softmax Attention is to compare the local maximum $\tilde{m}_i^{(j)}$ of $Q \cdot K^T$ with the running global maximum $m_i^{(j)}$, and skip the softmax (exp) and BMM2 calculation for blocks that are below a certain threshold $\lambda$:</p>
+<p>$$\exp(\tilde{m}_i^{(j)} - m_i^{(j)}) &lt; \lambda$$</p>
 <p>In this way, we can indirectly control the sparsity via the threshold. The threshold is set to be inversely proportional to the context length, i.e., the longer the context, the smaller the threshold is needed to achieve the same sparsity.</p>
 <p>The method is fully dynamic, and can be applied to both the prefilling and decoding. The algorithm of Skip Softmax Attention is described in the paper <a class="reference external" href="https://arxiv.org/pdf/2512.12087">BLASST: Dynamic Blocked Attention Sparsity via Softmax Thresholding</a>. We have also published a <a class="reference external" href="https://developer.nvidia.com/blog/accelerating-long-context-inference-with-skip-softmax-in-nvidia-tensorrt-llm/">Developer Blog</a> for explanation. Please refer to these resources for in-depth dive into the algorithm details. We will focus on the application of Skip Softmax Attention in TensorRT-LLM to accelerate long-context inference.</p>
 <p align="center">
@@ -1145,7 +1145,7 @@ throughput<span class="w"> </span>--dataset<span class="w"> </span><span class="
 </section>
 <section id="conclusion">
 <h2>Conclusion<a class="headerlink" href="#conclusion" title="Link to this heading">#</a></h2>
-<p>Skip Softmax Attention is a kernel-based solution for accelerating the attention. Due to the design that BMM1 (<span class="math notranslate nohighlight">\(Q \cdot K^T\)</span>) in the attention kernel is not skipped, the performance gain is capped to 1.8x at kernel level. Nevertheless, it excels at achieving high sparsity with minimal accuracy degradation, and is especially effective in the medium-to-long context scenarios where previous methods like MInference cannot well handle, because the introduced runtime overhead may not pay off the speedup of the attention kernel. The drop-in nature of Skip Softmax Attention makes it a flexible, easy-to-use method for accelerating long-context inference. The Skip Softmax Attention kernels will also be <a class="reference external" href="https://github.com/flashinfer-ai/flashinfer/issues/2306">available in FlashInfer</a> for adoptions by the open-source community.</p>
+<p>Skip Softmax Attention is a kernel-based solution for accelerating the attention. Due to the design that BMM1 ($Q \cdot K^T$) in the attention kernel is not skipped, the performance gain is capped to 1.8x at kernel level. Nevertheless, it excels at achieving high sparsity with minimal accuracy degradation, and is especially effective in the medium-to-long context scenarios where previous methods like MInference cannot well handle, because the introduced runtime overhead may not pay off the speedup of the attention kernel. The drop-in nature of Skip Softmax Attention makes it a flexible, easy-to-use method for accelerating long-context inference. The Skip Softmax Attention kernels will also be <a class="reference external" href="https://github.com/flashinfer-ai/flashinfer/issues/2306">available in FlashInfer</a> for adoptions by the open-source community.</p>
 </section>
 </section>
 
@@ -1231,8 +1231,8 @@ throughput<span class="w"> </span>--dataset<span class="w"> </span><span class="
   
 
   <!-- Scripts loaded after <body> so the DOM is not blocked -->
-  <script defer src="../../_static/scripts/bootstrap.js?digest=a95f357e85573c9b56d5"></script>
-<script defer src="../../_static/scripts/pydata-sphinx-theme.js?digest=a95f357e85573c9b56d5"></script>
+  <script defer src="../../_static/scripts/bootstrap.js?digest=90905a2f556bf617f1a9"></script>
+<script defer src="../../_static/scripts/pydata-sphinx-theme.js?digest=90905a2f556bf617f1a9"></script>
 
 
   <footer class="bd-footer">
@@ -1304,9 +1304,9 @@ throughput<span class="w"> </span>--dataset<span class="w"> </span><span class="
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on June 27, 2026.</p>
+  <p>Last updated on July 14, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/c25c23f">c25c23f</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/1662a87">1662a87</a>.</p>
   
 </div></div>
       

@@ -28,8 +28,8 @@
   </noscript>
   
   <!-- Loaded before other Sphinx assets -->
-  <link href="../../_static/styles/theme.css?digest=a95f357e85573c9b56d5" rel="stylesheet" />
-<link href="../../_static/styles/pydata-sphinx-theme.css?digest=a95f357e85573c9b56d5" rel="stylesheet" />
+  <link href="../../_static/styles/theme.css?digest=90905a2f556bf617f1a9" rel="stylesheet" />
+<link href="../../_static/styles/pydata-sphinx-theme.css?digest=90905a2f556bf617f1a9" rel="stylesheet" />
 
     <link rel="stylesheet" type="text/css" href="../../_static/pygments.css?v=8f2a1f02" />
     <link rel="stylesheet" type="text/css" href="../../_static/styles/nvidia-sphinx-theme.css?v=933278ad" />
@@ -40,10 +40,10 @@
     <link rel="stylesheet" type="text/css" href="../../_static/custom.css?v=19d20f17" />
   
   <!-- So that users can add custom icons -->
-  <script defer src="../../_static/scripts/fontawesome.js?digest=a95f357e85573c9b56d5"></script>
+  <script defer src="../../_static/scripts/fontawesome.js?digest=90905a2f556bf617f1a9"></script>
   <!-- Pre-loaded scripts that we'll load fully later -->
-  <link rel="preload" as="script" href="../../_static/scripts/bootstrap.js?digest=a95f357e85573c9b56d5" />
-<link rel="preload" as="script" href="../../_static/scripts/pydata-sphinx-theme.js?digest=a95f357e85573c9b56d5" />
+  <link rel="preload" as="script" href="../../_static/scripts/bootstrap.js?digest=90905a2f556bf617f1a9" />
+<link rel="preload" as="script" href="../../_static/scripts/pydata-sphinx-theme.js?digest=90905a2f556bf617f1a9" />
 
 
 
@@ -61,9 +61,9 @@
     <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
     <script>DOCUMENTATION_OPTIONS.pagename = 'legacy/performance/perf-benchmarking';</script>
     <script>
-        DOCUMENTATION_OPTIONS.theme_version = '0.19.0';
+        DOCUMENTATION_OPTIONS.theme_version = '0.20.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc20';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc21';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -77,7 +77,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc20" />
+  <meta name="docsearch:version" content="1.3.0rc21" />
   
     
     <script src="../../_static/searchtools.js"></script>
@@ -444,6 +444,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../../features/feature-combination-matrix.html">Feature Combination Matrix</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/disagg-serving.html">Disaggregated Serving</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/embeddings.html">Embeddings (Encoder-Only Models)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/kvcache.html">KV Cache System</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/long-sequence.html">Long Sequences</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/lora.html">LoRA (Low-Rank Adaptation)</a></li>
@@ -454,6 +455,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../../features/quantization.html">Quantization</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/sampling.html">Sampling</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/additional-outputs.html">Additional Outputs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/post-processor-hook.html">Post-Processing Hook</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/guided-decoding.html">Guided Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/speculative-decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/checkpoint-loading.html">Checkpoint Loading</a></li>
@@ -493,6 +495,7 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog25_Scaling_Video_Generation_Across_NVL72_Rack_with_TensorRT-LLM.html">Scaling Video Generation Across NVL72 rack with TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog24_MoE_as_Dense_GEMM.html">MoE as Dense GEMM: Optimizing Low-Latency MoE Inference on NVIDIA Blackwell</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog23_Joint_Optimization_of_Agent_Applications_and_TensorRT-LLM.html">Joint Optimization of Agent Applications and TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog22_Helix_Parallelism_Scaling_Multi_Million_Token_Decoding_with_KV_Cache_Sharding.html">Helix Parallelism in TensorRT-LLM: Scaling Multi-Million-Token Decoding with KV Cache Sharding</a></li>
@@ -530,9 +533,9 @@
 <li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM">Github Code</a></li>
 <li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/issues?q=is%3Aissue%20state%3Aopen%20label%3Aroadmap">Roadmap</a></li>
 </ul>
-<p aria-level="2" class="caption" role="heading"><span class="caption-text">Use TensorRT Engine</span></p>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Migration</span></p>
 <ul class="nav bd-sidenav">
-<li class="toctree-l1"><a class="reference internal" href="../tensorrt_quickstart.html">LLM API with TensorRT Engine</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../tensorrt-backend-removal.html">Migration Guide: TensorRT Backend Removed</a></li>
 </ul>
 </div>
 </nav></div>
@@ -584,7 +587,7 @@
 <div id="searchbox"></div>
                 <article class="bd-article">
                   
-  <section class="tex2jax_ignore mathjax_ignore" id="tensorrt-llm-benchmarking">
+  <section id="tensorrt-llm-benchmarking">
 <span id="perf-benchmarking"></span><h1>TensorRT-LLM Benchmarking<a class="headerlink" href="#tensorrt-llm-benchmarking" title="Link to this heading">#</a></h1>
 <div class="admonition important">
 <p class="admonition-title">Important</p>
@@ -744,7 +747,7 @@ Total<span class="w"> </span>Latency<span class="w"> </span><span class="o">(</s
 <p>The workflow for <code class="docutils literal notranslate"><span class="pre">trtllm-bench</span></code> is composed of the following steps:</p>
 <ol class="arabic simple">
 <li><p>Prepare a dataset to drive the inflight batching benchmark.</p></li>
-<li><p>Build a benchmark engine using <code class="docutils literal notranslate"><span class="pre">trtllm-bench</span> <span class="pre">build</span></code> subcommand (not required for <a class="reference internal" href="#running-with-the-pytorch-workflow">PyTorch flow</a>).</p></li>
+<li><p>Build a benchmark engine using <code class="docutils literal notranslate"><span class="pre">trtllm-bench</span> <span class="pre">build</span></code> subcommand (not required for <a class="reference internal" href="#running-with-the-pytorch-workflow"><span class="xref myst">PyTorch flow</span></a>).</p></li>
 <li><p>Run the max throughput benchmark using the <code class="docutils literal notranslate"><span class="pre">trtllm-bench</span> <span class="pre">throughput</span></code> subcommand or low latency benchmark using the <code class="docutils literal notranslate"><span class="pre">trtllm-bench</span> <span class="pre">latency</span></code> subcommand.</p></li>
 </ol>
 <section id="preparing-a-dataset">
@@ -937,7 +940,7 @@ upper bound throughput number.</p>
 <section id="how-the-benchmarker-works">
 <h4>How the Benchmarker Works<a class="headerlink" href="#how-the-benchmarker-works" title="Link to this heading">#</a></h4>
 <p>The benchmarker reads a data file where a single line contains
-a complete JSON request entry as specified in <a class="reference internal" href="#preparing-a-dataset"><span class="std std-ref">Preparing a Dataset</span></a>.
+a complete JSON request entry as specified in <a class="reference internal" href="#preparing-a-dataset"><code class="xref myst docutils literal notranslate"><span class="pre">preparing-a-dataset</span></code></a>.
 The process that the benchmarker follows is:</p>
 <ol class="arabic simple">
 <li><p>Iterate over all input requests. If <code class="docutils literal notranslate"><span class="pre">logits</span></code> is specified, construct the request using the specified
@@ -945,8 +948,8 @@ list of logits. Otherwise, tokenize the <code class="docutils literal notranslat
 <li><p>Submit the dataset to the TensorRT-LLM <code class="docutils literal notranslate"><span class="pre">Executor</span></code> API as fast as possible (offline mode).</p></li>
 <li><p>Wait for all requests to return, compute statistics, and then report results.</p></li>
 </ol>
-<p>To run the benchmarker, run the following commands with the <a class="reference internal" href="#building-a-benchmark-engine">engine</a> and
-<a class="reference internal" href="#preparing-a-dataset">dataset</a> generated from previous steps:</p>
+<p>To run the benchmarker, run the following commands with the <a class="reference internal" href="#building-a-benchmark-engine"><span class="xref myst">engine</span></a> and
+<a class="reference internal" href="#preparing-a-dataset"><span class="xref myst">dataset</span></a> generated from previous steps:</p>
 <div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>trtllm-bench<span class="w"> </span>--model<span class="w"> </span>meta-llama/Llama-3.1-8B<span class="w"> </span>throughput<span class="w"> </span>--dataset<span class="w"> </span>/tmp/synthetic_128_128.txt<span class="w"> </span>--engine_dir<span class="w"> </span>/tmp/meta-llama/Llama-3.1-8B/tp_1_pp_1
 <span class="o">[</span>TensorRT-LLM<span class="o">]</span><span class="w"> </span>TensorRT-LLM<span class="w"> </span>version:<span class="w"> </span><span class="m">0</span>.17.0
 <span class="o">[</span><span class="m">01</span>/18/2025-01:01:13<span class="o">]</span><span class="w"> </span><span class="o">[</span>TRT-LLM<span class="o">]</span><span class="w"> </span><span class="o">[</span>I<span class="o">]</span><span class="w"> </span>Preparing<span class="w"> </span>to<span class="w"> </span>run<span class="w"> </span>throughput<span class="w"> </span>benchmark...
@@ -1023,9 +1026,9 @@ Total<span class="w"> </span>Latency<span class="w"> </span><span class="o">(</s
 <p><strong>Non-breaking</strong>: <code class="docutils literal notranslate"><span class="pre">--config</span> <span class="pre">&lt;file.yaml&gt;</span></code> is the preferred flag for passing a <a class="reference internal" href="../../commands/trtllm-serve/trtllm-serve.html#configuring-with-yaml-files"><span class="std std-ref">YAML configuration file</span></a>.
 Existing workflows using <code class="docutils literal notranslate"><span class="pre">--extra_llm_api_options</span> <span class="pre">&lt;file.yaml&gt;</span></code> continue to work; it is an equivalent alias.</p>
 </div>
-<p>To benchmark the PyTorch backend (<code class="docutils literal notranslate"><span class="pre">tensorrt_llm._torch</span></code>), use the following command with <a class="reference internal" href="#preparing-a-dataset">dataset</a> generated from previous steps. With the PyTorch flow, you will not need to
+<p>To benchmark the PyTorch backend (<code class="docutils literal notranslate"><span class="pre">tensorrt_llm._torch</span></code>), use the following command with <a class="reference internal" href="#preparing-a-dataset"><span class="xref myst">dataset</span></a> generated from previous steps. With the PyTorch flow, you will not need to
 run <code class="docutils literal notranslate"><span class="pre">trtllm-bench</span> <span class="pre">build</span></code>; the <code class="docutils literal notranslate"><span class="pre">throughput</span></code> benchmark initializes the backend by tuning against the
-dataset provided via <code class="docutils literal notranslate"><span class="pre">--dataset</span></code> (or the other build mode settings described <a class="reference internal" href="#other-build-modes">above</a>).
+dataset provided via <code class="docutils literal notranslate"><span class="pre">--dataset</span></code> (or the other build mode settings described <a class="reference internal" href="#other-build-modes"><span class="xref myst">above</span></a>).
 Note that CUDA graph is enabled by default. You can add additional pytorch config with
 <code class="docutils literal notranslate"><span class="pre">--config</span></code> followed by the path to a YAML file. For more details, please refer to the
 help text by running the command with <code class="docutils literal notranslate"><span class="pre">--help</span></code>.</p>
@@ -1320,7 +1323,7 @@ when the checkpoint precision is <code class="docutils literal notranslate"><spa
 </section>
 <section id="low-latency-benchmark">
 <h2>Low Latency Benchmark<a class="headerlink" href="#low-latency-benchmark" title="Link to this heading">#</a></h2>
-<p>The low latency benchmark follows a similar workflow to the <a class="reference internal" href="#max-throughput-benchmark">throughput benchmark</a>
+<p>The low latency benchmark follows a similar workflow to the <a class="reference internal" href="#max-throughput-benchmark"><span class="xref myst">throughput benchmark</span></a>
 but requires building the engine separately from <code class="docutils literal notranslate"><span class="pre">trtllm-bench</span></code>. Low latency benchmarks has the following modes:</p>
 <ul class="simple">
 <li><p>A single-request low-latency engine</p></li>
@@ -1330,7 +1333,7 @@ but requires building the engine separately from <code class="docutils literal n
 <h3>Low Latency TensorRT-LLM Engine for Llama-3 70B<a class="headerlink" href="#low-latency-tensorrt-llm-engine-for-llama-3-70b" title="Link to this heading">#</a></h3>
 <p>To build a low-latency engine for the latency benchmark, run the following quantize and build commands.
 The <code class="docutils literal notranslate"><span class="pre">$checkpoint_dir</span></code> is the path to the <a class="reference external" href="https://huggingface.co/meta-llama/Meta-Llama-3-70B">meta-llama/Meta-Llama-3-70B</a> Hugging Face checkpoint in your cache or downloaded to a specific location with the <a class="reference external" href="https://huggingface.co/docs/huggingface_hub/en/guides/cli">huggingface-cli</a>.
-To prepare a dataset, follow the same process as specified in <a class="reference internal" href="#preparing-a-dataset"><span class="std std-ref">Preparing a Dataset</span></a>.</p>
+To prepare a dataset, follow the same process as specified in <a class="reference internal" href="#preparing-a-dataset"><code class="xref myst docutils literal notranslate"><span class="pre">preparing-a-dataset</span></code></a>.</p>
 <section id="benchmarking-a-non-medusa-low-latency-engine">
 <h4>Benchmarking a non-Medusa Low Latency Engine<a class="headerlink" href="#benchmarking-a-non-medusa-low-latency-engine" title="Link to this heading">#</a></h4>
 <p>To quantize the checkpoint:</p>
@@ -1464,7 +1467,7 @@ The choices are specified with a YAML file like the following example (<code cla
 </tr>
 <tr class="row-odd"><td><p>Latency</p></td>
 <td><p>Build</p></td>
-<td><p>See <a class="reference internal" href="#low-latency-tensorrt-llm-engine-for-llama-3-70b">section about building low latency engines</a></p></td>
+<td><p>See <a class="reference internal" href="#low-latency-tensorrt-llm-engine-for-llama-3-70b"><span class="xref myst">section about building low latency engines</span></a></p></td>
 </tr>
 <tr class="row-even"><td><p>Non-Medusa Latency</p></td>
 <td><p>Benchmark</p></td>
@@ -1478,18 +1481,16 @@ The choices are specified with a YAML file like the following example (<code cla
 </table>
 </div>
 <p>where,</p>
-<dl class="simple myst">
-<dt><code class="docutils literal notranslate"><span class="pre">$HF_MODEL</span></code></dt><dd><p>The Hugging Face name of a model.</p>
-</dd>
-<dt><code class="docutils literal notranslate"><span class="pre">$NUM_REQUESTS</span></code></dt><dd><p>The number of requests to generate.</p>
-</dd>
-<dt><code class="docutils literal notranslate"><span class="pre">$DATASET_PATH</span></code></dt><dd><p>The path where the dataset was written when preparing the dataset.</p>
-</dd>
-<dt><code class="docutils literal notranslate"><span class="pre">$ENGINE_DIR</span></code></dt><dd><p>The engine directory as printed by <code class="docutils literal notranslate"><span class="pre">trtllm-bench</span> <span class="pre">build</span></code>.</p>
-</dd>
-<dt><code class="docutils literal notranslate"><span class="pre">$MEDUSA_CHOICES</span></code></dt><dd><p>A YAML config representing the Medusa tree for the benchmark.</p>
-</dd>
-</dl>
+<p><code class="docutils literal notranslate"><span class="pre">$HF_MODEL</span></code>
+: The Hugging Face name of a model.</p>
+<p><code class="docutils literal notranslate"><span class="pre">$NUM_REQUESTS</span></code>
+: The number of requests to generate.</p>
+<p><code class="docutils literal notranslate"><span class="pre">$DATASET_PATH</span></code>
+: The path where the dataset was written when preparing the dataset.</p>
+<p><code class="docutils literal notranslate"><span class="pre">$ENGINE_DIR</span></code>
+: The engine directory as printed by <code class="docutils literal notranslate"><span class="pre">trtllm-bench</span> <span class="pre">build</span></code>.</p>
+<p><code class="docutils literal notranslate"><span class="pre">$MEDUSA_CHOICES</span></code>
+: A YAML config representing the Medusa tree for the benchmark.</p>
 </section>
 </section>
 
@@ -1588,8 +1589,8 @@ The choices are specified with a YAML file like the following example (<code cla
   
 
   <!-- Scripts loaded after <body> so the DOM is not blocked -->
-  <script defer src="../../_static/scripts/bootstrap.js?digest=a95f357e85573c9b56d5"></script>
-<script defer src="../../_static/scripts/pydata-sphinx-theme.js?digest=a95f357e85573c9b56d5"></script>
+  <script defer src="../../_static/scripts/bootstrap.js?digest=90905a2f556bf617f1a9"></script>
+<script defer src="../../_static/scripts/pydata-sphinx-theme.js?digest=90905a2f556bf617f1a9"></script>
 
 
   <footer class="bd-footer">
@@ -1661,9 +1662,9 @@ The choices are specified with a YAML file like the following example (<code cla
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on June 27, 2026.</p>
+  <p>Last updated on July 14, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/c25c23f">c25c23f</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/1662a87">1662a87</a>.</p>
   
 </div></div>
       

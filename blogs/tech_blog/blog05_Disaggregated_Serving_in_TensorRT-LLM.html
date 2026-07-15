@@ -28,8 +28,8 @@
   </noscript>
   
   <!-- Loaded before other Sphinx assets -->
-  <link href="../../_static/styles/theme.css?digest=a95f357e85573c9b56d5" rel="stylesheet" />
-<link href="../../_static/styles/pydata-sphinx-theme.css?digest=a95f357e85573c9b56d5" rel="stylesheet" />
+  <link href="../../_static/styles/theme.css?digest=90905a2f556bf617f1a9" rel="stylesheet" />
+<link href="../../_static/styles/pydata-sphinx-theme.css?digest=90905a2f556bf617f1a9" rel="stylesheet" />
 
     <link rel="stylesheet" type="text/css" href="../../_static/pygments.css?v=8f2a1f02" />
     <link rel="stylesheet" type="text/css" href="../../_static/styles/nvidia-sphinx-theme.css?v=933278ad" />
@@ -40,10 +40,10 @@
     <link rel="stylesheet" type="text/css" href="../../_static/custom.css?v=19d20f17" />
   
   <!-- So that users can add custom icons -->
-  <script defer src="../../_static/scripts/fontawesome.js?digest=a95f357e85573c9b56d5"></script>
+  <script defer src="../../_static/scripts/fontawesome.js?digest=90905a2f556bf617f1a9"></script>
   <!-- Pre-loaded scripts that we'll load fully later -->
-  <link rel="preload" as="script" href="../../_static/scripts/bootstrap.js?digest=a95f357e85573c9b56d5" />
-<link rel="preload" as="script" href="../../_static/scripts/pydata-sphinx-theme.js?digest=a95f357e85573c9b56d5" />
+  <link rel="preload" as="script" href="../../_static/scripts/bootstrap.js?digest=90905a2f556bf617f1a9" />
+<link rel="preload" as="script" href="../../_static/scripts/pydata-sphinx-theme.js?digest=90905a2f556bf617f1a9" />
 
 
 
@@ -59,13 +59,11 @@
     <script src="../../_static/togglebutton.js?v=b8b12719"></script>
     <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
     <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
-    <script>window.MathJax = {"options": {"processHtmlClass": "tex2jax_process|mathjax_process|math|output_area"}}</script>
-    <script defer="defer" src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
     <script>DOCUMENTATION_OPTIONS.pagename = 'blogs/tech_blog/blog05_Disaggregated_Serving_in_TensorRT-LLM';</script>
     <script>
-        DOCUMENTATION_OPTIONS.theme_version = '0.19.0';
+        DOCUMENTATION_OPTIONS.theme_version = '0.20.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc20';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc21';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -81,7 +79,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc20" />
+  <meta name="docsearch:version" content="1.3.0rc21" />
   
     
     <script src="../../_static/searchtools.js"></script>
@@ -448,6 +446,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../../features/feature-combination-matrix.html">Feature Combination Matrix</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/disagg-serving.html">Disaggregated Serving</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/embeddings.html">Embeddings (Encoder-Only Models)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/kvcache.html">KV Cache System</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/long-sequence.html">Long Sequences</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/lora.html">LoRA (Low-Rank Adaptation)</a></li>
@@ -458,6 +457,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../../features/quantization.html">Quantization</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/sampling.html">Sampling</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/additional-outputs.html">Additional Outputs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/post-processor-hook.html">Post-Processing Hook</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/guided-decoding.html">Guided Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/speculative-decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/checkpoint-loading.html">Checkpoint Loading</a></li>
@@ -497,6 +497,7 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="current nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="blog25_Scaling_Video_Generation_Across_NVL72_Rack_with_TensorRT-LLM.html">Scaling Video Generation Across NVL72 rack with TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blog24_MoE_as_Dense_GEMM.html">MoE as Dense GEMM: Optimizing Low-Latency MoE Inference on NVIDIA Blackwell</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blog23_Joint_Optimization_of_Agent_Applications_and_TensorRT-LLM.html">Joint Optimization of Agent Applications and TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blog22_Helix_Parallelism_Scaling_Multi_Million_Token_Decoding_with_KV_Cache_Sharding.html">Helix Parallelism in TensorRT-LLM: Scaling Multi-Million-Token Decoding with KV Cache Sharding</a></li>
@@ -534,9 +535,9 @@
 <li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM">Github Code</a></li>
 <li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/issues?q=is%3Aissue%20state%3Aopen%20label%3Aroadmap">Roadmap</a></li>
 </ul>
-<p aria-level="2" class="caption" role="heading"><span class="caption-text">Use TensorRT Engine</span></p>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Migration</span></p>
 <ul class="nav bd-sidenav">
-<li class="toctree-l1"><a class="reference internal" href="../../legacy/tensorrt_quickstart.html">LLM API with TensorRT Engine</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../legacy/tensorrt-backend-removal.html">Migration Guide: TensorRT Backend Removed</a></li>
 </ul>
 </div>
 </nav></div>
@@ -588,47 +589,47 @@
 <div id="searchbox"></div>
                 <article class="bd-article">
                   
-  <section class="tex2jax_ignore mathjax_ignore" id="disaggregated-serving-in-tensorrt-llm">
+  <section id="disaggregated-serving-in-tensorrt-llm">
 <h1>Disaggregated Serving in TensorRT LLM<a class="headerlink" href="#disaggregated-serving-in-tensorrt-llm" title="Link to this heading">#</a></h1>
 <p>By NVIDIA TensorRT LLM Team</p>
 <ul class="simple">
-<li><p><a class="reference internal" href="#disaggregated-serving-in-tensorrt-llm">Disaggregated Serving in TensorRT LLM</a></p>
+<li><p><a class="reference internal" href="#disaggregated-serving-in-tensorrt-llm"><span class="xref myst">Disaggregated Serving in TensorRT LLM</span></a></p>
 <ul>
-<li><p><a class="reference internal" href="#motivation">Motivation</a></p></li>
-<li><p><a class="reference internal" href="#id1">Disaggregated Serving in TensorRT LLM</a></p>
+<li><p><a class="reference internal" href="../../features/ray-orchestrator.html#motivation"><span class="std std-ref">Motivation</span></a></p></li>
+<li><p><a class="reference internal" href="#disaggregated-serving-in-tensorrt-llm-1"><span class="xref myst">Disaggregated Serving in TensorRT LLM</span></a></p>
 <ul>
-<li><p><a class="reference internal" href="#trtllm-serve">trtllm-serve</a></p></li>
-<li><p><a class="reference internal" href="#dynamo">Dynamo</a></p></li>
-<li><p><a class="reference internal" href="#triton-inference-server">Triton Inference Server</a></p></li>
+<li><p><a class="reference internal" href="../../features/disagg-serving.html#trtllm-serve"><span class="std std-ref">trtllm-serve</span></a></p></li>
+<li><p><a class="reference internal" href="../../features/disagg-serving.html#dynamo"><span class="std std-ref">Dynamo</span></a></p></li>
+<li><p><a class="reference internal" href="#triton-inference-server"><span class="xref myst">Triton Inference Server</span></a></p></li>
 </ul>
 </li>
-<li><p><a class="reference internal" href="#kv-cache-exchange">KV Cache Exchange</a></p>
+<li><p><a class="reference internal" href="#kv-cache-exchange"><span class="xref myst">KV Cache Exchange</span></a></p>
 <ul>
-<li><p><a class="reference internal" href="#multi-backend-support">Multi-backend Support</a></p></li>
-<li><p><a class="reference internal" href="#overlap-optimization">Overlap Optimization</a></p></li>
-<li><p><a class="reference internal" href="#cache-layout-transformation">Cache Layout Transformation</a></p></li>
+<li><p><a class="reference internal" href="#multi-backend-support"><span class="xref myst">Multi-backend Support</span></a></p></li>
+<li><p><a class="reference internal" href="#overlap-optimization"><span class="xref myst">Overlap Optimization</span></a></p></li>
+<li><p><a class="reference internal" href="#cache-layout-transformation"><span class="xref myst">Cache Layout Transformation</span></a></p></li>
 </ul>
 </li>
-<li><p><a class="reference internal" href="#performance-studies">Performance Studies</a></p>
+<li><p><a class="reference internal" href="#performance-studies"><span class="xref myst">Performance Studies</span></a></p>
 <ul>
-<li><p><a class="reference internal" href="#measurement-methodology">Measurement Methodology</a></p></li>
-<li><p><a class="reference internal" href="#deepseek-r1">DeepSeek R1</a></p>
+<li><p><a class="reference internal" href="#measurement-methodology"><span class="xref myst">Measurement Methodology</span></a></p></li>
+<li><p><a class="reference internal" href="#deepseek-r1"><span class="xref myst">DeepSeek R1</span></a></p>
 <ul>
-<li><p><a class="reference internal" href="#isl-4400-osl-1200-machine-translation-dataset">ISL 4400 - OSL 1200 (Machine Translation Dataset)</a></p></li>
-<li><p><a class="reference internal" href="#isl-8192-osl-256-synthetic-dataset">ISL 8192 - OSL 256 (Synthetic Dataset)</a></p></li>
-<li><p><a class="reference internal" href="#isl-4096-osl-1024-machine-translation-dataset">ISL 4096 - OSL 1024 (Machine Translation Dataset)</a></p></li>
+<li><p><a class="reference internal" href="#isl-4400---osl-1200-machine-translation-dataset"><span class="xref myst">ISL 4400 - OSL 1200 (Machine Translation Dataset)</span></a></p></li>
+<li><p><a class="reference internal" href="#isl-8192---osl-256-synthetic-dataset"><span class="xref myst">ISL 8192 - OSL 256 (Synthetic Dataset)</span></a></p></li>
+<li><p><a class="reference internal" href="#isl-4096---osl-1024-machine-translation-dataset"><span class="xref myst">ISL 4096 - OSL 1024 (Machine Translation Dataset)</span></a></p></li>
 </ul>
 </li>
-<li><p><a class="reference internal" href="#qwen-3">Qwen 3</a></p>
+<li><p><a class="reference internal" href="#qwen-3"><span class="xref myst">Qwen 3</span></a></p>
 <ul>
-<li><p><a class="reference internal" href="#isl-8192-osl-1024-machine-translation-dataset">ISL 8192 - OSL 1024 (Machine Translation Dataset)</a></p></li>
+<li><p><a class="reference internal" href="#isl-8192---osl-1024-machine-translation-dataset"><span class="xref myst">ISL 8192 - OSL 1024 (Machine Translation Dataset)</span></a></p></li>
 </ul>
 </li>
-<li><p><a class="reference internal" href="#reproducing-steps">Reproducing Steps</a></p></li>
+<li><p><a class="reference internal" href="#reproducing-steps"><span class="xref myst">Reproducing Steps</span></a></p></li>
 </ul>
 </li>
-<li><p><a class="reference internal" href="#future-work">Future Work</a></p></li>
-<li><p><a class="reference internal" href="#acknowledgement">Acknowledgement</a></p></li>
+<li><p><a class="reference internal" href="#future-work"><span class="xref myst">Future Work</span></a></p></li>
+<li><p><a class="reference internal" href="blog25_Scaling_Video_Generation_Across_NVL72_Rack_with_TensorRT-LLM.html#acknowledgement"><span class="std std-ref">Acknowledgement</span></a></p></li>
 </ul>
 </li>
 </ul>
@@ -774,7 +775,7 @@ trtllm-serve<span class="w"> </span>disaggregated<span class="w"> </span>-c<span
 <li><p>Measure total throughput (tok/s) and latency (tok/s/user) for generation servers from different TP/EP/DP/PP mappings, concurrency levels and speculative decoding turned on/off.</p></li>
 <li><p>Find the ratio of context to generation workers such that aggregated throughput of context servers matches the aggregated throughput of generation servers for the workload’s input sequence length (ISL) and output sequence length (OSL)</p></li>
 <li><p>Calculate the throughput per GPU using the formula:
-<span class="math notranslate nohighlight">\(\frac{\text{Total Output Tokens/sec}}{\left(\frac{\text{NumCtxGPUs} \times \text{GenReqRate}}{\text{CtxReqRate}}\right) + \text{NumGenGPUs}}\)</span></p></li>
+$\frac{\text{Total Output Tokens/sec}}{\left(\frac{\text{NumCtxGPUs} \times \text{GenReqRate}}{\text{CtxReqRate}}\right) + \text{NumGenGPUs}}$</p></li>
 <li><p>Once the ideal ratio of context to generation servers is computed, the “rate-matched” Pareto curve can be constructed to identify the best configuration to use at different latencies (tok/s/user)</p></li>
 </ul>
 </li>
@@ -973,8 +974,8 @@ trtllm-serve<span class="w"> </span>disaggregated<span class="w"> </span>-c<span
   
 
   <!-- Scripts loaded after <body> so the DOM is not blocked -->
-  <script defer src="../../_static/scripts/bootstrap.js?digest=a95f357e85573c9b56d5"></script>
-<script defer src="../../_static/scripts/pydata-sphinx-theme.js?digest=a95f357e85573c9b56d5"></script>
+  <script defer src="../../_static/scripts/bootstrap.js?digest=90905a2f556bf617f1a9"></script>
+<script defer src="../../_static/scripts/pydata-sphinx-theme.js?digest=90905a2f556bf617f1a9"></script>
 
 
   <footer class="bd-footer">
@@ -1046,9 +1047,9 @@ trtllm-serve<span class="w"> </span>disaggregated<span class="w"> </span>-c<span
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on June 27, 2026.</p>
+  <p>Last updated on July 14, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/c25c23f">c25c23f</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/1662a87">1662a87</a>.</p>
   
 </div></div>
       

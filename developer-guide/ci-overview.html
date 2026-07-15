@@ -28,8 +28,8 @@
   </noscript>
   
   <!-- Loaded before other Sphinx assets -->
-  <link href="../_static/styles/theme.css?digest=a95f357e85573c9b56d5" rel="stylesheet" />
-<link href="../_static/styles/pydata-sphinx-theme.css?digest=a95f357e85573c9b56d5" rel="stylesheet" />
+  <link href="../_static/styles/theme.css?digest=90905a2f556bf617f1a9" rel="stylesheet" />
+<link href="../_static/styles/pydata-sphinx-theme.css?digest=90905a2f556bf617f1a9" rel="stylesheet" />
 
     <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=8f2a1f02" />
     <link rel="stylesheet" type="text/css" href="../_static/styles/nvidia-sphinx-theme.css?v=933278ad" />
@@ -40,10 +40,10 @@
     <link rel="stylesheet" type="text/css" href="../_static/custom.css?v=19d20f17" />
   
   <!-- So that users can add custom icons -->
-  <script defer src="../_static/scripts/fontawesome.js?digest=a95f357e85573c9b56d5"></script>
+  <script defer src="../_static/scripts/fontawesome.js?digest=90905a2f556bf617f1a9"></script>
   <!-- Pre-loaded scripts that we'll load fully later -->
-  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=a95f357e85573c9b56d5" />
-<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=a95f357e85573c9b56d5" />
+  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=90905a2f556bf617f1a9" />
+<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=90905a2f556bf617f1a9" />
 
 
 
@@ -61,9 +61,9 @@
     <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
     <script>DOCUMENTATION_OPTIONS.pagename = 'developer-guide/ci-overview';</script>
     <script>
-        DOCUMENTATION_OPTIONS.theme_version = '0.19.0';
+        DOCUMENTATION_OPTIONS.theme_version = '0.20.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc20';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc21';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc20" />
+  <meta name="docsearch:version" content="1.3.0rc21" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -446,6 +446,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../features/feature-combination-matrix.html">Feature Combination Matrix</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/disagg-serving.html">Disaggregated Serving</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/embeddings.html">Embeddings (Encoder-Only Models)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/kvcache.html">KV Cache System</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/long-sequence.html">Long Sequences</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/lora.html">LoRA (Low-Rank Adaptation)</a></li>
@@ -456,6 +457,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../features/quantization.html">Quantization</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/sampling.html">Sampling</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/additional-outputs.html">Additional Outputs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/post-processor-hook.html">Post-Processing Hook</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/guided-decoding.html">Guided Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/speculative-decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/checkpoint-loading.html">Checkpoint Loading</a></li>
@@ -495,6 +497,7 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog25_Scaling_Video_Generation_Across_NVL72_Rack_with_TensorRT-LLM.html">Scaling Video Generation Across NVL72 rack with TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog24_MoE_as_Dense_GEMM.html">MoE as Dense GEMM: Optimizing Low-Latency MoE Inference on NVIDIA Blackwell</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog23_Joint_Optimization_of_Agent_Applications_and_TensorRT-LLM.html">Joint Optimization of Agent Applications and TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog22_Helix_Parallelism_Scaling_Multi_Million_Token_Decoding_with_KV_Cache_Sharding.html">Helix Parallelism in TensorRT-LLM: Scaling Multi-Million-Token Decoding with KV Cache Sharding</a></li>
@@ -532,9 +535,9 @@
 <li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM">Github Code</a></li>
 <li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/issues?q=is%3Aissue%20state%3Aopen%20label%3Aroadmap">Roadmap</a></li>
 </ul>
-<p aria-level="2" class="caption" role="heading"><span class="caption-text">Use TensorRT Engine</span></p>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Migration</span></p>
 <ul class="nav bd-sidenav">
-<li class="toctree-l1"><a class="reference internal" href="../legacy/tensorrt_quickstart.html">LLM API with TensorRT Engine</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../legacy/tensorrt-backend-removal.html">Migration Guide: TensorRT Backend Removed</a></li>
 </ul>
 </div>
 </nav></div>
@@ -586,19 +589,19 @@
 <div id="searchbox"></div>
                 <article class="bd-article">
                   
-  <section class="tex2jax_ignore mathjax_ignore" id="continuous-integration-overview">
+  <section id="continuous-integration-overview">
 <h1>Continuous Integration Overview<a class="headerlink" href="#continuous-integration-overview" title="Link to this heading">#</a></h1>
 <p>This page explains how TensorRT‑LLM’s CI is organized and how individual tests map to Jenkins stages. Most stages execute integration tests defined in YAML files, while unit tests run as part of a merge‑request pipeline. The sections below describe how to locate a test and trigger the stage that runs it.</p>
 <section id="table-of-contents">
 <h2>Table of Contents<a class="headerlink" href="#table-of-contents" title="Link to this heading">#</a></h2>
 <ol class="arabic simple">
-<li><p><a class="reference internal" href="#ci-pipelines">CI pipelines</a></p></li>
-<li><p><a class="reference internal" href="#test-definitions">Test definitions</a></p></li>
-<li><p><a class="reference internal" href="#unit-tests">Unit tests</a></p></li>
-<li><p><a class="reference internal" href="#jenkins-stage-names">Jenkins stage names</a></p></li>
-<li><p><a class="reference internal" href="#finding-the-stage-for-a-test">Finding the stage for a test</a></p></li>
-<li><p><a class="reference internal" href="#waiving-tests">Waiving tests</a></p></li>
-<li><p><a class="reference internal" href="#triggering-ci-best-practices">Triggering CI Best Practices</a></p></li>
+<li><p><a class="reference internal" href="#ci-pipelines"><span class="xref myst">CI pipelines</span></a></p></li>
+<li><p><a class="reference internal" href="#test-definitions"><span class="xref myst">Test definitions</span></a></p></li>
+<li><p><a class="reference internal" href="#unit-tests"><span class="xref myst">Unit tests</span></a></p></li>
+<li><p><a class="reference internal" href="#jenkins-stage-names"><span class="xref myst">Jenkins stage names</span></a></p></li>
+<li><p><a class="reference internal" href="#finding-the-stage-for-a-test"><span class="xref myst">Finding the stage for a test</span></a></p></li>
+<li><p><a class="reference internal" href="#waiving-tests"><span class="xref myst">Waiving tests</span></a></p></li>
+<li><p><a class="reference internal" href="#triggering-ci-best-practices"><span class="xref myst">Triggering CI Best Practices</span></a></p></li>
 </ol>
 </section>
 <section id="ci-pipelines">
@@ -613,12 +616,12 @@
 <li><p><code class="docutils literal notranslate"><span class="pre">stage</span></code>: either <code class="docutils literal notranslate"><span class="pre">pre_merge</span></code> or <code class="docutils literal notranslate"><span class="pre">post_merge</span></code>.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">backend</span></code>: <code class="docutils literal notranslate"><span class="pre">pytorch</span></code>, <code class="docutils literal notranslate"><span class="pre">tensorrt</span></code> or <code class="docutils literal notranslate"><span class="pre">triton</span></code>.</p></li>
 </ul>
-<p>Example from <code class="docutils literal notranslate"><span class="pre">l0_a100.yml</span></code>:</p>
+<p>Example from <code class="docutils literal notranslate"><span class="pre">l0_a30.yml</span></code>:</p>
 <div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="w">      </span><span class="nt">terms</span><span class="p">:</span>
-<span class="w">        </span><span class="nt">stage</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">post_merge</span>
-<span class="w">        </span><span class="nt">backend</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">triton</span>
+<span class="w">        </span><span class="nt">stage</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">pre_merge</span>
+<span class="w">        </span><span class="nt">backend</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">pytorch</span>
 <span class="w"> </span><span class="w w-Error"> </span><span class="nt">tests</span><span class="p">:</span>
-<span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">triton_server/test_triton.py::test_gpt_ib_ptuning[gpt-ib-ptuning]</span>
+<span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">unittest/_torch/sampler/test_beam_search.py</span>
 </pre></div>
 </div>
 </section>
@@ -646,8 +649,8 @@
 <h3>Using <code class="docutils literal notranslate"><span class="pre">test_to_stage_mapping.py</span></code><a class="headerlink" href="#using-test-to-stage-mapping-py" title="Link to this heading">#</a></h3>
 <p>Manually searching YAML and Groovy files can be tedious.  The helper script
 <code class="docutils literal notranslate"><span class="pre">scripts/test_to_stage_mapping.py</span></code> automates the lookup:</p>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python<span class="w"> </span>scripts/test_to_stage_mapping.py<span class="w"> </span>--tests<span class="w"> </span><span class="s2">&quot;triton_server/test_triton.py::test_gpt_ib_ptuning[gpt-ib-ptuning]&quot;</span>
-python<span class="w"> </span>scripts/test_to_stage_mapping.py<span class="w"> </span>--tests<span class="w"> </span>gpt_ib_ptuning
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python<span class="w"> </span>scripts/test_to_stage_mapping.py<span class="w"> </span>--tests<span class="w"> </span><span class="s2">&quot;unittest/_torch/sampler/test_beam_search.py&quot;</span>
+python<span class="w"> </span>scripts/test_to_stage_mapping.py<span class="w"> </span>--tests<span class="w"> </span>test_beam_search
 python<span class="w"> </span>scripts/test_to_stage_mapping.py<span class="w"> </span>--stages<span class="w"> </span>A100X-Triton-Post-Merge-1
 python<span class="w"> </span>scripts/test_to_stage_mapping.py<span class="w"> </span>--test-list<span class="w"> </span>my_tests.txt
 python<span class="w"> </span>scripts/test_to_stage_mapping.py<span class="w"> </span>--test-list<span class="w"> </span>my_tests.yml
@@ -789,8 +792,8 @@ selective keeps CI turnaround fast and conserves hardware resources.</p>
   
 
   <!-- Scripts loaded after <body> so the DOM is not blocked -->
-  <script defer src="../_static/scripts/bootstrap.js?digest=a95f357e85573c9b56d5"></script>
-<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=a95f357e85573c9b56d5"></script>
+  <script defer src="../_static/scripts/bootstrap.js?digest=90905a2f556bf617f1a9"></script>
+<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=90905a2f556bf617f1a9"></script>
 
 
   <footer class="bd-footer">
@@ -862,9 +865,9 @@ selective keeps CI turnaround fast and conserves hardware resources.</p>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on June 27, 2026.</p>
+  <p>Last updated on July 14, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/c25c23f">c25c23f</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/1662a87">1662a87</a>.</p>
   
 </div></div>
       

@@ -28,8 +28,8 @@
   </noscript>
   
   <!-- Loaded before other Sphinx assets -->
-  <link href="../_static/styles/theme.css?digest=a95f357e85573c9b56d5" rel="stylesheet" />
-<link href="../_static/styles/pydata-sphinx-theme.css?digest=a95f357e85573c9b56d5" rel="stylesheet" />
+  <link href="../_static/styles/theme.css?digest=90905a2f556bf617f1a9" rel="stylesheet" />
+<link href="../_static/styles/pydata-sphinx-theme.css?digest=90905a2f556bf617f1a9" rel="stylesheet" />
 
     <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=8f2a1f02" />
     <link rel="stylesheet" type="text/css" href="../_static/styles/nvidia-sphinx-theme.css?v=933278ad" />
@@ -40,10 +40,10 @@
     <link rel="stylesheet" type="text/css" href="../_static/custom.css?v=19d20f17" />
   
   <!-- So that users can add custom icons -->
-  <script defer src="../_static/scripts/fontawesome.js?digest=a95f357e85573c9b56d5"></script>
+  <script defer src="../_static/scripts/fontawesome.js?digest=90905a2f556bf617f1a9"></script>
   <!-- Pre-loaded scripts that we'll load fully later -->
-  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=a95f357e85573c9b56d5" />
-<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=a95f357e85573c9b56d5" />
+  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=90905a2f556bf617f1a9" />
+<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=90905a2f556bf617f1a9" />
 
 
 
@@ -61,9 +61,9 @@
     <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
     <script>DOCUMENTATION_OPTIONS.pagename = 'features/multi-modality';</script>
     <script>
-        DOCUMENTATION_OPTIONS.theme_version = '0.19.0';
+        DOCUMENTATION_OPTIONS.theme_version = '0.20.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc20';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc21';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc20" />
+  <meta name="docsearch:version" content="1.3.0rc21" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -446,6 +446,7 @@
 <li class="toctree-l1"><a class="reference internal" href="feature-combination-matrix.html">Feature Combination Matrix</a></li>
 <li class="toctree-l1"><a class="reference internal" href="attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
 <li class="toctree-l1"><a class="reference internal" href="disagg-serving.html">Disaggregated Serving</a></li>
+<li class="toctree-l1"><a class="reference internal" href="embeddings.html">Embeddings (Encoder-Only Models)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="kvcache.html">KV Cache System</a></li>
 <li class="toctree-l1"><a class="reference internal" href="long-sequence.html">Long Sequences</a></li>
 <li class="toctree-l1"><a class="reference internal" href="lora.html">LoRA (Low-Rank Adaptation)</a></li>
@@ -456,6 +457,7 @@
 <li class="toctree-l1"><a class="reference internal" href="quantization.html">Quantization</a></li>
 <li class="toctree-l1"><a class="reference internal" href="sampling.html">Sampling</a></li>
 <li class="toctree-l1"><a class="reference internal" href="additional-outputs.html">Additional Outputs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="post-processor-hook.html">Post-Processing Hook</a></li>
 <li class="toctree-l1"><a class="reference internal" href="guided-decoding.html">Guided Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="speculative-decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="checkpoint-loading.html">Checkpoint Loading</a></li>
@@ -495,6 +497,7 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog25_Scaling_Video_Generation_Across_NVL72_Rack_with_TensorRT-LLM.html">Scaling Video Generation Across NVL72 rack with TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog24_MoE_as_Dense_GEMM.html">MoE as Dense GEMM: Optimizing Low-Latency MoE Inference on NVIDIA Blackwell</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog23_Joint_Optimization_of_Agent_Applications_and_TensorRT-LLM.html">Joint Optimization of Agent Applications and TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog22_Helix_Parallelism_Scaling_Multi_Million_Token_Decoding_with_KV_Cache_Sharding.html">Helix Parallelism in TensorRT-LLM: Scaling Multi-Million-Token Decoding with KV Cache Sharding</a></li>
@@ -532,9 +535,9 @@
 <li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM">Github Code</a></li>
 <li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/issues?q=is%3Aissue%20state%3Aopen%20label%3Aroadmap">Roadmap</a></li>
 </ul>
-<p aria-level="2" class="caption" role="heading"><span class="caption-text">Use TensorRT Engine</span></p>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Migration</span></p>
 <ul class="nav bd-sidenav">
-<li class="toctree-l1"><a class="reference internal" href="../legacy/tensorrt_quickstart.html">LLM API with TensorRT Engine</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../legacy/tensorrt-backend-removal.html">Migration Guide: TensorRT Backend Removed</a></li>
 </ul>
 </div>
 </nav></div>
@@ -586,7 +589,7 @@
 <div id="searchbox"></div>
                 <article class="bd-article">
                   
-  <section class="tex2jax_ignore mathjax_ignore" id="multimodal-support-in-tensorrt-llm">
+  <section id="multimodal-support-in-tensorrt-llm">
 <h1>Multimodal Support in TensorRT LLM<a class="headerlink" href="#multimodal-support-in-tensorrt-llm" title="Link to this heading">#</a></h1>
 <p>TensorRT LLM supports a variety of multimodal models, enabling efficient inference with inputs beyond just text.</p>
 <hr class="docutils" />
@@ -613,12 +616,20 @@
 <h2>Model Support Matrix<a class="headerlink" href="#model-support-matrix" title="Link to this heading">#</a></h2>
 <p>Please refer to the latest multimodal <a class="reference internal" href="../models/supported-models.html#multimodal-feature-support-matrix-pytorch-backend"><span class="std std-ref">support matrix</span></a>.</p>
 </section>
+<section id="optional-dependencies">
+<h2>Optional dependencies<a class="headerlink" href="#optional-dependencies" title="Link to this heading">#</a></h2>
+<p>Video input decoding uses OpenCV (<code class="docutils literal notranslate"><span class="pre">cv2</span></code>) and is not installed by default. Install it only for models with video inputs:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>pip<span class="w"> </span>install<span class="w"> </span>opencv-python-headless
+</pre></div>
+</div>
+<p>Image-only and text-only workflows do not require this package.</p>
+</section>
 <section id="examples">
 <h2>Examples<a class="headerlink" href="#examples" title="Link to this heading">#</a></h2>
 <p>The following examples demonstrate how to use TensorRT LLM’s multimodal support in various scenarios, including quick run examples, serving endpoints, and performance benchmarking.</p>
 <section id="quick-start">
 <h3>Quick start<a class="headerlink" href="#quick-start" title="Link to this heading">#</a></h3>
-<p>Quickly try out TensorRT LLM’s multimodal support using our <code class="docutils literal notranslate"><span class="pre">LLM-API</span></code> and a ready-to-run <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/c25c23f/examples/llm-api/quickstart_multimodal.py">example</a>:</p>
+<p>Quickly try out TensorRT LLM’s multimodal support using our <code class="docutils literal notranslate"><span class="pre">LLM-API</span></code> and a ready-to-run <a class="reference internal" href="#source:examples/llm-api/quickstart_multimodal.py"><span class="xref myst">example</span></a>:</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python3<span class="w"> </span>quickstart_multimodal.py<span class="w"> </span>--model_dir<span class="w"> </span>Efficient-Large-Model/NVILA-8B<span class="w"> </span>--modality<span class="w"> </span>image<span class="w"> </span>--disable_kv_cache_reuse
 </pre></div>
 </div>
@@ -629,7 +640,7 @@
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>trtllm-serve<span class="w"> </span>Qwen/Qwen2-VL-7B-Instruct<span class="w">  </span>--backend<span class="w"> </span>pytorch
 </pre></div>
 </div>
-<p>You can then send OpenAI-compatible requests, such as via curl or API clients, to the server endpoint. See <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/c25c23f/examples/serve/curl_chat_client_for_multimodal.sh">curl chat client for multimodal script</a> as an example.</p>
+<p>You can then send OpenAI-compatible requests, such as via curl or API clients, to the server endpoint. See <a class="reference internal" href="#source:examples/serve/curl_chat_client_for_multimodal.sh"><span class="xref myst">curl chat client for multimodal script</span></a> as an example.</p>
 </section>
 <section id="run-with-trtllm-bench">
 <h3>Run with <a class="reference internal" href="../commands/trtllm-bench.html"><span class="std std-doc"><code class="docutils literal notranslate"><span class="pre">trtllm-bench</span></code></span></a><a class="headerlink" href="#run-with-trtllm-bench" title="Link to this heading">#</a></h3>
@@ -690,6 +701,7 @@
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#background">Background</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#optimizations">Optimizations</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#model-support-matrix">Model Support Matrix</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#optional-dependencies">Optional dependencies</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#examples">Examples</a><ul class="nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#quick-start">Quick start</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#openai-compatible-server-via-trtllm-serve">OpenAI-Compatible Server via <span class="xref myst"><code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code></span></a></li>
@@ -714,8 +726,8 @@
   
 
   <!-- Scripts loaded after <body> so the DOM is not blocked -->
-  <script defer src="../_static/scripts/bootstrap.js?digest=a95f357e85573c9b56d5"></script>
-<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=a95f357e85573c9b56d5"></script>
+  <script defer src="../_static/scripts/bootstrap.js?digest=90905a2f556bf617f1a9"></script>
+<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=90905a2f556bf617f1a9"></script>
 
 
   <footer class="bd-footer">
@@ -787,9 +799,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on June 27, 2026.</p>
+  <p>Last updated on July 14, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/c25c23f">c25c23f</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/1662a87">1662a87</a>.</p>
   
 </div></div>
       

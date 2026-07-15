@@ -28,8 +28,8 @@
   </noscript>
   
   <!-- Loaded before other Sphinx assets -->
-  <link href="../../_static/styles/theme.css?digest=a95f357e85573c9b56d5" rel="stylesheet" />
-<link href="../../_static/styles/pydata-sphinx-theme.css?digest=a95f357e85573c9b56d5" rel="stylesheet" />
+  <link href="../../_static/styles/theme.css?digest=90905a2f556bf617f1a9" rel="stylesheet" />
+<link href="../../_static/styles/pydata-sphinx-theme.css?digest=90905a2f556bf617f1a9" rel="stylesheet" />
 
     <link rel="stylesheet" type="text/css" href="../../_static/pygments.css?v=8f2a1f02" />
     <link rel="stylesheet" type="text/css" href="../../_static/styles/nvidia-sphinx-theme.css?v=933278ad" />
@@ -40,10 +40,10 @@
     <link rel="stylesheet" type="text/css" href="../../_static/custom.css?v=19d20f17" />
   
   <!-- So that users can add custom icons -->
-  <script defer src="../../_static/scripts/fontawesome.js?digest=a95f357e85573c9b56d5"></script>
+  <script defer src="../../_static/scripts/fontawesome.js?digest=90905a2f556bf617f1a9"></script>
   <!-- Pre-loaded scripts that we'll load fully later -->
-  <link rel="preload" as="script" href="../../_static/scripts/bootstrap.js?digest=a95f357e85573c9b56d5" />
-<link rel="preload" as="script" href="../../_static/scripts/pydata-sphinx-theme.js?digest=a95f357e85573c9b56d5" />
+  <link rel="preload" as="script" href="../../_static/scripts/bootstrap.js?digest=90905a2f556bf617f1a9" />
+<link rel="preload" as="script" href="../../_static/scripts/pydata-sphinx-theme.js?digest=90905a2f556bf617f1a9" />
 
 
 
@@ -61,9 +61,9 @@
     <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
     <script>DOCUMENTATION_OPTIONS.pagename = 'blogs/tech_blog/blog08_Scaling_Expert_Parallelism_in_TensorRT-LLM_part2';</script>
     <script>
-        DOCUMENTATION_OPTIONS.theme_version = '0.19.0';
+        DOCUMENTATION_OPTIONS.theme_version = '0.20.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc20';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc21';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc20" />
+  <meta name="docsearch:version" content="1.3.0rc21" />
   
     
     <script src="../../_static/searchtools.js"></script>
@@ -446,6 +446,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../../features/feature-combination-matrix.html">Feature Combination Matrix</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/disagg-serving.html">Disaggregated Serving</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/embeddings.html">Embeddings (Encoder-Only Models)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/kvcache.html">KV Cache System</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/long-sequence.html">Long Sequences</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/lora.html">LoRA (Low-Rank Adaptation)</a></li>
@@ -456,6 +457,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../../features/quantization.html">Quantization</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/sampling.html">Sampling</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/additional-outputs.html">Additional Outputs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/post-processor-hook.html">Post-Processing Hook</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/guided-decoding.html">Guided Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/speculative-decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/checkpoint-loading.html">Checkpoint Loading</a></li>
@@ -495,6 +497,7 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="current nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="blog25_Scaling_Video_Generation_Across_NVL72_Rack_with_TensorRT-LLM.html">Scaling Video Generation Across NVL72 rack with TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blog24_MoE_as_Dense_GEMM.html">MoE as Dense GEMM: Optimizing Low-Latency MoE Inference on NVIDIA Blackwell</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blog23_Joint_Optimization_of_Agent_Applications_and_TensorRT-LLM.html">Joint Optimization of Agent Applications and TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blog22_Helix_Parallelism_Scaling_Multi_Million_Token_Decoding_with_KV_Cache_Sharding.html">Helix Parallelism in TensorRT-LLM: Scaling Multi-Million-Token Decoding with KV Cache Sharding</a></li>
@@ -532,9 +535,9 @@
 <li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM">Github Code</a></li>
 <li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/issues?q=is%3Aissue%20state%3Aopen%20label%3Aroadmap">Roadmap</a></li>
 </ul>
-<p aria-level="2" class="caption" role="heading"><span class="caption-text">Use TensorRT Engine</span></p>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Migration</span></p>
 <ul class="nav bd-sidenav">
-<li class="toctree-l1"><a class="reference internal" href="../../legacy/tensorrt_quickstart.html">LLM API with TensorRT Engine</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../legacy/tensorrt-backend-removal.html">Migration Guide: TensorRT Backend Removed</a></li>
 </ul>
 </div>
 </nav></div>
@@ -586,27 +589,27 @@
 <div id="searchbox"></div>
                 <article class="bd-article">
                   
-  <section class="tex2jax_ignore mathjax_ignore" id="scaling-expert-parallelism-in-tensorrt-llm-part-2-performance-status-and-optimization">
+  <section id="scaling-expert-parallelism-in-tensorrt-llm-part-2-performance-status-and-optimization">
 <h1>Scaling Expert Parallelism in TensorRT LLM (Part 2: Performance Status and Optimization)<a class="headerlink" href="#scaling-expert-parallelism-in-tensorrt-llm-part-2-performance-status-and-optimization" title="Link to this heading">#</a></h1>
 <p>This blog post continues our previous work on <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog04_Scaling_Expert_Parallelism_in_TensorRT-LLM.md">Scaling Expert Parallelism in TensorRT LLM (Part 1: Design and Implementation of Large-scale EP)</a>, where we introduced the fundamental design and implementation of large-scale Expert Parallelism (EP) in TensorRT LLM. Building upon that foundation, we have made significant performance improvements through various optimizations, achieving better throughput and latency for large-scale MoE models.</p>
 <p><em>By NVIDIA TensorRT LLM Team</em></p>
 <section id="table-of-contents">
 <h2>Table of Contents<a class="headerlink" href="#table-of-contents" title="Link to this heading">#</a></h2>
 <ul class="simple">
-<li><p><a class="reference internal" href="#scaling-expert-parallelism-in-tensorrt-llm-part-2-performance-status-and-optimization">Scaling Expert Parallelism in TensorRT LLM (Part 2: Performance Status and Optimization)</a></p>
+<li><p><a class="reference internal" href="#scaling-expert-parallelism-in-tensorrt-llm-part-2-performance-status-and-optimization"><span class="xref myst">Scaling Expert Parallelism in TensorRT LLM (Part 2: Performance Status and Optimization)</span></a></p>
 <ul>
-<li><p><a class="reference internal" href="#table-of-contents">Table of Contents</a></p></li>
-<li><p><a class="reference internal" href="#optimization-highlights">Optimization Highlights</a></p>
+<li><p><a class="reference internal" href="#table-of-contents"><span class="xref myst">Table of Contents</span></a></p></li>
+<li><p><a class="reference internal" href="#optimization-highlights"><span class="xref myst">Optimization Highlights</span></a></p>
 <ul>
-<li><p><a class="reference internal" href="#kernel-optimizations">Kernel Optimizations</a></p>
+<li><p><a class="reference internal" href="#kernel-optimizations"><span class="xref myst">Kernel Optimizations</span></a></p>
 <ul>
-<li><p><a class="reference internal" href="#moe-auxiliary-kernels">MoE Auxiliary Kernels</a></p></li>
-<li><p><a class="reference internal" href="#communication-kernels">Communication Kernels</a></p></li>
+<li><p><a class="reference internal" href="#moe-auxiliary-kernels"><span class="xref myst">MoE Auxiliary Kernels</span></a></p></li>
+<li><p><a class="reference internal" href="#communication-kernels"><span class="xref myst">Communication Kernels</span></a></p></li>
 </ul>
 </li>
-<li><p><a class="reference internal" href="#expert-parallelism-load-balancer-eplb">Expert Parallelism Load Balancer (EPLB)</a></p>
+<li><p><a class="reference internal" href="#expert-parallelism-load-balancer-eplb"><span class="xref myst">Expert Parallelism Load Balancer (EPLB)</span></a></p>
 <ul>
-<li><p><a class="reference internal" href="#attempts-at-online-eplb-implementation">Attempts at Online EPLB Implementation</a></p>
+<li><p><a class="reference internal" href="#attempts-at-online-eplb-implementation"><span class="xref myst">Attempts at Online EPLB Implementation</span></a></p>
 <ul>
 <li><p><a class="reference internal" href="#1-initial-approach-for-weight-updating---cudamemcpyasync"><span class="xref myst">1. Initial Approach for Weight Updating - cudaMemcpyAsync</span></a></p></li>
 <li><p><a class="reference internal" href="#2-avoiding-deadlock---multithreaded-cpu-copy-with-managed-memory"><span class="xref myst">2. Avoiding Deadlock - Multithreaded CPU Copy with Managed Memory</span></a></p></li>
@@ -616,22 +619,22 @@
 </li>
 </ul>
 </li>
-<li><p><a class="reference internal" href="#multi-token-prediction-mtp">Multi-Token Prediction (MTP)</a></p></li>
-<li><p><a class="reference internal" href="#host-overhead-optimization">Host Overhead Optimization</a></p>
+<li><p><a class="reference internal" href="#multi-token-prediction-mtp"><span class="xref myst">Multi-Token Prediction (MTP)</span></a></p></li>
+<li><p><a class="reference internal" href="#host-overhead-optimization"><span class="xref myst">Host Overhead Optimization</span></a></p>
 <ul>
-<li><p><a class="reference internal" href="#reduce-binding-and-inter-process-communication-overhead">Reduce Binding and Inter-Process Communication Overhead</a></p></li>
-<li><p><a class="reference internal" href="#support-stream-interval">Support Stream Interval</a></p></li>
+<li><p><a class="reference internal" href="#reduce-binding-and-inter-process-communication-overhead"><span class="xref myst">Reduce Binding and Inter-Process Communication Overhead</span></a></p></li>
+<li><p><a class="reference internal" href="#support-stream-interval"><span class="xref myst">Support Stream Interval</span></a></p></li>
 </ul>
 </li>
 </ul>
 </li>
-<li><p><a class="reference internal" href="#end-to-end-performance">End-to-End Performance</a></p></li>
-<li><p><a class="reference internal" href="#future-work">Future Work</a></p>
+<li><p><a class="reference internal" href="#end-to-end-performance"><span class="xref myst">End-to-End Performance</span></a></p></li>
+<li><p><a class="reference internal" href="#future-work"><span class="xref myst">Future Work</span></a></p>
 <ul>
-<li><p><a class="reference internal" href="#further-performance-optimization">Further Performance Optimization</a></p></li>
+<li><p><a class="reference internal" href="#further-performance-optimization"><span class="xref myst">Further Performance Optimization</span></a></p></li>
 </ul>
 </li>
-<li><p><a class="reference internal" href="#acknowledgements">Acknowledgements</a></p></li>
+<li><p><a class="reference internal" href="blog14_Scaling_Expert_Parallelism_in_TensorRT-LLM_part3.html#acknowledgements"><span class="std std-ref">Acknowledgements</span></a></p></li>
 </ul>
 </li>
 </ul>
@@ -699,7 +702,7 @@
 <li><p><strong>Online EPLB</strong>: Dynamic runtime redistribution that adapts to real-time workload patterns</p></li>
 </ul>
 <p>While Static EPLB provides good baseline improvements, Online EPLB offers the potential for optimal load balancing by responding to actual runtime patterns. However, implementing Online EPLB presented several unexpected technical challenges, particularly around weight synchronization and memory management in GPU clusters.</p>
-<p>In the previous <a class="reference internal" href="#kernel-optimizations">Kernel Optimizations</a> section, we noted that <code class="docutils literal notranslate"><span class="pre">reduce_scatter</span></code> and <code class="docutils literal notranslate"><span class="pre">alltoall</span></code> kernels do not show good scalability, with load imbalance being the major root cause. After applying proper EPLB strategy, those kernels perform well even when EP size scales to larger extents.</p>
+<p>In the previous <a class="reference internal" href="#kernel-optimizations"><span class="xref myst">Kernel Optimizations</span></a> section, we noted that <code class="docutils literal notranslate"><span class="pre">reduce_scatter</span></code> and <code class="docutils literal notranslate"><span class="pre">alltoall</span></code> kernels do not show good scalability, with load imbalance being the major root cause. After applying proper EPLB strategy, those kernels perform well even when EP size scales to larger extents.</p>
 <section id="attempts-at-online-eplb-implementation">
 <h4>Attempts at Online EPLB Implementation<a class="headerlink" href="#attempts-at-online-eplb-implementation" title="Link to this heading">#</a></h4>
 <p>We discussed the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog04_Scaling_Expert_Parallelism_in_TensorRT-LLM.md#high-level-design-introduction">high-level design</a> and <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog04_Scaling_Expert_Parallelism_in_TensorRT-LLM.md#online-ep-load-balancer">implementation considerations</a> of Online EPLB in our previous blog. However, several unexpected issues arose during implementation.</p>
@@ -983,8 +986,8 @@ always<span class="w"> </span>defer<span class="w"> </span>defer+madvise<span cl
   
 
   <!-- Scripts loaded after <body> so the DOM is not blocked -->
-  <script defer src="../../_static/scripts/bootstrap.js?digest=a95f357e85573c9b56d5"></script>
-<script defer src="../../_static/scripts/pydata-sphinx-theme.js?digest=a95f357e85573c9b56d5"></script>
+  <script defer src="../../_static/scripts/bootstrap.js?digest=90905a2f556bf617f1a9"></script>
+<script defer src="../../_static/scripts/pydata-sphinx-theme.js?digest=90905a2f556bf617f1a9"></script>
 
 
   <footer class="bd-footer">
@@ -1056,9 +1059,9 @@ always<span class="w"> </span>defer<span class="w"> </span>defer+madvise<span cl
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on June 27, 2026.</p>
+  <p>Last updated on July 14, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/c25c23f">c25c23f</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/1662a87">1662a87</a>.</p>
   
 </div></div>
       
