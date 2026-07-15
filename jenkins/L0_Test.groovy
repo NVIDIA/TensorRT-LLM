@@ -1242,6 +1242,8 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     scriptFatBuildPathNode,
                     true
                 )
+
+                def container = LLM_DOCKER_IMAGE.replace("urm.nvidia.com/", "urm.nvidia.com#")
                 if (cluster.fatBuilderArgs != null) {
                     def fatSqshDir = "${cluster.scratchPath}/users/svc_tensorrt/fat_sqsh"
                     def containerDir = "${cluster.scratchPath}/users/svc_tensorrt/containers"
@@ -1428,8 +1430,7 @@ bash "${scriptFatBuildPathNode}" "\$fatSqshPath" "\$baseSqshPath" "${llmTarfile}
                     extraArgs,
                 ).join(" ")
 
-                // Generate Job Launch Script
-                def container = LLM_DOCKER_IMAGE.replace("urm.nvidia.com/", "urm.nvidia.com#")
+                // Generate Job Launch Script (container defined above, before the fat sqsh block)
                 def mounts = getMountListForSlurmTest(cluster, true).join(",")
                 String[] taskArgs = getNodeArgs(nodeCount, gpuCount, disaggMultiNodeMode)
                 if (taskArgs == null) {
