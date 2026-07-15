@@ -1013,17 +1013,23 @@ class GvrTopKKernel:
     # the accepted rung's column seeds Phase 3 with zero rescan. This is the
     # R0 admission primitive (op#18 multithresh lineage); it is only invoked
     # from the enable_r0 path added in a later commit, so the base kernel is
-    # unaffected. Single-CTA form; the cluster (cluster_size>1) all-reduce
-    # mirrors block_count_ge and is added alongside the cluster R0 path.
+    # unaffected. Slice + cluster form: each CTA scans [slice_start,
+    # slice_end) and the M per-CTA totals are DSMEM all-reduced across the
+    # cluster (cluster_size>1, do_cluster_sync) with a release cluster_arrive
+    # mirroring block_count_ge; at cs==1 (or short-row degrade) the local
+    # totals are the answer. smem_ptcnt_multi holds slice-local per-thread
+    # columns (the accepted rung's column seeds Phase 3 per CTA).
     # ------------------------------------------------------------------
     @cute.jit
     def block_count_ge_multi(
-        self, input_row, N, s_mt_thr, smem_ptcnt_multi, smem_wcnt_multi,
-        s_mt_cnt, tidx, warp_id, lane,
+        self, input_row, slice_start, slice_end, s_mt_thr, smem_ptcnt_multi,
+        smem_wcnt_multi, s_mt_cnt, s_cluster_partial_m, do_cluster_sync,
+        tidx, warp_id, lane,
     ):
         M = cutlass.const_expr(self.M_thr)
         num_threads = cutlass.const_expr(self.num_threads)
         num_warps = cutlass.const_expr(self.num_warps)
+        cluster_size = cutlass.const_expr(self.cluster_size)
         vec_w = cutlass.const_expr(self.vec_bits // self.dtype.width)
         elem_bytes = cutlass.const_expr(self.dtype.width // 8)
         vec_align = cutlass.const_expr(self.vec_align_bytes)
@@ -1037,15 +1043,16 @@ class GvrTopKKernel:
             cnt_frag[m] = cutlass.Int32(0)
 
         row_addr = input_row.iterator.toint()
-        n_aligned = (N // cutlass.Int32(vec_w)) * cutlass.Int32(vec_w)
-        i = tidx * cutlass.Int32(vec_w)
+        slice_len = slice_end - slice_start
+        n_aligned = slice_start + (slice_len // cutlass.Int32(vec_w)) * cutlass.Int32(vec_w)
+        i = slice_start + tidx * cutlass.Int32(vec_w)
         step = cutlass.Int32(step_elem)
 
         if self.enable_unroll_4:
             rng_frag = cute.make_fragment((vec_w,), self.dtype)
             big_iters = cutlass.Int32(0)
-            if N > i + cutlass.Int32(vec_w - 1):
-                big_iters = (N - i - cutlass.Int32(vec_w)) // cutlass.Int32(step_elem) + cutlass.Int32(1)
+            if slice_end > i + cutlass.Int32(vec_w - 1):
+                big_iters = (slice_end - i - cutlass.Int32(vec_w)) // cutlass.Int32(step_elem) + cutlass.Int32(1)
             for k in cutlass.range(big_iters, unroll=self.mt_unroll):
                 i_local = i + k * cutlass.Int32(step_elem)
                 src_ptr_k = cute.make_ptr(
@@ -1063,7 +1070,7 @@ class GvrTopKKernel:
             i = i + big_iters * cutlass.Int32(step_elem)
 
         tail_frag = cute.make_fragment((vec_w,), self.dtype)
-        while i + cutlass.Int32(vec_w - 1) < N:
+        while i + cutlass.Int32(vec_w - 1) < slice_end:
             src_ptr = cute.make_ptr(
                 self.dtype, row_addr + cutlass.Int64(i) * cutlass.Int64(elem_bytes),
                 cute.AddressSpace.gmem, assumed_align=vec_align)
@@ -1079,7 +1086,7 @@ class GvrTopKKernel:
             i = i + step
 
         it = n_aligned + tidx
-        while it < N:
+        while it < slice_end:
             v = self._load_fp32(input_row, it)
             for m in cutlass.range_constexpr(M):
                 cnt_frag[m] = cnt_frag[m] + cutlass.Int32(v >= thr_frag[m])
@@ -1093,14 +1100,44 @@ class GvrTopKKernel:
             if lane == 0:
                 smem_wcnt_multi[m * num_warps + warp_id] = wc
         cute.arch.barrier()
+        # Block-reduce the M warp counts to this CTA's slice totals. Stage
+        # into DSMEM scratch at cs>1 (for the cluster merge below), else
+        # write straight to s_mt_cnt.
         if warp_id == cutlass.Int32(0):
             for m in cutlass.range_constexpr(M):
                 v = cutlass.Int32(0)
                 if lane < cutlass.Int32(num_warps):
                     v = smem_wcnt_multi[m * num_warps + lane]
                 total = self.warp_reduce_sum_i32(v)
-                if lane == 0:
-                    s_mt_cnt[m] = total
+                if lane == cutlass.Int32(0):
+                    if cutlass.const_expr(cluster_size > 1):
+                        s_cluster_partial_m[m] = total
+                    else:
+                        s_mt_cnt[m] = total
+        cute.arch.barrier()
+        if cutlass.const_expr(cluster_size > 1):
+            if do_cluster_sync:
+                # Release arrive (NOT relaxed): pairs with the peer
+                # cluster_wait acquire so the staged M totals are visible
+                # before any CTA reads them over DSMEM.
+                cute.arch.cluster_arrive()
+                cute.arch.cluster_wait()
+                if tidx == cutlass.Int32(0):
+                    local_ptr = s_cluster_partial_m.iterator
+                    for m in cutlass.range_constexpr(M):
+                        total = cutlass.Int32(0)
+                        for peer in cutlass.range_constexpr(cluster_size):
+                            peer_addr = mapa_shared_cluster(
+                                local_ptr + cutlass.Int32(m), cutlass.Int32(peer))
+                            total = total + ld_shared_cluster_i32(peer_addr)
+                        s_mt_cnt[m] = total
+                cute.arch.barrier()
+            else:
+                # short-row degrade: this CTA's local totals are the answer.
+                if tidx == cutlass.Int32(0):
+                    for m in cutlass.range_constexpr(M):
+                        s_mt_cnt[m] = s_cluster_partial_m[m]
+                cute.arch.barrier()
 
     # ------------------------------------------------------------------
     # Phase 2: Secant-interpolation threshold search
@@ -2234,12 +2271,24 @@ class GvrTopKKernel:
                 layout=cute.make_ordered_layout((1,), order=(0,)),
                 byte_alignment=16,
             )
+            # DSMEM scratch for the M-way cluster all-reduce of the R0 rung
+            # counts (cs>1 only; mapa.shared::cluster needs the same offset
+            # on every CTA).
+            if cutlass.const_expr(self.cluster_size > 1):
+                s_cluster_partial_m = smem.allocate_tensor(
+                    element_type=cutlass.Int32,
+                    layout=cute.make_ordered_layout((M_r0,), order=(0,)),
+                    byte_alignment=16,
+                )
+            else:
+                s_cluster_partial_m = None
         else:
             s_mt_thr = None
             smem_ptcnt_multi = None
             smem_wcnt_multi = None
             s_mt_cnt = None
             s_r0col = None
+            s_cluster_partial_m = None
 
         # ---- Per-row dispatch ----
         # Three branches:
@@ -2320,6 +2369,7 @@ class GvrTopKKernel:
                         smem_wcnt_multi,
                         s_mt_cnt,
                         s_r0col,
+                        s_cluster_partial_m,
                         tidx,
                         warp_id,
                         lane,
@@ -2359,6 +2409,7 @@ class GvrTopKKernel:
                             smem_wcnt_multi,
                             s_mt_cnt,
                             s_r0col,
+                            s_cluster_partial_m,
                             tidx,
                             warp_id,
                             lane,
@@ -2395,6 +2446,7 @@ class GvrTopKKernel:
                     smem_wcnt_multi,
                     s_mt_cnt,
                     s_r0col,
+                    s_cluster_partial_m,
                     tidx,
                     warp_id,
                     lane,
@@ -2434,6 +2486,7 @@ class GvrTopKKernel:
         smem_wcnt_multi,
         s_mt_cnt,
         s_r0col,
+        s_cluster_partial_m,
         tidx,
         warp_id,
         lane,
@@ -2517,17 +2570,20 @@ class GvrTopKKernel:
             # full row in one CTA. The slice-parallel + cluster count-merge
             # variant that lets R0 cover the cs>1 long-row branch lands in a
             # later commit; until then cs>1 keeps the secant path.
-            if cutlass.const_expr(self.enable_r0 and cluster_size == 1):
+            if cutlass.const_expr(self.enable_r0):
                 # P1b rung placement -> ONE M-ary R0 count pass -> accept the
                 # tightest rung with count in [K, kC]. On a miss, fall back to
-                # the existing secant search (a later commit replaces this
-                # fallback with the inline log-falsi refine).
+                # the inline log-falsi R1 shot / fb_fix refine. At cs>1 each
+                # CTA scans its slice and block_count_ge_multi cluster-merges
+                # the rung counts (phase1b rungs are per-CTA identical since
+                # preIdx stats are full-row).
                 self.phase1b_hspace_rungs(
                     input_row, N, pre_idx_row, pre_idx_count, pre_idx_offset,
                     smem_hist, s_thr, s_mt_thr, tidx, warp_id, lane)
                 self.block_count_ge_multi(
-                    input_row, N, s_mt_thr, smem_ptcnt_multi, smem_wcnt_multi,
-                    s_mt_cnt, tidx, warp_id, lane)
+                    input_row, slice_start, slice_end, s_mt_thr,
+                    smem_ptcnt_multi, smem_wcnt_multi, s_mt_cnt,
+                    s_cluster_partial_m, do_cluster_sync, tidx, warp_id, lane)
                 cute.arch.barrier()
                 if tidx == 0:
                     # tightest admissible rung = LAST m with count in [K, kC]
@@ -2601,10 +2657,10 @@ class GvrTopKKernel:
                         # one single-threshold pass; smem_ptcnt comes out fresh
                         # for Phase 3 on acceptance.
                         self.block_count_ge(
-                            input_row, cutlass.Int32(0), N, s_thr[0],
+                            input_row, slice_start, slice_end, s_thr[0],
                             smem_ptcnt, smem_wcnt, s_iscalars, s_cluster_partial,
                             tidx, warp_id, lane,
-                            do_cluster_sync=cutlass.Boolean(False),
+                            do_cluster_sync=do_cluster_sync,
                             smem_input=smem_input)
                         cute.arch.barrier()
                         if tidx == cutlass.Int32(0):
@@ -2660,10 +2716,10 @@ class GvrTopKKernel:
                                         s_thr[0] = cand
                                     cute.arch.barrier()
                                 self.block_count_ge(
-                                    input_row, cutlass.Int32(0), N, s_thr[0],
+                                    input_row, slice_start, slice_end, s_thr[0],
                                     smem_ptcnt, smem_wcnt, s_iscalars,
                                     s_cluster_partial, tidx, warp_id, lane,
-                                    do_cluster_sync=cutlass.Boolean(False),
+                                    do_cluster_sync=do_cluster_sync,
                                     smem_input=smem_input)
                                 cute.arch.barrier()
                                 if tidx == cutlass.Int32(0):
@@ -2702,10 +2758,10 @@ class GvrTopKKernel:
                                 # protects and MUST be exercised by the tie
                                 # gate on silicon before enabling.
                                 self.block_count_ge(
-                                    input_row, cutlass.Int32(0), N, s_thr[2],
+                                    input_row, slice_start, slice_end, s_thr[2],
                                     smem_ptcnt, smem_wcnt, s_iscalars,
                                     s_cluster_partial, tidx, warp_id, lane,
-                                    do_cluster_sync=cutlass.Boolean(False),
+                                    do_cluster_sync=do_cluster_sync,
                                     smem_input=smem_input)
                                 cute.arch.barrier()
                                 if tidx == cutlass.Int32(0):
