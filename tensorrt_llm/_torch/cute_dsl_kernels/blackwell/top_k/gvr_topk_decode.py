@@ -1698,11 +1698,15 @@ class GvrTopKKernel:
         while i7 < cand_count:
             vk = self._smem_ld_f32(keys_base, i7)
             bin_f = (vk - lo) * inv
+            # Clamp in the FLOAT domain before the int cast: fptosi is
+            # undefined for out-of-range/NaN inputs at the IR level (PTX
+            # cvt.rzi saturates, but LLVM may optimize on the poison).
+            # fmax first canonicalizes NaN to 0; the pair keeps the
+            # edge-bin clamping semantics bit-identical for in-range
+            # values.
+            bin_f = cute.arch.fmax(bin_f, cutlass.Float32(0.0))
+            bin_f = _fmin_f32_inline(bin_f, cutlass.Float32(kBins - 1))
             bin_i = cutlass.Int32(bin_f)
-            if bin_i < cutlass.Int32(0):
-                bin_i = cutlass.Int32(0)
-            if bin_i > cutlass.Int32(kBins - 1):
-                bin_i = cutlass.Int32(kBins - 1)
             atomicAdd(smem_hist.iterator + bin_i, cutlass.Int32(1))
             i7 = i7 + cutlass.Int32(num_threads)
         cute.arch.barrier()

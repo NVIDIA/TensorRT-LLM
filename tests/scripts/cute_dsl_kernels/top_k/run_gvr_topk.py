@@ -203,6 +203,17 @@ def gvr_topk_decode(
                    given CTA processes, so longer rows land in earlier
                    waves. Use together with :func:`gvr_topk_sort_prepare`.
                    Compatible with ``cluster_size > 1``.
+        p4_warp_redundant: Default True. Phase 4 redundant-warp cadence:
+                   every warp replays the k-th bin search reduce and the
+                   snap-loop decision from the staged SMEM partials
+                   (bit-identical across warps), removing the publish
+                   barriers and keeping threshold/convergence state in
+                   registers. False restores the leader-thread cadence.
+        p2_warp_redundant: Default True. Phase 2 redundant-warp secant
+                   cadence (cluster_size == 1 only): one barrier per
+                   round; every warp reduces the staged warp counts and
+                   replays the classify + secant update in registers.
+                   False restores the leader cadence.
         order_row: Required iff ``seqlen_sorted=True``. Request-level —
                    ``int32[batch_size = num_rows // next_n]`` on the same
                    device as ``logits``; ``order_row[i]`` is the original
