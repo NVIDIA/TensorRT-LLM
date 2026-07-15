@@ -1756,11 +1756,12 @@ class DeepseekV4DecoderLayer(DecoderLayer):
             post_mult_value=2.0,
         )
 
-        # FIXME: incompatible with mixed quantization mode
         quant_config = self._get_decoder_layer_quant_config(model_config, layer_idx)
-        self.is_nvfp4 = quant_config.layer_quant_mode.has_nvfp4()
-        assert quant_config.quant_algo is not QuantAlgo.MIXED_PRECISION, (
-            "MIXED_PRECISION is ambiguous"
+        # MIXED_PRECISION is resolved per module. Routed experts use their
+        # layer-specific config, while layer-level NVFP4 fusions stay disabled.
+        self.is_nvfp4 = (
+            quant_config.quant_algo != QuantAlgo.MIXED_PRECISION
+            and quant_config.layer_quant_mode.has_nvfp4()
         )
 
         self.allreduce = None
