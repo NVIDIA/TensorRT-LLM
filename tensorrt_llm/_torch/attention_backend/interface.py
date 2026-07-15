@@ -412,10 +412,10 @@ class AttentionMetadata:
 
     def prepare_for_spec_dec(self, *fields) -> None:
         assert len(self._saved_tensors) == 0, (
-            f"prepare_for_spec_dec called while fields "
+            "prepare_for_spec_dec called while fields "
             f"{list(self._saved_tensors)} are still saved; a previous "
-            f"forward likely raised between prepare_for_spec_dec and "
-            f"restore_from_spec_dec")
+            "forward likely raised between prepare_for_spec_dec and "
+            "restore_from_spec_dec")
         for f in fields:
             v = getattr(self, f)
             assert isinstance(v, torch.Tensor), f"{f} is not a torch.Tensor"
