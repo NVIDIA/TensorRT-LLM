@@ -1254,14 +1254,20 @@ class KVCacheManager(BaseResourceManager):
         assert max_atten_window_upper_bound > 0, "Impossible to fit in any sequence in kvCache"
         return max_atten_window_upper_bound
 
+    def _resolve_window_size(
+            self,
+            window_size: Optional[int],
+            error_msg: str = "window_size must be provided for VSWA") -> int:
+        if window_size is not None:
+            return window_size
+        if self.is_vswa:
+            raise ValueError(error_msg)
+        return self.max_attention_window_vec[0]
+
     def get_cache_indices(self,
                           request: LlmRequest,
                           window_size: Optional[int] = None) -> List[int]:
-        if window_size is None:
-            if len(self.max_attention_window_vec) > 1:
-                raise ValueError("window_size must be provided for VSWA")
-            window_size = self.max_attention_window_vec[0]
-
+        window_size = self._resolve_window_size(window_size)
         result = self.impl.get_cache_block_ids(request.py_request_id,
                                                window_size)
         assert len(result) == 1
@@ -1298,16 +1304,7 @@ class KVCacheManager(BaseResourceManager):
         hash matches what ``storeBlocks`` would later compute. Beam-width-1
         only; the connector enforces this at startup.
         """
-        if window_size is None:
-            # ``is_vswa`` (distinct window sizes) is the real VSWA signal; a
-            # uniform per-layer vector such as ``[4096, 4096, ...]`` has
-            # ``len > 1`` yet a single effective window, so keying off the
-            # length would spuriously reject it for connector callers that omit
-            # ``window_size``.
-            if self.is_vswa:
-                raise ValueError("window_size must be provided for VSWA")
-            window_size = self.max_attention_window_vec[0]
-
+        window_size = self._resolve_window_size(window_size)
         return list(
             self.impl.commit_and_get_block_hashes_for_request(
                 request, window_size))
@@ -1331,10 +1328,7 @@ class KVCacheManager(BaseResourceManager):
         Returns:
             The retention priority of the block (0-100), or default priority (35) if not found.
         """
-        if window_size is None:
-            if len(self.max_attention_window_vec) > 1:
-                raise ValueError("window_size must be provided for VSWA")
-            window_size = self.max_attention_window_vec[0]
+        window_size = self._resolve_window_size(window_size)
         return self.impl.get_priority_by_block_id(block_id, window_size)
 
     def get_batch_cache_indices(
@@ -1348,10 +1342,9 @@ class KVCacheManager(BaseResourceManager):
         beam_width = beam_width or 1
         if window_size is None:
             if layer_idx is None:
-                if len(self.max_attention_window_vec) > 1:
-                    raise ValueError(
-                        "layer_idx or window_size must be provided for VSWA")
-                window_size = self.max_attention_window_vec[0]
+                window_size = self._resolve_window_size(
+                    window_size,
+                    "layer_idx or window_size must be provided for VSWA")
             else:
                 layer_offset = self.layer_offsets[layer_idx]
                 # Explicit layer_offset -> window_size mapping (no modulo
@@ -2230,6 +2223,10 @@ class KVCacheManager(BaseResourceManager):
         self.impl.reset_reuse_state()
 
 
+class NoFreeSlotsError(ValueError):
+    """A slot-backed resource manager has no capacity for another request."""
+
+
 class SlotManager:
 
     def __init__(self, max_num_requests: int):
@@ -2258,7 +2255,7 @@ class SlotManager:
             return self.slot_mapping[request_id]
 
         if len(self.free_slots) == 0:
-            raise ValueError("No free slots")
+            raise NoFreeSlotsError("No free slots")
         slot = self.free_slots.pop()
         self.slot_mapping[request_id] = slot
         return slot
@@ -2283,10 +2280,6 @@ class BlockManager:
         self.tokens_per_block = tokens_per_block
         self.max_blocks_per_seq = self.num_blocks
 
-        self.base_block_offsets = torch.arange(self.num_blocks,
-                                               device="cpu",
-                                               dtype=torch.int32)
-
         self.block_ids = dict()
         self.num_sequences = dict()
         self.free_blocks = deque(range(self.num_blocks))
@@ -2310,10 +2303,9 @@ class BlockManager:
         for i in range(len(request_ids)):
             block_ids = self.block_ids[request_ids[i]]
             block_num = len(block_ids)
+            # Block ids are the page offsets directly; no lookup table needed.
             block_offsets[i, 0:block_num].copy_(
-                self.base_block_offsets[torch.tensor(block_ids,
-                                                     dtype=torch.int32,
-                                                     device="cpu")])
+                torch.tensor(block_ids, dtype=torch.int32, device="cpu"))
 
     def compute_block_count(self, token_count: int,
                             tokens_per_page: int) -> int:

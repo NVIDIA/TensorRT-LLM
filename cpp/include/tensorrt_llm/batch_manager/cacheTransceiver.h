@@ -232,6 +232,11 @@ public:
     {
         return {};
     }
+
+    [[nodiscard]] virtual bool hasPoisonedTransferBuffer() const
+    {
+        return false;
+    }
 };
 
 class CacheTransceiver : public BaseCacheTransceiver
@@ -279,6 +284,8 @@ public:
 
     [[nodiscard]] std::vector<char> getSerializedDataTransceiverState() const override;
 
+    [[nodiscard]] bool hasPoisonedTransferBuffer() const override;
+
 private:
     void initializeCommState();
 
@@ -291,9 +298,12 @@ private:
     // request while a C++ status check still dereferences it.
     std::vector<std::pair<std::shared_ptr<LlmRequest>, std::future<void>>> mSenderFutures;
     std::vector<std::pair<std::shared_ptr<LlmRequest>, std::future<void>>> mRequesterFutures;
-    // Dedup sets so observe-only timeout WARN logs fire at most once per stuck request.
+    // Dedup timeout logs separately from accepted cancellation requests so a
+    // backend that initially declines cancellation is retried on later polls.
     std::unordered_set<LlmRequest::RequestIdType> mTimedOutSenderIds;
     std::unordered_set<LlmRequest::RequestIdType> mTimedOutRequesterIds;
+    std::unordered_set<LlmRequest::RequestIdType> mCancelRequestedSenderIds;
+    std::unordered_set<LlmRequest::RequestIdType> mCancelRequestedRequesterIds;
     std::unordered_set<LlmRequest::RequestIdType> mCompletedSenderRequestIds;
     std::unordered_set<LlmRequest::RequestIdType> mFailedSenderRequestIds;
     std::unordered_map<LlmRequest::RequestIdType, std::shared_ptr<LlmRequest>> mSenderRequestsAwaitingConsensus;

@@ -33,7 +33,6 @@ from .._torch.pyexecutor.llm_request import LlmResponse
 from .._utils import (global_mpi_rank, global_mpi_size, mpi_comm, mpi_rank,
                       nvtx_range_debug)
 from ..bindings import executor as tllm
-from ..builder import ConfigEncoder, Engine, EngineConfig
 from ..llmapi.llm_args import BaseLlmArgs, ExecutorMemoryType, PybindMirror
 from ..llmapi.tokenizer import TokenizerBase
 from ..llmapi.tracer import global_tracer
@@ -41,7 +40,6 @@ from ..llmapi.utils import _SyncQueue, configure_cpu_affinity, logger_debug
 from ..lora_manager import LoraManager
 from ..prompt_adapter_manager import PromptAdapterManager
 from ..runtime import ModelConfig
-from ..runtime.model_runner import _engine_config_to_model_config
 from ..sampling_params import BatchedLogitsProcessor, SamplingParams
 from .executor import GenerationExecutor, IterationResultQueue
 from .ipc import FusedIpcQueue, IpcQueue
@@ -92,7 +90,7 @@ class BaseWorker(GenerationExecutor):
 
     def __init__(
         self,
-        engine: Union[Path, Engine],
+        engine: Path,
         executor_config: Optional[tllm.ExecutorConfig] = None,
         batched_logits_processor: Optional[BatchedLogitsProcessor] = None,
         postproc_worker_config: Optional[PostprocWorkerConfig] = None,
@@ -221,14 +219,6 @@ class BaseWorker(GenerationExecutor):
             executor_config.parallel_config = tllm.ParallelConfig(
                 participant_ids=comm_ranks, device_ids=device_ids)
 
-            if isinstance(engine, Engine):
-                return tllm.Executor(engine.engine,
-                                     json.dumps(engine.config.to_dict(),
-                                                cls=ConfigEncoder),
-                                     tllm.ModelType.DECODER_ONLY,
-                                     executor_config=executor_config,
-                                     managed_weights=engine.managed_weights)
-
             assert not hasattr(executor_config, "backend")
             return tllm.Executor(engine, tllm.ModelType.DECODER_ONLY,
                                  executor_config)
@@ -240,26 +230,6 @@ class BaseWorker(GenerationExecutor):
         self._lora_manager: Optional[LoraManager] = None
         self._prompt_adapter_manager: Optional[PromptAdapterManager] = None
         self._runtime_model_config: Optional[ModelConfig] = None
-        if self.rank == 0 and isinstance(self.engine, tllm.Executor):
-            if isinstance(self.engine, Engine):
-                engine_config = self.engine.config
-            else:
-                engine_config = EngineConfig.from_json_file(
-                    f"{self._engine}/config.json")
-            self._runtime_model_config = _engine_config_to_model_config(
-                engine_config)
-            if engine_config.build_config.plugin_config.lora_plugin:
-                # TODO(azuker): Passing peft cache manager to LoraManager is used for LoRA optimization
-                # (see LoraManager constructor docstring). Getting the peft cache manager from this
-                # point in the TRT flow is currently not supported (it's at the CPP
-                # Executor->ExecutorImpl->TrtGptModel->mPeftCacheManager) therefore for now this LoRA
-                # optimization is not available in TRT-python flow.
-                self._lora_manager = LoraManager(
-                    mapping=engine_config.pretrained_config.mapping,
-                    model_config=self._runtime_model_config,
-                    cpp_peft_cache_manager=None)
-            if engine_config.build_config.max_prompt_embedding_table_size > 0:
-                self._prompt_adapter_manager = PromptAdapterManager()
 
         if self._backend == "pytorch" and self._lora_config is not None:
             from tensorrt_llm._torch.pyexecutor.resource_manager import \

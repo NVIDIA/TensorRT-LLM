@@ -192,12 +192,8 @@ def get_test_config(test_desc, example_dir, test_root):
         f"{test_configs_root}/disagg_config_diff_max_tokens.yaml",
         "2_ranks":
         f"{test_configs_root}/disagg_config.yaml",
-        "2_ranks_trt_backend":
-        f"{test_configs_root}/disagg_config_trt_backend.yaml",
         "gen_only":
         f"{test_configs_root}/disagg_config_gen_only.yaml",
-        "gen_only_trt_backend":
-        f"{test_configs_root}/disagg_config_gen_only_trt_backend.yaml",
         "gen_only_bs1":
         f"{test_configs_root}/disagg_config_gen_only_bs1.yaml",
         "gen_only_insufficient_kv":
@@ -212,8 +208,6 @@ def get_test_config(test_desc, example_dir, test_root):
         f"{test_configs_root}/disagg_config_conversation.yaml",
         "4_ranks":
         f"{test_configs_root}/disagg_config_ctxtp2_gentp1.yaml",
-        "4_ranks_trt_backend":
-        f"{test_configs_root}/disagg_config_ctxtp2_gentp1_trt_backend.yaml",
         "cuda_graph":
         f"{test_configs_root}/disagg_config_cuda_graph_padding.yaml",
         "mixed":
@@ -877,23 +871,6 @@ def test_disaggregated_single_gpu(disaggregated_test_root,
 
 @pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
                          indirect=True)
-def test_disaggregated_single_gpu_trt_backend(disaggregated_test_root,
-                                              disaggregated_example_root,
-                                              llm_venv, llama_model_root):
-    setup_model_symlink(llm_venv, llama_model_root,
-                        "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
-
-    env = llm_venv._new_env.copy()
-    env["CUDA_VISIBLE_DEVICES"] = "0"
-    run_disaggregated_test(disaggregated_example_root,
-                           "2_ranks_trt_backend",
-                           env=env,
-                           model_path=llama_model_root,
-                           cwd=llm_venv.get_working_directory())
-
-
-@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
-                         indirect=True)
 def test_disaggregated_benchmark_gen_only(disaggregated_test_root,
                                           disaggregated_example_root, llm_venv,
                                           llama_model_root):
@@ -937,23 +914,6 @@ def test_disaggregated_router(disaggregated_test_root,
                            router_type,
                            env=llm_venv._new_env,
                            extra_endpoints_test=fetch_perf_metrics,
-                           model_path=llama_model_root,
-                           cwd=llm_venv.get_working_directory())
-
-
-@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
-                         indirect=True)
-def test_disaggregated_benchmark_gen_only_trt_backend(
-        disaggregated_test_root, disaggregated_example_root, llm_venv,
-        llama_model_root):
-    setup_model_symlink(llm_venv, llama_model_root,
-                        "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
-
-    env = llm_venv._new_env.copy()
-    env['TRTLLM_DISAGG_BENCHMARK_GEN_ONLY'] = '1'
-    run_disaggregated_test(disaggregated_example_root,
-                           "gen_only_trt_backend",
-                           env=env,
                            model_path=llama_model_root,
                            cwd=llm_venv.get_working_directory())
 
@@ -1049,22 +1009,6 @@ def test_disaggregated_multi_gpu(disaggregated_test_root,
 
     run_disaggregated_test(disaggregated_example_root,
                            "4_ranks",
-                           env=llm_venv._new_env,
-                           model_path=llama_model_root,
-                           cwd=llm_venv.get_working_directory())
-
-
-@pytest.mark.skip_less_device(2)
-@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
-                         indirect=True)
-def test_disaggregated_multi_gpu_trt_backend(disaggregated_test_root,
-                                             disaggregated_example_root,
-                                             llm_venv, llama_model_root):
-    setup_model_symlink(llm_venv, llama_model_root,
-                        "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
-
-    run_disaggregated_test(disaggregated_example_root,
-                           "4_ranks_trt_backend",
                            env=llm_venv._new_env,
                            model_path=llama_model_root,
                            cwd=llm_venv.get_working_directory())

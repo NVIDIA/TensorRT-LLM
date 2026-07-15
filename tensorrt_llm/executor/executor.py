@@ -20,7 +20,6 @@ from tensorrt_llm.logger import logger, set_level
 
 from .._utils import mpi_world_size
 from ..bindings import executor as tllm
-from ..builder import Engine
 from ..conversation_params import ConversationParams
 from ..disaggregated_params import DisaggregatedParams
 from ..llmapi.llm_args import BaseLlmArgs, TorchLlmArgs
@@ -536,7 +535,7 @@ class GenerationExecutor(ABC):
 
     @staticmethod
     def create(
-        engine: Union[Path, Engine],
+        engine: Path,
         executor_config: Optional[tllm.ExecutorConfig] = None,
         batched_logits_processor: Optional[BatchedLogitsProcessor] = None,
         model_world_size: int = 1,

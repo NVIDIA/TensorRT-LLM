@@ -342,17 +342,6 @@ class TestCreateKvSliceTokenRange:
         assert kv_slice.token_range is not None
         assert (kv_slice.token_range.start, kv_slice.token_range.end) == (0, prompt_len)
 
-    def test_respects_explicit_token_range(self):
-        prompt_len = 17
-        transceiver, req = _build_transceiver_for_kv_slice(
-            num_extra_kv_tokens=7, prompt_len=prompt_len
-        )
-        explicit = TokenRange(start=0, end=8)
-
-        kv_slice = transceiver._create_kv_slice(req, token_range=explicit)
-
-        assert kv_slice.token_range is explicit
-
 
 # ---------------------------------------------------------------------------
 # CacheReuseAdapter.get_cached_token_count_per_layer_group: SWA clamp.

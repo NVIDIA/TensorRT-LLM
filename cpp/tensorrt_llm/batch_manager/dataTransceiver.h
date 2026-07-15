@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -23,6 +23,7 @@
 #include <string>
 #include <vector>
 
+#include "tensorrt_llm/batch_manager/baseTransBuffer.h"
 #include "tensorrt_llm/batch_manager/cacheTransceiver.h"
 #include "tensorrt_llm/batch_manager/cacheTransferLayer.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h"
@@ -129,6 +130,20 @@ public:
 
     void appendMeasure(LlmRequest::TimePoint start, LlmRequest::TimePoint end, size_t size);
 
+    /// @brief Transfer ownership of pre-assigned receive buffers to this session.
+    void setReservedRecvBuffers(std::vector<BufferIndexHolder> holders);
+
+    [[nodiscard]] bool hasReservedRecvBuffer(BaseTransBufferManager const& manager) const noexcept;
+
+    /// @brief Release one formatter's pre-assigned buffer after its receive and postprocessing complete.
+    bool releaseReservedRecvBuffer(BaseTransBufferManager const& manager) noexcept;
+
+    /// @brief Release all pre-assigned receive buffers after the full receive pipeline completes.
+    void releaseReservedRecvBuffers() noexcept;
+
+    /// @brief Fail closed when receive-buffer quiescence cannot be established.
+    void poisonReservedRecvBuffers() noexcept;
+
     // TODO: 1. use global id instead of context request id; 2. export to llm metrics instead of file
     void exportMeasure(std::ofstream& outFile, bool isContext) const;
 
@@ -161,6 +176,7 @@ private:
     runtime::BufferManager const* mBufferManager;
     LlmRequest const* mRequest;
     std::unique_ptr<KVCacheTimes> mTimes;
+    std::vector<BufferIndexHolder> mReservedRecvBuffers;
     int32_t mIndexFromEnd{0};
     BlockKey mLastBlockKey{};
 };

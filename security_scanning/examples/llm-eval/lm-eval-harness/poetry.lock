@@ -1650,22 +1650,22 @@ dill = ">=0.4.1"
 
 [[package]]
 name = "narwhals"
-version = "2.23.0"
+version = "2.24.0"
 description = "Extremely lightweight compatibility layer between dataframe libraries"
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 markers = "python_version >= \"3.11\""
 files = [
-    {file = "narwhals-2.23.0-py3-none-any.whl", hash = "sha256:769e7b9ab102c93d8fa019f6b4cd1a657909b04a20bf6210e5a35aae06814ae9"},
-    {file = "narwhals-2.23.0.tar.gz", hash = "sha256:13e7ff5b4bb4a2f77b907c2e4d8a76e273dfc1323a3c997440a2f9fd26aed408"},
+    {file = "narwhals-2.24.0-py3-none-any.whl", hash = "sha256:42fdedf44e5b2ca7505630d45b4ac3058f38d8485cba9fe1652ca23152df7489"},
+    {file = "narwhals-2.24.0.tar.gz", hash = "sha256:b5c0f684ccd9d7475b564111e319a4964abcf2baf79d3cf6b1003d06ac9b828d"},
 ]
 
 [package.extras]
 cudf = ["cudf-cu12 (>=24.10.0) ; sys_platform == \"linux\""]
 dask = ["dask[dataframe] (>=2024.8)"]
 duckdb = ["duckdb (>=1.1)"]
-ibis = ["ibis-framework (>=6.0.0)", "packaging (>=21.3)", "pyarrow-hotfix (>=0.7)", "rich (>=12.4.4)"]
+ibis = ["ibis-framework (>=6.0.0)", "packaging (>=21.3)", "pyarrow-hotfix (>=0.7)"]
 modin = ["modin (>=0.22.0)"]
 pandas = ["pandas (>=1.3.4)"]
 polars = ["polars (>=0.20.4)"]
