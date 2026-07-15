@@ -64,7 +64,7 @@ LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE = env.wheelDockerImagePy312
 LLM_WHEEL_DOCKER_IMAGE = env.wheelDockerImage
 
 // DLFW torch image
-DLFW_IMAGE = "urm.nvidia.com/docker/nvidia/pytorch:26.04-py3"
+DLFW_IMAGE = "urm.nvidia.com/docker/nvidia/pytorch:26.05-py3"
 
 //Ubuntu base image
 UBUNTU_22_04_IMAGE = "urm.nvidia.com/docker/ubuntu:22.04"
@@ -1096,6 +1096,8 @@ def getPytestBaseCommandLine(
     if (stageName.contains("-Ray-")) {
         testCmdLine += ["--run-ray"]
     }
+    def unittestMarkExpr = (stageName.startsWith("CPU-")) ? "cpu_only and not disabled" : "not cpu_only"
+    testCmdLine += ["--unittest-markexpr='${unittestMarkExpr}'"]
     if (extraArgs) {
         testCmdLine += extraArgs
     }
@@ -2477,6 +2479,37 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                     imagePullPolicy: Always"""
         nodeLabelPrefix = "cpu"
         break
+    case "cpu":
+        containerConfig = """
+                  - name: trt-llm
+                    image: ${image}
+                    command: ['sleep', ${POD_TIMEOUT_SECONDS_TEST}]
+                    tty: true
+                    resources:
+                      requests:
+                        cpu: ${TESTER_CORES}
+                        memory: ${TESTER_MEMORY}
+                        ephemeral-storage: 300Gi
+                      limits:
+                        cpu: ${TESTER_CORES}
+                        memory: ${TESTER_MEMORY}
+                        ephemeral-storage: 300Gi
+                    imagePullPolicy: Always
+                    volumeMounts:
+                    - name: dshm
+                      mountPath: /dev/shm
+                    - name: scratch-trt-llm-data
+                      mountPath: /scratch.trt_llm_data
+                      readOnly: true
+                    - name: sw-tensorrt-pvc
+                      mountPath: "/mnt/sw-tensorrt-pvc"
+                      readOnly: false
+                    securityContext:
+                      capabilities:
+                        add:
+                        - SYS_ADMIN"""
+        nodeLabelPrefix = "cpu"
+        break
     default:
         def hasMultipleGPUs = (gpuCount > 1)
         def memorySize = "${TESTER_MEMORY}"
@@ -2765,7 +2798,7 @@ def launchTestListCheck(pipeline)
             def llmPath = sh (script: "realpath .", returnStdout: true).trim()
             def llmSrc = "${llmPath}/TensorRT-LLM/src"
             trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install -r ${llmSrc}/requirements-dev.txt")
-            sh "NVIDIA_TRITON_SERVER_VERSION=26.04 LLM_ROOT=${llmSrc} LLM_BACKEND_ROOT=${llmSrc}/triton_backend python3 ${llmSrc}/scripts/check_test_list.py --l0 --qa --waive"
+            sh "NVIDIA_TRITON_SERVER_VERSION=26.05 LLM_ROOT=${llmSrc} LLM_BACKEND_ROOT=${llmSrc}/triton_backend python3 ${llmSrc}/scripts/check_test_list.py --l0 --qa --waive"
         } catch (InterruptedException e) {
             throw e
         } catch (Exception e) {
@@ -2925,6 +2958,9 @@ def getMakoArgsFromStageName(stageName, parseSysinfo=false) {
         // If stageName contains "-AutoDeploy-", add "backend=autodeploy" to makoArgs
         // At this point, only tests with backend=autodeploy or unspecified backend will be run
         makoArgs += ["backend=autodeploy"]
+    } else if (stageName.contains("-Generic-")) {
+        // Generic stages select tests by marker expression rather than backend ownership.
+        makoArgs += ["backend=generic"]
     } else if (stageName.contains("-Verl-")) {
         // If stageName contains "-Verl-", add "backend=verl" to makoArgs
         // At this point, only tests with backend=verl or unspecified backend will be run
@@ -2968,9 +3004,19 @@ def renderTestDB(pipeline, testContext, llmSrc, stageName, preDefinedMakoOpts=nu
     def makoOpts = preDefinedMakoOpts
 
     if (!makoOpts) {
-        def scriptPath = "${llmSrc}/tests/integration/defs/sysinfo/get_sysinfo.py"
         def makoArgs = getMakoArgsFromStageName(stageName)
-        makoOpts = getMakoOpts(scriptPath, makoArgs)
+        if (stageName.startsWith("CPU-")) {
+            def cpuName = env.targetArch == AARCH64_TRIPLE ? "aarch64" : "x86_64"
+            makoOpts = transformMakoArgsToJson(
+                ["Mako options:"] + makoArgs + [
+                    "system_gpu_count=0",
+                    "cpu=${cpuName}",
+                    "linux_distribution_name=ubuntu"
+                ])
+        } else {
+            def scriptPath = "${llmSrc}/tests/integration/defs/sysinfo/get_sysinfo.py"
+            makoOpts = getMakoOpts(scriptPath, makoArgs)
+        }
     }
 
     sh "pip3 install --extra-index-url https://urm.nvidia.com/artifactory/api/pypi/sw-tensorrt-pypi/simple --ignore-installed trt-test-db==1.8.5+bc6df7"
@@ -3565,7 +3611,11 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         sh "nproc && free -g && hostname"
         echoNodeAndGpuInfo(pipeline, stageName)
         sh "cat ${MODEL_CACHE_DIR}/README"
-        sh "nvidia-smi && nvidia-smi -q && nvidia-smi topo -m"
+        if (stageName.startsWith("CPU-")) {
+            sh "ln -s /usr/local/cuda/compat/lib.real /usr/local/cuda/compat/lib"
+        } else {
+            sh "nvidia-smi && nvidia-smi -q && nvidia-smi topo -m"
+        }
         sh "df -h"
 
         // setup HF_HOME to cache model and datasets
@@ -4084,7 +4134,8 @@ def runLLMBuild(
     wheel_path="",
     version_local="",
     cpver="cp312",
-    plat_name="")
+    plat_name="",
+    pin_torch=false)
 {
     sh "pwd && ls -alh"
     sh "env | sort"
@@ -4093,6 +4144,12 @@ def runLLMBuild(
     trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, "tensorrt_llm", false, true)
     if (env.alternativeTRT) {
         sh "cd tensorrt_llm/ && sed -i 's#tensorrt~=.*\$#tensorrt#g' requirements.txt && cat requirements.txt"
+    }
+    if (pin_torch) {
+        // WAR: Upgrading to torch 2.12 conflicts with the current triton dependency, so we
+        // pin build_wheel to the public torch 2.11.0 here. Remove this WAR once triton is
+        // upgraded to 3.7.0 and torch is upgraded to 2.12.0.
+        sh "cd tensorrt_llm/ && sed -i 's#^torch[><=].*#torch==2.11.0#g' requirements.txt && cat requirements.txt"
     }
 
     // Random sleep to avoid resource contention
@@ -4533,6 +4590,7 @@ def launchTestJobs(pipeline, testFilter)
     // may break the mapping functionality.
 
     x86TestConfigs = [
+        "CPU-Generic-x86-1": ["cpu", "l0_cpu_x86", 1, 1],
         "DGX_H100-4_GPUs-CPP-1": ["dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
         "A10-PyTorch-1": ["a10", "l0_a10", 1, 2],
         "A10-PyTorch-2": ["a10", "l0_a10", 2, 2],
@@ -4674,12 +4732,12 @@ def launchTestJobs(pipeline, testFilter)
         "DGX_B200-8_GPUs-PyTorch-4": ["auto:dgx-b200-flex", "l0_dgx_b200", 4, 4, 8, 1, true],
         "DGX_B200-8_GPUs-AutoDeploy-Post-Merge-1": ["auto:dgx-b200-flex", "l0_dgx_b200", 1, 1, 8, 1, true],
         "DGX_B200-4_GPUs-Verl-Post-Merge-1": ["auto:dgx-b200-flex", "l0_verl", 1, 1, 4, 1, true],
-        // "B300-PyTorch-1": ["auto:dgx-b300-flex", "l0_b300", 1, 2, 1, 1, true],
-        // "B300-PyTorch-2": ["auto:dgx-b300-flex", "l0_b300", 2, 2, 1, 1, true],
-        // "B300-PyTorch-Post-Merge-1": ["auto:dgx-b300-flex", "l0_b300", 1, 1, 1, 1, true],
-        // "DGX_B300-4_GPUs-PyTorch-1": ["auto:dgx-b300-flex", "l0_dgx_b300", 1, 1, 4, 1, true],
-        // "DGX_B300-4_GPUs-PyTorch-Post-Merge-1": ["auto:dgx-b300-flex", "l0_dgx_b300", 1, 2, 4, 1, true],
-        // "DGX_B300-4_GPUs-PyTorch-Post-Merge-2": ["auto:dgx-b300-flex", "l0_dgx_b300", 2, 2, 4, 1, true],
+        "B300-PyTorch-1": ["auto:dgx-b300-flex", "l0_b300", 1, 2, 1, 1, true],
+        "B300-PyTorch-2": ["auto:dgx-b300-flex", "l0_b300", 2, 2, 1, 1, true],
+        "B300-PyTorch-Post-Merge-1": ["auto:dgx-b300-flex", "l0_b300", 1, 1, 1, 1, true],
+        "DGX_B300-4_GPUs-PyTorch-1": ["auto:dgx-b300-flex", "l0_dgx_b300", 1, 1, 4, 1, true],
+        "DGX_B300-4_GPUs-PyTorch-Post-Merge-1": ["auto:dgx-b300-flex", "l0_dgx_b300", 1, 2, 4, 1, true],
+        "DGX_B300-4_GPUs-PyTorch-Post-Merge-2": ["auto:dgx-b300-flex", "l0_dgx_b300", 2, 2, 4, 1, true],
         // VisualGen PerfSanity post-merge test
         "DGX_B200-8_GPUs-PyTorch-VisualGen-PerfSanity-Post-Merge-1": ["auto:dgx-b200-flex", "l0_b200_visual_gen_perf_sanity", 1, 1, 8, 1, true],
         // PerfSanity post-merge tests
@@ -4731,6 +4789,7 @@ def launchTestJobs(pipeline, testFilter)
 
     // SBSA machines from the Blossom machine pool
     SBSATestConfigs = [
+        "CPU-Generic-arm-1": ["cpu", "l0_cpu_arm", 1, 1],
         "GH200-TensorRT-Post-Merge-1": ["gh200", "l0_gh200", 1, 1],
         // DGX Spark is also named as GB10 Grace Blackwell Superchip.
         "GB10-PyTorch-1": ["gb10x", "l0_gb10", 1, 1],
@@ -5140,7 +5199,7 @@ def launchTestJobs(pipeline, testFilter)
             }
 
             buildRunner("[${toStageName(values[1], key)}] Build") {
-                wheelName = runLLMBuild(pipeline, cpu_arch, values[3], "", versionLocal, cpver, values[7])
+                wheelName = runLLMBuild(pipeline, cpu_arch, values[3], "", versionLocal, cpver, values[7], values[0] != LLM_DOCKER_IMAGE)
             }
 
             // TODO: Re-enable the sanity check after updating GPU testers' driver version.
@@ -5380,8 +5439,8 @@ def launchTestJobs(pipeline, testFilter)
 
     // CBTS Layer 2: replace `parallelJobsFiltered` with affected stages plus
     // PackageSanityCheck (kept iff sanity_required) and PerfSanity (kept iff
-    // perfsanity_required). Pure -Perf- stages always excluded (own trigger
-    // model, full-list benchmarks). Post-Merge stages are never force-kept;
+    // perfsanity_required). Pure -Perf- stages run only when CBTS selects them
+    // (present in affected_stages). Post-Merge stages are never force-kept;
     // they only run when explicitly listed in affected_stages.
     def cbts = testFilter[(CBTS_RESULT)]
     if (cbts != null) {
@@ -5391,7 +5450,6 @@ def launchTestJobs(pipeline, testFilter)
         def needsSanity = cbts.sanity_required
         def needsPerfSanity = cbts.perfsanity_required
         parallelJobsFiltered = parallelJobs.findAll { key, _ ->
-            if (key =~ /-Perf-/) return false
             if (key =~ /Post-Merge/) return affectedSet.contains(key)
             return affectedSet.contains(key) ||
                    (needsSanity && key =~ /PackageSanityCheck/) ||
