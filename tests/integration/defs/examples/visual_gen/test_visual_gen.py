@@ -648,7 +648,7 @@ def _generate_ltx2_cuda_graph_trtllm_backend_video(output_path):
         TorchCompileConfig,
     )
 
-    scratch_space = conftest.llm_models_root()
+    scratch_space = _llm_models_root()
     checkpoint_path = os.path.join(scratch_space, LTX2_MODEL_CHECKPOINT_PATH)
     text_encoder_path = _ltx2_lpips_text_encoder_path()
     spatial_upsampler_path = os.path.join(scratch_space, LTX2_UPSAMPLER_SUBPATH)
