@@ -23,6 +23,7 @@ import torch
 from torch.autograd import DeviceType
 
 from ..utils import _maybe_print_rank0, _sync
+from .nsys import _NsysProfiler, measured_range
 
 
 def _kernel_times_to_summary_list(
@@ -61,6 +62,7 @@ def _time_moe_forward_eager(
     iters: int,
     flush_l2: bool = True,
     collect_kernels: bool = True,
+    nsys: bool = False,
 ) -> Tuple[List[float], Dict[str, Any]]:
     """Time eager ``ConfigurableMoE.forward``.
 
@@ -70,7 +72,13 @@ def _time_moe_forward_eager(
     window). When ``collect_kernels=True`` a separate, shorter profiler pass is
     run only to gather the kernel breakdown; profiler-derived numbers are not
     used to score the candidate.
+
+    When ``nsys=True`` the measured region is captured for an external
+    ``nsys -c cudaProfilerApi`` run (see ``timing/nsys.py``); this forces
+    ``collect_kernels`` off since CUPTI/Kineto conflicts with nsys.
     """
+    if nsys:
+        collect_kernels = False
     device = x.device if x.numel() > 0 else torch.device("cuda")
     l2_buffer = _l2_flush_buffer(device) if flush_l2 else None
 
@@ -80,18 +88,25 @@ def _time_moe_forward_eager(
 
     starts = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
     ends = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
+    profiler = _NsysProfiler(nsys)
     _sync()
     for _ in range(warmup):
         if l2_buffer is not None:
             l2_buffer.zero_()
         _do_forward()
+    # Start the nsys capture AFTER warmup so warmup is excluded from the window.
+    profiler.start()
     for i in range(iters):
         if l2_buffer is not None:
             l2_buffer.zero_()
         starts[i].record()
-        _do_forward()
+        # NVTX wraps ONLY the forward (between the start/end records, excluding
+        # the L2-flush memset) so the range == the CUDA-event latency window.
+        with measured_range(nsys):
+            _do_forward()
         ends[i].record()
     _sync()
+    profiler.stop()
     forward_times_ms = [starts[i].elapsed_time(ends[i]) for i in range(iters)]
 
     detailed_stats: Dict[str, Any] = {

@@ -30,10 +30,7 @@ from tensorrt_llm._torch.disaggregation.resource.utils import get_physical_pool
 from tensorrt_llm._torch.distributed.communicator import Distributed
 from tensorrt_llm._torch.pyexecutor.kv_cache_transceiver import KvCacheTransceiver
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
-from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import (
-    MambaHybridCacheManager,
-    PythonMambaCacheManager,
-)
+from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import MambaHybridCacheManager
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.bindings import LlmRequestState
@@ -141,9 +138,6 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         endpoints = cast(list, self._dist.allgather(self._transfer_worker.sender_endpoint))
         layer_num = len(self._kv_cache_manager.pp_layers)
         if isinstance(self._kv_cache_manager, MambaHybridCacheManager):
-            assert isinstance(self._kv_cache_manager._impl, PythonMambaCacheManager), (
-                "CppMambaCacheManager is not supported with Python transceiver, please set TRTLLM_USE_CPP_MAMBA=0"
-            )
             layer_num += len(self._kv_cache_manager._impl.mamba_layer_offsets)
         layer_num_per_pp = cast(list, getattr(self._dist, "pp_allgather")(layer_num))
         self._transfer_worker.populate_instance_and_rank_info(
@@ -173,12 +167,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
     def __exit__(self, _exc_type, _exc_val, _exc_tb):
         self.shutdown()
 
-    def _create_kv_slice(
-        self,
-        req: LlmRequest,
-        token_range: Optional[TokenRange] = None,
-        is_last_slice: bool = True,
-    ) -> KVSlice:
+    def _create_kv_slice(self, req: LlmRequest) -> KVSlice:
         adapter = self._reuse_adapter
         tpb = adapter.tokens_per_block
         assert self._page_table is not None
@@ -191,13 +180,18 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             else [0] * len(layer_groups)
         )
 
-        if token_range is None and req.prompt_len > 0:
-            # Align with KV cache allocation (prepare_disagg_gen_init /
-            # _get_context_bytes), which reserves prompt_len +
-            # num_extra_kv_tokens slots for speculative decoding methods
-            # (e.g. EAGLE3) that consume extra KV positions per request.
-            num_extra_kv_tokens = getattr(self._kv_cache_manager, "num_extra_kv_tokens", 0) or 0
-            token_range = TokenRange(start=0, end=req.prompt_len + num_extra_kv_tokens)
+        token_range = None
+        if req.prompt_len > 0:
+            # end must match the trimmed block list below (ceil(prompt_len / tpb)
+            # blocks). num_extra_kv_tokens slots (speculative decoding) are not
+            # transferred. In the previously added support for ctx disabling
+            # speculative decoding while gen enables it, both sides currently
+            # use prompt_len as the transfer range, so the ranges stay
+            # consistent.
+            # TODO: the accuracy impact of not transferring num_extra_kv_tokens
+            # on MTP and other speculative decoding paths is currently unclear;
+            # revisit whether these extra KV slots need to be transferred.
+            token_range = TokenRange(start=0, end=req.prompt_len)
 
         groups = []
         for idx, lg in enumerate(layer_groups):
@@ -206,8 +200,6 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 continue
             block_ids = adapter.get_block_ids(req, idx, lg)
             # Limit to prompt_len blocks, matching C++ cacheFormatter behavior.
-            # Extra blocks from num_extra_kv_tokens (speculative decoding) have
-            # uninitialized KV data and must not be transferred.
             total_blocks = (req.prompt_len + tpb - 1) // tpb
             if block_ids.size > total_blocks:
                 block_ids = block_ids[:total_blocks]
@@ -242,7 +234,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             mamba_state_index = self._kv_cache_manager.mamba_cache_index[req.py_request_id]
 
         return KVSlice(
-            is_last_slice=is_last_slice,
+            is_last_slice=True,
             block_ids_per_layer_groups=groups,
             mamba_state_index=mamba_state_index,
             token_range=token_range,

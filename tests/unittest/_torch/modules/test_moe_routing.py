@@ -794,15 +794,17 @@ def _perfect_router_worker(parallel_mode, routing_name, num_tokens, dtype,
 
         # Simulate per-rank token-count skew so each rank exercises a
         # different cache key (num_tokens, routing_method, dtype, ep_size).
-        # DEP processes its own share of tokens per rank; TEP replicates
-        # input across ranks so keep a uniform list there.
-        if parallel_mode == "DEP":
+        # When attention uses DP (parallel_mode starts with "D"), each rank
+        # processes its own token share; otherwise all ranks see the same
+        # token count so pass a single-element list.
+        if parallel_mode[0] == "D":
             all_rank_num_tokens = [
                 num_tokens + i for i in range(mapping.world_size)
             ]
+            my_num_tokens = all_rank_num_tokens[mapping.rank]
         else:
-            all_rank_num_tokens = [num_tokens] * mapping.world_size
-        my_num_tokens = all_rank_num_tokens[mapping.rank]
+            all_rank_num_tokens = [num_tokens]
+            my_num_tokens = num_tokens
 
         model_config = ModelConfig(pretrained_config=pretrained_config,
                                    mapping=mapping,

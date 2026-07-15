@@ -41,6 +41,9 @@ unless a field carries an explicit allowlist (`TelemetryField.categorical(...)`)
 and any field may opt out with `telemetry=False`. Every captured field is listed
 below; the runtime can capture nothing absent from this list.
 
+If the manifest check fails, run `python3 scripts/generate_llm_args_golden_manifest.py`, then commit
+`tensorrt_llm/usage/llm_args_golden_manifest.json`; new fields require telemetry/privacy CODEOWNER approval.
+
 ## LLM API Configuration Fields
 
 A field can still be absent from a specific payload when its parent config is

@@ -28,7 +28,7 @@ T = TypeVar("T")
 
 
 class MPINodeState:
-    ''' MPINodeState acts as a central global state shares between tasks on MPI node.
+    """MPINodeState acts as a central global state shares between tasks on MPI node.
 
     An example:
         def task():
@@ -45,7 +45,7 @@ class MPINodeState:
         This should produce the following output:
         - [1, 1, 1, 1]
         - [2, 2, 2, 2]
-    '''
+    """
 
     state = None
     # Global MPICommExecutor instance to be reused across multiple MpiCommSession instances
@@ -59,9 +59,9 @@ class MPINodeState:
 
 
 def external_mpi_comm_available(model_world_size: int) -> bool:
-    ''' Check if the current process is launched by mpirun and does not use MPIPoolExecutor to spawn processes.
+    """Check if the current process is launched by mpirun and does not use MPIPoolExecutor to spawn processes.
     e.g. mpirun -np 4 python script.py
-    '''
+    """
     if ENABLE_MULTI_DEVICE:
         return (get_mpi_world_size() == model_world_size
                 and model_world_size > 1) or (global_mpi_size()
@@ -71,7 +71,7 @@ def external_mpi_comm_available(model_world_size: int) -> bool:
 
 
 def need_spawn_mpi_workers(model_world_size: int) -> bool:
-    ''' Check if the current process needs to spawn MPI workers. '''
+    """Check if the current process needs to spawn MPI workers."""
     if ENABLE_MULTI_DEVICE:
         return get_mpi_world_size() == 1 and model_world_size > 1
     else:
@@ -83,6 +83,20 @@ def set_mpi_session_cpp(comm):
         comm_fortran = comm.py2f()
         from tensorrt_llm.bindings import MpiComm
         MpiComm.set_raw_mpi_session_by_fortran_handle(comm_fortran)
+
+
+def validate_session_world_size(mpi_session, model_world_size: int) -> None:
+    """Fail loudly when an external session cannot serve ``model_world_size``.
+
+    ``submit()`` launches one worker task per pool worker, so an externally
+    provided session must match the model's world size exactly; otherwise the
+    wrong number of executors would start.
+    """
+    external_workers = getattr(mpi_session, "n_workers", None)
+    if external_workers is not None and external_workers != model_world_size:
+        raise ValueError(
+            f"External MPI session has {external_workers} workers but "
+            f"the model needs world_size={model_world_size}.")
 
 
 class MpiSession(abc.ABC):
@@ -220,13 +234,13 @@ class MpiCommSession(MpiSession):
 
     def submit(self, task: Callable[..., T], *args,
                **kwargs) -> List[Future[T]]:
-        ''' Submit a task to MPI workers.
+        """Submit a task to MPI workers.
 
         Args:
             task: The task to be submitted.
             args: Positional arguments for the task.
             kwargs: Keyword arguments for the task.
-        '''
+        """
         assert self.mpi_pool is not None, 'MPI session not started'
         worker_futures = [
             self.mpi_pool.submit(task, *args, **kwargs)
@@ -281,7 +295,7 @@ class MpiCommSession(MpiSession):
             self.owns_mpi_pool = False
         else:
             logger_debug(
-                f"_start_mpi_pool: Creating new MPICommExecutor (not COMM_WORLD or ENABLE_MULTI_DEVICE=False)\n",
+                "_start_mpi_pool: Creating new MPICommExecutor (not COMM_WORLD or ENABLE_MULTI_DEVICE=False)\n",
                 "grey")
             # For non-COMM_WORLD communicators, create a new executor
             comm_executor = MPICommExecutor(self.comm)
@@ -302,13 +316,32 @@ class RemoteTask(NamedTuple):
     sync: bool = False  # if True, the result will be sent back to the client
 
 
+class RemoteWorkerDeath(NamedTuple):
+    """Worker-death notification forwarded by RemoteMpiCommSessionServer.
+
+    Async (fire-and-forget) task submissions have no result channel, so a
+    crashed worker would otherwise be invisible to the client and pending
+    requests would block forever. The exception is carried as strings (not
+    the exception object) because arbitrary exceptions may not pickle.
+    """
+    exc_type: str
+    message: str
+
+    @classmethod
+    def from_exception(cls, e: BaseException) -> "RemoteWorkerDeath":
+        return cls(exc_type=type(e).__name__, message=str(e))
+
+    def to_exception(self) -> RuntimeError:
+        return RuntimeError(
+            f"Remote MPI worker died: {self.exc_type}: {self.message}")
+
+
 class RemoteMpiCommSessionClient(MpiSession):
-    '''
-    RemoteMpiCommSessionClient is a variant of MpiCommSession that is used to connect to a remote MPI pool.
+    """RemoteMpiCommSessionClient is a variant of MpiCommSession that is used to connect to a remote MPI pool.
 
     Note: This class uses a global singleton pattern because ZeroMQ PAIR sockets only support
     one connection at a time. Multiple LLM instances will reuse the same client connection.
-    '''
+    """
     _global_instance = None
     _global_instance_lock = threading.Lock()
 
@@ -344,6 +377,9 @@ class RemoteMpiCommSessionClient(MpiSession):
                                  socket_type=zmq.PAIR,
                                  use_hmac_encryption=True)
         self._is_shutdown = False
+        # Non-error messages consumed by check_worker_error() while scanning
+        # for RemoteWorkerDeath are buffered here for poll() (submit_sync).
+        self._pending_responses: list = []
         self._initialized = True
 
     def submit(self,
@@ -351,7 +387,7 @@ class RemoteMpiCommSessionClient(MpiSession):
                *args,
                sync: bool = False,
                **kwargs) -> list:
-        ''' Submit a task to the remote MPI pool. '''
+        """Submit a task to the remote MPI pool."""
         if self._is_shutdown:
             logger_debug("RemoteMpiCommSessionClient is already shut down\n",
                          "yellow")
@@ -365,7 +401,7 @@ class RemoteMpiCommSessionClient(MpiSession):
     SYNC_IDLE_INTERVAL = 8
 
     def submit_sync(self, task, *args, **kwargs) -> List[T]:
-        ''' Submit a task to the remote MPI pool and wait for task completion. '''
+        """Submit a task to the remote MPI pool and wait for task completion."""
         self.submit(task, *args, sync=True, **kwargs)
 
         while not ((res := self.poll()) or self._is_shutdown):
@@ -382,16 +418,39 @@ class RemoteMpiCommSessionClient(MpiSession):
         return res
 
     def poll(self) -> bool:
-        ''' Poll the queue for a response.
+        """Poll the queue for a response.
+
         Returns:
             True if a response is received, False otherwise.
-        '''
+        """
         if self._is_shutdown:
             return False
+        if self._pending_responses:
+            return self._pending_responses.pop(0)
         response = self.queue.poll(0.1)
         if response:
             return self.queue.get()  # should get a True if success
         return False
+
+    def check_worker_error(self) -> Optional[BaseException]:
+        """Non-blockingly fetch a worker-death notification, if any.
+
+        RemoteMpiCommSessionServer forwards a RemoteWorkerDeath when an async
+        (fire-and-forget) worker future fails -- the only error channel in
+        this mode, since submit() returns no futures for the client to watch.
+        Non-error messages encountered while scanning are buffered for poll().
+        """
+        if self._is_shutdown:
+            return None
+        try:
+            while self.queue.poll(0):
+                msg = self.queue.get()
+                if isinstance(msg, RemoteWorkerDeath):
+                    return msg.to_exception()
+                self._pending_responses.append(msg)
+        except Exception as e:
+            logger_debug(f"check_worker_error poll failed: {e}\n", "grey")
+        return None
 
     def abort(self):
         self.shutdown()
@@ -402,7 +461,7 @@ class RemoteMpiCommSessionClient(MpiSession):
         # LLM instances. Marking it as shutdown would prevent subsequent LLM instances from
         # using it. The connection stays open for the entire lifetime of the mgmn setup.
         logger_debug(
-            f"RemoteMpiCommSessionClient.shutdown() called (no-op for singleton)\n",
+            "RemoteMpiCommSessionClient.shutdown() called (no-op for singleton)\n",
             "grey")
 
     def shutdown_abort(self, grace: float = 60, reason=None):
@@ -410,14 +469,13 @@ class RemoteMpiCommSessionClient(MpiSession):
 
 
 class RemoteMpiCommSessionServer():
-    '''
-    RemoteMpiCommSessionServer is a variant of MpiCommSession that is used to create a remote MPI pool.
-    '''
+    """RemoteMpiCommSessionServer is a variant of MpiCommSession that is used to create a remote MPI pool.
+    """
 
     def __init__(self,
                  hmac_key: bytes,
                  n_workers: int = 0,
-                 addr: str = f'tcp://127.0.0.1:*',
+                 addr: str = 'tcp://127.0.0.1:*',
                  comm=None,
                  is_comm: bool = False):
         # FIXME: this is a hack to avoid circular import, resolve later
@@ -520,9 +578,36 @@ class RemoteMpiCommSessionServer():
                 assert len(futures) == self.num_results == mpi_world_size()
                 # Store futures to wait for them before the next task
                 pending_futures = list(futures)
-                if message.sync:
-                    for future in futures:
+                for future in futures:
+                    if message.sync:
                         future.add_done_callback(self.mpi_future_callback)
+                    else:
+                        # Fire-and-forget tasks have no result channel, but a
+                        # crashed worker must still reach the client (the
+                        # client-side session has no futures to watch); see
+                        # RemoteWorkerDeath.
+                        future.add_done_callback(self.mpi_async_error_callback)
+
+    def mpi_async_error_callback(self, future):
+        """Forward a worker exception to the client for async tasks.
+
+        Runs on the executor's callback thread, like the existing sync-path
+        mpi_future_callback (same pre-existing cross-thread ZMQ-put pattern).
+        Best-effort: the socket may already be closed at shutdown.
+        """
+        if future.cancelled():
+            return
+        exc = future.exception()
+        if exc is None:
+            return
+        print_colored(
+            f"RemoteMpiCommSessionServer: async MPI worker failed, forwarding "
+            f"to client: {type(exc).__name__}: {exc}\n", "red")
+        try:
+            self.queue.put(RemoteWorkerDeath.from_exception(exc))
+        except Exception as e:
+            logger_debug(f"Failed to forward worker death to client: {e}\n",
+                         "red")
 
     def mpi_future_callback(self, future):
         logger_debug(f"rank{global_mpi_rank()} got future: {future}\n", "red")
@@ -540,7 +625,7 @@ class RemoteMpiCommSessionServer():
             "grey")
         if len(self.results) == self.num_results:
             logger_debug(
-                f"RemoteMpiCommSessionServer received all results, sending to client\n",
+                "RemoteMpiCommSessionServer received all results, sending to client\n",
                 "green")
             try:
                 self.queue.put_noblock(self.results, retry=2)
@@ -551,7 +636,7 @@ class RemoteMpiCommSessionServer():
                 else:
                     raise e
 
-            logger_debug(f"RemoteMpiCommSessionServer sent results to client\n",
+            logger_debug("RemoteMpiCommSessionServer sent results to client\n",
                          "green")
             self.results.clear()
 
@@ -581,8 +666,7 @@ def get_mpi_world_size() -> int:
 
 
 def split_mpi_env(mpi_env_keys: List[str] | None = None) -> Tuple[dict, dict]:
-    '''
-    Splits the environment variables into MPI-related and non-MPI-related dictionaries.
+    """Splits the environment variables into MPI-related and non-MPI-related dictionaries.
 
     Args:
         mpi_env_keys: Additional environment variables to be considered as MPI-related.
@@ -591,7 +675,7 @@ def split_mpi_env(mpi_env_keys: List[str] | None = None) -> Tuple[dict, dict]:
         Tuple[dict, dict]: (non_mpi_env, mpi_env)
             - non_mpi_env: Environment dictionary without MPI-related variables
             - mpi_env: Environment dictionary containing only MPI-related variables
-    '''
+    """
     current_env = os.environ.copy()
 
     # Identify MPI-related variables

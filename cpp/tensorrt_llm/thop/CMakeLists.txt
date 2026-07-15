@@ -70,6 +70,7 @@ add_library(
   fp8Quantize.cpp
   dsv3FusedAGemmOp.cpp
   deepseekV4QNormOp.cpp
+  deepseekV4BlockTableOp.cpp
   inverseRopeFp8QuantOp.cpp
   fusedQKNormRopeOp.cpp
   fusedDiTQKNormRopeOp.cpp
@@ -81,6 +82,7 @@ add_library(
   fusedAddRMSNormQuant.cpp
   fusedActivationQuant.cpp
   fusedGatedRMSNormQuant.cpp
+  rmsNormFp4Quant.cpp
   fusedTopkSoftmax.cpp
   gatherTreeOp.cpp
   groupRmsNormOp.cpp

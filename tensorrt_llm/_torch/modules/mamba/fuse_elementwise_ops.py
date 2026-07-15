@@ -24,7 +24,7 @@ def _extract_transpose_prefill_kernel(
     src_ptr,
     dst_ptr,
     num_prefill_tokens,
-    d_in_proj,
+    src_stride_seq,
     d_inner,
     conv_dim,
     BLOCK_SEQ: tl.constexpr,
@@ -42,9 +42,11 @@ def _extract_transpose_prefill_kernel(
     conv_mask = conv_offsets < conv_dim
     mask = seq_mask[:, None] & conv_mask[None, :]
 
-    # Cast to int64 to avoid overflow: seq_offsets * d_in_proj can exceed INT32_MAX
-    # (e.g., 131071 * 22656 = 2,969,544,576 > 2,147,483,647)
-    src_offsets = seq_offsets[:, None].to(tl.int64) * d_in_proj + d_inner + conv_offsets[None, :]
+    # Cast to int64 to avoid overflow: seq_offsets * src_stride_seq can exceed
+    # INT32_MAX (e.g., 131071 * 22656 = 2,969,544,576 > 2,147,483,647)
+    src_offsets = (
+        seq_offsets[:, None].to(tl.int64) * src_stride_seq + d_inner + conv_offsets[None, :]
+    )
     data = tl.load(src_ptr + src_offsets, mask=mask, other=0.0)
 
     dst_offsets = conv_offsets[:, None] * num_prefill_tokens + seq_offsets[None, :]
@@ -58,11 +60,13 @@ def extract_transpose_prefill_slice(
     width: int,
 ) -> torch.Tensor:
     """
-    Extract and transpose a contiguous prefill slice for causal_conv1d_fn.
+    Extract and transpose a prefill slice for causal_conv1d_fn.
 
-    Input:  src[num_tokens, num_cols]
+    Input:  src[num_tokens, num_cols], rows contiguous (arbitrary row stride,
+            so column-slice views of a wider tensor work in place)
     Output: [width, num_prefill_tokens]
     """
+    assert src.stride(1) == 1
     out = torch.empty(width, num_prefill_tokens, dtype=src.dtype, device=src.device)
 
     BLOCK_SEQ, BLOCK_CONV = 32, 128
@@ -72,7 +76,7 @@ def extract_transpose_prefill_slice(
         src,
         out,
         num_prefill_tokens,
-        src.shape[1],
+        src.stride(0),
         start_col,
         width,
         BLOCK_SEQ,
@@ -207,7 +211,7 @@ def _transpose_and_split_qkv_kernel(
     v_ptr,
     num_prefill,
     num_decode,
-    num_cols,
+    decode_stride_seq,
     q_dim: tl.constexpr,
     k_dim: tl.constexpr,
     v_dim: tl.constexpr,
@@ -216,8 +220,9 @@ def _transpose_and_split_qkv_kernel(
 ):
     """Fused transpose-prefill + split-decode into contiguous q, k, v.
 
-    Reads prefill from transposed layout [D, T_p] and decode from
-    row-major layout [T_d, D], writes both into contiguous q/k/v outputs.
+    Reads prefill from transposed layout [D, T_p] and decode from row-major
+    layout [T_d, D] with contiguous rows of arbitrary stride, writes both
+    into contiguous q/k/v outputs.
     Grid: (num_seq_blocks_total, num_dim_blocks, 3)
     program_id(2): 0=Q, 1=K, 2=V
     """
@@ -251,7 +256,7 @@ def _transpose_and_split_qkv_kernel(
 
     # Decode: read from decode_ptr[T_d, D] row-major
     decode_row = seq_offsets - num_prefill
-    decode_indices = decode_row[:, None].to(tl.int64) * num_cols + (
+    decode_indices = decode_row[:, None].to(tl.int64) * decode_stride_seq + (
         src_col_offset + dim_offsets[None, :]
     ).to(tl.int64)
     decode_data = tl.load(
@@ -281,9 +286,13 @@ def transpose_and_split_qkv(
     """
     Fused transpose prefill [D, T_p] + split decode [T_d, D] into contiguous q, k, v.
 
+    The decode tensor may be a column-slice view of a wider tensor (contiguous
+    rows, arbitrary row stride).
+
     Replaces separate transpose_copy_back + split_qkv_contiguous for mixed batches.
     """
-    num_cols, num_prefill = prefill_t.shape
+    assert decode.stride(-1) == 1
+    num_prefill = prefill_t.shape[1]
     num_decode = decode.shape[0]
     total_seq = num_prefill + num_decode
 
@@ -303,7 +312,7 @@ def transpose_and_split_qkv(
         v_flat,
         num_prefill,
         num_decode,
-        num_cols,
+        decode.stride(0),
         q_dim,
         k_dim,
         v_dim,
