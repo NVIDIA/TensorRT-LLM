@@ -1198,6 +1198,8 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
             def slurmJobLogPath = "${jobWorkspace}/job-output.log"
             def scriptLaunchPathLocal = Utils.createTempLocation(pipeline, "./slurm_launch.sh")
             def scriptLaunchPathNode = "${jobWorkspace}/${jobUID}-slurm_launch.sh"
+            def scriptPreparePathLocal = Utils.createTempLocation(pipeline, "./prepare_container.sh")
+            def scriptPreparePathNode = "${jobWorkspace}/${jobUID}-prepare_container.sh"
             def scriptSubmitPathLocal = Utils.createTempLocation(pipeline, "./slurm_submit.sh")
             def scriptSubmitPathNode = "${jobWorkspace}/${jobUID}-slurm_submit.sh"
             def scriptTrackPathLocal = Utils.createTempLocation(pipeline, "./slurm_track.sh")
@@ -1675,6 +1677,7 @@ bash "${scriptFatBuildPathNode}" "\$fatSqshPath" "\$baseSqshPath" "${llmTarfile}
                     scriptFatBuildSbatchPathNode,
                     scriptBashUtilsPathNode,
                     scriptLaunchPathNode,
+                    scriptPreparePathNode,
                     scriptSubmitPathNode,
                     scriptTrackPathNode,
                     testListPathNode,
@@ -1688,44 +1691,84 @@ bash "${scriptFatBuildPathNode}" "\$fatSqshPath" "\$baseSqshPath" "${llmTarfile}
                 }
                 def findKeepWhenRetryArgs = filesToKeepWhenRetry.collect { " ! -name \"\$(basename \"${it}\")\"" }.join("")
 
+                // Generate Prepare Container script: submits the CPU fat-sqsh builder job
+                // (if needed) and polls until it completes. Run Pytest starts only after
+                // this stage returns, so the fat sqsh is already on disk when the GPU job
+                // starts and the srunPrologue can reuse it (SKIP_INSTALL=1).
                 def fatSqshDir = "${cluster.scratchPath}/users/svc_tensorrt/fat_sqsh"
-                def fatSqshSubmitSection = ""
+                def scriptPrepareContent = "#!/bin/bash\nset -euo pipefail\necho 'No fat sqsh builder configured; skipping Prepare Container.'\n"
                 if (cluster.fatBuilderArgs != null) {
-                    fatSqshSubmitSection = """
-# Fat sqsh: submit CPU builder job if needed, then add --dependency to GPU test job.
+                    scriptPrepareContent = """#!/bin/bash
+set -euo pipefail
 mkdir -p "${fatSqshDir}"
 fatHash=\$(printf '%s' "${llmTarfile}|${LLM_DOCKER_IMAGE}" | sha256sum | cut -d' ' -f1 | head -c 16)
 fatSqshPath="${fatSqshDir}/fat-\${fatHash}.sqsh"
-SBATCH_DEPENDENCY=""
-if [ ! -f "\$fatSqshPath" ]; then
-    EXISTING=\$(squeue -h -n "fat_build_\${fatHash}" -o "%i" 2>/dev/null | head -1 || true)
-    if [ -n "\$EXISTING" ]; then
-        echo "Fat sqsh builder already running as job \$EXISTING, adding dependency"
-        # afterany (not afterok): the builder is best-effort. A failed build must not
-        # deadlock the GPU job as DependencyNeverSatisfied; it falls back to base sqsh.
-        SBATCH_DEPENDENCY="--dependency=afterany:\$EXISTING"
+
+if [ -f "\$fatSqshPath" ]; then
+    echo "Fat sqsh already cached: \$fatSqshPath"
+    exit 0
+fi
+
+BUILDER_ID=""
+EXISTING=\$(squeue -h -n "fat_build_\${fatHash}" -o "%i" 2>/dev/null | head -1 || true)
+if [ -n "\$EXISTING" ]; then
+    echo "Fat sqsh builder already running as job \$EXISTING, will wait for it"
+    BUILDER_ID="\$EXISTING"
+else
+    # Submit the CPU builder. Best-effort: any submission failure is non-fatal;
+    # the GPU job will fall back to base sqsh + full install.
+    set +e
+    BUILDER_OUT=\$(sbatch --parsable --job-name="fat_build_\${fatHash}" "${scriptFatBuildSbatchPathNode}" 2>&1)
+    BUILDER_RC=\$?
+    set -e
+    # sbatch may print unrelated WARNINGs to stderr (captured via 2>&1); --parsable's real
+    # output is a line "<jobid>" or "<jobid>;<cluster>". Extract the numeric job id only.
+    BUILDER_ID=\$(printf '%s\\n' "\$BUILDER_OUT" | grep -oE '^[0-9]+' | tail -1)
+    if [ "\$BUILDER_RC" -eq 0 ] && [ -n "\$BUILDER_ID" ]; then
+        echo "Submitted fat sqsh builder as job \$BUILDER_ID"
     else
-        # Submit the CPU builder. Best-effort: any submission failure must NOT block the
-        # GPU test job -- it just runs without a dependency (base sqsh + full install).
-        set +e
-        BUILDER_OUT=\$(sbatch --parsable --job-name="fat_build_\${fatHash}" "${scriptFatBuildSbatchPathNode}" 2>&1)
-        BUILDER_RC=\$?
-        set -e
-        # sbatch may print unrelated WARNINGs to stderr (captured via 2>&1); --parsable's real
-        # output is a line "<jobid>" or "<jobid>;<cluster>". Extract the numeric job id only.
-        BUILDER_ID=\$(printf '%s\\n' "\$BUILDER_OUT" | grep -oE '^[0-9]+' | tail -1)
-        if [ "\$BUILDER_RC" -eq 0 ] && [ -n "\$BUILDER_ID" ]; then
-            echo "Submitted fat sqsh builder as job \$BUILDER_ID"
-            SBATCH_DEPENDENCY="--dependency=afterany:\$BUILDER_ID"
-        else
-            echo "Fat sqsh builder submission failed (rc=\$BUILDER_RC): \$BUILDER_OUT"
-            echo "Falling back: GPU test job will run without dependency (base sqsh + full install)"
-            SBATCH_DEPENDENCY=""
-        fi
+        echo "Fat sqsh builder submission failed (rc=\$BUILDER_RC): \$BUILDER_OUT"
+        echo "GPU test job will fall back to base sqsh + full install"
+        exit 0
     fi
 fi
-""".replaceAll("(?m)^\\s{20}", "")
+
+# Poll until the builder job finishes (success or failure).
+echo "Waiting for fat sqsh builder job \$BUILDER_ID to complete..."
+while true; do
+    if ! STATUS=\$(sacct -j "\$BUILDER_ID" --format=State -Pn --allocations 2>&1); then
+        echo "Warning: sacct failed, retrying in 60s..."
+        sleep 60
+        continue
+    fi
+    case "\${STATUS:-}" in
+        COMPLETED|FAILED|CANCELLED|TIMEOUT|NODE_FAIL|OUT_OF_MEMORY)
+            echo "Fat sqsh builder job \$BUILDER_ID finished: \$STATUS"
+            break
+            ;;
+        *)
+            echo "Fat sqsh builder job \$BUILDER_ID state: \${STATUS:-UNKNOWN}, waiting..."
+            sleep 60
+            ;;
+    esac
+done
+
+if [ -f "\$fatSqshPath" ]; then
+    echo "Fat sqsh ready: \$fatSqshPath"
+else
+    echo "Fat sqsh not found after builder completed (status=\$STATUS); GPU job will fall back to base sqsh + full install"
+fi
+"""
                 }
+                pipeline.writeFile(file: scriptPreparePathLocal, text: scriptPrepareContent)
+                Utils.exec(pipeline, script: "echo 'Prepare Container script:' && cat ${scriptPreparePathLocal}")
+                Utils.copyFileToRemoteHost(
+                    pipeline,
+                    remote,
+                    scriptPreparePathLocal,
+                    scriptPreparePathNode,
+                    true
+                )
 
                 def scriptSubmit = """#!/bin/bash
                     set -xEeuo pipefail
@@ -1743,9 +1786,10 @@ fi
                     # Clean up workspace: remove all files/dirs not in the keep list
                     find "${jobWorkspace}" -maxdepth 1 -mindepth 1 ${findKeepWhenRetryArgs} -exec rm -rf {} +
 
-                    ${fatSqshSubmitSection}
+                    # Prepare Container stage has already completed; fat sqsh is ready on disk
+                    # (or builder failed, in which case the GPU job falls back to base sqsh).
                     touch ${slurmJobLogPath}
-                    jobId=\$(sbatch \${SBATCH_DEPENDENCY:-} ${scriptLaunchPathNode} | awk '{print \$4}')
+                    jobId=\$(sbatch ${scriptLaunchPathNode} | awk '{print \$4}')
                     if [ -z "\$jobId" ]; then
                         echo "Error: Slurm job submission failed, no job ID returned."
                         exit 1
@@ -1763,6 +1807,17 @@ fi
                     scriptSubmitPathLocal,
                     scriptSubmitPathNode,
                     true
+                )
+            }
+
+            stage("[${stageName}] Prepare Container") {
+                // Submit the CPU fat-sqsh builder job (if configured) and record its
+                // SLURM job ID so Run Pytest can add --dependency to the GPU test job.
+                Utils.exec(
+                    pipeline,
+                    timeout: false,
+                    script: Utils.sshUserCmd(remote, scriptPreparePathNode),
+                    numRetries: 3
                 )
             }
 

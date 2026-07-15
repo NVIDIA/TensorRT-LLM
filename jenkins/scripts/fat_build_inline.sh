@@ -50,13 +50,19 @@ echo "[fat_build] LLM tarfile: ${LLM_TARFILE_URL%%\?*}"
 
 # Write the install script into WORK_DIR (mounted as /work inside the container).
 # Variable expansion happens here in the outer shell; the container sees literal values.
+# All work is done inside /opt/trtllm/ in the container filesystem (not in the /work mount),
+# so the source tree and installed packages are baked into the exported sqsh image.
 cat > "$WORK_DIR/install.sh" << INSTALL_EOF
 #!/bin/bash
 set -euo pipefail
-cd /work
+mkdir -p /opt/trtllm
+cd /opt/trtllm
 echo "[fat_build] Downloading $TAR_NAME..."
 wget -nv "$LLM_TARFILE_URL"
 tar -zxf "$TAR_NAME"
+rm -f "$TAR_NAME"
+echo "[fat_build] Installing apt deps..."
+apt-get install -y libffi-dev
 echo "[fat_build] Installing requirements-dev.txt..."
 pip3 install --retries 10 -r TensorRT-LLM/src/requirements-dev.txt
 echo "[fat_build] Installing trtllm wheel..."
