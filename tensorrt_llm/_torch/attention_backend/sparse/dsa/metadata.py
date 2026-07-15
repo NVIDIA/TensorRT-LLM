@@ -181,6 +181,51 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self.create_buffers_for_mla_rope_append(capture_graph=capture_graph)
         self.create_buffers_for_indexer(capture_graph=capture_graph)
 
+    def prepare_for_draft_replay(self) -> dict | None:
+        if self.kv_cache_manager is None or not hasattr(self.kv_cache_manager, "index_head_dim"):
+            return None
+
+        saved_state = {
+            "host_indexer_k_cache_block_offsets": (self.host_indexer_k_cache_block_offsets.clone()),
+            "indexer_k_cache_block_offsets": self.indexer_k_cache_block_offsets.clone(),
+            "host_slot_mapping_fp8": self.host_slot_mapping_fp8.clone(),
+            "host_slot_mapping_scale": self.host_slot_mapping_scale.clone(),
+            "slot_mapping_fp8": self.slot_mapping_fp8.clone(),
+            "slot_mapping_scale": self.slot_mapping_scale.clone(),
+        }
+
+        # The manager has already been switched to the draft manager. Decode
+        # its encoded block offsets into pool indices so host-offloaded block
+        # IDs cannot be used as raw (and potentially out-of-range) indices.
+        pool_indices = self._get_pool_block_indices()
+        num_blocks = pool_indices.shape[1]
+        self.host_indexer_k_cache_block_offsets[: self.num_seqs, :num_blocks].copy_(pool_indices)
+        self.indexer_k_cache_block_offsets[: self.num_seqs].copy_(
+            self.host_indexer_k_cache_block_offsets[: self.num_seqs],
+            non_blocking=True,
+        )
+        self.indexer_k_cache_block_offsets.clamp_(min=0)
+        Indexer.recompute_slot_mappings(self)
+
+        return saved_state
+
+    def restore_after_draft_replay(self, saved_state: dict | None) -> None:
+        if saved_state is None:
+            return
+
+        self.host_indexer_k_cache_block_offsets.copy_(
+            saved_state["host_indexer_k_cache_block_offsets"],
+            non_blocking=True,
+        )
+        self.indexer_k_cache_block_offsets.copy_(
+            saved_state["indexer_k_cache_block_offsets"],
+            non_blocking=True,
+        )
+        self.host_slot_mapping_fp8.copy_(saved_state["host_slot_mapping_fp8"])
+        self.host_slot_mapping_scale.copy_(saved_state["host_slot_mapping_scale"])
+        self.slot_mapping_fp8.copy_(saved_state["slot_mapping_fp8"])
+        self.slot_mapping_scale.copy_(saved_state["slot_mapping_scale"])
+
     def prepare(self):
         super().prepare()
         self._invalidate_pool_view_cache()

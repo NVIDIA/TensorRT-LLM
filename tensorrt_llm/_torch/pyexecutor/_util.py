@@ -1344,6 +1344,16 @@ class KvCacheCreator:
                 "Attention DP is enabled, separate draft KV cache is not supported."
             )
             return False
+
+        sparse_cfg = self._sparse_attention_config
+        if (sparse_cfg is not None
+                and getattr(sparse_cfg, "algorithm", None) == "deepseek_v4"
+                and self._mapping.pp_size > 1):
+            logger.info(
+                "DeepSeek-V4 separate draft KV cache is only supported for PP=1; "
+                "folding draft layers into the unified manager for pp_size=%d.",
+                self._mapping.pp_size)
+            return False
         return should_use_separate_draft_kv_cache(self._speculative_config)
 
     def _get_effective_draft_config(self) -> ModelConfig:
