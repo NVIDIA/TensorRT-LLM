@@ -34,6 +34,7 @@ from tensorrt_llm.functional import AttentionMaskType
 from tensorrt_llm.math_utils import ceil_div
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
+from ..pyexecutor.config_utils import is_mla
 from ..utils import (compute_swizzled_sf_shape, get_global_attrs,
                      get_model_extra_attrs)
 from .interface import (AttentionBackend, AttentionForwardArgs,
@@ -1312,6 +1313,59 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             self.has_w4a8_nvfp4_fp8 = self.quant_config.layer_quant_mode.has_w4a8_nvfp4_fp8(
             )
         self.create_fmha_libs()
+
+    @classmethod
+    def runtime_workspace_bytes_per_token(cls, model_config, mapping) -> int:
+        """fp8 context-MLA stages a K/V dequant workspace sized by the summed attended KV length
+        (``total_kv_len``) across the context requests in a forward step, not by ``max_num_tokens`` -- so
+        KV-cache reuse can push it far past the profiling floor. This buffer is shared across attention
+        layers. ``0`` for non-MLA / non-fp8-KV / absorption-mode sparse MLA (which reads K/V straight from
+        the paged cache and stages no dequant buffer).
+
+        The per-token cost is the single source of truth in C++
+        (``AttentionOp::contextMlaWorkspaceBytesPerToken``, exposed via nanobind), so it cannot drift
+        from the runtime allocation.
+        """
+        config = model_config.pretrained_config
+        if not is_mla(config):
+            return 0
+        quant_config = model_config.quant_config
+        fp8_context_mla = (quant_config is not None
+                           and quant_config.quant_mode.has_fp8_kv_cache()
+                           and get_sm_version() in (90, 100, 103, 120))
+        if not fp8_context_mla:
+            return 0
+        # Attention-DP runs the full head set per rank; otherwise heads shard across TP (mirror
+        # mNumAttnHeads).
+        attn_tp = 1 if mapping.enable_attention_dp else mapping.tp_size
+        num_attn_heads = config.num_attention_heads // attn_tp
+        # The buffer is skipped only where AttentionOp::useSparseMLA() holds, which needs all three of:
+        #   * DSA / DeepSeek-V4 -- only these lower to the absorption path that reads K/V from the paged
+        #     cache. Skip-softmax passes no sparse indices to C++, and its ignore-list can exclude a layer,
+        #     so those layers still run dense MLA. The workspace is shared, so one dense layer forces the
+        #     reserve.
+        #   * SM 100 / 103 -- mUseTllmGen is `sm >= 100 && sm != 120`.
+        #   * short-seq MHA fallback off -- it routes short contexts back through the dense path.
+        # Match the runtime predicate, not just "a sparse config exists": over-reserving costs KV pool,
+        # under-reserving OOMs mid-forward.
+        sparse_algorithm = getattr(model_config.sparse_attention_config,
+                                   "algorithm", None)
+        sparse_mla = (sparse_algorithm in ("dsa", "deepseek_v4")
+                      and get_sm_version() in (100, 103))
+        short_seq_mha_enabled = int(
+            os.environ.get("TRTLLM_MLA_SHORT_SEQ_MHA_THRESHOLD", "0")) > 0
+        stages_no_buffer = sparse_mla and not short_seq_mha_enabled
+        return int(
+            thop.get_context_mla_workspace_bytes_per_token(
+                num_attn_heads=num_attn_heads,
+                qk_rope_head_dim=config.qk_rope_head_dim,
+                qk_nope_head_dim=config.qk_nope_head_dim,
+                v_head_dim=config.v_head_dim,
+                fp8_context_mla=fp8_context_mla,
+                # Paged context MLA always uses separate Q/KV input; the term is otherwise gated to 0.
+                separate_q_and_kv_input=True,
+                sparse_mla=stages_no_buffer,
+            ))
 
     def get_local_layer_idx(self, metadata: TrtllmAttentionMetadata) -> int:
         if self.local_layer_idx is not None:
