@@ -2026,6 +2026,63 @@ class Indexer(nn.Module):
             non_blocking=True)
 
     @staticmethod
+    def recompute_context_kv_gather_mappings(
+            metadata: DSAtrtllmAttentionMetadata,
+            indexer_params: Optional[IndexerParams] = None) -> None:
+        """Recompute context KV-cache gather mappings for the active cache manager."""
+        if not metadata.enable_context_mla_with_cached_kv:
+            metadata.slot_mapping_fp8_fullkv = metadata.slot_mapping_fp8
+            metadata.slot_mapping_scale_fullkv = metadata.slot_mapping_scale
+            return
+
+        if indexer_params is None:
+            indexer_params = Indexer.build_indexer_params(metadata)
+            if indexer_params is None:
+                return
+
+        num_contexts = indexer_params.num_contexts
+        if num_contexts == 0:
+            # Generation does not consume full-KV gather mappings.  In
+            # particular, avoid allocating temporary zero-length tensors
+            # while capturing generation CUDA graphs.
+            return
+        total_kv_per_request = indexer_params.kv_lens[:num_contexts]
+        total_kv_len = total_kv_per_request.sum().item()
+        host_slot_mapping_fp8_fullkv = torch.empty(total_kv_len,
+                                                   dtype=torch.int64,
+                                                   pin_memory=prefer_pinned())
+        host_slot_mapping_scale_fullkv = torch.empty(total_kv_len,
+                                                     dtype=torch.int64,
+                                                     pin_memory=prefer_pinned())
+
+        req_indices = torch.repeat_interleave(
+            torch.arange(num_contexts, dtype=torch.int64, device='cpu'),
+            total_kv_per_request)
+
+        cu_kv = torch.zeros(num_contexts + 1, dtype=torch.int64, device='cpu')
+        cu_kv[1:] = total_kv_per_request.to(torch.int64).cumsum(0)
+        kv_positions = (
+            torch.arange(total_kv_len, dtype=torch.int64, device='cpu') -
+            cu_kv[:-1].repeat_interleave(total_kv_per_request))
+
+        fp8_flat_indices, scale_flat_indices = _compute_slot_mappings(
+            kv_positions,
+            metadata.host_indexer_k_cache_block_offsets,
+            req_indices,
+            indexer_params.head_dim,
+            indexer_params.tokens_per_block,
+            indexer_params.quant_block_size,
+            data_bytes_per_token=indexer_params.data_bytes_per_token,
+        )
+
+        host_slot_mapping_fp8_fullkv.copy_(fp8_flat_indices)
+        host_slot_mapping_scale_fullkv.copy_(scale_flat_indices)
+        metadata.slot_mapping_fp8_fullkv = host_slot_mapping_fp8_fullkv.cuda(
+            non_blocking=True)
+        metadata.slot_mapping_scale_fullkv = host_slot_mapping_scale_fullkv.cuda(
+            non_blocking=True)
+
+    @staticmethod
     def prepare_for_update_k_cache(metadata: DSAtrtllmAttentionMetadata,
                                    indexer_params: IndexerParams):
         """
@@ -2044,8 +2101,6 @@ class Indexer(nn.Module):
         """
         num_contexts = indexer_params.num_contexts
         seq_lens = indexer_params.seq_lens
-        tokens_per_block = indexer_params.tokens_per_block
-        head_dim = indexer_params.head_dim
 
         # When MLA chunked prefill is active, it already handles chunking
         # Indexer should just process the current MLA chunk as a single chunk
@@ -2088,54 +2143,9 @@ class Indexer(nn.Module):
             else:
                 metadata.indexer_prefill_chunks = None
 
-        # When chunked prefill or KVCache reuse is enabled, we need to gather the full KV for indexer's logit computation.
-        # Indexer's own chunking does not need full KV gathering, instead it gathers only the current chunk with loop-based gathering.
-        if metadata.enable_context_mla_with_cached_kv:
-            # Use kv_lens which correctly computes (raw_past + seq_lens) // compress_ratio.
-            total_kv_per_request = indexer_params.kv_lens[:num_contexts]
-            total_kv_len = total_kv_per_request.sum().item()
-            host_slot_mapping_fp8_fullkv = torch.empty(
-                total_kv_len, dtype=torch.int64, pin_memory=prefer_pinned())
-            host_slot_mapping_scale_fullkv = torch.empty(
-                total_kv_len, dtype=torch.int64, pin_memory=prefer_pinned())
-
-            req_indices = torch.repeat_interleave(
-                torch.arange(num_contexts, dtype=torch.int64, device='cpu'),
-                total_kv_per_request)
-
-            cu_kv = torch.zeros(num_contexts + 1,
-                                dtype=torch.int64,
-                                device='cpu')
-            cu_kv[1:] = total_kv_per_request.to(torch.int64).cumsum(0)
-            kv_positions = (
-                torch.arange(total_kv_len, dtype=torch.int64, device='cpu') -
-                cu_kv[:-1].repeat_interleave(total_kv_per_request))
-
-            fp8_flat_indices, scale_flat_indices = _compute_slot_mappings(
-                kv_positions,
-                metadata.host_indexer_k_cache_block_offsets,
-                req_indices,
-                head_dim,
-                tokens_per_block,
-                indexer_params.quant_block_size,
-                data_bytes_per_token=head_dim //
-                2 if metadata.kv_cache_manager.use_fp4 else head_dim,
-            )
-
-            host_slot_mapping_fp8_fullkv[:total_kv_len] = fp8_flat_indices
-            host_slot_mapping_scale_fullkv[:total_kv_len] = scale_flat_indices
-
-            assert len(fp8_flat_indices) == total_kv_len, \
-                f"host_slot_mapping_fp8_fullkv/host_slot_mapping_scale_fullkv length mismatch: {len(fp8_flat_indices)} != total_kv_len={total_kv_len}"
-
-            # Store extended mappings for indexer full KV gathering
-            metadata.slot_mapping_fp8_fullkv = host_slot_mapping_fp8_fullkv.cuda(
-                non_blocking=True)
-            metadata.slot_mapping_scale_fullkv = host_slot_mapping_scale_fullkv.cuda(
-                non_blocking=True)
-        else:
-            metadata.slot_mapping_fp8_fullkv = metadata.slot_mapping_fp8
-            metadata.slot_mapping_scale_fullkv = metadata.slot_mapping_scale
+        # When chunked prefill or KVCache reuse is enabled, gather mappings
+        # cover all cached and newly appended indexer tokens.
+        Indexer.recompute_context_kv_gather_mappings(metadata, indexer_params)
 
     @staticmethod
     def prepare_scheduler_metadata(metadata: DSAtrtllmAttentionMetadata):

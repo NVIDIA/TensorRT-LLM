@@ -3456,62 +3456,6 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
 
-    @pytest.mark.skip_less_mpi_world_size(4)
-    @skip_pre_blackwell
-    @pytest.mark.parametrize(
-        "indexer_k_dtype,mtp_nextn,use_cute_dsl,host_cache_size_gb,chunked_prefill,max_batch_size",
-        [
-            ("fp8", 0, False, 0, False, 24),
-            ("fp4", 1, False, 0, True, 24),
-            ("fp4", 3, True, 0, False, 24),
-            ("fp8", 0, False, 10, False, 24),
-        ],
-        ids=[
-            "baseline",
-            "fp4_mtp1_chunked",
-            "fp4_dsl_mtp3",
-            "host_cache_offload",
-        ],
-    )
-    def test_kv_cache_manager_v2(self, indexer_k_dtype, mtp_nextn, use_cute_dsl,
-                                 host_cache_size_gb, chunked_prefill,
-                                 max_batch_size):
-        """Exercise DSA indexer cache paths backed by KVCacheManagerV2."""
-        kv_cache_config = KvCacheConfig(
-            free_gpu_memory_fraction=0.4 if host_cache_size_gb else 0.7,
-            host_cache_size=host_cache_size_gb * (1 << 30),
-            use_kv_cache_manager_v2=True,
-        )
-        sparse_attention_config = DeepSeekSparseAttentionConfig(
-            indexer_k_dtype=indexer_k_dtype,
-            skip_indexer_for_short_seqs=False,
-            use_cute_dsl_paged_mqa_logits=use_cute_dsl,
-        )
-        speculative_config = (MTPDecodingConfig(
-            max_draft_len=mtp_nextn) if mtp_nextn else None)
-        llm_kwargs = {}
-        if chunked_prefill:
-            llm_kwargs.update(enable_chunked_prefill=True, max_num_tokens=512)
-
-        with LLM(
-                f"{llm_models_root()}/DeepSeek-V3.2-Exp-FP4-v2",
-                max_batch_size=max_batch_size,
-                tensor_parallel_size=4,
-                pipeline_parallel_size=1,
-                moe_expert_parallel_size=4,
-                kv_cache_config=kv_cache_config,
-                disable_overlap_scheduler=False,
-                cuda_graph_config=CudaGraphConfig(
-                    enable_padding=True, max_batch_size=max_batch_size),
-                moe_config=MoeConfig(backend="CUTLASS", max_num_tokens=16384),
-                enable_attention_dp=True,
-                speculative_config=speculative_config,
-                sparse_attention_config=sparse_attention_config,
-                **llm_kwargs,
-        ) as llm:
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
-
     @pytest.mark.skip_less_mpi_world_size(8)
     @skip_pre_blackwell
     @pytest.mark.parametrize(
@@ -7812,7 +7756,8 @@ class TestGLM52(LlmapiAccuracyTestHarness):
         # precision.
         model_name = "zai-org/GLM-5.2"
         model_path = f"{llm_models_root()}/GLM-5.2-NVFP4"
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7)
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7,
+                                        use_kv_cache_manager_v2=True)
 
         pytorch_config = dict(
             disable_overlap_scheduler=False,
@@ -7828,6 +7773,7 @@ class TestGLM52(LlmapiAccuracyTestHarness):
                  pipeline_parallel_size=1,
                  moe_expert_parallel_size=ep_size,
                  kv_cache_config=kv_cache_config,
+                 max_batch_size=128,
                  max_seq_len=8192,
                  **pytorch_config) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4

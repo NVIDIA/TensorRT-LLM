@@ -50,6 +50,7 @@ from tensorrt_llm._torch.attention_backend.sparse.utils import get_sparse_attn_k
 from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import Role
 from tensorrt_llm._torch.speculative.interface import (
+    SpecWorkerBase,
     prepare_attn_metadata_for_draft_replay,
     restore_attn_metadata_after_draft_replay,
 )
@@ -3343,6 +3344,80 @@ class TestPrepareRestoreAttnMetadataForDraftReplay:
         assert meta.kv_cache_manager is original_kv_mgr
         torch.testing.assert_close(meta.kv_cache_block_offsets, original_offsets)
         torch.testing.assert_close(meta.host_kv_cache_block_offsets, original_host_offsets)
+
+    def test_draft_context_recomputes_and_restores_dsa_metadata(self):
+        """The eager draft context must switch DSA indexer cache metadata."""
+        meta = self._make_mock_metadata()
+        mgr = self._make_mock_draft_manager()
+        mgr.index_head_dim = 128
+        meta.enable_flash_mla = False
+        meta.host_indexer_k_cache_block_offsets = torch.tensor([1, 2, 3])
+        meta.indexer_k_cache_block_offsets = torch.tensor([4, 5, 6])
+        meta.host_slot_mapping_fp8 = torch.tensor([7, 8, 9])
+        meta.host_slot_mapping_scale = torch.tensor([10, 11, 12])
+        meta.slot_mapping_fp8 = torch.tensor([13, 14, 15])
+        meta.slot_mapping_scale = torch.tensor([16, 17, 18])
+        meta.slot_mapping_fp8_fullkv = torch.tensor([19, 20, 21])
+        meta.slot_mapping_scale_fullkv = torch.tensor([22, 23, 24])
+        meta._update_indexer_k_cache_block_offsets = Mock()
+        original_manager = meta.kv_cache_manager
+        original_host_indexer_offsets = meta.host_indexer_k_cache_block_offsets
+        original_host_slot_mapping_fp8 = meta.host_slot_mapping_fp8
+        original_host_slot_mapping_scale = meta.host_slot_mapping_scale
+        original_slot_mapping_fp8_fullkv = meta.slot_mapping_fp8_fullkv
+        original_slot_mapping_scale_fullkv = meta.slot_mapping_scale_fullkv
+
+        def is_attn_metadata(obj, cls):
+            if cls in (TrtllmAttentionMetadata, DSAtrtllmAttentionMetadata):
+                return obj is meta
+            return builtins.isinstance(obj, cls)
+
+        with (
+            patch(
+                "tensorrt_llm._torch.speculative.interface.isinstance",
+                side_effect=is_attn_metadata,
+            ),
+            patch.object(Indexer, "recompute_slot_mappings") as recompute,
+            patch.object(
+                Indexer,
+                "recompute_context_kv_gather_mappings",
+            ) as recompute_context_gather,
+        ):
+            with SpecWorkerBase.draft_kv_cache_context(Mock(), meta, mgr):
+                assert meta.kv_cache_manager is mgr
+                assert meta.host_indexer_k_cache_block_offsets is not original_host_indexer_offsets
+                assert meta.host_slot_mapping_fp8 is not original_host_slot_mapping_fp8
+                assert meta.host_slot_mapping_scale is not original_host_slot_mapping_scale
+                meta._update_indexer_k_cache_block_offsets.assert_called_once_with()
+                recompute.assert_called_once_with(meta)
+                recompute_context_gather.assert_called_once_with(meta)
+                meta.host_indexer_k_cache_block_offsets.fill_(99)
+                meta.slot_mapping_fp8_fullkv = torch.tensor([100, 200, 300])
+                meta.slot_mapping_scale_fullkv = torch.tensor([400, 500, 600])
+
+        assert meta.kv_cache_manager is original_manager
+        assert meta.host_indexer_k_cache_block_offsets is original_host_indexer_offsets
+        assert meta.host_slot_mapping_fp8 is original_host_slot_mapping_fp8
+        assert meta.host_slot_mapping_scale is original_host_slot_mapping_scale
+        assert meta.slot_mapping_fp8_fullkv is original_slot_mapping_fp8_fullkv
+        assert meta.slot_mapping_scale_fullkv is original_slot_mapping_scale_fullkv
+
+
+def test_recompute_context_kv_gather_mappings_skips_generation():
+    """Generation graphs must not allocate unused full-KV mapping tensors."""
+    fp8_mapping = torch.tensor([1, 2, 3])
+    scale_mapping = torch.tensor([4, 5, 6])
+    metadata = SimpleNamespace(
+        enable_context_mla_with_cached_kv=True,
+        slot_mapping_fp8_fullkv=fp8_mapping,
+        slot_mapping_scale_fullkv=scale_mapping,
+    )
+    indexer_params = SimpleNamespace(num_contexts=0)
+
+    Indexer.recompute_context_kv_gather_mappings(metadata, indexer_params)
+
+    assert metadata.slot_mapping_fp8_fullkv is fp8_mapping
+    assert metadata.slot_mapping_scale_fullkv is scale_mapping
 
 
 @pytest.mark.skipif(not has_deep_gemm(), reason="DeepGEMM not available")
