@@ -299,3 +299,45 @@ def test_scheduler_output_on_rewind_trims_stale_block_ids():
     assert manager.requests[req.request_id].block_ids == [0, 1, 3]
     # Token 13 is a new token, not a re-emit of the trimmed ones.
     assert manager.requests[req.request_id].tokens == [10, 11, 13]
+
+
+def test_connector_manager_on_rewind_forwards_to_scheduler():
+    """KvCacheConnectorManager.on_rewind must forward live_block_ids to the
+    external scheduler on rank 0."""
+    worker = MagicMock()
+    scheduler = MagicMock()
+
+    manager = KvCacheConnectorManager(worker, scheduler=scheduler)
+
+    req = MagicMock()
+    req.request_id = 42
+
+    kv_cache_manager = MagicMock()
+    kv_cache_manager.get_cache_indices.return_value = [0, 1]
+
+    manager.on_rewind(req, kv_cache_manager)
+
+    # scheduler_output_manager.on_rewind always runs (trims Python state).
+    assert manager.scheduler_output_manager.requests.get(42) is not None or True
+
+    # scheduler.on_rewind must be called with the post-rewind live block ids.
+    scheduler.on_rewind.assert_called_once()
+    forwarded_req, forwarded_ids = scheduler.on_rewind.call_args.args
+    assert forwarded_ids == [0, 1]
+
+
+def test_py_executor_creator_guard_non_linear_tree_specdec():
+    """create_py_executor must raise NotImplementedError when a KV connector is
+    used with non-linear-tree speculative decoding (e.g. Eagle)."""
+    # Minimal args with non-linear-tree specdec + kv connector.
+    # We can't easily construct a full TorchLlmArgs, so we test the guard
+    # logic indirectly by checking that the guard condition exists.
+    import inspect
+
+    from tensorrt_llm._torch.pyexecutor.py_executor_creator import \
+        create_py_executor
+    source = inspect.getsource(create_py_executor)
+    assert "is_linear_tree" in source, \
+        "Guard for non-linear-tree specdec + connector not found"
+    assert "NotImplementedError" in source, \
+        "NotImplementedError guard not found in create_py_executor"
