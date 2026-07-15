@@ -66,6 +66,80 @@ class _ModuleStub:
         self.unpadded_hidden_size = hidden_size
 
 
+class _FusedMoeRunnerCapture:
+    def __init__(self) -> None:
+        self.run_moe_args: tuple[object, ...] | None = None
+
+    def run_moe(self, *args: object) -> torch.Tensor:
+        self.run_moe_args = args
+        return torch.empty(0)
+
+
+class _MoERunnerStub:
+    def __init__(self, fused_moe_runner: _FusedMoeRunnerCapture) -> None:
+        self.fused_moe_runner = fused_moe_runner
+
+
+def _get_fused_moe_runner_schema(method_name: str) -> torch.FunctionSchema:
+    class_name = "__torch__.torch.classes.trtllm.FusedMoeRunner"
+    schemas = [
+        schema
+        for schema in torch._C._jit_get_custom_class_schemas()
+        if schema.name == method_name and str(schema.arguments[0].type) == class_name
+    ]
+    assert len(schemas) == 1, f"Expected one FusedMoeRunner.{method_name} schema, found {schemas}"
+    return schemas[0]
+
+
+@pytest.mark.skipif(
+    not _TRTLLM_AVAILABLE,
+    reason="Requires the built TensorRT-LLM C++ extension for its TorchBind schema.",
+)
+def test_cutlass_moe_op_run_moe_matches_torchbind_schema_arity() -> None:
+    """The Python caller must supply every argument required by TorchBind."""
+    from tensorrt_llm._torch.modules.fused_moe.ops.moe_op_cutlass import CutlassMoEOp
+
+    x = torch.empty(1, 1)
+    token_selected_slots = torch.empty(1, 1, dtype=torch.int32)
+    token_final_scales = torch.empty(1, 1)
+    w3_w1_weight = torch.empty(1, 2, 1)
+    w2_weight = torch.empty(1, 1, 1)
+    module = _ModuleStub(
+        w3_w1_weight=w3_w1_weight,
+        w2_weight=w2_weight,
+        top_k=1,
+        hidden_size=1,
+        activation_type=0,
+    )
+
+    runner_capture = _FusedMoeRunnerCapture()
+    op = CutlassMoEOp()
+    op.moe_runner = _MoERunnerStub(runner_capture)
+    op.gemm_tactics = [0, 0]
+    op.compute_moe(
+        module=module,
+        x=x,
+        token_selected_slots=token_selected_slots,
+        token_final_scales=token_final_scales,
+        w3_w1_weight=w3_w1_weight,
+        w3_w1_bias=None,
+        w2_weight=w2_weight,
+        w2_bias=None,
+        output_dtype=x.dtype,
+        quant_scales=[],
+        use_all_to_all=False,
+    )
+
+    schema = _get_fused_moe_runner_schema("run_moe")
+    expected_arg_count = len(schema.arguments) - 1  # Exclude the bound runner (`self`).
+    assert runner_capture.run_moe_args is not None
+    actual_arg_count = len(runner_capture.run_moe_args)
+    assert actual_arg_count == expected_arg_count, (
+        f"CutlassMoEOp supplied {actual_arg_count} arguments to FusedMoeRunner.run_moe, "
+        f"but its TorchBind schema requires {expected_arg_count}: {schema}"
+    )
+
+
 @requires_cuda_and_op
 def test_cutlass_moe_op_run_moe_no_lora_smoke():
     from tensorrt_llm._torch.modules.fused_moe.ops.moe_op_cutlass import CutlassMoEOp
