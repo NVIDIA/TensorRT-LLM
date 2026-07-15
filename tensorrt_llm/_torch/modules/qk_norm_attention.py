@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -220,13 +220,21 @@ class QKNormRoPEAttention(Attention):
         self.aux_stream = torch.cuda.Stream()
         self.ln_events = [torch.cuda.Event(), torch.cuda.Event()]
 
-    def post_load_weights(self):
-        super().post_load_weights()
-        if not self._gate_tail_fused_preprocess_enabled:
-            return
+    def cache_derived_state(self):
+        super().cache_derived_state()
+        self._configure_gate_tail_fused_preprocess()
 
-        supported = (self._gate_tail_layout_active and self.mapping.cp_size == 1
-                     and self.head_dim == 256
+    def _configure_gate_tail_fused_preprocess(self):
+        """Restore the fused QK-norm/RoPE preprocessing config on the attention op.
+
+        Derived-state stage: recomputed from the currently loaded weights on every
+        load path, including GMS read-only sharing (which only runs
+        cache_derived_state, not the weight transform). Depends on the base gate-tail
+        layout already being resolved by ``super().cache_derived_state()``.
+        """
+        supported = (self._gate_tail_fused_preprocess_enabled
+                     and self._gate_tail_layout_active
+                     and self.mapping.cp_size == 1 and self.head_dim == 256
                      and self.qkv_proj.dtype == torch.bfloat16
                      and self.q_norm.weight is not None
                      and self.k_norm.weight is not None
@@ -237,11 +245,13 @@ class QKNormRoPEAttention(Attention):
                      and self.pos_embd_params.is_neox
                      and hasattr(self.attn, "configure_qk_norm_preprocessing"))
         if not supported:
-            logger.warning_once(
-                "Gate-tail fused QK-norm/RoPE preprocessing is not supported "
-                "for this attention configuration; keeping the standalone "
-                "fused QK-norm/RoPE kernel.",
-                key="gate_tail_fused_preprocess_unsupported")
+            self._gate_tail_fused_preprocess_active = False
+            if self._gate_tail_fused_preprocess_enabled:
+                logger.warning_once(
+                    "Gate-tail fused QK-norm/RoPE preprocessing is not supported "
+                    "for this attention configuration; keeping the standalone "
+                    "fused QK-norm/RoPE kernel.",
+                    key="gate_tail_fused_preprocess_unsupported")
             return
 
         self.attn.configure_qk_norm_preprocessing(

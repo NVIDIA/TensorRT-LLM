@@ -471,6 +471,11 @@ class Attention(nn.Module):
         # fused qk-norm-rope kernel; the attention op consumes [Q|K|V] as a row-strided view.
         self._gate_tail_layout_enabled = bool(self.attn_output_gate)
         self._gate_tail_layout_active = False
+        # Guards the one-shot gate-tail weight permutation so it runs once per set
+        # of freshly loaded qkv weights. Reset by reload orchestrators (full reload
+        # via ModelLoader._reset_weights_transformed, partial/RLHF reload via
+        # pre_reload_weights) so re-loaded weights get permuted again.
+        self._weights_transformed = False
 
         # [Chunked Attention]
         # Chunked attention is applied to context requests only. Chunked attention will be
@@ -700,18 +705,32 @@ class Attention(nn.Module):
                                 or self.o_proj.has_w4a8_nvfp4_fp8)
 
     def post_load_weights(self):
+        # Staged post-load hooks: transform_weights performs the one-shot weight
+        # permutation, cache_derived_state restores the Python-side state derived
+        # from the (possibly already-permuted) weights.
+        self.transform_weights()
+        self.cache_derived_state()
+
+    def transform_weights(self):
         self._maybe_permute_gate_tail_layout()
 
-    def _maybe_permute_gate_tail_layout(self):
-        """Permute qkv_proj weight rows from [q0|g0|q1|g1|...|K|V] to [Q|K|V|G].
+    def cache_derived_state(self):
+        self._refresh_gate_tail_layout_state()
 
-        Load-time-only transform enabling the copy-free gate path in forward.
-        Engaged for plain weights and per-tensor FP8 QDQ weights with a backend
-        that supports the strided [Q|K|V] view in both context and generation
-        paths. The FP8 weight scale is scalar and does not need to be permuted.
+    def pre_reload_weights(self):
+        # A weight reload rebinds qkv_proj with fresh checkpoint-order (interleaved)
+        # bytes, so the one-shot gate-tail permutation must run again. Full reloads
+        # reset this guard via ModelLoader._reset_weights_transformed; partial (RLHF)
+        # reloads invoke this hook once per update cycle.
+        self._weights_transformed = False
+
+    def _gate_tail_layout_supported(self):
+        """Whether the copy-free gate-tail [Q|K|V|G] layout applies here.
+
+        Determined purely by config, weight dtype and backend capability, so it
+        yields the same answer in a fresh process that only restores derived state
+        (e.g. a GMS read-only reader).
         """
-        if not self._gate_tail_layout_enabled or self._gate_tail_layout_active:
-            return
         has_quant = getattr(self.qkv_proj, "has_any_quant", False)
         has_fp8_qdq = getattr(self.qkv_proj, "has_fp8_qdq", False)
         weight_scale = getattr(self.qkv_proj, "weight_scale", None)
@@ -722,36 +741,66 @@ class Attention(nn.Module):
               and weight_scale is not None and weight_scale.numel() == 1)
         supports_strided_qkv = getattr(self.attn, "support_strided_fused_qkv",
                                        lambda: False)()
-        supported = (self.attn_backend == "TRTLLM" and self.support_fused_qkv
-                     and supports_strided_qkv
-                     and getattr(self, "fuse_qk_norm_rope", False)
-                     and not getattr(self, "skip_rope", False)
-                     and self.mapping.cp_size == 1 and has_supported_weight)
-        if not supported:
-            logger.warning_once(
-                "Gate-tail QKV layout is not supported for this attention "
-                "configuration; keeping the interleaved layout.",
-                key="gate_tail_layout_unsupported")
+        return (self.attn_backend == "TRTLLM" and self.support_fused_qkv
+                and supports_strided_qkv
+                and getattr(self, "fuse_qk_norm_rope", False)
+                and not getattr(self, "skip_rope", False)
+                and self.mapping.cp_size == 1 and has_supported_weight)
+
+    def _maybe_permute_gate_tail_layout(self):
+        """Permute qkv_proj weight rows from [q0|g0|q1|g1|...|K|V] to [Q|K|V|G].
+
+        One-shot weight transform (``transform_weights`` stage) enabling the
+        copy-free gate path in forward. Guarded by ``_weights_transformed`` so it
+        runs once per set of freshly loaded weights; reload orchestrators reset that
+        guard before rebinding new bytes. Engaged for plain weights and per-tensor
+        FP8 QDQ weights with a backend that supports the strided [Q|K|V] view in both
+        context and generation paths. The FP8 weight scale is scalar and does not
+        need to be permuted.
+        """
+        if self._weights_transformed:
             return
-        device = self.qkv_proj.weight.device
-        d = self.head_dim
-        q_gate_rows = torch.arange(2 * self.q_size,
-                                   device=device).view(self.num_heads, 2, d)
-        perm = torch.cat([
-            q_gate_rows[:, 0, :].reshape(-1),  # Q
-            torch.arange(2 * self.kv_size, device=device) +
-            2 * self.q_size,  # K, V
-            q_gate_rows[:, 1, :].reshape(-1),  # gate
-        ])
-        with torch.no_grad():
-            self.qkv_proj.weight.data.copy_(
-                self.qkv_proj.weight.data.index_select(0, perm))
-            if self.qkv_proj.bias is not None:
-                self.qkv_proj.bias.data.copy_(
-                    self.qkv_proj.bias.data.index_select(0, perm))
-        self._gate_tail_layout_active = True
-        logger.info_once("gate-tail [Q|K|V|G] qkv layout engaged",
-                         key="gate_tail_layout_engaged")
+        if self._gate_tail_layout_enabled:
+            if self._gate_tail_layout_supported():
+                device = self.qkv_proj.weight.device
+                d = self.head_dim
+                q_gate_rows = torch.arange(2 * self.q_size, device=device).view(
+                    self.num_heads, 2, d)
+                perm = torch.cat([
+                    q_gate_rows[:, 0, :].reshape(-1),  # Q
+                    torch.arange(2 * self.kv_size, device=device) +
+                    2 * self.q_size,  # K, V
+                    q_gate_rows[:, 1, :].reshape(-1),  # gate
+                ])
+                with torch.no_grad():
+                    self.qkv_proj.weight.data.copy_(
+                        self.qkv_proj.weight.data.index_select(0, perm))
+                    if self.qkv_proj.bias is not None:
+                        self.qkv_proj.bias.data.copy_(
+                            self.qkv_proj.bias.data.index_select(0, perm))
+                logger.info_once("gate-tail [Q|K|V|G] qkv layout engaged",
+                                 key="gate_tail_layout_engaged")
+            else:
+                logger.warning_once(
+                    "Gate-tail QKV layout is not supported for this attention "
+                    "configuration; keeping the interleaved layout.",
+                    key="gate_tail_layout_unsupported")
+        self._weights_transformed = True
+
+    def _refresh_gate_tail_layout_state(self):
+        """Recompute the forward-time gate-tail activation from loaded weights.
+
+        Runs on every load path, including GMS read-only sharing where the weights
+        arrive already permuted and only Python-side derived state must be restored.
+        """
+        active = (self._gate_tail_layout_enabled
+                  and self._gate_tail_layout_supported())
+        if active and not self._weights_transformed:
+            # Weights published by a GMS writer are already in [Q|K|V|G] layout;
+            # mark the transform guard so a later transform_weights() does not
+            # permute them a second time.
+            self._weights_transformed = True
+        self._gate_tail_layout_active = active
 
     def split_qkv(self, q, k=None, v=None):
         if k is None and v is None:
