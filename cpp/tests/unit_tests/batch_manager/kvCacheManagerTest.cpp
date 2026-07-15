@@ -10652,6 +10652,28 @@ private:
     std::filesystem::path mPath;
 };
 
+// Scoped setenv/unsetenv, so a gtest ASSERT early-exit cannot leak the variable into later tests.
+class ScopedEnvVar
+{
+public:
+    ScopedEnvVar(char const* name, char const* value)
+        : mName{name}
+    {
+        setenv(name, value, /*overwrite=*/1);
+    }
+
+    ~ScopedEnvVar()
+    {
+        unsetenv(mName);
+    }
+
+    ScopedEnvVar(ScopedEnvVar const&) = delete;
+    ScopedEnvVar& operator=(ScopedEnvVar const&) = delete;
+
+private:
+    char const* mName;
+};
+
 // Small-pool BlockManager with a disk tier. tokensPerBlock=4; window fits maxBlocksPerSeq.
 std::unique_ptr<BlockManager> makeDiskTierBlockManager(std::shared_ptr<tr::CudaStream> const& stream,
     std::string const& diskPath, bool retainedOnly, SizeType32 blocksInPrimaryPool, SizeType32 blocksInSecondaryPool,
@@ -10773,7 +10795,7 @@ TEST_F(KVCacheManagerTest, DiskTierSpillAllRoundTripTest)
 // lands. Same spill/evict/reuse scenario as DiskTierSpillAllRoundTripTest, only with TLLM_KV_DISK_READERS set.
 TEST_F(KVCacheManagerTest, DiskTierDetachedOnboardReadyTest)
 {
-    setenv("TLLM_KV_DISK_READERS", "4", /*overwrite=*/1);
+    ScopedEnvVar readersEnv{"TLLM_KV_DISK_READERS", "4"};
     auto const stream = std::make_shared<tr::CudaStream>();
     DiskTierDir dir;
     auto blockManagerPtr
@@ -10799,7 +10821,6 @@ TEST_F(KVCacheManagerTest, DiskTierDetachedOnboardReadyTest)
     EXPECT_GE(blockManager.getNumDiskOnboards(), 1u);
 
     releaseDiskTierSequence(blockManager, seqA2);
-    unsetenv("TLLM_KV_DISK_READERS");
 }
 
 // Retained-only mode: unmarked victims are discarded at the gate; marked ones spill.
@@ -11022,7 +11043,7 @@ float diskPatternValue(int slot, int i)
 // TLLM_KV_DISK_ASYNC_STORE is left unset so spills are synchronous and this isolates the read path.
 void runDiskOnboardByteRoundTrip(char const* readers, int nSlots)
 {
-    setenv("TLLM_KV_DISK_READERS", readers, /*overwrite=*/1);
+    ScopedEnvVar readersEnv{"TLLM_KV_DISK_READERS", readers};
     DiskTierDir dir;
     int constexpr blockSize = 2048; // floats per slot
 
@@ -11091,7 +11112,6 @@ void runDiskOnboardByteRoundTrip(char const* readers, int nSlots)
         EXPECT_EQ(bad, 0) << "readers=" << readers << " slot=" << k << ": disk onboard corrupted " << bad << "/"
                           << blockSize << " elements";
     }
-    unsetenv("TLLM_KV_DISK_READERS");
 }
 } // namespace
 
@@ -11119,8 +11139,8 @@ TEST_F(KVCacheManagerTest, DiskTierSyncOnboardByteExactTest)
 // Before the fix the TLLM_CHECK throw escaped the thread entry point and std::terminate'd the process.
 TEST_F(KVCacheManagerTest, DiskTierAsyncWriteFailureContainedTest)
 {
-    setenv("TLLM_KV_DISK_ASYNC_STORE", "1", /*overwrite=*/1);
-    setenv("TLLM_KV_DISK_WRITERS", "1", /*overwrite=*/1);
+    ScopedEnvVar asyncStoreEnv{"TLLM_KV_DISK_ASYNC_STORE", "1"};
+    ScopedEnvVar writersEnv{"TLLM_KV_DISK_WRITERS", "1"};
     DiskTierDir dir;
     int constexpr blockSize = 256;
     auto bufferManager = tr::BufferManager(std::make_shared<tr::CudaStream>());
@@ -11153,9 +11173,6 @@ TEST_F(KVCacheManagerTest, DiskTierAsyncWriteFailureContainedTest)
     auto src2 = std::make_shared<KVCacheBlock>(1, tk::KVCacheIndex(1, /*isSecondary=*/true));
     transferManager.spillToFileUnstaged(src2, /*diskSlot=*/1, {pool}, dir.str(), /*spillId=*/2);
     EXPECT_TRUE(waitForSpill(2)) << "writer stopped processing after a failed job";
-
-    unsetenv("TLLM_KV_DISK_WRITERS");
-    unsetenv("TLLM_KV_DISK_ASYNC_STORE");
 }
 
 // A failed detached onboard read (missing slot file) must not crash the reader thread; the failure surfaces
@@ -11163,7 +11180,7 @@ TEST_F(KVCacheManagerTest, DiskTierAsyncWriteFailureContainedTest)
 // never-filled block. Before the fix the reader's TLLM_CHECK throw std::terminate'd the process.
 TEST_F(KVCacheManagerTest, DiskTierOnboardReadFailureSurfacesTest)
 {
-    setenv("TLLM_KV_DISK_READERS", "2", /*overwrite=*/1);
+    ScopedEnvVar readersEnv{"TLLM_KV_DISK_READERS", "2"};
     auto const stream = std::make_shared<tr::CudaStream>();
     DiskTierDir dir;
     auto blockManagerPtr
@@ -11205,7 +11222,6 @@ TEST_F(KVCacheManagerTest, DiskTierOnboardReadFailureSurfacesTest)
 
     // Teardown stays clean: the sequence releases without touching the never-filled blocks.
     releaseDiskTierSequence(blockManager, seqA2);
-    unsetenv("TLLM_KV_DISK_READERS");
 }
 
 // shutdownDiskWorkers() must stop+join every disk worker while reads are queued (holding raw GPU dst
@@ -11215,9 +11231,9 @@ TEST_F(KVCacheManagerTest, DiskTierOnboardReadFailureSurfacesTest)
 // bug where workers stopped only in the destructor, after releasePools() had already freed the pools.
 TEST_F(KVCacheManagerTest, DiskTierShutdownWithQueuedWorkTest)
 {
-    setenv("TLLM_KV_DISK_READERS", "4", /*overwrite=*/1);
-    setenv("TLLM_KV_DISK_WRITERS", "4", /*overwrite=*/1);
-    setenv("TLLM_KV_DISK_ASYNC_STORE", "1", /*overwrite=*/1);
+    ScopedEnvVar readersEnv{"TLLM_KV_DISK_READERS", "4"};
+    ScopedEnvVar writersEnv{"TLLM_KV_DISK_WRITERS", "4"};
+    ScopedEnvVar asyncStoreEnv{"TLLM_KV_DISK_ASYNC_STORE", "1"};
     DiskTierDir dir;
     int constexpr blockSize = 2048; // floats per slot
     int constexpr nSlots = 8;
@@ -11272,9 +11288,6 @@ TEST_F(KVCacheManagerTest, DiskTierShutdownWithQueuedWorkTest)
     pool.secondaryPtr->release();
 
     // The transfer-manager destructor (at scope end) calls shutdownDiskWorkers() once more -- also a no-op.
-    unsetenv("TLLM_KV_DISK_READERS");
-    unsetenv("TLLM_KV_DISK_WRITERS");
-    unsetenv("TLLM_KV_DISK_ASYNC_STORE");
 }
 
 // The disk write queue must stay bounded by mDiskWriteQueueMax under sustained spill load: with the retained
@@ -11284,9 +11297,9 @@ namespace
 void runWriteQueueBoundedTest(bool unstaged)
 {
     using tensorrt_llm::testing::KVCacheTransferManagerTestAccess;
-    setenv("TLLM_KV_DISK_ASYNC_STORE", "1", /*overwrite=*/1);
-    setenv("TLLM_KV_DISK_WRITERS", "1", /*overwrite=*/1); // one writer drains; the cap must still bound the backlog
-    setenv("TLLM_KV_DISK_WRITE_QUEUE", "4", /*overwrite=*/1);
+    ScopedEnvVar asyncStoreEnv{"TLLM_KV_DISK_ASYNC_STORE", "1"};
+    ScopedEnvVar writersEnv{"TLLM_KV_DISK_WRITERS", "1"}; // one writer drains; the cap must still bound the backlog
+    ScopedEnvVar writeQueueEnv{"TLLM_KV_DISK_WRITE_QUEUE", "4"};
     std::size_t constexpr cap = 4;
     std::size_t constexpr burst = 200; // far more than the cap: the producer must block once the queue is full
 
@@ -11331,10 +11344,6 @@ void runWriteQueueBoundedTest(bool unstaged)
 
     EXPECT_LE(observedMax.load(), cap) << "write queue exceeded its cap -- spills not backpressured";
     EXPECT_GT(observedMax.load(), 0u) << "queue never filled -- the burst did not actually stress the cap";
-
-    unsetenv("TLLM_KV_DISK_WRITE_QUEUE");
-    unsetenv("TLLM_KV_DISK_WRITERS");
-    unsetenv("TLLM_KV_DISK_ASYNC_STORE");
 }
 } // namespace
 

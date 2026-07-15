@@ -238,6 +238,8 @@ private:
     void diskWriterLoop();
     void enqueueDiskWrite(std::string filename, void const* src, std::size_t bytes);
     void enqueueDiskWriteUnstaged(std::string filename, void const* src, std::size_t bytes, std::uint64_t spillId);
+    // Shared lock/wait/push tail of the two enqueue paths (per-slot serialization + bounded-queue backpressure).
+    void enqueueDiskWriteCommon(DiskWriteJob&& job);
     void waitForDiskSlotWrites(std::string const& filename);
 
     // ---- Disk-tier async ONBOARD: read slot files disk->GPU OFF the scheduler thread ----

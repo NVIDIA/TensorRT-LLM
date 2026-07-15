@@ -537,26 +537,7 @@ void KVCacheTransferManager::enqueueDiskWrite(std::string filename, void const* 
     job.bytes = bytes;
     job.staged.resize(bytes);
     std::memcpy(job.staged.data(), src, bytes); // fast host->host copy; frees the slot
-
-    {
-        std::unique_lock<std::mutex> lock(mDiskMutex);
-        // Per-slot serialization + bounded-queue backpressure: a retained spill is never dropped (that gate is
-        // upstream) but still waits here for room, not bypassing the cap, so retained load can't grow RAM unbounded.
-        mDiskQueueCv.wait(lock,
-            [this, &job]
-            {
-                bool const slotClear = mDiskInflight.find(job.filename) == mDiskInflight.end();
-                bool const hasRoom = mDiskWriteQueue.size() < mDiskWriteQueueMax;
-                return (slotClear && hasRoom) || mDiskWriterStop;
-            });
-        if (mDiskWriterStop)
-        {
-            return;
-        }
-        ++mDiskInflight[job.filename]; // mark BEFORE the block becomes loadable
-        mDiskWriteQueue.push(std::move(job));
-    }
-    mDiskQueueCv.notify_one();
+    enqueueDiskWriteCommon(std::move(job));
 }
 
 void KVCacheTransferManager::enqueueDiskWriteUnstaged(
@@ -567,11 +548,15 @@ void KVCacheTransferManager::enqueueDiskWriteUnstaged(
     job.bytes = bytes;
     job.src = src; // no staging: the writer reads the pinned host slot directly
     job.spillId = spillId;
+    enqueueDiskWriteCommon(std::move(job));
+}
 
+void KVCacheTransferManager::enqueueDiskWriteCommon(DiskWriteJob&& job)
+{
     {
         std::unique_lock<std::mutex> lock(mDiskMutex);
-        // Same per-slot serialization + bounded-queue backpressure as enqueueDiskWrite: a retained spill waits
-        // for room too (never dropped, never bypasses the cap), so retained load stays RAM-bounded.
+        // Per-slot serialization + bounded-queue backpressure: a retained spill is never dropped (that gate is
+        // upstream at eviction) but still waits here for room, so retained load can't grow RAM unbounded.
         mDiskQueueCv.wait(lock,
             [this, &job]
             {
