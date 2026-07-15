@@ -1711,7 +1711,9 @@ if [ ! -f "\$fatSqshPath" ]; then
         BUILDER_OUT=\$(sbatch --parsable --job-name="fat_build_\${fatHash}" "${scriptFatBuildSbatchPathNode}" 2>&1)
         BUILDER_RC=\$?
         set -e
-        BUILDER_ID=\$(printf '%s' "\$BUILDER_OUT" | head -1 | cut -d';' -f1)
+        # sbatch may print unrelated WARNINGs to stderr (captured via 2>&1); --parsable's real
+        # output is a line "<jobid>" or "<jobid>;<cluster>". Extract the numeric job id only.
+        BUILDER_ID=\$(printf '%s\\n' "\$BUILDER_OUT" | grep -oE '^[0-9]+' | tail -1)
         if [ "\$BUILDER_RC" -eq 0 ] && [ -n "\$BUILDER_ID" ]; then
             echo "Submitted fat sqsh builder as job \$BUILDER_ID"
             SBATCH_DEPENDENCY="--dependency=afterany:\$BUILDER_ID"
