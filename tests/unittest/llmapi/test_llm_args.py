@@ -209,11 +209,10 @@ class TestEncoderRuntimeSizes:
     """Cover encoder runtime size fields and fallback to LLM limits.
 
     `encoder_max_batch_size` / `encoder_max_num_tokens` are user-facing
-    knobs for multimodal encoder scheduling and AttentionMetadata. An explicit
-    token value is strict; when unset, its base falls back to the LLM-side
-    `max_num_tokens` before model-aware compatibility resolution. They are
-    PyTorch-backend only, so they live on `TorchLlmArgs` rather than the shared
-    `BaseLlmArgs`.
+    knobs for multimodal encoder scheduling and AttentionMetadata. When unset,
+    they fall back to the corresponding LLM-side values before model-aware
+    atomic-item compatibility resolution. They are PyTorch-backend only, so
+    they live on `TorchLlmArgs` rather than the shared `BaseLlmArgs`.
     """
 
     def test_defaults_are_none(self, llm_args_cls):

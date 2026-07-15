@@ -672,6 +672,17 @@ def test_dummy_mm_max_tokens_per_item_is_image_only():
     assert demand["image"] == (1540 // 14) ** 2 == 110**2
 
 
+def test_attention_metadata_capacity_uses_item_and_token_budgets():
+    proc = _make_dummy_processor(spatial_merge_size=2)
+
+    assert proc.get_mm_encoder_attention_metadata_capacity(max_num_items=8, max_num_tokens=100) == {
+        "attention": 8
+    }
+    assert proc.get_mm_encoder_attention_metadata_capacity(
+        max_num_items=100, max_num_tokens=12
+    ) == {"attention": 3}
+
+
 @pytest.mark.parametrize("budget", [1024, 4096, 8192])
 def test_dummy_get_size_for_max_tokens_fits_and_aligns(budget):
     proc = _make_dummy_processor()

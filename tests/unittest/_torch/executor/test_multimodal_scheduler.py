@@ -169,19 +169,15 @@ def test_multimodal_scheduler_preserves_non_multimodal_requests():
     assert output.context_requests == [request]
 
 
-def test_unset_encoder_token_budget_auto_raises_for_atomic_item():
-    assert _resolve_mm_encoder_token_budget(None, 8192, 65536) == 65536
+def test_encoder_token_budget_auto_raises_for_atomic_item():
+    assert _resolve_mm_encoder_token_budget(8192, 65536) == 65536
 
 
-def test_explicit_encoder_token_budget_remains_strict():
-    assert _resolve_mm_encoder_token_budget(8192, 8192, 65536) == 8192
-
-
-def test_explicit_encoder_token_budget_rejects_oversized_item():
+def test_request_rejects_item_above_effective_startup_maximum():
     request = _request(1, [9])
     request.py_multimodal_data["image"] = {"pixel_values": torch.empty(1)}
 
-    with pytest.raises(ValueError, match="exceeding encoder_max_num_tokens=8"):
+    with pytest.raises(ValueError, match="exceeding the effective startup maximum 8"):
         initialize_multimodal_encoder_request(request, max_num_tokens=8)
 
 

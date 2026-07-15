@@ -435,6 +435,12 @@ class Mistral3InputProcessor(BaseMultimodalInputProcessor,
             self._vit_tokens(width=int(width), height=int(height), patch=patch)
             for height, width in image_sizes
         ]
+        min_tokens_per_image = merge * merge
+        if any(token_length < min_tokens_per_image or token_length %
+               min_tokens_per_image for token_length in encoder_token_lengths):
+            raise ValueError(
+                "Processed Mistral image geometry must contain a nonempty "
+                f"multiple of {min_tokens_per_image} encoder tokens")
         item_refs = [("image", item_idx)
                      for item_idx in range(len(encoder_token_lengths))]
         output_embedding_lengths = [
@@ -575,6 +581,17 @@ class Mistral3InputProcessor(BaseMultimodalInputProcessor,
         unit = patch * merge
         edge = max((max_size // unit) * unit, unit)
         return {"image": self._vit_tokens(width=edge, height=edge, patch=patch)}
+
+    def get_mm_encoder_attention_metadata_capacity(
+            self, max_num_items: int,
+            max_num_tokens: int) -> Optional[Dict[str, int]]:
+        """Bound Pixtral contexts by item and physical-token budgets."""
+        _, merge, _, _ = self._vision_geometry()
+        min_tokens_per_image = merge * merge
+        return {
+            "attention":
+            max(1, min(max_num_items, max_num_tokens // min_tokens_per_image))
+        }
 
     def get_dummy_mm_data_for_tokens(
         self,

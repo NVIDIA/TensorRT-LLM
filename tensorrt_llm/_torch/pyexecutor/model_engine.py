@@ -93,12 +93,9 @@ from .scheduler import ScheduledRequests
 from .trace_log_utils import log_mem_snapshot
 
 
-def _resolve_mm_encoder_token_budget(configured_budget: Optional[int],
-                                     base_budget: int,
+def _resolve_mm_encoder_token_budget(base_budget: int,
                                      model_max_atomic_item_tokens: int) -> int:
-    """Resolve the encoder token budget without weakening an explicit limit."""
-    if configured_budget is not None:
-        return base_budget
+    """Keep the model's largest indivisible MM item schedulable."""
     return max(base_budget, model_max_atomic_item_tokens)
 
 
@@ -322,10 +319,9 @@ class PyTorchModelEngine(ModelEngine):
             self.encoder_max_num_items,
             self.encoder_max_num_tokens,
         ) = llm_args.get_encoder_runtime_sizes()
-        # Preserve whether the encoder-specific limit was explicitly set. An
-        # explicit value is a hard user contract; an unset value inherits the
-        # LLM token budget and may be raised later for compatibility with the
-        # model's largest atomic MM item.
+        # Preserve the optional user value separately from its resolved LLM
+        # fallback. Atomic MM items cannot be split, so either base value may
+        # be raised later to keep the model's largest valid item schedulable.
         self.configured_encoder_max_num_tokens = llm_args.encoder_max_num_tokens
         self.encoder_token_budget_base = self.encoder_max_num_tokens
 
@@ -459,6 +455,8 @@ class PyTorchModelEngine(ModelEngine):
             isinstance(self.model, MultimodalModelMixin)
             and self.input_processor.supports_mm_encoder_item_scheduling)
         self.model_max_mm_encoder_item_tokens: Optional[int] = None
+        self.mm_encoder_attention_metadata_capacity: Optional[Dict[str,
+                                                                   int]] = None
         if self.supports_mm_encoder_item_scheduling:
             max_tokens_per_item = self.input_processor.get_mm_max_tokens_per_item(
             )
@@ -473,41 +471,41 @@ class PyTorchModelEngine(ModelEngine):
             model_max_atomic_item_tokens = max(max_tokens_per_item.values())
             self.model_max_mm_encoder_item_tokens = model_max_atomic_item_tokens
             effective_encoder_token_budget = _resolve_mm_encoder_token_budget(
-                self.configured_encoder_max_num_tokens,
-                self.encoder_max_num_tokens,
-                model_max_atomic_item_tokens,
-            )
+                self.encoder_max_num_tokens, model_max_atomic_item_tokens)
             if effective_encoder_token_budget > self.encoder_max_num_tokens:
                 logger.warning_once(
-                    "encoder_max_num_tokens is unset and its resolved LLM "
-                    f"fallback ({self.encoder_max_num_tokens}) is smaller "
-                    "than the model's largest atomic "
+                    f"encoder_max_num_tokens={self.encoder_max_num_tokens} "
+                    "is smaller than the model's largest atomic "
                     f"multimodal item ({model_max_atomic_item_tokens}); "
                     f"using {model_max_atomic_item_tokens} as the "
                     "effective encoder runtime budget.",
                     key="raise_encoder_max_num_tokens_for_atomic_item",
                 )
                 self.encoder_max_num_tokens = effective_encoder_token_budget
-            elif (self.configured_encoder_max_num_tokens is not None and
-                  model_max_atomic_item_tokens > self.encoder_max_num_tokens):
-                logger.info(
-                    "Using explicit encoder_max_num_tokens=%d as a strict "
-                    "runtime limit; multimodal items above this limit will "
-                    "be rejected (model atomic maximum=%d).",
-                    self.encoder_max_num_tokens,
-                    model_max_atomic_item_tokens,
-                )
         self.effective_encoder_max_num_tokens = self.encoder_max_num_tokens
         if self.supports_mm_encoder_item_scheduling:
+            attention_metadata_capacity = (
+                self.input_processor.get_mm_encoder_attention_metadata_capacity(
+                    self.encoder_max_num_items,
+                    self.effective_encoder_max_num_tokens,
+                ))
+            if attention_metadata_capacity is not None:
+                if (not attention_metadata_capacity or any(
+                        value <= 0
+                        for value in attention_metadata_capacity.values())):
+                    raise ValueError(
+                        "get_mm_encoder_attention_metadata_capacity() must "
+                        "return nonempty positive capacities or None")
+                self.mm_encoder_attention_metadata_capacity = (
+                    attention_metadata_capacity)
             logger.info(
                 "Multimodal encoder token budget: configured=%s, base=%d, "
-                "effective=%d, model_atomic_max=%d, policy=%s.",
+                "effective=%d, model_atomic_max=%d, attention_capacity=%s.",
                 self.configured_encoder_max_num_tokens,
                 self.encoder_token_budget_base,
                 self.effective_encoder_max_num_tokens,
                 self.model_max_mm_encoder_item_tokens,
-                ("strict" if self.configured_encoder_max_num_tokens is not None
-                 else "auto"),
+                self.mm_encoder_attention_metadata_capacity,
             )
         self._set_up_multimodal_encoder_attn_metadata()
         if self.llm_args.enable_layerwise_nvtx_marker:
@@ -2661,9 +2659,13 @@ class PyTorchModelEngine(ModelEngine):
         """
         for module in self.model.modules():
             if isinstance(module, MultimodalEncoderMixin):
-                module.setup_attn_metadata(
+                setup_kwargs: Dict[str, Any] = dict(
                     max_num_items=self.encoder_max_num_items,
                     max_num_tokens=self.encoder_max_num_tokens)
+                if self.mm_encoder_attention_metadata_capacity is not None:
+                    setup_kwargs["attention_metadata_capacity"] = (
+                        self.mm_encoder_attention_metadata_capacity)
+                module.setup_attn_metadata(**setup_kwargs)
 
     def _set_up_spec_metadata(
             self,

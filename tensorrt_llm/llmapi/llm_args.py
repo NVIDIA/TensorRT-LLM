@@ -4770,12 +4770,11 @@ class TorchLlmArgs(BaseLlmArgs):
         default=None,
         description=(
             "Maximum number of encoder attention tokens scheduled in one "
-            "multimodal encoder iteration. An explicit value is a strict "
-            "limit, and requests containing a larger atomic item are rejected. "
-            "When unset, the limit falls back to `max_num_tokens` and may be "
-            "raised to the model's largest atomic item for compatibility. This "
-            "budget is shared proportionately across all encoded modalities; "
-            "per-modality knobs may be added later."),
+            "multimodal encoder iteration. It falls back to `max_num_tokens` "
+            "when unset. Because an atomic multimodal item cannot be split, "
+            "the effective budget is raised to the model's largest atomic item "
+            "when necessary. This budget is shared proportionately across all "
+            "encoded modalities; per-modality knobs may be added later."),
         status="prototype")
 
     @field_validator("encoder_max_batch_size", "encoder_max_num_tokens")

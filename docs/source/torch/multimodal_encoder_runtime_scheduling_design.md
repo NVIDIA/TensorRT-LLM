@@ -12,7 +12,7 @@ SPDX-License-Identifier: Apache-2.0
 | Follow-up | [PR #13503: encoder sizing controls](https://github.com/NVIDIA/TensorRT-LLM/pull/13503) |
 | Implementation | [PR #16051](https://github.com/NVIDIA/TensorRT-LLM/pull/16051) |
 | Korean version | [멀티모달 인코더 런타임 스케줄링](multimodal_encoder_runtime_scheduling_design_KR.md) |
-| Last updated | 2026-07-10 |
+| Last updated | 2026-07-15 |
 
 ## Summary
 
@@ -28,9 +28,11 @@ before a connector or merger reduces the representation. This cost is intentiona
 the number of placeholder embeddings inserted into the LLM prompt.
 
 The default admission policy follows the vLLM model: an MM request rejected by LLM capacity does not
-run its encoder independently. An opt-in environment variable enables an experimental eager encoder
-policy for A/B testing. That policy lets an already-admitted request make encoder progress before the
-current iteration's LLM-capacity filtering; it does not pre-encode waiting requests.
+run its encoder independently. The public
+`multimodal_config.enable_eager_encoder_scheduling` argument enables an experimental eager encoder
+policy for A/B testing and defaults to `false`. That policy lets an already-admitted request make
+encoder progress before the current iteration's LLM-capacity filtering; it does not pre-encode waiting
+requests.
 
 This document is implementation-oriented: statements in the present tense describe the current
 branch. Sections explicitly marked as deferred or required testing are not implemented yet. In
@@ -121,9 +123,10 @@ that identity.
 
 ### Configuration semantics
 
-An explicit encoder token budget is a strict user contract. `None` selects a
-compatibility policy that starts from the resolved LLM value and may raise it
-to keep the model's largest valid atomic item schedulable:
+The encoder token budget is a base scheduling value. `None` resolves that base
+from the LLM token budget. Because an atomic MM item cannot be split across
+encoder forwards, either base value is raised when necessary to keep the
+model's largest valid atomic item schedulable:
 
 ```text
 resolved_encoder_max_batch_size =
@@ -133,10 +136,21 @@ base_encoder_token_budget =
     encoder_max_num_tokens if explicitly set else max_num_tokens
 
 effective_encoder_token_budget =
-    base_encoder_token_budget                         # explicit, strict
     max(base_encoder_token_budget,
-        model_max_atomic_item_tokens)                 # unset, compatibility
+        model_max_atomic_item_tokens)
 ```
+
+The four startup configuration cases are therefore:
+
+| User input | Item budget | Token-budget base | Effective token budget |
+| --- | --- | --- | --- |
+| both values set | `encoder_max_batch_size` | `encoder_max_num_tokens` | `max(base, model atomic maximum)` |
+| item value only | `encoder_max_batch_size` | `max_num_tokens` | `max(base, model atomic maximum)` |
+| token value only | `max_batch_size` | `encoder_max_num_tokens` | `max(base, model atomic maximum)` |
+| neither value set | `max_batch_size` | `max_num_tokens` | `max(base, model atomic maximum)` |
+
+These rules resolve only the two public scheduling axes. They do **not** copy either value directly
+into attention's `max_num_requests`; that separate startup conversion is described below.
 
 The item-count budget counts original MM items. It does not count requests, internal attention
 sequences, video frames, temporal units, or physical encoder forwards.
@@ -144,15 +158,17 @@ sequences, video frames, temporal units, or physical encoder forwards.
 The implementation must:
 
 1. retain the optional configured value plus the base and effective values;
-2. log the configured/base/effective values and warn once when compatibility mode raises the value;
+2. log the configured/base/effective values and warn once when atomic-item compatibility raises the
+   value;
 3. use the effective value consistently for scheduling, profiling, attention metadata, and workspace
    sizing; and
 4. not raise `encoder_max_batch_size` except to enforce the existing positive-value validation.
 
-With an explicit token budget, an individual request containing an item above that budget is invalid.
-In compatibility mode, an item above the model's startup-declared maximum is invalid. Input processing
-should normally resize or sample media to remain within model limits. A defensive runtime check fails
-only that request; it must not dynamically resize metadata or abort the server.
+An item above the effective startup maximum is invalid. Since that maximum is at least the model's
+startup-declared maximum atomic item, normal model-valid inputs are not rejected merely because the
+configured base was smaller. Input processing should normally resize or sample media to remain within
+model limits. A defensive runtime check fails only an inconsistent request; it must not dynamically
+resize metadata or abort the server.
 
 ## Scope and model gating
 
@@ -168,8 +184,8 @@ supports_mm_encoder_item_scheduling = (
 ```
 
 The executor installs the MM scheduler only when the combined capability is true. Models outside the
-mixin and processors without complete item metadata continue through the legacy path. There is no
-runtime kill switch and no per-iteration `model.modules()` scan for scheduler gating.
+mixin and processors without complete item metadata continue through the existing full-request path.
+There is no runtime kill switch and no per-iteration `model.modules()` scan for scheduler gating.
 
 The initial implementation requires complete item-level support for:
 
@@ -319,7 +335,7 @@ An item has exactly one of two persistent states:
 | `READY` | tensor | Reusable request-local result |
 
 For readability, `get_multimodal_encoder_progress()` derives request-level
-`MultimodalEncoderProgress.PENDING`, `PARTIAL`, or `READY` from these slots and the legacy full
+`MultimodalEncoderProgress.PENDING`, `PARTIAL`, or `READY` from these slots and the existing full-request
 embedding. It is not a second stored state and does not modify the C++ `LlmRequestState`; MM requests
 remain in `CONTEXT_INIT` so same-iteration encoder-to-LLM execution is preserved.
 
@@ -346,9 +362,8 @@ contract in this order:
 2. Set `supports_mm_encoder_item_scheduling` only when the model inherits `MultimodalModelMixin` and
    the processor explicitly advertises complete item metadata support.
 3. Require a nonempty `get_mm_max_tokens_per_item()` result with positive per-modality values.
-4. Preserve whether `encoder_max_num_tokens` was explicit. Keep an explicit
-   value strict; when it is unset, raise the effective fallback to the largest
-   valid atomic item when necessary.
+4. Preserve the optional configured value and resolved base separately, then raise the effective
+   value to the largest valid atomic item when necessary.
 5. Initialize `MultimodalEncoderMixin` attention metadata and direct encoder profiling with the
    effective budget.
 6. Reject existing asynchronous MM prefetch and install `MultimodalScheduler` for the default coupled
@@ -383,10 +398,10 @@ The current request path is:
    `multimodal_embedding` and raw media tensors are removed. Later chunked-prefill iterations reuse the
    embedding without recharging the encoder budget. Normal request teardown eventually releases it.
 
-The in-budget legacy branch diverges at step 5: no selected-item map is produced, and the existing
-model forward encodes the complete MM payload. Its item slots remain `None`; readiness is instead
-recognized from the completed `multimodal_embedding`. The admission gate explicitly skips that ready
-request, so later chunked-prefill iterations do not ghost-charge its encoder cost.
+The full-request fast path diverges at step 5: no selected-item map is produced, and the existing model
+forward encodes the complete MM payload. Its item slots remain `None`; readiness is instead recognized
+from the completed `multimodal_embedding`. The admission gate explicitly skips that ready request, so
+later chunked-prefill iterations do not ghost-charge its encoder cost.
 
 ### Two distinct budget passes
 
@@ -568,12 +583,6 @@ multimodal_config:
 
 The default is `false`, which selects the coupled policy.
 
-The implementation retains one diagnostic environment variable:
-
-```text
-TLLM_MM_ENCODER_FORWARD_LOG=1  # log Qwen-style grid item/token counts
-```
-
 Eager mode selects encoder items from the existing `active_requests` before LLM capacity
 filtering. It lets an already-admitted request continue encoder progress in an iteration where LLM
 capacity rejects it; it does not create a separate pre-admission collection or increase the active
@@ -611,8 +620,8 @@ re-packs the items.
 
 In pipeline parallel execution, the current implementation executes the selected MM encoder items on
 **every PP rank** after reconstructing the first stage's schedule. The supported Qwen and Mistral MM
-wrappers currently instantiate the encoder on every PP stage, and the legacy full-request MM path also
-duplicates encoder execution across PP stages. Therefore item scheduling preserves the existing PP
+wrappers currently instantiate the encoder on every PP stage, and the existing full-request MM path
+also duplicates encoder execution across PP stages. Therefore item scheduling preserves the existing PP
 ownership behavior rather than introducing first-stage-only encoding and an embedding broadcast. It
 may duplicate encoder compute by the PP degree. MM+PP needs a dedicated integration test before this
 behavior can be considered fully validated or optimized.
@@ -700,6 +709,7 @@ At startup, the model engine scans `model.modules()` once for `MultimodalEncoder
 module.setup_attn_metadata(
     max_num_items=encoder_max_num_items,
     max_num_tokens=effective_encoder_max_num_tokens,
+    attention_metadata_capacity=processor_capacity,
 )
 ```
 
@@ -707,38 +717,62 @@ module.setup_attn_metadata(
 encoder maps the item/token pair to its own attention sequence/window/segment capacity. This is
 necessary because one image may map to one attention sequence while one video item may expand to
 multiple temporal segments, and windowed encoders may create several internal sequences per item.
-`setup_attn_metadata()` obtains that mapping through the model hook:
+The input processor owns the exact resize and grid constraints, so an opted-in processor first maps
+the resolved budgets and its live startup geometry to model-specific capacities:
 
 ```python
-capacities = module.get_encoder_attention_metadata_capacity(
+processor_capacity = input_processor.get_mm_encoder_attention_metadata_capacity(
     max_num_items=encoder_max_num_items,
     max_num_tokens=effective_encoder_max_num_tokens,
 )
 ```
 
-This module scan is initialization-only and is unrelated to per-iteration scheduler gating. For Qwen,
-let `T` be `effective_encoder_max_num_tokens` and let `U = spatial_merge_unit` (the square of the
-spatial merge size). Every Qwen2/2.5 full-attention temporal segment contains at least `U` physical
-tokens; every nonempty window contains an integral positive number of merged cells and therefore at
-least `U` physical tokens. Qwen3 temporal segments have the same minimum. Consequently the exact
-static upper bound used by the implementation is:
+`None` retains the encoder model's conservative
+`get_encoder_attention_metadata_capacity()` fallback. This split is intentional: the model knows what
+an attention "request" means, while the processor knows the media geometry that can reach it. The
+module scan and conversion run once during initialization and are unrelated to per-iteration scheduler
+gating.
+
+For Qwen, let `T` be `effective_encoder_max_num_tokens`, `U = spatial_merge_unit`, and `A_min` be the
+minimum number of post-merge spatial cells in one Qwen2.5 image/video frame under the live startup
+processor. For window attention, let `W/A` be the maximum number of nonempty windows per post-merge
+cell over the startup geometry. Qwen2.5 uses:
 
 ```text
-Qwen2/2.5 full-attention max_num_requests   = max(1, floor(T / U))
-Qwen2/2.5 window-attention max_num_requests = max(1, floor(T / U))
-Qwen3 attention max_num_requests            = max(1, floor(T / U))
+Qwen2.5 full-attention max_num_requests =
+    max(1, floor(T / (U * A_min)))
+
+Qwen2.5 window-attention max_num_requests =
+    max(1, floor(T * max(W / A) / U))
 ```
 
-Pixtral maps each scheduled image item to one nonempty attention context. Each context contains at
-least one physical token, so its bound uses both axes:
+`encoder_max_num_items` is intentionally not a factor in these two Qwen2.5 formulas: one atomic video
+item can contain enough temporal segments to consume the entire token budget. Request processing
+validates the actual Qwen2.5 grids against the same minimum-frame and window-ratio contract. A
+request-local processor override may use a different shape only when the resulting grid remains within
+the startup capacity; otherwise that request fails before scheduler admission instead of overflowing a
+fixed metadata buffer.
+
+Qwen3 differs: its video processor clamps aggregate temporal pixel volume, so a sufficiently long
+video can shrink each temporal segment to one merged cell. Its safe bound therefore remains the hard
+geometry limit:
 
 ```text
-Pixtral attention max_num_requests = max(1, min(encoder_max_num_items, T))
+Qwen3 attention max_num_requests = max(1, floor(T / U))
 ```
 
-Mistral3 uses `PixtralVisionModel` as its vision tower and therefore inherits that mapping. The item
-bound is normally tighter, but the token term preserves the token-to-context capacity contract. These
-runtime-scheduled Qwen and Mistral/Pixtral paths do not consume the legacy 8192 fallback.
+Pixtral maps each scheduled image item to one nonempty attention context. Its processor aligns images
+to a spatial-merge tile, so one context consumes at least `U` physical patches and both budget axes
+apply:
+
+```text
+Pixtral attention max_num_requests =
+    max(1, min(encoder_max_num_items, floor(T / U)))
+```
+
+Mistral3 uses `PixtralVisionModel` as its vision tower and therefore receives this processor-derived
+mapping. Its processed item metadata also validates the nonempty merge-tile invariant. These
+runtime-scheduled Qwen2.5, Qwen3, and Mistral/Pixtral paths do not consume the legacy 8192 fallback.
 
 The base `MultimodalEncoderMixin` retains the legacy minimum only for encoders that have not opted into
 runtime item scheduling or have not supplied a model-specific conversion. Their encoder forward is not
@@ -750,8 +784,8 @@ profiling executes two feasible boundary shapes sequentially: one longest item a
 `encoder_max_num_items` equal shorter items sharing the same aggregate token budget. Inputs from one
 shape are released before the next, and only the final output remains live for the subsequent LLM
 dummy forward. This covers both maximum context length and maximum item/sequence pressure without
-adding two dummy batches together into an impossible peak. In strict mode both shapes stay within the
-explicit budget; in compatibility mode they use the auto-raised effective budget.
+adding two dummy batches together into an impossible peak. Both shapes use the effective budget after
+atomic-item compatibility resolution.
 
 ## Execution ordering
 
@@ -863,12 +897,9 @@ is not a checked-in regression test. The following material gaps remain:
 
 ## Performance and observability
 
-Current observability is intentionally narrow. Startup logs report configured, base, effective, model
-atomic-maximum, and strict/auto policy values; compatibility-mode raises also produce a warning.
-Startup also reports when eager scheduling is enabled. Setting
-`TLLM_MM_ENCODER_FORWARD_LOG=1` logs Qwen-style grid-derived item/token counts at encoder forward time;
-it is a diagnostic for Qwen-like inputs and can report zero for Mistral inputs. The normal scheduler
-does not log each item.
+Current observability is intentionally narrow. Startup logs report configured, base, effective, and
+model atomic-maximum values; atomic-item compatibility raises also produce a warning.
+Startup also reports when eager scheduling is enabled. The normal scheduler does not log each item.
 
 The following desired metrics are not yet implemented as stable counters:
 
@@ -905,9 +936,9 @@ error, and full-request path completion.
 
 1. Qwen2/2.5-VL, Qwen3-VL, and Mistral3/Pixtral processors emit typed physical-cost, output-length,
    and prompt-ordered item-reference metadata.
-2. Startup retains configured, base, and effective token budgets. Explicit configuration is strict;
-   an unset value may auto-raise for the model atomic maximum. The effective value feeds encoder
-   metadata setup and long-item/many-item profiling.
+2. Startup retains configured, base, and effective token budgets. Either an explicit base or the LLM
+   fallback may auto-raise for the model atomic maximum. The effective value feeds encoder metadata
+   setup and long-item/many-item profiling.
 3. Request attachment creates the immutable MM request-kind flag, fixed output slots, and output
    offsets while keeping the request in `CONTEXT_INIT`.
 4. `ScheduledRequests` and `SerializableSchedulerOutput` carry selected item IDs through the existing
@@ -921,8 +952,9 @@ error, and full-request path completion.
    outputs directly into one contiguous request-local buffer without `torch.cat`.
 8. Completed raw encoder payloads are stripped while scheduler metadata and the final embedding are
    retained.
-9. Experimental eager scheduling selects from the existing active set before LLM capacity and
-   is gated by an environment variable that defaults off.
+9. Experimental eager scheduling selects from the existing active set before LLM capacity and is
+   controlled by the public `multimodal_config.enable_eager_encoder_scheduling` argument, which
+   defaults to `false`.
 10. The feature rejects asynchronous MM prefetch, and eager mode rejects attention DP and
     disaggregated serving, rather than silently combining unvalidated paths.
 
@@ -997,7 +1029,7 @@ The following are intentionally not required to land the first runtime-enforceme
 1. What resident-output byte limit and eviction policy should eager mode use? GPU-to-host offload
    is not planned for the current work.
 2. How should MM prefetch and the overlap scheduler coordinate item ownership and execution ordering?
-3. Should a later public configuration replace the experimental environment variable?
+3. What production benchmark threshold should justify enabling the eager policy for a workload?
 4. Is strict FCFS waiting admission preferable after production traces, or should a bounded bypass or
    best-fit policy be added?
 5. Which model families can prove semantically equivalent item-internal chunking?

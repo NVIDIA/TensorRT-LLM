@@ -684,6 +684,22 @@ class BaseMultimodalDummyInputsBuilder(ABC):
         """
         return {}
 
+    def get_mm_encoder_attention_metadata_capacity(
+            self, max_num_items: int,
+            max_num_tokens: int) -> Optional[Dict[str, int]]:
+        """Return a processor-geometry-aware encoder sequence capacity.
+
+        The keys identify model-specific attention metadata objects (for
+        example, Qwen2.5-VL has separate ``full_attention`` and
+        ``window_attention`` entries). ``None`` keeps the encoder model's
+        conservative fallback mapping. Concrete processors should return a
+        positive upper bound derived from the startup item/token budgets and
+        the same geometry constraints used to normalize runtime media.
+
+        The default intentionally ignores both inputs.
+        """
+        return None
+
     def get_preferred_media_io_kwargs(self) -> Dict[str, Dict[str, Any]]:
         """Per-modality media-IO decode defaults for this model.
 
