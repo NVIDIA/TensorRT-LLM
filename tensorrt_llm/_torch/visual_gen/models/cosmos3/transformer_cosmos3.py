@@ -1128,14 +1128,22 @@ class Cosmos3VFMTransformer(BaseDiffusionModel):
                 if not self.sharder.is_active:
                     k_und = k_und[:, :max_real_len]
                     v_und = v_und[:, :max_real_len]
-                hidden_gen = layer(
-                    hidden_gen,
-                    k_und,
-                    v_und,
-                    freqs_gen,
-                    timestep=timestep,
-                    real_text_lens=real_text_lens,
-                )
+                    hidden_gen = layer(
+                        hidden_gen,
+                        k_und,
+                        v_und,
+                        freqs_gen,
+                        timestep=timestep,
+                        real_text_lens=real_text_lens,
+                    )
+                else:
+                    hidden_gen = layer(
+                        hidden_gen,
+                        k_und,
+                        v_und,
+                        freqs_gen,
+                        timestep=timestep,
+                    )
 
         hidden_gen = self.sharder.gather(hidden_gen, dim=1, unpad_to=S_gen)
 
