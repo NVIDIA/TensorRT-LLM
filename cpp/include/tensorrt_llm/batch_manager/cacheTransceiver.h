@@ -329,6 +329,8 @@ private:
     std::unordered_set<LlmRequest::RequestIdType> mCompletedSenderRequestIds;
     std::unordered_set<LlmRequest::RequestIdType> mFailedSenderRequestIds;
     std::unordered_map<LlmRequest::RequestIdType, std::shared_ptr<LlmRequest>> mSenderRequestsAwaitingConsensus;
+    // Diagnostic-only tombstones for requests reported locally before PP consensus commits.
+    std::unordered_set<LlmRequest::RequestIdType> mDiagnosticLocallyReportedSenderRequestIds;
     std::unordered_set<LlmRequest::RequestIdType> mCompletedRequesterRequestIds;
     std::unordered_set<LlmRequest::RequestIdType> mFailedRequesterRequestIds;
     std::unordered_map<LlmRequest::RequestIdType, std::shared_ptr<LlmRequest>> mRequesterRequestsAwaitingConsensus;
@@ -337,6 +339,8 @@ private:
     std::shared_ptr<CacheTransceiverComm> mGroupComm;
     std::shared_ptr<CacheTransceiverComm> mGroupTensorParaComm, mGroupPipeParaComm, mGroupDataComm, mGroupTPInDPComm;
     std::unique_ptr<ContextTransferVoteMailbox> mContextTransferVoteMailbox;
+    bool mDiagnosticEarlyLocalContextCompletion{false};
+    bool mDiagnosticObservedConsensusGap{false};
 
     executor::kv_cache::CommState const* mCommState;
     std::unique_ptr<executor::kv_cache::CacheState> mCacheState;
