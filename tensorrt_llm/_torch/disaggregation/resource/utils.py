@@ -47,15 +47,29 @@ def get_pool_view_global_layer_ids(
     pool_view: PoolView, layer_group: AttentionLayerGroup
 ) -> List[int]:
     """
-    Global layer IDs for the layers that appear in *pool_view*, ordered as in
-    *layer_group.local_layers*.
+    Global layer IDs for the layers that appear in *pool_view*, ordered by their
+    physical offset within the coalesced buffer (ascending).
+
+    The order is derived from the buffer entries' physical offsets rather than
+    from ``layer_group.local_layers`` order on purpose: the KV transfer maps
+    layers positionally (a layer's position in this list times the per-layer
+    slot size gives its byte offset), so the position must reflect the physical
+    slot layout. Deriving it from offsets keeps the transceiver decoupled from
+    the KV-cache manager's layer-grouping order (which is an implementation
+    detail, not an API contract). This mirrors ``get_aggregated_pages``, which
+    likewise sorts buffers by their offset inside the coalesced buffer.
     """
-    local_ids_in_pool = get_unique_layers(pool_view)
-    return [
-        ll.global_layer_id
-        for ll in layer_group.local_layers
-        if ll.local_layer_id in local_ids_in_pool
-    ]
+    local_to_global = {ll.local_layer_id: ll.global_layer_id for ll in layer_group.local_layers}
+    # A layer may contribute several buffer entries (e.g. KEY and VALUE); use the
+    # smallest offset as that layer's position within the slot.
+    min_offset: dict[int, int] = {}
+    for entry in pool_view.buffer_entries:
+        local_layer_id = int(entry["local_layer_id"])
+        offset = int(entry["offset"])
+        if local_layer_id not in min_offset or offset < min_offset[local_layer_id]:
+            min_offset[local_layer_id] = offset
+    ordered_local_ids = sorted(min_offset, key=lambda lid: min_offset[lid])
+    return [local_to_global[lid] for lid in ordered_local_ids]
 
 
 # -------------------------------------------------------------------------

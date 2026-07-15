@@ -450,6 +450,10 @@ def test_KvCacheConfig_declaration():
         kv_cache_event_hash_algo="auto").kv_cache_event_hash_algo == "auto"
     assert KvCacheConfig(kv_cache_event_hash_algo="v1_block_key"
                          ).kv_cache_event_hash_algo == "v1_block_key"
+    assert KvCacheConfig(kv_cache_event_hash_algo="v2_sha256"
+                         ).kv_cache_event_hash_algo == "v2_sha256"
+    assert KvCacheConfig(kv_cache_event_hash_algo="v2_sha256_64"
+                         ).kv_cache_event_hash_algo == "v2_sha256_64"
     assert pybind_config.enable_partial_reuse == True
     assert pybind_config.copy_on_partial_reuse == True
     assert pybind_config.attention_dp_events_gather_period_ms == 10

@@ -258,6 +258,30 @@ The same pattern (`@torch.library.custom_op("trtllm::...")`, `register_fake`, co
 - **DLPack/CUDA Graphs.** When exporting tensors via DLPack, use the stream override that mimics the `CUDAGraphCompatibleWrapper` in `argmax.py` so the capture replays cleanly.  
 - **JIT compile cache.** Always cache compiled kernels by the keys that affect codegen (dtype, last-dim size, hardware variant). `argmax.py` and the `cute_dsl_custom_ops.py` runners are good references.
 
+### 4.5 Pruning autotuner tactics with nvMatmulHeuristics
+
+A CuTe DSL runner that exposes many tactics (tile / cluster / swap / prefetch combinations) can be expensive to autotune, because the AutoTuner JIT-compiles and benchmarks every candidate returned by `get_valid_tactics`. A runner can therefore rank and prune its own candidate list with [nvMatmulHeuristics](https://pypi.org/project/nvidia-matmul-heuristics/) *inside* `get_valid_tactics`, before the tactics ever reach the compile+benchmark loop — all shapes and inputs are already visible at that point, so no extra AutoTuner hook is needed. The pruning is a no-op by default and must degrade gracefully to the full list on any failure, so tuning never loses a valid candidate.
+
+Today this is wired up for the SM100/SM103 (Blackwell B200/B300) NVFP4 dense GEMM: `CuteDSLNVFP4BlackwellRunner.get_valid_tactics` builds the full sweep and then hands it to the private `_rank_prune_tactics` helper. The pruned set is a strict, re-validated subset of the full sweep — it never introduces a tactic the kernel validator rejected — so correctness is unchanged and only autotuner wall-time is affected. On a 4096³ NVFP4 GEMM this cuts a cold autotune from ~120 tactics to ~5 (roughly 7× less wall-time) while keeping the selected kernel within a few percent of the full-sweep best.
+
+The behavior is controlled entirely by environment variables (all read at tune time; the package must be installed, otherwise the path silently falls back to the full sweep):
+
+| Environment variable | Default | Meaning |
+|---|---|---|
+| `TRTLLM_CUTEDSL_NVMMH_ENABLE` | `0` | Master opt-in switch. Set to `1` to enable heuristic tactic pruning. When unset/`0`, or when `nvidia-matmul-heuristics` is not installed, the full tactic sweep runs unchanged. |
+| `TRTLLM_CUTEDSL_NVMMH_FIELDS` | `tile,cluster` | Comma-separated list of the knobs nvMatmulHeuristics drives; any knob not listed is swept by the runner. Recognized tokens: `tile`, `cluster`, `swizzle`, `cta_order`. `tile` and `cluster` are a coupled pair (the 2-SM encoding maps the joint `(cta, cluster)`), so naming either drives both. Accepted aliases: `cta_tile` / `mma_tiler` → `tile`. Unknown tokens are warned once and ignored. **Top-K tile/cluster pruning happens only when `tile`/`cluster` is selected; with scheduler-only fields (`swizzle` and/or `cta_order`) every valid tile/cluster is swept and merely annotated with the model's scheduler knobs.** |
+| `TRTLLM_CUTEDSL_NVMMH_MAX_TACTICS` | `5` | Top-K distinct `(tile, cluster, swap)` keys to keep from the model's ranking (applies only when `tile`/`cluster` is in `FIELDS`). Both `use_prefetch` variants of a kept key are profiled on top (prefetch is not modeled), so the final tactic count can be up to ~2× this. Larger K = closer to the full-sweep best but slower autotune; smaller K = faster autotune with a larger potential perf gap. |
+
+Example (enable pruning, keep the top 8 tile/cluster candidates):
+
+```bash
+export TRTLLM_CUTEDSL_NVMMH_ENABLE=1
+export TRTLLM_CUTEDSL_NVMMH_FIELDS=tile,cluster
+export TRTLLM_CUTEDSL_NVMMH_MAX_TACTICS=8
+```
+
+The adapter and env helpers live in [`tensorrt_llm/_torch/custom_ops/cutedsl_matmul_heuristics.py`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/custom_ops/cutedsl_matmul_heuristics.py); the `get_valid_tactics` / `_rank_prune_tactics` pruning is in [`cute_dsl_custom_ops.py`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/custom_ops/cute_dsl_custom_ops.py).
+
 ---
 
 ## 5. Example walkthrough: `indexer_k_cache_scatter_op`
