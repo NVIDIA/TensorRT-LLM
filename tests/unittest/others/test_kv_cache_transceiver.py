@@ -834,9 +834,9 @@ def hybrid_dtypes(request):
     """
     Returns (kv_dtype, mamba_conv_dtype, mamba_ssm_dtype) based on the parametrized string.
 
-    KV dtype: fp8, bf16
-    Conv dtype: fp8, bf16, fp32
-    SSM dtype: bf16, fp32
+    The C++ transceiver requires the KV and SSM pools to use the same dtype.
+    Conv state may use a different dtype because it is packed within the SSM
+    pool and transferred as raw bytes.
     """
     kv_dtype_str, conv_dtype_str, ssm_dtype_str = request.param
 
@@ -864,23 +864,11 @@ def hybrid_dtypes(request):
     [
         # (kv_dtype, conv_dtype, ssm_dtype)
         ("bf16", "bf16", "bf16"),
-        ("bf16", "bf16", "fp32"),
         ("bf16", "fp32", "bf16"),
-        ("bf16", "fp32", "fp32"),
-        ("fp8", "bf16", "bf16"),
-        ("fp8", "bf16", "fp32"),
-        ("fp8", "fp32", "bf16"),
-        ("fp8", "fp32", "fp32"),
     ],
     ids=[
         "kv_bf16-conv_bf16-ssm_bf16",
-        "kv_bf16-conv_bf16-ssm_fp32",
         "kv_bf16-conv_fp32-ssm_bf16",
-        "kv_bf16-conv_fp32-ssm_fp32",
-        "kv_fp8-conv_bf16-ssm_bf16",
-        "kv_fp8-conv_bf16-ssm_fp32",
-        "kv_fp8-conv_fp32-ssm_bf16",
-        "kv_fp8-conv_fp32-ssm_fp32",
     ],
     indirect=["hybrid_dtypes"],
 )
