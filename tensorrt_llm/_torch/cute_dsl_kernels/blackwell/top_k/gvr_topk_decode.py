@@ -239,8 +239,8 @@ class GvrTopKKernel:
         p1b_cache: Optional[bool] = None,
         fb_fix: bool = True,
         fb_alpha: float = 0.2,
-        enable_p4_rank_scatter: bool = False,
-        enable_p4_rank_scatter_exact: bool = False,
+        enable_p4_rank_scatter: Optional[bool] = None,
+        enable_p4_rank_scatter_exact: Optional[bool] = None,
     ):
         # cluster_size: number of CTAs cooperating per row. 1 = single-CTA
         # path; 2/4 = thread-block cluster with DSMEM aggregation. Capped at
@@ -412,6 +412,14 @@ class GvrTopKKernel:
         # win (~1.078x, HW-invariant). enable_p4_rank_scatter_exact adds ONE
         # fine-histogram recursion on the straddling coarse bin so the result is
         # bit-exact vs torch.topk (adds a few barriers back but still < snap).
+        # Default ON with R0: nsys over the op22 4k-1M BS=1 best/worst envelope
+        # gives geomean ~1.09x (K1024 1.12 / K2048 1.12 / K512 1.05) with NO
+        # cell regressing >2%. Resolves to OFF when enable_r0 is False, so the
+        # base kernel stays byte-identical to upstream.
+        if enable_p4_rank_scatter is None:
+            enable_p4_rank_scatter = bool(enable_r0)
+        if enable_p4_rank_scatter_exact is None:
+            enable_p4_rank_scatter_exact = bool(enable_p4_rank_scatter)
         self.enable_p4_rank_scatter = bool(enable_p4_rank_scatter)
         self.enable_p4_rank_scatter_exact = bool(enable_p4_rank_scatter_exact)
 
