@@ -34,6 +34,7 @@ from tensorrt_llm.llmapi.llm_args import (BaseLlmArgs, CacheTransceiverConfig,
                                           DecodeCudaGraphConfig,
                                           DecodingBaseConfig,
                                           DeepSeekV4SparseAttentionConfig,
+                                          DSparkDecodingConfig,
                                           DynamicBatchConfig,
                                           Eagle3DecodingConfig,
                                           EagleDecodingConfig,
@@ -239,6 +240,60 @@ def test_decoding_type_eagle_warns_on_pytorch_backend(monkeypatch):
     assert any(
         "EAGLE (v1/v2) draft checkpoints are incompatible with Eagle3" in m
         for m in warnings_seen)
+
+
+def test_dspark_block_size_resolved_from_checkpoint(tmp_path):
+    (tmp_path / "config.json").write_text('{"dspark_block_size": 5}')
+    spec_cfg = DSparkDecodingConfig(max_draft_len=5,
+                                    speculative_model=str(tmp_path))
+
+    args = TorchLlmArgs(
+        model="/tmp/dummy_model",
+        skip_tokenizer_init=True,
+        speculative_config=spec_cfg,
+    )
+
+    assert args.speculative_config.block_size == 5
+
+
+def test_dspark_block_size_must_match_max_draft_len(tmp_path):
+    (tmp_path / "config.json").write_text('{"dspark_block_size": 4}')
+    spec_cfg = DSparkDecodingConfig(max_draft_len=5,
+                                    speculative_model=str(tmp_path))
+
+    with pytest.raises(ValueError, match="block_size must equal max_draft_len"):
+        TorchLlmArgs(
+            model="/tmp/dummy_model",
+            skip_tokenizer_init=True,
+            speculative_config=spec_cfg,
+        )
+
+
+def test_dspark_requires_speculative_model():
+    # The DSpark draft weights live in the checkpoint's mtp.* namespace, so an
+    # unset speculative_model must fail fast at config validation instead of
+    # raising an opaque TypeError deep inside engine construction.
+    spec_cfg = DSparkDecodingConfig(max_draft_len=5)
+
+    with pytest.raises(ValueError,
+                       match="requires speculative_config.speculative_model"):
+        TorchLlmArgs(
+            model="/tmp/dummy_model",
+            skip_tokenizer_init=True,
+            speculative_config=spec_cfg,
+        )
+
+
+def test_dspark_requires_positive_max_draft_len(tmp_path):
+    (tmp_path / "config.json").write_text('{"dspark_block_size": 5}')
+    spec_cfg = DSparkDecodingConfig(speculative_model=str(tmp_path))
+
+    with pytest.raises(ValueError, match="max_draft_len must be > 0"):
+        TorchLlmArgs(
+            model="/tmp/dummy_model",
+            skip_tokenizer_init=True,
+            speculative_config=spec_cfg,
+        )
 
 
 def test_post_processor_hook_rejected_with_skip_tokenizer_init():
