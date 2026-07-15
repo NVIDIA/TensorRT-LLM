@@ -325,6 +325,10 @@ class Compressor(nn.Module):
 
     def enable_footer_scale_cache(self) -> None:
         assert not self.is_indexer, "the indexer compressor keeps its native cache layout"
+        assert not self.rotate_activation, (
+            "the footer-scale postprocess does not apply the Hadamard rotation; "
+            "footer-scale mode requires rotate_activation=False"
+        )
         self.footer_scale_cache = True
 
     def _footer_scale_postprocess_scatter(

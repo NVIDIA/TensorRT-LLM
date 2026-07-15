@@ -19,8 +19,8 @@ Quantization: each 128-element tile of the 512-element nope half is scaled by
 stored as FP8 E4M3 with the FP32 scale inline (flashinfer's
 ``kv_scale_format="arbitrary_fp32"`` / GLM mode; DSv3.2 pow2 scales are a
 special case this writer does not produce). The 64-element rope half stays
-bf16. Semantics mirror SGLang's ``quantize_k_cache`` packer byte for byte,
-including the deliberate absence of an epsilon guard on the tile max.
+bf16. Nonzero tiles match SGLang's ``quantize_k_cache`` packer byte for byte;
+zero tiles use scale 1.0 to avoid division by zero.
 
 Sparse indices address tokens as global pool slot ids (``page = slot //
 page_size``, ``offset = slot % page_size``) — the currency
@@ -91,13 +91,13 @@ def _quant_scatter_kernel(
             tl.store(pool_bf16_ptr + rope_out_offsets, rope)
         else:
             # one 128-element nope tile: arbitrary fp32 scale + fp8 values.
-            # Mirrors SGLang's packer exactly: scale = max|x| / FP8_MAX with
-            # no epsilon guard, quantize as x * (1 / scale).
+            # Keep zero tiles finite without changing nonzero quantization.
             tile_range = tl.arange(0, TILE)
             tile_in_offsets = token_id * rows_stride0 + tile_id * TILE + tile_range
             x = tl.load(rows_ptr + tile_in_offsets).to(tl.float32)
 
-            y_s = tl.max(tl.abs(x)) / FP8_MAX
+            max_abs = tl.max(tl.abs(x))
+            y_s = tl.where(max_abs > 0.0, max_abs / FP8_MAX, 1.0)
             y_s_inv = 1.0 / y_s
             x_fp8 = tl.clamp(x * y_s_inv, FP8_MIN, FP8_MAX).to(pool_fp8_ptr.dtype.element_ty)
 

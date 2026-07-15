@@ -157,7 +157,10 @@ def run_flashinfer_sparse_mla(
     elif attention_input_type == AttentionInputType.generation_only:
         start_idx, end_idx = metadata.num_ctx_tokens, metadata.num_tokens
     else:
-        start_idx, end_idx = 0, metadata.num_tokens
+        raise NotImplementedError(
+            "The FlashInfer DSv4 FMHA expects phase-split calls "
+            "(context_only / generation_only), matching the DSv4 model forward structure."
+        )
     num_tokens = end_idx - start_idx
 
     output = forward_args.output
