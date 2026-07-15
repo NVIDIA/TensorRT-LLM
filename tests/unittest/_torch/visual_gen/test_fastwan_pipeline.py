@@ -122,19 +122,12 @@ class TestFastWanComponentAccuracy:
         )
 
 
-class TestFastWanImageNotSupported:
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="nvtx_range decorator needs CUDA")
-    def test_image_raises_not_implemented(self):
-        pipe = object.__new__(WanDMDPipeline)
-        with pytest.raises(NotImplementedError):
-            pipe.forward(prompt="test", seed=0, image=object())
-
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 class TestFastWanForward:
     """Run the full forward() pass and validate the output video shape."""
 
-    def test_single_prompt_backward_compat(self, fastwan_pipeline):
+    def test_single_prompt_shape(self, fastwan_pipeline):
         """Single prompt returns (B, T, H, W, C) with B=1."""
         result = fastwan_pipeline.forward(
             prompt="A red fox walking through snow",

@@ -1,7 +1,7 @@
 {
   "video": "fastwan_lpips_golden_video.mp4",
   "model": "FastVideo/FastWan2.2-TI2V-5B-FullAttn-Diffusers",
-  "source": "SGLang multimodal_gen (trusted reference)",
+  "source": "FastVideo VideoGenerator (trusted reference)",
   "prompt": "A red fox walking through snow",
   "negative_prompt": "",
   "height": 704,
