@@ -262,13 +262,6 @@ class PyTorchModelEngine(ModelEngine):
         _configure_deep_gemm_pdl()
 
         self.forward_pass_callable = None
-        # When True (set by PyExecutor for the overlap scheduler loop),
-        # forward() skips logits post processors and the executor loop
-        # applies them explicitly after the previous iteration's tokens
-        # have been appended to the requests. Applying them inside
-        # forward() would let processors observe a token list that is
-        # one step stale under the overlap scheduler.
-        self.defer_logits_post_processors = False
         self.ub_buffers = None
         if llm_args.encode_only and llm_args.mm_encoder_only:
             raise ValueError(
@@ -5534,8 +5527,7 @@ class PyTorchModelEngine(ModelEngine):
             if self.forward_pass_callable is not None:
                 self.forward_pass_callable()
 
-            if not self.defer_logits_post_processors:
-                self._execute_logit_post_processors(scheduled_requests, outputs)
+            self._execute_logit_post_processors(scheduled_requests, outputs)
 
             return outputs
 

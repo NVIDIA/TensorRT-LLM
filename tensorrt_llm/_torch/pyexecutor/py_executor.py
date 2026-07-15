@@ -860,12 +860,6 @@ class PyExecutor:
                 "TLLM_PP_ASYNC_BROADCAST_SAMPLE_STATE", "1") == "1"
         else:
             self.event_loop = self._executor_loop if self.disable_overlap_scheduler else self._executor_loop_overlap
-            if not self.disable_overlap_scheduler and hasattr(
-                    self.model_engine, "_execute_logit_post_processors"):
-                # _executor_loop_overlap applies logits post processors
-                # explicitly after _update_requests so they observe an
-                # up-to-date token list; see model_engine.forward.
-                self.model_engine.defer_logits_post_processors = True
         if is_trace_enabled("TLLM_TRACE_EXECUTOR_LOOP"):
             self.event_loop = trace_func(self.event_loop)
 
@@ -3880,18 +3874,6 @@ class PyExecutor:
                     guided_decoder_failed_requests = None
                     with self.perf_manager.record_perf_events(
                             None, gpu_sample_end) as sample_timing:
-                        if getattr(self.model_engine,
-                                   "defer_logits_post_processors", False):
-                            # Deferred from model_engine.forward: the
-                            # previous iteration's tokens were appended to
-                            # the requests only in _update_requests above.
-                            # Running the processors earlier would expose a
-                            # one-step-stale token list (e.g. BART forced
-                            # BOS would fire twice). inference_mode matches
-                            # forward, whose logits are inference tensors.
-                            with torch.inference_mode():
-                                self.model_engine._execute_logit_post_processors(
-                                    scheduled_batch, batch_outputs)
                         if self.guided_decoder is not None:
                             # add_batch must be called again to have updated new tokens.
                             self.guided_decoder.add_batch(scheduled_batch)

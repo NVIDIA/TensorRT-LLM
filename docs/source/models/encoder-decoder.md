@@ -26,10 +26,12 @@ is in progress.
 This is the PyTorch LLM path, not the legacy TensorRT encoder-decoder workflow
 under `examples/models/core/enc_dec/`.
 
-mBART architecture loading is available. The PyTorch backend applies the
-checkpoint's forced BOS and EOS tokens from `generation_config.json`. Source-
-and target-language selection remains checkpoint-specific, so validate the
-configured language tokens before deployment.
+mBART architecture loading is available. When a BART or mBART checkpoint
+defines `forced_bos_token_id`, the PyTorch backend seeds that token in the
+decoder prefix. Source- and target-language selection remains
+checkpoint-specific, so validate the configured language tokens before
+deployment. Refer to [Understand BART and mBART decoder tokens](#understand-bart-and-mbart-decoder-tokens)
+for BOS, EOS, and output-limit behavior.
 
 ## Feature support
 
@@ -172,8 +174,39 @@ with LLM(
 
 For this many-to-one checkpoint, `generation_config.json` selects English with
 the `en_XX` forced BOS token. For other mBART checkpoints, confirm that
-`decoder_start_token_id`, `forced_bos_token_id`, and the tokenizer language
-settings select the source and target languages you intend to serve.
+`decoder_start_token_id`, `forced_bos_token_id`, `eos_token_id`, and the
+tokenizer language settings select the source and target languages you intend
+to serve.
+
+### Understand BART and mBART decoder tokens
+
+When a BART or mBART checkpoint defines `forced_bos_token_id`, the PyTorch
+backend initializes the decoder with the following internal prefix:
+
+```text
+[decoder_start_token_id, forced_bos_token_id]
+```
+
+For example, BART-large-CNN uses `[2, 0]`. Customers provide only the encoder
+input; do not prepend either decoder token. By default, the returned token IDs
+exclude `decoder_start_token_id` but include `forced_bos_token_id`, so the
+BART-large-CNN output begins with token ID 0.
+
+The forced BOS token counts against `SamplingParams.max_tokens`. Consequently,
+a request using this prefix requires `max_tokens` to be at least 2. The runtime
+uses the remaining token budget for model-selected tokens. This behavior is the
+same for greedy decoding and beam search and does not require a customer logits
+processor.
+
+EOS is a stopping token rather than a forced final token. The runtime uses
+`SamplingParams.end_id`, which defaults to the tokenizer's `eos_token_id`. If
+the model generates EOS before the output limit, the returned token IDs include
+EOS and `finish_reason` is `"stop"`. Set `ignore_eos=True` to continue decoding
+past EOS.
+
+The runtime does not inject `forced_eos_token_id` when a sequence reaches
+`max_tokens`. It preserves the model-selected final token and reports
+`finish_reason="length"`.
 
 ## Run a batch
 
@@ -458,10 +491,32 @@ Use these guidelines as a starting point:
 
 The following benchmarks compare the PyTorch backend with the legacy TensorRT
 encoder-decoder path for large-batch inference. The measurements use BF16 on
-one H100 96 GB GPU with greedy decoding, natural EOS, an output limit of 128
-tokens, and mixed encoder input lengths from 260 to 440 tokens. Each result is
-the average of ten timed runs after three warmup runs. Executed-token throughput
-includes the terminal EOS token for both paths.
+one H100 80 GB GPU with greedy decoding, an output limit of 128 tokens, and
+mixed encoder input lengths from 260 to 440 tokens. The Flan-T5-XL results are
+the average of ten timed runs after three warmup runs. The BART results are the
+average of 20 timed runs after five warmup runs. Executed-token throughput
+includes the terminal EOS token when a sequence emits it.
+
+The PyTorch configuration uses the `TRTLLM` attention backend, the overlap
+scheduler, the Python scheduler, decoder CUDA graphs with padding, KV cache
+manager V1, `max_input_len=512`, `max_seq_len=1024`, and
+`max_num_tokens=65536`. Block reuse and chunked prefill are disabled. The KV
+cache uses `free_gpu_memory_fraction=0.3` and
+`cross_kv_cache_fraction=0.5`.
+
+The legacy TensorRT configuration uses separate BF16 encoder and decoder
+engines built for batch size 128 and beam width 1. The encoder supports 512
+input tokens and 65,536 tokens per iteration; the decoder supports a sequence
+length of 129. The benchmark runs these engines through `ModelRunnerCpp` with
+greedy `top_k=1` decoding and the same KV cache fractions. For BART, the legacy
+TensorRT benchmark starts the decoder with token IDs `[2, 0]` and generates at
+most 127 more tokens. The PyTorch LLM API applies the same decoder prefix
+internally and counts token ID 0 as the first output token; customers do not
+need to provide the decoder prefix. Both paths use token ID 2 as EOS and stop
+when the model generates it naturally. If a sequence reaches the output limit,
+it retains the model-selected final token and reports a length stop instead of
+forcing EOS. This setup also lets beam search begin after the shared decoder
+prefix without a per-step Python logits processor.
 
 ### Flan-T5-XL
 
@@ -477,14 +532,14 @@ the tested batch sizes.
 
 ### BART-large-CNN
 
-For BART-large-CNN, the PyTorch backend still has a performance gap compared
-with the legacy TensorRT path. Work to close this gap is in progress.
+For BART-large-CNN, the PyTorch backend has 21.9% to 36.0% higher latency than
+the legacy TensorRT path across the tested batch sizes.
 
 | Batch size | Legacy TensorRT latency | PyTorch latency | PyTorch latency difference | Legacy TensorRT executed tokens/s | PyTorch executed tokens/s |
 | ---: | ---: | ---: | ---: | ---: | ---: |
-| 32 | 221.3 ms | 370.6 ms | 67.5% slower | 13,102 | 8,071 |
-| 64 | 240.2 ms | 507.6 ms | 111.4% slower | 23,110 | 11,037 |
-| 128 | 309.6 ms | 788.3 ms | 154.6% slower | 35,894 | 14,213 |
+| 32 | 229.9 ms | 280.2 ms | 21.9% slower | 12,611 | 10,662 |
+| 64 | 252.2 ms | 343.0 ms | 36.0% slower | 22,007 | 16,209 |
+| 128 | 352.3 ms | 472.7 ms | 34.2% slower | 31,544 | 23,518 |
 
 Performance depends on the model, request distribution, decoding settings, and
 GPU configuration. Benchmark with a representative workload before deployment.
@@ -528,5 +583,5 @@ encoder-decoder models.
 
 Confirm that the source uses the task prefix and language settings expected by
 the checkpoint. Also compare the same model dtype, beam width, length penalty,
-EOS handling, and forced BOS/EOS token configuration. Small numerical
+EOS stopping behavior, and forced BOS configuration. Small numerical
 differences can change lower-ranked beam hypotheses when scores are close.

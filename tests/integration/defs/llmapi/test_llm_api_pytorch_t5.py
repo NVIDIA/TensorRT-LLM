@@ -405,8 +405,7 @@ _TEST_CASES = [
         feature_id="bf16-kv-v2-cuda-graph-off-greedy",
     ),
     # Overlap-scheduler cases: outputs must be identical to the non-overlap
-    # runs above; this covers the deferred logits post-processors which would
-    # otherwise observe a one-step-stale token list.
+    # runs above.
     _test_case(
         model_name="t5-small",
         torch_dtype="bfloat16",

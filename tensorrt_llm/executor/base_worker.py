@@ -464,6 +464,10 @@ class BaseWorker(GenerationExecutor):
                                llm_args: Optional[BaseLlmArgs] = None) -> int:
             # deduce max_tokens when it's not set by user
             max_tokens = request.sampling_params.max_tokens
+            output_prefix_len = len(
+                request.sampling_params._decoder_output_token_prefix)
+            if max_tokens is not None:
+                max_tokens -= output_prefix_len
             query_token_len = len(
                 request.query_token_ids) if request.query_token_ids else 0
 

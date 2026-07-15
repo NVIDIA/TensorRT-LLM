@@ -52,10 +52,10 @@ _MAX_KV_TOKENS = 384
 _MIN_GPU_MEMORY_MB = 16_000
 _FREE_GPU_MEMORY_FRACTION = 0.2
 _CROSS_KV_CACHE_FRACTION = 0.5
-# "The update improves batching, lowers latency"
-_EXPECTED_GREEDY_OUTPUT_TOKEN_IDS = [0, 133, 2935, 15296, 14398, 154, 6, 32222, 35940, 2]
+# "The update improves batching, lowers latency,"
+_EXPECTED_GREEDY_OUTPUT_TOKEN_IDS = [0, 133, 2935, 15296, 14398, 154, 6, 32222, 35940, 6]
 _MBART_EXPECTED_GREEDY_OUTPUT_TOKEN_IDS = [
-    # "The UN chief says there is no military"
+    # "The UN chief says there is no military solution"
     250004,
     581,
     8274,
@@ -65,21 +65,21 @@ _MBART_EXPECTED_GREEDY_OUTPUT_TOKEN_IDS = [
     83,
     110,
     116338,
-    2,
+    29806,
 ]
 _EXPECTED_BEAM_OUTPUT_TOKEN_IDS_BY_BEAMS = {
     2: [
+        # "The update improves batching, lowers latency,"
+        [0, 133, 2935, 15296, 14398, 154, 6, 32222, 35940, 6],
         # "The update improves batching, lowers latency"
-        [0, 133, 2935, 15296, 14398, 154, 6, 32222, 35940, 2],
-        # "The update improves batching, lowers"
-        [0, 0, 133, 2935, 15296, 14398, 154, 6, 32222, 2],
+        [0, 0, 133, 2935, 15296, 14398, 154, 6, 32222, 35940],
     ],
 }
 _MIXED_ENCODER_EXPECTED_TOKEN_IDS_BY_REQUEST = [
-    # "The update improves batching, lowers latency"
-    [[0, 133, 2935, 15296, 14398, 154, 6, 32222, 35940, 2]],
-    # "The company opened a training center on Monday"
-    [[0, 133, 138, 1357, 10, 1058, 1312, 15, 302, 2]],
+    # "The update improves batching, lowers latency,"
+    [[0, 133, 2935, 15296, 14398, 154, 6, 32222, 35940, 6]],
+    # "The company opened a training center on Monday."
+    [[0, 133, 138, 1357, 10, 1058, 1312, 15, 302, 4]],
 ]
 
 
@@ -189,8 +189,7 @@ _TEST_CASES = [
         feature_id="bf16-kv-v2-cuda-graph-on-greedy",
     ),
     # Overlap-scheduler cases: outputs must be identical to the non-overlap
-    # runs above; this covers the deferred logits post-processors (forced
-    # BOS/EOS) which would otherwise observe a one-step-stale token list.
+    # runs above.
     _test_case(
         torch_dtype="bfloat16",
         use_kv_cache_manager_v2=False,
@@ -614,7 +613,7 @@ def test_mbart_pytorch_generate_encoder_decoder_end_to_end(
 
         token_ids = token_ids_by_output[0]
         assert token_ids[0] == tokenizer.lang_code_to_id[_MBART_TARGET_LANG]
-        assert token_ids[-1] == tokenizer.eos_token_id
+        assert response.outputs[0].finish_reason == "length"
         _assert_expected_generation(
             tokenizer,
             token_ids_by_output,
