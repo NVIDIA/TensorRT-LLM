@@ -183,7 +183,9 @@ class TestRetryableErrors:
 class TestNetworkExceptions:
     @patch("open_search_db.requests.get")
     def test_connection_error_retries_then_none(self, mock_get):
-        mock_get.side_effect = ConnectionError("Connection refused")
+        import requests as req
+
+        mock_get.side_effect = req.exceptions.ConnectionError("Connection refused")
         result = OpenSearchDB.queryFromOpenSearchDB("{}", VALID_PROJECT)
         assert result is None
         assert mock_get.call_count == DEFAULT_RETRY_COUNT
@@ -244,8 +246,11 @@ class TestLogging:
 
     @patch("open_search_db.requests.get")
     def test_network_exception_logs_tag_and_type(self, mock_get, caplog):
-        mock_get.side_effect = ConnectionError("refused")
         import logging
+
+        import requests as req
+
+        mock_get.side_effect = req.exceptions.ConnectionError("refused")
 
         with caplog.at_level(logging.INFO):
             OpenSearchDB.queryFromOpenSearchDB("{}", VALID_PROJECT)
@@ -277,10 +282,12 @@ class TestLogging:
 
         with caplog.at_level(logging.INFO):
             OpenSearchDB.queryFromOpenSearchDB("{}", VALID_PROJECT)
-        for line in caplog.text.splitlines():
-            if f"{_TAG}[ERROR]" in line:
-                assert "\n" not in line
-                assert " | " in line
+        error_records = [r for r in caplog.records if f"{_TAG}[ERROR]" in r.getMessage()]
+        assert len(error_records) >= 1, f"Expected at least one {_TAG}[ERROR] log record"
+        for record in error_records:
+            msg = record.getMessage()
+            assert "\n" not in msg, "Log message should not contain raw newlines"
+            assert " | " in msg, "Newlines in error text should be replaced with ' | '"
 
     @patch("open_search_db.requests.get")
     def test_transient_retry_logs_warn_level(self, mock_get, caplog):
@@ -333,12 +340,12 @@ class TestEdgeCases:
         assert "x" * 10000 not in caplog.text
 
     @patch("open_search_db.requests.get")
-    def test_unknown_status_code_retries(self, mock_get):
-        """Unclassified status codes (e.g. 418) are treated as retryable."""
+    def test_unknown_4xx_status_code_non_retryable(self, mock_get):
+        """Any 4xx (except 429) is treated as a client error and fails immediately."""
         mock_get.return_value = MockResponse(418, text="I'm a teapot")
         result = OpenSearchDB.queryFromOpenSearchDB("{}", VALID_PROJECT)
         assert result is None
-        assert mock_get.call_count == DEFAULT_RETRY_COUNT
+        assert mock_get.call_count == 1  # no retry for client errors
 
     @patch("open_search_db.requests.get")
     def test_202_returns_response(self, mock_get):
