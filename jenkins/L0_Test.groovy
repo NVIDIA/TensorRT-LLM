@@ -5439,8 +5439,8 @@ def launchTestJobs(pipeline, testFilter)
 
     // CBTS Layer 2: replace `parallelJobsFiltered` with affected stages plus
     // PackageSanityCheck (kept iff sanity_required) and PerfSanity (kept iff
-    // perfsanity_required). Pure -Perf- stages always excluded (own trigger
-    // model, full-list benchmarks). Post-Merge stages are never force-kept;
+    // perfsanity_required). Pure -Perf- stages run only when CBTS selects them
+    // (present in affected_stages). Post-Merge stages are never force-kept;
     // they only run when explicitly listed in affected_stages.
     def cbts = testFilter[(CBTS_RESULT)]
     if (cbts != null) {
@@ -5450,7 +5450,6 @@ def launchTestJobs(pipeline, testFilter)
         def needsSanity = cbts.sanity_required
         def needsPerfSanity = cbts.perfsanity_required
         parallelJobsFiltered = parallelJobs.findAll { key, _ ->
-            if (key =~ /-Perf-/) return false
             if (key =~ /Post-Merge/) return affectedSet.contains(key)
             return affectedSet.contains(key) ||
                    (needsSanity && key =~ /PackageSanityCheck/) ||
