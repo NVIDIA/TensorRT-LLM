@@ -250,6 +250,12 @@ class OpenSearchDB:
         _T = OpenSearchDB._LOG_TAG
         _S = OpenSearchDB._sanitize_log
         use_poc_db = "sandbox" in project
+
+        if DISABLE_OPEN_SEARCH_DB_FOR_LOCAL_TEST:
+            OpenSearchDB.logger.info(f"{_T}[INFO](op=post, db={project}) "
+                                     f"disabled for local test, skipping")
+            return True
+
         if not OPEN_SEARCH_DB_BASE_URL:
             OpenSearchDB.logger.error(
                 f"{_T}[ERROR](op=post, cat=config, db={project}) "
@@ -274,12 +280,13 @@ class OpenSearchDB:
                 f"data type check failed")
             return False
 
-        json_data_dump = json.dumps(json_data)
-
-        if DISABLE_OPEN_SEARCH_DB_FOR_LOCAL_TEST:
-            OpenSearchDB.logger.info(f"{_T}[INFO](op=post, db={project}) "
-                                     f"disabled for local test, skipping")
-            return True
+        try:
+            json_data_dump = json.dumps(json_data)
+        except (TypeError, ValueError) as e:
+            OpenSearchDB.logger.error(
+                f"{_T}[ERROR](op=post, cat=serialize, db={project}) "
+                f"{_S(str(e))}")
+            return False
 
         url = f"{OPEN_SEARCH_DB_BASE_URL}/dataflow2/{project}/posting"
         headers = {
@@ -300,6 +307,13 @@ class OpenSearchDB:
                     return True
 
                 last_error = _S(f"HTTP {status_code}: {last_text[:200]}")
+
+                if OpenSearchDB._is_non_retryable(status_code):
+                    OpenSearchDB.logger.error(
+                        f"{_T}[ERROR](op=post, cat=non_retryable, status={status_code}, db={project}) "
+                        f"url: {url}, error: {last_error}")
+                    return False
+
                 OpenSearchDB.logger.warning(
                     f"{_T}[WARN](op=post, cat=transient, status={status_code}, db={project}, attempt={attempt}/{DEFAULT_RETRY_COUNT}) "
                     f"will retry")
@@ -321,11 +335,17 @@ class OpenSearchDB:
     # HTTP status codes where retry makes sense (transient server/network issues)
     _RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 
-    # HTTP status codes that indicate a client error — retry will not help
+    # Any 4xx except 429 is a client error — the request itself is wrong, retry won't help.
+    # Use _is_non_retryable() rather than checking this set directly.
     _NON_RETRYABLE_STATUS_CODES = {400, 401, 403, 404, 405, 413, 414}
 
     @staticmethod
-    def queryFromOpenSearchDB(json_data, project) -> dict:
+    def _is_non_retryable(status_code: int) -> bool:
+        """Return True for 4xx client errors (except 429 Too Many Requests)."""
+        return 400 <= status_code < 500 and status_code != 429
+
+    @staticmethod
+    def queryFromOpenSearchDB(json_data, project):
         """
         Query data from OpenSearchDB.
 
@@ -334,6 +354,12 @@ class OpenSearchDB:
         :return: requests.Response on success, None on failure.
                  This function never raises exceptions.
         """
+        if requests is None:
+            OpenSearchDB.logger.error(
+                f"{OpenSearchDB._LOG_TAG}[ERROR](op=query, cat=config, db={project}) "
+                f"requests package is not available")
+            return None
+
         _T = OpenSearchDB._LOG_TAG
         _S = OpenSearchDB._sanitize_log
         use_poc_db = "sandbox" in project
@@ -376,7 +402,7 @@ class OpenSearchDB:
                 last_error = _S(f"HTTP {res.status_code}: {res.text[:200]}")
 
                 # Client errors (4xx except 429) — input is wrong, retry won't help
-                if res.status_code in OpenSearchDB._NON_RETRYABLE_STATUS_CODES:
+                if OpenSearchDB._is_non_retryable(res.status_code):
                     OpenSearchDB.logger.error(
                         f"{_T}[ERROR](op=query, cat=non_retryable, status={res.status_code}, db={project}) "
                         f"url: {url}, error: {last_error}")
@@ -386,7 +412,7 @@ class OpenSearchDB:
                 OpenSearchDB.logger.warning(
                     f"{_T}[WARN](op=query, cat=transient, status={res.status_code}, db={project}, attempt={attempt}/{DEFAULT_RETRY_COUNT}) "
                     f"will retry")
-            except Exception as e:
+            except requests.exceptions.RequestException as e:
                 last_error = _S(f"{type(e).__name__}: {e}")
                 OpenSearchDB.logger.warning(
                     f"{_T}[WARN](op=query, cat=network, db={project}, attempt={attempt}/{DEFAULT_RETRY_COUNT}) "
