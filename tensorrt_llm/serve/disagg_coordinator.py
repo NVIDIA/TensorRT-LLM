@@ -59,7 +59,12 @@ from tensorrt_llm.serve.cluster_storage import (
 from tensorrt_llm.serve.disagg_auto_scaling import DisaggClusterManager, WorkerInfo
 from tensorrt_llm.serve.metadata_server import create_metadata_server
 from tensorrt_llm.serve.openai_client import OpenAIClient
-from tensorrt_llm.serve.router import CoordinatorDelegatingRouter, Router, build_disagg_routers
+from tensorrt_llm.serve.router import (
+    CoordinatorDelegatingRouter,
+    KvCacheAwareRouter,
+    Router,
+    build_disagg_routers,
+)
 
 __all__ = [
     "DisaggCoordinator",
@@ -258,11 +263,14 @@ class DisaggCoordinatorService(DisaggCoordinator):
 
     async def cluster_info(self) -> Dict[str, Any]:
         info = {"is_ready": await self.is_ready()}
-        # Expose block-hash granularity so a delegating client (which doesn't
-        # monitor servers) hashes with the same tokens_per_block as the workers.
-        tpb = getattr(self._ctx_router, "_tokens_per_block", None)
-        if tpb is not None:
-            info["tokens_per_block"] = tpb
+        routing_key_configs = {}
+        for role, router in (("context", self._ctx_router), ("generation", self._gen_router)):
+            if isinstance(router, KvCacheAwareRouter):
+                config = router.routing_key_config()
+                if config is not None:
+                    routing_key_configs[role] = config
+        if routing_key_configs:
+            info["routing_key_configs"] = routing_key_configs
         if self._disagg_cluster_manager:
             info.update(await self._disagg_cluster_manager.cluster_info())
         return info
@@ -438,19 +446,7 @@ class CoordinatorClient(DisaggCoordinator):
         # Fail fast: probe /cluster_info with bounded retry so a delegating server
         # exits non-zero if its coordinator never comes up (vs 500-ing every req).
         info = await self._await_coordinator()
-        # Adopt the coordinator's tokens_per_block so the client's block hashes
-        # line up with the workers (a delegating client can't learn it itself).
-        tpb = info.get("tokens_per_block")
-        if tpb is not None:
-            for router in (self._ctx_router, self._gen_router):
-                local = getattr(router, "_local", router)
-                if getattr(local, "_tokens_per_block", None) != tpb:
-                    local._tokens_per_block = tpb
-                    local._tpb_auto = False
-                    logger.info(
-                        f"CoordinatorClient: adopted coordinator "
-                        f"tokens_per_block={tpb} for {getattr(local, '_namespace', '?')}"
-                    )
+        self._sync_delegating_router_configs(info)
 
     async def _await_coordinator(self) -> Dict[str, Any]:
         """Poll the coordinator's /cluster_info until reachable, or raise.
@@ -504,11 +500,20 @@ class CoordinatorClient(DisaggCoordinator):
                 if resp.status != 200:
                     return False
             info = await self.cluster_info()
+            self._sync_delegating_router_configs(info)
             await self._sync_stateless_routers(info)
             return info.get("is_ready", False)
         except Exception as e:  # noqa: BLE001
             logger.warning(f"CoordinatorClient health check failed: {e}")
             return False
+
+    def _sync_delegating_router_configs(self, info: Dict[str, Any]) -> None:
+        configs = info.get("routing_key_configs", {})
+        for role, router in (("context", self._ctx_router), ("generation", self._gen_router)):
+            config = configs.get(role)
+            local = getattr(router, "_local", None)
+            if config is not None and isinstance(local, KvCacheAwareRouter):
+                local.set_routing_key_config(config)
 
     async def _sync_stateless_routers(self, info: Dict[str, Any]) -> None:
         current_workers = info.get("current_workers")

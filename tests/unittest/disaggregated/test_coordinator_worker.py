@@ -48,7 +48,17 @@ from tensorrt_llm.llmapi.disagg_utils import (
 )
 from tensorrt_llm.serve.coordinator_server import CoordinatorServer
 from tensorrt_llm.serve.disagg_coordinator import CoordinatorClient, DisaggCoordinatorService
-from tensorrt_llm.serve.openai_protocol import CompletionRequest, DisaggregatedParams
+from tensorrt_llm.serve.openai_protocol import (
+    ChatCompletionRequest,
+    CompletionRequest,
+    DisaggregatedParams,
+)
+from tensorrt_llm.serve.router import (
+    KV_CACHE_HASH_ALGO_V1,
+    KV_CACHE_HASH_ALGO_V2,
+    CoordinatorDelegatingRouter,
+    KvCacheAwareRouter,
+)
 from tensorrt_llm.serve.router_utils import BlockHashMixin as SharedBlockHashMixin
 
 
@@ -186,6 +196,75 @@ def test_coordinator_rejects_unknown_role():
 
     with pytest.raises(ValueError, match="Unsupported coordinator role"):
         coordinator._router_for_role("typo")
+
+
+def test_kv_router_rejects_mixed_prepared_hash_algorithms():
+    router = KvCacheAwareRouter(server_role=ServerRole.CONTEXT, servers=["server-a", "server-b"])
+    router._prepared_ready_servers.update(router.servers)
+    router._server_state["server-a"].set_hash_algo(KV_CACHE_HASH_ALGO_V1)
+    router._server_state["server-b"].set_hash_algo(KV_CACHE_HASH_ALGO_V2)
+
+    with pytest.raises(RuntimeError, match="one hash algorithm per role"):
+        router.routing_key_config()
+
+
+@pytest.mark.asyncio
+async def test_coordinator_exposes_role_hash_algorithm():
+    ctx_server = "127.0.0.1:1234"
+    gen_server = "127.0.0.1:1235"
+    config = _make_config([ctx_server], [gen_server], "kv_cache_aware", "kv_cache_aware")
+    coordinator = DisaggCoordinatorService(config, _client_factory)
+    ctx_router = coordinator.ctx_router
+    gen_router = coordinator.gen_router
+    assert isinstance(ctx_router, KvCacheAwareRouter)
+    assert isinstance(gen_router, KvCacheAwareRouter)
+    ctx_router._prepared_ready_servers.add(ctx_server)
+    gen_router._prepared_ready_servers.add(gen_server)
+    ctx_router._server_state[ctx_server].set_hash_algo(KV_CACHE_HASH_ALGO_V2)
+    gen_router._server_state[gen_server].set_hash_algo(KV_CACHE_HASH_ALGO_V1)
+
+    info = await coordinator.cluster_info()
+
+    assert info["routing_key_configs"]["context"] == {
+        "tokens_per_block": 32,
+        "kv_cache_hash_algo": KV_CACHE_HASH_ALGO_V2,
+    }
+    assert info["routing_key_configs"]["generation"] == {
+        "tokens_per_block": 32,
+        "kv_cache_hash_algo": KV_CACHE_HASH_ALGO_V1,
+    }
+
+
+def test_coordinator_client_configures_empty_delegating_kv_router():
+    config = _make_config([], [], "kv_cache_aware", "round_robin")
+    client = CoordinatorClient("http://coordinator", config)
+    assert isinstance(client.ctx_router, CoordinatorDelegatingRouter)
+    local = client.ctx_router._local
+    assert isinstance(local, KvCacheAwareRouter)
+    assert local.servers == []
+
+    client._sync_delegating_router_configs(
+        {
+            "routing_key_configs": {
+                "context": {
+                    "tokens_per_block": 64,
+                    "kv_cache_hash_algo": KV_CACHE_HASH_ALGO_V2,
+                }
+            }
+        }
+    )
+
+    request = CompletionRequest(model="m", prompt=[1, 2, 3])
+    routing_key = local.routing_key(request)
+    assert local.servers == []
+    assert local._tokens_per_block == 64
+    assert set(routing_key["block_hashes_by_algo"]) == {KV_CACHE_HASH_ALGO_V2}
+
+
+def test_content_affinity_key_uses_fixed_seed():
+    request = ChatCompletionRequest(model="m", messages=[{"role": "user", "content": "hello"}])
+
+    assert KvCacheAwareRouter._content_affinity_key(request) == 7306401829117098140
 
 
 def test_prefix_token_cache_retokenizes_extended_text():

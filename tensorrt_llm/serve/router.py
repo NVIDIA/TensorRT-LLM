@@ -20,6 +20,7 @@ from typing import Awaitable, Callable, Dict, Iterable, List, Optional
 
 import aiohttp
 import msgpack
+from blake3 import blake3
 
 from tensorrt_llm.llmapi.disagg_utils import (MetadataServerConfig,
                                               RouterConfig, ServerRole)
@@ -31,9 +32,10 @@ from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest
 # Re-exported here for backward compat.
 from tensorrt_llm.serve.router_utils import (  # noqa: F401
     KV_CACHE_HASH_ALGO_DEFAULT, KV_CACHE_HASH_ALGO_V1, KV_CACHE_HASH_ALGO_V2,
-    KV_CACHE_HASH_ALGO_V2_SHA256_64, BlockHash, BlockHashMixin, OpenAIRequest,
-    block_key_hasher, get_cache_salt_id, get_request_num_tokens,
-    hash_v1_block_key, truncate_sha256_hash_to_int64, v2_sha256_block_hasher)
+    KV_CACHE_HASH_ALGO_V2_SHA256_64, KV_CACHE_HASH_ALGOS, BlockHash,
+    BlockHashMixin, OpenAIRequest, block_key_hasher, get_cache_salt_id,
+    get_request_num_tokens, hash_v1_block_key, truncate_sha256_hash_to_int64,
+    v2_sha256_block_hasher)
 
 _MSGPACK_HEADERS = {"Content-Type": "application/msgpack"}
 COORDINATOR_FINISH_MAX_ATTEMPTS = 3
@@ -41,6 +43,7 @@ COORDINATOR_FINISH_RETRY_DELAY_S = 0.1
 
 # Max number of conversations whose home-server pin is retained (LRU).
 ROUTE_AFFINITY_CACHE_SIZE = 50000
+ROUTE_AFFINITY_HASH_SEED = b"TensorRT-LLM-route-affinity-v1!!"
 # Leading token-id count folded into the affinity key so pre-tokenized
 # requests (placeholder message content) still key per conversation.
 ROUTE_AFFINITY_TOKEN_PREFIX = 256
@@ -768,6 +771,10 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
         self._load_weight = load_weight
         self._load_cap = load_cap
         self._track_routed_blocks = track_routed_blocks
+        # A coordinator client has no local server pool. The coordinator injects
+        # the role's effective hash algorithm so this router can act solely as a
+        # routing-key encoder.
+        self._routing_hash_algo: Optional[str] = None
 
     def _create_server_state(self, server: str) -> KvCacheAwareServerState:
         return KvCacheAwareServerState(server, self._use_tokens,
@@ -792,6 +799,32 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
         # Lock-free attribute read; state is seeded at handshake and refreshed
         # by update_with_events.
         return self._server_state[server].hash_algo
+
+    def routing_key_config(self) -> Optional[dict[str, int | str]]:
+        """Return the encoding configuration shared by prepared servers."""
+        hash_algos = {
+            self._get_server_hash_algo(server)
+            for server in self._prepared_ready_servers
+        }
+        if len(hash_algos) > 1:
+            raise RuntimeError(
+                f"KV-cache-aware routing requires one hash algorithm per role; "
+                f"found {sorted(hash_algos)} for {self._server_role}")
+        if not hash_algos:
+            return None
+        return {
+            "tokens_per_block": self._tokens_per_block,
+            "kv_cache_hash_algo": hash_algos.pop(),
+        }
+
+    def set_routing_key_config(self, config: dict[str, int | str]) -> None:
+        hash_algo = str(config["kv_cache_hash_algo"])
+        if hash_algo not in KV_CACHE_HASH_ALGOS:
+            raise ValueError(f"Unknown KV cache hash algorithm {hash_algo!r}; "
+                             f"expected one of {sorted(KV_CACHE_HASH_ALGOS)}")
+        self._tokens_per_block = int(config["tokens_per_block"])
+        self._tpb_auto = False
+        self._routing_hash_algo = hash_algo
 
     def _events_aligned(self, server: str) -> bool:
         worker_tpb = self._server_info.get(server, {}).get("tokens_per_block")
@@ -860,7 +893,9 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
         token_ids = getattr(request, "prompt_token_ids", None)
         if token_ids:
             parts.append(str(list(token_ids[:ROUTE_AFFINITY_TOKEN_PREFIX])))
-        return hash("".join(parts))
+        digest = blake3("".join(parts).encode("utf-8"),
+                        key=ROUTE_AFFINITY_HASH_SEED).digest(length=8)
+        return int.from_bytes(digest, "little", signed=False)
 
     async def get_next_server(self,
                               request: OpenAIRequest,
@@ -883,10 +918,15 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
         """
         cache_salt_id = self._get_request_cache_salt_id(request)
         # Hash for every algo any server might use (usually one).
-        algos = {
-            self._get_server_hash_algo(s)
-            for s in self._server_state.keys()
-        } or None
+        algos = ({self._routing_hash_algo}
+                 if self._routing_hash_algo is not None else {
+                     self._get_server_hash_algo(s)
+                     for s in self._server_state.keys()
+                 })
+        if not algos:
+            raise RuntimeError(
+                "KV-cache routing-key encoder has no hash algorithm; "
+                "synchronize it with the coordinator before routing")
         token_lists, block_hashes_by_algo = \
             self._tokenize_and_compute_block_hashes_by_algo(
                 request, algos, cache_salt_id)
