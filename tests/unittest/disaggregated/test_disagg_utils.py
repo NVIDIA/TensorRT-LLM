@@ -129,8 +129,7 @@ def test_server_keep_alive_timeout(tmp_path):
     yaml_file = tmp_path / "keep_alive_config.yaml"
     with open(yaml_file, "w") as f:
         yaml.dump(cfg, f)
-    assert parse_disagg_config_file(
-        yaml_file).server_keep_alive_timeout == 3600
+    assert parse_disagg_config_file(yaml_file).server_keep_alive_timeout == 3600
 
 
 def test_extract_ctx_gen_cfgs():
