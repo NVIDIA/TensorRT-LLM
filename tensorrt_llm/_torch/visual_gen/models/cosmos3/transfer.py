@@ -394,7 +394,7 @@ def media_height_width(value: Any) -> tuple[int, int] | None:
     return None
 
 
-def resize_center_crop_frames(frames: torch.Tensor, height: int, width: int) -> torch.Tensor:
+def resize_center_crop_uint8_cthw(frames: torch.Tensor, height: int, width: int) -> torch.Tensor:
     """Scale-to-cover then center-crop control frames to ``(height, width)``.
 
     ``frames``: uint8 ``[3, T, H, W]`` -> uint8 ``[3, T, H, W]``. Aspect ratio is
@@ -419,7 +419,7 @@ def resize_center_crop_frames(frames: torch.Tensor, height: int, width: int) -> 
     return cropped.round().clamp(0, 255).to(torch.uint8).permute(1, 0, 2, 3).contiguous()
 
 
-def _to_uint8_rgb_frame(value: Any) -> np.ndarray:
+def _pil_to_uint8_rgb(value: Any) -> np.ndarray:
     """Coerce one frame (PIL image, path, tensor, or ndarray) to a uint8 RGB array.
 
     Returns ``[H, W, 3]`` uint8. Float inputs in ``[-1, 1]`` or ``[0, 1]`` are
@@ -451,7 +451,7 @@ def _to_uint8_rgb_frame(value: Any) -> np.ndarray:
     raise TypeError(f"Cosmos3 transfer expected an RGB frame, got {type(value)!r}.")
 
 
-def _path_media_to_uint8_frames(path: str | Path, max_frames: int | None) -> torch.Tensor:
+def _path_media_to_uint8_cthw(path: str | Path, max_frames: int | None) -> torch.Tensor:
     """Decode a control-media file (image or video) to uint8 ``[3, T, H, W]`` frames.
 
     Classified by content (image vs video) via the shared probe, not the suffix;
@@ -464,7 +464,7 @@ def _path_media_to_uint8_frames(path: str | Path, max_frames: int | None) -> tor
         raise FileNotFoundError(f"Missing Cosmos3 transfer control_path: {media_path}")
     # Classify by content, not suffix — the same content probe as the V2V path.
     if is_image_file(media_path):
-        array = _to_uint8_rgb_frame(media_path)
+        array = _pil_to_uint8_rgb(media_path)
         return torch.from_numpy(array).permute(2, 0, 1).unsqueeze(1).contiguous()
 
     # Same OpenCV decode stack as V2V, consumed as a tensor:
@@ -473,7 +473,7 @@ def _path_media_to_uint8_frames(path: str | Path, max_frames: int | None) -> tor
     return frames_thwc[..., :3].permute(3, 0, 1, 2).contiguous()
 
 
-def media_to_uint8_frames(
+def media_to_uint8_cthw(
     value: Any, *, height: int, width: int, max_frames: int | None = None
 ) -> torch.Tensor:
     """Load any control/input media into uint8 ``[3, T, H, W]`` frames fit to ``(height, width)``.
@@ -483,27 +483,27 @@ def media_to_uint8_frames(
     entry point for turning a transfer control (or input) reference into frames.
     """
     if isinstance(value, str | Path):
-        frames = _path_media_to_uint8_frames(value, max_frames=max_frames)
+        frames = _path_media_to_uint8_cthw(value, max_frames=max_frames)
     elif isinstance(value, torch.Tensor):
-        frames = normalized_video_to_uint8_frames(value)
+        frames = normalized_video_to_uint8_cthw(value)
     elif isinstance(value, np.ndarray):
-        frames = normalized_video_to_uint8_frames(torch.from_numpy(value))
+        frames = normalized_video_to_uint8_cthw(torch.from_numpy(value))
     elif isinstance(value, list | tuple):
         if not value:
             raise ValueError("Cosmos3 transfer control frames cannot be empty.")
         selected = value[:max_frames] if max_frames is not None else value
         tensors = [
-            torch.from_numpy(_to_uint8_rgb_frame(frame)).permute(2, 0, 1) for frame in selected
+            torch.from_numpy(_pil_to_uint8_rgb(frame)).permute(2, 0, 1) for frame in selected
         ]
         frames = torch.stack(tensors, dim=1).contiguous()
     else:
         raise TypeError(f"Unsupported Cosmos3 transfer control payload type: {type(value)!r}.")
     if max_frames is not None:
         frames = frames[:, : int(max_frames)]
-    return resize_center_crop_frames(frames, int(height), int(width))
+    return resize_center_crop_uint8_cthw(frames, int(height), int(width))
 
 
-def normalized_video_to_uint8_frames(video: torch.Tensor) -> torch.Tensor:
+def normalized_video_to_uint8_cthw(video: torch.Tensor) -> torch.Tensor:
     """Convert an in-memory video tensor to uint8 ``[3, T, H, W]`` control frames.
 
     Accepts ``[1, 3, T, H, W]`` / ``[3, T, H, W]`` (or channels-last); float values
@@ -534,7 +534,7 @@ def normalized_video_to_uint8_frames(video: torch.Tensor) -> torch.Tensor:
     return tensor.contiguous()
 
 
-def uint8_frames_to_model_input(frames: torch.Tensor, *, dtype: torch.dtype) -> torch.Tensor:
+def uint8_cthw_to_normalized_5d(frames: torch.Tensor, *, dtype: torch.dtype) -> torch.Tensor:
     """Normalize uint8 control frames into the transfer model's input tensor.
 
     ``frames``: uint8 ``[3, T, H, W]`` -> ``[1, 3, T, H, W]`` in ``[-1, 1]``
@@ -637,11 +637,9 @@ def load_or_compute_control_frames(
     input_frames: torch.Tensor | None,
 ) -> torch.Tensor:
     if hint.control is not None:
-        return media_to_uint8_frames(
-            hint.control, height=height, width=width, max_frames=max_frames
-        )
+        return media_to_uint8_cthw(hint.control, height=height, width=width, max_frames=max_frames)
     if hint.control_path is not None:
-        return media_to_uint8_frames(
+        return media_to_uint8_cthw(
             hint.control_path, height=height, width=width, max_frames=max_frames
         )
     if hint.key == "edge":

@@ -27,19 +27,19 @@ from tensorrt_llm._torch.visual_gen.models.cosmos3 import pipeline_cosmos3 as pi
 from tensorrt_llm._torch.visual_gen.models.cosmos3 import transfer as transfer_module
 from tensorrt_llm._torch.visual_gen.models.cosmos3.pipeline_cosmos3 import Cosmos3OmniMoTPipeline
 from tensorrt_llm._torch.visual_gen.models.cosmos3.transfer import (
-    _path_media_to_uint8_frames,
-    _to_uint8_rgb_frame,
+    _path_media_to_uint8_cthw,
+    _pil_to_uint8_rgb,
     find_closest_target_size,
     load_or_compute_control_frames,
     make_blur_control,
     make_edge_control,
     media_height_width,
-    media_to_uint8_frames,
-    normalized_video_to_uint8_frames,
+    media_to_uint8_cthw,
+    normalized_video_to_uint8_cthw,
     pad_temporal_frames,
-    resize_center_crop_frames,
+    resize_center_crop_uint8_cthw,
     resolve_transfer_config,
-    uint8_frames_to_model_input,
+    uint8_cthw_to_normalized_5d,
 )
 from tensorrt_llm._torch.visual_gen.models.cosmos3.transformer_cosmos3 import TransformerOutput
 from tensorrt_llm._torch.visual_gen.models.cosmos3.utils import read_video_tensor
@@ -273,17 +273,17 @@ class TestTransferMediaHelpers:
         assert tuple(frames.shape) == (5, 16, 16, 3) and frames.dtype == torch.uint8
         assert read_video_tensor(clip, max_frames=3).shape[0] == 3
 
-        cthw = _path_media_to_uint8_frames(clip, max_frames=None)
+        cthw = _path_media_to_uint8_cthw(clip, max_frames=None)
         assert tuple(cthw.shape) == (3, 5, 16, 16)
         assert media_height_width(str(clip)) == (16, 16)
 
         image_path = tmp_path / "frame.png"
         PIL.Image.new("RGB", (8, 4), "red").save(image_path)
-        image_cthw = _path_media_to_uint8_frames(image_path, max_frames=None)
+        image_cthw = _path_media_to_uint8_cthw(image_path, max_frames=None)
         assert tuple(image_cthw.shape) == (3, 1, 4, 8)
 
         with pytest.raises(FileNotFoundError):
-            _path_media_to_uint8_frames(tmp_path / "missing.mp4", max_frames=None)
+            _path_media_to_uint8_cthw(tmp_path / "missing.mp4", max_frames=None)
 
 
 class TestTransferFrameConversions:
@@ -292,70 +292,70 @@ class TestTransferFrameConversions:
     CPU-only; the video-path decode is covered by ``test_video_decode_paths``.
     """
 
-    def test_uint8_frames_to_model_input_maps_0_255_to_pm1(self):
+    def test_uint8_cthw_to_normalized_5d_maps_0_255_to_pm1(self):
         black = torch.zeros(3, 2, 4, 5, dtype=torch.uint8)
-        out = uint8_frames_to_model_input(black, dtype=torch.float32)
+        out = uint8_cthw_to_normalized_5d(black, dtype=torch.float32)
         assert out.shape == (1, 3, 2, 4, 5) and out.dtype == torch.float32
         assert torch.allclose(out, torch.full_like(out, -1.0))  # 0 -> -1
         white = torch.full((3, 1, 2, 2), 255, dtype=torch.uint8)
         assert torch.allclose(
-            uint8_frames_to_model_input(white, dtype=torch.float32),
+            uint8_cthw_to_normalized_5d(white, dtype=torch.float32),
             torch.ones(1, 3, 1, 2, 2),  # 255 / 127.5 - 1 == 1.0
         )
 
-    def test_uint8_frames_to_model_input_rejects_bad_shape(self):
+    def test_uint8_cthw_to_normalized_5d_rejects_bad_shape(self):
         with pytest.raises(ValueError, match="3, T, H, W"):
-            uint8_frames_to_model_input(
+            uint8_cthw_to_normalized_5d(
                 torch.zeros(2, 4, 4, dtype=torch.uint8), dtype=torch.float32
             )
 
     def test_normalized_video_roundtrips_with_model_input(self):
         frames = (torch.arange(3 * 2 * 4 * 4) % 256).reshape(3, 2, 4, 4).to(torch.uint8)
-        model_input = uint8_frames_to_model_input(frames, dtype=torch.float32)
-        back = normalized_video_to_uint8_frames(model_input)
+        model_input = uint8_cthw_to_normalized_5d(frames, dtype=torch.float32)
+        back = normalized_video_to_uint8_cthw(model_input)
         assert back.shape == (3, 2, 4, 4) and back.dtype == torch.uint8
         assert (back.int() - frames.int()).abs().max() <= 1  # rounding tolerance
 
     def test_normalized_video_accepts_channels_last(self):
         thwc = torch.rand(2, 4, 5, 3)  # [T, H, W, C] in [0, 1]
-        out = normalized_video_to_uint8_frames(thwc)
+        out = normalized_video_to_uint8_cthw(thwc)
         assert out.shape == (3, 2, 4, 5) and out.dtype == torch.uint8
 
     def test_normalized_video_rejects_batch_gt_1(self):
         with pytest.raises(ValueError, match="batch size 1"):
-            normalized_video_to_uint8_frames(torch.zeros(2, 3, 1, 4, 4))
+            normalized_video_to_uint8_cthw(torch.zeros(2, 3, 1, 4, 4))
 
-    def test_resize_center_crop_frames_shape(self):
+    def test_resize_center_crop_uint8_cthw_shape(self):
         frames = (torch.arange(3 * 2 * 8 * 4) % 256).reshape(3, 2, 8, 4).to(torch.uint8)
-        out = resize_center_crop_frames(frames, height=4, width=4)
+        out = resize_center_crop_uint8_cthw(frames, height=4, width=4)
         assert out.shape == (3, 2, 4, 4) and out.dtype == torch.uint8
 
-    def test_resize_center_crop_frames_rejects_bad_shape(self):
+    def test_resize_center_crop_uint8_cthw_rejects_bad_shape(self):
         with pytest.raises(ValueError, match="3, T, H, W"):
-            resize_center_crop_frames(torch.zeros(1, 2, 4, 4, dtype=torch.uint8), 4, 4)
+            resize_center_crop_uint8_cthw(torch.zeros(1, 2, 4, 4, dtype=torch.uint8), 4, 4)
 
-    def test_to_uint8_rgb_frame_from_pil_and_float_tensor(self):
+    def test_pil_to_uint8_rgb_from_pil_and_float_tensor(self):
         img = PIL.Image.new("RGB", (5, 4), (10, 20, 30))  # (W=5, H=4)
-        arr = _to_uint8_rgb_frame(img)
+        arr = _pil_to_uint8_rgb(img)
         assert arr.shape == (4, 5, 3) and arr.dtype == np.uint8
         assert arr[0, 0].tolist() == [10, 20, 30]
         chw = torch.full((3, 4, 5), -1.0)  # [-1, 1] CHW float, -1 -> 0
-        out = _to_uint8_rgb_frame(chw)
+        out = _pil_to_uint8_rgb(chw)
         assert out.shape == (4, 5, 3) and out.dtype == np.uint8 and int(out.max()) == 0
 
-    def test_media_to_uint8_frames_from_list(self):
+    def test_media_to_uint8_cthw_from_list(self):
         frames = [PIL.Image.new("RGB", (8, 6), (v, v, v)) for v in (0, 128, 255)]
-        out = media_to_uint8_frames(frames, height=4, width=4)
+        out = media_to_uint8_cthw(frames, height=4, width=4)
         assert out.shape == (3, 3, 4, 4) and out.dtype == torch.uint8
 
-    def test_media_to_uint8_frames_from_tensor(self):
+    def test_media_to_uint8_cthw_from_tensor(self):
         video = torch.rand(1, 3, 2, 8, 6)  # [1, 3, T, H, W] in [0, 1]
-        out = media_to_uint8_frames(video, height=4, width=4)
+        out = media_to_uint8_cthw(video, height=4, width=4)
         assert out.shape == (3, 2, 4, 4) and out.dtype == torch.uint8
 
-    def test_media_to_uint8_frames_rejects_unknown_type(self):
+    def test_media_to_uint8_cthw_rejects_unknown_type(self):
         with pytest.raises(TypeError, match="control payload type"):
-            media_to_uint8_frames(42, height=4, width=4)
+            media_to_uint8_cthw(42, height=4, width=4)
 
 
 # =============================================================================
