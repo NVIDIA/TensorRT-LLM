@@ -573,6 +573,8 @@ class GvrTopKKernel:
         tidx,
         warp_id,
         lane,
+        smem_gath=None,  # cute.Tensor [top_k] f32 or None (p1b_cache): stash
+        # the gathered value per preIdx slot so P1b skips a 2nd GMEM gather.
     ):
         """preIdx scan + warp reduce + block aggregate + initial threshold.
 
@@ -597,8 +599,12 @@ class GvrTopKKernel:
                 i = tidx + cutlass.Int32(u * self.num_threads)
                 raw = pre_idx_row[i]
                 idx = raw + pre_idx_offset
+                if cutlass.const_expr(smem_gath is not None):
+                    smem_gath[i] = cutlass.Float32(self.NEG_FLT_MAX)
                 if idx >= 0 and idx < N:
                     v = self._load_fp32(input_row, idx)
+                    if cutlass.const_expr(smem_gath is not None):
+                        smem_gath[i] = v
                     local_max = cute.arch.fmax(local_max, v)
                     local_min = _fmin_f32_inline(local_min, v)
                     local_sum = local_sum + v
@@ -612,8 +618,12 @@ class GvrTopKKernel:
             idx = cutlass.Int32(-1)
             if tidx < cutlass.Int32(pre_idx_count):
                 idx = pre_idx_row[tidx] + pre_idx_offset
+                if cutlass.const_expr(smem_gath is not None):
+                    smem_gath[tidx] = cutlass.Float32(self.NEG_FLT_MAX)
             if idx >= 0 and idx < N:
                 v = self._load_fp32(input_row, idx)
+                if cutlass.const_expr(smem_gath is not None):
+                    smem_gath[tidx] = v
                 local_max = cute.arch.fmax(local_max, v)
                 local_min = _fmin_f32_inline(local_min, v)
                 local_sum = local_sum + v
@@ -799,6 +809,76 @@ class GvrTopKKernel:
                             and cum_before < cutlass.Int32(self.qneeds[m])):
                         s_mt_thr[m] = v_lo + cutlass.Float32(top - cutlass.Int32(j)) * width
             # unfired rungs (heavy invalid-preIdx rows: total < need): v_lo
+            if lane == 0:
+                for m in cutlass.range_constexpr(M):
+                    if total < cutlass.Int32(self.qneeds[m]):
+                        s_mt_thr[m] = v_lo
+        cute.arch.barrier()
+
+    # ------------------------------------------------------------------
+    # P1b (p1b_cache variant) — build the rung histogram from the SMEM
+    # gathered values that P1 stashed (smem_gath), skipping P1b's second
+    # GMEM random gather. Sentinel NEG_FLT_MAX marks invalid/out-of-range
+    # preIdx slots. Rung extraction is identical to phase1b_hspace_rungs.
+    # ------------------------------------------------------------------
+    @cute.jit
+    def phase1b_hspace_rungs_cached(self, pre_idx_count, smem_gath, smem_hist,
+                                    s_thr, s_mt_thr, tidx, warp_id, lane):
+        M = cutlass.const_expr(self.M_thr)
+        NB = cutlass.const_expr(256)
+        SEG = cutlass.const_expr(8)
+        num_threads = cutlass.const_expr(self.num_threads)
+
+        jz = tidx
+        while jz < cutlass.Int32(NB):
+            smem_hist[jz] = cutlass.Int32(0)
+            jz = jz + cutlass.Int32(num_threads)
+        cute.arch.barrier()
+
+        v_lo = s_thr[1]
+        v_hi = s_thr[2]
+        width = (v_hi - v_lo) / cutlass.Float32(NB)
+        inv_w = cutlass.Float32(1.0) / width
+
+        ig = tidx
+        while ig < cutlass.Int32(pre_idx_count):
+            v = smem_gath[ig]
+            if v > cutlass.Float32(self.NEG_FLT_MAX):
+                bf = (v - v_lo) * inv_w
+                b = cutlass.Int32(bf)
+                if b < cutlass.Int32(0):
+                    b = cutlass.Int32(0)
+                if b > cutlass.Int32(NB - 1):
+                    b = cutlass.Int32(NB - 1)
+                atomicAdd(smem_hist.iterator + b, cutlass.Int32(1))
+            ig = ig + cutlass.Int32(num_threads)
+        cute.arch.barrier()
+
+        if warp_id == cutlass.Int32(0):
+            top = cutlass.Int32(NB - 1) - lane * cutlass.Int32(SEG)
+            seg_frag = cute.make_fragment((SEG,), cutlass.Int32)
+            part = cutlass.Int32(0)
+            for j in cutlass.range_constexpr(SEG):
+                v8 = smem_hist[top - cutlass.Int32(j)]
+                seg_frag[j] = v8
+                part = part + v8
+            tp = part
+            for off_i in cutlass.range_constexpr(5):
+                off_v = cutlass.const_expr(1 << off_i)
+                other = cute.arch.shuffle_sync_up(tp, off_v, mask_and_clamp=0)
+                if lane >= cutlass.Int32(off_v):
+                    tp = tp + other
+            excl = tp - part
+            total = cute.arch.shuffle_sync(tp, cutlass.Int32(self.WARP_SIZE - 1))
+            run = cutlass.Int32(0)
+            for j in cutlass.range_constexpr(SEG):
+                run = run + seg_frag[j]
+                cum_at = excl + run
+                cum_before = cum_at - seg_frag[j]
+                for m in cutlass.range_constexpr(M):
+                    if (cum_at >= cutlass.Int32(self.qneeds[m])
+                            and cum_before < cutlass.Int32(self.qneeds[m])):
+                        s_mt_thr[m] = v_lo + cutlass.Float32(top - cutlass.Int32(j)) * width
             if lane == 0:
                 for m in cutlass.range_constexpr(M):
                     if total < cutlass.Int32(self.qneeds[m]):
@@ -2300,6 +2380,16 @@ class GvrTopKKernel:
                 )
             else:
                 s_cluster_partial_m = None
+            # p1b_cache: P1 stashes the K gathered preIdx values here so P1b
+            # skips a second GMEM random gather (dtype-gated: 16-bit only).
+            if cutlass.const_expr(self.p1b_cache):
+                smem_gath = smem.allocate_tensor(
+                    element_type=cutlass.Float32,
+                    layout=cute.make_ordered_layout((self.top_k,), order=(0,)),
+                    byte_alignment=128,
+                )
+            else:
+                smem_gath = None
         else:
             s_mt_thr = None
             smem_ptcnt_multi = None
@@ -2307,6 +2397,7 @@ class GvrTopKKernel:
             s_mt_cnt = None
             s_r0col = None
             s_cluster_partial_m = None
+            smem_gath = None
 
         # ---- Per-row dispatch ----
         # Three branches:
@@ -2388,6 +2479,7 @@ class GvrTopKKernel:
                         s_mt_cnt,
                         s_r0col,
                         s_cluster_partial_m,
+                        smem_gath,
                         tidx,
                         warp_id,
                         lane,
@@ -2428,6 +2520,7 @@ class GvrTopKKernel:
                             s_mt_cnt,
                             s_r0col,
                             s_cluster_partial_m,
+                            smem_gath,
                             tidx,
                             warp_id,
                             lane,
@@ -2465,6 +2558,7 @@ class GvrTopKKernel:
                     s_mt_cnt,
                     s_r0col,
                     s_cluster_partial_m,
+                    smem_gath,
                     tidx,
                     warp_id,
                     lane,
@@ -2505,6 +2599,7 @@ class GvrTopKKernel:
         s_mt_cnt,
         s_r0col,
         s_cluster_partial_m,
+        smem_gath,
         tidx,
         warp_id,
         lane,
@@ -2538,6 +2633,7 @@ class GvrTopKKernel:
             tidx,
             warp_id,
             lane,
+            smem_gath=smem_gath,  # p1b_cache: stash gathered values (None-op OFF)
         )
 
         # Degenerate threshold init: val_hi <= -self.FLT_MAX or val_lo >= val_hi.
@@ -2595,9 +2691,16 @@ class GvrTopKKernel:
                 # CTA scans its slice and block_count_ge_multi cluster-merges
                 # the rung counts (phase1b rungs are per-CTA identical since
                 # preIdx stats are full-row).
-                self.phase1b_hspace_rungs(
-                    input_row, N, pre_idx_row, pre_idx_count, pre_idx_offset,
-                    smem_hist, s_thr, s_mt_thr, tidx, warp_id, lane)
+                if cutlass.const_expr(self.p1b_cache):
+                    # rungs from the SMEM gather-cache P1 stashed (no 2nd
+                    # GMEM gather); 16-bit only.
+                    self.phase1b_hspace_rungs_cached(
+                        pre_idx_count, smem_gath, smem_hist, s_thr, s_mt_thr,
+                        tidx, warp_id, lane)
+                else:
+                    self.phase1b_hspace_rungs(
+                        input_row, N, pre_idx_row, pre_idx_count, pre_idx_offset,
+                        smem_hist, s_thr, s_mt_thr, tidx, warp_id, lane)
                 self.block_count_ge_multi(
                     input_row, slice_start, slice_end, s_mt_thr,
                     smem_ptcnt_multi, smem_wcnt_multi, s_mt_cnt,
