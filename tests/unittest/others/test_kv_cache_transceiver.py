@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import gc
 import multiprocessing
 import sys
@@ -16,8 +19,8 @@ from tensorrt_llm._torch.pyexecutor.kv_cache_transceiver import \
     create_kv_cache_transceiver
 from tensorrt_llm._torch.pyexecutor.llm_request import (LlmRequest,
                                                         LlmRequestState)
-from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import \
-    MixedMambaHybridCacheManager
+from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import (
+    CppMambaHybridCacheManager, MixedMambaHybridCacheManager)
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig, KvCacheConfig
@@ -31,6 +34,21 @@ DEFAULT_KV_TRANSFER_TIMEOUT_S = (
     CacheTransceiverConfig.model_fields["kv_transfer_timeout_ms"].default /
     1000.0)
 KV_TRANSFER_COMPLETION_MARGIN_S = 10.0
+
+
+def test_cpp_transceiver_rejects_mixed_mamba_manager():
+    config = CacheTransceiverConfig(backend="NIXL", transceiver_runtime="CPP")
+    mixed_manager = object.__new__(MixedMambaHybridCacheManager)
+
+    with pytest.raises(
+            ValueError,
+            match="MixedMambaHybridCacheManager requires the Python"):
+        create_kv_cache_transceiver(mapping=None,
+                                    dist=None,
+                                    kv_cache_manager=None,
+                                    attention_type=AttentionTypeCpp.DEFAULT,
+                                    cache_transceiver_config=config,
+                                    mamba_cache_manager=mixed_manager)
 
 
 def create_kv_cache_manager(mapping,
@@ -716,7 +734,7 @@ def create_hybrid_cache_manager(mapping,
                                 dtype,
                                 mamba_conv_dtype=torch.float16,
                                 mamba_ssm_dtype=torch.float16):
-    """Create a MixedMambaHybridCacheManager for testing hybrid models.
+    """Create a unified-pool hybrid manager for C++ transceiver tests.
 
     This manager handles both KV cache (attention layers) and Mamba cache (RNN layers).
 
@@ -733,7 +751,7 @@ def create_hybrid_cache_manager(mapping,
     attention_layer_mask = [True, False]
     mamba_layer_mask = [False, True]
 
-    return MixedMambaHybridCacheManager(
+    return CppMambaHybridCacheManager(
         # Mamba cache parameters
         mamba_d_state=16,
         mamba_d_conv=4,
@@ -789,9 +807,9 @@ def hybrid_dtypes(request):
     """
     Returns (kv_dtype, mamba_conv_dtype, mamba_ssm_dtype) based on the parametrized string.
 
-    KV dtype: fp8, bf16
-    Conv dtype: fp8, bf16, fp32
-    SSM dtype: bf16, fp32
+    The C++ transceiver requires the KV and SSM pools to use the same dtype.
+    Conv state may use a different dtype because it is packed within the SSM
+    pool and transferred as raw bytes.
     """
     kv_dtype_str, conv_dtype_str, ssm_dtype_str = request.param
 
@@ -819,23 +837,11 @@ def hybrid_dtypes(request):
     [
         # (kv_dtype, conv_dtype, ssm_dtype)
         ("bf16", "bf16", "bf16"),
-        ("bf16", "bf16", "fp32"),
         ("bf16", "fp32", "bf16"),
-        ("bf16", "fp32", "fp32"),
-        ("fp8", "bf16", "bf16"),
-        ("fp8", "bf16", "fp32"),
-        ("fp8", "fp32", "bf16"),
-        ("fp8", "fp32", "fp32"),
     ],
     ids=[
         "kv_bf16-conv_bf16-ssm_bf16",
-        "kv_bf16-conv_bf16-ssm_fp32",
         "kv_bf16-conv_fp32-ssm_bf16",
-        "kv_bf16-conv_fp32-ssm_fp32",
-        "kv_fp8-conv_bf16-ssm_bf16",
-        "kv_fp8-conv_bf16-ssm_fp32",
-        "kv_fp8-conv_fp32-ssm_bf16",
-        "kv_fp8-conv_fp32-ssm_fp32",
     ],
     indirect=["hybrid_dtypes"],
 )
@@ -934,10 +940,10 @@ def test_hybrid_cache_transceiver_single_process(backend, hybrid_dtypes):
     # independently-allocated slots on each side, so we check the
     # request's own slot instead of the full state buffer (which has
     # extra padding-dummy slots that only the ctx side touched).
-    slot_ctx = hybrid_cache_manager_ctx._impl.mamba_impl.get_cache_index(
-        ctx_request.py_request_id)
-    slot_gen = hybrid_cache_manager_gen._impl.mamba_impl.get_cache_index(
-        gen_request.py_request_id)
+    slot_ctx = hybrid_cache_manager_ctx.get_state_indices(
+        [ctx_request.py_request_id], [False])[0]
+    slot_gen = hybrid_cache_manager_gen.get_state_indices(
+        [gen_request.py_request_id], [False])[0]
     assert torch.equal(
         hybrid_cache_manager_gen.get_conv_states(1)[slot_gen],
         hybrid_cache_manager_ctx.get_conv_states(1)[slot_ctx]), (
