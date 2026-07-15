@@ -15,7 +15,7 @@
 
 import pickle
 import sys
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import cloudpickle
 import mpi4py
@@ -26,6 +26,8 @@ from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector import (
     AsyncRequests, KvCacheConnectorManager,
     KvCacheConnectorSchedulerOutputManager)
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
+from tensorrt_llm._torch.pyexecutor.resource_manager import (CacheTypeCpp,
+                                                             KVCacheManager)
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 
 cloudpickle.register_pickle_by_value(sys.modules[__name__])
@@ -301,6 +303,55 @@ def test_scheduler_output_on_rewind_trims_stale_block_ids():
     assert manager.requests[req.request_id].tokens == [10, 11, 13]
 
 
+def _make_kv_cache_manager_for_update_resources(is_draft: bool):
+    manager = object.__new__(KVCacheManager)
+    manager.kv_cache_type = CacheTypeCpp.SELF
+    manager.is_draft = is_draft
+    manager.kv_connector_manager = MagicMock()
+    manager._kv_reserve_draft_tokens = 0
+    manager.rewind_kv_cache = MagicMock()
+    return manager
+
+
+def _make_generation_request_for_rewind(rewind_len: int):
+    req = MagicMock()
+    req.state = LlmRequestState.GENERATION_IN_PROGRESS
+    req.py_rewind_len = rewind_len
+    req.py_num_accepted_draft_tokens = 0
+    return req
+
+
+def test_update_resources_notifies_connector_only_from_target_kv_manager():
+    req = _make_generation_request_for_rewind(rewind_len=1)
+    scheduled_batch = ScheduledRequests()
+    scheduled_batch.generation_requests = [req]
+
+    manager = _make_kv_cache_manager_for_update_resources(is_draft=False)
+
+    with patch(
+            "tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2._update_kv_cache_draft_token_location"
+    ):
+        manager.update_resources(scheduled_batch)
+
+    manager.rewind_kv_cache.assert_called_once_with(req, 1)
+    manager.kv_connector_manager.on_rewind.assert_called_once_with(req, manager)
+
+
+def test_update_resources_draft_kv_manager_does_not_notify_connector():
+    req = _make_generation_request_for_rewind(rewind_len=1)
+    scheduled_batch = ScheduledRequests()
+    scheduled_batch.generation_requests = [req]
+
+    manager = _make_kv_cache_manager_for_update_resources(is_draft=True)
+    manager._kv_reserve_draft_tokens = 2
+
+    manager.update_resources(scheduled_batch)
+
+    assert manager.rewind_kv_cache.call_count == 2
+    manager.rewind_kv_cache.assert_any_call(req, 1)
+    manager.kv_connector_manager.on_rewind.assert_not_called()
+
+
 def test_connector_manager_on_rewind_forwards_to_scheduler():
     """KvCacheConnectorManager.on_rewind must forward live_block_ids to the
     external scheduler on rank 0."""
@@ -311,33 +362,22 @@ def test_connector_manager_on_rewind_forwards_to_scheduler():
 
     req = MagicMock()
     req.request_id = 42
+    req.get_tokens.return_value = [1, 2, 3]
 
     kv_cache_manager = MagicMock()
     kv_cache_manager.get_cache_indices.return_value = [0, 1]
 
+    req_state = manager.scheduler_output_manager.requests[42]
+    req_state.block_ids = [0, 1, 2]
+    req_state.tokens = [1, 2, 3, 4]
+
     manager.on_rewind(req, kv_cache_manager)
 
-    # scheduler_output_manager.on_rewind always runs (trims Python state).
-    assert manager.scheduler_output_manager.requests.get(42) is not None or True
+    assert req_state.block_ids == [0, 1]
+    assert req_state.tokens == [1, 2, 3]
 
     # scheduler.on_rewind must be called with the post-rewind live block ids.
     scheduler.on_rewind.assert_called_once()
     forwarded_req, forwarded_ids = scheduler.on_rewind.call_args.args
+    assert forwarded_req is req
     assert forwarded_ids == [0, 1]
-
-
-def test_py_executor_creator_guard_non_linear_tree_specdec():
-    """create_py_executor must raise NotImplementedError when a KV connector is
-    used with non-linear-tree speculative decoding (e.g. Eagle)."""
-    # Minimal args with non-linear-tree specdec + kv connector.
-    # We can't easily construct a full TorchLlmArgs, so we test the guard
-    # logic indirectly by checking that the guard condition exists.
-    import inspect
-
-    from tensorrt_llm._torch.pyexecutor.py_executor_creator import \
-        create_py_executor
-    source = inspect.getsource(create_py_executor)
-    assert "is_linear_tree" in source, \
-        "Guard for non-linear-tree specdec + connector not found"
-    assert "NotImplementedError" in source, \
-        "NotImplementedError guard not found in create_py_executor"
