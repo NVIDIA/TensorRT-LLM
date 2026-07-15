@@ -13,12 +13,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import glob
+import json
 import multiprocessing
 import os
+import re
 import threading
+from contextlib import ExitStack
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, List
+from typing import Any, Iterator, List, Tuple
 
 import psutil
 import safetensors
@@ -36,6 +39,7 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
 _WEIGHT_CACHE_ENV = "TRTLLM_HF_WEIGHT_CACHE"
+_LAYERWISE_SAFETENSORS_ENV = "TRTLLM_HF_LAYERWISE_SAFETENSORS"
 _WEIGHT_CACHE_MAX_ENTRIES_ENV = "TRTLLM_HF_WEIGHT_CACHE_MAX_ENTRIES"
 # Default to a single cached checkpoint: each entry pins a full copy of the
 # raw weights in CPU RAM, so callers wanting cross-model caching must opt in
@@ -53,6 +57,104 @@ class HfWeightLoader(BaseWeightLoader):
     """
     Loads weights from SafeTensors/bin/pth files.
     """
+
+    @staticmethod
+    def is_layerwise_safetensors_enabled() -> bool:
+        return os.environ.get(_LAYERWISE_SAFETENSORS_ENV,
+                              "0").lower() in ("1", "true", "yes", "on")
+
+    @staticmethod
+    def _layer_bucket_name(weight_name: str) -> Tuple[str, int]:
+        """Return a stable, layer-atomic bucket for a checkpoint tensor."""
+        match = re.match(r"^(?:model\.)?layers\.(\d+)\.", weight_name)
+        if match is not None:
+            return ("layer", int(match.group(1)))
+        match = re.match(r"^mtp\.(\d+)\.", weight_name)
+        if match is not None:
+            return ("mtp", int(match.group(1)))
+        return ("top", 0)
+
+    def iter_layer_weight_buckets(
+            self,
+            checkpoint_dir: str,
+            mapping: Mapping,
+            use_consolidated: bool = False,
+            **kwargs) -> Iterator[ConsumableWeightsDict]:
+        """Yield real CPU tensors one semantic layer at a time.
+
+        The safetensors index is used only as metadata. Tensor storage remains
+        mmap-backed and the file handles for a bucket stay alive until the
+        caller advances the iterator. This keeps cross-shard, same-layer
+        fusions atomic without materializing the complete checkpoint.
+        """
+        del mapping, kwargs
+        weight_files = glob.glob(f"{checkpoint_dir}/*.safetensors")
+        weight_files = [
+            path for path in weight_files
+            if ("consolidated" in os.path.basename(path)) == use_consolidated
+        ]
+        if not weight_files:
+            checkpoint_kind = "consolidated " if use_consolidated else ""
+            raise RuntimeError(
+                f"Layer-wise loading requires {checkpoint_kind}safetensors "
+                f"weights in {checkpoint_dir}.")
+
+        files_by_name = {os.path.basename(path): path for path in weight_files}
+        index_files = sorted(
+            glob.glob(f"{checkpoint_dir}/*.safetensors.index.json"))
+        entries: List[Tuple[str, str]] = []
+        use_index = bool(index_files) and not use_consolidated and all(
+            "consolidated" not in name for name in files_by_name)
+        if use_index:
+            with open(index_files[0], encoding="utf-8") as index_file:
+                weight_map = json.load(index_file).get("weight_map", {})
+            missing_files = set(weight_map.values()) - set(files_by_name)
+            if missing_files:
+                raise RuntimeError(
+                    f"Safetensors index {index_files[0]} references missing "
+                    f"checkpoint files: {sorted(missing_files)}")
+            for weight_name, file_name in weight_map.items():
+                entries.append((weight_name, files_by_name[file_name]))
+            if not entries:
+                raise RuntimeError(
+                    f"Safetensors index {index_files[0]} has an empty weight_map."
+                )
+        else:
+            seen_keys = set()
+            for path in sorted(weight_files):
+                with safetensors.safe_open(path, framework="pt",
+                                           device="cpu") as handle:
+                    for key in handle.keys():
+                        if key in seen_keys:
+                            raise RuntimeError(
+                                "Duplicate tensor key found across safetensors "
+                                f"files without an index: {key}")
+                        seen_keys.add(key)
+                        entries.append((key, path))
+
+        buckets = {}
+        for weight_name, path in entries:
+            bucket = self._layer_bucket_name(weight_name)
+            buckets.setdefault(bucket, []).append((weight_name, path))
+
+        def bucket_sort_key(bucket):
+            kind, index = bucket
+            return ({"top": 0, "layer": 1, "mtp": 2}[kind], index)
+
+        for bucket in sorted(buckets, key=bucket_sort_key):
+            tensors = {}
+            with ExitStack() as stack:
+                handles = {}
+                for weight_name, path in buckets[bucket]:
+                    if path not in handles:
+                        handles[path] = stack.enter_context(
+                            safetensors.safe_open(path,
+                                                  framework="pt",
+                                                  device="cpu"))
+                    tensors[weight_name] = handles[path].get_tensor(weight_name)
+                logger.info("Loading HF weight bucket %s with %d tensors",
+                            bucket, len(tensors))
+                yield ConsumableWeightsDict(tensors)
 
     @staticmethod
     def _is_weight_cache_enabled() -> bool:

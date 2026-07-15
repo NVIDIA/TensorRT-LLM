@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 from typing import Optional
 
 from tensorrt_llm._torch.models.checkpoints.base_checkpoint_loader import \
@@ -73,3 +76,12 @@ class HfCheckpointLoader(BaseCheckpointLoader):
     @property
     def checkpoint_format(self) -> str:
         return self._checkpoint_format
+
+    def is_layerwise_loading_enabled(self) -> bool:
+        return (hasattr(self._weight_loader,
+                        "is_layerwise_safetensors_enabled")
+                and self._weight_loader.is_layerwise_safetensors_enabled())
+
+    def iter_layer_weight_buckets(self, checkpoint_dir: str, **kwargs):
+        return self._weight_loader.iter_layer_weight_buckets(
+            checkpoint_dir, **kwargs)

@@ -187,6 +187,23 @@ def test_deepseek_v4_weight_remap_for_fp8_routed_experts():
     assert "model.layers.0.mlp.experts.0.w1.weight_scale" not in remapped
 
 
+def test_deepseek_v4_weight_remap_for_mtp_mxfp4_routed_experts():
+    weights = {
+        "mtp.0.ffn.experts.0.w1.weight": torch.tensor(
+            [[-1, 2], [3, -4]], dtype=torch.int8),
+        "mtp.0.ffn.experts.0.w1.scale": torch.tensor([1, 2],
+                                                       dtype=torch.int8),
+    }
+
+    remapped = _remap_deepseek_v4_checkpoint_keys(
+        weights, num_hidden_layers=61, kv_lora_rank=448)
+
+    assert remapped[
+        "model.layers.61.mlp.experts.0.w1.weight"].dtype == torch.uint8
+    assert remapped[
+        "model.layers.61.mlp.experts.0.w1.weight_scale"].dtype == torch.uint8
+
+
 def test_deepseek_v4_fused_a_weight_scale_rebuilds_fp8_shape():
     module = torch.nn.Module()
     module.weight = torch.nn.Parameter(torch.empty((2048, 7168), dtype=torch.float8_e4m3fn))

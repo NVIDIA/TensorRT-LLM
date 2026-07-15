@@ -1,6 +1,12 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+import json
 from unittest import mock
 
 import pytest
+import torch
+from safetensors.torch import save_file
 
 from tensorrt_llm._torch.models.checkpoints import HfWeightLoader
 from tensorrt_llm._torch.models.checkpoints.base_weight_loader import ConsumableWeightsDict
@@ -9,6 +15,82 @@ from tensorrt_llm.mapping import Mapping
 
 class MyError(Exception):
     pass
+
+
+def test_layerwise_safetensors_keeps_cross_shard_layer_atomic(tmp_path):
+    shard1 = tmp_path / "model-00001-of-00002.safetensors"
+    shard2 = tmp_path / "model-00002-of-00002.safetensors"
+    save_file(
+        {
+            "embed.weight": torch.tensor([1.0]),
+            "layers.0.attn.compressor.wkv.weight": torch.tensor([2.0]),
+        }, str(shard1))
+    save_file(
+        {
+            "layers.0.attn.compressor.wgate.weight": torch.tensor([3.0]),
+            "layers.1.attn.wq_b.weight": torch.tensor([4.0]),
+            "mtp.0.enorm.weight": torch.tensor([5.0]),
+        }, str(shard2))
+    weight_map = {
+        "embed.weight": shard1.name,
+        "layers.0.attn.compressor.wkv.weight": shard1.name,
+        "layers.0.attn.compressor.wgate.weight": shard2.name,
+        "layers.1.attn.wq_b.weight": shard2.name,
+        "mtp.0.enorm.weight": shard2.name,
+    }
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": weight_map}), encoding="utf-8")
+
+    loader = HfWeightLoader()
+    buckets = []
+    for bucket in loader.iter_layer_weight_buckets(str(tmp_path),
+                                                    mapping=Mapping()):
+        buckets.append(set(bucket.keys()))
+
+    assert buckets == [
+        {"embed.weight"},
+        {
+            "layers.0.attn.compressor.wkv.weight",
+            "layers.0.attn.compressor.wgate.weight",
+        },
+        {"layers.1.attn.wq_b.weight"},
+        {"mtp.0.enorm.weight"},
+    ]
+
+
+def test_layerwise_safetensors_without_index_discovers_keys(tmp_path):
+    save_file({
+        "model.layers.2.foo.weight": torch.tensor([2.0]),
+        "lm_head.weight": torch.tensor([1.0]),
+    }, str(tmp_path / "model.safetensors"))
+
+    loader = HfWeightLoader()
+    buckets = [
+        set(bucket.keys()) for bucket in loader.iter_layer_weight_buckets(
+            str(tmp_path), mapping=Mapping())
+    ]
+
+    assert buckets == [{"lm_head.weight"},
+                       {"model.layers.2.foo.weight"}]
+
+
+def test_layerwise_safetensors_rejects_missing_index_shard(tmp_path):
+    shard1 = tmp_path / "model-00001-of-00002.safetensors"
+    save_file({"layers.0.foo.weight": torch.tensor([1.0])}, str(shard1))
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({
+            "weight_map": {
+                "layers.0.foo.weight": shard1.name,
+                "layers.1.foo.weight": "model-00002-of-00002.safetensors",
+            }
+        }),
+        encoding="utf-8")
+
+    loader = HfWeightLoader()
+    with pytest.raises(RuntimeError, match="missing checkpoint files"):
+        next(
+            loader.iter_layer_weight_buckets(str(tmp_path),
+                                             mapping=Mapping()))
 
 
 @pytest.fixture(autouse=True)

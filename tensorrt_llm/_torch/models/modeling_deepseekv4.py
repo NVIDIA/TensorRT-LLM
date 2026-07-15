@@ -28,6 +28,7 @@
 import copy
 import math
 import os
+import re
 from typing import TYPE_CHECKING, Dict, List, Optional
 
 if TYPE_CHECKING:
@@ -314,11 +315,10 @@ def _remap_deepseek_v4_checkpoint_keys(
         ``lm_head`` via ``shared_head``. Flash omits this key entirely; Flash-Base
         carries it but matches the main head, so we let the main head win.
     """
-    mtp_layer_prefix = f"model.layers.{num_hidden_layers}"
     routed_moe_scale_name = "weight_scale_inv"
     for key, value in weights.items():
         if (
-            key.startswith("layers.")
+            (key.startswith("layers.") or re.match(r"^mtp\.\d+\.", key))
             and ".ffn.experts." in key
             and key.endswith(".weight")
             and getattr(value, "ndim", 0) == 2
@@ -444,14 +444,17 @@ def _remap_deepseek_v4_checkpoint_keys(
             out[f"model.{k}"] = v
             continue
 
-        # mtp.0.head.weight is intentionally dropped (Flash-Base only); see
+        # mtp.<n>.head.weight is intentionally dropped (Flash-Base only); see
         # docstring caveats.
-        if k == "mtp.0.head.weight":
+        if re.match(r"^mtp\.\d+\.head\.weight$", k):
             continue
 
-        # mtp.0.* — route to model.layers.{num_hidden_layers}.*
-        if k.startswith("mtp.0."):
-            rest = k[len("mtp.0.") :]
+        # mtp.<n>.* — route to model.layers.{num_hidden_layers + n}.*
+        mtp_match = re.match(r"^mtp\.(\d+)\.(.*)$", k)
+        if mtp_match is not None:
+            mtp_idx = int(mtp_match.group(1))
+            mtp_layer_prefix = f"model.layers.{num_hidden_layers + mtp_idx}"
+            rest = mtp_match.group(2)
             # MTP-only keys: enorm, hnorm map directly; norm maps to
             # shared_head.norm; hc_head_* maps under shared_head; e_proj /
             # h_proj are loaded as two separate Linear modules (no fused
@@ -524,13 +527,40 @@ class DeepseekV4WeightLoader:
         self.model_config = model.model_config
         self.is_draft_model = is_draft_model
 
-    def load_weights(self, weights: Dict, skip_modules: List[str] = []):
+    def load_weights(self,
+                     weights: Dict,
+                     skip_modules: List[str] = [],
+                     initial_bucket_loading: bool = False):
         # If the checkpoint uses raw DS-V4 keys (layers.X.attn.wkv.weight,
         # mtp.0.*, embed.weight, head.weight), rewrite them to the model's
         # named-parameter keys before iterating modules. The detection is by
         # presence of any top-level "layers." key; HF-style checkpoints use
         # "model.layers." and skip this branch.
-        if any(k == "embed.weight" or k.startswith("layers.") for k in weights):
+        raw_checkpoint = any(
+            k in ("embed.weight", "head.weight", "norm.weight")
+            or k.startswith(("layers.", "mtp.", "hc_head_"))
+            for k in weights)
+        active_layer = None
+        if initial_bucket_loading:
+            layer_indices = set()
+            has_top_level = False
+            for key in weights:
+                if key.startswith("layers."):
+                    layer_indices.add(int(key.split(".", 2)[1]))
+                elif (mtp_match := re.match(r"^mtp\.(\d+)\.", key)) is not None:
+                    layer_indices.add(self.config.num_hidden_layers + int(mtp_match.group(1)))
+                elif key.startswith("model.layers."):
+                    layer_indices.add(int(key.split(".", 3)[2]))
+                else:
+                    has_top_level = True
+            if len(layer_indices) > 1 or (layer_indices and has_top_level):
+                raise ValueError(
+                    "Initial weight bucket must contain exactly one model "
+                    f"layer or top-level weights, got layers={sorted(layer_indices)}, "
+                    f"has_top_level={has_top_level}.")
+            active_layer = next(iter(layer_indices), None)
+
+        if raw_checkpoint:
             weights = _remap_deepseek_v4_checkpoint_keys(
                 weights,
                 num_hidden_layers=self.config.num_hidden_layers,
@@ -551,6 +581,10 @@ class DeepseekV4WeightLoader:
             )
             model_params = dict(self.model.named_parameters())
             for pname, p in model_params.items():
+                if initial_bucket_loading:
+                    if active_layer is None or not pname.startswith(
+                            f"model.layers.{active_layer}."):
+                        continue
                 if pname in weights:
                     continue
                 if any(pname.endswith(s) for s in _ones_suffixes):
@@ -816,6 +850,29 @@ class DeepseekV4WeightLoader:
         for name, module in tqdm(all_named_modules.items(), desc="Loading weights"):
             if name.startswith("draft_model"):
                 continue
+            if initial_bucket_loading:
+                if active_layer is None:
+                    if name.startswith("model.layers."):
+                        continue
+                else:
+                    is_target_module = False
+                    if name.startswith("model.layers."):
+                        module_layer = int(name.split(".", 3)[2])
+                        if active_layer >= self.config.num_hidden_layers:
+                            # Runtime may instantiate multiple MTP replicas.
+                            # The existing name rewrite below maps each replica
+                            # back to the checkpoint MTP layer modulo the number
+                            # of checkpoint next-token layers.
+                            checkpoint_mtp_idx = active_layer - self.config.num_hidden_layers
+                            runtime_mtp_idx = module_layer - self.config.num_hidden_layers
+                            is_target_module = (
+                                runtime_mtp_idx % self.config.num_nextn_predict_layers
+                                == checkpoint_mtp_idx
+                            )
+                        else:
+                            is_target_module = module_layer == active_layer
+                    if not is_target_module:
+                        continue
             names = name.split(".")
             parent_module_name = ".".join(names[:-1])
 
@@ -2564,9 +2621,12 @@ class DeepseekV4ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV4Model, Pretrai
             **kwargs,
         )
 
-    def load_weights(self, weights: Dict):
+    def load_weights(self,
+                     weights: Dict,
+                     initial_bucket_loading: bool = False):
         weight_loader = DeepseekV4WeightLoader(self)
-        weight_loader.load_weights(weights)
+        weight_loader.load_weights(
+            weights, initial_bucket_loading=initial_bucket_loading)
 
     def post_load_weights(self):
         layers = self.model.layers[: self.config.num_hidden_layers]
