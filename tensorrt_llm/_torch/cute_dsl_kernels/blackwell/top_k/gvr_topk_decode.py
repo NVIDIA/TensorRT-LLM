@@ -374,16 +374,26 @@ class GvrTopKKernel:
         #    every (dtype, K, N); the M=2 pass is ~free and the R1 falsi shot
         #    covers the 3-7% bracket misses. uh4 (M=4) was silicon-falsified
         #    (mc geomean 0.956 — admission != latency).
-        #  - p1b_cache default = (dtype != fp32): the SMEM gather-cache wins
-        #    +0.8-2.8% on 16-bit (random half-prec gather is the cost); flat/
-        #    negative on fp32 (occupancy at kC=6144), so OFF there.
+        #  - p1b_cache default is cs-aware:
+        #      * cs>1 (cluster): ON for ALL dtypes. The SMEM gather-cache win
+        #        holds and the fp32 occupancy regression that hurts the
+        #        single-CTA path does NOT reproduce in the cluster kernel
+        #        (latency-bound, different SMEM budget). nsys cs=4: K1024
+        #        ~1.01x / K2048 ~1.02x / K512 wash, 0 losses, exact. Matches
+        #        op26 dispatch_p1bc_mc (unconditional ON).
+        #      * cs=1 (single-CTA): (dtype != fp32). The gather-cache wins
+        #        +0.8-2.8% on 16-bit (random half-prec gather is the cost) but
+        #        is flat/negative on fp32 (occupancy at kC=6144), so OFF there.
         #  - kC-diet: K512 single-CTA -> kC=3072 (saves 16KB SMEM; 16-bit win,
         #    fp32 neutral). kC>=2560 is the K512 16-bit tie-safety contract so
         #    3072 is safe; the cluster port and K1024/K2048 stay stock.
         if enable_r0 and r0_qfracs is None:
             r0_qfracs = (0.85, 0.35)
         if enable_r0 and p1b_cache is None:
-            p1b_cache = dtype != cutlass.Float32
+            if cluster_size > 1:
+                p1b_cache = True
+            else:
+                p1b_cache = dtype != cutlass.Float32
         self.p1b_cache = bool(p1b_cache)
         if enable_r0 and top_k == 512 and cluster_size == 1 and self.kC > 3072:
             self.kC = 3072
