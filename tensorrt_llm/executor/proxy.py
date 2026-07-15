@@ -573,7 +573,9 @@ class GenerationExecutorProxy(GenerationExecutor):
             raise RuntimeError(
                 "Executor worker returned error") from ready_signal
 
-        if isinstance(self.mpi_session, MpiPoolSession) and len(status) == 3:
+        # Use the polymorphic predicate: the module-level ``MpiPoolSession``
+        # symbol may be rebound to a factory at runtime, breaking ``isinstance``.
+        if not self.mpi_session.is_comm_session() and len(status) == 3:
             worker_process_identities: List[WorkerProcessIdentity] = status[2]
             self._worker_process_monitor.register(worker_process_identities)
 
