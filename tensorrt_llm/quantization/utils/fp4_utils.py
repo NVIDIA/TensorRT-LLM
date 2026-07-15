@@ -6,6 +6,10 @@ import torch
 SF_DTYPE = torch.uint8
 FLOAT4_E2M1X2 = torch.uint8
 
+# Number of elements sharing one NVFP4 E4M3 scale factor
+# (SF_VEC_SIZE in cpp/tensorrt_llm/kernels/quantization.h).
+NVFP4_SF_VEC_SIZE = 16
+
 # For GEMM autotuning.
 # Taken from https://github.com/NVIDIA/TensorRT-LLM/blob/main/cpp/include/tensorrt_llm/runtime//modelConfig.h#L38
 # TODO: move to model config, tune for blackwell hardware
