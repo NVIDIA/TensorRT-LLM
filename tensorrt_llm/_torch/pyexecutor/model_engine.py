@@ -1461,9 +1461,26 @@ class PyTorchModelEngine(ModelEngine):
                                  resource_manager=resource_manager)
                 torch.cuda.synchronize()
 
+    @staticmethod
+    def _release_megamoe_profiling_scratch():
+        # Free the MegaMoE CuteDSL AutoTuner profiling scratch and evict the
+        # tuning-latched local workspaces. MUST run per engine (target AND
+        # draft) after ITS autotune warmup, BEFORE its CUDA-graph capture: a
+        # later cache miss would otherwise evict a workspace whose raw
+        # pointer a captured graph already baked in.
+        from ..custom_ops import cute_dsl_megamoe_custom_op as _megamoe_op
+        release_megamoe_scratch = getattr(_megamoe_op,
+                                          "release_megamoe_profiling_scratch",
+                                          None)
+        if release_megamoe_scratch is not None:
+            release_megamoe_scratch()
+
     def _run_autotuner_warmup(self, resource_manager: ResourceManager):
         """Runs a forward pass to populate the autotuner cache."""
         if not self.llm_args.enable_autotuner:
+            # Still evict warmup-latched workspaces before capture even
+            # though no tuning ran (matches the enabled path).
+            self._release_megamoe_profiling_scratch()
             return
         AutoTuner.get().setup_distributed_state(self.mapping, self.dist)
         logger.info("Running autotuner warmup...")
@@ -1513,6 +1530,8 @@ class PyTorchModelEngine(ModelEngine):
             f"[Autotuner] Cache size after warmup is {len(AutoTuner.get().profiling_cache)}"
         )
         AutoTuner.get().print_profiling_cache()
+
+        self._release_megamoe_profiling_scratch()
 
         # Clear workspace buffers allocated during the autotuner forward pass.
         # The autotuner runs a context-only forward with max_num_tokens, which

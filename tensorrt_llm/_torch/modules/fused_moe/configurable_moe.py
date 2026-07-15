@@ -158,6 +158,11 @@ class ConfigurableMoE(MoE):
         apply_router_weight_on_input: bool = False,
         layer_idx: Optional[int] = None,
         override_quant_config: Optional["QuantConfig"] = None,
+        # Declared explicitly (not left in **kwargs) so it does NOT flow into
+        # the base ``MoE.__init__`` below, which rejects unknown kwargs.
+        # Consumed only by the MegaMoECuteDsl backend (bench-only knob; must
+        # be rank-identical).
+        combine_format: str = "bf16",
         **kwargs,
     ):
         super().__init__(
@@ -187,6 +192,7 @@ class ConfigurableMoE(MoE):
             model_config=model_config,
             routing_method=routing_method,
             override_quant_config=override_quant_config,
+            combine_format=combine_format,
             **kwargs,
         )
 
@@ -326,6 +332,7 @@ class ConfigurableMoE(MoE):
                 init_load_balancer=False,
                 without_comm=True,
                 activation_type=self.activation_type,
+                combine_format=kwargs.get("combine_format", "bf16"),
             )
 
         # Backend acceptance is validated at the end of ``__init__`` instead
