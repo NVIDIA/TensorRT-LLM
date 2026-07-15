@@ -1843,6 +1843,25 @@ def cbtsResizeSplits(configs) {
     return resized
 }
 
+// True when an exception indicates the K8s dispatcher pod this SLURM stage runs
+// inside died mid-run -- kubelet eviction, container termination, or the JNLP
+// agent otherwise going offline. Retrying inside such a pod is futile (every
+// step runs on the dead agent and fails immediately) and its in-pod cleanup can
+// no longer reach the SLURM controller, so callers stop retrying in place and
+// reconcile the orphaned SLURM job / Jenkins node off-pod. Matches the flattened
+// cause chain so the signal is still recognized when wrapped by the cleanup's
+// AbortException (e.g. "Error during clean up SLURM resources: ... marked
+// offline: Pod failed (Reason: Evicted ...)").
+boolean isDispatcherPodFailure(Throwable e) {
+    def text = FailureClassifier.flattenThrowable(e).collect { it.toString() }.join(" ").toLowerCase()
+    return [
+        "pod failed (reason:",
+        "pod just failed",
+        "pod failed because container terminated",
+        "unable to create live filepath",
+    ].any { text.contains(it) }
+}
+
 def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, gpuCount=1, nodeCount=1, runWithSbatch=false, skipInstallWheel=false, cpver="cp312", String outerAttemptTag="", boolean useClusterDurations=false)
 {
   echo "Run Slurm job with native sbatch: $runWithSbatch"
@@ -1900,6 +1919,15 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
       // User abort / pipeline timeout -- never retry
       throw e
     } catch (Exception e) {
+      // If the K8s dispatcher pod this stage runs inside died mid-run, every
+      // retry attempt would execute on that same dead pod and fail immediately,
+      // and the in-pod cleanup can no longer reach the SLURM controller. Stop
+      // retrying in place and propagate so the pod-level wrapper reconciles the
+      // orphaned SLURM job / Jenkins node off-pod (fail closed).
+      if (isDispatcherPodFailure(e)) {
+        echo "[INFRA-RETRY] ${stageName}: dispatcher pod died mid-run; not retrying on the dead pod (${e.toString()}). Failing closed for off-pod reconciliation."
+        throw e
+      }
       // classify() handles FlowInterruptedException + exit-code-143 +
       // typed throws + cause-chain pattern matching, returning one of
       // PipelineInterruption / InfraFailure / UserFailure. Scope=SLURM
