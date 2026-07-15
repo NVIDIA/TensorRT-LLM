@@ -311,6 +311,18 @@ class GenerationExecutorProxy(GenerationExecutor):
                 result.queue.put(dead_error)
             except Exception:  # noqa: BLE001 - a full/closed queue must not stop the sweep
                 pass
+        # Abandon the owned MPI session NOW rather than at teardown: the dead
+        # pool's manager thread is wedged in an MPI call forever, and CPython
+        # joins non-daemon threads (threading._shutdown) BEFORE the
+        # atexit/GC teardown that runs shutdown() -- deregistering at
+        # teardown time is already too late to let the process exit.
+        if getattr(self, '_owns_mpi_session', False):
+            abandon = getattr(self.mpi_session, 'abandon', None)
+            if abandon is not None:
+                try:
+                    abandon()
+                except Exception as e:  # noqa: BLE001 - best-effort cleanup
+                    logger.debug(f"MPI session abandon failed (ignored): {e!r}")
 
     def _handle_worker_death(self, error: BaseException) -> None:
         """Event-driven worker-death handler.

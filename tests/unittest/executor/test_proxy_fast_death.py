@@ -476,3 +476,31 @@ def test_abandon_mpi_pool_threads_tolerates_missing_pool():
 
     _abandon_mpi_pool_threads(None)
     _abandon_mpi_pool_threads(object())  # no _pool attribute
+
+
+def test_mark_engine_dead_abandons_owned_session_immediately():
+    """Abandon must happen at detection time, not at teardown.
+
+    CPython's exit sequence joins non-daemon threads before atexit/GC can
+    run shutdown(), so a wedged pool manager thread must be deregistered
+    the moment the engine is marked dead.
+    """
+    proxy = _bare_proxy()
+    proxy._owns_mpi_session = True
+    proxy.mpi_session = _Mock()
+
+    proxy._mark_engine_dead(RuntimeError("worker died"))
+    proxy.mpi_session.abandon.assert_called_once_with()
+
+    # Sticky: a second death report must not re-abandon.
+    proxy._mark_engine_dead(RuntimeError("again"))
+    proxy.mpi_session.abandon.assert_called_once_with()
+
+
+def test_mark_engine_dead_leaves_external_session_alone():
+    proxy = _bare_proxy()
+    proxy._owns_mpi_session = False
+    proxy.mpi_session = _Mock()
+
+    proxy._mark_engine_dead(RuntimeError("worker died"))
+    proxy.mpi_session.abandon.assert_not_called()
