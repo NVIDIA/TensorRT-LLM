@@ -439,4 +439,4 @@ def test_phi3_state_dict_keys():
     # Projections are fused: no separate q/k/v or gate/up keys.
     for key in state_dict:
         for unfused in ("q_proj", "k_proj", "v_proj", "gate_proj", "up_proj"):
-            assert unfused not in key, f"Unexpected unfused key: {key}"
+            assert unfused not in key.split("."), f"Unexpected unfused key: {key}"
