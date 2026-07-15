@@ -1135,6 +1135,10 @@ def getPytestBaseCommandLine(
         extraInternalEnv += " CBTS_COVERAGE_CONFIG=${coverageConfigFile}"
         extraInternalEnv += " CBTS_MARKER_FILE=${outputPath}/cbts_current_test.txt"
     }
+    // Skip TRTLLM-Gen FMHA JIT warmup for non-performance tests.
+    if (!stageName.contains("-Perf-") && !stageName.contains("-PerfSanity-")) {
+        extraInternalEnv += " TLLM_ENABLE_TRTLLM_GEN_FMHA_JIT_WARMUP=0"
+    }
 
     // Container port allocation environment variables for avoiding port conflicts
     def portEnvVars = ""

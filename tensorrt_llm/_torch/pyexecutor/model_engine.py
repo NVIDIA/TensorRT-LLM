@@ -1412,6 +1412,10 @@ class PyTorchModelEngine(ModelEngine):
         if not issubclass(self.attn_backend.Metadata, TrtllmAttentionMetadata):
             return
 
+        if os.environ.get("TLLM_ENABLE_TRTLLM_GEN_FMHA_JIT_WARMUP", "1") != "1":
+            logger.info("Skipping TRTLLM-Gen FMHA JIT warmup")
+            return
+
         @contextlib.contextmanager
         def trtllm_gen_fmha_jit_warmup():
             previous = self._trtllm_gen_jit_warmup
