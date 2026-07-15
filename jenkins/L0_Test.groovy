@@ -640,14 +640,18 @@ def cleanUpNodeResources(def pipeline, SlurmCluster cluster, String clusterName,
 // offline), the in-pod cleanup can no longer reach the controller, so the SLURM
 // job and any Jenkins agent node leak. slurmResourceRegistry records the live
 // resources per stage -- the dispatcher pod spec (from the pod wrapper) and the
-// SLURM job / Jenkins node identity (from the stage body). The normal cleanup
-// path and the finalizer remove an entry once its resources are actually torn
-// down; whatever is left is reconciled by running the cleanup from a *fresh*
-// pod. Only serializable primitives are stored (no SlurmCluster/Throwable) so
-// pipeline persistence is unaffected; the cluster is rebuilt from clusterName.
-// Keyed by stageName: dispatcher-pod deaths are no longer retried in place (see
-// isDispatcherPodFailure), so a stage has at most one orphaned attempt.
-@Field def slurmResourceRegistry = new java.util.concurrent.ConcurrentHashMap()
+// SLURM job / Jenkins node identity (from the stage body, re-registered per
+// inner attempt). Deregistering after a successful cleanup clears only the
+// per-attempt job/node identity and keeps the stage-level podSpec, so a *later*
+// attempt's dispatcher-pod death can still be reconciled off-pod (the pod spec
+// is registered once, before the inner retry loop). Only serializable
+// primitives are stored (no SlurmCluster/Throwable) so pipeline persistence is
+// unaffected; the cluster is rebuilt from clusterName. Plain maps: pipeline
+// Groovy runs single-threaded under CPS (parallel branches interleave at step
+// boundaries, never execute Groovy concurrently) and each stage writes its own
+// key, so no concurrent map corruption -- and the Jenkins script sandbox forbids
+// `new ConcurrentHashMap`. Keyed by stageName.
+@Field def slurmResourceRegistry = [:]
 
 void registerSlurmResource(String stageName, Map fields) {
     if (!stageName) {
@@ -655,17 +659,25 @@ void registerSlurmResource(String stageName, Map fields) {
     }
     def entry = slurmResourceRegistry.get(stageName)
     if (entry == null) {
-        entry = new java.util.concurrent.ConcurrentHashMap()
+        entry = [:]
         slurmResourceRegistry.put(stageName, entry)
     }
-    // ConcurrentHashMap rejects null values; skip absent fields. Writers for a
-    // given stage run sequentially (pod wrapper, then stage body), so no merge race.
+    // Skip absent fields. Writers for a given stage run sequentially (pod
+    // wrapper, then stage body), so no merge race.
     fields.each { k, v -> if (v != null) { entry.put(k, v) } }
 }
 
+// Called once an attempt's resources are actually torn down: drop the per-attempt
+// job/node identity but keep the stage's podSpec (needed to launch a cleanup pod
+// for a later attempt). An entry left with only a podSpec is inert -- finalize
+// and the post-build sweep both skip entries with no job/node.
 void deregisterSlurmResource(String stageName) {
-    if (stageName) {
-        slurmResourceRegistry.remove(stageName)
+    if (!stageName) {
+        return
+    }
+    def entry = slurmResourceRegistry.get(stageName)
+    if (entry != null) {
+        ["clusterName", "jobUID", "nodeName", "slurmJobId", "usedSbatch"].each { entry.remove(it) }
     }
 }
 
