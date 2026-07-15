@@ -526,6 +526,7 @@ def cleanUpSlurmResources(def pipeline, SlurmCluster cluster, String clusterName
     CloudManager.withSlurmSshCredentials(pipeline, clusterName, cluster) { remote ->
         def jobWorkspace = "/home/svc_tensorrt/bloom/scripts/${jobUID}"
 
+        Utils.exec(pipeline, script: "echo \"=== [Clean Up Slurm Resource] START: \$(date '+%Y-%m-%d %H:%M:%S') jobUID=${jobUID} ===\"")
         Utils.exec(pipeline, script: "echo Sleeping to allow Slurm job completion; sleep 30")
 
         def slurmJobID = Utils.exec(
@@ -542,7 +543,7 @@ def cleanUpSlurmResources(def pipeline, SlurmCluster cluster, String clusterName
         if (!slurmJobID || !slurmJobID.isNumber()) {
             echo "Slurm job may not submit successfully. No job ID found."
         } else {
-            Utils.exec(pipeline, script: "echo Slurm job ID: ${slurmJobID}")
+            Utils.exec(pipeline, script: "echo \"=== [Clean Up Slurm Resource] gpu_job_id=${slurmJobID} ===\"")
 
             Utils.exec(
                 pipeline,
@@ -574,7 +575,7 @@ def cleanUpSlurmResources(def pipeline, SlurmCluster cluster, String clusterName
             )
         )
 
-        Utils.exec(pipeline, script: "echo Slurm job ID: ${slurmJobID} cleaned up")
+        Utils.exec(pipeline, script: "echo \"=== [Clean Up Slurm Resource] END: \$(date '+%Y-%m-%d %H:%M:%S') gpu_job_id=${slurmJobID} jobUID=${jobUID} cleaned up ===\"")
     }
 }
 
@@ -1700,16 +1701,19 @@ bash "${scriptFatBuildPathNode}" "\$fatSqshPath" "\$baseSqshPath" "${llmTarfile}
                 if (cluster.fatBuilderArgs != null) {
                     scriptPrepareContent = """#!/bin/bash
 set -euo pipefail
+echo "=== [Prepare Container] STAGE START: \$(date '+%Y-%m-%d %H:%M:%S') on \$(hostname) ==="
 mkdir -p "${fatSqshDir}"
 fatHash=\$(printf '%s' "${llmTarfile}|${LLM_DOCKER_IMAGE}" | sha256sum | cut -d' ' -f1 | head -c 16)
 fatSqshPath="${fatSqshDir}/fat-\${fatHash}.sqsh"
 
 if [ -f "\$fatSqshPath" ]; then
     echo "Fat sqsh already cached: \$fatSqshPath"
+    echo "=== [Prepare Container] STAGE END (cache hit): \$(date '+%Y-%m-%d %H:%M:%S') fat_sqsh=\$fatSqshPath ==="
     exit 0
 fi
 
 BUILDER_ID=""
+STATUS=""
 EXISTING=\$(squeue -h -n "fat_build_\${fatHash}" -o "%i" 2>/dev/null | head -1 || true)
 if [ -n "\$EXISTING" ]; then
     echo "Fat sqsh builder already running as job \$EXISTING, will wait for it"
@@ -1725,10 +1729,11 @@ else
     # output is a line "<jobid>" or "<jobid>;<cluster>". Extract the numeric job id only.
     BUILDER_ID=\$(printf '%s\\n' "\$BUILDER_OUT" | grep -oE '^[0-9]+' | tail -1)
     if [ "\$BUILDER_RC" -eq 0 ] && [ -n "\$BUILDER_ID" ]; then
-        echo "Submitted fat sqsh builder as job \$BUILDER_ID"
+        echo "Submitted fat sqsh builder as cpu_builder_job_id=\$BUILDER_ID at \$(date '+%Y-%m-%d %H:%M:%S')"
     else
         echo "Fat sqsh builder submission failed (rc=\$BUILDER_RC): \$BUILDER_OUT"
         echo "GPU test job will fall back to base sqsh + full install"
+        echo "=== [Prepare Container] STAGE END (builder submission failed): \$(date '+%Y-%m-%d %H:%M:%S') ==="
         exit 0
     fi
 fi
@@ -1758,6 +1763,7 @@ if [ -f "\$fatSqshPath" ]; then
 else
     echo "Fat sqsh not found after builder completed (status=\$STATUS); GPU job will fall back to base sqsh + full install"
 fi
+echo "=== [Prepare Container] STAGE END: \$(date '+%Y-%m-%d %H:%M:%S') cpu_builder_job_id=\$BUILDER_ID final_status=\$STATUS ==="
 """
                 }
                 pipeline.writeFile(file: scriptPreparePathLocal, text: scriptPrepareContent)
@@ -1786,6 +1792,7 @@ fi
                     # Clean up workspace: remove all files/dirs not in the keep list
                     find "${jobWorkspace}" -maxdepth 1 -mindepth 1 ${findKeepWhenRetryArgs} -exec rm -rf {} +
 
+                    echo "=== [Run Pytest] Submitting GPU SLURM job: \$(date '+%Y-%m-%d %H:%M:%S') on \$(hostname) ==="
                     # Prepare Container stage has already completed; fat sqsh is ready on disk
                     # (or builder failed, in which case the GPU job falls back to base sqsh).
                     touch ${slurmJobLogPath}
@@ -1794,7 +1801,7 @@ fi
                         echo "Error: Slurm job submission failed, no job ID returned."
                         exit 1
                     fi
-                    echo "Submitted Slurm job \$jobId"
+                    echo "=== [Run Pytest] GPU SLURM job submitted: gpu_job_id=\$jobId time=\$(date '+%Y-%m-%d %H:%M:%S') ==="
                     # Save Slurm job ID for later steps to retrieve
                     echo "\$jobId" > "${jobWorkspace}/slurm_job_id.txt"
                 """.replaceAll("(?m)^\\s*", "").trim()
@@ -1854,6 +1861,7 @@ fi
                     trap 'rc=\$?; echo "Error in file \${BASH_SOURCE[0]} on line \$LINENO: \$BASH_COMMAND (exit \$rc)"; exit \$rc' ERR
 
                     jobId=${slurmJobId}
+                    echo "=== [Run Pytest] Tracking GPU SLURM job_id=\$jobId START: \$(date '+%Y-%m-%d %H:%M:%S') ==="
                     tail -f ${slurmJobLogPath} &
                     tailPid=\$!
 
@@ -1911,6 +1919,7 @@ fi
                     echo "Slurm job \$jobId nodelist: \${NODE_LIST:-UNKNOWN}"
                     printf '%s\n' "\$NODE_LIST" > "${jobWorkspace}/slurm_node_list.txt"
 
+                    echo "=== [Run Pytest] Tracking GPU SLURM job_id=\$jobId END: \$(date '+%Y-%m-%d %H:%M:%S') node=\${NODE_LIST:-UNKNOWN} status=\$STATUS exit_code=\$EXIT_CODE ==="
                     if [[ "\$STATUS" == "COMPLETED" && \$EXIT_CODE -eq 0 ]]; then
                         echo "Pytest succeed in Slurm job \$jobId"
                         echo "Status: \$STATUS | Exit_code \$EXIT_CODE"
