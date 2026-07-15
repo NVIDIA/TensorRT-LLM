@@ -406,8 +406,13 @@ endif()
 option(ENABLE_BOLT_COMPATIBLE "Enable BOLT-compatible build flags" OFF)
 if(ENABLE_BOLT_COMPATIBLE AND NOT WIN32)
   message(STATUS "BOLT compatible flags enabled")
-  # Compiler flags for C/C++
-  add_compile_options(-fno-reorder-blocks-and-partition -fno-plt)
+  # Compiler flags for C/C++ -fno-reorder-blocks-and-partition is GCC-only
+  # (required for GCC 8+ per BOLT docs). Clang does not support this flag and
+  # does not enable the corresponding optimization by default.
+  if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    add_compile_options(-fno-reorder-blocks-and-partition)
+  endif()
+  add_compile_options(-fno-plt)
   # Linker flags - applies to shared, module, and executable targets
   add_link_options(-Wl,--emit-relocs)
   # Disable stripping - required for BOLT (affects pybind11 POST_BUILD strip)

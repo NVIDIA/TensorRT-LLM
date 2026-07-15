@@ -42,7 +42,19 @@ requires_gemma4_transformers = pytest.mark.skipif(
 _LLM_MODELS_ROOT = os.environ.get("LLM_MODELS_ROOT")
 if _LLM_MODELS_ROOT is None:
     pytest.skip("LLM_MODELS_ROOT not set", allow_module_level=True)
-_GEMMA4_MODELS = os.path.join(_LLM_MODELS_ROOT, "gemma4")
+# Canonical model root subdir is "gemma" (see tests/test_common/llm_data.py:
+# "google/gemma-4-E2B-it" -> "gemma/gemma-4-E2B-it"), not "gemma4".
+_GEMMA4_MODELS = os.path.join(_LLM_MODELS_ROOT, "gemma")
+
+# Imported after the module-level skip guard so that collecting this module on
+# a machine without LLM_MODELS_ROOT does not pull in the runtime import.
+from tensorrt_llm.llmapi import LLM, KvCacheConfig, SamplingParams  # noqa: E402
+
+# These dummy models are tiny, but the default KV-cache fraction sizes the pool
+# to most of the (very large B200) device memory, leaving nothing for the other
+# executor components -> OOM at executor creation. Cap it so the whole pipeline
+# fits regardless of card size.
+_KV_CACHE_CONFIG = KvCacheConfig(free_gpu_memory_fraction=0.5)
 
 # Real model paths — used for tokenizer + base config
 MODEL_PATHS = {
@@ -51,11 +63,6 @@ MODEL_PATHS = {
     "31B": os.path.join(_GEMMA4_MODELS, "gemma-4-31B-it"),
     "E4B": os.path.join(_GEMMA4_MODELS, "gemma-4-E4B-it"),
 }
-
-
-def _model_available(name: str) -> bool:
-    path = MODEL_PATHS.get(name, "")
-    return os.path.isfile(os.path.join(path, "config.json"))
 
 
 def _make_dummy_config_dir(
@@ -73,10 +80,20 @@ def _make_dummy_config_dir(
 
     Returns path to the temp directory.
     """
+    # Fail loudly rather than silently skipping when the real checkpoint is
+    # missing: these tests are registered in CI with LLM_MODELS_ROOT set, so an
+    # absent artifact is a setup error, not a reason to report a passing skip.
+    config_path = os.path.join(model_path, "config.json")
+    if not os.path.isfile(config_path):
+        raise FileNotFoundError(
+            f"Gemma4 test checkpoint not found: {config_path}. These E2E tests "
+            f"require the real gemma-4 models under $LLM_MODELS_ROOT/gemma."
+        )
+
     tmp_dir = tempfile.mkdtemp(prefix="gemma4_dummy_")
 
     # Load and patch config
-    with open(os.path.join(model_path, "config.json")) as f:
+    with open(config_path) as f:
         config = json.load(f)
 
     tc = config.get("text_config", config)
@@ -176,14 +193,17 @@ def _make_dummy_config_dir(
 
 
 @requires_gemma4_transformers
-@pytest.mark.skipif(not _model_available("26B"), reason="gemma-4-26B-A4B-it not found")
 def test_e2e_text_26b_dummy():
     """E2E text generation for 26B-A4B (MoE + K=V + softcap + hybrid attn)."""
-    from tensorrt_llm.llmapi import LLM, SamplingParams
-
     dummy_dir = _make_dummy_config_dir(MODEL_PATHS["26B"])
     try:
-        llm = LLM(dummy_dir, load_format="dummy", attn_backend="FLASHINFER", dtype="bfloat16")
+        llm = LLM(
+            dummy_dir,
+            load_format="dummy",
+            attn_backend="FLASHINFER",
+            dtype="bfloat16",
+            kv_cache_config=_KV_CACHE_CONFIG,
+        )
         with llm:
             output = llm.generate(["Hello"], SamplingParams(max_tokens=4))
             assert len(output) == 1
@@ -193,14 +213,17 @@ def test_e2e_text_26b_dummy():
 
 
 @requires_gemma4_transformers
-@pytest.mark.skipif(not _model_available("E2B"), reason="gemma-4-E2B-it not found")
 def test_e2e_text_e2b_dummy():
     """E2E text generation for E2B (KV sharing + PLE + double-wide MLP)."""
-    from tensorrt_llm.llmapi import LLM, SamplingParams
-
     dummy_dir = _make_dummy_config_dir(MODEL_PATHS["E2B"])
     try:
-        llm = LLM(dummy_dir, load_format="dummy", attn_backend="FLASHINFER", dtype="bfloat16")
+        llm = LLM(
+            dummy_dir,
+            load_format="dummy",
+            attn_backend="FLASHINFER",
+            dtype="bfloat16",
+            kv_cache_config=_KV_CACHE_CONFIG,
+        )
         with llm:
             output = llm.generate(["Hello"], SamplingParams(max_tokens=4))
             assert len(output) == 1
@@ -210,14 +233,17 @@ def test_e2e_text_e2b_dummy():
 
 
 @requires_gemma4_transformers
-@pytest.mark.skipif(not _model_available("31B"), reason="gemma-4-31B-it not found")
 def test_e2e_text_31b_dummy():
     """E2E text generation for 31B (K=V + hybrid attn + softcap)."""
-    from tensorrt_llm.llmapi import LLM, SamplingParams
-
     dummy_dir = _make_dummy_config_dir(MODEL_PATHS["31B"])
     try:
-        llm = LLM(dummy_dir, load_format="dummy", attn_backend="FLASHINFER", dtype="bfloat16")
+        llm = LLM(
+            dummy_dir,
+            load_format="dummy",
+            attn_backend="FLASHINFER",
+            dtype="bfloat16",
+            kv_cache_config=_KV_CACHE_CONFIG,
+        )
         with llm:
             output = llm.generate(["Hello"], SamplingParams(max_tokens=4))
             assert len(output) == 1
@@ -227,14 +253,57 @@ def test_e2e_text_31b_dummy():
 
 
 @requires_gemma4_transformers
-@pytest.mark.skipif(not _model_available("E4B"), reason="gemma-4-E4B-it not found")
+@pytest.mark.parametrize("max_seq_len", [256, 512])
+def test_e2e_text_e2b_dummy_small_max_seq_len(max_seq_len):
+    """E2E with max_seq_len <= sliding_window (256 and 512).
+
+    Regression test: when max_seq_len is at most the sliding window size, all
+    attention windows clamp to max_seq_len, the KV cache manager reports a
+    single window (is_vswa False), and the FlashInfer metadata used to skip
+    the per-pool page-index mapping — while the pools still differ by
+    head_dim. The shared page-index list then sends out-of-range page ids to
+    the smaller (global head_dim) pool and append_paged_kv_cache crashes with
+    an illegal memory access during the warmup prefill.
+    """
+    # Real E2B geometry with dummy weights: the sliding (head_dim 256) and
+    # global (head_dim 512) layers must keep different page-index scales,
+    # and sliding_window must stay 512 so both max_seq_len values are at
+    # most the window. Shrinking the config changes both and hides the bug.
+    dummy_dir = _make_dummy_config_dir(
+        MODEL_PATHS["E2B"],
+        dummy_head_dim=256,
+        dummy_global_head_dim=512,
+        shrink_hidden=False,
+    )
+    try:
+        llm = LLM(
+            dummy_dir,
+            load_format="dummy",
+            attn_backend="FLASHINFER",
+            dtype="bfloat16",
+            max_seq_len=max_seq_len,
+            kv_cache_config=_KV_CACHE_CONFIG,
+        )
+        with llm:
+            output = llm.generate(["Hello"], SamplingParams(max_tokens=4))
+            assert len(output) == 1
+            assert len(output[0].outputs[0].token_ids) > 0
+    finally:
+        shutil.rmtree(dummy_dir, ignore_errors=True)
+
+
+@requires_gemma4_transformers
 def test_e2e_text_e4b_dummy():
     """E2E text generation for E4B (KV sharing + hybrid attn)."""
-    from tensorrt_llm.llmapi import LLM, SamplingParams
-
     dummy_dir = _make_dummy_config_dir(MODEL_PATHS["E4B"])
     try:
-        llm = LLM(dummy_dir, load_format="dummy", attn_backend="FLASHINFER", dtype="bfloat16")
+        llm = LLM(
+            dummy_dir,
+            load_format="dummy",
+            attn_backend="FLASHINFER",
+            dtype="bfloat16",
+            kv_cache_config=_KV_CACHE_CONFIG,
+        )
         with llm:
             output = llm.generate(["Hello"], SamplingParams(max_tokens=4))
             assert len(output) == 1
@@ -249,13 +318,10 @@ def test_e2e_text_e4b_dummy():
 
 
 @requires_gemma4_transformers
-@pytest.mark.skipif(not _model_available("26B"), reason="gemma-4-26B-A4B-it not found")
 def test_e2e_multimodal_26b_dummy():
     """E2E multimodal: image → vision tower → embedder → LLM → output."""
     import numpy as np
     from PIL import Image
-
-    from tensorrt_llm.llmapi import LLM, SamplingParams
 
     dummy_dir = _make_dummy_config_dir(MODEL_PATHS["26B"])
     try:
@@ -277,7 +343,13 @@ def test_e2e_multimodal_26b_dummy():
             tokenize=False,
         )
 
-        llm = LLM(dummy_dir, load_format="dummy", attn_backend="FLASHINFER", dtype="bfloat16")
+        llm = LLM(
+            dummy_dir,
+            load_format="dummy",
+            attn_backend="FLASHINFER",
+            dtype="bfloat16",
+            kv_cache_config=_KV_CACHE_CONFIG,
+        )
         with llm:
             img = Image.fromarray(np.random.randint(0, 255, (224, 224, 3), dtype=np.uint8))
             prompt = {

@@ -58,7 +58,6 @@ from .llm_request import ExecutorResponse, LlmRequestState
 from .mamba_cache_manager import (BaseMambaCacheManager,
                                   CppMambaHybridCacheManager,
                                   MixedMambaHybridCacheManager,
-                                  use_cpp_mamba_cache_manager,
                                   use_py_mamba_cache_manager)
 from .model_engine import PyTorchModelEngine
 from .py_executor import PyExecutor
@@ -82,7 +81,7 @@ def ceil_div(a: int, b: int) -> int:
 def _non_hybrid_kv_cache_manager_cls(config, kv_cache_config: KvCacheConfig):
     # Models with per-layer head_dim (e.g., Gemma4 hybrid attention)
     # require KVCacheManagerV2 for per-layer buffer sizes.
-    needs_v2 = (kv_cache_config.use_kv_cache_manager_v2
+    needs_v2 = (kv_cache_config.use_kv_cache_manager_v2 is True
                 or is_gemma4_hybrid(config))
     return KVCacheManagerV2 if needs_v2 else KVCacheManager
 
@@ -94,13 +93,13 @@ def get_kv_cache_manager_cls(
         cache_transceiver_config: Optional[CacheTransceiverConfig] = None):
     """Resolve the concrete KV cache manager class for ``model_config``.
 
-    For hybrid mamba models the choice between ``Mixed`` ( TRTLLM_USE_CPP_MAMBA / TRTLLM_USE_PY_MAMBA) and
-    ``Cpp`` (unified pool with block reuse) is made here. Callers that don't
-    care about disagg can omit ``is_disagg`` and get the unified-pool default.
+    For hybrid mamba models the choice between ``Mixed`` (TRTLLM_USE_PY_MAMBA)
+    and ``Cpp`` (unified pool with block reuse) is made here. Callers that
+    don't care about disagg can omit ``is_disagg`` and get the unified-pool
+    default.
 
     Env-var overrides (agg mode only — disagg picks its inner impl via
     ``cache_transceiver_config.transceiver_runtime``):
-      * ``TRTLLM_USE_CPP_MAMBA=1`` — Mixed manager with CppMambaCacheManager.
       * ``TRTLLM_USE_PY_MAMBA=1``  — Mixed manager with PythonMambaCacheManager.
     """
     config = model_config.pretrained_config
@@ -136,10 +135,6 @@ def get_kv_cache_manager_cls(
             return MixedMambaHybridCacheManager
         if kv_cache_config.enable_block_reuse:
             return CppMambaHybridCacheManager
-        if use_cpp_mamba_cache_manager():
-            logger.info(
-                "Using MixedMambaHybridCacheManager for hybrid mamba model")
-            return MixedMambaHybridCacheManager
         if (cache_transceiver_config is not None
                 and cache_transceiver_config.transceiver_runtime == "PYTHON"):
             logger.info("Python transceiver detected; using "
@@ -322,6 +317,8 @@ class KvCacheCreator:
         self._kv_cache_config = kv_cache_config
         self._max_kv_tokens_in = self._kv_cache_config.max_tokens
         self._max_gpu_total_bytes_in = self._kv_cache_config.max_gpu_total_bytes
+        self._pool_ratio_in = self._kv_cache_config.pool_ratio
+        self._avg_seq_len_in = self._kv_cache_config.avg_seq_len
         self._max_num_tokens = max_num_tokens
         self._max_beam_width = max_beam_width
         self._kv_connector_manager = kv_connector_manager
@@ -417,9 +414,9 @@ class KvCacheCreator:
                         f"Gemma4 hybrid attention requires KVCacheManagerV2, "
                         f"which is not yet supported with {incompat_str}. "
                         f"Disable these features to run Gemma4 hybrid models.")
-                # Plain V2 (user opt-in via ``use_kv_cache_manager_v2=True``):
-                # V2 was a preference, not a structural requirement, so we
-                # can safely fall back to V1.
+                # Plain V2 (explicitly enabled or selected by a model default):
+                # V2 was a preference, not a structural requirement, so we can
+                # safely fall back to V1.
                 logger.warning(
                     "KVCacheManagerV2 is not supported with %s. "
                     "Falling back to KVCacheManager.", incompat_str)
@@ -755,6 +752,11 @@ class KvCacheCreator:
             max_tokens = min(
                 estimate_max_tokens, self._kv_cache_config.max_tokens
             ) if self._kv_cache_config.max_tokens is not None else estimate_max_tokens
+            # User-provided pool sizing can underprovision the temporary
+            # estimation cache and cause warmup to hang or fail. Override it
+            # for estimation, then restore it in configure_kv_cache_capacity().
+            self._kv_cache_config.pool_ratio = None
+            self._kv_cache_config.avg_seq_len = self._max_seq_len
             if self._is_kv_cache_manager_v2:
                 free_mem, _ = torch.cuda.mem_get_info()
                 max_gpu_total_bytes = int(
@@ -878,6 +880,11 @@ class KvCacheCreator:
         kv_cache_max_memory = self._cal_max_memory(peak_memory,
                                                    total_gpu_memory, fraction,
                                                    allocated_bytes)
+
+        # Estimation uses inferred pool sizing; the final manager uses the
+        # user-provided configuration.
+        self._kv_cache_config.pool_ratio = self._pool_ratio_in
+        self._kv_cache_config.avg_seq_len = self._avg_seq_len_in
 
         # NOTE:
         # For KVCacheManager, KvCacheCreator currently controls capacity using two parameters in KVCacheConfig:
@@ -1819,6 +1826,7 @@ def _create_kv_cache_manager(
             dtype=kv_cache_dtype,
             spec_config=spec_config,
             vocab_size=config.vocab_size,
+            max_num_tokens=max_num_tokens,
             max_beam_width=max_beam_width,
             is_draft=is_draft,
             kv_connector_manager=kv_connector_manager
@@ -2051,6 +2059,43 @@ def create_kv_cache_compression_manager(
     return None
 
 
+def compute_max_num_sequences(mapping: Mapping,
+                              max_batch_size: int,
+                              disable_overlap_scheduler: bool,
+                              enable_overlap_headroom: bool = False) -> int:
+    """Size the sequence-slot pool (and the sampler state it indexes).
+
+    ``enable_overlap_headroom`` is intentionally opt-in. DeepSeek-V4 needs a
+    second non-PP slot set because the V2 scheduler can backfill seats before
+    the overlap scheduler releases the previous iteration's terminal slots.
+    Other models retain their established sizing until that behavior is
+    validated independently. Pipeline parallelism already sizes the pool by
+    ``pp_size``.
+    """
+    if mapping.has_pp():
+        num_micro_batches = mapping.pp_size
+    else:
+        num_micro_batches = (2 if enable_overlap_headroom
+                             and not disable_overlap_scheduler else 1)
+    return max_batch_size * num_micro_batches
+
+
+def should_enable_dsv4_adp_dummy_fixes(model_type: Optional[str],
+                                       mapping: Mapping) -> bool:
+    """Gate DSv4 ADP dummy behavior while PP remains follow-up scope."""
+    return model_type == "deepseek_v4" and not mapping.has_pp()
+
+
+def should_enable_dsv4_overlap_headroom(
+        model_type: Optional[str], spec_config: Optional[SpeculativeConfig],
+        mapping: Mapping, disable_overlap_scheduler: bool) -> bool:
+    """Gate extra sequence slots to the validated DSv4 MTP overlap path."""
+    return (should_enable_dsv4_adp_dummy_fixes(model_type, mapping)
+            and spec_config is not None
+            and spec_config.spec_dec_mode.is_mtp_eagle_one_model()
+            and not disable_overlap_scheduler)
+
+
 def create_py_executor_instance(
     *,
     dist,
@@ -2077,6 +2122,7 @@ def create_py_executor_instance(
     virtual_memory_pools: Optional[dict] = None,
     execution_stream: Optional[torch.cuda.Stream] = None,
     dwdp_manager: Optional[DwdpManager] = None,
+    max_num_sequences: Optional[int] = None,
 ) -> PyExecutor:
     set_low_latency_dispatch(
         getattr(llm_args, 'enable_low_latency_host_dispatch', False))
@@ -2085,7 +2131,9 @@ def create_py_executor_instance(
 
     spec_config = model_engine.spec_config
 
-    max_num_sequences = max_batch_size * mapping.pp_size
+    if max_num_sequences is None:
+        max_num_sequences = compute_max_num_sequences(
+            mapping, max_batch_size, llm_args.disable_overlap_scheduler)
 
     logger.info(
         f"max_seq_len={max_seq_len}, max_num_requests={max_num_sequences}, max_num_tokens={max_num_tokens}, max_batch_size={max_batch_size}"
@@ -2282,7 +2330,9 @@ def create_py_executor_instance(
 
     # When scheduler_capacity == 1, attention dp dummy request will prevent the scheduling of DISAGG_GENERATION_INIT.
     # Enlarge scheduler capacity to avoid DISAGG_GENERATION_INIT stuck in the scheduler.
-    scheduler_capacity = max_num_sequences
+    # V1 scheduler handles overlap via two_step_lookahead, so skip the
+    # slot-pool overlap factor here.
+    scheduler_capacity = max_batch_size * mapping.pp_size
     if scheduler_capacity == 1 and mapping.enable_attention_dp and kv_cache_manager:
         scheduler_capacity += 1
 
@@ -2436,11 +2486,15 @@ def create_torch_sampler_args(
     speculative_config: SpeculativeConfig,
     max_beam_width: int,
     disable_overlap_scheduler: bool,
-    disable_flashinfer_sampling: bool,
     enable_async_worker: bool,
     enable_speculative_beam_history_d2h: bool,
+    max_num_sequences: Optional[int] = None,
 ):
-    max_num_sequences = max_batch_size * mapping.pp_size
+    # The sampler's per-slot state is indexed by sequence slots, so it must
+    # be sized identically to the executor's slot pool.
+    if max_num_sequences is None:
+        max_num_sequences = compute_max_num_sequences(
+            mapping, max_batch_size, disable_overlap_scheduler)
     max_draft_len = (0 if speculative_config is None else
                      speculative_config.max_draft_len)
     max_total_draft_tokens = (0 if speculative_config is None else
@@ -2452,7 +2506,6 @@ def create_torch_sampler_args(
         max_total_draft_tokens=max_total_draft_tokens,
         max_num_sequences=max_num_sequences,
         max_beam_width=max_beam_width,
-        disable_flashinfer_sampling=disable_flashinfer_sampling,
         disable_overlap_scheduler=disable_overlap_scheduler,
         enable_async_worker=enable_async_worker,
         enable_speculative_beam_history_d2h=enable_speculative_beam_history_d2h,
@@ -2471,7 +2524,7 @@ def instantiate_sampler(
     speculative_config: SpeculativeConfig,
     decoding_config: trtllm.DecodingConfig,
     kv_cache_config: KvCacheConfig,
-    disable_flashinfer_sampling: bool,
+    max_num_sequences: Optional[int] = None,
 ):
     enable_async_worker = (confidential_compute_enabled()
                            or llm_args.sampler_force_async_worker)
@@ -2483,10 +2536,10 @@ def instantiate_sampler(
         speculative_config=speculative_config,
         max_beam_width=max_beam_width,
         disable_overlap_scheduler=llm_args.disable_overlap_scheduler,
-        disable_flashinfer_sampling=disable_flashinfer_sampling,
         enable_async_worker=enable_async_worker,
         enable_speculative_beam_history_d2h=llm_args.
         enable_speculative_beam_history_d2h,
+        max_num_sequences=max_num_sequences,
     )
     decoding_mode = get_decoding_mode(decoding_config=decoding_config,
                                       max_beam_width=max_beam_width)
@@ -2515,7 +2568,8 @@ def instantiate_sampler(
                              max_beam_width=max_beam_width,
                              decoding_config=decoding_config,
                              kv_cache_config=kv_cache_config,
-                             enable_async_worker=enable_async_worker)
+                             enable_async_worker=enable_async_worker,
+                             max_num_sequences=max_num_sequences)
     if not engine.model.model_config.is_generation:
         # NOTE: choose sampler based on model type
         return EarlyStopSampler()
