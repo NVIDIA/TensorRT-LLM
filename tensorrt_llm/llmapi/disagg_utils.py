@@ -30,6 +30,13 @@ def validate_config_bool(value: Any, field_name: str) -> bool:
         f"{field_name} must be a boolean, got {type(value).__name__}")
 
 
+def validate_config_non_negative_int(value: Any, field_name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(
+            f"{field_name} must be a non-negative integer, got {value!r}")
+    return value
+
+
 class ServerRole(IntEnum):
     CONTEXT = 0
     GENERATION = 1
@@ -251,7 +258,8 @@ def extract_disagg_cfg(hostname: str = 'localhost',
         allow_request_chat_template, "allow_request_chat_template")
     config.gen_strip_message_history = gen_strip_message_history
     config.gen_tokids_ctxbytes = gen_tokids_ctxbytes
-    config.server_keep_alive_timeout = server_keep_alive_timeout
+    config.server_keep_alive_timeout = validate_config_non_negative_int(
+        server_keep_alive_timeout, "server_keep_alive_timeout")
     return config
 
 

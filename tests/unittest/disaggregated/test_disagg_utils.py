@@ -131,6 +131,20 @@ def test_server_keep_alive_timeout(tmp_path):
         yaml.dump(cfg, f)
     assert parse_disagg_config_file(yaml_file).server_keep_alive_timeout == 3600
 
+    # Zero is a valid boundary value.
+    cfg["server_keep_alive_timeout"] = 0
+    assert extract_disagg_cfg(**cfg).server_keep_alive_timeout == 0
+
+
+@pytest.mark.parametrize("value", [None, "10", 10.0, True, False, -1])
+def test_server_keep_alive_timeout_rejects_invalid_values(value):
+    cfg = get_yaml_config()
+    cfg["server_keep_alive_timeout"] = value
+    with pytest.raises(
+            ValueError,
+            match="server_keep_alive_timeout must be a non-negative integer"):
+        extract_disagg_cfg(**cfg)
+
 
 def test_extract_ctx_gen_cfgs():
     configs = extract_ctx_gen_cfgs(

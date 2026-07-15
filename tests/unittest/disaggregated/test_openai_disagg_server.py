@@ -12,11 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from starlette.datastructures import Headers
 
 from tensorrt_llm.llmapi.disagg_utils import extract_disagg_cfg
+from tensorrt_llm.serve import openai_disagg_server
 from tensorrt_llm.serve.openai_disagg_server import OpenAIDisaggServer
 from tensorrt_llm.serve.openai_protocol import (
     CompletionRequest,
@@ -27,6 +29,37 @@ from tensorrt_llm.serve.openai_protocol import (
 
 def _raw_request(headers: dict[str, str]):
     return SimpleNamespace(headers=Headers(headers=headers))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("config_kwargs", "expected_timeout"),
+    [({}, 10), ({"server_keep_alive_timeout": 3600}, 3600)],
+)
+async def test_server_keep_alive_timeout_is_passed_to_uvicorn(
+    monkeypatch, config_kwargs, expected_timeout
+):
+    config = extract_disagg_cfg(
+        context_servers={"num_instances": 0},
+        generation_servers={"num_instances": 0},
+        **config_kwargs,
+    )
+    server = object.__new__(OpenAIDisaggServer)
+    server._config = config
+    server.app = object()
+
+    uvicorn_config = object()
+    config_factory = Mock(return_value=uvicorn_config)
+    uvicorn_server = SimpleNamespace(serve=AsyncMock())
+    server_factory = Mock(return_value=uvicorn_server)
+    monkeypatch.setattr(openai_disagg_server.uvicorn, "Config", config_factory)
+    monkeypatch.setattr(openai_disagg_server.uvicorn, "Server", server_factory)
+
+    await server(host="localhost", port=8000)
+
+    assert config_factory.call_args.kwargs["timeout_keep_alive"] == expected_timeout
+    server_factory.assert_called_once_with(uvicorn_config)
+    uvicorn_server.serve.assert_awaited_once_with(sockets=None)
 
 
 def test_extract_conversation_id_from_headers():
