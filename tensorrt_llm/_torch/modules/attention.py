@@ -469,7 +469,15 @@ class Attention(nn.Module):
         # HF layout to [Q|K|V|G]. Q/K/V then form one contiguous slice of the GEMM output,
         # which removes the q/gate de-interleave copies and the q,k,v re-concat before the
         # fused qk-norm-rope kernel; the attention op consumes [Q|K|V] as a row-strided view.
-        self._gate_tail_layout_enabled = bool(self.attn_output_gate)
+        # Gate-tail is a self-attention decode/generation fast path that has no
+        # LoRA-aware code path: forward would add the interleaved-layout LoRA QKV
+        # contribution onto the [Q|K|V|G] base output and then assert on non-empty
+        # lora_params. Disable the layout entirely when LoRA is configured so those
+        # requests keep the correct interleaved path.
+        lora_configured = (config is not None
+                           and config.lora_config is not None)
+        self._gate_tail_layout_enabled = bool(self.attn_output_gate
+                                              and not lora_configured)
         self._gate_tail_layout_active = False
         # Guards the one-shot gate-tail weight permutation so it runs once per set
         # of freshly loaded qkv weights. Reset by reload orchestrators (full reload
