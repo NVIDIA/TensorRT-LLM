@@ -16,41 +16,8 @@ import PIL.Image
 import torch
 import torch.nn.functional as F
 
+from .defaults import VIDEO_RES_SIZE_INFO
 from .utils import read_video_tensor
-
-# Cosmos3 output resolution buckets keyed by target level, then aspect ratio;
-# each value is (width, height). A source frame maps onto the bucket whose
-# aspect ratio is closest (see ``find_closest_target_size``).
-VIDEO_RES_SIZE_INFO: dict[str, dict[str, tuple[int, int]]] = {
-    "256": {
-        "1,1": (256, 256),
-        "4,3": (320, 256),
-        "3,4": (256, 320),
-        "16,9": (320, 192),
-        "9,16": (192, 320),
-    },
-    "480": {
-        "1,1": (640, 640),
-        "4,3": (736, 544),
-        "3,4": (544, 736),
-        "16,9": (832, 480),
-        "9,16": (480, 832),
-    },
-    "704": {
-        "1,1": (960, 960),
-        "4,3": (1088, 832),
-        "3,4": (832, 1088),
-        "16,9": (1280, 704),
-        "9,16": (704, 1280),
-    },
-    "720": {
-        "1,1": (960, 960),
-        "4,3": (1104, 832),
-        "3,4": (832, 1104),
-        "16,9": (1280, 720),
-        "9,16": (720, 1280),
-    },
-}
 
 
 def find_closest_target_size(h: int, w: int, resolution: str | int) -> tuple[int, int]:
@@ -77,21 +44,39 @@ def find_closest_target_size(h: int, w: int, resolution: str | int) -> tuple[int
     return best_size
 
 
+# ---------------------------------------------------------------------------
+# Transfer sampling + per-control-hint defaults, ported from vllm-omni's
+# Cosmos3 transfer implementation; the guidance and edge/blur presets are
+# empirically tuned per control modality:
+# https://github.com/vllm-project/vllm-omni/blob/main/vllm_omni/diffusion/models/cosmos3/transfer.py
+# ---------------------------------------------------------------------------
+
+# Supported control hints, in application order.
 TRANSFER_HINT_KEYS: tuple[str, ...] = ("edge", "blur", "depth", "seg", "wsm")
+
+# Chunked-sampling defaults for long-video transfer.
 TRANSFER_SAMPLE_DEFAULTS: dict[str, Any] = {
-    "num_video_frames_per_chunk": 93,
-    "num_conditional_frames": 1,
-    "max_frames": 5000,
-    "show_control_condition": False,
-    "show_input": False,
-    "num_first_chunk_conditional_frames": 0,
-    "share_vision_temporal_positions": True,
+    "num_video_frames_per_chunk": 93,  # frames per autoregressive chunk (4k+1 form)
+    "num_conditional_frames": 1,  # overlap frames reused from the previous chunk
+    "max_frames": 5000,  # hard cap on total input frames
+    "show_control_condition": False,  # debug: also emit the control frames
+    "show_input": False,  # debug: also emit the input frames
+    "num_first_chunk_conditional_frames": 0,  # chunk 0 has no prior chunk to condition on
+    "share_vision_temporal_positions": True,  # control tokens reuse the video patches' positions
 }
+
+# Per-hint guidance tuning: text guidance_scale, control_guidance, and flow_shift,
+# chosen empirically per control modality.
 TRANSFER_DEFAULTS: dict[str, dict[str, Any]] = {
     "edge": {"guidance_scale": 3.0, "control_guidance": 1.5, "flow_shift": 10.0},
     "blur": {"guidance_scale": 3.0, "control_guidance": 1.5, "flow_shift": 10.0},
     "depth": {"guidance_scale": 3.0, "control_guidance": 1.5, "flow_shift": 10.0},
-    "seg": {"guidance_scale": 3.0, "control_guidance": 2.0, "flow_shift": 10.0},
+    "seg": {
+        "guidance_scale": 3.0,
+        "control_guidance": 2.0,
+        "flow_shift": 10.0,
+    },  # leans harder on control
+    # Precomputed control; control-only guidance (text off), 10 fps / 101-frame chunks.
     "wsm": {
         "guidance_scale": 1.0,
         "control_guidance": 3.0,
@@ -101,6 +86,9 @@ TRANSFER_DEFAULTS: dict[str, dict[str, Any]] = {
         "num_video_frames_per_chunk": 101,
     },
 }
+
+# Canny (lower, upper) thresholds per edge-strength preset (fed to cv2.Canny);
+# higher preset = higher thresholds = sparser edges.
 EDGE_PRESETS: dict[str, tuple[int, int]] = {
     "none": (20, 50),
     "very_low": (20, 50),
@@ -109,28 +97,25 @@ EDGE_PRESETS: dict[str, tuple[int, int]] = {
     "high": (200, 300),
     "very_high": (300, 400),
 }
-BLUR_DOWNUP_PRESETS: dict[str, int] = {
-    "none": 1,
-    "very_low": 4,
-    "low": 4,
-    "medium": 10,
-    "high": 16,
-    "very_high": 16,
+
+# Bilateral-blur strength presets: ``pre_blur_downscale`` (downscale applied
+# before the bilateral filter) and ``downup`` (down/up-sample factor after);
+# larger = blurrier.
+BLUR_PRESETS: dict[str, dict[str, int]] = {
+    "none": {"pre_blur_downscale": 1, "downup": 1},
+    "very_low": {"pre_blur_downscale": 1, "downup": 4},
+    "low": {"pre_blur_downscale": 4, "downup": 4},
+    "medium": {"pre_blur_downscale": 2, "downup": 10},
+    "high": {"pre_blur_downscale": 1, "downup": 16},
+    "very_high": {"pre_blur_downscale": 4, "downup": 16},
 }
-BLUR_PRE_BLUR_DOWNSCALE_PRESETS: dict[str, int] = {
-    "none": 1,
-    "very_low": 1,
-    "low": 4,
-    "medium": 2,
-    "high": 1,
-    "very_high": 4,
-}
-BILATERAL_REFERENCE_RESOLUTION = 720
-BILATERAL_D = 30
-BILATERAL_SIGMA_COLOR = 150
-BILATERAL_SIGMA_SPACE = 100
-BILATERAL_ITERATIONS = 1
-IMAGE_EXTENSIONS = {".bmp", ".gif", ".jpg", ".jpeg", ".png", ".tif", ".tiff", ".webp"}
+
+# cv2.bilateralFilter parameters for the blur control, tuned at a 720p reference.
+BILATERAL_REFERENCE_RESOLUTION = 720  # resolution the params below are tuned for
+BILATERAL_D = 30  # filter diameter in pixels
+BILATERAL_SIGMA_COLOR = 150  # color-space sigma
+BILATERAL_SIGMA_SPACE = 100  # coordinate-space sigma
+BILATERAL_ITERATIONS = 1  # number of bilateral passes
 
 
 @dataclass
@@ -331,73 +316,91 @@ def resolve_transfer_config(
     for hint in hints.values():
         if hint.key == "edge" and hint.preset_edge_threshold not in EDGE_PRESETS:
             raise ValueError(f"Unsupported Cosmos3 edge preset: {hint.preset_edge_threshold!r}.")
-        if hint.key == "blur" and hint.preset_blur_strength not in BLUR_DOWNUP_PRESETS:
+        if hint.key == "blur" and hint.preset_blur_strength not in BLUR_PRESETS:
             raise ValueError(f"Unsupported Cosmos3 blur preset: {hint.preset_blur_strength!r}.")
     return config
 
 
-def media_hw(value: Any) -> tuple[int, int] | None:
-    if isinstance(value, PIL.Image.Image):
-        return value.height, value.width
-    if isinstance(value, str | Path):
-        media_path = Path(value)
-        if media_path.suffix.lower() in IMAGE_EXTENSIONS:
-            with PIL.Image.open(media_path) as image:
-                return image.height, image.width
-        # Read dimensions from the container header via OpenCV (the shared media
-        # decoder) — no frame decode needed. A missing decoder yields no
-        # dimensions here; the actual decode raises the clear install hint.
-        try:
-            from tensorrt_llm.inputs.media_io import _get_cv2
+def _height_width_from_shape(shape) -> tuple[int, int] | None:
+    """Infer ``(H, W)`` from a frame tensor/array shape by locating the channel axis.
 
-            cv2 = _get_cv2()
-        except ImportError:
-            return None
-        capture = cv2.VideoCapture(str(media_path))
-        try:
-            if not capture.isOpened():
-                return None
-            width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
-            height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        finally:
-            capture.release()
-        return (height, width) if width > 0 and height > 0 else None
-    if isinstance(value, torch.Tensor):
-        tensor = value.detach()
-        if tensor.ndim == 5:
-            tensor = tensor[0]
-        if tensor.ndim == 4:
-            if tensor.shape[0] in (3, 4) and tensor.shape[-1] not in (3, 4):
-                return int(tensor.shape[-2]), int(tensor.shape[-1])
-            if tensor.shape[-1] in (3, 4):
-                return int(tensor.shape[1]), int(tensor.shape[2])
-        if tensor.ndim == 3:
-            if tensor.shape[0] in (3, 4) and tensor.shape[-1] not in (3, 4):
-                return int(tensor.shape[-2]), int(tensor.shape[-1])
-            if tensor.shape[-1] in (3, 4):
-                return int(tensor.shape[0]), int(tensor.shape[1])
-        return None
-    if isinstance(value, np.ndarray):
-        array = value
-        if array.ndim == 5:
-            array = array[0]
-        if array.ndim == 4:
-            if array.shape[0] in (3, 4) and array.shape[-1] not in (3, 4):
-                return int(array.shape[-2]), int(array.shape[-1])
-            if array.shape[-1] in (3, 4):
-                return int(array.shape[1]), int(array.shape[2])
-        if array.ndim == 3:
-            if array.shape[0] in (3, 4) and array.shape[-1] not in (3, 4):
-                return int(array.shape[-2]), int(array.shape[-1])
-            if array.shape[-1] in (3, 4):
-                return int(array.shape[0]), int(array.shape[1])
-        return None
-    if isinstance(value, list | tuple) and value:
-        return media_hw(value[0])
+    Treats a leading or trailing size-3/4 axis as the channel axis and reads the
+    two spatial axes around it: handles ``[B?]{CTHW, THWC, CHW, HWC}``.
+    """
+    dims = list(shape)
+    if len(dims) == 5:  # drop the leading batch axis
+        dims = dims[1:]
+    if len(dims) == 4:
+        if dims[0] in (3, 4) and dims[-1] not in (3, 4):  # C T H W
+            return int(dims[-2]), int(dims[-1])
+        if dims[-1] in (3, 4):  # T H W C
+            return int(dims[1]), int(dims[2])
+    if len(dims) == 3:
+        if dims[0] in (3, 4) and dims[-1] not in (3, 4):  # C H W
+            return int(dims[-2]), int(dims[-1])
+        if dims[-1] in (3, 4):  # H W C
+            return int(dims[0]), int(dims[1])
     return None
 
 
-def resize_center_crop_uint8_cthw(frames: torch.Tensor, height: int, width: int) -> torch.Tensor:
+def _video_file_height_width(media_path: Path) -> tuple[int, int] | None:
+    """Read ``(H, W)`` from a video container header via OpenCV — no frame decode.
+
+    Returns None if OpenCV is unavailable or the file will not open; the actual
+    decode elsewhere raises the clear ``pip install`` hint.
+    """
+    try:
+        from tensorrt_llm.inputs.media_io import _get_cv2
+
+        cv2 = _get_cv2()
+    except ImportError:
+        return None
+    capture = cv2.VideoCapture(str(media_path))
+    try:
+        if not capture.isOpened():
+            return None
+        width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    finally:
+        capture.release()
+    return (height, width) if width > 0 and height > 0 else None
+
+
+def media_height_width(value: Any) -> tuple[int, int] | None:
+    """Return the ``(height, width)`` of a transfer control input, or None if unknown.
+
+    Accepts any form a control can take — a PIL image, a file path (image or
+    video, read from the header without a full decode), a tensor/ndarray
+    (inferred from shape), or a list (its first element). Callers feed the result
+    to ``find_closest_target_size`` to pick the output resolution whose aspect
+    ratio best matches the control.
+    """
+    if isinstance(value, PIL.Image.Image):
+        return value.height, value.width
+    if isinstance(value, str | Path):
+        from tensorrt_llm.inputs.media_io import is_image_file
+
+        media_path = Path(value)
+        if is_image_file(media_path):
+            with PIL.Image.open(media_path) as image:
+                return image.height, image.width
+        return _video_file_height_width(media_path)
+    if isinstance(value, torch.Tensor):
+        return _height_width_from_shape(value.shape)
+    if isinstance(value, np.ndarray):
+        return _height_width_from_shape(value.shape)
+    if isinstance(value, list | tuple) and value:
+        return media_height_width(value[0])
+    return None
+
+
+def resize_center_crop_frames(frames: torch.Tensor, height: int, width: int) -> torch.Tensor:
+    """Scale-to-cover then center-crop control frames to ``(height, width)``.
+
+    ``frames``: uint8 ``[3, T, H, W]`` -> uint8 ``[3, T, H, W]``. Aspect ratio is
+    preserved (scaled so the target fits, excess cropped) so the control signal
+    stays aligned with the generated video.
+    """
     if frames.ndim != 4 or frames.shape[0] != 3:
         raise ValueError(
             f"Cosmos3 transfer frames must have shape [3, T, H, W], got {tuple(frames.shape)}."
@@ -416,7 +419,13 @@ def resize_center_crop_uint8_cthw(frames: torch.Tensor, height: int, width: int)
     return cropped.round().clamp(0, 255).to(torch.uint8).permute(1, 0, 2, 3).contiguous()
 
 
-def _pil_to_uint8_rgb(value: Any) -> np.ndarray:
+def _to_uint8_rgb_frame(value: Any) -> np.ndarray:
+    """Coerce one frame (PIL image, path, tensor, or ndarray) to a uint8 RGB array.
+
+    Returns ``[H, W, 3]`` uint8. Float inputs in ``[-1, 1]`` or ``[0, 1]`` are
+    rescaled to ``[0, 255]``. uint8 RGB is the form the cv2 control generators
+    (edge/blur) operate on.
+    """
     if isinstance(value, PIL.Image.Image):
         return np.asarray(value.convert("RGB"), dtype=np.uint8)
     if isinstance(value, str | Path):
@@ -442,45 +451,64 @@ def _pil_to_uint8_rgb(value: Any) -> np.ndarray:
     raise TypeError(f"Cosmos3 transfer expected an RGB frame, got {type(value)!r}.")
 
 
-def _path_media_to_uint8_cthw(path: str | Path, max_frames: int | None) -> torch.Tensor:
+def _path_media_to_uint8_frames(path: str | Path, max_frames: int | None) -> torch.Tensor:
+    """Decode a control-media file (image or video) to uint8 ``[3, T, H, W]`` frames.
+
+    Classified by content (image vs video) via the shared probe, not the suffix;
+    a single image becomes a one-frame clip.
+    """
+    from tensorrt_llm.inputs.media_io import is_image_file
+
     media_path = Path(path)
     if not media_path.exists():
         raise FileNotFoundError(f"Missing Cosmos3 transfer control_path: {media_path}")
-    if media_path.suffix.lower() in IMAGE_EXTENSIONS:
-        array = _pil_to_uint8_rgb(media_path)
+    # Classify by content, not suffix — the same content probe as the V2V path.
+    if is_image_file(media_path):
+        array = _to_uint8_rgb_frame(media_path)
         return torch.from_numpy(array).permute(2, 0, 1).unsqueeze(1).contiguous()
 
-    # Same torchvision/PyAV decode stack as V2V, consumed as a tensor:
+    # Same OpenCV decode stack as V2V, consumed as a tensor:
     # [T, H, W, C] -> [C, T, H, W] with the layout `contiguous` as the only copy.
     frames_thwc = read_video_tensor(media_path, max_frames=max_frames)
     return frames_thwc[..., :3].permute(3, 0, 1, 2).contiguous()
 
 
-def media_to_uint8_cthw(
+def media_to_uint8_frames(
     value: Any, *, height: int, width: int, max_frames: int | None = None
 ) -> torch.Tensor:
+    """Load any control/input media into uint8 ``[3, T, H, W]`` frames fit to ``(height, width)``.
+
+    Accepts a file path, a video tensor/ndarray, or a list of frames, and returns
+    the canonical uint8 form the cv2 control generators (edge/blur) consume — the
+    entry point for turning a transfer control (or input) reference into frames.
+    """
     if isinstance(value, str | Path):
-        frames = _path_media_to_uint8_cthw(value, max_frames=max_frames)
+        frames = _path_media_to_uint8_frames(value, max_frames=max_frames)
     elif isinstance(value, torch.Tensor):
-        frames = normalized_video_to_uint8_cthw(value)
+        frames = normalized_video_to_uint8_frames(value)
     elif isinstance(value, np.ndarray):
-        frames = normalized_video_to_uint8_cthw(torch.from_numpy(value))
+        frames = normalized_video_to_uint8_frames(torch.from_numpy(value))
     elif isinstance(value, list | tuple):
         if not value:
             raise ValueError("Cosmos3 transfer control frames cannot be empty.")
         selected = value[:max_frames] if max_frames is not None else value
         tensors = [
-            torch.from_numpy(_pil_to_uint8_rgb(frame)).permute(2, 0, 1) for frame in selected
+            torch.from_numpy(_to_uint8_rgb_frame(frame)).permute(2, 0, 1) for frame in selected
         ]
         frames = torch.stack(tensors, dim=1).contiguous()
     else:
         raise TypeError(f"Unsupported Cosmos3 transfer control payload type: {type(value)!r}.")
     if max_frames is not None:
         frames = frames[:, : int(max_frames)]
-    return resize_center_crop_uint8_cthw(frames, int(height), int(width))
+    return resize_center_crop_frames(frames, int(height), int(width))
 
 
-def normalized_video_to_uint8_cthw(video: torch.Tensor) -> torch.Tensor:
+def normalized_video_to_uint8_frames(video: torch.Tensor) -> torch.Tensor:
+    """Convert an in-memory video tensor to uint8 ``[3, T, H, W]`` control frames.
+
+    Accepts ``[1, 3, T, H, W]`` / ``[3, T, H, W]`` (or channels-last); float values
+    in ``[-1, 1]`` / ``[0, 1]`` are rescaled to ``[0, 255]``.
+    """
     tensor = video.detach().cpu()
     if tensor.ndim == 5:
         if tensor.shape[0] != 1:
@@ -506,7 +534,12 @@ def normalized_video_to_uint8_cthw(video: torch.Tensor) -> torch.Tensor:
     return tensor.contiguous()
 
 
-def uint8_cthw_to_normalized_5d(frames: torch.Tensor, *, dtype: torch.dtype) -> torch.Tensor:
+def uint8_frames_to_model_input(frames: torch.Tensor, *, dtype: torch.dtype) -> torch.Tensor:
+    """Normalize uint8 control frames into the transfer model's input tensor.
+
+    ``frames``: uint8 ``[3, T, H, W]`` -> ``[1, 3, T, H, W]`` in ``[-1, 1]``
+    (``/127.5 - 1``), the batched normalized form the control encoder consumes.
+    """
     if frames.ndim != 4 or frames.shape[0] != 3:
         raise ValueError(
             f"Cosmos3 transfer frames must have shape [3, T, H, W], got {tuple(frames.shape)}."
@@ -562,15 +595,16 @@ def _import_cv2(hint_key: str):
 def make_blur_control(frames: torch.Tensor, preset: str) -> torch.Tensor:
     cv2 = _import_cv2("blur")
     preset = preset.lower()
-    if preset not in BLUR_DOWNUP_PRESETS:
+    if preset not in BLUR_PRESETS:
         raise ValueError(f"Unsupported Cosmos3 blur preset: {preset!r}.")
     if preset == "none":
         return frames.clone()
 
     frames_np = frames.detach().cpu().numpy().astype(np.uint8)
     _, t, h, w = frames_np.shape
-    pre_blur_factor = max(1, int(BLUR_PRE_BLUR_DOWNSCALE_PRESETS[preset]))
-    downup_factor = max(1, int(BLUR_DOWNUP_PRESETS[preset]))
+    blur_params = BLUR_PRESETS[preset]
+    pre_blur_factor = max(1, int(blur_params["pre_blur_downscale"]))
+    downup_factor = max(1, int(blur_params["downup"]))
     result = np.empty_like(frames_np)
     for idx in range(t):
         frame = np.ascontiguousarray(np.transpose(frames_np[:, idx], (1, 2, 0)))
@@ -603,9 +637,11 @@ def load_or_compute_control_frames(
     input_frames: torch.Tensor | None,
 ) -> torch.Tensor:
     if hint.control is not None:
-        return media_to_uint8_cthw(hint.control, height=height, width=width, max_frames=max_frames)
+        return media_to_uint8_frames(
+            hint.control, height=height, width=width, max_frames=max_frames
+        )
     if hint.control_path is not None:
-        return media_to_uint8_cthw(
+        return media_to_uint8_frames(
             hint.control_path, height=height, width=width, max_frames=max_frames
         )
     if hint.key == "edge":

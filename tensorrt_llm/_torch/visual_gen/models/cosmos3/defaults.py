@@ -25,9 +25,45 @@ from tensorrt_llm._torch.visual_gen.pipeline import ExtraParamSchema
 # Constant tables
 # ---------------------------------------------------------------------------
 
+# Cosmos3 output resolution buckets keyed by target level, then aspect ratio;
+# each value is (width, height). A source frame maps onto the bucket whose
+# aspect ratio is closest (see ``find_closest_target_size`` in ``transfer.py``).
+VIDEO_RES_SIZE_INFO = {
+    "256": {
+        "1,1": (256, 256),
+        "4,3": (320, 256),
+        "3,4": (256, 320),
+        "16,9": (320, 192),
+        "9,16": (192, 320),
+    },
+    "480": {
+        "1,1": (640, 640),
+        "4,3": (736, 544),
+        "3,4": (544, 736),
+        "16,9": (832, 480),
+        "9,16": (480, 832),
+    },
+    "704": {
+        "1,1": (960, 960),
+        "4,3": (1088, 832),
+        "3,4": (832, 1088),
+        "16,9": (1280, 704),
+        "9,16": (704, 1280),
+    },
+    "720": {
+        "1,1": (960, 960),
+        "4,3": (1104, 832),
+        "3,4": (832, 1104),
+        "16,9": (1280, 720),
+        "9,16": (720, 1280),
+    },
+}
+
+# The default video resolution is the 720p 16:9 bucket, ``(width, height)``.
+_DEFAULT_VIDEO_W, _DEFAULT_VIDEO_H = VIDEO_RES_SIZE_INFO["720"]["16,9"]
 COSMOS3_720P_PARAMS = {
-    "height": 720,
-    "width": 1280,
+    "height": _DEFAULT_VIDEO_H,
+    "width": _DEFAULT_VIDEO_W,
     "num_inference_steps": 35,
     "guidance_scale": 6.0,
     "max_sequence_length": 4096,

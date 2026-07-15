@@ -58,11 +58,11 @@ from .transfer import (
     Cosmos3TransferConfig,
     find_closest_target_size,
     load_or_compute_control_frames,
-    media_hw,
-    media_to_uint8_cthw,
+    media_height_width,
+    media_to_uint8_frames,
     pad_temporal_frames,
     resolve_transfer_config,
-    uint8_cthw_to_normalized_5d,
+    uint8_frames_to_model_input,
 )
 from .transformer_cosmos3 import Cosmos3VFMTransformer
 from .utils import normalize_video_input, pil_to_rgb
@@ -1305,11 +1305,11 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
     ) -> tuple[int, int] | None:
         for hint in transfer_config.ordered_hints:
             if hint.control is not None:
-                detected = media_hw(hint.control)
+                detected = media_height_width(hint.control)
                 if detected is not None:
                     return detected
             if hint.control_path is not None:
-                detected = media_hw(hint.control_path)
+                detected = media_height_width(hint.control_path)
                 if detected is not None:
                     return detected
         return None
@@ -1510,7 +1510,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         input_frames = None
         transfer_input_fps = self._video_payload_fps(video) if video is not None else None
         source_hw = (
-            media_hw(video)
+            media_height_width(video)
             if video is not None
             else self._first_transfer_control_hw(transfer_config)
         )
@@ -1522,7 +1522,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                 f"target={width}x{height} (WxH), transfer_input_fps={transfer_input_fps}"
             )
         if video is not None:
-            input_frames = media_to_uint8_cthw(
+            input_frames = media_to_uint8_frames(
                 video,
                 height=height,
                 width=width,
@@ -1629,7 +1629,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             start_frame = chunk_id * stride
             end_frame = min(start_frame + chunk_frames, total_frames)
             control_norms = {
-                key: uint8_cthw_to_normalized_5d(
+                key: uint8_frames_to_model_input(
                     pad_temporal_frames(frames[:, start_frame:end_frame], chunk_frames),
                     dtype=self.dtype,
                 )
@@ -1649,7 +1649,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                     chunk_frames,
                 )
                 if current_conditional_frames > 0:
-                    input_cond = uint8_cthw_to_normalized_5d(
+                    input_cond = uint8_frames_to_model_input(
                         input_frames[:, :current_conditional_frames],
                         dtype=self.dtype,
                     )
@@ -1740,7 +1740,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             all_controls = all_controls.to(full_output)
             full_output = torch.cat([all_controls, full_output], dim=-1)
         if transfer_config.show_input and input_frames is not None:
-            normalized_input = uint8_cthw_to_normalized_5d(
+            normalized_input = uint8_frames_to_model_input(
                 input_frames[:, :total_frames], dtype=torch.float32
             )
             full_output = torch.cat([normalized_input.to(full_output), full_output], dim=-1)
