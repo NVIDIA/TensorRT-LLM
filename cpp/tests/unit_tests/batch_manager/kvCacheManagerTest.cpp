@@ -11114,6 +11114,100 @@ TEST_F(KVCacheManagerTest, DiskTierSyncOnboardByteExactTest)
     runDiskOnboardByteRoundTrip(/*readers=*/"0", /*nSlots=*/4);
 }
 
+// A failed async spill (unwritable slot file) must be contained on the writer thread: per-slot bookkeeping
+// still runs (the spill id is published for the reserved-pool reap) and the worker keeps serving later jobs.
+// Before the fix the TLLM_CHECK throw escaped the thread entry point and std::terminate'd the process.
+TEST_F(KVCacheManagerTest, DiskTierAsyncWriteFailureContainedTest)
+{
+    setenv("TLLM_KV_DISK_ASYNC_STORE", "1", /*overwrite=*/1);
+    setenv("TLLM_KV_DISK_WRITERS", "1", /*overwrite=*/1);
+    DiskTierDir dir;
+    int constexpr blockSize = 256;
+    auto bufferManager = tr::BufferManager(std::make_shared<tr::CudaStream>());
+    auto transferManager = KVCacheTransferManager(bufferManager);
+    auto pool = KVCacheBlockPool(0, /*kvFactor=*/2, 0, 0, 0);
+    pool.primaryPtr = bufferManager.gpu(tr::ITensor::makeShape({2, blockSize}), nvinfer1::DataType::kFLOAT);
+    pool.secondaryPtr = tr::BufferManager::pinned(tr::ITensor::makeShape({2, blockSize}), nvinfer1::DataType::kFLOAT);
+
+    auto waitForSpill = [&](std::uint64_t spillId)
+    {
+        auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+        while (std::chrono::steady_clock::now() < deadline)
+        {
+            auto const done = transferManager.drainCompletedSpills();
+            if (std::find(done.begin(), done.end(), spillId) != done.end())
+            {
+                return true;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        return false;
+    };
+
+    // Unwritable destination (missing parent dir): the open fails on the writer thread.
+    auto src = std::make_shared<KVCacheBlock>(0, tk::KVCacheIndex(0, /*isSecondary=*/true));
+    transferManager.spillToFileUnstaged(src, /*diskSlot=*/0, {pool}, dir.str() + "/missing_subdir", /*spillId=*/1);
+    EXPECT_TRUE(waitForSpill(1)) << "failed spill did not publish its id (bookkeeping skipped)";
+
+    // Worker survived: a valid spill afterwards completes normally.
+    auto src2 = std::make_shared<KVCacheBlock>(1, tk::KVCacheIndex(1, /*isSecondary=*/true));
+    transferManager.spillToFileUnstaged(src2, /*diskSlot=*/1, {pool}, dir.str(), /*spillId=*/2);
+    EXPECT_TRUE(waitForSpill(2)) << "writer stopped processing after a failed job";
+
+    unsetenv("TLLM_KV_DISK_WRITERS");
+    unsetenv("TLLM_KV_DISK_ASYNC_STORE");
+}
+
+// A failed detached onboard read (missing slot file) must not crash the reader thread; the failure surfaces
+// as a throw from areBlocksReady() on the calling (scheduler) thread, and no request is unparked onto the
+// never-filled block. Before the fix the reader's TLLM_CHECK throw std::terminate'd the process.
+TEST_F(KVCacheManagerTest, DiskTierOnboardReadFailureSurfacesTest)
+{
+    setenv("TLLM_KV_DISK_READERS", "2", /*overwrite=*/1);
+    auto const stream = std::make_shared<tr::CudaStream>();
+    DiskTierDir dir;
+    auto blockManagerPtr
+        = makeDiskTierBlockManager(stream, dir.str(), /*retainedOnly=*/false, /*prim=*/4, /*sec=*/2, /*disk=*/8);
+    auto& blockManager = *blockManagerPtr;
+
+    auto seqA = addDiskTierSequence(blockManager, 0, iotaTokens(0, 16), std::nullopt);
+    releaseDiskTierSequence(blockManager, seqA);
+    churnOnce(blockManager, 1, 100); // A's deepest blocks spill to disk
+    ASSERT_GE(blockManager.getNumDiskSpills(), 2u);
+
+    // Break the tier: delete the slot files so the detached onboard reads below fail on the reader threads.
+    for (auto const& entry : fs::directory_iterator(dir.str()))
+    {
+        fs::remove_all(entry.path());
+    }
+
+    // Rematch A's prefix: the disk onboards are handed to the reader pool and fail off-thread.
+    auto seqA2 = addDiskTierSequence(blockManager, 2, iotaTokens(0, 16), std::nullopt);
+
+    bool threw = false;
+    auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    while (!threw && std::chrono::steady_clock::now() < deadline)
+    {
+        try
+        {
+            (void) blockManager.areBlocksReady(/*requestId=*/2); // false while pending; throws once failed
+        }
+        catch (std::exception const&)
+        {
+            threw = true;
+        }
+        if (!threw)
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    }
+    EXPECT_TRUE(threw) << "failed onboard was not surfaced on the scheduler thread";
+
+    // Teardown stays clean: the sequence releases without touching the never-filled blocks.
+    releaseDiskTierSequence(blockManager, seqA2);
+    unsetenv("TLLM_KV_DISK_READERS");
+}
+
 // shutdownDiskWorkers() must stop+join every disk worker while reads are queued (holding raw GPU dst
 // pointers) and unstaged writes are queued (holding raw host src pointers), so releasePools() can free
 // the pools with no use-after-free -- and it must be idempotent. Passing == no hang/crash reaching the

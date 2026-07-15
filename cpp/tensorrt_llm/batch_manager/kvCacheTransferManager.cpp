@@ -489,16 +489,25 @@ void KVCacheTransferManager::diskWriterLoop()
         // The slow, writeback-throttle-prone part runs HERE, off the scheduler thread.
         // Unstaged jobs (src != nullptr) read the pinned host slot directly; staged jobs read the copy.
         void const* data = job.src ? job.src : static_cast<void const*>(job.staged.data());
-        int fd = ::open(job.filename.c_str(), O_CREAT | O_WRONLY, 0644);
-        TLLM_CHECK_WITH_INFO(fd >= 0,
-            "[disk-tier] cannot open %s for async write; failing loudly rather than leaving a corrupt slot",
-            job.filename.c_str());
-        auto const written = ::pwrite(fd, data, job.bytes, 0);
-        ::close(fd);
-        TLLM_CHECK_WITH_INFO(written == static_cast<ssize_t>(job.bytes),
-            "[disk-tier] short async write to %s (%zd/%zu); failing loudly rather than leaving a corrupt slot",
-            job.filename.c_str(), static_cast<ssize_t>(written), job.bytes);
+        try
+        {
+            int fd = ::open(job.filename.c_str(), O_CREAT | O_WRONLY, 0644);
+            TLLM_CHECK_WITH_INFO(fd >= 0, "[disk-tier] cannot open %s for async write", job.filename.c_str());
+            auto const written = ::pwrite(fd, data, job.bytes, 0);
+            ::close(fd);
+            TLLM_CHECK_WITH_INFO(written == static_cast<ssize_t>(job.bytes),
+                "[disk-tier] short async write to %s (%zd/%zu)", job.filename.c_str(),
+                static_cast<ssize_t>(written), job.bytes);
+        }
+        catch (std::exception const& e)
+        {
+            // Contain the I/O error here (else it escapes the thread -> std::terminate). The slot is left
+            // unwritten; a later onboard of it fails and aborts that request (see diskReaderLoop).
+            TLLM_LOG_ERROR("[disk-tier] async write to %s failed: %s", job.filename.c_str(), e.what());
+        }
 
+        // Runs whether the write succeeded or failed, so producers waiting on this slot and the reserved-pool
+        // reap are always notified.
         {
             std::lock_guard<std::mutex> lock(mDiskMutex);
             if (auto it = mDiskInflight.find(job.filename); it != mDiskInflight.end() && --it->second <= 0)
@@ -716,21 +725,31 @@ void KVCacheTransferManager::diskReaderLoop()
                 buf = pageableFallback.data();
             }
             std::size_t off = 0;
-            for (size_t i = 0; i < job.dsts.size(); ++i)
+            try
             {
-                int fd = ::open(job.files[i].c_str(), O_RDONLY);
-                TLLM_CHECK_WITH_INFO(fd >= 0,
-                    "[disk-tier] cannot open %s for async read; failing loudly rather than serving corrupt KV",
-                    job.files[i].c_str());
-                auto const got = ::read(fd, buf + off, job.bytes[i]);
-                ::close(fd);
-                TLLM_CHECK_WITH_INFO(got == static_cast<ssize_t>(job.bytes[i]),
-                    "[disk-tier] short async read from %s (%zd/%zu); failing loudly rather than serving corrupt KV",
-                    job.files[i].c_str(), static_cast<ssize_t>(got), job.bytes[i]);
-                TLLM_CUDA_CHECK(cudaMemcpyAsync(job.dsts[i], buf + off, job.bytes[i], cudaMemcpyHostToDevice, stream));
-                off += job.bytes[i];
+                for (size_t i = 0; i < job.dsts.size(); ++i)
+                {
+                    int fd = ::open(job.files[i].c_str(), O_RDONLY);
+                    TLLM_CHECK_WITH_INFO(fd >= 0, "[disk-tier] cannot open %s for async read", job.files[i].c_str());
+                    auto const got = ::read(fd, buf + off, job.bytes[i]);
+                    ::close(fd);
+                    TLLM_CHECK_WITH_INFO(got == static_cast<ssize_t>(job.bytes[i]),
+                        "[disk-tier] short async read from %s (%zd/%zu)", job.files[i].c_str(),
+                        static_cast<ssize_t>(got), job.bytes[i]);
+                    TLLM_CUDA_CHECK(
+                        cudaMemcpyAsync(job.dsts[i], buf + off, job.bytes[i], cudaMemcpyHostToDevice, stream));
+                    off += job.bytes[i];
+                }
+                TLLM_CUDA_CHECK(cudaStreamSynchronize(stream));
             }
-            TLLM_CUDA_CHECK(cudaStreamSynchronize(stream));
+            catch (std::exception const& e)
+            {
+                // Contain it (a throw escaping this thread -> std::terminate). The block stays pending so no
+                // request forwards onto never-filled KV; areBlocksReady() re-raises this on the scheduler thread.
+                TLLM_LOG_ERROR("[disk-tier] async onboard of block %d failed: %s", job.blockId, e.what());
+                mAnyReadFailed.store(true, std::memory_order_release);
+                continue;
+            }
         }
 
         {

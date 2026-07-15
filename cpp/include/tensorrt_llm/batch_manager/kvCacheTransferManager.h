@@ -105,6 +105,14 @@ public:
         return mReadInflightCount.load(std::memory_order_acquire) > 0;
     }
 
+    //! \brief Lock-free: true once any async onboard read has failed. The failed block stays in the pending
+    //! set (nothing forwards onto it); areBlocksReady() re-raises the failure on the scheduler thread, the
+    //! same path a synchronous disk-read failure takes.
+    [[nodiscard]] bool anyReadFailed() const noexcept
+    {
+        return mAnyReadFailed.load(std::memory_order_acquire);
+    }
+
     //! \brief True when a reader pool is present, so onboards can be detached from the scheduler thread.
     [[nodiscard]] bool asyncDiskReadEnabled() const
     {
@@ -261,6 +269,8 @@ private:
     // Lock-free mirror of mPendingBlockReads.size() (updated under mReadMutex on every insert/erase) so
     // areBlocksReady() can skip its per-block scan + the mutex when nothing is in flight (common case).
     std::atomic<std::size_t> mReadInflightCount{0};
+    // Set by a reader thread when an async onboard read fails; polled by areBlocksReady().
+    std::atomic<bool> mAnyReadFailed{false};
     bool mDiskReaderStop{false};
     // Set once shutdownDiskWorkers() has stopped+joined the disk workers, so releasePools() and the
     // destructor do not repeat the work. Only touched on the owning thread.
