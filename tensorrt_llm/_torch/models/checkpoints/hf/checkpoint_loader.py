@@ -77,11 +77,6 @@ class HfCheckpointLoader(BaseCheckpointLoader):
     def checkpoint_format(self) -> str:
         return self._checkpoint_format
 
-    def is_layerwise_loading_enabled(self) -> bool:
-        """Return whether opt-in HF safetensors layer-wise loading is enabled."""
-        return (hasattr(self._weight_loader, "is_layerwise_safetensors_enabled")
-                and self._weight_loader.is_layerwise_safetensors_enabled())
-
     def iter_layer_weight_buckets(
             self, checkpoint_dir: str,
             **kwargs: Any) -> Iterator[ConsumableWeightsDict]:

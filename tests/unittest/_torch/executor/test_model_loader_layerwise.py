@@ -48,9 +48,12 @@ def _moe_context(_config, _mapping):
     yield None
 
 
-def _make_loader(monkeypatch, model, *, spec_config=None):
+def _make_loader(monkeypatch, model, *, spec_config=None, layerwise_loading=True):
     loader = ModelLoader(
-        llm_args=SimpleNamespace(load_format=LoadFormat.AUTO),
+        llm_args=SimpleNamespace(
+            load_format=LoadFormat.AUTO,
+            enable_hf_layerwise_loading=layerwise_loading,
+        ),
         mapping=MagicMock(name="mapping"),
         spec_config=spec_config,
         sparse_attention_config=None,
@@ -79,7 +82,6 @@ def _make_loader(monkeypatch, model, *, spec_config=None):
 def _make_checkpoint_loader(events, buckets):
     checkpoint_loader = MagicMock(name="checkpoint_loader")
     checkpoint_loader.checkpoint_format = "HF"
-    checkpoint_loader.is_layerwise_loading_enabled.return_value = True
     mapper = MagicMock(name="weight_mapper")
 
     def initialize_mapper(_model, _config):
@@ -132,6 +134,23 @@ def test_layerwise_model_loader_orders_mapper_buckets_sync_and_post_load(monkeyp
     assert events[-1] == ("post_load",)
     assert synchronize.call_count == 2
     checkpoint_loader.load_weights.assert_not_called()
+
+
+def test_layerwise_model_loader_is_disabled_by_default_config(monkeypatch):
+    events = []
+    model = _LayerwiseModel(events)
+    loader = _make_loader(monkeypatch, model, layerwise_loading=False)
+    checkpoint_loader, mapper = _make_checkpoint_loader(events, [{"layers.0.weight": object()}])
+    checkpoint_loader.load_weights.return_value = {"eager.weight": object()}
+    checkpoint_loader.is_weights_preloaded.return_value = False
+    checkpoint_loader.get_initialized_weight_mapper.return_value = mapper
+
+    loaded_model, _ = loader.load("/checkpoint", checkpoint_loader)
+
+    assert loaded_model is model
+    checkpoint_loader.load_weights.assert_called_once()
+    checkpoint_loader.iter_layer_weight_buckets.assert_not_called()
+    assert ("load", "eager.weight", mapper, False) in events
 
 
 def test_layerwise_model_loader_rejects_unsupported_model_before_iteration(monkeypatch):

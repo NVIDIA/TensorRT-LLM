@@ -74,6 +74,10 @@ methods:
         default: null
         status: prototype
       # Runtime behavior
+      enable_hf_layerwise_loading:
+        annotation: bool
+        default: False
+        status: prototype
       garbage_collection_gen0_threshold:
         annotation: int
         default: 20000

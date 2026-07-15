@@ -560,10 +560,10 @@ class ModelLoader:
 
                 model_checkpoint_dir = (model.llm_checkpoint_dir if hasattr(
                     model, 'llm_checkpoint_dir') else checkpoint_dir)
-                layerwise_loading = (
-                    checkpoint_loader.checkpoint_format == "HF" and hasattr(
-                        checkpoint_loader, 'is_layerwise_loading_enabled')
-                    and checkpoint_loader.is_layerwise_loading_enabled())
+                layerwise_loading = (checkpoint_loader.checkpoint_format == "HF"
+                                     and getattr(self.llm_args,
+                                                 'enable_hf_layerwise_loading',
+                                                 False))
                 if layerwise_loading:
                     if loads_draft_weights:
                         raise RuntimeError(
@@ -576,7 +576,7 @@ class ModelLoader:
                         model.load_weights).parameters
                     if "initial_bucket_loading" not in load_parameters:
                         raise RuntimeError(
-                            "TRTLLM_HF_LAYERWISE_SAFETENSORS is enabled, but "
+                            "enable_hf_layerwise_loading is enabled, but "
                             f"{type(model).__name__}.load_weights does not support "
                             "initial_bucket_loading.")
                     self.weight_mapper = checkpoint_loader.get_initialized_weight_mapper(

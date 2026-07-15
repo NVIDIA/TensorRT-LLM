@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+-->
+
 # Checkpoint Loading
 
 The PyTorch backend provides a flexible and extensible infrastructure for loading model checkpoints from different formats, such as HuggingFace (HF). This system allows you to load models from various sources (e.g., HuggingFace or custom formats) by implementing the required components, such as the checkpoint’s weight loader, mapper, and configuration parser.
@@ -82,6 +87,39 @@ Currently, HF checkpoint loader is the primary built-in format, supporting:
 - **Weights loading** (`.safetensors/.bin/.pth`) - Loading HF compatible weights from disk
 - **Configuration parser** - Parsing HF stored configuration information to TRTLLM `ModelConfig` object
 - **Weights Mapping** - Converting HF weights into TRTLLM compatible representation
+
+### Layer-wise Safetensors Loading
+
+The PyTorch backend can load supported Hugging Face safetensors checkpoints one
+semantic model layer at a time. This bounds the live raw checkpoint tensors to
+top-level weights or one model layer instead of materializing the complete
+checkpoint in host memory before model-specific transformations finish.
+
+Enable the prototype option in the LLM configuration:
+
+```yaml
+enable_hf_layerwise_loading: true
+```
+
+For example, save the option as `config.yaml` and start the server with:
+
+```bash
+trtllm-serve --model <model_path> --config config.yaml
+```
+
+The loader groups tensors by semantic layer independently of safetensors shard
+boundaries, so inputs needed by same-layer projection and expert fusions remain
+available together. The default eager loading path is unchanged when the option
+is `false`.
+
+Current limitations:
+
+- Only DeepSeek V4 implements the required model-specific layer scoping.
+- Only safetensors checkpoints are supported; `.bin` and `.pth` checkpoints
+  continue to use eager loading.
+- A separate speculative draft checkpoint is not supported in layer-wise mode.
+- Closing each bucket releases its mmap-backed tensor storage, but filesystem
+  data may remain in the reclaimable Linux page cache.
 
 ## Using Checkpoint Loaders
 

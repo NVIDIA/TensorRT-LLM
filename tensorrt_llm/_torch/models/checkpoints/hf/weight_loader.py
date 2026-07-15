@@ -39,7 +39,6 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
 _WEIGHT_CACHE_ENV = "TRTLLM_HF_WEIGHT_CACHE"
-_LAYERWISE_SAFETENSORS_ENV = "TRTLLM_HF_LAYERWISE_SAFETENSORS"
 _WEIGHT_CACHE_MAX_ENTRIES_ENV = "TRTLLM_HF_WEIGHT_CACHE_MAX_ENTRIES"
 # Default to a single cached checkpoint: each entry pins a full copy of the
 # raw weights in CPU RAM, so callers wanting cross-model caching must opt in
@@ -57,12 +56,6 @@ class HfWeightLoader(BaseWeightLoader):
     """
     Loads weights from SafeTensors/bin/pth files.
     """
-
-    @staticmethod
-    def is_layerwise_safetensors_enabled() -> bool:
-        """Return whether semantic-layer safetensors loading is enabled."""
-        return os.environ.get(_LAYERWISE_SAFETENSORS_ENV,
-                              "0").lower() in ("1", "true", "yes", "on")
 
     @staticmethod
     def _layer_bucket_name(weight_name: str) -> Tuple[str, int]:

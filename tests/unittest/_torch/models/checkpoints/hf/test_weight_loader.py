@@ -101,23 +101,6 @@ def test_layerwise_safetensors_rejects_missing_index_shard(tmp_path):
         next(loader.iter_layer_weight_buckets(str(tmp_path), mapping=Mapping()))
 
 
-@pytest.mark.parametrize("value", ["1", "true", "TRUE", "yes", "Yes", "on", "ON"])
-def test_layerwise_safetensors_environment_true_values(monkeypatch, value):
-    monkeypatch.setenv("TRTLLM_HF_LAYERWISE_SAFETENSORS", value)
-
-    assert HfWeightLoader.is_layerwise_safetensors_enabled()
-
-
-@pytest.mark.parametrize("value", [None, "0", "false", "no", "off", "unexpected"])
-def test_layerwise_safetensors_environment_false_values(monkeypatch, value):
-    if value is None:
-        monkeypatch.delenv("TRTLLM_HF_LAYERWISE_SAFETENSORS", raising=False)
-    else:
-        monkeypatch.setenv("TRTLLM_HF_LAYERWISE_SAFETENSORS", value)
-
-    assert not HfWeightLoader.is_layerwise_safetensors_enabled()
-
-
 def test_layerwise_safetensors_uses_natural_layer_order_and_preserves_values(tmp_path):
     save_file(
         {
