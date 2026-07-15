@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -254,6 +254,17 @@ void initialize(MpiThreadSupport threadMode, bool forwardAbortToParent)
     }
 #endif // ENABLE_MULTI_DEVICE
     mpiInitialized = true;
+}
+
+MpiThreadSupport getThreadSupport()
+{
+#if ENABLE_MULTI_DEVICE
+    int providedMode = MPI_THREAD_SINGLE;
+    TLLM_MPI_CHECK(MPI_Query_thread(&providedMode));
+    return static_cast<MpiThreadSupport>(providedMode);
+#else
+    TLLM_THROW("Multi device support is disabled.");
+#endif
 }
 
 void MpiComm::barrier() const

@@ -37,6 +37,7 @@
 #include <optional>
 #include <stdexcept>
 #include <unordered_map>
+#include <utility>
 
 namespace tensorrt_llm::batch_manager
 {
@@ -341,7 +342,8 @@ public:
         }
     }
 
-    [[nodiscard]] std::future<void> sendAsync(std::shared_ptr<LlmRequest> const& llmRequest)
+    [[nodiscard]] std::future<void> sendAsync(
+        std::shared_ptr<LlmRequest> const& llmRequest, CacheSender::CompletionCallback completionCallback)
     {
         TLLM_CHECK(llmRequest != nullptr);
         std::promise<void> promise;
@@ -355,8 +357,8 @@ public:
             std::scoped_lock lock(mSenderMutex);
             TLLM_CHECK_WITH_INFO(
                 !mTerminate, "Cannot enqueue request %zu after CacheSender termination", llmRequest->mRequestId);
-            auto const result
-                = mReadyResponses.emplace(llmRequest->mRequestId, Response{llmRequest, std::move(promise)});
+            auto const result = mReadyResponses.emplace(
+                llmRequest->mRequestId, Response{llmRequest, std::move(promise), std::move(completionCallback)});
             TLLM_CHECK_WITH_INFO(
                 result.second, "Request %zu is already queued for KV cache transfer", llmRequest->mRequestId);
         }
@@ -629,6 +631,7 @@ private:
         // protects worker-side dereferences and the promise itself from premature destruction.
         std::shared_ptr<LlmRequest> mRequest;
         std::promise<void> mPromise;
+        CacheSender::CompletionCallback mCompletionCallback;
     };
 
     struct AsyncSendResource
@@ -677,6 +680,7 @@ private:
             TLLM_CUDA_CHECK(cudaSetDevice(mDeviceId));
             sendSync(*resp.mRequest);
             release(id);
+            notifyCompletion(resp, /*failed=*/false);
             resp.mPromise.set_value();
         }
         catch (tensorrt_llm::common::RequestSpecificException const& e)
@@ -922,6 +926,7 @@ private:
 
     void failResponse(Response& response, std::exception_ptr const& exception) noexcept
     {
+        notifyCompletion(response, /*failed=*/true);
         try
         {
             response.mPromise.set_exception(exception);
@@ -929,6 +934,27 @@ private:
         catch (std::future_error const& err)
         {
             TLLM_LOG_ERROR("Failed to set CacheSender response exception: %s", err.what());
+        }
+    }
+
+    void notifyCompletion(Response& response, bool const failed) noexcept
+    {
+        auto completionCallback = std::exchange(response.mCompletionCallback, {});
+        if (!completionCallback)
+        {
+            return;
+        }
+        try
+        {
+            completionCallback(failed);
+        }
+        catch (std::exception const& err)
+        {
+            TLLM_LOG_ERROR("CacheSender completion callback failed: %s", err.what());
+        }
+        catch (...)
+        {
+            TLLM_LOG_ERROR("CacheSender completion callback failed with an unknown error");
         }
     }
 
@@ -1738,9 +1764,15 @@ CacheSender::CacheSender(
 {
 }
 
+std::future<void> CacheSender::sendAsync(
+    std::shared_ptr<LlmRequest> const& llmRequest, CompletionCallback completionCallback) const
+{
+    return mImpl->sendAsync(llmRequest, std::move(completionCallback));
+}
+
 std::future<void> CacheSender::sendAsync(std::shared_ptr<LlmRequest> const& llmRequest) const
 {
-    return mImpl->sendAsync(llmRequest);
+    return mImpl->sendAsync(llmRequest, {});
 }
 
 executor::kv_cache::CommState const& CacheSender::getCommState() const

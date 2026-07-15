@@ -781,7 +781,8 @@ def run_disaggregated_test(example_dir,
                            model_path=None,
                            cwd=None,
                            disagg_schedule_style=None,
-                           post_client_test=None):
+                           post_client_test=None,
+                           expected_context_worker_log=None):
     """Run disaggregated test using service discovery instead of MPI."""
     if mpi_disabled():
         pytest.skip(
@@ -795,7 +796,8 @@ def run_disaggregated_test(example_dir,
                                   os.path.dirname(__file__))
     config, ctx_workers, gen_workers, disagg_server, server_port, work_dir = \
         setup_disagg_cluster(config_file, model_name=model_path, env=run_env, cwd=cwd,
-                             schedule_style=disagg_schedule_style)
+                             schedule_style=disagg_schedule_style,
+                             save_log=expected_context_worker_log is not None)
 
     server_host = config.get("hostname", "localhost")
 
@@ -831,6 +833,15 @@ def run_disaggregated_test(example_dir,
             use_ray=True)
         if post_client_test is not None:
             post_client_test(server_url)
+        if expected_context_worker_log is not None:
+            context_worker_logs = []
+            for worker in ctx_workers:
+                assert worker.log_path is not None
+                with open(worker.log_path, 'r', errors='replace') as log_file:
+                    context_worker_logs.append(log_file.read())
+            assert any(expected_context_worker_log in log
+                       for log in context_worker_logs), \
+                f"Expected context-worker log not found: {expected_context_worker_log!r}"
     finally:
         terminate(*ctx_workers, *gen_workers, disagg_server)
         shutil.rmtree(work_dir, ignore_errors=True)
@@ -1380,11 +1391,14 @@ def test_disaggregated_ctxpp4_gentp4(disaggregated_test_root, llm_venv,
                                      llama_model_root):
     setup_model_symlink(llm_venv, llama_model_root,
                         "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
-    run_disaggregated_test(disaggregated_example_root,
-                           "ctxpp4_gentp4",
-                           env=llm_venv._new_env,
-                           model_path=llama_model_root,
-                           cwd=llm_venv.get_working_directory())
+    run_disaggregated_test(
+        disaggregated_example_root,
+        "ctxpp4_gentp4",
+        env=llm_venv._new_env,
+        model_path=llama_model_root,
+        cwd=llm_venv.get_working_directory(),
+        expected_context_worker_log=
+        "Enabled worker-published context-transfer consensus")
 
 
 @skip_no_hopper

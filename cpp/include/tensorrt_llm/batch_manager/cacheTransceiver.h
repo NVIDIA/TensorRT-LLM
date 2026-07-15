@@ -26,6 +26,7 @@
 #include "tensorrt_llm/executor/dataTransceiverState.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include "tensorrt_llm/runtime/utils/pgUtils.h"
+#include <cstddef>
 #include <future>
 #include <memory>
 #include <mutex>
@@ -54,6 +55,7 @@ class BaseKVCacheManager;
 
 class CacheSender;
 class CacheReceiver;
+class ContextTransferVoteMailbox;
 
 class CacheTransceiverComm
 {
@@ -146,6 +148,25 @@ public:
             return true;
         }
         TLLM_THROW("Input arguments only supported in mpi");
+    }
+
+    [[nodiscard]] std::unique_ptr<mpi::MpiRequest> sendAsync(
+        void const* buffer, std::size_t size, mpi::MpiType dtype, int dest, mpi::MpiTag tag) const
+    {
+        TLLM_CHECK_WITH_INFO(isMpi(), "Point-to-point cache-transceiver status messages require MPI.");
+        return mMpiComm->sendAsync(buffer, size, dtype, dest, tag);
+    }
+
+    [[nodiscard]] bool iprobe(int source, mpi::MpiTag tag, MPI_Status* status) const
+    {
+        TLLM_CHECK_WITH_INFO(isMpi(), "Point-to-point cache-transceiver status messages require MPI.");
+        return mMpiComm->iprobe(source, tag, status);
+    }
+
+    void recv(void* buffer, std::size_t size, mpi::MpiType dtype, int source, mpi::MpiTag tag) const
+    {
+        TLLM_CHECK_WITH_INFO(isMpi(), "Point-to-point cache-transceiver status messages require MPI.");
+        static_cast<void>(mMpiComm->recv(buffer, size, dtype, source, tag));
     }
 
     CacheTransceiverComm split(int color, int key)
@@ -244,6 +265,7 @@ public:
         std::optional<executor::CacheTransceiverConfig> cacheTransceiverConfig = std::nullopt,
         std::vector<SizeType32> const& rnnLayerNumPerPP = {});
 
+    // Constructor used by the PyExecutor Nanobind path. The legacy C++ factory uses the ModelConfig overload above.
     CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheManager, std::vector<SizeType32> numKvHeadsPerLayer,
         SizeType32 sizePerHead, SizeType32 tokensPerBlock, runtime::WorldConfig const& worldConfig,
         std::vector<SizeType32> const& attentionLayerNumPerPP, nvinfer1::DataType dataType,
@@ -253,7 +275,8 @@ public:
         std::vector<SizeType32> const& rnnLayerNumPerPP = {})
         : CacheTransceiver(cacheManager,
             executor::kv_cache::CacheState::ModelConfig{numKvHeadsPerLayer, sizePerHead, tokensPerBlock}, worldConfig,
-            attentionLayerNumPerPP, dataType, attentionType, cacheTransceiverConfig, rnnLayerNumPerPP)
+            attentionLayerNumPerPP, dataType, attentionType, cacheTransceiverConfig, rnnLayerNumPerPP,
+            /*enableWorkerPublishedContextConsensus=*/true)
     {
     }
 
@@ -279,6 +302,13 @@ public:
     [[nodiscard]] bool hasPoisonedTransferBuffer() const override;
 
 private:
+    CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheManager,
+        executor::kv_cache::CacheState::ModelConfig const& cacheStateModelCfg, runtime::WorldConfig const& worldConfig,
+        std::vector<SizeType32> const& attentionLayerNumPerPP, nvinfer1::DataType dataType,
+        executor::kv_cache::CacheState::AttentionType attentionType,
+        std::optional<executor::CacheTransceiverConfig> cacheTransceiverConfig,
+        std::vector<SizeType32> const& rnnLayerNumPerPP, bool enableWorkerPublishedContextConsensus);
+
     void initializeCommState();
 
     void setContextState(LlmRequest* llmRequest);
@@ -306,6 +336,7 @@ private:
 
     std::shared_ptr<CacheTransceiverComm> mGroupComm;
     std::shared_ptr<CacheTransceiverComm> mGroupTensorParaComm, mGroupPipeParaComm, mGroupDataComm, mGroupTPInDPComm;
+    std::unique_ptr<ContextTransferVoteMailbox> mContextTransferVoteMailbox;
 
     executor::kv_cache::CommState const* mCommState;
     std::unique_ptr<executor::kv_cache::CacheState> mCacheState;
