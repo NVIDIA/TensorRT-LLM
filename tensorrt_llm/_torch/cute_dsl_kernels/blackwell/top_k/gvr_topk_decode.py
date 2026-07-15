@@ -2719,6 +2719,19 @@ class GvrTopKKernel:
                     if best_m >= cutlass.Int32(0):
                         s_thr[0] = s_mt_thr[best_m]
                         s_iscalars[0] = s_mt_cnt[best_m]
+                        # done=1: the threshold is admitted, so Phase 3 must
+                        # SKIP its retry-shrink and honor s_thr[0]. (block_count
+                        # _ge / secant leave done via their own path; the R0
+                        # admission must set it explicitly or Phase 3 re-searches
+                        # and the cluster collect diverges -> wrong output.)
+                        s_iscalars[1] = cutlass.Int32(1)
+                        # Snapshot this CTA's LOCAL slice count for the chosen
+                        # rung into s_iscalars[5] — the per-CTA cand_count that
+                        # Phase 3/4's cluster gather consumes (block_count_ge
+                        # sets it too; the R0 admission must match). Without it
+                        # the cluster collect under-counts -> wrong output.
+                        if cutlass.const_expr(cluster_size > 1):
+                            s_iscalars[5] = s_cluster_partial_m[best_m]
                 cute.arch.barrier()
                 bc = s_r0col[0]
                 if bc >= cutlass.Int32(0):
@@ -2754,6 +2767,11 @@ class GvrTopKKernel:
                             if s_mt_cnt[mm] < cutlass.Int32(self.top_k):
                                 bhi = s_mt_thr[mm]
                                 chi = s_mt_cnt[mm]
+                        # Persist the MEASURED rung bracket so the fb_fix refine
+                        # starts tight (op#26 does this) instead of restarting
+                        # from P1's wide [pmin, pmax] -> far fewer count passes.
+                        s_thr[1] = blo
+                        s_thr[2] = bhi
                         fire = cutlass.Int32(-1)
                         if clo > cutlass.Int32(0) and chi >= cutlass.Int32(0):
                             chic = chi
@@ -2789,6 +2807,10 @@ class GvrTopKKernel:
                             if (c1 >= cutlass.Int32(self.top_k)
                                     and c1 <= cutlass.Int32(self.kC)):
                                 s_r0col[0] = cutlass.Int32(0)   # R1 accepted
+                                # done=1 so Phase 3 honors the R1 threshold
+                                # (block_count_ge already set s_iscalars[0]/[5]
+                                # + fresh smem_ptcnt for the cluster collect).
+                                s_iscalars[1] = cutlass.Int32(1)
                             else:
                                 s_r0col[0] = cutlass.Int32(-1)  # -> secant
                         cute.arch.barrier()
