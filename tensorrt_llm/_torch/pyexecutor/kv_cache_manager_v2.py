@@ -180,9 +180,9 @@ class ConversationManager:
             if previous_handle is not None:
                 previous_handle.drop()
 
-        state.current_request_id = None
+        self.finish_request(request)
 
-    def update_conversation(self, request: LlmRequest) -> None:
+    def prepare_request(self, request: LlmRequest) -> None:
         """Register a context request unless its conversation has another active one."""
         conversation_id = _request_conversation_id(request)
         if conversation_id is None:
@@ -199,6 +199,19 @@ class ConversationManager:
             return
 
         state.current_request_id = request_id
+
+    def finish_request(self, request: LlmRequest) -> None:
+        """Clear a request as active while preserving any saved drop plan."""
+        conversation_id = _request_conversation_id(request)
+        if conversation_id is None:
+            return
+        state = self._conversation_states.get(conversation_id)
+        if state is None or state.current_request_id != request.py_request_id:
+            return
+
+        state.current_request_id = None
+        if state.planned_drop_handle is None:
+            self._conversation_states.pop(conversation_id)
 
     def clear(self) -> None:
         """Clear state after reusable KV-cache blocks have been cleared."""
@@ -2034,7 +2047,7 @@ class KVCacheManagerV2(BaseResourceManager):
     def _prepare_context_impl(self, req: LlmRequest) -> bool:
         if req.is_first_context_chunk:
             if self.conversation_manager is not None:
-                self.conversation_manager.update_conversation(req)
+                self.conversation_manager.prepare_request(req)
             kv_cache = self.kv_cache_map.get(req.py_request_id)
             if kv_cache is None:
                 all_tokens = req.get_tokens(DEFAULT_BEAM_INDEX)
@@ -2906,6 +2919,8 @@ class KVCacheManagerV2(BaseResourceManager):
         self._early_freed_index_requests.add(request_id)
 
     def free_resources(self, request: LlmRequest, pin_on_release: bool = False):
+        if self.conversation_manager is not None:
+            self.conversation_manager.finish_request(request)
         self._allocated_draft_lens.pop(request.py_request_id, None)
         kv_cache = self.kv_cache_map.pop(request.py_request_id, None)
         if kv_cache is None:

@@ -301,6 +301,35 @@ def test_per_conversation_policy_without_params_uses_per_request_commit(
             manager.free_resources(request)
 
 
+def test_per_conversation_policy_releases_cancelled_request(
+    caplog: pytest.LogCaptureFixture,
+    manager: KVCacheManagerV2,
+) -> None:
+    request_a = _ContextRequest(1, list(range(8)), 8, "conv-1")
+    request_b = _ContextRequest(2, list(range(8)), 8, "conv-1")
+
+    try:
+        batch_a = _prepare_context_resources(manager, request_a)
+        assert manager.prepare_context(request_a)
+        assert manager.resize_context(request_a, num_tokens=4)
+        request_a.context_current_position = 4
+        request_a.context_remaining_length = 4
+        _update_context_resources(manager, batch_a)
+        _free_if_active(manager, request_a)
+
+        caplog.clear()
+        batch_b = _prepare_context_resources(manager, request_b)
+        assert manager.prepare_context(request_b)
+        assert "already has current request" not in caplog.text
+        assert manager.resize_context(request_b, num_tokens=request_b.prompt_len)
+        request_b.context_current_position = request_b.prompt_len
+        request_b.context_remaining_length = 0
+        _update_context_resources(manager, batch_b)
+    finally:
+        _free_if_active(manager, request_b)
+        _free_if_active(manager, request_a)
+
+
 def test_per_conversation_policy_drops_previous_divergent_blocks(
     manager: KVCacheManagerV2,
 ) -> None:
