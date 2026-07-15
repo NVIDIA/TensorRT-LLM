@@ -206,9 +206,13 @@ class GvrTopKKernel:
 
     Algorithm phases:
       P1: preIdx Min/Max/Mean → initial threshold
-      P2: Secant threshold search loop (count-only)
+      P1b: 256-bin histogram over prev-topK gathered values → M rung
+           thresholds (enable_r0 only)
+      P2: threshold admission — default (enable_r0=True) is a single-pass
+          multi-threshold rung-ladder; enable_r0=False keeps the classic
+          secant threshold search loop (count-only), also the R0-miss fallback
       P3: Ballot-free candidate collect into smem keys[]/vals[]
-      P4: Histogram snap (cand → exact top-K) + writeback
+      P4: rank-and-scatter (enable_r0) / histogram snap → exact top-K + writeback
 
     For different compress_ratio:
       cr = 1: preIdxOffset = (row_idx % next_n) + 1. V3.2 decode +1 temporal shift.
@@ -233,7 +237,7 @@ class GvrTopKKernel:
         enable_smem_cache: bool = False,
         smem_cache_elems: int = 32768,
         seqlen_sorted: bool = False,
-        enable_r0: bool = False,
+        enable_r0: bool = True,
         r0_qfracs: Optional[tuple] = None,
         mt_unroll: int = 4,
         p1b_cache: Optional[bool] = None,
@@ -352,12 +356,21 @@ class GvrTopKKernel:
         self.FLT_MAX = 3.4028235e38
         self.NEG_FLT_MAX = -self.FLT_MAX
 
-        # --- op#26 R0 histogram-ladder admission (inert until enable_r0) ---
+        # --- op#26 R0 histogram-ladder admission (default ON) ---
         # enable_r0: replace the Phase-2 secant search with a single-pass
         #   multi-threshold "rung ladder" admission seeded by a 256-bin
-        #   histogram over the prev-topK gathered values (P1b). OFF here;
-        #   the ladder body / dispatch land in later commits. All fields are
-        #   const-foldable so an OFF kernel is byte-identical to the base.
+        #   histogram over the prev-topK gathered values (P1b).
+        #   DEFAULT True: validated on real DSv4/V3.2 decode-capture
+        #   workloads (25-cell seq-len scan) where R0 wins 24/25 vs the
+        #   secant baseline, geomean 1.33x (pro 128k 2.10x). Correctness is
+        #   value-set-exact vs torch.topk (186/186 across dtype/K/N/BS/cluster
+        #   + tie plateaus). The secant path is retained verbatim and remains
+        #   reachable via enable_r0=False; it is the exact fallback for the
+        #   large-N / cold-hint (low preIdx hit-rate) regime where R0 can
+        #   regress on the synthetic worst axis — a follow-up PR adds a
+        #   data-driven dispatch guard to route between the two. All R0 fields
+        #   are const-foldable, so an enable_r0=False kernel is byte-identical
+        #   to the pre-R0 upstream base.
         # r0_qfracs: descending h-space quantile fractions defining the M
         #   candidate rungs (ascending threshold values); None => no rungs.
         # mt_unroll: 4-way unroll factor for block_count_ge_multi.

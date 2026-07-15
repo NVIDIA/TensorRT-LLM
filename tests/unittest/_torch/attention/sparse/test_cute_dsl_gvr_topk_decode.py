@@ -15,10 +15,16 @@
 
 from typing import Optional
 
+import cutlass
+import cutlass.cute as cute
 import pytest
 import torch
+from cutlass.cute import runtime as _crt
 
 import tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops  # noqa: F401
+from tensorrt_llm._torch.cute_dsl_kernels.blackwell.top_k.gvr_topk_decode import (
+    GvrTopKKernel as _GvrTopKKernel,
+)
 from tensorrt_llm._utils import get_sm_version
 
 skip_not_sm100 = pytest.mark.skipif(
@@ -663,3 +669,168 @@ def test_lb_vs_reference(
         next_n,
         compress_ratio=compress_ratio,
     )
+
+
+# ===========================================================================
+# R0 histogram-ladder admission equivalence tests.
+#
+# ``enable_r0=True`` (the GvrTopKKernel default) replaces the Phase-2 secant
+# threshold search with a single-pass multi-threshold "rung ladder" admission
+# seeded by a 256-bin histogram over the prev-topK gathered values. This must
+# select the SAME top-K as the retained secant baseline (``enable_r0=False``).
+#
+# top-K is order-independent, so correctness is checked by INDEX SET (not
+# position): for continuous fp32 logits (tie-free with probability 1) the R0
+# and base index sets must be identical; for bf16/fp16 boundary value-ties can
+# make two equally-valid selections differ in index, so there the guarantee is
+# value-set (multiset) equality against the tie-aware torch.topk reference.
+#
+# The custom op does not plumb ``enable_r0`` (activation / dispatch land in a
+# follow-up PR), so these tests drive ``GvrTopKKernel`` directly. This is also
+# the only remaining coverage of the secant fallback path, since every op-level
+# test above now inherits the ``enable_r0=True`` default.
+# ===========================================================================
+
+_R0_DT = {
+    torch.float32: cutlass.Float32,
+    torch.bfloat16: cutlass.BFloat16,
+    torch.float16: cutlass.Float16,
+}
+# Compiled-kernel cache keyed on (enable_r0, dtype, top_k, cluster_size, T,
+# min_blocks_per_mp). Shapes (num_rows / N / batch) are symbolic, so one
+# compile covers every N and batch_size within a bucket (mirrors the runner).
+_r0_kernel_cache: dict = {}
+
+
+def _compile_gvr_direct(kernel):
+    """Compile a ``GvrTopKKernel`` with symbolic shapes, mirroring the
+    production runner's fake-tensor construction (128-bit loads, no
+    ``order_row`` / ``output_values``)."""
+    n_rows, n_cols, n_batch = cute.sym_int(), cute.sym_int(), cute.sym_int()
+    in_f = _crt.make_fake_compact_tensor(
+        kernel.dtype, (n_rows, n_cols), stride_order=(1, 0), assumed_align=16
+    )
+    pi_f = _crt.make_fake_compact_tensor(
+        cutlass.Int32, (n_batch, kernel.top_k), stride_order=(1, 0), assumed_align=16
+    )
+    sl_f = _crt.make_fake_compact_tensor(cutlass.Int32, (n_batch,), stride_order=(0,))
+    oi_f = _crt.make_fake_compact_tensor(
+        cutlass.Int32, (n_rows, kernel.top_k), stride_order=(1, 0), assumed_align=16
+    )
+    fs = _crt.make_fake_stream(use_tvm_ffi_env_stream=True)
+    # __call__(input, pre_idx, seq_lens, output_values, output_indices, order_row, stream)
+    return cute.compile(
+        kernel, in_f, pi_f, sl_f, None, oi_f, None, stream=fs, options="--enable-tvm-ffi"
+    )
+
+
+def _run_gvr_direct(logits, pre_idx, seq_lens, top_k, enable_r0, cluster_size):
+    """Drive ``GvrTopKKernel`` directly (bypassing the custom op, which does
+    not expose ``enable_r0``). Fixed at ``next_n=1``, ``compress_ratio=1``,
+    128-bit loads. When ``enable_r0=True`` the ctor auto-derives the shipped
+    R0 config (r0_qfracs=M2D, cs-aware p1b_cache, K512 kC-diet, P4
+    rank-scatter) — i.e. the exact default arm. Returns int32
+    ``[num_rows, top_k]`` indices."""
+    num_rows, N = logits.shape
+    num_sms = torch.cuda.get_device_properties(0).multi_processor_count
+    num_threads = 1024 if (num_rows <= num_sms and N >= 65536) else 512
+    min_blocks_per_mp = 1 if num_rows <= num_sms else 3
+    key = (enable_r0, logits.dtype, top_k, cluster_size, num_threads, min_blocks_per_mp)
+    if key not in _r0_kernel_cache:
+        kernel = _GvrTopKKernel(
+            dtype=_R0_DT[logits.dtype],
+            top_k=top_k,
+            next_n=1,
+            num_threads=num_threads,
+            compress_ratio=1,
+            use_256bit_load=False,
+            min_blocks_per_mp=min_blocks_per_mp,
+            cluster_size=cluster_size,
+            return_output_values=False,
+            enable_r0=enable_r0,
+        )
+        _r0_kernel_cache[key] = _compile_gvr_direct(kernel)
+    out = torch.empty(num_rows, top_k, dtype=torch.int32, device="cuda")
+    _r0_kernel_cache[key](logits, pre_idx, seq_lens, None, out, None)
+    torch.cuda.synchronize()
+    return out
+
+
+def _make_r0_pre_idx(logits, top_k, hint, seed):
+    """Build ``pre_idx`` in the kernel's native cr=1 convention: the kernel
+    reads ``logits[pre_idx + 1]``, so store ``true_index - 1``.
+
+    ``hint='real'`` seeds a warm hint (near-topK indices) so R0's admission
+    ladder hits on the first pass; ``hint='rand'`` seeds a cold hint (random
+    in-range indices) that misses admission and forces the R0-miss inline
+    log-falsi (R1) + fb_fix fallback."""
+    num_rows, N = logits.shape
+    g = torch.Generator(device="cuda").manual_seed(seed)
+    if hint == "real":
+        noised = logits.float() + 0.15 * torch.randn(num_rows, N, generator=g, device="cuda")
+        pre = noised.topk(top_k, dim=1).indices.int()
+    else:
+        pre = torch.randint(0, N, (num_rows, top_k), generator=g, device="cuda").int()
+    return (pre - 1).clamp(min=0).contiguous()
+
+
+@skip_not_sm100
+@pytest.mark.parametrize(
+    "dtype,top_k",
+    [
+        (torch.bfloat16, 512),
+        (torch.bfloat16, 1024),
+        (torch.float16, 1024),
+        (torch.float32, 2048),
+    ],
+)
+@pytest.mark.parametrize("N", [8192, 65536])
+@pytest.mark.parametrize("batch_size", [1, 16])
+@pytest.mark.parametrize("hint", ["real", "rand"])
+@pytest.mark.parametrize("cluster_size", [1, 4])
+def test_cute_dsl_gvr_topk_decode_r0_equivalence(dtype, top_k, N, batch_size, hint, cluster_size):
+    """R0 admission (``enable_r0=True``, the new default) selects the same
+    top-K as the secant baseline (``enable_r0=False``), by index set.
+
+    ``hint='real'`` exercises the R0 admission-hit fast path; ``hint='rand'``
+    forces the R0-miss log-falsi (R1) + fb_fix fallback. ``cluster_size=4``
+    confirms R0 gates to single-CTA and the ``None`` R0 buffers propagate
+    cleanly through the cluster path.
+    """
+    if N < top_k * 2:
+        pytest.skip(f"N ({N}) < 2*top_k ({2 * top_k}): GVR histogram bucket too coarse")
+
+    num_rows = batch_size  # next_n = 1
+    torch.manual_seed(0)
+    torch.cuda.manual_seed(0)
+    logits = (torch.randn(num_rows, N, device="cuda") * 2.0).to(dtype).contiguous()
+    seq_lens = torch.full((num_rows,), N, dtype=torch.int32, device="cuda")
+    pre_idx = _make_r0_pre_idx(logits, top_k, hint, seed=1)
+
+    out_base = _run_gvr_direct(
+        logits, pre_idx, seq_lens, top_k, enable_r0=False, cluster_size=cluster_size
+    )
+    out_r0 = _run_gvr_direct(
+        logits, pre_idx, seq_lens, top_k, enable_r0=True, cluster_size=cluster_size
+    )
+
+    # 1. Both arms independently produce a valid top-K (tie-aware value set).
+    _tie_aware_check(out_base, logits, seq_lens, top_k, next_n=1, compress_ratio=1)
+    _tie_aware_check(out_r0, logits, seq_lens, top_k, next_n=1, compress_ratio=1)
+
+    # 2. Equivalence. fp32 logits are tie-free w.p. 1 → the top-K index set is
+    #    unique, so R0 and base must return the identical set (order-independent,
+    #    compared as sorted indices). For bf16/fp16 boundary value-ties permit
+    #    distinct valid index sets, so equivalence there is the value-set
+    #    equality already established in step 1 (both == torch.topk reference).
+    if dtype == torch.float32:
+        base_sorted, _ = out_base.sort(dim=-1)
+        r0_sorted, _ = out_r0.sort(dim=-1)
+        mismatch = (base_sorted != r0_sorted).any(dim=-1)
+        if bool(mismatch.any().item()):
+            bad = int(mismatch.int().argmax().item())
+            raise AssertionError(
+                f"row={bad}: R0 index set != secant-base index set "
+                f"(base={sorted(out_base[bad].tolist())}, "
+                f"r0={sorted(out_r0[bad].tolist())})"
+            )
