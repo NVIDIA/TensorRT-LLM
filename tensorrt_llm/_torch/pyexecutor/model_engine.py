@@ -1602,6 +1602,10 @@ class PyTorchModelEngine(ModelEngine):
                         f"{num_tokens_i} tokens, {num_gen_requests_i} "
                         f"generation requests, "
                         f"force_initstates={force_init_i}. Skipping.")
+                    # Mirror _general_warmup_impl: an OOM between dispatch()
+                    # and combine() leaves MoE A2A state in ``dispatched``,
+                    # tripping ``dispatch called twice`` on the next forward.
+                    self._reset_moe_alltoall_state()
                     torch.cuda.empty_cache()
 
         clear_memory_buffers()
