@@ -269,7 +269,8 @@ Clients can then send requests to the disaggregated server at `localhost:8000`, 
 Set `internal_request_auth_key` to the same non-empty secret in the disaggregated
 server config and in each context/generation worker config. The proxy signs internal
 generation requests with this key, and generation workers reject request-supplied
-`ctx_info_endpoint` values that do not carry a valid signature.
+disaggregated metadata such as `ctx_info_endpoint` or `encoded_opaque_state` when
+the internal handoff does not carry a valid signature.
 
 
 #### Sending requests to the disaggregated server

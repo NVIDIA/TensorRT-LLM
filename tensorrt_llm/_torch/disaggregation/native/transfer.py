@@ -75,6 +75,7 @@ if TYPE_CHECKING:
 
 AttentionTypeCpp = tensorrt_llm.bindings.internal.batch_manager.AttentionType
 LlmRequestType = tensorrt_llm.bindings.internal.batch_manager.LlmRequestType
+
 # Number of worker threads for KV transfer queues (default: 1)
 KV_TRANSFER_NUM_THREADS = int(os.environ.get("TRTLLM_KV_TRANSFER_NUM_THREADS", "1"))
 
@@ -1655,10 +1656,6 @@ class Receiver(ReceiverBase):
         endpoint = self._extract_info_endpoint(params)
         return endpoint not in self._sender_ep_instance_map
 
-    def _validate_info_endpoint(self, endpoint: Optional[str]) -> None:
-        if endpoint is None:
-            raise ValueError("Receiver: ctx_info_endpoint is required")
-
     def _get_or_connect_dealer(self, endpoint: Optional[str]):
         if endpoint is None:
             raise ValueError("Receiver: peer endpoint is None; peer may not have registered yet")
@@ -1668,7 +1665,6 @@ class Receiver(ReceiverBase):
 
     def _get_sender_info(self, params: DisaggregatedParams) -> RankInfo:
         info_endpoint = self._extract_info_endpoint(params)
-        self._validate_info_endpoint(info_endpoint)
         if self._should_register_peer(params):
             logger.info(f"Registering peer in first request to endpoint '{info_endpoint}'")
             messenger = ZMQMessenger(mode="DEALER", endpoint=info_endpoint)
