@@ -1084,13 +1084,16 @@ class PyTorchModelEngine(ModelEngine):
         # Warm up every graph shape before capturing any graph. Attention
         # kernels can switch implementations at smaller batch sizes and require
         # a larger workspace, so the first pass grows the workspace to its
-        # maximum size. The second pass captures without resizing it.
+        # maximum size. The second pass runs the final per-shape warmup and
+        # captures without resizing the workspace.
         with self.cuda_graph_runner.allow_capture():
-            with self.cuda_graph_runner.warmup_only():
+            self.cuda_graph_runner.is_warmup_only = True
+            try:
                 self._run_cuda_graph_warmup(resource_manager)
+            finally:
+                self.cuda_graph_runner.is_warmup_only = False
             self.cuda_graph_runner.padding_dummy_requests = {}
-            with self.cuda_graph_runner.capture_only():
-                self._run_cuda_graph_warmup(resource_manager)
+            self._run_cuda_graph_warmup(resource_manager)
         log_mem_snapshot("warmup/after_cuda_graph_capture")
         if can_run_general_warmup:
             # Pre-populate the memory pool with max-shape allocations to reduce
@@ -5130,13 +5133,16 @@ class PyTorchModelEngine(ModelEngine):
         self._run_autotuner_warmup_encoder()
         # Warm up every encoder graph shape before capturing any graph. Some
         # attention kernels switch implementations at smaller shapes and need
-        # a larger workspace, so the capture pass can only start after the
-        # workspace has reached its maximum size.
+        # a larger workspace, so the first pass grows the workspace to its
+        # maximum size. The second pass runs the final per-shape warmup and
+        # captures without resizing the workspace.
         with self.encoder_cuda_graph_runner.allow_capture():
-            with self.encoder_cuda_graph_runner.warmup_only():
+            self.encoder_cuda_graph_runner.is_warmup_only = True
+            try:
                 self._run_cuda_graph_warmup_encoder()
-            with self.encoder_cuda_graph_runner.capture_only():
-                self._run_cuda_graph_warmup_encoder()
+            finally:
+                self.encoder_cuda_graph_runner.is_warmup_only = False
+            self._run_cuda_graph_warmup_encoder()
 
         # Pre-populate the memory pool with max-shape allocations to reduce
         # fragmentation at runtime.

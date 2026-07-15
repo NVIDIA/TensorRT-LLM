@@ -1,7 +1,6 @@
 import bisect
 import contextlib
 from dataclasses import dataclass
-from enum import Enum, auto
 from typing import (Any, Callable, Dict, Iterator, List, Optional, Tuple,
                     TypeAlias)
 
@@ -38,48 +37,6 @@ CUDA_GRAPH_DUMMY_REQUEST_ID = (1 << 64) - 1
 # dummies need one prompt token plus one generated token.
 ENC_DEC_CUDA_GRAPH_DUMMY_TOKEN_NUM = 2
 KeyType: TypeAlias = Tuple[int, int, bool, bool, bool]
-
-
-class _CUDAGraphCaptureMode(Enum):
-    WARMUP_AND_CAPTURE = auto()
-    WARMUP_ONLY = auto()
-    CAPTURE_ONLY = auto()
-
-
-class _CUDAGraphCaptureModeMixin:
-    _capture_mode = _CUDAGraphCaptureMode.WARMUP_AND_CAPTURE
-
-    @contextlib.contextmanager
-    def warmup_only(self) -> Iterator[None]:
-        """Run eager CUDA graph warmups without capturing a graph."""
-        previous_mode = self._capture_mode
-        self._capture_mode = _CUDAGraphCaptureMode.WARMUP_ONLY
-        try:
-            yield
-        finally:
-            self._capture_mode = previous_mode
-
-    @contextlib.contextmanager
-    def capture_only(self) -> Iterator[None]:
-        """Capture graphs previously prepared by ``warmup_only``."""
-        previous_mode = self._capture_mode
-        self._capture_mode = _CUDAGraphCaptureMode.CAPTURE_ONLY
-        try:
-            yield
-        finally:
-            self._capture_mode = previous_mode
-
-    @property
-    def is_warmup_only(self) -> bool:
-        return self._capture_mode == _CUDAGraphCaptureMode.WARMUP_ONLY
-
-    @property
-    def is_capture_only(self) -> bool:
-        return self._capture_mode == _CUDAGraphCaptureMode.CAPTURE_ONLY
-
-    @property
-    def _should_warmup(self) -> bool:
-        return not self.is_capture_only
 
 
 @dataclass
@@ -135,7 +92,7 @@ class CUDAGraphRunnerConfig:
     sparse_attention_config: Optional[BaseSparseAttentionConfig] = None
 
 
-class CUDAGraphRunner(_CUDAGraphCaptureModeMixin):
+class CUDAGraphRunner:
     """
     Manages the lifecycle and execution of CUDA graphs for the model engine.
 
@@ -143,7 +100,7 @@ class CUDAGraphRunner(_CUDAGraphCaptureModeMixin):
     and low-level execution (capturing, resource management, replaying) for
     multiple graphs, keyed by (batch size, draft_len, is_first_draft).
     """
-    WARMUP_STEPS = 2
+    WARMUP_STEPS = 1
 
     def __init__(self, config: CUDAGraphRunnerConfig):
         self.config = config
@@ -175,6 +132,7 @@ class CUDAGraphRunner(_CUDAGraphCaptureModeMixin):
         # tensor reallocation from invalidating addresses baked into existing
         # CUDA graphs.  Use allow_capture() context manager during warmup.
         self._capture_allowed = False
+        self.is_warmup_only = False
 
     def _create_shared_static_tensors(self):
         """Allocates static tensors sized for the largest possible batch."""
@@ -367,10 +325,6 @@ class CUDAGraphRunner(_CUDAGraphCaptureModeMixin):
         if key in self.graph_metadata:
             return self.graph_metadata[key][
                 "attn_metadata"], self.graph_metadata[key]["spec_metadata"], key
-        elif self.is_capture_only:
-            raise RuntimeError(
-                f"CUDA graph key {key} was not prepared by the warmup-only pass"
-            )
 
         # Graph doesn't exist yet.  If on-the-fly capture is not allowed,
         # fall back to eager so the caller doesn't need a separate check.
@@ -455,6 +409,11 @@ class CUDAGraphRunner(_CUDAGraphCaptureModeMixin):
         capture_inputs = initial_inputs.copy()
         capture_inputs.update(sliced_static_tensors)
 
+        self.graph_metadata[key] = {
+            "attn_metadata": initial_inputs["attn_metadata"],
+            "spec_metadata": initial_inputs.get("spec_metadata", None),
+        }
+
         def _setup_spec_decoding_and_forward(key: KeyType, forward_fn: Callable,
                                              capture_inputs: Dict[str, Any]):
             is_first_draft = key[2]
@@ -466,29 +425,16 @@ class CUDAGraphRunner(_CUDAGraphCaptureModeMixin):
 
         output = None
         with with_multi_stream(True), piecewise_cuda_graph(False):
-            if self._should_warmup:
-                # We have to do warm up runs to initialize PyTorch's
-                # internal states according to the docs:
-                # https://pytorch.org/docs/stable/notes/cuda.html#cuda-graph-semantics
-                # This also lets us initialize states in the attn_metadata
-                # and resize the shared attention workspace before any graph is captured.
-                for _ in range(self.WARMUP_STEPS):
-                    output = _setup_spec_decoding_and_forward(
-                        key, forward_fn, capture_inputs)
-                    if postprocess_fn is not None:
-                        postprocess_fn(capture_inputs)
-
-            if self.is_capture_only:
-                metadata = self.graph_metadata.get(key)
-                if metadata is None:
-                    raise RuntimeError(
-                        f"CUDA graph key {key} was not prepared by the warmup-only pass"
-                    )
-
-            self.graph_metadata[key] = {
-                "attn_metadata": initial_inputs["attn_metadata"],
-                "spec_metadata": initial_inputs.get("spec_metadata", None),
-            }
+            # We have to do a warmup run to initialize PyTorch's internal
+            # states according to the docs:
+            # https://pytorch.org/docs/stable/notes/cuda.html#cuda-graph-semantics
+            # This also lets us initialize states in the attn_metadata and
+            # resize the shared attention workspace before any graph is captured.
+            for _ in range(self.WARMUP_STEPS):
+                output = _setup_spec_decoding_and_forward(
+                    key, forward_fn, capture_inputs)
+                if postprocess_fn is not None:
+                    postprocess_fn(capture_inputs)
 
             if self.is_warmup_only:
                 return output
@@ -756,7 +702,7 @@ class EncoderCUDAGraphRunnerConfig:
     cuda_graph_mem_pool: Any
 
 
-class EncoderCUDAGraphRunner(_CUDAGraphCaptureModeMixin):
+class EncoderCUDAGraphRunner:
     """CUDA graph runner for no-cache encoder forward passes.
 
     Designed for encoder inputs with `input_ids` (flat [total_tokens]) and
@@ -766,7 +712,7 @@ class EncoderCUDAGraphRunner(_CUDAGraphCaptureModeMixin):
     Restricted to `TrtllmAttentionMetadata` — FlashInfer's per-batch planner state is not compatible with CUDA graph capture/replay.
     """
 
-    WARMUP_STEPS = 2
+    WARMUP_STEPS = 1
 
     def __init__(self, config: EncoderCUDAGraphRunnerConfig):
         self.config = config
@@ -792,6 +738,7 @@ class EncoderCUDAGraphRunner(_CUDAGraphCaptureModeMixin):
         self.cuda_graph_meta_buffers = get_memory_buffers()
 
         self._capture_allowed = False
+        self.is_warmup_only = False
 
         # CUDA graph H2D memcpy nodes require pinned host sources. In CC mode
         # prefer_pinned() is false: pageable host buffers are preferred, so the
@@ -980,10 +927,6 @@ class EncoderCUDAGraphRunner(_CUDAGraphCaptureModeMixin):
 
         if key in self.graph_metadata:
             return self.graph_metadata[key]["attn_metadata"], key
-        elif self.is_capture_only:
-            raise RuntimeError(
-                f"Encoder CUDA graph key {key} was not prepared by the warmup-only pass"
-            )
 
         # New key not yet captured. Only create metadata if capture is
         # allowed (warmup time); otherwise fall back to eager.
@@ -1069,24 +1012,16 @@ class EncoderCUDAGraphRunner(_CUDAGraphCaptureModeMixin):
 
         attn_md = capture_inputs["attn_metadata"]
 
+        self.graph_metadata[key] = {"attn_metadata": attn_md}
+
         output = None
         with with_multi_stream(True), piecewise_cuda_graph(False):
-            if self._should_warmup:
-                # Warmup runs required by CUDA graph semantics. See
-                # https://pytorch.org/docs/stable/notes/cuda.html#cuda-graph-semantics
-                # Warmups initialize PyTorch and attention metadata state, and
-                # resize the shared attention workspace before any graph is captured.
-                for _ in range(self.WARMUP_STEPS):
-                    output = forward_fn(capture_inputs)
-
-            if self.is_capture_only:
-                metadata = self.graph_metadata.get(key)
-                if metadata is None:
-                    raise RuntimeError(
-                        f"Encoder CUDA graph key {key} was not prepared by the warmup-only pass"
-                    )
-
-            self.graph_metadata[key] = {"attn_metadata": attn_md}
+            # Warmup runs required by CUDA graph semantics. See
+            # https://pytorch.org/docs/stable/notes/cuda.html#cuda-graph-semantics
+            # Warmups initialize PyTorch and attention metadata state, and
+            # resize the shared attention workspace before any graph is captured.
+            for _ in range(self.WARMUP_STEPS):
+                output = forward_fn(capture_inputs)
 
             if self.is_warmup_only:
                 return output
