@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2021-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2021-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -230,6 +230,17 @@ public:
 #if ENABLE_MULTI_DEVICE
         // TODO: Don't ignore return status
         TLLM_MPI_CHECK(MPI_Wait(&mRequest, MPI_STATUS_IGNORE));
+#else
+        TLLM_THROW("Multi device support is disabled.");
+#endif
+    }
+
+    [[nodiscard]] bool isCompleted()
+    {
+#if ENABLE_MULTI_DEVICE
+        int completed = 0;
+        TLLM_MPI_CHECK(MPI_Test(&mRequest, &completed, MPI_STATUS_IGNORE));
+        return completed != 0;
 #else
         TLLM_THROW("Multi device support is disabled.");
 #endif
@@ -466,6 +477,9 @@ std::vector<int> getWorldRanks(MpiComm const& comm);
 int getNumNodes();
 
 void initialize(MpiThreadSupport threadMode = MpiThreadSupport::THREAD_MULTIPLE, bool forwardAbortToParent = false);
+
+//! \brief Return the MPI thread support level provided by the active runtime.
+[[nodiscard]] MpiThreadSupport getThreadSupport();
 
 //! \brief Returns true iff the WideEP fault-tolerance MPI mode is enabled.
 //!

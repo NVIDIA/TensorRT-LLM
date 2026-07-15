@@ -45,6 +45,7 @@
 #include "tensorrt_llm/batch_manager/rnnCacheFormatter.h"
 #include "tensorrt_llm/batch_manager/rnnCacheTransBuffer.h"
 #include "tensorrt_llm/batch_manager/rnnStateManager.h"
+#include "tensorrt_llm/batch_manager/transferStatusConsensus.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/executor/cache_transmission/mpi_utils/connection.h"
@@ -71,6 +72,7 @@ namespace
 using RequestIdType = LlmRequest::RequestIdType;
 
 constexpr int kTransferFuturePollIntervalMs = 10;
+constexpr int kContextConsensusPollIntervalMs = 1;
 
 // Finite status checks are scheduler polls, not terminal deadlines. Pure polls
 // use short slices; calls that ask for at least one completion keep bounded
@@ -348,6 +350,17 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
     executor::kv_cache::CacheState::AttentionType attentionType,
     std::optional<executor::CacheTransceiverConfig> cacheTransceiverConfig,
     std::vector<SizeType32> const& rnnLayerNumPerPP)
+    : CacheTransceiver(cacheManager, cacheStateModelCfg, worldConfig, attentionLayerNumPerPP, dataType, attentionType,
+        cacheTransceiverConfig, rnnLayerNumPerPP, /*enableWorkerPublishedContextConsensus=*/false)
+{
+}
+
+CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheManager,
+    executor::kv_cache::CacheState::ModelConfig const& cacheStateModelCfg, runtime::WorldConfig const& worldConfig,
+    std::vector<SizeType32> const& attentionLayerNumPerPP, nvinfer1::DataType dataType,
+    executor::kv_cache::CacheState::AttentionType attentionType,
+    std::optional<executor::CacheTransceiverConfig> cacheTransceiverConfig,
+    std::vector<SizeType32> const& rnnLayerNumPerPP, bool const enableWorkerPublishedContextConsensus)
     : mCacheTransceiverConfig{cacheTransceiverConfig}
 {
     using tensorrt_llm::batch_manager::kv_cache_manager::CacheFormatter;
@@ -422,6 +435,58 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
             // Group ranks with same (ppRank, dpRank) accounting for CP.
             mGroupTPInDPComm = std::make_shared<CacheTransceiverComm>(
                 mGroupComm->split(worldConfig.getPipelineParallelRank() * dpSize + dpRank, worldConfig.getRank()));
+        }
+    }
+
+    if (useMPI() && worldConfig.getPipelineParallelism() > 1)
+    {
+        // This is a one-time startup agreement, not a scheduler-hot-path collective. Every MPI PP constructor
+        // participates so a mixed binding/configuration selects the synchronous fallback on every rank.
+        auto const threadSupport = mpi::getThreadSupport();
+        auto const consensusConfig = [&]()
+        {
+            WorkerPublishedConsensusConfig config;
+            config.enabledForCppBinding = enableWorkerPublishedContextConsensus;
+            config.mpiControlPlane = true;
+            config.nixlUcxBackend = backendType.value() == executor::CacheTransceiverConfig::BackendType::NIXL
+                && common::getEnvNixlBackend() == "UCX";
+            config.tensorParallelism = worldConfig.getTensorParallelism();
+            config.contextParallelism = worldConfig.getContextParallelism();
+            config.pipelineParallelism = worldConfig.getPipelineParallelism();
+            config.attentionDp = mCacheState->getParallelConfig().mEnableAttentionDP;
+            config.inflightCancellation = common::getEnvDisaggEnableInflightCancel();
+            config.transferOverlap = !common::getEnvDisableKVCacheTransferOverlap();
+            config.layerwiseTransfer = common::getEnvDisaggLayerwise();
+            config.mpiThreadMultiple = threadSupport == mpi::MpiThreadSupport::THREAD_MULTIPLE;
+            return config;
+        }();
+        constexpr std::uint64_t kWorkerPublishedConsensusVersion = 1;
+        auto const localVersion
+            = supportsWorkerPublishedConsensus(consensusConfig) ? kWorkerPublishedConsensusVersion : 0;
+        TLLM_CHECK(mGroupPipeParaComm);
+        std::vector<std::uint64_t> protocolVersions(static_cast<std::size_t>(mGroupPipeParaComm->getSize()));
+        mGroupPipeParaComm->allgather(&localVersion, protocolVersions.data(), 1, mpi::MpiType::kUINT64);
+        auto const useWorkerPublishedContextConsensus = selectWorkerPublishedConsensus(protocolVersions);
+        if (useWorkerPublishedContextConsensus)
+        {
+            TLLM_LOG_INFO(
+                "Enabled worker-published context-transfer consensus v%lu for the C++ NIXL/UCX TP1/CP1 "
+                "pipeline-parallel path.",
+                kWorkerPublishedConsensusVersion);
+        }
+        else if (std::any_of(protocolVersions.begin(), protocolVersions.end(),
+                     [](std::uint64_t const version) { return version != 0; }))
+        {
+            TLLM_LOG_WARNING(
+                "Pipeline ranks advertised different worker-published context-transfer consensus capabilities; "
+                "retaining synchronous context-transfer consensus on every rank.");
+        }
+
+        // Construct the mailbox immediately after the all-rank agreement. If later transceiver initialization
+        // throws, member unwinding still sends this rank's ordered close marker to its peers.
+        if (useWorkerPublishedContextConsensus)
+        {
+            mContextTransferVoteMailbox = std::make_unique<ContextTransferVoteMailbox>(mGroupPipeParaComm);
         }
     }
     bool isMLA = attentionType == executor::kv_cache::CacheState::AttentionType::kMLA;
@@ -576,6 +641,10 @@ CacheTransceiver::~CacheTransceiver()
     // Stop sender/receiver workers while the connection manager and transfer
     // plugin are still alive. The workers can access both during termination.
     mCacheSender.reset();
+    if (mContextTransferVoteMailbox)
+    {
+        mContextTransferVoteMailbox->shutdown();
+    }
     mCacheReceiver.reset();
 
     if (mWrapperLibHandle)
@@ -623,7 +692,16 @@ void CacheTransceiver::respondAndSendAsync(std::shared_ptr<LlmRequest> llmReques
         return;
     }
     setContextState(llmRequest.get());
-    auto future = mCacheSender->sendAsync(llmRequest);
+    CacheSender::CompletionCallback completionCallback;
+    if (mContextTransferVoteMailbox)
+    {
+        auto* mailbox = mContextTransferVoteMailbox.get();
+        auto const requestId = llmRequest->mRequestId;
+        completionCallback
+            = [mailbox, requestId](bool const failed) { mailbox->publishOutcomeToPeers(requestId, failed); };
+    }
+    auto future = completionCallback ? mCacheSender->sendAsync(llmRequest, std::move(completionCallback))
+                                     : mCacheSender->sendAsync(llmRequest);
     mSenderFutures.emplace_back(std::move(llmRequest), std::move(future));
 }
 
@@ -731,6 +809,122 @@ std::vector<LlmRequest::RequestIdType> gatherRequestIds(
     return retData;
 }
 
+namespace
+{
+
+class ContextTransferConsensusBackend
+{
+public:
+    ContextTransferConsensusBackend(ContextTransferVoteMailbox* mailbox,
+        std::shared_ptr<CacheTransceiverComm> const& intraStageComm,
+        std::shared_ptr<CacheTransceiverComm> const& pipeStageComm)
+        : mMailbox(mailbox)
+        , mIntraStageComm(intraStageComm)
+        , mPipeStageComm(pipeStageComm)
+    {
+    }
+
+    [[nodiscard]] bool isWorkerPublished() const noexcept
+    {
+        return mMailbox != nullptr;
+    }
+
+    template <typename SenderFutures>
+    [[nodiscard]] std::unordered_set<RequestIdType> selectReadyRequests(SenderFutures const& senderFutures) const
+    {
+        if (isWorkerPublished())
+        {
+            std::unordered_set<RequestIdType> readyRequestIds;
+            for (auto const& [request, future] : senderFutures)
+            {
+                if (future.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready)
+                {
+                    readyRequestIds.insert(request->mRequestId);
+                }
+            }
+            return readyRequestIds;
+        }
+
+        std::vector<RequestIdType> locallyReadyRequestIds;
+        for (auto const& [request, future] : senderFutures)
+        {
+            if (future.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready)
+            {
+                locallyReadyRequestIds.push_back(request->mRequestId);
+            }
+        }
+        std::unordered_map<RequestIdType, int> frequencyMap;
+        if (mIntraStageComm && mIntraStageComm->getSize() > 1)
+        {
+            for (auto const requestId : gatherRequestIds(mIntraStageComm, locallyReadyRequestIds))
+            {
+                ++frequencyMap[requestId];
+            }
+        }
+        else
+        {
+            for (auto const requestId : locallyReadyRequestIds)
+            {
+                ++frequencyMap[requestId];
+            }
+        }
+
+        auto const requiredReadyCount = mIntraStageComm ? mIntraStageComm->getSize() : 1;
+        std::unordered_set<RequestIdType> readyRequestIds;
+        for (auto const& [requestId, readyCount] : frequencyMap)
+        {
+            if (readyCount == requiredReadyCount)
+            {
+                readyRequestIds.insert(requestId);
+            }
+        }
+        return readyRequestIds;
+    }
+
+    [[nodiscard]] bool resolveLocalFailure(RequestIdType const requestId, bool const observedFailure) const
+    {
+        if (!isWorkerPublished())
+        {
+            return observedFailure;
+        }
+
+        auto const publishedFailure = mMailbox->recordLocalOutcome(requestId);
+        TLLM_CHECK_WITH_INFO(!observedFailure || publishedFailure,
+            "Context-transfer future failed after its worker published a successful terminal vote.");
+        return publishedFailure;
+    }
+
+    [[nodiscard]] TransferConsensusOutcome poll(std::unordered_set<RequestIdType> const& completedRequestIds,
+        std::unordered_set<RequestIdType> const& failedRequestIds,
+        std::unordered_set<RequestIdType> const& timedOutRequestIds) const
+    {
+        if (!isWorkerPublished())
+        {
+            return reduceTransferStates(
+                mIntraStageComm, mPipeStageComm, completedRequestIds, failedRequestIds, timedOutRequestIds);
+        }
+
+        auto mailboxResult = mMailbox->poll();
+        TransferConsensusOutcome outcome;
+        outcome.completedRequestIds = std::move(mailboxResult.completedRequestIds);
+        outcome.failedRequestIds = std::move(mailboxResult.failedRequestIds);
+        return outcome;
+    }
+
+private:
+    ContextTransferVoteMailbox* mMailbox;
+    std::shared_ptr<CacheTransceiverComm> const& mIntraStageComm;
+    std::shared_ptr<CacheTransceiverComm> const& mPipeStageComm;
+};
+
+std::unordered_set<RequestIdType> const& getEmptyRequestIdSet()
+{
+    static std::unordered_set<RequestIdType> const emptyRequestIds;
+    return emptyRequestIds;
+}
+
+} // namespace
+
 void updateKVCacheTransferBW(std::shared_ptr<CacheTransceiverComm> const& mComm, LlmRequest* request)
 {
     namespace su = executor::serialize_utils;
@@ -796,80 +990,42 @@ void updateKVCacheTransferBW(std::shared_ptr<CacheTransceiverComm> const& mComm,
 }
 
 RequestStatuses CacheTransceiver::checkContextTransferStatus(
-    std::optional<int> const& atLeastRequestNum, bool markComplete)
+    std::optional<int> const& atLeastRequestNum, bool const markComplete)
 {
     bool const blockAll = !atLeastRequestNum.has_value();
     bool const inflightCancelEnabled = common::getEnvDisaggEnableInflightCancel();
     TLLM_CHECK_WITH_INFO(!inflightCancelEnabled || !blockAll,
         "In-flight cancellation requires a finite context-transfer status poll; pass 0 for a nonblocking poll.");
-    std::optional<int> senderFutureTimeoutMs = std::nullopt;
+
+    bool const needsProgress = atLeastRequestNum.value_or(0) > 0;
+    std::optional<int> senderFutureTimeoutMs;
+    std::optional<int> kvTransferTimeoutMs;
     if (mCacheTransceiverConfig.has_value())
     {
         senderFutureTimeoutMs = mCacheTransceiverConfig->getKvTransferSenderFutureTimeoutMs();
-    }
-    bool const needsProgress = atLeastRequestNum.value_or(0) > 0;
-    auto const futureWaitInterval = getTransferFutureWaitInterval(senderFutureTimeoutMs, needsProgress);
-    // Without the opt-in flag, deadline checks remain observe-only. With the
-    // flag, timeout IDs participate in the same topology consensus as terminal
-    // outcomes and request cancellation is requested on every nonterminal rank.
-    std::optional<int> kvTransferTimeoutMs = std::nullopt;
-    if (mCacheTransceiverConfig.has_value())
-    {
         kvTransferTimeoutMs = mCacheTransceiverConfig->getKvTransferTimeoutMs();
     }
+    auto const futureWaitInterval = getTransferFutureWaitInterval(senderFutureTimeoutMs, needsProgress);
 
-    auto syncComm = mCacheState->getParallelConfig().mEnableAttentionDP ? mGroupTPInDPComm : mGroupTensorParaComm;
-    std::vector<LlmRequest::RequestIdType> contextCompleteRequestIds;
-    for (auto&& [request, future] : mSenderFutures)
+    auto const& intraStageComm
+        = mCacheState->getParallelConfig().mEnableAttentionDP ? mGroupTPInDPComm : mGroupTensorParaComm;
+    ContextTransferConsensusBackend consensusBackend{
+        mContextTransferVoteMailbox.get(), intraStageComm, mGroupPipeParaComm};
+    std::optional<std::chrono::steady_clock::time_point> progressDeadline;
+    if (consensusBackend.isWorkerPublished() && needsProgress)
     {
-        if (future.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready)
-        {
-            contextCompleteRequestIds.push_back(request->mRequestId);
-        }
+        progressDeadline = std::chrono::steady_clock::now() + futureWaitInterval;
     }
+    auto toProcess = consensusBackend.selectReadyRequests(mSenderFutures);
 
-    std::unordered_map<LlmRequest::RequestIdType, int> frequencyMap;
-    if ((syncComm) && syncComm->getSize() > 1)
-    {
-        auto gatherRequestIdVec = gatherRequestIds(syncComm, contextCompleteRequestIds);
-        for (auto&& requestId : gatherRequestIdVec)
-        {
-            frequencyMap[requestId]++;
-        }
-    }
-    else
-    {
-        for (auto&& requestId : contextCompleteRequestIds)
-        {
-            frequencyMap[requestId]++;
-        }
-    }
-    std::vector<std::pair<LlmRequest::RequestIdType, int>> freqVec(frequencyMap.begin(), frequencyMap.end());
-
-    std::sort(freqVec.begin(), freqVec.end(),
-        [](std::pair<LlmRequest::RequestIdType, int> const& left,
-            std::pair<LlmRequest::RequestIdType, int> const& right) { return left.second > right.second; });
-    std::unordered_set<LlmRequest::RequestIdType> toCompleteIdSet;
-    for (auto&& [requestId, freq] : freqVec)
-    {
-        if (freq == ((syncComm) ? syncComm->getSize() : 1))
-        {
-            toCompleteIdSet.insert(requestId);
-        }
-    }
-
-    // Make sure there are at least atLeastRequestNum requests in toCompleteIdSet.
-    // This will preserve the order of insertion for KVCache transfer requests.
+    // Preserve insertion order when a caller asks this poll to make progress on at least N requests.
     for (auto it = mSenderFutures.begin();
-         atLeastRequestNum.value_or(0) > static_cast<int>(toCompleteIdSet.size()) && it != mSenderFutures.end(); ++it)
+         atLeastRequestNum.value_or(0) > static_cast<int>(toProcess.size()) && it != mSenderFutures.end(); ++it)
     {
-        auto& [request, future] = *it;
-        toCompleteIdSet.insert(request->mRequestId);
+        toProcess.insert(it->first->mRequestId);
     }
 
-    // Record local terminal outcomes for requests selected this round. The
-    // request is reported only after all ranks in the sync group agree that the
-    // request reached a terminal state.
+    // Future polling, timeout accounting, and local outcome retention are shared by every consensus backend.
     for (auto it = mSenderFutures.begin(); it != mSenderFutures.end();)
     {
         auto& [request, future] = *it;
@@ -878,87 +1034,134 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
             && future.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready)
         {
             auto const elapsedMs = getTransferElapsedMs(request, LlmRequest::getSteadyClockNow());
-            if (elapsedMs > kvTransferTimeoutMs.value())
+            if (elapsedMs > kvTransferTimeoutMs.value() && mTimedOutSenderIds.insert(requestId).second)
             {
-                if (mTimedOutSenderIds.insert(requestId).second)
-                {
-                    TLLM_LOG_WARNING(
-                        "Context KV cache transfer for request %ld exceeded configured timeout: "
-                        "elapsed %ld ms > limit %d ms (%s).",
-                        requestId, elapsedMs, kvTransferTimeoutMs.value(),
-                        inflightCancelEnabled ? "requesting cancellation" : "observe-only");
-                }
+                TLLM_LOG_WARNING(
+                    "Context KV cache transfer for request %ld exceeded configured timeout: "
+                    "elapsed %ld ms > limit %d ms (%s).",
+                    requestId, elapsedMs, kvTransferTimeoutMs.value(),
+                    inflightCancelEnabled ? "requesting cancellation" : "observe-only");
             }
         }
-        if (blockAll || (toCompleteIdSet.find(requestId) != toCompleteIdSet.end()))
+
+        if (!blockAll && toProcess.find(requestId) == toProcess.end())
+        {
+            ++it;
+            continue;
+        }
+
+        auto waitInterval = futureWaitInterval;
+        if (progressDeadline.has_value())
+        {
+            // Worker-published status polling has one total budget across local future waits and mailbox progress.
+            waitInterval = std::max(std::chrono::milliseconds(0),
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    progressDeadline.value() - std::chrono::steady_clock::now()));
+        }
+        auto const status = blockAll ? std::future_status::ready : future.wait_for(waitInterval);
+        if (status == std::future_status::timeout)
+        {
+            TLLM_LOG_DEBUG(
+                "Context KV cache transfer for request %ld is not ready after %ld ms wait slice; keeping it "
+                "in progress.",
+                requestId, static_cast<long>(waitInterval.count()));
+            ++it;
+            continue;
+        }
+
+        bool observedFailure = status != std::future_status::ready;
+        if (!observedFailure)
         {
             try
             {
-                auto const status = blockAll ? std::future_status::ready : future.wait_for(futureWaitInterval);
-                if (status == std::future_status::ready)
+                future.get();
+                if (kvTransferTimeoutMs.has_value())
                 {
-                    future.get();
-                    if (kvTransferTimeoutMs.has_value())
+                    auto const elapsedMs = getTransferElapsedMs(request, request->getKvCacheTransferEnd());
+                    if (elapsedMs > kvTransferTimeoutMs.value() && mTimedOutSenderIds.insert(requestId).second)
                     {
-                        auto const elapsedMs = getTransferElapsedMs(request, request->getKvCacheTransferEnd());
-                        if (elapsedMs > kvTransferTimeoutMs.value() && mTimedOutSenderIds.insert(requestId).second)
-                        {
-                            TLLM_LOG_WARNING(
-                                "Context KV cache transfer for request %ld completed after its deadline: "
-                                "elapsed %ld ms > limit %d ms (%s).",
-                                requestId, elapsedMs, kvTransferTimeoutMs.value(),
-                                inflightCancelEnabled ? "failing request" : "observe-only");
-                        }
+                        TLLM_LOG_WARNING(
+                            "Context KV cache transfer for request %ld completed after its deadline: "
+                            "elapsed %ld ms > limit %d ms (%s).",
+                            requestId, elapsedMs, kvTransferTimeoutMs.value(),
+                            inflightCancelEnabled ? "failing request" : "observe-only");
                     }
-                    recordLocalTransferOutcome(requestId, request, /*failed=*/false, mCompletedSenderRequestIds,
-                        mFailedSenderRequestIds, mSenderRequestsAwaitingConsensus);
-                    it = mSenderFutures.erase(it);
-                }
-                else if (status == std::future_status::timeout)
-                {
-                    TLLM_LOG_DEBUG(
-                        "Context KV cache transfer for request %ld is not ready after %ld ms wait slice; keeping it "
-                        "in progress.",
-                        requestId, static_cast<long>(futureWaitInterval.count()));
-                    ++it;
-                }
-                else
-                {
-                    TLLM_LOG_ERROR(
-                        "Future returned unexpected status for request %ld. Recording as failed.", requestId);
-
-                    recordLocalTransferOutcome(requestId, request, /*failed=*/true, mCompletedSenderRequestIds,
-                        mFailedSenderRequestIds, mSenderRequestsAwaitingConsensus);
-                    it = mSenderFutures.erase(it);
                 }
             }
-            catch (std::exception const& e)
+            catch (std::exception const& error)
             {
-                TLLM_LOG_ERROR("Error occurred during context transfer for request %ld: %s", requestId, e.what());
-                recordLocalTransferOutcome(requestId, request, /*failed=*/true, mCompletedSenderRequestIds,
-                    mFailedSenderRequestIds, mSenderRequestsAwaitingConsensus);
-                it = mSenderFutures.erase(it);
+                TLLM_LOG_ERROR("Error occurred during context transfer for request %ld: %s", requestId, error.what());
+                observedFailure = true;
             }
             catch (...)
             {
                 TLLM_LOG_ERROR("Unknown error occurred during context transfer for request %ld", requestId);
-                recordLocalTransferOutcome(requestId, request, /*failed=*/true, mCompletedSenderRequestIds,
-                    mFailedSenderRequestIds, mSenderRequestsAwaitingConsensus);
-                it = mSenderFutures.erase(it);
+                observedFailure = true;
             }
         }
         else
         {
-            ++it;
+            TLLM_LOG_ERROR("Future returned unexpected status for request %ld. Recording as failed.", requestId);
         }
+
+        auto completedRequest = request;
+        it = mSenderFutures.erase(it);
+        // Erase the consumed future before a backend invariant can throw, so no no-state future remains pollable.
+        auto const failed = consensusBackend.resolveLocalFailure(requestId, observedFailure);
+        recordLocalTransferOutcome(requestId, std::move(completedRequest), failed, mCompletedSenderRequestIds,
+            mFailedSenderRequestIds, mSenderRequestsAwaitingConsensus);
     }
 
-    RequestStatuses requestsStatus{};
-    auto const consensusOutcome = reduceTransferStates(syncComm, mGroupPipeParaComm, mCompletedSenderRequestIds,
-        mFailedSenderRequestIds, inflightCancelEnabled ? mTimedOutSenderIds : std::unordered_set<RequestIdType>{});
-    if (inflightCancelEnabled)
+    RequestStatuses requestsStatus;
+    auto commitConsensusOutcome = [&](TransferConsensusOutcome const& outcome)
     {
-        for (auto const requestId : consensusOutcome.timedOutRequestIds)
+        for (auto const requestId : sortedRequestIds(outcome.failedRequestIds))
+        {
+            auto const requestIt = mSenderRequestsAwaitingConsensus.find(requestId);
+            if (requestIt == mSenderRequestsAwaitingConsensus.end())
+            {
+                TLLM_CHECK_WITH_INFO(!consensusBackend.isWorkerPublished(),
+                    "Missing retained context request %zu for a globally failed worker-published transfer.",
+                    static_cast<std::size_t>(requestId));
+                continue;
+            }
+            requestIt->second->setState(LlmRequestState::kDISAGG_TRANS_ERROR);
+            requestsStatus.errorRequestIds.insert(requestId);
+            mTimedOutSenderIds.erase(requestId);
+            mCancelRequestedSenderIds.erase(requestId);
+            eraseLocalTransferOutcome(
+                requestId, mCompletedSenderRequestIds, mFailedSenderRequestIds, mSenderRequestsAwaitingConsensus);
+        }
+        for (auto const requestId : sortedRequestIds(outcome.completedRequestIds))
+        {
+            auto const requestIt = mSenderRequestsAwaitingConsensus.find(requestId);
+            if (requestIt == mSenderRequestsAwaitingConsensus.end())
+            {
+                TLLM_CHECK_WITH_INFO(!consensusBackend.isWorkerPublished(),
+                    "Missing retained context request %zu for a globally completed worker-published transfer.",
+                    static_cast<std::size_t>(requestId));
+                continue;
+            }
+            requestsStatus.completedRequestIds.insert(requestId);
+            if (markComplete)
+            {
+                requestIt->second->setState(LlmRequestState::kDISAGG_CONTEXT_COMPLETE);
+            }
+            mTimedOutSenderIds.erase(requestId);
+            mCancelRequestedSenderIds.erase(requestId);
+            eraseLocalTransferOutcome(
+                requestId, mCompletedSenderRequestIds, mFailedSenderRequestIds, mSenderRequestsAwaitingConsensus);
+        }
+    };
+
+    auto requestTimedOutCancellations = [&](TransferConsensusOutcome const& outcome)
+    {
+        if (!inflightCancelEnabled)
+        {
+            return;
+        }
+
+        for (auto const requestId : outcome.timedOutRequestIds)
         {
             auto const futureIt = std::find_if(mSenderFutures.begin(), mSenderFutures.end(),
                 [requestId](auto const& entry) { return entry.first->mRequestId == requestId; });
@@ -979,37 +1182,42 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
                 TLLM_LOG_DEBUG("Context cancellation for request %ld was not accepted; will retry", requestId);
             }
         }
-    }
-    for (auto const requestId : sortedRequestIds(consensusOutcome.failedRequestIds))
+    };
+
+    auto pollAndCommitConsensus = [&]()
     {
-        auto const requestIt = mSenderRequestsAwaitingConsensus.find(requestId);
-        if (requestIt == mSenderRequestsAwaitingConsensus.end())
-        {
-            continue;
-        }
-        requestIt->second->setState(LlmRequestState::kDISAGG_TRANS_ERROR);
-        requestsStatus.errorRequestIds.insert(requestId);
-        mTimedOutSenderIds.erase(requestId);
-        mCancelRequestedSenderIds.erase(requestId);
-        eraseLocalTransferOutcome(
-            requestId, mCompletedSenderRequestIds, mFailedSenderRequestIds, mSenderRequestsAwaitingConsensus);
-    }
-    for (auto const requestId : sortedRequestIds(consensusOutcome.completedRequestIds))
+        auto const& timedOutRequestIds = inflightCancelEnabled ? mTimedOutSenderIds : getEmptyRequestIdSet();
+        auto const outcome
+            = consensusBackend.poll(mCompletedSenderRequestIds, mFailedSenderRequestIds, timedOutRequestIds);
+        requestTimedOutCancellations(outcome);
+        commitConsensusOutcome(outcome);
+    };
+
+    // Collective consensus must be entered exactly once per status call. The mailbox can make independent progress
+    // and may be polled repeatedly without requiring a matching peer scheduler call.
+    pollAndCommitConsensus();
+    if (consensusBackend.isWorkerPublished())
     {
-        auto const requestIt = mSenderRequestsAwaitingConsensus.find(requestId);
-        if (requestIt == mSenderRequestsAwaitingConsensus.end())
+        auto const committedCount
+            = [&]() { return requestsStatus.completedRequestIds.size() + requestsStatus.errorRequestIds.size(); };
+        if (blockAll)
         {
-            continue;
+            while (!mSenderRequestsAwaitingConsensus.empty())
+            {
+                std::this_thread::sleep_for(std::chrono::milliseconds(kContextConsensusPollIntervalMs));
+                pollAndCommitConsensus();
+            }
         }
-        requestsStatus.completedRequestIds.insert(requestId);
-        if (markComplete)
+        else if (needsProgress)
         {
-            requestIt->second->setState(LlmRequestState::kDISAGG_CONTEXT_COMPLETE);
+            while (committedCount() < static_cast<std::size_t>(atLeastRequestNum.value())
+                && !mSenderRequestsAwaitingConsensus.empty()
+                && std::chrono::steady_clock::now() < progressDeadline.value())
+            {
+                std::this_thread::sleep_for(std::chrono::milliseconds(kContextConsensusPollIntervalMs));
+                pollAndCommitConsensus();
+            }
         }
-        mTimedOutSenderIds.erase(requestId);
-        mCancelRequestedSenderIds.erase(requestId);
-        eraseLocalTransferOutcome(
-            requestId, mCompletedSenderRequestIds, mFailedSenderRequestIds, mSenderRequestsAwaitingConsensus);
     }
 
     return requestsStatus;

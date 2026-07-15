@@ -517,7 +517,8 @@ def test_async_transfer_keeps_llm_request_alive():
     completed_ctx_ids = set()
 
     def poll_transfers():
-        completed, failed = transceiver_ctx.check_context_transfer_status(1)
+        completed, failed = transceiver_ctx.impl.check_context_transfer_status(
+            1, True)
         assert failed == []
         completed_ctx_ids.update(completed)
         transceiver_gen.check_gen_transfer_status(1)
@@ -528,6 +529,9 @@ def test_async_transfer_keeps_llm_request_alive():
                 == LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE)
 
     wait_for_transfer_completion(poll_transfers, transfers_done)
+    assert ctx_request.state == LlmRequestState.DISAGG_CONTEXT_COMPLETE
+    assert transceiver_ctx.impl.check_context_transfer_status(0,
+                                                              True) == ([], [])
 
 
 def _build_ctx_request_for_timeout_test(request_id: int) -> LlmRequest:

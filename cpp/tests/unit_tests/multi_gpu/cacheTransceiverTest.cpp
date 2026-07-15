@@ -32,6 +32,7 @@
 #include "tensorrt_llm/batch_manager/cacheFormatter.h"
 #include "tensorrt_llm/batch_manager/cacheTransceiver.h"
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
+#include "tensorrt_llm/batch_manager/transferStatusConsensus.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/envUtils.h"
@@ -42,6 +43,8 @@
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include "tensorrt_llm/testing/kvCacheManagerTestUtil.h"
+#include <atomic>
+#include <chrono>
 #include <csignal>
 #include <cstddef>
 #include <cstdint>
@@ -53,6 +56,7 @@
 #include <tensorrt_llm/batch_manager/cacheTransBuffer.h>
 #include <tensorrt_llm/batch_manager/mlaCacheFormatter.h>
 #include <tensorrt_llm/executor/cache_transmission/cacheSplitConcat.h>
+#include <thread>
 
 #include "gtest/gtest.h"
 #include <gmock/gmock.h>
@@ -159,6 +163,106 @@ TEST_F(CacheConfigTest, EqualTo)
         tensorParallelism};
     EXPECT_EQ(state0, state1);
 }
+
+#if ENABLE_MULTI_DEVICE
+TEST(ContextTransferVoteMailboxTest, WorkerVotesProgressWithoutPeerSchedulerPolling)
+{
+    constexpr int kPipelineParallelism = 4;
+    constexpr std::uint64_t kBlockedRequestId = 41;
+    constexpr std::uint64_t kIndependentRequestId = 42;
+    constexpr int kFailureRank = 1;
+    constexpr auto kRankZeroSchedulerDelay = std::chrono::seconds(3);
+    constexpr auto kPressureTimeout = std::chrono::seconds(2);
+    constexpr auto kTeardownDelay = std::chrono::milliseconds(250);
+    constexpr auto kPollTimeout = std::chrono::seconds(5);
+
+    tensorrt_llm::mpi::initialize(tensorrt_llm::mpi::MpiThreadSupport::THREAD_MULTIPLE);
+    if (tensorrt_llm::mpi::getThreadSupport() != tensorrt_llm::mpi::MpiThreadSupport::THREAD_MULTIPLE)
+    {
+        GTEST_SKIP() << "Test requires MPI_THREAD_MULTIPLE.";
+    }
+    auto& world = tensorrt_llm::mpi::MpiComm::world();
+    if (world.getSize() < kPipelineParallelism || world.getSize() % kPipelineParallelism != 0)
+    {
+        GTEST_SKIP() << "Test requires a process count divisible by four.";
+    }
+
+    auto ppMpiComm = std::make_shared<tensorrt_llm::mpi::MpiComm const>(
+        world.split(world.getRank() / kPipelineParallelism, world.getRank()));
+    auto ppComm = std::make_shared<CacheTransceiverComm>(ppMpiComm);
+    ContextTransferVoteMailbox mailbox(ppComm);
+    auto const ppRank = ppComm->getRank();
+
+    std::thread worker(
+        [&]()
+        {
+            mailbox.publishOutcomeToPeers(kIndependentRequestId, ppRank == kFailureRank);
+            if (ppRank != kPipelineParallelism - 1)
+            {
+                mailbox.publishOutcomeToPeers(kBlockedRequestId, /*failed=*/false);
+            }
+        });
+    worker.join();
+
+    if (ppRank == 0)
+    {
+        // Simulate rank 0 being inside model forward while its transfer worker still publishes to downstream ranks.
+        std::this_thread::sleep_for(kRankZeroSchedulerDelay);
+    }
+    EXPECT_EQ(mailbox.recordLocalOutcome(kIndependentRequestId), ppRank == kFailureRank);
+    if (ppRank != kPipelineParallelism - 1)
+    {
+        EXPECT_FALSE(mailbox.recordLocalOutcome(kBlockedRequestId));
+    }
+
+    bool independentFailed = false;
+    auto const independentDeadline = std::chrono::steady_clock::now() + (ppRank == 0 ? kPollTimeout : kPressureTimeout);
+    while (!independentFailed && std::chrono::steady_clock::now() < independentDeadline)
+    {
+        auto const result = mailbox.poll();
+        EXPECT_EQ(result.completedRequestIds.count(kBlockedRequestId), 0);
+        EXPECT_EQ(result.failedRequestIds.count(kBlockedRequestId), 0);
+        independentFailed = result.failedRequestIds.count(kIndependentRequestId) != 0;
+        if (!independentFailed)
+        {
+            std::this_thread::yield();
+        }
+    }
+    EXPECT_TRUE(independentFailed);
+
+    // No rank may commit the blocked request until its last worker publishes, but the independent request above is
+    // not held behind it. This barrier is test coordination after the pressure property has already been verified.
+    ppMpiComm->barrier();
+    if (ppRank == kPipelineParallelism - 1)
+    {
+        std::thread finalWorker([&]() { mailbox.publishOutcomeToPeers(kBlockedRequestId, /*failed=*/false); });
+        finalWorker.join();
+        EXPECT_FALSE(mailbox.recordLocalOutcome(kBlockedRequestId));
+    }
+
+    bool blockedCompleted = false;
+    auto const blockedDeadline = std::chrono::steady_clock::now() + kPollTimeout;
+    while (!blockedCompleted && std::chrono::steady_clock::now() < blockedDeadline)
+    {
+        auto const result = mailbox.poll();
+        blockedCompleted = result.completedRequestIds.count(kBlockedRequestId) != 0;
+        if (!blockedCompleted)
+        {
+            std::this_thread::yield();
+        }
+    }
+    EXPECT_TRUE(blockedCompleted);
+
+    // Exercise skewed teardown: peers must keep draining until rank 0 sends its ordered close marker.
+    if (ppRank == 0)
+    {
+        std::this_thread::sleep_for(kTeardownDelay);
+    }
+    auto const shutdownStart = std::chrono::steady_clock::now();
+    mailbox.shutdown();
+    EXPECT_LT(std::chrono::steady_clock::now() - shutdownStart, kPollTimeout);
+}
+#endif // ENABLE_MULTI_DEVICE
 
 // TODO: Restore multi-rank tests.
 
@@ -329,7 +433,8 @@ protected:
         return std::make_unique<LlmRequest>(mRequestId++, std::move(request));
     }
 
-    void addRequestAndTransportCache(std::shared_ptr<LlmRequest> const& llmRequest)
+    void addRequestAndTransportCache(
+        std::shared_ptr<LlmRequest> const& llmRequest, CacheSender::CompletionCallback completionCallback = {})
     {
         auto constexpr beamIdx{0};
         auto constexpr beamWidth{1};
@@ -348,7 +453,9 @@ protected:
                     TLLM_CUDA_CHECK(cudaMemset(it->data(), llmRequest->getPromptLen(), it->getSizeInBytes()));
                 }
             }
-            mFutures.emplace_back(mSender->sendAsync(llmRequest));
+            auto future = completionCallback ? mSender->sendAsync(llmRequest, std::move(completionCallback))
+                                             : mSender->sendAsync(llmRequest);
+            mFutures.emplace_back(std::move(future));
         }
         else
         {
@@ -423,6 +530,60 @@ TEST_F(SymmetricalCacheTest, SimpleTest)
     for (auto& future : mFutures)
     {
         future.get();
+    }
+}
+
+TEST_F(SymmetricalCacheTest, CompletionCallbackRunsExactlyOnceBeforeFutureReady)
+{
+    auto const worldSize = setUpCommunicator();
+    if (worldSize != 2)
+    {
+        GTEST_SKIP() << "mpirun 2 processes is required to run this test.";
+    }
+    setUpCacheManager();
+    setUpCacheTransceiver();
+    auto request = std::shared_ptr<LlmRequest>(makeLlmRequest(10));
+
+    std::atomic<int> callbackCount{0};
+    std::atomic<bool> callbackReportedFailure{true};
+    std::atomic<bool> callbackEntered{false};
+    std::atomic<bool> allowCallbackReturn{false};
+    CacheSender::CompletionCallback callback;
+    if (isSender)
+    {
+        callback = [&](bool const failed)
+        {
+            callbackReportedFailure.store(failed);
+            callbackCount.fetch_add(1);
+            callbackEntered.store(true);
+            while (!allowCallbackReturn.load())
+            {
+                std::this_thread::yield();
+            }
+        };
+    }
+    addRequestAndTransportCache(request, std::move(callback));
+
+    if (isSender)
+    {
+        ASSERT_EQ(mFutures.size(), 1);
+        auto const callbackDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (!callbackEntered.load() && std::chrono::steady_clock::now() < callbackDeadline)
+        {
+            std::this_thread::yield();
+        }
+        EXPECT_TRUE(callbackEntered.load());
+        if (callbackEntered.load())
+        {
+            EXPECT_EQ(mFutures.front().wait_for(std::chrono::milliseconds(0)), std::future_status::timeout);
+        }
+        allowCallbackReturn.store(true);
+        mFutures.front().get();
+        mFutures.clear();
+        EXPECT_EQ(callbackCount.load(), 1);
+        EXPECT_FALSE(callbackReportedFailure.load());
+        mSender.reset();
+        EXPECT_EQ(callbackCount.load(), 1);
     }
 }
 

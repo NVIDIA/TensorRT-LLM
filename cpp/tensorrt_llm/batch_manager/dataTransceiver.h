@@ -17,6 +17,7 @@
 
 #pragma once
 #include <fstream>
+#include <functional>
 #include <future>
 #include <map>
 #include <string>
@@ -263,6 +264,8 @@ private:
 class CacheSender
 {
 public:
+    using CompletionCallback = std::function<void(bool failed)>;
+
     /// @brief Constructor.
     /// @param manager The connection manager.
     /// @param selfIndex The sequential index of the current executor process.
@@ -276,6 +279,10 @@ public:
     /// worker can extend the request's lifetime past the caller's reference.
     /// @return Once the data is fully sent, the future object will become valid.
     [[nodiscard]] virtual std::future<void> sendAsync(std::shared_ptr<LlmRequest> const& llmRequest) const;
+
+    /// @brief Asynchronously respond and report the terminal worker outcome before the returned future becomes ready.
+    [[nodiscard]] std::future<void> sendAsync(
+        std::shared_ptr<LlmRequest> const& llmRequest, CompletionCallback completionCallback) const;
 
     /// @brief Return the internal communicator status.
     /// @return The communicator status.
