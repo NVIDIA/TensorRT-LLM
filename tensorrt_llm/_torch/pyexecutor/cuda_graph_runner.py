@@ -158,9 +158,17 @@ class CUDAGraphRunner:
                     (max_total_tokens, ), device="cuda", dtype=torch.long)
 
     def _get_seq_len_mode(
-            self,
-            batch: ScheduledRequests,
-            new_tensors_device: Optional[SampleStateTensors] = None):
+        self,
+        batch: ScheduledRequests,
+        new_tensors_device: Optional[SampleStateTensors] = None,
+        promoted_context_request_ids: frozenset[int] = frozenset()
+    ) -> bool:
+        """Select the sparse-attention graph family for the execution view.
+
+        ``promoted_context_request_ids`` contains semantic final-context rows
+        that the model engine temporarily placed in the generation list. It is
+        empty for the existing generation-only path.
+        """
         if (isinstance(self.sparse_config, SeqLenAwareSparseAttentionConfig)
                 and self.sparse_config.needs_separate_short_long_cuda_graphs()):
             # Some sparse attention algorithms need to use different forward paths for short and long sequences.
@@ -180,8 +188,16 @@ class CUDAGraphRunner:
                 is_spec_request = get_draft_token_length(
                     request) > 0 or next_draft_tokens_device is not None
                 num_draft_tokens = self.spec_config.max_draft_len if is_spec_request else 0
+                if request.py_request_id in promoted_context_request_ids:
+                    # A promoted context row may retain overlap bookkeeping
+                    # such as py_batch_idx from an earlier context chunk. That
+                    # state describes the previous batch, not the sequence
+                    # length of the final prompt token executed by this graph.
+                    # Use the authoritative context cursor so graph keying
+                    # matches the decode-shaped input prepared for this row.
+                    total_seq_len = request.context_current_position + 1
                 # First draft
-                if request.py_is_first_draft:
+                elif request.py_is_first_draft:
                     total_seq_len = len(request.get_tokens(0))
                 # With overlap scheduler disabled or dummy request or not assigned to a batch,
                 elif not overlap_scheduler_enabled or request.is_dummy or request.py_batch_idx is None:
@@ -205,15 +221,20 @@ class CUDAGraphRunner:
         return short_seq_len_mode
 
     def get_graph_key(
-            self,
-            batch: ScheduledRequests,
-            new_tensors_device: Optional[SampleStateTensors] = None,
-            spec_resource_manager: Optional[BaseResourceManager] = None,
-            spec_metadata: Optional[SpecMetadata] = None):
+        self,
+        batch: ScheduledRequests,
+        new_tensors_device: Optional[SampleStateTensors] = None,
+        spec_resource_manager: Optional[BaseResourceManager] = None,
+        spec_metadata: Optional[SpecMetadata] = None,
+        promoted_context_request_ids: frozenset[int] = frozenset()
+    ) -> KeyType:
         batch_size = batch.batch_size
 
         # Get the sequence length mode.
-        short_seq_len_mode = self._get_seq_len_mode(batch, new_tensors_device)
+        # Keep the graph-key tuple unchanged; promoted IDs only correct the
+        # sequence length observed by sparse short/long graph selection.
+        short_seq_len_mode = self._get_seq_len_mode(
+            batch, new_tensors_device, promoted_context_request_ids)
 
         # Spec one-engine sampler has two code paths (argmax fast-path vs
         # advanced sampling kernel). Include this in the key so we capture
@@ -281,7 +302,8 @@ class CUDAGraphRunner:
         draft_tokens_cuda: Optional[torch.Tensor] = None,
         new_tensors_device: Optional[SampleStateTensors] = None,
         spec_resource_manager: Optional[BaseResourceManager] = None,
-    ) -> Tuple[Optional[Any], Optional[Any], Optional[Tuple[int, int, bool]]]:
+        promoted_context_request_ids: frozenset[int] = frozenset(),
+    ) -> Tuple[Optional[Any], Optional[Any], Optional[KeyType]]:
         """
         Determines if the current batch can be run with a CUDA graph.
 
@@ -289,6 +311,10 @@ class CUDAGraphRunner:
         - The attn_metadata for the graph, if applicable.
         - The spec_metadata for the graph, if applicable.
         - The key for the graph, if applicable.
+
+        ``promoted_context_request_ids`` is execution-view metadata. It does
+        not change request state or type and is used only to build a graph key
+        consistent with the final-context token that will be executed.
         """
         # disable when doing statistic
         if ExpertStatistic.should_record():
@@ -318,8 +344,11 @@ class CUDAGraphRunner:
             # do carry a delta must first populate the model-side cache for their
             # current seq slot before graph replay.
             return None, None, None
+        # Propagate the execution-view identity through graph lookup. Existing
+        # callers pass the empty default and retain generation-only behavior.
         key = self.get_graph_key(batch, new_tensors_device,
-                                 spec_resource_manager, spec_metadata)
+                                 spec_resource_manager, spec_metadata,
+                                 promoted_context_request_ids)
 
         if key in self.graphs:
             return self.graph_metadata[key][

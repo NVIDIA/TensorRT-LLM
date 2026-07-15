@@ -8328,6 +8328,87 @@ static void seedAndRelease(KVCacheManager& mgr, LlmRequest::RequestIdType reqId,
     (void) mgr.removeSequence(reqId, req);
 }
 
+TEST_F(KVCacheManagerTest, AddSequenceBatchLeavesOneFinalContextTokenAfterReuse)
+{
+    auto const stream = std::make_shared<tr::CudaStream>();
+    auto mgr = makeBatchTestKVCacheManager(stream);
+    auto constexpr beamWidth = 1;
+    auto constexpr promptLen = 9;
+    auto constexpr seedRequestId = 0;
+    auto constexpr requestId = 1;
+    auto const inputTokens = std::make_shared<VecTokens>(VecTokens{0, 1, 2, 3, 4, 5, 6, 7, 8});
+
+    seedAndRelease(*mgr, seedRequestId, inputTokens);
+
+    auto req = std::make_shared<LlmRequest>(
+        LlmRequest::RequestIdType{requestId}, /*maxNewTokens=*/2, inputTokens, tr::SamplingConfig{beamWidth}, false);
+    auto const initialState = req->getState();
+    auto const requestType = req->getLlmRequestType();
+
+    mgr->addSequenceBatch({{{requestId, promptLen, beamWidth}}}, {std::ref(*req)});
+
+    EXPECT_EQ(req->getPrepopulatedPromptLen(), promptLen - 1);
+    EXPECT_EQ(req->getContextCurrentPosition(), promptLen - 1);
+    EXPECT_EQ(req->getContextRemainingLength(), 1);
+    EXPECT_EQ(req->getContextChunkSize(), 1);
+    EXPECT_TRUE(req->isLastContextChunk());
+    EXPECT_EQ(req->getState(), initialState);
+    EXPECT_EQ(req->getLlmRequestType(), requestType);
+
+    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*req);
+    EXPECT_NO_THROW(static_cast<void>(mgr->removeSequence(requestId, req)));
+}
+
+TEST_F(KVCacheManagerTest, AddSequenceBatchLeavesOneFinalMultimodalContextTokenAfterReuse)
+{
+    auto const stream = std::make_shared<tr::CudaStream>();
+    auto mgr = makeBatchTestKVCacheManager(stream);
+    auto constexpr beamWidth = 1;
+    auto constexpr promptLen = 9;
+    auto constexpr seedRequestId = 0;
+    auto constexpr requestId = 1;
+    auto constexpr mropePositionDelta = 7;
+    auto const inputTokens = std::make_shared<VecTokens>(VecTokens{0, 1, 2, 3, 4, 5, 6, 7, 8});
+    auto const multimodalHashes = std::make_shared<std::vector<std::vector<SizeType32>>>(
+        std::vector<std::vector<SizeType32>>{{1, 2, 3, 4, 5, 6, 7, 8}});
+    auto const multimodalPositions = std::make_shared<std::vector<SizeType32>>(std::vector<SizeType32>{1});
+    auto const multimodalLengths = std::make_shared<std::vector<SizeType32>>(std::vector<SizeType32>{4});
+    tr::SamplingConfig const samplingConfig{beamWidth};
+    auto const makeRequest = [&](LlmRequest::RequestIdType reqId, SizeType32 maxNewTokens)
+    {
+        return std::make_shared<LlmRequest>(reqId, maxNewTokens, inputTokens, samplingConfig, /*isStreaming=*/false,
+            std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
+            std::nullopt, multimodalHashes, multimodalPositions, multimodalLengths, std::nullopt, std::nullopt,
+            std::nullopt, mropePositionDelta);
+    };
+
+    auto seedReq = makeRequest(seedRequestId, /*maxNewTokens=*/0);
+    mgr->addSequenceBatch({{{seedRequestId, promptLen, beamWidth}}}, {std::ref(*seedReq)});
+    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*seedReq);
+    (void) mgr->removeSequence(seedRequestId, seedReq);
+
+    auto req = makeRequest(requestId, /*maxNewTokens=*/2);
+    auto const initialState = req->getState();
+    auto const requestType = req->getLlmRequestType();
+
+    mgr->addSequenceBatch({{{requestId, promptLen, beamWidth}}}, {std::ref(*req)});
+
+    EXPECT_EQ(req->getPrepopulatedPromptLen(), promptLen - 1);
+    EXPECT_EQ(req->getContextCurrentPosition(), promptLen - 1);
+    EXPECT_EQ(req->getContextRemainingLength(), 1);
+    EXPECT_EQ(req->getContextChunkSize(), 1);
+    EXPECT_TRUE(req->isLastContextChunk());
+    EXPECT_EQ(req->getState(), initialState);
+    EXPECT_EQ(req->getLlmRequestType(), requestType);
+    ASSERT_TRUE(req->getMropePositionDeltas().has_value());
+    EXPECT_EQ(req->getMropePositionDeltas().value(), mropePositionDelta);
+    ASSERT_TRUE(req->getMultimodalHashes().has_value());
+    EXPECT_EQ(req->getMultimodalHashes().value(), multimodalHashes);
+
+    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*req);
+    EXPECT_NO_THROW(static_cast<void>(mgr->removeSequence(requestId, req)));
+}
+
 // Test 1: Two requests in a batch, both partially match the same leaf block.
 // The tracker should assign reuse to the last request and bump the first to copy.
 TEST_F(KVCacheManagerTest, BatchAddSequence_LeafPartialThenPartial)
