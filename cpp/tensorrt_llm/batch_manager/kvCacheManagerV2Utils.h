@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -76,6 +76,10 @@ public:
 
     at::Tensor getCopyIndex(
         std::vector<LlmRequest::RequestIdType> const& requestIds, SizeType32 numContext, SizeType32 beamWidth);
+
+    //! Gathers each request's beam-0 K block offsets into a host snapshot.
+    void gatherKBlockOffsets(at::Tensor const& source, at::Tensor destination,
+        std::vector<LlmRequest::RequestIdType> const& requestIds, SizeType32 numBlocks);
 
     /// Number of sequences currently tracked (i.e. active IndexMapper slots).
     [[nodiscard]] SizeType32 size() const noexcept

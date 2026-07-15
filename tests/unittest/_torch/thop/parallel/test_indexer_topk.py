@@ -1387,6 +1387,133 @@ def test_cute_dsl_indexer_topk_decode(batch_size, next_n, index_topk, num_tokens
     )
 
 
+def _large_k_indexer_case(top_k: int, generation: int):
+    """Build a deterministic, tie-heavy input for the direct indexer op."""
+    batch_size = 2
+    next_n = 2
+    num_rows = batch_size * next_n
+    num_tokens = ((top_k + 521 + 31) // 32) * 32
+    columns = torch.arange(num_tokens, dtype=torch.int64, device="cuda")
+    rows = torch.arange(num_rows, dtype=torch.int64, device="cuda")[:, None]
+    logits = ((columns[None, :] * 17 + rows * 29 + generation * 43) % 257).to(torch.float32)
+    seq_lens = torch.tensor(
+        [num_tokens - 3 - generation, num_tokens - 17 + generation],
+        dtype=torch.int32,
+        device="cuda",
+    )
+    return logits.contiguous(), seq_lens, next_n
+
+
+def _assert_large_k_indexer_result(
+    logits: torch.Tensor,
+    seq_lens: torch.Tensor,
+    indices: torch.Tensor,
+    top_k: int,
+    next_n: int,
+):
+    """Compare indices with a tie-safe, independent torch.topk oracle."""
+    num_rows = logits.shape[0]
+    row_offsets = torch.arange(num_rows, device="cuda") % next_n
+    row_seq_lens = seq_lens.repeat_interleave(next_n) - next_n + row_offsets + 1
+
+    assert indices.shape == (num_rows, top_k)
+    assert indices.dtype == torch.int32
+    assert indices.is_contiguous()
+    assert torch.all(indices >= 0)
+    assert torch.all(indices < row_seq_lens[:, None])
+
+    sorted_indices = indices.sort(dim=1).values
+    assert torch.all(sorted_indices[:, 1:] > sorted_indices[:, :-1])
+
+    selected_values = logits.gather(1, indices.to(torch.int64)).sort(dim=1, descending=True).values
+    oracle_values = []
+    for row in range(num_rows):
+        row_seq_len = int(row_seq_lens[row].item())
+        oracle_values.append(
+            torch.topk(logits[row, :row_seq_len], top_k).values.sort(descending=True).values
+        )
+    oracle_values = torch.stack(oracle_values)
+    torch.testing.assert_close(selected_values, oracle_values, rtol=0.0, atol=0.0)
+
+
+@pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE, reason="CuTE DSL not available")
+@skip_pre_blackwell
+@pytest.mark.parametrize("index_topk", [4096, 4097, 8192])
+def test_cute_dsl_indexer_topk_decode_large_k_cuda_graph(index_topk):
+    """Validate eager and captured direct-indexer execution above k=2048."""
+    eager_logits, eager_seq_lens, next_n = _large_k_indexer_case(index_topk, 0)
+    num_rows = eager_logits.shape[0]
+    eager_indices = torch.empty(num_rows, index_topk, dtype=torch.int32, device="cuda")
+    eager_pointer = eager_indices.data_ptr()
+    torch.ops.trtllm.cute_dsl_indexer_topk_decode(
+        input_values=eager_logits,
+        seq_lens=eager_seq_lens,
+        output_indices=eager_indices,
+        top_k=index_topk,
+        next_n=next_n,
+        num_copy_bits=256,
+    )
+    torch.cuda.synchronize()
+    assert eager_indices.data_ptr() == eager_pointer
+    _assert_large_k_indexer_result(eager_logits, eager_seq_lens, eager_indices, index_topk, next_n)
+
+    graph_logits, graph_seq_lens, _ = _large_k_indexer_case(index_topk, 1)
+    graph_indices = torch.empty_like(eager_indices)
+    graph_pointers = (
+        graph_logits.data_ptr(),
+        graph_seq_lens.data_ptr(),
+        graph_indices.data_ptr(),
+    )
+
+    warmup_stream = torch.cuda.Stream()
+    warmup_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(warmup_stream):
+        torch.ops.trtllm.cute_dsl_indexer_topk_decode(
+            input_values=graph_logits,
+            seq_lens=graph_seq_lens,
+            output_indices=graph_indices,
+            top_k=index_topk,
+            next_n=next_n,
+            num_copy_bits=256,
+        )
+    torch.cuda.current_stream().wait_stream(warmup_stream)
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        torch.ops.trtllm.cute_dsl_indexer_topk_decode(
+            input_values=graph_logits,
+            seq_lens=graph_seq_lens,
+            output_indices=graph_indices,
+            top_k=index_topk,
+            next_n=next_n,
+            num_copy_bits=256,
+        )
+    torch.cuda.synchronize()
+    assert graph_pointers == (
+        graph_logits.data_ptr(),
+        graph_seq_lens.data_ptr(),
+        graph_indices.data_ptr(),
+    )
+    _assert_large_k_indexer_result(graph_logits, graph_seq_lens, graph_indices, index_topk, next_n)
+
+    for generation in (2, 3):
+        replay_logits, replay_seq_lens, _ = _large_k_indexer_case(index_topk, generation)
+        graph_logits.copy_(replay_logits)
+        graph_seq_lens.copy_(replay_seq_lens)
+        graph_indices.fill_(-1)
+        graph.replay()
+        torch.cuda.synchronize()
+        assert graph_pointers == (
+            graph_logits.data_ptr(),
+            graph_seq_lens.data_ptr(),
+            graph_indices.data_ptr(),
+        )
+        _assert_large_k_indexer_result(
+            graph_logits, graph_seq_lens, graph_indices, index_topk, next_n
+        )
+
+
 @pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE, reason="CuTE DSL not available")
 @skip_pre_blackwell
 @pytest.mark.parametrize("batch_size", [1, 16, 256])

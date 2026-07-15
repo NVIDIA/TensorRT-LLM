@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2019-2026, NVIDIA CORPORATION.  All rights reserved.
  * Copyright (c) 2021, NAVER Corp.  Authored by CLOVA.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -25,6 +25,7 @@ namespace kernels
 
 INSTANTIATE_ATTENTION_INPUT_OUTPUT_PROCESSING(half, half, KVBlockArray);
 INSTANTIATE_ATTENTION_INPUT_OUTPUT_PROCESSING(half, half, KVLinearBuffer);
+INSTANTIATE_SPARSE_KV_CACHE_COMPACT_V2_LAYERS(half);
 
 } // namespace kernels
 
