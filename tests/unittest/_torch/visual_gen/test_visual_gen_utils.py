@@ -277,7 +277,7 @@ class TestInputReferenceMaterialization:
             request, "vid-1", generator, media_storage_path=str(tmp_path)
         )
         assert params.image is not None
-        assert str(params.image).endswith("vid-1_reference.png")
+        assert str(params.image).endswith("vid-1_reference")
         # The decoded image is identical to what we passed in.
         with open(params.image, "rb") as f:
             decoded = Image.open(f).convert("RGB")
@@ -320,12 +320,13 @@ class TestInputReferenceMaterialization:
         params = parse_visual_gen_params(
             request, "vid-3", generator, media_storage_path=str(tmp_path)
         )
-        # Video content routes to extra_params["video"], not params.image,
-        # and the written suffix drives the worker's decode dispatch.
+        # Video content routes to extra_params["video"], not params.image.
+        # The stored file has no type-suffix — the worker classifies by
+        # content, so a fabricated extension would assert a type, not hint one.
         assert params.image is None
         assert params.extra_params is not None
-        assert str(params.extra_params["video"]).endswith("vid-3_reference.mp4")
-        assert (tmp_path / "vid-3_reference.mp4").exists()
+        assert str(params.extra_params["video"]).endswith("vid-3_reference")
+        assert (tmp_path / "vid-3_reference").exists()
 
     def test_base64_video_reference_routes_to_extra_params(self, tmp_path):
         # Classification is content-based, so the JSON/base64 path can
@@ -337,12 +338,12 @@ class TestInputReferenceMaterialization:
             request, "vid-4", generator, media_storage_path=str(tmp_path)
         )
         assert params.image is None
-        assert str(params.extra_params["video"]).endswith("vid-4_reference.mp4")
+        assert str(params.extra_params["video"]).endswith("vid-4_reference")
 
     def test_multipart_image_reference_routes_to_image(self, tmp_path):
-        # JPEG upload: content sniffing classifies it as an image even
-        # though the stored name is the cosmetic ``.png`` (PIL identifies
-        # by content, not suffix).
+        # JPEG upload: content sniffing classifies it as an image and routes
+        # to params.image. The stored file has no type-suffix (PIL identifies
+        # by content, not name).
         generator = _StubVisualGen()
         img = Image.new("RGB", (4, 4), (10, 20, 30))
         buf = BytesIO()
@@ -354,7 +355,7 @@ class TestInputReferenceMaterialization:
             request, "vid-5", generator, media_storage_path=str(tmp_path)
         )
         assert params.extra_params is None
-        assert str(params.image).endswith("vid-5_reference.png")
+        assert str(params.image).endswith("vid-5_reference")
 
     def test_undecodable_reference_raises_and_cleans_up(self, tmp_path):
         pytest.importorskip("cv2")
