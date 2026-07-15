@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""License and attribution data and generators for the standalone llmc package.
+"""License and attribution data and generators for the standalone paragraf package.
 
 Separated from create_standalone_package.py to keep data and logic apart.
 """

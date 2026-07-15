@@ -757,18 +757,14 @@ class Sender(SenderBase):
                 src_block_ids = src_block_ids_per_groups[self_lg]
                 dst_block_ids = dst_block_ids_per_groups[peer_lg]
 
-                # Speculative decoding: generation may have one extra draft-token block.
+                # Both sides trim block lists to ceil(prompt_len / tpb) in
+                # _create_kv_slice, so dst must never exceed src. A smaller dst
+                # (generation prefix-cache reuse) is handled via dst_start below.
                 block_diff = dst_block_ids.size - src_block_ids.size
-                if block_diff == 1:
-                    logger.debug(
-                        f"Trimming 1 extra dst block for draft tokens: "
-                        f"src={src_block_ids.size}, dst={dst_block_ids.size}"
-                    )
-                    dst_block_ids = dst_block_ids[:-1]
-                elif block_diff > 1:
+                if block_diff > 0:
                     raise ValueError(
                         f"src/dst block count mismatch: {src_block_ids.size} vs "
-                        f"{dst_block_ids.size} (expected diff <= 1)"
+                        f"{dst_block_ids.size} (dst must not exceed src)"
                     )
                 tpb = extractor.page_table.tokens_per_block
                 token_range = task._slice.token_range
