@@ -82,9 +82,6 @@ public:
     //! KVCacheManager::addSequenceBatch in every step.
     void syncWithBufferManager();
 
-    //! \brief Synchronize bufferManager stream with internal streams. This method ensures that prefill and decode
-    //! kernels for next step will wait for offloading and onboarding work that has already been scheduled. This method
-    //! must be called after the last call to KVCacheManager::addSequenceBatch in every step.
     //! \brief Disk tier: write a host-resident block's bytes to its slot files (synchronous POSIX).
     void spillToFile(BlockPtr const& srcHostBlock, SizeType32 diskSlot, std::vector<KVCacheBlockPool> const& pools,
         std::string const& directory);
@@ -143,6 +140,9 @@ public:
     //! to shed best-effort spills under writer saturation; retained spills are never shed -- they backpressure.
     [[nodiscard]] bool diskWriteQueueFull();
 
+    //! \brief Synchronize bufferManager stream with internal streams. This method ensures that prefill and decode
+    //! kernels for next step will wait for offloading and onboarding work that has already been scheduled. This method
+    //! must be called after the last call to KVCacheManager::addSequenceBatch in every step.
     void syncTransfers();
 
     ~KVCacheTransferManager();

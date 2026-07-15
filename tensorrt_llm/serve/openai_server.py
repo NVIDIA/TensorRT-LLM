@@ -2263,6 +2263,8 @@ class OpenAIServer(_VideoRoutesMixin):
             )
             promise = self.generator.generate_async(
                 inputs=input_tokens,
+                # ResponsesRequest does not expose kv_cache_ttl_seconds yet, so
+                # this resolves to None (no disk retention on /v1/responses).
                 kv_cache_retention_config=_disk_retention_config(request),
                 sampling_params=sampling_params,
                 streaming=request.stream,

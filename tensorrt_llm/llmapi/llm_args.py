@@ -3343,7 +3343,7 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
     disk_cache_size: Optional[NonNegativeInt] = Field(
         default=None,
         description=
-        "Size of the disk cache in bytes. Only used by KV cache manager v2 in the PyTorch backend."
+        "Size of the disk cache in bytes. Enables the disk KV cache tier in the PyTorch backend, for both the default KV cache manager and KV cache manager v2."
     )
     disk_cache_path: Optional[str] = Field(
         default=None,
