@@ -1391,6 +1391,16 @@
       "path": "sparse_attention_config.enable_heuristic_topk"
     },
     {
+      "allowed_values": [
+        "triton",
+        "msa"
+      ],
+      "annotation": "Literal['triton', 'msa']",
+      "converter": "",
+      "kind": "categorical",
+      "path": "sparse_attention_config.implementation"
+    },
+    {
       "allowed_values": [],
       "annotation": "Optional[int]",
       "converter": "",
@@ -1451,6 +1461,20 @@
       "converter": "allowlist",
       "kind": "categorical",
       "path": "sparse_attention_config.kt_cache_dtype"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[int]",
+      "converter": "",
+      "kind": "value",
+      "path": "sparse_attention_config.num_attention_heads"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "Optional[int]",
+      "converter": "",
+      "kind": "value",
+      "path": "sparse_attention_config.num_key_value_heads"
     },
     {
       "allowed_values": [],

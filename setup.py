@@ -425,6 +425,9 @@ else:
 # internal absolute imports (e.g., "from triton_kernels.foo import bar") work.
 packages += find_packages(include=["triton_kernels", "triton_kernels.*"])
 
+msa_package_dir = {"fmha_sm100": "3rdparty/MSA/python/fmha_sm100"}
+packages += ["fmha_sm100"]
+
 # https://setuptools.pypa.io/en/latest/references/keywords.html
 setup(
     name='tensorrt_llm',
@@ -439,6 +442,7 @@ setup(
     url="https://github.com/NVIDIA/TensorRT-LLM",
     download_url="https://github.com/NVIDIA/TensorRT-LLM/tags",
     packages=packages,
+    package_dir=msa_package_dir,
     exclude_package_data=exclude_package_data,
     # TODO Add windows support for python bindings.
     classifiers=[
@@ -451,8 +455,17 @@ setup(
     license="Apache License 2.0",
     keywords="nvidia tensorrt deeplearning inference",
     package_data={
-        'tensorrt_llm': package_data,
+        'tensorrt_llm':
+        package_data,
         'triton_kernels': ['LICENSE', 'VERSION', 'README.md'],
+        'fmha_sm100': [
+            '*.py',
+            'csrc/**/*',
+            'cute/**/*',
+            'cutlass/include/**/*',
+            'cutlass/tools/util/include/**/*',
+            'cutlass/LICENSE.txt',
+        ],
     },
     license_files=get_license(),
     entry_points={
