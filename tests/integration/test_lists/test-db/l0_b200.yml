@@ -127,6 +127,7 @@ l0_b200:
   - unittest/_torch/modules/fused_ops/test_rmsnorm_fp4_quant.py
   - unittest/_torch/modules/fused_ops/test_gelu_tanh_mul_fp4_quant.py
   - unittest/_torch/modules/fused_ops/test_rmsnorm_residual_add.py
+  - unittest/_torch/modules/fused_ops/test_fused_qk_norm_rope_gate.py
   - unittest/_torch/modules/test_gemma4_fused_qkv_prep.py
   - unittest/_torch/modules/test_awq_quantization.py
   - unittest/_torch/modules/test_triton_linear.py
