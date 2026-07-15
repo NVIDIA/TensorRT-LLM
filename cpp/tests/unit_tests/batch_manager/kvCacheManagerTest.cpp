@@ -10852,6 +10852,48 @@ TEST_F(KVCacheManagerTest, DiskTierExpiryAtSpillTest)
     EXPECT_GE(blockManager.getNumDiskGateDropped(), 2u);
 }
 
+// The disk-retention deadline must be anchored when the block is committed to the reuse tree
+// (storeContextBlocks), not at allocation -- otherwise a long prefill eats into the requested TTL.
+TEST_F(KVCacheManagerTest, DiskTierRetentionAnchoredAtCommitTest)
+{
+    auto const stream = std::make_shared<tr::CudaStream>();
+    DiskTierDir dir;
+    auto blockManagerPtr
+        = makeDiskTierBlockManager(stream, dir.str(), /*retainedOnly=*/false, /*prim=*/4, /*sec=*/2, /*disk=*/8);
+    auto& blockManager = *blockManagerPtr;
+    auto const windowSize = blockManager.getPoolWindowSize(0);
+    auto constexpr ttl = std::chrono::milliseconds(60000);
+
+    auto s = addDiskTierSequence(blockManager, 0, iotaTokens(0, 16), ttl);
+    auto const blockIds = s.seq->getCacheBlockIds(windowSize).at(0); // beam 0
+    ASSERT_FALSE(blockIds.empty());
+
+    // Allocated but not yet committed: no block may carry an absolute deadline.
+    for (auto const bid : blockIds)
+    {
+        EXPECT_FALSE(blockManager.getBlockById(bid, windowSize)->getRetentionExpiry().has_value())
+            << "retention deadline stamped at allocation instead of deferred to commit";
+    }
+
+    // Commit to the reuse tree -> the deadline is anchored at ~now + ttl for the committed blocks.
+    auto const before = std::chrono::steady_clock::now().time_since_epoch();
+    blockManager.storeContextBlocks(*s.seq, *s.req);
+    auto const after = std::chrono::steady_clock::now().time_since_epoch();
+
+    std::size_t stamped = 0;
+    for (auto const bid : blockIds)
+    {
+        auto const expiry = blockManager.getBlockById(bid, windowSize)->getRetentionExpiry();
+        if (expiry.has_value())
+        {
+            ++stamped;
+            EXPECT_GE(*expiry, before + ttl); // clock started at commit, not earlier at allocation
+            EXPECT_LE(*expiry, after + ttl);
+        }
+    }
+    EXPECT_GT(stamped, 0u) << "commit did not anchor any retention deadline";
+}
+
 // Bug-1 regression: a re-send that REUSES blocks re-stamps them (max-merge extends).
 TEST_F(KVCacheManagerTest, DiskTierReuseRestampTest)
 {

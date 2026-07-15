@@ -1622,7 +1622,8 @@ BlockPtr WindowBlockManager::getFreeBlock(GenerationRequest& sequence, executor:
     mEvictionPolicy->claimBlock(block, priority, durationMs);
     if (auto const diskRetentionMs = sequence.getDiskRetentionMs())
     {
-        block->markRetained(std::chrono::steady_clock::now().time_since_epoch() + *diskRetentionMs);
+        // Anchor the deadline at commit (storeBlocks), not at allocation.
+        block->setPendingRetention(*diskRetentionMs);
     }
     TLLM_LOG_DEBUG("%s::getFreeBlock - Block %d is now acquired by sequence %d", mLogPrefix.c_str(),
         block->getBlockId(), sequence.getRequestId());
@@ -3083,6 +3084,12 @@ std::pair<SizeType32, std::vector<KVCacheBlock::IdType>> WindowBlockManager::sto
             prevBlock->incRefCount();
             pinnedBlockIds.push_back(prevBlock->getBlockId());
         }
+    }
+
+    // Blocks are now committed to the reuse tree: anchor any pending retention duration to now.
+    for (auto const& b : storedBlocks)
+    {
+        b->commitRetention();
     }
 
     if (mEventManager)

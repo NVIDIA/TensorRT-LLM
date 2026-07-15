@@ -487,6 +487,24 @@ public:
         mRetentionExpiry = std::nullopt;
     }
 
+    //! \brief Record the requested disk-retention duration without starting the clock; commitRetention()
+    //! turns it into an absolute deadline when the block is first committed to the reuse tree.
+    void setPendingRetention(std::chrono::milliseconds duration)
+    {
+        mPendingRetentionDuration
+            = mPendingRetentionDuration ? std::max(*mPendingRetentionDuration, duration) : duration;
+    }
+
+    //! \brief Anchor a pending retention duration to now (called when the block is committed / made reusable).
+    void commitRetention()
+    {
+        if (mPendingRetentionDuration)
+        {
+            markRetained(std::chrono::steady_clock::now().time_since_epoch() + *mPendingRetentionDuration);
+            mPendingRetentionDuration = std::nullopt;
+        }
+    }
+
     //! \brief Times this block's content has been reused (prefix-matched); drives the disk reuse-gate.
     [[nodiscard]] SizeType32 getReuseCount() const
     {
@@ -658,6 +676,9 @@ private:
 
     // Disk-tier retention deadline (steady clock); nullopt = never marked.
     std::optional<std::chrono::steady_clock::time_point::duration> mRetentionExpiry;
+
+    // Requested retention duration, held until commit; commitRetention() converts it to mRetentionExpiry.
+    std::optional<std::chrono::milliseconds> mPendingRetentionDuration;
 
     // How many times this block's content has been reused (prefix-matched). Metadata on the block object,
     // so it survives tier moves like mRetentionExpiry (swapDiskResidency swaps only residency pointers).
