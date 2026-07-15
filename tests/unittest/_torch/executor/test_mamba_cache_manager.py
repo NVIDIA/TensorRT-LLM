@@ -17,8 +17,9 @@ from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import (
     PythonMambaCacheManager,
     _get_mamba_hybrid_pool_size,
 )
-from tensorrt_llm._torch.pyexecutor.resource_manager import CacheTypeCpp
+from tensorrt_llm._torch.pyexecutor.resource_manager import CacheTypeCpp, DataType
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
+from tensorrt_llm._utils import torch_dtype_to_binding
 from tensorrt_llm.bindings.internal.batch_manager import LinearCacheType
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig, MTPDecodingConfig
 from tensorrt_llm.mapping import Mapping
@@ -360,13 +361,17 @@ def _build_hybrid_with_mamba_layer(
     enable_block_reuse=False,
     mamba_state_cache_interval=256,
     is_estimating_kv_cache=False,
+    dtype=DataType.HALF,
+    mamba_layer_mask=None,
+    attention_layer_mask=None,
+    mamba_ssm_cache_dtype=torch.float16,
 ):
     """Construct a real CppMambaHybridCacheManager with one mamba layer +
     one full-attention layer so the parent KVCacheManager goes through the
     linear-attention pool sizing path."""
     # Layer 0: mamba; Layer 1: full attention. Single rank, no MPI.
-    mamba_mask = [True, False]
-    attn_mask = [False, True]
+    mamba_mask = mamba_layer_mask or [True, False]
+    attn_mask = attention_layer_mask or [False, True]
     mapping = Mapping(world_size=1, rank=0, tp_size=1, pp_size=1)
     # Cap max_tokens to keep the real C++ pool allocation tiny.
     kv_cache_config = KvCacheConfig(
@@ -380,13 +385,13 @@ def _build_hybrid_with_mamba_layer(
         mamba_num_heads=4,
         mamba_n_groups=1,
         mamba_head_dim=8,
-        mamba_num_layers=1,
+        mamba_num_layers=sum(mamba_mask),
         mamba_layer_mask=mamba_mask,
         mamba_cache_dtype=torch.float16,
-        mamba_ssm_cache_dtype=torch.float16,
+        mamba_ssm_cache_dtype=mamba_ssm_cache_dtype,
         kv_cache_config=kv_cache_config,
         kv_cache_type=CacheTypeCpp.SELF,
-        num_layers=1,
+        num_layers=sum(attn_mask),
         num_kv_heads=4,
         head_dim=64,
         tokens_per_block=32,
@@ -396,7 +401,61 @@ def _build_hybrid_with_mamba_layer(
         spec_config=spec_config,
         layer_mask=attn_mask,
         is_estimating_kv_cache=is_estimating_kv_cache,
+        dtype=dtype,
     )
+
+
+@skip_no_cuda
+@pytest.mark.parametrize(
+    "mamba_ssm_cache_dtype",
+    [torch.float16, torch.float32, torch.bfloat16],
+)
+def test_cpp_hybrid_passes_per_window_pool_dtypes_for_nvfp4_kv_cache(
+    mamba_ssm_cache_dtype,
+):
+    mgr = _build_hybrid_with_mamba_layer(
+        dtype=DataType.NVFP4,
+        mamba_ssm_cache_dtype=mamba_ssm_cache_dtype,
+    )
+    recurrent_pool_dtype = torch_dtype_to_binding(mamba_ssm_cache_dtype)
+
+    expected_dtypes = [
+        (LinearCacheType.RECURRENT_STATES.value, recurrent_pool_dtype),
+        (128, DataType.NVFP4),
+    ]
+    assert [
+        (config.window_size, config.dtype) for config in mgr.pool_configurations
+    ] == expected_dtypes
+    assert [
+        (config.window_size, config.dtype) for config in mgr.impl.pool_configurations
+    ] == expected_dtypes
+    assert mgr._layer_to_pool_idx == {0: 0, 1: 1}
+    assert mgr.recurrent_states_pool_index == 0
+    assert mgr.impl.get_recurrent_states_pool().dtype == mamba_ssm_cache_dtype
+
+    compact_scale_pointers = mgr.impl.get_block_scale_pool_pointers()
+    assert mgr.impl.get_block_pool_pointers().shape == (2, 2)
+    assert compact_scale_pointers.shape == (1, 2)
+    assert mgr.kv_cache_pool_pointers.shape == (2, 2, 2)
+    assert torch.count_nonzero(mgr.kv_cache_pool_pointers[0, :, 1]) == 0
+    assert torch.equal(mgr.kv_cache_pool_pointers[1, :, 1], compact_scale_pointers[0])
+
+
+@skip_no_cuda
+def test_cpp_hybrid_merges_compact_scale_rows_with_unmanaged_layers():
+    mgr = _build_hybrid_with_mamba_layer(
+        dtype=DataType.NVFP4,
+        mamba_layer_mask=[True, False, True, False],
+        attention_layer_mask=[False, False, False, True],
+    )
+
+    assert mgr.pp_layers == [0, 2, 3]
+    assert mgr.kv_cache_pool_mapping[:, 0].tolist() == [0, 0, 1]
+    compact_scale_pointers = mgr.impl.get_block_scale_pool_pointers()
+    assert compact_scale_pointers.shape == (1, 2)
+    assert mgr.kv_cache_pool_pointers.shape == (2, 2, 2)
+    assert torch.count_nonzero(mgr.kv_cache_pool_pointers[0, :, 1]) == 0
+    assert torch.equal(mgr.kv_cache_pool_pointers[1, :, 1], compact_scale_pointers[0])
 
 
 @skip_no_cuda
@@ -646,6 +705,14 @@ def test_cpp_hybrid_zero_local_mamba_layers():
     # On the early-exit branch, num_layers is forwarded as-is.
     assert mgr.num_layers == 4
     assert mgr.num_local_layers == 2
+    assert all(
+        config.window_size != LinearCacheType.RECURRENT_STATES.value
+        for config in mgr.pool_configurations
+    )
+    assert all(
+        config.window_size != LinearCacheType.RECURRENT_STATES.value
+        for config in mgr.impl.pool_configurations
+    )
 
     # No mamba-only state was allocated.
     for attr in (
