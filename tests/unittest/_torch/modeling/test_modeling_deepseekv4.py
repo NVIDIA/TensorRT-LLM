@@ -3,52 +3,31 @@ import inspect
 import json
 import struct
 import textwrap
-import weakref
-from copy import deepcopy
+from types import SimpleNamespace
 
 import pytest
 import torch
 from transformers import PretrainedConfig
 
 # from utils.util import default_dtype
-import tensorrt_llm
 from tensorrt_llm._torch.attention_backend.interface import AttentionForwardArgs
-from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.cache_manager import (
-    DeepseekV4CacheManager,
-)
 from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.compressor import Compressor
 from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.deepseek_v4 import (
     DeepseekV4Indexer,
     DeepseekV4TrtllmAttention,
-    DeepseekV4TrtllmAttentionMetadata,
 )
 from tensorrt_llm._torch.attention_backend.trtllm import TrtllmAttention
 from tensorrt_llm._torch.configs.deepseekv4 import DeepseekV4Config
-from tensorrt_llm._torch.metadata import KVCacheParams
-from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_deepseekv4 import (
-    DeepseekV4DecoderLayer,
+    DeepseekV4Attention,
     DeepseekV4ForCausalLM,
     DeepseekV4Gate,
-    DeepseekV4MTP,
+    DeepseekV4WeightLoader,
     _copy_deepseek_v4_fused_a_weight_scale,
-    _deepseek_v4_pos_embd_params,
     _remap_deepseek_v4_checkpoint_keys,
     _resolve_enable_fused_hc,
 )
-from tensorrt_llm._torch.modules.linear import TensorParallelMode
-from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, SamplingConfig
-from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
-from tensorrt_llm._torch.utils import AuxStreamType, model_extra_attrs
-from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
-from tensorrt_llm.llmapi.llm_args import (
-    DeepSeekV4SparseAttentionConfig,
-    KvCacheConfig,
-    MTPDecodingConfig,
-)
-from tensorrt_llm.mapping import Mapping
-from tensorrt_llm.models.modeling_utils import QuantConfig
-from tensorrt_llm.quantization.mode import QuantAlgo
+from tensorrt_llm._torch.pyexecutor.model_loader import ModelLoader, initialize_dummy_weights
 
 DEEPSEEK_V4_TINY_CONFIG = {
     "architectures": ["DeepseekV4ForCausalLM"],
@@ -283,6 +262,16 @@ def test_deepseek_v4_attn_sink_remap():
         remapped["model.layers.0.self_attn.attn_sink"], weights["layers.0.attn.attn_sink"]
     )
 
+    # The MTP sink is re-prefixed to the extra layer index and routes through
+    # the same self_attn loader branch (and thus load_attn_sink) as the main
+    # layers.
+    mtp_remapped = _remap_deepseek_v4_checkpoint_keys(
+        {"mtp.0.attn.attn_sink": torch.arange(4, dtype=torch.float32)},
+        num_hidden_layers=1,
+        kv_lora_rank=448,
+    )
+    assert "model.layers.1.self_attn.attn_sink" in mtp_remapped
+
 
 def test_deepseek_v4_flat_hc_weight_remap():
     weights = {
@@ -401,6 +390,23 @@ def test_deepseek_v4_compressor_rotate_and_indexer_rope_contracts():
     assert "rotate_activation=False" in attention_init
 
 
+class _CudaMarkedTensor:
+    """Proxy over a real CPU tensor that reports ``is_cuda=True``.
+
+    The forward injection gate keys on ``attn_sink.data.is_cuda`` (the C++
+    op takes the raw pointer without a device check), and these unit tests
+    must stay runnable on CPU-only hosts.
+    """
+
+    is_cuda = True
+
+    def __init__(self, tensor):
+        object.__setattr__(self, "_tensor", tensor)
+
+    def __getattr__(self, name):
+        return getattr(object.__getattribute__(self, "_tensor"), name)
+
+
 def test_deepseek_v4_attention_forward_injects_attn_sink(monkeypatch):
     captured = {}
 
@@ -416,7 +422,7 @@ def test_deepseek_v4_attention_forward_injects_attn_sink(monkeypatch):
     )
     attn = object.__new__(DeepseekV4TrtllmAttention)
     sink = torch.ones(4, dtype=torch.float32)
-    attn.attn_sink = torch.nn.Parameter(sink, requires_grad=False)
+    attn.attn_sink = SimpleNamespace(data=_CudaMarkedTensor(sink))
 
     metadata = object()
     assert DeepseekV4TrtllmAttention.forward(attn, "q", None, None, metadata) == "ok"
@@ -435,505 +441,259 @@ def test_deepseek_v4_attention_forward_injects_attn_sink(monkeypatch):
     assert captured["forward_args"].attention_sinks.data_ptr() == sink.data_ptr()
     assert forward_args.attention_sinks is None
 
+    # Device gate: a still-on-CPU pre-registered sink (hook-less harnesses
+    # that never ran the owning module's staged post-load hooks,
+    # post_load_weights / cache_derived_state) must NOT be injected --
+    # attentionOp.cpp reads the raw pointer without a device check, so a
+    # host pointer would reach the CUDA kernel. Null-sink behavior is the
+    # correct fallback.
+    captured.clear()
+    attn.attn_sink = torch.nn.Parameter(sink, requires_grad=False)
+    assert DeepseekV4TrtllmAttention.forward(attn, "q", None, None, metadata) == "ok"
+    assert captured["forward_args"].attention_sinks is None
 
-def test_deepseek_v4_moe_auto_backend_on_blackwell(monkeypatch):
-    monkeypatch.setattr("tensorrt_llm._torch.model_config.get_sm_version", lambda: 100)
 
-    assert ModelConfig.resolve_moe_backend("AUTO", "DeepseekV4ForCausalLM") == "TRTLLM"
+def _make_attention_stub(num_heads_tp=4):
+    """Bare DeepseekV4Attention carrying only the attn_sink surface (the
+    real __init__ needs a GPU-backed MLA tree). ``_weights_transformed`` is
+    pre-set so MLA's transform chain is a no-op on the stub."""
+    stub = object.__new__(DeepseekV4Attention)
+    torch.nn.Module.__init__(stub)
+    stub.num_heads_tp = num_heads_tp
+    stub.mqa = SimpleNamespace()
+    stub._weights_transformed = True
+    stub._register_attn_sink()
+    return stub
 
 
-def test_deepseek_v4_routed_moe_quant_config_from_mxfp4_header(tmp_path, monkeypatch):
-    monkeypatch.setattr("tensorrt_llm._torch.model_config.get_sm_version", lambda: 100)
-    tensor_name = "layers.0.ffn.experts.0.w1.weight"
-    shard_name = "model-00001-of-00001.safetensors"
-    header = {
-        tensor_name: {
-            "dtype": "I8",
-            "shape": [2, 2],
-            "data_offsets": [0, 0],
-        },
-    }
-    payload = json.dumps(header).encode("utf-8")
-    (tmp_path / shard_name).write_bytes(struct.pack("<Q", len(payload)) + payload)
-    (tmp_path / "model.safetensors.index.json").write_text(
-        json.dumps(
-            {
-                "weight_map": {
-                    tensor_name: shard_name,
-                }
-            }
+def test_deepseek_v4_attention_module_owns_attn_sink():
+    """attn_sink must be a Parameter of the DSv4-owned nn.Module.
+
+    Module ownership is what makes it transportable: only
+    module._parameters entries enter state_dict()/named_parameters(), which
+    is exactly what the GMS writer commit (finalize_gms_write /
+    _iter_module_tensors), GMS read-only materialization, and dummy init
+    enumerate. A backend-held Parameter is invisible to all of them. It
+    must also exist with stable storage at construction time: CUDA-graph
+    warmup capture happens at LLM init, before any RLHF update_weights, and
+    -inf is the neutral sink (kernels add exp(sink - max) to the softmax
+    denominator)."""
+    stub = _make_attention_stub(num_heads_tp=64)
+    parent = torch.nn.Module()
+    parent.self_attn = stub
+
+    sink = stub.attn_sink
+    assert isinstance(sink, torch.nn.Parameter)
+    assert sink.requires_grad is False
+    assert sink.dtype == torch.float32
+    assert tuple(sink.shape) == (64,)
+    assert torch.isneginf(sink.data).all()
+    assert stub._attn_sink_loaded is False
+    assert "self_attn.attn_sink" in parent.state_dict()
+    assert "self_attn.attn_sink" in dict(parent.named_parameters())
+    # The backend alias shares the Parameter object, so loader copy_ and
+    # forward injection stay in sync.
+    assert stub.mqa.attn_sink is stub.attn_sink
+
+    # __init__ must register unconditionally (warmup capture needs the
+    # storage before any reload could create it lazily).
+    init_src = inspect.getsource(DeepseekV4Attention.__init__)
+    assert "self._register_attn_sink()" in init_src
+
+
+def test_deepseek_v4_cache_derived_state_rewires_rebound_attn_sink(monkeypatch):
+    """GMS read-only materialization REBINDS module._parameters["attn_sink"]
+    to a new Parameter bound zero-copy to writer-committed shared storage
+    (the CPU-built param never sees model.to("cuda") on the GMS path), so
+    cache_derived_state must re-wire the backend alias to the transported
+    Parameter and must NOT write it: the receiver's local _attn_sink_loaded
+    flag is still False while the storage holds real values shared with the
+    writer and every peer."""
+    monkeypatch.setattr(torch.Tensor, "cuda", lambda self: self)
+    stub = _make_attention_stub()
+    values = torch.tensor([0.5, -1.0, 2.0, 0.0], dtype=torch.float32)
+    transported = torch.nn.Parameter(values.clone(), requires_grad=False)
+    ptr = transported.data_ptr()
+    # Mirror of the upstream materializer's rebind statement.
+    stub._parameters["attn_sink"] = transported
+
+    DeepseekV4Attention.cache_derived_state(stub)
+
+    assert stub.mqa.attn_sink is transported
+    assert torch.equal(transported.data, values)  # no -inf refill
+    assert transported.data_ptr() == ptr
+    assert stub._attn_sink_loaded is False
+
+
+def test_deepseek_v4_attn_sink_stage_preservation_semantics(monkeypatch):
+    """Both staged hooks are VALUE-PRESERVING for attn_sink. Dummy init must
+    skip it at the source (suffix skip-list in initialize_dummy_weights;
+    exp(-inf) == 0 is the exact no-sink math) while still randomizing
+    sibling params. Direct-write transports (MX P2P) deliver real values
+    with _attn_sink_loaded still False, and repeated finalize sweeps must
+    preserve them without rebinding .data (captured graphs bake the device
+    pointer). cache_derived_state (read-only stage) never writes either."""
+    if not torch.cuda.is_available():
+        # The one-time CUDA migration is exercised on GPU runners; keep the
+        # value/flag/pointer contract testable on CPU-only hosts.
+        monkeypatch.setattr(torch.Tensor, "cuda", lambda self: self)
+
+    stub = _make_attention_stub()
+    parent = torch.nn.Module()
+    parent.self_attn = stub
+    parent.probe = torch.nn.Parameter(torch.zeros(4), requires_grad=False)
+
+    # (a) dummy init: the ctor -inf survives via the source-level skip while
+    # a sibling fp32 Parameter IS randomized (the skip is suffix-scoped).
+    initialize_dummy_weights(parent)
+    assert torch.isneginf(stub.attn_sink.data).all()
+    assert not torch.equal(parent.probe.data, torch.zeros(4))
+    DeepseekV4Attention.post_load_weights(stub)
+    assert torch.isneginf(stub.attn_sink.data.cpu()).all()
+    if torch.cuda.is_available():
+        assert stub.attn_sink.data.is_cuda
+    ptr = stub.attn_sink.data_ptr()
+
+    # (b) MX-P2P-style direct Parameter write: real values land WITHOUT
+    # load_attn_sink (diagnostic flag stays False); the full post-load walk
+    # must preserve them across repeated sweeps, pointer stable. This is
+    # the direct regression test for the flag-gated refill.
+    transported = torch.tensor([0.5, -1.0, 2.0, 0.0], dtype=torch.float32)
+    stub.attn_sink.data.copy_(transported)
+    assert stub._attn_sink_loaded is False
+    DeepseekV4Attention.post_load_weights(stub)
+    DeepseekV4Attention.post_load_weights(stub)  # finalize sweeps repeat
+    assert torch.equal(stub.attn_sink.data.cpu(), transported)
+    assert stub.attn_sink.data_ptr() == ptr
+    assert stub.mqa.attn_sink is stub.attn_sink
+
+    # (c) loader-delivered values behave identically (flag is diagnostic
+    # only, it gates nothing).
+    loaded = torch.tensor([1.5, 2.5, 3.5, 4.5], dtype=torch.float32)
+    stub.attn_sink.data.copy_(loaded)
+    stub._attn_sink_loaded = True
+    DeepseekV4Attention.post_load_weights(stub)
+    assert torch.equal(stub.attn_sink.data.cpu(), loaded)
+    assert stub.attn_sink.data_ptr() == ptr
+
+    # (d) the read-only stage must not write even with the flag unset and
+    # non-neutral values (RO receivers hold writer-transported real values).
+    stub_ro = _make_attention_stub()
+    stub_ro.attn_sink.data.copy_(transported)
+    DeepseekV4Attention.cache_derived_state(stub_ro)
+    assert torch.equal(stub_ro.attn_sink.data.cpu(), transported)
+
+
+def test_deepseek_v4_attn_sink_ctor_value_survives_meta_init_mode():
+    """Executable contract for what _register_attn_sink relies on:
+    MetaInitMode intercepts only aten.empty/empty_like, so torch.full (no
+    tensor args) executes for real on CPU -- the -inf ctor value exists as
+    real bytes that later allocation stages must preserve."""
+    from tensorrt_llm._torch.models.modeling_utils import MetaInitMode
+
+    with MetaInitMode():
+        sink = torch.nn.Parameter(
+            torch.full((4,), float("-inf"), dtype=torch.float32), requires_grad=False
         )
+        probe = torch.empty(4)
+
+    assert sink.device.type == "cpu"
+    assert torch.isneginf(sink).all()
+    assert probe.device.type == "meta"  # the mode WAS active around both
+
+
+def test_initialize_dummy_weights_skips_attn_sink_suffix():
+    """Shared-layer contract for the dummy initializer: the ``.attn_sink``
+    suffix skip preserves ctor values for ANY module registering the param
+    (the neutral value is the correct dummy sink), while suffix scoping
+    keeps the skip from swallowing similarly named params."""
+    model = torch.nn.Module()
+    inner = torch.nn.Module()
+    model.self_attn = inner
+    inner.attn_sink = torch.nn.Parameter(
+        torch.full((3,), float("-inf"), dtype=torch.float32), requires_grad=False
     )
-    config = DeepseekV4Config(num_hidden_layers=2)
+    inner.attn_sink_bias = torch.nn.Parameter(torch.zeros(3), requires_grad=False)
+    model.weight = torch.nn.Parameter(torch.zeros(3), requires_grad=False)
 
-    layer_quant_config = ModelConfig._set_deepseek_v4_routed_moe_quant_config(
-        config, str(tmp_path), "TRTLLM", None
+    initialize_dummy_weights(model)
+
+    assert torch.isneginf(inner.attn_sink.data).all()
+    assert not torch.equal(inner.attn_sink_bias.data, torch.zeros(3))
+    assert not torch.equal(model.weight.data, torch.zeros(3))
+
+
+def test_deepseek_v4_attn_sink_reached_by_model_loader_walks(monkeypatch):
+    """The GMS read-only loader branch runs ONLY ModelLoader._walk_cache_state
+    and the full/dummy branches run _walk_full_post_load: with the round-9
+    model-level backend sweep gone, both real walks must reach the
+    module-level staged hooks (rebind re-wire on the cache walk,
+    value-preserving migration + re-wire on the full walk)."""
+    monkeypatch.setattr(torch.Tensor, "cuda", lambda self: self)
+    root = _make_causal_lm_stub()
+    attn = _make_attention_stub()
+    root.attn = attn
+
+    rebound = torch.nn.Parameter(
+        torch.tensor([9.0, 8.0, 7.0, 6.0], dtype=torch.float32), requires_grad=False
     )
+    attn._parameters["attn_sink"] = rebound  # upstream RO rebind
 
-    quant_config = layer_quant_config["model.layers.0.mlp.experts"]
-    assert layer_quant_config["model.layers.1.mlp.experts"].quant_algo == quant_config.quant_algo
-    assert quant_config.quant_algo == QuantAlgo.W4A8_MXFP4_MXFP8
-    assert quant_config.group_size == 32
+    ModelLoader._walk_cache_state(root)
+    # Read-only stage: alias re-wired to the transported Parameter, values
+    # untouched.
+    assert attn.mqa.attn_sink is rebound
+    assert torch.equal(rebound.data, torch.tensor([9.0, 8.0, 7.0, 6.0]))
+
+    ModelLoader._walk_full_post_load(root)
+    # Writer stage is value-preserving too: directly transported values
+    # (diagnostic flag never set) survive the full walk -- no -inf refill.
+    assert torch.equal(attn.attn_sink.data, torch.tensor([9.0, 8.0, 7.0, 6.0]))
+    assert attn.attn_sink is rebound
+    assert attn.mqa.attn_sink is attn.attn_sink
 
 
-def test_deepseek_v4_routed_moe_quant_config_covers_mtp_layers(tmp_path, monkeypatch):
-    monkeypatch.setattr("tensorrt_llm._torch.model_config.get_sm_version", lambda: 100)
-    tensor_name = "layers.0.ffn.experts.0.w1.weight"
-    shard_name = "model-00001-of-00001.safetensors"
-    _write_safetensors_header(tmp_path / shard_name, tensor_name, "I8", [2, 2])
-    (tmp_path / "model.safetensors.index.json").write_text(
-        json.dumps(
-            {
-                "weight_map": {
-                    tensor_name: shard_name,
-                }
-            }
-        )
+def test_deepseek_v4_load_attn_sink_refreshes_in_place():
+    """Reload must copy_ into the module-owned pre-registered storage (never
+    rebind: the captured CUDA graph baked this pointer), apply the per-head
+    TP split, and latch _attn_sink_loaded on the owner module."""
+    loader = object.__new__(DeepseekV4WeightLoader)
+    loader.model_config = SimpleNamespace(
+        mapping=SimpleNamespace(enable_attention_dp=False, tp_size=2, tp_rank=1)
     )
+    owner = _make_attention_stub(num_heads_tp=8)
+    ptr = owner.attn_sink.data_ptr()
 
-    class MTPMode:
-        @staticmethod
-        def is_mtp_one_model():
-            return True
+    sink_src = torch.arange(16, dtype=torch.float32)
+    loader.load_attn_sink(owner, sink_src)
+    assert owner.attn_sink.data_ptr() == ptr
+    assert torch.equal(owner.attn_sink.data, sink_src[8:])
+    assert owner._attn_sink_loaded is True
+    # The backend alias observes the refresh through the shared object.
+    assert owner.mqa.attn_sink is owner.attn_sink
+    assert torch.equal(owner.mqa.attn_sink.data, sink_src[8:])
 
-    class MTPConfig:
-        spec_dec_mode = MTPMode()
-        num_nextn_predict_layers = 3
+    # Shape drift across reloads must fail loudly, not corrupt storage.
+    with pytest.raises(ValueError, match="attn_sink shape changed"):
+        loader.load_attn_sink(owner, torch.arange(8, dtype=torch.float32))
+    assert torch.equal(owner.attn_sink.data, sink_src[8:])
 
-    layer_quant_config = ModelConfig._set_deepseek_v4_routed_moe_quant_config(
-        DeepseekV4Config(num_hidden_layers=2), str(tmp_path), "TRTLLM", None, MTPConfig()
+    # Under attention DP (tp_size == 1 mapping) the full sink is kept.
+    loader.model_config = SimpleNamespace(
+        mapping=SimpleNamespace(enable_attention_dp=True, tp_size=1, tp_rank=0)
     )
-
-    quant_algo = layer_quant_config["model.layers.0.mlp.experts"].quant_algo
-    for layer_idx in range(1, 5):
-        assert layer_quant_config[f"model.layers.{layer_idx}.mlp.experts"].quant_algo == quant_algo
-
-
-def test_deepseek_v4_mtp_projection_uses_fp8_quant_config(monkeypatch):
-    def fake_decoder_layer_init(self, model_config, *_args, **_kwargs):
-        torch.nn.Module.__init__(self)
-        self.model_config = model_config
-        self.config = model_config.pretrained_config
-
-    monkeypatch.setattr(DeepseekV4DecoderLayer, "__init__", fake_decoder_layer_init)
-    monkeypatch.setattr(torch.cuda, "Event", lambda: object())
-    monkeypatch.setattr(
-        "tensorrt_llm._torch.distributed.AllReduce", lambda *args, **kwargs: object()
-    )
-
-    config = DeepseekV4Config(hidden_size=512, hc_mult=2)
-    config.torch_dtype = torch.bfloat16
-    quant_config = QuantConfig(quant_algo=QuantAlgo.FP8_BLOCK_SCALES)
-    model_config = ModelConfig(
-        pretrained_config=config,
-        mapping=Mapping(world_size=4, rank=2, tp_size=4),
-        quant_config=quant_config,
-    )
-
-    mtp_layer = DeepseekV4MTP(
-        model_config,
-        layer_idx=config.num_hidden_layers,
-        aux_stream_dict={AuxStreamType.MoeShared: object()},
-    )
-
-    assert mtp_layer.e_proj.quant_config is quant_config
-    assert mtp_layer.h_proj.quant_config is quant_config
-    assert mtp_layer.e_proj.tp_mode == TensorParallelMode.ROW
-    assert mtp_layer.h_proj.tp_mode == TensorParallelMode.ROW
-    assert mtp_layer.e_proj.in_features == config.hidden_size // 4
-    assert mtp_layer.h_proj.in_features == config.hidden_size // 4
-    assert mtp_layer.e_proj.out_features == config.hidden_size
-    assert mtp_layer.h_proj.out_features == config.hidden_size
-    assert mtp_layer.e_proj.reduce_output is True
-    assert mtp_layer.h_proj.reduce_output is True
-    assert mtp_layer.e_proj.weight.dtype is torch.float8_e4m3fn
-    assert mtp_layer.h_proj.weight.dtype is torch.float8_e4m3fn
-    assert hasattr(mtp_layer.e_proj, "weight_scale")
-    assert hasattr(mtp_layer.h_proj, "weight_scale")
+    owner_dp = _make_attention_stub(num_heads_tp=16)
+    loader.load_attn_sink(owner_dp, sink_src)
+    assert torch.equal(owner_dp.attn_sink.data, sink_src)
 
 
-def test_deepseek_v4_routed_moe_quant_config_ignores_fp8_header(tmp_path):
-    tensor_name = "layers.0.ffn.experts.0.w1.weight"
-    shard_name = "model-00001-of-00001.safetensors"
-    _write_safetensors_header(tmp_path / shard_name, tensor_name, "F8_E4M3", [2, 2])
-    (tmp_path / "model.safetensors.index.json").write_text(
-        json.dumps({"weight_map": {tensor_name: shard_name}})
-    )
-    existing = {"existing": object()}
-
-    layer_quant_config = ModelConfig._set_deepseek_v4_routed_moe_quant_config(
-        DeepseekV4Config(), str(tmp_path), "TRTLLM", existing
-    )
-
-    assert layer_quant_config is existing
-
-
-def test_deepseek_v4_rope_params_follow_layer_compress_ratio():
-    config = DeepseekV4Config(
-        compress_ratios=[0, 4],
-        rope_theta=10000.0,
-        compress_rope_theta=160000.0,
-        rope_scaling={
-            "type": "yarn",
-            "factor": 16.0,
-            "original_max_position_embeddings": 65536,
-            "beta_fast": 32,
-            "beta_slow": 1,
-        },
-    )
-    sparse_attn_config = DeepSeekV4SparseAttentionConfig(
-        compress_ratios=[1, 4, 1],
-        window_size=128,
-    )
-    model_config = ModelConfig(pretrained_config=config, sparse_attention_config=sparse_attn_config)
-
-    dense_rope = _deepseek_v4_pos_embd_params(config, model_config, 0)
-    compressed_rope = _deepseek_v4_pos_embd_params(config, model_config, 1)
-    active_config_rope = _deepseek_v4_pos_embd_params(config, model_config, 2)
-
-    assert dense_rope.type == PositionEmbeddingType.rope_gptj
-    assert dense_rope.rope.scale_type == RotaryScalingType.none
-    assert dense_rope.rope.theta == 10000.0
-    assert dense_rope.rope.scale == 1.0
-    assert compressed_rope.type == PositionEmbeddingType.yarn
-    assert compressed_rope.rope.scale_type == RotaryScalingType.yarn
-    assert compressed_rope.rope.theta == 160000.0
-    assert compressed_rope.rope.scale == 16.0
-    assert compressed_rope.rope.mscale == 0.0
-    assert compressed_rope.rope.mscale_all_dim == 0.0
-    assert active_config_rope.type == PositionEmbeddingType.rope_gptj
-    assert active_config_rope.rope.scale_type == RotaryScalingType.none
-    assert active_config_rope.rope.theta == 10000.0
-
-
-def test_deepseek_v4_sparse_ratios_prefer_checkpoint_defaults(tmp_path, monkeypatch):
-    checkpoint_ratios = [128, 128, 4, 128, 4, 128, 0, 4]
-    config = DeepseekV4Config(
-        architectures=["DeepseekV4ForCausalLM"],
-        num_hidden_layers=len(checkpoint_ratios),
-        compress_ratios=checkpoint_ratios,
-    )
-    monkeypatch.setattr(
-        "tensorrt_llm._torch.model_config.load_pretrained_config", lambda *args, **kwargs: config
-    )
-    sparse_attn_config = DeepSeekV4SparseAttentionConfig(
-        compress_ratios=[1, 1, 4, 128, 4, 128, 4],
-        q_split_threshold=2048,
-        skip_indexer_for_short_seqs=False,
-    )
-
-    model_config = ModelConfig.from_pretrained(
-        str(tmp_path),
-        sparse_attention_config=sparse_attn_config,
-        attn_backend="TRTLLM",
-        moe_backend="TRTLLM",
-    )
-
-    assert model_config.sparse_attention_config.compress_ratios == [128, 128, 4, 128, 4, 128, 1, 4]
-    # V4 sparse MLA hardcodes window_size==128 (FMHA kernel TileSizeKV; see
-    # the runtime assertion in deepseek_v4.py:DeepseekV4TrtllmAttentionMetadata
-    # __post_init__), so this is the only legal value here.
-    assert model_config.sparse_attention_config.window_size == 128
-
-
-def test_deepseek_v4_model_config_defaults_to_fp4_indexer(tmp_path, monkeypatch):
-    checkpoint_ratios = [128, 128, 4, 128, 4, 128, 0, 4]
-    config = DeepseekV4Config(
-        architectures=["DeepseekV4ForCausalLM"],
-        num_hidden_layers=len(checkpoint_ratios),
-        compress_ratios=checkpoint_ratios,
-    )
-    monkeypatch.setattr(
-        "tensorrt_llm._torch.model_config.load_pretrained_config", lambda *args, **kwargs: config
-    )
-    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
-    monkeypatch.setattr("tensorrt_llm._utils.get_sm_version", lambda: 100)
-
-    model_config = ModelConfig.from_pretrained(
-        str(tmp_path),
-        attn_backend="TRTLLM",
-        moe_backend="TRTLLM",
-    )
-
-    assert model_config.sparse_attention_config.indexer_k_dtype == "fp4"
-
-
-def test_deepseek_v4_model_config_defaults_to_fp8_before_blackwell(tmp_path, monkeypatch):
-    checkpoint_ratios = [128, 128, 4, 128, 4, 128, 0, 4]
-    config = DeepseekV4Config(
-        architectures=["DeepseekV4ForCausalLM"],
-        num_hidden_layers=len(checkpoint_ratios),
-        compress_ratios=checkpoint_ratios,
-    )
-    monkeypatch.setattr(
-        "tensorrt_llm._torch.model_config.load_pretrained_config", lambda *args, **kwargs: config
-    )
-    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
-    monkeypatch.setattr("tensorrt_llm._utils.get_sm_version", lambda: 90)
-
-    model_config = ModelConfig.from_pretrained(
-        str(tmp_path),
-        attn_backend="TRTLLM",
-        moe_backend="TRTLLM",
-    )
-
-    assert model_config.sparse_attention_config.indexer_k_dtype == "fp8"
-
-
-def test_deepseek_v4_sparse_ratios_keep_checkpoint_length_without_mtp(tmp_path, monkeypatch):
-    checkpoint_ratios = [128, 128] + [4, 128] * 29 + [0, 4]
-    config = DeepseekV4Config(
-        architectures=["DeepseekV4ForCausalLM"],
-        num_hidden_layers=61,
-        compress_ratios=checkpoint_ratios,
-    )
-    monkeypatch.setattr(
-        "tensorrt_llm._torch.model_config.load_pretrained_config", lambda *args, **kwargs: config
-    )
-    sparse_attn_config = DeepSeekV4SparseAttentionConfig(
-        compress_ratios=[1, 1, 4, 128, 4, 128, 4],
-    )
-
-    model_config = ModelConfig.from_pretrained(
-        str(tmp_path),
-        sparse_attention_config=sparse_attn_config,
-        attn_backend="TRTLLM",
-        moe_backend="TRTLLM",
-    )
-
-    assert len(model_config.sparse_attention_config.compress_ratios) == len(checkpoint_ratios)
-    assert model_config.sparse_attention_config.compress_ratios[:-2] == (checkpoint_ratios[:-2])
-    assert model_config.sparse_attention_config.compress_ratios[-2:] == [1, 4]
-
-
-def test_deepseek_v4_sparse_ratios_keep_explicit_override(tmp_path, monkeypatch):
-    checkpoint_ratios = [128, 128, 4, 128, 4, 128, 0, 4]
-    explicit_ratios = [1, 4, 1, 4, 1, 4, 1, 4]
-    config = DeepseekV4Config(
-        architectures=["DeepseekV4ForCausalLM"],
-        num_hidden_layers=len(checkpoint_ratios),
-        compress_ratios=checkpoint_ratios,
-    )
-    monkeypatch.setattr(
-        "tensorrt_llm._torch.model_config.load_pretrained_config", lambda *args, **kwargs: config
-    )
-    sparse_attn_config = DeepSeekV4SparseAttentionConfig(
-        compress_ratios=explicit_ratios,
-    )
-
-    model_config = ModelConfig.from_pretrained(
-        str(tmp_path),
-        sparse_attention_config=sparse_attn_config,
-        attn_backend="TRTLLM",
-        moe_backend="TRTLLM",
-    )
-
-    assert model_config.sparse_attention_config.compress_ratios == explicit_ratios
-
-
-def test_deepseek_v4_sparse_ratios_resolve_mtp_layers_from_checkpoint(tmp_path, monkeypatch):
-    checkpoint_ratios = [128, 128]
-    config = DeepseekV4Config(
-        architectures=["DeepseekV4ForCausalLM"],
-        num_hidden_layers=len(checkpoint_ratios),
-        num_nextn_predict_layers=1,
-        compress_ratios=checkpoint_ratios,
-    )
-    monkeypatch.setattr(
-        "tensorrt_llm._torch.model_config.load_pretrained_config", lambda *args, **kwargs: config
-    )
-
-    spec_config = MTPDecodingConfig(max_draft_len=1)
-    model_config = ModelConfig.from_pretrained(
-        str(tmp_path),
-        attn_backend="TRTLLM",
-        moe_backend="TRTLLM",
-        spec_config=spec_config,
-    )
-
-    assert spec_config.num_nextn_predict_layers == 1
-    assert model_config.sparse_attention_config.compress_ratios == [128, 128, 1]
-
-
-def test_deepseek_v4_sanity():
-    config_dict = deepcopy(DEEPSEEK_V4_TINY_CONFIG)
-    config = DeepseekV4Config(**config_dict)
-    config.dtype = torch.bfloat16
-    config.mapping = Mapping(world_size=1, tp_size=1, rank=0)
-    config.tie_word_embeddings = False
-
-    vocab_size = config.vocab_size
-    max_batch_size = 4
-
-    sparse_attn_config = DeepSeekV4SparseAttentionConfig(
-        index_n_heads=64,
-        index_head_dim=128,
-        window_size=128,
-        compress_ratios=[1, 1, 4, 128, 4, 128, 4],
-        index_topk=512,
-    )
-    config.sparse_attention_config = sparse_attn_config
-
-    device = torch.device("cuda")
-    # with default_dtype(config.dtype):
-    model_config = ModelConfig(
-        pretrained_config=config, sparse_attention_config=sparse_attn_config, attn_backend="TRTLLM"
-    )
-    model = DeepseekV4ForCausalLM(model_config).to(device)
-    assert not model.model.layers[0].fusion_config.POST_MOE_FUSION
-
-    context_sequence_length = [3, 2, 5]
-    num_contexts = len(context_sequence_length)
-    sequence_length = context_sequence_length + [1, 1]
-
-    # Total tokens = sum(sequence_length) = 3+2+5+1+1 = 12
-    input_ids = torch.randint(
-        0, vocab_size, (sum(sequence_length),), dtype=torch.int32, device=device
-    )
-    past_seen_tokens = [0, 0, 0, 62, 75]
-    request_ids = list(range(len(sequence_length)))
-    token_nums = (torch.tensor(past_seen_tokens) + torch.tensor(sequence_length)).tolist()
-    prompt_lens = token_nums[:num_contexts] + past_seen_tokens[num_contexts:]
-    tokens_per_block = 128  # DeepSeek-V4 requirement
-    max_new_tokens = 1024
-    required_blocks = sum(
-        (token_num + max_new_tokens + tokens_per_block - 1) // tokens_per_block
-        for token_num in token_nums
-    )
-    num_blocks = max(10, required_blocks)
-    head_dim = config.v_head_dim
-    num_layers = config.num_hidden_layers
-    max_seq_len = num_blocks * tokens_per_block
-    batch_size = len(sequence_length)
-
-    if config.dtype == torch.half:
-        kv_cache_dtype = tensorrt_llm.bindings.DataType.HALF
-    elif config.dtype == torch.bfloat16:
-        kv_cache_dtype = tensorrt_llm.bindings.DataType.BF16
-    else:
-        raise ValueError("Invalid dtype")
-    mapping = config.mapping
-    kv_cache_config = KvCacheConfig(max_tokens=num_blocks * tokens_per_block)
-    kv_cache_config.max_util_for_resume = 0.1
-
-    kv_cache_manager = DeepseekV4CacheManager(
-        kv_cache_config=KvCacheConfig(
-            enable_block_reuse=False,
-            max_tokens=num_blocks * tokens_per_block,
-            event_buffer_max_size=0,
-        ),
-        kv_cache_type=tensorrt_llm.bindings.internal.batch_manager.CacheType.SELFKONLY,
-        num_layers=num_layers,
-        num_kv_heads=1,
-        head_dim=head_dim,
-        tokens_per_block=tokens_per_block,
-        max_seq_len=max_seq_len,
-        max_batch_size=batch_size,
-        mapping=mapping,
-        dtype=kv_cache_dtype,
-        compressor_dtype=tensorrt_llm.bindings.DataType.FLOAT,
-        vocab_size=vocab_size,
-        max_num_tokens=max_seq_len * max_batch_size,
-        sparse_attn_config=sparse_attn_config,
-        model_config=model_config,
-    )
-    # Register request IDs in KV cache via prepare_context / resize_context
-    reqs = []
-    for i, req_id in enumerate(request_ids):
-        req = LlmRequest(
-            request_id=req_id,
-            max_new_tokens=max_new_tokens,
-            input_tokens=list(range(token_nums[i])),
-            sampling_config=SamplingConfig(),
-            is_streaming=False,
-        )
-        success = kv_cache_manager.prepare_context(req)
-        assert success, f"Failed to prepare context for request {req_id}"
-        if i < num_contexts:
-            success = kv_cache_manager.resize_context(req, req.context_chunk_size)
-        else:
-            # Warm-cache setup for a generation request: simulate
-            # past_seen_tokens[i] worth of history without running forward.
-            # Reach into kv_cache.resize directly because resize_context no
-            # longer exposes a history_length override (production callers
-            # use prepare_disagg_gen_init or update_resources to advance it).
-            kv_cache = kv_cache_manager.kv_cache_map[req.py_request_id]
-            kv_cache.enable_swa_scratch_reuse = False
-            target = (
-                req.context_current_position + token_nums[i] + kv_cache_manager.num_extra_kv_tokens
-            )
-            capacity = max(kv_cache.capacity, target)
-            success = kv_cache.resize(capacity, past_seen_tokens[i])
-        assert success, f"Failed to resize context for request {req_id}"
-        reqs.append(req)
-
-    attn_metadata = DeepseekV4TrtllmAttentionMetadata(
-        seq_lens=torch.tensor(sequence_length, dtype=torch.int32),
-        num_contexts=num_contexts,
-        max_num_requests=len(sequence_length),
-        kv_cache_params=KVCacheParams(
-            use_cache=True,
-            num_cached_tokens_per_seq=past_seen_tokens,
-        ),
-        kv_cache_manager=kv_cache_manager,
-        request_ids=request_ids,
-        prompt_lens=prompt_lens,
-        max_num_tokens=8192,
-        mapping=mapping,
-        sparse_attention_config=sparse_attn_config,
-    )
-
-    position_ids = []
-    seq_lens = []
-    for i, tokens in enumerate(past_seen_tokens):
-        seq_len = context_sequence_length[i] if i < len(context_sequence_length) else 1
-        position_id = torch.arange(tokens, tokens + seq_len, device=input_ids.device)
-        position_ids.append(position_id)
-        seq_lens.append(seq_len)
-
-    position_ids = torch.cat(position_ids).unsqueeze(0).to(torch.int32)
-
-    extra_attrs = model_config.extra_attrs
-    extra_attrs["attention_metadata"] = weakref.ref(attn_metadata)
-    with torch.inference_mode(), model_extra_attrs(extra_attrs):
-        scheduled_batch = ScheduledRequests()
-        scheduled_batch.context_requests_last_chunk = reqs[:num_contexts]
-        scheduled_batch.generation_requests = reqs[num_contexts:]
-        kv_cache_manager.prepare_resources(scheduled_batch)
-        attn_metadata.prepare()
-
-        logits = model.forward(
-            input_ids=input_ids, position_ids=position_ids, attn_metadata=attn_metadata
-        )
-
-        for req in reqs[:num_contexts]:
-            req.context_current_position = seq_lens[req.py_request_id]
-        for req in reqs:
-            req.add_new_token(seq_lens[req.py_request_id], 0)
-        kv_cache_manager.update_context_resources(scheduled_batch)
-        kv_cache_manager.update_resources(scheduled_batch)
-    assert len(past_seen_tokens) == logits.shape[0]
-
-    extra_attrs["attention_metadata"] = weakref.ref(attn_metadata)
-    with torch.inference_mode(), model_extra_attrs(extra_attrs):
-        seq_lens = [seq_len + 1 for seq_len in seq_lens]
-        scheduled_batch = ScheduledRequests()
-        scheduled_batch.generation_requests = reqs
-        for req in reqs:
-            assert kv_cache_manager.try_allocate_generation(req)
-        kv_cache_manager.prepare_resources(scheduled_batch)
-        attn_metadata.prepare()
-        logits = model.forward(
-            input_ids=input_ids,
-            position_ids=position_ids,
-            attn_metadata=attn_metadata,
-            return_context_logits=True,
-        )
-        for req in reqs:
-            req.add_new_token(seq_lens[req.py_request_id], 0)
-        kv_cache_manager.update_resources(scheduled_batch)
-    assert input_ids.shape == logits.shape[:-1]
-
-    for req in reqs:
-        kv_cache_manager.free_resources(req)
-    kv_cache_manager.shutdown()
+def _make_causal_lm_stub():
+    """Bare DeepseekV4ForCausalLM without a GPU-backed model tree (the real
+    __init__ needs one). ``config`` is a read-only property forwarding to
+    ``model_config.pretrained_config``.
+    """
+    stub = object.__new__(DeepseekV4ForCausalLM)
+    torch.nn.Module.__init__(stub)
+    stub.model_config = SimpleNamespace(pretrained_config=SimpleNamespace(num_hidden_layers=0))
+    stub.model = SimpleNamespace(layers=[])
+    return stub

@@ -197,6 +197,9 @@ def initialize_dummy_weights(
     # and KV cache scaling for any `load_format="dummy"` + IPC update_weights
     # flow when the checkpoint doesn't ship calibrated values (e.g., HF
     # FineGrainedFP8, which uses dynamic activation quantization by design).
+    # ``.attn_sink`` too: its constructor ``-inf`` is the exact no-sink math
+    # and must survive dummy init; no post-load hook may refill it (direct-
+    # write transports deliver sink values without passing through a loader).
     _SKIP_NAME_SUFFIXES = (
         ".input_scale",
         ".inv_input_scale",
@@ -204,6 +207,7 @@ def initialize_dummy_weights(
         ".inv_kv_scales",
         ".alpha",
         ".scalar_alpha",
+        ".attn_sink",
     )
 
     for _name, param in model.state_dict().items():
@@ -502,14 +506,14 @@ class ModelLoader:
 
                 _apply_to_buffers_only(model, allocate_buffer_on_cuda)
 
-                need_initialized_weights = load_format not in (LoadFormat.AUTO,
-                                                               LoadFormat.DUMMY)
-
                 def allocate_weights_on_cuda(t: torch.Tensor):
                     if t not in memo:
                         cuda_t = torch.empty_like(t, device='cuda')
-                        if t.device != torch.device('meta') and (
-                                need_initialized_weights or is_meta_init):
+                        # Copy EVERY non-meta source: the pool slot is
+                        # ``empty_like`` garbage, and skipping AUTO/DUMMY
+                        # would destroy constructor values (calibration
+                        # scalars, attn_sink ``-inf``) that nothing re-fills.
+                        if t.device != torch.device('meta'):
                             if t.is_cuda:
                                 memory_type_map = {
                                     ExecutorMemoryType.MODEL_WEIGHTS_MAIN:
