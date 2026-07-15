@@ -23,6 +23,10 @@ from typing import Optional, cast
 
 import torch
 
+from tensorrt_llm._torch.pyexecutor.sampler.ops.penalties import (
+    BeamPenaltyMetadata,
+    apply_beam_occurrence_penalties_triton,
+)
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.bindings.executor import FinishReason
 
@@ -48,6 +52,7 @@ class BeamSearchMetadata(StrategyMetadata):
     predecessor_beams: torch.Tensor
     seq_offsets: torch.Tensor
     beam_idx_arange: torch.Tensor
+    penalty: BeamPenaltyMetadata | None = None
 
 
 def top_k_sampling_batch(
@@ -210,7 +215,16 @@ def beam_search_sampling_batch(
     )
     assert batch_size == beam_search_args.seq_slots.size(0)
 
+    # Beam penalties consume log-probabilities normalized from temperature-scaled logits.
     logprobs = torch.log_softmax(logits, dim=-1)
+    if beam_search_args.penalty is not None:
+        apply_beam_occurrence_penalties_triton(
+            logprobs,
+            beam_search_args.penalty,
+            beam_search_args.seq_slots,
+            beam_search_args.seq_lens,
+            beam_width_in,
+        )
 
     finished_beams_mask = (
         beam_search_args.finished_beams[beam_search_args.seq_slots, :beam_width_in]
