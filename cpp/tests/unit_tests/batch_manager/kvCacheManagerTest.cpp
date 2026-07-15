@@ -8288,16 +8288,17 @@ TEST_F(KVCacheManagerTest, StaticLinearHybridAllocationTest)
 // ownership tracking.
 ///////////////////////////////////////////////////////////////////////////////
 
-// Helper: create a KVCacheManager for batch tests.
-// tokensPerBlock=4, 16 primary blocks, block reuse enabled, partial reuse enabled.
-static auto makeBatchTestKVCacheManager(std::shared_ptr<tensorrt_llm::runtime::CudaStream> const& stream)
+// Helper: create a KVCacheManager for batch tests. The default pool geometry is
+// tokensPerBlock=4, 16 primary blocks, no secondary blocks. Tests that certify
+// local offload can opt into secondary blocks without duplicating the manager
+// construction used by the ownership tests below.
+static auto makeBatchTestKVCacheManager(std::shared_ptr<tensorrt_llm::runtime::CudaStream> const& stream,
+    SizeType32 blocksInPrimaryPool = 16, SizeType32 blocksInSecondaryPool = 0)
 {
     auto constexpr numLayers = 1;
     auto constexpr numKvHeads = 1;
     auto constexpr sizePerHead = 16;
     auto constexpr tokensPerBlock = 4;
-    auto constexpr blocksInPrimaryPool = 16;
-    auto constexpr blocksInSecondaryPool = 0;
     auto constexpr maxNumSequences = 16;
     auto constexpr beamWidth = 1;
     auto constexpr maxAttentionWindow = tokensPerBlock * 8;
@@ -8357,6 +8358,99 @@ TEST_F(KVCacheManagerTest, AddSequenceBatchLeavesOneFinalContextTokenAfterReuse)
 
     tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*req);
     EXPECT_NO_THROW(static_cast<void>(mgr->removeSequence(requestId, req)));
+}
+
+TEST_F(KVCacheManagerTest, AddSequenceBatchOnboardsOffloadedPrefixForFinalContextToken)
+{
+    auto const stream = std::make_shared<tr::CudaStream>();
+    auto mgr = makeBatchTestKVCacheManager(stream, /*blocksInPrimaryPool=*/16, /*blocksInSecondaryPool=*/4);
+    auto constexpr beamWidth = 1;
+    auto constexpr promptLen = 9;
+    auto constexpr reusableLen = promptLen - 1;
+    auto const inputTokens = std::make_shared<VecTokens>(VecTokens{0, 1, 2, 3, 4, 5, 6, 7, 8});
+    tr::SamplingConfig const samplingConfig{beamWidth};
+
+    // Seed two reusable full blocks and remember them before the sequence is
+    // released. Moving both blocks to secondary memory forces the next batch
+    // through the real local-onboard path instead of GPU-only radix reuse.
+    auto seedReq = std::make_shared<LlmRequest>(
+        LlmRequest::RequestIdType{0}, SizeType32{0}, inputTokens, samplingConfig, /*isStreaming=*/false);
+    mgr->addSequenceBatch({{{0, promptLen, beamWidth}}}, {std::ref(*seedReq)});
+    auto const windowSize = theOnlyWindowSize(*mgr);
+    auto const seedBlockIds = mgr->getSequence(0).getCacheBlockIds(windowSize).at(0);
+    ASSERT_EQ(seedBlockIds.size(), 3);
+    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*seedReq);
+    (void) mgr->removeSequence(0, seedReq);
+
+    // KVCacheManager intentionally exposes BlockManager as read-only. This
+    // test needs to force a specific reusable block into the secondary tier,
+    // so keep the mutation local to the fixture instead of widening the
+    // production interface solely for test setup.
+    auto& blockManager = const_cast<BlockManager&>(mgr->getBlockManager());
+    for (auto const blockId : {seedBlockIds[0], seedBlockIds[1]})
+    {
+        auto block = blockManager.getBlockById(blockId, windowSize);
+        ASSERT_TRUE(block->isPrimary());
+        blockManager.offloadBlock(block, windowSize);
+        EXPECT_FALSE(block->isPrimary());
+    }
+    stream->synchronize();
+
+    // Two requests claiming the same host-resident prefix in one IFB batch
+    // must both stop at the final prompt token. They may share the immutable
+    // prefix, but each needs private writable capacity for that final token.
+    auto req1 = std::make_shared<LlmRequest>(
+        LlmRequest::RequestIdType{1}, SizeType32{1}, inputTokens, samplingConfig, /*isStreaming=*/false);
+    auto req2 = std::make_shared<LlmRequest>(
+        LlmRequest::RequestIdType{2}, SizeType32{1}, inputTokens, samplingConfig, /*isStreaming=*/false);
+    auto const req1State = req1->getState();
+    auto const req2State = req2->getState();
+    auto const req1Type = req1->getLlmRequestType();
+    auto const req2Type = req2->getLlmRequestType();
+
+    mgr->addSequenceBatch({{{1, promptLen, beamWidth}, {2, promptLen, beamWidth}}}, {std::ref(*req1), std::ref(*req2)});
+    // refreshBlocks joins all onboard/copy work to the execution stream. A
+    // model forward or CUDA graph replay enqueued after this point can consume
+    // the restored prefix without a host-side synchronization.
+    mgr->refreshBlocks();
+    stream->synchronize();
+
+    for (auto const& req : {req1, req2})
+    {
+        EXPECT_EQ(req->getPrepopulatedPromptLen(), reusableLen);
+        EXPECT_EQ(req->getContextCurrentPosition(), reusableLen);
+        EXPECT_EQ(req->getContextRemainingLength(), 1);
+        EXPECT_EQ(req->getContextChunkSize(), 1);
+        EXPECT_TRUE(req->isLastContextChunk());
+    }
+    EXPECT_EQ(req1->getState(), req1State);
+    EXPECT_EQ(req2->getState(), req2State);
+    EXPECT_EQ(req1->getLlmRequestType(), req1Type);
+    EXPECT_EQ(req2->getLlmRequestType(), req2Type);
+
+    auto const req1BlockIds = mgr->getSequence(1).getCacheBlockIds(windowSize).at(0);
+    auto const req2BlockIds = mgr->getSequence(2).getCacheBlockIds(windowSize).at(0);
+    ASSERT_EQ(req1BlockIds.size(), 3);
+    ASSERT_EQ(req2BlockIds.size(), 3);
+    EXPECT_EQ(req1BlockIds[0], req2BlockIds[0]);
+    EXPECT_EQ(req1BlockIds[1], req2BlockIds[1]);
+    EXPECT_NE(req1BlockIds[2], req2BlockIds[2]);
+
+    // Exercise the failure path for one claimant, then complete the other.
+    // A subsequent request must still reuse the prefix, proving cancellation
+    // did not leave stale ownership or invalidate the source blocks.
+    EXPECT_NO_THROW(static_cast<void>(mgr->removeSequence(1, std::nullopt)));
+    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*req2);
+    EXPECT_NO_THROW(static_cast<void>(mgr->removeSequence(2, req2)));
+
+    auto req3 = std::make_shared<LlmRequest>(
+        LlmRequest::RequestIdType{3}, SizeType32{1}, inputTokens, samplingConfig, /*isStreaming=*/false);
+    mgr->addSequenceBatch({{{3, promptLen, beamWidth}}}, {std::ref(*req3)});
+    EXPECT_EQ(req3->getContextCurrentPosition(), reusableLen);
+    EXPECT_EQ(req3->getContextRemainingLength(), 1);
+    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*req3);
+    EXPECT_NO_THROW(static_cast<void>(mgr->removeSequence(3, req3)));
+    EXPECT_TRUE(blockManager.verifyQueueIntegrity(windowSize));
 }
 
 TEST_F(KVCacheManagerTest, AddSequenceBatchLeavesOneFinalMultimodalContextTokenAfterReuse)

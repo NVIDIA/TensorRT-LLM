@@ -1361,7 +1361,7 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         self.assertEqual(model_engine.previous_request_ids, [])
         kv_cache_manager.shutdown()
 
-    def test_kv_cache_manager_with_execution_stream(self):
+    def test_kv_cache_manager_with_execution_stream(self) -> None:
         """Test that KVCacheManager uses the provided execution_stream.
         """
         # Create a dedicated execution stream
@@ -1393,6 +1393,39 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
             "KVCacheManager should still use the provided execution_stream after forward"
         )
 
+        kv_cache_manager.shutdown()
+
+    def test_cuda_graph_replay_observes_execution_stream_dependency(
+            self) -> None:
+        """A graph replay on the KV manager stream waits for restored KV data."""
+        execution_stream = torch.cuda.Stream()
+        transfer_stream = torch.cuda.Stream()
+        _, kv_cache_manager = create_model_engine_and_kvcache(
+            execution_stream=execution_stream)
+
+        source = torch.zeros(1, dtype=torch.int32, device="cuda")
+        observed = torch.zeros_like(source)
+        graph = torch.cuda.CUDAGraph()
+        torch.cuda.synchronize()
+        with torch.cuda.graph(graph, stream=execution_stream):
+            observed.copy_(source)
+
+        ready = torch.cuda.Event()
+        with torch.cuda.stream(transfer_stream):
+            # Model the async host-to-device restore completed by the local
+            # offload manager. Recording the event after the write is the same
+            # dependency shape that refreshBlocks/resume installs.
+            source.fill_(7)
+            ready.record()
+
+        manager_stream = torch.cuda.ExternalStream(
+            kv_cache_manager._stream.cuda_stream)
+        with torch.cuda.stream(manager_stream):
+            manager_stream.wait_event(ready)
+            graph.replay()
+        torch.cuda.synchronize()
+
+        self.assertEqual(observed.item(), 7)
         kv_cache_manager.shutdown()
 
 

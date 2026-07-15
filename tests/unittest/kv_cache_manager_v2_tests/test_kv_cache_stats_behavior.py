@@ -14,6 +14,7 @@
 # limitations under the License.
 
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -275,6 +276,44 @@ def _assert_request_stats(
     assert request.alloc_new_blocks == alloc_new
     assert request.reused_blocks == reused
     assert request.missed_blocks == missed
+
+
+@pytest.mark.parametrize(
+    ("is_active", "resume_succeeds", "expected_result", "expected_calls"),
+    [
+        (True, False, True, []),
+        (False, False, False, ["resume"]),
+        (False, True, True, ["resume", "restore"]),
+    ],
+)
+def test_v2_resume_restores_offsets_only_after_execution_stream_ready(
+    is_active: bool,
+    resume_succeeds: bool,
+    expected_result: bool,
+    expected_calls: list[str],
+) -> None:
+    """V2 restores page tables only after resume joins the execution stream."""
+    manager = object.__new__(KVCacheManagerV2)
+    execution_stream = object()
+    manager._stream = SimpleNamespace(cuda_stream=execution_stream)
+    calls: list[str] = []
+
+    def resume(actual_stream: object) -> bool:
+        assert actual_stream is execution_stream
+        calls.append("resume")
+        return resume_succeeds
+
+    kv_cache = SimpleNamespace(is_active=is_active, resume=resume)
+
+    def restore(request_id: int, actual_cache: object) -> None:
+        assert request_id == 17
+        assert actual_cache is kv_cache
+        calls.append("restore")
+
+    manager._restore_page_index_bufs = restore
+
+    assert manager._resume_and_restore(17, kv_cache) is expected_result
+    assert calls == expected_calls
 
 
 def _run_v1_context(manager: KVCacheManagerV1, request: LlmRequest):
