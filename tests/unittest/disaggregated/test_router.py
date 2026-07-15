@@ -5,6 +5,7 @@ import threading
 from unittest import mock
 
 import aiohttp
+import msgpack
 import pytest
 
 from tensorrt_llm.llmapi.disagg_utils import RouterConfig
@@ -24,6 +25,7 @@ from tensorrt_llm.serve.router import (KV_CACHE_HASH_ALGO_V1,
                                        KV_CACHE_HASH_ALGO_V2,
                                        KV_CACHE_HASH_ALGO_V2_SHA256_64,
                                        BlockHashMixin, ConversationRouter,
+                                       CoordinatorDelegatingRouter,
                                        KvCacheAwareRouter,
                                        KvCacheAwareServerState,
                                        LoadBalancingRouter, RoundRobinRouter,
@@ -72,6 +74,38 @@ def _make_mock_aiohttp_session(return_value=None):
     mock_session.get = mock.MagicMock(return_value=mock_ctx)
     mock_session.close = mock.AsyncMock()
     return mock_session
+
+
+@pytest.mark.asyncio
+async def test_coordinator_finish_retries_failed_release():
+    local_router = RoundRobinRouter(server_role=None, servers=["server1"])
+    router = CoordinatorDelegatingRouter("http://coordinator", local_router,
+                                         "generation")
+
+    def _response(status, body):
+        response = mock.AsyncMock()
+        response.status = status
+        response.read = mock.AsyncMock(
+            return_value=msgpack.packb(body, use_bin_type=True))
+        context = mock.AsyncMock()
+        context.__aenter__ = mock.AsyncMock(return_value=response)
+        context.__aexit__ = mock.AsyncMock(return_value=False)
+        return context
+
+    session = mock.MagicMock()
+    session.post = mock.MagicMock(side_effect=[
+        _response(503, {"error": "temporarily unavailable"}),
+        _response(200, {}),
+    ])
+    session.close = mock.AsyncMock()
+    router._session = session
+
+    with mock.patch("tensorrt_llm.serve.router.asyncio.sleep",
+                    new_callable=mock.AsyncMock) as sleep:
+        await router._finish_async(123, True)
+
+    assert session.post.call_count == 2
+    sleep.assert_awaited_once()
 
 
 @pytest.fixture(autouse=True)

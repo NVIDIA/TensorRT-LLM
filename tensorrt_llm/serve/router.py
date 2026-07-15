@@ -36,6 +36,8 @@ from tensorrt_llm.serve.router_utils import (  # noqa: F401
     hash_v1_block_key, truncate_sha256_hash_to_int64, v2_sha256_block_hasher)
 
 _MSGPACK_HEADERS = {"Content-Type": "application/msgpack"}
+COORDINATOR_FINISH_MAX_ATTEMPTS = 3
+COORDINATOR_FINISH_RETRY_DELAY_S = 0.1
 
 # Max number of conversations whose home-server pin is retained (LRU).
 ROUTE_AFFINITY_CACHE_SIZE = 50000
@@ -1683,26 +1685,43 @@ class CoordinatorDelegatingRouter(Router):
 
     async def _finish_async(self, req_id: int, success: bool):
         _t0 = time.monotonic()
-        try:
-            async with self.session.post(
-                    f"{self._coordinator_url}/finish",
-                    data=msgpack.packb(
-                        {
-                            "role": self._role,
-                            "req_id": req_id,
-                            "success": success
-                        },
-                        use_bin_type=True),
-                    headers=_MSGPACK_HEADERS,
-                    timeout=self._request_timeout_s) as resp:
-                if resp.status != 200:
-                    body = msgpack.unpackb(await resp.read(), raw=False)
+        for attempt in range(1, COORDINATOR_FINISH_MAX_ATTEMPTS + 1):
+            try:
+                async with self.session.post(
+                        f"{self._coordinator_url}/finish",
+                        data=msgpack.packb(
+                            {
+                                "role": self._role,
+                                "req_id": req_id,
+                                "success": success
+                            },
+                            use_bin_type=True),
+                        headers=_MSGPACK_HEADERS,
+                        timeout=self._request_timeout_s) as resp:
+                    if resp.status != 200:
+                        raw_body = await resp.read()
+                        try:
+                            body = msgpack.unpackb(raw_body, raw=False)
+                        except Exception:  # noqa: BLE001
+                            body = raw_body.decode(errors="replace")
+                        error = body.get("error", body) if isinstance(
+                            body, dict) else body
+                        raise RuntimeError(
+                            f"coordinator /finish returned {resp.status}: {error}"
+                        )
+                self._finish_lat.record(time.monotonic() - _t0)
+                return
+            except Exception as e:  # noqa: BLE001
+                if attempt == COORDINATOR_FINISH_MAX_ATTEMPTS:
                     logger.warning(
-                        f"coordinator /finish returned {resp.status}: "
-                        f"{body.get('error', body)}")
-            self._finish_lat.record(time.monotonic() - _t0)
-        except Exception as e:  # noqa: BLE001
-            logger.warning(f"CoordinatorDelegatingRouter finish failed: {e}")
+                        f"CoordinatorDelegatingRouter finish failed after "
+                        f"{attempt} attempts: {e}")
+                    return
+                logger.warning(
+                    f"CoordinatorDelegatingRouter finish attempt {attempt} "
+                    f"failed: {e}; retrying")
+                await asyncio.sleep(COORDINATOR_FINISH_RETRY_DELAY_S *
+                                    (2**(attempt - 1)))
 
     async def close(self):
         if self._background_tasks:

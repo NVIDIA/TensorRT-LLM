@@ -125,6 +125,10 @@ class OpenAIDisaggregatedService(OpenAIService):
         disagg_request_id = await self._coordinator.get_disagg_request_id()
         # reserve a gen_server if conditional disagg is needed
         gen_server, need_ctx = await self._check_conditional_disagg(request, disagg_request_id)
+        # Context retries may replace disagg_request_id for the KV-transfer
+        # handshake. Keep the ID used to reserve the generation server separate
+        # so its coordinator-side load is released under the original key.
+        gen_reservation_id = disagg_request_id if gen_server else None
         need_ctx = need_ctx and not await self._check_gen_only_disagg(request)
         ctx_response = None
         gen_req = request
@@ -150,7 +154,7 @@ class OpenAIDisaggregatedService(OpenAIService):
             except Exception:
                 if gen_server:
                     await self._gen_router.finish_request(
-                        request, success=False, req_id=disagg_request_id
+                        request, success=False, req_id=gen_reservation_id
                     )
                 raise
         else:
@@ -168,13 +172,14 @@ class OpenAIDisaggregatedService(OpenAIService):
                 gen_server, _ = await self._gen_router.get_next_server(
                     gen_req, exclude_server=ctx_server, req_id=disagg_request_id
                 )
+                gen_reservation_id = disagg_request_id
             gen_response = await self._gen_client.send_request(
-                gen_req, server=gen_server, hooks=hooks, req_id=disagg_request_id
+                gen_req, server=gen_server, hooks=hooks, req_id=gen_reservation_id
             )
             return gen_response
         else:
             if gen_server:
-                await self._gen_router.finish_request(request, req_id=disagg_request_id)
+                await self._gen_router.finish_request(request, req_id=gen_reservation_id)
             if request.stream:
                 # ctx client will never return a generator when streaming is requested
                 # make up for this by returning a done generator

@@ -408,6 +408,37 @@ async def test_send_disagg_request_leaves_streaming_usage_to_gen_server(schedule
     )
 
 
+@pytest.mark.asyncio
+async def test_context_retry_preserves_generation_reservation_id():
+    service = _make_service("context_first")
+    service._ctx_client = AsyncMock()
+    service._gen_client = AsyncMock()
+    service._coordinator.get_disagg_request_id = AsyncMock(return_value=101)
+    service._check_conditional_disagg = AsyncMock(return_value=("gen:9001", True))
+    service._check_gen_only_disagg = AsyncMock(return_value=False)
+    service._ctx_router.get_next_server = AsyncMock(return_value=("ctx:9000", {"server_info": {}}))
+
+    async def _ctx_response(request, *_args, **_kwargs):
+        # OpenAIHttpClient regenerates this field before a successful retry.
+        request.disaggregated_params.disagg_request_id = 202
+        return _make_completion_response("", finish_reason="length", disagg_request_id=202)
+
+    service._ctx_client.send_request = AsyncMock(side_effect=_ctx_response)
+    service._gen_client.send_request = AsyncMock(
+        return_value=_make_completion_response(
+            "done", finish_reason="stop", disagg_request_id=202, context_only=False
+        )
+    )
+
+    request = CompletionRequest(model="test-model", prompt="hello")
+    await service._send_disagg_request(request)
+
+    service._gen_router.get_next_server.assert_not_awaited()
+    gen_call = service._gen_client.send_request.call_args
+    assert gen_call.kwargs["req_id"] == 101
+    assert gen_call.args[0].disaggregated_params.ctx_request_id == 202
+
+
 def test_generation_postprocessor_rewrites_usage_from_disaggregated_params():
     ctx_usage = UsageInfo(
         prompt_tokens=128,

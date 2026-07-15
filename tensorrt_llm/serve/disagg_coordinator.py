@@ -538,6 +538,26 @@ class CoordinatorClient(DisaggCoordinator):
             logger.warning(f"CoordinatorClient cluster_info failed: {e}")
         return {"is_ready": False}
 
+    async def proxy_cluster_storage_request(
+        self,
+        method: str,
+        path: str,
+        query: list[tuple[str, str]],
+        body: bytes,
+        content_type: Optional[str],
+    ) -> Tuple[bytes, int, Optional[str]]:
+        """Forward a public HTTP-storage request to the coordinator."""
+        headers = {"Content-Type": content_type} if content_type else None
+        async with self.session.request(
+            method,
+            f"{self._remote_url}{path}",
+            params=query,
+            data=body,
+            headers=headers,
+            timeout=self._request_timeout_s,
+        ) as resp:
+            return await resp.read(), resp.status, resp.headers.get("Content-Type")
+
     async def stop(self) -> None:
         if self._session is not None:
             await self._session.close()

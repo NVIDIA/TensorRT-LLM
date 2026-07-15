@@ -231,6 +231,32 @@ class OpenAIDisaggServer:
         cluster_storage = getattr(self._coordinator, "cluster_storage", None)
         if isinstance(cluster_storage, HttpClusterStorageServer):
             cluster_storage.add_routes(self.app)
+        elif (isinstance(self._coordinator, CoordinatorClient)
+              and isinstance(self._disagg_cluster_storage,
+                             HttpClusterStorageServer)):
+            # Keep the configured public cluster_uri valid in fleet mode while
+            # the coordinator remains the sole owner of the HTTP storage state.
+            for path, method in (("/set", "POST"), ("/get", "GET"),
+                                 ("/delete", "DELETE"), ("/expire", "GET"),
+                                 ("/get_prefix", "GET")):
+                self.app.add_api_route(path,
+                                       self._proxy_cluster_storage_request,
+                                       methods=[method])
+
+    async def _proxy_cluster_storage_request(self,
+                                             raw_req: Request) -> Response:
+        try:
+            body, status, content_type = (
+                await self._coordinator.proxy_cluster_storage_request(
+                    raw_req.method, raw_req.url.path,
+                    list(raw_req.query_params.multi_items()),
+                    await raw_req.body(), raw_req.headers.get("Content-Type")))
+        except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
+            logger.warning(f"Failed to proxy cluster storage request: {e}")
+            return JSONResponse(status_code=502,
+                                content={"error": "coordinator unavailable"})
+        headers = {"Content-Type": content_type} if content_type else None
+        return Response(content=body, status_code=status, headers=headers)
 
     @staticmethod
     def _extract_conversation_id(req: UCompletionRequest, raw_req: Request):
