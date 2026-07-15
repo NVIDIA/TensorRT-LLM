@@ -1260,6 +1260,7 @@ class ModelLoader:
             lora_config=self.lora_config,
             allreduce_strategy=self.llm_args.allreduce_strategy,
             mm_encoder_only=self.llm_args.mm_encoder_only,
+            disable_mm_encoder=self.llm_args.disable_mm_encoder,
             attn_backend=self.llm_args.attn_backend,
             moe_backend=self.llm_args.moe_config.backend,
             moe_disable_finalize_fusion=self.llm_args.moe_config.
