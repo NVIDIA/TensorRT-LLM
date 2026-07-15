@@ -31,6 +31,7 @@ from tensorrt_llm._torch.attention_backend.fmha import (
 from tensorrt_llm._utils import get_sm_version, maybe_pin_memory, prefer_pinned
 from tensorrt_llm.bindings.internal import thop
 from tensorrt_llm.functional import AttentionMaskType
+from tensorrt_llm.math_utils import ceil_div
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from ..utils import (compute_swizzled_sf_shape, get_global_attrs,
@@ -607,8 +608,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                             self.runtime_features.has_speculative_draft_tokens))
             max_blocks = None
             if not spec_active and self.kv_cache_manager.tokens_per_block:
-                max_blocks = -(-max_kv_len //
-                               self.kv_cache_manager.tokens_per_block)
+                max_blocks = ceil_div(max_kv_len,
+                                      self.kv_cache_manager.tokens_per_block)
             self.kv_cache_manager.copy_batch_block_offsets(
                 self.kv_cache_block_offsets,
                 self.request_ids,
