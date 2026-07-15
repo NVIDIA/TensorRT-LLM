@@ -32,6 +32,7 @@ from tensorrt_llm.logger import logger
 from .transformer_qwen_image import QwenImageTransformer2DModel
 
 # TeaCache polynomial coefficients for Qwen-Image.
+# Reference: https://github.com/vllm-project/vllm-omni/blob/main/vllm_omni/diffusion/cache/teacache/config.py#L30
 QWEN_IMAGE_TEACACHE_COEFFICIENTS = {
     "qwen": [
         -4.50000000e02,
@@ -689,8 +690,8 @@ class QwenImagePipeline(BasePipeline):
                 latents = latents.to(latents_dtype)
 
         if getattr(self, "rank", 0) == 0:
-            if cache_acc is not None and cache_acc.is_enabled():
-                stats = cache_acc.get_stats()
+            if cache_on:
+                stats = self.cache_accelerator.get_stats()
                 if stats and "hit_rate" in stats:
                     logger.info(
                         f"TeaCache: {stats['hit_rate']:.1%} hit rate "
