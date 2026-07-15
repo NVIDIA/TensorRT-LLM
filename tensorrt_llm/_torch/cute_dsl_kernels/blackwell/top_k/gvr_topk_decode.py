@@ -400,20 +400,21 @@ class GvrTopKKernel:
         self.r0_qfracs = tuple(float(q) for q in r0_qfracs) if r0_qfracs else ()
         if self.r0_qfracs:
             assert all(0.0 < q < 1.0 for q in self.r0_qfracs), self.r0_qfracs
-            assert list(self.r0_qfracs) == sorted(self.r0_qfracs, reverse=True), \
+            assert list(self.r0_qfracs) == sorted(self.r0_qfracs, reverse=True), (
                 "r0_qfracs must be descending h (ascending threshold value)"
+            )
         self.M_thr = len(self.r0_qfracs)
         # need[m] = ceil(q_m * K) prev-topK values >= rung m.
-        self.qneeds = tuple(max(1, int(math.ceil(q * self.top_k)))
-                            for q in self.r0_qfracs)
+        self.qneeds = tuple(max(1, int(math.ceil(q * self.top_k))) for q in self.r0_qfracs)
         # R1 inline shot aim in log2-count space: geometric center of the
         # [K, kC] acceptance window.
-        self.log2_r1aim = (math.log2(math.sqrt(self.top_k * self.kC))
-                           if self.r0_qfracs else 0.0)
+        self.log2_r1aim = math.log2(math.sqrt(self.top_k * self.kC)) if self.r0_qfracs else 0.0
         # fb_fix interior aim (HLS grid optimum): log2(K * (kC/K)**fb_alpha).
         self.log2_mstar = (
             math.log2(self.top_k * (self.kC / self.top_k) ** float(fb_alpha))
-            if self.r0_qfracs else 0.0)
+            if self.r0_qfracs
+            else 0.0
+        )
 
         # --- op#7 P4 fused rank-and-scatter (inert until enable_p4_rank_scatter) ---
         # Replaces phase4_histogram_snap's k-th-bin search + 2-pass writeback
@@ -772,12 +773,23 @@ class GvrTopKKernel:
     # so the base kernel is unaffected.
     # ------------------------------------------------------------------
     @cute.jit
-    def phase1b_hspace_rungs(self, input_row, N, pre_idx_row, pre_idx_count,
-                             pre_idx_offset, smem_hist, s_thr, s_mt_thr,
-                             tidx, warp_id, lane):
+    def phase1b_hspace_rungs(
+        self,
+        input_row,
+        N,
+        pre_idx_row,
+        pre_idx_count,
+        pre_idx_offset,
+        smem_hist,
+        s_thr,
+        s_mt_thr,
+        tidx,
+        warp_id,
+        lane,
+    ):
         M = cutlass.const_expr(self.M_thr)
         NB = cutlass.const_expr(256)
-        SEG = cutlass.const_expr(8)          # NB / WARP_SIZE bins per lane
+        SEG = cutlass.const_expr(8)  # NB / WARP_SIZE bins per lane
         num_threads = cutlass.const_expr(self.num_threads)
 
         jz = tidx
@@ -827,7 +839,7 @@ class GvrTopKKernel:
                 other = cute.arch.shuffle_sync_up(tp, off_v, mask_and_clamp=0)
                 if lane >= cutlass.Int32(off_v):
                     tp = tp + other
-            excl = tp - part                 # cum of all bins above my segment
+            excl = tp - part  # cum of all bins above my segment
             total = cute.arch.shuffle_sync(tp, cutlass.Int32(self.WARP_SIZE - 1))
             run = cutlass.Int32(0)
             for j in cutlass.range_constexpr(SEG):
@@ -835,8 +847,9 @@ class GvrTopKKernel:
                 cum_at = excl + run
                 cum_before = cum_at - seg_frag[j]
                 for m in cutlass.range_constexpr(M):
-                    if (cum_at >= cutlass.Int32(self.qneeds[m])
-                            and cum_before < cutlass.Int32(self.qneeds[m])):
+                    if cum_at >= cutlass.Int32(self.qneeds[m]) and cum_before < cutlass.Int32(
+                        self.qneeds[m]
+                    ):
                         s_mt_thr[m] = v_lo + cutlass.Float32(top - cutlass.Int32(j)) * width
             # unfired rungs (heavy invalid-preIdx rows: total < need): v_lo
             if lane == 0:
@@ -852,8 +865,9 @@ class GvrTopKKernel:
     # preIdx slots. Rung extraction is identical to phase1b_hspace_rungs.
     # ------------------------------------------------------------------
     @cute.jit
-    def phase1b_hspace_rungs_cached(self, pre_idx_count, smem_gath, smem_hist,
-                                    s_thr, s_mt_thr, tidx, warp_id, lane):
+    def phase1b_hspace_rungs_cached(
+        self, pre_idx_count, smem_gath, smem_hist, s_thr, s_mt_thr, tidx, warp_id, lane
+    ):
         M = cutlass.const_expr(self.M_thr)
         NB = cutlass.const_expr(256)
         SEG = cutlass.const_expr(8)
@@ -906,8 +920,9 @@ class GvrTopKKernel:
                 cum_at = excl + run
                 cum_before = cum_at - seg_frag[j]
                 for m in cutlass.range_constexpr(M):
-                    if (cum_at >= cutlass.Int32(self.qneeds[m])
-                            and cum_before < cutlass.Int32(self.qneeds[m])):
+                    if cum_at >= cutlass.Int32(self.qneeds[m]) and cum_before < cutlass.Int32(
+                        self.qneeds[m]
+                    ):
                         s_mt_thr[m] = v_lo + cutlass.Float32(top - cutlass.Int32(j)) * width
             if lane == 0:
                 for m in cutlass.range_constexpr(M):
@@ -1150,9 +1165,19 @@ class GvrTopKKernel:
     # ------------------------------------------------------------------
     @cute.jit
     def block_count_ge_multi(
-        self, input_row, slice_start, slice_end, s_mt_thr, smem_ptcnt_multi,
-        smem_wcnt_multi, s_mt_cnt, s_cluster_partial_m, do_cluster_sync,
-        tidx, warp_id, lane,
+        self,
+        input_row,
+        slice_start,
+        slice_end,
+        s_mt_thr,
+        smem_ptcnt_multi,
+        smem_wcnt_multi,
+        s_mt_cnt,
+        s_cluster_partial_m,
+        do_cluster_sync,
+        tidx,
+        warp_id,
+        lane,
     ):
         M = cutlass.const_expr(self.M_thr)
         num_threads = cutlass.const_expr(self.num_threads)
@@ -1180,12 +1205,17 @@ class GvrTopKKernel:
             rng_frag = cute.make_fragment((vec_w,), self.dtype)
             big_iters = cutlass.Int32(0)
             if slice_end > i + cutlass.Int32(vec_w - 1):
-                big_iters = (slice_end - i - cutlass.Int32(vec_w)) // cutlass.Int32(step_elem) + cutlass.Int32(1)
+                big_iters = (slice_end - i - cutlass.Int32(vec_w)) // cutlass.Int32(
+                    step_elem
+                ) + cutlass.Int32(1)
             for k in cutlass.range(big_iters, unroll=self.mt_unroll):
                 i_local = i + k * cutlass.Int32(step_elem)
                 src_ptr_k = cute.make_ptr(
-                    self.dtype, row_addr + cutlass.Int64(i_local) * cutlass.Int64(elem_bytes),
-                    cute.AddressSpace.gmem, assumed_align=vec_align)
+                    self.dtype,
+                    row_addr + cutlass.Int64(i_local) * cutlass.Int64(elem_bytes),
+                    cute.AddressSpace.gmem,
+                    assumed_align=vec_align,
+                )
                 src_k = cute.make_tensor(src_ptr_k, cute.make_layout((vec_w,)))
                 cute.copy(copy_atom, src_k, rng_frag)
                 for j in cutlass.range_constexpr(vec_w):
@@ -1200,8 +1230,11 @@ class GvrTopKKernel:
         tail_frag = cute.make_fragment((vec_w,), self.dtype)
         while i + cutlass.Int32(vec_w - 1) < slice_end:
             src_ptr = cute.make_ptr(
-                self.dtype, row_addr + cutlass.Int64(i) * cutlass.Int64(elem_bytes),
-                cute.AddressSpace.gmem, assumed_align=vec_align)
+                self.dtype,
+                row_addr + cutlass.Int64(i) * cutlass.Int64(elem_bytes),
+                cute.AddressSpace.gmem,
+                assumed_align=vec_align,
+            )
             src = cute.make_tensor(src_ptr, cute.make_layout((vec_w,)))
             cute.copy(copy_atom, src, tail_frag)
             for j in cutlass.range_constexpr(vec_w):
@@ -1256,7 +1289,8 @@ class GvrTopKKernel:
                         total = cutlass.Int32(0)
                         for peer in cutlass.range_constexpr(cluster_size):
                             peer_addr = mapa_shared_cluster(
-                                local_ptr + cutlass.Int32(m), cutlass.Int32(peer))
+                                local_ptr + cutlass.Int32(m), cutlass.Int32(peer)
+                            )
                             total = total + ld_shared_cluster_i32(peer_addr)
                         s_mt_cnt[m] = total
                 cute.arch.barrier()
@@ -1874,8 +1908,12 @@ class GvrTopKKernel:
             bmin_r = cutlass.Float32(self.FLT_MAX)
             bmax_r = cutlass.Float32(self.NEG_FLT_MAX)
             for w in cutlass.range_constexpr(self.num_warps):
-                vmin = cutlass.Float32(llvm.bitcast(cutlass.Float32.mlir_type, smem_wcnt[w].ir_value()))
-                vmax = cutlass.Float32(llvm.bitcast(cutlass.Float32.mlir_type, smem_hist[w].ir_value()))
+                vmin = cutlass.Float32(
+                    llvm.bitcast(cutlass.Float32.mlir_type, smem_wcnt[w].ir_value())
+                )
+                vmax = cutlass.Float32(
+                    llvm.bitcast(cutlass.Float32.mlir_type, smem_hist[w].ir_value())
+                )
                 bmin_r = _fmin_f32_inline(bmin_r, vmin)
                 bmax_r = cute.arch.fmax(bmax_r, vmax)
             if bmax_r <= bmin_r:
@@ -1903,8 +1941,11 @@ class GvrTopKKernel:
             # ---- 3-step high→low bin search → straddling bin b* + rank_above ----
             warp_bin_sum = cutlass.Int32(0)
             for jb in cutlass.range_constexpr(bins_per_warp):
-                bidx_s = (cutlass.Int32(kBins - 1) - warp_id * cutlass.Int32(bins_per_warp)
-                          - cutlass.Int32(jb))
+                bidx_s = (
+                    cutlass.Int32(kBins - 1)
+                    - warp_id * cutlass.Int32(bins_per_warp)
+                    - cutlass.Int32(jb)
+                )
                 warp_bin_sum = warp_bin_sum + smem_hist[bidx_s]
             if lane == cutlass.Int32(0):
                 smem_wcnt[warp_id] = warp_bin_sum
@@ -1932,8 +1973,11 @@ class GvrTopKKernel:
                 rank_above = base_cum
                 set_d = cutlass.Int32(0)
                 for jb2 in cutlass.range_constexpr(bins_per_warp):
-                    bidx2 = (cutlass.Int32(kBins - 1) - target_warp * cutlass.Int32(bins_per_warp)
-                             - cutlass.Int32(jb2))
+                    bidx2 = (
+                        cutlass.Int32(kBins - 1)
+                        - target_warp * cutlass.Int32(bins_per_warp)
+                        - cutlass.Int32(jb2)
+                    )
                     ra_before = base_cum
                     base_cum = base_cum + smem_hist[bidx2]
                     if base_cum >= cutlass.Int32(kK) and set_d == cutlass.Int32(0):
@@ -1985,8 +2029,11 @@ class GvrTopKKernel:
                 # fine 3-step search seeded at rank_above (over fbins bins)
                 fws = cutlass.Int32(0)
                 for jbf in cutlass.range_constexpr(fbpw):
-                    bif = (cutlass.Int32(fbins - 1) - warp_id * cutlass.Int32(fbpw)
-                           - cutlass.Int32(jbf))
+                    bif = (
+                        cutlass.Int32(fbins - 1)
+                        - warp_id * cutlass.Int32(fbpw)
+                        - cutlass.Int32(jbf)
+                    )
                     fws = fws + smem_hist[bif]
                 if lane == cutlass.Int32(0):
                     smem_wcnt[warp_id] = fws
@@ -2010,8 +2057,8 @@ class GvrTopKKernel:
                     # histogram bins as scratch would corrupt sb_star/ra_fine
                     # when twf2 == num_warps-1. Slots [4]/[1] are dead here
                     # (re-zeroed at the cnt_above/cnt_strad reset below).
-                    s_iscalars[4] = pre   # prefix into target fine warp
-                    s_iscalars[1] = twf   # target fine warp
+                    s_iscalars[4] = pre  # prefix into target fine warp
+                    s_iscalars[1] = twf  # target fine warp
                 cute.arch.barrier()
                 pre_f = s_iscalars[4]
                 twf2 = s_iscalars[1]
@@ -2021,8 +2068,11 @@ class GvrTopKKernel:
                     ra_fine = base_f
                     sd = cutlass.Int32(0)
                     for jb3 in cutlass.range_constexpr(fbpw):
-                        sbi = (cutlass.Int32(fbins - 1) - twf2 * cutlass.Int32(fbpw)
-                               - cutlass.Int32(jb3))
+                        sbi = (
+                            cutlass.Int32(fbins - 1)
+                            - twf2 * cutlass.Int32(fbpw)
+                            - cutlass.Int32(jb3)
+                        )
                         ra_b = base_f
                         base_f = base_f + smem_hist[sbi]
                         if base_f >= cutlass.Int32(kK) and sd == cutlass.Int32(0):
@@ -3037,16 +3087,36 @@ class GvrTopKKernel:
                     # rungs from the SMEM gather-cache P1 stashed (no 2nd
                     # GMEM gather); 16-bit only.
                     self.phase1b_hspace_rungs_cached(
-                        pre_idx_count, smem_gath, smem_hist, s_thr, s_mt_thr,
-                        tidx, warp_id, lane)
+                        pre_idx_count, smem_gath, smem_hist, s_thr, s_mt_thr, tidx, warp_id, lane
+                    )
                 else:
                     self.phase1b_hspace_rungs(
-                        input_row, N, pre_idx_row, pre_idx_count, pre_idx_offset,
-                        smem_hist, s_thr, s_mt_thr, tidx, warp_id, lane)
+                        input_row,
+                        N,
+                        pre_idx_row,
+                        pre_idx_count,
+                        pre_idx_offset,
+                        smem_hist,
+                        s_thr,
+                        s_mt_thr,
+                        tidx,
+                        warp_id,
+                        lane,
+                    )
                 self.block_count_ge_multi(
-                    input_row, slice_start, slice_end, s_mt_thr,
-                    smem_ptcnt_multi, smem_wcnt_multi, s_mt_cnt,
-                    s_cluster_partial_m, do_cluster_sync, tidx, warp_id, lane)
+                    input_row,
+                    slice_start,
+                    slice_end,
+                    s_mt_thr,
+                    smem_ptcnt_multi,
+                    smem_wcnt_multi,
+                    s_mt_cnt,
+                    s_cluster_partial_m,
+                    do_cluster_sync,
+                    tidx,
+                    warp_id,
+                    lane,
+                )
                 cute.arch.barrier()
                 if tidx == 0:
                     # tightest admissible rung = LAST m with count in [K, kC]
@@ -3054,8 +3124,7 @@ class GvrTopKKernel:
                     best_m = cutlass.Int32(-1)
                     for m in cutlass.range_constexpr(cutlass.const_expr(self.M_thr)):
                         cm = s_mt_cnt[m]
-                        if (cm >= cutlass.Int32(self.top_k)
-                                and cm <= cutlass.Int32(self.kC)):
+                        if cm >= cutlass.Int32(self.top_k) and cm <= cutlass.Int32(self.kC):
                             best_m = cutlass.Int32(m)
                     s_r0col[0] = best_m
                     if best_m >= cutlass.Int32(0):
@@ -3080,8 +3149,7 @@ class GvrTopKKernel:
                     # accepted: seed Phase 3 with the rung's cached per-thread
                     # count column (zero rescan; matches secant's smem_ptcnt
                     # hand-off contract).
-                    smem_ptcnt[tidx] = smem_ptcnt_multi[
-                        bc * cutlass.Int32(num_threads) + tidx]
+                    smem_ptcnt[tidx] = smem_ptcnt_multi[bc * cutlass.Int32(num_threads) + tidx]
                 cute.arch.barrier()
                 # ---- R0 miss: SEEDED bounded log-falsi refine ----
                 # At large N the M2D rungs straddle [K, kC]; the refine must
@@ -3110,9 +3178,9 @@ class GvrTopKKernel:
                                     chi = s_mt_cnt[mm]
                             s_thr[1] = blo
                             s_thr[2] = bhi
-                            s_iscalars[2] = clo   # SEED known rung counts
+                            s_iscalars[2] = clo  # SEED known rung counts
                             s_iscalars[3] = chi
-                            s_iscalars[1] = cutlass.Int32(0)   # done=0
+                            s_iscalars[1] = cutlass.Int32(0)  # done=0
                             cand = (blo + bhi) * cutlass.Float32(0.5)
                             if clo > cutlass.Int32(0) and chi >= cutlass.Int32(0):
                                 chic = chi
@@ -3133,8 +3201,7 @@ class GvrTopKKernel:
                             s_thr[0] = cand
                         cute.arch.barrier()
                         rs = cutlass.Int32(0)
-                        while (rs < cutlass.Int32(8)
-                               and s_iscalars[1] == cutlass.Int32(0)):
+                        while rs < cutlass.Int32(8) and s_iscalars[1] == cutlass.Int32(0):
                             if rs > cutlass.Int32(0):
                                 if tidx == cutlass.Int32(0):
                                     lo3 = s_thr[1]
@@ -3161,18 +3228,26 @@ class GvrTopKKernel:
                                     s_thr[0] = cand
                                 cute.arch.barrier()
                             self.block_count_ge(
-                                input_row, slice_start, slice_end, s_thr[0],
-                                smem_ptcnt, smem_wcnt, s_iscalars,
-                                s_cluster_partial, tidx, warp_id, lane,
+                                input_row,
+                                slice_start,
+                                slice_end,
+                                s_thr[0],
+                                smem_ptcnt,
+                                smem_wcnt,
+                                s_iscalars,
+                                s_cluster_partial,
+                                tidx,
+                                warp_id,
+                                lane,
                                 do_cluster_sync=do_cluster_sync,
-                                smem_input=smem_input)
+                                smem_input=smem_input,
+                            )
                             cute.arch.barrier()
                             if tidx == cutlass.Int32(0):
                                 c3 = s_iscalars[0]
                                 t3v = s_thr[0]
-                                if (c3 >= cutlass.Int32(self.top_k)
-                                        and c3 <= cutlass.Int32(self.kC)):
-                                    s_iscalars[1] = cutlass.Int32(1)   # accept
+                                if c3 >= cutlass.Int32(self.top_k) and c3 <= cutlass.Int32(self.kC):
+                                    s_iscalars[1] = cutlass.Int32(1)  # accept
                                 elif c3 > cutlass.Int32(self.kC):
                                     s_thr[1] = t3v
                                     s_iscalars[2] = c3
@@ -3197,23 +3272,42 @@ class GvrTopKKernel:
                             # tie-plateau fail-soft: land on the measured
                             # undershoot side (count <= kC => no overflow).
                             self.block_count_ge(
-                                input_row, slice_start, slice_end, s_thr[2],
-                                smem_ptcnt, smem_wcnt, s_iscalars,
-                                s_cluster_partial, tidx, warp_id, lane,
+                                input_row,
+                                slice_start,
+                                slice_end,
+                                s_thr[2],
+                                smem_ptcnt,
+                                smem_wcnt,
+                                s_iscalars,
+                                s_cluster_partial,
+                                tidx,
+                                warp_id,
+                                lane,
                                 do_cluster_sync=do_cluster_sync,
-                                smem_input=smem_input)
+                                smem_input=smem_input,
+                            )
                             cute.arch.barrier()
                             if tidx == cutlass.Int32(0):
                                 s_thr[0] = s_thr[2]
                                 s_iscalars[1] = cutlass.Int32(1)
                             cute.arch.barrier()
                     else:
-                            self.phase2_secant_search(
-                                input_row, N, slice_start, slice_end,
-                                smem_ptcnt, smem_wcnt, s_thr, s_iscalars,
-                                s_cluster_partial, tidx, warp_id, lane,
-                                do_cluster_sync=do_cluster_sync,
-                                smem_input=smem_input)
+                        self.phase2_secant_search(
+                            input_row,
+                            N,
+                            slice_start,
+                            slice_end,
+                            smem_ptcnt,
+                            smem_wcnt,
+                            s_thr,
+                            s_iscalars,
+                            s_cluster_partial,
+                            tidx,
+                            warp_id,
+                            lane,
+                            do_cluster_sync=do_cluster_sync,
+                            smem_input=smem_input,
+                        )
             else:
                 self.phase2_secant_search(
                     input_row,
@@ -3278,15 +3372,33 @@ class GvrTopKKernel:
                 cand_count_p4 = min(s_iscalars[0], cutlass.Int32(self.kC))
                 if cutlass.const_expr(self.enable_p4_rank_scatter):
                     self.phase4_rank_scatter(
-                        smem_keys, smem_vals, smem_hist, smem_wcnt, s_thr,
-                        s_iscalars, output_values_row, output_indices_row,
-                        cand_count_p4, tidx, warp_id, lane,
+                        smem_keys,
+                        smem_vals,
+                        smem_hist,
+                        smem_wcnt,
+                        s_thr,
+                        s_iscalars,
+                        output_values_row,
+                        output_indices_row,
+                        cand_count_p4,
+                        tidx,
+                        warp_id,
+                        lane,
                     )
                 else:
                     self.phase4_histogram_snap(
-                        smem_keys, smem_vals, smem_hist, smem_wcnt, s_thr,
-                        s_iscalars, output_values_row, output_indices_row,
-                        cand_count_p4, tidx, warp_id, lane,
+                        smem_keys,
+                        smem_vals,
+                        smem_hist,
+                        smem_wcnt,
+                        s_thr,
+                        s_iscalars,
+                        output_values_row,
+                        output_indices_row,
+                        cand_count_p4,
+                        tidx,
+                        warp_id,
+                        lane,
                     )
             else:
                 # cs>1: only the leader (CTA 0 in cluster) runs Phase 4.
@@ -3337,15 +3449,33 @@ class GvrTopKKernel:
                     cand_count_p4 = min(s_iscalars[0], cutlass.Int32(self.kC))
                     if cutlass.const_expr(self.enable_p4_rank_scatter):
                         self.phase4_rank_scatter(
-                            smem_keys, smem_vals, smem_hist, smem_wcnt, s_thr,
-                            s_iscalars, output_values_row, output_indices_row,
-                            cand_count_p4, tidx, warp_id, lane,
+                            smem_keys,
+                            smem_vals,
+                            smem_hist,
+                            smem_wcnt,
+                            s_thr,
+                            s_iscalars,
+                            output_values_row,
+                            output_indices_row,
+                            cand_count_p4,
+                            tidx,
+                            warp_id,
+                            lane,
                         )
                     else:
                         self.phase4_histogram_snap(
-                            smem_keys, smem_vals, smem_hist, smem_wcnt, s_thr,
-                            s_iscalars, output_values_row, output_indices_row,
-                            cand_count_p4, tidx, warp_id, lane,
+                            smem_keys,
+                            smem_vals,
+                            smem_hist,
+                            smem_wcnt,
+                            s_thr,
+                            s_iscalars,
+                            output_values_row,
+                            output_indices_row,
+                            cand_count_p4,
+                            tidx,
+                            warp_id,
+                            lane,
                         )
 
         # Final cluster barrier: keep peer CTAs (and their SMEM) alive
