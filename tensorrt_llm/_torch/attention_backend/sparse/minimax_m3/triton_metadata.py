@@ -1,131 +1,31 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""MiniMax-M3 sparse attention configuration + per-forward metadata.
+"""MiniMax-M3 Triton reference per-forward metadata.
 
 Contains:
 
-  * :class:`MiniMaxM3SparseConfig`            -- post-TP-shard kernel
-                                                 parameter bundle.
-  * :class:`MiniMaxM3SparseAttentionMetadata` -- per-forward metadata
-                                                 dataclass with a
-                                                 CUDA-graph-safe
-                                                 :meth:`prepare`.
+  * :class:`MiniMaxM3TritonSparseAttentionMetadata` -- per-forward metadata
+    dataclass with a CUDA-graph-safe :meth:`prepare`.
   * Helpers to migrate metadata across devices, build it from a real
-    :class:`KVCacheManagerV2`, and pre-allocate CUDA-graph-stable
-    buffers.
-  * :func:`get_minimax_m3_attention_metadata_cls` -- lazy factory for
-    the :class:`AttentionMetadata` subclass the pyexecutor wires into
-    the M3 sparse layer's forward path.
+    :class:`KVCacheManagerV2`, and pre-allocate CUDA-graph-stable buffers.
+  * :class:`MiniMaxM3AttentionMetadata` -- the :class:`AttentionMetadata`
+    subclass the pyexecutor wires into the M3 sparse layer's forward path.
 """
 
 from __future__ import annotations
 
 import dataclasses
-import functools
 from dataclasses import dataclass, field
-from typing import List, Literal, Optional, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 
-from ..params import SparseParams
-
-
-@dataclass(frozen=True)
-class MiniMaxM3SparseParams(SparseParams):
-    """Lowered runtime parameters for the MiniMax-M3 sparse backend."""
-
-    algorithm: Literal["minimax_m3"] = field(init=False, default="minimax_m3")
-    num_index_heads: int = 4
-    sparse_index_dim: int = 128
-    block_size: int = 128
-    topk: int = 16
-    init_blocks: int = 0
-    local_blocks: int = 1
-    score_type: str = "max"
-    disable_index_value: bool = True
-
-
-@dataclass(frozen=True)
-class MiniMaxM3SparseConfig:
-    """Per-rank kernel parameter bundle for MiniMax-M3 sparse attention.
-
-    This is **not** a user-facing config (use
-    :class:`tensorrt_llm.llmapi.llm_args.MiniMaxM3SparseAttentionConfig`
-    for that). It is the layer-invariant, post-TP-shard parameter bundle
-    that backend kernels and reference helpers consume. The user knobs
-    come from :class:`MiniMaxM3SparseParams`; ``num_q_heads`` /
-    ``num_kv_heads`` / ``head_dim`` come from the per-rank model
-    geometry and must be supplied by the caller (typically via
-    :meth:`from_sparse_params`).
-    """
-
-    num_q_heads: int
-    num_kv_heads: int
-    head_dim: int
-    num_index_heads: int
-    sparse_index_dim: int
-    block_size: int
-    topk: int
-    init_blocks: int = 0
-    local_blocks: int = 1
-    score_type: str = "max"
-
-    def __post_init__(self) -> None:
-        if self.num_q_heads % self.num_kv_heads != 0:
-            raise ValueError(
-                f"num_q_heads ({self.num_q_heads}) must be divisible by "
-                f"num_kv_heads ({self.num_kv_heads})"
-            )
-        if self.num_index_heads % self.num_kv_heads != 0:
-            raise ValueError(
-                f"num_index_heads ({self.num_index_heads}) must be divisible "
-                f"by num_kv_heads ({self.num_kv_heads})"
-            )
-        if self.block_size <= 0:
-            raise ValueError(f"block_size must be > 0, got {self.block_size}")
-        if self.topk <= 0:
-            raise ValueError(f"topk must be > 0, got {self.topk}")
-        if self.init_blocks < 0:
-            raise ValueError(f"init_blocks must be >= 0, got {self.init_blocks}")
-        if self.local_blocks < 0:
-            raise ValueError(f"local_blocks must be >= 0, got {self.local_blocks}")
-        if self.score_type != "max":
-            # SGLang exposes only "max" today and that is what the MiniMax-M3
-            # checkpoint config specifies. Reject anything else explicitly so
-            # a config drift surfaces immediately.
-            raise ValueError(
-                f"score_type={self.score_type!r} is not supported "
-                "(only 'max' matches the SGLang reference)"
-            )
-
-    @classmethod
-    def from_sparse_params(
-        cls,
-        sparse_params: "MiniMaxM3SparseParams",
-        *,
-        num_q_heads: int,
-        num_kv_heads: int,
-        head_dim: int,
-    ) -> "MiniMaxM3SparseConfig":
-        """Build a kernel param bundle from lowered ``MiniMaxM3SparseParams``
-        and the per-rank model geometry.
-        """
-        return cls(
-            num_q_heads=int(num_q_heads),
-            num_kv_heads=int(num_kv_heads),
-            head_dim=int(head_dim),
-            num_index_heads=int(sparse_params.num_index_heads),
-            sparse_index_dim=int(sparse_params.sparse_index_dim),
-            block_size=int(sparse_params.block_size),
-            topk=int(sparse_params.topk),
-            init_blocks=int(sparse_params.init_blocks),
-            local_blocks=int(sparse_params.local_blocks),
-            score_type=str(sparse_params.score_type),
-        )
+from ...interface import AttentionMetadata
+from .common import build_paged_kv_slot_mapping
 
 
 @dataclass
-class MiniMaxM3SparseAttentionMetadata:
+class MiniMaxM3TritonSparseAttentionMetadata:
     """Per-forward metadata for MiniMax-M3 sparse attention.
 
     Mirrors the shape of SGLang's
@@ -269,12 +169,12 @@ class MiniMaxM3SparseAttentionMetadata:
 
 
 def ensure_metadata_on_device(
-    metadata: "MiniMaxM3SparseAttentionMetadata",
+    metadata: "MiniMaxM3TritonSparseAttentionMetadata",
     device: torch.device,
-) -> "MiniMaxM3SparseAttentionMetadata":
+) -> "MiniMaxM3TritonSparseAttentionMetadata":
     """Return ``metadata`` with every GPU-consumed tensor on ``device``.
 
-    Constructs a new :class:`MiniMaxM3SparseAttentionMetadata` whose
+    Constructs a new :class:`MiniMaxM3TritonSparseAttentionMetadata` whose
     tensor fields are migrated to ``device`` when they live elsewhere.
     The CPU-side mirror ``seq_lens_cpu`` is preserved because the
     algorithm reads it only when explicitly noted (e.g. for
@@ -304,18 +204,6 @@ def ensure_metadata_on_device(
         q_batch_row=_move(metadata.q_batch_row),
         q_positions=_move(metadata.q_positions),
     )
-
-
-def replace_metadata(
-    metadata: MiniMaxM3SparseAttentionMetadata,
-    **changes,
-) -> MiniMaxM3SparseAttentionMetadata:
-    """Helper around :func:`dataclasses.replace` for ``metadata``.
-
-    Provided so callers can build a decode metadata from a prefill
-    metadata without manually re-typing every field.
-    """
-    return dataclasses.replace(metadata, **changes)
 
 
 def allocate_minimax_m3_static_buffers(
@@ -405,6 +293,82 @@ def allocate_minimax_m3_static_buffers(
     }
 
 
+def _build_runtime_metadata_fresh(
+    *,
+    kv_cache_manager,
+    request_ids,
+    seq_lens: torch.Tensor,
+    seq_lens_cpu: torch.Tensor,
+    is_prefill: bool,
+    prefix_lens: Optional[torch.Tensor],
+    extend_seq_lens_cpu: Optional[List[int]],
+    device: torch.device,
+) -> Tuple[MiniMaxM3TritonSparseAttentionMetadata, torch.Tensor]:
+    """Fresh-allocation build of the Triton reference metadata.
+
+    Delegates the backend-neutral req_to_token, slot_ids and out_cache_loc
+    derivation to common.build_paged_kv_slot_mapping and adds the Triton-only
+    fields: cu_seqlens_q, prefix_lens on device, and the scalar max_seqlen
+    values and per-query-token tensors that prepare() computes. Used when no
+    graph-stable static_buffers are supplied; the static_buffers path in
+    build_runtime_metadata_from_kv_manager keeps its own in-place buffer writes.
+    """
+    batch = int(seq_lens.shape[0])
+    seq_lens_dev = seq_lens.to(device) if seq_lens.device != device else seq_lens
+
+    if is_prefill:
+        if extend_seq_lens_cpu is None:
+            raise ValueError("prefill metadata requires extend_seq_lens_cpu")
+        if prefix_lens is None:
+            raise ValueError("prefill metadata requires prefix_lens")
+        prefix_lens_dev = prefix_lens.to(device) if prefix_lens.device != device else prefix_lens
+        qo_lens_cpu = torch.tensor([int(x) for x in extend_seq_lens_cpu], dtype=torch.int32)
+        qo_offset_cpu = prefix_lens.detach().to(device="cpu", dtype=torch.int32)
+        req_to_token, slot_ids, out_cache_loc = build_paged_kv_slot_mapping(
+            kv_cache_manager=kv_cache_manager,
+            request_ids=request_ids,
+            qo_lens_cpu=qo_lens_cpu,
+            qo_offset_cpu=qo_offset_cpu,
+            device=device,
+        )
+        cu_q: List[int] = [0]
+        for ext in extend_seq_lens_cpu:
+            cu_q.append(cu_q[-1] + int(ext))
+        cu_seqlens_q = torch.tensor(cu_q, dtype=torch.int32, device=device)
+        meta = MiniMaxM3TritonSparseAttentionMetadata(
+            is_prefill=True,
+            req_to_token=req_to_token,
+            slot_ids=slot_ids,
+            seq_lens=seq_lens_dev,
+            seq_lens_cpu=seq_lens_cpu,
+            prefix_lens=prefix_lens_dev,
+            cu_seqlens_q=cu_seqlens_q,
+            extend_seq_lens_cpu=list(extend_seq_lens_cpu),
+            q_batch_row=None,
+            q_positions=None,
+        )
+    else:
+        # Decode: the new token sits at position seq_lens[b] - 1.
+        qo_lens_cpu = torch.ones(batch, dtype=torch.int32)
+        qo_offset_cpu = seq_lens_cpu.detach().to(device="cpu", dtype=torch.int32) - 1
+        req_to_token, slot_ids, out_cache_loc = build_paged_kv_slot_mapping(
+            kv_cache_manager=kv_cache_manager,
+            request_ids=request_ids,
+            qo_lens_cpu=qo_lens_cpu,
+            qo_offset_cpu=qo_offset_cpu,
+            device=device,
+        )
+        meta = MiniMaxM3TritonSparseAttentionMetadata(
+            is_prefill=False,
+            req_to_token=req_to_token,
+            slot_ids=slot_ids,
+            seq_lens=seq_lens_dev,
+            seq_lens_cpu=seq_lens_cpu,
+        )
+    meta.prepare()
+    return meta, out_cache_loc
+
+
 def build_runtime_metadata_from_kv_manager(
     *,
     kv_cache_manager,
@@ -416,8 +380,8 @@ def build_runtime_metadata_from_kv_manager(
     extend_seq_lens_cpu: Optional[List[int]] = None,
     device: Optional[torch.device] = None,
     static_buffers: Optional[dict] = None,
-) -> Tuple[MiniMaxM3SparseAttentionMetadata, torch.Tensor]:
-    """Build a :class:`MiniMaxM3SparseAttentionMetadata` from a real
+) -> Tuple[MiniMaxM3TritonSparseAttentionMetadata, torch.Tensor]:
+    """Build a :class:`MiniMaxM3TritonSparseAttentionMetadata` from a real
     :class:`MiniMaxM3KVCacheManagerV2`.
 
     Returns the populated metadata plus an ``out_cache_loc`` tensor
@@ -452,6 +416,21 @@ def build_runtime_metadata_from_kv_manager(
     the end-to-end runtime path without going through the full LLM
     forward.
     """
+    if device is None:
+        device = seq_lens.device
+
+    if static_buffers is None:
+        return _build_runtime_metadata_fresh(
+            kv_cache_manager=kv_cache_manager,
+            request_ids=request_ids,
+            seq_lens=seq_lens,
+            seq_lens_cpu=seq_lens_cpu,
+            is_prefill=is_prefill,
+            prefix_lens=prefix_lens,
+            extend_seq_lens_cpu=extend_seq_lens_cpu,
+            device=device,
+        )
+
     tokens_per_block = int(kv_cache_manager.tokens_per_block)
     # block_ids_per_seq is a [batch_size, max_blocks_per_seq] tensor; row b
     # holds the block ids assigned to request_ids[b] in order.
@@ -459,8 +438,6 @@ def build_runtime_metadata_from_kv_manager(
     batch = int(seq_lens.shape[0])
     max_blocks = int(block_ids.shape[1])
     max_kv_len = max_blocks * tokens_per_block
-    if device is None:
-        device = seq_lens.device
 
     if static_buffers is not None:
         if static_buffers.get("device") != device:
@@ -631,7 +608,7 @@ def build_runtime_metadata_from_kv_manager(
             cu_seqlens_q = torch.tensor(cu_q, dtype=torch.int32, device=device)
             q_batch_row = None
             q_positions = None
-        meta = MiniMaxM3SparseAttentionMetadata(
+        meta = MiniMaxM3TritonSparseAttentionMetadata(
             is_prefill=True,
             req_to_token=req_to_token,
             slot_ids=slot_ids,
@@ -663,7 +640,7 @@ def build_runtime_metadata_from_kv_manager(
             out_cache_loc = out_cache_loc_buf[:batch]
         else:
             out_cache_loc = torch.tensor(out_cache_loc_list, dtype=torch.int32, device=device)
-        meta = MiniMaxM3SparseAttentionMetadata(
+        meta = MiniMaxM3TritonSparseAttentionMetadata(
             is_prefill=False,
             req_to_token=req_to_token,
             slot_ids=slot_ids,
@@ -674,242 +651,222 @@ def build_runtime_metadata_from_kv_manager(
     return meta, out_cache_loc
 
 
-@functools.lru_cache(maxsize=1)
-def get_minimax_m3_attention_metadata_cls():
-    """Return :class:`MiniMaxM3AttentionMetadata` (lazy import).
+class MiniMaxM3AttentionMetadata(AttentionMetadata):
+    """:class:`AttentionMetadata` that pre-builds MiniMax-M3 metadata.
 
-    The class extends :class:`AttentionMetadata` so the pyexecutor's
-    metadata-creation/prepare hooks (model_engine.py) drive M3 metadata
-    construction outside the CUDA-graph capture window. Building the
-    M3-sparse ``req_to_token`` / ``slot_ids`` / ``out_cache_loc``
-    tensors during ``prepare()`` lands them on the GPU **before** the
-    forward call; the forward path then reads from the pre-built
-    attachment and performs no CPU->GPU copies, which is required for
-    CUDA-graph capture safety (``cudaErrorStreamCaptureUnsupported``
-    fires for CPU->GPU ``memcpyAsync`` calls inside a captured stream).
+    Overrides :meth:`prepare` so the M3-sparse
+    :class:`MiniMaxM3TritonSparseAttentionMetadata` and the per-new-token
+    ``out_cache_loc`` are built **once per scheduler step**, on the
+    cache device, before the model forward runs.  The result is
+    stored as ``self.minimax_m3 = {"metadata": m3_meta,
+    "out_cache_loc": out_cache_loc}`` so the model layer's
+    ``_dense_forward`` and ``_sparse_forward`` can read it without
+    any device migration.
+
+    Test paths that build their own metadata can short-circuit by
+    attaching ``attn_metadata.minimax_m3`` directly before calling
+    the forward; those paths do not go through :meth:`prepare`.
     """
-    from ...interface import AttentionMetadata
 
-    class MiniMaxM3AttentionMetadata(AttentionMetadata):
-        """:class:`AttentionMetadata` that pre-builds MiniMax-M3 metadata.
+    minimax_m3: Optional[dict] = None
+    # Lazily allocated dict of persistent device buffers used to keep
+    # ``MiniMaxM3TritonSparseAttentionMetadata`` tensor addresses stable
+    # across CUDA-graph capture/replay. None until the first
+    # ``prepare()`` call decides to use them (``is_cuda_graph`` /
+    # graph-stable mode).
+    _m3_static_buffers: Optional[dict] = None
 
-        Overrides :meth:`prepare` so the M3-sparse
-        :class:`MiniMaxM3SparseAttentionMetadata` and the per-new-token
-        ``out_cache_loc`` are built **once per scheduler step**, on the
-        cache device, before the model forward runs.  The result is
-        stored as ``self.minimax_m3 = {"metadata": m3_meta,
-        "out_cache_loc": out_cache_loc}`` so the model layer's
-        ``_dense_forward`` and ``_sparse_forward`` can read it without
-        any device migration.
+    def _maybe_get_m3_static_buffers(
+        self, cache_device: torch.device, kv_cache_manager
+    ) -> Optional[dict]:
+        """Return persistent M3 buffers when graph stability is
+        required.
 
-        Test paths that build their own metadata can short-circuit by
-        attaching ``attn_metadata.minimax_m3`` directly before calling
-        the forward; those paths do not go through :meth:`prepare`.
+        Allocates the persistent buffer dict the first time it is
+        needed and caches it on ``self._m3_static_buffers``. We
+        allocate the buffers under two conditions:
+
+          * ``self.is_cuda_graph`` is True -- the captured graph
+            requires stable ``data_ptr()`` across replays; OR
+          * the previous prepare() already allocated buffers --
+            we keep using them so the algorithm sees the same
+            addresses even between non-graph and graph-mode calls
+            (which can happen when the model engine alternates
+            between eager warmup and graph replay).
+
+        Returns ``None`` when no static buffers should be used (e.g.
+        eager-only test paths that rely on per-call allocations).
         """
+        need_static = (
+            bool(getattr(self, "is_cuda_graph", False)) or self._m3_static_buffers is not None
+        )
+        if not need_static:
+            return None
+        if self._m3_static_buffers is not None:
+            bufs = self._m3_static_buffers
+            if bufs.get("device") == cache_device:
+                return bufs
 
-        minimax_m3: Optional[dict] = None
-        # Lazily allocated dict of persistent device buffers used to keep
-        # ``MiniMaxM3SparseAttentionMetadata`` tensor addresses stable
-        # across CUDA-graph capture/replay. None until the first
-        # ``prepare()`` call decides to use them (``is_cuda_graph`` /
-        # graph-stable mode).
-        _m3_static_buffers: Optional[dict] = None
+        # First-time use: return an empty placeholder dict.
+        # ``build_runtime_metadata_from_kv_manager`` performs the
+        # actual allocation lazily on the first call where the
+        # current scheduler step's geometry (max_kv_len from the
+        # manager's block-id table, total_q from extend_seq_lens,
+        # actual batch size after CUDA-graph padding) is known.
+        # That removes the need to predict the warmup geometry up
+        # front. The first allocation pins the buffer addresses
+        # for the rest of this metadata instance's lifetime, so all
+        # subsequent prepare() calls reuse the same ``data_ptr()``s
+        # and CUDA graph capture/replay stays valid.
+        placeholder: dict = {
+            "device": cache_device,
+            # Caller-provided hints used by the lazy allocator below
+            # when it sizes the persistent buffers on the first real
+            # prepare() call.
+            "max_num_sequences_hint": int(
+                getattr(self, "max_num_sequences", None) or self.max_num_requests
+            ),
+            "max_num_tokens_hint": int(
+                getattr(self, "max_num_tokens", None)
+                or (int(getattr(self, "max_num_sequences", None) or self.max_num_requests))
+            ),
+        }
+        self._m3_static_buffers = placeholder
+        return placeholder
 
-        def _maybe_get_m3_static_buffers(
-            self, cache_device: torch.device, kv_cache_manager
-        ) -> Optional[dict]:
-            """Return persistent M3 buffers when graph stability is
-            required.
+    def prepare(self) -> None:
+        super().prepare()
 
-            Allocates the persistent buffer dict the first time it is
-            needed and caches it on ``self._m3_static_buffers``. We
-            allocate the buffers under two conditions:
+        # Always rebuild the M3 metadata block on each prepare()
+        # call so it reflects the current scheduler step's seq_lens
+        # / request_ids / num_cached_tokens. Production
+        # ``model_engine`` invokes ``prepare()`` outside any CUDA
+        # graph capture window, so the (potentially expensive) build
+        # is safe to perform here.
+        #
+        # When CUDA graph is enabled the inner ``build_runtime_metadata_from_kv_manager``
+        # call writes into the persistent ``_m3_static_buffers`` so
+        # the captured graph keeps reading from stable ``data_ptr()``s
+        # across replays. Without this the captured ``index_select``
+        # over ``req_to_token``/``slot_ids`` reads from freed warmup
+        # memory and either produces wrong tokens or fires
+        # ``Indexing.cu:1515`` ``srcIndex < srcSelectDimSize``.
+        self.minimax_m3 = None
 
-              * ``self.is_cuda_graph`` is True -- the captured graph
-                requires stable ``data_ptr()`` across replays; OR
-              * the previous prepare() already allocated buffers --
-                we keep using them so the algorithm sees the same
-                addresses even between non-graph and graph-mode calls
-                (which can happen when the model engine alternates
-                between eager warmup and graph replay).
+        # Production path: build the M3 metadata from the standard
+        # AttentionMetadata fields. Requires kv_cache_manager + the
+        # M3 sparse-cache contract.
+        kv_cache_manager = getattr(self, "kv_cache_manager", None)
+        if kv_cache_manager is None or not hasattr(kv_cache_manager, "get_index_k_buffer"):
+            # Not an M3 KV cache manager: nothing to build. The
+            # forward path will raise a clear error if the M3
+            # backend ends up dispatched without the M3 cache.
+            return
+        request_ids = getattr(self, "request_ids", None)
+        seq_lens = self.seq_lens
+        if request_ids is None or seq_lens is None:
+            return
+        num_contexts = int(getattr(self, "num_contexts", 0) or 0)
+        batch_size = int(seq_lens.shape[0])
+        if batch_size == 0:
+            return
 
-            Returns ``None`` when no static buffers should be used (e.g.
-            eager-only test paths that rely on per-call allocations).
-            """
-            need_static = (
-                bool(getattr(self, "is_cuda_graph", False)) or self._m3_static_buffers is not None
-            )
-            if not need_static:
-                return None
-            if self._m3_static_buffers is not None:
-                bufs = self._m3_static_buffers
-                if bufs.get("device") == cache_device:
-                    return bufs
+        # The cache device hosts every paged buffer; this is the
+        # device the forward path consumes.
+        try:
+            layer_buf = kv_cache_manager.get_buffers(0)
+            cache_device = layer_buf.device
+        except Exception:
+            cache_device = torch.device(f"cuda:{torch.cuda.current_device()}")
 
-            # First-time use: return an empty placeholder dict.
-            # ``build_runtime_metadata_from_kv_manager`` performs the
-            # actual allocation lazily on the first call where the
-            # current scheduler step's geometry (max_kv_len from the
-            # manager's block-id table, total_q from extend_seq_lens,
-            # actual batch size after CUDA-graph padding) is known.
-            # That removes the need to predict the warmup geometry up
-            # front. The first allocation pins the buffer addresses
-            # for the rest of this metadata instance's lifetime, so all
-            # subsequent prepare() calls reuse the same ``data_ptr()``s
-            # and CUDA graph capture/replay stays valid.
-            placeholder: dict = {
-                "device": cache_device,
-                # Caller-provided hints used by the lazy allocator below
-                # when it sizes the persistent buffers on the first real
-                # prepare() call.
-                "max_num_sequences_hint": int(
-                    getattr(self, "max_num_sequences", None) or self.max_num_requests
-                ),
-                "max_num_tokens_hint": int(
-                    getattr(self, "max_num_tokens", None)
-                    or (int(getattr(self, "max_num_sequences", None) or self.max_num_requests))
-                ),
-            }
-            self._m3_static_buffers = placeholder
-            return placeholder
+        seq_lens_cpu = (
+            getattr(self, "seq_lens_cpu", None)
+            if hasattr(self, "seq_lens_cpu")
+            else seq_lens.detach().to("cpu")
+        )
+        if seq_lens_cpu is None:
+            seq_lens_cpu = seq_lens.detach().to("cpu")
 
-        def prepare(self) -> None:
-            super().prepare()
+        kv_cache_params = getattr(self, "kv_cache_params", None)
+        num_cached_per_seq = (
+            kv_cache_params.num_cached_tokens_per_seq
+            if kv_cache_params is not None
+            else [0] * batch_size
+        )
 
-            # Always rebuild the M3 metadata block on each prepare()
-            # call so it reflects the current scheduler step's seq_lens
-            # / request_ids / num_cached_tokens. Production
-            # ``model_engine`` invokes ``prepare()`` outside any CUDA
-            # graph capture window, so the (potentially expensive) build
-            # is safe to perform here.
-            #
-            # When CUDA graph is enabled the inner ``build_runtime_metadata_from_kv_manager``
-            # call writes into the persistent ``_m3_static_buffers`` so
-            # the captured graph keeps reading from stable ``data_ptr()``s
-            # across replays. Without this the captured ``index_select``
-            # over ``req_to_token``/``slot_ids`` reads from freed warmup
-            # memory and either produces wrong tokens or fires
-            # ``Indexing.cu:1515`` ``srcIndex < srcSelectDimSize``.
-            self.minimax_m3 = None
+        # ``attn_metadata.seq_lens`` from the PyExecutor is the
+        # per-step new-token count. The M3 sparse-attention algorithm
+        # consumes a *cumulative* kv length: ``minimax_m3_sparse_*``
+        # masks reads against ``metadata.seq_lens`` as the per-request
+        # K-side extent. Compute that cumulative kv length per request
+        # and feed it into the algorithm metadata builder.
+        kv_lens_cpu_list = [
+            int(num_cached_per_seq[b]) + int(seq_lens_cpu[b].item()) for b in range(batch_size)
+        ]
+        kv_lens_cpu = torch.tensor(kv_lens_cpu_list, dtype=torch.int32)
+        kv_lens_dev = kv_lens_cpu.to(device=cache_device, non_blocking=True)
 
-            # Production path: build the M3 metadata from the standard
-            # AttentionMetadata fields. Requires kv_cache_manager + the
-            # M3 sparse-cache contract.
-            kv_cache_manager = getattr(self, "kv_cache_manager", None)
-            if kv_cache_manager is None or not hasattr(kv_cache_manager, "get_index_k_buffer"):
-                # Not an M3 KV cache manager: nothing to build. The
-                # forward path will raise a clear error if the M3
-                # backend ends up dispatched without the M3 cache.
-                return
-            request_ids = getattr(self, "request_ids", None)
-            seq_lens = self.seq_lens
-            if request_ids is None or seq_lens is None:
-                return
-            num_contexts = int(getattr(self, "num_contexts", 0) or 0)
-            batch_size = int(seq_lens.shape[0])
-            if batch_size == 0:
-                return
+        static_buffers = self._maybe_get_m3_static_buffers(cache_device, kv_cache_manager)
 
-            # The cache device hosts every paged buffer; this is the
-            # device the forward path consumes.
-            try:
-                layer_buf = kv_cache_manager.get_buffers(0)
-                cache_device = layer_buf.device
-            except Exception:
-                cache_device = torch.device(f"cuda:{torch.cuda.current_device()}")
-
-            seq_lens_cpu = (
-                getattr(self, "seq_lens_cpu", None)
-                if hasattr(self, "seq_lens_cpu")
-                else seq_lens.detach().to("cpu")
-            )
-            if seq_lens_cpu is None:
-                seq_lens_cpu = seq_lens.detach().to("cpu")
-
-            kv_cache_params = getattr(self, "kv_cache_params", None)
-            num_cached_per_seq = (
-                kv_cache_params.num_cached_tokens_per_seq
-                if kv_cache_params is not None
-                else [0] * batch_size
-            )
-
-            # ``attn_metadata.seq_lens`` from the PyExecutor is the
-            # per-step new-token count. The M3 sparse-attention algorithm
-            # consumes a *cumulative* kv length: ``minimax_m3_sparse_*``
-            # masks reads against ``metadata.seq_lens`` as the per-request
-            # K-side extent. Compute that cumulative kv length per request
-            # and feed it into the algorithm metadata builder.
-            kv_lens_cpu_list = [
-                int(num_cached_per_seq[b]) + int(seq_lens_cpu[b].item()) for b in range(batch_size)
+        # Any batch containing a context (prefill or chunked extend)
+        # request takes the extend path. For prefill rows
+        # ``num_cached_per_seq`` is ``prefix_lens`` and the full new
+        # chunk is ``extend_seq_len``; for decode rows
+        # ``num_cached`` is ``kv_len - 1`` and ``extend_seq_len`` is
+        # 1, so the same builder produces the correct one-slot
+        # entry. Pure-decode batches (``num_contexts == 0``) still
+        # take the decode optimization for CUDA-graph warmup
+        # geometry.
+        #
+        # Mixed prefill+decode batches always take the extend path:
+        # the prefill kernel handles decode rows as 1-slot extends.
+        # The decode branch below is a pure-decode-only perf
+        # specialization. (iter-131 regression: previously a wrong
+        # predicate routed mixed batches into the decode branch and
+        # crashed in index_copy_.)
+        is_extend = num_contexts > 0
+        if is_extend:
+            prefix_lens_list = [int(num_cached_per_seq[b]) for b in range(batch_size)]
+            extend_seq_lens_cpu = [
+                kv_lens_cpu_list[b] - prefix_lens_list[b] for b in range(batch_size)
             ]
-            kv_lens_cpu = torch.tensor(kv_lens_cpu_list, dtype=torch.int32)
-            kv_lens_dev = kv_lens_cpu.to(device=cache_device, non_blocking=True)
+            prefix_lens = torch.tensor(
+                prefix_lens_list,
+                dtype=torch.int32,
+                device=cache_device,
+            )
+            m3_meta, out_cache_loc = build_runtime_metadata_from_kv_manager(
+                kv_cache_manager=kv_cache_manager,
+                request_ids=request_ids,
+                seq_lens=kv_lens_dev,
+                seq_lens_cpu=kv_lens_cpu,
+                is_prefill=True,
+                prefix_lens=prefix_lens,
+                extend_seq_lens_cpu=extend_seq_lens_cpu,
+                device=cache_device,
+                static_buffers=static_buffers,
+            )
+        else:
+            m3_meta, out_cache_loc = build_runtime_metadata_from_kv_manager(
+                kv_cache_manager=kv_cache_manager,
+                request_ids=request_ids,
+                seq_lens=kv_lens_dev,
+                seq_lens_cpu=kv_lens_cpu,
+                is_prefill=False,
+                device=cache_device,
+                static_buffers=static_buffers,
+            )
 
-            static_buffers = self._maybe_get_m3_static_buffers(cache_device, kv_cache_manager)
-
-            # Any batch containing a context (prefill or chunked extend)
-            # request takes the extend path. For prefill rows
-            # ``num_cached_per_seq`` is ``prefix_lens`` and the full new
-            # chunk is ``extend_seq_len``; for decode rows
-            # ``num_cached`` is ``kv_len - 1`` and ``extend_seq_len`` is
-            # 1, so the same builder produces the correct one-slot
-            # entry. Pure-decode batches (``num_contexts == 0``) still
-            # take the decode optimization for CUDA-graph warmup
-            # geometry.
-            #
-            # Mixed prefill+decode batches always take the extend path:
-            # the prefill kernel handles decode rows as 1-slot extends.
-            # The decode branch below is a pure-decode-only perf
-            # specialization. (iter-131 regression: previously a wrong
-            # predicate routed mixed batches into the decode branch and
-            # crashed in index_copy_.)
-            is_extend = num_contexts > 0
-            if is_extend:
-                prefix_lens_list = [int(num_cached_per_seq[b]) for b in range(batch_size)]
-                extend_seq_lens_cpu = [
-                    kv_lens_cpu_list[b] - prefix_lens_list[b] for b in range(batch_size)
-                ]
-                prefix_lens = torch.tensor(
-                    prefix_lens_list,
-                    dtype=torch.int32,
-                    device=cache_device,
-                )
-                m3_meta, out_cache_loc = build_runtime_metadata_from_kv_manager(
-                    kv_cache_manager=kv_cache_manager,
-                    request_ids=request_ids,
-                    seq_lens=kv_lens_dev,
-                    seq_lens_cpu=kv_lens_cpu,
-                    is_prefill=True,
-                    prefix_lens=prefix_lens,
-                    extend_seq_lens_cpu=extend_seq_lens_cpu,
-                    device=cache_device,
-                    static_buffers=static_buffers,
-                )
-            else:
-                m3_meta, out_cache_loc = build_runtime_metadata_from_kv_manager(
-                    kv_cache_manager=kv_cache_manager,
-                    request_ids=request_ids,
-                    seq_lens=kv_lens_dev,
-                    seq_lens_cpu=kv_lens_cpu,
-                    is_prefill=False,
-                    device=cache_device,
-                    static_buffers=static_buffers,
-                )
-
-            self.minimax_m3 = {
-                "metadata": m3_meta,
-                "out_cache_loc": out_cache_loc,
-            }
-
-    return MiniMaxM3AttentionMetadata
+        self.minimax_m3 = {
+            "metadata": m3_meta,
+            "out_cache_loc": out_cache_loc,
+        }
 
 
 __all__ = [
-    "MiniMaxM3SparseConfig",
-    "MiniMaxM3SparseAttentionMetadata",
+    "MiniMaxM3AttentionMetadata",
+    "MiniMaxM3TritonSparseAttentionMetadata",
     "allocate_minimax_m3_static_buffers",
     "build_runtime_metadata_from_kv_manager",
     "ensure_metadata_on_device",
-    "get_minimax_m3_attention_metadata_cls",
-    "replace_metadata",
 ]
