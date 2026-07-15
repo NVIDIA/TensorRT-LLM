@@ -73,6 +73,7 @@ tiktoken
 blobfile
 openai-harmony==0.0.4
 nvidia-cutlass-dsl[cu13]==4.5.0; python_version >= "3.10"
+nvidia-matmul-heuristics==0.1.0.27; python_version >= "3.10" # analytic GEMM heuristics for CuTe DSL autotuner tactic pruning
 plotly
 numexpr
 partial_json_parser

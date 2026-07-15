@@ -33,7 +33,8 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import (
     BaseResourceManager, CacheTypeCpp, DataType, KVCacheManager,
     PoolConfiguration, get_pp_layers)
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
-from tensorrt_llm._utils import nvtx_range, prefer_pinned
+from tensorrt_llm._utils import (nvtx_range, prefer_pinned,
+                                 torch_dtype_to_binding)
 from tensorrt_llm.bindings.internal.batch_manager import (
     LinearAttentionMetadata, LinearCacheType)
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
@@ -1447,6 +1448,21 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
                 kv_cache_config.max_attention_window.append(
                     LinearCacheType.RECURRENT_STATES.
                     value if mamba_layer_mask[i] else max_seq_len)
+
+        recurrent_states_window = LinearCacheType.RECURRENT_STATES.value
+        local_windows = {
+            recurrent_states_window
+            if mamba_layer_mask[layer_idx] else max_seq_len
+            for layer_idx in self.pp_layers
+        }
+        kwargs["pool_configurations"] = [
+            PoolConfiguration(
+                window_size=window_size,
+                head_dim=head_dim,
+                dtype=torch_dtype_to_binding(self.ssm_state_dtype)
+                if window_size == recurrent_states_window else dtype,
+            ) for window_size in sorted(local_windows)
+        ]
 
         # Normalize num_kv_heads to a per-layer list and zero out mamba
         # layer positions: those layers carry SSM/conv state instead of KV
