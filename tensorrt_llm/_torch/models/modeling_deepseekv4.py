@@ -527,10 +527,26 @@ class DeepseekV4WeightLoader:
         self.model_config = model.model_config
         self.is_draft_model = is_draft_model
 
-    def load_weights(self,
-                     weights: Dict,
-                     skip_modules: List[str] = [],
-                     initial_bucket_loading: bool = False):
+    def load_weights(
+        self,
+        weights: Dict,
+        skip_modules: Optional[List[str]] = None,
+        initial_bucket_loading: bool = False,
+    ):
+        """Remap and load eager or semantic-layer DeepSeek V4 weights.
+
+        Args:
+            weights: Raw checkpoint tensors or model-named tensors.
+            skip_modules: Module-name fragments to omit while loading.
+            initial_bucket_loading: Restrict traversal and synthesized defaults
+                to the single semantic layer represented by ``weights``. A
+                top-level bucket instead skips all decoder layers.
+
+        Raises:
+            ValueError: If an initial bucket mixes top-level tensors with a
+                layer or contains more than one semantic layer.
+        """
+        skip_modules = skip_modules or []
         # If the checkpoint uses raw DS-V4 keys (layers.X.attn.wkv.weight,
         # mtp.0.*, embed.weight, head.weight), rewrite them to the model's
         # named-parameter keys before iterating modules. The detection is by
@@ -539,7 +555,8 @@ class DeepseekV4WeightLoader:
         raw_checkpoint = any(
             k in ("embed.weight", "head.weight", "norm.weight")
             or k.startswith(("layers.", "mtp.", "hc_head_"))
-            for k in weights)
+            for k in weights
+        )
         active_layer = None
         if initial_bucket_loading:
             layer_indices = set()
@@ -557,7 +574,8 @@ class DeepseekV4WeightLoader:
                 raise ValueError(
                     "Initial weight bucket must contain exactly one model "
                     f"layer or top-level weights, got layers={sorted(layer_indices)}, "
-                    f"has_top_level={has_top_level}.")
+                    f"has_top_level={has_top_level}."
+                )
             active_layer = next(iter(layer_indices), None)
 
         if raw_checkpoint:
@@ -583,7 +601,8 @@ class DeepseekV4WeightLoader:
             for pname, p in model_params.items():
                 if initial_bucket_loading:
                     if active_layer is None or not pname.startswith(
-                            f"model.layers.{active_layer}."):
+                        f"model.layers.{active_layer}."
+                    ):
                         continue
                 if pname in weights:
                     continue
@@ -2621,12 +2640,9 @@ class DeepseekV4ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV4Model, Pretrai
             **kwargs,
         )
 
-    def load_weights(self,
-                     weights: Dict,
-                     initial_bucket_loading: bool = False):
+    def load_weights(self, weights: Dict, initial_bucket_loading: bool = False):
         weight_loader = DeepseekV4WeightLoader(self)
-        weight_loader.load_weights(
-            weights, initial_bucket_loading=initial_bucket_loading)
+        weight_loader.load_weights(weights, initial_bucket_loading=initial_bucket_loading)
 
     def post_load_weights(self):
         layers = self.model.layers[: self.config.num_hidden_layers]

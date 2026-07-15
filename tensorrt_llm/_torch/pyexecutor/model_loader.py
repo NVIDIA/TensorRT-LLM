@@ -561,13 +561,17 @@ class ModelLoader:
                 model_checkpoint_dir = (model.llm_checkpoint_dir if hasattr(
                     model, 'llm_checkpoint_dir') else checkpoint_dir)
                 layerwise_loading = (
-                    hasattr(checkpoint_loader, 'is_layerwise_loading_enabled')
+                    checkpoint_loader.checkpoint_format == "HF" and hasattr(
+                        checkpoint_loader, 'is_layerwise_loading_enabled')
                     and checkpoint_loader.is_layerwise_loading_enabled())
                 if layerwise_loading:
                     if loads_draft_weights:
                         raise RuntimeError(
                             "HF layer-wise loading does not yet support a "
                             "separate speculative draft checkpoint.")
+                    # Validate the model contract before constructing the
+                    # generator: advancing it would open files and may start
+                    # mutating the model with the first bucket.
                     load_parameters = inspect.signature(
                         model.load_weights).parameters
                     if "initial_bucket_loading" not in load_parameters:
@@ -582,11 +586,10 @@ class ModelLoader:
                     )
                     for weight_bucket in checkpoint_loader.iter_layer_weight_buckets(
                             model_checkpoint_dir, **load_weights_kwargs):
-                        self._call_load_weights(
-                            model.load_weights,
-                            weight_bucket,
-                            self.weight_mapper,
-                            initial_bucket_loading=True)
+                        self._call_load_weights(model.load_weights,
+                                                weight_bucket,
+                                                self.weight_mapper,
+                                                initial_bucket_loading=True)
                         # copy_(..., non_blocking=True) and backend transforms
                         # may still consume mmap-backed source storage.
                         torch.cuda.synchronize()
@@ -1331,7 +1334,20 @@ class ModelLoader:
                            weight_mapper,
                            allow_partial_loading: bool = False,
                            initial_bucket_loading: bool = False):
-        """Calls the model's weight loading method with the correct arguments."""
+        """Call a model weight loader with only the options it declares.
+
+        Args:
+            load_method: Bound model method that consumes checkpoint weights.
+            weights: Weight dictionary passed to ``load_method``.
+            weight_mapper: Initialized checkpoint-to-model name mapper.
+            allow_partial_loading: Whether a reload may omit model weights.
+            initial_bucket_loading: Whether ``weights`` is one bucket from the
+                initial semantic-layer checkpoint load.
+
+        Raises:
+            AssertionError: If a requested option is unsupported by the model
+                method.
+        """
         args = inspect.signature(load_method).parameters
         kargs = {}
         if "weight_mapper" in args:

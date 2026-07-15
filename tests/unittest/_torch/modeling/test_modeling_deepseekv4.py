@@ -5,6 +5,7 @@ import struct
 import textwrap
 import weakref
 from copy import deepcopy
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -31,6 +32,7 @@ from tensorrt_llm._torch.models.modeling_deepseekv4 import (
     DeepseekV4ForCausalLM,
     DeepseekV4Gate,
     DeepseekV4MTP,
+    DeepseekV4WeightLoader,
     _copy_deepseek_v4_fused_a_weight_scale,
     _deepseek_v4_pos_embd_params,
     _remap_deepseek_v4_checkpoint_keys,
@@ -189,19 +191,53 @@ def test_deepseek_v4_weight_remap_for_fp8_routed_experts():
 
 def test_deepseek_v4_weight_remap_for_mtp_mxfp4_routed_experts():
     weights = {
-        "mtp.0.ffn.experts.0.w1.weight": torch.tensor(
-            [[-1, 2], [3, -4]], dtype=torch.int8),
-        "mtp.0.ffn.experts.0.w1.scale": torch.tensor([1, 2],
-                                                       dtype=torch.int8),
+        "mtp.0.ffn.experts.0.w1.weight": torch.tensor([[-1, 2], [3, -4]], dtype=torch.int8),
+        "mtp.0.ffn.experts.0.w1.scale": torch.tensor([1, 2], dtype=torch.int8),
     }
 
-    remapped = _remap_deepseek_v4_checkpoint_keys(
-        weights, num_hidden_layers=61, kv_lora_rank=448)
+    remapped = _remap_deepseek_v4_checkpoint_keys(weights, num_hidden_layers=61, kv_lora_rank=448)
 
-    assert remapped[
-        "model.layers.61.mlp.experts.0.w1.weight"].dtype == torch.uint8
-    assert remapped[
-        "model.layers.61.mlp.experts.0.w1.weight_scale"].dtype == torch.uint8
+    assert remapped["model.layers.61.mlp.experts.0.w1.weight"].dtype == torch.uint8
+    assert remapped["model.layers.61.mlp.experts.0.w1.weight_scale"].dtype == torch.uint8
+
+
+def test_deepseek_v4_weight_remap_supports_multiple_mtp_layers():
+    weights = {
+        "mtp.0.enorm.weight": torch.tensor([1.0]),
+        "mtp.1.enorm.weight": torch.tensor([2.0]),
+        "mtp.1.head.weight": torch.tensor([3.0]),
+    }
+
+    remapped = _remap_deepseek_v4_checkpoint_keys(weights, num_hidden_layers=61, kv_lora_rank=448)
+
+    assert torch.equal(remapped["model.layers.61.enorm.weight"], weights["mtp.0.enorm.weight"])
+    assert torch.equal(remapped["model.layers.62.enorm.weight"], weights["mtp.1.enorm.weight"])
+    assert all(not key.endswith("head.weight") for key in remapped)
+
+
+@pytest.mark.parametrize(
+    "weights",
+    [
+        {
+            "layers.0.attn.weight": torch.tensor([1.0]),
+            "layers.1.attn.weight": torch.tensor([2.0]),
+        },
+        {
+            "embed.weight": torch.tensor([1.0]),
+            "layers.0.attn.weight": torch.tensor([2.0]),
+        },
+        {
+            "mtp.0.enorm.weight": torch.tensor([1.0]),
+            "mtp.1.enorm.weight": torch.tensor([2.0]),
+        },
+    ],
+)
+def test_deepseek_v4_layerwise_loading_rejects_non_atomic_bucket(weights):
+    loader = DeepseekV4WeightLoader.__new__(DeepseekV4WeightLoader)
+    loader.config = SimpleNamespace(num_hidden_layers=61)
+
+    with pytest.raises(ValueError, match="exactly one model layer or top-level weights"):
+        loader.load_weights(weights, initial_bucket_loading=True)
 
 
 def test_deepseek_v4_fused_a_weight_scale_rebuilds_fp8_shape():

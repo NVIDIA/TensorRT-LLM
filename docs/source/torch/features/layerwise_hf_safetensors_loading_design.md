@@ -230,53 +230,31 @@ model startup alone is not sufficient proof of numerical equivalence.
   key discovery and support for `model.layers.<n>` names.
 - `test_layerwise_safetensors_rejects_missing_index_shard`: verifies that all
   index-referenced shards are validated before the first bucket is yielded.
+- Parameterized environment tests cover the disabled default and all accepted
+  true spellings.
+- Numeric-order, empty-index, duplicate-key, consolidated-selection, tensor
+  value, and handle-lifetime tests cover metadata and resource boundaries.
+
+`tests/unittest/_torch/executor/test_model_loader_layerwise.py` contains fake
+model and checkpoint-loader orchestration tests. They verify mapper ordering,
+one call and one CUDA barrier per successful bucket, keyword-only capability
+detection, `llm_checkpoint_dir`, iterator cleanup after consumer failure, and
+early rejection of unsupported models and separate draft checkpoints.
 
 `tests/unittest/_torch/modeling/test_modeling_deepseekv4.py` contains:
 
 - `test_deepseek_v4_weight_remap_for_mtp_mxfp4_routed_experts`: verifies MTP
   routed-expert scale-layout detection and remapped dtypes.
+- Multi-MTP remapping and malformed semantic-bucket rejection tests.
 
 These tests are CPU-only in intent. Full test-file collection still requires a
 Linux TensorRT-LLM development environment because module imports depend on the
 TensorRT-LLM runtime stack.
 
-### Required tests before upstreaming
-
-#### HF bucket iterator
-
-- Environment parsing: false by default and all documented true spellings.
-- Natural numeric order: layer 2 precedes layer 10 regardless of index order.
-- Empty index rejection.
-- Duplicate-key rejection for no-index multi-file checkpoints.
-- Consolidated selection does not accidentally consume an ordinary sharded
-  index or non-consolidated files.
-- Non-safetensors input fails with the documented error.
-- Handle lifetime: handles remain open during bucket consumption and close when
-  advancing, on normal completion, and on consumer exception.
-- Tensor contents exactly match the source files for cross-shard buckets.
-
-#### ModelLoader orchestration
-
-Use fake checkpoint loaders and a small fake model to avoid GPU/model weights:
-
-- Mapper initialization occurs once and before the first bucket load.
-- One model load call occurs per bucket in iterator order.
-- `initial_bucket_loading=True` is passed only on the layer-wise path.
-- CUDA synchronization occurs once after every successful bucket load and
-  before the iterator advances.
-- An unsupported model fails before the iterator is consumed or model state is
-  changed.
-- A separate draft checkpoint fails before bucket consumption.
-- `llm_checkpoint_dir` is honored.
-- Consumer exceptions close current handles and prevent later buckets and
-  global post-load publication.
-- The ordinary eager, preloaded, MX, GMS, and draft-loading paths retain their
-  existing call ordering when the environment variable is unset.
+### Remaining tests before upstreaming
 
 #### DeepSeek V4 bucket scoping
 
-- Reject a bucket containing two base layers.
-- Reject a bucket mixing top-level and layer weights.
 - A top bucket never visits layer modules.
 - A base-layer bucket visits only its matching runtime layer.
 - Synthesized indexer defaults are limited to the active layer.
@@ -317,9 +295,10 @@ As of 2026-07-14:
 - The observed node cgroup peak was approximately 874-878 GiB on a 952 GiB
   node. After load, anonymous memory dropped substantially; most remaining
   cgroup memory was reclaimable checkpoint page cache.
-- The focused pytest cases have not yet run in a complete development image;
-  login and benchmark images used during bring-up did not include pytest and
-  compute nodes could not fetch it from PyPI.
+- In the branch-matched development image on a Slurm GPU node, the complete
+  DeepSeek V4 modeling file passed (41 tests). The complete HF weight-loader,
+  layer-wise ModelLoader, and existing MX/GMS ModelLoader files passed together
+  (62 tests).
 
 ## Known limitations and review focus
 

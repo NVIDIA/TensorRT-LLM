@@ -1,14 +1,14 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-from typing import Optional
+from typing import Any, Iterator, Optional
 
 from tensorrt_llm._torch.models.checkpoints.base_checkpoint_loader import \
     BaseCheckpointLoader
 from tensorrt_llm._torch.models.checkpoints.base_config_loader import \
     BaseConfigLoader
-from tensorrt_llm._torch.models.checkpoints.base_weight_loader import \
-    BaseWeightLoader
+from tensorrt_llm._torch.models.checkpoints.base_weight_loader import (
+    BaseWeightLoader, ConsumableWeightsDict)
 from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import \
     BaseWeightMapper
 from tensorrt_llm._torch.models.checkpoints.hf.config_loader import \
@@ -78,10 +78,22 @@ class HfCheckpointLoader(BaseCheckpointLoader):
         return self._checkpoint_format
 
     def is_layerwise_loading_enabled(self) -> bool:
-        return (hasattr(self._weight_loader,
-                        "is_layerwise_safetensors_enabled")
+        """Return whether opt-in HF safetensors layer-wise loading is enabled."""
+        return (hasattr(self._weight_loader, "is_layerwise_safetensors_enabled")
                 and self._weight_loader.is_layerwise_safetensors_enabled())
 
-    def iter_layer_weight_buckets(self, checkpoint_dir: str, **kwargs):
+    def iter_layer_weight_buckets(
+            self, checkpoint_dir: str,
+            **kwargs: Any) -> Iterator[ConsumableWeightsDict]:
+        """Yield semantic-layer weight buckets from the underlying HF loader.
+
+        Args:
+            checkpoint_dir: Directory containing Hugging Face checkpoint files.
+            **kwargs: Arguments forwarded to the concrete weight loader.
+
+        Yields:
+            A consumable dictionary containing top-level tensors or tensors
+            for exactly one base/MTP checkpoint layer.
+        """
         return self._weight_loader.iter_layer_weight_buckets(
             checkpoint_dir, **kwargs)

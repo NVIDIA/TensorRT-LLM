@@ -18,9 +18,9 @@ import multiprocessing
 import os
 import re
 import threading
-from contextlib import ExitStack
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack
 from typing import Any, Iterator, List, Tuple
 
 import psutil
@@ -60,6 +60,7 @@ class HfWeightLoader(BaseWeightLoader):
 
     @staticmethod
     def is_layerwise_safetensors_enabled() -> bool:
+        """Return whether semantic-layer safetensors loading is enabled."""
         return os.environ.get(_LAYERWISE_SAFETENSORS_ENV,
                               "0").lower() in ("1", "true", "yes", "on")
 
@@ -74,18 +75,35 @@ class HfWeightLoader(BaseWeightLoader):
             return ("mtp", int(match.group(1)))
         return ("top", 0)
 
-    def iter_layer_weight_buckets(
-            self,
-            checkpoint_dir: str,
-            mapping: Mapping,
-            use_consolidated: bool = False,
-            **kwargs) -> Iterator[ConsumableWeightsDict]:
+    def iter_layer_weight_buckets(self,
+                                  checkpoint_dir: str,
+                                  mapping: Mapping,
+                                  use_consolidated: bool = False,
+                                  **kwargs) -> Iterator[ConsumableWeightsDict]:
         """Yield real CPU tensors one semantic layer at a time.
 
         The safetensors index is used only as metadata. Tensor storage remains
         mmap-backed and the file handles for a bucket stay alive until the
         caller advances the iterator. This keeps cross-shard, same-layer
         fusions atomic without materializing the complete checkpoint.
+
+        Args:
+            checkpoint_dir: Directory containing safetensors files and an
+                optional Hugging Face safetensors index.
+            mapping: Distributed mapping accepted for parity with eager
+                checkpoint loading. Bucketing itself is rank-independent.
+            use_consolidated: Select consolidated files instead of ordinary
+                Hugging Face shards.
+            **kwargs: Extra eager-loader arguments that do not affect bucket
+                planning.
+
+        Yields:
+            A consumable dictionary for all top-level tensors or one numeric
+            base/MTP layer. File handles remain open until the next iteration.
+
+        Raises:
+            RuntimeError: If the selected safetensors files are missing or
+                their index/key metadata is incomplete or ambiguous.
         """
         del mapping, kwargs
         weight_files = glob.glob(f"{checkpoint_dir}/*.safetensors")
