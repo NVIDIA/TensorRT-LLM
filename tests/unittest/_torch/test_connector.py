@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -250,3 +250,52 @@ def test_scheduler_output_block_hashes_read_through():
     assert kv_cache_manager.commit_and_get_block_hashes.call_count == 2
     for call in kv_cache_manager.commit_and_get_block_hashes.call_args_list:
         assert call.args == (req, )
+
+
+def test_scheduler_output_on_rewind_trims_stale_block_ids():
+    """on_rewind must trim block_ids/tokens after speculative-decoding rewind.
+
+    Regression test for the hang caused by stale freed block ids retained
+    in KvCacheConnectorSchedulerOutputRequest after rewindKVCache frees
+    blocks crossing a block boundary.
+    """
+    req = MagicMock()
+    req.request_id = 42
+
+    kv_cache_manager = MagicMock()
+    # Simulate 3 blocks allocated, then rewind frees the last block.
+    kv_cache_manager.get_cache_indices.side_effect = [
+        [0, 1, 2],  # before rewind
+        [0, 1],  # after rewind: last block freed
+        [0, 1, 3],  # after next alloc (new block id 3)
+    ]
+
+    # Tokens: 3 blocks * block_size, then rewind removes last block's tokens,
+    # then a new token is appended.
+    req.get_tokens.side_effect = [
+        [10, 11, 12],  # before rewind
+        [10, 11],  # after rewind (shorter)
+        [10, 11, 13],  # after next step (accepted token added)
+    ]
+
+    manager = KvCacheConnectorSchedulerOutputManager()
+
+    # Build initial state: 3 blocks, 3 tokens.
+    scheduled_batch = ScheduledRequests()
+    scheduled_batch.generation_requests = [req]
+    manager.build_scheduler_output(scheduled_batch, AsyncRequests({}, {}),
+                                   kv_cache_manager)
+    assert manager.requests[req.request_id].block_ids == [0, 1, 2]
+    assert manager.requests[req.request_id].tokens == [10, 11, 12]
+
+    # Rewind: frees block 2, tokens shrink.
+    manager.on_rewind(req, kv_cache_manager)
+    assert manager.requests[req.request_id].block_ids == [0, 1]
+    assert manager.requests[req.request_id].tokens == [10, 11]
+
+    # Next step: new block 3 allocated, new token 13 appended.
+    manager.build_scheduler_output(scheduled_batch, AsyncRequests({}, {}),
+                                   kv_cache_manager)
+    assert manager.requests[req.request_id].block_ids == [0, 1, 3]
+    # Token 13 is a new token, not a re-emit of the trimmed ones.
+    assert manager.requests[req.request_id].tokens == [10, 11, 13]
