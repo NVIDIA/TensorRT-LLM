@@ -16,7 +16,10 @@
 
 import asyncio
 import queue as _queue
+import time as _time
+from concurrent.futures import Future as _Future
 from unittest.mock import Mock
+from unittest.mock import Mock as _Mock
 
 import pytest
 
@@ -338,3 +341,86 @@ def test_proxy_check_remote_worker_death_marks_engine_dead():
     proxy2 = _bare_proxy()
     proxy2.mpi_session = object()
     assert proxy2._check_remote_worker_death() is False
+
+
+# --- Non-blocking teardown on a dead engine ---
+# A worker world torn down abruptly (MPI_Abort by the HangDetector, SIGKILL,
+# the OOM killer) never completes its mpi4py futures and never sends the
+# result-queue shutdown sentinel. Without bounds, shutdown() blocks forever on
+# f.result(), the dispatcher join, and the dead pool join -- so detection
+# (PR #16338 / #15816) alone only moves the client hang from generate() into
+# teardown. These tests pin the bounded-teardown behavior.
+
+
+def _teardown_proxy(engine_dead):
+    proxy = _bare_proxy()
+    proxy.workers_started = True
+    proxy.doing_shutdown = True  # skip pre_shutdown(); teardown path only
+    proxy._engine_dead = engine_dead
+    proxy._fatal_error = RuntimeError("worker died") if engine_dead else None
+    proxy.dispatch_result_thread = None
+    proxy.rpc_client = None
+    proxy.request_queue = _Mock()
+    proxy.worker_init_status_queue = _Mock()
+    proxy.result_queue = _Mock()
+    proxy._resource_governor_queue = None
+    proxy._owns_mpi_session = True
+    proxy.mpi_session = _Mock()
+    proxy._handle_background_error = lambda *a, **k: None
+    return proxy
+
+
+def test_shutdown_does_not_block_on_dead_engine():
+    """With the engine dead, never-completing futures must not hang teardown."""
+    proxy = _teardown_proxy(engine_dead=True)
+    pending = _Future()  # never completes -- the MPI_Abort premise
+    done = _Future()
+    done.set_exception(RuntimeError("captured by mpi_done_callback already"))
+    proxy.mpi_futures = [pending, done]
+
+    dispatcher = _Mock()
+    dispatcher.is_alive.return_value = True
+    proxy.dispatch_result_thread = dispatcher
+
+    start = _time.monotonic()
+    proxy.shutdown()
+    elapsed = _time.monotonic() - start
+
+    # One collective 5 s grace, not an unbounded f.result() per future.
+    assert elapsed < 30
+    assert not pending.done()
+    # The dispatcher join is bounded (daemon thread is leaked, not awaited).
+    dispatcher.stop.assert_called_once()
+    dispatcher.join.assert_called_once_with(timeout=5.0)
+    # The dead pool is not joined.
+    proxy.mpi_session.shutdown.assert_called_once_with(wait=False)
+    assert proxy.workers_started is False
+
+
+def test_shutdown_keeps_blocking_semantics_when_engine_alive():
+    """Orderly shutdown is unchanged: futures reaped, session joined."""
+    proxy = _teardown_proxy(engine_dead=False)
+    done = _Future()
+    done.set_result(None)
+    proxy.mpi_futures = [done]
+
+    dispatcher = _Mock()
+    dispatcher.is_alive.return_value = True
+    proxy.dispatch_result_thread = dispatcher
+
+    proxy.shutdown()
+
+    dispatcher.join.assert_called_once_with(timeout=None)
+    proxy.mpi_session.shutdown.assert_called_once_with(wait=True)
+    assert proxy.workers_started is False
+
+
+def test_shutdown_does_not_shut_down_external_session():
+    """An externally owned session must stay alive even on a dead engine."""
+    proxy = _teardown_proxy(engine_dead=True)
+    proxy._owns_mpi_session = False
+    proxy.mpi_futures = []
+
+    proxy.shutdown()
+
+    proxy.mpi_session.shutdown.assert_not_called()
