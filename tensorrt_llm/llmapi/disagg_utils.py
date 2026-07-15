@@ -106,6 +106,13 @@ class DisaggServerConfig():
     # the orchestrator relays a string instead of materializing the token-id list
     # on its event loop. Text-only, non-harmony deployments (see _get_ctx_request).
     gen_tokids_ctxbytes: bool = False
+    # HTTP keep-alive timeout (in seconds) for the disaggregated server's
+    # client-facing uvicorn listener. Idle client connections are closed after
+    # this many seconds; a client that later reuses such a dropped pooled
+    # connection sees "Connection reset by peer". Raise it (e.g. 3600) for
+    # high-concurrency or long-prefill (agentic) workloads where clients keep
+    # large idle connection pools. Default 10 preserves the historical behavior.
+    server_keep_alive_timeout: int = 10
 
 
 @dataclass
@@ -192,6 +199,7 @@ def extract_disagg_cfg(hostname: str = 'localhost',
                        allow_request_chat_template: bool = False,
                        gen_strip_message_history: bool = False,
                        gen_tokids_ctxbytes: bool = False,
+                       server_keep_alive_timeout: int = 10,
                        **kwargs: Any) -> DisaggServerConfig:
     context_servers = context_servers or {}
     generation_servers = generation_servers or {}
@@ -243,6 +251,7 @@ def extract_disagg_cfg(hostname: str = 'localhost',
         allow_request_chat_template, "allow_request_chat_template")
     config.gen_strip_message_history = gen_strip_message_history
     config.gen_tokids_ctxbytes = gen_tokids_ctxbytes
+    config.server_keep_alive_timeout = server_keep_alive_timeout
     return config
 
 

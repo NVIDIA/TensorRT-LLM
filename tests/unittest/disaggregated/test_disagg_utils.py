@@ -115,6 +115,24 @@ def test_extract_disagg_cfg(sample_yaml_config):
     verify_disagg_config(config, sample_yaml_config)
 
 
+def test_server_keep_alive_timeout(tmp_path):
+    # Defaults to 10s when the key is absent (preserves historical behavior).
+    assert extract_disagg_cfg(
+        **get_yaml_config()).server_keep_alive_timeout == 10
+
+    # A top-level override is threaded onto the config...
+    cfg = get_yaml_config()
+    cfg["server_keep_alive_timeout"] = 3600
+    assert extract_disagg_cfg(**cfg).server_keep_alive_timeout == 3600
+
+    # ...and survives a round-trip through the YAML file parser.
+    yaml_file = tmp_path / "keep_alive_config.yaml"
+    with open(yaml_file, "w") as f:
+        yaml.dump(cfg, f)
+    assert parse_disagg_config_file(
+        yaml_file).server_keep_alive_timeout == 3600
+
+
 def test_extract_ctx_gen_cfgs():
     configs = extract_ctx_gen_cfgs(
         type="ctx",

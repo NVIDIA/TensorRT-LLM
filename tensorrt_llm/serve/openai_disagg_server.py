@@ -54,7 +54,6 @@ from tensorrt_llm.serve.router import Router, create_router
 from tensorrt_llm.version import __version__ as VERSION
 
 # yapf: enale
-TIMEOUT_KEEP_ALIVE = 10  # seconds.
 
 class RawRequestResponseHooks(ResponseHooks):
     def __init__(self, raw_req: Request, perf_metrics_collector: DisaggPerfMetricsCollector):
@@ -231,11 +230,12 @@ class OpenAIDisaggServer:
         return JSONResponse(content={"version": VERSION})
 
     async def __call__(self, host: str, port: int, sockets: list[socket.socket] | None = None):
+        keep_alive_timeout = self._config.server_keep_alive_timeout
         config = uvicorn.Config(self.app,
                                 host=host,
                                 port=port,
                                 log_level=logger.level,
-                                timeout_keep_alive=TIMEOUT_KEEP_ALIVE)
+                                timeout_keep_alive=keep_alive_timeout)
         await uvicorn.Server(config).serve(sockets=sockets)
 
     async def _sync_server_clock(self, server: str):
