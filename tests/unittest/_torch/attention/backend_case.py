@@ -26,14 +26,12 @@ import tensorrt_llm
 from tensorrt_llm._torch.attention_backend.interface import (
     AttentionForwardArgs,
     AttentionInputType,
-    MLAParams,
     PositionalEmbeddingParams,
     PredefinedAttentionMask,
     RopeParams,
 )
 from tensorrt_llm._torch.attention_backend.sparse import get_sparse_attn_kv_cache_manager
 from tensorrt_llm._torch.attention_backend.utils import create_attention, get_attention_backend
-from tensorrt_llm._torch.attention_backend.vanilla import VanillaAttention
 from tensorrt_llm._torch.flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
@@ -56,6 +54,11 @@ BF16_RTOL = 3e-3
 # differ from the fp16 golden by ~0.1-0.4. Matches test_attention_mla.py (fp8=4e-1).
 FP8_ATOL = 4e-1
 FP4_ATOL = 6e-1
+# Selected-sparse-MLA golden-vs-backend tolerance. Looser than dense bf16: the
+# selected-attention path accumulates over gathered latent rows in bf16, so the
+# TRTLLM kernel and the Vanilla golden diverge more than dense attention does.
+SPARSE_ATOL = 1e-1
+SPARSE_RTOL = 1e-2
 
 # Backends compared against the VanillaAttention golden. FlashInfer is only
 # included when available, so callers can iterate this list unconditionally.
@@ -141,7 +144,9 @@ class BackendCase:
     qk_nope_head_dim: Optional[int] = None
     qk_rope_head_dim: Optional[int] = None
     use_kv_cache_manager_v2: bool = False
-    hf_config_overrides: Optional[dict] = None
+    # Low-level (atol, rtol) override for a single case, e.g. a captured/replayed
+    # case. Left unset by the model sweep, which derives tolerances by dtype (and
+    # a sparse default) in ``_tolerances``.
     atol: Optional[float] = None
     rtol: Optional[float] = None
 
@@ -282,7 +287,6 @@ def _sparse_pretrained_config(case: BackendCase) -> SimpleNamespace:
         qk_rope_head_dim=case.qk_rope_head_dim,
         v_head_dim=case.v_head_dim,
     )
-    values.update(case.hf_config_overrides or {})
     return SimpleNamespace(**values)
 
 
@@ -806,11 +810,7 @@ def _run_sparse_mla_backend(
     sparse_metadata_params = sparse_config.to_sparse_metadata_params(
         pretrained_config=pretrained_config
     )
-    AttentionCls = (
-        VanillaAttention
-        if backend == "VANILLA"
-        else get_attention_backend(backend, sparse_params=sparse_params)
-    )
+    AttentionCls = get_attention_backend(backend, sparse_params=sparse_params)
     request_ids = list(range(case.num_seqs))
     d_latent = case.kv_lora_rank + case.qk_rope_head_dim
     pos_embd_params = _mla_context_pos_embd_params(case)
@@ -820,55 +820,35 @@ def _run_sparse_mla_backend(
         sparse_attention_config=sparse_config,
         pretrained_config=pretrained_config,
     )
-    if backend == "VANILLA":
-        attn = VanillaAttention(
-            layer_idx=0,
-            num_heads=case.num_heads,
-            head_dim=d_latent,
-            num_kv_heads=1,
-            q_scaling=case.q_scaling,
-            pos_embd_params=pos_embd_params,
-            sparse_params=sparse_params,
-            mla_params=MLAParams(
-                q_lora_rank=case.q_lora_rank,
-                kv_lora_rank=case.kv_lora_rank,
-                qk_rope_head_dim=case.qk_rope_head_dim,
-                qk_nope_head_dim=case.qk_nope_head_dim,
-                # Selected sparse MLA returns latent values; the model's V
-                # projection lives outside the standalone backend.
-                v_head_dim=case.kv_lora_rank,
-                predicted_tokens_per_seq=case.sparse_generation_tokens_per_seq,
-                hidden_size=case.hidden_size,
-            ),
-            dtype=case.compute_dtype,
-            skip_create_weights_in_init=True,
-        )
-    else:
-        attn = create_attention(
-            backend,
-            layer_idx=0,
-            num_heads=case.num_heads,
-            head_dim=d_latent,
-            num_kv_heads=1,
-            q_scaling=case.q_scaling,
-            pos_embd_params=pos_embd_params,
-            is_mla_enable=True,
-            q_lora_rank=case.q_lora_rank,
-            kv_lora_rank=case.kv_lora_rank,
-            qk_nope_head_dim=case.qk_nope_head_dim,
-            qk_rope_head_dim=case.qk_rope_head_dim,
-            v_head_dim=case.kv_lora_rank,
-            hidden_size=case.hidden_size,
-            predicted_tokens_per_seq=case.sparse_generation_tokens_per_seq,
-            sparse_params=sparse_params,
-            dtype=case.compute_dtype,
-            skip_create_weights_in_init=True,
-        )
-    if backend == "TRTLLM":
-        # Weight creation is intentionally skipped because the harness injects
-        # selections instead of running the indexer. Quant/FMHA state is still
-        # required by the backend forward path.
-        attn.update_quant_config(None)
+    # Every backend (Vanilla included) is built through the production factory so
+    # the harness does not special-case backend construction.
+    attn = create_attention(
+        backend,
+        layer_idx=0,
+        num_heads=case.num_heads,
+        head_dim=d_latent,
+        num_kv_heads=1,
+        q_scaling=case.q_scaling,
+        pos_embd_params=pos_embd_params,
+        is_mla_enable=True,
+        q_lora_rank=case.q_lora_rank,
+        kv_lora_rank=case.kv_lora_rank,
+        qk_nope_head_dim=case.qk_nope_head_dim,
+        qk_rope_head_dim=case.qk_rope_head_dim,
+        # Selected sparse MLA returns latent values; the model's V projection
+        # lives outside the standalone backend, so v_head_dim is the latent width.
+        v_head_dim=case.kv_lora_rank,
+        hidden_size=case.hidden_size,
+        predicted_tokens_per_seq=case.sparse_generation_tokens_per_seq,
+        sparse_params=sparse_params,
+        dtype=case.compute_dtype,
+        skip_create_weights_in_init=True,
+    )
+    # Weight creation is skipped (the harness injects selections instead of
+    # running the indexer); update_quant_config still initializes the quant/FMHA
+    # state the fused backends need before forward, and is a safe no-op for
+    # Vanilla (the base implementation only stores quant_config).
+    attn.update_quant_config(None)
     mgr = _build_mla_kv_cache_manager(
         case,
         backend,
@@ -1286,6 +1266,9 @@ def _tolerances(case: "BackendCase", kv_dtype) -> tuple:
             raise ValueError("BackendCase.atol and rtol must be set together")
         return case.atol, case.rtol
 
+    if case.is_sparse:
+        return SPARSE_ATOL, SPARSE_RTOL
+
     bf16 = case.compute_dtype == torch.bfloat16
     if kv_dtype == torch.float8_e4m3fn:
         return (FP8_ATOL + BF16_ATOL, BF16_RTOL) if bf16 else (FP8_ATOL, RTOL)
@@ -1650,7 +1633,11 @@ def run_case(case: BackendCase, *, seed: int = 0) -> Dict[str, torch.Tensor]:
 
         # A gen-only batch also exercises the captured-CUDA-graph path
         # (production replays a captured decode graph); it must still match the
-        # eager golden.
+        # eager golden. Sparse cases are excluded: the standalone sparse runner
+        # is an eager correctness oracle that validates injected selections on the
+        # host and rebuilds each request's logical cache with Python loops, none
+        # of which is graph-capturable. Graph coverage of the DSA decode kernel is
+        # exercised at the model level, not by this backend-only oracle.
         if case.is_gen_only and not case.is_sparse:
             cg_out = run_backend(
                 case,

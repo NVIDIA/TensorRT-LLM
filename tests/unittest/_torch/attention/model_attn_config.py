@@ -55,29 +55,9 @@ elsewhere):
 """
 
 from dataclasses import dataclass
-from typing import List, Literal, Optional, Tuple
+from typing import List, Optional
 
 from tensorrt_llm.llmapi.llm_args import BaseSparseAttentionConfig, DeepSeekSparseAttentionConfig
-
-
-@dataclass(frozen=True)
-class SparseHarnessConfig:
-    """Backend-neutral semantics and dimensions for a sparse test case.
-
-    Algorithms that produce the same selection representation reuse one
-    generator/runner. A new representation extends this common harness once,
-    rather than adding per-backend tests.
-    """
-
-    attention_family: Literal["standard", "mla"]
-    selection_unit: Literal["none", "token", "block"]
-    topk: int
-    page_size: int = 64
-    kv_layout: Literal["NHD", "HND"] = "HND"
-    use_kv_cache_manager_v2: bool = False
-    compute_dtypes: Tuple[str, ...] = ("bfloat16",)
-    selection_patterns: Tuple[str, ...] = ("random", "singleton")
-    generation_tokens_per_seq: int = 2
 
 
 @dataclass(frozen=True)
@@ -104,11 +84,11 @@ class ModelAttnConfig:
     qk_rope_head_dim: Optional[int] = None
     v_head_dim: Optional[int] = None
     hidden_size: Optional[int] = None
+    # User-facing sparse config, lowered by production `to_sparse_params` etc.
+    # Everything the sparse test sweep needs (attention family, selection unit,
+    # top-k, tolerances) is derived from this + the fields above, so no separate
+    # harness/override/tolerance knobs live on the model config.
     sparse_attention_config: Optional[BaseSparseAttentionConfig] = None
-    sparse_harness_config: Optional[SparseHarnessConfig] = None
-    hf_config_overrides: Optional[dict] = None
-    atol: Optional[float] = None
-    rtol: Optional[float] = None
 
 
 # ---------------------------------------------------------------------------
@@ -623,13 +603,6 @@ _MLA = [
             index_topk=128,
             skip_indexer_for_short_seqs=False,
         ),
-        sparse_harness_config=SparseHarnessConfig(
-            attention_family="mla",
-            selection_unit="token",
-            topk=128,
-        ),
-        atol=0.1,
-        rtol=0.01,
     ),
     # DeepSeek-V3: 128 Q heads, qk_nope=128, qk_rope=64, kv_lora=512, v=128.
     ModelAttnConfig(
