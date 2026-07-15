@@ -3087,6 +3087,10 @@ class PyTorchModelEngine(ModelEngine):
             else:
                 prompt_lengths[idx] = request.py_prompt_len
 
+            # Physical KV length for the kernels: subtract the tokens a
+            # KV-cache compression manager evicted (tracked on the request,
+            # 0 without compression). Position ids and the cached_tokens stat
+            # keep the logical count.
             if request.is_dummy:
                 num_cached_tokens_per_seq[idx] = base_past_seen
                 request.cached_tokens = base_past_seen
@@ -3097,9 +3101,11 @@ class PyTorchModelEngine(ModelEngine):
                     num_previous_batch] = request.py_batch_idx
                 num_previous_batch += 1
 
-                num_cached_tokens_per_seq[
-                    idx] = base_past_seen + num_tokens_per_extend_request
-                request.cached_tokens = num_cached_tokens_per_seq[idx].item()
+                request.cached_tokens = (base_past_seen +
+                                         num_tokens_per_extend_request)
+                num_cached_tokens_per_seq[idx] = (
+                    base_past_seen + num_tokens_per_extend_request -
+                    request.py_num_compressed_tokens)
 
             request.py_batch_idx = request.py_seq_slot
 
@@ -3341,8 +3347,9 @@ class PyTorchModelEngine(ModelEngine):
                 py_request_id] = request.py_num_accepted_draft_tokens_indices
             prompt_lengths.append(len(prompt_tokens))
             past_seen_token_num = begin_compute
-            num_cached_tokens_per_seq.append(past_seen_token_num)
-            request.cached_tokens = num_cached_tokens_per_seq[-1]
+            num_cached_tokens_per_seq.append(past_seen_token_num -
+                                             request.py_num_compressed_tokens)
+            request.cached_tokens = past_seen_token_num
             append_cross_attention_state(
                 request,
                 project_encoder_output=not request.py_skip_cross_kv_projection
@@ -3527,8 +3534,9 @@ class PyTorchModelEngine(ModelEngine):
                     list(
                         range(past_seen_token_num,
                               past_seen_token_num + 1 + num_draft_tokens)))
-                num_cached_tokens_per_seq.append(past_seen_token_num)
-                request.cached_tokens = num_cached_tokens_per_seq[-1]
+                num_cached_tokens_per_seq.append(
+                    past_seen_token_num - request.py_num_compressed_tokens)
+                request.cached_tokens = past_seen_token_num
                 # update batch index
                 request.py_batch_idx = request.py_seq_slot
             else:
@@ -3555,9 +3563,11 @@ class PyTorchModelEngine(ModelEngine):
                 previous_pos_indices.extend([previous_batch_idx] *
                                             runtime_tokens_per_gen_step)
 
-                num_cached_tokens_per_seq.append(past_seen_token_num +
-                                                 runtime_tokens_per_gen_step)
-                request.cached_tokens = num_cached_tokens_per_seq[-1]
+                num_cached_tokens_per_seq.append(
+                    past_seen_token_num + runtime_tokens_per_gen_step -
+                    request.py_num_compressed_tokens)
+                request.cached_tokens = (past_seen_token_num +
+                                         runtime_tokens_per_gen_step)
                 if self.enable_spec_decode and spec_config.spec_dec_mode.extend_ctx(
                         self.attn_backend) and spec_config.is_linear_tree:
                     prompt_lengths.append(runtime_tokens_per_gen_step)
@@ -3614,7 +3624,8 @@ class PyTorchModelEngine(ModelEngine):
                 py_request_id] = request.py_num_accepted_draft_tokens_indices
             prompt_lengths.append(request.py_prompt_len)
             past_seen_token_num = begin_compute
-            num_cached_tokens_per_seq.append(past_seen_token_num)
+            num_cached_tokens_per_seq.append(past_seen_token_num -
+                                             request.py_num_compressed_tokens)
             append_cross_attention_state(request, project_encoder_output=False)
 
             # update batch index
@@ -3691,7 +3702,8 @@ class PyTorchModelEngine(ModelEngine):
                 request.cached_tokens = past_seen_token_num
                 for beam in range(beam_width):
                     position_ids.append(position_id)
-                    num_cached_tokens_per_seq.append(past_seen_token_num)
+                    num_cached_tokens_per_seq.append(
+                        past_seen_token_num - request.py_num_compressed_tokens)
                     prompt_lengths.append(request.py_prompt_len)
                     gather_ids.append(len(position_ids) - 1)
 
