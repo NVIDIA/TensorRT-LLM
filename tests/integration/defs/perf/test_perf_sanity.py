@@ -139,14 +139,20 @@ GEN_ONLY_PERF_METRIC_LOG_QUERIES = {
 
 # Per-iter prev_device_step_time logged by each gen worker. Example line:
 #   [TRT-LLM] [I] [_torch][RANK 0] iter = 5, global_rank = 0, ...,
-#   host_step_time = 6.79ms, prev_device_step_time = 6.94ms, ...
+#   host_step_time = 6.79ms, prev_device_step_time = 6.94ms, ...,
+#   states = {..., 'num_generation_tokens': 512, ...}
 # Only the gen worker (decode) emits this. The device value reported at iter N
 # is the device step time of iter N-1 (device runs async). Iters 0-4 are
 # skipped: iter 0/1 include KV-cache transfer wait time, and iters 2-4 are
 # warmup that has not yet reached steady state. prev_device_step_time may be
 # 'N/A' (e.g. iter 1); the regex requires a numeric value so those lines do
-# not match.
+# not match. num_generation_tokens is captured by a separate regex applied
+# to the same line (name is stable, order relative to prev_device_step_time
+# is not) so the scanner can bucket rows by ngen without silently dropping
+# any line whose states dict is printed before prev_device_step_time. See
+# _scan_gen_worker_device_step_time.
 _DEVICE_STEP_TIME_RE = re.compile(r"iter\s*=\s*(\d+),.*?prev_device_step_time\s*=\s*([\d.]+)\s*ms")
+_NUM_GEN_TOKENS_RE = re.compile(r"'num_generation_tokens':\s*(\d+)")
 
 
 def gen_worker_log_sizes(output_dir: str, num_gen_servers: int) -> List[int]:
@@ -167,42 +173,88 @@ def _scan_gen_worker_device_step_time(
     output_dir: str,
     num_gen_servers: int,
     start_offsets: Optional[List[int]] = None,
-) -> Tuple[List[float], int]:
-    """Single pass over the gen logs. Returns (per_file_means, total_count).
+) -> Tuple[List[Dict[int, Tuple[int, float]]], int]:
+    """Single-pass scan of the gen logs.
 
-    per_file_means holds one mean per file that had >=1 usable line;
-    total_count is the number of usable (iter >= 5, numeric) lines across all
-    files, used by the caller to detect when the cross-node log flush has
-    settled. errors="replace" guards against invalid UTF-8: tqdm progress bars
+    Returns (per_file_by_ngen, total_count):
+      - per_file_by_ngen: one dict per file that produced >=1 usable line,
+        mapping num_generation_tokens -> (count, Welford mean of
+        prev_device_step_time) over rows with iter >= 5 and a numeric
+        prev_device_step_time. Rows lacking num_generation_tokens on the same
+        line are skipped for the mean but still counted for settle detection.
+      - total_count: the number of iter >= 5 rows with a numeric
+        prev_device_step_time across all files. This is monotonic as new
+        lines flush across NFS (rows only get appended) so the caller can use
+        it as the settle signal without worrying that changes to a per-ngen
+        filter can make it drop.
+
+    Memory is O(distinct num_generation_tokens per file), a small constant
+    in practice (steady-state plus a shrinking tail).
+
+    errors="replace" guards against invalid UTF-8: tqdm progress bars
     (model load) write partial multibyte sequences that would otherwise raise
     UnicodeDecodeError mid-scan.
     """
-    per_file_means: List[float] = []
+    per_file_by_ngen: List[Dict[int, Tuple[int, float]]] = []
     total_count = 0
     for i in range(num_gen_servers):
         log_path = os.path.join(output_dir, f"gen_server_{i}.log")
         if not os.path.isfile(log_path):
             continue
-        # Welford streaming mean: O(1) memory and numerically stable for
-        # large iteration counts.
-        count = 0
-        mean = 0.0
+
+        seek_to = (
+            start_offsets[i]
+            if start_offsets is not None and i < len(start_offsets) and start_offsets[i]
+            else 0
+        )
+
+        by_ngen: Dict[int, Tuple[int, float]] = {}
         with open(log_path, errors="replace") as f:
-            if start_offsets is not None and i < len(start_offsets) and start_offsets[i]:
-                f.seek(start_offsets[i])
+            if seek_to:
+                f.seek(seek_to)
             for line in f:
                 m = _DEVICE_STEP_TIME_RE.search(line)
                 if m is None:
                     continue
-                iter_idx = int(m.group(1))
-                if iter_idx < 5:
+                if int(m.group(1)) < 5:
                     continue
+                total_count += 1
+                ngen_m = _NUM_GEN_TOKENS_RE.search(line)
+                if ngen_m is None:
+                    continue
+                ngen = int(ngen_m.group(1))
+                dt = float(m.group(2))
+                count, mean = by_ngen.get(ngen, (0, 0.0))
                 count += 1
-                mean += (float(m.group(2)) - mean) / count
-        if count:
-            per_file_means.append(mean)
-            total_count += count
-    return per_file_means, total_count
+                mean += (dt - mean) / count
+                by_ngen[ngen] = (count, mean)
+        if by_ngen:
+            per_file_by_ngen.append(by_ngen)
+    return per_file_by_ngen, total_count
+
+
+def _mean_at_mode_ngen(
+    per_file_by_ngen: List[Dict[int, Tuple[int, float]]],
+) -> Optional[float]:
+    """Aggregate per-file per-ngen buckets into a single mean.
+
+    Within each file pick the num_generation_tokens value with the most
+    iterations (the mode) and take its Welford mean; ties break to the
+    largest ngen because the steady-state plateau is the upper of any tied
+    clusters. Mode is more robust than strict == max — a one-off spike where
+    a single iter's ngen briefly exceeds the sustained batch would otherwise
+    collapse the mean to 1-2 samples. Then average the per-file means across
+    workers. Returns None if no file had a usable row.
+    """
+    means: List[float] = []
+    for by_ngen in per_file_by_ngen:
+        if not by_ngen:
+            continue
+        _mode_ngen, (_count, mean) = max(by_ngen.items(), key=lambda kv: (kv[1][0], kv[0]))
+        means.append(mean)
+    if not means:
+        return None
+    return sum(means) / len(means)
 
 
 def parse_gen_worker_device_step_time(
@@ -214,8 +266,15 @@ def parse_gen_worker_device_step_time(
 ) -> Optional[float]:
     """Mean per-iter prev_device_step_time (ms) across all gen workers.
 
-    For each gen_server_{i}.log, average prev_device_step_time over iters >= 5,
-    then average those per-file means across the num_gen_servers workers.
+    For each gen_server_{i}.log, bucket iter >= 5 rows by
+    num_generation_tokens, pick the bucket with the most rows (the mode; ties
+    break to the largest ngen), and take that bucket's mean. Then average
+    those per-file means across the num_gen_servers workers. Iterations near
+    the end of a run have a shrinking num_generation_tokens as sequences
+    finish and land in smaller-ngen buckets, so they don't drag the mean
+    below the steady-state cost. Using the mode (rather than strict == max)
+    is robust against a single iter whose ngen briefly spikes above the
+    sustained batch, which would otherwise collapse the mean to 1-2 samples.
     Returns None if no usable line is found in any file.
 
     When start_offsets is provided, only the bytes from start_offsets[i] to
@@ -227,26 +286,30 @@ def parse_gen_worker_device_step_time(
     benchmark_status file) when this runs — so when the client returns, the
     decode iterations are done but their log lines may still be flushing across
     NFS. Reading once immediately can see zero iter>=5 lines and wrongly return
-    None. So poll the slice until the usable-line count is non-zero AND stable
-    across two consecutive reads (flush drained), bounded by settle_timeout.
+    None. So poll the slice until the iter>=5 row count is non-zero AND
+    stable across two consecutive reads (flush drained), bounded by
+    settle_timeout. The settle signal is the raw iter>=5 row count (not the
+    mode-bucket count) because raw rows are monotonic across polls, whereas
+    the mode ngen — and therefore its bucket size — can shift while the tail
+    is still flushing.
     """
     deadline = time.time() + settle_timeout
     prev_count = -1
     while True:
-        per_file_means, total_count = _scan_gen_worker_device_step_time(
+        per_file_by_ngen, total_count = _scan_gen_worker_device_step_time(
             output_dir, num_gen_servers, start_offsets
         )
         # Non-empty and unchanged since the last poll → the flush has settled.
         if total_count > 0 and total_count == prev_count:
-            return sum(per_file_means) / len(per_file_means)
+            return _mean_at_mode_ngen(per_file_by_ngen)
         if time.time() >= deadline:
-            if per_file_means:
+            if per_file_by_ngen:
                 print_info(
                     f"parse_gen_worker_device_step_time: settle_timeout "
                     f"({settle_timeout}s) reached with {total_count} line(s); "
                     "returning current mean."
                 )
-                return sum(per_file_means) / len(per_file_means)
+                return _mean_at_mode_ngen(per_file_by_ngen)
             return None
         prev_count = total_count
         time.sleep(poll_interval)

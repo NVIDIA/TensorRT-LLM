@@ -27,7 +27,7 @@ from tensorrt_llm._torch.modules.multi_stream_utils import \
     maybe_execute_in_parallel
 from tensorrt_llm._torch.modules.rotary_embedding import RotaryEmbedding
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
-from tensorrt_llm._torch.utils import maybe_compile
+from tensorrt_llm._torch.utils import Fp4QuantizedTensor, maybe_compile
 from tensorrt_llm._utils import (get_size_in_bytes, get_sm_version,
                                  maybe_pin_memory, prefer_pinned)
 from tensorrt_llm.bindings import DataType
@@ -87,6 +87,7 @@ class DSAMetadataParams(SparseMetadataParams):
 
     indexer_max_chunk_size: int
     max_sparse_topk: Optional[int]
+    index_head_dim: int
     enable_indexer_skip: bool
     enable_heuristic_topk: bool
     use_cute_dsl_paged_mqa_logits: bool
@@ -626,7 +627,6 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
     def __init__(self, *args, **kwargs):
         """Initialize DSA metadata with SM count and indexer chunk size."""
         sparse_attention_config = kwargs.pop("sparse_attention_config", None)
-        self.sparse_attention_config = sparse_attention_config
         if (kwargs.get("sparse_metadata_params") is None
                 and sparse_attention_config is not None and hasattr(
                     sparse_attention_config, "to_sparse_metadata_params")):
@@ -670,14 +670,13 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             raise ValueError("DSA sparse attention metadata params are not set")
         self.num_sparse_topk = sparse_metadata_params.max_sparse_topk
         self.sparse_mla_topk = self.num_sparse_topk
-        self.indexer_head_dim = getattr(self.sparse_attention_config,
-                                        "index_head_dim", 128)
+        self.indexer_head_dim = sparse_metadata_params.index_head_dim
         self.indexer_quant_block_size = 128
         self.enable_indexer_skip = (sparse_metadata_params.enable_indexer_skip)
         capture_graph = self.is_cuda_graph
-        # Get compression ratio from sparse attention config. Plain DSA has no
-        # compression and uses the default [1]; DeepSeek-V4 overrides this.
-        self.compress_ratios = getattr(self.sparse_attention_config,
+        # Plain DSA has no compression and uses the default [1]. DeepSeek-V4's
+        # metadata params carry the model-specific compression ratios.
+        self.compress_ratios = getattr(sparse_metadata_params,
                                        'compress_ratios', [1])
 
         # Effective tokens-per-block for the indexer k-cache slot mapping.
@@ -2389,10 +2388,12 @@ class Indexer(nn.Module):
         has_prefill = num_contexts > 0
         num_gen_tokens = num_tokens - num_ctx_tokens
 
-        topk_indices_buffer = torch.empty(
+        topk_indices_buffer = metadata.get_empty(
+            metadata.cuda_graph_buffers,
             (hidden_states.shape[0], self.index_topk),
+            cache_name="indexer_topk_out_buffer",
             dtype=torch.int32,
-            device=hidden_states.device)
+            capture_graph=metadata.is_cuda_graph)
         if not use_custom_topk:
             topk_indices_buffer[:hidden_states.shape[0]] = -1
 
@@ -2879,7 +2880,18 @@ class Indexer(nn.Module):
         """
         assert self._fused_wk_wp_weight is not None, \
             "cache_derived_state() must be called before forward()"
-        hidden_float = _to_float(hidden_states)
+        # When the boundary fusion pre-quantized the next layer's kv_a_proj
+        # NVFP4 input, hidden_states is an Fp4QuantizedTensor that also carries
+        # the BF16 post-RMSNorm value. Use that BF16 view here -- the indexer
+        # weight is BF16 and the matmul needs a float input.
+        if isinstance(hidden_states, Fp4QuantizedTensor):
+            assert hidden_states.unquantized_hidden_states is not None, (
+                "pre_indexer_proj received Fp4QuantizedTensor without bf16 view; "
+                "the producer fusion must request return_norm_out=True")
+            hidden_states_bf = hidden_states.unquantized_hidden_states
+        else:
+            hidden_states_bf = hidden_states
+        hidden_float = _to_float(hidden_states_bf)
         with _tf32_matmul_enabled():
             # F.linear computes input @ weight.T internally; no explicit .t() needed.
             # _fused_wk_wp_weight is [head_dim + n_heads, hidden_size] (nn.Linear convention).
@@ -2890,7 +2902,7 @@ class Indexer(nn.Module):
         indexer_k, weights = fused_out.split([self.head_dim, self.n_heads],
                                              dim=-1)
         # Cast indexer_k back to model dtype for downstream ops (k_norm, RoPE, FP8 quantize)
-        indexer_k = indexer_k.to(hidden_states.dtype)
+        indexer_k = indexer_k.to(hidden_states_bf.dtype)
 
         q_pe, q_nope, k_pe, k_nope = self._qk_projection_and_rope(
             qr, indexer_k, position_ids)
