@@ -276,11 +276,19 @@ class MTPWorker(SpecWorkerBase):
     def __init__(self,
                  spec_config: "MTPDecodingConfig",
                  model_config=None,
-                 use_separate_draft_kv_cache: bool = False):
+                 use_separate_draft_kv_cache: bool = False,
+                 *,
+                 mapping=None):
         super().__init__(use_separate_draft_kv_cache)
         self.spec_config = spec_config
         self.model_config = model_config
-        self.mapping = getattr(model_config, "mapping", None)
+        # Use the mapping passed by get_spec_worker (the same Mapping that shards
+        # the draft LM head). model_config.mapping is unreliable here -- for the
+        # MTP worker it can be None -- so reading it caused greedy draft sampling
+        # to skip the TP argmax gather and desync the ranks into a hang under
+        # plain TP + overlap scheduler.
+        self.mapping = mapping if mapping is not None else getattr(
+            model_config, "mapping", None)
         self.is_thop = False
         self.sa_enhancer: Optional[SADraftEnhancer] = None
         if spec_config.sa_config is not None:

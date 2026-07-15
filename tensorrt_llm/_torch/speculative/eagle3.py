@@ -1206,10 +1206,12 @@ class MTPEagleWorker(Eagle3OneModelWorker):
     def __init__(self,
                  spec_config,
                  model_config: Optional[ModelConfig] = None,
-                 use_separate_draft_kv_cache: bool = False):
+                 use_separate_draft_kv_cache: bool = False,
+                 *,
+                 mapping: Optional[Mapping] = None):
         super().__init__(
             spec_config,
-            mapping=None,
+            mapping=mapping,
             model_config=model_config,
             use_separate_draft_kv_cache=use_separate_draft_kv_cache)
         # Preserved for callers/tests that still expect this attribute.

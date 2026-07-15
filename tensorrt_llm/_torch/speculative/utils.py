@@ -444,10 +444,15 @@ def get_spec_worker(spec_config,
                     use_separate_draft_kv_cache: bool = False):
     spec_dec_mode = spec_config.spec_dec_mode
     if spec_dec_mode.is_mtp_vanilla():
-        return MTPWorker(spec_config, model_config, use_separate_draft_kv_cache)
+        return MTPWorker(spec_config,
+                         model_config,
+                         use_separate_draft_kv_cache,
+                         mapping=mapping)
     if spec_dec_mode.is_mtp_eagle_one_model():
-        return MTPEagleWorker(spec_config, model_config,
-                              use_separate_draft_kv_cache)
+        return MTPEagleWorker(spec_config,
+                              model_config,
+                              use_separate_draft_kv_cache,
+                              mapping=mapping)
     if spec_dec_mode.is_eagle3_one_model():
         if _is_effective_dynamic_tree(spec_config):
             return Eagle3OneModelDynamicTreeWorker(spec_config, mapping,
