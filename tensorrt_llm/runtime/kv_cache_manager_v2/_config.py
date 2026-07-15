@@ -20,7 +20,7 @@
 import os
 from dataclasses import dataclass, field
 from enum import IntEnum
-from typing import ClassVar, NewType, Protocol
+from typing import ClassVar, Literal, NewType, Protocol
 
 from ._common import CacheTier, LayerId
 
@@ -69,6 +69,8 @@ class HostCacheTierConfig:
 class DiskCacheTierConfig:
     quota: int  # in bytes
     path: str  # a folder where we will store data as files
+    backend: Literal["posix", "nixl_gds"] = "posix"
+    gds_thread_count: int = 8
 
     @property
     def tier(self) -> CacheTier:
@@ -79,6 +81,10 @@ class DiskCacheTierConfig:
         assert os.path.isdir(self.path), (
             f"Disk path {self.path} does not exist or is not a directory"
         )
+        assert self.backend in ("posix", "nixl_gds"), (
+            f"Unsupported disk cache backend: {self.backend}"
+        )
+        assert self.gds_thread_count > 0, "GDS_MT thread count must be positive"
 
 
 @dataclass(slots=True)

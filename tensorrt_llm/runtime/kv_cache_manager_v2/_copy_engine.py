@@ -23,7 +23,7 @@ from dataclasses import dataclass
 # avoid importing the whole tensorrt_llm module, which takes time during debugging.
 from importlib.util import find_spec
 from pathlib import Path
-from typing import ClassVar, NamedTuple, Sequence, cast
+from typing import Any, ClassVar, NamedTuple, Sequence, cast
 
 import cuda.bindings.driver as drv
 
@@ -38,7 +38,12 @@ from ._utils import (
     temporary_sys_path,
 )
 
+_NixlGdsCopyEngine: Any
+
 if "tensorrt_llm" in sys.modules:
+    from tensorrt_llm.bindings.internal.batch_manager import (
+        kv_cache_manager_v2_utils as _native_utils,
+    )
     from tensorrt_llm.bindings.internal.batch_manager.kv_cache_manager_v2_utils import (  # noqa # type: ignore
         DiskAddress,
         DiskToDiskTask,
@@ -53,11 +58,14 @@ if "tensorrt_llm" in sys.modules:
         copy_host_to_disk,
         copy_host_to_host,
     )
+
+    _NixlGdsCopyEngine = getattr(_native_utils, "NixlGdsCopyEngine", None)
 else:
     # fast path for dev, avoids importing the whole tensorrt_llm module
     spec = find_spec("kv_cache_manager_v2")
     assert spec is not None and spec.origin is not None
     with temporary_sys_path(str(Path(spec.origin).parent.parent.parent)):
+        from bindings.internal.batch_manager import kv_cache_manager_v2_utils as _native_utils  # noqa
         from bindings.internal.batch_manager.kv_cache_manager_v2_utils import (  # noqa
             DiskAddress,
             DiskToDiskTask,
@@ -72,6 +80,8 @@ else:
             copy_host_to_disk,
             copy_host_to_host,
         )
+
+        _NixlGdsCopyEngine = getattr(_native_utils, "NixlGdsCopyEngine", None)
 
 
 class CopyTask(NamedTuple):
@@ -311,14 +321,38 @@ class StagingBufferManager:
 
 
 class CopyEngine:
-    __slots__ = ("_staging_buffer_manager",)
+    __slots__ = ("_staging_buffer_manager", "_nixl_gds_engine", "_nixl_gds_thread_count")
     _staging_buffer_manager: StagingBufferManager | None
+    _nixl_gds_engine: Any | None
+    _nixl_gds_thread_count: int | None
 
     def __init__(self) -> None:
         self._staging_buffer_manager = None
+        self._nixl_gds_engine = None
+        self._nixl_gds_thread_count = None
 
     def close(self) -> None:
         self._staging_buffer_manager = None
+        self._nixl_gds_engine = None
+        self._nixl_gds_thread_count = None
+
+    def initialize_nixl_gds(self, thread_count: int) -> Any:
+        """Create the one GDS_MT engine owned by this worker process."""
+        if thread_count <= 0:
+            raise ValueError("NIXL GDS_MT thread count must be positive")
+        if self._nixl_gds_engine is None:
+            if _NixlGdsCopyEngine is None:
+                raise RuntimeError(
+                    "NIXL GDS support is unavailable in the loaded TensorRT-LLM bindings"
+                )
+            self._nixl_gds_engine = _NixlGdsCopyEngine(thread_count)
+            self._nixl_gds_thread_count = thread_count
+        elif thread_count != self._nixl_gds_thread_count:
+            raise RuntimeError(
+                "NIXL GDS_MT is already initialized with thread_count="
+                f"{self._nixl_gds_thread_count}; cannot reconfigure it to {thread_count}"
+            )
+        return self._nixl_gds_engine
 
     @property
     def staging_buffer_manager(self) -> StagingBufferManager:
@@ -335,7 +369,20 @@ class CopyEngine:
         num_bytes: int,
         tasks: Sequence[CopyTask],
         stream: CudaStream,
+        disk_backend: str = "posix",
+        gds_thread_count: int = 8,
     ) -> None:
+        if disk_backend not in ("posix", "nixl_gds"):
+            raise ValueError(f"Unsupported disk cache backend: {disk_backend}")
+        if (
+            disk_backend == "nixl_gds"
+            and CacheTier.DISK in (dst_cache_tier, src_cache_tier)
+            and dst_cache_tier != src_cache_tier
+        ):
+            return self._transfer_nixl_gds(
+                dst_cache_tier, src_cache_tier, num_bytes, tasks, stream, gds_thread_count
+            )
+
         copier = get_copier(dst_cache_tier, src_cache_tier)
         if not isinstance(copier, tuple):
             return copier(tasks, num_bytes, stream)
@@ -366,9 +413,58 @@ class CopyEngine:
                 )
                 remaining = remaining[n:]
 
+    def _transfer_nixl_gds(
+        self,
+        dst_cache_tier: CacheTier,
+        src_cache_tier: CacheTier,
+        num_bytes: int,
+        tasks: Sequence[CopyTask],
+        stream: CudaStream,
+        thread_count: int,
+    ) -> None:
+        engine = self.initialize_nixl_gds(thread_count)
+
+        if dst_cache_tier == CacheTier.DISK:
+            disk_tasks = [
+                HostToDiskTask(
+                    DiskAddress(cast(DiskAddress, task.dst).fd, cast(DiskAddress, task.dst).pos),
+                    cast(MemAddress, task.src),
+                )
+                for task in tasks
+            ]
+            if src_cache_tier == CacheTier.GPU_MEM:
+                result = engine.copy_device_to_disk(disk_tasks, num_bytes, stream)
+            elif src_cache_tier == CacheTier.HOST_MEM:
+                result = engine.copy_host_to_disk(disk_tasks, num_bytes, stream)
+            else:
+                raise ValueError(f"Unsupported NIXL GDS source tier: {src_cache_tier}")
+        elif src_cache_tier == CacheTier.DISK:
+            memory_tasks = [
+                DiskToHostTask(
+                    cast(MemAddress, task.dst),
+                    DiskAddress(cast(DiskAddress, task.src).fd, cast(DiskAddress, task.src).pos),
+                )
+                for task in tasks
+            ]
+            if dst_cache_tier == CacheTier.GPU_MEM:
+                result = engine.copy_disk_to_device(memory_tasks, num_bytes, stream)
+            elif dst_cache_tier == CacheTier.HOST_MEM:
+                result = engine.copy_disk_to_host(memory_tasks, num_bytes, stream)
+            else:
+                raise ValueError(f"Unsupported NIXL GDS destination tier: {dst_cache_tier}")
+        else:
+            raise ValueError(
+                f"NIXL GDS requires one disk tier, got {src_cache_tier} -> {dst_cache_tier}"
+            )
+        _unwrap(drv.CUresult(result))
+
 
 _copy_engine = CopyEngine()
 atexit.register(_copy_engine.close)
+
+
+def initialize_nixl_gds(thread_count: int) -> None:
+    _copy_engine.initialize_nixl_gds(thread_count)
 
 
 def batched_copy(
@@ -377,5 +473,15 @@ def batched_copy(
     num_bytes: int,
     tasks: Sequence[CopyTask],
     stream: CudaStream,
+    disk_backend: str = "posix",
+    gds_thread_count: int = 8,
 ) -> None:
-    _copy_engine.transfer(dst_cache_tier, src_cache_tier, num_bytes, tasks, stream)
+    _copy_engine.transfer(
+        dst_cache_tier,
+        src_cache_tier,
+        num_bytes,
+        tasks,
+        stream,
+        disk_backend,
+        gds_thread_count,
+    )

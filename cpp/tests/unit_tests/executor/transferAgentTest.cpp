@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -89,6 +89,26 @@ public:
 
     std::string backend;
 };
+
+TEST(FileDescTest, BorrowedDescriptorKeepsOffsetAndOwnership)
+{
+    int pipeFds[2];
+    ASSERT_EQ(pipe(pipeFds), 0);
+    {
+        FileDesc desc(pipeFds[0], 123, 456);
+        EXPECT_EQ(desc.getFd(), static_cast<uint64_t>(pipeFds[0]));
+        EXPECT_EQ(desc.getOffset(), 123);
+        EXPECT_EQ(desc.getLen(), 456);
+
+        FileDesc moved(std::move(desc));
+        EXPECT_EQ(moved.getFd(), static_cast<uint64_t>(pipeFds[0]));
+        EXPECT_EQ(moved.getOffset(), 123);
+        EXPECT_EQ(moved.getLen(), 456);
+    }
+    EXPECT_NE(fcntl(pipeFds[0], F_GETFD), -1);
+    EXPECT_EQ(close(pipeFds[0]), 0);
+    EXPECT_EQ(close(pipeFds[1]), 0);
+}
 
 TEST_P(TransferAgentTest, Basic)
 {

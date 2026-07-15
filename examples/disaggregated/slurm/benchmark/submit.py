@@ -200,7 +200,18 @@ def upsert_env_config(env_config, config_key, key_name, value_str):
 
 
 def convert_envs_to_str(env_vars: Dict[str, str]) -> str:
-    return ','.join([f"{key}='{value}'" for key, value in env_vars.items()])
+    """Format client environment for Slurm's comma-delimited --export.
+
+    The surrounding shell argument is already double quoted. Embedding single
+    quotes here makes them literal parts of values as parsed by Slurm (for
+    example, TMPDIR becomes ``'/data/...'`` and slurmstepd falls back to /tmp).
+    """
+    for key, value in env_vars.items():
+        if ',' in str(value):
+            raise ValueError(
+                f"Client environment value for {key} contains a comma, which "
+                "cannot be represented safely in srun --export")
+    return ','.join([f"{key}={value}" for key, value in env_vars.items()])
 
 
 def replace_env_in_file(log_dir, file_path, env_var):
@@ -432,6 +443,7 @@ def submit_job(config, log_dir, dry_run):
     env_config.setdefault('build_wheel', False)
     env_config.setdefault('cuda_architectures', '')
     env_config.setdefault('trtllm_wheel_path', '')
+    env_config.setdefault('job_tmpdir_root', '')
     env_config.setdefault('worker_env_var', '')
     env_config.setdefault('server_env_var', '')
 
@@ -464,8 +476,12 @@ def submit_job(config, log_dir, dry_run):
         'enable_attention_dp', False) else 1
     gen_dp_size = gen_tp_size if worker_config['gen'].get(
         'enable_attention_dp', False) else 1
-    ucx_warmup_requests = 2 * ctx_num * ctx_dp_size * gen_num * gen_dp_size \
-        if benchmark_config['mode'] == "e2e" else 0
+    default_ucx_warmup_requests = (
+        2 * ctx_num * ctx_dp_size * gen_num * gen_dp_size
+        if benchmark_config['mode'] == "e2e" else 0)
+    ucx_warmup_requests = int(
+        benchmark_config.get('ucx_warmup_requests',
+                             default_ucx_warmup_requests))
 
     if compact_packing:
         # Compact packing: pack all workers into the minimum number of nodes,
@@ -580,6 +596,9 @@ def submit_job(config, log_dir, dry_run):
     start_server_cmds = []
     container_mount_str = env_config['container_mount']
     container_mount_str += f",{script_dir}:{script_dir}"
+    udev_mount = "/run/udev:/run/udev"
+    if udev_mount not in container_mount_str.split(','):
+        container_mount_str += f",{udev_mount}"
 
     # Pre-define server-type-specific configurations
     server_configs = {
@@ -724,10 +743,21 @@ def submit_job(config, log_dir, dry_run):
     # Append benchmark commands
     if benchmark_config.get('enable_benchmark', True):
         env_var = config['benchmark'].get('env_var', {})
+        if benchmark_config.get('use_evalscope', False) or benchmark_config.get(
+                'use_aiperf', False):
+            env_var['TMPDIR'] = os.path.join(log_dir, 'client_runtime', 'tmp')
+            client_cmds.append(f"mkdir -p '{env_var['TMPDIR']}'")
         benchmark_prefix = client_slurm_prefix + [
             f"--export \"{convert_envs_to_str(env_var)}\""
         ]
-        if benchmark_config.get('use_aiperf', False):
+        if benchmark_config.get('use_evalscope', False):
+            benchmark_cmd = [
+                f"bash {os.path.join(script_dir, 'run_benchmark_evalscope.sh')}",
+                f"'{env_config['model_path']}' '{benchmark_config['dataset_file']}' '{benchmark_config['concurrency_list']}' '{log_dir}' {disagg_server_hostname} {disagg_server_port} {ucx_warmup_requests}",
+                f"&> {log_dir}/6_bench.log"
+            ]
+            client_cmds.append(" ".join(benchmark_prefix + benchmark_cmd))
+        elif benchmark_config.get('use_aiperf', False):
             benchmark_cmd = [
                 f"bash {os.path.join(script_dir, 'run_benchmark_aiperf.sh')}",
                 f"'{env_config['model_path']}' '{benchmark_config['dataset_file']}' {benchmark_config['multi_round']} {gen_num} '{benchmark_config['concurrency_list']}' {benchmark_config['streaming']} '{log_dir}' {disagg_server_hostname} {disagg_server_port} {ucx_warmup_requests}",
@@ -839,6 +869,7 @@ def submit_job(config, log_dir, dry_run):
         '--build-wheel', str(env_config['build_wheel']).lower(),
         '--cuda-architectures', env_config['cuda_architectures'],
         '--trtllm-wheel-path', env_config['trtllm_wheel_path'],
+        '--job-tmpdir-root', env_config['job_tmpdir_root'],
     ]
     # yapf: enable
 

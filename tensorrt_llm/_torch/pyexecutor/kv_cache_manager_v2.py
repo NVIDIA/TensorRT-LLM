@@ -886,9 +886,18 @@ class KVCacheManagerV2(BaseResourceManager):
         if disk_cache_size is not None and disk_cache_size > 0:
             disk_cache_path = kv_cache_config.disk_cache_path
             assert disk_cache_path is not None
-            cache_tiers.append(DiskCacheTierConfig(quota=disk_cache_size, path=disk_cache_path))
+            cache_tiers.append(
+                DiskCacheTierConfig(
+                    quota=disk_cache_size,
+                    path=disk_cache_path,
+                    backend=kv_cache_config.disk_cache_backend,
+                    gds_thread_count=kv_cache_config.disk_cache_gds_thread_count,
+                )
+            )
             logger.info(
-                f"KV cache manager v2 disk cache quota set to {disk_cache_size / (1 << 30):.2f}GiB at {disk_cache_path}"
+                f"KV cache manager v2 disk cache quota set to "
+                f"{disk_cache_size / (1 << 30):.2f}GiB at {disk_cache_path} "
+                f"using {kv_cache_config.disk_cache_backend}"
             )
 
         self.vocab_size = vocab_size

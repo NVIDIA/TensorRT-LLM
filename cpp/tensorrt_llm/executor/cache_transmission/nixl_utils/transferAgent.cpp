@@ -24,6 +24,7 @@
 
 #include <algorithm>
 #include <arpa/inet.h>
+#include <cerrno>
 #include <chrono>
 #include <cuda.h>
 #include <dirent.h>
@@ -237,7 +238,7 @@ uint16_t getIncrmentPort(uint16_t basePort)
     nixl_reg_dlist_t list(FILE_SEG);
     for (auto const& desc : descs.getDescs())
     {
-        list.addDesc(nixlBlobDesc{0, desc.getLen(), desc.getFd()});
+        list.addDesc(nixlBlobDesc{desc.getOffset(), desc.getLen(), desc.getFd()});
     }
     return list;
 }
@@ -267,12 +268,12 @@ uint16_t getIncrmentPort(uint16_t basePort)
     nixl_xfer_dlist_t list{FILE_SEG};
     for (auto const& desc : descs.getDescs())
     {
-        list.addDesc(nixlBasicDesc{0, desc.getLen(), desc.getFd()});
+        list.addDesc(nixlBasicDesc{desc.getOffset(), desc.getLen(), desc.getFd()});
     }
     return list;
 }
 
-void NixlHelper::posixGpuToFileFallback(MemoryDescs const& memoryDescs, FileDescs const& fileDescs)
+void NixlHelper::posixMemoryToFileFallback(MemoryDescs const& memoryDescs, FileDescs const& fileDescs)
 {
     auto const& memVec = memoryDescs.getDescs();
     auto const& fileVec = fileDescs.getDescs();
@@ -284,18 +285,37 @@ void NixlHelper::posixGpuToFileFallback(MemoryDescs const& memoryDescs, FileDesc
         auto& fileDesc = fileVec[i];
 
         ssize_t numBytes = static_cast<ssize_t>(memDesc.getLen());
-        std::vector<uint8_t> hostBuffer(numBytes);
+        void const* src = reinterpret_cast<void const*>(memDesc.getAddr());
+        std::vector<uint8_t> hostBuffer;
+        if (memoryDescs.getType() == MemoryType::kVRAM)
+        {
+            hostBuffer.resize(numBytes);
+            cudaError_t const cpyErr = cudaMemcpy(hostBuffer.data(), src, numBytes, cudaMemcpyDeviceToHost);
+            TLLM_CHECK_WITH_INFO(cpyErr == cudaSuccess, "cudaMemcpy to host failed, error=%d", cpyErr);
+            src = hostBuffer.data();
+        }
+        else
+        {
+            TLLM_CHECK_WITH_INFO(memoryDescs.getType() == MemoryType::kDRAM,
+                "POSIX file fallback only supports DRAM or VRAM descriptors");
+        }
 
-        cudaError_t cpyErr = cudaMemcpy(
-            hostBuffer.data(), reinterpret_cast<void*>(memDesc.getAddr()), numBytes, cudaMemcpyDeviceToHost);
-        TLLM_CHECK_WITH_INFO(cpyErr == cudaSuccess, "cudaMemcpy to host failed, error=%d", cpyErr);
-
-        ssize_t written = ::write(fileDesc.getFd(), hostBuffer.data(), numBytes);
-        TLLM_CHECK_WITH_INFO(written >= 0, "POSIX write error=%zd", written);
+        ssize_t written = 0;
+        while (written < numBytes)
+        {
+            ssize_t const result = ::pwrite(fileDesc.getFd(), static_cast<uint8_t const*>(src) + written,
+                numBytes - written, fileDesc.getOffset() + written);
+            if (result < 0 && errno == EINTR)
+            {
+                continue;
+            }
+            TLLM_CHECK_WITH_INFO(result > 0, "POSIX write error=%zd", result);
+            written += result;
+        }
     }
 }
 
-void NixlHelper::posixFileToGpuFallback(MemoryDescs const& memoryDescs, FileDescs const& fileDescs)
+void NixlHelper::posixFileToMemoryFallback(MemoryDescs const& memoryDescs, FileDescs const& fileDescs)
 {
     auto const& memVec = memoryDescs.getDescs();
     auto const& fileVec = fileDescs.getDescs();
@@ -307,14 +327,38 @@ void NixlHelper::posixFileToGpuFallback(MemoryDescs const& memoryDescs, FileDesc
         auto& fileDesc = fileVec[i];
 
         ssize_t numBytes = static_cast<ssize_t>(memDesc.getLen());
-        std::vector<uint8_t> hostBuffer(numBytes);
+        std::vector<uint8_t> hostBuffer;
+        void* dst = reinterpret_cast<void*>(memDesc.getAddr());
+        if (memoryDescs.getType() == MemoryType::kVRAM)
+        {
+            hostBuffer.resize(numBytes);
+            dst = hostBuffer.data();
+        }
+        else
+        {
+            TLLM_CHECK_WITH_INFO(memoryDescs.getType() == MemoryType::kDRAM,
+                "POSIX file fallback only supports DRAM or VRAM descriptors");
+        }
 
-        ssize_t bytesRead = ::read(fileDesc.getFd(), hostBuffer.data(), numBytes);
-        TLLM_CHECK_WITH_INFO(bytesRead == numBytes, "POSIX read error=%zd", bytesRead);
+        ssize_t bytesRead = 0;
+        while (bytesRead < numBytes)
+        {
+            ssize_t const result = ::pread(fileDesc.getFd(), static_cast<uint8_t*>(dst) + bytesRead,
+                numBytes - bytesRead, fileDesc.getOffset() + bytesRead);
+            if (result < 0 && errno == EINTR)
+            {
+                continue;
+            }
+            TLLM_CHECK_WITH_INFO(result > 0, "POSIX read error=%zd", result);
+            bytesRead += result;
+        }
 
-        cudaError_t cpyErr = cudaMemcpy(
-            reinterpret_cast<void*>(memDesc.getAddr()), hostBuffer.data(), numBytes, cudaMemcpyHostToDevice);
-        TLLM_CHECK_WITH_INFO(cpyErr == cudaSuccess, "cudaMemcpy to device failed, error=%d", cpyErr);
+        if (memoryDescs.getType() == MemoryType::kVRAM)
+        {
+            cudaError_t const cpyErr = cudaMemcpy(
+                reinterpret_cast<void*>(memDesc.getAddr()), hostBuffer.data(), numBytes, cudaMemcpyHostToDevice);
+            TLLM_CHECK_WITH_INFO(cpyErr == cudaSuccess, "cudaMemcpy to device failed, error=%d", cpyErr);
+        }
     }
 }
 
@@ -990,6 +1034,10 @@ NixlLoopbackAgent::NixlLoopbackAgent(BaseAgentConfig const& config)
     init["batch_pool_size"] = std::to_string(8);
     init["batch_limit"] = std::to_string(128);
     init["max_request_size"] = std::to_string(16 * 1024 * 1024);
+    for (auto const& [key, value] : config.backendParams)
+    {
+        init[key] = value;
+    }
 
     if (config.multiThread)
     {
@@ -1086,7 +1134,7 @@ std::unique_ptr<TransferStatus> NixlLoopbackAgent::submitLoopbackRequests(
     return std::make_unique<NixlTransferStatus>(std::weak_ptr<nixlAgent>(mRawAgent), handle);
 }
 
-void NixlLoopbackAgent::executeLoopbackRequest(
+bool NixlLoopbackAgent::executeLoopbackRequest(
     MemoryDescs const& memoryDescs, FileDescs const& fileDescs, bool isOffload)
 {
     std::shared_lock<std::shared_mutex> lock(mLock);
@@ -1097,7 +1145,7 @@ void NixlLoopbackAgent::executeLoopbackRequest(
     ret = this->registerFiles(fileDescs);
     if (ret < 0)
     { // register can fail if no GDS support
-        TLLM_LOG_DEBUG("NIXL GDS register files failed, using POSIX fallback");
+        TLLM_LOG_WARNING("NIXL GDS register files failed, using POSIX fallback");
         fallback = true;
     }
     else
@@ -1105,7 +1153,7 @@ void NixlLoopbackAgent::executeLoopbackRequest(
         ret = this->registerMemory(memoryDescs);
         if (ret < 0)
         { // register can fail if no GDS support
-            TLLM_LOG_DEBUG("NIXL GDS register memory failed, using POSIX fallback");
+            TLLM_LOG_WARNING("NIXL GDS register memory failed, using POSIX fallback");
             this->deregisterFiles(fileDescs);
             fallback = true;
         }
@@ -1115,14 +1163,14 @@ void NixlLoopbackAgent::executeLoopbackRequest(
     {
         if (isOffload)
         {
-            NixlHelper::posixGpuToFileFallback(memoryDescs, fileDescs);
+            NixlHelper::posixMemoryToFileFallback(memoryDescs, fileDescs);
         }
         else
         {
-            NixlHelper::posixFileToGpuFallback(memoryDescs, fileDescs);
+            NixlHelper::posixFileToMemoryFallback(memoryDescs, fileDescs);
         }
 
-        return;
+        return false;
     }
 
     std::unique_ptr<TransferStatus> status = this->submitLoopbackRequests(memoryDescs, fileDescs, isOffload);
@@ -1132,6 +1180,7 @@ void NixlLoopbackAgent::executeLoopbackRequest(
 
     this->deregisterMemory(memoryDescs);
     this->deregisterFiles(fileDescs);
+    return true;
 }
 
 #if defined(__clang__)

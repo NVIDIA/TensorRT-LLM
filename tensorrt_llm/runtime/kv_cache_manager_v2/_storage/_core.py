@@ -185,29 +185,47 @@ class HostSlotPool(SlotPoolBase):
 
 
 class DiskSlotPool(SlotPoolBase):
-    __slots__ = ("_filename", "_fd")
+    __slots__ = ("_filename", "_fd", "_temp_path")
     # Currently only used to get the parent folder where we create temporary files.
     # You won't find file with this name.
     filename: str
     _fd: FileDescriptor
+    _temp_path: str | None
 
-    def __init__(self, filename: str, slot_size: int, num_slots: int) -> None:
+    def __init__(
+        self, filename: str, slot_size: int, num_slots: int, direct_io: bool = False
+    ) -> None:
         super().__init__(slot_size)
         self.filename = filename
         folder = os.path.dirname(filename)
         assert os.path.isdir(folder), f"Folder {folder} does not exist"
-        try:
-            fd = os.open(folder, os.O_TMPFILE | os.O_RDWR | os.O_EXCL, 0o664)
-        except OSError as e:
-            if e.errno != errno.EOPNOTSUPP:
-                raise
-            # Fallback for filesystems/architectures not supporting O_TMPFILE
+        self._temp_path = None
+        if direct_io:
+            direct_io_flag = getattr(os, "O_DIRECT", 0)
+            if direct_io_flag == 0:
+                raise RuntimeError("nixl_gds requires os.O_DIRECT support")
             fd, path = tempfile.mkstemp(dir=folder)
             try:
-                os.unlink(path)
+                direct_fd = os.open(path, os.O_RDWR | direct_io_flag)
             except OSError:
+                os.unlink(path)
                 os.close(fd)
                 raise
+            else:
+                os.close(fd)
+                fd = direct_fd
+                self._temp_path = path
+        else:
+            try:
+                fd = os.open(folder, os.O_TMPFILE | os.O_RDWR | os.O_EXCL, 0o664)
+            except OSError:
+                # Fallback for filesystems/architectures not supporting O_TMPFILE.
+                fd, path = tempfile.mkstemp(dir=folder)
+                try:
+                    os.unlink(path)
+                except OSError:
+                    os.close(fd)
+                    raise
         self._fd = FileDescriptor(fd)
         self.resize(num_slots)
 
@@ -217,6 +235,12 @@ class DiskSlotPool(SlotPoolBase):
             return
         os.close(self.fd)
         self._fd = BAD_FILE_DESCRIPTOR
+        if self._temp_path is not None:
+            try:
+                os.unlink(self._temp_path)
+            except FileNotFoundError:
+                pass
+            self._temp_path = None
 
     @property
     def fd(self) -> FileDescriptor:
@@ -625,13 +649,20 @@ class DiskPoolGroup(PoolGroupBase):
     __slots__ = ()
 
     def __init__(
-        self, num_slots: int, slot_size_list: TypedIndexList[PoolIndex, int], filename_template: str
+        self,
+        num_slots: int,
+        slot_size_list: TypedIndexList[PoolIndex, int],
+        filename_template: str,
+        direct_io: bool = False,
     ):
         super().__init__(num_slots)
         num_pools = typed_len(slot_size_list)
         self._pools = make_typed(
             lambda pool_idx: DiskSlotPool(
-                filename_template.format(pool_idx), slot_size_list[pool_idx], num_slots
+                filename_template.format(pool_idx),
+                slot_size_list[pool_idx],
+                num_slots,
+                direct_io,
             ),
             num_pools,
         )
@@ -974,6 +1005,7 @@ class DiskCacheLevelStorage(CacheLevelStorage):
         slot_size_lists: TypedIndexList[PoolGroupIndex, TypedIndexList[PoolIndex, int]],
         slot_count_list: TypedIndexList[PoolGroupIndex, int],
         filename_template: str,
+        direct_io: bool = False,
     ):
         num_pool_groups = typed_len(slot_size_lists)
         assert num_pool_groups == typed_len(slot_count_list), (
@@ -985,6 +1017,7 @@ class DiskCacheLevelStorage(CacheLevelStorage):
                 slot_count_list[pg_idx],
                 slot_size_lists[pg_idx],
                 filename_template.format(pg_idx, "{}"),
+                direct_io,
             ),
             num_pool_groups,
         )

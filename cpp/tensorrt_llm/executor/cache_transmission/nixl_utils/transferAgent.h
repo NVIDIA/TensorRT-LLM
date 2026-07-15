@@ -37,8 +37,8 @@ struct NixlHelper
     [[nodiscard]] static nixl_xfer_op_t convert(TransferOp const& op);
     [[nodiscard]] static nixl_xfer_dlist_t convertXferDist(TransferDescs const& descs);
     [[nodiscard]] static nixl_xfer_dlist_t convertXferDist(FileDescs const& descs);
-    static void posixGpuToFileFallback(MemoryDescs const& memoryDesc, FileDescs const& fileDescs);
-    static void posixFileToGpuFallback(MemoryDescs const& memoryDesc, FileDescs const& fileDescs);
+    static void posixMemoryToFileFallback(MemoryDescs const& memoryDesc, FileDescs const& fileDescs);
+    static void posixFileToMemoryFallback(MemoryDescs const& memoryDesc, FileDescs const& fileDescs);
 
     /// @brief Coalesce contiguous memory regions to reduce memory registration overhead.
     /// Adjacent memory regions with the same deviceId will be merged into a single region.
@@ -159,8 +159,7 @@ public:
     /// Synchronously release the NIXL agent. Idempotent; drains in-flight requests.
     void shutdown() noexcept;
 
-    virtual void executeLoopbackRequest(
-        MemoryDescs const& memoryDescs, FileDescs const& fileDescs, bool isOffload) override;
+    bool executeLoopbackRequest(MemoryDescs const& memoryDescs, FileDescs const& fileDescs, bool isOffload) override;
 
 private:
     int registerMemory(MemoryDescs const& descs);

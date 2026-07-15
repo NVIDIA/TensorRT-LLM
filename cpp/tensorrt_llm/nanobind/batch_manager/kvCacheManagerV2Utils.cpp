@@ -72,6 +72,34 @@ void KVCacheManagerV2UtilsBindings::initBindings(nb::module_& module)
         .def_rw("dst", &Task<MemAddress, MemAddress>::dst)
         .def_rw("src", &Task<MemAddress, MemAddress>::src);
 
+    nb::class_<NixlGdsCopyEngine>(module, "NixlGdsCopyEngine")
+        .def(nb::init<SizeType32>(), nb::arg("thread_count"))
+        .def(
+            "copy_device_to_disk",
+            [](NixlGdsCopyEngine& self, std::vector<Task<DiskAddress, MemAddress>> const& tasks, ssize_t numBytes,
+                uintptr_t stream) -> int
+            { return self.copyDeviceToDisk(tasks, numBytes, reinterpret_cast<CUstream>(stream)); },
+            nb::arg("tasks"), nb::arg("num_bytes"), nb::arg("stream"), nb::call_guard<nb::gil_scoped_release>())
+        .def(
+            "copy_disk_to_device",
+            [](NixlGdsCopyEngine& self, std::vector<Task<MemAddress, DiskAddress>> const& tasks, ssize_t numBytes,
+                uintptr_t stream) -> int
+            { return self.copyDiskToDevice(tasks, numBytes, reinterpret_cast<CUstream>(stream)); },
+            nb::arg("tasks"), nb::arg("num_bytes"), nb::arg("stream"), nb::call_guard<nb::gil_scoped_release>())
+        .def(
+            "copy_host_to_disk",
+            [](NixlGdsCopyEngine& self, std::vector<Task<DiskAddress, MemAddress>> const& tasks, ssize_t numBytes,
+                uintptr_t stream) -> int
+            { return self.copyHostToDisk(tasks, numBytes, reinterpret_cast<CUstream>(stream)); },
+            nb::arg("tasks"), nb::arg("num_bytes"), nb::arg("stream"), nb::call_guard<nb::gil_scoped_release>())
+        .def(
+            "copy_disk_to_host",
+            [](NixlGdsCopyEngine& self, std::vector<Task<MemAddress, DiskAddress>> const& tasks, ssize_t numBytes,
+                uintptr_t stream) -> int
+            { return self.copyDiskToHost(tasks, numBytes, reinterpret_cast<CUstream>(stream)); },
+            nb::arg("tasks"), nb::arg("num_bytes"), nb::arg("stream"), nb::call_guard<nb::gil_scoped_release>())
+        .def("last_transfer_used_gds", &NixlGdsCopyEngine::lastTransferUsedGds);
+
     nb::class_<IndexMapper>(module, "IndexMapper")
         .def(nb::init<SizeType32, SizeType32>(), nb::arg("max_batch_size"), nb::arg("max_beam_width"))
         .def("add_new_sequence", &IndexMapper::addNewSequence)
