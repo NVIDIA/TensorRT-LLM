@@ -616,11 +616,13 @@ class KVCacheManager(BaseResourceManager):
 
         disk_cache_size = getattr(kv_cache_config, "disk_cache_size", None) or 0
         if disk_cache_size and (mapping.enable_attention_dp
-                                or mapping.pp_size > 1):
+                                or mapping.pp_size > 1 or mapping.cp_size > 1):
             raise ValueError(
-                "disk KV-cache tier is not supported with attention-DP or pipeline parallelism "
-                "(cross-rank onboard-readiness sync assumes identical per-rank batches); got "
-                f"enable_attention_dp={mapping.enable_attention_dp}, pp_size={mapping.pp_size}. "
+                "disk KV-cache tier is not supported with attention-DP, pipeline parallelism, "
+                "or context parallelism (cross-rank onboard-readiness sync assumes identical "
+                "per-rank batches and covers only the plain-TP group); got "
+                f"enable_attention_dp={mapping.enable_attention_dp}, pp_size={mapping.pp_size}, "
+                f"cp_size={mapping.cp_size}. "
                 "Disable disk_cache_size or use plain tensor parallelism.")
         blocks_in_disk_pool = 0
         if disk_cache_size:
