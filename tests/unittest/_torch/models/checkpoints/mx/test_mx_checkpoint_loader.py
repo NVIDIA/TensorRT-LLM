@@ -33,6 +33,7 @@ from tensorrt_llm._torch.models.checkpoints.mx import checkpoint_loader as mx_ch
 from tensorrt_llm._torch.models.checkpoints.mx.checkpoint_loader import (
     _MX_SOURCE_IDENTITY_METADATA_KEY,
     _MX_STAGED_TRANSFORM_PROTOCOL_VERSION,
+    _MX_TRANSFORM_ABI_ID_METADATA_KEY,
     _MX_TRANSFORM_PROTOCOL_VERSION_METADATA_KEY,
     _MX_WEIGHT_LAYOUT_METADATA_KEY,
     _MX_WEIGHT_LAYOUT_POST_TRANSFORM,
@@ -44,6 +45,7 @@ from tensorrt_llm._torch.models.checkpoints.mx.checkpoint_loader import (
 )
 from tensorrt_llm._torch.weight_sharing import (
     ARTIFACT_IDENTITY_FORMAT_VERSION,
+    LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1,
     SOURCE_IDENTITY_FORMAT_VERSION,
     ArtifactIdentity,
     SourceIdentity,
@@ -52,7 +54,12 @@ from tensorrt_llm._torch.weight_sharing import (
 _MISSING = object()
 
 
-def _identity(rank: int = 0, suffix: str = "same") -> SourceIdentity:
+def _identity(
+    rank: int = 0,
+    suffix: str = "same",
+    *,
+    transform_abi_id: str | None = LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1,
+) -> SourceIdentity:
     return SourceIdentity(
         format_version=SOURCE_IDENTITY_FORMAT_VERSION,
         artifact_identity=ArtifactIdentity(
@@ -66,6 +73,7 @@ def _identity(rank: int = 0, suffix: str = "same") -> SourceIdentity:
         parallel_fingerprint=f"parallel-{suffix}",
         rank=rank,
         shard_fingerprint=f"shard-{rank}-{suffix}",
+        transform_abi_id=transform_abi_id,
         model_name="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
     )
 
@@ -411,7 +419,7 @@ class TestLoadWeightsMxPath:
         mx_loader.load_weights.assert_not_called()
         mock_super_load.assert_called_once()
 
-    def test_post_transform_source_falls_back_before_p2p_when_not_allowlisted(
+    def test_post_transform_source_falls_back_before_p2p_when_profile_is_not_qualified(
         self,
     ) -> None:
         identity = _identity()
@@ -463,6 +471,51 @@ class TestLoadWeightsMxPath:
             source_instance.metadata.pop(_MX_TRANSFORM_PROTOCOL_VERSION_METADATA_KEY)
         else:
             source_instance.metadata[_MX_TRANSFORM_PROTOCOL_VERSION_METADATA_KEY] = protocol_value
+        fake_mx = _build_fake_modelexpress(
+            load_weights_return={},
+            source_instances=[source_instance],
+        )
+
+        with (
+            _install_fake_modelexpress(fake_mx),
+            patch.object(
+                HfCheckpointLoader, "load_weights", return_value=disk_weights
+            ) as mock_super_load,
+        ):
+            result = loader.load_weights(
+                "/nonexistent",
+                mapping=MagicMock(),
+                model=MagicMock(),
+                source_identity=identity,
+                allow_post_transform_weights=True,
+                prepare_post_transform_receiver=prepare_receiver,
+            )
+
+        assert result is disk_weights
+        assert loader.is_weights_preloaded() is False
+        assert loader.is_post_transform_weights_preloaded() is False
+        mx_loader = fake_mx.trtllm_live_transfer.MxLiveWeightLoader.return_value
+        mx_loader.load_weights.assert_not_called()
+        prepare_receiver.assert_not_called()
+        mock_super_load.assert_called_once()
+
+    @pytest.mark.parametrize(
+        "transform_abi_id",
+        ["trtllm-llama-target-layout-v2", _MISSING],
+        ids=["mismatched-abi", "missing-abi"],
+    )
+    def test_post_transform_source_with_unsupported_abi_falls_back_before_p2p(
+        self, transform_abi_id: object
+    ) -> None:
+        identity = _identity()
+        loader = MXCheckpointLoader(mx_server_url="http://mx:8001")
+        disk_weights = {"disk.weight": MagicMock()}
+        prepare_receiver = MagicMock()
+        source_instance = _source_instance(identity)
+        if transform_abi_id is _MISSING:
+            source_instance.metadata.pop(_MX_TRANSFORM_ABI_ID_METADATA_KEY)
+        else:
+            source_instance.metadata[_MX_TRANSFORM_ABI_ID_METADATA_KEY] = transform_abi_id
         fake_mx = _build_fake_modelexpress(
             load_weights_return={},
             source_instances=[source_instance],
@@ -632,6 +685,7 @@ class TestPublishAsSource:
         assert metadata[_MX_TRANSFORM_PROTOCOL_VERSION_METADATA_KEY] == str(
             _MX_STAGED_TRANSFORM_PROTOCOL_VERSION
         )
+        assert metadata[_MX_TRANSFORM_ABI_ID_METADATA_KEY] == LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1
         assert _MX_SOURCE_IDENTITY_METADATA_KEY in metadata
 
     def test_publish_synchronizes_cuda_before_exposing_source(self, monkeypatch):
@@ -661,6 +715,18 @@ class TestPublishAsSource:
 
         fake_mx.trtllm_live_transfer.publish_model_params.assert_not_called()
 
+    def test_transform_abi_required_for_post_transform_publish(self):
+        loader = MXCheckpointLoader(mx_server_url="http://mx:8001")
+        fake_mx = _build_fake_modelexpress()
+
+        with _install_fake_modelexpress(fake_mx):
+            loader.publish_as_source(
+                MagicMock(),
+                source_identity=_identity(transform_abi_id=None),
+            )
+
+        fake_mx.trtllm_live_transfer.publish_model_params.assert_not_called()
+
     def test_publish_without_metadata_kwarg_uses_identity_metadata(self):
         loader = MXCheckpointLoader(mx_server_url="http://mx:8001")
         calls = []
@@ -687,6 +753,7 @@ class TestPublishAsSource:
         assert metadata[_MX_TRANSFORM_PROTOCOL_VERSION_METADATA_KEY] == str(
             _MX_STAGED_TRANSFORM_PROTOCOL_VERSION
         )
+        assert metadata[_MX_TRANSFORM_ABI_ID_METADATA_KEY] == LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1
 
     def test_env_var_set_during_publish_then_restored(self):
         loader = MXCheckpointLoader(mx_server_url="http://mx-instance:9999")
@@ -764,6 +831,10 @@ class TestPublishAsSource:
         assert captured["identity"].extra_parameters[
             _MX_TRANSFORM_PROTOCOL_VERSION_METADATA_KEY
         ] == str(_MX_STAGED_TRANSFORM_PROTOCOL_VERSION)
+        assert (
+            captured["identity"].extra_parameters[_MX_TRANSFORM_ABI_ID_METADATA_KEY]
+            == LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1
+        )
 
     def test_serialized_identity_ignores_local_checkpoint_path(self):
         donor_identity = _identity()

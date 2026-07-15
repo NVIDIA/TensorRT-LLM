@@ -4,6 +4,7 @@
 
 from collections.abc import Callable
 from contextlib import contextmanager, nullcontext
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -16,6 +17,7 @@ from tensorrt_llm._torch.pyexecutor import model_loader as model_loader_mod
 from tensorrt_llm._torch.pyexecutor.model_loader import ModelLoader
 from tensorrt_llm._torch.weight_sharing import (
     ARTIFACT_IDENTITY_FORMAT_VERSION,
+    LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1,
     SOURCE_IDENTITY_FORMAT_VERSION,
     ArtifactIdentity,
     PostTransformProfile,
@@ -101,7 +103,14 @@ def _make_loader(monkeypatch, *, events, spec_config=None):
         side_effect=lambda fn, weights, mapper, **kwargs: fn(weights, mapper)
     )
     loader._load_and_validate_config = MagicMock(
-        return_value=SimpleNamespace(name="config", mapping=SimpleNamespace())
+        return_value=SimpleNamespace(
+            name="config",
+            mapping=SimpleNamespace(),
+            pretrained_config=SimpleNamespace(
+                architectures=["TinyForCausalLM"],
+                model_type="tiny",
+            ),
+        )
     )
 
     monkeypatch.setattr(model_loader_mod, "timing", lambda *_args, **_kwargs: nullcontext())
@@ -122,7 +131,10 @@ def _make_loader(monkeypatch, *, events, spec_config=None):
 
     def _build_source_identity(_cls, *_args, **kwargs):
         assert kwargs["artifact_identity"] is _SOURCE_IDENTITY.artifact_identity
-        return _SOURCE_IDENTITY
+        return replace(
+            _SOURCE_IDENTITY,
+            transform_abi_id=kwargs["transform_abi_id"],
+        )
 
     monkeypatch.setattr(
         model_loader_mod.SourceIdentity,
@@ -204,6 +216,7 @@ def _tiny_profile_registry() -> PostTransformProfileRegistry:
                 model_type="tiny",
                 speculative_mode=None,
                 protocol_version=(ModelLoader._MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION),
+                transform_abi_id=LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1,
                 transfer_scope=PostTransformTransferScope.TARGET_MODEL,
             ),
         )
@@ -488,6 +501,7 @@ def test_gms_rw_mx_post_transform_preload_uses_staged_path(monkeypatch):
     _args, kwargs = checkpoint_loader.load_weights.call_args
     assert kwargs["allow_post_transform_weights"] is True
     assert callable(kwargs["prepare_post_transform_receiver"])
+    assert loader._source_identity.transform_abi_id == LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1
     loader._call_load_weights.assert_not_called()
     checkpoint_loader.post_load_publish.assert_called_once_with(
         model,

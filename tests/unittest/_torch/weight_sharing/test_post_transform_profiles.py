@@ -13,10 +13,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from types import SimpleNamespace
+
 import pytest
 from torch import nn
 
 from tensorrt_llm._torch.weight_sharing import (
+    LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1,
+    PostTransformConfigIdentity,
     PostTransformFeature,
     PostTransformProfile,
     PostTransformProfileRegistry,
@@ -41,6 +45,7 @@ def _profile(
     model_type: str = "model",
     speculative_mode: str | None = None,
     protocol_version: int = 1,
+    transform_abi_id: str = LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1,
     transfer_scope: PostTransformTransferScope = PostTransformTransferScope.TARGET_MODEL,
     supported_features: frozenset[PostTransformFeature] = frozenset(),
 ) -> PostTransformProfile:
@@ -51,6 +56,7 @@ def _profile(
         model_type=model_type,
         speculative_mode=speculative_mode,
         protocol_version=protocol_version,
+        transform_abi_id=transform_abi_id,
         transfer_scope=transfer_scope,
         supported_features=supported_features,
     )
@@ -72,6 +78,7 @@ def test_exact_profile_is_qualified() -> None:
     assert decision.qualified
     assert decision.reason is PostTransformQualificationReason.QUALIFIED
     assert decision.profile is profile
+    assert decision.transform_abi_id == LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1
     assert decision.unsupported_features == frozenset()
 
 
@@ -232,6 +239,8 @@ def test_registry_rejects_duplicate_match_key() -> None:
             id="speculative-mode",
         ),
         pytest.param({"protocol_version": 0}, "protocol_version", id="protocol"),
+        pytest.param({"transform_abi_id": ""}, "transform_abi_id", id="transform-abi"),
+        pytest.param({"transform_abi_id": 1}, "transform_abi_id", id="transform-abi-type"),
     ],
 )
 def test_profile_rejects_invalid_required_fields(
@@ -239,3 +248,45 @@ def test_profile_rejects_invalid_required_fields(
 ) -> None:
     with pytest.raises(ValueError, match=expected_message):
         _profile(**kwargs)
+
+
+def test_config_identity_is_captured_before_later_normalization() -> None:
+    pretrained_config = SimpleNamespace(
+        architectures=["ModelForCausalLM"],
+        model_type="model",
+    )
+    model_config = SimpleNamespace(pretrained_config=pretrained_config)
+
+    identity = PostTransformConfigIdentity.from_model_config(model_config)
+    pretrained_config.architectures[0] = "NormalizedForCausalLM"
+    pretrained_config.model_type = "normalized"
+
+    assert identity == PostTransformConfigIdentity(
+        architecture="ModelForCausalLM",
+        model_type="model",
+    )
+
+
+@pytest.mark.parametrize(
+    "architectures, model_type, expected",
+    [
+        pytest.param([], "model", (None, "model"), id="missing-architecture"),
+        pytest.param([1], "model", (None, "model"), id="non-string-architecture"),
+        pytest.param(["ModelForCausalLM"], 1, ("ModelForCausalLM", None), id="model-type"),
+    ],
+)
+def test_config_identity_fails_closed_for_noncanonical_dimensions(
+    architectures: list[object],
+    model_type: object,
+    expected: tuple[str | None, str | None],
+) -> None:
+    identity = PostTransformConfigIdentity.from_model_config(
+        SimpleNamespace(
+            pretrained_config=SimpleNamespace(
+                architectures=architectures,
+                model_type=model_type,
+            )
+        )
+    )
+
+    assert (identity.architecture, identity.model_type) == expected

@@ -34,6 +34,7 @@ from _source_identity_fakes import (
 )
 
 from tensorrt_llm._torch.weight_sharing import (
+    LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1,
     IdentityCheckPolicy,
     SourceIdentity,
     SourceIdentityMismatchError,
@@ -65,6 +66,26 @@ def test_from_model_config_requires_one_artifact_source() -> None:
             config,
             checkpoint_dir="/checkpoint",
             artifact_identity=make_artifact_identity(),
+        )
+
+
+def test_from_model_config_binds_transform_abi() -> None:
+    identity = SourceIdentity.from_model_config(
+        FakeModelConfig(),
+        artifact_identity=make_artifact_identity(),
+        transform_abi_id=LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1,
+    )
+
+    assert identity.transform_abi_id == LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1
+
+
+@pytest.mark.parametrize("transform_abi_id", ["", 1])
+def test_source_identity_rejects_invalid_transform_abi(transform_abi_id: object) -> None:
+    with pytest.raises(ValueError, match="transform_abi_id"):
+        SourceIdentity.from_model_config(
+            FakeModelConfig(),
+            artifact_identity=make_artifact_identity(),
+            transform_abi_id=transform_abi_id,
         )
 
 
@@ -201,7 +222,10 @@ def test_enforced_sharing_skips_global():
 
 
 def test_serialization_roundtrip():
-    a = identity_from(FakeModelConfig())
+    a = identity_from(
+        FakeModelConfig(),
+        transform_abi_id=LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1,
+    )
     restored = SourceIdentity.from_dict(a.to_dict())
     assert restored == a
     assert a.matches(restored).matched
@@ -211,6 +235,13 @@ def test_serialization_roundtrip():
 def test_deserialization_rejects_missing_artifact_identity():
     payload = identity_from(FakeModelConfig()).to_dict()
     payload.pop("artifact_identity")
+    with pytest.raises(KeyError):
+        SourceIdentity.from_dict(payload)
+
+
+def test_deserialization_rejects_missing_transform_abi_field():
+    payload = identity_from(FakeModelConfig()).to_dict()
+    payload.pop("transform_abi_id")
     with pytest.raises(KeyError):
         SourceIdentity.from_dict(payload)
 
@@ -226,6 +257,14 @@ def test_deserialization_rejects_v1_identity_without_artifact_binding():
     payload = identity_from(FakeModelConfig()).to_dict()
     payload["format_version"] = 1
     payload.pop("artifact_identity")
+    with pytest.raises(ValueError, match="Unsupported SourceIdentity format version"):
+        SourceIdentity.from_dict(payload)
+
+
+def test_deserialization_rejects_v2_identity_without_transform_abi_binding():
+    payload = identity_from(FakeModelConfig()).to_dict()
+    payload["format_version"] = 2
+    payload.pop("transform_abi_id")
     with pytest.raises(ValueError, match="Unsupported SourceIdentity format version"):
         SourceIdentity.from_dict(payload)
 
@@ -272,6 +311,41 @@ def test_check_enforce_shares_despite_mismatch():
     assert decision.should_share is True
 
 
+def test_transform_abi_mismatch_is_never_bypassed():
+    local = identity_from(
+        FakeModelConfig(),
+        transform_abi_id=LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1,
+    )
+    source = identity_from(
+        FakeModelConfig(),
+        transform_abi_id="trtllm-llama-target-layout-v2",
+    )
+
+    result = local.matches(source, compare_global=False, compare_shard=False)
+    decision = check_weight_sharing_compatibility(
+        local,
+        source,
+        IdentityCheckPolicy.ENFORCE,
+    )
+
+    assert not result.matched
+    assert result.mismatched_fields == ["transform_abi_id"]
+    assert decision.should_share is False
+
+
+def test_transform_abi_participates_in_global_fingerprint():
+    without_abi = identity_from(FakeModelConfig())
+    with_abi = identity_from(
+        FakeModelConfig(),
+        transform_abi_id=LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1,
+    )
+
+    result = without_abi.matches(with_abi)
+
+    assert result.mismatched_fields == ["transform_abi_id"]
+    assert without_abi.global_fingerprint != with_abi.global_fingerprint
+
+
 def test_format_version_mismatch_never_matches():
     a = identity_from(FakeModelConfig())
     b = (
@@ -289,5 +363,11 @@ def test_format_version_mismatch_never_matches():
         )
     )
     result = a.matches(b)
+    enforce_decision = check_weight_sharing_compatibility(
+        a,
+        b,
+        IdentityCheckPolicy.ENFORCE,
+    )
     assert not result.matched
     assert "format_version" in result.mismatched_fields
+    assert enforce_decision.should_share is False
