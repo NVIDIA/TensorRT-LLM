@@ -321,56 +321,24 @@ class CacheCost:
         return self.slope * tokens + self.intercept
 
 
-def get_mla_context_workspace_bytes_per_token(model_config, mapping) -> int:
-    """Per-token byte cost of the fp8 context-MLA K/V dequant workspace.
+def get_attention_workspace_bytes_per_token(model_config, mapping) -> int:
+    """Per-token workspace headroom the model's selected attention backend declares.
 
-    This buffer is shared across attention layers and scales with the summed attended KV length
-    (``total_kv_len``) of the step's context requests, which KV-cache reuse can grow far past the floor the
-    profiling forward measures against an empty cache. The per-token size is the single source of truth in
-    C++ (``AttentionOp::contextMlaWorkspaceBytesPerToken``, exposed via nanobind), so the estimator's
-    reserve cannot drift from the runtime allocation. Returns 0 for non-MLA / non-fp8-KV / absorption-mode
-    sparse MLA (which reads K/V straight from the paged cache). A non-zero result drives both the reserve
-    and the scheduler's admission cap.
+    The KV-cache profiling forward under-measures any attention workspace sized by a runtime quantity it
+    does not drive to its serving maximum (e.g. ``total_kv_len``, inflated by KV reuse). Backends declare
+    such a buffer via ``AttentionBackend.runtime_workspace_bytes_per_token``; this resolves the model's
+    backend and returns its rate. A backend that stages no such buffer inherits the default 0, so no
+    workspace is reserved and no admission cap is installed for it. See ``ATTENTION_DEVELOPER_GUIDE.md``
+    §2.3.
     """
-    from tensorrt_llm.bindings.internal import thop
-    config = model_config.pretrained_config
-    if not is_mla(config):
-        return 0
-    quant_config = model_config.quant_config
-    fp8_context_mla = (quant_config is not None
-                       and quant_config.quant_mode.has_fp8_kv_cache()
-                       and get_sm_version() in (90, 100, 103, 120))
-    if not fp8_context_mla:
-        return 0
-    # Attention-DP runs the full head set per rank; otherwise heads shard across TP (mirror mNumAttnHeads).
-    attn_tp = 1 if mapping.enable_attention_dp else mapping.tp_size
-    num_attn_heads = config.num_attention_heads // attn_tp
-    # The buffer is skipped only where AttentionOp::useSparseMLA() holds, which needs all three of:
-    #   * DSA / DeepSeek-V4 -- only these lower to the absorption path that reads K/V from the paged cache.
-    #     Skip-softmax passes no sparse indices to C++, and its ignore-list can exclude a layer, so those
-    #     layers still run dense MLA. The workspace is shared, so one dense layer forces the reserve.
-    #   * SM 100 / 103 -- mUseTllmGen is `sm >= 100 && sm != 120`.
-    #   * short-seq MHA fallback off -- it routes short contexts back through the dense path.
-    # Match the runtime predicate, not just "a sparse config exists": over-reserving costs KV pool,
-    # under-reserving OOMs mid-forward.
-    sparse_algorithm = getattr(model_config.sparse_attention_config,
-                               "algorithm", None)
-    sparse_mla = (sparse_algorithm in ("dsa", "deepseek_v4")
-                  and get_sm_version() in (100, 103))
-    short_seq_mha_enabled = int(
-        os.environ.get("TRTLLM_MLA_SHORT_SEQ_MHA_THRESHOLD", "0")) > 0
-    stages_no_buffer = sparse_mla and not short_seq_mha_enabled
-    return int(
-        thop.get_context_mla_workspace_bytes_per_token(
-            num_attn_heads=num_attn_heads,
-            qk_rope_head_dim=config.qk_rope_head_dim,
-            qk_nope_head_dim=config.qk_nope_head_dim,
-            v_head_dim=config.v_head_dim,
-            fp8_context_mla=fp8_context_mla,
-            # Paged context MLA always uses separate Q/KV input; the term is otherwise gated to 0.
-            separate_q_and_kv_input=True,
-            sparse_mla=stages_no_buffer,
-        ))
+    from ..attention_backend.utils import get_attention_backend
+
+    # Resolved without ``sparse_params``: those are per-layer, while this workspace is one buffer shared
+    # across every attention layer, so the declaration is a whole-model question. The sparse backends all
+    # derive from the dense class and inherit its declaration, which reads the sparse gate off model_config.
+    return get_attention_backend(
+        model_config.attn_backend).runtime_workspace_bytes_per_token(
+            model_config, mapping)
 
 
 def get_mla_context_workspace_kv_len_cap(kv_cache_config, max_batch_size,
@@ -1171,13 +1139,13 @@ class KvCacheCreator:
         self._kv_cache_config.pool_ratio = self._pool_ratio_in
         self._kv_cache_config.avg_seq_len = self._avg_seq_len_in
 
-        # Reserve headroom for the fp8 context-MLA attention workspace, which the profiling forward
-        # under-measures (fresh-prefill dummies never exercise KV reuse). This is only needed when KV-cache
-        # reuse can push summed attended KV past the profiled floor: get_mla_context_workspace_kv_len_cap
-        # returns None (no reservation) with reuse off -- the workspace is then bounded by max_num_tokens --
-        # or with chunked prefill -- each attention launch is then bounded by its chunk buffer -- since
-        # reserving in those cases would double-count and needlessly shrink the KV pool (up to ~37% for
-        # Kimi-K2 attention-DP). When it does apply,
+        # Reserve headroom for the attention workspace the selected backend declares (today: fp8
+        # context-MLA), which the profiling forward under-measures (fresh-prefill dummies never exercise
+        # KV reuse). This is only needed when KV-cache reuse can push summed attended KV past the profiled
+        # floor: get_mla_context_workspace_kv_len_cap returns None (no reservation) with reuse off -- the
+        # workspace is then bounded by max_num_tokens -- or with chunked prefill -- each attention launch is
+        # then bounded by its chunk buffer -- since reserving in those cases would double-count and
+        # needlessly shrink the KV pool (up to ~37% for Kimi-K2 attention-DP). When it does apply,
         # reserve w * L_cap bytes -- covering the worst-case summed attended KV the scheduler admits
         # (get_mla_context_workspace_kv_len_cap) -- but clamp it to the per-token split budget * w / (k + w)
         # so a memory-constrained node shares the budget at a common token count instead of starving the
@@ -1185,7 +1153,7 @@ class KvCacheCreator:
         # covers exactly reserve/w tokens of summed attended KV; that count is carried to the KV manager as
         # the scheduler's admission cap so it never re-derives the cap from pool layout (which V2
         # overstates). No cap or w == 0 -> no-op.
-        w_bytes_per_token = get_mla_context_workspace_bytes_per_token(
+        w_bytes_per_token = get_attention_workspace_bytes_per_token(
             self._model_engine.model.model_config, self._mapping)
         kv_len_cap = get_mla_context_workspace_kv_len_cap(
             self._kv_cache_config, self._max_batch_size, self._max_num_tokens,
