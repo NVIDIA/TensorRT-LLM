@@ -240,31 +240,52 @@ class PeerRegistrar:
                 f"(local={self_pv.mapper_kind.name}, peer={peer_pv.mapper_kind.name})"
             )
 
-        # FLAT pools carry no per-buffer layer info, so layer ids and
-        # layer count come from the layer_group itself.
-        #
-        # Sort by global_layer_id so that ``.index(first_overlap_layer)``
-        # below returns the layer's slot position. This relies on the
-        # convention that managers (V1 / V2 / DSv4) assign global_layer_id
-        # monotonically with the layer's byte offset in the slot.
+        # Order both layer-id lists by physical slot position so that a layer's
+        # index in the list *is* its slot offset. The KV transfer maps layers
+        # positionally (byte offset = index * per-layer stride) and the mappers
+        # copy one contiguous ``[offset, offset + transfer_layers)`` fragment, so
+        # the order must reflect the actual physical layout. We derive it from
+        # the KV-cache manager's layout rather than assuming ``global_layer_id``
+        # is monotonic with the layer's byte offset in the slot:
+        #   INDEXED: ``get_pool_view_global_layer_ids`` orders layers by their
+        #            ``buffer_entries`` offsets (the V2 pool-view layout).
+        #   FLAT:    the pool has no per-buffer layer info; it packs the whole
+        #            layer group equal-sized in ``local_layers`` order, so that
+        #            order already *is* the physical order.
         if self_pv.mapper_kind == MapperKind.FLAT:
-            self_global_ids = sorted(get_global_layer_ids(self_lg))
-            peer_global_ids = sorted(get_global_layer_ids(peer_lg))
+            self_global_ids = get_global_layer_ids(self_lg)
+            peer_global_ids = get_global_layer_ids(peer_lg)
             self_num_layers = get_layer_group_num_layers(self_lg)
             peer_num_layers = get_layer_group_num_layers(peer_lg)
         else:
-            self_global_ids = sorted(get_pool_view_global_layer_ids(self_pv, self_lg))
-            peer_global_ids = sorted(get_pool_view_global_layer_ids(peer_pv, peer_lg))
+            self_global_ids = get_pool_view_global_layer_ids(self_pv, self_lg)
+            peer_global_ids = get_pool_view_global_layer_ids(peer_pv, peer_lg)
             self_num_layers = get_pool_view_num_layers(self_pv)
             peer_num_layers = get_pool_view_num_layers(peer_pv)
 
-        overlapping_layers = sorted(set(self_global_ids) & set(peer_global_ids))
-        transfer_layers = len(overlapping_layers)
+        overlap = set(self_global_ids) & set(peer_global_ids)
+        transfer_layers = len(overlap)
 
         if transfer_layers > 0:
-            first_overlap_layer = overlapping_layers[0]
+            # Anchor on the overlap layer that comes first in self's physical
+            # order and locate the *same* global layer in peer's physical order.
+            # Since the mapper copies a single contiguous fragment, the shared
+            # layers must occupy an aligned, contiguous run of slots on both
+            # peers. Validate that here instead of relying on a global-layer-id
+            # ordering convention and silently transferring the wrong bytes.
+            first_overlap_layer = next(g for g in self_global_ids if g in overlap)
             self_layer_offset = self_global_ids.index(first_overlap_layer)
             peer_layer_offset = peer_global_ids.index(first_overlap_layer)
+            self_run = self_global_ids[self_layer_offset : self_layer_offset + transfer_layers]
+            peer_run = peer_global_ids[peer_layer_offset : peer_layer_offset + transfer_layers]
+            if set(self_run) != overlap or self_run != peer_run:
+                raise ValueError(
+                    "PeerRegistrar.get_kv_map: shared layers do not form an "
+                    "aligned contiguous run of physical slots on both peers "
+                    f"(self={self_global_ids}, peer={peer_global_ids}, "
+                    f"overlap={sorted(overlap)}); the KV transfer requires shared "
+                    "layers to occupy matching contiguous slot ranges."
+                )
         else:
             self_layer_offset = 0
             peer_layer_offset = 0
