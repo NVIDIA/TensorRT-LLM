@@ -112,8 +112,6 @@ struct DataBase
 
     /// For fused shared expert
     int32_t mNumFusedSharedExperts;
-    int32_t mSharedExpertTokenOffset;
-    int32_t mSharedExpertNumTokens;
     int32_t mTotalExpertsPerToken;
 };
 
@@ -152,8 +150,6 @@ struct KernelParamsBase
     int32_t mNumLocalExperts = 0;
 
     int32_t mNumFusedSharedExperts;
-    int32_t mSharedExpertTokenOffset;
-    int32_t mSharedExpertNumTokens;
     int32_t mTotalExpertsPerToken;
 
     // Public initialization function - make it a template to accept different Data types
@@ -184,8 +180,6 @@ struct KernelParamsBase
         mNumLocalExperts = data.mNumLocalExperts;
 
         mNumFusedSharedExperts = data.mNumFusedSharedExperts;
-        mSharedExpertTokenOffset = data.mSharedExpertTokenOffset;
-        mSharedExpertNumTokens = data.mSharedExpertNumTokens;
         mTotalExpertsPerToken = data.mTotalExpertsPerToken;
     }
 };
