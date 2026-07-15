@@ -1030,7 +1030,11 @@ def test_hybrid_cache_transceiver_cancel_request(backend):
     # Try to receive gen request
     cache_transceiver_gen.request_and_receive_async(gen_request)
 
-    # Block the main thread due to the async operation
-    time.sleep(2)
-    cache_transceiver_gen.check_gen_transfer_status(0)
+    def transfer_finished():
+        return (gen_request.state
+                != LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS)
+
+    wait_for_transfer_completion(
+        lambda: cache_transceiver_gen.check_gen_transfer_status(0),
+        transfer_finished)
     assert gen_request.state == LlmRequestState.DISAGG_TRANS_ERROR
