@@ -378,6 +378,7 @@ full:RTX_PRO_6000_Blackwell_Server_Edition/perf/test_perf.py::test_perf[quant:w4
 full:sm100/examples/test_nemotron.py::test_llm_nemotron_3_8b_1gpu[bfloat16-fp8] SKIP (megatron-core 0.8 is not supported in python 3.12)
 full:sm100/unittest/bindings SKIP (Disable for Blackwell)
 kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2Llama::test_chunked_prefill SKIP (https://nvbugs/6428002)
+kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2Llama::test_eviction_with_block_reuse SKIP (https://nvbugs/6462303)
 llmapi/test_llm_examples.py::test_llmapi_speculative_decoding_eagle3 SKIP (https://nvbugs/6075431)
 perf/test_perf.py::test_perf[bart_large_cnn-plugin-float16-bs:8-input_output_len:60,20] SKIP # (https://nvidia.slack.com/archives/C059LSY62BT/p1704525727177449)
 perf/test_perf.py::test_perf[flan_t5_base-bench-float16-input_output_len:128,20] SKIP
@@ -445,6 +446,7 @@ unittest/_torch/ray_orchestrator/multi_gpu/test_llm_update_weights_multi_gpu.py 
 unittest/_torch/ray_orchestrator/multi_gpu/test_llm_update_weights_multi_gpu.py::test_llm_partial_update_weights_nvfp4[auto-Qwen3/Qwen3-8B] SKIP (https://nvbugs/6372690)
 unittest/_torch/ray_orchestrator/multi_gpu/test_llm_update_weights_multi_gpu.py::test_llm_partial_update_weights_nvfp4[fp8-Qwen3/Qwen3-30B-A3B] SKIP (https://nvbugs/6372690)
 unittest/_torch/ray_orchestrator/multi_gpu/test_llm_update_weights_multi_gpu.py::test_llm_partial_update_weights_nvfp4[fp8-Qwen3/Qwen3-8B] SKIP (https://nvbugs/6372690)
+unittest/_torch/speculative/hw_agnostic/test_dflash.py::test_dflash_qwen3_5_4b[False] SKIP (https://nvbugs/6451032)
 unittest/_torch/speculative/hw_agnostic/test_dflash.py::test_dflash_qwen3_5_4b[True] SKIP (https://nvbugs/6451032)
 unittest/_torch/speculative/test_eagle3.py::test_llama_eagle3[True-TRTLLM-True-False-True-True-True-False-False-False] SKIP (https://nvbugs/6451425)
 unittest/_torch/thop/parallel/test_fp8_rowwise_linear.py::test_fp8_rowwise_linear[dtype1] SKIP (https://nvbugs/6301807)
