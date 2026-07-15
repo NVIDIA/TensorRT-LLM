@@ -14,7 +14,7 @@
 # the License.
 """Wan 2.2 fused DiT kernel helpers.
 
-Provides thin wrappers around the trtllm::fused_dit_layernorm_shift_scale[_quant]
+Provides thin wrappers around the trtllm::fused_adaptive_layernorm[_quant]
 custom ops used for the three LayerNorm sites in WanBlock.
 """
 
@@ -66,11 +66,11 @@ def apply_fused_layernorm_adaln_quant(
     scale_msa = scale_msa.to(dtype=x.dtype).contiguous()
     shift_msa = shift_msa.to(dtype=x.dtype).contiguous()
     if fp4_input_scale is not None:
-        y_fp4, sf_out = torch.ops.trtllm.fused_dit_layernorm_shift_scale_quant(
+        y_fp4, sf_out = torch.ops.trtllm.fused_adaptive_layernorm_quant(
             x, None, None, scale_msa, shift_msa, fp4_input_scale, seq_len_per_batch, eps
         )
         return Fp4QuantizedTensor(y_fp4, sf_out)
-    out = torch.ops.trtllm.fused_dit_layernorm_shift_scale(
+    out = torch.ops.trtllm.fused_adaptive_layernorm(
         x, None, None, scale_msa, shift_msa, seq_len_per_batch, eps
     )
     return out
@@ -92,7 +92,7 @@ def apply_fused_layernorm_affine_quant(
     # seq_len_per_batch is unused for the affine path; pass M as a safe value.
     seq_len_per_batch = x.shape[0]
     if fp4_input_scale is not None:
-        y_fp4, sf_out = torch.ops.trtllm.fused_dit_layernorm_shift_scale_quant(
+        y_fp4, sf_out = torch.ops.trtllm.fused_adaptive_layernorm_quant(
             x,
             ln_weight.to(x.dtype),
             ln_bias.to(x.dtype),
@@ -103,7 +103,7 @@ def apply_fused_layernorm_affine_quant(
             eps,
         )
         return Fp4QuantizedTensor(y_fp4, sf_out)
-    out = torch.ops.trtllm.fused_dit_layernorm_shift_scale(
+    out = torch.ops.trtllm.fused_adaptive_layernorm(
         x, ln_weight.to(x.dtype), ln_bias.to(x.dtype), None, None, seq_len_per_batch, eps
     )
     return out

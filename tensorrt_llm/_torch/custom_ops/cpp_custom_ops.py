@@ -1297,7 +1297,7 @@ def _register_fake():
         sf_out = x.new_empty((sf_size, ), dtype=torch.uint8)
         return y_fp4, sf_out
 
-    @torch.library.register_fake("trtllm::fused_dit_layernorm_shift_scale")
+    @torch.library.register_fake("trtllm::fused_adaptive_layernorm")
     def _(
         x: torch.Tensor,
         ln_weight: Optional[torch.Tensor],
@@ -1309,8 +1309,7 @@ def _register_fake():
     ) -> torch.Tensor:
         return x.new_empty(x.shape, dtype=torch.bfloat16)
 
-    @torch.library.register_fake(
-        "trtllm::fused_dit_layernorm_shift_scale_quant")
+    @torch.library.register_fake("trtllm::fused_adaptive_layernorm_quant")
     def _(
         x: torch.Tensor,
         ln_weight: Optional[torch.Tensor],

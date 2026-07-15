@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-Tests for trtllm::fused_dit_layernorm_shift_scale[_quant].
+Tests for trtllm::fused_adaptive_layernorm[_quant].
 
 Covers all 6 compile-time instantiations:
   (has_ln_affine=F, has_modulation=F, has_quant=F) -- plain LN -> bf16
@@ -122,7 +122,7 @@ def test_bf16_correctness(M, B, has_ln_affine, has_modulation):
     x, ln_w, ln_b, scale_msa, shift_msa, seq_len, ref = _make_inputs(
         M, B, has_ln_affine, has_modulation
     )
-    out = torch.ops.trtllm.fused_dit_layernorm_shift_scale(
+    out = torch.ops.trtllm.fused_adaptive_layernorm(
         x, ln_w, ln_b, scale_msa, shift_msa, seq_len, EPS
     )
 
@@ -157,9 +157,7 @@ def test_adaln_batch_modulation_correctness():
         torch.bfloat16
     )
 
-    out = torch.ops.trtllm.fused_dit_layernorm_shift_scale(
-        x, None, None, scale_msa, shift_msa, S, EPS
-    )
+    out = torch.ops.trtllm.fused_adaptive_layernorm(x, None, None, scale_msa, shift_msa, S, EPS)
     ref = _ref_layernorm_adaln(x, scale_msa, shift_msa, S, EPS).to(torch.bfloat16)
 
     # Cross-batch: rows from different batch elements should be measurably different.
@@ -192,7 +190,7 @@ def test_affine_fp32_weight_downcast_matches_eager():
     ln_bias = torch.randn(D, device=device) * 0.1
 
     # The op reads weight/bias as bf16 (kernel ABI); mimic the model's downcast.
-    out = torch.ops.trtllm.fused_dit_layernorm_shift_scale(
+    out = torch.ops.trtllm.fused_adaptive_layernorm(
         x, ln_weight.to(torch.bfloat16), ln_bias.to(torch.bfloat16), None, None, M, EPS
     )
     ref_fp32 = _ref_layernorm_affine(x, ln_weight, ln_bias, EPS)
@@ -246,15 +244,15 @@ def test_fp4_quant_gemm_correctness(M, B, has_ln_affine, has_modulation):
 
     # bf16 reference: unfused LN + F.linear.
     if has_ln_affine:
-        out_bf16 = torch.ops.trtllm.fused_dit_layernorm_shift_scale(
+        out_bf16 = torch.ops.trtllm.fused_adaptive_layernorm(
             x, ln_w, ln_b, None, None, seq_len, EPS
         )
     elif has_modulation:
-        out_bf16 = torch.ops.trtllm.fused_dit_layernorm_shift_scale(
+        out_bf16 = torch.ops.trtllm.fused_adaptive_layernorm(
             x, None, None, scale_msa, shift_msa, seq_len, EPS
         )
     else:
-        out_bf16 = torch.ops.trtllm.fused_dit_layernorm_shift_scale(
+        out_bf16 = torch.ops.trtllm.fused_adaptive_layernorm(
             x, None, None, None, None, seq_len, EPS
         )
     D_ref = F.linear(out_bf16, W)
@@ -262,7 +260,7 @@ def test_fp4_quant_gemm_correctness(M, B, has_ln_affine, has_modulation):
     sf_scale_x = (448.0 * 6.0) / out_bf16.abs().max().float()
     sf_scale_w = (448.0 * 6.0) / W.abs().max().float()
 
-    y_fp4, y_sf = torch.ops.trtllm.fused_dit_layernorm_shift_scale_quant(
+    y_fp4, y_sf = torch.ops.trtllm.fused_adaptive_layernorm_quant(
         x, ln_w, ln_b, scale_msa, shift_msa, sf_scale_x, seq_len, EPS
     )
 
@@ -297,7 +295,7 @@ def test_validation_mutual_exclusivity():
     scale = torch.zeros(1, D, device=device).to(torch.bfloat16)
     shift = torch.zeros(1, D, device=device).to(torch.bfloat16)
     with pytest.raises(RuntimeError, match="mutually exclusive"):
-        torch.ops.trtllm.fused_dit_layernorm_shift_scale(x, ln_w, ln_b, scale, shift, 32, EPS)
+        torch.ops.trtllm.fused_adaptive_layernorm(x, ln_w, ln_b, scale, shift, 32, EPS)
 
 
 def test_validation_wrong_hidden_dim():
@@ -307,7 +305,7 @@ def test_validation_wrong_hidden_dim():
     device = torch.device("cuda")
     x = torch.randn(32, 4096, device=device).to(torch.bfloat16)
     with pytest.raises(RuntimeError):
-        torch.ops.trtllm.fused_dit_layernorm_shift_scale(x, None, None, None, None, 32, EPS)
+        torch.ops.trtllm.fused_adaptive_layernorm(x, None, None, None, None, 32, EPS)
 
 
 def test_validation_wrong_dtype():
@@ -317,7 +315,7 @@ def test_validation_wrong_dtype():
     device = torch.device("cuda")
     x = torch.randn(32, D, device=device)  # float32
     with pytest.raises(RuntimeError):
-        torch.ops.trtllm.fused_dit_layernorm_shift_scale(x, None, None, None, None, 32, EPS)
+        torch.ops.trtllm.fused_adaptive_layernorm(x, None, None, None, None, 32, EPS)
 
 
 def test_validation_non_divisible_seq_len():
@@ -330,7 +328,7 @@ def test_validation_non_divisible_seq_len():
     shift = torch.zeros(3, D, device=device).to(torch.bfloat16)
     # seq_len_per_batch=11 → B=3, 3*11=33 ✓; seq_len_per_batch=10 → 33%10≠0 ✗
     with pytest.raises(RuntimeError):
-        torch.ops.trtllm.fused_dit_layernorm_shift_scale(x, None, None, scale, shift, 10, EPS)
+        torch.ops.trtllm.fused_adaptive_layernorm(x, None, None, scale, shift, 10, EPS)
 
 
 def test_validation_non_contiguous_x():
@@ -343,7 +341,7 @@ def test_validation_non_contiguous_x():
     x_strided = base[:, :D]
     assert not x_strided.is_contiguous()
     with pytest.raises(RuntimeError, match=r"contiguous"):
-        torch.ops.trtllm.fused_dit_layernorm_shift_scale(x_strided, None, None, None, None, 32, EPS)
+        torch.ops.trtllm.fused_adaptive_layernorm(x_strided, None, None, None, None, 32, EPS)
 
 
 def test_validation_ln_weight_without_ln_bias():
@@ -354,7 +352,7 @@ def test_validation_ln_weight_without_ln_bias():
     x = torch.randn(32, D, device=device).to(torch.bfloat16)
     ln_w = torch.ones(D, device=device).to(torch.bfloat16)
     with pytest.raises(RuntimeError, match="ln_weight and ln_bias must both be provided together"):
-        torch.ops.trtllm.fused_dit_layernorm_shift_scale(x, ln_w, None, None, None, 32, EPS)
+        torch.ops.trtllm.fused_adaptive_layernorm(x, ln_w, None, None, None, 32, EPS)
 
 
 def test_validation_scale_msa_without_shift_msa():
@@ -367,7 +365,7 @@ def test_validation_scale_msa_without_shift_msa():
     with pytest.raises(
         RuntimeError, match="scale_msa and shift_msa must both be provided together"
     ):
-        torch.ops.trtllm.fused_dit_layernorm_shift_scale(x, None, None, scale, None, 32, EPS)
+        torch.ops.trtllm.fused_adaptive_layernorm(x, None, None, scale, None, 32, EPS)
 
 
 def test_validation_non_positive_seq_len():
@@ -379,7 +377,7 @@ def test_validation_non_positive_seq_len():
     scale = torch.zeros(1, D, device=device).to(torch.bfloat16)
     shift = torch.zeros(1, D, device=device).to(torch.bfloat16)
     with pytest.raises(RuntimeError, match="seq_len_per_batch must be positive"):
-        torch.ops.trtllm.fused_dit_layernorm_shift_scale(x, None, None, scale, shift, 0, EPS)
+        torch.ops.trtllm.fused_adaptive_layernorm(x, None, None, scale, shift, 0, EPS)
 
 
 @skip_pre_blackwell
@@ -391,7 +389,7 @@ def test_validation_sf_scale_wrong_dtype():
     x = torch.randn(32, D, device=device).to(torch.bfloat16)
     sf_scale = torch.ones(1, device=device).to(torch.bfloat16)  # wrong dtype
     with pytest.raises(RuntimeError, match="dtype"):
-        torch.ops.trtllm.fused_dit_layernorm_shift_scale_quant(
+        torch.ops.trtllm.fused_adaptive_layernorm_quant(
             x, None, None, None, None, sf_scale, 32, EPS
         )
 
@@ -405,7 +403,7 @@ def test_validation_sf_scale_non_scalar():
     x = torch.randn(32, D, device=device).to(torch.bfloat16)
     sf_scale = torch.ones(2, device=device)  # non-scalar
     with pytest.raises(RuntimeError, match="scalar tensor"):
-        torch.ops.trtllm.fused_dit_layernorm_shift_scale_quant(
+        torch.ops.trtllm.fused_adaptive_layernorm_quant(
             x, None, None, None, None, sf_scale, 32, EPS
         )
 
@@ -453,7 +451,7 @@ def test_wan14b_production_shape_bf16(M, B, has_ln_affine, has_modulation):
     x, ln_w, ln_b, scale_msa, shift_msa, seq_len, ref = _make_inputs(
         M, B, has_ln_affine, has_modulation, seed=99
     )
-    out = torch.ops.trtllm.fused_dit_layernorm_shift_scale(
+    out = torch.ops.trtllm.fused_adaptive_layernorm(
         x, ln_w, ln_b, scale_msa, shift_msa, seq_len, EPS
     )
 
@@ -489,7 +487,7 @@ def test_fp4_quant_production_scale(M, B, has_ln_affine, has_modulation):
     x = (x * 0.5).to(torch.bfloat16)
     W = torch.randn(out_dim, D, dtype=torch.bfloat16, device=device) * 0.05
 
-    out_bf16 = torch.ops.trtllm.fused_dit_layernorm_shift_scale(
+    out_bf16 = torch.ops.trtllm.fused_adaptive_layernorm(
         x, ln_w, ln_b, scale_msa, shift_msa, seq_len, EPS
     )
     D_ref = F.linear(out_bf16, W)
@@ -497,7 +495,7 @@ def test_fp4_quant_production_scale(M, B, has_ln_affine, has_modulation):
     sf_scale_x = (448.0 * 6.0) / out_bf16.abs().max().float()
     sf_scale_w = (448.0 * 6.0) / W.abs().max().float()
 
-    y_fp4, y_sf = torch.ops.trtllm.fused_dit_layernorm_shift_scale_quant(
+    y_fp4, y_sf = torch.ops.trtllm.fused_adaptive_layernorm_quant(
         x, ln_w, ln_b, scale_msa, shift_msa, sf_scale_x, seq_len, EPS
     )
 
@@ -546,9 +544,7 @@ def test_adaln_production_modulator_extraction():
     assert scale_msa.is_contiguous()
     assert scale_msa.shape == (B, D)  # T=1 so T*D == D
 
-    out = torch.ops.trtllm.fused_dit_layernorm_shift_scale(
-        x, None, None, scale_msa, shift_msa, S, EPS
-    )
+    out = torch.ops.trtllm.fused_adaptive_layernorm(x, None, None, scale_msa, shift_msa, S, EPS)
     ref = _ref_layernorm_adaln(x, scale_msa, shift_msa, S, EPS).to(torch.bfloat16)
 
     assert out.shape == (M, D)
@@ -573,7 +569,7 @@ def test_adaln_rejects_non_contiguous_modulators():
     assert not scale_nc.is_contiguous()
 
     with pytest.raises(RuntimeError, match=r"contiguous"):
-        torch.ops.trtllm.fused_dit_layernorm_shift_scale(x, None, None, scale_nc, shift_nc, S, EPS)
+        torch.ops.trtllm.fused_adaptive_layernorm(x, None, None, scale_nc, shift_nc, S, EPS)
 
 
 # ---------------------------------------------------------------------------
@@ -605,7 +601,7 @@ def test_fp4_quant_production_shape_smoke(M, B, has_ln_affine, has_modulation):
     x = (x * 0.5).to(torch.bfloat16)
 
     sf_scale = torch.tensor(1.0, dtype=torch.float32, device=device)
-    y_fp4, y_sf = torch.ops.trtllm.fused_dit_layernorm_shift_scale_quant(
+    y_fp4, y_sf = torch.ops.trtllm.fused_adaptive_layernorm_quant(
         x, ln_w, ln_b, scale_msa, shift_msa, sf_scale, seq_len, EPS
     )
 
@@ -635,7 +631,7 @@ def test_fp4_sf_allocation_boundaries(M):
     x = (torch.randn(M, D, device=device) * 0.5).to(torch.bfloat16)
     sf_scale = torch.tensor(1.0, dtype=torch.float32, device=device)
 
-    y_fp4, y_sf = torch.ops.trtllm.fused_dit_layernorm_shift_scale_quant(
+    y_fp4, y_sf = torch.ops.trtllm.fused_adaptive_layernorm_quant(
         x, None, None, None, None, sf_scale, M, EPS
     )
 

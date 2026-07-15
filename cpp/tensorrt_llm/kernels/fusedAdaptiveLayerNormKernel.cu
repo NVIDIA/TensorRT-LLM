@@ -16,9 +16,9 @@
 
 // Fused DiT LayerNorm + optional AdaLN/affine + optional NVFP4 quantization kernel.
 // Three mode combos × two output dtypes = 6 compile-time instantiations; see
-// launchFusedDiTLayerNormShiftScaleKernel and fusedDiTLayerNormShiftScaleKernel.h.
+// launchFusedAdaptiveLayerNormKernel and fusedAdaptiveLayerNormKernel.h.
 
-#include "fusedDiTLayerNormShiftScaleKernel.h"
+#include "fusedAdaptiveLayerNormKernel.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/kernels/quantization.cuh"
@@ -97,7 +97,7 @@ __launch_bounds__(BLOCK_SIZE, 4)
 #elif defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
 __launch_bounds__(BLOCK_SIZE, 8)
 #endif
-    fusedDiTLayerNormShiftScaleKernel(DiTLayerNormShiftScaleParams p)
+    fusedAdaptiveLayerNormKernel(AdaptiveLayerNormParams p)
 {
     static_assert(D % 8 == 0, "D must be a multiple of 8");
     static_assert(D % 16 == 0, "D must be a multiple of 16 (NVFP4 SF group size)");
@@ -413,13 +413,13 @@ __launch_bounds__(BLOCK_SIZE, 8)
 #endif
 }
 
-void launchFusedDiTLayerNormShiftScaleKernel(DiTLayerNormShiftScaleParams const& params, bool has_ln_affine,
-    bool has_modulation, bool has_quant, cudaStream_t stream)
+void launchFusedAdaptiveLayerNormKernel(
+    AdaptiveLayerNormParams const& params, bool has_ln_affine, bool has_modulation, bool has_quant, cudaStream_t stream)
 {
-    TLLM_CHECK_WITH_INFO(params.D == 5120, "fusedDiTLayerNormShiftScaleKernel only supports D=5120 (got %d)", params.D);
+    TLLM_CHECK_WITH_INFO(params.D == 5120, "fusedAdaptiveLayerNormKernel only supports D=5120 (got %d)", params.D);
     TLLM_CHECK_WITH_INFO(!(has_ln_affine && has_modulation), "has_ln_affine and has_modulation are mutually exclusive");
     TLLM_CHECK_WITH_INFO(!has_quant || tensorrt_llm::common::getSMVersion() >= 100,
-        "fusedDiTLayerNormShiftScaleKernel quant mode requires SM >= 100 (Blackwell+), got SM %d",
+        "fusedAdaptiveLayerNormKernel quant mode requires SM >= 100 (Blackwell+), got SM %d",
         tensorrt_llm::common::getSMVersion());
 
     constexpr int D = 5120;
@@ -438,7 +438,7 @@ void launchFusedDiTLayerNormShiftScaleKernel(DiTLayerNormShiftScaleParams const&
     cfg.numAttrs = 1;
 
 #define LAUNCH(AFF, MOD, QUANT)                                                                                        \
-    cudaLaunchKernelEx(&cfg, fusedDiTLayerNormShiftScaleKernel<D, BLOCK_SIZE, AFF, MOD, QUANT>, params)
+    cudaLaunchKernelEx(&cfg, fusedAdaptiveLayerNormKernel<D, BLOCK_SIZE, AFF, MOD, QUANT>, params)
 
     if (!has_ln_affine && !has_modulation && !has_quant)
         LAUNCH(false, false, false);
@@ -453,7 +453,7 @@ void launchFusedDiTLayerNormShiftScaleKernel(DiTLayerNormShiftScaleParams const&
     else if (!has_ln_affine && has_modulation && has_quant)
         LAUNCH(false, true, true);
     else
-        TLLM_CHECK_WITH_INFO(false, "Unsupported flag combination in launchFusedDiTLayerNormShiftScaleKernel");
+        TLLM_CHECK_WITH_INFO(false, "Unsupported flag combination in launchFusedAdaptiveLayerNormKernel");
 
 #undef LAUNCH
 

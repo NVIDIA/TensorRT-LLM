@@ -539,11 +539,7 @@ class WanBlock(nn.Module):
                 self.scale_shift_table.float() + temb.float()
             ).chunk(6, dim=1)
 
-        if (
-            self._norm1_fp4_scale is not None
-            and self._fused_ln_supported
-            and self._ln_fusion_enabled
-        ):
+        if self._fused_ln_supported and self._ln_fusion_enabled:
             # x is [B, S, D]; flatten to 2D for the fused op, reshape output back.
             normed = self._fused_adaln_quant(
                 x, scale_msa, shift_msa, temb, self._norm1_fp4_scale, self.norm1.variance_epsilon
@@ -573,8 +569,7 @@ class WanBlock(nn.Module):
         x = (x.float() + attn1_out.float() * gate_msa).to(x.dtype)
 
         if (
-            self._norm2_fp4_scale is not None
-            and self._fused_ln_supported
+            self._fused_ln_supported
             and self._ln_fusion_enabled
             and isinstance(self.norm2, LayerNorm)
             and self.norm2.weight is not None
@@ -632,14 +627,9 @@ class WanBlock(nn.Module):
         # Apply to_out once to the combined (text + image) attention output
         x = x + self.attn2.to_out[0](attn2_output)
 
-        # 3. Feed-forward. Mirrors norm1: fuse LN+AdaLN+NVFP4 into a prequantized
-        # tensor reshaped back to [B, S, D]; self.ffn consumes it (the MLP
-        # restores rank for a 3D prequantized Fp4QuantizedTensor, see mlp.py).
-        if (
-            self._norm3_fp4_scale is not None
-            and self._fused_ln_supported
-            and self._ln_fusion_enabled
-        ):
+        # 3. Feed-forward. Mirrors norm1: fused LN+AdaLN (with optional NVFP4
+        # quant) reshaped back to [B, S, D]; self.ffn consumes it.
+        if self._fused_ln_supported and self._ln_fusion_enabled:
             normed = self._fused_adaln_quant(
                 x,
                 c_scale_msa,

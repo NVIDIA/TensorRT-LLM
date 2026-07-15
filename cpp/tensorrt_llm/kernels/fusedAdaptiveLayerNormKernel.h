@@ -14,8 +14,8 @@
  * limitations under the License.
  */
 
-#ifndef TRTLLM_FUSEDDITLAYERNORMSHIFTSCALEKERNEL_H
-#define TRTLLM_FUSEDDITLAYERNORMSHIFTSCALEKERNEL_H
+#ifndef TRTLLM_FUSEDADAPTIVELAYERNORMKERNEL_H
+#define TRTLLM_FUSEDADAPTIVELAYERNORMKERNEL_H
 
 #include "tensorrt_llm/common/config.h"
 #include <cstdint>
@@ -43,7 +43,7 @@ namespace kernels
 //   HAS_QUANT=false: out_bf16 [M, D]
 //   HAS_QUANT=true:  out_fp4  [M, D/8]  (8 FP4 nibbles packed per uint32)
 //                    out_sf   swizzled NVFP4 scale factors (uint8 array)
-struct DiTLayerNormShiftScaleParams
+struct AdaptiveLayerNormParams
 {
     // Input
     __nv_bfloat16 const* x = nullptr; // [M, D] bf16
@@ -73,11 +73,11 @@ struct DiTLayerNormShiftScaleParams
 
 // Launch the fused kernel. The bool flags select the matching compile-time specialization.
 // has_ln_affine and has_modulation must not both be true. Supported hidden_dim: 5120 (Wan 14B).
-void launchFusedDiTLayerNormShiftScaleKernel(DiTLayerNormShiftScaleParams const& params, bool has_ln_affine,
-    bool has_modulation, bool has_quant, cudaStream_t stream);
+void launchFusedAdaptiveLayerNormKernel(AdaptiveLayerNormParams const& params, bool has_ln_affine, bool has_modulation,
+    bool has_quant, cudaStream_t stream);
 
 } // namespace kernels
 
 TRTLLM_NAMESPACE_END
 
-#endif // TRTLLM_FUSEDDITLAYERNORMSHIFTSCALEKERNEL_H
+#endif // TRTLLM_FUSEDADAPTIVELAYERNORMKERNEL_H

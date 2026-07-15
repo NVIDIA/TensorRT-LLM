@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#include "tensorrt_llm/kernels/fusedDiTLayerNormShiftScaleKernel.h"
+#include "tensorrt_llm/kernels/fusedAdaptiveLayerNormKernel.h"
 #include "tensorrt_llm/thop/thUtils.h"
 
 TRTLLM_NAMESPACE_BEGIN
@@ -25,7 +25,7 @@ namespace torch_ext
 namespace
 {
 
-// Validate and fill common fields of DiTLayerNormShiftScaleParams.
+// Validate and fill common fields of AdaptiveLayerNormParams.
 // Returns {M, D, has_ln_affine, has_modulation}.
 struct ValidatedParams
 {
@@ -46,7 +46,7 @@ ValidatedParams validateInputs(at::Tensor const& x, std::optional<at::Tensor> co
 
     int64_t const M = x.size(0);
     int64_t const D = x.size(1);
-    TORCH_CHECK(D == 5120, "fused_dit_layernorm_shift_scale only supports D=5120 (got ", D, ")");
+    TORCH_CHECK(D == 5120, "fused_adaptive_layernorm only supports D=5120 (got ", D, ")");
     TORCH_CHECK(D % 16 == 0, "D must be divisible by 16 (NVFP4 group size)");
 
     TORCH_CHECK(ln_weight.has_value() == ln_bias.has_value(), "ln_weight and ln_bias must both be provided together");
@@ -57,7 +57,7 @@ ValidatedParams validateInputs(at::Tensor const& x, std::optional<at::Tensor> co
     bool const has_modulation = scale_msa.has_value();
 
     TORCH_CHECK(!(has_ln_affine && has_modulation),
-        "fused_dit_layernorm_shift_scale: ln_weight/ln_bias and scale_msa/shift_msa are mutually exclusive");
+        "fused_adaptive_layernorm: ln_weight/ln_bias and scale_msa/shift_msa are mutually exclusive");
 
     if (has_ln_affine)
     {
@@ -98,7 +98,7 @@ ValidatedParams validateInputs(at::Tensor const& x, std::optional<at::Tensor> co
 
 } // namespace
 
-at::Tensor fused_dit_layernorm_shift_scale(at::Tensor const& x, std::optional<at::Tensor> const& ln_weight,
+at::Tensor fused_adaptive_layernorm(at::Tensor const& x, std::optional<at::Tensor> const& ln_weight,
     std::optional<at::Tensor> const& ln_bias, std::optional<at::Tensor> const& scale_msa,
     std::optional<at::Tensor> const& shift_msa, int64_t seq_len_per_batch, double eps)
 {
@@ -108,7 +108,7 @@ at::Tensor fused_dit_layernorm_shift_scale(at::Tensor const& x, std::optional<at
 
     auto stream = at::cuda::getCurrentCUDAStream(x.get_device());
 
-    tensorrt_llm::kernels::DiTLayerNormShiftScaleParams params;
+    tensorrt_llm::kernels::AdaptiveLayerNormParams params;
     params.x = reinterpret_cast<__nv_bfloat16 const*>(x.data_ptr());
     params.ln_weight = v.has_ln_affine ? reinterpret_cast<__nv_bfloat16 const*>(ln_weight->data_ptr()) : nullptr;
     params.ln_bias = v.has_ln_affine ? reinterpret_cast<__nv_bfloat16 const*>(ln_bias->data_ptr()) : nullptr;
@@ -123,13 +123,13 @@ at::Tensor fused_dit_layernorm_shift_scale(at::Tensor const& x, std::optional<at
     params.seq_len_per_batch = static_cast<int>(seq_len_per_batch);
     params.eps = static_cast<float>(eps);
 
-    tensorrt_llm::kernels::launchFusedDiTLayerNormShiftScaleKernel(
+    tensorrt_llm::kernels::launchFusedAdaptiveLayerNormKernel(
         params, v.has_ln_affine, v.has_modulation, /*has_quant=*/false, stream);
 
     return out;
 }
 
-std::tuple<at::Tensor, at::Tensor> fused_dit_layernorm_shift_scale_quant(at::Tensor const& x,
+std::tuple<at::Tensor, at::Tensor> fused_adaptive_layernorm_quant(at::Tensor const& x,
     std::optional<at::Tensor> const& ln_weight, std::optional<at::Tensor> const& ln_bias,
     std::optional<at::Tensor> const& scale_msa, std::optional<at::Tensor> const& shift_msa, at::Tensor const& sf_scale,
     int64_t seq_len_per_batch, double eps)
@@ -155,7 +155,7 @@ std::tuple<at::Tensor, at::Tensor> fused_dit_layernorm_shift_scale_quant(at::Ten
 
     auto stream = at::cuda::getCurrentCUDAStream(x.get_device());
 
-    tensorrt_llm::kernels::DiTLayerNormShiftScaleParams params;
+    tensorrt_llm::kernels::AdaptiveLayerNormParams params;
     params.x = reinterpret_cast<__nv_bfloat16 const*>(x.data_ptr());
     params.ln_weight = v.has_ln_affine ? reinterpret_cast<__nv_bfloat16 const*>(ln_weight->data_ptr()) : nullptr;
     params.ln_bias = v.has_ln_affine ? reinterpret_cast<__nv_bfloat16 const*>(ln_bias->data_ptr()) : nullptr;
@@ -170,7 +170,7 @@ std::tuple<at::Tensor, at::Tensor> fused_dit_layernorm_shift_scale_quant(at::Ten
     params.seq_len_per_batch = static_cast<int>(seq_len_per_batch);
     params.eps = static_cast<float>(eps);
 
-    tensorrt_llm::kernels::launchFusedDiTLayerNormShiftScaleKernel(
+    tensorrt_llm::kernels::launchFusedAdaptiveLayerNormKernel(
         params, v.has_ln_affine, v.has_modulation, /*has_quant=*/true, stream);
 
     return std::make_tuple(y_fp4, sf_out);
@@ -184,15 +184,15 @@ TRTLLM_NAMESPACE_END
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
-        "fused_dit_layernorm_shift_scale(Tensor x, Tensor? ln_weight, Tensor? ln_bias, "
+        "fused_adaptive_layernorm(Tensor x, Tensor? ln_weight, Tensor? ln_bias, "
         "Tensor? scale_msa, Tensor? shift_msa, int seq_len_per_batch, float eps) -> Tensor");
     m.def(
-        "fused_dit_layernorm_shift_scale_quant(Tensor x, Tensor? ln_weight, Tensor? ln_bias, "
+        "fused_adaptive_layernorm_quant(Tensor x, Tensor? ln_weight, Tensor? ln_bias, "
         "Tensor? scale_msa, Tensor? shift_msa, Tensor sf_scale, int seq_len_per_batch, float eps) -> (Tensor, Tensor)");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
-    m.impl("fused_dit_layernorm_shift_scale", &tensorrt_llm::torch_ext::fused_dit_layernorm_shift_scale);
-    m.impl("fused_dit_layernorm_shift_scale_quant", &tensorrt_llm::torch_ext::fused_dit_layernorm_shift_scale_quant);
+    m.impl("fused_adaptive_layernorm", &tensorrt_llm::torch_ext::fused_adaptive_layernorm);
+    m.impl("fused_adaptive_layernorm_quant", &tensorrt_llm::torch_ext::fused_adaptive_layernorm_quant);
 }

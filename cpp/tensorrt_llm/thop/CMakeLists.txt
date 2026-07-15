@@ -72,7 +72,7 @@ add_library(
   deepseekV4QNormOp.cpp
   inverseRopeFp8QuantOp.cpp
   fusedQKNormRopeOp.cpp
-  fusedDiTLayerNormShiftScaleOp.cpp
+  fusedAdaptiveLayerNormOp.cpp
   fusedDiTQKNormRopeOp.cpp
   fusedDiTSplitQKNormRopeOp.cpp
   fusedDiTSplitNormOp.cpp
