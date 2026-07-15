@@ -331,7 +331,7 @@ def mergeWaiveList(pipeline, globalVars)
     // Get TOT waive list
     LLM_TOT_ROOT = "llm-tot"
     def targetBranch = env.gitlabTargetBranch ? env.gitlabTargetBranch : globalVars[TARGET_BRANCH]
-    if (env.gitlabTargetBranch == env.gitlabSourceBranch) {
+    if (env.gitlabActionType == "PUSH" && env.gitlabTargetBranch == env.gitlabSourceBranch) {
         // The pipeline is triggered by a GitLab push, not a merge request. Use main as target branch to get the TOT waive list.
         targetBranch = "main"
     }
