@@ -837,8 +837,7 @@ def create_py_executor(
                 "(e.g. Eagle) is not supported yet. The connector's per-request "
                 "block bookkeeping is not trimmed after rewind, which can cause "
                 "hangs in get_finished. See "
-                "https://github.com/NVIDIA/TensorRT-LLM/issues/16448"
-            )
+                "https://github.com/NVIDIA/TensorRT-LLM/issues/16448")
 
         try:
             module = importlib.import_module(
