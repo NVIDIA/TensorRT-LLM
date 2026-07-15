@@ -583,6 +583,58 @@ class TestCosmos3V2VConditioningParams:
             _normalize_condition_video_keep("middle")
 
 
+class TestNormalizeVideoInputContentDispatch:
+    """``normalize_video_input_path`` classifies files by content, not suffix.
+
+    The serve path stores references with no type-suffix, so decode dispatch
+    must key on the container, not the filename. CPU-only; the clip is
+    synthesized with OpenCV (``cv2`` ships in no CI image → importorskip).
+    """
+
+    @staticmethod
+    def _write_mp4(path, num_frames: int = 3) -> None:
+        cv2 = pytest.importorskip("cv2")
+        np = pytest.importorskip("numpy")
+        writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"mp4v"), 4.0, (16, 16))
+        try:
+            for _ in range(num_frames):
+                writer.write(np.zeros((16, 16, 3), dtype=np.uint8))
+        finally:
+            writer.release()
+        assert path.exists() and path.stat().st_size > 0
+
+    def test_video_without_extension_decodes_to_frames(self, tmp_path):
+        pytest.importorskip("cv2")
+        from tensorrt_llm._torch.visual_gen.models.cosmos3.utils import normalize_video_input_path
+
+        # OpenCV's *writer* selects the muxer by extension, so encode to a
+        # ``.mp4`` path, then rename to a suffix-less name — exactly what the
+        # serve path produces (raw bytes written to ``{id}_reference``).
+        encoded = tmp_path / "clip.mp4"
+        self._write_mp4(encoded)
+        ref = encoded.rename(tmp_path / "reference")
+        frames = normalize_video_input_path(ref)
+        # Took the video-decode path (returns PIL frames), not the single-still
+        # path (which would return the bare ``[str(path)]``).
+        assert frames and all(isinstance(f, PIL.Image.Image) for f in frames)
+
+    def test_image_without_extension_is_single_frame(self, tmp_path):
+        from tensorrt_llm._torch.visual_gen.models.cosmos3.utils import normalize_video_input_path
+
+        ref = tmp_path / "reference"  # no ``.png`` suffix
+        PIL.Image.new("RGB", (8, 8), (1, 2, 3)).save(ref, format="PNG")
+        assert normalize_video_input_path(ref) == [str(ref)]
+
+    def test_undecodable_file_raises(self, tmp_path):
+        pytest.importorskip("cv2")
+        from tensorrt_llm._torch.visual_gen.models.cosmos3.utils import normalize_video_input_path
+
+        ref = tmp_path / "reference"
+        ref.write_bytes(b"not media")
+        with pytest.raises(ValueError, match="decodable"):
+            normalize_video_input_path(ref)
+
+
 @pytest.mark.integration
 @pytest.mark.cosmos3_v2v
 @pytest.mark.high_cuda_memory
