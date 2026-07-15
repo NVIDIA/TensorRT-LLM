@@ -715,6 +715,7 @@ class TestNoBatching(TestKVCacheManagerV2):
                 drop_handle = kv_cache.plan_committed_block_drop()
                 self.assertIsNotNone(drop_handle)
                 self.assertIsInstance(drop_handle, PlannedDropHandle)
+            _ = stream_holder.take_finish_event()
             kv_cache.close()
             assert drop_handle is not None
             return drop_handle

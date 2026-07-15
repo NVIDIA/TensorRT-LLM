@@ -129,7 +129,7 @@ class _ContextRequest:
     py_conversation_params: ConversationParams | None = field(init=False)
     use_conversation_params: bool = True
     lora_task_id: int | None = None
-    cache_salt_id: int | None = None
+    cache_salt: str | None = None
     is_first_context_chunk: bool = True
     is_last_context_chunk: bool = True
     is_disagg_generation_init_state: bool = False
