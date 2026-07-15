@@ -949,7 +949,7 @@ private:
                                 "receiver.",
                                 reqId);
                             sendReadySignal(reqId, false);
-                            discardSession(reqId);
+                            discardTransferState(reqId);
                         }
                         else
                         {
