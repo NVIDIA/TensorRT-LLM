@@ -94,8 +94,8 @@ pipeline {
     parameters {
         string(
             name: 'DAYS',
-            defaultValue: '3',
-            description: 'Number of days to look back in OpenSearch for test durations (e.g. 3, 5, 7).')
+            defaultValue: '7',
+            description: 'Number of days to look back in OpenSearch for test durations (e.g. 3, 7, 14). '
         string(
             name: 'SOURCE_REPO',
             defaultValue: 'NVIDIA/TensorRT-LLM',
@@ -142,7 +142,6 @@ pipeline {
                     sh """
                         cd ${LLM_ROOT}
                         python3 jenkins/scripts/generate_duration.py \
-                            --from-opensearch \
                             --days ${params.DAYS} \
                             --duration-file new_test_durations.json
                         echo "Generated file size: \$(wc -l < new_test_durations.json) lines"

@@ -14,17 +14,11 @@
 # limitations under the License.
 
 import argparse
-import csv
 import glob
 import json
 import os
 import re
 import time
-
-# Default CSV columns from pytest-csv:
-#   id, module, name, file, doc, markers, status, message, duration
-STATUS_COLUMN = 6
-DURATION_COLUMN = 8
 
 OPENSEARCH_INDEX = "df-swdl-trtllm-infra-ci-prod-test_info-*"
 
@@ -152,56 +146,53 @@ def query_opensearch_durations(days):
     return test_durations
 
 
-# Parse command-line arguments
-parser = argparse.ArgumentParser(description="Generate test duration file.")
-parser.add_argument(
-    "--duration-file",
-    type=str,
-    default="new_test_duration.json",
-    help="Path to the output duration file (default: new_test_duration.json)",
-)
-parser.add_argument(
-    "--cluster",
-    type=str,
-    default=None,
-    help="Cluster name (e.g. 'aws_dfw').  When set, writes "
-    "tests/integration/defs/.test_durations_<cluster> relative to the "
-    "repo root instead of --duration-file.",
-)
-parser.add_argument(
-    "--from-opensearch",
-    action="store_true",
-    default=False,
-    help="Query OpenSearch instead of reading local CSV files.",
-)
-parser.add_argument(
-    "--days", type=int, default=3, help="Number of days to look back in OpenSearch (default: 3)."
-)
-parser.add_argument(
-    "--test-list-dir",
-    type=str,
-    default=DEFAULT_TEST_LIST_DIR,
-    help="Directory of turtle test-db YAML lists used to filter OpenSearch "
-    "results. Only turtle names present in these lists are written "
-    f"(default: {DEFAULT_TEST_LIST_DIR}).",
-)
-parser.add_argument(
-    "--no-filter",
-    action="store_true",
-    default=False,
-    help="Skip filtering OpenSearch results against the test-db lists.",
-)
-args = parser.parse_args()
-
-# Resolve output path
-if args.cluster:
-    NEW_TEST_DURATION = os.path.join(
-        _REPO_ROOT, "tests", "integration", "defs", f".test_durations_{args.cluster}"
+def main():
+    # Parse command-line arguments
+    parser = argparse.ArgumentParser(description="Generate test duration file.")
+    parser.add_argument(
+        "--duration-file",
+        type=str,
+        default="new_test_duration.json",
+        help="Path to the output duration file (default: new_test_duration.json)",
     )
-else:
-    NEW_TEST_DURATION = args.duration_file
+    parser.add_argument(
+        "--cluster",
+        type=str,
+        default=None,
+        help="Cluster name (e.g. 'aws_dfw').  When set, writes "
+        "tests/integration/defs/.test_durations_<cluster> relative to the "
+        "repo root instead of --duration-file.",
+    )
+    parser.add_argument(
+        "--days",
+        type=int,
+        default=7,
+        help="Number of days to look back in OpenSearch (default: 7).",
+    )
+    parser.add_argument(
+        "--test-list-dir",
+        type=str,
+        default=DEFAULT_TEST_LIST_DIR,
+        help="Directory of turtle test-db YAML lists used to filter OpenSearch "
+        "results. Only turtle names present in these lists are written "
+        f"(default: {DEFAULT_TEST_LIST_DIR}).",
+    )
+    parser.add_argument(
+        "--no-filter",
+        action="store_true",
+        default=False,
+        help="Skip filtering OpenSearch results against the test-db lists.",
+    )
+    args = parser.parse_args()
 
-if args.from_opensearch:
+    # Resolve output path
+    if args.cluster:
+        NEW_TEST_DURATION = os.path.join(
+            _REPO_ROOT, "tests", "integration", "defs", f".test_durations_{args.cluster}"
+        )
+    else:
+        NEW_TEST_DURATION = args.duration_file
+
     print(f"Querying OpenSearch for last {args.days} day(s)...")
     test_durations = query_opensearch_durations(args.days)
     raw_count = len(test_durations)
@@ -240,59 +231,6 @@ if args.from_opensearch:
     print(f"  Unique tests in output : {len(test_durations)}")
     print(f"  Output written to      : {NEW_TEST_DURATION}")
 
-else:
-    # CSV mode: read from local report.csv files produced by the CI run
-    TEST_RESULTS_DIR = os.getcwd()
-    all_csv_files = sorted(glob.glob(os.path.join(TEST_RESULTS_DIR, "*/report.csv")))
 
-    print(f"TEST_RESULTS_DIR: {TEST_RESULTS_DIR}")
-    print(f"Found {len(all_csv_files)} CSV report file(s)")
-
-    test_durations = {}
-    passed_count = 0
-    skipped_count = 0
-
-    for report_csv in all_csv_files:
-        print(f"Processing {report_csv}...")
-        try:
-            with open(report_csv, "r", newline="") as csv_file:
-                reader = csv.reader(csv_file)
-                for row in reader:
-                    if len(row) <= max(STATUS_COLUMN, DURATION_COLUMN):
-                        continue
-
-                    status = row[STATUS_COLUMN].strip()
-                    if status != "passed":
-                        skipped_count += 1
-                        continue
-
-                    test_id = row[0].strip()
-                    duration_str = row[DURATION_COLUMN].strip()
-
-                    # Remove stage name prefix (everything up to first '/')
-                    test_name = test_id.split("/", 1)[-1]
-
-                    try:
-                        duration = float(duration_str)
-                    except ValueError:
-                        # Fall back to last column if the fixed index doesn't work
-                        try:
-                            duration = float(row[-1].strip())
-                        except ValueError:
-                            print(f"  Warning: Could not parse duration for {test_name}. Skipping.")
-                            continue
-
-                    test_durations[test_name] = duration
-                    passed_count += 1
-        except (OSError, csv.Error) as e:
-            print(f"  Warning: Failed to process {report_csv}: {e}")
-
-    with open(NEW_TEST_DURATION, "w") as file:
-        json.dump(test_durations, file, indent=3)
-
-    print("\nSummary:")
-    print(f"  CSV files processed    : {len(all_csv_files)}")
-    print(f"  Passed rows collected  : {passed_count}")
-    print(f"  Non-passed rows skipped: {skipped_count}")
-    print(f"  Unique tests in output : {len(test_durations)}")
-    print(f"  Output written to      : {NEW_TEST_DURATION}")
+if __name__ == "__main__":
+    main()
