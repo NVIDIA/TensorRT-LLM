@@ -514,12 +514,6 @@ class CuteDslMlaFmha(PhasedFmha):
         q_rope = q_view[..., d_latent:].permute(2, 3, 1, 0)
 
         o_kernel = output_view.permute(2, 3, 1, 0)
-        lse_storage = torch.empty(
-            (batch_size, seq_len_q, num_heads),
-            dtype=torch.float32,
-            device=q.device,
-        )
-        lse = lse_storage.permute(2, 1, 0)
 
         op(
             q_latent,
@@ -529,7 +523,6 @@ class CuteDslMlaFmha(PhasedFmha):
             page_table,
             cache_seqs_base,
             o_kernel,
-            lse,
             workspace,
             num_heads,
             seq_len_q,
@@ -577,11 +570,11 @@ class CuteDslMlaFmha(PhasedFmha):
             CuteDSLNVMlaDecodeBlackwellRunner,
         )
 
-        required_workspace_size = CuteDSLNVMlaDecodeBlackwellRunner.get_max_workspace_size(
+        required_workspace_size = CuteDSLNVMlaDecodeBlackwellRunner.get_max_padded_workspace_size(
             self.attn.num_heads,
             q.shape[0] // metadata.num_generations,
             self.attn.kv_lora_rank,
-            metadata.num_generations,
+            metadata.max_num_requests,
             cutlass.Float32,
         )
         current_workspace_size = workspace.numel() * workspace.element_size()

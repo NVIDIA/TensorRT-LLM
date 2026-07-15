@@ -8254,6 +8254,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
         _IS_VAR_SPLIT_KV = False
         _SKIP_CORRECTION_THRESHOLD = 0.0
 
+        _WORKSPACE_ALIGN = 128
+        _LSE_DTYPE_BYTES = 4  # float32
+
         def __init__(
             self,
             in_dtype,
@@ -8338,34 +8341,71 @@ if IS_CUTLASS_DSL_AVAILABLE:
             return [True, False]
 
         @classmethod
-        def get_max_workspace_size(
+        def get_max_split_kv_workspace_size(
             cls,
             H: int,
-            S: int,
             D: int,
-            B: int,
             acc_dtype: Type[cutlass.Numeric],
         ) -> int:
-            """Workspace bytes the FMHA layer must allocate so that ANY
-            (batch, split_kv) the AutoTuner may pick fits. The bound must be
-            batch-INDEPENDENT: CUDA graphs are captured per batch size in
-            descending order, and a later capture that needed a larger
-            workspace would resize the buffer, dangling the address baked
-            into every previously captured graph."""
-            max_active_blocks = cls._get_max_active_blocks()
+            """Raw bytes reserved for split-KV intermediates.
+
+            Batch-INDEPENDENT: CUDA graphs are captured per batch size in
+            descending order, and a later capture that needed a larger workspace
+            would resize the buffer, dangling the address baked into every
+            previously captured graph.
 
             # cuda graph capture(B=8):   eager warmup N times  →  capture graph_8
             # cuda graph capture(B=4):   eager warmup N times  →  capture graph_4
-            # cuda graph capture(B=2):   eager warmup N times  →  capture graph_2
             # ...
             # cuda graph replay
+            # A later capture with a bigger workspace would resize it, so the
+            # bound covers every batch size up-front."""
+            max_active_blocks = cls._get_max_active_blocks()
+            return (2 * H * (max_active_blocks // 2) * (D + 1) *
+                    acc_dtype.width // 8)
 
-            # The latter graph capture with different batch size may have bigger workspace size, which will resize the workspace.
-            # Then the workspace address of previously captured graph will be invalid.
-            # So we need to return the max workspace size for all batch sizes.
+        @classmethod
+        def get_workspace_layout(
+            cls,
+            H: int,
+            seq_len_q: int,
+            D: int,
+            max_batch_size: int,
+            acc_dtype: Type[cutlass.Numeric],
+        ) -> Tuple[int, int, int, int, int]:
+            """Return LSE/split-KV offsets and sizes, then total bytes."""
+            lse_offset = 0
+            lse_size = cls.get_lse_workspace_size(H, seq_len_q, max_batch_size)
+            split_kv_offset = pad_up(lse_offset + lse_size,
+                                     cls._WORKSPACE_ALIGN)
+            split_kv_size = cls.get_max_split_kv_workspace_size(H, D, acc_dtype)
+            workspace_size = split_kv_offset + pad_up(split_kv_size,
+                                                      cls._WORKSPACE_ALIGN)
+            return (lse_offset, lse_size, split_kv_offset, split_kv_size,
+                    workspace_size)
 
-            return 2 * H * (max_active_blocks // 2) * (D +
-                                                       1) * acc_dtype.width // 8
+        @classmethod
+        def get_lse_workspace_size(
+            cls,
+            H: int,
+            seq_len_q: int,
+            batch_size: int,
+        ) -> int:
+            """Raw bytes for an LSE tensor shaped ``(batch_size, seq_len_q, H)``."""
+            return seq_len_q * batch_size * H * cls._LSE_DTYPE_BYTES
+
+        @classmethod
+        def get_max_padded_workspace_size(
+            cls,
+            H: int,
+            seq_len_q: int,
+            D: int,
+            max_batch_size: int,
+            acc_dtype: Type[cutlass.Numeric],
+        ) -> int:
+            """Padded bytes for the max-batch LSE and split-KV regions."""
+            return cls.get_workspace_layout(H, seq_len_q, D, max_batch_size,
+                                            acc_dtype)[4]
 
         def get_valid_tactics(
             self,
@@ -8461,8 +8501,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                   (2, 3, 1, 0))  # q_rope
             inputs[6] = _relayout(inputs[6], (batch, seq_len_q, H, d_latent),
                                   (2, 3, 1, 0))  # o
-            inputs[7] = _relayout(inputs[7], (batch, seq_len_q, H),
-                                  (2, 1, 0))  # lse [H, S_q, B]
 
             # page_table [max_blocks, B] <- (B, max_blocks).transpose(0, 1),
             # with in-bounds page ids ([0, num_pages) from the c_latent pool).
@@ -8506,17 +8544,33 @@ if IS_CUTLASS_DSL_AVAILABLE:
             cache = self.__class__.tuning_config_cache
             if key not in cache:
                 # Inputs: 0 q_latent  1 q_rope  2 c_latent  3 c_rope
-                #         4 page_table  5 cache_seqs  6 o  7 lse  8 workspace
-                # Batch dim per input: q/o (H, D, S, B) -> 3, lse (H, S, B) -> 2,
+                #         4 page_table  5 cache_seqs  6 o  7 workspace
+                # Batch dim per input: q/o (H, D, S, B) -> 3,
                 # cache_seqs (B,) -> 0, page_table (max_blocks, B) -> 1.
-                batch_dims = ((0, 3), (1, 3), (4, 1), (5, 0), (6, 3), (7, 2))
+                batch_dims = ((0, 3), (1, 3), (4, 1), (5, 0), (6, 3))
                 free = 5  # cache_seqs -- the free dynamic batch dim
                 # (input, dim) whose size is a static config quantity, not
                 # per-request -- kept at its real size for profiling but
-                # excluded from the cache key: page_table dim0 (max_blocks),
-                # c_latent/c_rope dim2 (KV pool num_pages, differs between
-                # the estimation-phase and final KV cache), workspace dim0.
-                static_size_dims = ((2, 2), (3, 2), (4, 0), (8, 0))
+                # excluded from the cache key (constraint dims are set to -1 in
+                # the key): page_table dim0 (max_blocks) and workspace dim0.
+                # Small tensors, so reconstructing them at real size is cheap.
+                #
+                # NOTE: the paged-KV pool (c_latent/c_rope) is deliberately NOT
+                # listed in ANY spec. The AutoTuner rebuilds (via torch.rand)
+                # only inputs that carry a DynamicDim; a purely-static input is
+                # reused BY REFERENCE (_prepare_input_tensors). Constraining
+                # num_pages to drop it from the cache key would instead turn it
+                # into a DynamicDim, and the AutoTuner would allocate a fresh
+                # copy of the WHOLE KV pool per profiled batch -- during KV-cache
+                # estimation / final warmup the pool fills most of GPU memory, so
+                # duplicating it OOMs. Leaving c_latent/c_rope static means the
+                # profiling forward reads the real pool (zero extra memory, real
+                # addresses/content). The cost is that num_pages then enters the
+                # cache key: estimation-phase entries (small pool) don't transfer
+                # to the final warmup (large pool), so the final warmup re-tunes
+                # -- harmless, since runtime num_pages equals the final pool and
+                # thus hits the final-warmup entries (no in-run JIT stall).
+                static_size_dims = ((4, 0), (7, 0))
                 constraint_dims = [(i, d) for (i, d) in batch_dims if i != free]
                 batch_constraints = tuple(
                     ConstraintSpec(
@@ -8563,8 +8617,33 @@ if IS_CUTLASS_DSL_AVAILABLE:
             inputs: List[torch.Tensor],
             tactic,
             **kwargs,
-        ) -> Tuple[torch.Tensor, torch.Tensor]:
-            (q_latent, q_rope, c_latent, c_rope, page_table, cache_seqs, o, lse,
+        ) -> torch.Tensor:
+            """Run the CuTe DSL MLA decode kernel.
+
+            Args:
+                inputs (List[torch.Tensor]):
+                    inputs[0]: Query latent tensor of shape (H, D, S_q, B).
+                    inputs[1]: Query RoPE tensor of shape (H, R, S_q, B).
+                    inputs[2]: Paged latent-cache tensor of shape
+                        (page_size, D, num_pages).
+                    inputs[3]: Paged RoPE-cache tensor of shape
+                        (page_size, R, num_pages).
+                    inputs[4]: Page table tensor of shape
+                        (max_blocks_per_sequence, B), dtype: int32.
+                    inputs[5]: Cache sequence lengths tensor of shape (B),
+                        dtype: int32.
+                    inputs[6]: Output tensor of shape (H, D, S_q, B).
+                    inputs[7]: Contiguous raw workspace with at least the
+                        workspace_size returned by get_workspace_layout.
+                tactic: Tuple containing (mma_qk_tiler_mn, mma_pv_tiler_mn,
+                    split_kv, is_persistent).
+                **kwargs: Optional softmax_scale and output_scale values.
+
+            Returns:
+                torch.Tensor: Output tensor of shape (H, D, S_q, B). The LSE
+                    tensor of shape (H, S_q, B) remains in the workspace.
+            """
+            (q_latent, q_rope, c_latent, c_rope, page_table, cache_seqs, o,
              workspace) = inputs
             softmax_scale = float(kwargs.get("softmax_scale", 1.0))
             output_scale = float(kwargs.get("output_scale", 1.0))
@@ -8591,6 +8670,46 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 out_dtype = self.in_dtype
 
             seq_len_q = self.seq_len_q
+
+            # LSE output lives at [lse_offset, lse_offset + lse_size); the
+            # split-KV intermediates follow at the fixed split_kv_offset so their
+            # base address is batch-independent (CUDA-graph safe: a graph
+            # captured at one batch must not see the split-KV base move at
+            # another). The slice taken here is the current batch's LSE; the
+            # reserved region is sized from the max batch to match
+            # get_max_padded_workspace_size, falling back to the current batch
+            # for standalone callers without an engine max. LSE is carved (not
+            # an op input, which under CUDA graphs would pin one throwaway copy
+            # per captured graph); it is never read downstream, the kernel only
+            # writes it.
+            batch_size = cache_seqs.shape[0]
+            d_latent = q_latent.shape[1]
+            max_batch_size = max(batch_size, self.max_batch_size)
+            (lse_offset, lse_size, split_kv_offset, split_kv_size,
+             required_workspace_size) = self.get_workspace_layout(
+                 self.num_heads, seq_len_q, d_latent, max_batch_size,
+                 cutlass.Float32)
+
+            if not workspace.is_contiguous():
+                raise RuntimeError(
+                    "CuteDSLNVMlaDecodeBlackwellRunner requires a contiguous "
+                    "workspace.")
+            workspace_bytes = workspace.view(torch.uint8).reshape(-1)
+            if workspace_bytes.numel() < required_workspace_size:
+                raise RuntimeError(
+                    "CuteDSLNVMlaDecodeBlackwellRunner workspace is too small: "
+                    f"got {workspace_bytes.numel()} bytes, require "
+                    f"{required_workspace_size} bytes for "
+                    f"batch_size={batch_size}, max_batch_size={max_batch_size}."
+                )
+
+            lse = workspace_bytes[lse_offset:lse_offset + lse_size].view(
+                torch.float32).view(max_batch_size, seq_len_q,
+                                    self.num_heads)[:batch_size].permute(
+                                        2, 1, 0)
+            # Kernel split-KV intermediates start AFTER the reserved LSE region.
+            split_workspace = workspace_bytes[split_kv_offset:split_kv_offset +
+                                              split_kv_size]
 
             cache_key = self.unique_id() + (
                 out_dtype,
@@ -8655,9 +8774,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
                             divisibility=(128 // out_dtype.width))
                 lse_ct = cute.runtime.from_dlpack(
                     lse, assumed_align=16).mark_layout_dynamic(leading_dim=0)
-                use_workspace = split_kv > 1 and workspace.numel() > 0
+                use_workspace = split_kv > 1 and split_workspace.numel() > 0
                 workspace_ct = (cute.runtime.from_dlpack(
-                    workspace, assumed_align=32).mark_layout_dynamic()
+                    split_workspace, assumed_align=32).mark_layout_dynamic()
                                 if use_workspace else None)
                 cache_seqs_ct = cute.runtime.from_dlpack(
                     cache_seqs, assumed_align=16).mark_layout_dynamic()
@@ -8694,7 +8813,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 page_table,
                 o,
                 lse,
-                workspace if (split_kv > 1 and workspace.numel() > 0) else None,
+                split_workspace if
+                (split_kv > 1 and split_workspace.numel() > 0) else None,
                 split_kv,
                 cache_seqs,
                 None,  # block_split_kvs: var-split path unused (is_var_split_kv False)
@@ -8702,11 +8822,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 output_scale,
                 stream,
             )
-            return o, lse
+            return o
 
     @torch.library.custom_op(
         "trtllm::cute_dsl_mla_decode_fp8_blackwell",
-        mutates_args=("o", "lse", "workspace"),
+        mutates_args=("o", "workspace"),
         device_types="cuda",
     )
     def cute_dsl_mla_decode_fp8_blackwell(
@@ -8717,7 +8837,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
         page_table: torch.Tensor,
         cache_seqs: torch.Tensor,
         o: torch.Tensor,
-        lse: torch.Tensor,
         workspace: torch.Tensor,
         num_heads: int,
         seq_len_q: int,
@@ -8728,7 +8847,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
     ) -> None:
         """CuTe DSL FP8 MLA decode (Blackwell SM100/SM103).
 
-        ``o``, ``lse``, ``workspace`` are mutated in place. Tensor layouts:
+        ``o`` and ``workspace`` are mutated in place (the LSE output is carved
+        from ``workspace`` internally and never returned). Tensor layouts:
         see ``BlackwellMultiHeadLatentAttentionForwardFP8``.
         ``max_batch_size`` > 0 lets the AutoTuner profile batch buckets up to
         the engine's max batch instead of stopping at the tuning-time batch.
@@ -8748,7 +8868,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             max_batch_size=max_batch_size,
         )
         inputs = [
-            q_latent, q_rope, c_latent, c_rope, page_table, cache_seqs, o, lse,
+            q_latent, q_rope, c_latent, c_rope, page_table, cache_seqs, o,
             workspace
         ]
         tuner = AutoTuner.get()
@@ -8779,7 +8899,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
         page_table: torch.Tensor,
         cache_seqs: torch.Tensor,
         o: torch.Tensor,
-        lse: torch.Tensor,
         workspace: torch.Tensor,
         num_heads: int,
         seq_len_q: int,
@@ -8792,7 +8911,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
     @torch.library.custom_op(
         "trtllm::cute_dsl_mla_decode_fp16_blackwell",
-        mutates_args=("o", "lse", "workspace"),
+        mutates_args=("o", "workspace"),
         device_types="cuda",
     )
     def cute_dsl_mla_decode_fp16_blackwell(
@@ -8803,7 +8922,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
         page_table: torch.Tensor,
         cache_seqs: torch.Tensor,
         o: torch.Tensor,
-        lse: torch.Tensor,
         workspace: torch.Tensor,
         num_heads: int,
         seq_len_q: int,
@@ -8814,7 +8932,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
     ) -> None:
         """CuTe DSL FP16/BF16 MLA decode (Blackwell SM100/SM103).
 
-        ``o``, ``lse``, ``workspace`` are mutated in place. Tensor layouts:
+        ``o`` and ``workspace`` are mutated in place (the LSE output is carved
+        from ``workspace`` internally and never returned). Tensor layouts:
         see ``BlackwellMultiHeadLatentAttentionForwardFP16``.
         ``max_batch_size`` > 0 lets the AutoTuner profile batch buckets up to
         the engine's max batch instead of stopping at the tuning-time batch.
@@ -8851,7 +8970,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             max_batch_size=max_batch_size,
         )
         inputs = [
-            q_latent, q_rope, c_latent, c_rope, page_table, cache_seqs, o, lse,
+            q_latent, q_rope, c_latent, c_rope, page_table, cache_seqs, o,
             workspace
         ]
         tuner = AutoTuner.get()
@@ -8882,7 +9001,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
         page_table: torch.Tensor,
         cache_seqs: torch.Tensor,
         o: torch.Tensor,
-        lse: torch.Tensor,
         workspace: torch.Tensor,
         num_heads: int,
         seq_len_q: int,
