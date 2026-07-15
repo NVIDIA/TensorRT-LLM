@@ -1456,10 +1456,13 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
             if self.kv_layout == "footer_scale":
                 self.compressor.enable_footer_scale_cache()
 
-    def support_fused_rope(self) -> bool:
+    @classmethod
+    def support_fused_rope(cls) -> bool:
         # The packed FlashInfer cache is written after Python-side RoPE; the
         # native TRTLLM path keeps the fused C++ RoPE implementation.
-        return self.kv_layout == "native"
+        from ...fmha.flashinfer_sparse_mla import is_flashinfer_sparse_mla_enabled
+
+        return not is_flashinfer_sparse_mla_enabled("deepseek_v4")
 
     def _prepare_sparse_forward_args(
         self,

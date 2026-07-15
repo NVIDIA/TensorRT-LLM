@@ -2957,6 +2957,17 @@ class Indexer(nn.Module):
                                         q_scale=q_scale)
 
 
+def _resolve_dsa_kv_layout(attn_backend: str | None) -> str:
+    """Resolve the DSA layout owned by TRTLLM's selected sparse-MLA FMHA."""
+    if attn_backend == "TRTLLM":
+        from ..fmha.flashinfer_sparse_mla import \
+            is_flashinfer_sparse_mla_enabled
+
+        if is_flashinfer_sparse_mla_enabled("dsa"):
+            return "inline_scale"
+    return "native"
+
+
 class DSATrtllmAttention(TrtllmAttention):
     """TRT-LLM attention layer with DSA sparse indexer for MLA models."""
 
@@ -3003,11 +3014,7 @@ class DSATrtllmAttention(TrtllmAttention):
             attention_chunk_size=attention_chunk_size,
             **kwargs)
 
-        from ..fmha.flashinfer_sparse_mla import \
-            is_flashinfer_sparse_mla_enabled
-
-        self.kv_layout = ("inline_scale" if
-                          is_flashinfer_sparse_mla_enabled("dsa") else "native")
+        self.kv_layout = _resolve_dsa_kv_layout("TRTLLM")
 
         # Cross-layer indexer sharing: only "full" layers own an indexer;
         # "shared" layers reuse the previous full layer's top-k (see
@@ -3028,10 +3035,11 @@ class DSATrtllmAttention(TrtllmAttention):
         else:
             self.indexer = None
 
-    def support_fused_rope(self) -> bool:
+    @classmethod
+    def support_fused_rope(cls) -> bool:
         # FlashInfer writes inline-scale pages after Python-side RoPE. This
         # also disables the short-sequence dense-MHA bypass for that FMHA.
-        return self.kv_layout == "native"
+        return _resolve_dsa_kv_layout("TRTLLM") == "native"
 
     def sparse_attn_predict(
         self,
@@ -3164,12 +3172,7 @@ class DSACacheManager(KVCacheManager):
         # inline-scale pages. Cache allocation and FMHA dispatch use the same
         # registry/environment helper so fallback never sees this layout.
         attn_backend = kwargs.pop("attn_backend", None)
-        from ..fmha.flashinfer_sparse_mla import \
-            is_flashinfer_sparse_mla_enabled
-
-        self._kv_layout = ("inline_scale" if attn_backend == "TRTLLM"
-                           and is_flashinfer_sparse_mla_enabled("dsa") else
-                           "native")
+        self._kv_layout = _resolve_dsa_kv_layout(attn_backend)
         if self._kv_layout == "inline_scale":
             from .inline_scale_kv import PAGE_SIZE, TOKEN_BYTES
             assert tokens_per_block == PAGE_SIZE, (
@@ -3279,11 +3282,8 @@ class DSACacheManager(KVCacheManager):
 
         num_attention_layers = KVCacheManager._resolve_num_attention_layers(
             model_config, mapping, num_layers)
-        from ..fmha.flashinfer_sparse_mla import \
-            is_flashinfer_sparse_mla_enabled
-
-        if (getattr(model_config, "attn_backend", None) == "TRTLLM"
-                and is_flashinfer_sparse_mla_enabled("dsa")):
+        if _resolve_dsa_kv_layout(getattr(model_config, "attn_backend",
+                                          None)) == "inline_scale":
             # FlashInfer serves the latent pool as inline-scale pages
             # (inline_scale_kv.py): a fixed 656 bytes per token regardless of
             # the KV cache dtype.

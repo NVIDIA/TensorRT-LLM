@@ -165,9 +165,9 @@ def _get_attn_bytes_per_token(
     return token_bytes
 
 
-def _resolve_kv_layout(model_config) -> str:
+def _resolve_kv_layout(attn_backend: str | None) -> str:
     """Resolve the layout owned by TRTLLM's selected sparse-MLA FMHA."""
-    if model_config is not None and getattr(model_config, "attn_backend", None) == "TRTLLM":
+    if attn_backend == "TRTLLM":
         from ...fmha.flashinfer_sparse_mla import is_flashinfer_sparse_mla_enabled
 
         if is_flashinfer_sparse_mla_enabled("deepseek_v4"):
@@ -250,13 +250,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         attn_backend = kwargs.pop("attn_backend", None)
         if attn_backend is None:
             attn_backend = getattr(kwargs.get("model_config"), "attn_backend", None)
-        from ...fmha.flashinfer_sparse_mla import is_flashinfer_sparse_mla_enabled
-
-        self._kv_layout = (
-            "footer_scale"
-            if attn_backend == "TRTLLM" and is_flashinfer_sparse_mla_enabled("deepseek_v4")
-            else "native"
-        )
+        self._kv_layout = _resolve_kv_layout(attn_backend)
         if self._kv_layout == "footer_scale":
             assert tokens_per_block == 256, (
                 "The FlashInfer DSv4 FMHA requires tokens_per_block=256: its "
@@ -1447,7 +1441,7 @@ class DeepseekV4CacheManager(KVCacheManagerV2):
         else:
             has_fp8_kv_cache = False
         indexer_k_dtype = model_config.sparse_attention_config.indexer_k_dtype
-        kv_layout = _resolve_kv_layout(model_config)
+        kv_layout = _resolve_kv_layout(getattr(model_config, "attn_backend", None))
         non_sliding_attn_size_per_token = _estimate_non_sliding_attn_size_per_token(
             head_dim,
             index_head_dim,

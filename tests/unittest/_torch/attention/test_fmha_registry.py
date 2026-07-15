@@ -46,3 +46,53 @@ def test_flashinfer_sparse_mla_is_unavailable_off_sm120(monkeypatch):
 def test_flashinfer_sparse_mla_never_runtime_falls_back():
     fmha = object.__new__(flashinfer_sparse_mla.FlashInferSparseMlaFmha)
     assert fmha.is_supported(None, None, None, None, None)
+
+
+def test_sparse_mla_rope_capability_is_callable_before_instantiation(monkeypatch):
+    from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.deepseek_v4 import (
+        DeepseekV4TrtllmAttention,
+    )
+    from tensorrt_llm._torch.attention_backend.sparse.dsa import DSATrtllmAttention
+
+    monkeypatch.setattr(
+        flashinfer_sparse_mla,
+        "is_flashinfer_sparse_mla_enabled",
+        lambda algorithm: algorithm in ("deepseek_v4", "dsa"),
+    )
+    assert not DeepseekV4TrtllmAttention.support_fused_rope()
+    assert not DSATrtllmAttention.support_fused_rope()
+
+    monkeypatch.setattr(
+        flashinfer_sparse_mla,
+        "is_flashinfer_sparse_mla_enabled",
+        lambda algorithm: False,
+    )
+    assert DeepseekV4TrtllmAttention.support_fused_rope()
+    assert DSATrtllmAttention.support_fused_rope()
+
+
+def test_flashinfer_sparse_mla_forward_dispatch(monkeypatch):
+    from tensorrt_llm._torch.attention_backend.sparse import dsa_flashinfer
+    from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4 import flashinfer
+
+    calls = []
+    monkeypatch.setattr(
+        flashinfer,
+        "run_flashinfer_sparse_mla",
+        lambda *args: calls.append(("deepseek_v4", args)),
+    )
+    monkeypatch.setattr(
+        dsa_flashinfer,
+        "run_flashinfer_sparse_mla",
+        lambda *args: calls.append(("dsa", args)),
+    )
+
+    for algorithm in ("deepseek_v4", "dsa"):
+        attn = SimpleNamespace(sparse_params=SimpleNamespace(algorithm=algorithm))
+        fmha = object.__new__(flashinfer_sparse_mla.FlashInferSparseMlaFmha)
+        fmha._attn_ref = lambda: attn
+        q, metadata, forward_args = object(), object(), object()
+
+        fmha.forward(q, None, None, metadata, forward_args)
+
+        assert calls[-1] == (algorithm, (attn, q, metadata, forward_args))

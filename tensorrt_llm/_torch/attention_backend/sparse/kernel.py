@@ -1,6 +1,5 @@
 import math
 import os
-from typing import Optional, Tuple
 
 import torch
 import triton
@@ -2225,7 +2224,7 @@ def deepseek_v4_local_to_global_indices(
     compress_ratio: int = 1,
     num_compressed_indices: int = 0,  # max number of compressed indices
     split_extra: bool = False,
-) -> torch.Tensor | Tuple[torch.Tensor, Optional[torch.Tensor]]:
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]:
     """
     Convert local token indices to global KV cache pool indices.
 
