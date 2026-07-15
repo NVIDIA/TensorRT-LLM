@@ -2080,16 +2080,12 @@ class EagleDecodingConfig(DecodingBaseConfig):
                 logger.warning(
                     f"max_total_draft_tokens is not provided, use the default value {default_max_total_draft_tokens} (default_max_total_draft_tokens = dynamic_tree_max_topK * max_draft_len)"
                 )
-            else:
-                if self.max_total_draft_tokens < self.max_draft_len:
-                    raise ValueError(
-                        f"max_total_draft_tokens ({self.max_total_draft_tokens}) should be >= max_draft_len ({self.max_draft_len})"
-                    )
-                if self.max_total_draft_tokens > self.dynamic_tree_max_topK * self.max_draft_len:
-                    raise ValueError(
-                        f"max_total_draft_tokens ({self.max_total_draft_tokens}) should be <= "
-                        f"dynamic_tree_max_topK * max_draft_len ({self.dynamic_tree_max_topK * self.max_draft_len})"
-                    )
+            elif not (self.max_draft_len <= self.max_total_draft_tokens <=
+                      default_max_total_draft_tokens):
+                raise ValueError(
+                    f"max_total_draft_tokens ({self.max_total_draft_tokens}) must be in "
+                    f"[max_draft_len ({self.max_draft_len}), dynamic_tree_max_topK * "
+                    f"max_draft_len ({default_max_total_draft_tokens})]")
 
         # Linear tree
         if self.max_total_draft_tokens is None:
@@ -2521,15 +2517,15 @@ class MTPDecodingConfig(DecodingBaseConfig):
             default_max_total_draft_tokens = self.dynamic_tree_max_topK * self.max_draft_len
             if self.max_total_draft_tokens is None:
                 self.max_total_draft_tokens = default_max_total_draft_tokens
-            elif self.max_total_draft_tokens < self.max_draft_len:
-                raise ValueError(
-                    f"max_total_draft_tokens ({self.max_total_draft_tokens}) must be >= "
-                    f"max_draft_len ({self.max_draft_len})")
-            elif self.max_total_draft_tokens > default_max_total_draft_tokens:
-                raise ValueError(
-                    f"max_total_draft_tokens ({self.max_total_draft_tokens}) must be <= "
-                    f"dynamic_tree_max_topK * max_draft_len ({default_max_total_draft_tokens})"
+                logger.warning(
+                    f"max_total_draft_tokens is not provided, use the default value {default_max_total_draft_tokens} (default_max_total_draft_tokens = dynamic_tree_max_topK * max_draft_len)"
                 )
+            elif not (self.max_draft_len <= self.max_total_draft_tokens <=
+                      default_max_total_draft_tokens):
+                raise ValueError(
+                    f"max_total_draft_tokens ({self.max_total_draft_tokens}) must be in "
+                    f"[max_draft_len ({self.max_draft_len}), dynamic_tree_max_topK * "
+                    f"max_draft_len ({default_max_total_draft_tokens})]")
         elif self.max_draft_len is not None:
             self.max_total_draft_tokens = self.max_draft_len  # linear chain
         return self
