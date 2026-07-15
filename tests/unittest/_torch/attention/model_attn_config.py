@@ -19,7 +19,9 @@ identical given pre-rotated Q/K, so it is represented by the base RoPE style
 
 ``rope`` is one of ``None`` / ``"neox"`` / ``"gptj"``. ``mask`` is
 ``"causal"`` / ``"full"`` / ``"sliding"``. ``no_cache=True`` marks the
-bidirectional, KV-cache-free DiT / encoder workloads.
+bidirectional, KV-cache-free DiT / encoder workloads. Sparse models carry the
+same user-facing sparse-attention config that production lowers independently
+for the backend, metadata, and KV-cache manager.
 
 ID naming rule:
 - Use lowercase snake_case:
@@ -46,13 +48,36 @@ elsewhere):
   Qwen2.5-VL with ``use_sliding_window=False``).
 - Vision/text encoders (SigLip/Radio/CLIP/Parakeet, MiniMax-VL tower) collapse
   onto the bidirectional MHA tuples already listed (e.g. 16x64 / 12x64 full).
-- Sparse/DSA indexer attention (GLM-DSA, NSA, RocketKV) is a separate paradigm
-  validated under sparse/; there is no dense Vanilla golden for it.
+- Sparse indexer correctness is validated under ``sparse/``. This model sweep
+  injects deterministic backend-neutral selections and validates the selected
+  attention path against the Vanilla golden.
 - Multimodal cross variants (Llama4-vision, Gemma4-MM) reuse the cross tuples.
 """
 
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List, Literal, Optional, Tuple
+
+from tensorrt_llm.llmapi.llm_args import BaseSparseAttentionConfig, DeepSeekSparseAttentionConfig
+
+
+@dataclass(frozen=True)
+class SparseHarnessConfig:
+    """Backend-neutral semantics and dimensions for a sparse test case.
+
+    Algorithms that produce the same selection representation reuse one
+    generator/runner. A new representation extends this common harness once,
+    rather than adding per-backend tests.
+    """
+
+    attention_family: Literal["standard", "mla"]
+    selection_unit: Literal["none", "token", "block"]
+    topk: int
+    page_size: int = 64
+    kv_layout: Literal["NHD", "HND"] = "HND"
+    use_kv_cache_manager_v2: bool = False
+    compute_dtypes: Tuple[str, ...] = ("bfloat16",)
+    selection_patterns: Tuple[str, ...] = ("random", "singleton")
+    generation_tokens_per_seq: int = 2
 
 
 @dataclass(frozen=True)
@@ -78,6 +103,12 @@ class ModelAttnConfig:
     qk_nope_head_dim: Optional[int] = None
     qk_rope_head_dim: Optional[int] = None
     v_head_dim: Optional[int] = None
+    hidden_size: Optional[int] = None
+    sparse_attention_config: Optional[BaseSparseAttentionConfig] = None
+    sparse_harness_config: Optional[SparseHarnessConfig] = None
+    hf_config_overrides: Optional[dict] = None
+    atol: Optional[float] = None
+    rtol: Optional[float] = None
 
 
 # ---------------------------------------------------------------------------
@@ -569,6 +600,37 @@ _STANDARD = [
 # MLA (DeepSeek-style absorbed latent attention). num_kv_heads == 1 latent head.
 # ---------------------------------------------------------------------------
 _MLA = [
+    # DeepSeek-V3.2 DSA uses absorbed MLA for both context and generation.
+    # The model's V projection is outside the standalone backend; the sparse
+    # backend itself returns kv_lora_rank-wide latent values per query head.
+    ModelAttnConfig(
+        "deepseekv3_2_dsa_mla",
+        "DeepSeek-V3.2",
+        num_heads=128,
+        num_kv_heads=1,
+        head_dim=192,
+        rope="gptj",
+        is_mla=True,
+        kv_lora_rank=512,
+        q_lora_rank=1536,
+        qk_nope_head_dim=128,
+        qk_rope_head_dim=64,
+        v_head_dim=128,
+        hidden_size=7168,
+        sparse_attention_config=DeepSeekSparseAttentionConfig(
+            index_n_heads=64,
+            index_head_dim=128,
+            index_topk=128,
+            skip_indexer_for_short_seqs=False,
+        ),
+        sparse_harness_config=SparseHarnessConfig(
+            attention_family="mla",
+            selection_unit="token",
+            topk=128,
+        ),
+        atol=0.1,
+        rtol=0.01,
+    ),
     # DeepSeek-V3: 128 Q heads, qk_nope=128, qk_rope=64, kv_lora=512, v=128.
     ModelAttnConfig(
         "deepseekv3_mla",

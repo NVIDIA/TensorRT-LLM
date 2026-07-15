@@ -22,7 +22,6 @@ from typing import List, Optional
 
 import pytest
 import torch
-import torch.nn.functional as F
 
 import tensorrt_llm
 import tensorrt_llm.bindings
@@ -33,6 +32,7 @@ from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4 import (
 from tensorrt_llm._torch.attention_backend.sparse.dsa import (HAS_FAST_HADAMARD,
                                                               DSACacheManager)
 from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
+from tensorrt_llm._torch.attention_backend.vanilla import VanillaIndexer
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.modules.mla import MLA
@@ -271,18 +271,6 @@ def _copy_ref_compressor_weights(ref_compressor: RefCompressor,
     ref_compressor.norm.weight.data.copy_(compressor.norm.weight.data)
 
 
-def _topk_from_scores(scores: torch.Tensor, topk_tokens: int) -> torch.Tensor:
-    row = torch.full((topk_tokens, ),
-                     -1,
-                     dtype=torch.int32,
-                     device=scores.device)
-    if scores.numel() == 0:
-        return row
-    k = min(topk_tokens, scores.numel())
-    row[:k] = torch.topk(scores.float(), k, dim=-1).indices.to(torch.int32)
-    return row
-
-
 def _ceil_pow2_scale(amax: torch.Tensor, max_value_inv: float,
                      min_amax: float) -> torch.Tensor:
     scaled = torch.clamp(amax.float(), min=min_amax) * max_value_inv
@@ -355,14 +343,6 @@ def _prepare_fp4_indexer_k_reference(k: torch.Tensor) -> torch.Tensor:
                                           min_amax=fp4_min_amax)
 
 
-def _reference_indexer_scores(q: torch.Tensor, k: torch.Tensor,
-                              weights: torch.Tensor,
-                              softmax_scale: float) -> torch.Tensor:
-    head_scores = torch.einsum("hd,kd->hk", q.float(), k.float())
-    head_scores = F.relu(head_scores) * softmax_scale
-    return (head_scores * weights.float().unsqueeze(-1)).sum(dim=0)
-
-
 def calculate_reference_deepseek_v4_topk_indices(
     mla,
     ref_indexer_compressor: RefCompressor,
@@ -378,26 +358,29 @@ def calculate_reference_deepseek_v4_topk_indices(
     compress_ratio: int,
     device: torch.device,
 ) -> torch.Tensor:
-    """Independent PyTorch reference for HF DS4 ratio-4 indexer top-k indices."""
+    """Independent PyTorch reference for HF DS4 ratio-4 indexer top-k indices.
+
+    The index-space query projection, per-head token weights, logit scoring, and
+    top-k are shared with the DSA path via :class:`VanillaIndexer`; this function
+    adds the DeepSeek-V4-specific compressor that produces the reference K.
+    """
     indexer = mla.mqa.indexer
+    vindexer = VanillaIndexer(indexer)
     num_tokens = hidden_states.shape[0]
     topk_indices = torch.full((num_tokens, topk_tokens),
                               -1,
                               dtype=torch.int32,
                               device=device)
 
-    q_ref = F.linear(qr, indexer.wq_b.weight)
-    q_ref = q_ref.view(num_tokens, indexer.n_heads, indexer.head_dim)
-    q_ref = q_ref.unsqueeze(0)
-    apply_rotary_emb(q_ref[..., -indexer.rope_dim:],
-                     freqs_cis[position_ids.long()])
-    q_ref = q_ref.squeeze(0)
-    use_fp4_indexer = indexer.indexer_k_dtype == "fp4"
-    if use_fp4_indexer:
-        q_ref = _prepare_fp4_indexer_q_reference(q_ref)
-
-    weights = F.linear(hidden_states, indexer.weights_proj.weight)
-    weights = weights.float() * (indexer.n_heads**-0.5)
+    use_fp4_indexer = vindexer.uses_fp4
+    q_ref = vindexer.project_query(
+        qr,
+        position_ids,
+        freqs_cis,
+        apply_rotary_emb,
+        fp4_prep=_prepare_fp4_indexer_q_reference if use_fp4_indexer else None,
+    )
+    weights = vindexer.token_weights(hidden_states)
 
     offset = 0
     for req_idx in ctx_indices:
@@ -421,11 +404,10 @@ def calculate_reference_deepseek_v4_topk_indices(
             for token_idx in range(seq_len):
                 valid_len = (token_idx + 1) // compress_ratio
                 k_for_scores = compressed_kv_for_scores[:valid_len]
-                scores = _reference_indexer_scores(q_ref[offset + token_idx],
-                                                   k_for_scores,
-                                                   weights[offset + token_idx],
-                                                   indexer.softmax_scale)
-                topk_indices[offset + token_idx] = _topk_from_scores(
+                scores = vindexer.scores(q_ref[offset + token_idx],
+                                         k_for_scores,
+                                         weights[offset + token_idx])
+                topk_indices[offset + token_idx] = vindexer.topk_from_scores(
                     scores, topk_tokens)
 
         offset += seq_len
@@ -467,11 +449,10 @@ def calculate_reference_deepseek_v4_topk_indices(
         compressed_kv_for_scores = (
             _prepare_fp4_indexer_k_reference(compressed_kv)
             if use_fp4_indexer else compressed_kv)
-        scores = _reference_indexer_scores(q_ref[token_idx],
-                                           compressed_kv_for_scores[:valid_len],
-                                           weights[token_idx],
-                                           indexer.softmax_scale)
-        topk_indices[token_idx] = _topk_from_scores(scores, topk_tokens)
+        scores = vindexer.scores(q_ref[token_idx],
+                                 compressed_kv_for_scores[:valid_len],
+                                 weights[token_idx])
+        topk_indices[token_idx] = vindexer.topk_from_scores(scores, topk_tokens)
 
     return topk_indices
 

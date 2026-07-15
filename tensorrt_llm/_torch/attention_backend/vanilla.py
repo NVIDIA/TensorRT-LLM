@@ -2,7 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import math
-from typing import Optional
+from dataclasses import replace
+from typing import Callable, Optional
 
 import torch
 import torch.nn.functional as F
@@ -116,20 +117,40 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
             self.qk_nope_head_dim = mla_params.qk_nope_head_dim
             self.v_head_dim = mla_params.v_head_dim
 
-        self.dsa_rope_cos_sin = None
-        self.dsa_rope_is_neox = True
+        self.sparse_mla_rope_cos_sin = None
+        self.sparse_mla_rope_is_neox = True
         if (self.is_mla_enable
                 and getattr(self.sparse_params, "algorithm", None) == "dsa"
                 and pos_embd_params is not None
                 and pos_embd_params.rope is not None):
-            self.dsa_rope_cos_sin = pos_embd_params.rope.create_rope_const_params(
+            self.sparse_mla_rope_cos_sin = pos_embd_params.rope.create_rope_const_params(
                 interleave=False)[1].reshape(pos_embd_params.rope.max_positions,
                                              2, -1)
-            self.dsa_rope_is_neox = pos_embd_params.is_neox
+            self.sparse_mla_rope_is_neox = pos_embd_params.is_neox
 
     @classmethod
     def support_mla(cls) -> bool:
         return True
+
+    def sparse_kv_predict(
+        self,
+        q: torch.Tensor,
+        k: Optional[torch.Tensor],
+        metadata: VanillaAttentionMetadata,
+        forward_args: AttentionForwardArgs,
+    ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """Lower backend-neutral sparse KV selection for Vanilla attention."""
+        return None, None
+
+    def sparse_attn_predict(
+        self,
+        q: torch.Tensor,
+        k: Optional[torch.Tensor],
+        metadata: VanillaAttentionMetadata,
+        forward_args: AttentionForwardArgs,
+    ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """Use request-local caller-provided selections in the Vanilla backend."""
+        return forward_args.topk_indices, None
 
     @staticmethod
     def _apply_rotary_embedding(x: torch.Tensor, cos: torch.Tensor,
@@ -152,58 +173,59 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
             rotated = torch.stack((out1, out2), dim=-1).flatten(-2)
         return torch.cat((rotated, x_pass), dim=-1)
 
-    def _prepare_dsa_mla_inputs(
+    def _prepare_sparse_mla_inputs(
         self,
         fused_q: torch.Tensor,
         latent_cache: torch.Tensor,
         q_pe: Optional[torch.Tensor],
         positions: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Apply DSA MLA RoPE to raw packed query and latent-cache inputs.
+        """Apply sparse MLA RoPE to raw packed query and latent-cache inputs.
 
         As with the other attention paths, omitting positional-embedding
         parameters means the caller already applied RoPE.
         """
-        if self.dsa_rope_cos_sin is None:
+        if self.sparse_mla_rope_cos_sin is None:
             return fused_q, latent_cache
 
         if positions.numel() == 0:
             return fused_q, latent_cache
         max_position = int(positions.max().item())
-        if max_position >= self.dsa_rope_cos_sin.shape[0]:
+        if max_position >= self.sparse_mla_rope_cos_sin.shape[0]:
             raise ValueError(
-                f"DSA position {max_position} exceeds the configured RoPE table "
-                f"size {self.dsa_rope_cos_sin.shape[0]}")
+                f"Sparse MLA position {max_position} exceeds the configured RoPE table "
+                f"size {self.sparse_mla_rope_cos_sin.shape[0]}")
 
         num_tokens = fused_q.shape[0]
         fused_head_dim = self.kv_lora_rank + self.qk_rope_head_dim
         query = fused_q.view(num_tokens, self.num_heads, fused_head_dim).clone()
         if q_pe is None:
             raise ValueError(
-                "Vanilla DSA requires raw q_pe when RoPE parameters are configured"
+                "Vanilla sparse MLA requires raw q_pe when RoPE parameters are configured"
             )
         expected_numel = num_tokens * self.num_heads * self.qk_rope_head_dim
         if q_pe.numel() != expected_numel:
             raise ValueError(
-                f"DSA q_pe has {q_pe.numel()} elements, expected {expected_numel}"
+                f"Sparse MLA q_pe has {q_pe.numel()} elements, expected {expected_numel}"
             )
         query_rope = q_pe.reshape(num_tokens, self.num_heads,
                                   self.qk_rope_head_dim)
 
         if latent_cache.shape[1] != fused_head_dim:
             raise ValueError(
-                f"DSA latent cache width must be {fused_head_dim}, got "
+                f"Sparse MLA latent cache width must be {fused_head_dim}, got "
                 f"{latent_cache.shape[1]}")
         latent_cache = latent_cache.clone()
         key_rope = latent_cache[:, self.kv_lora_rank:].unsqueeze(1)
-        cos_sin = self.dsa_rope_cos_sin.index_select(
+        cos_sin = self.sparse_mla_rope_cos_sin.index_select(
             0,
-            positions.to(device=self.dsa_rope_cos_sin.device, dtype=torch.long))
+            positions.to(device=self.sparse_mla_rope_cos_sin.device,
+                         dtype=torch.long))
         cos, sin = cos_sin.unbind(dim=1)
         query[..., -self.qk_rope_head_dim:] = self._apply_rotary_embedding(
-            query_rope, cos, sin, self.dsa_rope_is_neox)
+            query_rope, cos, sin, self.sparse_mla_rope_is_neox)
         latent_cache[:, self.kv_lora_rank:] = self._apply_rotary_embedding(
-            key_rope, cos, sin, self.dsa_rope_is_neox).squeeze(1)
+            key_rope, cos, sin, self.sparse_mla_rope_is_neox).squeeze(1)
         return query.view(num_tokens, -1), latent_cache
 
     def _single_request_sparse_attn_predict(
@@ -691,7 +713,7 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
             remaining -= num_tokens
         return torch.cat(chunks, dim=0)
 
-    def _mla_forward_dsa(
+    def _mla_forward_sparse(
         self,
         fused_q: torch.Tensor,
         metadata: VanillaAttentionMetadata,
@@ -700,11 +722,11 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
         topk_indices: torch.Tensor,
         attention_input_type: AttentionInputType,
     ) -> torch.Tensor:
-        """Run DSA selected attention from caller-provided local top-k rows.
+        """Run selected sparse MLA from caller-provided local top-k rows.
 
-        DSA's indexer owns selection. This golden consumes its request-local
-        token positions, gathers the selected latent K/V, and performs the
-        absorbed MLA attention directly in PyTorch.
+        The sparse algorithm owns selection. This golden consumes its
+        request-local token positions, gathers the selected latent K/V, and
+        performs the absorbed MLA attention directly in PyTorch.
         """
         if attention_input_type == AttentionInputType.context_only:
             seq_start, seq_end = 0, metadata.num_contexts
@@ -796,7 +818,7 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
                              dtype=torch.long) for past, q_len in zip(
                                  phase_past_tokens, phase_seq_lens, strict=True)
             ])
-        fused_q, latent_cache = self._prepare_dsa_mla_inputs(
+        fused_q, latent_cache = self._prepare_sparse_mla_inputs(
             fused_q, latent_cache, q_pe, positions)
 
         from .utils import append_mla_latent_cache
@@ -908,25 +930,42 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
                 raise ValueError("Vanilla MLA requires a KV cache manager.")
             if forward_args.latent_cache is None:
                 raise ValueError("Vanilla MLA requires latent_cache.")
-            sparse_algorithm = getattr(self.sparse_params, "algorithm", None)
-            if forward_args.topk_indices is not None:
+            if self.sparse_params is not None:
+                sparse_algorithm = self.sparse_params.algorithm
                 if sparse_algorithm != "dsa":
                     raise ValueError(
                         "Vanilla selected MLA currently supports only DSA")
+                kv_idx, kv_off = self.sparse_kv_predict(q, k, metadata,
+                                                        forward_args)
+                at_idx, at_off = self.sparse_attn_predict(
+                    q, k, metadata, forward_args)
+                forward_args.sparse_prediction = replace(
+                    forward_args.sparse_prediction,
+                    sparse_kv_indices=kv_idx,
+                    sparse_kv_offsets=kv_off,
+                    sparse_attn_indices=at_idx,
+                    sparse_attn_offsets=at_off,
+                    sparse_attn_indices_block_size=getattr(
+                        self.sparse_params, "indices_block_size"),
+                )
+            sparse_attn_indices = (
+                forward_args.sparse_prediction.sparse_attn_indices)
+            if sparse_attn_indices is not None:
                 if k is not None or v is not None:
                     raise ValueError(
-                        "Vanilla DSA expects absorbed queries and latent cache, "
+                        "Vanilla sparse MLA expects absorbed queries and latent cache, "
                         "not explicit K/V tensors")
-                return self._mla_forward_dsa(
+                return self._mla_forward_sparse(
                     q,
                     metadata,
                     forward_args.latent_cache,
                     forward_args.q_pe,
-                    forward_args.topk_indices,
+                    sparse_attn_indices,
                     forward_args.attention_input_type,
                 )
-            if sparse_algorithm == "dsa":
-                raise ValueError("Vanilla DSA requires topk_indices")
+            if self.sparse_params is not None:
+                raise ValueError(
+                    "Vanilla sparse MLA requires sparse attention indices")
             if forward_args.attention_input_type == AttentionInputType.context_only:
                 assert k is not None and v is not None
                 return self._mla_forward_context(q, k, v, metadata,
@@ -997,3 +1036,101 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
         attn_output = attn_output.view(q_len, -1)
 
         return attn_output
+
+
+class VanillaIndexer:
+    """fp32 reference for the production DSA / DeepSeek-V4 sparse ``Indexer``.
+
+    The production indexer (``sparse/dsa.py``) selects the top-k KV a query may
+    attend to. ``VanillaIndexer`` mirrors that selection math in plain fp32 so it
+    can serve as the indexer golden, analogous to how ``VanillaAttention`` is the
+    attention golden.
+
+    It is a standalone reference, deliberately **not** wired into
+    ``VanillaAttention.forward``:
+
+    * The indexer consumes index-space inputs (``qr`` / ``hidden_states`` / an
+      index-space K cache) that ``forward(q, k, v, metadata)`` never receives;
+      folding it into the forward path would widen the generic backend interface
+      with algorithm-specific tensors.
+    * A meaningful indexer golden must run against the *production indexer's own
+      weights*, so this class **wraps a production ``Indexer`` instance** and
+      reads its ``wq_b`` / ``weights_proj`` / ``softmax_scale`` / ... rather than
+      owning independent (non-comparable) parameters.
+
+    It owns the parts common to DSA and DeepSeek-V4 -- the index-space query
+    projection, the per-head token weights, the logit scoring, and the top-k.
+    Algorithm-specific K comes from a compressor / ``wk`` projection, so the
+    caller supplies the reference K and this class handles the rest.
+
+    Selection is discrete: top-k over near-tied logits, and an fp32 reference vs
+    an fp8/fp4 kernel can pick different borderline tokens. Compare the selected
+    index *set*, never exact attention outputs.
+    """
+
+    def __init__(self, indexer):
+        self.indexer = indexer
+        self.n_heads = indexer.n_heads
+        self.head_dim = indexer.head_dim
+        self.rope_dim = indexer.rope_dim
+        self.softmax_scale = indexer.softmax_scale
+        self.indexer_k_dtype = getattr(indexer, "indexer_k_dtype", None)
+
+    @property
+    def uses_fp4(self) -> bool:
+        return self.indexer_k_dtype == "fp4"
+
+    def project_query(
+        self,
+        qr: torch.Tensor,
+        position_ids: torch.Tensor,
+        freqs_cis: torch.Tensor,
+        rope_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
+        *,
+        fp4_prep: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
+    ) -> torch.Tensor:
+        """Index-space query: ``wq_b`` GEMM + RoPE on the rope slice.
+
+        ``rope_fn(slice, freqs)`` applies RoPE in place (the caller injects the
+        algorithm's rotary helper). ``fp4_prep`` optionally applies the fp4
+        indexer quant/dequant. Returns ``[num_tokens, n_heads, head_dim]``.
+        """
+        num_tokens = qr.shape[0]
+        q = F.linear(qr, self.indexer.wq_b.weight)
+        q = q.view(num_tokens, self.n_heads, self.head_dim).unsqueeze(0)
+        rope_fn(q[..., -self.rope_dim:], freqs_cis[position_ids.long()])
+        q = q.squeeze(0)
+        if fp4_prep is not None:
+            q = fp4_prep(q)
+        return q
+
+    def token_weights(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Per-head token weights: ``weights_proj`` GEMM scaled by ``n_heads**-0.5``."""
+        weights = F.linear(hidden_states, self.indexer.weights_proj.weight)
+        return weights.float() * (self.n_heads**-0.5)
+
+    def scores(self, q_row: torch.Tensor, k: torch.Tensor,
+               weights_row: torch.Tensor) -> torch.Tensor:
+        """Per-KV index logits for one query token (fp32).
+
+        ``q_row`` is ``[n_heads, head_dim]``, ``k`` is ``[num_kv, head_dim]``,
+        ``weights_row`` is ``[n_heads]``. Mirrors the production indexer: per-head
+        ReLU(q·k) scaled by ``softmax_scale``, combined with the per-head weights.
+        Returns ``[num_kv]`` logits.
+        """
+        head_scores = torch.einsum("hd,kd->hk", q_row.float(), k.float())
+        head_scores = F.relu(head_scores) * self.softmax_scale
+        return (head_scores * weights_row.float().unsqueeze(-1)).sum(dim=0)
+
+    def topk_from_scores(self, scores: torch.Tensor,
+                         topk_tokens: int) -> torch.Tensor:
+        """Top-k KV positions for one query token, ``-1``-padded to ``topk_tokens``."""
+        row = torch.full((topk_tokens, ),
+                         -1,
+                         dtype=torch.int32,
+                         device=scores.device)
+        if scores.numel() == 0:
+            return row
+        k = min(topk_tokens, scores.numel())
+        row[:k] = torch.topk(scores.float(), k, dim=-1).indices.to(torch.int32)
+        return row

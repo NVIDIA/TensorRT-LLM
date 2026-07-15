@@ -78,6 +78,33 @@ _PHASES = _phases_from_window(_NON_SLIDING_PHASE_WINDOW)
 
 
 def _phases_for(cfg: ModelAttnConfig) -> dict:
+    if cfg.sparse_attention_config is not None:
+        harness = cfg.sparse_harness_config
+        if harness is None:
+            raise ValueError(f"Sparse model config {cfg.id} must define a sparse harness")
+        if (harness.attention_family == "mla") != cfg.is_mla:
+            raise ValueError(
+                f"Sparse harness family {harness.attention_family!r} does not match {cfg.id}"
+            )
+        long_len = harness.topk + 32
+        generation_len = harness.generation_tokens_per_seq
+        return {
+            "ctx": dict(
+                seq_lens=[long_len, 73, 41],
+                num_cached_tokens=[0, 0, 0],
+                num_contexts=3,
+            ),
+            "gen": dict(
+                seq_lens=[generation_len] * 3,
+                num_cached_tokens=[long_len, 73, 41],
+                num_contexts=0,
+            ),
+            "mix": dict(
+                seq_lens=[long_len, generation_len, generation_len],
+                num_cached_tokens=[0, long_len, 73],
+                num_contexts=1,
+            ),
+        }
     if cfg.mask != "sliding":
         return _PHASES
 
@@ -113,6 +140,20 @@ def _common(cfg: ModelAttnConfig) -> dict:
             qk_nope_head_dim=cfg.qk_nope_head_dim,
             qk_rope_head_dim=cfg.qk_rope_head_dim,
             v_head_dim=cfg.v_head_dim,
+            hidden_size=cfg.hidden_size,
+        )
+    if cfg.sparse_attention_config is not None:
+        harness = cfg.sparse_harness_config
+        assert harness is not None
+        common.update(
+            sparse_attention_config=cfg.sparse_attention_config.model_dump(mode="json"),
+            sparse_attention_family=harness.attention_family,
+            sparse_selection_unit=harness.selection_unit,
+            sparse_topk=harness.topk,
+            sparse_generation_tokens_per_seq=harness.generation_tokens_per_seq,
+            hf_config_overrides=cfg.hf_config_overrides,
+            atol=cfg.atol,
+            rtol=cfg.rtol,
         )
     return common
 
@@ -135,6 +176,36 @@ def _expand(cfg: ModelAttnConfig, precisions, kv_layouts, page_sizes):
     """
     common = _common(cfg)
     phases = _phases_for(cfg)
+
+    # The model's sparse harness declares the common input/selection semantics
+    # and cache constraints. Fake request-local selections isolate backend
+    # execution from the separately-tested algorithm/indexer.
+    if cfg.sparse_attention_config is not None:
+        harness = cfg.sparse_harness_config
+        assert harness is not None
+        for dtype, kvd in precisions:
+            if kvd is not None or dtype not in harness.compute_dtypes:
+                continue
+            for phase_name in ("ctx", "gen", "mix"):
+                for selection in harness.selection_patterns:
+                    manager = "v2" if harness.use_kv_cache_manager_v2 else "v1"
+                    tag = (
+                        f"{_prec_tag(dtype, kvd)}-{harness.kv_layout}"
+                        f"-p{harness.page_size}-{manager}-{selection}"
+                    )
+                    yield (
+                        f"{cfg.id}-{phase_name}-{tag}",
+                        BackendCase(
+                            page_size=harness.page_size,
+                            kv_layout=harness.kv_layout,
+                            dtype=dtype,
+                            sparse_selection=selection,
+                            use_kv_cache_manager_v2=harness.use_kv_cache_manager_v2,
+                            **phases[phase_name],
+                            **common,
+                        ),
+                    )
+        return
 
     # Bidirectional, KV-cache-free DiT / encoder workloads: only compute dtype.
     if cfg.no_cache:

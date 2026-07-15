@@ -14,28 +14,34 @@ replay suite (captured cases) — a captured case is just a serialized
 
 import math
 from dataclasses import asdict, dataclass
+from types import SimpleNamespace
 from typing import Dict, List, Optional
 
 import torch
 from backend_capability import BACKEND_CAPS, unsupported_reason
 from kv_cache_utils import apply_rope, fill_kv_cache_logical, make_position_ids
+from pydantic import TypeAdapter
 
 import tensorrt_llm
 from tensorrt_llm._torch.attention_backend.interface import (
     AttentionForwardArgs,
     AttentionInputType,
+    MLAParams,
     PositionalEmbeddingParams,
     PredefinedAttentionMask,
     RopeParams,
 )
+from tensorrt_llm._torch.attention_backend.sparse import get_sparse_attn_kv_cache_manager
 from tensorrt_llm._torch.attention_backend.utils import create_attention, get_attention_backend
+from tensorrt_llm._torch.attention_backend.vanilla import VanillaAttention
 from tensorrt_llm._torch.flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from tensorrt_llm._torch.metadata import KVCacheParams
+from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import str_dtype_to_torch, torch_dtype_to_binding
 from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
-from tensorrt_llm.llmapi.llm_args import KvCacheConfig
+from tensorrt_llm.llmapi.llm_args import KvCacheConfig, SparseAttentionConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
@@ -55,6 +61,7 @@ FP4_ATOL = 6e-1
 # included when available, so callers can iterate this list unconditionally.
 BACKENDS_UNDER_TEST = ("TRTLLM",) + (("FLASHINFER",) if IS_FLASHINFER_AVAILABLE else ())
 DEFAULT_MAX_NUM_TOKENS = 8192
+_SPARSE_CONFIG_ADAPTER = TypeAdapter(SparseAttentionConfig)
 
 
 def _dtype_to_torch(dtype: str):
@@ -92,7 +99,19 @@ class BackendCase:
     q_scaling: float = 1.0
     page_size: int = 64
     cache: str = "paged"  # "paged" | "none"
-    sparse: str = "off"  # "off" | "degenerate"
+    # Serialized user-facing sparse config. It is lowered independently into
+    # backend params, metadata params, and the sparse KV-cache manager, exactly
+    # as in production.
+    sparse_attention_config: Optional[dict] = None
+    # Backend-neutral sparse execution contract. This keeps the runner from
+    # inferring DSA/MLA semantics from an algorithm name.
+    sparse_attention_family: Optional[str] = None  # "standard" | "mla"
+    sparse_selection_unit: Optional[str] = None  # "none" | "token" | "block"
+    sparse_topk: Optional[int] = None
+    # Fake backend-neutral selection policy used in backend-level tests. The
+    # real algorithm/indexer is covered separately.
+    sparse_selection: str = "random"  # "random" | "singleton"
+    sparse_generation_tokens_per_seq: int = 1
     # RoPE config: RopeParams kwargs (+ optional "is_neox"), or None to disable.
     rope: Optional[dict] = None
     # When True (and rope set), exercise TRTLLM's in-kernel fused RoPE: TRTLLM
@@ -116,11 +135,15 @@ class BackendCase:
     # and latent-cache inputs: TRTLLM fuses RoPE while Vanilla/FlashInfer receive
     # the equivalent pre-rotated tensors.
     v_head_dim: Optional[int] = None
+    hidden_size: Optional[int] = None
     q_lora_rank: Optional[int] = None
     kv_lora_rank: Optional[int] = None
     qk_nope_head_dim: Optional[int] = None
     qk_rope_head_dim: Optional[int] = None
     use_kv_cache_manager_v2: bool = False
+    hf_config_overrides: Optional[dict] = None
+    atol: Optional[float] = None
+    rtol: Optional[float] = None
 
     @property
     def num_seqs(self) -> int:
@@ -133,6 +156,20 @@ class BackendCase:
     @property
     def is_cross(self) -> bool:
         return self.seq_lens_kv is not None
+
+    @property
+    def is_sparse(self) -> bool:
+        return self.sparse_attention_config is not None
+
+    @property
+    def prompt_lens(self) -> List[int]:
+        """Original prompt lengths expected by fused generation kernels."""
+        return [
+            seq_len if i < self.num_contexts else cached_len
+            for i, (seq_len, cached_len) in enumerate(
+                zip(self.seq_lens, self.num_cached_tokens, strict=True)
+            )
+        ]
 
     @property
     def is_gen_only(self) -> bool:
@@ -199,6 +236,54 @@ def _rope_params_from_dict(d: dict) -> RopeParams:
         if isinstance(kwargs.get(key), list):
             kwargs[key] = tuple(kwargs[key])
     return RopeParams(**kwargs)
+
+
+def _sparse_config(case: BackendCase):
+    """Restore the production sparse config from its serialized case form."""
+    if case.sparse_attention_config is None:
+        return None
+    return _SPARSE_CONFIG_ADAPTER.validate_python(case.sparse_attention_config)
+
+
+def _validate_sparse_case(case: BackendCase) -> None:
+    """Reject incomplete or unsupported sparse harness contracts explicitly."""
+    harness_fields = (
+        case.sparse_attention_family,
+        case.sparse_selection_unit,
+        case.sparse_topk,
+    )
+    if not case.is_sparse:
+        if any(value is not None for value in harness_fields):
+            raise ValueError("Sparse harness fields require sparse_attention_config")
+        return
+    if any(value is None for value in harness_fields):
+        raise ValueError("Sparse backend cases require family, selection unit, and top-k")
+    if case.sparse_attention_family == "mla" and not case.is_mla:
+        raise ValueError("Sparse MLA harness requires is_mla=True")
+    if case.sparse_selection_unit not in ("token", "block"):
+        raise ValueError(
+            f"Unsupported sparse selection unit: {case.sparse_selection_unit!r} "
+            "(expected 'token' or 'block')"
+        )
+    if case.sparse_topk <= 0:
+        raise ValueError("Sparse backend cases require sparse_topk > 0")
+
+
+def _sparse_pretrained_config(case: BackendCase) -> SimpleNamespace:
+    """Build one HF-like config shared by every sparse lowering boundary."""
+    values = dict(
+        rms_norm_eps=1e-6,
+        hidden_size=case.hidden_size,
+        num_attention_heads=case.num_heads,
+        num_key_value_heads=case.num_kv_heads,
+        q_lora_rank=case.q_lora_rank,
+        kv_lora_rank=case.kv_lora_rank,
+        qk_nope_head_dim=case.qk_nope_head_dim,
+        qk_rope_head_dim=case.qk_rope_head_dim,
+        v_head_dim=case.v_head_dim,
+    )
+    values.update(case.hf_config_overrides or {})
+    return SimpleNamespace(**values)
 
 
 def _randn(gen: torch.Generator, dtype: torch.dtype, *shape) -> torch.Tensor:
@@ -275,10 +360,18 @@ def _build_kv_cache_manager(case: BackendCase, backend: str, kv_dtype: torch.dty
 # FlashInfer, the comparison validates the absorbed-MQA math regardless of the
 # RoPE values (RoPE correctness is covered by test_attention_mla.py).
 # ---------------------------------------------------------------------------
-def _build_mla_kv_cache_manager(case: BackendCase, backend: str):
+def _build_mla_kv_cache_manager(
+    case: BackendCase,
+    backend: str,
+    sparse_config=None,
+    model_config=None,
+    pretrained_config=None,
+):
     """A SELFKONLY KV cache for MLA: one latent head, head_dim kv_lora+qk_rope."""
     d_latent = case.kv_lora_rank + case.qk_rope_head_dim
-    paged = BACKEND_CAPS[backend]["paged"]
+    # Sparse selected-attention tests deliberately exercise multiple pages in
+    # Vanilla too. Dense Vanilla keeps its historical single-block setup.
+    paged = case.is_sparse or BACKEND_CAPS[backend]["paged"]
     max_total = max(case.token_nums)
     if paged:
         tokens_per_block = case.page_size
@@ -289,10 +382,12 @@ def _build_mla_kv_cache_manager(case: BackendCase, backend: str):
     num_blocks = case.num_seqs * pages_per_seq
     mapping = Mapping(world_size=1, tp_size=1, rank=0)
     cache_types = tensorrt_llm.bindings.internal.batch_manager.CacheType
-    cls = KVCacheManagerV2 if case.use_kv_cache_manager_v2 else KVCacheManager
-    return cls(
-        KvCacheConfig(max_tokens=num_blocks * tokens_per_block, enable_block_reuse=False),
-        cache_types.SELFKONLY,
+    kwargs = dict(
+        kv_cache_config=KvCacheConfig(
+            max_tokens=num_blocks * tokens_per_block,
+            enable_block_reuse=False,
+        ),
+        kv_cache_type=cache_types.SELFKONLY,
         num_layers=1,
         num_kv_heads=1,
         head_dim=d_latent,
@@ -302,6 +397,20 @@ def _build_mla_kv_cache_manager(case: BackendCase, backend: str):
         mapping=mapping,
         dtype=torch_dtype_to_binding(case.compute_dtype),
     )
+
+    if sparse_config is not None and backend != "VANILLA":
+        cls = get_sparse_attn_kv_cache_manager(sparse_config)
+        if model_config is None or pretrained_config is None:
+            raise ValueError("Sparse cache manager requires model and pretrained configs")
+        kwargs.update(
+            sparse_attention_config=sparse_config,
+            model_config=model_config,
+            pretrained_config=pretrained_config,
+        )
+    else:
+        cls = KVCacheManagerV2 if case.use_kv_cache_manager_v2 else KVCacheManager
+
+    return cls(**kwargs)
 
 
 def generate_mla_gen_inputs(case: BackendCase, seed: int = 0) -> Dict:
@@ -328,6 +437,230 @@ def generate_mla_gen_inputs(case: BackendCase, seed: int = 0) -> Dict:
         latent_cache=_randn(gen, cdt, case.nnz_q, d_latent),
         # Cached latent prefix per request.
         cached_latent=[_randn(gen, cdt, c, d_latent) for c in case.num_cached_tokens],
+    )
+
+
+def _build_sparse_topk_indices(
+    case: BackendCase,
+    generator: torch.Generator,
+) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Build causal request-local selections for a sparse backend case."""
+    if case.sparse_selection_unit != "token":
+        raise ValueError(
+            f"Token selection builder cannot handle {case.sparse_selection_unit!r} selections"
+        )
+    topk = case.sparse_topk
+    if topk is None or topk <= 0:
+        raise ValueError("Sparse token-selection cases require a positive top-k")
+    if case.sparse_selection not in ("random", "singleton"):
+        raise ValueError(f"Unsupported sparse selection policy: {case.sparse_selection}")
+
+    indices = torch.full(
+        (case.nnz_q, topk),
+        -1,
+        dtype=torch.int32,
+        device="cuda",
+    )
+    singleton_oracle_mask = (
+        torch.zeros(case.nnz_q, dtype=torch.bool, device="cuda")
+        if case.sparse_selection == "singleton"
+        else None
+    )
+    row = 0
+    for cached_len, q_len in zip(case.num_cached_tokens, case.seq_lens, strict=True):
+        for token_idx in range(q_len):
+            max_index = cached_len + token_idx
+            if case.sparse_selection == "singleton":
+                if max_index + 1 <= topk:
+                    # DSA is effectively dense while the visible prefix fits
+                    # within top-k; a real indexer returns every causal token.
+                    indices[row, : max_index + 1] = torch.arange(
+                        max_index + 1,
+                        dtype=torch.int32,
+                        device="cuda",
+                    )
+                else:
+                    # Repeating one logical token across all top-k slots keeps
+                    # the physical shape production-valid while yielding an
+                    # analytic singleton-value oracle for truly sparse rows.
+                    selector = row % 3
+                    selected = (0, max_index, max_index // 2)[selector]
+                    indices[row].fill_(selected)
+                    singleton_oracle_mask[row] = True
+            else:
+                valid = min(max_index + 1, topk)
+                selected = torch.randperm(
+                    max_index + 1,
+                    generator=generator,
+                    device="cuda",
+                )[:valid]
+                indices[row, :valid] = torch.sort(selected).values.to(torch.int32)
+            row += 1
+    return indices, singleton_oracle_mask
+
+
+def _build_sparse_block_indices(
+    case: BackendCase,
+    generator: torch.Generator,
+    block_size: int,
+) -> torch.Tensor:
+    """Build causal request-local *block* selections for a block-sparse case.
+
+    Skeleton for the next block-granular algorithm family (e.g. RocketKV, whose
+    ``indices_block_size == page_size``). Mirrors ``_build_sparse_topk_indices``
+    but selects logical KV *blocks* instead of tokens: for a query at causal
+    position ``p`` the selectable blocks are ``0 .. p // block_size`` (the block
+    holding ``p`` is inclusive), and each row is padded to ``sparse_topk`` with
+    ``-1``. Returns ``[nnz_q, sparse_topk]`` int32 block indices.
+    """
+    if case.sparse_selection_unit != "block":
+        raise ValueError(
+            f"Block selection builder cannot handle {case.sparse_selection_unit!r} selections"
+        )
+    if block_size <= 0:
+        raise ValueError("Block-selection cases require a positive block size")
+    topk = case.sparse_topk
+    if topk is None or topk <= 0:
+        raise ValueError("Block-selection cases require a positive top-k")
+    if case.sparse_selection not in ("random", "singleton"):
+        raise ValueError(f"Unsupported sparse selection policy: {case.sparse_selection}")
+
+    indices = torch.full((case.nnz_q, topk), -1, dtype=torch.int32, device="cuda")
+    row = 0
+    for cached_len, q_len in zip(case.num_cached_tokens, case.seq_lens, strict=True):
+        for token_idx in range(q_len):
+            max_block = (cached_len + token_idx) // block_size
+            num_blocks = max_block + 1
+            if case.sparse_selection == "singleton":
+                indices[row].fill_(row % num_blocks)
+            else:
+                valid = min(num_blocks, topk)
+                selected = torch.randperm(num_blocks, generator=generator, device="cuda")[:valid]
+                indices[row, :valid] = torch.sort(selected).values.to(torch.int32)
+            row += 1
+    return indices
+
+
+def generate_sparse_block_inputs(case: BackendCase, seed: int = 0) -> Dict:
+    """Skeleton input generator for block-selected sparse attention.
+
+    TODO(sparse-block): flesh out once a block-granular algorithm lands. The
+    reusable ``_build_sparse_block_indices`` builder is wired here; still missing
+    are (a) the standard/MLA input tensors for the block family and (b) the
+    matching Vanilla block reference forward in ``VanillaAttention`` that
+    ``_run_sparse_block_backend`` will call. Until both exist this raises so the
+    contract is explicit rather than silently mis-run.
+    """
+    sparse_config = _sparse_config(case)
+    assert sparse_config is not None
+    sparse_params = sparse_config.to_sparse_params(
+        layer_idx=0, pretrained_config=_sparse_pretrained_config(case)
+    )
+    block_size = getattr(sparse_params, "indices_block_size")
+    selection_gen = torch.Generator(device="cuda").manual_seed(seed + 1)
+    _ = _build_sparse_block_indices(case, selection_gen, block_size)
+    raise NotImplementedError(
+        "Block-selected sparse attention is a skeleton: add the block input "
+        "tensors and a VanillaAttention block reference forward, plus a block "
+        "ModelAttnConfig (e.g. RocketKV), before enabling this path."
+    )
+
+
+def _run_sparse_block_backend(
+    case: BackendCase,
+    backend: str,
+    inputs: Dict,
+    *,
+    kv_layout: str,
+) -> torch.Tensor:
+    """Skeleton runner for block-selected sparse attention.
+
+    TODO(sparse-block): implement the block-family forward once a Vanilla block
+    reference exists, following ``_run_sparse_mla_backend`` (lower the production
+    ``sparse_attention_config`` via ``to_sparse_params`` / the sparse KV-cache
+    manager, inject ``inputs`` block selections, and compare against the Vanilla
+    golden).
+    """
+    raise NotImplementedError(
+        "Block-selected sparse backend runner is a skeleton; see "
+        "_run_sparse_mla_backend for the token-selected MLA reference."
+    )
+
+
+def generate_sparse_mla_inputs(case: BackendCase, seed: int = 0) -> Dict:
+    """Generate raw absorbed-MLA inputs plus backend-neutral sparse selections."""
+    if case.sparse_attention_family != "mla" or case.sparse_selection_unit != "token":
+        raise ValueError("This generator supports token-selected sparse MLA only")
+    gen = torch.Generator(device="cuda").manual_seed(seed)
+    selection_gen = torch.Generator(device="cuda").manual_seed(seed + 1)
+    cdt = case.compute_dtype
+    num_heads = case.num_heads
+    kv_lora_rank = case.kv_lora_rank
+    qk_rope_head_dim = case.qk_rope_head_dim
+    d_latent = kv_lora_rank + qk_rope_head_dim
+
+    q_nope = _randn(gen, cdt, case.nnz_q, num_heads, kv_lora_rank)
+    q_pe = _randn(gen, cdt, case.nnz_q, num_heads, qk_rope_head_dim)
+    fused_q = torch.cat((q_nope, q_pe), dim=-1).reshape(case.nnz_q, num_heads * d_latent)
+    compressed_kv = _randn(gen, cdt, case.nnz_q, kv_lora_rank)
+    k_pe = _randn(gen, cdt, case.nnz_q, qk_rope_head_dim)
+    latent_cache = torch.cat((compressed_kv, k_pe), dim=-1)
+
+    pos_embd_params = _mla_context_pos_embd_params(case)
+    rope_params = pos_embd_params.rope
+    assert rope_params is not None
+    new_positions = make_position_ids(case.seq_lens, case.num_cached_tokens)
+    rotated_new_k_pe = apply_rope(
+        k_pe,
+        new_positions,
+        rope_params,
+        qk_rope_head_dim,
+        is_neox=pos_embd_params.is_neox,
+    )
+    expected_new_latent = torch.cat((compressed_kv, rotated_new_k_pe), dim=-1)
+
+    cached_latent = []
+    for cached_len in case.num_cached_tokens:
+        cached_compressed = _randn(gen, cdt, cached_len, kv_lora_rank)
+        cached_k_pe = _randn(gen, cdt, cached_len, qk_rope_head_dim)
+        if cached_len:
+            cached_positions = torch.arange(cached_len, dtype=torch.int32, device="cuda")
+            cached_k_pe = apply_rope(
+                cached_k_pe,
+                cached_positions,
+                rope_params,
+                qk_rope_head_dim,
+                is_neox=pos_embd_params.is_neox,
+            )
+        cached_latent.append(torch.cat((cached_compressed, cached_k_pe), dim=-1))
+
+    topk_indices, singleton_oracle_mask = _build_sparse_topk_indices(case, selection_gen)
+    expected_output = None
+    if case.sparse_selection == "singleton":
+        new_per_seq = _split_packed_tokens(expected_new_latent, case.seq_lens)
+        selected_values = []
+        row = 0
+        for cached, new_tokens in zip(cached_latent, new_per_seq, strict=True):
+            logical_cache = torch.cat((cached, new_tokens), dim=0)
+            for _ in range(new_tokens.shape[0]):
+                selected_values.append(logical_cache[int(topk_indices[row, 0]), :kv_lora_rank])
+                row += 1
+        expected_output = (
+            torch.stack(selected_values)
+            .unsqueeze(1)
+            .expand(-1, num_heads, -1)
+            .reshape(case.nnz_q, num_heads * kv_lora_rank)
+        )
+
+    return dict(
+        fused_q=fused_q,
+        q_pe=q_pe,
+        latent_cache=latent_cache,
+        cached_latent=cached_latent,
+        expected_new_latent=expected_new_latent,
+        topk_indices=topk_indices,
+        expected_output=expected_output,
+        expected_output_mask=singleton_oracle_mask,
     )
 
 
@@ -453,6 +786,199 @@ def _assert_cache_contains_new_tokens(
         actual = torch.cat(pieces, dim=concat_dim).to(torch.float32)
         expected = expected_per_seq[i].to(buf.dtype).to(torch.float32)
         torch.testing.assert_close(actual, expected, atol=atol, rtol=rtol)
+
+
+def _run_sparse_mla_backend(
+    case: BackendCase,
+    backend: str,
+    inputs: Dict,
+    *,
+    kv_layout: str,
+) -> torch.Tensor:
+    """Run selected sparse MLA through production backend/config lowering."""
+    sparse_config = _sparse_config(case)
+    assert sparse_config is not None
+    pretrained_config = _sparse_pretrained_config(case)
+    sparse_params = sparse_config.to_sparse_params(
+        layer_idx=0,
+        pretrained_config=pretrained_config,
+    )
+    sparse_metadata_params = sparse_config.to_sparse_metadata_params(
+        pretrained_config=pretrained_config
+    )
+    AttentionCls = (
+        VanillaAttention
+        if backend == "VANILLA"
+        else get_attention_backend(backend, sparse_params=sparse_params)
+    )
+    request_ids = list(range(case.num_seqs))
+    d_latent = case.kv_lora_rank + case.qk_rope_head_dim
+    pos_embd_params = _mla_context_pos_embd_params(case)
+    mapping = Mapping(world_size=1, tp_size=1, rank=0)
+    model_config = ModelConfig(
+        mapping=mapping,
+        sparse_attention_config=sparse_config,
+        pretrained_config=pretrained_config,
+    )
+    if backend == "VANILLA":
+        attn = VanillaAttention(
+            layer_idx=0,
+            num_heads=case.num_heads,
+            head_dim=d_latent,
+            num_kv_heads=1,
+            q_scaling=case.q_scaling,
+            pos_embd_params=pos_embd_params,
+            sparse_params=sparse_params,
+            mla_params=MLAParams(
+                q_lora_rank=case.q_lora_rank,
+                kv_lora_rank=case.kv_lora_rank,
+                qk_rope_head_dim=case.qk_rope_head_dim,
+                qk_nope_head_dim=case.qk_nope_head_dim,
+                # Selected sparse MLA returns latent values; the model's V
+                # projection lives outside the standalone backend.
+                v_head_dim=case.kv_lora_rank,
+                predicted_tokens_per_seq=case.sparse_generation_tokens_per_seq,
+                hidden_size=case.hidden_size,
+            ),
+            dtype=case.compute_dtype,
+            skip_create_weights_in_init=True,
+        )
+    else:
+        attn = create_attention(
+            backend,
+            layer_idx=0,
+            num_heads=case.num_heads,
+            head_dim=d_latent,
+            num_kv_heads=1,
+            q_scaling=case.q_scaling,
+            pos_embd_params=pos_embd_params,
+            is_mla_enable=True,
+            q_lora_rank=case.q_lora_rank,
+            kv_lora_rank=case.kv_lora_rank,
+            qk_nope_head_dim=case.qk_nope_head_dim,
+            qk_rope_head_dim=case.qk_rope_head_dim,
+            v_head_dim=case.kv_lora_rank,
+            hidden_size=case.hidden_size,
+            predicted_tokens_per_seq=case.sparse_generation_tokens_per_seq,
+            sparse_params=sparse_params,
+            dtype=case.compute_dtype,
+            skip_create_weights_in_init=True,
+        )
+    if backend == "TRTLLM":
+        # Weight creation is intentionally skipped because the harness injects
+        # selections instead of running the indexer. Quant/FMHA state is still
+        # required by the backend forward path.
+        attn.update_quant_config(None)
+    mgr = _build_mla_kv_cache_manager(
+        case,
+        backend,
+        sparse_config,
+        model_config,
+        pretrained_config,
+    )
+
+    try:
+        mgr.add_dummy_requests(request_ids, case.token_nums)
+        _fill_mla_cache(
+            mgr,
+            0,
+            request_ids,
+            inputs["cached_latent"],
+            kv_layout=kv_layout,
+        )
+        metadata = AttentionCls.Metadata(
+            num_contexts=case.num_contexts,
+            kv_cache_params=KVCacheParams(
+                use_cache=True,
+                num_cached_tokens_per_seq=case.num_cached_tokens,
+            ),
+            seq_lens=torch.tensor(case.seq_lens, dtype=torch.int),
+            max_num_requests=case.num_seqs,
+            max_num_tokens=case.max_num_tokens,
+            kv_cache_manager=mgr,
+            request_ids=request_ids,
+            prompt_lens=case.prompt_lens,
+            kv_layout=kv_layout,
+            mapping=mapping,
+            sparse_metadata_params=sparse_metadata_params,
+        )
+        metadata.prepare()
+
+        num_context_tokens = sum(case.seq_lens[: case.num_contexts])
+        phases = []
+        if case.num_contexts:
+            phases.append((AttentionInputType.context_only, slice(0, num_context_tokens)))
+        if case.num_contexts < case.num_seqs:
+            phases.append(
+                (AttentionInputType.generation_only, slice(num_context_tokens, case.nnz_q))
+            )
+
+        outputs = []
+        for attention_input_type, token_slice in phases:
+            fused_q = inputs["fused_q"][token_slice].clone()
+            q_pe = inputs["q_pe"][token_slice]
+            latent_cache = inputs["latent_cache"][token_slice].clone()
+            forward_kwargs = {}
+            if backend == "TRTLLM" and attention_input_type == AttentionInputType.generation_only:
+                cu_q_seqlens = torch.empty(case.num_seqs + 1, dtype=torch.int32, device="cuda")
+                cu_kv_seqlens = torch.empty(case.num_seqs + 1, dtype=torch.int32, device="cuda")
+                fmha_scheduler_counter = torch.empty(1, dtype=torch.uint32, device="cuda")
+                attn.mla_rope_generation(
+                    fused_q,
+                    q_pe,
+                    latent_cache,
+                    metadata,
+                    cu_q_seqlens,
+                    cu_kv_seqlens,
+                    fmha_scheduler_counter,
+                    None,
+                    None,
+                    None,
+                )
+                forward_kwargs.update(
+                    cu_q_seqlens=cu_q_seqlens,
+                    cu_kv_seqlens=cu_kv_seqlens,
+                    fmha_scheduler_counter=fmha_scheduler_counter,
+                )
+
+            forward_args = AttentionForwardArgs(
+                latent_cache=latent_cache,
+                q_pe=q_pe,
+                topk_indices=inputs["topk_indices"][token_slice],
+                attention_input_type=attention_input_type,
+                **forward_kwargs,
+            )
+            out = attn.forward(
+                fused_q,
+                None,
+                None,
+                metadata,
+                forward_args=forward_args,
+            )
+            assert forward_args.sparse_prediction.sparse_attn_indices is not None
+            assert (
+                forward_args.sparse_prediction.sparse_attn_indices_block_size
+                == sparse_params.indices_block_size
+            )
+            outputs.append(out[0] if isinstance(out, tuple) else out)
+
+        expected_latents = _split_packed_tokens(inputs["expected_new_latent"], case.seq_lens)
+        cache_atol, cache_rtol = _tolerances(case, case.compute_dtype)
+        _assert_cache_contains_new_tokens(
+            mgr,
+            0,
+            request_ids,
+            case.seq_lens,
+            case.num_cached_tokens,
+            expected_latents,
+            kv_layout=metadata.kv_layout,
+            cache_kind="mla",
+            atol=cache_atol,
+            rtol=cache_rtol,
+        )
+        return torch.cat(outputs, dim=0)[: case.nnz_q].contiguous()
+    finally:
+        mgr.shutdown()
 
 
 def _run_mla_gen_backend(
@@ -755,6 +1281,11 @@ def _tolerances(case: "BackendCase", kv_dtype) -> tuple:
     dtype is bf16 its coarser mantissa compounds with the quant error, so the
     quantized atol gets extra headroom and the rtol relaxes to the bf16 rtol.
     """
+    if case.atol is not None or case.rtol is not None:
+        if case.atol is None or case.rtol is None:
+            raise ValueError("BackendCase.atol and rtol must be set together")
+        return case.atol, case.rtol
+
     bf16 = case.compute_dtype == torch.bfloat16
     if kv_dtype == torch.float8_e4m3fn:
         return (FP8_ATOL + BF16_ATOL, BF16_RTOL) if bf16 else (FP8_ATOL, RTOL)
@@ -875,6 +1406,14 @@ def run_backend(
     the caller passes a layout the backend supports (gated by the capability
     matrix). MLA cases are dispatched to the absorbed-generation path.
     """
+    if case.is_sparse:
+        sparse_kind = (case.sparse_attention_family, case.sparse_selection_unit)
+        if sparse_kind == ("mla", "token"):
+            return _run_sparse_mla_backend(case, backend, inputs, kv_layout=kv_layout)
+        if case.sparse_selection_unit == "block":
+            return _run_sparse_block_backend(case, backend, inputs, kv_layout=kv_layout)
+        raise ValueError(f"Unsupported sparse harness contract: {sparse_kind}")
+
     if case.is_mla:
         if case.is_context_only:
             return _run_mla_context_backend(case, backend, inputs, kv_layout=kv_layout)
@@ -1063,8 +1602,17 @@ def run_case(case: BackendCase, *, seed: int = 0) -> Dict[str, torch.Tensor]:
     Returns the per-backend outputs (including ``"VANILLA"`` golden) for callers
     that want the raw tensors (e.g. the minimizer).
     """
+    _validate_sparse_case(case)
     is_mla = case.is_mla
-    if is_mla:
+    if case.is_sparse:
+        sparse_kind = (case.sparse_attention_family, case.sparse_selection_unit)
+        if sparse_kind == ("mla", "token"):
+            inputs = generate_sparse_mla_inputs(case, seed)
+        elif case.sparse_selection_unit == "block":
+            inputs = generate_sparse_block_inputs(case, seed)
+        else:
+            raise ValueError(f"Unsupported sparse harness contract: {sparse_kind}")
+    elif is_mla:
         if case.is_context_only:
             inputs = generate_mla_context_inputs(case, seed)
         else:
@@ -1073,6 +1621,11 @@ def run_case(case: BackendCase, *, seed: int = 0) -> Dict[str, torch.Tensor]:
         inputs = generate_inputs(case, seed)
     golden = run_backend(case, "VANILLA", inputs, kv_dtype=case.compute_dtype, kv_layout="NHD")
     results = {"VANILLA": golden}
+
+    if case.sparse_selection == "singleton" and inputs.get("expected_output") is not None:
+        oracle_mask = inputs["expected_output_mask"]
+        assert oracle_mask is not None and oracle_mask.any()
+        torch.testing.assert_close(golden[oracle_mask], inputs["expected_output"][oracle_mask])
 
     # Evaluate every supported backend before asserting, so one backend's
     # mismatch does not mask another's.
@@ -1098,7 +1651,7 @@ def run_case(case: BackendCase, *, seed: int = 0) -> Dict[str, torch.Tensor]:
         # A gen-only batch also exercises the captured-CUDA-graph path
         # (production replays a captured decode graph); it must still match the
         # eager golden.
-        if case.is_gen_only:
+        if case.is_gen_only and not case.is_sparse:
             cg_out = run_backend(
                 case,
                 backend,
