@@ -418,6 +418,56 @@ def _copy_tree(src_dir: str, dst_dir: str) -> int:
     return count
 
 
+def _rewrite_generated_test_layout(filepath: str, content: str) -> str:
+    """Rewrite TensorRT-LLM source-tree paths in selected generated tests."""
+
+    def replace_required(old: str, new: str) -> None:
+        nonlocal content
+        if old not in content:
+            raise ValueError(f"Expected standalone layout pattern not found in {filepath}: {old}")
+        content = content.replace(old, new)
+
+    def substitute_required(pattern: str, replacement: str) -> None:
+        nonlocal content
+        content, count = re.subn(pattern, replacement, content)
+        if count == 0:
+            raise ValueError(
+                f"Expected standalone layout pattern not found in {filepath}: {pattern}"
+            )
+
+    filename = os.path.basename(filepath)
+    model_registry_pattern = (
+        r"""["']examples["']\s*/\s*["']auto_deploy["']\s*/\s*"""
+        r"""["']model_registry["']"""
+    )
+    runner_model_registry = '"runners" / "trtllm" / "model_registry"'
+
+    if filename == "test_llm_api_paragraf_trtllm.py":
+        substitute_required(model_registry_pattern, runner_model_registry)
+        for config_name in ("nano_v3.yaml", "super_v3.yaml"):
+            substitute_required(
+                rf"""["']examples["']\s*/\s*["']auto_deploy["']\s*/\s*["']{config_name}["']""",
+                f'{runner_model_registry} / "configs" / "{config_name}"',
+            )
+    elif filename == "test_mrope_delta_cache.py":
+        replace_required(
+            "return Path(__file__).resolve().parents[6]",
+            "return Path(__file__).resolve().parents[4]",
+        )
+        replace_required(
+            '_repo_root() / "tensorrt_llm" / "_torch" / "auto_deploy" / "config"',
+            '_repo_root() / "paragraf" / "config"',
+        )
+        substitute_required(model_registry_pattern, runner_model_registry)
+    elif filename == "test_example_configs.py":
+        replace_required(
+            '_AD_EXAMPLES_DIR = _REPO_ROOT / "examples" / "auto_deploy"',
+            '_AD_EXAMPLES_DIR = _REPO_ROOT / "runners" / "trtllm" / "model_registry"',
+        )
+
+    return content
+
+
 def _rewrite_imports_in_file(
     filepath: str,
     *,
@@ -456,6 +506,7 @@ def _rewrite_imports_in_file(
         "_REPO_ROOT = pathlib.Path(__file__).resolve().parents[5]",
         "_REPO_ROOT = pathlib.Path(__file__).resolve().parents[3]",
     )
+    content = _rewrite_generated_test_layout(filepath, content)
 
     def ensure_imports(before_pos: int, *imports: str) -> None:
         nonlocal content

@@ -31,22 +31,10 @@ from tensorrt_llm.sampling_params import SamplingParams
 from .accuracy_core import (GSM8K, MMLU, MMMU, CnnDailymail,
                             LlmapiAccuracyTestHarness)
 
-
-def _find_model_registry_dir() -> Path:
-    llm_root = Path(get_llm_root())
-    candidates = (
-        llm_root / "examples" / "auto_deploy" / "model_registry",
-        llm_root / "runners" / "trtllm" / "model_registry",
-    )
-    for candidate in candidates:
-        if candidate.is_dir():
-            return candidate
-    raise FileNotFoundError(
-        f"Could not find the model registry below {llm_root}")
-
-
-_AD_MODEL_REGISTRY_DIR = _find_model_registry_dir()
-_AD_CONFIGS_DIR = _AD_MODEL_REGISTRY_DIR / "configs"
+_AD_CONFIGS_DIR = (Path(get_llm_root()) / 'examples' / 'auto_deploy' /
+                   'model_registry' / 'configs')
+_AD_MODEL_REGISTRY_DIR = Path(
+    get_llm_root()) / 'examples' / 'auto_deploy' / 'model_registry'
 
 
 def _load_ad_config(config_name):
@@ -558,7 +546,8 @@ class TestNemotronV2(LlmapiAccuracyTestHarness):
 class TestNemotronNanoV3(LlmapiAccuracyTestHarness):
     MODEL_NAME = "nvidia/Nemotron-3-Nano"
 
-    CONFIG_YAML = str(_AD_CONFIGS_DIR / "nano_v3.yaml")
+    CONFIG_YAML = str(
+        Path(get_llm_root()) / "examples" / "auto_deploy" / "nano_v3.yaml")
     MODEL_PATHS = {
         "bf16":
         hf_id_to_local_model_dir("nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16"),
@@ -631,7 +620,8 @@ class TestNemotronNanoV3(LlmapiAccuracyTestHarness):
 
 class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
     MODEL_NAME = "nvidia/Nemotron-Super-V3"
-    CONFIG_YAML = str(_AD_CONFIGS_DIR / "super_v3.yaml")
+    CONFIG_YAML = str(
+        Path(get_llm_root()) / "examples" / "auto_deploy" / "super_v3.yaml")
     MODEL_PATHS = {
         "bf16":
         hf_id_to_local_model_dir(
@@ -813,7 +803,9 @@ class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
             f"model_path={model_path}")
         print(f"kwargs: {kwargs}")
 
-        mtp_yaml = str(_AD_CONFIGS_DIR / "super_v3_mtp.yaml")
+        mtp_yaml = str(
+            Path(get_llm_root()) / "examples" / "auto_deploy" /
+            "model_registry" / "configs" / "super_v3_mtp.yaml")
         yaml_extra = [mtp_yaml]
 
         print_memory_usage("test start")
@@ -842,7 +834,9 @@ class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
 
 class TestNemotronUltraV3(LlmapiAccuracyTestHarness):
     MODEL_NAME = "nvidia/Nemotron-Ultra-V3"
-    CONFIG_YAML = str(_AD_CONFIGS_DIR / "ultra_v3.yaml")
+    CONFIG_YAML = str(
+        Path(get_llm_root()) / "examples" / "auto_deploy" / "model_registry" /
+        "configs" / "ultra_v3.yaml")
     MODEL_PATHS = {
         "nvfp4": hf_id_to_local_model_dir("nvidia/Nemotron-Ultra-V3-NVFP4"),
     }

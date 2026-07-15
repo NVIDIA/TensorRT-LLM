@@ -18,7 +18,6 @@ import torch
 import torch.nn as nn
 import yaml
 
-import tensorrt_llm._torch.auto_deploy as auto_deploy_package
 from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import StateResourceHandler
 from tensorrt_llm._torch.auto_deploy.shim.interface import CachedSequenceInterface
 from tensorrt_llm._torch.auto_deploy.transform.interface import SharedConfig
@@ -27,17 +26,8 @@ from tensorrt_llm._torch.auto_deploy.transform.library.mrope_delta_cache import 
 )
 
 
-def _find_model_registry_dir() -> Path:
-    package_path = Path(auto_deploy_package.__file__).resolve()
-    for root in package_path.parents:
-        candidates = (
-            root / "examples" / "auto_deploy" / "model_registry",
-            root / "runners" / "trtllm" / "model_registry",
-        )
-        for candidate in candidates:
-            if candidate.is_dir():
-                return candidate
-    raise FileNotFoundError(f"Could not find the model registry above {package_path}")
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parents[6]
 
 
 def test_initialize_mrope_delta_cache_registers_state_resource():
@@ -66,7 +56,9 @@ def test_initialize_mrope_delta_cache_registers_state_resource():
 
 
 def test_initialize_mrope_delta_cache_disabled_in_default_config():
-    config_path = Path(auto_deploy_package.__file__).resolve().parent / "config" / "default.yaml"
+    config_path = (
+        _repo_root() / "tensorrt_llm" / "_torch" / "auto_deploy" / "config" / "default.yaml"
+    )
     with open(config_path) as f:
         config = yaml.safe_load(f)
 
@@ -74,7 +66,7 @@ def test_initialize_mrope_delta_cache_disabled_in_default_config():
 
 
 def test_qwen_registry_configs_explicitly_enable_mrope_delta_cache():
-    config_dir = _find_model_registry_dir() / "configs"
+    config_dir = _repo_root() / "examples" / "auto_deploy" / "model_registry" / "configs"
     # 35b enables mrope_delta_cache; 400b explicitly disables it (NVFP4 accuracy)
     expected = {
         "qwen3.5_moe_35b.yaml": True,

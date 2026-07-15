@@ -205,6 +205,63 @@ def test_uses_paragraf_test_layout(generated_package: Path) -> None:
     assert not stale_names
 
 
+def test_keeps_layout_rewrites_out_of_source_tests() -> None:
+    llm_api_source = (
+        REPO_ROOT / "tests" / "integration" / "defs" / "accuracy" / "test_llm_api_autodeploy.py"
+    ).read_text()
+    assert "'examples' / 'auto_deploy'" in llm_api_source
+    assert '"runners" / "trtllm"' not in llm_api_source
+
+    mrope_source = (
+        REPO_ROOT
+        / "tests"
+        / "unittest"
+        / "auto_deploy"
+        / "singlegpu"
+        / "transformations"
+        / "library"
+        / "test_mrope_delta_cache.py"
+    ).read_text()
+    assert "Path(__file__).resolve().parents[6]" in mrope_source
+    assert '_repo_root() / "tensorrt_llm" / "_torch" / "auto_deploy"' in mrope_source
+
+    example_configs_source = (
+        REPO_ROOT
+        / "tests"
+        / "unittest"
+        / "auto_deploy"
+        / "singlegpu"
+        / "utils"
+        / "test_example_configs.py"
+    ).read_text()
+    assert '_AD_EXAMPLES_DIR = _REPO_ROOT / "examples" / "auto_deploy"' in example_configs_source
+
+
+def test_rewrites_generated_test_resource_layout(generated_package: Path) -> None:
+    generated_tests = generated_package / "tests"
+    llm_api = (
+        generated_tests / "integration" / "defs" / "accuracy" / "test_llm_api_paragraf_trtllm.py"
+    ).read_text()
+    runner_registry = '"runners" / "trtllm" / "model_registry"'
+    assert runner_registry in llm_api
+    assert f'{runner_registry} / "configs" / "nano_v3.yaml"' in llm_api
+    assert f'{runner_registry} / "configs" / "super_v3.yaml"' in llm_api
+
+    mrope = (
+        generated_tests / "singlegpu" / "transformations" / "library" / "test_mrope_delta_cache.py"
+    ).read_text()
+    assert "Path(__file__).resolve().parents[4]" in mrope
+    assert '_repo_root() / "paragraf" / "config" / "default.yaml"' in mrope
+    assert runner_registry in mrope
+
+    example_configs = (
+        generated_tests / "singlegpu" / "utils" / "test_example_configs.py"
+    ).read_text()
+    assert (
+        '_AD_EXAMPLES_DIR = _REPO_ROOT / "runners" / "trtllm" / "model_registry"' in example_configs
+    )
+
+
 def test_does_not_add_test_guards_to_runners(generated_package: Path) -> None:
     runner = generated_package / "runners" / "trtllm" / "build_and_run_paragraf_trtllm.py"
     content = runner.read_text()
@@ -249,6 +306,7 @@ def test_guards_optional_trtllm_tests(generated_package: Path, relative_path: Pa
     "relative_path",
     [
         Path("singlegpu/test_pattern_matcher.py"),
+        Path("singlegpu/transformations/library/test_mrope_delta_cache.py"),
         Path("multigpu/custom_ops/test_dist.py"),
     ],
     ids=str,

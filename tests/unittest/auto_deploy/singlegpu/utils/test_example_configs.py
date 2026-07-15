@@ -29,11 +29,7 @@ from tensorrt_llm._torch.auto_deploy.llm_args import LlmArgs
 
 # Root directory for the example configs
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[5]
-_SOURCE_EXAMPLES_DIR = _REPO_ROOT / "examples" / "auto_deploy"
-_PARAGRAF_MODEL_REGISTRY_DIR = _REPO_ROOT / "runners" / "trtllm" / "model_registry"
-_AD_EXAMPLES_DIR = (
-    _SOURCE_EXAMPLES_DIR if _SOURCE_EXAMPLES_DIR.is_dir() else _PARAGRAF_MODEL_REGISTRY_DIR
-)
+_AD_EXAMPLES_DIR = _REPO_ROOT / "examples" / "auto_deploy"
 
 # Files that are not LlmArgs configs and should be excluded from validation
 _EXCLUDED_FILES = {
