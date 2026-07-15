@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from collections import Counter
 from dataclasses import dataclass, field
 from typing import Dict, List, Tuple
 
@@ -31,9 +32,7 @@ from tensorrt_llm._torch.disaggregation.resource.page import (
 from tensorrt_llm._torch.disaggregation.resource.utils import (
     get_layer_byte_ranges,
     get_layer_to_layer_group,
-    get_num_buffer_entries,
     get_pool_view_global_layer_ids,
-    get_pool_view_num_layers,
 )
 
 # Type alias for (lg_idx, pool_idx) pair
@@ -165,6 +164,13 @@ class PeerRegistrar:
         Layer-overlap is required: a peer pool with the same pool_role but
         zero layer overlap with self is *not* a match — the two pools cover
         disjoint layers and have nothing to transfer.
+
+        A self layer group never matches multiple peer layer groups, so the
+        result is one peer pool per self pool. Layer groups partition each
+        rank's layers by attention/life-cycle class, which both sides derive
+        from the same model config; PP only changes which layers overlap (the
+        fan-out across peer PP ranks is handled by calling this method once
+        per peer rank). Step 1 raises if this invariant is ever violated.
         """
         key = self._unique_key(peer_ri.instance_name, peer_ri.instance_rank)
         if key in self._lg_pool_mapping_cache:
@@ -196,13 +202,31 @@ class PeerRegistrar:
                 if not pv_global_ids:
                     continue
 
-                # Step 1: find peer layer_group via any overlapping global_layer_id.
-                peer_lg_idx = next(
-                    (peer_layer_to_group[g] for g in pv_global_ids if g in peer_layer_to_group),
-                    None,
-                )
-                if peer_lg_idx is None:
+                # Step 1: find the peer layer_group via overlapping global_layer_ids.
+                # A self layer group (hence each of its pool views) never matches
+                # multiple peer layer groups: layer groups partition a rank's
+                # layers by attention/life-cycle class, both sides derive that
+                # class from the same model config, and global ids are
+                # PP-invariant. So PP only changes WHICH layers overlap — layers
+                # the peer doesn't hold are a legal skip (PP slices, one-sided
+                # MTP layers) — never how many peer LGs they land in; the PP
+                # fan-out is handled by per-peer-rank calls of this method. A
+                # multi-LG hit therefore means the two peers group layers
+                # differently (unsupported topology), and we fail loudly instead
+                # of silently transferring only the first LG's overlap.
+                peer_lg_indices = {
+                    peer_layer_to_group[g] for g in pv_global_ids if g in peer_layer_to_group
+                }
+                if not peer_lg_indices:
                     continue
+                if len(peer_lg_indices) > 1:
+                    raise ValueError(
+                        "PeerRegistrar.get_pool_mapping: pool view "
+                        f"(lg={self_lg_idx}, pool={self_pi}) spans multiple peer "
+                        f"layer groups {sorted(peer_lg_indices)}; mismatched layer "
+                        "grouping between peers is not supported"
+                    )
+                peer_lg_idx = next(iter(peer_lg_indices))
                 peer_lg = peer_pt.layer_groups[peer_lg_idx]
 
                 # Step 2: pick the first peer pool with the same pool_role
@@ -283,8 +307,6 @@ class PeerRegistrar:
         # entries. Layer selection is explicit, so mappers never assume a
         # uniform layer stride (other role classes may interleave), and no
         # convention about global-id/byte-offset ordering is needed.
-        self_num_layers = get_pool_view_num_layers(self_pv)
-        peer_num_layers = get_pool_view_num_layers(peer_pv)
         self_global_ids = get_pool_view_global_layer_ids(self_pv, self_lg)
         peer_global_ids = get_pool_view_global_layer_ids(peer_pv, peer_lg)
         overlapping_layers = sorted(set(self_global_ids) & set(peer_global_ids))
@@ -303,13 +325,11 @@ class PeerRegistrar:
         # layer's region); head-mismatch mappers slice heads inside each.
         self_buffers_per_layer = self._get_buffers_per_layer(
             self_pv,
-            self_num_layers,
             layer_group_id=self_lg_idx,
             pool_idx=self_pi,
         )
         peer_buffers_per_layer = self._get_buffers_per_layer(
             peer_pv,
-            peer_num_layers,
             layer_group_id=peer_lg_idx,
             pool_idx=peer_pi,
         )
@@ -331,21 +351,31 @@ class PeerRegistrar:
     @staticmethod
     def _get_buffers_per_layer(
         pool_view: PoolView,
-        num_layers: int,
         *,
         layer_group_id: int,
         pool_idx: int,
     ) -> int:
-        num_entries = get_num_buffer_entries(pool_view)
-        if num_entries == 0:
+        """Per-layer buffer count of a view (e.g. K+V -> 2, key-only -> 1).
+
+        Views are bucketed per (layer group, pool, mapper kind) at page-table
+        build time, so every layer in a view carries the same role set and
+        hence the same entry count — a skewed distribution should never occur.
+        Still verify it per layer rather than via total-count divisibility:
+        e.g. 1 + 3 entries over two layers passes ``total % layers == 0`` yet
+        would make head-slicing mappers split every layer at wrong offsets.
+        """
+        entries = pool_view.buffer_entries
+        if len(entries) == 0:
             return 1
-        if num_layers <= 0 or num_entries % num_layers != 0:
+        counts = Counter(int(e["local_layer_id"]) for e in entries)
+        distinct = set(counts.values())
+        if len(distinct) != 1:
             raise ValueError(
                 "PoolView buffer entries are not evenly distributed across layers: "
                 f"layer_group={layer_group_id}, pool={pool_idx}, "
-                f"entries={num_entries}, layers={num_layers}"
+                f"per-layer entry counts={sorted(counts.items())}"
             )
-        return num_entries // num_layers
+        return distinct.pop()
 
     @staticmethod
     def _find_overlap(self_val, peer_val, self_rank, peer_rank=None):

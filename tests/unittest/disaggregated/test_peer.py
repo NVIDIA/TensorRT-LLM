@@ -826,7 +826,6 @@ def test_get_buffers_per_layer_rejects_non_uniform_nhd_entries():
     with pytest.raises(ValueError, match="layer_group=3, pool=4"):
         PeerRegistrar._get_buffers_per_layer(
             pool_view,
-            2,
             layer_group_id=3,
             pool_idx=4,
         )

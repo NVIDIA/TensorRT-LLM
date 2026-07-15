@@ -217,13 +217,24 @@ def get_unique_pool_memory_descs(
 
 def get_layer_to_layer_group(page_table: KVCachePageTable) -> Dict[int, int]:
     """
-    Build ``{global_layer_id: lg_idx}`` mapping
+    Build ``{global_layer_id: lg_idx}`` mapping.
+
+    Layer groups must partition a rank's attention layers: every
+    global_layer_id belongs to exactly one group. Peer matching relies on
+    this, so a duplicate raises instead of silently keeping the last group.
     """
     out: Dict[int, int] = {}
     for lg_idx, lg in enumerate(page_table.layer_groups):
         if isinstance(lg, AttentionLayerGroup):
             for ll in lg.local_layers:
-                out[int(ll.global_layer_id)] = int(lg_idx)
+                gid = int(ll.global_layer_id)
+                if gid in out:
+                    raise ValueError(
+                        f"global_layer_id {gid} appears in layer groups "
+                        f"{out[gid]} and {lg_idx}; layer groups must partition "
+                        "a rank's attention layers"
+                    )
+                out[gid] = int(lg_idx)
     return out
 
 

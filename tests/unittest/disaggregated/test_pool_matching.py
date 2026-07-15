@@ -48,6 +48,7 @@ from tensorrt_llm._torch.disaggregation.resource.page import (
     PhysicalPoolGroup,
     PoolView,
 )
+from tensorrt_llm._torch.disaggregation.resource.utils import get_layer_to_layer_group
 
 # ---------------------------------------------------------------------------
 # Builders
@@ -330,6 +331,47 @@ def test_pp_partial_layer_overlap():
 
     mapping = reg.get_pool_mapping(peer_ri)
     assert mapping == {(0, 0): (0, 0)}
+
+
+def test_pool_view_spanning_multiple_peer_lgs_raises():
+    """A self pool view spanning two peer LGs must fail loudly.
+
+    Mismatched layer grouping between peers is an unsupported topology;
+    silently transferring only the first LG's overlap would drop layers.
+    """
+    self_lg = _attn_lg(0, [(0, 10), (1, 11)], [_kv_pool_view(0, [0, 1])])
+    # Peer holds the same global layers but split across two layer groups.
+    peer_lg0 = _attn_lg(0, [(0, 10)], [_kv_pool_view(0, [0])])
+    peer_lg1 = _attn_lg(1, [(0, 11)], [_kv_pool_view(0, [0])])
+
+    reg = _registrar(_page_table([self_lg]))
+    peer_ri = _rank_info(name="peer", rank=1, page_table=_page_table([peer_lg0, peer_lg1]))
+
+    with pytest.raises(ValueError, match="multiple peer layer groups"):
+        reg.get_pool_mapping(peer_ri)
+
+
+def test_skewed_buffer_entries_per_layer_raises():
+    """A skewed per-layer entry distribution must raise.
+
+    1 + 3 entries over two layers passes ``total % layers == 0`` (4 % 2)
+    but is not a uniform per-layer layout — must raise, not return 2.
+    """
+    view = _pool_view(0, [(0, "key"), (1, "key"), (1, "key"), (1, "key")])
+    with pytest.raises(ValueError, match="not evenly distributed"):
+        PeerRegistrar._get_buffers_per_layer(view, layer_group_id=0, pool_idx=0)
+
+
+def test_duplicate_global_layer_id_across_lgs_raises():
+    """Layer groups must partition a rank's attention layers.
+
+    The same global_layer_id in two LGs would silently corrupt peer matching.
+    """
+    lg0 = _attn_lg(0, [(0, 10)], [_kv_pool_view(0, [0])])
+    lg1 = _attn_lg(1, [(0, 10)], [_kv_pool_view(0, [0])])
+
+    with pytest.raises(ValueError, match="layer groups must partition"):
+        get_layer_to_layer_group(_page_table([lg0, lg1]))
 
 
 def test_two_pools_distinct_roles_in_same_lg():
