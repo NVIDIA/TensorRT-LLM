@@ -1368,6 +1368,15 @@ class KVCacheManager(BaseResourceManager):
         window_size = self._resolve_window_size(window_size)
         return self.impl.get_priority_by_block_id(block_id, window_size)
 
+    def get_memory_pool_block_indices(self, block_ids: List[int], *,
+                                      window_size: int) -> List[int]:
+        # Translate logical block IDs to primary-pool slot indices. With host offload enabled,
+        # a block's ID and its current pool slot can diverge after an offload/onboard cycle.
+        # Every referenced block must be primary (asserted in C++): callers do primary-pool
+        # pointer arithmetic and the returned index carries no residency information.
+        return self.impl.get_memory_pool_block_indices(list(block_ids),
+                                                       window_size)
+
     def get_batch_cache_indices(
         self,
         request_ids: List[int],
