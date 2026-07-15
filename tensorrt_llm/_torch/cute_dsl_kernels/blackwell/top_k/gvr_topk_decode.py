@@ -699,6 +699,89 @@ class GvrTopKKernel:
         cute.arch.barrier()
 
     # ------------------------------------------------------------------
+    # P1b — 256-bin SMEM histogram over the prev-topK gathered values
+    # (band [v_lo, v_hi] = P1's pmin/pmax = s_thr[1]/s_thr[2]), then M
+    # h-space quantile rungs into s_mt_thr (ascending value order). Reuses
+    # the Phase-4 smem_hist buffer (kNumBins >= 512 >= 256 in every spec;
+    # Phase 4 re-zeroes it later). Provides the R0 admission placement; it
+    # is only invoked from the enable_r0 path (added in a follow-up commit),
+    # so the base kernel is unaffected.
+    # ------------------------------------------------------------------
+    @cute.jit
+    def phase1b_hspace_rungs(self, input_row, N, pre_idx_row, pre_idx_count,
+                             pre_idx_offset, smem_hist, s_thr, s_mt_thr,
+                             tidx, warp_id, lane):
+        M = cutlass.const_expr(self.M_thr)
+        NB = cutlass.const_expr(256)
+        SEG = cutlass.const_expr(8)          # NB / WARP_SIZE bins per lane
+        num_threads = cutlass.const_expr(self.num_threads)
+
+        jz = tidx
+        while jz < cutlass.Int32(NB):
+            smem_hist[jz] = cutlass.Int32(0)
+            jz = jz + cutlass.Int32(num_threads)
+        cute.arch.barrier()
+
+        v_lo = s_thr[1]
+        v_hi = s_thr[2]
+        width = (v_hi - v_lo) / cutlass.Float32(NB)  # caller guards v_hi > v_lo
+        inv_w = cutlass.Float32(1.0) / width
+
+        ig = tidx
+        while ig < cutlass.Int32(pre_idx_count):
+            idx = pre_idx_row[ig] + pre_idx_offset
+            if idx >= cutlass.Int32(0) and idx < N:
+                v = cutlass.Float32(input_row[idx])
+                bf = (v - v_lo) * inv_w
+                b = cutlass.Int32(bf)
+                if b < cutlass.Int32(0):
+                    b = cutlass.Int32(0)
+                if b > cutlass.Int32(NB - 1):
+                    b = cutlass.Int32(NB - 1)
+                atomicAdd(smem_hist.iterator + b, cutlass.Int32(1))
+            ig = ig + cutlass.Int32(num_threads)
+        cute.arch.barrier()
+
+        # Warp-0-parallel rung extraction (a tid0 256-bin serial walk is a
+        # ~10-15us per-CTA dependency chain). Lane l owns the SEG consecutive
+        # bins descending from bin NB-1-l*SEG; segment sums -> 5-step shfl_up
+        # inclusive scan gives each lane the cumulative count of all
+        # higher-value bins; each lane then walks its SEG bins once and fires
+        # rung m at the unique crossing bin (cum_before < qneeds[m] <=
+        # cum_at). qfracs descending in h => thresholds ascending in m.
+        if warp_id == cutlass.Int32(0):
+            top = cutlass.Int32(NB - 1) - lane * cutlass.Int32(SEG)
+            seg_frag = cute.make_fragment((SEG,), cutlass.Int32)
+            part = cutlass.Int32(0)
+            for j in cutlass.range_constexpr(SEG):
+                v8 = smem_hist[top - cutlass.Int32(j)]
+                seg_frag[j] = v8
+                part = part + v8
+            tp = part
+            for off_i in cutlass.range_constexpr(5):
+                off_v = cutlass.const_expr(1 << off_i)
+                other = cute.arch.shuffle_sync_up(tp, off_v, mask_and_clamp=0)
+                if lane >= cutlass.Int32(off_v):
+                    tp = tp + other
+            excl = tp - part                 # cum of all bins above my segment
+            total = cute.arch.shuffle_sync(tp, cutlass.Int32(self.WARP_SIZE - 1))
+            run = cutlass.Int32(0)
+            for j in cutlass.range_constexpr(SEG):
+                run = run + seg_frag[j]
+                cum_at = excl + run
+                cum_before = cum_at - seg_frag[j]
+                for m in cutlass.range_constexpr(M):
+                    if (cum_at >= cutlass.Int32(self.qneeds[m])
+                            and cum_before < cutlass.Int32(self.qneeds[m])):
+                        s_mt_thr[m] = v_lo + cutlass.Float32(top - cutlass.Int32(j)) * width
+            # unfired rungs (heavy invalid-preIdx rows: total < need): v_lo
+            if lane == 0:
+                for m in cutlass.range_constexpr(M):
+                    if total < cutlass.Int32(self.qneeds[m]):
+                        s_mt_thr[m] = v_lo
+        cute.arch.barrier()
+
+    # ------------------------------------------------------------------
     # block_count_ge — GE-count of input vs threshold (shared by P2/P3).
     # Per-thread strided accumulate → smem_ptcnt[tid] (for P3 prefix sum)
     # → warp reduce → block reduce → s_iscalars[0] = cand_count.
