@@ -233,6 +233,12 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
     {
         TLLM_CHECK_WITH_INFO(topK <= 22, "For DeepSeek routing method, must have topK <= 22");
         TLLM_CHECK_WITH_INFO(topkGroup <= 4, "For DeepSeek routing method, must have topkGroup <= 4");
+        // Fused shared experts assume the full expert set is resident on this rank
+        // (no expert parallelism): the appended experts live at global indices
+        // [numExperts, numExperts + numFusedSharedExpert) on every rank.
+        TLLM_CHECK_WITH_INFO(numFusedSharedExpert == 0 || (localExpertOffset == 0 && localNumExperts == numExperts),
+            "Fused shared experts do not support expert parallelism yet.");
+
         moe::dev::routing::routingDeepSeek::Data routingData;
         routingData.mDtypeOutput = btg::Dtype::Bfloat16;
         routingData.mUsePdl = tensorrt_llm::common::getEnvEnablePDL();
@@ -272,23 +278,6 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
         routingData.mNumLocalExperts = localNumExperts;
         routingData.mRouteScale = routedScalingFactor;
         routingData.mUseRoutingSoftmax = false;
-
-        // TODO Should these be passed directly instead? This does assume a constant number of experts per device
-        int32_t const numDevices = numExperts / localNumExperts;
-        int32_t const deviceIndex = localExpertOffset / localNumExperts;
-        int32_t const baseTokensPerDevice = numTokens / numDevices;
-        int32_t const remainingTokens = numTokens % numDevices;
-
-        if (deviceIndex < remainingTokens)
-        {
-            routingData.mSharedExpertTokenOffset = (baseTokensPerDevice + 1) * deviceIndex;
-            routingData.mSharedExpertNumTokens = baseTokensPerDevice + 1;
-        }
-        else
-        {
-            routingData.mSharedExpertTokenOffset = remainingTokens + deviceIndex * baseTokensPerDevice;
-            routingData.mSharedExpertNumTokens = baseTokensPerDevice;
-        }
         moe::dev::routing::routingDeepSeek::run(routingData, stream);
     }
     else if (routingMethodType == RoutingMethodType::Llama4)

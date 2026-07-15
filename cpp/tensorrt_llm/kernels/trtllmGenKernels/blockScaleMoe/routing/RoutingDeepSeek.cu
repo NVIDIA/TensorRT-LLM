@@ -585,7 +585,6 @@ void run(Data& data, void* stream)
         data.mNumExperts += data.mNumFusedSharedExperts;
         data.mTopK += data.mNumFusedSharedExperts;
         data.mNumLocalExperts += data.mNumFusedSharedExperts;
-        // data.mLocalExpertsStartIdx += data.mNumFusedSharedExperts;
     }
 
     // Step 2: Permutation pipeline (reads from mPtrTopKPacked written by step 1)
