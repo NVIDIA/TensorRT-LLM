@@ -236,7 +236,7 @@ class GvrTopKKernel:
         enable_r0: bool = False,
         r0_qfracs: Optional[tuple] = None,
         mt_unroll: int = 4,
-        p1b_cache: bool = False,
+        p1b_cache: Optional[bool] = None,
         fb_fix: bool = True,
         fb_alpha: float = 0.2,
     ):
@@ -365,8 +365,26 @@ class GvrTopKKernel:
         #   refining (excludes the R2-class unmeasured-seed failure mode).
         self.enable_r0 = bool(enable_r0)
         self.mt_unroll = int(mt_unroll)
-        self.p1b_cache = bool(p1b_cache)
         self.fb_fix = bool(fb_fix)
+        # C7 dispatch (op#26 host policy folded into the ctor; all gated on
+        # enable_r0 so an OFF kernel is byte-identical to the base):
+        #  - qfracs default = M2D (0.85, 0.35): dispatch_r0_op26 ships M2D for
+        #    every (dtype, K, N); the M=2 pass is ~free and the R1 falsi shot
+        #    covers the 3-7% bracket misses. uh4 (M=4) was silicon-falsified
+        #    (mc geomean 0.956 — admission != latency).
+        #  - p1b_cache default = (dtype != fp32): the SMEM gather-cache wins
+        #    +0.8-2.8% on 16-bit (random half-prec gather is the cost); flat/
+        #    negative on fp32 (occupancy at kC=6144), so OFF there.
+        #  - kC-diet: K512 single-CTA -> kC=3072 (saves 16KB SMEM; 16-bit win,
+        #    fp32 neutral). kC>=2560 is the K512 16-bit tie-safety contract so
+        #    3072 is safe; the cluster port and K1024/K2048 stay stock.
+        if enable_r0 and r0_qfracs is None:
+            r0_qfracs = (0.85, 0.35)
+        if enable_r0 and p1b_cache is None:
+            p1b_cache = dtype != cutlass.Float32
+        self.p1b_cache = bool(p1b_cache)
+        if enable_r0 and top_k == 512 and cluster_size == 1 and self.kC > 3072:
+            self.kC = 3072
         self.r0_qfracs = tuple(float(q) for q in r0_qfracs) if r0_qfracs else ()
         if self.r0_qfracs:
             assert all(0.0 < q < 1.0 for q in self.r0_qfracs), self.r0_qfracs
