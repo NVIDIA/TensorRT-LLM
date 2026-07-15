@@ -54,6 +54,18 @@ _NON_SERIALIZED_QUANT_PARAM_NAMES = (
     "inv_kv_scales",
 )
 
+_DYNAMIC_GENERATED_QUANT_PARAM_NAMES = (
+    "input_scale",
+    "weight_scale",
+    "weight_scale_2",
+)
+
+_DYNAMIC_SOURCE_WEIGHT_DTYPES = (
+    torch.bfloat16,
+    torch.float16,
+    torch.float32,
+)
+
 
 def _remap_checkpoint_keys(weights: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
     remapped = {}
@@ -918,16 +930,27 @@ class QwenImageTransformer2DModel(BaseDiffusionModel):
                 module.create_weights()
                 module.to(device)
 
-    def _allowed_missing_checkpoint_parameter_names(self) -> set[str]:
+    def _allowed_missing_checkpoint_parameter_names(
+        self, weights: Optional[Dict[str, torch.Tensor]] = None
+    ) -> set[str]:
         """Return local-only parameters omitted by checkpoints."""
         allowed_missing = set()
         for module_name, module in self.named_modules():
             if not isinstance(module, Linear) or module.quant_config is None:
                 continue
             prefix = f"{module_name}." if module_name else ""
+            param_names = _NON_SERIALIZED_QUANT_PARAM_NAMES
+            if (
+                weights is not None
+                and self.model_config.dynamic_weight_quant
+                and (checkpoint_weight := weights.get(f"{prefix}weight")) is not None
+                and checkpoint_weight.dtype in _DYNAMIC_SOURCE_WEIGHT_DTYPES
+            ):
+                param_names = param_names + _DYNAMIC_GENERATED_QUANT_PARAM_NAMES
+
             allowed_missing.update(
                 f"{prefix}{param_name}"
-                for param_name in _NON_SERIALIZED_QUANT_PARAM_NAMES
+                for param_name in param_names
                 if module._parameters.get(param_name) is not None
             )
         return allowed_missing
@@ -935,7 +958,7 @@ class QwenImageTransformer2DModel(BaseDiffusionModel):
     def _validate_checkpoint_keys(self, weights: Dict[str, torch.Tensor]) -> None:
         expected = {name for name, _ in self.named_parameters()}
         provided = set(weights)
-        allowed_missing = self._allowed_missing_checkpoint_parameter_names()
+        allowed_missing = self._allowed_missing_checkpoint_parameter_names(weights)
         missing = sorted((expected - provided) - allowed_missing)
         unexpected = sorted(provided - expected)
 
