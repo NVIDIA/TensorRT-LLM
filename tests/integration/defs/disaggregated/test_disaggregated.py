@@ -209,6 +209,8 @@ def get_test_config(test_desc, example_dir, test_root):
         f"{test_configs_root}/disagg_config_conversation.yaml",
         "multi_orchestrator":
         f"{test_configs_root}/disagg_config_multi_orchestrator.yaml",
+        "multi_process_gen_server":
+        f"{test_configs_root}/disagg_config_multi_process_gen_server.yaml",
         "4_ranks":
         f"{test_configs_root}/disagg_config_ctxtp2_gentp1.yaml",
         "cuda_graph":
@@ -895,6 +897,24 @@ def test_disaggregated_tinyllama_multi_orchestrator(disaggregated_test_root,
     env["CUDA_VISIBLE_DEVICES"] = "0"
     run_disaggregated_test(disaggregated_example_root,
                            "multi_orchestrator",
+                           num_iters=1,
+                           env=env,
+                           model_path=llama_model_root,
+                           cwd=llm_venv.get_working_directory())
+
+
+@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
+                         indirect=True)
+def test_disaggregated_multi_process_gen_server(disaggregated_test_root,
+                                                disaggregated_example_root,
+                                                llm_venv, llama_model_root):
+    setup_model_symlink(llm_venv, llama_model_root,
+                        "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+
+    env = llm_venv._new_env.copy()
+    env["CUDA_VISIBLE_DEVICES"] = "0"
+    run_disaggregated_test(disaggregated_example_root,
+                           "multi_process_gen_server",
                            num_iters=1,
                            env=env,
                            model_path=llama_model_root,

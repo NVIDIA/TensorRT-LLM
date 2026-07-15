@@ -1,3 +1,17 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import asyncio
 import atexit
 import gc
@@ -10,7 +24,6 @@ import signal
 import socket
 import subprocess  # nosec B404
 import sys
-import time
 import uuid
 from pathlib import Path
 from typing import Any, Dict, Optional, Sequence, Set
@@ -374,10 +387,43 @@ def launch_server(
         served_model_name: Optional[str] = None,
         allow_request_chat_template: bool = False,
         num_input_processor_workers: int = 8,
-        num_media_load_workers: int = 8):
+        num_media_load_workers: int = 8,
+        num_http_workers: int = 1):
 
     backend = llm_args["backend"]
     model = served_model_name or llm_args["model"]
+    if num_http_workers > 1:
+        from tensorrt_llm.serve.http_fleet import (FrontendProcessConfig,
+                                                   GeneratorProcessConfig,
+                                                   run_generator_http_fleet)
+
+        if backend not in ("pytorch", "_autodeploy"):
+            raise click.BadParameter(
+                f"{backend} is not a known backend, check help for available options.",
+                param_hint="backend")
+        generator_kind = ("autodeploy"
+                          if backend == "_autodeploy" else "pytorch")
+        run_generator_http_fleet(
+            GeneratorProcessConfig(generator_kind, dict(llm_args)),
+            FrontendProcessConfig(
+                host=host,
+                port=port,
+                model=model,
+                tool_parser=tool_parser,
+                server_role=server_role,
+                metadata_server_cfg=metadata_server_cfg,
+                disagg_cluster_config=disagg_cluster_config,
+                multimodal_server_config=multimodal_server_config,
+                chat_template=chat_template,
+                allow_request_chat_template=allow_request_chat_template,
+                input_processor_workers=num_input_processor_workers,
+                media_load_workers=num_media_load_workers,
+                middleware=tuple(middleware),
+            ),
+            num_http_workers,
+        )
+        return
+
     addr_info = socket.getaddrinfo(host, port, socket.AF_UNSPEC,
                                    socket.SOCK_STREAM)
     address_family = socket.AF_INET6 if all(
@@ -561,8 +607,29 @@ def launch_mm_encoder_server(
     encoder_args: dict,
     metadata_server_cfg: Optional[MetadataServerConfig] = None,
     allow_request_chat_template: bool = False,
+    num_http_workers: int = 1,
 ):
     model = encoder_args["model"]
+    if num_http_workers > 1:
+        from tensorrt_llm.serve.http_fleet import (FrontendProcessConfig,
+                                                   GeneratorProcessConfig,
+                                                   run_generator_http_fleet)
+
+        run_generator_http_fleet(
+            GeneratorProcessConfig("mm_encoder", dict(encoder_args)),
+            FrontendProcessConfig(
+                host=host,
+                port=port,
+                model=model,
+                tool_parser=None,
+                server_role=ServerRole.MM_ENCODER,
+                metadata_server_cfg=metadata_server_cfg,
+                allow_request_chat_template=allow_request_chat_template,
+            ),
+            num_http_workers,
+        )
+        return
+
     encoder_args.pop("build_config", None)
     mm_encoder = MultimodalEncoder(**encoder_args)
 
@@ -637,6 +704,7 @@ def launch_embedding_server(
     max_queue_delay: float,
     max_queue_size: int,
     metadata_server_cfg: Optional[MetadataServerConfig] = None,
+    num_http_workers: int = 1,
 ):
     model = llm_args["model"]
     llm_args.pop("build_config", None)
@@ -663,6 +731,34 @@ def launch_embedding_server(
             model_kwargs["architectures"] = override["architectures"]
         llm_args["model_kwargs"] = model_kwargs
 
+    if num_http_workers > 1:
+        from tensorrt_llm.serve.http_fleet import (FrontendProcessConfig,
+                                                   GeneratorProcessConfig,
+                                                   run_generator_http_fleet)
+
+        run_generator_http_fleet(
+            GeneratorProcessConfig(
+                "embedding",
+                dict(llm_args),
+                service_kwargs={
+                    "embedding_max_queue_delay": max_queue_delay,
+                    "embedding_max_queue_size": max_queue_size,
+                },
+            ),
+            FrontendProcessConfig(
+                host=host,
+                port=port,
+                model=model,
+                tool_parser=None,
+                server_role=ServerRole.EMBEDDING,
+                metadata_server_cfg=metadata_server_cfg,
+                embedding_max_queue_delay=max_queue_delay,
+                embedding_max_queue_size=max_queue_size,
+            ),
+            num_http_workers,
+        )
+        return
+
     # Encoder-only (embedding) serving uses the synchronous llm.encode() fast path
     # (no KV cache / sampler / scheduler), coalesced behind the dynamic batcher.
     llm = PyTorchLLM(encode_only=True, **llm_args)
@@ -684,6 +780,7 @@ def launch_visual_gen_server(
         visual_gen_args: Optional[VisualGenArgs] = None,
         metadata_server_cfg: Optional[MetadataServerConfig] = None,
         middleware: Sequence[str] = (),
+        num_http_workers: int = 1,
 ):
     """Launch a VISUAL_GEN model server for image/video generation.
 
@@ -702,6 +799,29 @@ def launch_visual_gen_server(
     ext = _detect_external_launch()
     if ext is not None and ext[0] != 0:
         VisualGen(model=model, args=visual_gen_args)
+        return
+
+    if num_http_workers > 1:
+        from tensorrt_llm.serve.http_fleet import (FrontendProcessConfig,
+                                                   GeneratorProcessConfig,
+                                                   run_generator_http_fleet)
+
+        run_generator_http_fleet(
+            GeneratorProcessConfig("visual_gen", {
+                "model": model,
+                "args": visual_gen_args
+            }),
+            FrontendProcessConfig(
+                host=host,
+                port=port,
+                model=model,
+                tool_parser=None,
+                server_role=ServerRole.VISUAL_GEN,
+                metadata_server_cfg=metadata_server_cfg,
+                middleware=tuple(middleware),
+            ),
+            num_http_workers,
+        )
         return
 
     # Reserve the listening (host, port) by binding the socket *before*
@@ -902,6 +1022,13 @@ def launch_visual_gen_server(
                   "payloads (image / video / audio) for multimodal "
                   "requests.",
                   status="prototype")
+@stability_option(
+    "--num_http_workers",
+    type=click.IntRange(min=1),
+    default=1,
+    help="Number of FastAPI frontend processes. Values greater than one use "
+    "a single generator process connected over Unix-domain IPC.",
+    status="prototype")
 @stability_option("--trust_remote_code",
                   is_flag=True,
                   default=False,
@@ -1069,29 +1196,30 @@ def launch_visual_gen_server(
     help=
     "Types of agents to schedule. Now Only Support Open Deep Research agent.",
     status="prototype")
-def serve(
-        model: str, tokenizer: Optional[str], custom_tokenizer: Optional[str],
-        post_processor_hook: Optional[str], host: str, port: int,
-        log_level: str, backend: str, max_beam_width: int, max_batch_size: int,
-        max_num_tokens: int, max_seq_len: int, tensor_parallel_size: int,
-        pipeline_parallel_size: int, context_parallel_size: int,
-        moe_expert_parallel_size: Optional[int],
-        moe_cluster_parallel_size: Optional[int], gpus_per_node: Optional[int],
-        free_gpu_memory_fraction: float, kv_cache_dtype: str,
-        num_postprocess_workers: int, num_input_processor_workers: int,
-        num_media_load_workers: int, trust_remote_code: bool,
-        revision: Optional[str], extra_llm_api_options: Optional[str],
-        reasoning_parser: Optional[str], tool_parser: Optional[str],
-        metadata_server_config_file: Optional[str], server_role: Optional[str],
-        fail_fast_on_attention_window_too_large: bool,
-        otlp_traces_endpoint: Optional[str], enable_chunked_prefill: bool,
-        enable_attention_dp: bool, disagg_cluster_uri: Optional[str],
-        media_io_kwargs: Optional[str], agent_percentage: float,
-        agent_types: Optional[str], video_pruning_rate: Optional[float],
-        telemetry: bool, custom_module_dirs: list[Path],
-        chat_template: Optional[str], allow_request_chat_template: bool,
-        middleware: tuple[str, ...], grpc: bool, enable_visual_gen: bool,
-        served_model_name: Optional[str], visual_gen_args: Optional[str]):
+def serve(model: str, tokenizer: Optional[str], custom_tokenizer: Optional[str],
+          post_processor_hook: Optional[str], host: str, port: int,
+          log_level: str, backend: str, max_beam_width: int,
+          max_batch_size: int, max_num_tokens: int, max_seq_len: int,
+          tensor_parallel_size: int, pipeline_parallel_size: int,
+          context_parallel_size: int, moe_expert_parallel_size: Optional[int],
+          moe_cluster_parallel_size: Optional[int],
+          gpus_per_node: Optional[int], free_gpu_memory_fraction: float,
+          kv_cache_dtype: str, num_postprocess_workers: int,
+          num_input_processor_workers: int, num_media_load_workers: int,
+          num_http_workers: int, trust_remote_code: bool,
+          revision: Optional[str], extra_llm_api_options: Optional[str],
+          reasoning_parser: Optional[str], tool_parser: Optional[str],
+          metadata_server_config_file: Optional[str],
+          server_role: Optional[str],
+          fail_fast_on_attention_window_too_large: bool,
+          otlp_traces_endpoint: Optional[str], enable_chunked_prefill: bool,
+          enable_attention_dp: bool, disagg_cluster_uri: Optional[str],
+          media_io_kwargs: Optional[str], agent_percentage: float,
+          agent_types: Optional[str], video_pruning_rate: Optional[float],
+          telemetry: bool, custom_module_dirs: list[Path],
+          chat_template: Optional[str], allow_request_chat_template: bool,
+          middleware: tuple[str, ...], grpc: bool, enable_visual_gen: bool,
+          served_model_name: Optional[str], visual_gen_args: Optional[str]):
     """Running an OpenAI API compatible server
 
     MODEL: model name | HF checkpoint path | TensorRT engine path
@@ -1255,6 +1383,8 @@ def serve(
                 server_role,
                 "disagg_cluster_config":
                 disagg_cluster_config,
+                "num_http_workers":
+                num_http_workers if num_http_workers > 1 else None,
             }
             for name, value in unsupported_args.items():
                 if value is not None:
@@ -1282,7 +1412,8 @@ def serve(
                 served_model_name=served_model_name,
                 allow_request_chat_template=allow_request_chat_template,
                 num_input_processor_workers=num_input_processor_workers,
-                num_media_load_workers=num_media_load_workers)
+                num_media_load_workers=num_media_load_workers,
+                num_http_workers=num_http_workers)
 
     def _serve_visual_gen():
         parsed_visual_gen_args = (VisualGenArgs.from_yaml(visual_gen_args)
@@ -1291,8 +1422,13 @@ def serve(
         metadata_server_cfg = parse_metadata_server_config_file(
             metadata_server_config_file)
 
-        launch_visual_gen_server(host, port, model, parsed_visual_gen_args,
-                                 metadata_server_cfg, middleware)
+        launch_visual_gen_server(host,
+                                 port,
+                                 model,
+                                 parsed_visual_gen_args,
+                                 metadata_server_cfg,
+                                 middleware,
+                                 num_http_workers=num_http_workers)
 
     is_visual_gen = (enable_visual_gen or visual_gen_args is not None
                      or get_is_diffusion_only_model(model))
@@ -1386,6 +1522,13 @@ def serve(
     "Only enable this for trusted clients.",
     status="prototype")
 @stability_option(
+    "--num_http_workers",
+    type=click.IntRange(min=1),
+    default=1,
+    help="Number of FastAPI frontend processes. Values greater than one use "
+    "a single generator process connected over Unix-domain IPC.",
+    status="prototype")
+@stability_option(
     "--telemetry/--no-telemetry",
     default=True,
     help="Enable or disable anonymous usage telemetry collection.",
@@ -1396,7 +1539,8 @@ def serve_encoder(model: str, host: str, port: int, log_level: str,
                   extra_encoder_options: Optional[str], revision: Optional[str],
                   free_gpu_memory_fraction: float, tensor_parallel_size: int,
                   metadata_server_config_file: Optional[str],
-                  allow_request_chat_template: bool, telemetry: bool):
+                  allow_request_chat_template: bool, num_http_workers: int,
+                  telemetry: bool):
     """Running an OpenAI API compatible server
 
     MODEL: model name | HF checkpoint path | TensorRT engine path
@@ -1446,7 +1590,8 @@ def serve_encoder(model: str, host: str, port: int, log_level: str,
         port,
         encoder_args,
         metadata_server_cfg,
-        allow_request_chat_template=allow_request_chat_template)
+        allow_request_chat_template=allow_request_chat_template,
+        num_http_workers=num_http_workers)
 
 
 @click.command("embeddings")
@@ -1505,6 +1650,12 @@ def serve_encoder(model: str, host: str, port: int, log_level: str,
               type=str,
               default=None,
               help="Path to metadata server config file")
+@click.option(
+    "--num_http_workers",
+    type=click.IntRange(min=1),
+    default=1,
+    help="Number of FastAPI frontend processes. Values greater than one use "
+    "a single generator process connected over Unix-domain IPC.")
 @click.option("--telemetry/--no-telemetry",
               default=True,
               help="Enable or disable anonymous usage telemetry collection.")
@@ -1513,7 +1664,7 @@ def serve_embedding(
         max_num_tokens: int, max_queue_delay: float, max_queue_size: int,
         trust_remote_code: bool, extra_llm_api_options: Optional[str],
         revision: Optional[str], metadata_server_config_file: Optional[str],
-        telemetry: bool):
+        num_http_workers: int, telemetry: bool):
     """Run an OpenAI-compatible /v1/embeddings server for encoder-only models.
 
     Coalesces concurrent requests with a dynamic batcher and serves them through
@@ -1562,8 +1713,13 @@ def serve_embedding(
     metadata_server_cfg = parse_metadata_server_config_file(
         metadata_server_config_file)
 
-    launch_embedding_server(host, port, llm_args, max_queue_delay,
-                            max_queue_size, metadata_server_cfg)
+    launch_embedding_server(host,
+                            port,
+                            llm_args,
+                            max_queue_delay,
+                            max_queue_size,
+                            metadata_server_cfg,
+                            num_http_workers=num_http_workers)
 
 
 @click.command("disaggregated")
@@ -1720,7 +1876,7 @@ def _launch_disagg_fleet(disagg_cfg, config_file, metadata_server_config_file,
     explicit per-worker ``TLLM_DISAGG_WORKER_PROCESS_ID`` and independent
     ``SO_REUSEPORT`` sockets. MPI/PMIX/SLURM environment variables are stripped.
 
-    Returns the list of ``Popen`` handles.
+    Returns a generic ``HttpFleet`` supervisor around the ``Popen`` handles.
     """
     from tensorrt_llm.llmapi.disagg_utils import disagg_process_id_space
     public_host, public_port = disagg_cfg.hostname, disagg_cfg.port
@@ -1761,29 +1917,22 @@ def _launch_disagg_fleet(disagg_cfg, config_file, metadata_server_config_file,
         raise ValueError(
             f"num_workers must be between 1 and {procid_space}, got {num_workers}"
         )
-    fleet = []
+    worker_environments = []
     for i in range(num_workers):
         worker_env = dict(base_env)
         # Explicit per-worker process index (no shared counter file).
         worker_env[DisaggWorkerEnvs.TLLM_DISAGG_WORKER_PROCESS_ID] = str(i)
-        p = subprocess.Popen(cmd,
-                             env=worker_env,
-                             stdout=sys.stdout,
-                             stderr=sys.stderr)
-        logger.info(f"Disagg fleet worker {i} launched (pid={p.pid})")
-        fleet.append(p)
+        worker_environments.append(worker_env)
+
+    from tensorrt_llm.serve.http_fleet import launch_subprocess_http_fleet
+    fleet = launch_subprocess_http_fleet(
+        cmd,
+        worker_environments,
+        name="Disaggregated HTTP",
+    )
 
     def _cleanup():
-        for p in fleet:
-            if p.poll() is None:
-                p.terminate()
-        deadline = time.monotonic() + 10
-        for p in fleet:
-            try:
-                p.wait(timeout=max(0, deadline - time.monotonic()))
-            except Exception:
-                p.kill()
-                p.wait()
+        fleet.cleanup()
 
     def _handle_signal(signum, _frame):
         _cleanup()
@@ -1807,23 +1956,14 @@ def _serve_disagg_fleet(disagg_cfg, config_file, metadata_server_config_file,
                                  metadata_server_config_file, request_timeout,
                                  server_start_timeout, num_workers,
                                  coordinator_url)
-    # Block until any worker exits; a nonzero exit from any worker is a failure.
     try:
-        while True:
-            for i, p in enumerate(fleet):
-                rc = p.poll()
-                if rc is not None:
-                    if rc != 0:
-                        raise RuntimeError(
-                            f"Disagg fleet worker {i} (pid={p.pid}) exited with "
-                            f"code {rc}")
-                    # A clean exit of one worker ends the fleet.
-                    return
-            time.sleep(1)
+        worker_id, process, return_code = fleet.wait()
+        if return_code != 0:
+            raise RuntimeError(
+                f"Disagg fleet worker {worker_id} (pid={process.pid}) "
+                f"exited with code {return_code}")
     finally:
-        for process in fleet:
-            if process.poll() is None:
-                process.terminate()
+        fleet.cleanup()
 
 
 def _serve_coordinator_and_fleet(disagg_cfg, config_file,
@@ -1884,16 +2024,11 @@ def _serve_coordinator_and_fleet(disagg_cfg, config_file,
                                            uds=coord_uds))
 
         async def _monitor_fleet():
-            while True:
-                for i, process in enumerate(fleet):
-                    return_code = process.poll()
-                    if return_code is not None:
-                        if return_code != 0:
-                            raise RuntimeError(
-                                f"Disagg fleet worker {i} (pid={process.pid}) "
-                                f"exited with code {return_code}")
-                        return
-                await asyncio.sleep(1)
+            worker_id, process, return_code = await fleet.wait_async()
+            if return_code != 0:
+                raise RuntimeError(
+                    f"Disagg fleet worker {worker_id} (pid={process.pid}) "
+                    f"exited with code {return_code}")
 
         monitor_task = asyncio.create_task(_monitor_fleet())
         done, pending = await asyncio.wait((server_task, monitor_task),
@@ -1907,9 +2042,7 @@ def _serve_coordinator_and_fleet(disagg_cfg, config_file,
     try:
         asyncio.run(_serve_and_monitor())
     finally:
-        for process in fleet:
-            if process.poll() is None:
-                process.terminate()
+        fleet.cleanup()
 
 
 def _init_fleet_worker_process():
@@ -1985,13 +2118,9 @@ def _run_fleet_worker():
     server = _build_disagg_server_from_env()
     host, port = server._config.hostname, server._config.port
 
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    # SO_REUSEPORT: every worker binds the same (host, port); the kernel spreads
-    # connections across the workers' accept queues by 4-tuple hash.
-    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+    from tensorrt_llm.serve.http_fleet import bind_reuseport_http_socket
     try:
-        s.bind((host, port))
+        s = bind_reuseport_http_socket(host, port)
     except OSError as e:
         raise RuntimeError(
             f"Fleet worker failed to SO_REUSEPORT-bind {host}:{port}: {e}")

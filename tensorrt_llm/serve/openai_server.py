@@ -1,4 +1,18 @@
 #!/usr/bin/env python
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import array
 import asyncio
 import base64
@@ -95,7 +109,8 @@ from tensorrt_llm.serve.responses_utils import \
 from tensorrt_llm.serve.tool_parser.tool_parser_factory import ToolParserFactory
 from tensorrt_llm.serve.visual_gen_metrics import \
     build_visual_gen_timing_headers
-from tensorrt_llm.serve.visual_gen_utils import parse_visual_gen_params
+from tensorrt_llm.serve.visual_gen_utils import (VIDEO_STORE,
+                                                 parse_visual_gen_params)
 from tensorrt_llm.version import __version__ as VERSION
 from tensorrt_llm.visual_gen import VisualGen
 
@@ -267,7 +282,11 @@ class OpenAIServer(_VideoRoutesMixin):
             input_processor_workers: int = 8,
             media_load_workers: int = 8):
         self.generator = generator
-        self._is_visual_gen = isinstance(generator, VisualGen)
+        self._generator_kind = getattr(generator, "generator_kind", None)
+        self._is_visual_gen = (isinstance(generator, VisualGen)
+                               or self._generator_kind == "visual_gen")
+        self._owns_generator_lifecycle = getattr(generator, "owns_lifecycle",
+                                                 True)
         self._embedding_max_queue_delay = embedding_max_queue_delay
         self._embedding_max_queue_size = embedding_max_queue_size
         self.embedding_batcher: Optional[EncodeBatcher] = None
@@ -346,7 +365,8 @@ class OpenAIServer(_VideoRoutesMixin):
 
         @asynccontextmanager
         async def lifespan(app: FastAPI):
-            if self.metadata_server is not None:
+            if (self._owns_generator_lifecycle
+                    and self.metadata_server is not None):
                 metadata = {
                     "model": self.model,
                     "version": VERSION,
@@ -360,7 +380,7 @@ class OpenAIServer(_VideoRoutesMixin):
                                          metadata)
                 logger.info(f"trtllm/{self.generator.llm_id} is registered")
 
-            if self.disagg_cluster_config:
+            if self._owns_generator_lifecycle and self.disagg_cluster_config:
                 self.disagg_cluster_storage = create_cluster_storage_client(
                     self.disagg_cluster_config.cluster_uri,
                     self.disagg_cluster_config.cluster_name)
@@ -368,8 +388,7 @@ class OpenAIServer(_VideoRoutesMixin):
                     self.server_role, self.host, self.port,
                     self.disagg_cluster_config, self.disagg_cluster_storage)
 
-            # VisualGen has no args
-            if not isinstance(self.generator, VisualGen):
+            if self._owns_generator_lifecycle and not self._is_visual_gen:
                 # Start energy monitoring if enabled
                 if getattr(self.generator.args, "enable_energy_metrics", False):
                     try:
@@ -386,19 +405,13 @@ class OpenAIServer(_VideoRoutesMixin):
                 # tensorrt backend does not have this attribute but it always has iter stats enabled.
                 if self.metrics_collector and getattr(
                         self.generator.args, "enable_iter_perf_stats", True):
-                    # The background loop becomes the sole consumer of the
-                    # engine stats queue; /metrics reads from a tee buffer
-                    # bounded by iter_stats_max_iterations to avoid racing
-                    # the loop for the queue (nvbug 6102381).
-                    # One shared buffer is sufficient while this collector task
-                    # is the only consumer of the engine iteration-stats queue.
-                    # Other consumers can read it through get_iteration_stats(),
-                    # which clears the buffer. Adding another queue consumer
-                    # requires revisiting the buffering and clearing ownership.
-                    max_buf = self._iteration_stats_buffer_maxlen(
-                        getattr(self.generator.args,
-                                "iter_stats_max_iterations", 1000))
-                    self._iteration_stats_buffer = deque(maxlen=max_buf)
+                    # Direct generators tee stats locally. Fleet stats are
+                    # buffered by the generator process for all frontends.
+                    if self._generator_kind is None:
+                        max_buf = self._iteration_stats_buffer_maxlen(
+                            getattr(self.generator.args,
+                                    "iter_stats_max_iterations", 1000))
+                        self._iteration_stats_buffer = deque(maxlen=max_buf)
                     self._iteration_stats_collector_task = asyncio.create_task(
                         self._iteration_stats_collector_loop())
                     logger.info(
@@ -425,10 +438,11 @@ class OpenAIServer(_VideoRoutesMixin):
                     pass
                 logger.info("Stopped background iteration stats collector task")
 
-            if self.metadata_server is not None:
+            if (self._owns_generator_lifecycle
+                    and self.metadata_server is not None):
                 self.metadata_server.remove(f"trtllm/{self.generator.llm_id}")
                 logger.info(f"trtllm/{self.generator.llm_id} is unregistered")
-            if self.disagg_cluster_worker:
+            if self._owns_generator_lifecycle and self.disagg_cluster_worker:
                 await self.disagg_cluster_worker.deregister_worker()
             if self.resource_governor is not None:
                 self.resource_governor.close()
@@ -451,14 +465,15 @@ class OpenAIServer(_VideoRoutesMixin):
             return JSONResponse(status_code=400, content={"error": str(exc)})
 
         if self.server_role is ServerRole.VISUAL_GEN:
-            assert isinstance(
-                self.generator, VisualGen
-            ), "generator must be a VisualGen for VISUAL_GEN server"
+            assert self._is_visual_gen, (
+                "generator must provide VisualGen capabilities for a "
+                "VISUAL_GEN server")
             self.register_visual_gen_routes()
         elif self.server_role is ServerRole.MM_ENCODER:
-            assert isinstance(
-                self.generator, MultimodalEncoder
-            ), "generator must be a MultimodalEncoder for multimodal encoder"
+            assert (
+                isinstance(self.generator, MultimodalEncoder)
+                or self._generator_kind == "mm_encoder"), (
+                    "generator must provide multimodal encoder capabilities")
             self.register_mm_encoder_routes()
         elif self.server_role is ServerRole.EMBEDDING:
             assert getattr(self.generator.args, "encode_only", False), (
@@ -479,6 +494,7 @@ class OpenAIServer(_VideoRoutesMixin):
                       "/tmp/trtllm_generated"))  # nosec B108
         self.media_storage_path.mkdir(exist_ok=True, parents=True)
         self.video_gen_tasks = {}
+        self.video_store = getattr(self.generator, "video_store", VIDEO_STORE)
 
     def _init_llm(self, chat_template: Optional[str] = None):
         self.tokenizer = self.generator.tokenizer
@@ -516,7 +532,8 @@ class OpenAIServer(_VideoRoutesMixin):
             os.getenv("TRTLLM_RESPONSES_API_DISABLE_STORE", ""))
                              < 1) and not self.postproc_worker_enabled
 
-        self.conversation_store = ConversationHistoryStore()
+        self.conversation_store = getattr(self.generator, "conversation_store",
+                                          ConversationHistoryStore())
 
         # gpt-oss
         self.harmony_adapter: HarmonyAdapter | None = None
@@ -700,7 +717,7 @@ class OpenAIServer(_VideoRoutesMixin):
 
     @property
     def postproc_worker_enabled(self) -> bool:
-        if isinstance(self.generator, VisualGen):
+        if self._is_visual_gen:
             return False
 
         return True if self.generator.args.num_postprocess_workers > 0 else False
@@ -812,7 +829,9 @@ class OpenAIServer(_VideoRoutesMixin):
         self.app.add_api_route("/kv_cache_events",
                                self.get_kv_cache_events,
                                methods=["POST"])
-        resource_governor_queue = self.generator._executor.resource_governor_queue
+        executor = getattr(self.generator, "_executor", None)
+        resource_governor_queue = getattr(executor, "resource_governor_queue",
+                                          None)
         if resource_governor_queue is not None:
             from .resource_governor import ResourceGovernor
             self.resource_governor = ResourceGovernor(
@@ -1098,7 +1117,9 @@ class OpenAIServer(_VideoRoutesMixin):
                                methods=["DELETE"])
 
     async def health(self) -> Response:
-        if self._check_health():
+        healthy = (await asyncio.to_thread(self._check_health) if
+                   self._generator_kind is not None else self._check_health())
+        if healthy:
             return Response(status_code=200)
         else:
             # If the engine has a fatal error, trigger server shutdown so the
@@ -1192,6 +1213,10 @@ class OpenAIServer(_VideoRoutesMixin):
             async for stat in self.generator.get_stats_async(timeout=None):
                 stats.append(stat)
             return JSONResponse(content=stats)
+
+        if self._generator_kind is not None:
+            return JSONResponse(
+                content=await self.generator.take_iteration_stats(2))
 
         # When the background collector loop is active it is the sole
         # consumer of the engine stats queue; serve /metrics from the tee
@@ -1407,8 +1432,8 @@ class OpenAIServer(_VideoRoutesMixin):
         earlier iterations and could leave gauges unset if the latest iteration had no
         context-phase activity.
 
-        The task sleeps when idle and is woken up via _iteration_stats_wakeup_event when
-        requests complete.
+        The task is woken when local requests complete. The fleet owner also polls because
+        requests may complete in another frontend process.
 
         The loop will continue until the task is cancelled during server shutdown.
         """
@@ -1416,7 +1441,15 @@ class OpenAIServer(_VideoRoutesMixin):
             logger.info("Iteration stats collector loop started")
             while True:
                 # Wait for signal that requests have completed and stats may be available
-                await self._iteration_stats_wakeup_event.wait()
+                if self._generator_kind is None:
+                    await self._iteration_stats_wakeup_event.wait()
+                else:
+                    try:
+                        await asyncio.wait_for(
+                            self._iteration_stats_wakeup_event.wait(),
+                            timeout=1.0)
+                    except asyncio.TimeoutError:
+                        pass
 
                 # Clear the event for next wakeup
                 self._iteration_stats_wakeup_event.clear()
@@ -1440,6 +1473,12 @@ class OpenAIServer(_VideoRoutesMixin):
         except asyncio.CancelledError:
             logger.info("Iteration stats collector loop cancelled")
             raise
+
+    async def _start_generation(self, *args, **kwargs):
+        if self._generator_kind is not None:
+            return await asyncio.to_thread(self.generator.generate_async, *args,
+                                           **kwargs)
+        return self.generator.generate_async(*args, **kwargs)
 
     async def openai_chat(self, request: ChatCompletionRequest,
                           raw_request: Request) -> Response:
@@ -1609,7 +1648,7 @@ class OpenAIServer(_VideoRoutesMixin):
                     functools.partial(preprocess_fn, prompt, sampling_params,
                                       disaggregated_params))
 
-            promise = self.generator.generate_async(
+            promise = await self._start_generation(
                 inputs=generate_inputs,
                 sampling_params=sampling_params,
                 _postproc_params=postproc_params
@@ -1750,7 +1789,7 @@ class OpenAIServer(_VideoRoutesMixin):
             if mm_data is not None:
                 prompt["multi_modal_data"] = mm_data
 
-            promise = self.generator.generate_async(inputs=prompt, )
+            promise = await self._start_generation(inputs=prompt)
             asyncio.create_task(self.await_disconnected(raw_request, promise))
 
             response = await create_mm_embedding_response(promise)
@@ -1939,7 +1978,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 else:
                     tokens_prompt = prompt
 
-                promise = self.generator.generate_async(
+                promise = await self._start_generation(
                     inputs=tokens_prompt,
                     sampling_params=sampling_params,
                     _postproc_params=postproc_params,
@@ -2097,7 +2136,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 agent_hierarchy=request.agent_hierarchy)
 
             # Generate
-            promise = self.generator.generate_async(
+            promise = await self._start_generation(
                 inputs=harmony_tokens,
                 sampling_params=sampling_params,
                 _postproc_params=postproc_params
@@ -2239,7 +2278,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 if request.stream else responses_api_post_processor,
                 postproc_args=postproc_args,
             )
-            promise = self.generator.generate_async(
+            promise = await self._start_generation(
                 inputs=input_tokens,
                 sampling_params=sampling_params,
                 streaming=request.stream,
@@ -2321,24 +2360,24 @@ class OpenAIServer(_VideoRoutesMixin):
 
     async def release_memory(self,
                              request: MemoryUpdateRequest) -> JSONResponse:
-        assert isinstance(
-            self.generator, AsyncLLM
-        ), "/release_memory endpoint is only supported with AsyncLLM()"
+        assert (isinstance(self.generator, AsyncLLM)
+                or getattr(self.generator, "supports_collective_rpc", False)), (
+                    "/release_memory endpoint requires collective RPC support")
         await self.generator.collective_rpc('sleep', args=(request.tags, ))
         return JSONResponse(content={"status": "success"})
 
     async def resume_memory(self, request: MemoryUpdateRequest) -> JSONResponse:
-        assert isinstance(
-            self.generator, AsyncLLM
-        ), "/resume_memory endpoint is only supported with AsyncLLM()"
+        assert (isinstance(self.generator, AsyncLLM)
+                or getattr(self.generator, "supports_collective_rpc", False)), (
+                    "/resume_memory endpoint requires collective RPC support")
         await self.generator.collective_rpc('wakeup', args=(request.tags, ))
         return JSONResponse(content={"status": "success"})
 
     async def update_weights(self,
                              request: UpdateWeightsRequest) -> JSONResponse:
-        assert isinstance(
-            self.generator, AsyncLLM
-        ), "/update_weights endpoint is only supported with AsyncLLM()"
+        assert (isinstance(self.generator, AsyncLLM)
+                or getattr(self.generator, "supports_collective_rpc", False)), (
+                    "/update_weights endpoint requires collective RPC support")
         await self.generator.collective_rpc('update_weights',
                                             args=(request.weights, ))
         return JSONResponse(content={"status": "success"})

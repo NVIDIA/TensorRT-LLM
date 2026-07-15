@@ -181,6 +181,44 @@ echo -e "cache_transceiver_config:\n  backend: UCX\n  max_tokens_in_buffer: 2048
 # Start Generation servers
 CUDA_VISIBLE_DEVICES=2 trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --host localhost --port 8003 --backend pytorch --config ./gen_config.yml &> log_gen_0 &
 ```
+
+#### Multiple HTTP frontends for a context or generation server
+
+A context or generation model server can run multiple HTTP frontend processes
+without loading multiple copies of the model. Add `--num_http_workers` when
+starting that server. For example, the generation server above can use four
+frontends as follows:
+
+```
+CUDA_VISIBLE_DEVICES=2 trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
+    --host localhost --port 8003 --backend pytorch \
+    --config ./gen_config.yml --num_http_workers 4 &> log_gen_0 &
+```
+
+The command starts one generator service process and four FastAPI frontend
+processes on the same address. The generator service owns the LLM control
+plane, executor proxy, and shared serving state. Separate GPU executor workers
+own scheduling, model execution, GPU state, and the KV cache. Each frontend
+forwards generation and generator-wide operations to the generator service
+over IPC.
+
+The frontend fleet is one logical context or generation server. List its shared
+address only once in `disagg_config.yaml`, and count it as one server instance:
+
+```
+generation_servers:
+  num_instances: 1
+  urls:
+      - "localhost:8003"
+```
+
+Increasing `num_http_workers` scales HTTP handling for that server; it does not
+increase `num_instances`, create additional schedulers, or multiply GPU model
+capacity. The same option can be applied independently to a context server.
+Because all frontends access the executor-owned KV cache event stream through
+the generator service, KV cache event consumers can treat the fleet as a
+single server.
+
 Once the context and generation servers are launched, you can launch the disaggregated
 server, which will accept requests from clients and do the orchestration between context
 and generation servers. The disaggregated server can be launched with:

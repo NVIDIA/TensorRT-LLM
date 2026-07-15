@@ -29,7 +29,7 @@ from tensorrt_llm.media.encoding import resolve_video_format
 from tensorrt_llm.media.tensor_payload import is_tensor_format
 from tensorrt_llm.serve.openai_protocol import VideoGenerationRequest, VideoJob, VideoJobList
 from tensorrt_llm.serve.visual_gen_metrics import build_visual_gen_timing_headers
-from tensorrt_llm.serve.visual_gen_utils import VIDEO_STORE, parse_visual_gen_params
+from tensorrt_llm.serve.visual_gen_utils import parse_visual_gen_params
 from tensorrt_llm.visual_gen.params import VisualGenParams
 
 
@@ -332,7 +332,7 @@ class _VideoRoutesMixin:
             )
 
             # Persist the queued job before scheduling the background task so
-            # that a fast-completing task can always look it up in VIDEO_STORE.
+            # that a fast-completing task can always look it up in the store.
             video_job = VideoJob(
                 created_at=int(time.time()),
                 id=video_id,
@@ -344,7 +344,7 @@ class _VideoRoutesMixin:
                 size=f"{params.width}x{params.height}",
                 response_format=request.response_format,
             )
-            await VIDEO_STORE.upsert(video_id, video_job)
+            await self.video_store.upsert(video_id, video_job)
 
             # Start background generation task
             task = asyncio.create_task(
@@ -381,17 +381,20 @@ class _VideoRoutesMixin:
         """Background task to generate video and save to storage."""
         try:
             background_start = time.perf_counter()
-            future = self.generator.generate_async(inputs=request.prompt, params=params)
+            future = await self._start_generation(inputs=request.prompt, params=params)
+            register_alias = getattr(self.generator, "register_generation_alias", None)
+            if register_alias is not None:
+                await asyncio.to_thread(register_alias, video_id, future)
             output = await future
 
             if output.video is None:
                 # Update job status to failed since we're in a background task
-                job = await VIDEO_STORE.get(video_id)
+                job = await self.video_store.get(video_id)
                 if job:
                     job.status = "failed"
                     job.completed_at = int(time.time())
                     job.error = "Video generation failed: output.video is None"
-                    await VIDEO_STORE.upsert(video_id, job)
+                    await self.video_store.upsert(video_id, job)
                 return
 
             if is_tensor_format(request.format):
@@ -422,7 +425,7 @@ class _VideoRoutesMixin:
                 f"latency={latency:.3f}s generation={generation:.3f}s "
                 f"denoise={denoise:.3f}s"
             )
-            job = await VIDEO_STORE.get(video_id)
+            job = await self.video_store.get(video_id)
             if job:
                 job.status = "completed"
                 job.completed_at = int(time.time())
@@ -432,16 +435,16 @@ class _VideoRoutesMixin:
                 # compatibility, and the full list on output_paths.
                 job.output_path = str(saved_paths[0])
                 job.output_paths = [str(p) for p in saved_paths]
-                await VIDEO_STORE.upsert(video_id, job)
+                await self.video_store.upsert(video_id, job)
 
         except Exception as e:
             logger.error(traceback.format_exc())
-            job = await VIDEO_STORE.get(video_id)
+            job = await self.video_store.get(video_id)
             if job:
                 job.status = "failed"
                 job.completed_at = int(time.time())
                 job.error = str(e)
-                await VIDEO_STORE.upsert(video_id, job)
+                await self.video_store.upsert(video_id, job)
 
     async def list_videos(self, raw_request: Request) -> Response:
         """List all generated videos.
@@ -451,7 +454,7 @@ class _VideoRoutesMixin:
         """
         try:
             # List videos from storage
-            video_jobs = await VIDEO_STORE.list_values()
+            video_jobs = await self.video_store.list_values()
 
             # Convert to API format
             response = VideoJobList(
@@ -476,7 +479,7 @@ class _VideoRoutesMixin:
         try:
             logger.info(f"Getting video metadata: {video_id}")
             # Get metadata from storage
-            job = await VIDEO_STORE.get(video_id)
+            job = await self.video_store.get(video_id)
             if not job:
                 return self.create_error_response(
                     f"Video {video_id} not found",
@@ -510,7 +513,7 @@ class _VideoRoutesMixin:
         """
         try:
             # Get metadata first to check status
-            job = await VIDEO_STORE.get(video_id)
+            job = await self.video_store.get(video_id)
             if not job:
                 return self.create_error_response(
                     f"Video {video_id} not found",
@@ -591,7 +594,7 @@ class _VideoRoutesMixin:
         """
         try:
             # Check if video exists
-            job = await VIDEO_STORE.get(video_id)
+            job = await self.video_store.get(video_id)
             if not job:
                 return self.create_error_response(
                     f"Video {video_id} not found",
@@ -609,6 +612,9 @@ class _VideoRoutesMixin:
 
             # Cancel any in-flight generation task so it cannot recreate the
             # output file or pin memory after the delete returns.
+            cancel_generation = getattr(self.generator, "cancel_generation", None)
+            if cancel_generation is not None:
+                await cancel_generation(video_id)
             task = self.video_gen_tasks.pop(video_id, None)
             if task is not None and not task.done():
                 task.cancel()
@@ -640,7 +646,7 @@ class _VideoRoutesMixin:
                     os.remove(video_path)
 
             # Delete from store
-            success = await VIDEO_STORE.pop(video_id)
+            success = await self.video_store.pop(video_id)
 
             return JSONResponse(content={"deleted": success is not None})
 

@@ -33,6 +33,99 @@ The following abbreviated command syntax shows the commonly used arguments to st
 
 For the full syntax and argument descriptions, refer to :ref:`syntax`.
 
+Multiple HTTP Frontend Processes
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Use ``--num_http_workers`` to run multiple FastAPI frontend processes for one
+model instance. For example:
+
+.. code-block:: bash
+
+   trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
+       --backend pytorch \
+       --host 0.0.0.0 \
+       --port 8000 \
+       --num_http_workers 4
+
+With a value greater than one, ``trtllm-serve`` starts one generator service
+process that owns the LLM control plane, executor proxy, and shared serving
+state. GPU executor workers remain separate and own scheduling, model
+execution, and GPU state. ``trtllm-serve`` also starts the requested number of
+FastAPI frontend processes. The frontends share the public port using
+``SO_REUSEPORT`` and forward generator operations to the generator service
+over authenticated IPC.
+
+The process topology changes as follows:
+
+.. code-block:: text
+
+   Default (num_http_workers=1)
+
+      Clients
+         |
+         v
+      +----------------------------+
+      | One CPU/control process    |
+      | FastAPI frontend           |
+      | LLM and executor proxy     |
+      +-------------+--------------+
+                    |
+                    | executor IPC / RPC
+                    v
+      +----------------------------+
+      | GPU executor worker(s)     |
+      | Scheduler, model, KV cache |
+      +----------------------------+
+
+   Multiple frontends (num_http_workers=3)
+
+                        Clients
+                           |
+                           v
+                  Shared host and port
+                    (SO_REUSEPORT)
+                    /      |      \
+                   v       v       v
+             +---------+ +---------+ +---------+
+             | FastAPI | | FastAPI | | FastAPI |  frontend processes
+             | worker 0| | worker 1| | worker 2|
+             +----+----+ +----+----+ +----+----+
+                  \           |           /
+                   \          | IPC      /
+                    v         v         v
+                  +---------------------------+
+                  | One generator service     |
+                  | LLM and executor proxy    |
+                  | Shared serving state      |
+                  +-------------+-------------+
+                                |
+                                | executor IPC / RPC
+                                v
+                  +---------------------------+
+                  | GPU executor worker(s)    |
+                  | Scheduler and model       |
+                  | GPU state and KV cache    |
+                  +---------------------------+
+
+This topology can increase HTTP connection handling and request preprocessing
+capacity without loading another copy of the model. It does not create more
+model instances or increase the generator's batch capacity. TCP connections,
+including persistent connections, remain assigned to the frontend selected by
+the operating system.
+
+Generator-wide operations remain centralized in the generator service. This
+includes request cancellation, conversation and media state, iteration
+statistics, health status, and access to the executor-owned KV cache event
+stream. Consequently, all frontend processes expose one logical server rather
+than independent replicas. The processes are supervised as one unit; if the
+generator service, an executor worker, or any required frontend exits, the
+remaining processes are stopped.
+
+``--num_http_workers`` is a prototype option. For the main LLM server, it is
+supported with the PyTorch and AutoDeploy backends and is not supported by the
+gRPC server. It is also available for the embedding, multimodal encoder, and
+visual generation HTTP server modes.
+
 Inference Endpoints
 -------------------
 

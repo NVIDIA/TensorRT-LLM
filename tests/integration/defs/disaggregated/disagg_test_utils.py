@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -101,6 +101,8 @@ def _run_worker(
     Returns:
         ProcessWrapper: Wrapped subprocess
     """
+    worker_config = worker_config.copy()
+    num_http_workers = worker_config.pop("num_http_workers", 1)
     worker_config_path = os.path.join(work_dir, f"{role}_{port}_config.yaml")
     with open(worker_config_path, "w+") as f:
         yaml.dump(worker_config, f)
@@ -118,6 +120,8 @@ def _run_worker(
             "--server_role",
             "context" if role.startswith("ctx") else "generation",
         ]
+        if num_http_workers > 1:
+            cmd.extend(["--num_http_workers", str(num_http_workers)])
         if env is None:
             env = os.environ.copy()
         else:
