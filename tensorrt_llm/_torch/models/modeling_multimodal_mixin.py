@@ -312,20 +312,23 @@ class MultimodalModelMixin:
         the single tensor contract for both encoded and cached-only paths.
         """
         encoder_cache = self._get_multimodal_encoder_cache()
-        cache_hits = [False] * len(multimodal_params)
+        cache_misses = []
         if encoder_cache is not None:
-            cache_hits = [
-                self._attach_encoder_cache_hit(param, encoder_cache) for param in multimodal_params
-            ]
+            for param in multimodal_params:
+                if param.multimodal_data.get("multimodal_embedding") is not None:
+                    # The forward that attached this request-local embedding already populated the
+                    # persistent cache.
+                    continue
+                if not self._attach_encoder_cache_hit(param, encoder_cache):
+                    cache_misses.append(param)
 
         embeddings = get_multimodal_embeddings(
             encoder_forward_fn=self.encode_multimodal_inputs,
             multimodal_params=list(multimodal_params),
         )
         if encoder_cache is not None:
-            for param, cache_hit in zip(multimodal_params, cache_hits, strict=True):
-                if not cache_hit:
-                    self._write_encoder_cache_entries(param, encoder_cache)
+            for param in cache_misses:
+                self._write_encoder_cache_entries(param, encoder_cache)
 
         # Validate post-gather so cached-only paths (KV reuse, all-cached chunked prefill) are also
         # checked, not just paths that ran the encoder.

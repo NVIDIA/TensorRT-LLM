@@ -324,6 +324,54 @@ def test_encoder_cache_full_hit_does_not_rewrite_entries():
     put.assert_not_called()
 
 
+def test_encoder_cache_repeated_chunk_does_not_rewrite_entries():
+    model = CountingEncoderMultimodalModel(
+        make_embedding(hidden_size=4),
+        torch.tensor([7]),
+        encoder_cache_max_bytes=4096,
+    )
+    param = make_keyed_multimodal_param()
+    first_embeddings = model._get_or_encode_multimodal_embeddings([param])
+    cache = model._multimodal_encoder_cache
+    assert cache is not None
+    assert model.encode_calls == 1
+
+    with patch.object(cache, "put", wraps=cache.put) as put:
+        second_embeddings = model._get_or_encode_multimodal_embeddings([param])
+
+    # We should not have called the multimodal encoder forward a second time.
+    assert model.encode_calls == 1
+    torch.testing.assert_close(second_embeddings, first_embeddings)
+    put.assert_not_called()
+    assert cache.stats().replacements == 0
+
+
+def test_encoder_cache_mixed_attached_and_uncached_requests():
+    model = CountingEncoderMultimodalModel(
+        make_embedding(hidden_size=4),
+        torch.tensor([7]),
+        encoder_cache_max_bytes=4096,
+    )
+    local_embedding = torch.full((2, 4), 99.0)
+    attached = make_keyed_multimodal_param(local_embedding=local_embedding)
+    uncached = make_keyed_multimodal_param(
+        item_hashes=[[9] * 8],
+    )
+
+    embeddings = model._get_or_encode_multimodal_embeddings([attached, uncached])
+
+    assert model.encode_calls == 1
+    # Since we set `local_embedding` to be `99.0` above, if we had actually called
+    # `model.encode_multimodal_inputs` on it, we would have had `1.0` as the value instead for the
+    # first request's embeddings.
+    torch.testing.assert_close(embeddings[:2], local_embedding)
+    # For the 2nd request, it should be equal to the `model.encode_calls` above.
+    torch.testing.assert_close(embeddings[2:], torch.ones((2, 4)))
+    cache = model._multimodal_encoder_cache
+    assert cache is not None
+    assert len(cache) == 1
+
+
 def test_encoder_cache_partial_hit_logs_and_uses_encoder():
     model = CountingEncoderMultimodalModel(
         make_embedding(hidden_size=4),
@@ -437,8 +485,13 @@ def test_request_local_multimodal_embedding_wins_over_encoder_cache():
     model._get_or_encode_multimodal_embeddings([make_keyed_multimodal_param()])
     local_embedding = torch.full((2, 4), 99.0)
     chunk_param = make_keyed_multimodal_param(local_embedding=local_embedding)
+    cache = model._multimodal_encoder_cache
+    assert cache is not None
 
-    embeddings = model._get_or_encode_multimodal_embeddings([chunk_param])
+    with patch.object(cache, "put", wraps=cache.put) as put:
+        embeddings = model._get_or_encode_multimodal_embeddings([chunk_param])
 
     assert model.encode_calls == 1
     torch.testing.assert_close(embeddings, local_embedding)
+    put.assert_not_called()
+    assert cache.stats().replacements == 0

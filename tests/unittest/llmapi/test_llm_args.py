@@ -548,9 +548,11 @@ class TestMultimodalConfig:
             MultimodalConfig(encoder_cache_max_bytes=value)
 
     def test_torch_llm_args_with_encoder_side_stream_max_ahead(self):
-        args = TorchLlmArgs(
-            model=llama_model_path,
-            multimodal_config=MultimodalConfig(encoder_side_stream_max_ahead=2))
+        args = TorchLlmArgs(model=llama_model_path,
+                            multimodal_config=MultimodalConfig(
+                                encoder_side_stream_max_ahead=2,
+                                encoder_cache_max_bytes=0,
+                            ))
         assert args.multimodal_config.encoder_side_stream_max_ahead == 2
 
     def test_torch_llm_args_with_multimodal_video_pruning_rate(self):
@@ -590,6 +592,7 @@ class TestMultimodalConfig:
             model=llama_model_path,
             multimodal_config={
                 "encoder_side_stream_max_ahead": 2,
+                "encoder_cache_max_bytes": 0,
                 "video_pruning_rate": 0.5,
             },
         )
@@ -607,7 +610,15 @@ class TestMultimodalConfig:
                         }
                     },
                     "encoder_side_stream_max_ahead": 1,
+                    "encoder_cache_max_bytes": 0,
                 },
+            )
+
+    def test_encoder_cache_and_side_stream_max_ahead_are_exclusive(self):
+        with pytest.raises(ValidationError, match="mutually exclusive"):
+            MultimodalConfig(
+                encoder_cache_max_bytes="1MiB",
+                encoder_side_stream_max_ahead=1,
             )
 
 
@@ -1020,9 +1031,13 @@ class TestExplicitCliKeysPrecedence:
 
     def test_multimodal_config_yaml_siblings_preserved(self):
         base = {
-            "model": "dummy",
+            "model":
+            "dummy",
             "multimodal_config":
-            MultimodalConfig(encoder_side_stream_max_ahead=2),
+            MultimodalConfig(
+                encoder_side_stream_max_ahead=2,
+                encoder_cache_max_bytes=0,
+            ),
         }
         yaml_dict = {
             "multimodal_config": {
@@ -1036,9 +1051,13 @@ class TestExplicitCliKeysPrecedence:
 
     def test_multimodal_config_null_yaml_preserves_base_config(self):
         base = {
-            "model": "dummy",
+            "model":
+            "dummy",
             "multimodal_config":
-            MultimodalConfig(encoder_side_stream_max_ahead=2),
+            MultimodalConfig(
+                encoder_side_stream_max_ahead=2,
+                encoder_cache_max_bytes=0,
+            ),
         }
         yaml_dict = {"multimodal_config": None}
         merged = update_llm_args_with_extra_dict(base, yaml_dict)
