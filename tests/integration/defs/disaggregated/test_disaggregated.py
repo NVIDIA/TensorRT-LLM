@@ -861,9 +861,9 @@ def run_disaggregated_test(example_dir,
                 assert worker.log_path is not None
                 with open(worker.log_path, 'r', errors='replace') as log_file:
                     context_worker_logs.append(log_file.read())
-            assert any(expected_context_worker_log in log
+            assert all(expected_context_worker_log in log
                        for log in context_worker_logs), \
-                f"Expected context-worker log not found: {expected_context_worker_log!r}"
+                f"Expected context-worker log not found on every worker: {expected_context_worker_log!r}"
     finally:
         terminate(*ctx_workers, *gen_workers, disagg_server)
         shutil.rmtree(work_dir, ignore_errors=True)
@@ -1594,6 +1594,27 @@ def test_disaggregated_ctxpp4_gentp4(disaggregated_test_root, llm_venv,
         cwd=llm_venv.get_working_directory(),
         expected_context_worker_log=
         "Enabled worker-published context-transfer consensus")
+
+
+@pytest.mark.skip_less_device(8)
+@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
+                         indirect=True)
+def test_disaggregated_ctxpp4_gentp4_diagnostic_local_completion(
+        disaggregated_test_root, llm_venv, disaggregated_example_root,
+        llama_model_root):
+    setup_model_symlink(llm_venv, llama_model_root,
+                        "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+    env = llm_venv._new_env.copy()
+    env["TRTLLM_DIAGNOSTIC_EARLY_LOCAL_CONTEXT_COMPLETION"] = "1"
+    run_disaggregated_test(
+        disaggregated_example_root,
+        "ctxpp4_gentp4",
+        env=env,
+        model_path=llama_model_root,
+        cwd=llm_venv.get_working_directory(),
+        expected_context_worker_log=
+        "DIAGNOSTIC ONLY: reporting successful local context-transfer completion"
+    )
 
 
 @skip_no_hopper

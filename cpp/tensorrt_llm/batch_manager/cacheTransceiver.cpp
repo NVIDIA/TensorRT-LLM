@@ -73,6 +73,7 @@ using RequestIdType = LlmRequest::RequestIdType;
 
 constexpr int kTransferFuturePollIntervalMs = 10;
 constexpr int kContextConsensusPollIntervalMs = 1;
+constexpr char const* kDiagnosticEarlyLocalContextCompletionEnv = "TRTLLM_DIAGNOSTIC_EARLY_LOCAL_CONTEXT_COMPLETION";
 
 // Finite status checks are scheduler polls, not terminal deadlines. Pure polls
 // use short slices; calls that ask for at least one completion keep bounded
@@ -486,8 +487,23 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
         // throws, member unwinding still sends this rank's ordered close marker to its peers.
         if (useWorkerPublishedContextConsensus)
         {
+            auto const localDiagnosticMode
+                = static_cast<std::uint64_t>(common::getBoolEnv(kDiagnosticEarlyLocalContextCompletionEnv));
+            std::vector<std::uint64_t> diagnosticModes(static_cast<std::size_t>(mGroupPipeParaComm->getSize()));
+            mGroupPipeParaComm->allgather(&localDiagnosticMode, diagnosticModes.data(), 1, mpi::MpiType::kUINT64);
+            TLLM_CHECK_WITH_INFO(std::all_of(diagnosticModes.begin(), diagnosticModes.end(),
+                                     [&](std::uint64_t const mode) { return mode == localDiagnosticMode; }),
+                "%s must be set consistently on every context pipeline rank.",
+                kDiagnosticEarlyLocalContextCompletionEnv);
+            mDiagnosticEarlyLocalContextCompletion = localDiagnosticMode != 0;
             mContextTransferVoteMailbox = std::make_unique<ContextTransferVoteMailbox>(mGroupPipeParaComm);
         }
+    }
+    if (mDiagnosticEarlyLocalContextCompletion)
+    {
+        TLLM_LOG_WARNING(
+            "DIAGNOSTIC ONLY: reporting successful local context-transfer completion before PP consensus. "
+            "Any local or late global failure is fatal; do not use this mode in production.");
     }
     bool isMLA = attentionType == executor::kv_cache::CacheState::AttentionType::kMLA;
     std::optional<size_t> maxNumTokens = mCacheTransceiverConfig.value().getMaxTokensInBuffer();
@@ -680,6 +696,15 @@ void CacheTransceiver::setContextState(LlmRequest* llmRequest)
 void CacheTransceiver::respondAndSendAsync(std::shared_ptr<LlmRequest> llmRequest)
 {
     TLLM_CHECK(llmRequest && llmRequest->isContextOnlyRequest());
+    if (mDiagnosticEarlyLocalContextCompletion)
+    {
+        auto const requestId = llmRequest->mRequestId;
+        TLLM_CHECK_WITH_INFO(mSenderRequestsAwaitingConsensus.find(requestId) == mSenderRequestsAwaitingConsensus.end()
+                && mDiagnosticLocallyReportedSenderRequestIds.find(requestId)
+                    == mDiagnosticLocallyReportedSenderRequestIds.end(),
+            "DIAGNOSTIC ONLY: context request ID %zu was reused before its prior PP consensus retired.",
+            static_cast<std::size_t>(requestId));
+    }
     llmRequest->setState(LlmRequestState::kDISAGG_CONTEXT_TRANS_IN_PROGRESS);
     // If context phase params is already set, it means that the KV cache
     // transfer is already in progress.
@@ -1017,6 +1042,7 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
         progressDeadline = std::chrono::steady_clock::now() + futureWaitInterval;
     }
     auto toProcess = consensusBackend.selectReadyRequests(mSenderFutures);
+    RequestStatuses requestsStatus;
 
     // Preserve insertion order when a caller asks this poll to make progress on at least N requests.
     for (auto it = mSenderFutures.begin();
@@ -1110,9 +1136,23 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
         auto const failed = consensusBackend.resolveLocalFailure(requestId, observedFailure);
         recordLocalTransferOutcome(requestId, std::move(completedRequest), failed, mCompletedSenderRequestIds,
             mFailedSenderRequestIds, mSenderRequestsAwaitingConsensus);
+        if (mDiagnosticEarlyLocalContextCompletion)
+        {
+            TLLM_CHECK_WITH_INFO(!failed,
+                "DIAGNOSTIC ONLY: context request %zu failed locally; the early-release experiment supports "
+                "successful transfers only.",
+                static_cast<std::size_t>(requestId));
+            TLLM_CHECK_WITH_INFO(mDiagnosticLocallyReportedSenderRequestIds.insert(requestId).second,
+                "Context request %zu was reported locally more than once in diagnostic mode.",
+                static_cast<std::size_t>(requestId));
+            requestsStatus.completedRequestIds.insert(requestId);
+            if (markComplete)
+            {
+                mSenderRequestsAwaitingConsensus.at(requestId)->setState(LlmRequestState::kDISAGG_CONTEXT_COMPLETE);
+            }
+        }
     }
 
-    RequestStatuses requestsStatus;
     auto commitConsensusOutcome = [&](TransferConsensusOutcome const& outcome)
     {
         for (auto const requestId : sortedRequestIds(outcome.failedRequestIds))
@@ -1125,6 +1165,10 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
                     static_cast<std::size_t>(requestId));
                 continue;
             }
+            TLLM_CHECK_WITH_INFO(mDiagnosticLocallyReportedSenderRequestIds.erase(requestId) == 0,
+                "DIAGNOSTIC ONLY: context request %zu failed PP consensus after local completion was already "
+                "reported; the early-release experiment is invalid.",
+                static_cast<std::size_t>(requestId));
             requestIt->second->setState(LlmRequestState::kDISAGG_TRANS_ERROR);
             requestsStatus.errorRequestIds.insert(requestId);
             mTimedOutSenderIds.erase(requestId);
@@ -1142,10 +1186,14 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
                     static_cast<std::size_t>(requestId));
                 continue;
             }
-            requestsStatus.completedRequestIds.insert(requestId);
-            if (markComplete)
+            auto const wasReportedLocally = mDiagnosticLocallyReportedSenderRequestIds.erase(requestId) > 0;
+            if (!wasReportedLocally)
             {
-                requestIt->second->setState(LlmRequestState::kDISAGG_CONTEXT_COMPLETE);
+                requestsStatus.completedRequestIds.insert(requestId);
+                if (markComplete)
+                {
+                    requestIt->second->setState(LlmRequestState::kDISAGG_CONTEXT_COMPLETE);
+                }
             }
             mTimedOutSenderIds.erase(requestId);
             mCancelRequestedSenderIds.erase(requestId);
@@ -1196,7 +1244,16 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
     // Collective consensus must be entered exactly once per status call. The mailbox can make independent progress
     // and may be polled repeatedly without requiring a matching peer scheduler call.
     pollAndCommitConsensus();
-    if (consensusBackend.isWorkerPublished())
+    if (mDiagnosticEarlyLocalContextCompletion && !mDiagnosticObservedConsensusGap
+        && !mDiagnosticLocallyReportedSenderRequestIds.empty())
+    {
+        TLLM_LOG_WARNING(
+            "DIAGNOSTIC OBSERVED: %zu locally completed context transfer(s) will be released while still awaiting "
+            "PP consensus.",
+            mDiagnosticLocallyReportedSenderRequestIds.size());
+        mDiagnosticObservedConsensusGap = true;
+    }
+    if (consensusBackend.isWorkerPublished() && !mDiagnosticEarlyLocalContextCompletion)
     {
         auto const committedCount
             = [&]() { return requestsStatus.completedRequestIds.size() + requestsStatus.errorRequestIds.size(); };
