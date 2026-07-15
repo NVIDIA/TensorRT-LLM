@@ -1426,7 +1426,10 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                         "--s3-upload-path=${uploadPath}/${stageName}",
                     ]
                     if (ENABLE_S3_ECHO_STDOUT) {
-                        extraArgs += ["--s3-echo-stdout"]
+                        extraArgs += [
+                            "--s3-echo-stdout",
+                            "--s3-capture-mode=timestamped",
+                        ]
                     }
                 }
                 def pytestCommand = getPytestBaseCommandLine(
@@ -3922,7 +3925,10 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                 "--s3-upload-path=${uploadPath}/${stageName}",
             ]
             if (ENABLE_S3_ECHO_STDOUT) {
-                extraArgs += ["--s3-echo-stdout"]
+                extraArgs += [
+                    "--s3-echo-stdout",
+                    "--s3-capture-mode=timestamped",
+                ]
             }
         }
         def pytestCommand = getPytestBaseCommandLine(

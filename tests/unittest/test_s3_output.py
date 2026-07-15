@@ -13,12 +13,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import io
 import logging
+import os
 import subprocess
 import sys
 
 import pytest
-from test_common.s3_output import FDRedirector, UploadLogPlugin
+from test_common.s3_output import (
+    FDRedirector,
+    FileSlice,
+    FileSliceReader,
+    SessionCapture,
+    UploadLogPlugin,
+)
 
 
 class Report:
@@ -39,12 +47,16 @@ class CaptureContext:
 class RecordingS3Client:
     def __init__(self):
         self.uploads = []
+        self.fileobj_uploads = []
 
     def upload_file(self, filepath, bucket, object_key, ExtraArgs=None):
         self.uploads.append((filepath, bucket, object_key, ExtraArgs))
 
+    def upload_fileobj(self, fileobj, bucket, object_key, ExtraArgs=None):
+        self.fileobj_uploads.append((fileobj.read(), bucket, object_key, ExtraArgs))
 
-def make_plugin(tmp_path, inline_output_max_bytes):
+
+def make_plugin(tmp_path, inline_output_max_bytes, capture_mode="timestamped"):
     return UploadLogPlugin(
         endpoint_url="https://example.com",
         aws_access_key_id="user",
@@ -53,6 +65,7 @@ def make_plugin(tmp_path, inline_output_max_bytes):
         upload_path="logs",
         output_path=str(tmp_path),
         skip_upload=True,
+        capture_mode=capture_mode,
         inline_output_max_bytes=inline_output_max_bytes,
     )
 
@@ -123,6 +136,23 @@ def test_teardown_fallback_warns_when_capture_is_still_active(tmp_path, caplog):
 
     with pytest.raises(StopIteration):
         next(hook)
+
+
+def test_session_capture_closes_after_teardown(tmp_path):
+    nodeid = "test_module.py::test_case"
+    plugin = make_plugin(tmp_path, inline_output_max_bytes=256, capture_mode="session")
+    capture = CaptureContext()
+    plugin._active_capture[nodeid] = {"stdout_redir": capture}
+    item = type("Item", (), {"nodeid": nodeid})()
+
+    hook = plugin.pytest_runtest_teardown(item, nextitem=None)
+    next(hook)
+    assert not capture.closed
+
+    with pytest.raises(StopIteration):
+        next(hook)
+    assert capture.closed
+    assert nodeid not in plugin._active_capture
 
 
 def test_small_stdout_is_inlined_without_upload(tmp_path):
@@ -207,6 +237,80 @@ def test_deferred_stdout_is_removed_after_upload_finishes(tmp_path):
     assert len(plugin.s3.uploads) == 1
     assert plugin._deferred_uploads == []
     assert not (tmp_path / test_name).exists()
+
+
+def test_file_slice_upload_reads_only_test_range(tmp_path):
+    test_name = "test-slice"
+    spool = tmp_path / "stdout-spool.log"
+    prefix = b"previous test\n"
+    content = b"parent\nchild\nparent again\n"
+    spool.write_bytes(prefix + content + b"next test\n")
+    plugin = make_plugin(tmp_path, inline_output_max_bytes=3, capture_mode="session")
+    plugin.skip_upload = False
+    plugin.s3 = RecordingS3Client()
+    plugin._captured_slices[(test_name, "stdout.log")] = FileSlice(
+        str(spool), len(prefix), len(content)
+    )
+    report = Report()
+
+    plugin.upload_and_report(report, test_name, "stdout.log", "Captured stdout")
+
+    assert plugin.s3.fileobj_uploads == [
+        (
+            content,
+            "bucket",
+            "logs/test-slice/stdout.log",
+            {"ContentType": "text/plain"},
+        )
+    ]
+    assert "uploaded to" in report.sections[0][1]
+
+
+def test_file_slice_reader_supports_upload_size_probe(tmp_path):
+    spool = tmp_path / "stdout-spool.log"
+    spool.write_bytes(b"prefix\ntest output\nsuffix\n")
+    file_slice = FileSlice(str(spool), len(b"prefix\n"), len(b"test output\n"))
+
+    with io.BufferedReader(FileSliceReader(file_slice)) as source_file:
+        assert source_file.tell() == 0
+        assert source_file.seek(0, os.SEEK_END) == file_slice.size
+        assert source_file.tell() == file_slice.size
+        assert source_file.seek(0) == 0
+        assert source_file.read() == b"test output\n"
+
+
+def test_session_capture_preserves_parent_and_existing_child_stdout_order(tmp_path):
+    capture = SessionCapture(str(tmp_path))
+    capture.start()
+    child = None
+    try:
+        child = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                "import os, sys; sys.stdin.buffer.read(1); "
+                "os.write(1, b'child stdout\\n'); os.write(2, b'child stderr\\n')",
+            ],
+            stdin=subprocess.PIPE,
+        )
+        offsets = capture.snapshot()
+        os.write(1, b"parent before\n")
+        child.stdin.write(b"x")
+        child.stdin.close()
+        assert child.wait(timeout=10) == 0
+        os.write(1, b"parent after\n")
+        slices = capture.slices_since(offsets)
+    finally:
+        if child is not None and child.poll() is None:
+            child.kill()
+            child.wait()
+        capture.stop()
+
+    with io.BufferedReader(FileSliceReader(slices["stdout.log"])) as stdout_file:
+        assert stdout_file.read() == b"parent before\nchild stdout\nparent after\n"
+    with io.BufferedReader(FileSliceReader(slices["stderr.log"])) as stderr_file:
+        assert stderr_file.read() == b"child stderr\n"
+    capture.remove_files()
 
 
 def test_small_log_file_is_not_inlined(tmp_path):
