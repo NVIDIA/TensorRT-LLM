@@ -137,6 +137,68 @@ def get_latest_license_preapproved_container_deps(scan_type: str):
     return data_source["nested_preapproved_deps"]
 
 
+def get_triaged_deps(scan_type: str, branch: str) -> dict:
+    """Return {package_name: ticket_url} for all packages that have a triage_record."""
+    try:
+        resp = ES_CLIENT.search(
+            index=ES_INDEX_BASE + "-*",
+            body={
+                "size": 10000,
+                "query": {
+                    "bool": {
+                        "filter": [
+                            {"term": {"s_type": "triage_record"}},
+                            {"term": {"s_scan_type": scan_type}},
+                            {"term": {"s_branch": branch}},
+                        ]
+                    }
+                },
+                "_source": ["s_package_name", "s_ticket_url"],
+            },
+        )
+    except Exception as exc:
+        print(f"Failed to query triaged deps for {scan_type}: {exc}", file=sys.stderr)
+        return {}
+    result = {}
+    for hit in resp["hits"]["hits"]:
+        src = hit["_source"]
+        pkg = src.get("s_package_name")
+        ticket = src.get("s_ticket_url")
+        if pkg and ticket:
+            result[pkg] = ticket
+    return result
+
+
+def save_triage_records(
+    post_url: str,
+    scan_type: str,
+    branch: str,
+    ts_created: int,
+    records: list,
+) -> None:
+    """Persist (package_name, ticket_url) triage records so future runs can skip re-triage.
+
+    Each record dict must have 'package_name' and 'ticket_url' keys.
+    """
+    docs = [
+        {
+            "s_type": "triage_record",
+            "s_scan_type": scan_type,
+            "s_branch": branch,
+            "ts_created": ts_created,
+            "s_package_name": rec["package_name"],
+            "s_ticket_url": rec["ticket_url"],
+        }
+        for rec in records
+        if rec.get("package_name") and rec.get("ticket_url")
+    ]
+    if not docs:
+        return
+    _, errors = es_post(post_url, docs)
+    if errors:
+        print(f"Failed to save some triage records for {scan_type}", file=sys.stderr)
+
+
 def get_dashboard_url(build_number, branch):
     starttime = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
     base = (

@@ -9,7 +9,7 @@ from submit_report import (
     submit_source_code_licenses,
     submit_source_code_vulns,
 )
-from utils.es import get_dashboard_url, get_last_scan_results
+from utils.es import get_dashboard_url
 from utils.slack import post_slack_msg
 
 # this json file will be generated from pulse in pipeline scanning
@@ -65,7 +65,6 @@ SUBMIT_KWARG = {
         "ref": args.ref,
     },
     "start_datetime": datetime.now(timezone.utc),
-    "only_report_new_risk": args.scan_mode == "monitor",
 }
 
 
@@ -75,19 +74,15 @@ def process_result():
     count_container_licenses = 0
 
     if not args.skip_source_code:
-        last_source_vulns = get_last_scan_results("source_code_vulnerability", args.ref)
         source_vulns = submit_source_code_vulns(
             os.path.join(args.report_directory, "source_code/vulns.json"),
-            last_source_vulns,
             **SUBMIT_KWARG,
         )
         if len(source_vulns) > 0:
             RISKY_DEPENDENCIES.append(f"{len(source_vulns)} new source code vulnerability")
 
-        last_source_licenses = get_last_scan_results("source_code_license", args.ref)
         source_licenses = submit_source_code_licenses(
             os.path.join(args.report_directory, "source_code/sbom.json"),
-            last_source_licenses,
             **SUBMIT_KWARG,
             license_check_token=LICENSE_CHECK_TOKEN,
         )
@@ -100,31 +95,26 @@ def process_result():
                 )
 
     if not args.skip_container:
-        last_container_vulns = get_last_scan_results("container_vulnerability", args.ref)
         amd64_container_vulns = submit_container_vulns(
             os.path.join(args.report_directory, "release_amd64/vulns.json"),
             os.path.join(args.report_directory, "base_amd64/vulns.json"),
             "amd64",
-            last_container_vulns,
             **SUBMIT_KWARG,
         )
         arm64_container_vulns = submit_container_vulns(
             os.path.join(args.report_directory, "release_arm64/vulns.json"),
             os.path.join(args.report_directory, "base_arm64/vulns.json"),
             "arm64",
-            last_container_vulns,
             **SUBMIT_KWARG,
         )
-        count_container_vulns = len(amd64_container_vulns + arm64_container_vulns)
+        count_container_vulns = len(amd64_container_vulns) + len(arm64_container_vulns)
         if count_container_vulns > 0:
             RISKY_DEPENDENCIES.append(f"{count_container_vulns} new container vulnerability")
 
-        last_container_licenses = get_last_scan_results("container_license", args.ref)
         amd64_container_licenses = submit_container_licenses(
             os.path.join(args.report_directory, "release_amd64/licenses.json"),
             os.path.join(args.report_directory, "base_amd64/licenses.json"),
             "amd64",
-            last_container_licenses,
             **SUBMIT_KWARG,
             license_check_token=LICENSE_CHECK_TOKEN,
         )
@@ -132,11 +122,10 @@ def process_result():
             os.path.join(args.report_directory, "release_arm64/licenses.json"),
             os.path.join(args.report_directory, "base_arm64/licenses.json"),
             "arm64",
-            last_container_licenses,
             **SUBMIT_KWARG,
             license_check_token=LICENSE_CHECK_TOKEN,
         )
-        count_container_licenses = len(amd64_container_licenses + arm64_container_licenses)
+        count_container_licenses = len(amd64_container_licenses) + len(arm64_container_licenses)
         if count_container_licenses > 0:
             RISKY_DEPENDENCIES.append(
                 f"{count_container_licenses} new container non-permissive license"
