@@ -146,6 +146,56 @@ class MpiSession(abc.ABC):
         fut.set_result(None)
         killer.join()
 
+    def abandon(self):
+        """Tear the session down without waiting on a dead worker world.
+
+        Called instead of ``shutdown()`` once the workers are known dead
+        (e.g. killed by ``MPI_Abort`` from the hang detector, SIGKILL, or
+        the OOM killer): joining anything owned by such a session can block
+        forever. The default is a non-waiting shutdown; subclasses extend
+        it where extra unblocking is needed.
+        """
+        self.shutdown(wait=False)
+
+
+def _abandon_mpi_pool_threads(mpi_pool) -> None:
+    """Let interpreter exit proceed despite a wedged pool manager thread.
+
+    After the worker world dies abruptly, the ``MPIPoolExecutor``'s manager
+    thread stays blocked in an MPI call forever. Two independent mechanisms
+    then hang process exit even after a non-waiting shutdown: mpi4py's exit
+    hook joins every manager thread it registered, and CPython's
+    ``threading._shutdown`` joins every non-daemon thread. Deregister the
+    wedged thread from both so exit can proceed (the thread dies with the
+    process).
+
+    Best-effort by design: the names are private to mpi4py (``_lib`` in
+    3.x, ``_core`` in 4.x; both use ``THREADS_QUEUES``) and CPython
+    (``threading._shutdown_locks``, Python 3.9-3.12). Where a name is
+    absent (e.g. Python 3.13+), that mechanism is left alone and exit may
+    still block on it.
+    """
+    thread = getattr(getattr(mpi_pool, '_pool', None), 'thread', None)
+    if thread is None:
+        return
+    # mpi4py's own exit hook (joins all registered manager threads).
+    for mod_name in ('mpi4py.futures._lib', 'mpi4py.futures._core'):
+        mod = sys.modules.get(mod_name)
+        registry = getattr(mod, 'THREADS_QUEUES', None) if mod else None
+        if registry is not None:
+            try:
+                registry.pop(thread, None)
+            except Exception as e:  # noqa: BLE001 - best-effort cleanup
+                logger.debug(f"THREADS_QUEUES cleanup failed (ignored): {e!r}")
+    # CPython's non-daemon thread join at interpreter shutdown.
+    tstate_lock = getattr(thread, '_tstate_lock', None)
+    shutdown_locks = getattr(threading, '_shutdown_locks', None)
+    if tstate_lock is not None and shutdown_locks is not None:
+        try:
+            shutdown_locks.discard(tstate_lock)
+        except Exception as e:  # noqa: BLE001 - best-effort cleanup
+            logger.debug(f"_shutdown_locks cleanup failed (ignored): {e!r}")
+
 
 class MpiPoolSession(MpiSession):
 
@@ -177,6 +227,11 @@ class MpiPoolSession(MpiSession):
         if self.mpi_pool is not None:
             self.mpi_pool.shutdown(wait=wait)
             self.mpi_pool = None
+
+    def abandon(self):
+        if self.mpi_pool is not None:
+            _abandon_mpi_pool_threads(self.mpi_pool)
+        self.shutdown(wait=False)
 
     def abort(self):
         self.get_comm().Abort(1)

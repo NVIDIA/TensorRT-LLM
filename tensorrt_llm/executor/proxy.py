@@ -690,10 +690,13 @@ class GenerationExecutorProxy(GenerationExecutor):
 
         self.workers_started = False
         if self._owns_mpi_session:
-            # Joining a pool whose workers were killed abruptly blocks
-            # forever; when the engine is dead, shut the session down without
-            # waiting.
-            self.mpi_session.shutdown(wait=not self._engine_dead)
+            if self._engine_dead:
+                # Joining anything owned by an abruptly-killed worker world
+                # blocks forever (the pool join, and later interpreter exit
+                # on the wedged manager thread): abandon instead of joining.
+                self.mpi_session.abandon()
+            else:
+                self.mpi_session.shutdown()
 
         # Process the errors in-case error during shutting down the threads
         self._handle_background_error()

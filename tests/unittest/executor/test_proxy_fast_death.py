@@ -392,8 +392,9 @@ def test_shutdown_does_not_block_on_dead_engine():
     # The dispatcher join is bounded (daemon thread is leaked, not awaited).
     dispatcher.stop.assert_called_once()
     dispatcher.join.assert_called_once_with(timeout=5.0)
-    # The dead pool is not joined.
-    proxy.mpi_session.shutdown.assert_called_once_with(wait=False)
+    # The dead pool is not joined; the session is abandoned instead.
+    proxy.mpi_session.abandon.assert_called_once_with()
+    proxy.mpi_session.shutdown.assert_not_called()
     assert proxy.workers_started is False
 
 
@@ -411,7 +412,8 @@ def test_shutdown_keeps_blocking_semantics_when_engine_alive():
     proxy.shutdown()
 
     dispatcher.join.assert_called_once_with(timeout=None)
-    proxy.mpi_session.shutdown.assert_called_once_with(wait=True)
+    proxy.mpi_session.shutdown.assert_called_once_with()
+    proxy.mpi_session.abandon.assert_not_called()
     assert proxy.workers_started is False
 
 
@@ -424,3 +426,53 @@ def test_shutdown_does_not_shut_down_external_session():
     proxy.shutdown()
 
     proxy.mpi_session.shutdown.assert_not_called()
+    proxy.mpi_session.abandon.assert_not_called()
+
+
+def test_abandon_mpi_pool_threads_unblocks_interpreter_exit():
+    """Both exit-join mechanisms release a wedged pool manager thread.
+
+    The thread is deregistered from mpi4py's THREADS_QUEUES and CPython's
+    _shutdown_locks, so process exit can proceed without joining it.
+    """
+    import sys as _sys
+    import threading as _threading
+    import types as _types
+
+    from tensorrt_llm.llmapi.mpi_session import _abandon_mpi_pool_threads
+
+    release = _threading.Event()
+    wedged = _threading.Thread(target=release.wait, name="fake_manager")
+    wedged.daemon = False
+    wedged.start()
+    try:
+        # Fake mpi4py registry module, as mpi4py would have registered it.
+        fake_mod = _types.ModuleType("mpi4py.futures._lib")
+        fake_mod.THREADS_QUEUES = {wedged: object()}
+        prev = _sys.modules.get("mpi4py.futures._lib")
+        _sys.modules["mpi4py.futures._lib"] = fake_mod
+        try:
+            fake_pool = _Mock()
+            fake_pool._pool.thread = wedged
+
+            _abandon_mpi_pool_threads(fake_pool)
+
+            assert wedged not in fake_mod.THREADS_QUEUES
+            shutdown_locks = getattr(_threading, "_shutdown_locks", None)
+            if shutdown_locks is not None:  # CPython 3.9-3.12
+                assert wedged._tstate_lock not in shutdown_locks
+        finally:
+            if prev is None:
+                del _sys.modules["mpi4py.futures._lib"]
+            else:
+                _sys.modules["mpi4py.futures._lib"] = prev
+    finally:
+        release.set()
+        wedged.join(timeout=5)
+
+
+def test_abandon_mpi_pool_threads_tolerates_missing_pool():
+    from tensorrt_llm.llmapi.mpi_session import _abandon_mpi_pool_threads
+
+    _abandon_mpi_pool_threads(None)
+    _abandon_mpi_pool_threads(object())  # no _pool attribute
