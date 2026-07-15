@@ -3371,6 +3371,7 @@ class PyTorchModelEngine(ModelEngine):
             multimodal_params = MultimodalParams(
                 multimodal_data=request.py_multimodal_data,
                 multimodal_runtime=py_multimodal_runtime,
+                mm_item_order=getattr(request, "py_mm_item_order", None),
                 input_ids_start_offset=context_start_idx)
             # Transfer any cross-iter MM encoder prefetch event stamped on the request onto the
             # freshly-built MultimodalParams. The downstream consume site reads it from the wrapper,
@@ -4300,6 +4301,7 @@ class PyTorchModelEngine(ModelEngine):
             if request.py_multimodal_data is not None:
                 multimodal_params = MultimodalParams(
                     multimodal_data=request.py_multimodal_data,
+                    mm_item_order=getattr(request, "py_mm_item_order", None),
                     input_ids_start_offset=context_start_idx)
                 multimodal_params.to_device("multimodal_data",
                                             "cuda",
