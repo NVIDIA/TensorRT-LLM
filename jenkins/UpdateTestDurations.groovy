@@ -95,7 +95,7 @@ pipeline {
         string(
             name: 'DAYS',
             defaultValue: '7',
-            description: 'Number of days to look back in OpenSearch for test durations (e.g. 3, 7, 14). '
+            description: 'Number of days to look back in OpenSearch for test durations (e.g. 3, 7, 14). ')
         string(
             name: 'SOURCE_REPO',
             defaultValue: 'NVIDIA/TensorRT-LLM',
