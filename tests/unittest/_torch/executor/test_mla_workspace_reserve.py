@@ -25,7 +25,7 @@ from unittest.mock import Mock
 
 import pytest
 
-from tensorrt_llm._torch.pyexecutor._util import get_mla_context_workspace_bytes_per_token
+from tensorrt_llm._torch.pyexecutor._util import get_attention_workspace_bytes_per_token
 from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 
 
@@ -104,6 +104,9 @@ def test_no_cap_returns_untouched():
 
 
 def test_workspace_bytes_zero_for_non_mla_model():
-    # No kv_lora_rank on the config -> not MLA -> 0 (early return, no binding call needed).
-    model_config = SimpleNamespace(pretrained_config=SimpleNamespace(), quant_config=None)
-    assert get_mla_context_workspace_bytes_per_token(model_config, Mock()) == 0
+    # No kv_lora_rank on the config -> TRTLLM backend declares no reservation -> 0
+    # (early return, no binding call needed). Exercises the full resolve-backend path.
+    model_config = SimpleNamespace(
+        pretrained_config=SimpleNamespace(), quant_config=None, attn_backend="TRTLLM"
+    )
+    assert get_attention_workspace_bytes_per_token(model_config, Mock()) == 0

@@ -1078,6 +1078,19 @@ class AttentionBackend(Generic[TMetadata]):
     def support_multi_item_scoring(cls) -> bool:
         return False
 
+    @classmethod
+    def runtime_workspace_bytes_per_token(cls, model_config, mapping) -> int:
+        """Per-token bytes to reserve for a workspace this backend stages whose size scales with a
+        runtime quantity the KV-cache estimator does not drive to its serving maximum while profiling
+        (e.g. ``total_kv_len``, inflated by KV-cache reuse). Default ``0`` -- correct for every backend
+        except fp8 context-MLA today.
+
+        A non-zero rate is reserved from the KV budget by the estimator and its driving sum is capped by
+        the scheduler, so the workspace can never exceed the reservation. Keep it identical to the
+        runtime allocation's per-token cost. See ``ATTENTION_DEVELOPER_GUIDE.md`` §2.3.
+        """
+        return 0
+
     def create_output(self, q: torch.Tensor, **kwargs) -> List[torch.Tensor]:
         """
         Create the output tensors for the attention operation.

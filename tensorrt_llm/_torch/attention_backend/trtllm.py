@@ -1282,6 +1282,46 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             )
         self.create_fmha_libs()
 
+    @classmethod
+    def runtime_workspace_bytes_per_token(cls, model_config, mapping) -> int:
+        """fp8 context-MLA stages a K/V dequant workspace sized by the summed attended KV length
+        (``total_kv_len``) across the context requests in a forward step, not by ``max_num_tokens`` -- so
+        KV-cache reuse can push it far past the profiling floor. ``0`` for non-MLA, non-fp8-KV, or sparse
+        MLA (which reads K/V straight from the paged cache and stages no dequant buffer).
+
+        The per-token cost is the single source of truth in C++
+        (``AttentionOp::contextMlaWorkspaceBytesPerToken``, exposed via nanobind), so it cannot drift
+        from the runtime allocation.
+        """
+        config = model_config.pretrained_config
+        is_mla = getattr(config, "kv_lora_rank", None) is not None
+        if not is_mla:
+            return 0
+        quant_config = model_config.quant_config
+        fp8_context_mla = (quant_config is not None
+                           and quant_config.quant_mode.has_fp8_kv_cache()
+                           and get_sm_version() in (90, 100, 103, 120))
+        if not fp8_context_mla:
+            return 0
+        # With attention DP each rank runs the full head set (attention is not TP-sharded); otherwise
+        # the heads are sharded across TP. Mirror the runtime ``mNumAttnHeads``.
+        attn_tp = 1 if mapping.enable_attention_dp else mapping.tp_size
+        num_attn_heads = config.num_attention_heads // attn_tp
+        sparse_mla = getattr(model_config, "sparse_attention_config",
+                             None) is not None
+        from tensorrt_llm.bindings.internal import thop
+        return int(
+            thop.get_context_mla_workspace_bytes_per_token(
+                num_attn_heads=num_attn_heads,
+                qk_rope_head_dim=config.qk_rope_head_dim,
+                qk_nope_head_dim=config.qk_nope_head_dim,
+                v_head_dim=config.v_head_dim,
+                fp8_context_mla=fp8_context_mla,
+                # Paged context MLA always uses separate Q/KV input; the term is otherwise gated to 0.
+                separate_q_and_kv_input=True,
+                sparse_mla=sparse_mla,
+            ))
+
     def get_local_layer_idx(self, metadata: TrtllmAttentionMetadata) -> int:
         if self.local_layer_idx is not None:
             return self.local_layer_idx

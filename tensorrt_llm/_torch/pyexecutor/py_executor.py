@@ -5117,9 +5117,9 @@ class PyExecutor:
         if cap != "unset":
             return cap
         # Lazy import: _util imports py_executor at module scope, so a top-level import here is circular.
-        from ._util import get_mla_context_workspace_bytes_per_token
+        from ._util import get_attention_workspace_bytes_per_token
         cap = None
-        w = get_mla_context_workspace_bytes_per_token(
+        w = get_attention_workspace_bytes_per_token(
             self.model_engine.model.model_config, self.dist.mapping)
         if w > 0:
             blocks = getattr(self.kv_cache_manager, "blocks_in_primary_pool",
