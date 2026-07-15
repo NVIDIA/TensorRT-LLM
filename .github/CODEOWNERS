@@ -221,6 +221,11 @@
 /tensorrt_llm/_torch/pyexecutor/mamba_cache_manager.py @NVIDIA/trt-llm-kv-cache-manager-devs
 /tensorrt_llm/_torch/pyexecutor/resource_manager.py @NVIDIA/trt-llm-kv-cache-manager-devs
 /tensorrt_llm/runtime/kv_cache_manager_v2 @NVIDIA/trt-llm-kv-cache-manager-devs
+/tests/unittest/_torch/executor/test_dual_pool_kv_cache.py @NVIDIA/trt-llm-kv-cache-manager-devs
+/tests/unittest/_torch/executor/test_kv_cache* @NVIDIA/trt-llm-kv-cache-manager-devs
+/tests/unittest/_torch/executor/test_kv_pool_rebalance.py @NVIDIA/trt-llm-kv-cache-manager-devs
+/tests/unittest/_torch/executor/test_kvcache_aware_router.py @NVIDIA/trt-llm-kv-cache-manager-devs
+/tests/unittest/_torch/executor/test_mamba_cache_manager.py @NVIDIA/trt-llm-kv-cache-manager-devs
 /tests/unittest/kv_cache_manager_v2_tests @NVIDIA/trt-llm-kv-cache-manager-devs
 
 # ===== DISAGGREGATED SERVING =====
