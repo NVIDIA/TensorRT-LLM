@@ -26,6 +26,7 @@ Supported (dtype, K): fp32 / bf16 / fp16 x 512 / 1024 / 2048.
 cluster_size: 1 (default), 2, 4 (B200 GPC limit caps at ~16).
 """
 
+import math
 from dataclasses import dataclass
 from typing import Optional
 
@@ -231,6 +232,11 @@ class GvrTopKKernel:
         enable_smem_cache: bool = False,
         smem_cache_elems: int = 32768,
         seqlen_sorted: bool = False,
+        enable_r0: bool = False,
+        r0_qfracs: Optional[tuple] = None,
+        mt_unroll: int = 4,
+        p1b_cache: bool = False,
+        fb_fix: bool = True,
     ):
         # cluster_size: number of CTAs cooperating per row. 1 = single-CTA
         # path; 2/4 = thread-block cluster with DSMEM aggregation. Capped at
@@ -341,6 +347,37 @@ class GvrTopKKernel:
         self.MAX_REFINE_ITERS = 15
         self.FLT_MAX = 3.4028235e38
         self.NEG_FLT_MAX = -self.FLT_MAX
+
+        # --- op#26 R0 histogram-ladder admission (inert until enable_r0) ---
+        # enable_r0: replace the Phase-2 secant search with a single-pass
+        #   multi-threshold "rung ladder" admission seeded by a 256-bin
+        #   histogram over the prev-topK gathered values (P1b). OFF here;
+        #   the ladder body / dispatch land in later commits. All fields are
+        #   const-foldable so an OFF kernel is byte-identical to the base.
+        # r0_qfracs: descending h-space quantile fractions defining the M
+        #   candidate rungs (ascending threshold values); None => no rungs.
+        # mt_unroll: 4-way unroll factor for block_count_ge_multi.
+        # p1b_cache: stash the K gathered preIdx values in SMEM so P1b skips
+        #   a second GMEM random gather (dtype-gated in a later commit).
+        # fb_fix: R0-miss fallback re-measures the rung bracket ends before
+        #   refining (excludes the R2-class unmeasured-seed failure mode).
+        self.enable_r0 = bool(enable_r0)
+        self.mt_unroll = int(mt_unroll)
+        self.p1b_cache = bool(p1b_cache)
+        self.fb_fix = bool(fb_fix)
+        self.r0_qfracs = tuple(float(q) for q in r0_qfracs) if r0_qfracs else ()
+        if self.r0_qfracs:
+            assert all(0.0 < q < 1.0 for q in self.r0_qfracs), self.r0_qfracs
+            assert list(self.r0_qfracs) == sorted(self.r0_qfracs, reverse=True), \
+                "r0_qfracs must be descending h (ascending threshold value)"
+        self.M_thr = len(self.r0_qfracs)
+        # need[m] = ceil(q_m * K) prev-topK values >= rung m.
+        self.qneeds = tuple(max(1, int(math.ceil(q * self.top_k)))
+                            for q in self.r0_qfracs)
+        # R1 inline shot aim in log2-count space: geometric center of the
+        # [K, kC] acceptance window.
+        self.log2_r1aim = (math.log2(math.sqrt(self.top_k * self.kC))
+                           if self.r0_qfracs else 0.0)
 
     # ------------------------------------------------------------------
     # SMEM slice cache loader. Streams this CTA's slice GMEM → SMEM via
@@ -878,6 +915,103 @@ class GvrTopKKernel:
                         total = total + ld_shared_cluster_i32(peer_addr)
                     s_iscalars[0] = total
                 cute.arch.barrier()  # broadcast cluster total within this CTA
+
+    # ------------------------------------------------------------------
+    # block_count_ge_multi<M> — GE-count of the input row against M
+    # thresholds in ONE vectorized scan, reusing block_count_ge's memory
+    # path (same vec_w / 4-way-unroll / tail loops) with M static register
+    # counters. Caches all M per-thread count columns in smem_ptcnt_multi so
+    # the accepted rung's column seeds Phase 3 with zero rescan. This is the
+    # R0 admission primitive (op#18 multithresh lineage); it is only invoked
+    # from the enable_r0 path added in a later commit, so the base kernel is
+    # unaffected. Single-CTA form; the cluster (cluster_size>1) all-reduce
+    # mirrors block_count_ge and is added alongside the cluster R0 path.
+    # ------------------------------------------------------------------
+    @cute.jit
+    def block_count_ge_multi(
+        self, input_row, N, s_mt_thr, smem_ptcnt_multi, smem_wcnt_multi,
+        s_mt_cnt, tidx, warp_id, lane,
+    ):
+        M = cutlass.const_expr(self.M_thr)
+        num_threads = cutlass.const_expr(self.num_threads)
+        num_warps = cutlass.const_expr(self.num_warps)
+        vec_w = cutlass.const_expr(self.vec_bits // self.dtype.width)
+        elem_bytes = cutlass.const_expr(self.dtype.width // 8)
+        vec_align = cutlass.const_expr(self.vec_align_bytes)
+        copy_atom = self._make_load_copy_atom()
+        step_elem = cutlass.const_expr(num_threads * vec_w)
+
+        thr_frag = cute.make_fragment((M,), cutlass.Float32)
+        cnt_frag = cute.make_fragment((M,), cutlass.Int32)
+        for m in cutlass.range_constexpr(M):
+            thr_frag[m] = s_mt_thr[m]
+            cnt_frag[m] = cutlass.Int32(0)
+
+        row_addr = input_row.iterator.toint()
+        n_aligned = (N // cutlass.Int32(vec_w)) * cutlass.Int32(vec_w)
+        i = tidx * cutlass.Int32(vec_w)
+        step = cutlass.Int32(step_elem)
+
+        if self.enable_unroll_4:
+            rng_frag = cute.make_fragment((vec_w,), self.dtype)
+            big_iters = cutlass.Int32(0)
+            if N > i + cutlass.Int32(vec_w - 1):
+                big_iters = (N - i - cutlass.Int32(vec_w)) // cutlass.Int32(step_elem) + cutlass.Int32(1)
+            for k in cutlass.range(big_iters, unroll=self.mt_unroll):
+                i_local = i + k * cutlass.Int32(step_elem)
+                src_ptr_k = cute.make_ptr(
+                    self.dtype, row_addr + cutlass.Int64(i_local) * cutlass.Int64(elem_bytes),
+                    cute.AddressSpace.gmem, assumed_align=vec_align)
+                src_k = cute.make_tensor(src_ptr_k, cute.make_layout((vec_w,)))
+                cute.copy(copy_atom, src_k, rng_frag)
+                for j in cutlass.range_constexpr(vec_w):
+                    if cutlass.const_expr(self.dtype == cutlass.Float32):
+                        vj = rng_frag[j]
+                    else:
+                        vj = cutlass.Float32(rng_frag[j])
+                    for m in cutlass.range_constexpr(M):
+                        cnt_frag[m] = cnt_frag[m] + cutlass.Int32(vj >= thr_frag[m])
+            i = i + big_iters * cutlass.Int32(step_elem)
+
+        tail_frag = cute.make_fragment((vec_w,), self.dtype)
+        while i + cutlass.Int32(vec_w - 1) < N:
+            src_ptr = cute.make_ptr(
+                self.dtype, row_addr + cutlass.Int64(i) * cutlass.Int64(elem_bytes),
+                cute.AddressSpace.gmem, assumed_align=vec_align)
+            src = cute.make_tensor(src_ptr, cute.make_layout((vec_w,)))
+            cute.copy(copy_atom, src, tail_frag)
+            for j in cutlass.range_constexpr(vec_w):
+                if cutlass.const_expr(self.dtype == cutlass.Float32):
+                    vj = tail_frag[j]
+                else:
+                    vj = cutlass.Float32(tail_frag[j])
+                for m in cutlass.range_constexpr(M):
+                    cnt_frag[m] = cnt_frag[m] + cutlass.Int32(vj >= thr_frag[m])
+            i = i + step
+
+        it = n_aligned + tidx
+        while it < N:
+            v = self._load_fp32(input_row, it)
+            for m in cutlass.range_constexpr(M):
+                cnt_frag[m] = cnt_frag[m] + cutlass.Int32(v >= thr_frag[m])
+            it = it + cutlass.Int32(num_threads)
+
+        for m in cutlass.range_constexpr(M):
+            smem_ptcnt_multi[m * num_threads + tidx] = cnt_frag[m]
+
+        for m in cutlass.range_constexpr(M):
+            wc = self.warp_reduce_sum_i32(cnt_frag[m])
+            if lane == 0:
+                smem_wcnt_multi[m * num_warps + warp_id] = wc
+        cute.arch.barrier()
+        if warp_id == cutlass.Int32(0):
+            for m in cutlass.range_constexpr(M):
+                v = cutlass.Int32(0)
+                if lane < cutlass.Int32(num_warps):
+                    v = smem_wcnt_multi[m * num_warps + lane]
+                total = self.warp_reduce_sum_i32(v)
+                if lane == 0:
+                    s_mt_cnt[m] = total
 
     # ------------------------------------------------------------------
     # Phase 2: Secant-interpolation threshold search
