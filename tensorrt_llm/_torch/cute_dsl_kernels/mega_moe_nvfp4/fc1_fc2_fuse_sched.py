@@ -1,5 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: BSD-3-Clause
 """Fused fc1 + fc2 MegaMoE scheduler."""
 
 from enum import IntEnum
@@ -657,19 +659,31 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
         num_fc2_hidden_blocks = (hidden + params.cluster_tile_n -
                                  1) // params.cluster_tile_n
 
-        # current_work init must use ext.WorkTileInfo (8 fields) to match the
-        # shape that gen_next_work writes; otherwise MLIR serialization slot
-        # Scheduler emits the final 8-field work tile directly.
-        current_work = ext.WorkTileInfo(
-            expert_idx=Int32(WorkTileState.DONE),
-            tile_m_idx=Int32(0),
-            tile_n_idx=Int32(0),
-            cumulative_data_physical_row=Int32(0),
-            cumulative_sf_physical_row=Int32(0),
-            cumulative_token_block_count=Int32(0),
-            valid_tokens_in_tile=Int32(0),
-            phase_and_peek=Int32(BlockPhase.None_),
-        )
+        # current_work init must use ext.WorkTileInfo to match the shape that
+        # gen_next_work writes; otherwise MLIR serialization slots would differ.
+        if const_expr(params.is_swap_ab):
+            current_work = ext.WorkTileInfo(
+                expert_idx=Int32(WorkTileState.DONE),
+                tile_m_idx=Int32(0),
+                tile_n_idx=Int32(0),
+                cumulative_data_physical_row=Int32(0),
+                cumulative_sf_physical_row=Int32(0),
+                cumulative_token_block_count=Int32(0),
+                valid_tokens_in_cta_tile=Int32(0),
+                phase_and_peek=Int32(BlockPhase.None_),
+            )
+        else:
+            current_work = ext.WorkTileInfo(
+                expert_idx=Int32(WorkTileState.DONE),
+                tile_m_idx=Int32(0),
+                tile_n_idx=Int32(0),
+                cumulative_data_physical_row=Int32(0),
+                cumulative_sf_physical_row=Int32(0),
+                cumulative_token_block_count=Int32(0),
+                valid_tokens_in_cta_cluster_tile=Int32(0),
+                phase_and_peek=Int32(BlockPhase.None_),
+                fc1_counter_index=Int32(0),
+            )
 
         sched_producer_group = pipeline.CooperativeGroup(
             pipeline.Agent.Thread, 32)
@@ -855,9 +869,7 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
             result across the sched warp.
 
         Cluster-internal protocol (DSMEM broadcast + cluster_pipeline mbar
-        wait) is identical between the two paths.  Mirrors
-        ``cute_dsl_kernel_library/dsl_kernels/moe/moe_persistent_scheduler.py``
-        ``_fetch_next_cluster_idx`` (lines 838-894).
+        wait) is identical between the two paths.
         """
         ds = self._dynamic_state
         cluster_pipeline = self._cluster_pipeline
@@ -1176,14 +1188,14 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
             cluster_intermediate_or_hidden_block_idx *
             params.cluster_shape_mn[1] + self.cta_id_in_cluster[1])
 
-        # valid_tokens_in_tile: clip cta_tile_m tokens at the current expert
+        # valid_tokens_in_cta_tile: clip cta_tile_m tokens at the current expert
         # right boundary.
         token_idx_start_in_expert = cta_token_block_idx * Int32(cta_tile_m)
         remaining_in_expert = (state.current_this_expert_token_cnt -
                                token_idx_start_in_expert)
         remaining_in_expert = cutlass.max(remaining_in_expert, Int32(0))
-        valid_tokens_in_tile = cutlass.min(remaining_in_expert,
-                                           Int32(cta_tile_m))
+        valid_tokens_in_cta_tile = cutlass.min(remaining_in_expert,
+                                               Int32(cta_tile_m))
 
         # Swap scheduler-internal M/N back to GEMM-domain M/N on output.
         if const_expr(params.is_swap_ab):
@@ -1194,16 +1206,41 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
             tile_n_idx = cta_intermediate_or_hidden_block_idx
 
         # ext.enrich_work_tile_info may OR the peek bit into phase_and_peek.
-        return self._ext.WorkTileInfo(
-            expert_idx=state.current_expert_idx,
-            tile_m_idx=tile_m_idx,
-            tile_n_idx=tile_n_idx,
-            cumulative_data_physical_row=state.current_data_cumul,
-            cumulative_sf_physical_row=state.current_sf_cumul,
-            cumulative_token_block_count=state.current_token_block_cumul,
-            valid_tokens_in_tile=valid_tokens_in_tile,
-            phase_and_peek=state.current_phase,
-        )
+        if const_expr(params.is_swap_ab):
+            return self._ext.WorkTileInfo(
+                expert_idx=state.current_expert_idx,
+                tile_m_idx=tile_m_idx,
+                tile_n_idx=tile_n_idx,
+                cumulative_data_physical_row=state.current_data_cumul,
+                cumulative_sf_physical_row=state.current_sf_cumul,
+                cumulative_token_block_count=state.current_token_block_cumul,
+                valid_tokens_in_cta_tile=valid_tokens_in_cta_tile,
+                phase_and_peek=state.current_phase,
+            )
+        else:
+            fc1_counter_index = cluster_token_block_idx
+            cluster_tile_m = params.cluster_shape_mn[0] * cta_tile_m
+            cluster_start = cluster_token_block_idx * Int32(cluster_tile_m)
+            remaining_cluster = cutlass.max(
+                state.current_this_expert_token_cnt - cluster_start, Int32(0))
+            valid_tokens_in_cluster_tile = cutlass.min(remaining_cluster,
+                                                       Int32(cluster_tile_m))
+            # Pack: high 16b = per-CTA tile count, low 16b = cluster-level count.
+            valid_tokens_in_cta_cluster_tile = (
+                (valid_tokens_in_cta_tile << Int32(16))
+                | valid_tokens_in_cluster_tile)
+            return self._ext.WorkTileInfo(
+                expert_idx=state.current_expert_idx,
+                tile_m_idx=tile_m_idx,
+                tile_n_idx=tile_n_idx,
+                cumulative_data_physical_row=state.current_data_cumul,
+                cumulative_sf_physical_row=state.current_sf_cumul,
+                cumulative_token_block_count=state.current_token_block_cumul,
+                valid_tokens_in_cta_cluster_tile=
+                valid_tokens_in_cta_cluster_tile,
+                phase_and_peek=state.current_phase,
+                fc1_counter_index=fc1_counter_index,
+            )
 
     @dsl_user_op
     @cute.jit
@@ -1218,16 +1255,29 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
         state = self._fused_state
 
         # Sentinel-by-default work tile; conditionally overwritten by decode.
-        base_work = self._ext.WorkTileInfo(
-            expert_idx=Int32(WorkTileState.DONE),
-            tile_m_idx=Int32(0),
-            tile_n_idx=Int32(0),
-            cumulative_data_physical_row=Int32(0),
-            cumulative_sf_physical_row=Int32(0),
-            cumulative_token_block_count=Int32(0),
-            valid_tokens_in_tile=Int32(0),
-            phase_and_peek=Int32(BlockPhase.None_),
-        )
+        if const_expr(self.params.is_swap_ab):
+            base_work = self._ext.WorkTileInfo(
+                expert_idx=Int32(WorkTileState.DONE),
+                tile_m_idx=Int32(0),
+                tile_n_idx=Int32(0),
+                cumulative_data_physical_row=Int32(0),
+                cumulative_sf_physical_row=Int32(0),
+                cumulative_token_block_count=Int32(0),
+                valid_tokens_in_cta_tile=Int32(0),
+                phase_and_peek=Int32(BlockPhase.None_),
+            )
+        else:
+            base_work = self._ext.WorkTileInfo(
+                expert_idx=Int32(WorkTileState.DONE),
+                tile_m_idx=Int32(0),
+                tile_n_idx=Int32(0),
+                cumulative_data_physical_row=Int32(0),
+                cumulative_sf_physical_row=Int32(0),
+                cumulative_token_block_count=Int32(0),
+                valid_tokens_in_cta_cluster_tile=Int32(0),
+                phase_and_peek=Int32(BlockPhase.None_),
+                fc1_counter_index=Int32(0),
+            )
 
         # DSL carry for mutated self and while-condition fields.
         outer_group_end = state.current_group_end
