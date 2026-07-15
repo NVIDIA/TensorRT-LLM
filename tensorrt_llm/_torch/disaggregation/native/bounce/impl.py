@@ -34,7 +34,7 @@ from tensorrt_llm._torch.disaggregation.base.agent import (
     TransferOp,
     TransferRequest,
 )
-from tensorrt_llm.runtime.generation import CUASSERT
+from tensorrt_llm._utils import CUASSERT
 
 from .buffer import SlotAllocator
 from .config import SizingContext, fit_within_free

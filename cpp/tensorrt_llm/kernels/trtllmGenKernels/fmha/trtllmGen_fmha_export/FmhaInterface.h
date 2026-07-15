@@ -69,6 +69,9 @@ struct FmhaData {
   };
 
   struct Scales {
+    // DSv4 inverse-RoPE + 1x128 FP8 quant fusion output scale tensor.
+    float* dsv4OScaleFp32D{nullptr};
+
     // FP4 scaling factors for KV cache
     void const* kSfBasePtr;
     void const* vSfBasePtr;
@@ -104,6 +107,9 @@ struct FmhaData {
     // [sumOfSeqLensKv * numHeadsKv, hiddenDimKv] for sparse attention.
     void const* kBasePtr;
     void const* vBasePtr;
+
+    // DSv4 inverse-RoPE metadata inputs.
+    float const* dsv4InvRopeCosSinCacheD{nullptr};
 
     // Base pointer for the DSv4 sparse MLA sliding-window KV pool.
     void const* slidingWindowKvPoolBasePtr{nullptr};
@@ -153,6 +159,7 @@ struct FmhaData {
 class FmhaInterface {
 public:
   using ModuleCache = std::unordered_map<std::string, std::tuple<CUmodule, CUfunction>>;
+  enum class KernelCacheStatus { Unknown, CacheHit, CacheMiss };
 
   FmhaInterface(bool exportsCubin = false, int32_t numRotations = 1, bool verbose = false)
     : mExportsCubin(exportsCubin)
@@ -164,7 +171,7 @@ public:
   // Set the verbosity level for logging. When false, TLLM_LOG_INFO messages are suppressed.
   void setVerbose(bool verbose);
 
-  void generateAndCompileKernel(FmhaConfig& fmhaConfig) const;
+  KernelCacheStatus generateAndCompileKernel(FmhaConfig& fmhaConfig) const;
 
   std::string getKernelNameFromConfigs(FmhaConfig const& fmhaConfig) const;
 

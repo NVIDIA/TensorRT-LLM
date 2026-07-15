@@ -191,6 +191,12 @@ def create_test_backend(
     )
 
 
+# ============================================================================
+# Staged post-load hook lifecycle tests
+# ============================================================================
+# These tests cover staged hook contracts rather than the common backend matrix
+# below. Keep them grouped so they can move to a dedicated file if the MoE test
+# layout is split later.
 def test_moe_post_load_weights_uses_idempotent_transform_hook():
     class HookTestMoE(MoE):
         def create_weights(self):

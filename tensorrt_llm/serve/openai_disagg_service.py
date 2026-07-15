@@ -79,6 +79,8 @@ class OpenAIDisaggregatedService(OpenAIService):
         self._health_check_interval_secs = health_check_interval_secs
         # Opt-in body-shrink for generation_only requests; see _get_gen_request.
         self._strip_gen_message_history = config.gen_strip_message_history
+        # Opt-in: ask context workers to return prompt_token_ids as base64 int32.
+        self._tokids_ctxbytes = config.gen_tokids_ctxbytes
 
         self._ctx_client = None
         self._gen_client = None
@@ -208,6 +210,7 @@ class OpenAIDisaggregatedService(OpenAIService):
                     disagg_request_id=disagg_request_id,
                     schedule_style=self._schedule_style,
                     conversation_id=conversation_id,
+                    return_prompt_token_ids_b64=self._tokids_ctxbytes,
                 ),
                 "stream": False,
                 "stream_options": None,
@@ -233,7 +236,12 @@ class OpenAIDisaggregatedService(OpenAIService):
             if isinstance(request, CompletionRequest):
                 request.prompt = ctx_response.prompt_token_ids
             elif isinstance(request, ChatCompletionRequest):
-                request.prompt_token_ids = ctx_response.prompt_token_ids
+                # Relay the base64 token-id string verbatim (no int-list
+                # materialization on the orchestrator loop), else the int array.
+                if ctx_response.prompt_token_ids_b64 is not None:
+                    request.prompt_token_ids_b64 = ctx_response.prompt_token_ids_b64
+                else:
+                    request.prompt_token_ids = ctx_response.prompt_token_ids
                 # Opt-in: drop conversation history so the gen worker doesn't
                 # re-parse the full conversation JSON (dominates its GIL at high
                 # concurrency). It uses prompt_token_ids and only reads the last

@@ -575,29 +575,6 @@ def test_collect_llm_api_config_captures_nested_config_value_fields():
     assert config["moe_config.backend"] == "AUTO"
 
 
-def test_collect_llm_api_config_captures_quant_algo_cross_module():
-    """quant_config.quant_algo (QuantConfig in modeling_utils.py) is captured.
-
-    QuantConfig is defined outside llm_args.py but the collector recurses into
-    any nested pydantic model, so marking the field at its definition site is
-    sufficient. quant_config is a real model field only on TrtLlmArgs.
-    """
-    from tensorrt_llm.llmapi.llm_args import TrtLlmArgs
-    from tensorrt_llm.models.modeling_utils import QuantConfig
-    from tensorrt_llm.quantization.mode import QuantAlgo
-
-    args = TrtLlmArgs(
-        model="/customer/private/Llama",
-        skip_tokenizer_init=True,
-        quant_config=QuantConfig(quant_algo=QuantAlgo.FP8),
-    )
-
-    config, meta = _loads_payloads(args)
-
-    assert config["quant_config.quant_algo"] == "FP8"
-    assert meta["capture_succeeded"] is True
-
-
 def test_field_wrapper_preserves_callable_json_schema_extra_with_metadata():
     """Preserve callable json_schema_extra when adding status/telemetry metadata.
 
@@ -663,17 +640,6 @@ def test_collect_llm_api_config_captures_none_on_optional_allowlist_field():
     assert meta["unsafe_excluded"] is False
 
 
-def test_collect_llm_api_config_captures_quant_algo_none():
-    """quant_config.quant_algo defaults to None and is captured as null."""
-    from tensorrt_llm.llmapi.llm_args import TrtLlmArgs
-
-    args = TrtLlmArgs(model="/customer/private/Llama", skip_tokenizer_init=True)
-
-    config, _ = _loads_payloads(args)
-
-    assert config["quant_config.quant_algo"] is None
-
-
 def test_collect_llm_api_config_captures_sampler_type_categorical():
     """sampler_type is a bounded Union[str, SamplerType] categorical allowlist."""
     args = TorchLlmArgs(
@@ -731,22 +697,6 @@ def test_collect_llm_api_config_captures_gms_load_format():
     config, meta = _loads_payloads(args)
 
     assert config["load_format"] == "gms"
-    assert meta["capture_succeeded"] is True
-
-
-def test_collect_llm_api_config_captures_backend_allowlist_on_trt_args():
-    """TrtLlmArgs inherits backend as Optional[str] -> bounded categorical allowlist."""
-    from tensorrt_llm.llmapi.llm_args import TrtLlmArgs
-
-    args = TrtLlmArgs(
-        model="/customer/private/Llama",
-        skip_tokenizer_init=True,
-        backend="tensorrt",
-    )
-
-    config, meta = _loads_payloads(args)
-
-    assert config["backend"] == "tensorrt"
     assert meta["capture_succeeded"] is True
 
 

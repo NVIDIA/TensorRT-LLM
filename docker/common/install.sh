@@ -15,7 +15,6 @@ tensorrt=0
 polygraphy=0
 mpi4py=0
 pytorch=0
-opencv=0
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -51,10 +50,6 @@ while [[ $# -gt 0 ]]; do
             pytorch=1
             shift 1
             ;;
-        --opencv)
-            opencv=1
-            shift 1
-            ;;
         --all)
             base=1
             cmake=1
@@ -64,7 +59,6 @@ while [[ $# -gt 0 ]]; do
             polygraphy=1
             mpi4py=1
             pytorch=1
-            opencv=1
             shift 1
             ;;
         *)
@@ -121,11 +115,4 @@ fi
 if [ $pytorch -eq 1 ]; then
     echo "Installing PyTorch..."
     bash $SCRIPT_DIR/install_pytorch.sh $TORCH_INSTALL_TYPE
-fi
-
-if [ $opencv -eq 1 ]; then
-    echo "Installing OpenCV..."
-    bash -c "pip3 uninstall -y opencv"
-    rm -rf /usr/local/lib/python3*/dist-packages/cv2/
-    bash -c "pip3 install opencv-python-headless --force-reinstall --no-deps --no-cache-dir"
 fi
