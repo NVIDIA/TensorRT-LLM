@@ -3318,24 +3318,34 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
     @skip_pre_hopper
     @pytest.mark.skip_less_device_memory(140000)
     @pytest.mark.parametrize(
-        "tp_size,pp_size,ep_size,mtp_nextn,fp8kv,attention_dp,cuda_graph,overlap_scheduler,max_batch_size,moe_backend,disable_skip_indexer,enable_heuristic_topk",
+        "tp_size,pp_size,ep_size,mtp_nextn,fp8kv,attention_dp,cuda_graph,overlap_scheduler,max_batch_size,moe_backend,disable_skip_indexer,enable_heuristic_topk,use_cute_dsl_topk",
         [
-            (8, 1, 8, 0, False, True, True, True, 24, "_DEFAULT", False, False),
-            (8, 1, 8, 1, False, True, True, True, 24, "_DEFAULT", False, False),
-            (8, 1, 8, 0, True, True, True, True, 24, "_DEFAULT", False, False),
-            (8, 1, 8, 3, False, False, True, True, 1, "TRTLLM", False, False),
-            (8, 1, 8, 3, False, False, True, True, 1, "_DEFAULT", False, False),
-            (8, 1, 8, 1, False, True, True, True, 24, "_DEFAULT", True, False),
-            (8, 1, 8, 1, False, True, True, True, 24, "_DEFAULT", False, True),
+            (8, 1, 8, 0, False, True, True, True, 24, "_DEFAULT", False, False,
+             False),
+            (8, 1, 8, 1, False, True, True, True, 24, "_DEFAULT", False, False,
+             False),
+            (8, 1, 8, 0, True, True, True, True, 24, "_DEFAULT", False, False,
+             False),
+            (8, 1, 8, 3, False, False, True, True, 1, "TRTLLM", False, False,
+             False),
+            (8, 1, 8, 3, False, False, True, True, 1, "_DEFAULT", False, False,
+             False),
+            (8, 1, 8, 1, False, True, True, True, 24, "_DEFAULT", True, False,
+             False),
+            (8, 1, 8, 1, False, True, True, True, 24, "_DEFAULT", False, True,
+             False),
+            (8, 1, 8, 1, False, True, True, True, 24, "_DEFAULT", False, True,
+             True),
         ],
         ids=[
             "baseline", "baseline_mtp1", "baseline_fp8kv", "latency",
-            "latency_default", "disable_skip_indexer", "heuristic_topk_mtp1"
+            "latency_default", "disable_skip_indexer", "heuristic_topk_mtp1",
+            "cute_dsl_gvr_mtp1"
         ])
     def test_fp8_blockscale(self, tp_size, pp_size, ep_size, mtp_nextn, fp8kv,
                             attention_dp, cuda_graph, overlap_scheduler,
                             max_batch_size, moe_backend, disable_skip_indexer,
-                            enable_heuristic_topk):
+                            enable_heuristic_topk, use_cute_dsl_topk):
         if get_sm_version() == 100 or get_sm_version() == 103:
             moe_backend = "DEEPGEMM" if moe_backend == "_DEFAULT" else moe_backend
             moe_config = MoeConfig(backend=moe_backend, max_num_tokens=16384)
@@ -3362,16 +3372,19 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
                 )
             kv_cache_config.dtype = "fp8"
 
-        if enable_heuristic_topk and get_sm_version() < 100:
+        if (enable_heuristic_topk
+                or use_cute_dsl_topk) and get_sm_version() < 100:
             pytest.skip("Heuristic TopK requires Blackwell (SM >= 100)")
 
-        dsa_config = None
+        dsa_kwargs = {}
         if disable_skip_indexer:
-            dsa_config = DeepSeekSparseAttentionConfig(
-                skip_indexer_for_short_seqs=False)
+            dsa_kwargs["skip_indexer_for_short_seqs"] = False
         if enable_heuristic_topk:
-            dsa_config = DeepSeekSparseAttentionConfig(
-                enable_heuristic_topk=True)
+            dsa_kwargs["enable_heuristic_topk"] = enable_heuristic_topk
+        if use_cute_dsl_topk:
+            dsa_kwargs["use_cute_dsl_topk"] = use_cute_dsl_topk
+        dsa_config = DeepSeekSparseAttentionConfig(
+            **dsa_kwargs) if dsa_kwargs else None
 
         mtp_config = None
         if mtp_nextn > 0:

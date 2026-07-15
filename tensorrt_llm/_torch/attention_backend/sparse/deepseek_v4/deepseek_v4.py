@@ -250,6 +250,7 @@ def make_deepseek_v4_sparse_metadata_params(
         ),
         enable_indexer_skip=sparse_attention_config.skip_indexer_for_short_seqs,
         enable_heuristic_topk=sparse_attention_config.enable_heuristic_topk,
+        use_cute_dsl_topk=sparse_attention_config.use_cute_dsl_topk,
         use_cute_dsl_paged_mqa_logits=(sparse_attention_config.use_cute_dsl_paged_mqa_logits),
         q_split_threshold=sparse_attention_config.q_split_threshold,
         compress_ratios=sparse_attention_config.compress_ratios,
@@ -771,6 +772,11 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             self.num_total_compressed_tokens,
             self._compress_ratios_sorted,
         )
+
+        # LJF row-reorder for the GVR DSL top-k path. V4 does not chain the base
+        # DSAtrtllmAttentionMetadata.prepare(), so call the shared helper here so
+        # the reorder engages for DeepSeek-V4 too (not just V3.2).
+        self._compute_kv_lens_row_reorder()
 
     def prepare_compressed_kv_metadata(
         self,

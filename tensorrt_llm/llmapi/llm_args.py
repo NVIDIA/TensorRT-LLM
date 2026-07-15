@@ -954,6 +954,7 @@ class DeepSeekSparseAttentionConfig(SeqLenAwareSparseAttentionConfig):
             index_head_dim=_value("index_head_dim", 128),
             enable_indexer_skip=self.skip_indexer_for_short_seqs,
             enable_heuristic_topk=self.enable_heuristic_topk,
+            use_cute_dsl_topk=self.use_cute_dsl_topk,
             use_cute_dsl_paged_mqa_logits=(self.use_cute_dsl_paged_mqa_logits),
             q_split_threshold=self.q_split_threshold,
         )
@@ -1062,6 +1063,7 @@ class DeepSeekV4SparseAttentionConfig(DeepSeekSparseAttentionConfig):
             index_head_dim=_value("index_head_dim", 128),
             enable_indexer_skip=self.skip_indexer_for_short_seqs,
             enable_heuristic_topk=self.enable_heuristic_topk,
+            use_cute_dsl_topk=self.use_cute_dsl_topk,
             use_cute_dsl_paged_mqa_logits=(self.use_cute_dsl_paged_mqa_logits),
             q_split_threshold=self.q_split_threshold,
             compress_ratios=self.compress_ratios,
