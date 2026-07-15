@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -21,6 +21,7 @@
 #include "tensorrt_llm/kernels/kvCacheUtils.h"
 #include "tensorrt_llm/kernels/mlaKernels.h"
 #include "tensorrt_llm/runtime/iTensor.h"
+#include <cuda_bf16.h>
 #include <cuda_runtime_api.h>
 
 #ifdef ENABLE_FP4
@@ -394,6 +395,9 @@ void invokeQKVPreprocessing(QKVPreprocessingParams<T, KVCacheBuffer> params, cud
     TLLM_CHECK_WITH_INFO(params.q_norm_weight == nullptr
             || (params.separate_q_kv_output && params.size_per_head == 256 && params.qk_norm_eps > 0.0f),
         "Fused QK norm preprocessing requires separate output, head_size 256, and positive epsilon.");
+    // The fused QK-norm RoPE path is implemented for bf16 only; other dtypes would skip the RMSNorm.
+    TLLM_CHECK_WITH_INFO((params.q_norm_weight == nullptr || std::is_same_v<T, __nv_bfloat16>),
+        "Fused QK norm preprocessing is only implemented for bf16 inputs.");
     if (params.cache_type == KvCacheDataType::INT8)
     {
         invokeApplyBiasRopeUpdateKVCacheDispatch<T, int8_t, KVCacheBuffer>(params, stream);

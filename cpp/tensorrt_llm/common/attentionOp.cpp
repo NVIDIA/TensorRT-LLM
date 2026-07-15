@@ -2127,6 +2127,9 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
         TLLM_CHECK_WITH_INFO(params.attention_input_token_stride == 0
                 || params.attention_input_token_stride == (mNumAttnHeads + 2 * mNumAttnKVHeads) * getHeadSize(),
             "Strided attention_input is not supported by the unfused context MHA path.");
+        // This fallback kernel does not apply QK norm, so fused QK-norm weights must not slip through.
+        TLLM_CHECK_WITH_INFO(params.q_norm_weight == nullptr && params.k_norm_weight == nullptr,
+            "Fused QK norm preprocessing is not supported by the unfused context MHA path.");
         // FIXME: a temporary solution to make sure the padding part of key/value buffer is 0
         // NOTE: pointer subtraction is used below since there could be some extra gap due to alignment.
         //  Otherwise, we could do cudaMemsetAsync(workspaceViews.kBuf, 0, k_buf_2_size + v_buf_2_size, stream).
@@ -2510,6 +2513,10 @@ int AttentionOp::enqueueGeneration(EnqueueGenerationParams<T> const& params, cud
         params.workspace, cpWorkspaceLayout, cpMaxPaddedSequenceLength, mNumHeads, mNumKVHeads, mHeadSize);
 
     T* attention_input = const_cast<T*>(params.attention_input);
+    // Ulysses/CP preprocess (invokeCpTranspose) assumes a packed qkv layout and cannot honor a row stride.
+    TLLM_CHECK_WITH_INFO(mCpSize == 1 || params.attention_input_token_stride == 0
+            || params.attention_input_token_stride == (mNumAttnHeads + 2 * mNumAttnKVHeads) * getHeadSize(),
+        "Strided (gate-tail) attention_input is not supported with Ulysses/context parallelism (mCpSize > 1).");
     if (mCpSize > 1 && mAttnTpSize > 1 && mAttnCpSize == 1)
     {
         this->template ulyssesGenerationPreprocess<T>(
@@ -2634,6 +2641,9 @@ int AttentionOp::enqueueGeneration(EnqueueGenerationParams<T> const& params, cud
     TLLM_CHECK_WITH_INFO(params.attention_input_token_stride == 0
             || params.attention_input_token_stride == (mNumAttnHeads + 2 * mNumAttnKVHeads) * getHeadSize(),
         "Strided attention_input is not supported by the masked MHA generation path.");
+    // This fallback kernel does not apply QK norm, so fused QK-norm weights must not slip through.
+    TLLM_CHECK_WITH_INFO(params.q_norm_weight == nullptr && params.k_norm_weight == nullptr,
+        "Fused QK norm preprocessing is not supported by the masked MHA generation path.");
     dispatch_params.mUnfuseQkvGemm = mUnfuseQkvGemm;
     dispatch_params.qkv_buf = attention_input;
     dispatch_params.qkv_bias = params.qkv_bias;
