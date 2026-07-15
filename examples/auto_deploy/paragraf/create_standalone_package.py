@@ -155,6 +155,31 @@ DEV_DEPS = [
 # repository rather than the generated package.
 SOURCE_ONLY_TEST_DIRS = {"standalone"}
 
+# Source test names retain their AutoDeploy identity inside TensorRT-LLM. Rename
+# them only in the generated repository, where they exercise Paragraf through
+# the optional TensorRT-LLM integration.
+PARAGRAF_TRTLLM_TEST_RENAMES = {
+    "test_llm_api_autodeploy.py": "test_llm_api_paragraf_trtllm.py",
+    "test_ad_disagg.py": "test_paragraf_trtllm_disagg.py",
+    "test_ad_disagg_trtllm_serve.py": "test_paragraf_trtllm_disagg_serve.py",
+    "test_ad_guided_decoding.py": "test_paragraf_trtllm_guided_decoding.py",
+    "test_ad_speculative_decoding.py": "test_paragraf_trtllm_speculative_decoding.py",
+    "test_ad_dist_strategies.py": "test_paragraf_trtllm_dist_strategies.py",
+    "test_ad_build_small_multi.py": "test_paragraf_trtllm_build_small_multi.py",
+    "test_ad_moe_op.py": "test_paragraf_trtllm_moe_op.py",
+    "test_ad_executor_swa_eviction.py": "test_paragraf_trtllm_executor_swa_eviction.py",
+    "test_create_ad_executor.py": "test_create_paragraf_trtllm_executor.py",
+    "test_ad_build_small_single.py": "test_paragraf_trtllm_build_small_single.py",
+    "test_ad_guided_decoding_regex.py": "test_paragraf_trtllm_guided_decoding_regex.py",
+    "test_ad_trtllm_bench.py": "test_paragraf_trtllm_bench.py",
+    "test_ad_trtllm_sampler.py": "test_paragraf_trtllm_sampler.py",
+    "test_ad_trtllm_serve.py": "test_paragraf_trtllm_serve.py",
+}
+SOURCE_TEST_NAMES_BY_GENERATED_NAME = {
+    generated_name: source_name
+    for source_name, generated_name in PARAGRAF_TRTLLM_TEST_RENAMES.items()
+}
+
 # Tests in this set are copied, but only collected when the optional TensorRT-LLM
 # wheel is enabled through TRTLLM_REDIRECT_AD_TO_PARAGRAF. Keeping this explicit
 # also covers indirect dependencies where a rewritten ``paragraf`` import loads
@@ -188,8 +213,6 @@ OPTIONAL_TRTLLM_TEST_FILES = {
     "test_triton_moe.py",
     # Require onnx (optional dep)
     "test_export_fp8_linear_to_onnx.py",
-    # Uses hardcoded TRT-LLM repo path
-    "test_mrope_delta_cache.py",
     # Depend on TRT-LLM mamba/fla kernels (relative imports beyond auto_deploy)
     "test_mamba_rms_norm.py",
     "test_triton_rms_norm.py",
@@ -311,7 +334,8 @@ _MANAGED_PATHS = [
     # Remove the package directory produced before the Paragraf rename.
     "llmc",
     "tests",
-    "examples/auto_deploy/model_registry",
+    # Remove the source-shaped test-data path produced by older generators.
+    "examples/auto_deploy",
     "runners",
     "pyproject.toml",
     "README.md",
@@ -501,15 +525,21 @@ def _requires_optional_trtllm_guard(filepath: str, tests_dir: str) -> bool:
     relative_path = os.path.relpath(filepath, tests_dir).replace("\\", "/")
     if not TEST_FILE_RE.fullmatch(os.path.basename(filepath)):
         return False
+    generated_basename = os.path.basename(filepath)
+    source_basename = SOURCE_TEST_NAMES_BY_GENERATED_NAME.get(
+        generated_basename, generated_basename
+    )
     path_parts = relative_path.split("/")
     if relative_path.startswith("integration/"):
         return True
     if "shim" in path_parts:
         return True
-    if os.path.basename(filepath) in OPTIONAL_TRTLLM_TEST_FILES:
+    if source_basename in OPTIONAL_TRTLLM_TEST_FILES:
         return True
     if relative_path.startswith("multigpu/"):
-        multigpu_path = relative_path.removeprefix("multigpu/")
+        multigpu_parts = relative_path.removeprefix("multigpu/").split("/")
+        multigpu_parts[-1] = source_basename
+        multigpu_path = "/".join(multigpu_parts)
         return multigpu_path not in PURE_STANDALONE_MULTIGPU_TEST_FILES
     return False
 
@@ -583,15 +613,26 @@ def _copy_tests(output_dir: str) -> int:
         rel_path = os.path.relpath(src_path, AD_TESTS_DIR)
         if any(part in SOURCE_ONLY_TEST_DIRS for part in rel_path.split(os.sep)):
             continue
-        count += _copy_file(src_path, os.path.join(tests_dst, rel_path))
+        generated_name = PARAGRAF_TRTLLM_TEST_RENAMES.get(
+            os.path.basename(rel_path), os.path.basename(rel_path)
+        )
+        generated_rel_path = os.path.join(os.path.dirname(rel_path), generated_name)
+        count += _copy_file(src_path, os.path.join(tests_dst, generated_rel_path))
 
     # Copy every tracked test from the newer unit-test tree. This avoids an
     # allowlist that silently misses tests added alongside new AutoDeploy code.
     for src_path in _tracked_files_under(AD_TORCH_TESTS_DIR):
         rel_path = os.path.relpath(src_path, AD_TORCH_TESTS_DIR)
+        path_parts = rel_path.split(os.sep)
+        if path_parts[0] == "unit":
+            path_parts = path_parts[1:]
+        generated_rel_path = os.path.join(*path_parts)
+        generated_path = os.path.join(tests_dst, generated_rel_path)
+        if os.path.exists(generated_path):
+            raise FileExistsError(f"Generated test path collision for {src_path}: {generated_path}")
         count += _copy_file(
             src_path,
-            os.path.join(tests_dst, "_torch", "auto_deploy", rel_path),
+            generated_path,
         )
 
     # The CI classifier also finds a small number of AutoDeploy integration
@@ -604,9 +645,13 @@ def _copy_tests(output_dir: str) -> int:
             continue
         if not AUTODEPLOY_TEST_RE.search(rel_from_tests.replace("\\", "/")):
             continue
+        generated_name = PARAGRAF_TRTLLM_TEST_RENAMES.get(
+            os.path.basename(rel_from_tests), os.path.basename(rel_from_tests)
+        )
+        generated_rel_path = os.path.join(os.path.dirname(rel_from_tests), generated_name)
         count += _copy_file(
             src_path,
-            os.path.join(tests_dst, "integration", rel_from_tests),
+            os.path.join(tests_dst, "integration", generated_rel_path),
         )
 
     for rel_path in INTEGRATION_SUPPORT_FILES:
@@ -619,11 +664,6 @@ def _copy_tests(output_dir: str) -> int:
             os.path.join(AD_INTEGRATION_TESTS_DIR, rel_path),
             os.path.join(tests_dst, "integration", "defs", rel_path),
         )
-
-    count += _copy_tracked_tree(
-        os.path.join(AD_EXAMPLES_SRC, "model_registry"),
-        os.path.join(output_dir, "examples", "auto_deploy", "model_registry"),
-    )
 
     for rel_path in TORCH_TEST_SUPPORT_FILES:
         count += _copy_file(

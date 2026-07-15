@@ -32,6 +32,23 @@ AUTODEPLOY = re.compile(r"auto_?deploy|_ad_", re.IGNORECASE)
 TEST_FILE = re.compile(r"(?:^test_.*|.*_test)\.py$")
 CANONICAL_IMPORT = "tensorrt_llm._torch.auto_deploy"
 OPTIONAL_TRTLLM_GUARD = "Paragraf optional TRT-LLM tests require"
+GENERATED_TEST_RENAMES = {
+    "test_llm_api_autodeploy.py": "test_llm_api_paragraf_trtllm.py",
+    "test_ad_disagg.py": "test_paragraf_trtllm_disagg.py",
+    "test_ad_disagg_trtllm_serve.py": "test_paragraf_trtllm_disagg_serve.py",
+    "test_ad_guided_decoding.py": "test_paragraf_trtllm_guided_decoding.py",
+    "test_ad_speculative_decoding.py": "test_paragraf_trtllm_speculative_decoding.py",
+    "test_ad_dist_strategies.py": "test_paragraf_trtllm_dist_strategies.py",
+    "test_ad_build_small_multi.py": "test_paragraf_trtllm_build_small_multi.py",
+    "test_ad_moe_op.py": "test_paragraf_trtllm_moe_op.py",
+    "test_ad_executor_swa_eviction.py": "test_paragraf_trtllm_executor_swa_eviction.py",
+    "test_create_ad_executor.py": "test_create_paragraf_trtllm_executor.py",
+    "test_ad_build_small_single.py": "test_paragraf_trtllm_build_small_single.py",
+    "test_ad_guided_decoding_regex.py": "test_paragraf_trtllm_guided_decoding_regex.py",
+    "test_ad_trtllm_bench.py": "test_paragraf_trtllm_bench.py",
+    "test_ad_trtllm_sampler.py": "test_paragraf_trtllm_sampler.py",
+    "test_ad_trtllm_serve.py": "test_paragraf_trtllm_serve.py",
+}
 
 
 def _tracked_autodeploy_tests() -> set[Path]:
@@ -57,12 +74,18 @@ def _generated_test_path(source_path: Path) -> Path:
     torch_prefix = "tests/unittest/_torch/auto_deploy/"
     integration_prefix = "tests/integration/"
     if path.startswith(legacy_prefix):
-        return Path(path.removeprefix(legacy_prefix))
-    if path.startswith(torch_prefix):
-        return Path("_torch/auto_deploy") / path.removeprefix(torch_prefix)
-    if path.startswith(integration_prefix):
-        return Path("integration") / path.removeprefix(integration_prefix)
-    raise AssertionError(f"Unhandled AutoDeploy test path: {source_path}")
+        generated_path = Path(path.removeprefix(legacy_prefix))
+    elif path.startswith(torch_prefix):
+        generated_path = Path(path.removeprefix(torch_prefix))
+        if generated_path.parts[0] == "unit":
+            generated_path = Path(*generated_path.parts[1:])
+    elif path.startswith(integration_prefix):
+        generated_path = Path("integration") / path.removeprefix(integration_prefix)
+    else:
+        raise AssertionError(f"Unhandled AutoDeploy test path: {source_path}")
+    return generated_path.with_name(
+        GENERATED_TEST_RENAMES.get(generated_path.name, generated_path.name)
+    )
 
 
 @pytest.fixture(scope="module")
@@ -160,9 +183,26 @@ def test_copies_focused_integration_support(generated_package: Path) -> None:
     assert (integration_defs / "conftest.py").is_file()
     assert (integration_defs / "accuracy" / "accuracy_core.py").is_file()
     assert (integration_defs / "disaggregated" / "disagg_test_utils.py").is_file()
+    assert (generated_package / "runners" / "trtllm" / "model_registry" / "models.yaml").is_file()
+
+
+def test_uses_paragraf_test_layout(generated_package: Path) -> None:
+    generated_tests = generated_package / "tests"
+    assert not (generated_tests / "_torch" / "auto_deploy").exists()
+    assert not (generated_package / "examples" / "auto_deploy").exists()
+    assert not {
+        path.relative_to(generated_tests)
+        for path in generated_tests.rglob("*")
+        if "auto_deploy" in path.relative_to(generated_tests).parts
+    }
     assert (
-        generated_package / "examples" / "auto_deploy" / "model_registry" / "models.yaml"
+        generated_tests / "integration" / "defs" / "accuracy" / "test_llm_api_paragraf_trtllm.py"
     ).is_file()
+    assert (generated_tests / "singlegpu" / "models" / "test_gpt_oss_modeling.py").is_file()
+    stale_names = {
+        path.name for path in generated_tests.rglob("test*.py") if AUTODEPLOY.search(path.name)
+    }
+    assert not stale_names
 
 
 def test_does_not_add_test_guards_to_runners(generated_package: Path) -> None:
@@ -194,8 +234,8 @@ def test_rewrites_all_canonical_auto_deploy_imports(generated_package: Path) -> 
         Path("singlegpu/custom_ops/attention/test_trtllm_attention_op.py"),
         Path("singlegpu/shim/test_engine.py"),
         Path("multigpu/compile/test_bypass_captured_graphs.py"),
-        Path("_torch/auto_deploy/unit/singlegpu/models/test_gpt_oss_modeling.py"),
-        Path("integration/defs/examples/test_ad_guided_decoding.py"),
+        Path("singlegpu/models/test_gpt_oss_modeling.py"),
+        Path("integration/defs/examples/test_paragraf_trtllm_guided_decoding.py"),
     ],
     ids=str,
 )
@@ -222,7 +262,11 @@ def test_keeps_pure_standalone_tests_unguarded(
 
 def test_rewrites_runner_imports_in_optional_tests(generated_package: Path) -> None:
     content = (
-        generated_package / "tests" / "singlegpu" / "smoke" / "test_ad_build_small_single.py"
+        generated_package
+        / "tests"
+        / "singlegpu"
+        / "smoke"
+        / "test_paragraf_trtllm_build_small_single.py"
     ).read_text()
     assert "from build_and_run_ad import" not in content
     assert "from runners.trtllm.build_and_run_paragraf_trtllm import" in content
