@@ -2686,6 +2686,7 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
             },
             "tensor_parallel_size": 2,
             "moe_expert_parallel_size": 2,
+            "enable_autotuner": False,
         }
         gen_server_config = {
             "disable_overlap_scheduler": False,
@@ -2702,6 +2703,7 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
             },
             "tensor_parallel_size": 2,
             "moe_expert_parallel_size": 2,
+            "enable_autotuner": False,
         }
         disaggregated_server_config = {
             "hostname": "localhost",
