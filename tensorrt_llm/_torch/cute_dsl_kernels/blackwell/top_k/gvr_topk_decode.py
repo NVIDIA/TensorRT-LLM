@@ -2741,177 +2741,131 @@ class GvrTopKKernel:
                     smem_ptcnt[tidx] = smem_ptcnt_multi[
                         bc * cutlass.Int32(num_threads) + tidx]
                 cute.arch.barrier()
-                # ---- R0 miss: inline log-falsi R1 shot, then secant ----
-                # A single extra count pass at a log-count regula-falsi aim
-                # resolves the common near-boundary miss without the full
-                # secant loop. Fired only when BOTH bracket ends were actually
-                # measured by the rungs; otherwise (and on an R1 miss) the
-                # clean secant fallback runs. s_thr[1]/s_thr[2] are left at
-                # P1's pmin/pmax so the secant path sees the same state as if
-                # R0 had never run.
+                # ---- R0 miss: SEEDED bounded log-falsi refine ----
+                # At large N the M2D rungs straddle [K, kC]; the refine must
+                # find a threshold with count in [K, kC] between the measured
+                # rungs. SEED the loop with the rung bracket AND its known
+                # counts (clo/chi) so it does log-count regula-falsi from
+                # iter 0 with no re-measure and no separate R1 shot -> ~2-3
+                # count passes (op#26 efficiency) instead of ~6. done=1 on
+                # accept so Phase 3 skips its retry-shrink.
                 if bc < cutlass.Int32(0):
-                    if tidx == cutlass.Int32(0):
-                        M = cutlass.const_expr(self.M_thr)
-                        blo = v_lo
-                        bhi = v_hi
-                        clo = cutlass.Int32(-1)
-                        chi = cutlass.Int32(-1)
-                        # lo end = deepest rung that overshoots (count > kC)
-                        for m in cutlass.range_constexpr(M):
-                            if s_mt_cnt[m] > cutlass.Int32(self.kC):
-                                blo = s_mt_thr[m]
-                                clo = s_mt_cnt[m]
-                        # hi end = shallowest rung that undershoots (count < K)
-                        for m in cutlass.range_constexpr(M):
-                            mm = cutlass.const_expr(M - 1) - m
-                            if s_mt_cnt[mm] < cutlass.Int32(self.top_k):
-                                bhi = s_mt_thr[mm]
-                                chi = s_mt_cnt[mm]
-                        # Persist the MEASURED rung bracket so the fb_fix refine
-                        # starts tight (op#26 does this) instead of restarting
-                        # from P1's wide [pmin, pmax] -> far fewer count passes.
-                        s_thr[1] = blo
-                        s_thr[2] = bhi
-                        fire = cutlass.Int32(-1)
-                        if clo > cutlass.Int32(0) and chi >= cutlass.Int32(0):
-                            chic = chi
-                            if chic < cutlass.Int32(1):
-                                chic = cutlass.Int32(1)
-                            l_lo = cmath.log2(cutlass.Float32(clo), fastmath=True)
-                            l_hi = cmath.log2(cutlass.Float32(chic), fastmath=True)
-                            den = l_lo - l_hi
-                            if den > cutlass.Float32(0.0):
-                                f = (l_lo - cutlass.Float32(self.log2_r1aim)) / den
-                                if f < cutlass.Float32(0.05):
-                                    f = cutlass.Float32(0.05)
-                                if f > cutlass.Float32(0.95):
-                                    f = cutlass.Float32(0.95)
-                                nv = blo + (bhi - blo) * f
-                                if nv > blo and nv < bhi:
-                                    s_thr[0] = nv
-                                    fire = cutlass.Int32(1)
-                        s_r0col[0] = fire
-                    cute.arch.barrier()
-                    if s_r0col[0] == cutlass.Int32(1):
-                        # one single-threshold pass; smem_ptcnt comes out fresh
-                        # for Phase 3 on acceptance.
-                        self.block_count_ge(
-                            input_row, slice_start, slice_end, s_thr[0],
-                            smem_ptcnt, smem_wcnt, s_iscalars, s_cluster_partial,
-                            tidx, warp_id, lane,
-                            do_cluster_sync=do_cluster_sync,
-                            smem_input=smem_input)
-                        cute.arch.barrier()
+                    if cutlass.const_expr(self.fb_fix):
                         if tidx == cutlass.Int32(0):
-                            c1 = s_iscalars[0]
-                            if (c1 >= cutlass.Int32(self.top_k)
-                                    and c1 <= cutlass.Int32(self.kC)):
-                                s_r0col[0] = cutlass.Int32(0)   # R1 accepted
-                                # done=1 so Phase 3 honors the R1 threshold
-                                # (block_count_ge already set s_iscalars[0]/[5]
-                                # + fresh smem_ptcnt for the cluster collect).
-                                s_iscalars[1] = cutlass.Int32(1)
-                            else:
-                                s_r0col[0] = cutlass.Int32(-1)  # -> secant
+                            M = cutlass.const_expr(self.M_thr)
+                            blo = v_lo
+                            bhi = v_hi
+                            clo = cutlass.Int32(-1)
+                            chi = cutlass.Int32(-1)
+                            for m in cutlass.range_constexpr(M):
+                                if s_mt_cnt[m] > cutlass.Int32(self.kC):
+                                    blo = s_mt_thr[m]
+                                    clo = s_mt_cnt[m]
+                            for m in cutlass.range_constexpr(M):
+                                mm = cutlass.const_expr(M - 1) - m
+                                if s_mt_cnt[mm] < cutlass.Int32(self.top_k):
+                                    bhi = s_mt_thr[mm]
+                                    chi = s_mt_cnt[mm]
+                            s_thr[1] = blo
+                            s_thr[2] = bhi
+                            s_iscalars[2] = clo   # SEED known rung counts
+                            s_iscalars[3] = chi
+                            s_iscalars[1] = cutlass.Int32(0)   # done=0
+                            cand = (blo + bhi) * cutlass.Float32(0.5)
+                            if clo > cutlass.Int32(0) and chi >= cutlass.Int32(0):
+                                chic = chi
+                                if chic < cutlass.Int32(1):
+                                    chic = cutlass.Int32(1)
+                                l_lo = cmath.log2(cutlass.Float32(clo), fastmath=True)
+                                l_hi = cmath.log2(cutlass.Float32(chic), fastmath=True)
+                                den = l_lo - l_hi
+                                if den > cutlass.Float32(0.0):
+                                    t3 = (cutlass.Float32(self.log2_mstar) - l_hi) / den
+                                    cnd3 = bhi + t3 * (blo - bhi)
+                                    if cnd3 > blo and cnd3 < bhi:
+                                        cand = cnd3
+                            elif chi < cutlass.Int32(0):
+                                cand = bhi
+                            elif clo < cutlass.Int32(0):
+                                cand = blo
+                            s_thr[0] = cand
                         cute.arch.barrier()
-                    if s_r0col[0] < cutlass.Int32(0):
-                        if cutlass.const_expr(self.fb_fix):
-                            # fb_fix: bounded log-count regula-falsi refine
-                            # from P1's [pmin, pmax] with both end counts
-                            # unknown; converges into [K, kC] and sets done=1
-                            # so upstream Phase 3 skips its own retry-shrink.
-                            if tidx == cutlass.Int32(0):
-                                s_iscalars[1] = cutlass.Int32(0)   # done=0
-                                s_iscalars[2] = cutlass.Int32(-1)  # cnt_lo unknown
-                                s_iscalars[3] = cutlass.Int32(-1)  # cnt_hi unknown
-                                # defined rs=0 probe (op#26 forced the P2 seed;
-                                # the bracket midpoint is state-independent).
-                                s_thr[0] = (s_thr[1] + s_thr[2]) * cutlass.Float32(0.5)
-                            cute.arch.barrier()
-                            rs = cutlass.Int32(0)
-                            while (rs < cutlass.Int32(30)
-                                   and s_iscalars[1] == cutlass.Int32(0)):
-                                if rs > cutlass.Int32(0):
-                                    if tidx == cutlass.Int32(0):
-                                        lo3 = s_thr[1]
-                                        hi3 = s_thr[2]
-                                        clo3 = s_iscalars[2]
-                                        chi3 = s_iscalars[3]
-                                        cand = (lo3 + hi3) * cutlass.Float32(0.5)
-                                        if chi3 < cutlass.Int32(0):
-                                            cand = hi3          # measure hi end
-                                        elif clo3 < cutlass.Int32(0):
-                                            cand = lo3          # then lo end
-                                        else:
-                                            # both ends measured: log-count
-                                            # regula falsi aimed at m*.
-                                            chic = chi3
-                                            if chic < cutlass.Int32(1):
-                                                chic = cutlass.Int32(1)
-                                            l_lo = cmath.log2(cutlass.Float32(clo3), fastmath=True)
-                                            l_hi = cmath.log2(cutlass.Float32(chic), fastmath=True)
-                                            den3 = l_lo - l_hi
-                                            if den3 > cutlass.Float32(0.0):
-                                                t3 = (cutlass.Float32(self.log2_mstar) - l_hi) / den3
-                                                cnd3 = hi3 + t3 * (lo3 - hi3)
-                                                if cnd3 > lo3 and cnd3 < hi3:
-                                                    cand = cnd3
-                                        s_thr[0] = cand
-                                    cute.arch.barrier()
-                                self.block_count_ge(
-                                    input_row, slice_start, slice_end, s_thr[0],
-                                    smem_ptcnt, smem_wcnt, s_iscalars,
-                                    s_cluster_partial, tidx, warp_id, lane,
-                                    do_cluster_sync=do_cluster_sync,
-                                    smem_input=smem_input)
-                                cute.arch.barrier()
+                        rs = cutlass.Int32(0)
+                        while (rs < cutlass.Int32(8)
+                               and s_iscalars[1] == cutlass.Int32(0)):
+                            if rs > cutlass.Int32(0):
                                 if tidx == cutlass.Int32(0):
-                                    c3 = s_iscalars[0]
-                                    t3v = s_thr[0]
-                                    if (c3 >= cutlass.Int32(self.top_k)
-                                            and c3 <= cutlass.Int32(self.kC)):
-                                        s_iscalars[1] = cutlass.Int32(1)   # accept
-                                    elif c3 > cutlass.Int32(self.kC):
-                                        s_thr[1] = t3v          # measured lo end
-                                        s_iscalars[2] = c3
-                                        if t3v >= s_thr[2]:
-                                            rng3 = s_thr[2] - s_thr[1]
-                                            if rng3 < cutlass.Float32(1.0):
-                                                rng3 = cutlass.Float32(1.0)
-                                            s_thr[2] = s_thr[2] + rng3 * cutlass.Float32(8.0)
-                                            s_iscalars[3] = cutlass.Int32(-1)
+                                    lo3 = s_thr[1]
+                                    hi3 = s_thr[2]
+                                    clo3 = s_iscalars[2]
+                                    chi3 = s_iscalars[3]
+                                    cand = (lo3 + hi3) * cutlass.Float32(0.5)
+                                    if chi3 < cutlass.Int32(0):
+                                        cand = hi3
+                                    elif clo3 < cutlass.Int32(0):
+                                        cand = lo3
                                     else:
-                                        s_thr[2] = t3v          # measured hi end
-                                        s_iscalars[3] = c3
-                                        if t3v <= s_thr[1]:
-                                            rng3 = s_thr[2] - s_thr[1]
-                                            if rng3 < cutlass.Float32(1.0):
-                                                rng3 = cutlass.Float32(1.0)
-                                            s_thr[1] = s_thr[1] - rng3 * cutlass.Float32(8.0)
-                                            s_iscalars[2] = cutlass.Int32(-1)
+                                        chic = chi3
+                                        if chic < cutlass.Int32(1):
+                                            chic = cutlass.Int32(1)
+                                        l_lo = cmath.log2(cutlass.Float32(clo3), fastmath=True)
+                                        l_hi = cmath.log2(cutlass.Float32(chic), fastmath=True)
+                                        den3 = l_lo - l_hi
+                                        if den3 > cutlass.Float32(0.0):
+                                            t3 = (cutlass.Float32(self.log2_mstar) - l_hi) / den3
+                                            cnd3 = hi3 + t3 * (lo3 - hi3)
+                                            if cnd3 > lo3 and cnd3 < hi3:
+                                                cand = cnd3
+                                    s_thr[0] = cand
                                 cute.arch.barrier()
-                                rs = rs + cutlass.Int32(1)
-                            if s_iscalars[1] != cutlass.Int32(1):
-                                # CORRECTNESS-CRITICAL tie-plateau fallback: no
-                                # threshold yields count in [K, kC] (a value
-                                # tie block straddles the boundary). Land on
-                                # the measured undershoot side (count <= kC
-                                # guaranteed => no collect overflow). This is
-                                # the path the kC >= 5K 16-bit tie contract
-                                # protects and MUST be exercised by the tie
-                                # gate on silicon before enabling.
-                                self.block_count_ge(
-                                    input_row, slice_start, slice_end, s_thr[2],
-                                    smem_ptcnt, smem_wcnt, s_iscalars,
-                                    s_cluster_partial, tidx, warp_id, lane,
-                                    do_cluster_sync=do_cluster_sync,
-                                    smem_input=smem_input)
-                                cute.arch.barrier()
-                                if tidx == cutlass.Int32(0):
-                                    s_thr[0] = s_thr[2]
-                                    s_iscalars[1] = cutlass.Int32(1)
-                                cute.arch.barrier()
-                        else:
+                            self.block_count_ge(
+                                input_row, slice_start, slice_end, s_thr[0],
+                                smem_ptcnt, smem_wcnt, s_iscalars,
+                                s_cluster_partial, tidx, warp_id, lane,
+                                do_cluster_sync=do_cluster_sync,
+                                smem_input=smem_input)
+                            cute.arch.barrier()
+                            if tidx == cutlass.Int32(0):
+                                c3 = s_iscalars[0]
+                                t3v = s_thr[0]
+                                if (c3 >= cutlass.Int32(self.top_k)
+                                        and c3 <= cutlass.Int32(self.kC)):
+                                    s_iscalars[1] = cutlass.Int32(1)   # accept
+                                elif c3 > cutlass.Int32(self.kC):
+                                    s_thr[1] = t3v
+                                    s_iscalars[2] = c3
+                                    if t3v >= s_thr[2]:
+                                        rng3 = s_thr[2] - s_thr[1]
+                                        if rng3 < cutlass.Float32(1.0):
+                                            rng3 = cutlass.Float32(1.0)
+                                        s_thr[2] = s_thr[2] + rng3 * cutlass.Float32(8.0)
+                                        s_iscalars[3] = cutlass.Int32(-1)
+                                else:
+                                    s_thr[2] = t3v
+                                    s_iscalars[3] = c3
+                                    if t3v <= s_thr[1]:
+                                        rng3 = s_thr[2] - s_thr[1]
+                                        if rng3 < cutlass.Float32(1.0):
+                                            rng3 = cutlass.Float32(1.0)
+                                        s_thr[1] = s_thr[1] - rng3 * cutlass.Float32(8.0)
+                                        s_iscalars[2] = cutlass.Int32(-1)
+                            cute.arch.barrier()
+                            rs = rs + cutlass.Int32(1)
+                        if s_iscalars[1] != cutlass.Int32(1):
+                            # tie-plateau fail-soft: land on the measured
+                            # undershoot side (count <= kC => no overflow).
+                            self.block_count_ge(
+                                input_row, slice_start, slice_end, s_thr[2],
+                                smem_ptcnt, smem_wcnt, s_iscalars,
+                                s_cluster_partial, tidx, warp_id, lane,
+                                do_cluster_sync=do_cluster_sync,
+                                smem_input=smem_input)
+                            cute.arch.barrier()
+                            if tidx == cutlass.Int32(0):
+                                s_thr[0] = s_thr[2]
+                                s_iscalars[1] = cutlass.Int32(1)
+                            cute.arch.barrier()
+                    else:
                             self.phase2_secant_search(
                                 input_row, N, slice_start, slice_end,
                                 smem_ptcnt, smem_wcnt, s_thr, s_iscalars,
