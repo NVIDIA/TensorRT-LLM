@@ -32,6 +32,7 @@ from typing import Optional
 
 import cutlass
 import cutlass.cute as cute
+import cutlass.cute.math as cmath
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass.utils.distributed import atomicAdd
@@ -2545,12 +2546,77 @@ class GvrTopKKernel:
                     smem_ptcnt[tidx] = smem_ptcnt_multi[
                         bc * cutlass.Int32(num_threads) + tidx]
                 cute.arch.barrier()
+                # ---- R0 miss: inline log-falsi R1 shot, then secant ----
+                # A single extra count pass at a log-count regula-falsi aim
+                # resolves the common near-boundary miss without the full
+                # secant loop. Fired only when BOTH bracket ends were actually
+                # measured by the rungs; otherwise (and on an R1 miss) the
+                # clean secant fallback runs. s_thr[1]/s_thr[2] are left at
+                # P1's pmin/pmax so the secant path sees the same state as if
+                # R0 had never run.
                 if bc < cutlass.Int32(0):
-                    self.phase2_secant_search(
-                        input_row, N, slice_start, slice_end, smem_ptcnt,
-                        smem_wcnt, s_thr, s_iscalars, s_cluster_partial, tidx,
-                        warp_id, lane, do_cluster_sync=do_cluster_sync,
-                        smem_input=smem_input)
+                    if tidx == cutlass.Int32(0):
+                        M = cutlass.const_expr(self.M_thr)
+                        blo = v_lo
+                        bhi = v_hi
+                        clo = cutlass.Int32(-1)
+                        chi = cutlass.Int32(-1)
+                        # lo end = deepest rung that overshoots (count > kC)
+                        for m in cutlass.range_constexpr(M):
+                            if s_mt_cnt[m] > cutlass.Int32(self.kC):
+                                blo = s_mt_thr[m]
+                                clo = s_mt_cnt[m]
+                        # hi end = shallowest rung that undershoots (count < K)
+                        for m in cutlass.range_constexpr(M):
+                            mm = cutlass.const_expr(M - 1) - m
+                            if s_mt_cnt[mm] < cutlass.Int32(self.top_k):
+                                bhi = s_mt_thr[mm]
+                                chi = s_mt_cnt[mm]
+                        fire = cutlass.Int32(-1)
+                        if clo > cutlass.Int32(0) and chi >= cutlass.Int32(0):
+                            chic = chi
+                            if chic < cutlass.Int32(1):
+                                chic = cutlass.Int32(1)
+                            l_lo = cmath.log2(cutlass.Float32(clo), fastmath=True)
+                            l_hi = cmath.log2(cutlass.Float32(chic), fastmath=True)
+                            den = l_lo - l_hi
+                            if den > cutlass.Float32(0.0):
+                                f = (l_lo - cutlass.Float32(self.log2_r1aim)) / den
+                                if f < cutlass.Float32(0.05):
+                                    f = cutlass.Float32(0.05)
+                                if f > cutlass.Float32(0.95):
+                                    f = cutlass.Float32(0.95)
+                                nv = blo + (bhi - blo) * f
+                                if nv > blo and nv < bhi:
+                                    s_thr[0] = nv
+                                    fire = cutlass.Int32(1)
+                        s_r0col[0] = fire
+                    cute.arch.barrier()
+                    if s_r0col[0] == cutlass.Int32(1):
+                        # one single-threshold pass; smem_ptcnt comes out fresh
+                        # for Phase 3 on acceptance.
+                        self.block_count_ge(
+                            input_row, cutlass.Int32(0), N, s_thr[0],
+                            smem_ptcnt, smem_wcnt, s_iscalars, s_cluster_partial,
+                            tidx, warp_id, lane,
+                            do_cluster_sync=cutlass.Boolean(False),
+                            smem_input=smem_input)
+                        cute.arch.barrier()
+                        if tidx == cutlass.Int32(0):
+                            c1 = s_iscalars[0]
+                            if (c1 >= cutlass.Int32(self.top_k)
+                                    and c1 <= cutlass.Int32(self.kC)):
+                                s_r0col[0] = cutlass.Int32(0)   # R1 accepted
+                            else:
+                                s_r0col[0] = cutlass.Int32(-1)  # -> secant
+                        cute.arch.barrier()
+                    if s_r0col[0] < cutlass.Int32(0):
+                        self.phase2_secant_search(
+                            input_row, N, slice_start, slice_end, smem_ptcnt,
+                            smem_wcnt, s_thr, s_iscalars, s_cluster_partial,
+                            tidx, warp_id, lane,
+                            do_cluster_sync=do_cluster_sync,
+                            smem_input=smem_input)
             else:
                 self.phase2_secant_search(
                     input_row,
