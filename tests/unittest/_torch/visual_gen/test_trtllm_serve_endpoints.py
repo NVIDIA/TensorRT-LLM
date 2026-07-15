@@ -63,7 +63,7 @@ def _assert_llm_envelope(
 def _require_opencv():
     """Skip unless OpenCV is installed (the shared optional video decoder).
 
-    These tests drive ``_reference_is_video``, which decodes references via
+    These tests drive ``is_video_file``, which decodes references via
     OpenCV (the same optional dep the multimodal video path uses). ``cv2`` ships
     in no CI image, so this ``importorskip``-s it and returns the module for
     tests that synthesize a clip with ``cv2.VideoWriter``.
@@ -850,7 +850,7 @@ class TestVideoGenerationSync:
         # through as params.image (a filesystem path).
         params = video_client.mock_gen.last_params
         assert isinstance(params.image, str)
-        assert params.image.endswith("_reference.png")
+        assert params.image.endswith("_reference")
         assert os.path.exists(params.image)
 
     def test_sync_video_generation_multipart_with_video_reference(self, video_client, tmp_path):
@@ -887,12 +887,12 @@ class TestVideoGenerationSync:
 
         # Video content must NOT land on params.image; it rides
         # extra_params["video"] (the same pipeline entry the offline
-        # example's --video_path uses), stored with a .mp4 suffix.
+        # example's --video_path uses), stored without a type-suffix.
         params = video_client.mock_gen.last_params
         assert params.image is None
         assert isinstance(params.extra_params, dict)
         video_ref = params.extra_params["video"]
-        assert video_ref.endswith("_reference.mp4")
+        assert video_ref.endswith("_reference")
         assert os.path.exists(video_ref)
 
     def test_sync_video_generation_undecodable_reference_400(self, video_client):

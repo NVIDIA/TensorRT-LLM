@@ -11,7 +11,6 @@ from typing import Any, List, Optional
 import PIL.Image
 
 IMAGE_EXTENSIONS = frozenset({".png", ".jpg", ".jpeg", ".webp", ".bmp"})
-VIDEO_EXTENSIONS = frozenset({".mp4", ".avi"})
 
 
 def pil_to_rgb(value: Any) -> PIL.Image.Image:
@@ -57,15 +56,19 @@ def normalize_video_input_path(path: Path, max_frames: Optional[int] = None) -> 
             frame_paths = frame_paths[:max_frames]
         return frame_paths
 
-    suffix = path.suffix.lower()
-    if suffix in IMAGE_EXTENSIONS:
+    # Classify a single file by content, not by suffix: a decodable still is
+    # one conditioning frame; a decodable video is expanded to its frames.
+    # Extensions are unreliable — the serve path stores references with no
+    # type-suffix at all — so the container decides, not the name.
+    from tensorrt_llm.inputs.media_io import is_image_file, is_video_file
+
+    if is_image_file(path):
         return [str(path)]
-    if suffix in VIDEO_EXTENSIONS:
+    if is_video_file(path):
         return decode_video_file(path, max_frames=max_frames)
     raise ValueError(
-        "Cosmos3 video path must be a frame directory, an image file "
-        f"{sorted(IMAGE_EXTENSIONS)}, or a video file "
-        f"{sorted(VIDEO_EXTENSIONS)}; got {path}"
+        f"Cosmos3 reference must be a frame directory, a decodable image, "
+        f"or a decodable video; got {path}"
     )
 
 

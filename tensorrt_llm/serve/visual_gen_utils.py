@@ -4,9 +4,7 @@ import os
 import shutil
 from typing import Any, Dict, List, Optional
 
-from PIL import Image, UnidentifiedImageError
-
-from tensorrt_llm.inputs.media_io import _get_cv2
+from tensorrt_llm.inputs.media_io import is_image_file, is_video_file
 from tensorrt_llm.logger import logger
 from tensorrt_llm.serve.openai_protocol import ImageGenerationRequest, VideoGenerationRequest
 from tensorrt_llm.visual_gen import VisualGen, VisualGenParams
@@ -85,39 +83,6 @@ def _merge_extra_params(
 
     if not params.extra_params:
         params.extra_params = None
-
-
-def _reference_is_image(path: str) -> bool:
-    """True when ``path`` holds image content (anything PIL can open).
-
-    Capability-based: the supported set is whatever the decoder accepts,
-    with no enumerated format table. The probe parses only the header —
-    pixel decode stays in the worker.
-    """
-    try:
-        with Image.open(path):
-            return True
-    except UnidentifiedImageError:
-        return False
-
-
-def _reference_is_video(path: str) -> bool:
-    """True when ``path`` holds video content (an OpenCV-decodable video stream).
-
-    Total predicate over *content*: False for images, audio, and undecodable
-    content alike. Images must be excluded explicitly because FFmpeg demuxes a
-    still image as a valid single-frame video stream, so a video probe alone
-    would claim every PNG/JPEG. OpenCV is the optional decoder shared with the
-    multimodal video path; ``_get_cv2`` raises a clear install hint if missing.
-    """
-    if _reference_is_image(path):
-        return False
-    cv2 = _get_cv2()
-    capture = cv2.VideoCapture(path)
-    try:
-        return bool(capture.isOpened() and capture.read()[0])
-    finally:
-        capture.release()
 
 
 def parse_visual_gen_params(
@@ -204,18 +169,16 @@ def parse_visual_gen_params(
                 else:
                     with open(tmp_path, "wb") as f:
                         shutil.copyfileobj(request.input_reference.file, f)
-                # image, video, or reject.
-                if _reference_is_image(tmp_path):
+
+                if is_image_file(tmp_path):
                     is_video = False
-                elif _reference_is_video(tmp_path):
+                elif is_video_file(tmp_path):
                     is_video = True
                 else:
                     raise ValueError(
                         "input_reference content is neither a decodable image nor a decodable video."
                     )
-                ref_path = os.path.join(
-                    media_storage_path, f"{id}_reference{'.mp4' if is_video else '.png'}"
-                )
+                ref_path = os.path.join(media_storage_path, f"{id}_reference")
                 os.replace(tmp_path, ref_path)
             except Exception:
                 # Cleanup-and-reraise, not handling: every failure path —
