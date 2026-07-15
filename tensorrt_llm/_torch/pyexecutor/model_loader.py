@@ -1068,7 +1068,14 @@ class ModelLoader:
             return None
         spec_dec_mode = getattr(spec_config, "spec_dec_mode", None)
         mode_name = getattr(spec_dec_mode, "name", None)
-        return mode_name.lower() if isinstance(mode_name, str) else "unknown"
+        if not isinstance(mode_name, str):
+            logger.warning(
+                "Unable to identify the speculative decoding mode from %s; "
+                "post-transform sharing is disabled for this load.",
+                type(spec_dec_mode).__name__,
+            )
+            return "unknown"
+        return mode_name.lower()
 
     @classmethod
     def _qualify_post_transform_profile(

@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Unit tests for GMS-specific branches in ``ModelLoader``."""
 
+from collections.abc import Callable
 from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -173,8 +174,13 @@ class _PostTransformMxLoader:
         self.post_load_publish = MagicMock()
 
     @staticmethod
-    def _load_weights(*_args, **kwargs):
-        kwargs["prepare_post_transform_receiver"](kwargs["model"])
+    def _load_weights(
+        *_args: object,
+        prepare_post_transform_receiver: Callable[[nn.Module], None],
+        model: nn.Module,
+        **_kwargs: object,
+    ) -> dict[str, torch.Tensor]:
+        prepare_post_transform_receiver(model)
         return {}
 
     def is_post_transform_weights_preloaded(self) -> bool:
