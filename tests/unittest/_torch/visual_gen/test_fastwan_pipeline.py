@@ -21,10 +21,6 @@ TestFastWanComponentAccuracy
     against them to catch weight-loading bugs, quantization changes, or
     refactors that silently shift component outputs. Requires a real checkpoint.
 
-TestFastWanImageNotSupported
-    Verifies FastWan raises NotImplementedError on image input (text-to-video
-    only for now). No checkpoint required.
-
 Run:
     DIFFUSION_MODEL_PATH_FASTWAN=/path/to/checkpoint \\
         pytest tests/unittest/_torch/visual_gen/test_fastwan_pipeline.py -v -s
@@ -42,7 +38,6 @@ os.environ["TLLM_DISABLE_MPI"] = "1"
 import pytest
 import torch
 
-from tensorrt_llm._torch.visual_gen.models.wan.pipeline_fastwan import WanDMDPipeline
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
 from tensorrt_llm.visual_gen.args import AttentionConfig, TorchCompileConfig, VisualGenArgs
 
