@@ -510,6 +510,10 @@ class BasePipeline(nn.Module):
         acc.wrap()
         self.cache_accelerator = acc
 
+    @property
+    def cache_enabled(self) -> bool:
+        return self.cache_accelerator is not None and self.cache_accelerator.is_enabled()
+
     def setup_parallel_vae(self):
         """Enable parallel-VAE decode mode and wrap the VAE on participating ranks.
 
@@ -1065,7 +1069,7 @@ class BasePipeline(nn.Module):
         has_extra_streams = extra_streams is not None and len(extra_streams) > 0
 
         # Reset cache acceleration state for new generation (TeaCache / Cache-DiT)
-        if getattr(self, "cache_accelerator", None) and self.cache_accelerator.is_enabled():
+        if self.cache_enabled:
             self.cache_accelerator.refresh(total_steps)
 
         if self.rank == 0:
@@ -1203,7 +1207,7 @@ class BasePipeline(nn.Module):
             logger.info(f"Denoising done: {total_time:.2f}s ({total_time / total_steps:.2f}s/step)")
 
             # Single logging site for TeaCache and Cache-DiT.
-            if getattr(self, "cache_accelerator", None) and self.cache_accelerator.is_enabled():
+            if self.cache_enabled:
                 stats = self.cache_accelerator.get_stats()
                 if stats:
                     if self.pipeline_config.cache_backend == "cache_dit":

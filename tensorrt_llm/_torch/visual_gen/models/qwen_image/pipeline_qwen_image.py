@@ -30,6 +30,7 @@ from tensorrt_llm.logger import logger
 from .transformer_qwen_image import QwenImageTransformer2DModel
 
 # TeaCache polynomial coefficients for Qwen-Image.
+# Reference: https://github.com/vllm-project/vllm-omni/blob/main/vllm_omni/diffusion/cache/teacache/config.py#L30
 QWEN_IMAGE_TEACACHE_COEFFICIENTS = {
     "qwen": [
         -4.50000000e02,
@@ -535,18 +536,17 @@ class QwenImagePipeline(BasePipeline):
         timer.mark_denoise_start()
         logger.info(f"Denoising ({len(timesteps)} steps)...")
 
-        cache_acc = getattr(self, "cache_accelerator", None)
-
         # Reset cache state for this generation (TeaCache / Cache-DiT).
-        if cache_acc is not None and cache_acc.is_enabled():
-            cache_acc.refresh(len(timesteps))
+        cache_on = self.cache_enabled
+        if cache_on:
+            self.cache_accelerator.refresh(len(timesteps))
 
         for i, t in enumerate(timesteps):
             timestep = t.expand(latents.shape[0]).to(latents.dtype)
 
             # Conditional (positive) branch.
-            if cache_acc is not None:
-                self.transformer._cache_branch = None
+            if cache_on:
+                self.transformer._cache_branch = "cond"
             noise_pred = self.transformer(
                 hidden_states=latents,
                 timestep=timestep / 1000,
@@ -558,7 +558,7 @@ class QwenImagePipeline(BasePipeline):
 
             if do_true_cfg:
                 # Unconditional (negative) branch — separate cache state.
-                if cache_acc is not None:
+                if cache_on:
                     self.transformer._cache_branch = "uncond"
                 neg_noise_pred = self.transformer(
                     hidden_states=latents,
@@ -568,8 +568,8 @@ class QwenImagePipeline(BasePipeline):
                     img_shapes=img_shapes,
                     return_dict=False,
                 )[0]
-                if cache_acc is not None:
-                    self.transformer._cache_branch = None
+                if cache_on:
+                    self.transformer._cache_branch = "cond"
                 comb = neg_noise_pred + true_cfg_scale * (noise_pred - neg_noise_pred)
                 cond_norm = torch.norm(noise_pred, dim=-1, keepdim=True)
                 noise_norm = torch.norm(comb, dim=-1, keepdim=True)
@@ -581,8 +581,8 @@ class QwenImagePipeline(BasePipeline):
                 latents = latents.to(latents_dtype)
 
         if getattr(self, "rank", 0) == 0:
-            if cache_acc is not None and cache_acc.is_enabled():
-                stats = cache_acc.get_stats()
+            if cache_on:
+                stats = self.cache_accelerator.get_stats()
                 if stats and "hit_rate" in stats:
                     logger.info(
                         f"TeaCache: {stats['hit_rate']:.1%} hit rate "

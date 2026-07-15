@@ -23,7 +23,7 @@ from tensorrt_llm.logger import logger
 from ..config import CacheDiTConfig
 
 # Batched CFG: default enable_separate_cfg False (single cond+uncond batch).
-# Qwen-Image uses true CFG (two separate forward passes), not batched CFG,
+# Qwen-Image uses non-batched CFG (two separate forward passes),
 # so it has no enable_separate_cfg flag here.
 _WAN_CFG_DEFAULT = False
 _FLUX_CFG_DEFAULT = False
