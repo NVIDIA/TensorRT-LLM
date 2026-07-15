@@ -4972,6 +4972,13 @@ class TorchLlmArgs(BaseLlmArgs):
                 # spec-dec mode; MTP-Eagle one-model shares the Eagle3 one-model
                 # worker/metadata/sampler, so it rides the same unified
                 # production/acceptance path.
+                #
+                # Every supported path runs a neural draft head that yields a
+                # per-token proposal distribution q(x). Rejection sampling needs
+                # q to form min(1, p/q) and the (p - q)+ residual correction, so
+                # retrieval-based drafters that emit only token ids with no q are
+                # excluded: NGram is simply absent from this whitelist, and SA
+                # (sa_config) is rejected below via rs_sa_active.
                 from tensorrt_llm._torch.speculative.interface import \
                     SpeculativeDecodingMode as TorchSpeculativeDecodingMode
 
