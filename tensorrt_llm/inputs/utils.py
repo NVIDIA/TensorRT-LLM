@@ -451,6 +451,7 @@ class MultimodalDataTracker:
             self._item_order.append({
                 "modality": media_type,
                 "index": len(self._data[media_type]),
+                "placeholder": placeholder,
             })
         (self._embeddings
          if is_embedding else self._data)[media_type].append(data)
@@ -470,26 +471,44 @@ class MultimodalDataTracker:
     def item_order(self) -> List[Dict[str, Union[str, int]]]:
         """Prompt-order manifest of data-backed items.
 
-        Each entry is `{"modality": <str>, "index": <int>}` where `index`
-        is the item's position in `multi_modal_data[modality]`. The union
-        value type reflects those two typed fields.
+        Each entry is `{"modality": <str>, "index": <int>, "placeholder": <str>}`.
+        `index` is the item's position in `multi_modal_data[modality]`;
+        `placeholder` is the exact string the input processor will look
+        for when splicing this item's encoder embedding.
         """
         return list(self._item_order)
 
 
-def add_multimodal_placeholders(model_type: str, text_prompt: str,
-                                mm_placeholder_counts: dict[str, int]) -> str:
+def add_multimodal_placeholders(
+    model_type: str,
+    text_prompt: str,
+    mm_placeholder_counts: dict[str, int],
+    item_order: Optional[List[Dict[str, Union[str, int]]]] = None,
+) -> str:
     """Add multimodal placeholders to the text prompt.
 
-    Placeholders that already exist in the text are counted and subtracted
-    from the requested count to avoid double-insertion (e.g. when the
-    client already embeds ``<image>`` in the prompt text).
+    Placeholders already in the text are counted and subtracted to
+    avoid double-insertion (e.g. when the client already embeds
+    `<image>` in the prompt text). When `item_order` is supplied,
+    placeholders are emitted in prompt-arrival order (needed for mixed
+    modality); otherwise they follow `mm_placeholder_counts` iteration
+    order.
     """
+    if item_order:
+        wanted = [e["placeholder"] for e in item_order]
+    else:
+        wanted = [
+            ph for ph, n in mm_placeholder_counts.items() for _ in range(n)
+        ]
+
+    remaining = {ph: text_prompt.count(ph) for ph in set(wanted)}
     placeholders = []
-    for placeholder, count in mm_placeholder_counts.items():
-        existing = text_prompt.count(placeholder)
-        needed = max(0, count - existing)
-        placeholders.extend([placeholder] * needed)
+    for ph in wanted:
+        if remaining[ph] > 0:
+            remaining[ph] -= 1
+        else:
+            placeholders.append(ph)
+
     if not placeholders:
         return text_prompt
     parts = []

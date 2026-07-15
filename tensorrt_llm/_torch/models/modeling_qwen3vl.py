@@ -1619,10 +1619,6 @@ class Qwen3VLModelBase(PreTrainedModel, MultimodalModelMixin):
         placeholder_placement=MultimodalPlaceholderPlacement.BEFORE_TEXT,
         placeholders_separator="",
         content_format=ContentFormat.STRING,
-        # Place `<|image_pad|>` / `<|video_pad|>` at their content-part
-        # position so the rendered prompt token order agrees with
-        # `MultimodalParams.mm_item_order`.
-        interleave_placeholders=True,
     ),
 )
 class Qwen3VLModel(Qwen3VLModelBase):
