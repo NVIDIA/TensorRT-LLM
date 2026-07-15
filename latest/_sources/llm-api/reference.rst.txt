@@ -73,6 +73,14 @@ API Reference
     :member-order: groupwise
     :inherited-members:
 
+.. autoclass:: tensorrt_llm.llmapi.ConversationParams
+    :members:
+    :undoc-members:
+    :show-inheritance:
+    :special-members: __init__
+    :member-order: groupwise
+    :inherited-members:
+
 .. autoclass:: tensorrt_llm.llmapi.DisaggScheduleStyle
     :members:
     :undoc-members:
@@ -185,14 +193,6 @@ API Reference
     :member-order: groupwise
     :inherited-members:
 
-.. autoclass:: tensorrt_llm.llmapi.BuildConfig
-    :members:
-    :undoc-members:
-    :show-inheritance:
-    :special-members: __init__
-    :member-order: groupwise
-    :inherited-members:
-
 .. autoclass:: tensorrt_llm.llmapi.QuantConfig
     :members:
     :undoc-members:
@@ -210,14 +210,6 @@ API Reference
     :inherited-members:
 
 .. autoclass:: tensorrt_llm.llmapi.CalibConfig
-    :members:
-    :undoc-members:
-    :show-inheritance:
-    :special-members: __init__
-    :member-order: groupwise
-    :inherited-members:
-
-.. autoclass:: tensorrt_llm.llmapi.BuildCacheConfig
     :members:
     :undoc-members:
     :show-inheritance:
@@ -360,16 +352,7 @@ API Reference
     :special-members: __init__
     :member-order: groupwise
     :inherited-members:
-    :exclude-members: model_fields,copy,model_validate_strings,model_extra,model_validate,schema_json,model_dump,model_copy,model_fields_set,schema,model_parametrized_name,model_computed_fields,parse_file,model_dump_json,parse_raw,model_rebuild,json,dict,model_post_init,model_json_schema,model_validate_json,construct,update_forward_refs,validate,model_config,model_construct,parse_obj,from_orm
-
-.. autoclass:: tensorrt_llm.llmapi.TrtLlmArgs
-    :members:
-    :undoc-members:
-    :show-inheritance:
-    :special-members: __init__
-    :member-order: groupwise
-    :inherited-members:
-    :exclude-members: model_fields,copy,model_validate_strings,model_extra,model_validate,schema_json,model_dump,model_copy,model_fields_set,schema,model_parametrized_name,model_computed_fields,parse_file,model_dump_json,parse_raw,model_rebuild,json,dict,model_post_init,model_json_schema,model_validate_json,construct,update_forward_refs,validate,model_config,model_construct,parse_obj,from_orm
+    :exclude-members: from_orm,json,model_construct,model_validate,model_config,copy,construct,model_extra,model_fields_set,dict,update_forward_refs,model_dump,model_post_init,model_rebuild,parse_file,parse_raw,model_fields,model_validate_json,model_copy,model_computed_fields,model_dump_json,schema_json,model_parametrized_name,schema,validate,model_json_schema,parse_obj,model_validate_strings
 
 .. autoclass:: tensorrt_llm.llmapi.AutoDecodingConfig
     :members:
@@ -476,6 +459,14 @@ API Reference
     :inherited-members:
 
 .. autoclass:: tensorrt_llm.llmapi.add_thinking_budget_logits_processor
+    :members:
+    :undoc-members:
+    :show-inheritance:
+    :special-members: __init__
+    :member-order: groupwise
+    :inherited-members:
+
+.. autoclass:: tensorrt_llm.llmapi.DeepSeekV4SparseAttentionConfig
     :members:
     :undoc-members:
     :show-inheritance:

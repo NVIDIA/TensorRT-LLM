@@ -28,8 +28,8 @@
   </noscript>
   
   <!-- Loaded before other Sphinx assets -->
-  <link href="../../_static/styles/theme.css?digest=a95f357e85573c9b56d5" rel="stylesheet" />
-<link href="../../_static/styles/pydata-sphinx-theme.css?digest=a95f357e85573c9b56d5" rel="stylesheet" />
+  <link href="../../_static/styles/theme.css?digest=90905a2f556bf617f1a9" rel="stylesheet" />
+<link href="../../_static/styles/pydata-sphinx-theme.css?digest=90905a2f556bf617f1a9" rel="stylesheet" />
 
     <link rel="stylesheet" type="text/css" href="../../_static/pygments.css?v=8f2a1f02" />
     <link rel="stylesheet" type="text/css" href="../../_static/styles/nvidia-sphinx-theme.css?v=933278ad" />
@@ -40,10 +40,10 @@
     <link rel="stylesheet" type="text/css" href="../../_static/custom.css?v=19d20f17" />
   
   <!-- So that users can add custom icons -->
-  <script defer src="../../_static/scripts/fontawesome.js?digest=a95f357e85573c9b56d5"></script>
+  <script defer src="../../_static/scripts/fontawesome.js?digest=90905a2f556bf617f1a9"></script>
   <!-- Pre-loaded scripts that we'll load fully later -->
-  <link rel="preload" as="script" href="../../_static/scripts/bootstrap.js?digest=a95f357e85573c9b56d5" />
-<link rel="preload" as="script" href="../../_static/scripts/pydata-sphinx-theme.js?digest=a95f357e85573c9b56d5" />
+  <link rel="preload" as="script" href="../../_static/scripts/bootstrap.js?digest=90905a2f556bf617f1a9" />
+<link rel="preload" as="script" href="../../_static/scripts/pydata-sphinx-theme.js?digest=90905a2f556bf617f1a9" />
 
 
 
@@ -61,9 +61,9 @@
     <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
     <script>DOCUMENTATION_OPTIONS.pagename = 'blogs/tech_blog/blog01_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs';</script>
     <script>
-        DOCUMENTATION_OPTIONS.theme_version = '0.19.0';
+        DOCUMENTATION_OPTIONS.theme_version = '0.20.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc20';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc21';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc20" />
+  <meta name="docsearch:version" content="1.3.0rc21" />
   
     
     <script src="../../_static/searchtools.js"></script>
@@ -446,6 +446,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../../features/feature-combination-matrix.html">Feature Combination Matrix</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/disagg-serving.html">Disaggregated Serving</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/embeddings.html">Embeddings (Encoder-Only Models)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/kvcache.html">KV Cache System</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/long-sequence.html">Long Sequences</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/lora.html">LoRA (Low-Rank Adaptation)</a></li>
@@ -456,6 +457,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../../features/quantization.html">Quantization</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/sampling.html">Sampling</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/additional-outputs.html">Additional Outputs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/post-processor-hook.html">Post-Processing Hook</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/guided-decoding.html">Guided Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/speculative-decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/checkpoint-loading.html">Checkpoint Loading</a></li>
@@ -495,6 +497,7 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="current nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="blog25_Scaling_Video_Generation_Across_NVL72_Rack_with_TensorRT-LLM.html">Scaling Video Generation Across NVL72 rack with TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blog24_MoE_as_Dense_GEMM.html">MoE as Dense GEMM: Optimizing Low-Latency MoE Inference on NVIDIA Blackwell</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blog23_Joint_Optimization_of_Agent_Applications_and_TensorRT-LLM.html">Joint Optimization of Agent Applications and TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blog22_Helix_Parallelism_Scaling_Multi_Million_Token_Decoding_with_KV_Cache_Sharding.html">Helix Parallelism in TensorRT-LLM: Scaling Multi-Million-Token Decoding with KV Cache Sharding</a></li>
@@ -532,9 +535,9 @@
 <li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM">Github Code</a></li>
 <li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/issues?q=is%3Aissue%20state%3Aopen%20label%3Aroadmap">Roadmap</a></li>
 </ul>
-<p aria-level="2" class="caption" role="heading"><span class="caption-text">Use TensorRT Engine</span></p>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Migration</span></p>
 <ul class="nav bd-sidenav">
-<li class="toctree-l1"><a class="reference internal" href="../../legacy/tensorrt_quickstart.html">LLM API with TensorRT Engine</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../legacy/tensorrt-backend-removal.html">Migration Guide: TensorRT Backend Removed</a></li>
 </ul>
 </div>
 </nav></div>
@@ -586,39 +589,39 @@
 <div id="searchbox"></div>
                 <article class="bd-article">
                   
-  <section class="tex2jax_ignore mathjax_ignore" id="pushing-latency-boundaries-optimizing-deepseek-r1-performance-on-nvidia-b200-gpus">
+  <section id="pushing-latency-boundaries-optimizing-deepseek-r1-performance-on-nvidia-b200-gpus">
 <h1>Pushing Latency Boundaries: Optimizing DeepSeek-R1 Performance on NVIDIA B200 GPUs<a class="headerlink" href="#pushing-latency-boundaries-optimizing-deepseek-r1-performance-on-nvidia-b200-gpus" title="Link to this heading">#</a></h1>
 <p>by NVIDIA TensorRT LLM team</p>
 <section id="table-of-contents">
 <h2>Table of Contents<a class="headerlink" href="#table-of-contents" title="Link to this heading">#</a></h2>
 <ul class="simple">
-<li><p><a class="reference internal" href="#pushing-latency-boundaries-optimizing-deepseek-r1-performance-on-nvidia-b200-gpus">Pushing Latency Boundaries: Optimizing DeepSeek-R1 Performance on NVIDIA B200 GPUs</a></p>
+<li><p><a class="reference internal" href="#pushing-latency-boundaries-optimizing-deepseek-r1-performance-on-nvidia-b200-gpus"><span class="xref myst">Pushing Latency Boundaries: Optimizing DeepSeek-R1 Performance on NVIDIA B200 GPUs</span></a></p>
 <ul>
-<li><p><a class="reference internal" href="#table-of-contents">Table of Contents</a></p></li>
-<li><p><a class="reference internal" href="#background">Background</a></p></li>
-<li><p><a class="reference internal" href="#implementation-configuration">Implementation Configuration</a></p>
+<li><p><a class="reference internal" href="#table-of-contents"><span class="xref myst">Table of Contents</span></a></p></li>
+<li><p><a class="reference internal" href="../../torch/features/lora.html#background"><span class="std std-ref">Background</span></a></p></li>
+<li><p><a class="reference internal" href="#implementation-configuration"><span class="xref myst">Implementation Configuration</span></a></p>
 <ul>
-<li><p><a class="reference internal" href="#workload-profile">Workload Profile</a></p></li>
-<li><p><a class="reference internal" href="#model-architecture">Model Architecture</a></p></li>
-<li><p><a class="reference internal" href="#precision-strategy">Precision Strategy</a></p></li>
-<li><p><a class="reference internal" href="#parallelism-strategy">Parallelism Strategy</a></p></li>
-<li><p><a class="reference internal" href="#everything-in-one-diagram">Everything in One Diagram</a></p></li>
+<li><p><a class="reference internal" href="#workload-profile"><span class="xref myst">Workload Profile</span></a></p></li>
+<li><p><a class="reference internal" href="#model-architecture"><span class="xref myst">Model Architecture</span></a></p></li>
+<li><p><a class="reference internal" href="#precision-strategy"><span class="xref myst">Precision Strategy</span></a></p></li>
+<li><p><a class="reference internal" href="#parallelism-strategy"><span class="xref myst">Parallelism Strategy</span></a></p></li>
+<li><p><a class="reference internal" href="#everything-in-one-diagram"><span class="xref myst">Everything in One Diagram</span></a></p></li>
 </ul>
 </li>
-<li><p><a class="reference internal" href="#key-optimizations">Key Optimizations</a></p>
+<li><p><a class="reference internal" href="#key-optimizations"><span class="xref myst">Key Optimizations</span></a></p>
 <ul>
-<li><p><a class="reference internal" href="#system-level-optimizations">System Level optimizations</a></p>
+<li><p><a class="reference internal" href="#system-level-optimizations"><span class="xref myst">System Level optimizations</span></a></p>
 <ul>
-<li><p><a class="reference internal" href="#cuda-graph-programmatic-dependent-launch">CUDA Graph &amp; Programmatic Dependent Launch</a></p></li>
-<li><p><a class="reference internal" href="#mtp">MTP</a></p>
+<li><p><a class="reference internal" href="#cuda-graph--programmatic-dependent-launch"><span class="xref myst">CUDA Graph &amp; Programmatic Dependent Launch</span></a></p></li>
+<li><p><a class="reference internal" href="../../features/speculative-decoding.html#mtp"><span class="std std-ref">MTP</span></a></p>
 <ul>
 <li><p><a class="reference internal" href="#autoregressive-mtp-layers"><span class="xref myst">Autoregressive MTP Layers</span></a></p></li>
 <li><p><a class="reference internal" href="#relax-acceptance-verification"><span class="xref myst">Relax Acceptance Verification</span></a></p></li>
 </ul>
 </li>
-<li><p><a class="reference internal" href="#multi-streams">Multi-streams</a></p></li>
-<li><p><a class="reference internal" href="#sparse-experts-as-gemms-only-works-when-moe-backend-cutlass">Sparse Experts as GEMMs (only works when moe_backend=CUTLASS)</a></p></li>
-<li><p><a class="reference internal" href="#re-balanced-the-sparse-experts">Re-balanced the sparse experts</a></p>
+<li><p><a class="reference internal" href="blog15_Optimizing_DeepSeek_V32_on_NVIDIA_Blackwell_GPUs.html#multi-streams"><span class="std std-ref">Multi-streams</span></a></p></li>
+<li><p><a class="reference internal" href="#sparse-experts-as-gemms-only-works-when-moe_backendcutlass"><span class="xref myst">Sparse Experts as GEMMs (only works when moe_backend=CUTLASS)</span></a></p></li>
+<li><p><a class="reference internal" href="#re-balanced-the-sparse-experts"><span class="xref myst">Re-balanced the sparse experts</span></a></p>
 <ul>
 <li><p><a class="reference internal" href="#mixed-etp"><span class="xref myst">Mixed ETP</span></a></p></li>
 <li><p><a class="reference internal" href="#smart-router"><span class="xref myst">Smart Router</span></a></p></li>
@@ -626,30 +629,30 @@
 </li>
 </ul>
 </li>
-<li><p><a class="reference internal" href="#kernel-level-optimizations">Kernel Level optimizations</a></p>
+<li><p><a class="reference internal" href="#kernel-level-optimizations"><span class="xref myst">Kernel Level optimizations</span></a></p>
 <ul>
-<li><p><a class="reference internal" href="#attention-kernel">Attention Kernel</a></p></li>
-<li><p><a class="reference internal" href="#grouped-gemm">Grouped GEMM</a></p>
+<li><p><a class="reference internal" href="#attention-kernel"><span class="xref myst">Attention Kernel</span></a></p></li>
+<li><p><a class="reference internal" href="#grouped-gemm"><span class="xref myst">Grouped GEMM</span></a></p>
 <ul>
 <li><p><a class="reference internal" href="#cutlass-backend-default-backend"><span class="xref myst">CUTLASS Backend (default backend)</span></a></p></li>
 <li><p><a class="reference internal" href="#trtllm-backend"><span class="xref myst">TRTLLM Backend</span></a></p></li>
 </ul>
 </li>
-<li><p><a class="reference internal" href="#communication-kernel">Communication Kernel</a></p></li>
-<li><p><a class="reference internal" href="#dense-gemm-optimization">Dense GEMM optimization</a></p>
+<li><p><a class="reference internal" href="#communication-kernel"><span class="xref myst">Communication Kernel</span></a></p></li>
+<li><p><a class="reference internal" href="#dense-gemm-optimization"><span class="xref myst">Dense GEMM optimization</span></a></p>
 <ul>
 <li><p><a class="reference internal" href="#fuse-a-gemm"><span class="std std-ref">Fuse_A_GEMM</span></a></p></li>
 <li><p><a class="reference internal" href="#routergemm"><span class="std std-ref">RouterGEMM</span></a></p></li>
 </ul>
 </li>
-<li><p><a class="reference internal" href="#kernel-fusion">Kernel fusion</a></p></li>
+<li><p><a class="reference internal" href="#kernel-fusion"><span class="xref myst">Kernel fusion</span></a></p></li>
 </ul>
 </li>
 </ul>
 </li>
-<li><p><a class="reference internal" href="#how-to-reproduce">How to reproduce</a></p></li>
-<li><p><a class="reference internal" href="#future-works">Future Works</a></p></li>
-<li><p><a class="reference internal" href="#acknowledgment">Acknowledgment</a></p></li>
+<li><p><a class="reference internal" href="#how-to-reproduce"><span class="xref myst">How to reproduce</span></a></p></li>
+<li><p><a class="reference internal" href="#future-works"><span class="xref myst">Future Works</span></a></p></li>
+<li><p><a class="reference internal" href="blog22_Helix_Parallelism_Scaling_Multi_Million_Token_Decoding_with_KV_Cache_Sharding.html#acknowledgment"><span class="std std-ref">Acknowledgment</span></a></p></li>
 </ul>
 </li>
 </ul>
@@ -1193,8 +1196,8 @@
   
 
   <!-- Scripts loaded after <body> so the DOM is not blocked -->
-  <script defer src="../../_static/scripts/bootstrap.js?digest=a95f357e85573c9b56d5"></script>
-<script defer src="../../_static/scripts/pydata-sphinx-theme.js?digest=a95f357e85573c9b56d5"></script>
+  <script defer src="../../_static/scripts/bootstrap.js?digest=90905a2f556bf617f1a9"></script>
+<script defer src="../../_static/scripts/pydata-sphinx-theme.js?digest=90905a2f556bf617f1a9"></script>
 
 
   <footer class="bd-footer">
@@ -1266,9 +1269,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on June 27, 2026.</p>
+  <p>Last updated on July 14, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/c25c23f">c25c23f</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/1662a87">1662a87</a>.</p>
   
 </div></div>
       

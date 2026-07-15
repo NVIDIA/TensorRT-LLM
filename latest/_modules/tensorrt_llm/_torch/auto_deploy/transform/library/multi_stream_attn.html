@@ -27,8 +27,8 @@
   </noscript>
   
   <!-- Loaded before other Sphinx assets -->
-  <link href="../../../../../../_static/styles/theme.css?digest=a95f357e85573c9b56d5" rel="stylesheet" />
-<link href="../../../../../../_static/styles/pydata-sphinx-theme.css?digest=a95f357e85573c9b56d5" rel="stylesheet" />
+  <link href="../../../../../../_static/styles/theme.css?digest=90905a2f556bf617f1a9" rel="stylesheet" />
+<link href="../../../../../../_static/styles/pydata-sphinx-theme.css?digest=90905a2f556bf617f1a9" rel="stylesheet" />
 
     <link rel="stylesheet" type="text/css" href="../../../../../../_static/pygments.css?v=8f2a1f02" />
     <link rel="stylesheet" type="text/css" href="../../../../../../_static/styles/nvidia-sphinx-theme.css?v=933278ad" />
@@ -39,10 +39,10 @@
     <link rel="stylesheet" type="text/css" href="../../../../../../_static/custom.css?v=19d20f17" />
   
   <!-- So that users can add custom icons -->
-  <script defer src="../../../../../../_static/scripts/fontawesome.js?digest=a95f357e85573c9b56d5"></script>
+  <script defer src="../../../../../../_static/scripts/fontawesome.js?digest=90905a2f556bf617f1a9"></script>
   <!-- Pre-loaded scripts that we'll load fully later -->
-  <link rel="preload" as="script" href="../../../../../../_static/scripts/bootstrap.js?digest=a95f357e85573c9b56d5" />
-<link rel="preload" as="script" href="../../../../../../_static/scripts/pydata-sphinx-theme.js?digest=a95f357e85573c9b56d5" />
+  <link rel="preload" as="script" href="../../../../../../_static/scripts/bootstrap.js?digest=90905a2f556bf617f1a9" />
+<link rel="preload" as="script" href="../../../../../../_static/scripts/pydata-sphinx-theme.js?digest=90905a2f556bf617f1a9" />
 
 
 
@@ -278,6 +278,25 @@ let darkTheme = isDarkTheme();
 let modal = null;
 let modalContent = null;
 let previousScrollOffset = [window.scrollX, window.scrollY];
+let _lazyObserver = null;
+let _renderQueue = Promise.resolve();
+
+// Apply d3 zoom to each SVG. Idempotent: an SVG already wrapped is skipped,
+// so this is safe to call both for the initial batch and for diagrams that
+// render lazily once they become visible.
+const addZoomToSvgs = (svgs) => {
+    svgs.each(function() {
+        if (this.getAttribute('data-zoom-applied') === 'true') return;
+        var svg = d3.select(this);
+        svg.html("<g class='wrapper'>" + svg.html() + "</g>");
+        var inner = svg.select("g");
+        var zoom = d3.zoom().on("zoom", function(event) {
+            inner.attr("transform", event.transform);
+        });
+        svg.call(zoom);
+        this.setAttribute('data-zoom-applied', 'true');
+    });
+};
 
 const runMermaid = async (rerun) => {
     console.log("Running mermaid diagrams, rerun =", rerun);
@@ -285,7 +304,15 @@ const runMermaid = async (rerun) => {
     let all_mermaids = document.querySelectorAll(".mermaid");
 
     if (rerun) {
+        // Disconnect any previous lazy rendering observer
+        if (_lazyObserver) {
+            _lazyObserver.disconnect();
+            _lazyObserver = null;
+        }
+
         all_mermaids.forEach((el) => {
+            el.removeAttribute('data-mermaid-deferred');
+            el.removeAttribute('data-mermaid-render-failed');
             if(!el.hasAttribute("data-original-code")) {
                 // store original code
                 // console.log(`Storing original code for first run: `, el.innerHTML);
@@ -302,35 +329,89 @@ const runMermaid = async (rerun) => {
                 el.setAttribute('data-original-code', el.innerHTML);
             }
         });
-        await mermaid.run();
+
+        // Separate visible and hidden elements. Mermaid's layout engine measures
+        // text dimensions via the DOM, which fails for elements hidden by a parent
+        // (e.g., Reveal.js non-active slides, sphinx-design unopened tabs),
+        // producing broken SVGs. Render visible elements now, defer hidden ones.
+        const visible = [];
+        const hidden = [];
+        all_mermaids.forEach((el) => {
+            // offsetParent is null for display:none ancestors.
+            // getClientRects().length > 0 catches position:fixed elements
+            // (which also have null offsetParent but are still visible).
+            if (el.offsetParent !== null || el.getClientRects().length > 0) {
+                visible.push(el);
+            } else {
+                hidden.push(el);
+                el.setAttribute('data-mermaid-deferred', 'true');
+            }
+        });
+
+        if (visible.length > 0) {
+            try {
+                await mermaid.run({ nodes: visible });
+            } catch (e) {
+                console.error("Mermaid rendering failed:", e);
+            }
+        }
+
+        // Lazily render hidden elements when they become visible.
+        // Uses a promise chain (_renderQueue) to serialize rendering,
+        // since IntersectionObserver may report multiple entries at once
+        // and mermaid.run() is not safe to call concurrently.
+        if (hidden.length > 0) {
+            if (typeof IntersectionObserver === 'undefined') {
+                console.warn("IntersectionObserver not available; hidden mermaid diagrams will not render.");
+            } else {
+                _renderQueue = Promise.resolve();
+                _lazyObserver = new IntersectionObserver((entries) => {
+                    for (const entry of entries) {
+                        if (entry.isIntersecting && entry.target.getAttribute("data-processed") !== "true") {
+                            _lazyObserver.unobserve(entry.target);
+                            const el = entry.target;
+                            _renderQueue = _renderQueue.then(async () => {
+                                try {
+                                    await mermaid.run({ nodes: [el] });
+                                    el.removeAttribute('data-mermaid-deferred');
+                                    // Apply zoom to the now-rendered diagram, matching
+                                    // the decoration visible diagrams receive.
+                                    if ("False" === "True") {
+                                        addZoomToSvgs(d3.selectAll(""));
+                                    }
+                                } catch (e) {
+                                    console.error("Mermaid deferred rendering failed:", e);
+                                    el.removeAttribute('data-mermaid-deferred');
+                                    el.setAttribute('data-mermaid-render-failed', 'true');
+                                }
+                            });
+                        }
+                    }
+                });
+                hidden.forEach((el) => _lazyObserver.observe(el));
+            }
+        }
     }
 
     all_mermaids = document.querySelectorAll(".mermaid");
-    const mermaids_processed = document.querySelectorAll(".mermaid[data-processed='true']");
+    // Exclude deferred (hidden) and render-failed elements from completion checks
+    const mermaids_active = document.querySelectorAll(".mermaid:not([data-mermaid-deferred]):not([data-mermaid-render-failed])");
+    const mermaids_processed = document.querySelectorAll(".mermaid:not([data-mermaid-deferred]):not([data-mermaid-render-failed])[data-processed='true']");
 
     if ("False" === "True") {
-        const mermaids_to_add_zoom = -1 === -1 ? all_mermaids.length : -1;
+        const mermaids_to_add_zoom = -1 === -1 ? mermaids_active.length : -1;
         if(mermaids_to_add_zoom > 0) {
             var svgs = d3.selectAll("");
-            if(all_mermaids.length !== mermaids_processed.length) {
+            // Wait until every active (visible) diagram has rendered. Deferred
+            // diagrams are excluded, so a fixed d3_node_count that counts a
+            // hidden diagram no longer loops forever waiting for its SVG.
+            if(mermaids_active.length !== mermaids_processed.length) {
                 setTimeout(() => runMermaid(false), 200);
                 return;
-            } else if(svgs.size() !== mermaids_to_add_zoom) {
-                setTimeout(() => runMermaid(false), 200);
-                return;
-            } else {
-                svgs.each(function() {
-                    var svg = d3.select(this);
-                    svg.html("<g class='wrapper'>" + svg.html() + "</g>");
-                    var inner = svg.select("g");
-                    var zoom = d3.zoom().on("zoom", function(event) {
-                        inner.attr("transform", event.transform);
-                    });
-                    svg.call(zoom);
-                });
             }
+            addZoomToSvgs(svgs);
         }
-    } else if(all_mermaids.length !== mermaids_processed.length) {
+    } else if(mermaids_active.length !== mermaids_processed.length) {
         // Wait for mermaid to process all diagrams
         setTimeout(() => runMermaid(false), 200);
         return;
@@ -496,9 +577,9 @@ window.addEventListener("load", load);
 window.runMermaid = runMermaid;</script>
     <script>DOCUMENTATION_OPTIONS.pagename = '_modules/tensorrt_llm/_torch/auto_deploy/transform/library/multi_stream_attn';</script>
     <script>
-        DOCUMENTATION_OPTIONS.theme_version = '0.19.0';
+        DOCUMENTATION_OPTIONS.theme_version = '0.20.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc20';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc21';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -512,7 +593,7 @@ window.runMermaid = runMermaid;</script>
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc20" />
+  <meta name="docsearch:version" content="1.3.0rc21" />
   
     
     <script src="../../../../../../_static/searchtools.js"></script>
@@ -875,6 +956,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l1"><a class="reference internal" href="../../../../../../features/feature-combination-matrix.html">Feature Combination Matrix</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../../../features/attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../../../features/disagg-serving.html">Disaggregated Serving</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../../features/embeddings.html">Embeddings (Encoder-Only Models)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../../../features/kvcache.html">KV Cache System</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../../../features/long-sequence.html">Long Sequences</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../../../features/lora.html">LoRA (Low-Rank Adaptation)</a></li>
@@ -885,6 +967,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l1"><a class="reference internal" href="../../../../../../features/quantization.html">Quantization</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../../../features/sampling.html">Sampling</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../../../features/additional-outputs.html">Additional Outputs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../../features/post-processor-hook.html">Post-Processing Hook</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../../../features/guided-decoding.html">Guided Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../../../features/speculative-decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../../../features/checkpoint-loading.html">Checkpoint Loading</a></li>
@@ -924,6 +1007,7 @@ window.runMermaid = runMermaid;</script>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../../../../../blogs/tech_blog/blog25_Scaling_Video_Generation_Across_NVL72_Rack_with_TensorRT-LLM.html">Scaling Video Generation Across NVL72 rack with TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../../../blogs/tech_blog/blog24_MoE_as_Dense_GEMM.html">MoE as Dense GEMM: Optimizing Low-Latency MoE Inference on NVIDIA Blackwell</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../../../blogs/tech_blog/blog23_Joint_Optimization_of_Agent_Applications_and_TensorRT-LLM.html">Joint Optimization of Agent Applications and TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../../../blogs/tech_blog/blog22_Helix_Parallelism_Scaling_Multi_Million_Token_Decoding_with_KV_Cache_Sharding.html">Helix Parallelism in TensorRT-LLM: Scaling Multi-Million-Token Decoding with KV Cache Sharding</a></li>
@@ -961,9 +1045,9 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM">Github Code</a></li>
 <li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/issues?q=is%3Aissue%20state%3Aopen%20label%3Aroadmap">Roadmap</a></li>
 </ul>
-<p aria-level="2" class="caption" role="heading"><span class="caption-text">Use TensorRT Engine</span></p>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Migration</span></p>
 <ul class="nav bd-sidenav">
-<li class="toctree-l1"><a class="reference internal" href="../../../../../../legacy/tensorrt_quickstart.html">LLM API with TensorRT Engine</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../../legacy/tensorrt-backend-removal.html">Migration Guide: TensorRT Backend Removed</a></li>
 </ul>
 </div>
 </nav></div>
@@ -1143,6 +1227,15 @@ window.runMermaid = runMermaid;</script>
 <span class="c1"># (and therefore a separate symm_mem workspace), so a concurrent main-stream</span>
 <span class="c1"># allgather on workspace_id=0 cannot clobber its buffer.</span>
 <span class="n">_AUX_WORKSPACE_ID</span> <span class="o">=</span> <span class="mi">1</span>
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">_is_narrow_op</span><span class="p">(</span><span class="n">n</span><span class="p">:</span> <span class="n">Node</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;True for either narrow representation: aten.narrow.default or the</span>
+<span class="sd">    torch.narrow built-in (emitted by the generic fuse_gemms split).&quot;&quot;&quot;</span>
+    <span class="k">return</span> <span class="n">n</span><span class="o">.</span><span class="n">op</span> <span class="o">==</span> <span class="s2">&quot;call_function&quot;</span> <span class="ow">and</span> <span class="n">n</span><span class="o">.</span><span class="n">target</span> <span class="ow">in</span> <span class="p">(</span>
+        <span class="n">torch</span><span class="o">.</span><span class="n">narrow</span><span class="p">,</span>
+        <span class="n">torch</span><span class="o">.</span><span class="n">ops</span><span class="o">.</span><span class="n">aten</span><span class="o">.</span><span class="n">narrow</span><span class="o">.</span><span class="n">default</span><span class="p">,</span>
+    <span class="p">)</span>
 
 
 <span class="k">def</span><span class="w"> </span><span class="nf">_is_linear</span><span class="p">(</span><span class="n">node</span><span class="p">:</span> <span class="n">Node</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
@@ -1371,6 +1464,117 @@ window.runMermaid = runMermaid;</script>
 
 
 <span class="c1"># ===========================================================================</span>
+<span class="c1"># Pattern 3 (V12): Full KV path on aux WITHOUT AllGather (sharding-excluded case)</span>
+<span class="c1"># ===========================================================================</span>
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">_execute_kv_path_in_aux_stream_no_allgather</span><span class="p">(</span>
+    <span class="n">gm</span><span class="p">:</span> <span class="n">GraphModule</span><span class="p">,</span> <span class="n">world_size</span><span class="p">:</span> <span class="nb">int</span>
+<span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tuple</span><span class="p">[</span><span class="n">GraphModule</span><span class="p">,</span> <span class="nb">int</span><span class="p">]:</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;V12 pattern: full KV path on aux when KV linear has no AllGather downstream.</span>
+
+<span class="sd">    Triggers when:</span>
+<span class="sd">      - Unfused Q/KV GEMMs (two linears share fork point), AND</span>
+<span class="sd">      - KV linear has NO AllGather downstream (e.g., yaml ``exclude_shard_node_filter``</span>
+<span class="sd">        excludes ``kv_a_proj_with_mqa`` from tensor-parallel sharding).</span>
+
+<span class="sd">    This is the PT-pattern equivalent for AD: KV path (kv_linear + split +</span>
+<span class="sd">    kv_a_layernorm + view) all on aux stream, in parallel with Q path on main.</span>
+
+<span class="sd">    Pattern 2 (post fuse_dsv3) wraps only the small KV-cone after the fused</span>
+<span class="sd">    GEMM narrow. Pattern 3 wraps the larger KV chain starting from kv_linear,</span>
+<span class="sd">    which is closer to what PT does in attention.py:1696 and avoids the CUDA</span>
+<span class="sd">    driver folding small aux chunks back into main.</span>
+<span class="sd">    &quot;&quot;&quot;</span>
+    <span class="n">triples</span> <span class="o">=</span> <span class="n">_find_mla_qkv_pairs</span><span class="p">(</span><span class="n">gm</span><span class="p">)</span>
+    <span class="k">if</span> <span class="ow">not</span> <span class="n">triples</span><span class="p">:</span>
+        <span class="k">return</span> <span class="n">gm</span><span class="p">,</span> <span class="mi">0</span>
+
+    <span class="n">graph</span> <span class="o">=</span> <span class="n">gm</span><span class="o">.</span><span class="n">graph</span>
+    <span class="n">node_order</span> <span class="o">=</span> <span class="p">{</span><span class="n">n</span><span class="p">:</span> <span class="n">i</span> <span class="k">for</span> <span class="n">i</span><span class="p">,</span> <span class="n">n</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="n">graph</span><span class="o">.</span><span class="n">nodes</span><span class="p">)}</span>
+    <span class="n">num_matches</span> <span class="o">=</span> <span class="mi">0</span>
+
+    <span class="c1"># event_id is a stable per-match id (one per MLA fork) so each layer gets its</span>
+    <span class="c1"># own main/aux CUDA event; without it monolithic CG capture dedups the shared</span>
+    <span class="c1"># event recorded N times and the Q/KV overlap collapses across layers.</span>
+    <span class="k">for</span> <span class="n">event_id</span><span class="p">,</span> <span class="p">(</span><span class="n">fork_point</span><span class="p">,</span> <span class="n">q_linear</span><span class="p">,</span> <span class="n">kv_linear</span><span class="p">)</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="n">triples</span><span class="p">):</span>
+        <span class="c1"># Skip if kv_linear has an AllGather downstream — that&#39;s pattern 0&#39;s job.</span>
+        <span class="n">kv_ag</span> <span class="o">=</span> <span class="n">_find_downstream_node</span><span class="p">(</span><span class="n">kv_linear</span><span class="p">,</span> <span class="k">lambda</span> <span class="n">n</span><span class="p">:</span> <span class="n">is_op</span><span class="p">(</span><span class="n">n</span><span class="p">,</span> <span class="n">all_gather_ops</span><span class="p">()),</span> <span class="n">max_depth</span><span class="o">=</span><span class="mi">2</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">kv_ag</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">continue</span>
+
+        <span class="c1"># BFS forward from kv_linear to find the mla_op and the KV chain nodes.</span>
+        <span class="n">mla_op</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Node</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="n">kv_chain_set</span> <span class="o">=</span> <span class="p">{</span><span class="n">kv_linear</span><span class="p">}</span>
+        <span class="n">queue</span><span class="p">:</span> <span class="n">deque</span><span class="p">[</span><span class="n">Node</span><span class="p">]</span> <span class="o">=</span> <span class="n">deque</span><span class="p">([</span><span class="n">kv_linear</span><span class="p">])</span>
+        <span class="k">while</span> <span class="n">queue</span><span class="p">:</span>
+            <span class="n">n</span> <span class="o">=</span> <span class="n">queue</span><span class="o">.</span><span class="n">popleft</span><span class="p">()</span>
+            <span class="n">tgt_str</span> <span class="o">=</span> <span class="nb">str</span><span class="p">(</span><span class="nb">getattr</span><span class="p">(</span><span class="n">n</span><span class="p">,</span> <span class="s2">&quot;target&quot;</span><span class="p">,</span> <span class="s2">&quot;&quot;</span><span class="p">))</span>
+            <span class="k">if</span> <span class="s2">&quot;trtllm_mla&quot;</span> <span class="ow">in</span> <span class="n">tgt_str</span> <span class="ow">or</span> <span class="s2">&quot;torch_mla&quot;</span> <span class="ow">in</span> <span class="n">tgt_str</span><span class="p">:</span>
+                <span class="n">mla_op</span> <span class="o">=</span> <span class="n">n</span>
+                <span class="k">continue</span>
+            <span class="k">for</span> <span class="n">u</span> <span class="ow">in</span> <span class="n">n</span><span class="o">.</span><span class="n">users</span><span class="p">:</span>
+                <span class="k">if</span> <span class="n">u</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">kv_chain_set</span><span class="p">:</span>
+                    <span class="n">kv_chain_set</span><span class="o">.</span><span class="n">add</span><span class="p">(</span><span class="n">u</span><span class="p">)</span>
+                    <span class="n">queue</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">u</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">mla_op</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">continue</span>
+
+        <span class="n">kv_chain</span> <span class="o">=</span> <span class="p">[</span><span class="n">n</span> <span class="k">for</span> <span class="n">n</span> <span class="ow">in</span> <span class="n">kv_chain_set</span> <span class="k">if</span> <span class="n">n</span> <span class="ow">is</span> <span class="ow">not</span> <span class="n">kv_linear</span> <span class="ow">and</span> <span class="n">n</span> <span class="ow">is</span> <span class="ow">not</span> <span class="n">mla_op</span><span class="p">]</span>
+        <span class="n">kv_outputs</span> <span class="o">=</span> <span class="p">[</span><span class="n">n</span> <span class="k">for</span> <span class="n">n</span> <span class="ow">in</span> <span class="n">kv_chain</span> <span class="k">if</span> <span class="n">mla_op</span> <span class="ow">in</span> <span class="n">n</span><span class="o">.</span><span class="n">users</span><span class="p">]</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">kv_outputs</span><span class="p">:</span>
+            <span class="k">continue</span>
+
+        <span class="n">last_kv_op</span> <span class="o">=</span> <span class="nb">max</span><span class="p">(</span><span class="n">kv_outputs</span><span class="p">,</span> <span class="n">key</span><span class="o">=</span><span class="k">lambda</span> <span class="n">n</span><span class="p">:</span> <span class="n">node_order</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">n</span><span class="p">,</span> <span class="mi">0</span><span class="p">))</span>
+
+        <span class="n">ad_logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span>
+            <span class="s2">&quot;Multi-stream MLA pattern 3 (no-AG full KV path): &quot;</span>
+            <span class="sa">f</span><span class="s2">&quot;Q=</span><span class="si">{</span><span class="n">q_linear</span><span class="o">.</span><span class="n">name</span><span class="si">}</span><span class="s2">, KV=</span><span class="si">{</span><span class="n">kv_linear</span><span class="o">.</span><span class="n">name</span><span class="si">}</span><span class="s2">, mla_op=</span><span class="si">{</span><span class="n">mla_op</span><span class="o">.</span><span class="n">name</span><span class="si">}</span><span class="s2">, last_kv=</span><span class="si">{</span><span class="n">last_kv_op</span><span class="o">.</span><span class="n">name</span><span class="si">}</span><span class="s2">&quot;</span>
+        <span class="p">)</span>
+
+        <span class="c1"># Step 1: begin_aux before kv_linear, wrapping fork_point as input.</span>
+        <span class="k">with</span> <span class="n">graph</span><span class="o">.</span><span class="n">inserting_before</span><span class="p">(</span><span class="n">kv_linear</span><span class="p">):</span>
+            <span class="n">begin_node</span> <span class="o">=</span> <span class="n">graph</span><span class="o">.</span><span class="n">call_function</span><span class="p">(</span>
+                <span class="n">begin_aux_stream_passthrough</span><span class="p">,</span> <span class="n">args</span><span class="o">=</span><span class="p">(</span><span class="n">fork_point</span><span class="p">,),</span> <span class="n">kwargs</span><span class="o">=</span><span class="p">{</span><span class="s2">&quot;event_id&quot;</span><span class="p">:</span> <span class="n">event_id</span><span class="p">}</span>
+            <span class="p">)</span>
+            <span class="n">begin_node</span><span class="o">.</span><span class="n">meta</span><span class="p">[</span><span class="s2">&quot;val&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">fork_point</span><span class="o">.</span><span class="n">meta</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;val&quot;</span><span class="p">)</span>
+        <span class="n">kv_linear</span><span class="o">.</span><span class="n">args</span> <span class="o">=</span> <span class="nb">tuple</span><span class="p">(</span><span class="n">begin_node</span> <span class="k">if</span> <span class="n">a</span> <span class="ow">is</span> <span class="n">fork_point</span> <span class="k">else</span> <span class="n">a</span> <span class="k">for</span> <span class="n">a</span> <span class="ow">in</span> <span class="n">kv_linear</span><span class="o">.</span><span class="n">args</span><span class="p">)</span>
+
+        <span class="c1"># Step 2: end_aux right after last_kv_op (rewire mla_op).</span>
+        <span class="k">with</span> <span class="n">graph</span><span class="o">.</span><span class="n">inserting_after</span><span class="p">(</span><span class="n">last_kv_op</span><span class="p">):</span>
+            <span class="n">end_node</span> <span class="o">=</span> <span class="n">graph</span><span class="o">.</span><span class="n">call_function</span><span class="p">(</span>
+                <span class="n">end_aux_stream_passthrough</span><span class="p">,</span> <span class="n">args</span><span class="o">=</span><span class="p">(</span><span class="n">last_kv_op</span><span class="p">,),</span> <span class="n">kwargs</span><span class="o">=</span><span class="p">{</span><span class="s2">&quot;event_id&quot;</span><span class="p">:</span> <span class="n">event_id</span><span class="p">}</span>
+            <span class="p">)</span>
+            <span class="n">end_node</span><span class="o">.</span><span class="n">meta</span><span class="p">[</span><span class="s2">&quot;val&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">last_kv_op</span><span class="o">.</span><span class="n">meta</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;val&quot;</span><span class="p">)</span>
+        <span class="n">mla_op</span><span class="o">.</span><span class="n">args</span> <span class="o">=</span> <span class="nb">tuple</span><span class="p">(</span><span class="n">end_node</span> <span class="k">if</span> <span class="n">a</span> <span class="ow">is</span> <span class="n">last_kv_op</span> <span class="k">else</span> <span class="n">a</span> <span class="k">for</span> <span class="n">a</span> <span class="ow">in</span> <span class="n">mla_op</span><span class="o">.</span><span class="n">args</span><span class="p">)</span>
+
+        <span class="c1"># Step 3: wait_aux before mla_op on a Q-side input.</span>
+        <span class="n">q_inputs_to_mla</span> <span class="o">=</span> <span class="p">[</span>
+            <span class="n">u</span>
+            <span class="k">for</span> <span class="n">u</span> <span class="ow">in</span> <span class="n">mla_op</span><span class="o">.</span><span class="n">all_input_nodes</span>
+            <span class="k">if</span> <span class="n">u</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">kv_outputs</span> <span class="ow">and</span> <span class="n">u</span><span class="o">.</span><span class="n">op</span> <span class="o">!=</span> <span class="s2">&quot;get_attr&quot;</span> <span class="ow">and</span> <span class="n">u</span> <span class="ow">is</span> <span class="ow">not</span> <span class="n">end_node</span>
+        <span class="p">]</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">q_inputs_to_mla</span><span class="p">:</span>
+            <span class="k">continue</span>
+        <span class="n">q_input_for_wait</span> <span class="o">=</span> <span class="nb">sorted</span><span class="p">(</span><span class="n">q_inputs_to_mla</span><span class="p">,</span> <span class="n">key</span><span class="o">=</span><span class="k">lambda</span> <span class="n">x</span><span class="p">:</span> <span class="n">node_order</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="mi">0</span><span class="p">))[</span><span class="o">-</span><span class="mi">1</span><span class="p">]</span>
+        <span class="k">with</span> <span class="n">graph</span><span class="o">.</span><span class="n">inserting_before</span><span class="p">(</span><span class="n">mla_op</span><span class="p">):</span>
+            <span class="n">wait_node</span> <span class="o">=</span> <span class="n">graph</span><span class="o">.</span><span class="n">call_function</span><span class="p">(</span>
+                <span class="n">wait_aux_stream_passthrough</span><span class="p">,</span>
+                <span class="n">args</span><span class="o">=</span><span class="p">(</span><span class="n">q_input_for_wait</span><span class="p">,),</span>
+                <span class="n">kwargs</span><span class="o">=</span><span class="p">{</span><span class="s2">&quot;event_id&quot;</span><span class="p">:</span> <span class="n">event_id</span><span class="p">},</span>
+            <span class="p">)</span>
+            <span class="n">wait_node</span><span class="o">.</span><span class="n">meta</span><span class="p">[</span><span class="s2">&quot;val&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">q_input_for_wait</span><span class="o">.</span><span class="n">meta</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;val&quot;</span><span class="p">)</span>
+        <span class="n">mla_op</span><span class="o">.</span><span class="n">args</span> <span class="o">=</span> <span class="nb">tuple</span><span class="p">(</span><span class="n">wait_node</span> <span class="k">if</span> <span class="n">a</span> <span class="ow">is</span> <span class="n">q_input_for_wait</span> <span class="k">else</span> <span class="n">a</span> <span class="k">for</span> <span class="n">a</span> <span class="ow">in</span> <span class="n">mla_op</span><span class="o">.</span><span class="n">args</span><span class="p">)</span>
+
+        <span class="n">num_matches</span> <span class="o">+=</span> <span class="mi">1</span>
+
+    <span class="k">if</span> <span class="n">num_matches</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">:</span>
+        <span class="n">eliminate_dead_code</span><span class="p">(</span><span class="n">gm</span><span class="p">)</span>
+
+    <span class="k">return</span> <span class="n">gm</span><span class="p">,</span> <span class="n">num_matches</span>
+
+
+<span class="c1"># ===========================================================================</span>
 <span class="c1"># Pattern 1: Projection overlap (fallback)</span>
 <span class="c1"># ===========================================================================</span>
 
@@ -1480,6 +1684,171 @@ window.runMermaid = runMermaid;</script>
 
 
 <span class="c1"># ===========================================================================</span>
+<span class="c1"># Pattern 2: Fused-graph KV-cone overlap (post a-projection fusion)</span>
+<span class="c1"># ===========================================================================</span>
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">_execute_kv_cone_in_aux_stream_fused</span><span class="p">(</span><span class="n">gm</span><span class="p">:</span> <span class="n">GraphModule</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tuple</span><span class="p">[</span><span class="n">GraphModule</span><span class="p">,</span> <span class="nb">int</span><span class="p">]:</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;V8 — wrap KV-cone with begin/end/wait_aux (assumes KV-cone is in graph</span>
+<span class="sd">    order BEFORE Q-cone, achieved by modeling_deepseek.py forward reorder).</span>
+
+<span class="sd">    Layout AFTER user-code reorder (modeling_deepseek.py calls KV path first)::</span>
+
+<span class="sd">        dsv3, narrow_kv, narrow_q  (main, views = free)</span>
+<span class="sd">        split_with_sizes_1   ┐</span>
+<span class="sd">        getitem×2            │  KV-cone (already in graph order before Q)</span>
+<span class="sd">        kv_a_layernorm       │</span>
+<span class="sd">        aten.to.dtype        │</span>
+<span class="sd">        view_1               ┘</span>
+<span class="sd">        q_a_layernorm  ┐</span>
+<span class="sd">        q_b_proj       │  Q-cone</span>
+<span class="sd">        view → split   │</span>
+<span class="sd">        getitem×2      ┘</span>
+<span class="sd">        trtllm_mla_with_cache</span>
+
+<span class="sd">    This transform wraps the KV-cone segment with begin_aux/end_aux markers,</span>
+<span class="sd">    and inserts wait_aux before the MLA op.  No node reordering is needed.</span>
+<span class="sd">    Same pattern as multi_stream_moe.</span>
+
+<span class="sd">    On the piecewise CG path begin/end/wait_aux are no-ops (disable_multi_stream</span>
+<span class="sd">    from commit c38f0d24); monolithic CG (decode) has multi_stream enabled</span>
+<span class="sd">    so the stream switch yields actual Q/KV overlap.</span>
+<span class="sd">    &quot;&quot;&quot;</span>
+    <span class="kn">from</span><span class="w"> </span><span class="nn">collections</span><span class="w"> </span><span class="kn">import</span> <span class="n">deque</span>
+
+    <span class="n">graph</span> <span class="o">=</span> <span class="n">gm</span><span class="o">.</span><span class="n">graph</span>
+    <span class="n">node_order</span> <span class="o">=</span> <span class="p">{</span><span class="n">n</span><span class="p">:</span> <span class="n">i</span> <span class="k">for</span> <span class="n">i</span><span class="p">,</span> <span class="n">n</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="n">graph</span><span class="o">.</span><span class="n">nodes</span><span class="p">)}</span>
+    <span class="n">num_wrapped</span> <span class="o">=</span> <span class="mi">0</span>
+
+    <span class="c1"># DSv3 MLA fused a-projection split sizes: q_a_lora (1536), kv_a_with_mqa (576).</span>
+    <span class="n">_DSV3_Q_A_OUT</span> <span class="o">=</span> <span class="mi">1536</span>
+    <span class="n">_DSV3_KV_A_OUT</span> <span class="o">=</span> <span class="mi">576</span>
+
+    <span class="c1"># Anchor structurally: the fused DSv3 a-projection is any node feeding two</span>
+    <span class="c1"># narrows of length 1536 (q_a) and 576 (kv_a).  This is producer-agnostic --</span>
+    <span class="c1"># matches both the dedicated dsv3_fused_a_gemm op and the generic fuse_gemms</span>
+    <span class="c1"># torch_linear_simple -- and identifies q/kv by LENGTH (args[3]) rather than</span>
+    <span class="c1"># start offset, so it is robust to the [q;kv] vs [kv;q] cat order.</span>
+    <span class="n">fused_nodes</span> <span class="o">=</span> <span class="p">[]</span>
+    <span class="k">for</span> <span class="n">n</span> <span class="ow">in</span> <span class="n">graph</span><span class="o">.</span><span class="n">nodes</span><span class="p">:</span>
+        <span class="n">nws</span> <span class="o">=</span> <span class="p">[</span><span class="n">u</span> <span class="k">for</span> <span class="n">u</span> <span class="ow">in</span> <span class="n">n</span><span class="o">.</span><span class="n">users</span> <span class="k">if</span> <span class="n">_is_narrow_op</span><span class="p">(</span><span class="n">u</span><span class="p">)</span> <span class="ow">and</span> <span class="nb">len</span><span class="p">(</span><span class="n">u</span><span class="o">.</span><span class="n">args</span><span class="p">)</span> <span class="o">&gt;=</span> <span class="mi">4</span><span class="p">]</span>
+        <span class="n">lens</span> <span class="o">=</span> <span class="p">{</span><span class="nb">int</span><span class="p">(</span><span class="n">u</span><span class="o">.</span><span class="n">args</span><span class="p">[</span><span class="mi">3</span><span class="p">])</span> <span class="k">for</span> <span class="n">u</span> <span class="ow">in</span> <span class="n">nws</span><span class="p">}</span>
+        <span class="k">if</span> <span class="n">_DSV3_Q_A_OUT</span> <span class="ow">in</span> <span class="n">lens</span> <span class="ow">and</span> <span class="n">_DSV3_KV_A_OUT</span> <span class="ow">in</span> <span class="n">lens</span><span class="p">:</span>
+            <span class="n">fused_nodes</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">n</span><span class="p">)</span>
+    <span class="k">if</span> <span class="ow">not</span> <span class="n">fused_nodes</span><span class="p">:</span>
+        <span class="k">return</span> <span class="n">gm</span><span class="p">,</span> <span class="mi">0</span>
+
+    <span class="c1"># event_id is a stable per-match id (one per MLA fork) so each layer gets its</span>
+    <span class="c1"># own main/aux CUDA event; without it monolithic CG capture dedups the shared</span>
+    <span class="c1"># event recorded N times and the Q/KV overlap collapses across layers.</span>
+    <span class="k">for</span> <span class="n">event_id</span><span class="p">,</span> <span class="n">dsv3</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="n">fused_nodes</span><span class="p">):</span>
+        <span class="n">narrows</span> <span class="o">=</span> <span class="p">[</span><span class="n">u</span> <span class="k">for</span> <span class="n">u</span> <span class="ow">in</span> <span class="n">dsv3</span><span class="o">.</span><span class="n">users</span> <span class="k">if</span> <span class="n">_is_narrow_op</span><span class="p">(</span><span class="n">u</span><span class="p">)</span> <span class="ow">and</span> <span class="nb">len</span><span class="p">(</span><span class="n">u</span><span class="o">.</span><span class="n">args</span><span class="p">)</span> <span class="o">&gt;=</span> <span class="mi">4</span><span class="p">]</span>
+        <span class="n">narrow_kv</span> <span class="o">=</span> <span class="nb">next</span><span class="p">((</span><span class="n">n</span> <span class="k">for</span> <span class="n">n</span> <span class="ow">in</span> <span class="n">narrows</span> <span class="k">if</span> <span class="nb">int</span><span class="p">(</span><span class="n">n</span><span class="o">.</span><span class="n">args</span><span class="p">[</span><span class="mi">3</span><span class="p">])</span> <span class="o">==</span> <span class="n">_DSV3_KV_A_OUT</span><span class="p">),</span> <span class="kc">None</span><span class="p">)</span>
+        <span class="n">narrow_q</span> <span class="o">=</span> <span class="nb">next</span><span class="p">((</span><span class="n">n</span> <span class="k">for</span> <span class="n">n</span> <span class="ow">in</span> <span class="n">narrows</span> <span class="k">if</span> <span class="nb">int</span><span class="p">(</span><span class="n">n</span><span class="o">.</span><span class="n">args</span><span class="p">[</span><span class="mi">3</span><span class="p">])</span> <span class="o">==</span> <span class="n">_DSV3_Q_A_OUT</span><span class="p">),</span> <span class="kc">None</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">narrow_kv</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="n">narrow_q</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">continue</span>
+
+        <span class="c1"># BFS forward from narrow_kv: collect KV cone, find trtllm_mla join.</span>
+        <span class="n">mla_op</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="n">kv_cone</span><span class="p">:</span> <span class="n">List</span><span class="p">[</span><span class="n">Node</span><span class="p">]</span> <span class="o">=</span> <span class="p">[]</span>
+        <span class="n">visited</span> <span class="o">=</span> <span class="p">{</span><span class="n">narrow_kv</span><span class="p">}</span>
+        <span class="n">queue</span> <span class="o">=</span> <span class="n">deque</span><span class="p">([</span><span class="n">narrow_kv</span><span class="p">])</span>
+        <span class="k">while</span> <span class="n">queue</span><span class="p">:</span>
+            <span class="n">n</span> <span class="o">=</span> <span class="n">queue</span><span class="o">.</span><span class="n">popleft</span><span class="p">()</span>
+            <span class="k">if</span> <span class="s2">&quot;trtllm_mla&quot;</span> <span class="ow">in</span> <span class="nb">str</span><span class="p">(</span><span class="nb">getattr</span><span class="p">(</span><span class="n">n</span><span class="p">,</span> <span class="s2">&quot;target&quot;</span><span class="p">,</span> <span class="s2">&quot;&quot;</span><span class="p">)):</span>
+                <span class="n">mla_op</span> <span class="o">=</span> <span class="n">n</span>
+                <span class="k">continue</span>
+            <span class="k">if</span> <span class="n">n</span> <span class="ow">is</span> <span class="ow">not</span> <span class="n">narrow_kv</span><span class="p">:</span>
+                <span class="n">kv_cone</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">n</span><span class="p">)</span>
+            <span class="k">for</span> <span class="n">u</span> <span class="ow">in</span> <span class="n">n</span><span class="o">.</span><span class="n">users</span><span class="p">:</span>
+                <span class="k">if</span> <span class="n">u</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">visited</span><span class="p">:</span>
+                    <span class="n">visited</span><span class="o">.</span><span class="n">add</span><span class="p">(</span><span class="n">u</span><span class="p">)</span>
+                    <span class="n">queue</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">u</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">mla_op</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="ow">not</span> <span class="n">kv_cone</span><span class="p">:</span>
+            <span class="k">continue</span>
+
+        <span class="n">kv_cone</span><span class="o">.</span><span class="n">sort</span><span class="p">(</span><span class="n">key</span><span class="o">=</span><span class="k">lambda</span> <span class="n">x</span><span class="p">:</span> <span class="n">node_order</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="mi">0</span><span class="p">))</span>
+        <span class="n">kv_outputs</span> <span class="o">=</span> <span class="p">[</span><span class="n">n</span> <span class="k">for</span> <span class="n">n</span> <span class="ow">in</span> <span class="n">kv_cone</span> <span class="k">if</span> <span class="n">mla_op</span> <span class="ow">in</span> <span class="n">n</span><span class="o">.</span><span class="n">users</span><span class="p">]</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">kv_outputs</span><span class="p">:</span>
+            <span class="k">continue</span>
+        <span class="n">first_kv_compute</span> <span class="o">=</span> <span class="n">kv_cone</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span>
+        <span class="n">last_kv_op</span> <span class="o">=</span> <span class="n">kv_cone</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">]</span>
+
+        <span class="c1"># Sanity: KV cone must come BEFORE Q-cone in graph order (= user code</span>
+        <span class="c1"># has already been reordered to call KV first).  If Q comes first,</span>
+        <span class="c1"># this V8 path is not applicable — would need V7-style reorder.</span>
+        <span class="n">q_users</span> <span class="o">=</span> <span class="nb">sorted</span><span class="p">(</span>
+            <span class="p">(</span><span class="n">u</span> <span class="k">for</span> <span class="n">u</span> <span class="ow">in</span> <span class="n">narrow_q</span><span class="o">.</span><span class="n">users</span> <span class="k">if</span> <span class="n">u</span> <span class="ow">is</span> <span class="ow">not</span> <span class="n">mla_op</span><span class="p">),</span>
+            <span class="n">key</span><span class="o">=</span><span class="k">lambda</span> <span class="n">x</span><span class="p">:</span> <span class="n">node_order</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="nb">float</span><span class="p">(</span><span class="s2">&quot;inf&quot;</span><span class="p">)),</span>
+        <span class="p">)</span>
+        <span class="k">if</span> <span class="n">q_users</span> <span class="ow">and</span> <span class="n">node_order</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">q_users</span><span class="p">[</span><span class="mi">0</span><span class="p">],</span> <span class="mi">0</span><span class="p">)</span> <span class="o">&lt;</span> <span class="n">node_order</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">first_kv_compute</span><span class="p">,</span> <span class="mi">0</span><span class="p">):</span>
+            <span class="n">ad_logger</span><span class="o">.</span><span class="n">debug</span><span class="p">(</span>
+                <span class="sa">f</span><span class="s2">&quot;KV cone </span><span class="si">{</span><span class="n">first_kv_compute</span><span class="o">.</span><span class="n">name</span><span class="si">}</span><span class="s2"> is AFTER Q anchor </span><span class="si">{</span><span class="n">q_users</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">name</span><span class="si">}</span><span class="s2"> &quot;</span>
+                <span class="s2">&quot;in graph order — V8 layout invariant violated. Skipping.&quot;</span>
+            <span class="p">)</span>
+            <span class="k">continue</span>
+
+        <span class="c1"># Pick an MLA-op Q-side input to wrap with wait_aux (stream-level sync;</span>
+        <span class="c1"># one call gates the entire aux stream).  Use last input that isn&#39;t</span>
+        <span class="c1"># in kv_outputs / a buffer.</span>
+        <span class="n">q_inputs_to_mla</span> <span class="o">=</span> <span class="p">[</span>
+            <span class="n">u</span> <span class="k">for</span> <span class="n">u</span> <span class="ow">in</span> <span class="n">mla_op</span><span class="o">.</span><span class="n">all_input_nodes</span> <span class="k">if</span> <span class="n">u</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">kv_outputs</span> <span class="ow">and</span> <span class="n">u</span><span class="o">.</span><span class="n">op</span> <span class="o">!=</span> <span class="s2">&quot;get_attr&quot;</span>
+        <span class="p">]</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">q_inputs_to_mla</span><span class="p">:</span>
+            <span class="k">continue</span>
+        <span class="n">wait_input_for_wait</span> <span class="o">=</span> <span class="nb">sorted</span><span class="p">(</span><span class="n">q_inputs_to_mla</span><span class="p">,</span> <span class="n">key</span><span class="o">=</span><span class="k">lambda</span> <span class="n">x</span><span class="p">:</span> <span class="n">node_order</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="mi">0</span><span class="p">))[</span><span class="o">-</span><span class="mi">1</span><span class="p">]</span>
+
+        <span class="n">ad_logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span>
+            <span class="sa">f</span><span class="s2">&quot;Multi-stream MLA pattern 2 (V8, KV-first user code): dsv3=</span><span class="si">{</span><span class="n">dsv3</span><span class="o">.</span><span class="n">name</span><span class="si">}</span><span class="s2">, &quot;</span>
+            <span class="sa">f</span><span class="s2">&quot;narrow_kv=</span><span class="si">{</span><span class="n">narrow_kv</span><span class="o">.</span><span class="n">name</span><span class="si">}</span><span class="s2">, kv_cone=[</span><span class="si">{</span><span class="s1">&#39;,&#39;</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">n</span><span class="o">.</span><span class="n">name</span><span class="w"> </span><span class="k">for</span><span class="w"> </span><span class="n">n</span><span class="w"> </span><span class="ow">in</span><span class="w"> </span><span class="n">kv_cone</span><span class="p">)</span><span class="si">}</span><span class="s2">], &quot;</span>
+            <span class="sa">f</span><span class="s2">&quot;last_kv=</span><span class="si">{</span><span class="n">last_kv_op</span><span class="o">.</span><span class="n">name</span><span class="si">}</span><span class="s2">, q_for_wait=</span><span class="si">{</span><span class="n">wait_input_for_wait</span><span class="o">.</span><span class="n">name</span><span class="si">}</span><span class="s2">, &quot;</span>
+            <span class="sa">f</span><span class="s2">&quot;mla_op=</span><span class="si">{</span><span class="n">mla_op</span><span class="o">.</span><span class="n">name</span><span class="si">}</span><span class="s2">&quot;</span>
+        <span class="p">)</span>
+
+        <span class="c1"># Step 1: Insert begin_aux just before first_kv_compute, with narrow_kv</span>
+        <span class="c1"># as input (semantics: aux waits for main&#39;s narrow_kv = dsv3, i.e. only</span>
+        <span class="c1"># dsv3 must complete before KV-cone starts on aux).</span>
+        <span class="c1"># Per-fork event_id (begin/end/wait below share it) so each layer keeps a</span>
+        <span class="c1"># distinct CUDA event under monolithic CG capture.</span>
+        <span class="k">with</span> <span class="n">graph</span><span class="o">.</span><span class="n">inserting_before</span><span class="p">(</span><span class="n">first_kv_compute</span><span class="p">):</span>
+            <span class="n">begin_node</span> <span class="o">=</span> <span class="n">graph</span><span class="o">.</span><span class="n">call_function</span><span class="p">(</span>
+                <span class="n">begin_aux_stream_passthrough</span><span class="p">,</span> <span class="n">args</span><span class="o">=</span><span class="p">(</span><span class="n">narrow_kv</span><span class="p">,),</span> <span class="n">kwargs</span><span class="o">=</span><span class="p">{</span><span class="s2">&quot;event_id&quot;</span><span class="p">:</span> <span class="n">event_id</span><span class="p">}</span>
+            <span class="p">)</span>
+            <span class="n">begin_node</span><span class="o">.</span><span class="n">meta</span><span class="p">[</span><span class="s2">&quot;val&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">narrow_kv</span><span class="o">.</span><span class="n">meta</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;val&quot;</span><span class="p">)</span>
+        <span class="n">first_kv_compute</span><span class="o">.</span><span class="n">args</span> <span class="o">=</span> <span class="nb">tuple</span><span class="p">(</span>
+            <span class="n">begin_node</span> <span class="k">if</span> <span class="n">a</span> <span class="ow">is</span> <span class="n">narrow_kv</span> <span class="k">else</span> <span class="n">a</span> <span class="k">for</span> <span class="n">a</span> <span class="ow">in</span> <span class="n">first_kv_compute</span><span class="o">.</span><span class="n">args</span>
+        <span class="p">)</span>
+
+        <span class="c1"># Step 2: Insert end_aux right after last_kv_op (switch back to main</span>
+        <span class="c1"># so Q-cone enqueues on main).</span>
+        <span class="k">with</span> <span class="n">graph</span><span class="o">.</span><span class="n">inserting_after</span><span class="p">(</span><span class="n">last_kv_op</span><span class="p">):</span>
+            <span class="n">end_node</span> <span class="o">=</span> <span class="n">graph</span><span class="o">.</span><span class="n">call_function</span><span class="p">(</span>
+                <span class="n">end_aux_stream_passthrough</span><span class="p">,</span> <span class="n">args</span><span class="o">=</span><span class="p">(</span><span class="n">last_kv_op</span><span class="p">,),</span> <span class="n">kwargs</span><span class="o">=</span><span class="p">{</span><span class="s2">&quot;event_id&quot;</span><span class="p">:</span> <span class="n">event_id</span><span class="p">}</span>
+            <span class="p">)</span>
+            <span class="n">end_node</span><span class="o">.</span><span class="n">meta</span><span class="p">[</span><span class="s2">&quot;val&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">last_kv_op</span><span class="o">.</span><span class="n">meta</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;val&quot;</span><span class="p">)</span>
+        <span class="c1"># Rewire mla_op&#39;s reference to last_kv_op → end_node.</span>
+        <span class="n">mla_op</span><span class="o">.</span><span class="n">args</span> <span class="o">=</span> <span class="nb">tuple</span><span class="p">(</span><span class="n">end_node</span> <span class="k">if</span> <span class="n">a</span> <span class="ow">is</span> <span class="n">last_kv_op</span> <span class="k">else</span> <span class="n">a</span> <span class="k">for</span> <span class="n">a</span> <span class="ow">in</span> <span class="n">mla_op</span><span class="o">.</span><span class="n">args</span><span class="p">)</span>
+
+        <span class="c1"># Step 3: Insert wait_aux just before mla_op on the chosen input (single</span>
+        <span class="c1"># event wait — gates entire aux stream).</span>
+        <span class="k">with</span> <span class="n">graph</span><span class="o">.</span><span class="n">inserting_before</span><span class="p">(</span><span class="n">mla_op</span><span class="p">):</span>
+            <span class="n">wait_node</span> <span class="o">=</span> <span class="n">graph</span><span class="o">.</span><span class="n">call_function</span><span class="p">(</span>
+                <span class="n">wait_aux_stream_passthrough</span><span class="p">,</span>
+                <span class="n">args</span><span class="o">=</span><span class="p">(</span><span class="n">wait_input_for_wait</span><span class="p">,),</span>
+                <span class="n">kwargs</span><span class="o">=</span><span class="p">{</span><span class="s2">&quot;event_id&quot;</span><span class="p">:</span> <span class="n">event_id</span><span class="p">},</span>
+            <span class="p">)</span>
+            <span class="n">wait_node</span><span class="o">.</span><span class="n">meta</span><span class="p">[</span><span class="s2">&quot;val&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">wait_input_for_wait</span><span class="o">.</span><span class="n">meta</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;val&quot;</span><span class="p">)</span>
+        <span class="n">mla_op</span><span class="o">.</span><span class="n">args</span> <span class="o">=</span> <span class="nb">tuple</span><span class="p">(</span><span class="n">wait_node</span> <span class="k">if</span> <span class="n">a</span> <span class="ow">is</span> <span class="n">wait_input_for_wait</span> <span class="k">else</span> <span class="n">a</span> <span class="k">for</span> <span class="n">a</span> <span class="ow">in</span> <span class="n">mla_op</span><span class="o">.</span><span class="n">args</span><span class="p">)</span>
+
+        <span class="n">num_wrapped</span> <span class="o">+=</span> <span class="mi">1</span>
+
+    <span class="k">if</span> <span class="n">num_wrapped</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">:</span>
+        <span class="n">eliminate_dead_code</span><span class="p">(</span><span class="n">gm</span><span class="p">)</span>
+
+    <span class="k">return</span> <span class="n">gm</span><span class="p">,</span> <span class="n">num_wrapped</span>
+
+
+<span class="c1"># ===========================================================================</span>
 <span class="c1"># Transform class</span>
 <span class="c1"># ===========================================================================</span>
 
@@ -1492,9 +1861,10 @@ window.runMermaid = runMermaid;</script>
 
 <span class="sd">    Pattern 0: Full KV path overlap for unfused Q/KV GEMMs (begin/end aux).</span>
 <span class="sd">    Pattern 1: Overlaps KV projection linear with Q projection chain (fallback).</span>
+<span class="sd">    Pattern 2: Fused-graph (post a-projection fusion) KV-cone overlap.</span>
 
-<span class="sd">    Pattern 0 is tried first; if it matches (unfused graph), pattern 1 is skipped.</span>
-<span class="sd">    If pattern 0 finds nothing (fused graph), pattern 1 runs as fallback.</span>
+<span class="sd">    Pattern 0 is tried first.  If it finds nothing, pattern 2 is tried (handles</span>
+<span class="sd">    the post-V4 fused graph).  Pattern 1 is the legacy fallback.</span>
 <span class="sd">    &quot;&quot;&quot;</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">_apply</span><span class="p">(</span>
@@ -1506,18 +1876,28 @@ window.runMermaid = runMermaid;</script>
     <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tuple</span><span class="p">[</span><span class="n">GraphModule</span><span class="p">,</span> <span class="n">TransformInfo</span><span class="p">]:</span>
         <span class="n">cuda_stream_manager</span><span class="o">.</span><span class="n">add_device</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">current_device</span><span class="p">())</span>
 
-        <span class="c1"># Pattern 0: full KV path on aux (unfused GEMMs)</span>
+        <span class="n">n_unfused</span> <span class="o">=</span> <span class="mi">0</span>
+        <span class="n">n_fused</span> <span class="o">=</span> <span class="mi">0</span>
+        <span class="n">n_proj</span> <span class="o">=</span> <span class="mi">0</span>
+        <span class="n">n_no_ag</span> <span class="o">=</span> <span class="mi">0</span>
+        <span class="c1"># Pattern 0: full KV path on aux (unfused GEMMs with AllGather)</span>
         <span class="n">gm</span><span class="p">,</span> <span class="n">n_unfused</span> <span class="o">=</span> <span class="n">_execute_kv_path_in_aux_stream</span><span class="p">(</span><span class="n">gm</span><span class="p">,</span> <span class="n">shared_config</span><span class="o">.</span><span class="n">world_size</span><span class="p">)</span>
         <span class="n">ad_logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Multi-stream MLA pattern 0 (unfused KV path): </span><span class="si">{</span><span class="n">n_unfused</span><span class="si">}</span><span class="s2"> matches&quot;</span><span class="p">)</span>
 
-        <span class="k">if</span> <span class="n">n_unfused</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">:</span>
-            <span class="n">total</span> <span class="o">=</span> <span class="n">n_unfused</span>
-        <span class="k">else</span><span class="p">:</span>
-            <span class="c1"># Fallback: Pattern 1 (projection overlap)</span>
-            <span class="n">gm</span><span class="p">,</span> <span class="n">n_proj</span> <span class="o">=</span> <span class="n">_execute_kv_proj_in_aux_stream</span><span class="p">(</span><span class="n">gm</span><span class="p">)</span>
-            <span class="n">ad_logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Multi-stream MLA pattern 1 (projection): </span><span class="si">{</span><span class="n">n_proj</span><span class="si">}</span><span class="s2"> matches&quot;</span><span class="p">)</span>
-            <span class="n">total</span> <span class="o">=</span> <span class="n">n_proj</span>
+        <span class="k">if</span> <span class="n">n_unfused</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
+            <span class="c1"># Pattern 3 (V12): full KV path on aux for unfused GEMMs WITHOUT AllGather</span>
+            <span class="n">gm</span><span class="p">,</span> <span class="n">n_no_ag</span> <span class="o">=</span> <span class="n">_execute_kv_path_in_aux_stream_no_allgather</span><span class="p">(</span><span class="n">gm</span><span class="p">,</span> <span class="n">shared_config</span><span class="o">.</span><span class="n">world_size</span><span class="p">)</span>
+            <span class="n">ad_logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Multi-stream MLA pattern 3 (no-AG full KV path): </span><span class="si">{</span><span class="n">n_no_ag</span><span class="si">}</span><span class="s2"> matches&quot;</span><span class="p">)</span>
+            <span class="k">if</span> <span class="n">n_no_ag</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
+                <span class="c1"># Pattern 2: fused-graph KV-cone overlap (fuse_gemms + op-level dsv3 select).</span>
+                <span class="n">gm</span><span class="p">,</span> <span class="n">n_fused</span> <span class="o">=</span> <span class="n">_execute_kv_cone_in_aux_stream_fused</span><span class="p">(</span><span class="n">gm</span><span class="p">)</span>
+                <span class="n">ad_logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Multi-stream MLA pattern 2 (fused KV cone): </span><span class="si">{</span><span class="n">n_fused</span><span class="si">}</span><span class="s2"> matches&quot;</span><span class="p">)</span>
+                <span class="k">if</span> <span class="n">n_fused</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
+                    <span class="c1"># Pattern 1: legacy projection overlap fallback</span>
+                    <span class="n">gm</span><span class="p">,</span> <span class="n">n_proj</span> <span class="o">=</span> <span class="n">_execute_kv_proj_in_aux_stream</span><span class="p">(</span><span class="n">gm</span><span class="p">)</span>
+                    <span class="n">ad_logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Multi-stream MLA pattern 1 (projection): </span><span class="si">{</span><span class="n">n_proj</span><span class="si">}</span><span class="s2"> matches&quot;</span><span class="p">)</span>
 
+        <span class="n">total</span> <span class="o">=</span> <span class="n">n_unfused</span> <span class="o">+</span> <span class="n">n_no_ag</span> <span class="o">+</span> <span class="n">n_fused</span> <span class="o">+</span> <span class="n">n_proj</span>
         <span class="n">info</span> <span class="o">=</span> <span class="n">TransformInfo</span><span class="p">(</span>
             <span class="n">skipped</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
             <span class="n">num_matches</span><span class="o">=</span><span class="n">total</span><span class="p">,</span>
@@ -1561,8 +1941,8 @@ window.runMermaid = runMermaid;</script>
   
 
   <!-- Scripts loaded after <body> so the DOM is not blocked -->
-  <script defer src="../../../../../../_static/scripts/bootstrap.js?digest=a95f357e85573c9b56d5"></script>
-<script defer src="../../../../../../_static/scripts/pydata-sphinx-theme.js?digest=a95f357e85573c9b56d5"></script>
+  <script defer src="../../../../../../_static/scripts/bootstrap.js?digest=90905a2f556bf617f1a9"></script>
+<script defer src="../../../../../../_static/scripts/pydata-sphinx-theme.js?digest=90905a2f556bf617f1a9"></script>
 
 
   <footer class="bd-footer">
@@ -1634,9 +2014,9 @@ window.runMermaid = runMermaid;</script>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on June 27, 2026.</p>
+  <p>Last updated on July 14, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/c25c23f">c25c23f</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/1662a87">1662a87</a>.</p>
   
 </div></div>
       

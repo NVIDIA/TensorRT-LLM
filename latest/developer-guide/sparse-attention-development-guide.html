@@ -28,8 +28,8 @@
   </noscript>
   
   <!-- Loaded before other Sphinx assets -->
-  <link href="../_static/styles/theme.css?digest=a95f357e85573c9b56d5" rel="stylesheet" />
-<link href="../_static/styles/pydata-sphinx-theme.css?digest=a95f357e85573c9b56d5" rel="stylesheet" />
+  <link href="../_static/styles/theme.css?digest=90905a2f556bf617f1a9" rel="stylesheet" />
+<link href="../_static/styles/pydata-sphinx-theme.css?digest=90905a2f556bf617f1a9" rel="stylesheet" />
 
     <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=8f2a1f02" />
     <link rel="stylesheet" type="text/css" href="../_static/styles/nvidia-sphinx-theme.css?v=933278ad" />
@@ -40,10 +40,10 @@
     <link rel="stylesheet" type="text/css" href="../_static/custom.css?v=19d20f17" />
   
   <!-- So that users can add custom icons -->
-  <script defer src="../_static/scripts/fontawesome.js?digest=a95f357e85573c9b56d5"></script>
+  <script defer src="../_static/scripts/fontawesome.js?digest=90905a2f556bf617f1a9"></script>
   <!-- Pre-loaded scripts that we'll load fully later -->
-  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=a95f357e85573c9b56d5" />
-<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=a95f357e85573c9b56d5" />
+  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=90905a2f556bf617f1a9" />
+<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=90905a2f556bf617f1a9" />
 
 
 
@@ -61,9 +61,9 @@
     <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
     <script>DOCUMENTATION_OPTIONS.pagename = 'developer-guide/sparse-attention-development-guide';</script>
     <script>
-        DOCUMENTATION_OPTIONS.theme_version = '0.19.0';
+        DOCUMENTATION_OPTIONS.theme_version = '0.20.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc20';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc21';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -73,13 +73,13 @@
 
     <link rel="index" title="Index" href="../genindex.html" />
     <link rel="search" title="Search" href="../search.html" />
-    <link rel="next" title="MoE as Dense GEMM: Optimizing Low-Latency MoE Inference on NVIDIA Blackwell" href="../blogs/tech_blog/blog24_MoE_as_Dense_GEMM.html" />
+    <link rel="next" title="Scaling Video Generation Across NVL72 rack with TensorRT-LLM" href="../blogs/tech_blog/blog25_Scaling_Video_Generation_Across_NVL72_Rack_with_TensorRT-LLM.html" />
     <link rel="prev" title="Telemetry" href="telemetry.html" />
 
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc20" />
+  <meta name="docsearch:version" content="1.3.0rc21" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -446,6 +446,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../features/feature-combination-matrix.html">Feature Combination Matrix</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/disagg-serving.html">Disaggregated Serving</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/embeddings.html">Embeddings (Encoder-Only Models)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/kvcache.html">KV Cache System</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/long-sequence.html">Long Sequences</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/lora.html">LoRA (Low-Rank Adaptation)</a></li>
@@ -456,6 +457,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../features/quantization.html">Quantization</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/sampling.html">Sampling</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/additional-outputs.html">Additional Outputs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/post-processor-hook.html">Post-Processing Hook</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/guided-decoding.html">Guided Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/speculative-decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/checkpoint-loading.html">Checkpoint Loading</a></li>
@@ -495,6 +497,7 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog25_Scaling_Video_Generation_Across_NVL72_Rack_with_TensorRT-LLM.html">Scaling Video Generation Across NVL72 rack with TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog24_MoE_as_Dense_GEMM.html">MoE as Dense GEMM: Optimizing Low-Latency MoE Inference on NVIDIA Blackwell</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog23_Joint_Optimization_of_Agent_Applications_and_TensorRT-LLM.html">Joint Optimization of Agent Applications and TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog22_Helix_Parallelism_Scaling_Multi_Million_Token_Decoding_with_KV_Cache_Sharding.html">Helix Parallelism in TensorRT-LLM: Scaling Multi-Million-Token Decoding with KV Cache Sharding</a></li>
@@ -532,9 +535,9 @@
 <li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM">Github Code</a></li>
 <li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/issues?q=is%3Aissue%20state%3Aopen%20label%3Aroadmap">Roadmap</a></li>
 </ul>
-<p aria-level="2" class="caption" role="heading"><span class="caption-text">Use TensorRT Engine</span></p>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Migration</span></p>
 <ul class="nav bd-sidenav">
-<li class="toctree-l1"><a class="reference internal" href="../legacy/tensorrt_quickstart.html">LLM API with TensorRT Engine</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../legacy/tensorrt-backend-removal.html">Migration Guide: TensorRT Backend Removed</a></li>
 </ul>
 </div>
 </nav></div>
@@ -586,7 +589,7 @@
 <div id="searchbox"></div>
                 <article class="bd-article">
                   
-  <section class="tex2jax_ignore mathjax_ignore" id="sparse-attention-development-guide">
+  <section id="sparse-attention-development-guide">
 <h1>Sparse Attention Development Guide<a class="headerlink" href="#sparse-attention-development-guide" title="Link to this heading">#</a></h1>
 <p>This guide is for contributors adding a new sparse attention algorithm
 to TensorRT LLM. It walks through the framework hooks each algorithm
@@ -597,25 +600,25 @@ the new backend.</p>
 rationale and high-level architecture diagrams, see the
 <a class="reference internal" href="../blogs/tech_blog/blog17_Sparse_Attention_in_TensorRT-LLM.html"><span class="std std-doc">Sparse Attention tech blog</span></a>.</p>
 <ul class="simple">
-<li><p><a class="reference internal" href="#two-integration-levels">Two integration levels</a></p></li>
-<li><p><a class="reference internal" href="#lowered-sparse-parameters">Lowered sparse parameters</a></p></li>
-<li><p><a class="reference internal" href="#framework-level-sparse-attention">Framework-level sparse attention</a></p>
+<li><p><a class="reference internal" href="#two-integration-levels"><span class="xref myst">Two integration levels</span></a></p></li>
+<li><p><a class="reference internal" href="#lowered-sparse-parameters"><span class="xref myst">Lowered sparse parameters</span></a></p></li>
+<li><p><a class="reference internal" href="#framework-level-sparse-attention"><span class="xref myst">Framework-level sparse attention</span></a></p>
 <ul>
-<li><p><a class="reference internal" href="#prediction-hooks">Prediction hooks</a></p></li>
-<li><p><a class="reference internal" href="#attentionop-behavior">AttentionOp behavior</a></p></li>
-<li><p><a class="reference internal" href="#auxiliary-memory-pools">Auxiliary memory pools</a></p></li>
+<li><p><a class="reference internal" href="#prediction-hooks"><span class="xref myst">Prediction hooks</span></a></p></li>
+<li><p><a class="reference internal" href="#attentionop-behavior"><span class="xref myst">AttentionOp behavior</span></a></p></li>
+<li><p><a class="reference internal" href="#auxiliary-memory-pools"><span class="xref myst">Auxiliary memory pools</span></a></p></li>
 </ul>
 </li>
-<li><p><a class="reference internal" href="#adding-a-new-framework-level-algorithm">Adding a new framework-level algorithm</a></p>
+<li><p><a class="reference internal" href="#adding-a-new-framework-level-algorithm"><span class="xref myst">Adding a new framework-level algorithm</span></a></p>
 <ul>
-<li><p><a class="reference internal" href="#configuration-class">1. Configuration class</a></p></li>
-<li><p><a class="reference internal" href="#prediction-module">2. Prediction module</a></p></li>
-<li><p><a class="reference internal" href="#auxiliary-memory">3. Auxiliary memory</a></p></li>
-<li><p><a class="reference internal" href="#registration-and-dispatch">4. Registration and dispatch</a></p></li>
+<li><p><a class="reference internal" href="#1-configuration-class"><span class="xref myst">1. Configuration class</span></a></p></li>
+<li><p><a class="reference internal" href="#2-prediction-module"><span class="xref myst">2. Prediction module</span></a></p></li>
+<li><p><a class="reference internal" href="#3-auxiliary-memory"><span class="xref myst">3. Auxiliary memory</span></a></p></li>
+<li><p><a class="reference internal" href="#4-registration-and-dispatch"><span class="xref myst">4. Registration and dispatch</span></a></p></li>
 </ul>
 </li>
-<li><p><a class="reference internal" href="#kernel-level-sparse-attention">Kernel-level sparse attention</a></p></li>
-<li><p><a class="reference internal" href="#roadmap">Roadmap</a></p></li>
+<li><p><a class="reference internal" href="#kernel-level-sparse-attention"><span class="xref myst">Kernel-level sparse attention</span></a></p></li>
+<li><p><a class="reference internal" href="../features/ray-orchestrator.html#roadmap"><span class="std std-ref">Roadmap</span></a></p></li>
 </ul>
 <section id="two-integration-levels">
 <h2>Two integration levels<a class="headerlink" href="#two-integration-levels" title="Link to this heading">#</a></h2>
@@ -945,11 +948,11 @@ framework-level scaffolding for maintainability.</p></li>
       </div>
     </a>
     <a class="right-next"
-       href="../blogs/tech_blog/blog24_MoE_as_Dense_GEMM.html"
+       href="../blogs/tech_blog/blog25_Scaling_Video_Generation_Across_NVL72_Rack_with_TensorRT-LLM.html"
        title="next page">
       <div class="prev-next-info">
         <p class="prev-next-subtitle">next</p>
-        <p class="prev-next-title">MoE as Dense GEMM: Optimizing Low-Latency MoE Inference on NVIDIA Blackwell</p>
+        <p class="prev-next-title">Scaling Video Generation Across NVL72 rack with TensorRT-LLM</p>
       </div>
       <i class="fa-solid fa-angle-right"></i>
     </a>
@@ -1009,8 +1012,8 @@ framework-level scaffolding for maintainability.</p></li>
   
 
   <!-- Scripts loaded after <body> so the DOM is not blocked -->
-  <script defer src="../_static/scripts/bootstrap.js?digest=a95f357e85573c9b56d5"></script>
-<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=a95f357e85573c9b56d5"></script>
+  <script defer src="../_static/scripts/bootstrap.js?digest=90905a2f556bf617f1a9"></script>
+<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=90905a2f556bf617f1a9"></script>
 
 
   <footer class="bd-footer">
@@ -1082,9 +1085,9 @@ framework-level scaffolding for maintainability.</p></li>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on June 27, 2026.</p>
+  <p>Last updated on July 14, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/c25c23f">c25c23f</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/1662a87">1662a87</a>.</p>
   
 </div></div>
       

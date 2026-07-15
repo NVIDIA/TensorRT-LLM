@@ -28,8 +28,8 @@
   </noscript>
   
   <!-- Loaded before other Sphinx assets -->
-  <link href="../_static/styles/theme.css?digest=a95f357e85573c9b56d5" rel="stylesheet" />
-<link href="../_static/styles/pydata-sphinx-theme.css?digest=a95f357e85573c9b56d5" rel="stylesheet" />
+  <link href="../_static/styles/theme.css?digest=90905a2f556bf617f1a9" rel="stylesheet" />
+<link href="../_static/styles/pydata-sphinx-theme.css?digest=90905a2f556bf617f1a9" rel="stylesheet" />
 
     <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=8f2a1f02" />
     <link rel="stylesheet" type="text/css" href="../_static/styles/nvidia-sphinx-theme.css?v=933278ad" />
@@ -40,10 +40,10 @@
     <link rel="stylesheet" type="text/css" href="../_static/custom.css?v=19d20f17" />
   
   <!-- So that users can add custom icons -->
-  <script defer src="../_static/scripts/fontawesome.js?digest=a95f357e85573c9b56d5"></script>
+  <script defer src="../_static/scripts/fontawesome.js?digest=90905a2f556bf617f1a9"></script>
   <!-- Pre-loaded scripts that we'll load fully later -->
-  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=a95f357e85573c9b56d5" />
-<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=a95f357e85573c9b56d5" />
+  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=90905a2f556bf617f1a9" />
+<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=90905a2f556bf617f1a9" />
 
 
 
@@ -59,13 +59,11 @@
     <script src="../_static/togglebutton.js?v=b8b12719"></script>
     <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
     <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
-    <script>window.MathJax = {"options": {"processHtmlClass": "tex2jax_process|mathjax_process|math|output_area"}}</script>
-    <script defer="defer" src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
     <script>DOCUMENTATION_OPTIONS.pagename = 'deployment-guide/deployment-guide-for-minimax-m3-on-trtllm';</script>
     <script>
-        DOCUMENTATION_OPTIONS.theme_version = '0.19.0';
+        DOCUMENTATION_OPTIONS.theme_version = '0.20.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc20';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc21';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -81,7 +79,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc20" />
+  <meta name="docsearch:version" content="1.3.0rc21" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -448,6 +446,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../features/feature-combination-matrix.html">Feature Combination Matrix</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/disagg-serving.html">Disaggregated Serving</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/embeddings.html">Embeddings (Encoder-Only Models)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/kvcache.html">KV Cache System</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/long-sequence.html">Long Sequences</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/lora.html">LoRA (Low-Rank Adaptation)</a></li>
@@ -458,6 +457,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../features/quantization.html">Quantization</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/sampling.html">Sampling</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/additional-outputs.html">Additional Outputs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/post-processor-hook.html">Post-Processing Hook</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/guided-decoding.html">Guided Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/speculative-decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/checkpoint-loading.html">Checkpoint Loading</a></li>
@@ -497,6 +497,7 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog25_Scaling_Video_Generation_Across_NVL72_Rack_with_TensorRT-LLM.html">Scaling Video Generation Across NVL72 rack with TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog24_MoE_as_Dense_GEMM.html">MoE as Dense GEMM: Optimizing Low-Latency MoE Inference on NVIDIA Blackwell</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog23_Joint_Optimization_of_Agent_Applications_and_TensorRT-LLM.html">Joint Optimization of Agent Applications and TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog22_Helix_Parallelism_Scaling_Multi_Million_Token_Decoding_with_KV_Cache_Sharding.html">Helix Parallelism in TensorRT-LLM: Scaling Multi-Million-Token Decoding with KV Cache Sharding</a></li>
@@ -534,9 +535,9 @@
 <li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM">Github Code</a></li>
 <li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/issues?q=is%3Aissue%20state%3Aopen%20label%3Aroadmap">Roadmap</a></li>
 </ul>
-<p aria-level="2" class="caption" role="heading"><span class="caption-text">Use TensorRT Engine</span></p>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Migration</span></p>
 <ul class="nav bd-sidenav">
-<li class="toctree-l1"><a class="reference internal" href="../legacy/tensorrt_quickstart.html">LLM API with TensorRT Engine</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../legacy/tensorrt-backend-removal.html">Migration Guide: TensorRT Backend Removed</a></li>
 </ul>
 </div>
 </nav></div>
@@ -591,20 +592,25 @@
 <div id="searchbox"></div>
                 <article class="bd-article">
                   
-  <section class="tex2jax_ignore mathjax_ignore" id="deployment-guide-for-minimax-m3-on-tensorrt-llm">
+  <section id="deployment-guide-for-minimax-m3-on-tensorrt-llm">
 <h1>Deployment Guide for MiniMax-M3 on TensorRT LLM<a class="headerlink" href="#deployment-guide-for-minimax-m3-on-tensorrt-llm" title="Link to this heading">#</a></h1>
 <section id="introduction">
 <h2>Introduction<a class="headerlink" href="#introduction" title="Link to this heading">#</a></h2>
 <p>This deployment guide provides step-by-step instructions for running the MiniMax-M3 model using TensorRT LLM. It covers the complete setup required; from accessing model weights and preparing the software environment to configuring TensorRT LLM parameters, launching the server, and validating inference output.</p>
 <p>MiniMax-M3 is a Mixture-of-Experts (MoE) model that uses MiniMax block-sparse attention. The first few layers use dense attention with a dense MLP, while the remaining layers combine a sparse attention path (an index-K block selector followed by sparse grouped-query attention) with MoE (top-4 of 128 routed experts plus one shared expert). In TensorRT LLM it is served through the <code class="docutils literal notranslate"><span class="pre">MiniMaxM3SparseForConditionalGeneration</span></code> architecture (text, image, and video) and the text-only <code class="docutils literal notranslate"><span class="pre">MiniMaxM3SparseForCausalLM</span></code> architecture.</p>
-<p>MiniMax-M3 is served in <strong>BF16</strong>; no FP8/NVFP4 serving path is supported at this time. The block-sparse attention path does <strong>not</strong> currently support KV cache reuse or Multi-Token Prediction (MTP) in this release.</p>
+<p>TensorRT LLM supports two precisions for MiniMax-M3:</p>
+<ul class="simple">
+<li><p><strong>BF16</strong> — the official upstream checkpoint from MiniMaxAI.</p></li>
+<li><p><strong>MXFP8</strong> — an NVIDIA-published checkpoint that quantizes the MoE/Linear weights to MXFP8 while keeping activations and the KV cache in BF16. The weights occupy ~half the memory of BF16, which is the recommended choice for throughput-oriented deployments and is the default for this guide.</p></li>
+</ul>
+<p>The block-sparse attention path does <strong>not</strong> currently support KV cache reuse or Multi-Token Prediction (MTP) in this release.</p>
 <p>This guide deploys MiniMax-M3 on <strong>8x NVIDIA GB200 GPUs across 2 nodes</strong> (4 GPUs per node) using Slurm and the <code class="docutils literal notranslate"><span class="pre">trtllm-llmapi-launch</span></code> multi-node launcher, with the MoE experts distributed via expert parallelism. The attention layers can run with either Tensor-Expert Parallelism (TEP) or Data-Expert Parallelism (DEP); see <a class="reference internal" href="#choosing-the-parallelism-strategy-tep-vs-dep"><span class="xref myst">Choosing the Parallelism Strategy</span></a>.</p>
 <p>The guide is intended for developers and practitioners seeking high-throughput or low-latency inference using NVIDIA’s accelerated stack.</p>
 </section>
 <section id="prerequisites">
 <h2>Prerequisites<a class="headerlink" href="#prerequisites" title="Link to this heading">#</a></h2>
 <ul class="simple">
-<li><p>GPU: 8x NVIDIA GB200 GPUs across 2 nodes (4 GPUs per node). Tensor/expert parallelism of 8 (<code class="docutils literal notranslate"><span class="pre">--tp_size</span> <span class="pre">8</span> <span class="pre">--moe_expert_parallel_size</span> <span class="pre">8</span></code>) spans all 8 GPUs, and the model is served in BF16, so plan for the corresponding memory footprint.</p></li>
+<li><p>GPU: 8x NVIDIA GB200 GPUs across 2 nodes (4 GPUs per node). Tensor/expert parallelism of 8 (<code class="docutils literal notranslate"><span class="pre">tensor_parallel_size:</span> <span class="pre">8</span></code>, <code class="docutils literal notranslate"><span class="pre">moe_expert_parallel_size:</span> <span class="pre">8</span></code> in the curated YAML) spans all 8 GPUs. Plan for the corresponding memory footprint — MXFP8 weights occupy roughly half of BF16.</p></li>
 <li><p>Multi-node launcher: Slurm with the pyxis/enroot container plugin (or an equivalent MPI launcher) to start one rank per GPU across both nodes.</p></li>
 <li><p>High-speed inter-node interconnect (e.g., InfiniBand) for tensor/expert-parallel traffic.</p></li>
 <li><p>Shared filesystem visible to both nodes for the model weights and the configuration file.</p></li>
@@ -615,24 +621,38 @@
 </section>
 <section id="models">
 <h2>Models<a class="headerlink" href="#models" title="Link to this heading">#</a></h2>
-<p>The following checkpoint is available:</p>
+<p>Two checkpoints are supported. Both are loaded through the same <code class="docutils literal notranslate"><span class="pre">MiniMaxM3SparseForConditionalGeneration</span></code> / <code class="docutils literal notranslate"><span class="pre">MiniMaxM3SparseForCausalLM</span></code> architectures and share the same chat template and serving CLI; the only difference is the on-disk weight format.</p>
+<section id="mxfp8-recommended-for-throughput">
+<h3>MXFP8 (recommended for throughput)<a class="headerlink" href="#mxfp8-recommended-for-throughput" title="Link to this heading">#</a></h3>
 <ul class="simple">
-<li><p><a class="reference external" href="https://huggingface.co/MiniMaxAI/MiniMax-M3">MiniMaxAI/MiniMax-M3</a> — Official BF16 checkpoint</p></li>
+<li><p><a class="reference external" href="https://huggingface.co/MiniMaxAI/MiniMax-M3-MXFP8">MiniMaxAI/MiniMax-M3-MXFP8</a> — MiniMaxAI-published MXFP8-quantized checkpoint. Weights are stored in MXFP8 (block size 1×32); activations and the KV cache stay in BF16.</p></li>
+</ul>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>git<span class="w"> </span>lfs<span class="w"> </span>install
+git<span class="w"> </span>clone<span class="w"> </span>https://huggingface.co/MiniMaxAI/MiniMax-M3-MXFP8<span class="w"> </span>/models/MiniMax-M3-MXFP8
+</pre></div>
+</div>
+</section>
+<section id="bf16-upstream">
+<h3>BF16 (upstream)<a class="headerlink" href="#bf16-upstream" title="Link to this heading">#</a></h3>
+<ul class="simple">
+<li><p><a class="reference external" href="https://huggingface.co/MiniMaxAI/MiniMax-M3">MiniMaxAI/MiniMax-M3</a> — Official BF16 checkpoint from MiniMaxAI.</p></li>
 </ul>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>git<span class="w"> </span>lfs<span class="w"> </span>install
 git<span class="w"> </span>clone<span class="w"> </span>https://huggingface.co/MiniMaxAI/MiniMax-M3<span class="w"> </span>/models/MiniMax-M3
 </pre></div>
 </div>
-<p>The checkpoint ships its own chat template (<code class="docutils literal notranslate"><span class="pre">chat_template.jinja</span></code>), which is passed explicitly to the server (see <a class="reference internal" href="#launch-the-tensorrt-llm-server">Launch the TensorRT LLM Server</a>).</p>
+<p>Both checkpoints ship their own chat template (<code class="docutils literal notranslate"><span class="pre">chat_template.jinja</span></code>), which is passed explicitly to the server (see <a class="reference internal" href="#launch-the-tensorrt-llm-server"><span class="xref myst">Launch the TensorRT LLM Server</span></a>).</p>
+</section>
 </section>
 <section id="feature-support-notes">
 <h2>Feature Support Notes<a class="headerlink" href="#feature-support-notes" title="Link to this heading">#</a></h2>
 <ul class="simple">
 <li><p><strong>Block-sparse attention is required.</strong> MiniMax-M3 runs on the block-sparse attention backend, which must be selected via <code class="docutils literal notranslate"><span class="pre">sparse_attention_config.algorithm:</span> <span class="pre">minimax_m3</span></code> in the YAML configuration. There is no dense fallback for the sparse layers.</p></li>
-<li><p><strong>BF16 only.</strong> MiniMax-M3 is served in BF16. No FP8/NVFP4 serving path is supported at this time. The default MoE backend is used.</p></li>
+<li><p><strong>Supported precisions: BF16 and MXFP8.</strong> No additional FP8/NVFP4 serving paths are supported at this time. MXFP8 quantizes only the weights; activations and the KV cache stay in BF16, so the curated YAML is identical for both checkpoints. The default MoE backend is used.</p></li>
 <li><p><strong>KV cache reuse must be disabled.</strong> KV cache reuse is not supported on the sparse-attention path, so set <code class="docutils literal notranslate"><span class="pre">kv_cache_config.enable_block_reuse:</span> <span class="pre">false</span></code>.</p></li>
 <li><p><strong>MTP is not supported</strong> on the sparse-attention path in this release.</p></li>
-<li><p><strong>Parallelism</strong>: MoE experts run with expert parallelism. The attention layers support both Tensor-Expert Parallelism (TEP) and Data-Expert Parallelism (DEP, via <code class="docutils literal notranslate"><span class="pre">--enable_attention_dp</span></code>). The overlap scheduler and CUDA graphs are also supported.</p></li>
+<li><p><strong><code class="docutils literal notranslate"><span class="pre">max_seq_len</span></code> must be capped for CUDA graphs.</strong> The dense GQA expansion in the first few attention layers and the per-Q FP32 expansion in the sparse decode kernel allocate temporary tensors whose size grows linearly with the warmup decode’s <code class="docutils literal notranslate"><span class="pre">max_k</span></code>. If <code class="docutils literal notranslate"><span class="pre">max_seq_len</span></code> is left at the checkpoint default, that <code class="docutils literal notranslate"><span class="pre">max_k</span></code> follows <code class="docutils literal notranslate"><span class="pre">max_position_embeddings</span></code> (1M for MXFP8, 512K for BF16) and the resulting gigabyte-scale single-allocation request exceeds the caching allocator’s CUDA-graph-safe path, so capture fails with <code class="docutils literal notranslate"><span class="pre">cudaErrorStreamCaptureUnsupported</span></code> / OOM. The curated YAML therefore sets <code class="docutils literal notranslate"><span class="pre">max_seq_len</span></code> to a small value just above ISL+OSL (<code class="docutils literal notranslate"><span class="pre">2068</span></code> for the 1k/1k benchmark) so CUDA graphs can capture cleanly. Raise it for longer-context workloads, but expect a corresponding cut in <code class="docutils literal notranslate"><span class="pre">max_batch_size</span></code>.</p></li>
+<li><p><strong>Parallelism.</strong> MoE experts run with expert parallelism. The attention layers support both Tensor-Expert Parallelism (TEP) and Data-Expert Parallelism (DEP, via <code class="docutils literal notranslate"><span class="pre">enable_attention_dp:</span> <span class="pre">true</span></code>). The overlap scheduler is enabled by default.</p></li>
 <li><p><strong>Multimodal.</strong> <code class="docutils literal notranslate"><span class="pre">MiniMaxM3SparseForConditionalGeneration</span></code> supports text, image, and video inputs. The text decoder is also usable standalone (text-only) via the <code class="docutils literal notranslate"><span class="pre">MiniMaxM3SparseForCausalLM</span></code> architecture.</p></li>
 </ul>
 </section>
@@ -642,7 +662,7 @@ git<span class="w"> </span>clone<span class="w"> </span>https://huggingface.co/M
 <section id="container-image">
 <h3>Container Image<a class="headerlink" href="#container-image" title="Link to this heading">#</a></h3>
 <p>The TensorRT LLM NVIDIA NGC image is used as the Slurm container:</p>
-<div class="highlight-text notranslate"><div class="highlight"><pre><span></span>nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc20
+<div class="highlight-text notranslate"><div class="highlight"><pre><span></span>nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc21
 </pre></div>
 </div>
 <p>Note:</p>
@@ -664,14 +684,23 @@ git<span class="w"> </span>clone<span class="w"> </span>https://huggingface.co/M
 <p class="admonition-title">Show MiniMax-M3 throughput config</p>
 <div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">max_batch_size</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">256</span>
 <span class="nt">max_num_tokens</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">8192</span>
+<span class="c1"># Cap max_seq_len explicitly. Without this cap the warmup decode used for</span>
+<span class="c1"># CUDA-graph capture inherits the checkpoint&#39;s max_position_embeddings</span>
+<span class="c1"># (1M for MXFP8, 512K for BF16), which makes both the dense GQA expansion</span>
+<span class="c1"># in `_dense_forward` and the per-Q FP32 slab in `_sparse_gqa_masked`</span>
+<span class="c1"># allocate gigabyte-scale temporaries that exceed the caching allocator&#39;s</span>
+<span class="c1"># graph-safe path and fail capture with cudaErrorStreamCaptureUnsupported.</span>
+<span class="c1"># 2068 leaves a small margin over ISL+OSL=2048 (1k/1k benchmark).</span>
+<span class="nt">max_seq_len</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">2068</span>
 <span class="nt">tensor_parallel_size</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">8</span>
 <span class="nt">moe_expert_parallel_size</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">8</span>
 <span class="nt">enable_attention_dp</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span>
 <span class="nt">trust_remote_code</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span>
 <span class="nt">cuda_graph_config</span><span class="p">:</span>
 <span class="w">  </span><span class="nt">enable_padding</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span>
+<span class="w">  </span><span class="nt">max_batch_size</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">256</span>
 <span class="nt">kv_cache_config</span><span class="p">:</span>
-<span class="w">  </span><span class="nt">free_gpu_memory_fraction</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">0.3</span>
+<span class="w">  </span><span class="nt">free_gpu_memory_fraction</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">0.7</span>
 <span class="w">  </span><span class="nt">enable_block_reuse</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">false</span>
 <span class="nt">sparse_attention_config</span><span class="p">:</span>
 <span class="w">  </span><span class="nt">algorithm</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">minimax_m3</span>
@@ -685,12 +714,12 @@ git<span class="w"> </span>clone<span class="w"> </span>https://huggingface.co/M
 <section id="launch-the-tensorrt-llm-server">
 <h3>Launch the TensorRT LLM Server<a class="headerlink" href="#launch-the-tensorrt-llm-server" title="Link to this heading">#</a></h3>
 <p>MiniMax-M3 is launched through the <code class="docutils literal notranslate"><span class="pre">trtllm-llmapi-launch</span></code> wrapper, which sets up the multi-rank (MPI/Slurm) environment that the parallel server requires. The wrapper is run once per rank by Slurm (<code class="docutils literal notranslate"><span class="pre">srun</span></code>), with one task (rank) per GPU. The example below launches the server across 2 nodes (<code class="docutils literal notranslate"><span class="pre">-N</span> <span class="pre">2</span></code>), 4 GPUs per node (<code class="docutils literal notranslate"><span class="pre">--ntasks-per-node</span> <span class="pre">4</span></code>, 8 ranks total), using the curated YAML to drive parallelism, batching, and the MiniMax-M3 sparse-attention backend:</p>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nb">export</span><span class="w"> </span><span class="nv">MODEL</span><span class="o">=</span>/models/MiniMax-M3<span class="w">   </span><span class="c1"># path on the shared filesystem; mounted into the container</span>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nb">export</span><span class="w"> </span><span class="nv">MODEL</span><span class="o">=</span>/models/MiniMax-M3-MXFP8<span class="w">   </span><span class="c1"># MXFP8 (recommended); use /models/MiniMax-M3 for BF16</span>
 
 srun<span class="w"> </span>-N<span class="w"> </span><span class="m">2</span><span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--ntasks<span class="w"> </span><span class="m">8</span><span class="w"> </span>--ntasks-per-node<span class="w"> </span><span class="m">4</span><span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--mpi<span class="o">=</span>pmix<span class="w"> </span>--gres<span class="o">=</span>gpu:4<span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--container-image<span class="o">=</span>nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc20<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--container-image<span class="o">=</span>nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc21<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--container-mounts<span class="o">=</span>/models:/models,/workspace:/workspace,<span class="si">${</span><span class="nv">TRTLLM_DIR</span><span class="si">}</span>:<span class="si">${</span><span class="nv">TRTLLM_DIR</span><span class="si">}</span><span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--container-workdir<span class="w"> </span>/workspace<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>bash<span class="w"> </span>-c<span class="w"> </span><span class="s2">&quot;trtllm-llmapi-launch \</span>
@@ -703,7 +732,7 @@ srun<span class="w"> </span>-N<span class="w"> </span><span class="m">2</span><s
 <span class="s2">          --extra_llm_api_options </span><span class="nv">$EXTRA_LLM_API_FILE</span><span class="s2">&quot;</span>
 </pre></div>
 </div>
-<p>The parallelism, batch, KV-cache, sparse-attention, and CUDA-graph settings all live in the YAML; no CLI flags need to change to tune them.</p>
+<p>The parallelism, batch, KV-cache, sparse-attention, and CUDA-graph settings all live in the YAML; no CLI flags need to change to tune them. The same <code class="docutils literal notranslate"><span class="pre">$EXTRA_LLM_API_FILE</span></code> is used for both the MXFP8 and BF16 checkpoints — point <code class="docutils literal notranslate"><span class="pre">$MODEL</span></code> at the directory of whichever checkpoint you want to serve.</p>
 <blockquote>
 <div><p>[!NOTE]
 Adjust <code class="docutils literal notranslate"><span class="pre">-N</span></code>, <code class="docutils literal notranslate"><span class="pre">--ntasks</span></code>, <code class="docutils literal notranslate"><span class="pre">--ntasks-per-node</span></code>, and <code class="docutils literal notranslate"><span class="pre">--gres=gpu:</span></code> to match your cluster’s GPUs-per-node. The total number of tasks (ranks) must equal <code class="docutils literal notranslate"><span class="pre">tensor_parallel_size</span></code> (<code class="docutils literal notranslate"><span class="pre">8</span></code>). Add the partition / account / node-list flags (<code class="docutils literal notranslate"><span class="pre">-p</span></code>, <code class="docutils literal notranslate"><span class="pre">-A</span></code>, <code class="docutils literal notranslate"><span class="pre">-w</span></code>) required by your Slurm setup, and ensure <code class="docutils literal notranslate"><span class="pre">/models</span></code>, <code class="docutils literal notranslate"><span class="pre">/workspace</span></code>, and the TensorRT LLM repository resolve to the same shared paths on both nodes.</p>
@@ -752,7 +781,7 @@ Adjust <code class="docutils literal notranslate"><span class="pre">-N</span></c
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>curl<span class="w"> </span>http://localhost:8000/v1/chat/completions<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>-H<span class="w"> </span><span class="s2">&quot;Content-Type: application/json&quot;</span><span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>-d<span class="w"> </span><span class="s1">&#39;{</span>
-<span class="s1">      &quot;model&quot;: &quot;MiniMaxAI/MiniMax-M3&quot;,</span>
+<span class="s1">      &quot;model&quot;: &quot;MiniMaxAI/MiniMax-M3-MXFP8&quot;,</span>
 <span class="s1">      &quot;messages&quot;: [</span>
 <span class="s1">          {&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: &quot;What is the capital of France?&quot;}</span>
 <span class="s1">      ],</span>
@@ -765,7 +794,7 @@ Adjust <code class="docutils literal notranslate"><span class="pre">-N</span></c
 <div class="highlight-json notranslate"><div class="highlight"><pre><span></span><span class="p">{</span>
 <span class="w">  </span><span class="nt">&quot;id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;chatcmpl-...&quot;</span><span class="p">,</span>
 <span class="w">  </span><span class="nt">&quot;object&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;chat.completion&quot;</span><span class="p">,</span>
-<span class="w">  </span><span class="nt">&quot;model&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;MiniMaxAI/MiniMax-M3&quot;</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">&quot;model&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;MiniMaxAI/MiniMax-M3-MXFP8&quot;</span><span class="p">,</span>
 <span class="w">  </span><span class="nt">&quot;choices&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
 <span class="w">    </span><span class="p">{</span>
 <span class="w">      </span><span class="nt">&quot;index&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
@@ -815,7 +844,7 @@ Adjust <code class="docutils literal notranslate"><span class="pre">-N</span></c
 <span class="s">for concurrency in ${concurrency_list}; do</span>
 <span class="s">    num_prompts=$((concurrency * multi_round))</span>
 <span class="s">    python -m tensorrt_llm.serve.scripts.benchmark_serving \</span>
-<span class="s">        --model MiniMaxAI/MiniMax-M3 \</span>
+<span class="s">        --model MiniMaxAI/MiniMax-M3-MXFP8 \</span>
 <span class="s">        --backend openai \</span>
 <span class="s">        --dataset-name &quot;random&quot; \</span>
 <span class="s">        --random-input-len ${isl} \</span>
@@ -886,19 +915,16 @@ chmod<span class="w"> </span>+x<span class="w"> </span>bench.sh
 <li><p>Both TPOT and ITL ignore TTFT.</p></li>
 </ul>
 <p>For a single request, ITLs are the time intervals between tokens, while TPOT is the average of those intervals:</p>
-<div class="math notranslate nohighlight">
-\[
+<p>$$
 \text{TPOT (1 request)} = \text{Avg(ITL)} = \frac{\text{E2E latency} - \text{TTFT}}{\text{Num Output Tokens} - 1}
-\]</div>
+$$</p>
 <p>Across different requests, <strong>average TPOT</strong> is the mean of each request’s TPOT (all requests weighted equally), while <strong>average ITL</strong> is token-weighted (all tokens weighted equally):</p>
-<div class="math notranslate nohighlight">
-\[
+<p>$$
 \text{Avg TPOT (N requests)} = \frac{\text{TPOT}_1 + \text{TPOT}_2 + \cdots + \text{TPOT}_N}{N}
-\]</div>
-<div class="math notranslate nohighlight">
-\[
+$$</p>
+<p>$$
 \text{Avg ITL (N requests)} = \frac{\text{Sum of all ITLs across requests}}{\text{Num Output Tokens across requests}}
-\]</div>
+$$</p>
 </section>
 <section id="end-to-end-e2e-latency">
 <h4>End-to-End (E2E) Latency<a class="headerlink" href="#end-to-end-e2e-latency" title="Link to this heading">#</a></h4>
@@ -907,18 +933,16 @@ chmod<span class="w"> </span>+x<span class="w"> </span>bench.sh
 <section id="total-token-throughput">
 <h4>Total Token Throughput<a class="headerlink" href="#total-token-throughput" title="Link to this heading">#</a></h4>
 <p>The combined rate at which the system processes both input (prompt) tokens and output (generated) tokens.</p>
-<div class="math notranslate nohighlight">
-\[
+<p>$$
 \text{Total TPS} = \frac{\text{Num Input Tokens}+\text{Num Output Tokens}}{T_{last} - T_{first}}
-\]</div>
+$$</p>
 </section>
 <section id="tokens-per-second-tps-or-output-token-throughput">
 <h4>Tokens Per Second (TPS) or Output Token Throughput<a class="headerlink" href="#tokens-per-second-tps-or-output-token-throughput" title="Link to this heading">#</a></h4>
 <p>How many output tokens the system generates each second.</p>
-<div class="math notranslate nohighlight">
-\[
+<p>$$
 \text{TPS} = \frac{\text{Num Output Tokens}}{T_{last} - T_{first}}
-\]</div>
+$$</p>
 </section>
 </section>
 </section>
@@ -975,7 +999,11 @@ chmod<span class="w"> </span>+x<span class="w"> </span>bench.sh
     <ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#introduction">Introduction</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#prerequisites">Prerequisites</a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#models">Models</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#models">Models</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mxfp8-recommended-for-throughput">MXFP8 (recommended for throughput)</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#bf16-upstream">BF16 (upstream)</a></li>
+</ul>
+</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#feature-support-notes">Feature Support Notes</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#deployment-steps">Deployment Steps</a><ul class="nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#container-image">Container Image</a></li>
@@ -1027,8 +1055,8 @@ chmod<span class="w"> </span>+x<span class="w"> </span>bench.sh
   
 
   <!-- Scripts loaded after <body> so the DOM is not blocked -->
-  <script defer src="../_static/scripts/bootstrap.js?digest=a95f357e85573c9b56d5"></script>
-<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=a95f357e85573c9b56d5"></script>
+  <script defer src="../_static/scripts/bootstrap.js?digest=90905a2f556bf617f1a9"></script>
+<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=90905a2f556bf617f1a9"></script>
 
 
   <footer class="bd-footer">
@@ -1100,9 +1128,9 @@ chmod<span class="w"> </span>+x<span class="w"> </span>bench.sh
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on June 27, 2026.</p>
+  <p>Last updated on July 14, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/c25c23f">c25c23f</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/1662a87">1662a87</a>.</p>
   
 </div></div>
       

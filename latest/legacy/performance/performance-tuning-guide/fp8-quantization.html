@@ -28,8 +28,8 @@
   </noscript>
   
   <!-- Loaded before other Sphinx assets -->
-  <link href="../../../_static/styles/theme.css?digest=a95f357e85573c9b56d5" rel="stylesheet" />
-<link href="../../../_static/styles/pydata-sphinx-theme.css?digest=a95f357e85573c9b56d5" rel="stylesheet" />
+  <link href="../../../_static/styles/theme.css?digest=90905a2f556bf617f1a9" rel="stylesheet" />
+<link href="../../../_static/styles/pydata-sphinx-theme.css?digest=90905a2f556bf617f1a9" rel="stylesheet" />
 
     <link rel="stylesheet" type="text/css" href="../../../_static/pygments.css?v=8f2a1f02" />
     <link rel="stylesheet" type="text/css" href="../../../_static/styles/nvidia-sphinx-theme.css?v=933278ad" />
@@ -40,10 +40,10 @@
     <link rel="stylesheet" type="text/css" href="../../../_static/custom.css?v=19d20f17" />
   
   <!-- So that users can add custom icons -->
-  <script defer src="../../../_static/scripts/fontawesome.js?digest=a95f357e85573c9b56d5"></script>
+  <script defer src="../../../_static/scripts/fontawesome.js?digest=90905a2f556bf617f1a9"></script>
   <!-- Pre-loaded scripts that we'll load fully later -->
-  <link rel="preload" as="script" href="../../../_static/scripts/bootstrap.js?digest=a95f357e85573c9b56d5" />
-<link rel="preload" as="script" href="../../../_static/scripts/pydata-sphinx-theme.js?digest=a95f357e85573c9b56d5" />
+  <link rel="preload" as="script" href="../../../_static/scripts/bootstrap.js?digest=90905a2f556bf617f1a9" />
+<link rel="preload" as="script" href="../../../_static/scripts/pydata-sphinx-theme.js?digest=90905a2f556bf617f1a9" />
 
 
 
@@ -61,9 +61,9 @@
     <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
     <script>DOCUMENTATION_OPTIONS.pagename = 'legacy/performance/performance-tuning-guide/fp8-quantization';</script>
     <script>
-        DOCUMENTATION_OPTIONS.theme_version = '0.19.0';
+        DOCUMENTATION_OPTIONS.theme_version = '0.20.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc20';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc21';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -77,7 +77,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc20" />
+  <meta name="docsearch:version" content="1.3.0rc21" />
   
     
     <script src="../../../_static/searchtools.js"></script>
@@ -444,6 +444,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../../../features/feature-combination-matrix.html">Feature Combination Matrix</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/disagg-serving.html">Disaggregated Serving</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../features/embeddings.html">Embeddings (Encoder-Only Models)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/kvcache.html">KV Cache System</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/long-sequence.html">Long Sequences</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/lora.html">LoRA (Low-Rank Adaptation)</a></li>
@@ -454,6 +455,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../../../features/quantization.html">Quantization</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/sampling.html">Sampling</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/additional-outputs.html">Additional Outputs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../features/post-processor-hook.html">Post-Processing Hook</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/guided-decoding.html">Guided Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/speculative-decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/checkpoint-loading.html">Checkpoint Loading</a></li>
@@ -493,6 +495,7 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog25_Scaling_Video_Generation_Across_NVL72_Rack_with_TensorRT-LLM.html">Scaling Video Generation Across NVL72 rack with TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog24_MoE_as_Dense_GEMM.html">MoE as Dense GEMM: Optimizing Low-Latency MoE Inference on NVIDIA Blackwell</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog23_Joint_Optimization_of_Agent_Applications_and_TensorRT-LLM.html">Joint Optimization of Agent Applications and TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog22_Helix_Parallelism_Scaling_Multi_Million_Token_Decoding_with_KV_Cache_Sharding.html">Helix Parallelism in TensorRT-LLM: Scaling Multi-Million-Token Decoding with KV Cache Sharding</a></li>
@@ -530,9 +533,9 @@
 <li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM">Github Code</a></li>
 <li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/issues?q=is%3Aissue%20state%3Aopen%20label%3Aroadmap">Roadmap</a></li>
 </ul>
-<p aria-level="2" class="caption" role="heading"><span class="caption-text">Use TensorRT Engine</span></p>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Migration</span></p>
 <ul class="nav bd-sidenav">
-<li class="toctree-l1"><a class="reference internal" href="../../tensorrt_quickstart.html">LLM API with TensorRT Engine</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../tensorrt-backend-removal.html">Migration Guide: TensorRT Backend Removed</a></li>
 </ul>
 </div>
 </nav></div>
@@ -584,8 +587,12 @@
 <div id="searchbox"></div>
                 <article class="bd-article">
                   
-  <section class="tex2jax_ignore mathjax_ignore" id="fp8-quantization">
+  <section id="fp8-quantization">
 <span id="id1"></span><h1>FP8 Quantization<a class="headerlink" href="#fp8-quantization" title="Link to this heading">#</a></h1>
+<div class="admonition caution">
+<p class="admonition-title">Caution</p>
+<p>The legacy TensorRT backend has been removed and is no longer supported. This page is retained for cross-reference only.</p>
+</div>
 <p>Quantization is a technique that allows models to run in lower precisions like int8 and fp8 while maintaining acceptable output quality. Running in lower precisions can greatly boost performance, significantly increasing throughput and decreasing latency. The tradeoff is a drop in output quality, but in many cases the output quality is still acceptable and many real world deployments utilize quantization. If you want to learn more about quantization refer to <a class="reference external" href="https://developer.nvidia.com/blog/mastering-llm-techniques-inference-optimization/">Mastering LLM Techniques - Inference Optimization</a></p>
 <p>This section walks through enabling fp8 quantization and highlight some fp8 quantization specific configuration options for boosting performance. It also continues the case study of Llama-3.3-70B split across 4 H100-sxm-80GB GPUs via tensor parallelism and showcase the effects of enabling these configuration options on performance.</p>
 <blockquote>
@@ -639,7 +646,7 @@
 </section>
 <section id="fp8-baseline-performance">
 <h2>FP8 “Baseline” Performance<a class="headerlink" href="#fp8-baseline-performance" title="Link to this heading">#</a></h2>
-<p>Benchmarking the engine produced by the example above yielded the following performance results. Note that we enabled some of the build flags we mentioned <a class="reference internal" href="useful-build-time-flags.html"><span class="std std-doc">earlier</span></a> (multiple profiles, paged_context_fmha) and also tuned max batch size and max num tokens. This is done to give a sense of what performance is achievable if you tune an fp8 engine but exclude options that have been tailored for quantization. We recommend disabling the gemm plugin for quantized engines which is why it is not included here (it is off by default). Reduce fusion has a quantization specific optimization that will be covered later. For the remainder of this page we will refer to this setup as the “baseline” numbers for fp8.</p>
+<p>Benchmarking the engine produced by the example above yielded the following performance results. Note that we enabled some of the build flags we mentioned earlier (multiple profiles, paged_context_fmha) and also tuned max batch size and max num tokens. This is done to give a sense of what performance is achievable if you tune an fp8 engine but exclude options that have been tailored for quantization. We recommend disabling the gemm plugin for quantized engines which is why it is not included here (it is off by default). Reduce fusion has a quantization specific optimization that will be covered later. For the remainder of this page we will refer to this setup as the “baseline” numbers for fp8.</p>
 <div class="pst-scrollable-table-container"><table class="table">
 <thead>
 <tr class="row-odd"><th class="head"><p>Metric</p></th>
@@ -708,7 +715,7 @@
 </section>
 <section id="reduce-norm-fusion-with-user-buffers-for-llama-models">
 <h2>Reduce Norm Fusion with User Buffers for Llama Models<a class="headerlink" href="#reduce-norm-fusion-with-user-buffers-for-llama-models" title="Link to this heading">#</a></h2>
-<p>The <a class="reference internal" href="useful-build-time-flags.html#reduce-norm-fusion-plugin-for-llama-models"><span class="std std-ref">Reduce Norm Fusion</span></a> feature is supported for fp8. An additional optimization called “User Buffers” is also supported for fp8 models. The user buffer feature aims to eliminate extra copies from the local buffer to the shared buffer in the communication kernel, leading to improved end-to-end performance.</p>
+<p>The Reduce Norm Fusion feature is supported for fp8. An additional optimization called “User Buffers” is also supported for fp8 models. The user buffer feature aims to eliminate extra copies from the local buffer to the shared buffer in the communication kernel, leading to improved end-to-end performance.</p>
 <section id="enabling-reduce-norm-fusion-with-user-buffers">
 <h3>Enabling Reduce Norm Fusion with User Buffers<a class="headerlink" href="#enabling-reduce-norm-fusion-with-user-buffers" title="Link to this heading">#</a></h3>
 <p>To enable reduce norm fusion with user buffers, add the following lines below <code class="docutils literal notranslate"><span class="pre">BuildConfig</span></code>’s initialization</p>
@@ -805,7 +812,7 @@ accuracy loss is unacceptable.</p>
 </section>
 <section id="low-latency-gemm-plugin">
 <h2>Low Latency GEMM Plugin<a class="headerlink" href="#low-latency-gemm-plugin" title="Link to this heading">#</a></h2>
-<p>Previously we mentioned the <a class="reference internal" href="useful-build-time-flags.html#gemm-plugin"><span class="std std-ref">GEMM Plugin</span></a> feature. Although it has fp8 support we recommend disabling it (by default it is disabled). However for low-latency scenarios in fp8 we recommend trying the low latency GEMM plugin to see if it is effective for your workload.</p>
+<p>Previously we mentioned the GEMM Plugin feature. Although it has fp8 support we recommend disabling it (by default it is disabled). However for low-latency scenarios in fp8 we recommend trying the low latency GEMM plugin to see if it is effective for your workload.</p>
 <section id="enabling-low-latency-gemm-plugin">
 <h3>Enabling Low Latency GEMM plugin<a class="headerlink" href="#enabling-low-latency-gemm-plugin" title="Link to this heading">#</a></h3>
 <p>To enable the low latency GEMM plugin, add the following lines below <code class="docutils literal notranslate"><span class="pre">BuildConfig</span></code>’s initialization</p>
@@ -1003,8 +1010,8 @@ accuracy loss is unacceptable.</p>
   
 
   <!-- Scripts loaded after <body> so the DOM is not blocked -->
-  <script defer src="../../../_static/scripts/bootstrap.js?digest=a95f357e85573c9b56d5"></script>
-<script defer src="../../../_static/scripts/pydata-sphinx-theme.js?digest=a95f357e85573c9b56d5"></script>
+  <script defer src="../../../_static/scripts/bootstrap.js?digest=90905a2f556bf617f1a9"></script>
+<script defer src="../../../_static/scripts/pydata-sphinx-theme.js?digest=90905a2f556bf617f1a9"></script>
 
 
   <footer class="bd-footer">
@@ -1076,9 +1083,9 @@ accuracy loss is unacceptable.</p>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on June 27, 2026.</p>
+  <p>Last updated on July 14, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/c25c23f">c25c23f</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/1662a87">1662a87</a>.</p>
   
 </div></div>
       

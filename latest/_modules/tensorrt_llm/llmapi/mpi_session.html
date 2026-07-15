@@ -27,8 +27,8 @@
   </noscript>
   
   <!-- Loaded before other Sphinx assets -->
-  <link href="../../../_static/styles/theme.css?digest=a95f357e85573c9b56d5" rel="stylesheet" />
-<link href="../../../_static/styles/pydata-sphinx-theme.css?digest=a95f357e85573c9b56d5" rel="stylesheet" />
+  <link href="../../../_static/styles/theme.css?digest=90905a2f556bf617f1a9" rel="stylesheet" />
+<link href="../../../_static/styles/pydata-sphinx-theme.css?digest=90905a2f556bf617f1a9" rel="stylesheet" />
 
     <link rel="stylesheet" type="text/css" href="../../../_static/pygments.css?v=8f2a1f02" />
     <link rel="stylesheet" type="text/css" href="../../../_static/styles/nvidia-sphinx-theme.css?v=933278ad" />
@@ -39,10 +39,10 @@
     <link rel="stylesheet" type="text/css" href="../../../_static/custom.css?v=19d20f17" />
   
   <!-- So that users can add custom icons -->
-  <script defer src="../../../_static/scripts/fontawesome.js?digest=a95f357e85573c9b56d5"></script>
+  <script defer src="../../../_static/scripts/fontawesome.js?digest=90905a2f556bf617f1a9"></script>
   <!-- Pre-loaded scripts that we'll load fully later -->
-  <link rel="preload" as="script" href="../../../_static/scripts/bootstrap.js?digest=a95f357e85573c9b56d5" />
-<link rel="preload" as="script" href="../../../_static/scripts/pydata-sphinx-theme.js?digest=a95f357e85573c9b56d5" />
+  <link rel="preload" as="script" href="../../../_static/scripts/bootstrap.js?digest=90905a2f556bf617f1a9" />
+<link rel="preload" as="script" href="../../../_static/scripts/pydata-sphinx-theme.js?digest=90905a2f556bf617f1a9" />
 
 
 
@@ -278,6 +278,25 @@ let darkTheme = isDarkTheme();
 let modal = null;
 let modalContent = null;
 let previousScrollOffset = [window.scrollX, window.scrollY];
+let _lazyObserver = null;
+let _renderQueue = Promise.resolve();
+
+// Apply d3 zoom to each SVG. Idempotent: an SVG already wrapped is skipped,
+// so this is safe to call both for the initial batch and for diagrams that
+// render lazily once they become visible.
+const addZoomToSvgs = (svgs) => {
+    svgs.each(function() {
+        if (this.getAttribute('data-zoom-applied') === 'true') return;
+        var svg = d3.select(this);
+        svg.html("<g class='wrapper'>" + svg.html() + "</g>");
+        var inner = svg.select("g");
+        var zoom = d3.zoom().on("zoom", function(event) {
+            inner.attr("transform", event.transform);
+        });
+        svg.call(zoom);
+        this.setAttribute('data-zoom-applied', 'true');
+    });
+};
 
 const runMermaid = async (rerun) => {
     console.log("Running mermaid diagrams, rerun =", rerun);
@@ -285,7 +304,15 @@ const runMermaid = async (rerun) => {
     let all_mermaids = document.querySelectorAll(".mermaid");
 
     if (rerun) {
+        // Disconnect any previous lazy rendering observer
+        if (_lazyObserver) {
+            _lazyObserver.disconnect();
+            _lazyObserver = null;
+        }
+
         all_mermaids.forEach((el) => {
+            el.removeAttribute('data-mermaid-deferred');
+            el.removeAttribute('data-mermaid-render-failed');
             if(!el.hasAttribute("data-original-code")) {
                 // store original code
                 // console.log(`Storing original code for first run: `, el.innerHTML);
@@ -302,35 +329,89 @@ const runMermaid = async (rerun) => {
                 el.setAttribute('data-original-code', el.innerHTML);
             }
         });
-        await mermaid.run();
+
+        // Separate visible and hidden elements. Mermaid's layout engine measures
+        // text dimensions via the DOM, which fails for elements hidden by a parent
+        // (e.g., Reveal.js non-active slides, sphinx-design unopened tabs),
+        // producing broken SVGs. Render visible elements now, defer hidden ones.
+        const visible = [];
+        const hidden = [];
+        all_mermaids.forEach((el) => {
+            // offsetParent is null for display:none ancestors.
+            // getClientRects().length > 0 catches position:fixed elements
+            // (which also have null offsetParent but are still visible).
+            if (el.offsetParent !== null || el.getClientRects().length > 0) {
+                visible.push(el);
+            } else {
+                hidden.push(el);
+                el.setAttribute('data-mermaid-deferred', 'true');
+            }
+        });
+
+        if (visible.length > 0) {
+            try {
+                await mermaid.run({ nodes: visible });
+            } catch (e) {
+                console.error("Mermaid rendering failed:", e);
+            }
+        }
+
+        // Lazily render hidden elements when they become visible.
+        // Uses a promise chain (_renderQueue) to serialize rendering,
+        // since IntersectionObserver may report multiple entries at once
+        // and mermaid.run() is not safe to call concurrently.
+        if (hidden.length > 0) {
+            if (typeof IntersectionObserver === 'undefined') {
+                console.warn("IntersectionObserver not available; hidden mermaid diagrams will not render.");
+            } else {
+                _renderQueue = Promise.resolve();
+                _lazyObserver = new IntersectionObserver((entries) => {
+                    for (const entry of entries) {
+                        if (entry.isIntersecting && entry.target.getAttribute("data-processed") !== "true") {
+                            _lazyObserver.unobserve(entry.target);
+                            const el = entry.target;
+                            _renderQueue = _renderQueue.then(async () => {
+                                try {
+                                    await mermaid.run({ nodes: [el] });
+                                    el.removeAttribute('data-mermaid-deferred');
+                                    // Apply zoom to the now-rendered diagram, matching
+                                    // the decoration visible diagrams receive.
+                                    if ("False" === "True") {
+                                        addZoomToSvgs(d3.selectAll(""));
+                                    }
+                                } catch (e) {
+                                    console.error("Mermaid deferred rendering failed:", e);
+                                    el.removeAttribute('data-mermaid-deferred');
+                                    el.setAttribute('data-mermaid-render-failed', 'true');
+                                }
+                            });
+                        }
+                    }
+                });
+                hidden.forEach((el) => _lazyObserver.observe(el));
+            }
+        }
     }
 
     all_mermaids = document.querySelectorAll(".mermaid");
-    const mermaids_processed = document.querySelectorAll(".mermaid[data-processed='true']");
+    // Exclude deferred (hidden) and render-failed elements from completion checks
+    const mermaids_active = document.querySelectorAll(".mermaid:not([data-mermaid-deferred]):not([data-mermaid-render-failed])");
+    const mermaids_processed = document.querySelectorAll(".mermaid:not([data-mermaid-deferred]):not([data-mermaid-render-failed])[data-processed='true']");
 
     if ("False" === "True") {
-        const mermaids_to_add_zoom = -1 === -1 ? all_mermaids.length : -1;
+        const mermaids_to_add_zoom = -1 === -1 ? mermaids_active.length : -1;
         if(mermaids_to_add_zoom > 0) {
             var svgs = d3.selectAll("");
-            if(all_mermaids.length !== mermaids_processed.length) {
+            // Wait until every active (visible) diagram has rendered. Deferred
+            // diagrams are excluded, so a fixed d3_node_count that counts a
+            // hidden diagram no longer loops forever waiting for its SVG.
+            if(mermaids_active.length !== mermaids_processed.length) {
                 setTimeout(() => runMermaid(false), 200);
                 return;
-            } else if(svgs.size() !== mermaids_to_add_zoom) {
-                setTimeout(() => runMermaid(false), 200);
-                return;
-            } else {
-                svgs.each(function() {
-                    var svg = d3.select(this);
-                    svg.html("<g class='wrapper'>" + svg.html() + "</g>");
-                    var inner = svg.select("g");
-                    var zoom = d3.zoom().on("zoom", function(event) {
-                        inner.attr("transform", event.transform);
-                    });
-                    svg.call(zoom);
-                });
             }
+            addZoomToSvgs(svgs);
         }
-    } else if(all_mermaids.length !== mermaids_processed.length) {
+    } else if(mermaids_active.length !== mermaids_processed.length) {
         // Wait for mermaid to process all diagrams
         setTimeout(() => runMermaid(false), 200);
         return;
@@ -496,9 +577,9 @@ window.addEventListener("load", load);
 window.runMermaid = runMermaid;</script>
     <script>DOCUMENTATION_OPTIONS.pagename = '_modules/tensorrt_llm/llmapi/mpi_session';</script>
     <script>
-        DOCUMENTATION_OPTIONS.theme_version = '0.19.0';
+        DOCUMENTATION_OPTIONS.theme_version = '0.20.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc20';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc21';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -512,7 +593,7 @@ window.runMermaid = runMermaid;</script>
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc20" />
+  <meta name="docsearch:version" content="1.3.0rc21" />
   
     
     <script src="../../../_static/searchtools.js"></script>
@@ -875,6 +956,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/feature-combination-matrix.html">Feature Combination Matrix</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/disagg-serving.html">Disaggregated Serving</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../features/embeddings.html">Embeddings (Encoder-Only Models)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/kvcache.html">KV Cache System</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/long-sequence.html">Long Sequences</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/lora.html">LoRA (Low-Rank Adaptation)</a></li>
@@ -885,6 +967,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/quantization.html">Quantization</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/sampling.html">Sampling</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/additional-outputs.html">Additional Outputs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../features/post-processor-hook.html">Post-Processing Hook</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/guided-decoding.html">Guided Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/speculative-decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/checkpoint-loading.html">Checkpoint Loading</a></li>
@@ -924,6 +1007,7 @@ window.runMermaid = runMermaid;</script>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog25_Scaling_Video_Generation_Across_NVL72_Rack_with_TensorRT-LLM.html">Scaling Video Generation Across NVL72 rack with TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog24_MoE_as_Dense_GEMM.html">MoE as Dense GEMM: Optimizing Low-Latency MoE Inference on NVIDIA Blackwell</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog23_Joint_Optimization_of_Agent_Applications_and_TensorRT-LLM.html">Joint Optimization of Agent Applications and TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog22_Helix_Parallelism_Scaling_Multi_Million_Token_Decoding_with_KV_Cache_Sharding.html">Helix Parallelism in TensorRT-LLM: Scaling Multi-Million-Token Decoding with KV Cache Sharding</a></li>
@@ -961,9 +1045,9 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM">Github Code</a></li>
 <li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/issues?q=is%3Aissue%20state%3Aopen%20label%3Aroadmap">Roadmap</a></li>
 </ul>
-<p aria-level="2" class="caption" role="heading"><span class="caption-text">Use TensorRT Engine</span></p>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Migration</span></p>
 <ul class="nav bd-sidenav">
-<li class="toctree-l1"><a class="reference internal" href="../../../legacy/tensorrt_quickstart.html">LLM API with TensorRT Engine</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../legacy/tensorrt-backend-removal.html">Migration Guide: TensorRT Backend Removed</a></li>
 </ul>
 </div>
 </nav></div>
@@ -1049,7 +1133,7 @@ window.runMermaid = runMermaid;</script>
 
 
 <span class="k">class</span><span class="w"> </span><span class="nc">MPINodeState</span><span class="p">:</span>
-<span class="w">    </span><span class="sd">&#39;&#39;&#39; MPINodeState acts as a central global state shares between tasks on MPI node.</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;MPINodeState acts as a central global state shares between tasks on MPI node.</span>
 
 <span class="sd">    An example:</span>
 <span class="sd">        def task():</span>
@@ -1066,7 +1150,7 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">        This should produce the following output:</span>
 <span class="sd">        - [1, 1, 1, 1]</span>
 <span class="sd">        - [2, 2, 2, 2]</span>
-<span class="sd">    &#39;&#39;&#39;</span>
+<span class="sd">    &quot;&quot;&quot;</span>
 
     <span class="n">state</span> <span class="o">=</span> <span class="kc">None</span>
     <span class="c1"># Global MPICommExecutor instance to be reused across multiple MpiCommSession instances</span>
@@ -1080,9 +1164,9 @@ window.runMermaid = runMermaid;</script>
 
 
 <span class="k">def</span><span class="w"> </span><span class="nf">external_mpi_comm_available</span><span class="p">(</span><span class="n">model_world_size</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
-<span class="w">    </span><span class="sd">&#39;&#39;&#39; Check if the current process is launched by mpirun and does not use MPIPoolExecutor to spawn processes.</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Check if the current process is launched by mpirun and does not use MPIPoolExecutor to spawn processes.</span>
 <span class="sd">    e.g. mpirun -np 4 python script.py</span>
-<span class="sd">    &#39;&#39;&#39;</span>
+<span class="sd">    &quot;&quot;&quot;</span>
     <span class="k">if</span> <span class="n">ENABLE_MULTI_DEVICE</span><span class="p">:</span>
         <span class="k">return</span> <span class="p">(</span><span class="n">get_mpi_world_size</span><span class="p">()</span> <span class="o">==</span> <span class="n">model_world_size</span>
                 <span class="ow">and</span> <span class="n">model_world_size</span> <span class="o">&gt;</span> <span class="mi">1</span><span class="p">)</span> <span class="ow">or</span> <span class="p">(</span><span class="n">global_mpi_size</span><span class="p">()</span>
@@ -1092,7 +1176,7 @@ window.runMermaid = runMermaid;</script>
 
 
 <span class="k">def</span><span class="w"> </span><span class="nf">need_spawn_mpi_workers</span><span class="p">(</span><span class="n">model_world_size</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
-<span class="w">    </span><span class="sd">&#39;&#39;&#39; Check if the current process needs to spawn MPI workers. &#39;&#39;&#39;</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Check if the current process needs to spawn MPI workers.&quot;&quot;&quot;</span>
     <span class="k">if</span> <span class="n">ENABLE_MULTI_DEVICE</span><span class="p">:</span>
         <span class="k">return</span> <span class="n">get_mpi_world_size</span><span class="p">()</span> <span class="o">==</span> <span class="mi">1</span> <span class="ow">and</span> <span class="n">model_world_size</span> <span class="o">&gt;</span> <span class="mi">1</span>
     <span class="k">else</span><span class="p">:</span>
@@ -1104,6 +1188,20 @@ window.runMermaid = runMermaid;</script>
         <span class="n">comm_fortran</span> <span class="o">=</span> <span class="n">comm</span><span class="o">.</span><span class="n">py2f</span><span class="p">()</span>
         <span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.bindings</span><span class="w"> </span><span class="kn">import</span> <span class="n">MpiComm</span>
         <span class="n">MpiComm</span><span class="o">.</span><span class="n">set_raw_mpi_session_by_fortran_handle</span><span class="p">(</span><span class="n">comm_fortran</span><span class="p">)</span>
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">validate_session_world_size</span><span class="p">(</span><span class="n">mpi_session</span><span class="p">,</span> <span class="n">model_world_size</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Fail loudly when an external session cannot serve ``model_world_size``.</span>
+
+<span class="sd">    ``submit()`` launches one worker task per pool worker, so an externally</span>
+<span class="sd">    provided session must match the model&#39;s world size exactly; otherwise the</span>
+<span class="sd">    wrong number of executors would start.</span>
+<span class="sd">    &quot;&quot;&quot;</span>
+    <span class="n">external_workers</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">mpi_session</span><span class="p">,</span> <span class="s2">&quot;n_workers&quot;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">external_workers</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">external_workers</span> <span class="o">!=</span> <span class="n">model_world_size</span><span class="p">:</span>
+        <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+            <span class="sa">f</span><span class="s2">&quot;External MPI session has </span><span class="si">{</span><span class="n">external_workers</span><span class="si">}</span><span class="s2"> workers but &quot;</span>
+            <span class="sa">f</span><span class="s2">&quot;the model needs world_size=</span><span class="si">{</span><span class="n">model_world_size</span><span class="si">}</span><span class="s2">.&quot;</span><span class="p">)</span>
 
 
 <span class="k">class</span><span class="w"> </span><span class="nc">MpiSession</span><span class="p">(</span><span class="n">abc</span><span class="o">.</span><span class="n">ABC</span><span class="p">):</span>
@@ -1251,13 +1349,13 @@ window.runMermaid = runMermaid;</script>
 <a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.MpiCommSession.submit">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">submit</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">task</span><span class="p">:</span> <span class="n">Callable</span><span class="p">[</span><span class="o">...</span><span class="p">,</span> <span class="n">T</span><span class="p">],</span> <span class="o">*</span><span class="n">args</span><span class="p">,</span>
                <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">List</span><span class="p">[</span><span class="n">Future</span><span class="p">[</span><span class="n">T</span><span class="p">]]:</span>
-<span class="w">        </span><span class="sd">&#39;&#39;&#39; Submit a task to MPI workers.</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Submit a task to MPI workers.</span>
 
 <span class="sd">        Args:</span>
 <span class="sd">            task: The task to be submitted.</span>
 <span class="sd">            args: Positional arguments for the task.</span>
 <span class="sd">            kwargs: Keyword arguments for the task.</span>
-<span class="sd">        &#39;&#39;&#39;</span>
+<span class="sd">        &quot;&quot;&quot;</span>
         <span class="k">assert</span> <span class="bp">self</span><span class="o">.</span><span class="n">mpi_pool</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">,</span> <span class="s1">&#39;MPI session not started&#39;</span>
         <span class="n">worker_futures</span> <span class="o">=</span> <span class="p">[</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">mpi_pool</span><span class="o">.</span><span class="n">submit</span><span class="p">(</span><span class="n">task</span><span class="p">,</span> <span class="o">*</span><span class="n">args</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span>
@@ -1322,7 +1420,7 @@ window.runMermaid = runMermaid;</script>
             <span class="bp">self</span><span class="o">.</span><span class="n">owns_mpi_pool</span> <span class="o">=</span> <span class="kc">False</span>
         <span class="k">else</span><span class="p">:</span>
             <span class="n">logger_debug</span><span class="p">(</span>
-                <span class="sa">f</span><span class="s2">&quot;_start_mpi_pool: Creating new MPICommExecutor (not COMM_WORLD or ENABLE_MULTI_DEVICE=False)</span><span class="se">\n</span><span class="s2">&quot;</span><span class="p">,</span>
+                <span class="s2">&quot;_start_mpi_pool: Creating new MPICommExecutor (not COMM_WORLD or ENABLE_MULTI_DEVICE=False)</span><span class="se">\n</span><span class="s2">&quot;</span><span class="p">,</span>
                 <span class="s2">&quot;grey&quot;</span><span class="p">)</span>
             <span class="c1"># For non-COMM_WORLD communicators, create a new executor</span>
             <span class="n">comm_executor</span> <span class="o">=</span> <span class="n">MPICommExecutor</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">comm</span><span class="p">)</span>
@@ -1344,13 +1442,32 @@ window.runMermaid = runMermaid;</script>
     <span class="n">sync</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>  <span class="c1"># if True, the result will be sent back to the client</span>
 
 
+<span class="k">class</span><span class="w"> </span><span class="nc">RemoteWorkerDeath</span><span class="p">(</span><span class="n">NamedTuple</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Worker-death notification forwarded by RemoteMpiCommSessionServer.</span>
+
+<span class="sd">    Async (fire-and-forget) task submissions have no result channel, so a</span>
+<span class="sd">    crashed worker would otherwise be invisible to the client and pending</span>
+<span class="sd">    requests would block forever. The exception is carried as strings (not</span>
+<span class="sd">    the exception object) because arbitrary exceptions may not pickle.</span>
+<span class="sd">    &quot;&quot;&quot;</span>
+    <span class="n">exc_type</span><span class="p">:</span> <span class="nb">str</span>
+    <span class="n">message</span><span class="p">:</span> <span class="nb">str</span>
+
+    <span class="nd">@classmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">from_exception</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">e</span><span class="p">:</span> <span class="ne">BaseException</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s2">&quot;RemoteWorkerDeath&quot;</span><span class="p">:</span>
+        <span class="k">return</span> <span class="bp">cls</span><span class="p">(</span><span class="n">exc_type</span><span class="o">=</span><span class="nb">type</span><span class="p">(</span><span class="n">e</span><span class="p">)</span><span class="o">.</span><span class="vm">__name__</span><span class="p">,</span> <span class="n">message</span><span class="o">=</span><span class="nb">str</span><span class="p">(</span><span class="n">e</span><span class="p">))</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">to_exception</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="ne">RuntimeError</span><span class="p">:</span>
+        <span class="k">return</span> <span class="ne">RuntimeError</span><span class="p">(</span>
+            <span class="sa">f</span><span class="s2">&quot;Remote MPI worker died: </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">exc_type</span><span class="si">}</span><span class="s2">: </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">message</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+
+
 <span class="k">class</span><span class="w"> </span><span class="nc">RemoteMpiCommSessionClient</span><span class="p">(</span><span class="n">MpiSession</span><span class="p">):</span>
-<span class="w">    </span><span class="sd">&#39;&#39;&#39;</span>
-<span class="sd">    RemoteMpiCommSessionClient is a variant of MpiCommSession that is used to connect to a remote MPI pool.</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;RemoteMpiCommSessionClient is a variant of MpiCommSession that is used to connect to a remote MPI pool.</span>
 
 <span class="sd">    Note: This class uses a global singleton pattern because ZeroMQ PAIR sockets only support</span>
 <span class="sd">    one connection at a time. Multiple LLM instances will reuse the same client connection.</span>
-<span class="sd">    &#39;&#39;&#39;</span>
+<span class="sd">    &quot;&quot;&quot;</span>
     <span class="n">_global_instance</span> <span class="o">=</span> <span class="kc">None</span>
     <span class="n">_global_instance_lock</span> <span class="o">=</span> <span class="n">threading</span><span class="o">.</span><span class="n">Lock</span><span class="p">()</span>
 
@@ -1386,6 +1503,9 @@ window.runMermaid = runMermaid;</script>
                                  <span class="n">socket_type</span><span class="o">=</span><span class="n">zmq</span><span class="o">.</span><span class="n">PAIR</span><span class="p">,</span>
                                  <span class="n">use_hmac_encryption</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_is_shutdown</span> <span class="o">=</span> <span class="kc">False</span>
+        <span class="c1"># Non-error messages consumed by check_worker_error() while scanning</span>
+        <span class="c1"># for RemoteWorkerDeath are buffered here for poll() (submit_sync).</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_pending_responses</span><span class="p">:</span> <span class="nb">list</span> <span class="o">=</span> <span class="p">[]</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_initialized</span> <span class="o">=</span> <span class="kc">True</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">submit</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
@@ -1393,7 +1513,7 @@ window.runMermaid = runMermaid;</script>
                <span class="o">*</span><span class="n">args</span><span class="p">,</span>
                <span class="n">sync</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
                <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">:</span>
-<span class="w">        </span><span class="sd">&#39;&#39;&#39; Submit a task to the remote MPI pool. &#39;&#39;&#39;</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Submit a task to the remote MPI pool.&quot;&quot;&quot;</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_is_shutdown</span><span class="p">:</span>
             <span class="n">logger_debug</span><span class="p">(</span><span class="s2">&quot;RemoteMpiCommSessionClient is already shut down</span><span class="se">\n</span><span class="s2">&quot;</span><span class="p">,</span>
                          <span class="s2">&quot;yellow&quot;</span><span class="p">)</span>
@@ -1407,7 +1527,7 @@ window.runMermaid = runMermaid;</script>
     <span class="n">SYNC_IDLE_INTERVAL</span> <span class="o">=</span> <span class="mi">8</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">submit_sync</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">task</span><span class="p">,</span> <span class="o">*</span><span class="n">args</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">List</span><span class="p">[</span><span class="n">T</span><span class="p">]:</span>
-<span class="w">        </span><span class="sd">&#39;&#39;&#39; Submit a task to the remote MPI pool and wait for task completion. &#39;&#39;&#39;</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Submit a task to the remote MPI pool and wait for task completion.&quot;&quot;&quot;</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">submit</span><span class="p">(</span><span class="n">task</span><span class="p">,</span> <span class="o">*</span><span class="n">args</span><span class="p">,</span> <span class="n">sync</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span>
 
         <span class="k">while</span> <span class="ow">not</span> <span class="p">((</span><span class="n">res</span> <span class="o">:=</span> <span class="bp">self</span><span class="o">.</span><span class="n">poll</span><span class="p">())</span> <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">_is_shutdown</span><span class="p">):</span>
@@ -1424,16 +1544,39 @@ window.runMermaid = runMermaid;</script>
         <span class="k">return</span> <span class="n">res</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">poll</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
-<span class="w">        </span><span class="sd">&#39;&#39;&#39; Poll the queue for a response.</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Poll the queue for a response.</span>
+
 <span class="sd">        Returns:</span>
 <span class="sd">            True if a response is received, False otherwise.</span>
-<span class="sd">        &#39;&#39;&#39;</span>
+<span class="sd">        &quot;&quot;&quot;</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_is_shutdown</span><span class="p">:</span>
             <span class="k">return</span> <span class="kc">False</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_pending_responses</span><span class="p">:</span>
+            <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_pending_responses</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span>
         <span class="n">response</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">queue</span><span class="o">.</span><span class="n">poll</span><span class="p">(</span><span class="mf">0.1</span><span class="p">)</span>
         <span class="k">if</span> <span class="n">response</span><span class="p">:</span>
             <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">queue</span><span class="o">.</span><span class="n">get</span><span class="p">()</span>  <span class="c1"># should get a True if success</span>
         <span class="k">return</span> <span class="kc">False</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">check_worker_error</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Optional</span><span class="p">[</span><span class="ne">BaseException</span><span class="p">]:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Non-blockingly fetch a worker-death notification, if any.</span>
+
+<span class="sd">        RemoteMpiCommSessionServer forwards a RemoteWorkerDeath when an async</span>
+<span class="sd">        (fire-and-forget) worker future fails -- the only error channel in</span>
+<span class="sd">        this mode, since submit() returns no futures for the client to watch.</span>
+<span class="sd">        Non-error messages encountered while scanning are buffered for poll().</span>
+<span class="sd">        &quot;&quot;&quot;</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_is_shutdown</span><span class="p">:</span>
+            <span class="k">return</span> <span class="kc">None</span>
+        <span class="k">try</span><span class="p">:</span>
+            <span class="k">while</span> <span class="bp">self</span><span class="o">.</span><span class="n">queue</span><span class="o">.</span><span class="n">poll</span><span class="p">(</span><span class="mi">0</span><span class="p">):</span>
+                <span class="n">msg</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">queue</span><span class="o">.</span><span class="n">get</span><span class="p">()</span>
+                <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">msg</span><span class="p">,</span> <span class="n">RemoteWorkerDeath</span><span class="p">):</span>
+                    <span class="k">return</span> <span class="n">msg</span><span class="o">.</span><span class="n">to_exception</span><span class="p">()</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">_pending_responses</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">msg</span><span class="p">)</span>
+        <span class="k">except</span> <span class="ne">Exception</span> <span class="k">as</span> <span class="n">e</span><span class="p">:</span>
+            <span class="n">logger_debug</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;check_worker_error poll failed: </span><span class="si">{</span><span class="n">e</span><span class="si">}</span><span class="se">\n</span><span class="s2">&quot;</span><span class="p">,</span> <span class="s2">&quot;grey&quot;</span><span class="p">)</span>
+        <span class="k">return</span> <span class="kc">None</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">abort</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">shutdown</span><span class="p">()</span>
@@ -1444,7 +1587,7 @@ window.runMermaid = runMermaid;</script>
         <span class="c1"># LLM instances. Marking it as shutdown would prevent subsequent LLM instances from</span>
         <span class="c1"># using it. The connection stays open for the entire lifetime of the mgmn setup.</span>
         <span class="n">logger_debug</span><span class="p">(</span>
-            <span class="sa">f</span><span class="s2">&quot;RemoteMpiCommSessionClient.shutdown() called (no-op for singleton)</span><span class="se">\n</span><span class="s2">&quot;</span><span class="p">,</span>
+            <span class="s2">&quot;RemoteMpiCommSessionClient.shutdown() called (no-op for singleton)</span><span class="se">\n</span><span class="s2">&quot;</span><span class="p">,</span>
             <span class="s2">&quot;grey&quot;</span><span class="p">)</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">shutdown_abort</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">grace</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mi">60</span><span class="p">,</span> <span class="n">reason</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
@@ -1452,14 +1595,13 @@ window.runMermaid = runMermaid;</script>
 
 
 <span class="k">class</span><span class="w"> </span><span class="nc">RemoteMpiCommSessionServer</span><span class="p">():</span>
-<span class="w">    </span><span class="sd">&#39;&#39;&#39;</span>
-<span class="sd">    RemoteMpiCommSessionServer is a variant of MpiCommSession that is used to create a remote MPI pool.</span>
-<span class="sd">    &#39;&#39;&#39;</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;RemoteMpiCommSessionServer is a variant of MpiCommSession that is used to create a remote MPI pool.</span>
+<span class="sd">    &quot;&quot;&quot;</span>
 
     <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
                  <span class="n">hmac_key</span><span class="p">:</span> <span class="nb">bytes</span><span class="p">,</span>
                  <span class="n">n_workers</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">0</span><span class="p">,</span>
-                 <span class="n">addr</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="sa">f</span><span class="s1">&#39;tcp://127.0.0.1:*&#39;</span><span class="p">,</span>
+                 <span class="n">addr</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s1">&#39;tcp://127.0.0.1:*&#39;</span><span class="p">,</span>
                  <span class="n">comm</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
                  <span class="n">is_comm</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">):</span>
         <span class="c1"># FIXME: this is a hack to avoid circular import, resolve later</span>
@@ -1562,9 +1704,36 @@ window.runMermaid = runMermaid;</script>
                 <span class="k">assert</span> <span class="nb">len</span><span class="p">(</span><span class="n">futures</span><span class="p">)</span> <span class="o">==</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_results</span> <span class="o">==</span> <span class="n">mpi_world_size</span><span class="p">()</span>
                 <span class="c1"># Store futures to wait for them before the next task</span>
                 <span class="n">pending_futures</span> <span class="o">=</span> <span class="nb">list</span><span class="p">(</span><span class="n">futures</span><span class="p">)</span>
-                <span class="k">if</span> <span class="n">message</span><span class="o">.</span><span class="n">sync</span><span class="p">:</span>
-                    <span class="k">for</span> <span class="n">future</span> <span class="ow">in</span> <span class="n">futures</span><span class="p">:</span>
+                <span class="k">for</span> <span class="n">future</span> <span class="ow">in</span> <span class="n">futures</span><span class="p">:</span>
+                    <span class="k">if</span> <span class="n">message</span><span class="o">.</span><span class="n">sync</span><span class="p">:</span>
                         <span class="n">future</span><span class="o">.</span><span class="n">add_done_callback</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">mpi_future_callback</span><span class="p">)</span>
+                    <span class="k">else</span><span class="p">:</span>
+                        <span class="c1"># Fire-and-forget tasks have no result channel, but a</span>
+                        <span class="c1"># crashed worker must still reach the client (the</span>
+                        <span class="c1"># client-side session has no futures to watch); see</span>
+                        <span class="c1"># RemoteWorkerDeath.</span>
+                        <span class="n">future</span><span class="o">.</span><span class="n">add_done_callback</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">mpi_async_error_callback</span><span class="p">)</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">mpi_async_error_callback</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">future</span><span class="p">):</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Forward a worker exception to the client for async tasks.</span>
+
+<span class="sd">        Runs on the executor&#39;s callback thread, like the existing sync-path</span>
+<span class="sd">        mpi_future_callback (same pre-existing cross-thread ZMQ-put pattern).</span>
+<span class="sd">        Best-effort: the socket may already be closed at shutdown.</span>
+<span class="sd">        &quot;&quot;&quot;</span>
+        <span class="k">if</span> <span class="n">future</span><span class="o">.</span><span class="n">cancelled</span><span class="p">():</span>
+            <span class="k">return</span>
+        <span class="n">exc</span> <span class="o">=</span> <span class="n">future</span><span class="o">.</span><span class="n">exception</span><span class="p">()</span>
+        <span class="k">if</span> <span class="n">exc</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">return</span>
+        <span class="n">print_colored</span><span class="p">(</span>
+            <span class="sa">f</span><span class="s2">&quot;RemoteMpiCommSessionServer: async MPI worker failed, forwarding &quot;</span>
+            <span class="sa">f</span><span class="s2">&quot;to client: </span><span class="si">{</span><span class="nb">type</span><span class="p">(</span><span class="n">exc</span><span class="p">)</span><span class="o">.</span><span class="vm">__name__</span><span class="si">}</span><span class="s2">: </span><span class="si">{</span><span class="n">exc</span><span class="si">}</span><span class="se">\n</span><span class="s2">&quot;</span><span class="p">,</span> <span class="s2">&quot;red&quot;</span><span class="p">)</span>
+        <span class="k">try</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">queue</span><span class="o">.</span><span class="n">put</span><span class="p">(</span><span class="n">RemoteWorkerDeath</span><span class="o">.</span><span class="n">from_exception</span><span class="p">(</span><span class="n">exc</span><span class="p">))</span>
+        <span class="k">except</span> <span class="ne">Exception</span> <span class="k">as</span> <span class="n">e</span><span class="p">:</span>
+            <span class="n">logger_debug</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Failed to forward worker death to client: </span><span class="si">{</span><span class="n">e</span><span class="si">}</span><span class="se">\n</span><span class="s2">&quot;</span><span class="p">,</span>
+                         <span class="s2">&quot;red&quot;</span><span class="p">)</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">mpi_future_callback</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">future</span><span class="p">):</span>
         <span class="n">logger_debug</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;rank</span><span class="si">{</span><span class="n">global_mpi_rank</span><span class="p">()</span><span class="si">}</span><span class="s2"> got future: </span><span class="si">{</span><span class="n">future</span><span class="si">}</span><span class="se">\n</span><span class="s2">&quot;</span><span class="p">,</span> <span class="s2">&quot;red&quot;</span><span class="p">)</span>
@@ -1582,7 +1751,7 @@ window.runMermaid = runMermaid;</script>
             <span class="s2">&quot;grey&quot;</span><span class="p">)</span>
         <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">results</span><span class="p">)</span> <span class="o">==</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_results</span><span class="p">:</span>
             <span class="n">logger_debug</span><span class="p">(</span>
-                <span class="sa">f</span><span class="s2">&quot;RemoteMpiCommSessionServer received all results, sending to client</span><span class="se">\n</span><span class="s2">&quot;</span><span class="p">,</span>
+                <span class="s2">&quot;RemoteMpiCommSessionServer received all results, sending to client</span><span class="se">\n</span><span class="s2">&quot;</span><span class="p">,</span>
                 <span class="s2">&quot;green&quot;</span><span class="p">)</span>
             <span class="k">try</span><span class="p">:</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">queue</span><span class="o">.</span><span class="n">put_noblock</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">results</span><span class="p">,</span> <span class="n">retry</span><span class="o">=</span><span class="mi">2</span><span class="p">)</span>
@@ -1593,7 +1762,7 @@ window.runMermaid = runMermaid;</script>
                 <span class="k">else</span><span class="p">:</span>
                     <span class="k">raise</span> <span class="n">e</span>
 
-            <span class="n">logger_debug</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;RemoteMpiCommSessionServer sent results to client</span><span class="se">\n</span><span class="s2">&quot;</span><span class="p">,</span>
+            <span class="n">logger_debug</span><span class="p">(</span><span class="s2">&quot;RemoteMpiCommSessionServer sent results to client</span><span class="se">\n</span><span class="s2">&quot;</span><span class="p">,</span>
                          <span class="s2">&quot;green&quot;</span><span class="p">)</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">results</span><span class="o">.</span><span class="n">clear</span><span class="p">()</span>
 
@@ -1623,8 +1792,7 @@ window.runMermaid = runMermaid;</script>
 
 
 <span class="k">def</span><span class="w"> </span><span class="nf">split_mpi_env</span><span class="p">(</span><span class="n">mpi_env_keys</span><span class="p">:</span> <span class="n">List</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tuple</span><span class="p">[</span><span class="nb">dict</span><span class="p">,</span> <span class="nb">dict</span><span class="p">]:</span>
-<span class="w">    </span><span class="sd">&#39;&#39;&#39;</span>
-<span class="sd">    Splits the environment variables into MPI-related and non-MPI-related dictionaries.</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Splits the environment variables into MPI-related and non-MPI-related dictionaries.</span>
 
 <span class="sd">    Args:</span>
 <span class="sd">        mpi_env_keys: Additional environment variables to be considered as MPI-related.</span>
@@ -1633,7 +1801,7 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">        Tuple[dict, dict]: (non_mpi_env, mpi_env)</span>
 <span class="sd">            - non_mpi_env: Environment dictionary without MPI-related variables</span>
 <span class="sd">            - mpi_env: Environment dictionary containing only MPI-related variables</span>
-<span class="sd">    &#39;&#39;&#39;</span>
+<span class="sd">    &quot;&quot;&quot;</span>
     <span class="n">current_env</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="o">.</span><span class="n">copy</span><span class="p">()</span>
 
     <span class="c1"># Identify MPI-related variables</span>
@@ -1699,8 +1867,8 @@ window.runMermaid = runMermaid;</script>
   
 
   <!-- Scripts loaded after <body> so the DOM is not blocked -->
-  <script defer src="../../../_static/scripts/bootstrap.js?digest=a95f357e85573c9b56d5"></script>
-<script defer src="../../../_static/scripts/pydata-sphinx-theme.js?digest=a95f357e85573c9b56d5"></script>
+  <script defer src="../../../_static/scripts/bootstrap.js?digest=90905a2f556bf617f1a9"></script>
+<script defer src="../../../_static/scripts/pydata-sphinx-theme.js?digest=90905a2f556bf617f1a9"></script>
 
 
   <footer class="bd-footer">
@@ -1772,9 +1940,9 @@ window.runMermaid = runMermaid;</script>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on June 27, 2026.</p>
+  <p>Last updated on July 14, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/c25c23f">c25c23f</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/1662a87">1662a87</a>.</p>
   
 </div></div>
       

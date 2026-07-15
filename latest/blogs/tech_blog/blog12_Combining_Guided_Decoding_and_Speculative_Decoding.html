@@ -28,8 +28,8 @@
   </noscript>
   
   <!-- Loaded before other Sphinx assets -->
-  <link href="../../_static/styles/theme.css?digest=a95f357e85573c9b56d5" rel="stylesheet" />
-<link href="../../_static/styles/pydata-sphinx-theme.css?digest=a95f357e85573c9b56d5" rel="stylesheet" />
+  <link href="../../_static/styles/theme.css?digest=90905a2f556bf617f1a9" rel="stylesheet" />
+<link href="../../_static/styles/pydata-sphinx-theme.css?digest=90905a2f556bf617f1a9" rel="stylesheet" />
 
     <link rel="stylesheet" type="text/css" href="../../_static/pygments.css?v=8f2a1f02" />
     <link rel="stylesheet" type="text/css" href="../../_static/styles/nvidia-sphinx-theme.css?v=933278ad" />
@@ -40,10 +40,10 @@
     <link rel="stylesheet" type="text/css" href="../../_static/custom.css?v=19d20f17" />
   
   <!-- So that users can add custom icons -->
-  <script defer src="../../_static/scripts/fontawesome.js?digest=a95f357e85573c9b56d5"></script>
+  <script defer src="../../_static/scripts/fontawesome.js?digest=90905a2f556bf617f1a9"></script>
   <!-- Pre-loaded scripts that we'll load fully later -->
-  <link rel="preload" as="script" href="../../_static/scripts/bootstrap.js?digest=a95f357e85573c9b56d5" />
-<link rel="preload" as="script" href="../../_static/scripts/pydata-sphinx-theme.js?digest=a95f357e85573c9b56d5" />
+  <link rel="preload" as="script" href="../../_static/scripts/bootstrap.js?digest=90905a2f556bf617f1a9" />
+<link rel="preload" as="script" href="../../_static/scripts/pydata-sphinx-theme.js?digest=90905a2f556bf617f1a9" />
 
 
 
@@ -59,13 +59,11 @@
     <script src="../../_static/togglebutton.js?v=b8b12719"></script>
     <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
     <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
-    <script>window.MathJax = {"options": {"processHtmlClass": "tex2jax_process|mathjax_process|math|output_area"}}</script>
-    <script defer="defer" src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
     <script>DOCUMENTATION_OPTIONS.pagename = 'blogs/tech_blog/blog12_Combining_Guided_Decoding_and_Speculative_Decoding';</script>
     <script>
-        DOCUMENTATION_OPTIONS.theme_version = '0.19.0';
+        DOCUMENTATION_OPTIONS.theme_version = '0.20.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc20';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc21';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -81,7 +79,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc20" />
+  <meta name="docsearch:version" content="1.3.0rc21" />
   
     
     <script src="../../_static/searchtools.js"></script>
@@ -448,6 +446,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../../features/feature-combination-matrix.html">Feature Combination Matrix</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/disagg-serving.html">Disaggregated Serving</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/embeddings.html">Embeddings (Encoder-Only Models)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/kvcache.html">KV Cache System</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/long-sequence.html">Long Sequences</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/lora.html">LoRA (Low-Rank Adaptation)</a></li>
@@ -458,6 +457,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../../features/quantization.html">Quantization</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/sampling.html">Sampling</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/additional-outputs.html">Additional Outputs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/post-processor-hook.html">Post-Processing Hook</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/guided-decoding.html">Guided Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/speculative-decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/checkpoint-loading.html">Checkpoint Loading</a></li>
@@ -497,6 +497,7 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="current nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="blog25_Scaling_Video_Generation_Across_NVL72_Rack_with_TensorRT-LLM.html">Scaling Video Generation Across NVL72 rack with TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blog24_MoE_as_Dense_GEMM.html">MoE as Dense GEMM: Optimizing Low-Latency MoE Inference on NVIDIA Blackwell</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blog23_Joint_Optimization_of_Agent_Applications_and_TensorRT-LLM.html">Joint Optimization of Agent Applications and TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blog22_Helix_Parallelism_Scaling_Multi_Million_Token_Decoding_with_KV_Cache_Sharding.html">Helix Parallelism in TensorRT-LLM: Scaling Multi-Million-Token Decoding with KV Cache Sharding</a></li>
@@ -534,9 +535,9 @@
 <li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM">Github Code</a></li>
 <li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/issues?q=is%3Aissue%20state%3Aopen%20label%3Aroadmap">Roadmap</a></li>
 </ul>
-<p aria-level="2" class="caption" role="heading"><span class="caption-text">Use TensorRT Engine</span></p>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Migration</span></p>
 <ul class="nav bd-sidenav">
-<li class="toctree-l1"><a class="reference internal" href="../../legacy/tensorrt_quickstart.html">LLM API with TensorRT Engine</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../legacy/tensorrt-backend-removal.html">Migration Guide: TensorRT Backend Removed</a></li>
 </ul>
 </div>
 </nav></div>
@@ -588,41 +589,41 @@
 <div id="searchbox"></div>
                 <article class="bd-article">
                   
-  <section class="tex2jax_ignore mathjax_ignore" id="combining-guided-decoding-and-speculative-decoding-making-cpu-and-gpu-cooperate-seamlessly">
+  <section id="combining-guided-decoding-and-speculative-decoding-making-cpu-and-gpu-cooperate-seamlessly">
 <h1>Combining Guided Decoding and Speculative Decoding: Making CPU and GPU Cooperate Seamlessly<a class="headerlink" href="#combining-guided-decoding-and-speculative-decoding-making-cpu-and-gpu-cooperate-seamlessly" title="Link to this heading">#</a></h1>
 <p><em>By NVIDIA TensorRT LLM Team and the XGrammar Team</em></p>
 <section id="table-of-contents">
 <h2>Table of Contents<a class="headerlink" href="#table-of-contents" title="Link to this heading">#</a></h2>
 <ul class="simple">
-<li><p><a class="reference internal" href="#combining-guided-decoding-and-speculative-decoding-making-cpu-and-gpu-cooperate-seamlessly">Combining Guided Decoding and Speculative Decoding: Making CPU and GPU Cooperate Seamlessly</a></p>
+<li><p><a class="reference internal" href="#combining-guided-decoding-and-speculative-decoding-making-cpu-and-gpu-cooperate-seamlessly"><span class="xref myst">Combining Guided Decoding and Speculative Decoding: Making CPU and GPU Cooperate Seamlessly</span></a></p>
 <ul>
-<li><p><a class="reference internal" href="#table-of-contents">Table of Contents</a></p></li>
-<li><p><a class="reference internal" href="#background-and-challenges">Background and Challenges</a></p>
+<li><p><a class="reference internal" href="#table-of-contents"><span class="xref myst">Table of Contents</span></a></p></li>
+<li><p><a class="reference internal" href="#background-and-challenges"><span class="xref myst">Background and Challenges</span></a></p>
 <ul>
-<li><p><a class="reference internal" href="#motivation">Motivation</a></p></li>
-<li><p><a class="reference internal" href="#guided-decoding">Guided Decoding</a></p></li>
-<li><p><a class="reference internal" href="#speculative-decoding">Speculative Decoding</a></p></li>
-<li><p><a class="reference internal" href="#two-challenges">Two Challenges</a></p></li>
+<li><p><a class="reference internal" href="../../features/ray-orchestrator.html#motivation"><span class="std std-ref">Motivation</span></a></p></li>
+<li><p><a class="reference internal" href="#guided-decoding"><span class="xref myst">Guided Decoding</span></a></p></li>
+<li><p><a class="reference internal" href="#speculative-decoding"><span class="xref myst">Speculative Decoding</span></a></p></li>
+<li><p><a class="reference internal" href="#two-challenges"><span class="xref myst">Two Challenges</span></a></p></li>
 </ul>
 </li>
-<li><p><a class="reference internal" href="#trace-grammar-state-for-draft-token-proposal-and-rejection">Trace Grammar State for Draft Token Proposal and Rejection</a></p>
+<li><p><a class="reference internal" href="#trace-grammar-state-for-draft-token-proposal-and-rejection"><span class="xref myst">Trace Grammar State for Draft Token Proposal and Rejection</span></a></p>
 <ul>
-<li><p><a class="reference internal" href="#target-model">Target Model</a></p></li>
-<li><p><a class="reference internal" href="#draft-model">Draft Model</a></p></li>
+<li><p><a class="reference internal" href="#target-model"><span class="xref myst">Target Model</span></a></p></li>
+<li><p><a class="reference internal" href="#draft-model"><span class="xref myst">Draft Model</span></a></p></li>
 </ul>
 </li>
-<li><p><a class="reference internal" href="#make-grammar-computation-capturable-by-cuda-graph">Make Grammar Computation Capturable by CUDA Graph</a></p>
+<li><p><a class="reference internal" href="#make-grammar-computation-capturable-by-cuda-graph"><span class="xref myst">Make Grammar Computation Capturable by CUDA Graph</span></a></p>
 <ul>
-<li><p><a class="reference internal" href="#cuda-callback">CUDA Callback</a></p></li>
-<li><p><a class="reference internal" href="#integration-to-tensorrt-llm-python-runtime">Integration to TensorRT LLM Python Runtime</a></p></li>
-<li><p><a class="reference internal" href="#cuda-graph-compatibility-grammar-computation">CUDA Graph Compatibility: Grammar Computation</a></p></li>
-<li><p><a class="reference internal" href="#cuda-graph-compatibility-mask-applying-kernel">CUDA Graph Compatibility: Mask Applying Kernel</a></p></li>
-<li><p><a class="reference internal" href="#troubleshooting-data-race-between-host-and-cuda-callback">Troubleshooting: Data Race between Host and CUDA Callback</a></p></li>
-<li><p><a class="reference internal" href="#troubleshooting-deadlock-by-gil-and-cuda-mutex">Troubleshooting: Deadlock by GIL and CUDA Mutex</a></p></li>
+<li><p><a class="reference internal" href="#cuda-callback"><span class="xref myst">CUDA Callback</span></a></p></li>
+<li><p><a class="reference internal" href="#integration-to-tensorrt-llm-python-runtime"><span class="xref myst">Integration to TensorRT LLM Python Runtime</span></a></p></li>
+<li><p><a class="reference internal" href="#cuda-graph-compatibility-grammar-computation"><span class="xref myst">CUDA Graph Compatibility: Grammar Computation</span></a></p></li>
+<li><p><a class="reference internal" href="#cuda-graph-compatibility-mask-applying-kernel"><span class="xref myst">CUDA Graph Compatibility: Mask Applying Kernel</span></a></p></li>
+<li><p><a class="reference internal" href="#troubleshooting-data-race-between-host-and-cuda-callback"><span class="xref myst">Troubleshooting: Data Race between Host and CUDA Callback</span></a></p></li>
+<li><p><a class="reference internal" href="#troubleshooting-deadlock-by-gil-and-cuda-mutex"><span class="xref myst">Troubleshooting: Deadlock by GIL and CUDA Mutex</span></a></p></li>
 </ul>
 </li>
-<li><p><a class="reference internal" href="#performance-and-analysis">Performance and Analysis</a></p></li>
-<li><p><a class="reference internal" href="#acknowledgements">Acknowledgements</a></p></li>
+<li><p><a class="reference internal" href="#performance-and-analysis"><span class="xref myst">Performance and Analysis</span></a></p></li>
+<li><p><a class="reference internal" href="blog14_Scaling_Expert_Parallelism_in_TensorRT-LLM_part3.html#acknowledgements"><span class="std std-ref">Acknowledgements</span></a></p></li>
 </ul>
 </li>
 </ul>
@@ -677,10 +678,10 @@
 </ul>
 </li>
 </ul>
-<p>Second, specific to the one-model speculative decoding where a single CUDA graph contains multiple (draft and target) model forwards, the CPU-GPU synchronization becomes challenging. Note that for every step <span class="math notranslate nohighlight">\(i\)</span>, there are two event waits:</p>
+<p>Second, specific to the one-model speculative decoding where a single CUDA graph contains multiple (draft and target) model forwards, the CPU-GPU synchronization becomes challenging. Note that for every step $i$, there are two event waits:</p>
 <ul class="simple">
-<li><p>The host waits for the <em>token event</em> that indicates the readiness of CPU tokens from step <span class="math notranslate nohighlight">\(i-1\)</span>.</p></li>
-<li><p>The model forward stream waits for the <em>mask event</em> that indicates the readiness of GPU masks from step <span class="math notranslate nohighlight">\(i\)</span>.</p></li>
+<li><p>The host waits for the <em>token event</em> that indicates the readiness of CPU tokens from step $i-1$.</p></li>
+<li><p>The model forward stream waits for the <em>mask event</em> that indicates the readiness of GPU masks from step $i$.</p></li>
 </ul>
 <div align="center">
 <figure>
@@ -720,11 +721,11 @@
 <li><p>CUDA events and event waits can be inserted before and after the host functions, which can be used to synchronize the CPU and GPU computation.</p></li>
 <li><p>The host functions can be captured and replayed by CUDA graph.</p></li>
 </ul>
-<p>Hence, we can launch grammar computation along with other auxiliary host functions as CUDA callbacks to a CUDA stream. The CUDA graph should capture and replay multiple model forwards and corresponding grammar computation all together. To achieve CPU-GPU overlapping, the grammar computation should be placed on a dedicated CUDA stream. Specifically, for every step <span class="math notranslate nohighlight">\(i\)</span>:</p>
+<p>Hence, we can launch grammar computation along with other auxiliary host functions as CUDA callbacks to a CUDA stream. The CUDA graph should capture and replay multiple model forwards and corresponding grammar computation all together. To achieve CPU-GPU overlapping, the grammar computation should be placed on a dedicated CUDA stream. Specifically, for every step $i$:</p>
 <ul class="simple">
 <li><p>The grammar stream:</p>
 <ul>
-<li><p>waits for the <em>token event</em> that indicates the readiness of CPU tokens from step <span class="math notranslate nohighlight">\(i-1\)</span>;</p></li>
+<li><p>waits for the <em>token event</em> that indicates the readiness of CPU tokens from step $i-1$;</p></li>
 <li><p>performs grammar advance and mask gen (CUDA callback);</p></li>
 <li><p>asynchronously copies the CPU masks to GPU;</p></li>
 <li><p>records the <em>mask event</em>.</p></li>
@@ -815,9 +816,9 @@
 <p>Clearly, the CUDA callback may read unexpected data. This data race motivates a dedicated request states class — <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/v1.1.0rc5/tensorrt_llm/_torch/pyexecutor/guided_decoder.py#L20"><code class="docutils literal notranslate"><span class="pre">GuidedRequest</span></code></a>. It is a request snapshot created for guided decoder only, so it will never be modified by other components. It is also possible that the guided decoder itself may access request states via both normal host functions and CUDA callbacks, so we adopt a protocol that the request snapshots should be created on the host, and then accessed only via CUDA callbacks. This prevents potential data race within an executor iteration.</p>
 <p>When overlap scheduler is enabled, another data race scenario exists between executor iterations:</p>
 <ul class="simple">
-<li><p>Iteration <span class="math notranslate nohighlight">\(i\)</span> launches CUDA callbacks, which will read request states from a fixed address;</p></li>
-<li><p>Iteration <span class="math notranslate nohighlight">\(i+1\)</span> updates the request states;</p></li>
-<li><p>Iteration <span class="math notranslate nohighlight">\(i\)</span>’s CUDA callbacks are executed, reading request states updated by iteration <span class="math notranslate nohighlight">\(i+1\)</span>.</p></li>
+<li><p>Iteration $i$ launches CUDA callbacks, which will read request states from a fixed address;</p></li>
+<li><p>Iteration $i+1$ updates the request states;</p></li>
+<li><p>Iteration $i$’s CUDA callbacks are executed, reading request states updated by iteration $i+1$.</p></li>
 </ul>
 <p>Again, the CUDA callbacks may read unexpected data. A straightforward solution is letting the request state update wait for CUDA callback execution, but this effectively disables overlap scheduling. To resolve this issue and also unblock overlap scheduling, a <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/v1.1.0rc5/tensorrt_llm/_torch/pyexecutor/guided_decoder.py#L417">queue</a> is introduced. For each iteration, a new batch of request states is put into the queue; then, a CUDA callback is launched to fetch a new batch of request states from the queue, and all the subsequent CUDA callbacks access the newly fetched request states. This allows the co-existence of the request snapshots of two (or even more) iterations, which prevents potential data race between iterations.</p>
 </section>
@@ -1013,8 +1014,8 @@
   
 
   <!-- Scripts loaded after <body> so the DOM is not blocked -->
-  <script defer src="../../_static/scripts/bootstrap.js?digest=a95f357e85573c9b56d5"></script>
-<script defer src="../../_static/scripts/pydata-sphinx-theme.js?digest=a95f357e85573c9b56d5"></script>
+  <script defer src="../../_static/scripts/bootstrap.js?digest=90905a2f556bf617f1a9"></script>
+<script defer src="../../_static/scripts/pydata-sphinx-theme.js?digest=90905a2f556bf617f1a9"></script>
 
 
   <footer class="bd-footer">
@@ -1086,9 +1087,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on June 27, 2026.</p>
+  <p>Last updated on July 14, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/c25c23f">c25c23f</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/1662a87">1662a87</a>.</p>
   
 </div></div>
       

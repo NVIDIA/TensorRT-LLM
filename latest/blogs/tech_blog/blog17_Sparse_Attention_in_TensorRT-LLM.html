@@ -28,8 +28,8 @@
   </noscript>
   
   <!-- Loaded before other Sphinx assets -->
-  <link href="../../_static/styles/theme.css?digest=a95f357e85573c9b56d5" rel="stylesheet" />
-<link href="../../_static/styles/pydata-sphinx-theme.css?digest=a95f357e85573c9b56d5" rel="stylesheet" />
+  <link href="../../_static/styles/theme.css?digest=90905a2f556bf617f1a9" rel="stylesheet" />
+<link href="../../_static/styles/pydata-sphinx-theme.css?digest=90905a2f556bf617f1a9" rel="stylesheet" />
 
     <link rel="stylesheet" type="text/css" href="../../_static/pygments.css?v=8f2a1f02" />
     <link rel="stylesheet" type="text/css" href="../../_static/styles/nvidia-sphinx-theme.css?v=933278ad" />
@@ -40,10 +40,10 @@
     <link rel="stylesheet" type="text/css" href="../../_static/custom.css?v=19d20f17" />
   
   <!-- So that users can add custom icons -->
-  <script defer src="../../_static/scripts/fontawesome.js?digest=a95f357e85573c9b56d5"></script>
+  <script defer src="../../_static/scripts/fontawesome.js?digest=90905a2f556bf617f1a9"></script>
   <!-- Pre-loaded scripts that we'll load fully later -->
-  <link rel="preload" as="script" href="../../_static/scripts/bootstrap.js?digest=a95f357e85573c9b56d5" />
-<link rel="preload" as="script" href="../../_static/scripts/pydata-sphinx-theme.js?digest=a95f357e85573c9b56d5" />
+  <link rel="preload" as="script" href="../../_static/scripts/bootstrap.js?digest=90905a2f556bf617f1a9" />
+<link rel="preload" as="script" href="../../_static/scripts/pydata-sphinx-theme.js?digest=90905a2f556bf617f1a9" />
 
 
 
@@ -59,13 +59,11 @@
     <script src="../../_static/togglebutton.js?v=b8b12719"></script>
     <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
     <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
-    <script>window.MathJax = {"options": {"processHtmlClass": "tex2jax_process|mathjax_process|math|output_area"}}</script>
-    <script defer="defer" src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
     <script>DOCUMENTATION_OPTIONS.pagename = 'blogs/tech_blog/blog17_Sparse_Attention_in_TensorRT-LLM';</script>
     <script>
-        DOCUMENTATION_OPTIONS.theme_version = '0.19.0';
+        DOCUMENTATION_OPTIONS.theme_version = '0.20.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc20';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc21';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -81,7 +79,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc20" />
+  <meta name="docsearch:version" content="1.3.0rc21" />
   
     
     <script src="../../_static/searchtools.js"></script>
@@ -448,6 +446,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../../features/feature-combination-matrix.html">Feature Combination Matrix</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/disagg-serving.html">Disaggregated Serving</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/embeddings.html">Embeddings (Encoder-Only Models)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/kvcache.html">KV Cache System</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/long-sequence.html">Long Sequences</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/lora.html">LoRA (Low-Rank Adaptation)</a></li>
@@ -458,6 +457,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../../features/quantization.html">Quantization</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/sampling.html">Sampling</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/additional-outputs.html">Additional Outputs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../features/post-processor-hook.html">Post-Processing Hook</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/guided-decoding.html">Guided Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/speculative-decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/checkpoint-loading.html">Checkpoint Loading</a></li>
@@ -497,6 +497,7 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="current nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="blog25_Scaling_Video_Generation_Across_NVL72_Rack_with_TensorRT-LLM.html">Scaling Video Generation Across NVL72 rack with TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blog24_MoE_as_Dense_GEMM.html">MoE as Dense GEMM: Optimizing Low-Latency MoE Inference on NVIDIA Blackwell</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blog23_Joint_Optimization_of_Agent_Applications_and_TensorRT-LLM.html">Joint Optimization of Agent Applications and TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blog22_Helix_Parallelism_Scaling_Multi_Million_Token_Decoding_with_KV_Cache_Sharding.html">Helix Parallelism in TensorRT-LLM: Scaling Multi-Million-Token Decoding with KV Cache Sharding</a></li>
@@ -534,9 +535,9 @@
 <li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM">Github Code</a></li>
 <li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/issues?q=is%3Aissue%20state%3Aopen%20label%3Aroadmap">Roadmap</a></li>
 </ul>
-<p aria-level="2" class="caption" role="heading"><span class="caption-text">Use TensorRT Engine</span></p>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Migration</span></p>
 <ul class="nav bd-sidenav">
-<li class="toctree-l1"><a class="reference internal" href="../../legacy/tensorrt_quickstart.html">LLM API with TensorRT Engine</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../legacy/tensorrt-backend-removal.html">Migration Guide: TensorRT Backend Removed</a></li>
 </ul>
 </div>
 </nav></div>
@@ -588,39 +589,39 @@
 <div id="searchbox"></div>
                 <article class="bd-article">
                   
-  <section class="tex2jax_ignore mathjax_ignore" id="sparse-attention-in-tensorrt-llm">
+  <section id="sparse-attention-in-tensorrt-llm">
 <h1>Sparse Attention in TensorRT LLM<a class="headerlink" href="#sparse-attention-in-tensorrt-llm" title="Link to this heading">#</a></h1>
 <p><strong>Table of Contents</strong></p>
 <ul class="simple">
-<li><p><a class="reference internal" href="#introduction-and-motivation">Introduction and Motivation</a></p></li>
-<li><p><a class="reference internal" href="#overview-of-sparse-attention-in-tensorrt-llm">Overview of Sparse Attention in TensorRT LLM</a></p></li>
-<li><p><a class="reference internal" href="#sparse-attention-framework-design">Sparse Attention Framework Design</a></p>
+<li><p><a class="reference internal" href="#introduction-and-motivation"><span class="xref myst">Introduction and Motivation</span></a></p></li>
+<li><p><a class="reference internal" href="#overview-of-sparse-attention-in-tensorrt-llm"><span class="xref myst">Overview of Sparse Attention in TensorRT LLM</span></a></p></li>
+<li><p><a class="reference internal" href="#sparse-attention-framework-design"><span class="xref myst">Sparse Attention Framework Design</span></a></p>
 <ul>
-<li><p><a class="reference internal" href="#design-philosophy">Design Philosophy</a></p></li>
-<li><p><a class="reference internal" href="#architecture-overview">Architecture Overview</a></p></li>
-<li><p><a class="reference internal" href="#prediction-module">Prediction Module</a></p></li>
-<li><p><a class="reference internal" href="#attention-operator-design">Attention Operator Design</a></p></li>
-<li><p><a class="reference internal" href="#auxiliary-memory-management">Auxiliary Memory Management</a></p></li>
+<li><p><a class="reference internal" href="#design-philosophy"><span class="xref myst">Design Philosophy</span></a></p></li>
+<li><p><a class="reference internal" href="#architecture-overview"><span class="xref myst">Architecture Overview</span></a></p></li>
+<li><p><a class="reference internal" href="#prediction-module"><span class="xref myst">Prediction Module</span></a></p></li>
+<li><p><a class="reference internal" href="#attention-operator-design"><span class="xref myst">Attention Operator Design</span></a></p></li>
+<li><p><a class="reference internal" href="#auxiliary-memory-management"><span class="xref myst">Auxiliary Memory Management</span></a></p></li>
 </ul>
 </li>
-<li><p><a class="reference internal" href="#algorithm-implementations">Algorithm Implementations</a></p>
+<li><p><a class="reference internal" href="#algorithm-implementations"><span class="xref myst">Algorithm Implementations</span></a></p>
 <ul>
-<li><p><a class="reference internal" href="#rocketkv">RocketKV</a></p></li>
-<li><p><a class="reference internal" href="#deepseek-sparse-attention-dsa">DeepSeek Sparse Attention (DSA)</a></p></li>
-<li><p><a class="reference internal" href="#skip-softmax-attention-blasst">Skip Softmax Attention (BLASST)</a></p></li>
+<li><p><a class="reference internal" href="../../features/sparse-attention.html#rocketkv"><span class="std std-ref">RocketKV</span></a></p></li>
+<li><p><a class="reference internal" href="#deepseek-sparse-attention-dsa"><span class="xref myst">DeepSeek Sparse Attention (DSA)</span></a></p></li>
+<li><p><a class="reference internal" href="#skip-softmax-attention-blasst"><span class="xref myst">Skip Softmax Attention (BLASST)</span></a></p></li>
 </ul>
 </li>
-<li><p><a class="reference internal" href="#evaluation">Evaluation</a></p>
+<li><p><a class="reference internal" href="blog23_Joint_Optimization_of_Agent_Applications_and_TensorRT-LLM.html#evaluation"><span class="std std-ref">Evaluation</span></a></p>
 <ul>
-<li><p><a class="reference internal" href="#id3">RocketKV</a></p></li>
-<li><p><a class="reference internal" href="#id4">DeepSeek Sparse Attention (DSA)</a></p></li>
-<li><p><a class="reference internal" href="#id5">Skip Softmax Attention (BLASST)</a></p></li>
+<li><p><a class="reference internal" href="#rocketkv-1"><span class="xref myst">RocketKV</span></a></p></li>
+<li><p><a class="reference internal" href="#deepseek-sparse-attention-dsa-1"><span class="xref myst">DeepSeek Sparse Attention (DSA)</span></a></p></li>
+<li><p><a class="reference internal" href="#skip-softmax-attention-blasst-1"><span class="xref myst">Skip Softmax Attention (BLASST)</span></a></p></li>
 </ul>
 </li>
-<li><p><a class="reference internal" href="#summary-and-future-work">Summary and Future Work</a></p>
+<li><p><a class="reference internal" href="#summary-and-future-work"><span class="xref myst">Summary and Future Work</span></a></p>
 <ul>
-<li><p><a class="reference internal" href="#current-state">Current State</a></p></li>
-<li><p><a class="reference internal" href="#future-work">Future Work</a></p></li>
+<li><p><a class="reference internal" href="#current-state"><span class="xref myst">Current State</span></a></p></li>
+<li><p><a class="reference internal" href="#future-work"><span class="xref myst">Future Work</span></a></p></li>
 </ul>
 </li>
 </ul>
@@ -837,9 +838,8 @@
 <section id="id2">
 <h4>How It Works in TensorRT LLM<a class="headerlink" href="#id2" title="Link to this heading">#</a></h4>
 <p>DSA integrates into TensorRT LLM through the same <code class="docutils literal notranslate"><span class="pre">sparse_attn_predict</span></code> interface used by RocketKV, validating the framework’s generality beyond the use case it was originally designed for. The key differences are that DSA’s prediction module is a <strong>neural network</strong> (the indexer) rather than a heuristic scoring function, and it produces <strong>token-level</strong> indices rather than page-level ones.</p>
-<p>The indexer consists of two low-rank linear projections (for Q and K), a LayerNorm, RoPE, and a weight projection layer. Given query token <span class="math notranslate nohighlight">\(c_t^Q\)</span> and hidden state <span class="math notranslate nohighlight">\(h_t\)</span>, it computes index scores via an MQA-style dot product:</p>
-<div class="math notranslate nohighlight">
-\[I_{t} = \sum_{j=1}^{h}W_j^I \cdot \text{ReLU}(Q_{t, j}^I (K_t^I)^T)\]</div>
+<p>The indexer consists of two low-rank linear projections (for Q and K), a LayerNorm, RoPE, and a weight projection layer. Given query token $c_t^Q$ and hidden state $h_t$, it computes index scores via an MQA-style dot product:</p>
+<p>$$I_{t} = \sum_{j=1}^{h}W_j^I \cdot \text{ReLU}(Q_{t, j}^I (K_t^I)^T)$$</p>
 <p>A Top-K operation selects the most relevant indices, producing a <code class="docutils literal notranslate"><span class="pre">topk_indices</span></code> tensor of shape <code class="docutils literal notranslate"><span class="pre">[num_tokens,</span> <span class="pre">topk]</span></code> containing <strong>request-local</strong> token positions.</p>
 <p><strong>Prediction module.</strong> Currently, DSA only supports the <code class="docutils literal notranslate"><span class="pre">TrtllmAttention</span></code> backend, implemented as <code class="docutils literal notranslate"><span class="pre">DSATrtllmAttention</span></code>. Similar to RocketKV, the backend’s primary responsibility is sparse index prediction, which consists of two stages: the <strong>indexer module</strong> and <strong>index conversion</strong>. The indexer module is determined by the model architecture itself—it computes the logical sparse indices that identify which KV tokens each query should attend to. The index conversion step is dictated by the sparse MLA kernel’s requirements—it transforms these logical, request-local indices into physical KV cache addresses expressed as token-level offsets relative to the KV cache pool base.</p>
 <p>Concretely, a Triton kernel <code class="docutils literal notranslate"><span class="pre">triton_convert_req_index_to_global_index</span></code> performs the address translation, converting logical positions within each request sequence into physical addresses in the global KV cache memory pool. Unlike RocketKV, which uses <code class="docutils literal notranslate"><span class="pre">gatherKvPageOffsetsKernel</span></code> for page alignment, DSA bypasses this step entirely—the sparse MLA kernel natively supports token-level sparsity.</p>
@@ -1104,8 +1104,8 @@
   
 
   <!-- Scripts loaded after <body> so the DOM is not blocked -->
-  <script defer src="../../_static/scripts/bootstrap.js?digest=a95f357e85573c9b56d5"></script>
-<script defer src="../../_static/scripts/pydata-sphinx-theme.js?digest=a95f357e85573c9b56d5"></script>
+  <script defer src="../../_static/scripts/bootstrap.js?digest=90905a2f556bf617f1a9"></script>
+<script defer src="../../_static/scripts/pydata-sphinx-theme.js?digest=90905a2f556bf617f1a9"></script>
 
 
   <footer class="bd-footer">
@@ -1177,9 +1177,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on June 27, 2026.</p>
+  <p>Last updated on July 14, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/c25c23f">c25c23f</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/1662a87">1662a87</a>.</p>
   
 </div></div>
       

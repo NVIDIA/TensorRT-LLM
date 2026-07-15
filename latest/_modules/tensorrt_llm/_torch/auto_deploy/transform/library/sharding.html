@@ -27,8 +27,8 @@
   </noscript>
   
   <!-- Loaded before other Sphinx assets -->
-  <link href="../../../../../../_static/styles/theme.css?digest=a95f357e85573c9b56d5" rel="stylesheet" />
-<link href="../../../../../../_static/styles/pydata-sphinx-theme.css?digest=a95f357e85573c9b56d5" rel="stylesheet" />
+  <link href="../../../../../../_static/styles/theme.css?digest=90905a2f556bf617f1a9" rel="stylesheet" />
+<link href="../../../../../../_static/styles/pydata-sphinx-theme.css?digest=90905a2f556bf617f1a9" rel="stylesheet" />
 
     <link rel="stylesheet" type="text/css" href="../../../../../../_static/pygments.css?v=8f2a1f02" />
     <link rel="stylesheet" type="text/css" href="../../../../../../_static/styles/nvidia-sphinx-theme.css?v=933278ad" />
@@ -39,10 +39,10 @@
     <link rel="stylesheet" type="text/css" href="../../../../../../_static/custom.css?v=19d20f17" />
   
   <!-- So that users can add custom icons -->
-  <script defer src="../../../../../../_static/scripts/fontawesome.js?digest=a95f357e85573c9b56d5"></script>
+  <script defer src="../../../../../../_static/scripts/fontawesome.js?digest=90905a2f556bf617f1a9"></script>
   <!-- Pre-loaded scripts that we'll load fully later -->
-  <link rel="preload" as="script" href="../../../../../../_static/scripts/bootstrap.js?digest=a95f357e85573c9b56d5" />
-<link rel="preload" as="script" href="../../../../../../_static/scripts/pydata-sphinx-theme.js?digest=a95f357e85573c9b56d5" />
+  <link rel="preload" as="script" href="../../../../../../_static/scripts/bootstrap.js?digest=90905a2f556bf617f1a9" />
+<link rel="preload" as="script" href="../../../../../../_static/scripts/pydata-sphinx-theme.js?digest=90905a2f556bf617f1a9" />
 
 
 
@@ -278,6 +278,25 @@ let darkTheme = isDarkTheme();
 let modal = null;
 let modalContent = null;
 let previousScrollOffset = [window.scrollX, window.scrollY];
+let _lazyObserver = null;
+let _renderQueue = Promise.resolve();
+
+// Apply d3 zoom to each SVG. Idempotent: an SVG already wrapped is skipped,
+// so this is safe to call both for the initial batch and for diagrams that
+// render lazily once they become visible.
+const addZoomToSvgs = (svgs) => {
+    svgs.each(function() {
+        if (this.getAttribute('data-zoom-applied') === 'true') return;
+        var svg = d3.select(this);
+        svg.html("<g class='wrapper'>" + svg.html() + "</g>");
+        var inner = svg.select("g");
+        var zoom = d3.zoom().on("zoom", function(event) {
+            inner.attr("transform", event.transform);
+        });
+        svg.call(zoom);
+        this.setAttribute('data-zoom-applied', 'true');
+    });
+};
 
 const runMermaid = async (rerun) => {
     console.log("Running mermaid diagrams, rerun =", rerun);
@@ -285,7 +304,15 @@ const runMermaid = async (rerun) => {
     let all_mermaids = document.querySelectorAll(".mermaid");
 
     if (rerun) {
+        // Disconnect any previous lazy rendering observer
+        if (_lazyObserver) {
+            _lazyObserver.disconnect();
+            _lazyObserver = null;
+        }
+
         all_mermaids.forEach((el) => {
+            el.removeAttribute('data-mermaid-deferred');
+            el.removeAttribute('data-mermaid-render-failed');
             if(!el.hasAttribute("data-original-code")) {
                 // store original code
                 // console.log(`Storing original code for first run: `, el.innerHTML);
@@ -302,35 +329,89 @@ const runMermaid = async (rerun) => {
                 el.setAttribute('data-original-code', el.innerHTML);
             }
         });
-        await mermaid.run();
+
+        // Separate visible and hidden elements. Mermaid's layout engine measures
+        // text dimensions via the DOM, which fails for elements hidden by a parent
+        // (e.g., Reveal.js non-active slides, sphinx-design unopened tabs),
+        // producing broken SVGs. Render visible elements now, defer hidden ones.
+        const visible = [];
+        const hidden = [];
+        all_mermaids.forEach((el) => {
+            // offsetParent is null for display:none ancestors.
+            // getClientRects().length > 0 catches position:fixed elements
+            // (which also have null offsetParent but are still visible).
+            if (el.offsetParent !== null || el.getClientRects().length > 0) {
+                visible.push(el);
+            } else {
+                hidden.push(el);
+                el.setAttribute('data-mermaid-deferred', 'true');
+            }
+        });
+
+        if (visible.length > 0) {
+            try {
+                await mermaid.run({ nodes: visible });
+            } catch (e) {
+                console.error("Mermaid rendering failed:", e);
+            }
+        }
+
+        // Lazily render hidden elements when they become visible.
+        // Uses a promise chain (_renderQueue) to serialize rendering,
+        // since IntersectionObserver may report multiple entries at once
+        // and mermaid.run() is not safe to call concurrently.
+        if (hidden.length > 0) {
+            if (typeof IntersectionObserver === 'undefined') {
+                console.warn("IntersectionObserver not available; hidden mermaid diagrams will not render.");
+            } else {
+                _renderQueue = Promise.resolve();
+                _lazyObserver = new IntersectionObserver((entries) => {
+                    for (const entry of entries) {
+                        if (entry.isIntersecting && entry.target.getAttribute("data-processed") !== "true") {
+                            _lazyObserver.unobserve(entry.target);
+                            const el = entry.target;
+                            _renderQueue = _renderQueue.then(async () => {
+                                try {
+                                    await mermaid.run({ nodes: [el] });
+                                    el.removeAttribute('data-mermaid-deferred');
+                                    // Apply zoom to the now-rendered diagram, matching
+                                    // the decoration visible diagrams receive.
+                                    if ("False" === "True") {
+                                        addZoomToSvgs(d3.selectAll(""));
+                                    }
+                                } catch (e) {
+                                    console.error("Mermaid deferred rendering failed:", e);
+                                    el.removeAttribute('data-mermaid-deferred');
+                                    el.setAttribute('data-mermaid-render-failed', 'true');
+                                }
+                            });
+                        }
+                    }
+                });
+                hidden.forEach((el) => _lazyObserver.observe(el));
+            }
+        }
     }
 
     all_mermaids = document.querySelectorAll(".mermaid");
-    const mermaids_processed = document.querySelectorAll(".mermaid[data-processed='true']");
+    // Exclude deferred (hidden) and render-failed elements from completion checks
+    const mermaids_active = document.querySelectorAll(".mermaid:not([data-mermaid-deferred]):not([data-mermaid-render-failed])");
+    const mermaids_processed = document.querySelectorAll(".mermaid:not([data-mermaid-deferred]):not([data-mermaid-render-failed])[data-processed='true']");
 
     if ("False" === "True") {
-        const mermaids_to_add_zoom = -1 === -1 ? all_mermaids.length : -1;
+        const mermaids_to_add_zoom = -1 === -1 ? mermaids_active.length : -1;
         if(mermaids_to_add_zoom > 0) {
             var svgs = d3.selectAll("");
-            if(all_mermaids.length !== mermaids_processed.length) {
+            // Wait until every active (visible) diagram has rendered. Deferred
+            // diagrams are excluded, so a fixed d3_node_count that counts a
+            // hidden diagram no longer loops forever waiting for its SVG.
+            if(mermaids_active.length !== mermaids_processed.length) {
                 setTimeout(() => runMermaid(false), 200);
                 return;
-            } else if(svgs.size() !== mermaids_to_add_zoom) {
-                setTimeout(() => runMermaid(false), 200);
-                return;
-            } else {
-                svgs.each(function() {
-                    var svg = d3.select(this);
-                    svg.html("<g class='wrapper'>" + svg.html() + "</g>");
-                    var inner = svg.select("g");
-                    var zoom = d3.zoom().on("zoom", function(event) {
-                        inner.attr("transform", event.transform);
-                    });
-                    svg.call(zoom);
-                });
             }
+            addZoomToSvgs(svgs);
         }
-    } else if(all_mermaids.length !== mermaids_processed.length) {
+    } else if(mermaids_active.length !== mermaids_processed.length) {
         // Wait for mermaid to process all diagrams
         setTimeout(() => runMermaid(false), 200);
         return;
@@ -496,9 +577,9 @@ window.addEventListener("load", load);
 window.runMermaid = runMermaid;</script>
     <script>DOCUMENTATION_OPTIONS.pagename = '_modules/tensorrt_llm/_torch/auto_deploy/transform/library/sharding';</script>
     <script>
-        DOCUMENTATION_OPTIONS.theme_version = '0.19.0';
+        DOCUMENTATION_OPTIONS.theme_version = '0.20.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc20';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc21';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -512,7 +593,7 @@ window.runMermaid = runMermaid;</script>
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc20" />
+  <meta name="docsearch:version" content="1.3.0rc21" />
   
     
     <script src="../../../../../../_static/searchtools.js"></script>
@@ -875,6 +956,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l1"><a class="reference internal" href="../../../../../../features/feature-combination-matrix.html">Feature Combination Matrix</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../../../features/attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../../../features/disagg-serving.html">Disaggregated Serving</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../../features/embeddings.html">Embeddings (Encoder-Only Models)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../../../features/kvcache.html">KV Cache System</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../../../features/long-sequence.html">Long Sequences</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../../../features/lora.html">LoRA (Low-Rank Adaptation)</a></li>
@@ -885,6 +967,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l1"><a class="reference internal" href="../../../../../../features/quantization.html">Quantization</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../../../features/sampling.html">Sampling</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../../../features/additional-outputs.html">Additional Outputs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../../features/post-processor-hook.html">Post-Processing Hook</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../../../features/guided-decoding.html">Guided Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../../../features/speculative-decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../../../features/checkpoint-loading.html">Checkpoint Loading</a></li>
@@ -924,6 +1007,7 @@ window.runMermaid = runMermaid;</script>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../../../../../blogs/tech_blog/blog25_Scaling_Video_Generation_Across_NVL72_Rack_with_TensorRT-LLM.html">Scaling Video Generation Across NVL72 rack with TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../../../blogs/tech_blog/blog24_MoE_as_Dense_GEMM.html">MoE as Dense GEMM: Optimizing Low-Latency MoE Inference on NVIDIA Blackwell</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../../../blogs/tech_blog/blog23_Joint_Optimization_of_Agent_Applications_and_TensorRT-LLM.html">Joint Optimization of Agent Applications and TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../../../../blogs/tech_blog/blog22_Helix_Parallelism_Scaling_Multi_Million_Token_Decoding_with_KV_Cache_Sharding.html">Helix Parallelism in TensorRT-LLM: Scaling Multi-Million-Token Decoding with KV Cache Sharding</a></li>
@@ -961,9 +1045,9 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM">Github Code</a></li>
 <li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/issues?q=is%3Aissue%20state%3Aopen%20label%3Aroadmap">Roadmap</a></li>
 </ul>
-<p aria-level="2" class="caption" role="heading"><span class="caption-text">Use TensorRT Engine</span></p>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Migration</span></p>
 <ul class="nav bd-sidenav">
-<li class="toctree-l1"><a class="reference internal" href="../../../../../../legacy/tensorrt_quickstart.html">LLM API with TensorRT Engine</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../../../../legacy/tensorrt-backend-removal.html">Migration Guide: TensorRT Backend Removed</a></li>
 </ul>
 </div>
 </nav></div>
@@ -1035,11 +1119,13 @@ window.runMermaid = runMermaid;</script>
 <span class="c1"># limitations under the License.</span>
 <span class="sd">&quot;&quot;&quot;Transformations to support graph sharding.</span>
 
-<span class="sd">.. deprecated::</span>
-<span class="sd">    The heuristic-based sharding infrastructure in this module (``detect_sharding``,</span>
-<span class="sd">    ``sharding_transform_executor``, and all ``ShardingInfo`` classes) is being replaced</span>
-<span class="sd">    by the hint-driven IR sharding system in ``sharding_ir.py``.  New development should</span>
-<span class="sd">    target ``sharding_ir.py``; this module will be removed once the transition is complete.</span>
+<span class="sd">Heuristic-detection fallback for modeling files not yet ported to sharding IR.</span>
+<span class="sd">The auto-detect dispatcher in ``sharding_ir.py::is_shardingIR_enabled`` routes</span>
+<span class="sd">FX graphs without ``torch.ops.auto_deploy.all_reduce`` markers here; graphs</span>
+<span class="sd">authored against the sharding IR are handled by ``apply_sharding_hints`` instead.</span>
+<span class="sd">New modeling-file work should target the sharding IR (see</span>
+<span class="sd">``.claude/skills/ad-sharding-ir-port``); this module remains the fallback while</span>
+<span class="sd">the long-tail of unported modeling files is brought across.</span>
 
 <span class="sd">Our sharding algorithm for tensor parallelism (TP) is based on the following steps:</span>
 
@@ -1110,7 +1196,6 @@ window.runMermaid = runMermaid;</script>
     <span class="n">shape</span><span class="p">,</span>
     <span class="n">subgraph</span><span class="p">,</span>
 <span class="p">)</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">...utils.pipeline_cache_hooks</span><span class="w"> </span><span class="kn">import</span> <span class="n">mark_pipeline_cache_hook</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">...utils.quantization_utils</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span>
     <span class="n">cutlass_fp4_scale_to_modelopt_fp4_scale</span><span class="p">,</span>
     <span class="n">modelopt_fp4_scale_to_cutlass_fp4_scale</span><span class="p">,</span>
@@ -1121,6 +1206,18 @@ window.runMermaid = runMermaid;</script>
     <span class="n">TransformConfig</span><span class="p">,</span>
     <span class="n">TransformInfo</span><span class="p">,</span>
     <span class="n">TransformRegistry</span><span class="p">,</span>
+<span class="p">)</span>
+
+<span class="c1"># Shared sharding primitives now live in the default IR pipeline (sharding_ir.py).</span>
+<span class="c1"># The dependency points legacy -&gt; IR; sharding_ir.py never imports from sharding.py.</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">.sharding_ir</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span>
+    <span class="n">SplitDimension</span><span class="p">,</span>
+    <span class="n">_get_dist_ops</span><span class="p">,</span>
+    <span class="n">_load_hook</span><span class="p">,</span>
+    <span class="n">_shard_fp4_weight_scale</span><span class="p">,</span>
+    <span class="n">_split_tensor_for_tp</span><span class="p">,</span>
+    <span class="n">shard_weight_tensor</span><span class="p">,</span>
+    <span class="n">validate_allreduce_strategy</span><span class="p">,</span>
 <span class="p">)</span>
 
 <span class="c1">########################################################</span>
@@ -1214,17 +1311,6 @@ window.runMermaid = runMermaid;</script>
     <span class="n">BMM</span> <span class="o">=</span> <span class="s2">&quot;bmm&quot;</span>
 
 
-<span class="k">class</span><span class="w"> </span><span class="nc">SplitDimension</span><span class="p">(</span><span class="n">IntEnum</span><span class="p">):</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;Enum for tensor split dimensions in sharding.&quot;&quot;&quot;</span>
-
-    <span class="c1"># NOTE: The names COLUMN/ROW reflect the hugging face</span>
-    <span class="c1"># base_tp_plan sharding notation, but since we assume Y = W @ X^T,</span>
-    <span class="c1"># when splitting weight matrix W^T across columns, the actual split</span>
-    <span class="c1"># is over dimension 0</span>
-    <span class="n">COLUMN</span> <span class="o">=</span> <span class="mi">0</span>
-    <span class="n">ROW</span> <span class="o">=</span> <span class="mi">1</span>
-
-
 <span class="k">class</span><span class="w"> </span><span class="nc">DistBackend</span><span class="p">(</span><span class="n">Enum</span><span class="p">):</span>
 <span class="w">    </span><span class="sd">&quot;&quot;&quot;Enum for distributed backend.&quot;&quot;&quot;</span>
 
@@ -1294,6 +1380,18 @@ window.runMermaid = runMermaid;</script>
         <span class="s2">&quot;Only effective when shard_all_unprocessed is True. &quot;</span>
         <span class="s2">&quot;When None, all unprocessed linear nodes are sharded.&quot;</span><span class="p">,</span>
     <span class="p">)</span>
+    <span class="n">exclude_shard_node_filter</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span><span class="s2">&quot;Comma-separated list of substrings. Linear nodes whose name contains &quot;</span>
+        <span class="s2">&quot;ANY of the listed substrings are kept TP-replicated across all ranks &quot;</span>
+        <span class="s2">&quot;(no column-shard / row-shard / AllGather / AllReduce added) regardless of which &quot;</span>
+        <span class="s2">&quot;sharding path (heuristic catch-all, MHA, MLA, MoE, MLP) selected them. &quot;</span>
+        <span class="s2">&quot;Other sharding for the same layer (e.g. q_b_proj head-shard, o_proj row-shard) is &quot;</span>
+        <span class="s2">&quot;unaffected. Use to match PT-style replicated patterns -- for example, DeepseekV3 &quot;</span>
+        <span class="s2">&quot;keeps q_a_proj + kv_a_proj_with_mqa replicated (TP-unsharded, no AllGather) while &quot;</span>
+        <span class="s2">&quot;still column-sharding q_b/kv_b by heads. Example: &quot;</span>
+        <span class="s2">&quot;&#39;q_a_proj,kv_a_proj_with_mqa&#39;. When None (default), all sharding paths run as-is.&quot;</span><span class="p">,</span>
+    <span class="p">)</span>
     <span class="n">allreduce_strategy</span><span class="p">:</span> <span class="n">AllReduceStrategy</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
         <span class="n">default</span><span class="o">=</span><span class="n">AllReduceStrategy</span><span class="o">.</span><span class="n">AUTO</span><span class="p">,</span>
         <span class="n">description</span><span class="o">=</span><span class="s2">&quot;AllReduce strategy for distributed operations. &quot;</span>
@@ -1333,8 +1431,7 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">        Production path builds ``DistConfig`` in ``LlmArgs.init_dist_config`` and</span>
 <span class="sd">        passes it through ``SharedConfig.dist_config``.  This fallback is only</span>
 <span class="sd">        entered when ``shared_config.dist_config is None`` (tests constructing</span>
-<span class="sd">        ``InferenceOptimizer`` directly without a ``dist_config`` kwarg).  Will</span>
-<span class="sd">        be removed together with the legacy sharding pipeline.</span>
+<span class="sd">        ``InferenceOptimizer`` directly without a ``dist_config`` kwarg).</span>
 <span class="sd">        &quot;&quot;&quot;</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">dist_config</span> <span class="o">=</span> <span class="n">DistConfig</span><span class="o">.</span><span class="n">from_sharding_params</span><span class="p">(</span>
             <span class="n">rank</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">rank</span><span class="p">,</span>
@@ -1426,6 +1523,11 @@ window.runMermaid = runMermaid;</script>
 
     <span class="n">target_node</span><span class="p">:</span> <span class="nb">str</span>
     <span class="n">config</span><span class="p">:</span> <span class="n">ShardingTransformConfig</span>
+    <span class="c1"># Weight/param name (e.g. &quot;...self_attn.q_a_proj.weight&quot;) resolved at from_node()</span>
+    <span class="c1"># time, where the FX node is available. exclude_shard_node_filter is documented in</span>
+    <span class="c1"># weight-name terms, so the central exclusion check matches against this (falling</span>
+    <span class="c1"># back to target_node). None when the node has no extractable weight.</span>
+    <span class="n">weight_name</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">validate</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">gm</span><span class="p">:</span> <span class="n">GraphModule</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span> <span class="n">node</span><span class="p">:</span> <span class="n">Node</span> <span class="o">=</span> <span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">&quot;&quot;&quot;</span>
@@ -1454,16 +1556,17 @@ window.runMermaid = runMermaid;</script>
         <span class="k">return</span> <span class="kc">True</span>
 
     <span class="k">def</span><span class="w"> </span><span class="fm">__hash__</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
-<span class="w">        </span><span class="sd">&quot;&quot;&quot;Make the transform info hashable by excluding the config field.</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Make the transform info hashable by excluding non-identity fields.</span>
 
-<span class="sd">        The config field is excluded because:</span>
-<span class="sd">        1. It may not be hashable (ShardingTransformConfig is mutable)</span>
-<span class="sd">        2. Tests set config=None before comparison anyway</span>
+<span class="sd">        Excluded:</span>
+<span class="sd">        - config: may not be hashable (ShardingTransformConfig is mutable); tests</span>
+<span class="sd">          set config=None before comparison anyway.</span>
+<span class="sd">        - weight_name: derived from the node (hence from target_node), so it is</span>
+<span class="sd">          redundant for identity; tests construct expected transforms without it.</span>
 <span class="sd">        &quot;&quot;&quot;</span>
-        <span class="c1"># Get all fields except &#39;config&#39; for hashing</span>
         <span class="n">field_values</span> <span class="o">=</span> <span class="p">[]</span>
         <span class="k">for</span> <span class="n">field_name</span><span class="p">,</span> <span class="n">field_info</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">model_fields</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
-            <span class="k">if</span> <span class="n">field_name</span> <span class="o">!=</span> <span class="s2">&quot;config&quot;</span><span class="p">:</span>
+            <span class="k">if</span> <span class="n">field_name</span> <span class="ow">not</span> <span class="ow">in</span> <span class="p">(</span><span class="s2">&quot;config&quot;</span><span class="p">,</span> <span class="s2">&quot;weight_name&quot;</span><span class="p">):</span>
                 <span class="n">value</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">field_name</span><span class="p">)</span>
                 <span class="c1"># Handle enums</span>
                 <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">value</span><span class="p">,</span> <span class="p">(</span><span class="n">Enum</span><span class="p">,</span> <span class="n">IntEnum</span><span class="p">)):</span>
@@ -1505,7 +1608,12 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">        Create the correct TPShardingInfo subclass (FP8/FP4/base) based on `node`.</span>
 <span class="sd">        &quot;&quot;&quot;</span>
         <span class="n">subcls</span> <span class="o">=</span> <span class="n">_resolve_tp_cls_from_node</span><span class="p">(</span><span class="n">node</span><span class="p">)</span>
-        <span class="k">return</span> <span class="n">subcls</span><span class="p">(</span><span class="n">target_node</span><span class="o">=</span><span class="n">node</span><span class="o">.</span><span class="n">name</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span>
+        <span class="n">wname</span> <span class="o">=</span> <span class="n">extract_weight_name</span><span class="p">(</span><span class="n">node</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">subcls</span><span class="p">(</span>
+            <span class="n">target_node</span><span class="o">=</span><span class="n">node</span><span class="o">.</span><span class="n">name</span><span class="p">,</span>
+            <span class="n">weight_name</span><span class="o">=</span><span class="n">wname</span> <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">wname</span><span class="p">,</span> <span class="nb">str</span><span class="p">)</span> <span class="k">else</span> <span class="kc">None</span><span class="p">,</span>
+            <span class="o">**</span><span class="n">kwargs</span><span class="p">,</span>
+        <span class="p">)</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">validate</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">gm</span><span class="p">:</span> <span class="n">GraphModule</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span> <span class="n">node</span><span class="p">:</span> <span class="n">Node</span> <span class="o">=</span> <span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">&quot;&quot;&quot;Validate the transformation configuration.&quot;&quot;&quot;</span>
@@ -1789,38 +1897,6 @@ window.runMermaid = runMermaid;</script>
             <span class="p">)</span>
 
 
-<span class="k">def</span><span class="w"> </span><span class="nf">_shard_fp4_weight_scale</span><span class="p">(</span>
-    <span class="n">weight_scale</span><span class="p">,</span>
-    <span class="n">original_uint8_weight_shape</span><span class="p">,</span>
-    <span class="n">dim</span><span class="p">,</span>
-    <span class="n">rank</span><span class="p">,</span>
-    <span class="n">world_size</span><span class="p">,</span>
-    <span class="n">min_local_shape</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span>
-    <span class="n">fused_weight_dims</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
-<span class="p">):</span>
-    <span class="c1"># Convert original uint8 shape to element shape (FP4 packs 2 elements per byte)</span>
-    <span class="n">weight_shape_elements</span> <span class="o">=</span> <span class="nb">list</span><span class="p">(</span><span class="n">original_uint8_weight_shape</span><span class="p">)</span>
-    <span class="n">weight_shape_elements</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">]</span> <span class="o">*=</span> <span class="mi">2</span>
-    <span class="n">modelopt_weight_scale</span> <span class="o">=</span> <span class="n">cutlass_fp4_scale_to_modelopt_fp4_scale</span><span class="p">(</span>
-        <span class="n">weight_scale</span><span class="p">,</span> <span class="nb">tuple</span><span class="p">(</span><span class="n">weight_shape_elements</span><span class="p">)</span>
-    <span class="p">)</span>
-    <span class="k">if</span> <span class="n">fused_weight_dims</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-        <span class="c1"># Fused weights (e.g. Mamba in_proj) are split per-component then sharded.</span>
-        <span class="c1"># The scale must follow the same per-component splitting to stay aligned.</span>
-        <span class="n">sharded_scale</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">cat</span><span class="p">(</span>
-            <span class="p">[</span>
-                <span class="n">_split_tensor_for_tp</span><span class="p">(</span><span class="n">chunk</span><span class="p">,</span> <span class="n">dim</span><span class="p">,</span> <span class="n">rank</span><span class="p">,</span> <span class="n">world_size</span><span class="p">,</span> <span class="n">min_local_shape</span><span class="p">)</span>
-                <span class="k">for</span> <span class="n">chunk</span> <span class="ow">in</span> <span class="n">torch</span><span class="o">.</span><span class="n">split</span><span class="p">(</span><span class="n">modelopt_weight_scale</span><span class="p">,</span> <span class="nb">list</span><span class="p">(</span><span class="n">fused_weight_dims</span><span class="p">),</span> <span class="n">dim</span><span class="o">=</span><span class="n">dim</span><span class="p">)</span>
-            <span class="p">],</span>
-            <span class="n">dim</span><span class="o">=</span><span class="n">dim</span><span class="p">,</span>
-        <span class="p">)</span>
-    <span class="k">else</span><span class="p">:</span>
-        <span class="n">sharded_scale</span> <span class="o">=</span> <span class="n">_split_tensor_for_tp</span><span class="p">(</span>
-            <span class="n">modelopt_weight_scale</span><span class="p">,</span> <span class="n">dim</span><span class="p">,</span> <span class="n">rank</span><span class="p">,</span> <span class="n">world_size</span><span class="p">,</span> <span class="n">min_local_shape</span>
-        <span class="p">)</span>
-    <span class="k">return</span> <span class="n">modelopt_fp4_scale_to_cutlass_fp4_scale</span><span class="p">(</span><span class="n">sharded_scale</span><span class="p">)</span>
-
-
 <span class="k">class</span><span class="w"> </span><span class="nc">FP4WeightShardingInfo</span><span class="p">(</span><span class="n">QuantizationShardingMixin</span><span class="p">,</span> <span class="n">WeightShardingInfo</span><span class="p">):</span>
 <span class="w">    </span><span class="sd">&quot;&quot;&quot;Tensor-parallel sharding for FP4-quantized linears.&quot;&quot;&quot;</span>
 
@@ -1992,7 +2068,12 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">        Create the correct EPShardingInfo subclass (FP8/NVFP4/base) based on `node`.</span>
 <span class="sd">        &quot;&quot;&quot;</span>
         <span class="n">subcls</span> <span class="o">=</span> <span class="n">_resolve_ep_cls_from_node</span><span class="p">(</span><span class="n">node</span><span class="p">)</span>
-        <span class="k">return</span> <span class="n">subcls</span><span class="p">(</span><span class="n">target_node</span><span class="o">=</span><span class="n">node</span><span class="o">.</span><span class="n">name</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span>
+        <span class="n">wname</span> <span class="o">=</span> <span class="n">extract_weight_name</span><span class="p">(</span><span class="n">node</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">subcls</span><span class="p">(</span>
+            <span class="n">target_node</span><span class="o">=</span><span class="n">node</span><span class="o">.</span><span class="n">name</span><span class="p">,</span>
+            <span class="n">weight_name</span><span class="o">=</span><span class="n">wname</span> <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">wname</span><span class="p">,</span> <span class="nb">str</span><span class="p">)</span> <span class="k">else</span> <span class="kc">None</span><span class="p">,</span>
+            <span class="o">**</span><span class="n">kwargs</span><span class="p">,</span>
+        <span class="p">)</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">validate</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">gm</span><span class="p">:</span> <span class="n">GraphModule</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span> <span class="n">node</span><span class="p">:</span> <span class="n">Node</span> <span class="o">=</span> <span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">&quot;&quot;&quot;Validate the transformation configuration.&quot;&quot;&quot;</span>
@@ -2219,6 +2300,19 @@ window.runMermaid = runMermaid;</script>
     <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tuple</span><span class="p">[</span><span class="n">GraphModule</span><span class="p">,</span> <span class="n">TransformInfo</span><span class="p">]:</span>
         <span class="n">local_rank</span><span class="p">,</span> <span class="n">world_size</span> <span class="o">=</span> <span class="n">shared_config</span><span class="o">.</span><span class="n">local_rank</span><span class="p">,</span> <span class="n">shared_config</span><span class="o">.</span><span class="n">world_size</span>
         <span class="k">assert</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">gm</span><span class="p">,</span> <span class="n">GraphModule</span><span class="p">),</span> <span class="s2">&quot;Expecting GraphModule&quot;</span>
+
+        <span class="c1"># Honor the auto-detect dispatcher in apply_sharding_hints. When the</span>
+        <span class="c1"># IR pipeline has already sharded this graph, the heuristic-detection</span>
+        <span class="c1"># fallback would either re-shard the same nodes or build a stale plan.</span>
+        <span class="k">if</span> <span class="n">gm</span><span class="o">.</span><span class="n">meta</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;sharding_ir_applied&quot;</span><span class="p">):</span>
+            <span class="n">ad_logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span>
+                <span class="s2">&quot;detect_sharding: sharding IR already applied to this graph; &quot;</span>
+                <span class="s2">&quot;skipping heuristic-detection fallback.&quot;</span>
+            <span class="p">)</span>
+            <span class="k">return</span> <span class="n">gm</span><span class="p">,</span> <span class="n">TransformInfo</span><span class="p">(</span>
+                <span class="n">skipped</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">num_matches</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span> <span class="n">is_clean</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">has_valid_shapes</span><span class="o">=</span><span class="kc">True</span>
+            <span class="p">)</span>
+
         <span class="n">_is_draft</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">gm</span><span class="p">,</span> <span class="s2">&quot;is_draft&quot;</span><span class="p">,</span> <span class="kc">False</span><span class="p">)</span>
         <span class="n">config</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span>
         <span class="n">config</span><span class="o">.</span><span class="n">factory_config</span> <span class="o">=</span> <span class="n">factory</span><span class="o">.</span><span class="n">get_sharding_config</span><span class="p">()</span> <span class="k">if</span> <span class="n">factory</span> <span class="k">else</span> <span class="p">{}</span>
@@ -2264,6 +2358,28 @@ window.runMermaid = runMermaid;</script>
             <span class="k">if</span> <span class="n">ShardingDim</span><span class="o">.</span><span class="n">EP</span> <span class="ow">in</span> <span class="n">config</span><span class="o">.</span><span class="n">sharding_dims</span><span class="p">:</span>
                 <span class="n">ad_logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span><span class="s2">&quot;Running autodeploy EP sharding heuristics&quot;</span><span class="p">)</span>
                 <span class="n">info</span> <span class="o">+=</span> <span class="n">detect_ep_shard</span><span class="p">(</span><span class="n">gm</span><span class="p">,</span> <span class="n">transform_container</span><span class="p">)</span>
+                <span class="c1"># Under attention-DP, EP-sharding the draft submodel forces its</span>
+                <span class="c1"># MoE op into the alltoall path. Target and draft share a</span>
+                <span class="c1"># single process-wide MoeAlltoAll workspace + flag_val counter</span>
+                <span class="c1"># (singleton in MoeAlltoAll._WORKSPACE), so a misconfigured</span>
+                <span class="c1"># draft alltoall corrupts the workspace and the subsequent</span>
+                <span class="c1"># target alltoall calls hang or fault. Replicating the draft</span>
+                <span class="c1"># (no EP sharding, no alltoall) is the safe choice: the draft</span>
+                <span class="c1"># is small enough that the 4x weight memory is negligible,</span>
+                <span class="c1"># and each rank computes its local-batch slice locally with no</span>
+                <span class="c1"># cross-rank communication needed.</span>
+                <span class="c1"># TODO: https://github.com/NVIDIA/TensorRT-LLM/issues/15168</span>
+                <span class="k">if</span> <span class="p">(</span>
+                    <span class="n">_is_draft</span>
+                    <span class="ow">and</span> <span class="n">config</span><span class="o">.</span><span class="n">dist_config</span><span class="o">.</span><span class="n">enable_attention_dp</span>
+                    <span class="ow">and</span> <span class="n">transform_container</span><span class="o">.</span><span class="n">ep_transforms</span>
+                <span class="p">):</span>
+                    <span class="n">ad_logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span>
+                        <span class="s2">&quot;Reverting </span><span class="si">%d</span><span class="s2"> EP sharding transform(s) on draft submodel &quot;</span>
+                        <span class="s2">&quot;under attention_dp (replicating instead).&quot;</span><span class="p">,</span>
+                        <span class="nb">len</span><span class="p">(</span><span class="n">transform_container</span><span class="o">.</span><span class="n">ep_transforms</span><span class="p">),</span>
+                    <span class="p">)</span>
+                    <span class="n">transform_container</span><span class="o">.</span><span class="n">ep_transforms</span><span class="o">.</span><span class="n">clear</span><span class="p">()</span>
             <span class="k">if</span> <span class="n">ShardingDim</span><span class="o">.</span><span class="n">BMM</span> <span class="ow">in</span> <span class="n">config</span><span class="o">.</span><span class="n">sharding_dims</span><span class="p">:</span>
                 <span class="c1"># While BMM nodes are most likely used for MoE (e.g. LLama4),</span>
                 <span class="c1"># technically, this is a different transformation.</span>
@@ -2346,6 +2462,19 @@ window.runMermaid = runMermaid;</script>
         <span class="n">factory</span><span class="p">:</span> <span class="n">ModelFactory</span><span class="p">,</span>
         <span class="n">shared_config</span><span class="p">:</span> <span class="n">SharedConfig</span><span class="p">,</span>
     <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tuple</span><span class="p">[</span><span class="n">GraphModule</span><span class="p">,</span> <span class="n">TransformInfo</span><span class="p">]:</span>
+        <span class="c1"># Honor the auto-detect dispatcher: when apply_sharding_hints handled</span>
+        <span class="c1"># this graph, detect_sharding was skipped and no transform plan was</span>
+        <span class="c1"># built. Mirror that here so we don&#39;t attempt to read an absent</span>
+        <span class="c1"># _sharding_transform_container.</span>
+        <span class="k">if</span> <span class="n">gm</span><span class="o">.</span><span class="n">meta</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;sharding_ir_applied&quot;</span><span class="p">):</span>
+            <span class="n">ad_logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span>
+                <span class="s2">&quot;sharding_transform_executor: sharding IR already applied; &quot;</span>
+                <span class="s2">&quot;no heuristic plan to execute.&quot;</span>
+            <span class="p">)</span>
+            <span class="k">return</span> <span class="n">gm</span><span class="p">,</span> <span class="n">TransformInfo</span><span class="p">(</span>
+                <span class="n">skipped</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">num_matches</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span> <span class="n">is_clean</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">has_valid_shapes</span><span class="o">=</span><span class="kc">True</span>
+            <span class="p">)</span>
+
         <span class="c1"># create a node dict for faster lookup</span>
         <span class="n">node_dict</span> <span class="o">=</span> <span class="p">{</span><span class="n">n</span><span class="o">.</span><span class="n">name</span><span class="p">:</span> <span class="n">n</span> <span class="k">for</span> <span class="n">n</span> <span class="ow">in</span> <span class="n">gm</span><span class="o">.</span><span class="n">graph</span><span class="o">.</span><span class="n">nodes</span><span class="p">}</span>
 
@@ -2370,17 +2499,6 @@ window.runMermaid = runMermaid;</script>
             <span class="sa">f</span><span class="s2">&quot;BMM=</span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="n">transforms</span><span class="o">.</span><span class="n">bmm_transforms</span><span class="p">)</span><span class="si">}</span><span class="s2">, &quot;</span>
             <span class="sa">f</span><span class="s2">&quot;RMSNorm=</span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="n">transforms</span><span class="o">.</span><span class="n">rmsnorm_transforms</span><span class="p">)</span><span class="si">}</span><span class="s2">&quot;</span>
         <span class="p">)</span>
-
-        <span class="c1"># If there are EP transforms and we have a CachedSequenceInterface, ensure</span>
-        <span class="c1"># batch_info_host is added to the graph as a placeholder and activated on</span>
-        <span class="c1"># the SequenceInfo so the runtime DP-aware max_num_tokens (slot 14) flows</span>
-        <span class="c1"># into the MoE all-to-all op as a kwarg. _add_or_retrieve_input is</span>
-        <span class="c1"># idempotent — safe even if another transform (e.g.</span>
-        <span class="c1"># gather_logits_before_lm_head) already added the placeholder.</span>
-        <span class="c1"># When cm is None (e.g., unit tests that drive the sharding transform</span>
-        <span class="c1"># standalone), skip — the MoE op falls back to max_num_tokens.</span>
-        <span class="k">if</span> <span class="n">transforms</span><span class="o">.</span><span class="n">ep_transforms</span> <span class="ow">and</span> <span class="n">cm</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">_add_or_retrieve_input</span><span class="p">(</span><span class="n">gm</span><span class="p">,</span> <span class="n">cm</span><span class="p">,</span> <span class="s2">&quot;batch_info_host&quot;</span><span class="p">,</span> <span class="n">init_val</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
 
         <span class="k">with</span> <span class="n">WeightBiasInfoCache</span><span class="p">():</span>
             <span class="k">for</span> <span class="n">tp_transform</span> <span class="ow">in</span> <span class="n">transforms</span><span class="o">.</span><span class="n">weight_sharding_transforms</span><span class="p">:</span>
@@ -2434,6 +2552,12 @@ window.runMermaid = runMermaid;</script>
     <span class="k">def</span><span class="w"> </span><span class="nf">add</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">transform</span><span class="p">:</span> <span class="n">ShardingTransformInfo</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">&quot;&quot;&quot;Append a transform only if that node was</span>
 <span class="sd">        not sharded before. Do not overwrite existing transforms.</span>
+
+<span class="sd">        Honors ``ShardingTransformConfig.exclude_shard_node_filter``: nodes whose</span>
+<span class="sd">        name matches any of the configured substrings are kept replicated across</span>
+<span class="sd">        TP ranks (the transform is silently dropped). The exclusion applies to</span>
+<span class="sd">        all weight/EP sharding paths so callers do not need to thread the filter</span>
+<span class="sd">        through every heuristic.</span>
 <span class="sd">        &quot;&quot;&quot;</span>
         <span class="c1"># Find the appropriate list by checking inheritance</span>
         <span class="n">transform_list</span> <span class="o">=</span> <span class="kc">None</span>
@@ -2444,6 +2568,17 @@ window.runMermaid = runMermaid;</script>
 
         <span class="k">if</span> <span class="n">transform_list</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
             <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Unknown transform type: </span><span class="si">{</span><span class="nb">type</span><span class="p">(</span><span class="n">transform</span><span class="p">)</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+
+        <span class="c1"># Global node-exclusion filter -- keeps matching nodes replicated</span>
+        <span class="c1"># regardless of which sharding heuristic picked them up.</span>
+        <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">transform</span><span class="p">,</span> <span class="p">(</span><span class="n">WeightShardingInfo</span><span class="p">,</span> <span class="n">EPShardingInfo</span><span class="p">))</span> <span class="ow">and</span> <span class="n">_is_node_excluded</span><span class="p">(</span>
+            <span class="n">transform</span><span class="o">.</span><span class="n">weight_name</span> <span class="ow">or</span> <span class="n">transform</span><span class="o">.</span><span class="n">target_node</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span>
+        <span class="p">):</span>
+            <span class="n">ad_logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span>
+                <span class="sa">f</span><span class="s2">&quot;Skipping sharding for node </span><span class="si">{</span><span class="n">transform</span><span class="o">.</span><span class="n">target_node</span><span class="si">!r}</span><span class="s2"> &quot;</span>
+                <span class="sa">f</span><span class="s2">&quot;due to exclude_shard_node_filter&quot;</span>
+            <span class="p">)</span>
+            <span class="k">return</span> <span class="kc">False</span>
 
         <span class="c1"># Check if node already has a transform</span>
         <span class="k">for</span> <span class="n">existing_transform</span> <span class="ow">in</span> <span class="n">transform_list</span><span class="p">:</span>
@@ -2458,26 +2593,19 @@ window.runMermaid = runMermaid;</script>
 <span class="c1">########################################################</span>
 
 
-<span class="k">def</span><span class="w"> </span><span class="nf">_load_hook</span><span class="p">(</span>
-    <span class="n">state_dict</span><span class="p">,</span>
-    <span class="n">prefix</span><span class="p">,</span>
-    <span class="o">*</span><span class="n">args</span><span class="p">,</span>
-    <span class="n">f_split</span><span class="p">:</span> <span class="n">Callable</span><span class="p">[[</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="nb">int</span><span class="p">],</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">],</span>
-    <span class="n">param_key</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
-    <span class="n">param_shape</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Size</span><span class="p">,</span>
-<span class="p">):</span>
-    <span class="c1"># TODO: we need to support loading either a sharded or unsharded checkpoint.</span>
-    <span class="c1"># Otherwise, basic workflows like</span>
-    <span class="c1"># model.load_state_dict(model.state_dict()) will fail.</span>
-    <span class="c1"># This is quite a hacky solution. A better solution would be to store extra_state in</span>
-    <span class="c1"># the state_dict to identify whether the state_dict is sharded or not.</span>
-    <span class="n">key</span> <span class="o">=</span> <span class="n">prefix</span> <span class="o">+</span> <span class="n">param_key</span>
-    <span class="k">if</span> <span class="n">key</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">state_dict</span><span class="p">:</span>
-        <span class="k">return</span>
-    <span class="n">p_to_load</span> <span class="o">=</span> <span class="n">state_dict</span><span class="p">[</span><span class="n">key</span><span class="p">]</span>
-    <span class="n">did_split</span> <span class="o">=</span> <span class="n">param_shape</span> <span class="o">!=</span> <span class="n">p_to_load</span><span class="o">.</span><span class="n">shape</span>
-    <span class="n">p_to_load</span> <span class="o">=</span> <span class="n">p_to_load</span> <span class="k">if</span> <span class="ow">not</span> <span class="n">did_split</span> <span class="k">else</span> <span class="n">f_split</span><span class="p">(</span><span class="n">p_to_load</span><span class="p">)</span>
-    <span class="n">state_dict</span><span class="p">[</span><span class="n">key</span><span class="p">]</span> <span class="o">=</span> <span class="n">p_to_load</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">_is_node_excluded</span><span class="p">(</span><span class="n">node_name</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">config</span><span class="p">:</span> <span class="s2">&quot;ShardingTransformConfig&quot;</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Return True if ``node_name`` matches any keyword in</span>
+<span class="sd">    ``ShardingTransformConfig.exclude_shard_node_filter``.</span>
+
+<span class="sd">    The filter is a comma-separated list of substrings; a node is excluded if its</span>
+<span class="sd">    name contains ANY of the listed substrings. Used to keep selected linears</span>
+<span class="sd">    replicated across TP ranks (no sharding/AllGather/AllReduce inserted).</span>
+<span class="sd">    &quot;&quot;&quot;</span>
+    <span class="n">pattern</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">config</span><span class="p">,</span> <span class="s2">&quot;exclude_shard_node_filter&quot;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+    <span class="k">if</span> <span class="ow">not</span> <span class="n">pattern</span><span class="p">:</span>
+        <span class="k">return</span> <span class="kc">False</span>
+    <span class="n">keywords</span> <span class="o">=</span> <span class="p">[</span><span class="n">k</span><span class="o">.</span><span class="n">strip</span><span class="p">()</span> <span class="k">for</span> <span class="n">k</span> <span class="ow">in</span> <span class="n">pattern</span><span class="o">.</span><span class="n">split</span><span class="p">(</span><span class="s2">&quot;,&quot;</span><span class="p">)</span> <span class="k">if</span> <span class="n">k</span><span class="o">.</span><span class="n">strip</span><span class="p">()]</span>
+    <span class="k">return</span> <span class="nb">any</span><span class="p">(</span><span class="n">kw</span> <span class="ow">in</span> <span class="n">node_name</span> <span class="k">for</span> <span class="n">kw</span> <span class="ow">in</span> <span class="n">keywords</span><span class="p">)</span>
 
 
 <span class="k">def</span><span class="w"> </span><span class="nf">_load_hook_remove</span><span class="p">(</span>
@@ -2489,87 +2617,6 @@ window.runMermaid = runMermaid;</script>
     <span class="n">key</span> <span class="o">=</span> <span class="n">prefix</span> <span class="o">+</span> <span class="n">param_key</span>
     <span class="n">ad_logger</span><span class="o">.</span><span class="n">debug</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Sharder LOAD hook is called for &#39;</span><span class="si">{</span><span class="n">key</span><span class="si">}</span><span class="s2">&#39;&quot;</span><span class="p">)</span>
     <span class="n">state_dict</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="n">key</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
-
-
-<span class="k">def</span><span class="w"> </span><span class="nf">validate_allreduce_strategy</span><span class="p">(</span><span class="n">v</span><span class="p">):</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;Convert string names like &#39;AUTO&#39; to AllReduceStrategy enum.</span>
-
-<span class="sd">    This is a shared validator for allreduce_strategy fields across all config classes.</span>
-
-<span class="sd">    Args:</span>
-<span class="sd">        v: Value to validate - can be AllReduceStrategy enum, string name, or integer value</span>
-
-<span class="sd">    Returns:</span>
-<span class="sd">        AllReduceStrategy enum value</span>
-
-<span class="sd">    Raises:</span>
-<span class="sd">        ValueError: If the input is an invalid strategy string</span>
-<span class="sd">    &quot;&quot;&quot;</span>
-    <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">v</span><span class="p">,</span> <span class="n">AllReduceStrategy</span><span class="p">):</span>
-        <span class="k">return</span> <span class="n">v</span>
-    <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">v</span><span class="p">,</span> <span class="nb">str</span><span class="p">):</span>
-        <span class="c1"># Try to get enum by name</span>
-        <span class="k">try</span><span class="p">:</span>
-            <span class="k">return</span> <span class="n">AllReduceStrategy</span><span class="p">[</span><span class="n">v</span><span class="p">]</span>
-        <span class="k">except</span> <span class="ne">KeyError</span><span class="p">:</span>
-            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
-                <span class="sa">f</span><span class="s2">&quot;Invalid allreduce strategy: </span><span class="si">{</span><span class="n">v</span><span class="si">}</span><span class="s2">. &quot;</span>
-                <span class="sa">f</span><span class="s2">&quot;Valid options: </span><span class="si">{</span><span class="s1">&#39;, &#39;</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">s</span><span class="o">.</span><span class="n">name</span><span class="w"> </span><span class="k">for</span><span class="w"> </span><span class="n">s</span><span class="w"> </span><span class="ow">in</span><span class="w"> </span><span class="n">AllReduceStrategy</span><span class="p">)</span><span class="si">}</span><span class="s2">&quot;</span>
-            <span class="p">)</span>
-    <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">v</span><span class="p">,</span> <span class="nb">int</span><span class="p">):</span>
-        <span class="k">return</span> <span class="n">AllReduceStrategy</span><span class="p">(</span><span class="n">v</span><span class="p">)</span>
-    <span class="k">return</span> <span class="n">v</span>  <span class="c1"># Let Pydantic handle other types</span>
-
-
-<span class="n">_LOGGED_DIST_BACKEND_CHOICES</span><span class="p">:</span> <span class="nb">set</span><span class="p">[</span><span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">str</span><span class="p">]]</span> <span class="o">=</span> <span class="nb">set</span><span class="p">()</span>
-
-
-<span class="k">def</span><span class="w"> </span><span class="nf">_log_dist_backend_choice</span><span class="p">(</span><span class="n">configured_backend</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">resolved_backend</span><span class="p">:</span> <span class="nb">str</span><span class="p">):</span>
-    <span class="n">key</span> <span class="o">=</span> <span class="p">(</span><span class="n">configured_backend</span><span class="p">,</span> <span class="n">resolved_backend</span><span class="p">)</span>
-    <span class="k">if</span> <span class="n">key</span> <span class="ow">in</span> <span class="n">_LOGGED_DIST_BACKEND_CHOICES</span><span class="p">:</span>
-        <span class="k">return</span>
-    <span class="n">_LOGGED_DIST_BACKEND_CHOICES</span><span class="o">.</span><span class="n">add</span><span class="p">(</span><span class="n">key</span><span class="p">)</span>
-    <span class="n">ad_logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span>
-        <span class="sa">f</span><span class="s2">&quot;AutoDeploy selected distributed backend: </span><span class="si">{</span><span class="n">resolved_backend</span><span class="si">}</span><span class="s2"> &quot;</span>
-        <span class="sa">f</span><span class="s2">&quot;(configured: </span><span class="si">{</span><span class="n">configured_backend</span><span class="si">}</span><span class="s2">)&quot;</span>
-    <span class="p">)</span>
-
-
-<span class="k">def</span><span class="w"> </span><span class="nf">_get_dist_ops</span><span class="p">(</span><span class="n">backend</span><span class="p">:</span> <span class="nb">str</span><span class="p">):</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;Get the (all_gather, all_reduce) op pair for *backend*.</span>
-
-<span class="sd">    backend may be &#39;auto&#39;, &#39;trtllm&#39;, or &#39;torch&#39;. &#39;auto&#39; resolves to TRT-LLM</span>
-<span class="sd">    ops when available, else PyTorch distributed ops. Strategies (allgather</span>
-<span class="sd">    SYMM_MEM, allreduce NCCL/etc.) are passed as op arguments at the call</span>
-<span class="sd">    site, not selected here.</span>
-<span class="sd">    &quot;&quot;&quot;</span>
-    <span class="k">if</span> <span class="nb">hasattr</span><span class="p">(</span><span class="n">backend</span><span class="p">,</span> <span class="s2">&quot;value&quot;</span><span class="p">):</span>
-        <span class="n">backend</span> <span class="o">=</span> <span class="n">backend</span><span class="o">.</span><span class="n">value</span>
-    <span class="n">configured_backend</span> <span class="o">=</span> <span class="nb">str</span><span class="p">(</span><span class="n">backend</span><span class="p">)</span>
-
-    <span class="k">if</span> <span class="n">backend</span> <span class="o">==</span> <span class="s2">&quot;trtllm&quot;</span><span class="p">:</span>
-        <span class="n">_log_dist_backend_choice</span><span class="p">(</span><span class="n">configured_backend</span><span class="p">,</span> <span class="s2">&quot;trtllm&quot;</span><span class="p">)</span>
-        <span class="k">return</span> <span class="p">(</span>
-            <span class="n">torch</span><span class="o">.</span><span class="n">ops</span><span class="o">.</span><span class="n">auto_deploy</span><span class="o">.</span><span class="n">trtllm_dist_all_gather</span><span class="o">.</span><span class="n">default</span><span class="p">,</span>
-            <span class="n">torch</span><span class="o">.</span><span class="n">ops</span><span class="o">.</span><span class="n">auto_deploy</span><span class="o">.</span><span class="n">trtllm_dist_all_reduce</span><span class="o">.</span><span class="n">default</span><span class="p">,</span>
-        <span class="p">)</span>
-    <span class="k">if</span> <span class="n">backend</span> <span class="o">==</span> <span class="s2">&quot;torch&quot;</span><span class="p">:</span>
-        <span class="n">_log_dist_backend_choice</span><span class="p">(</span><span class="n">configured_backend</span><span class="p">,</span> <span class="s2">&quot;torch&quot;</span><span class="p">)</span>
-        <span class="k">return</span> <span class="p">(</span>
-            <span class="n">torch</span><span class="o">.</span><span class="n">ops</span><span class="o">.</span><span class="n">auto_deploy</span><span class="o">.</span><span class="n">torch_dist_all_gather</span><span class="o">.</span><span class="n">default</span><span class="p">,</span>
-            <span class="n">torch</span><span class="o">.</span><span class="n">ops</span><span class="o">.</span><span class="n">auto_deploy</span><span class="o">.</span><span class="n">torch_dist_all_reduce</span><span class="o">.</span><span class="n">default</span><span class="p">,</span>
-        <span class="p">)</span>
-    <span class="k">if</span> <span class="n">is_trtllm_op_available</span><span class="p">():</span>
-        <span class="n">_log_dist_backend_choice</span><span class="p">(</span><span class="n">configured_backend</span><span class="p">,</span> <span class="s2">&quot;trtllm&quot;</span><span class="p">)</span>
-        <span class="k">return</span> <span class="p">(</span>
-            <span class="n">torch</span><span class="o">.</span><span class="n">ops</span><span class="o">.</span><span class="n">auto_deploy</span><span class="o">.</span><span class="n">trtllm_dist_all_gather</span><span class="o">.</span><span class="n">default</span><span class="p">,</span>
-            <span class="n">torch</span><span class="o">.</span><span class="n">ops</span><span class="o">.</span><span class="n">auto_deploy</span><span class="o">.</span><span class="n">trtllm_dist_all_reduce</span><span class="o">.</span><span class="n">default</span><span class="p">,</span>
-        <span class="p">)</span>
-    <span class="n">_log_dist_backend_choice</span><span class="p">(</span><span class="n">configured_backend</span><span class="p">,</span> <span class="s2">&quot;torch&quot;</span><span class="p">)</span>
-    <span class="k">return</span> <span class="p">(</span>
-        <span class="n">torch</span><span class="o">.</span><span class="n">ops</span><span class="o">.</span><span class="n">auto_deploy</span><span class="o">.</span><span class="n">torch_dist_all_gather</span><span class="o">.</span><span class="n">default</span><span class="p">,</span>
-        <span class="n">torch</span><span class="o">.</span><span class="n">ops</span><span class="o">.</span><span class="n">auto_deploy</span><span class="o">.</span><span class="n">torch_dist_all_reduce</span><span class="o">.</span><span class="n">default</span><span class="p">,</span>
-    <span class="p">)</span>
 
 
 <span class="k">def</span><span class="w"> </span><span class="nf">_validate_sharded_shapes</span><span class="p">(</span>
@@ -2669,143 +2716,6 @@ window.runMermaid = runMermaid;</script>
 <span class="c1">########################################################</span>
 <span class="c1">#  Sharding transform functions</span>
 <span class="c1">########################################################</span>
-
-
-<span class="k">def</span><span class="w"> </span><span class="nf">_split_tensor_for_tp</span><span class="p">(</span>
-    <span class="n">t</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
-    <span class="n">dim</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
-    <span class="n">rank</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
-    <span class="n">world_size</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
-    <span class="n">min_local_shape</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">1</span><span class="p">,</span>
-<span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;Split a tensor for tensor-parallelism, respecting min_local_shape.</span>
-
-<span class="sd">    When world_size exceeds the maximum number of even splits (e.g. GQA with</span>
-<span class="sd">    num_kv_heads &lt; world_size), multiple ranks share the same shard.</span>
-
-<span class="sd">    TODO: support num_units % world_size != 0 via GCD-based partial replication.</span>
-<span class="sd">    When num_heads doesn&#39;t divide by world_size (e.g. 28 Q heads at tp_size=8),</span>
-<span class="sd">    use effective_splits = gcd(num_heads, world_size) to split at head</span>
-<span class="sd">    boundaries and replicate each shard across world_size // effective_splits</span>
-<span class="sd">    ranks. To compensate the duplication in all_reduce, scale rowwise weights</span>
-<span class="sd">    by 1 / replication_factor during sharding (baked into the weight tensor,</span>
-<span class="sd">    no changes to all_reduce or the graph needed).</span>
-<span class="sd">    &quot;&quot;&quot;</span>
-    <span class="n">max_split_size</span> <span class="o">=</span> <span class="n">t</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="n">dim</span><span class="p">]</span> <span class="o">//</span> <span class="n">min_local_shape</span>
-    <span class="k">if</span> <span class="n">world_size</span> <span class="o">&gt;</span> <span class="n">max_split_size</span><span class="p">:</span>
-        <span class="k">assert</span> <span class="n">world_size</span> <span class="o">%</span> <span class="n">max_split_size</span> <span class="o">==</span> <span class="mi">0</span><span class="p">,</span> <span class="p">(</span>
-            <span class="sa">f</span><span class="s2">&quot;world_size (</span><span class="si">{</span><span class="n">world_size</span><span class="si">}</span><span class="s2">) must be divisible by max_split_size (</span><span class="si">{</span><span class="n">max_split_size</span><span class="si">}</span><span class="s2">). &quot;</span>
-            <span class="sa">f</span><span class="s2">&quot;GQA with num_kv_heads not dividing world_size is not supported.&quot;</span>
-        <span class="p">)</span>
-        <span class="n">num_groups</span> <span class="o">=</span> <span class="n">world_size</span> <span class="o">//</span> <span class="n">max_split_size</span>
-        <span class="n">ad_logger</span><span class="o">.</span><span class="n">debug</span><span class="p">(</span>
-            <span class="sa">f</span><span class="s2">&quot;World size </span><span class="si">{</span><span class="n">world_size</span><span class="si">}</span><span class="s2"> is greater than the max split size </span><span class="si">{</span><span class="n">max_split_size</span><span class="si">}</span><span class="s2">. &quot;</span>
-            <span class="sa">f</span><span class="s2">&quot;Splitting tensor to </span><span class="si">{</span><span class="n">num_groups</span><span class="si">}</span><span class="s2"> chunks&quot;</span>
-        <span class="p">)</span>
-        <span class="k">return</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor_split</span><span class="p">(</span><span class="n">t</span><span class="p">,</span> <span class="n">max_split_size</span><span class="p">,</span> <span class="n">dim</span><span class="o">=</span><span class="n">dim</span><span class="p">)[</span><span class="n">rank</span> <span class="o">//</span> <span class="n">num_groups</span><span class="p">]</span>
-
-    <span class="k">assert</span> <span class="n">max_split_size</span> <span class="o">%</span> <span class="n">world_size</span> <span class="o">==</span> <span class="mi">0</span><span class="p">,</span> <span class="p">(</span>
-        <span class="sa">f</span><span class="s2">&quot;Number of units (</span><span class="si">{</span><span class="n">max_split_size</span><span class="si">}</span><span class="s2">, dim </span><span class="si">{</span><span class="n">dim</span><span class="si">}</span><span class="s2"> size </span><span class="si">{</span><span class="n">t</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="n">dim</span><span class="p">]</span><span class="si">}</span><span class="s2"> / &quot;</span>
-        <span class="sa">f</span><span class="s2">&quot;min_local_shape </span><span class="si">{</span><span class="n">min_local_shape</span><span class="si">}</span><span class="s2">) must be divisible by world_size &quot;</span>
-        <span class="sa">f</span><span class="s2">&quot;(</span><span class="si">{</span><span class="n">world_size</span><span class="si">}</span><span class="s2">). For attention heads, use a world_size that divides &quot;</span>
-        <span class="sa">f</span><span class="s2">&quot;num_heads evenly (e.g. for </span><span class="si">{</span><span class="n">max_split_size</span><span class="si">}</span><span class="s2"> heads, try world_size in &quot;</span>
-        <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="p">[</span><span class="n">d</span><span class="w"> </span><span class="k">for</span><span class="w"> </span><span class="n">d</span><span class="w"> </span><span class="ow">in</span><span class="w"> </span><span class="nb">range</span><span class="p">(</span><span class="mi">2</span><span class="p">,</span><span class="w"> </span><span class="n">max_split_size</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="mi">1</span><span class="p">)</span><span class="w"> </span><span class="k">if</span><span class="w"> </span><span class="n">max_split_size</span><span class="w"> </span><span class="o">%</span><span class="w"> </span><span class="n">d</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="mi">0</span><span class="p">]</span><span class="si">}</span><span class="s2">).&quot;</span>
-    <span class="p">)</span>
-    <span class="k">return</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor_split</span><span class="p">(</span><span class="n">t</span><span class="p">,</span> <span class="n">world_size</span><span class="p">,</span> <span class="n">dim</span><span class="o">=</span><span class="n">dim</span><span class="p">)[</span><span class="n">rank</span><span class="p">]</span>
-
-
-<span class="k">def</span><span class="w"> </span><span class="nf">shard_weight_tensor</span><span class="p">(</span>
-    <span class="n">gm</span><span class="p">:</span> <span class="n">GraphModule</span><span class="p">,</span>
-    <span class="n">weight_tensor</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
-    <span class="n">param_key</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
-    <span class="n">dim</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
-    <span class="n">rank</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
-    <span class="n">world_size</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
-    <span class="n">min_local_shape</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">1</span><span class="p">,</span>
-    <span class="n">fused_weight_dims</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">list</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
-    <span class="n">requires_grad</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
-    <span class="n">custom_shard_fn</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Callable</span><span class="p">[[</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">],</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
-<span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tuple</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">Size</span><span class="p">]:</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;Shard a weight tensor across ranks and register load hook.</span>
-
-<span class="sd">    Args:</span>
-<span class="sd">        gm: GraphModule containing the weight</span>
-<span class="sd">        weight_tensor: The weight tensor to shard</span>
-<span class="sd">        param_key: Parameter key for registering load hook</span>
-<span class="sd">        dim: Dimension to shard along</span>
-<span class="sd">        rank: Current rank</span>
-<span class="sd">        world_size: Total number of ranks</span>
-<span class="sd">        min_local_shape: Minimum local shape constraint (for GQA)</span>
-<span class="sd">        fused_weight_dims: List of dimensions for fused weights</span>
-<span class="sd">        custom_shard_fn: Optional custom function to shard the tensor</span>
-<span class="sd">        requires_grad: Whether the parameter should require gradients</span>
-
-<span class="sd">    Returns:</span>
-<span class="sd">        Tuple of (sharded_tensor, sharded_shape)</span>
-<span class="sd">    &quot;&quot;&quot;</span>
-
-    <span class="c1"># Handle fused weights</span>
-    <span class="k">if</span> <span class="n">fused_weight_dims</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-
-        <span class="k">def</span><span class="w"> </span><span class="nf">f_split</span><span class="p">(</span>
-            <span class="n">t</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span>
-            <span class="n">fused_dims</span><span class="p">:</span> <span class="nb">list</span> <span class="o">=</span> <span class="n">fused_weight_dims</span><span class="p">,</span>
-            <span class="n">d</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="n">dim</span><span class="p">,</span>
-        <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
-            <span class="k">return</span> <span class="n">torch</span><span class="o">.</span><span class="n">cat</span><span class="p">(</span>
-                <span class="p">[</span>
-                    <span class="n">_split_tensor_for_tp</span><span class="p">(</span><span class="n">w</span><span class="p">,</span> <span class="n">dim</span><span class="p">,</span> <span class="n">rank</span><span class="p">,</span> <span class="n">world_size</span><span class="p">,</span> <span class="n">min_local_shape</span><span class="p">)</span>
-                    <span class="k">for</span> <span class="n">w</span> <span class="ow">in</span> <span class="n">torch</span><span class="o">.</span><span class="n">split</span><span class="p">(</span><span class="n">t</span><span class="p">,</span> <span class="n">fused_dims</span><span class="p">,</span> <span class="n">dim</span><span class="o">=</span><span class="n">d</span><span class="p">)</span>
-                <span class="p">],</span>
-                <span class="n">dim</span><span class="o">=</span><span class="n">d</span><span class="p">,</span>
-            <span class="p">)</span>
-
-    <span class="k">else</span><span class="p">:</span>
-        <span class="n">f_split</span> <span class="o">=</span> <span class="n">partial</span><span class="p">(</span>
-            <span class="n">_split_tensor_for_tp</span><span class="p">,</span>
-            <span class="n">dim</span><span class="o">=</span><span class="n">dim</span><span class="p">,</span>
-            <span class="n">rank</span><span class="o">=</span><span class="n">rank</span><span class="p">,</span>
-            <span class="n">world_size</span><span class="o">=</span><span class="n">world_size</span><span class="p">,</span>
-            <span class="n">min_local_shape</span><span class="o">=</span><span class="n">min_local_shape</span><span class="p">,</span>
-        <span class="p">)</span>
-
-    <span class="n">sharded_weight</span> <span class="o">=</span> <span class="n">f_split</span><span class="p">(</span><span class="n">weight_tensor</span><span class="p">)</span>
-    <span class="n">sharded_shape</span> <span class="o">=</span> <span class="n">sharded_weight</span><span class="o">.</span><span class="n">shape</span>
-
-    <span class="c1"># Update the parameter in the module</span>
-    <span class="n">modname</span><span class="p">,</span> <span class="n">_</span><span class="p">,</span> <span class="n">param_name</span> <span class="o">=</span> <span class="n">param_key</span><span class="o">.</span><span class="n">rpartition</span><span class="p">(</span><span class="s2">&quot;.&quot;</span><span class="p">)</span>
-    <span class="n">submod</span> <span class="o">=</span> <span class="n">gm</span><span class="o">.</span><span class="n">get_submodule</span><span class="p">(</span><span class="n">modname</span><span class="p">)</span>
-
-    <span class="c1"># Register load hook on the owning submodule (not the top-level gm).</span>
-    <span class="c1"># This ensures the hook runs *after* any parent-level hooks that transform</span>
-    <span class="c1"># the state_dict (e.g., unfusing fused MoE checkpoint weights into</span>
-    <span class="c1"># individual expert keys). With the hook on gm, it would run before</span>
-    <span class="c1"># unfusing and fail to find the individual expert keys.</span>
-    <span class="n">hook</span> <span class="o">=</span> <span class="n">partial</span><span class="p">(</span>
-        <span class="n">_load_hook</span><span class="p">,</span>
-        <span class="n">f_split</span><span class="o">=</span><span class="n">f_split</span><span class="p">,</span>
-        <span class="n">param_key</span><span class="o">=</span><span class="n">param_name</span><span class="p">,</span>
-        <span class="n">param_shape</span><span class="o">=</span><span class="n">sharded_shape</span><span class="p">,</span>
-    <span class="p">)</span>
-    <span class="n">submod</span><span class="o">.</span><span class="n">_register_load_state_dict_pre_hook</span><span class="p">(</span>
-        <span class="n">mark_pipeline_cache_hook</span><span class="p">(</span>
-            <span class="n">hook</span><span class="p">,</span>
-            <span class="p">{</span>
-                <span class="s2">&quot;type&quot;</span><span class="p">:</span> <span class="s2">&quot;shard_tp&quot;</span><span class="p">,</span>
-                <span class="s2">&quot;param_key&quot;</span><span class="p">:</span> <span class="n">param_name</span><span class="p">,</span>
-                <span class="s2">&quot;param_shape&quot;</span><span class="p">:</span> <span class="nb">list</span><span class="p">(</span><span class="n">sharded_shape</span><span class="p">),</span>
-                <span class="s2">&quot;dim&quot;</span><span class="p">:</span> <span class="n">dim</span><span class="p">,</span>
-                <span class="s2">&quot;rank&quot;</span><span class="p">:</span> <span class="n">rank</span><span class="p">,</span>
-                <span class="s2">&quot;world_size&quot;</span><span class="p">:</span> <span class="n">world_size</span><span class="p">,</span>
-                <span class="s2">&quot;min_local_shape&quot;</span><span class="p">:</span> <span class="n">min_local_shape</span><span class="p">,</span>
-                <span class="s2">&quot;fused_weight_dims&quot;</span><span class="p">:</span> <span class="nb">list</span><span class="p">(</span><span class="n">fused_weight_dims</span><span class="p">)</span> <span class="k">if</span> <span class="n">fused_weight_dims</span> <span class="k">else</span> <span class="kc">None</span><span class="p">,</span>
-            <span class="p">},</span>
-        <span class="p">)</span>
-    <span class="p">)</span>
-    <span class="n">param_new</span> <span class="o">=</span> <span class="n">nn</span><span class="o">.</span><span class="n">Parameter</span><span class="p">(</span><span class="n">sharded_weight</span><span class="o">.</span><span class="n">detach</span><span class="p">()</span><span class="o">.</span><span class="n">clone</span><span class="p">(),</span> <span class="n">requires_grad</span><span class="o">=</span><span class="n">requires_grad</span><span class="p">)</span>
-    <span class="nb">setattr</span><span class="p">(</span><span class="n">submod</span><span class="p">,</span> <span class="n">param_name</span><span class="p">,</span> <span class="n">param_new</span><span class="p">)</span>
-
-    <span class="k">return</span> <span class="n">sharded_weight</span><span class="p">,</span> <span class="n">sharded_shape</span>
 
 
 <span class="k">def</span><span class="w"> </span><span class="nf">_shard_parameter_node</span><span class="p">(</span>
@@ -2923,10 +2833,12 @@ window.runMermaid = runMermaid;</script>
     <span class="c1"># `strategy` is required on the trtllm op (no default) so the caller cannot</span>
     <span class="c1"># accidentally drop the AD-config-selected strategy. The torch op is a plain</span>
     <span class="c1"># torch.distributed all_gather and intentionally has no strategy/symm_mem.</span>
-    <span class="k">if</span> <span class="n">all_gather_op</span> <span class="ow">is</span> <span class="n">torch</span><span class="o">.</span><span class="n">ops</span><span class="o">.</span><span class="n">auto_deploy</span><span class="o">.</span><span class="n">trtllm_dist_all_gather</span><span class="o">.</span><span class="n">default</span><span class="p">:</span>
-        <span class="n">allgather_args</span> <span class="o">=</span> <span class="p">(</span><span class="n">config</span><span class="o">.</span><span class="n">allgather_strategy</span><span class="o">.</span><span class="n">name</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
-    <span class="k">else</span><span class="p">:</span>
+    <span class="c1"># Compare against the always-registered torch op so standalone mode never</span>
+    <span class="c1"># probes the optional TRT-LLM op merely to determine the call signature.</span>
+    <span class="k">if</span> <span class="n">all_gather_op</span> <span class="ow">is</span> <span class="n">torch</span><span class="o">.</span><span class="n">ops</span><span class="o">.</span><span class="n">auto_deploy</span><span class="o">.</span><span class="n">torch_dist_all_gather</span><span class="o">.</span><span class="n">default</span><span class="p">:</span>
         <span class="n">allgather_args</span> <span class="o">=</span> <span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">,)</span>
+    <span class="k">else</span><span class="p">:</span>
+        <span class="n">allgather_args</span> <span class="o">=</span> <span class="p">(</span><span class="n">config</span><span class="o">.</span><span class="n">allgather_strategy</span><span class="o">.</span><span class="n">name</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
     <span class="n">dist_lookup</span> <span class="o">=</span> <span class="p">{</span>
         <span class="mi">0</span><span class="p">:</span> <span class="p">(</span><span class="n">all_gather_op</span><span class="p">,</span> <span class="o">*</span><span class="n">allgather_args</span><span class="p">),</span>
         <span class="mi">1</span><span class="p">:</span> <span class="p">(</span><span class="n">all_reduce_op</span><span class="p">,</span> <span class="n">allreduce_strategy</span><span class="p">),</span>
@@ -3229,13 +3141,6 @@ window.runMermaid = runMermaid;</script>
     <span class="c1"># (Will be used inside the op to determine enable_alltoall and workspace size)</span>
     <span class="n">mapping_config</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">dist_config</span><span class="o">.</span><span class="n">serialize</span><span class="p">()</span>
 
-    <span class="c1"># Look up batch_info_host placeholder if present. ShardingTransformExecutor</span>
-    <span class="c1"># ensures it&#39;s added/activated when there are EP transforms; if it&#39;s missing</span>
-    <span class="c1"># (e.g., a different code path bypasses the executor), the MoE op falls back</span>
-    <span class="c1"># to max_num_tokens for runtime padding.</span>
-    <span class="n">batch_info_host_nodes</span> <span class="o">=</span> <span class="n">gm</span><span class="o">.</span><span class="n">graph</span><span class="o">.</span><span class="n">find_nodes</span><span class="p">(</span><span class="n">op</span><span class="o">=</span><span class="s2">&quot;placeholder&quot;</span><span class="p">,</span> <span class="n">target</span><span class="o">=</span><span class="s2">&quot;batch_info_host&quot;</span><span class="p">)</span>
-    <span class="n">batch_info_host_node</span> <span class="o">=</span> <span class="n">batch_info_host_nodes</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="k">if</span> <span class="n">batch_info_host_nodes</span> <span class="k">else</span> <span class="kc">None</span>
-
     <span class="c1"># Write back weight/scale list updates (applied above) and inject mapping args.</span>
     <span class="c1"># set_op_args uses the op schema to place values into kwargs or the correct</span>
     <span class="c1"># positional slot, avoiding manual index arithmetic.</span>
@@ -3244,7 +3149,6 @@ window.runMermaid = runMermaid;</script>
         <span class="n">node</span><span class="p">,</span>
         <span class="n">mapping_config</span><span class="o">=</span><span class="n">mapping_config</span><span class="p">,</span>
         <span class="n">max_num_tokens</span><span class="o">=</span><span class="n">config</span><span class="o">.</span><span class="n">max_num_tokens</span><span class="p">,</span>
-        <span class="n">batch_info_host</span><span class="o">=</span><span class="n">batch_info_host_node</span><span class="p">,</span>
     <span class="p">)</span>
 
     <span class="k">if</span> <span class="ow">not</span> <span class="n">enable_alltoall</span><span class="p">:</span>
@@ -3838,13 +3742,19 @@ window.runMermaid = runMermaid;</script>
     <span class="c1"># extract o_proj node</span>
     <span class="n">o_proj</span> <span class="o">=</span> <span class="n">layer_subgraph</span><span class="o">.</span><span class="n">terminating_node</span>
 
-    <span class="c1"># add the sharding strategies for the q_a_proj and kv_a_proj nodes</span>
-    <span class="n">num_simple_shards</span> <span class="o">=</span> <span class="n">_process_simple_shard</span><span class="p">(</span>
-        <span class="p">[</span><span class="n">q_a_proj</span><span class="p">,</span> <span class="n">kv_a_proj</span><span class="p">],</span> <span class="n">transform_container</span><span class="p">,</span> <span class="n">layer_type</span><span class="o">=</span><span class="n">LayerType</span><span class="o">.</span><span class="n">MLA</span>
-    <span class="p">)</span>
-    <span class="k">if</span> <span class="n">num_simple_shards</span> <span class="o">&lt;</span> <span class="mi">2</span><span class="p">:</span>
-        <span class="c1"># it means that &quot;someone else&quot; already sharded these nodes. Skipping.</span>
-        <span class="k">return</span> <span class="mi">0</span>
+    <span class="c1"># Simple-shard the q_a_proj/kv_a_proj opening linears (replicated output).</span>
+    <span class="c1"># Nodes excluded via exclude_shard_node_filter stay replicated. add() dedups</span>
+    <span class="c1"># nodes an earlier sharding source already touched, so we always continue to</span>
+    <span class="c1"># q_b/kv_b/o_proj instead of aborting the layer. The filter matches the WEIGHT</span>
+    <span class="c1"># name (e.g. &quot;q_a_proj&quot;), not the FX linear-node name, so resolve it.</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">_excl_name</span><span class="p">(</span><span class="n">n</span><span class="p">):</span>
+        <span class="n">w</span> <span class="o">=</span> <span class="n">extract_weight_name</span><span class="p">(</span><span class="n">n</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">w</span> <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">w</span><span class="p">,</span> <span class="nb">str</span><span class="p">)</span> <span class="k">else</span> <span class="n">n</span><span class="o">.</span><span class="n">name</span>
+
+    <span class="n">a_proj_candidates</span> <span class="o">=</span> <span class="p">[</span><span class="n">q_a_proj</span><span class="p">,</span> <span class="n">kv_a_proj</span><span class="p">]</span>
+    <span class="n">a_proj_to_shard</span> <span class="o">=</span> <span class="p">[</span><span class="n">n</span> <span class="k">for</span> <span class="n">n</span> <span class="ow">in</span> <span class="n">a_proj_candidates</span> <span class="k">if</span> <span class="ow">not</span> <span class="n">_is_node_excluded</span><span class="p">(</span><span class="n">_excl_name</span><span class="p">(</span><span class="n">n</span><span class="p">),</span> <span class="n">config</span><span class="p">)]</span>
+    <span class="k">if</span> <span class="n">a_proj_to_shard</span><span class="p">:</span>
+        <span class="n">_process_simple_shard</span><span class="p">(</span><span class="n">a_proj_to_shard</span><span class="p">,</span> <span class="n">transform_container</span><span class="p">,</span> <span class="n">layer_type</span><span class="o">=</span><span class="n">LayerType</span><span class="o">.</span><span class="n">MLA</span><span class="p">)</span>
 
     <span class="c1"># extract the sub-subgraph from q_b_proj and kv_b_proj to o_proj</span>
     <span class="n">sub_subgraph</span> <span class="o">=</span> <span class="n">subgraph</span><span class="p">(</span>
@@ -3923,7 +3833,7 @@ window.runMermaid = runMermaid;</script>
 
 <span class="k">def</span><span class="w"> </span><span class="nf">_determine_fused_weight_dims</span><span class="p">(</span>
     <span class="n">linear_nodes</span><span class="p">:</span> <span class="n">List</span><span class="p">[</span><span class="n">Node</span><span class="p">],</span>
-<span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">list</span><span class="p">]:</span>
 <span class="w">    </span><span class="sd">&quot;&quot;&quot;</span>
 <span class="sd">    Determine the fused weight dims for the given linear nodes and subgraph nodes.</span>
 <span class="sd">    &quot;&quot;&quot;</span>
@@ -3967,6 +3877,8 @@ window.runMermaid = runMermaid;</script>
             <span class="n">num_chunks</span> <span class="o">=</span> <span class="n">linear_chunk_users</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">args</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span>
             <span class="n">weight_dim</span> <span class="o">=</span> <span class="n">linear_node</span><span class="o">.</span><span class="n">meta</span><span class="p">[</span><span class="s2">&quot;val&quot;</span><span class="p">]</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">2</span><span class="p">]</span>
             <span class="n">fused_weight_dims</span> <span class="o">=</span> <span class="p">[</span><span class="n">weight_dim</span> <span class="o">//</span> <span class="n">num_chunks</span><span class="p">]</span> <span class="o">*</span> <span class="n">num_chunks</span>
+
+    <span class="k">return</span> <span class="n">fused_weight_dims</span>
 
 
 <span class="k">def</span><span class="w"> </span><span class="nf">_find_upstream_qk_proj</span><span class="p">(</span><span class="n">node</span><span class="p">:</span> <span class="n">Node</span><span class="p">,</span> <span class="n">gm</span><span class="p">:</span> <span class="n">GraphModule</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]:</span>
@@ -4759,8 +4671,8 @@ window.runMermaid = runMermaid;</script>
   
 
   <!-- Scripts loaded after <body> so the DOM is not blocked -->
-  <script defer src="../../../../../../_static/scripts/bootstrap.js?digest=a95f357e85573c9b56d5"></script>
-<script defer src="../../../../../../_static/scripts/pydata-sphinx-theme.js?digest=a95f357e85573c9b56d5"></script>
+  <script defer src="../../../../../../_static/scripts/bootstrap.js?digest=90905a2f556bf617f1a9"></script>
+<script defer src="../../../../../../_static/scripts/pydata-sphinx-theme.js?digest=90905a2f556bf617f1a9"></script>
 
 
   <footer class="bd-footer">
@@ -4832,9 +4744,9 @@ window.runMermaid = runMermaid;</script>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on June 27, 2026.</p>
+  <p>Last updated on July 14, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/c25c23f">c25c23f</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/1662a87">1662a87</a>.</p>
   
 </div></div>
       

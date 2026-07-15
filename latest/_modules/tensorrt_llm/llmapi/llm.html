@@ -27,8 +27,8 @@
   </noscript>
   
   <!-- Loaded before other Sphinx assets -->
-  <link href="../../../_static/styles/theme.css?digest=a95f357e85573c9b56d5" rel="stylesheet" />
-<link href="../../../_static/styles/pydata-sphinx-theme.css?digest=a95f357e85573c9b56d5" rel="stylesheet" />
+  <link href="../../../_static/styles/theme.css?digest=90905a2f556bf617f1a9" rel="stylesheet" />
+<link href="../../../_static/styles/pydata-sphinx-theme.css?digest=90905a2f556bf617f1a9" rel="stylesheet" />
 
     <link rel="stylesheet" type="text/css" href="../../../_static/pygments.css?v=8f2a1f02" />
     <link rel="stylesheet" type="text/css" href="../../../_static/styles/nvidia-sphinx-theme.css?v=933278ad" />
@@ -39,10 +39,10 @@
     <link rel="stylesheet" type="text/css" href="../../../_static/custom.css?v=19d20f17" />
   
   <!-- So that users can add custom icons -->
-  <script defer src="../../../_static/scripts/fontawesome.js?digest=a95f357e85573c9b56d5"></script>
+  <script defer src="../../../_static/scripts/fontawesome.js?digest=90905a2f556bf617f1a9"></script>
   <!-- Pre-loaded scripts that we'll load fully later -->
-  <link rel="preload" as="script" href="../../../_static/scripts/bootstrap.js?digest=a95f357e85573c9b56d5" />
-<link rel="preload" as="script" href="../../../_static/scripts/pydata-sphinx-theme.js?digest=a95f357e85573c9b56d5" />
+  <link rel="preload" as="script" href="../../../_static/scripts/bootstrap.js?digest=90905a2f556bf617f1a9" />
+<link rel="preload" as="script" href="../../../_static/scripts/pydata-sphinx-theme.js?digest=90905a2f556bf617f1a9" />
 
 
 
@@ -278,6 +278,25 @@ let darkTheme = isDarkTheme();
 let modal = null;
 let modalContent = null;
 let previousScrollOffset = [window.scrollX, window.scrollY];
+let _lazyObserver = null;
+let _renderQueue = Promise.resolve();
+
+// Apply d3 zoom to each SVG. Idempotent: an SVG already wrapped is skipped,
+// so this is safe to call both for the initial batch and for diagrams that
+// render lazily once they become visible.
+const addZoomToSvgs = (svgs) => {
+    svgs.each(function() {
+        if (this.getAttribute('data-zoom-applied') === 'true') return;
+        var svg = d3.select(this);
+        svg.html("<g class='wrapper'>" + svg.html() + "</g>");
+        var inner = svg.select("g");
+        var zoom = d3.zoom().on("zoom", function(event) {
+            inner.attr("transform", event.transform);
+        });
+        svg.call(zoom);
+        this.setAttribute('data-zoom-applied', 'true');
+    });
+};
 
 const runMermaid = async (rerun) => {
     console.log("Running mermaid diagrams, rerun =", rerun);
@@ -285,7 +304,15 @@ const runMermaid = async (rerun) => {
     let all_mermaids = document.querySelectorAll(".mermaid");
 
     if (rerun) {
+        // Disconnect any previous lazy rendering observer
+        if (_lazyObserver) {
+            _lazyObserver.disconnect();
+            _lazyObserver = null;
+        }
+
         all_mermaids.forEach((el) => {
+            el.removeAttribute('data-mermaid-deferred');
+            el.removeAttribute('data-mermaid-render-failed');
             if(!el.hasAttribute("data-original-code")) {
                 // store original code
                 // console.log(`Storing original code for first run: `, el.innerHTML);
@@ -302,35 +329,89 @@ const runMermaid = async (rerun) => {
                 el.setAttribute('data-original-code', el.innerHTML);
             }
         });
-        await mermaid.run();
+
+        // Separate visible and hidden elements. Mermaid's layout engine measures
+        // text dimensions via the DOM, which fails for elements hidden by a parent
+        // (e.g., Reveal.js non-active slides, sphinx-design unopened tabs),
+        // producing broken SVGs. Render visible elements now, defer hidden ones.
+        const visible = [];
+        const hidden = [];
+        all_mermaids.forEach((el) => {
+            // offsetParent is null for display:none ancestors.
+            // getClientRects().length > 0 catches position:fixed elements
+            // (which also have null offsetParent but are still visible).
+            if (el.offsetParent !== null || el.getClientRects().length > 0) {
+                visible.push(el);
+            } else {
+                hidden.push(el);
+                el.setAttribute('data-mermaid-deferred', 'true');
+            }
+        });
+
+        if (visible.length > 0) {
+            try {
+                await mermaid.run({ nodes: visible });
+            } catch (e) {
+                console.error("Mermaid rendering failed:", e);
+            }
+        }
+
+        // Lazily render hidden elements when they become visible.
+        // Uses a promise chain (_renderQueue) to serialize rendering,
+        // since IntersectionObserver may report multiple entries at once
+        // and mermaid.run() is not safe to call concurrently.
+        if (hidden.length > 0) {
+            if (typeof IntersectionObserver === 'undefined') {
+                console.warn("IntersectionObserver not available; hidden mermaid diagrams will not render.");
+            } else {
+                _renderQueue = Promise.resolve();
+                _lazyObserver = new IntersectionObserver((entries) => {
+                    for (const entry of entries) {
+                        if (entry.isIntersecting && entry.target.getAttribute("data-processed") !== "true") {
+                            _lazyObserver.unobserve(entry.target);
+                            const el = entry.target;
+                            _renderQueue = _renderQueue.then(async () => {
+                                try {
+                                    await mermaid.run({ nodes: [el] });
+                                    el.removeAttribute('data-mermaid-deferred');
+                                    // Apply zoom to the now-rendered diagram, matching
+                                    // the decoration visible diagrams receive.
+                                    if ("False" === "True") {
+                                        addZoomToSvgs(d3.selectAll(""));
+                                    }
+                                } catch (e) {
+                                    console.error("Mermaid deferred rendering failed:", e);
+                                    el.removeAttribute('data-mermaid-deferred');
+                                    el.setAttribute('data-mermaid-render-failed', 'true');
+                                }
+                            });
+                        }
+                    }
+                });
+                hidden.forEach((el) => _lazyObserver.observe(el));
+            }
+        }
     }
 
     all_mermaids = document.querySelectorAll(".mermaid");
-    const mermaids_processed = document.querySelectorAll(".mermaid[data-processed='true']");
+    // Exclude deferred (hidden) and render-failed elements from completion checks
+    const mermaids_active = document.querySelectorAll(".mermaid:not([data-mermaid-deferred]):not([data-mermaid-render-failed])");
+    const mermaids_processed = document.querySelectorAll(".mermaid:not([data-mermaid-deferred]):not([data-mermaid-render-failed])[data-processed='true']");
 
     if ("False" === "True") {
-        const mermaids_to_add_zoom = -1 === -1 ? all_mermaids.length : -1;
+        const mermaids_to_add_zoom = -1 === -1 ? mermaids_active.length : -1;
         if(mermaids_to_add_zoom > 0) {
             var svgs = d3.selectAll("");
-            if(all_mermaids.length !== mermaids_processed.length) {
+            // Wait until every active (visible) diagram has rendered. Deferred
+            // diagrams are excluded, so a fixed d3_node_count that counts a
+            // hidden diagram no longer loops forever waiting for its SVG.
+            if(mermaids_active.length !== mermaids_processed.length) {
                 setTimeout(() => runMermaid(false), 200);
                 return;
-            } else if(svgs.size() !== mermaids_to_add_zoom) {
-                setTimeout(() => runMermaid(false), 200);
-                return;
-            } else {
-                svgs.each(function() {
-                    var svg = d3.select(this);
-                    svg.html("<g class='wrapper'>" + svg.html() + "</g>");
-                    var inner = svg.select("g");
-                    var zoom = d3.zoom().on("zoom", function(event) {
-                        inner.attr("transform", event.transform);
-                    });
-                    svg.call(zoom);
-                });
             }
+            addZoomToSvgs(svgs);
         }
-    } else if(all_mermaids.length !== mermaids_processed.length) {
+    } else if(mermaids_active.length !== mermaids_processed.length) {
         // Wait for mermaid to process all diagrams
         setTimeout(() => runMermaid(false), 200);
         return;
@@ -496,9 +577,9 @@ window.addEventListener("load", load);
 window.runMermaid = runMermaid;</script>
     <script>DOCUMENTATION_OPTIONS.pagename = '_modules/tensorrt_llm/llmapi/llm';</script>
     <script>
-        DOCUMENTATION_OPTIONS.theme_version = '0.19.0';
+        DOCUMENTATION_OPTIONS.theme_version = '0.20.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc20';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc21';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -512,7 +593,7 @@ window.runMermaid = runMermaid;</script>
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc20" />
+  <meta name="docsearch:version" content="1.3.0rc21" />
   
     
     <script src="../../../_static/searchtools.js"></script>
@@ -875,6 +956,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/feature-combination-matrix.html">Feature Combination Matrix</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/disagg-serving.html">Disaggregated Serving</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../features/embeddings.html">Embeddings (Encoder-Only Models)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/kvcache.html">KV Cache System</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/long-sequence.html">Long Sequences</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/lora.html">LoRA (Low-Rank Adaptation)</a></li>
@@ -885,6 +967,7 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/quantization.html">Quantization</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/sampling.html">Sampling</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/additional-outputs.html">Additional Outputs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../features/post-processor-hook.html">Post-Processing Hook</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/guided-decoding.html">Guided Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/speculative-decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/checkpoint-loading.html">Checkpoint Loading</a></li>
@@ -924,6 +1007,7 @@ window.runMermaid = runMermaid;</script>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog25_Scaling_Video_Generation_Across_NVL72_Rack_with_TensorRT-LLM.html">Scaling Video Generation Across NVL72 rack with TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog24_MoE_as_Dense_GEMM.html">MoE as Dense GEMM: Optimizing Low-Latency MoE Inference on NVIDIA Blackwell</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog23_Joint_Optimization_of_Agent_Applications_and_TensorRT-LLM.html">Joint Optimization of Agent Applications and TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog22_Helix_Parallelism_Scaling_Multi_Million_Token_Decoding_with_KV_Cache_Sharding.html">Helix Parallelism in TensorRT-LLM: Scaling Multi-Million-Token Decoding with KV Cache Sharding</a></li>
@@ -961,9 +1045,9 @@ window.runMermaid = runMermaid;</script>
 <li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM">Github Code</a></li>
 <li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/issues?q=is%3Aissue%20state%3Aopen%20label%3Aroadmap">Roadmap</a></li>
 </ul>
-<p aria-level="2" class="caption" role="heading"><span class="caption-text">Use TensorRT Engine</span></p>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Migration</span></p>
 <ul class="nav bd-sidenav">
-<li class="toctree-l1"><a class="reference internal" href="../../../legacy/tensorrt_quickstart.html">LLM API with TensorRT Engine</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../legacy/tensorrt-backend-removal.html">Migration Guide: TensorRT Backend Removed</a></li>
 </ul>
 </div>
 </nav></div>
@@ -1022,9 +1106,7 @@ window.runMermaid = runMermaid;</script>
 <span></span><span class="kn">import</span><span class="w"> </span><span class="nn">atexit</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">json</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">os</span>
-<span class="kn">import</span><span class="w"> </span><span class="nn">shutil</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">socket</span>
-<span class="kn">import</span><span class="w"> </span><span class="nn">tempfile</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">time</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">weakref</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">collections.abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">Mapping</span>
@@ -1045,14 +1127,15 @@ window.runMermaid = runMermaid;</script>
 <span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.metrics.enums</span><span class="w"> </span><span class="kn">import</span> <span class="n">MetricNames</span>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">.._utils</span><span class="w"> </span><span class="kn">import</span> <span class="n">nvtx_range_debug</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">..bindings</span><span class="w"> </span><span class="kn">import</span> <span class="n">executor</span> <span class="k">as</span> <span class="n">tllm</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">..bindings</span><span class="w"> </span><span class="kn">import</span> <span class="n">steady_clock_now</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">..builder</span><span class="w"> </span><span class="kn">import</span> <span class="n">EngineConfig</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">..conversation_params</span><span class="w"> </span><span class="kn">import</span> <span class="n">ConversationParams</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">..disaggregated_params</span><span class="w"> </span><span class="kn">import</span> <span class="n">DisaggregatedParams</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">..executor</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span><span class="n">DetokenizedGenerationResultBase</span><span class="p">,</span> <span class="n">GenerationExecutor</span><span class="p">,</span>
                         <span class="n">GenerationResult</span><span class="p">,</span> <span class="n">IterationResult</span><span class="p">,</span> <span class="n">LoRARequest</span><span class="p">,</span>
                         <span class="n">PostprocWorkerConfig</span><span class="p">,</span> <span class="n">PromptAdapterRequest</span><span class="p">)</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">..executor.postproc_worker</span><span class="w"> </span><span class="kn">import</span> <span class="n">PostprocParams</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">..executor.postprocessor_hook</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span><span class="n">PostProcessorHook</span><span class="p">,</span>
+                                           <span class="n">load_post_processor_hook</span><span class="p">)</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">..executor.request</span><span class="w"> </span><span class="kn">import</span> <span class="n">DEFAULT_REQUEST_PRIORITY</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">..executor.utils</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span><span class="n">RequestError</span><span class="p">,</span> <span class="n">create_mpi_comm_session</span><span class="p">,</span>
                               <span class="n">get_spawn_proxy_process_env</span><span class="p">)</span>
@@ -1062,14 +1145,12 @@ window.runMermaid = runMermaid;</script>
 <span class="kn">from</span><span class="w"> </span><span class="nn">..logger</span><span class="w"> </span><span class="kn">import</span> <span class="n">logger</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">..sampling_params</span><span class="w"> </span><span class="kn">import</span> <span class="n">LogitsProcessor</span><span class="p">,</span> <span class="n">SamplingParams</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">..scheduling_params</span><span class="w"> </span><span class="kn">import</span> <span class="n">SchedulingParams</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">.llm_args</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span><span class="n">TORCH_LLMARGS_EXPLICIT_DOCSTRING</span><span class="p">,</span>
-                       <span class="n">TRT_LLMARGS_EXPLICIT_DOCSTRING</span><span class="p">,</span> <span class="n">PeftCacheConfig</span><span class="p">,</span>
-                       <span class="n">PybindMirror</span><span class="p">,</span> <span class="n">TorchLlmArgs</span><span class="p">,</span> <span class="n">TrtLlmArgs</span><span class="p">)</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">.llm_args</span><span class="w"> </span><span class="kn">import</span> <span class="n">TORCH_LLMARGS_EXPLICIT_DOCSTRING</span><span class="p">,</span> <span class="n">TorchLlmArgs</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">.llm_utils</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span><span class="n">CachedModelLoader</span><span class="p">,</span> <span class="n">KvCacheRetentionConfig</span><span class="p">,</span>
-                        <span class="n">LlmBuildStats</span><span class="p">,</span> <span class="n">ModelLoader</span><span class="p">,</span> <span class="n">_ModelRuntimeContext</span><span class="p">)</span>
+                        <span class="n">LlmBuildStats</span><span class="p">,</span> <span class="n">ModelLoader</span><span class="p">)</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">.mpi_session</span><span class="w"> </span><span class="kn">import</span> <span class="n">MpiPoolSession</span><span class="p">,</span> <span class="n">external_mpi_comm_available</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">.thinking_budget</span><span class="w"> </span><span class="kn">import</span> <span class="n">add_thinking_budget_logits_processor</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">.tokenizer</span><span class="w"> </span><span class="kn">import</span> <span class="n">TokenizerBase</span><span class="p">,</span> <span class="n">_xgrammar_tokenizer_info</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">.tokenizer</span><span class="w"> </span><span class="kn">import</span> <span class="n">TokenizerBase</span>
 <span class="c1"># TODO[chunweiy]: move the following symbols back to utils scope, and remove the following import</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">.utils</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span><span class="n">append_docstring</span><span class="p">,</span> <span class="n">exception_handler</span><span class="p">,</span> <span class="n">get_device_count</span><span class="p">,</span>
                     <span class="n">logger_debug</span><span class="p">,</span> <span class="n">set_api_status</span><span class="p">)</span>
@@ -1102,15 +1183,20 @@ window.runMermaid = runMermaid;</script>
 
     <span class="nd">@classmethod</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">_from_generation_result</span><span class="p">(</span>
-            <span class="bp">cls</span><span class="p">,</span>
-            <span class="n">generation_result</span><span class="p">:</span> <span class="n">GenerationResult</span><span class="p">,</span>
-            <span class="n">prompt</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
-            <span class="n">tokenizer</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">TokenizerBase</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s1">&#39;RequestOutput&#39;</span><span class="p">:</span>
+        <span class="bp">cls</span><span class="p">,</span>
+        <span class="n">generation_result</span><span class="p">:</span> <span class="n">GenerationResult</span><span class="p">,</span>
+        <span class="n">prompt</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">tokenizer</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">TokenizerBase</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">post_processor_hook</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">PostProcessorHook</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="s1">&#39;RequestOutput&#39;</span><span class="p">:</span>
         <span class="n">inst</span> <span class="o">=</span> <span class="bp">cls</span><span class="o">.</span><span class="fm">__new__</span><span class="p">(</span><span class="bp">cls</span><span class="p">)</span>
         <span class="n">inst</span><span class="o">.</span><span class="vm">__dict__</span><span class="o">.</span><span class="n">update</span><span class="p">(</span><span class="n">generation_result</span><span class="o">.</span><span class="vm">__dict__</span><span class="p">)</span>
         <span class="n">inst</span><span class="o">.</span><span class="n">tokenizer</span> <span class="o">=</span> <span class="n">tokenizer</span>
         <span class="n">inst</span><span class="o">.</span><span class="n">_streaming</span> <span class="o">=</span> <span class="n">generation_result</span><span class="o">.</span><span class="n">_streaming</span>
         <span class="n">inst</span><span class="o">.</span><span class="n">_prompt</span> <span class="o">=</span> <span class="n">prompt</span>
+        <span class="c1"># User post-processing hook; threaded onto the result the</span>
+        <span class="c1"># user holds, where the in-proxy detok runs. None when unconfigured.</span>
+        <span class="n">inst</span><span class="o">.</span><span class="n">_post_processor_hook</span> <span class="o">=</span> <span class="n">post_processor_hook</span>
         <span class="k">return</span> <span class="n">inst</span>
 
     <span class="nd">@property</span>
@@ -1222,15 +1308,6 @@ window.runMermaid = runMermaid;</script>
     <span class="k">return</span> <span class="kc">False</span>
 
 
-<span class="n">TRT_LLM_DOCSTRING</span> <span class="o">=</span> <span class="n">TRT_LLMARGS_EXPLICIT_DOCSTRING</span> <span class="o">+</span> <span class="s2">&quot;&quot;&quot;</span>
-
-<span class="s2">    Attributes:</span>
-<span class="s2">        tokenizer (tensorrt_llm.llmapi.tokenizer.TokenizerBase, optional): The tokenizer loaded by LLM instance, if any.</span>
-<span class="s2">        workspace (pathlib.Path): The directory to store intermediate files.</span>
-<span class="s2">        llm_id (str): The unique ID of the LLM instance.</span>
-<span class="s2">        disaggregated_params (dict): The disaggregated parameters of the LLM instance.</span>
-<span class="s2">&quot;&quot;&quot;</span>
-
 <span class="n">TORCH_LLM_DOCSTRING</span> <span class="o">=</span> <span class="n">TORCH_LLMARGS_EXPLICIT_DOCSTRING</span> <span class="o">+</span> <span class="s2">&quot;&quot;&quot;</span>
 
 <span class="s2">    Attributes:</span>
@@ -1298,8 +1375,9 @@ window.runMermaid = runMermaid;</script>
                     <span class="n">LlmArgs</span> <span class="k">as</span> <span class="n">AutoDeployLlmArgs</span>
                 <span class="n">llm_args_cls</span> <span class="o">=</span> <span class="n">AutoDeployLlmArgs</span>
             <span class="k">else</span><span class="p">:</span>
-                <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span><span class="s2">&quot;Using LLM with TensorRT backend&quot;</span><span class="p">)</span>
-                <span class="n">llm_args_cls</span> <span class="o">=</span> <span class="n">TrtLlmArgs</span>
+                <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                    <span class="sa">f</span><span class="s2">&quot;Unknown backend: </span><span class="si">{</span><span class="n">backend</span><span class="si">!r}</span><span class="s2">. Supported backends are &quot;</span>
+                    <span class="s2">&quot;&#39;pytorch&#39; and &#39;_autodeploy&#39;.&quot;</span><span class="p">)</span>
 
             <span class="c1"># check the kwargs and raise ValueError directly</span>
             <span class="n">valid_keys</span> <span class="o">=</span> <span class="nb">set</span><span class="p">(</span>
@@ -1333,6 +1411,18 @@ window.runMermaid = runMermaid;</script>
         <span class="n">logger_debug</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;LLM.args.mpi_session: </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">mpi_session</span><span class="si">}</span><span class="se">\n</span><span class="s2">&quot;</span><span class="p">,</span>
                      <span class="s2">&quot;yellow&quot;</span><span class="p">)</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">mpi_session</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">mpi_session</span>
+        <span class="c1"># Keep the live session on LLM only. LLM args are passed to model-build</span>
+        <span class="c1"># tasks and executor workers, and MpiSession objects are not pickleable.</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">mpi_session</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_owns_mpi_session</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">mpi_session</span> <span class="ow">is</span> <span class="kc">None</span>
+
+        <span class="c1"># Build this LLM&#39;s post-processing hook for the in-proxy detok path (each</span>
+        <span class="c1"># postproc worker builds its own). Resolving here fails fast on a bad</span>
+        <span class="c1"># import path at startup rather than per-request.</span>
+        <span class="n">_post_processor_path</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="p">,</span> <span class="s2">&quot;post_processor_hook&quot;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_post_processor_hook</span> <span class="o">=</span> <span class="p">(</span>
+            <span class="n">load_post_processor_hook</span><span class="p">(</span><span class="n">_post_processor_path</span><span class="p">)</span>
+            <span class="k">if</span> <span class="n">_post_processor_path</span> <span class="k">else</span> <span class="kc">None</span><span class="p">)</span>
 
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">parallel_config</span><span class="o">.</span><span class="n">is_multi_gpu</span><span class="p">:</span>
             <span class="k">if</span> <span class="n">os</span><span class="o">.</span><span class="n">getenv</span><span class="p">(</span><span class="s2">&quot;RAY_LOCAL_WORLD_SIZE&quot;</span><span class="p">)</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">get_device_count</span><span class="p">(</span>
@@ -1344,6 +1434,8 @@ window.runMermaid = runMermaid;</script>
             <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span>
                 <span class="sa">f</span><span class="s1">&#39;start MpiSession with </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">parallel_config</span><span class="o">.</span><span class="n">world_size</span><span class="si">}</span><span class="s1"> workers&#39;</span>
             <span class="p">)</span>
+            <span class="c1"># _owns_mpi_session is already True here: this branch only runs</span>
+            <span class="c1"># when no external session was supplied.</span>
             <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">mpi_session</span><span class="p">:</span>
                 <span class="n">mpi_process_pre_spawned</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">get_spawn_proxy_process_env</span><span class="p">()</span>
                 <span class="k">if</span> <span class="ow">not</span> <span class="n">mpi_process_pre_spawned</span><span class="p">:</span>
@@ -1361,22 +1453,19 @@ window.runMermaid = runMermaid;</script>
             <span class="bp">self</span><span class="o">.</span><span class="n">_executor</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">GenerationExecutor</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_encode_only</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_encoder_executor</span> <span class="o">=</span> <span class="kc">None</span>
-            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_on_trt_backend</span><span class="p">:</span>
-                <span class="bp">self</span><span class="o">.</span><span class="n">_workspace</span> <span class="o">=</span> <span class="n">tempfile</span><span class="o">.</span><span class="n">TemporaryDirectory</span><span class="p">(</span>
-                    <span class="n">suffix</span><span class="o">=</span><span class="s2">&quot;-llm-workspace&quot;</span><span class="p">,</span> <span class="nb">dir</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">workspace</span><span class="p">)</span>
-            <span class="k">else</span><span class="p">:</span>
-                <span class="bp">self</span><span class="o">.</span><span class="n">_workspace</span> <span class="o">=</span> <span class="kc">None</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_workspace</span> <span class="o">=</span> <span class="kc">None</span>
 
             <span class="bp">self</span><span class="o">.</span><span class="n">_hf_model_dir</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Path</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_hf_model_config</span> <span class="o">=</span> <span class="kc">None</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_generation_config</span> <span class="o">=</span> <span class="kc">None</span>
 
-            <span class="bp">self</span><span class="o">.</span><span class="n">runtime_context</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">_ModelRuntimeContext</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">llm_build_stats</span> <span class="o">=</span> <span class="n">LlmBuildStats</span><span class="p">()</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_build_model</span><span class="p">()</span>
 
         <span class="k">except</span> <span class="ne">Exception</span><span class="p">:</span>
-            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">mpi_session</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="c1"># _owns_mpi_session is assigned before this try block, so it is</span>
+            <span class="c1"># always present here.</span>
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">mpi_session</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">_owns_mpi_session</span><span class="p">:</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">mpi_session</span><span class="o">.</span><span class="n">shutdown</span><span class="p">()</span>
             <span class="k">raise</span>
 
@@ -1516,6 +1605,8 @@ window.runMermaid = runMermaid;</script>
             <span class="n">DisaggregatedParams</span><span class="p">,</span> <span class="n">Sequence</span><span class="p">[</span><span class="n">DisaggregatedParams</span><span class="p">]]]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
         <span class="n">scheduling_params</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Union</span><span class="p">[</span><span class="n">SchedulingParams</span><span class="p">,</span>
                                           <span class="n">List</span><span class="p">[</span><span class="n">SchedulingParams</span><span class="p">]]]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">conversation_params</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Union</span><span class="p">[</span><span class="n">ConversationParams</span><span class="p">,</span>
+                                            <span class="n">List</span><span class="p">[</span><span class="n">ConversationParams</span><span class="p">]]]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
         <span class="n">cache_salt</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Union</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Sequence</span><span class="p">[</span><span class="nb">str</span><span class="p">]]]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
         <span class="n">priority</span><span class="p">:</span> <span class="n">Union</span><span class="p">[</span><span class="nb">float</span><span class="p">,</span> <span class="n">List</span><span class="p">[</span><span class="nb">float</span><span class="p">]]</span> <span class="o">=</span> <span class="n">DEFAULT_REQUEST_PRIORITY</span><span class="p">,</span>
     <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Union</span><span class="p">[</span><span class="n">RequestOutput</span><span class="p">,</span> <span class="n">List</span><span class="p">[</span><span class="n">RequestOutput</span><span class="p">]]:</span>
@@ -1538,11 +1629,13 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">                Disaggregated parameters. Defaults to None.</span>
 <span class="sd">            scheduling_params (tensorrt_llm.scheduling_params.SchedulingParams, List[tensorrt_llm.scheduling_params.SchedulingParams], optional):</span>
 <span class="sd">                Scheduling parameters. Defaults to None.</span>
+<span class="sd">            conversation_params (tensorrt_llm.conversation_params.ConversationParams, List[tensorrt_llm.conversation_params.ConversationParams], optional):</span>
+<span class="sd">                Conversation parameters. Defaults to None.</span>
 <span class="sd">            cache_salt (str, Sequence[str], optional): If specified, KV cache will be salted with the provided string to limit the kv cache reuse to the requests with the same string. Defaults to None.</span>
 <span class="sd">            priority (float, List[float]): The scheduling priority for the request(s), in the range [0, 1]. Higher values indicate higher priority. Defaults to 0.5.</span>
 
 <span class="sd">        Returns:</span>
-<span class="sd">            Union[tensorrt_llm.llmapi.RequestOutput, List[tensorrt_llm.llmapi.RequestOutput]]: The output data of the completion request to the LLM.</span>
+<span class="sd">            Union[tensorrt_llm.llmapi.llm.RequestOutput, List[tensorrt_llm.llmapi.llm.RequestOutput]]: The output data of the completion request to the LLM.</span>
 <span class="sd">        &quot;&quot;&quot;</span>
         <span class="n">unbatched</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_is_unbatched_optional_inputs</span><span class="p">(</span><span class="n">inputs</span><span class="p">)</span>
         <span class="k">if</span> <span class="n">inputs</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">unbatched</span><span class="p">:</span>
@@ -1582,6 +1675,7 @@ window.runMermaid = runMermaid;</script>
                     <span class="n">kv_cache_retention_config</span><span class="p">,</span> <span class="n">i</span><span class="p">),</span>
                 <span class="n">disaggregated_params</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_item_at</span><span class="p">(</span><span class="n">disaggregated_params</span><span class="p">,</span> <span class="n">i</span><span class="p">),</span>
                 <span class="n">scheduling_params</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_item_at</span><span class="p">(</span><span class="n">scheduling_params</span><span class="p">,</span> <span class="n">i</span><span class="p">),</span>
+                <span class="n">conversation_params</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_item_at</span><span class="p">(</span><span class="n">conversation_params</span><span class="p">,</span> <span class="n">i</span><span class="p">),</span>
                 <span class="n">cache_salt</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_item_at</span><span class="p">(</span><span class="n">cache_salt</span><span class="p">,</span> <span class="n">i</span><span class="p">),</span>
                 <span class="n">priority</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_item_at</span><span class="p">(</span><span class="n">priority</span><span class="p">,</span> <span class="n">i</span><span class="p">),</span>
                 <span class="n">streaming</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
@@ -1612,6 +1706,7 @@ window.runMermaid = runMermaid;</script>
         <span class="n">trace_headers</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">str</span><span class="p">]]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
         <span class="n">_postproc_params</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">PostprocParams</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
         <span class="n">scheduling_params</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">SchedulingParams</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">conversation_params</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">ConversationParams</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
         <span class="n">cache_salt</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
         <span class="n">priority</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="n">DEFAULT_REQUEST_PRIORITY</span><span class="p">,</span>
     <span class="p">)</span> <span class="o">-&gt;</span> <span class="n">RequestOutput</span><span class="p">:</span>
@@ -1629,11 +1724,12 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">            disaggregated_params (tensorrt_llm.disaggregated_params.DisaggregatedParams, optional): Disaggregated parameters. Defaults to None.</span>
 <span class="sd">            trace_headers (Mapping[str, str], optional): Trace headers. Defaults to None.</span>
 <span class="sd">            scheduling_params (tensorrt_llm.scheduling_params.SchedulingParams, optional): Scheduling parameters. Defaults to None.</span>
+<span class="sd">            conversation_params (tensorrt_llm.conversation_params.ConversationParams, optional): Conversation parameters. Defaults to None.</span>
 <span class="sd">            cache_salt (str, optional): If specified, KV cache will be salted with the provided string to limit the kv cache reuse to the requests with the same string. Defaults to None.</span>
 <span class="sd">            priority (float): The scheduling priority for the request, in the range [0, 1]. Higher values indicate higher priority. Defaults to 0.5.</span>
 
 <span class="sd">        Returns:</span>
-<span class="sd">            tensorrt_llm.llmapi.RequestOutput: The output data of the completion request to the LLM.</span>
+<span class="sd">            tensorrt_llm.llmapi.llm.RequestOutput: The output data of the completion request to the LLM.</span>
 <span class="sd">        &quot;&quot;&quot;</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_encode_only</span><span class="p">:</span>
             <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span>
@@ -1648,11 +1744,10 @@ window.runMermaid = runMermaid;</script>
 
         <span class="c1"># With pytorch backend, py_executor has logic to handle max_tokens of 1,</span>
         <span class="c1"># so set to 1 to avoid allocating unnecessary KV cache blocks for single request</span>
-        <span class="c1"># TODO: Also support for trt backend</span>
         <span class="n">is_ctx_only</span> <span class="o">=</span> <span class="n">disaggregated_params</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">disaggregated_params</span><span class="o">.</span><span class="n">request_type</span> <span class="o">==</span> <span class="s2">&quot;context_only&quot;</span>
         <span class="n">is_gen_only</span> <span class="o">=</span> <span class="n">disaggregated_params</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">disaggregated_params</span><span class="o">.</span><span class="n">request_type</span> <span class="o">==</span> <span class="s2">&quot;generation_only&quot;</span>
 
-        <span class="k">if</span> <span class="n">is_ctx_only</span> <span class="ow">and</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">_on_trt_backend</span><span class="p">:</span>
+        <span class="k">if</span> <span class="n">is_ctx_only</span><span class="p">:</span>
             <span class="n">sampling_params</span><span class="o">.</span><span class="n">max_tokens</span> <span class="o">=</span> <span class="mi">1</span>
 
         <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">inputs</span><span class="p">,</span> <span class="n">PreprocessedInputs</span><span class="p">):</span>
@@ -1698,6 +1793,7 @@ window.runMermaid = runMermaid;</script>
             <span class="n">postproc_params</span><span class="o">=</span><span class="n">_postproc_params</span><span class="p">,</span>
             <span class="n">multimodal_params</span><span class="o">=</span><span class="n">multimodal_params</span><span class="p">,</span>
             <span class="n">scheduling_params</span><span class="o">=</span><span class="n">scheduling_params</span><span class="p">,</span>
+            <span class="n">conversation_params</span><span class="o">=</span><span class="n">conversation_params</span><span class="p">,</span>
             <span class="n">cache_salt</span><span class="o">=</span><span class="n">cache_salt</span><span class="p">,</span>
             <span class="n">arrival_time</span><span class="o">=</span><span class="n">arrival_time</span><span class="p">,</span>
             <span class="n">encoder_input_token_ids</span><span class="o">=</span><span class="n">encoder_input_token_ids</span><span class="p">,</span>
@@ -1708,8 +1804,11 @@ window.runMermaid = runMermaid;</script>
             <span class="n">result</span><span class="o">.</span><span class="n">metrics_dict</span><span class="o">.</span><span class="n">update</span><span class="p">(</span>
                 <span class="p">{</span><span class="n">MetricNames</span><span class="o">.</span><span class="n">ARRIVAL_TIMESTAMP</span><span class="p">:</span> <span class="n">time</span><span class="o">.</span><span class="n">time</span><span class="p">()})</span>
 
-        <span class="k">return</span> <span class="n">RequestOutput</span><span class="o">.</span><span class="n">_from_generation_result</span><span class="p">(</span><span class="n">result</span><span class="p">,</span> <span class="n">prompt</span><span class="p">,</span>
-                                                     <span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">RequestOutput</span><span class="o">.</span><span class="n">_from_generation_result</span><span class="p">(</span>
+            <span class="n">result</span><span class="p">,</span>
+            <span class="n">prompt</span><span class="p">,</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span><span class="p">,</span>
+            <span class="n">post_processor_hook</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_post_processor_hook</span><span class="p">)</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">_preprocess</span><span class="p">(</span>
         <span class="bp">self</span><span class="p">,</span>
@@ -2173,6 +2272,25 @@ window.runMermaid = runMermaid;</script>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_executor</span><span class="o">.</span><span class="n">get_stats</span><span class="p">(</span><span class="n">timeout</span><span class="o">=</span><span class="n">timeout</span><span class="p">)</span>
 
     <span class="nd">@set_api_status</span><span class="p">(</span><span class="s2">&quot;beta&quot;</span><span class="p">)</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">get_kv_cache_capacity</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Get the runtime&#39;s static primary/GPU KV cache capacity.</span>
+
+<span class="sd">        Raises:</span>
+<span class="sd">            RuntimeError: If called when ``encode_only=True``.</span>
+
+<span class="sd">        Returns:</span>
+<span class="sd">            dict: KV cache capacity. The returned capacity covers the primary</span>
+<span class="sd">                GPU KV cache pool only; CPU/host offload capacity is not</span>
+<span class="sd">                included.</span>
+<span class="sd">                e.g., {&quot;maxNumBlocks&quot;: ..., &quot;tokensPerBlock&quot;: ..., &quot;maxNumTokens&quot;: ...}</span>
+<span class="sd">        &quot;&quot;&quot;</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_encode_only</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span>
+                <span class="s2">&quot;get_kv_cache_capacity() is not available when &quot;</span>
+                <span class="s2">&quot;encode_only=True. Use llm.encode() for encoder-only models.&quot;</span><span class="p">)</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_executor</span><span class="o">.</span><span class="n">get_kv_cache_capacity</span><span class="p">()</span>
+
+    <span class="nd">@set_api_status</span><span class="p">(</span><span class="s2">&quot;beta&quot;</span><span class="p">)</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">get_stats_async</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">timeout</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">float</span><span class="p">]</span> <span class="o">=</span> <span class="mi">2</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">IterationResult</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">&quot;&quot;&quot;Get iteration statistics from the runtime.</span>
 <span class="sd">        To collect statistics, you can call this function in an async coroutine or the /metrics endpoint (if you&#39;re using trtllm-serve)</span>
@@ -2407,10 +2525,6 @@ window.runMermaid = runMermaid;</script>
                                              <span class="bp">self</span><span class="o">.</span><span class="n">llm_build_stats</span><span class="p">))</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_engine_dir</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">_hf_model_dir</span> <span class="o">=</span> <span class="n">model_loader</span><span class="p">()</span>
 
-    <span class="nd">@property</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">_on_trt_backend</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
-        <span class="k">return</span> <span class="nb">isinstance</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="p">,</span> <span class="n">TrtLlmArgs</span><span class="p">)</span>
-
     <span class="k">def</span><span class="w"> </span><span class="nf">_try_load_tokenizer</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Optional</span><span class="p">[</span><span class="n">TokenizerBase</span><span class="p">]:</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">skip_tokenizer_init</span><span class="p">:</span>
             <span class="k">return</span> <span class="kc">None</span>
@@ -2418,9 +2532,6 @@ window.runMermaid = runMermaid;</script>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">tokenizer</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
             <span class="k">assert</span> <span class="nb">isinstance</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">tokenizer</span><span class="p">,</span> <span class="n">TokenizerBase</span><span class="p">)</span>
             <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">tokenizer</span>
-
-        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">runtime_context</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">runtime_context</span><span class="o">.</span><span class="n">tokenizer</span>
 
         <span class="c1"># TODO smor- need to refine what is the desired behavior if lora is enabled</span>
         <span class="c1"># in terms of the tokenizer initialization process</span>
@@ -2481,7 +2592,8 @@ window.runMermaid = runMermaid;</script>
             <span class="bp">self</span><span class="o">.</span><span class="n">_encoder_executor</span><span class="o">.</span><span class="n">shutdown</span><span class="p">()</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_encoder_executor</span> <span class="o">=</span> <span class="kc">None</span>
 
-        <span class="k">if</span> <span class="nb">hasattr</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="s1">&#39;mpi_session&#39;</span><span class="p">)</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">mpi_session</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="k">if</span> <span class="p">(</span><span class="nb">hasattr</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="s1">&#39;mpi_session&#39;</span><span class="p">)</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">mpi_session</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
+                <span class="ow">and</span> <span class="nb">getattr</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="s2">&quot;_owns_mpi_session&quot;</span><span class="p">,</span> <span class="kc">True</span><span class="p">)):</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">mpi_session</span><span class="o">.</span><span class="n">shutdown</span><span class="p">()</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">mpi_session</span> <span class="o">=</span> <span class="kc">None</span>
 
@@ -2524,198 +2636,6 @@ window.runMermaid = runMermaid;</script>
         <span class="bp">self</span><span class="o">.</span><span class="n">shutdown</span><span class="p">()</span>
 
 
-<span class="nd">@append_docstring</span><span class="p">(</span><span class="n">TRT_LLM_DOCSTRING</span><span class="p">)</span>
-<span class="k">class</span><span class="w"> </span><span class="nc">_TrtLLM</span><span class="p">(</span><span class="n">BaseLLM</span><span class="p">):</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;LLM class is the main class for running a LLM model using TensorRT LLM backend.</span>
-
-<span class="sd">    Parameters:</span>
-<span class="sd">    &quot;&quot;&quot;</span>
-
-    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
-                 <span class="n">model</span><span class="p">:</span> <span class="n">Union</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Path</span><span class="p">],</span>
-                 <span class="n">tokenizer</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Union</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Path</span><span class="p">,</span> <span class="n">TokenizerBase</span><span class="p">,</span>
-                                           <span class="n">PreTrainedTokenizerBase</span><span class="p">]]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
-                 <span class="n">tokenizer_mode</span><span class="p">:</span> <span class="n">Literal</span><span class="p">[</span><span class="s1">&#39;auto&#39;</span><span class="p">,</span> <span class="s1">&#39;slow&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="s1">&#39;auto&#39;</span><span class="p">,</span>
-                 <span class="n">skip_tokenizer_init</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
-                 <span class="n">trust_remote_code</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
-                 <span class="n">tensor_parallel_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">1</span><span class="p">,</span>
-                 <span class="n">dtype</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">&quot;auto&quot;</span><span class="p">,</span>
-                 <span class="n">revision</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
-                 <span class="n">tokenizer_revision</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
-                 <span class="o">**</span><span class="n">kwargs</span><span class="p">:</span> <span class="n">Any</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
-        <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">(</span><span class="n">model</span><span class="p">,</span> <span class="n">tokenizer</span><span class="p">,</span> <span class="n">tokenizer_mode</span><span class="p">,</span> <span class="n">skip_tokenizer_init</span><span class="p">,</span>
-                         <span class="n">trust_remote_code</span><span class="p">,</span> <span class="n">tensor_parallel_size</span><span class="p">,</span> <span class="n">dtype</span><span class="p">,</span>
-                         <span class="n">revision</span><span class="p">,</span> <span class="n">tokenizer_revision</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span>
-
-    <span class="nd">@property</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">workspace</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Path</span><span class="p">:</span>
-        <span class="k">return</span> <span class="n">Path</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_workspace</span><span class="o">.</span><span class="n">name</span><span class="p">)</span> <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_on_trt_backend</span> <span class="k">else</span> <span class="kc">None</span>
-
-    <span class="k">def</span><span class="w"> </span><span class="nf">save</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">engine_dir</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
-<span class="w">        </span><span class="sd">&quot;&quot;&quot;Save the built engine to the given path.</span>
-
-<span class="sd">        Args:</span>
-<span class="sd">            engine_dir (str): The path to save the engine.</span>
-<span class="sd">        &quot;&quot;&quot;</span>
-        <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Save model to </span><span class="si">{</span><span class="n">engine_dir</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
-        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_engine_dir</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span><span class="s2">&quot;The engine is not built yet.&quot;</span><span class="p">)</span>
-
-        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_engine_dir</span><span class="o">.</span><span class="n">absolute</span><span class="p">()</span> <span class="o">==</span> <span class="n">os</span><span class="o">.</span><span class="n">path</span><span class="o">.</span><span class="n">abspath</span><span class="p">(</span><span class="n">engine_dir</span><span class="p">):</span>
-            <span class="k">return</span>
-
-        <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">mpi_session</span> <span class="ow">or</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">mpi_session</span><span class="o">.</span><span class="n">is_comm_session</span><span class="p">():</span>
-            <span class="n">shutil</span><span class="o">.</span><span class="n">copytree</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_engine_dir</span><span class="p">,</span> <span class="n">engine_dir</span><span class="p">,</span> <span class="n">dirs_exist_ok</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
-        <span class="k">else</span><span class="p">:</span>
-            <span class="c1"># NFS is fragile, so we copy files one by one</span>
-            <span class="n">target_engine_dir</span> <span class="o">=</span> <span class="n">Path</span><span class="p">(</span><span class="n">engine_dir</span><span class="p">)</span>
-            <span class="n">target_engine_dir</span><span class="o">.</span><span class="n">mkdir</span><span class="p">(</span><span class="n">parents</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">exist_ok</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
-            <span class="c1"># copy files one by one</span>
-            <span class="k">for</span> <span class="n">file</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_engine_dir</span><span class="o">.</span><span class="n">iterdir</span><span class="p">():</span>
-                <span class="n">logger_debug</span><span class="p">(</span>
-                    <span class="sa">f</span><span class="s2">&quot;Copying </span><span class="si">{</span><span class="n">file</span><span class="si">}</span><span class="s2"> to </span><span class="si">{</span><span class="n">target_engine_dir</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">file</span><span class="o">.</span><span class="n">name</span><span class="si">}</span><span class="se">\n</span><span class="s2">&quot;</span><span class="p">)</span>
-                <span class="n">shutil</span><span class="o">.</span><span class="n">copy</span><span class="p">(</span><span class="n">file</span><span class="p">,</span> <span class="n">target_engine_dir</span> <span class="o">/</span> <span class="n">file</span><span class="o">.</span><span class="n">name</span><span class="p">)</span>
-
-    <span class="k">def</span><span class="w"> </span><span class="nf">_build_model</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
-        <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="n">_build_model</span><span class="p">()</span>
-        <span class="c1"># update the model_dir to a local dir for the runtime, such as tokenizer loading.</span>
-        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_engine_dir</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">model</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_engine_dir</span>
-
-        <span class="c1"># Tokenizer and config loading should be after calling model_loader(), since model_loader() may download the model from HF hub.</span>
-        <span class="c1"># It should also be before bindings ExecutorConfig, which may depend on tokenizer info.</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">_tokenizer</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_try_load_tokenizer</span><span class="p">()</span>
-        <span class="c1"># Load HF config from the original HF model dir when available,</span>
-        <span class="c1"># since self.args.model now points to the engine dir (whose</span>
-        <span class="c1"># config.json uses TRT-LLM schema, not HF schema).</span>
-        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_hf_model_dir</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">_hf_model_config</span> <span class="o">=</span> <span class="n">ModelLoader</span><span class="o">.</span><span class="n">load_hf_model_config</span><span class="p">(</span>
-                <span class="bp">self</span><span class="o">.</span><span class="n">_hf_model_dir</span><span class="p">,</span>
-                <span class="n">trust_remote_code</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">trust_remote_code</span><span class="p">)</span>
-        <span class="k">else</span><span class="p">:</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">_hf_model_config</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_try_load_hf_model_config</span><span class="p">()</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">_generation_config</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_try_load_generation_config</span><span class="p">()</span>
-
-        <span class="c1"># Multimodal special handling:</span>
-        <span class="c1"># 1. Default load_tokenizer may fail because MM has different tokenizer configuration. Hence we initialize it inside input processor</span>
-        <span class="c1"># 2. May need to modify model weights for MM (e.g., resize vocab embedding). We must do such operation via input processor&#39;s __init__</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">input_processor</span> <span class="o">=</span> <span class="n">create_input_processor</span><span class="p">(</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">_hf_model_dir</span><span class="p">,</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span><span class="p">,</span>
-            <span class="n">trust_remote_code</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">trust_remote_code</span><span class="p">)</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">_tokenizer</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">input_processor</span><span class="o">.</span><span class="n">tokenizer</span>
-
-        <span class="n">max_batch_size</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">max_batch_size</span>
-        <span class="n">max_num_tokens</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">max_num_tokens</span>
-        <span class="n">max_seq_len</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">max_seq_len</span>
-
-        <span class="n">build_config</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">build_config</span>
-
-        <span class="n">max_batch_size</span> <span class="o">=</span> <span class="n">max_batch_size</span> <span class="ow">or</span> <span class="n">build_config</span><span class="o">.</span><span class="n">max_batch_size</span>
-        <span class="n">max_num_tokens</span> <span class="o">=</span> <span class="n">max_num_tokens</span> <span class="ow">or</span> <span class="n">build_config</span><span class="o">.</span><span class="n">max_num_tokens</span>
-        <span class="n">max_seq_len</span> <span class="o">=</span> <span class="n">max_seq_len</span> <span class="ow">or</span> <span class="n">build_config</span><span class="o">.</span><span class="n">max_seq_len</span>
-
-        <span class="bp">self</span><span class="o">.</span><span class="n">_executor_config</span> <span class="o">=</span> <span class="n">tllm</span><span class="o">.</span><span class="n">ExecutorConfig</span><span class="p">(</span>
-            <span class="n">max_beam_width</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">max_beam_width</span><span class="p">,</span>
-            <span class="n">scheduler_config</span><span class="o">=</span><span class="n">PybindMirror</span><span class="o">.</span><span class="n">maybe_to_pybind</span><span class="p">(</span>
-                <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">scheduler_config</span><span class="p">),</span>
-            <span class="n">batching_type</span><span class="o">=</span><span class="n">PybindMirror</span><span class="o">.</span><span class="n">maybe_to_pybind</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">batching_type</span><span class="p">)</span>
-            <span class="ow">or</span> <span class="n">tllm</span><span class="o">.</span><span class="n">BatchingType</span><span class="o">.</span><span class="n">INFLIGHT</span><span class="p">,</span>
-            <span class="n">max_batch_size</span><span class="o">=</span><span class="n">max_batch_size</span><span class="p">,</span>
-            <span class="n">max_num_tokens</span><span class="o">=</span><span class="n">max_num_tokens</span><span class="p">,</span>
-            <span class="n">gather_generation_logits</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">gather_generation_logits</span><span class="p">,</span>
-            <span class="n">fail_fast_on_attention_window_too_large</span><span class="o">=</span><span class="nb">getattr</span><span class="p">(</span>
-                <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="p">,</span> <span class="s1">&#39;fail_fast_on_attention_window_too_large&#39;</span><span class="p">,</span> <span class="kc">False</span><span class="p">))</span>
-
-        <span class="c1"># also set executor_config.max_seq_len in TRT workflow, to deduce default max_tokens</span>
-        <span class="k">if</span> <span class="n">max_seq_len</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">_executor_config</span><span class="o">.</span><span class="n">max_seq_len</span> <span class="o">=</span> <span class="n">max_seq_len</span>
-        <span class="k">else</span><span class="p">:</span>
-            <span class="n">engine_config</span> <span class="o">=</span> <span class="n">EngineConfig</span><span class="o">.</span><span class="n">from_json_file</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_engine_dir</span> <span class="o">/</span>
-                                                        <span class="s2">&quot;config.json&quot;</span><span class="p">)</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">_executor_config</span><span class="o">.</span><span class="n">max_seq_len</span> <span class="o">=</span> <span class="n">engine_config</span><span class="o">.</span><span class="n">build_config</span><span class="o">.</span><span class="n">max_seq_len</span>
-
-        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">kv_cache_config</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">_executor_config</span><span class="o">.</span><span class="n">kv_cache_config</span> <span class="o">=</span> <span class="n">PybindMirror</span><span class="o">.</span><span class="n">maybe_to_pybind</span><span class="p">(</span>
-                <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">kv_cache_config</span><span class="p">)</span>
-        <span class="k">if</span> <span class="n">os</span><span class="o">.</span><span class="n">getenv</span><span class="p">(</span><span class="s2">&quot;FORCE_DETERMINISTIC&quot;</span><span class="p">,</span> <span class="s2">&quot;0&quot;</span><span class="p">)</span> <span class="o">==</span> <span class="s2">&quot;1&quot;</span><span class="p">:</span>
-            <span class="c1"># Disable KV cache reuse for deterministic mode</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">_executor_config</span><span class="o">.</span><span class="n">kv_cache_config</span><span class="o">.</span><span class="n">enable_block_reuse</span> <span class="o">=</span> <span class="kc">False</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">_executor_config</span><span class="o">.</span><span class="n">kv_cache_config</span><span class="o">.</span><span class="n">enable_partial_reuse</span> <span class="o">=</span> <span class="kc">False</span>
-        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">peft_cache_config</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">_executor_config</span><span class="o">.</span><span class="n">peft_cache_config</span> <span class="o">=</span> <span class="n">PybindMirror</span><span class="o">.</span><span class="n">maybe_to_pybind</span><span class="p">(</span>
-                <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">peft_cache_config</span><span class="p">)</span>
-
-        <span class="n">lora_config</span> <span class="o">=</span> <span class="kc">None</span>
-        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">build_config</span><span class="o">.</span><span class="n">plugin_config</span><span class="o">.</span><span class="n">lora_plugin</span><span class="p">:</span>
-            <span class="n">engine_config</span> <span class="o">=</span> <span class="n">EngineConfig</span><span class="o">.</span><span class="n">from_json_file</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_engine_dir</span> <span class="o">/</span>
-                                                        <span class="s2">&quot;config.json&quot;</span><span class="p">)</span>
-            <span class="n">lora_config</span> <span class="o">=</span> <span class="n">engine_config</span><span class="o">.</span><span class="n">build_config</span><span class="o">.</span><span class="n">lora_config</span>
-            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">lora_config</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-                <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span>
-                    <span class="s2">&quot;Overriding lora_config from engine with lora_config from LLM args&quot;</span>
-                <span class="p">)</span>
-                <span class="n">lora_config</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">lora_config</span>
-
-            <span class="n">max_lora_rank</span> <span class="o">=</span> <span class="n">lora_config</span><span class="o">.</span><span class="n">max_lora_rank</span>
-            <span class="n">num_lora_modules</span> <span class="o">=</span> <span class="n">engine_config</span><span class="o">.</span><span class="n">pretrained_config</span><span class="o">.</span><span class="n">num_hidden_layers</span> <span class="o">*</span> \
-                <span class="nb">len</span><span class="p">(</span><span class="n">lora_config</span><span class="o">.</span><span class="n">lora_target_modules</span> <span class="o">+</span> <span class="n">lora_config</span><span class="o">.</span><span class="n">missing_qkv_modules</span><span class="p">)</span>
-
-            <span class="n">peft_cache_config_model</span> <span class="o">=</span> <span class="n">PeftCacheConfig</span><span class="o">.</span><span class="n">from_pybind</span><span class="p">(</span>
-                <span class="bp">self</span><span class="o">.</span><span class="n">_executor_config</span><span class="o">.</span><span class="n">peft_cache_config</span>
-            <span class="p">)</span> <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_executor_config</span><span class="o">.</span><span class="n">peft_cache_config</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span> <span class="n">PeftCacheConfig</span><span class="p">(</span>
-            <span class="p">)</span>
-            <span class="k">if</span> <span class="n">lora_config</span><span class="o">.</span><span class="n">max_loras</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-                <span class="n">peft_cache_config_model</span><span class="o">.</span><span class="n">num_device_module_layer</span> <span class="o">=</span> \
-                    <span class="n">max_lora_rank</span> <span class="o">*</span> <span class="n">num_lora_modules</span> <span class="o">*</span> <span class="n">lora_config</span><span class="o">.</span><span class="n">max_loras</span>
-            <span class="k">if</span> <span class="n">lora_config</span><span class="o">.</span><span class="n">max_cpu_loras</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-                <span class="n">peft_cache_config_model</span><span class="o">.</span><span class="n">num_host_module_layer</span> <span class="o">=</span> \
-                    <span class="n">max_lora_rank</span> <span class="o">*</span> <span class="n">num_lora_modules</span> <span class="o">*</span> <span class="n">lora_config</span><span class="o">.</span><span class="n">max_cpu_loras</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">_executor_config</span><span class="o">.</span><span class="n">peft_cache_config</span> <span class="o">=</span> <span class="n">peft_cache_config_model</span><span class="o">.</span><span class="n">_to_pybind</span><span class="p">(</span>
-            <span class="p">)</span>
-
-        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">decoding_config</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">_executor_config</span><span class="o">.</span><span class="n">decoding_config</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">decoding_config</span>
-        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">guided_decoding_backend</span> <span class="o">==</span> <span class="s1">&#39;xgrammar&#39;</span><span class="p">:</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">_executor_config</span><span class="o">.</span><span class="n">guided_decoding_config</span> <span class="o">=</span> <span class="n">tllm</span><span class="o">.</span><span class="n">GuidedDecodingConfig</span><span class="p">(</span>
-                <span class="n">backend</span><span class="o">=</span><span class="n">tllm</span><span class="o">.</span><span class="n">GuidedDecodingConfig</span><span class="o">.</span><span class="n">GuidedDecodingBackend</span><span class="o">.</span>
-                <span class="n">XGRAMMAR</span><span class="p">,</span>
-                <span class="o">**</span><span class="n">_xgrammar_tokenizer_info</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span><span class="p">))</span>
-        <span class="k">elif</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">guided_decoding_backend</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
-                <span class="sa">f</span><span class="s2">&quot;Unsupported guided decoding backend </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">guided_decoding_backend</span><span class="si">}</span><span class="s2">&quot;</span>
-            <span class="p">)</span>
-
-        <span class="bp">self</span><span class="o">.</span><span class="n">_executor_config</span><span class="o">.</span><span class="n">normalize_log_probs</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">normalize_log_probs</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">_executor_config</span><span class="o">.</span><span class="n">enable_chunked_context</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">enable_chunked_prefill</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">_executor_config</span><span class="o">.</span><span class="n">max_beam_width</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">max_beam_width</span> <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">build_config</span><span class="o">.</span><span class="n">max_beam_width</span>
-        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">extended_runtime_perf_knob_config</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">_executor_config</span><span class="o">.</span><span class="n">extended_runtime_perf_knob_config</span> <span class="o">=</span> <span class="n">PybindMirror</span><span class="o">.</span><span class="n">maybe_to_pybind</span><span class="p">(</span>
-                <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">extended_runtime_perf_knob_config</span><span class="p">)</span>
-        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">cache_transceiver_config</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">_executor_config</span><span class="o">.</span><span class="n">cache_transceiver_config</span> <span class="o">=</span> <span class="n">PybindMirror</span><span class="o">.</span><span class="n">maybe_to_pybind</span><span class="p">(</span>
-                <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">cache_transceiver_config</span><span class="p">)</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">_executor_config</span><span class="o">.</span><span class="n">llm_parallel_config</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">parallel_config</span>
-        <span class="n">return_logits</span> <span class="o">=</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">gather_generation_logits</span>
-                         <span class="ow">or</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">build_config</span>
-                             <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">build_config</span><span class="o">.</span><span class="n">gather_context_logits</span><span class="p">))</span>
-
-        <span class="bp">self</span><span class="o">.</span><span class="n">_executor</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_executor_cls</span><span class="o">.</span><span class="n">create</span><span class="p">(</span>
-            <span class="bp">self</span><span class="o">.</span><span class="n">_engine_dir</span><span class="p">,</span>
-            <span class="n">executor_config</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_executor_config</span><span class="p">,</span>
-            <span class="n">batched_logits_processor</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">batched_logits_processor</span><span class="p">,</span>
-            <span class="n">model_world_size</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">parallel_config</span><span class="o">.</span><span class="n">world_size</span><span class="p">,</span>
-            <span class="n">mpi_session</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">mpi_session</span><span class="p">,</span>
-            <span class="n">reuse_mpi_comm</span><span class="o">=</span><span class="n">external_mpi_comm_available</span><span class="p">(</span>
-                <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">parallel_config</span><span class="o">.</span><span class="n">world_size</span><span class="p">),</span>
-            <span class="n">return_logits</span><span class="o">=</span><span class="n">return_logits</span><span class="p">,</span>
-            <span class="n">postproc_worker_config</span><span class="o">=</span><span class="n">PostprocWorkerConfig</span><span class="p">(</span>
-                <span class="n">num_postprocess_workers</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">num_postprocess_workers</span><span class="p">,</span>
-                <span class="n">postprocess_tokenizer_dir</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">postprocess_tokenizer_dir</span><span class="p">,</span>
-            <span class="p">),</span>
-            <span class="n">is_llm_executor</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
-
-
 <span class="nd">@append_docstring</span><span class="p">(</span><span class="n">TORCH_LLM_DOCSTRING</span><span class="p">)</span>
 <span class="k">class</span><span class="w"> </span><span class="nc">_TorchLLM</span><span class="p">(</span><span class="n">BaseLLM</span><span class="p">):</span>
 <span class="w">    </span><span class="sd">&quot;&quot;&quot;LLM class is the main class for running a LLM model using PyTorch backend.</span>
@@ -2738,7 +2658,7 @@ window.runMermaid = runMermaid;</script>
 
         <span class="n">backend</span> <span class="o">=</span> <span class="n">kwargs</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s2">&quot;backend&quot;</span><span class="p">,</span> <span class="s2">&quot;pytorch&quot;</span><span class="p">)</span>
 
-        <span class="c1"># Validate that users don&#39;t pass TrtLlmArgs-specific arguments</span>
+        <span class="c1"># Validate that only arguments supported by the PyTorch backend are passed.</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_validate_args_for_torch_backend</span><span class="p">(</span><span class="n">kwargs</span><span class="p">)</span>
 
         <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">(</span><span class="n">model</span><span class="p">,</span>
@@ -2804,9 +2724,9 @@ window.runMermaid = runMermaid;</script>
         <span class="c1"># 2. May need to modify model weights for MM (e.g., resize vocab embedding). We must do such operation via input processor&#39;s __init__</span>
         <span class="n">checkpoint_format</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="p">,</span> <span class="s2">&quot;checkpoint_format&quot;</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
         <span class="n">input_processor_kwargs</span> <span class="o">=</span> <span class="p">{}</span>
-        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">video_pruning_rate</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-            <span class="n">input_processor_kwargs</span><span class="p">[</span>
-                <span class="s1">&#39;video_pruning_rate&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">video_pruning_rate</span>
+        <span class="n">video_pruning_rate</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">multimodal_config</span><span class="o">.</span><span class="n">video_pruning_rate</span>
+        <span class="k">if</span> <span class="n">video_pruning_rate</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">input_processor_kwargs</span><span class="p">[</span><span class="s1">&#39;video_pruning_rate&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">video_pruning_rate</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">input_processor</span> <span class="o">=</span> <span class="n">create_input_processor</span><span class="p">(</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_hf_model_dir</span><span class="p">,</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">tokenizer</span><span class="p">,</span>
@@ -2860,6 +2780,7 @@ window.runMermaid = runMermaid;</script>
             <span class="n">postproc_worker_config</span><span class="o">=</span><span class="n">PostprocWorkerConfig</span><span class="p">(</span>
                 <span class="n">num_postprocess_workers</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">num_postprocess_workers</span><span class="p">,</span>
                 <span class="n">postprocess_tokenizer_dir</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">postprocess_tokenizer_dir</span><span class="p">,</span>
+                <span class="n">post_processor_hook</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">post_processor_hook</span><span class="p">,</span>
             <span class="p">),</span>
             <span class="n">is_llm_executor</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
             <span class="n">hf_model_dir</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_hf_model_dir</span><span class="p">,</span>
@@ -2867,23 +2788,20 @@ window.runMermaid = runMermaid;</script>
             <span class="n">llm_args</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="p">)</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">_validate_args_for_torch_backend</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">kwargs</span><span class="p">:</span> <span class="nb">dict</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
-<span class="w">        </span><span class="sd">&quot;&quot;&quot;Validate that users don&#39;t pass TrtLlmArgs-specific arguments when using PyTorch backend.</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Validate that only arguments supported by the PyTorch backend are passed.</span>
 <span class="sd">        &quot;&quot;&quot;</span>
-        <span class="n">trtllm_fields</span> <span class="o">=</span> <span class="nb">set</span><span class="p">(</span><span class="n">TrtLlmArgs</span><span class="o">.</span><span class="n">model_fields</span><span class="o">.</span><span class="n">keys</span><span class="p">())</span>
         <span class="n">torchllm_fields</span> <span class="o">=</span> <span class="nb">set</span><span class="p">(</span><span class="n">TorchLlmArgs</span><span class="o">.</span><span class="n">model_fields</span><span class="o">.</span><span class="n">keys</span><span class="p">())</span>
 
-        <span class="n">trtllm_specific_fields</span> <span class="o">=</span> <span class="n">trtllm_fields</span> <span class="o">-</span> <span class="n">torchllm_fields</span>
+        <span class="c1"># Check if any arguments not supported by the PyTorch backend are passed.</span>
+        <span class="n">unsupported_args</span> <span class="o">=</span> <span class="p">[</span>
+            <span class="n">key</span> <span class="k">for</span> <span class="n">key</span> <span class="ow">in</span> <span class="n">kwargs</span>
+            <span class="k">if</span> <span class="n">key</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">torchllm_fields</span> <span class="ow">and</span> <span class="n">key</span> <span class="ow">not</span> <span class="ow">in</span> <span class="p">(</span><span class="s1">&#39;_mpi_session&#39;</span><span class="p">,</span>
+                                                          <span class="s1">&#39;backend&#39;</span><span class="p">)</span>
+        <span class="p">]</span>
 
-        <span class="c1"># Check if any TrtLlmArgs-specific arguments are passed</span>
-        <span class="n">trtllm_specific_args</span> <span class="o">=</span> <span class="p">[]</span>
-        <span class="k">for</span> <span class="n">key</span> <span class="ow">in</span> <span class="n">kwargs</span><span class="p">:</span>
-            <span class="k">if</span> <span class="n">key</span> <span class="ow">in</span> <span class="n">trtllm_specific_fields</span><span class="p">:</span>
-                <span class="n">trtllm_specific_args</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">key</span><span class="p">)</span>
-
-        <span class="k">if</span> <span class="n">trtllm_specific_args</span><span class="p">:</span>
+        <span class="k">if</span> <span class="n">unsupported_args</span><span class="p">:</span>
             <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
-                <span class="sa">f</span><span class="s2">&quot;The following arguments are specific to TensorRT backend and cannot be used with PyTorch backend: </span><span class="si">{</span><span class="n">trtllm_specific_args</span><span class="si">}</span><span class="s2">.</span><span class="se">\n</span><span class="s2">&quot;</span>
-                <span class="sa">f</span><span class="s2">&quot;Please use &#39;from tensorrt_llm._tensorrt_engine import LLM&#39; instead to use the TensorRT backend.&quot;</span>
+                <span class="sa">f</span><span class="s2">&quot;The following arguments are not supported by the PyTorch backend: </span><span class="si">{</span><span class="n">unsupported_args</span><span class="si">}</span><span class="s2">.&quot;</span>
             <span class="p">)</span>
 
 
@@ -2955,8 +2873,8 @@ window.runMermaid = runMermaid;</script>
   
 
   <!-- Scripts loaded after <body> so the DOM is not blocked -->
-  <script defer src="../../../_static/scripts/bootstrap.js?digest=a95f357e85573c9b56d5"></script>
-<script defer src="../../../_static/scripts/pydata-sphinx-theme.js?digest=a95f357e85573c9b56d5"></script>
+  <script defer src="../../../_static/scripts/bootstrap.js?digest=90905a2f556bf617f1a9"></script>
+<script defer src="../../../_static/scripts/pydata-sphinx-theme.js?digest=90905a2f556bf617f1a9"></script>
 
 
   <footer class="bd-footer">
@@ -3028,9 +2946,9 @@ window.runMermaid = runMermaid;</script>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on June 27, 2026.</p>
+  <p>Last updated on July 14, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/c25c23f">c25c23f</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/1662a87">1662a87</a>.</p>
   
 </div></div>
       

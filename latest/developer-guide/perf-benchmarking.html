@@ -28,8 +28,8 @@
   </noscript>
   
   <!-- Loaded before other Sphinx assets -->
-  <link href="../_static/styles/theme.css?digest=a95f357e85573c9b56d5" rel="stylesheet" />
-<link href="../_static/styles/pydata-sphinx-theme.css?digest=a95f357e85573c9b56d5" rel="stylesheet" />
+  <link href="../_static/styles/theme.css?digest=90905a2f556bf617f1a9" rel="stylesheet" />
+<link href="../_static/styles/pydata-sphinx-theme.css?digest=90905a2f556bf617f1a9" rel="stylesheet" />
 
     <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=8f2a1f02" />
     <link rel="stylesheet" type="text/css" href="../_static/styles/nvidia-sphinx-theme.css?v=933278ad" />
@@ -40,10 +40,10 @@
     <link rel="stylesheet" type="text/css" href="../_static/custom.css?v=19d20f17" />
   
   <!-- So that users can add custom icons -->
-  <script defer src="../_static/scripts/fontawesome.js?digest=a95f357e85573c9b56d5"></script>
+  <script defer src="../_static/scripts/fontawesome.js?digest=90905a2f556bf617f1a9"></script>
   <!-- Pre-loaded scripts that we'll load fully later -->
-  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=a95f357e85573c9b56d5" />
-<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=a95f357e85573c9b56d5" />
+  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=90905a2f556bf617f1a9" />
+<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=90905a2f556bf617f1a9" />
 
 
 
@@ -61,9 +61,9 @@
     <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
     <script>DOCUMENTATION_OPTIONS.pagename = 'developer-guide/perf-benchmarking';</script>
     <script>
-        DOCUMENTATION_OPTIONS.theme_version = '0.19.0';
+        DOCUMENTATION_OPTIONS.theme_version = '0.20.0';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc20';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc21';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc20" />
+  <meta name="docsearch:version" content="1.3.0rc21" />
   
     
     <script src="../_static/searchtools.js"></script>
@@ -446,6 +446,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../features/feature-combination-matrix.html">Feature Combination Matrix</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/disagg-serving.html">Disaggregated Serving</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/embeddings.html">Embeddings (Encoder-Only Models)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/kvcache.html">KV Cache System</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/long-sequence.html">Long Sequences</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/lora.html">LoRA (Low-Rank Adaptation)</a></li>
@@ -456,6 +457,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../features/quantization.html">Quantization</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/sampling.html">Sampling</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/additional-outputs.html">Additional Outputs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../features/post-processor-hook.html">Post-Processing Hook</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/guided-decoding.html">Guided Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/speculative-decoding.html">Speculative Decoding</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/checkpoint-loading.html">Checkpoint Loading</a></li>
@@ -495,6 +497,7 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog25_Scaling_Video_Generation_Across_NVL72_Rack_with_TensorRT-LLM.html">Scaling Video Generation Across NVL72 rack with TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog24_MoE_as_Dense_GEMM.html">MoE as Dense GEMM: Optimizing Low-Latency MoE Inference on NVIDIA Blackwell</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog23_Joint_Optimization_of_Agent_Applications_and_TensorRT-LLM.html">Joint Optimization of Agent Applications and TensorRT-LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog22_Helix_Parallelism_Scaling_Multi_Million_Token_Decoding_with_KV_Cache_Sharding.html">Helix Parallelism in TensorRT-LLM: Scaling Multi-Million-Token Decoding with KV Cache Sharding</a></li>
@@ -532,9 +535,9 @@
 <li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM">Github Code</a></li>
 <li class="toctree-l1"><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/issues?q=is%3Aissue%20state%3Aopen%20label%3Aroadmap">Roadmap</a></li>
 </ul>
-<p aria-level="2" class="caption" role="heading"><span class="caption-text">Use TensorRT Engine</span></p>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Migration</span></p>
 <ul class="nav bd-sidenav">
-<li class="toctree-l1"><a class="reference internal" href="../legacy/tensorrt_quickstart.html">LLM API with TensorRT Engine</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../legacy/tensorrt-backend-removal.html">Migration Guide: TensorRT Backend Removed</a></li>
 </ul>
 </div>
 </nav></div>
@@ -586,7 +589,7 @@
 <div id="searchbox"></div>
                 <article class="bd-article">
                   
-  <section class="tex2jax_ignore mathjax_ignore" id="tensorrt-llm-benchmarking">
+  <section id="tensorrt-llm-benchmarking">
 <span id="perf-benchmarking"></span><h1>TensorRT LLM Benchmarking<a class="headerlink" href="#tensorrt-llm-benchmarking" title="Link to this heading">#</a></h1>
 <div class="admonition note">
 <p class="admonition-title">Note</p>
@@ -610,36 +613,36 @@ easier for users to reproduce our officially published <a class="reference inter
 <section id="table-of-contents">
 <h2>Table of Contents<a class="headerlink" href="#table-of-contents" title="Link to this heading">#</a></h2>
 <ul class="simple">
-<li><p><a class="reference internal" href="#tensorrt-llm-benchmarking">TensorRT LLM Benchmarking</a></p>
+<li><p><a class="reference internal" href="#tensorrt-llm-benchmarking"><span class="xref myst">TensorRT LLM Benchmarking</span></a></p>
 <ul>
-<li><p><a class="reference internal" href="#table-of-contents">Table of Contents</a></p></li>
-<li><p><a class="reference internal" href="#before-benchmarking">Before Benchmarking</a></p>
+<li><p><a class="reference internal" href="#table-of-contents"><span class="xref myst">Table of Contents</span></a></p></li>
+<li><p><a class="reference internal" href="#before-benchmarking"><span class="xref myst">Before Benchmarking</span></a></p>
 <ul>
-<li><p><a class="reference internal" href="#persistence-mode">Persistence mode</a></p></li>
-<li><p><a class="reference internal" href="#gpu-clock-management">GPU Clock Management</a></p></li>
-<li><p><a class="reference internal" href="#set-power-limits">Set power limits</a></p></li>
-<li><p><a class="reference internal" href="#boost-settings">Boost settings</a></p></li>
+<li><p><a class="reference internal" href="#persistence-mode"><span class="xref myst">Persistence mode</span></a></p></li>
+<li><p><a class="reference internal" href="#gpu-clock-management"><span class="xref myst">GPU Clock Management</span></a></p></li>
+<li><p><a class="reference internal" href="#set-power-limits"><span class="xref myst">Set power limits</span></a></p></li>
+<li><p><a class="reference internal" href="#boost-settings"><span class="xref myst">Boost settings</span></a></p></li>
 </ul>
 </li>
-<li><p><a class="reference internal" href="#throughput-benchmarking">Throughput Benchmarking</a></p>
+<li><p><a class="reference internal" href="#throughput-benchmarking"><span class="xref myst">Throughput Benchmarking</span></a></p>
 <ul>
-<li><p><a class="reference internal" href="#limitations-and-caveats">Limitations and Caveats</a></p>
+<li><p><a class="reference internal" href="#limitations-and-caveats"><span class="xref myst">Limitations and Caveats</span></a></p>
 <ul>
-<li><p><a class="reference internal" href="#validated-networks-for-benchmarking">Validated Networks for Benchmarking</a></p></li>
-<li><p><a class="reference internal" href="#supported-quantization-modes">Supported Quantization Modes</a></p></li>
+<li><p><a class="reference internal" href="#validated-networks-for-benchmarking"><span class="xref myst">Validated Networks for Benchmarking</span></a></p></li>
+<li><p><a class="reference internal" href="#supported-quantization-modes"><span class="xref myst">Supported Quantization Modes</span></a></p></li>
 </ul>
 </li>
-<li><p><a class="reference internal" href="#preparing-a-dataset">Preparing a Dataset</a></p></li>
-<li><p><a class="reference internal" href="#running-with-the-pytorch-workflow">Running with the PyTorch Workflow</a></p>
+<li><p><a class="reference internal" href="#preparing-a-dataset"><span class="xref myst">Preparing a Dataset</span></a></p></li>
+<li><p><a class="reference internal" href="#running-with-the-pytorch-workflow"><span class="xref myst">Running with the PyTorch Workflow</span></a></p>
 <ul>
-<li><p><a class="reference internal" href="#benchmarking-with-lora-adapters-in-pytorch-workflow">Benchmarking with LoRA Adapters in PyTorch workflow</a></p></li>
-<li><p><a class="reference internal" href="#running-multi-modal-models-in-the-pytorch-workflow">Running multi-modal models in the PyTorch Workflow</a></p></li>
-<li><p><a class="reference internal" href="#quantization-in-the-pytorch-flow">Quantization in the PyTorch Flow</a></p></li>
+<li><p><a class="reference internal" href="#benchmarking-with-lora-adapters-in-pytorch-workflow"><span class="xref myst">Benchmarking with LoRA Adapters in PyTorch workflow</span></a></p></li>
+<li><p><a class="reference internal" href="#running-multi-modal-models-in-the-pytorch-workflow"><span class="xref myst">Running multi-modal models in the PyTorch Workflow</span></a></p></li>
+<li><p><a class="reference internal" href="#quantization-in-the-pytorch-flow"><span class="xref myst">Quantization in the PyTorch Flow</span></a></p></li>
 </ul>
 </li>
 </ul>
 </li>
-<li><p><a class="reference internal" href="#online-serving-benchmarking">Online Serving Benchmarking</a></p></li>
+<li><p><a class="reference internal" href="#online-serving-benchmarking"><span class="xref myst">Online Serving Benchmarking</span></a></p></li>
 </ul>
 </li>
 </ul>
@@ -805,7 +808,7 @@ directory. For example, to generate a synthetic dataset of 1000 requests with a 
 </section>
 <section id="running-with-the-pytorch-workflow">
 <h3>Running with the PyTorch Workflow<a class="headerlink" href="#running-with-the-pytorch-workflow" title="Link to this heading">#</a></h3>
-<p>To benchmark the PyTorch backend (<code class="docutils literal notranslate"><span class="pre">tensorrt_llm._torch</span></code>), use the following command with <a class="reference internal" href="#preparing-a-dataset">dataset</a> generated from previous steps. The <code class="docutils literal notranslate"><span class="pre">throughput</span></code> benchmark initializes the backend by tuning against the dataset provided via <code class="docutils literal notranslate"><span class="pre">--dataset</span></code> (or the other build mode settings described above).</p>
+<p>To benchmark the PyTorch backend (<code class="docutils literal notranslate"><span class="pre">tensorrt_llm._torch</span></code>), use the following command with <a class="reference internal" href="#preparing-a-dataset"><span class="xref myst">dataset</span></a> generated from previous steps. The <code class="docutils literal notranslate"><span class="pre">throughput</span></code> benchmark initializes the backend by tuning against the dataset provided via <code class="docutils literal notranslate"><span class="pre">--dataset</span></code> (or the other build mode settings described above).</p>
 <p>Note that CUDA graph is enabled by default. You can add additional pytorch config with <code class="docutils literal notranslate"><span class="pre">--config</span></code> followed by the path to a YAML file. For more details, please refer to the help text by running the command with <code class="docutils literal notranslate"><span class="pre">--help</span></code>.</p>
 <div class="admonition tip">
 <p class="admonition-title">Tip</p>
@@ -1218,8 +1221,8 @@ when the checkpoint precision is <code class="docutils literal notranslate"><spa
   
 
   <!-- Scripts loaded after <body> so the DOM is not blocked -->
-  <script defer src="../_static/scripts/bootstrap.js?digest=a95f357e85573c9b56d5"></script>
-<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=a95f357e85573c9b56d5"></script>
+  <script defer src="../_static/scripts/bootstrap.js?digest=90905a2f556bf617f1a9"></script>
+<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=90905a2f556bf617f1a9"></script>
 
 
   <footer class="bd-footer">
@@ -1291,9 +1294,9 @@ when the checkpoint precision is <code class="docutils literal notranslate"><spa
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on June 27, 2026.</p>
+  <p>Last updated on July 14, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/c25c23f">c25c23f</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/1662a87">1662a87</a>.</p>
   
 </div></div>
       
