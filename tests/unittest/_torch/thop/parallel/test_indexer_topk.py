@@ -1199,6 +1199,7 @@ def generate_pre_idx_v4(
     return pre_idx
 
 
+# radix filter single-cta test.
 @pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE, reason="CuTE DSL not available")
 @skip_pre_blackwell
 @pytest.mark.parametrize("batch_size", [1, 4, 64, 256])
@@ -1224,6 +1225,7 @@ def test_cute_dsl_radix_topk_decode_single_cta(batch_size, next_n, index_topk, n
     )
 
 
+# radix filter 2-pass multi-cta test.
 @pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE, reason="CuTE DSL not available")
 @skip_pre_blackwell
 @pytest.mark.parametrize("batch_size", [1, 4, 64])
@@ -1255,6 +1257,7 @@ def test_cute_dsl_radix_topk_decode_multi_cta(
     )
 
 
+# cute dsl top-k public interface test, tuned between single-cta and multi-cta.
 @pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE, reason="CuTE DSL not available")
 @skip_pre_blackwell
 @pytest.mark.parametrize("batch_size", [1, 4, 64, 128])
@@ -1288,6 +1291,7 @@ def test_cute_dsl_indexer_radix_topk_decode(batch_size, next_n, index_topk, num_
     )
 
 
+# radix select multi-cta (atomicAdd gmem for cta communication) test.
 @pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE, reason="CuTE DSL not available")
 @skip_pre_blackwell
 @pytest.mark.parametrize("batch_size", [1, 16, 256])
@@ -1317,6 +1321,7 @@ def test_cute_dsl_radix_topk_decode_single_pass_multi_cta(
     )
 
 
+# radix select multi-cta cluster test.
 @pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE, reason="CuTE DSL not available")
 @skip_pre_blackwell
 @pytest.mark.parametrize("batch_size", [1, 16, 256])
@@ -1353,6 +1358,7 @@ def test_cute_dsl_radix_topk_decode_single_pass_multi_cta_cluster(
     )
 
 
+# radix filter single-pass multi-cta test.
 @pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE, reason="CuTE DSL not available")
 @skip_pre_blackwell
 @pytest.mark.parametrize("batch_size", [1, 16])
@@ -1419,6 +1425,7 @@ def _rf_sp_check(logits, seq_lens, top_k, next_n, cluster_size):
         )
 
 
+# radix filter single-pass multi-cta group-2-heavy test.
 @pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE, reason="CuTE DSL not available")
 @skip_pre_blackwell
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
@@ -1439,6 +1446,7 @@ def test_cute_dsl_radix_filter_sp_multi_cta_group2_heavy(dtype, cluster_size, in
     _rf_sp_check(logits, seq_lens, index_topk, 1, cluster_size)
 
 
+# radix filter single-pass multi-cta solo and degrade test.
 @pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE, reason="CuTE DSL not available")
 @skip_pre_blackwell
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])

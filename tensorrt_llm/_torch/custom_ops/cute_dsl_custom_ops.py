@@ -5104,6 +5104,39 @@ if IS_CUTLASS_DSL_AVAILABLE:
             )
             cls.kernel_cache[key] = compiled_kernel
 
+        @staticmethod
+        def auto_cluster_size(num_tokens: int,
+                              num_rows: int,
+                              num_sms: Optional[int] = None) -> int:
+            """Heuristic cluster_size for the radix-filter SP multi-CTA path.
+
+            Returns 1 (=> caller should use single-CTA) or a cluster_size in
+            {2, 4, 8, 16}. Derived from a B200 sweep (single-vs-multi-tune/
+            HEURISTIC.md, 1210 configs x2, ~82% exact / ~2.8% mean overhead vs
+            oracle). cluster_size = min(N-parallelism cap, SM-budget cap):
+
+              - peak_cs(N): each CTA's chunk has a ~8K sweet spot; N x4 -> cs x2.
+              - large_occupancy correction: single-CTA switches to its
+                large_occupancy mode at num_rows > num_sms (halved SMEM ->
+                candidate spill -> REREAD GMEM re-scan -> very slow for huge N);
+                so past that switch, floor cluster_size at 2 to split the row.
+              - occ_cap: grid = num_rows * cs should stay within ~one SM wave.
+            """
+            if num_sms is None:
+                num_sms = _get_num_sms()
+            n = num_tokens
+            if n <= 8192:
+                return 1
+            # peak_cs = 2^floor((log2 N - 10) / 2), capped at 16.
+            peak_cs = min(1 << ((n.bit_length() - 1 - 10) // 2), 16)
+            # single-CTA's large_occupancy mode chokes on huge N past num_sms.
+            occ_lo = 2 if (num_rows > num_sms and n >= 262144) else 1
+            budget = max(occ_lo, num_sms // num_rows)
+            occ_cap = 1 << (budget.bit_length() - 1)  # floor power of 2
+            # Cap at the hardware max cluster size (lru_cached; queried once).
+            cs = min(peak_cs, occ_cap, _query_max_cluster_size())
+            return cs if cs >= 2 else 1
+
         @classmethod
         def forward(
             cls,
@@ -6262,6 +6295,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         single_pass_multi_cta_cluster: bool = False,
         overflow_policy: str = "REREAD",
         cache_smem_values: bool = False,
+        radix_filter_single_pass_multi_cta: bool = True,
     ) -> None:
         """Unified CuTE DSL Top-K that auto-selects single-CTA or multi-CTA (2-pass multi-CTA) or
         single-pass multi-CTA. When single_pass_multi_cta=True, it selects between single-CTA
@@ -6312,7 +6346,41 @@ if IS_CUTLASS_DSL_AVAILABLE:
         num_rows = input_values.shape[0]
         num_tokens = input_values.shape[1]
 
-        if single_pass_multi_cta:
+        if radix_filter_single_pass_multi_cta:
+            # --- radix-FILTER single-CTA vs SP multi-CTA (cluster DSMEM) ---
+            # Default path. auto_cluster_size() returns 1 (=> single-CTA) or a
+            # cluster_size in {2,4,8,16} (=> radix-filter SP multi-CTA cluster).
+            # See CuteDSLTopKDecodeRadixFilterSPMultiCTARunner.auto_cluster_size
+            # and single-vs-multi-tune/HEURISTIC.md for the heuristic.
+            cluster_size = (
+                CuteDSLTopKDecodeRadixFilterSPMultiCTARunner.auto_cluster_size(
+                    num_tokens, num_rows))
+            if cluster_size >= 2:
+                CuteDSLTopKDecodeRadixFilterSPMultiCTARunner.forward(
+                    input_values=input_values,
+                    seq_lens=seq_lens,
+                    top_k=top_k,
+                    next_n=next_n,
+                    cluster_size=cluster_size,
+                    return_val=False,
+                    num_copy_bits=num_copy_bits,
+                    overflow_policy=overflow_policy,
+                    output_indices=output_indices,
+                    cache_smem_values=cache_smem_values,
+                )
+            else:
+                CuteDSLTopKDecodeSingleCTARunner.forward(
+                    input_values=input_values,
+                    seq_lens=seq_lens,
+                    top_k=top_k,
+                    next_n=next_n,
+                    return_val=False,
+                    num_copy_bits=num_copy_bits,
+                    overflow_policy=overflow_policy,
+                    output_indices=output_indices,
+                    cache_smem_values=cache_smem_values,
+                )
+        elif single_pass_multi_cta:
             # --- heuristic for single-CTA vs single-pass multi-CTA ---
             # Determines whether the single-pass multi-CTA kernel
             # is faster than single-CTA based on SM wave occupancy analysis.
@@ -6457,6 +6525,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         single_pass_multi_cta_cluster: bool = False,
         overflow_policy: str = "REREAD",
         cache_smem_values: bool = False,
+        radix_filter_single_pass_multi_cta: bool = True,
     ) -> None:
         return None
 

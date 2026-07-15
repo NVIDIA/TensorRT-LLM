@@ -45,7 +45,7 @@ if not torch.cuda.is_available():
 
 from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import CuteDSLTopKPrefillSingleCTARunner
 from tensorrt_llm._torch.cute_dsl_kernels.blackwell.top_k.filtered_top_k_decode_varlen import (
-    cute_dsl_topk_wrapper,
+    cute_dsl_radix_filter_topk_wrapper,
     generate_seq_lens,
 )
 from tensorrt_llm._torch.cute_dsl_kernels.blackwell.top_k.filtered_top_k_varlen_util import (
@@ -136,8 +136,8 @@ def _compare_truncate_result(
 
 
 def _run_decode_kernel(logits, seq_lens, top_k, next_n, overflow_policy):
-    """Run decode kernel via cute_dsl_topk_wrapper with given overflow_policy."""
-    indices, _ = cute_dsl_topk_wrapper(
+    """Run decode kernel via cute_dsl_radix_filter_topk_wrapper with given overflow_policy."""
+    indices, _ = cute_dsl_radix_filter_topk_wrapper(
         logits,
         seq_lens,
         top_k,

@@ -1418,6 +1418,8 @@ class FilteredTopKKernelVarlen:
         cta_in_group,
         topk_remaining,
         output_indices_row,
+        score,
+        output_values_row,
     ):
         """Unified DSMEM prefix-scan output collection (Path A + Path B).
 
@@ -1468,7 +1470,10 @@ class FilteredTopKKernelVarlen:
         # 3. group-1: s_indices[0 .. s_counter-1] -> output[exclusive_offset_1 + i]
         for i in range(tidx, local_g1, num_threads):
             idx = cutlass.Int32(cutlass.Uint32(s_indices[i]))
-            output_indices_row[exclusive_offset_1 + i] = idx
+            pos = exclusive_offset_1 + i
+            output_indices_row[pos] = idx
+            if cutlass.const_expr(self.return_val):
+                output_values_row[pos] = score[idx]
 
         # 4. group-2: s_indices[top_k-topk_remaining + i] -> output[group1_total + eo2 + i]
         #    (Path A: group2_count == 0, loop is a no-op)
@@ -1478,6 +1483,8 @@ class FilteredTopKKernelVarlen:
                 src = self.top_k - topk_remaining + i
                 idx = cutlass.Int32(cutlass.Uint32(s_indices[src]))
                 output_indices_row[pos] = idx
+                if cutlass.const_expr(self.return_val):
+                    output_values_row[pos] = score[idx]
 
     @cute.jit
     def _phase3_writeback(self, tidx, row_start, s_indices, score, indices, dst, dst_values):
@@ -2090,6 +2097,8 @@ class FilteredTopKKernelVarlen:
                         cta_in_group,
                         topk_remaining,
                         dst,
+                        score,
+                        dst_values,
                     )
                 else:
                     self._phase3_writeback(

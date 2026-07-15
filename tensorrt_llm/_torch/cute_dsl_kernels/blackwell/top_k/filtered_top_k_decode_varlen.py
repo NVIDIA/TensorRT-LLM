@@ -336,6 +336,7 @@ class FilteredTopKKernelVarlenDecode(FilteredTopKKernelVarlen):
         # from seqlen decides solo (needed_ctas==1) vs cluster (>=2) at runtime.
         need_cluster_sync = False
         cta_in_group = 0
+        # TODO: move this if to line 411-412? make the logic more clear.
         if cutlass.const_expr(self.single_pass_multi_cta):
             row_id = bidx // self.num_ctas_per_row
             cta_in_group = bidx % self.num_ctas_per_row
@@ -515,7 +516,7 @@ def _bucket_num_cols(num_cols: int) -> int:
 compiled_filter_topk_dict = {}
 
 
-def cute_dsl_topk_wrapper(
+def cute_dsl_radix_filter_topk_wrapper(
     input_values,
     seq_lens,
     top_k,
@@ -638,7 +639,134 @@ def cute_dsl_topk_wrapper(
     return output_indices_torch, output_values_torch
 
 
-def cute_dsl_topk_multi_cta_wrapper(
+def cute_dsl_radix_filter_topk_single_pass_multi_cta_wrapper(
+    input_values,
+    seq_lens,
+    top_k,
+    next_n,
+    cluster_size,
+    return_val=True,
+    num_copy_bits=256,
+    overflow_policy: str = "REREAD",
+    cache_smem_values: bool = False,
+):
+    """Standalone compile+launch for the radix-filter single-pass multi-CTA
+    (cluster DSMEM) decode kernel.
+    """
+    torch_dtype = input_values.dtype
+    dtype = _TORCH_TO_CUTLASS_DTYPE[torch_dtype]
+    num_rows, num_cols = input_values.shape
+    bucketed_num_cols = _bucket_num_cols(num_cols)
+    chunk_size_per_cta = math.ceil(bucketed_num_cols / cluster_size)
+
+    # single_pass marker + cluster_size / chunk_size in the key to avoid
+    # colliding with the single-CTA / 2-pass compiled kernels.
+    key = (
+        "sp_multi_cta",
+        dtype,
+        bucketed_num_cols,
+        top_k,
+        next_n,
+        return_val,
+        num_copy_bits,
+        cluster_size,
+        chunk_size_per_cta,
+        overflow_policy,
+        cache_smem_values,
+    )
+    if key not in compiled_filter_topk_dict:
+        n_rows = cute.sym_int()
+        n_cols = cute.sym_int()
+        n_batch = cute.sym_int()
+        input_fake = cute.runtime.make_fake_compact_tensor(
+            dtype, (n_rows, n_cols), stride_order=(1, 0), assumed_align=32
+        )
+        if overflow_policy == "GMEM_SPILL":
+            # Per-CTA spill buffer: (num_rows * cluster_size, num_buffers, chunk).
+            buffer_fake = cute.runtime.make_fake_compact_tensor(
+                cutlass.Int32,
+                (cute.sym_int(), cute.sym_int(), cute.sym_int()),
+                stride_order=(2, 1, 0),
+                assumed_align=32,
+            )
+        else:
+            buffer_fake = None
+        seqlen_fake = cute.runtime.make_fake_compact_tensor(
+            cute.Int32, (n_batch,), stride_order=(0,)
+        )
+        output_indices_fake = cute.runtime.make_fake_compact_tensor(
+            cutlass.Int32, (n_rows, top_k), stride_order=(1, 0)
+        )
+        if return_val:
+            output_values_fake = cute.runtime.make_fake_compact_tensor(
+                dtype, (n_rows, top_k), stride_order=(1, 0)
+            )
+        else:
+            output_values_fake = None
+        fake_stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+
+        filtered_topk_func = FilteredTopKKernelVarlenDecode(
+            dtype,
+            bucketed_num_cols,
+            top_k,
+            next_n,
+            num_copy_bits=num_copy_bits,
+            return_val=return_val,
+            chunk_size_per_cta=chunk_size_per_cta,
+            num_ctas_per_row=cluster_size,
+            overflow_policy=overflow_policy,
+            cache_smem_values=cache_smem_values,
+            single_pass_multi_cta=True,
+        )
+
+        compiled_kernel = cute.compile(
+            filtered_topk_func,
+            input_fake,
+            None,  # indices_fake: unused in this path
+            buffer_fake,
+            seqlen_fake,
+            output_indices_fake,
+            output_values_fake,
+            stream=fake_stream,
+            min_blocks_per_mp=1,
+            options="--enable-tvm-ffi",
+        )
+        compiled_filter_topk_dict[key] = compiled_kernel
+    else:
+        compiled_kernel = compiled_filter_topk_dict[key]
+
+    output_indices_torch = torch.empty(num_rows, top_k, dtype=torch.int32, device="cuda")
+    if return_val:
+        output_values_torch = torch.empty(num_rows, top_k, dtype=torch_dtype, device="cuda")
+    else:
+        output_values_torch = None
+
+    if overflow_policy == "GMEM_SPILL":
+        buffer_numbers = 2 if dtype == cutlass.Float32 else 1
+        buffer_torch = torch.empty(
+            num_rows * cluster_size,
+            buffer_numbers,
+            chunk_size_per_cta,
+            dtype=torch.int32,
+            device="cuda",
+        )
+    else:
+        buffer_torch = None
+
+    # TVM FFI uses env stream automatically; the kernel __call__ issues the
+    # cluster launch (cluster_dim = cluster_size) internally.
+    compiled_kernel(
+        input_values,
+        None,  # indices
+        buffer_torch,
+        seq_lens,
+        output_indices_torch,
+        output_values_torch,
+    )
+    return output_indices_torch, output_values_torch
+
+
+def cute_dsl_radix_filter_topk_multi_cta_wrapper(
     input_values,
     seq_lens,
     top_k,
@@ -1035,7 +1163,7 @@ def run_filtered_topk_decode(
         if print_verbose:
             print("PASSED")
 
-        wrapper_output_indices, wrapper_output_values = cute_dsl_topk_wrapper(
+        wrapper_output_indices, wrapper_output_values = cute_dsl_radix_filter_topk_wrapper(
             input_torch,
             seq_lens,
             top_k,
@@ -1058,7 +1186,7 @@ def run_filtered_topk_decode(
 
         # test multi-cta version.
         wrapper_output_indices_multi_cta, wrapper_output_values_multi_cta = (
-            cute_dsl_topk_multi_cta_wrapper(
+            cute_dsl_radix_filter_topk_multi_cta_wrapper(
                 input_torch,
                 seq_lens,
                 top_k,
