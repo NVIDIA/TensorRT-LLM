@@ -634,6 +634,102 @@ def cleanUpNodeResources(def pipeline, SlurmCluster cluster, String clusterName,
     }
 }
 
+// ---- Off-pod SLURM resource reconciliation --------------------------------
+// A SLURM stage runs inside a K8s dispatcher pod that ssh-drives the job on the
+// login node. If that pod dies mid-run (eviction, container error, agent
+// offline), the in-pod cleanup can no longer reach the controller, so the SLURM
+// job and any Jenkins agent node leak. slurmResourceRegistry records the live
+// resources per stage -- the dispatcher pod spec (from the pod wrapper) and the
+// SLURM job / Jenkins node identity (from the stage body). The normal cleanup
+// path and the finalizer remove an entry once its resources are actually torn
+// down; whatever is left is reconciled by running the cleanup from a *fresh*
+// pod. Only serializable primitives are stored (no SlurmCluster/Throwable) so
+// pipeline persistence is unaffected; the cluster is rebuilt from clusterName.
+// Keyed by stageName: dispatcher-pod deaths are no longer retried in place (see
+// isDispatcherPodFailure), so a stage has at most one orphaned attempt.
+@Field def slurmResourceRegistry = new java.util.concurrent.ConcurrentHashMap()
+
+void registerSlurmResource(String stageName, Map fields) {
+    if (!stageName) {
+        return
+    }
+    def entry = slurmResourceRegistry.get(stageName)
+    if (entry == null) {
+        entry = new java.util.concurrent.ConcurrentHashMap()
+        slurmResourceRegistry.put(stageName, entry)
+    }
+    // ConcurrentHashMap rejects null values; skip absent fields. Writers for a
+    // given stage run sequentially (pod wrapper, then stage body), so no merge race.
+    fields.each { k, v -> if (v != null) { entry.put(k, v) } }
+}
+
+void deregisterSlurmResource(String stageName) {
+    if (stageName) {
+        slurmResourceRegistry.remove(stageName)
+    }
+}
+
+// Reconcile one orphaned SLURM entry off the (dead) dispatcher pod: launch a
+// fresh short-lived pod and run the normal cleanup from there (scancel the job,
+// clean the workspace, and -- agent path -- drop the leaked Jenkins node), then
+// deregister. Best-effort: a finalizer failure is logged and the entry is left
+// for the post-build sweep to retry; it never masks the stage's own failure.
+def finalizeSlurmResourceEntry(pipeline, String stageName, def entry, def podSpecOverride = null) {
+    if (entry == null) {
+        return
+    }
+    // Pod died before any job/node was provisioned: nothing to reconcile.
+    if (!entry.jobUID && !entry.nodeName) {
+        deregisterSlurmResource(stageName)
+        return
+    }
+    def podSpec = podSpecOverride ?: entry.podSpec
+    def cluster = entry.clusterName ? SlurmConfig.clusterConfig[entry.clusterName] : null
+    if (!podSpec || !cluster) {
+        echo "[SLURM-FINALIZER] ${stageName}: cannot reconcile off-pod (missing pod spec or unknown cluster " +
+             "'${entry.clusterName}'); SLURM job=${entry.slurmJobId ?: entry.jobUID ?: 'unknown'} " +
+             "node=${entry.nodeName ?: 'n/a'} may need manual cleanup."
+        return
+    }
+    try {
+        echo "[SLURM-FINALIZER] ${stageName}: reconciling orphaned SLURM resources off-pod " +
+             "(job=${entry.slurmJobId ?: entry.jobUID}, node=${entry.nodeName ?: 'n/a'})."
+        trtllm_utils.launchKubernetesPod(pipeline, podSpec, entry.containerName ?: "trt-llm", {
+            if (entry.usedSbatch) {
+                cleanUpSlurmResources(pipeline, cluster, entry.clusterName, entry.jobUID)
+            } else {
+                cleanUpNodeResources(pipeline, cluster, entry.clusterName, entry.nodeName, entry.slurmJobId)
+            }
+        })
+        deregisterSlurmResource(stageName)
+        echo "[SLURM-FINALIZER] ${stageName}: off-pod reconciliation complete."
+    } catch (Exception e) {
+        echo "[SLURM-FINALIZER] ${stageName}: off-pod reconciliation failed (${e.toString()}); leaving entry for post-build sweep."
+    }
+}
+
+def finalizeOrphanedSlurmResource(pipeline, String stageName, def podSpecOverride = null) {
+    finalizeSlurmResourceEntry(pipeline, stageName, slurmResourceRegistry.get(stageName), podSpecOverride)
+}
+
+// Post-build backstop: reconcile any SLURM resources still registered at the end
+// of the build (a dispatcher-pod death whose in-catch finalize also failed, or a
+// failure mode the catch never saw). Runs off-pod from a fresh cleanup pod.
+def sweepOrphanedSlurmResources(pipeline) {
+    def orphans = slurmResourceRegistry.keySet().collect { it }.findAll {
+        def e = slurmResourceRegistry.get(it)
+        e != null && (e.jobUID || e.nodeName)
+    }
+    if (orphans.isEmpty()) {
+        return
+    }
+    echo "[SLURM-FINALIZER] post-build sweep: ${orphans.size()} SLURM resource(s) were not cleaned up " +
+         "in-stage; reconciling off-pod: ${orphans.join(', ')}"
+    orphans.each { sName ->
+        finalizeSlurmResourceEntry(pipeline, sName, slurmResourceRegistry.get(sName))
+    }
+}
+
 // Authoritative timeout signal: ask the SLURM controller (via sacct on the
 // cluster login node) for a job's terminal state. Returns the uppercased
 // primary state token -- e.g. "TIMEOUT", "COMPLETED", "FAILED", "NODE_FAIL",
@@ -744,6 +840,11 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
                     }
 
                 slurmJobID = jobIDs ? jobIDs[-1] : null
+
+                // Record the live SLURM job + Jenkins node so a dispatcher-pod death
+                // can be reconciled off-pod (the in-pod cleanup can't reach the login
+                // node once the pod is gone). Deregistered when cleanup actually runs.
+                registerSlurmResource(stageName, [clusterName: partition.clusterName, nodeName: nodeName, slurmJobId: slurmJobID, usedSbatch: false])
 
                 if (!slurmJobID || !slurmJobID.isNumber()) {
                     echo "Slurm job did not submit successfully. No job ID found.\nSubmission output:\n${slurmSubmitOutput}"
@@ -986,6 +1087,9 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
                     }
                 }
             }
+            // Cleanup ran on the live pod; drop the registry entry so the off-pod
+            // finalizer/sweep does not reconcile already-freed resources.
+            deregisterSlurmResource(stageName)
         }
     }
 }
@@ -1668,6 +1772,10 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     recordSlurmPlacementContext(placementContext, slurmJobId, null, stageName)
                 }
                 Utils.exec(pipeline, script: "echo Slurm job ID: ${slurmJobId}")
+                // Record the live SLURM job so a dispatcher-pod death can be reconciled
+                // off-pod (the in-pod cleanup can't reach the login node once the pod is
+                // gone). Deregistered when cleanup actually runs.
+                registerSlurmResource(stageName, [clusterName: partition.clusterName, jobUID: jobUID, slurmJobId: slurmJobId, usedSbatch: true])
 
                 def scriptTrack = """#!/bin/bash
                     set -xEeuo pipefail
@@ -1810,6 +1918,9 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     }
                 }
             }
+            // Cleanup ran on the live pod; drop the registry entry so the off-pod
+            // finalizer/sweep does not reconcile already-freed resources.
+            deregisterSlurmResource(stageName)
         }
     }
 }
@@ -4456,6 +4567,9 @@ def runInKubernetes(pipeline, podSpec, containerName)
 def runKubernetesPodWithInfraRetry(Map opts = [:], pipeline, podSpec, containerName, String stageName, Closure runner)
 {
     boolean singleAttempt = opts.singleAttempt ?: false
+    // SLURM dispatcher pods opt in to off-pod resource reconciliation: on a
+    // mid-run pod death their SLURM job / Jenkins node would otherwise leak.
+    boolean slurmDispatcher = opts.slurmDispatcher ?: false
 
     // DEBUG_MODE preserves the existing 2-hour-input human-inspection workflow
     // inside runLLMTestlistOnPlatform's finallyRunner: a single attempt only.
@@ -4483,6 +4597,11 @@ def runKubernetesPodWithInfraRetry(Map opts = [:], pipeline, podSpec, containerN
                     echo "[INFRA-RETRY] ${stageName}: relaunching pod (attempt ${launchAttempt}), avoiding prior host node(s): ${avoidedKubernetesHostNodes.join(', ')}"
                 }
                 def attemptPodSpec = trtllm_utils.withKubernetesHostNodeExclusion(podSpec, avoidedKubernetesHostNodes)
+                if (slurmDispatcher) {
+                    // Record the dispatcher pod spec so the off-pod finalizer/sweep can
+                    // launch a fresh cleanup pod if this pod dies mid-run.
+                    registerSlurmResource(stageName, [podSpec: attemptPodSpec, containerName: containerName])
+                }
                 trtllm_utils.launchKubernetesPodWithPlacement(pipeline, attemptPodSpec, containerName, attemptPlacementContext, {
                     attemptPlacementContext.runnerStarted = true
                     runner("", true, null)
@@ -4492,8 +4611,15 @@ def runKubernetesPodWithInfraRetry(Map opts = [:], pipeline, podSpec, containerN
                 throw e
             } catch (Exception e) {
                 // Once the runner has started, this is an execution failure the
-                // inner retry owns -- honor singleAttempt and do not re-run.
+                // inner retry owns -- honor singleAttempt and do not re-run. But if
+                // the dispatcher pod itself died mid-run, its in-pod cleanup could not
+                // reach the login node, leaking the SLURM job / Jenkins node. We are
+                // back on the parent context here, so reconcile them from a fresh
+                // cleanup pod before failing closed.
                 if (attemptPlacementContext.runnerStarted) {
+                    if (slurmDispatcher && isDispatcherPodFailure(e)) {
+                        finalizeOrphanedSlurmResource(pipeline, stageName)
+                    }
                     throw e
                 }
                 def c = FailureClassifier.classify(e, InfraFailure.K8S)
@@ -4826,7 +4952,7 @@ def launchTestJobs(pipeline, testFilter)
             config = LLVM_CONFIG
         }
         runLLMTestlistOnSlurm(pipeline, values[0], values[1], config, key.contains("-Perf-"), key, values[2], values[3], values[4] ?: 1, values[5] ?: 1, values[6] ?: false, false, "cp312", attemptTag)
-    }, [singleAttempt: true]]]}
+    }, [singleAttempt: true, slurmDispatcher: true]]]}
     // SLURM dispatcher pods run their own inner retry loop
     // (runLLMTestlistOnSlurm with SLURM_INFRA_RETRY_MAX). Disabling the outer
     // K8s pod retry (singleAttempt:true) here caps total attempts at
@@ -5097,7 +5223,7 @@ def launchTestJobs(pipeline, testFilter)
                 config = LLVM_CONFIG
             }
             runLLMTestlistOnSlurm(pipeline, values[0], values[1], config, key.contains("-Perf-"), key, values[2], values[3], values[4] ?: 1, values[5] ?: 1, values[6] ?: false, false, "cp312", attemptTag, values[7] ?: false)
-        }, [singleAttempt: true]]]}
+        }, [singleAttempt: true, slurmDispatcher: true]]]}
         parallelJobs += parallelSlurmJobs
 
         // Add SBSA multi node Slurm jobs
@@ -5111,7 +5237,7 @@ def launchTestJobs(pipeline, testFilter)
                 config = LLVM_CONFIG
             }
             runLLMTestlistOnSlurm(pipeline, values[0], values[1], config, key.contains("-Perf-"), key, values[2], values[3], values[4] ?: 1, values[5] ?: 2, values[6] ?: false, false, "cp312", attemptTag, values[7] ?: false)
-        }, [singleAttempt: true]]]}
+        }, [singleAttempt: true, slurmDispatcher: true]]]}
 
         parallelJobs += parallelMultiNodesSBSAJobs
     }
@@ -5694,6 +5820,7 @@ pipeline {
         stage("Test") {
             steps {
                 script {
+                    try {
                     if (env.JOB_NAME ==~ /.*BuildDockerImageSanityTest.*/) {
                         parallelJobs = launchTestJobsForImagesSanityCheck(this, globalVars)
                     } else {
@@ -5752,6 +5879,16 @@ pipeline {
                                 dgxJobs.failFast = params.enableFailFast
                                 parallel dgxJobs
                             }
+                        }
+                    }
+                    } finally {
+                        // Backstop: reclaim any SLURM job / Jenkins node left orphaned
+                        // by a dispatcher-pod death whose in-catch finalize did not run
+                        // or failed. Best-effort; never fails the build.
+                        try {
+                            sweepOrphanedSlurmResources(this)
+                        } catch (Exception sweepErr) {
+                            echo "[SLURM-FINALIZER] post-build sweep error: ${sweepErr}"
                         }
                     }
                 }
