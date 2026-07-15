@@ -378,6 +378,7 @@ full:RTX_PRO_6000_Blackwell_Server_Edition/perf/test_perf.py::test_perf[quant:w4
 full:sm100/examples/test_nemotron.py::test_llm_nemotron_3_8b_1gpu[bfloat16-fp8] SKIP (megatron-core 0.8 is not supported in python 3.12)
 full:sm100/unittest/bindings SKIP (Disable for Blackwell)
 kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2Llama::test_chunked_prefill SKIP (https://nvbugs/6428002)
+kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2Llama::test_eviction_with_block_reuse SKIP (https://nvbugs/6462303)
 llmapi/test_llm_examples.py::test_llmapi_speculative_decoding_eagle3 SKIP (https://nvbugs/6075431)
 perf/test_perf.py::test_perf[bart_large_cnn-plugin-float16-bs:8-input_output_len:60,20] SKIP # (https://nvidia.slack.com/archives/C059LSY62BT/p1704525727177449)
 perf/test_perf.py::test_perf[flan_t5_base-bench-float16-input_output_len:128,20] SKIP
