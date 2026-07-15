@@ -7,8 +7,9 @@ from typing import NotRequired, TypedDict
 
 sys.path.append(os.path.abspath(".."))
 from utils.common import is_permissive, load_json
-from utils.es import es_post
+from utils.es import es_post, get_triaged_deps, save_triage_records
 from utils.report import diff_licenses, get_preapproved_deps_map, get_vulns, is_preapproved
+from utils.triage import call_triage_agent, extract_ticket_refs, format_risks_for_agent
 
 ES_POST_URL = os.environ.get("TRTLLM_ES_POST_URL")
 if not ES_POST_URL:
@@ -28,14 +29,50 @@ def safe(value, default=None):
     return value if value else default
 
 
+def _run_triage(risk_docs: list, scan_type: str, branch: str, ts_created: int) -> dict:
+    """Call triage agent for untriaged risk_docs; persist ticket records; return {pkg: ticket_url}."""
+    if not risk_docs:
+        return {}
+    is_vuln = "vulnerability" in scan_type
+    agent_resp = call_triage_agent(
+        format_risks_for_agent(
+            risk_docs if is_vuln else [],
+            risk_docs if not is_vuln else [],
+        )
+    )
+    if not agent_resp:
+        return {}
+    ticket_refs = extract_ticket_refs(agent_resp)
+    new_tickets = {}
+    for item in ticket_refs.get("vulnerability", []):
+        pkg, url = item.get("dependency_name"), item.get("ticket_url")
+        if pkg and url:
+            new_tickets[pkg] = url
+    license_ticket = ticket_refs.get("license")
+    if license_ticket and license_ticket.get("ticket_url"):
+        url = license_ticket["ticket_url"]
+        for pkg in license_ticket.get("dependencies") or []:
+            new_tickets[pkg] = url
+    if new_tickets:
+        save_triage_records(
+            ES_POST_URL,
+            scan_type,
+            branch,
+            ts_created,
+            [{"package_name": k, "ticket_url": v} for k, v in new_tickets.items()],
+        )
+    return new_tickets
+
+
 def submit_source_code_vulns(
     input_file: str,
-    last_scan_result: dict,
     build_metadata: BuildMetadata,
     start_datetime: datetime,
-    only_report_new_risk: bool,
-):
-    # Read scan report
+) -> list:
+    """Triage untriaged source-code vulnerabilities, save all docs to ES, return untriaged risks."""
+    SCAN_TYPE = "source_code_vulnerability"
+    triaged_deps = get_triaged_deps(SCAN_TYPE, build_metadata["ref"])
+    ts = int(start_datetime.timestamp() * 1000)
 
     bulk_documents = []
     risks_to_report = []
@@ -49,11 +86,9 @@ def submit_source_code_vulns(
                 continue
             package_name = safe(v.get("Package Name"))
             package_version = safe(v.get("Package Version"))
-            result_key = (package_name, package_version)
-            is_new = result_key not in last_scan_result
             doc = {
-                "ts_created": int(start_datetime.timestamp() * 1000),
-                "s_type": "source_code_vulnerability",
+                "ts_created": ts,
+                "s_type": SCAN_TYPE,
                 "s_run_date": start_datetime.strftime("%Y-%m-%d"),
                 "s_build_url": build_metadata["build_url"],
                 "s_build_number": build_metadata["build_number"],
@@ -66,14 +101,23 @@ def submit_source_code_vulns(
                 "d_score": safe(v.get("Score")),
                 "s_status": safe(v.get("Status")),
                 "s_published_date": safe(v.get("Vulnerability Published Date")),
-                "s_upgrade_short_term": safe(v.get("Upgrade-Guidance", {}).get("Short-Term")),
-                "s_upgrade_long_term": safe(v.get("Upgrade-Guidance", {}).get("Long-Term")),
-                "b_is_new": is_new,
+                "s_package_fix_version": (
+                    safe(v.get("Upgrade-Guidance", {}).get("Long-Term"))
+                    or safe(v.get("Upgrade-Guidance", {}).get("Short-Term"))
+                    or "N/A"
+                ),
+                "s_license_ids": "N/A",
+                "s_ticket_url": triaged_deps.get(package_name),
             }
-            if is_new or not only_report_new_risk:
+            if package_name not in triaged_deps:
                 risks_to_report.append(doc)
-
             bulk_documents.append(doc)
+
+        new_tickets = _run_triage(risks_to_report, SCAN_TYPE, build_metadata["ref"], ts)
+        for doc in bulk_documents:
+            if doc["s_package_name"] in new_tickets:
+                doc["s_ticket_url"] = new_tickets[doc["s_package_name"]]
+
         if bulk_documents:
             _, errors = es_post(ES_POST_URL, bulk_documents)
             if errors:
@@ -91,13 +135,19 @@ def submit_source_code_vulns(
 
 def submit_source_code_licenses(
     input_file: str,
-    last_scan_result: dict,
     build_metadata: BuildMetadata,
     start_datetime: datetime,
-    only_report_new_risk: bool,
     license_check_token: str,
-):
-    map_preapproved = get_preapproved_deps_map("source_code_license")
+) -> list | None:
+    """Triage untriaged source-code license risks, save all docs to ES, return untriaged risks.
+
+    Returns None if the SBOM file is missing.
+    """
+    SCAN_TYPE = "source_code_license"
+    triaged_deps = get_triaged_deps(SCAN_TYPE, build_metadata["ref"])
+    ts = int(start_datetime.timestamp() * 1000)
+
+    map_preapproved = get_preapproved_deps_map(SCAN_TYPE)
     sbom_documents = []
     risks_to_report = []
     sbom_path = Path(input_file)
@@ -134,13 +184,11 @@ def submit_source_code_licenses(
                 or ""
                 for lic_entry in component_licenses
             ]
-            result_key = (package_name, package_version)
-            is_new = result_key not in last_scan_result
             purl = component.get("purl", "")
             supplier = component.get("supplier", {}).get("name", "") or ""
             doc = {
-                "ts_created": int(start_datetime.timestamp() * 1000),
-                "s_type": "source_code_license",
+                "ts_created": ts,
+                "s_type": SCAN_TYPE,
                 "s_run_date": start_datetime.strftime("%Y-%m-%d"),
                 "s_build_url": build_metadata["build_url"],
                 "s_build_number": build_metadata["build_number"],
@@ -149,16 +197,23 @@ def submit_source_code_licenses(
                 "s_package_version": package_version,
                 "s_purl": purl,
                 "s_supplier": supplier,
+                "s_package_fix_version": "N/A",
                 "s_license_ids": ",".join(license_ids),
                 "s_bom_ref": component.get("bom-ref"),
                 "s_component_type": component.get("type"),
-                "b_is_new": is_new,
+                "s_ticket_url": triaged_deps.get(package_name),
             }
-            if (is_new or not only_report_new_risk) and not is_preapproved(
+            if package_name not in triaged_deps and not is_preapproved(
                 map_preapproved, package_name, (component.get("type") or "unknown").lower()
             ):
                 risks_to_report.append(doc)
             sbom_documents.append(doc)
+
+        new_tickets = _run_triage(risks_to_report, SCAN_TYPE, build_metadata["ref"], ts)
+        for doc in sbom_documents:
+            if doc["s_package_name"] in new_tickets:
+                doc["s_ticket_url"] = new_tickets[doc["s_package_name"]]
+
         if sbom_documents:
             _, sbom_errors = es_post(ES_POST_URL, sbom_documents)
             if sbom_errors:
@@ -179,11 +234,14 @@ def submit_container_vulns(
     input_file: str,
     base_input_file: str,
     platform: str,
-    last_scan_result: dict,
     build_metadata: BuildMetadata,
     start_datetime: datetime,
-    only_report_new_risk: bool,
-):
+) -> list:
+    """Triage untriaged container vulnerabilities, save all docs to ES, return untriaged risks."""
+    SCAN_TYPE = "container_vulnerability"
+    triaged_deps = get_triaged_deps(SCAN_TYPE, build_metadata["ref"])
+    ts = int(start_datetime.timestamp() * 1000)
+
     release_data = load_json(input_file)
     base_data = load_json(base_input_file)
     trtllm_deps = get_vulns(input_file)
@@ -195,11 +253,9 @@ def submit_container_vulns(
     for v in trtllm_deps:
         package_name = v.get("package_name")
         package_version = v.get("package_version")
-        result_key = (package_name, package_version)
-        is_new = result_key not in last_scan_result
         doc = {
-            "ts_created": int(start_datetime.timestamp() * 1000),
-            "s_type": "container_vulnerability",
+            "ts_created": ts,
+            "s_type": SCAN_TYPE,
             "s_run_date": start_datetime.strftime("%Y-%m-%d"),
             "s_build_url": build_metadata["build_url"],
             "s_build_number": build_metadata["build_number"],
@@ -211,14 +267,21 @@ def submit_container_vulns(
             "s_package_name": package_name,
             "s_package_version": package_version,
             "s_package_fix_version": v.get("fix") or "N/A",
+            "s_license_ids": "N/A",
             "s_cve": v.get("vuln"),
             "s_cve_url": v.get("url"),
             "s_package_paths": ",".join(v.get("package_paths", [])),
-            "b_is_new": is_new,
+            "s_ticket_url": triaged_deps.get(package_name),
         }
-        if is_new or not only_report_new_risk:
+        if package_name not in triaged_deps:
             risks_to_report.append(doc)
         docs.append(doc)
+
+    new_tickets = _run_triage(risks_to_report, SCAN_TYPE, build_metadata["ref"], ts)
+    for doc in docs:
+        if doc["s_package_name"] in new_tickets:
+            doc["s_ticket_url"] = new_tickets[doc["s_package_name"]]
+
     if docs:
         _, errors = es_post(ES_POST_URL, docs)
         if errors:
@@ -235,17 +298,20 @@ def submit_container_licenses(
     input_file: str,
     base_input_file: str,
     platform: str,
-    last_scan_result: dict,
     build_metadata: BuildMetadata,
     start_datetime: datetime,
-    only_report_new_risk: bool,
     license_check_token: str,
-):
+) -> list:
+    """Triage untriaged container license risks, save all docs to ES, return untriaged risks."""
+    SCAN_TYPE = "container_license"
+    triaged_deps = get_triaged_deps(SCAN_TYPE, build_metadata["ref"])
+    ts = int(start_datetime.timestamp() * 1000)
+
     release_data = load_json(input_file)
     base_data = load_json(base_input_file)
-    trtllm_deps = diff_licenses("container_license", input_file, base_input_file)
+    trtllm_deps = diff_licenses(SCAN_TYPE, input_file, base_input_file)
 
-    map_preapproved = get_preapproved_deps_map("container_license")
+    map_preapproved = get_preapproved_deps_map(SCAN_TYPE)
 
     docs = []
     risks_to_report = []
@@ -272,11 +338,9 @@ def submit_container_licenses(
         license_ids = v.get("licenses", [])
         if license_ids and package_name not in non_permissive_pkgs:
             continue
-        result_key = (package_name, package_version)
-        is_new = result_key not in last_scan_result
         doc = {
-            "ts_created": int(start_datetime.timestamp() * 1000),
-            "s_type": "container_license",
+            "ts_created": ts,
+            "s_type": SCAN_TYPE,
             "s_run_date": start_datetime.strftime("%Y-%m-%d"),
             "s_build_url": build_metadata["build_url"],
             "s_build_number": build_metadata["build_number"],
@@ -287,14 +351,21 @@ def submit_container_licenses(
             "s_package_name": package_name,
             "s_package_version": package_version,
             "s_package_type": v.get("type"),
+            "s_package_fix_version": "N/A",
             "s_license_ids": ",".join(license_ids),
-            "b_is_new": is_new,
+            "s_ticket_url": triaged_deps.get(package_name),
         }
-        if (is_new or not only_report_new_risk) and not is_preapproved(
+        if package_name not in triaged_deps and not is_preapproved(
             map_preapproved, package_name, (v.get("type") or "unknown").lower()
         ):
             risks_to_report.append(doc)
         docs.append(doc)
+
+    new_tickets = _run_triage(risks_to_report, SCAN_TYPE, build_metadata["ref"], ts)
+    for doc in docs:
+        if doc["s_package_name"] in new_tickets:
+            doc["s_ticket_url"] = new_tickets[doc["s_package_name"]]
+
     if docs:
         _, errors = es_post(ES_POST_URL, docs)
         if errors:
