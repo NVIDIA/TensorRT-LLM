@@ -24,6 +24,7 @@
 #include <dlfcn.h>
 #include <numeric>
 #include <sstream>
+#include <tuple>
 
 namespace tensorrt_llm::executor::kv_cache
 {
@@ -195,10 +196,11 @@ std::pair<MemoryDescs, MemoryDescs> VmmDescSplitter::splitAndCoalesceTransferDes
     size_t prevSrcChunkSize = 0, prevDstChunkSize = 0;
     uintptr_t prevSrcBase = 0, prevDstBase = 0;
 
-    auto emitPiece = [&](uintptr_t srcAddr, uintptr_t dstAddr, size_t len, uint32_t srcDev, uint32_t dstDev,
-                         size_t srcChunkSize, uintptr_t srcBase, size_t dstChunkSize, uintptr_t dstBase)
+    auto emitPiece
+        = [&](uintptr_t srcAddr, uintptr_t dstAddr, size_t len, uint32_t srcDev, uint32_t dstDev, size_t srcChunkSize,
+              uintptr_t srcBase, size_t dstChunkSize, uintptr_t dstBase, bool regionsKnown)
     {
-        if (enableCoalesce && !outSrc.empty())
+        if (enableCoalesce && regionsKnown && !outSrc.empty())
         {
             auto const& lastSrc = outSrc.back();
             auto const& lastDst = outDst.back();
@@ -233,11 +235,15 @@ std::pair<MemoryDescs, MemoryDescs> VmmDescSplitter::splitAndCoalesceTransferDes
         bool valid = false;
     };
 
+    // Returns {chunkSize, regionBase, found}. A miss means the address is not covered by any
+    // region metadata (e.g. the peer did not send its region info). Two misses both look like
+    // {0, 0} yet may belong to two distinct regions, so pieces with a missed lookup on either
+    // side are never merged — a merge could silently cross a chunk or registration boundary.
     auto cachedLookup = [](uintptr_t addr, VramRegionMap const& regionMap, RegionCache& cache)
     {
         if (cache.valid && addr >= cache.base && addr - cache.base < cache.totalLen)
         {
-            return std::pair<size_t, uintptr_t>{cache.chunkSize, cache.base};
+            return std::tuple<size_t, uintptr_t, bool>{cache.chunkSize, cache.base, true};
         }
         auto it = regionMap.upper_bound(addr);
         if (it != regionMap.begin())
@@ -246,10 +252,10 @@ std::pair<MemoryDescs, MemoryDescs> VmmDescSplitter::splitAndCoalesceTransferDes
             if (addr >= it->first && addr - it->first < it->second.totalLen)
             {
                 cache = {it->first, it->second.totalLen, it->second.chunkSize, true};
-                return std::pair<size_t, uintptr_t>{cache.chunkSize, cache.base};
+                return std::tuple<size_t, uintptr_t, bool>{cache.chunkSize, cache.base, true};
             }
         }
-        return std::pair<size_t, uintptr_t>{0, 0};
+        return std::tuple<size_t, uintptr_t, bool>{0, 0, false};
     };
 
     RegionCache srcCache, dstCache;
@@ -258,8 +264,8 @@ std::pair<MemoryDescs, MemoryDescs> VmmDescSplitter::splitAndCoalesceTransferDes
     {
         auto const& src = srcVec[idx];
         auto const& dst = dstVec[idx];
-        auto [srcChunkSize, srcBase] = cachedLookup(src.getAddr(), localRegionMap, srcCache);
-        auto [dstChunkSize, dstBase] = cachedLookup(dst.getAddr(), remoteRegionMap, dstCache);
+        auto [srcChunkSize, srcBase, srcFound] = cachedLookup(src.getAddr(), localRegionMap, srcCache);
+        auto [dstChunkSize, dstBase, dstFound] = cachedLookup(dst.getAddr(), remoteRegionMap, dstCache);
 
         uintptr_t srcAddr = src.getAddr();
         uintptr_t dstAddr = dst.getAddr();
@@ -281,7 +287,7 @@ std::pair<MemoryDescs, MemoryDescs> VmmDescSplitter::splitAndCoalesceTransferDes
 
             size_t pieceSize = std::min({remaining, srcPieceSize, dstPieceSize});
             emitPiece(srcAddr, dstAddr, pieceSize, src.getDeviceId(), dst.getDeviceId(), srcChunkSize, srcBase,
-                dstChunkSize, dstBase);
+                dstChunkSize, dstBase, srcFound && dstFound);
             srcAddr += pieceSize;
             dstAddr += pieceSize;
             remaining -= pieceSize;

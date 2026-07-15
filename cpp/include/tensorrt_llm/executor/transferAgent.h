@@ -221,8 +221,11 @@ struct VmmDescSplitter
     /// min(srcPiece, dstPiece, remaining). Pairs are sorted by src address, and adjacent pieces
     /// whose src AND dst are both contiguous (same deviceId) are merged — but a merged desc never
     /// crosses a chunk boundary on either side, and never spans two distinct regions, so every
-    /// output desc stays within a single registered memory region. Non-kVRAM descs pass through
-    /// unchanged (no region info is available to bound the merge).
+    /// output desc stays within a single registered memory region. Merging requires region
+    /// metadata: a piece whose address misses the region map on either side is never merged,
+    /// because two unknown regions are indistinguishable and a merge could cross a chunk or
+    /// registration boundary. With no region metadata the result is split-only. Non-kVRAM descs
+    /// pass through unchanged (no region info is available to bound the merge).
     /// @param enableCoalesce When false, only split at chunk boundaries without merging pieces.
     [[nodiscard]] static std::pair<MemoryDescs, MemoryDescs> splitAndCoalesceTransferDescs(MemoryDescs const& srcDescs,
         MemoryDescs const& dstDescs, VramRegionMap const& localRegionMap, VramRegionMap const& remoteRegionMap,

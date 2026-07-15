@@ -646,7 +646,10 @@ void NixlTransferAgent::invalidateRemoteAgent(std::string const& name)
     // contiguous pieces. A coalesced descriptor never crosses a chunk boundary or a registered
     // region boundary on either side, so every descriptor still falls within a single registered
     // memory region on both local and remote sides. Set TRTLLM_NIXL_DISABLE_COALESCE=1 to fall back
-    // to split-only descriptors. Find remote agent's region map (empty map if not found).
+    // to split-only descriptors. Find remote agent's region map (empty map if not found — e.g. the
+    // peer's AgentDesc carried no region info; addresses missing from a map are never coalesced,
+    // so an empty remote map degrades to split-only rather than risking merges across unknown
+    // remote chunk/registration boundaries).
     static VramRegionMap const kEmptyMap;
     auto remoteIt = mRemoteVramRegionInfo.find(request.getRemoteName());
     auto const& remoteRegionMap = (remoteIt != mRemoteVramRegionInfo.end()) ? remoteIt->second : kEmptyMap;
