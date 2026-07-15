@@ -211,7 +211,11 @@ class PixtralVisionModel(torch.nn.Module, MultimodalEncoderMixin):
     def get_encoder_attention_metadata_capacity(
         self, max_num_items: int, max_num_tokens: int
     ) -> dict[str, int]:
-        """Map each nonempty image item to one Pixtral attention context."""
+        """Conservatively map each item to one Pixtral attention context.
+
+        Mistral3's processor normally injects the tighter merge-tile-aware
+        token bound into :meth:`setup_attn_metadata`.
+        """
         return {"attention": max(1, min(max_num_items, max_num_tokens))}
 
     @torch.inference_mode()

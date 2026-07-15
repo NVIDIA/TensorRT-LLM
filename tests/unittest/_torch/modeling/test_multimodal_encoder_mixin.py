@@ -69,6 +69,21 @@ def test_setup_attn_metadata_floors_small_item_count():
     }
 
 
+def test_setup_attn_metadata_accepts_processor_capacity():
+    encoder = _DummyEncoder()
+    encoder.setup_attn_metadata(
+        max_num_items=8,
+        max_num_tokens=100,
+        attention_metadata_capacity={"attention": 7},
+    )
+
+    assert encoder.attn_metadata.kwargs == {
+        "max_num_requests": 7,
+        "max_num_tokens": 100,
+        "kv_cache_manager": None,
+    }
+
+
 def test_setup_attn_metadata_is_idempotent_per_call():
     """Subsequent calls overwrite the previous AttentionMetadata, which
     matches how the engine drives `_set_up_multimodal_encoder_attn_metadata` (called

@@ -61,11 +61,17 @@ class MultimodalEncoderMixin:
             "attention": max(max_num_items, _ENCODER_FALLBACK_MAX_NUM_REQUESTS)
         }
 
-    def setup_attn_metadata(self, max_num_items: int,
-                            max_num_tokens: int) -> None:
+    def setup_attn_metadata(
+        self,
+        max_num_items: int,
+        max_num_tokens: int,
+        attention_metadata_capacity: Optional[dict[str, int]] = None,
+    ) -> None:
         """Map encoder item/token budgets to attention metadata capacity."""
-        capacities = self.get_encoder_attention_metadata_capacity(
-            max_num_items, max_num_tokens)
+        capacities = (attention_metadata_capacity
+                      if attention_metadata_capacity is not None else
+                      self.get_encoder_attention_metadata_capacity(
+                          max_num_items, max_num_tokens))
         self.attn_metadata = self.metadata_cls(
             max_num_requests=capacities["attention"],
             max_num_tokens=max_num_tokens,
