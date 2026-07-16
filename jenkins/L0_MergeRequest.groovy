@@ -807,7 +807,8 @@ def getCbtsResult(pipeline, testFilter, globalVars)
         pipeline.echo("CBTS: scope=${result.scope}, " +
                       "stages=${result.affected_stages.size()}")
         def runStatus = (testFilter[(IS_POST_MERGE)] ?: false) ? "post_merge" : "pre_merge"
-        _cbtsReportDecision(pipeline, globalVars, runStatus, "", output)
+        def multiGpuScheduled = (testFilter[(MULTI_GPU_FILE_CHANGED)] ?: false) as boolean
+        _cbtsReportDecision(pipeline, globalVars, runStatus, "", output, multiGpuScheduled)
         return result
     } catch (InterruptedException e) {
         throw e
@@ -819,10 +820,15 @@ def getCbtsResult(pipeline, testFilter, globalVars)
 
 // Post one CBTS decision record to OpenSearch (best-effort; never blocks CI).
 // decisionJson null for deferred; reason used only then. Context/creds via env.
-def _cbtsReportDecision(pipeline, globalVars, String status, String reason, String decisionJson)
+// multiGpuScheduled: true when multi-GPU pre-merge stages will actually run,
+// so they are included in the skip-rate denominator.
+def _cbtsReportDecision(pipeline, globalVars, String status, String reason, String decisionJson, boolean multiGpuScheduled = false)
 {
     try {
         def args = "--status ${status}"
+        if (multiGpuScheduled) {
+            args += " --multi-gpu-scheduled"
+        }
         if (decisionJson != null) {
             pipeline.writeFile(file: "${LLM_ROOT}/cbts_decision.json", text: decisionJson)
             args += " --decision cbts_decision.json"

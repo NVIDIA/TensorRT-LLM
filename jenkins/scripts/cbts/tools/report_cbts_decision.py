@@ -25,6 +25,7 @@ import argparse
 import json
 import logging
 import os
+import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -34,16 +35,30 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))  # jenkins/scripts/
 logger = logging.getLogger("report_cbts_decision")
 
 
+_MULTI_GPU_RE = re.compile(r"\d+_GPUs")
+
+
+def _is_multi_gpu_stage(name: str) -> bool:
+    return bool(_MULTI_GPU_RE.search(name))
+
+
 def _case_counts(
-    affected: list[str], kept_per_stage: dict, status: str, repo_root: str
+    affected: list[str],
+    kept_per_stage: dict,
+    status: str,
+    repo_root: str,
+    multi_gpu_scheduled: bool = True,
 ) -> tuple[int, int]:
-    """(cbts_cases, total_cases): cases CBTS runs vs all cases in the mode.
+    r"""(cbts_cases, total_cases): cases CBTS runs vs all cases in the mode.
 
     cbts = sum over hit stages of the Layer-3-kept count (or full if a stage
     wasn't narrowed). total = full case count over the whole trigger-mode
     universe: all non-Post-Merge stages for pre_merge, all stages for
-    post_merge. Only meaningful when CBTS ran; returns (0, 0) otherwise or on
-    any failure so the record still posts.
+    post_merge. When multi_gpu_scheduled is False (pre_merge only), stages
+    whose name matches /\d+_GPUs/ are excluded from both counts — they will
+    not be scheduled by Jenkins and should not inflate the denominator.
+    Only meaningful when CBTS ran; returns (0, 0) otherwise or on any failure
+    so the record still posts.
     """
     if status not in ("pre_merge", "post_merge"):
         return 0, 0
@@ -66,10 +81,22 @@ def _case_counts(
             )
 
         post = status == "post_merge"
+
+        def scheduled(name: str) -> bool:
+            # Post-Merge stages are already gated by the `post` flag below.
+            # For pre_merge, additionally exclude multi-GPU stages when not triggered.
+            return post or multi_gpu_scheduled or not _is_multi_gpu_stage(name)
+
         cbts = sum(
-            kept_per_stage.get(name, full(stages[name])) for name in affected if name in stages
+            kept_per_stage.get(name, full(stages[name]))
+            for name in affected
+            if name in stages and scheduled(name)
         )
-        total = sum(full(st) for name, st in stages.items() if post or "Post-Merge" not in name)
+        total = sum(
+            full(st)
+            for name, st in stages.items()
+            if (post or "Post-Merge" not in name) and scheduled(name)
+        )
         return cbts, total
     except Exception as exc:  # noqa: BLE001 - case rate is best-effort
         logger.info("CBTS case-count failed (non-fatal): %s", exc)
@@ -83,6 +110,7 @@ def build_document(
     pr_number: str,
     cbts_cases: int,
     total_cases: int,
+    multi_gpu_scheduled: bool = True,
 ) -> dict:
     """Build the typed OpenSearch doc (field prefixes: s_=str, l_=int, d_=float, flat_=dict)."""
     scope = decision.get("scope")
@@ -105,6 +133,7 @@ def build_document(
         "l_total_cases": total_cases,
         "l_cbts_cases": cbts_cases,
         "d_case_skip_rate": round(case_skip_rate, 4),
+        "b_multi_gpu_scheduled": multi_gpu_scheduled,
         "flat_detail": {
             "hit_stages": affected,
             "scopes": list(decision.get("scopes") or []),
@@ -122,6 +151,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--decision", default=None, help="Path to cbts/main.py decision JSON.")
     parser.add_argument("--pr-number", default="", help="PR / MR number for s_pr_number.")
     parser.add_argument("--repo-root", default=".", help="Repo root (for the case-rate counts).")
+    parser.add_argument(
+        "--multi-gpu-scheduled",
+        action="store_true",
+        default=False,
+        help="Pass when multi-GPU pre-merge stages will actually run (multi_gpu_file_changed=true). "
+        "Omit to exclude those stages from the skip-rate denominator.",
+    )
     args = parser.parse_args(argv)
 
     # Lazy import: any failure surfaces here and is caught by the __main__
@@ -136,9 +172,16 @@ def main(argv: list[str] | None = None) -> int:
         decision.get("affected_stage_test_counts") or {},
         args.status,
         args.repo_root,
+        multi_gpu_scheduled=args.multi_gpu_scheduled,
     )
     doc = build_document(
-        decision, args.status, args.reason, args.pr_number, cbts_cases, total_cases
+        decision,
+        args.status,
+        args.reason,
+        args.pr_number,
+        cbts_cases,
+        total_cases,
+        multi_gpu_scheduled=args.multi_gpu_scheduled,
     )
     OpenSearchDB.add_id_of_json(doc)
     ok = OpenSearchDB.postToOpenSearchDB(doc, CBTS_PROJECT_NAME)
