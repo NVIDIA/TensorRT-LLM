@@ -287,6 +287,29 @@ def _copy_deepseek_v4_fused_a_weight_scale(
     module.weight_scale.data.copy_(fused_a_scale)
 
 
+def _is_deepseek_v4_semantic_layer_target(
+    module_layer: int,
+    active_layer: int,
+    num_hidden_layers: int,
+    num_nextn_predict_layers: int,
+) -> bool:
+    """Return whether a runtime layer belongs to a checkpoint layer bucket.
+
+    Runtime MTP replicas map back to their checkpoint MTP layer by modulo.
+    Reject base layers before that operation: Python maps negative values into
+    the non-negative residue range, which would make base layers look like MTP
+    replicas, especially when the divisor is one.
+    """
+    if active_layer < num_hidden_layers:
+        return module_layer == active_layer
+    if module_layer < num_hidden_layers:
+        return False
+
+    checkpoint_mtp_idx = active_layer - num_hidden_layers
+    runtime_mtp_idx = module_layer - num_hidden_layers
+    return runtime_mtp_idx % num_nextn_predict_layers == checkpoint_mtp_idx
+
+
 def _remap_deepseek_v4_checkpoint_keys(
     weights: Dict, num_hidden_layers: int, kv_lora_rank: int = 448
 ) -> Dict:
@@ -877,19 +900,12 @@ class DeepseekV4WeightLoader:
                     is_target_module = False
                     if name.startswith("model.layers."):
                         module_layer = int(name.split(".", 3)[2])
-                        if active_layer >= self.config.num_hidden_layers:
-                            # Runtime may instantiate multiple MTP replicas.
-                            # The existing name rewrite below maps each replica
-                            # back to the checkpoint MTP layer modulo the number
-                            # of checkpoint next-token layers.
-                            checkpoint_mtp_idx = active_layer - self.config.num_hidden_layers
-                            runtime_mtp_idx = module_layer - self.config.num_hidden_layers
-                            is_target_module = (
-                                runtime_mtp_idx % self.config.num_nextn_predict_layers
-                                == checkpoint_mtp_idx
-                            )
-                        else:
-                            is_target_module = module_layer == active_layer
+                        is_target_module = _is_deepseek_v4_semantic_layer_target(
+                            module_layer=module_layer,
+                            active_layer=active_layer,
+                            num_hidden_layers=self.config.num_hidden_layers,
+                            num_nextn_predict_layers=self.config.num_nextn_predict_layers,
+                        )
                     if not is_target_module:
                         continue
             names = name.split(".")

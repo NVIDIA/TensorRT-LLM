@@ -35,6 +35,7 @@ from tensorrt_llm._torch.models.modeling_deepseekv4 import (
     DeepseekV4WeightLoader,
     _copy_deepseek_v4_fused_a_weight_scale,
     _deepseek_v4_pos_embd_params,
+    _is_deepseek_v4_semantic_layer_target,
     _remap_deepseek_v4_checkpoint_keys,
     _resolve_enable_fused_hc,
 )
@@ -238,6 +239,47 @@ def test_deepseek_v4_layerwise_loading_rejects_non_atomic_bucket(weights):
 
     with pytest.raises(ValueError, match="exactly one model layer or top-level weights"):
         loader.load_weights(weights, initial_bucket_loading=True)
+
+
+@pytest.mark.parametrize(
+    "module_layer,active_layer,num_hidden_layers,num_nextn_predict_layers,expected",
+    [
+        # Base-layer buckets select only the exact base layer.
+        (3, 3, 61, 1, True),
+        (4, 3, 61, 1, False),
+        # Regression: negative modulo must not classify base layers as MTP.
+        (0, 61, 61, 1, False),
+        (60, 61, 61, 1, False),
+        (0, 62, 61, 2, False),
+        # One checkpoint MTP layer may back multiple runtime replicas.
+        (61, 61, 61, 1, True),
+        (62, 61, 61, 1, True),
+        (63, 61, 61, 1, True),
+        # Multiple checkpoint MTP layers retain their modulo mapping.
+        (61, 61, 61, 2, True),
+        (63, 61, 61, 2, True),
+        (62, 61, 61, 2, False),
+        (62, 62, 61, 2, True),
+        (64, 62, 61, 2, True),
+        (63, 62, 61, 2, False),
+    ],
+)
+def test_deepseek_v4_semantic_layer_target(
+    module_layer,
+    active_layer,
+    num_hidden_layers,
+    num_nextn_predict_layers,
+    expected,
+):
+    assert (
+        _is_deepseek_v4_semantic_layer_target(
+            module_layer,
+            active_layer,
+            num_hidden_layers,
+            num_nextn_predict_layers,
+        )
+        is expected
+    )
 
 
 def test_deepseek_v4_fused_a_weight_scale_rebuilds_fp8_shape():
