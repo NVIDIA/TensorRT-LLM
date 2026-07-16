@@ -57,7 +57,7 @@ _NUM_PATCHES = 3 * 2 * 2  # 12
 # So final output = (1-sigma_1)*(1-sigma_2)*initial  =  0.243*0.478*initial  ≈  0.1162
 _SIGMA_1 = WanDMDPipeline.DMD_TIMESTEPS[1] / WanDMDPipeline.NUM_TRAIN_TIMESTEPS  # 0.757
 _SIGMA_2 = WanDMDPipeline.DMD_TIMESTEPS[2] / WanDMDPipeline.NUM_TRAIN_TIMESTEPS  # 0.522
-_ZERO_NOISE_EXPECTED_SCALE = (1.0 - _SIGMA_1) * (1.0 - _SIGMA_2)                  # ≈ 0.1162
+_ZERO_NOISE_EXPECTED_SCALE = (1.0 - _SIGMA_1) * (1.0 - _SIGMA_2)  # ≈ 0.1162
 
 _RANDN_PATH = "tensorrt_llm._torch.visual_gen.models.wan.pipeline_fastwan.randn_tensor"
 
@@ -105,9 +105,7 @@ def _make_stub(transformer):
     """
     pipe = object.__new__(WanDMDPipeline)
     pipe.__dict__["transformer"] = transformer
-    pipe.__dict__["pipeline_config"] = type(
-        "_Config", (), {"torch_dtype": torch.bfloat16}
-    )()
+    pipe.__dict__["pipeline_config"] = type("_Config", (), {"torch_dtype": torch.bfloat16})()
     return pipe
 
 
@@ -158,7 +156,6 @@ class TestDMDTimesteps:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 class TestDMDMath:
-
     def test_output_dtype_is_bfloat16(self):
         output = _run(
             _make_stub(_RecordingTransformer()),
@@ -181,6 +178,7 @@ class TestDMDMath:
     def test_final_step_does_not_call_randn_tensor(self):
         """randn_tensor must be called for steps 0 and 1 only — never on the final step."""
         from diffusers.utils.torch_utils import randn_tensor as _orig
+
         call_count = [0]
 
         def _counting(*args, **kwargs):
