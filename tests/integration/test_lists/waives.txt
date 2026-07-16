@@ -378,8 +378,6 @@ full:sm100/unittest/bindings SKIP (Disable for Blackwell)
 kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2Llama::test_chunked_prefill SKIP (https://nvbugs/6428002)
 kv_cache/test_kv_cache_v2_scheduler.py::TestKVCacheV2Llama::test_eviction_with_block_reuse SKIP (https://nvbugs/6462303)
 llmapi/test_llm_api_pytorch_bart.py::test_bart_pytorch_generate_encoder_decoder_end_to_end[bf16-kv-v1-cuda-graph-on-greedy-tp2-bart-large-cnn] SKIP (https://nvbugs/6463812)
-llmapi/test_llm_api_pytorch_moe_lora.py::test_mixtral_moe_routed_expert_fp8_multi_lora_varying_ranks[cudagraph] SKIP (https://nvbugs/6463829)
-llmapi/test_llm_api_pytorch_moe_lora.py::test_mixtral_moe_routed_expert_fp8_multi_lora_varying_ranks[eager] SKIP (https://nvbugs/6463829)
 llmapi/test_llm_examples.py::test_llmapi_speculative_decoding_eagle3 SKIP (https://nvbugs/6075431)
 perf/test_perf.py::test_perf[bart_large_cnn-plugin-float16-bs:8-input_output_len:60,20] SKIP # (https://nvidia.slack.com/archives/C059LSY62BT/p1704525727177449)
 perf/test_perf.py::test_perf[flan_t5_base-bench-float16-input_output_len:128,20] SKIP
