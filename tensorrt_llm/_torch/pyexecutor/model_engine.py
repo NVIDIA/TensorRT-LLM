@@ -22,7 +22,7 @@ from tensorrt_llm._utils import (is_trace_enabled, maybe_pin_memory, nvtx_range,
                                  prefer_pinned, release_gc, torch_dtype_to_str,
                                  trace_func)
 from tensorrt_llm.bindings.internal.runtime import TaskLayerModuleConfig
-from tensorrt_llm.inputs.multimodal import (MultimodalParams,
+from tensorrt_llm.inputs.multimodal import (MultimodalInput, MultimodalParams,
                                             MultimodalRuntimeData,
                                             _has_mm_payload_keys,
                                             check_mm_embed_cumsum_if_needed,
@@ -154,6 +154,25 @@ def _filter_piecewise_capture_num_tokens(
         if max_capturable_num_tokens < i <= max_num_tokens
     })
     return kept, unrecordable
+
+
+def _build_request_multimodal_input(
+        request: LlmRequest, cache_enabled: bool) -> Optional[MultimodalInput]:
+    # Skip building this input (and its `from_components` validation) when the cache is disabled.
+    if not cache_enabled or request.multimodal_hashes is None:
+        return None
+    # `multimodal_input` is consumed only by the encoder-cache key path
+    # (`MultimodalModelMixin._encoder_cache_keys`), which uses UUID-aware multimodal hashes
+    # internally. Although the `multimodal_uuids` are not exposed as an attribute, they remain in
+    # the backing C++ request for KV-cache block keys and cache events.
+    return MultimodalInput.from_components(
+        request.multimodal_hashes,
+        request.multimodal_positions,
+        request.multimodal_lengths,
+        mm_item_run_cu_offsets=request.multimodal_item_run_cu_offsets,
+        mm_run_positions=request.multimodal_run_positions,
+        mm_run_lengths=request.multimodal_run_lengths,
+    )
 
 
 def _filter_cuda_graph_batch_sizes(cuda_graph_batch_sizes: list[int],
@@ -361,7 +380,11 @@ class PyTorchModelEngine(ModelEngine):
             trust_remote_code=llm_args.trust_remote_code,
             **input_processor_kwargs)
         self.input_processor_with_hash = create_input_processor_with_hash(
-            self.input_processor)
+            self.input_processor,
+            encoder_cache_enabled=(
+                llm_args.multimodal_config is not None
+                and llm_args.multimodal_config.encoder_cache_max_bytes > 0),
+        )
         if model is None:
             lora_config: Optional[
                 LoraConfig] = None if is_draft_model else llm_args.lora_config
@@ -836,6 +859,13 @@ class PyTorchModelEngine(ModelEngine):
             pass
         logger.debug(f"Detected use_mrope: {use_mrope}")
         return use_mrope
+
+    @functools.cached_property
+    def _mm_encoder_cache_enabled(self) -> bool:
+        """Whether the multimodal encoder cache is active for this model."""
+        multimodal_config = self.model.model_config.multimodal_config
+        return (multimodal_config is not None
+                and multimodal_config.encoder_cache_max_bytes > 0)
 
     @property
     def is_warmup(self):
@@ -3296,6 +3326,10 @@ class PyTorchModelEngine(ModelEngine):
         draft_tokens = []
         draft_lens = []
         gen_request_seq_slots = []  # per generation request
+        # One-model rejection: slots of gen requests that produced 0 real draft
+        # tokens this step (marked in _handle_dynamic_draft_len); their stale
+        # draft_probs rows are one-hot'd after spec_metadata.prepare().
+        padding_gen_slots = []
         multimodal_params_list = []
         mrope_position_ids = [
         ]  # (start_idx, end_idx, (3,1,L) mrope_pos_ids) per multimodal request
@@ -3421,6 +3455,8 @@ class PyTorchModelEngine(ModelEngine):
                 )
 
             multimodal_params = MultimodalParams(
+                multimodal_input=_build_request_multimodal_input(
+                    request, self._mm_encoder_cache_enabled),
                 multimodal_data=request.py_multimodal_data,
                 multimodal_runtime=py_multimodal_runtime,
                 input_ids_start_offset=context_start_idx)
@@ -3541,6 +3577,10 @@ class PyTorchModelEngine(ModelEngine):
             self.runtime_draft_len)
         runtime_draft_token_buffer_width = runtime_tokens_per_gen_step - 1
         for request in extend_requests:
+            if getattr(request, "py_needs_onehot_draft_probs", False):
+                if request.py_seq_slot is not None:
+                    padding_gen_slots.append(request.py_seq_slot)
+                request.py_needs_onehot_draft_probs = False  # consume once
             request_ids.append(request.py_request_id)
             request_accepted_path[
                 request.
@@ -4278,6 +4318,11 @@ class PyTorchModelEngine(ModelEngine):
             spec_metadata.populate_sampling_params_for_one_model(
                 scheduled_requests.all_requests())
             spec_metadata.prepare()
+            # One-model rejection: one-hot the stale draft_probs rows of gen
+            # requests that produced no draft tokens this step, so the (possibly
+            # captured) rejection kernel reads a legal placeholder distribution.
+            spec_metadata.write_padding_onehot_draft_probs(
+                padding_gen_slots, self.runtime_draft_len)
             inputs['spec_metadata'] = spec_metadata
 
             if self.enable_attention_dp:
@@ -4351,6 +4396,8 @@ class PyTorchModelEngine(ModelEngine):
             # Multimodal
             if request.py_multimodal_data is not None:
                 multimodal_params = MultimodalParams(
+                    multimodal_input=_build_request_multimodal_input(
+                        request, self._mm_encoder_cache_enabled),
                     multimodal_data=request.py_multimodal_data,
                     input_ids_start_offset=context_start_idx)
                 multimodal_params.to_device("multimodal_data",

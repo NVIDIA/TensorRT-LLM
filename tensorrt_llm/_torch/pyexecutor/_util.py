@@ -581,6 +581,10 @@ class KvCacheCreator:
                 self._profiling_stage_data,
                 dict) and not self._profiling_stage_data.get("enable_mm_reqs"):
             return []
+        # No local multimodal encoder (disable_mm_encoder or MM E/P disagg):
+        # nothing to profile.
+        if getattr(self._model_engine.model, "mm_encoder", object()) is None:
+            return []
         input_processor = self._model_engine.input_processor
         _, encoder_max_num_tokens = self._llm_args.get_encoder_runtime_sizes()
         # Modality-agnostic: the model declares each modality's per-item token
@@ -627,6 +631,21 @@ class KvCacheCreator:
         with torch.inference_mode():
             return self._model_engine.model.encode_multimodal_inputs(
                 self._dummy_encoder_inputs)
+
+    def _reserve_multimodal_encoder_cache_memory(
+        self,
+        peak_memory: int,
+    ) -> int:
+        """Reserve encoder-cache capacity when the model implements that cache."""
+        model = self._model_engine.model
+        if (not isinstance(model, MultimodalModelMixin)
+                or not model.supports_encoder_cache):
+            return peak_memory
+
+        multimodal_config = model.model_config.multimodal_config
+        if multimodal_config is None:
+            return peak_memory
+        return peak_memory + multimodal_config.encoder_cache_max_bytes
 
     def _get_token_num_for_estimation(self) -> int:
         """Compute KV cache capacity required for estimate_max_kv_cache_tokens to succeed."""
@@ -875,6 +894,14 @@ class KvCacheCreator:
             peak_memory = total_used_bytes
             allocated_bytes = 0
             activation_bytes = 0
+
+        peak_memory_without_encoder_cache = peak_memory
+        peak_memory = self._reserve_multimodal_encoder_cache_memory(peak_memory)
+        if peak_memory != peak_memory_without_encoder_cache:
+            mem_gb = (peak_memory - peak_memory_without_encoder_cache) / GB
+            logger.info(
+                f"Reserving {mem_gb:.2f} GiB for the multimodal encoder cache while estimating KV cache "
+                "capacity.", )
 
         # calculate max memory from peak memory and free gpu memory fraction
         kv_cache_max_memory = self._cal_max_memory(peak_memory,
