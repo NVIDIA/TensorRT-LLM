@@ -2414,6 +2414,22 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             None
         ] * self.max_num_sequences
 
+    @staticmethod
+    def _is_draft_batch(requests: list[LlmRequest]) -> bool:
+        """Whether this batch belongs to the draft model.
+
+        Batches are homogeneous by construction: ModelDrafter builds all-draft
+        batches for its sample_async/update_requests calls on this shared
+        sampler, and PyExecutor's batches are all-target. The pending-steps
+        accounting relies on this to skip draft batches wholesale; assert it so
+        a mixed batch fails loudly instead of silently corrupting the counters.
+        """
+        is_draft: bool = requests[0].py_is_draft
+        assert all(r.py_is_draft == is_draft for r in requests), (
+            "sampler batch must be homogeneous (all-draft or all-target)"
+        )
+        return is_draft
+
     def get_generator(self, device: torch.device) -> torch.Generator:
         """Get a deterministic generator for the specified device.
 
@@ -3632,7 +3648,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         if not state.requests:
             return
 
-        if self._track_pending_steps and not state.requests[0].py_is_draft:
+        if self._track_pending_steps and not self._is_draft_batch(state.requests):
             for req in state.requests:
                 slot = req.py_seq_slot
                 if slot is not None and self._pending_steps[slot] > 0:
@@ -3798,7 +3814,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             num_context_logits_prefix_sum,
         )
 
-        if self._track_pending_steps and requests and not requests[0].py_is_draft:
+        if self._track_pending_steps and requests and not self._is_draft_batch(requests):
             for r in requests:
                 assert r.py_seq_slot is not None
                 self._pending_steps[r.py_seq_slot] += 1
@@ -4831,7 +4847,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
 
         if any(getattr(r, "py_bad_words", None) for r in sampling_requests):
             stale_by_one: list[bool] | None = None
-            if self._track_pending_steps and not sampling_requests[0].py_is_draft:
+            if self._track_pending_steps and not self._is_draft_batch(sampling_requests):
                 pending = [
                     self._pending_steps[r.py_seq_slot] if r.py_seq_slot is not None else 0
                     for r in sampling_requests
