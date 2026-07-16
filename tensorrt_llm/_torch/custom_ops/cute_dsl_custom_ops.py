@@ -7241,12 +7241,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             SPLIT_KV = compute_block_kv * 2  # NUM_MATH_WG = 2
             aligned_max_ctx = (
                 (max_context_len + SPLIT_KV - 1) // SPLIT_KV) * SPLIT_KV
-            # Persistent arena buffer (stable address across CUDA-graph replays)
-            # instead of a per-forward torch.empty: at long context this
-            # [B*next_n, kv_len] output is large and, as a churning transient, goes
-            # stale when the shared graph pool is perturbed by the co-captured spec
-            # sampler (the c128+ advanced-sampling IMA). Mirrors the CuteDSL topk
-            # runner's arena usage.
+            # Use a persistent arena buffer instead of a per-forward torch.empty
+            # so the output address stays stable across CUDA-graph replays.
             _reserve = torch.cuda.is_current_stream_capturing()
             logits = get_memory_buffers().get_buffer(
                 [B * next_n, aligned_max_ctx],
@@ -8097,12 +8093,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             SPLIT_KV = compute_block_kv * 2  # NUM_MATH_WG = 2
             aligned_max_ctx = (
                 (max_context_len + SPLIT_KV - 1) // SPLIT_KV) * SPLIT_KV
-            # Persistent arena buffer (stable address across CUDA-graph replays)
-            # instead of a per-forward torch.empty: at long context this
-            # [B*next_n, kv_len] output is large and, as a churning transient, goes
-            # stale when the shared graph pool is perturbed by the co-captured spec
-            # sampler (the c128+ advanced-sampling IMA). Mirrors the CuteDSL topk
-            # runner's arena usage.
+            # Use a persistent arena buffer instead of a per-forward torch.empty
+            # so the output address stays stable across CUDA-graph replays.
             _reserve = torch.cuda.is_current_stream_capturing()
             logits = get_memory_buffers().get_buffer(
                 [B * next_n, aligned_max_ctx],
