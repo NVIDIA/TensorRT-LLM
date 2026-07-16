@@ -56,24 +56,6 @@ def _has_compiled_blocks(*block_lists: Any) -> bool:
     )
 
 
-def _clear_stale_fake_pipeline_cached_flag() -> None:
-    """Clear cache_dit's leaked class-level FakeDiffusionPipeline._is_cached flag.
-
-    CachedAdapter.create_context sets ``pipe.__class__._is_cached = True``. For
-    transformer-only / pipe-less adapters the pipe class is FakeDiffusionPipeline,
-    and cache_dit.disable_cache(transformer) never clears the class-level flag.
-    A later re-enable (e.g. re-wrap after torch.compile) then sees its brand-new
-    FakeDiffusionPipeline as "already cached", skips cache-context creation, and
-    asserts in mock_blocks.
-    """
-    try:
-        from cache_dit.caching.block_adapters.block_adapters import FakeDiffusionPipeline
-    except ImportError:
-        return
-    if "_is_cached" in FakeDiffusionPipeline.__dict__:
-        del FakeDiffusionPipeline._is_cached
-
-
 def _resolved_enable_separate_cfg(cfg: CacheDiTConfig, default: bool) -> bool:
     if cfg.enable_separate_cfg is not None:
         return cfg.enable_separate_cfg
@@ -394,7 +376,6 @@ def enable_cache_dit_for_pipeline(
     pipeline: Any, cache_dit_cfg: CacheDiTConfig
 ) -> CacheDiTEnableResult:
     """Dispatch to a registered enabler or raise."""
-    _clear_stale_fake_pipeline_cached_flag()
     name = pipeline.__class__.__name__
     if name not in CUSTOM_CACHE_DIT_ENABLERS:
         raise ValueError(
