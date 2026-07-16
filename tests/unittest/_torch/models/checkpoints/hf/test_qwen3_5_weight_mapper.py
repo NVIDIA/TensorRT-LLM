@@ -18,11 +18,15 @@ from types import SimpleNamespace
 import torch
 
 from tensorrt_llm._torch.models.checkpoints.hf.qwen3_5_weight_mapper import Qwen3_5MoeHfWeightMapper
+from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
 
 def _make_mapper(dtype=torch.bfloat16):
     mapper = Qwen3_5MoeHfWeightMapper()
-    mapper._config = SimpleNamespace(pretrained_config=SimpleNamespace(torch_dtype=dtype))
+    mapper._config = SimpleNamespace(
+        pretrained_config=SimpleNamespace(torch_dtype=dtype),
+        quant_config_dict={},
+    )
     return mapper
 
 
@@ -30,19 +34,23 @@ def test_qwen35_modelopt_preprocess_preserves_scalar_fp8_scale_name():
     mapper = _make_mapper()
     scale = torch.tensor(0.5, dtype=torch.float32)
 
-    is_modelopt_ckpt, weights = mapper._preprocess_modelopt_ckpt(
+    weights, is_modelopt_pb_wo = mapper._normalize_scale_names(
         {
             "model.layers.0.linear_attn.out_proj.weight_scale": scale,
-        }
+        },
+        QuantAlgo.MIXED_PRECISION,
     )
 
-    assert is_modelopt_ckpt
+    assert not is_modelopt_pb_wo
     assert "model.layers.0.linear_attn.out_proj.weight_scale" in weights
     assert weights["model.layers.0.linear_attn.out_proj.weight_scale"].shape == torch.Size([])
 
 
 def test_qwen35_rescales_per_tensor_fp8_linear_attention_qkvz_projection():
     mapper = _make_mapper(dtype=torch.bfloat16)
+    mapper._config.quant_config_dict = {
+        "model.layers.0.linear_attn.in_proj_qkvz": QuantConfig(quant_algo=QuantAlgo.FP8),
+    }
     mapper._config.pretrained_config.linear_num_key_heads = 1
     mapper._config.pretrained_config.linear_num_value_heads = 1
     mapper._config.pretrained_config.linear_key_head_dim = 2
@@ -73,7 +81,7 @@ def test_qwen35_rescales_per_tensor_fp8_linear_attention_qkvz_projection():
         z_input_scale_name: torch.tensor(1.0, dtype=torch.float32),
     }
 
-    updated = mapper._rescale_linear_attn_qkvz_per_tensor_fp8(weights)
+    updated = mapper._requantize_linear_attn_fp8_qkvz(weights)
     packed = mapper._pack_split_projections(updated)
 
     assert scale_name not in updated

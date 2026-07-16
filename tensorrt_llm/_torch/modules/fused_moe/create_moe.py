@@ -28,6 +28,22 @@ from .moe_load_balancer import get_moe_load_balancer
 from .routing import BaseMoeRoutingMethod
 
 
+def _is_same_or_child_module_path(lhs: str, rhs: str) -> bool:
+    return lhs == rhs or lhs.startswith(f"{rhs}.") or rhs.startswith(f"{lhs}.")
+
+
+def _get_layer_quant_config(model_config: ModelConfig,
+                            layer_idx: Optional[int]) -> Optional[QuantConfig]:
+    if layer_idx is None or model_config.quant_config_dict is None:
+        return None
+
+    moe_module_name = f"model.layers.{layer_idx}.mlp.experts"
+    for name, quant_config in model_config.quant_config_dict.items():
+        if _is_same_or_child_module_path(name, moe_module_name):
+            return quant_config
+    return None
+
+
 def _get_pretrained_megamoe_capability_args(
         model_config: ModelConfig) -> Dict[str, Optional[object]]:
     """Extract dtype / hidden / intermediate kwargs for MegaMoE
@@ -59,9 +75,9 @@ def get_moe_cls(
     layer_idx: Optional[int] = None,
 ) -> Type[MoE]:
     moe_backend = model_config.moe_backend
-    quant_config = model_config.quant_config
-    if override_quant_config is not None:
-        quant_config = override_quant_config
+    quant_config = (override_quant_config
+                    or _get_layer_quant_config(model_config, layer_idx)
+                    or model_config.quant_config)
     layer_prefix = f"[layer_idx={layer_idx}] " if layer_idx is not None else ""
     if moe_backend.upper() == "MARLIN":
         # Marlin MoE is a Hopper-specific NVFP4 W4A16 backend. Require nvfp4
@@ -74,14 +90,18 @@ def get_moe_cls(
     elif moe_backend.upper() == "VANILLA":
         return VanillaMoE
     elif moe_backend.upper() == "CUTEDSL":
+        has_w4a16_nvfp4 = (quant_config is not None
+                           and quant_config.quant_algo == QuantAlgo.W4A16_NVFP4)
         if quant_config is not None and (
                 quant_config.quant_mode.has_fp8_block_scales()
-                or quant_config.quant_mode.has_nvfp4()):
-            # On SM120 / SM121 + NVFP4 the cuteDSL family member is the
+                or quant_config.quant_mode.has_nvfp4() or has_w4a16_nvfp4):
+            # On SM120 / SM121 + NVFP4/W4A16_NVFP4 the cuteDSL family member is the
             # hybrid CUTLASS-prefill / FlashInfer NVFP4 MoE decode backend
             # (CuteDslB12xFusedMoE). Prefer it when flashinfer is importable;
             # otherwise fall through to CuteDslFusedMoE for SM100 / SM103.
-            if quant_config.quant_mode.has_nvfp4():
+            has_nvfp4 = (quant_config.quant_mode.has_nvfp4()
+                         and not has_w4a16_nvfp4)
+            if has_nvfp4 or has_w4a16_nvfp4:
                 from tensorrt_llm._utils import get_sm_version
                 sm_version = get_sm_version()
                 if sm_version in CuteDslB12xFusedMoE._SUPPORTED_SM_VERSIONS:
@@ -97,13 +117,24 @@ def get_moe_cls(
                     except ImportError:
                         logger.warning(
                             "CuteDslB12xFusedMoE eligible (SM%d + NVFP4) "
-                            "but flashinfer is not importable; using CuteDslFusedMoE.",
+                            "but flashinfer is not importable; using %s.",
                             sm_version,
+                            "CutlassFusedMoE"
+                            if has_w4a16_nvfp4 else "CuteDslFusedMoE",
                         )
+                        if has_w4a16_nvfp4:
+                            return CutlassFusedMoE
+                elif has_w4a16_nvfp4:
+                    logger.warning(
+                        "CuteDslB12xFusedMoE requires SM120/121 for W4A16_NVFP4 "
+                        "(got SM%d). Using CutlassFusedMoE.",
+                        sm_version,
+                    )
+                    return CutlassFusedMoE
             return CuteDslFusedMoE
         else:
             logger.warning(
-                f"{layer_prefix}CuteDslFusedMoE only supports fp8_block_scales and nvfp4. "
+                f"{layer_prefix}CuteDslFusedMoE only supports fp8_block_scales, nvfp4, and w4a16_nvfp4. "
                 f"Check out details in quant_config: {quant_config}. Using CutlassFusedMoE instead."
             )
             return CutlassFusedMoE
@@ -212,7 +243,8 @@ def resolve_moe_cls(
 ) -> Type[MoE]:
     moe_cls = get_moe_cls(model_config, override_quant_config, layer_idx)
 
-    effective_quant_config = override_quant_config or model_config.quant_config
+    effective_quant_config = (override_quant_config or _get_layer_quant_config(
+        model_config, layer_idx) or model_config.quant_config)
     has_quant = (effective_quant_config is not None
                  and effective_quant_config.layer_quant_mode.has_any_quant(
                      exclude_kv_cache=True))

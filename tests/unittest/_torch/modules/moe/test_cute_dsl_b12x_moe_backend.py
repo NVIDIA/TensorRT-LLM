@@ -334,8 +334,8 @@ def test_w4a16_nvfp4_post_load_uses_modelopt_scale_contract(monkeypatch):
     module.fc31_input_scale = torch.tensor(2.0, dtype=torch.float32)
     module.fc2_input_scale = torch.tensor(4.0, dtype=torch.float32)
 
-    with patch.object(NVFP4CutlassFusedMoEMethod, "post_load_weights", return_value=None):
-        NVFP4CuteDslB12xFusedMoEMethod().post_load_weights(module)
+    with patch.object(NVFP4CutlassFusedMoEMethod, "transform_weights", return_value=None):
+        NVFP4CuteDslB12xFusedMoEMethod().transform_weights(module)
 
     assert _FakeB12xWrapper.calls
     wrapper_kwargs = _FakeB12xWrapper.calls[0]
