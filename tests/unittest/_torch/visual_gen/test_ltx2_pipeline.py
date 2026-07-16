@@ -1239,20 +1239,30 @@ class TestLTX2TwoStageLoRAHelpers:
         assert queried_devices == ["cuda:1"]
 
     def test_two_stage_cuda_graph_key_includes_lora_state(self):
-        """Original and merged LoRA bindings must not share CUDA graph keys."""
-        lora_state = {"value": "original"}
+        """No (lora_state, topology) combination may share a CUDA graph key.
+
+        Red/green matrix over the states production visits — (original,
+        default) for stage 1 and (merged, stage2) for stage 2 — plus the
+        off-diagonal combinations, proving both key dimensions isolate
+        independently.
+        """
+        state = {"lora": "original", "topology": "default"}
         runner = ltx2_two_stages._LTX2TwoStageCUDAGraphRunner(
             ltx2_two_stages.CUDAGraphRunnerConfig(use_cuda_graph=True),
-            lambda: lora_state["value"],
+            lambda: state["lora"],
+            lambda: state["topology"],
         )
 
-        original_key = runner.get_graph_key(torch.empty(1, 2))
-        lora_state["value"] = "merged"
-        merged_key = runner.get_graph_key(torch.empty(1, 2))
+        keys = {}
+        for lora in ("original", "merged"):
+            for topology in ("default", "stage2"):
+                state["lora"], state["topology"] = lora, topology
+                keys[(lora, topology)] = runner.get_graph_key(torch.empty(1, 2))
 
-        assert original_key != merged_key
-        assert original_key[-1] == ("ltx2_two_stage_lora_state", "original")
-        assert merged_key[-1] == ("ltx2_two_stage_lora_state", "merged")
+        assert len(set(keys.values())) == 4, "graph keys shared across states"
+        for (lora, topology), key in keys.items():
+            assert key[-2] == ("ltx2_two_stage_lora_state", lora)
+            assert key[-1] == ("ltx2_two_stage_topology", topology)
 
     def test_two_stage_cuda_graph_setup_uses_pipeline_config(self):
         """CUDA graph setup runs before the two-stage model_config is assigned."""

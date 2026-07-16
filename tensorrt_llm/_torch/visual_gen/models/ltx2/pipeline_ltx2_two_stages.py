@@ -11,6 +11,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import safetensors.torch
 import torch
+import torch.distributed as dist
 
 from tensorrt_llm._torch.modules.linear import Linear, UnquantizedLinearMethod
 from tensorrt_llm._torch.visual_gen.cuda_graph_runner import CUDAGraphRunnerConfig
@@ -46,6 +47,7 @@ from .pipeline_ltx2 import (
     _LTX2CUDAGraphRunner,
     _prefetch_ltx2_safetensors_files,
 )
+from .transformer_ltx2 import Stage2Groups
 
 STAGE_2_DISTILLED_SIGMA_VALUES = [0.909375, 0.725, 0.421875, 0.0]
 
@@ -933,14 +935,17 @@ class _LTX2TwoStageCUDAGraphRunner(_LTX2CUDAGraphRunner):
         self,
         config: CUDAGraphRunnerConfig,
         lora_state_getter: Callable[[], str],
+        topology_getter: Callable[[], str],
     ) -> None:
         super().__init__(config)
         self._lora_state_getter = lora_state_getter
+        self._topology_getter = topology_getter
 
     def get_graph_key(self, *args, **kwargs):
         return (
             *super().get_graph_key(*args, **kwargs),
             ("ltx2_two_stage_lora_state", self._lora_state_getter()),
+            ("ltx2_two_stage_topology", self._topology_getter()),
         )
 
 
@@ -970,6 +975,42 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
 
     def _current_lora_cuda_graph_state(self) -> str:
         return getattr(self, "_lora_cuda_graph_state", "original")
+
+    def _current_topology_state(self) -> str:
+        return getattr(self, "_stage2_topology_state", "default")
+
+    def _stage2_transformer_groups(self) -> Optional[Stage2Groups]:
+        """Build the stage-2 dual-topology groups (once, collectively, at load).
+
+        cfg is flattened into ulysses while every other mesh dim's groups are
+        preserved verbatim, so cp-side attention wrappers keep their peers. The
+        only new communicators are the stage-2 ulysses groups, plus one
+        seq-plane group at cp>1 whose shard/gather order is cp-major (encoded
+        via seq_rank/gather_index — ``dist.new_group`` sorts its rank list).
+        """
+        vgm = self.pipeline_config.visual_gen_mapping
+        if vgm is None or vgm.world_size <= 1 or vgm.cfg_size <= 1:
+            return None
+        fold = vgm.flatten_cfg_ranks()
+        uly_group = None
+        # Every rank must create EVERY group (world-collective); keep only ours.
+        for ranks in fold:
+            g = dist.new_group(ranks, use_local_synchronization=False)
+            if self.rank in ranks:
+                uly_group = g
+        flat = [r for ranks in fold for r in ranks]
+        if len(fold) == 1:
+            seq_group, gather_index = uly_group, None
+        else:
+            seq_group = dist.new_group(sorted(flat), use_local_synchronization=False)
+            gather_index = flat
+        return Stage2Groups(
+            ulysses_group=uly_group,
+            seq_group=seq_group,
+            seq_rank=flat.index(self.rank),
+            seq_size=len(flat),
+            gather_index=gather_index,
+        )
 
     def _is_cuda_graph_enabled(self) -> bool:
         for config_name in ("pipeline_config", "model_config"):
@@ -1002,6 +1043,7 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
         runner = _LTX2TwoStageCUDAGraphRunner(
             CUDAGraphRunnerConfig(use_cuda_graph=True),
             self._current_lora_cuda_graph_state,
+            self._current_topology_state,
         )
         compile_note = " (with torch.compile)" if self.pipeline_config.torch_compile.enable else ""
         logger.info(
@@ -1203,6 +1245,7 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
         """
         # Optional prompt enhancement (applied once and reused for both stages).
         self._lora_cuda_graph_state = "original"
+        self._stage2_topology_state = "default"
         if enhance_prompt:
             logger.info("Enhancing prompt with Gemma3 (two-stage)...")
             prompt_text = prompt if isinstance(prompt, str) else prompt[0]
@@ -1211,6 +1254,23 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
             enhance_prompt = False
 
         _assert_resolution(height, width, is_two_stage=True)
+        if self.transformer._has_stage2:
+            # Fail fast (no serial fallback exists): the full-resolution latent
+            # token count must divide the stage-2 seq plane. Uses the canonical
+            # VAE scale factors rather than re-deriving them.
+            lat = VideoLatentShape.from_pixel_shape(
+                VideoPixelShape(
+                    batch=1, frames=num_frames, height=height, width=width, fps=frame_rate
+                )
+            )
+            s2_tokens = lat.frames * lat.height * lat.width
+            seq = self.transformer._sharder_s2.size
+            if s2_tokens % seq != 0:
+                raise ValueError(
+                    f"Stage-2 patchified token count ({s2_tokens} = {lat.frames}x"
+                    f"{lat.height}x{lat.width}) is not divisible by the stage-2 "
+                    f"seq-plane size ({seq}); adjust resolution or num_frames."
+                )
         pipeline_start = time.time()
         # Two-stage timing: stage 1 is reported as ``denoise``; stage 2
         # (spatial upsample + refinement denoise + decode) folds into
@@ -1435,6 +1495,13 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
                 logger.info(f"Merged distilled LoRA ({n} params) for stage 2 (BF16 weights)")
 
             gpu_tl.mark("lora_bind")
+            if self.transformer._has_stage2:
+                # Graph key first, then transformer state: no window where the
+                # stage-2 stacks are live under the default key. The switch
+                # precedes prepare_text_cache (topology-dependent) inside
+                # _refinement_denoise and is restored in the finally below.
+                self._stage2_topology_state = "stage2"
+                self.transformer.set_ulysses_topology(is_stage2=True)
             video_latents, audio_latents = self._refinement_denoise(
                 video_latents=video_latents,
                 audio_latents=audio_latents,
@@ -1452,6 +1519,9 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
             gpu_tl.mark("stage2_denoise")
             stage2_denoise_time = time.time() - stage2_start
             logger.info(f"Stage 2 denoising time: {stage2_denoise_time:.2f}s (BF16 weights)")
+            if self.transformer._has_stage2:
+                self._stage2_topology_state = "default"
+                self.transformer.set_ulysses_topology(is_stage2=False)
             if using_persistent_lora:
                 lora_cache.bind_original()
                 self._lora_cuda_graph_state = "original"
