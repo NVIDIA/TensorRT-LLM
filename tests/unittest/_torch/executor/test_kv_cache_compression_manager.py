@@ -279,40 +279,39 @@ class TestFactory:
             mock_logger.warning.assert_called_once()
 
     def test_factory_accepts_independent_draft_manager(self):
-        from tensorrt_llm._torch.speculative.interface import SpeculativeDecodingMode
-
         cfg = MagicMock()
         cfg.algorithm = "made_up_method"
         target = _v2_manager(is_draft=False)
         draft = _v2_manager(is_draft=True)
-        spec_config = SimpleNamespace(spec_dec_mode=SpeculativeDecodingMode.EAGLE3_ONE_MODEL)
 
         assert (
             create_kv_cache_compression_manager(
                 cfg,
                 target,
                 draft_kv_cache_manager=draft,
-                spec_config=spec_config,
             )
             is None
         )
 
     def test_eviction_method_predicate_defaults_false(self):
-        # The base is not an evicting method, so the factory's speculative
-        # mode gate never restricts it: methods that do not touch the draft
-        # KV (e.g. offloading) work with any speculative mode.
+        # Non-evicting methods (e.g. offloading) are never restricted by the
+        # speculative mode: the call-site gate reads this config predicate.
+        from tensorrt_llm.llmapi.llm_args import KvCacheCompressionConfig
+
+        config = KvCacheCompressionConfig(algorithm="offload")
+        assert config.is_eviction_method() is False
         m = BaseKVCacheCompressionManager(_v2_manager(is_draft=False))
-        assert m.is_eviction_method() is False
         assert not hasattr(m, "spec_config")
 
-    def test_eviction_method_predicate_follows_class_flag(self):
-        # The factory's speculative gate reads this predicate: an evicting
-        # method (physically_evicts_cached_tokens True) only accepts modes
-        # whose draft KV is a standard paged cache in the same forward.
-        class _EvictingManager(BaseKVCacheCompressionManager):
-            physically_evicts_cached_tokens = True
+    def test_spec_gate_only_restricts_eviction_methods(self):
+        from tensorrt_llm._torch.pyexecutor._util import kv_cache_compression_supported_with_spec
+        from tensorrt_llm._torch.speculative.interface import SpeculativeDecodingMode
+        from tensorrt_llm.llmapi.llm_args import KvCacheCompressionConfig
 
-        assert _EvictingManager.is_eviction_method() is True
+        config = KvCacheCompressionConfig(algorithm="offload")
+        spec_config = SimpleNamespace(spec_dec_mode=SpeculativeDecodingMode.DFLASH)
+        assert kv_cache_compression_supported_with_spec(config, spec_config, None) is True
+        assert kv_cache_compression_supported_with_spec(config, None, None) is True
 
 
 # ---------------------------------------------------------------------- #

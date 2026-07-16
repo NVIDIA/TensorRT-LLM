@@ -3268,6 +3268,10 @@ class KvCacheCompressionConfig(StrictBaseModel):
         "compression manager is built. Concrete algorithm configs subclass this "
         "and set the value.")
 
+    def is_eviction_method(self) -> bool:
+        """Whether this method physically evicts cached tokens."""
+        return False
+
 
 @PybindMirror.mirror_pybind_fields(_AgentTreeConfig)
 class AgentTreeConfig(StrictBaseModel, PybindMirror):

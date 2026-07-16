@@ -2032,20 +2032,43 @@ def _create_kv_cache_manager(
     return kv_cache_manager
 
 
+def kv_cache_compression_supported_with_spec(
+    config: KvCacheCompressionConfig,
+    spec_config: Optional[SpeculativeConfig],
+    draft_kv_cache_manager: Optional[KVCacheManagerV2],
+) -> bool:
+    """Decide, before any manager is created, whether the configured
+    compression method supports the speculative setup. Logs the reason and
+    returns False when it does not; the run then stays uncompressed."""
+    if spec_config is None or not config.is_eviction_method():
+        return True
+    # Evicting methods co-compact the draft KV, so they only support spec
+    # modes whose draft KV is a standard paged cache in the same forward
+    # (one-model speculation).
+    mode = spec_config.spec_dec_mode
+    if not (mode.is_mtp_one_model() or mode.is_eagle3_one_model()):
+        logger.warning(
+            "KV-cache compression algorithm '%s' evicts cached tokens and "
+            "does not support speculative decoding mode %s (the draft KV must "
+            "be a standard paged cache compacted together with the target); "
+            "running without a compression manager.", config.algorithm,
+            mode.name)
+        return False
+    return True
+
+
 def create_kv_cache_compression_manager(
     config: KvCacheCompressionConfig,
     kv_cache_manager: KVCacheManagerV2,
     draft_kv_cache_manager: Optional[KVCacheManagerV2] = None,
-    spec_config: Optional[SpeculativeConfig] = None,
 ) -> Optional[BaseKVCacheCompressionManager]:
     """Build the KV-cache compression manager for ``config.algorithm``, or return
     None if no algorithm matches.
 
     Called from ``create_py_executor`` and registered as a resource manager,
     like the KV cache manager itself. Concrete algorithms add a dispatch branch
-    here; the framework ships none. Speculative-decoding compatibility is also
-    decided here: a compression manager is only created when the speculative
-    mode supports it, otherwise the run stays uncompressed.
+    here; the framework ships none. Speculative-decoding compatibility is
+    decided by the caller via ``kv_cache_compression_supported_with_spec``.
     """
     logger.warning(
         "KV-cache compression algorithm '%s' is not registered; running without "
@@ -2259,16 +2282,19 @@ def create_py_executor_instance(
     kv_cache_compression_config = getattr(llm_args,
                                           "kv_cache_compression_config", None)
     if kv_cache_compression_config is not None:
-        compression_manager = create_kv_cache_compression_manager(
-            kv_cache_compression_config,
-            kv_cache_manager,
-            draft_kv_cache_manager=resources.get(
-                ResourceManagerType.DRAFT_KV_CACHE_MANAGER),
-            spec_config=spec_config,
-        )
-        if compression_manager is not None:
-            resources[ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER] = (
-                compression_manager)
+        draft_kv_cache_manager = resources.get(
+            ResourceManagerType.DRAFT_KV_CACHE_MANAGER)
+        if kv_cache_compression_supported_with_spec(kv_cache_compression_config,
+                                                    spec_config,
+                                                    draft_kv_cache_manager):
+            compression_manager = create_kv_cache_compression_manager(
+                kv_cache_compression_config,
+                kv_cache_manager,
+                draft_kv_cache_manager=draft_kv_cache_manager,
+            )
+            if compression_manager is not None:
+                resources[ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER] = (
+                    compression_manager)
 
     resource_manager = ResourceManager(resources)
 
