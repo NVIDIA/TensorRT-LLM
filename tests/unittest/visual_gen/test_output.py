@@ -765,14 +765,18 @@ def test_pipeline_output_has_eight_fields():
     """PipelineOutput has the eight expected fields."""
     field_names = {f.name for f in fields(PipelineOutput)}
     assert field_names == {
+        "request_id",
         "image",
         "video",
         "audio",
+        "action",
         "frame_rate",
         "audio_sample_rate",
-        "pre_denoise",
-        "denoise",
-        "post_denoise",
+        "raw_action_dim",
+        "action_mode",
+        "domain_id",
+        "error",
+        "metrics",
     }
 
 
