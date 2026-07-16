@@ -243,6 +243,7 @@ class GvrTopKKernel:
         p1b_cache: Optional[bool] = None,
         fb_fix: bool = True,
         fb_alpha: float = 0.2,
+        r0_vseed: Optional[bool] = None,
         enable_p4_rank_scatter: Optional[bool] = None,
         enable_p4_rank_scatter_exact: Optional[bool] = None,
     ):
@@ -373,6 +374,14 @@ class GvrTopKKernel:
         #   to the pre-R0 upstream base.
         # r0_qfracs: descending h-space quantile fractions defining the M
         #   candidate rungs (ascending threshold values); None => no rungs.
+        # r0_vseed: park P1's pmean (the secant init probe) as one extra
+        #   "virtual seed" rung column in the M-ary count pass (no extra
+        #   memory traffic or sync; the column reuses the secant per-thread
+        #   count buffer, so SMEM does not grow). Adapts the admission
+        #   ladder to the row's value distribution: fixes the fat-admission
+        #   regime (a coarse quantile rung admitting ~kC candidates where
+        #   pmean admits ~K) and donates a measured interior bracket point
+        #   to the fallback refine on a full miss. None => enable_r0.
         # mt_unroll: 4-way unroll factor for block_count_ge_multi.
         # p1b_cache: stash the K gathered preIdx values in SMEM so P1b skips
         #   a second GMEM random gather (dtype-gated in a later commit).
@@ -400,8 +409,16 @@ class GvrTopKKernel:
         #  - kC-diet: K512 single-CTA -> kC=3072 (saves 16KB SMEM; 16-bit win,
         #    fp32 neutral). kC>=2560 is the K512 16-bit tie-safety contract so
         #    3072 is safe; the cluster port and K1024/K2048 stay stock.
+        if r0_vseed is None:
+            r0_vseed = enable_r0
         if enable_r0 and r0_qfracs is None:
-            r0_qfracs = (0.85, 0.35)
+            # Per-K default (2026-07-16 vseed full-envelope audit, 2772
+            # cells): with the virtual seed rung on, pmean covers q.35's
+            # admission region for K512/K1024 (2 count columns = zero
+            # column tax); K2048 keeps q.35 (kC/K = 2.5 makes a fat admit
+            # costlier than a slim 2-pass miss). Without vseed, q.35 must
+            # stay for all K (it is the only slim rung).
+            r0_qfracs = (0.85, 0.35) if (top_k == 2048 or not r0_vseed) else (0.85,)
         if enable_r0 and p1b_cache is None:
             if cluster_size > 1:
                 p1b_cache = True
@@ -417,6 +434,18 @@ class GvrTopKKernel:
                 "r0_qfracs must be descending h (ascending threshold value)"
             )
         self.M_thr = len(self.r0_qfracs)
+        # --- vseed (2026-07-16): fold P1's pmean (the secant init
+        # probe) into the M-ary R0 count pass as one extra "virtual rung".
+        # Fixes the flash-1M fat-admission regression (the coarse q.85 rung
+        # admits ~4400 candidates where pmean admits ~630 -> 7x P3/P4 cand
+        # cost) and, on a true miss, donates a measured interior bracket
+        # point to the fallback refine. Const-folded: r0_vseed=False kernels
+        # are byte-identical to before. M_qf = rungs P1b places from qneeds;
+        # M_thr = total columns counted/admitted (M_qf + 1 when vseed).
+        self.r0_vseed = bool(r0_vseed) and bool(enable_r0) and self.M_thr > 0
+        self.M_qf = self.M_thr
+        if self.r0_vseed:
+            self.M_thr = self.M_qf + 1
         # need[m] = ceil(q_m * K) prev-topK values >= rung m.
         self.qneeds = tuple(max(1, int(math.ceil(q * self.top_k))) for q in self.r0_qfracs)
         # R1 inline shot aim in log2-count space: geometric center of the
@@ -619,6 +648,8 @@ class GvrTopKKernel:
         lane,
         smem_gath=None,  # cute.Tensor [top_k] f32 or None (p1b_cache): stash
         # the gathered value per preIdx slot so P1b skips a 2nd GMEM gather.
+        s_mt_thr=None,   # r0_vseed: P1 also parks pmean in the last rung
+        # column (visibility via P1's own trailing barrier -> zero extra sync).
     ):
         """preIdx scan + warp reduce + block aggregate + initial threshold.
 
@@ -732,6 +763,8 @@ class GvrTopKKernel:
                         pmean = (pmin + pmax) * cutlass.Float32(0.5)
                     cnt_lo_seed = pre_idx_count + (pre_idx_count >> 2)
                     s_thr[0] = pmean
+                    if cutlass.const_expr(self.r0_vseed):
+                        s_mt_thr[self.M_thr - 1] = pmean
                     s_thr[1] = pmin
                     s_thr[2] = pmax
                     s_iscalars[0] = cutlass.Int32(0)  # cand_count
@@ -767,6 +800,8 @@ class GvrTopKKernel:
 
                 cnt_lo_seed = pre_idx_count + (pre_idx_count >> 2)
                 s_thr[0] = pmean
+                if cutlass.const_expr(self.r0_vseed):
+                    s_mt_thr[self.M_thr - 1] = pmean
                 s_thr[1] = pmin
                 s_thr[2] = pmax
                 s_iscalars[0] = cutlass.Int32(0)
@@ -800,7 +835,7 @@ class GvrTopKKernel:
         warp_id,
         lane,
     ):
-        M = cutlass.const_expr(self.M_thr)
+        M = cutlass.const_expr(self.M_qf)
         NB = cutlass.const_expr(256)
         SEG = cutlass.const_expr(8)  # NB / WARP_SIZE bins per lane
         num_threads = cutlass.const_expr(self.num_threads)
@@ -881,7 +916,7 @@ class GvrTopKKernel:
     def phase1b_hspace_rungs_cached(
         self, pre_idx_count, smem_gath, smem_hist, s_thr, s_mt_thr, tidx, warp_id, lane
     ):
-        M = cutlass.const_expr(self.M_thr)
+        M = cutlass.const_expr(self.M_qf)
         NB = cutlass.const_expr(256)
         SEG = cutlass.const_expr(8)
         num_threads = cutlass.const_expr(self.num_threads)
@@ -1191,6 +1226,7 @@ class GvrTopKKernel:
         tidx,
         warp_id,
         lane,
+        smem_ptcnt=None,  # vseed: last column's per-thread counts land here
     ):
         M = cutlass.const_expr(self.M_thr)
         num_threads = cutlass.const_expr(self.num_threads)
@@ -1267,7 +1303,10 @@ class GvrTopKKernel:
             it = it + cutlass.Int32(num_threads)
 
         for m in cutlass.range_constexpr(M):
-            smem_ptcnt_multi[m * num_threads + tidx] = cnt_frag[m]
+            if cutlass.const_expr(self.r0_vseed and m == self.M_qf):
+                smem_ptcnt[tidx] = cnt_frag[m]
+            else:
+                smem_ptcnt_multi[m * num_threads + tidx] = cnt_frag[m]
 
         for m in cutlass.range_constexpr(M):
             wc = self.warp_reduce_sum_i32(cnt_frag[m])
@@ -2749,6 +2788,12 @@ class GvrTopKKernel:
         # columns; s_r0col carries the accepted rung index tid0 -> all.
         if cutlass.const_expr(self.enable_r0):
             M_r0 = cutlass.const_expr(self.M_thr)
+            # vseed (v3): the pmean column's per-thread counts reuse the
+            # existing single-column smem_ptcnt buffer, so the BIG multi
+            # buffer only holds the M_qf rung columns -> zero smem growth
+            # (the round-1 +2-4KB column pushed 16-bit mb3/T1024 configs over
+            # an occupancy cliff: K2048 fp16 BS1024 -26%).
+            M_r0_pt = cutlass.const_expr(self.M_qf)
             s_mt_thr = smem.allocate_tensor(
                 element_type=cutlass.Float32,
                 layout=cute.make_ordered_layout((M_r0,), order=(0,)),
@@ -2756,7 +2801,7 @@ class GvrTopKKernel:
             )
             smem_ptcnt_multi = smem.allocate_tensor(
                 element_type=cutlass.Int32,
-                layout=cute.make_ordered_layout((M_r0 * num_threads,), order=(0,)),
+                layout=cute.make_ordered_layout((M_r0_pt * num_threads,), order=(0,)),
                 byte_alignment=128,
             )
             smem_wcnt_multi = smem.allocate_tensor(
@@ -3039,6 +3084,7 @@ class GvrTopKKernel:
             warp_id,
             lane,
             smem_gath=smem_gath,  # p1b_cache: stash gathered values (None-op OFF)
+            s_mt_thr=s_mt_thr,    # r0_vseed: park pmean in the last rung column
         )
 
         # Degenerate threshold init: val_hi <= -self.FLT_MAX or val_lo >= val_hi.
@@ -3129,16 +3175,22 @@ class GvrTopKKernel:
                     tidx,
                     warp_id,
                     lane,
+                    smem_ptcnt=smem_ptcnt,
                 )
                 cute.arch.barrier()
                 if tidx == 0:
-                    # tightest admissible rung = LAST m with count in [K, kC]
-                    # (ascending thresholds => non-increasing counts in m).
+                    # tightest admissible rung = SMALLEST count in [K, kC].
+                    # (Explicit argmin: with r0_vseed the pmean column is not
+                    # sorted into the rung order; for sorted rungs this is
+                    # equivalent to the old "last m in window" rule.)
                     best_m = cutlass.Int32(-1)
+                    best_c = cutlass.Int32(2147483647)
                     for m in cutlass.range_constexpr(cutlass.const_expr(self.M_thr)):
                         cm = s_mt_cnt[m]
-                        if cm >= cutlass.Int32(self.top_k) and cm <= cutlass.Int32(self.kC):
+                        if (cm >= cutlass.Int32(self.top_k) and cm <= cutlass.Int32(self.kC)
+                                and cm < best_c):
                             best_m = cutlass.Int32(m)
+                            best_c = cm
                     s_r0col[0] = best_m
                     if best_m >= cutlass.Int32(0):
                         s_thr[0] = s_mt_thr[best_m]
@@ -3158,10 +3210,10 @@ class GvrTopKKernel:
                             s_iscalars[5] = s_cluster_partial_m[best_m]
                 cute.arch.barrier()
                 bc = s_r0col[0]
-                if bc >= cutlass.Int32(0):
-                    # accepted: seed Phase 3 with the rung's cached per-thread
-                    # count column (zero rescan; matches secant's smem_ptcnt
-                    # hand-off contract).
+                if bc >= cutlass.Int32(0) and bc < cutlass.Int32(self.M_qf):
+                    # accepted rung column: copy its cached per-thread counts
+                    # into the secant hand-off buffer (zero rescan). The vseed
+                    # column (bc == M_qf) is ALREADY in smem_ptcnt (v3 reuse).
                     smem_ptcnt[tidx] = smem_ptcnt_multi[bc * cutlass.Int32(num_threads) + tidx]
                 cute.arch.barrier()
                 # ---- R0 miss: SEEDED bounded log-falsi refine ----
@@ -3181,14 +3233,16 @@ class GvrTopKKernel:
                             clo = cutlass.Int32(-1)
                             chi = cutlass.Int32(-1)
                             for m in cutlass.range_constexpr(M):
-                                if s_mt_cnt[m] > cutlass.Int32(self.kC):
-                                    blo = s_mt_thr[m]
-                                    clo = s_mt_cnt[m]
-                            for m in cutlass.range_constexpr(M):
-                                mm = cutlass.const_expr(M - 1) - m
-                                if s_mt_cnt[mm] < cutlass.Int32(self.top_k):
-                                    bhi = s_mt_thr[mm]
-                                    chi = s_mt_cnt[mm]
+                                cm = s_mt_cnt[m]
+                                tm = s_mt_thr[m]
+                                if cm > cutlass.Int32(self.kC) and (
+                                        clo < cutlass.Int32(0) or tm > blo):
+                                    blo = tm
+                                    clo = cm
+                                if cm < cutlass.Int32(self.top_k) and (
+                                        chi < cutlass.Int32(0) or tm < bhi):
+                                    bhi = tm
+                                    chi = cm
                             s_thr[1] = blo
                             s_thr[2] = bhi
                             s_iscalars[2] = clo  # SEED known rung counts
