@@ -311,18 +311,23 @@ class GenerationExecutorProxy(GenerationExecutor):
                 result.queue.put(dead_error)
             except Exception:  # noqa: BLE001 - a full/closed queue must not stop the sweep
                 pass
-        # Abandon the owned MPI session NOW rather than at teardown: the dead
-        # pool's manager thread is wedged in an MPI call forever, and CPython
-        # joins non-daemon threads (threading._shutdown) BEFORE the
+        # Release the session's exit joins NOW rather than at teardown: the
+        # dead pool's manager thread is wedged in an MPI call forever, and
+        # CPython joins non-daemon threads (threading._shutdown) BEFORE the
         # atexit/GC teardown that runs shutdown() -- deregistering at
-        # teardown time is already too late to let the process exit.
-        if getattr(self, '_owns_mpi_session', False):
-            abandon = getattr(self.mpi_session, 'abandon', None)
-            if abandon is not None:
-                try:
-                    abandon()
-                except Exception as e:  # noqa: BLE001 - best-effort cleanup
-                    logger.debug(f"MPI session abandon failed (ignored): {e!r}")
+        # teardown time is already too late to let the process exit. This is
+        # non-destructive bookkeeping, so it applies to external (unowned)
+        # sessions too: in the LLM API path the session is created by the
+        # LLM object and passed in, and its owner's later blocking
+        # shutdown() must also not join the dead world.
+        release = getattr(getattr(self, 'mpi_session', None),
+                          'release_exit_joins', None)
+        if release is not None:
+            try:
+                release()
+            except Exception as e:  # noqa: BLE001 - best-effort cleanup
+                logger.debug(
+                    f"MPI session exit-join release failed (ignored): {e!r}")
 
     def _handle_worker_death(self, error: BaseException) -> None:
         """Event-driven worker-death handler.

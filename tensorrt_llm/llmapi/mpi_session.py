@@ -146,15 +146,25 @@ class MpiSession(abc.ABC):
         fut.set_result(None)
         killer.join()
 
+    def release_exit_joins(self):
+        """Mark the worker world dead and release anything that would join it.
+
+        Non-destructive counterpart of ``abandon()``: called the moment the
+        workers are known dead (killed by ``MPI_Abort`` from the hang
+        detector, SIGKILL, or the OOM killer), possibly by a component that
+        does not own the session. It must not tear the session down -- only
+        ensure that nothing (interpreter exit, a later blocking
+        ``shutdown()`` by the owner) will wait forever on the dead world.
+        Default: no-op.
+        """
+
     def abandon(self):
         """Tear the session down without waiting on a dead worker world.
 
-        Called instead of ``shutdown()`` once the workers are known dead
-        (e.g. killed by ``MPI_Abort`` from the hang detector, SIGKILL, or
-        the OOM killer): joining anything owned by such a session can block
-        forever. The default is a non-waiting shutdown; subclasses extend
-        it where extra unblocking is needed.
+        Called instead of ``shutdown()`` once the workers are known dead:
+        joining anything owned by such a session can block forever.
         """
+        self.release_exit_joins()
         self.shutdown(wait=False)
 
 
@@ -224,14 +234,18 @@ class MpiPoolSession(MpiSession):
         return [future.result() for future in futures]
 
     def shutdown(self, wait=True):
+        if getattr(self, '_pool_dead', False):
+            # A dead pool can never be joined; never block on it, no matter
+            # what the caller asked for.
+            wait = False
         if self.mpi_pool is not None:
             self.mpi_pool.shutdown(wait=wait)
             self.mpi_pool = None
 
-    def abandon(self):
+    def release_exit_joins(self):
         if self.mpi_pool is not None:
             _abandon_mpi_pool_threads(self.mpi_pool)
-        self.shutdown(wait=False)
+        self._pool_dead = True
 
     def abort(self):
         self.get_comm().Abort(1)

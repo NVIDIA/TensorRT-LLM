@@ -478,29 +478,57 @@ def test_abandon_mpi_pool_threads_tolerates_missing_pool():
     _abandon_mpi_pool_threads(object())  # no _pool attribute
 
 
-def test_mark_engine_dead_abandons_owned_session_immediately():
-    """Abandon must happen at detection time, not at teardown.
+def test_mark_engine_dead_releases_exit_joins_immediately():
+    """Exit-join release must happen at detection time, not at teardown.
 
     CPython's exit sequence joins non-daemon threads before atexit/GC can
     run shutdown(), so a wedged pool manager thread must be deregistered
     the moment the engine is marked dead.
     """
     proxy = _bare_proxy()
-    proxy._owns_mpi_session = True
     proxy.mpi_session = _Mock()
 
     proxy._mark_engine_dead(RuntimeError("worker died"))
-    proxy.mpi_session.abandon.assert_called_once_with()
+    proxy.mpi_session.release_exit_joins.assert_called_once_with()
 
-    # Sticky: a second death report must not re-abandon.
+    # Sticky: a second death report must not re-release.
     proxy._mark_engine_dead(RuntimeError("again"))
-    proxy.mpi_session.abandon.assert_called_once_with()
+    proxy.mpi_session.release_exit_joins.assert_called_once_with()
 
 
-def test_mark_engine_dead_leaves_external_session_alone():
+def test_mark_engine_dead_releases_external_sessions_too():
+    """Ownership must not gate the exit-join release.
+
+    In the LLM API path the session is created by the LLM object and
+    passed in (proxy does not own it), yet its exit joins must still be
+    released -- this exact gap kept the process hanging in the GB200
+    hardware validation. The release is non-destructive bookkeeping.
+    """
     proxy = _bare_proxy()
     proxy._owns_mpi_session = False
     proxy.mpi_session = _Mock()
 
     proxy._mark_engine_dead(RuntimeError("worker died"))
+    proxy.mpi_session.release_exit_joins.assert_called_once_with()
+    # But destructive teardown is still reserved for the owner.
     proxy.mpi_session.abandon.assert_not_called()
+    proxy.mpi_session.shutdown.assert_not_called()
+
+
+def test_pool_session_shutdown_never_blocks_after_release():
+    """A released session never blocks, even on an explicit shutdown().
+
+    After release_exit_joins(), a blocking shutdown() from the session
+    owner must not join the dead pool.
+    """
+    from tensorrt_llm.llmapi.mpi_session import MpiPoolSession
+
+    session = MpiPoolSession.__new__(MpiPoolSession)
+    pool = _Mock()
+    pool._pool.thread = None  # no real manager thread to deregister
+    session.mpi_pool = pool
+
+    session.release_exit_joins()
+    session.shutdown()  # owner asks for the default blocking shutdown
+
+    pool.shutdown.assert_called_once_with(wait=False)
