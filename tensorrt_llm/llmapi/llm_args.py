@@ -5357,11 +5357,32 @@ class TorchLlmArgs(BaseLlmArgs):
                             value = draft_cfg.get(top_level_key)
                         return value
 
+                    # The checkpoint's ``dspark_target_layer_ids`` is
+                    # authoritative: it fixes both which target hidden states
+                    # were captured during draft training and the input width of
+                    # ``main_proj`` (hidden_size * num_capture_layers). If the
+                    # user leaves ``target_layer_ids`` unset we copy it verbatim
+                    # (order preserved, since the projection columns are
+                    # order-dependent). An explicit override that does not match
+                    # the checkpoint list exactly would either mismatch the
+                    # projection shape at runtime (different count) or feed the
+                    # draft hidden states it was not trained on (same count,
+                    # different layers), so reject it during validation.
+                    ckpt_layer_ids = _dspark_get("target_layer_ids",
+                                                 "dspark_target_layer_ids")
                     if spec_cfg.target_layer_ids is None:
-                        layer_ids = _dspark_get("target_layer_ids",
-                                                "dspark_target_layer_ids")
-                        if layer_ids is not None:
-                            spec_cfg.target_layer_ids = layer_ids
+                        if ckpt_layer_ids is not None:
+                            spec_cfg.target_layer_ids = list(ckpt_layer_ids)
+                    elif ckpt_layer_ids is not None and list(
+                            spec_cfg.target_layer_ids) != list(ckpt_layer_ids):
+                        raise ValueError(
+                            "DSpark target_layer_ids must match the checkpoint's "
+                            "dspark_target_layer_ids exactly (the draft "
+                            "projection weights are trained for that specific "
+                            f"layer set); got override {spec_cfg.target_layer_ids} "
+                            f"but the checkpoint specifies {list(ckpt_layer_ids)}. "
+                            "Leave target_layer_ids unset to use the checkpoint "
+                            "value.")
                     if spec_cfg.mask_token_id is None:
                         mask_id = _dspark_get("mask_token_id",
                                               "dspark_noise_token_id")

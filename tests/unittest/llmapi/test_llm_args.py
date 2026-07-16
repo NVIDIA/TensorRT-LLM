@@ -269,6 +269,91 @@ def test_dspark_block_size_must_match_max_draft_len(tmp_path):
         )
 
 
+def test_dspark_target_layer_ids_resolved_from_checkpoint(tmp_path):
+    # When the user leaves target_layer_ids unset, the checkpoint's ordered
+    # dspark_target_layer_ids must be adopted verbatim.
+    (tmp_path / "config.json").write_text(
+        '{"dspark_block_size": 5, "dspark_target_layer_ids": [3, 1, 2]}')
+    spec_cfg = DSparkDecodingConfig(max_draft_len=5,
+                                    speculative_model=str(tmp_path))
+
+    args = TorchLlmArgs(
+        model="/tmp/dummy_model",
+        skip_tokenizer_init=True,
+        speculative_config=spec_cfg,
+    )
+
+    # Order is preserved (projection columns are order-dependent).
+    assert args.speculative_config.target_layer_ids == [3, 1, 2]
+
+
+def test_dspark_target_layer_ids_matching_override_accepted(tmp_path):
+    # An explicit override that matches the checkpoint list exactly is fine.
+    (tmp_path / "config.json").write_text(
+        '{"dspark_block_size": 5, "dspark_target_layer_ids": [1, 2, 3]}')
+    spec_cfg = DSparkDecodingConfig(max_draft_len=5,
+                                    speculative_model=str(tmp_path),
+                                    target_layer_ids=[1, 2, 3])
+
+    args = TorchLlmArgs(
+        model="/tmp/dummy_model",
+        skip_tokenizer_init=True,
+        speculative_config=spec_cfg,
+    )
+
+    assert args.speculative_config.target_layer_ids == [1, 2, 3]
+
+
+def test_dspark_target_layer_ids_mismatched_count_rejected(tmp_path):
+    # A different number of layers would mismatch main_proj.in_features.
+    (tmp_path / "config.json").write_text(
+        '{"dspark_block_size": 5, "dspark_target_layer_ids": [1, 2, 3]}')
+    spec_cfg = DSparkDecodingConfig(max_draft_len=5,
+                                    speculative_model=str(tmp_path),
+                                    target_layer_ids=[1, 2])
+
+    with pytest.raises(ValueError, match="must match the checkpoint"):
+        TorchLlmArgs(
+            model="/tmp/dummy_model",
+            skip_tokenizer_init=True,
+            speculative_config=spec_cfg,
+        )
+
+
+def test_dspark_target_layer_ids_same_count_different_layers_rejected(tmp_path):
+    # Same count but different layers: shapes line up, but the draft would see
+    # hidden states it was not trained on, so this must be rejected too.
+    (tmp_path / "config.json").write_text(
+        '{"dspark_block_size": 5, "dspark_target_layer_ids": [1, 2, 3]}')
+    spec_cfg = DSparkDecodingConfig(max_draft_len=5,
+                                    speculative_model=str(tmp_path),
+                                    target_layer_ids=[1, 2, 4])
+
+    with pytest.raises(ValueError, match="must match the checkpoint"):
+        TorchLlmArgs(
+            model="/tmp/dummy_model",
+            skip_tokenizer_init=True,
+            speculative_config=spec_cfg,
+        )
+
+
+def test_dspark_target_layer_ids_order_mismatch_rejected(tmp_path):
+    # Same set but different order: projection columns are order-dependent, so a
+    # reordered override must be rejected rather than silently accepted.
+    (tmp_path / "config.json").write_text(
+        '{"dspark_block_size": 5, "dspark_target_layer_ids": [1, 2, 3]}')
+    spec_cfg = DSparkDecodingConfig(max_draft_len=5,
+                                    speculative_model=str(tmp_path),
+                                    target_layer_ids=[3, 2, 1])
+
+    with pytest.raises(ValueError, match="must match the checkpoint"):
+        TorchLlmArgs(
+            model="/tmp/dummy_model",
+            skip_tokenizer_init=True,
+            speculative_config=spec_cfg,
+        )
+
+
 def test_dspark_requires_speculative_model():
     # The DSpark draft weights live in the checkpoint's mtp.* namespace, so an
     # unset speculative_model must fail fast at config validation instead of
