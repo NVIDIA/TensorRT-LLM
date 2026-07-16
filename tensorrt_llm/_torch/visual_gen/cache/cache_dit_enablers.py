@@ -23,6 +23,8 @@ from tensorrt_llm.logger import logger
 from ..config import CacheDiTConfig
 
 # Batched CFG: default enable_separate_cfg False (single cond+uncond batch).
+# Qwen-Image uses non-batched CFG (two separate forward passes),
+# so it has no enable_separate_cfg flag here.
 _WAN_CFG_DEFAULT = False
 _FLUX_CFG_DEFAULT = False
 _LTX2_CFG_DEFAULT = False
@@ -342,12 +344,44 @@ def enable_cache_dit_for_ltx2(pipeline: Any, cache_dit_cfg: CacheDiTConfig) -> C
     )
 
 
+def enable_cache_dit_for_qwen_image(
+    pipeline: Any, cache_dit_cfg: CacheDiTConfig
+) -> CacheDiTEnableResult:
+    """Qwen-Image: single transformer, auto-detected by cache-dit (no BlockAdapter needed)."""
+    calibrator = _maybe_calibrator(cache_dit_cfg)
+    db_cfg = _build_db_cache_config(cache_dit_cfg)
+
+    if calibrator is not None:
+        logger.info(f"TaylorSeer enabled with order={cache_dit_cfg.taylorseer_order}")
+
+    logger.info(
+        f"Cache-DiT: Qwen-Image — Fn={db_cfg.Fn_compute_blocks}, Bn={db_cfg.Bn_compute_blocks}, "
+        f"W={db_cfg.max_warmup_steps}",
+    )
+
+    disable_target = cache_dit.enable_cache(
+        pipeline.transformer,
+        cache_config=db_cfg,
+        calibrator_config=calibrator,
+    )
+
+    def refresh(num_inference_steps: int) -> None:
+        _refresh_ctx(pipeline.transformer, cache_dit_cfg, num_inference_steps, False)
+
+    return CacheDiTEnableResult(
+        refresh=refresh,
+        disable_target=disable_target,
+        summary_modules=[pipeline.transformer],
+    )
+
+
 CUSTOM_CACHE_DIT_ENABLERS = {
     "WanPipeline": enable_cache_dit_for_wan,
     "WanImageToVideoPipeline": enable_cache_dit_for_wan,
     "FluxPipeline": lambda p, c: enable_cache_dit_for_flux(p, c, is_flux2=False),
     "Flux2Pipeline": lambda p, c: enable_cache_dit_for_flux(p, c, is_flux2=True),
     "LTX2Pipeline": enable_cache_dit_for_ltx2,
+    "QwenImagePipeline": enable_cache_dit_for_qwen_image,
 }
 
 
