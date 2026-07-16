@@ -5265,6 +5265,23 @@ class TorchLlmArgs(BaseLlmArgs):
         if missing:
             raise ValueError("encoder_cuda_graph_config requires "
                              f"{' and '.join(missing)}.")
+
+        return self
+
+    @model_validator(mode="after")
+    def validate_eager_encoder_scheduling_compatibility(self) -> 'TorchLlmArgs':
+        if not self.multimodal_config.enable_eager_encoder_scheduling:
+            return self
+        if self.enable_attention_dp:
+            raise ValueError(
+                "multimodal_config.enable_eager_encoder_scheduling does not "
+                "yet support attention DP (enable_attention_dp=True)")
+        if (self.cache_transceiver_config is not None
+                and self.cache_transceiver_config.backend is not None):
+            raise ValueError(
+                "multimodal_config.enable_eager_encoder_scheduling does not "
+                "yet support disaggregated serving "
+                "(cache_transceiver_config)")
         return self
 
     attn_backend: str = Field(
