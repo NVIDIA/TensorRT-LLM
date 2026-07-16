@@ -293,7 +293,7 @@ class OpenAIDisaggregatedService(OpenAIService):
             # The server is reserved for generation request
             gen_server, info = await self._gen_router.get_next_server(request, req_id=req_id)
             match_length = sum(info["matches"])
-            total_length = sum(len(token_list) for token_list in info["token_lists"])
+            total_length = info["num_tokens"]
             need_ctx_decision = (
                 match_length == 0
                 or total_length - match_length

@@ -38,8 +38,8 @@ from tensorrt_llm.serve.router_utils import (  # noqa: F401
     v2_sha256_block_hasher)
 
 _MSGPACK_HEADERS = {"Content-Type": "application/msgpack"}
+COORDINATOR_FINISH_MAX_ATTEMPTS = 3
 COORDINATOR_FINISH_RETRY_DELAY_S = 0.1
-COORDINATOR_FINISH_MAX_RETRY_DELAY_S = 5.0
 
 # Max number of conversations whose home-server pin is retained (LRU).
 ROUTE_AFFINITY_CACHE_SIZE = 50000
@@ -931,9 +931,9 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
             self._tokenize_and_compute_block_hashes_by_algo(
                 request, algos, cache_salt_id)
         return {
-            "token_lists": token_lists,
             "block_hashes_by_algo": block_hashes_by_algo,
-            "conv_key": self._content_affinity_key(request)
+            "conv_key": self._content_affinity_key(request),
+            "num_tokens": sum(len(token_list) for token_list in token_lists),
         }
 
     async def _route(self, key, exclude_server=None, request=None, req_id=None):
@@ -943,9 +943,9 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
         conversation affinity, and round-robin tie-breaking. Standalone requests
         are keyed by ``id(request)``; coordinator requests use ``req_id``.
         """
-        token_lists = (key or {}).get("token_lists") or []
         block_hashes_by_algo = (key or {}).get("block_hashes_by_algo") or {}
         conv_key = (key or {}).get("conv_key")
+        num_tokens = (key or {}).get("num_tokens", 0)
         async with self._lock:
             server_states = {
                 server: state
@@ -1019,8 +1019,8 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
         return server, {
             "block_hashes": block_hashes,
             "hash_algo": hash_algo,
-            "token_lists": token_lists,
             "matches": matches,
+            "num_tokens": num_tokens,
             "server_info": self._server_info.get(server, {}),
         }, req_id
 
@@ -1725,10 +1725,7 @@ class CoordinatorDelegatingRouter(Router):
 
     async def _finish_async(self, req_id: int, success: bool):
         _t0 = time.monotonic()
-        attempt = 0
-        delay = COORDINATOR_FINISH_RETRY_DELAY_S
-        while True:
-            attempt += 1
+        for attempt in range(1, COORDINATOR_FINISH_MAX_ATTEMPTS + 1):
             try:
                 async with self.session.post(
                         f"{self._coordinator_url}/finish",
@@ -1755,11 +1752,16 @@ class CoordinatorDelegatingRouter(Router):
                 self._finish_lat.record(time.monotonic() - _t0)
                 return
             except Exception as e:  # noqa: BLE001
+                if attempt == COORDINATOR_FINISH_MAX_ATTEMPTS:
+                    logger.warning(
+                        f"CoordinatorDelegatingRouter finish failed after "
+                        f"{attempt} attempts: {e}")
+                    return
                 logger.warning(
                     f"CoordinatorDelegatingRouter finish attempt {attempt} "
-                    f"failed: {e}; retrying in {delay:.1f}s")
-                await asyncio.sleep(delay)
-                delay = min(delay * 2, COORDINATOR_FINISH_MAX_RETRY_DELAY_S)
+                    f"failed: {e}; retrying")
+                await asyncio.sleep(COORDINATOR_FINISH_RETRY_DELAY_S *
+                                    (2**(attempt - 1)))
 
     async def close(self):
         if self._background_tasks:

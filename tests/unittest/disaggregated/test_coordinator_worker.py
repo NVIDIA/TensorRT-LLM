@@ -32,9 +32,11 @@ while stateless routers never touch the coordinator.
 """
 
 import asyncio
+import json
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from unittest.mock import AsyncMock
 
 import aiohttp
 import pytest
@@ -47,7 +49,12 @@ from tensorrt_llm.llmapi.disagg_utils import (
     ServerRole,
 )
 from tensorrt_llm.serve.coordinator_server import CoordinatorServer
-from tensorrt_llm.serve.disagg_coordinator import CoordinatorClient, DisaggCoordinatorService
+from tensorrt_llm.serve.disagg_coordinator import (
+    COORDINATOR_RESERVATION_TIMEOUT_ENV,
+    CoordinatorClient,
+    DisaggCoordinatorService,
+    coordinator_reservation_timeout,
+)
 from tensorrt_llm.serve.openai_protocol import (
     ChatCompletionRequest,
     CompletionRequest,
@@ -93,10 +100,11 @@ def _free_port():
 
 
 class _FakeWorker:
-    """Minimal HTTP worker: /health -> 200 (used for readiness only)."""
+    """Minimal HTTP worker exposing health and routing metadata."""
 
-    def __init__(self):
+    def __init__(self, server_info=None):
         self.port = _free_port()
+        server_info_body = json.dumps(server_info or {}).encode()
 
         class Handler(BaseHTTPRequestHandler):
             def log_message(self, *a):
@@ -105,9 +113,15 @@ class _FakeWorker:
             def do_GET(self):
                 if self.path == "/health":
                     self.send_response(200)
+                elif self.path == "/server_info":
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(server_info_body)))
                 else:
                     self.send_response(404)
                 self.end_headers()
+                if self.path == "/server_info":
+                    self.wfile.write(server_info_body)
 
         self._httpd = ThreadingHTTPServer(("127.0.0.1", self.port), Handler)
         self._thread = threading.Thread(target=self._httpd.serve_forever, daemon=True)
@@ -235,6 +249,32 @@ async def test_coordinator_exposes_role_hash_algorithm():
     }
 
 
+@pytest.mark.asyncio
+async def test_coordinator_expires_stale_reservation():
+    config = _make_config([], ["gen:8000"], "round_robin", "conversation")
+    coordinator = DisaggCoordinatorService(
+        config,
+        _client_factory,
+        reservation_timeout_secs=0.01,
+    )
+
+    await coordinator.select("generation", "conversation", 123, None)
+    assert coordinator.gen_router._server_content_load["gen:8000"] == 1
+
+    await asyncio.sleep(0.02)
+
+    assert coordinator.gen_router._server_content_load["gen:8000"] == 0
+    assert coordinator._reservation_tasks == {}
+
+
+def test_coordinator_reservation_timeout_env(monkeypatch):
+    monkeypatch.delenv(COORDINATOR_RESERVATION_TIMEOUT_ENV, raising=False)
+    assert coordinator_reservation_timeout() == 180
+
+    monkeypatch.setenv(COORDINATOR_RESERVATION_TIMEOUT_ENV, "60")
+    assert coordinator_reservation_timeout() == 60
+
+
 def test_coordinator_client_configures_empty_delegating_kv_router():
     config = _make_config([], [], "kv_cache_aware", "round_robin")
     client = CoordinatorClient("http://coordinator", config)
@@ -259,6 +299,8 @@ def test_coordinator_client_configures_empty_delegating_kv_router():
     assert local.servers == []
     assert local._tokens_per_block == 64
     assert set(routing_key["block_hashes_by_algo"]) == {KV_CACHE_HASH_ALGO_V2}
+    assert routing_key["num_tokens"] == 3
+    assert "token_lists" not in routing_key
 
 
 def test_content_affinity_key_uses_fixed_seed():
@@ -317,6 +359,51 @@ def test_stateless_router_places_locally_in_worker():
             assert set(picks) == {gen0.url, gen1.url}, (
                 f"local round-robin should hit both gen workers, got {picks}"
             )
+
+
+def test_static_stateless_router_prepares_generation_first_server_info():
+    """Fleet startup prepares static local routers for generation-first."""
+    from tensorrt_llm.serve.router import RoundRobinRouter
+
+    ctx_info_endpoint = "tcp://127.0.0.1:12345"
+    ctx_server_info = {"disaggregated_params": {"ctx_info_endpoint": ctx_info_endpoint}}
+    with _FakeWorker(ctx_server_info) as ctx0, _FakeWorker() as gen0:
+        config = _make_config([ctx0.url], [gen0.url], "round_robin", "round_robin")
+        config.schedule_style = "generation_first"
+        with _CoordinatorThread(config) as coord:
+            assert asyncio.run(_wait_coord_ready(coord.url))
+
+            async def drive():
+                remote = CoordinatorClient(coord.url, config)
+                await remote.start()
+                assert isinstance(remote.ctx_router, RoundRobinRouter)
+                request = CompletionRequest(model="m", prompt="hello")
+                server, info = await remote.ctx_router.get_next_server(request)
+                await remote.stop()
+                return server, info
+
+            server, info = asyncio.run(drive())
+            assert server == ctx0.url
+            assert (
+                info["server_info"]["disaggregated_params"]["ctx_info_endpoint"]
+                == ctx_info_endpoint
+            )
+
+
+@pytest.mark.asyncio
+async def test_stateless_router_syncs_coordinator_server_add_remove():
+    """Coordinator server lists propagate metadata topology changes."""
+    config = _make_config(["ctx-old:8000"], [], "round_robin", "round_robin")
+    client = CoordinatorClient("http://coordinator", config)
+    client.ctx_router._fetch_server_info = AsyncMock(return_value={})
+
+    await client._sync_stateless_routers(
+        {"server_lists": {"context": ["ctx-new:8001"], "generation": []}}
+    )
+
+    assert client.ctx_router.servers == ["ctx-new:8001"]
+    client.ctx_router._fetch_server_info.assert_awaited_once_with("ctx-new:8001", None)
+    await client.stop()
 
 
 def test_conversation_coordinator_sticky_by_conv_id():

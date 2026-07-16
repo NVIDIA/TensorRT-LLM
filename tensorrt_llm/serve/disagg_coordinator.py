@@ -35,6 +35,7 @@ Two implementations for the coordinator/worker deployment:
 """
 
 import asyncio
+import os
 import time
 from abc import ABC, abstractmethod
 from typing import Any, Dict, Optional, Tuple
@@ -73,6 +74,18 @@ __all__ = [
     "coordinator_base_url",
     "make_coordinator_session",
 ]
+
+COORDINATOR_RESERVATION_TIMEOUT_ENV = "TRTLLM_DISAGG_COORDINATOR_RESERVATION_TIMEOUT"
+COORDINATOR_RESERVATION_TIMEOUT_DEFAULT_S = 180.0
+
+
+def coordinator_reservation_timeout() -> float:
+    return float(
+        os.environ.get(
+            COORDINATOR_RESERVATION_TIMEOUT_ENV,
+            COORDINATOR_RESERVATION_TIMEOUT_DEFAULT_S,
+        )
+    )
 
 
 class DisaggCoordinator(ABC):
@@ -119,6 +132,7 @@ class DisaggCoordinatorService(DisaggCoordinator):
         server_preparation_func=None,
         server_start_timeout_secs: int = 180,
         health_check_interval_secs: int = 3,
+        reservation_timeout_secs: Optional[float] = None,
     ):
         self._config = config
         self._client_factory = client_factory
@@ -152,6 +166,12 @@ class DisaggCoordinatorService(DisaggCoordinator):
         )
         self._server_start_timeout_secs = server_start_timeout_secs
         self._health_check_interval_secs = health_check_interval_secs
+        self._reservation_timeout_secs = (
+            coordinator_reservation_timeout()
+            if reservation_timeout_secs is None
+            else reservation_timeout_secs
+        )
+        self._reservation_tasks: dict[tuple[str, int], asyncio.Task] = {}
 
         self._ctx_client: Optional[OpenAIClient] = None
         self._gen_client: Optional[OpenAIClient] = None
@@ -194,8 +214,16 @@ class DisaggCoordinatorService(DisaggCoordinator):
     ) -> Tuple[str, dict, Optional[str]]:
         _t0 = time.monotonic()
         router = self._router_for_role(role)
+        reservation_key = (self._normalize_role(role), req_id)
+        previous = self._reservation_tasks.pop(reservation_key, None)
+        if previous is not None:
+            previous.cancel()
+            await router.finish_request_by_id(req_id, False)
         result = await router.get_next_server_by_key(
             routing_key, req_id=req_id, exclude_server=exclude_server
+        )
+        self._reservation_tasks[reservation_key] = asyncio.create_task(
+            self._expire_reservation(reservation_key, router)
         )
         self._api_lat(f"select[{role}]").record(time.monotonic() - _t0)
         return result
@@ -205,16 +233,38 @@ class DisaggCoordinatorService(DisaggCoordinator):
 
     async def finish(self, role: str, req_id, success: bool = True) -> None:
         _t0 = time.monotonic()
+        reservation = self._reservation_tasks.pop((self._normalize_role(role), req_id), None)
+        if reservation is not None:
+            reservation.cancel()
         await self._router_for_role(role).finish_request_by_id(req_id, success)
         self._api_lat(f"finish[{role}]").record(time.monotonic() - _t0)
 
-    def _router_for_role(self, role: str) -> Router:
+    async def _expire_reservation(self, key: tuple[str, int], router: Router) -> None:
+        try:
+            await asyncio.sleep(self._reservation_timeout_secs)
+            logger.warning(
+                f"Releasing stale coordinator reservation for role={key[0]}, "
+                f"req_id={key[1]} after {self._reservation_timeout_secs}s"
+            )
+            await router.finish_request_by_id(key[1], False)
+        finally:
+            if self._reservation_tasks.get(key) is asyncio.current_task():
+                self._reservation_tasks.pop(key, None)
+
+    @staticmethod
+    def _normalize_role(role: str) -> str:
         normalized_role = str(role).lower()
         if normalized_role in ("context", "ctx"):
-            return self._ctx_router
+            return "context"
         if normalized_role in ("generation", "gen"):
-            return self._gen_router
+            return "generation"
         raise ValueError(f"Unsupported coordinator role: {role}")
+
+    def _router_for_role(self, role: str) -> Router:
+        normalized_role = self._normalize_role(role)
+        if normalized_role == "context":
+            return self._ctx_router
+        return self._gen_router
 
     async def start(self) -> None:
         await self._ctx_router.prepare_servers()
@@ -247,6 +297,12 @@ class DisaggCoordinatorService(DisaggCoordinator):
             await self._wait_for_all_servers_ready()
 
     async def stop(self) -> None:
+        reservations = list(self._reservation_tasks.values())
+        self._reservation_tasks.clear()
+        for reservation in reservations:
+            reservation.cancel()
+        if reservations:
+            await asyncio.gather(*reservations, return_exceptions=True)
         if self._disagg_cluster_manager:
             await self._disagg_cluster_manager.stop()
         if self._metadata_server:
@@ -262,7 +318,13 @@ class DisaggCoordinatorService(DisaggCoordinator):
         return True
 
     async def cluster_info(self) -> Dict[str, Any]:
-        info = {"is_ready": await self.is_ready()}
+        info = {
+            "is_ready": await self.is_ready(),
+            "server_lists": {
+                "context": list(self._ctx_router.servers),
+                "generation": list(self._gen_router.servers),
+            },
+        }
         routing_key_configs = {}
         for role, router in (("context", self._ctx_router), ("generation", self._gen_router)):
             if isinstance(router, KvCacheAwareRouter):
@@ -447,6 +509,7 @@ class CoordinatorClient(DisaggCoordinator):
         # exits non-zero if its coordinator never comes up (vs 500-ing every req).
         info = await self._await_coordinator()
         self._sync_delegating_router_configs(info)
+        await self._sync_stateless_routers(info)
 
     async def _await_coordinator(self) -> Dict[str, Any]:
         """Poll the coordinator's /cluster_info until reachable, or raise.
@@ -516,21 +579,22 @@ class CoordinatorClient(DisaggCoordinator):
                 local.set_routing_key_config(config)
 
     async def _sync_stateless_routers(self, info: Dict[str, Any]) -> None:
-        current_workers = info.get("current_workers")
-        if current_workers is None:
+        server_lists = info.get("server_lists")
+        if server_lists is None:
             return
-        router_workers = (
-            (self._ctx_router, current_workers.get("context_servers", [])),
-            (self._gen_router, current_workers.get("generation_servers", [])),
+        router_servers = (
+            (self._ctx_router, server_lists.get("context", [])),
+            (self._gen_router, server_lists.get("generation", [])),
         )
-        for router, workers in router_workers:
+        for router, servers in router_servers:
             if isinstance(router, CoordinatorDelegatingRouter):
                 continue
-            desired = {f"{worker['host']}:{worker['port']}" for worker in workers}
+            desired = set(servers)
             for server in set(router.servers) - desired:
                 await router.remove_server(server)
             for server in desired - set(router.servers):
                 await router.add_server(server)
+            await router.prepare_servers()
 
     async def cluster_info(self) -> Dict[str, Any]:
         try:

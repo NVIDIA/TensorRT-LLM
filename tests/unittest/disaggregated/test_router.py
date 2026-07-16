@@ -77,7 +77,7 @@ def _make_mock_aiohttp_session(return_value=None):
 
 
 @pytest.mark.asyncio
-async def test_coordinator_finish_retries_failed_release():
+async def test_coordinator_finish_retry_is_bounded():
     local_router = RoundRobinRouter(server_role=None, servers=["server1"])
     router = CoordinatorDelegatingRouter("http://coordinator", local_router,
                                          "generation")
@@ -97,7 +97,6 @@ async def test_coordinator_finish_retries_failed_release():
         _response(503, {"error": "temporarily unavailable"}),
         _response(503, {"error": "temporarily unavailable"}),
         _response(503, {"error": "temporarily unavailable"}),
-        _response(200, {}),
     ])
     session.close = mock.AsyncMock()
     router._session = session
@@ -106,8 +105,8 @@ async def test_coordinator_finish_retries_failed_release():
                     new_callable=mock.AsyncMock) as sleep:
         await router._finish_async(123, True)
 
-    assert session.post.call_count == 4
-    assert sleep.await_count == 3
+    assert session.post.call_count == 3
+    assert sleep.await_count == 2
 
 
 @pytest.fixture(autouse=True)

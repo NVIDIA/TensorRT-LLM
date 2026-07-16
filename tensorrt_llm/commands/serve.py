@@ -1743,6 +1743,8 @@ def _launch_disagg_fleet(disagg_cfg, config_file, metadata_server_config_file,
         request_timeout)
     base_env[DisaggWorkerEnvs.TLLM_DISAGG_SERVER_START_TIMEOUT] = str(
         server_start_timeout)
+    base_env[DisaggWorkerEnvs.TLLM_DISAGG_SCHEDULE_STYLE] = \
+        disagg_cfg.schedule_style
     # Propagate the parent's log level so fleet workers' INFO logs (e.g. the
     # per-request [ttft_split] / [coord_api] breakdowns) are not dropped.
     base_env[DisaggWorkerEnvs.TLLM_DISAGG_LOG_LEVEL] = logger.level
@@ -1963,6 +1965,9 @@ def _build_disagg_server_from_env() -> "OpenAIDisaggServer":
                        "180"))
 
     disagg_cfg = parse_disagg_config_file(config_file)
+    schedule_style = os.environ.get(DisaggWorkerEnvs.TLLM_DISAGG_SCHEDULE_STYLE)
+    if schedule_style:
+        disagg_cfg.schedule_style = schedule_style
     metadata_server_cfg = parse_metadata_server_config_file(
         metadata_config_file)
 
@@ -2106,6 +2111,7 @@ class DisaggWorkerEnvs(StrEnum):
     TLLM_DISAGG_METADATA_CONFIG_FILE = "TRTLLM_DISAGG_METADATA_CONFIG_FILE"
     TLLM_DISAGG_REQUEST_TIMEOUT = "TRTLLM_DISAGG_REQUEST_TIMEOUT"
     TLLM_DISAGG_SERVER_START_TIMEOUT = "TRTLLM_DISAGG_SERVER_START_TIMEOUT"
+    TLLM_DISAGG_SCHEDULE_STYLE = "TRTLLM_DISAGG_SCHEDULE_STYLE"
     # Parent's logger level; the forked uvicorn fleet is a fresh process that
     # otherwise defaults to WARNING and drops the workers' INFO logs.
     TLLM_DISAGG_LOG_LEVEL = "TRTLLM_DISAGG_LOG_LEVEL"
