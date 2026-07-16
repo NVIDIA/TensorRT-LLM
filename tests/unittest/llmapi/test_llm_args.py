@@ -261,6 +261,31 @@ class TestEncoderRuntimeSizes:
             llm_args_cls(model=llama_model_path, **{field_name: invalid_value})
 
 
+class TestEagerEncoderSchedulingCompatibility:
+    """Eager MM encoder scheduling rejects unsupported feature combinations."""
+
+    def test_eager_alone_is_accepted(self):
+        args = TorchLlmArgs(model=llama_model_path,
+                            multimodal_config=MultimodalConfig(
+                                enable_eager_encoder_scheduling=True))
+        assert args.multimodal_config.enable_eager_encoder_scheduling
+
+    def test_eager_rejects_attention_dp(self):
+        with pytest.raises(ValidationError, match="attention DP"):
+            TorchLlmArgs(model=llama_model_path,
+                         enable_attention_dp=True,
+                         multimodal_config=MultimodalConfig(
+                             enable_eager_encoder_scheduling=True))
+
+    def test_eager_rejects_disaggregated_serving(self):
+        with pytest.raises(ValidationError, match="disaggregated"):
+            TorchLlmArgs(
+                model=llama_model_path,
+                cache_transceiver_config=CacheTransceiverConfig(backend="NIXL"),
+                multimodal_config=MultimodalConfig(
+                    enable_eager_encoder_scheduling=True))
+
+
 def test_decoding_type_eagle3_parses_to_eagle3_decoding_config():
     adapter = TypeAdapter(SpeculativeConfig)
     spec_cfg = adapter.validate_python(

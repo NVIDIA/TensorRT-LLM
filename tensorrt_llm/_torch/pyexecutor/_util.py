@@ -68,7 +68,8 @@ from .resource_manager import (BaseKVCacheCompressionManager, KVCacheManager,
 from .sampler import (EarlyStopSampler, EarlyStopWithMMResult, TorchSampler,
                       TRTLLMSampler)
 from .scheduler import (BindCapacityScheduler, BindMicroBatchScheduler,
-                        KVCacheV2Scheduler, SimpleScheduler,
+                        KVCacheV2Scheduler, MultimodalEagerEncoderScheduler,
+                        MultimodalScheduler, SimpleScheduler,
                         SimpleUnifiedScheduler)
 from .seq_slot_manager import SeqSlotManager
 
@@ -2577,6 +2578,29 @@ def create_py_executor_instance(
                 reorder_policy_config.policy_args.agent_types,
                 reorder_policy_config.policy_args.agent_inflight_seq_num)
         scheduler = SimpleScheduler(capacity_scheduler, mb_scheduler)
+
+    if getattr(model_engine, "supports_mm_encoder_item_scheduling", False):
+        # Wrap the LLM scheduler with atomic MM item budgeting. The
+        # side-stream conflict is checked here rather than in an args
+        # validator because item scheduling is a model capability
+        # (MultimodalModelMixin + processor opt-in) only known after model
+        # load; side-stream prefetch stays valid for other MM models.
+        multimodal_config = llm_args.multimodal_config
+        if multimodal_config.encoder_side_stream_max_ahead > 0:
+            raise NotImplementedError(
+                "MM side-stream prefetch is not yet compatible with "
+                "item-level encoder scheduling; set "
+                "multimodal_config.encoder_side_stream_max_ahead to 0")
+        scheduler_cls = MultimodalScheduler
+        if multimodal_config.enable_eager_encoder_scheduling:
+            logger.info("Eager multimodal encoder scheduling is enabled for "
+                        "capacity-rejected active requests.")
+            scheduler_cls = MultimodalEagerEncoderScheduler
+        scheduler = scheduler_cls(
+            scheduler,
+            max_num_items=model_engine.encoder_max_num_items,
+            max_num_tokens=model_engine.encoder_max_num_tokens,
+        )
 
     config = model_engine.model.model_config.pretrained_config
     attention_type = AttentionTypeCpp.MLA if is_mla(

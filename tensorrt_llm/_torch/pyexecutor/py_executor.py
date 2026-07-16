@@ -89,8 +89,7 @@ from .resource_manager import (NoFreeSlotsError, ResourceManager,
                                ResourceManagerType, request_context)
 from .sampler import (AsyncWorkerMixin, Sampler, SamplerEvent, SampleState,
                       SampleStateTensors, TRTLLMSampler)
-from .scheduler import (MultimodalEagerEncoderScheduler, MultimodalScheduler,
-                        RequestScheduler, ScheduledRequests,
+from .scheduler import (RequestScheduler, ScheduledRequests,
                         SerializableSchedulerOutput, WaitingQueue,
                         create_waiting_queue)
 from .scheduler.adp_router import ADPRouter
@@ -574,34 +573,11 @@ class PyExecutor:
         self.model_engine = model_engine
         self._enable_dsv4_adp_dummy_fixes = getattr(
             model_engine, "_enable_dsv4_adp_dummy_fixes", False)
-        supports_mm_encoder_item_scheduling = getattr(
+        # Compatibility checks and MultimodalScheduler wrapping live in
+        # `create_py_executor_instance`; the executor only keeps the flag
+        # its loop paths branch on.
+        self._supports_mm_encoder_item_scheduling = getattr(
             model_engine, "supports_mm_encoder_item_scheduling", False)
-        self.is_multimodal_model = supports_mm_encoder_item_scheduling
-        if self.is_multimodal_model:
-            multimodal_config = model_engine.llm_args.multimodal_config
-            if multimodal_config.encoder_side_stream_max_ahead > 0:
-                raise NotImplementedError(
-                    "MM side-stream prefetch is not yet compatible with "
-                    "item-level encoder scheduling; set "
-                    "multimodal_config.encoder_side_stream_max_ahead to 0")
-            eager_mm_encoder_scheduling = (
-                multimodal_config.enable_eager_encoder_scheduling)
-            if eager_mm_encoder_scheduling and (model_engine.enable_attention_dp
-                                                or kv_cache_transceiver):
-                raise NotImplementedError(
-                    "Eager MM encoder scheduling does not yet support "
-                    "attention DP or disaggregated serving")
-            scheduler_cls = MultimodalScheduler
-            if eager_mm_encoder_scheduling:
-                logger.info(
-                    "Eager multimodal encoder scheduling is enabled for "
-                    "capacity-rejected active requests.")
-                scheduler_cls = MultimodalEagerEncoderScheduler
-            scheduler = scheduler_cls(
-                scheduler,
-                max_num_items=model_engine.encoder_max_num_items,
-                max_num_tokens=model_engine.encoder_max_num_tokens,
-            )
         self.scheduler = scheduler
         self.enable_attention_dp = model_engine.enable_attention_dp
         self.dist = dist
@@ -2594,7 +2570,7 @@ class PyExecutor:
                             local_disagg_candidates,
                             fitting_disagg_gen_init_requests)
 
-                if (self.is_multimodal_model
+                if (self._supports_mm_encoder_item_scheduling
                         and scheduled_batch.scheduled_mm_encoder_items):
                     self._forward_multimodal_encoder_step(scheduled_batch)
 
@@ -4018,7 +3994,7 @@ class PyExecutor:
                     self._finalize_adp_dummy_allocation(False)
                     continue
 
-                if (self.is_multimodal_model
+                if (self._supports_mm_encoder_item_scheduling
                         and scheduled_batch.scheduled_mm_encoder_items):
                     self._forward_multimodal_encoder_step(scheduled_batch)
 
@@ -4498,7 +4474,7 @@ class PyExecutor:
                     self._finalize_adp_dummy_allocation(False)
                     continue
 
-                if (self.is_multimodal_model
+                if (self._supports_mm_encoder_item_scheduling
                         and scheduled_batch.scheduled_mm_encoder_items):
                     self._forward_multimodal_encoder_step(scheduled_batch)
 
@@ -5066,7 +5042,8 @@ class PyExecutor:
             enable_attention_dp=self.enable_attention_dp,
             max_num_active_requests=self.max_num_active_requests,
             all_ranks_num_active_requests=all_ranks_num_active_requests)
-        if (not new_requests or not getattr(self, "is_multimodal_model", False)
+        if (not new_requests or
+                not getattr(self, "_supports_mm_encoder_item_scheduling", False)
                 or self.enable_attention_dp):
             return new_requests
         return self._apply_mm_encoder_admission(waiting_queue, new_requests)
@@ -5205,7 +5182,7 @@ class PyExecutor:
             """
             try:
                 self._validate_request(request)
-                if self.is_multimodal_model:
+                if self._supports_mm_encoder_item_scheduling:
                     initialize_multimodal_encoder_request(
                         request,
                         max_num_tokens=self.model_engine.encoder_max_num_tokens)

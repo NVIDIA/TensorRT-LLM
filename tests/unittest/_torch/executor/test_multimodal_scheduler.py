@@ -220,7 +220,7 @@ def _executor_for_mm_admission(active_requests, *, max_num_tokens=8):
     executor.dist = SimpleNamespace(tp_size=1)
     executor.max_num_active_requests = 8
     executor.is_benchmark_disagg = False
-    executor.is_multimodal_model = True
+    executor._supports_mm_encoder_item_scheduling = True
     executor.model_engine = SimpleNamespace(
         encoder_max_num_items=8,
         encoder_max_num_tokens=max_num_tokens,
