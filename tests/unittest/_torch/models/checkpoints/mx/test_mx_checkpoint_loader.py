@@ -10,7 +10,7 @@
 
 These tests intentionally do not exercise the upstream modelexpress library.
 The import-failure path blocks modelexpress symbols from sys.modules so the
-assertion is about our fallback behavior, not the upstream API.
+assertion is about our dependency handling, not the upstream API.
 """
 
 import json
@@ -190,11 +190,6 @@ class TestLoadWeightsFallback:
         return MXCheckpointLoader(mx_server_url="http://mx:8001"), {}
 
     @staticmethod
-    def _modelexpress_unavailable(stack):
-        stack.enter_context(_block_modelexpress())
-        return (MXCheckpointLoader(mx_server_url="http://mx:8001"), {"model": MagicMock()})
-
-    @staticmethod
     def _upstream_raises(stack):
         identity = _identity()
         loader = MXCheckpointLoader(mx_server_url="http://mx:8001")
@@ -221,14 +216,12 @@ class TestLoadWeightsFallback:
         [
             ("no_mx_server_url", _no_url),
             ("no_model_kwarg", _no_model),
-            ("modelexpress_not_installed", _modelexpress_unavailable),
             ("source_probe_raises", _source_probe_raises),
             ("upstream_raises", _upstream_raises),
         ],
         ids=[
             "no-mx-server-url",
             "no-model-kwarg",
-            "modelexpress-not-installed",
             "source-probe-raises",
             "upstream-raises",
         ],
@@ -251,6 +244,25 @@ class TestLoadWeightsFallback:
             f"trigger={trigger_id}: is_weights_preloaded() must stay False on any fallback path"
         )
         mock_super_load.assert_called_once()
+
+    def test_missing_modelexpress_client_fails_with_install_hint(self):
+        loader = MXCheckpointLoader(mx_server_url="http://mx:8001")
+        with (
+            _block_modelexpress(),
+            patch.object(HfCheckpointLoader, "load_weights") as mock_super_load,
+            pytest.raises(ImportError) as exc_info,
+        ):
+            loader.load_weights(
+                "/nonexistent",
+                mapping=MagicMock(),
+                model=MagicMock(),
+            )
+
+        message = str(exc_info.value)
+        assert 'pip install "tensorrt-llm[mx]"' in message
+        assert "select a different `checkpoint_format`" in message
+        assert loader.is_weights_preloaded() is False
+        mock_super_load.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

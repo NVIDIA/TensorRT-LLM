@@ -64,11 +64,16 @@ For pip installations outside the official release container, install the MX
 Python client through the optional `mx` extra:
 
 ```bash
-pip install "tensorrt_llm[mx]"
+pip install "tensorrt-llm[mx]"
 ```
 
 The extra pins the ModelExpress client to version `0.4.1`, matching the client
 API qualified by this integration. Deploy a compatible MX server version.
+The extra can be added to an existing TensorRT LLM installation. If the MX
+loading path is configured but the client cannot be imported, TensorRT LLM
+fails with an actionable installation message instead of silently loading from
+the Hugging Face checkpoint. Source discovery and transfer failures continue to
+use the Hugging Face fallback described above.
 
 ## Deploy the MX Service
 

@@ -198,9 +198,10 @@ class MXCheckpointLoader(HfCheckpointLoader):
     publishes its weights after `post_load_weights()` runs, together with
     metadata that lets compatible targets skip one-shot post-load transforms.
 
-    When the MX server or library is unavailable, this loader
-    transparently falls back to standard HuggingFace checkpoint
-    loading via the parent `HfCheckpointLoader`.
+    When the MX server is unavailable, this loader transparently falls back
+    to standard HuggingFace checkpoint loading via the parent
+    `HfCheckpointLoader`. A missing MX client is treated as a configuration
+    error and reported with an actionable installation command.
 
     All transport-level mechanics (NIXL, dtype casts, source matching,
     fallback) are delegated to `modelexpress.trtllm_live_transfer`
@@ -352,13 +353,14 @@ class MXCheckpointLoader(HfCheckpointLoader):
             from modelexpress import (
                 trtllm_live_transfer as mx_transfer,  # type: ignore[import-not-found]
             )
-        except ImportError:
-            logger.warning(
-                "modelexpress library not installed; cannot use MX P2P "
-                "weight transfer. Install TensorRT-LLM with the 'mx' extra. "
-                "Falling back to disk loading."
-            )
-            return self._fallback_to_disk(checkpoint_dir, mapping, **kwargs)
+        except ImportError as exc:
+            raise ImportError(
+                "ModelExpress checkpoint loading was explicitly requested, "
+                "but the ModelExpress client could not be imported. Install "
+                'the MX dependencies with `pip install "tensorrt-llm[mx]"`, '
+                "or select a different "
+                "`checkpoint_format` to continue without MX."
+            ) from exc
 
         try:
             with _MX_TRANSFER_STATE_LOCK:
