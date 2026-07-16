@@ -1867,17 +1867,19 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     true
                 )
 
-                // Monitor the job. The track script always exits 0 once it records
-                // a verdict, so numRetries only re-runs on transport loss, not on a
-                // job that already reached a terminal state.
+                // Monitor the job. The track script always exits 0 once it records a
+                // verdict, so a re-run can't change a terminal state. A frontend lost
+                // mid-monitor is recovered by the enclosing withSlurmFrontendFailover
+                // -- it fails the closure over to another frontend and the submit guard
+                // reuses the still-active job -- so the monitor needs no same-frontend
+                // retries of its own.
                 Utils.exec(
                     pipeline,
                     timeout: false,
                     script: Utils.sshUserCmd(
                         remote,
                         scriptTrackPathNode
-                    ),
-                    numRetries: 3
+                    )
                 )
 
                 // Verdict: "<STATE> <EXIT_CODE>"; success is COMPLETED + exit 0.
