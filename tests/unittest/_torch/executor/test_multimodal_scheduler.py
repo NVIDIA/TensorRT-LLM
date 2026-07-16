@@ -89,7 +89,7 @@ def test_mm_encoder_token_lengths_distinguishes_missing_and_invalid_data():
     assert get_multimodal_encoder_token_lengths(request) is None
 
     request.py_multimodal_data = []
-    with pytest.raises(TypeError, match="py_multimodal_data must be a dict"):
+    with pytest.raises(TypeError, match="multimodal_data must be a dict"):
         get_multimodal_encoder_token_lengths(request)
 
 
