@@ -504,9 +504,10 @@ class MultimodalParams:
     multimodal_runtime: Optional[MultimodalRuntimeData] = None
     input_ids_start_offset: int = 0
     # Prompt-order manifest of data-backed items. Each entry is
-    # ``{"modality": m, "index": i}`` where ``i`` indexes
-    # ``multi_modal_data[m]``. Read by encoders that interleave items
-    # across modalities in prompt order.
+    # ``{"modality": m, "index": i, "placeholder": p}`` where ``i`` indexes
+    # ``multi_modal_data[m]``. Encoders that interleave items across modalities
+    # in prompt order read ``modality``/``index``; ``placeholder`` is carried
+    # for parity with the tracker manifest.
     mm_item_order: Optional[List[Dict[str, Union[str, int]]]] = None
     # CUDA event recorded on a side stream by the MM encoder prefetch path.
     # When set, the consume site in `get_multimodal_embeddings` issues a

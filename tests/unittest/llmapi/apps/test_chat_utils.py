@@ -6,6 +6,7 @@ from tensorrt_llm.inputs import MultimodalDataTracker
 from tensorrt_llm.inputs.media_io import AudioMediaIO
 from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
 from tensorrt_llm.inputs.registry import MULTIMODAL_PLACEHOLDER_REGISTRY
+from tensorrt_llm.inputs.utils import retrieve_multimodal_placeholder
 from tensorrt_llm.serve import chat_utils as _chat_utils
 from tensorrt_llm.serve.chat_utils import (
     _make_media_io,
@@ -419,6 +420,20 @@ _VIDEO_PLACEHOLDER = MULTIMODAL_PLACEHOLDER_REGISTRY.get_placeholder(
 )
 
 
+def _expected_item(modality: str, index: int) -> dict:
+    """Build an expected ``item_order`` entry, mirroring ``add_data``.
+
+    ``add_data`` records the placeholder produced for each item, formatting the
+    modality template with a 1-based running count that equals ``index + 1`` on
+    the data (non-embedding) path exercised by these tests.
+    """
+    return {
+        "modality": modality,
+        "index": index,
+        "placeholder": retrieve_multimodal_placeholder(_MM_MODEL_TYPE, modality, index + 1),
+    }
+
+
 class TestMultimodalPlaceholderCounts:
     """Verify per-message multimodal placeholder counts.
 
@@ -539,7 +554,8 @@ class TestMmItemOrderReturn:
 
     The 4th tuple element from ``parse_chat_messages_coroutines`` is the
     ``MultimodalDataTracker.item_order()`` manifest, indexed within modality
-    in content-parts order.
+    in content-parts order. Each entry carries ``modality``, ``index`` and the
+    ``placeholder`` string recorded by ``add_data``.
     """
 
     @pytest.mark.parametrize(
@@ -560,9 +576,9 @@ class TestMmItemOrderReturn:
                     }
                 ],
                 [
-                    {"modality": "image", "index": 0},
-                    {"modality": "video", "index": 0},
-                    {"modality": "image", "index": 1},
+                    _expected_item("image", 0),
+                    _expected_item("video", 0),
+                    _expected_item("image", 1),
                 ],
             ),
             # Items spanning multiple messages: indices accumulate across
@@ -585,9 +601,9 @@ class TestMmItemOrderReturn:
                     },
                 ],
                 [
-                    {"modality": "image", "index": 0},
-                    {"modality": "video", "index": 0},
-                    {"modality": "image", "index": 1},
+                    _expected_item("image", 0),
+                    _expected_item("video", 0),
+                    _expected_item("image", 1),
                 ],
             ),
         ],

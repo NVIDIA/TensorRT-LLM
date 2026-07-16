@@ -373,11 +373,12 @@ class MultimodalDataTracker:
         self._placeholder_counts = defaultdict[str, int](int)
         self._placeholder_to_modality: dict[str, str] = {}
         # Prompt-order manifest of data-backed items. Each entry is
-        # `{"modality": <str>, "index": <int>}`; the value union reflects
-        # those two typed fields (`modality` is the modality name, `index`
-        # is the item's position in `multi_modal_data[modality]`).
-        # Populated by `add_data` (skipping `is_embedding=True` items —
-        # the interleave manifest addresses raw payload only).
+        # `{"modality": <str>, "index": <int>, "placeholder": <str>}`:
+        # `modality` is the modality name, `index` is the item's position in
+        # `multi_modal_data[modality]`, and `placeholder` is the exact string
+        # the input processor splices this item's embedding into. Populated by
+        # `add_data` (skipping `is_embedding=True` items — the interleave
+        # manifest addresses raw payload only).
         self._item_order: list[dict[str, Union[str, int]]] = []
         self._multimodal_server_config = multimodal_server_config if multimodal_server_config is not None else MultimodalServerConfig(
         )
