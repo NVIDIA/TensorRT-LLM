@@ -245,6 +245,59 @@ class TestLTX2VideoOnlyModel(unittest.TestCase):
         )
 
 
+class TestLTX2TopologyConstruction(unittest.TestCase):
+    """Construction-time gates: attention TYPE is fixed at construction, the
+    {default, stage2} stacks only exist when stage-2 groups are provided, and
+    the topology switch fails fast on a model built without them."""
+
+    DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+    def _build(self, model_type=None, **kwargs):
+        from tensorrt_llm._torch.visual_gen.models.ltx2.transformer_ltx2 import (
+            LTXModel,
+            LTXModelType,
+        )
+
+        model_type = model_type or LTXModelType.AudioVideo
+        cfg = AUDIO_VIDEO_CONFIG if model_type == LTXModelType.AudioVideo else VIDEO_ONLY_CONFIG
+        return LTXModel(
+            model_type=model_type,
+            model_config=_create_model_config(),
+            **cfg,
+            **kwargs,
+        )
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_no_stage2_groups_builds_no_extra_stacks(self):
+        model = self._build()
+        self.assertFalse(model._has_stage2)
+        self.assertIs(model._sharder_s2, model._sharder)
+        self.assertIs(model._active_sharder, model._sharder)
+        block = model.transformer_blocks[0]
+        self.assertIs(block._sharder_s2, block._sharder)
+        for name in ("attn1", "video_to_audio_attn", "audio_attn1"):
+            mod = getattr(block, name, None)
+            if mod is not None:
+                self.assertIs(mod._attn_stage2, mod._attn_default)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_topology_switch_raises_without_stage2_groups(self):
+        model = self._build()
+        with self.assertRaises(AssertionError):
+            model.set_ulysses_topology(is_stage2=True)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_conditional_audio_attn1_is_plain(self):
+        """Default CONDITIONAL mode constructs plain audio self-attention;
+        v2a keeps its wrapper decision from the construction gates."""
+        model = self._build()
+        block = model.transformer_blocks[0]
+        # Single-GPU (ulysses_size == 1): nothing is ulysses-wrapped, and the
+        # TYPE constants reflect construction, not runtime state.
+        self.assertFalse(block.audio_attn1.is_ulysses)
+        self.assertFalse(block.attn1.is_ulysses)
+
+
 class TestLTX2AudioVideoModel(unittest.TestCase):
     """Unit tests for LTXModel with AudioVideo type."""
 

@@ -1520,8 +1520,11 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
             stage2_denoise_time = time.time() - stage2_start
             logger.info(f"Stage 2 denoising time: {stage2_denoise_time:.2f}s (BF16 weights)")
             if self.transformer._has_stage2:
-                self._stage2_topology_state = "default"
+                # Mirror of the entry order: the key must read "stage2" at every
+                # instant the stage-2 stacks might be live, so restore the
+                # transformer FIRST and flip the key only after it succeeded.
                 self.transformer.set_ulysses_topology(is_stage2=False)
+                self._stage2_topology_state = "default"
             if using_persistent_lora:
                 lora_cache.bind_original()
                 self._lora_cuda_graph_state = "original"

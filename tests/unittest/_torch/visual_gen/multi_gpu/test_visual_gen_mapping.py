@@ -174,6 +174,41 @@ class TestConstruction:
             )
 
 
+class TestFlattenCfgRanks:
+    """flatten_cfg_ranks is pure layout arithmetic: one rank list per combined
+    coordinate of every non-(cfg, ulysses) mesh dim, cfg outermost / ulysses
+    innermost within each list."""
+
+    def test_cfg2_u4_is_one_world_list(self):
+        vgm = VisualGenMapping(world_size=8, rank=0, cfg_size=2, ulysses_size=4)
+        assert vgm.flatten_cfg_ranks() == [[0, 1, 2, 3, 4, 5, 6, 7]]
+
+    def test_cfg2_cp2_u2_preserves_ring_fibers(self):
+        vgm = VisualGenMapping(world_size=8, rank=0, cfg_size=2, ring_size=2, ulysses_size=2)
+        lists = vgm.flatten_cfg_ranks()
+        assert lists == [[0, 1, 4, 5], [2, 3, 6, 7]]
+        # Every list holds a single cp coordinate, so stage-1 ring pairs
+        # ({0,2},{1,3},{4,6},{5,7}) are never split across lists.
+        for a, b in ((0, 2), (1, 3), (4, 6), (5, 7)):
+            assert sum(a in grp for grp in lists) == 1
+            assert not any(a in grp and b in grp for grp in lists)
+
+    def test_cfg2_attn2d_2x2_u1(self):
+        vgm = VisualGenMapping(
+            world_size=8, rank=0, cfg_size=2, attn2d_row_size=2, attn2d_col_size=2
+        )
+        assert vgm.flatten_cfg_ranks() == [[0, 4], [1, 5], [2, 6], [3, 7]]
+
+    def test_cfg1_is_identity_partition(self):
+        vgm = VisualGenMapping(world_size=4, rank=0, ulysses_size=4)
+        assert vgm.flatten_cfg_ranks() == [[0, 1, 2, 3]]
+
+    def test_lists_partition_the_world(self):
+        vgm = VisualGenMapping(world_size=8, rank=0, cfg_size=2, ring_size=2, ulysses_size=2)
+        flat = [r for grp in vgm.flatten_cfg_ranks() for r in grp]
+        assert sorted(flat) == list(range(8))
+
+
 class TestSingleGPURanksAndGroups:
     def test_ranks_are_zero(self):
         vgm = VisualGenMapping(world_size=1, rank=0)
