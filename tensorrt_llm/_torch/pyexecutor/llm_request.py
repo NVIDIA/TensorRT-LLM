@@ -675,6 +675,8 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_logits_post_processors = kwargs.pop("py_logits_post_processors",
                                                     None)
         self.py_lora_path: str | None = kwargs.pop("py_lora_path", None)
+        self.py_reusable_prompt_len: int | None = kwargs.pop(
+            "py_reusable_prompt_len", None)
         self.expect_snapshot_points: list[int] = []
         # Multimodal data
         self.py_multimodal_data = kwargs.pop("py_multimodal_data", None)
@@ -1185,6 +1187,8 @@ def executor_request_to_llm_request(
         context_phase_params=executor_request.context_phase_params,
         cache_salt=executor_request.cache_salt,
         arrival_time=getattr(executor_request, "py_arrival_time", None),
+        py_reusable_prompt_len=getattr(executor_request,
+                                       "py_reusable_prompt_len", None),
         py_multimodal_data=getattr(executor_request, "py_multimodal_data",
                                    None),
         kv_cache_retention_config=executor_request.kv_cache_retention_config,

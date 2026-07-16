@@ -26,6 +26,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import (FileResponse, JSONResponse, Response,
                                StreamingResponse)
 from fastapi.routing import APIRoute
+from jinja2.exceptions import TemplateError
 from pydantic import ValidationError
 from starlette.routing import Mount
 from transformers import AutoProcessor
@@ -154,6 +155,85 @@ if _MSGSPEC_ENABLED:
 
 
 TIMEOUT_KEEP_ALIVE = 5  # seconds.
+
+
+def _has_mm_placeholders(mm_placeholder_counts: list[dict[str, int]]) -> bool:
+    return any(count > 0 for message_counts in mm_placeholder_counts
+               for count in message_counts.values())
+
+
+def _encode_text_prompt(tokenizer, prompt: str,
+                        add_special_tokens: bool) -> list[int] | None:
+    try:
+        token_ids = tokenizer.encode(prompt,
+                                     add_special_tokens=add_special_tokens)
+    except TypeError:
+        try:
+            token_ids = tokenizer.encode(prompt)
+        except (AttributeError, TypeError, ValueError, RuntimeError):
+            return None
+    except (AttributeError, ValueError, RuntimeError):
+        return None
+    return list(token_ids)
+
+
+def _get_reusable_prompt_len(
+    tokenizer,
+    stable_prompt: str,
+    full_prompt: str | list[int],
+    add_special_tokens: bool,
+) -> int | None:
+    # Pre-tokenized prompts are consumed as-is, so their stable prefix must be
+    # encoded the same way.  In particular, Router token IDs are produced with
+    # add_special_tokens=False even if the original request set the flag.
+    stable_add_special_tokens = (add_special_tokens if isinstance(
+        full_prompt, str) else False)
+    stable_token_ids = _encode_text_prompt(tokenizer, stable_prompt,
+                                           stable_add_special_tokens)
+    if stable_token_ids is None:
+        return None
+
+    if isinstance(full_prompt, str):
+        full_token_ids = _encode_text_prompt(tokenizer, full_prompt,
+                                             add_special_tokens)
+        if full_token_ids is None:
+            return None
+    elif (isinstance(full_prompt, list)
+          and all(isinstance(token_id, int) for token_id in full_prompt)):
+        full_token_ids = full_prompt
+    else:
+        return None
+
+    stable_prompt_len = len(stable_token_ids)
+    if (stable_prompt_len > 0
+            and full_token_ids[:stable_prompt_len] == stable_token_ids):
+        return stable_prompt_len
+    return None
+
+
+def _mamba_save_last_snapshot_enabled(generator) -> bool:
+    args = getattr(generator, "args", None)
+    kv_cache_config = getattr(args, "kv_cache_config", None)
+    return (getattr(kv_cache_config, "enable_block_reuse", False) is True and
+            getattr(kv_cache_config, "mamba_save_last_snapshot", False) is True)
+
+
+async def _maybe_apply_stable_chat_template(
+    enabled: bool,
+    template_kwargs: dict[str, Any],
+) -> str | None:
+    if not enabled:
+        return None
+
+    try:
+        stable_prompt = await async_apply_chat_template(**template_kwargs)
+    except (TemplateError, TypeError, ValueError, RuntimeError) as exc:
+        logger.debug(
+            "Unable to derive a stable prompt boundary; disabling final-boundary reuse: %s",
+            exc,
+        )
+        return None
+    return stable_prompt if isinstance(stable_prompt, str) else None
 
 
 def _build_tool_strict_guided_decoding_params(tools, tool_parser_name):
@@ -1545,8 +1625,30 @@ class OpenAIServer(_VideoRoutesMixin):
                     base64.b64decode(request.prompt_token_ids_b64),
                     dtype=np.int32).tolist()
 
+            should_compute_stable_prompt = (
+                _mamba_save_last_snapshot_enabled(self.generator)
+                and request.add_generation_prompt
+                and not _has_mm_placeholders(mm_placeholder_counts))
+            stable_prompt_task = _maybe_apply_stable_chat_template(
+                should_compute_stable_prompt,
+                dict(
+                    model_type=resolve_top_level_model_type(self.model_config),
+                    tokenizer=self.tokenizer,
+                    processor=self.processor,
+                    conversation=conversation,
+                    add_generation_prompt=False,
+                    mm_placeholder_counts=mm_placeholder_counts,
+                    tools=tool_dicts,
+                    documents=request.documents,
+                    chat_template=request.chat_template or self.chat_template,
+                    chat_template_kwargs=request.chat_template_kwargs or {},
+                ),
+            )
+
             if request.prompt_token_ids is not None:
                 prompt = request.prompt_token_ids
+                (mm_data, mm_embeddings), stable_prompt = await asyncio.gather(
+                    mm_coroutines, stable_prompt_task)
             else:
                 prompt_task = async_apply_chat_template(
                     model_type=resolve_top_level_model_type(self.model_config),
@@ -1560,12 +1662,20 @@ class OpenAIServer(_VideoRoutesMixin):
                     chat_template=request.chat_template or self.chat_template,
                     chat_template_kwargs=request.chat_template_kwargs or {},
                 )
-                prompt, (mm_data, mm_embeddings) = await asyncio.gather(
-                    prompt_task, mm_coroutines)
+                prompt, (mm_data,
+                         mm_embeddings), stable_prompt = await asyncio.gather(
+                             prompt_task, mm_coroutines, stable_prompt_task)
+
+            reusable_prompt_len = None
+            if isinstance(stable_prompt, str):
+                reusable_prompt_len = _get_reusable_prompt_len(
+                    self.tokenizer,
+                    stable_prompt,
+                    prompt,
+                    request.add_special_tokens,
+                )
             prompt = prompt_inputs(prompt)
 
-            if request.prompt_token_ids is not None:
-                mm_data, mm_embeddings = await mm_coroutines
             if mm_data:
                 prompt["multi_modal_data"] = mm_data
             if mm_embeddings:
@@ -1620,6 +1730,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 conversation_params=conversation_params,
                 cache_salt=request.cache_salt,
                 trace_headers=trace_headers,
+                reusable_prompt_len=reusable_prompt_len,
                 scheduling_params=scheduling_params,
             )
             asyncio.create_task(self.await_disconnected(raw_request, promise))

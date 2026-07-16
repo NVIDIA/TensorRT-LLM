@@ -360,6 +360,10 @@ methods:
       cache_salt:
         annotation: Optional[str]
         default: null
+      reusable_prompt_len:
+        annotation: Optional[int]
+        default: null
+        status: prototype
       trace_headers:
         annotation: Optional[Mapping[str, str]]
         default: null

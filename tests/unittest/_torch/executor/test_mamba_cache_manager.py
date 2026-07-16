@@ -24,6 +24,7 @@ from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import (
     MixedMambaHybridCacheManager,
     PythonMambaCacheManager,
     V2MambaHybridCacheManager,
+    _calc_context_stop_positions_for_request,
     _get_mamba_hybrid_pool_size,
     calc_context_stop_positions,
 )
@@ -85,6 +86,31 @@ def test_hybrid_cache_manager_factory_honors_cpp_preference_with_block_reuse(mon
     )
 
 
+def test_hybrid_cache_manager_factory_rejects_cpp_preference_for_save_last(monkeypatch):
+    monkeypatch.delenv("TRTLLM_USE_CPP_MAMBA", raising=False)
+    monkeypatch.delenv("TRTLLM_USE_PY_MAMBA", raising=False)
+    monkeypatch.setenv("TLLM_MAMBA_MANAGER_PREFERENCE", "CPP")
+    config = SimpleNamespace(
+        architectures=["Qwen3_5MoeForCausalLM"],
+        num_hidden_layers=2,
+        layer_types=["linear_attention", "full_attention"],
+    )
+    model_config = SimpleNamespace(
+        pretrained_config=config,
+        sparse_attention_config=None,
+        get_num_mamba_layers=lambda: 1,
+    )
+
+    with pytest.raises(ValueError, match="requires V2MambaHybridCacheManager"):
+        get_kv_cache_manager_cls(
+            model_config,
+            KvCacheConfig(
+                enable_block_reuse=True,
+                mamba_save_last_snapshot=True,
+            ),
+        )
+
+
 def test_hybrid_cache_manager_factory_keeps_legacy_disagg_route(monkeypatch):
     monkeypatch.delenv("TRTLLM_USE_PY_MAMBA", raising=False)
     monkeypatch.delenv("TLLM_MAMBA_MANAGER_PREFERENCE", raising=False)
@@ -138,6 +164,28 @@ def test_v2_hybrid_incompatibility_falls_back_to_cpp_manager():
         )
         is CppMambaHybridCacheManager
     )
+
+
+def test_v2_save_last_rejects_cpp_fallback():
+    config = SimpleNamespace(
+        architectures=["Qwen3_5MoeForCausalLM"],
+        num_hidden_layers=2,
+        layer_types=["linear_attention", "full_attention"],
+    )
+    model_config = SimpleNamespace(
+        pretrained_config=config,
+        sparse_attention_config=None,
+    )
+    creator = object.__new__(KvCacheCreator)
+    creator._kv_connector_manager = None
+    creator._max_beam_width = 2
+
+    with pytest.raises(ValueError, match="requires V2MambaHybridCacheManager"):
+        creator._fallback_if_unsupported_kv_cache_manager_v2(
+            V2MambaHybridCacheManager,
+            model_config,
+            KvCacheConfig(mamba_save_last_snapshot=True),
+        )
 
 
 def _make_mgr(
@@ -456,10 +504,17 @@ def test_non_mtp_pytorch_prepare_and_get_state_indices_flow():
 
 
 def test_calc_context_stop_positions_returns_snapshot_points():
-    assert calc_context_stop_positions(128, 32, 64) == [64, 128]
-    assert calc_context_stop_positions(70, 32, 256) == []
-    assert calc_context_stop_positions(70, 32, 0) == []
-    assert calc_context_stop_positions(70, 32, None) == []
+    assert calc_context_stop_positions(
+        prompt_len=70,
+        tokens_per_block=32,
+        mamba_state_cache_interval=256,
+        save_last_snapshot=True,
+    ) == [70]
+    assert calc_context_stop_positions(128, 32, 64, True) == [64, 128]
+    assert calc_context_stop_positions(128, 32, 64, False) == [64, 128]
+    assert calc_context_stop_positions(70, 32, 256, False) == []
+    assert calc_context_stop_positions(70, 32, 0, True) == [70]
+    assert calc_context_stop_positions(70, 32, None, True) == [70]
 
 
 def test_v2_hybrid_prepare_expect_snapshot_points():
@@ -467,6 +522,7 @@ def test_v2_hybrid_prepare_expect_snapshot_points():
     mgr.kv_cache_config = KvCacheConfig(
         enable_block_reuse=True,
         mamba_state_cache_interval=64,
+        mamba_save_last_snapshot=True,
     )
     mgr.tokens_per_block = 32
     mgr._mamba_state_cache_interval = 64
@@ -474,7 +530,75 @@ def test_v2_hybrid_prepare_expect_snapshot_points():
 
     mgr.prepare_expect_snapshot_points([request])
 
-    assert request.expect_snapshot_points == [64, 128]
+    assert request.expect_snapshot_points == [64, 128, 150]
+
+
+def test_v2_hybrid_prepare_expect_snapshot_points_save_last_only():
+    mgr = object.__new__(V2MambaHybridCacheManager)
+    mgr.kv_cache_config = KvCacheConfig(
+        enable_block_reuse=True,
+        mamba_state_cache_interval=0,
+        mamba_save_last_snapshot=True,
+    )
+    mgr.tokens_per_block = 32
+    mgr._mamba_state_cache_interval = 0
+    request = SimpleNamespace(prompt_len=150)
+
+    mgr.prepare_expect_snapshot_points([request])
+
+    assert request.expect_snapshot_points == [150]
+
+
+@pytest.mark.parametrize(
+    "interval, capacity, expected_snapshots",
+    [
+        (0, 256, 4),
+        (64, 256, 8),
+    ],
+)
+def test_v2_hybrid_reserves_final_snapshot_per_concurrent_request(
+    interval, capacity, expected_snapshots
+):
+    mgr = object.__new__(V2MambaHybridCacheManager)
+    mgr.max_batch_size = 4
+    mgr._mamba_state_cache_interval = interval
+    config = KvCacheConfig(
+        enable_block_reuse=True,
+        mamba_state_cache_interval=interval,
+        mamba_save_last_snapshot=True,
+    )
+
+    assert mgr._num_ssm_snapshots_for_capacity(capacity, config) == expected_snapshots
+
+
+def test_v2_hybrid_prepare_expect_snapshot_points_uses_stable_boundary():
+    mgr = object.__new__(V2MambaHybridCacheManager)
+    mgr.kv_cache_config = KvCacheConfig(
+        enable_block_reuse=True,
+        mamba_state_cache_interval=0,
+        mamba_save_last_snapshot=True,
+    )
+    mgr.tokens_per_block = 32
+    mgr._mamba_state_cache_interval = 0
+    request = SimpleNamespace(
+        prompt_len=150,
+        py_reusable_prompt_len=137,
+    )
+
+    mgr.prepare_expect_snapshot_points([request])
+
+    assert request.expect_snapshot_points == [137]
+
+
+def test_v2_hybrid_stable_boundary_becomes_snapshot_point():
+    request = SimpleNamespace(
+        prompt_len=150,
+        py_reusable_prompt_len=137,
+    )
+
+    assert _calc_context_stop_positions_for_request(
+        request, tokens_per_block=32, mamba_state_cache_interval=0, save_last_snapshot=True
+    ) == [137]
 
 
 def test_request_block_reuse_commit_limit_uses_snapshot_points():
@@ -501,6 +625,7 @@ def test_v2_block_reuse_commit_saves_ssm_snapshot_at_snapshot_point():
         prompt_len=150,
         context_current_position=137,
         context_remaining_length=13,
+        py_reusable_prompt_len=137,
         expect_snapshot_points=[137],
         is_dummy_request=False,
         is_dummy=False,
@@ -1160,6 +1285,20 @@ def test_cpp_hybrid_dry_run_recurrent_pool_additive_with_block_reuse():
         f"need >= live_state + reuse_snapshots = {expected_min}; the old "
         f"max(reuse, live) formula dropped reuse headroom"
     )
+
+
+@skip_no_cuda
+def test_cpp_hybrid_dry_run_accepts_zero_snapshot_interval():
+    mgr = _build_hybrid_with_mamba_layer(
+        enable_block_reuse=True,
+        mamba_state_cache_interval=0,
+        is_estimating_kv_cache=True,
+    )
+    try:
+        recurrent_primary, _ = mgr.blocks_per_window[LinearCacheType.RECURRENT_STATES.value]
+        assert recurrent_primary >= mgr.max_batch_size
+    finally:
+        mgr.shutdown()
 
 
 # ---------------------------------------------------------------------------

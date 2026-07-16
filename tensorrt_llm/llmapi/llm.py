@@ -598,6 +598,7 @@ class BaseLLM:
         conversation_params: Optional[ConversationParams] = None,
         cache_salt: Optional[str] = None,
         priority: float = DEFAULT_REQUEST_PRIORITY,
+        reusable_prompt_len: Optional[int] = None,
     ) -> RequestOutput:
         """Generate output for the given prompt in the asynchronous mode.
         Asynchronous generation accepts single prompt only.
@@ -616,6 +617,7 @@ class BaseLLM:
             conversation_params (tensorrt_llm.conversation_params.ConversationParams, optional): Conversation parameters. Defaults to None.
             cache_salt (str, optional): If specified, KV cache will be salted with the provided string to limit the kv cache reuse to the requests with the same string. Defaults to None.
             priority (float): The scheduling priority for the request, in the range [0, 1]. Higher values indicate higher priority. Defaults to 0.5.
+            reusable_prompt_len (int, optional): Length of the stable prompt prefix that can be reused. Defaults to None.
 
         Returns:
             tensorrt_llm.llmapi.llm.RequestOutput: The output data of the completion request to the LLM.
@@ -684,6 +686,7 @@ class BaseLLM:
             scheduling_params=scheduling_params,
             conversation_params=conversation_params,
             cache_salt=cache_salt,
+            reusable_prompt_len=reusable_prompt_len,
             arrival_time=arrival_time,
             encoder_input_token_ids=encoder_input_token_ids,
             priority=priority,

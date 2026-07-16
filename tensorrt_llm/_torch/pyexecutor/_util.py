@@ -121,9 +121,16 @@ def get_kv_cache_manager_cls(
                 f"Sparse attention algorithm {sparse_attn_algorithm!r} is not "
                 "supported with hybrid Mamba / linear-attention models.")
 
+        save_last_snapshot = kv_cache_config.mamba_save_last_snapshot
+
         # Skip Softmax only changes attention kernels. Hybrid models still
         # need a Mamba-capable cache manager for recurrent state.
         if is_disagg:
+            if save_last_snapshot:
+                raise ValueError(
+                    "mamba_save_last_snapshot requires "
+                    "V2MambaHybridCacheManager, which is not yet supported "
+                    "for disaggregated serving.")
             if kv_cache_config.enable_block_reuse:
                 return CppMambaHybridCacheManager
             if (cache_transceiver_config is not None and
@@ -134,6 +141,11 @@ def get_kv_cache_manager_cls(
             return CppMambaHybridCacheManager
 
         if use_py_mamba_cache_manager() and not is_disagg:
+            if save_last_snapshot:
+                raise ValueError(
+                    "mamba_save_last_snapshot requires "
+                    "V2MambaHybridCacheManager and cannot be used with "
+                    "TRTLLM_USE_PY_MAMBA=1.")
             if kv_cache_config.enable_block_reuse:
                 raise ValueError(
                     "TRTLLM_USE_PY_MAMBA=1 forces "
@@ -148,6 +160,11 @@ def get_kv_cache_manager_cls(
         if env_override is not None:
             env_override = env_override.upper()
             if env_override == 'MIXED':
+                if save_last_snapshot:
+                    raise ValueError(
+                        "mamba_save_last_snapshot requires "
+                        "V2MambaHybridCacheManager and cannot be used with "
+                        "TLLM_MAMBA_MANAGER_PREFERENCE=MIXED.")
                 if kv_cache_config.enable_block_reuse:
                     raise ValueError(
                         "TLLM_MAMBA_MANAGER_PREFERENCE=MIXED forces "
@@ -160,6 +177,11 @@ def get_kv_cache_manager_cls(
                     "MixedMambaHybridCacheManager.")
                 return MixedMambaHybridCacheManager
             if env_override == 'CPP':
+                if save_last_snapshot:
+                    raise ValueError(
+                        "mamba_save_last_snapshot requires "
+                        "V2MambaHybridCacheManager and cannot be used with "
+                        "TLLM_MAMBA_MANAGER_PREFERENCE=CPP.")
                 logger.warning(
                     "Environment variable TLLM_MAMBA_MANAGER_PREFERENCE=CPP "
                     "overrides the default Mamba cache manager to "
@@ -437,6 +459,12 @@ class KvCacheCreator:
                         f"which is not yet supported with {incompat_str}. "
                         f"Disable these features to run Gemma4 hybrid models.")
                 if is_hybrid_linear(config):
+                    if (kv_cache_config is not None
+                            and kv_cache_config.mamba_save_last_snapshot):
+                        raise ValueError(
+                            "mamba_save_last_snapshot requires "
+                            "V2MambaHybridCacheManager, which is not "
+                            f"supported with {incompat_str}.")
                     logger.warning(
                         "KVCacheManagerV2-backed MambaHybridCacheManager is "
                         "not supported with %s. Falling back to "

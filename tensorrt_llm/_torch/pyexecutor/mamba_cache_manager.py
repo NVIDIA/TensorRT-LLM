@@ -1147,12 +1147,14 @@ class MixedMambaHybridCacheManager(KVCacheManager, MambaCacheManager,
                                         kv_cache_dtype_byte_size)
 
 
-def calc_context_stop_positions(
-        prompt_len: int, tokens_per_block: int,
-        mamba_state_cache_interval: Optional[int]) -> list[int]:
+def calc_context_stop_positions(prompt_len: int,
+                                tokens_per_block: int,
+                                mamba_state_cache_interval: Optional[int],
+                                save_last_snapshot: bool = False) -> list[int]:
     """Compute token positions at which mamba state snapshots should be saved.
 
-    Returns regular interval boundaries. ``tokens_per_block`` is kept in the
+    Returns regular interval boundaries, plus the final prompt length when
+    ``save_last_snapshot`` is requested. ``tokens_per_block`` is kept in the
     signature because the C++/V1 path used it to derive block-aligned points;
     V2 can snapshot exact partial boundaries.
     """
@@ -1162,7 +1164,35 @@ def calc_context_stop_positions(
         stop_positions.extend(
             range(mamba_state_cache_interval, prompt_len + 1,
                   mamba_state_cache_interval))
+    if save_last_snapshot:
+        stop_positions.append(prompt_len)
     return sorted({pos for pos in stop_positions if 0 < pos <= prompt_len})
+
+
+def _get_request_snapshot_limit(
+    request: LlmRequest,
+    save_last_snapshot: bool = False,
+) -> int:
+    if save_last_snapshot:
+        reusable_prompt_len = getattr(request, "py_reusable_prompt_len", None)
+        if isinstance(reusable_prompt_len, int) and reusable_prompt_len > 0:
+            return min(reusable_prompt_len, request.prompt_len)
+    return request.prompt_len
+
+
+def _calc_context_stop_positions_for_request(
+    request: LlmRequest,
+    tokens_per_block: int,
+    mamba_state_cache_interval: Optional[int],
+    save_last_snapshot: bool = False,
+) -> list[int]:
+    snapshot_limit = _get_request_snapshot_limit(request, save_last_snapshot)
+    return calc_context_stop_positions(
+        snapshot_limit,
+        tokens_per_block,
+        mamba_state_cache_interval,
+        save_last_snapshot,
+    )
 
 
 @triton.jit
@@ -2480,6 +2510,14 @@ class V2MambaHybridCacheManager(KVCacheManagerV2, MambaHybridCacheManager):
         num_snapshots = 0
         if interval is not None and interval > 0:
             num_snapshots += capacity // interval
+
+        if kv_cache_config.mamba_save_last_snapshot:
+            # Every concurrently scheduled request may end between regular
+            # interval boundaries, so each one needs its own final snapshot
+            # slot. Reserving one global slot can overcommit the SSM pool as
+            # soon as two requests finish at different boundaries.
+            num_snapshots += self.max_batch_size
+
         return num_snapshots
 
     def _ssm_slots_per_request_for_typical_batch(
@@ -3130,14 +3168,15 @@ class V2MambaHybridCacheManager(KVCacheManagerV2, MambaHybridCacheManager):
             return
 
         interval = self._mamba_state_cache_interval
-        if interval is None or interval <= 0:
+        save_last_snapshot = self.kv_cache_config.mamba_save_last_snapshot
+        if (interval is None or interval <= 0) and not save_last_snapshot:
             for request in requests:
                 request.expect_snapshot_points = []
             return
 
         for request in requests:
-            request.expect_snapshot_points = calc_context_stop_positions(
-                request.prompt_len, self.tokens_per_block, interval)
+            request.expect_snapshot_points = _calc_context_stop_positions_for_request(
+                request, self.tokens_per_block, interval, save_last_snapshot)
 
     def calc_next_context_chunk_size(self, request: LlmRequest) -> int:
         prompt_len = request.prompt_len
