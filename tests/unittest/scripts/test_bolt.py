@@ -20,6 +20,7 @@ Covers the pure logic most likely to regress silently:
 - apply_bolt.profile_for: ELF-basename -> profile-file mapping (.yaml preferred,
   .fdata fallback, multi-dot names like the python bindings, empty/missing).
 """
+
 from __future__ import annotations
 
 import importlib.util
