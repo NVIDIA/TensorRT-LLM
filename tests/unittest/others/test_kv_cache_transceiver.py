@@ -36,8 +36,10 @@ DEFAULT_KV_TRANSFER_TIMEOUT_S = (
 KV_TRANSFER_COMPLETION_MARGIN_S = 10.0
 
 
-def test_cpp_transceiver_rejects_mixed_mamba_manager():
-    config = CacheTransceiverConfig(backend="NIXL", transceiver_runtime="CPP")
+@pytest.mark.parametrize("transceiver_runtime", ["CPP", "auto"])
+def test_cpp_transceiver_rejects_mixed_mamba_manager(transceiver_runtime):
+    config = CacheTransceiverConfig(backend="NIXL",
+                                    transceiver_runtime=transceiver_runtime)
     mixed_manager = object.__new__(MixedMambaHybridCacheManager)
 
     with pytest.raises(
