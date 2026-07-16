@@ -50,6 +50,26 @@ def _dense_penalty_reference(logits, counts, presence, rep, pre, freq, temp):
     return (penalized - sub) / temp
 
 
+def _pack_presence_prefix(counts, presence):
+    packed = torch.zeros(
+        presence.size(0),
+        (presence.size(1) + 31) // 32,
+        dtype=torch.int32,
+        device=presence.device,
+    )
+    prefix_slots, prefix_tokens = torch.nonzero(presence, as_tuple=True)
+    empty = torch.empty(0, dtype=torch.int64, device=presence.device)
+    update_occurrence_workspace(
+        counts,
+        packed,
+        empty,
+        empty,
+        prefix_slots,
+        prefix_tokens,
+    )
+    return packed
+
+
 @pytest.mark.parametrize(
     "name,rep,pre,freq,temp,use_prefix",
     [
@@ -83,6 +103,7 @@ def test_regular_triton_matches_dense_logits_reference(name, rep, pre, freq, tem
         if use_prefix
         else None
     )
+    presence_prefix = _pack_presence_prefix(counts, presence) if presence is not None else None
     rep_t, pre_t, freq_t, temp_t = _col(rep), _col(pre), _col(freq), _col(temp)
     slots = torch.arange(A, dtype=torch.int64, device="cuda")
 
@@ -90,7 +111,7 @@ def test_regular_triton_matches_dense_logits_reference(name, rep, pre, freq, tem
     apply_batched_occurrence_penalties_triton(
         got,
         counts,
-        presence,
+        presence_prefix,
         torch.ones(A, dtype=torch.bool, device="cuda"),
         torch.zeros(A, dtype=torch.bool, device="cuda"),
         torch.zeros(1, A, 1, dtype=torch.int32, device="cuda"),
@@ -174,22 +195,56 @@ def test_triton_indirect_indexing_bf16():
     torch.testing.assert_close(logits[untouched], orig[untouched], rtol=0, atol=0)
 
 
-def test_update_occurrence_workspace():
-    counts = torch.zeros(3, 16, dtype=torch.int32, device="cuda")
-    presence = torch.zeros(3, 16, dtype=torch.int32, device="cuda")
-    long = lambda xs: torch.tensor(xs, dtype=torch.int64, device="cuda")  # noqa: E731
+def test_packed_prefix_boundaries_match_dense_logits_reference():
+    vocab = 70
+    counts = torch.zeros(1, vocab, dtype=torch.int32, device="cuda")
+    presence_prefix = torch.zeros(1, (vocab + 31) // 32, dtype=torch.int32, device="cuda")
 
+    counted_tokens = torch.tensor([31, 31, 45], dtype=torch.int64, device="cuda")
+    prefix_tokens = torch.tensor([0, 31, 31, 32, 63, 69], dtype=torch.int64, device="cuda")
+    counted_slots = torch.zeros_like(counted_tokens)
+    prefix_slots = torch.zeros_like(prefix_tokens)
     update_occurrence_workspace(
-        counts, presence, long([0, 0, 1]), long([2, 2, 5]), long([0]), long([7])
+        counts,
+        presence_prefix,
+        counted_slots,
+        counted_tokens,
+        prefix_slots,
+        prefix_tokens,
     )
-    assert counts[0, 2] == 2  # repeated (slot, token) accumulates
-    assert counts[1, 5] == 1
-    assert presence[0, 7] == 1
-    assert counts[0, 7] == 0  # prefix token is not counted
 
-    # presence_prefix=None and empty prefix updates must not raise.
-    update_occurrence_workspace(counts, None, long([0]), long([2]), long([]), long([]))
-    assert counts[0, 2] == 3
+    logits = torch.linspace(-7.0, 7.0, vocab, device="cuda").view(1, -1)
+    original = logits.clone()
+    apply_batched_occurrence_penalties_triton(
+        logits,
+        counts,
+        presence_prefix,
+        torch.ones(1, dtype=torch.bool, device="cuda"),
+        torch.zeros(1, dtype=torch.bool, device="cuda"),
+        torch.zeros(1, 1, 1, dtype=torch.int32, device="cuda"),
+        torch.zeros(1, dtype=torch.int64, device="cuda"),
+        torch.zeros(1, dtype=torch.int32, device="cuda"),
+        torch.ones(1, dtype=torch.int32, device="cuda"),
+        None,
+        torch.tensor([1.2], device="cuda"),
+        torch.tensor([0.4], device="cuda"),
+        torch.tensor([0.3], device="cuda"),
+        max_num_steps=1,
+    )
+
+    dense_prefix = torch.zeros_like(counts)
+    dense_prefix[0, torch.unique(prefix_tokens)] = 1
+    expected = _dense_penalty_reference(
+        original,
+        counts,
+        dense_prefix,
+        torch.tensor([[1.2]], device="cuda"),
+        torch.tensor([[0.4]], device="cuda"),
+        torch.tensor([[0.3]], device="cuda"),
+        torch.ones(1, 1, device="cuda"),
+    )
+    assert presence_prefix.shape == (1, 3)
+    torch.testing.assert_close(logits, expected, rtol=1e-4, atol=1e-4)
 
 
 def _make_handler_request(

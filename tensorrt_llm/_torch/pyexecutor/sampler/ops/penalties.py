@@ -39,16 +39,17 @@ def update_occurrence_workspace(
 ) -> None:
     """Fold newly-committed tokens into the persistent occurrence workspace.
 
-    Mirrors the accumulation ``batchApplyPenalty`` performs in its ``penaltyWorkspace``
-    (``[..., 2 * vocabSize]`` = ``[presencePrefix, counts]``): tokens in the ignored
+    Mirrors the logical accumulation ``batchApplyPenalty`` performs in its
+    ``penaltyWorkspace`` while packing the prefix-presence half: tokens in the ignored
     prompt prefix ``[0, prompt_ignore_length)`` set the presence bitmap only (they count
     for repetition but not for presence/frequency), while all other tokens (the rest of
     the prompt plus every generated token) increment the occurrence counts.
 
     Arguments (all index tensors are 1-D and pre-split on the host):
       counts: ``int32[num_slots, vocab_size]`` occurrence counts, updated in place.
-      presence_prefix: integer/bool ``[num_slots, vocab_size]`` prefix presence bitmap,
-        or ``None`` when no active request uses ``prompt_ignore_length``.
+      presence_prefix: packed int32 ``[num_slots, ceil(vocab_size / 32)]`` prefix
+        presence bitmap, or ``None`` when no active request uses
+        ``prompt_ignore_length``.
       counted_slots / counted_tokens: (slot, token) pairs to increment in ``counts``.
       prefix_slots / prefix_tokens: (slot, token) pairs to mark in ``presence_prefix``.
     """
@@ -57,7 +58,39 @@ def update_occurrence_workspace(
         # accumulate=True sums repeated (slot, token) pairs -> occurrence count.
         counts.index_put_((counted_slots, counted_tokens), ones, accumulate=True)
     if presence_prefix is not None and prefix_slots.numel() > 0:
-        presence_prefix[prefix_slots, prefix_tokens] = 1
+        block_size = 256
+        _mark_presence_prefix_kernel[(triton.cdiv(prefix_slots.numel(), block_size),)](
+            presence_prefix,
+            prefix_slots,
+            prefix_tokens,
+            presence_prefix.stride(0),
+            prefix_slots.numel(),
+            BLOCK_SIZE=block_size,
+        )
+
+
+@triton.jit
+def _mark_presence_prefix_kernel(
+    presence_prefix_ptr,
+    prefix_slots_ptr,
+    prefix_tokens_ptr,
+    presence_prefix_row_stride,
+    num_tokens,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Atomically mark ignored-prefix tokens in the packed presence bitmap."""
+    offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < num_tokens
+    slots = tl.load(prefix_slots_ptr + offsets, mask=mask, other=0)
+    tokens = tl.load(prefix_tokens_ptr + offsets, mask=mask, other=0).to(tl.int32)
+    word_offsets = tokens // 32
+    bit_offsets = tokens % 32
+    bits = tl.full((BLOCK_SIZE,), 1, tl.int32) << bit_offsets
+    tl.atomic_or(
+        presence_prefix_ptr + slots * presence_prefix_row_stride + word_offsets,
+        bits,
+        mask=mask,
+    )
 
 
 @triton.jit
@@ -78,6 +111,7 @@ def _apply_batched_occurrence_penalties_kernel(
     vocab,
     logits_row_stride,
     workspace_row_stride,
+    presence_prefix_row_stride,
     new_tokens_step_stride,
     new_tokens_slot_stride,
     new_tokens_beam_stride,
@@ -124,8 +158,14 @@ def _apply_batched_occurrence_penalties_kernel(
     logit = tl.load(logits_ptr + logit_offset, mask=mask, other=0.0).to(tl.float32)
     seen = count > 0
     if HAS_PRESENCE_PREFIX:
-        prefix = tl.load(presence_prefix_ptr + count_offset, mask=mask, other=0)
-        seen |= prefix > 0
+        prefix_word_offsets = vocab_block * BLOCK_SIZE // 32 + tl.arange(0, BLOCK_SIZE // 32)
+        prefix_words = tl.load(
+            presence_prefix_ptr + slot * presence_prefix_row_stride + prefix_word_offsets,
+            mask=valid_row & (prefix_word_offsets < tl.cdiv(vocab, 32)),
+            other=0,
+        )
+        prefix_seen = (prefix_words[:, None] >> tl.arange(0, 32)[None, :]) & 1
+        seen |= prefix_seen.to(tl.int1).reshape(BLOCK_SIZE)
 
     repetition = tl.load(repetition_ptr + slot, mask=valid_row, other=1.0)
     presence = tl.load(presence_ptr + slot, mask=valid_row, other=0.0)
@@ -204,6 +244,7 @@ def apply_batched_occurrence_penalties_triton(
         vocab,
         logits.stride(0),
         counts.stride(0),
+        presence_prefix.stride(0) if has_presence_prefix else counts.stride(0),
         new_tokens.stride(0),
         new_tokens.stride(1),
         new_tokens.stride(2),

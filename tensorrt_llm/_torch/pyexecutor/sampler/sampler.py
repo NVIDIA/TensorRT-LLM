@@ -1363,8 +1363,8 @@ class _OccurrencePenaltyHandler:
       shape ``[max_num_sequences]``) -- the counterpart of
       ``allocateBuffer`` + ``fillBuffers``; filled once per request in
       ``prepare_for_new_request`` and gathered per step (no per-step host rebuild);
-    * an occurrence workspace (``counts`` / ``presence_prefix``, shape
-      ``[max_num_sequences, vocab_size]``) -- the counterpart of ``allocateWorkspace`` /
+    * an occurrence workspace (dense ``counts`` plus a packed ``presence_prefix``
+      bitmap) -- the counterpart of ``allocateWorkspace`` /
       ``mPenaltyWorkspaceDevice``; updated incrementally each step.
 
     The actual logits math lives in the ops module. Parameter buffers are allocated
@@ -1388,15 +1388,15 @@ class _OccurrencePenaltyHandler:
         has_previous_token: torch.Tensor
         """bool[slots]; whether ``new_tokens`` contains a token to accumulate."""
 
-        # --- Occurrence workspace (allocateWorkspace counterpart), lazy, [slots, vocab] ---
+        # --- Occurrence workspace (allocateWorkspace counterpart), allocated lazily ---
         counts: torch.Tensor | None = None
         """int32 or None; per-slot occurrence counts of prompt (beyond
         prompt_ignore_length) and generated tokens. Drives presence/frequency and (via
         counts > 0) repetition."""
         presence_prefix: torch.Tensor | None = None
-        """int32 or None; per-slot presence bitmap for the ignored prompt prefix
-        [0, prompt_ignore_length). Allocated only when some request sets
-        prompt_ignore_length > 0; contributes to repetition only."""
+        """Packed int32 or None; per-slot presence bitmap with shape
+        ``[slots, ceil(vocab / 32)]`` for the ignored prompt prefix
+        ``[0, prompt_ignore_length)``. It contributes to repetition only."""
 
     @dataclass(kw_only=True)
     class _SlotState:
@@ -1523,7 +1523,12 @@ class _OccurrencePenaltyHandler:
                     (self._max_num_sequences, vocab_size), dtype=torch.int32, device=self._device
                 )
             if self._needs_prefix and self.store.presence_prefix is None:
-                self.store.presence_prefix = torch.zeros_like(self.store.counts)
+                packed_vocab_size = (vocab_size + 31) // 32
+                self.store.presence_prefix = torch.zeros(
+                    (self._max_num_sequences, packed_vocab_size),
+                    dtype=torch.int32,
+                    device=self._device,
+                )
 
     def _to_device(self, values: list[int], dtype: torch.dtype) -> torch.Tensor:
         return torch.tensor(values, dtype=dtype, pin_memory=prefer_pinned()).to(
