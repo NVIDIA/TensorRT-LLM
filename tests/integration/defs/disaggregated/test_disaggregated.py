@@ -29,7 +29,6 @@ from typing import Any, Optional
 import aiohttp
 import numpy as np
 import pytest
-import requests as _requests
 import yaml
 from defs.common import get_free_port_in_ci as get_free_port
 from defs.common import (parse_gsm8k_output, resolve_llm_model_path,
@@ -801,18 +800,23 @@ def setup_disagg_cluster(
 
                     # Track worker registration count for the status log.
                     try:
-                        info_resp = _requests.get(
-                            f"http://localhost:{server_port}/cluster_info",
-                            timeout=2)
-                        if info_resp.status_code == 200:
-                            workers = info_resp.json().get(
-                                "current_workers", {})
-                            count = (len(workers.get("context_servers", [])) +
-                                     len(workers.get("generation_servers", [])))
-                            if count > last_worker_count:
-                                last_worker_count = count
-                    except (_requests.exceptions.ConnectionError,
-                            _requests.exceptions.Timeout):
+                        timeout = aiohttp.ClientTimeout(total=2)
+                        async with aiohttp.ClientSession(
+                                timeout=timeout) as session:
+                            async with session.get(
+                                    f"http://localhost:{server_port}/cluster_info"
+                            ) as info_resp:
+                                if info_resp.status == 200:
+                                    workers = (await info_resp.json()).get(
+                                        "current_workers", {})
+                                    count = (len(
+                                        workers.get("context_servers", [])) +
+                                             len(
+                                                 workers.get(
+                                                     "generation_servers", [])))
+                                    if count > last_worker_count:
+                                        last_worker_count = count
+                    except (aiohttp.ClientError, asyncio.TimeoutError):
                         pass
 
             # Run the readiness poller and the watchdog concurrently.
