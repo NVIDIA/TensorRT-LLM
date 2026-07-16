@@ -37,7 +37,7 @@ mpirun --allow-run-as-root --oversubscribe --bind-to none --map-by slot -np 8 \
 Perf knobs:
 - ``--combine-format {bf16,fp8,fp4}`` -> ``create_moe(combine_format=...)``
   backend constructor argument (bf16 / 32e4m3xe8m0 / 16e2m1xbf16)
-- ``--autotune``                      -> sets ``MEGAMOE_TACTIC_AUTOTUNE=1``
+- ``--autotune``                      -> sets ``MEGAMOE_TACTIC_AUTOTUNE=1`` (otherwise 0)
   (the MegaMoE tactic-sweep opt-in, default OFF) + one forward inside
   ``autotune()`` (the real AutoTuner tuning mode: MERGE lockstep tactic
   sweep vs the heuristic; tuning-mode launches use the top max-token
@@ -354,10 +354,10 @@ def main():
     )
     mapping.rank = rank
     _ensure_dist(rank, world_size)
+    # Override any inherited shell value so the reported mode is the mode
+    # actually used by every backend constructed by this benchmark.
+    os.environ["MEGAMOE_TACTIC_AUTOTUNE"] = "1" if args.autotune else "0"
     if args.autotune:
-        # Backend reads the opt-in at construction; same argv on every rank
-        # keeps it rank-identical (it gates collective tuning behavior).
-        os.environ["MEGAMOE_TACTIC_AUTOTUNE"] = "1"
         # The MERGE tuning strategy barriers the EP ranks in lockstep and
         # needs the tuner's distributed state wired up before any forward.
         AutoTuner.get().setup_distributed_state(mapping)

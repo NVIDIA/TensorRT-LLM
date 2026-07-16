@@ -604,7 +604,6 @@ class MegaMoECuteDsl(MoE):
         self._profiling_scratch_kwargs = None
         self._weights_loaded = False
         self._weights_created = False
-        self._post_load_done = False
         self.quant_method = None
         # Per-instance staging cache (key -> {tensor name: tensor}) and
         # last-staged-T tracker; together they implement the always-pad-
@@ -1026,14 +1025,6 @@ class MegaMoECuteDsl(MoE):
         self.quant_method.load_weights(
             self, weights, self.weight_loading_mode, allow_partial_loading=allow_partial_loading
         )
-        # Eager loading path: ``FusedMoEMethodBase.load_weights`` already
-        # ran ``quant_method.process_weights_after_loading(self)`` at its
-        # tail. Mark the sentinel so a subsequent
-        # ``backend.process_weights_after_loading()`` becomes a no-op
-        # instead of re-stacking ``mega_fc*_weight*`` from
-        # already-finalised parent buffers.
-        if not allow_partial_loading:
-            self._post_load_done = True
 
     def post_load_weights(self) -> None:
         if self.quant_method is None:
@@ -1054,51 +1045,11 @@ class MegaMoECuteDsl(MoE):
             self.create_weights()
         super().cache_derived_state()
 
-    def process_weights_after_loading(self) -> None:
-        """Run quant-method weight transforms; idempotent across calls.
-
-        The real MegaMoE-format build (``[w3|w1]`` cat, 16-atom gate/up
-        interleave, ``to_blocked`` swizzle, and ``fc1_norm_const`` setup) lives in
-        :meth:`NVFP4MegaMoECuteDslMethod.process_weights_after_loading`.
-        This hook must dispatch to that method directly so two paths
-        both reach it:
-
-          * Eager loading (``allow_partial_loading=False``) -- fired by
-            ``FusedMoEMethodBase.load_weights`` itself.
-          * Partial loading (RLHF reload, etc.) -- ``load_weights``
-            skips its tail call, so the caller invokes this hook on
-            ``ConfigurableMoE`` -> backend to finalise.
-
-        ``_post_load_done`` keeps the call idempotent: a second
-        invocation after eager finalisation must not re-run the
-        transforms (``_build_mega_format_weights`` would re-stack
-        ``mega_fc*_weight*`` from already-finalised parent buffers).
-        """
-        if getattr(self, "_post_load_done", False):
-            return
-        if self.quant_method is None:
-            self.create_weights()
-        self.quant_method.process_weights_after_loading(self)
-        self._post_load_done = True
-
     def pre_reload_weights(self) -> None:
-        """Reset cached state before a hot weight reload.
-
-        ``_post_load_done`` is cleared so the next ``process_weights_after_loading``
-        re-runs the MegaMoE-format weight transforms over the new
-        checkpoint bytes. The symmetric-memory provider is forward-time
-        scratch that does not need to be re-rendezvoused on weight
-        reload; we keep it as-is to avoid an unnecessary collective.
-        """
-        # Fail-fast mirror of MoE.pre_reload_weights: the reload walk reaches
-        # this override directly (ConfigurableMoE is _weights_removed).
-        if self._using_load_balancer():
-            raise NotImplementedError(
-                "Weight reloading is not compatible with Expert Parallel Load Balancer (EPLB). "
-            )
-        self._post_load_done = False
-        if self.quant_method is not None and hasattr(self.quant_method, "pre_reload_weights"):
-            self.quant_method.pre_reload_weights(self)
+        raise NotImplementedError(
+            "MegaMoE-CuteDSL does not support hot weight reloading; its "
+            "source weights are released after initial packing."
+        )
 
     def _build_weight_view(self) -> MegaMoECuteDslWeightView:
         """Bundle the MegaMoE-format weight tensors registered by the
