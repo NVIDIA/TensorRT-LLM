@@ -1352,14 +1352,15 @@ class AsyncWorkerMixin:
 class _OccurrencePenaltyHandler:
     """Applies repetition / presence / frequency penalties for :class:`TorchSampler`.
 
-    Occurrence tracking and penalty formulas are aligned with the C++
+    Occurrence tracking and the individual penalty transforms follow the C++
     ``batchApplyPenalty`` kernel (``cpp/tensorrt_llm/kernels/penaltyKernels.cu``) as
-    driven by ``PenaltyLayer``. All persistent device state lives in a single
-    :class:`_PenaltyStore`, the torch counterpart of the tensors ``PenaltyLayer``
-    allocates:
+    driven by ``PenaltyLayer``. Their ordering follows TorchSampler: penalties are
+    applied before the sampling strategy handles temperature. All persistent device
+    state lives in a single :class:`_PenaltyStore`, the torch counterpart of the tensors
+    ``PenaltyLayer`` allocates:
 
-    * per-slot penalty-parameter buffers (``repetition`` / ``presence`` / ``frequency``
-      / ``temperature``, shape ``[max_num_sequences]``) -- the counterpart of
+    * per-slot penalty-parameter buffers (``repetition`` / ``presence`` / ``frequency``,
+      shape ``[max_num_sequences]``) -- the counterpart of
       ``allocateBuffer`` + ``fillBuffers``; filled once per request in
       ``prepare_for_new_request`` and gathered per step (no per-step host rebuild);
     * an occurrence workspace (``counts`` / ``presence_prefix``, shape
@@ -1382,9 +1383,6 @@ class _OccurrencePenaltyHandler:
         """float32; per-slot presence penalty (default 0.0)."""
         frequency: torch.Tensor
         """float32; per-slot frequency penalty (default 0.0)."""
-        temperature: torch.Tensor
-        """float32; per-slot effective sampling temperature (default 1.0), used to couple
-        the additive penalties to the deferred temperature division for C++ parity."""
         active: torch.Tensor
         """bool[slots]; whether a slot has an active occurrence penalty."""
         has_previous_token: torch.Tensor
@@ -1432,7 +1430,6 @@ class _OccurrencePenaltyHandler:
                 repetition=torch.ones(max_num_sequences, dtype=torch.float32, device=self._device),
                 presence=torch.zeros(max_num_sequences, dtype=torch.float32, device=self._device),
                 frequency=torch.zeros(max_num_sequences, dtype=torch.float32, device=self._device),
-                temperature=torch.ones(max_num_sequences, dtype=torch.float32, device=self._device),
                 active=torch.zeros(max_num_sequences, dtype=torch.bool, device=self._device),
                 has_previous_token=torch.zeros(
                     max_num_sequences, dtype=torch.bool, device=self._device
@@ -1474,7 +1471,6 @@ class _OccurrencePenaltyHandler:
         repetition = _unwrap_singleton(sampling_config.repetition_penalty)
         presence = _unwrap_singleton(sampling_config.presence_penalty)
         frequency = _unwrap_singleton(sampling_config.frequency_penalty)
-        temperature = _unwrap_singleton(sampling_config.temperature)
         prompt_ignore_length = _unwrap_singleton(sampling_config.prompt_ignore_length)
         # min(prompt_ignore_length, inputLen), matching the C++ kernel.
         prompt_ignore_length = min(
@@ -1509,9 +1505,6 @@ class _OccurrencePenaltyHandler:
             self._num_active_slots += 1
             self._fill_slot(self.store.active, slot, True)
         self._fill_slot(self.store.has_previous_token, slot, False)
-        # Effective sampling temperature (cf. resolve_sampling_strategy): the value
-        # the regular strategy later divides by; 0/None -> 1.0.
-        self._fill_slot(self.store.temperature, slot, temperature or 1.0)
 
         # Re-zero the workspace slot so a prior occupant's counts do not leak in.
         if self.store.counts is not None:
@@ -1688,7 +1681,6 @@ class _OccurrencePenaltyHandler:
             store.repetition,
             store.presence,
             store.frequency,
-            store.temperature,
             max_num_steps=max(num_steps),
             history_synced=has_history_sync,
         )

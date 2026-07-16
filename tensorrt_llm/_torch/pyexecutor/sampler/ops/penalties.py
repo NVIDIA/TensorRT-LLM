@@ -75,7 +75,6 @@ def _apply_batched_occurrence_penalties_kernel(
     repetition_ptr,
     presence_ptr,
     frequency_ptr,
-    temperature_ptr,
     vocab,
     logits_row_stride,
     workspace_row_stride,
@@ -131,13 +130,12 @@ def _apply_batched_occurrence_penalties_kernel(
     repetition = tl.load(repetition_ptr + slot, mask=valid_row, other=1.0)
     presence = tl.load(presence_ptr + slot, mask=valid_row, other=0.0)
     frequency = tl.load(frequency_ptr + slot, mask=valid_row, other=0.0)
-    temperature = tl.load(temperature_ptr + slot, mask=valid_row, other=1.0)
 
     repeated = tl.where(logit < 0.0, logit * repetition, logit / repetition)
     logit = tl.where(seen, repeated, logit)
     logit -= tl.where(
         count > 0,
-        (presence + frequency * count.to(tl.float32)) * temperature,
+        presence + frequency * count.to(tl.float32),
         0.0,
     )
     logit = tl.maximum(-LOGIT_LIMIT, tl.minimum(logit, LOGIT_LIMIT))
@@ -174,12 +172,11 @@ def apply_batched_occurrence_penalties_triton(
     repetition: torch.Tensor,
     presence: torch.Tensor,
     frequency: torch.Tensor,
-    temperature: torch.Tensor,
     *,
     max_num_steps: int,
     history_synced: bool = False,
 ) -> torch.Tensor:
-    """Apply regular occurrence penalties without materializing active row indices."""
+    """Apply regular occurrence penalties before downstream temperature handling."""
     num_requests = seq_slots.numel()
     if num_requests == 0:
         return logits
@@ -204,7 +201,6 @@ def apply_batched_occurrence_penalties_triton(
         repetition,
         presence,
         frequency,
-        temperature,
         vocab,
         logits.stride(0),
         counts.stride(0),

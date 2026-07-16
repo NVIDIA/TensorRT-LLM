@@ -31,20 +31,23 @@ def _col(values):
 def _dense_penalty_reference(logits, counts, presence, rep, pre, freq, temp):
     """Dense post-temperature reference for ``apply_occurrence_penalties_triton``.
 
-    Follows the ``batchApplyPenalty`` order: temperature (``logit /= temp``), then
-    repetition where the token is present anywhere (``counts > 0`` or the prefix bitmap),
-    then presence + frequency where counted (``counts > 0``). ``rep/pre/freq/temp`` are
-    per-row ``[A, 1]`` tensors. The kernel is pre-temperature-division, so callers compare
-    ``kernel_out / temp`` against this.
+    Follows the TorchSampler order: repetition where the token is present anywhere
+    (``counts > 0`` or the prefix bitmap), then presence + frequency where counted
+    (``counts > 0``), followed by temperature division in the sampling strategy.
+    ``rep/pre/freq/temp`` are per-row ``[A, 1]`` tensors.
     """
-    lt = logits.float() / temp
+    penalized = logits.float()
     present = counts > 0
     if presence is not None:
         present = present | (presence > 0)
-    lt = torch.where(present, torch.where(lt < 0, lt * rep, lt / rep), lt)
+    penalized = torch.where(
+        present,
+        torch.where(penalized < 0, penalized * rep, penalized / rep),
+        penalized,
+    )
     counts_f = counts.to(torch.float32)
-    sub = torch.where(counts > 0, pre + freq * counts_f, lt.new_zeros(()))
-    return lt - sub
+    sub = torch.where(counts > 0, pre + freq * counts_f, penalized.new_zeros(()))
+    return (penalized - sub) / temp
 
 
 @pytest.mark.parametrize(
@@ -56,7 +59,7 @@ def _dense_penalty_reference(logits, counts, presence, rep, pre, freq, temp):
         ("presence", [1.0, 1.0], [0.5, 1.5], [0.0, 0.0], [1.0, 1.0], False),
         # frequency only (counts > 1 -> proportional)
         ("frequency", [1.0, 1.0], [0.0, 0.0], [0.4, 0.9], [1.0, 1.0], False),
-        # combined with temperature != 1 (exercises the temperature coupling)
+        # combined with temperature != 1 (exercises penalty-before-temperature order)
         (
             "combined_temp",
             [1.2, 0.8, 1.5],
@@ -98,7 +101,6 @@ def test_regular_triton_matches_dense_logits_reference(name, rep, pre, freq, tem
         rep_t.squeeze(1),
         pre_t.squeeze(1),
         freq_t.squeeze(1),
-        temp_t.squeeze(1),
         max_num_steps=1,
     )
     ref = _dense_penalty_reference(logits, counts, presence, rep_t, pre_t, freq_t, temp_t)
@@ -141,7 +143,6 @@ def test_triton_indirect_indexing_bf16():
         rep,
         pre,
         freq,
-        temp,
         max_num_steps=1,
     )
 
@@ -158,8 +159,8 @@ def test_triton_indirect_indexing_bf16():
     )
     expected = orig[active_rows].clone()
     active_temperature = temp[active_slots].view(-1, 1)
-    # Match the kernel's fp32-compute -> bf16-store boundary before comparing the deferred
-    # temperature division. This keeps the tolerance about Triton math, not bf16 rounding.
+    # Recover the pre-temperature kernel output, then match its fp32-compute -> bf16-store
+    # boundary. This keeps the tolerance about Triton math, not bf16 rounding.
     expected[active_row_mask] = (ref * active_temperature).to(torch.bfloat16)
     torch.testing.assert_close(logits[active_rows], expected, rtol=5e-3, atol=5e-3)
     torch.testing.assert_close(

@@ -179,12 +179,10 @@ def _reference_penalized_logits(
     ]
     occurrence_counts = torch.bincount(valid_occurrences, minlength=vocab_size).float()
 
-    temperature = sampling_params.temperature
-    effective_temperature = 1.0 if temperature is None or temperature == 0.0 else temperature
     presence_penalty = sampling_params.presence_penalty or 0.0
     frequency_penalty = sampling_params.frequency_penalty or 0.0
-    adjusted_logits -= presence_penalty * effective_temperature * (occurrence_counts > 0)
-    adjusted_logits -= frequency_penalty * effective_temperature * occurrence_counts
+    adjusted_logits -= presence_penalty * (occurrence_counts > 0)
+    adjusted_logits -= frequency_penalty * occurrence_counts
 
     dtype_limit = torch.finfo(raw_logits.dtype).max
     return adjusted_logits.clamp(min=-dtype_limit, max=dtype_limit).to(raw_logits.dtype)
