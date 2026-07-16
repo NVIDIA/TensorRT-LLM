@@ -764,7 +764,7 @@ def setup_disagg_cluster(
 
             # How long to wait after the disagg server is reachable with no
             # new workers registering before declaring a worker hung.
-            _NO_PROGRESS_TIMEOUT = 300
+            _NO_PROGRESS_TIMEOUT = 600
 
             async def _tick():
                 nonlocal last_tick
