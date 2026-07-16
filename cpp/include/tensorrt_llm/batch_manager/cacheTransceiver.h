@@ -340,7 +340,9 @@ private:
     std::shared_ptr<CacheTransceiverComm> mGroupTensorParaComm, mGroupPipeParaComm, mGroupDataComm, mGroupTPInDPComm;
     std::unique_ptr<ContextTransferVoteMailbox> mContextTransferVoteMailbox;
     bool mDiagnosticEarlyLocalContextCompletion{false};
+    bool mDiagnosticNoContextConsensusTraffic{false};
     bool mDiagnosticObservedConsensusGap{false};
+    bool mDiagnosticObservedNoConsensusCompletion{false};
 
     executor::kv_cache::CommState const* mCommState;
     std::unique_ptr<executor::kv_cache::CacheState> mCacheState;

@@ -1599,13 +1599,13 @@ def test_disaggregated_ctxpp4_gentp4(disaggregated_test_root, llm_venv,
 @pytest.mark.skip_less_device(8)
 @pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
                          indirect=True)
-def test_disaggregated_ctxpp4_gentp4_diagnostic_local_completion(
+def test_disaggregated_ctxpp4_gentp4_diagnostic_no_consensus_traffic(
         disaggregated_test_root, llm_venv, disaggregated_example_root,
         llama_model_root):
     setup_model_symlink(llm_venv, llama_model_root,
                         "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
     env = llm_venv._new_env.copy()
-    env["TRTLLM_DIAGNOSTIC_EARLY_LOCAL_CONTEXT_COMPLETION"] = "1"
+    env["TRTLLM_DIAGNOSTIC_DISABLE_PP_CONTEXT_CONSENSUS_TRAFFIC"] = "1"
     run_disaggregated_test(
         disaggregated_example_root,
         "ctxpp4_gentp4",
@@ -1613,7 +1613,7 @@ def test_disaggregated_ctxpp4_gentp4_diagnostic_local_completion(
         model_path=llama_model_root,
         cwd=llm_venv.get_working_directory(),
         expected_context_worker_log=
-        "DIAGNOSTIC ONLY: reporting successful local context-transfer completion"
+        "DIAGNOSTIC OBSERVED: context transfer completed with no runtime PP consensus traffic"
     )
 
 

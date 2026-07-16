@@ -74,6 +74,15 @@ using RequestIdType = LlmRequest::RequestIdType;
 constexpr int kTransferFuturePollIntervalMs = 10;
 constexpr int kContextConsensusPollIntervalMs = 1;
 constexpr char const* kDiagnosticEarlyLocalContextCompletionEnv = "TRTLLM_DIAGNOSTIC_EARLY_LOCAL_CONTEXT_COMPLETION";
+constexpr char const* kDiagnosticNoContextConsensusTrafficEnv
+    = "TRTLLM_DIAGNOSTIC_DISABLE_PP_CONTEXT_CONSENSUS_TRAFFIC";
+
+enum class ContextConsensusDiagnosticMode : std::uint64_t
+{
+    kNone = 0,
+    kEarlyLocalCompletion = 1,
+    kNoConsensusTraffic = 2,
+};
 
 // Finite status checks are scheduler polls, not terminal deadlines. Pure polls
 // use short slices; calls that ask for at least one completion keep bounded
@@ -468,12 +477,43 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
         std::vector<std::uint64_t> protocolVersions(static_cast<std::size_t>(mGroupPipeParaComm->getSize()));
         mGroupPipeParaComm->allgather(&localVersion, protocolVersions.data(), 1, mpi::MpiType::kUINT64);
         auto const useWorkerPublishedContextConsensus = selectWorkerPublishedConsensus(protocolVersions);
+
+        // Agree on diagnostic mode before constructing the mailbox. The no-traffic experiment deliberately retains
+        // this one-time startup agreement while removing all per-request consensus publications and polls.
+        auto const diagnosticEarlyLocalCompletion = common::getBoolEnv(kDiagnosticEarlyLocalContextCompletionEnv);
+        auto const diagnosticNoConsensusTraffic = common::getBoolEnv(kDiagnosticNoContextConsensusTrafficEnv);
+        TLLM_CHECK_WITH_INFO(!diagnosticEarlyLocalCompletion || !diagnosticNoConsensusTraffic,
+            "%s and %s cannot both be enabled.", kDiagnosticEarlyLocalContextCompletionEnv,
+            kDiagnosticNoContextConsensusTrafficEnv);
+        auto const diagnosticMode = diagnosticNoConsensusTraffic
+            ? ContextConsensusDiagnosticMode::kNoConsensusTraffic
+            : (diagnosticEarlyLocalCompletion ? ContextConsensusDiagnosticMode::kEarlyLocalCompletion
+                                              : ContextConsensusDiagnosticMode::kNone);
+        auto const localDiagnosticMode = static_cast<std::uint64_t>(diagnosticMode);
+        std::vector<std::uint64_t> diagnosticModes(static_cast<std::size_t>(mGroupPipeParaComm->getSize()));
+        mGroupPipeParaComm->allgather(&localDiagnosticMode, diagnosticModes.data(), 1, mpi::MpiType::kUINT64);
+        TLLM_CHECK_WITH_INFO(std::all_of(diagnosticModes.begin(), diagnosticModes.end(),
+                                 [&](std::uint64_t const mode) { return mode == localDiagnosticMode; }),
+            "Context-consensus diagnostic mode must be set consistently on every context pipeline rank.");
+        TLLM_CHECK_WITH_INFO(
+            diagnosticMode == ContextConsensusDiagnosticMode::kNone || useWorkerPublishedContextConsensus,
+            "Context-consensus diagnostics require the qualified C++ NIXL/UCX TP1/CP1 pipeline-parallel path.");
+        mDiagnosticEarlyLocalContextCompletion
+            = diagnosticMode == ContextConsensusDiagnosticMode::kEarlyLocalCompletion;
+        mDiagnosticNoContextConsensusTraffic = diagnosticMode == ContextConsensusDiagnosticMode::kNoConsensusTraffic;
+
         if (useWorkerPublishedContextConsensus)
         {
-            TLLM_LOG_INFO(
-                "Enabled worker-published context-transfer consensus v%lu for the C++ NIXL/UCX TP1/CP1 "
-                "pipeline-parallel path.",
-                kWorkerPublishedConsensusVersion);
+            if (!mDiagnosticNoContextConsensusTraffic)
+            {
+                // If later transceiver initialization throws, member unwinding still sends this rank's ordered close
+                // marker to its peers.
+                mContextTransferVoteMailbox = std::make_unique<ContextTransferVoteMailbox>(mGroupPipeParaComm);
+                TLLM_LOG_INFO(
+                    "Enabled worker-published context-transfer consensus v%lu for the C++ NIXL/UCX TP1/CP1 "
+                    "pipeline-parallel path.",
+                    kWorkerPublishedConsensusVersion);
+            }
         }
         else if (std::any_of(protocolVersions.begin(), protocolVersions.end(),
                      [](std::uint64_t const version) { return version != 0; }))
@@ -482,28 +522,18 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
                 "Pipeline ranks advertised different worker-published context-transfer consensus capabilities; "
                 "retaining synchronous context-transfer consensus on every rank.");
         }
-
-        // Construct the mailbox immediately after the all-rank agreement. If later transceiver initialization
-        // throws, member unwinding still sends this rank's ordered close marker to its peers.
-        if (useWorkerPublishedContextConsensus)
-        {
-            auto const localDiagnosticMode
-                = static_cast<std::uint64_t>(common::getBoolEnv(kDiagnosticEarlyLocalContextCompletionEnv));
-            std::vector<std::uint64_t> diagnosticModes(static_cast<std::size_t>(mGroupPipeParaComm->getSize()));
-            mGroupPipeParaComm->allgather(&localDiagnosticMode, diagnosticModes.data(), 1, mpi::MpiType::kUINT64);
-            TLLM_CHECK_WITH_INFO(std::all_of(diagnosticModes.begin(), diagnosticModes.end(),
-                                     [&](std::uint64_t const mode) { return mode == localDiagnosticMode; }),
-                "%s must be set consistently on every context pipeline rank.",
-                kDiagnosticEarlyLocalContextCompletionEnv);
-            mDiagnosticEarlyLocalContextCompletion = localDiagnosticMode != 0;
-            mContextTransferVoteMailbox = std::make_unique<ContextTransferVoteMailbox>(mGroupPipeParaComm);
-        }
     }
     if (mDiagnosticEarlyLocalContextCompletion)
     {
         TLLM_LOG_WARNING(
             "DIAGNOSTIC ONLY: reporting successful local context-transfer completion before PP consensus. "
             "Any local or late global failure is fatal; do not use this mode in production.");
+    }
+    if (mDiagnosticNoContextConsensusTraffic)
+    {
+        TLLM_LOG_WARNING(
+            "DIAGNOSTIC ONLY: committing successful local context-transfer completion without publishing or "
+            "polling PP consensus. Any local failure is fatal; do not use this mode in production.");
     }
     bool isMLA = attentionType == executor::kv_cache::CacheState::AttentionType::kMLA;
     std::optional<size_t> maxNumTokens = mCacheTransceiverConfig.value().getMaxTokensInBuffer();
@@ -842,11 +872,14 @@ class ContextTransferConsensusBackend
 public:
     ContextTransferConsensusBackend(ContextTransferVoteMailbox* mailbox,
         std::shared_ptr<CacheTransceiverComm> const& intraStageComm,
-        std::shared_ptr<CacheTransceiverComm> const& pipeStageComm)
+        std::shared_ptr<CacheTransceiverComm> const& pipeStageComm, bool const diagnosticLocalOnly)
         : mMailbox(mailbox)
         , mIntraStageComm(intraStageComm)
         , mPipeStageComm(pipeStageComm)
+        , mDiagnosticLocalOnly(diagnosticLocalOnly)
     {
+        TLLM_CHECK_WITH_INFO(!mDiagnosticLocalOnly || mMailbox == nullptr,
+            "Diagnostic local-only context completion cannot use a worker-published consensus mailbox.");
     }
 
     [[nodiscard]] bool isWorkerPublished() const noexcept
@@ -854,10 +887,20 @@ public:
         return mMailbox != nullptr;
     }
 
+    [[nodiscard]] bool isDiagnosticLocalOnly() const noexcept
+    {
+        return mDiagnosticLocalOnly;
+    }
+
+    [[nodiscard]] bool makesIndependentProgress() const noexcept
+    {
+        return isWorkerPublished() || isDiagnosticLocalOnly();
+    }
+
     template <typename SenderFutures>
     [[nodiscard]] std::unordered_set<RequestIdType> selectReadyRequests(SenderFutures const& senderFutures) const
     {
-        if (isWorkerPublished())
+        if (makesIndependentProgress())
         {
             std::unordered_set<RequestIdType> readyRequestIds;
             for (auto const& [request, future] : senderFutures)
@@ -923,6 +966,14 @@ public:
         std::unordered_set<RequestIdType> const& failedRequestIds,
         std::unordered_set<RequestIdType> const& timedOutRequestIds) const
     {
+        if (isDiagnosticLocalOnly())
+        {
+            TransferConsensusOutcome outcome;
+            outcome.completedRequestIds = completedRequestIds;
+            outcome.failedRequestIds = failedRequestIds;
+            outcome.timedOutRequestIds = timedOutRequestIds;
+            return outcome;
+        }
         if (!isWorkerPublished())
         {
             return reduceTransferStates(
@@ -940,6 +991,7 @@ private:
     ContextTransferVoteMailbox* mMailbox;
     std::shared_ptr<CacheTransceiverComm> const& mIntraStageComm;
     std::shared_ptr<CacheTransceiverComm> const& mPipeStageComm;
+    bool mDiagnosticLocalOnly;
 };
 
 std::unordered_set<RequestIdType> const& getEmptyRequestIdSet()
@@ -1035,9 +1087,9 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
     auto const& intraStageComm
         = mCacheState->getParallelConfig().mEnableAttentionDP ? mGroupTPInDPComm : mGroupTensorParaComm;
     ContextTransferConsensusBackend consensusBackend{
-        mContextTransferVoteMailbox.get(), intraStageComm, mGroupPipeParaComm};
+        mContextTransferVoteMailbox.get(), intraStageComm, mGroupPipeParaComm, mDiagnosticNoContextConsensusTraffic};
     std::optional<std::chrono::steady_clock::time_point> progressDeadline;
-    if (consensusBackend.isWorkerPublished() && needsProgress)
+    if (consensusBackend.makesIndependentProgress() && needsProgress)
     {
         progressDeadline = std::chrono::steady_clock::now() + futureWaitInterval;
     }
@@ -1079,7 +1131,7 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
         auto waitInterval = futureWaitInterval;
         if (progressDeadline.has_value())
         {
-            // Worker-published status polling has one total budget across local future waits and mailbox progress.
+            // Independently progressing backends have one total budget across local future waits and status progress.
             waitInterval = std::max(std::chrono::milliseconds(0),
                 std::chrono::duration_cast<std::chrono::milliseconds>(
                     progressDeadline.value() - std::chrono::steady_clock::now()));
@@ -1240,6 +1292,31 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
         requestTimedOutCancellations(outcome);
         commitConsensusOutcome(outcome);
     };
+
+    if (mDiagnosticNoContextConsensusTraffic)
+    {
+        TLLM_CHECK(consensusBackend.isDiagnosticLocalOnly());
+        TLLM_CHECK(!mContextTransferVoteMailbox);
+        TLLM_CHECK_WITH_INFO(!inflightCancelEnabled,
+            "DIAGNOSTIC ONLY: context consensus traffic cannot be disabled with in-flight cancellation enabled.");
+        TLLM_CHECK_WITH_INFO(mFailedSenderRequestIds.empty(),
+            "DIAGNOSTIC ONLY: a context transfer failed locally while PP consensus traffic was disabled.");
+        TLLM_CHECK_WITH_INFO(mTimedOutSenderIds.empty(),
+            "DIAGNOSTIC ONLY: a context transfer exceeded its deadline while PP consensus traffic was disabled.");
+        auto const localOutcome
+            = consensusBackend.poll(mCompletedSenderRequestIds, mFailedSenderRequestIds, mTimedOutSenderIds);
+        auto const localCompletedCount = localOutcome.completedRequestIds.size();
+        commitConsensusOutcome(localOutcome);
+        if (!mDiagnosticObservedNoConsensusCompletion && localCompletedCount > 0)
+        {
+            TLLM_LOG_WARNING(
+                "DIAGNOSTIC OBSERVED: context transfer completed with no runtime PP consensus traffic "
+                "(%zu successful local completion(s)).",
+                localCompletedCount);
+            mDiagnosticObservedNoConsensusCompletion = true;
+        }
+        return requestsStatus;
+    }
 
     // Collective consensus must be entered exactly once per status call. The mailbox can make independent progress
     // and may be polled repeatedly without requiring a matching peer scheduler call.
