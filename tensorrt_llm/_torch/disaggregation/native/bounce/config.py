@@ -15,10 +15,36 @@
 """Bounce configuration and pluggable sizing policy. A config enables bounce; leaving it unset keeps
 the per-block path. The size knob doubles as the on and off switch."""
 
+import os
 from dataclasses import dataclass, field
 from typing import Optional
 
+from tensorrt_llm import logger
+
 _MIB = 1024 * 1024
+
+# Test/advanced override for the block-count gate below (users only tune the bounce size). Read on
+# the generation side, so set it there; unset uses the default.
+_MIN_BLOCKS_ENV = "TRTLLM_KV_CACHE_BOUNCE_MIN_BLOCKS"
+
+
+def _env_min_blocks(default: int) -> int:
+    """Read the gate from the env, defensively: unset or malformed falls back to the default (never
+    crashing), and the value is clamped to at least 1."""
+    raw = os.environ.get(_MIN_BLOCKS_ENV)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning(f"{_MIN_BLOCKS_ENV}={raw!r} is not an integer; using default {default}")
+        return default
+    if value < 1:
+        logger.warning(
+            f"{_MIN_BLOCKS_ENV}={value} < 1; clamping to 1 (bounce always clears the gate)"
+        )
+        return 1
+    return value
 
 
 def _round_up(a: int, b: int) -> int:
@@ -85,9 +111,12 @@ class Config:
     min_blocks: int = 96
 
 
-def config_from_size(size_mb: int) -> Optional[Config]:
-    """Build a bounce config from a per-region size in MiB, or None to leave bounce off when the size
-    is not positive. The size is both the capacity and the on and off switch."""
+def config_from_size(size_mb: int, min_blocks: Optional[int] = None) -> Optional[Config]:
+    """Build a bounce config from a per-region size in MiB, or None to leave bounce off (size <= 0).
+    Size is both the capacity and the on/off switch. min_blocks is the gate below which a transfer
+    stays on the per-block path; when unset it comes from the env, else the default."""
     if size_mb is None or size_mb <= 0:
         return None
-    return Config(sizing=FixedSizing(capacity_mb=size_mb))
+    if min_blocks is None:
+        min_blocks = _env_min_blocks(Config.min_blocks)
+    return Config(sizing=FixedSizing(capacity_mb=size_mb), min_blocks=min_blocks)
