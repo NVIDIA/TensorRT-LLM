@@ -74,6 +74,8 @@ SchedulerOutput = namedtuple(
         "paused_requests",
         "fitting_disagg_gen_init_requests",
         "num_fitting_requests",
+        # request id -> prompt-ordered indices of its MM items selected for
+        # encoder execution this iteration
         "scheduled_mm_encoder_items",
     ],
     defaults=[None],
@@ -166,6 +168,10 @@ class ScheduledRequests:
     """Requests that are in the generation phase."""
     paused_requests: RequestList
     """Requests that are paused."""
+    scheduled_mm_encoder_items: dict[int, list[int]] | None
+    """Maps a request id to the prompt-ordered indices of its multimodal items
+    selected for encoder execution this iteration (only items whose encoder
+    outputs are still missing). ``None`` when no items were scheduled."""
 
     def __init__(self):
         self.encoder_requests: RequestList = []
@@ -272,6 +278,8 @@ class SerializableSchedulerOutput:
     ]  # request ids of fitting disaggregated generation initialization requests
     num_fitting_requests: int  # number of fitting requests
     wait_for_disagg_gen_transfer_progress: bool = False
+    # request id -> prompt-ordered indices of its MM items selected for
+    # encoder execution this iteration
     scheduled_mm_encoder_items: dict[int, list[int]] | None = None
 
     @classmethod

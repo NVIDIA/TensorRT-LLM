@@ -30,7 +30,6 @@ class _ItemMetadataFakeProcessor:
         self.existing_embedding_lengths = existing_embedding_lengths
 
     def __call__(self, inputs, sampling_params):
-        del inputs, sampling_params
         return [101, 102], {
             "multimodal_data": {
                 "image": {},
@@ -70,7 +69,6 @@ def test_mm_item_metadata_is_materialized_when_embedding_lengths_match():
         output_embedding_lengths=[2],
     )
     assert multimodal_data["multimodal_embedding_lengths"] == [2]
-    assert multimodal_data["multimodal_embedding_lengths"] is item_metadata.output_embedding_lengths
     assert "multimodal_item_refs" not in multimodal_data
     assert "multimodal_encoder_token_lengths" not in multimodal_data
 
@@ -85,12 +83,11 @@ def test_mm_item_metadata_rejects_mismatched_embedding_lengths():
 def test_mm_item_scheduling_contract_requires_metadata_for_raw_payload():
     class MissingMetadataProcessor(_ItemMetadataFakeProcessor):
         def get_mm_encoder_item_metadata(self, prompt_token_ids, multimodal_data):
-            del prompt_token_ids, multimodal_data
             return None
 
     input_processor = create_input_processor_with_hash(MissingMetadataProcessor([2]))
 
-    with pytest.raises(ValueError, match="must return item metadata"):
+    with pytest.raises(TypeError, match="must return item metadata"):
         input_processor({"prompt": "unused"}, sampling_params=None)
 
 

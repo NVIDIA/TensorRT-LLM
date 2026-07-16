@@ -5,6 +5,7 @@
 from copy import copy, deepcopy
 from dataclasses import dataclass, field
 from enum import Enum, auto
+from itertools import accumulate
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union, cast
 
 import torch
@@ -57,8 +58,16 @@ class MultimodalEncoderProgress(Enum):
     """Python-only progress derived from request-local MM item outputs."""
 
     PENDING = auto()
+    """No MM item of the request has an encoder output yet; the request may
+    still take the full-request batch encoding path."""
+
     PARTIAL = auto()
+    """Some but not all items are encoded; the request must continue on the
+    item-scheduling path until every item has an output."""
+
     READY = auto()
+    """No further encoder work is needed: every item is encoded, a
+    precomputed embedding was supplied, or the request has no MM payload."""
 
 
 if TYPE_CHECKING:
@@ -693,9 +702,21 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         # Multimodal data
         self.py_multimodal_data = kwargs.pop("py_multimodal_data", None)
         self.py_mm_item_order = kwargs.pop("py_mm_item_order", None)
+        # Per-request MM encoder item state, set by
+        # `initialize_multimodal_encoder_request` at admission.
+        # True iff the request carries raw MM payloads that the item
+        # scheduler must encode before the request may enter LLM prefill.
         self.py_is_multimodal_encoder_request = False
+        # One slot per atomic MM item, in prompt order. `None` until the
+        # item's encoder forward ran; then a view into the shared
+        # `py_mm_encoder_output_buffer`. All-set == encoder READY.
         self.py_mm_encoder_outputs: List[Optional[torch.Tensor]] = []
+        # Single preallocated embedding tensor covering all items; the
+        # per-item views above alias rows of it so items encoded across
+        # different iterations land in one contiguous fuse-ready buffer.
         self.py_mm_encoder_output_buffer: Optional[torch.Tensor] = None
+        # Row offsets of each item within the buffer:
+        # `accumulate(embedding_lengths, initial=0)`.
         self.py_mm_encoder_output_offsets: List[int] = []
         encoder_input_tokens = kwargs.get("encoder_input_tokens")
         encoder_output_len = kwargs.get("encoder_output_len")
@@ -1089,52 +1110,28 @@ def get_multimodal_embedding_lengths(
 
 def get_multimodal_encoder_token_lengths(
         request: LlmRequest) -> Optional[List[int]]:
-    """Return per-item physical encoder attention-token costs."""
-    py_multimodal_data = request.py_multimodal_data
-    if py_multimodal_data is not None and not isinstance(
-            py_multimodal_data, dict):
-        raise TypeError("py_multimodal_data must be a dict")
-    item_metadata = get_multimodal_encoder_item_metadata(py_multimodal_data)
+    """Return per-item physical encoder attention-token costs.
+
+    Field-level validation happens inside
+    `get_multimodal_encoder_item_metadata`; only the request-level
+    cross-check against `multimodal_embedding_lengths` lives here.
+    """
+    item_metadata = get_multimodal_encoder_item_metadata(
+        request.py_multimodal_data)
     if item_metadata is None:
         return None
-    token_lengths = _validate_optional_int_list(
-        item_metadata.encoder_token_lengths,
-        "multimodal_encoder_item_metadata.encoder_token_lengths")
-    if token_lengths is None:
-        raise ValueError("Multimodal encoder token lengths are required")
-    if any(length <= 0 for length in token_lengths):
-        raise ValueError(
-            "multimodal_encoder_item_metadata.encoder_token_lengths must "
-            "contain positive values")
-
-    output_embedding_lengths = _validate_optional_int_list(
-        item_metadata.output_embedding_lengths,
-        "multimodal_encoder_item_metadata.output_embedding_lengths")
-    if output_embedding_lengths is None:
-        raise ValueError(
-            "Multimodal encoder output embedding lengths are required")
-    if any(length <= 0 for length in output_embedding_lengths):
-        raise ValueError(
-            "multimodal_encoder_item_metadata.output_embedding_lengths must "
-            "contain positive values")
-
     embedding_lengths = get_multimodal_embedding_lengths(request)
     if embedding_lengths is None:
         raise ValueError("Multimodal encoder item scheduling requires "
                          "multimodal_embedding_lengths")
-    if output_embedding_lengths != embedding_lengths:
+    if item_metadata.output_embedding_lengths != embedding_lengths:
         raise ValueError("Multimodal encoder item output lengths must match "
                          "multimodal_embedding_lengths")
-    if not (len(item_metadata.item_refs) == len(token_lengths) ==
-            len(output_embedding_lengths)):
-        raise ValueError(
-            "Multimodal encoder item references and lengths must align")
-    return token_lengths
+    return item_metadata.encoder_token_lengths
 
 
 def initialize_multimodal_encoder_request(request: LlmRequest,
-                                          max_num_tokens: Optional[int] = None
-                                          ) -> None:
+                                          max_num_tokens: int) -> None:
     """Initialize immutable request kind and mutable per-item encoder state."""
     mm_data = request.py_multimodal_data
     has_raw_payload = isinstance(mm_data, dict) and any(
@@ -1144,12 +1141,12 @@ def initialize_multimodal_encoder_request(request: LlmRequest,
                           and mm_data.get("multimodal_embedding") is not None)
     token_lengths = get_multimodal_encoder_token_lengths(
         request) if has_raw_payload and not has_full_embedding else None
-    if (token_lengths is not None and max_num_tokens is not None
-            and any(length > max_num_tokens for length in token_lengths)):
-        largest = max(token_lengths)
-        raise ValueError(
-            f"Multimodal item requires {largest} encoder tokens, exceeding "
-            f"the effective startup maximum {max_num_tokens}")
+    if token_lengths is not None:
+        largest = max(token_lengths, default=0)
+        if largest > max_num_tokens:
+            raise ValueError(
+                f"Multimodal item requires {largest} encoder tokens, exceeding "
+                f"the effective startup maximum {max_num_tokens}")
 
     request.py_is_multimodal_encoder_request = token_lengths is not None
     request.py_mm_encoder_outputs = ([None] * len(token_lengths)
@@ -1161,10 +1158,8 @@ def initialize_multimodal_encoder_request(request: LlmRequest,
         if embedding_lengths is None:
             raise ValueError("Multimodal item scheduling requires "
                              "multimodal_embedding_lengths")
-        request.py_mm_encoder_output_offsets.append(0)
-        for length in embedding_lengths:
-            request.py_mm_encoder_output_offsets.append(
-                request.py_mm_encoder_output_offsets[-1] + length)
+        request.py_mm_encoder_output_offsets = list(
+            accumulate(embedding_lengths, initial=0))
 
 
 def get_multimodal_encoder_progress(

@@ -177,8 +177,6 @@ class MultimodalModelMixin:
         if item_metadata is None:
             raise ValueError(f"Missing multimodal item reference for index {item_idx}")
         item_refs = item_metadata.item_refs
-        if not isinstance(item_refs, list):
-            raise TypeError("Multimodal encoder item references must be a list")
         if item_idx >= len(item_refs):
             raise ValueError(f"Missing multimodal item reference for index {item_idx}")
         modality, local_idx = item_refs[item_idx]
@@ -250,8 +248,6 @@ class MultimodalModelMixin:
                 raise ValueError("MM item metadata is required for item encoding")
             item_refs = item_metadata.item_refs
             embedding_lengths = item_metadata.output_embedding_lengths
-            if not isinstance(item_refs, list) or not isinstance(embedding_lengths, list):
-                raise TypeError("MM item metadata must contain lists")
             modality = item_refs[item_idx][0]
             encoder_inputs.append(
                 (
@@ -286,8 +282,13 @@ class MultimodalModelMixin:
             if not group_params:
                 return
             embeddings = self.encode_multimodal_inputs(group_params)
-            if embeddings.shape[0] != sum(group_lengths):
-                raise ValueError("MM encoder output length does not match selected items")
+            expected_length = sum(group_lengths)
+            if embeddings.shape[0] != expected_length:
+                raise ValueError(
+                    f"MM encoder output length {embeddings.shape[0]} does not "
+                    f"match the {expected_length} rows declared by the "
+                    "selected items"
+                )
             outputs.extend(torch.split(embeddings, group_lengths, dim=0))
             group_params.clear()
             group_lengths.clear()

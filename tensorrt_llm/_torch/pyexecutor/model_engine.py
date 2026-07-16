@@ -458,6 +458,10 @@ class PyTorchModelEngine(ModelEngine):
         self.mm_encoder_attention_metadata_capacity: Optional[Dict[str,
                                                                    int]] = None
         if self.supports_mm_encoder_item_scheduling:
+            if self.encoder_max_num_tokens is None:
+                raise ValueError(
+                    "MM encoder item scheduling requires a token budget; set "
+                    "encoder_max_num_tokens or max_num_tokens")
             max_tokens_per_item = self.input_processor.get_mm_max_tokens_per_item(
             )
             if not max_tokens_per_item:

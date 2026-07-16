@@ -266,29 +266,54 @@ class Qwen2VLInputProcessorBase(BaseMultimodalInputProcessor,
             self._validate_encoder_attention_geometry(grids_by_modality)
 
         config = self.config
-        token_to_modality = {
-            int(config.image_token_id): "image",
-            int(config.video_token_id): "video",
-        }
+        image_token_id = int(config.image_token_id)
+        video_token_id = int(config.video_token_id)
         vision_start_token_id = int(config.vision_start_token_id)
         vision_end_token_id = int(config.vision_end_token_id)
 
+        # Bounded `list.index` scans run at C speed, unlike a per-token
+        # Python loop over the full prompt.
         modalities: List[str] = []
-        item_start = 0
-        while item_start < len(prompt_token_ids):
-            if prompt_token_ids[item_start] != vision_start_token_id:
-                item_start += 1
-                continue
-            item_end = item_start + 1
-            modality = None
-            while (item_end < len(prompt_token_ids)
-                   and prompt_token_ids[item_end] != vision_end_token_id):
-                modality = token_to_modality.get(prompt_token_ids[item_end],
-                                                 modality)
-                item_end += 1
-            if modality is not None:
-                modalities.append(modality)
-            item_start = item_end + 1
+        search_start = 0
+        prompt_length = len(prompt_token_ids)
+        while search_start < prompt_length:
+            try:
+                item_start = prompt_token_ids.index(vision_start_token_id,
+                                                    search_start)
+            except ValueError:
+                break
+            try:
+                item_end = prompt_token_ids.index(vision_end_token_id,
+                                                  item_start + 1)
+            except ValueError as error:
+                raise ValueError(
+                    "Unclosed Qwen vision span in prompt token IDs") from error
+
+            image_pos = None
+            video_pos = None
+            try:
+                image_pos = prompt_token_ids.index(image_token_id,
+                                                   item_start + 1, item_end)
+            except ValueError:
+                pass
+            try:
+                video_pos = prompt_token_ids.index(video_token_id,
+                                                   item_start + 1, item_end)
+            except ValueError:
+                pass
+
+            if image_pos is not None and video_pos is not None:
+                raise ValueError(
+                    "Qwen vision span contains both image and video tokens")
+            if image_pos is not None:
+                modalities.append("image")
+            elif video_pos is not None:
+                modalities.append("video")
+            else:
+                raise ValueError(
+                    "Qwen vision span contains no image or video token")
+
+            search_start = item_end + 1
 
         video_grids = grids_by_modality.get("video")
         num_video_spans = modalities.count("video")
