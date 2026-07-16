@@ -304,14 +304,15 @@ class TestFactory:
         assert not hasattr(m, "spec_config")
 
     def test_spec_gate_only_restricts_eviction_methods(self):
-        from tensorrt_llm._torch.pyexecutor._util import kv_cache_compression_supported_with_spec
+        from tensorrt_llm._torch.pyexecutor._util import validate_kv_cache_compression_with_spec
         from tensorrt_llm._torch.speculative.interface import SpeculativeDecodingMode
         from tensorrt_llm.llmapi.llm_args import KvCacheCompressionConfig
 
+        # Non-evicting methods pass with any speculative mode; no exception.
         config = KvCacheCompressionConfig(algorithm="offload")
         spec_config = SimpleNamespace(spec_dec_mode=SpeculativeDecodingMode.DFLASH)
-        assert kv_cache_compression_supported_with_spec(config, spec_config, None) is True
-        assert kv_cache_compression_supported_with_spec(config, None, None) is True
+        validate_kv_cache_compression_with_spec(config, spec_config, None)
+        validate_kv_cache_compression_with_spec(config, None, None)
 
 
 # ---------------------------------------------------------------------- #
