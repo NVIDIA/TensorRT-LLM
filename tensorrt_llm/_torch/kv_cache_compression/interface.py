@@ -8,9 +8,8 @@ from typing import Optional
 class KvCacheCompressionMode(IntEnum):
     """Algorithm-level traits of a KV-cache compression method.
 
-    Mirrors ``SpeculativeDecodingMode``: configs map their ``algorithm``
-    string to a member here, and callers read ``is_*`` predicates instead of
-    comparing strings.
+    Configs map their ``algorithm`` string to a member here; callers read the
+    ``is_*`` predicates instead of comparing strings.
     """
 
     NONE = auto()
