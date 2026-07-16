@@ -244,8 +244,12 @@ def real_dataset(root_args, **kwargs):
         if any(key in req for key in ["image", "image_1", "video"]):
             # multimodal input
             if "video" in req and req["video"] is not None:
-                raise NotImplementedError(
-                    "Video modality is not supported yet for real-dataset preparation."
+                # Video inputs are not supported yet; warn and fall through to
+                # image handling. Raising here would reject datasets that carry
+                # a video column alongside images, which previously worked (the
+                # original `assert "Not supported yet"` never fired).
+                logging.warning(
+                    "Video modality is not supported yet; ignoring 'video' field."
                 )
             assert kwargs["output_len_dist"] is not None, (
                 "Output length distribution must be set for multimodal requests."
