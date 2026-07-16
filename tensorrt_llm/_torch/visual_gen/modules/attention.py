@@ -4,7 +4,6 @@ from typing import Optional, Tuple
 import torch
 import torch.nn as nn
 
-from tensorrt_llm.logger import logger
 from tensorrt_llm.visual_gen.sparse_attention import SkipSoftmaxAttentionConfig
 
 from ...modules.linear import Linear, TensorParallelMode, WeightMode, WeightsLoadingConfig
@@ -193,26 +192,11 @@ class Attention(nn.Module):
             ]
         )
 
-        # Ulysses auto-wrap normally skips SEPARATE_QKV (cross-attention).
-        # The async-ulysses path uses SEPARATE_QKV for stream-pipelined
-        # V/Q/K projections AND still needs the head-sharding wrap — opt in
-        # via async_ulysses=True.
-        cp_size = vgm.cp_size if vgm else 1
-        use_ulysses = (
-            ulysses_size > 1
-            and enable_sequence_parallel
-            and (self.qkv_mode != QKVMode.SEPARATE_QKV or async_ulysses or cp_size == 1)
-        )
-        if ulysses_size > 1 and enable_sequence_parallel and not use_ulysses:
-            # Ulysses was requested (ulysses_size > 1, SP on) but disabled: this is a
-            # SEPARATE_QKV cross-attention that is neither async nor pure-Ulysses
-            # (cp_size > 1), so it falls back to the all-gather K/V path.
-            logger.debug(
-                f"Attention(layer={layer_idx}): Ulysses disabled despite ulysses_size="
-                f"{ulysses_size} — qkv_mode={self.qkv_mode.value}, "
-                f"async_ulysses={async_ulysses}, cp_size={cp_size} "
-                f"(SEPARATE_QKV cross-attn needs async_ulysses or cp_size==1)."
-            )
+        # Ulysses (head-sharding) is orthogonal to CP (sequence-sharding), so it
+        # composes with pure-Ulysses, Attention2D and async alike, including for
+        # SEPARATE_QKV cross-attn. Ring + SEPARATE_QKV is the only unsupported
+        # combination and is rejected below.
+        use_ulysses = ulysses_size > 1 and enable_sequence_parallel
 
         # Compute head counts for the backend
         # Ulysses shards heads across workers; inner backend sees sharded count

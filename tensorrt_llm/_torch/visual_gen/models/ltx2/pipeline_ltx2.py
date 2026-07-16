@@ -602,7 +602,6 @@ def _load_component_weights(
         "text_encoder_path": "google/gemma-3-12b-it",
         "spatial_upsampler_path": None,
         "distilled_lora_path": None,
-        "stage2_ulysses": False,
     },
     doc=(
         "Lightricks LTX-2 support. ``pipeline_config()`` returns the "
@@ -1460,6 +1459,7 @@ class LTX2Pipeline(BasePipeline):
         rescale_scale: float = 0.0,
         guidance_skip_step: int = 0,
         enhance_prompt: bool = False,
+        _latents_on_all_ranks: bool = False,
     ):
         """Generate video (and audio) from text, optionally conditioned on an image.
 
@@ -2067,11 +2067,19 @@ class LTX2Pipeline(BasePipeline):
             aud_latents = aud_latents.to(self.dtype)
             return decode_audio(aud_latents, self.audio_decoder, self.vocoder)
 
-        video, audio = self.decode_latents(
-            latents=latents,
-            decode_fn=decode_video_fn,
-            extra_latents={"audio": (audio_latents, decode_audio_fn)},
-        )
+        if output_type == "latent" and _latents_on_all_ranks:
+            # Internal two-stage handoff: the latent "decode" is a cheap local
+            # unpatchify and every rank already holds the full latents — keep them
+            # on every rank (decode_latents' rank gate exists to skip real VAE
+            # decode only). The external latent contract stays rank-0-return.
+            video = decode_video_fn(latents)
+            audio = decode_audio_fn(audio_latents) if audio_latents is not None else None
+        else:
+            video, audio = self.decode_latents(
+                latents=latents,
+                decode_fn=decode_video_fn,
+                extra_latents={"audio": (audio_latents, decode_audio_fn)},
+            )
 
         if self.rank == 0:
             logger.info(f"Decoding completed in {time.time() - decode_start:.2f}s")
