@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from typing import Literal
 
 import torch
@@ -6,6 +21,7 @@ from diffusers.models.autoencoders.autoencoder_kl import AutoencoderKLOutput
 from diffusers.models.autoencoders.autoencoder_kl_wan import WanAttentionBlock, WanCausalConv3d
 from diffusers.models.autoencoders.vae import DecoderOutput, DiagonalGaussianDistribution
 
+from tensorrt_llm._torch.visual_gen.models.wan import wan_vae
 from tensorrt_llm._torch.visual_gen.modules.vae import (
     HaloExchangeConv,
     HaloExchangeConv2dStride2,
@@ -34,6 +50,12 @@ class WanCausalConvHalo(HaloExchangeConv):
 
 class ParallelVAE_Wan(ParallelVAEBase):
     """Parallel VAE wrapper for ``AutoencoderKLWan``."""
+
+    # Module classes replaced with parallel variants. Subclasses that wrap a
+    # different VAE implementation (e.g. the native ``WanVAE``) override these
+    # to target their own module classes; everything else is inherited.
+    _conv3d_cls: type = WanCausalConv3d
+    _attn_cls: type = WanAttentionBlock
 
     @staticmethod
     def make_spec(split_dim: Literal["height", "width"]) -> SplitSpec:
@@ -88,7 +110,7 @@ class ParallelVAE_Wan(ParallelVAEBase):
         targets = [
             (name, module)
             for name, module in model.named_modules()
-            if isinstance(module, WanCausalConv3d) and max(module.kernel_size) > 1
+            if isinstance(module, self._conv3d_cls) and max(module.kernel_size) > 1
         ]
         for name, module in targets:
             self._replace_module(
@@ -108,7 +130,7 @@ class ParallelVAE_Wan(ParallelVAEBase):
         targets = [
             (name, module)
             for name, module in model.named_modules()
-            if isinstance(module, WanAttentionBlock)
+            if isinstance(module, self._attn_cls)
         ]
         for name, module in targets:
             self._replace_module(
@@ -172,3 +194,24 @@ class ParallelVAE_Wan(ParallelVAEBase):
                     pad_before_conv=pad_module.padding,
                 ),
             )
+
+
+# Two parallel-VAE wrappers, one per VAE *class* (not a temporary transition):
+#   ParallelVAE_Wan       wraps the diffusers AutoencoderKLWan -- used by Cosmos3
+#                         (models/cosmos3) and the Wan TRTLLM_USE_DIFFUSER_VAE
+#                         debug fallback.
+#   ParallelVAE_TrtllmWan wraps the native WanVAE -- the default for Wan2.1/2.2.
+# They share all splitting logic via the base class; only the conv3d/attention
+# module classes differ. ParallelVAE_Wan stays as long as any model uses the
+# diffusers AutoencoderKLWan.
+class ParallelVAE_TrtllmWan(ParallelVAE_Wan):
+    """Parallel VAE wrapper for the native ``WanVAE``.
+
+    Identical parallelisation to ``ParallelVAE_Wan``; only the conv3d/attention
+    module classes differ (the native ``WanCausalConv3d`` / ``WanAttentionBlock``
+    in ``wan_vae.py``). Resample Conv2d replacement is inherited unchanged because
+    the native ``WanConv2d`` subclasses ``nn.Conv2d``.
+    """
+
+    _conv3d_cls = wan_vae.WanCausalConv3d
+    _attn_cls = wan_vae.WanAttentionBlock
