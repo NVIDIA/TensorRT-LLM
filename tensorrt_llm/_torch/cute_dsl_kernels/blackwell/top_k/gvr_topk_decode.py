@@ -3543,5 +3543,213 @@ class GvrTopKKernel:
             min_blocks_per_mp=self.min_blocks_per_mp,
         )
 
+    # ------------------------------------------------------------------ #
+    #  Host-side launch-shape policy + self-contained launcher            #
+    # ------------------------------------------------------------------ #
+    # cluster_size / num_threads / min_blocks_per_mp / use_256bit_load are
+    # compile-time ctor knobs: a compiled kernel cannot change its own grid
+    # or cluster shape, so batch-size adaptation MUST happen at launch time
+    # by picking a different compiled variant. ``pick_config`` is that
+    # policy as a pure function colocated with the kernel (single source of
+    # truth), and ``launch`` is a thin variant-cache wrapper so direct-drive
+    # users (tests, benchmarks) get the same shapes production would pick.
+    # The production custom op keeps its own equivalent inline policy for
+    # now; unifying it onto ``pick_config`` is a call-site change deferred
+    # to the dispatch-guard follow-up PR.
+
+    _NUM_SMS: Optional[int] = None
+    _LAUNCH_CACHE: dict = {}
+
+    @staticmethod
+    def _device_num_sms() -> int:
+        if GvrTopKKernel._NUM_SMS is None:
+            import torch  # local: keep the module importable without torch
+
+            GvrTopKKernel._NUM_SMS = torch.cuda.get_device_properties(
+                torch.cuda.current_device()
+            ).multi_processor_count
+        return GvrTopKKernel._NUM_SMS
+
+    @staticmethod
+    def pick_config(
+        torch_dtype,
+        num_rows: int,
+        num_candidates: int,
+        max_seq_len: Optional[int] = None,
+        num_sms: Optional[int] = None,
+    ) -> dict:
+        """Pick the launch-shape ctor kwargs for ``(dtype, BS, N)``.
+
+        Mirrors the production runner policy (cluster_size auto-pick +
+        ``_pick_tuning``) so any caller instantiating the kernel directly
+        gets the same shapes the custom op would use. Rationale (B200,
+        nsys cold-L2, 2026-07-15 big-BS triage): a config frozen at the
+        BS=1 optimum (cs = N>=65536 ? 4 : 1, T=1024, mbpm=1) is geomean
+        2.27x slower (max 6.0x) than the op-bench anchor at BS in
+        {64, 256, 1024}, while this policy is 0.95x (parity/better).
+        Multi-CTA splitting only pays while the grid is a single wave
+        (num_rows * cluster_size <= num_sms); past that, row parallelism
+        already saturates the SMs and per-row splitting is pure overhead.
+
+        ``max_seq_len``: pass the peak runtime N under CUDA-graph capture
+        so the variant is picked for the replay shape, not the capture
+        shape (same contract as the custom op's ``_pick_tuning``).
+
+        Returns kwargs for ``GvrTopKKernel(...)``: ``cluster_size``,
+        ``num_threads``, ``use_256bit_load``, ``min_blocks_per_mp``,
+        ``enable_warp_parallel_reduce``.
+        """
+        import torch  # local: keep the module importable without torch
+
+        if num_sms is None:
+            num_sms = GvrTopKKernel._device_num_sms()
+        n_row = max_seq_len if max_seq_len is not None else num_candidates
+        is_fp32 = torch_dtype == torch.float32
+
+        # cluster_size: B200 SXM5 synth-data tuning (matches the custom
+        # op's auto-pick): N < 64K -> 1 (sync unrecouped); tiny grid at
+        # large N -> 8; single-wave -> 4/2; multi-wave -> 1.
+        if n_row < 65536:
+            cluster_size = 1
+        elif num_rows <= 4 and n_row >= 131072:
+            cluster_size = 8
+        elif num_rows * 4 <= num_sms:
+            cluster_size = 4
+        elif num_rows * 2 <= num_sms:
+            cluster_size = 2
+        else:
+            cluster_size = 1
+
+        # Cluster CTAs split the row, so tuning targets per-CTA work.
+        n_per_cta = n_row // cluster_size
+        # T=1024 needs 1 CTA/SM grid AND enough per-CTA vec work. Under
+        # graph capture, raise the half-prec bar so a small capture-N
+        # doesn't force T=1024 on small-N replays.
+        n_thresh_t = 131072 if (max_seq_len is not None and not is_fp32) else 65536
+        num_threads = 1024 if (num_rows <= num_sms and n_per_cta >= n_thresh_t) else 512
+        # V=256-bit only helps fp32 at large N; half-prec cvt doubles reg
+        # pressure. Caller must hand a 32B-aligned contiguous tensor
+        # (``launch`` downgrades on misalignment).
+        use_256bit_load = is_fp32 and n_per_cta >= 16384
+        enable_warp_parallel_reduce = num_threads == 1024
+
+        # min_blocks_per_mp: reg-vs-occupancy 3-tier (fp32 wants ~70 regs
+        # for 4-LDG ILP -> mb<=2; half-prec fits 40 regs -> mb=3 packs
+        # 3 CTA/SM when rows oversubscribe the device).
+        vec_bits = 256 if use_256bit_load else 128
+        vec_w = vec_bits // (32 if is_fp32 else 16)
+        n_vec_iters = max(1, n_per_cta // (num_threads * vec_w))
+        if is_fp32:
+            if n_vec_iters < 4:
+                min_blocks_per_mp = 0
+            elif num_rows <= num_sms:
+                min_blocks_per_mp = 1
+            elif num_sms * 2 < num_rows <= num_sms * 3 and n_per_cta <= 32768:
+                min_blocks_per_mp = 3
+            else:
+                min_blocks_per_mp = 2
+        else:
+            if num_rows > num_sms:
+                min_blocks_per_mp = 3
+            elif n_vec_iters < 4:
+                min_blocks_per_mp = 0
+            else:
+                min_blocks_per_mp = 1
+
+        return dict(
+            cluster_size=cluster_size,
+            num_threads=num_threads,
+            use_256bit_load=use_256bit_load,
+            min_blocks_per_mp=min_blocks_per_mp,
+            enable_warp_parallel_reduce=enable_warp_parallel_reduce,
+        )
+
+    @classmethod
+    def launch(
+        cls,
+        logits,
+        pre_idx,
+        seq_lens,
+        output_indices,
+        top_k: int,
+        next_n: int = 1,
+        compress_ratio: int = 1,
+        max_seq_len: Optional[int] = None,
+        num_sms: Optional[int] = None,
+        **kernel_overrides,
+    ) -> None:
+        """Compile-and-launch with ``pick_config`` shapes (indices-only path).
+
+        Owns a class-level compiled-variant cache keyed by every ctor knob,
+        so repeated calls at any (BS, N, dtype) reuse the right variant.
+        ``kernel_overrides`` (e.g. ``enable_r0=False``, ``cluster_size=8``)
+        override the picked config and participate in the cache key.
+        Mirrors the custom op's compile contract: sym_int shapes, tvm-ffi
+        env stream (launches on the ambient torch stream), fixed
+        ``return_output_values=False`` / ``seqlen_sorted=False``.
+        """
+        import torch  # local: keep the module importable without torch
+        from cutlass.cute import runtime as _crt
+
+        _cute_dt = {
+            torch.float32: cutlass.Float32,
+            torch.float16: cutlass.Float16,
+            torch.bfloat16: cutlass.BFloat16,
+        }
+        num_rows, num_candidates = logits.shape
+        cfg = cls.pick_config(
+            logits.dtype, num_rows, num_candidates, max_seq_len=max_seq_len, num_sms=num_sms
+        )
+        cfg.update(kernel_overrides)
+        if cfg["cluster_size"] > 1:
+            try:
+                from .single_pass_multi_cta_radix_topk_cluster import _query_max_cluster_size
+
+                cfg["cluster_size"] = min(cfg["cluster_size"], _query_max_cluster_size())
+            except ImportError:
+                pass  # standalone snapshot: trust the [1, 16] ctor bound
+        if cfg.get("use_256bit_load") and logits.data_ptr() % 32 != 0:
+            cfg["use_256bit_load"] = False  # 256-bit vec loads need 32B alignment
+
+        key = (logits.dtype, top_k, next_n, compress_ratio) + tuple(sorted(cfg.items()))
+        compiled = cls._LAUNCH_CACHE.get(key)
+        if compiled is None:
+            kernel = cls(
+                dtype=_cute_dt[logits.dtype],
+                top_k=top_k,
+                next_n=next_n,
+                compress_ratio=compress_ratio,
+                return_output_values=False,
+                **cfg,
+            )
+            n_rows, n_cols, n_batch = cute.sym_int(), cute.sym_int(), cute.sym_int()
+            in_align = 32 if cfg["use_256bit_load"] else 16
+            input_fake = _crt.make_fake_compact_tensor(
+                kernel.dtype, (n_rows, n_cols), stride_order=(1, 0), assumed_align=in_align
+            )
+            pre_idx_fake = _crt.make_fake_compact_tensor(
+                cutlass.Int32, (n_batch, top_k), stride_order=(1, 0), assumed_align=16
+            )
+            seq_lens_fake = _crt.make_fake_compact_tensor(
+                cutlass.Int32, (n_batch,), stride_order=(0,)
+            )
+            out_indices_fake = _crt.make_fake_compact_tensor(
+                cutlass.Int32, (n_rows, top_k), stride_order=(1, 0), assumed_align=16
+            )
+            fake_stream = _crt.make_fake_stream(use_tvm_ffi_env_stream=True)
+            compiled = cute.compile(
+                kernel,
+                input_fake,
+                pre_idx_fake,
+                seq_lens_fake,
+                None,
+                out_indices_fake,
+                None,
+                stream=fake_stream,
+                options="--enable-tvm-ffi",
+            )
+            cls._LAUNCH_CACHE[key] = compiled
+        compiled(logits, pre_idx, seq_lens, None, output_indices, None)
+
 
 __all__ = ["GvrTopKKernel", "GvrParams"]
