@@ -344,12 +344,10 @@ def test_proxy_check_remote_worker_death_marks_engine_dead():
 
 
 # --- Non-blocking teardown on a dead engine ---
-# A worker world torn down abruptly (MPI_Abort by the HangDetector, SIGKILL,
-# the OOM killer) never completes its mpi4py futures and never sends the
-# result-queue shutdown sentinel. Without bounds, shutdown() blocks forever on
-# f.result(), the dispatcher join, and the dead pool join -- so detection
-# (PR #16338 / #15816) alone only moves the client hang from generate() into
-# teardown. These tests pin the bounded-teardown behavior.
+# An abruptly-killed worker world never completes its mpi4py futures and
+# never sends the result-queue shutdown sentinel, so an unbounded shutdown()
+# blocks forever on f.result(), the dispatcher join, and the pool join.
+# These tests pin the bounded-teardown behavior.
 
 
 def _teardown_proxy(engine_dead):
@@ -373,7 +371,7 @@ def _teardown_proxy(engine_dead):
 def test_shutdown_does_not_block_on_dead_engine():
     """With the engine dead, never-completing futures must not hang teardown."""
     proxy = _teardown_proxy(engine_dead=True)
-    pending = _Future()  # never completes -- the MPI_Abort premise
+    pending = _Future()  # never completes: abrupt worker death
     done = _Future()
     done.set_exception(RuntimeError("captured by mpi_done_callback already"))
     proxy.mpi_futures = [pending, done]
@@ -499,10 +497,9 @@ def test_mark_engine_dead_releases_exit_joins_immediately():
 def test_mark_engine_dead_releases_external_sessions_too():
     """Ownership must not gate the exit-join release.
 
-    In the LLM API path the session is created by the LLM object and
-    passed in (proxy does not own it), yet its exit joins must still be
-    released -- this exact gap kept the process hanging in the GB200
-    hardware validation. The release is non-destructive bookkeeping.
+    The LLM API creates the session and passes it in, so the proxy does
+    not own it; the release is non-destructive bookkeeping and must still
+    happen.
     """
     proxy = _bare_proxy()
     proxy._owns_mpi_session = False

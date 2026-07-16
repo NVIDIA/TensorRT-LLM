@@ -149,21 +149,14 @@ class MpiSession(abc.ABC):
     def release_exit_joins(self):
         """Mark the worker world dead and release anything that would join it.
 
-        Non-destructive counterpart of ``abandon()``: called the moment the
-        workers are known dead (killed by ``MPI_Abort`` from the hang
-        detector, SIGKILL, or the OOM killer), possibly by a component that
-        does not own the session. It must not tear the session down -- only
-        ensure that nothing (interpreter exit, a later blocking
-        ``shutdown()`` by the owner) will wait forever on the dead world.
-        Default: no-op.
+        Non-destructive, so it may be called by a component that does not
+        own the session. Must not tear the session down -- only ensure that
+        nothing (interpreter exit, a later blocking ``shutdown()`` by the
+        owner) waits forever on the dead world. Default: no-op.
         """
 
     def abandon(self):
-        """Tear the session down without waiting on a dead worker world.
-
-        Called instead of ``shutdown()`` once the workers are known dead:
-        joining anything owned by such a session can block forever.
-        """
+        """Tear the session down without waiting on a dead worker world."""
         self.release_exit_joins()
         self.shutdown(wait=False)
 
@@ -171,19 +164,16 @@ class MpiSession(abc.ABC):
 def _abandon_mpi_pool_threads(mpi_pool) -> None:
     """Let interpreter exit proceed despite a wedged pool manager thread.
 
-    After the worker world dies abruptly, the ``MPIPoolExecutor``'s manager
-    thread stays blocked in an MPI call forever. Two independent mechanisms
-    then hang process exit even after a non-waiting shutdown: mpi4py's exit
-    hook joins every manager thread it registered, and CPython's
-    ``threading._shutdown`` joins every non-daemon thread. Deregister the
-    wedged thread from both so exit can proceed (the thread dies with the
-    process).
+    When the worker world dies abruptly, the ``MPIPoolExecutor`` manager
+    thread stays blocked in an MPI call forever, and process exit hangs on
+    it twice: mpi4py's exit hook joins every registered manager thread, and
+    CPython joins every non-daemon thread. Deregister the thread from both;
+    it is reaped with the process.
 
-    Best-effort by design: the names are private to mpi4py (``_lib`` in
-    3.x, ``_core`` in 4.x; both use ``THREADS_QUEUES``) and CPython
-    (``threading._shutdown_locks``, Python 3.9-3.12). Where a name is
-    absent (e.g. Python 3.13+), that mechanism is left alone and exit may
-    still block on it.
+    Best-effort: the touched names are private to mpi4py (``THREADS_QUEUES``
+    in ``_lib``/3.x and ``_core``/4.x) and CPython
+    (``threading._shutdown_locks``, 3.9-3.12). Where a name is absent, that
+    mechanism is left alone and exit may still block on it.
     """
     thread = getattr(getattr(mpi_pool, '_pool', None), 'thread', None)
     if thread is None:

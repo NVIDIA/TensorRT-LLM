@@ -311,15 +311,10 @@ class GenerationExecutorProxy(GenerationExecutor):
                 result.queue.put(dead_error)
             except Exception:  # noqa: BLE001 - a full/closed queue must not stop the sweep
                 pass
-        # Release the session's exit joins NOW rather than at teardown: the
-        # dead pool's manager thread is wedged in an MPI call forever, and
-        # CPython joins non-daemon threads (threading._shutdown) BEFORE the
-        # atexit/GC teardown that runs shutdown() -- deregistering at
-        # teardown time is already too late to let the process exit. This is
-        # non-destructive bookkeeping, so it applies to external (unowned)
-        # sessions too: in the LLM API path the session is created by the
-        # LLM object and passed in, and its owner's later blocking
-        # shutdown() must also not join the dead world.
+        # Release the session's exit joins here, not at teardown: interpreter
+        # exit joins non-daemon threads before any teardown code runs, so a
+        # wedged pool manager thread must be deregistered while user code is
+        # still alive. Non-destructive, hence safe for unowned sessions.
         release = getattr(getattr(self, 'mpi_session', None),
                           'release_exit_joins', None)
         if release is not None:
@@ -656,12 +651,9 @@ class GenerationExecutorProxy(GenerationExecutor):
 
         logger_debug('Proxy.shutdown...\n', "yellow")
 
-        # A worker world torn down abruptly (MPI_Abort by the HangDetector,
-        # SIGKILL, the OOM killer) never completes its mpi4py futures, so once
-        # the engine is known dead the blocking waits below would hang
-        # teardown until an outer timeout (e.g. pytest's) fires. Give the
-        # futures one short collective grace instead, and skip the ones still
-        # pending.
+        # An abruptly-killed worker world (MPI_Abort, SIGKILL, OOM) never
+        # completes its mpi4py futures: give them one short collective grace
+        # instead of blocking on each, and skip the ones still pending.
         if self._engine_dead:
             concurrent.futures.wait(self.mpi_futures, timeout=5.0)
 
@@ -684,10 +676,9 @@ class GenerationExecutorProxy(GenerationExecutor):
         if self.dispatch_result_thread is not None and self.dispatch_result_thread.is_alive(
         ):
             self.dispatch_result_thread.stop()
-            # With the engine dead, the worker that would send the shutdown
-            # sentinel is gone, so the dispatcher may be blocked in a ZMQ
-            # recv that never returns: bound the join and leak the daemon
-            # thread rather than hang teardown.
+            # With the engine dead, the shutdown sentinel will never arrive
+            # and the dispatcher may be blocked in a ZMQ recv forever: bound
+            # the join and leak the daemon thread.
             self.dispatch_result_thread.join(
                 timeout=5.0 if self._engine_dead else None)
 
@@ -708,9 +699,7 @@ class GenerationExecutorProxy(GenerationExecutor):
         self.workers_started = False
         if self._owns_mpi_session:
             if self._engine_dead:
-                # Joining anything owned by an abruptly-killed worker world
-                # blocks forever (the pool join, and later interpreter exit
-                # on the wedged manager thread): abandon instead of joining.
+                # Anything joining a dead worker world blocks forever.
                 self.mpi_session.abandon()
             else:
                 self.mpi_session.shutdown()
