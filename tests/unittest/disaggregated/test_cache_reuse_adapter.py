@@ -14,6 +14,9 @@
 # limitations under the License.
 """Tests for CacheReuseAdapter, _create_kv_slice SWA trim, and Sender token-start derivation."""
 
+from types import SimpleNamespace
+from unittest.mock import MagicMock
+
 import numpy as np
 import pytest
 
@@ -263,6 +266,95 @@ class TestTokenRange:
     def test_start_eq_end_rejected(self):
         with pytest.raises(ValueError):
             TokenRange(start=256, end=256)
+
+
+# ---------------------------------------------------------------------------
+# _create_kv_slice: default TokenRange spans prompt_len, matching the
+# trimmed block list actually transferred.
+# ---------------------------------------------------------------------------
+
+
+def _build_transceiver_for_kv_slice(num_extra_kv_tokens: int, prompt_len: int):
+    """Stub a KvCacheTransceiverV2 so _create_kv_slice runs without dist setup.
+
+    Wires only the attributes the method touches:
+      - reuse adapter: tokens_per_block, per-layer-group cached count, block ids
+      - page table:    layer groups
+      - cache manager: num_extra_kv_tokens (read in this code path)
+    """
+    tokens_per_block = 8
+    layer_group = AttentionLayerGroup(pool_group_idx=0, kv_head_num_per_rank=1)
+    total_blocks = (prompt_len + num_extra_kv_tokens + tokens_per_block - 1) // tokens_per_block
+    block_ids = np.arange(total_blocks, dtype=np.int64)
+
+    reuse_adapter = SimpleNamespace(
+        tokens_per_block=tokens_per_block,
+        get_cached_token_count_per_layer_group=lambda req, layer_groups: [0] * len(layer_groups),
+        get_block_ids=lambda req, idx, lg: block_ids,
+    )
+    page_table = SimpleNamespace(layer_groups=[layer_group])
+    cache_manager = SimpleNamespace(num_extra_kv_tokens=num_extra_kv_tokens)
+
+    transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver._reuse_adapter = reuse_adapter
+    transceiver._page_table = page_table
+    transceiver._kv_cache_manager = cache_manager
+
+    req = SimpleNamespace(
+        prompt_len=prompt_len,
+        py_request_id=0,
+        py_beam_width=1,  # beam search disabled; _trim_packed_beam_block_ids is pass-through
+        is_generation_only_request=lambda: False,
+    )
+    return transceiver, req
+
+
+class TestCreateKvSliceTokenRange:
+    """token_range.end must be prompt_len, matching the trimmed block list.
+
+    The sender reconstructs total_blocks from token_range.end (ceil(end / tpb)),
+    so end must stay at prompt_len -- not prompt_len + num_extra_kv_tokens --
+    to match the blocks actually transferred.
+    """
+
+    def test_excludes_num_extra_kv_tokens(self):
+        prompt_len = 17
+        num_extra_kv_tokens = 7
+        transceiver, req = _build_transceiver_for_kv_slice(num_extra_kv_tokens, prompt_len)
+
+        kv_slice = transceiver._create_kv_slice(req)
+
+        assert kv_slice.token_range is not None
+        assert (kv_slice.token_range.start, kv_slice.token_range.end) == (0, prompt_len)
+
+    def test_extra_tokens_do_not_cross_block_boundary(self):
+        # Reconstructed total_blocks (ceil(end / tpb)) must match the blocks sent.
+        prompt_len = 16
+        num_extra_kv_tokens = 7
+        transceiver, req = _build_transceiver_for_kv_slice(num_extra_kv_tokens, prompt_len)
+        tpb = transceiver._reuse_adapter.tokens_per_block
+
+        # Setup must actually exercise a boundary crossing: prompt_len ends on a
+        # block boundary and the extra tokens would otherwise add a block.
+        assert prompt_len % tpb == 0
+        assert (prompt_len + num_extra_kv_tokens + tpb - 1) // tpb == prompt_len // tpb + 1
+
+        kv_slice = transceiver._create_kv_slice(req)
+
+        end = kv_slice.token_range.end
+        transferred_blocks = kv_slice.block_ids_per_layer_groups[0].size
+        assert (end + tpb - 1) // tpb == transferred_blocks
+
+    def test_defaults_to_prompt_len_when_no_extra(self):
+        prompt_len = 17
+        transceiver, req = _build_transceiver_for_kv_slice(
+            num_extra_kv_tokens=0, prompt_len=prompt_len
+        )
+
+        kv_slice = transceiver._create_kv_slice(req)
+
+        assert kv_slice.token_range is not None
+        assert (kv_slice.token_range.start, kv_slice.token_range.end) == (0, prompt_len)
 
 
 # ---------------------------------------------------------------------------
@@ -559,3 +651,46 @@ class TestSenderTokenStarts:
         )
         # total_blocks for slice = 2 → raw start = 16; clamped = max(16, 16) = 16.
         assert (src_start, dst_start) == (16, 16)
+
+
+# ---------------------------------------------------------------------------
+# KvCacheTransceiverV2 context-manager (__enter__/__exit__) + shutdown idempotency. (#14137)
+# ---------------------------------------------------------------------------
+class TestTransceiverContextManager:
+    @staticmethod
+    def _tc():
+        # Bypass the heavy __init__ (cuda device, TransferWorker, dist broadcasts).
+        tc = object.__new__(KvCacheTransceiverV2)
+        tc._send_sessions = {}
+        tc._recv_sessions = {}
+        tc._send_reqs = {}
+        tc._recv_reqs = {}
+        tc._transfer_worker = MagicMock()
+        return tc
+
+    def test_enter_returns_self(self):
+        tc = self._tc()
+        with tc as ctx:
+            assert ctx is tc
+
+    def test_exit_calls_shutdown(self):
+        tc = self._tc()
+        with tc:
+            pass
+        tc._transfer_worker.shutdown.assert_called_once()
+        assert tc._shutdown is True
+
+    def test_exit_calls_shutdown_on_exception(self):
+        tc = self._tc()
+        with pytest.raises(RuntimeError, match="boom"):
+            with tc:
+                raise RuntimeError("boom")
+        # __exit__ still ran shutdown despite the in-block exception.
+        tc._transfer_worker.shutdown.assert_called_once()
+        assert tc._shutdown is True
+
+    def test_shutdown_is_idempotent(self):
+        tc = self._tc()
+        tc.shutdown()
+        tc.shutdown()  # second call short-circuits on the _shutdown guard.
+        tc._transfer_worker.shutdown.assert_called_once()

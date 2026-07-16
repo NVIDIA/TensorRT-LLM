@@ -879,16 +879,18 @@ protected:
             cpMetaData.emplace(length, tokensPerBlock, mCpRank, mCpSize);
             seqLen = cpMetaData.value().mSeqLenOnThisCPRank;
         }
-        texec::Request request{VecTokens(seqLen, seqLen), maxNewTokens};
-        auto state = std::make_unique<texec::DataTransceiverState>();
 
+        auto state = std::make_unique<texec::DataTransceiverState>();
         TLLM_CHECK(mContextCommState);
         state->setCommState(texec::kv_cache::CommState{*mContextCommState});
         state->setCacheState(*mContextCacheState);
         auto stats = texec::ContextPhaseParams({}, mRequestId, state.release(), std::nullopt);
-        request.setContextPhaseParams(std::move(stats));
 
-        auto llmRequestPtr = std::make_shared<LlmRequest>(mRequestId++, std::move(request));
+        tr::SamplingConfig samplingConfig{1};
+        auto inputTokens = std::make_shared<VecTokens>(seqLen, seqLen);
+        auto llmRequestPtr = std::make_shared<LlmRequest>(
+            mRequestId++, maxNewTokens, inputTokens, samplingConfig, /*isStreaming=*/false);
+        llmRequestPtr->setContextPhaseParams(std::move(stats));
         return std::make_unique<WrappedLlmRequest>(std::move(llmRequestPtr), cpMetaData);
     }
 
@@ -904,7 +906,6 @@ protected:
             cpMetaData.emplace(length, tokensPerBlock, mCpRank, mCpSize);
             seqLen = cpMetaData.value().mSeqLenOnThisCPRank;
         }
-        texec::Request request{VecTokens(seqLen, seqLen), maxNewTokens};
 
         auto state = std::make_unique<texec::DataTransceiverState>();
         state->setCommState(texec::kv_cache::CommState{*mContextCommState});
@@ -919,8 +920,12 @@ protected:
             mContextCacheState->getParallelConfig().mTensorParallelism};
         state->setCacheState(cacheState);
         auto stats = texec::ContextPhaseParams({}, requestId, state.release(), std::nullopt);
-        request.setContextPhaseParams(std::move(stats));
-        auto llmRequestPtr = std::make_shared<LlmRequest>(requestId, std::move(request));
+
+        tr::SamplingConfig samplingConfig{1};
+        auto inputTokens = std::make_shared<VecTokens>(seqLen, seqLen);
+        auto llmRequestPtr
+            = std::make_shared<LlmRequest>(requestId, maxNewTokens, inputTokens, samplingConfig, /*isStreaming=*/false);
+        llmRequestPtr->setContextPhaseParams(std::move(stats));
 
         return std::make_unique<WrappedLlmRequest>(std::move(llmRequestPtr), cpMetaData);
     }
@@ -1340,24 +1345,8 @@ TEST_P(AsymmetricalCacheTest, TestCase)
         // https://nvbugs/5760737
         GTEST_SKIP() << "Temporarily skipping cache transceiver tests with Mooncake backend for Indexer KCache.";
     }
+
     std::vector<int> lenList = {30, 10, 60, 80};
-    if (genCp > 1)
-    {
-        std::vector<int> updatedLenList;
-        for (auto len : lenList)
-        {
-            if (len > tokensPerBlock * (genCp - 1))
-            {
-                updatedLenList.push_back(len);
-            }
-        }
-        if (updatedLenList.empty())
-        {
-            GTEST_SKIP() << "Skipping test because not even one request has one block per genCP rank. tokensPerBlock="
-                         << tokensPerBlock << ", genCp=" << genCp;
-        }
-        lenList = updatedLenList;
-    }
 
     setUpCommunicator(contextTp, contextPp, contextCp, genTp, genPp, genCp, isMLA, contextDP, generationDP);
 
@@ -1465,26 +1454,8 @@ TEST_P(AsymmetricalCacheTestWithDP, TestCase)
     {
         GTEST_SKIP() << "Temporarily skipping cache transceiver tests with NIXL and MOONCAKE backend for CP.";
     }
-    // Filter request lengths based on CP requirements.
-    // Each request must have at least one block per CP rank to be valid for CP tests.
+
     std::vector<int> lenList = {60, 30, 60, 10};
-    if (genCp > 1)
-    {
-        std::vector<int> updatedLenList;
-        for (auto len : lenList)
-        {
-            if (len > tokensPerBlock * (genCp - 1))
-            {
-                updatedLenList.push_back(len);
-            }
-        }
-        if (updatedLenList.empty())
-        {
-            GTEST_SKIP() << "Skipping test because not even one request has one block per genCP rank. tokensPerBlock="
-                         << tokensPerBlock << ", genCp=" << genCp;
-        }
-        lenList = updatedLenList;
-    }
 
     setUpCommunicator(contextTp, contextPp, contextCp, genTp, genPp, genCp, isMLA, contextDP, generationDP);
 

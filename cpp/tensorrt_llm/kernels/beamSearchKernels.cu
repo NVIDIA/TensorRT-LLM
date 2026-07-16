@@ -16,6 +16,7 @@
 
 #include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/common/reduceKernelUtils.cuh"
 #include "tensorrt_llm/kernels/beamSearchKernels.h"
 
 using namespace tensorrt_llm::common;
@@ -135,21 +136,26 @@ void invokeUpdateCacheIndirection(int* tgtCI, int const* srcCI, BeamHypotheses& 
     sync_check_cuda_error(stream);
 }
 
-__global__ void addCumLogProbs(float* __restrict pStage1LogProbs, float const* __restrict cumLogProbs,
-    FinishedState const* finished, int const* endIds, float const* diversityRates,
+__global__ void addCumLogProbs(float* __restrict pStage1LogProbs, int const* __restrict pStage1Ids,
+    float const* __restrict cumLogProbs, FinishedState const* finished, int const* endIds, float const* diversityRates,
     runtime::SizeType32 const* batchSlots, size_t const nBS, size_t const nBMIn, size_t const nBMOut, size_t const nBM)
 {
     int const bid = blockIdx.x; // Index of request in batch
     runtime::SizeType32 const slot = batchSlots[bid];
     float const diversityRate{diversityRates[slot]};
     float* pLocalLogProbs = pStage1LogProbs + bid * nBMIn * nBMOut * 2;
+    int const* pLocalIds = pStage1Ids + bid * nBMIn * nBMOut * 2;
 
     for (int i = threadIdx.x; i < nBMIn * nBMOut * 2; i += blockDim.x)
     {
         int const iBMIn = i / (nBMOut * 2);
-        if (finished[slot * nBMIn + iBMIn].isFinished())
+        if (finished[slot * nBM + iBMIn].isFinished())
         {
-            pLocalLogProbs[i] += (i == endIds[slot]) ? 1.0f : 0.0f;
+            // In V2 path, i is a candidate-slot index (0..nBMIn*nBMOut*2-1), NOT a vocab token id.
+            // Use pStage1Ids to look up the actual token id for the EOS comparison.
+            bool const isEOS = (pLocalIds[i] == endIds[slot]);
+            // Keep only the EOS candidate with its proper cumulative score; suppress all others.
+            pLocalLogProbs[i] = isEOS ? (pLocalLogProbs[i] + cumLogProbs[slot * nBM + iBMIn]) : -FLT_MAX;
         }
         else
         {
@@ -160,21 +166,27 @@ __global__ void addCumLogProbs(float* __restrict pStage1LogProbs, float const* _
     return;
 }
 
-__global__ void addCumLogProbs(half* __restrict pStage1LogProbs, float const* __restrict cumLogProbs,
-    FinishedState const* finished, int const* endIds, float const* diversityRates,
+__global__ void addCumLogProbs(half* __restrict pStage1LogProbs, int const* __restrict pStage1Ids,
+    float const* __restrict cumLogProbs, FinishedState const* finished, int const* endIds, float const* diversityRates,
     runtime::SizeType32 const* batchSlots, size_t const nBS, size_t const nBMIn, size_t const nBMOut, size_t const nBM)
 {
     int const bid = blockIdx.x; // Index of request in batch
     runtime::SizeType32 const slot = batchSlots[bid];
     float const diversityRate{diversityRates[slot]};
     half* pLocalLogProbs = pStage1LogProbs + bid * nBMIn * nBMOut * 2;
+    int const* pLocalIds = pStage1Ids + bid * nBMIn * nBMOut * 2;
 
     for (int i = threadIdx.x; i < nBMIn * nBMOut * 2; i += blockDim.x)
     {
         int const iBMIn = i / (nBMOut * 2);
-        if (finished[slot * nBMIn + iBMIn].isFinished())
+        if (finished[slot * nBM + iBMIn].isFinished())
         {
-            pLocalLogProbs[i] += (i == endIds[slot]) ? 1.0f : 0.0f;
+            // In V2 path, i is a candidate-slot index (0..nBMIn*nBMOut*2-1), NOT a vocab token id.
+            // Use pStage1Ids to look up the actual token id for the EOS comparison.
+            bool const isEOS = (pLocalIds[i] == endIds[slot]);
+            // Keep only the EOS candidate with its proper cumulative score; suppress all others.
+            pLocalLogProbs[i]
+                = isEOS ? (half) (float(pLocalLogProbs[i]) + cumLogProbs[slot * nBM + iBMIn]) : (half) -HALF_FLT_MAX;
         }
         else
         {

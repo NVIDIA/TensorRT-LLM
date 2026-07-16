@@ -1,7 +1,23 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import contextlib
 import errno
 import json
 import os
+import struct
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -20,7 +36,9 @@ from tensorrt_llm._utils import (get_sm_version, is_sm_100f,
 from tensorrt_llm.bindings import LayerType as LayerTypeCpp
 from tensorrt_llm.functional import AllReduceStrategy
 from tensorrt_llm.llmapi.llm_args import (DeepSeekSparseAttentionConfig,
-                                          KvCacheConfig, MoeLoadBalancerConfig)
+                                          DeepSeekV4SparseAttentionConfig,
+                                          KvCacheConfig, MoeLoadBalancerConfig,
+                                          MultimodalConfig)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -39,31 +57,23 @@ if TYPE_CHECKING:
 
 TConfig = TypeVar("TConfig", bound=transformers.PretrainedConfig)
 
+_DEEPSEEK_V4_ARCHITECTURES = {"DeepseekV4ForCausalLM"}
+_DEEPSEEK_V4_ROUTED_EXPERT_WEIGHT = "layers.0.ffn.experts.0.w1.weight"
 
-def _unified_kv_pool_includes_mamba(
-        is_disagg: bool, spec_config: Optional['SpeculativeConfig']) -> bool:
-    """Whether the KV cache pool will include mamba layers for a hybrid model.
+_MINIMAX_M3_ARCHITECTURES = {
+    "MiniMaxM3SparseForCausalLM",
+    "MiniMaxM3SparseForConditionalGeneration",
+}
 
-    True for the default Python ``MambaHybridCacheManager`` route, where
-    mamba state is allocated alongside attention KV inside one pool (with
-    zero KV heads on mamba layers). False for the V1-route managers used
-    when:
 
-      * disaggregated serving forces the C++ mamba manager
-        (``TRTLLM_USE_CPP_MAMBA=1`` enables the same path locally), or
-      * ``TRTLLM_USE_PY_MAMBA=1`` forces the Python mamba manager locally
-        (agg-mode override), or
-      * one-model speculative decoding splits mamba and attention into
-        separate caches.
-
-    Single source of truth for the binding-side layer-counting decision; do
-    not duplicate the predicate at call sites.
-    """
-    use_split_pool = is_disagg \
-        or os.environ.get('TRTLLM_USE_CPP_MAMBA', '0') == '1' \
-        or os.environ.get('TRTLLM_USE_PY_MAMBA', '0') == '1'
-    use_spec = spec_config is not None
-    return not (use_split_pool or use_spec)
+def _is_lock_infra_error(exc: BaseException) -> bool:
+    """Whether exc indicates broken lock infrastructure (not mere contention)."""
+    if isinstance(exc, PermissionError):
+        return True
+    if isinstance(exc, OSError):
+        return exc.errno in (errno.EACCES, errno.EPERM, errno.ENOLCK,
+                             errno.ESTALE)
+    return False
 
 
 @contextlib.contextmanager
@@ -77,47 +87,44 @@ def config_file_lock(timeout: int = 10):
     Args:
         timeout: Maximum time to wait for lock acquisition in seconds
     """
-    # Use a single global lock file in HF cache directory
-    # This serializes all model loading operations to prevent race conditions
+    # Use a single global lock file in HF cache directory to serialize loads.
     lock_path = Path(HF_MODULES_CACHE) / "_remote_code.lock"
-
-    # Create and acquire the lock
     lock = filelock.FileLock(str(lock_path), timeout=timeout)
 
+    # Guard only acquisition so caller-body exceptions propagate (single-yield).
     try:
-        with lock:
-            yield
-    except (PermissionError, OSError, filelock.Timeout) as e:
-        # Fallback to tempdir when primary lock path is unusable (e.g.,
-        # NFS locking failures like ENOLCK/ESTALE, permission issues,
-        # or lock acquisition timeouts)
-        if isinstance(e,
-                      OSError) and e.errno not in (errno.EACCES, errno.EPERM,
-                                                   errno.ENOLCK, errno.ESTALE):
+        lock.acquire(timeout=timeout)
+    except filelock.Timeout:
+        # Contention, not broken infra: a tempdir lock can't serialize against
+        # the holder, so degrade to no lock instead of crashing the process.
+        logger.warning(
+            f"could not acquire config lock within {timeout}s, proceeding without lock"
+        )
+        yield
+    except (PermissionError, OSError) as e:
+        # Broken lock infra (perms / NFS ENOLCK/ESTALE): retry on a tempdir lock.
+        if not _is_lock_infra_error(e):
             raise
         tmp_dir = Path(tempfile.gettempdir())
         tmp_dir.mkdir(parents=True, exist_ok=True)
-        tmp_lock_path = tmp_dir / "_remote_code.lock"
-        tmp_lock = filelock.FileLock(str(tmp_lock_path), timeout=timeout)
+        tmp_lock = filelock.FileLock(str(tmp_dir / "_remote_code.lock"),
+                                     timeout=timeout)
         try:
-            with tmp_lock:
+            tmp_lock.acquire(timeout=timeout)
+        except (PermissionError, OSError, filelock.Timeout):
+            logger.warning(
+                "tempdir config lock unavailable, proceeding without lock")
+            yield
+        else:
+            try:
                 yield
-        except filelock.Timeout:
-            logger.warning(
-                f"failed to acquire tempdir config lock within {timeout} seconds, proceeding without lock"
-            )
-            # proceed without lock
+            finally:
+                tmp_lock.release()
+    else:
+        try:
             yield
-        except (PermissionError, OSError) as e:
-            if isinstance(
-                    e, OSError) and e.errno not in (errno.EACCES, errno.EPERM,
-                                                    errno.ENOLCK, errno.ESTALE):
-                raise
-            logger.warning(
-                f"tempdir config lock unavailable due to OS/permission issue: {e}, proceeding without lock"
-            )
-            # proceed without lock
-            yield
+        finally:
+            lock.release()
 
 
 @dataclass(kw_only=True)
@@ -183,8 +190,18 @@ class ModelConfig(Generic[TConfig]):
     # If true, ONLY the vision encoder part of the full model is loaded/executed.
     mm_encoder_only: bool = False
 
+    # If true, the multimodal encoder of a multimodal checkpoint is NOT
+    # instantiated/loaded and the model serves text-only requests. This is
+    # opt-in per model: each model implementation must honor this flag when
+    # building its encoder (currently the Qwen3-VL / Qwen3.5-VL models); a
+    # model that does not check it simply ignores the flag (no-op).
+    disable_mm_encoder: bool = False
+
     # Video pruning rate for VLM models (None = EVS disabled)
     video_pruning_rate: Optional[float] = None
+
+    # Multimodal model configuration, e.g. vision encoder CUDA graph buckets.
+    multimodal_config: MultimodalConfig | None = None
 
     def __setattr__(self, key, value):
         """
@@ -299,7 +316,8 @@ class ModelConfig(Generic[TConfig]):
             return False
         return model_architectures[0] not in [
             "BertForSequenceClassification", "Qwen2ForProcessRewardModel",
-            "Qwen2ForRewardModel", "LlamaForTextEmbedding"
+            "Qwen2ForRewardModel", "LlamaForTextEmbedding",
+            "Qwen3ForTextEmbedding"
         ]
         # TODO: should be 'not model_type == ModelType.ENCODER_ONLY'
         # once ModelType is used in pytorch flow.
@@ -321,6 +339,11 @@ class ModelConfig(Generic[TConfig]):
         """
         if moe_backend.upper() != "AUTO":
             return moe_backend
+
+        if architecture in _DEEPSEEK_V4_ARCHITECTURES:
+            sm_version = get_sm_version()
+            if 100 <= sm_version < 120:
+                return "TRTLLM"
 
         if architecture == "GptOssForCausalLM":
             sm_version = get_sm_version()
@@ -410,6 +433,7 @@ class ModelConfig(Generic[TConfig]):
                 'group_size', quant_config.group_size)
             quant_config.exclude_modules = json_quant_configs.get(
                 'exclude_modules', quant_config.exclude_modules)
+
             for layer in mixed_quant_configs:
                 layer_cfg = mixed_quant_configs[layer]
                 config = QuantConfig()
@@ -505,6 +529,24 @@ class ModelConfig(Generic[TConfig]):
             else:
                 quant_config.exclude_modules = default_exclude
 
+        # MXFP8 checkpoints (e4m3 weights + UE8M0 1x32 block scales, dynamic MXFP8 acts).
+        elif hf_quant_config.get("quant_method") == "mxfp8":
+            quant_config.quant_algo = QuantAlgo.MXFP8
+            block_size = hf_quant_config.get("weight_block_size", [1, 32])
+            # MXFP8 uses 1x32 blocks along the K dim; group_size is the K block (32).
+            assert tuple(block_size) == (1, 32), (
+                f"MXFP8 only supports weight_block_size=[1,32], got {block_size}"
+            )
+            quant_config.group_size = block_size[1]
+
+            # Layers the producer left in BF16.
+            ignored = hf_quant_config.get("ignored_layers", [])
+            if hf_exclude_modules is not None:
+                quant_config.exclude_modules = list(
+                    dict.fromkeys(hf_exclude_modules + ignored))
+            else:
+                quant_config.exclude_modules = list(ignored)
+
         # NOTE: This is for llm-compressor's quantized checkpoints.
         elif hf_quant_config.get("quant_method") == "compressed-tensors":
             update_quant_config_from_compressed_tensors(quant_config,
@@ -523,6 +565,199 @@ class ModelConfig(Generic[TConfig]):
             else:
                 quant_config.exclude_modules = default_exclude
         return quant_config, layer_quant_config
+
+    @staticmethod
+    def _read_safetensors_header(path: Path) -> Dict[str, Any]:
+        with open(path, "rb") as f:
+            header_size = struct.unpack("<Q", f.read(8))[0]
+            return json.loads(f.read(header_size))
+
+    @staticmethod
+    def _get_safetensors_header_for_tensor(checkpoint_dir: str,
+                                           tensor_name: str) -> Optional[Dict]:
+        checkpoint_path = Path(checkpoint_dir)
+        candidates = []
+        index_path = checkpoint_path / "model.safetensors.index.json"
+        if index_path.exists():
+            with open(index_path) as f:
+                index = json.load(f)
+            shard_name = index.get("weight_map", {}).get(tensor_name)
+            if shard_name is not None:
+                candidates.append(checkpoint_path / shard_name)
+
+        candidates.extend(sorted(checkpoint_path.glob("*.safetensors")))
+        seen = set()
+        for candidate in candidates:
+            if candidate in seen or not candidate.exists():
+                continue
+            seen.add(candidate)
+            header = ModelConfig._read_safetensors_header(candidate)
+            if tensor_name in header:
+                return header[tensor_name]
+        return None
+
+    @staticmethod
+    def _detect_deepseek_v4_routed_moe_layout(
+            checkpoint_dir: str) -> Optional[str]:
+        tensor_info = ModelConfig._get_safetensors_header_for_tensor(
+            checkpoint_dir, _DEEPSEEK_V4_ROUTED_EXPERT_WEIGHT)
+        if tensor_info is None:
+            return None
+
+        dtype = tensor_info.get("dtype")
+        shape = tensor_info.get("shape", [])
+        if dtype == "I8" and len(shape) == 2:
+            return "mxfp4"
+        if dtype == "U8":
+            return "nvfp4"
+        return None
+
+    @staticmethod
+    def _is_deepseek_v4_base_checkpoint(checkpoint_dir: str) -> bool:
+        tensor_info = ModelConfig._get_safetensors_header_for_tensor(
+            checkpoint_dir, _DEEPSEEK_V4_ROUTED_EXPERT_WEIGHT)
+        if tensor_info is None:
+            return False
+
+        return ModelConfig._detect_deepseek_v4_routed_moe_layout(
+            checkpoint_dir) not in ("mxfp4", "nvfp4")
+
+    @staticmethod
+    def _has_deepseek_v4_layer_only_modelopt_quant_config(
+            quant_config_file: str) -> bool:
+        with open(quant_config_file) as f:
+            quant_config_dict = json.load(f)
+
+        quantization_config = quant_config_dict.get('quantization', {})
+        return (quantization_config.get('quant_algo', None) is None and
+                quantization_config.get('quantized_layers', None) is not None)
+
+    @staticmethod
+    def _set_deepseek_v4_routed_moe_quant_config(pretrained_config,
+                                                 checkpoint_dir: str,
+                                                 moe_backend: str,
+                                                 layer_quant_config,
+                                                 spec_config=None,
+                                                 require_layout: bool = False):
+        layout = ModelConfig._detect_deepseek_v4_routed_moe_layout(
+            checkpoint_dir)
+        if layout not in ("mxfp4", "nvfp4"):
+            if require_layout:
+                raise ValueError(
+                    "DeepSeek-V4 checkpoint has layer-specific quantized_layers "
+                    "in hf_quant_config.json, but the routed MoE layout could "
+                    "not be detected from safetensors metadata. Expected "
+                    f"{_DEEPSEEK_V4_ROUTED_EXPERT_WEIGHT} to use dtype I8 "
+                    "for MXFP4 or U8 for NVFP4.")
+            return layer_quant_config
+
+        experts_quant_config = QuantConfig()
+        if layout == "mxfp4":
+            experts_quant_config.quant_algo = ModelConfig.get_mxfp4_quant_algo(
+                moe_backend)
+            experts_quant_config.group_size = 32
+        else:
+            experts_quant_config.quant_algo = QuantAlgo.NVFP4
+            experts_quant_config.group_size = 16
+        experts_quant_config.exclude_modules = [
+            'block.*.attn.out', 'block.*.mlp.gate', 'block.*.attn.qkv',
+            'embedding', 'unembedding'
+        ]
+
+        if layer_quant_config is None:
+            layer_quant_config = {}
+        else:
+            layer_quant_config = dict(layer_quant_config)
+
+        num_moe_layers = pretrained_config.num_hidden_layers
+        if (spec_config is not None
+                and spec_config.spec_dec_mode.is_mtp_one_model()):
+            num_moe_layers += spec_config.num_nextn_predict_layers
+
+        for layer_idx in range(num_moe_layers):
+            layer_quant_config[
+                f"model.layers.{layer_idx}.mlp.experts"] = experts_quant_config
+
+        logger.info(
+            "Detected DeepSeek-V4 routed MoE %s checkpoint layout; using "
+            "%s for routed experts.", layout.upper(),
+            experts_quant_config.quant_algo)
+        return layer_quant_config
+
+    @staticmethod
+    def _set_minimax_m3_layer_quant_config(pretrained_config,
+                                           layer_quant_config):
+        """Normalize the Minimax M3 MIXED_PRECISION per-layer quant config.
+
+        Two fix-ups are applied:
+
+        1. Strip the ``language_model.`` prefix from every per-layer key.
+           The M3 VL checkpoint stores keys like
+           ``language_model.model.layers.0.self_attn.o_proj -> MXFP8`` in
+           ``hf_quant_config.json``, but the TRT-LLM module tree names the text
+           decoder ``model.layers.0.self_attn.o_proj`` (no ``language_model.``
+           prefix -- the loader strips it). ``apply_layerwise_quant_config``
+           matches *standalone* Linears (e.g. ``o_proj``, ``down_proj``) with an
+           **exact** ``name == key`` comparison, so the prefixed keys never match
+           and those layers silently fall back to the global ``MIXED_PRECISION``
+           config -> loaded unquantized (MXFP8 ``weight_scale`` dropped) -> the
+           attention/MLP output magnitude explodes. Stripping the prefix makes
+           the exact match succeed. (Fused qkv/gate_up Linears and the Attention
+           wrapper use substring matches and happened to work regardless.)
+
+        2. Inject a single coarse ``model.layers.N.block_sparse_moe.experts``
+           entry per MoE layer so ``MiniMaxM3MoE._get_experts_quant_config`` can
+           select the NVFP4 backend for the routed experts (the fine-grained
+           per-linear NVFP4 expert keys can't be used directly).
+
+        Does nothing when there is no per-layer config (e.g. the uniform MXFP8
+        or a BF16 checkpoint).
+        """
+        from tensorrt_llm.models.modeling_utils import QuantAlgo
+        if layer_quant_config is None:
+            return layer_quant_config
+
+        # (1) Strip the ``language_model.`` prefix so exact-match per-layer
+        # quant assignment works for standalone base Linears.
+        _LM_PREFIX = "language_model."
+        layer_quant_config = {
+            (k[len(_LM_PREFIX):] if k.startswith(_LM_PREFIX) else k): v
+            for k, v in layer_quant_config.items()
+        }
+
+        # (2) Inject coarse NVFP4 expert entries (only when routed experts are
+        # NVFP4).
+        has_nvfp4_experts = any(
+            "block_sparse_moe.experts" in k and isinstance(v, QuantConfig)
+            and v.quant_algo == QuantAlgo.NVFP4
+            for k, v in layer_quant_config.items())
+        if not has_nvfp4_experts:
+            return layer_quant_config
+
+        experts_quant_config = QuantConfig()
+        experts_quant_config.quant_algo = QuantAlgo.NVFP4
+        # TODO: remove the hardcoded group_size and read it from the per-linear
+        # NVFP4 expert entries in hf_quant_config.json instead. 16 is correct
+        # for standard NVFP4 today, but this is a latent bug if a checkpoint
+        # ever ships a different group size.
+        experts_quant_config.group_size = 16
+
+        text_config = getattr(pretrained_config, "text_config",
+                              pretrained_config)
+        if isinstance(text_config, dict):
+            moe_layer_freq = text_config.get("moe_layer_freq", [])
+        else:
+            moe_layer_freq = getattr(text_config, "moe_layer_freq", [])
+
+        for layer_idx, freq in enumerate(moe_layer_freq):
+            if int(freq) != 0:
+                layer_quant_config[
+                    f"model.layers.{layer_idx}.block_sparse_moe.experts"] = experts_quant_config
+
+        logger.info(
+            "Detected Minimax M3 NVFP4 routed MoE checkpoint; using NVFP4 "
+            "for routed experts.")
+        return layer_quant_config
 
     @staticmethod
     def load_quant_config_from_dtypes_json(dtypes_json_file, moe_backend: str):
@@ -581,6 +816,67 @@ class ModelConfig(Generic[TConfig]):
                         checkpoint_dir: str,
                         trust_remote_code=False,
                         **kwargs):
+
+        def update_sparse_attention_indexer_config(pretrained_config, kwargs):
+            sparse_attention_config = kwargs.get('sparse_attention_config')
+            if sparse_attention_config:
+                index_n_heads = sparse_attention_config.index_n_heads or pretrained_config.index_n_heads
+                index_head_dim = sparse_attention_config.index_head_dim or pretrained_config.index_head_dim
+                # index_topk needs an explicit-set check rather than `or`: the
+                # DeepSeekV4SparseAttentionConfig default (512) is truthy, so a
+                # plain `or` shadows the checkpoint's index_topk (e.g. Pro's
+                # 1024) whenever the user did not set it. Mirror the window_size
+                # handling below and consult model_fields_set. (index_n_heads /
+                # index_head_dim stay on `or` since their defaults are None.)
+                if 'index_topk' in sparse_attention_config.model_fields_set:
+                    index_topk = sparse_attention_config.index_topk
+                else:
+                    index_topk = pretrained_config.index_topk
+                indexer_max_chunk_size = sparse_attention_config.indexer_max_chunk_size
+                skip_indexer_for_short_seqs = sparse_attention_config.skip_indexer_for_short_seqs
+                # Pass-through DSA tuning flags so user-set values survive the
+                # V4 sparse_attention_config rebuild below. The V3.2 path
+                # already threads these explicitly (lines 723-727); without
+                # this block the V4 rebuild silently drops any user override
+                # back to subclass defaults (e.g., enable_heuristic_topk=False
+                # even when the user set it to True in --extra_llm_api_options).
+                use_cute_dsl_topk = sparse_attention_config.use_cute_dsl_topk
+                use_cute_dsl_paged_mqa_logits = sparse_attention_config.use_cute_dsl_paged_mqa_logits
+                q_split_threshold = sparse_attention_config.q_split_threshold
+                indexer_rope_interleave = sparse_attention_config.indexer_rope_interleave
+                enable_heuristic_topk = sparse_attention_config.enable_heuristic_topk
+                indexer_k_dtype = sparse_attention_config.indexer_k_dtype
+            else:
+                index_n_heads = pretrained_config.index_n_heads
+                index_head_dim = pretrained_config.index_head_dim
+                index_topk = pretrained_config.index_topk
+                indexer_max_chunk_size = None
+                skip_indexer_for_short_seqs = True
+                # Defaults match DeepSeekV4SparseAttentionConfig field defaults.
+                use_cute_dsl_topk = False
+                use_cute_dsl_paged_mqa_logits = False
+                q_split_threshold = 8192
+                indexer_rope_interleave = False
+                enable_heuristic_topk = False
+                default_sparse_attention_config = DeepSeekV4SparseAttentionConfig(
+                )
+                indexer_k_dtype = default_sparse_attention_config.indexer_k_dtype
+            indexer_config = {}
+            indexer_config['index_n_heads'] = index_n_heads
+            indexer_config['index_head_dim'] = index_head_dim
+            indexer_config['index_topk'] = index_topk
+            indexer_config['indexer_max_chunk_size'] = indexer_max_chunk_size
+            indexer_config[
+                'skip_indexer_for_short_seqs'] = skip_indexer_for_short_seqs
+            indexer_config['use_cute_dsl_topk'] = use_cute_dsl_topk
+            indexer_config[
+                'use_cute_dsl_paged_mqa_logits'] = use_cute_dsl_paged_mqa_logits
+            indexer_config['q_split_threshold'] = q_split_threshold
+            indexer_config['indexer_rope_interleave'] = indexer_rope_interleave
+            indexer_config['enable_heuristic_topk'] = enable_heuristic_topk
+            indexer_config['indexer_k_dtype'] = indexer_k_dtype
+            return indexer_config
+
         # Use file lock to prevent race conditions when multiple processes
         # try to import/cache the same remote model config file
         with config_file_lock():
@@ -602,7 +898,13 @@ class ModelConfig(Generic[TConfig]):
                     if sparse_attention_config:
                         index_n_heads = sparse_attention_config.index_n_heads or pretrained_config.index_n_heads
                         index_head_dim = sparse_attention_config.index_head_dim or pretrained_config.index_head_dim
-                        index_topk = sparse_attention_config.index_topk or pretrained_config.index_topk
+                        # Explicit-set check (see V4 path above): only honor a
+                        # user-provided index_topk; otherwise take the
+                        # checkpoint value rather than a truthy subclass default.
+                        if 'index_topk' in sparse_attention_config.model_fields_set:
+                            index_topk = sparse_attention_config.index_topk
+                        else:
+                            index_topk = pretrained_config.index_topk
                         indexer_max_chunk_size = sparse_attention_config.indexer_max_chunk_size
                         skip_indexer_for_short_seqs = sparse_attention_config.skip_indexer_for_short_seqs
                         use_cute_dsl_topk = sparse_attention_config.use_cute_dsl_topk
@@ -636,6 +938,78 @@ class ModelConfig(Generic[TConfig]):
                             indexer_rope_interleave=indexer_rope_interleave,
                             enable_heuristic_topk=enable_heuristic_topk,
                             indexer_k_dtype=indexer_k_dtype)
+                elif pretrained_config.architectures[
+                        0] == "DeepseekV4ForCausalLM":
+                    if cls._is_deepseek_v4_base_checkpoint(checkpoint_dir):
+                        logger.warning(
+                            "Support for DeepSeek-V4 Base checkpoints is "
+                            "experimental. For better supported behavior, use "
+                            "a DeepSeek-V4 Instruct checkpoint.")
+                    indexer_config = update_sparse_attention_indexer_config(
+                        pretrained_config, kwargs)
+                    checkpoint_compress_ratios = getattr(
+                        pretrained_config, 'compress_ratios', None)
+                    num_base_layers = pretrained_config.num_hidden_layers
+                    spec_config = kwargs.get('spec_config', None)
+                    if (spec_config is not None
+                            and getattr(spec_config, 'num_nextn_predict_layers',
+                                        None) is None):
+                        spec_config.num_nextn_predict_layers = getattr(
+                            pretrained_config, 'num_nextn_predict_layers', 1)
+                    mtp_enabled = (spec_config is not None and
+                                   spec_config.spec_dec_mode.is_mtp_one_model())
+                    sparse_attention_config = kwargs.get(
+                        'sparse_attention_config')
+                    checkpoint_window_size = getattr(pretrained_config,
+                                                     'window_size', None)
+                    if checkpoint_window_size is None:
+                        checkpoint_window_size = getattr(
+                            pretrained_config, 'sliding_window', None)
+                    if sparse_attention_config:
+                        compress_ratios = sparse_attention_config.compress_ratios
+                        window_size = sparse_attention_config.window_size
+                        if 'window_size' not in sparse_attention_config.model_fields_set:
+                            window_size = checkpoint_window_size
+                    else:
+                        compress_ratios = checkpoint_compress_ratios
+                        window_size = checkpoint_window_size
+
+                    if (checkpoint_compress_ratios is not None
+                            and (compress_ratios is None
+                                 or len(checkpoint_compress_ratios)
+                                 > len(compress_ratios))):
+                        compress_ratios = checkpoint_compress_ratios
+
+                    if window_size is None:
+                        window_size = checkpoint_window_size
+                    if window_size is None:
+                        window_size = pretrained_config.sliding_window
+
+                    # Normalize checkpoint-facing ratio 0 (SWA-only/uncompressed)
+                    # to 1 internally so cache allocation math works. The
+                    # external config keeps the original semantics.
+                    compress_ratios = [
+                        ratio if ratio > 0 else 1 for ratio in compress_ratios
+                    ]
+
+                    # Only synthesize ratios for extra MTP layers. The base
+                    # model ratios must come from the checkpoint or an
+                    # explicit user override; padding a short default list for
+                    # non-MTP changes sparse attention semantics.
+                    if mtp_enabled:
+                        mtp_num_layers = spec_config.num_nextn_predict_layers
+                        total_layers = num_base_layers + mtp_num_layers
+                        if len(compress_ratios) < total_layers:
+                            compress_ratios = list(compress_ratios) + [1] * (
+                                total_layers - len(compress_ratios))
+
+                    indexer_k_dtype = indexer_config.pop('indexer_k_dtype')
+                    kwargs[
+                        'sparse_attention_config'] = DeepSeekV4SparseAttentionConfig(
+                            compress_ratios=compress_ratios,
+                            window_size=window_size,
+                            indexer_k_dtype=indexer_k_dtype,
+                            **indexer_config)
             else:
                 raise ValueError(
                     "checkpoint_dir is None. Cannot load model config without a valid checkpoint directory."
@@ -711,6 +1085,7 @@ class ModelConfig(Generic[TConfig]):
 
         quant_config = QuantConfig()
         layer_quant_config = None
+        require_deepseek_v4_routed_moe_layout = False
         requested_moe_backend = kwargs.get('moe_backend', 'AUTO')
         architecture = pretrained_config.architectures[
             0] if pretrained_config.architectures else ""
@@ -733,8 +1108,33 @@ class ModelConfig(Generic[TConfig]):
                 getattr(pretrained_config, "quantization_config", None),
                 source_file="hf_quant_config.json",
             )
+            if architecture in _DEEPSEEK_V4_ARCHITECTURES:
+                require_deepseek_v4_routed_moe_layout = (
+                    cls._has_deepseek_v4_layer_only_modelopt_quant_config(
+                        quant_config_file))
             quant_config, layer_quant_config = cls._build_modelopt_quant_config(
                 normalized, checkpoint_dir, moe_backend_hint)
+            hf_quant_config = getattr(pretrained_config, "quantization_config",
+                                      None)
+            if quant_config.quant_algo is None and hf_quant_config is not None:
+                hf_quant_config, hf_layer_quant_config = cls.load_hf_quant_config(
+                    hf_quant_config,
+                    moe_backend_hint,
+                    checkpoint_dir=checkpoint_dir)
+                if hf_quant_config.quant_algo is not None:
+                    logger.info(
+                        "Using quantization_config from config.json as global "
+                        "quantization because hf_quant_config.json does not set "
+                        "a global quant_algo.")
+                    quant_config = hf_quant_config
+                    if hf_layer_quant_config is not None:
+                        if layer_quant_config is None:
+                            layer_quant_config = hf_layer_quant_config
+                        else:
+                            layer_quant_config = {
+                                **hf_layer_quant_config,
+                                **layer_quant_config,
+                            }
         # quantized ckpt in other formats
         elif getattr(pretrained_config, "quantization_config",
                      None) is not None:
@@ -752,6 +1152,19 @@ class ModelConfig(Generic[TConfig]):
             architecture,
             quant_config=quant_config,
         )
+
+        if architecture in _DEEPSEEK_V4_ARCHITECTURES:
+            layer_quant_config = cls._set_deepseek_v4_routed_moe_quant_config(
+                pretrained_config,
+                checkpoint_dir,
+                kwargs['moe_backend'],
+                layer_quant_config,
+                kwargs.get('spec_config', None),
+                require_layout=require_deepseek_v4_routed_moe_layout)
+
+        if architecture in _MINIMAX_M3_ARCHITECTURES:
+            layer_quant_config = cls._set_minimax_m3_layer_quant_config(
+                pretrained_config, layer_quant_config)
 
         model_config = cls(pretrained_config=pretrained_config,
                            quant_config=quant_config,

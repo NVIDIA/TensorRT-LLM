@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""End-to-end test for the standalone llmc package.
+"""End-to-end test for the standalone paragraf package.
 
 This test:
 1. Runs create_standalone_package.py to generate the standalone package
@@ -36,7 +36,7 @@ import pytest
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", ".."))
 CREATE_SCRIPT = os.path.join(
-    REPO_ROOT, "examples", "auto_deploy", "llmc", "create_standalone_package.py"
+    REPO_ROOT, "examples", "auto_deploy", "paragraf", "create_standalone_package.py"
 )
 
 
@@ -109,19 +109,41 @@ class TestStandalonePackage:
         result = _run_isolated(
             standalone_package,
             """
-            from llmc._compat import TRTLLM_AVAILABLE
+            from paragraf._compat import TRTLLM_AVAILABLE
             assert not TRTLLM_AVAILABLE, f"Got {TRTLLM_AVAILABLE}"
             print("OK")
             """,
         )
         assert result.returncode == 0, f"stdout: {result.stdout}\nstderr: {result.stderr}"
 
-    def test_import_llmc(self, standalone_package):
-        """The full llmc module should import."""
+    def test_import_paragraf(self, standalone_package):
+        """The full paragraf module should import."""
         result = _run_isolated(
             standalone_package,
             """
+            import paragraf
+            print("OK")
+            """,
+        )
+        assert result.returncode == 0, f"stdout: {result.stdout}\nstderr: {result.stderr}"
+
+    def test_import_llmc_alias(self, standalone_package):
+        """The installed wheel should preserve canonical identity for legacy imports."""
+        result = _run_isolated(
+            standalone_package,
+            """
+            import importlib
+            import importlib.metadata
+
             import llmc
+            import paragraf
+
+            legacy_logger = importlib.import_module("llmc.utils.logger")
+            canonical_logger = importlib.import_module("paragraf.utils.logger")
+            assert llmc is paragraf
+            assert legacy_logger is canonical_logger
+            assert legacy_logger.__name__ == "paragraf.utils.logger"
+            assert importlib.metadata.version("nvidia-llmc") == "0.1.0"
             print("OK")
             """,
         )
@@ -133,10 +155,44 @@ class TestStandalonePackage:
             standalone_package,
             """
             import torch
-            import llmc
+            import paragraf
             ops = [n for n in dir(torch.ops.auto_deploy) if not n.startswith('_')]
             assert len(ops) > 0, f"No ops: {ops}"
             print(f"{len(ops)} ops")
+            """,
+        )
+        assert result.returncode == 0, f"stdout: {result.stdout}\nstderr: {result.stderr}"
+
+    def test_linear_simple_works_in_standalone_on_b200(self, standalone_package):
+        """The standalone linear op must work on the B200 bf16 path."""
+        result = _run_isolated(
+            standalone_package,
+            """
+            from unittest import mock
+
+            import torch
+            import paragraf
+            from paragraf.custom_ops.linear import linear
+
+            if torch.cuda.is_available():
+                device = "cuda"
+                dtype = torch.bfloat16
+            else:
+                device = "cpu"
+                dtype = torch.float32
+
+            x = torch.randn(2, 3, 5, device=device, dtype=dtype)
+            weight = torch.randn(7, 5, device=device, dtype=dtype)
+            bias = torch.randn(7, device=device, dtype=dtype)
+
+            # Force the Blackwell bf16 branch even when this standalone test
+            # runs on H100 CI instead of B200 CI.
+            with mock.patch.object(linear, "get_sm_version", return_value=100):
+                out = torch.ops.auto_deploy.torch_linear_simple(x, weight, bias)
+
+            ref = torch.ops.aten.linear(x, weight, bias)
+            torch.testing.assert_close(out, ref)
+            print("OK")
             """,
         )
         assert result.returncode == 0, f"stdout: {result.stdout}\nstderr: {result.stderr}"
@@ -146,10 +202,10 @@ class TestStandalonePackage:
         result = _run_isolated(
             standalone_package,
             """
-            from llmc._compat import (
+            from paragraf._compat import (
                 ActivationType, KvCacheConfig, str_dtype_to_torch,
             )
-            from llmc.utils.dist_config import DistConfig
+            from paragraf.utils.dist_config import DistConfig
             import torch
             assert ActivationType.Silu == 4
             assert KvCacheConfig().tokens_per_block == 32
@@ -163,7 +219,7 @@ class TestStandalonePackage:
     def test_run_unit_tests(self, standalone_package):
         """Run the copied unit tests from the standalone package's tests/ dir.
 
-        Tests have been import-rewritten to use `llmc` instead of
+        Tests have been import-rewritten to use `paragraf` instead of
         `tensorrt_llm._torch.auto_deploy`, so they run directly against the
         standalone package.
         """

@@ -456,8 +456,23 @@ def throughput_command(
         kwargs = kwargs | runtime_config.get_llm_args()
         kwargs['skip_tokenizer_init'] = not no_skip_tokenizer_init
         kwargs['backend'] = options.backend
+        if (options.modality is None and options.backend == "pytorch"
+                and "disable_mm_encoder" not in kwargs
+                and not kwargs.get("mm_encoder_only", False)):
+            # Text-only benchmark: skip a multimodal checkpoint's encoder so
+            # its GPU memory goes to the KV cache pool instead. Text-only
+            # models ignore this flag. Overridable via extra_llm_api_options.
+            kwargs["disable_mm_encoder"] = True
+            logger.info(
+                "Text-only benchmark (--modality not set): the multimodal "
+                "encoder, if the model has one, will not be loaded.")
         if bench_env.telemetry_config is not None:
             kwargs["telemetry_config"] = bench_env.telemetry_config
+
+        runtime_config.settings_config.max_batch_size = kwargs.get(
+            "max_batch_size", runtime_config.settings_config.max_batch_size)
+        runtime_config.settings_config.max_num_tokens = kwargs.get(
+            "max_num_tokens", runtime_config.settings_config.max_num_tokens)
 
         llm = get_llm(runtime_config, kwargs)
 

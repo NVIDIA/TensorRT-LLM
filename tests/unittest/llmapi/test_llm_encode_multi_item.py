@@ -405,7 +405,7 @@ def test_unsupported_attention_backend(
         llm,
         pytest.raises(
             ValueError,
-            match=".*Attention does not support multi-item scoring.*",
+            match=".*The selected attention backend does not support multi-item scoring.*",
         ),
     ):
         llm.encode(prompt_inputs, batch_indexed_model_output=False)

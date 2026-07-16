@@ -30,7 +30,9 @@ from ..metrics import MetricNames, MetricsCollector, RequestEventTiming
 from ..metrics.perf_utils import \
     process_req_perf_metrics as _process_req_perf_metrics
 from ..sampling_params import LogprobParams, SamplingParams
-from .utils import ErrorResponse, has_event_loop, is_llm_response
+from .postprocessor_hook import PostProcessorHook, apply_post_processor_hook
+from .utils import (EngineDeadError, ErrorResponse, has_event_loop,
+                    is_llm_response)
 
 if TYPE_CHECKING:
     from .executor import GenerationExecutor
@@ -190,6 +192,10 @@ class GenerationResultBase:
         # None indicates not yet available (e.g., before first step/stream).
         self.avg_decoded_tokens_per_iter: Optional[float] = None
         self._done = False
+        # Sticky terminal exception (e.g. EngineDeadError). Once set, the result
+        # is permanently failed: result()/aresult()/_exception() re-raise it on
+        # every subsequent call instead of looking successful.
+        self._terminal_error: Optional[BaseException] = None
         self._aborted = False
         self.metrics_dict = {}
         self.candidate_metrics: list[dict] = []
@@ -828,7 +834,8 @@ class DetokenizedGenerationResultBase(GenerationResultBase):
                  tokenizer: Optional[Callable] = None,
                  streaming: bool = False,
                  background_error_handler: Optional[Callable] = None,
-                 postproc_params: Optional["PostprocParams"] = None):
+                 postproc_params: Optional["PostprocParams"] = None,
+                 post_processor_hook: Optional[PostProcessorHook] = None):
         super().__init__(
             id,
             sampling_params,
@@ -837,6 +844,9 @@ class DetokenizedGenerationResultBase(GenerationResultBase):
         )
         self.tokenizer = tokenizer
         self._streaming = streaming
+        # User post-processing hook, threaded in alongside the
+        # tokenizer by this result's creator; None when unconfigured.
+        self._post_processor_hook = post_processor_hook
 
     def _handle_response(self, response: "GenerationExecutor.Response"):
         GenerationResultBase._handle_response(self, response)
@@ -851,7 +861,12 @@ class DetokenizedGenerationResultBase(GenerationResultBase):
             'spaces_between_special_tokens':
             self.sampling_params.spaces_between_special_tokens
         }
-        if self.sampling_params.detokenize and self.tokenizer is not None:
+        # Detokenize when the client asked for text, OR whenever a post-processing
+        # hook is configured: the hook runs on every response regardless of the
+        # client's ``detokenize`` flag, else it could be bypassed with
+        # ``detokenize=False``.
+        if (self.sampling_params.detokenize or self._post_processor_hook
+                is not None) and self.tokenizer is not None:
             for beam_output in self.outputs:
                 beam_output._last_text_len = len(beam_output.text)
                 if hasattr(
@@ -890,6 +905,21 @@ class DetokenizedGenerationResultBase(GenerationResultBase):
                             beam_output.stop_reason = stop_reason
                             self._done = True
                             break
+
+            self._apply_post_processor_hook()
+
+    def _apply_post_processor_hook(self):
+        """Run the user post-processing hook at the detok chokepoint.
+
+        Runs after detok populated ``text``/``text_diff`` and before any
+        per-endpoint formatter reads them. The hook instance is threaded in via
+        ``post_processor_hook`` (``None`` when unconfigured) so independent
+        ``LLM`` instances stay isolated.
+        """
+        hook = self._post_processor_hook
+        if hook is None:
+            return
+        apply_post_processor_hook(hook, self, streaming=self._streaming)
 
 
 # alias
@@ -966,12 +996,26 @@ class GenerationResult(GenerationResultBase):
 
     def _result_step(self, timeout: Optional[float] = None):
         response = self.queue.get()
+        # Fast-fail: when a worker dies, the proxy enqueues EngineDeadError onto
+        # every pending result so this get() unblocks instead of hanging forever
+        # on a queue whose producer is gone. Record it as the sticky terminal
+        # error and mark the result done before raising, so subsequent
+        # result()/aresult()/_exception() calls keep surfacing the failure
+        # instead of re-blocking on an empty queue or looking successful.
+        if isinstance(response, EngineDeadError):
+            self._terminal_error = response
+            self._done = True
+            raise response
         self._handle_response(response)
 
     async def _aresult_step(self):
         assert self.aqueue is not None, "The asyncio event loop was not present during initialization, so async operations are not available."
         response = await self.aqueue.get()
         global_tracer().log_instant("result_step.get")
+        if isinstance(response, EngineDeadError):
+            self._terminal_error = response
+            self._done = True
+            raise response
         self._handle_response(response)
 
     def result(self, timeout: Optional[float] = None) -> "GenerationResult":
@@ -983,6 +1027,8 @@ class GenerationResult(GenerationResultBase):
         Returns:
             tensorrt_llm.executor.result.GenerationResult: generation result.
         """
+        if self._terminal_error is not None:
+            raise self._terminal_error
         while not self._done:
             self._result_step(timeout)
         return self
@@ -993,6 +1039,8 @@ class GenerationResult(GenerationResultBase):
         Returns:
             tensorrt_llm.executor.result.GenerationResult: generation result.
         """
+        if self._terminal_error is not None:
+            raise self._terminal_error
         while not self._done:
             await self._aresult_step()
         return self
@@ -1004,6 +1052,8 @@ class GenerationResult(GenerationResultBase):
         return self
 
     def __next__(self):
+        if self._terminal_error is not None:
+            raise self._terminal_error
         if self._done:
             raise StopIteration
 
@@ -1014,6 +1064,8 @@ class GenerationResult(GenerationResultBase):
         return self
 
     async def __anext__(self):
+        if self._terminal_error is not None:
+            raise self._terminal_error
         if self._done:
             raise StopAsyncIteration
 

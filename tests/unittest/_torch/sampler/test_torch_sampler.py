@@ -47,11 +47,11 @@ from tensorrt_llm._torch.pyexecutor.sampler import (
     _request_get_sampling_params,
     _request_strategy,
 )
-from tensorrt_llm._torch.pyexecutor.sampling_utils import (
+from tensorrt_llm._torch.pyexecutor.sampler.sampling_utils import (
     GREEDY,
     BeamSearch,
+    FlashInferGroupedStrategySampler,
     Greedy,
-    SimpleGroupedStrategySampler,
     Strategy,
     StrategyMetadata,
     TemperatureOnly,
@@ -59,9 +59,6 @@ from tensorrt_llm._torch.pyexecutor.sampling_utils import (
     TopKTopP,
     TopP,
     UtilsSamplingParams,
-)
-from tensorrt_llm._torch.pyexecutor.sampling_utils_flashinfer import (
-    FlashInferGroupedStrategySampler,
 )
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.bindings import SamplingConfig
@@ -1402,12 +1399,10 @@ class TestBatchedSampling:
     @pytest.fixture(scope="function")
     def sampler(
         self,
-        use_flashinfer: bool,
         max_draft_len: int,
         seq_slot_assignment: tuple[list[int], int],
     ) -> TorchSampler:
         return self._build_sampler(
-            use_flashinfer=use_flashinfer,
             max_draft_len=max_draft_len,
             seq_slot_assignment=seq_slot_assignment,
         )
@@ -1415,7 +1410,6 @@ class TestBatchedSampling:
     def _build_sampler(
         self,
         *,
-        use_flashinfer: bool,
         max_draft_len: int,
         seq_slot_assignment: tuple[list[int], int],
     ) -> TorchSampler:
@@ -1427,7 +1421,6 @@ class TestBatchedSampling:
                 max_beam_width=1,  # currently the only supported value
                 max_num_sequences=num_seq_slots,
                 max_total_draft_tokens=max_draft_len,
-                disable_flashinfer_sampling=(not use_flashinfer),
                 disable_overlap_scheduler=False,
             )
         )
@@ -1498,29 +1491,7 @@ class TestBatchedSampling:
         return new_tokens
 
     @pytest.mark.parametrize(
-        "use_flashinfer, max_draft_len, sampling_params_list",
-        [
-            pytest.param(use_flashinfer, max_draft_len, [])
-            for (use_flashinfer, max_draft_len) in product(
-                [False, True],
-                [0, 3],
-            )
-        ],
-    )
-    def test_backend_selection(
-        self,
-        sampler: TorchSampler,
-        use_flashinfer: bool,
-    ):
-        """Check that TorchSampler uses the correct sampling backend."""
-        expected_cls = (
-            FlashInferGroupedStrategySampler if use_flashinfer else SimpleGroupedStrategySampler
-        )
-        assert sampler._grouped_sampler_cls == expected_cls
-
-    @pytest.mark.parametrize(
         (
-            "use_flashinfer",
             "max_draft_len",
             "draft_lens",
             "sampling_params_list",
@@ -1531,18 +1502,16 @@ class TestBatchedSampling:
         [
             # NB: non-zero draft len ensures that LlmRequest.py_target_probs is set.
             pytest.param(
-                use_flashinfer,
                 3,
                 [3] * len(sampling_params_list),
                 sampling_params_list,
                 params_label,
                 False,
                 vocab_size,
-                id=f"{'FlashInfer' if use_flashinfer else 'Torch'}-{params_label}",
+                id=f"FlashInfer-{params_label}",
             )
             # https://stackoverflow.com/a/75421799, does not work with nested loops
-            for (use_flashinfer, (sampling_params_list, params_label), vocab_size) in product(
-                [False, True],
+            for ((sampling_params_list, params_label), vocab_size) in product(
                 _build_test_cases(
                     vocab_size=VOCAB_SIZE,
                     allow_greedy=False,  # Greedy does not return probs
@@ -1740,7 +1709,6 @@ class TestBatchedSampling:
     def _compute_probs(
         self,
         *,
-        use_flashinfer: bool,
         model_outputs: dict[str, torch.Tensor],
         sampling_params_list: list[SamplingParams],
         seq_slot_assignment: tuple[list[int], int],
@@ -1761,7 +1729,6 @@ class TestBatchedSampling:
         # compute probs in general.
         draft_len_with_probs = max(1, max_draft_len)
         sampler_with_probs = self._build_sampler(
-            use_flashinfer=use_flashinfer,
             max_draft_len=draft_len_with_probs,
             seq_slot_assignment=seq_slot_assignment,
         )
@@ -1801,13 +1768,11 @@ class TestBatchedSampling:
         patch_ctx: pytest.MonkeyPatch,
         *,
         sampler: TorchSampler,
-        use_flashinfer: bool,
     ):
         """Setup interception of sample_async and request grouping.
 
-        If FlashInfer.sampling is used, this validates that at every
-        invocation of sample_async, the sampling backend is called at most
-        once for any given sampling strategy (if FlashInfer.sampling is used).
+        Validates that at every invocation of sample_async, the FlashInfer
+        sampling backend is called at most once for any given sampling strategy.
 
         Used by test_samples.
         """
@@ -1816,72 +1781,76 @@ class TestBatchedSampling:
         # This variable tracks which request types have been encountered.
         flashinfer_keys_seen: set[Any] = set()
 
-        if use_flashinfer:
-            assert sampler._grouped_sampler_cls == FlashInferGroupedStrategySampler
-            sample_grouped_strategies_orig = (
-                FlashInferGroupedStrategySampler.sample_grouped_strategies
-            )
+        assert sampler._grouped_sampler_cls == FlashInferGroupedStrategySampler
+        sample_grouped_strategies_orig = sampler._grouped_sampler_cls.sample_grouped_strategies
 
-            def _sample_grouped_strategies(
-                group_key: FlashInferGroupedStrategySampler.STRATEGY_KEY_TYPE,
-                strategies: list[Strategy],
-                logits: torch.Tensor,
-                *,
-                group_logit_indices: Optional[torch.Tensor] = None,
-                generator: Optional[torch.Generator] = None,
-                return_probs: bool,
-                group_metadata: StrategyMetadata | None = None,
-            ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor] | float]:
-                assert generator is sampler.get_generator(logits.device)
-                if isinstance(group_key, tuple):
-                    assert isinstance(group_key[0], str)
-                else:
-                    assert isinstance(group_key, str)
-                nonlocal flashinfer_keys_seen
-                assert (group_key, return_probs) not in flashinfer_keys_seen
-                flashinfer_keys_seen.add((group_key, return_probs))
-                return sample_grouped_strategies_orig(
+        def _sample_grouped_strategies(
+            group_key: FlashInferGroupedStrategySampler.STRATEGY_KEY_TYPE,
+            strategies: list[Strategy],
+            logits: torch.Tensor,
+            *,
+            group_logit_indices: Optional[torch.Tensor] = None,
+            generator: Optional[torch.Generator] = None,
+            return_probs: bool,
+            group_metadata: StrategyMetadata | None = None,
+        ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor] | float]:
+            assert generator is sampler.get_generator(logits.device)
+            if isinstance(group_key, tuple):
+                assert isinstance(group_key[0], str)
+            else:
+                assert isinstance(group_key, str)
+            nonlocal flashinfer_keys_seen
+            assert (group_key, return_probs) not in flashinfer_keys_seen
+            flashinfer_keys_seen.add((group_key, return_probs))
+            result: tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor] | float] = (
+                sample_grouped_strategies_orig(
                     group_key,
                     strategies,
                     logits,
                     group_logit_indices=group_logit_indices,
                     generator=generator,
                     return_probs=return_probs,
+                    group_metadata=group_metadata,
                 )
+            )
+            return result
 
-            patch_ctx.setattr(
-                sampler._grouped_sampler_cls,
-                "sample_grouped_strategies",
-                _sample_grouped_strategies,
+        # _grouped_sampler_cls is a class; point the instance at a subclass
+        # that overrides the callable, rather than mutating the shared class.
+        instrumented_cls = type(
+            "InstrumentedFlashInferGroupedStrategySampler",
+            (FlashInferGroupedStrategySampler,),
+            {"sample_grouped_strategies": staticmethod(_sample_grouped_strategies)},
+        )
+        patch_ctx.setattr(sampler, "_grouped_sampler_cls", instrumented_cls)
+
+        sample_async_orig = sampler.sample_async
+
+        def _sample_async(
+            scheduled_requests: ScheduledRequests,
+            model_outputs: dict[str, torch.Tensor],
+            num_context_logits_prefix_sum: list[int],
+            resource_manager=None,
+        ):
+            nonlocal flashinfer_keys_seen
+            flashinfer_keys_seen.clear()
+            res = sample_async_orig(
+                scheduled_requests,
+                model_outputs,
+                num_context_logits_prefix_sum,
+                resource_manager,
             )
 
-            sample_async_orig = sampler.sample_async
+            # Fast greedy path bypasses flashinfer sampling, so flashinfer_keys_seen
+            # will be empty when all requests are greedy
+            all_greedy = all(
+                _request_strategy(req, vocab_size=2**31) == GREEDY
+                for req in scheduled_requests.all_requests()
+            )
+            assert flashinfer_keys_seen or all_greedy
+            return res
 
-            def _sample_async(
-                scheduled_requests: ScheduledRequests,
-                model_outputs: dict[str, torch.Tensor],
-                num_context_logits_prefix_sum: list[int],
-                resource_manager=None,
-            ):
-                nonlocal flashinfer_keys_seen
-                flashinfer_keys_seen.clear()
-                res = sample_async_orig(
-                    scheduled_requests,
-                    model_outputs,
-                    num_context_logits_prefix_sum,
-                    resource_manager,
-                )
-
-                # Fast greedy path bypasses flashinfer sampling, so flashinfer_keys_seen
-                # will be empty when all requests are greedy
-                all_greedy = all(
-                    _request_strategy(req, vocab_size=2**31) == GREEDY
-                    for req in scheduled_requests.all_requests()
-                )
-                assert flashinfer_keys_seen or all_greedy
-                return res
-
-            patch_ctx.setattr(sampler, "sample_async", _sample_async)
+        patch_ctx.setattr(sampler, "sample_async", _sample_async)
 
     @dataclass(frozen=True, kw_only=True)
     class _TorchUtilsSamplingParams:
@@ -1925,6 +1894,8 @@ class TestBatchedSampling:
             deterministic: bool,
             check_nan: bool,
             generator: torch.Generator,
+            seed: Optional[Union[int, torch.Tensor]] = None,
+            offset: Optional[Union[int, torch.Tensor]] = None,
         ) -> torch.Tensor:
             assert filter_apply_order == "top_k_first"
             assert deterministic
@@ -1991,6 +1962,8 @@ class TestBatchedSampling:
             deterministic: bool,
             check_nan: bool,
             generator: torch.Generator,
+            seed: Optional[Union[int, torch.Tensor]] = None,
+            offset: Optional[Union[int, torch.Tensor]] = None,
         ) -> torch.Tensor:
             assert deterministic
             assert not check_nan, "check_nan syncs"
@@ -2022,6 +1995,8 @@ class TestBatchedSampling:
             deterministic: bool,
             check_nan: bool,
             generator: torch.Generator,
+            seed: Optional[Union[int, torch.Tensor]] = None,
+            offset: Optional[Union[int, torch.Tensor]] = None,
         ) -> torch.Tensor:
             assert deterministic
             assert not check_nan, "check_nan syncs"
@@ -2052,6 +2027,8 @@ class TestBatchedSampling:
             deterministic: bool,
             check_nan: bool,
             generator: torch.Generator,
+            seed: Optional[Union[int, torch.Tensor]] = None,
+            offset: Optional[Union[int, torch.Tensor]] = None,
         ) -> torch.Tensor:
             assert deterministic
             assert not check_nan, "check_nan syncs"
@@ -2173,11 +2150,11 @@ class TestBatchedSampling:
             test_expected_counts != 0, 0, test_token_counts
         )
         assert (test_token_counts_for_zero_prob == 0).all()
-        test_expected_counts_ma = np.ma.masked_array(
+        test_expected_counts_ma = np.ma.MaskedArray(
             test_expected_counts.numpy(),
             mask=(test_expected_counts.numpy() == 0),
         )
-        test_token_counts_ma = np.ma.masked_array(
+        test_token_counts_ma = np.ma.MaskedArray(
             test_token_counts.numpy(),
             mask=test_expected_counts_ma.mask,
         )
@@ -2227,14 +2204,13 @@ class TestBatchedSampling:
             prob_delta = np.where(prob_delta > 5e-2, prob_delta, 0)  # NB: this is rather liberal
             # bound relative differences on remaining probs
             prob_delta_rel = (
-                np.ma.masked_array(num_samples * prob_delta, mask=test_expected_counts_ma.mask)
+                np.ma.MaskedArray(num_samples * prob_delta, mask=test_expected_counts_ma.mask)
                 / test_expected_counts_ma.data
             )
             assert prob_delta_rel.max() < 0.05
 
     @pytest.mark.parametrize(
         (
-            "use_flashinfer",
             "max_draft_len",
             "sampling_params_list",
             "allow_zero_draft_len",
@@ -2243,7 +2219,6 @@ class TestBatchedSampling:
         ),
         [
             pytest.param(
-                use_flashinfer,
                 max_draft_len,
                 sampling_params_list,
                 allow_zero_draft_len,
@@ -2254,21 +2229,19 @@ class TestBatchedSampling:
                 ),  # bypass_sampling
                 vocab_size,
                 id=(
-                    f"{'FlashInfer' if use_flashinfer else 'Torch'}"
+                    f"FlashInfer"
                     f"-draft_len={0 if allow_zero_draft_len else 1}..{max_draft_len}"
                     f"-{params_label}"
                 ),
             )
             # https://stackoverflow.com/a/75421799, does not work with nested loops
             for (
-                use_flashinfer,
                 is_mixed,
                 max_draft_len,
                 allow_zero_draft_len,
                 _build_test_cases,
                 vocab_size,
             ) in product(
-                [False, True],
                 [False, True],
                 [0, 3],
                 [False, True],
@@ -2294,7 +2267,6 @@ class TestBatchedSampling:
         sampling_params_list: list[SamplingParams],
         seq_slot_assignment: tuple[list[int], int],
         max_draft_len: int,
-        use_flashinfer: bool,
         allow_zero_draft_len: bool,  # used by fixtures
         bypass_sampling: bool,
         monkeypatch: pytest.MonkeyPatch,
@@ -2320,7 +2292,6 @@ class TestBatchedSampling:
             # model_outputs. These probs, the computation of which is validated by 'test_probs',
             # are used to validate the batched sampling process later in this test.
             mock_requests_with_probs = self._compute_probs(
-                use_flashinfer=use_flashinfer,
                 model_outputs=model_outputs,
                 sampling_params_list=sampling_params_list,
                 seq_slot_assignment=seq_slot_assignment,
@@ -2336,9 +2307,7 @@ class TestBatchedSampling:
             mock_sampling_log: Optional[list[TestBatchedSampling._MockSamplingLogEntry]] = None
 
             with monkeypatch.context() as patch_ctx:
-                self._inject_batching_check(
-                    patch_ctx, sampler=sampler, use_flashinfer=use_flashinfer
-                )
+                self._inject_batching_check(patch_ctx, sampler=sampler)
                 if bypass_sampling:
                     mock_sampling_log = self._instrument_sampling_backend(
                         patch_ctx, sampler=sampler
@@ -2500,7 +2469,6 @@ class TestBatchedSampling:
 
     @pytest.mark.parametrize(
         (
-            "use_flashinfer",
             "max_draft_len",
             "allow_zero_draft_len",
             "vocab_size",
@@ -2509,7 +2477,6 @@ class TestBatchedSampling:
         ),
         [
             pytest.param(
-                False,  # NB: _unbatch_sampling_results does not depend on backend
                 max_draft_len,
                 allow_zero_draft_len,
                 vocab_size,
@@ -2545,7 +2512,6 @@ class TestBatchedSampling:
         vocab_size: int,  # used by fixtures
         seq_slot_assignment: tuple[list[int], int],
         max_draft_len: int,
-        use_flashinfer: bool,  # used by fixtures
         allow_zero_draft_len: bool,  # used by fixtures
         ordered: bool,
     ):

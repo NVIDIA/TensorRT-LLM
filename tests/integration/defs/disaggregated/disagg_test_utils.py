@@ -136,7 +136,6 @@ def _run_worker(
             stderr = log_file
         if device != -1:
             env["CUDA_VISIBLE_DEVICES"] = str(device)
-        print(f"Running {role} on port {port}")
         return ProcessWrapper(
             subprocess.Popen(cmd, env=env, stdout=stdout, stderr=stderr),
             log_file=log_file,

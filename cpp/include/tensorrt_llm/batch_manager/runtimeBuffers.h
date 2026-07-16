@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2023-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -208,7 +208,9 @@ public:
         //! Temporarily store the transposed results of multiple fragment logits, [maxBeamWidth, kCACHE_LENGTH]
         TensorPtr transposedLogits;
 
-        //! Temporarily store logits buffer address during the transposing, [kCACHE_LENGTH]
+        //! Temporarily store logits buffer address during the transposing, [maxBatchSize, kCACHE_LENGTH]
+        //! One row per batch slot (same layout as fragmentPointerHost) so concurrent flushes for
+        //! different requests in the same batch never clobber each other's pointer arrays.
         TensorPtr fragmentPointerDevice;
 
         //! Temporarily store logits buffer address during the transposing, [maxBatchSize, kCACHE_LENGTH]
@@ -222,11 +224,14 @@ public:
             workIdx = (workIdx + 1) % (fragmentPointerHost->getShape().d[0]);
         }
 
-        [[nodiscard]] TensorPtr getFragmentPointerHost()
+        //! Returns matching host and device pointer rows for the current workIdx, then advances
+        //! workIdx.  Always call this instead of the individual getters to avoid ordering bugs.
+        [[nodiscard]] std::pair<TensorPtr, TensorPtr> getFragmentPointerSlot()
         {
-            TensorPtr slice = runtime::ITensor::slice(fragmentPointerHost, workIdx, 1);
+            TensorPtr host = runtime::ITensor::slice(fragmentPointerHost, workIdx, 1);
+            TensorPtr device = runtime::ITensor::slice(fragmentPointerDevice, workIdx, 1);
             cycleWorkIdx();
-            return slice;
+            return {std::move(host), std::move(device)};
         };
     };
 
