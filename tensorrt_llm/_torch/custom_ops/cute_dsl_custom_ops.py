@@ -3957,9 +3957,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
         active_clusters_cache = dict()
         _TILE_M = 256
         _CLUSTER_M = 2
-        _M_BUCKET = 64
-        _TILE_N_GRANULARITY = 16
-        _MAX_SWAPPED_TILE_N = 240
         _SCALE_BLOCK_K = 128
         _SCALES_PER_WORD = 4
         _PACKED_SCALE_K = _SCALE_BLOCK_K * _SCALES_PER_WORD
@@ -3985,67 +3982,55 @@ if IS_CUTLASS_DSL_AVAILABLE:
             self.use_tvm_ffi = use_tvm_ffi
 
         @classmethod
-        def _get_swapped_tile_n(cls, m: int, n: int,
-                                max_active_clusters: int) -> int:
-            bucket_m = pad_up(m, cls._M_BUCKET)
-            if bucket_m <= cls._TILE_M * cls._CLUSTER_M:
-                return pad_up(ceil_div(bucket_m, cls._CLUSTER_M),
-                              cls._TILE_N_GRANULARITY)
-
-            # Fill complete cluster waves within the tile-N cap.
-            clusters_per_n_tile = ceil_div(n, cls._TILE_M)
-            min_n_tiles = ceil_div(bucket_m, cls._MAX_SWAPPED_TILE_N)
-            waves = ceil_div(
-                min_n_tiles * clusters_per_n_tile,
-                max_active_clusters,
-            )
-            available_clusters = waves * max_active_clusters
-            n_tiles = max(
-                1,
-                available_clusters // clusters_per_n_tile,
-            )
-            return pad_up(ceil_div(bucket_m, n_tiles), cls._TILE_N_GRANULARITY)
-
-        @classmethod
-        def _get_no_swap_tile_n(cls, m: int, num_splits: int) -> Optional[int]:
-            if num_splits != 1:
-                return None
-            # Small-M no-swap cases avoid underfilled swapped tiles.
-            if (448 <= m <= cls._TILE_M * cls._CLUSTER_M
-                    and m % cls._M_BUCKET == 0):
-                return 208
-
-            # No-swap resonances repeat every seven M tiles from M=2304.
-            m_tiles = ceil_div(m, cls._TILE_M)
-            first_resonant_m_tiles = 9
-            resonance_period_m_tiles = 7
-            is_resonant = (m_tiles >= first_resonant_m_tiles
-                           and (m_tiles - first_resonant_m_tiles) %
-                           resonance_period_m_tiles == 0)
-            if m % cls._TILE_M == 0 and is_resonant:
-                return 224
-            return None
-
-        @classmethod
         def _get_tactic(cls, m: int, n: int, num_splits: int,
                         max_active_clusters: int):
-            if num_splits > 1 and m <= cls._M_BUCKET // 2:
-                # A 128x32 tile exposes more work at tiny M.
-                return ((cls._TILE_M // cls._CLUSTER_M,
-                         cls._M_BUCKET // cls._CLUSTER_M), (cls._CLUSTER_M, 1),
-                        True, None, True)
-            no_swap_tile_n = cls._get_no_swap_tile_n(m, num_splits)
-            if no_swap_tile_n is not None:
-                # Grouped L2 traversal regresses at the M=2304 resonance.
-                return ((cls._TILE_M, no_swap_tile_n), (cls._CLUSTER_M, 1),
-                        False, None, m != 2304)
+            del n, num_splits, max_active_clusters
+            # Keep the number of compiled kernels finite. Problem dimensions are
+            # runtime arguments, and the standard CUDA graph warmup sizes exercise
+            # every (split-K, tile) combination used below. Runtime request shapes
+            # therefore cannot trigger synchronous CuTe compilation.
+            # Split-1 tactics are warmed at M=192, 320, 384, and 448; the wider
+            # ranges reuse the best or near-best of those measured B200 tactics.
+            if m <= 32:
+                return ((128, 32), (cls._CLUSTER_M, 1), True, None, True)
+            if m <= 64:
+                return ((cls._TILE_M, 64), (cls._CLUSTER_M, 1), True, 8, True)
+            if m <= 128:
+                return ((cls._TILE_M, 128), (cls._CLUSTER_M, 1), True, None,
+                        True)
+            if m <= 256:
+                return ((cls._TILE_M, 144), (cls._CLUSTER_M, 1), True, None,
+                        True)
+            if m <= 352:
+                return ((cls._TILE_M, 160), (cls._CLUSTER_M, 1), True, None,
+                        True)
+            if m <= 416:
+                return ((cls._TILE_M, 192), (cls._CLUSTER_M, 1), True, None,
+                        True)
+            if m <= 512:
+                return ((cls._TILE_M, 208), (cls._CLUSTER_M, 1), False, None,
+                        True)
+            if m <= 704:
+                return ((cls._TILE_M, 144), (cls._CLUSTER_M, 1), True, None,
+                        True)
+            if m <= 896:
+                return ((cls._TILE_M, 160), (cls._CLUSTER_M, 1), True, None,
+                        True)
+            if m <= 1792:
+                return ((cls._TILE_M, 208), (cls._CLUSTER_M, 1), False, None,
+                        True)
+            return ((cls._TILE_M, 192), (cls._CLUSTER_M, 1), True, None, True)
 
-            tile_n = cls._get_swapped_tile_n(m, n, max_active_clusters)
-            if num_splits > 1 and m <= 2 * cls._M_BUCKET:
-                tile_n = cls._M_BUCKET if m <= cls._M_BUCKET else 2 * cls._M_BUCKET
-            max_ab_stages = 8 if m <= cls._M_BUCKET else None
-            return ((cls._TILE_M, tile_n), (cls._CLUSTER_M, 1), True,
-                    max_ab_stages, True)
+        @staticmethod
+        def _get_compile_key(k: int, num_splits: int, mma_tiler_mn: tuple,
+                             cluster_shape_mn: tuple, swap_ab: bool,
+                             max_ab_stages: Optional[int], l2_swizzle: bool,
+                             use_tvm_ffi: bool) -> tuple:
+            # Exact problem dimensions and scale strides are runtime arguments.
+            # Do not add them here: doing so causes multi-second synchronous JIT
+            # compilation on previously unseen request token counts.
+            return (k, num_splits, mma_tiler_mn, cluster_shape_mn, swap_ab,
+                    max_ab_stages, l2_swizzle, use_tvm_ffi)
 
         def forward(self, inputs: List[torch.Tensor], num_splits: int) -> None:
             a_tensor, a_sf_tensor, b_tensor, b_sf_tensor, partials = inputs
@@ -4073,23 +4058,18 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 kernel_m, kernel_n = m, n
                 kernel_a, kernel_b = a_tensor, b_tensor
                 kernel_sfa, kernel_sfb = a_sf_tensor, b_sf_tensor
-            ctas_per_mma = 2 if mma_tiler_mn[0] == 256 else 1
-            cta_tile_m = mma_tiler_mn[0] // ctas_per_mma
-            cluster_tile_m = cta_tile_m * cluster_shape_mn[0]
-            cluster_tile_n = mma_tiler_mn[1] * cluster_shape_mn[1]
-            work_clusters = (ceil_div(kernel_m, cluster_tile_m) *
-                             ceil_div(kernel_n, cluster_tile_n))
-            # TMA hides scale latency when all work fits one cluster wave.
-            tma_packed_scales = (m >= 512
-                                 and work_clusters <= max_active_clusters)
             kernel_sfa_stride = kernel_sfa.stride(1)
             kernel_sfb_stride = kernel_sfb.stride(1)
-            # Tail tiles require a runtime MMA-N descriptor.
-            dynamic_mma_n = kernel_n % mma_tiler_mn[1] != 0
-            cache_key = (kernel_m, kernel_n, k, num_splits, kernel_sfa_stride,
-                         kernel_sfb_stride, mma_tiler_mn, cluster_shape_mn,
-                         swap_ab, dynamic_mma_n, max_ab_stages, l2_swizzle,
-                         tma_packed_scales, self.use_tvm_ffi)
+            cache_key = self._get_compile_key(
+                k,
+                num_splits,
+                mma_tiler_mn,
+                cluster_shape_mn,
+                swap_ab,
+                max_ab_stages,
+                l2_swizzle,
+                self.use_tvm_ffi,
+            )
 
             a_ptr = make_ptr(
                 cutlass.Float8E4M3FN,
@@ -4135,8 +4115,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     cluster_shape_mn,
                     False,
                     packed_k128_scales=True,
-                    tma_packed_scales=tma_packed_scales,
-                    dynamic_mma_n=dynamic_mma_n,
+                    tma_packed_scales=False,
+                    dynamic_mma_n=True,
                     apply_alpha=False,
                     max_ab_stages=max_ab_stages,
                     l2_swizzle=l2_swizzle,
@@ -4169,6 +4149,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
             if self.use_tvm_ffi:
                 compiled_gemm(
+                    kernel_m,
+                    kernel_n,
+                    kernel_sfa_stride,
+                    kernel_sfb_stride,
                     kernel_a.data_ptr(),
                     kernel_b.data_ptr(),
                     kernel_sfa.data_ptr(),
@@ -4178,6 +4162,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 )
             else:
                 compiled_gemm(
+                    kernel_m,
+                    kernel_n,
+                    kernel_sfa_stride,
+                    kernel_sfb_stride,
                     a_ptr,
                     b_ptr,
                     a_sf_ptr,

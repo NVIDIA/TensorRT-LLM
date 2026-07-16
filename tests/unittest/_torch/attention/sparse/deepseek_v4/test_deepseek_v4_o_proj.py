@@ -89,17 +89,20 @@ def test_dsv4_fmha_epilogue_output_uses_fused_oproj() -> None:
         (64, 2, ((256, 64), (2, 1), True, 8, True)),
         (96, 2, ((256, 128), (2, 1), True, None, True)),
         (128, 2, ((256, 128), (2, 1), True, None, True)),
-        (256, 1, ((256, 128), (2, 1), True, None, True)),
+        (192, 1, ((256, 144), (2, 1), True, None, True)),
+        (256, 1, ((256, 144), (2, 1), True, None, True)),
+        (320, 1, ((256, 160), (2, 1), True, None, True)),
+        (384, 1, ((256, 192), (2, 1), True, None, True)),
         (448, 1, ((256, 208), (2, 1), False, None, True)),
         (512, 1, ((256, 208), (2, 1), False, None, True)),
         (704, 1, ((256, 144), (2, 1), True, None, True)),
-        (2240, 1, ((256, 224), (2, 1), True, None, True)),
-        (2304, 1, ((256, 224), (2, 1), False, None, False)),
-        (3776, 1, ((256, 224), (2, 1), True, None, True)),
-        (4096, 1, ((256, 224), (2, 1), False, None, True)),
-        (5888, 1, ((256, 224), (2, 1), False, None, True)),
-        (9472, 1, ((256, 224), (2, 1), False, None, True)),
-        (16384, 1, ((256, 240), (2, 1), True, None, True)),
+        (768, 1, ((256, 160), (2, 1), True, None, True)),
+        (1024, 1, ((256, 208), (2, 1), False, None, True)),
+        (1792, 1, ((256, 208), (2, 1), False, None, True)),
+        (1793, 1, ((256, 192), (2, 1), True, None, True)),
+        (2240, 1, ((256, 192), (2, 1), True, None, True)),
+        (4096, 1, ((256, 192), (2, 1), True, None, True)),
+        (16384, 1, ((256, 192), (2, 1), True, None, True)),
     ],
 )
 def test_dsv4_ob_cute_tactic(
@@ -109,6 +112,45 @@ def test_dsv4_ob_cute_tactic(
 ) -> None:
     runner = cute_dsl_custom_ops.CuteDSLFp8SplitKGemmRunner
     assert runner._get_tactic(num_tokens, 7168, num_splits, 74) == expected
+
+
+def test_dsv4_ob_cute_compile_key_excludes_runtime_shapes() -> None:
+    runner = cute_dsl_custom_ops.CuteDSLFp8SplitKGemmRunner
+    warm_keys = set()
+    for num_tokens, num_splits in (
+        (1, 4),
+        (32, 2),
+        (64, 2),
+        (128, 2),
+        (192, 1),
+        (320, 1),
+        (384, 1),
+        (448, 1),
+    ):
+        tactic = runner._get_tactic(num_tokens, 7168, num_splits, 74)
+        warm_keys.add(runner._get_compile_key(16384, num_splits, *tactic, True))
+
+    runtime_keys = set()
+    for num_tokens, num_splits in (
+        (3, 4),
+        (17, 4),
+        (37, 2),
+        (73, 2),
+        (129, 1),
+        (193, 1),
+        (511, 1),
+        (704, 1),
+        (768, 1),
+        (1025, 1),
+        (1793, 1),
+        (4097, 1),
+        (16383, 1),
+    ):
+        tactic = runner._get_tactic(num_tokens, 7168, num_splits, 74)
+        runtime_keys.add(runner._get_compile_key(16384, num_splits, *tactic, True))
+
+    assert len(warm_keys) == 8
+    assert runtime_keys <= warm_keys
 
 
 def _check_dsv4_oa_fp8out_tensor_contract() -> None:
@@ -323,6 +365,66 @@ def test_dsv4_pro_fp8_splitk_gemm_partials(
     torch.testing.assert_close(
         partials.float(), torch.full_like(partials, expected_partial, dtype=torch.float32)
     )
+
+
+@skip_pre_blackwell
+def test_dsv4_pro_fp8_splitk_gemm_reuses_kernels_and_captures_cuda_graph(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if get_sm_version() // 10 != 10:
+        pytest.skip("dsv4_fp8_splitk_gemm requires the SM100 family")
+
+    n, k = 7168, 16384
+    packed_k = k // 512
+    b = torch.full((n, k), 0.03125, device="cuda", dtype=torch.float8_e4m3fn)
+    sfb_storage = torch.full((n * packed_k,), 0x7F7F7F7F, device="cuda", dtype=torch.int32)
+    sfb = torch.as_strided(sfb_storage, (n, packed_k), (1, n))
+    runner = cute_dsl_custom_ops.CuteDSLFp8SplitKGemmRunner
+    monkeypatch.delenv("TRTLLM_DSV4_OB_SPLIT_K", raising=False)
+    monkeypatch.setattr(runner, "kernel_cache", {})
+
+    def run(num_tokens: int) -> torch.Tensor:
+        aligned_m = (num_tokens + 3) // 4 * 4
+        a = torch.full((num_tokens, k), 0.03125, device="cuda", dtype=torch.float8_e4m3fn)
+        sfa_storage = torch.full(
+            (aligned_m * packed_k,), 0x7F7F7F7F, device="cuda", dtype=torch.int32
+        )
+        sfa = torch.as_strided(sfa_storage, (num_tokens, packed_k), (1, aligned_m))
+        return torch.ops.trtllm.dsv4_fp8_splitk_gemm(a, sfa, b, sfb)
+
+    # These are present in the default CUDA graph warmup list and cover every
+    # compile-time (split-K, tile) combination used by the standard path.
+    for num_tokens in (1, 32, 64, 128, 192, 256, 320, 384, 448, 512, 768, 1024):
+        run(num_tokens)
+    assert len(runner.kernel_cache) == 8
+
+    # Irregular context and generation token counts must reuse those kernels.
+    for num_tokens in (3, 17, 37, 73, 129, 193, 511, 704, 769, 1025, 1793, 4097):
+        output = run(num_tokens)
+        num_splits = runner._select_num_splits(num_tokens)
+        expected_partial = (k // num_splits) * 0.03125 * 0.03125
+        torch.testing.assert_close(
+            output[0, 0].float(), torch.tensor(expected_partial, device="cuda")
+        )
+    assert len(runner.kernel_cache) == 8
+
+    # Capture an irregular shape after warmup and verify replay does not compile.
+    num_tokens = 37
+    aligned_m = (num_tokens + 3) // 4 * 4
+    a = torch.full((num_tokens, k), 0.03125, device="cuda", dtype=torch.float8_e4m3fn)
+    sfa_storage = torch.full((aligned_m * packed_k,), 0x7F7F7F7F, device="cuda", dtype=torch.int32)
+    sfa = torch.as_strided(sfa_storage, (num_tokens, packed_k), (1, aligned_m))
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_output = torch.ops.trtllm.dsv4_fp8_splitk_gemm(a, sfa, b, sfb)
+    graph.replay()
+    torch.cuda.synchronize()
+    expected_partial = (k // 2) * 0.03125 * 0.03125
+    torch.testing.assert_close(
+        graph_output[0, 0].float(), torch.tensor(expected_partial, device="cuda")
+    )
+    assert len(runner.kernel_cache) == 8
 
 
 @skip_pre_blackwell

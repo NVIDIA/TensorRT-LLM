@@ -408,12 +408,12 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
     @cute.jit(preprocess=True)
     def wrapper_dsv4_splitk_packed_ue8m0(
         self,
-        m: cutlass.Constexpr,
-        n: cutlass.Constexpr,
+        m: cutlass.Int32,
+        n: cutlass.Int32,
         k: cutlass.Constexpr,
         num_splits: cutlass.Constexpr,
-        sfa_k_stride: cutlass.Constexpr,
-        sfb_k_stride: cutlass.Constexpr,
+        sfa_k_stride: cutlass.Int32,
+        sfb_k_stride: cutlass.Int32,
         a_ptr: cute.Pointer,
         b_ptr: cute.Pointer,
         sfa_ptr: cute.Pointer,
