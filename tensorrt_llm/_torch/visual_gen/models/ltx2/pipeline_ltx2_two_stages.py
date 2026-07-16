@@ -934,6 +934,8 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
              then decode.
     """
 
+    SUPPORTED_CACHE_BACKENDS = ("teacache",)
+
     @property
     def common_warmup_shapes(self) -> list:
         return [(512, 768, 121)]

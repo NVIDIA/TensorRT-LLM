@@ -62,6 +62,8 @@ class _PipelineConfigShim:
 class _PipelineTeacacheTestDouble:
     """Minimal object for BasePipeline._setup_cache_acceleration / _apply_teacache_coefficients tests."""
 
+    SUPPORTED_CACHE_BACKENDS = ("teacache", "cache_dit")
+
     def __init__(self, model_config: DiffusionModelConfig):
         self.model_config = model_config
         self.cache_accelerator = None

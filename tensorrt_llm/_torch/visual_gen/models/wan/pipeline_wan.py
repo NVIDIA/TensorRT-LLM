@@ -112,6 +112,8 @@ WAN_DEFAULT_NEGATIVE_PROMPT = (
     doc="Wan 2.1 & 2.2 text-to-video family.",
 )
 class WanPipeline(BasePipeline):
+    SUPPORTED_CACHE_BACKENDS = ("teacache", "cache_dit")
+
     def __init__(self, pipeline_config):
         # Wan2.2 A14B two-stage denoising parameters
         self.transformer_2 = None

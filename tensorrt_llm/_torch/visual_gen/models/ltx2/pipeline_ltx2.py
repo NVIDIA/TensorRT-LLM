@@ -620,6 +620,8 @@ class LTX2Pipeline(BasePipeline):
     ``transformers`` library.
     """
 
+    SUPPORTED_CACHE_BACKENDS = ("teacache", "cache_dit")
+
     def __init__(self, model_config):
         _sa_cfg = model_config.attention.sparse_attention_config
         if _sa_cfg is not None and getattr(_sa_cfg, "algorithm", None) == "vsa":

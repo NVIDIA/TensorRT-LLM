@@ -105,6 +105,8 @@ class Flux2Pipeline(BasePipeline):
     Follows WAN pipeline pattern for DiffusionModelLoader integration.
     """
 
+    SUPPORTED_CACHE_BACKENDS = ("teacache", "cache_dit")
+
     # Hidden state layers per text encoder type (auto-detected at load time)
     _TEXT_ENCODER_CONFIG = {
         "Mistral3ForConditionalGeneration": {

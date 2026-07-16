@@ -50,6 +50,8 @@ class FluxPipeline(BasePipeline):
     Supports FLUX.1-dev (50 steps, guidance) and FLUX.1-schnell (4 steps, no guidance).
     """
 
+    SUPPORTED_CACHE_BACKENDS = ("teacache", "cache_dit")
+
     def __init__(self, pipeline_config):
         if (
             pipeline_config.visual_gen_mapping is not None

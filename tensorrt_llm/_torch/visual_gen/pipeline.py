@@ -106,6 +106,13 @@ class BasePipeline(nn.Module):
     Base class for diffusion pipelines.
     """
 
+    # Cache-acceleration backends this pipeline supports. PipelineLoader calls
+    # _setup_cache_acceleration() on every pipeline after torch.compile;
+    # pipelines that don't opt in here skip enablement with a warning instead
+    # of failing at enable time (e.g. no Cache-DiT enabler / TeaCache extractor
+    # registered for their transformer).
+    SUPPORTED_CACHE_BACKENDS: Tuple[str, ...] = ()
+
     @classmethod
     def resolve_variant(cls, config: "DiffusionPipelineConfig") -> Type["BasePipeline"]:
         """Return *cls* or a more specialized subclass based on *config*.
@@ -496,14 +503,25 @@ class BasePipeline(nn.Module):
 
         cfg = self.pipeline_config
 
-        if cfg.cache_backend == "cache_dit":
+        backend = cfg.cache_backend
+        if backend is None:
+            return
+
+        if backend not in self.SUPPORTED_CACHE_BACKENDS:
+            logger.warning(
+                f"cache_backend={backend!r} is configured but {self.__class__.__name__} "
+                f"does not support it (supported: {list(self.SUPPORTED_CACHE_BACKENDS)}); "
+                "continuing without cache acceleration."
+            )
+            return
+
+        if backend == "cache_dit":
             acc = CacheDiTAccelerator(self, cfg.cache_dit)
             acc.wrap()
             self.cache_accelerator = acc
             return
 
-        use_teacache = cfg.cache_backend == "teacache"
-        if not use_teacache:
+        if backend != "teacache":
             return
 
         acc = TeaCacheAccelerator(self, cfg.teacache)
