@@ -387,43 +387,58 @@ def test_layer_group_meta_serialization():
 
 
 def _make_fake_v2_manager(attrs, role_mapper_kinds, *, num_pools=1, slot_bytes_list=(640,)):
-    """Build a minimal duck-typed KVCacheManagerV2 for _build_page_table_v2."""
-    from types import SimpleNamespace
+    """Build a minimal duck-typed KVCacheManagerV2 for _build_page_table_v2.
 
-    from tensorrt_llm.runtime.kv_cache_manager_v2 import CacheTier
+    ``attrs`` keeps the storage-layer shape ``{(layer_id, role):
+    (life_cycle_id, pool_index, offset, size)}``; the fake synthesizes the
+    public ``pool_group_descs`` view from it. Buffer order within a
+    coalesced buffer follows ascending offset, mirroring how the real
+    storage config assigns offsets in ``buffer_ids`` order.
+    """
+    from types import SimpleNamespace
 
     base = 0x1000
 
-    def _make_pool(slot_bytes):
-        return SimpleNamespace(
-            slot_size=slot_bytes,
-            num_slots=4,
-            slot_address=lambda slot, _sb=slot_bytes: base + slot * _sb,
+    per_pool: dict[int, list] = {}
+    for (layer_id, role), attr in attrs.items():
+        per_pool.setdefault(int(attr.pool_index), []).append(
+            (int(attr.offset), layer_id, role, int(attr.size))
         )
+
+    coalesced_buffers = []
+    for pool_idx in range(num_pools):
+        buffers = sorted(per_pool.get(pool_idx, []))
+        sizes = {size for _, _, _, size in buffers}
+        assert len(sizes) == 1, "buffers in a coalesced buffer are uniform-size by construction"
+        coalesced_buffers.append(
+            SimpleNamespace(
+                single_buffer_size=sizes.pop(),
+                buffer_ids=[
+                    SimpleNamespace(layer_id=layer_id, role=role)
+                    for _, layer_id, role, _ in buffers
+                ],
+            )
+        )
+
+    pg_desc = SimpleNamespace(
+        pool_group_index=0,
+        num_slots=4,
+        pools=[
+            SimpleNamespace(pool_index=pi, base_address=base, slot_bytes=sb)
+            for pi, sb in enumerate(slot_bytes_list)
+        ],
+        slot_desc=SimpleNamespace(
+            variants=[SimpleNamespace(layer_group_id=0, coalesced_buffers=coalesced_buffers)]
+        ),
+    )
 
     impl = SimpleNamespace(
         layer_grouping=((0, 1),),
-        _life_cycles=[SimpleNamespace(window_size=None)],
-        _init_config=SimpleNamespace(
-            cache_tiers=[SimpleNamespace(tier=CacheTier.GPU_MEM)], tokens_per_block=16
+        init_config=SimpleNamespace(
+            tokens_per_block=16,
+            layers=[SimpleNamespace(window_size=None), SimpleNamespace(window_size=None)],
         ),
-        _storage=SimpleNamespace(
-            _buffer_attr=attrs,
-            num_life_cycles=1,
-            get_pool_group_index=lambda _lc: 0,
-            _levels=[
-                SimpleNamespace(
-                    storage=SimpleNamespace(
-                        _pool_groups=[
-                            SimpleNamespace(
-                                num_pools=num_pools,
-                                _pools=[_make_pool(sb) for sb in slot_bytes_list],
-                            )
-                        ]
-                    )
-                )
-            ],
-        ),
+        pool_group_descs=[pg_desc],
     )
     return SimpleNamespace(
         impl=impl,
