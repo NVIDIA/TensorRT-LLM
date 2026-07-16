@@ -57,6 +57,7 @@ class Attention(nn.Module):
         module_name: Optional[str] = None,
         enable_sequence_parallel: bool = True,
         async_ulysses: bool = False,
+        separate_qkv_is_self_attention: bool = False,
     ):
         super().__init__()
 
@@ -194,14 +195,18 @@ class Attention(nn.Module):
         )
 
         # Ulysses auto-wrap normally skips SEPARATE_QKV (cross-attention).
-        # The async-ulysses path uses SEPARATE_QKV for stream-pipelined
-        # V/Q/K projections AND still needs the head-sharding wrap — opt in
-        # via async_ulysses=True.
+        # Separately projected self-attention and the async-ulysses path still
+        # need the head-sharding wrap and opt in explicitly.
         cp_size = vgm.cp_size if vgm else 1
         use_ulysses = (
             ulysses_size > 1
             and enable_sequence_parallel
-            and (self.qkv_mode != QKVMode.SEPARATE_QKV or async_ulysses or cp_size == 1)
+            and (
+                self.qkv_mode != QKVMode.SEPARATE_QKV
+                or separate_qkv_is_self_attention
+                or async_ulysses
+                or cp_size == 1
+            )
         )
         if ulysses_size > 1 and enable_sequence_parallel and not use_ulysses:
             # Ulysses was requested (ulysses_size > 1, SP on) but disabled: this is a
@@ -248,7 +253,12 @@ class Attention(nn.Module):
             sparse_params=sparse_params,
         )
 
-        if enable_sequence_parallel and self.qkv_mode == QKVMode.SEPARATE_QKV and vgm is not None:
+        if (
+            enable_sequence_parallel
+            and self.qkv_mode == QKVMode.SEPARATE_QKV
+            and not separate_qkv_is_self_attention
+            and vgm is not None
+        ):
             ring_size = vgm.ring_size
             if ring_size > 1:
                 raise ValueError(

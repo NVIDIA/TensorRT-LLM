@@ -495,6 +495,7 @@ class QwenJointAttention(Attention):
         module_name: Optional[str] = None,
     ):
         config = config or DiffusionModelConfig()
+        dtype = dtype or config.torch_dtype
         super().__init__(
             hidden_size=dim,
             num_attention_heads=num_attention_heads,
@@ -508,6 +509,7 @@ class QwenJointAttention(Attention):
             config=config,
             layer_idx=layer_idx,
             module_name=module_name,
+            separate_qkv_is_self_attention=True,
         )
         self.head_dim = attention_head_dim
         self._supports_key_padding_mask = _supports_qwen_key_padding_mask(

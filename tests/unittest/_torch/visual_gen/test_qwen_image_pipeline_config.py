@@ -15,6 +15,7 @@ from tensorrt_llm._torch.utils import gelu_tanh
 
 # Importing the models package applies the Qwen-Image registration side effect.
 from tensorrt_llm._torch.visual_gen import models  # noqa: F401
+from tensorrt_llm._torch.visual_gen import modules as visual_gen_modules
 from tensorrt_llm._torch.visual_gen.attention_backend.parallel import (
     Attention2DAttention,
     RingAttention,
@@ -213,31 +214,42 @@ def test_qwen_pipeline_quant_config_parses_from_args(
 
 
 @pytest.mark.parametrize(
-    ("visual_gen_mapping", "not_wrapped_as"),
+    ("visual_gen_mapping", "expected_use_ulysses"),
     [
         pytest.param(
             SimpleNamespace(
-                attn2d_row_size=2,
-                attn2d_col_size=2,
+                cp_size=2,
                 ring_size=1,
-                ulysses_size=1,
+                ulysses_size=2,
             ),
-            "Attention2DAttention",
-            id="attention2d",
+            True,
+            id="hybrid-context-parallel-ulysses",
         ),
         pytest.param(
             SimpleNamespace(
-                attn2d_row_size=1,
-                attn2d_col_size=1,
+                cp_size=2,
                 ring_size=2,
                 ulysses_size=1,
             ),
-            "RingAttention",
+            False,
             id="ring",
         ),
     ],
 )
-def test_qwen_joint_attention_keeps_separate_qkv_path_unwrapped(visual_gen_mapping, not_wrapped_as):
+def test_qwen_joint_attention_wraps_separate_qkv_self_attention(
+    monkeypatch, visual_gen_mapping, expected_use_ulysses
+):
+    captured = {}
+
+    def capture_parallel_attention(attn, **kwargs):
+        captured.update(kwargs)
+        return attn
+
+    monkeypatch.setattr(
+        visual_gen_modules.attention,
+        "wrap_parallel_attention",
+        capture_parallel_attention,
+    )
     config = DiffusionModelConfig(
         attention=AttentionConfig(backend="VANILLA"),
         visual_gen_mapping=visual_gen_mapping,
@@ -251,7 +263,8 @@ def test_qwen_joint_attention_keeps_separate_qkv_path_unwrapped(visual_gen_mappi
     )
 
     assert attention.qkv_mode == QKVMode.SEPARATE_QKV
-    assert attention.attn.__class__.__name__ != not_wrapped_as
+    assert captured["enable_sequence_parallel"]
+    assert captured["use_ulysses"] is expected_use_ulysses
 
 
 class _FakeTokenBatch:
@@ -295,7 +308,12 @@ class _FakeTextEncoder:
     ],
 )
 def test_qwen_encode_prompt_returns_none_for_all_valid_masks(attention_mask, expect_none):
-    pipeline = QwenImagePipeline(SimpleNamespace(torch_dtype=torch.float32))
+    pipeline_config = DiffusionPipelineConfig(
+        model_configs={
+            "transformer": DiffusionModelConfig(pretrained_config=SimpleNamespace()),
+        }
+    )
+    pipeline = QwenImagePipeline(pipeline_config)
     pipeline.tokenizer = _FakeTokenizer(attention_mask)
     pipeline.text_encoder = _FakeTextEncoder()
 
@@ -329,8 +347,8 @@ def test_qwen_joint_attention_passes_padding_mask_to_backend(monkeypatch):
 
     monkeypatch.setattr(attention, "_attn_impl", fake_attn_impl)
 
-    hidden_states = torch.randn(1, 4, 16)
-    encoder_hidden_states = torch.randn(1, 3, 16)
+    hidden_states = torch.randn(1, 4, 16, dtype=torch.bfloat16)
+    encoder_hidden_states = torch.randn(1, 3, 16, dtype=torch.bfloat16)
     attention_mask = torch.tensor([[True, False, True, True, True, True, True]])
 
     attention(
@@ -382,8 +400,8 @@ def test_qwen_joint_attention_tp2_shards_both_streams():
     )
 
     joint_q, joint_k, joint_v = attention._prepare_qkv_unfused(
-        hidden_states=torch.randn(1, 4, 16),
-        encoder_hidden_states=torch.randn(1, 3, 16),
+        hidden_states=torch.randn(1, 4, 16, dtype=torch.bfloat16),
+        encoder_hidden_states=torch.randn(1, 3, 16, dtype=torch.bfloat16),
         image_rotary_emb=None,
     )
 
@@ -432,8 +450,8 @@ def test_qwen_joint_attention_fused_rope_passes_2d_freqs_to_kernel(monkeypatch):
 
     monkeypatch.setattr(attention, "apply_packed_qk_norm_rope", fake_apply_packed_qk_norm_rope)
 
-    hidden_states = torch.randn(batch_size, img_seq, 16)
-    encoder_hidden_states = torch.randn(batch_size, txt_seq, 16)
+    hidden_states = torch.randn(batch_size, img_seq, 16, dtype=torch.bfloat16)
+    encoder_hidden_states = torch.randn(batch_size, txt_seq, 16, dtype=torch.bfloat16)
     img_phases = torch.randn(img_seq, head_dim // 2)
     txt_phases = torch.randn(txt_seq, head_dim // 2)
     image_rotary_emb = (
@@ -460,8 +478,8 @@ def test_qwen_joint_attention_reuses_precomputed_fused_rope(monkeypatch):
         attention_head_dim=8,
         config=DiffusionModelConfig(),
     )
-    hidden_states = torch.randn(2, 7, 16)
-    encoder_hidden_states = torch.randn(2, 5, 16)
+    hidden_states = torch.randn(2, 7, 16, dtype=torch.bfloat16)
+    encoder_hidden_states = torch.randn(2, 5, 16, dtype=torch.bfloat16)
     image_rotary_emb = (
         torch.polar(torch.ones(7, 4), torch.randn(7, 4)),
         torch.polar(torch.ones(5, 4), torch.randn(5, 4)),
