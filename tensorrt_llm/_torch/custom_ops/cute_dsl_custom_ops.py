@@ -6533,6 +6533,26 @@ if IS_CUTLASS_DSL_AVAILABLE:
         indices = input_values.new_empty((num_rows, top_k), dtype=torch.int32)
         return indices
 
+    def _radix_select_preferred(dtype, num_tokens: int, num_rows: int) -> bool:
+        """radix-SELECT SP beats radix-FILTER at small N: select loads the whole
+        chunk into SMEM and radix-selects in place, which is leaner than filter's
+        histogram + refine when the chunk fits SMEM and the fixed overhead is not
+        amortized over few elements. SMEM-capacity driven, so distribution-robust.
+        fp32 (4B) fills SMEM at half the N and its 4 refine rounds favor filter ->
+        always filter. Tuned on a B200 randn sweep (filter-vs-select, best-vs-best
+        + tuned): bf16 wins up to ~32%, fp16 up to ~12%.
+
+        bf16 N=32768 is batch-split: select wins only at large batch (grid
+        pressure forces both to single-CTA, where select single beats filter
+        single); at small batch filter's cluster is better, so keep filter.
+        """
+        if dtype == torch.bfloat16:
+            return num_tokens <= 16384 or (num_tokens == 32768
+                                           and num_rows >= 74)
+        if dtype == torch.float16:
+            return num_tokens <= 16384
+        return False
+
     @torch.library.custom_op("trtllm::cute_dsl_indexer_topk_decode",
                              mutates_args=("output_indices", ),
                              device_types="cuda")
@@ -6600,11 +6620,29 @@ if IS_CUTLASS_DSL_AVAILABLE:
         num_tokens = input_values.shape[1]
 
         if radix_filter_single_pass_multi_cta:
+            _R = CuteDSLTopKDecodeRadixFilterSPMultiCTARunner
+            _is_fp32 = input_values.dtype == torch.float32
+            # At small N (bf16 <= 32K, fp16 <= 16K) radix-SELECT SP beats
+            # radix-FILTER; route there. The select cluster runner auto-picks
+            # ctas (=1 => select single-CTA for small batch, else cluster), so
+            # this covers both. Falls through to filter only if select can't
+            # fit the problem (capacity -> None), which small N never hits.
+            if _radix_select_preferred(input_values.dtype, num_tokens,
+                                       num_rows):
+                _sel = CuteDSLTopKDecodeSinglePassMultiCTAClusterRunner.forward(
+                    input_values=input_values,
+                    seq_lens=seq_lens,
+                    top_k=top_k,
+                    next_n=next_n,
+                    return_val=False,
+                    num_copy_bits=num_copy_bits,
+                    output_indices=output_indices,
+                )
+                if _sel[0] is not None:
+                    return
             # radix-FILTER single-CTA vs SP multi-CTA (cluster DSMEM). Heuristic
             # is overflow-policy-coupled: REREAD has a large_occupancy re-scan
             # cliff, cliff-free policies don't -> pick the matching tune.
-            _R = CuteDSLTopKDecodeRadixFilterSPMultiCTARunner
-            _is_fp32 = input_values.dtype == torch.float32
             if overflow_policy == "REREAD":
                 cluster_size = _R.auto_cluster_size(num_tokens, num_rows,
                                                     _is_fp32)
