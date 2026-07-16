@@ -64,7 +64,7 @@ def get_moe_cls(
         quant_config = override_quant_config
     layer_prefix = f"[layer_idx={layer_idx}] " if layer_idx is not None else ""
     if moe_backend.upper() == "MARLIN":
-        # Marlin MoE is a Hopper-specific NVFP4 W4A16 backend. Layers without
+        # Marlin MoE is an Ada/Hopper NVFP4 W4A16 backend. Layers without
         # NVFP4 quantization (e.g. deliberately-unquantized MTP draft layers in
         # MIXED_PRECISION checkpoints) fall back to CutlassFusedMoE, matching
         # the CUTEDSL / DENSEGEMM / MEGAMOE_* fallback behavior below.

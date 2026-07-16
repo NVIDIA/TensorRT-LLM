@@ -8,7 +8,8 @@ import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 from tensorrt_llm._torch.autotuner import autotune
 from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from tensorrt_llm._torch.modules.linear import Linear
-from tensorrt_llm._torch.utils import model_extra_attrs
+from tensorrt_llm._torch.utils import (is_nvfp4_marlin_supported_sm,
+                                       model_extra_attrs)
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.math_utils import pad_up
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
@@ -751,8 +752,8 @@ def test_fp4_linear_cuda_core(dtype, mnk):
 
 
 @pytest.mark.skipif(
-    get_sm_version() < 90 or get_sm_version() >= 100,
-    reason="Marlin NVFP4 backend runs Hopper",
+    not is_nvfp4_marlin_supported_sm(),
+    reason="Marlin NVFP4 backend runs on Ada (SM89) and Hopper (SM90-99)",
 )
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize(

@@ -82,8 +82,8 @@ if(FAST_BUILD)
     STATUS "FAST_BUILD enabled for kernels: using -O1 for CUDA compilation")
 endif()
 
-# Marlin NVFP4: Hopper-only OBJECT library. Pinned to sm_90 so the global
-# CMAKE_CUDA_ARCHITECTURES doesn't propagate.
+# Marlin NVFP4: Ada (SM89, e.g. L40S) and Hopper (SM90) OBJECT library.
+# Pinned to sm_89/sm_90 so the global CMAKE_CUDA_ARCHITECTURES doesn't propagate.
 file(GLOB_RECURSE MARLIN_SRC "marlin/*.cu" "marlin/*.cpp")
 if(MARLIN_SRC)
   add_library(marlin_src OBJECT ${MARLIN_SRC})
@@ -95,7 +95,7 @@ if(MARLIN_SRC)
       $<TARGET_PROPERTY:${INTERNAL_CUTLASS_KERNELS_TARGET},INTERFACE_INCLUDE_DIRECTORIES>
   )
   target_link_libraries(marlin_src PRIVATE trtllm_gen_fmha_interface)
-  set_cuda_architectures(marlin_src 90)
+  set_cuda_architectures(marlin_src 89 90)
 endif()
 
 add_library(
