@@ -635,25 +635,31 @@ class Qwen3_5MoeMLP(nn.Module):
         self.act_fn = ACT2FN[config.hidden_act]
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Intentionally left untagged: with no ``layer_type`` it defaults to "unknown",
-        # which the ``shard_layers`` inclusion whitelist excludes -> kept replicated.
+        # Tagged ``layer_type="mlp"`` so the shared expert is TP-sharded like the
+        # routed experts (colwise gate/up + rowwise down). Its rowwise down_proj
+        # therefore emits a per-rank partial that is summed with the routed
+        # partial and lifted to full by the single merge-point all_reduce in
+        # ``Qwen3_5MoeSparseMoeBlock.forward``.
         gate = torch.ops.auto_deploy.torch_linear_simple(
             x,
             self.gate_proj.weight,
             self.gate_proj.bias,
             tp_mode="colwise",
+            layer_type="mlp",
         )
         up = torch.ops.auto_deploy.torch_linear_simple(
             x,
             self.up_proj.weight,
             self.up_proj.bias,
             tp_mode="colwise",
+            layer_type="mlp",
         )
         return torch.ops.auto_deploy.torch_linear_simple(
             self.act_fn(gate) * up,
             self.down_proj.weight,
             self.down_proj.bias,
             tp_mode="rowwise",
+            layer_type="mlp",
         )
 
 

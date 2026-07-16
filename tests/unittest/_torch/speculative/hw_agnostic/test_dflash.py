@@ -104,5 +104,35 @@ def test_dflash_qwen3_5_4b(disable_overlap_scheduler: bool):
     _run_and_check(llm_config, min_avg_accepted=1.0)
 
 
+@pytest.mark.high_cuda_memory
+def test_dflash_qwen3_8b_rejection():
+    """DFlash with rejection sampling on: the block-capture rejection path
+    (draft-prob scatter -> fail-closed guard -> rejection acceptance) runs
+    end-to-end with non-greedy sampling and produces coherent output."""
+    total_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
+    if total_mem_gb < 35:
+        pytest.skip("Not enough memory to load target + draft model")
+
+    models_path = llm_models_root()
+    llm_config = _make_llm_config(
+        target_model_dir=f"{models_path}/Qwen3/Qwen3-8B",
+        dflash_model_dir=f"{models_path}/Qwen3-8B-DFlash-b16",
+        disable_overlap_scheduler=True,
+    )
+    llm_config["speculative_config"].use_rejection_sampling = True
+
+    llm = LLM(**llm_config)
+    # Non-greedy so rejection sampling actually engages (all-greedy bypasses it).
+    outputs = llm.generate(
+        PROMPTS, SamplingParams(max_tokens=32, temperature=0.8, top_p=0.95, top_k=50, seed=1234)
+    )
+    llm.shutdown()
+
+    assert len(outputs) == len(PROMPTS)
+    for out in outputs:
+        assert len(out.outputs[0].token_ids) > 0
+        assert out.outputs[0].text.strip()
+
+
 if __name__ == "__main__":
     unittest.main()

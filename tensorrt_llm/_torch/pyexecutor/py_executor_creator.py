@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import copy
 import gc
 import importlib
@@ -670,6 +673,8 @@ def create_py_executor(
         cache_transceiver_config.max_tokens_in_buffer = net_max_seq_len
 
     config = model_engine.model.model_config.pretrained_config
+    max_num_seq_slots = getattr(model_engine, "max_num_seq_slots",
+                                max_batch_size * getattr(mapping, "pp_size", 1))
     if is_hybrid_linear(config) and kv_cache_config.enable_block_reuse and (
             cache_transceiver_config is not None
             and cache_transceiver_config.backend is not None
@@ -756,9 +761,14 @@ def create_py_executor(
     if guided_decoding_config is not None:
         with allocation_scope(ExecutorMemoryType.GUIDED_DECODER):
             if mapping.is_last_pp_rank():
+                guided_decoder_slots = (max_num_seq_slots if getattr(
+                    model_engine, "_enable_dsv4_overlap_headroom", False) else
+                                        max_batch_size)
                 kwargs = {
                     "guided_decoding_config": guided_decoding_config,
-                    "max_num_sequences": max_batch_size,
+                    # The scoped DeepSeek-V4 path follows the expanded slot
+                    # pool. Other configurations retain max_batch_size.
+                    "max_num_sequences": guided_decoder_slots,
                     "vocab_size_padded": model_engine.model.vocab_size_padded,
                     "rank": mapping.rank,
                 }
@@ -796,7 +806,7 @@ def create_py_executor(
             speculative_config=spec_config,
             decoding_config=decoding_config,
             kv_cache_config=kv_cache_config,
-            disable_flashinfer_sampling=llm_args.disable_flashinfer_sampling,
+            max_num_sequences=max_num_seq_slots,
         )
         logger.info(f"Using Sampler: {type(sampler).__name__}")
 
@@ -882,17 +892,15 @@ def create_py_executor(
             # NOTE: TRTLLM_USE_PY_MAMBA is an agg-mode-only override and has
             # no effect in disagg. The disagg manager choice is driven solely
             # by transceiver_runtime: PYTHON => PythonMambaCacheManager,
-            # otherwise CppMambaCacheManager. Clear the var here so the
-            # mutual-exclusion check in use_cpp_mamba_cache_manager() does
-            # not fire after we force TRTLLM_USE_CPP_MAMBA=1 below.
-            if os.environ.pop("TRTLLM_USE_PY_MAMBA", "0") == "1":
+            # otherwise CppMambaHybridCacheManager (unified pool, default).
+            if os.environ.get("TRTLLM_USE_PY_MAMBA", "0") == "1":
                 logger.warning(
                     "TRTLLM_USE_PY_MAMBA is ignored in disaggregated serving; "
                     "use cache_transceiver_config.transceiver_runtime='PYTHON' "
                     "to select PythonMambaCacheManager.")
             else:
                 logger.info("Disaggregated serving with hybrid model detected. "
-                            "Enabling CppMambaHybridCacheManager.")
+                            "Using CppMambaHybridCacheManager.")
 
         # Get draft config for one-engine speculative decoding if available
         draft_config = getattr(model_engine.model, 'draft_config', None)
@@ -987,6 +995,7 @@ def create_py_executor(
             cache_transceiver_config=cache_transceiver_config,
             virtual_memory_pools=vm_pools if not estimating_kv_cache else None,
             execution_stream=execution_stream,
+            max_num_sequences=max_num_seq_slots,
         )
 
         # Originally, peft_cache_config might be mutated inside
@@ -1062,6 +1071,7 @@ def create_py_executor(
                 virtual_memory_pools=vm_pools,
                 execution_stream=execution_stream,
                 dwdp_manager=dwdp_manager,
+                max_num_sequences=max_num_seq_slots,
             )
 
     _adjust_torch_mem_fraction()

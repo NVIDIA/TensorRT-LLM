@@ -14,6 +14,7 @@
 
 # yapf: disable
 import asyncio
+import os
 import traceback
 from abc import ABC, abstractmethod
 from typing import Any, AsyncGenerator, Callable, Dict, List, Optional, Tuple, Type
@@ -39,6 +40,22 @@ from tensorrt_llm.serve.responses_utils import (
 from tensorrt_llm.serve.router import Router
 
 # yapf: enable
+
+# msgspec msgpack is an opt-in transport for the orchestrator->worker request
+# body (alternative to the JSON path). Enable with TRTLLM_SERVE_ENABLE_MSGSPEC=1;
+# the orchestrator encodes the forwarded body as msgpack and flags it with the
+# X-TRTLLM-Msgpack header (Content-Type stays application/json so FastAPI still
+# routes it through Request.json()). Fails loudly at import if msgspec is missing.
+_MSGSPEC_ENABLED = os.getenv("TRTLLM_SERVE_ENABLE_MSGSPEC", "0") == "1"
+if _MSGSPEC_ENABLED:
+    try:
+        import msgspec
+    except ImportError as exc:
+        raise ImportError(
+            "TRTLLM_SERVE_ENABLE_MSGSPEC=1 requires the msgspec package "
+            "(listed in requirements.txt)."
+        ) from exc
+    _msgpack_encoder = msgspec.msgpack.Encoder()
 
 
 class OpenAIClient(ABC):
@@ -181,18 +198,25 @@ class OpenAIHttpClient(OpenAIClient):
                 dp = getattr(request, "disaggregated_params", None)
                 if dp is not None and getattr(dp, "disagg_request_id", None) is not None:
                     dp.disagg_request_id = self._disagg_id_generator()
-            # Serialize once on the orchestrator's single event-loop thread:
-            # model_dump_json (pydantic-core) is ~2.3x faster than
-            # model_dump(mode="json") + aiohttp json= (json.dumps). Decodes to
-            # identical JSON (pydantic just emits compact UTF-8 vs spaced ASCII).
-            body = request.model_dump_json(exclude_unset=True)
+            # Serialize once on the orchestrator's single event-loop thread.
+            if _MSGSPEC_ENABLED:
+                # msgspec msgpack: encode the request dict to msgpack bytes. Keep
+                # Content-Type application/json so FastAPI still routes the body
+                # through Request.json() (it only does that for json/+json content
+                # subtypes); the X-TRTLLM-Msgpack header tells the worker's
+                # Request.json() to decode with msgspec instead of stdlib json.
+                body = _msgpack_encoder.encode(request.model_dump(mode="json", exclude_unset=True))
+                req_headers = {"Content-Type": "application/json", "X-TRTLLM-Msgpack": "1"}
+            else:
+                body = request.model_dump_json(exclude_unset=True)
+                req_headers = {"Content-Type": "application/json"}
             try:
                 lines_yielded = 0
                 start_time = get_steady_clock_now_in_seconds()
                 async with self._session.post(
                     url,
                     data=body,
-                    headers={"Content-Type": "application/json"},
+                    headers=req_headers,
                 ) as http_response:
                     content_type = http_response.headers.get("Content-Type", "")
                     if not is_stream and "text/event-stream" in content_type:

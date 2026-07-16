@@ -529,7 +529,9 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
         // cache blocks to the corresponding buffer.
         // 5. send the buffer to the corresponding target. Ideally, we send only once (one buffer) for each target.
 
-        auto cacheBufferId = mCacheTransBufferManager->assignBufferIndexForSend();
+        auto const* sendCancelFlag
+            = common::getEnvDisaggEnableInflightCancel() ? &session.getDataContext().getTransferTerminate() : nullptr;
+        auto cacheBufferId = mCacheTransBufferManager->assignBufferIndexForSend(sendCancelFlag);
         BufferIndexHolder sendHolder(*mCacheTransBufferManager, cacheBufferId, /*isRecv=*/false);
         int peerDuplicateHeadFactor = targetInfo.mPeerDupHeadFactor;
         auto bufferTargetNum = targetNum / peerDuplicateHeadFactor;
@@ -609,8 +611,24 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
                 == inputKvCacheBlocksPerWindow.begin()->second.front()->getDataType());
         }
 
-        sendAllBuffers(session, deviceId, outputSplitCaches, bufferCoverTargetNum, preAllocSendBuffer, bufferManager,
-            targetInfo, pickUpConnections);
+        if (sendCancelFlag != nullptr && sendCancelFlag->load(std::memory_order_relaxed))
+        {
+            TLLM_THROW("KV cache transfer cancelled before NIXL submission");
+        }
+
+        try
+        {
+            sendAllBuffers(session, deviceId, outputSplitCaches, bufferCoverTargetNum, preAllocSendBuffer,
+                bufferManager, targetInfo, pickUpConnections);
+        }
+        catch (...)
+        {
+            if (agentConnection != nullptr && common::getEnvDisaggEnableInflightCancel())
+            {
+                sendHolder.poison();
+            }
+            throw;
+        }
 
         session.setTime(TransferSession::kTimeTransmissions);
 
@@ -875,12 +893,16 @@ void CacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& sess
                 if (preAssignedKvId.has_value())
                 {
                     cacheBufferId = static_cast<int>(*preAssignedKvId);
+                    if (!session.hasReservedRecvBuffer(*mCacheTransBufferManager))
+                    {
+                        recvHolder = BufferIndexHolder(*mCacheTransBufferManager, cacheBufferId, /*isRecv=*/true);
+                    }
                 }
                 else
                 {
                     cacheBufferId = mCacheTransBufferManager->assignBufferIndexForRecv();
+                    recvHolder = BufferIndexHolder(*mCacheTransBufferManager, cacheBufferId, /*isRecv=*/true);
                 }
-                recvHolder = BufferIndexHolder(*mCacheTransBufferManager, cacheBufferId, /*isRecv=*/true);
                 auto [recvSplitCachestmp, bufferCoverTargetNumtmp, onlyUseDynamicBuffer]
                     = mCacheTransBufferManager->getOrAllocateRecvBuffers(
                         cacheBufferId, static_cast<int>(targetNum), bufferEleSizes, bufferManager);
@@ -1014,6 +1036,7 @@ void CacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& sess
                     recvSplitCaches, outputBuffersPerWindow, destConfig, selfConfig, selfIdx, bufferManager);
 
                 bufferManager.getStream().synchronize();
+                (void) session.releaseReservedRecvBuffer(*mCacheTransBufferManager);
                 recvHolder.release();
             }
             session.setTime(TransferSession::kTimePostprocess);

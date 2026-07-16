@@ -41,7 +41,6 @@ DYNAMO_IMPORTS = [
     ("tensorrt_llm", "MultimodalEncoder"),
     ("tensorrt_llm", "logger"),
     # -- llmapi --
-    ("tensorrt_llm.llmapi", "BuildConfig"),
     ("tensorrt_llm.llmapi", "CapacitySchedulerPolicy"),
     ("tensorrt_llm.llmapi", "DynamicBatchConfig"),
     ("tensorrt_llm.llmapi", "KvCacheConfig"),

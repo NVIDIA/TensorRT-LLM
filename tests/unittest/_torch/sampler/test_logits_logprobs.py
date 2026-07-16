@@ -7,10 +7,7 @@ from utils.llm_data import llm_models_root
 from utils.util import force_ampere
 
 from tensorrt_llm import LLM, SamplingParams
-from tensorrt_llm._torch.pyexecutor.sampler.sampling_utils import (
-    _StrategyImpls,
-    top_k_top_p_sampling_batch,
-)
+from tensorrt_llm._torch.pyexecutor.sampler.sampling_utils import _StrategyImpls
 from tensorrt_llm.executor.result import TokenLogprobs
 from tensorrt_llm.llmapi.llm_utils import KvCacheConfig
 
@@ -93,13 +90,11 @@ def llm(
         yield llm
 
 
-@pytest.fixture(scope="module", params=[False, True])
-def simple_llm(request) -> LLM:
-    disable_flashinfer_sampling = request.param
+@pytest.fixture(scope="module")
+def simple_llm() -> LLM:
     llm = LLM(
         model=os.path.join(llm_models_root(), "llama-models-v2", "TinyLlama-1.1B-Chat-v1.0"),
         max_batch_size=8,
-        disable_flashinfer_sampling=disable_flashinfer_sampling,
         kv_cache_config=global_kvcache_config_prompt_logprobs,
     )
     return llm
@@ -777,20 +772,15 @@ def test_processed_logprobs_e2e(logprobs_k: int, simple_llm: LLM):
                 topp = topp if topp is not None else 1.0
                 temperature = temperature if temperature is not None else 1.0
 
-                # perform maksing top-k top-p
-                if simple_llm.args.disable_flashinfer_sampling:
-                    _, probs = top_k_top_p_sampling_batch(
-                        logits_for_token, top_k=topk, top_p=topp, temperature=temperature
-                    )
-                else:
-                    _, probs = _StrategyImpls.StrategyImplWithProbs._sample_with_probs(
-                        logits_for_token,
-                        group_logit_indices=None,
-                        top_k=torch.tensor([topk], dtype=torch.int32, device="cuda"),
-                        top_p=torch.tensor([topp], dtype=torch.float32, device="cuda"),
-                        temperature=torch.tensor([temperature], dtype=torch.float32, device="cuda"),
-                        generator=None,
-                    )
+                # perform masking top-k top-p via the flashinfer strategy impl
+                _, probs = _StrategyImpls.StrategyImplWithProbs._sample_with_probs(
+                    logits_for_token,
+                    group_logit_indices=None,
+                    top_k=torch.tensor([topk], dtype=torch.int32, device="cuda"),
+                    top_p=torch.tensor([topp], dtype=torch.float32, device="cuda"),
+                    temperature=torch.tensor([temperature], dtype=torch.float32, device="cuda"),
+                    generator=None,
+                )
 
             if temperature != 0:
                 logits_for_token /= temperature

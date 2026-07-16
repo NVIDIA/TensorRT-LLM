@@ -1807,13 +1807,17 @@ def get_gpu_device_list():
         suffix = ".exe" if is_windows() else ""
         # TODO: Use NRSU because we can't assume nvidia-smi across all platforms.
         cmd = " ".join(["nvidia-smi" + suffix, "-L"])
-        output = check_output(cmd, shell=True, cwd=temp_dirname)
+        try:
+            output = check_output(cmd, shell=True, cwd=temp_dirname)
+        except sp.CalledProcessError:
+            return []
     return [l.strip() for l in output.strip().split("\n")]
 
 
 def check_device_contain(keyword_list):
     "check device not contain keyword"
-    device = get_gpu_device_list()[0]
+    devices = get_gpu_device_list()
+    device = devices[0] if devices else ""
     return any(keyword in device for keyword in keyword_list)
 
 
@@ -2007,6 +2011,12 @@ def pytest_addoption(parser):
         default=False,
         help=
         "Enable Ray orchestrator path for integration tests (disables MPI).",
+    )
+    parser.addoption(
+        "--unittest-markexpr",
+        action="store",
+        default=None,
+        help="Marker expression forwarded to nested unittest pytest runs.",
     )
     parser.addoption(
         "--perf-log-formats",

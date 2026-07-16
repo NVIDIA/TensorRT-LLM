@@ -56,7 +56,7 @@ commands:
         flags:
         - "--allow_request_chat_template"
       backend:
-        type: Choice(['_autodeploy', 'pytorch', 'tensorrt'])
+        type: Choice(['_autodeploy', 'pytorch'])
         default: pytorch
         status: beta
         required: false

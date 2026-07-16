@@ -838,28 +838,25 @@ class PerfTestConfig:
                     [b >= 32 for b in self.batch_sizes]
                 ), f"gpt_350m and bloom_560m with small BS are very unstable! Please increase to at least 32."
 
-        # Mirror the skip_less_mpi_world_size fixture: when mpi_world_size == 1
-        # we are on a single node (workers spawn within the test) so use the
-        # local device count; otherwise the launcher already sized the world
-        # across nodes, so trust mpi_world_size as the cluster total.
-        try:
-            mpi_world_size = get_mpi_world_size()
-        except Exception:
-            mpi_world_size = 1
-        try:
-            device_count = get_device_count()
-        except Exception:
-            device_count = None
+        # Skip if not enough GPUs. TRTLLM_TOTAL_GPU_COUNT overrides
+        # auto-detection for multi-node setups.
+        total_gpus = int(os.environ["TRTLLM_TOTAL_GPU_COUNT"]
+                         ) if "TRTLLM_TOTAL_GPU_COUNT" in os.environ else None
+        if total_gpus is None:
+            try:
+                mpi_world_size = get_mpi_world_size()
+            except Exception:
+                mpi_world_size = 1
+            try:
+                device_count = get_device_count()
+            except Exception:
+                device_count = None
 
-        if mpi_world_size == 1:
-            total_gpus = device_count
-        else:
-            total_gpus = mpi_world_size
+            total_gpus = device_count if mpi_world_size == 1 else mpi_world_size
 
         if total_gpus is not None and self.num_gpus > total_gpus:
             pytest.skip(
-                f"Test requires {self.num_gpus} GPUs but only {total_gpus} available "
-                f"(mpi_world_size={mpi_world_size}, device_count={device_count})"
+                f"Test requires {self.num_gpus} GPUs but only {total_gpus} available"
             )
 
     def get_model_family(self) -> str:

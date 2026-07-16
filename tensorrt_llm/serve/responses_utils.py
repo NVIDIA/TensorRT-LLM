@@ -42,7 +42,7 @@ from transformers import AutoProcessor, PretrainedConfig
 
 from tensorrt_llm.bindings import steady_clock_now
 from tensorrt_llm.executor import GenerationResult
-from tensorrt_llm.inputs.utils import apply_chat_template
+from tensorrt_llm.inputs.utils import async_apply_chat_template
 from tensorrt_llm.llmapi import SamplingParams
 from tensorrt_llm.llmapi.llm import RequestOutput
 from tensorrt_llm.llmapi.reasoning_parser import (BaseReasoningParser,
@@ -822,13 +822,11 @@ async def _create_input_tokens(
 
     conversation, mm_coroutines, mm_placeholder_counts = parse_chat_messages_coroutines(
         messages, model_config)
-    mm_data = await mm_coroutines
-
     tools_dict = [
         tool.model_dump()
         for tool in _get_chat_completion_function_tools(request.tools)
     ]
-    token_ids = apply_chat_template(
+    token_task = async_apply_chat_template(
         model_type=resolve_top_level_model_type(model_config),
         tokenizer=tokenizer,
         processor=processor,
@@ -838,6 +836,9 @@ async def _create_input_tokens(
         mm_placeholder_counts=mm_placeholder_counts,
         enable_tokenize=True,
     )
+    token_ids, (mm_data,
+                _mm_embeddings) = await asyncio.gather(token_task,
+                                                       mm_coroutines)
 
     return token_ids, mm_data
 

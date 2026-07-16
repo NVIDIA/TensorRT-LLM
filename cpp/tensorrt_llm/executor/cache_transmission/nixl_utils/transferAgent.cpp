@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -321,6 +321,7 @@ void NixlHelper::posixFileToGpuFallback(MemoryDescs const& memoryDescs, FileDesc
 NixlTransferStatus::NixlTransferStatus(std::weak_ptr<nixlAgent> agent, nixlXferReqH* handle)
     : mWeakAgent{std::move(agent)}
     , mHandle{handle}
+    , mSynchronizeHandleAccess{common::getEnvDisaggEnableInflightCancel()}
 {
     TLLM_CHECK(!mWeakAgent.expired());
     TLLM_CHECK(mHandle);
@@ -328,19 +329,13 @@ NixlTransferStatus::NixlTransferStatus(std::weak_ptr<nixlAgent> agent, nixlXferR
 
 NixlTransferStatus::~NixlTransferStatus() noexcept
 {
-    if (mHandle == nullptr)
-    {
-        return;
-    }
-    // Skip release if the owning agent was reset; the underlying nixlXferReqH is already gone.
-    auto agent = mWeakAgent.lock();
-    if (!agent)
-    {
-        return;
-    }
     try
     {
-        agent->releaseXferReq(mHandle);
+        if (!release())
+        {
+            TLLM_LOG_WARNING(
+                "NIXL transfer handle release failed during destruction; backend handle may remain active");
+        }
     }
     catch (std::exception const& e)
     {
@@ -516,15 +511,7 @@ TransferState NixlTransferStatus::wait(int64_t timeout_ms) const
 
     while (true)
     {
-        auto agent = mWeakAgent.lock();
-        if (!agent)
-        {
-            // Owning agent was reset; report failure so callers don't deref a null status.
-            mLastStatus.store(static_cast<int>(NIXL_ERR_INVALID_PARAM), std::memory_order_relaxed);
-            return TransferState::kFAILURE;
-        }
-        auto status = agent->getXferStatus(mHandle);
-        mLastStatus.store(static_cast<int>(status), std::memory_order_relaxed);
+        auto const status = queryStatus();
         if (status == NIXL_SUCCESS)
         {
             return TransferState::kSUCCESS;
@@ -566,15 +553,64 @@ std::string NixlTransferStatus::getLastStatusStr() const
 
 [[nodiscard]] bool NixlTransferStatus::isCompleted() const
 {
+    return queryStatus() == NIXL_SUCCESS;
+}
+
+nixl_status_t NixlTransferStatus::queryStatus() const
+{
+    auto const query = [this]()
+    {
+        if (mHandle == nullptr)
+        {
+            mLastStatus.store(static_cast<int>(NIXL_ERR_INVALID_PARAM), std::memory_order_relaxed);
+            return NIXL_ERR_INVALID_PARAM;
+        }
+        auto agent = mWeakAgent.lock();
+        if (!agent)
+        {
+            // Owning agent was reset; report failure so callers don't deref a null status.
+            mLastStatus.store(static_cast<int>(NIXL_ERR_INVALID_PARAM), std::memory_order_relaxed);
+            return NIXL_ERR_INVALID_PARAM;
+        }
+        auto const status = agent->getXferStatus(mHandle);
+        mLastStatus.store(static_cast<int>(status), std::memory_order_relaxed);
+        return status;
+    };
+
+    if (mSynchronizeHandleAccess)
+    {
+        std::lock_guard<std::mutex> lock(mHandleMutex);
+        return query();
+    }
+    return query();
+}
+
+[[nodiscard]] bool NixlTransferStatus::release()
+{
+    std::lock_guard<std::mutex> lock(mHandleMutex);
+    if (mHandle == nullptr)
+    {
+        return true;
+    }
+
     auto agent = mWeakAgent.lock();
     if (!agent)
     {
+        mHandle = nullptr;
         mLastStatus.store(static_cast<int>(NIXL_ERR_INVALID_PARAM), std::memory_order_relaxed);
-        return false;
+        return true;
     }
-    auto status = agent->getXferStatus(mHandle);
+
+    auto status = agent->releaseXferReq(mHandle);
     mLastStatus.store(static_cast<int>(status), std::memory_order_relaxed);
-    return status == NIXL_SUCCESS;
+    if (status == NIXL_SUCCESS)
+    {
+        mHandle = nullptr;
+        return true;
+    }
+
+    TLLM_LOG_WARNING("NIXL releaseXferReq failed with status: %s", nixlEnumStrings::statusStr(status).c_str());
+    return false;
 }
 
 NixlTransferAgent::NixlTransferAgent(BaseAgentConfig const& config)

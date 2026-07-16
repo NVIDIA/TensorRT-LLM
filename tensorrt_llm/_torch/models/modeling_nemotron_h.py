@@ -553,7 +553,7 @@ class NemotronHLayer(DecoderLayer):
 
     def post_load_weights(self):
         """Post-process after loading weights."""
-        if self.norm.is_nvfp4 and not hasattr(self.norm, "nvfp4_scale"):
+        if self.norm.is_nvfp4 and self.norm.nvfp4_scale is None:
             self._try_attach_nvfp4_scale()
 
     def _try_attach_nvfp4_scale(self):
@@ -602,7 +602,7 @@ class NemotronHLayer(DecoderLayer):
 
         if hasattr(self, 'pre_allreduce'):
             norm = self.norm
-            has_nvfp4_scale = hasattr(norm, 'nvfp4_scale')
+            has_nvfp4_scale = norm.nvfp4_scale is not None
             if norm.is_nvfp4 and has_nvfp4_scale and norm.return_hp_output:
                 fusion_op = AllReduceFusionOp.RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4
             elif norm.is_nvfp4 and has_nvfp4_scale:

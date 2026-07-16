@@ -277,12 +277,14 @@ class DiffusionExecutor:
         visual_gen_args: "VisualGenArgs",
         req_hmac_key: Optional[bytes] = None,
         resp_hmac_key: Optional[bytes] = None,
+        in_client_process: bool = False,
     ):
         self.request_queue_addr = request_queue_addr
         self.response_queue_addr = response_queue_addr
         self.device_id = device_id
         self.visual_gen_args = visual_gen_args
         self.resp_hmac_key = resp_hmac_key
+        self.in_client_process = in_client_process
 
         self.pipeline = None  # initialized in _load_pipeline
         self.requests_ipc = None
@@ -435,10 +437,9 @@ class DiffusionExecutor:
             output = self.pipeline.infer(req)
             generation = time.perf_counter() - generation_start  # seconds
             if self.rank == 0:
-                # External launch co-locates this worker with the coordinator in one
-                # process; to_handle(local=True) hands the tensor over in-process
-                # instead of cross-process CUDA IPC (invalid same-process).
-                output.to_handle(local=_detect_external_launch() is not None)
+                # CUDA IPC handles are invalid within the producing process, so
+                # a same-process client takes the media via in-process handoff.
+                output.to_handle(local=self.in_client_process)
                 self.response_queue.put(
                     DiffusionResponse(
                         request_id=req.request_id,
@@ -467,8 +468,14 @@ def run_diffusion_worker(
     req_hmac_key: Optional[bytes] = None,
     resp_hmac_key: Optional[bytes] = None,
     local_rank: Optional[int] = None,
+    in_client_process: bool = False,
 ):
-    """Entry point for worker process."""
+    """Entry point for worker process.
+
+    ``in_client_process``: True only when this worker runs inside the client
+    process. Declared by the launch site — never derive it from the
+    environment here, the env writes below make every worker look external.
+    """
     try:
         # Set log level before any other work so loading logs are visible
         logger.set_level(log_level)
@@ -530,6 +537,7 @@ def run_diffusion_worker(
             visual_gen_args=visual_gen_args,
             req_hmac_key=req_hmac_key,
             resp_hmac_key=resp_hmac_key,
+            in_client_process=in_client_process,
         )
         executor.serve_forever()
         if executor.pipeline is not None:
@@ -690,6 +698,7 @@ class DiffusionRemoteClient:
                     "resp_hmac_key": self.resp_hmac_key,
                     "log_level": logger.level,
                     "local_rank": local_rank,
+                    "in_client_process": True,
                 },
                 daemon=True,
             )

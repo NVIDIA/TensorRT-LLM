@@ -2,6 +2,8 @@
 # Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Tests for content-format-driven chat template dispatch and placeholder handling."""
 
+import threading
+
 import pytest
 
 from tensorrt_llm.inputs.content_format import ContentFormat
@@ -15,6 +17,7 @@ from tensorrt_llm.inputs.utils import (
     _build_openai_content,
     _resolve_content_format,
     add_multimodal_placeholders,
+    async_apply_chat_template,
     interleave_mm_placeholders,
 )
 
@@ -324,3 +327,131 @@ class TestAddMultimodalPlaceholdersDedup:
         )
         assert result == text
         assert result.count("<image>") == 3
+
+
+class TestAsyncApplyChatTemplate:
+    @pytest.mark.asyncio
+    async def test_runs_in_worker_thread(self):
+        event_loop_thread_id = threading.current_thread().ident
+
+        class TrackingTokenizer:
+            def __init__(self):
+                self.worker_thread_id = None
+
+            def apply_chat_template(self, **_):
+                self.worker_thread_id = threading.current_thread().ident
+                return "rendered"
+
+        tokenizer = TrackingTokenizer()
+
+        result = await async_apply_chat_template(
+            model_type="test_string_model",
+            tokenizer=tokenizer,
+            processor=None,
+            conversation=[ConversationMessage(role="user", content="hello", media=[])],
+            add_generation_prompt=True,
+            mm_placeholder_counts=[{}],
+            chat_template="{{ messages }}",
+        )
+
+        assert result == "rendered"
+        assert tokenizer.worker_thread_id is not None
+        assert tokenizer.worker_thread_id != event_loop_thread_id
+
+
+class TestServingChatTemplateGather:
+    """Cover the asyncio.gather integration in the serving chat-template paths."""
+
+    @pytest.mark.asyncio
+    async def test_resource_governor_convert_messages(self, monkeypatch):
+        from unittest.mock import Mock
+
+        import tensorrt_llm.serve.resource_governor as rg
+
+        governor = object.__new__(rg.ResourceGovernor)
+        governor.model_config = Mock()
+        governor.tokenizer = Mock()
+        governor.processor = None
+
+        async def fake_mm_coroutine():
+            # parse_chat_messages_coroutines' coroutine yields
+            # (mm_data, mm_embeddings).
+            return ({"image": ["data"]}, None)
+
+        monkeypatch.setattr(
+            rg,
+            "parse_chat_messages_coroutines",
+            lambda messages, model_config, _: ([], fake_mm_coroutine(), [{}]),
+        )
+        # Must resolve the top-level model type, matching the serving call
+        # sites (not the raw model_config.model_type).
+        monkeypatch.setattr(rg, "resolve_top_level_model_type", lambda cfg: "resolved-model-type")
+
+        captured = {}
+
+        async def fake_async_apply(**kwargs):
+            captured.update(kwargs)
+            return [1, 2, 3]
+
+        monkeypatch.setattr(rg, "async_apply_chat_template", fake_async_apply)
+
+        token_ids = await governor._convert_messages(
+            messages=[{"role": "user", "content": "hi"}],
+            tool_dicts=None,
+            add_generation_prompt=True,
+            documents=None,
+            chat_template=None,
+            chat_template_kwargs=None,
+        )
+
+        # Returns only token_ids, not the (mm_data, mm_embeddings) tuple.
+        assert token_ids == [1, 2, 3]
+        # Uses the top-level resolver and forwards the real placeholder counts.
+        assert captured["model_type"] == "resolved-model-type"
+        assert captured["mm_placeholder_counts"] == [{}]
+
+    @pytest.mark.asyncio
+    async def test_responses_create_input_tokens_unpacks_mm_tuple(self, monkeypatch):
+        """_create_input_tokens must return mm_data, not the whole gather tuple."""
+        from unittest.mock import Mock
+
+        import tensorrt_llm.serve.responses_utils as ru
+
+        async def fake_create_input_messages(request, prev_msgs):
+            return [{"role": "user", "content": "hi"}]
+
+        async def fake_mm_coroutine():
+            return ({"image": ["data"]}, {"image": ["embed"]})
+
+        monkeypatch.setattr(ru, "_create_input_messages", fake_create_input_messages)
+        monkeypatch.setattr(
+            ru,
+            "parse_chat_messages_coroutines",
+            lambda messages, model_config: ([], fake_mm_coroutine(), [{}]),
+        )
+        monkeypatch.setattr(ru, "resolve_top_level_model_type", lambda cfg: "resolved-model-type")
+        monkeypatch.setattr(ru, "_get_chat_completion_function_tools", lambda tools: [])
+
+        async def fake_async_apply(**kwargs):
+            return [1, 2, 3]
+
+        monkeypatch.setattr(ru, "async_apply_chat_template", fake_async_apply)
+
+        request = Mock()
+        request.tools = None
+        request.store = False
+
+        token_ids, mm_data = await ru._create_input_tokens(
+            request=request,
+            prev_response=None,
+            prev_msgs=None,
+            conversation_store=None,
+            enable_store=False,
+            tokenizer=Mock(),
+            model_config=Mock(),
+            processor=None,
+        )
+
+        assert token_ids == [1, 2, 3]
+        # mm_data is the data dict, not the (mm_data, mm_embeddings) tuple.
+        assert mm_data == {"image": ["data"]}

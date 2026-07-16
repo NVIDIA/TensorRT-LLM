@@ -707,6 +707,37 @@ def apply_chat_template(
     return result
 
 
+async def async_apply_chat_template(
+    *,
+    model_type: str,
+    tokenizer: Union[TransformersTokenizer, TokenizerBase],
+    processor: ProcessorMixin,
+    conversation: list[ConversationMessage],
+    add_generation_prompt: bool,
+    mm_placeholder_counts: list[dict[str, int]],
+    tools: Optional[list[dict[str, Any]]] = None,
+    documents: Optional[list[dict[str, str]]] = None,
+    chat_template: Optional[str] = None,
+    chat_template_kwargs: Optional[dict[str, Any]] = None,
+    enable_tokenize: bool = False,
+) -> (str | List[str]):
+    """Apply chat template without blocking the event loop."""
+    return await asyncio.to_thread(
+        apply_chat_template,
+        model_type=model_type,
+        tokenizer=tokenizer,
+        processor=processor,
+        conversation=conversation,
+        add_generation_prompt=add_generation_prompt,
+        mm_placeholder_counts=mm_placeholder_counts,
+        tools=tools,
+        documents=documents,
+        chat_template=chat_template,
+        chat_template_kwargs=chat_template_kwargs,
+        enable_tokenize=enable_tokenize,
+    )
+
+
 def default_multimodal_input_loader(
     *,
     tokenizer: Optional[Union[TransformersTokenizer, TokenizerBase]],

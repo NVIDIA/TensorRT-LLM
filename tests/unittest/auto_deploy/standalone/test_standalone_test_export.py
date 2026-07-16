@@ -13,8 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for exporting standalone-compatible AutoDeploy tests to LLMC."""
+"""Tests for exporting standalone-compatible AutoDeploy tests to Paragraf."""
 
+import os
 import re
 import subprocess
 import sys
@@ -23,22 +24,25 @@ from pathlib import Path
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
-CREATE_SCRIPT = REPO_ROOT / "examples" / "auto_deploy" / "llmc" / "create_standalone_package.py"
+CREATE_SCRIPT = REPO_ROOT / "examples" / "auto_deploy" / "paragraf" / "create_standalone_package.py"
+LEGACY_CREATE_SCRIPT = (
+    REPO_ROOT / "examples" / "auto_deploy" / "llmc" / "create_standalone_package.py"
+)
 AD_SINGLEGPU_TESTS = REPO_ROOT / "tests" / "unittest" / "auto_deploy" / "singlegpu"
 AD_MULTIGPU_TESTS = REPO_ROOT / "tests" / "unittest" / "auto_deploy" / "multigpu"
 AD_TORCH_TESTS = REPO_ROOT / "tests" / "unittest" / "_torch" / "auto_deploy"
-LLMC_TRTLLM_SINGLEGPU_SMOKE_TEST = Path("smoke/test_ad_build_small_single.py")
-LLMC_TRTLLM_MULTIGPU_SMOKE_TEST = Path("smoke/test_ad_build_small_multi.py")
-LLMC_TRTLLM_RUNNER_TESTS = {
-    LLMC_TRTLLM_SINGLEGPU_SMOKE_TEST,
+PARAGRAF_TRTLLM_SINGLEGPU_SMOKE_TEST = Path("smoke/test_ad_build_small_single.py")
+PARAGRAF_TRTLLM_MULTIGPU_SMOKE_TEST = Path("smoke/test_ad_build_small_multi.py")
+PARAGRAF_TRTLLM_RUNNER_TESTS = {
+    PARAGRAF_TRTLLM_SINGLEGPU_SMOKE_TEST,
     Path("smoke/test_ad_guided_decoding_regex.py"),
     Path("smoke/test_ad_speculative_decoding.py"),
     Path("smoke/test_ad_trtllm_sampler.py"),
-    LLMC_TRTLLM_MULTIGPU_SMOKE_TEST,
+    PARAGRAF_TRTLLM_MULTIGPU_SMOKE_TEST,
 }
 
 EXPECTED_SINGLEGPU_SMOKE_FILES = {
-    path for path in LLMC_TRTLLM_RUNNER_TESTS if path != LLMC_TRTLLM_MULTIGPU_SMOKE_TEST
+    path for path in PARAGRAF_TRTLLM_RUNNER_TESTS if path != PARAGRAF_TRTLLM_MULTIGPU_SMOKE_TEST
 } | {
     Path("smoke/test_ad_trtllm_bench.py"),
     Path("smoke/test_ad_trtllm_serve.py"),
@@ -47,7 +51,7 @@ EXPECTED_SINGLEGPU_SMOKE_FILES = {
 EXPECTED_MULTIGPU_FILES = {
     Path("custom_ops/test_dist.py"),
     Path("custom_ops/test_sharded_rmsnorm.py"),
-    LLMC_TRTLLM_MULTIGPU_SMOKE_TEST,
+    PARAGRAF_TRTLLM_MULTIGPU_SMOKE_TEST,
     Path("transformations/library/conftest.py"),
     Path("transformations/library/test_apply_sharding_hints.py"),
     Path("transformations/library/test_bmm_sharding.py"),
@@ -61,22 +65,25 @@ EXPECTED_TORCH_UNIT_FILES = {
     Path("unit/singlegpu/models/test_gpt_oss_modeling.py"),
 }
 CANONICAL_IMPORT = "tensorrt_llm._torch.auto_deploy"
-STANDALONE_IMPORT = "llmc"
+STANDALONE_IMPORT = "paragraf"
 BUILD_AND_RUN_AD_IMPORT = "from build_and_run_ad import ExperimentConfig, main"
 TRTLLM_IMPORT_RE = re.compile(
     r"(?m)^(?:from|import) "
-    r"(?:tensorrt_llm(?:\.|\b)|llmc\.models\.custom\.modeling_gpt_oss(?:\.|\b))"
+    r"(?:tensorrt_llm(?:\.|\b)|paragraf\.models\.custom\.modeling_gpt_oss(?:\.|\b))"
 )
-LLMC_OPTIONAL_TRTLLM_GUARD = """
-_trtllm_redirect_value = os.environ.get("TRTLLM_REDIRECT_AD_TO_LLMC", "").lower()
+PARAGRAF_OPTIONAL_TRTLLM_GUARD = """
+_trtllm_redirect_value = os.environ.get("TRTLLM_REDIRECT_AD_TO_PARAGRAF")
+if _trtllm_redirect_value is None:
+    _trtllm_redirect_value = os.environ.get("TRTLLM_REDIRECT_AD_TO_LLMC", "")
+_trtllm_redirect_value = _trtllm_redirect_value.lower()
 if _trtllm_redirect_value not in {"1", "true", "yes", "on"}:
     pytest.skip(
-        "LLMC optional TRT-LLM tests require TRTLLM_REDIRECT_AD_TO_LLMC=true",
+        "Paragraf optional TRT-LLM tests require TRTLLM_REDIRECT_AD_TO_PARAGRAF=true",
         allow_module_level=True,
     )
 pytest.importorskip("tensorrt_llm")"""
-LLMC_TRTLLM_RUNNER_IMPORT = (
-    "from runners.trtllm.build_and_run_llmc_trtllm import ExperimentConfig, main"
+PARAGRAF_TRTLLM_RUNNER_IMPORT = (
+    "from runners.trtllm.build_and_run_paragraf_trtllm import ExperimentConfig, main"
 )
 
 
@@ -106,16 +113,16 @@ def _expected_exported_test(source: str, relative_path: Path) -> str:
         assert pytest_import is not None
         expected = (
             expected[: pytest_import.end()]
-            + LLMC_OPTIONAL_TRTLLM_GUARD
+            + PARAGRAF_OPTIONAL_TRTLLM_GUARD
             + "\n"
             + expected[pytest_import.end() :]
         )
 
-    if relative_path in LLMC_TRTLLM_RUNNER_TESTS:
+    if relative_path in PARAGRAF_TRTLLM_RUNNER_TESTS:
         build_import_pos = expected.index(BUILD_AND_RUN_AD_IMPORT)
         ensure_imports(build_import_pos, "os", "pytest")
         insert_optional_trtllm_guard()
-        expected = expected.replace(BUILD_AND_RUN_AD_IMPORT, LLMC_TRTLLM_RUNNER_IMPORT)
+        expected = expected.replace(BUILD_AND_RUN_AD_IMPORT, PARAGRAF_TRTLLM_RUNNER_IMPORT)
     else:
         trtllm_import = TRTLLM_IMPORT_RE.search(expected)
         if trtllm_import is not None:
@@ -131,7 +138,10 @@ def _expected_exported_test(source: str, relative_path: Path) -> str:
 @pytest.fixture(scope="module")
 def generated_package(tmp_path_factory: pytest.TempPathFactory) -> Path:
     """Generate the package once and return the package directory."""
-    output_dir = tmp_path_factory.mktemp("llmc_test_export")
+    output_dir = tmp_path_factory.mktemp("paragraf_test_export")
+    legacy_package_dir = output_dir / "llmc"
+    legacy_package_dir.mkdir()
+    (legacy_package_dir / "stale.py").touch()
     subprocess.run(
         [sys.executable, str(CREATE_SCRIPT), "--output-dir", str(output_dir)],
         check=True,
@@ -139,6 +149,16 @@ def generated_package(tmp_path_factory: pytest.TempPathFactory) -> Path:
         text=True,
         timeout=60,
     )
+    assert legacy_package_dir.is_symlink()
+    assert os.readlink(legacy_package_dir) == "paragraf"
+    subprocess.run(
+        [sys.executable, str(CREATE_SCRIPT), "--output-dir", str(output_dir)],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert legacy_package_dir.is_symlink()
     return output_dir
 
 
@@ -158,6 +178,27 @@ def generated_multigpu_tests(generated_package: Path) -> Path:
 def generated_torch_unit_tests(generated_package: Path) -> Path:
     """Return the generated _torch/auto_deploy unit test directory."""
     return generated_package / "tests" / "_torch" / "auto_deploy"
+
+
+def test_generates_paragraf_package_identity(generated_package: Path) -> None:
+    assert (generated_package / "paragraf" / "__init__.py").is_file()
+    assert (generated_package / "llmc").is_symlink()
+    pyproject = (generated_package / "pyproject.toml").read_text()
+    assert 'name = "nvidia-llmc"' in pyproject
+    assert 'include = ["paragraf*", "llmc"]' in pyproject
+
+
+def test_legacy_generator_entrypoint(tmp_path: Path) -> None:
+    output_dir = tmp_path / "legacy-generator-output"
+    subprocess.run(
+        [sys.executable, str(LEGACY_CREATE_SCRIPT), "--output-dir", str(output_dir)],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert (output_dir / "paragraf" / "__init__.py").is_file()
+    assert (output_dir / "llmc").is_symlink()
 
 
 def test_exports_exact_multigpu_allowlist(generated_multigpu_tests: Path) -> None:
@@ -192,8 +233,9 @@ def test_registers_inert_threadleak_marker(generated_multigpu_tests: Path) -> No
 def test_conftest_allows_explicit_redirect_mode(generated_multigpu_tests: Path) -> None:
     conftest = generated_multigpu_tests.parent / "conftest.py"
     content = conftest.read_text()
+    assert "TRTLLM_REDIRECT_AD_TO_PARAGRAF" in content
     assert "TRTLLM_REDIRECT_AD_TO_LLMC" in content
-    assert "set TRTLLM_REDIRECT_AD_TO_LLMC=true only for optional TRT-LLM tests" in content
+    assert "set TRTLLM_REDIRECT_AD_TO_PARAGRAF=true only for optional TRT-LLM tests" in content
     assert "_package_root = os.path.dirname(_tests_dir)" in content
     assert "sys.path.insert(0, _package_root)" in content
     assert "def llm_root()" in content
@@ -207,10 +249,17 @@ def test_creates_minimal_utils_util_stub(generated_package: Path) -> None:
 
 
 def test_does_not_add_test_guards_to_runners(generated_package: Path) -> None:
-    runner = generated_package / "runners" / "trtllm" / "build_and_run_llmc_trtllm.py"
+    runner = generated_package / "runners" / "trtllm" / "build_and_run_paragraf_trtllm.py"
     content = runner.read_text()
     assert "pytest.skip" not in content
     assert "pytest.importorskip" not in content
+
+
+def test_generates_legacy_runner_wrapper(generated_package: Path) -> None:
+    runner = generated_package / "runners" / "trtllm" / "build_and_run_llmc_trtllm.py"
+    content = runner.read_text()
+    assert "build_and_run_paragraf_trtllm" in content
+    assert "main()" in content
 
 
 @pytest.mark.parametrize("relative_path", sorted(EXPECTED_SINGLEGPU_SMOKE_FILES, key=str), ids=str)
@@ -222,12 +271,15 @@ def test_rewrites_singlegpu_smoke_auto_deploy_imports(
 
     assert exported == _expected_exported_test(source, relative_path)
     assert CANONICAL_IMPORT not in exported
-    if relative_path in LLMC_TRTLLM_RUNNER_TESTS:
+    if relative_path in PARAGRAF_TRTLLM_RUNNER_TESTS:
         assert BUILD_AND_RUN_AD_IMPORT not in exported
-        assert "build_and_run_llmc_trtllm" in exported
+        assert "build_and_run_paragraf_trtllm" in exported
     else:
-        assert "LLMC optional TRT-LLM tests require TRTLLM_REDIRECT_AD_TO_LLMC=true" in exported
-    assert "TRTLLM_REDIRECT_AD_TO_LLMC" in exported
+        assert (
+            "Paragraf optional TRT-LLM tests require TRTLLM_REDIRECT_AD_TO_PARAGRAF=true"
+            in exported
+        )
+    assert "TRTLLM_REDIRECT_AD_TO_PARAGRAF" in exported
 
 
 @pytest.mark.parametrize("relative_path", sorted(EXPECTED_MULTIGPU_FILES, key=str), ids=str)
@@ -239,10 +291,10 @@ def test_rewrites_multigpu_auto_deploy_imports(
 
     assert exported == _expected_exported_test(source, relative_path)
     assert CANONICAL_IMPORT not in exported
-    if relative_path == LLMC_TRTLLM_MULTIGPU_SMOKE_TEST:
+    if relative_path == PARAGRAF_TRTLLM_MULTIGPU_SMOKE_TEST:
         assert BUILD_AND_RUN_AD_IMPORT not in exported
-        assert "build_and_run_llmc_trtllm" in exported
-        assert "TRTLLM_REDIRECT_AD_TO_LLMC" in exported
+        assert "build_and_run_paragraf_trtllm" in exported
+        assert "TRTLLM_REDIRECT_AD_TO_PARAGRAF" in exported
 
 
 @pytest.mark.parametrize("relative_path", sorted(EXPECTED_TORCH_UNIT_FILES, key=str), ids=str)
@@ -254,4 +306,4 @@ def test_rewrites_torch_unit_auto_deploy_imports(
 
     assert exported == _expected_exported_test(source, relative_path)
     assert CANONICAL_IMPORT not in exported
-    assert "LLMC optional TRT-LLM tests require TRTLLM_REDIRECT_AD_TO_LLMC=true" in exported
+    assert "Paragraf optional TRT-LLM tests require TRTLLM_REDIRECT_AD_TO_PARAGRAF=true" in exported

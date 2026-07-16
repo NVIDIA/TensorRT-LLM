@@ -178,7 +178,6 @@ def _make_llm_args():
             calibration_layer_indices=None,
         ),
         sampler_type=None,
-        disable_flashinfer_sampling=False,
         cuda_graph_config=None,
         parallel_config=SimpleNamespace(to_mapping=lambda: SimpleNamespace()),
         get_runtime_sizes=lambda: (1, 128, 128, 4),

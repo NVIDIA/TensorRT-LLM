@@ -51,9 +51,8 @@ from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExt
 from tensorrt_llm._torch.disaggregation.resource.utils import get_unique_pool_memory_descs
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
-from tensorrt_llm._utils import nvtx_range
+from tensorrt_llm._utils import CUASSERT, nvtx_range
 from tensorrt_llm.disaggregated_params import DisaggregatedParams, DisaggScheduleStyle
-from tensorrt_llm.runtime.generation import CUASSERT
 
 if TYPE_CHECKING:
     from .bounce import Config
@@ -551,11 +550,30 @@ class Sender(SenderBase):
         agent_result = AgentResult.SUCCESS
         send_slot_id = None
         if write_meta.src_ptrs.size > 0:
-            request, send_slot_id = build_send_request(
-                self._bounce,
-                write_meta,
-                lambda: Sender._make_agent_request(write_meta, device_id=self._device_id),
-            )
+            try:
+                request, send_slot_id = build_send_request(
+                    self._bounce,
+                    write_meta,
+                    lambda: Sender._make_agent_request(write_meta, device_id=self._device_id),
+                )
+            except Exception as e:
+                # Don't let a gather fault escape: without a result the receiver would hang and its
+                # region leak. Tell the receiver it failed and fail the local task instead.
+                logger.error(
+                    f"_deliver_kv_to_agent: failed to build the KV send request for "
+                    f"{write_meta.unique_rid} slice={write_meta.slice_id}: {e}"
+                )
+                task.fail(RuntimeError(f"build_send_request failed: {e}"))
+                self._get_or_connect_dealer(write_meta.peer_endpoint).send(
+                    _make_kv_result_msg(
+                        self._instance_rank,
+                        write_meta.unique_rid,
+                        write_meta.slice_id,
+                        True,  # is_last_slice — ensures receiver resolves its task future
+                        AgentResult.FAILED,
+                    )
+                )
+                return
             if timer:
                 timer.record_transfer_start(write_meta.peer_rank)
             try:
@@ -758,18 +776,14 @@ class Sender(SenderBase):
                 src_block_ids = src_block_ids_per_groups[self_lg]
                 dst_block_ids = dst_block_ids_per_groups[peer_lg]
 
-                # Speculative decoding: generation may have one extra draft-token block.
+                # Both sides trim block lists to ceil(prompt_len / tpb) in
+                # _create_kv_slice, so dst must never exceed src. A smaller dst
+                # (generation prefix-cache reuse) is handled via dst_start below.
                 block_diff = dst_block_ids.size - src_block_ids.size
-                if block_diff == 1:
-                    logger.debug(
-                        f"Trimming 1 extra dst block for draft tokens: "
-                        f"src={src_block_ids.size}, dst={dst_block_ids.size}"
-                    )
-                    dst_block_ids = dst_block_ids[:-1]
-                elif block_diff > 1:
+                if block_diff > 0:
                     raise ValueError(
                         f"src/dst block count mismatch: {src_block_ids.size} vs "
-                        f"{dst_block_ids.size} (expected diff <= 1)"
+                        f"{dst_block_ids.size} (dst must not exceed src)"
                     )
                 tpb = extractor.page_table.tokens_per_block
                 token_range = task._slice.token_range
@@ -1508,9 +1522,8 @@ class Receiver(ReceiverBase):
             (peer_ri.layer_num_per_pp all-equal) or per-writer sizes differ. If that full per-stage
             list isn't available (shorter than the fan-in degree), be conservative and fall back.
         Otherwise fall back to the per-fragment path (correct, just not coalesced).
-        NOTE: equal layer COUNT == equal BYTES only when per-layer KV is uniform; for mixed layer
-        groups (e.g. differing slot_bytes) reserve()'s `total % num_writers` divisibility guard is the
-        backstop, and a fully size-aware split (per-writer offsets) would be the general fix."""
+        Equal layer count means equal bytes only when the per-block sizes match; reserve() rejects
+        the mismatched case, so this only needs the count to split evenly."""
         if overlap.duplicate_head_factor != 1:
             return False
         if overlap.overlap_pp_size > 1:
@@ -1995,13 +2008,16 @@ class RxSession(RxSessionBase):
             self._terminal_status = SessionStatus.CANCELLED
             exc = RuntimeError(f"RxSession {self.disagg_request_id} cancelled")
             for task in self._kv_tasks:
+                rid_slice = (self.disagg_request_id, task.slice_id)
                 if task.status == TaskStatus.INIT:
                     # INIT = reserved but no write in flight, so freeing its bounce reservation here
-                    # is safe (TRANSFERRING tasks keep running and self-release on SUCCESS/FAILED).
-                    self._receiver._bounce.release_idle_reservation(
-                        (self.disagg_request_id, task.slice_id)
-                    )
+                    # is safe.
+                    self._receiver._bounce.release_idle_reservation(rid_slice)
                     task.fail(exc)
+                elif task.status == TaskStatus.TRANSFERRING:
+                    # A write may still be mid-flight, so quarantine the region rather than freeing
+                    # it; this keeps a cancelled transfer from leaking. No-op when bounce is off.
+                    self._receiver._bounce.orphan_reservation(rid_slice)
         # Send outside the lock to avoid holding it during I/O.
         self._receiver.send_cancel_to_senders(self.disagg_request_id, self._sender_endpoints)
 
@@ -2059,6 +2075,10 @@ class RxSession(RxSessionBase):
             self.aux_slot = None
         # Unregister from Receiver; keep fields alive for in-flight listener messages.
         if self._receiver is not None:
+            # Reclaim any bounce region still live at teardown (closed mid-transfer) so it isn't
+            # leaked; a no-op for finished or non-bounce transfers.
+            for task in self._kv_tasks:
+                self._receiver._bounce.orphan_reservation((self.disagg_request_id, task.slice_id))
             self._receiver.clear_session(self.disagg_request_id)
 
     def __enter__(self):

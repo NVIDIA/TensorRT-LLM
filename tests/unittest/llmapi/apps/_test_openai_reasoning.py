@@ -9,12 +9,9 @@ from .openai_server import RemoteOpenAIServer
 pytestmark = pytest.mark.threadleak(enabled=False)
 
 
-# Note: Qwen3 model is not supported with TRT backend.
-# TRT backend with enabled beam search can run test cases with and without beam search.
 @pytest.fixture(
     scope="module",
     params=[
-        ("DeepSeek-R1-Distill-Qwen-1.5B", "trt", True),
         ("DeepSeek-R1-Distill-Qwen-1.5B", "pytorch", False),
         ("DeepSeek-R1-Distill-Qwen-1.5B", "pytorch", True),
         ("Qwen3/Qwen3-0.6B", "pytorch", False),
@@ -71,8 +68,6 @@ def test_reasoning_parser(client: openai.OpenAI, model_name: str, backend: str,
                           use_beam_search: bool):
     if backend == "pytorch" and use_beam_search != enable_beam_search:
         pytest.skip("PyTorch backend fixes beam width on startup.")
-    if backend == "trt" and not use_beam_search:
-        pytest.skip("Reduce test cases.")
 
     messages = [{"role": "user", "content": "hi"}]
     if not use_beam_search:

@@ -28,7 +28,7 @@ unset or when the safety sanitizer rejects the runtime value.
 
 ### `TorchLlmArgs`
 
-258 captured fields.
+261 captured fields.
 
 | Captured key | Annotation | Kind | Converter | Allowed values |
 |--------------|------------|------|-----------|----------------|
@@ -50,11 +50,12 @@ unset or when the safety sanitizer rejects the runtime value.
 | `batch_wait_timeout_iters` | `<class 'int'>` | `value` |  |  |
 | `batch_wait_timeout_ms` | `<class 'float'>` | `value` |  |  |
 | `cache_transceiver_config.backend` | `Optional[Literal['DEFAULT', 'UCX', 'NIXL', 'MOONCAKE', 'MPI']]` | `categorical` |  | `DEFAULT`, `UCX`, `NIXL`, `MOONCAKE`, `MPI` |
+| `cache_transceiver_config.kv_cache_bounce_size_mb` | `<class 'int'>` | `value` |  |  |
 | `cache_transceiver_config.kv_transfer_poll_interval_ms` | `Optional[Annotated[int, Gt(gt=0)]]` | `value` |  |  |
 | `cache_transceiver_config.kv_transfer_sender_future_timeout_ms` | `Optional[Annotated[int, Gt(gt=0)]]` | `value` |  |  |
 | `cache_transceiver_config.kv_transfer_timeout_ms` | `Optional[Annotated[int, Gt(gt=0)]]` | `value` |  |  |
 | `cache_transceiver_config.max_tokens_in_buffer` | `Optional[int]` | `value` |  |  |
-| `cache_transceiver_config.transceiver_runtime` | `Optional[Literal['CPP', 'PYTHON']]` | `categorical` |  | `CPP`, `PYTHON` |
+| `cache_transceiver_config.transceiver_runtime` | `Optional[Literal['CPP', 'PYTHON', 'auto']]` | `categorical` |  | `CPP`, `PYTHON`, `auto` |
 | `context_parallel_size` | `<class 'int'>` | `value` |  |  |
 | `cp_config.block_size` | `Optional[int]` | `value` |  |  |
 | `cp_config.cp_anchor_size` | `Optional[int]` | `value` |  |  |
@@ -70,7 +71,6 @@ unset or when the safety sanitizer rejects the runtime value.
 | `cuda_graph_config.mode` | `Literal['decode']` | `categorical` |  | `decode`, `encode` |
 | `cuda_graph_config.num_tokens` | `Optional[List[Annotated[int, Gt(gt=0)]]]` | `value` |  |  |
 | `cuda_graph_config.seq_lens` | `Optional[List[Annotated[int, Gt(gt=0)]]]` | `value` |  |  |
-| `disable_flashinfer_sampling` | `<class 'bool'>` | `value` |  |  |
 | `disable_overlap_scheduler` | `<class 'bool'>` | `value` |  |  |
 | `dtype` | `<class 'str'>` | `categorical` | allowlist | `auto`, `float16`, `bfloat16`, `float32` |
 | `dwdp_config.contention_opt` | `<class 'bool'>` | `value` |  |  |
@@ -88,6 +88,7 @@ unset or when the safety sanitizer rejects the runtime value.
 | `enable_layerwise_nvtx_marker` | `<class 'bool'>` | `value` |  |  |
 | `enable_lm_head_tp_in_adp` | `<class 'bool'>` | `value` |  |  |
 | `enable_lora` | `<class 'bool'>` | `value` |  |  |
+| `enable_low_latency_host_dispatch` | `<class 'bool'>` | `value` |  |  |
 | `enable_min_latency` | `<class 'bool'>` | `value` |  |  |
 | `enable_resource_governor` | `<class 'bool'>` | `value` |  |  |
 | `enable_speculative_beam_history_d2h` | `<class 'bool'>` | `value` |  |  |
@@ -155,6 +156,8 @@ unset or when the safety sanitizer rejects the runtime value.
 | `moe_config.use_low_precision_moe_combine` | `<class 'bool'>` | `value` |  |  |
 | `moe_expert_parallel_size` | `Optional[int]` | `value` |  |  |
 | `moe_tensor_parallel_size` | `Optional[int]` | `value` |  |  |
+| `multimodal_config.encoder_side_stream_max_ahead` | `<class 'int'>` | `value` |  |  |
+| `multimodal_config.video_pruning_rate` | `Optional[float]` | `value` |  |  |
 | `mx_config.preshard_strategy` | `<class 'str'>` | `categorical` | allowlist | `per_module` |
 | `mx_config.server_query_timeout_s` | `Optional[Annotated[int, Ge(ge=0)]]` | `value` |  |  |
 | `num_postprocess_workers` | `<class 'int'>` | `value` |  |  |
@@ -231,8 +234,8 @@ unset or when the safety sanitizer rejects the runtime value.
 | `sparse_attention_config.use_cute_dsl_paged_mqa_logits` | `<class 'bool'>` | `value` |  |  |
 | `sparse_attention_config.use_cute_dsl_topk` | `<class 'bool'>` | `value` |  |  |
 | `sparse_attention_config.window_size` | `<class 'int'>` | `value` |  |  |
-| `speculative_config.acceptance_length_threshold` | `Optional[Annotated[float, Ge(ge=0)]]` | `value` |  |  |
-| `speculative_config.acceptance_window` | `Optional[Annotated[int, Ge(ge=0)]]` | `value` |  |  |
+| `speculative_config.acceptance_rate_threshold` | `Optional[float]` | `value` |  |  |
+| `speculative_config.acceptance_rate_window_size` | `Optional[Annotated[int, Ge(ge=0)]]` | `value` |  |  |
 | `speculative_config.allow_advanced_sampling` | `<class 'bool'>` | `value` |  |  |
 | `speculative_config.begin_thinking_phase_token` | `<class 'int'>` | `value` |  |  |
 | `speculative_config.decoding_type` | `Literal['AUTO']` | `categorical` |  | `AUTO`, `DFlash`, `Draft_Target`, `Eagle3`, `Eagle`, `Lookahead`, `MTP`, `Medusa`, `NGram`, `PARD`, `SA`, `SaveState`, `User_Provided` |
@@ -289,11 +292,10 @@ unset or when the safety sanitizer rejects the runtime value.
 | `use_cute_dsl_bf16_gemm` | `<class 'bool'>` | `value` |  |  |
 | `use_cute_dsl_blockscaling_bmm` | `<class 'bool'>` | `value` |  |  |
 | `use_cute_dsl_blockscaling_mm` | `<class 'bool'>` | `value` |  |  |
-| `video_pruning_rate` | `Optional[float]` | `value` |  |  |
 
 ### `TrtLlmArgs`
 
-279 captured fields.
+280 captured fields.
 
 | Captured key | Annotation | Kind | Converter | Allowed values |
 |--------------|------------|------|-----------|----------------|
@@ -369,11 +371,12 @@ unset or when the safety sanitizer rejects the runtime value.
 | `build_config.weight_sparsity` | `<class 'bool'>` | `value` |  |  |
 | `build_config.weight_streaming` | `<class 'bool'>` | `value` |  |  |
 | `cache_transceiver_config.backend` | `Optional[Literal['DEFAULT', 'UCX', 'NIXL', 'MOONCAKE', 'MPI']]` | `categorical` |  | `DEFAULT`, `UCX`, `NIXL`, `MOONCAKE`, `MPI` |
+| `cache_transceiver_config.kv_cache_bounce_size_mb` | `<class 'int'>` | `value` |  |  |
 | `cache_transceiver_config.kv_transfer_poll_interval_ms` | `Optional[Annotated[int, Gt(gt=0)]]` | `value` |  |  |
 | `cache_transceiver_config.kv_transfer_sender_future_timeout_ms` | `Optional[Annotated[int, Gt(gt=0)]]` | `value` |  |  |
 | `cache_transceiver_config.kv_transfer_timeout_ms` | `Optional[Annotated[int, Gt(gt=0)]]` | `value` |  |  |
 | `cache_transceiver_config.max_tokens_in_buffer` | `Optional[int]` | `value` |  |  |
-| `cache_transceiver_config.transceiver_runtime` | `Optional[Literal['CPP', 'PYTHON']]` | `categorical` |  | `CPP`, `PYTHON` |
+| `cache_transceiver_config.transceiver_runtime` | `Optional[Literal['CPP', 'PYTHON', 'auto']]` | `categorical` |  | `CPP`, `PYTHON`, `auto` |
 | `calib_config.calib_batch_size` | `<class 'int'>` | `value` |  |  |
 | `calib_config.calib_batches` | `<class 'int'>` | `value` |  |  |
 | `calib_config.calib_max_seq_length` | `<class 'int'>` | `value` |  |  |
@@ -481,11 +484,11 @@ unset or when the safety sanitizer rejects the runtime value.
 | `quant_config.clamp_val` | `Optional[List[float]]` | `value` |  |  |
 | `quant_config.group_size` | `Optional[int]` | `value` |  |  |
 | `quant_config.has_zero_point` | `<class 'bool'>` | `value` |  |  |
-| `quant_config.kv_cache_quant_algo` | `Optional[tensorrt_llm.quantization.mode.QuantAlgo]` | `categorical` |  | `W8A16`, `W4A16`, `W4A16_AWQ`, `W4A8_AWQ`, `W8A16_GPTQ`, `W4A16_GPTQ`, `W8A8_SQ_PER_CHANNEL`, `W8A8_SQ_PER_TENSOR_PLUGIN`, `W8A8_SQ_PER_CHANNEL_PER_TOKEN_PLUGIN`, `W8A8_SQ_PER_CHANNEL_PER_TENSOR_PLUGIN`, `W8A8_SQ_PER_TENSOR_PER_TOKEN_PLUGIN`, `W4A8_QSERVE_PER_GROUP`, `W4A8_QSERVE_PER_CHANNEL`, `FP8`, `FP8_PER_CHANNEL_PER_TOKEN`, `FP8_BLOCK_SCALES`, `INT8`, `MIXED_PRECISION`, `NVFP4`, `W4A8_NVFP4_FP8`, `W4A8_MXFP4_FP8`, `W4A8_MXFP4_MXFP8`, `W4A16_MXFP4`, `MXFP8`, `NVFP4_AWQ`, `NVFP4_ARC`, `NO_QUANT` |
+| `quant_config.kv_cache_quant_algo` | `Optional[tensorrt_llm.quantization.mode.QuantAlgo]` | `categorical` |  | `W8A16`, `W4A16`, `W4A16_AWQ`, `W4A8_AWQ`, `W8A16_GPTQ`, `W4A16_GPTQ`, `W8A8_SQ_PER_CHANNEL`, `W8A8_SQ_PER_TENSOR_PLUGIN`, `W8A8_SQ_PER_CHANNEL_PER_TOKEN_PLUGIN`, `W8A8_SQ_PER_CHANNEL_PER_TENSOR_PLUGIN`, `W8A8_SQ_PER_TENSOR_PER_TOKEN_PLUGIN`, `W4A8_QSERVE_PER_GROUP`, `W4A8_QSERVE_PER_CHANNEL`, `FP8`, `FP8_PER_CHANNEL_PER_TOKEN`, `FP8_BLOCK_SCALES`, `INT8`, `MIXED_PRECISION`, `NVFP4`, `W4A8_NVFP4_FP8`, `W4A8_MXFP4_FP8`, `W4A8_MXFP4_MXFP8`, `W4A16_MXFP4`, `MXFP8`, `W4A16_NVFP4`, `NVFP4_AWQ`, `NVFP4_ARC`, `NO_QUANT` |
 | `quant_config.mamba_ssm_philox_rounds` | `<class 'int'>` | `value` |  |  |
 | `quant_config.mamba_ssm_stochastic_rounding` | `<class 'bool'>` | `value` |  |  |
 | `quant_config.pre_quant_scale` | `<class 'bool'>` | `value` |  |  |
-| `quant_config.quant_algo` | `Optional[tensorrt_llm.quantization.mode.QuantAlgo]` | `categorical` |  | `W8A16`, `W4A16`, `W4A16_AWQ`, `W4A8_AWQ`, `W8A16_GPTQ`, `W4A16_GPTQ`, `W8A8_SQ_PER_CHANNEL`, `W8A8_SQ_PER_TENSOR_PLUGIN`, `W8A8_SQ_PER_CHANNEL_PER_TOKEN_PLUGIN`, `W8A8_SQ_PER_CHANNEL_PER_TENSOR_PLUGIN`, `W8A8_SQ_PER_TENSOR_PER_TOKEN_PLUGIN`, `W4A8_QSERVE_PER_GROUP`, `W4A8_QSERVE_PER_CHANNEL`, `FP8`, `FP8_PER_CHANNEL_PER_TOKEN`, `FP8_BLOCK_SCALES`, `INT8`, `MIXED_PRECISION`, `NVFP4`, `W4A8_NVFP4_FP8`, `W4A8_MXFP4_FP8`, `W4A8_MXFP4_MXFP8`, `W4A16_MXFP4`, `MXFP8`, `NVFP4_AWQ`, `NVFP4_ARC`, `NO_QUANT` |
+| `quant_config.quant_algo` | `Optional[tensorrt_llm.quantization.mode.QuantAlgo]` | `categorical` |  | `W8A16`, `W4A16`, `W4A16_AWQ`, `W4A8_AWQ`, `W8A16_GPTQ`, `W4A16_GPTQ`, `W8A8_SQ_PER_CHANNEL`, `W8A8_SQ_PER_TENSOR_PLUGIN`, `W8A8_SQ_PER_CHANNEL_PER_TOKEN_PLUGIN`, `W8A8_SQ_PER_CHANNEL_PER_TENSOR_PLUGIN`, `W8A8_SQ_PER_TENSOR_PER_TOKEN_PLUGIN`, `W4A8_QSERVE_PER_GROUP`, `W4A8_QSERVE_PER_CHANNEL`, `FP8`, `FP8_PER_CHANNEL_PER_TOKEN`, `FP8_BLOCK_SCALES`, `INT8`, `MIXED_PRECISION`, `NVFP4`, `W4A8_NVFP4_FP8`, `W4A8_MXFP4_FP8`, `W4A8_MXFP4_MXFP8`, `W4A16_MXFP4`, `MXFP8`, `W4A16_NVFP4`, `NVFP4_AWQ`, `NVFP4_ARC`, `NO_QUANT` |
 | `quant_config.smoothquant_val` | `<class 'float'>` | `value` |  |  |
 | `quant_config.use_meta_recipe` | `<class 'bool'>` | `value` |  |  |
 | `reasoning_parser` | `Optional[str]` | `categorical` | allowlist | `auto`, `deepseek-r1`, `laguna`, `qwen3`, `qwen3_5`, `minimax_m2`, `minimax_m2_append_think`, `nano-v3`, `gemma4`, `kimi_k2`, `kimi_k25` |
@@ -529,8 +532,8 @@ unset or when the safety sanitizer rejects the runtime value.
 | `sparse_attention_config.use_cute_dsl_paged_mqa_logits` | `<class 'bool'>` | `value` |  |  |
 | `sparse_attention_config.use_cute_dsl_topk` | `<class 'bool'>` | `value` |  |  |
 | `sparse_attention_config.window_size` | `<class 'int'>` | `value` |  |  |
-| `speculative_config.acceptance_length_threshold` | `Optional[Annotated[float, Ge(ge=0)]]` | `value` |  |  |
-| `speculative_config.acceptance_window` | `Optional[Annotated[int, Ge(ge=0)]]` | `value` |  |  |
+| `speculative_config.acceptance_rate_threshold` | `Optional[float]` | `value` |  |  |
+| `speculative_config.acceptance_rate_window_size` | `Optional[Annotated[int, Ge(ge=0)]]` | `value` |  |  |
 | `speculative_config.allow_advanced_sampling` | `<class 'bool'>` | `value` |  |  |
 | `speculative_config.begin_thinking_phase_token` | `<class 'int'>` | `value` |  |  |
 | `speculative_config.decoding_type` | `Literal['AUTO']` | `categorical` |  | `AUTO`, `DFlash`, `Draft_Target`, `Eagle3`, `Eagle`, `Lookahead`, `MTP`, `Medusa`, `NGram`, `PARD`, `SA`, `SaveState`, `User_Provided` |

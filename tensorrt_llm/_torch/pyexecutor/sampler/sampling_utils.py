@@ -22,64 +22,53 @@ import abc
 import sys
 from collections.abc import Hashable
 from dataclasses import dataclass
-from typing import Any, Generic, Literal, Optional, Type, TypeAlias, TypeVar, cast
+from typing import Any, Literal, Optional, Type, TypeAlias, TypeVar, cast
 
 import torch
 
-from tensorrt_llm._torch.flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from tensorrt_llm._torch.pyexecutor.sampler.ops import flashinfer, vanilla
 
-# NB: these flashinfer op wrappers are plain Python functions that are safe to
-# import even without flashinfer installed (the flashinfer import inside
-# ops/flashinfer.py is itself guarded); they are only *called* under
-# IS_FLASHINFER_AVAILABLE. Importing them unconditionally keeps them defined for
-# static analysis (they are referenced unconditionally in the strategy impls).
+# These op wrappers are safe to import without flashinfer installed; they are
+# only called on the flashinfer sampler / speculative-worker paths.
 from tensorrt_llm._torch.pyexecutor.sampler.ops.flashinfer import (
-    sampling_from_probs_generator_op as sampling_from_probs_generator_op,
+    sampling_from_probs_op as sampling_from_probs_op,
 )
 from tensorrt_llm._torch.pyexecutor.sampler.ops.flashinfer import softmax_op as softmax_op
 from tensorrt_llm._torch.pyexecutor.sampler.ops.flashinfer import (
     top_k_mask_logits_op as top_k_mask_logits_op,
 )
 from tensorrt_llm._torch.pyexecutor.sampler.ops.flashinfer import (
-    top_k_sampling_from_probs_generator_op as top_k_sampling_from_probs_generator_op,
+    top_k_sampling_from_probs_op as top_k_sampling_from_probs_op,
 )
 from tensorrt_llm._torch.pyexecutor.sampler.ops.flashinfer import (
-    top_k_top_p_sampling_from_logits_with_generator_op as top_k_top_p_sampling_from_logits_with_generator_op,  # noqa: E501
+    top_k_top_p_sampling_from_logits_op as top_k_top_p_sampling_from_logits_op,
 )
 from tensorrt_llm._torch.pyexecutor.sampler.ops.flashinfer import (
     top_p_renorm_probs_op as top_p_renorm_probs_op,
 )
 from tensorrt_llm._torch.pyexecutor.sampler.ops.flashinfer import (
-    top_p_sampling_from_probs_generator_op as top_p_sampling_from_probs_generator_op,
+    top_p_sampling_from_probs_op as top_p_sampling_from_probs_op,
+)
+from tensorrt_llm._torch.pyexecutor.sampler.ops.vanilla import (
+    GREEDY_TEMPERATURE_THRESHOLD as GREEDY_TEMPERATURE_THRESHOLD,
 )
 from tensorrt_llm._torch.pyexecutor.sampler.ops.vanilla import (
     BeamSearchMetadata as BeamSearchMetadata,
 )
+from tensorrt_llm._torch.pyexecutor.sampler.ops.vanilla import Fusions as Fusions
 from tensorrt_llm._torch.pyexecutor.sampler.ops.vanilla import StrategyMetadata as StrategyMetadata
-from tensorrt_llm._torch.pyexecutor.sampler.ops.vanilla import _Fusions as _Fusions
 from tensorrt_llm._torch.pyexecutor.sampler.ops.vanilla import (
     beam_search_sampling_batch as beam_search_sampling_batch,
 )
 from tensorrt_llm._torch.pyexecutor.sampler.ops.vanilla import (
     get_rejected_indices as get_rejected_indices,
 )
-from tensorrt_llm._torch.pyexecutor.sampler.ops.vanilla import greedy as _torch_greedy
 from tensorrt_llm._torch.pyexecutor.sampler.ops.vanilla import (
     greedy_search_sampling_batch as greedy_search_sampling_batch,
 )
 from tensorrt_llm._torch.pyexecutor.sampler.ops.vanilla import sample_rejected as sample_rejected
 from tensorrt_llm._torch.pyexecutor.sampler.ops.vanilla import (
-    temperature_sampling_batch as temperature_sampling_batch,
-)
-from tensorrt_llm._torch.pyexecutor.sampler.ops.vanilla import (
-    top_k_sampling_batch as top_k_sampling_batch,
-)
-from tensorrt_llm._torch.pyexecutor.sampler.ops.vanilla import (
     top_k_top_p_sampling_batch as top_k_top_p_sampling_batch,
-)
-from tensorrt_llm._torch.pyexecutor.sampler.ops.vanilla import (
-    top_p_sampling_batch as top_p_sampling_batch,
 )
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.sampling_params import SamplingParams
@@ -100,7 +89,8 @@ GREEDY: Greedy = ("greedy", None)
 
 Strategy: TypeAlias = TopK | TopP | Greedy | TopKTopP | TemperatureOnly | BeamSearch
 
-BEAM_SEARCH_PAD_TOKEN = -1
+# Re-exported from the beam-search op implementation (single source of truth).
+BEAM_SEARCH_PAD_TOKEN = vanilla.BEAM_SEARCH_PAD_TOKEN
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -183,14 +173,14 @@ def sample(
     # 'cast' needed b/c of https://github.com/python/mypy/issues/19081
     match strategy:
         case ("top_k", top_k, temperature):
-            tokens, softmax = top_k_sampling_batch(
+            tokens, softmax = top_k_top_p_sampling_batch(
                 logits,
                 top_k=cast(int, top_k),
                 temperature=cast(float, temperature),
                 generator=generator,
             )
         case ("top_p", top_p, temperature):
-            tokens, softmax = top_p_sampling_batch(
+            tokens, softmax = top_k_top_p_sampling_batch(
                 logits,
                 top_p=cast(float, top_p),
                 generator=generator,
@@ -205,7 +195,7 @@ def sample(
                 generator=generator,
             )
         case ("temperature", temperature):
-            tokens, softmax = temperature_sampling_batch(
+            tokens, softmax = top_k_top_p_sampling_batch(
                 logits,
                 temperature=cast(float, temperature),
                 generator=generator,
@@ -229,92 +219,6 @@ def sample(
 
 
 GenericStrategyKeyType = TypeVar("GenericStrategyKeyType", bound=Hashable)
-
-
-class GroupedStrategySampler(Generic[GenericStrategyKeyType], abc.ABC):
-    @staticmethod
-    @abc.abstractmethod
-    def strategy_grouping_key(strategy: Strategy) -> GenericStrategyKeyType:
-        raise NotImplementedError
-
-    @staticmethod
-    @abc.abstractmethod
-    def get_metadata_type_for_group(
-        strategy_key: GenericStrategyKeyType,
-    ) -> Type[StrategyMetadata] | None:
-        raise NotImplementedError
-
-    @staticmethod
-    @abc.abstractmethod
-    def sample_grouped_strategies(
-        group_key: GenericStrategyKeyType,
-        strategies: list[Strategy],
-        logits: torch.Tensor,
-        *,
-        group_logit_indices: torch.Tensor | None = None,
-        generator: torch.Generator | None = None,
-        return_probs: bool,
-        group_metadata: StrategyMetadata | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor | None, float | torch.Tensor | None]:
-        """Sample grouped strategies.
-
-        Returns:
-          - Sampled tokens
-          - Processed probs (whenever return_probs=True)
-          - Temperature (used to compute processed _log_ probs)
-        """
-        raise NotImplementedError
-
-
-class SimpleGroupedStrategySampler(GroupedStrategySampler[Strategy]):
-    STRATEGY_KEY_TYPE: TypeAlias = Strategy
-
-    @override
-    @staticmethod
-    def strategy_grouping_key(strategy: Strategy) -> STRATEGY_KEY_TYPE:
-        return strategy
-
-    @override
-    @staticmethod
-    def get_metadata_type_for_group(
-        strategy_key: STRATEGY_KEY_TYPE,
-    ) -> Type[StrategyMetadata] | None:
-        match strategy_key:
-            case ("beam_search", _, _, _):
-                return BeamSearchMetadata
-            case _:
-                return None
-
-    @override
-    @staticmethod
-    def sample_grouped_strategies(
-        group_key: STRATEGY_KEY_TYPE,
-        strategies: list[Strategy],
-        logits: torch.Tensor,
-        *,
-        group_logit_indices: torch.Tensor | None = None,
-        generator: torch.Generator | None = None,
-        return_probs: bool,
-        group_metadata: StrategyMetadata | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor | None, float | torch.Tensor | None]:
-        if group_key[0] == "beam_search":
-            beam_width_in = group_key[1]
-        else:
-            beam_width_in = 1
-
-        if group_logit_indices is not None:
-            logits = logits[group_logit_indices]
-        assert logits.size(0) == beam_width_in * len(strategies)
-
-        assert all(strategy == group_key for strategy in strategies), "group must be consistent"
-
-        return sample(
-            group_key,
-            logits,
-            generator=generator,
-            return_probs=return_probs,
-            group_metadata=group_metadata,
-        )
 
 
 class _StrategyImpls:
@@ -345,8 +249,19 @@ class _StrategyImpls:
         ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
             pass
 
+        # TODO: Revisit this after determining performance impact
+        #
+        # NB: NaN logits can lead to crashes, see
+        #     https://github.com/flashinfer-ai/flashinfer/issues/1575
+        #
         @staticmethod
         def _flashinfer_check_nans(inputs: torch.Tensor) -> bool:
+            # Deliberately returns False to keep FlashInfer's own 'check_nan' path
+            # disabled: that path is a host-side `if torch.any(torch.isnan(...))`,
+            # which forces a device sync on every call. The explicit async
+            # device-side assert below provides the same protection without
+            # stalling the pipeline.
+            # https://github.com/pytorch/pytorch/issues/36853
             torch._assert_async(~torch.any(torch.isnan(inputs)))
             return False
 
@@ -386,8 +301,8 @@ class _StrategyImpls:
             probs: torch.Tensor,
             generator: Optional[torch.Generator],
         ) -> torch.Tensor:
-            return sampling_from_probs_generator_op(
-                probs, generator, check_nan=cls._flashinfer_check_nans(probs)
+            return sampling_from_probs_op(
+                probs, generator=generator, check_nan=cls._flashinfer_check_nans(probs)
             )
 
         def _sample_greedy_with_probs(
@@ -646,11 +561,11 @@ class _StrategyImpls:
             logits = self._prepare_logits_with_temperature(
                 logits, group_logit_indices, self._temperature
             )
-            return top_k_top_p_sampling_from_logits_with_generator_op(
+            return top_k_top_p_sampling_from_logits_op(
                 logits,
                 self._top_k,
                 self._top_p,
-                generator,
+                generator=generator,
                 check_nan=self._flashinfer_check_nans(logits),
             ), None
 
@@ -681,8 +596,11 @@ class _StrategyImpls:
             probs = self._prepare_probs_with_temperature(
                 logits, group_logit_indices, self._temperature
             )
-            return top_k_sampling_from_probs_generator_op(
-                probs, self._top_k, generator, check_nan=self._flashinfer_check_nans(probs)
+            return top_k_sampling_from_probs_op(
+                probs,
+                self._top_k,
+                generator=generator,
+                check_nan=self._flashinfer_check_nans(probs),
             ), None
 
     class TopPSampleOnly(StrategyImplSampleOnly):
@@ -712,8 +630,11 @@ class _StrategyImpls:
             probs = self._prepare_probs_with_temperature(
                 logits, group_logit_indices, self._temperature
             )
-            return top_p_sampling_from_probs_generator_op(
-                probs, self._top_p, generator, check_nan=self._flashinfer_check_nans(probs)
+            return top_p_sampling_from_probs_op(
+                probs,
+                self._top_p,
+                generator=generator,
+                check_nan=self._flashinfer_check_nans(probs),
             ), None
 
     class TemperatureOnlySampleOnly(StrategyImplSampleOnly):
@@ -804,12 +725,11 @@ _STRATEGY_KEY_TYPE: TypeAlias = (
 )
 
 
-class FlashInferGroupedStrategySampler(GroupedStrategySampler[_STRATEGY_KEY_TYPE]):
+class FlashInferGroupedStrategySampler:
     """Implements batched sampling with FlashInfer.sampling kernels."""
 
     STRATEGY_KEY_TYPE: TypeAlias = _STRATEGY_KEY_TYPE
 
-    @override
     @staticmethod
     def strategy_grouping_key(strategy: Strategy) -> _STRATEGY_KEY_TYPE:
         match strategy:
@@ -826,7 +746,6 @@ class FlashInferGroupedStrategySampler(GroupedStrategySampler[_STRATEGY_KEY_TYPE
             case _:
                 raise NotImplementedError("Unsupported strategy encountered")
 
-    @override
     @staticmethod
     def get_metadata_type_for_group(
         strategy_key: _STRATEGY_KEY_TYPE,
@@ -837,7 +756,6 @@ class FlashInferGroupedStrategySampler(GroupedStrategySampler[_STRATEGY_KEY_TYPE
             case _:
                 return None
 
-    @override
     @staticmethod
     def sample_grouped_strategies(
         group_key: _STRATEGY_KEY_TYPE,
@@ -849,6 +767,13 @@ class FlashInferGroupedStrategySampler(GroupedStrategySampler[_STRATEGY_KEY_TYPE
         return_probs: bool,
         group_metadata: StrategyMetadata | None = None,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """Sample grouped strategies.
+
+        Returns:
+          - Sampled tokens
+          - Processed probs (whenever return_probs=True)
+          - Temperature (used to compute processed _log_ probs)
+        """
         beam_width_in = 1
         strategy_impl_cls: Type[_StrategyImpls.StrategyImpl]
         if return_probs:
@@ -900,7 +825,7 @@ class FlashInferGroupedStrategySampler(GroupedStrategySampler[_STRATEGY_KEY_TYPE
 
 
 # Re-export the torch greedy op (used by drafting_loops and speculative/interface).
-greedy = _torch_greedy
+greedy = greedy_search_sampling_batch
 
 # ---------------------------------------------------------------------------
 # Spec-decoding interface: compute_probs_from_logits (per-request tensor params)
@@ -911,12 +836,11 @@ def sanitize_top_k(top_k: torch.Tensor, vocab_size: int) -> torch.Tensor:
     """Map ``top_k`` into a backend-safe range before top-k filtering.
 
     Per ``SamplingParams``, ``top_k == 0`` means "all logits" (top-k disabled),
-    but the flashinfer (``top_k_mask_logits``) and PyTorch-native top-k paths
-    break on a literal 0 — they mask the entire row (all-zero probs) or gather
-    out of bounds. Mirror the C++ op (``dynamicTreeKernels.cu``): map any
-    non-positive value (and any oversized disable sentinel such as
-    ``INT32_MAX``) to ``vocab_size`` (== keep all tokens), leaving genuine
-    top_k values untouched.
+    but the flashinfer top-k kernels (``top_k_mask_logits``) break on a literal
+    0 — they mask the entire row (all-zero probs). Map any non-positive value
+    (and any oversized disable sentinel such as ``INT32_MAX``) to
+    ``vocab_size`` (== keep all tokens), leaving genuine top_k values
+    untouched.
     """
     return torch.where(top_k > 0, top_k, torch.full_like(top_k, vocab_size)).clamp(max=vocab_size)
 
@@ -928,24 +852,15 @@ def compute_probs_from_logits(
     top_k: Optional[torch.Tensor],
     top_p: Optional[torch.Tensor],
 ) -> torch.Tensor:
-    """Compute filtered+normalized probs. Dispatches: flashinfer → C++ op → CPU.
+    """Compute filtered+normalized probs via flashinfer (hard dependency).
 
-    ``temperatures``, ``top_k``, ``top_p`` are per-request tensors matching
-    the spec-decoding call site in interface.py.
+    ``temperatures``, ``top_k``, ``top_p`` are per-request tensors matching the
+    spec-decoding call site in interface.py.
     """
     if top_k is not None:
         top_k = sanitize_top_k(top_k, logits.shape[-1])
 
-    if logits.is_cuda and IS_FLASHINFER_AVAILABLE:
-        return flashinfer.compute_probs_from_logits_op(logits, temperatures, top_k, top_p)
-    if logits.is_cuda:
-        # TRT-LLM C++ op (CUDA, no flashinfer). The op keeps a skip_temperature
-        # flag; temperature is always applied here.
-        probs: torch.Tensor = torch.ops.trtllm.compute_probs_from_logits_op(
-            logits, temperatures, top_k, top_p, False
-        )
-        return probs
-    return vanilla.compute_probs_from_logits_op(logits, temperatures, top_k, top_p)
+    return flashinfer.compute_probs_from_logits_op(logits, temperatures, top_k, top_p)
 
 
 @torch.compile(options={"max-autotune": True})
@@ -954,26 +869,23 @@ def sampling_batch_spec_dec_one_model(
     temperatures: torch.Tensor,
     top_k: torch.Tensor,
     top_p: torch.Tensor,
-    seed: Optional[int] = None,
-    offset: Optional[int] = None,
+    seed: Optional[torch.Tensor] = None,
+    offset: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """CUDA-graph compatible sampling; supports mixed sampling params. Returns sampled tokens."""
     top_k = sanitize_top_k(top_k, logits.shape[-1])
     # Greedy rows (temperature <= threshold) must return the argmax token, not a
     # sample from the temperature-scaled distribution. Capture the argmax from the
-    # *original* logits up front; _safely_apply_temperature_inplace then guards the division
+    # *original* logits up front; safely_apply_temperature_inplace then guards the division
     # against the greedy sentinel, and torch.where restores the greedy rows below.
     # All ops are branch-free (no data-dependent control flow), so this stays
     # CUDA-graph safe.
-    is_greedy = temperatures <= vanilla._GREEDY_TEMPERATURE_THRESHOLD
+    is_greedy = temperatures <= vanilla.GREEDY_TEMPERATURE_THRESHOLD
     greedy_tokens = logits.argmax(dim=-1)
-    logits = vanilla._safely_apply_temperature_inplace(logits, temperatures)
-    if IS_FLASHINFER_AVAILABLE:
-        sampled = flashinfer.top_k_top_p_sampling_from_logits_op(
-            logits, top_k, top_p, seed=seed, offset=offset
-        )
-    else:
-        sampled = vanilla.forward_native_sampling(logits, top_k, top_p)
+    logits = vanilla.safely_apply_temperature_inplace(logits, temperatures)
+    sampled = flashinfer.top_k_top_p_sampling_from_logits_op(
+        logits, top_k, top_p, seed=seed, offset=offset
+    )
     # argmax yields int64; cast so torch.where preserves the sampler's dtype
     # (flashinfer returns int32) instead of promoting the result to int64.
     return torch.where(is_greedy, greedy_tokens.to(sampled.dtype), sampled)
@@ -989,14 +901,8 @@ def sampling_batch_spec_dec_one_model_for_rejection(
     offset: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Draft sampler returning tokens AND probs for the downstream rejection-sampling path."""
+    # Rejection sampling relies on flashinfer's seed/offset support for
+    # determinism and cross-rank consistency.
     probs = compute_probs_from_logits(logits, temperatures, top_k, top_p)
-    if not IS_FLASHINFER_AVAILABLE:
-        # The torch-native fallback samples from the global RNG and ignores
-        # seed/offset, which breaks determinism and cross-rank consistency that
-        # one-model speculative rejection sampling relies on. Require flashinfer
-        # instead of silently degrading (matches the pre-refactor behavior).
-        raise RuntimeError(
-            "Rejection sampling for one-model speculative decoding requires flashinfer"
-        )
     tokens = flashinfer.sampling_from_probs_op(probs, seed=seed, offset=offset)
     return tokens, probs

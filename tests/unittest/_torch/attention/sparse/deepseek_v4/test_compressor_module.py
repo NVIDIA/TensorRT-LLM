@@ -39,6 +39,7 @@ from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4.deepseek_v4 import
     DEEPSEEK_V4_SLIDING_ATTENTION,
     DeepseekV4AttentionType,
     DeepseekV4Indexer,
+    DeepseekV4TrtllmAttentionMetadata,
 )
 from tensorrt_llm._torch.modules.rotary_embedding import RopeParams
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState
@@ -359,6 +360,93 @@ INDEX_HEAD_DIM = 128  # Fixed head_dim for indexer (INDEXER_COMPRESS)
 MAX_BATCH, MAX_SEQ, PAGE_SIZE = 16, 4096, 128
 ORI_SEQ_LEN = 65536
 ROPE_THETA, ROPE_FACTOR, BETA_FAST, BETA_SLOW = 40000.0, 4, 32, 1
+
+
+def _active_compressed_position_ids(
+    compress_ratio, num_contexts, num_gen_tokens_per_seq, cached_tokens, kv_lens
+):
+    """Run the real metadata helpers and return IDs consumed by postprocess."""
+    batch_size = len(cached_tokens)
+    num_generations = batch_size - num_contexts
+    cached_tokens = torch.tensor(cached_tokens, dtype=torch.int32, device=DEVICE)
+    kv_lens = torch.tensor(kv_lens, dtype=torch.int32, device=DEVICE)
+
+    metadata = object.__new__(DeepseekV4TrtllmAttentionMetadata)
+    metadata.num_contexts = num_contexts
+    metadata.num_generations = num_generations
+    metadata.num_gen_tokens_per_seq = num_gen_tokens_per_seq
+    metadata._compress_ratios_sorted = [compress_ratio]
+    metadata.compressed_kv_lens_cuda = {
+        compress_ratio: torch.empty(batch_size, dtype=torch.int32, device=DEVICE)
+    }
+    metadata.past_kv_lens_cuda = {
+        compress_ratio: torch.empty(batch_size, dtype=torch.int32, device=DEVICE)
+    }
+    metadata.new_comp_kv_lens_cuda = {
+        compress_ratio: torch.empty(batch_size, dtype=torch.int32, device=DEVICE)
+    }
+    metadata.cu_new_comp_kv_cuda = {
+        compress_ratio: torch.empty(batch_size + 1, dtype=torch.int32, device=DEVICE)
+    }
+
+    ctx_comp = (
+        (kv_lens[:num_contexts] // compress_ratio)
+        - (cached_tokens[:num_contexts] // compress_ratio)
+    ).sum()
+    gen_slots = num_generations * ((num_gen_tokens_per_seq + compress_ratio - 1) // compress_ratio)
+    total_slots = int(ctx_comp.item()) + gen_slots
+    metadata.compressed_position_ids_cuda = {
+        compress_ratio: torch.full((total_slots,), -1, dtype=torch.int32, device=DEVICE)
+    }
+    compressed_mask = {compress_ratio: torch.empty(total_slots, dtype=torch.bool, device=DEVICE)}
+
+    metadata.prepare_compressed_kv_metadata(kv_lens, cached_tokens)
+    metadata._compute_compressed_mask(
+        metadata.new_comp_kv_lens_cuda,
+        metadata.cu_new_comp_kv_cuda,
+        compressed_mask,
+        batch_size,
+        {compress_ratio: total_slots},
+        [compress_ratio],
+    )
+
+    position_ids = metadata.compressed_position_ids_cuda[compress_ratio]
+    return position_ids[compressed_mask[compress_ratio]].cpu().tolist()
+
+
+@pytest.mark.parametrize(
+    "compress_ratio,next_n,cached_tokens,expected_position_ids",
+    [
+        pytest.param(4, 5, [4, 4], [4, 4], id="cr4_next5"),
+        pytest.param(4, 6, [4, 7], [4, 4, 8], id="cr4_next6_mixed"),
+        pytest.param(4, 7, [4, 6, 7], [4, 4, 8, 4, 8], id="cr4_next7_mixed"),
+        pytest.param(128, 8, [120, 128, 383], [0, 256], id="cr128_boundary_mixed"),
+    ],
+)
+def test_generation_position_ids_follow_compact_compressor_output(
+    compress_ratio, next_n, cached_tokens, expected_position_ids
+):
+    """Active postprocess rows use IDs in exact cu_new_comp ownership order."""
+    kv_lens = [cached + next_n for cached in cached_tokens]
+
+    actual_position_ids = _active_compressed_position_ids(
+        compress_ratio, 0, next_n, cached_tokens, kv_lens
+    )
+
+    assert actual_position_ids == expected_position_ids
+
+
+def test_mixed_context_generation_position_ids_follow_compact_output():
+    """Generation IDs remain compact after an exact context output prefix."""
+    actual_position_ids = _active_compressed_position_ids(
+        compress_ratio=4,
+        num_contexts=1,
+        num_gen_tokens_per_seq=5,
+        cached_tokens=[0, 4, 4],
+        kv_lens=[8, 9, 9],
+    )
+
+    assert actual_position_ids == [0, 4, 4, 4]
 
 
 def precompute_freqs_cis(

@@ -258,10 +258,6 @@ class TestLoggerAPI:
         singleton = Logger()
         assert hasattr(singleton, "rank")
 
-    def test_has_trt_logger(self):
-        singleton = Logger()
-        assert hasattr(singleton, "trt_logger")
-
     def test_log_once_deduplication(self, capture_log):
         singleton = Logger()
         singleton._min_severity = "info"

@@ -243,6 +243,7 @@ class TestLoadWeightsMxPath:
         )
         mapping = MagicMock(name="mapping")
         model = MagicMock(name="model")
+        prepare_receiver = MagicMock()
 
         with _install_fake_modelexpress(fake_mx):
             result = loader.load_weights(
@@ -250,11 +251,14 @@ class TestLoadWeightsMxPath:
                 mapping=mapping,
                 model=model,
                 source_identity=identity,
+                allow_post_transform_weights=True,
+                prepare_post_transform_receiver=prepare_receiver,
             )
 
         assert result == {}
         assert loader.is_weights_preloaded() is True
         assert loader.is_post_transform_weights_preloaded() is False
+        prepare_receiver.assert_not_called()
 
         # Verify the integration contract with the upstream library:
         # 1. Constructed MxLiveWeightLoader with our mx_server_url.
@@ -298,11 +302,14 @@ class TestLoadWeightsMxPath:
         assert result is fallback
         mock_super_load.assert_not_called()
 
-    def test_post_transform_full_success_sets_skip_signal_when_allowlisted(self):
+    def test_post_transform_full_success_prepares_receiver_before_p2p(self):
         identity = _identity()
         loader = MXCheckpointLoader(mx_server_url="http://mx:8001")
+        model = MagicMock(name="model")
+        events = []
+        prepare_receiver = MagicMock(side_effect=lambda _model: events.append("prepare_receiver"))
         fake_mx = _build_fake_modelexpress(
-            load_weights_return={},
+            load_weights_side_effect=lambda *_args, **_kwargs: events.append("p2p") or {},
             source_instances=[_source_instance(identity)],
         )
 
@@ -310,16 +317,19 @@ class TestLoadWeightsMxPath:
             result = loader.load_weights(
                 "/nonexistent",
                 mapping=MagicMock(),
-                model=MagicMock(),
+                model=model,
                 source_identity=identity,
                 allow_post_transform_weights=True,
+                prepare_post_transform_receiver=prepare_receiver,
             )
 
         assert result == {}
         assert loader.is_weights_preloaded() is True
         assert loader.is_post_transform_weights_preloaded() is True
+        prepare_receiver.assert_called_once_with(model)
+        assert events == ["prepare_receiver", "p2p"]
 
-    def test_post_transform_source_falls_back_before_p2p_when_not_allowlisted(self):
+    def test_post_transform_source_without_receiver_preparer_falls_back_before_p2p(self):
         identity = _identity()
         loader = MXCheckpointLoader(mx_server_url="http://mx:8001")
         disk_weights = {"disk.weight": MagicMock()}
@@ -339,7 +349,7 @@ class TestLoadWeightsMxPath:
                 mapping=MagicMock(),
                 model=MagicMock(),
                 source_identity=identity,
-                allow_post_transform_weights=False,
+                allow_post_transform_weights=True,
             )
 
         assert result is disk_weights
@@ -347,6 +357,39 @@ class TestLoadWeightsMxPath:
         assert loader.is_post_transform_weights_preloaded() is False
         mx_loader = fake_mx.trtllm_live_transfer.MxLiveWeightLoader.return_value
         mx_loader.load_weights.assert_not_called()
+        mock_super_load.assert_called_once()
+
+    def test_post_transform_source_falls_back_before_p2p_when_not_allowlisted(self):
+        identity = _identity()
+        loader = MXCheckpointLoader(mx_server_url="http://mx:8001")
+        disk_weights = {"disk.weight": MagicMock()}
+        prepare_receiver = MagicMock()
+        fake_mx = _build_fake_modelexpress(
+            load_weights_return={},
+            source_instances=[_source_instance(identity)],
+        )
+
+        with (
+            _install_fake_modelexpress(fake_mx),
+            patch.object(
+                HfCheckpointLoader, "load_weights", return_value=disk_weights
+            ) as mock_super_load,
+        ):
+            result = loader.load_weights(
+                "/nonexistent",
+                mapping=MagicMock(),
+                model=MagicMock(),
+                source_identity=identity,
+                allow_post_transform_weights=False,
+                prepare_post_transform_receiver=prepare_receiver,
+            )
+
+        assert result is disk_weights
+        assert loader.is_weights_preloaded() is False
+        assert loader.is_post_transform_weights_preloaded() is False
+        mx_loader = fake_mx.trtllm_live_transfer.MxLiveWeightLoader.return_value
+        mx_loader.load_weights.assert_not_called()
+        prepare_receiver.assert_not_called()
         mock_super_load.assert_called_once()
 
     @pytest.mark.parametrize(
@@ -360,6 +403,7 @@ class TestLoadWeightsMxPath:
         identity = _identity()
         loader = MXCheckpointLoader(mx_server_url="http://mx:8001")
         disk_weights = {"disk.weight": MagicMock()}
+        prepare_receiver = MagicMock()
         source_instance = _source_instance(identity)
         if protocol_value is _MISSING:
             source_instance.metadata.pop(_MX_TRANSFORM_PROTOCOL_VERSION_METADATA_KEY)
@@ -382,6 +426,7 @@ class TestLoadWeightsMxPath:
                 model=MagicMock(),
                 source_identity=identity,
                 allow_post_transform_weights=True,
+                prepare_post_transform_receiver=prepare_receiver,
             )
 
         assert result is disk_weights
@@ -389,12 +434,15 @@ class TestLoadWeightsMxPath:
         assert loader.is_post_transform_weights_preloaded() is False
         mx_loader = fake_mx.trtllm_live_transfer.MxLiveWeightLoader.return_value
         mx_loader.load_weights.assert_not_called()
+        prepare_receiver.assert_not_called()
         mock_super_load.assert_called_once()
 
     def test_selects_matching_source_metadata_from_multiple_instances(self):
         rank0_identity = _identity(rank=0)
         rank1_identity = _identity(rank=1)
         loader = MXCheckpointLoader(mx_server_url="http://mx:8001")
+        model = MagicMock(name="model")
+        prepare_receiver = MagicMock()
         fake_mx = _build_fake_modelexpress(
             load_weights_return={},
             source_instances=[
@@ -410,14 +458,16 @@ class TestLoadWeightsMxPath:
             result = loader.load_weights(
                 "/nonexistent",
                 mapping=MagicMock(),
-                model=MagicMock(),
+                model=model,
                 source_identity=rank1_identity,
                 allow_post_transform_weights=True,
+                prepare_post_transform_receiver=prepare_receiver,
             )
 
         assert result == {}
         assert loader.is_weights_preloaded() is True
         assert loader.is_post_transform_weights_preloaded() is True
+        prepare_receiver.assert_called_once_with(model)
         mock_super_load.assert_not_called()
 
     def test_post_transform_mixed_success_falls_back_to_full_disk_load(self):
@@ -428,6 +478,8 @@ class TestLoadWeightsMxPath:
         loader = MXCheckpointLoader(mx_server_url="http://mx:8001")
         fallback = {"some.weight": MagicMock(numel=lambda: 1, element_size=lambda: 4)}
         disk_weights = {"disk.weight": MagicMock()}
+        model = MagicMock(name="model")
+        prepare_receiver = MagicMock()
         fake_mx = _build_fake_modelexpress(
             load_weights_return=fallback,
             source_instances=[_source_instance(identity)],
@@ -442,14 +494,16 @@ class TestLoadWeightsMxPath:
             result = loader.load_weights(
                 "/nonexistent",
                 mapping=MagicMock(),
-                model=MagicMock(),
+                model=model,
                 source_identity=identity,
                 allow_post_transform_weights=True,
+                prepare_post_transform_receiver=prepare_receiver,
             )
 
         assert result is disk_weights
         assert loader.is_weights_preloaded() is False
         assert loader.is_post_transform_weights_preloaded() is False
+        prepare_receiver.assert_called_once_with(model)
         mock_super_load.assert_called_once()
 
     def test_post_transform_source_can_be_disallowed_before_p2p(self):
@@ -460,6 +514,7 @@ class TestLoadWeightsMxPath:
         identity = _identity()
         loader = MXCheckpointLoader(mx_server_url="http://mx:8001")
         disk_weights = {"disk.weight": MagicMock()}
+        prepare_receiver = MagicMock()
         fake_mx = _build_fake_modelexpress(
             load_weights_return={},
             source_instances=[_source_instance(identity)],
@@ -477,12 +532,14 @@ class TestLoadWeightsMxPath:
                 model=MagicMock(),
                 source_identity=identity,
                 allow_post_transform_weights=False,
+                prepare_post_transform_receiver=prepare_receiver,
             )
 
         assert result is disk_weights
         assert loader.is_weights_preloaded() is False
         assert loader.is_post_transform_weights_preloaded() is False
         fake_mx.trtllm_live_transfer.MxLiveWeightLoader.assert_not_called()
+        prepare_receiver.assert_not_called()
         mock_super_load.assert_called_once()
 
 

@@ -226,6 +226,11 @@ public:
     [[nodiscard]] virtual bool checkGenTransferComplete() const = 0;
 
     virtual bool cancelRequest(std::shared_ptr<LlmRequest> llmRequest) = 0;
+
+    [[nodiscard]] virtual bool hasPoisonedTransferBuffer() const
+    {
+        return false;
+    }
 };
 
 class CacheTransceiver : public BaseCacheTransceiver
@@ -237,7 +242,6 @@ public:
         executor::kv_cache::CacheState::AttentionType attentionType
         = executor::kv_cache::CacheState::AttentionType::kDEFAULT,
         std::optional<executor::CacheTransceiverConfig> cacheTransceiverConfig = std::nullopt,
-        rnn_state_manager::RnnStateManager* rnnStateManager = nullptr,
         std::vector<SizeType32> const& rnnLayerNumPerPP = {});
 
     CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheManager, std::vector<SizeType32> numKvHeadsPerLayer,
@@ -246,11 +250,10 @@ public:
         executor::kv_cache::CacheState::AttentionType attentionType
         = executor::kv_cache::CacheState::AttentionType::kDEFAULT,
         std::optional<executor::CacheTransceiverConfig> cacheTransceiverConfig = std::nullopt,
-        rnn_state_manager::RnnStateManager* rnnStateManager = nullptr,
         std::vector<SizeType32> const& rnnLayerNumPerPP = {})
         : CacheTransceiver(cacheManager,
             executor::kv_cache::CacheState::ModelConfig{numKvHeadsPerLayer, sizePerHead, tokensPerBlock}, worldConfig,
-            attentionLayerNumPerPP, dataType, attentionType, cacheTransceiverConfig, rnnStateManager, rnnLayerNumPerPP)
+            attentionLayerNumPerPP, dataType, attentionType, cacheTransceiverConfig, rnnLayerNumPerPP)
     {
     }
 
@@ -273,6 +276,8 @@ public:
 
     virtual bool cancelRequest(std::shared_ptr<LlmRequest> llmRequest) override;
 
+    [[nodiscard]] bool hasPoisonedTransferBuffer() const override;
+
 private:
     void initializeCommState();
 
@@ -285,9 +290,12 @@ private:
     // request while a C++ status check still dereferences it.
     std::vector<std::pair<std::shared_ptr<LlmRequest>, std::future<void>>> mSenderFutures;
     std::vector<std::pair<std::shared_ptr<LlmRequest>, std::future<void>>> mRequesterFutures;
-    // Dedup sets so observe-only timeout WARN logs fire at most once per stuck request.
+    // Dedup timeout logs separately from accepted cancellation requests so a
+    // backend that initially declines cancellation is retried on later polls.
     std::unordered_set<LlmRequest::RequestIdType> mTimedOutSenderIds;
     std::unordered_set<LlmRequest::RequestIdType> mTimedOutRequesterIds;
+    std::unordered_set<LlmRequest::RequestIdType> mCancelRequestedSenderIds;
+    std::unordered_set<LlmRequest::RequestIdType> mCancelRequestedRequesterIds;
     std::unordered_set<LlmRequest::RequestIdType> mCompletedSenderRequestIds;
     std::unordered_set<LlmRequest::RequestIdType> mFailedSenderRequestIds;
     std::unordered_map<LlmRequest::RequestIdType, std::shared_ptr<LlmRequest>> mSenderRequestsAwaitingConsensus;
@@ -306,7 +314,6 @@ private:
     std::vector<std::unique_ptr<kv_cache_manager::CacheTransBufferManager>> mCacheTransBufferManagers;
     std::vector<BaseTransBufferManager*> mCacheTransBufferManagerPtrs;
 
-    rnn_state_manager::RnnStateManager* mRnnStateManager{nullptr};
     // TODO(shreyasm): update this to use same container as kv by using base trans buffers instead
     std::unique_ptr<rnn_state_manager::RnnCacheTransBufferManager> mRnnCacheTransBufferManager{nullptr};
 

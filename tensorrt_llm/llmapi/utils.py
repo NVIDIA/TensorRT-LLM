@@ -149,7 +149,12 @@ def get_device_count() -> int:
     return torch.cuda.device_count() if torch.cuda.is_available() else 0
 
 
-def get_total_gpu_memory(device: int) -> float:
+def get_total_gpu_memory(device: int) -> int:
+    # Compat for no GPU environment, only for device=0.
+    # Otherwise, the caller should ensure there are that many GPUs.
+    if device == 0 and get_device_count() == 0:
+        return 0
+
     return torch.cuda.get_device_properties(device).total_memory
 
 

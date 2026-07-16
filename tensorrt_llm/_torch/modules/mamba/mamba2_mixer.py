@@ -24,8 +24,6 @@ from torch import nn
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
 from tensorrt_llm._torch.modules.multi_stream_utils import \
     maybe_execute_in_parallel
-from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import \
-    use_cpp_mamba_cache_manager
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
@@ -308,17 +306,10 @@ class Mamba2Mixer(nn.Module):
 
         state_indices = mamba_metadata.state_indices[:num_prefills +
                                                      num_decodes]
-        if use_cpp_mamba_cache_manager():
-            conv_states = attn_metadata.kv_cache_manager.get_conv_states(
-                self.layer_idx)
-            ssm_states = attn_metadata.kv_cache_manager.get_ssm_states(
-                self.layer_idx)
-            layer_cache = None  # Not used in C++ path
-        else:
-            layer_cache = attn_metadata.kv_cache_manager.mamba_layer_cache(
-                self.layer_idx)
-            conv_states = layer_cache.conv
-            ssm_states = layer_cache.temporal
+        layer_cache = attn_metadata.kv_cache_manager.mamba_layer_cache(
+            self.layer_idx)
+        conv_states = layer_cache.conv
+        ssm_states = layer_cache.temporal
 
         state_indices_p, state_indices_d = torch.split(state_indices,
                                                        batch_split_size)

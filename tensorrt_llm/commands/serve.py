@@ -11,7 +11,7 @@ import subprocess  # nosec B404
 import sys
 import uuid
 from pathlib import Path
-from typing import Any, Dict, Mapping, Optional, Sequence, Set
+from typing import Any, Dict, Optional, Sequence, Set
 
 import click
 import torch
@@ -22,24 +22,20 @@ from torch.cuda import device_count
 
 from tensorrt_llm import LLM as PyTorchLLM
 from tensorrt_llm import MultimodalEncoder
-from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm._utils import mpi_rank
 from tensorrt_llm.commands._serve_stability import stability_option
 from tensorrt_llm.commands.utils import (collect_explicit_cli_keys,
                                          get_is_diffusion_only_model)
 from tensorrt_llm.executor.utils import LlmLauncherEnvs
 from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
-from tensorrt_llm.llmapi import (BuildConfig, CapacitySchedulerPolicy,
-                                 DynamicBatchConfig, KvCacheConfig,
-                                 SchedulerConfig)
+from tensorrt_llm.llmapi import KvCacheConfig
 from tensorrt_llm.llmapi.disagg_utils import (DisaggClusterConfig,
                                               MetadataServerConfig, ServerRole,
                                               extract_disagg_cluster_config,
                                               parse_disagg_config_file,
                                               parse_metadata_server_config_file,
                                               validate_config_bool)
-from tensorrt_llm.llmapi.llm_args import (MultimodalConfig, TorchLlmArgs,
-                                          TrtLlmArgs)
+from tensorrt_llm.llmapi.llm_args import MultimodalConfig, TorchLlmArgs
 from tensorrt_llm.llmapi.llm_utils import update_llm_args_with_extra_dict
 from tensorrt_llm.llmapi.mpi_session import find_free_ipc_addr
 from tensorrt_llm.llmapi.reasoning_parser import (ReasoningParserFactory,
@@ -157,9 +153,7 @@ def is_non_default_or_required(param_name, value, backend, explicit_cli_keys):
            for s in cli_derived_fields.get(param_name, ())):
         return True
 
-    if backend == "tensorrt":
-        llm_args_class = TrtLlmArgs
-    elif backend == "_autodeploy":
+    if backend == "_autodeploy":
         from tensorrt_llm._torch.auto_deploy.llm_args import \
             LlmArgs as AutoDeployLlmArgs
         llm_args_class = AutoDeployLlmArgs
@@ -179,19 +173,21 @@ def is_non_default_or_required(param_name, value, backend, explicit_cli_keys):
     return value != default
 
 
+# CLI/API defaults are sourced from the TorchLlmArgs field defaults so they stay
+# in lock-step with the args class and can't drift.
+_LLM_ARGS_FIELDS = TorchLlmArgs.model_fields
+
+
 def get_llm_args(
         model: str,
         tokenizer: Optional[str] = None,
         custom_tokenizer: Optional[str] = None,
         post_processor_hook: Optional[str] = None,
         backend: str = "pytorch",
-        max_beam_width: int = BuildConfig.model_fields["max_beam_width"].
-    default,
-        max_batch_size: int = BuildConfig.model_fields["max_batch_size"].
-    default,
-        max_num_tokens: int = BuildConfig.model_fields["max_num_tokens"].
-    default,
-        max_seq_len: int = BuildConfig.model_fields["max_seq_len"].default,
+        max_beam_width: int = _LLM_ARGS_FIELDS["max_beam_width"].default,
+        max_batch_size: int = _LLM_ARGS_FIELDS["max_batch_size"].default,
+        max_num_tokens: int = _LLM_ARGS_FIELDS["max_num_tokens"].default,
+        max_seq_len: int = None,
         tensor_parallel_size: int = 1,
         pipeline_parallel_size: int = 1,
         context_parallel_size: int = 1,
@@ -250,19 +246,8 @@ def get_llm_args(
                       dtype=kv_cache_dtype),
         "cp_config":
         cp_config,
-        "build_config":
-        BuildConfig(max_batch_size=max_batch_size,
-                    max_num_tokens=max_num_tokens,
-                    max_beam_width=max_beam_width,
-                    max_seq_len=max_seq_len) if backend == "tensorrt" else None,
         "scheduler_config":
-        SchedulerConfig(capacity_scheduler_policy=CapacitySchedulerPolicy.
-                        GUARANTEED_NO_EVICT,
-                        dynamic_batch_config=DynamicBatchConfig(
-                            enable_batch_size_tuning=True,
-                            enable_max_num_tokens_tuning=False,
-                            dynamic_batch_moving_average_window=128))
-        if backend == "tensorrt" else None,
+        None,
         "max_batch_size":
         max_batch_size,
         "max_beam_width":
@@ -419,9 +404,6 @@ def launch_server(
             # AutoDeploy does not support build_config
             llm_args.pop("build_config", None)
             llm = AutoDeployLLM(**llm_args)
-        elif backend == 'tensorrt' or backend == 'trt':
-            llm_args.pop("backend")
-            llm = LLM(**llm_args)
         else:
             raise click.BadParameter(
                 f"{backend} is not a known backend, check help for available options.",
@@ -489,9 +471,6 @@ def launch_grpc_server(host: str,
             from tensorrt_llm._torch.auto_deploy import LLM as AutoDeployLLM
             llm_args.pop("build_config", None)
             llm = AutoDeployLLM(**llm_args)
-        elif backend == "tensorrt" or backend == "trt":
-            llm_args.pop("backend")
-            llm = LLM(**llm_args)
         else:
             raise click.BadParameter(
                 f"{backend} is not a known backend, check help for available options.",
@@ -764,27 +743,6 @@ def launch_visual_gen_server(
         uvloop.run(server(host, port, sockets=[s]))
 
 
-class ChoiceWithAlias(click.Choice):
-
-    def __init__(self,
-                 choices: Sequence[str],
-                 aliases: Mapping[str, str],
-                 case_sensitive: bool = True) -> None:
-        super().__init__(choices, case_sensitive)
-        self.aliases = aliases
-
-    def to_info_dict(self) -> Dict[str, Any]:
-        info_dict = super().to_info_dict()
-        info_dict["aliases"] = self.aliases
-        return info_dict
-
-    def convert(self, value: Any, param: Optional["click.Parameter"],
-                ctx: Optional["click.Context"]) -> Any:
-        if value in self.aliases:
-            value = self.aliases[value]
-        return super().convert(value, param, ctx)
-
-
 @click.command("serve")
 @click.argument("model", type=str)
 @stability_option(
@@ -826,8 +784,7 @@ class ChoiceWithAlias(click.Choice):
                   status="beta")
 @stability_option(
     "--backend",
-    type=ChoiceWithAlias(["pytorch", "tensorrt", "_autodeploy"],
-                         {"trt": "tensorrt"}),
+    type=click.Choice(["pytorch", "_autodeploy"]),
     default="pytorch",
     help="The backend to use to serve the model. Default is pytorch backend.",
     status="beta")
@@ -847,26 +804,26 @@ class ChoiceWithAlias(click.Choice):
                   status="beta")
 @stability_option("--max_beam_width",
                   type=int,
-                  default=BuildConfig.model_fields["max_beam_width"].default,
+                  default=_LLM_ARGS_FIELDS["max_beam_width"].default,
                   help="Maximum number of beams for beam search decoding.",
                   status="beta")
 @stability_option(
     "--max_batch_size",
     type=int,
-    default=BuildConfig.model_fields["max_batch_size"].default,
+    default=_LLM_ARGS_FIELDS["max_batch_size"].default,
     help="Maximum number of requests that the engine can schedule.",
     status="beta")
 @stability_option(
     "--max_num_tokens",
     type=int,
-    default=BuildConfig.model_fields["max_num_tokens"].default,
+    default=_LLM_ARGS_FIELDS["max_num_tokens"].default,
     help=
     "Maximum number of batched input tokens after padding is removed in each batch.",
     status="beta")
 @stability_option(
     "--max_seq_len",
     type=int,
-    default=BuildConfig.model_fields["max_seq_len"].default,
+    default=None,
     help="Maximum total length of one request, including prompt and outputs. "
     "If unspecified, the value is deduced from the model config.",
     status="beta")
@@ -1363,7 +1320,7 @@ def serve(
 @stability_option(
     "--max_batch_size",
     type=int,
-    default=BuildConfig.model_fields["max_batch_size"].default,
+    default=_LLM_ARGS_FIELDS["max_batch_size"].default,
     help="Maximum number of requests that the engine can schedule.",
     status="beta")
 @stability_option(
@@ -1503,7 +1460,7 @@ def serve_encoder(model: str, host: str, port: int, log_level: str,
               help="The logging level.")
 @click.option("--max_batch_size",
               type=int,
-              default=BuildConfig.model_fields["max_batch_size"].default,
+              default=_LLM_ARGS_FIELDS["max_batch_size"].default,
               help="Maximum batch size coalesced into a single encode() call.")
 @click.option(
     "--max_num_tokens",

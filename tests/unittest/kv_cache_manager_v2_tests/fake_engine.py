@@ -161,7 +161,7 @@ class FakeEngine:
         )
         pool = manager.get_mem_pool_base_address(layer_id, role, index_mode)
         stride = manager.get_page_stride(layer_id, role)
-        lc_id = manager._storage._layer_to_life_cycle_ids[layer_id]
+        lc_id = manager.get_layer_group_id(layer_id)
         if is_ssm:
             # SSM: only one page (the SSM slot), only check the last history token
             if not history:
@@ -237,7 +237,7 @@ class FakeEngine:
         )
         pool = manager.get_mem_pool_base_address(layer_id, role, index_mode)
         stride = manager.get_page_stride(layer_id, role)
-        lc_id = manager._storage._layer_to_life_cycle_ids[layer_id]
+        lc_id = manager.get_layer_group_id(layer_id)
         if is_ssm:
             # SSM: write only the last input token at position 0 of the SSM page
             ssm_idx = kv_cache.get_ssm_block_base_index(lc_id, beam)

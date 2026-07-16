@@ -879,16 +879,18 @@ protected:
             cpMetaData.emplace(length, tokensPerBlock, mCpRank, mCpSize);
             seqLen = cpMetaData.value().mSeqLenOnThisCPRank;
         }
-        texec::Request request{VecTokens(seqLen, seqLen), maxNewTokens};
-        auto state = std::make_unique<texec::DataTransceiverState>();
 
+        auto state = std::make_unique<texec::DataTransceiverState>();
         TLLM_CHECK(mContextCommState);
         state->setCommState(texec::kv_cache::CommState{*mContextCommState});
         state->setCacheState(*mContextCacheState);
         auto stats = texec::ContextPhaseParams({}, mRequestId, state.release(), std::nullopt);
-        request.setContextPhaseParams(std::move(stats));
 
-        auto llmRequestPtr = std::make_shared<LlmRequest>(mRequestId++, std::move(request));
+        tr::SamplingConfig samplingConfig{1};
+        auto inputTokens = std::make_shared<VecTokens>(seqLen, seqLen);
+        auto llmRequestPtr = std::make_shared<LlmRequest>(
+            mRequestId++, maxNewTokens, inputTokens, samplingConfig, /*isStreaming=*/false);
+        llmRequestPtr->setContextPhaseParams(std::move(stats));
         return std::make_unique<WrappedLlmRequest>(std::move(llmRequestPtr), cpMetaData);
     }
 
@@ -904,7 +906,6 @@ protected:
             cpMetaData.emplace(length, tokensPerBlock, mCpRank, mCpSize);
             seqLen = cpMetaData.value().mSeqLenOnThisCPRank;
         }
-        texec::Request request{VecTokens(seqLen, seqLen), maxNewTokens};
 
         auto state = std::make_unique<texec::DataTransceiverState>();
         state->setCommState(texec::kv_cache::CommState{*mContextCommState});
@@ -919,8 +920,12 @@ protected:
             mContextCacheState->getParallelConfig().mTensorParallelism};
         state->setCacheState(cacheState);
         auto stats = texec::ContextPhaseParams({}, requestId, state.release(), std::nullopt);
-        request.setContextPhaseParams(std::move(stats));
-        auto llmRequestPtr = std::make_shared<LlmRequest>(requestId, std::move(request));
+
+        tr::SamplingConfig samplingConfig{1};
+        auto inputTokens = std::make_shared<VecTokens>(seqLen, seqLen);
+        auto llmRequestPtr
+            = std::make_shared<LlmRequest>(requestId, maxNewTokens, inputTokens, samplingConfig, /*isStreaming=*/false);
+        llmRequestPtr->setContextPhaseParams(std::move(stats));
 
         return std::make_unique<WrappedLlmRequest>(std::move(llmRequestPtr), cpMetaData);
     }

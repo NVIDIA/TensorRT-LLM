@@ -245,6 +245,9 @@ def make_deepseek_v4_sparse_metadata_params(
         max_sparse_topk=_sparse_config_value(
             sparse_attention_config, pretrained_config, "index_topk"
         ),
+        index_head_dim=_sparse_config_value(
+            sparse_attention_config, pretrained_config, "index_head_dim", 128
+        ),
         enable_indexer_skip=sparse_attention_config.skip_indexer_for_short_seqs,
         enable_heuristic_topk=sparse_attention_config.enable_heuristic_topk,
         use_cute_dsl_paged_mqa_logits=(sparse_attention_config.use_cute_dsl_paged_mqa_logits),
@@ -271,16 +274,11 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         super().__post_init__()
         self.num_total_compressed_tokens = {}
         self.max_ctx_compressed_tokens = {}
-        window_size = getattr(self.sparse_metadata_params, "window_size", None)
-        if window_size is None and self.sparse_attention_config is not None:
-            window_size = self.sparse_attention_config.window_size
-        compress_ratios = getattr(self.sparse_metadata_params, "compress_ratios", None)
-        if not compress_ratios and self.sparse_attention_config is not None:
-            compress_ratios = self.sparse_attention_config.compress_ratios
-        if compress_ratios:
-            self.compress_ratios = compress_ratios
-
-        self.window_size = window_size
+        sparse_metadata_params = self.sparse_metadata_params
+        if not isinstance(sparse_metadata_params, DeepSeekV4MetadataParams):
+            raise ValueError("DeepSeek-V4 sparse attention metadata params are not set")
+        self.window_size = sparse_metadata_params.window_size
+        window_size = self.window_size
         assert window_size == 128, (
             f"Dual-pool sparse MLA requires window_size == 128, which equals to the"
             f"TileSizeKV of the FMHA kernel. (got {window_size})."
@@ -821,6 +819,7 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             }
             self._compute_gen_compressed_position_ids(
                 self.past_kv_lens_cuda,
+                self.cu_new_comp_kv_cuda,
                 self.compressed_position_ids_cuda,
                 num_contexts,
                 num_generations,
@@ -927,6 +926,7 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
     @maybe_compile(dynamic=True, options={"max-autotune": True})
     def _compute_gen_compressed_position_ids(
         past_kv_lens_bufs: Dict[int, torch.Tensor],
+        cu_new_comp_kv_bufs: Dict[int, torch.Tensor],
         compressed_position_ids_bufs: Dict[int, torch.Tensor],
         num_contexts: int,
         num_generations: int,
@@ -934,7 +934,12 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         compress_ratios: list,
         gen_output_offsets: Dict[int, int],
     ):
-        """Generation compressed position IDs.
+        """Generation position IDs in exact compact compressor output order.
+
+        The decode kernel packs valid outputs according to ``cu_new_comp_kv``.
+        The corresponding request and local offset are recovered for every
+        compact output index. Reserved slots after the compact prefix are masked
+        during postprocess, so their position IDs are irrelevant.
 
         gen_output_offsets: dict mapping compress_ratio -> Python int offset,
         pre-extracted by the caller to avoid tensor-scalar .item() inside
@@ -942,13 +947,17 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         device = past_kv_lens_bufs[compress_ratios[0]].device
         batch_size = num_contexts + num_generations
         for compress_ratio in compress_ratios:
-            gen_past = past_kv_lens_bufs[compress_ratio][num_contexts:batch_size]
             new_gen_comp = (num_gen_tokens_per_seq + compress_ratio - 1) // compress_ratio
-            gen_offsets = torch.arange(new_gen_comp, dtype=torch.int32, device=device)
-            gen_pos = gen_past.unsqueeze(1) + gen_offsets.unsqueeze(0)
             gen_comp = num_generations * new_gen_comp
-            result = (gen_pos.reshape(-1) * compress_ratio).to(torch.int)
             output_offset = gen_output_offsets[compress_ratio]
+            cu_new_comp = cu_new_comp_kv_bufs[compress_ratio]
+            output_idx = torch.arange(gen_comp, dtype=torch.int32, device=device) + output_offset
+            # Search the zero-offset prefix: Inductor miscompiles searchsorted on cu_new_comp[1:].
+            req_idx = torch.searchsorted(cu_new_comp[: batch_size + 1], output_idx, right=True) - 1
+            req_idx = req_idx.clamp(min=num_contexts, max=batch_size - 1)
+            offset_in_req = output_idx - cu_new_comp[req_idx]
+            past_kv_lens = past_kv_lens_bufs[compress_ratio]
+            result = ((past_kv_lens[req_idx] + offset_in_req) * compress_ratio).to(torch.int)
             compressed_position_ids_bufs[compress_ratio][
                 output_offset : output_offset + gen_comp
             ] = result

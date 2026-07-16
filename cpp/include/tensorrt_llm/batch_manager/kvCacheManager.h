@@ -2578,6 +2578,24 @@ public:
     [[nodiscard]] std::vector<executor::IdType> commitAndGetBlockHashesForRequest(
         LlmRequest const& llmRequest, SizeType32 windowSize) override;
 
+    //! @brief Translate logical block IDs into primary-pool block indices.
+    //! @details A block ID is stable for the lifetime of a block, but its position inside the
+    //!          memory pool can change after offload/onboard cycles. This function performs
+    //!          that translation. The returned index is the value of
+    //!          `KVCacheBlock::getMemoryPoolBlockIndex()` for each input, with the pool flag
+    //!          stripped (see `kernels::KVCacheIndex::get()`), so it is only meaningful for
+    //!          blocks resident in the primary pool. Every referenced block must therefore be
+    //!          primary; this is asserted. Callers (e.g. the disaggregation cache transceiver
+    //!          on the Python side) cannot check residency themselves, and the invariant holds
+    //!          because allocation onboards offloaded blocks and offload only ever selects free
+    //!          blocks — a violation indicates a block-lifetime bug.
+    //! @param blockIds  IDs to translate.
+    //! @param windowSize Attention window the IDs belong to (selects the WindowBlockManager).
+    //! @throws Aborts via TLLM_CHECK_WITH_INFO if any referenced block is not found or is not
+    //!         currently in the primary pool.
+    [[nodiscard]] std::vector<kernels::KVCacheIndex::UnderlyingType> getMemoryPoolBlockIndicesByBlockIds(
+        std::vector<KVCacheBlock::IdType> const& blockIds, SizeType32 windowSize) const;
+
     std::optional<KVCacheBlock::IdType> getLastBlockId(LlmRequest::RequestIdType requestId) const override;
 
     /// @brief Calculates the number of kv-cache blocks that a sequence will require, for a single beam.

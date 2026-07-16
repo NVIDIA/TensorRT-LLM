@@ -104,14 +104,12 @@ llm.generate(["Hello, my name is",
 ### Performance
 
 The Torch Sampler leverages the optimized sampling kernels provided by
-[FlashInfer](https://docs.flashinfer.ai/api/sampling.html). The sampler
-also uses the [sorting-free implementations](https://flashinfer.ai/2025/03/10/sampling.html)
+[FlashInfer](https://docs.flashinfer.ai/api/sampling.html), which is a required
+dependency for the Torch Sampler. The sampler also uses the
+[sorting-free implementations](https://flashinfer.ai/2025/03/10/sampling.html)
 whenever possible. This optimization does not compute the complete set of token sampling probabilities
 (after top-k / top-p masking etc.), which typically can be omitted unless requested by the user or
 required for speculative decoding (rejection sampling).
-In case of unexpected problems, the use of FlashInfer in Torch Sampler can
-be disabled via the `disable_flashinfer_sampling` config option (note that this option is likely
-to be removed in a future TensorRT LLM release).
 
 Moreover, Torch Sampler internally batches requests with compatible sampling parameters. This
 can greatly reduce the overall latency of the sampling step when request batches are comprised

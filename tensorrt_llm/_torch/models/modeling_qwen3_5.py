@@ -34,7 +34,6 @@ from ...inputs import (
 from ..pyexecutor.config_utils import get_qwen3_hybrid_layer_types
 from .checkpoints.base_weight_mapper import BaseWeightMapper
 from .checkpoints.hf.qwen3_5_weight_mapper import Qwen3_5MoeHfWeightMapper
-from .modeling_multimodal_utils import _is_mm_disagg
 from .modeling_qwen3_next import Qwen3NextForCausalLM
 from .modeling_qwen3vl import (
     Qwen3VisionModel,
@@ -691,11 +690,20 @@ class _Qwen3_5VLModel(Qwen3VLModelBase):
         ]
 
     def load_weights(self, weights: Dict[str, torch.Tensor], weight_mapper: BaseWeightMapper):
-        if not _is_mm_disagg():
+        # None under MM E/P disagg or disable_mm_encoder.
+        if self.mm_encoder is not None:
             self.mm_encoder.load_weights(weights)
 
         weight_mapper = Qwen3_5MoeHfWeightMapper()
-        weight_mapper.init_model_and_config(self.llm, self.model_config)
+        # Hand the mapper the inner LM's model_config, not the VLM wrapper's:
+        # only the inner config went through the Qwen3.5 quant-dict
+        # normalization applied in the inner LM's __init__ (HF->TRT-LLM key
+        # translation + synthesis of the fused in_proj_qkvz FP8 entry). With
+        # the wrapper's un-normalized copy the mapper misses that FP8 entry,
+        # dequantizes the GDN in_proj projections to bf16 and drops their
+        # calibrated scales; the FP8-built module then re-casts with
+        # weight_scale=1.0 and quantizes activations dynamically every step.
+        weight_mapper.init_model_and_config(self.llm, self.llm.model_config)
         filtered_weights = {k: v for k, v in weights.items() if not k.startswith("model.visual.")}
         params_map = {
             r"^model\.language_model\.(.*)$": r"model.\1",

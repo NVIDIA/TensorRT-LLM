@@ -54,6 +54,8 @@ DEFAULT_TEST_TIMEOUT = 3600
 DEFAULT_SERVER_WAITING_TIMEOUT = 2100
 # Timeout for the accuracy evaluation
 DEFAULT_ACC_EVALUATION_TIMEOUT = 1500
+# Preserve the legacy effectively-unbounded per-request timeout, in seconds.
+DEFAULT_REQUEST_TIMEOUT_S = 1_800_000
 DEEPSEEKV4_TEST_MAX_BATCH_SIZE = 128
 
 
@@ -153,6 +155,8 @@ def launch_disaggregated_llm(
     enable_perf=False,
     extra_env: Optional[Dict[str, str]] = None,
     gen_extra_env: Optional[Dict[str, str]] = None,
+    request_timeout_s: float = DEFAULT_REQUEST_TIMEOUT_S,
+    request_max_retries: Optional[int] = None,
 ):
     temp_dir = tempfile.TemporaryDirectory()
     disaggregated_serving_config_path = os.path.join(
@@ -406,9 +410,14 @@ def launch_disaggregated_llm(
                 f"Server is not ready after {server_waiting_timeout} seconds. Please check the logs for more details."
             )
 
-        client = openai.OpenAI(api_key="1234567890",
-                               base_url=f"http://localhost:{serve_port}/v1",
-                               timeout=1800000)
+        client_kwargs: Dict[str, Any] = {
+            "api_key": "1234567890",
+            "base_url": f"http://localhost:{serve_port}/v1",
+            "timeout": request_timeout_s,
+        }
+        if request_max_retries is not None:
+            client_kwargs["max_retries"] = request_max_retries
+        client = openai.OpenAI(**client_kwargs)
 
         def send_request(prompt: str, sampling_params: SamplingParams,
                          streaming: bool):
@@ -1077,18 +1086,21 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_device(2)
     @pytest.mark.skip_less_device_memory(60000)
     @skip_no_hopper
-    def test_gen_only_sync(self):
-        """Test gen-only synchronous KV transfer path with NIXL Python transceiver.
+    @pytest.mark.parametrize("transceiver_runtime", ["PYTHON", "CPP"],
+                             ids=["python", "cpp"])
+    def test_gen_only_sync(self, transceiver_runtime):
+        """Test gen-only synchronous KV transfer with each NIXL runtime.
 
         Sets TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP=1 so the gen worker calls
-        request_and_receive_sync instead of the async path. Accuracy must be
-        identical to the standard async path.
+        the blocking request_and_receive_sync path. The C++ variant uses a
+        bounded client timeout so a stuck transfer fails this test instead of
+        waiting for its outer one-hour timeout.
         """
         ctx_server_config = {
             "disable_overlap_scheduler": True,
             "cache_transceiver_config": {
                 "backend": "NIXL",
-                "transceiver_runtime": "PYTHON",
+                "transceiver_runtime": transceiver_runtime,
                 "max_tokens_in_buffer": 4096,
             },
         }
@@ -1096,7 +1108,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             "disable_overlap_scheduler": True,
             "cache_transceiver_config": {
                 "backend": "NIXL",
-                "transceiver_runtime": "PYTHON",
+                "transceiver_runtime": transceiver_runtime,
                 "max_tokens_in_buffer": 4096,
             },
         }
@@ -1117,6 +1129,10 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                 self.MODEL_PATH,
                 # Apply to both servers: gen worker uses sync receive path.
                 extra_env={"TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP": "1"},
+                request_timeout_s=(120 if transceiver_runtime == "CPP" else
+                                   DEFAULT_REQUEST_TIMEOUT_S),
+                request_max_retries=(0
+                                     if transceiver_runtime == "CPP" else None),
         ) as llm:
             run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])
 
