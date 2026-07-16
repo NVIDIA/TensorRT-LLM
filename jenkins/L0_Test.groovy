@@ -1699,6 +1699,7 @@ bash "${scriptFatBuildPathNode}" "\$fatSqshPath" "\$baseSqshPath" "${llmTarfile}
                 def fatSqshDir = "${cluster.scratchPath}/users/svc_tensorrt/fat_sqsh"
                 def scriptPrepareContent = "#!/bin/bash\nset -euo pipefail\necho 'No fat sqsh builder configured; skipping Prepare Container.'\n"
                 if (cluster.fatBuilderArgs != null) {
+                    def fatBuildLogPath = SlurmConfig.getOutputFilePath("${cluster.homeDir}/slurm-logs", "${jobUID}-fat_build")
                     scriptPrepareContent = """#!/bin/bash
 set -euo pipefail
 echo "=== [Prepare Container] STAGE START: \$(date '+%Y-%m-%d %H:%M:%S') on \$(hostname) ==="
