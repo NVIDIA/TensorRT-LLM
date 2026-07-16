@@ -450,6 +450,15 @@ def _logic_ltx2_dual_topology(rank, world_size, backend, audio_seq_len):
         blk = d_model.transformer_blocks[0]
         expect = blk.attn1._attn_stage2 if is_stage2 else blk.attn1._attn_default
         assert blk.attn1.attn is expect, f"Rank {rank}: attn stack not switched"
+        # is_ulysses must track the ACTIVE stack (the pair can differ in type).
+        from tensorrt_llm._torch.visual_gen.attention_backend.parallel import UlyssesAttention
+
+        for name in ("attn1", "video_to_audio_attn", "audio_attn1"):
+            mod = getattr(blk, name, None)
+            if mod is not None:
+                assert mod.is_ulysses == isinstance(mod.attn, UlyssesAttention), (
+                    f"Rank {rank}: {name}.is_ulysses stale (is_stage2={is_stage2})"
+                )
         sh = d_model._active_sharder
         assert sh.size == (world_size if is_stage2 else world_size // 2)
         assert torch.equal(sh.gather(sh.shard(x, dim=1), dim=1), x), (

@@ -1397,10 +1397,10 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
                 )
             )
 
-        if self._parallel_vae_enabled:
+        vgm = self.pipeline_config.visual_gen_mapping
+        if self._parallel_vae_enabled and self.rank in vgm.vae_ranks:
             # Parallel Stage 2 left identical refined latents on every rank;
-            # decode collectively (tile-parallel over vgm.vae_group).
-            vgm = self.pipeline_config.visual_gen_mapping
+            # VAE ranks decode collectively (tile-parallel over vgm.vae_group).
             video_latents = video_latents.to(self.dtype).contiguous()
             logger.info("Decoding upsampled video (tile-parallel)...")
             video = tile_parallel_decode(
@@ -1410,7 +1410,7 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
                 pg=vgm.vae_group,
             )
             video = postprocess_video_tensor(video)
-        elif self.rank == 0:
+        elif not self._parallel_vae_enabled and self.rank == 0:
             logger.info("Decoding upsampled video (tiled)...")
             video_latents = video_latents.to(self.dtype)
             chunks = list(
@@ -1423,7 +1423,8 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
             video = torch.cat(chunks, dim=2)
             video = postprocess_video_tensor(video)
         else:
-            # Non-parallel-VAE decode stays rank-0-only; other ranks return no media.
+            # Non-decoding ranks (outside vae_ranks under parallel VAE, or
+            # non-rank-0 otherwise) return no media.
             video = None
         gpu_tl.mark("video_decode")
 

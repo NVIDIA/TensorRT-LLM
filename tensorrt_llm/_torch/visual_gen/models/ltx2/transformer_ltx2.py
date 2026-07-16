@@ -179,10 +179,11 @@ class LTX2Attention(Attention):
                     f"num_key_value_heads ({H_kv}) divisible by ulysses_size ({U})"
                 )
 
-        # Attention TYPE is fixed at construction. Whether the base class wrapped
-        # ``self.attn`` in Ulysses is a construction-time constant; the AV cross-attn
-        # dispatch reads it to choose seq-sharded K/V (wrapper does the a2a) vs the
-        # all-gather-full-K/V plain path (ring CP).
+        # Whether ``self.attn`` is Ulysses-wrapped; the AV cross-attn dispatch
+        # reads it to choose seq-sharded K/V (wrapper does the a2a) vs the
+        # all-gather-full-K/V plain path (ring CP). Tracks the ACTIVE stack:
+        # set_active_attn() recomputes it, since the {default, stage2} stacks
+        # can differ in type (e.g. cfg2 x u1 -> stage-2 ulysses).
         self.is_ulysses = isinstance(self.attn, UlyssesAttention)
 
         # {default, stage2} topology stacks. Both are built HERE and swapped whole
@@ -194,13 +195,15 @@ class LTX2Attention(Attention):
         self._attn_default = self.attn
         self._attn_stage2 = self._attn_default
         if stage2_ulysses_group is not None and enable_sp:
+            # The stage-2 ulysses group lives inside one TP fiber, so the inner
+            # backend is sized from TP-local head counts (as the default stack is).
             s2 = torch_dist.get_world_size(group=stage2_ulysses_group)
-            H = self.num_attention_heads
-            H_kv = self.num_key_value_heads
+            H = self.local_num_attention_heads
+            H_kv = self.local_num_key_value_heads
             if H % s2 != 0 or H_kv % s2 != 0:
                 raise ValueError(
-                    f"stage-2 ulysses requires num_attention_heads ({H}) and "
-                    f"num_key_value_heads ({H_kv}) divisible by the stage-2 "
+                    f"stage-2 ulysses requires TP-local num_attention_heads ({H}) "
+                    f"and num_key_value_heads ({H_kv}) divisible by the stage-2 "
                     f"ulysses group size ({s2})"
                 )
             inner = create_attention(
@@ -246,6 +249,7 @@ class LTX2Attention(Attention):
         """
         self._modules.pop("attn", None)
         self.attn = self._attn_stage2 if is_stage2 else self._attn_default
+        self.is_ulysses = isinstance(self.attn, UlyssesAttention)
 
     def _init_qkv_proj(self):
         """Override for cross-attention: use _context_dim for K/V input.
