@@ -573,6 +573,10 @@ class GenerationExecutorProxy(GenerationExecutor):
             raise RuntimeError(
                 "Executor worker returned error") from ready_signal
 
+        # Re-import to bypass the test-suite monkey-patch of the module-level
+        # name (see tests/test_common/session_reuse.py) so isinstance always
+        # receives the real class rather than the factory shim.
+        from ..llmapi.mpi_session import MpiPoolSession
         if isinstance(self.mpi_session, MpiPoolSession) and len(status) == 3:
             worker_process_identities: List[WorkerProcessIdentity] = status[2]
             self._worker_process_monitor.register(worker_process_identities)
