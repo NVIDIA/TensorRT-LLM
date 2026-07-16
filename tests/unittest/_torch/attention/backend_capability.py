@@ -116,7 +116,7 @@ def unsupported_reason(backend: str, case) -> Optional[str]:
 
     sparse_config = getattr(case, "sparse_attention_config", None)
     if sparse_config is not None:
-        algorithm = sparse_config.get("algorithm")
+        algorithm = sparse_config.algorithm
         if backend == "TRTLLM" and algorithm == "dsa":
             # DSA runs on Hopper (FlashMLA) and Blackwell; only the FP8 KV-cache
             # DSA path is Blackwell-only.

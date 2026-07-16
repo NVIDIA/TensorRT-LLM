@@ -86,15 +86,11 @@ _SPARSE_COMPUTE_DTYPE = "bfloat16"
 _SPARSE_KV_LAYOUT = "HND"
 _SPARSE_PAGE_SIZE = 64
 _SPARSE_USE_KVM_V2 = False
-_SPARSE_SELECTION_PATTERNS = ("random", "singleton")
-_SPARSE_GENERATION_TOKENS_PER_SEQ = 2
 
 
 def _phases_for(cfg: ModelAttnConfig) -> dict:
     if cfg.sparse_attention_config is not None:
-        return _phases(
-            cfg.sparse_attention_config.sparse_topk + 32, _SPARSE_GENERATION_TOKENS_PER_SEQ
-        )
+        return _phases(cfg.sparse_attention_config.sparse_topk + 32, gen_len=1)
     if cfg.mask != "sliding":
         return _PHASES
 
@@ -133,10 +129,7 @@ def _common(cfg: ModelAttnConfig) -> dict:
             hidden_size=cfg.hidden_size,
         )
     if cfg.sparse_attention_config is not None:
-        common.update(
-            sparse_attention_config=cfg.sparse_attention_config.model_dump(mode="json"),
-            sparse_generation_tokens_per_seq=_SPARSE_GENERATION_TOKENS_PER_SEQ,
-        )
+        common.update(sparse_attention_config=cfg.sparse_attention_config)
     return common
 
 
@@ -160,28 +153,27 @@ def _expand(cfg: ModelAttnConfig, precisions, kv_layouts, page_sizes):
     phases = _phases_for(cfg)
 
     # Sparse cases use one model-agnostic sweep (bf16 latent cache, fixed layout/
-    # page/manager). Fake request-local selections isolate backend execution from
+    # page/manager). Each phase mixes singleton and random selection rows in a
+    # single execution; the injected selections isolate backend execution from
     # the separately-tested algorithm/indexer.
     if cfg.sparse_attention_config is not None:
         manager = "v2" if _SPARSE_USE_KVM_V2 else "v1"
+        tag = (
+            f"{_prec_tag(_SPARSE_COMPUTE_DTYPE, None)}-{_SPARSE_KV_LAYOUT}"
+            f"-p{_SPARSE_PAGE_SIZE}-{manager}"
+        )
         for phase_name in ("ctx", "gen", "mix"):
-            for selection in _SPARSE_SELECTION_PATTERNS:
-                tag = (
-                    f"{_prec_tag(_SPARSE_COMPUTE_DTYPE, None)}-{_SPARSE_KV_LAYOUT}"
-                    f"-p{_SPARSE_PAGE_SIZE}-{manager}-{selection}"
-                )
-                yield (
-                    f"{cfg.id}-{phase_name}-{tag}",
-                    BackendCase(
-                        page_size=_SPARSE_PAGE_SIZE,
-                        kv_layout=_SPARSE_KV_LAYOUT,
-                        dtype=_SPARSE_COMPUTE_DTYPE,
-                        sparse_selection=selection,
-                        use_kv_cache_manager_v2=_SPARSE_USE_KVM_V2,
-                        **phases[phase_name],
-                        **common,
-                    ),
-                )
+            yield (
+                f"{cfg.id}-{phase_name}-{tag}",
+                BackendCase(
+                    page_size=_SPARSE_PAGE_SIZE,
+                    kv_layout=_SPARSE_KV_LAYOUT,
+                    dtype=_SPARSE_COMPUTE_DTYPE,
+                    use_kv_cache_manager_v2=_SPARSE_USE_KVM_V2,
+                    **phases[phase_name],
+                    **common,
+                ),
+            )
         return
 
     # Bidirectional, KV-cache-free DiT / encoder workloads: only compute dtype.

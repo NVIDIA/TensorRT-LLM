@@ -57,7 +57,7 @@ elsewhere):
 from dataclasses import dataclass
 from typing import List, Optional
 
-from tensorrt_llm.llmapi.llm_args import BaseSparseAttentionConfig, DeepSeekSparseAttentionConfig
+from tensorrt_llm.llmapi.llm_args import DeepSeekSparseAttentionConfig, SparseAttentionConfig
 
 
 @dataclass(frozen=True)
@@ -86,7 +86,7 @@ class ModelAttnConfig:
     hidden_size: Optional[int] = None
     # User-facing sparse config, lowered by production `to_sparse_params()`. The
     # sparse sweep derives its other parameters from this and `is_mla`.
-    sparse_attention_config: Optional[BaseSparseAttentionConfig] = None
+    sparse_attention_config: Optional[SparseAttentionConfig] = None
 
 
 # ---------------------------------------------------------------------------
