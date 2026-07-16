@@ -953,8 +953,13 @@ class StorageManager:
         for lc_idx, lc in typed_enumerate(self._life_cycles.get()):
             pg_idx = self.get_pool_group_index(lc_idx)
             if lc_idx == ssm_lc_idx:
-                # SSM: always 1 dedicated block per request, never shared.
-                num_slots[pg_idx] += len(batch.kv_caches)
+                # SSM state pages do not scale with token count. They scale
+                # with the number of live states and reusable snapshots the
+                # batch shape asks the storage planner to retain.
+                num_slots[pg_idx] += sum(
+                    kv.ssm_snapshots if kv.ssm_snapshots is not None else 1
+                    for kv in batch.kv_caches
+                )
                 continue
             # Shared sys blocks (counted once): union of non-stale sys blocks across all requests.
             # A sys block needs memory if it's non-stale for ANY request.

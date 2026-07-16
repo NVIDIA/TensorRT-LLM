@@ -153,6 +153,7 @@ LayerConfig = AttentionLayerConfig | SsmLayerConfig
 class KVCacheDesc:
     capacity: int
     history_length: int
+    ssm_snapshots: int | None = None
 
 @dataclass(slots=True)
 class BatchDesc:

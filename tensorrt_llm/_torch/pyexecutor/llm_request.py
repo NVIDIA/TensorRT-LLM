@@ -833,6 +833,14 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_result.set_exclude_last_generation_logits(
             exclude_last_generation_logits)
 
+    def block_reuse_commit_limit(self) -> int:
+        if not self.expect_snapshot_points:
+            return self.prompt_len
+        return min(max(self.expect_snapshot_points), self.prompt_len)
+
+    def should_save_ssm_snapshot(self, commit_end: int) -> bool:
+        return commit_end in self.expect_snapshot_points
+
     @property
     def cached_tokens(self) -> int:
         return self._cached_tokens
