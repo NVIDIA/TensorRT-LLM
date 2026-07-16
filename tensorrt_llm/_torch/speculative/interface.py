@@ -42,7 +42,8 @@ if IS_FLASHINFER_AVAILABLE:
     import flashinfer
 
 from ..pyexecutor.sampler.sampling_utils import (
-    compute_probs_from_logits, greedy, sampling_batch_spec_dec_one_model,
+    compute_probs_from_logits, greedy_search_sampling_batch,
+    sampling_batch_spec_dec_one_model,
     sampling_batch_spec_dec_one_model_for_rejection)
 
 
@@ -1703,7 +1704,8 @@ class SpecWorkerBase(nn.Module, ABC):
         Returns:
             draft_tokens: [num_tokens] - Sampled draft token ids (int32)
         """
-        draft_tokens = greedy(logits, return_probs=False)[0]
+        draft_tokens = greedy_search_sampling_batch(logits,
+                                                    return_probs=False)[0]
 
         # Apply the cached draft->target vocab offset map.
         if self._d2t is not None:
