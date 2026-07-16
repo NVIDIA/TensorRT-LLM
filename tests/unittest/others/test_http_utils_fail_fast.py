@@ -20,6 +20,10 @@ import pytest
 from test_common.error_utils import check_error, report_error
 from test_common.http_utils import fail_if_proc_died, wait_for_endpoint_ready
 
+# The CPU-Generic CI stages select tests with `-m cpu_only`; without this
+# marker every test here is deselected and pytest exits with code 5.
+pytestmark = pytest.mark.cpu_only
+
 # Nothing listens here; connections are refused immediately.
 DEAD_URL = "http://127.0.0.1:9/health"
 
