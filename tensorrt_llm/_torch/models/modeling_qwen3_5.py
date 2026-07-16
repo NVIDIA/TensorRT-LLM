@@ -15,7 +15,7 @@
 
 import re
 from types import SimpleNamespace
-from typing import Dict, List
+from typing import Dict, List, Literal
 
 import torch
 from transformers import PretrainedConfig
@@ -673,6 +673,13 @@ class _Qwen3_5VLModel(Qwen3VLModelBase):
         # doesn't support KV-cache block reuse. Without this the VLM path
         # would silently fall back to the global default (block reuse on).
         return Qwen3NextForCausalLM.get_model_defaults(llm_args)
+
+    @classmethod
+    def get_preferred_transceiver_runtime(
+        cls, pretrained_config: object | None = None
+    ) -> Literal["PYTHON"]:
+        """Match the hybrid text decoder's V2 disaggregated route."""
+        return "PYTHON"
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig], *args, **kwargs):
         kwargs["vision_model_class"] = Qwen3VisionModel

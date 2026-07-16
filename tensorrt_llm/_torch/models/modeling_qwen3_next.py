@@ -18,7 +18,7 @@
 import copy
 import os
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Dict, List, Optional
+from typing import TYPE_CHECKING, Dict, List, Literal, Optional
 
 import torch
 
@@ -991,6 +991,13 @@ class Qwen3NextForCausalLM(SpecDecOneEngineForCausalLM[Qwen3NextModel,
         # TODO: Remove enable_block_reuse=False once KV cache block reuse
         # is supported for Mamba/SSM-based models
         return {"kv_cache_config": {"enable_block_reuse": False}}
+
+    @classmethod
+    def get_preferred_transceiver_runtime(cls,
+                                          pretrained_config: object
+                                          | None = None) -> Literal["PYTHON"]:
+        """Use the Python transceiver for V2 hybrid-state transfers."""
+        return "PYTHON"
 
     def load_weights(self,
                      weights: dict,

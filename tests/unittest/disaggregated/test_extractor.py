@@ -1,3 +1,17 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import numpy as np
 import pytest
 
@@ -244,11 +258,19 @@ def test_mamba_layer_group_serialization():
         ssm_states=ssm_pool,
         conv_section_bytes=[512, 256, 256],
         ssm_bytes_per_head=128,
+        conv_layer_slot0_addresses={10: 1000, 11: 2000, 12: 3000},
+        ssm_layer_slot0_addresses={10: 8000, 11: 9000, 12: 10000},
+        conv_physical_slot_stride_bytes=512,
+        ssm_physical_slot_stride_bytes=1024,
     )
 
     d = mlg.to_dict()
     assert d["mamba_layer_offsets"] == {10: 0, 11: 1, 12: 2}
     assert d["conv_section_bytes"] == [512, 256, 256]
+    assert d["conv_layer_slot0_addresses"] == {10: 1000, 11: 2000, 12: 3000}
+    assert d["ssm_layer_slot0_addresses"] == {10: 8000, 11: 9000, 12: 10000}
+    assert d["conv_physical_slot_stride_bytes"] == 512
+    assert d["ssm_physical_slot_stride_bytes"] == 1024
 
     from tensorrt_llm._torch.disaggregation.resource.page import LayerGroup
 
@@ -263,6 +285,93 @@ def test_mamba_layer_group_serialization():
     assert restored.ssm_states.num_slots == 8
     assert restored.conv_section_bytes == [512, 256, 256]
     assert restored.ssm_bytes_per_head == 128
+    assert restored.conv_layer_slot0_addresses == {10: 1000, 11: 2000, 12: 3000}
+    assert restored.ssm_layer_slot0_addresses == {10: 8000, 11: 9000, 12: 10000}
+    assert restored.conv_physical_slot_stride_bytes == 512
+    assert restored.ssm_physical_slot_stride_bytes == 1024
+
+
+def test_v2_mamba_registration_uses_coalesced_physical_pool():
+    from tensorrt_llm._torch.disaggregation.resource.page import (
+        KVCachePageTable,
+        MambaLayerGroup,
+        PhysicalPool,
+        PhysicalPoolGroup,
+    )
+    from tensorrt_llm._torch.disaggregation.resource.utils import get_unique_pool_memory_descs
+
+    state_bytes = 64
+    num_layers = 2
+    num_slots = 8
+    # Equal-sized SSM and convolution states share one interleaved V2 pool.
+    physical_slot_bytes = state_bytes * num_layers * 2
+    physical_pool = PhysicalPool(
+        base_address=1000,
+        slot_bytes=physical_slot_bytes,
+        num_slots=num_slots,
+    )
+    mamba_group = MambaLayerGroup(
+        pool_group_idx=0,
+        mamba_layer_offsets={1: 0, 2: 1},
+        conv_states=PhysicalPool(
+            base_address=1000 + state_bytes,
+            slot_bytes=state_bytes,
+            num_slots=num_slots,
+        ),
+        ssm_states=PhysicalPool(
+            base_address=1000,
+            slot_bytes=state_bytes,
+            num_slots=num_slots,
+        ),
+        conv_layer_slot0_addresses={
+            1: 1000 + state_bytes,
+            2: 1000 + state_bytes * 3,
+        },
+        ssm_layer_slot0_addresses={
+            1: 1000,
+            2: 1000 + state_bytes * 2,
+        },
+        conv_physical_slot_stride_bytes=physical_slot_bytes,
+        ssm_physical_slot_stride_bytes=physical_slot_bytes,
+    )
+    page_table = KVCachePageTable(
+        tokens_per_block=16,
+        layer_groups=[mamba_group],
+        pool_groups=[PhysicalPoolGroup(pools=[physical_pool])],
+    )
+
+    assert get_unique_pool_memory_descs(page_table, device_id=3) == [
+        (1000, physical_slot_bytes * num_slots, 3, "kv_cache_memory_pool0")
+    ]
+
+
+def test_legacy_mamba_registration_uses_layer_major_pools():
+    from tensorrt_llm._torch.disaggregation.resource.page import (
+        KVCachePageTable,
+        MambaLayerGroup,
+        PhysicalPool,
+    )
+    from tensorrt_llm._torch.disaggregation.resource.utils import get_unique_pool_memory_descs
+
+    num_layers = 3
+    conv_pool = PhysicalPool(base_address=1000, slot_bytes=128, num_slots=10)
+    ssm_pool = PhysicalPool(base_address=8000, slot_bytes=256, num_slots=8)
+    mamba_group = MambaLayerGroup(
+        pool_group_idx=0,
+        mamba_layer_offsets={10: 0, 11: 1, 12: 2},
+        conv_states=conv_pool,
+        ssm_states=ssm_pool,
+    )
+    page_table = KVCachePageTable(
+        tokens_per_block=16,
+        layer_groups=[mamba_group],
+        pool_groups=[],
+    )
+
+    assert get_unique_pool_memory_descs(page_table, device_id=3) == [
+        (1000, num_layers * conv_pool.num_slots * conv_pool.slot_bytes, 3, "kv_cache_memory_pool0"),
+        (8000, num_layers * ssm_pool.num_slots * ssm_pool.slot_bytes, 3, "kv_cache_memory_pool1"),
+    ]
 
 
 def test_mixed_page_table_serialization():

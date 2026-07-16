@@ -17,7 +17,7 @@ import os
 import re
 from contextlib import contextmanager
 from dataclasses import replace
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 import torch
 
@@ -990,6 +990,13 @@ class NemotronHForCausalLM(SpecDecOneEngineForCausalLM[NemotronHModel,
         # TODO: Remove enable_block_reuse=False once KV cache block reuse
         # is supported for Mamba/SSM-based models
         return {"kv_cache_config": {"enable_block_reuse": False}}
+
+    @classmethod
+    def get_preferred_transceiver_runtime(cls,
+                                          pretrained_config: object
+                                          | None = None) -> Literal["PYTHON"]:
+        """Use the Python transceiver for V2 hybrid-state transfers."""
+        return "PYTHON"
 
     @staticmethod
     def lora_config(model_dir: str):

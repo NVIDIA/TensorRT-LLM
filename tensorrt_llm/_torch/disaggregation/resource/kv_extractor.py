@@ -21,7 +21,10 @@ from tensorrt_llm._torch.disaggregation.resource.page import (
     PoolView,
 )
 from tensorrt_llm._torch.disaggregation.resource.utils import get_physical_pool
-from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import MambaHybridCacheManager
+from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import (
+    MambaHybridCacheManager,
+    V2MambaHybridCacheManager,
+)
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import get_size_in_bytes, nvtx_range
 from tensorrt_llm.bindings import DataType
@@ -129,6 +132,65 @@ def _build_layer_group_for_mamba(
         ssm_states=ssm_pool,
         conv_section_bytes=conv_section_bytes,
         ssm_bytes_per_head=ssm_bytes_per_head,
+    )
+
+
+def _physical_slot_stride_bytes(tensor) -> int:
+    return int(tensor.stride(0) * tensor.element_size())
+
+
+def _build_layer_group_for_v2_mamba(
+    manager: V2MambaHybridCacheManager, pool_group_idx: int
+) -> MambaLayerGroup:
+    mamba_layer_offsets = {
+        int(global_layer_id): int(local_layer_id)
+        for global_layer_id, local_layer_id in manager.mamba_layer_offsets.items()
+    }
+
+    first_conv_state = manager.all_conv_states[0]
+    first_ssm_state = manager.all_ssm_states[0]
+    conv_physical_slot_stride_bytes = _physical_slot_stride_bytes(first_conv_state)
+    ssm_physical_slot_stride_bytes = _physical_slot_stride_bytes(first_ssm_state)
+    conv_slot_bytes = int(first_conv_state[0].numel() * first_conv_state.element_size())
+    ssm_slot_bytes = int(first_ssm_state[0].numel() * first_ssm_state.element_size())
+    num_slots = int(first_ssm_state.shape[0])
+
+    conv_layer_slot0_addresses = {
+        int(global_layer_id): int(manager.all_conv_states[offset].data_ptr())
+        for global_layer_id, offset in mamba_layer_offsets.items()
+    }
+    ssm_layer_slot0_addresses = {
+        int(global_layer_id): int(manager.all_ssm_states[offset].data_ptr())
+        for global_layer_id, offset in mamba_layer_offsets.items()
+    }
+
+    d_conv_m1 = manager.conv_state_shape[1]
+    conv_elem_size = first_conv_state.element_size()
+    nheads, head_dim, d_state = manager.ssm_state_shape
+    conv_section_bytes = [dim * d_conv_m1 * conv_elem_size for dim in manager.conv_section_dims]
+
+    ssm_elem_size = first_ssm_state.element_size()
+    ssm_bytes_per_head = head_dim * d_state * ssm_elem_size
+
+    return MambaLayerGroup(
+        pool_group_idx=pool_group_idx,
+        mamba_layer_offsets=mamba_layer_offsets,
+        conv_states=PhysicalPool(
+            base_address=int(first_conv_state.data_ptr()),
+            slot_bytes=conv_slot_bytes,
+            num_slots=num_slots,
+        ),
+        ssm_states=PhysicalPool(
+            base_address=int(first_ssm_state.data_ptr()),
+            slot_bytes=ssm_slot_bytes,
+            num_slots=num_slots,
+        ),
+        conv_section_bytes=conv_section_bytes,
+        ssm_bytes_per_head=ssm_bytes_per_head,
+        conv_layer_slot0_addresses=conv_layer_slot0_addresses,
+        ssm_layer_slot0_addresses=ssm_layer_slot0_addresses,
+        conv_physical_slot_stride_bytes=conv_physical_slot_stride_bytes,
+        ssm_physical_slot_stride_bytes=ssm_physical_slot_stride_bytes,
     )
 
 
@@ -339,6 +401,14 @@ def _build_page_table_v2(manager) -> KVCachePageTable:
         for variant in pg_desc.slot_desc.variants:
             layer_group_id = int(variant.layer_group_id)
             all_internal_layer_ids = list(manager.impl.layer_grouping[layer_group_id])
+            if isinstance(manager, V2MambaHybridCacheManager) and any(
+                manager._is_local_mamba_layer(int(layer_id)) for layer_id in all_internal_layer_ids
+            ):
+                layer_groups_by_id[layer_group_id] = _build_layer_group_for_v2_mamba(
+                    manager, storage_pg_to_list_idx[storage_pg_idx]
+                )
+                continue
+
             all_global_layer_ids = _compute_global_layer_ids(manager, layer_group_id)
 
             local_layers = [
@@ -392,7 +462,9 @@ def _build_page_table_v2(manager) -> KVCachePageTable:
             raise ValueError(f"Missing V2 layer group descriptor for layer group {layer_group_id}")
         layer_groups.append(layer_group)
 
-    if isinstance(manager, MambaHybridCacheManager):
+    if isinstance(manager, MambaHybridCacheManager) and not isinstance(
+        manager, V2MambaHybridCacheManager
+    ):
         mamba_layer_group_idx = len(pool_groups)
         mamba_layer_group = _build_layer_group_for_mamba(manager, mamba_layer_group_idx)
         layer_groups.append(mamba_layer_group)

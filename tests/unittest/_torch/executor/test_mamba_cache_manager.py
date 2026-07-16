@@ -10,6 +10,8 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 
+from tensorrt_llm._torch.disaggregation.resource.kv_extractor import build_page_table_from_manager
+from tensorrt_llm._torch.disaggregation.resource.page import AttentionLayerGroup, MambaLayerGroup
 from tensorrt_llm._torch.pyexecutor._util import KvCacheCreator, get_kv_cache_manager_cls
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDA_GRAPH_DUMMY_REQUEST_ID
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import (
@@ -31,7 +33,13 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import CacheTypeCpp, DataTy
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._utils import torch_dtype_to_binding
 from tensorrt_llm.bindings.internal.batch_manager import LinearCacheType
-from tensorrt_llm.llmapi.llm_args import KvCacheConfig, MTPDecodingConfig
+from tensorrt_llm.llmapi.llm_args import (
+    CacheTransceiverConfig,
+    KvCacheConfig,
+    MTPDecodingConfig,
+    TorchLlmArgs,
+)
+from tensorrt_llm.llmapi.llm_utils import _resolve_transceiver_runtime_auto
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.runtime.kv_cache_manager_v2 import GpuCacheTierConfig, LayerId
 from tensorrt_llm.runtime.kv_cache_manager_v2 import KVCacheManager as RuntimeKVCacheManager
@@ -85,9 +93,59 @@ def test_hybrid_cache_manager_factory_honors_cpp_preference_with_block_reuse(mon
     )
 
 
-def test_hybrid_cache_manager_factory_keeps_legacy_disagg_route(monkeypatch):
+@pytest.mark.parametrize(
+    ("backend", "runtime", "backend_env", "expected_cls"),
+    [
+        ("NIXL", "PYTHON", None, V2MambaHybridCacheManager),
+        ("DEFAULT", "PYTHON", None, V2MambaHybridCacheManager),
+        ("DEFAULT", "PYTHON", "TRTLLM_USE_UCX_KVCACHE", CppMambaHybridCacheManager),
+        ("UCX", "PYTHON", None, CppMambaHybridCacheManager),
+        ("NIXL", "auto", None, CppMambaHybridCacheManager),
+        ("NIXL", None, None, CppMambaHybridCacheManager),
+        ("NIXL", "CPP", None, CppMambaHybridCacheManager),
+        ("UCX", None, None, CppMambaHybridCacheManager),
+    ],
+)
+def test_hybrid_cache_manager_factory_gates_v2_disagg_backend(
+    monkeypatch, backend, runtime, backend_env, expected_cls
+):
     monkeypatch.delenv("TRTLLM_USE_PY_MAMBA", raising=False)
     monkeypatch.delenv("TLLM_MAMBA_MANAGER_PREFERENCE", raising=False)
+    for env_var in (
+        "TRTLLM_USE_NIXL_KVCACHE",
+        "TRTLLM_USE_UCX_KVCACHE",
+        "TRTLLM_USE_MOONCAKE_KVCACHE",
+        "TRTLLM_USE_MPI_KVCACHE",
+    ):
+        monkeypatch.delenv(env_var, raising=False)
+    if backend_env is not None:
+        monkeypatch.setenv(backend_env, "1")
+    config = SimpleNamespace(
+        architectures=["Qwen3_5MoeForCausalLM"],
+        num_hidden_layers=2,
+        layer_types=["linear_attention", "full_attention"],
+    )
+    model_config = SimpleNamespace(
+        pretrained_config=config,
+        sparse_attention_config=None,
+        get_num_mamba_layers=lambda: 1,
+    )
+    transceiver_config = CacheTransceiverConfig(backend=backend, transceiver_runtime=runtime)
+
+    assert (
+        get_kv_cache_manager_cls(
+            model_config,
+            KvCacheConfig(enable_block_reuse=False),
+            is_disagg=True,
+            cache_transceiver_config=transceiver_config,
+        )
+        is expected_cls
+    )
+
+
+def test_hybrid_disagg_python_runtime_keeps_mixed_override(monkeypatch):
+    monkeypatch.delenv("TRTLLM_USE_PY_MAMBA", raising=False)
+    monkeypatch.setenv("TLLM_MAMBA_MANAGER_PREFERENCE", "MIXED")
     config = SimpleNamespace(
         architectures=["Qwen3_5MoeForCausalLM"],
         num_hidden_layers=2,
@@ -104,18 +162,34 @@ def test_hybrid_cache_manager_factory_keeps_legacy_disagg_route(monkeypatch):
             model_config,
             KvCacheConfig(enable_block_reuse=False),
             is_disagg=True,
-        )
-        is CppMambaHybridCacheManager
-    )
-    assert (
-        get_kv_cache_manager_cls(
-            model_config,
-            KvCacheConfig(enable_block_reuse=False),
-            is_disagg=True,
-            cache_transceiver_config=SimpleNamespace(transceiver_runtime="PYTHON"),
+            cache_transceiver_config=CacheTransceiverConfig(
+                backend="NIXL", transceiver_runtime="PYTHON"
+            ),
         )
         is MixedMambaHybridCacheManager
     )
+
+
+def test_hybrid_models_resolve_auto_to_python_transceiver(monkeypatch):
+    from tensorrt_llm._torch.models.modeling_nemotron_h import NemotronHForCausalLM
+    from tensorrt_llm._torch.models.modeling_qwen3_5 import Qwen3_5VLModel
+    from tensorrt_llm._torch.models.modeling_qwen3_next import Qwen3NextForCausalLM
+
+    for env_var in (
+        "TRTLLM_USE_NIXL_KVCACHE",
+        "TRTLLM_USE_UCX_KVCACHE",
+        "TRTLLM_USE_MOONCAKE_KVCACHE",
+        "TRTLLM_USE_MPI_KVCACHE",
+    ):
+        monkeypatch.delenv(env_var, raising=False)
+
+    for model_cls in (NemotronHForCausalLM, Qwen3NextForCausalLM, Qwen3_5VLModel):
+        llm_args = TorchLlmArgs(
+            model="/tmp/dummy_model",
+            cache_transceiver_config=CacheTransceiverConfig(backend="DEFAULT"),
+        )
+        _resolve_transceiver_runtime_auto(llm_args, model_cls)
+        assert llm_args.cache_transceiver_config.transceiver_runtime == "PYTHON"
 
 
 def test_v2_hybrid_incompatibility_falls_back_to_cpp_manager():
@@ -860,6 +934,44 @@ def test_v2_hybrid_mamba_state_views_use_logical_slots():
         mgr.add_dummy_requests([123, 456], token_nums=[8, 8], is_gen=False)
         indices = mgr.get_state_indices([123, 456], [False, False])
         assert all(0 <= index < ssm_slots for index in indices)
+    finally:
+        mgr.shutdown()
+
+
+@skip_no_cuda
+def test_v2_hybrid_disagg_page_table_preserves_lifecycle_indices():
+    mgr = _build_v2_hybrid_with_mamba_layer(max_batch_size=4, num_mamba_layers=2)
+    try:
+        page_table = build_page_table_from_manager(mgr)
+
+        assert len(page_table.layer_groups) == mgr.impl._storage.num_life_cycles
+        assert isinstance(page_table.layer_groups[0], MambaLayerGroup)
+        assert isinstance(page_table.layer_groups[1], AttentionLayerGroup)
+
+        requests = mgr.add_dummy_requests([123], token_nums=[64], is_gen=False)
+        assert len(requests) == 1
+        attention_blocks = list(
+            mgr.kv_cache_map[123].get_aggregated_page_indices(1, valid_only=True)
+        )
+        assert attention_blocks
+    finally:
+        mgr.shutdown()
+
+
+@skip_no_cuda
+def test_v2_hybrid_disagg_page_table_uses_qwen3_next_conv_sections():
+    mgr = _build_v2_hybrid_with_mamba_layer(max_batch_size=4, model_type="qwen3_next")
+    try:
+        page_table = build_page_table_from_manager(mgr)
+        mamba_group = page_table.layer_groups[0]
+
+        assert isinstance(mamba_group, MambaLayerGroup)
+        d_conv_m1 = mgr.conv_state_shape[1]
+        conv_elem_size = mgr.all_conv_states[0].element_size()
+        assert mamba_group.conv_section_bytes == [
+            dim * d_conv_m1 * conv_elem_size for dim in mgr.conv_section_dims
+        ]
+        assert mgr.conv_section_dims == [8, 8, 32]
     finally:
         mgr.shutdown()
 

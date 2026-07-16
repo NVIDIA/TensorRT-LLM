@@ -87,6 +87,22 @@ def _non_hybrid_kv_cache_manager_cls(config, kv_cache_config: KvCacheConfig):
     return KVCacheManagerV2 if needs_v2 else KVCacheManager
 
 
+def _resolve_disagg_transceiver_route(
+    cache_transceiver_config: Optional[CacheTransceiverConfig],
+) -> tuple[Optional[str], Optional[str]]:
+    """Return the effective backend and runtime used for manager routing."""
+    if cache_transceiver_config is None:
+        return None, None
+
+    backend, _ = cache_transceiver_config._resolve_default_backend()
+    runtime = cache_transceiver_config.transceiver_runtime
+    if runtime == "auto":
+        # Model loading normally resolves ``auto``. Paths that skip model
+        # defaults use the global C++ fallback, matching transceiver creation.
+        runtime = None
+    return backend, runtime
+
+
 def get_kv_cache_manager_cls(
         model_config: ModelConfig,
         kv_cache_config: KvCacheConfig,
@@ -99,8 +115,12 @@ def get_kv_cache_manager_cls(
     Callers that don't care about disagg can omit ``is_disagg`` and get the
     unified-pool default.
 
-    Aggregated serving defaults to V2. Disaggregated serving keeps the legacy
-    manager routing until the V2 transceiver/page-table adapter is enabled.
+    V2 disaggregated serving requires the Python transceiver with the NIXL
+    backend. Other disaggregated configurations keep their legacy manager.
+
+    Env-var overrides:
+      * ``TRTLLM_USE_PY_MAMBA=1``  — Mixed manager in aggregated serving.
+      * ``TLLM_MAMBA_MANAGER_PREFERENCE`` — explicit manager preference.
     """
     config = model_config.pretrained_config
     sparse_attn_config = model_config.sparse_attention_config
@@ -121,18 +141,16 @@ def get_kv_cache_manager_cls(
                 f"Sparse attention algorithm {sparse_attn_algorithm!r} is not "
                 "supported with hybrid Mamba / linear-attention models.")
 
+        if is_disagg:
+            backend, runtime = _resolve_disagg_transceiver_route(
+                cache_transceiver_config)
+            if runtime != "PYTHON":
+                return CppMambaHybridCacheManager
+            if backend != "NIXL":
+                return CppMambaHybridCacheManager
+
         # Skip Softmax only changes attention kernels. Hybrid models still
         # need a Mamba-capable cache manager for recurrent state.
-        if is_disagg:
-            if kv_cache_config.enable_block_reuse:
-                return CppMambaHybridCacheManager
-            if (cache_transceiver_config is not None and
-                    cache_transceiver_config.transceiver_runtime == "PYTHON"):
-                logger.info("Python transceiver detected; using "
-                            "MixedMambaHybridCacheManager for hybrid model")
-                return MixedMambaHybridCacheManager
-            return CppMambaHybridCacheManager
-
         if use_py_mamba_cache_manager() and not is_disagg:
             if kv_cache_config.enable_block_reuse:
                 raise ValueError(
@@ -380,15 +398,15 @@ class KvCacheCreator:
             cache_transceiver_config=self._cache_transceiver_config)
         cls = self._fallback_if_unsupported_kv_cache_manager_v2(
             cls, model_config, kv_cache_config)
-        # The V1-route hybrid mamba managers (disagg, TRTLLM_USE_PY_MAMBA, or
+        # The V1-route hybrid mamba managers (TRTLLM_USE_PY_MAMBA or
         # one-model speculative decoding) keep mamba
         # state in a separate cache that doesn't honor block reuse. Warn at
         # the routing site so users see the warning where the decision is
         # actually made.
         if is_hybrid_linear(model_engine.model.model_config.pretrained_config) \
                 and kv_cache_config.enable_block_reuse:
-            uses_v1_mamba_route = self._is_disagg \
-                or os.environ.get('TRTLLM_USE_PY_MAMBA', '0') == '1' \
+            uses_v1_mamba_route = \
+                os.environ.get('TRTLLM_USE_PY_MAMBA', '0') == '1' \
                 or self._speculative_config is not None
             if uses_v1_mamba_route and not issubclass(
                     cls, V2MambaHybridCacheManager):
@@ -1866,6 +1884,8 @@ def _create_kv_cache_manager(
     manager_extra_kwargs = {}
     if issubclass(kv_cache_manager_cls, KVCacheManagerV2):
         manager_extra_kwargs["enable_stats"] = enable_kv_cache_stats
+    if issubclass(kv_cache_manager_cls, V2MambaHybridCacheManager):
+        manager_extra_kwargs["is_disagg"] = is_disagg
 
     if is_mla(config):
         kv_cache_manager = kv_cache_manager_cls(
