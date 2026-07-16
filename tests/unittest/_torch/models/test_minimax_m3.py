@@ -766,7 +766,7 @@ def test_minimax_m3_routing_method_default_scale_is_identity():
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not _has_cuda(), reason="MiniMax-M3 needs CUDA")
-def test_text_norm_weights_real_loader_smoke():
+def test_text_norm_weights_real_loader_smoke(monkeypatch: pytest.MonkeyPatch):
     """real ``_load_weights_impl_v2`` populates norm parameters.
 
     Constructs a memory-safe stub containing the top-level ``model.norm``
@@ -880,18 +880,15 @@ def test_text_norm_weights_real_loader_smoke():
     # executor so a failure surfaces immediately rather than as a thread
     # traceback (the parallel path is exercised in production; for this
     # tiny 3-module slice the serial walk is what the test should observe).
-    os.environ["TRT_LLM_DISABLE_LOAD_WEIGHTS_IN_PARALLEL"] = "True"
-    try:
-        weight_mapper = MiniMaxM3HfWeightMapper()
-        weight_mapper.init_model_and_config(stub, stub.model_config)
-        _load_weights_impl_v2(
-            stub,
-            text_weights,
-            weight_mapper,
-            allow_partial_loading=True,
-        )
-    finally:
-        os.environ.pop("TRT_LLM_DISABLE_LOAD_WEIGHTS_IN_PARALLEL", None)
+    monkeypatch.setenv("TRT_LLM_DISABLE_LOAD_WEIGHTS_IN_PARALLEL", "True")
+    weight_mapper = MiniMaxM3HfWeightMapper()
+    weight_mapper.init_model_and_config(stub, stub.model_config)
+    _load_weights_impl_v2(
+        stub,
+        text_weights,
+        weight_mapper,
+        allow_partial_loading=True,
+    )
 
     # The three norms should now hold the source tensors' values.
     torch.testing.assert_close(

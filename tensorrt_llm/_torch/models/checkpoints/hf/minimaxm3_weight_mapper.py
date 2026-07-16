@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from torch import nn
+from torch import Tensor, nn
 
 from tensorrt_llm._torch.models.checkpoints.hf.weight_mapper import HfWeightMapper
 from tensorrt_llm._torch.models.modeling_utils import register_mapper
@@ -32,7 +32,9 @@ class MiniMaxM3HfWeightMapper(HfWeightMapper):
         super().__init__()
         self.params_map = MINIMAX_M3_PARAMS_MAP
 
-    def _duplicate_kv_weights(self, module: nn.Module, new_name: str, weights: dict) -> dict:
+    def _duplicate_kv_weights(
+        self, module: nn.Module, new_name: str, weights: dict[str, Tensor]
+    ) -> dict[str, Tensor]:
         if new_name not in ["k_proj", "v_proj"]:
             return weights
 
