@@ -309,7 +309,7 @@ class BlackwellFusedMultiHeadAttentionForward:
             p_source,
         )
 
-    def _setup_attributes(self):
+    def _setup_attributes(self, enable_skip_softmax: bool) -> None:
         """Set up configurations and parameters for the FMHA kernel operation.
 
         This method initializes and configures various attributes required for the
@@ -334,7 +334,12 @@ class BlackwellFusedMultiHeadAttentionForward:
         self.epi_stage = 2
 
         # Tunable parameters
-        self.rescale_threshold = 8.0 if self.enable_skip_correction else 0.0
+        if not self.enable_skip_correction:
+            self.rescale_threshold = 0.0
+        elif enable_skip_softmax:
+            self.rescale_threshold = 1.0
+        else:
+            self.rescale_threshold = 8.0
         # FP8 P pre-scale: offset added to exp2 exponent so that P*2^offset fills
         # more of E4M3's [0, 448] range, improving quantization precision.
         # Derived from rescale_threshold to guarantee P*2^offset <= 448.
@@ -503,7 +508,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         # V may use a different dtype (pv_dtype) to allow qk_dtype != pv_dtype.
         if cutlass.const_expr(self.q_dtype != self.k_dtype):
             raise TypeError(f"Type mismatch: {self.q_dtype} != {self.k_dtype}")
-        self._setup_attributes()
+        self._setup_attributes(skip_softmax_threshold_log2 is not None)
 
         cta_group = tcgen05.CtaGroup.ONE
         # the intermediate tensor p is from tmem & k-major
