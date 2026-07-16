@@ -58,7 +58,9 @@ from tensorrt_llm._torch.pyexecutor.sampler.sampling_utils import (
     TopK,
     TopKTopP,
     TopP,
+    TopPDecayOverride,
     UtilsSamplingParams,
+    resolve_sampling_strategy,
 )
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.bindings import SamplingConfig
@@ -1793,6 +1795,7 @@ class TestBatchedSampling:
             generator: Optional[torch.Generator] = None,
             return_probs: bool,
             group_metadata: StrategyMetadata | None = None,
+            decay_override: Optional[TopPDecayOverride] = None,
         ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor] | float]:
             assert generator is sampler.get_generator(logits.device)
             if isinstance(group_key, tuple):
@@ -1811,6 +1814,7 @@ class TestBatchedSampling:
                     generator=generator,
                     return_probs=return_probs,
                     group_metadata=group_metadata,
+                    decay_override=decay_override,
                 )
             )
             return result
@@ -2756,3 +2760,113 @@ class TestApplyBadWords:
         logits = self._run_stale([req], [True], {0: 9})
         assert self._banned_cols(logits[0]) == {2}
         assert not torch.isnan(logits).any()
+
+
+class TestTopPDecay:
+    """Minimal functional guards for Top-P Decay in TorchSampler.
+
+    Covers strategy routing, the post-sample runtime update (parity with the
+    C++ computeToppDecay recurrence; cases ported from
+    topPSamplingLayerTest.cpp), and per-request rejection of unsupported
+    combinations.
+    """
+
+    VOCAB_SIZE = 1000
+
+    @staticmethod
+    def _params(**kw) -> UtilsSamplingParams:
+        base = dict(temperature=None, top_p=None, top_k=None, use_beam_search=False)
+        base.update(kw)
+        return UtilsSamplingParams(**base)
+
+    @staticmethod
+    def _make_sampler(*, max_draft_len=0):
+        return TorchSampler(
+            TorchSampler.Args(
+                max_seq_len=128,
+                max_draft_len=max_draft_len,
+                max_num_sequences=8,
+                max_beam_width=1,
+                max_total_draft_tokens=max_draft_len,
+                disable_overlap_scheduler=True,
+            )
+        )
+
+    def test_strategy_routing(self):
+        # Active decay (set and < 1.0) forces a top-p-capable strategy even for
+        # an otherwise-greedy request (initial top-p defaults to 1.0), so the
+        # decayed runtime value can take effect on later steps.
+        s = resolve_sampling_strategy(self._params(top_p_decay=0.5), vocab_size=self.VOCAB_SIZE)
+        assert s[0] == "top_p" and s[1] == pytest.approx(1.0)
+        s = resolve_sampling_strategy(
+            self._params(top_k=50, top_p=0.9, top_p_decay=0.8), vocab_size=self.VOCAB_SIZE
+        )
+        assert s[0] == "top_k_top_p"
+        # decay == 1.0 (the C++ default) is a no-op and does not activate...
+        s = resolve_sampling_strategy(self._params(top_p_decay=1.0), vocab_size=self.VOCAB_SIZE)
+        assert s is GREEDY
+        # ...and an explicit greedy control wins over an active decay.
+        s = resolve_sampling_strategy(
+            self._params(top_p_decay=0.5, top_k=1), vocab_size=self.VOCAB_SIZE
+        )
+        assert s is GREEDY
+
+    def test_runtime_update_parity(self):
+        # Post-sample update parity with the C++ computeToppDecay recurrence:
+        #   runtime = initial                    if reset_id >= 0 and token == reset_id
+        #           = max(runtime * decay, min)  otherwise
+        sampler = self._make_sampler()
+        store = sampler.store.top_p_decay_store
+        configs = [
+            dict(initial=0.8, decay=0.3, top_p_min=0.5, reset_id=2),  # decay, then reset
+            dict(initial=0.2, decay=0.9, top_p_min=0.1, reset_id=-1),  # plain decay, floored
+            dict(initial=0.3, decay=0.5, top_p_min=0.6, reset_id=-1),  # min > initial: rises
+        ]
+        token_steps = [[1, 2, 3], [9, 9, 9], [9, 9, 9]]
+        slots = list(range(len(configs)))
+        for slot, cfg in zip(slots, configs):
+            sampler._top_p_decay_slots.add(slot)
+            store.runtime_top_p_decay_cuda[slot] = cfg["initial"]
+            store.initial_top_p_decay_cuda[slot] = cfg["initial"]
+            store.top_p_decay_cuda[slot] = cfg["decay"]
+            store.top_p_decay_min_cuda[slot] = cfg["top_p_min"]
+            store.top_p_decay_reset_ids_cuda[slot] = cfg["reset_id"]
+            store.is_top_p_decay_slot_cuda[slot] = True
+
+        runtime = [cfg["initial"] for cfg in configs]
+        slots_cuda = torch.tensor(slots, dtype=torch.int64, device="cuda")
+        for step in range(3):
+            for slot in slots:
+                sampler.store.new_tokens[0, slot, 0] = token_steps[slot][step]
+            sampler._update_top_p_decay_after_sample(
+                new_tokens_cuda=sampler.store.new_tokens, sampled_slots_cuda=slots_cuda
+            )
+            got = store.runtime_top_p_decay_cuda.cpu()
+            for slot, cfg in zip(slots, configs):
+                tok = token_steps[slot][step]
+                if cfg["reset_id"] >= 0 and tok == cfg["reset_id"]:
+                    runtime[slot] = cfg["initial"]
+                else:
+                    runtime[slot] = max(runtime[slot] * cfg["decay"], cfg["top_p_min"])
+                assert got[slot].item() == pytest.approx(runtime[slot], abs=1e-6), (step, slot)
+
+    def test_reject_speculative_draft_tokens(self):
+        # Decay + draft tokens through TorchSampler is rejected per-request at
+        # admission (validate_request), so only the offending request fails.
+        sampler = self._make_sampler(max_draft_len=4)
+
+        def _request(params: SamplingParams, draft_tokens):
+            params._validate()
+            req = SimpleNamespace(
+                sampling_config=SamplingConfig(params._get_sampling_config()),
+                is_context_init_state=False,
+                py_sampling_strategy=None,
+                py_draft_tokens=draft_tokens,
+            )
+            req.get_beam_width_by_iter = lambda for_next_iteration=False: 1
+            return cast(LlmRequest, req)
+
+        with pytest.raises(ValueError, match="speculative"):
+            sampler.validate_request(_request(SamplingParams(top_p=0.9, top_p_decay=0.5), [1, 2]))
+        # Same request without decay is accepted.
+        sampler.validate_request(_request(SamplingParams(top_p=0.9), [1, 2]))

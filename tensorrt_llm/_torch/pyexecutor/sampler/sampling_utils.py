@@ -39,6 +39,7 @@ from tensorrt_llm._torch.pyexecutor.sampler.ops.flashinfer import (
     top_p_renorm_probs_op,
     top_p_sampling_from_probs_op,
 )
+from tensorrt_llm._torch.pyexecutor.sampler.ops.trtllm import top_p_decay_gather
 from tensorrt_llm._torch.pyexecutor.sampler.ops.vanilla import (
     GREEDY_TEMPERATURE_THRESHOLD,
     BeamSearchMetadata,
@@ -106,6 +107,10 @@ class UtilsSamplingParams:
         use_beam_search: Whether to use beam search.
         beam_width_in: The beam_width of a request before the sampling step.
         beam_width_out: The beam_width of a request after the sampling step.
+        top_p_decay: Per-step multiplicative decay applied to the runtime top-p.
+        top_p_min: Lower bound for the decayed runtime top-p.
+        top_p_reset_ids: Token id which, when sampled, resets the runtime top-p to
+            its initial value. A value < 0 never matches a token.
     """
 
     temperature: Optional[float]
@@ -114,6 +119,36 @@ class UtilsSamplingParams:
     use_beam_search: Optional[bool]
     beam_width_in: Optional[int] = None
     beam_width_out: Optional[int] = None
+    top_p_decay: Optional[float] = None
+    top_p_min: Optional[float] = None
+    top_p_reset_ids: Optional[int] = None
+
+
+@dataclass(frozen=True, kw_only=True)
+class TopPDecayOverride:
+    """Per-group runtime top-p override for decay-active rows.
+
+    ``slots`` maps each per-step group row to its sequence slot; the decayed
+    per-row top-p is gathered on-device from the per-slot ``runtime_top_p``
+    store, gated by ``is_decay_slot`` (non-decay rows keep their static top-p).
+    """
+
+    slots: torch.Tensor
+    """Per-step group rows' sequence slots (int64, device)."""
+    runtime_top_p: torch.Tensor
+    """Per-slot runtime (decayed) top-p store (float32, device)."""
+    is_decay_slot: torch.Tensor
+    """Per-slot decay-active gate (bool, device)."""
+
+
+def top_p_decay_active(params: UtilsSamplingParams) -> bool:
+    """Whether dynamic top-p decay is active for a request.
+
+    Decay is active iff ``top_p_decay`` is explicitly set and ``< 1.0``. A decay
+    of ``1.0`` (the C++ default) is a no-op, and ``top_p_min`` / ``top_p_reset_ids``
+    alone do not activate dynamic behavior.
+    """
+    return params.top_p_decay is not None and params.top_p_decay < 1.0
 
 
 def resolve_sampling_strategy(params: UtilsSamplingParams, *, vocab_size: int) -> Strategy:
@@ -124,13 +159,25 @@ def resolve_sampling_strategy(params: UtilsSamplingParams, *, vocab_size: int) -
     top_p = params.top_p
     top_k = params.top_k
 
+    # When top-p decay is active, the runtime top-p can shrink below 1.0 on later
+    # steps even if the request starts at top_p == 1.0 / None. Force a top-p-capable
+    # strategy (defaulting the initial top-p to 1.0) so the decayed value takes effect.
+    # However, an EXPLICIT greedy control (see params_imply_explicit_greedy) is a
+    # deterministic intent that must be honored even with decay set -- only the
+    # implicit "all params unset" greedy case is overridden by decay.
+    decay_active = top_p_decay_active(params)
+
     if SamplingParams.params_imply_greedy_decoding(
         temperature=temperature,
         top_p=top_p,
         top_k=top_k,
         use_beam_search=use_beam_search,
     ):
-        return GREEDY
+        explicitly_greedy = SamplingParams.params_imply_explicit_greedy(
+            temperature=temperature, top_p=top_p, top_k=top_k
+        )
+        if explicitly_greedy or not decay_active:
+            return GREEDY
 
     # --- resolving default values
     # NB: not greedy, hence temperature != 0 if specified
@@ -152,7 +199,10 @@ def resolve_sampling_strategy(params: UtilsSamplingParams, *, vocab_size: int) -
     assert top_k > 1, "non-greedy sampling requires valid top_k"
     need_top_k = top_k < vocab_size
     assert top_p > 0, "non-greedy sampling requires valid top_p"
-    need_top_p = top_p < 1
+    # A decay-active request must go through a top-p-capable path even when its
+    # initial top_p is 1.0, so the runtime top-p (sourced per-row at sample time)
+    # can shrink the nucleus on later steps.
+    need_top_p = top_p < 1 or decay_active
 
     if need_top_p:
         if need_top_k:
@@ -271,6 +321,40 @@ class _StrategyImpls:
         def _make_tensor(data: list[Any], dtype: torch.dtype, device: torch.device) -> torch.Tensor:
             return torch.tensor(data, dtype=dtype, pin_memory=prefer_pinned()).to(
                 device=device, non_blocking=True
+            )
+
+        def _apply_top_p_runtime_override(
+            self,
+            decay_override: "TopPDecayOverride",
+        ) -> None:
+            """Override the per-row static top-p with the decayed top-p.
+
+            Only decay-active rows (per the on-device ``is_decay_slot`` gate) are
+            overridden, so a group mixing top-p-decay and plain top-p requests
+            keeps each row's correct value. The overridden ``self._top_p`` tensor
+            then feeds both sampling and ``top_p_renorm_probs_op`` (so processed
+            logprobs match). Single fused launch (gather + gate + select).
+
+            The caller (sample_grouped_strategies) is responsible for the
+            None-check; this method requires an actual override.
+            """
+            # Only TopP*/TopKTopP* impls (which own a per-row ``_top_p`` tensor)
+            # receive a runtime override; access via getattr keeps this base-class
+            # helper independent of subclass attribute declarations.
+            static_top_p: torch.Tensor = getattr(self, "_top_p")
+            assert static_top_p.shape == decay_override.slots.shape, (
+                static_top_p.shape,
+                decay_override.slots.shape,
+            )
+            setattr(
+                self,
+                "_top_p",
+                top_p_decay_gather(
+                    runtime_top_p=decay_override.runtime_top_p,
+                    is_decay_slot=decay_override.is_decay_slot,
+                    static_top_p=static_top_p,
+                    slots=decay_override.slots,
+                ),
             )
 
         @staticmethod
@@ -768,6 +852,7 @@ class FlashInferGroupedStrategySampler:
         generator: Optional[torch.Generator] = None,
         return_probs: bool,
         group_metadata: StrategyMetadata | None = None,
+        decay_override: Optional[TopPDecayOverride] = None,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
         """Sample grouped strategies.
 
@@ -817,6 +902,10 @@ class FlashInferGroupedStrategySampler:
         else:
             assert group_logit_indices.size(0) == beam_width_in * len(strategies)
         strategy_impl = strategy_impl_cls.from_strategies(strategies, cuda_device=logits.device)
+        # For top-p / top_k_top_p groups, override the per-row static top-p with the
+        # decayed top-p on the decay-active rows (gated on-device).
+        if decay_override is not None:
+            strategy_impl._apply_top_p_runtime_override(decay_override)
         next_tokens, softmax = strategy_impl.sample(
             logits,
             group_logit_indices=group_logit_indices,

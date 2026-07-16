@@ -211,7 +211,7 @@ class SamplingParams:
             If temperature > 0 and/or top_k > 1 are specified, sampling will proceed accordingly and top_p will default to top_p = 1.
             Setting top_p = 0 should result in greedy sampling, but is currently disallowed in the backend.
         top_p_min (float, optional): Controls decay in the top-P algorithm. topPMin is lower-bound. None means using C++ runtime default 1.e-6. Defaults to None.
-        top_p_reset_ids (int, optional): Controls decay in the top-P algorithm. Indicates where to reset the decay. None means using C++ runtime default 1. Defaults to None.
+        top_p_reset_ids (int, optional): Controls decay in the top-P algorithm. The token id which, when sampled, resets the decayed top-P to its initial value. None means using C++ runtime default -1 (which never matches a token). Defaults to None.
         top_p_decay (float, optional): Controls decay in the top-P algorithm. The decay value. None means using C++ runtime default 1.f. Defaults to None.
         seed (int, optional): Controls the random seed used by the random number generator in sampling. None means using C++ runtime default 0. Defaults to None.
         temperature (float, optional): Controls the modulation of logits when sampling new tokens. It can have values >= 0.f. Defaults to None.
@@ -379,6 +379,23 @@ class SamplingParams:
         if self.temperature is not None and self.temperature < 0:
             raise ValueError(f"require temperature >= 0, got temperature={self.temperature}")
 
+        # Top-p decay params follow the C++ warn-and-default policy (see
+        # topPSamplingLayer.cpp): out-of-range values are clamped to the runtime
+        # defaults rather than raising. Note top_p_min > top_p is intentionally
+        # allowed (C++ parity: the runtime top-p may rise toward top_p_min).
+        if self.top_p_decay is not None and (self.top_p_decay <= 0 or self.top_p_decay > 1):
+            logger.warning(
+                f"top_p_decay must be in (0, 1], got {self.top_p_decay}. "
+                f"Falling back to the default (1.0)."
+            )
+            self.top_p_decay = None
+        if self.top_p_min is not None and (self.top_p_min <= 0 or self.top_p_min > 1):
+            logger.warning(
+                f"top_p_min must be in (0, 1], got {self.top_p_min}. "
+                f"Falling back to the default (1e-6)."
+            )
+            self.top_p_min = None
+
         if self.best_of is not None and self.best_of < self.n:
             raise ValueError(f"best_of ({self.best_of}) cannot be less than n ({self.n})")
 
@@ -444,14 +461,42 @@ class SamplingParams:
             or temperature == 0
         )
 
+    # NB: Static, because downstream code only holds instances of
+    #     bindings.SamplingConfig (not SamplingParams). Single source of truth for
+    #     the "explicit greedy control" predicate shared with
+    #     resolve_sampling_strategy (sampling_utils.py).
+    @staticmethod
+    def params_imply_explicit_greedy(
+        *,
+        temperature: Optional[float],
+        top_p: Optional[float],
+        top_k: Optional[int],
+    ) -> bool:
+        """Whether the request carries an explicit greedy control.
+
+        Explicit means top_k == 1, top_p == 0.0, or temperature == 0, as opposed
+        to the implicit "all params unset" greedy default.
+        """
+        return top_k == 1 or top_p == 0.0 or temperature == 0
+
     @property
     def _greedy_decoding(self) -> bool:
-        return self.params_imply_greedy_decoding(
+        if not self.params_imply_greedy_decoding(
             temperature=self.temperature,
             top_p=self.top_p,
             top_k=self.top_k,
             use_beam_search=self.use_beam_search,
+        ):
+            return False
+        # Keep this consistent with resolve_sampling_strategy: an active top_p_decay
+        # (set and < 1.0) routes to top-p sampling and is therefore NOT greedy,
+        # unless the request also carries an explicit greedy control, which is a
+        # deterministic intent that wins over decay.
+        decay_active = self.top_p_decay is not None and self.top_p_decay < 1.0
+        explicitly_greedy = self.params_imply_explicit_greedy(
+            temperature=self.temperature, top_p=self.top_p, top_k=self.top_k
         )
+        return explicitly_greedy or not decay_active
 
     @property
     def _need_return_context_logits(self) -> bool:
