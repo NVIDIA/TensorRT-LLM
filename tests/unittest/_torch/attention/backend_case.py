@@ -32,7 +32,6 @@ from tensorrt_llm._torch.attention_backend.sparse import get_sparse_attn_kv_cach
 from tensorrt_llm._torch.attention_backend.utils import create_attention, get_attention_backend
 from tensorrt_llm._torch.flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from tensorrt_llm._torch.metadata import KVCacheParams
-from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import str_dtype_to_torch, torch_dtype_to_binding
@@ -326,7 +325,6 @@ def _build_mla_kv_cache_manager(
     case: BackendCase,
     backend: str,
     sparse_config=None,
-    model_config=None,
 ):
     """A SELFKONLY KV cache for MLA: one latent head, head_dim kv_lora+qk_rope."""
     d_latent = case.kv_lora_rank + case.qk_rope_head_dim
@@ -359,14 +357,9 @@ def _build_mla_kv_cache_manager(
         dtype=torch_dtype_to_binding(case.compute_dtype),
     )
 
-    if sparse_config is not None and backend != "VANILLA":
+    if sparse_config is not None:
         cls = get_sparse_attn_kv_cache_manager(sparse_config)
-        if model_config is None:
-            raise ValueError("Sparse cache manager requires a model config")
-        kwargs.update(
-            sparse_attention_config=sparse_config,
-            model_config=model_config,
-        )
+        kwargs.update(sparse_attention_config=sparse_config)
     else:
         cls = KVCacheManagerV2 if case.use_kv_cache_manager_v2 else KVCacheManager
 
@@ -670,10 +663,6 @@ def _run_sparse_mla_backend(
     d_latent = case.kv_lora_rank + case.qk_rope_head_dim
     pos_embd_params = _mla_context_pos_embd_params(case)
     mapping = Mapping(world_size=1, tp_size=1, rank=0)
-    model_config = ModelConfig(
-        mapping=mapping,
-        sparse_attention_config=sparse_config,
-    )
     attn = create_attention(
         backend,
         layer_idx=0,
@@ -699,12 +688,7 @@ def _run_sparse_mla_backend(
     # Weights are skipped (selections are injected, not produced by an indexer);
     # update_quant_config initializes the quant/FMHA state needed before forward.
     attn.update_quant_config(None)
-    mgr = _build_mla_kv_cache_manager(
-        case,
-        backend,
-        sparse_config,
-        model_config,
-    )
+    mgr = _build_mla_kv_cache_manager(case, backend, sparse_config)
 
     try:
         mgr.add_dummy_requests(request_ids, case.token_nums)
