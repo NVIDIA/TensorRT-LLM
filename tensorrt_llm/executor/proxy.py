@@ -43,13 +43,16 @@ from .rpc import RPCClient
 from .rpc.rpc_common import RPCError, get_unique_ipc_addr
 from .utils import (EngineDeadError, ErrorResponse, RequestError,
                     WorkerCommIpcAddrs, create_mpi_comm_session,
+                    get_multi_frontend_ipc_info, get_num_serve_frontends,
                     get_spawn_proxy_process_env, is_llm_response,
-                    print_alive_threads)
+                    multi_frontend_request_addr, multi_frontend_result_addr,
+                    namespace_client_id, print_alive_threads)
 from .worker import GenerationExecutorWorker, worker_main
 from .worker_process_monitor import WorkerProcessIdentity, WorkerProcessMonitor
 
 __all__ = [
     "GenerationExecutorProxy",
+    "GenerationExecutorFrontendProxy",
 ]
 
 # Methods that are explicitly implemented for multi-rank MPI/IPC executor
@@ -160,6 +163,21 @@ class GenerationExecutorProxy(GenerationExecutor):
         self._is_pytorch_backend = _backend in ["pytorch", "_autodeploy"]
         self._enable_resource_governor = bool(
             getattr(_llm_args, "enable_resource_governor", False))
+
+        # Multi-frontend serving (TLLM_SERVE_NUM_FRONTENDS > 1) on the classic
+        # IPC path: trtllm-serve (the launcher, frontend 0) pre-generates a
+        # shared ipc directory + HMAC key so this proxy, the rank0 worker and
+        # the attached frontends agree on deterministic endpoints (see
+        # _setup_queues). Attached frontends never reach this class -- they
+        # construct GenerationExecutorFrontendProxy instead.
+        self._multi_frontend_info = get_multi_frontend_ipc_info()
+        self._num_frontends = get_num_serve_frontends(
+        ) if self._multi_frontend_info is not None else 1
+        if self._num_frontends > 1 and self._enable_resource_governor:
+            raise ValueError(
+                "Multi-frontend serving does not support "
+                "enable_resource_governor: the resource-governor signal only "
+                "reaches the launcher frontend.")
 
         # Generate RPC address and key for stats RPC
         self.rpc_addr = get_unique_ipc_addr()
@@ -395,33 +413,87 @@ class GenerationExecutorProxy(GenerationExecutor):
             self._shutdown_event.wait(timeout=5.0)
 
     def _setup_queues(self) -> WorkerCommIpcAddrs:
-
-        self.request_queue = IpcQueue(is_server=True,
-                                      name="proxy_request_queue")
+        frontend_result_addrs = None
+        if self._num_frontends > 1:
+            # Multi-frontend serving: deterministic endpoints shared with the
+            # attached frontends. The rank0 worker BINDS the request ingress
+            # (PULL) so every frontend can PUSH-connect; each frontend
+            # (including this launcher, frontend 0) binds its own result lane
+            # (PULL) that the worker / postproc processes PUSH-connect to,
+            # selected by the frontend id in client_id's top bits.
+            ipc_dir, hmac_key = self._multi_frontend_info
+            request_addr = (multi_frontend_request_addr(ipc_dir), hmac_key)
+            frontend_result_addrs = [(multi_frontend_result_addr(ipc_dir,
+                                                                 i), hmac_key)
+                                     for i in range(self._num_frontends)]
+            self.request_queue = IpcQueue(request_addr,
+                                          is_server=False,
+                                          socket_type=zmq.PUSH,
+                                          name="proxy_request_queue")
+            self.result_queue = FusedIpcQueue(frontend_result_addrs[0],
+                                              is_server=True,
+                                              fuse_message=False,
+                                              socket_type=zmq.PULL,
+                                              name="proxy_result_queue")
+        else:
+            request_addr = None
+            self.request_queue = IpcQueue(is_server=True,
+                                          name="proxy_request_queue")
+            # TODO[chunweiy]: Unify IpcQueue and FusedIpcQueue
+            # Use PULL mode when enable_postprocess_parallel as there are
+            # multiple senders from multiple processes.
+            self.result_queue = FusedIpcQueue(
+                is_server=True,
+                fuse_message=False,
+                socket_type=zmq.PULL
+                if self.enable_postprocess_parallel else zmq.PAIR,
+                name="proxy_result_queue")
         self.worker_init_status_queue = IpcQueue(
             is_server=True,
             socket_type=zmq.ROUTER,
             name="worker_init_status_queue")
-        # TODO[chunweiy]: Unify IpcQueue and FusedIpcQueue
-        # Use PULL mode when enable_postprocess_parallel as there are
-        # multiple senders from multiple processes.
-        self.result_queue = FusedIpcQueue(
-            is_server=True,
-            fuse_message=False,
-            socket_type=zmq.PULL
-            if self.enable_postprocess_parallel else zmq.PAIR,
-            name="proxy_result_queue")
         self._resource_governor_queue = IpcQueue(
             is_server=True, name="proxy_resource_governor_queue"
         ) if self._enable_resource_governor else None
         # Stats and KV events are now fetched via RPC, not IPC queues.
         return WorkerCommIpcAddrs(
-            request_queue_addr=self.request_queue.address,
+            # A connect-mode queue has no bound .address; use the preset one.
+            request_queue_addr=request_addr
+            if request_addr is not None else self.request_queue.address,
             worker_init_status_queue_addr=self.worker_init_status_queue.address,
             result_queue_addr=self.result_queue.address,
             resource_governor_queue_addr=self._resource_governor_queue.address
             if self._resource_governor_queue is not None else None,
+            frontend_result_queue_addrs=frontend_result_addrs,
         )
+
+    def multi_frontend_attach_info(self) -> Optional[dict]:
+        """The attach payload consumed by attached serving frontends.
+
+        See GenerationExecutorFrontendProxy and commands/serve.py. Returns
+        None unless multi-frontend mode is active.
+        """
+        if self._num_frontends <= 1:
+            return None
+        ipc_dir, hmac_key = self._multi_frontend_info
+        return {
+            "mode":
+            "classic",
+            "request_addr":
+            multi_frontend_request_addr(ipc_dir),
+            "result_addrs": [
+                multi_frontend_result_addr(ipc_dir, i)
+                for i in range(self._num_frontends)
+            ],
+            "hmac_key":
+            hmac_key.hex(),
+            # Stats / KV events / disagg params RPC endpoint on the rank0
+            # worker (ROUTER socket, natively multi-client).
+            "rpc_addr":
+            self.rpc_addr,
+            "rpc_hmac_key":
+            self.hmac_key.hex(),
+        }
 
     @property
     def resource_governor_queue(self):
@@ -911,3 +983,101 @@ class GenerationExecutorProxy(GenerationExecutor):
     def __exit__(self, exc_type, exc_value, traceback):
         self.shutdown()
         return False  # propagate the exception
+
+
+class GenerationExecutorFrontendProxy(GenerationExecutorProxy):
+    """An attached serving frontend for the classic IPC executor path.
+
+    Used for multi-frontend serving (TLLM_SERVE_NUM_FRONTENDS > 1).
+    PUSH-connects to the request ingress bound by the rank0 worker and binds
+    its own per-frontend result lane (PULL); the worker routes responses to
+    this lane by the frontend id embedded in the top bits of client_id (see
+    utils.namespace_client_id). It never owns the engine: no MPI
+    session, no worker launch, and shutdown never emits the worker's None
+    shutdown sentinel -- that right is the launcher frontend's alone.
+    """
+
+    def __init__(
+        self,
+        attach_info: dict,
+        *,
+        frontend_id: int,
+        postproc_worker_config: Optional[PostprocWorkerConfig] = None,
+        is_llm_executor: Optional[bool] = None,
+    ) -> None:
+        if not 0 < frontend_id < (1 << 16):
+            raise ValueError(f"frontend_id out of range: {frontend_id}")
+        if frontend_id >= len(attach_info["result_addrs"]):
+            raise ValueError(
+                f"frontend_id {frontend_id} has no result lane: only "
+                f"{len(attach_info['result_addrs'])} lanes were provisioned")
+        postproc_worker_config = postproc_worker_config or PostprocWorkerConfig(
+        )
+        # Deliberately skip GenerationExecutorProxy.__init__: it creates an
+        # MPI session, launches workers, and registers the pre_shutdown
+        # atexit hook that emits the engine shutdown sentinel.
+        GenerationExecutor.__init__(
+            self,
+            num_postprocess_workers=postproc_worker_config.
+            num_postprocess_workers,
+            postprocess_tokenizer_dir=postproc_worker_config.
+            postprocess_tokenizer_dir,
+            is_llm_executor=is_llm_executor)
+
+        self._frontend_id = frontend_id
+        self._results: Dict[int, GenerationResult] = {}
+        self.garbage_collection_gen0_threshold = None
+        self.workers_started = False
+        self.dispatch_result_thread: Optional[ManagedThread] = None
+        # The resource governor lives with the launcher frontend only; the
+        # inherited resource_governor_queue property must return None here so
+        # OpenAIServer takes its governor-disabled path (openai_server.py).
+        self._resource_governor_queue = None
+
+        hmac_key = bytes.fromhex(attach_info["hmac_key"])
+        self.request_queue = IpcQueue(
+            (attach_info["request_addr"], hmac_key),
+            is_server=False,
+            socket_type=zmq.PUSH,
+            name=f"frontend_{frontend_id}_request_queue")
+        self.result_queue = FusedIpcQueue(
+            (attach_info["result_addrs"][frontend_id], hmac_key),
+            is_server=True,
+            fuse_message=False,
+            socket_type=zmq.PULL,
+            name=f"frontend_{frontend_id}_result_queue")
+
+        # Stats / KV events / disagg params share the rank0 worker's stats
+        # RPC server with the launcher (ROUTER socket, natively
+        # multi-client; per-frontend sampling).
+        self.rpc_client: Optional[RPCClient] = None
+        if attach_info.get("rpc_addr"):
+            self.rpc_client = RPCClient(attach_info["rpc_addr"],
+                                        hmac_key=bytes.fromhex(
+                                            attach_info["rpc_hmac_key"]))
+
+    def _get_next_client_id(self) -> int:
+        # Embed the frontend id in the top bits so the worker routes the
+        # responses back to this frontend's result lane.
+        return namespace_client_id(self._frontend_id,
+                                   super()._get_next_client_id())
+
+    def pre_shutdown(self):
+        if self.doing_shutdown:
+            return
+        self.doing_shutdown = True
+        # Abort this frontend's in-flight requests so the engine frees their
+        # slots. Never send the None engine-shutdown sentinel: the launcher
+        # frontend owns the engine lifecycle (see the class docstring).
+        self._abort_all_requests()
+
+    def shutdown(self):
+        self.pre_shutdown()
+        if self.rpc_client is not None:
+            self.rpc_client.close()
+            self.rpc_client = None
+        # The dispatch thread blocks on result_queue.get(); it is a daemon
+        # ManagedThread that exits with the process or on the worker's
+        # per-lane None sentinel at engine teardown. Closing its socket from
+        # another thread is not ZMQ-safe, so leave the queues to process
+        # teardown.
