@@ -228,7 +228,12 @@ def echoRemoteLogTail(def pipeline, Map remote, String remotePath, int lines = 2
 // the locally-staged result XMLs when the same stageName is uploaded more than
 // once in a build (e.g. SLURM infra-failure retries). First attempt passes "".
 def uploadResults(def pipeline, SlurmCluster cluster, String clusterName, String nodeName, String stageName, Boolean stageIsInterrupted, String postTag="") {
-    CloudManager.withSlurmSshCredentials(pipeline, clusterName, cluster) { remote ->
+    CloudManager.withSlurmSshCredentialRemotes(pipeline, clusterName, cluster) { remotes ->
+        // Pin one reachable frontend for the whole collect: every download targets
+        // the same node workspace (/home/svc_tensorrt/bloom/scripts/${nodeName}),
+        // so the find + scps must all hit the login node that holds those files.
+        // No whole-closure failover here -- uploadArtifacts/junit must not re-run.
+        def remote = CloudManager.selectReachableSlurmRemote(pipeline, remotes)
         def hasTimeoutTest = false
         def downloadResultSucceed = false
         def downloadPerfResultSucceed = false
@@ -599,7 +604,7 @@ def processShardTestList(llmSrc, testDBList, splitId, splits, perfMode=false, du
 }
 
 def cleanUpSlurmResources(def pipeline, SlurmCluster cluster, String clusterName, String jobUID){
-    CloudManager.withSlurmSshCredentials(pipeline, clusterName, cluster) { remote ->
+    CloudManager.withSlurmFrontendFailover(pipeline, clusterName, cluster) { remote ->
         def jobWorkspace = "/home/svc_tensorrt/bloom/scripts/${jobUID}"
 
         Utils.exec(pipeline, script: "echo Sleeping to allow Slurm job completion; sleep 30")
@@ -642,7 +647,7 @@ def cleanUpSlurmResources(def pipeline, SlurmCluster cluster, String clusterName
             pipeline,
             script: Utils.sshUserCmd(
                 remote,
-                "\"${cleanupCommands}\""
+                Utils.bashWrappedRemoteCmd(cleanupCommands)
             )
         )
 
@@ -658,7 +663,7 @@ def cleanUpNodeResources(def pipeline, SlurmCluster cluster, String clusterName,
 
     Utils.exec(pipeline, script: "echo Sleeping to allow node destruction; sleep 30")
 
-    CloudManager.withSlurmSshCredentials(pipeline, clusterName, cluster) { remote ->
+    CloudManager.withSlurmFrontendFailover(pipeline, clusterName, cluster) { remote ->
         Utils.exec(pipeline, script: "echo Slurm job ID: ${slurmJobID}")
 
         Utils.exec(
@@ -683,7 +688,7 @@ def cleanUpNodeResources(def pipeline, SlurmCluster cluster, String clusterName,
             pipeline,
             script: Utils.sshUserCmd(
                 remote,
-                "\"${cleanupCommands}\""
+                Utils.bashWrappedRemoteCmd(cleanupCommands)
             )
         )
 
@@ -704,7 +709,7 @@ def querySlurmJobState(def pipeline, SlurmCluster cluster, String clusterName, S
     }
     String state = null
     try {
-        CloudManager.withSlurmSshCredentials(pipeline, clusterName, cluster) { remote ->
+        CloudManager.withSlurmFrontendFailover(pipeline, clusterName, cluster) { remote ->
             // -X: allocation row only (skip .batch/.extern steps). -Pn:
             // parsable, no header. First line's first token is the job state;
             // SLURM renders cancellations as "CANCELLED by <uid>", so we keep
@@ -748,7 +753,7 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
 
     try {
         // Run ssh command to start node in desired cluster via SLURM
-        CloudManager.withSlurmSshCredentials(pipeline, partition.clusterName, cluster) { remote ->
+        CloudManager.withSlurmFrontendFailover(pipeline, partition.clusterName, cluster) { remote ->
             stage('Request Node Via Slurm') {
                 println("Selected Cluster: ${cluster.name}")
 
@@ -817,12 +822,14 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
         def jobRunningStartMs = null
 
         stage('Check If Node Is Online') {
-            CloudManager.withSlurmSshCredentials(pipeline, partition.clusterName, cluster) { remote ->
+            CloudManager.withSlurmSshCredentialRemotes(pipeline, partition.clusterName, cluster) { remotes ->
                 // Check the SLURM job once; if it is no longer active, raise a typed
                 // InfraFailure(SLURM) so the retry layer routes it via instanceof (scope=SLURM).
                 def checkSlurmJobActive = {
                     try {
-                        SlurmConfig.checkJobStatus(pipeline, cluster, slurmJobID, remote)
+                        CloudManager.withSlurmFrontendFailover(pipeline, remotes) { statusRemote ->
+                            SlurmConfig.checkJobStatus(pipeline, cluster, slurmJobID, statusRemote)
+                        }
                     } catch (InterruptedException e) {
                         throw e
                     } catch (Exception e) {
@@ -845,8 +852,8 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
                 // which overflowed the per-stage step cap). Release the held job every 10
                 // iterations (~30 min). 300 iterations * 3 min = 15h budget.
                 // Exit codes: 0 = job RUNNING, 3 = job no longer active, 4 = timed out.
-                def sacctStateCmd = Utils.sshUserCmd(remote, "\"sacct -j ${slurmJobID} --format=State -Pn --allocations\"")
-                def releaseCmd = Utils.sshUserCmd(remote, "\"scontrol release ${slurmJobID} || true\"")
+                def sacctStateCmd = CloudManager.sshUserCmdWithSlurmFrontendFailover(remotes, "\"sacct -j ${slurmJobID} --format=State -Pn --allocations\"")
+                def releaseCmd = CloudManager.sshUserCmdWithSlurmFrontendFailover(remotes, "\"scontrol release ${slurmJobID} || true\"")
                 def waitRc = pipeline.sh(returnStatus: true, script: """
                     set +e
                     counter=0
@@ -967,7 +974,7 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
                         def setupLogPath = "/home/svc_tensorrt/slurm-logs/slurm-${slurmJobID}-${nodeName}.out"
                         def enrootLog = Utils.exec(
                             pipeline,
-                            script: Utils.sshUserCmd(remote, "\"grep '\\[ENROOT\\]' ${setupLogPath} 2>/dev/null || true\""),
+                            script: CloudManager.sshUserCmdWithSlurmFrontendFailover(remotes, Utils.bashWrappedRemoteCmd("grep '\\[ENROOT\\]' ${setupLogPath} 2>/dev/null || true")),
                             returnStdout: true,
                             numRetries: 3
                         ).trim()
@@ -1252,7 +1259,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
             string(credentialsId: 'TRTLLM_HF_TOKEN', variable: 'HF_TOKEN'),
             string(credentialsId: 'svc_tensorrt-swift-stack-key', variable: 'S3_SECRET_KEY'),
         ]) {
-            CloudManager.withSlurmSshCredentials(pipeline, partition.clusterName, cluster) { remote ->
+            CloudManager.withSlurmFrontendFailover(pipeline, partition.clusterName, cluster) { remote ->
             def tarName = BUILD_CONFIGS[config][TARNAME]
             def llmTarfile = "https://urm.nvidia.com/artifactory/${ARTIFACT_PATH}/${tarName}"
             def llmPath = sh (script: "realpath .", returnStdout: true).trim()
@@ -1323,11 +1330,20 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 def makoOptsJson = transformMakoArgsToJson(["Mako options:"] + makoArgs)
                 String clusterNameForDurations = useClusterDurations ? partition.clusterName.replaceAll('[^a-zA-Z0-9]', '_') : null
                 def testListPathLocal = renderTestDB(pipeline, testList, llmSrcLocal, stageName, makoOptsJson, clusterNameForDurations)
+                // Copy the test list atomically. A retry that reuses a still-active job
+                // re-copies over ${testListPathNode} while that job may be reading it via
+                // --test-list; scp truncates-then-streams, so a concurrent read could see a
+                // partial list and silently run a subset. Stage to a temp path and mv into
+                // place (same-dir rename is atomic) so a reader sees the whole old or new file.
                 Utils.copyFileToRemoteHost(
                     pipeline,
                     remote,
                     testListPathLocal,
-                    testListPathNode
+                    "${testListPathNode}.tmp"
+                )
+                Utils.exec(
+                    pipeline,
+                    script: Utils.sshUserCmd(remote, "\"mv -f ${testListPathNode}.tmp ${testListPathNode}\"")
                 )
 
                 // Download and Merge waives.txt
@@ -1671,13 +1687,26 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     set -xEeuo pipefail
                     trap 'rc=\$?; echo "Error in file \${BASH_SOURCE[0]} on line \$LINENO: \$BASH_COMMAND (exit \$rc)"; exit \$rc' ERR
 
-                    # Clean up previous job intermediate files so that retry can work
+                    # Reuse an already-active job after an ambiguous frontend disconnect.
                     if [ -f "${jobWorkspace}/slurm_job_id.txt" ]; then
                         previous_job_id=\$(cat "${jobWorkspace}/slurm_job_id.txt")
                         echo "Found previous Slurm job ID: \${previous_job_id}"
-                        scancel "\${previous_job_id}" || true
-                        # Wait for 120 seconds to ensure the previous job is canceled
-                        sleep 120
+                        previous_state=\$(sacct -j "\${previous_job_id}" --format=State -Pn --allocations 2>/dev/null | head -1 | cut -d'|' -f1 | awk '{print \$1}' || true)
+                        if [ -z "\${previous_state}" ]; then
+                            previous_state=\$(scontrol show job "\${previous_job_id}" 2>/dev/null | tr ' ' '\\n' | sed -n 's/^JobState=//p' | head -1 || true)
+                        fi
+                        case "\${previous_state}" in
+                            RUNNING|PENDING|CONFIGURING|COMPLETING|REQUEUED|RESIZING|SUSPENDED|SIGNALING|STOPPED)
+                                echo "Reusing active Slurm job \${previous_job_id} in state \${previous_state}"
+                                exit 0
+                                ;;
+                            *)
+                                echo "Previous Slurm job \${previous_job_id} is not active (state='\${previous_state:-UNKNOWN}'). Cleaning it up before resubmission."
+                                scancel "\${previous_job_id}" || true
+                                # Wait for 120 seconds to ensure the previous job is canceled
+                                sleep 120
+                                ;;
+                        esac
                     fi
 
                     # Clean up workspace: remove all files/dirs not in the keep list
@@ -1706,14 +1735,15 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
             }
 
             stage("[${stageName}] Run Pytest") {
-                // Submit the Slurm job
+                // Submit the Slurm job. Submit/metadata/track all run on the one
+                // frontend the enclosing withSlurmFrontendFailover pinned, so they
+                // share the job workspace (slurm_job_id.txt, scripts) on that login
+                // node; a frontend disconnect fails the whole closure over to a fresh
+                // frontend as a unit (the submit script reuses an active job).
                 Utils.exec(
                     pipeline,
                     timeout: false,
-                    script: Utils.sshUserCmd(
-                        remote,
-                        scriptSubmitPathNode
-                    ),
+                    script: Utils.sshUserCmd(remote, scriptSubmitPathNode),
                     numRetries: 3
                 )
 
@@ -1722,10 +1752,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 if (!slurmJobId) {
                     slurmJobId = Utils.exec(
                         pipeline,
-                        script: Utils.sshUserCmd(
-                            remote,
-                            "\"cat ${jobWorkspace}/slurm_job_id.txt\""
-                        ),
+                        script: Utils.sshUserCmd(remote, "\"cat ${jobWorkspace}/slurm_job_id.txt\""),
                         returnStdout: true,
                         numRetries: 3
                     ).trim()
@@ -1816,15 +1843,12 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     true
                 )
 
-                // Track the Slurm job
+                // Track the Slurm job on the same pinned frontend.
                 try {
                     Utils.exec(
                         pipeline,
                         timeout: false,
-                        script: Utils.sshUserCmd(
-                            remote,
-                            scriptTrackPathNode
-                        ),
+                        script: Utils.sshUserCmd(remote, scriptTrackPathNode),
                         numRetries: 3
                     )
                 } catch (InterruptedException e) {
@@ -1853,7 +1877,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 }
             }
             echo "Finished test stage execution."
-            }  // end CloudManager.withSlurmSshCredentials
+            }  // end CloudManager.withSlurmFrontendFailover
         }  // end withCredentials
     } catch (InterruptedException e) {
         stageIsInterrupted = true
@@ -2245,7 +2269,7 @@ def readSlurmWorkspaceFile(def pipeline, Map remote, String path, String stageNa
             pipeline,
             script: Utils.sshUserCmd(
                 remote,
-                "\"cat ${path} 2>/dev/null || true\""
+                Utils.bashWrappedRemoteCmd("cat ${path} 2>/dev/null || true")
             ),
             returnStdout: true,
             numRetries: numRetries
@@ -2254,6 +2278,13 @@ def readSlurmWorkspaceFile(def pipeline, Map remote, String path, String stageNa
     } catch (InterruptedException e) {
         throw e
     } catch (Exception e) {
+        // A dead frontend must propagate so the enclosing withSlurmFrontendFailover
+        // fails over to another remote; swallowing it as "" would strand the stage on
+        // the unreachable frontend. Any other read failure (missing file, transient)
+        // is non-fatal -- the metadata is best-effort, so return "" and carry on.
+        if (CloudManager.isSlurmFrontendConnectionFailure(e)) {
+            throw e
+        }
         echo "[INFRA-RETRY] ${stageName}: unable to read SLURM metadata file ${path}: ${e.toString()}"
         return ""
     }
@@ -2308,7 +2339,7 @@ def captureSlurmJobNodeList(def pipeline, SlurmCluster cluster, String clusterNa
     def capturedJobID = slurmJobID
     def nodeList = null
     try {
-        CloudManager.withSlurmSshCredentials(pipeline, clusterName, cluster) { remote ->
+        CloudManager.withSlurmFrontendFailover(pipeline, clusterName, cluster) { remote ->
             def metadata = captureSlurmWorkspaceMetadata(pipeline, remote, jobWorkspace, placementContext, stageName)
             capturedJobID = capturedJobID ?: metadata.slurmJobId
             nodeList = metadata.nodeList
