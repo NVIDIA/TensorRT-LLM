@@ -22,26 +22,9 @@ def pil_to_rgb(value: Any) -> PIL.Image.Image:
 
 
 def decode_video_file(path: Path, max_frames: Optional[int] = None) -> List[PIL.Image.Image]:
-    # OpenCV is the shared multimodal video decoder; ``_get_cv2`` raises a clear
-    # ``pip install opencv-python-headless`` hint when it is not installed.
-    from tensorrt_llm.inputs.media_io import _get_cv2
+    from tensorrt_llm.inputs.media_io import decode_video_frames
 
-    cv2 = _get_cv2()
-    capture = cv2.VideoCapture(str(path))
-    try:
-        if not capture.isOpened():
-            raise ValueError(f"Cosmos3 could not open video file: {path}")
-        frames: List[PIL.Image.Image] = []
-        while max_frames is None or len(frames) < max_frames:
-            ok, frame = capture.read()
-            if not ok:
-                break
-            frames.append(PIL.Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)))
-    finally:
-        capture.release()
-    if not frames:
-        raise ValueError(f"Cosmos3 video file contains no frames: {path}")
-    return frames
+    return decode_video_frames(path, max_frames=max_frames)
 
 
 def normalize_video_input_path(path: Path, max_frames: Optional[int] = None) -> List[Any]:
@@ -89,3 +72,19 @@ def normalize_video_input(video: Any, max_frames: Optional[int] = None) -> List[
     if isinstance(video, (str, Path)):
         return normalize_video_input_path(Path(video), max_frames=max_frames)
     return [video]
+
+
+def load_reference_video(src: Any):
+    """Decode a reference into the framework's ``VideoData`` (all frames).
+
+    Offline entry point: decodes any supported reference into ``VideoData`` for
+    ``multi_modal_data["video"]``. It does **not** crop and carries no temporal
+    metadata — the Cosmos3 worker crops the first/last conditioning window, and
+    the temporal placement is set by ``condition_video_latent_indexes`` +
+    ``frame_rate`` (request params), not the reference. The worker reads
+    ``.frames`` and VAE-encodes them; it never decodes media itself.
+    """
+    from tensorrt_llm.inputs.multimodal_data import VideoData
+
+    frames = normalize_video_input(src, max_frames=None)
+    return VideoData(frames=[pil_to_rgb(frame) for frame in frames], metadata={})

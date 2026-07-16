@@ -313,24 +313,28 @@ class TestInputReferenceMaterialization:
         finally:
             os.remove(path)
 
-    def test_multipart_video_reference_routes_to_extra_params(self, tmp_path):
+    def test_multipart_video_reference_routes_to_multimodal(self, tmp_path):
+        from tensorrt_llm.inputs.multimodal_data import VideoData
+
         generator = _StubVisualGen()
         upload = UploadFile(file=BytesIO(self._mp4_bytes()), filename="clip.mp4")
         request = VideoGenerationRequest(prompt="x", input_reference=upload)
         params = parse_visual_gen_params(
             request, "vid-3", generator, media_storage_path=str(tmp_path)
         )
-        # Video content routes to extra_params["video"], not params.image.
-        # The stored file has no type-suffix — the worker classifies by
-        # content, so a fabricated extension would assert a type, not hint one.
+        # Video content is decoded into VideoData under multi_modal_data["video"]
+        # (framework convention), not params.image. The worker crops + VAE-encodes.
         assert params.image is None
-        assert params.extra_params is not None
-        assert str(params.extra_params["video"]).endswith("vid-3_reference")
-        assert (tmp_path / "vid-3_reference").exists()
+        assert params.multi_modal_data is not None
+        video_data = params.multi_modal_data["video"]
+        assert isinstance(video_data, VideoData)
+        assert len(video_data.frames) >= 1
 
-    def test_base64_video_reference_routes_to_extra_params(self, tmp_path):
+    def test_base64_video_reference_routes_to_multimodal(self, tmp_path):
         # Classification is content-based, so the JSON/base64 path can
         # carry video even though it has no content-type or filename.
+        from tensorrt_llm.inputs.multimodal_data import VideoData
+
         generator = _StubVisualGen()
         b64 = base64.b64encode(self._mp4_bytes()).decode()
         request = VideoGenerationRequest(prompt="x", input_reference=b64)
@@ -338,7 +342,7 @@ class TestInputReferenceMaterialization:
             request, "vid-4", generator, media_storage_path=str(tmp_path)
         )
         assert params.image is None
-        assert str(params.extra_params["video"]).endswith("vid-4_reference")
+        assert isinstance(params.multi_modal_data["video"], VideoData)
 
     def test_multipart_image_reference_routes_to_image(self, tmp_path):
         # JPEG upload: content sniffing classifies it as an image and routes

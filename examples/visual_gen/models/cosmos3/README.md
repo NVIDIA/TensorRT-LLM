@@ -5,7 +5,7 @@ Cosmos3 supports the following generation modes from a single checkpoint:
 - **T2V** — text-to-video (`prompts/t2v.json`).
 - **T2I** — text-to-image (`prompts/t2i.json`); emits a still frame (use `--output_type image` / a non-video `--output_path`).
 - **I2V / TI2V** — image-conditioned video (`prompts/i2v.json`). Condition on a reference frame via the prompt file's `vision_path` or `--image_path`. The image may be a local path, a `file://` / `http(s)://` URL, or a `data:` URI.
-- **V2V** — video-conditioned video (`prompts/v2v.json`). Condition on a reference video via `--video_path` (a local frame directory or `.mp4`/`.avi` file). Only the first (or last, per `condition_video_keep`) `max(condition_frame_indexes_vision) * 4 + 1` input frames condition the output (5 by default); `.mp4`/`.avi` decode uses OpenCV (see [Media I/O dependencies](#media-io-dependencies)).
+- **V2V** — video-conditioned video (`prompts/v2v.json`). Condition on a reference video via `--video_path` (a local frame directory or `.mp4`/`.avi` file). Only the first (or last, per `condition_video_keep`) `max(condition_video_latent_indexes) * 4 + 1` input frames condition the output (5 by default); `.mp4`/`.avi` decode uses OpenCV (see [Media I/O dependencies](#media-io-dependencies)).
 - **T2AV** — text-to-video with synchronized audio (`prompts/t2av.json` with `enable_audio: true`, or pass `--enable_audio`). Combine with a `vision_path` for image-conditioned audio-video (TI2AV).
 
 ## Checkpoints

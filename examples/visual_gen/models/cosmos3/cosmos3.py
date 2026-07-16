@@ -107,6 +107,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from tensorrt_llm import VisualGen, VisualGenArgs
+from tensorrt_llm._torch.visual_gen.models.cosmos3.utils import load_reference_video
 
 _SCRIPT_DIR = Path(__file__).resolve().parent
 
@@ -279,7 +280,7 @@ def main():
     params.extra_params["output_type"] = output_type
 
     if args.video_path is not None:
-        params.extra_params["video"] = args.video_path
+        params.multi_modal_data = {"video": load_reference_video(args.video_path)}
 
     if negative_prompt is None:
         params.negative_prompt = None

@@ -4,7 +4,8 @@ import os
 import shutil
 from typing import Any, Dict, List, Optional
 
-from tensorrt_llm.inputs.media_io import is_image_file, is_video_file
+from tensorrt_llm.inputs.media_io import decode_video_frames, is_image_file, is_video_file
+from tensorrt_llm.inputs.multimodal_data import VideoData
 from tensorrt_llm.logger import logger
 from tensorrt_llm.serve.openai_protocol import ImageGenerationRequest, VideoGenerationRequest
 from tensorrt_llm.visual_gen import VisualGen, VisualGenParams
@@ -188,9 +189,13 @@ def parse_visual_gen_params(
                     os.remove(tmp_path)
                 raise
             if is_video:
-                if params.extra_params is None:
-                    params.extra_params = {}
-                params.extra_params["video"] = ref_path
+                # V2V reference: decode into ``VideoData`` under
+                # ``multi_modal_data["video"]`` — the one intake video-capable
+                # pipelines read. The decode is model-agnostic (all frames, no
+                # crop); each pipeline picks its own conditioning window.
+                params.multi_modal_data = {
+                    "video": VideoData(frames=decode_video_frames(ref_path), metadata={})
+                }
             else:
                 params.image = ref_path
 

@@ -854,7 +854,8 @@ class TestVideoGenerationSync:
         assert os.path.exists(params.image)
 
     def test_sync_video_generation_multipart_with_video_reference(self, video_client, tmp_path):
-        """A video ``input_reference`` routes to ``extra_params["video"]`` (V2V).
+        """A video ``input_reference`` is decoded into ``VideoData`` under
+        ``multi_modal_data["video"]`` (V2V).
 
         The reference is classified by decoding its content, so the clip is
         synthesized in-test with OpenCV — no video asset ships with the repo.
@@ -885,15 +886,16 @@ class TestVideoGenerationSync:
         assert resp.status_code == 200
         assert len(resp.content) > 0
 
-        # Video content must NOT land on params.image; it rides
-        # extra_params["video"] (the same pipeline entry the offline
-        # example's --video_path uses), stored without a type-suffix.
+        # Video content must NOT land on params.image; it's decoded into
+        # VideoData under multi_modal_data["video"] (framework convention; the
+        # same pipeline entry the offline example's --video_path uses).
+        from tensorrt_llm.inputs.multimodal_data import VideoData
+
         params = video_client.mock_gen.last_params
         assert params.image is None
-        assert isinstance(params.extra_params, dict)
-        video_ref = params.extra_params["video"]
-        assert video_ref.endswith("_reference")
-        assert os.path.exists(video_ref)
+        video_data = params.multi_modal_data["video"]
+        assert isinstance(video_data, VideoData)
+        assert len(video_data.frames) >= 1
 
     def test_sync_video_generation_undecodable_reference_400(self, video_client):
         """Content neither PIL nor OpenCV can decode is rejected at the boundary."""

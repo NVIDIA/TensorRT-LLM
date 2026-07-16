@@ -35,7 +35,7 @@ COSMOS3_720P_PARAMS = {
     "frame_rate": 24.0,
 }
 
-COSMOS3_DEFAULT_CONDITION_FRAME_INDEXES_VISION = (0, 1)
+COSMOS3_DEFAULT_CONDITION_VIDEO_LATENT_INDEXES = (0, 1)
 COSMOS3_DEFAULT_CONDITION_VIDEO_KEEP = "first"
 
 # Fields merged by the executor for every request. Modality-specific values
@@ -95,10 +95,15 @@ COSMOS3_EXTRA_SPECS: Dict[str, ExtraParamSchema] = {
         default="video",
         description="Output modality: 'video' (T2V/I2V) or 'image' (text-to-image).",
     ),
-    "condition_frame_indexes_vision": ExtraParamSchema(
+    "condition_video_latent_indexes": ExtraParamSchema(
         type="list",
-        default=list(COSMOS3_DEFAULT_CONDITION_FRAME_INDEXES_VISION),
-        description="Latent frame indexes to keep fixed for video conditioning.",
+        default=list(COSMOS3_DEFAULT_CONDITION_VIDEO_LATENT_INDEXES),
+        description=(
+            "Latent frame indexes OF THE OUTPUT video to pin to the encoded "
+            "reference (not source-frame selection). Each latent frame spans 4 "
+            "pixel frames, so the worker consumes the first (or last, per "
+            "condition_video_keep) max(indexes)*4+1 reference frames."
+        ),
     ),
     "condition_video_keep": ExtraParamSchema(
         type="str",
@@ -109,14 +114,5 @@ COSMOS3_EXTRA_SPECS: Dict[str, ExtraParamSchema] = {
         type="float",
         default=None,
         description="Optional scheduler flow shift override. Uses the Cosmos3 mode default when omitted.",
-    ),
-    "video": ExtraParamSchema(
-        type="path_or_list",
-        default=None,
-        description=(
-            "Video input for video-to-video generation: "
-            ".mp4/.avi file, frame directory, image path, or list of PIL "
-            "images / frame paths."
-        ),
     ),
 }

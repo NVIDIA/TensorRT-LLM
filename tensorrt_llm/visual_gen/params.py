@@ -12,7 +12,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import os
 from typing import Any, Dict, List, Optional, Union
 
 from pydantic import Field
@@ -73,6 +72,14 @@ class VisualGenParams(StrictBaseModel):
     image: Optional[Union[str, bytes, List[Union[str, bytes]]]] = Field(
         default=None, description="Reference image(s) for I2V/I2I."
     )
+    # Framework multimodal convention: modality -> data. Cosmos3 V2V carries its
+    # reference here as ``{"video": VideoData(frames, metadata)}``; the worker
+    # reads the frames and VAE-encodes them (see ``inputs.multimodal_data``).
+    multi_modal_data: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Multimodal conditioning inputs keyed by modality "
+        "(e.g. {'video': VideoData}; see inputs.multimodal_data).",
+    )
 
     # Per-prompt multiplier
     num_images_per_prompt: int = Field(default=1, description="Number of images per prompt.")
@@ -94,8 +101,6 @@ _TYPE_MAP = {
     "bool": (bool,),
     "str": (str,),
     "list": (list,),
-    # Cosmos3 V2V `video` reference: a media path or an in-memory frame list.
-    "path_or_list": (str, os.PathLike, list),
 }
 
 # Generation config fields that pipelines declare defaults for. If a user
