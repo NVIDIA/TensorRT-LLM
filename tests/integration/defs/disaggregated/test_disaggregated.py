@@ -762,14 +762,9 @@ def setup_disagg_cluster(
             start = time.monotonic()
             last_tick = start
 
-            # How long to wait after the disagg server is reachable with no
-            # new workers registering before declaring a worker hung.
-            _NO_PROGRESS_TIMEOUT = 600
-
             async def _tick():
                 nonlocal last_tick
                 last_worker_count = 0
-                last_progress_time = start
                 last_status_log = start
 
                 while True:
@@ -792,7 +787,7 @@ def setup_disagg_cluster(
                         )
                         last_status_log = now
 
-                    # Fast path: detect workers that have exited (crash/OOM).
+                    # Detect workers that have exited (crash/OOM).
                     dead = [
                         w for w in all_workers if w.process.poll() is not None
                     ]
@@ -804,11 +799,7 @@ def setup_disagg_cluster(
                             f"{len(dead)} worker(s) exited during startup: "
                             f"{details}")
 
-                    # Slow path: detect workers that are alive but hung (e.g.
-                    # stuck in MPI cleanup after OOM, so process.poll() never
-                    # fires). Poll cluster_info; if the worker count hasn't
-                    # increased for _NO_PROGRESS_TIMEOUT seconds after the
-                    # server first becomes reachable, declare the cluster stuck.
+                    # Track worker registration count for the status log.
                     try:
                         info_resp = _requests.get(
                             f"http://localhost:{server_port}/cluster_info",
@@ -820,22 +811,9 @@ def setup_disagg_cluster(
                                      len(workers.get("generation_servers", [])))
                             if count > last_worker_count:
                                 last_worker_count = count
-                                last_progress_time = now
-                            elif (count < num_ctx_instances + num_gen_instances
-                                  and now - last_progress_time
-                                  > _NO_PROGRESS_TIMEOUT):
-                                raise RuntimeError(
-                                    f"No new workers registered for "
-                                    f"{_NO_PROGRESS_TIMEOUT}s "
-                                    f"({last_worker_count} registered so far); "
-                                    f"a worker may be hung during startup. "
-                                    f"Check worker logs under {work_dir}")
-                    except _requests.exceptions.ConnectionError:
-                        # Disagg server not up yet; reset the progress clock so
-                        # _NO_PROGRESS_TIMEOUT only counts from first contact.
-                        last_progress_time = now
-                    except _requests.exceptions.Timeout:
-                        last_progress_time = now
+                    except (_requests.exceptions.ConnectionError,
+                            _requests.exceptions.Timeout):
+                        pass
 
             # Run the readiness poller and the watchdog concurrently.
             # asyncio.wait(FIRST_COMPLETED) means whichever finishes first
