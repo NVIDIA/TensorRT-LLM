@@ -438,12 +438,6 @@ def test_mx_post_transform_receiver_falls_back_for_unqualified_model(monkeypatch
     assert load_fn == model.load_weights
     assert weights == {"disk.weight": checkpoint_loader._disk_weight}
     assert mapper is loader.weight_mapper
-    checkpoint_loader.post_load_publish.assert_called_once_with(
-        model,
-        checkpoint_dir="/ckpt",
-        weights_preloaded=False,
-        source_identity=loader._source_identity,
-    )
     assert events == ["load_weights", "post_load_weights"]
     checkpoint_loader.post_load_publish.assert_not_called()
 

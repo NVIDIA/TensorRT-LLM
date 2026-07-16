@@ -890,7 +890,10 @@ class TestMxSourceQueryTimeoutDefault:
                 model=MagicMock(),
                 source_identity=identity,
                 allow_post_transform_weights=True,
+                prepare_post_transform_receiver=lambda _model: None,
             )
+        mx_loader = fake_mx.trtllm_live_transfer.MxLiveWeightLoader.return_value
+        mx_loader.load_weights.assert_called_once()
         assert "MX_SOURCE_QUERY_TIMEOUT" not in os.environ
 
     def test_no_registered_source_honors_configured_timeout(self):
@@ -909,7 +912,10 @@ class TestMxSourceQueryTimeoutDefault:
                 model=MagicMock(),
                 source_identity=identity,
                 allow_post_transform_weights=True,
+                prepare_post_transform_receiver=lambda _model: None,
             )
+        mx_loader = fake_mx.trtllm_live_transfer.MxLiveWeightLoader.return_value
+        mx_loader.load_weights.assert_called_once()
         assert "MX_SOURCE_QUERY_TIMEOUT" not in os.environ
 
     def test_existing_source_keeps_upstream_default_when_unset(self):
