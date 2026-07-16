@@ -1390,11 +1390,18 @@ class FilteredTopKKernelVarlen:
 
         The caller owns the surrounding barriers::
 
-            cluster_arrive_relaxed(); cluster_wait()   # publish local histograms
+            cluster_arrive(); cluster_wait()           # publish local histograms
             _cluster_reduce_histogram(...)
             cute.arch.barrier()                        # s_hist_merged ready (intra-CTA)
             <prefix sum on s_hist_merged>
             cluster_arrive_relaxed(); cluster_wait()   # peers done reading before rebuild
+
+        The two arrives differ on purpose: the publish one is non-relaxed
+        ``cluster_arrive`` (release fence, so the s_histogram stores are visible
+        to a peer's ld.shared::cluster; relaxed would risk stale reads — cf. GVR
+        fix bc6d0e83a3), while the post-read one is relaxed (the peer reads
+        drained into s_hist_merged before the intra-CTA barrier, so it is a
+        liveness-only WAR barrier).
 
         Only bins ``0 .. radix-1`` are merged; the ``radix`` guard slot is not
         read by the prefix-sum helpers.
@@ -1441,7 +1448,7 @@ class FilteredTopKKernelVarlen:
             if slr < cutlass.Int32(0):
                 slr = cutlass.Int32(0)
             s_prefix[1] = topk_remaining - slr
-        cute.arch.cluster_arrive_relaxed()
+        cute.arch.cluster_arrive()
         cute.arch.cluster_wait()
 
         # 2. Exclusive prefix over peers p < cta_in_group (thread 0 computes).
@@ -1457,7 +1464,7 @@ class FilteredTopKKernelVarlen:
             s_prefix[2] = eo1
             s_prefix[3] = eo2
         cute.arch.barrier()
-        # All CTAs finished reading peer s_prefix before anyone exits (SMEM lifetime).
+        # Liveness barrier before exit: relaxed (peer s_prefix reads already drained).
         cute.arch.cluster_arrive_relaxed()
         cute.arch.cluster_wait()
 
@@ -1761,7 +1768,7 @@ class FilteredTopKKernelVarlen:
             # is read straight-line; only the buffer read in the -= differs.
             if cutlass.const_expr(self.single_pass_multi_cta):
                 if need_cluster_sync:
-                    cute.arch.cluster_arrive_relaxed()
+                    cute.arch.cluster_arrive()
                     cute.arch.cluster_wait()
                     self._cluster_reduce_histogram(tidx, s_histogram, s_hist_merged)
                     cute.arch.barrier()
@@ -1778,6 +1785,7 @@ class FilteredTopKKernelVarlen:
                         g_num_input,
                         s_num_input_idx=0,
                     )
+                    # WAR barrier: relaxed (peer reads already drained, see docstring).
                     cute.arch.cluster_arrive_relaxed()
                     cute.arch.cluster_wait()
                 else:
@@ -1887,7 +1895,7 @@ class FilteredTopKKernelVarlen:
                         # duplicated per branch to avoid a tensor phi-merge).
                         if cutlass.const_expr(self.single_pass_multi_cta):
                             if need_cluster_sync:
-                                cute.arch.cluster_arrive_relaxed()
+                                cute.arch.cluster_arrive()
                                 cute.arch.cluster_wait()
                                 self._cluster_reduce_histogram(tidx, s_histogram, s_hist_merged)
                                 cute.arch.barrier()
@@ -1904,6 +1912,7 @@ class FilteredTopKKernelVarlen:
                                     g_num_input,
                                     s_num_input_idx=r_idx ^ 1,
                                 )
+                                # WAR barrier: relaxed (peer reads already drained).
                                 cute.arch.cluster_arrive_relaxed()
                                 cute.arch.cluster_wait()
                             else:
