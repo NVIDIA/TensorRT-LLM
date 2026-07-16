@@ -17,8 +17,10 @@
 
 #include "tensorrt_llm/batch_manager/baseTransBuffer.h"
 #include "tensorrt_llm/batch_manager/cacheTransBuffer.h"
+#include "tensorrt_llm/batch_manager/dataTransceiver.h"
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
 #include <NvInferRuntime.h>
+#include <atomic>
 #include <gtest/gtest.h>
 #include <memory>
 #include <optional>
@@ -334,6 +336,56 @@ TEST_P(BufferIndexHolderLifecycleTest, ExceptionUnwindStillReleases)
         // Holder destructor ran during unwind.
     }
     EXPECT_EQ(inUse(), before);
+}
+
+TEST_P(BufferIndexHolderLifecycleTest, InactiveTransferSessionReleasesReservedReceiveSlot)
+{
+    if (!isRecv())
+    {
+        GTEST_SKIP() << "TransferSession reserves receive slots only";
+    }
+    int const before = inUse();
+    auto idx = acquire();
+    ASSERT_TRUE(idx.has_value());
+    {
+        tensorrt_llm::executor::DataTransceiverState selfState;
+        tensorrt_llm::executor::DataTransceiverState otherState;
+        tensorrt_llm::runtime::BufferManager bufferManager{std::make_shared<tensorrt_llm::runtime::CudaStream>()};
+        std::vector<Connection const*> connections{nullptr};
+        TransferSession session(std::move(connections), DataContext{0}, std::vector<SizeType32>{0}, selfState,
+            std::move(otherState), bufferManager, 0, BlockKey{}, nullptr, false);
+        std::vector<BufferIndexHolder> holders;
+        holders.emplace_back(mgr(), idx, /*isRecv=*/true);
+        session.setReservedRecvBuffers(std::move(holders));
+        EXPECT_EQ(inUse(), before + 1);
+    }
+    EXPECT_EQ(inUse(), before);
+    EXPECT_FALSE(mgr().hasPoisonedBuffer());
+}
+
+TEST_P(BufferIndexHolderLifecycleTest, ActiveTransferSessionPoisonsReservedReceiveSlot)
+{
+    if (!isRecv())
+    {
+        GTEST_SKIP() << "TransferSession reserves receive slots only";
+    }
+    int const before = inUse();
+    auto idx = acquire();
+    ASSERT_TRUE(idx.has_value());
+    {
+        tensorrt_llm::executor::DataTransceiverState selfState;
+        tensorrt_llm::executor::DataTransceiverState otherState;
+        tensorrt_llm::runtime::BufferManager bufferManager{std::make_shared<tensorrt_llm::runtime::CudaStream>()};
+        std::vector<Connection const*> connections{nullptr};
+        std::atomic<bool> terminate{false};
+        TransferSession session(std::move(connections), DataContext{0, terminate, true}, std::vector<SizeType32>{0},
+            selfState, std::move(otherState), bufferManager, 0, BlockKey{}, nullptr, false);
+        std::vector<BufferIndexHolder> holders;
+        holders.emplace_back(mgr(), idx, /*isRecv=*/true);
+        session.setReservedRecvBuffers(std::move(holders));
+    }
+    EXPECT_TRUE(mgr().hasPoisonedBuffer());
+    EXPECT_EQ(inUse(), before + 1);
 }
 
 INSTANTIATE_TEST_SUITE_P(SideVariants, BufferIndexHolderLifecycleTest,

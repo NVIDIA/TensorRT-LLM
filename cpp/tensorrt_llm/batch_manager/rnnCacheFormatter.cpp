@@ -170,9 +170,8 @@ void RnnCacheFormatter::format(TransferSession& session)
                 bufferSizesPerTarget[t] = ssmBufBytes + convBufBytes;
             }
 
-            auto const* sendCancelFlag = common::getEnvDisaggEnableInflightCancel()
-                ? &session.getDataContext().getTransferTerminate()
-                : nullptr;
+            auto const* sendCancelFlag
+                = session.isInflightCancelEnabled() ? &session.getDataContext().getTransferTerminate() : nullptr;
             auto cacheBufferId = mRnnCacheTransBufferManager->assignBufferIndexForSend(sendCancelFlag);
             BufferIndexHolder sendHolder(*mRnnCacheTransBufferManager, cacheBufferId, /*isRecv=*/false);
             auto allocationResult = mRnnCacheTransBufferManager->getOrAllocateSendBuffers(
@@ -230,7 +229,7 @@ void RnnCacheFormatter::format(TransferSession& session)
             }
             catch (...)
             {
-                if (agentConnection != nullptr && common::getEnvDisaggEnableInflightCancel())
+                if (agentConnection != nullptr && session.isInflightCancelEnabled())
                 {
                     sendHolder.poison();
                 }

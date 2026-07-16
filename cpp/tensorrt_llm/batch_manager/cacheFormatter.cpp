@@ -530,7 +530,7 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
         // 5. send the buffer to the corresponding target. Ideally, we send only once (one buffer) for each target.
 
         auto const* sendCancelFlag
-            = common::getEnvDisaggEnableInflightCancel() ? &session.getDataContext().getTransferTerminate() : nullptr;
+            = session.isInflightCancelEnabled() ? &session.getDataContext().getTransferTerminate() : nullptr;
         auto cacheBufferId = mCacheTransBufferManager->assignBufferIndexForSend(sendCancelFlag);
         BufferIndexHolder sendHolder(*mCacheTransBufferManager, cacheBufferId, /*isRecv=*/false);
         int peerDuplicateHeadFactor = targetInfo.mPeerDupHeadFactor;
@@ -623,7 +623,7 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
         }
         catch (...)
         {
-            if (agentConnection != nullptr && common::getEnvDisaggEnableInflightCancel())
+            if (agentConnection != nullptr && session.isInflightCancelEnabled())
             {
                 sendHolder.poison();
             }

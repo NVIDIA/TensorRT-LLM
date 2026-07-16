@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -17,6 +17,8 @@
 
 #include "tensorrt_llm/executor/cache_transmission/agent_utils/connection.h"
 #include <gtest/gtest.h>
+
+#include <atomic>
 
 using namespace tensorrt_llm::batch_manager::kv_cache_manager;
 using namespace tensorrt_llm::runtime;
@@ -229,6 +231,38 @@ TEST_P(AgentCommTest, AgentConnectionManagerConnect)
         ASSERT_EQ(recvData[i], 'a');
     }
     TLLM_LOG_INFO("after finish");
+}
+
+TEST_P(AgentCommTest, CancelledFirstNotificationRetriesAgentMetadata)
+{
+    std::vector<tensorrt_llm::batch_manager::BaseTransBufferManager*> bufferManagers{mTransBufferManager.get()};
+    auto connectionManager0 = std::make_unique<AgentConnectionManager>(bufferManagers, *mCacheState, backend);
+    auto connectionManager1 = std::make_unique<AgentConnectionManager>(bufferManagers, *mCacheState, backend);
+    auto const commState0 = connectionManager0->getCommState();
+    auto const commState1 = connectionManager1->getCommState();
+    auto const* connection0 = connectionManager0->getConnections(commState1).at(0);
+    auto* agentConnection0 = const_cast<AgentConnection*>(dynamic_cast<AgentConnection const*>(connection0));
+    ASSERT_NE(agentConnection0, nullptr);
+
+    std::vector<std::optional<size_t>> cacheBufferIds{std::optional<size_t>{0}};
+    int constexpr validConnectionIdx = 0;
+    std::atomic<bool> cancelled{true};
+    tensorrt_llm::executor::DataTransceiverState dataTransceiverState0{*mCacheState, commState0};
+    tensorrt_llm::batch_manager::RequestInfo cancelledRequestInfo{2, dataTransceiverState0};
+    EXPECT_THROW(agentConnection0->sendRequestAndBufferInfo(
+                     cancelledRequestInfo, cacheBufferIds, validConnectionIdx, &cancelled),
+        std::exception);
+
+    cancelled.store(false, std::memory_order_relaxed);
+    uint64_t constexpr retryRequestId = 3;
+    tensorrt_llm::batch_manager::RequestInfo retryRequestInfo{retryRequestId, dataTransceiverState0};
+    ASSERT_NO_THROW(
+        agentConnection0->sendRequestAndBufferInfo(retryRequestInfo, cacheBufferIds, validConnectionIdx, &cancelled));
+
+    tensorrt_llm::batch_manager::RequestInfo receivedRequestInfo;
+    std::atomic<bool> terminate{false};
+    ASSERT_NE(connectionManager1->recvConnectionAndRequestInfo(receivedRequestInfo, terminate), nullptr);
+    EXPECT_EQ(receivedRequestInfo.getRequestId(), retryRequestId);
 }
 
 INSTANTIATE_TEST_SUITE_P(AvailableBackends, AgentCommTest, ::testing::ValuesIn(getAvailableBackends()),

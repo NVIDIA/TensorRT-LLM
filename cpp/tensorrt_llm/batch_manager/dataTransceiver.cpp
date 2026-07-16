@@ -326,6 +326,7 @@ public:
     Impl(executor::kv_cache::ConnectionManager* manager, SizeType32 selfIndex, CacheTransferLayer cacheLayer)
         : mManager{manager}
         , mSelfState{cacheLayer.getCacheState(), executor::kv_cache::CommState{manager->getCommState()}}
+        , mInflightCancelEnabled{cacheLayer.isInflightCancelEnabled()}
         , mCacheTransferLayer{std::move(cacheLayer)}
         , mBufferManager{std::make_shared<runtime::CudaStream>()}
     {
@@ -347,7 +348,7 @@ public:
         std::promise<void> promise;
         auto future = promise.get_future();
         llmRequest->setKvCacheTransferStart(LlmRequest::getSteadyClockNow());
-        if (common::getEnvDisaggEnableInflightCancel())
+        if (mInflightCancelEnabled)
         {
             (void) getOrCreateInFlightCancelFlag(llmRequest->mRequestId);
         }
@@ -414,7 +415,7 @@ public:
             }
             mRequestToSession.erase(it);
         }
-        if (common::getEnvDisaggEnableInflightCancel())
+        if (mInflightCancelEnabled)
         {
             std::lock_guard<std::mutex> lg(mInFlightCancelMutex);
             mInFlightCancelFlags.erase(requestId);
@@ -436,7 +437,7 @@ public:
         {
             TLLM_LOG_WARNING("Failed to discard sender session for request %ld: unknown exception", requestId);
         }
-        if (!common::getEnvDisaggEnableInflightCancel())
+        if (!mInflightCancelEnabled)
         {
             return;
         }
@@ -496,7 +497,7 @@ public:
         TLLM_CHECK_WITH_INFO(peerIdx < static_cast<int>(allCounterparts.size()),
             "Peer rank %d not found in expected counterparts", peerSelfIdx);
         std::shared_ptr<std::atomic<bool>> cancelFlag;
-        if (common::getEnvDisaggEnableInflightCancel())
+        if (mInflightCancelEnabled)
         {
             cancelFlag = getOrCreateInFlightCancelFlag(requestId);
         }
@@ -507,13 +508,13 @@ public:
             {
                 auto session = cancelFlag != nullptr
                     ? TransferSession(std::vector<Connection const*>(allCounterparts.size(), nullptr),
-                        DataContext{tagFromRequestId(requestId), *cancelFlag}, allCounterparts, mSelfState,
-                        info.getTransState(), mBufferManager, info.getIndexFromEnd(), info.getLastBlockKey(), nullptr,
-                        !common::getEnvKVCacheTimeOutputPath().empty())
+                        DataContext{tagFromRequestId(requestId), *cancelFlag, mInflightCancelEnabled}, allCounterparts,
+                        mSelfState, info.getTransState(), mBufferManager, info.getIndexFromEnd(),
+                        info.getLastBlockKey(), nullptr, !common::getEnvKVCacheTimeOutputPath().empty())
                     : TransferSession(std::vector<Connection const*>(allCounterparts.size(), nullptr),
-                        DataContext{tagFromRequestId(requestId), mTerminate}, allCounterparts, mSelfState,
-                        info.getTransState(), mBufferManager, info.getIndexFromEnd(), info.getLastBlockKey(), nullptr,
-                        !common::getEnvKVCacheTimeOutputPath().empty());
+                        DataContext{tagFromRequestId(requestId), mTerminate, mInflightCancelEnabled}, allCounterparts,
+                        mSelfState, info.getTransState(), mBufferManager, info.getIndexFromEnd(),
+                        info.getLastBlockKey(), nullptr, !common::getEnvKVCacheTimeOutputPath().empty());
                 session.setTime(TransferSession::kTimeRequestInfo);
                 it = mRequestToSession.emplace(requestId, std::move(session)).first;
             }
@@ -540,7 +541,6 @@ public:
 
     bool cancelRequest(LlmRequest const& llmRequest)
     {
-        bool const inflightCancelEnabled = common::getEnvDisaggEnableInflightCancel();
         bool isCancelled = false;
         bool isCurrentRequest = false;
         {
@@ -551,11 +551,11 @@ public:
                 isCurrentRequest = mCurrentRequest.has_value() && mCurrentRequest.value() == llmRequest.mRequestId;
                 // The legacy path cannot interrupt a ready/active transfer, so
                 // preserve its false return until the opt-in is enabled.
-                if (!isCurrentRequest || inflightCancelEnabled)
+                if (!isCurrentRequest || mInflightCancelEnabled)
                 {
                     mCancelledRequests.insert(llmRequest.mRequestId);
                     isCancelled = true;
-                    if (inflightCancelEnabled && !isCurrentRequest)
+                    if (mInflightCancelEnabled && !isCurrentRequest)
                     {
                         // Keep only the request ID as a tombstone so a late peer
                         // receives ready=false without retaining the request.
@@ -569,7 +569,7 @@ public:
                 }
             }
         }
-        if (inflightCancelEnabled && (!isCancelled || isCurrentRequest))
+        if (mInflightCancelEnabled && (!isCancelled || isCurrentRequest))
         {
             std::lock_guard<std::mutex> lg(mInFlightCancelMutex);
             auto flagIt = mInFlightCancelFlags.find(llmRequest.mRequestId);
@@ -885,7 +885,7 @@ private:
             std::scoped_lock lock(mSenderMutex);
             mTerminate = true;
         }
-        if (common::getEnvDisaggEnableInflightCancel())
+        if (mInflightCancelEnabled)
         {
             std::lock_guard<std::mutex> lg(mInFlightCancelMutex);
             for (auto& [id, flag] : mInFlightCancelFlags)
@@ -973,6 +973,7 @@ private:
     executor::kv_cache::ConnectionManager* mManager;
     std::map<LlmRequest::RequestIdType, TransferSession> mRequestToSession;
     executor::DataTransceiverState mSelfState;
+    bool mInflightCancelEnabled{false};
     CacheTransferLayer mCacheTransferLayer;
     std::mutex mMtxForMap;
     runtime::BufferManager mBufferManager;
@@ -987,6 +988,7 @@ public:
     Impl(executor::kv_cache::ConnectionManager* manager, SizeType32 selfIndex, CacheTransferLayer cacheLayer)
         : mManager{manager}
         , mSelfState{cacheLayer.getCacheState(), executor::kv_cache::CommState{manager->getCommState()}}
+        , mInflightCancelEnabled{cacheLayer.isInflightCancelEnabled()}
         , mCacheTransferLayer{std::move(cacheLayer)}
         , mBufferManager{std::make_shared<runtime::CudaStream>()}
     {
@@ -1027,7 +1029,7 @@ public:
             }
             auto& asyncResource = mInstanceToAsyncResource.at(processInfo);
             std::shared_ptr<std::atomic<bool>> cancelFlag;
-            if (common::getEnvDisaggEnableInflightCancel())
+            if (mInflightCancelEnabled)
             {
                 cancelFlag = std::make_shared<std::atomic<bool>>(false);
                 std::lock_guard<std::mutex> lg(mInFlightCancelMutex);
@@ -1067,7 +1069,7 @@ public:
         }
         catch (...)
         {
-            if (common::getEnvDisaggEnableInflightCancel())
+            if (mInflightCancelEnabled)
             {
                 session.poisonReservedRecvBuffers();
             }
@@ -1121,7 +1123,7 @@ public:
         std::vector<std::optional<size_t>> cacheBufferIds;
         if (agentConnectionManager)
         {
-            auto const* bufferCancel = common::getEnvDisaggEnableInflightCancel() ? perRequestCancel : nullptr;
+            auto const* bufferCancel = mInflightCancelEnabled ? perRequestCancel : nullptr;
             auto const& managers = agentConnectionManager->getCacheTransBufferManagers();
             recvHolders.reserve(managers.size());
             cacheBufferIds.reserve(managers.size());
@@ -1165,8 +1167,7 @@ public:
             allConnections.emplace_back(connection);
         }
 
-        if (common::getEnvDisaggEnableInflightCancel() && perRequestCancel != nullptr
-            && perRequestCancel->load(std::memory_order_relaxed))
+        if (mInflightCancelEnabled && perRequestCancel != nullptr && perRequestCancel->load(std::memory_order_relaxed))
         {
             TLLM_THROW("KV cache receive request cancelled before publishing receive buffers");
         }
@@ -1237,10 +1238,12 @@ public:
             auto const& resource = getReceiveCacheResource(llmRequest);
             TransferSession session = perRequestCancel != nullptr
                 ? TransferSession(std::move(allConnections),
-                    DataContext{tagFromRequestId(requestId), *perRequestCancel}, std::move(allCounterparts), mSelfState,
-                    contextState, resource->mBufferManager, requestInfo.getIndexFromEnd(),
-                    requestInfo.getLastBlockKey(), &llmRequest, !common::getEnvKVCacheTimeOutputPath().empty())
-                : TransferSession(std::move(allConnections), DataContext{tagFromRequestId(requestId), mTerminate},
+                    DataContext{tagFromRequestId(requestId), *perRequestCancel, mInflightCancelEnabled},
+                    std::move(allCounterparts), mSelfState, contextState, resource->mBufferManager,
+                    requestInfo.getIndexFromEnd(), requestInfo.getLastBlockKey(), &llmRequest,
+                    !common::getEnvKVCacheTimeOutputPath().empty())
+                : TransferSession(std::move(allConnections),
+                    DataContext{tagFromRequestId(requestId), mTerminate, mInflightCancelEnabled},
                     std::move(allCounterparts), mSelfState, contextState, resource->mBufferManager,
                     requestInfo.getIndexFromEnd(), requestInfo.getLastBlockKey(), &llmRequest,
                     !common::getEnvKVCacheTimeOutputPath().empty());
@@ -1252,7 +1255,7 @@ public:
         }
         catch (...)
         {
-            if (common::getEnvDisaggEnableInflightCancel())
+            if (mInflightCancelEnabled)
             {
                 for (auto& holder : recvHolders)
                 {
@@ -1349,12 +1352,12 @@ public:
                 queuedCancelledReqId = llmRequest.mRequestId;
             }
         }
-        if (common::getEnvDisaggEnableInflightCancel() && queuedCancelledReqId.has_value())
+        if (mInflightCancelEnabled && queuedCancelledReqId.has_value())
         {
             std::lock_guard<std::mutex> lg(mInFlightCancelMutex);
             mInFlightCancelFlags.erase(*queuedCancelledReqId);
         }
-        if (!isCancelled && common::getEnvDisaggEnableInflightCancel())
+        if (!isCancelled && mInflightCancelEnabled)
         {
             std::lock_guard<std::mutex> lg(mInFlightCancelMutex);
             auto flagIt = mInFlightCancelFlags.find(llmRequest.mRequestId);
@@ -1396,8 +1399,8 @@ public:
             {
                 auto* agentConnection = dynamic_cast<executor::kv_cache::AgentConnection const*>(connections.at(i));
                 TLLM_CHECK(agentConnection);
-                auto ready = agentConnection->recvReadySignalWithStatus(
-                    executor::kv_cache::DataContext{session.getDataContext().getTag(), perRequestCancel});
+                auto ready = agentConnection->recvReadySignalWithStatus(executor::kv_cache::DataContext{
+                    session.getDataContext().getTag(), perRequestCancel, session.isInflightCancelEnabled()});
                 if (!ready.has_value())
                 {
                     return ReadySignalResult::kCancelled;
@@ -1433,7 +1436,7 @@ public:
         }
         else if (result == ReadySignalResult::kMixed)
         {
-            if (common::getEnvDisaggEnableInflightCancel())
+            if (mInflightCancelEnabled)
             {
                 session.poisonReservedRecvBuffers();
             }
@@ -1448,7 +1451,7 @@ public:
     ~Impl()
     {
         mTerminate.store(true);
-        if (common::getEnvDisaggEnableInflightCancel())
+        if (mInflightCancelEnabled)
         {
             std::lock_guard<std::mutex> lg(mInFlightCancelMutex);
             for (auto& [id, flag] : mInFlightCancelFlags)
@@ -1489,7 +1492,7 @@ private:
             TLLM_CUDA_CHECK(cudaSetDevice(mDeviceId));
             TLLM_LOG_DEBUG("KV cache receive request %zu, context request %zu phase=%s begin.", requestId,
                 contextRequestId, phase);
-            auto const* cancelFlag = common::getEnvDisaggEnableInflightCancel() ? &perRequestCancel : nullptr;
+            auto const* cancelFlag = mInflightCancelEnabled ? &perRequestCancel : nullptr;
             session.emplace(sendRequestInfo(llmRequest, cancelFlag));
             session->setTime(TransferSession::kTimeRequestInfo);
             TLLM_LOG_DEBUG(
@@ -1503,7 +1506,7 @@ private:
                 contextRequestId, phase, static_cast<int>(readyResult));
             if (readyResult == ReadySignalResult::kCancelled)
             {
-                if (common::getEnvDisaggEnableInflightCancel())
+                if (mInflightCancelEnabled)
                 {
                     session->poisonReservedRecvBuffers();
                 }
@@ -1516,7 +1519,7 @@ private:
             }
             if (readyResult == ReadySignalResult::kMixed)
             {
-                if (common::getEnvDisaggEnableInflightCancel())
+                if (mInflightCancelEnabled)
                 {
                     session->poisonReservedRecvBuffers();
                 }
@@ -1538,7 +1541,7 @@ private:
         }
         catch (std::exception const& err)
         {
-            if (common::getEnvDisaggEnableInflightCancel() && session.has_value())
+            if (mInflightCancelEnabled && session.has_value())
             {
                 session->poisonReservedRecvBuffers();
             }
@@ -1549,7 +1552,7 @@ private:
         }
         catch (...)
         {
-            if (common::getEnvDisaggEnableInflightCancel() && session.has_value())
+            if (mInflightCancelEnabled && session.has_value())
             {
                 session->poisonReservedRecvBuffers();
             }
@@ -1686,7 +1689,7 @@ private:
                         requestAndPromise.mPromise->set_exception(std::current_exception());
                     }
                 }
-                if (common::getEnvDisaggEnableInflightCancel() && requestAndPromise.mRequest != nullptr)
+                if (mInflightCancelEnabled && requestAndPromise.mRequest != nullptr)
                 {
                     std::lock_guard<std::mutex> lg(mInFlightCancelMutex);
                     mInFlightCancelFlags.erase(requestAndPromise.mRequest->mRequestId);
@@ -1711,6 +1714,7 @@ private:
     std::unordered_map<std::string, std::unique_ptr<AsyncResource>> mInstanceToAsyncResource;
     executor::kv_cache::ConnectionManager* mManager;
     executor::DataTransceiverState mSelfState;
+    bool mInflightCancelEnabled{false};
     CacheTransferLayer mCacheTransferLayer;
     std::unordered_map<std::string, std::unique_ptr<ReceiveCacheResource>> mProcessToResources;
     std::mutex mProcessIoResouceMutex;

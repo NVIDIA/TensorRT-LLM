@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2025-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -30,9 +30,11 @@ class CommState;
 struct DataContext
 {
 public:
-    explicit DataContext(int tag, std::atomic<bool> const& transferTerminate = sDefaultTransferTerminate)
+    explicit DataContext(int tag, std::atomic<bool> const& transferTerminate = sDefaultTransferTerminate,
+        bool enableInflightCancel = false)
         : mTag{tag}
         , mTransferTerminate(transferTerminate)
+        , mEnableInflightCancel(enableInflightCancel)
     {
     }
 
@@ -46,10 +48,16 @@ public:
         return mTransferTerminate;
     }
 
+    [[nodiscard]] bool isInflightCancelEnabled() const noexcept
+    {
+        return mEnableInflightCancel;
+    }
+
 private:
     inline static std::atomic<bool> sDefaultTransferTerminate{false};
     int const mTag;
     std::atomic<bool> const& mTransferTerminate;
+    bool const mEnableInflightCancel;
 };
 
 class Connection
