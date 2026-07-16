@@ -33,12 +33,6 @@ def _run_triage(risk_docs: list, scan_type: str, branch: str, ts_created: int) -
     """Call triage agent for untriaged risk_docs; persist ticket records; return {pkg: ticket_url}."""
     if not risk_docs:
         return {}
-    print(
-        format_risks_for_agent(
-            [],
-            risk_docs,
-        )
-    )
     is_vuln = "vulnerability" in scan_type
     agent_resp = call_triage_agent(
         format_risks_for_agent(
@@ -46,7 +40,6 @@ def _run_triage(risk_docs: list, scan_type: str, branch: str, ts_created: int) -
             risk_docs if not is_vuln else [],
         )
     )
-    print(agent_resp)
     if not agent_resp:
         return {}
     ticket_refs = extract_ticket_refs(agent_resp)
@@ -121,7 +114,6 @@ def submit_source_code_vulns(
             bulk_documents.append(doc)
         if risks_to_report:
             new_tickets = _run_triage(risks_to_report, SCAN_TYPE, build_metadata["ref"], ts)
-            print(new_tickets)
             for doc in bulk_documents:
                 if doc["s_package_name"] in new_tickets:
                     doc["s_ticket_url"] = new_tickets[doc["s_package_name"]]
@@ -221,7 +213,6 @@ def submit_source_code_licenses(
 
         if risks_to_report:
             new_tickets = _run_triage(risks_to_report, SCAN_TYPE, build_metadata["ref"], ts)
-            print(new_tickets)
             for doc in sbom_documents:
                 if doc["s_package_name"] in new_tickets:
                     doc["s_ticket_url"] = new_tickets[doc["s_package_name"]]
