@@ -2410,7 +2410,11 @@ class BaseKVCacheCompressionManager(BaseResourceManager):
         scheduled_batch: "ScheduledRequests",
         **kwargs,
     ) -> None:
-        """Fired once per generation step before this step's forward."""
+        """Fired once per iteration before the forward pass, including
+        iterations that schedule only context requests. No algorithm overrides
+        it yet; split it into separate context-step and generation-step hooks
+        once a subclass needs the distinction.
+        """
 
     def on_generation_step_end(
         self,
@@ -2456,12 +2460,7 @@ class BaseKVCacheCompressionManager(BaseResourceManager):
                 self.on_request_init(req)
         self.on_generation_step_begin(scheduled_batch)
 
-    def update_resources(
-        self,
-        scheduled_batch: "ScheduledRequests",
-        attn_metadata: Optional["AttentionMetadata"] = None,
-        kv_cache_dtype_byte_size: Optional[float] = None,
-    ) -> None:
+    def update_resources(self, scheduled_batch: "ScheduledRequests") -> None:
         """Fire :meth:`on_context_step_end` with the requests whose final
         prefill chunk ran this iteration, then :meth:`on_generation_step_end`.
 
@@ -2470,9 +2469,7 @@ class BaseKVCacheCompressionManager(BaseResourceManager):
         request-state transitions: it is iteration-exact and immune to a
         short-output request going straight to ``GENERATION_TO_COMPLETE``
         (which, under the overlap scheduler, never passes through
-        ``GENERATION_IN_PROGRESS``). Signature matches the other resource
-        managers so PyExecutor passes ``attn_metadata`` /
-        ``kv_cache_dtype_byte_size`` through transparently.
+        ``GENERATION_IN_PROGRESS``).
         """
         if scheduled_batch.context_requests_last_chunk:
             self.on_context_step_end(
