@@ -28,8 +28,12 @@ import zmq.asyncio
 from tensorrt_llm.logger import logger
 
 from .._utils import customized_gc_thresholds, mpi_rank, nvtx_range_debug
-from ..llmapi.mpi_session import (MpiCommSession, MpiPoolSession, MpiSession,
-                                  RemoteMpiCommSessionClient,
+# Alias unaffected by test-infra monkey-patching of ``MpiPoolSession`` (which
+# replaces the module-level name with a factory function for pool reuse).
+from ..llmapi.mpi_session import MpiCommSession
+from ..llmapi.mpi_session import MpiPoolSession
+from ..llmapi.mpi_session import MpiPoolSession as _RealMpiPoolSession
+from ..llmapi.mpi_session import (MpiSession, RemoteMpiCommSessionClient,
                                   validate_session_world_size)
 from ..llmapi.tracer import enable_llm_tracer, get_tracer, global_tracer
 from ..llmapi.utils import (AsyncQueue, ManagedThread, _SyncQueue,
@@ -573,7 +577,8 @@ class GenerationExecutorProxy(GenerationExecutor):
             raise RuntimeError(
                 "Executor worker returned error") from ready_signal
 
-        if isinstance(self.mpi_session, MpiPoolSession) and len(status) == 3:
+        if isinstance(self.mpi_session,
+                      _RealMpiPoolSession) and len(status) == 3:
             worker_process_identities: List[WorkerProcessIdentity] = status[2]
             self._worker_process_monitor.register(worker_process_identities)
 
