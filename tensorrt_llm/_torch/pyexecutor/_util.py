@@ -2032,50 +2032,45 @@ def _create_kv_cache_manager(
     return kv_cache_manager
 
 
-def kv_cache_compression_supported_with_spec(
+def validate_kv_cache_compression_with_spec(
     config: KvCacheCompressionConfig,
     spec_config: Optional[SpeculativeConfig],
     draft_kv_cache_manager: Optional[KVCacheManagerV2],
-) -> bool:
-    """Decide, before any manager is created, whether the configured
-    compression method supports the speculative setup. Logs the reason and
-    returns False when it does not; the run then stays uncompressed."""
-
-    def unsupported(reason: str) -> bool:
-        logger.warning(
-            "KV-cache compression algorithm '%s' %s; running without a "
-            "compression manager.", config.algorithm, reason)
-        return False
-
+) -> None:
+    """Reject speculative setups the compression method cannot run with."""
     if (spec_config is None
             or not config.kv_cache_compression_mode.is_eviction_method()):
-        return True
-    # Evicting methods co-compact the draft KV, so they only support spec
-    # modes whose draft KV is a standard paged cache in the same forward
-    # (one-model speculation).
+        return
+    # Evicting methods co-compact the draft KV, so the draft must be a
+    # standard paged cache in the same forward (one-model speculation).
     mode = spec_config.spec_dec_mode
     if not (mode.is_mtp_one_model() or mode.is_eagle3_one_model()):
-        return unsupported(
-            f"evicts cached tokens and does not support speculative decoding "
-            f"mode {mode.name} (the draft KV must be a standard paged cache "
-            "compacted together with the target)")
+        raise ValueError(
+            f"KV-cache compression algorithm {config.algorithm!r} does not "
+            f"support speculative decoding mode {mode.name}: the draft KV "
+            "must be a standard paged cache compacted together with the "
+            "target (one-model MTP/EAGLE3).")
     if config.algorithm == "triattention":
         if spec_config.max_draft_len is None:
-            return unsupported("requires a resolved max_draft_len")
+            raise ValueError(
+                "TriAttention speculative compatibility requires a resolved "
+                "max_draft_len")
         if not spec_config.is_linear_tree:
-            return unsupported("requires linear drafting")
+            raise ValueError(
+                "TriAttention speculative compatibility requires linear "
+                "drafting")
         if spec_config.draft_len_schedule is not None:
-            return unsupported(
-                "does not yet support dynamic speculative draft lengths")
+            raise ValueError("TriAttention does not yet support dynamic "
+                             "speculative draft lengths")
         if (spec_config.acceptance_window is not None
                 or spec_config.acceptance_length_threshold is not None):
-            return unsupported(
-                "does not support runtime speculative acceptance gating")
+            raise ValueError("TriAttention does not support runtime "
+                             "speculative acceptance gating")
         if draft_kv_cache_manager is None:
-            return unsupported(
-                "requires a separate draft KV cache; shared target/draft "
-                "pools cannot be compacted safely")
-    return True
+            raise ValueError(
+                "TriAttention speculative compatibility requires a separate "
+                "draft KV cache; shared target/draft pools cannot be "
+                "compacted safely")
 
 
 def create_kv_cache_compression_manager(
@@ -2089,7 +2084,7 @@ def create_kv_cache_compression_manager(
     Called from ``create_py_executor`` and registered as a resource manager,
     like the KV cache manager itself. Concrete algorithms add a dispatch branch
     here; the framework ships none. Speculative-decoding compatibility is
-    decided by the caller via ``kv_cache_compression_supported_with_spec``.
+    checked by the caller via ``validate_kv_cache_compression_with_spec``.
     """
     if config.algorithm == "triattention":
         from tensorrt_llm._torch.kv_cache_compression.triattention import \
@@ -2326,17 +2321,17 @@ def create_py_executor_instance(
     if kv_cache_compression_config is not None:
         draft_kv_cache_manager = resources.get(
             ResourceManagerType.DRAFT_KV_CACHE_MANAGER)
-        if kv_cache_compression_supported_with_spec(kv_cache_compression_config,
-                                                    spec_config,
-                                                    draft_kv_cache_manager):
-            compression_manager = create_kv_cache_compression_manager(
-                kv_cache_compression_config,
-                kv_cache_manager,
-                draft_kv_cache_manager=draft_kv_cache_manager,
-            )
-            if compression_manager is not None:
-                resources[ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER] = (
-                    compression_manager)
+        validate_kv_cache_compression_with_spec(kv_cache_compression_config,
+                                                spec_config,
+                                                draft_kv_cache_manager)
+        compression_manager = create_kv_cache_compression_manager(
+            kv_cache_compression_config,
+            kv_cache_manager,
+            draft_kv_cache_manager=draft_kv_cache_manager,
+        )
+        if compression_manager is not None:
+            resources[ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER] = (
+                compression_manager)
 
     resource_manager = ResourceManager(resources)
 
