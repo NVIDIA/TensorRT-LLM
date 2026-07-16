@@ -3289,8 +3289,8 @@ class TriAttentionKvCacheCompressionConfig(KvCacheCompressionConfig):
     it is converted to the runtime schema at load. TriAttention is a pure
     compression method: it has no sparse-attention config and no attention
     backend of its own -- decode runs the model's standard attention over the
-    compacted cache, and the manager reconciles the cached-token count via the
-    framework's ``adjust_attention_metadata`` hook.
+    compacted cache, and the manager publishes each request's evicted count on
+    ``LlmRequest.py_num_compressed_tokens`` for the engine to subtract.
     """
     algorithm: Literal["triattention"] = "triattention"
     eviction_mode: Literal["union", "per_head", "per_layer_perhead"] = Field(
