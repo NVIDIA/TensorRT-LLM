@@ -1738,8 +1738,11 @@ else
     fi
 fi
 
-# Poll until the builder job finishes (success or failure).
+# Poll until the builder job finishes (success or failure); tail the builder log live.
 echo "Waiting for fat sqsh builder job \$BUILDER_ID to complete..."
+touch "${fatBuildLogPath}"
+tail -f "${fatBuildLogPath}" &
+FAT_TAIL_PID=\$!
 while true; do
     if ! STATUS=\$(sacct -j "\$BUILDER_ID" --format=State -Pn --allocations 2>&1); then
         echo "Warning: sacct failed, retrying in 60s..."
@@ -1757,6 +1760,7 @@ while true; do
             ;;
     esac
 done
+kill \$FAT_TAIL_PID 2>/dev/null || true
 
 if [ -f "\$fatSqshPath" ]; then
     echo "Fat sqsh ready: \$fatSqshPath"

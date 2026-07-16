@@ -19,9 +19,9 @@ slurm_install_setup() {
 
         nvidia-smi && nvidia-smi -q && nvidia-smi topo -m
         if [[ "${SKIP_INSTALL:-0}" == "1" ]]; then
-            # Fat sqsh: source tree and packages are already in the container at /opt/trtllm/.
-            echo "SKIP_INSTALL=1: skipping wget, tar, apt, and pip installs (pre-baked in fat sqsh at /opt/trtllm/)"
-            resourcePathNode=/opt/trtllm
+            # Fat sqsh: source tree and packages are already in the container at /tmp/TensorRT-LLM/.
+            echo "SKIP_INSTALL=1: skipping wget, tar, apt, and pip installs (pre-baked in fat sqsh at /tmp/TensorRT-LLM/)"
+            resourcePathNode=/tmp
         else
             retry_command --timeout 1800 bash -c "wget -nv $llmTarfile"
             tar -zxf $tarName
