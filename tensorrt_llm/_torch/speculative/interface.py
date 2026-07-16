@@ -533,10 +533,16 @@ class SpecMetadata:
     use_sampling_params_for_draft_tokens: bool = False
     # Vocab size used for draft_probs buffer allocation.
     vocab_size: int = 0
+    # Size of the SeqSlotManager pool. py_seq_slot values range over
+    # [0, num_seq_slots); DeepSeek-V4 overlap can use 2 * max_batch_size,
+    # larger than max_num_requests (== max_batch_size).
+    # Slot-indexed buffers (draft_probs) must span this full range.
+    # 0 falls back to max_num_requests.
+    num_seq_slots: int = 0
     # Draft probabilities buffer for rejection sampling, indexed by py_seq_slot
     # so per-request data is stable across iterations regardless of batch
     # composition shifts (chunking ctx, gen completion, new ctx joining).
-    # Shape: [max_num_requests, max_draft_len, vocab_size].
+    # Shape: [num_seq_slots, max_draft_len, vocab_size].
     draft_probs: Optional[torch.Tensor] = None
     draft_probs_vocab_size: int = 0
     # Whether draft_probs contains valid data.
@@ -573,8 +579,9 @@ class SpecMetadata:
                 and self.vocab_size > 0):
             # 3D [slot, draft_step, vocab] so we can scatter/gather by slot id
             # and avoid the brittle "batch position == buffer position" mapping.
+            slot_capacity = self.num_seq_slots or self.max_num_requests
             self.draft_probs = torch.empty(
-                (self.max_num_requests, self.max_draft_len, self.vocab_size),
+                (slot_capacity, self.max_draft_len, self.vocab_size),
                 dtype=torch.float32,
                 device='cuda')
             self.draft_probs_vocab_size = self.vocab_size
@@ -634,10 +641,16 @@ class SpecMetadata:
         before the CUDA graph key is built.
         """
         from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
+        from tensorrt_llm._torch.pyexecutor.sampler.sampling_utils import \
+            GREEDY_TEMPERATURE_THRESHOLD
         from tensorrt_llm.sampling_params import SamplingParams
 
-        # Need to use a very small value for temperature when disabled to avoid division by 0
-        DISABLE_TEMP_VAL = 1e-5
+        # Sentinel temperature for greedy / temperature-disabled rows. Must stay
+        # strictly below GREEDY_TEMPERATURE_THRESHOLD so the sampling kernels
+        # recognize these rows as greedy; small enough that even if a row were
+        # (incorrectly) sampled, softmax(logits / val) is effectively one-hot,
+        # and non-zero to avoid division by 0.
+        DISABLE_TEMP_VAL = GREEDY_TEMPERATURE_THRESHOLD / 10
         # Very large values disable topk.
         DISABLE_TOPK_VAL = torch.iinfo(torch.int32).max
         DISABLE_TOPP_VAL = 1.0

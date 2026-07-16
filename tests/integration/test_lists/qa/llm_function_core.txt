@@ -19,7 +19,7 @@ accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_auto_dtype_with
 accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_auto_dtype_with_helix[nccl-cudagraph:with_padding-pp1tp1cp4]
 accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_auto_dtype_with_helix[nccl-cudagraph:with_padding-pp1tp2cp2]
 accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_auto_dtype_with_helix[nccl-cudagraph:with_padding-pp2tp1cp2]
-accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_gen_only_sync
+accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_gen_only_sync[python]
 accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_guided_decoding[llguidance-mtp_nextn=0]
 accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_guided_decoding[llguidance-mtp_nextn=2]
 accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_guided_decoding[xgrammar-mtp_nextn=0]
@@ -568,6 +568,9 @@ accuracy/test_llm_api_pytorch.py::TestKimiK2::test_nvfp4[8gpus]
 accuracy/test_llm_api_pytorch.py::TestLagunaXS::test_bf16
 accuracy/test_llm_api_pytorch.py::TestLagunaXS::test_fp8
 accuracy/test_llm_api_pytorch.py::TestLagunaXS::test_nvfp4
+accuracy/test_llm_api_pytorch.py::TestLagunaXS_2_1::test_bf16_dflash
+accuracy/test_llm_api_pytorch.py::TestLagunaXS_2_1::test_fp8_dflash
+accuracy/test_llm_api_pytorch.py::TestLagunaXS_2_1::test_nvfp4_dflash
 accuracy/test_llm_api_pytorch.py::TestLlama3_1_8B::test_nvfp4
 accuracy/test_llm_api_pytorch.py::TestLlama3_1_8B::test_nvfp4_streaming[stream_interval_4]
 accuracy/test_llm_api_pytorch.py::TestLlama3_1_8B::test_nvfp4_streaming[stream_interval_64]

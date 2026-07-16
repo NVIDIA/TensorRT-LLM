@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import bisect
 import contextlib
 import functools
@@ -19,7 +22,7 @@ from tensorrt_llm._utils import (is_trace_enabled, maybe_pin_memory, nvtx_range,
                                  prefer_pinned, release_gc, torch_dtype_to_str,
                                  trace_func)
 from tensorrt_llm.bindings.internal.runtime import TaskLayerModuleConfig
-from tensorrt_llm.inputs.multimodal import (MultimodalParams,
+from tensorrt_llm.inputs.multimodal import (MultimodalInput, MultimodalParams,
                                             MultimodalRuntimeData,
                                             _has_mm_payload_keys,
                                             check_mm_embed_cumsum_if_needed,
@@ -151,6 +154,25 @@ def _filter_piecewise_capture_num_tokens(
         if max_capturable_num_tokens < i <= max_num_tokens
     })
     return kept, unrecordable
+
+
+def _build_request_multimodal_input(
+        request: LlmRequest, cache_enabled: bool) -> Optional[MultimodalInput]:
+    # Skip building this input (and its `from_components` validation) when the cache is disabled.
+    if not cache_enabled or request.multimodal_hashes is None:
+        return None
+    # `multimodal_input` is consumed only by the encoder-cache key path
+    # (`MultimodalModelMixin._encoder_cache_keys`), which uses UUID-aware multimodal hashes
+    # internally. Although the `multimodal_uuids` are not exposed as an attribute, they remain in
+    # the backing C++ request for KV-cache block keys and cache events.
+    return MultimodalInput.from_components(
+        request.multimodal_hashes,
+        request.multimodal_positions,
+        request.multimodal_lengths,
+        mm_item_run_cu_offsets=request.multimodal_item_run_cu_offsets,
+        mm_run_positions=request.multimodal_run_positions,
+        mm_run_lengths=request.multimodal_run_lengths,
+    )
 
 
 def _filter_cuda_graph_batch_sizes(cuda_graph_batch_sizes: list[int],
@@ -296,6 +318,13 @@ class PyTorchModelEngine(ModelEngine):
         self.mapping = mapping
         if mapping.has_pp():
             init_pp_comm(mapping)
+        # Start with the established pool size. Once the model is loaded we
+        # selectively enable headroom for the non-PP DeepSeek-V4 overlap path.
+        from ._util import (compute_max_num_sequences,
+                            should_enable_dsv4_adp_dummy_fixes,
+                            should_enable_dsv4_overlap_headroom)
+        self.max_num_seq_slots = compute_max_num_sequences(
+            mapping, self.batch_size, llm_args.disable_overlap_scheduler)
         self.dist = dist
         if dist is not None:
             ExpertStatistic.create(self.dist.rank)
@@ -351,7 +380,11 @@ class PyTorchModelEngine(ModelEngine):
             trust_remote_code=llm_args.trust_remote_code,
             **input_processor_kwargs)
         self.input_processor_with_hash = create_input_processor_with_hash(
-            self.input_processor)
+            self.input_processor,
+            encoder_cache_enabled=(
+                llm_args.multimodal_config is not None
+                and llm_args.multimodal_config.encoder_cache_max_bytes > 0),
+        )
         if model is None:
             lora_config: Optional[
                 LoraConfig] = None if is_draft_model else llm_args.lora_config
@@ -373,6 +406,23 @@ class PyTorchModelEngine(ModelEngine):
                 setattr(self, "moe_load_balancer", moe_load_balancer)
         else:
             self.model = model
+        pretrained_config = self.model.model_config.pretrained_config
+        model_type = getattr(pretrained_config, "model_type", None)
+        # Keep the scheduler/dummy fix model-scoped, while the larger slot pool
+        # is restricted to the validated MTP overlap configuration. PP remains
+        # on its established path for follow-up changes.
+        self._enable_dsv4_adp_dummy_fixes = (should_enable_dsv4_adp_dummy_fixes(
+            model_type, mapping))
+        self._enable_dsv4_overlap_headroom = (
+            should_enable_dsv4_overlap_headroom(
+                model_type, spec_config, mapping,
+                llm_args.disable_overlap_scheduler))
+        self.max_num_seq_slots = compute_max_num_sequences(
+            mapping,
+            self.batch_size,
+            llm_args.disable_overlap_scheduler,
+            enable_overlap_headroom=self._enable_dsv4_overlap_headroom,
+        )
         if drafting_loop_wrapper is not None:
             self.model = drafting_loop_wrapper(self.model)
             self.model_is_wrapped = True
@@ -809,6 +859,13 @@ class PyTorchModelEngine(ModelEngine):
             pass
         logger.debug(f"Detected use_mrope: {use_mrope}")
         return use_mrope
+
+    @functools.cached_property
+    def _mm_encoder_cache_enabled(self) -> bool:
+        """Whether the multimodal encoder cache is active for this model."""
+        multimodal_config = self.model.model_config.multimodal_config
+        return (multimodal_config is not None
+                and multimodal_config.encoder_cache_max_bytes > 0)
 
     @property
     def is_warmup(self):
@@ -2188,6 +2245,11 @@ class PyTorchModelEngine(ModelEngine):
             spec_resource_manager: Optional[BaseResourceManager],
             no_cache=False):
         spec_config = self.spec_config if self.enable_spec_decode else None
+        # Only the scoped DeepSeek-V4 overlap path opts into larger metadata
+        # buffers. Passing None preserves the established max_num_requests
+        # fallback for every other model, including MTP-Eagle with PP.
+        num_seq_slots = (self.max_num_seq_slots
+                         if self._enable_dsv4_overlap_headroom else None)
         if no_cache:
             return get_spec_metadata(
                 spec_config,
@@ -2196,7 +2258,8 @@ class PyTorchModelEngine(ModelEngine):
                 max_num_tokens=self.max_num_tokens,
                 spec_resource_manager=spec_resource_manager,
                 is_draft_model=self.is_draft_model,
-                max_seq_len=self.max_seq_len)
+                max_seq_len=self.max_seq_len,
+                num_seq_slots=num_seq_slots)
 
         if self.spec_metadata is not None:
             return self.spec_metadata
@@ -2207,7 +2270,8 @@ class PyTorchModelEngine(ModelEngine):
             max_num_tokens=self.max_num_tokens,
             spec_resource_manager=spec_resource_manager,
             is_draft_model=self.is_draft_model,
-            max_seq_len=self.max_seq_len)
+            max_seq_len=self.max_seq_len,
+            num_seq_slots=num_seq_slots)
         return self.spec_metadata
 
     def cleanup(self) -> None:
@@ -3402,6 +3466,8 @@ class PyTorchModelEngine(ModelEngine):
                 )
 
             multimodal_params = MultimodalParams(
+                multimodal_input=_build_request_multimodal_input(
+                    request, self._mm_encoder_cache_enabled),
                 multimodal_data=request.py_multimodal_data,
                 multimodal_runtime=py_multimodal_runtime,
                 input_ids_start_offset=context_start_idx)
@@ -4332,6 +4398,8 @@ class PyTorchModelEngine(ModelEngine):
             # Multimodal
             if request.py_multimodal_data is not None:
                 multimodal_params = MultimodalParams(
+                    multimodal_input=_build_request_multimodal_input(
+                        request, self._mm_encoder_cache_enabled),
                     multimodal_data=request.py_multimodal_data,
                     input_ids_start_offset=context_start_idx)
                 multimodal_params.to_device("multimodal_data",

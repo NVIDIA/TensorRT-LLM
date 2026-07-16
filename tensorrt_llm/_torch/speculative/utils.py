@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 from bisect import bisect_left
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, Optional
@@ -45,9 +48,14 @@ def get_spec_metadata(spec_config,
                       max_num_tokens,
                       spec_resource_manager=None,
                       is_draft_model=False,
-                      max_seq_len=262144):
+                      max_seq_len=262144,
+                      num_seq_slots=None):
     use_rejection_sampling = getattr(spec_config, "use_rejection_sampling",
                                      False)
+    # Slot-indexed buffers (draft_probs) must span the SeqSlotManager pool;
+    # DeepSeek-V4 overlap can exceed max_num_requests.
+    num_seq_slots = (num_seq_slots
+                     if num_seq_slots is not None else max_num_requests)
     vocab_size = getattr(model_config, "vocab_size", 0)
     if spec_config.spec_dec_mode.is_mtp_eagle_one_model():
         # MTP Eagle one-model reuses Eagle3 one-model metadata for the
@@ -67,6 +75,7 @@ def get_spec_metadata(spec_config,
             max_num_tokens=max_num_tokens,
             use_rejection_sampling=use_rejection_sampling,
             vocab_size=vocab_size,
+            num_seq_slots=num_seq_slots,
             spec_resource_manager=spec_resource_manager,
         )
     if spec_config.spec_dec_mode.is_mtp_vanilla():
