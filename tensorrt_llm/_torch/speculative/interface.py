@@ -1346,9 +1346,16 @@ class SpecWorkerBase(nn.Module, ABC):
         mapping = self.mapping
         if mapping is None or getattr(mapping, "tp_size", 1) <= 1:
             return False
-        # Plain attention DP (without LM-head TP) replicates full-vocab logits.
-        if (getattr(mapping, "enable_attention_dp", False)
-                and not getattr(mapping, "enable_lm_head_tp_in_adp", False)):
+        # Under attention DP every rank is data-parallel -- it owns a distinct
+        # set of requests -- so the draft logits must NOT be cross-rank gathered,
+        # whether they are replicated full-vocab (plain ADP) or vocab-sharded
+        # (ADP + LM-head TP). A per-rank argmax on the rank's own logits is the
+        # correct proposal (verified later); a gather would splice in a
+        # mismatched collective across ranks that hold different token counts,
+        # desyncing them into a hang / DeepEP launch failure. Only plain TP
+        # (tp>1 without ADP), where all ranks share the same tokens sharded over
+        # the vocab dim, needs the gather.
+        if getattr(mapping, "enable_attention_dp", False):
             return False
         draft_full_vocab = (getattr(spec_metadata, "draft_vocab_size", 0)
                             or getattr(spec_metadata, "vocab_size", 0) or 0)
@@ -1375,15 +1382,11 @@ class SpecWorkerBase(nn.Module, ABC):
                 or not self._draft_logits_are_sharded(logits, spec_metadata)):
             return logits
 
+        # Only plain TP (no attention DP) reaches here -- ADP variants return
+        # early via _draft_logits_are_sharded, since their ranks are
+        # data-parallel and must not gather draft logits across ranks.
         from ..distributed.ops import allgather
-        mapping = self.mapping
-        if (getattr(mapping, "enable_attention_dp", False)
-                and getattr(mapping, "enable_lm_head_tp_in_adp", False)):
-            assert mapping_lm_head_tp is not None, (
-                "mapping_lm_head_tp is required to gather ADP + LM-head-TP draft "
-                "logits")
-            return allgather(logits, mapping_lm_head_tp, dim=-1)
-        return allgather(logits, mapping, dim=-1)
+        return allgather(logits, self.mapping, dim=-1)
 
     def advanced_sample_draft(self,
                               logits: torch.Tensor,
@@ -1751,22 +1754,10 @@ class SpecWorkerBase(nn.Module, ABC):
             combined = self._get_local_max_and_combined(logits)
             gathered = allgather(combined, mapping, dim=-1)
             return self._get_draft_tokens_from_gathered(gathered)
-        elif (sharded and mapping is not None
-              and getattr(mapping, "tp_size", 1) > 1
-              and mapping.enable_lm_head_tp_in_adp):
-            # ADP + LM-head TP: the worker trimmed the LM-head-TP padding rows, so
-            # each rank holds [token_count, vocab_shard] for its own tokens. Gather
-            # the per-rank (index, value) over mapping_lm_head_tp and pick the
-            # global argmax per row (no token re-slice needed after the trim).
-            assert mapping_lm_head_tp is not None, (
-                "mapping_lm_head_tp is required for ADP + LM-head-TP greedy "
-                "draft sampling")
-            from ..distributed.ops import allgather
-            combined = self._get_local_max_and_combined(logits,
-                                                        mapping_lm_head_tp)
-            gathered = allgather(combined, mapping_lm_head_tp, dim=-1)
-            return self._get_draft_tokens_from_gathered(gathered)
-        # No TP gather needed: plain argmax (draft-vocab space; caller applies d2t).
+        # No TP gather for attention-DP (incl. ADP + LM-head TP): each rank owns
+        # its own requests, so a per-rank argmax is the correct proposal and a
+        # cross-rank gather here would desync the ranks (see
+        # _draft_logits_are_sharded). Plain argmax; caller applies d2t.
         return torch.argmax(logits, dim=-1).type(torch.int32)
 
     def advanced_sample_draft_block(self, gen_logits: torch.Tensor,
