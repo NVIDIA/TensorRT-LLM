@@ -40,6 +40,7 @@ from tensorrt_llm._torch.models.checkpoints.mx.checkpoint_loader import (
     _build_mx_source_metadata,
     _normalize_model_identity,
     _resolve_mx_model_name,
+    _serialize_source_identity,
 )
 from tensorrt_llm._torch.weight_sharing import SourceIdentity
 
@@ -653,9 +654,9 @@ class TestPublishAsSource:
 
         assert calls == [model]
         metadata = captured["identity"].extra_parameters
-        assert metadata[_MX_SOURCE_IDENTITY_METADATA_KEY] == json.dumps(
-            source_identity.to_dict(), sort_keys=True, separators=(",", ":")
-        )
+        serialized_identity = json.loads(metadata[_MX_SOURCE_IDENTITY_METADATA_KEY])
+        assert "model_name" not in serialized_identity
+        assert SourceIdentity.from_dict(serialized_identity).matches(source_identity).matched
         assert metadata[_MX_WEIGHT_LAYOUT_METADATA_KEY] == _MX_WEIGHT_LAYOUT_POST_TRANSFORM
         assert metadata[_MX_TRANSFORM_PROTOCOL_VERSION_METADATA_KEY] == str(
             _MX_STAGED_TRANSFORM_PROTOCOL_VERSION
@@ -727,7 +728,9 @@ class TestPublishAsSource:
             )
 
         serialized = captured["identity"].extra_parameters["trtllm_source_identity"]
-        assert SourceIdentity.from_dict(json.loads(serialized)) == source_identity
+        published_identity = SourceIdentity.from_dict(json.loads(serialized))
+        assert published_identity.model_name is None
+        assert published_identity.matches(source_identity).matched
         assert (
             captured["identity"].extra_parameters[_MX_WEIGHT_LAYOUT_METADATA_KEY]
             == _MX_WEIGHT_LAYOUT_POST_TRANSFORM
@@ -735,6 +738,20 @@ class TestPublishAsSource:
         assert captured["identity"].extra_parameters[
             _MX_TRANSFORM_PROTOCOL_VERSION_METADATA_KEY
         ] == str(_MX_STAGED_TRANSFORM_PROTOCOL_VERSION)
+
+    def test_serialized_identity_ignores_local_checkpoint_path(self):
+        donor_identity = _identity()
+        receiver_identity = SourceIdentity(
+            **{
+                **donor_identity.to_dict(),
+                "model_name": "/tmp/no-shards/TinyLlama",
+            }
+        )
+
+        assert donor_identity.model_name != receiver_identity.model_name
+        assert _serialize_source_identity(donor_identity) == _serialize_source_identity(
+            receiver_identity
+        )
 
 
 # ---------------------------------------------------------------------------

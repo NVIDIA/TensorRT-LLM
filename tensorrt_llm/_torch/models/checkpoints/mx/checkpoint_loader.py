@@ -101,8 +101,15 @@ def _temporary_env(key: str, value: Optional[str]) -> Iterator[None]:
 
 def _serialize_source_identity(identity: SourceIdentity) -> str:
     """Serialize TRT-LLM's layout identity for MX's identity map."""
+    payload = identity.to_dict()
+    # `model_name` is a cleartext discovery descriptor and is deliberately
+    # excluded from SourceIdentity compatibility checks. The outer MX identity
+    # already carries the normalized model name; embedding a local checkpoint
+    # path here would make otherwise-compatible no-shards receivers hash to a
+    # different MX source.
+    payload.pop("model_name", None)
     return json.dumps(
-        identity.to_dict(),
+        payload,
         sort_keys=True,
         separators=(",", ":"),
     )
