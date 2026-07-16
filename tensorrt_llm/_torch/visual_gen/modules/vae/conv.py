@@ -1,8 +1,42 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from typing import List, Optional
 
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+
+
+def _spatial_channels_last_format(x: torch.Tensor) -> Optional[torch.memory_format]:
+    """Return ``x``'s channels-last memory format (2D or 3D), or ``None``.
+
+    The halo exchange builds row-major send/recv buffers and concatenates them
+    with ``x`` along the split dimension. When ``x`` is channels-last (as the
+    native Wan VAE convs require and produce), a mixed-format ``torch.cat`` falls
+    back to row-major, so every downstream conv re-converts via a full-tensor
+    ``channels_last`` copy. Materialising the halo slices in ``x``'s format
+    before the ``cat`` lets it preserve channels-last, making the conv's
+    ``_channels_last_*_if_needed`` a no-op. Returns ``None`` when ``x`` is not
+    unambiguously channels-last, in which case the caller leaves layout untouched.
+    """
+    if x.dim() == 5 and x.is_contiguous(memory_format=torch.channels_last_3d):
+        return torch.channels_last_3d
+    if x.dim() == 4 and x.is_contiguous(memory_format=torch.channels_last):
+        return torch.channels_last
+    return None
 
 
 class HaloExchangeConv(nn.Module):
@@ -122,6 +156,13 @@ class HaloExchangeConv(nn.Module):
         if self.halo_right < exchange_size:
             recv_from_right = torch.narrow(recv_from_right, dim, 0, self.halo_right)
 
+        # Match the halo slices' layout to ``x`` so the cat preserves
+        # channels-last and downstream convs skip a full-tensor re-conversion.
+        mf = _spatial_channels_last_format(x)
+        if mf is not None:
+            recv_from_left = recv_from_left.contiguous(memory_format=mf)
+            recv_from_right = recv_from_right.contiguous(memory_format=mf)
+
         return torch.cat([recv_from_left, x, recv_from_right], dim=dim)
 
     def _strip_halo(self, x: torch.Tensor) -> torch.Tensor:
@@ -233,6 +274,11 @@ class HaloExchangeConv2dStride2(nn.Module):
             dist.send(send_left, dst=self.rank - 1)
 
         if self.rank != self.world_size - 1:
+            # Match the halo slice's layout to ``x`` so the cat preserves
+            # channels-last (see ``_spatial_channels_last_format``).
+            mf = _spatial_channels_last_format(x)
+            if mf is not None:
+                right_context = right_context.contiguous(memory_format=mf)
             x = torch.cat([x, right_context], dim=dim)
 
         if self.rank == self.world_size - 1:

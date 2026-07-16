@@ -2164,14 +2164,14 @@ files = [
 
 [[package]]
 name = "smart-open"
-version = "8.0.0"
+version = "8.0.1"
 description = "Utils for streaming large files (S3, HDFS, GCS, SFTP, Azure Blob Storage, gzip, bz2, zst...)"
 optional = false
 python-versions = "<4.0,>=3.10"
 groups = ["main"]
 files = [
-    {file = "smart_open-8.0.0-py3-none-any.whl", hash = "sha256:ff4f395c9e86f23e27771dc4ba756ad4bd145f181859a782c50d64168485761b"},
-    {file = "smart_open-8.0.0.tar.gz", hash = "sha256:5a2008d60688bd3b33c52e2ef666d3c60cf956e73e215de8c7b242cf56fdd1b2"},
+    {file = "smart_open-8.0.1-py3-none-any.whl", hash = "sha256:3e97f90e92a952cb57863dfe132082c400a52eeeb27c067692fb51dbcc5b0089"},
+    {file = "smart_open-8.0.1.tar.gz", hash = "sha256:18b1c4496003c6902be17c15f032b5c319f307c89c6ae9e6b028b508bed8b2cf"},
 ]
 
 [package.dependencies]
