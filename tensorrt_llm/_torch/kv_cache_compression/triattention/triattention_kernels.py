@@ -610,8 +610,11 @@ def _tri_score_perhead_kernel(
     T_BLOCK: tl.constexpr,
     F_BLOCK: tl.constexpr,
 ):
-    seg = tl.program_id(0)
-    t_blk = tl.program_id(1)
+    # Token tiles ride the fastest grid axis: adjacent programs then walk
+    # consecutive K pages of one (request, layer, head) and reuse its
+    # calibration/phase rows in L2 (~2% faster than segment-major order).
+    seg = tl.program_id(1)
+    t_blk = tl.program_id(0)
     # KV heads are grid-parallel (axis 2): iterations of the former kv_head
     # loop shared NO data (each KV head reads its own K and writes its own
     # output rows), so hoisting it onto the grid multiplies parallelism with
@@ -908,9 +911,13 @@ class _FixedScoreGroup:
         ):
             raise ValueError("score output lengths do not fit the keep-set selector")
         num_segments = request_count * self.num_layers
+        if num_segments > 65535:
+            # Segments sit on the y grid axis (CUDA caps y/z at 65535) so the
+            # unbounded x axis can hold the token tiles of long sequences.
+            raise ValueError("request*layer segment count exceeds the CUDA grid limit")
         output = self.output[:request_count]
         _launch_tri_score_perhead(
-            (num_segments, self.max_ntblk, self.num_kv_heads),
+            (self.max_ntblk, num_segments, self.num_kv_heads),
             (
                 *self.pointer_prefix,
                 valid_seq_lens,

@@ -1180,9 +1180,14 @@ class _FixedScoreStagingBuffers:
         self._phase_args = (*phase_pointer_args, *phase_constants)
         self._score_args = (*score_pointer_args, *score_geometry, *score_constants)
         phase_grid = (self.max_requests, 1, 1)
+        score_segments = self.max_requests * group.num_layers
+        if score_segments > 65535:
+            # Segments sit on the y grid axis (CUDA caps y/z at 65535) so the
+            # unbounded x axis can hold the token tiles of long sequences.
+            raise ValueError("request*layer segment count exceeds the CUDA grid limit")
         score_grid = (
-            self.max_requests * group.num_layers,
             group.max_ntblk,
+            score_segments,
             group.num_kv_heads,
         )
         with torch.cuda.device(self.device):
