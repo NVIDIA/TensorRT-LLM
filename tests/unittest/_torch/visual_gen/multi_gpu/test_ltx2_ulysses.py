@@ -513,6 +513,60 @@ if __name__ == "__main__":
     pytest.main([__file__, "-v"])
 
 
+def _logic_ltx2_full_audio_construction(rank, world_size, backend, audio_seq_len):
+    """Legacy FULL mode at ulysses>1: audio_attn1 is CONSTRUCTED as ulysses (env
+    constant is the only selector) and, given stage-2 groups under cfg2, gets
+    its own distinct {default, stage2} stack pair like attn1/v2a."""
+    import tensorrt_llm._torch.visual_gen.models.ltx2.transformer_ltx2 as tl
+    from tensorrt_llm._torch.visual_gen.models.ltx2.transformer_ltx2 import LTXModel, LTXModelType
+
+    device = torch.device(f"cuda:{rank}")
+    dtype = torch.bfloat16
+
+    orig = tl._LTX2_AUDIO_CONDITIONAL_SHARD
+    tl._LTX2_AUDIO_CONDITIONAL_SHARD = False
+    try:
+        torch.manual_seed(123)
+        d_cfg = _make_model_config_cfg(cfg_size=2, ulysses_size=world_size // 2, backend=backend)
+        s2 = _build_stage2_groups_for_test(d_cfg.visual_gen_mapping)
+        model = (
+            LTXModel(
+                model_type=LTXModelType.AudioVideo,
+                model_config=d_cfg,
+                stage2_groups=s2,
+                **_AV_CONFIG,
+            )
+            .to(device, dtype=dtype)
+            .eval()
+        )
+        _init_all_weights(model)
+        model.configure_audio_ulysses(audio_seq_len)
+        blk = model.transformer_blocks[0]
+        assert blk.audio_attn1.is_ulysses, "FULL mode must construct ulysses audio_attn1"
+        assert blk.audio_attn1._attn_stage2 is not blk.audio_attn1._attn_default, (
+            "FULL audio_attn1 must get a distinct stage-2 stack under cfg2"
+        )
+        # Both topologies forward without error (audio sharded across the active group).
+        video, audio, v_ctx, a_ctx, v_pos, a_pos = _build_inputs(
+            1, 16, (1, 4, 4), audio_seq_len, dtype, device
+        )
+        for is_stage2 in (False, True, False):
+            model.set_ulysses_topology(is_stage2=is_stage2)
+            cache = model.prepare_text_cache(
+                video_context=v_ctx,
+                video_positions=v_pos,
+                audio_context=a_ctx,
+                audio_positions=a_pos,
+                dtype=dtype,
+            )
+            video_i, audio_i, *_ = _build_inputs(1, 16, (1, 4, 4), audio_seq_len, dtype, device)
+            with torch.no_grad():
+                v, a = model(video=video_i, audio=audio_i, text_cache=cache)
+            assert v.shape[1] == 16 and a.shape[1] == audio_seq_len
+    finally:
+        tl._LTX2_AUDIO_CONDITIONAL_SHARD = orig
+
+
 class TestLTX2TopologySwitch:
     """{default, stage2} dual-topology switch on 4 GPUs (cfg2 x u2 -> u4):
     pointer alternation, shard/gather round-trip, and whole-dataflow numerical
@@ -521,3 +575,6 @@ class TestLTX2TopologySwitch:
     @pytest.mark.parametrize("audio_seq_len", [64, 62], ids=["no_pad", "pad2"])
     def test_dual_topology_alternation_matches_reference(self, audio_seq_len):
         run_test_in_distributed(4, _logic_ltx2_dual_topology, "VANILLA", audio_seq_len)
+
+    def test_full_audio_mode_construction_and_switch(self):
+        run_test_in_distributed(4, _logic_ltx2_full_audio_construction, "VANILLA", 64)
