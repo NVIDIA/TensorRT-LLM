@@ -362,7 +362,6 @@ class TestExplicitTeaCacheCoefficientsRequired:
             ):
                 with patch.object(TeaCacheBackend, "enable"):
                     LTX2Pipeline.post_load_weights(pipe)
-                    # The loader enables cache acceleration after torch.compile.
                     BasePipeline._setup_cache_acceleration(pipe)
         assert pipe.cache_accelerator is not None
 
@@ -451,7 +450,6 @@ class TestExplicitTeaCacheCoefficientsRequired:
                 ) as TB:
                     TB.side_effect = [backend_a, backend_b]
                     WanPipeline.post_load_weights(pipe)
-                    # The loader enables cache acceleration after torch.compile.
                     BasePipeline._setup_cache_acceleration(pipe)
         assert TB.call_count == 2
         assert mock_enable.call_count == 2
@@ -484,7 +482,6 @@ class TestExplicitTeaCacheCoefficientsRequired:
                 ) as TB:
                     TB.return_value = MagicMock()
                     WanPipeline.post_load_weights(pipe)
-                    # The loader enables cache acceleration after torch.compile.
                     BasePipeline._setup_cache_acceleration(pipe)
 
         assert TB.call_count == 2
@@ -521,7 +518,6 @@ class TestExplicitTeaCacheCoefficientsRequired:
                 ) as TB:
                     TB.return_value = MagicMock()
                     WanImageToVideoPipeline.post_load_weights(pipe)
-                    # The loader enables cache acceleration after torch.compile.
                     BasePipeline._setup_cache_acceleration(pipe)
 
         assert TB.call_count == 2
