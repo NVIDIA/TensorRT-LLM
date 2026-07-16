@@ -342,15 +342,13 @@ class WanImageToVideoPipeline(BasePipeline):
 
             if not self.is_wan22_14b:
                 self._apply_teacache_coefficients(WAN_I2V_TEACACHE_COEFFICIENTS)
-                self._setup_cache_acceleration()
-            else:
-                if self.pipeline_config.cache_backend == "cache_dit":
-                    self._setup_cache_acceleration()
 
         if self.transformer_2 is not None:
             if hasattr(self.transformer_2, "post_load_weights"):
                 self.transformer_2.post_load_weights()
 
+        # Wan 2.2 TeaCache validation; cache acceleration itself is enabled by
+        # the loader after torch.compile (see PipelineLoader.load).
         if (
             self.transformer is not None
             and self.transformer_2 is not None
@@ -363,7 +361,6 @@ class WanImageToVideoPipeline(BasePipeline):
                     "teacache.coefficients_2 (high-noise and low-noise stage polynomials). "
                     "There is no built-in coefficient table for Wan 2.2."
                 )
-            self._setup_cache_acceleration()
 
     def _run_warmup(self, height: int, width: int, num_frames: int, steps: int) -> None:
         dummy_image = PIL.Image.new("RGB", (width, height))
