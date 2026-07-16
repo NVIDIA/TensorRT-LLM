@@ -1299,10 +1299,16 @@ class TestLTX2TwoStageLoRAHelpers:
         with pytest.raises(RuntimeError, match="does not match"):
             wrapped(x)
 
+        # A key without the topology element is refused outright.
+        with pytest.raises(RuntimeError, match="missing the ltx2_two_stage_topology"):
+            runner._check_topology((("arg0", (2, 8)),))
+
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_two_stage_warmup_precaptures_both_topologies(self):
-        """A warmup pass crossing the stage boundary leaves one captured graph
-        per topology; a same-shape real request replays with zero new captures."""
+        """Runner coverage: a pass crossing the stage boundary leaves one
+        captured graph per topology and a same-shape repeat replays with zero
+        new captures. The production warmup path is covered separately by
+        test_run_warmup_precaptures_both_topologies."""
 
         class TinyTransformer:
             def __init__(self):
@@ -1341,6 +1347,55 @@ class TestLTX2TwoStageLoRAHelpers:
         runner.capture = lambda *a, **k: (captures.append(a), original_capture(*a, **k))
         run_stage("default")
         run_stage("stage2")
+        assert not captures, "post-warmup request re-captured a graph"
+        assert len(runner.graphs) == 2
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_run_warmup_precaptures_both_topologies(self):
+        """The production warmup entrypoint (_run_warmup) pre-captures one
+        graph per topology; a repeat warmup-shaped request performs zero new
+        captures. forward is stubbed to model the two-stage boundary, but the
+        driver is the real inherited _run_warmup."""
+
+        class TinyTransformer:
+            def __init__(self):
+                self.lin = torch.nn.Linear(8, 8, device="cuda")
+                self.active_topology = "default"
+                self.device = "cuda"
+
+            def forward(self, x):
+                return self.lin(x)
+
+        pipeline = object.__new__(ltx2_two_stages.LTX2TwoStagesPipeline)
+        pipeline.pipeline_config = DiffusionPipelineConfig(
+            cuda_graph=CudaGraphConfig(enable=True),
+            torch_compile=TorchCompileConfig(enable=False),
+        )
+        pipeline.transformer = TinyTransformer()
+        pipeline._cuda_graph_runners = {}
+        pipeline._setup_cuda_graphs()
+        runner = pipeline._cuda_graph_runners["transformer"]
+
+        x = torch.randn(2, 8, device="cuda")
+
+        def fake_forward(*args, **kwargs):
+            for topology in ("default", "stage2"):
+                pipeline._stage2_topology_state = topology
+                pipeline.transformer.active_topology = topology
+                pipeline.transformer.forward(x)
+
+        pipeline.forward = fake_forward
+
+        ltx2_two_stages.LTX2TwoStagesPipeline._run_warmup(pipeline, 512, 768, 121, 2)
+        assert sorted(key[-1] for key in runner.graphs) == [
+            ("ltx2_two_stage_topology", "default"),
+            ("ltx2_two_stage_topology", "stage2"),
+        ]
+
+        captures = []
+        original_capture = runner.capture
+        runner.capture = lambda *a, **k: (captures.append(a), original_capture(*a, **k))
+        ltx2_two_stages.LTX2TwoStagesPipeline._run_warmup(pipeline, 512, 768, 121, 2)
         assert not captures, "post-warmup request re-captured a graph"
         assert len(runner.graphs) == 2
 

@@ -968,6 +968,7 @@ class _LTX2TwoStageCUDAGraphRunner(_LTX2CUDAGraphRunner):
                         "restored after it on exit."
                     )
                 return
+        raise RuntimeError("CUDA graph key is missing the ltx2_two_stage_topology element")
 
     def capture(self, key, fn, args, kwargs) -> None:
         self._check_topology(key)
