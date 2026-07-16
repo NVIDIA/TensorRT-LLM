@@ -44,6 +44,7 @@ import uvicorn
 
 from tensorrt_llm.llmapi.disagg_utils import (
     CtxGenServerConfig,
+    DisaggClusterConfig,
     DisaggServerConfig,
     RouterConfig,
     ServerRole,
@@ -301,6 +302,75 @@ def test_coordinator_client_configures_empty_delegating_kv_router():
     assert set(routing_key["block_hashes_by_algo"]) == {KV_CACHE_HASH_ALGO_V2}
     assert routing_key["num_tokens"] == 3
     assert "token_lists" not in routing_key
+
+
+@pytest.mark.asyncio
+async def test_coordinator_client_readiness_is_cached():
+    config = _make_config([], [], "round_robin", "round_robin")
+    client = CoordinatorClient("http://coordinator", config)
+    client._is_ready = True
+
+    assert await client.is_ready() is True
+    assert client._session is None
+    await client.stop()
+
+
+@pytest.mark.asyncio
+async def test_coordinator_state_sync_starts_in_background():
+    config = _make_config([], [], "round_robin", "round_robin")
+    client = CoordinatorClient("http://coordinator", config)
+    client._state_sync_interval_s = 10
+    client._await_coordinator = AsyncMock(
+        return_value={
+            "is_ready": True,
+            "server_lists": {"context": [], "generation": []},
+        }
+    )
+    client._sync_coordinator_state = AsyncMock()
+
+    await client.start()
+
+    assert client._is_ready is True
+    client._sync_coordinator_state.assert_called_once_with(10)
+    await client.stop()
+
+
+def test_service_discovery_sets_coordinator_state_sync_interval():
+    config = _make_config([], [], "round_robin", "round_robin")
+    config.disagg_cluster_config = DisaggClusterConfig(
+        cluster_uri="http://cluster-storage",
+        heartbeat_interval_sec=7,
+    )
+
+    client = CoordinatorClient("http://coordinator", config)
+
+    assert client._state_sync_interval_s == 7
+
+
+@pytest.mark.asyncio
+async def test_cluster_info_updates_readiness_and_stateless_servers():
+    config = _make_config(["ctx-old:8001"], [], "round_robin", "round_robin")
+    client = CoordinatorClient("http://coordinator", config)
+    client.ctx_router.remove_server = AsyncMock(wraps=client.ctx_router.remove_server)
+    client.ctx_router.add_server = AsyncMock(wraps=client.ctx_router.add_server)
+    client.ctx_router.prepare_servers = AsyncMock()
+
+    await client._apply_cluster_info(
+        {
+            "is_ready": True,
+            "server_lists": {
+                "context": ["ctx-new:8001"],
+                "generation": [],
+            },
+        }
+    )
+
+    assert await client.is_ready() is True
+    assert client.ctx_router.servers == ["ctx-new:8001"]
+    client.ctx_router.remove_server.assert_awaited_once_with("ctx-old:8001")
+    client.ctx_router.add_server.assert_awaited_once_with("ctx-new:8001")
+    client.ctx_router.prepare_servers.assert_awaited_once()
+    await client.stop()
 
 
 def test_content_affinity_key_uses_fixed_seed():

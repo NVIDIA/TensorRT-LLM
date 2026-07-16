@@ -77,6 +77,7 @@ __all__ = [
 
 COORDINATOR_RESERVATION_TIMEOUT_ENV = "TRTLLM_DISAGG_COORDINATOR_RESERVATION_TIMEOUT"
 COORDINATOR_RESERVATION_TIMEOUT_DEFAULT_S = 180.0
+COORDINATOR_STATE_SYNC_INTERVAL_S = 3.0
 
 
 def coordinator_reservation_timeout() -> float:
@@ -433,8 +434,8 @@ class CoordinatorClient(DisaggCoordinator):
     so the worker computes the small routing key locally and the coordinator makes
     the placement (placement -> ``/select``, finish -> ``/finish``). A *stateless*
     router (round_robin, load_balancing) is used as-is and places locally in the
-    worker -- no coordinator round-trip. Readiness / cluster_info always proxy the
-    coordinator over HTTP.
+    worker -- no coordinator round-trip. A background ``/cluster_info`` poll keeps
+    readiness and stateless-router server lists synchronized with the coordinator.
 
     Args:
         remote_url: Coordinator base URL (e.g. ``http://host:PORT``).
@@ -459,6 +460,14 @@ class CoordinatorClient(DisaggCoordinator):
         self._request_timeout_s = request_timeout_s
         self._startup_timeout_s = startup_timeout_s
         self._session: Optional[aiohttp.ClientSession] = None
+        self._sync_task: Optional[asyncio.Task] = None
+        self._is_ready = False
+        if config.disagg_cluster_config is not None:
+            self._state_sync_interval_s = config.disagg_cluster_config.heartbeat_interval_sec
+        elif metadata_config is not None:
+            self._state_sync_interval_s = metadata_config.refresh_interval
+        else:
+            self._state_sync_interval_s = COORDINATOR_STATE_SYNC_INTERVAL_S
         # Local disagg-id generation (no HTTP hop): (node_id, per-worker process_id)
         # keeps the snowflake unique across co-located workers.
         self._node_id = config.node_id
@@ -508,8 +517,21 @@ class CoordinatorClient(DisaggCoordinator):
         # Fail fast: probe /cluster_info with bounded retry so a delegating server
         # exits non-zero if its coordinator never comes up (vs 500-ing every req).
         info = await self._await_coordinator()
-        self._sync_delegating_router_configs(info)
-        await self._sync_stateless_routers(info)
+        await self._apply_cluster_info(info)
+        self._sync_task = asyncio.create_task(
+            self._sync_coordinator_state(self._state_sync_interval_s)
+        )
+
+    async def _sync_coordinator_state(self, interval_s: float) -> None:
+        while True:
+            try:
+                await asyncio.sleep(interval_s)
+                await self._apply_cluster_info(await self.cluster_info())
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:  # noqa: BLE001
+                self._is_ready = False
+                logger.warning(f"CoordinatorClient state sync failed: {error}")
 
     async def _await_coordinator(self) -> Dict[str, Any]:
         """Poll the coordinator's /cluster_info until reachable, or raise.
@@ -556,19 +578,12 @@ class CoordinatorClient(DisaggCoordinator):
         return get_global_disagg_request_id(self._node_id, self._process_id)
 
     async def is_ready(self) -> bool:
-        try:
-            async with self.session.get(
-                f"{self._remote_url}/health", timeout=self._request_timeout_s
-            ) as resp:
-                if resp.status != 200:
-                    return False
-            info = await self.cluster_info()
-            self._sync_delegating_router_configs(info)
-            await self._sync_stateless_routers(info)
-            return info.get("is_ready", False)
-        except Exception as e:  # noqa: BLE001
-            logger.warning(f"CoordinatorClient health check failed: {e}")
-            return False
+        return self._is_ready
+
+    async def _apply_cluster_info(self, info: Dict[str, Any]) -> None:
+        self._is_ready = info.get("is_ready", False)
+        self._sync_delegating_router_configs(info)
+        await self._sync_stateless_routers(info)
 
     def _sync_delegating_router_configs(self, info: Dict[str, Any]) -> None:
         configs = info.get("routing_key_configs", {})
@@ -628,6 +643,10 @@ class CoordinatorClient(DisaggCoordinator):
             return await resp.read(), resp.status, resp.headers.get("Content-Type")
 
     async def stop(self) -> None:
+        if self._sync_task is not None:
+            self._sync_task.cancel()
+            await asyncio.gather(self._sync_task, return_exceptions=True)
+            self._sync_task = None
         if self._session is not None:
             await self._session.close()
             self._session = None
