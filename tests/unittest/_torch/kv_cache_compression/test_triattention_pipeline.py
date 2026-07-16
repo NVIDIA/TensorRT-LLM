@@ -49,10 +49,7 @@ from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import (
 from tensorrt_llm._torch.pyexecutor._util import create_kv_cache_compression_manager
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import Role
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
-from tensorrt_llm.llmapi.llm_args import (
-    KvCacheCompressionConfig,
-    TriAttentionKvCacheCompressionConfig,
-)
+from tensorrt_llm.llmapi.llm_args import TriAttentionKvCacheCompressionConfig
 
 _TORCH_TOPK_ORACLE = torch.topk
 
@@ -349,7 +346,11 @@ class TestKvCacheCompressionConfig:
 
         tri_args = TorchLlmArgs(
             model="dummy",
-            kv_cache_compression_config={"algorithm": "triattention"},
+            kv_cache_compression_config={
+                "algorithm": "triattention",
+                "model_path": "/models/test",
+                "calibration_path": "/calib/test.pt",
+            },
         )
         assert isinstance(
             tri_args.kv_cache_compression_config,
@@ -358,11 +359,13 @@ class TestKvCacheCompressionConfig:
         assert tri_args.kv_cache_compression_config.top_B == 2048
         assert tri_args.kv_cache_compression_config.beta == 128
 
-        unknown_args = TorchLlmArgs(
-            model="dummy",
-            kv_cache_compression_config={"algorithm": "future_method"},
-        )
-        assert type(unknown_args.kv_cache_compression_config) is KvCacheCompressionConfig
+        # The union dispatches on the algorithm tag, so an unknown algorithm
+        # fails config validation instead of falling back to a base config.
+        with pytest.raises(ValidationError):
+            TorchLlmArgs(
+                model="dummy",
+                kv_cache_compression_config={"algorithm": "future_method"},
+            )
 
     def test_eviction_mode_validated(self):
         with pytest.raises(ValidationError):
@@ -900,7 +903,8 @@ class TestStepEndHookRefactor:
             TriAttentionKvCacheCompressionConfig,
         )
 
-        config = TriAttentionKvCacheCompressionConfig(model_path="/models/test", top_B=8)
+        config = TriAttentionKvCacheCompressionConfig(
+            model_path="/models/test", calibration_path="/calib/test.pt", top_B=8)
         assert config.kv_cache_compression_mode.is_eviction_method() is True
         draft_manager = _make_fake_v2(is_draft=True)
         validate_kv_cache_compression_with_spec(
@@ -931,7 +935,8 @@ class TestStepEndHookRefactor:
 
         with pytest.raises(ValueError, match="standard paged cache compacted together"):
             validate_kv_cache_compression_with_spec(
-                TriAttentionKvCacheCompressionConfig(model_path="/models/test", top_B=8),
+                TriAttentionKvCacheCompressionConfig(
+            model_path="/models/test", calibration_path="/calib/test.pt", top_B=8),
                 spec_config,
                 _make_fake_v2(is_draft=True),
             )
@@ -948,7 +953,8 @@ class TestStepEndHookRefactor:
 
         with pytest.raises(ValueError, match="standard paged cache compacted together"):
             validate_kv_cache_compression_with_spec(
-                TriAttentionKvCacheCompressionConfig(model_path="/models/test", top_B=8),
+                TriAttentionKvCacheCompressionConfig(
+            model_path="/models/test", calibration_path="/calib/test.pt", top_B=8),
                 DFlashDecodingConfig(max_draft_len=3),
                 _make_fake_v2(is_draft=True),
             )
@@ -1851,7 +1857,8 @@ class TestFactory:
         # Calibration is deferred to the first request, so construction needs
         # no calibration file or CUDA.
         fake_v2 = _make_fake_v2(enable_block_reuse=False)
-        cfg = TriAttentionKvCacheCompressionConfig(top_B=32, beta=16, model_path="/models/test")
+        cfg = TriAttentionKvCacheCompressionConfig(
+            top_B=32, beta=16, model_path="/models/test", calibration_path="/calib/test.pt")
         mgr = create_kv_cache_compression_manager(cfg, kv_cache_manager=fake_v2)
         assert isinstance(mgr, TriAttention)
         assert mgr.top_B == 32
@@ -1864,6 +1871,7 @@ class TestFactory:
             beta=8,
             eviction_mode="per_head",
             model_path="/models/test",
+            calibration_path="/calib/test.pt",
         )
         mgr = create_kv_cache_compression_manager(
             cfg, kv_cache_manager=_make_fake_v2(enable_block_reuse=False)

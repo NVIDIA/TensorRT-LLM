@@ -28,7 +28,6 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from tensorrt_llm._torch.pyexecutor import _util as util_mod
 from tensorrt_llm._torch.pyexecutor._util import create_kv_cache_compression_manager
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
     BaseKVCacheCompressionManager,
@@ -265,40 +264,34 @@ class TestResourceManagerAPI:
 
 
 class TestFactory:
-    def test_returns_none_when_no_algorithm_registered(self, fake_kv_cache_manager):
-        # Framework-only: no concrete algorithm ships, so any config -> None.
+    def test_raises_when_no_algorithm_registered(self, fake_kv_cache_manager):
+        # A config whose algorithm has no registered manager is a developer
+        # error (config subclass added without a factory branch): fail loudly
+        # instead of silently running without compression.
         cfg = MagicMock()
         cfg.algorithm = "made_up_method"
-        assert create_kv_cache_compression_manager(cfg, fake_kv_cache_manager) is None
-
-    def test_warns_for_unregistered_algorithm(self, fake_kv_cache_manager):
-        cfg = MagicMock()
-        cfg.algorithm = "made_up_method"
-        with patch.object(util_mod, "logger") as mock_logger:
+        with pytest.raises(ValueError, match="no registered compression manager"):
             create_kv_cache_compression_manager(cfg, fake_kv_cache_manager)
-            mock_logger.warning.assert_called_once()
 
-    def test_factory_accepts_independent_draft_manager(self):
+    def test_unregistered_algorithm_raises_with_draft_manager_too(self):
         cfg = MagicMock()
         cfg.algorithm = "made_up_method"
         target = _v2_manager(is_draft=False)
         draft = _v2_manager(is_draft=True)
 
-        assert (
+        with pytest.raises(ValueError, match="no registered compression manager"):
             create_kv_cache_compression_manager(
                 cfg,
                 target,
                 draft_kv_cache_manager=draft,
             )
-            is None
-        )
 
     def test_eviction_method_predicate_defaults_false(self):
         # Non-evicting methods (e.g. offloading) are never restricted by the
         # speculative mode: the call-site gate reads this config predicate.
-        from tensorrt_llm.llmapi.llm_args import KvCacheCompressionConfig
+        from tensorrt_llm.llmapi.llm_args import BaseKvCacheCompressionConfig
 
-        config = KvCacheCompressionConfig(algorithm="offload")
+        config = BaseKvCacheCompressionConfig(algorithm="offload")
         assert config.kv_cache_compression_mode.is_eviction_method() is False
         m = BaseKVCacheCompressionManager(_v2_manager(is_draft=False))
         assert not hasattr(m, "spec_config")
@@ -306,10 +299,10 @@ class TestFactory:
     def test_spec_gate_only_restricts_eviction_methods(self):
         from tensorrt_llm._torch.pyexecutor._util import validate_kv_cache_compression_with_spec
         from tensorrt_llm._torch.speculative.interface import SpeculativeDecodingMode
-        from tensorrt_llm.llmapi.llm_args import KvCacheCompressionConfig
+        from tensorrt_llm.llmapi.llm_args import BaseKvCacheCompressionConfig
 
         # Non-evicting methods pass with any speculative mode; no exception.
-        config = KvCacheCompressionConfig(algorithm="offload")
+        config = BaseKvCacheCompressionConfig(algorithm="offload")
         spec_config = SimpleNamespace(spec_dec_mode=SpeculativeDecodingMode.DFLASH)
         validate_kv_cache_compression_with_spec(config, spec_config, None)
         validate_kv_cache_compression_with_spec(config, None, None)

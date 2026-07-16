@@ -39,7 +39,8 @@ def test_plain_attention_defaults_to_fused_rope() -> None:
 
 
 def test_kv_cache_compression_forces_unfused_rope() -> None:
-    model_config = ModelConfig(kv_cache_compression_config=TriAttentionKvCacheCompressionConfig())
+    model_config = ModelConfig(kv_cache_compression_config=TriAttentionKvCacheCompressionConfig(
+        model_path="/models/test", calibration_path="/calib/test.pt"))
     attn = _make_attention(model_config)
 
     assert attn.rope_fusion is False
@@ -71,7 +72,8 @@ def test_unfused_yarn_rope_is_applied_exactly_once() -> None:
         ),
         is_neox=True,
     )
-    model_config = ModelConfig(kv_cache_compression_config=TriAttentionKvCacheCompressionConfig())
+    model_config = ModelConfig(kv_cache_compression_config=TriAttentionKvCacheCompressionConfig(
+        model_path="/models/test", calibration_path="/calib/test.pt"))
     attn = Attention(
         hidden_size=256,
         num_attention_heads=8,

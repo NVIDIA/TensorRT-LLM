@@ -331,7 +331,8 @@ def test_draft_admission_gates_raise(gate, match):
 
         with pytest.raises(ValueError, match=match):
             validate_kv_cache_compression_with_spec(
-                TriAttentionKvCacheCompressionConfig(model_path="/models/test", top_B=8),
+                TriAttentionKvCacheCompressionConfig(
+                    model_path="/models/test", calibration_path="/calib/test.pt", top_B=8),
                 DFlashDecodingConfig(max_draft_len=3),
                 draft_manager,
             )

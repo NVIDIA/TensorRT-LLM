@@ -32,7 +32,7 @@ from tensorrt_llm.llmapi.llm_args import (
     CacheTransceiverConfig, CapacitySchedulerPolicy, EagleDecodingConfig,
     KvCacheCompressionConfig, KvCacheConfig, MTPDecodingConfig, PeftCacheConfig,
     SamplerType, SchedulerConfig, SparseAttentionConfig, SpeculativeConfig,
-    TorchLlmArgs, TriAttentionKvCacheCompressionConfig, WaitingQueuePolicy)
+    TorchLlmArgs, WaitingQueuePolicy)
 # isort: on
 from tensorrt_llm.logger import logger
 from tensorrt_llm.lora_helper import (LoraConfig,
@@ -2077,42 +2077,27 @@ def create_kv_cache_compression_manager(
     config: KvCacheCompressionConfig,
     kv_cache_manager: KVCacheManagerV2,
     draft_kv_cache_manager: Optional[KVCacheManagerV2] = None,
-) -> Optional[BaseKVCacheCompressionManager]:
-    """Build the KV-cache compression manager for ``config.algorithm``, or return
-    None if no algorithm matches.
+) -> BaseKVCacheCompressionManager:
+    """Build the KV-cache compression manager for ``config.algorithm``.
 
     Called from ``create_py_executor`` and registered as a resource manager,
     like the KV cache manager itself. Concrete algorithms add a dispatch branch
-    here; the framework ships none. Speculative-decoding compatibility is
-    checked by the caller via ``validate_kv_cache_compression_with_spec``.
+    here. Speculative-decoding compatibility is checked by the caller via
+    ``validate_kv_cache_compression_with_spec``.
     """
     if config.algorithm == "triattention":
         from tensorrt_llm._torch.kv_cache_compression.triattention import \
             TriAttention
 
-        triattention_config = (
-            config if isinstance(config, TriAttentionKvCacheCompressionConfig)
-            else TriAttentionKvCacheCompressionConfig.model_validate(
-                config.model_dump()))
         return TriAttention(
             kv_cache_manager,
             draft_kv_cache_manager=draft_kv_cache_manager,
-            top_B=triattention_config.top_B,
-            beta=triattention_config.beta,
-            model_path=triattention_config.model_path,
-            calibration_path=triattention_config.calibration_path,
-            eviction_mode=triattention_config.eviction_mode,
-            normalize_scores=triattention_config.normalize_scores,
-            pin_prefill=triattention_config.pin_prefill,
-            count_prompt_tokens=triattention_config.count_prompt_tokens,
+            **config.to_manager_kwargs(),
         )
 
-    logger.warning(
-        "KV-cache compression algorithm '%s' is not registered; running without "
-        "a compression manager.",
-        config.algorithm,
-    )
-    return None
+    raise ValueError(
+        f"KV-cache compression algorithm {config.algorithm!r} has a config but "
+        "no registered compression manager.")
 
 
 def create_py_executor_instance(
@@ -2329,9 +2314,8 @@ def create_py_executor_instance(
             kv_cache_manager,
             draft_kv_cache_manager=draft_kv_cache_manager,
         )
-        if compression_manager is not None:
-            resources[ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER] = (
-                compression_manager)
+        resources[ResourceManagerType.KV_CACHE_COMPRESSION_MANAGER] = (
+            compression_manager)
 
     resource_manager = ResourceManager(resources)
 

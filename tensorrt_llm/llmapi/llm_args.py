@@ -3253,7 +3253,7 @@ SparseAttentionConfig: TypeAlias = Annotated[
 ]
 
 
-class KvCacheCompressionConfig(StrictBaseModel):
+class BaseKvCacheCompressionConfig(StrictBaseModel):
     """Config for KV-cache compression: a compression manager runs a KV-reduction
     algorithm (e.g. periodic token eviction) alongside KVCacheManagerV2.
 
@@ -3277,7 +3277,7 @@ class KvCacheCompressionConfig(StrictBaseModel):
         return KvCacheCompressionMode.from_string(self.algorithm)
 
 
-class TriAttentionKvCacheCompressionConfig(KvCacheCompressionConfig):
+class TriAttentionKvCacheCompressionConfig(BaseKvCacheCompressionConfig):
     """KV-cache compression config for TriAttention.
 
     TriAttention periodically evicts cached tokens during generation, guided by
@@ -3312,10 +3312,12 @@ class TriAttentionKvCacheCompressionConfig(KvCacheCompressionConfig):
         "tokens compete for the budget (upstream behaviour).")
     top_B: int = Field(
         default=2048,
+        gt=0,
         description="Tokens kept at each periodic eviction (upstream `budget`; "
         "prompt tokens are always preserved on top).")
     beta: int = Field(
         default=128,
+        gt=0,
         description="Eviction period in confirmed generation tokens (upstream "
         "`divide_length`): one speculative iteration may advance the counter "
         "by multiple accepted tokens; at most one eviction is coalesced per update."
@@ -3331,21 +3333,40 @@ class TriAttentionKvCacheCompressionConfig(KvCacheCompressionConfig):
         "(produced by github.com/WeianMao/triattention). TRT-LLM does not "
         "compute calibration; it converts this file to the runtime schema at "
         "load.")
-    window_size: int = Field(
-        default=128,
-        description="Compatibility field retained for existing configs. The "
-        "implemented calibration-based selection does not use a separate "
-        "recency window.")
     count_prompt_tokens: bool = Field(
         default=False,
         description="If False (default), the KV budget counts only DECODE tokens "
         "(the pinned prompt is kept on top). Physical capacity reclaim currently "
         "requires False.")
 
+    @model_validator(mode="after")
+    def _require_calibration_inputs(self):
+        # Both paths are consumed at manager construction; failing here surfaces
+        # the error at config-validation time instead of deep in executor setup.
+        if not self.model_path or not self.calibration_path:
+            raise ValueError(
+                "TriAttention requires both model_path and calibration_path; "
+                "TRT-LLM consumes an official calibration file and does not "
+                "compute one.")
+        return self
 
-KvCacheCompressionConfigType: TypeAlias = Union[
-    TriAttentionKvCacheCompressionConfig,
-    KvCacheCompressionConfig,
+    def to_manager_kwargs(self) -> dict:
+        """Constructor kwargs for the TriAttention manager."""
+        return {
+            "top_B": self.top_B,
+            "beta": self.beta,
+            "model_path": self.model_path,
+            "calibration_path": self.calibration_path,
+            "eviction_mode": self.eviction_mode,
+            "normalize_scores": self.normalize_scores,
+            "pin_prefill": self.pin_prefill,
+            "count_prompt_tokens": self.count_prompt_tokens,
+        }
+
+
+KvCacheCompressionConfig: TypeAlias = Annotated[
+    Union[TriAttentionKvCacheCompressionConfig],
+    Field(discriminator="algorithm"),
 ]
 
 
@@ -4067,7 +4088,7 @@ class BaseLlmArgs(StrictBaseModel):
 
     # KV cache compression config (separate from sparse attention: changes which
     # KV is stored, not the attention computation)
-    kv_cache_compression_config: Optional[KvCacheCompressionConfigType] = Field(
+    kv_cache_compression_config: Optional[KvCacheCompressionConfig] = Field(
         default=None,
         description="KV-cache compression config; None disables compression.",
         status="prototype")

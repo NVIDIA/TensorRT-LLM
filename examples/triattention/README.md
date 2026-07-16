@@ -116,13 +116,11 @@ trtllm-eval --model <path_to_model> --config config.yaml longbench_v2 --max_outp
 
 * **`top_B`** (int, default=1024): Tokens kept at each eviction (the upstream `budget`). Prompt tokens are always preserved on top of this. Smaller `top_B` → more compression.
 * **`beta`** (int, default=128): Eviction period, in confirmed generation tokens (the upstream `divide_length`). Speculative acceptance advances the counter by `1 + accepted_draft_tokens`; at most one eviction is coalesced per final update.
-* **`eviction_mode`** (str, default=`per_layer`): Which token set each eviction keeps.
-    * `per_layer`: score a layer, average over heads, keep one set per layer (the simplest variant).
-    * `per_head`: each KV head keeps its own set, shared across layers (mean of per-layer maxima). The upstream AIME default.
+* **`eviction_mode`** (str, default=`union`): Which token set each eviction keeps.
+    * `union`: union of each KV head's top-B, re-ranked by the per-token max score. Matches the official base setting.
+    * `per_head`: each KV head keeps its own set, shared across layers (mean of per-layer maxima).
     * `per_layer_perhead`: each head keeps its own set, fully independent per layer.
-    * `union`: union of the per-head top-k, then re-ranked.
-* **`window_size`** (int, default=128): Most-recent tokens always preserved from eviction. Prevents the scorer from evicting freshly generated tokens.
-* **`normalize_scores`** (bool, default=True): Z-normalize each head's scores over the decode region before selection (upstream default). Used by `per_head` / `per_layer_perhead` / `union`; ignored by `per_layer`.
-* **`pin_prefill`** (bool, default=True): Always preserve the prompt (prefill) tokens; only decode tokens compete for the budget (upstream behaviour). Used by `per_head` / `per_layer_perhead` / `union`; `per_layer` uses the recency window instead.
+* **`normalize_scores`** (bool, default=True): Z-normalize each head's scores over the decode region before selection (upstream default).
+* **`pin_prefill`** (bool, default=True): Always preserve the prompt (prefill) tokens; only decode tokens compete for the budget (upstream behaviour).
 * **`calibration_path`** (str): Path to the calibration `.pt` from the official tool. Required — TensorRT LLM does not compute calibration.
 * **`model_path`** (str): Checkpoint path, used only to derive the model's RoPE tables when converting the official calibration file.
