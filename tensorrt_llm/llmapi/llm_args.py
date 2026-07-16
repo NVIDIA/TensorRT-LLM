@@ -4761,6 +4761,18 @@ class TorchLlmArgs(BaseLlmArgs):
         "Only load/execute the vision encoder part of the full model. Defaults to False.",
         status="prototype")
 
+    disable_mm_encoder: bool = Field(
+        default=False,
+        description=
+        "Skip instantiating and loading the multimodal (e.g. vision) encoder "
+        "of a multimodal checkpoint and serve it text-only. Saves the "
+        "encoder's GPU memory (enlarging the KV cache pool) for workloads "
+        "that never send image/video/audio inputs; such requests are "
+        "rejected. Only takes effect for model implementations that support "
+        "it (currently the Qwen3-VL / Qwen3.5-VL family); a no-op otherwise. "
+        "Defaults to False.",
+        status="prototype")
+
     encode_only: bool = Field(
         default=False,
         description=
@@ -4931,6 +4943,11 @@ class TorchLlmArgs(BaseLlmArgs):
                 "Use encode_only=True for LLM.encode(), or use "
                 "MultimodalEncoder/mm_encoder_only for multimodal encoder "
                 "execution.")
+        if self.disable_mm_encoder and self.mm_encoder_only:
+            raise ValueError(
+                "disable_mm_encoder and mm_encoder_only are mutually "
+                "exclusive: one skips the multimodal encoder, the other runs "
+                "only the multimodal encoder.")
         return self
 
     @model_validator(mode="after")
