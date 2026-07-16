@@ -1817,6 +1817,9 @@ __global__ __launch_bounds__(BLOCK_SIZE) void updateSparseKvCacheAfterFmha(
     // The number of 16B vectors per head size in the kv cache.
     constexpr int VECS_PER_HEAD = Dh * sizeof(TCache) / 16;
     static_assert(BLOCK_SIZE % VECS_PER_HEAD == 0, "Kernel block should be able to handle entire heads.");
+    // D64 and D128 map one complete K/V vector to each x lane, so registers can
+    // preserve the read-before-write value across the in-place ordering barrier.
+    constexpr bool use_register_staging = Layered && (Dh == 64 || Dh == 128) && sizeof(TCache) == 2;
 
     int const batch_idx = blockIdx.z;
     int const kv_head_idx = blockIdx.y;
@@ -1836,6 +1839,8 @@ __global__ __launch_bounds__(BLOCK_SIZE) void updateSparseKvCacheAfterFmha(
 
     for (int token_block_offset = 0; token_block_offset < num_sparse_tokens; token_block_offset += tokens_per_block)
     {
+        uint4 key_vector;
+        uint4 value_vector;
         int const sparse_token_offset = token_block_offset + threadIdx.y;
 
         if (sparse_token_offset < num_sparse_tokens)
@@ -1858,15 +1863,27 @@ __global__ __launch_bounds__(BLOCK_SIZE) void updateSparseKvCacheAfterFmha(
             auto const src_k_block_ptr = reinterpret_cast<uint4*>(src_k_ptr);
             auto const src_v_block_ptr = reinterpret_cast<uint4*>(src_v_ptr);
 
-            for (int head_vec_idx = threadIdx.x; head_vec_idx < VECS_PER_HEAD; head_vec_idx += vecs_per_block)
+            if constexpr (use_register_staging)
             {
+                int const head_vec_idx = threadIdx.x;
                 auto const src_k_vec_idx
                     = params.kv_cache_buffer.getKVLocalIdx(src_token_idx, kv_head_idx, VECS_PER_HEAD, head_vec_idx);
                 auto const src_v_vec_idx
                     = params.kv_cache_buffer.getKVLocalIdx(src_token_idx, kv_head_idx, VECS_PER_HEAD, head_vec_idx);
-
-                k_smem[threadIdx.y * VECS_PER_HEAD + head_vec_idx] = src_k_block_ptr[src_k_vec_idx];
-                v_smem[threadIdx.y * VECS_PER_HEAD + head_vec_idx] = src_v_block_ptr[src_v_vec_idx];
+                key_vector = src_k_block_ptr[src_k_vec_idx];
+                value_vector = src_v_block_ptr[src_v_vec_idx];
+            }
+            else
+            {
+                for (int head_vec_idx = threadIdx.x; head_vec_idx < VECS_PER_HEAD; head_vec_idx += vecs_per_block)
+                {
+                    auto const src_k_vec_idx
+                        = params.kv_cache_buffer.getKVLocalIdx(src_token_idx, kv_head_idx, VECS_PER_HEAD, head_vec_idx);
+                    auto const src_v_vec_idx
+                        = params.kv_cache_buffer.getKVLocalIdx(src_token_idx, kv_head_idx, VECS_PER_HEAD, head_vec_idx);
+                    k_smem[threadIdx.y * VECS_PER_HEAD + head_vec_idx] = src_k_block_ptr[src_k_vec_idx];
+                    v_smem[threadIdx.y * VECS_PER_HEAD + head_vec_idx] = src_v_block_ptr[src_v_vec_idx];
+                }
             }
         }
         __syncthreads();
@@ -1896,14 +1913,27 @@ __global__ __launch_bounds__(BLOCK_SIZE) void updateSparseKvCacheAfterFmha(
                 auto const dst_k_block_ptr = reinterpret_cast<uint4*>(dst_k_ptr);
                 auto const dst_v_block_ptr = reinterpret_cast<uint4*>(dst_v_ptr);
 
-                for (int head_vec_idx = threadIdx.x; head_vec_idx < VECS_PER_HEAD; head_vec_idx += vecs_per_block)
+                if constexpr (use_register_staging)
                 {
+                    int const head_vec_idx = threadIdx.x;
                     auto const dst_k_vec_idx
                         = params.kv_cache_buffer.getKVLocalIdx(dst_token_idx, kv_head_idx, VECS_PER_HEAD, head_vec_idx);
                     auto const dst_v_vec_idx
                         = params.kv_cache_buffer.getKVLocalIdx(dst_token_idx, kv_head_idx, VECS_PER_HEAD, head_vec_idx);
-                    dst_k_block_ptr[dst_k_vec_idx] = k_smem[threadIdx.y * VECS_PER_HEAD + head_vec_idx];
-                    dst_v_block_ptr[dst_v_vec_idx] = v_smem[threadIdx.y * VECS_PER_HEAD + head_vec_idx];
+                    dst_k_block_ptr[dst_k_vec_idx] = key_vector;
+                    dst_v_block_ptr[dst_v_vec_idx] = value_vector;
+                }
+                else
+                {
+                    for (int head_vec_idx = threadIdx.x; head_vec_idx < VECS_PER_HEAD; head_vec_idx += vecs_per_block)
+                    {
+                        auto const dst_k_vec_idx = params.kv_cache_buffer.getKVLocalIdx(
+                            dst_token_idx, kv_head_idx, VECS_PER_HEAD, head_vec_idx);
+                        auto const dst_v_vec_idx = params.kv_cache_buffer.getKVLocalIdx(
+                            dst_token_idx, kv_head_idx, VECS_PER_HEAD, head_vec_idx);
+                        dst_k_block_ptr[dst_k_vec_idx] = k_smem[threadIdx.y * VECS_PER_HEAD + head_vec_idx];
+                        dst_v_block_ptr[dst_v_vec_idx] = v_smem[threadIdx.y * VECS_PER_HEAD + head_vec_idx];
+                    }
                 }
             }
         }
@@ -1960,15 +1990,15 @@ void launchSparseKvCacheCompactV2Layers(
     constexpr int32_t kVectorsPerHead = HeadDim * sizeof(T) / 16;
     constexpr int32_t kDefaultSharedMemoryBytes = 48 * 1024;
     constexpr int32_t kSharedBytesPerToken = 2 * kVectorsPerHead * sizeof(uint4);
-    constexpr bool kUseD64VectorThreads = HeadDim == 64 && sizeof(T) == 2;
-    constexpr int32_t kVectorThreads = kUseD64VectorThreads ? kVectorsPerHead : 32;
+    constexpr bool kUseRegisterStaging = (HeadDim == 64 || HeadDim == 128) && sizeof(T) == 2;
+    constexpr int32_t kVectorThreads = kUseRegisterStaging ? kVectorsPerHead : 32;
     constexpr int32_t kTokensPerTile
-        = kUseD64VectorThreads ? 32 : (kSharedBytesPerToken * 32 <= kDefaultSharedMemoryBytes ? 32 : 16);
+        = kUseRegisterStaging ? 16 : (kSharedBytesPerToken * 32 <= kDefaultSharedMemoryBytes ? 32 : 16);
     constexpr int32_t kBlockSize = kVectorThreads * kTokensPerTile;
     static_assert(kSharedBytesPerToken * kTokensPerTile <= kDefaultSharedMemoryBytes);
     dim3 const block(kVectorThreads, kTokensPerTile);
     dim3 const grid(numLayers, params.kv_head_num, params.batch_size);
-    size_t const sharedBytes = 2 * block.y * kVectorsPerHead * sizeof(uint4);
+    size_t const sharedBytes = kUseRegisterStaging ? 0 : 2 * block.y * kVectorsPerHead * sizeof(uint4);
     updateSparseKvCacheAfterFmha<T, T, kBlockSize, HeadDim, KvCacheV2LayersBuffer, true>
         <<<grid, block, sharedBytes, stream>>>(params);
 }

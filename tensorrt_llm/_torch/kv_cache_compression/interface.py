@@ -13,12 +13,15 @@ class KvCacheCompressionMode(IntEnum):
     comparing strings.
     """
 
+    TRIATTENTION = auto()
     NONE = auto()
 
+    def is_triattention(self):
+        return self == KvCacheCompressionMode.TRIATTENTION
+
     def is_eviction_method(self):
-        """Whether this method physically evicts cached tokens. Evicting
-        algorithms add their member and extend this predicate."""
-        return False
+        """Whether this method physically evicts cached tokens."""
+        return self == KvCacheCompressionMode.TRIATTENTION
 
     @staticmethod
     def from_string(name: Optional[str]) -> "KvCacheCompressionMode":

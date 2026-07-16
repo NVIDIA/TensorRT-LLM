@@ -389,7 +389,97 @@ class _RuntimeKVLayout(NamedTuple):
     pool_view_fingerprint: Tuple[tuple, ...]
 
 
-class _BatchedUnionKeepSetSelector:
+class _BatchedKeepSetSelectorBase:
+    """Shared fixed buffers and prepared launchers for keep-set selectors."""
+
+    def __init__(
+        self,
+        *,
+        eviction_mode: str,
+        dense_layers: Tuple[int, ...],
+        num_query_heads: int,
+        num_kv_heads: int,
+        width: int,
+        keep_count: int,
+        prompt_len: int,
+        dtype: torch.dtype,
+        device: torch.device,
+        max_requests: int,
+    ) -> None:
+        if width <= keep_count or keep_count <= 0:
+            raise ValueError("keep-set selection requires width > keep_count > 0")
+        if max_requests <= 0:
+            raise ValueError("keep-set selection requires a positive request capacity")
+        self.eviction_mode = eviction_mode
+        self.dense_layers = tuple(int(layer) for layer in dense_layers)
+        self.num_query_heads = int(num_query_heads)
+        self.num_kv_heads = int(num_kv_heads)
+        self.width = int(width)
+        self.keep_count = int(keep_count)
+        self.prompt_len = int(prompt_len)
+        self.total_keep = self.prompt_len + self.keep_count
+        self.dtype = dtype
+        self.device = _canonical_device(device)
+        self.max_requests = int(max_requests)
+        self.valid_widths = torch.full(
+            (self.max_requests,), self.width, dtype=torch.int32, device=self.device
+        )
+
+    def _allocate_cpu_reference_buffers(
+        self,
+        scale_shape: Tuple[int, ...],
+        mask_shape: Tuple[int, ...],
+        index_dtype: torch.dtype,
+    ) -> None:
+        """CPU-only oracle scratch; None on CUDA, where prepared kernels run."""
+        if self.device.type == "cpu":
+            self.valid_scale = torch.empty(scale_shape, dtype=self.dtype, device=self.device)
+            self.token_indices = torch.arange(self.width, dtype=index_dtype, device=self.device)
+            self.invalid_mask = torch.empty(mask_shape, dtype=torch.bool, device=self.device)
+        else:
+            self.valid_scale = None
+            self.token_indices = None
+            self.invalid_mask = None
+
+    def _build_prepared_selection_launchers(
+        self,
+        scores_rows: torch.Tensor,
+        row_lengths: torch.Tensor,
+        provisional_indices: torch.Tensor,
+        keep_rows: torch.Tensor,
+    ) -> None:
+        """Bind the CuTE topk and the deterministic finalizer over row-major views."""
+        if self.device.type != "cuda":
+            self.prepared_topk = None
+            self.prepared_finalizer = None
+            return
+        self.prepared_topk = _PreparedCuteTopK(
+            int(scores_rows.shape[0]), self.width, self.keep_count, self.device
+        )
+        self.prepared_finalizer = _PreparedTopKFinalizer(
+            scores_rows,
+            row_lengths,
+            provisional_indices,
+            keep_rows,
+            self.keep_count,
+            self.prompt_len,
+        )
+
+    def _prefill_prompt_ordinals(self, keep: torch.Tensor) -> None:
+        if self.prompt_len:
+            prompt = torch.arange(self.prompt_len, dtype=torch.int32, device=self.device)
+            keep[..., : self.prompt_len].copy_(prompt.expand(*keep.shape[:-1], self.prompt_len))
+
+    def _validated_request_count(self, scores: torch.Tensor, what: str) -> int:
+        request_count = int(scores.shape[0]) if scores.ndim >= 1 else 0
+        if request_count <= 0 or request_count > self.max_requests:
+            raise ValueError(f"request count exceeds the {what} selection capacity")
+        if scores.is_cuda and request_count != self.max_requests:
+            raise ValueError("CUDA selection requires the selector's fixed request count")
+        return request_count
+
+
+class _BatchedUnionKeepSetSelector(_BatchedKeepSetSelectorBase):
     """Persistent ``[request, ...]`` buffers for union selection."""
 
     def __init__(
@@ -408,22 +498,21 @@ class _BatchedUnionKeepSetSelector:
         input_scores: Optional[torch.Tensor] = None,
         normalize_scores: bool = True,
     ) -> None:
-        if rows <= 0 or width <= keep_count or keep_count <= 0:
-            raise ValueError("cross-request selection requires rows > 0 and width > keep_count > 0")
-        if max_requests <= 0:
-            raise ValueError("cross-request selection requires a positive request capacity")
-        self.max_requests = max_requests
-        self.eviction_mode = "union"
-        self.dense_layers = tuple(dense_layers)
-        self.num_query_heads = int(num_query_heads)
-        self.num_kv_heads = int(num_kv_heads)
+        if rows <= 0:
+            raise ValueError("cross-request selection requires rows > 0")
+        super().__init__(
+            eviction_mode="union",
+            dense_layers=dense_layers,
+            num_query_heads=num_query_heads,
+            num_kv_heads=num_kv_heads,
+            width=width,
+            keep_count=keep_count,
+            prompt_len=prompt_len,
+            dtype=dtype,
+            device=device,
+            max_requests=max_requests,
+        )
         self.rows = rows
-        self.width = width
-        self.keep_count = keep_count
-        self.prompt_len = prompt_len
-        self.total_keep = prompt_len + keep_count
-        self.dtype = dtype
-        self.device = _canonical_device(device)
         if self.device.type == "cuda" and input_scores is None:
             raise ValueError("CUDA union selection requires its fixed score input")
 
@@ -436,35 +525,11 @@ class _BatchedUnionKeepSetSelector:
         self.keep = torch.empty(
             (max_requests, self.total_keep), dtype=torch.int32, device=self.device
         )
-        self.valid_widths = torch.full(
-            (max_requests,), width, dtype=torch.int32, device=self.device
+        self._allocate_cpu_reference_buffers(
+            (max_requests, 1, 1), (max_requests, 1, width), torch.int32
         )
-        if self.device.type == "cpu":
-            self.valid_scale = torch.empty((max_requests, 1, 1), dtype=dtype, device=self.device)
-            self.token_indices = torch.arange(width, dtype=torch.int32, device=self.device)
-            self.invalid_mask = torch.empty(
-                (max_requests, 1, width), dtype=torch.bool, device=self.device
-            )
-        else:
-            self.valid_scale = None
-            self.token_indices = None
-            self.invalid_mask = None
-        self.prepared_topk = (
-            _PreparedCuteTopK(max_requests, width, keep_count, self.device)
-            if self.device.type == "cuda"
-            else None
-        )
-        self.prepared_finalizer = (
-            _PreparedTopKFinalizer(
-                self.combined,
-                self.valid_widths,
-                self.final_indices,
-                self.keep,
-                keep_count,
-                prompt_len,
-            )
-            if self.device.type == "cuda"
-            else None
+        self._build_prepared_selection_launchers(
+            self.combined, self.valid_widths, self.final_indices, self.keep
         )
         self.prepared_scores = (
             _PreparedUnionScores(
@@ -478,9 +543,7 @@ class _BatchedUnionKeepSetSelector:
             if self.device.type == "cuda" and input_scores is not None
             else None
         )
-        if prompt_len:
-            prompt = torch.arange(prompt_len, dtype=torch.int32, device=self.device)
-            self.keep[:, :prompt_len].copy_(prompt.expand(max_requests, -1))
+        self._prefill_prompt_ordinals(self.keep)
 
     def _select_input_scores(
         self,
@@ -577,11 +640,7 @@ class _BatchedUnionKeepSetSelector:
         normalize_scores: bool,
     ) -> None:
         """Select from request-major score output without repacking it."""
-        request_count = int(scores.shape[0]) if scores.ndim >= 1 else 0
-        if request_count <= 0 or request_count > self.max_requests:
-            raise ValueError("request count exceeds the cross-request selection capacity")
-        if scores.is_cuda and request_count != self.max_requests:
-            raise ValueError("CUDA selection requires the selector's fixed request count")
+        request_count = self._validated_request_count(scores, "cross-request")
         if (
             scores.numel() != request_count * self.rows * self.width
             or int(scores.shape[-1]) != self.width
@@ -606,7 +665,7 @@ class _BatchedUnionKeepSetSelector:
         )
 
 
-class _BatchedPerHeadKeepSetSelector:
+class _BatchedPerHeadKeepSetSelector(_BatchedKeepSetSelectorBase):
     """Fixed ``[request, ...]`` selector for both per-head modes."""
 
     def __init__(
@@ -629,13 +688,19 @@ class _BatchedPerHeadKeepSetSelector:
             raise ValueError("per-head selection requires positive layer, head, and request counts")
         if num_query_heads % num_kv_heads:
             raise ValueError("query heads must be divisible by KV heads")
-        if width <= keep_count or keep_count <= 0:
-            raise ValueError("per-head selection requires width > keep_count > 0")
-        self.eviction_mode = eviction_mode
-        self.dense_layers = tuple(int(layer) for layer in dense_layers)
+        super().__init__(
+            eviction_mode=eviction_mode,
+            dense_layers=dense_layers,
+            num_query_heads=num_query_heads,
+            num_kv_heads=num_kv_heads,
+            width=width,
+            keep_count=keep_count,
+            prompt_len=prompt_len,
+            dtype=dtype,
+            device=device,
+            max_requests=max_requests,
+        )
         self.num_layers = len(self.dense_layers)
-        self.num_query_heads = int(num_query_heads)
-        self.num_kv_heads = int(num_kv_heads)
         self.query_group_size = self.num_query_heads // self.num_kv_heads
         self.rows = self.num_layers * self.num_query_heads
         self.selection_rows = (
@@ -643,48 +708,22 @@ class _BatchedPerHeadKeepSetSelector:
             if eviction_mode == "per_head"
             else self.num_layers * self.num_kv_heads
         )
-        self.width = int(width)
-        self.keep_count = int(keep_count)
-        self.prompt_len = int(prompt_len)
-        self.total_keep = self.prompt_len + self.keep_count
-        self.dtype = dtype
-        self.device = _canonical_device(device)
-        self.max_requests = int(max_requests)
 
         score_shape = (self.max_requests, self.num_layers, self.num_query_heads, self.width)
         grouped_shape = (self.max_requests, self.num_layers, self.num_kv_heads, self.width)
         self.row_mean = torch.empty(score_shape[:-1] + (1,), dtype=dtype, device=self.device)
         self.row_std = torch.empty_like(self.row_mean)
-        self.valid_widths = torch.full(
-            (self.max_requests,), self.width, dtype=torch.int32, device=self.device
-        )
         self.selection_scores = torch.empty(
             (self.max_requests, self.selection_rows, self.width),
             dtype=dtype,
             device=self.device,
         )
-        if self.device.type == "cpu":
-            self.valid_scale = torch.empty(
-                (self.max_requests, 1, 1, 1), dtype=dtype, device=self.device
-            )
-            self.token_indices = torch.arange(self.width, dtype=torch.long, device=self.device)
-            self.invalid_mask = torch.empty(
-                (self.max_requests, 1, 1, self.width), dtype=torch.bool, device=self.device
-            )
-            self.grouped_scores = torch.empty(grouped_shape, dtype=dtype, device=self.device)
-        else:
-            self.valid_scale = None
-            self.token_indices = None
-            self.invalid_mask = None
-            self.grouped_scores = None
-        self.prepared_topk = (
-            _PreparedCuteTopK(
-                self.max_requests * self.selection_rows,
-                self.width,
-                self.keep_count,
-                self.device,
-            )
-            if self.device.type == "cuda"
+        self._allocate_cpu_reference_buffers(
+            (self.max_requests, 1, 1, 1), (self.max_requests, 1, 1, self.width), torch.long
+        )
+        self.grouped_scores = (
+            torch.empty(grouped_shape, dtype=dtype, device=self.device)
+            if self.device.type == "cpu"
             else None
         )
         self.row_seq_lens = torch.full(
@@ -706,23 +745,13 @@ class _BatchedPerHeadKeepSetSelector:
         self.row_seq_lens_flat = self.row_seq_lens.view(-1)
         self.top_indices_i32_flat = self.top_indices_i32.view(-1, self.keep_count)
         self.keep_flat = self.keep.view(-1, self.total_keep)
-        self.prepared_finalizer = (
-            _PreparedTopKFinalizer(
-                self.selection_scores_flat,
-                self.row_seq_lens_flat,
-                self.top_indices_i32_flat,
-                self.keep_flat,
-                self.keep_count,
-                self.prompt_len,
-            )
-            if self.device.type == "cuda"
-            else None
+        self._build_prepared_selection_launchers(
+            self.selection_scores_flat,
+            self.row_seq_lens_flat,
+            self.top_indices_i32_flat,
+            self.keep_flat,
         )
-        if self.prompt_len:
-            prompt = torch.arange(self.prompt_len, dtype=torch.int32, device=self.device)
-            self.keep[:, :, : self.prompt_len].copy_(
-                prompt.view(1, 1, -1).expand(self.max_requests, self.selection_rows, -1)
-            )
+        self._prefill_prompt_ordinals(self.keep)
 
     def _select_input_scores(
         self,
@@ -829,11 +858,7 @@ class _BatchedPerHeadKeepSetSelector:
         *,
         normalize_scores: bool,
     ) -> None:
-        request_count = int(scores.shape[0]) if scores.ndim >= 1 else 0
-        if request_count <= 0 or request_count > self.max_requests:
-            raise ValueError("request count exceeds the per-head selection capacity")
-        if scores.is_cuda and request_count != self.max_requests:
-            raise ValueError("CUDA selection requires the selector's fixed request count")
+        request_count = self._validated_request_count(scores, "per-head")
         expected_shape = (
             request_count,
             self.num_layers,
@@ -1426,7 +1451,6 @@ class TriAttention(BaseKVCacheCompressionManager):
     """
 
     adjusts_generation_kv_length = True
-    physically_evicts_cached_tokens = True
 
     def __init__(
         self,
@@ -1726,99 +1750,89 @@ class TriAttention(BaseKVCacheCompressionManager):
         gen_requests = scheduled_batch.generation_requests
         if not gen_requests:
             return
-        active_requests = []
+        mgr = self.kv_cache_manager
+        resolved_requests = []
         for request in gen_requests:
             if request.is_dummy or request.state in (
                 LlmRequestState.GENERATION_COMPLETE,
                 LlmRequestState.CONTEXT_INIT,
             ):
                 continue
-            kv_cache = self.kv_cache_manager.kv_cache_map.get(request.py_request_id)
+            request_id = request.py_request_id
+            kv_cache = mgr.kv_cache_map.get(request_id)
             if kv_cache is None:
                 continue
             if not kv_cache.is_active:
                 raise RuntimeError(
                     "TriAttention cannot finalize a suspended target KV cache; "
-                    f"request {request.py_request_id} must be resumed before "
+                    f"request {request_id} must be resumed before "
                     "the final update hook"
                 )
-            if request.py_request_id not in self._request_states:
+            if request_id not in self._request_states:
                 self.on_request_init(request)
-            active_requests.append(request)
-        if not active_requests or not self._calibrated:
+            resolved_requests.append((request, request_id, kv_cache))
+        if not resolved_requests or not self._calibrated:
             return
-        mgr = self.kv_cache_manager
-        num_layers = self._num_layers_from_manager()
         protected_tails: Dict[int, int] = {}
+        eviction_groups = {}
 
-        # (1) bump per-request step counters; collect who evicts THIS step.
-        evict_now = []
-        for request in active_requests:
-            rid = request.py_request_id
-            kv_cache = mgr.kv_cache_map.get(rid)
-            if kv_cache is None or not kv_cache.is_active:
-                continue
+        # Resolve every active target cache before changing cadence state. The
+        # captured cache objects also avoid repeating the V2 map lookup here.
+        for request, request_id, kv_cache in resolved_requests:
             raw_capacity = int(kv_cache.capacity)
             # One-engine speculative decoding keeps a fixed reserve E. Under
             # overlap, B(n) is allocated/enqueued before finalizing B(n-1), so
             # its exact scheduler growth Q is also opaque. Both spans are
             # contiguous after the stable target prefix and move byte-for-byte.
             protected_tail = int(mgr.num_extra_kv_tokens) + self._inflight_generation_growth(
-                scheduled_batch, rid
+                scheduled_batch, request_id
             )
             seq_len = raw_capacity - protected_tail
             if seq_len < 0 or protected_tail < 0:
                 raise RuntimeError(
-                    f"Request {rid} has an inconsistent protected target tail: "
+                    f"Request {request_id} has an inconsistent protected target tail: "
                     f"confirmed={seq_len}, capacity={raw_capacity}, "
                     f"protected_tail={protected_tail}"
                 )
             if seq_len < kv_cache.history_length:
                 raise RuntimeError(
-                    f"Request {rid} KV length {seq_len} is below finalized "
+                    f"Request {request_id} KV length {seq_len} is below finalized "
                     f"history {kv_cache.history_length}"
                 )
-            request_state = self._request_states[rid]
+            request_state = self._request_states[request_id]
             request_state.confirmed_kv_length = seq_len
-            protected_tails[rid] = protected_tail
             previous_step = request_state.generation_steps
             confirmed_delta = 1 + int(request.py_num_accepted_draft_tokens)
             step = previous_step + confirmed_delta
             request_state.generation_steps = step
-            if previous_step // self.beta < step // self.beta:
-                if seq_len > self._minimum_evictable_length(request, seq_len):
-                    if self.draft_kv_cache_manager is not None:
-                        draft_kv_cache = self.draft_kv_cache_manager.kv_cache_map.get(rid)
-                        if draft_kv_cache is None or not draft_kv_cache.is_active:
-                            raise RuntimeError(
-                                "TriAttention cannot co-compress a missing or "
-                                f"suspended draft KV cache; request {rid} must "
-                                "be resumed before the final update hook"
-                            )
-                    evict_now.append((request, rid))
+            if previous_step // self.beta >= step // self.beta:
+                continue
+            keep_count = self._minimum_evictable_length(request, seq_len)
+            if seq_len <= keep_count:
+                continue
+            if self.draft_kv_cache_manager is not None:
+                draft_kv_cache = self.draft_kv_cache_manager.kv_cache_map.get(request_id)
+                if draft_kv_cache is None or not draft_kv_cache.is_active:
+                    raise RuntimeError(
+                        "TriAttention cannot co-compress a missing or "
+                        f"suspended draft KV cache; request {request_id} must "
+                        "be resumed before the final update hook"
+                    )
+            protected_tails[request_id] = protected_tail
+            prompt_len = min(int(request.py_prompt_len), seq_len)
+            key = (prompt_len, keep_count)
+            eviction_groups.setdefault(key, []).append((request, request_id))
 
         # (2) Compact all affected dense and kernel-masked SWA layers, then release
         # the unreachable tail directly through V2's public resize primitive.
-        if not evict_now:
+        if not eviction_groups:
             return
-        protected_tail_lengths = {rid: protected_tails[rid] for _, rid in evict_now}
-        # Prompt and retained geometry define selection and destination layout.
-        # Requests with the same geometry execute eagerly in bounded chunks.
-        # Chunking limits staging memory.
-        eviction_groups = {}
-        for request, rid in evict_now:
-            seq_len = self._request_states[rid].confirmed_kv_length
-            if seq_len is None:
-                raise RuntimeError(f"Missing confirmed KV length for request {rid}")
-            prompt_len = min(int(request.py_prompt_len), seq_len)
-            keep_count = self._minimum_evictable_length(request, seq_len)
-            key = (prompt_len, keep_count)
-            eviction_groups.setdefault(key, []).append((request, rid))
+        num_layers = self._num_layers_from_manager()
 
         for group in eviction_groups.values():
             for begin in range(0, len(group), _EAGER_REQUEST_CHUNK_SIZE):
                 chunk = group[begin : begin + _EAGER_REQUEST_CHUNK_SIZE]
-                chunk_tails = {rid: protected_tail_lengths[rid] for _, rid in chunk}
+                chunk_tails = {rid: protected_tails[rid] for _, rid in chunk}
                 with nvtx_range_debug("triattention.evict_request_group", color="purple"):
                     capacity_targets = self._evict_requests(
                         chunk,

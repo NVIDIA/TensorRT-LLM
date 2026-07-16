@@ -646,6 +646,34 @@ class TestStepEndHookRefactor:
             "exit:triattention.resize",
         ]
 
+    def test_suspended_cache_rejects_batch_before_cadence_mutation(self):
+        manager, first_request, _ = self._make_due_decode_request(seq_len=1024 + 4096 + 1)
+        second_request = _make_request(8, py_prompt_len=1024)
+        manager.kv_cache_manager.kv_cache_map[8] = SimpleNamespace(is_active=False)
+        first_state = manager._request_states[7]
+        second_state = _set_request_state(manager, 8, generation_steps=127)
+        batch = SimpleNamespace(generation_requests=[first_request, second_request])
+
+        with pytest.raises(RuntimeError, match="request 8 must be resumed"):
+            manager._periodic_evict(batch)
+
+        assert first_state.generation_steps == 127
+        assert first_state.confirmed_kv_length is None
+        assert second_state.generation_steps == 127
+        assert second_state.confirmed_kv_length is None
+
+    def test_non_boundary_step_skips_eviction_geometry(self):
+        manager, _, batch = self._make_due_decode_request(seq_len=1024 + 4096 + 1)
+        state = manager._request_states[7]
+        state.generation_steps = 126
+
+        with mock.patch.object(manager, "_minimum_evictable_length") as keep_count:
+            manager._periodic_evict(batch)
+
+        keep_count.assert_not_called()
+        assert state.generation_steps == 127
+        assert state.confirmed_kv_length == 1024 + 4096 + 1
+
     def test_eager_eviction_chunks_large_due_cohort(self):
         manager, _, _ = self._make_due_decode_request(seq_len=1024 + 4096 + 1)
         requests = []
@@ -861,19 +889,30 @@ class TestStepEndHookRefactor:
         draft_cache.resize.assert_called_once_with(retained + 6, None)
 
     def test_mtp_eagle_paged_draft_length_contract_is_accepted(self):
-        # The factory runs the speculative feature gates and then builds the
-        # manager; a one-model MTP contract must pass both.
-        from tensorrt_llm._torch.pyexecutor._util import create_kv_cache_compression_manager
+        # A one-model MTP contract passes the call-site speculative gate, and
+        # the factory then builds a manager that validates cleanly.
+        from tensorrt_llm._torch.pyexecutor._util import (
+            create_kv_cache_compression_manager,
+            kv_cache_compression_supported_with_spec,
+        )
         from tensorrt_llm.llmapi.llm_args import (
             MTPDecodingConfig,
             TriAttentionKvCacheCompressionConfig,
         )
 
+        config = TriAttentionKvCacheCompressionConfig(model_path="/models/test", top_B=8)
+        assert config.kv_cache_compression_mode.is_eviction_method() is True
+        draft_manager = _make_fake_v2(is_draft=True)
+        assert (
+            kv_cache_compression_supported_with_spec(
+                config, MTPDecodingConfig(max_draft_len=1), draft_manager
+            )
+            is True
+        )
         manager = create_kv_cache_compression_manager(
-            TriAttentionKvCacheCompressionConfig(model_path="/models/test", top_B=8),
+            config,
             _make_fake_v2(),
-            draft_kv_cache_manager=_make_fake_v2(is_draft=True),
-            spec_config=MTPDecodingConfig(max_draft_len=1),
+            draft_kv_cache_manager=draft_manager,
         )
 
         manager._validate_v2_compatibility()
@@ -889,36 +928,38 @@ class TestStepEndHookRefactor:
             )
         else:
             spec_config = PARDDecodingConfig(max_draft_len=3)
-        # The factory's eviction-method speculative-mode gate declines to
-        # create a manager; the run stays uncompressed.
-        from tensorrt_llm._torch.pyexecutor._util import create_kv_cache_compression_manager
+        # The call-site speculative gate declines before any manager is
+        # created; the run stays uncompressed.
+        from tensorrt_llm._torch.pyexecutor._util import kv_cache_compression_supported_with_spec
         from tensorrt_llm.llmapi.llm_args import TriAttentionKvCacheCompressionConfig
 
-        manager = create_kv_cache_compression_manager(
-            TriAttentionKvCacheCompressionConfig(model_path="/models/test", top_B=8),
-            _make_fake_v2(),
-            draft_kv_cache_manager=_make_fake_v2(is_draft=True),
-            spec_config=spec_config,
+        assert (
+            kv_cache_compression_supported_with_spec(
+                TriAttentionKvCacheCompressionConfig(model_path="/models/test", top_B=8),
+                spec_config,
+                _make_fake_v2(is_draft=True),
+            )
+            is False
         )
-        assert manager is None
 
     def test_dflash_spec_mode_is_rejected(self):
         # Policy: the DFlash draft reads cross-attention context buffers, not
-        # a paged KV cache, so compression cannot cover it. The factory's
-        # eviction-method speculative-mode gate declines to create a manager.
-        from tensorrt_llm._torch.pyexecutor._util import create_kv_cache_compression_manager
+        # a paged KV cache, so compression cannot cover it. The call-site
+        # speculative gate declines to create a manager.
+        from tensorrt_llm._torch.pyexecutor._util import kv_cache_compression_supported_with_spec
         from tensorrt_llm.llmapi.llm_args import (
             DFlashDecodingConfig,
             TriAttentionKvCacheCompressionConfig,
         )
 
-        manager = create_kv_cache_compression_manager(
-            TriAttentionKvCacheCompressionConfig(model_path="/models/test", top_B=8),
-            _make_fake_v2(),
-            draft_kv_cache_manager=_make_fake_v2(is_draft=True),
-            spec_config=DFlashDecodingConfig(max_draft_len=3),
+        assert (
+            kv_cache_compression_supported_with_spec(
+                TriAttentionKvCacheCompressionConfig(model_path="/models/test", top_B=8),
+                DFlashDecodingConfig(max_draft_len=3),
+                _make_fake_v2(is_draft=True),
+            )
+            is False
         )
-        assert manager is None
 
     def test_prepare_snapshots_fixed_linear_generation_growth(self):
         manager = _make_fake_v2()

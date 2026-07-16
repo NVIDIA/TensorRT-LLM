@@ -321,21 +321,22 @@ def test_draft_admission_gates_raise(gate, match):
         draft_manager.max_attention_window_vec = [128]
     if gate == "dflash":
         # DFlash reads cross-attention context buffers, not a paged KV cache;
-        # the factory's eviction-method speculative-mode gate declines to
-        # create a manager and the run stays uncompressed.
-        from tensorrt_llm._torch.pyexecutor._util import create_kv_cache_compression_manager
+        # the call-site speculative gate declines to create a manager and the
+        # run stays uncompressed.
+        from tensorrt_llm._torch.pyexecutor._util import kv_cache_compression_supported_with_spec
         from tensorrt_llm.llmapi.llm_args import (
             DFlashDecodingConfig,
             TriAttentionKvCacheCompressionConfig,
         )
 
-        manager = create_kv_cache_compression_manager(
-            TriAttentionKvCacheCompressionConfig(model_path="/models/test", top_B=8),
-            _make_fake_v2(),
-            draft_kv_cache_manager=draft_manager,
-            spec_config=DFlashDecodingConfig(max_draft_len=3),
+        assert (
+            kv_cache_compression_supported_with_spec(
+                TriAttentionKvCacheCompressionConfig(model_path="/models/test", top_B=8),
+                DFlashDecodingConfig(max_draft_len=3),
+                draft_manager,
+            )
+            is False
         )
-        assert manager is None
         return
     manager = TriAttention(
         _make_fake_v2(),

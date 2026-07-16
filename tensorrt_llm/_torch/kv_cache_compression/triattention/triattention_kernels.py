@@ -16,7 +16,7 @@ House rules honored throughout:
 
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import List
 
 import torch
 import triton
@@ -426,132 +426,6 @@ def _pack_compaction_sources_kernel(
             swa_source,
             mask=write_swa & (move < swa_count),
         )
-
-
-def pack_compaction_sources(
-    selected_indices: torch.Tensor,
-    valid_seq_lens: torch.Tensor,
-    dense_offsets: torch.Tensor,
-    dense_indices: torch.Tensor,
-    *,
-    eviction_mode: str,
-    prompt_len: int,
-    keep_count: int,
-    num_dense_layers: int,
-    num_kv_heads: int,
-    max_protected_tail: int,
-    swa_window: int = 0,
-    swa_offsets: Optional[torch.Tensor] = None,
-    swa_indices: Optional[torch.Tensor] = None,
-) -> None:
-    """Pack all dynamic dense and optional SWA source ordinals in one launch."""
-    if eviction_mode not in ("union", "per_head", "per_layer_perhead"):
-        raise ValueError(f"unsupported compaction mode: {eviction_mode}")
-    prompt_len = int(prompt_len)
-    keep_count = int(keep_count)
-    num_dense_layers = int(num_dense_layers)
-    num_kv_heads = int(num_kv_heads)
-    max_protected_tail = int(max_protected_tail)
-    swa_window = int(swa_window)
-    request_count = int(selected_indices.shape[0]) if selected_indices.ndim else 0
-    if (
-        request_count <= 0
-        or min(keep_count, num_dense_layers, num_kv_heads) <= 0
-        or min(prompt_len, max_protected_tail, swa_window) < 0
-        or selected_indices.shape[-1] != prompt_len + keep_count
-    ):
-        raise ValueError("compaction packing requires valid positive geometry")
-
-    tensors = (selected_indices, valid_seq_lens, dense_offsets, dense_indices)
-    if any(
-        not tensor.is_cuda
-        or tensor.dtype != torch.int32
-        or not tensor.is_contiguous()
-        or tensor.device != selected_indices.device
-        for tensor in tensors
-    ):
-        raise ValueError("compaction packing requires contiguous CUDA int32 tensors")
-    if valid_seq_lens.shape != (request_count,) or dense_offsets.shape != (request_count + 1,):
-        raise ValueError("compaction lengths and offsets do not match the request count")
-
-    per_layer = eviction_mode == "per_layer_perhead"
-    union = eviction_mode == "union"
-    if union:
-        selection_rows = 1
-    elif per_layer:
-        selection_rows = num_dense_layers * num_kv_heads
-    else:
-        selection_rows = num_kv_heads
-    if union:
-        expected_selection_prefix = (request_count,)
-    else:
-        expected_selection_prefix = (request_count, selection_rows)
-    if tuple(selected_indices.shape[:-1]) != expected_selection_prefix:
-        raise ValueError("selected indices do not match the compaction mode")
-
-    domain_count = num_dense_layers * num_kv_heads if per_layer else num_kv_heads
-    expected_dense_prefix = (num_dense_layers, num_kv_heads) if per_layer else (num_kv_heads,)
-    if (
-        dense_indices.ndim != len(expected_dense_prefix) + 1
-        or tuple(dense_indices.shape[:-1]) != expected_dense_prefix
-    ):
-        raise ValueError("dense source buffer does not match the compaction mode")
-    dense_total = int(dense_indices.shape[-1])
-
-    has_swa = swa_indices is not None or swa_offsets is not None
-    if has_swa:
-        if swa_indices is None or swa_offsets is None or swa_window <= 0:
-            raise ValueError("SWA packing requires indices, offsets, and a positive window")
-        if (
-            not swa_indices.is_cuda
-            or not swa_offsets.is_cuda
-            or swa_indices.dtype != torch.int32
-            or swa_offsets.dtype != torch.int32
-            or not swa_indices.is_contiguous()
-            or not swa_offsets.is_contiguous()
-            or swa_indices.device != selected_indices.device
-            or swa_offsets.device != selected_indices.device
-            or swa_indices.ndim != 2
-            or tuple(swa_indices.shape[:-1]) != (num_kv_heads,)
-            or swa_offsets.shape != (request_count + 1,)
-        ):
-            raise ValueError("SWA source buffers do not match the compaction geometry")
-        swa_total = int(swa_indices.shape[-1])
-        swa_indices_arg = swa_indices
-        swa_offsets_arg = swa_offsets
-    else:
-        if swa_window != 0:
-            raise ValueError("SWA window requires SWA source buffers")
-        swa_total = 0
-        # HAS_SWA specializes the corresponding loads and stores away.
-        swa_indices_arg = dense_indices
-        swa_offsets_arg = dense_offsets
-
-    max_move = keep_count + max_protected_tail
-    if has_swa:
-        max_move = max(max_move, swa_window + max_protected_tail)
-    block = 256
-    _pack_compaction_sources_kernel[(request_count, domain_count, triton.cdiv(max_move, block))](
-        selected_indices,
-        valid_seq_lens,
-        dense_offsets,
-        dense_indices,
-        swa_offsets_arg,
-        swa_indices_arg,
-        DENSE_TOTAL=dense_total,
-        SWA_TOTAL=swa_total,
-        SELECTION_ROWS=selection_rows,
-        SELECTION_STRIDE=prompt_len + keep_count,
-        KEEP_COUNT=keep_count,
-        PROMPT_LEN=prompt_len,
-        NUM_KV_HEADS=num_kv_heads,
-        SWA_WINDOW=swa_window,
-        UNION=union,
-        PER_LAYER=per_layer,
-        HAS_SWA=has_swa,
-        BLOCK=block,
-        num_warps=4,
-    )
 
 
 @triton.jit
