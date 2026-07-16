@@ -186,7 +186,7 @@ def globalVars = [
     (CACHED_CHANGED_FILE_LIST): null,
     (ACTION_INFO): gitlabParamsFromBot.get('action_info', null),
     (IMAGE_KEY_TO_TAG): [:],
-    (TARGET_BRANCH): gitlabParamsFromBot.get('target_branch', null),
+    (TARGET_BRANCH): gitlabParamsFromBot.get('target_branch', 'main'),
 ]
 
 // If not running all test stages in the L0 pre-merge, we will not update the GitLab status at the end.
