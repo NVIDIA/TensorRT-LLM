@@ -1,10 +1,14 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import contextlib
 import inspect
 import math
 import os
 import time
 from dataclasses import dataclass
-from typing import Dict, Generic, List, Optional, Tuple, Type, TypeVar, Union
+from typing import (Any, Dict, Generic, List, Literal, Optional, Tuple, Type,
+                    TypeVar, Union)
 
 import torch
 from torch import nn
@@ -605,8 +609,40 @@ class DecoderModelForCausalLM(nn.Module,
 
         The returned dict is deep-merged with the user's llm_args, with
         user-set values taking priority over these defaults.
+
+        Note: ``cache_transceiver_config`` is rejected here (enforced at
+        load time) — the deep-merge could materialize or silently enable a
+        transceiver config the user did not turn on. Use
+        :meth:`get_preferred_transceiver_runtime` instead.
         """
         return {}
+
+    @classmethod
+    def get_preferred_transceiver_runtime(
+            cls,
+            pretrained_config: Any = None
+    ) -> Optional[Literal["CPP", "PYTHON"]]:
+        """Return the model's preferred KV-cache transceiver runtime.
+
+        Subclasses can override this to opt into a specific transceiver
+        implementation ('CPP' or 'PYTHON') that is adopted when the user
+        leaves ``cache_transceiver_config.transceiver_runtime`` at its
+        default 'auto'. Return None to defer to the global default (C++).
+
+        Args:
+            pretrained_config: the loaded HF pretrained config (may be None
+                on paths where no config was loaded). Implementation classes
+                shared by several architectures can inspect e.g.
+                ``pretrained_config.architectures`` to differentiate per
+                checkpoint.
+
+        This preference is intentionally kept out of the generic
+        :meth:`get_model_defaults` deep-merge: it must not materialize a
+        ``cache_transceiver_config`` when disaggregated serving is disabled,
+        and it is only honored when the effective backend supports it (the
+        Python transceiver requires NIXL).
+        """
+        return None
 
     @property
     def config(self):
@@ -876,7 +912,7 @@ def get_model_architecture(
             model_config.architectures) > 0:
         cls = MODEL_CLASS_MAPPING.get(model_config.architectures[0])
     else:
-        raise RuntimeError(f"Model architecture is not provided.")
+        raise RuntimeError("Model architecture is not provided.")
 
     if cls is None:
         arch = model_config.architectures[0]

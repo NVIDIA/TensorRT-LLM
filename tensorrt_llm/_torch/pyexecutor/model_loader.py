@@ -23,6 +23,7 @@ from tensorrt_llm.llmapi.llm_args import (DecodingBaseConfig,
                                           ModelExpressConfig,
                                           SparseAttentionConfig, TorchLlmArgs)
 from tensorrt_llm.llmapi.llm_utils import (_resolve_kv_cache_manager_v2_auto,
+                                           _resolve_transceiver_runtime_auto,
                                            apply_model_defaults_to_llm_args)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.lora_helper import LoraConfig
@@ -34,7 +35,8 @@ from ...llmapi.llm_args import LoadFormat
 from ..model_config import ModelConfig
 from ..models import AutoModelForCausalLM, LlamaForCausalLM
 from ..models.checkpoints.base_checkpoint_loader import BaseCheckpointLoader
-from ..models.modeling_utils import (DecoderModelForCausalLM, MetaInitMode,
+from ..models.modeling_utils import (MODEL_CLASS_MAPPING,
+                                     DecoderModelForCausalLM, MetaInitMode,
                                      timing)
 from ..modules.fused_moe.moe_load_balancer import (
     MoeLoadBalancer, maybe_create_moe_load_balancer)
@@ -356,6 +358,9 @@ class ModelLoader:
             checkpoint_loader: BaseCheckpointLoader) -> TorchLlmArgs:
         """Load model config and apply model-specific defaults to llm_args."""
         if checkpoint_loader is None:
+            # No config to resolve a model class from; still resolve the
+            # "auto" sentinel so it never leaks past config loading.
+            _resolve_transceiver_runtime_auto(llm_args)
             return llm_args
 
         config_kwargs = {
@@ -399,6 +404,20 @@ class ModelLoader:
                 llm_args.kv_cache_config.use_kv_cache_manager_v2,
                 model_cls.__name__
                 if model_cls is not None else "unknown model")
+
+        # The transceiver preference follows the checkpoint's original
+        # architecture: _resolve_class may rewrite it to an execution class
+        # (e.g. MTPDraftModelForCausalLM), which must not drop the target
+        # model's preference.
+        preference_cls = model_cls
+        architectures = getattr(config.pretrained_config, 'architectures', None)
+        if architectures:
+            preference_cls = MODEL_CLASS_MAPPING.get(architectures[0],
+                                                     model_cls)
+
+        # Resolve "auto" sentinel values after model defaults are applied.
+        _resolve_transceiver_runtime_auto(llm_args, preference_cls,
+                                          config.pretrained_config)
 
         return llm_args
 

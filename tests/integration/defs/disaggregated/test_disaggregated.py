@@ -2589,6 +2589,7 @@ def test_llama4_long_context_kv_cache_overflow(disaggregated_test_root,
                              cwd=llm_venv.get_working_directory())
 
 
+@skip_pre_blackwell
 @pytest.mark.timeout(2400)
 @pytest.mark.skip_less_device(4)
 @pytest.mark.parametrize("prompt_file", ["prompts.json", "long_prompts.json"],
