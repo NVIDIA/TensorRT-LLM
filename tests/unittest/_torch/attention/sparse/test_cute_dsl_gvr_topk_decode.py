@@ -882,6 +882,56 @@ def test_cute_dsl_gvr_topk_decode_r0_equivalence_bigbs(
 
 
 @skip_not_sm100
+@pytest.mark.parametrize(
+    "top_k,N,cluster_size",
+    [(512, 16384, 1), (1024, 131072, 4), (2048, 131072, 4)],
+)
+@pytest.mark.parametrize("band", ["sub_resolution", "one_ulp"])
+def test_cute_dsl_gvr_topk_decode_p4_exact_tail_ties(top_k, N, cluster_size, band):
+    """fp32 near-tie adversarial exactness (``p4_exact_tail``).
+
+    The P4 rank-scatter fine recursion resolves candidate values to
+    range/(kNumBins*256); distinct values spaced below that which straddle
+    the top-K boundary land in ONE fine bin and were previously kept in
+    arrival order (observed on real DSv4-Pro 512k-ISL captures as |miss|=1
+    with dv ~ 3e-6). ``sub_resolution`` plants ~2.4k distinct values spaced
+    5e-8 around the boundary; ``one_ulp`` plants a two-value bitwise plateau
+    (``nextafter`` pairs). Both stay within the kC candidate budget (tie
+    sets wider than kC are outside the kernel's contract). The default fp32
+    kernel must return the exact top-K value set; natural random data never
+    triggers this, so the adversarial construction is the only regression
+    coverage."""
+    torch.manual_seed(3)
+    torch.cuda.manual_seed(3)
+    logits = (torch.randn(1, N, device="cuda") * 2.0).float().contiguous()
+    boundary = torch.topk(logits[0], top_k).values[top_k - 1].item()
+    n_tie = 2400 if band == "sub_resolution" else 2000
+    plant = torch.randperm(N)[:n_tie]
+    if band == "sub_resolution":
+        tie_vals = boundary + (
+            torch.arange(n_tie, dtype=torch.float32, device="cuda") - n_tie // 2
+        ) * 5e-8
+    else:
+        tie_vals = torch.full((n_tie,), boundary, device="cuda")
+        tie_vals[::2] = torch.nextafter(
+            tie_vals[::2], torch.tensor(float("inf"), device="cuda")
+        )
+    logits[0, plant] = tie_vals
+    seq_lens = torch.full((1,), N, dtype=torch.int32, device="cuda")
+    pre_idx = _make_r0_pre_idx(logits, top_k, "real", seed=4)
+
+    out = _run_gvr_direct(
+        logits, pre_idx, seq_lens, top_k, enable_r0=True, cluster_size=cluster_size
+    )
+
+    # Value-multiset exactness (the boundary index set is not unique under
+    # bitwise plateaus, so indices are compared through their values).
+    sel = logits[0][out[0].long()].sort().values
+    ref = torch.topk(logits[0], top_k).values.sort().values
+    torch.testing.assert_close(sel, ref, rtol=0.0, atol=0.0)
+
+
+@skip_not_sm100
 def test_cute_dsl_gvr_topk_decode_pick_config_policy():
     """``pick_config`` returns the runner-equivalent launch shapes.
 
