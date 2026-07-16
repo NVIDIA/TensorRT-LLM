@@ -641,10 +641,16 @@ class SpecMetadata:
         before the CUDA graph key is built.
         """
         from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
+        from tensorrt_llm._torch.pyexecutor.sampler.sampling_utils import \
+            GREEDY_TEMPERATURE_THRESHOLD
         from tensorrt_llm.sampling_params import SamplingParams
 
-        # Need to use a very small value for temperature when disabled to avoid division by 0
-        DISABLE_TEMP_VAL = 1e-5
+        # Sentinel temperature for greedy / temperature-disabled rows. Must stay
+        # strictly below GREEDY_TEMPERATURE_THRESHOLD so the sampling kernels
+        # recognize these rows as greedy; small enough that even if a row were
+        # (incorrectly) sampled, softmax(logits / val) is effectively one-hot,
+        # and non-zero to avoid division by 0.
+        DISABLE_TEMP_VAL = GREEDY_TEMPERATURE_THRESHOLD / 10
         # Very large values disable topk.
         DISABLE_TOPK_VAL = torch.iinfo(torch.int32).max
         DISABLE_TOPP_VAL = 1.0
