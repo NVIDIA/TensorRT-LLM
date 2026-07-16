@@ -16,6 +16,7 @@ from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import (
     CppMambaHybridCacheManager,
     PythonMambaCacheManager,
     _get_mamba_hybrid_pool_size,
+    calc_context_stop_positions,
 )
 from tensorrt_llm._torch.pyexecutor.resource_manager import CacheTypeCpp, DataType
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
@@ -340,6 +341,39 @@ def test_non_mtp_pytorch_prepare_and_get_state_indices_flow():
         mgr.mamba_cache_index[402],
         mgr.mamba_cache_index[CUDA_GRAPH_DUMMY_REQUEST_ID],
     ]
+
+
+def test_calc_context_stop_positions_returns_regular_snapshot_points():
+    assert calc_context_stop_positions(128, 32, 64) == [64, 128]
+    assert calc_context_stop_positions(150, 32, 64) == [64, 128]
+    assert calc_context_stop_positions(70, 32, 256) == []
+    assert calc_context_stop_positions(70, 32, 0) == []
+    assert calc_context_stop_positions(70, 32, None) == []
+
+
+def test_cpp_hybrid_prepare_expect_snapshot_points():
+    mgr = object.__new__(CppMambaHybridCacheManager)
+    mgr.kv_cache_config = KvCacheConfig(
+        enable_block_reuse=True,
+        mamba_state_cache_interval=64,
+    )
+    mgr.tokens_per_block = 32
+    mgr.linear_attention_metadata = SimpleNamespace(states_snapshot_interval=64)
+    request = SimpleNamespace(prompt_len=150, expect_snapshot_points=[999])
+
+    mgr.prepare_expect_snapshot_points([request])
+
+    assert request.expect_snapshot_points == [64, 128]
+
+
+def test_cpp_hybrid_prepare_expect_snapshot_points_clears_when_reuse_disabled():
+    mgr = object.__new__(CppMambaHybridCacheManager)
+    mgr.kv_cache_config = KvCacheConfig(enable_block_reuse=False)
+    request = SimpleNamespace(prompt_len=150, expect_snapshot_points=[64])
+
+    mgr.prepare_expect_snapshot_points([request])
+
+    assert request.expect_snapshot_points == []
 
 
 # ---------------------------------------------------------------------------

@@ -2115,6 +2115,33 @@ TEST_F(ForceChunkTest, CapacityExactFit)
     EXPECT_EQ(reqs[1]->getContextChunkSize(), 10);
 }
 
+TEST_F(ForceChunkTest, ExpectedChunkingPoints)
+{
+    // Expected snapshot points are absolute context positions.
+    auto reqs = initRequests({30});
+    reqs[0]->setExpectedSnapshotPoints({12, 25});
+
+    chunkIteration(reqs, 10);
+    expectPositions(reqs, {12}, "iter 1");
+
+    chunkIteration(reqs, 10);
+    expectPositions(reqs, {25}, "iter 2");
+
+    chunkIteration(reqs, 10);
+    expectPositions(reqs, {30}, "iter 3");
+}
+
+TEST_F(ForceChunkTest, CapacityRoundsExpectedChunkDownToUnit)
+{
+    auto reqs = initRequests({50});
+    reqs[0]->setExpectedSnapshotPoints({30});
+
+    MicroBatchScheduler::setCtxRequestsChunkSize(
+        reqs, Policy::kFORCE_CHUNK, /*ctxTokensCapacity=*/25, /*chunkUnitSize=*/10, std::nullopt);
+
+    EXPECT_EQ(reqs[0]->getContextChunkSize(), 20);
+}
+
 TEST_F(ForceChunkTest, MultiIteration)
 {
     // A request with prompt_len=25 and chunk_unit_size=10 processes in 3 iterations:
@@ -2203,6 +2230,31 @@ TEST_F(ForceChunkTest, FullSchedulerPath)
     // Despite budget=100 >> prompt=30, FORCE_CHUNK limits chunk to unit_size=10.
     ASSERT_EQ(contextRequests.size(), 1);
     EXPECT_EQ(contextRequests[0]->getContextChunkSize(), 10);
+    EXPECT_EQ(genRequests.size(), 0);
+}
+
+TEST_F(ForceChunkTest, FullSchedulerUsesExpectedChunkingPoints)
+{
+    batch_scheduler::ContextChunkingConfig chunkConfig;
+    chunkConfig.chunkingPolicy = Policy::kFORCE_CHUNK;
+    chunkConfig.chunkUnitSize = 10;
+
+    auto scheduler = std::make_shared<MicroBatchScheduler>(chunkConfig);
+
+    constexpr SizeType32 maxBatchSize = 4;
+    constexpr SizeType32 maxNumTokens = 100;
+
+    RequestVector activeRequests;
+    auto request = createRequest(/*promptLen=*/30, /*maxNewTokens=*/1, /*reqId=*/0);
+    request->setExpectedSnapshotPoints({12, 25});
+    activeRequests.push_back(request);
+
+    ReqIdsSet inflightReqIds;
+    auto const [contextRequests, genRequests]
+        = (*scheduler)(activeRequests, inflightReqIds, maxBatchSize, maxNumTokens);
+
+    ASSERT_EQ(contextRequests.size(), 1);
+    EXPECT_EQ(contextRequests[0]->getContextChunkSize(), 12);
     EXPECT_EQ(genRequests.size(), 0);
 }
 

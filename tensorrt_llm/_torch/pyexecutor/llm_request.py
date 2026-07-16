@@ -675,7 +675,6 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_logits_post_processors = kwargs.pop("py_logits_post_processors",
                                                     None)
         self.py_lora_path: str | None = kwargs.pop("py_lora_path", None)
-        self.expect_snapshot_points: list[int] = []
         # Multimodal data
         self.py_multimodal_data = kwargs.pop("py_multimodal_data", None)
         encoder_input_tokens = kwargs.get("encoder_input_tokens")

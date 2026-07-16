@@ -1136,24 +1136,20 @@ class MixedMambaHybridCacheManager(KVCacheManager, MambaCacheManager,
                                         kv_cache_dtype_byte_size)
 
 
-def calc_context_stop_positions(prompt_len: int,
-                                tokens_per_block: int,
-                                mamba_state_cache_interval: int,
-                                save_last_snapshot: bool = False) -> list[int]:
+def calc_context_stop_positions(
+        prompt_len: int, tokens_per_block: int,
+        mamba_state_cache_interval: Optional[int]) -> list[int]:
     """Compute token positions at which mamba state snapshots should be saved.
 
-    Returns positions spaced by ``mamba_state_cache_interval`` plus the final
-    prompt length (and optionally the last block-aligned position).
+    Returns regular interval boundaries. ``tokens_per_block`` is kept in the
+    signature for compatibility with the C++/V1 path.
     """
-    stop_positions = list(
-        range(mamba_state_cache_interval, prompt_len,
+    del tokens_per_block
+    if mamba_state_cache_interval is None or mamba_state_cache_interval <= 0:
+        return []
+    return list(
+        range(mamba_state_cache_interval, prompt_len + 1,
               mamba_state_cache_interval))
-    last_ckpt = prompt_len // tokens_per_block * tokens_per_block
-    if save_last_snapshot and (last_ckpt not in stop_positions):
-        stop_positions.append(last_ckpt)
-    if prompt_len not in stop_positions:
-        stop_positions.append(prompt_len)
-    return stop_positions
 
 
 @triton.jit
@@ -2016,13 +2012,31 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
             return indices
         return self.cuda_state_indices
 
+    def prepare_expect_snapshot_points(self,
+                                       requests: List[LlmRequest]) -> None:
+        """Set reusable Mamba snapshot boundaries before scheduling."""
+        if not self.kv_cache_config.enable_block_reuse:
+            for request in requests:
+                request.expect_snapshot_points = []
+            return
+
+        interval = self.linear_attention_metadata.states_snapshot_interval
+        if interval is None or interval <= 0:
+            for request in requests:
+                request.expect_snapshot_points = []
+            return
+
+        for request in requests:
+            request.expect_snapshot_points = calc_context_stop_positions(
+                request.prompt_len, self.tokens_per_block, interval)
+
     def calc_next_context_chunk_size(self, request: LlmRequest) -> int:
         """Compute the next prefill chunk size for a context request when block reuse is enabled.
 
-        When kv_cache_config.enable_block_reuse is True, context prefill must stop exactly at
-        the positions returned by calc_context_stop_positions (mamba_state_cache_interval boundaries
-        and block boundaries). This returns the chunk_size to use for the next prefill step so
-        that the next stop position is not exceeded.
+        When kv_cache_config.enable_block_reuse is True, context prefill must
+        stop at each regular interval returned by
+        calc_context_stop_positions. The prompt end remains an implicit final
+        boundary.
 
         Args:
             request: Context request with prompt_len and context_current_position set.

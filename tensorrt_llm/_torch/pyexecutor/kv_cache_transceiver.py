@@ -134,7 +134,7 @@ def create_kv_cache_transceiver(
             and isinstance(mamba_cache_manager, MixedMambaHybridCacheManager)):
         raise ValueError(
             "MixedMambaHybridCacheManager requires the Python transceiver "
-            "runtime with the NIXL backend in disaggregated serving.")
+            "runtime in disaggregated serving.")
 
     _validate_disagg_inflight_cancel_config(cache_transceiver_config)
 

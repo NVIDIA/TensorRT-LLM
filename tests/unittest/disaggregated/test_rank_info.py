@@ -1,5 +1,24 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from types import SimpleNamespace
+
 import numpy as np
 
+from tensorrt_llm import bindings
+from tensorrt_llm._torch.disaggregation.native import rank_info as rank_info_module
 from tensorrt_llm._torch.disaggregation.native.auxiliary import AuxBufferMeta
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
 
@@ -75,3 +94,31 @@ def test_rank_info_roundtrip_with_aux_meta():
     np.testing.assert_array_equal(restored.aux_meta.size, [1024, 2048])
     np.testing.assert_array_equal(restored.aux_meta.item_sizes, [64, 128])
     assert restored.aux_meta.device == "cpu"
+
+
+def test_from_kv_cache_manager_uses_first_nonzero_kv_head_count(monkeypatch):
+    monkeypatch.setattr(rank_info_module, "build_page_table_from_manager", lambda _: None)
+    mapping = SimpleNamespace(
+        rank=0,
+        tp_size=1,
+        tp_rank=0,
+        pp_size=1,
+        pp_rank=0,
+        dp_size=1,
+        cp_size=1,
+        cp_rank=0,
+        enable_attention_dp=False,
+    )
+    manager = SimpleNamespace(
+        mapping=mapping,
+        num_kv_heads_per_layer=[0, 8, 0],
+        pp_layers=[0, 1, 2],
+        tokens_per_block=32,
+        head_dim=128,
+        dtype=bindings.DataType.HALF,
+        kv_factor=2,
+    )
+
+    info = RankInfo.from_kv_cache_manager("ctx", manager, device_id=0)
+
+    assert info.attention.kv_heads_per_rank == 8
