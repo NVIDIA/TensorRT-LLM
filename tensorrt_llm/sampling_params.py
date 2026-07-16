@@ -140,7 +140,7 @@ class SamplingParams:
         pad_id (int, optional): The pad token id. Defaults to None.
         max_tokens (int): The maximum number of tokens to generate. Defaults to 32.
         bad (str, List[str], optional): A string or a list of strings that redirect the generation when they are generated, so that the bad strings are excluded from the returned output. Defaults to None.
-        bad_token_ids (List[int], optional): A list of token ids that redirect the generation when they are generated, so that the bad ids are excluded from the returned output. Defaults to None.
+        bad_token_ids (List[Union[int, List[int]]], optional): A list of bad token id sequences that redirect the generation when they are generated, so that the bad ids are excluded from the returned output. Each element is either a single token id or a list of token ids forming a multi-token bad word. Defaults to None.
         stop (str, List[str], optional): A string or a list of strings that stop the generation when they are generated. The returned output will not contain the stop strings unless include_stop_str_in_output is True. Defaults to None.
         stop_token_ids (List[int], optional): A list of token ids that stop the generation when they are generated. Defaults to None.
         include_stop_str_in_output (bool): Whether to include the stop strings in output text. Defaults to False.
@@ -221,7 +221,7 @@ class SamplingParams:
     pad_id: Optional[int] = None
     max_tokens: int = 32
     bad: Optional[Union[str, List[str]]] = None
-    bad_token_ids: Optional[List[int]] = None
+    bad_token_ids: Optional[List[Union[int, List[int]]]] = None
     _bad_word_ids: Optional[List[List[int]]] = field(default=None, init=False, repr=False)
     stop: Optional[Union[str, List[str]]] = None
     stop_token_ids: Optional[List[int]] = None
@@ -437,7 +437,7 @@ class SamplingParams:
     def _get_bad_words(self) -> List[List[int]]:
         words = []
         if self.bad_token_ids:
-            words = [[i] for i in self.bad_token_ids]
+            words = [[i] if isinstance(i, int) else list(i) for i in self.bad_token_ids]
 
         if self.bad is None:
             return words
