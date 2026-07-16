@@ -11,7 +11,7 @@ from utils.es import es_post, get_triaged_deps, save_triage_records
 from utils.report import diff_licenses, get_preapproved_deps_map, get_vulns, is_preapproved
 from utils.triage import call_triage_agent, extract_ticket_refs, format_risks_for_agent
 
-ES_POST_URL = os.environ.get("TRTLLM_ES_POST_URL")
+ES_POST_URL = os.environ.get("TRTLLM_ES_POST_URL", "")
 if not ES_POST_URL:
     raise EnvironmentError("Error: Environment variable 'TRTLLM_ES_POST_URL' is not set!")
 
@@ -33,6 +33,12 @@ def _run_triage(risk_docs: list, scan_type: str, branch: str, ts_created: int) -
     """Call triage agent for untriaged risk_docs; persist ticket records; return {pkg: ticket_url}."""
     if not risk_docs:
         return {}
+    print(
+        format_risks_for_agent(
+            [],
+            risk_docs,
+        )
+    )
     is_vuln = "vulnerability" in scan_type
     agent_resp = call_triage_agent(
         format_risks_for_agent(
@@ -40,6 +46,7 @@ def _run_triage(risk_docs: list, scan_type: str, branch: str, ts_created: int) -
             risk_docs if not is_vuln else [],
         )
     )
+    print(agent_resp)
     if not agent_resp:
         return {}
     ticket_refs = extract_ticket_refs(agent_resp)
@@ -52,7 +59,7 @@ def _run_triage(risk_docs: list, scan_type: str, branch: str, ts_created: int) -
     if license_ticket and license_ticket.get("ticket_url"):
         url = license_ticket["ticket_url"]
         for pkg in license_ticket.get("dependencies") or []:
-            new_tickets[pkg] = url
+            new_tickets[pkg.get("name")] = url
     if new_tickets:
         save_triage_records(
             ES_POST_URL,
@@ -96,8 +103,8 @@ def submit_source_code_vulns(
                 "s_severity": safe(v.get("Severity")),
                 "s_package_name": package_name,
                 "s_package_version": package_version,
-                "s_cve": safe(v.get("Related Vuln")),
-                "s_bdsa": safe(v.get("CVE ID")),
+                "s_cve": safe(v.get("Related Vuln", "N/A")),
+                "s_bdsa": safe(v.get("CVE ID"), "N/A"),
                 "d_score": safe(v.get("Score")),
                 "s_status": safe(v.get("Status")),
                 "s_published_date": safe(v.get("Vulnerability Published Date")),
@@ -107,16 +114,17 @@ def submit_source_code_vulns(
                     or "N/A"
                 ),
                 "s_license_ids": "N/A",
-                "s_ticket_url": triaged_deps.get(package_name),
+                "s_ticket_url": triaged_deps.get(package_name, "N/A"),
             }
             if package_name not in triaged_deps:
                 risks_to_report.append(doc)
             bulk_documents.append(doc)
-
-        new_tickets = _run_triage(risks_to_report, SCAN_TYPE, build_metadata["ref"], ts)
-        for doc in bulk_documents:
-            if doc["s_package_name"] in new_tickets:
-                doc["s_ticket_url"] = new_tickets[doc["s_package_name"]]
+        if risks_to_report:
+            new_tickets = _run_triage(risks_to_report, SCAN_TYPE, build_metadata["ref"], ts)
+            print(new_tickets)
+            for doc in bulk_documents:
+                if doc["s_package_name"] in new_tickets:
+                    doc["s_ticket_url"] = new_tickets[doc["s_package_name"]]
 
         if bulk_documents:
             _, errors = es_post(ES_POST_URL, bulk_documents)
@@ -198,10 +206,12 @@ def submit_source_code_licenses(
                 "s_purl": purl,
                 "s_supplier": supplier,
                 "s_package_fix_version": "N/A",
+                "s_cve": "N/A",
+                "s_bdsa": "N/A",
                 "s_license_ids": ",".join(license_ids),
                 "s_bom_ref": component.get("bom-ref"),
                 "s_component_type": component.get("type"),
-                "s_ticket_url": triaged_deps.get(package_name),
+                "s_ticket_url": triaged_deps.get(package_name, "N/A"),
             }
             if package_name not in triaged_deps and not is_preapproved(
                 map_preapproved, package_name, (component.get("type") or "unknown").lower()
@@ -209,10 +219,12 @@ def submit_source_code_licenses(
                 risks_to_report.append(doc)
             sbom_documents.append(doc)
 
-        new_tickets = _run_triage(risks_to_report, SCAN_TYPE, build_metadata["ref"], ts)
-        for doc in sbom_documents:
-            if doc["s_package_name"] in new_tickets:
-                doc["s_ticket_url"] = new_tickets[doc["s_package_name"]]
+        if risks_to_report:
+            new_tickets = _run_triage(risks_to_report, SCAN_TYPE, build_metadata["ref"], ts)
+            print(new_tickets)
+            for doc in sbom_documents:
+                if doc["s_package_name"] in new_tickets:
+                    doc["s_ticket_url"] = new_tickets[doc["s_package_name"]]
 
         if sbom_documents:
             _, sbom_errors = es_post(ES_POST_URL, sbom_documents)
@@ -269,18 +281,19 @@ def submit_container_vulns(
             "s_package_fix_version": v.get("fix") or "N/A",
             "s_license_ids": "N/A",
             "s_cve": v.get("vuln"),
+            "s_bdsa": "N/A",
             "s_cve_url": v.get("url"),
             "s_package_paths": ",".join(v.get("package_paths", [])),
-            "s_ticket_url": triaged_deps.get(package_name),
+            "s_ticket_url": triaged_deps.get(package_name, ""),
         }
         if package_name not in triaged_deps:
             risks_to_report.append(doc)
         docs.append(doc)
-
-    new_tickets = _run_triage(risks_to_report, SCAN_TYPE, build_metadata["ref"], ts)
-    for doc in docs:
-        if doc["s_package_name"] in new_tickets:
-            doc["s_ticket_url"] = new_tickets[doc["s_package_name"]]
+    if risks_to_report:
+        new_tickets = _run_triage(risks_to_report, SCAN_TYPE, build_metadata["ref"], ts)
+        for doc in docs:
+            if doc["s_package_name"] in new_tickets:
+                doc["s_ticket_url"] = new_tickets[doc["s_package_name"]]
 
     if docs:
         _, errors = es_post(ES_POST_URL, docs)
@@ -351,9 +364,11 @@ def submit_container_licenses(
             "s_package_name": package_name,
             "s_package_version": package_version,
             "s_package_type": v.get("type"),
+            "s_cve": "N/A",
+            "s_bdsa": "N/A",
             "s_package_fix_version": "N/A",
             "s_license_ids": ",".join(license_ids),
-            "s_ticket_url": triaged_deps.get(package_name),
+            "s_ticket_url": triaged_deps.get(package_name, ""),
         }
         if package_name not in triaged_deps and not is_preapproved(
             map_preapproved, package_name, (v.get("type") or "unknown").lower()
@@ -361,10 +376,11 @@ def submit_container_licenses(
             risks_to_report.append(doc)
         docs.append(doc)
 
-    new_tickets = _run_triage(risks_to_report, SCAN_TYPE, build_metadata["ref"], ts)
-    for doc in docs:
-        if doc["s_package_name"] in new_tickets:
-            doc["s_ticket_url"] = new_tickets[doc["s_package_name"]]
+    if risks_to_report:
+        new_tickets = _run_triage(risks_to_report, SCAN_TYPE, build_metadata["ref"], ts)
+        for doc in docs:
+            if doc["s_package_name"] in new_tickets:
+                doc["s_ticket_url"] = new_tickets[doc["s_package_name"]]
 
     if docs:
         _, errors = es_post(ES_POST_URL, docs)
