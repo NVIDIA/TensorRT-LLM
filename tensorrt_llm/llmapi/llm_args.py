@@ -18,6 +18,7 @@ import functools
 import json
 import math
 import os
+import re
 import types
 from abc import ABC, abstractmethod
 from collections import defaultdict
@@ -412,8 +413,7 @@ class EncodeCudaGraphConfig(BaseCudaGraphConfig):
     @staticmethod
     def _generate_cuda_graph_seq_lens(max_seq_len: int,
                                       enable_padding: bool) -> List[int]:
-        """
-        Generate a list of max per-request sequence lengths for encoder CUDA graphs.
+        """Generate a list of max per-request sequence lengths for encoder CUDA graphs.
 
         Args:
             max_seq_len: Maximum per-request sequence length to generate up to.
@@ -511,6 +511,38 @@ class MultimodalEncoderCudaGraphConfig(StrictBaseModel):
         return self
 
 
+_BYTE_STRING_PATTERN = re.compile(r"^\s*(\d+)\s*([kmgt]i?b|b)?\s*$",
+                                  re.IGNORECASE)
+_BINARY_BYTE_UNITS: dict[Optional[str], int] = {
+    None: 1,
+    "b": 1,
+    "kb": 1024,
+    "kib": 1024,
+    "mb": 1024**2,
+    "mib": 1024**2,
+    "gb": 1024**3,
+    "gib": 1024**3,
+    "tb": 1024**4,
+    "tib": 1024**4,
+}
+
+
+def _parse_binary_byte_string(value: Any) -> Any:
+    if not isinstance(value, str):
+        return value
+
+    match = _BYTE_STRING_PATTERN.fullmatch(value)
+    if match is None:
+        raise ValueError(
+            "Byte strings must be non-negative integers with optional "
+            "B/KB/MB/GB/TB or KiB/MiB/GiB/TiB suffix.")
+
+    amount = int(match.group(1))
+    unit = match.group(2)
+    multiplier = _BINARY_BYTE_UNITS[unit.lower() if unit is not None else None]
+    return amount * multiplier
+
+
 class MultimodalConfig(StrictBaseModel):
     """Multimodal model configuration."""
 
@@ -530,7 +562,22 @@ class MultimodalConfig(StrictBaseModel):
         description=
         ("Maximum number of pending multimodal requests whose encoder work can be prefetched "
          "on a side CUDA stream ahead of admission. 0 disables side-stream prefetch. "
-         "Incompatible with encoder_cuda_graph because graph replay uses static buffers."
+         "Incompatible with encoder_cuda_graph because graph replay uses static buffers. "
+         "For the time being, this is also incompatible with encoder_cache_max_bytes > 0."
+         ),
+        status="prototype",
+    )
+
+    encoder_cache_max_bytes: NonNegativeInt = Field(
+        default=134_217_728,  # 128 MiB.
+        description=
+        ("Maximum bytes for the per-model cross-request multimodal encoder embedding cache. "
+         "Set to 0 to disable. String values such as '512MB' and '1GiB' use binary units. "
+         "Cache entries are per multimodal item, but reuse is all-or-nothing for each request: "
+         "every item in the request must hit the cache before cached embeddings are reused. "
+         "Only single-modality requests are cacheable for the time being. "
+         "For the time being, this is incompatible with encoder_side_stream_max_ahead > 0. "
+         "NOTE: This is only valid for child implementations of the `MultimodalModelMixin`."
          ),
         status="prototype",
     )
@@ -546,8 +593,13 @@ class MultimodalConfig(StrictBaseModel):
         status="prototype",
     )
 
+    @field_validator('encoder_cache_max_bytes', mode='before')
+    @classmethod
+    def parse_encoder_cache_max_bytes(cls, value):
+        return _parse_binary_byte_string(value)
+
     @model_validator(mode='after')
-    def validate_side_stream_cuda_graph_exclusive(self) -> 'MultimodalConfig':
+    def validate_encoder_optimization_compatibility(self) -> 'MultimodalConfig':
         if (self.encoder_cuda_graph is not None
                 and self.encoder_side_stream_max_ahead > 0):
             raise ValueError(
@@ -555,6 +607,14 @@ class MultimodalConfig(StrictBaseModel):
                 "multimodal_config.encoder_side_stream_max_ahead > 0 are "
                 "mutually exclusive. Disable side-stream MM prefetch or "
                 "disable MM encoder CUDA graphs.")
+        # TODO(TRTLLM-14034): Make encoder side-stream read and write from the cache.
+        if (self.encoder_cache_max_bytes > 0
+                and self.encoder_side_stream_max_ahead > 0):
+            raise ValueError(
+                "multimodal_config.encoder_cache_max_bytes > 0 and "
+                "multimodal_config.encoder_side_stream_max_ahead > 0 are "
+                "mutually exclusive. Disable side-stream MM prefetch or set "
+                "the MM encoder cache capacity to 0.")
         return self
 
 
@@ -3668,6 +3728,17 @@ class ExtendedRuntimePerfKnobConfig(StrictBaseModel, PybindMirror):
         return res
 
 
+# Legacy env-var selectors for the "DEFAULT" cache-transceiver backend,
+# ordered by priority. Single source of truth shared with
+# _torch/pyexecutor/kv_cache_transceiver.py.
+_CACHE_TRANSCEIVER_BACKEND_ENV_VARS = (
+    ("TRTLLM_USE_NIXL_KVCACHE", "NIXL"),
+    ("TRTLLM_USE_UCX_KVCACHE", "UCX"),
+    ("TRTLLM_USE_MOONCAKE_KVCACHE", "MOONCAKE"),
+    ("TRTLLM_USE_MPI_KVCACHE", "MPI"),
+)
+
+
 @PybindMirror.mirror_pybind_fields(_CacheTransceiverConfig)
 class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
     """Configuration for the cache transceiver."""
@@ -3678,11 +3749,16 @@ class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
             description=
             "The communication backend type to use for the cache transceiver.")
 
-    transceiver_runtime: Optional[Literal["CPP", "PYTHON"]] = Field(
-        default=None,
+    transceiver_runtime: Optional[Literal["CPP", "PYTHON", "auto"]] = Field(
+        default="auto",
         description=
-        "The runtime implementation. 'CPP' for C++ transceiver (default when not set), 'PYTHON' for Python transceiver."
-    )
+        "The runtime implementation. 'auto' (default) adopts the model's "
+        "preferred runtime when the effective backend supports it, and falls "
+        "back to the C++ transceiver otherwise. 'CPP' selects the C++ "
+        "transceiver, 'PYTHON' the Python transceiver. None is equivalent to "
+        "'CPP'. The model preference is only consulted on the PyTorch "
+        "backend's standard model-loading path; other paths (e.g. AutoDeploy) "
+        "fall back to the C++ transceiver under 'auto'.")
 
     max_tokens_in_buffer: Optional[int] = Field(
         default=None,
@@ -3712,6 +3788,20 @@ class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
         description=
         "Per-region size in MiB of the native-disagg KV-cache bounce buffer (one for send, one for recv). Bounce coalesces a request's scattered per-block KV into one contiguous fabric-VMM buffer and issues a single multi-rail NIXL write. The size doubles as the on/off switch: 0 (default) keeps the per-block path, >0 enables bounce at that capacity. Only used by the Python (v2) transceiver."
     )
+
+    def _resolve_default_backend(self) -> Tuple[Optional[str], Optional[str]]:
+        """Effective backend after resolving "DEFAULT" against legacy env vars.
+
+        Returns (effective_backend, env_var) where env_var is the legacy
+        environment variable that determined the choice, or None when the
+        backend was explicit or no env var was set (NIXL fallback).
+        """
+        if self.backend != "DEFAULT":
+            return self.backend, None
+        for env_var, backend in _CACHE_TRANSCEIVER_BACKEND_ENV_VARS:
+            if os.getenv(env_var) == "1":
+                return backend, env_var
+        return "NIXL", None
 
     def _to_pybind(self):
         return _CacheTransceiverConfig(
@@ -4529,6 +4619,16 @@ class TorchLlmArgs(BaseLlmArgs):
         description="Multimodal model configuration.",
         status="prototype")
 
+    @field_validator('multimodal_config', mode='before')
+    @classmethod
+    def init_multimodal_config(cls, v):
+        # The field is non-Optional, but callers (e.g. the multimodal
+        # quickstart) pass None to mean "unset". Coerce None back to the
+        # default so it does not fail type validation.
+        if v is None:
+            return MultimodalConfig()
+        return v
+
     attention_dp_config: Optional[AttentionDpConfig] = Field(
         default=None,
         description="Optimized load-balancing for the DP Attention scheduler.",
@@ -4770,6 +4870,18 @@ class TorchLlmArgs(BaseLlmArgs):
         "Only load/execute the vision encoder part of the full model. Defaults to False.",
         status="prototype")
 
+    disable_mm_encoder: bool = Field(
+        default=False,
+        description=
+        "Skip instantiating and loading the multimodal (e.g. vision) encoder "
+        "of a multimodal checkpoint and serve it text-only. Saves the "
+        "encoder's GPU memory (enlarging the KV cache pool) for workloads "
+        "that never send image/video/audio inputs; such requests are "
+        "rejected. Only takes effect for model implementations that support "
+        "it (currently the Qwen3-VL / Qwen3.5-VL family); a no-op otherwise. "
+        "Defaults to False.",
+        status="prototype")
+
     encode_only: bool = Field(
         default=False,
         description=
@@ -4940,6 +5052,11 @@ class TorchLlmArgs(BaseLlmArgs):
                 "Use encode_only=True for LLM.encode(), or use "
                 "MultimodalEncoder/mm_encoder_only for multimodal encoder "
                 "execution.")
+        if self.disable_mm_encoder and self.mm_encoder_only:
+            raise ValueError(
+                "disable_mm_encoder and mm_encoder_only are mutually "
+                "exclusive: one skips the multimodal encoder, the other runs "
+                "only the multimodal encoder.")
         return self
 
     @model_validator(mode="after")

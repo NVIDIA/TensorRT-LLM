@@ -123,6 +123,10 @@ methods:
         annotation: bool
         default: False
         status: prototype
+      disable_mm_encoder:
+        annotation: bool
+        default: False
+        status: prototype
       encode_only:
         annotation: bool
         default: False
