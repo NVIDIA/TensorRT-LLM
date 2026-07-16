@@ -2040,7 +2040,8 @@ def kv_cache_compression_supported_with_spec(
     """Decide, before any manager is created, whether the configured
     compression method supports the speculative setup. Logs the reason and
     returns False when it does not; the run then stays uncompressed."""
-    if spec_config is None or not config.is_eviction_method():
+    if (spec_config is None
+            or not config.kv_cache_compression_mode.is_eviction_method()):
         return True
     # Evicting methods co-compact the draft KV, so they only support spec
     # modes whose draft KV is a standard paged cache in the same forward

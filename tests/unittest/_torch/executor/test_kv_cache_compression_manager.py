@@ -299,7 +299,7 @@ class TestFactory:
         from tensorrt_llm.llmapi.llm_args import KvCacheCompressionConfig
 
         config = KvCacheCompressionConfig(algorithm="offload")
-        assert config.is_eviction_method() is False
+        assert config.kv_cache_compression_mode.is_eviction_method() is False
         m = BaseKVCacheCompressionManager(_v2_manager(is_draft=False))
         assert not hasattr(m, "spec_config")
 
