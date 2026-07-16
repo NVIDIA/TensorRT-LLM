@@ -140,9 +140,7 @@ class WanDMDPipeline(WanPipeline):
         nw = latents.shape[4] // pw
         start = time.time()
         for i, t in enumerate(timesteps):
-            t_tensor = torch.full(
-                (latents.shape[0], nf * nh * nw), float(t), device=latents.device
-            )
+            t_tensor = torch.full((latents.shape[0], nf * nh * nw), float(t), device=latents.device)
 
             pred_noise = self.transformer(
                 hidden_states=latents,
@@ -156,8 +154,10 @@ class WanDMDPipeline(WanPipeline):
             if i < num_steps - 1:
                 sigma_next = timesteps[i + 1] / self.NUM_TRAIN_TIMESTEPS
                 noise = randn_tensor(
-                    latents.shape, generator=generator,
-                    device=latents.device, dtype=self.dtype,
+                    latents.shape,
+                    generator=generator,
+                    device=latents.device,
+                    dtype=self.dtype,
                 )
                 latents = (1.0 - sigma_next) * pred_video + sigma_next * noise
             else:
