@@ -58,7 +58,7 @@ def format_risks_for_agent(vuln_docs: list, license_docs: list) -> list:
             items.append(item)
     for doc in license_docs:
         lics = doc.get("s_license_ids", "")
-        if lics == "Unknown License":
+        if lics == "Unknown License" or lics == "":
             item = _license_doc_to_agent_item(doc)
             key = (item["dependency_name"], item["current_version"], item["action_type"])
             if key not in seen:
@@ -107,6 +107,7 @@ def extract_ticket_refs(agent_response: dict) -> dict:
     """
     refs = {}
 
+    print(agent_response)
     agent_resp_value = json.loads(agent_response.get("value", "{}"))
     license_ticket = agent_resp_value.get("license_correction_ticket")
     if license_ticket and license_ticket.get("link"):
