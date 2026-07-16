@@ -18,10 +18,11 @@ import math
 import os
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 import pytest
 import torch
+import torch.nn.functional as F
 
 import tensorrt_llm
 import tensorrt_llm.bindings
@@ -32,7 +33,6 @@ from tensorrt_llm._torch.attention_backend.sparse.deepseek_v4 import (
 from tensorrt_llm._torch.attention_backend.sparse.dsa import (HAS_FAST_HADAMARD,
                                                               DSACacheManager)
 from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
-from tensorrt_llm._torch.attention_backend.vanilla import VanillaIndexer
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.modules.mla import MLA
@@ -57,6 +57,82 @@ try:
     HAS_FLASH_MLA = True
 except ImportError:
     HAS_FLASH_MLA = False
+
+
+class VanillaIndexer:
+    """fp32 reference for the production DSA / DeepSeek-V4 sparse ``Indexer``.
+
+    Wraps a production ``Indexer`` instance and reproduces its selection math in
+    plain fp32 (index-space query projection, per-head token weights, logit
+    scoring, top-k) so the trtllm indexer's selection can be compared against a
+    same-weights reference. Algorithm-specific K comes from a compressor / ``wk``
+    projection, so the caller supplies the reference K.
+
+    Selection is discrete: top-k over near-tied logits, and an fp32 reference vs
+    an fp8/fp4 kernel can pick different borderline tokens. Compare the selected
+    index *set*, never exact attention outputs.
+    """
+
+    def __init__(self, indexer):
+        self.indexer = indexer
+        self.n_heads = indexer.n_heads
+        self.head_dim = indexer.head_dim
+        self.rope_dim = indexer.rope_dim
+        self.softmax_scale = indexer.softmax_scale
+        self.indexer_k_dtype = getattr(indexer, "indexer_k_dtype", None)
+
+    @property
+    def uses_fp4(self) -> bool:
+        return self.indexer_k_dtype == "fp4"
+
+    def project_query(
+        self,
+        qr: torch.Tensor,
+        position_ids: torch.Tensor,
+        freqs_cis: torch.Tensor,
+        rope_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
+        *,
+        fp4_prep: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
+    ) -> torch.Tensor:
+        """Index-space query: ``wq_b`` GEMM + RoPE on the rope slice.
+
+        ``rope_fn(slice, freqs)`` applies RoPE in place (the caller injects the
+        algorithm's rotary helper). ``fp4_prep`` optionally applies the fp4
+        indexer quant/dequant. Returns ``[num_tokens, n_heads, head_dim]``.
+        """
+        num_tokens = qr.shape[0]
+        q = F.linear(qr, self.indexer.wq_b.weight)
+        q = q.view(num_tokens, self.n_heads, self.head_dim).unsqueeze(0)
+        rope_fn(q[..., -self.rope_dim:], freqs_cis[position_ids.long()])
+        q = q.squeeze(0)
+        if fp4_prep is not None:
+            q = fp4_prep(q)
+        return q
+
+    def token_weights(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Per-head token weights: ``weights_proj`` GEMM scaled by ``n_heads**-0.5``."""
+        weights = F.linear(hidden_states, self.indexer.weights_proj.weight)
+        return weights.float() * (self.n_heads**-0.5)
+
+    def scores(self, q_row: torch.Tensor, k: torch.Tensor,
+               weights_row: torch.Tensor) -> torch.Tensor:
+        """Per-KV index logits for one query token (fp32)."""
+        head_scores = torch.einsum("hd,kd->hk", q_row.float(), k.float())
+        head_scores = F.relu(head_scores) * self.softmax_scale
+        return (head_scores * weights_row.float().unsqueeze(-1)).sum(dim=0)
+
+    def topk_from_scores(self, scores: torch.Tensor,
+                         topk_tokens: int) -> torch.Tensor:
+        """Top-k KV positions for one query token, ``-1``-padded to ``topk_tokens``."""
+        row = torch.full((topk_tokens, ),
+                         -1,
+                         dtype=torch.int32,
+                         device=scores.device)
+        if scores.numel() == 0:
+            return row
+        k = min(topk_tokens, scores.numel())
+        row[:k] = torch.topk(scores.float(), k, dim=-1).indices.to(torch.int32)
+        return row
 
 
 @dataclass
