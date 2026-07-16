@@ -174,12 +174,54 @@ ENABLE_NGC_RELEASE_IMAGE_TEST = params.enableNgcReleaseImageTest ?: false
 
 COMMON_SSH_OPTIONS = "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o TCPKeepAlive=no -o ServerAliveInterval=30 -o ServerAliveCountMax=20"
 
+// Per-stage CBTS coverage exclusions applied on top of the upstream eligibility decision.
+CBTS_EXCLUDE_STAGES = [] as Set
+
+def isCbtsStage(String stageName) {
+    // Pipeline-level eligibility (post-merge gate + kill switch) is decided in L0_MergeRequest.groovy and propagated via testFilter.
+    if (!(testFilter[(CBTS_COVERAGE)] ?: false)) {
+        return false
+    }
+    // Perf stages skip coverage to avoid skewing measurements (perfMode == stageName.contains("Perf")).
+    if (stageName.contains("Perf")) {
+        return false
+    }
+    // Skip stages with no product Python coverage: TensorRT (legacy), CPP (gtest), AutoDeploy (leaving L0).
+    if (stageName.contains("TensorRT") || stageName.contains("CPP") || stageName.contains("AutoDeploy")) {
+        return false
+    }
+    // Phase 1: single-GPU only; multi-GPU / multi-node stages carry the "_GPUs" / "_Nodes" token.
+    if (stageName.contains("_GPUs") || stageName.contains("_Nodes")) {
+        return false
+    }
+    return !CBTS_EXCLUDE_STAGES.contains(stageName)
+}
+
 def scpFromRemoteCmd(Map remote, String remotePath, String localPath) {
     String portOpt = remote.port ? "-P ${remote.port} " : ""
     if (remote.privateKeyPath) {
         return "scp -i ${remote.privateKeyPath} ${portOpt}-r -p ${COMMON_SSH_OPTIONS} ${remote.user}@${remote.host}:${remotePath} ${localPath}"
     }
     return "sshpass -p '${remote.passwd}' scp ${portOpt}-r -p ${COMMON_SSH_OPTIONS} ${remote.user}@${remote.host}:${remotePath} ${localPath}"
+}
+
+// Print the last `lines` lines of the remote Slurm job log file to the console when the Slurm job fails.
+// If the log file does not exist, print a message to the console.
+def echoRemoteLogTail(def pipeline, Map remote, String remotePath, int lines = 200) {
+    pipeline.echo("===== Last ${lines} lines of ${remotePath} on ${remote.host} =====")
+    try {
+        def tailOut = Utils.exec(
+            pipeline,
+            script: Utils.sshUserCmd(remote,
+                "\"bash -c 'if [ -f \\\"${remotePath}\\\" ]; then tail -n ${lines} -- \\\"${remotePath}\\\"; " +
+                "else echo \\\"[log not found: ${remotePath}]\\\"; fi'\""),
+            returnStdout: true,
+            numRetries: 1,
+        )?.trim()
+        pipeline.echo(tailOut ?: "")
+    } catch (Exception tailEx) {
+        pipeline.echo("Ignorable warning: could not tail ${remotePath} on ${remote.host}: ${tailEx.message}")
+    }
 }
 
 // `postTag` uniquifies the uploaded tar filename, the Artifactory guard key and
@@ -227,6 +269,41 @@ def uploadResults(def pipeline, SlurmCluster cluster, String clusterName, String
                     ? "${perfResultsBasePath}/${perfFolders[0]}"
                     : "{${perfFolders.collect { "${perfResultsBasePath}/${it}" }.join(',')}}"
                 downloadPerfResultSucceed = Utils.exec(pipeline, script: scpFromRemoteCmd(remote, scpSources, "${stageName}/"), returnStatus: true, numRetries: 3) == 0
+            }
+
+            // Pull this stage's per-process .cbtscov files as one archive into ${stageName}/cbts/; bounded and non-fatal.
+            if (isCbtsStage(stageName)) {
+                def remoteWs = "/home/svc_tensorrt/bloom/scripts/${nodeName}"
+                def cbtsLocalDir = "${stageName}/cbts"
+                def cbtsArchive = "cbts_coverage_${stageName}.tar.gz"
+                sh "mkdir -p ${cbtsLocalDir}"
+                try {
+                    timeout(time: 5, unit: 'MINUTES') {
+                        // Pack on the login node; drop a partial archive when nothing matches so the scp fails cleanly.
+                        Utils.exec(
+                            pipeline,
+                            script: Utils.sshUserCmd(
+                                remote,
+                                "\"cd '${remoteWs}' && tar czf '${cbtsArchive}' .cbtscov.${stageName}* 2>/dev/null || rm -f '${cbtsArchive}'\""
+                            ),
+                            returnStatus: true,
+                            numRetries: 3,
+                        )
+                        def gotArchive = Utils.exec(
+                            pipeline,
+                            script: scpFromRemoteCmd(remote, "${remoteWs}/${cbtsArchive}", "${cbtsLocalDir}/"),
+                            returnStatus: true,
+                            numRetries: 3,
+                        ) == 0
+                        if (gotArchive) {
+                            sh "tar xzf ${cbtsLocalDir}/${cbtsArchive} -C ${cbtsLocalDir}/ && rm -f ${cbtsLocalDir}/${cbtsArchive}"
+                        } else {
+                            echo "CBTS: no coverage archive retrieved for ${stageName} (no coverage data or transfer skipped)."
+                        }
+                    }
+                } catch (Exception e) {
+                    echo "CBTS: coverage pull for ${stageName} skipped (${e.message}); continuing."
+                }
             }
 
             echo "hasTimeoutTest: ${hasTimeoutTest}, downloadResultSucceed: ${downloadResultSucceed}, downloadPerfResultSucceed: ${downloadPerfResultSucceed}"
@@ -290,7 +367,6 @@ def runIsolatedTests(preprocessedLists, testCmdLine, llmSrc, stageName) {
         isolateTestCmdLine += ["--test-prefix=${stageName}"]
         isolateTestCmdLine += ["--csv=${WORKSPACE}/${stageName}/report_isolated_${i}.csv"]
         isolateTestCmdLine += ["--periodic-junit-xmlpath ${WORKSPACE}/${stageName}/results_isolated_${i}.xml"]
-        isolateTestCmdLine += ["--cov-append"]  // Append coverage data to avoid overwriting previous data
 
         try {
             sh """
@@ -751,9 +827,12 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
                         throw e
                     } catch (Exception e) {
                         if (e.message?.contains("is no longer active")) {
+                            def slurmLogPath = "/home/svc_tensorrt/slurm-logs/slurm-${slurmJobID}-${nodeName}.out"
+                            echoRemoteLogTail(pipeline, remote, slurmLogPath)
                             throw new InfraFailure(
-                                "${e.message}. Check SLURM logs at /home/svc_tensorrt/slurm-logs/slurm-${slurmJobID}-${nodeName}.out on ${cluster.host}",
-                                e, InfraFailure.TRANSIENT, InfraFailure.SLURM, "<typed:slurm-job-inactive>")
+                                "${e.message}. Check SLURM logs at ${slurmLogPath} on ${cluster.host}",
+                                e, InfraFailure.TRANSIENT, InfraFailure.SLURM, "<typed:slurm-job-inactive>"
+                            )
                         }
                         // Otherwise, log the error but continue (SSH might be temporarily unavailable)
                         pipeline.echo("Warning: Could not check SLURM job status: ${e.message}")
@@ -1023,7 +1102,6 @@ def getPytestBaseCommandLine(
     String waivesFilePath,
     Boolean perfMode,
     String outputPath,
-    String trtllmWheelPath,
     String coverageConfigFile,
     String pytestUtil = "",
     List<String> extraArgs = [],
@@ -1032,6 +1110,7 @@ def getPytestBaseCommandLine(
 ) {
     def extraInternalEnv = ""
     def pytestTestTimeout = "3600"
+    def cbtsMode = isCbtsStage(stageName)
 
     // TRT uses half of the host logic cores for engine building which is bad for multi-GPU machines.
     extraInternalEnv = "__LUNOWUD=\"-thread_pool_size=${TESTER_CORES}\""
@@ -1041,6 +1120,13 @@ def getPytestBaseCommandLine(
     extraInternalEnv += " NCCL_DEBUG=INFO"
     // Pass stage name to perf sanity tests for OpenSearch tracking
     extraInternalEnv += " stageName=${stageName}"
+    // CBTS stages put cbts_plugin on PYTHONPATH (via ${VAR:-} for set -u safety) plus the marker/config env vars sitecustomize.py reads in subprocesses.
+    if (cbtsMode) {
+        def cbtsScriptDir = "${llmSrc}/jenkins/scripts/cbts/coverage_utils"
+        extraInternalEnv += " PYTHONPATH=${cbtsScriptDir}:\${PYTHONPATH:-}"
+        extraInternalEnv += " CBTS_COVERAGE_CONFIG=${coverageConfigFile}"
+        extraInternalEnv += " CBTS_MARKER_FILE=${outputPath}/cbts_current_test.txt"
+    }
 
     // Container port allocation environment variables for avoiding port conflicts
     def portEnvVars = ""
@@ -1074,11 +1160,8 @@ def getPytestBaseCommandLine(
         "--output-dir=${outputPath}/",
         "--csv=${outputPath}/report.csv",
         "-o junit_logging=${jUnitLogging}",
-        "--cov=${llmSrc}/examples/",
-        "--cov=${llmSrc}/tensorrt_llm/",
-        "--cov=${trtllmWheelPath}/tensorrt_llm/",
-        "--cov-report=",
-        "--cov-config=${coverageConfigFile}",
+        // Coverage capture: only CBTS (post-merge) stages instrument, via cbts_plugin / sitecustomize.
+        cbtsMode ? "-p cbts_plugin" : "",
         "--periodic-junit",
         "--periodic-junit-xmlpath ${outputPath}/results.xml",
         "--periodic-batch-size=1",
@@ -1275,16 +1358,20 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     )
                 }
 
-                // generate .coveragerc in workspace and add file path to pytest command
-                sh """
-                    touch ./.coveragerc
-                    echo '[run]' > ./.coveragerc
-                    echo 'branch = True' >> ./.coveragerc
-                    echo 'data_file = ${jobWorkspace}/.coverage.${stageName}' >> ./.coveragerc
-                    echo '[paths]' >> ./.coveragerc
-                    echo 'source =\n    ${llmSrcNode}/tensorrt_llm/\n    ---wheel_path---/tensorrt_llm//tensorrt_llm/' >> ./.coveragerc
-                    cat ./.coveragerc
-                """
+                // Generate .coveragerc: CBTS stages render coveragerc.template; all other stages get an empty rcfile (no coverage).
+                if (isCbtsStage(stageName)) {
+                    // @TRTLLM_WHEEL_PATH@ stays a placeholder; slurm_run.sh substitutes it on the worker.
+                    sh """
+                        cp ${llmSrcLocal}/jenkins/scripts/cbts/coverage_utils/coveragerc.template ./.coveragerc
+                        sed -i \\
+                            -e 's|@JOB_WORKSPACE@|${jobWorkspace}|g' \\
+                            -e 's|@STAGE_NAME@|${stageName}|g' \\
+                            ./.coveragerc
+                        cat ./.coveragerc
+                    """
+                } else {
+                    sh "touch ./.coveragerc"
+                }
 
                 Utils.copyFileToRemoteHost(
                     pipeline,
@@ -1328,7 +1415,6 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     waivesListPathNode,
                     perfMode,
                     jobWorkspace,
-                    "__PLACEHOLDER_TRTLLM_WHL_PATH__",
                     "$jobWorkspace/.coveragerc",
                     pytestUtil,
                     extraArgs,
@@ -1975,6 +2061,9 @@ def DEBUG_MODE = "debug"
 def DETAILED_LOG = "detailed_log"
 @Field
 def CBTS_RESULT = "cbts_result"
+// Pipeline-level CBTS coverage eligibility, decided in L0_MergeRequest.groovy.
+@Field
+def CBTS_COVERAGE = "cbts_coverage"
 // Suffix for CBTS-narrowed stages so their results aren't reused by non-CBTS runs.
 // A suffix (not prefix) keeps the GPU type as the first '-' token for positional parsers.
 @Field
@@ -1998,6 +2087,7 @@ def testFilter = [
     (AUTO_TRIGGER_TAG_LIST): [],
     (DETAILED_LOG): false,
     (CBTS_RESULT): null,
+    (CBTS_COVERAGE): false,
 ]
 
 @Field
@@ -3766,14 +3856,19 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         sh "echo ${TRTLLM_WHL_PATH}"
         def coverageConfigFile = "${llmSrc}/${stageName}/.coveragerc"
         sh "mkdir -p ${llmSrc}/${stageName} && touch ${coverageConfigFile}"
-        sh """
-            echo '[run]' > ${coverageConfigFile}
-            echo 'branch = True' >> ${coverageConfigFile}
-            echo 'data_file = ${WORKSPACE}/${stageName}/.coverage.${stageName}' >> ${coverageConfigFile}
-            echo '[paths]' >> ${coverageConfigFile}
-            echo 'source =\n    ${llmSrc}/tensorrt_llm/\n    ${TRTLLM_WHL_PATH}/tensorrt_llm/' >> ${coverageConfigFile}
-            cat ${coverageConfigFile}
-        """
+        // CBTS stages render coveragerc.template; all other stages leave the rcfile empty (no coverage). Keep in sync with the SLURM branch.
+        if (isCbtsStage(stageName)) {
+            // K8s runner knows TRTLLM_WHL_PATH here, so all placeholders are substituted at controller time (no worker-side sed).
+            sh """
+                cp ${llmSrc}/jenkins/scripts/cbts/coverage_utils/coveragerc.template ${coverageConfigFile}
+                sed -i \\
+                    -e 's|@TRTLLM_WHEEL_PATH@|${TRTLLM_WHL_PATH}|g' \\
+                    -e 's|@JOB_WORKSPACE@|${WORKSPACE}/${stageName}|g' \\
+                    -e 's|@STAGE_NAME@|${stageName}|g' \\
+                    ${coverageConfigFile}
+                cat ${coverageConfigFile}
+            """
+        }
         echoNodeAndGpuInfo(pipeline, stageName)
 
         // Allocate a unique port section for this container to avoid port conflicts
@@ -3801,7 +3896,6 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             "${llmSrc}/tests/integration/test_lists/waives.txt",
             perfMode,
             "${WORKSPACE}/${stageName}",
-            TRTLLM_WHL_PATH,
             coverageConfigFile,
             "",  // pytestUtil
             extraArgs,  // extraArgs
@@ -3886,6 +3980,15 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                 if (noRegularTests && noIsolateTests) {
                     error "No tests were executed for stage ${stageName}, please check the test list and test-db rendering result."
                 }
+            }
+
+            // CBTS coverage liveness signal: log this stage's touch counts (no artifacts); never fails the stage (|| true).
+            if (isCbtsStage(stageName)) {
+                sh """
+                    cd ${WORKSPACE}/${stageName} && \
+                    python3 ${llmSrc}/jenkins/scripts/cbts/coverage_utils/pystart_report.py \
+                        --glob '.cbtscov.${stageName}*' || true
+                """
             }
         }
 
