@@ -5235,6 +5235,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
             return output_indices_torch, output_values_torch
 
+    # TODO: rename,  CuteDSLTopKDecodeRadixFilterSPMultiCTARunner -> CuteDSLRadixFilterTopKSPMultiCTARunner
     class CuteDSLTopKDecodeRadixFilterSPMultiCTARunner:
         """Runner for the radix-FILTER single-pass multi-CTA decode top-k kernel.
 
@@ -5340,34 +5341,53 @@ if IS_CUTLASS_DSL_AVAILABLE:
         @staticmethod
         def auto_cluster_size(num_tokens: int,
                               num_rows: int,
+                              is_fp32: bool,
                               num_sms: Optional[int] = None) -> int:
-            """Heuristic cluster_size for the radix-filter SP multi-CTA path.
-
-            Returns 1 (=> caller should use single-CTA) or a cluster_size in
-            {2, 4, 8, 16}. Derived from a B200 sweep (single-vs-multi-tune/
-            HEURISTIC.md, 1210 configs x2, ~82% exact / ~2.8% mean overhead vs
-            oracle). cluster_size = min(N-parallelism cap, SM-budget cap):
-
-              - peak_cs(N): each CTA's chunk has a ~8K sweet spot; N x4 -> cs x2.
-              - large_occupancy correction: single-CTA switches to its
-                large_occupancy mode at num_rows > num_sms (halved SMEM ->
-                candidate spill -> REREAD GMEM re-scan -> very slow for huge N);
-                so past that switch, floor cluster_size at 2 to split the row.
-              - occ_cap: grid = num_rows * cs should stay within ~one SM wave.
+            """cluster_size for the REREAD overflow policy (has the large_occupancy
+            re-scan cliff). Shares peak_cs/occ_cap with auto_cluster_size_truncate
+            but floors nr > num_sms at cs=2 for huge N to dodge the single-CTA
+            large_occupancy REREAD blowup. Re-tuned on a B200 REREAD sweep
+            (~1.2% mean overhead vs oracle). Caveat: tuned on randn, fixed-length
+            seqlen inputs; real (concentrated) logits or varlen may shift it.
             """
-            if num_sms is None:
-                num_sms = _get_num_sms()
+            num_sms = num_sms or _get_num_sms()
             n = num_tokens
-            if n <= 8192:
-                return 1
-            # peak_cs = 2^floor((log2 N - 10) / 2), capped at 16.
-            peak_cs = min(1 << ((n.bit_length() - 1 - 10) // 2), 16)
-            # single-CTA's large_occupancy mode chokes on huge N past num_sms.
-            occ_lo = 2 if (num_rows > num_sms and n >= 262144) else 1
-            budget = max(occ_lo, num_sms // num_rows)
-            occ_cap = 1 << (budget.bit_length() - 1)  # floor power of 2
-            # Cap at the hardware max cluster size (lru_cached; queried once).
-            cs = min(peak_cs, occ_cap, _query_max_cluster_size())
+            # peak_cs by N; fp32 stays single up to 16K (4 refine rounds cost more).
+            peak = (1 if n <= 8192 or (is_fp32 and n <= 16384) else
+                    4 if n <= 32768 else 8 if n <= 131072 else 16)
+            # occ_cap by num_rows; grid budget tightens as cs grows. nr > num_sms
+            # -> cs=2 for huge N (split the row so single-CTA large_occupancy REREAD
+            # blowup is avoided), else single.
+            occ = (16 if num_rows <= 4 else 8 if num_rows <= 8 else 4 if
+                   num_rows <= 32 else 2 if num_rows <= 64 else 1 if num_rows <=
+                   num_sms else 2 if n >= 262144 else 1)
+            cs = min(peak, occ, _query_max_cluster_size())
+            return cs if cs >= 2 else 1
+
+        @staticmethod
+        def auto_cluster_size_truncate(num_tokens: int,
+                                       num_rows: int,
+                                       is_fp32: bool,
+                                       num_sms: Optional[int] = None) -> int:
+            """cluster_size for cliff-free overflow policies (TRUNCATE/GMEM_SPILL).
+            NOT interchangeable with auto_cluster_size (REREAD-tuned): here
+            nr > num_sms uses single-CTA (no REREAD large_occupancy blowup).
+            Re-tuned on a B200 TRUNCATE sweep (~0.6% mean overhead vs oracle).
+            Caveat: tuned on randn, fixed-length seqlen inputs; real (concentrated)
+            logit distributions or varlen seqlens may shift the optimum.
+            """
+            num_sms = num_sms or _get_num_sms()
+            n = num_tokens
+            # peak_cs by N; fp32 stays single up to 16K (4 refine rounds cost more).
+            peak = (1 if n <= 8192 or (is_fp32 and n <= 16384) else
+                    4 if n <= 32768 else 8 if n <= 131072 else 16)
+            # occ_cap by num_rows; grid budget tightens as cs grows. nr > num_sms
+            # -> single, except a narrow just-over-one-wave SP band at large N.
+            occ = (16 if num_rows <= 4 else
+                   8 if num_rows <= 8 else 4 if num_rows <= 32 else
+                   2 if num_rows <= 64 else 1 if num_rows <= num_sms else 2 if
+                   (num_rows <= 200 and n >= 131072) else 1)
+            cs = min(peak, occ, _query_max_cluster_size())
             return cs if cs >= 2 else 1
 
         @classmethod
@@ -6580,14 +6600,17 @@ if IS_CUTLASS_DSL_AVAILABLE:
         num_tokens = input_values.shape[1]
 
         if radix_filter_single_pass_multi_cta:
-            # --- radix-FILTER single-CTA vs SP multi-CTA (cluster DSMEM) ---
-            # Default path. auto_cluster_size() returns 1 (=> single-CTA) or a
-            # cluster_size in {2,4,8,16} (=> radix-filter SP multi-CTA cluster).
-            # See CuteDSLTopKDecodeRadixFilterSPMultiCTARunner.auto_cluster_size
-            # and single-vs-multi-tune/HEURISTIC.md for the heuristic.
-            cluster_size = (
-                CuteDSLTopKDecodeRadixFilterSPMultiCTARunner.auto_cluster_size(
-                    num_tokens, num_rows))
+            # radix-FILTER single-CTA vs SP multi-CTA (cluster DSMEM). Heuristic
+            # is overflow-policy-coupled: REREAD has a large_occupancy re-scan
+            # cliff, cliff-free policies don't -> pick the matching tune.
+            _R = CuteDSLTopKDecodeRadixFilterSPMultiCTARunner
+            _is_fp32 = input_values.dtype == torch.float32
+            if overflow_policy == "REREAD":
+                cluster_size = _R.auto_cluster_size(num_tokens, num_rows,
+                                                    _is_fp32)
+            else:
+                cluster_size = _R.auto_cluster_size_truncate(
+                    num_tokens, num_rows, _is_fp32)
             if cluster_size >= 2:
                 CuteDSLTopKDecodeRadixFilterSPMultiCTARunner.forward(
                     input_values=input_values,
