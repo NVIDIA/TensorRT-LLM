@@ -718,13 +718,16 @@ class BasicAVTransformerBlock(nn.Module):
         self.scale_shift_table = nn.Parameter(torch.empty(6, cfg.dim))
 
     def _init_audio_modules(self, cfg, rope_type, eps, model_config, idx):
-        # audio_attn1 needs key_padding_mask (audio is padded to divide ulysses_size; the
-        # mask zeros pad slots), but TRTLLM self-attn silently drops it — so downgrade to
-        # VANILLA when Ulysses is active under a TRTLLM backend.
+        # audio_attn1 needs key_padding_mask (audio is padded to the sharder
+        # multiple — ulysses_size, or the stage-2 seq size when stage-2 groups
+        # exist; the mask zeros pad slots), but TRTLLM self-attn silently drops
+        # it — so downgrade to VANILLA whenever padding is possible under a
+        # TRTLLM backend.
         audio_self_config = model_config
         vgm = model_config.visual_gen_mapping
         ulysses_size = vgm.ulysses_size if vgm is not None else 1
-        if ulysses_size > 1 and model_config.attention.backend == "TRTLLM":
+        may_pad = ulysses_size > 1 or self._stage2_ulysses_group is not None
+        if may_pad and model_config.attention.backend == "TRTLLM":
             audio_self_config = model_config.model_copy(
                 update={
                     "attention": model_config.attention.model_copy(update={"backend": "VANILLA"})

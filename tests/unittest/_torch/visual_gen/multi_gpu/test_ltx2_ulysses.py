@@ -607,6 +607,27 @@ def _logic_ltx2_stage2_head_divisibility_raises(rank, world_size, backend, _unus
         assert "stage-2 ulysses requires" in str(e), f"Rank {rank}: {e}"
 
 
+def _logic_ltx2_trtllm_audio_downgrade_with_stage2(rank, world_size, backend, _unused):
+    """cfg2 x u1 stage-2 fold under a TRTLLM backend: audio may be padded to the
+    stage-2 multiple, whose key_padding_mask TRTLLM drops — audio_attn1 must
+    downgrade to VANILLA at construction even though ulysses_size == 1."""
+    from tensorrt_llm._torch.visual_gen.models.ltx2.transformer_ltx2 import LTXModel, LTXModelType
+
+    d_cfg = _make_model_config_cfg(cfg_size=2, ulysses_size=1, backend="TRTLLM")
+    s2 = _build_stage2_groups_for_test(d_cfg.visual_gen_mapping)
+    model = LTXModel(
+        model_type=LTXModelType.AudioVideo,
+        model_config=d_cfg,
+        stage2_groups=s2,
+        **_AV_CONFIG,
+    )
+    blk = model.transformer_blocks[0]
+    assert blk.audio_attn1.attn_backend == "VANILLA", (
+        f"Rank {rank}: audio_attn1 backend {blk.audio_attn1.attn_backend}, expected VANILLA"
+    )
+    assert blk.attn1.attn_backend == "TRTLLM", f"Rank {rank}: video attn1 must keep TRTLLM"
+
+
 class TestLTX2TopologySwitch:
     """{default, stage2} dual-topology switch on 4 GPUs (cfg2 x u2 -> u4):
     pointer alternation, shard/gather round-trip, and whole-dataflow numerical
@@ -621,3 +642,6 @@ class TestLTX2TopologySwitch:
 
     def test_stage2_head_divisibility_raises(self):
         run_test_in_distributed(4, _logic_ltx2_stage2_head_divisibility_raises, "VANILLA", 0)
+
+    def test_trtllm_audio_downgrade_with_stage2_fold(self):
+        run_test_in_distributed(2, _logic_ltx2_trtllm_audio_downgrade_with_stage2, "TRTLLM", 0)
