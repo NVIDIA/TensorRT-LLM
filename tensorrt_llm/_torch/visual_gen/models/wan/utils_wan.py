@@ -89,8 +89,9 @@ def apply_fused_layernorm_affine_quant(
     Returns Fp4QuantizedTensor when fp4_input_scale is provided, else a bf16 tensor.
     """
     x = x.contiguous()
-    # seq_len_per_batch is unused for the affine path; pass M as a safe value.
-    seq_len_per_batch = x.shape[0]
+    # seq_len_per_batch is unused on the affine path (kernel only reads it under HAS_MODULATION).
+    # Pass 0 so any future kernel change that accidentally reads it here fails loudly.
+    seq_len_per_batch = 0
     if fp4_input_scale is not None:
         y_fp4, sf_out = torch.ops.trtllm.fused_adaptive_layernorm_quant(
             x,

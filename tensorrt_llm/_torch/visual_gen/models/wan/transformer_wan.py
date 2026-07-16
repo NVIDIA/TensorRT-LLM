@@ -1,5 +1,4 @@
 import math
-import os
 from typing import Optional, Tuple
 
 import torch
@@ -373,11 +372,6 @@ class WanBlock(nn.Module):
         self._norm3_fp4_scale: Optional[torch.Tensor] = None
         self._fused_ln_supported = hidden_size == 5120
 
-        # LayerNorm+NVFP4 fusion is enabled by default.
-        self._ln_fusion_enabled = (
-            os.environ.get("TRTLLM_DISABLE_NVFP4_LAYERNORM_FUSION", "0") != "1"
-        )
-
         self.ffn = MLP(
             hidden_size=hidden_size,
             intermediate_size=ffn_dim,
@@ -539,7 +533,7 @@ class WanBlock(nn.Module):
                 self.scale_shift_table.float() + temb.float()
             ).chunk(6, dim=1)
 
-        if self._fused_ln_supported and self._ln_fusion_enabled:
+        if self._fused_ln_supported:
             # x is [B, S, D]; flatten to 2D for the fused op, reshape output back.
             normed = self._fused_adaln_quant(
                 x, scale_msa, shift_msa, temb, self._norm1_fp4_scale, self.norm1.variance_epsilon
@@ -570,7 +564,6 @@ class WanBlock(nn.Module):
 
         if (
             self._fused_ln_supported
-            and self._ln_fusion_enabled
             and isinstance(self.norm2, LayerNorm)
             and self.norm2.weight is not None
         ):
@@ -629,7 +622,7 @@ class WanBlock(nn.Module):
 
         # 3. Feed-forward. Mirrors norm1: fused LN+AdaLN (with optional NVFP4
         # quant) reshaped back to [B, S, D]; self.ffn consumes it.
-        if self._fused_ln_supported and self._ln_fusion_enabled:
+        if self._fused_ln_supported:
             normed = self._fused_adaln_quant(
                 x,
                 c_scale_msa,
