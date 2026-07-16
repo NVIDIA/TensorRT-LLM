@@ -2896,7 +2896,7 @@ class W4A8MXFP4MXFP8LinearMethod(W4A8MXFP4FP8LinearMethod):
 
 
 class MarlinNVFP4LinearMethod(NVFP4LinearMethod):
-    """NVFP4 Linear method backed by the Marlin W4A16 kernel (Hopper only)."""
+    """NVFP4 Linear method backed by the Marlin W4A16 kernel (SM89/SM90)."""
 
     def transform_weights(self, module: Linear) -> None:
         from tensorrt_llm.quantization.utils import marlin_utils

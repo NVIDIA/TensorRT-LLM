@@ -110,13 +110,20 @@ def get_model_extra_attrs():
     return getattr(_model_extra_attrs, 'attrs', None)
 
 
+def is_nvfp4_marlin_supported_sm(sm_version: int | None = None) -> bool:
+    """Return True on Ada Lovelace (SM89, e.g. L40S) and Hopper (SM90-99)."""
+    if sm_version is None:
+        sm_version = get_sm_version()
+    return 89 <= sm_version < 100
+
+
 def is_nvfp4_marlin_enabled() -> bool:
-    is_hopper = get_sm_version() == 90
+    is_supported_sm = is_nvfp4_marlin_supported_sm()
     has_marlin_kernel = hasattr(torch.ops.trtllm, "marlin_nvfp4_gemm")
     attrs = get_model_extra_attrs()
     is_marlin_specified = attrs is not None and "marlin" in attrs.get(
         'nvfp4_gemm_allowed_backends', [])
-    return is_hopper and has_marlin_kernel and is_marlin_specified
+    return is_supported_sm and has_marlin_kernel and is_marlin_specified
 
 
 @contextlib.contextmanager
