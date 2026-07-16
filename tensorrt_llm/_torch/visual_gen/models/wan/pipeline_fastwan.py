@@ -95,9 +95,7 @@ class WanDMDPipeline(WanPipeline):
         self.validate_resolution(height, width, num_frames)
 
         if negative_prompt:
-            raise ValueError(
-                "FastWan is CFG-free and does not support negative prompts."
-            )
+            raise ValueError("FastWan is CFG-free and does not support negative prompts.")
         prompt_embeds, _ = self._encode_prompt(prompt, "", max_sequence_length)
 
         if self._fixed_latent is not None:
