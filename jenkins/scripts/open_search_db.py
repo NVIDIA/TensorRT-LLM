@@ -135,29 +135,52 @@ class OpenSearchDB:
         :param total: Total retry count (pair with attempt).
         :param url: Request URL appended at the end of the message (sanitized).
         """
-        level_tag = {
+        _LEVEL_TAG = {
             "debug": "DEBUG",
             "info": "INFO",
             "warning": "WARN",
-            "error": "ERROR"
+            "error": "ERROR",
         }
-        parts = [f"op={op}"]
-        if cat is not None:
-            parts.append(f"cat={cat}")
-        if status is not None:
-            parts.append(f"status={status}")
-        parts.append(f"db={OpenSearchDB._sanitize_log(db, max_len=200)}")
-        if attempt is not None:
-            parts.append(f"attempt={attempt}/{total}")
+        try:
+            level_lower = level.lower()
+            log_method = getattr(OpenSearchDB.logger, level_lower, None)
+            if log_method is None:
+                OpenSearchDB.logger.error(
+                    f"[OpenSearchDB][ERROR] _log() called with invalid level={level!r}; "
+                    f"op={op!r}, db={db!r}, msg={msg!r}")
+                log_method = OpenSearchDB.logger.error
+                level_lower = "error"
 
-        body = OpenSearchDB._sanitize_log(msg)
-        if url is not None:
-            body += f", url: {OpenSearchDB._sanitize_log(url)}"
+            parts = [f"op={op}"]
+            if cat is not None:
+                parts.append(f"cat={cat}")
+            if status is not None:
+                parts.append(f"status={status}")
+            parts.append(f"db={OpenSearchDB._sanitize_log(db, max_len=200)}")
+            if attempt is not None and total is not None:
+                parts.append(f"attempt={attempt}/{total}")
+            elif attempt is not None or total is not None:
+                OpenSearchDB.logger.error(
+                    f"[OpenSearchDB][ERROR] _log() requires both attempt and total, "
+                    f"or neither; got attempt={attempt!r}, total={total!r}")
 
-        log_line = (
-            f"{OpenSearchDB._LOG_TAG}[{level_tag.get(level.lower(), level.upper())}]"
-            f"({', '.join(parts)}) {body}")
-        getattr(OpenSearchDB.logger, level.lower())(log_line)
+            body = OpenSearchDB._sanitize_log(msg)
+            if url is not None:
+                body += f", url: {OpenSearchDB._sanitize_log(url)}"
+
+            tag = _LEVEL_TAG.get(level_lower, level_lower.upper())
+            log_line = (f"{OpenSearchDB._LOG_TAG}[{tag}]"
+                        f"({', '.join(parts)}) {body}")
+            log_method(log_line)
+        except Exception as exc:
+            # _log itself must never raise — emit a raw fallback record
+            try:
+                OpenSearchDB.logger.error(
+                    f"[OpenSearchDB][ERROR] _log() internal error "
+                    f"({type(exc).__name__}: {exc}); "
+                    f"original: level={level!r} op={op!r} db={db!r}")
+            except Exception:
+                pass  # absolute last resort
 
     @staticmethod
     def typeCheckForOpenSearchDB(json_data) -> bool:
@@ -372,14 +395,15 @@ class OpenSearchDB:
                                       url=url)
                     return False
 
-                OpenSearchDB._log("warning",
-                                  "post",
-                                  project,
-                                  "will retry",
-                                  cat="transient",
-                                  status=status_code,
-                                  attempt=attempt,
-                                  total=DEFAULT_RETRY_COUNT)
+                if attempt < DEFAULT_RETRY_COUNT:
+                    OpenSearchDB._log("warning",
+                                      "post",
+                                      project,
+                                      "will retry",
+                                      cat="transient",
+                                      status=status_code,
+                                      attempt=attempt,
+                                      total=DEFAULT_RETRY_COUNT)
             except Exception as e:
                 last_error = f"{type(e).__name__}: {e}"
                 OpenSearchDB._log("warning",
@@ -493,14 +517,15 @@ class OpenSearchDB:
                     return None
 
                 # Server errors (5xx, 429) — transient, worth retrying
-                OpenSearchDB._log("warning",
-                                  "query",
-                                  project,
-                                  "will retry",
-                                  cat="transient",
-                                  status=res.status_code,
-                                  attempt=attempt,
-                                  total=DEFAULT_RETRY_COUNT)
+                if attempt < DEFAULT_RETRY_COUNT:
+                    OpenSearchDB._log("warning",
+                                      "query",
+                                      project,
+                                      "will retry",
+                                      cat="transient",
+                                      status=res.status_code,
+                                      attempt=attempt,
+                                      total=DEFAULT_RETRY_COUNT)
             except requests.exceptions.RequestException as e:
                 last_error = f"{type(e).__name__}: {e}"
                 OpenSearchDB._log("warning",
