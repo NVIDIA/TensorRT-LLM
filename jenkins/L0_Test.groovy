@@ -2571,7 +2571,7 @@ def cbtsResizeSplits(configs) {
 
 // CBTS Layer 2: replace the normal stage set with the selector's affected
 // stages while retaining the baseline sanity and multi-GPU gates.
-def filterCbtsStageJobs(parallelJobs, parallelJobsFiltered, multiGpuJobs, testFilter) {
+def filterCbtsStageJobs(parallelJobsFiltered, testFilter) {
     def cbts = testFilter[(CBTS_RESULT)]
     if (cbts == null) {
         return parallelJobsFiltered
@@ -2587,7 +2587,9 @@ def filterCbtsStageJobs(parallelJobs, parallelJobsFiltered, multiGpuJobs, testFi
     } as Set
     def needsSanity = cbts.sanity_required
     def needsPerfSanity = cbts.perfsanity_required
-    def filtered = parallelJobs.findAll { key, _ ->
+    // Start from the baseline-eligible jobs so CBTS remains subtractive and
+    // cannot bypass trigger-mode gates such as multi-GPU or OnDemand.
+    def filtered = parallelJobsFiltered.findAll { key, _ ->
         if (key.contains("-OnDemand-")) {
             return false
         }
@@ -2612,9 +2614,12 @@ def filterCbtsStageJobs(parallelJobs, parallelJobsFiltered, multiGpuJobs, testFi
 
     // The coverage tier omits multi-GPU; re-add it under the baseline gate.
     if (cbts.enable_multi_gpu && testFilter[(MULTI_GPU_FILE_CHANGED)]) {
-        filtered += multiGpuJobs
+        def eligibleMultiGpuJobs = parallelJobsFiltered.findAll {
+            key, _ -> key =~ /\d+_GPUs/
+        }
+        filtered += eligibleMultiGpuJobs
         echo "CBTS [${cbts.scope}]: multi-GPU file changed → running " +
-             "${multiGpuJobs.size()} multi-GPU stage(s) at baseline"
+             "${eligibleMultiGpuJobs.size()} multi-GPU stage(s) at baseline"
     }
     return filtered
 }
@@ -6682,8 +6687,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         checkStageNameSet(testFilter[(EXTRA_STAGE_LIST)], fullSet, EXTRA_STAGE_LIST)
     }
 
-    parallelJobsFiltered = filterCbtsStageJobs(
-        parallelJobs, parallelJobsFiltered, multiGpuJobs, testFilter)
+    parallelJobsFiltered = filterCbtsStageJobs(parallelJobsFiltered, testFilter)
 
     if (globalVars[RUN_MODE] == "nightly_release") {
         parallelJobsFiltered = sanityCheckJobs
