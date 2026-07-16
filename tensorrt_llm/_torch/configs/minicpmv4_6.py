@@ -60,8 +60,7 @@ class MiniCPMV4_6VisionConfig(PretrainedConfig):
 
     @property
     def window_intermediate_size(self) -> int:
-        return (self.intermediate_size * self.window_kernel_size[0] *
-                self.window_kernel_size[1])
+        return self.intermediate_size * self.window_kernel_size[0] * self.window_kernel_size[1]
 
 
 class MiniCPMV4_6Config(PretrainedConfig):

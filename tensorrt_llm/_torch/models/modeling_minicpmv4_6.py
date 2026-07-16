@@ -22,25 +22,29 @@ model does *not* use mRoPE).
 """
 
 import dataclasses
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import transformers
 from packaging.version import Version
-from transformers import (AutoProcessor, AutoTokenizer, PretrainedConfig,
-                          PreTrainedModel)
+from transformers import AutoProcessor, AutoTokenizer, PretrainedConfig, PreTrainedModel
 
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 from tensorrt_llm.mapping import Mapping
 
 from ..._utils import nvtx_range
-from ...inputs import (BaseMultimodalDummyInputsBuilder,
-                       BaseMultimodalInputProcessor, ContentFormat,
-                       ExtraProcessedInputs, MultimodalPlaceholderMetadata,
-                       MultimodalPlaceholderPlacement, TextPrompt,
-                       register_input_processor)
+from ...inputs import (
+    BaseMultimodalDummyInputsBuilder,
+    BaseMultimodalInputProcessor,
+    ContentFormat,
+    ExtraProcessedInputs,
+    MultimodalPlaceholderMetadata,
+    MultimodalPlaceholderPlacement,
+    TextPrompt,
+    register_input_processor,
+)
 from ...sampling_params import SamplingParams
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import PredefinedAttentionMask
@@ -53,12 +57,14 @@ from ..modules.mlp import MLP
 from .checkpoints.base_weight_mapper import BaseWeightMapper
 from .checkpoints.hf.qwen3_5_weight_mapper import Qwen3_5MoeHfWeightMapper
 from .modeling_auto import AutoModelForCausalLM
-from .modeling_multimodal_utils import (_is_mm_disagg, find_input_mm_embeds,
-                                        fuse_input_embeds,
-                                        get_multimodal_embeddings)
+from .modeling_multimodal_utils import (
+    _is_mm_disagg,
+    find_input_mm_embeds,
+    fuse_input_embeds,
+    get_multimodal_embeddings,
+)
 from .modeling_qwen2vl import _prepare_qwen_vl_vision_attn_metadata
-from .modeling_utils import (QuantConfig, _load_weights_impl,
-                             register_auto_model)
+from .modeling_utils import QuantConfig, _load_weights_impl, register_auto_model
 
 
 def _gelu_tanh(x: torch.Tensor) -> torch.Tensor:
@@ -84,7 +90,8 @@ def _ensure_transformers_supports_minicpmv4_6() -> None:
             f"(installed: {installed}). This model was upstreamed into "
             f"transformers and ships no remote code to fall back on. Please "
             f"upgrade, e.g. `pip install 'transformers>="
-            f"{_MINICPMV4_6_MIN_TRANSFORMERS}'`.")
+            f"{_MINICPMV4_6_MIN_TRANSFORMERS}'`."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -114,12 +121,9 @@ class MiniCPMV4_6VisionEmbeddings(nn.Module):
         )
         self.num_patches_per_side = self.image_size // self.patch_size
         self.num_positions = self.num_patches_per_side**2
-        self.position_embedding = nn.Embedding(self.num_positions,
-                                               self.embed_dim,
-                                               dtype=dtype)
+        self.position_embedding = nn.Embedding(self.num_positions, self.embed_dim, dtype=dtype)
 
-    def forward(self, pixel_values: torch.Tensor,
-                target_sizes: torch.Tensor) -> torch.Tensor:
+    def forward(self, pixel_values: torch.Tensor, target_sizes: torch.Tensor) -> torch.Tensor:
         # pixel_values: NaViT-packed [1, C, patch_size, total_patch_axis]
         patch_embeds = self.patch_embedding(pixel_values)
         embeddings = patch_embeds.flatten(2).transpose(1, 2)  # [1, T, D]
@@ -132,19 +136,16 @@ class MiniCPMV4_6VisionEmbeddings(nn.Module):
             h, w = int(target_size[0]), int(target_size[1])
             fractional_coords_h = torch.arange(0, 1 - 1e-6, 1 / h)
             fractional_coords_w = torch.arange(0, 1 - 1e-6, 1 / w)
-            bucket_coords_h = torch.bucketize(fractional_coords_h,
-                                              boundaries,
-                                              right=True)
-            bucket_coords_w = torch.bucketize(fractional_coords_w,
-                                              boundaries,
-                                              right=True)
-            pos_ids = (bucket_coords_h[:, None] * nps +
-                       bucket_coords_w).flatten().to(
-                           self.position_embedding.weight.device)
+            bucket_coords_h = torch.bucketize(fractional_coords_h, boundaries, right=True)
+            bucket_coords_w = torch.bucketize(fractional_coords_w, boundaries, right=True)
+            pos_ids = (
+                (bucket_coords_h[:, None] * nps + bucket_coords_w)
+                .flatten()
+                .to(self.position_embedding.weight.device)
+            )
             position_embeddings.append(self.position_embedding(pos_ids))
 
-        position_embeddings = torch.concat(position_embeddings,
-                                           dim=0).unsqueeze(0)
+        position_embeddings = torch.concat(position_embeddings, dim=0).unsqueeze(0)
         return embeddings + position_embeddings
 
 
@@ -156,8 +157,7 @@ class MiniCPMV4_6VisionAttention(Attention):
     custom forward that skips the generic RoPE path. Runs replicated (tp=1).
     """
 
-    def __init__(self, model_config: ModelConfig[PretrainedConfig],
-                 layer_idx: int):
+    def __init__(self, model_config: ModelConfig[PretrainedConfig], layer_idx: int):
         config = model_config.pretrained_config.vision_config
         text_config = model_config.pretrained_config.text_config
         super().__init__(
@@ -178,8 +178,7 @@ class MiniCPMV4_6VisionAttention(Attention):
         # compiled LM region); unregister so `forward_impl` uses the eager path
         # with the vision-local `attn_metadata` instead of the LM's.
         if self.register_to_config:
-            model_config.extra_attrs.get("attn_layers",
-                                         {}).pop(self.layer_idx_str, None)
+            model_config.extra_attrs.get("attn_layers", {}).pop(self.layer_idx_str, None)
             self.register_to_config = False
 
     def forward(
@@ -203,8 +202,7 @@ class MiniCPMV4_6VisionAttention(Attention):
         )
         return self.o_proj(output, layer_idx=self.layer_idx)
 
-    def forward_window(self, hidden_states: torch.Tensor,
-                       window_len: int) -> torch.Tensor:
+    def forward_window(self, hidden_states: torch.Tensor, window_len: int) -> torch.Tensor:
         """Fixed-size window self-attention via batched SDPA.
 
         The ViT window merger reorders tokens into consecutive, equal-length
@@ -223,21 +221,18 @@ class MiniCPMV4_6VisionAttention(Attention):
 
         def to_windows(x: torch.Tensor) -> torch.Tensor:
             # [num_windows * window_len, H*D] -> [num_windows, H, window_len, D]
-            return x.view(num_windows, window_len, self.num_heads,
-                          self.head_dim).transpose(1, 2)
+            return x.view(num_windows, window_len, self.num_heads, self.head_dim).transpose(1, 2)
 
         q, k, v = to_windows(q), to_windows(k), to_windows(v)
         output = F.scaled_dot_product_attention(q, k, v)
-        output = output.transpose(1, 2).reshape(
-            num_tokens, self.num_heads * self.head_dim)
+        output = output.transpose(1, 2).reshape(num_tokens, self.num_heads * self.head_dim)
         return self.o_proj(output, layer_idx=self.layer_idx)
 
 
 class MiniCPMV4_6VisionMLP(MLP):
     """ViT feed-forward (``fc1`` -> gelu_tanh -> ``fc2``) on TRT-LLM ``MLP``."""
 
-    def __init__(self, model_config: ModelConfig[PretrainedConfig],
-                 layer_idx: int):
+    def __init__(self, model_config: ModelConfig[PretrainedConfig], layer_idx: int):
         config = model_config.pretrained_config.vision_config
         super().__init__(
             hidden_size=config.hidden_size,
@@ -251,23 +246,22 @@ class MiniCPMV4_6VisionMLP(MLP):
 
 
 class MiniCPMV4_6VisionEncoderLayer(nn.Module):
-
-    def __init__(self, model_config: ModelConfig[PretrainedConfig],
-                 layer_idx: int):
+    def __init__(self, model_config: ModelConfig[PretrainedConfig], layer_idx: int):
         super().__init__()
         config = model_config.pretrained_config.vision_config
         dtype = config.torch_dtype
-        self.layer_norm1 = LayerNorm(hidden_size=config.hidden_size,
-                                     eps=config.layer_norm_eps,
-                                     dtype=dtype)
+        self.layer_norm1 = LayerNorm(
+            hidden_size=config.hidden_size, eps=config.layer_norm_eps, dtype=dtype
+        )
         self.self_attn = MiniCPMV4_6VisionAttention(model_config, layer_idx)
-        self.layer_norm2 = LayerNorm(hidden_size=config.hidden_size,
-                                     eps=config.layer_norm_eps,
-                                     dtype=dtype)
+        self.layer_norm2 = LayerNorm(
+            hidden_size=config.hidden_size, eps=config.layer_norm_eps, dtype=dtype
+        )
         self.mlp = MiniCPMV4_6VisionMLP(model_config, layer_idx)
 
-    def forward(self, hidden_states: torch.Tensor,
-                attn_metadata: AttentionMetadata) -> torch.Tensor:
+    def forward(
+        self, hidden_states: torch.Tensor, attn_metadata: AttentionMetadata
+    ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.layer_norm1(hidden_states)
         hidden_states = self.self_attn(hidden_states, attn_metadata)
@@ -281,14 +275,15 @@ class MiniCPMV4_6VisionEncoderLayer(nn.Module):
 
 
 class MiniCPMV4_6VisionEncoder(nn.Module):
-
     def __init__(self, model_config: ModelConfig[PretrainedConfig]):
         super().__init__()
         config = model_config.pretrained_config.vision_config
-        self.layers = nn.ModuleList([
-            MiniCPMV4_6VisionEncoderLayer(model_config, layer_idx)
-            for layer_idx in range(config.num_hidden_layers)
-        ])
+        self.layers = nn.ModuleList(
+            [
+                MiniCPMV4_6VisionEncoderLayer(model_config, layer_idx)
+                for layer_idx in range(config.num_hidden_layers)
+            ]
+        )
 
 
 class MiniCPMV4_6ViTWindowAttentionMerger(nn.Module):
@@ -309,25 +304,30 @@ class MiniCPMV4_6ViTWindowAttentionMerger(nn.Module):
         mapping = model_config.mapping
 
         self.self_attn = MiniCPMV4_6VisionAttention(
-            model_config, layer_idx=config.num_hidden_layers)
-        self.layer_norm1 = LayerNorm(hidden_size=self.embed_dim,
-                                     eps=config.layer_norm_eps,
-                                     dtype=dtype)
-        self.pre_norm = LayerNorm(hidden_size=config.window_hidden_size,
-                                  eps=config.layer_norm_eps,
-                                  dtype=dtype)
-        self.linear_1 = Linear(config.window_hidden_size,
-                               config.window_intermediate_size,
-                               bias=True,
-                               dtype=dtype,
-                               mapping=mapping,
-                               tensor_parallel_mode=None)
-        self.linear_2 = Linear(config.window_intermediate_size,
-                               self.embed_dim,
-                               bias=True,
-                               dtype=dtype,
-                               mapping=mapping,
-                               tensor_parallel_mode=None)
+            model_config, layer_idx=config.num_hidden_layers
+        )
+        self.layer_norm1 = LayerNorm(
+            hidden_size=self.embed_dim, eps=config.layer_norm_eps, dtype=dtype
+        )
+        self.pre_norm = LayerNorm(
+            hidden_size=config.window_hidden_size, eps=config.layer_norm_eps, dtype=dtype
+        )
+        self.linear_1 = Linear(
+            config.window_hidden_size,
+            config.window_intermediate_size,
+            bias=True,
+            dtype=dtype,
+            mapping=mapping,
+            tensor_parallel_mode=None,
+        )
+        self.linear_2 = Linear(
+            config.window_intermediate_size,
+            self.embed_dim,
+            bias=True,
+            dtype=dtype,
+            mapping=mapping,
+            tensor_parallel_mode=None,
+        )
 
     def get_window_index(
         self, target_sizes: torch.Tensor
@@ -343,18 +343,16 @@ class MiniCPMV4_6ViTWindowAttentionMerger(nn.Module):
             if height % window_h != 0 or width % window_w != 0:
                 raise ValueError(
                     f"height={height}, width={width} must be divisible by "
-                    f"window size {self.window_kernel_size}")
+                    f"window size {self.window_kernel_size}"
+                )
             index = torch.arange(height * width).reshape(height, width)
             num_windows_h = height // window_h
             num_windows_w = width // window_w
             num_windows = num_windows_h * num_windows_w
-            index = index.reshape(num_windows_h, window_h, num_windows_w,
-                                  window_w)
-            index = index.permute(0, 2, 1, 3).reshape(num_windows,
-                                                       window_h * window_w)
+            index = index.reshape(num_windows_h, window_h, num_windows_w, window_w)
+            index = index.permute(0, 2, 1, 3).reshape(num_windows, window_h * window_w)
             window_index_list.append(index.reshape(-1) + token_offset)
-            cu_this = torch.arange(1, num_windows + 1) * (
-                window_h * window_w) + cu_seqlens[-1]
+            cu_this = torch.arange(1, num_windows + 1) * (window_h * window_w) + cu_seqlens[-1]
             cu_seqlens.extend(cu_this.tolist())
             token_offset += height * width
 
@@ -362,8 +360,9 @@ class MiniCPMV4_6ViTWindowAttentionMerger(nn.Module):
         cu_seqlens = torch.tensor(cu_seqlens, dtype=torch.int32)
         return window_index, cu_seqlens, max_seqlens
 
-    def forward(self, hidden_states: torch.Tensor, target_sizes: torch.Tensor,
-                cu_seqlens: List[int]) -> torch.Tensor:
+    def forward(
+        self, hidden_states: torch.Tensor, target_sizes: torch.Tensor, cu_seqlens: List[int]
+    ) -> torch.Tensor:
         # hidden_states: [T, D]
         residual = hidden_states
         hidden_states = self.layer_norm1(hidden_states)
@@ -385,15 +384,15 @@ class MiniCPMV4_6ViTWindowAttentionMerger(nn.Module):
         merged = []
         for i in range(len(target_sizes)):
             height, width = int(target_sizes[i][0]), int(target_sizes[i][1])
-            patch = hidden_states[cu_seqlens[i]:cu_seqlens[i + 1], :]
+            patch = hidden_states[cu_seqlens[i] : cu_seqlens[i + 1], :]
             merged_h, merged_w = height // window_h, width // window_w
-            patch_5d = patch.view(merged_h, window_h, merged_w, window_w,
-                                  embed_dim).permute(0, 2, 1, 3, 4)
-            hidden_state = patch_5d.reshape(merged_h * merged_w,
-                                            window_h * window_w * embed_dim)
-            mean_residual = patch_5d.reshape(merged_h * merged_w,
-                                             window_h * window_w,
-                                             embed_dim).mean(dim=1)
+            patch_5d = patch.view(merged_h, window_h, merged_w, window_w, embed_dim).permute(
+                0, 2, 1, 3, 4
+            )
+            hidden_state = patch_5d.reshape(merged_h * merged_w, window_h * window_w * embed_dim)
+            mean_residual = patch_5d.reshape(
+                merged_h * merged_w, window_h * window_w, embed_dim
+            ).mean(dim=1)
             hidden_state = self.pre_norm(hidden_state)
             hidden_state = self.linear_1(hidden_state)
             hidden_state = _gelu_tanh(hidden_state)
@@ -406,31 +405,31 @@ class MiniCPMV4_6ViTWindowAttentionMerger(nn.Module):
 class MiniCPMV4_6DownsampleMLP(nn.Module):
     """2x2 spatial-merge projection (``pre_norm`` -> ``linear_1`` -> GELU -> ``linear_2``)."""
 
-    def __init__(self, model_config: ModelConfig[PretrainedConfig],
-                 hidden_size: int, out_dim: int):
+    def __init__(self, model_config: ModelConfig[PretrainedConfig], hidden_size: int, out_dim: int):
         super().__init__()
         dtype = model_config.pretrained_config.vision_config.torch_dtype
         mapping = model_config.mapping
         merged_hidden_size = hidden_size * 4
-        self.pre_norm = LayerNorm(hidden_size=merged_hidden_size,
-                                  eps=1e-6,
-                                  dtype=dtype)
-        self.linear_1 = Linear(merged_hidden_size,
-                               merged_hidden_size,
-                               bias=True,
-                               dtype=dtype,
-                               mapping=mapping,
-                               tensor_parallel_mode=None)
-        self.linear_2 = Linear(merged_hidden_size,
-                               out_dim,
-                               bias=True,
-                               dtype=dtype,
-                               mapping=mapping,
-                               tensor_parallel_mode=None)
+        self.pre_norm = LayerNorm(hidden_size=merged_hidden_size, eps=1e-6, dtype=dtype)
+        self.linear_1 = Linear(
+            merged_hidden_size,
+            merged_hidden_size,
+            bias=True,
+            dtype=dtype,
+            mapping=mapping,
+            tensor_parallel_mode=None,
+        )
+        self.linear_2 = Linear(
+            merged_hidden_size,
+            out_dim,
+            bias=True,
+            dtype=dtype,
+            mapping=mapping,
+            tensor_parallel_mode=None,
+        )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        hidden_states = self.pre_norm(hidden_states).view(
-            -1, self.linear_1.in_features)
+        hidden_states = self.pre_norm(hidden_states).view(-1, self.linear_1.in_features)
         hidden_states = self.linear_1(hidden_states)
         hidden_states = F.gelu(hidden_states)
         hidden_states = self.linear_2(hidden_states)
@@ -451,12 +450,12 @@ class MiniCPMV4_6Merger(nn.Module):
             MiniCPMV4_6DownsampleMLP(model_config, hidden_size, hidden_size)
             for _ in range(self.merger_times - 1)
         ]
-        mlps.append(
-            MiniCPMV4_6DownsampleMLP(model_config, hidden_size, llm_embed_dim))
+        mlps.append(MiniCPMV4_6DownsampleMLP(model_config, hidden_size, llm_embed_dim))
         self.mlp = nn.ModuleList(mlps)
 
-    def forward(self, hidden_states: torch.Tensor,
-                target_sizes: torch.Tensor) -> List[torch.Tensor]:
+    def forward(
+        self, hidden_states: torch.Tensor, target_sizes: torch.Tensor
+    ) -> List[torch.Tensor]:
         merge_h, merge_w = self.merge_kernel_size
         start = 0
         processed_features = []
@@ -465,22 +464,23 @@ class MiniCPMV4_6Merger(nn.Module):
             num_patches = height * width
             embed_dim = hidden_states.shape[-1]
             merged_h, merged_w = height // merge_h, width // merge_w
-            hidden_state = (hidden_states[start:start + num_patches, :].view(
-                merged_h, merge_h, merged_w, merge_w,
-                embed_dim).permute(0, 2, 1, 3,
-                                   4).reshape(merged_h * merged_w,
-                                              merge_h * merge_w * embed_dim))
+            hidden_state = (
+                hidden_states[start : start + num_patches, :]
+                .view(merged_h, merge_h, merged_w, merge_w, embed_dim)
+                .permute(0, 2, 1, 3, 4)
+                .reshape(merged_h * merged_w, merge_h * merge_w * embed_dim)
+            )
             hidden_state = self.mlp[0](hidden_state)
             for j in range(1, self.merger_times):
                 height = height // merge_h
                 width = width // merge_w
                 inner_dim = hidden_state.shape[-1]
                 merged_h, merged_w = height // merge_h, width // merge_w
-                hidden_state = (hidden_state.view(
-                    merged_h, merge_h, merged_w, merge_w,
-                    inner_dim).permute(0, 2, 1, 3,
-                                       4).reshape(merged_h * merged_w,
-                                                  merge_h * merge_w * inner_dim))
+                hidden_state = (
+                    hidden_state.view(merged_h, merge_h, merged_w, merge_w, inner_dim)
+                    .permute(0, 2, 1, 3, 4)
+                    .reshape(merged_h * merged_w, merge_h * merge_w * inner_dim)
+                )
                 hidden_state = self.mlp[j](hidden_state)
             start += num_patches
             processed_features.append(hidden_state)
@@ -514,24 +514,23 @@ class MiniCPMV4_6VisionModel(nn.Module):
         # dataclasses.replace gives a fresh extra_attrs (init=False), so the
         # vision attention's transient layer registration can't collide with
         # the LLM's.
-        vision_model_config = dataclasses.replace(model_config,
-                                                  quant_config=QuantConfig(),
-                                                  mapping=Mapping())
+        vision_model_config = dataclasses.replace(
+            model_config, quant_config=QuantConfig(), mapping=Mapping()
+        )
         self.model_config = vision_model_config
         self.config = self.vision_config
 
-        self.embeddings = MiniCPMV4_6VisionEmbeddings(self.vision_config,
-                                                      self.dtype)
+        self.embeddings = MiniCPMV4_6VisionEmbeddings(self.vision_config, self.dtype)
         self.encoder = MiniCPMV4_6VisionEncoder(vision_model_config)
-        self.post_layernorm = LayerNorm(hidden_size=self.vision_config.hidden_size,
-                                        eps=self.vision_config.layer_norm_eps,
-                                        dtype=self.dtype)
-        self.vit_merger = MiniCPMV4_6ViTWindowAttentionMerger(
-            vision_model_config)
+        self.post_layernorm = LayerNorm(
+            hidden_size=self.vision_config.hidden_size,
+            eps=self.vision_config.layer_norm_eps,
+            dtype=self.dtype,
+        )
+        self.vit_merger = MiniCPMV4_6ViTWindowAttentionMerger(vision_model_config)
         self.merger = MiniCPMV4_6Merger(vision_model_config)
 
-        self.metadata_cls = get_attention_backend(
-            model_config.attn_backend).Metadata
+        self.metadata_cls = get_attention_backend(model_config.attn_backend).Metadata
 
     def _make_attn_metadata(self, seq_lens: List[int]) -> AttentionMetadata:
         num_segments = len(seq_lens)
@@ -550,31 +549,27 @@ class MiniCPMV4_6VisionModel(nn.Module):
     def _grid_cu_seqlens(target_sizes: torch.Tensor) -> List[int]:
         cu = [0]
         for i in range(len(target_sizes)):
-            cu.append(cu[-1] +
-                      int(target_sizes[i][0]) * int(target_sizes[i][1]))
+            cu.append(cu[-1] + int(target_sizes[i][0]) * int(target_sizes[i][1]))
         return cu
 
-    def _get_image_features(self, pixel_values: torch.Tensor,
-                            target_sizes: torch.Tensor) -> List[torch.Tensor]:
+    def _get_image_features(
+        self, pixel_values: torch.Tensor, target_sizes: torch.Tensor
+    ) -> List[torch.Tensor]:
         pixel_values = pixel_values.to(self.dtype)
         hidden_states = self.embeddings(pixel_values, target_sizes).squeeze(0)
 
         use_vit_merger = self.downsample_mode != "4x"
         if use_vit_merger and self.insert_layer_id >= 0:
-            attn_metadata = self._make_attn_metadata(
-                self._grid_seq_lens(target_sizes))
+            attn_metadata = self._make_attn_metadata(self._grid_seq_lens(target_sizes))
             for layer_index, encoder_layer in enumerate(self.encoder.layers):
                 hidden_states = encoder_layer(hidden_states, attn_metadata)
                 if layer_index == self.insert_layer_id:
                     cu_seqlens = self._grid_cu_seqlens(target_sizes)
-                    hidden_states = self.vit_merger(hidden_states, target_sizes,
-                                                    cu_seqlens)
+                    hidden_states = self.vit_merger(hidden_states, target_sizes, cu_seqlens)
                     target_sizes = target_sizes // 2
-                    attn_metadata = self._make_attn_metadata(
-                        self._grid_seq_lens(target_sizes))
+                    attn_metadata = self._make_attn_metadata(self._grid_seq_lens(target_sizes))
         else:
-            attn_metadata = self._make_attn_metadata(
-                self._grid_seq_lens(target_sizes))
+            attn_metadata = self._make_attn_metadata(self._grid_seq_lens(target_sizes))
             for encoder_layer in self.encoder.layers:
                 hidden_states = encoder_layer(hidden_states, attn_metadata)
 
@@ -583,8 +578,7 @@ class MiniCPMV4_6VisionModel(nn.Module):
 
     @torch.inference_mode()
     @nvtx_range("MiniCPMV4_6 vision encoder")
-    def forward(self,
-                multimodal_params: List[MultimodalParams]) -> List[torch.Tensor]:
+    def forward(self, multimodal_params: List[MultimodalParams]) -> List[torch.Tensor]:
         pixel_values_list = []
         target_sizes_list = []
         for param in multimodal_params:
@@ -602,10 +596,16 @@ class MiniCPMV4_6VisionModel(nn.Module):
             return []
 
         # NaViT packing: concat along the packed patch axis; target grids stack.
-        pixel_values = (torch.cat(pixel_values_list, dim=-1)
-                        if len(pixel_values_list) > 1 else pixel_values_list[0])
-        target_sizes = (torch.cat(target_sizes_list, dim=0)
-                        if len(target_sizes_list) > 1 else target_sizes_list[0])
+        pixel_values = (
+            torch.cat(pixel_values_list, dim=-1)
+            if len(pixel_values_list) > 1
+            else pixel_values_list[0]
+        )
+        target_sizes = (
+            torch.cat(target_sizes_list, dim=0)
+            if len(target_sizes_list) > 1
+            else target_sizes_list[0]
+        )
         target_sizes = target_sizes.to("cpu")
 
         features = self._get_image_features(pixel_values, target_sizes)
@@ -615,10 +615,9 @@ class MiniCPMV4_6VisionModel(nn.Module):
         converted_weights = {}
         for key, value in weights.items():
             if key.startswith("model.vision_tower."):
-                converted_weights[key[len("model.vision_tower."):]] = value
+                converted_weights[key[len("model.vision_tower.") :]] = value
             elif key.startswith("model.merger."):
-                converted_weights["merger." +
-                                  key[len("model.merger."):]] = value
+                converted_weights["merger." + key[len("model.merger.") :]] = value
 
         # q/k/v -> qkv_proj fusion is handled by _load_weights_impl's params_map;
         # only the projection / MLP renames need explicit regex substitutions.
@@ -633,39 +632,40 @@ class MiniCPMV4_6VisionModel(nn.Module):
 # ---------------------------------------------------------------------------
 # Input processor
 # ---------------------------------------------------------------------------
-class MiniCPMV4_6InputProcessor(BaseMultimodalInputProcessor,
-                                BaseMultimodalDummyInputsBuilder):
+class MiniCPMV4_6InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInputsBuilder):
     """Runs the HF MiniCPM-V processor and rewrites image tokens to the OOV
     sentinel expected by ``fuse_input_embeds``."""
 
-    def __init__(self,
-                 model_path: str,
-                 config: PretrainedConfig,
-                 tokenizer: AutoTokenizer,
-                 trust_remote_code: bool = True,
-                 **kwargs):
+    def __init__(
+        self,
+        model_path: str,
+        config: PretrainedConfig,
+        tokenizer: AutoTokenizer,
+        trust_remote_code: bool = True,
+        **kwargs,
+    ):
         _ensure_transformers_supports_minicpmv4_6()
-        super().__init__(model_path=model_path,
-                         config=config,
-                         tokenizer=tokenizer,
-                         trust_remote_code=trust_remote_code,
-                         **kwargs)
+        super().__init__(
+            model_path=model_path,
+            config=config,
+            tokenizer=tokenizer,
+            trust_remote_code=trust_remote_code,
+            **kwargs,
+        )
         self._config = config
         self._model_path = model_path
-        self._tokenizer = tokenizer if tokenizer is not None else \
-            AutoTokenizer.from_pretrained(model_path,
-                                          trust_remote_code=trust_remote_code)
+        self._tokenizer = (
+            tokenizer
+            if tokenizer is not None
+            else AutoTokenizer.from_pretrained(model_path, trust_remote_code=trust_remote_code)
+        )
         self._processor = AutoProcessor.from_pretrained(
-            model_path,
-            use_fast=self.use_fast,
-            trust_remote_code=trust_remote_code)
-        self._dtype = (config.torch_dtype or config.text_config.torch_dtype
-                       or torch.bfloat16)
+            model_path, use_fast=self.use_fast, trust_remote_code=trust_remote_code
+        )
+        self._dtype = config.torch_dtype or config.text_config.torch_dtype or torch.bfloat16
         self.tllm_multimodal_token_id = self.get_vocab_size() + 1
-        self.image_token_str = getattr(self._processor, "image_token",
-                                       "<|image_pad|>")
-        self.video_token_str = getattr(self._processor, "video_token",
-                                       "<|video_pad|>")
+        self.image_token_str = getattr(self._processor, "image_token", "<|image_pad|>")
+        self.video_token_str = getattr(self._processor, "video_token", "<|video_pad|>")
 
     def get_vocab_size(self) -> int:
         return self.config.text_config.vocab_size
@@ -692,22 +692,21 @@ class MiniCPMV4_6InputProcessor(BaseMultimodalInputProcessor,
 
     def _mm_token_ids(self) -> List[int]:
         return [
-            tid for attr in ("image_token_id", "video_token_id")
+            tid
+            for attr in ("image_token_id", "video_token_id")
             if (tid := getattr(self.config, attr, None)) is not None
         ]
 
     def _postprocess(self, input_ids: torch.IntTensor) -> torch.IntTensor:
         token_ids = self._mm_token_ids()
         if token_ids:
-            ids_tensor = torch.tensor(token_ids,
-                                      device=input_ids.device,
-                                      dtype=input_ids.dtype)
-            input_ids[torch.isin(input_ids,
-                                 ids_tensor)] = self.tllm_multimodal_token_id
+            ids_tensor = torch.tensor(token_ids, device=input_ids.device, dtype=input_ids.dtype)
+            input_ids[torch.isin(input_ids, ids_tensor)] = self.tllm_multimodal_token_id
         return input_ids
 
-    def _preprocess(self, text_prompt: str, images, videos, video_metadata,
-                    mm_processor_kwargs: Dict):
+    def _preprocess(
+        self, text_prompt: str, images, videos, video_metadata, mm_processor_kwargs: Dict
+    ):
         do_rescale = True
         if images and isinstance(images[0], torch.Tensor):
             do_rescale = False
@@ -715,11 +714,13 @@ class MiniCPMV4_6InputProcessor(BaseMultimodalInputProcessor,
         # the HF rescale (x / 255) must be skipped for video.
         if videos and isinstance(videos[0][0], torch.Tensor):
             do_rescale = False
-        call_kwargs = dict(text=[text_prompt],
-                           images=images,
-                           do_rescale=do_rescale,
-                           return_tensors="pt",
-                           **mm_processor_kwargs)
+        call_kwargs = dict(
+            text=[text_prompt],
+            images=images,
+            do_rescale=do_rescale,
+            return_tensors="pt",
+            **mm_processor_kwargs,
+        )
         if videos is not None:
             # Frames are already sampled by TRT-LLM's load_video, so disable the
             # HF processor's own frame sampling (which would otherwise require
@@ -731,29 +732,24 @@ class MiniCPMV4_6InputProcessor(BaseMultimodalInputProcessor,
 
     def get_num_tokens_per_image(self, *, image, **kwargs) -> int:
         do_rescale = not isinstance(image, torch.Tensor)
-        processed = self.processor(text=[self.image_token_str],
-                                   images=[image],
-                                   do_rescale=do_rescale,
-                                   return_tensors="pt")
+        processed = self.processor(
+            text=[self.image_token_str], images=[image], do_rescale=do_rescale, return_tensors="pt"
+        )
         input_ids = processed["input_ids"][0]
         return int((input_ids == self.config.image_token_id).sum().item())
 
-    def get_num_tokens_per_video(self,
-                                 *,
-                                 video,
-                                 video_metadata=None,
-                                 **kwargs) -> int:
+    def get_num_tokens_per_video(self, *, video, video_metadata=None, **kwargs) -> int:
         # `video` is the list of pre-sampled frames (see find_mm_token_lengths).
         frames = video
         do_rescale = not (frames and isinstance(frames[0], torch.Tensor))
         processed = self.processor(
             text=[self.video_token_str],
             videos=[frames],
-            video_metadata=[video_metadata]
-            if video_metadata is not None else None,
+            video_metadata=[video_metadata] if video_metadata is not None else None,
             do_sample_frames=False,
             do_rescale=do_rescale,
-            return_tensors="pt")
+            return_tensors="pt",
+        )
         input_ids = processed["input_ids"][0]
         return int((input_ids == self.config.video_token_id).sum().item())
 
@@ -769,8 +765,7 @@ class MiniCPMV4_6InputProcessor(BaseMultimodalInputProcessor,
         mm_processor_kwargs = inputs.get("mm_processor_kwargs", {}) or {}
 
         if not mm_data:
-            input_ids = self.tokenizer(text_prompt,
-                                       return_tensors="pt").input_ids
+            input_ids = self.tokenizer(text_prompt, return_tensors="pt").input_ids
             return input_ids[0].to(torch.int32).tolist(), None
 
         images = mm_data.get("image")
@@ -780,11 +775,10 @@ class MiniCPMV4_6InputProcessor(BaseMultimodalInputProcessor,
             # Each item is a VideoData (frames + decode metadata) from
             # load_video, mirroring the Qwen-VL input processor.
             videos = [vd.frames for vd in video_datas]
-            video_metadata = [
-                getattr(vd, "metadata", None) for vd in video_datas
-            ]
-        processed_inputs = self._preprocess(text_prompt, images, videos,
-                                            video_metadata, mm_processor_kwargs)
+            video_metadata = [getattr(vd, "metadata", None) for vd in video_datas]
+        processed_inputs = self._preprocess(
+            text_prompt, images, videos, video_metadata, mm_processor_kwargs
+        )
 
         multimodal_data = {}
         pixel_values = processed_inputs.get("pixel_values")
@@ -830,9 +824,7 @@ class MiniCPMV4_6InputProcessor(BaseMultimodalInputProcessor,
     ),
 )
 class MiniCPMV4_6Model(PreTrainedModel):
-
-    def __init__(self, model_config: ModelConfig[PretrainedConfig], *args,
-                 **kwargs):
+    def __init__(self, model_config: ModelConfig[PretrainedConfig], *args, **kwargs):
         config = model_config.pretrained_config
         super().__init__(config)
         if hasattr(self, "llm"):
@@ -841,14 +833,14 @@ class MiniCPMV4_6Model(PreTrainedModel):
         if _is_mm_disagg():
             raise NotImplementedError(
                 "MiniCPMV4_6 does not support disaggregated multimodal serving "
-                "yet. Unset TLLM_MULTIMODAL_DISAGGREGATED or set it to '0'.")
+                "yet. Unset TLLM_MULTIMODAL_DISAGGREGATED or set it to '0'."
+            )
 
         self.model_config = model_config
         self.mm_encoder = MiniCPMV4_6VisionModel(model_config).eval()
 
         # Inner LLM resolved from text_config (Qwen3_5ForCausalLM, hybrid).
-        llm_model_config = dataclasses.replace(
-            model_config, pretrained_config=config.text_config)
+        llm_model_config = dataclasses.replace(model_config, pretrained_config=config.text_config)
         # Share the wrapper's extra_attrs so the LM's attention layers register
         # into the same dict the engine binds via with_model_extra_attrs (needed
         # for the compiled / piecewise-CUDA-graph LM path). dataclasses.replace
@@ -890,25 +882,24 @@ class MiniCPMV4_6Model(PreTrainedModel):
                 encoder_forward_fn=self.mm_encoder.forward,
                 multimodal_params=multimodal_params[:num_context_requests],
             )
-            mm_embeds = find_input_mm_embeds(
-                mm_embeds, multimodal_params[:num_context_requests])
+            mm_embeds = find_input_mm_embeds(mm_embeds, multimodal_params[:num_context_requests])
 
         input_ids, inputs_embeds = fuse_input_embeds(
-            self.llm.model.embed_tokens, input_ids, mm_embeds, **kwargs)
-        return self.llm.forward(attn_metadata=attn_metadata,
-                                input_ids=input_ids,
-                                position_ids=position_ids,
-                                inputs_embeds=inputs_embeds,
-                                return_context_logits=return_context_logits)
+            self.llm.model.embed_tokens, input_ids, mm_embeds, **kwargs
+        )
+        return self.llm.forward(
+            attn_metadata=attn_metadata,
+            input_ids=input_ids,
+            position_ids=position_ids,
+            inputs_embeds=inputs_embeds,
+            return_context_logits=return_context_logits,
+        )
 
     @property
     def multimodal_data_device_paths(self) -> List[str]:
-        return [
-            "image.pixel_values", "video.pixel_values", "multimodal_embedding"
-        ]
+        return ["image.pixel_values", "video.pixel_values", "multimodal_embedding"]
 
-    def load_weights(self, weights: Dict[str, torch.Tensor],
-                     weight_mapper: BaseWeightMapper):
+    def load_weights(self, weights: Dict[str, torch.Tensor], weight_mapper: BaseWeightMapper):
         if self.mm_encoder is not None:
             self.mm_encoder.load_weights(weights)
             if hasattr(weights, "mark_consumed"):
@@ -917,11 +908,7 @@ class MiniCPMV4_6Model(PreTrainedModel):
 
         llm_weight_mapper = Qwen3_5MoeHfWeightMapper()
         llm_weight_mapper.init_model_and_config(self.llm, self.model_config)
-        llm_weights = {
-            k: v
-            for k, v in weights.items()
-            if k.startswith("model.language_model.")
-        }
+        llm_weights = {k: v for k, v in weights.items() if k.startswith("model.language_model.")}
         self.llm.load_weights(llm_weights, llm_weight_mapper)
         if hasattr(weights, "mark_consumed"):
             weights.mark_consumed("model.language_model")
