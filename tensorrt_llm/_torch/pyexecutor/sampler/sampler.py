@@ -88,11 +88,7 @@ from ..finish_reason import FinishedState
 from ..llm_request import LlmRequest, LlmRequestState, get_draft_token_length
 from ..resource_manager import ResourceManager, ResourceManagerType
 from ..scheduler import ScheduledRequests
-from .ops.penalties import (
-    BeamPenaltyMetadata,
-    apply_occurrence_penalties_triton,
-    update_occurrence_workspace,
-)
+from .ops.penalties import apply_batched_occurrence_penalties_triton, update_occurrence_workspace
 from .sampling_utils import (
     BEAM_SEARCH_PAD_TOKEN,
     GREEDY,
@@ -451,6 +447,22 @@ def _unwrap_singleton(p: Optional[List[T]]) -> Optional[T]:
         return None
     (t,) = p
     return t
+
+
+def _has_occurrence_penalty(request: LlmRequest) -> bool:
+    sampling_config = request.sampling_config
+    repetition = _unwrap_singleton(sampling_config.repetition_penalty)
+    presence = _unwrap_singleton(sampling_config.presence_penalty)
+    frequency = _unwrap_singleton(sampling_config.frequency_penalty)
+    return (
+        (repetition is not None and repetition != 1.0)
+        or (presence is not None and presence != 0.0)
+        or (frequency is not None and frequency != 0.0)
+    )
+
+
+def _is_occurrence_penalty_active(request: LlmRequest) -> bool:
+    return _get_max_beam_width(request) == 1 and _has_occurrence_penalty(request)
 
 
 def _get_beam_width_in(request: LlmRequest) -> int:
@@ -1342,9 +1354,9 @@ class _OccurrencePenaltyHandler:
 
     Occurrence tracking and penalty formulas are aligned with the C++
     ``batchApplyPenalty`` kernel (``cpp/tensorrt_llm/kernels/penaltyKernels.cu``) as
-    driven by ``PenaltyLayer``. Beam search uses temperature-before-normalization
-    semantics. All persistent device state lives in a single :class:`_PenaltyStore`, the
-    torch counterpart of the tensors ``PenaltyLayer`` allocates:
+    driven by ``PenaltyLayer``. All persistent device state lives in a single
+    :class:`_PenaltyStore`, the torch counterpart of the tensors ``PenaltyLayer``
+    allocates:
 
     * per-slot penalty-parameter buffers (``repetition`` / ``presence`` / ``frequency``
       / ``temperature``, shape ``[max_num_sequences]``) -- the counterpart of
@@ -1357,10 +1369,6 @@ class _OccurrencePenaltyHandler:
     The actual logits math lives in the ops module. Parameter buffers are allocated
     eagerly (tiny, vocab-independent); vocab-sized workspaces are allocated lazily and
     skipped entirely when no matching request uses an occurrence penalty.
-
-    Beam search uses two C++-shaped workspaces. The beam-search sampling op copies the
-    selected parent's state into the other buffer before applying the penalty to normalized
-    log probabilities.
     """
 
     @dataclass(kw_only=True)
@@ -1377,12 +1385,10 @@ class _OccurrencePenaltyHandler:
         temperature: torch.Tensor
         """float32; per-slot effective sampling temperature (default 1.0), used to couple
         the additive penalties to the deferred temperature division for C++ parity."""
-        beam_active: torch.Tensor
-        """bool[slots]; whether a slot has an active beam occurrence penalty."""
-        beam_buffer_indices: torch.Tensor
-        """int32[slots]; current beam workspace selector."""
-        prompt_lengths: torch.Tensor
-        """int32[slots]; separates the context and generation phases on device."""
+        active: torch.Tensor
+        """bool[slots]; whether a slot has an active occurrence penalty."""
+        has_previous_token: torch.Tensor
+        """bool[slots]; whether ``new_tokens`` contains a token to accumulate."""
 
         # --- Occurrence workspace (allocateWorkspace counterpart), lazy, [slots, vocab] ---
         counts: torch.Tensor | None = None
@@ -1393,10 +1399,6 @@ class _OccurrencePenaltyHandler:
         """int32 or None; per-slot presence bitmap for the ignored prompt prefix
         [0, prompt_ignore_length). Allocated only when some request sets
         prompt_ignore_length > 0; contributes to repetition only."""
-        beam_workspace_a: torch.Tensor | None = None
-        """int32 or None; ``[slots, max_beam_width, 2, vocab_size]``."""
-        beam_workspace_b: torch.Tensor | None = None
-        """Second parent-aware workspace used by beam search."""
 
     @dataclass(kw_only=True)
     class _SlotState:
@@ -1405,22 +1407,22 @@ class _OccurrencePenaltyHandler:
         prompt_ignore_length: int
         counted_len: int
         """Number of sequence tokens already folded into the workspace."""
-        use_beam_search: bool
-        beam_initialized: bool = False
+        initialized: bool = False
+        has_previous_token: bool = False
+        last_step_was_speculative: bool = False
 
     def __init__(
         self,
         *,
         max_num_sequences: int,
-        max_beam_width: int,
         device: torch.device | str,
     ):
         self._max_num_sequences = max_num_sequences
-        self._max_beam_width = max_beam_width
         self._device = torch.device(device)
         # Whether any (past or current) active request uses prompt_ignore_length > 0,
         # which requires allocating the presence-prefix bitmap.
         self._needs_prefix = False
+        self._num_active_slots = 0
         # Per-slot state; None marks a slot without active occurrence penalties.
         self._slots: list[_OccurrencePenaltyHandler._SlotState | None] = [None] * max_num_sequences
         # Eagerly allocate the (tiny, vocab-independent) parameter buffers with their
@@ -1431,24 +1433,21 @@ class _OccurrencePenaltyHandler:
                 presence=torch.zeros(max_num_sequences, dtype=torch.float32, device=self._device),
                 frequency=torch.zeros(max_num_sequences, dtype=torch.float32, device=self._device),
                 temperature=torch.ones(max_num_sequences, dtype=torch.float32, device=self._device),
-                beam_active=torch.zeros(max_num_sequences, dtype=torch.bool, device=self._device),
-                beam_buffer_indices=torch.zeros(
-                    max_num_sequences, dtype=torch.int32, device=self._device
-                ),
-                prompt_lengths=torch.zeros(
-                    max_num_sequences, dtype=torch.int32, device=self._device
+                active=torch.zeros(max_num_sequences, dtype=torch.bool, device=self._device),
+                has_previous_token=torch.zeros(
+                    max_num_sequences, dtype=torch.bool, device=self._device
                 ),
             )
-
-    @staticmethod
-    def _is_active(
-        repetition: float | None, presence: float | None, frequency: float | None
-    ) -> bool:
-        return (
-            (repetition is not None and repetition != 1.0)
-            or (presence is not None and presence != 0.0)
-            or (frequency is not None and frequency != 0.0)
-        )
+            # Persistent destinations for the per-step metadata consumed by Triton.
+            self._request_offsets = torch.empty(
+                max_num_sequences, dtype=torch.int32, device=self._device
+            )
+            self._request_num_steps = torch.empty(
+                max_num_sequences, dtype=torch.int32, device=self._device
+            )
+            self._history_synced = torch.empty(
+                max_num_sequences, dtype=torch.bool, device=self._device
+            )
 
     @staticmethod
     def _fill_slot(tensor: torch.Tensor, slot: int, value: bool | float | int) -> None:
@@ -1463,19 +1462,18 @@ class _OccurrencePenaltyHandler:
         Inactive slots are never gathered, so their stale parameters/counts are left
         untouched.
         """
+        was_active = self._slots[slot] is not None
+        if not _is_occurrence_penalty_active(request):
+            self._slots[slot] = None
+            if was_active:
+                self._num_active_slots -= 1
+                self._fill_slot(self.store.active, slot, False)
+            return
+
         sampling_config = request.sampling_config
         repetition = _unwrap_singleton(sampling_config.repetition_penalty)
         presence = _unwrap_singleton(sampling_config.presence_penalty)
         frequency = _unwrap_singleton(sampling_config.frequency_penalty)
-        previous_state = self._slots[slot]
-        previous_use_beam_search = previous_state is not None and previous_state.use_beam_search
-
-        if not self._is_active(repetition, presence, frequency):
-            self._slots[slot] = None
-            if previous_use_beam_search:
-                self._fill_slot(self.store.beam_active, slot, False)
-            return
-
         temperature = _unwrap_singleton(sampling_config.temperature)
         prompt_ignore_length = _unwrap_singleton(sampling_config.prompt_ignore_length)
         # min(prompt_ignore_length, inputLen), matching the C++ kernel.
@@ -1489,7 +1487,6 @@ class _OccurrencePenaltyHandler:
         state = self._SlotState(
             prompt_ignore_length=prompt_ignore_length,
             counted_len=0,
-            use_beam_search=_get_max_beam_width(request) > 1,
         )
         self._slots[slot] = state
         # Fill the per-slot parameter buffers (once per request; gathered every step).
@@ -1508,31 +1505,20 @@ class _OccurrencePenaltyHandler:
             slot,
             frequency if frequency is not None else 0.0,
         )
-        if state.use_beam_search != previous_use_beam_search:
-            self._fill_slot(self.store.beam_active, slot, state.use_beam_search)
-
-        if state.use_beam_search:
-            self._fill_slot(self.store.beam_buffer_indices, slot, 0)
-            self._fill_slot(
-                self.store.prompt_lengths,
-                slot,
-                request.py_orig_prompt_len,
-            )
-        else:
-            # Effective sampling temperature (cf. resolve_sampling_strategy): the value
-            # the regular strategy later divides by; 0/None -> 1.0.
-            self._fill_slot(self.store.temperature, slot, temperature or 1.0)
+        if not was_active:
+            self._num_active_slots += 1
+            self._fill_slot(self.store.active, slot, True)
+        self._fill_slot(self.store.has_previous_token, slot, False)
+        # Effective sampling temperature (cf. resolve_sampling_strategy): the value
+        # the regular strategy later divides by; 0/None -> 1.0.
+        self._fill_slot(self.store.temperature, slot, temperature or 1.0)
 
         # Re-zero the workspace slot so a prior occupant's counts do not leak in.
-        if state.use_beam_search:
-            if self.store.beam_workspace_a is not None:
-                self.store.beam_workspace_a[slot].zero_()
-                assert self.store.beam_workspace_b is not None
-                self.store.beam_workspace_b[slot].zero_()
-        elif self.store.counts is not None:
+        if self.store.counts is not None:
             self.store.counts[slot].zero_()
-            if self.store.presence_prefix is not None:
-                self.store.presence_prefix[slot].zero_()
+
+        if self.store.presence_prefix is not None:
+            self.store.presence_prefix[slot].zero_()
 
     def _ensure_workspace(self, vocab_size: int) -> None:
         # Lazily allocate the occurrence workspace on first use (vocab_size is only known
@@ -1546,101 +1532,79 @@ class _OccurrencePenaltyHandler:
             if self._needs_prefix and self.store.presence_prefix is None:
                 self.store.presence_prefix = torch.zeros_like(self.store.counts)
 
-    def _ensure_beam_workspace(self, vocab_size: int) -> None:
-        with torch.inference_mode(False):
-            if self.store.beam_workspace_a is None:
-                shape = (
-                    self._max_num_sequences,
-                    self._max_beam_width,
-                    2,
-                    vocab_size,
-                )
-                self.store.beam_workspace_a = torch.zeros(
-                    shape, dtype=torch.int32, device=self._device
-                )
-                self.store.beam_workspace_b = torch.zeros_like(self.store.beam_workspace_a)
-
-    def _initialize_beam_workspace(
-        self,
-        request: LlmRequest,
-        state: "_OccurrencePenaltyHandler._SlotState",
-    ) -> None:
-        if state.beam_initialized:
-            return
-        slot = request.py_seq_slot
-        assert slot is not None
-        workspace = self.store.beam_workspace_a
-        assert workspace is not None
-        counts = workspace[slot, 0, 1, :].unsqueeze(0)
-        presence_prefix = workspace[slot, 0, 0, :].unsqueeze(0)
-        workspace_row = 0
-        counted_slots: list[int] = []
-        counted_tokens: list[int] = []
-        prefix_slots: list[int] = []
-        prefix_tokens: list[int] = []
-        for index, token in enumerate(request.get_tokens(0)[: request.py_orig_prompt_len]):
-            if token < 0 or token >= workspace.size(-1):
-                continue
-            if index < state.prompt_ignore_length:
-                prefix_slots.append(workspace_row)
-                prefix_tokens.append(token)
-            else:
-                counted_slots.append(workspace_row)
-                counted_tokens.append(token)
-        update_occurrence_workspace(
-            counts,
-            presence_prefix,
-            self._to_device(counted_slots, torch.int64),
-            self._to_device(counted_tokens, torch.int64),
-            self._to_device(prefix_slots, torch.int64),
-            self._to_device(prefix_tokens, torch.int64),
-        )
-        state.beam_initialized = True
-
-    def get_beam_metadata(
-        self,
-        requests: list[LlmRequest],
-        *,
-        vocab_size: int,
-        new_tokens: torch.Tensor,
-        predecessor_beams: torch.Tensor,
-    ) -> BeamPenaltyMetadata | None:
-        active_requests = []
-        for request in requests:
-            assert request.py_seq_slot is not None
-            state = self._slots[request.py_seq_slot]
-            if state is not None and state.use_beam_search:
-                active_requests.append(request)
-
-        if not active_requests:
-            return None
-
-        self._ensure_beam_workspace(vocab_size)
-        for request in active_requests:
-            assert request.py_seq_slot is not None
-            state = self._slots[request.py_seq_slot]
-            assert state is not None
-            self._initialize_beam_workspace(request, state)
-
-        store = self.store
-        assert store.beam_workspace_a is not None
-        assert store.beam_workspace_b is not None
-        return BeamPenaltyMetadata(
-            workspace_a=store.beam_workspace_a,
-            workspace_b=store.beam_workspace_b,
-            active=store.beam_active,
-            buffer_indices=store.beam_buffer_indices,
-            prompt_lengths=store.prompt_lengths,
-            new_tokens=new_tokens,
-            predecessor_beams=predecessor_beams,
-            repetition=store.repetition,
-            presence=store.presence,
-            frequency=store.frequency,
-        )
-
     def _to_device(self, values: list[int], dtype: torch.dtype) -> torch.Tensor:
         return torch.tensor(values, dtype=dtype, pin_memory=prefer_pinned()).to(
             self._device, non_blocking=True
+        )
+
+    def _initialize_workspace(
+        self,
+        request: LlmRequest,
+        state: "_OccurrencePenaltyHandler._SlotState",
+        vocab_size: int,
+    ) -> None:
+        """Initialize one regular slot from its prompt exactly once."""
+        if state.initialized:
+            return
+
+        slot = request.py_seq_slot
+        assert slot is not None
+        counts = self.store.counts
+        assert counts is not None
+        counted_tokens: list[int] = []
+        prefix_tokens: list[int] = []
+        for index, token in enumerate(request.get_tokens(0)[: request.py_orig_prompt_len]):
+            if token < 0 or token >= vocab_size:
+                continue
+            if index < state.prompt_ignore_length:
+                prefix_tokens.append(token)
+            else:
+                counted_tokens.append(token)
+
+        update_occurrence_workspace(
+            counts,
+            self.store.presence_prefix,
+            self._to_device([slot] * len(counted_tokens), torch.int64),
+            self._to_device(counted_tokens, torch.int64),
+            self._to_device([slot] * len(prefix_tokens), torch.int64),
+            self._to_device(prefix_tokens, torch.int64),
+        )
+        state.counted_len = request.py_orig_prompt_len
+        state.initialized = True
+
+    def _sync_speculative_request_history(
+        self,
+        logits: torch.Tensor,
+        requests: list[LlmRequest],
+        synced_slots: set[int],
+    ) -> None:
+        """Fold newly confirmed speculative tokens into the occurrence workspace."""
+        counts = self.store.counts
+        assert counts is not None
+        counted_slots: list[int] = []
+        counted_tokens: list[int] = []
+
+        for request in requests:
+            assert request.py_seq_slot is not None
+            slot = request.py_seq_slot
+            state = self._slots[slot]
+            if slot not in synced_slots or state is None:
+                continue
+            self._fill_slot(self.store.has_previous_token, slot, False)
+            tokens = request.get_tokens(0)
+            for token in tokens[state.counted_len :]:
+                if 0 <= token < logits.size(-1):
+                    counted_slots.append(slot)
+                    counted_tokens.append(token)
+            state.counted_len = len(tokens)
+
+        update_occurrence_workspace(
+            counts,
+            self.store.presence_prefix,
+            self._to_device(counted_slots, torch.int64),
+            self._to_device(counted_tokens, torch.int64),
+            self._to_device([], torch.int64),
+            self._to_device([], torch.int64),
         )
 
     @nvtx_range("apply_occurrence_penalties")
@@ -1650,91 +1614,83 @@ class _OccurrencePenaltyHandler:
         logits: torch.Tensor,
         requests: list[LlmRequest],
         num_steps: list[int],
-        num_beams: list[int],
+        *,
+        new_tokens: torch.Tensor,
+        seq_slots: torch.Tensor,
+        request_offsets: torch.Tensor,
+        request_num_steps: torch.Tensor,
     ) -> torch.Tensor:
         """Apply occurrence penalties to ``logits`` in place; returns ``logits``.
 
         ``logits`` is the packed generated-token logits ``[sum(num_steps * num_beams),
         vocab_size]``; the row layout matches ``TorchSampler._apply_min_length_penalty``.
         """
-        # py_seq_slot is guaranteed non-None for sampling requests (asserted in
-        # setup_sampler_step), so it is safe to index self._slots by it directly.
-        if not any(
-            (state := self._slots[r.py_seq_slot]) is not None and not state.use_beam_search  # type: ignore
-            for r in requests
-        ):
+        if self._num_active_slots == 0:
             return logits
 
         self._ensure_workspace(logits.size(-1))
         store = self.store
-        counts, presence_prefix = store.counts, store.presence_prefix
+        has_active_request = False
+        history_synced_requests: list[bool] = []
+        history_sync_slots: set[int] = set()
+        counts = store.counts
         assert counts is not None
-
-        # (slot, token) updates to fold into the workspace this step.
-        counted_slots: list[int] = []
-        counted_tokens: list[int] = []
-        prefix_slots: list[int] = []
-        prefix_tokens: list[int] = []
-        # Active logits rows and the slot each row reads its parameters/counts from.
-        active_rows: list[int] = []
-        row_slots: list[int] = []
-
-        current_offset = 0
-        for i, request in enumerate(requests):
+        for request, steps in zip(requests, num_steps, strict=True):
             assert request.py_seq_slot is not None
-            steps = num_steps[i]
-            beams = num_beams[i]
-            state = self._slots[request.py_seq_slot]
-            if state is not None and not state.use_beam_search:
-                slot = request.py_seq_slot
-                # Fold newly-committed tokens (beam_width == 1 -> single beam 0).
-                tokens = request.get_tokens(0)
-                pil = state.prompt_ignore_length
-                for idx in range(state.counted_len, len(tokens)):
-                    token = tokens[idx]
-                    if token < 0 or token >= logits.size(-1):
-                        continue
-                    if idx < pil:
-                        prefix_slots.append(slot)
-                        prefix_tokens.append(token)
-                    else:
-                        counted_slots.append(slot)
-                        counted_tokens.append(token)
-                state.counted_len = len(tokens)
-                # Every step/beam row uses the committed-history counts (intra-window
-                # draft tokens are not progressively counted -- exact for beam_width==1
-                # without speculation).
-                for beam in range(beams):
-                    for step in range(steps):
-                        active_rows.append(current_offset + steps * beam + step)
-                        row_slots.append(slot)
-            current_offset += steps * beams
+            slot = request.py_seq_slot
+            state = self._slots[slot]
+            history_synced = False
+            if state is not None:
+                has_active_request = True
+                self._initialize_workspace(request, state, logits.size(-1))
+                history_synced = steps > 1 or state.last_step_was_speculative
+                if history_synced:
+                    history_sync_slots.add(slot)
+                elif state.has_previous_token:
+                    # The fused kernel below will fold exactly one regular token into
+                    # counts. Keep the host history cursor aligned without rescanning it.
+                    state.counted_len += 1
+                state.has_previous_token = True
+                state.last_step_was_speculative = steps > 1
+            history_synced_requests.append(history_synced)
 
-        # Update the persistent workspace with this step's committed tokens.
-        update_occurrence_workspace(
-            counts,
-            presence_prefix,
-            self._to_device(counted_slots, torch.int64),
-            self._to_device(counted_tokens, torch.int64),
-            self._to_device(prefix_slots, torch.int64),
-            self._to_device(prefix_tokens, torch.int64),
-        )
-
-        # Apply the penalties in place via the fused Triton kernel: indirect indexing by
-        # active_rows (logits row) / row_slots (workspace + param slot), no
-        # [num_active, vocab] intermediates.
-        row_slots_cuda = self._to_device(row_slots, torch.int64)
-        active_rows_cuda = self._to_device(active_rows, torch.int64)
-        apply_occurrence_penalties_triton(
+        if not has_active_request:
+            return logits
+        num_requests = len(requests)
+        has_history_sync = any(history_synced_requests)
+        kernel_request_offsets = self._request_offsets[:num_requests]
+        kernel_request_num_steps = self._request_num_steps[:num_requests]
+        kernel_history_synced = self._history_synced[:num_requests]
+        kernel_request_offsets.copy_(request_offsets, non_blocking=True)
+        kernel_request_num_steps.copy_(request_num_steps, non_blocking=True)
+        if has_history_sync:
+            history_synced_host = torch.tensor(
+                history_synced_requests,
+                dtype=torch.bool,
+                pin_memory=prefer_pinned(),
+            )
+            kernel_history_synced.copy_(history_synced_host, non_blocking=True)
+        # The regular specialization still receives this pointer, but HISTORY_SYNCED=False
+        # makes the Triton compiler remove all loads from the untouched buffer.
+        if history_sync_slots:
+            self._sync_speculative_request_history(logits, requests, history_sync_slots)
+        apply_batched_occurrence_penalties_triton(
             logits,
-            active_rows_cuda,
-            row_slots_cuda,
             counts,
-            presence_prefix,
+            store.presence_prefix,
+            store.active,
+            store.has_previous_token,
+            new_tokens,
+            seq_slots,
+            kernel_request_offsets,
+            kernel_request_num_steps,
+            kernel_history_synced,
             store.repetition,
             store.presence,
             store.frequency,
             store.temperature,
+            max_num_steps=max(num_steps),
+            history_synced=has_history_sync,
         )
         return logits
 
@@ -2784,7 +2740,6 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             )
             self._penalty_handler = _OccurrencePenaltyHandler(
                 max_num_sequences=self.max_num_sequences,
-                max_beam_width=self.max_beam_width,
                 device="cuda",
             )
 
@@ -3336,6 +3291,11 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
     @override
     def validate_request(self, request: LlmRequest) -> None:
         if self._use_beam_search:
+            if _has_occurrence_penalty(request):
+                logger.warning(
+                    "TorchSampler does not support repetition, presence, or frequency "
+                    "penalties with beam search; these penalties will be ignored."
+                )
             if request.py_return_log_probs:
                 if request.py_num_logprobs > 1:
                     raise ValueError(
@@ -3903,7 +3863,6 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         *,
         seq_slots_cuda: torch.Tensor,
         seq_lens_cuda: torch.Tensor,
-        vocab_size: int,
     ) -> dict[RequestGroupKey[GenericStrategyKeyType], RequestGroupValueWithMetadata]:
         grouped_requests_with_metadata: dict[
             RequestGroupKey[GenericStrategyKeyType], RequestGroupValueWithMetadata
@@ -3940,12 +3899,6 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                     predecessor_beams=beam_search_store.predecessor_beams,
                     seq_offsets=beam_search_store.seq_offsets,
                     beam_idx_arange=beam_search_store.beam_idx_arange,
-                    penalty=self._penalty_handler.get_beam_metadata(
-                        [requests[index] for index in value.indices.tolist()],
-                        vocab_size=vocab_size,
-                        new_tokens=self.store.new_tokens,
-                        predecessor_beams=beam_search_store.predecessor_beams,
-                    ),
                 )
             elif metadata_type is None:
                 metadata = None
@@ -4450,7 +4403,6 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             get_metadata_type_for_group_fn=self._grouped_sampler_cls.get_metadata_type_for_group,
             seq_slots_cuda=seq_slots_cuda,
             seq_lens_cuda=seq_lens_cuda,
-            vocab_size=logits_cuda.size(1),
         )
         generator_cuda = self.get_generator(cuda_device)
 
@@ -5124,7 +5076,10 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             logits_cuda,
             sampling_requests,
             sampling_requests_metadata.req_num_steps.tolist(),
-            sampling_requests_metadata.req_num_beams.tolist(),
+            new_tokens=new_tokens_cuda,
+            seq_slots=seq_slots_cuda,
+            request_offsets=sampling_requests_metadata.req_offsets,
+            request_num_steps=sampling_requests_metadata.req_num_steps,
         )
 
         # Fast path for greedy sampling

@@ -21,7 +21,7 @@ from utils.llm_data import llm_models_root
 
 from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm.executor.result import CompletionOutput, GenerationResult
-from tensorrt_llm.llmapi import CudaGraphConfig
+from tensorrt_llm.llmapi import CudaGraphConfig, NGramDecodingConfig
 from tensorrt_llm.llmapi import KvCacheConfig as TRT_KvCacheConfig
 
 
@@ -106,13 +106,15 @@ def _make_penalty_e2e_cases() -> list[_PenaltyE2ECase]:
 
 def _create_torch_llm(
     model_dir: Path,
-    max_beam_width: int = 1,
     max_batch_size: int | None = None,
-    sampler_type: str = "TorchSampler",
+    speculative_config: NGramDecodingConfig | None = None,
+    enable_iter_perf_stats: bool = False,
 ) -> LLM:
-    beam_kwargs = {"max_beam_width": max_beam_width}
+    llm_kwargs: dict[str, object] = {}
     if max_batch_size is not None:
-        beam_kwargs["max_batch_size"] = max_batch_size
+        llm_kwargs["max_batch_size"] = max_batch_size
+    if speculative_config is not None:
+        llm_kwargs["speculative_config"] = speculative_config
 
     return LLM(
         model=str(model_dir),
@@ -120,26 +122,19 @@ def _create_torch_llm(
         trust_remote_code=True,
         enable_chunked_prefill=True,
         cuda_graph_config=CudaGraphConfig(),
-        sampler_type=sampler_type,
+        sampler_type="TorchSampler",
         kv_cache_config=TRT_KvCacheConfig(enable_block_reuse=False),
         max_num_tokens=128,
-        **beam_kwargs,
+        enable_iter_perf_stats=enable_iter_perf_stats,
+        **llm_kwargs,
     )
 
 
 def _run_penalty_e2e_cases(
     model_dir: Path,
     cases: list[_PenaltyE2ECase],
-    max_beam_width: int = 1,
-    sampler_type: str = "TorchSampler",
 ) -> tuple[dict[str, GenerationResult], dict[str, tuple[int, ...]]]:
-    max_batch_size = len(cases) if max_beam_width > 1 else None
-    with _create_torch_llm(
-        model_dir,
-        max_beam_width,
-        max_batch_size,
-        sampler_type=sampler_type,
-    ) as llm:
+    with _create_torch_llm(model_dir) as llm:
         outputs = llm.generate(
             [case.prompt for case in cases],
             sampling_params=[case.sampling_params for case in cases],
@@ -284,43 +279,59 @@ def test_torch_sampler_penalty_logits_e2e(model_path):
 
 
 @pytest.mark.high_cuda_memory
-def test_torch_sampler_beam_penalty_e2e(model_path):
-    """Exercise request-level beam dispatch and multi-step parent-state updates."""
+def test_torch_sampler_speculative_penalty_e2e(model_path):
+    """Validate penalties through overlap scheduling and confirmed-history updates."""
     case = _PenaltyE2ECase(
-        "beam_combined_penalties",
-        "Repeat the word blue several times: blue blue",
+        "ngram_speculative_penalties",
+        "red blue red blue red blue red blue red blue",
         SamplingParams(
-            max_tokens=6,
-            n=2,
-            best_of=2,
-            use_beam_search=True,
-            # Isolate occurrence-penalty semantics in the cross-backend comparison.
-            temperature=1.0,
+            max_tokens=8,
+            temperature=0.0,
+            seed=12345,
             ignore_eos=True,
-            logprobs=0,
-            repetition_penalty=10.0,
-            presence_penalty=100.0,
-            frequency_penalty=25.0,
+            presence_penalty=0.01,
+            frequency_penalty=0.01,
             prompt_ignore_length=2,
         ),
     )
-    cases = [case]
-    results, _ = _run_penalty_e2e_cases(model_path, cases, max_beam_width=2)
-    reference_results, _ = _run_penalty_e2e_cases(
-        model_path,
-        cases,
-        max_beam_width=2,
-        sampler_type="TRTLLMSampler",
+    speculative_config = NGramDecodingConfig(
+        max_draft_len=3,
+        max_matching_ngram_size=2,
+        is_keep_all=True,
+        is_use_oldest=True,
+        is_public_pool=False,
     )
-
-    torch_outputs = results[case.name].outputs
-    reference_outputs = reference_results[case.name].outputs
-    assert [output.token_ids for output in torch_outputs] == [
-        output.token_ids for output in reference_outputs
-    ]
-    for output, reference_output in zip(torch_outputs, reference_outputs, strict=True):
-        assert output.cumulative_logprob == pytest.approx(
-            reference_output.cumulative_logprob,
-            rel=2e-4,
-            abs=2e-3,
+    with _create_torch_llm(
+        model_path,
+        max_batch_size=1,
+        speculative_config=speculative_config,
+        enable_iter_perf_stats=True,
+    ) as llm:
+        speculative_outputs = llm.generate(
+            [case.prompt],
+            sampling_params=[case.sampling_params],
+            use_tqdm=False,
         )
+        stats = llm.get_stats(timeout=5)
+
+    with _create_torch_llm(model_path, max_batch_size=1) as llm:
+        reference_outputs = llm.generate(
+            [case.prompt],
+            sampling_params=[case.sampling_params],
+            use_tqdm=False,
+        )
+
+    assert len(speculative_outputs) == len(reference_outputs) == 1
+    speculative_stats = [
+        stat["specDecodingStats"]
+        for stat in stats
+        if stat.get("specDecodingStats", {}).get("numDraftTokens", 0) > 0
+    ]
+    assert speculative_stats, "NGram must produce draft tokens in this test"
+    assert sum(stat["numAcceptedTokens"] for stat in speculative_stats) > 0
+
+    speculative_completions = speculative_outputs[0].outputs
+    reference_completions = reference_outputs[0].outputs
+    assert [completion.token_ids for completion in speculative_completions] == [
+        completion.token_ids for completion in reference_completions
+    ]
