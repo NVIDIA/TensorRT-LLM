@@ -20,7 +20,6 @@ from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import (
     CppMambaHybridCacheManager,
     PythonMambaCacheManager,
     _get_mamba_hybrid_pool_size,
-    calc_context_stop_positions,
 )
 from tensorrt_llm._torch.pyexecutor.resource_manager import CacheTypeCpp, DataType
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
@@ -347,28 +346,26 @@ def test_non_mtp_pytorch_prepare_and_get_state_indices_flow():
     ]
 
 
-def test_calc_context_stop_positions_returns_regular_snapshot_points():
-    assert calc_context_stop_positions(128, 32, 64) == [64, 128]
-    assert calc_context_stop_positions(150, 32, 64) == [64, 128]
-    assert calc_context_stop_positions(70, 32, 256) == []
-    assert calc_context_stop_positions(70, 32, 0) == []
-    assert calc_context_stop_positions(70, 32, -64) == []
-    assert calc_context_stop_positions(70, 32, None) == []
-
-
 def test_cpp_hybrid_prepare_expect_snapshot_points():
     mgr = object.__new__(CppMambaHybridCacheManager)
     mgr.kv_cache_config = KvCacheConfig(
         enable_block_reuse=True,
         mamba_state_cache_interval=64,
     )
-    mgr.tokens_per_block = 32
     mgr.linear_attention_metadata = SimpleNamespace(states_snapshot_interval=64)
-    request = SimpleNamespace(prompt_len=150, expect_snapshot_points=[999])
+    requests = [
+        SimpleNamespace(prompt_len=150, expect_snapshot_points=[999]),
+        SimpleNamespace(prompt_len=128, expect_snapshot_points=[]),
+        SimpleNamespace(prompt_len=32, expect_snapshot_points=[]),
+    ]
 
-    mgr.prepare_expect_snapshot_points([request])
+    mgr.prepare_expect_snapshot_points(requests)
 
-    assert request.expect_snapshot_points == [64, 128]
+    assert [request.expect_snapshot_points for request in requests] == [
+        [64, 128],
+        [64, 128],
+        [],
+    ]
 
 
 def test_cpp_hybrid_prepare_expect_snapshot_points_clears_when_reuse_disabled():
@@ -391,28 +388,6 @@ def test_cpp_hybrid_prepare_expect_snapshot_points_clears_for_invalid_interval(i
     mgr.prepare_expect_snapshot_points([request])
 
     assert request.expect_snapshot_points == []
-
-
-def test_cpp_hybrid_next_chunk_uses_request_snapshot_points() -> None:
-    mgr = object.__new__(CppMambaHybridCacheManager)
-    mgr.kv_cache_config = KvCacheConfig(
-        enable_block_reuse=True,
-        mamba_state_cache_interval=64,
-    )
-    request = SimpleNamespace(
-        prompt_len=150,
-        context_current_position=70,
-        expect_snapshot_points=[140, 75],
-    )
-
-    assert mgr.calc_next_context_chunk_size(request) == 5
-
-    request.expect_snapshot_points = [200]
-    assert mgr.calc_next_context_chunk_size(request) == 80
-
-    request.expect_snapshot_points = [140, 75]
-    request.context_current_position = 145
-    assert mgr.calc_next_context_chunk_size(request) == 5
 
 
 def test_expect_snapshot_points_binding_round_trip():

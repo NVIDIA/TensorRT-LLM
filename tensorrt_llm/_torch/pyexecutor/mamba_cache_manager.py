@@ -1136,22 +1136,6 @@ class MixedMambaHybridCacheManager(KVCacheManager, MambaCacheManager,
                                         kv_cache_dtype_byte_size)
 
 
-def calc_context_stop_positions(
-        prompt_len: int, tokens_per_block: int,
-        mamba_state_cache_interval: Optional[int]) -> list[int]:
-    """Compute token positions at which mamba state snapshots should be saved.
-
-    Returns regular interval boundaries. ``tokens_per_block`` is kept in the
-    signature for compatibility with the C++/V1 path.
-    """
-    del tokens_per_block
-    if mamba_state_cache_interval is None or mamba_state_cache_interval <= 0:
-        return []
-    return list(
-        range(mamba_state_cache_interval, prompt_len + 1,
-              mamba_state_cache_interval))
-
-
 @triton.jit
 def _promote_mamba_state_kernel(
     src_ptr,
@@ -2034,36 +2018,8 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
             return
 
         for request in requests:
-            request.expect_snapshot_points = calc_context_stop_positions(
-                request.prompt_len, self.tokens_per_block, interval)
-
-    def calc_next_context_chunk_size(self, request: LlmRequest) -> int:
-        """Compute the next prefill chunk size for a context request when block reuse is enabled.
-
-        When kv_cache_config.enable_block_reuse is True, context prefill must
-        stop at each position in ``request.expect_snapshot_points``. The
-        prompt end remains an implicit final boundary.
-
-        Args:
-            request: Context request with prompt_len and context_current_position set.
-
-        Returns:
-            Number of tokens to prefill in the next step (0 if context is already complete).
-        """
-        prompt_len = request.prompt_len
-        current = request.context_current_position
-        if current >= prompt_len:
-            return 0
-        if not self.kv_cache_config.enable_block_reuse:
-            assert current == 0, (
-                "Expected context_current_position to be 0 when block reuse is "
-                f"disabled, but got {current}")
-            return prompt_len - current
-        stop_positions = sorted(set(request.expect_snapshot_points))
-        for pos in stop_positions:
-            if pos > current:
-                return min(pos, prompt_len) - current
-        return prompt_len - current
+            request.expect_snapshot_points = list(
+                range(interval, request.prompt_len + 1, interval))
 
     def _setup_states(self) -> None:
         # Pool layout: {numLocalLayers, numBlocks, ssm_bytes + conv_bytes} (as uint8)
