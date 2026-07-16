@@ -59,8 +59,8 @@ from typing import TYPE_CHECKING, Dict, List, NamedTuple, Optional, Sequence, Tu
 
 import torch
 
-from tensorrt_llm._torch.kv_cache_compression.triattention.compaction import (
-    _PreparedTritonKernelLaunch,
+from tensorrt_llm._torch.kv_cache_compression.triattention.prepared_launch import (
+    PreparedTritonKernelLaunch,
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2, Role
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState, get_draft_token_length
@@ -221,7 +221,7 @@ class _PreparedTopKFinalizer:
 
         from .triattention_kernels import _finalize_topk_indices_kernel
 
-        self._prepared_launch = _PreparedTritonKernelLaunch(
+        self._prepared_launch = PreparedTritonKernelLaunch(
             _finalize_topk_indices_kernel,
             (scores, seq_lens, provisional_indices, output_indices),
             dict(
@@ -294,7 +294,7 @@ class _PreparedUnionScores:
         self._prepared_stats_launch = None
         if normalize_scores:
             stats_grid = (request_count * rows, 1, 1)
-            self._prepared_stats_launch = _PreparedTritonKernelLaunch(
+            self._prepared_stats_launch = PreparedTritonKernelLaunch(
                 _score_row_stats_kernel,
                 (scores, valid_widths, row_mean, row_inv_std),
                 dict(ROWS=rows, WIDTH=width, BLOCK=256),
@@ -302,7 +302,7 @@ class _PreparedUnionScores:
                 num_warps=4,
             )
         union_grid = (request_count, (width + 31) // 32, 1)
-        self._prepared_union_launch = _PreparedTritonKernelLaunch(
+        self._prepared_union_launch = PreparedTritonKernelLaunch(
             _score_union_kernel,
             (scores, valid_widths, row_mean, row_inv_std, combined),
             dict(ROWS=rows, WIDTH=width, NORMALIZE=normalize_scores, BLOCK=32),

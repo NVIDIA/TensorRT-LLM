@@ -27,56 +27,14 @@ from typing import Callable, Dict, List, NamedTuple, Optional, Tuple
 
 import torch
 
+from .prepared_launch import PreparedTritonKernelLaunch
+
 _SUPPORTED_POOL_DTYPES = (torch.bfloat16, torch.float16, torch.float32)
 
-
-class _PreparedTritonKernelLaunch:
-    """Replay one Triton kernel launch frozen at build time.
-
-    ``warmup`` JIT-compiles the kernel once for a fixed grid, bound tensor
-    set, and constexpr set; ``__call__`` re-launches the compiled binary
-    directly, skipping Triton's per-call dispatch. Constexpr values are
-    passed positionally on replay, so their dict order must match the
-    kernel's constexpr parameter declaration order.
-    """
-
-    def __init__(
-        self,
-        triton_kernel,
-        bound_tensors: Tuple[torch.Tensor, ...],
-        constexpr_values: Dict[str, object],
-        *,
-        grid: Tuple[int, ...],
-        num_warps: int,
-    ) -> None:
-        self.device = bound_tensors[0].device
-        self.bound_tensors = tuple(bound_tensors)
-        self.constexpr_values = dict(constexpr_values)
-        with torch.cuda.device(self.device):
-            self.build_stream = torch.cuda.current_stream(self.device)
-            compiled = triton_kernel.warmup(
-                *self.bound_tensors,
-                **self.constexpr_values,
-                num_warps=num_warps,
-                grid=grid,
-            )
-            self.compiled_kernel_runner = compiled[grid]
-
-    def __call__(self, *replay_tensors: torch.Tensor) -> None:
-        """Replay the launch; ``replay_tensors``, if given, substitute the bound tensors."""
-        current_stream = torch.cuda.current_stream(self.device)
-        if (current_stream.device, current_stream.cuda_stream) != (
-            self.build_stream.device,
-            self.build_stream.cuda_stream,
-        ):
-            raise RuntimeError(
-                "a prepared Triton kernel launch must run on the stream it was built on"
-            )
-        self.compiled_kernel_runner(
-            *(replay_tensors if replay_tensors else self.bound_tensors),
-            *self.constexpr_values.values(),
-            stream=self.build_stream.cuda_stream,
-        )
+# Launch shape of the move-index packing kernel: tokens per program along the
+# move axis, and its warp count.
+_PACK_BLOCK_TOKENS = 256
+_PACK_NUM_WARPS = 4
 
 
 class _CppCompactGroup(NamedTuple):
@@ -108,7 +66,7 @@ class _SingleCacheCompaction(NamedTuple):
     tokens land at.
     """
 
-    prepared_move_index_pack: Optional[_PreparedTritonKernelLaunch]
+    prepared_move_index_pack: Optional[PreparedTritonKernelLaunch]
     cpp_launch_groups: Tuple[_CppCompactGroup, ...]
     move_source_indices: torch.Tensor
     move_source_offsets: torch.Tensor
@@ -144,7 +102,13 @@ def _validated_kv_head_count(
     launch's pool shape, so every layer on one side must agree on it.
     """
     first = pools[layers[0]]
-    num_kv_heads = int(first.shape[2]) if first.ndim == 5 and first.shape[2] > 0 else -1
+    if first.ndim != 5 or first.shape[2] <= 0:
+        raise ValueError(
+            f"{what} pools must be 5-D interleaved V2 pools "
+            f"[pages, K/V, heads, tokens, dim]; layer {layers[0]} has shape "
+            f"{tuple(first.shape)}"
+        )
+    num_kv_heads = int(first.shape[2])
     if not all(
         pools[layer].ndim == 5
         and pools[layer].shape[1] == 2
@@ -181,8 +145,10 @@ def _validated_tail_lengths(
 ) -> Tuple[int, ...]:
     if tail_lengths is None:
         tail_lengths = [0] * request_count
-    if len(tail_lengths) != request_count or any(length < 0 for length in tail_lengths):
+    if len(tail_lengths) != request_count:
         raise ValueError(f"{what} lengths must match the request count")
+    if any(length < 0 for length in tail_lengths):
+        raise ValueError(f"{what} lengths must be non-negative")
     return tuple(int(length) for length in tail_lengths)
 
 
@@ -212,7 +178,6 @@ def _page_table_provider(
 
 def _compact_groups(
     entries: List[Tuple[int, torch.Tensor, torch.Tensor]],
-    mode: str,
     pool_keys: Tuple[object, ...],
     device: torch.device,
     per_layer_slots: Optional[Dict[int, int]] = None,
@@ -226,7 +191,6 @@ def _compact_groups(
     for layer, pool, page_table in entries:
         key = (
             pool_keys[layer],
-            mode,
             str(pool.dtype),
             str(pool.device),
             tuple(int(value) for value in pool.shape[1:]),
@@ -273,14 +237,14 @@ def _prepared_move_index_pack_launch(
     *,
     eviction_mode: str,
     prompt_len: int,
-    keep_count: int,
+    decode_keep_count: int,
     num_dense_layers: int,
     num_kv_heads: int,
     max_protected_tail: int,
     swa_window: int,
     swa_move_source_offsets: Optional[torch.Tensor],
     swa_move_source_indices: Optional[torch.Tensor],
-) -> _PreparedTritonKernelLaunch:
+) -> PreparedTritonKernelLaunch:
     """Build one prepared launch of the move-index packing kernel.
 
     The kernel reads the kept-token ordinals and each request's valid length
@@ -298,12 +262,18 @@ def _prepared_move_index_pack_launch(
     else:
         selection_rows = num_kv_heads
     selection_prefix = (request_count,) if union else (request_count, selection_rows)
+    expected_selection = (*selection_prefix, prompt_len + decode_keep_count)
     if (
         request_count <= 0
-        or tuple(kept_token_ordinals.shape) != (*selection_prefix, prompt_len + keep_count)
+        or tuple(kept_token_ordinals.shape) != expected_selection
         or valid_sequence_lengths.shape != (request_count,)
     ):
-        raise ValueError("prepared compaction packing requires one valid fixed geometry")
+        raise ValueError(
+            f"prepared compaction packing expects kept ordinals of shape "
+            f"{expected_selection} and one valid length per request; got "
+            f"{tuple(kept_token_ordinals.shape)} and "
+            f"{tuple(valid_sequence_lengths.shape)}"
+        )
 
     device = kept_token_ordinals.device
     if not _cuda_int32_contiguous((kept_token_ordinals, valid_sequence_lengths), device):
@@ -321,12 +291,15 @@ def _prepared_move_index_pack_launch(
 
     from .triattention_kernels import _pack_compaction_sources_kernel
 
-    block = 256
-    max_move = keep_count + max_protected_tail
+    max_move = decode_keep_count + max_protected_tail
     if swa_total:
         max_move = max(max_move, swa_window + max_protected_tail)
     packed_row_count = num_dense_layers * num_kv_heads if per_layer else num_kv_heads
-    grid = (request_count, packed_row_count, (max_move + block - 1) // block)
+    grid = (
+        request_count,
+        packed_row_count,
+        (max_move + _PACK_BLOCK_TOKENS - 1) // _PACK_BLOCK_TOKENS,
+    )
     bound_tensors = (
         kept_token_ordinals,
         valid_sequence_lengths,
@@ -341,22 +314,22 @@ def _prepared_move_index_pack_launch(
         DENSE_TOTAL=int(move_source_indices.shape[-1]),
         SWA_TOTAL=swa_total,
         SELECTION_ROWS=selection_rows,
-        SELECTION_STRIDE=prompt_len + keep_count,
-        KEEP_COUNT=keep_count,
+        SELECTION_STRIDE=prompt_len + decode_keep_count,
+        KEEP_COUNT=decode_keep_count,
         PROMPT_LEN=prompt_len,
         NUM_KV_HEADS=num_kv_heads,
         SWA_WINDOW=swa_window,
         UNION=union,
         PER_LAYER=per_layer,
         HAS_SWA=swa_total > 0,
-        BLOCK=block,
+        BLOCK=_PACK_BLOCK_TOKENS,
     )
-    return _PreparedTritonKernelLaunch(
+    return PreparedTritonKernelLaunch(
         _pack_compaction_sources_kernel,
         bound_tensors,
         constexpr_values,
         grid=grid,
-        num_warps=4,
+        num_warps=_PACK_NUM_WARPS,
     )
 
 
@@ -369,6 +342,22 @@ class BatchedKVCacheCompaction:
     tail. A co-compressed draft cache reuses the target's kept token ordinals
     (broadcast over the draft's own KV-head count) plus the draft's own
     protected tail, landing at the same destination base.
+
+    Key constructor inputs:
+        `kept_token_ordinals`: increasing kept ordinals per request; shape
+            `[requests, prompt+keep]` for `union`, with a selection-row
+            dimension in between for the per-head modes.
+        `kv_block_offsets`: the staged V2 block-offset snapshot laid out as
+            `[slot, request, K/V, block]`, where a block offset encodes
+            page and K/V plane as `2*page + plane`.
+        `page_table_slots` / `layer_group_representative`: map each layer's
+            group representative to its snapshot slot; layers that share a
+            slot must share one block-offset table.
+        `protected_tail_lengths`: per-request KV positions past the valid
+            length reserved for a forward already in flight; they move with
+            the kept tokens.
+        `draft_*`: co-compressed draft-cache layout (union mode only); the
+            draft reuses the target keep set and pins the same prompt.
     """
 
     def __init__(
@@ -403,9 +392,19 @@ class BatchedKVCacheCompaction:
             raise ValueError("batched compaction requires requests and retained tokens")
         if not dense_layers:
             raise ValueError("batched compaction requires at least one dense layer")
+        if draft_layers and eviction_mode != "union":
+            raise ValueError("draft co-compaction supports only union eviction")
+        if draft_layer_pools is not None and not draft_layers:
+            raise ValueError("draft pools were given without any draft layers")
+        if not swa_layers and swa_window:
+            raise ValueError("swa_window was given without any SWA layers")
 
         self.eviction_mode = eviction_mode
         self.device = layer_pools[dense_layers[0]].device
+        # The move buffers are allocated on the pool device, so the selection
+        # tensors feeding the pack kernel must already live there.
+        if kept_token_ordinals.device != self.device:
+            raise ValueError("kept-token ordinals must live on the pool device")
         self.request_count = int(request_count)
         self.prompt_len = int(prompt_len)
         self.decode_keep_count = int(decode_keep_count)
@@ -477,7 +476,7 @@ class BatchedKVCacheCompaction:
             dense_move_indices,
             eviction_mode=self.eviction_mode,
             prompt_len=self.prompt_len,
-            keep_count=self.decode_keep_count,
+            decode_keep_count=self.decode_keep_count,
             num_dense_layers=len(self.dense_layers),
             num_kv_heads=self.num_kv_heads,
             max_protected_tail=self.max_protected_tail,
@@ -488,7 +487,7 @@ class BatchedKVCacheCompaction:
         self.target_dense_compaction = _SingleCacheCompaction(
             prepared_move_index_pack=dense_pack,
             cpp_launch_groups=_compact_groups(
-                dense_entries, "dense", self.layer_pool_keys, self.device, dense_slots
+                dense_entries, self.layer_pool_keys, self.device, dense_slots
             ),
             move_source_indices=dense_move_indices,
             move_source_offsets=dense_move_offsets,
@@ -499,9 +498,7 @@ class BatchedKVCacheCompaction:
         if self.swa_layers:
             self.target_swa_compaction = _SingleCacheCompaction(
                 prepared_move_index_pack=None,
-                cpp_launch_groups=_compact_groups(
-                    swa_entries, "swa", self.layer_pool_keys, self.device
-                ),
+                cpp_launch_groups=_compact_groups(swa_entries, self.layer_pool_keys, self.device),
                 move_source_indices=swa_move_indices,
                 move_source_offsets=swa_move_offsets,
                 destination_base=self.keep_count - self.swa_window,
@@ -547,10 +544,9 @@ class BatchedKVCacheCompaction:
         """Build the co-compressed draft cache's own pack and launch groups.
 
         The draft forms its own launch groups so it may use a different
-        KV-head count than the target.
+        KV-head count than the target. Union-only eviction is enforced by
+        the constructor before dense groups are built.
         """
-        if self.eviction_mode != "union":
-            raise ValueError("draft co-compaction supports only union eviction")
         if (
             draft_layer_pools is None
             or draft_layer_group_representative is None
@@ -602,7 +598,7 @@ class BatchedKVCacheCompaction:
             draft_move_indices,
             eviction_mode="union",
             prompt_len=self.prompt_len,
-            keep_count=self.decode_keep_count,
+            decode_keep_count=self.decode_keep_count,
             num_dense_layers=1,
             num_kv_heads=draft_num_kv_heads,
             max_protected_tail=max(draft_tail_lengths, default=0),
@@ -613,7 +609,7 @@ class BatchedKVCacheCompaction:
         return _SingleCacheCompaction(
             prepared_move_index_pack=draft_pack,
             cpp_launch_groups=_compact_groups(
-                draft_entries, "draft", tuple(draft_layer_pool_keys), self.device
+                draft_entries, tuple(draft_layer_pool_keys), self.device
             ),
             move_source_indices=draft_move_indices,
             move_source_offsets=draft_move_offsets,

@@ -101,6 +101,9 @@ def _reference_compact(
     for group_layer, (source_pool, destination_pool, page_table) in enumerate(
         zip(original, expected, page_tables)
     ):
+        # The kernel decodes K offsets as offset // 2 (the V2 2*page+plane
+        # encoding) regardless of the scale the table was built with; the
+        # reference mirrors the kernel, not the encoder.
         raw_page_table = page_table // _PAGE_INDEX_DIVISOR
         if source_indices.ndim == 2:
             layer_sources = source_indices
@@ -222,6 +225,20 @@ def test_sparse_kv_cache_compact_layers_per_layer_source():
 
     for actual, reference in zip(pools, expected):
         assert torch.equal(actual.cpu(), reference)
+
+
+def test_sparse_kv_cache_compact_layers_rejects_flat_source_with_layer_indices():
+    # A flat [kv_heads, total] source with per-layer indices would silently
+    # read layer 0 for every launch; the op rejects the combination instead.
+    _, pools, page_tables = _make_pools(2, torch.bfloat16, 64)
+    source_offsets = torch.tensor([0, 3, 6], dtype=torch.int32)
+    source_row = torch.tensor([2, 5, 8, 3, 7, 10], dtype=torch.int32)
+    source_indices = source_row.view(1, -1).expand(_NUM_KV_HEADS, -1).contiguous()
+    source_layer_indices = torch.tensor([0, 0], dtype=torch.int32)
+    arguments = _device_arguments(pools, source_indices, source_offsets, source_layer_indices)
+
+    with pytest.raises(RuntimeError, match="require 3-D per-layer source_indices"):
+        _compact(pools, page_tables, arguments, 0)
 
 
 def test_sparse_kv_cache_compact_layers_multiple_tiles():

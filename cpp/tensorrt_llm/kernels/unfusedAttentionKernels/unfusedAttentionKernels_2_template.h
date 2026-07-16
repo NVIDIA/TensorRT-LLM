@@ -1774,6 +1774,9 @@ struct KvCacheV2LayersBuffer
         return reinterpret_cast<uint8_t*>(static_cast<uintptr_t>(poolPointers[blockIdx.x]));
     }
 
+    // KVCacheManagerV2 block offsets encode page and K/V plane as
+    // 2*page + plane (K = 2p, V = 2p + 1); this table carries the K plane,
+    // so dividing by 2 recovers the page for both halves.
     __device__ __forceinline__ void* getKBlockPtr(int32_t batchIdx, int32_t tokenIdx) const
     {
         int32_t const blockOffset = pageTable[batchIdx * pageTableRequestStride + tokenIdx / tokensPerBlock];

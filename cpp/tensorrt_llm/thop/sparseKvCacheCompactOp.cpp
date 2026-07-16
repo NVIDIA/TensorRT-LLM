@@ -33,10 +33,10 @@ namespace torch_ext
 {
 
 //! Adapt one uniform group of KVCacheManagerV2 HND layer pools to the
-//! existing sparse-KV post-FMHA updater. Layers share one V2 block-offset table;
-//! destinationBase replaces the former arbitrary
-//! destination tensor because every TriAttention move targets one interval.
-//! Within each request and KV head, TriAttention supplies increasing source
+//! existing sparse-KV post-FMHA updater. Layers share one V2 block-offset
+//! table; destinationBase replaces the former arbitrary destination tensor
+//! because every compaction move targets one contiguous interval. Within
+//! each request and KV head, the caller must supply increasing source
 //! ordinals with destinationBase + move <= source[move], which makes the
 //! updater's forward tiled in-place copy safe.
 void sparseKvCacheCompactLayers(std::vector<th::Tensor> const& pools, th::Tensor const& poolPointers,
@@ -75,13 +75,10 @@ void sparseKvCacheCompactLayers(std::vector<th::Tensor> const& pools, th::Tensor
     TORCH_CHECK(
         pageTable.get_device() == device, "sparse_kv_cache_compact_layers: block offsets must be on the pool device");
 
-    auto const checkPointerArray = [device, numLayers](th::Tensor const& pointers, char const* name)
-    {
-        TORCH_CHECK(pointers.is_cuda() && pointers.get_device() == device && pointers.scalar_type() == th::kInt64
-                && pointers.dim() == 1 && pointers.size(0) == numLayers && pointers.is_contiguous(),
-            "sparse_kv_cache_compact_layers: ", name, " must be contiguous CUDA int64 [num_layers]");
-    };
-    checkPointerArray(poolPointers, "pool_pointers");
+    TORCH_CHECK(poolPointers.is_cuda() && poolPointers.get_device() == device
+            && poolPointers.scalar_type() == th::kInt64 && poolPointers.dim() == 1
+            && poolPointers.size(0) == numLayers && poolPointers.is_contiguous(),
+        "sparse_kv_cache_compact_layers: pool_pointers must be contiguous CUDA int64 [num_layers]");
 
     TORCH_CHECK(sourceIndices.is_cuda() && sourceIndices.get_device() == device
             && sourceIndices.scalar_type() == th::kInt32 && sourceIndices.is_contiguous()
@@ -94,6 +91,8 @@ void sparseKvCacheCompactLayers(std::vector<th::Tensor> const& pools, th::Tensor
     {
         TORCH_CHECK(sourceIndices.size(0) == numKvHeads,
             "sparse_kv_cache_compact_layers: source_indices KV-head dimension mismatch");
+        TORCH_CHECK(!sourceLayerIndices.has_value(),
+            "sparse_kv_cache_compact_layers: source_layer_indices require 3-D per-layer source_indices");
     }
     else
     {
@@ -113,6 +112,9 @@ void sparseKvCacheCompactLayers(std::vector<th::Tensor> const& pools, th::Tensor
         sourceLayerPtr = layerIndices.data_ptr<int32_t>();
     }
 
+    // The last element of source_offsets is the total move count and must equal
+    // source_indices.size(-1); it lives on device, so checking it here would
+    // force a sync -- the kernel trusts the caller.
     TORCH_CHECK(sourceOffsets.is_cuda() && sourceOffsets.get_device() == device
             && sourceOffsets.scalar_type() == th::kInt32 && sourceOffsets.is_contiguous() && sourceOffsets.dim() == 1
             && sourceOffsets.size(0) == batchSize + 1,

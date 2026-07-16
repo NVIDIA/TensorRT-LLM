@@ -5,6 +5,7 @@ from unittest import mock
 
 import pytest
 import torch
+from conftest import encode_block_offsets as _encode_block_offsets
 
 from tensorrt_llm._torch.kv_cache_compression.triattention.compaction import (
     BatchedKVCacheCompaction,
@@ -20,21 +21,6 @@ def _require_cute_topk_op() -> None:
     assert hasattr(torch.ops.trtllm, "cute_dsl_indexer_topk_decode"), (
         "CuTE TopK operation is not loaded"
     )
-
-
-def _encode_block_offsets(page_ids: torch.Tensor) -> torch.Tensor:
-    """Build the native V2 [pool, request, K/V, block] layout."""
-    encoded = torch.empty(
-        page_ids.shape[0],
-        page_ids.shape[1],
-        2,
-        page_ids.shape[2],
-        dtype=torch.int32,
-        device=page_ids.device,
-    )
-    encoded[:, :, 0] = page_ids.to(torch.int32) * 2
-    encoded[:, :, 1] = encoded[:, :, 0] + 1
-    return encoded
 
 
 def _stable_topk(row: torch.Tensor, width: int, keep_count: int) -> torch.Tensor:

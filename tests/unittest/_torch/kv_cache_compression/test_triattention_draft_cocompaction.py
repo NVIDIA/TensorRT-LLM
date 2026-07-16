@@ -19,6 +19,7 @@ from unittest import mock
 
 import pytest
 import torch
+from conftest import encode_block_offsets as _encode_block_offsets
 
 from tensorrt_llm._torch.kv_cache_compression.triattention import TriAttention
 from tensorrt_llm._torch.kv_cache_compression.triattention.compaction import (
@@ -30,23 +31,6 @@ from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import (
     _RequestCompressionState,
 )
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
-
-
-def _encode_block_offsets(page_ids: torch.Tensor) -> torch.Tensor:
-    """Build the native V2 [pool, request, K/V, block] layout."""
-    if page_ids.ndim == 2:
-        page_ids = page_ids.unsqueeze(0)
-    encoded = torch.empty(
-        page_ids.shape[0],
-        page_ids.shape[1],
-        2,
-        page_ids.shape[2],
-        dtype=torch.int32,
-        device=page_ids.device,
-    )
-    encoded[:, :, 0] = page_ids.to(torch.int32) * 2
-    encoded[:, :, 1] = encoded[:, :, 0] + 1
-    return encoded
 
 
 def _make_fake_v2(*, is_draft=False):
@@ -332,7 +316,8 @@ def test_draft_admission_gates_raise(gate, match):
         with pytest.raises(ValueError, match=match):
             validate_kv_cache_compression_with_spec(
                 TriAttentionKvCacheCompressionConfig(
-                    model_path="/models/test", calibration_path="/calib/test.pt", top_B=8),
+                    model_path="/models/test", calibration_path="/calib/test.pt", top_B=8
+                ),
                 DFlashDecodingConfig(max_draft_len=3),
                 draft_manager,
             )
