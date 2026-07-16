@@ -50,8 +50,8 @@ def get_long_seq_len(window: int) -> int:
     return window + 17
 
 
-def _phases_from_window(window: int) -> dict:
-    long_len = get_long_seq_len(window)
+def _phases(long_len: int, gen_len: int) -> dict:
+    """The ctx/gen/mix batch shapes, parameterized by context and generation len."""
     return {
         "ctx": dict(
             seq_lens=[long_len, 73, 41],
@@ -59,16 +59,20 @@ def _phases_from_window(window: int) -> dict:
             num_contexts=3,
         ),
         "gen": dict(
-            seq_lens=[1, 1, 1],
+            seq_lens=[gen_len] * 3,
             num_cached_tokens=[long_len, 73, 41],
             num_contexts=0,
         ),
         "mix": dict(
-            seq_lens=[long_len, 1, 1],
+            seq_lens=[long_len, gen_len, gen_len],
             num_cached_tokens=[0, long_len, 73],
             num_contexts=1,
         ),
     }
+
+
+def _phases_from_window(window: int) -> dict:
+    return _phases(get_long_seq_len(window), gen_len=1)
 
 
 # Standard self-attention batch phases. Non-sliding cases use a nominal window
@@ -77,59 +81,20 @@ def _phases_from_window(window: int) -> dict:
 _PHASES = _phases_from_window(_NON_SLIDING_PHASE_WINDOW)
 
 
-# Sparse test sweep dimensions are model-agnostic: one shared set for every
-# sparse config rather than per-model knobs. Everything else (attention family,
-# selection unit, top-k) is derived from the model's is_mla flag and its
-# sparse_attention_config.
+# Model-agnostic sparse sweep dimensions, shared by every sparse config.
 _SPARSE_COMPUTE_DTYPE = "bfloat16"
 _SPARSE_KV_LAYOUT = "HND"
 _SPARSE_PAGE_SIZE = 64
 _SPARSE_USE_KVM_V2 = False
 _SPARSE_SELECTION_PATTERNS = ("random", "singleton")
 _SPARSE_GENERATION_TOKENS_PER_SEQ = 2
-# Selection representation per algorithm (token-selecting vs block-selecting).
-_SPARSE_SELECTION_UNIT = {"dsa": "token", "deepseek_v4": "token", "rocket": "block"}
-
-
-def _sparse_selection_unit(cfg: ModelAttnConfig) -> str:
-    algo = cfg.sparse_attention_config.algorithm
-    if algo not in _SPARSE_SELECTION_UNIT:
-        raise ValueError(f"Unknown selection unit for sparse algorithm {algo!r}")
-    return _SPARSE_SELECTION_UNIT[algo]
-
-
-def _sparse_topk(cfg: ModelAttnConfig) -> int:
-    """The selection budget: the indexer's top-k (index_topk) or the algo's topk."""
-    sac = cfg.sparse_attention_config
-    topk = getattr(sac, "index_topk", None)
-    if topk is None:
-        topk = getattr(sac, "topk", None)
-    if topk is None:
-        raise ValueError(f"Cannot derive sparse top-k from {sac.algorithm!r} config")
-    return topk
 
 
 def _phases_for(cfg: ModelAttnConfig) -> dict:
     if cfg.sparse_attention_config is not None:
-        long_len = _sparse_topk(cfg) + 32
-        generation_len = _SPARSE_GENERATION_TOKENS_PER_SEQ
-        return {
-            "ctx": dict(
-                seq_lens=[long_len, 73, 41],
-                num_cached_tokens=[0, 0, 0],
-                num_contexts=3,
-            ),
-            "gen": dict(
-                seq_lens=[generation_len] * 3,
-                num_cached_tokens=[long_len, 73, 41],
-                num_contexts=0,
-            ),
-            "mix": dict(
-                seq_lens=[long_len, generation_len, generation_len],
-                num_cached_tokens=[0, long_len, 73],
-                num_contexts=1,
-            ),
-        }
+        return _phases(
+            cfg.sparse_attention_config.sparse_topk + 32, _SPARSE_GENERATION_TOKENS_PER_SEQ
+        )
     if cfg.mask != "sliding":
         return _PHASES
 
@@ -170,9 +135,6 @@ def _common(cfg: ModelAttnConfig) -> dict:
     if cfg.sparse_attention_config is not None:
         common.update(
             sparse_attention_config=cfg.sparse_attention_config.model_dump(mode="json"),
-            sparse_attention_family="mla" if cfg.is_mla else "standard",
-            sparse_selection_unit=_sparse_selection_unit(cfg),
-            sparse_topk=_sparse_topk(cfg),
             sparse_generation_tokens_per_seq=_SPARSE_GENERATION_TOKENS_PER_SEQ,
         )
     return common

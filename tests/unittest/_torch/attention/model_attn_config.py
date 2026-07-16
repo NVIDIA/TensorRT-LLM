@@ -84,10 +84,8 @@ class ModelAttnConfig:
     qk_rope_head_dim: Optional[int] = None
     v_head_dim: Optional[int] = None
     hidden_size: Optional[int] = None
-    # User-facing sparse config, lowered by production `to_sparse_params` etc.
-    # Everything the sparse test sweep needs (attention family, selection unit,
-    # top-k, tolerances) is derived from this + the fields above, so no separate
-    # harness/override/tolerance knobs live on the model config.
+    # User-facing sparse config, lowered by production `to_sparse_params()`. The
+    # sparse sweep derives its other parameters from this and `is_mla`.
     sparse_attention_config: Optional[BaseSparseAttentionConfig] = None
 
 

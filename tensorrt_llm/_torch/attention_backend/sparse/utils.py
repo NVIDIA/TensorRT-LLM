@@ -49,9 +49,7 @@ def get_vanilla_sparse_attn_attention_backend(
     if sparse_params.algorithm == "rocket":
         return RocketVanillaAttention
     elif sparse_params.algorithm == "dsa":
-        # DSA selected-attention is implemented directly in the base
-        # VanillaAttention (its `_mla_forward_sparse` golden), so the vanilla
-        # slot for DSA is VanillaAttention itself.
+        # DSA's selected-attention golden lives in the base VanillaAttention.
         from ..vanilla import VanillaAttention
         return VanillaAttention
     elif sparse_params.algorithm == "minimax_m3":

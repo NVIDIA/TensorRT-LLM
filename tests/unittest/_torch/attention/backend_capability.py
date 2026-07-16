@@ -117,8 +117,13 @@ def unsupported_reason(backend: str, case) -> Optional[str]:
     sparse_config = getattr(case, "sparse_attention_config", None)
     if sparse_config is not None:
         algorithm = sparse_config.get("algorithm")
-        if backend == "TRTLLM" and algorithm == "dsa" and sm < 100:
-            return f"TRTLLM DSA selected attention requires sm>=100 (have sm{sm})"
+        if backend == "TRTLLM" and algorithm == "dsa":
+            # DSA runs on Hopper (FlashMLA) and Blackwell; only the FP8 KV-cache
+            # DSA path is Blackwell-only.
+            if sm < 90:
+                return f"TRTLLM DSA requires sm>=90 (have sm{sm})"
+            if kv_dtype == "fp8" and sm < 100:
+                return f"TRTLLM DSA with FP8 KV cache requires sm>=100 (have sm{sm})"
 
     # KV-cache block layout: a case may request a specific layout (NHD/HND). A
     # backend that cannot store the cache that way is skipped (e.g. TRTLLM is

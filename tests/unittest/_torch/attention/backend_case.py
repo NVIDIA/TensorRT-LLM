@@ -54,9 +54,8 @@ BF16_RTOL = 3e-3
 # differ from the fp16 golden by ~0.1-0.4. Matches test_attention_mla.py (fp8=4e-1).
 FP8_ATOL = 4e-1
 FP4_ATOL = 6e-1
-# Selected-sparse-MLA golden-vs-backend tolerance. Looser than dense bf16: the
-# selected-attention path accumulates over gathered latent rows in bf16, so the
-# TRTLLM kernel and the Vanilla golden diverge more than dense attention does.
+# Golden-vs-backend tolerance for selected sparse MLA (bf16 latent-gather
+# accumulation).
 SPARSE_ATOL = 1e-1
 SPARSE_RTOL = 1e-2
 
@@ -65,6 +64,8 @@ SPARSE_RTOL = 1e-2
 BACKENDS_UNDER_TEST = ("TRTLLM",) + (("FLASHINFER",) if IS_FLASHINFER_AVAILABLE else ())
 DEFAULT_MAX_NUM_TOKENS = 8192
 _SPARSE_CONFIG_ADAPTER = TypeAdapter(SparseAttentionConfig)
+# Selection representation per sparse algorithm (token- vs block-selecting).
+_SELECTION_UNIT_BY_ALGORITHM = {"dsa": "token", "deepseek_v4": "token", "rocket": "block"}
 
 
 def _dtype_to_torch(dtype: str):
@@ -102,17 +103,13 @@ class BackendCase:
     q_scaling: float = 1.0
     page_size: int = 64
     cache: str = "paged"  # "paged" | "none"
-    # Serialized user-facing sparse config. It is lowered independently into
-    # backend params, metadata params, and the sparse KV-cache manager, exactly
-    # as in production.
+    # Serialized user-facing sparse config, lowered into backend params, metadata
+    # params, and the sparse KV-cache manager exactly as in production. The
+    # selection unit and top-k are derived from it (properties below); the
+    # attention family is ``is_mla``.
     sparse_attention_config: Optional[dict] = None
-    # Backend-neutral sparse execution contract. This keeps the runner from
-    # inferring DSA/MLA semantics from an algorithm name.
-    sparse_attention_family: Optional[str] = None  # "standard" | "mla"
-    sparse_selection_unit: Optional[str] = None  # "none" | "token" | "block"
-    sparse_topk: Optional[int] = None
-    # Fake backend-neutral selection policy used in backend-level tests. The
-    # real algorithm/indexer is covered separately.
+    # Injected selection policy for backend-level tests; the real algorithm /
+    # indexer is covered separately.
     sparse_selection: str = "random"  # "random" | "singleton"
     sparse_generation_tokens_per_seq: int = 1
     # RoPE config: RopeParams kwargs (+ optional "is_neox"), or None to disable.
@@ -144,9 +141,7 @@ class BackendCase:
     qk_nope_head_dim: Optional[int] = None
     qk_rope_head_dim: Optional[int] = None
     use_kv_cache_manager_v2: bool = False
-    # Low-level (atol, rtol) override for a single case, e.g. a captured/replayed
-    # case. Left unset by the model sweep, which derives tolerances by dtype (and
-    # a sparse default) in ``_tolerances``.
+    # Optional per-case (atol, rtol) override, e.g. for a captured/replayed case.
     atol: Optional[float] = None
     rtol: Optional[float] = None
 
@@ -165,6 +160,19 @@ class BackendCase:
     @property
     def is_sparse(self) -> bool:
         return self.sparse_attention_config is not None
+
+    @property
+    def sparse_selection_unit(self) -> Optional[str]:
+        """Selection representation ("token" / "block") for this algorithm."""
+        if self.sparse_attention_config is None:
+            return None
+        return _SELECTION_UNIT_BY_ALGORITHM.get(self.sparse_attention_config["algorithm"])
+
+    @property
+    def sparse_topk(self) -> Optional[int]:
+        """Per-token selection budget, resolved from the sparse config."""
+        config = _sparse_config(self)
+        return None if config is None else config.sparse_topk
 
     @property
     def prompt_lens(self) -> List[int]:
@@ -251,27 +259,16 @@ def _sparse_config(case: BackendCase):
 
 
 def _validate_sparse_case(case: BackendCase) -> None:
-    """Reject incomplete or unsupported sparse harness contracts explicitly."""
-    harness_fields = (
-        case.sparse_attention_family,
-        case.sparse_selection_unit,
-        case.sparse_topk,
-    )
+    """Reject incomplete or unsupported sparse contracts explicitly."""
     if not case.is_sparse:
-        if any(value is not None for value in harness_fields):
-            raise ValueError("Sparse harness fields require sparse_attention_config")
         return
-    if any(value is None for value in harness_fields):
-        raise ValueError("Sparse backend cases require family, selection unit, and top-k")
-    if case.sparse_attention_family == "mla" and not case.is_mla:
-        raise ValueError("Sparse MLA harness requires is_mla=True")
     if case.sparse_selection_unit not in ("token", "block"):
         raise ValueError(
             f"Unsupported sparse selection unit: {case.sparse_selection_unit!r} "
             "(expected 'token' or 'block')"
         )
-    if case.sparse_topk <= 0:
-        raise ValueError("Sparse backend cases require sparse_topk > 0")
+    if case.sparse_topk is None or case.sparse_topk <= 0:
+        raise ValueError("Sparse backend cases require a positive top-k")
 
 
 def _sparse_pretrained_config(case: BackendCase) -> SimpleNamespace:
@@ -593,7 +590,7 @@ def _run_sparse_block_backend(
 
 def generate_sparse_mla_inputs(case: BackendCase, seed: int = 0) -> Dict:
     """Generate raw absorbed-MLA inputs plus backend-neutral sparse selections."""
-    if case.sparse_attention_family != "mla" or case.sparse_selection_unit != "token":
+    if not case.is_mla or case.sparse_selection_unit != "token":
         raise ValueError("This generator supports token-selected sparse MLA only")
     gen = torch.Generator(device="cuda").manual_seed(seed)
     selection_gen = torch.Generator(device="cuda").manual_seed(seed + 1)
@@ -820,8 +817,6 @@ def _run_sparse_mla_backend(
         sparse_attention_config=sparse_config,
         pretrained_config=pretrained_config,
     )
-    # Every backend (Vanilla included) is built through the production factory so
-    # the harness does not special-case backend construction.
     attn = create_attention(
         backend,
         layer_idx=0,
@@ -844,10 +839,8 @@ def _run_sparse_mla_backend(
         dtype=case.compute_dtype,
         skip_create_weights_in_init=True,
     )
-    # Weight creation is skipped (the harness injects selections instead of
-    # running the indexer); update_quant_config still initializes the quant/FMHA
-    # state the fused backends need before forward, and is a safe no-op for
-    # Vanilla (the base implementation only stores quant_config).
+    # Weights are skipped (selections are injected, not produced by an indexer);
+    # update_quant_config initializes the quant/FMHA state needed before forward.
     attn.update_quant_config(None)
     mgr = _build_mla_kv_cache_manager(
         case,
@@ -1390,12 +1383,14 @@ def run_backend(
     matrix). MLA cases are dispatched to the absorbed-generation path.
     """
     if case.is_sparse:
-        sparse_kind = (case.sparse_attention_family, case.sparse_selection_unit)
-        if sparse_kind == ("mla", "token"):
+        if case.is_mla and case.sparse_selection_unit == "token":
             return _run_sparse_mla_backend(case, backend, inputs, kv_layout=kv_layout)
         if case.sparse_selection_unit == "block":
             return _run_sparse_block_backend(case, backend, inputs, kv_layout=kv_layout)
-        raise ValueError(f"Unsupported sparse harness contract: {sparse_kind}")
+        raise ValueError(
+            f"Unsupported sparse contract: is_mla={case.is_mla}, "
+            f"selection_unit={case.sparse_selection_unit!r}"
+        )
 
     if case.is_mla:
         if case.is_context_only:
@@ -1588,13 +1583,15 @@ def run_case(case: BackendCase, *, seed: int = 0) -> Dict[str, torch.Tensor]:
     _validate_sparse_case(case)
     is_mla = case.is_mla
     if case.is_sparse:
-        sparse_kind = (case.sparse_attention_family, case.sparse_selection_unit)
-        if sparse_kind == ("mla", "token"):
+        if case.is_mla and case.sparse_selection_unit == "token":
             inputs = generate_sparse_mla_inputs(case, seed)
         elif case.sparse_selection_unit == "block":
             inputs = generate_sparse_block_inputs(case, seed)
         else:
-            raise ValueError(f"Unsupported sparse harness contract: {sparse_kind}")
+            raise ValueError(
+                f"Unsupported sparse contract: is_mla={case.is_mla}, "
+                f"selection_unit={case.sparse_selection_unit!r}"
+            )
     elif is_mla:
         if case.is_context_only:
             inputs = generate_mla_context_inputs(case, seed)
@@ -1633,11 +1630,8 @@ def run_case(case: BackendCase, *, seed: int = 0) -> Dict[str, torch.Tensor]:
 
         # A gen-only batch also exercises the captured-CUDA-graph path
         # (production replays a captured decode graph); it must still match the
-        # eager golden. Sparse cases are excluded: the standalone sparse runner
-        # is an eager correctness oracle that validates injected selections on the
-        # host and rebuilds each request's logical cache with Python loops, none
-        # of which is graph-capturable. Graph coverage of the DSA decode kernel is
-        # exercised at the model level, not by this backend-only oracle.
+        # eager golden. The sparse runner rebuilds each request's logical cache on
+        # the host, which is not graph-capturable, so sparse cases are skipped.
         if case.is_gen_only and not case.is_sparse:
             cg_out = run_backend(
                 case,
