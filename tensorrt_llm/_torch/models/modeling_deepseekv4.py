@@ -26,7 +26,6 @@
 # --------------------------------------------------
 
 import copy
-import inspect
 import math
 import os
 from typing import TYPE_CHECKING, Dict, List, Optional
@@ -73,11 +72,8 @@ from ..modules.fused_moe import (
     create_moe,
     get_moe_cls,
 )
-from ..modules.fused_moe.fused_moe_cute_dsl import CuteDslFusedMoE
-from ..modules.fused_moe.fused_moe_cute_dsl_b12x import CuteDslB12xFusedMoE
 from ..modules.fused_moe.fused_moe_deepgemm import DeepGemmFusedMoE
 from ..modules.fused_moe.fused_moe_wide_ep import WideEPMoE
-from ..modules.fused_moe.mega_moe import MegaMoECuteDsl, MegaMoEDeepGemm
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import Linear, TensorParallelMode, WeightsLoadingConfig
 from ..modules.mhc.hyper_connection import HCHead, HCState, mHC
@@ -350,25 +346,8 @@ def _copy_deepseek_v4_fused_a_weight_scale(
     module.weight_scale.data.copy_(fused_a_scale)
 
 
-# Keep in sync with the top-level branches of _remap_deepseek_v4_checkpoint_keys:
-# a partial bucket carrying ONLY e.g. "head.weight" must still route through the
-# remap, else its weights are silently dropped under allow_partial_loading.
-_RAW_V4_TOP_LEVEL_KEYS = ("embed.weight", "head.weight", "norm.weight")
-# "mtp." (not "mtp.0.") so any future mtp.N key still routes; canonical HF keys
-# start with "model."/"lm_head" and can never match.
-_RAW_V4_KEY_PREFIXES = ("layers.", "mtp.", "hc_head_")
-
-
-def _is_raw_v4_checkpoint_key(k: str) -> bool:
-    """Mirror of the top-level branches in _remap_deepseek_v4_checkpoint_keys."""
-    return k in _RAW_V4_TOP_LEVEL_KEYS or k.startswith(_RAW_V4_KEY_PREFIXES)
-
-
 def _remap_deepseek_v4_checkpoint_keys(
-    weights: Dict,
-    num_hidden_layers: int,
-    kv_lora_rank: int = 448,
-    routed_moe_scale_name: Optional[str] = None,
+    weights: Dict, num_hidden_layers: int, kv_lora_rank: int = 448
 ) -> Dict:
     """Convert DeepSeek-V4 checkpoint keys to model named-parameter keys.
 
@@ -387,8 +366,8 @@ def _remap_deepseek_v4_checkpoint_keys(
         are zero-filled — V4 indexer's k path is served by the compressor, so
         the base ``Indexer.wk`` / ``k_norm`` are unused at forward time.
       * Routed experts can use either FP8 block scales or the packed MXFP4
-        layout. An explicit ``routed_moe_scale_name`` wins; the first-weight
-        sniff fallback cannot work for scale-only partial buckets.
+        layout. The first routed expert weight determines the scale suffix used
+        for all routed expert tensors in the shard.
       * ``self_attn.o_a_proj`` is loaded by the DeepSeek-V4 loader because it
         is a direct MLA parameter, not a child Linear module.
       * ``mtp.0.head.weight`` is dropped — DeepSeekV4MTP reuses the main
@@ -396,8 +375,7 @@ def _remap_deepseek_v4_checkpoint_keys(
         carries it but matches the main head, so we let the main head win.
     """
     mtp_layer_prefix = f"model.layers.{num_hidden_layers}"
-    if routed_moe_scale_name is None:
-        routed_moe_scale_name = _get_deepseek_v4_routed_moe_scale_name(weights, "layers.")
+    routed_moe_scale_name = _get_deepseek_v4_routed_moe_scale_name(weights, "layers.")
 
     def _rename_layer_subkey(rest: str) -> Optional[str]:
         # rest examples: "attn_norm.weight", "ffn_norm.weight",
@@ -541,124 +519,39 @@ class DeepseekV4WeightLoader:
         self.model_config = model.model_config
         self.is_draft_model = is_draft_model
 
-    def load_attn_sink(self, owner, sink_src: torch.Tensor) -> None:
-        """Refresh the pre-registered attn_sink in place.
-
-        Captured CUDA graphs bake the Parameter's device pointer: reload
-        must ``copy_`` in place, never rebind (the creation branch is a
-        defensive fallback; owned storage avoids aliasing trainer CUDA-IPC
-        memory). ``_attn_sink_loaded`` is diagnostic only — never reset,
-        gates no writes.
-        """
-        sink = sink_src[:]
-        mapping = self.model_config.mapping
-        if not mapping.enable_attention_dp and mapping.tp_size > 1:
-            # Same per-head TP split as load_weights' local ``split`` helper.
-            sink = torch.chunk(sink, mapping.tp_size)[mapping.tp_rank].contiguous()
-        existing = getattr(owner, "attn_sink", None)
-        if existing is not None:
-            if tuple(existing.shape) != tuple(sink.shape):
-                raise ValueError(
-                    f"attn_sink shape changed on reload: "
-                    f"{tuple(existing.shape)} vs {tuple(sink.shape)}"
-                )
-            existing.data.copy_(sink)
-        else:
-            param = nn.Parameter(
-                torch.empty(sink.shape, dtype=torch.float32, device="cuda"),
-                requires_grad=False,
-            )
-            param.data.copy_(sink)
-            owner.attn_sink = param
-        owner._attn_sink_loaded = True
-
-    def _routed_moe_scale_name_from_quant_config(self) -> Optional[str]:
-        """Derive the routed-expert scale suffix from the experts' quant config.
-
-        The remapper's key sniff needs an expert *weight* in the same dict,
-        which scale-only partial buckets never carry — an explicit name from
-        the config must win, with the sniff kept only as a fallback.
-        """
-        names = {}
-        quant_config_dict = getattr(self.model_config, "quant_config_dict", None)
-        # +1 covers the MTP layer.
-        for layer_idx in range(self.config.num_hidden_layers + 1):
-            if quant_config_dict is not None:
-                # Only count real experts entries: _get_experts_quant_config's
-                # fallback is the GLOBAL config (attention/dense), which would
-                # spuriously fail the uniformity check.
-                if f"model.layers.{layer_idx}.mlp.experts" not in quant_config_dict:
-                    continue
-            qc = DeepseekV4MoE._get_experts_quant_config(self.model_config, layer_idx)
-            if qc is None or qc.quant_algo is None:
-                continue
-            mode = qc.layer_quant_mode
-            # Packed-FP4 weights (uint8 storage) carry "weight_scale"; the
-            # list must cover every packed variant the resolver can yield.
-            if (
-                mode.has_nvfp4()
-                or mode.has_w4a8_nvfp4_fp8()
-                or mode.has_w4a16_mxfp4()
-                or mode.has_w4a8_mxfp4_fp8()
-                or mode.has_w4a8_mxfp4_mxfp8()
-            ):
-                names[layer_idx] = "weight_scale"
-            elif mode.has_fp8_block_scales():
-                names[layer_idx] = "weight_scale_inv"
-        unique = set(names.values())
-        if len(unique) > 1:
-            raise ValueError(
-                "Per-layer expert quant configs disagree on the routed-expert "
-                f"scale suffix: {names}"
-            )
-        return unique.pop() if unique else None
-
-    def load_weights(
-        self,
-        weights: Dict,
-        skip_modules: List[str] = [],
-        allow_partial_loading: bool = False,
-    ):
-        """Load (a subset of) checkpoint weights into the model.
-
-        With ``allow_partial_loading=True`` a bucket may legitimately omit
-        keys the model expects: the synthesize-defaults pass below is skipped
-        and per-module branches tolerate missing weights. The non-partial
-        path is unchanged by the flag.
-        """
-        # Rewrite raw DS-V4 keys (layers.X.*, mtp.0.*, embed.weight, ...) to
-        # the model's named-parameter keys; HF-style checkpoints
-        # ("model.layers.", "lm_head.") skip this branch.
-        if any(_is_raw_v4_checkpoint_key(k) for k in weights):
+    def load_weights(self, weights: Dict, skip_modules: List[str] = []):
+        # If the checkpoint uses raw DS-V4 keys (layers.X.attn.wkv.weight,
+        # mtp.0.*, embed.weight, head.weight), rewrite them to the model's
+        # named-parameter keys before iterating modules. The detection is by
+        # presence of any top-level "layers." key; HF-style checkpoints use
+        # "model.layers." and skip this branch.
+        if any(k == "embed.weight" or k.startswith("layers.") for k in weights):
             weights = _remap_deepseek_v4_checkpoint_keys(
                 weights,
                 num_hidden_layers=self.config.num_hidden_layers,
                 kv_lora_rank=self.config.kv_lora_rank,
-                routed_moe_scale_name=self._routed_moe_scale_name_from_quant_config(),
             )
             # Synthesize defaults (with correct shape pulled from the model)
             # for parameters the model has but the V4 checkpoint omits. We do
             # this in one place vs scattering zero-fills through the per-
             # module branches so the missing-key contract is auditable here.
-            # Skipped under partial loading (buckets legitimately omit keys).
             #   indexer.k_norm.weight     → ones
             #   indexer.k_norm.bias       → zeros
             #   indexer.wk.weight         → zeros (V4 indexer's k path is
             #                                served by compressor; wk unused)
-            if not allow_partial_loading:
-                _ones_suffixes = ("self_attn.indexer.k_norm.weight",)
-                _zeros_suffixes = (
-                    "self_attn.indexer.k_norm.bias",
-                    "self_attn.indexer.wk.weight",
-                )
-                model_params = dict(self.model.named_parameters())
-                for pname, p in model_params.items():
-                    if pname in weights:
-                        continue
-                    if any(pname.endswith(s) for s in _ones_suffixes):
-                        weights[pname] = torch.ones_like(p, device="cpu")
-                    elif any(pname.endswith(s) for s in _zeros_suffixes):
-                        weights[pname] = torch.zeros_like(p, device="cpu")
+            _ones_suffixes = ("self_attn.indexer.k_norm.weight",)
+            _zeros_suffixes = (
+                "self_attn.indexer.k_norm.bias",
+                "self_attn.indexer.wk.weight",
+            )
+            model_params = dict(self.model.named_parameters())
+            for pname, p in model_params.items():
+                if pname in weights:
+                    continue
+                if any(pname.endswith(s) for s in _ones_suffixes):
+                    weights[pname] = torch.ones_like(p, device="cpu")
+                elif any(pname.endswith(s) for s in _zeros_suffixes):
+                    weights[pname] = torch.zeros_like(p, device="cpu")
 
         def requantize_weight_with_new_scale(
             weight, weight_scale, old_scale_2, new_scale_2, device
@@ -909,15 +802,6 @@ class DeepseekV4WeightLoader:
             else:
                 return False
             keys = {a: f"{stem}_{a}" for a in ("fn", "base", "scale")}
-            if allow_partial_loading:
-                # fn/base/scale are independent (no fusion): copy whichever
-                # members are present; False falls through to the structured-key branch.
-                copied = False
-                for attr, key in keys.items():
-                    if key in weights:
-                        getattr(module, attr).data.copy_(weights[key][:])
-                        copied = True
-                return copied
             if not all(k in weights for k in keys.values()):
                 return False
             for attr, key in keys.items():
@@ -929,6 +813,17 @@ class DeepseekV4WeightLoader:
                 continue
             names = name.split(".")
             parent_module_name = ".".join(names[:-1])
+
+            if names[-1] == "mqa":
+                parent_attn_name = ".".join(names[:-1])
+                attn_sink_key = f"{parent_attn_name}.attn_sink"
+                if attn_sink_key in weights:
+                    sink_full = weights[attn_sink_key][:]
+                    if not self.model_config.mapping.enable_attention_dp:
+                        sink_full = split(sink_full, tp_size, tp_rank)
+                    sink_full = sink_full.to(torch.float32).cuda()
+                    module.attn_sink = nn.Parameter(sink_full, requires_grad=False)
+                continue
 
             if len(module._parameters) <= 0:
                 continue
@@ -1099,8 +994,8 @@ class DeepseekV4WeightLoader:
                         else:
                             fused_a = kv_a_proj_with_mqa
 
-                        # Defensive slice: DSv4 kv_a_proj_with_mqa is
-                        # exact-sized (mla.py), so this copies the full tensor.
+                        # For DeepseekV32: kv_a_proj_with_mqa is oversized
+                        # to include indexer k weights, which is filled in post_load_weights.
                         module.weight.data[0 : fused_a.shape[0]].copy_(fused_a)
 
                         ########### fuse weight_scale
@@ -1110,6 +1005,8 @@ class DeepseekV4WeightLoader:
                             )
                         else:
                             fused_a_scale = kv_a_proj_with_mqa_scale
+                        # For DeepseekV32: kv_a_proj_with_mqa is oversized
+                        # to include indexer k weights, which is filled in post_load_weights.
                         _copy_deepseek_v4_fused_a_weight_scale(module, fused_a, fused_a_scale)
                     else:
                         fused_a = weights[f"{'.'.join(names[:-1])}.kv_a_proj_with_mqa.weight"][:]
@@ -1128,7 +1025,8 @@ class DeepseekV4WeightLoader:
                                 fused_a_scale = torch.cat([q_a_proj_scale, fused_a_scale], dim=0)
 
                             _copy_deepseek_v4_fused_a_weight_scale(module, fused_a, fused_a_scale)
-                        # Defensive slice; see the fused-A weight copy above.
+                        # For DeepseekV32: kv_a_proj_with_mqa is oversized
+                        # to include indexer k weights, which is filled in post_load_weights.
                         module.weight.data[0 : fused_a.shape[0]].copy_(fused_a)
                 elif names[-1] in params_map:
                     module_weights = []
@@ -1136,9 +1034,7 @@ class DeepseekV4WeightLoader:
                         module_weights.append(
                             filter_weights(".".join(names[:-1] + [new_name]), weights)
                         )
-                    module.load_weights(
-                        weights=module_weights, allow_partial_loading=allow_partial_loading
-                    )
+                    module.load_weights(weights=module_weights)
                 elif names[-1] == "experts":
                     module_weights = filter_weights(name, weights)
                     module_weights = rename_moe_weight(
@@ -1149,9 +1045,7 @@ class DeepseekV4WeightLoader:
                             "gate_proj": "w1",
                         },
                     )
-                    module.load_weights(
-                        weights=[module_weights], allow_partial_loading=allow_partial_loading
-                    )
+                    module.load_weights(weights=[module_weights])
                 elif names[-1] == "backend" and isinstance(module, MoE):
                     # Special case: ConfigurableMoE.backend (TRTLLMGenFusedMoE)
                     # Currently saved MoE weights don't include 'backend' in their names.
@@ -1169,19 +1063,33 @@ class DeepseekV4WeightLoader:
                             "gate_proj": "w1",
                         },
                     )
-                    module.load_weights(
-                        weights=[module_weights], allow_partial_loading=allow_partial_loading
-                    )
+                    module.load_weights(weights=[module_weights])
                 elif names[-1] == "self_attn":
-                    o_a_proj_key = f"{name}.o_a_proj"
-                    if o_a_proj_key in weights:
+                    if f"{name}.o_a_proj" in weights:
                         load_o_a_proj(name, module)
-                    # attn_sink is a direct Parameter of self_attn (aliased
-                    # onto the mqa backend); only loader path for the
-                    # parent-named key. MTP layers route here via the remapper.
                     attn_sink_key = f"{name}.attn_sink"
                     if attn_sink_key in weights:
-                        self.load_attn_sink(module, weights[attn_sink_key])
+                        sink_full = weights[attn_sink_key][:]
+                        if not self.model_config.mapping.enable_attention_dp:
+                            sink_full = split(sink_full, tp_size, tp_rank)
+                        sink_full = sink_full.to(torch.float32).cuda()
+                        module.mqa.attn_sink = nn.Parameter(sink_full, requires_grad=False)
+                    continue
+                elif names[-1] == "mqa":
+                    # DeepseekV4TrtllmAttention owns the optional attn_sink
+                    # (per-head fp32, already TP-sharded). The checkpoint key
+                    # uses the parent attention module name, not the .mqa
+                    # suffix. When the key is absent we leave module.attn_sink
+                    # as None so DeepseekV4TrtllmAttention.forward does not pass
+                    # attention_sinks to the kernel.
+                    parent_attn_name = ".".join(names[:-1])
+                    attn_sink_key = f"{parent_attn_name}.attn_sink"
+                    if attn_sink_key in weights:
+                        sink_full = weights[attn_sink_key][:]
+                        if not self.model_config.mapping.enable_attention_dp:
+                            sink_full = split(sink_full, tp_size, tp_rank)
+                        sink_full = sink_full.to(torch.float32).cuda()
+                        module.attn_sink = nn.Parameter(sink_full, requires_grad=False)
                     continue
                 elif names[-1] == "next_layer_layernorm":
                     continue
@@ -1196,26 +1104,10 @@ class DeepseekV4WeightLoader:
                 else:
                     module_weights = filter_weights(name, weights)
                     if hasattr(module, "load_weights"):
-                        args = inspect.getfullargspec(module.load_weights).args
-                        if "allow_partial_loading" not in args and allow_partial_loading:
-                            raise NotImplementedError(
-                                f"allow_partial_loading is not supported for '{name}'"
-                            )
-                            module.load_weights(weights=[module_weights])
-                        else:
-                            module.load_weights(
-                                weights=[module_weights],
-                                allow_partial_loading=allow_partial_loading,
-                            )
+                        module.load_weights(weights=[module_weights])
                     else:
                         for n, p in module.named_parameters():
-                            if not allow_partial_loading and n not in module_weights:
-                                raise KeyError(
-                                    f"missing weight '{n}' for '{name}' on a "
-                                    f"full (non-partial) load"
-                                )
-                            if n in module_weights:
-                                p.data.copy_(module_weights[n][:])
+                            p.data.copy_(module_weights[n][:])
 
 
 @torch.compile(options={"max-autotune": True})
@@ -1426,76 +1318,6 @@ class DeepseekV4Attention(MLA):
         self.indexer = getattr(self.mqa, "indexer", None)
         self.compressor = getattr(self.mqa, "compressor", None)
 
-        self._register_attn_sink()
-
-    def _register_attn_sink(self) -> None:
-        """Pre-register ``attn_sink`` as a module Parameter at construction.
-
-        Ownership lives HERE, not on the (non-nn.Module) ``mqa`` backend:
-        only ``module._parameters`` entries are seen by the serialization/
-        transport walks (GMS writer commit, GMS materialization,
-        ``initialize_dummy_weights``); the backend consumes the value via
-        the ``_wire_attn_sink`` alias. Pre-registration (vs lazy creation)
-        is required because CUDA-graph warmup capture at LLM init bakes the
-        Parameter's device pointer into captured graphs. ``-inf`` is the
-        neutral sink (``exp(-inf) == 0``), so sink-less checkpoints keep
-        exact no-sink math.
-
-        ``torch.full`` survives ``MetaInitMode`` (which only intercepts
-        ``aten.empty*``), so the ctor value is real even under meta init.
-        No post-load hook refills ``-inf``; every allocation/init path must
-        preserve the ctor value at its source (dummy init skips
-        ``.attn_sink``; the memory-tag pool copies non-meta ctor tensors) —
-        new allocation/transport paths must follow suit. ``num_heads_tp``
-        matches the loader's TP split.
-        """
-        self.attn_sink = nn.Parameter(
-            torch.full((self.num_heads_tp,), float("-inf"), dtype=torch.float32),
-            requires_grad=False,
-        )
-        # Diagnostic only (never consulted by the finalize hooks);
-        # direct-write transports legitimately leave it False.
-        self._attn_sink_loaded = False
-        self._wire_attn_sink()
-
-    def _wire_attn_sink(self) -> None:
-        # Plain attribute alias sharing the Parameter object (loader copy_
-        # stays visible). getattr guards keep this callable on bare test stubs.
-        mqa = getattr(self, "mqa", None)
-        sink = getattr(self, "attn_sink", None)
-        if mqa is not None and sink is not None:
-            mqa.attn_sink = sink
-
-    def _finalize_attn_sink(self) -> None:
-        """Shared tail of both staged post-load hooks.
-
-        VALUE-PRESERVING invariant: never write ``attn_sink`` here on ANY
-        path. Sink values can arrive via direct-write transports that bypass
-        every loader hook (MX P2P; GMS materialization rebinds the Parameter
-        zero-copy to writer-shared storage): a refill would overwrite real
-        values and, on GMS, corrupt the writer and every peer. Destroyers of
-        the ctor value are guarded at the source (see ``_register_attn_sink``).
-
-        The re-wire is unconditional because GMS materialization rebinds the
-        Parameter object, leaving the ctor-time backend alias stale. The
-        CUDA migration is a fallback for hook-less harnesses only; it never
-        writes shared storage.
-        """
-        sink = getattr(self, "attn_sink", None)
-        if sink is None:
-            return
-        if not sink.data.is_cuda:
-            sink.data = sink.data.cuda()
-        self._wire_attn_sink()
-
-    def post_load_weights(self) -> None:
-        super().post_load_weights()
-        self._finalize_attn_sink()
-
-    def cache_derived_state(self) -> None:
-        super().cache_derived_state()
-        self._finalize_attn_sink()
-
 
 class DeepseekV4Gate(nn.Module):
     def __init__(
@@ -1567,25 +1389,17 @@ class DeepseekV4Gate(nn.Module):
             hidden_states, self.weight.t(), bias=None, out_dtype=torch.float32
         )
 
-    def load_weights(self, weights: List[Dict], allow_partial_loading: bool = False):
+    def load_weights(self, weights: List[Dict]):
         assert len(weights) == 1
 
-        w = weights[0].get("weight")
-        aux_name = "tid2eid" if self.is_hashed else "e_score_correction_bias"
-        aux = weights[0].get(aux_name)
-        if not allow_partial_loading and (w is None or aux is None):
-            raise ValueError(
-                f"DeepseekV4Gate expects 'weight' and '{aux_name}' when partial loading is disabled"
-            )
-        if w is not None:
-            self.weight.copy_(w[:])
+        self.weight.copy_(weights[0]["weight"][:])
 
         if self.is_hashed:
-            if aux is not None:
-                self.tid2eid.copy_(aux[:].to(self.tid2eid.dtype))
+            self.tid2eid.copy_(weights[0]["tid2eid"][:].to(self.tid2eid.dtype))
         else:
-            if aux is not None:
-                self.e_score_correction_bias.copy_(aux[:].to(self.e_score_correction_bias.dtype))
+            self.e_score_correction_bias.copy_(
+                weights[0]["e_score_correction_bias"][:].to(self.e_score_correction_bias.dtype)
+            )
 
     @property
     def routing_method(self) -> DeepSeekV4MoeRoutingMethod:
@@ -1642,7 +1456,6 @@ class DeepseekV4MoE(nn.Module):
 
         swiglu_limit = getattr(config, "swiglu_limit", None)
         moe_swiglu_limit = None
-        moe_swiglu_limit_scalar = None
         if swiglu_limit is not None:
             # `create_moe` only accepts swiglu_limit for these MoE classes;
             # resolve via get_moe_cls so backend-string fallbacks (e.g.
@@ -1655,40 +1468,7 @@ class DeepseekV4MoE(nn.Module):
                 TRTLLMGenFusedMoE,
                 WideEPMoE,
                 DeepGemmFusedMoE,
-                MegaMoECuteDsl,
             )
-            # Pass the scalar clamp only to backends that consume it (mirrors
-            # `create_moe`'s swiglu_limit_scalar support list); MegaMoECuteDsl
-            # and TritonFusedMoE consume the per-expert tensor built below.
-            moe_swiglu_limit_scalar = (
-                float(swiglu_limit)
-                if moe_cls
-                in (
-                    CutlassFusedMoE,
-                    TRTLLMGenFusedMoE,
-                    WideEPMoE,
-                    DeepGemmFusedMoE,
-                    MegaMoEDeepGemm,
-                    CuteDslFusedMoE,
-                    CuteDslB12xFusedMoE,
-                )
-                else None
-            )
-            if not supports_swiglu_limit and moe_swiglu_limit_scalar is None:
-                # Running without the checkpoint's activation clamp silently
-                # corrupts outputs; fail loudly.
-                raise NotImplementedError(
-                    f"config.swiglu_limit={swiglu_limit} requires a MoE backend "
-                    "that applies the SwiGLU activation clamp, but the resolved "
-                    f"backend {moe_cls.__name__} (moe_backend="
-                    f"{model_config.moe_backend!r}) consumes neither the "
-                    "per-expert `swiglu_limit` tensor nor `swiglu_limit_scalar`. "
-                    "Use a supported moe_backend (any backend other than "
-                    "VANILLA, MARLIN, and DENSEGEMM — e.g. CUTLASS, TRTLLM, "
-                    "CUTEDSL, DEEPGEMM, WIDEEP, TRITON, MEGAMOE_DEEPGEMM, "
-                    "MEGAMOE_CUTEDSL) or remove `swiglu_limit` from the model "
-                    "config."
-                )
             # NVFP4 routed-expert path: the TRTLLM-Gen fp4-block-scale fused-MoE
             # cubin produces near-zero accuracy without bias even when
             # swiglu_limit is supplied; drop the limit there until the cubin
@@ -1729,7 +1509,7 @@ class DeepseekV4MoE(nn.Module):
                 else MoEWeightLoadingMode.VANILLA
             ),
             swiglu_limit=moe_swiglu_limit,
-            swiglu_limit_scalar=moe_swiglu_limit_scalar,
+            swiglu_limit_scalar=(float(swiglu_limit) if swiglu_limit is not None else None),
         )
 
         self.mapping = model_config.mapping
@@ -2805,9 +2585,9 @@ class DeepseekV4ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV4Model, Pretrai
             **kwargs,
         )
 
-    def load_weights(self, weights: Dict, allow_partial_loading: bool = False):
+    def load_weights(self, weights: Dict):
         weight_loader = DeepseekV4WeightLoader(self)
-        weight_loader.load_weights(weights, allow_partial_loading=allow_partial_loading)
+        weight_loader.load_weights(weights)
 
     def post_load_weights(self):
         layers = self.model.layers[: self.config.num_hidden_layers]

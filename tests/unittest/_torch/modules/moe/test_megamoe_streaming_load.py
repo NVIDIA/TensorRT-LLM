@@ -1,22 +1,19 @@
-"""Initial streaming-load tests for ``NVFP4MegaMoECuteDslMethod``.
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
-Exercises the memory-bounded initial weight load of the MegaMoE-CuteDSL NVFP4
-quant method in ``tensorrt_llm/_torch/modules/fused_moe/quantization.py`` ONLY:
-
-* ``create_weights`` shrinks ``_STREAMED_SOURCE_PARAMS`` to 0-element
-  placeholders and records their full shapes for rematerialization,
-* ``load_weights`` (allow_partial_loading=False) rematerializes the sources on
-  CUDA, and ``process_weights_after_loading`` packs the MegaMoE-format derived
-  buffers (``mega_fc1/fc2_weight``, ``fc1_norm_const``) and frees the sources.
-
-Everything here is pure torch tensor plumbing: the CuTe DSL kernel is never
-imported or launched, so a single CUDA GPU of any architecture is enough and
-no model weights are required. The quant method is driven directly against a
-lightweight mock module that provides exactly the attributes the method
-touches; the weights dict is handed to the quant method as a single Dict --
-the same convention as ``MegaMoECuteDsl.load_weights`` (which unwraps the
-caller's ``[weights_dict]`` before forwarding).
-"""
+"""Tests for MegaMoE-CuteDSL NVFP4 streaming source weights."""
 
 import pytest
 
@@ -37,7 +34,6 @@ _STREAMED_PARAMS = ("w3_w1_weight", "w3_w1_weight_scale", "w2_weight", "w2_weigh
 
 
 def _load_classes():
-    """Import lazily so collection works on hosts without tensorrt_llm."""
     from tensorrt_llm._torch.modules.fused_moe.interface import MoEWeightLoadingMode
     from tensorrt_llm._torch.modules.fused_moe.quantization import NVFP4MegaMoECuteDslMethod
 
@@ -45,12 +41,7 @@ def _load_classes():
 
 
 class _StreamingMoEModule(nn.Module):
-    """Minimal stand-in for the MegaMoECuteDsl backend module.
-
-    Provides only the attributes ``NVFP4MegaMoECuteDslMethod`` (and its
-    NVFP4 / base parents) touch on the initial load path. Single-rank world:
-    tp_size == ep_size == 1, every expert is local.
-    """
+    """Minimal single-rank module for the quant-method load path."""
 
     def __init__(self, weight_loading_mode):
         super().__init__()
@@ -84,21 +75,6 @@ def _w2_input_scale(expert_id: int) -> float:
 
 
 def _make_vanilla_weights(seed: int = 20260708) -> dict:
-    """Synthesize a VANILLA-mode NVFP4 checkpoint dict for all experts.
-
-    Byte layouts follow the loader contract (verified against
-    ``FusedMoEMethodBase.load_expert_weights_to_dst`` and
-    ``NVFP4FusedMoEMethod.load_quant_scales`` / ``load_fp4_weight_block_scales``):
-
-    * ``{e}.w1/w3.weight``      uint8 ``(I, H // 2)``   (viewed as int64 rows)
-    * ``{e}.w2.weight``         uint8 ``(H, I // 2)``
-    * ``{e}.w1/w3.weight_scale``  fp8 ``(I, H // 16)``  (viewed as int32 rows)
-    * ``{e}.w2.weight_scale``     fp8 ``(H, I // 16)``
-    * ``{e}.*.input_scale`` / ``{e}.*.weight_scale_2``  fp32 scalars
-
-    The bytes are random -- only the streaming lifecycle is under test, no
-    kernel ever consumes them numerically.
-    """
     gen = torch.Generator(device="cuda").manual_seed(seed)
 
     def rand_u8(*shape):
@@ -131,7 +107,6 @@ def _make_vanilla_weights(seed: int = 20260708) -> dict:
 
 
 def _fresh(seed: int = 20260708):
-    """Build (method, module, weights) with weights created on cuda."""
     mode_cls, method_cls = _load_classes()
     module = _StreamingMoEModule(mode_cls.VANILLA)
     method = method_cls()
@@ -141,7 +116,6 @@ def _fresh(seed: int = 20260708):
 
 
 def _load(method, module, bucket, allow_partial_loading):
-    """Same calling convention as ``MegaMoECuteDsl.load_weights`` post-unwrap."""
     mode_cls, _ = _load_classes()
     method.load_weights(
         module, bucket, mode_cls.VANILLA, allow_partial_loading=allow_partial_loading
@@ -160,7 +134,6 @@ def _assert_sources_freed(module, context=""):
 
 
 def _assert_finalized(module, context=""):
-    """The full PWAL tail ran for this module: sources freed, stashes gone."""
     _assert_sources_freed(module, context)
     for stash in (
         "tmp_cutlass_w3_w1_weights",
@@ -179,7 +152,6 @@ def _expected_mega_fc2(weights) -> torch.Tensor:
 
 
 def _expected_mega_fc1(weights) -> torch.Tensor:
-    """16-atom gate/up interleave along M: [w1[0:16], w3[0:16], w1[16:32], ...]."""
     per_slot = []
     for e in range(NUM_EXPERTS):
         gate = weights[f"{e}.w1.weight"].view(INTERMEDIATE_SIZE // 16, 16, HIDDEN_SIZE // 2)
@@ -214,3 +186,13 @@ def test_initial_streaming_load_layer_atomic():
     assert torch.equal(module.mega_fc2_weight.data, _expected_mega_fc2(weights))
     assert torch.equal(module.mega_fc1_weight.data, _expected_mega_fc1(weights))
     assert torch.allclose(module.fc1_norm_const.data, _expected_fc1_norm_const())
+
+
+def test_partial_load_rejected_before_source_materialization():
+    method, module, weights = _fresh()
+    _assert_sources_freed(module, "before partial load")
+
+    with pytest.raises(NotImplementedError, match="only supports full initial weight loading"):
+        _load(method, module, weights, allow_partial_loading=True)
+
+    _assert_sources_freed(module, "after rejected partial load")

@@ -345,8 +345,7 @@ def create_moe_backend(
         # tensor limit is given (see the MegaMoE branch below).
         assert moe_cls in [
             CutlassFusedMoE, TRTLLMGenFusedMoE, WideEPMoE, DeepGemmFusedMoE,
-            MegaMoEDeepGemm, CuteDslFusedMoE, CuteDslB12xFusedMoE,
-            MegaMoECuteDsl
+            MegaMoEDeepGemm, CuteDslFusedMoE, MegaMoECuteDsl
         ], f"swiglu_limit_scalar is not supported in {moe_cls.__name__}."
 
     if combine_format != "bf16" and moe_cls is not MegaMoECuteDsl:

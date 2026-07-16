@@ -301,18 +301,10 @@ def _run_autotune_test(
         quant_algo: Quantization algorithm
         run_all_tactics: If False, skip full tactic replay and only run simple accuracy check
     """
-    # Autotune phase. MEGAMOE_CUTEDSL is excluded from tuning mode: its
-    # AutoTuner sweep cute.compile's every curated candidate tactic (a
-    # separate multi-minute JIT each), which unit tests cannot afford; the
-    # accuracy checks below exercise the deterministic fallback-tactic path
-    # (exactly what a non-tuned serving process runs).
+    # Autotune phase
     cache_path = os.path.join(tempfile.gettempdir(), "moe_module_autotuner_cache.json")
-    if backend_type == MoeBackendType.MEGAMOE_CUTEDSL:
-        with torch.inference_mode():
-            _ = run_forward_fn()
-    else:
-        with torch.inference_mode(), autotune(cache_path=cache_path):
-            _ = run_forward_fn()
+    with torch.inference_mode(), autotune(cache_path=cache_path):
+        _ = run_forward_fn()
 
     # Check if we should run full tactic replay
     if not run_all_tactics or not supports_autotuner_capture(

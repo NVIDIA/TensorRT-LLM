@@ -263,9 +263,6 @@ def test_fused_moe_load_weights_invalidates_transform_guard():
         w2_weight=torch.empty(1, 2, 2),
         bias=False,
         _weights_transformed=True,
-        # Partial loads run the reload-coverage credit scan, whose mode-drift
-        # guard reads module.weight_loading_mode.
-        weight_loading_mode=MoEWeightLoadingMode.VANILLA,
     )
 
     method.load_weights(
@@ -559,28 +556,6 @@ def test_megamoe_cutedsl_tactic_autotune_defaults_off(monkeypatch):
     monkeypatch.setenv("MEGAMOE_TACTIC_AUTOTUNE", "1")
     moe_on = _make_megamoe_cutedsl_for_ctor_test()
     assert moe_on.tactic_autotune is True
-
-
-def test_megamoe_cutedsl_tactic_autotune_env_opt_in(monkeypatch):
-    # MEGAMOE_TACTIC_AUTOTUNE=1 is read at backend construction (bench-only
-    # knob; must be set identically on all ranks). Other backends ignore it.
-    model_config = ModelConfig(
-        mapping=Mapping(world_size=1, rank=0, tp_size=1, moe_tp_size=1, moe_ep_size=1),
-        moe_backend=MoeBackendType.MEGAMOE_CUTEDSL.value,
-        skip_create_weights_in_init=True,
-    )
-    monkeypatch.setenv("MEGAMOE_TACTIC_AUTOTUNE", "1")
-    moe = create_moe_backend(
-        moe_cls=MegaMoECuteDsl,
-        routing_method=RenormalizeMoeRoutingMethod(top_k=2),
-        num_experts=8,
-        hidden_size=512,
-        intermediate_size=512,
-        dtype=torch.bfloat16,
-        model_config=model_config,
-        init_load_balancer=False,
-    )
-    assert moe.tactic_autotune is True
 
 
 def test_enumerate_megamoe_candidate_tactics_curated_space():
@@ -1108,17 +1083,8 @@ def test_moe_backend(
 
         # Autotune phase: tune kernels to find best tactics
         # Use cache_path to speed up subsequent runs by reusing tuning results
-        # MEGAMOE_CUTEDSL is excluded from tuning mode: its AutoTuner sweep
-        # cute.compile's every curated candidate tactic (a separate
-        # multi-minute JIT each), which unit tests cannot afford; the accuracy
-        # check below covers the deterministic fallback-tactic path (exactly
-        # what a non-tuned serving process runs).
-        if backend_type == MoeBackendType.MEGAMOE_CUTEDSL:
-            with torch.inference_mode():
-                _ = run_moe()
-        else:
-            with torch.inference_mode(), autotune(cache_path="/tmp/moe_autotuner_cache.json"):
-                _ = run_moe()
+        with torch.inference_mode(), autotune(cache_path="/tmp/moe_autotuner_cache.json"):
+            _ = run_moe()
 
         # flashinfer has no capture and replay mechanisms, so we skip test_all_kernels
         use_flashinfer = getattr(backend, "use_flashinfer", False)

@@ -1472,11 +1472,8 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
         **kwargs,
     ):
         forward_args = merge_attention_forward_args(forward_args, kwargs)
-        # attn_sink is aliased from the owning attention nn.Module; it may be
-        # absent or still on CPU pre-migration. The kernel checks dtype but
-        # not device, so gate on is_cuda (null-sink fallback is neutral).
         attn_sink = getattr(self, "attn_sink", None)
-        if attn_sink is not None and attn_sink.data.is_cuda:
+        if attn_sink is not None:
             if forward_args.attention_sinks is None:
                 forward_args = replace(forward_args, attention_sinks=attn_sink.data)
 
