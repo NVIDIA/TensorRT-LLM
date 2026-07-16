@@ -230,15 +230,6 @@ class KvCacheTransceiver(ABC):
     def commit_blocks_for_reuse(self, req: LlmRequest) -> None:
         """Commit received KV blocks to the radix tree for prefix reuse. No-op by default."""
 
-    def should_start_context_transfer_timer(self, req: LlmRequest) -> bool:
-        """Return whether context-side KV transfer timeout should start now."""
-        return True
-
-    def has_context_transfer_wait_timed_out(self, req: LlmRequest,
-                                            current_time: float) -> bool:
-        """Return whether a context send session waited too long for receiver readiness."""
-        return False
-
     def shutdown(self):
         """Shut down the transceiver and release registered resources."""
 

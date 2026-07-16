@@ -54,9 +54,6 @@ def _find_consensus_request_ids(request_ids_all_ranks, sync_size):
 
 
 class KvCacheTransceiverV2(KvCacheTransceiver):
-    _CONTEXT_RECEIVER_WAIT_TIMEOUT_MULTIPLIER = 10
-    _CONTEXT_RECEIVER_WAIT_TIMEOUT_FLOOR_MS = 600_000
-
     def __init__(
         self,
         mapping: Mapping,
@@ -99,7 +96,6 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         self._exchange_rank_info()
 
         self._send_sessions: Dict[int, TxSessionBase] = {}
-        self._send_session_created_times: Dict[int, float] = {}
         self._recv_sessions: Dict[int, RxSessionBase] = {}
         self._send_reqs = {}
         self._recv_reqs = {}
@@ -160,7 +156,6 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         for session in list(self._recv_sessions.values()):
             session.close()
         self._send_sessions.clear()
-        self._send_session_created_times.clear()
         self._send_reqs.clear()
         self._recv_sessions.clear()
         self._recv_reqs.clear()
@@ -465,7 +460,6 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         assert rid is not None
         if rid not in self._send_sessions:
             self._send_sessions[rid] = self._transfer_worker.create_tx_session(req)
-            self._send_session_created_times[rid] = time.monotonic()
         return self._send_sessions[rid]
 
     def _finalize_send(self, req: LlmRequest, session: TxSessionBase):
@@ -484,40 +478,6 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             disagg_info_endpoint=self._context_info_endpoint,
         )
         self._send_reqs[rid] = req
-
-    def should_start_context_transfer_timer(self, req: LlmRequest) -> bool:
-        rid = get_unique_rid(req)
-        if rid is None:
-            return False
-        session = self._send_sessions.get(rid)
-        if session is None:
-            return False
-        status = getattr(session, "status", SessionStatus.INIT)
-        return status not in (
-            SessionStatus.INIT,
-            SessionStatus.ERROR,
-            SessionStatus.CANCELLED,
-        )
-
-    def has_context_transfer_wait_timed_out(self, req: LlmRequest, current_time: float) -> bool:
-        if self.kv_transfer_timeout_ms is None:
-            return False
-        rid = get_unique_rid(req)
-        if rid is None:
-            return False
-        session = self._send_sessions.get(rid)
-        if session is None:
-            return False
-        if getattr(session, "status", SessionStatus.INIT) != SessionStatus.INIT:
-            return False
-        created_time = self._send_session_created_times.get(rid)
-        if created_time is None:
-            return False
-        wait_timeout_ms = max(
-            self.kv_transfer_timeout_ms * self._CONTEXT_RECEIVER_WAIT_TIMEOUT_MULTIPLIER,
-            self._CONTEXT_RECEIVER_WAIT_TIMEOUT_FLOOR_MS,
-        )
-        return (current_time - created_time) * 1000 > wait_timeout_ms
 
     @nvtx_range("KvCacheTransceiverV2.respond_and_send_async")
     def respond_and_send_async(self, req: LlmRequest):
@@ -630,7 +590,6 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             self._send_sessions[rid].close()
             del self._send_reqs[rid]
             del self._send_sessions[rid]
-            self._send_session_created_times.pop(rid, None)
 
         for rid in completed:
             if mark_complete:
@@ -638,10 +597,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             self._send_sessions[rid].close()
             del self._send_reqs[rid]
             del self._send_sessions[rid]
-            self._send_session_created_times.pop(rid, None)
         self._close_failed_sessions(self._send_sessions, self._send_reqs, failed)
-        for rid in failed:
-            self._send_session_created_times.pop(rid, None)
 
         # Sweep orphaned RecvReqInfo entries from ADP broadcast on non-assigned
         # DP ranks (entries that will never have a TxSession created for them).
@@ -787,7 +743,6 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 self._send_sessions[rid].close()
                 del self._send_reqs[rid]
                 del self._send_sessions[rid]
-                self._send_session_created_times.pop(rid, None)
 
         if rid in self._recv_sessions:
             self._recv_sessions[rid].cancel()

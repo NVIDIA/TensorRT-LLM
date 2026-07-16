@@ -25,7 +25,9 @@ from .scheduler import (
     RequestList,
     RequestScheduler,
     SchedulerOutput,
+    _get_forced_context_chunk_size,
     _get_lora_task_id,
+    _is_forced_context_chunk_boundary,
     drop_decoder_context_requests_waiting_for_encoder_output,
 )
 
@@ -595,7 +597,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         if force_chunk:
             # Snapshot boundaries can be shorter than chunk_unit_size.
             assert isinstance(req.expect_snapshot_points, list)
-            chunk_size = req.get_forced_context_chunk_size(context_remaining)
+            chunk_size = _get_forced_context_chunk_size(req, context_remaining)
             budget_context_remaining = context_remaining
         else:
             budget_context_remaining = (
@@ -619,7 +621,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         # Round down to chunk_unit_size boundary only when not hitting the end
         # or a checkpoint.
         if chunk_size < budget_context_remaining and not (
-            force_chunk and req.is_forced_context_chunk_boundary(chunk_size)
+            force_chunk and _is_forced_context_chunk_boundary(req, chunk_size)
         ):
             chunk_size = (chunk_size // self.chunk_unit_size) * self.chunk_unit_size
 

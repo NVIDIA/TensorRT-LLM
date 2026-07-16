@@ -631,51 +631,6 @@ def test_kv_transfer_timeout_silent_when_unset(capfd):
     transceiver_ctx.cancel_request(ctx_request)
 
 
-@pytest.mark.timeout(60)
-def test_python_context_transfer_timer_waits_for_receiver_ready():
-    mapping = Mapping(world_size=1, rank=0)
-    dist = Distributed.get(mapping)
-    kv_cache_manager_ctx = create_kv_cache_manager(mapping, DataType.HALF)
-
-    cache_transceiver_config = CacheTransceiverConfig(
-        backend="NIXL",
-        transceiver_runtime="PYTHON",
-        max_tokens_in_buffer=512,
-        kv_transfer_timeout_ms=100)
-    transceiver_ctx = create_kv_cache_transceiver(mapping, dist,
-                                                  kv_cache_manager_ctx,
-                                                  AttentionTypeCpp.DEFAULT,
-                                                  cache_transceiver_config)
-
-    try:
-        fill_kv_cache_buffer(kv_cache_manager_ctx)
-
-        ctx_request = _build_ctx_request_for_timeout_test(request_id=101)
-        disagg_request_id = uuid.uuid4().int & 0x7FFFFFFFFFFFFFFF
-        ctx_request.py_disaggregated_params = tensorrt_llm.DisaggregatedParams(
-            request_type="context_only", disagg_request_id=disagg_request_id)
-        kv_cache_manager_ctx.impl.add_sequence_batch(
-            [(ctx_request.py_request_id, ctx_request.prompt_len, 1)],
-            [ctx_request])
-
-        transceiver_ctx.respond_and_send_async(ctx_request)
-
-        assert not transceiver_ctx.should_start_context_transfer_timer(
-            ctx_request)
-        assert not transceiver_ctx.has_context_transfer_wait_timed_out(
-            ctx_request, time.monotonic())
-        transceiver_ctx._send_session_created_times[
-            disagg_request_id] = time.monotonic() - 601
-        assert transceiver_ctx.has_context_transfer_wait_timed_out(
-            ctx_request, time.monotonic())
-        transceiver_ctx._send_sessions[disagg_request_id].receiver_ready = True
-        assert transceiver_ctx.should_start_context_transfer_timer(ctx_request)
-        assert not transceiver_ctx.has_context_transfer_wait_timed_out(
-            ctx_request, time.monotonic())
-    finally:
-        shutdown_transceivers(transceiver_ctx)
-
-
 @pytest.mark.timeout(120)
 def test_context_transfer_bounded_poll_keeps_request_in_progress(capfd):
     """A bounded transfer poll must not make a non-ready request terminal."""

@@ -833,27 +833,6 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_result.set_exclude_last_generation_logits(
             exclude_last_generation_logits)
 
-    def next_expected_snapshot_point(self) -> int | None:
-        return min(
-            (point for point in self.expect_snapshot_points
-             if point > self.context_current_position),
-            default=None,
-        )
-
-    def get_forced_context_chunk_size(self, default_chunk_size: int) -> int:
-        if not self.expect_snapshot_points:
-            return min(self.context_remaining_length, default_chunk_size)
-        next_point = self.next_expected_snapshot_point()
-        if next_point is None:
-            return self.context_remaining_length
-        next_position = min(next_point, self.prompt_len)
-        return max(0, next_position - self.context_current_position)
-
-    def is_forced_context_chunk_boundary(self, chunk_size: int) -> bool:
-        next_position = self.context_current_position + chunk_size
-        return (next_position >= self.prompt_len
-                or next_position in self.expect_snapshot_points)
-
     @property
     def cached_tokens(self) -> int:
         return self._cached_tokens

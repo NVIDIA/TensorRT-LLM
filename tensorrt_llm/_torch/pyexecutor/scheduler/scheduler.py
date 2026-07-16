@@ -116,6 +116,28 @@ def _get_lora_task_id(req: LlmRequest):
     return (1, lora_id)
 
 
+def _next_expected_snapshot_point(req: LlmRequest) -> int | None:
+    return min(
+        (point for point in req.expect_snapshot_points if point > req.context_current_position),
+        default=None,
+    )
+
+
+def _get_forced_context_chunk_size(req: LlmRequest, default_chunk_size: int) -> int:
+    if not req.expect_snapshot_points:
+        return min(req.context_remaining_length, default_chunk_size)
+    next_point = _next_expected_snapshot_point(req)
+    if next_point is None:
+        return req.context_remaining_length
+    next_position = min(next_point, req.prompt_len)
+    return max(0, next_position - req.context_current_position)
+
+
+def _is_forced_context_chunk_boundary(req: LlmRequest, chunk_size: int) -> bool:
+    next_position = req.context_current_position + chunk_size
+    return next_position >= req.prompt_len or next_position in req.expect_snapshot_points
+
+
 class ScheduledRequests:
     """Scheduled requests separated into disjoint sets.
 
@@ -886,7 +908,7 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
     @staticmethod
     def _force_chunk_size(req: LlmRequest, tokens_per_block: int) -> int:
         assert isinstance(req.expect_snapshot_points, list)
-        return req.get_forced_context_chunk_size(tokens_per_block)
+        return _get_forced_context_chunk_size(req, tokens_per_block)
 
     def _chunk_forced(self, requests: RequestList, capacity: Optional[int], tokens_per_block: int):
         """Mirrors the kFORCE_CHUNK specialization of setCtxRequestsChunkSize (microBatchScheduler.cpp).

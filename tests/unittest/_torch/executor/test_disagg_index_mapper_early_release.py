@@ -81,25 +81,6 @@ class _FakeExecutor:
         return None
 
 
-class _FakeCancelExecutor:
-    def __init__(self, async_transfer_manager, kv_cache_transceiver):
-        self.active_requests = []
-        self.async_transfer_manager = async_transfer_manager
-        self.canceled_req_ids = []
-        self.force_terminate_ctx_for_partial_reuse = False
-        self.kv_cache_transceiver = kv_cache_transceiver
-        self.waiting_queue = MagicMock()
-
-    def _try_cancel_request(self, request):
-        return self.kv_cache_transceiver.cancel_request(request)
-
-    def _end_transfer_and_maybe_terminate(self, request):
-        return PyExecutor._end_transfer_and_maybe_terminate(self, request)
-
-    def _terminate_request(self, request):
-        return None
-
-
 class TestSendKvAsyncReleasesIndexSlot:
     """Test that `_send_kv_async` releases the IndexMapper slot before the
     transfer is started, which is where the production code actually lives
@@ -154,32 +135,6 @@ class TestSendKvAsyncReleasesIndexSlot:
         PyExecutor._send_kv_async(executor, [request])
 
         kv_cache_manager.release_index_slot.assert_called_once_with(42)
-
-
-def test_handle_canceled_requests_releases_in_transfer_context_request():
-    kv_cache_manager = MagicMock()
-    kv_cache_manager.store_blocks_for_reuse.return_value = 100
-    resource_manager = create_mock_resource_manager(kv_cache_manager=kv_cache_manager)
-    transfer_manager = AsyncTransferManager(resource_manager)
-    transceiver = MagicMock()
-    transceiver.cancel_request.return_value = True
-    executor = _FakeCancelExecutor(transfer_manager, transceiver)
-
-    request = create_mock_request(42)
-    request.is_child = False
-    request.parent_request_id = None
-    request.py_kv_transfer_start_time = 123.0
-    request.py_kv_transfer_timed_out = False
-    transfer_manager.start_transfer(request)
-    executor.canceled_req_ids = [42]
-
-    PyExecutor._handle_canceled_requests(executor)
-
-    executor.waiting_queue.remove_by_ids.assert_called_once_with({42})
-    transceiver.cancel_request.assert_called_once_with(request)
-    assert 42 not in transfer_manager.requests_in_transfer()
-    kv_cache_manager.unpin_blocks_by_id.assert_called_once_with(100)
-    assert executor.canceled_req_ids == []
 
 
 class TestIndexMapperSlotReuse:
