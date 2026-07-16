@@ -55,7 +55,7 @@ unset or when the safety sanitizer rejects the runtime value.
 | `cache_transceiver_config.kv_transfer_sender_future_timeout_ms` | `Optional[Annotated[int, Gt(gt=0)]]` | `value` |  |  |
 | `cache_transceiver_config.kv_transfer_timeout_ms` | `Optional[Annotated[int, Gt(gt=0)]]` | `value` |  |  |
 | `cache_transceiver_config.max_tokens_in_buffer` | `Optional[int]` | `value` |  |  |
-| `cache_transceiver_config.transceiver_runtime` | `Optional[Literal['CPP', 'PYTHON']]` | `categorical` |  | `CPP`, `PYTHON` |
+| `cache_transceiver_config.transceiver_runtime` | `Optional[Literal['CPP', 'PYTHON', 'auto']]` | `categorical` |  | `CPP`, `PYTHON`, `auto` |
 | `context_parallel_size` | `<class 'int'>` | `value` |  |  |
 | `cp_config.block_size` | `Optional[int]` | `value` |  |  |
 | `cp_config.cp_anchor_size` | `Optional[int]` | `value` |  |  |
@@ -376,7 +376,7 @@ unset or when the safety sanitizer rejects the runtime value.
 | `cache_transceiver_config.kv_transfer_sender_future_timeout_ms` | `Optional[Annotated[int, Gt(gt=0)]]` | `value` |  |  |
 | `cache_transceiver_config.kv_transfer_timeout_ms` | `Optional[Annotated[int, Gt(gt=0)]]` | `value` |  |  |
 | `cache_transceiver_config.max_tokens_in_buffer` | `Optional[int]` | `value` |  |  |
-| `cache_transceiver_config.transceiver_runtime` | `Optional[Literal['CPP', 'PYTHON']]` | `categorical` |  | `CPP`, `PYTHON` |
+| `cache_transceiver_config.transceiver_runtime` | `Optional[Literal['CPP', 'PYTHON', 'auto']]` | `categorical` |  | `CPP`, `PYTHON`, `auto` |
 | `calib_config.calib_batch_size` | `<class 'int'>` | `value` |  |  |
 | `calib_config.calib_batches` | `<class 'int'>` | `value` |  |  |
 | `calib_config.calib_max_seq_length` | `<class 'int'>` | `value` |  |  |
