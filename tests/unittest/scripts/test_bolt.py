@@ -61,7 +61,5 @@ def test_select_workloads_no_arg_no_suite(manifest):
 def test_select_workloads_falls_back_to_enabled_suite_entries(manifest, tmp_path):
     pytest.importorskip("yaml")
     suite = tmp_path / "suite.yaml"
-    suite.write_text(
-        "workloads:\n" "  - name: w_enabled\n" "  - name: w_disabled\n" "    enabled: false\n"
-    )
+    suite.write_text("workloads:\n  - name: w_enabled\n  - name: w_disabled\n    enabled: false\n")
     assert manifest.select_workloads(None, suite) == ["w_enabled"]
