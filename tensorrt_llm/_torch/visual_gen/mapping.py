@@ -421,6 +421,34 @@ class VisualGenMapping(DeviceMeshTopologyImpl):
             for b in bases
         ]
 
+    def flatten_cfg_seq_ranks(self) -> list:
+        """Rank lists for the seq-plane groups of the cfg-flattened topology.
+
+        One list per tp coordinate — the seq plane never crosses TP fibers
+        (TP ranks hold different weight shards). Within a list, cp coordinates
+        vary outermost, then cfg, then ulysses: the concatenation order of this
+        tp fiber's :meth:`flatten_cfg_ranks` lists, so at tp=1 the single list
+        equals ``flatten_cfg_ranks()`` flattened. Pure layout arithmetic.
+        """
+        strides, acc = {}, 1
+        for d in reversed(self._dim_names):
+            strides[d] = acc
+            acc *= self._dim_sizes[d]
+        cp_bases = [0]
+        for d in self._dim_names:
+            if d in ("cfg", "tp", "ulysses"):
+                continue
+            cp_bases = [b + strides[d] * v for b in cp_bases for v in range(self._dim_sizes[d])]
+        return [
+            [
+                strides["tp"] * t + b + strides["cfg"] * c + strides["ulysses"] * u
+                for b in cp_bases
+                for c in range(self._dim_sizes["cfg"])
+                for u in range(self._dim_sizes["ulysses"])
+            ]
+            for t in range(self._dim_sizes["tp"])
+        ]
+
     # ------------------------------------------------------------------
     # Rank decomposition
     # ------------------------------------------------------------------

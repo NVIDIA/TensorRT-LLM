@@ -135,14 +135,17 @@ class LTX2Attention(Attention):
             qkv_mode = QKVMode.FUSE_QKV
 
         # Caller opts in via enable_sequence_parallel. Cross-attn supports
-        # Ulysses and distributed Attention2D (SEPARATE_QKV + ring is rejected in
-        # Attention); under ring CP we disable wrappers and fall back to the plain
-        # backend + all-gather in the AV cross-attn forward path.
+        # Ulysses, and distributed Attention2D only WITH Ulysses on top (the AV
+        # dispatch keys the seq-sharded K/V path off the Ulysses wrapper); under
+        # ring CP or attn2d-without-ulysses we disable wrappers and fall back to
+        # the plain backend + all-gather in the AV cross-attn forward path.
         ulysses_size = vgm.ulysses_size if vgm is not None else 1
         cp_size = vgm.cp_size if vgm is not None else 1
         attn2d_active = vgm is not None and vgm.attn2d_row_size * vgm.attn2d_col_size > 1
         if self._is_cross_attn:
-            enable_sp = enable_sequence_parallel and (cp_size == 1 or attn2d_active)
+            enable_sp = enable_sequence_parallel and (
+                cp_size == 1 or (attn2d_active and ulysses_size > 1)
+            )
         else:
             enable_sp = enable_sequence_parallel
 

@@ -1028,17 +1028,26 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
             g = dist.new_group(ranks, use_local_synchronization=False)
             if self.rank in ranks:
                 uly_group = g
-        flat = [r for ranks in fold for r in ranks]
-        if len(fold) == 1:
+        fibers = vgm.flatten_cfg_seq_ranks()
+        if len(fold) == len(fibers):
+            # cp=1: each tp fiber's seq plane IS its ulysses group.
+            my_fiber = next(ranks for ranks in fold if self.rank in ranks)
             seq_group, gather_index = uly_group, None
         else:
-            seq_group = dist.new_group(sorted(flat), use_local_synchronization=False)
-            gather_index = flat
+            seq_group = my_fiber = None
+            for ranks in fibers:
+                g = dist.new_group(sorted(ranks), use_local_synchronization=False)
+                if self.rank in ranks:
+                    seq_group, my_fiber = g, ranks
+            # dist.new_group sorts its rank list; shard s lives on fiber[s], whose
+            # group rank is the position of that global rank in the sorted list.
+            sorted_fiber = sorted(my_fiber)
+            gather_index = [sorted_fiber.index(r) for r in my_fiber]
         return Stage2Groups(
             ulysses_group=uly_group,
             seq_group=seq_group,
-            seq_rank=flat.index(self.rank),
-            seq_size=len(flat),
+            seq_rank=my_fiber.index(self.rank),
+            seq_size=len(my_fiber),
             gather_index=gather_index,
         )
 

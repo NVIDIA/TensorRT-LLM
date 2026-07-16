@@ -367,17 +367,23 @@ def _build_stage2_groups_for_test(vgm):
         g = dist.new_group(ranks, use_local_synchronization=False)
         if rank in ranks:
             uly_group = g
-    flat = [r for ranks in fold for r in ranks]
-    if len(fold) == 1:
+    fibers = vgm.flatten_cfg_seq_ranks()
+    if len(fold) == len(fibers):
+        my_fiber = next(ranks for ranks in fold if rank in ranks)
         seq_group, gather_index = uly_group, None
     else:
-        seq_group = dist.new_group(sorted(flat), use_local_synchronization=False)
-        gather_index = flat
+        seq_group = my_fiber = None
+        for ranks in fibers:
+            g = dist.new_group(sorted(ranks), use_local_synchronization=False)
+            if rank in ranks:
+                seq_group, my_fiber = g, ranks
+        sorted_fiber = sorted(my_fiber)
+        gather_index = [sorted_fiber.index(r) for r in my_fiber]
     return Stage2Groups(
         ulysses_group=uly_group,
         seq_group=seq_group,
-        seq_rank=flat.index(rank),
-        seq_size=len(flat),
+        seq_rank=my_fiber.index(rank),
+        seq_size=len(my_fiber),
         gather_index=gather_index,
     )
 
