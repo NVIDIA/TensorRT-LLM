@@ -1403,11 +1403,7 @@ class _OccurrencePenaltyHandler:
         """Per-slot host-only bookkeeping (never read by the ops)."""
 
         prompt_ignore_length: int
-        counted_len: int
-        """Number of sequence tokens already folded into the workspace."""
         initialized: bool = False
-        has_previous_token: bool = False
-        last_step_was_speculative: bool = False
 
     def __init__(
         self,
@@ -1441,9 +1437,6 @@ class _OccurrencePenaltyHandler:
             )
             self._request_num_steps = torch.empty(
                 max_num_sequences, dtype=torch.int32, device=self._device
-            )
-            self._history_synced = torch.empty(
-                max_num_sequences, dtype=torch.bool, device=self._device
             )
 
     @staticmethod
@@ -1480,10 +1473,7 @@ class _OccurrencePenaltyHandler:
         if prompt_ignore_length > 0:
             self._needs_prefix = True
 
-        state = self._SlotState(
-            prompt_ignore_length=prompt_ignore_length,
-            counted_len=0,
-        )
+        state = self._SlotState(prompt_ignore_length=prompt_ignore_length)
         self._slots[slot] = state
         # Fill the per-slot parameter buffers (once per request; gathered every step).
         self._fill_slot(
@@ -1567,34 +1557,40 @@ class _OccurrencePenaltyHandler:
             self._to_device([slot] * len(prefix_tokens), torch.int64),
             self._to_device(prefix_tokens, torch.int64),
         )
-        state.counted_len = request.py_orig_prompt_len
         state.initialized = True
 
-    def _sync_speculative_request_history(
+    def update_token_counts(
         self,
-        logits: torch.Tensor,
-        requests: list[LlmRequest],
-        synced_slots: set[int],
+        updates: list[tuple[int, list[int]]],
     ) -> None:
-        """Fold newly confirmed speculative tokens into the occurrence workspace."""
+        """Commit finalized sampled tokens that replaced the device pending token.
+
+        This is used after sampler-side postprocessing has finalized a multi-token
+        result. The complete confirmed sequence is counted here, then the raw first
+        token left in ``new_tokens`` is marked consumed so the next kernel cannot count
+        it again. Regular one-token sampling never calls this method and keeps its
+        fused device-pending fast path.
+        """
+        if not updates or self._num_active_slots == 0:
+            return
+
         counts = self.store.counts
         assert counts is not None
+        vocab_size = counts.size(-1)
         counted_slots: list[int] = []
         counted_tokens: list[int] = []
 
-        for request in requests:
-            assert request.py_seq_slot is not None
-            slot = request.py_seq_slot
-            state = self._slots[slot]
-            if slot not in synced_slots or state is None:
+        for slot, tokens in updates:
+            if self._slots[slot] is None:
                 continue
             self._fill_slot(self.store.has_previous_token, slot, False)
-            tokens = request.get_tokens(0)
-            for token in tokens[state.counted_len :]:
-                if 0 <= token < logits.size(-1):
+            for token in tokens:
+                if 0 <= token < vocab_size:
                     counted_slots.append(slot)
                     counted_tokens.append(token)
-            state.counted_len = len(tokens)
+
+        if not counted_tokens:
+            return
 
         update_occurrence_workspace(
             counts,
@@ -1611,7 +1607,6 @@ class _OccurrencePenaltyHandler:
         self,
         logits: torch.Tensor,
         requests: list[LlmRequest],
-        num_steps: list[int],
         *,
         new_tokens: torch.Tensor,
         seq_slots: torch.Tensor,
@@ -1629,49 +1624,23 @@ class _OccurrencePenaltyHandler:
         self._ensure_workspace(logits.size(-1))
         store = self.store
         has_active_request = False
-        history_synced_requests: list[bool] = []
-        history_sync_slots: set[int] = set()
         counts = store.counts
         assert counts is not None
-        for request, steps in zip(requests, num_steps, strict=True):
+        for request in requests:
             assert request.py_seq_slot is not None
             slot = request.py_seq_slot
             state = self._slots[slot]
-            history_synced = False
             if state is not None:
                 has_active_request = True
                 self._initialize_workspace(request, state, logits.size(-1))
-                history_synced = steps > 1 or state.last_step_was_speculative
-                if history_synced:
-                    history_sync_slots.add(slot)
-                elif state.has_previous_token:
-                    # The fused kernel below will fold exactly one regular token into
-                    # counts. Keep the host history cursor aligned without rescanning it.
-                    state.counted_len += 1
-                state.has_previous_token = True
-                state.last_step_was_speculative = steps > 1
-            history_synced_requests.append(history_synced)
 
         if not has_active_request:
             return logits
         num_requests = len(requests)
-        has_history_sync = any(history_synced_requests)
         kernel_request_offsets = self._request_offsets[:num_requests]
         kernel_request_num_steps = self._request_num_steps[:num_requests]
-        kernel_history_synced = self._history_synced[:num_requests]
         kernel_request_offsets.copy_(request_offsets, non_blocking=True)
         kernel_request_num_steps.copy_(request_num_steps, non_blocking=True)
-        if has_history_sync:
-            history_synced_host = torch.tensor(
-                history_synced_requests,
-                dtype=torch.bool,
-                pin_memory=prefer_pinned(),
-            )
-            kernel_history_synced.copy_(history_synced_host, non_blocking=True)
-        # The regular specialization still receives this pointer, but HISTORY_SYNCED=False
-        # makes the Triton compiler remove all loads from the untouched buffer.
-        if history_sync_slots:
-            self._sync_speculative_request_history(logits, requests, history_sync_slots)
         apply_batched_occurrence_penalties_triton(
             logits,
             counts,
@@ -1682,12 +1651,9 @@ class _OccurrencePenaltyHandler:
             seq_slots,
             kernel_request_offsets,
             kernel_request_num_steps,
-            kernel_history_synced,
             store.repetition,
             store.presence,
             store.frequency,
-            max_num_steps=max(num_steps),
-            history_synced=has_history_sync,
         )
         return logits
 
@@ -4044,6 +4010,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             else:
                 return None
 
+        finalized_token_updates: list[tuple[int, list[int]]] = []
         for req_idx, req in enumerate(state.requests):
             if req.state == LlmRequestState.GENERATION_COMPLETE:
                 continue
@@ -4091,6 +4058,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 req.py_rewind_len = 0
             else:
                 processed = 1
+                num_tokens_before = req.get_num_tokens(DEFAULT_BEAM_IDX)
                 num_accepted = self.process_draft_tokens(
                     req,
                     new_tokens_tensor=new_tokens,
@@ -4105,6 +4073,12 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                     req.py_num_accepted_draft_tokens = 0
                     req.py_rewind_len = 0
                 processed += num_accepted
+                if actual_draft_len > 0:
+                    num_new_tokens = req.get_num_tokens(DEFAULT_BEAM_IDX) - num_tokens_before
+                    if num_new_tokens > 0:
+                        assert req.py_seq_slot is not None
+                        confirmed_tokens = req.get_tokens(DEFAULT_BEAM_IDX)[-num_new_tokens:]
+                        finalized_token_updates.append((req.py_seq_slot, confirmed_tokens))
                 self.handle_logprobs(req, logprobs_state_list=logprobs_state_list, count=processed)
             req.py_decoding_iter += 1
             # Check None or empty list
@@ -4112,6 +4086,8 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 self._finish_reasons_handler.store.num_accepted_draft_tokens_host[
                     req.py_seq_slot
                 ] = req.py_num_accepted_draft_tokens
+
+        self._penalty_handler.update_token_counts(finalized_token_updates)
 
     def _return_log_probs(self, requests: list[LlmRequest]) -> bool:
         return any(req.py_return_log_probs for req in requests)
@@ -5072,7 +5048,6 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         logits_cuda = self._penalty_handler.apply(
             logits_cuda,
             sampling_requests,
-            sampling_requests_metadata.req_num_steps.tolist(),
             new_tokens=new_tokens_cuda,
             seq_slots=seq_slots_cuda,
             request_offsets=sampling_requests_metadata.req_offsets,

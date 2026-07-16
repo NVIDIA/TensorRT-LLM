@@ -104,7 +104,6 @@ def _apply_batched_occurrence_penalties_kernel(
     seq_slots_ptr,
     request_offsets_ptr,
     request_num_steps_ptr,
-    request_history_synced_ptr,
     repetition_ptr,
     presence_ptr,
     frequency_ptr,
@@ -117,84 +116,78 @@ def _apply_batched_occurrence_penalties_kernel(
     new_tokens_beam_stride,
     LOGIT_LIMIT: tl.constexpr,
     HAS_PRESENCE_PREFIX: tl.constexpr,
-    HISTORY_SYNCED: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
-    """Update the regular workspace and apply penalties in one pass."""
+    """Update the workspace once and apply it to every row of a request."""
     request_idx = tl.program_id(0)
-    step_idx = tl.program_id(1)
-    vocab_block = tl.program_id(2)
+    vocab_block = tl.program_id(1)
 
     slot = tl.load(seq_slots_ptr + request_idx)
     active = tl.load(active_ptr + slot) != 0
     num_steps = tl.load(request_num_steps_ptr + request_idx)
-    row = tl.load(request_offsets_ptr + request_idx) + step_idx
-    valid_row = active & (step_idx < num_steps)
+    if not active or num_steps <= 0:
+        return
+
+    request_offset = tl.load(request_offsets_ptr + request_idx)
 
     offsets = vocab_block * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     vocab_mask = offsets < vocab
-    mask = vocab_mask & valid_row
 
     count_offset = slot * workspace_row_stride + offsets
-    count = tl.load(counts_ptr + count_offset, mask=mask, other=0)
-    history_synced = False
-    if HISTORY_SYNCED:
-        history_synced = tl.load(request_history_synced_ptr + request_idx) != 0
-    has_previous_token = tl.load(has_previous_token_ptr + slot, mask=valid_row, other=0) != 0
-    accumulate_previous = has_previous_token
-    if HISTORY_SYNCED:
-        accumulate_previous &= ~history_synced
+    count = tl.load(counts_ptr + count_offset, mask=vocab_mask, other=0)
+    has_previous_token = tl.load(has_previous_token_ptr + slot) != 0
     previous_token = tl.load(
         new_tokens_ptr
         + slot * new_tokens_slot_stride
         + 0 * new_tokens_step_stride
         + 0 * new_tokens_beam_stride,
-        mask=valid_row & accumulate_previous,
+        mask=has_previous_token,
         other=-1,
     )
-    count += tl.where(accumulate_previous & (offsets == previous_token), 1, 0)
+    count += tl.where(has_previous_token & (offsets == previous_token), 1, 0)
 
-    logit_offset = row * logits_row_stride + offsets
-    logit = tl.load(logits_ptr + logit_offset, mask=mask, other=0.0).to(tl.float32)
     seen = count > 0
     if HAS_PRESENCE_PREFIX:
         prefix_word_offsets = vocab_block * BLOCK_SIZE // 32 + tl.arange(0, BLOCK_SIZE // 32)
         prefix_words = tl.load(
             presence_prefix_ptr + slot * presence_prefix_row_stride + prefix_word_offsets,
-            mask=valid_row & (prefix_word_offsets < tl.cdiv(vocab, 32)),
+            mask=prefix_word_offsets < tl.cdiv(vocab, 32),
             other=0,
         )
         prefix_seen = (prefix_words[:, None] >> tl.arange(0, 32)[None, :]) & 1
         seen |= prefix_seen.to(tl.int1).reshape(BLOCK_SIZE)
 
-    repetition = tl.load(repetition_ptr + slot, mask=valid_row, other=1.0)
-    presence = tl.load(presence_ptr + slot, mask=valid_row, other=0.0)
-    frequency = tl.load(frequency_ptr + slot, mask=valid_row, other=0.0)
+    repetition = tl.load(repetition_ptr + slot)
+    presence = tl.load(presence_ptr + slot)
+    frequency = tl.load(frequency_ptr + slot)
 
-    repeated = tl.where(logit < 0.0, logit * repetition, logit / repetition)
-    logit = tl.where(seen, repeated, logit)
-    logit -= tl.where(
-        count > 0,
-        presence + frequency * count.to(tl.float32),
-        0.0,
-    )
-    logit = tl.maximum(-LOGIT_LIMIT, tl.minimum(logit, LOGIT_LIMIT))
+    # A request owns one occurrence row. Looping over its packed logits rows in the
+    # same program ensures every speculative row observes the same updated history;
+    # separate step programs would race with the count store below. Use the runtime
+    # request length so step counts do not create separate compiled kernel variants.
+    for step_idx in tl.range(0, num_steps):
+        logit_offset = (request_offset + step_idx) * logits_row_stride + offsets
+        logit = tl.load(logits_ptr + logit_offset, mask=vocab_mask, other=0.0).to(tl.float32)
 
-    tl.store(logits_ptr + logit_offset, logit.to(logits_ptr.dtype.element_ty), mask=mask)
-    # Regular non-speculative requests have one logits row. Store the incremented
-    # count from that row so the next sampling step observes it.
-    if HISTORY_SYNCED:
-        tl.store(
-            counts_ptr + count_offset,
-            count,
-            mask=mask & (step_idx == 0) & ~history_synced,
+        repeated = tl.where(logit < 0.0, logit * repetition, logit / repetition)
+        logit = tl.where(seen, repeated, logit)
+        logit -= tl.where(
+            count > 0,
+            presence + frequency * count.to(tl.float32),
+            0.0,
         )
-    else:
-        tl.store(counts_ptr + count_offset, count, mask=mask & (step_idx == 0))
+        logit = tl.maximum(-LOGIT_LIMIT, tl.minimum(logit, LOGIT_LIMIT))
+        tl.store(
+            logits_ptr + logit_offset,
+            logit.to(logits_ptr.dtype.element_ty),
+            mask=vocab_mask,
+        )
+
+    tl.store(counts_ptr + count_offset, count, mask=vocab_mask)
     tl.store(
         has_previous_token_ptr + slot,
         1,
-        mask=valid_row & (step_idx == 0) & (vocab_block == 0),
+        mask=vocab_block == 0,
     )
 
 
@@ -208,25 +201,19 @@ def apply_batched_occurrence_penalties_triton(
     seq_slots: torch.Tensor,
     request_offsets: torch.Tensor,
     request_num_steps: torch.Tensor,
-    request_history_synced: torch.Tensor | None,
     repetition: torch.Tensor,
     presence: torch.Tensor,
     frequency: torch.Tensor,
-    *,
-    max_num_steps: int,
-    history_synced: bool = False,
 ) -> torch.Tensor:
-    """Apply regular occurrence penalties before downstream temperature handling."""
+    """Apply occurrence penalties before downstream temperature handling."""
     num_requests = seq_slots.numel()
     if num_requests == 0:
         return logits
 
     vocab = logits.size(-1)
     block_size = 1024
-    grid = (num_requests, max_num_steps, triton.cdiv(vocab, block_size))
+    grid = (num_requests, triton.cdiv(vocab, block_size))
     has_presence_prefix = presence_prefix is not None
-    if history_synced:
-        assert request_history_synced is not None
     _apply_batched_occurrence_penalties_kernel[grid](
         logits,
         counts,
@@ -237,7 +224,6 @@ def apply_batched_occurrence_penalties_triton(
         seq_slots,
         request_offsets,
         request_num_steps,
-        request_history_synced if request_history_synced is not None else request_num_steps,
         repetition,
         presence,
         frequency,
@@ -250,7 +236,6 @@ def apply_batched_occurrence_penalties_triton(
         new_tokens.stride(2),
         LOGIT_LIMIT=torch.finfo(logits.dtype).max,
         HAS_PRESENCE_PREFIX=has_presence_prefix,
-        HISTORY_SYNCED=history_synced,
         BLOCK_SIZE=block_size,
         num_warps=4,
     )
