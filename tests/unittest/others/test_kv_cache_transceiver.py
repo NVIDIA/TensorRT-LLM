@@ -237,6 +237,7 @@ def _run_cpp_nixl_sync_transfer_stress():
     dist = Distributed.get(mapping)
     manager_kwargs = {
         "max_tokens": request_count * prompt_len * 2,
+        # This test validates transfer only, so no decode capacity is needed.
         "max_seq_len": prompt_len,
         "max_batch_size": request_count,
     }
@@ -279,7 +280,7 @@ def _run_cpp_nixl_sync_transfer_stress():
 
         def poll_context_transfers():
             completed, failed = transceiver_ctx.check_context_transfer_status(1)
-            assert failed == []
+            assert failed == [], f"context transfers failed: {failed}"
             completed_ctx_ids.update(completed)
 
         for request_index, ctx_request in enumerate(ctx_requests):
@@ -410,6 +411,7 @@ def test_cancel_request_in_transmission(attention_type):
 
     # Block the main thread due to the async operation
     time.sleep(2)
+    kv_cache_transceiver_gen.check_gen_transfer_status(0)
     assert gen_request.state == LlmRequestState.DISAGG_TRANS_ERROR
 
 
@@ -837,9 +839,7 @@ def hybrid_dtypes(request):
     ],
     indirect=["hybrid_dtypes"],
 )
-def test_hybrid_cache_transceiver_single_process(backend, hybrid_dtypes,
-                                                 monkeypatch):
-    monkeypatch.setenv("TRTLLM_USE_CPP_MAMBA", "1")
+def test_hybrid_cache_transceiver_single_process(backend, hybrid_dtypes):
     mapping = Mapping(world_size=1, rank=0)
     kv_dtype, mamba_conv_dtype, mamba_ssm_dtype = hybrid_dtypes
 
@@ -951,8 +951,7 @@ def test_hybrid_cache_transceiver_single_process(backend, hybrid_dtypes,
 
 @pytest.mark.timeout(120)
 @pytest.mark.parametrize("backend", ["NIXL", "UCX"], ids=["NIXL", "UCX"])
-def test_hybrid_cache_transceiver_cancel_request(backend, monkeypatch):
-    monkeypatch.setenv("TRTLLM_USE_CPP_MAMBA", "1")
+def test_hybrid_cache_transceiver_cancel_request(backend):
 
     mapping = Mapping(world_size=1, rank=0)
     dtype = DataType.HALF
@@ -1027,4 +1026,5 @@ def test_hybrid_cache_transceiver_cancel_request(backend, monkeypatch):
 
     # Block the main thread due to the async operation
     time.sleep(2)
+    cache_transceiver_gen.check_gen_transfer_status(0)
     assert gen_request.state == LlmRequestState.DISAGG_TRANS_ERROR

@@ -38,6 +38,7 @@ from typing import (
 import numpy as np
 import torch
 
+from tensorrt_llm._torch.flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from tensorrt_llm._torch.pyexecutor.make_decoding_batch_input_output import (
     MakeDecodingBatchInputOutput,
 )
@@ -87,16 +88,16 @@ from ..finish_reason import FinishedState
 from ..llm_request import LlmRequest, LlmRequestState, get_draft_token_length
 from ..resource_manager import ResourceManager, ResourceManagerType
 from ..scheduler import ScheduledRequests
-from .ops.interface import SamplerConfig, resolve_sampling_backend
 from .sampling_utils import (
     BEAM_SEARCH_PAD_TOKEN,
     GREEDY,
     BeamSearchMetadata,
+    FlashInferGroupedStrategySampler,
+    Fusions,
     GenericStrategyKeyType,
     Strategy,
     StrategyMetadata,
     UtilsSamplingParams,
-    _Fusions,
     get_rejected_indices,
     resolve_sampling_strategy,
     sample,
@@ -2321,7 +2322,6 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         max_beam_width: int
         max_total_draft_tokens: int
         disable_overlap_scheduler: bool = False
-        disable_flashinfer_sampling: bool = False
         enable_async_worker: bool = False
         enable_speculative_beam_history_d2h: bool = False
 
@@ -2345,13 +2345,15 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         self.LOGPROBS_SHAPE = (self.max_num_sequences, self.max_beam_width, self.max_tokens)
         self.TOPK_LOGPROBS_SHAPE = (self.max_num_sequences, self.max_tokens, self.max_topk_logprobs)
 
-        self._grouped_sampler_cls = resolve_sampling_backend(
-            is_cuda=True,
-            config=SamplerConfig(
-                # IS_FLASHINFER_AVAILABLE is checked inside resolve_sampling_backend.
-                use_flashinfer=not args.disable_flashinfer_sampling,
-            ),
-        )
+        # The Torch sampler hard-depends on flashinfer. Enforce it once here, at
+        # construction, so the check stays out of the CUDA-graph-captured
+        # sampling loop.
+        if not IS_FLASHINFER_AVAILABLE:
+            raise ImportError(
+                "flashinfer is not available, please install the version pinned "
+                "in requirements.txt."
+            )
+        self._grouped_sampler_cls = FlashInferGroupedStrategySampler
 
         # AutoDeploy build creates the sampler in inference mode,
         # which would disallow in-place mutating of new_tokens.
@@ -2541,31 +2543,6 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 )
             return True
         return False
-
-    def _handle_finish_reasons(
-        self,
-        request: LlmRequest,
-        finish_reasons: torch.Tensor,
-        finish_reasons_list: list[list[list[int]]],
-    ) -> bool:
-        """Check if all beams of a request have finished and set the request state accordingly
-
-        Args:
-            request: LlmRequest. The request to check.
-            finish_reasons: torch.Tensor. Shape: (max_tokens, max_batch_size, max_beam_width)
-                            The finish reasons for each beam.
-            finish_reasons_list: list[list[list[int]]]. The finish reasons for each beam.
-        Returns:
-            True if all beams have finished, False otherwise.
-        """
-        assert request.py_seq_slot is not None
-        beam_width = request.py_beam_width
-        return self._handle_finish_reasons_impl(
-            request,
-            beam_width,
-            finish_reasons[DEFAULT_STEP_IDX, request.py_seq_slot],
-            finish_reasons_list[request.py_seq_slot][DEFAULT_STEP_IDX],
-        )
 
     def _handle_first_finish_reasons(
         self,
@@ -3197,8 +3174,10 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             pin_memory=pin_memory,
             dtype=torch.int32,
         )
-        logprobs_tensor = logprobs_tensor_full[:, :-preallocate_extra_steps, :]
-        logprobs_indices_tensor = logprobs_indices_tensor_full[:, :-preallocate_extra_steps, :]
+        # NB: forward slicing, because [:, :-0, :] would yield an empty view
+        #     instead of the full history when preallocate_extra_steps == 0.
+        logprobs_tensor = logprobs_tensor_full[:, :num_generated_tokens, :]
+        logprobs_indices_tensor = logprobs_indices_tensor_full[:, :num_generated_tokens, :]
         if logprobs_tensor.numel() > 0:
             logprobs_list = request.py_result.log_probs
             assert logprobs_list is not None
@@ -4215,7 +4194,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 logit_indices_for_raw_logprobs_cuda += batch_next_tokens_offset_start
                 # NB: Copy could be avoided by storing logit indices (and temperature) instead (cf. comment on
                 #     processed logprobs above).
-                _Fusions.gather_scatter(
+                Fusions.gather_scatter(
                     batch_logits_for_logprobs_cuda,
                     logit_indices_for_raw_logprobs_cuda,
                     group_logits_cuda,
@@ -4301,44 +4280,53 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
     def _apply_min_length_penalty(
         logits: torch.Tensor,
         requests: list[LlmRequest],
-        num_steps: list[int],
-        num_beams: list[int],
-    ) -> torch.Tensor:
-        """Inplace apply min_length_penalty to logits.
+        num_steps_tensor: torch.Tensor,
+        num_beams_tensor: torch.Tensor,
+    ) -> None:
+        """Apply min_length_penalty to logits, mutating ``logits`` in place.
 
         Args:
             logits: The logits to apply min length penalty to
             requests: The requests to apply min length penalty to
-            num_steps: The number of steps per request
-
-        Returns:
-            The logits with min length penalty applied
+            num_steps_tensor: The number of steps per request (host tensor)
+            num_beams_tensor: The number of beams per request (host tensor)
         """
         if not any(
             r.py_min_length and (r.max_beam_num_tokens - r.py_orig_prompt_len) < r.py_min_length[0]
             for r in requests
         ):
-            return logits
+            return
+
+        # Deferred host conversion: only needed on the (rare) penalty path.
+        num_steps = num_steps_tensor.tolist()
+        num_beams = num_beams_tensor.tolist()
 
         rows: list[int] = []
         cols: list[int] = []
         current_offset = 0
         for index, r in enumerate(requests):
-            if r.py_min_length:
-                # Use the original end_id (before ignore_eos override)
-                # so we suppress the real EOS token, not token -1.
-                end_id = getattr(r, "py_original_end_id", r.py_end_id)
-                if end_id is not None and end_id > -1:
-                    for beam_idx in range(num_beams[index]):
-                        for step in range(num_steps[index]):
-                            if (
-                                r.get_num_tokens(beam_idx) - r.py_orig_prompt_len
-                            ) + step < r.py_min_length[0]:
-                                rows.append(current_offset + num_steps[index] * beam_idx + step)
-                                cols.append(end_id)
-                            else:
-                                break
+            # Advance the offset before any guard below can skip the request:
+            # every request occupies its logits rows, penalized or not.
+            req_offset = current_offset
             current_offset += num_steps[index] * num_beams[index]
+
+            if not r.py_min_length:
+                continue
+            # Use the original end_id (before ignore_eos override)
+            # so we suppress the real EOS token, not token -1.
+            end_id = getattr(r, "py_original_end_id", r.py_end_id)
+            if end_id is None or end_id <= -1:
+                continue
+
+            for beam_idx in range(num_beams[index]):
+                for step in range(num_steps[index]):
+                    if (r.get_num_tokens(beam_idx) - r.py_orig_prompt_len) + step < r.py_min_length[
+                        0
+                    ]:
+                        rows.append(req_offset + num_steps[index] * beam_idx + step)
+                        cols.append(end_id)
+                    else:
+                        break
 
         if rows:
             neg_inf = torch.full((), float("-inf"), dtype=logits.dtype, device=logits.device)
@@ -4349,8 +4337,6 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 logits.device, non_blocking=True
             )
             logits.index_put_((row_idx, col_idx), neg_inf, accumulate=False)
-
-        return logits
 
     @staticmethod
     def _select_generated_logits(
@@ -4464,37 +4450,6 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
 
         return sampling_requests, sampling_requests_metadata, logits_cuda
 
-    @staticmethod
-    def _longest_stop_word_len(requests: Iterable[LlmRequest]) -> int:
-        max_stop_word_len = 0
-        for req in requests:
-            assert req.py_stop_words_list is not None
-            _, cumsum = req.py_stop_words_list
-            if -1 in cumsum:
-                cumsum = cumsum[: cumsum.index(-1)]
-            request_max_stop_word_len = np.max(np.diff(cumsum, prepend=0), initial=0).item()
-            max_stop_word_len = max(max_stop_word_len, request_max_stop_word_len)
-        return max_stop_word_len
-
-    @staticmethod
-    def _requests_with_stop_words(requests: list[LlmRequest]) -> list[LlmRequest]:
-        return [
-            r
-            for r in requests
-            if (r.py_stop_words_list is not None and len(r.py_stop_words_list[0]) > 0)
-        ]
-
-    def _request_indices_with_stop_words(self, requests: list[LlmRequest]) -> torch.Tensor:
-        return torch.tensor(
-            [
-                ridx
-                for ridx, r in enumerate(requests)
-                if (r.py_stop_words_list is not None and len(r.py_stop_words_list[0]) > 0)
-            ],
-            dtype=torch.int32,
-            pin_memory=prefer_pinned(),
-        ).to(device="cuda", non_blocking=True)
-
     @nvtx_range("_process_logprobs")
     def _process_logprobs(
         self,
@@ -4561,7 +4516,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             )
 
             # (batch_size, vocab_size)
-            group_logprobs_cuda = _Fusions.gather_log_softmax(
+            group_logprobs_cuda = Fusions.gather_log_softmax(
                 batched_sampling_result.batch_logits_for_logprobs_cuda, group_logits_indices_cuda
             )
 
@@ -4598,10 +4553,10 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             sampled_indices_cuda = group_next_tokens_cuda.squeeze(1)
 
             # sampled_rank_cuda contains the 0-based rank, it will be corrected to 1-based in handle_logprobs
-            # NB: Computation of sampled rank could be lowered into GroupedStrategySampler, s.t., e.g., for
+            # NB: Computation of sampled rank could be lowered into FlashInferGroupedStrategySampler, s.t., e.g., for
             #     greedy sampling, logits management and log_softmax could be completely skipped (sampled rank
             #     computation is trivial in this case).
-            sampled_rank_cuda = _Fusions.determine_sampled_rank(
+            sampled_rank_cuda = Fusions.determine_sampled_rank(
                 group_logprobs_cuda, sampled_vals_cuda
             )
 
@@ -4688,11 +4643,11 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             logits_cuda, sampling_requests, sampling_requests_metadata.req_num_steps
         )
 
-        logits_cuda = self._apply_min_length_penalty(
+        self._apply_min_length_penalty(
             logits_cuda,
             sampling_requests,
-            sampling_requests_metadata.req_num_steps.tolist(),
-            sampling_requests_metadata.req_num_beams.tolist(),
+            sampling_requests_metadata.req_num_steps,
+            sampling_requests_metadata.req_num_beams,
         )
 
         # Fast path for greedy sampling
@@ -4846,6 +4801,7 @@ class TRTLLMSampler(Sampler[SampleStateTRTLLM], AsyncWorkerMixin):
         decoding_config: Optional[DecodingConfig] = None,
         kv_cache_config: Optional[KvCacheConfig] = None,
         enable_async_worker: bool = False,
+        max_num_sequences: Optional[int] = None,
     ):
         assert model.config is not None
         vocab_size = model.config.vocab_size
@@ -4864,11 +4820,16 @@ class TRTLLMSampler(Sampler[SampleStateTRTLLM], AsyncWorkerMixin):
         )
         self.max_batch_size = max_batch_size
         self.max_beam_width = max_beam_width
-        self.max_num_sequences = mapping.pp_size * max_batch_size
         self.max_seq_idle_microseconds = 180 * 1000 * 1000
         self.is_trt_overlap = not disable_overlap_scheduler
         self.num_micro_batches = (
             mapping.pp_size if mapping.pp_size > 1 else (2 if self.is_trt_overlap else 1)
+        )
+        # Decoder state is indexed by sequence slot and must match the
+        # executor's SeqSlotManager. The fallback preserves the established
+        # sizing for direct callers outside the PyExecutor creator.
+        self.max_num_sequences = (
+            max_num_sequences if max_num_sequences is not None else mapping.pp_size * max_batch_size
         )
         self.micro_batch_idx = 0
 

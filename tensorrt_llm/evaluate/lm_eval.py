@@ -17,7 +17,7 @@ import json
 import os
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 import click
 import numpy as np
@@ -33,7 +33,6 @@ except ImportError:
     TemplateLM = object
 
 from .. import LLM as PyTorchLLM
-from .._tensorrt_engine import LLM
 from ..inputs import (ConversationMessage, MultimodalDataTracker,
                       add_multimodal_placeholders, convert_image_mode)
 from ..inputs.content_format import ContentFormat
@@ -55,7 +54,7 @@ LM_EVAL_DEFAULT_IMAGE_PLACEHOLDER = "<image>"
 class LmEvalWrapper(TemplateLM):
 
     def __init__(self,
-                 llm: Union[LLM, PyTorchLLM],
+                 llm: PyTorchLLM,
                  sampling_params: Optional[SamplingParams] = None,
                  streaming: bool = False,
                  chat_template_kwargs: Optional[dict[str, Any]] = None,
@@ -199,7 +198,7 @@ class MultimodalLmEvalWrapper(LmEvalWrapper):
     """
 
     def __init__(self,
-                 llm: Union[LLM, PyTorchLLM],
+                 llm: PyTorchLLM,
                  sampling_params: Optional[SamplingParams] = None,
                  streaming: bool = False,
                  max_images: int = 999,
@@ -263,7 +262,7 @@ class MultimodalLmEvalWrapper(LmEvalWrapper):
         self.interleave = MULTIMODAL_PLACEHOLDER_REGISTRY.get_interleave_placeholders(
             self.model_type)
 
-    def _get_model_type(self, llm: Union[LLM, PyTorchLLM]) -> str:
+    def _get_model_type(self, llm: PyTorchLLM) -> str:
         """Extract model type from the model configuration."""
         config_path = os.path.join(llm._hf_model_dir, 'config.json')
 
@@ -602,7 +601,7 @@ class LmEvalEvaluator(Evaluator):
         logger.info(f"Results saved to {result_path}")
 
     def evaluate(self,
-                 llm: Union[LLM, PyTorchLLM],
+                 llm: PyTorchLLM,
                  sampling_params: Optional[SamplingParams] = None,
                  streaming: bool = False,
                  scores_filter: str = None,
@@ -663,7 +662,7 @@ class LmEvalEvaluator(Evaluator):
 
     @classmethod
     def command_harness(cls, ctx, **kwargs):
-        llm: Union[LLM, PyTorchLLM] = ctx.obj
+        llm: PyTorchLLM = ctx.obj
 
         # Resolve the post-processor: accept a callable (already-bound) or the
         # string key "strip_thinking_mmmu" coming from CLI flags.
@@ -1336,7 +1335,7 @@ class LongBenchV1(LmEvalEvaluator):
         return None
 
     def evaluate(self,
-                 llm: Union[LLM, PyTorchLLM],
+                 llm: PyTorchLLM,
                  sampling_params: Optional[SamplingParams] = None,
                  streaming: bool = False) -> float:
         import lm_eval
@@ -1445,7 +1444,7 @@ class LongBenchV1(LmEvalEvaluator):
     @click.pass_context
     @staticmethod
     def command(ctx, **kwargs) -> None:
-        llm: Union[LLM, PyTorchLLM] = ctx.obj
+        llm: PyTorchLLM = ctx.obj
 
         evaluator = LongBenchV1(
             dataset_path=kwargs.pop("dataset_path", None),

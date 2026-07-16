@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import bisect
 import contextlib
 import functools
@@ -19,7 +22,7 @@ from tensorrt_llm._utils import (is_trace_enabled, maybe_pin_memory, nvtx_range,
                                  prefer_pinned, release_gc, torch_dtype_to_str,
                                  trace_func)
 from tensorrt_llm.bindings.internal.runtime import TaskLayerModuleConfig
-from tensorrt_llm.inputs.multimodal import (MultimodalParams,
+from tensorrt_llm.inputs.multimodal import (MultimodalInput, MultimodalParams,
                                             MultimodalRuntimeData,
                                             _has_mm_payload_keys,
                                             check_mm_embed_cumsum_if_needed,
@@ -151,6 +154,25 @@ def _filter_piecewise_capture_num_tokens(
         if max_capturable_num_tokens < i <= max_num_tokens
     })
     return kept, unrecordable
+
+
+def _build_request_multimodal_input(
+        request: LlmRequest, cache_enabled: bool) -> Optional[MultimodalInput]:
+    # Skip building this input (and its `from_components` validation) when the cache is disabled.
+    if not cache_enabled or request.multimodal_hashes is None:
+        return None
+    # `multimodal_input` is consumed only by the encoder-cache key path
+    # (`MultimodalModelMixin._encoder_cache_keys`), which uses UUID-aware multimodal hashes
+    # internally. Although the `multimodal_uuids` are not exposed as an attribute, they remain in
+    # the backing C++ request for KV-cache block keys and cache events.
+    return MultimodalInput.from_components(
+        request.multimodal_hashes,
+        request.multimodal_positions,
+        request.multimodal_lengths,
+        mm_item_run_cu_offsets=request.multimodal_item_run_cu_offsets,
+        mm_run_positions=request.multimodal_run_positions,
+        mm_run_lengths=request.multimodal_run_lengths,
+    )
 
 
 def _filter_cuda_graph_batch_sizes(cuda_graph_batch_sizes: list[int],
@@ -296,6 +318,13 @@ class PyTorchModelEngine(ModelEngine):
         self.mapping = mapping
         if mapping.has_pp():
             init_pp_comm(mapping)
+        # Start with the established pool size. Once the model is loaded we
+        # selectively enable headroom for the non-PP DeepSeek-V4 overlap path.
+        from ._util import (compute_max_num_sequences,
+                            should_enable_dsv4_adp_dummy_fixes,
+                            should_enable_dsv4_overlap_headroom)
+        self.max_num_seq_slots = compute_max_num_sequences(
+            mapping, self.batch_size, llm_args.disable_overlap_scheduler)
         self.dist = dist
         if dist is not None:
             ExpertStatistic.create(self.dist.rank)
@@ -351,7 +380,11 @@ class PyTorchModelEngine(ModelEngine):
             trust_remote_code=llm_args.trust_remote_code,
             **input_processor_kwargs)
         self.input_processor_with_hash = create_input_processor_with_hash(
-            self.input_processor)
+            self.input_processor,
+            encoder_cache_enabled=(
+                llm_args.multimodal_config is not None
+                and llm_args.multimodal_config.encoder_cache_max_bytes > 0),
+        )
         if model is None:
             lora_config: Optional[
                 LoraConfig] = None if is_draft_model else llm_args.lora_config
@@ -373,6 +406,23 @@ class PyTorchModelEngine(ModelEngine):
                 setattr(self, "moe_load_balancer", moe_load_balancer)
         else:
             self.model = model
+        pretrained_config = self.model.model_config.pretrained_config
+        model_type = getattr(pretrained_config, "model_type", None)
+        # Keep the scheduler/dummy fix model-scoped, while the larger slot pool
+        # is restricted to the validated MTP overlap configuration. PP remains
+        # on its established path for follow-up changes.
+        self._enable_dsv4_adp_dummy_fixes = (should_enable_dsv4_adp_dummy_fixes(
+            model_type, mapping))
+        self._enable_dsv4_overlap_headroom = (
+            should_enable_dsv4_overlap_headroom(
+                model_type, spec_config, mapping,
+                llm_args.disable_overlap_scheduler))
+        self.max_num_seq_slots = compute_max_num_sequences(
+            mapping,
+            self.batch_size,
+            llm_args.disable_overlap_scheduler,
+            enable_overlap_headroom=self._enable_dsv4_overlap_headroom,
+        )
         if drafting_loop_wrapper is not None:
             self.model = drafting_loop_wrapper(self.model)
             self.model_is_wrapped = True
@@ -810,6 +860,13 @@ class PyTorchModelEngine(ModelEngine):
         logger.debug(f"Detected use_mrope: {use_mrope}")
         return use_mrope
 
+    @functools.cached_property
+    def _mm_encoder_cache_enabled(self) -> bool:
+        """Whether the multimodal encoder cache is active for this model."""
+        multimodal_config = self.model.model_config.multimodal_config
+        return (multimodal_config is not None
+                and multimodal_config.encoder_cache_max_bytes > 0)
+
     @property
     def is_warmup(self):
         return getattr(self, "_is_warmup", False)
@@ -1142,11 +1199,22 @@ class PyTorchModelEngine(ModelEngine):
                                                     num_tokens, num_gen_tokens),
                         resource_manager) as batch:
                     if batch is None and self.mapping.tp_size <= 1:
-                        continue  # Not enough KV cache space (single rank, safe to skip)
+                        # Safe to skip, but never silently: a skip during KV
+                        # cache estimation makes the profiling peak
+                        # unrepresentative of this shape.
+                        logger.warning(
+                            f"Skipping general warmup with {num_tokens} tokens "
+                            f"({num_gen_tokens} generation): not enough KV "
+                            f"cache space.")
+                        continue
                     self._assert_all_tp_ranks_have_warmup_batch(
                         batch, num_tokens)
                     if batch is None:
-                        continue  # All ranks agree: not enough space
+                        logger.warning(
+                            f"Skipping general warmup with {num_tokens} tokens "
+                            f"({num_gen_tokens} generation): not enough KV "
+                            f"cache space on any TP rank.")
+                        continue
                     logger.info(
                         f"Run warmup with {num_tokens} tokens, include {num_gen_tokens} generation tokens"
                     )
@@ -1539,7 +1607,14 @@ class PyTorchModelEngine(ModelEngine):
                         with self._release_batch_context(
                                 warmup_request, resource_manager) as batch:
                             if batch is None:
-                                # No KV cache space, cannot continue capturing graphs
+                                # No KV cache space for this batch size. During KV
+                                # cache estimation this makes the profiling peak
+                                # unrepresentative (the final executor still
+                                # captures this graph), so don't skip silently.
+                                logger.warning(
+                                    f"Skipping CUDA graph warmup ({label}) for "
+                                    f"batch size={bs}, draft_len={draft_len}: "
+                                    f"not enough KV cache space.")
                                 continue
                             logger.info(
                                 f"Run generation-only CUDA graph warmup ({label}) "
@@ -2155,6 +2230,11 @@ class PyTorchModelEngine(ModelEngine):
             spec_resource_manager: Optional[BaseResourceManager],
             no_cache=False):
         spec_config = self.spec_config if self.enable_spec_decode else None
+        # Only the scoped DeepSeek-V4 overlap path opts into larger metadata
+        # buffers. Passing None preserves the established max_num_requests
+        # fallback for every other model, including MTP-Eagle with PP.
+        num_seq_slots = (self.max_num_seq_slots
+                         if self._enable_dsv4_overlap_headroom else None)
         if no_cache:
             return get_spec_metadata(
                 spec_config,
@@ -2163,7 +2243,8 @@ class PyTorchModelEngine(ModelEngine):
                 max_num_tokens=self.max_num_tokens,
                 spec_resource_manager=spec_resource_manager,
                 is_draft_model=self.is_draft_model,
-                max_seq_len=self.max_seq_len)
+                max_seq_len=self.max_seq_len,
+                num_seq_slots=num_seq_slots)
 
         if self.spec_metadata is not None:
             return self.spec_metadata
@@ -2174,7 +2255,8 @@ class PyTorchModelEngine(ModelEngine):
             max_num_tokens=self.max_num_tokens,
             spec_resource_manager=spec_resource_manager,
             is_draft_model=self.is_draft_model,
-            max_seq_len=self.max_seq_len)
+            max_seq_len=self.max_seq_len,
+            num_seq_slots=num_seq_slots)
         return self.spec_metadata
 
     def cleanup(self) -> None:
@@ -3250,6 +3332,10 @@ class PyTorchModelEngine(ModelEngine):
         draft_tokens = []
         draft_lens = []
         gen_request_seq_slots = []  # per generation request
+        # One-model rejection: slots of gen requests that produced 0 real draft
+        # tokens this step (marked in _handle_dynamic_draft_len); their stale
+        # draft_probs rows are one-hot'd after spec_metadata.prepare().
+        padding_gen_slots = []
         multimodal_params_list = []
         mrope_position_ids = [
         ]  # (start_idx, end_idx, (3,1,L) mrope_pos_ids) per multimodal request
@@ -3376,6 +3462,8 @@ class PyTorchModelEngine(ModelEngine):
                 )
 
             multimodal_params = MultimodalParams(
+                multimodal_input=_build_request_multimodal_input(
+                    request, self._mm_encoder_cache_enabled),
                 multimodal_data=request.py_multimodal_data,
                 multimodal_runtime=py_multimodal_runtime,
                 input_ids_start_offset=context_start_idx)
@@ -3496,6 +3584,10 @@ class PyTorchModelEngine(ModelEngine):
             self.runtime_draft_len)
         runtime_draft_token_buffer_width = runtime_tokens_per_gen_step - 1
         for request in extend_requests:
+            if getattr(request, "py_needs_onehot_draft_probs", False):
+                if request.py_seq_slot is not None:
+                    padding_gen_slots.append(request.py_seq_slot)
+                request.py_needs_onehot_draft_probs = False  # consume once
             request_ids.append(request.py_request_id)
             request_accepted_path[
                 request.
@@ -4007,7 +4099,11 @@ class PyTorchModelEngine(ModelEngine):
             self.previous_kv_lens_offsets_cuda *= 0
 
         position_ids = self._apply_position_id_offset(position_ids)
-        if self.use_mrope and mrope_position_ids:
+        # Use the (3,1,N) MRoPE layout whenever the model declares MRoPE, even
+        # for text-only batches: keeping position_ids rank-consistent between
+        # warmup and serving keeps torch.compile guards stable, so piecewise
+        # CUDA graphs captured at warmup remain usable at runtime.
+        if self.use_mrope:
             # Mixed batches may have only some requests with multimodal MRoPE
             # data. Seed the full (3,1,N) buffer from scalar position_ids
             # (text-only tokens get the same value on all 3 axes), then
@@ -4166,7 +4262,10 @@ class PyTorchModelEngine(ModelEngine):
         if attn_metadata.padded_num_tokens is not None:
             self.input_ids_cuda[total_num_tokens:padded_num_tokens].fill_(0)
             virtual_num_tokens = padded_num_tokens
-            if self.use_mrope and mrope_position_ids:
+            # Match the rank of the unpadded branch: MRoPE models always use
+            # the (3,1,N) layout (see the seeding block above), so the padded
+            # view must stay 3D as well to keep torch.compile guards stable.
+            if self.use_mrope:
                 # Zero-fill padding on dim 2 (token dim) of (3,1,N) buffer.
                 self.mrope_position_ids_cuda[:, :, total_num_tokens:
                                              padded_num_tokens].fill_(0)
@@ -4231,6 +4330,11 @@ class PyTorchModelEngine(ModelEngine):
             spec_metadata.populate_sampling_params_for_one_model(
                 scheduled_requests.all_requests())
             spec_metadata.prepare()
+            # One-model rejection: one-hot the stale draft_probs rows of gen
+            # requests that produced no draft tokens this step, so the (possibly
+            # captured) rejection kernel reads a legal placeholder distribution.
+            spec_metadata.write_padding_onehot_draft_probs(
+                padding_gen_slots, self.runtime_draft_len)
             inputs['spec_metadata'] = spec_metadata
 
             if self.enable_attention_dp:
@@ -4304,6 +4408,8 @@ class PyTorchModelEngine(ModelEngine):
             # Multimodal
             if request.py_multimodal_data is not None:
                 multimodal_params = MultimodalParams(
+                    multimodal_input=_build_request_multimodal_input(
+                        request, self._mm_encoder_cache_enabled),
                     multimodal_data=request.py_multimodal_data,
                     input_ids_start_offset=context_start_idx)
                 multimodal_params.to_device("multimodal_data",

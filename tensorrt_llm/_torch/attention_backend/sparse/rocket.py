@@ -1098,12 +1098,12 @@ class RocketKVCacheManager(KVCacheManager):
                                  mapping: Mapping,
                                  num_layers: Optional[int] = None,
                                  **kwargs):
-        # get kv cache dtype bytes
-        mem_per_token = 2
+        # main KV cache dtype bytes (one each for K and V)
+        kv_dtype_bytes = 2
         quant_config = model_config.quant_config
         if quant_config is not None and quant_config.quant_mode.has_fp8_kv_cache(
         ):
-            mem_per_token = 1
+            kv_dtype_bytes = 1
 
         # get num key value heads
         config = model_config.pretrained_config
@@ -1122,10 +1122,10 @@ class RocketKVCacheManager(KVCacheManager):
 
         num_attention_layers = KVCacheManager._resolve_num_attention_layers(
             model_config, mapping, num_layers)
-        mem_per_token *= num_attention_layers * head_dim
 
-        # K and V
-        # 2 for K and V, 2 * kt_tokens_per_block / tokens_per_block for KT cache
+        # K and V: two tensors stored at the main KV cache dtype.
+        mem_per_token = kv_dtype_bytes * 2 * num_attention_layers * head_dim
+
         tokens_per_block = kwargs['tokens_per_block']
         sparse_attention_config = model_config.sparse_attention_config
         if sparse_attention_config is None:
@@ -1138,21 +1138,23 @@ class RocketKVCacheManager(KVCacheManager):
                 "RocketKV cache requires RocketKV sparse parameters")
         kt_tokens_per_block = next_power_of_2(
             math.ceil(tokens_per_block / sparse_params.page_size))
-        kt_factor = 2
-        if sparse_params.kt_cache_dtype == "float8_e5m2":
-            kt_factor = 1
-        kv_factor = 2 + kt_factor * kt_tokens_per_block / tokens_per_block
-        mem_per_token *= kv_factor
+        # KT (key-landmark) cache: a separate pool stored at kt_cache_dtype,
+        # NOT the main KV dtype. Per real token it holds
+        # kt_tokens_per_block / tokens_per_block landmark slots, each storing
+        # the concatenated (min, max) landmark -- a factor of 2 over head_dim.
+        # Size it at its own dtype's byte width (1 for float8_e5m2, else 2) so
+        # the estimate is independent of the main KV dtype and matches both
+        # get_cache_bytes_per_token and the physical pool allocated in
+        # RocketKVCacheManager.__init__.
+        kt_dtype_bytes = 1 if sparse_params.kt_cache_dtype == "float8_e5m2" else 2
+        mem_per_token += (kt_dtype_bytes * 2 * kt_tokens_per_block /
+                          tokens_per_block * num_attention_layers * head_dim)
         return mem_per_token
 
     def get_cache_bytes_per_token(self):
-        # 2 for K and V, 2 * kt_tokens_per_block / tokens_per_block for KT cache
-        kt_factor = 2
-        if self.kt_cache_dtype == torch.float8_e5m2:
-            kt_factor = 1
-        kv_factor = self.kv_factor + kt_factor * self.kt_tokens_per_block / self.tokens_per_block
+        # Main K/V cache: stored at the main KV cache dtype (self.dtype).
         cache_size_per_token = math.ceil(
-            kv_factor * sum(self.num_kv_heads_per_layer) * self.head_dim)
+            self.kv_factor * sum(self.num_kv_heads_per_layer) * self.head_dim)
 
         if self.dtype not in (DataType.FP8, DataType.HALF, DataType.BF16,
                               DataType.FLOAT, DataType.NVFP4):
@@ -1165,4 +1167,20 @@ class RocketKVCacheManager(KVCacheManager):
                 cache_size_per_token,
                 quant_vector_size=16,
                 scaling_factor_dtype=DataType.FP8)
+
+        # KT (key-landmark) cache: a separate pool physically allocated at
+        # kt_cache_dtype, NOT the main KV dtype -- see __init__:
+        #   torch.empty((num_blocks, kt_tokens_per_block, num_kv_heads,
+        #                head_dim * 2), dtype=kt_cache_dtype).
+        # The trailing factor of 2 is the concatenated (min, max) landmark per
+        # head_dim. Per real token the pool holds
+        # kt_tokens_per_block / tokens_per_block landmark slots. Size it at its
+        # own dtype's byte width (1 for float8_e5m2, else 2) so the estimate
+        # matches the allocation regardless of self.dtype.
+        kt_dtype_bytes = 1 if self.kt_cache_dtype == torch.float8_e5m2 else 2
+        kt_elements_per_token = math.ceil(
+            2 * self.kt_tokens_per_block / self.tokens_per_block *
+            sum(self.num_kv_heads_per_layer) * self.head_dim)
+        cache_size_bytes_per_token += kt_elements_per_token * kt_dtype_bytes
+
         return cache_size_bytes_per_token
