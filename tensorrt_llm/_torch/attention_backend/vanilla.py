@@ -942,16 +942,16 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
                 if sparse_algorithm != "dsa":
                     raise ValueError(
                         "Vanilla selected MLA currently supports only DSA")
-                kv_idx, kv_off = self.sparse_kv_predict(q, k, metadata,
-                                                        forward_args)
-                at_idx, at_off = self.sparse_attn_predict(
+                sparse_kv_indices, sparse_kv_offsets = self.sparse_kv_predict(
+                    q, k, metadata, forward_args)
+                sparse_attn_indices, sparse_attn_offsets = self.sparse_attn_predict(
                     q, k, metadata, forward_args)
                 forward_args.sparse_prediction = replace(
                     forward_args.sparse_prediction,
-                    sparse_kv_indices=kv_idx,
-                    sparse_kv_offsets=kv_off,
-                    sparse_attn_indices=at_idx,
-                    sparse_attn_offsets=at_off,
+                    sparse_kv_indices=sparse_kv_indices,
+                    sparse_kv_offsets=sparse_kv_offsets,
+                    sparse_attn_indices=sparse_attn_indices,
+                    sparse_attn_offsets=sparse_attn_offsets,
                     sparse_attn_indices_block_size=getattr(
                         self.sparse_params, "indices_block_size"),
                 )
