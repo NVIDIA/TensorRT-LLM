@@ -429,6 +429,7 @@ class UploadLogPlugin:
         upload_mode="sync",
         upload_workers=8,
         inline_output_max_bytes=256,
+        session_capture=None,
     ):
         self.upload_path = upload_path
         self.output_path = output_path
@@ -467,7 +468,7 @@ class UploadLogPlugin:
         self._test_names: dict = {}
         self._deferred_uploads = []
         self._captured_slices = {}
-        self._session_capture = None
+        self._session_capture = session_capture
         self._upload_failed = False
 
     def normalize_test_name(self, nodeid):
@@ -591,8 +592,11 @@ class UploadLogPlugin:
     def pytest_sessionstart(self, session):
         result = yield
         if self.capture_mode == "session":
-            self._session_capture = SessionCapture(self.output_path)
-            self._session_capture.start()
+            if self._session_capture is None:
+                self._session_capture = SessionCapture(self.output_path)
+                self._session_capture.start()
+            else:
+                self._session_capture.resume_parent()
         return result
 
     @pytest.hookimpl(wrapper=True)
@@ -964,14 +968,14 @@ def add_options(parser):
     )
 
 
-def register_plugin(config):
+def register_plugin(config, session_capture=None):
     """Register UploadLogPlugin if --s3-upload-path and --output-dir are both set."""
     s3_upload_path = config.getoption("--s3-upload-path", default=None)
     output_dir = config.getoption("--output-dir", default=None)
     if not (s3_upload_path and output_dir):
-        return
-    capture_mode = config.getoption("capture", default="no")
-    if capture_mode != "no":
+        return None
+    pytest_capture_mode = config.getoption("capture", default="no")
+    if pytest_capture_mode != "no":
         raise ValueError("capture mode must be 'no' when upload path is specified")
     s3_secret_key = config.getoption("--s3-secret-key")
     skip_upload = config.getoption("--s3-skip-upload", default=False)
@@ -979,6 +983,7 @@ def register_plugin(config):
         raise ValueError(
             "--s3-secret-key (or S3_SECRET_KEY env var) is required when --s3-upload-path is set"
         )
+    s3_capture_mode = config.getoption("--s3-capture-mode", default="session")
     plugin = UploadLogPlugin(
         endpoint_url=config.getoption("--s3-endpoint"),
         aws_access_key_id=config.getoption("--s3-username"),
@@ -988,9 +993,11 @@ def register_plugin(config):
         output_path=output_dir,
         echo_to_stdout=config.getoption("--s3-echo-stdout", default=False),
         skip_upload=skip_upload,
-        capture_mode=config.getoption("--s3-capture-mode", default="session"),
+        capture_mode=s3_capture_mode,
         upload_mode=config.getoption("--s3-upload-mode", default="sync"),
         upload_workers=config.getoption("--s3-upload-workers", default=8),
         inline_output_max_bytes=config.getoption("--s3-inline-output-max-bytes", default=256),
+        session_capture=session_capture if s3_capture_mode == "session" else None,
     )
     config.pluginmanager.register(plugin, "upload_log_plugin")
+    return plugin

@@ -18,8 +18,10 @@ import logging
 import os
 import subprocess
 import sys
+from types import SimpleNamespace
 
 import pytest
+from test_common import s3_output_hooks
 from test_common.s3_output import (
     FDRedirector,
     FileSlice,
@@ -56,7 +58,12 @@ class RecordingS3Client:
         self.fileobj_uploads.append((fileobj.read(), bucket, object_key, ExtraArgs))
 
 
-def make_plugin(tmp_path, inline_output_max_bytes, capture_mode="timestamped"):
+def make_plugin(
+    tmp_path,
+    inline_output_max_bytes,
+    capture_mode="timestamped",
+    session_capture=None,
+):
     return UploadLogPlugin(
         endpoint_url="https://example.com",
         aws_access_key_id="user",
@@ -67,6 +74,7 @@ def make_plugin(tmp_path, inline_output_max_bytes, capture_mode="timestamped"):
         skip_upload=True,
         capture_mode=capture_mode,
         inline_output_max_bytes=inline_output_max_bytes,
+        session_capture=session_capture,
     )
 
 
@@ -279,7 +287,7 @@ def test_file_slice_reader_supports_upload_size_probe(tmp_path):
         assert source_file.read() == b"test output\n"
 
 
-def test_session_capture_preserves_parent_and_existing_child_stdout_order(tmp_path):
+def test_session_capture_preserves_parent_and_child_stdout_order(tmp_path):
     capture = SessionCapture(str(tmp_path))
     capture.start()
     child = None
@@ -311,6 +319,125 @@ def test_session_capture_preserves_parent_and_existing_child_stdout_order(tmp_pa
     with io.BufferedReader(FileSliceReader(slices["stderr.log"])) as stderr_file:
         assert stderr_file.read() == b"child stderr\n"
     capture.remove_files()
+
+
+class _EarlyConfig:
+    def __init__(self, capture="no", numprocesses=None):
+        self.option = SimpleNamespace(numprocesses=numprocesses)
+        self.known_args_namespace = SimpleNamespace(
+            capture=capture,
+            numprocesses=numprocesses,
+        )
+        self.cleanups = []
+
+    def add_cleanup(self, cleanup):
+        self.cleanups.append(cleanup)
+
+
+def test_early_capture_preserves_conftest_child_output_for_case(tmp_path, monkeypatch):
+    monkeypatch.delenv("PYTEST_XDIST_WORKER", raising=False)
+    early_config = _EarlyConfig()
+    initial_hook = s3_output_hooks.pytest_load_initial_conftests(
+        early_config,
+        [
+            "-s",
+            "--s3-upload-path=logs",
+            f"--output-dir={tmp_path}",
+        ],
+    )
+    child = None
+    capture = None
+    try:
+        next(initial_hook)
+        state = s3_output_hooks._capture_state(early_config)
+        assert state is not None
+        capture = state.capture
+        assert capture is not None
+        child = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                "import os, sys; sys.stdin.buffer.read(1); "
+                "os.write(1, b'child stdout\\n'); os.write(2, b'child stderr\\n')",
+            ],
+            stdin=subprocess.PIPE,
+        )
+
+        with pytest.raises(StopIteration):
+            next(initial_hook)
+
+        plugin = make_plugin(
+            tmp_path,
+            inline_output_max_bytes=0,
+            capture_mode="session",
+            session_capture=capture,
+        )
+        session = SimpleNamespace(config=SimpleNamespace())
+        session_hook = plugin.pytest_sessionstart(session)
+        next(session_hook)
+        with pytest.raises(StopIteration):
+            next(session_hook)
+
+        offsets = capture.snapshot()
+        os.write(1, b"parent before\n")
+        child.stdin.write(b"x")
+        child.stdin.close()
+        assert child.wait(timeout=10) == 0
+        os.write(1, b"parent after\n")
+        slices = capture.slices_since(offsets)
+        capture.stop()
+
+        with io.BufferedReader(FileSliceReader(slices["stdout.log"])) as stdout_file:
+            assert stdout_file.read() == b"parent before\nchild stdout\nparent after\n"
+        with io.BufferedReader(FileSliceReader(slices["stderr.log"])) as stderr_file:
+            assert stderr_file.read() == b"child stderr\n"
+    finally:
+        if child is not None and child.poll() is None:
+            child.kill()
+            child.wait()
+        if capture is not None:
+            capture.stop()
+        for cleanup in early_config.cleanups:
+            cleanup()
+
+
+def test_early_capture_skips_xdist_controller(tmp_path, monkeypatch):
+    monkeypatch.delenv("PYTEST_XDIST_WORKER", raising=False)
+    early_config = _EarlyConfig(numprocesses=2)
+    initial_hook = s3_output_hooks.pytest_load_initial_conftests(
+        early_config,
+        [
+            "-s",
+            "-n",
+            "2",
+            "--s3-upload-path=logs",
+            f"--output-dir={tmp_path}",
+        ],
+    )
+
+    next(initial_hook)
+    assert s3_output_hooks._capture_state(early_config) is None
+    with pytest.raises(StopIteration):
+        next(initial_hook)
+
+
+def test_s3_plugin_registration_runs_on_xdist_worker_only(monkeypatch):
+    monkeypatch.delenv("PYTEST_XDIST_WORKER", raising=False)
+    registered_configs = []
+
+    def register_plugin(config, session_capture=None):
+        registered_configs.append(config)
+        return object()
+
+    monkeypatch.setattr(s3_output_hooks.s3_output, "register_plugin", register_plugin)
+    controller_config = _EarlyConfig(numprocesses=2)
+    s3_output_hooks.pytest_configure(controller_config)
+    assert registered_configs == []
+
+    monkeypatch.setenv("PYTEST_XDIST_WORKER", "gw0")
+    worker_config = _EarlyConfig(numprocesses=2)
+    s3_output_hooks.pytest_configure(worker_config)
+    assert registered_configs == [worker_config]
 
 
 def test_small_log_file_is_not_inlined(tmp_path):
