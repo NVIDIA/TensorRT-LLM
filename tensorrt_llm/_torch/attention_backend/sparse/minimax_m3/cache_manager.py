@@ -342,7 +342,7 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         return full_view[:, :2]
 
     def _prepare_page_table_tensor(self, index_mapper_capacity: int) -> None:
-        """Populate the base's page-table state without the broken exact_div.
+        """Populate compatibility page-table state from the V2 pool layout.
 
         The base method (renamed from ``_build_pool_mapping_tensors`` by the
         DSv4 refactor) divides ``addr_offset`` by ``key_bytes * kv_factor *
@@ -353,27 +353,92 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         three into one pool and the per-layer stride becomes
         ``3 * single_buffer_size`` — the base's ``exact_div`` then asserts.
 
-        This override computes ``offset`` directly from
-        ``self.impl.layer_grouping[group_id]`` (layer position in group) so
-        the formula stays correct regardless of how many extra buffers
-        coalesce with K/V. The M3 forward path uses :meth:`get_buffers` /
-        :meth:`get_index_k_buffer`, so the mapping offset only needs to be
-        consistent with the pool layout.
+        The M3 forward path uses :meth:`get_buffers` /
+        :meth:`get_index_k_buffer` rather than the generic attention op, so
+        these tensors only satisfy the common cache-manager metadata contract.
+        Build them from ``pool_group_descs`` instead of assuming that the
+        iteration order of ``layer_grouping`` matches physical pool layout.
+        Each slot variant provides its stable ``layer_group_id`` and the exact
+        order of buffers coalesced into each physical pool.
 
         The other four attributes (`index_scales`, `kv_offset`,
         `host_kv_cache_block_offsets`, and the NVFP4-stacked pointers) mirror
         the base's non-SWA else branch so downstream consumers keep working.
         """
         assert not self.enable_swa_scratch_reuse, "MiniMax M3 does not support SWA scratch reuse"
+
+        group_key_layers: List[Optional[int]] = [None] * self.num_pools
+        group_scale_layers: List[Optional[int]] = [None] * self.num_pools
+        kv_cache_pool_mapping_list: List[Optional[List[int]]] = [
+            None for _ in range(self.num_local_layers)
+        ]
+
+        for pool_group_desc in self.impl.pool_group_descs:
+            for variant in pool_group_desc.slot_desc.variants:
+                group_id = int(variant.layer_group_id)
+                assert 0 <= group_id < self.num_pools, (
+                    f"MiniMax M3 pool descriptor has layer_group_id={group_id}, "
+                    f"expected [0, {self.num_pools})"
+                )
+
+                key_groups = [
+                    [
+                        int(buffer_id.layer_id)
+                        for buffer_id in coalesced.buffer_ids
+                        if buffer_id.role == Role.KEY
+                    ]
+                    for coalesced in variant.coalesced_buffers
+                    if any(buffer_id.role == Role.KEY for buffer_id in coalesced.buffer_ids)
+                ]
+                assert len(key_groups) == 1 and key_groups[0], (
+                    f"MiniMax M3 layer group {group_id} must place all KEY buffers "
+                    "in exactly one coalesced pool"
+                )
+                key_layers = key_groups[0]
+                assert group_key_layers[group_id] is None, (
+                    f"Duplicate MiniMax M3 pool descriptor for layer group {group_id}"
+                )
+                group_key_layers[group_id] = key_layers[0]
+
+                for offset, layer_id in enumerate(key_layers):
+                    assert 0 <= layer_id < self.num_local_layers, (
+                        f"MiniMax M3 pool descriptor contains layer_id={layer_id}, "
+                        f"expected [0, {self.num_local_layers})"
+                    )
+                    assert kv_cache_pool_mapping_list[layer_id] is None, (
+                        f"Duplicate KEY buffer descriptor for MiniMax M3 layer {layer_id}"
+                    )
+                    kv_cache_pool_mapping_list[layer_id] = [group_id, offset]
+
+                if self.dtype == DataType.NVFP4:
+                    scale_groups = [
+                        [
+                            int(buffer_id.layer_id)
+                            for buffer_id in coalesced.buffer_ids
+                            if buffer_id.role == Role.KEY_BLOCK_SCALE
+                        ]
+                        for coalesced in variant.coalesced_buffers
+                        if any(
+                            buffer_id.role == Role.KEY_BLOCK_SCALE
+                            for buffer_id in coalesced.buffer_ids
+                        )
+                    ]
+                    assert len(scale_groups) == 1 and scale_groups[0] == key_layers, (
+                        f"MiniMax M3 NVFP4 layer group {group_id} requires KEY and "
+                        "KEY_BLOCK_SCALE buffers in the same layer order"
+                    )
+                    group_scale_layers[group_id] = scale_groups[0][0]
+
+        assert all(layer_id is not None for layer_id in group_key_layers), (
+            "MiniMax M3 pool descriptors do not cover every layer group"
+        )
+        assert all(mapping is not None for mapping in kv_cache_pool_mapping_list), (
+            "MiniMax M3 pool descriptors do not contain a KEY buffer for every local layer"
+        )
         kv_cache_pool_pointers = torch.tensor(
             [
-                [
-                    self.impl.get_mem_pool_base_address(
-                        self.impl.layer_grouping[pool_id][0], Role.KEY
-                    ),
-                    0,
-                ]
-                for pool_id in range(self.num_pools)
+                [self.impl.get_mem_pool_base_address(int(layer_id), Role.KEY), 0]
+                for layer_id in group_key_layers
             ],
             dtype=torch.int64,
             device="cpu",
@@ -381,6 +446,9 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         )
 
         if self.dtype == DataType.NVFP4:
+            assert all(layer_id is not None for layer_id in group_scale_layers), (
+                "MiniMax M3 pool descriptors do not cover every NVFP4 scale group"
+            )
             kv_cache_pool_pointers = torch.stack(
                 [
                     kv_cache_pool_pointers,
@@ -388,11 +456,11 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
                         [
                             [
                                 self.impl.get_mem_pool_base_address(
-                                    self.impl.layer_grouping[pool_id][0], Role.KEY_BLOCK_SCALE
+                                    int(layer_id), Role.KEY_BLOCK_SCALE
                                 ),
                                 0,
                             ]
-                            for pool_id in range(self.num_pools)
+                            for layer_id in group_scale_layers
                         ],
                         dtype=torch.int64,
                         device="cpu",
@@ -401,11 +469,6 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
                 ],
                 dim=-1,
             )
-
-        kv_cache_pool_mapping_list: List[List[int]] = [[0, 0] for _ in range(self.num_local_layers)]
-        for group_id, layers in enumerate(self.impl.layer_grouping):
-            for offset, layer_id in enumerate(layers):
-                kv_cache_pool_mapping_list[int(layer_id)] = [group_id, offset]
 
         self.kv_cache_pool_pointers = kv_cache_pool_pointers
         self.kv_cache_pool_mapping = torch.tensor(
@@ -421,8 +484,8 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         self.kv_offset = torch.empty(
             self.num_pools, dtype=torch.int32, pin_memory=prefer_pinned(), device="cpu"
         )
-        for pool_id in range(self.num_pools):
-            layer_id = self.impl.layer_grouping[pool_id][0]
+        for pool_id, layer_id in enumerate(group_key_layers):
+            layer_id = int(layer_id)
             self.index_scales[pool_id] = self.impl.get_page_index_scale(layer_id, Role.KEY)
             if self.kv_cache_type != CacheTypeCpp.SELFKONLY:
                 self.kv_offset[pool_id] = exact_div(
