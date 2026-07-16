@@ -208,6 +208,70 @@ class TestFindInputMmEmbed:
             dim=0)
         torch.testing.assert_close(result[0], expected)
 
+    def test_mixed_full_prefill_and_partial_requests(self):
+        """A full-prefill request (no runtime) may share a batch with partial ones.
+
+        The runtime-less request keeps all of its rows; the partial ones are
+        still sliced to their own chunk.
+        """
+        mm_embeds = [torch.randn(3, _EMBED_DIM), torch.randn(4, _EMBED_DIM)]
+        multimodal_params = [
+            MultimodalParams(multimodal_runtime=None),  # full prefill
+            _make_multimodal_params(2, 1, [4]),  # 2 cached, 1 in chunk
+        ]
+
+        result = find_input_mm_embeds(mm_embeds, multimodal_params)
+
+        assert len(result) == 2
+        torch.testing.assert_close(result[0], mm_embeds[0])
+        torch.testing.assert_close(result[1], mm_embeds[1][2:3])
+
+    def test_mixed_full_prefill_keeps_request_indices_aligned(self):
+        """Slices must follow their own request when a runtime-less one sits in between."""
+        mm_embeds = [
+            torch.randn(3, _EMBED_DIM),
+            torch.randn(3, _EMBED_DIM),
+            torch.randn(4, _EMBED_DIM),
+        ]
+        multimodal_params = [
+            _make_multimodal_params(1, 1, [3]),  # rows [1:2]
+            MultimodalParams(multimodal_runtime=None),  # full prefill
+            _make_multimodal_params(2, 2, [4]),  # rows [2:4]
+        ]
+
+        result = find_input_mm_embeds(mm_embeds, multimodal_params)
+
+        assert len(result) == 3
+        torch.testing.assert_close(result[0], mm_embeds[0][1:2])
+        torch.testing.assert_close(result[1], mm_embeds[1])
+        torch.testing.assert_close(result[2], mm_embeds[2][2:4])
+
+    def test_mixed_full_prefill_rejected_when_pre_concatenated(self):
+        """Pre-concatenated embeds give no way to locate a runtime-less request's rows."""
+        mm_embeds = [torch.randn(7, _EMBED_DIM)]
+        multimodal_params = [
+            MultimodalParams(multimodal_runtime=None),
+            _make_multimodal_params(2, 1, [4]),
+        ]
+
+        with pytest.raises(ValueError,
+                           match="require multimodal_runtime for every"):
+            find_input_mm_embeds(mm_embeds, multimodal_params)
+
+    def test_mixed_full_prefill_all_in_chunk_returns_full_embeds(self):
+        """Nothing cached anywhere: the batch is returned untouched."""
+        mm_embeds = [torch.randn(3, _EMBED_DIM), torch.randn(4, _EMBED_DIM)]
+        multimodal_params = [
+            MultimodalParams(multimodal_runtime=None),
+            _make_multimodal_params(0, 4, [4]),
+        ]
+
+        result = find_input_mm_embeds(mm_embeds, multimodal_params)
+
+        assert len(result) == 2
+        torch.testing.assert_close(result[0], mm_embeds[0])
+        torch.testing.assert_close(result[1], mm_embeds[1])
+
     def test_error_handling_mismatched_counts(self):
         """
         Test error handling when mm_embeds and multimodal_params counts don't match
