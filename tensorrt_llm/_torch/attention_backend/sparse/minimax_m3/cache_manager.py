@@ -387,6 +387,7 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         pool_id: int = 0,
         is_kv_aggregate: bool = True,
         num_blocks_per_seq: Optional[Sequence[int]] = None,
+        index_scale: Optional[int] = None,
     ):
         """Return page indices; padded entries remain ``BAD_PAGE_INDEX`` (-1).
 
@@ -412,6 +413,9 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
             num_blocks_per_seq: Optional per-request truncation limits. When
                 omitted, preserve the full padded width required by MiniMax
                 CUDA-graph metadata initialization.
+            index_scale: Kept for compatibility with the base virtual method;
+                M3 bypasses the V1 block-id conversion entirely, so any
+                caller-supplied scale is ignored alongside ``index_scales``.
         """
         res = []
         for req_idx, req_id in enumerate(request_ids):
