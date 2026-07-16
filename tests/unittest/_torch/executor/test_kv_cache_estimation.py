@@ -560,6 +560,9 @@ def test_estimation_temporarily_uses_inferred_pool_sizing() -> None:
     )
     model_engine = Mock()
     model_engine.model.model_config.attn_backend = "TRTLLM"
+    # Explicit False: try_prepare_estimation skips estimation for
+    # encoder-decoder models, and a bare Mock attribute is truthy.
+    model_engine.model.model_config.is_encoder_decoder = False
     llm_args = Mock(cache_transceiver_config=None)
 
     with patch.object(
