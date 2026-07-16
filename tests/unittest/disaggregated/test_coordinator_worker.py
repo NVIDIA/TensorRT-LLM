@@ -502,6 +502,7 @@ def test_conversation_coordinator_sticky_by_conv_id():
 
             async def drive():
                 remote = CoordinatorClient(coord.url, config)
+                await remote.start()
                 # Stateful -> wrapped in a coordinator-delegating router.
                 assert isinstance(remote.gen_router, CoordinatorDelegatingRouter)
                 assert await remote.is_ready() is True
