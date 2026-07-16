@@ -406,7 +406,6 @@ class _LTX2CUDAGraphRunner(CUDAGraphRunner):
                 audio_pe=clone_pair(v.audio_pe),
                 audio_cross_pe=clone_pair(v.audio_cross_pe),
                 audio_kv=[clone_pair(kv) for kv in v.audio_kv] if v.audio_kv is not None else None,
-                topology=v.topology,
             )
         if isinstance(v, torch.Tensor):
             return v.clone()

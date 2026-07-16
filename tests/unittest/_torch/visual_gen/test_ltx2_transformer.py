@@ -287,15 +287,6 @@ class TestLTX2TopologyConstruction(unittest.TestCase):
             model.set_ulysses_topology(is_stage2=True)
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    def test_forward_rejects_stale_topology_text_cache(self):
-        """forward() refuses a text cache stamped with the other topology."""
-        from tensorrt_llm._torch.visual_gen.models.ltx2.text_cache import TextCache
-
-        model = self._build()
-        with self.assertRaisesRegex(RuntimeError, "prepared under topology 'stage2'"):
-            model.forward(None, None, text_cache=TextCache(topology="stage2"))
-
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_conditional_audio_attn1_is_plain(self):
         """Default CONDITIONAL mode constructs plain audio self-attention;
         v2a keeps its wrapper decision from the construction gates."""

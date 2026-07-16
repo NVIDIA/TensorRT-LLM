@@ -2200,7 +2200,6 @@ class LTXModel(BaseDiffusionModel):
             audio_pe=a_pe,
             audio_cross_pe=a_cross_pe,
             audio_kv=a_kv,
-            topology=self._active_topology,
         )
 
     def forward(
@@ -2233,15 +2232,6 @@ class LTXModel(BaseDiffusionModel):
         Returns:
             Tuple of (video_output, audio_output) velocity predictions.
         """
-        # The cache's PE shards/pads are topology-dependent; reject one built
-        # under the other topology (i.e. prepare_text_cache() was called before
-        # set_ulysses_topology()).
-        if text_cache.topology != self._active_topology:
-            raise RuntimeError(
-                f"text_cache was prepared under topology '{text_cache.topology}' "
-                f"but '{self._active_topology}' is active; call "
-                "prepare_text_cache() after set_ulysses_topology()."
-            )
         # Topology guard for torch.compile: a plain int read makes dynamo install
         # a value guard, so the default and stage-2 topologies never share a
         # compiled artifact (belt to the CUDA-graph key's suspenders).

@@ -443,23 +443,6 @@ def _logic_ltx2_dual_topology(rank, world_size, backend, audio_seq_len):
     with torch.no_grad():
         ref_v, ref_a = ref_model(video=video, audio=audio, text_cache=ref_cache)
 
-    # Ordering invariant: a cache built under the default topology must be
-    # rejected once stage2 is active (prepare_text_cache before the switch).
-    stale_cache = d_model.prepare_text_cache(
-        video_context=v_ctx,
-        video_positions=v_pos,
-        audio_context=a_ctx,
-        audio_positions=a_pos,
-        dtype=dtype,
-    )
-    d_model.set_ulysses_topology(is_stage2=True)
-    try:
-        with torch.no_grad():
-            d_model(video=video, audio=audio, text_cache=stale_cache)
-        raise AssertionError(f"Rank {rank}: stale-topology text_cache was not rejected")
-    except RuntimeError as e:
-        assert "prepared under topology 'default'" in str(e), f"Rank {rank}: {e}"
-
     x = torch.randn(1, 32, 8, device=device, dtype=dtype)
     for is_stage2 in (False, True, False, True):
         d_model.set_ulysses_topology(is_stage2=is_stage2)
