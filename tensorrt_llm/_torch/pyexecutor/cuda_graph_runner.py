@@ -50,6 +50,11 @@ def _restore_spec_decode_capture_state(
         attn_metadata: Any, saved_kv_lens_cuda: Optional[torch.Tensor]) -> None:
     if saved_kv_lens_cuda is None:
         return
+    # Speculative decoding updates kv_lens_cuda in-place during every forward.
+    # CUDA graph warmup reuses one dummy request for multiple eager forwards, so
+    # letting those updates accumulate would make later warmups/capture advertise
+    # more KV tokens than the dummy request actually allocated. Restore the
+    # single-step input state outside the graph after each forward instead.
     batch_size = saved_kv_lens_cuda.shape[0]
     attn_metadata.kv_lens_cuda[:batch_size].copy_(saved_kv_lens_cuda)
     attn_metadata.on_update_kv_lens()
