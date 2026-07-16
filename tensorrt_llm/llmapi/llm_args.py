@@ -412,8 +412,7 @@ class EncodeCudaGraphConfig(BaseCudaGraphConfig):
     @staticmethod
     def _generate_cuda_graph_seq_lens(max_seq_len: int,
                                       enable_padding: bool) -> List[int]:
-        """
-        Generate a list of max per-request sequence lengths for encoder CUDA graphs.
+        """Generate a list of max per-request sequence lengths for encoder CUDA graphs.
 
         Args:
             max_seq_len: Maximum per-request sequence length to generate up to.
@@ -3668,6 +3667,17 @@ class ExtendedRuntimePerfKnobConfig(StrictBaseModel, PybindMirror):
         return res
 
 
+# Legacy env-var selectors for the "DEFAULT" cache-transceiver backend,
+# ordered by priority. Single source of truth shared with
+# _torch/pyexecutor/kv_cache_transceiver.py.
+_CACHE_TRANSCEIVER_BACKEND_ENV_VARS = (
+    ("TRTLLM_USE_NIXL_KVCACHE", "NIXL"),
+    ("TRTLLM_USE_UCX_KVCACHE", "UCX"),
+    ("TRTLLM_USE_MOONCAKE_KVCACHE", "MOONCAKE"),
+    ("TRTLLM_USE_MPI_KVCACHE", "MPI"),
+)
+
+
 @PybindMirror.mirror_pybind_fields(_CacheTransceiverConfig)
 class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
     """Configuration for the cache transceiver."""
@@ -3678,11 +3688,16 @@ class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
             description=
             "The communication backend type to use for the cache transceiver.")
 
-    transceiver_runtime: Optional[Literal["CPP", "PYTHON"]] = Field(
-        default=None,
+    transceiver_runtime: Optional[Literal["CPP", "PYTHON", "auto"]] = Field(
+        default="auto",
         description=
-        "The runtime implementation. 'CPP' for C++ transceiver (default when not set), 'PYTHON' for Python transceiver."
-    )
+        "The runtime implementation. 'auto' (default) adopts the model's "
+        "preferred runtime when the effective backend supports it, and falls "
+        "back to the C++ transceiver otherwise. 'CPP' selects the C++ "
+        "transceiver, 'PYTHON' the Python transceiver. None is equivalent to "
+        "'CPP'. The model preference is only consulted on the PyTorch "
+        "backend's standard model-loading path; other paths (e.g. AutoDeploy) "
+        "fall back to the C++ transceiver under 'auto'.")
 
     max_tokens_in_buffer: Optional[int] = Field(
         default=None,
@@ -3712,6 +3727,20 @@ class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
         description=
         "Per-region size in MiB of the native-disagg KV-cache bounce buffer (one for send, one for recv). Bounce coalesces a request's scattered per-block KV into one contiguous fabric-VMM buffer and issues a single multi-rail NIXL write. The size doubles as the on/off switch: 0 (default) keeps the per-block path, >0 enables bounce at that capacity. Only used by the Python (v2) transceiver."
     )
+
+    def _resolve_default_backend(self) -> Tuple[Optional[str], Optional[str]]:
+        """Effective backend after resolving "DEFAULT" against legacy env vars.
+
+        Returns (effective_backend, env_var) where env_var is the legacy
+        environment variable that determined the choice, or None when the
+        backend was explicit or no env var was set (NIXL fallback).
+        """
+        if self.backend != "DEFAULT":
+            return self.backend, None
+        for env_var, backend in _CACHE_TRANSCEIVER_BACKEND_ENV_VARS:
+            if os.getenv(env_var) == "1":
+                return backend, env_var
+        return "NIXL", None
 
     def _to_pybind(self):
         return _CacheTransceiverConfig(
@@ -4761,6 +4790,18 @@ class TorchLlmArgs(BaseLlmArgs):
         "Only load/execute the vision encoder part of the full model. Defaults to False.",
         status="prototype")
 
+    disable_mm_encoder: bool = Field(
+        default=False,
+        description=
+        "Skip instantiating and loading the multimodal (e.g. vision) encoder "
+        "of a multimodal checkpoint and serve it text-only. Saves the "
+        "encoder's GPU memory (enlarging the KV cache pool) for workloads "
+        "that never send image/video/audio inputs; such requests are "
+        "rejected. Only takes effect for model implementations that support "
+        "it (currently the Qwen3-VL / Qwen3.5-VL family); a no-op otherwise. "
+        "Defaults to False.",
+        status="prototype")
+
     encode_only: bool = Field(
         default=False,
         description=
@@ -4931,6 +4972,11 @@ class TorchLlmArgs(BaseLlmArgs):
                 "Use encode_only=True for LLM.encode(), or use "
                 "MultimodalEncoder/mm_encoder_only for multimodal encoder "
                 "execution.")
+        if self.disable_mm_encoder and self.mm_encoder_only:
+            raise ValueError(
+                "disable_mm_encoder and mm_encoder_only are mutually "
+                "exclusive: one skips the multimodal encoder, the other runs "
+                "only the multimodal encoder.")
         return self
 
     @model_validator(mode="after")

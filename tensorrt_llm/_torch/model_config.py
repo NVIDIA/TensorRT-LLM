@@ -190,6 +190,13 @@ class ModelConfig(Generic[TConfig]):
     # If true, ONLY the vision encoder part of the full model is loaded/executed.
     mm_encoder_only: bool = False
 
+    # If true, the multimodal encoder of a multimodal checkpoint is NOT
+    # instantiated/loaded and the model serves text-only requests. This is
+    # opt-in per model: each model implementation must honor this flag when
+    # building its encoder (currently the Qwen3-VL / Qwen3.5-VL models); a
+    # model that does not check it simply ignores the flag (no-op).
+    disable_mm_encoder: bool = False
+
     # Video pruning rate for VLM models (None = EVS disabled)
     video_pruning_rate: Optional[float] = None
 
