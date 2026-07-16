@@ -36,7 +36,7 @@ ACCURACY_CONFIG = {
 }
 
 # Mirror the engine's encoder runtime sizes (``get_encoder_runtime_sizes`` ->
-# ``encoder_max_batch_size`` / ``encoder_max_num_tokens``, defaulting to
+# ``encoder_max_num_items`` / ``encoder_max_num_tokens``, defaulting to
 # ``max_batch_size`` / ``max_num_tokens``). The encoder ``AttentionMetadata`` is
 # sized once at load to this max budget; each forward re-preps it with the real
 # per-image seq lens. Two distinct axes: requests = image/sequence count budget,

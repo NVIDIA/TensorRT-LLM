@@ -487,8 +487,11 @@ class MultimodalScheduler(RequestScheduler):
     schedulers so MM encoder costs never enter the LLM token budget.
 
     ``max_num_items`` is the resolved user-facing
-    ``encoder_max_batch_size``. It counts atomic MM items across all requests
-    and modalities, not LLM requests or model-internal attention segments.
+    ``encoder_max_num_items``. It counts atomic MM items across all requests
+    and modalities, not LLM requests or model-internal attention segments;
+    item *size* is budgeted separately by ``max_num_tokens``, and encoders
+    that split one item into multiple attention sequences derive their own
+    workspace capacity from the token budget.
     """
 
     def __init__(
