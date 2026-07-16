@@ -18,6 +18,7 @@ import functools
 import json
 import math
 import os
+import re
 import types
 from abc import ABC, abstractmethod
 from collections import defaultdict
@@ -510,6 +511,38 @@ class MultimodalEncoderCudaGraphConfig(StrictBaseModel):
         return self
 
 
+_BYTE_STRING_PATTERN = re.compile(r"^\s*(\d+)\s*([kmgt]i?b|b)?\s*$",
+                                  re.IGNORECASE)
+_BINARY_BYTE_UNITS: dict[Optional[str], int] = {
+    None: 1,
+    "b": 1,
+    "kb": 1024,
+    "kib": 1024,
+    "mb": 1024**2,
+    "mib": 1024**2,
+    "gb": 1024**3,
+    "gib": 1024**3,
+    "tb": 1024**4,
+    "tib": 1024**4,
+}
+
+
+def _parse_binary_byte_string(value: Any) -> Any:
+    if not isinstance(value, str):
+        return value
+
+    match = _BYTE_STRING_PATTERN.fullmatch(value)
+    if match is None:
+        raise ValueError(
+            "Byte strings must be non-negative integers with optional "
+            "B/KB/MB/GB/TB or KiB/MiB/GiB/TiB suffix.")
+
+    amount = int(match.group(1))
+    unit = match.group(2)
+    multiplier = _BINARY_BYTE_UNITS[unit.lower() if unit is not None else None]
+    return amount * multiplier
+
+
 class MultimodalConfig(StrictBaseModel):
     """Multimodal model configuration."""
 
@@ -529,7 +562,22 @@ class MultimodalConfig(StrictBaseModel):
         description=
         ("Maximum number of pending multimodal requests whose encoder work can be prefetched "
          "on a side CUDA stream ahead of admission. 0 disables side-stream prefetch. "
-         "Incompatible with encoder_cuda_graph because graph replay uses static buffers."
+         "Incompatible with encoder_cuda_graph because graph replay uses static buffers. "
+         "For the time being, this is also incompatible with encoder_cache_max_bytes > 0."
+         ),
+        status="prototype",
+    )
+
+    encoder_cache_max_bytes: NonNegativeInt = Field(
+        default=134_217_728,  # 128 MiB.
+        description=
+        ("Maximum bytes for the per-model cross-request multimodal encoder embedding cache. "
+         "Set to 0 to disable. String values such as '512MB' and '1GiB' use binary units. "
+         "Cache entries are per multimodal item, but reuse is all-or-nothing for each request: "
+         "every item in the request must hit the cache before cached embeddings are reused. "
+         "Only single-modality requests are cacheable for the time being. "
+         "For the time being, this is incompatible with encoder_side_stream_max_ahead > 0. "
+         "NOTE: This is only valid for child implementations of the `MultimodalModelMixin`."
          ),
         status="prototype",
     )
@@ -545,8 +593,13 @@ class MultimodalConfig(StrictBaseModel):
         status="prototype",
     )
 
+    @field_validator('encoder_cache_max_bytes', mode='before')
+    @classmethod
+    def parse_encoder_cache_max_bytes(cls, value):
+        return _parse_binary_byte_string(value)
+
     @model_validator(mode='after')
-    def validate_side_stream_cuda_graph_exclusive(self) -> 'MultimodalConfig':
+    def validate_encoder_optimization_compatibility(self) -> 'MultimodalConfig':
         if (self.encoder_cuda_graph is not None
                 and self.encoder_side_stream_max_ahead > 0):
             raise ValueError(
@@ -554,6 +607,14 @@ class MultimodalConfig(StrictBaseModel):
                 "multimodal_config.encoder_side_stream_max_ahead > 0 are "
                 "mutually exclusive. Disable side-stream MM prefetch or "
                 "disable MM encoder CUDA graphs.")
+        # TODO(TRTLLM-14034): Make encoder side-stream read and write from the cache.
+        if (self.encoder_cache_max_bytes > 0
+                and self.encoder_side_stream_max_ahead > 0):
+            raise ValueError(
+                "multimodal_config.encoder_cache_max_bytes > 0 and "
+                "multimodal_config.encoder_side_stream_max_ahead > 0 are "
+                "mutually exclusive. Disable side-stream MM prefetch or set "
+                "the MM encoder cache capacity to 0.")
         return self
 
 
@@ -4548,6 +4609,16 @@ class TorchLlmArgs(BaseLlmArgs):
         default_factory=MultimodalConfig,
         description="Multimodal model configuration.",
         status="prototype")
+
+    @field_validator('multimodal_config', mode='before')
+    @classmethod
+    def init_multimodal_config(cls, v):
+        # The field is non-Optional, but callers (e.g. the multimodal
+        # quickstart) pass None to mean "unset". Coerce None back to the
+        # default so it does not fail type validation.
+        if v is None:
+            return MultimodalConfig()
+        return v
 
     attention_dp_config: Optional[AttentionDpConfig] = Field(
         default=None,
