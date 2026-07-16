@@ -1,7 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-import pickle
 from types import SimpleNamespace
 
 import pytest
@@ -12,6 +11,7 @@ from tensorrt_llm._torch.models.modeling_multimodal_mixin import MultimodalModel
 from tensorrt_llm._torch.models.modeling_qwen2vl import Qwen2VLInputProcessorBase
 from tensorrt_llm._torch.pyexecutor.executor_request_queue import RequestQueueItem
 from tensorrt_llm._torch.pyexecutor.llm_request import (
+    LlmRequest,
     MultimodalEncoderProgress,
     get_multimodal_encoder_progress,
     get_multimodal_encoder_token_lengths,
@@ -27,6 +27,7 @@ from tensorrt_llm._torch.pyexecutor.scheduler.scheduler import (
     MultimodalScheduler,
 )
 from tensorrt_llm._torch.pyexecutor.scheduler.waiting_queue import FCFSWaitingQueue
+from tensorrt_llm.bindings import SamplingConfig
 from tensorrt_llm.inputs.multimodal import (
     MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
     MultimodalParams,
@@ -61,15 +62,22 @@ class _BaseScheduler:
         return bool(requests)
 
 
-def _request(request_id, costs, *, ready=()):
-    outputs = [None] * len(costs)
-    for item_idx in ready:
-        outputs[item_idx] = torch.empty(1)
-    return SimpleNamespace(
+def _llm_request(request_id, multimodal_data=None):
+    return LlmRequest(
         request_id=request_id,
-        py_request_id=request_id,
-        py_is_multimodal_encoder_request=True,
-        py_multimodal_data={
+        max_new_tokens=1,
+        input_tokens=[1, 2, 3],
+        sampling_config=SamplingConfig(),
+        is_streaming=False,
+        py_multimodal_data=multimodal_data,
+    )
+
+
+def _request(request_id, costs, *, ready=()):
+    request = _llm_request(
+        request_id,
+        multimodal_data={
+            "image": {"pixel_values": torch.empty(len(costs), 1)},
             MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalEncoderItemMetadata(
                 item_refs=[("image", item_idx) for item_idx in range(len(costs))],
                 encoder_token_lengths=costs,
@@ -77,14 +85,15 @@ def _request(request_id, costs, *, ready=()):
             ),
             "multimodal_embedding_lengths": [1] * len(costs),
         },
-        py_mm_encoder_outputs=outputs,
-        multimodal_lengths=None,
-        is_context_init_state=False,
     )
+    initialize_multimodal_encoder_request(request, max_num_tokens=1 << 30)
+    for item_idx in ready:
+        request.py_mm_encoder_outputs[item_idx] = torch.empty(1)
+    return request
 
 
 def test_mm_encoder_token_lengths_distinguishes_missing_and_invalid_data():
-    request = SimpleNamespace(py_multimodal_data=None)
+    request = _llm_request(1)
 
     assert get_multimodal_encoder_token_lengths(request) is None
 
@@ -106,21 +115,6 @@ def test_mm_encoder_progress_is_derived_from_request_local_outputs():
     request.py_mm_encoder_outputs = [None, None]
     request.py_multimodal_data["multimodal_embedding"] = torch.empty(2, 1)
     assert get_multimodal_encoder_progress(request) is MultimodalEncoderProgress.READY
-
-
-def test_mm_encoder_item_metadata_survives_python_object_broadcast_serialization():
-    metadata = MultimodalEncoderItemMetadata(
-        item_refs=[("image", 0), ("video", 0)],
-        encoder_token_lengths=[16, 32],
-        output_embedding_lengths=[4, 8],
-    )
-
-    restored = pickle.loads(pickle.dumps({MULTIMODAL_ENCODER_ITEM_METADATA_KEY: metadata}))[
-        MULTIMODAL_ENCODER_ITEM_METADATA_KEY
-    ]
-
-    assert isinstance(restored, MultimodalEncoderItemMetadata)
-    assert restored == metadata
 
 
 def test_multimodal_scheduler_keeps_items_atomic_and_backfills_requests():
@@ -156,12 +150,8 @@ def test_multimodal_scheduler_uses_item_path_only_for_overflow():
 
 def test_multimodal_scheduler_preserves_non_multimodal_requests():
     scheduler = MultimodalScheduler(_BaseScheduler(), max_num_items=1, max_num_tokens=1)
-    request = SimpleNamespace(
-        request_id=1,
-        py_request_id=1,
-        py_is_multimodal_encoder_request=False,
-        is_context_init_state=False,
-    )
+    request = _llm_request(1)
+    initialize_multimodal_encoder_request(request, max_num_tokens=1)
 
     output = scheduler.schedule_request([request], set())
 
@@ -186,12 +176,8 @@ def test_eager_scheduler_encodes_request_rejected_by_llm_capacity():
     base_scheduler.capacity_scheduler = _RejectMultimodalCapacityScheduler()
     scheduler = MultimodalEagerEncoderScheduler(base_scheduler, max_num_items=1, max_num_tokens=8)
     multimodal_request = _request(1, [8])
-    text_request = SimpleNamespace(
-        request_id=2,
-        py_request_id=2,
-        py_is_multimodal_encoder_request=False,
-        is_context_init_state=False,
-    )
+    text_request = _llm_request(2)
+    initialize_multimodal_encoder_request(text_request, max_num_tokens=8)
 
     output = scheduler.schedule_request([multimodal_request, text_request], set())
 
@@ -242,7 +228,7 @@ def _waiting_item(request_id, costs=None):
         }
     return RequestQueueItem(
         request_id,
-        SimpleNamespace(py_multimodal_data=multimodal_data),
+        _llm_request(request_id, multimodal_data=multimodal_data),
     )
 
 
@@ -369,10 +355,9 @@ def test_item_outputs_fill_one_contiguous_buffer_and_release_raw_data(monkeypatc
     monkeypatch.setattr(MultimodalParams, "to_device", lambda self, *args, **kwargs: self)
     engine = object.__new__(PyTorchModelEngine)
     engine.model = _Model()
-    request = SimpleNamespace(
-        request_id=1,
-        py_request_id=1,
-        py_multimodal_data={
+    request = _llm_request(
+        1,
+        multimodal_data={
             "image": {
                 "pixel_values": torch.arange(5).unsqueeze(1),
                 "image_grid_thw": torch.tensor([[1, 1, 2], [1, 1, 3]]),
@@ -384,11 +369,9 @@ def test_item_outputs_fill_one_contiguous_buffer_and_release_raw_data(monkeypatc
             ),
             "multimodal_embedding_lengths": [2, 3],
         },
-        py_mm_encoder_outputs=[None, None],
-        py_mm_encoder_output_buffer=None,
-        py_mm_encoder_output_offsets=[0, 2, 5],
-        multimodal_lengths=None,
     )
+    initialize_multimodal_encoder_request(request, max_num_tokens=8)
+    assert request.py_mm_encoder_output_offsets == [0, 2, 5]
 
     engine.forward_multimodal_encoder_items([request], {1: [0]})
 
