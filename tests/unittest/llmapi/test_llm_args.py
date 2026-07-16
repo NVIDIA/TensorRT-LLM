@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import math
 import tempfile
 from collections import defaultdict
@@ -51,6 +54,7 @@ from tensorrt_llm.llmapi.llm_args import (BaseLlmArgs, CacheTransceiverConfig,
                                           update_llm_args_with_extra_dict)
 # fmt: on
 from tensorrt_llm.llmapi.llm_utils import (_resolve_kv_cache_manager_v2_auto,
+                                           _resolve_transceiver_runtime_auto,
                                            apply_model_defaults_to_llm_args)
 from tensorrt_llm.llmapi.mm_encoder import MultimodalEncoder
 from tensorrt_llm.llmapi.utils import print_traceback_on_error
@@ -450,6 +454,10 @@ def test_KvCacheConfig_declaration():
         kv_cache_event_hash_algo="auto").kv_cache_event_hash_algo == "auto"
     assert KvCacheConfig(kv_cache_event_hash_algo="v1_block_key"
                          ).kv_cache_event_hash_algo == "v1_block_key"
+    assert KvCacheConfig(kv_cache_event_hash_algo="v2_sha256"
+                         ).kv_cache_event_hash_algo == "v2_sha256"
+    assert KvCacheConfig(kv_cache_event_hash_algo="v2_sha256_64"
+                         ).kv_cache_event_hash_algo == "v2_sha256_64"
     assert pybind_config.enable_partial_reuse == True
     assert pybind_config.copy_on_partial_reuse == True
     assert pybind_config.attention_dp_events_gather_period_ms == 10
@@ -2814,3 +2822,296 @@ class TestEnableLowLatencyHostDispatch:
         with pytest.raises(ValidationError):
             TorchLlmArgs(model="gpt2",
                          enable_low_latency_host_dispatch={"val": 1})
+
+
+class _PreferPythonTransceiverModel:
+    """Fake model class opting into the Python transceiver."""
+
+    @classmethod
+    def get_model_defaults(cls, llm_args):
+        return {}
+
+    @classmethod
+    def get_preferred_transceiver_runtime(cls, pretrained_config=None):
+        return "PYTHON"
+
+
+class _ArchSensitiveTransceiverModel:
+    """Fake shared implementation class with a per-checkpoint preference."""
+
+    @classmethod
+    def get_model_defaults(cls, llm_args):
+        return {}
+
+    @classmethod
+    def get_preferred_transceiver_runtime(cls, pretrained_config=None):
+        architectures = getattr(pretrained_config, "architectures", None) or []
+        if architectures and architectures[0] == "ModelAForCausalLM":
+            return "PYTHON"
+        return None
+
+
+class TestTransceiverRuntimeAutoResolution:
+    """Tests for the transceiver_runtime 'auto' selection mechanism."""
+
+    def _disagg_args(self, backend="NIXL", **cfg_kwargs):
+        return TorchLlmArgs(
+            model="/tmp/dummy_model",
+            cache_transceiver_config=CacheTransceiverConfig(backend=backend,
+                                                            **cfg_kwargs),
+        )
+
+    def test_default_is_auto(self):
+        cfg = CacheTransceiverConfig(backend="NIXL")
+        assert cfg.transceiver_runtime == "auto"
+
+    def test_auto_no_model_preference_falls_back_to_none(self):
+        """'auto' with no model preference resolves to None (C++ transceiver)."""
+        args = self._disagg_args()
+        _resolve_transceiver_runtime_auto(args)
+        assert args.cache_transceiver_config.transceiver_runtime is None
+
+    @pytest.mark.parametrize("explicit_auto", [False, True])
+    def test_model_preference_adopted(self, explicit_auto):
+        """Model preference applies whether 'auto' is implicit or explicit."""
+        cfg_kwargs = {"transceiver_runtime": "auto"} if explicit_auto else {}
+        args = self._disagg_args(**cfg_kwargs)
+        _resolve_transceiver_runtime_auto(args, _PreferPythonTransceiverModel)
+        assert args.cache_transceiver_config.transceiver_runtime == "PYTHON"
+
+    @pytest.mark.parametrize("explicit_runtime", ["CPP", "PYTHON", None])
+    def test_explicit_value_not_overridden_by_model_preference(
+            self, explicit_runtime):
+        """User's explicit transceiver_runtime wins over the model preference."""
+        args = self._disagg_args(transceiver_runtime=explicit_runtime)
+        _resolve_transceiver_runtime_auto(args, _PreferPythonTransceiverModel)
+        assert args.cache_transceiver_config.transceiver_runtime == explicit_runtime
+
+    @pytest.mark.parametrize("backend", ["UCX", "MPI", "MOONCAKE"])
+    def test_python_preference_incompatible_backend_falls_back_to_cpp(
+            self, backend):
+        """Python transceiver requires NIXL; other backends fall back to C++."""
+        args = self._disagg_args(backend=backend)
+        _resolve_transceiver_runtime_auto(args, _PreferPythonTransceiverModel)
+        assert args.cache_transceiver_config.transceiver_runtime is None
+
+    def test_default_backend_resolves_to_nixl_and_adopts_preference(
+            self, monkeypatch):
+        for env_var in ("TRTLLM_USE_NIXL_KVCACHE", "TRTLLM_USE_UCX_KVCACHE",
+                        "TRTLLM_USE_MOONCAKE_KVCACHE",
+                        "TRTLLM_USE_MPI_KVCACHE"):
+            monkeypatch.delenv(env_var, raising=False)
+        args = self._disagg_args(backend="DEFAULT")
+        _resolve_transceiver_runtime_auto(args, _PreferPythonTransceiverModel)
+        assert args.cache_transceiver_config.transceiver_runtime == "PYTHON"
+        # The resolver only peeks at the effective backend; the "DEFAULT"
+        # sentinel is still resolved (with its warning) at transceiver
+        # creation time.
+        assert args.cache_transceiver_config.backend == "DEFAULT"
+
+    def test_default_backend_env_override_falls_back_to_cpp(self, monkeypatch):
+        """DEFAULT + TRTLLM_USE_UCX_KVCACHE=1 means effective UCX -> C++."""
+        monkeypatch.delenv("TRTLLM_USE_NIXL_KVCACHE", raising=False)
+        monkeypatch.setenv("TRTLLM_USE_UCX_KVCACHE", "1")
+        args = self._disagg_args(backend="DEFAULT")
+        _resolve_transceiver_runtime_auto(args, _PreferPythonTransceiverModel)
+        assert args.cache_transceiver_config.transceiver_runtime is None
+
+    def test_disagg_disabled_is_noop(self):
+        """Resolver never creates a config when cache_transceiver_config is None."""
+        args = TorchLlmArgs(model="/tmp/dummy_model")
+        assert args.cache_transceiver_config is None
+        _resolve_transceiver_runtime_auto(args, _PreferPythonTransceiverModel)
+        assert args.cache_transceiver_config is None
+
+    def test_backend_none_is_noop(self):
+        """A config without a backend (disagg off) is left untouched."""
+        args = TorchLlmArgs(
+            model="/tmp/dummy_model",
+            cache_transceiver_config=CacheTransceiverConfig(),
+        )
+        _resolve_transceiver_runtime_auto(args, _PreferPythonTransceiverModel)
+        assert args.cache_transceiver_config.backend is None
+        assert args.cache_transceiver_config.transceiver_runtime == "auto"
+
+    def test_invalid_model_preference_raises(self):
+
+        class _BadModel:
+
+            @classmethod
+            def get_preferred_transceiver_runtime(cls, pretrained_config=None):
+                return "JAVA"
+
+        args = self._disagg_args()
+        with pytest.raises(ValueError, match="JAVA"):
+            _resolve_transceiver_runtime_auto(args, _BadModel)
+
+    @pytest.mark.parametrize("disagg_enabled", [False, True])
+    @pytest.mark.parametrize("transceiver_defaults", [
+        {
+            "transceiver_runtime": "PYTHON"
+        },
+        {
+            "max_tokens_in_buffer": 4096
+        },
+        {
+            "backend": "NIXL"
+        },
+    ])
+    def test_model_defaults_reject_cache_transceiver_config(
+            self, disagg_enabled, transceiver_defaults):
+        """get_model_defaults must never carry cache_transceiver_config.
+
+        The deep-merge could materialize a config in aggregated mode or
+        silently enable a disabled one; the runtime preference belongs to
+        get_preferred_transceiver_runtime().
+        """
+        args = (self._disagg_args() if disagg_enabled else TorchLlmArgs(
+            model="/tmp/dummy_model"))
+        with pytest.raises(ValueError, match="cache_transceiver_config"):
+            apply_model_defaults_to_llm_args(
+                args, {"cache_transceiver_config": transceiver_defaults})
+        if not disagg_enabled:
+            assert args.cache_transceiver_config is None
+
+    def test_model_defaults_reject_transceiver_config_object_form(self):
+        """A Pydantic object value must not bypass the guard either."""
+        args = TorchLlmArgs(model="/tmp/dummy_model")
+        with pytest.raises(ValueError, match="cache_transceiver_config"):
+            apply_model_defaults_to_llm_args(
+                args, {
+                    "cache_transceiver_config":
+                    CacheTransceiverConfig(backend="NIXL",
+                                           transceiver_runtime="PYTHON")
+                })
+        assert args.cache_transceiver_config is None
+
+    def test_model_loader_resolves_auto_without_checkpoint_loader(self):
+        """The checkpoint_loader=None early return must still resolve 'auto'."""
+        from tensorrt_llm._torch.pyexecutor.model_loader import ModelLoader
+        args = self._disagg_args()
+        ModelLoader.load_config_and_apply_defaults("/tmp/dummy_model", args,
+                                                   None)
+        assert args.cache_transceiver_config.transceiver_runtime is None
+
+    @staticmethod
+    def _fake_checkpoint_loader(architectures):
+        from unittest.mock import MagicMock
+        fake_loader = MagicMock()
+        fake_config = MagicMock()
+        fake_config.pretrained_config.architectures = architectures
+        fake_loader.load_config.return_value = fake_config
+        return fake_loader
+
+    def test_model_loader_full_chain_adopts_model_preference(self, monkeypatch):
+        """End-to-end: load config -> resolve model class -> adopt preference."""
+        from tensorrt_llm._torch.pyexecutor import \
+            model_loader as model_loader_mod
+
+        monkeypatch.setattr(
+            model_loader_mod.AutoModelForCausalLM, "_resolve_class",
+            staticmethod(lambda config: _PreferPythonTransceiverModel))
+        fake_loader = self._fake_checkpoint_loader(["NotInMappingForCausalLM"])
+
+        args = self._disagg_args()
+        model_loader_mod.ModelLoader.load_config_and_apply_defaults(
+            "/tmp/dummy_model", args, fake_loader)
+        assert args.cache_transceiver_config.transceiver_runtime == "PYTHON"
+
+    @pytest.mark.parametrize("arch,expected", [
+        ("ModelAForCausalLM", "PYTHON"),
+        ("ModelBForCausalLM", None),
+    ])
+    def test_shared_class_differentiates_per_architecture(
+            self, monkeypatch, arch, expected):
+        """Shared implementation classes differentiate per checkpoint.
+
+        The preference hook receives pretrained_config so one implementation
+        class can vary its answer by architecture.
+        """
+        from tensorrt_llm._torch.pyexecutor import \
+            model_loader as model_loader_mod
+
+        monkeypatch.setattr(
+            model_loader_mod.AutoModelForCausalLM, "_resolve_class",
+            staticmethod(lambda config: _ArchSensitiveTransceiverModel))
+        fake_loader = self._fake_checkpoint_loader([arch])
+
+        args = self._disagg_args()
+        model_loader_mod.ModelLoader.load_config_and_apply_defaults(
+            "/tmp/dummy_model", args, fake_loader)
+        assert args.cache_transceiver_config.transceiver_runtime == expected
+
+    def test_mtp_execution_class_rewrite_keeps_target_preference(
+            self, monkeypatch):
+        """The MTP execution-class rewrite keeps the target's preference.
+
+        _resolve_class may return an execution class (MTP draft); the
+        preference must still follow the checkpoint's original architecture
+        via MODEL_CLASS_MAPPING.
+        """
+        from tensorrt_llm._torch.models.modeling_utils import \
+            MODEL_CLASS_MAPPING
+        from tensorrt_llm._torch.pyexecutor import \
+            model_loader as model_loader_mod
+
+        class _MtpDraftExecutionModel:
+
+            @classmethod
+            def get_model_defaults(cls, llm_args):
+                return {}
+
+            @classmethod
+            def get_preferred_transceiver_runtime(cls, pretrained_config=None):
+                return None
+
+        monkeypatch.setitem(MODEL_CLASS_MAPPING, "FakeTargetForCausalLM",
+                            _PreferPythonTransceiverModel)
+        monkeypatch.setattr(
+            model_loader_mod.AutoModelForCausalLM, "_resolve_class",
+            staticmethod(lambda config: _MtpDraftExecutionModel))
+        fake_loader = self._fake_checkpoint_loader(["FakeTargetForCausalLM"])
+
+        args = self._disagg_args()
+        model_loader_mod.ModelLoader.load_config_and_apply_defaults(
+            "/tmp/dummy_model", args, fake_loader)
+        assert args.cache_transceiver_config.transceiver_runtime == "PYTHON"
+
+    def test_model_loader_full_chain_aggregated_stays_none(self, monkeypatch):
+        """Full chain in aggregated mode: no transceiver config appears."""
+        from tensorrt_llm._torch.pyexecutor import \
+            model_loader as model_loader_mod
+
+        monkeypatch.setattr(
+            model_loader_mod.AutoModelForCausalLM, "_resolve_class",
+            staticmethod(lambda config: _PreferPythonTransceiverModel))
+        fake_loader = self._fake_checkpoint_loader(["NotInMappingForCausalLM"])
+
+        args = TorchLlmArgs(model="/tmp/dummy_model")
+        model_loader_mod.ModelLoader.load_config_and_apply_defaults(
+            "/tmp/dummy_model", args, fake_loader)
+        assert args.cache_transceiver_config is None
+
+    def test_resolve_default_backend_env_priority(self, monkeypatch):
+        env_vars = ("TRTLLM_USE_NIXL_KVCACHE", "TRTLLM_USE_UCX_KVCACHE",
+                    "TRTLLM_USE_MOONCAKE_KVCACHE", "TRTLLM_USE_MPI_KVCACHE")
+        for env_var in env_vars:
+            monkeypatch.delenv(env_var, raising=False)
+        cfg = CacheTransceiverConfig(backend="DEFAULT")
+
+        # No env var set: NIXL fallback.
+        assert cfg._resolve_default_backend() == ("NIXL", None)
+        # Each env var alone, then stacked in reverse priority order: the
+        # higher-priority variable must win.
+        monkeypatch.setenv("TRTLLM_USE_MPI_KVCACHE", "1")
+        assert cfg._resolve_default_backend() == ("MPI",
+                                                  "TRTLLM_USE_MPI_KVCACHE")
+        monkeypatch.setenv("TRTLLM_USE_MOONCAKE_KVCACHE", "1")
+        assert cfg._resolve_default_backend()[0] == "MOONCAKE"
+        monkeypatch.setenv("TRTLLM_USE_UCX_KVCACHE", "1")
+        assert cfg._resolve_default_backend()[0] == "UCX"
+        monkeypatch.setenv("TRTLLM_USE_NIXL_KVCACHE", "1")
+        assert cfg._resolve_default_backend()[0] == "NIXL"
+        # An explicit backend bypasses the env vars entirely.
+        assert CacheTransceiverConfig(
+            backend="UCX")._resolve_default_backend() == ("UCX", None)

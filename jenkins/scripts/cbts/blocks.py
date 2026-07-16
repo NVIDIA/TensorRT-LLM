@@ -508,6 +508,9 @@ def parse_stages_from_groovy(
     current_arch: Optional[str] = None
 
     for line in groovy_path.read_text().splitlines():
+        # Skip commented-out lines: disabled stage configs must not be parsed.
+        if line.lstrip().startswith("//"):
+            continue
         open_match = _MAP_OPEN_RE.search(line.rstrip())
         if open_match:
             # Reset on every map opening — including unfamiliar ones — so a
