@@ -179,6 +179,8 @@ l0_b200:
   - unittest/_torch/modeling/test_gemma4_multimodal.py
   - unittest/_torch/modeling/test_gemma4_e2e_dummy.py::test_e2e_text_26b_dummy
   - unittest/_torch/modeling/test_gemma4_e2e_dummy.py::test_e2e_text_e2b_dummy
+  - unittest/_torch/modeling/test_gemma4_e2e_dummy.py::test_e2e_text_e2b_dummy_small_max_seq_len[256]
+  - unittest/_torch/modeling/test_gemma4_e2e_dummy.py::test_e2e_text_e2b_dummy_small_max_seq_len[512]
   - unittest/_torch/modeling/test_gemma4_e2e_dummy.py::test_e2e_text_31b_dummy
   - unittest/_torch/modeling/test_gemma4_e2e_dummy.py::test_e2e_text_e4b_dummy
   - unittest/_torch/modeling/test_gemma4_e2e_dummy.py::test_e2e_multimodal_26b_dummy
