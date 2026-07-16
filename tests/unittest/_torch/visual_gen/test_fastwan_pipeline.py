@@ -117,7 +117,6 @@ class TestFastWanComponentAccuracy:
         )
 
 
-
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 class TestFastWanForward:
     """Run the full forward() pass and validate the output video shape."""
