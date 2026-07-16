@@ -2455,6 +2455,17 @@ def create_py_executor_instance(
                             if scheduler_config is not None else
                             WaitingQueuePolicy.FCFS)
 
+    # For enc-dec models max_seq_len covers the (longer) encoder sequence, so
+    # cap the executor's per-request max_tokens at the decoder position table
+    # (max_target_positions).
+    executor_max_seq_len = max_seq_len
+    if model_engine.model.model_config.is_encoder_decoder:
+        decoder_position_limit = getattr(config, "max_target_positions", None)
+        if (decoder_position_limit is not None
+                and executor_max_seq_len is not None):
+            executor_max_seq_len = min(executor_max_seq_len,
+                                       int(decoder_position_limit))
+
     return PyExecutor(
         resource_manager,
         scheduler,
@@ -2478,7 +2489,7 @@ def create_py_executor_instance(
         garbage_collection_gen0_threshold=garbage_collection_gen0_threshold,
         kv_connector_manager=kv_connector_manager,
         resource_governor_queue=resource_governor_queue,
-        max_seq_len=max_seq_len,
+        max_seq_len=executor_max_seq_len,
         peft_cache_config=peft_cache_config,
         virtual_memory_pools=virtual_memory_pools,
         execution_stream=execution_stream,

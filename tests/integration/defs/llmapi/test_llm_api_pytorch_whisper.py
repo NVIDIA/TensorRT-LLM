@@ -194,6 +194,20 @@ def test_whisper_pytorch_transcribe_end_to_end(monkeypatch):
         assert german_text
         assert _EXPECTED_TRANSCRIPT_FRAGMENT not in german_text.lower()
 
+        # PreprocessedInputs skips the input processor, so the executor-side
+        # max_tokens clamp is what bounds generation to the decoder table (448)
+        # rather than the encoder-sized max_seq_len. ignore_eos forces the
+        # request to reach that cap.
+        preprocessed = llm.preprocess(
+            _audio_prompt(wave, sample_rate), SamplingParams(temperature=0.0)
+        )
+        fresh_params = SamplingParams(temperature=0.0, max_tokens=10_000, ignore_eos=True)
+        result = llm.generate_async(preprocessed, fresh_params).result()
+        generated = list(result.outputs[0].token_ids)
+        assert len(generated) == 448 - len(preprocessed.prompt_token_ids)
+        expected = _EXPECTED_GREEDY_OUTPUT_TOKEN_IDS
+        assert generated[: len(expected)] == expected
+
 
 def test_whisper_pytorch_beam_search(monkeypatch):
     """Beam-2 transcription (cross-KV shared across beams)."""
