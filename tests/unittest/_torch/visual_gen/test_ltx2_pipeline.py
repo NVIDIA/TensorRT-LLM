@@ -1251,6 +1251,7 @@ class TestLTX2TwoStageLoRAHelpers:
             ltx2_two_stages.CUDAGraphRunnerConfig(use_cuda_graph=True),
             lambda: state["lora"],
             lambda: state["topology"],
+            lambda: state["topology"],
         )
 
         keys = {}
@@ -1263,6 +1264,103 @@ class TestLTX2TwoStageLoRAHelpers:
         for (lora, topology), key in keys.items():
             assert key[-2] == ("ltx2_two_stage_lora_state", lora)
             assert key[-1] == ("ltx2_two_stage_topology", topology)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_two_stage_cuda_graph_rejects_topology_mismatch(self):
+        """Capture and replay both fail fast when the graph key's topology does
+        not match the transformer's active topology (key flipped without the
+        switch, or the switch without the key)."""
+        key_state = {"topology": "default"}
+        xf_state = {"topology": "default"}
+        runner = ltx2_two_stages._LTX2TwoStageCUDAGraphRunner(
+            ltx2_two_stages.CUDAGraphRunnerConfig(use_cuda_graph=True),
+            lambda: "original",
+            lambda: key_state["topology"],
+            lambda: xf_state["topology"],
+        )
+        lin = torch.nn.Linear(8, 8, device="cuda")
+        wrapped = runner.wrap(lin.forward)
+        x = torch.randn(2, 8, device="cuda")
+
+        # Mismatch on a fresh key: capture must refuse before creating a graph.
+        key_state["topology"] = "stage2"
+        with pytest.raises(RuntimeError, match="does not match"):
+            wrapped(x)
+        assert not runner.graphs
+
+        # Matched states capture and replay normally.
+        xf_state["topology"] = "stage2"
+        wrapped(x)
+        assert len(runner.graphs) == 1
+        wrapped(x)
+
+        # Existing graph + transformer flipped back: replay must refuse.
+        xf_state["topology"] = "default"
+        with pytest.raises(RuntimeError, match="does not match"):
+            wrapped(x)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_two_stage_warmup_precaptures_both_topologies(self):
+        """A warmup pass crossing the stage boundary leaves one captured graph
+        per topology; a same-shape real request replays with zero new captures."""
+
+        class TinyTransformer:
+            def __init__(self):
+                self.lin = torch.nn.Linear(8, 8, device="cuda")
+                self.active_topology = "default"
+
+            def forward(self, x):
+                return self.lin(x)
+
+        pipeline = object.__new__(ltx2_two_stages.LTX2TwoStagesPipeline)
+        pipeline.pipeline_config = DiffusionPipelineConfig(
+            cuda_graph=CudaGraphConfig(enable=True),
+            torch_compile=TorchCompileConfig(enable=False),
+        )
+        pipeline.transformer = TinyTransformer()
+        pipeline._cuda_graph_runners = {}
+        pipeline._setup_cuda_graphs()
+        runner = pipeline._cuda_graph_runners["transformer"]
+
+        x = torch.randn(2, 8, device="cuda")
+
+        def run_stage(topology):
+            pipeline._stage2_topology_state = topology
+            pipeline.transformer.active_topology = topology
+            return pipeline.transformer.forward(x)
+
+        run_stage("default")
+        run_stage("stage2")
+        assert sorted(key[-1] for key in runner.graphs) == [
+            ("ltx2_two_stage_topology", "default"),
+            ("ltx2_two_stage_topology", "stage2"),
+        ]
+
+        captures = []
+        original_capture = runner.capture
+        runner.capture = lambda *a, **k: (captures.append(a), original_capture(*a, **k))
+        run_stage("default")
+        run_stage("stage2")
+        assert not captures, "post-warmup request re-captured a graph"
+        assert len(runner.graphs) == 2
+
+    def test_two_stage_forward_rejects_indivisible_stage2_tokens(self):
+        """forward() fails fast at request entry when the full-resolution token
+        count does not divide the stage-2 seq-plane size."""
+        lat = ltx2_two_stages.VideoLatentShape.from_pixel_shape(
+            ltx2_two_stages.VideoPixelShape(batch=1, frames=121, height=512, width=768, fps=24.0)
+        )
+        tokens = lat.frames * lat.height * lat.width
+        bad_size = next(s for s in (7, 11, 13) if tokens % s != 0)
+
+        pipeline = object.__new__(ltx2_two_stages.LTX2TwoStagesPipeline)
+        pipeline.transformer = SimpleNamespace(
+            _has_stage2=True,
+            _sharder_s2=SimpleNamespace(size=bad_size),
+        )
+
+        with pytest.raises(ValueError, match="not divisible by the stage-2"):
+            pipeline.forward(prompt="x", seed=0, height=512, width=768, num_frames=121)
 
     def test_two_stage_cuda_graph_setup_uses_pipeline_config(self):
         """CUDA graph setup runs before the two-stage model_config is assigned."""

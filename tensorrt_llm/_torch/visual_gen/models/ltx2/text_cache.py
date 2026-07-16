@@ -42,6 +42,10 @@ class TextCache:
         audio_cross_pe: Sharded-local RoPE for audio AV cross-attn (audio-video model only).
         video_kv: Per-layer pre-projected text K/V for video cross-attention.
         audio_kv: Per-layer pre-projected text K/V for audio cross-attention.
+        topology: Sharding topology active at cache-build time (``"default"``
+            or ``"stage2"``). PE shards and pads are topology-dependent;
+            ``LTXModel.forward`` rejects a cache whose topology does not
+            match the currently active one.
     """
 
     video_context: Optional[torch.Tensor] = None
@@ -54,3 +58,4 @@ class TextCache:
     audio_pe: Optional[tuple[torch.Tensor, torch.Tensor]] = None
     audio_cross_pe: Optional[tuple[torch.Tensor, torch.Tensor]] = None
     audio_kv: Optional[list[tuple[torch.Tensor, torch.Tensor]]] = None
+    topology: str = "default"

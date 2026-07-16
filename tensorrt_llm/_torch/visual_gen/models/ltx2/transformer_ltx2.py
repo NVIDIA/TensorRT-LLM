@@ -1601,6 +1601,7 @@ class LTXModel(BaseDiffusionModel):
             self._sharder_s2 = self._sharder
         self._active_sharder = self._sharder
         self._active_seq_size = self._active_sharder.size
+        self._active_topology = "default"
         self._cp_size = vgm.cp_size if vgm is not None else 1
         self._ulysses_size = vgm.ulysses_size if vgm is not None else 1
         if (
@@ -2063,6 +2064,13 @@ class LTXModel(BaseDiffusionModel):
             return AudioShardMode.NONE
         return AudioShardMode.CONDITIONAL if self._audio_conditional_shard else AudioShardMode.FULL
 
+    @property
+    def active_topology(self) -> str:
+        """``"stage2"`` iff the stage-2 sharder/attention stacks are active,
+        else ``"default"``. Values match the two-stage pipeline's graph-key
+        topology strings."""
+        return self._active_topology
+
     def set_ulysses_topology(self, is_stage2: bool = False) -> None:
         """Switch every topology-bound piece between the default and stage-2
         layouts: the active sharder on the model and every block, and the
@@ -2076,6 +2084,7 @@ class LTXModel(BaseDiffusionModel):
         assert self._has_stage2, "set_ulysses_topology on a transformer built without stage2 groups"
         self._active_sharder = self._sharder_s2 if is_stage2 else self._sharder
         self._active_seq_size = self._active_sharder.size
+        self._active_topology = "stage2" if is_stage2 else "default"
         for block in self.transformer_blocks:
             target = block.inner if isinstance(block, LTX2CacheDiTPattern0BlockWrapper) else block
             target._active_sharder = target._sharder_s2 if is_stage2 else target._sharder
@@ -2191,6 +2200,7 @@ class LTXModel(BaseDiffusionModel):
             audio_pe=a_pe,
             audio_cross_pe=a_cross_pe,
             audio_kv=a_kv,
+            topology=self._active_topology,
         )
 
     def forward(
@@ -2223,6 +2233,15 @@ class LTXModel(BaseDiffusionModel):
         Returns:
             Tuple of (video_output, audio_output) velocity predictions.
         """
+        # The cache's PE shards/pads are topology-dependent; reject one built
+        # under the other topology (i.e. prepare_text_cache() was called before
+        # set_ulysses_topology()).
+        if text_cache.topology != self._active_topology:
+            raise RuntimeError(
+                f"text_cache was prepared under topology '{text_cache.topology}' "
+                f"but '{self._active_topology}' is active; call "
+                "prepare_text_cache() after set_ulysses_topology()."
+            )
         # Topology guard for torch.compile: a plain int read makes dynamo install
         # a value guard, so the default and stage-2 topologies never share a
         # compiled artifact (belt to the CUDA-graph key's suspenders).

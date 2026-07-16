@@ -929,17 +929,25 @@ class _PersistentLoRAWeightCache:
 
 
 class _LTX2TwoStageCUDAGraphRunner(_LTX2CUDAGraphRunner):
-    """CUDA graph runner keyed by LTX-2 two-stage LoRA weight state."""
+    """CUDA graph runner keyed by LTX-2 two-stage LoRA weight state.
+
+    ``topology_getter`` (the pipeline's key state) feeds the graph key;
+    ``transformer_topology_getter`` (the transformer's actual state) is
+    cross-checked against the key before every capture and replay, so a
+    stale graph can never run against a transformer in the other topology.
+    """
 
     def __init__(
         self,
         config: CUDAGraphRunnerConfig,
         lora_state_getter: Callable[[], str],
         topology_getter: Callable[[], str],
+        transformer_topology_getter: Callable[[], str],
     ) -> None:
         super().__init__(config)
         self._lora_state_getter = lora_state_getter
         self._topology_getter = topology_getter
+        self._transformer_topology_getter = transformer_topology_getter
 
     def get_graph_key(self, *args, **kwargs):
         return (
@@ -947,6 +955,27 @@ class _LTX2TwoStageCUDAGraphRunner(_LTX2CUDAGraphRunner):
             ("ltx2_two_stage_lora_state", self._lora_state_getter()),
             ("ltx2_two_stage_topology", self._topology_getter()),
         )
+
+    def _check_topology(self, key) -> None:
+        for name, value in reversed(key):
+            if name == "ltx2_two_stage_topology":
+                active = self._transformer_topology_getter()
+                if value != active:
+                    raise RuntimeError(
+                        f"CUDA graph key topology '{value}' does not match the "
+                        f"transformer's active topology '{active}'; the graph key "
+                        "must be set before set_ulysses_topology() on entry and "
+                        "restored after it on exit."
+                    )
+                return
+
+    def capture(self, key, fn, args, kwargs) -> None:
+        self._check_topology(key)
+        super().capture(key, fn, args, kwargs)
+
+    def replay(self, key, args, kwargs):
+        self._check_topology(key)
+        return super().replay(key, args, kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -1044,6 +1073,7 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
             CUDAGraphRunnerConfig(use_cuda_graph=True),
             self._current_lora_cuda_graph_state,
             self._current_topology_state,
+            lambda: self.transformer.active_topology,
         )
         compile_note = " (with torch.compile)" if self.pipeline_config.torch_compile.enable else ""
         logger.info(

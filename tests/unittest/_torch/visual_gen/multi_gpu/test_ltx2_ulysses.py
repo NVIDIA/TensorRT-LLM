@@ -443,6 +443,23 @@ def _logic_ltx2_dual_topology(rank, world_size, backend, audio_seq_len):
     with torch.no_grad():
         ref_v, ref_a = ref_model(video=video, audio=audio, text_cache=ref_cache)
 
+    # Ordering invariant: a cache built under the default topology must be
+    # rejected once stage2 is active (prepare_text_cache before the switch).
+    stale_cache = d_model.prepare_text_cache(
+        video_context=v_ctx,
+        video_positions=v_pos,
+        audio_context=a_ctx,
+        audio_positions=a_pos,
+        dtype=dtype,
+    )
+    d_model.set_ulysses_topology(is_stage2=True)
+    try:
+        with torch.no_grad():
+            d_model(video=video, audio=audio, text_cache=stale_cache)
+        raise AssertionError(f"Rank {rank}: stale-topology text_cache was not rejected")
+    except RuntimeError as e:
+        assert "prepared under topology 'default'" in str(e), f"Rank {rank}: {e}"
+
     x = torch.randn(1, 32, 8, device=device, dtype=dtype)
     for is_stage2 in (False, True, False, True):
         d_model.set_ulysses_topology(is_stage2=is_stage2)
@@ -567,6 +584,31 @@ def _logic_ltx2_full_audio_construction(rank, world_size, backend, audio_seq_len
         tl._LTX2_AUDIO_CONDITIONAL_SHARD = orig
 
 
+def _logic_ltx2_stage2_head_divisibility_raises(rank, world_size, backend, _unused):
+    """Construction fails fast when the head count divides the stage-1 ulysses
+    size (u = ws/2) but not the stage-2 group size (cfg*u = ws)."""
+    from tensorrt_llm._torch.visual_gen.models.ltx2.transformer_ltx2 import LTXModel, LTXModelType
+
+    d_cfg = _make_model_config_cfg(cfg_size=2, ulysses_size=world_size // 2, backend=backend)
+    s2 = _build_stage2_groups_for_test(d_cfg.visual_gen_mapping)
+    bad = dict(
+        _AV_CONFIG,
+        num_attention_heads=6,
+        cross_attention_dim=6 * _AV_CONFIG["attention_head_dim"],
+    )
+    assert 6 % (world_size // 2) == 0 and 6 % world_size != 0
+    try:
+        LTXModel(
+            model_type=LTXModelType.AudioVideo,
+            model_config=d_cfg,
+            stage2_groups=s2,
+            **bad,
+        )
+        raise AssertionError(f"Rank {rank}: indivisible stage-2 head count was not rejected")
+    except ValueError as e:
+        assert "stage-2 ulysses requires" in str(e), f"Rank {rank}: {e}"
+
+
 class TestLTX2TopologySwitch:
     """{default, stage2} dual-topology switch on 4 GPUs (cfg2 x u2 -> u4):
     pointer alternation, shard/gather round-trip, and whole-dataflow numerical
@@ -578,3 +620,6 @@ class TestLTX2TopologySwitch:
 
     def test_full_audio_mode_construction_and_switch(self):
         run_test_in_distributed(4, _logic_ltx2_full_audio_construction, "VANILLA", 64)
+
+    def test_stage2_head_divisibility_raises(self):
+        run_test_in_distributed(4, _logic_ltx2_stage2_head_divisibility_raises, "VANILLA", 0)
