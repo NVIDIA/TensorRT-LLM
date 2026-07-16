@@ -198,7 +198,8 @@ from tensorrt_llm.sampling_params import SamplingParams
     "--duration",
     type=int,
     default=None,
-    help="Maximum run time in seconds. Benchmark stops at whichever limit is hit first (num_requests or duration).",
+    help=
+    "Maximum run time in seconds. Benchmark stops at whichever limit is hit first (num_requests or duration).",
 )
 @optgroup.option(
     "--warmup",

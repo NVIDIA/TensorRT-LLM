@@ -142,6 +142,7 @@ async def test_llm_manager_duration_not_exceeded():
 @pytest.mark.asyncio
 async def test_async_benchmark_duration():
     from unittest.mock import patch
+
     from tensorrt_llm.bench.benchmark.utils.asynchronous import async_benchmark
 
     # Mock LLM
@@ -169,9 +170,10 @@ async def test_async_benchmark_duration():
     requests = [req, req, req]
 
     # Patch EnergyMonitor and tqdm so we don't depend on actual NVML / environment
-    with patch('tensorrt_llm.bench.benchmark.utils.asynchronous.EnergyMonitor') as mock_energy, \
-         patch('tensorrt_llm.bench.benchmark.utils.asynchronous.tqdm.tqdm') as mock_tqdm:
-
+    with (
+        patch("tensorrt_llm.bench.benchmark.utils.asynchronous.EnergyMonitor") as mock_energy,
+        patch("tensorrt_llm.bench.benchmark.utils.asynchronous.tqdm.tqdm"),
+    ):
         # Mock the context manager of EnergyMonitor
         mock_energy.return_value.__enter__.return_value.total_energy = 100.0
 

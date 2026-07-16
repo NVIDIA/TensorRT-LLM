@@ -225,7 +225,8 @@ class LlmManager:
             while not self._stop.is_set():
                 self._raise_for_failed_tasks()
 
-                if self.duration is not None and self.start_time and time.perf_counter() - self.start_time >= self.duration:
+                if self.duration is not None and self.start_time and time.perf_counter(
+                ) - self.start_time >= self.duration:
                     logger.info("Duration reached. Stopping pulling requests.")
                     while not self._inbox.empty():
                         try:
@@ -252,11 +253,15 @@ class LlmManager:
         finally:
             logger.debug("Worker task finishing...")
             if self._stop.is_set():
-                logger.debug("Worker task cancelling remaining requests due to stop signal...")
+                logger.debug(
+                    "Worker task cancelling remaining requests due to stop signal..."
+                )
                 for task in self._tasks:
                     task.cancel()
             else:
-                logger.debug("Worker task exiting. Waiting for in-flight tasks to complete...")
+                logger.debug(
+                    "Worker task exiting. Waiting for in-flight tasks to complete..."
+                )
             logger.debug("Waiting for requests...")
             if self._tasks:
                 await asyncio.wait(self._tasks)
@@ -436,7 +441,9 @@ async def async_benchmark(
             if duration is None:
                 assert finished_requests == len(requests), "Benchmark failed"
             elif finished_requests < len(requests):
-                logger.info(f"Duration limit reached. Processed {finished_requests}/{len(requests)} requests.")
+                logger.info(
+                    f"Duration limit reached. Processed {finished_requests}/{len(requests)} requests."
+                )
 
         statistics.set_energy(monitor.total_energy)
         logger.info("Benchmark complete.")
