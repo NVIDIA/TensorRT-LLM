@@ -39,13 +39,13 @@ _QUANT_CHOICES = ("none", "nvfp4")
 _DIST_CONFIG_DEFAULT_CLI = "tep"
 _DIST_CONFIG_DEFAULT_AUTO = "tp-only"
 
-# This value is rewritten to ``llmc`` with the copied tests. Resolve the package
+# This value is rewritten to ``paragraf`` with the copied tests. Resolve the package
 # without importing it so test collection does not eagerly load every custom model.
 _AUTO_DEPLOY_PACKAGE = "tensorrt_llm._torch.auto_deploy"
 
-# These modeling files cannot participate in standalone LLMC auto-discovery.
+# These modeling files cannot participate in standalone Paragraf auto-discovery.
 # They either depend on TRT-LLM-only router ops, need trust-remote-code config
-# classes that LLMC does not package, or are conditional-generation models not
+# classes that Paragraf does not package, or are conditional-generation models not
 # registered as CausalLM classes for this harness. Keep canonical discovery
 # unchanged so the native TensorRT-LLM test matrix still covers them.
 _STANDALONE_DISCOVERY_EXCLUDED = {
@@ -157,7 +157,7 @@ def _discover_modeling_files() -> list:
     Deterministic ordering is important: a flaky test mapped to a different
     parametrize id from run to run would mislead bisection.
     """
-    excluded = _STANDALONE_DISCOVERY_EXCLUDED if _AUTO_DEPLOY_PACKAGE == "llmc" else set()
+    excluded = _STANDALONE_DISCOVERY_EXCLUDED if _AUTO_DEPLOY_PACKAGE == "paragraf" else set()
     return sorted(
         str(path) for path in _MODELING_DIR.glob("modeling_*.py") if path.name not in excluded
     )

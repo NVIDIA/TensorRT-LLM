@@ -27,7 +27,7 @@ from tensorrt_llm._torch.modules.multi_stream_utils import \
     maybe_execute_in_parallel
 from tensorrt_llm._torch.modules.rotary_embedding import RotaryEmbedding
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
-from tensorrt_llm._torch.utils import maybe_compile
+from tensorrt_llm._torch.utils import Fp4QuantizedTensor, maybe_compile
 from tensorrt_llm._utils import (get_size_in_bytes, get_sm_version,
                                  maybe_pin_memory, prefer_pinned)
 from tensorrt_llm.bindings import DataType
@@ -2388,10 +2388,12 @@ class Indexer(nn.Module):
         has_prefill = num_contexts > 0
         num_gen_tokens = num_tokens - num_ctx_tokens
 
-        topk_indices_buffer = torch.empty(
+        topk_indices_buffer = metadata.get_empty(
+            metadata.cuda_graph_buffers,
             (hidden_states.shape[0], self.index_topk),
+            cache_name="indexer_topk_out_buffer",
             dtype=torch.int32,
-            device=hidden_states.device)
+            capture_graph=metadata.is_cuda_graph)
         if not use_custom_topk:
             topk_indices_buffer[:hidden_states.shape[0]] = -1
 
@@ -2878,7 +2880,18 @@ class Indexer(nn.Module):
         """
         assert self._fused_wk_wp_weight is not None, \
             "cache_derived_state() must be called before forward()"
-        hidden_float = _to_float(hidden_states)
+        # When the boundary fusion pre-quantized the next layer's kv_a_proj
+        # NVFP4 input, hidden_states is an Fp4QuantizedTensor that also carries
+        # the BF16 post-RMSNorm value. Use that BF16 view here -- the indexer
+        # weight is BF16 and the matmul needs a float input.
+        if isinstance(hidden_states, Fp4QuantizedTensor):
+            assert hidden_states.unquantized_hidden_states is not None, (
+                "pre_indexer_proj received Fp4QuantizedTensor without bf16 view; "
+                "the producer fusion must request return_norm_out=True")
+            hidden_states_bf = hidden_states.unquantized_hidden_states
+        else:
+            hidden_states_bf = hidden_states
+        hidden_float = _to_float(hidden_states_bf)
         with _tf32_matmul_enabled():
             # F.linear computes input @ weight.T internally; no explicit .t() needed.
             # _fused_wk_wp_weight is [head_dim + n_heads, hidden_size] (nn.Linear convention).
@@ -2889,7 +2902,7 @@ class Indexer(nn.Module):
         indexer_k, weights = fused_out.split([self.head_dim, self.n_heads],
                                              dim=-1)
         # Cast indexer_k back to model dtype for downstream ops (k_norm, RoPE, FP8 quantize)
-        indexer_k = indexer_k.to(hidden_states.dtype)
+        indexer_k = indexer_k.to(hidden_states_bf.dtype)
 
         q_pe, q_nope, k_pe, k_nope = self._qk_projection_and_rope(
             qr, indexer_k, position_ids)

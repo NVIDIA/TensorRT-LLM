@@ -114,6 +114,27 @@ def _warn_if_unsupported_v1_kv_cache_event_hash_algo(hash_algo: str) -> None:
         "event hashes.")
 
 
+def _merge_kv_cache_pool_pointers(
+    kv_cache_pool_pointers: torch.Tensor,
+    block_scale_pool_pointers: torch.Tensor,
+    layer_to_pool_mapping: torch.Tensor,
+    layer_pool_dtypes: Sequence["DataType"],
+) -> torch.Tensor:
+    """Align compact scale rows with data rows in C++ physical-pool order."""
+    dtype_by_physical_pool = dict(
+        zip(layer_to_pool_mapping[:, 0].tolist(), layer_pool_dtypes))
+    fp4_pool_indices = [
+        compact_pool_idx for compact_pool_idx, physical_pool_idx in enumerate(
+            sorted(dtype_by_physical_pool))
+        if dtype_by_physical_pool[physical_pool_idx] == DataType.NVFP4
+    ]
+
+    aligned_scale_pool_pointers = torch.zeros_like(kv_cache_pool_pointers)
+    aligned_scale_pool_pointers[fp4_pool_indices] = block_scale_pool_pointers
+    return torch.stack([kv_cache_pool_pointers, aligned_scale_pool_pointers],
+                       dim=-1)
+
+
 class BaseResourceManager(ABC):
 
     @abstractmethod
@@ -621,15 +642,31 @@ class KVCacheManager(BaseResourceManager):
 
         self.impl.allocate_pools(False)
         self.kv_cache_pool_pointers = self.impl.get_block_pool_pointers()
+        self.kv_cache_pool_mapping = self.impl.get_layer_to_pool_mapping()
         kv_cache_block_scale_pool_pointers = self.impl.get_block_scale_pool_pointers(
         )
         if kv_cache_block_scale_pool_pointers.numel() > 0:
-            self.kv_cache_pool_pointers = torch.stack([
-                self.kv_cache_pool_pointers, kv_cache_block_scale_pool_pointers
-            ],
-                                                      dim=-1)
+            # C++ reports one effective configuration per actual window,
+            # including manager-level defaults when none were supplied.
+            dtype_by_window = {
+                config.window_size: config.dtype
+                for config in self.impl.pool_configurations
+            }
+            # Match the local layer order used by C++ to build the pointer
+            # mapping. The Python window helpers additionally account for
+            # global PP layer IDs and therefore do not describe these rows.
+            layer_pool_dtypes = [
+                dtype_by_window[self.max_attention_window_vec[
+                    layer_offset % len(self.max_attention_window_vec)]]
+                for layer_offset in range(self.num_local_layers)
+            ]
+            self.kv_cache_pool_pointers = _merge_kv_cache_pool_pointers(
+                self.kv_cache_pool_pointers,
+                kv_cache_block_scale_pool_pointers,
+                self.kv_cache_pool_mapping,
+                layer_pool_dtypes,
+            )
 
-        self.kv_cache_pool_mapping = self.impl.get_layer_to_pool_mapping()
         self.num_pools = self.impl.num_pools
         self.max_blocks_per_seq = self.impl.max_blocks_per_seq
         self.enable_block_reuse = kv_cache_config.enable_block_reuse
@@ -1254,14 +1291,20 @@ class KVCacheManager(BaseResourceManager):
         assert max_atten_window_upper_bound > 0, "Impossible to fit in any sequence in kvCache"
         return max_atten_window_upper_bound
 
+    def _resolve_window_size(
+            self,
+            window_size: Optional[int],
+            error_msg: str = "window_size must be provided for VSWA") -> int:
+        if window_size is not None:
+            return window_size
+        if self.is_vswa:
+            raise ValueError(error_msg)
+        return self.max_attention_window_vec[0]
+
     def get_cache_indices(self,
                           request: LlmRequest,
                           window_size: Optional[int] = None) -> List[int]:
-        if window_size is None:
-            if len(self.max_attention_window_vec) > 1:
-                raise ValueError("window_size must be provided for VSWA")
-            window_size = self.max_attention_window_vec[0]
-
+        window_size = self._resolve_window_size(window_size)
         result = self.impl.get_cache_block_ids(request.py_request_id,
                                                window_size)
         assert len(result) == 1
@@ -1298,16 +1341,7 @@ class KVCacheManager(BaseResourceManager):
         hash matches what ``storeBlocks`` would later compute. Beam-width-1
         only; the connector enforces this at startup.
         """
-        if window_size is None:
-            # ``is_vswa`` (distinct window sizes) is the real VSWA signal; a
-            # uniform per-layer vector such as ``[4096, 4096, ...]`` has
-            # ``len > 1`` yet a single effective window, so keying off the
-            # length would spuriously reject it for connector callers that omit
-            # ``window_size``.
-            if self.is_vswa:
-                raise ValueError("window_size must be provided for VSWA")
-            window_size = self.max_attention_window_vec[0]
-
+        window_size = self._resolve_window_size(window_size)
         return list(
             self.impl.commit_and_get_block_hashes_for_request(
                 request, window_size))
@@ -1331,11 +1365,17 @@ class KVCacheManager(BaseResourceManager):
         Returns:
             The retention priority of the block (0-100), or default priority (35) if not found.
         """
-        if window_size is None:
-            if len(self.max_attention_window_vec) > 1:
-                raise ValueError("window_size must be provided for VSWA")
-            window_size = self.max_attention_window_vec[0]
+        window_size = self._resolve_window_size(window_size)
         return self.impl.get_priority_by_block_id(block_id, window_size)
+
+    def get_memory_pool_block_indices(self, block_ids: List[int], *,
+                                      window_size: int) -> List[int]:
+        # Translate logical block IDs to primary-pool slot indices. With host offload enabled,
+        # a block's ID and its current pool slot can diverge after an offload/onboard cycle.
+        # Every referenced block must be primary (asserted in C++): callers do primary-pool
+        # pointer arithmetic and the returned index carries no residency information.
+        return self.impl.get_memory_pool_block_indices(list(block_ids),
+                                                       window_size)
 
     def get_batch_cache_indices(
         self,
@@ -1348,10 +1388,9 @@ class KVCacheManager(BaseResourceManager):
         beam_width = beam_width or 1
         if window_size is None:
             if layer_idx is None:
-                if len(self.max_attention_window_vec) > 1:
-                    raise ValueError(
-                        "layer_idx or window_size must be provided for VSWA")
-                window_size = self.max_attention_window_vec[0]
+                window_size = self._resolve_window_size(
+                    window_size,
+                    "layer_idx or window_size must be provided for VSWA")
             else:
                 layer_offset = self.layer_offsets[layer_idx]
                 # Explicit layer_offset -> window_size mapping (no modulo
@@ -2230,6 +2269,10 @@ class KVCacheManager(BaseResourceManager):
         self.impl.reset_reuse_state()
 
 
+class NoFreeSlotsError(ValueError):
+    """A slot-backed resource manager has no capacity for another request."""
+
+
 class SlotManager:
 
     def __init__(self, max_num_requests: int):
@@ -2258,7 +2301,7 @@ class SlotManager:
             return self.slot_mapping[request_id]
 
         if len(self.free_slots) == 0:
-            raise ValueError("No free slots")
+            raise NoFreeSlotsError("No free slots")
         slot = self.free_slots.pop()
         self.slot_mapping[request_id] = slot
         return slot
@@ -2283,10 +2326,6 @@ class BlockManager:
         self.tokens_per_block = tokens_per_block
         self.max_blocks_per_seq = self.num_blocks
 
-        self.base_block_offsets = torch.arange(self.num_blocks,
-                                               device="cpu",
-                                               dtype=torch.int32)
-
         self.block_ids = dict()
         self.num_sequences = dict()
         self.free_blocks = deque(range(self.num_blocks))
@@ -2310,10 +2349,9 @@ class BlockManager:
         for i in range(len(request_ids)):
             block_ids = self.block_ids[request_ids[i]]
             block_num = len(block_ids)
+            # Block ids are the page offsets directly; no lookup table needed.
             block_offsets[i, 0:block_num].copy_(
-                self.base_block_offsets[torch.tensor(block_ids,
-                                                     dtype=torch.int32,
-                                                     device="cpu")])
+                torch.tensor(block_ids, dtype=torch.int32, device="cpu"))
 
     def compute_block_count(self, token_count: int,
                             tokens_per_page: int) -> int:

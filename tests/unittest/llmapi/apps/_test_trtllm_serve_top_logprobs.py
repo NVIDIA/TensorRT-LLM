@@ -1,6 +1,5 @@
 import openai
 import pytest
-import yaml
 
 from ..test_llm import get_model_path
 from .openai_server import RemoteOpenAIServer
@@ -13,34 +12,15 @@ def model_name():
     return "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
 
 
-@pytest.fixture(scope="module", params=["trt", "pytorch"])
+@pytest.fixture(scope="module", params=["pytorch"])
 def backend(request):
     return request.param
 
 
 @pytest.fixture(scope="module")
-def temp_extra_llm_api_options_file(tmp_path_factory):
-    extra_llm_api_options_dict = {
-        "enable_chunked_prefill": False,
-        "gather_generation_logits": True,
-        "kv_cache_config": {
-            "enable_block_reuse": False,
-        }
-    }
-
-    temp_file_path = tmp_path_factory.mktemp(
-        "config") / "extra_llm_api_options.yaml"
-    with open(temp_file_path, 'w') as f:
-        yaml.dump(extra_llm_api_options_dict, f)
-    return temp_file_path
-
-
-@pytest.fixture(scope="module")
-def server(model_name: str, backend: str, temp_extra_llm_api_options_file: str):
+def server(model_name: str, backend: str):
     model_path = get_model_path(model_name)
     args = ["--backend", f"{backend}"]
-    if backend == "trt":
-        args += ["--extra_llm_api_options", temp_extra_llm_api_options_file]
     with RemoteOpenAIServer(model_path, args) as remote_server:
         yield remote_server
 

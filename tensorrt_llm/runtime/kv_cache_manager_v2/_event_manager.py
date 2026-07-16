@@ -525,6 +525,12 @@ class KVCacheEventManager:
         self._v1_root_attrs_by_block_key.pop(block_hash, None)
 
     @staticmethod
+    def _resolve_page_ref(page_ref: Any) -> Any:
+        if page_ref is None:
+            return None
+        return page_ref() if callable(page_ref) else page_ref
+
+    @staticmethod
     def _normalize_token(token: TokenIdExt) -> UniqueToken:
         if isinstance(token, bytes):
             return UniqueToken(token.hex())
@@ -541,7 +547,7 @@ class KVCacheEventManager:
                 continue
             if page_ref is None:
                 continue
-            page = page_ref()
+            page = self._resolve_page_ref(page_ref)
             if page is None:
                 continue
             cache_level = page.cache_level
@@ -565,7 +571,7 @@ class KVCacheEventManager:
         return {
             life_cycle_id
             for life_cycle_id, page_ref in enumerate(block.storage)
-            if page_ref is not None and page_ref() is not None
+            if page_ref is not None and KVCacheEventManager._resolve_page_ref(page_ref) is not None
         }
 
     def _parent_hash_from_radix_block(self, block: Any) -> EventBlockHash | None:
@@ -577,7 +583,7 @@ class KVCacheEventManager:
     def _hash_from_radix_block(self, block: Any) -> EventBlockHash:
         if self._hash_algo == KV_CACHE_HASH_ALGO_V1:
             return self._v1_hash_from_radix_block(block)
-        return self._normalize_block_hash(block.key)
+        return self._normalize_block_hash(getattr(block, "event_key", block.key))
 
     def _v1_hash_from_radix_block(self, block: Any) -> int:
         key = bytes(block.key)

@@ -23,6 +23,9 @@ from ..utils import (ActivationType, deep_gemm_gen_tuning_buckets,
                      get_last_power_of_2_num_tokens_buckets,
                      is_gated_activation, last_positive_power_of_2,
                      next_positive_power_of_2)
+from .cutedsl_matmul_heuristics import (NVFP4_PRECISION,
+                                        nvmmh_enabled_for_nvfp4, nvmmh_fields,
+                                        nvmmh_max_tactics, rank_configs)
 
 try:
     from cuda.bindings import driver as cuda
@@ -522,7 +525,242 @@ if IS_CUTLASS_DSL_AVAILABLE:
             logger.debug(
                 f"CuteDSL: Found {len(valid_tactics)} valid tactics for M={m}, N={n}, K={real_k}"
             )
-            return valid_tactics
+            # Optionally rank/prune the sweep with nvMatmulHeuristics (opt-in via
+            # TRTLLM_CUTEDSL_NVMMH_ENABLE). Returns the full sweep unchanged when
+            # disabled, unconfigured, or on any failure.
+            return self._rank_prune_tactics(valid_tactics, m, n, real_k)
+
+        def _swap_ab_candidates(self, m, n):
+            """Deterministic swap_ab choice (not swept), constrained by C-layout
+            alignment.
+
+            swap_ab=True maps the kernel M to the GEMM N (and vice versa), which
+            is preferred when M is small (<=128) so the kernel works on the
+            larger dimension; large M does not swap. The chosen value must still
+            satisfy the output (C) 16-byte alignment: swap_ab=False needs
+            N%8==0, swap_ab=True needs M%8==0. Falls back to the feasible value
+            if the preferred one violates alignment; returns [] if neither works.
+            """
+            m_aligned = m % 8 == 0
+            n_aligned = n % 8 == 0
+            prefer_swap = m <= 128
+            if prefer_swap and m_aligned:
+                return [True]
+            if not prefer_swap and n_aligned:
+                return [False]
+            if n_aligned:
+                return [False]
+            if m_aligned:
+                return [True]
+            return []
+
+        @staticmethod
+        def _heuristic_to_tactic_tile(cta, cluster):
+            """Translate a nvMatmulHeuristics (cta, cluster) config to this
+            kernel's (mma_tiler_mn, cluster_shape_mn).
+
+            nvMatmulHeuristics caps the per-CTA tile M at 128 on Blackwell and
+            encodes the 2-SM (2-CTA) MMA as cluster_m == 2 (in the queried
+            kernel frame), so its effective M tile is cluster_m * cta_m. This
+            kernel instead encodes the same 2-SM op as mma_tiler_m == 256
+            (use_2cta_instrs). So a 2-CTA config (cluster_m == 2) doubles the M
+            tile while keeping the cluster; everything else passes through.
+
+            The 2-SM op additionally requires the N tile to be aligned (the
+            ``mma_n_align_requirement_2cta`` in libheuristics; 16 for NVFP4/bf16
+            output, 32 when the N tile exceeds the 256 UTCMMA max). If N is not
+            aligned it is not a valid 2-SM config, so leave it single-CTA.
+            """
+            cta_m, cta_n = int(cta[0]), int(cta[1])
+            cluster_m, cluster_n = int(cluster[0]), int(cluster[1])
+            n_align = 32 if cta_n > 256 else 16
+            if cluster_m == 2 and cta_n % n_align == 0:
+                # 2-SM MMA along the kernel M dimension.
+                return (2 * cta_m, cta_n), (cluster_m, cluster_n)
+            return (cta_m, cta_n), (cluster_m, cluster_n)
+
+        @staticmethod
+        def _unpack_tactic(tactic):
+            """Unpack a tactic into the full knob set with back-compat defaults.
+
+            The base tactic is (mma_tiler_mn, cluster_shape_mn, swap_ab,
+            use_prefetch). The heuristic path may append two tile-scheduler
+            knobs (swizzle_size, raster_along_m); older 4-tuples (and the full
+            sweep) default to the kernel's neutral values (no swizzle, M-major
+            raster). Non-tuple tactics use the default kernel tactic.
+            """
+            if not isinstance(tactic, (tuple, list)):
+                return (128, 128), (1, 1), False, False, 1, True
+            mma_tiler_mn = tactic[0]
+            cluster_shape_mn = tactic[1]
+            swap_ab = tactic[2]
+            use_prefetch = tactic[3]
+            swizzle_size = int(tactic[4]) if len(tactic) > 4 else 1
+            raster_along_m = bool(tactic[5]) if len(tactic) > 5 else True
+            return (mma_tiler_mn, cluster_shape_mn, swap_ab, use_prefetch,
+                    swizzle_size, raster_along_m)
+
+        def _tactic_is_supported(self, mma_tiler_mn, cluster_shape_mn, swap_ab,
+                                 use_prefetch, m, n, real_k) -> bool:
+            """Whether the kernel can run this (tile, cluster, swap, prefetch).
+
+            Validity gate used by get_valid_tactics() (the full enumeration).
+            The nvMatmulHeuristics path does NOT call this -- it trusts the
+            model's mapped tiles and emits them directly.
+            """
+            sf_vec_size = 16
+            if swap_ab:
+                c_major, kernel_m, kernel_n = "m", n, m
+            else:
+                c_major, kernel_m, kernel_n = "n", m, n
+
+            if not self.__class__.kernel_class.can_implement(
+                    cutlass.Float4E2M1FN,  # ab_dtype
+                    cutlass.Float8E4M3FN,  # sf_dtype
+                    sf_vec_size,
+                    cutlass.BFloat16,  # c_dtype
+                    mma_tiler_mn,
+                    cluster_shape_mn,
+                    kernel_m,
+                    kernel_n,
+                    real_k,
+                    1,  # batch_size
+                    "k",  # a_major
+                    "k",  # b_major
+                    c_major,
+            ):
+                return False
+
+            # Prefetch pruning: only worthwhile for a CTA-wave ratio in (0.5, 1.0)
+            # or large K.
+            cta_nums = get_dense_gemm_approximate_cta_nums(
+                m, n, mma_tiler_mn, cluster_shape_mn)
+            cta_wave_ratio = cta_nums / torch.cuda.get_device_properties(
+            ).multi_processor_count
+            if use_prefetch and not any(
+                (0.5 < cta_wave_ratio < 1.0, real_k >= 8192)):
+                return False
+            return True
+
+        def _rank_prune_tactics(self, tactics, m, n, real_k):
+            """Rank/prune the full-sweep tactics with nvMatmulHeuristics (opt-in).
+
+            Called at the end of get_valid_tactics. A strict, re-validated subset
+            of ``tactics`` -- it never introduces a (tile, cluster, swap) the
+            kernel validator rejected. Gated by TRTLLM_CUTEDSL_NVMMH_ENABLE;
+            TRTLLM_CUTEDSL_NVMMH_FIELDS selects the model-driven knobs. When
+            "tile"/"cluster" is selected we keep only the top
+            TRTLLM_CUTEDSL_NVMMH_MAX_TACTICS ranked (mma_tiler, cluster, swap)
+            keys (all matching prefetch variants retained); when only scheduler
+            knobs (swizzle / cta_order) are selected we sweep every tile/cluster
+            and just annotate it with the model's swizzle / raster (a safe
+            6-tuple extension -- they do not affect can_implement). Deterministic
+            swap_ab selection (small M swaps) is applied here, in the opt-in path
+            only.
+
+            Purely additive: on any failure, an empty match, or when heuristics
+            are disabled / unconfigured, returns ``tactics`` unchanged so
+            profiling never loses a valid candidate.
+            """
+            if not nvmmh_enabled_for_nvfp4() or not tactics:
+                return tactics
+            fields = nvmmh_fields()
+            if not fields:
+                return tactics
+            try:
+                max_tactics = nvmmh_max_tactics()
+                # Only prune the tile/cluster set when the model is asked to
+                # drive it; scheduler-only fields keep the full sweep.
+                prune_tile_cluster = bool(fields & {"tile", "cluster"})
+                use_swizzle = "swizzle" in fields
+                use_cta_order = "cta_order" in fields
+                emit_extended = use_swizzle or use_cta_order
+
+                # Deterministic swap orientation (opt-in only), intersected with
+                # the orientations actually present in the valid tactics.
+                valid_swaps = {t[2] for t in tactics}
+                swap_pref = [
+                    s
+                    for s in self._swap_ab_candidates(m, n) if s in valid_swaps
+                ] or list(valid_swaps)
+
+                # Build the model's ranked preference over (mma_tiler, cluster,
+                # swap) keys, plus the per-key scheduler knobs. Query enough
+                # configs to find matches within the valid candidate list.
+                query_count = max(max_tactics * 4, 16)
+                pref_rank = {}
+                pref_sched = {}
+                for swap_ab in swap_pref:
+                    kernel_m, kernel_n = (n, m) if swap_ab else (m, n)
+                    for cfg in rank_configs(kernel_m, kernel_n, real_k,
+                                            NVFP4_PRECISION, query_count):
+                        # Map per-CTA tile + cluster to this kernel's mma_tiler /
+                        # cluster (cluster_m==2 encodes an mma_tiler_m==256 2-SM
+                        # op). Off-grid maps simply won't match the valid list.
+                        mma_tiler_mn, cluster_shape_mn = \
+                            self._heuristic_to_tactic_tile(cfg.cta, cfg.cluster)
+                        key = (mma_tiler_mn, cluster_shape_mn, swap_ab)
+                        if key in pref_rank:
+                            continue
+                        pref_rank[key] = len(pref_rank)
+                        swizzle_size = cfg.swizzle_factor if use_swizzle else 1
+                        # nvMatmulHeuristics cta_order==0 is row-major (N-major)
+                        # raster -> raster_along_m=False; !=0 -> M-major -> True.
+                        raster_along_m = ((cfg.cta_order != 0)
+                                          if use_cta_order else True)
+                        pref_sched[key] = (max(1, int(swizzle_size)),
+                                           bool(raster_along_m))
+
+                # Restrict to the top-K ranked tile/cluster keys ONLY when the
+                # model drives tile/cluster. For scheduler-only fields keep every
+                # valid tile/cluster key and just annotate it below.
+                valid_keys = {(t[0], t[1], t[2]) for t in tactics}
+                if prune_tile_cluster:
+                    matched_keys = valid_keys & pref_rank.keys()
+                    if not matched_keys:
+                        return tactics
+                    kept_keys = set(
+                        sorted(matched_keys,
+                               key=lambda kk: pref_rank[kk])[:max_tactics])
+                else:
+                    kept_keys = valid_keys
+
+                # Emit every supplied (already-valid) tactic whose key is kept,
+                # re-validating as a safety net and optionally annotating the
+                # model's swizzle / raster (neutral defaults for unranked keys).
+                selected = []
+                for t in tactics:
+                    key = (t[0], t[1], t[2])
+                    if key not in kept_keys:
+                        continue
+                    mma_tiler_mn, cluster_shape_mn, swap_ab, use_prefetch = t[:
+                                                                              4]
+                    if not self._tactic_is_supported(
+                            mma_tiler_mn, cluster_shape_mn, swap_ab,
+                            use_prefetch, m, n, real_k):
+                        continue
+                    if emit_extended:
+                        swizzle_size, raster_along_m = pref_sched.get(
+                            key, (1, True))
+                        selected.append(
+                            (mma_tiler_mn, cluster_shape_mn, swap_ab,
+                             use_prefetch, swizzle_size, raster_along_m))
+                    else:
+                        selected.append((mma_tiler_mn, cluster_shape_mn,
+                                         swap_ab, use_prefetch))
+
+                logger.debug(
+                    f"CuteDSL nvMatmulHeuristics: {len(tactics)} valid -> "
+                    f"{len(selected)} tactics ({len(kept_keys)} keys) for "
+                    f"M={m}, N={n}, K={real_k}; fields={sorted(fields)}")
+                return selected if selected else tactics
+            except Exception as e:  # noqa: BLE001 - must never break tuning
+                logger.warning_once(
+                    f"[nvMatmulHeuristics] NVFP4 tactic filtering failed: {e}. "
+                    f"Falling back to full tactic list.",
+                    key="nvmmh_nvfp4_filter_failure",
+                )
+                return tactics
 
         def make_cute_dsl_global_pointer(self, tensor: torch.Tensor, dtype,
                                          assumed_align: int):
@@ -559,16 +797,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             """
             sf_vec_size = 16
 
-            if isinstance(tactic, tuple):
-                mma_tiler_mn, cluster_shape_mn, swap_ab, use_prefetch = tactic
-            else:
-                # fallback to default tactic
-                mma_tiler_mn, cluster_shape_mn, swap_ab, use_prefetch = [
-                    (128, 128),
-                    (1, 1),
-                    False,
-                    False,
-                ]
+            (mma_tiler_mn, cluster_shape_mn, swap_ab, use_prefetch,
+             swizzle_size, raster_along_m) = self._unpack_tactic(tactic)
 
             a_tensor, b_tensor, a_sf_tensor, b_sf_tensor, alpha_tensor = inputs
             m, k, n = a_tensor.shape[0], a_tensor.shape[1], b_tensor.shape[0]
@@ -631,7 +861,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 stream = cuda.CUstream(torch_stream.cuda_stream)
 
             cache_key = (sf_vec_size, mma_tiler_mn, cluster_shape_mn, swap_ab,
-                         use_prefetch, self.use_tvm_ffi)
+                         use_prefetch, swizzle_size, raster_along_m,
+                         self.use_tvm_ffi)
             if swap_ab:
                 kernel_m = n
                 kernel_n = m
@@ -698,6 +929,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     mma_tiler_mn,
                     cluster_shape_mn,
                     use_prefetch,
+                    swizzle_size,
+                    raster_along_m,
                 )
                 # Compute max active clusters on current device
                 hardware_info = cutlass.utils.HardwareInfo()
@@ -724,7 +957,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     max_active_clusters,
                     stream,
                     swap_ab,
-                    options=f"--opt-level 2 --enable-tvm-ffi"
+                    options="--opt-level 2 --enable-tvm-ffi"
                     if self.use_tvm_ffi else "--opt-level 2",
                 )
 
@@ -1181,7 +1414,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     False,  # swap_ab=False for SwiGLU
                 ]
                 compile_kwargs = dict(
-                    options=f"--opt-level 2 --enable-tvm-ffi"
+                    options="--opt-level 2 --enable-tvm-ffi"
                     if self.use_tvm_ffi else "--opt-level 2", )
                 if has_bias:
                     compile_kwargs["bias_ptr"] = bias_ptr
@@ -1675,7 +1908,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
                 compiled_gemm = cute.compile(
                     *compile_args,
-                    options=f"--opt-level 2 --enable-tvm-ffi"
+                    options="--opt-level 2 --enable-tvm-ffi"
                     if self.use_tvm_ffi else "--opt-level 2",
                 )
 
@@ -3619,7 +3852,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     c_cute_tensor,
                     max_active_clusters=max_active_clusters,
                     stream=stream,
-                    options=f"--opt-level 2 --enable-tvm-ffi"
+                    options="--opt-level 2 --enable-tvm-ffi"
                     if self.use_tvm_ffi else "--opt-level 2",
                 )
                 self.__class__.kernel_cache[cache_key] = compiled_gemm
@@ -3933,7 +4166,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     c_cute_tensor,
                     max_active_clusters=max_active_clusters,
                     stream=stream,
-                    options=f"--opt-level 2 --enable-tvm-ffi"
+                    options="--opt-level 2 --enable-tvm-ffi"
                     if self.use_tvm_ffi else "--opt-level 2",
                 )
                 self.__class__.kernel_cache[cache_key] = compiled_gemm
