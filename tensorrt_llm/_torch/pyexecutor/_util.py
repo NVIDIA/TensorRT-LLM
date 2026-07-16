@@ -622,6 +622,11 @@ class KvCacheCreator:
                 allocations[modality] += 1
             return allocations
 
+        # Two boundary batches share the same token budget but peak
+        # differently: one maximal-length item stresses length-dominated
+        # attention scratch, while the maximal item count stresses per-item
+        # overheads. Profile both; skip the second when it degenerates to
+        # the first.
         item_limits = [distribute_items(1)]
         if self._model_engine.encoder_max_num_items > 1:
             item_limits.append(
@@ -635,6 +640,11 @@ class KvCacheCreator:
                     max_items_per_modality=max_items_per_modality,
                     dtype=self._model_engine.model.dtype)
             except NotImplementedError:
+                logger.info(
+                    "MM encoder warmup skipped: %s does not implement "
+                    "get_dummy_mm_data_for_tokens(); memory estimation will "
+                    "not include encoder peak usage.",
+                    type(input_processor).__name__)
                 return []
             if multimodal_data:
                 batches.append(
