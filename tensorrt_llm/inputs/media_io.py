@@ -376,6 +376,33 @@ def is_video_file(path) -> bool:
         capture.release()
 
 
+def decode_video_frames(path, max_frames: Optional[int] = None) -> List["Image.Image"]:
+    """Decode a video file into its frames as PIL images, in order, no sampling.
+
+    Unlike :func:`load_video` — which samples ``num_frames`` evenly for
+    VLM-style inputs — this preserves every frame sequentially from the start;
+    ``max_frames`` bounds the decode when only a prefix is needed.
+    Reference-conditioning consumers (e.g. video-to-video pipelines) pick
+    their own frame window downstream.
+    """
+    cv2 = _get_cv2()
+    capture = cv2.VideoCapture(str(path))
+    try:
+        if not capture.isOpened():
+            raise ValueError(f"Could not open video file: {path}")
+        frames = []
+        while max_frames is None or len(frames) < max_frames:
+            ok, frame = capture.read()
+            if not ok:
+                break
+            frames.append(Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)))
+    finally:
+        capture.release()
+    if not frames:
+        raise ValueError(f"Video file contains no frames: {path}")
+    return frames
+
+
 def _select_cv2_stream_buffered_backend() -> Optional[int]:
     """Return a VideoCapture backend that can read from a Python `BytesIO`.
 

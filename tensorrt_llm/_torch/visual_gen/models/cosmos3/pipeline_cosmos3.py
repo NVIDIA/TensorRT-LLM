@@ -36,8 +36,8 @@ from tensorrt_llm.logger import logger
 
 from .defaults import (
     COSMOS3_720P_PARAMS,
-    COSMOS3_DEFAULT_CONDITION_FRAME_INDEXES_VISION,
     COSMOS3_DEFAULT_CONDITION_VIDEO_KEEP,
+    COSMOS3_DEFAULT_CONDITION_VIDEO_LATENT_INDEXES,
     COSMOS3_EXTRA_SPECS,
     COSMOS3_PIPELINE_DEFAULTS,
     COSMOS3_T2I_PARAMS,
@@ -62,11 +62,11 @@ COSMOS3_IMAGE_RESOLUTION_TEMPLATE = "This image is of {height}x{width} resolutio
 TRTLLM_DISABLE_COSMOS3_GUARDRAILS = os.environ.get("TRTLLM_DISABLE_COSMOS3_GUARDRAILS", "0") == "1"
 
 
-def _normalize_condition_frame_indexes_vision(
+def _normalize_condition_video_latent_indexes(
     indexes: Iterable[int] | int | str | None,
 ) -> tuple[int, ...]:
     if indexes is None:
-        return COSMOS3_DEFAULT_CONDITION_FRAME_INDEXES_VISION
+        return COSMOS3_DEFAULT_CONDITION_VIDEO_LATENT_INDEXES
     if isinstance(indexes, int):
         normalized = (indexes,)
     elif isinstance(indexes, str):
@@ -76,19 +76,19 @@ def _normalize_condition_frame_indexes_vision(
         normalized = tuple(int(index) for index in indexes)
 
     if not normalized:
-        raise ValueError("Cosmos3 condition_frame_indexes_vision must not be empty.")
+        raise ValueError("Cosmos3 condition_video_latent_indexes must not be empty.")
     if any(index < 0 for index in normalized):
         raise ValueError(
-            f"Cosmos3 condition_frame_indexes_vision must be non-negative, got {normalized}."
+            f"Cosmos3 condition_video_latent_indexes must be non-negative, got {normalized}."
         )
     return normalized
 
 
 def _condition_pixel_frame_count(
-    condition_frame_indexes_vision: Iterable[int],
+    condition_video_latent_indexes: Iterable[int],
     temporal_compression: int,
 ) -> int:
-    return max(condition_frame_indexes_vision) * int(temporal_compression) + 1
+    return max(condition_video_latent_indexes) * int(temporal_compression) + 1
 
 
 def _normalize_condition_video_keep(keep: str | None) -> str:
@@ -309,6 +309,14 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         extra_params = req.params.extra_params or {}
         output_type = extra_params.get("output_type", "video")
 
+        # The V2V reference rides in ``multi_modal_data["video"]`` as a
+        # ``VideoData`` (framework convention); the worker crops + VAE-encodes its
+        # frames. Both producers (offline and serve) build it, so there is no
+        # legacy-path fallback.
+        mm_data = req.params.multi_modal_data or {}
+        video_data = mm_data.get("video")
+        video = video_data.frames if video_data is not None else None
+
         return self.forward(
             prompt=req.prompt,
             negative_prompt=req.params.negative_prompt,
@@ -335,8 +343,8 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             use_guardrails=extra_params.get("use_guardrails", True),
             enable_audio=extra_params.get("enable_audio", False),
             output_type=output_type,
-            video=extra_params.get("video"),
-            condition_frame_indexes_vision=extra_params.get("condition_frame_indexes_vision"),
+            video=video,
+            condition_video_latent_indexes=extra_params.get("condition_video_latent_indexes"),
             condition_video_keep=extra_params.get("condition_video_keep"),
             flow_shift=extra_params.get("flow_shift"),
         )
@@ -679,7 +687,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         video_tensor: torch.Tensor,
         num_frames: int,
         generator: torch.Generator,
-        condition_frame_indexes_vision: Iterable[int] | int | str | None = None,
+        condition_video_latent_indexes: Iterable[int] | int | str | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Prepare V2V latents with explicit clean conditioned latent frames."""
         if video_tensor.ndim == 4:
@@ -696,11 +704,11 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         T_lat = (num_frames - 1) // self.vae_scale_factor_temporal + 1
         H_lat = video_tensor.shape[-2] // self.vae_scale_factor_spatial
         W_lat = video_tensor.shape[-1] // self.vae_scale_factor_spatial
-        indexes = _normalize_condition_frame_indexes_vision(condition_frame_indexes_vision)
+        indexes = _normalize_condition_video_latent_indexes(condition_video_latent_indexes)
         out_of_range = [index for index in indexes if index >= T_lat]
         if out_of_range:
             raise ValueError(
-                "Cosmos3 condition_frame_indexes_vision contains indexes outside the latent video: "
+                "Cosmos3 condition_video_latent_indexes contains indexes outside the latent video: "
                 f"indexes={indexes}, latent_frames={T_lat}."
             )
 
@@ -769,7 +777,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         enable_audio: bool = COSMOS3_EXTRA_SPECS["enable_audio"].default,
         output_type: str = COSMOS3_EXTRA_SPECS["output_type"].default,
         video: Any = None,
-        condition_frame_indexes_vision: Any = None,
+        condition_video_latent_indexes: Any = None,
         condition_video_keep: Any = None,
         flow_shift: Optional[float] = None,
     ):
@@ -962,16 +970,19 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                 image, height=height, width=width, num_frames=num_frames, generator=generator
             )
         elif video is not None:
-            condition_frame_indexes_vision = _normalize_condition_frame_indexes_vision(
-                condition_frame_indexes_vision
+            condition_video_latent_indexes = _normalize_condition_video_latent_indexes(
+                condition_video_latent_indexes
             )
             condition_video_keep = _normalize_condition_video_keep(condition_video_keep)
             condition_pixel_frames = min(
                 _condition_pixel_frame_count(
-                    condition_frame_indexes_vision, self.vae_scale_factor_temporal
+                    condition_video_latent_indexes, self.vae_scale_factor_temporal
                 ),
                 num_frames,
             )
+            # ``video`` is the reference frames (a list, from the producer's
+            # ``VideoData``). The worker crops the first/last conditioning window
+            # uniformly — producers never crop, so behavior never depends on them.
             video = normalize_video_input(
                 video,
                 max_frames=None if condition_video_keep == "last" else condition_pixel_frames,
@@ -986,13 +997,13 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             if self.rank == 0:
                 logger.info(
                     f"Cosmos3 V2V conditioning: frames={video.shape[2]}, "
-                    f"latent_indexes={condition_frame_indexes_vision}"
+                    f"latent_indexes={condition_video_latent_indexes}"
                 )
             latents, velocity_mask, condition_latents = self._prepare_latents_v2v(
                 video,
                 num_frames=num_frames,
                 generator=generator,
-                condition_frame_indexes_vision=condition_frame_indexes_vision,
+                condition_video_latent_indexes=condition_video_latent_indexes,
             )
         else:
             latents = self._prepare_latents(height, width, num_frames, generator)

@@ -38,8 +38,8 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.visual_gen.models.cosmos3.defaults import (
-    COSMOS3_DEFAULT_CONDITION_FRAME_INDEXES_VISION,
     COSMOS3_DEFAULT_CONDITION_VIDEO_KEEP,
+    COSMOS3_DEFAULT_CONDITION_VIDEO_LATENT_INDEXES,
     COSMOS3_EXTRA_SPECS,
     COSMOS3_T2I_PARAMS,
 )
@@ -50,8 +50,8 @@ from tensorrt_llm._torch.visual_gen.models.cosmos3.pipeline_cosmos3 import (
     COSMOS3_IMAGE_RESOLUTION_TEMPLATE,
     Cosmos3OmniMoTPipeline,
     _condition_pixel_frame_count,
-    _normalize_condition_frame_indexes_vision,
     _normalize_condition_video_keep,
+    _normalize_condition_video_latent_indexes,
 )
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
 from tensorrt_llm.visual_gen.args import TorchCompileConfig, VisualGenArgs
@@ -517,8 +517,8 @@ class TestCosmos3I2V:
 
 class TestCosmos3V2VExtraParams:
     def test_condition_defaults_are_declared(self):
-        assert COSMOS3_EXTRA_SPECS["condition_frame_indexes_vision"].default == list(
-            COSMOS3_DEFAULT_CONDITION_FRAME_INDEXES_VISION
+        assert COSMOS3_EXTRA_SPECS["condition_video_latent_indexes"].default == list(
+            COSMOS3_DEFAULT_CONDITION_VIDEO_LATENT_INDEXES
         )
         assert (
             COSMOS3_EXTRA_SPECS["condition_video_keep"].default
@@ -528,11 +528,6 @@ class TestCosmos3V2VExtraParams:
     def test_flow_shift_default_is_request_optional(self):
         spec = COSMOS3_EXTRA_SPECS["flow_shift"]
         assert spec.type == "float"
-        assert spec.default is None
-
-    def test_video_spec_declares_path_or_list_input(self):
-        spec = COSMOS3_EXTRA_SPECS["video"]
-        assert spec.type == "path_or_list"
         assert spec.default is None
 
 
@@ -547,13 +542,13 @@ class TestCosmos3V2VConditioningParams:
             ("0, 2", (0, 2)),
         ],
     )
-    def test_normalize_condition_frame_indexes_vision(self, value, expected):
-        assert _normalize_condition_frame_indexes_vision(value) == expected
+    def test_normalize_condition_video_latent_indexes(self, value, expected):
+        assert _normalize_condition_video_latent_indexes(value) == expected
 
     @pytest.mark.parametrize("value", [[], "", [-1], "0, -1", [0, -2]])
-    def test_invalid_condition_frame_indexes_vision_raise(self, value):
+    def test_invalid_condition_video_latent_indexes_raise(self, value):
         with pytest.raises(ValueError):
-            _normalize_condition_frame_indexes_vision(value)
+            _normalize_condition_video_latent_indexes(value)
 
     @pytest.mark.parametrize(
         "indexes,expected",
@@ -635,6 +630,46 @@ class TestNormalizeVideoInputContentDispatch:
             normalize_video_input_path(ref)
 
 
+class TestLoadReferenceVideo:
+    """``load_reference_video`` decodes any reference into the framework's
+    ``VideoData`` (all frames) for ``multi_modal_data["video"]``. It does not
+    crop — the worker does — so the producer stays model-agnostic. CPU-only."""
+
+    def test_from_pil_list_all_frames(self):
+        from tensorrt_llm._torch.visual_gen.models.cosmos3.utils import load_reference_video
+        from tensorrt_llm.inputs.multimodal_data import VideoData
+
+        frames = [PIL.Image.new("RGB", (8, 8), (i, i, i)) for i in range(6)]
+        vd = load_reference_video(frames)
+        assert isinstance(vd, VideoData)
+        assert len(vd.frames) == 6  # all frames, no crop
+        assert all(isinstance(f, PIL.Image.Image) for f in vd.frames)
+        # No temporal metadata: placement comes from request params
+        # (condition_video_latent_indexes, frame_rate), not the reference.
+        assert vd.metadata == {}
+
+    def test_from_video_file(self, tmp_path):
+        pytest.importorskip("cv2")
+        from tensorrt_llm._torch.visual_gen.models.cosmos3.utils import load_reference_video
+
+        enc = tmp_path / "clip.mp4"
+        TestNormalizeVideoInputContentDispatch._write_mp4(enc, num_frames=8)
+        assert len(load_reference_video(enc).frames) == 8  # all frames
+
+    def test_from_directory(self, tmp_path):
+        from tensorrt_llm._torch.visual_gen.models.cosmos3.utils import load_reference_video
+
+        for i in range(5):
+            PIL.Image.new("RGB", (8, 8), (i, i, i)).save(tmp_path / f"{i:03d}.png")
+        assert len(load_reference_video(tmp_path).frames) == 5
+
+    def test_missing_path_raises(self, tmp_path):
+        from tensorrt_llm._torch.visual_gen.models.cosmos3.utils import load_reference_video
+
+        with pytest.raises(ValueError, match="does not exist"):
+            load_reference_video(tmp_path / "nope")
+
+
 @pytest.mark.integration
 @pytest.mark.cosmos3_v2v
 @pytest.mark.high_cuda_memory
@@ -646,7 +681,7 @@ class TestCosmos3V2V:
             image=None,
             video=video,
             num_frames=NUM_FRAMES,
-            condition_frame_indexes_vision=[0, 1],
+            condition_video_latent_indexes=[0, 1],
             condition_video_keep="first",
         )
         _assert_valid_video(result.video, num_frames=NUM_FRAMES)
@@ -656,6 +691,24 @@ class TestCosmos3V2V:
             flow_shift=10.0,
             use_karras_sigmas=False,
         )
+
+    def test_v2v_multimodal_reference_smoke(self, cosmos3_pipeline):
+        """The V2V reference arrives as ``VideoData`` (built by
+        ``load_reference_video``, all frames) under ``multi_modal_data["video"]``;
+        the worker crops the conditioning window and VAE-encodes. Mirrors what the
+        offline example feeds the pipeline."""
+        from tensorrt_llm._torch.visual_gen.models.cosmos3.utils import load_reference_video
+
+        video_data = load_reference_video(_make_test_video(NUM_FRAMES))
+        result = _run_forward(
+            cosmos3_pipeline,
+            image=None,
+            video=video_data.frames,
+            num_frames=NUM_FRAMES,
+            condition_video_latent_indexes=[0, 1],
+            condition_video_keep="first",
+        )
+        _assert_valid_video(result.video, num_frames=NUM_FRAMES)
 
     def test_v2v_keep_last_smoke(self, cosmos3_pipeline):
         """condition_video_keep="last" pins the tail of the input, not the head.
@@ -667,14 +720,14 @@ class TestCosmos3V2V:
         """
         dark = PIL.Image.new("RGB", (WIDTH, HEIGHT), (40, 40, 40))
         bright = PIL.Image.new("RGB", (WIDTH, HEIGHT), (230, 230, 230))
-        # 5 = max(condition_frame_indexes_vision) * 4 + 1 conditioning frames.
+        # 5 = max(condition_video_latent_indexes) * 4 + 1 conditioning frames.
         video = [dark.copy() for _ in range(NUM_FRAMES)] + [bright.copy() for _ in range(5)]
         result = _run_forward(
             cosmos3_pipeline,
             image=None,
             video=video,
             num_frames=NUM_FRAMES,
-            condition_frame_indexes_vision=[0, 1],
+            condition_video_latent_indexes=[0, 1],
             condition_video_keep="last",
         )
         _assert_valid_video(result.video, num_frames=NUM_FRAMES)
@@ -793,7 +846,7 @@ class TestCosmos3Audio:
             cosmos3_pipeline,
             enable_audio=True,
             video=_make_test_video(NUM_FRAMES),
-            condition_frame_indexes_vision=[0, 1],
+            condition_video_latent_indexes=[0, 1],
             condition_video_keep="first",
         )
         _assert_valid_video(result.video, num_frames=NUM_FRAMES)
