@@ -61,8 +61,6 @@ SPARSE_RTOL = 1e-2
 # included when available, so callers can iterate this list unconditionally.
 BACKENDS_UNDER_TEST = ("TRTLLM",) + (("FLASHINFER",) if IS_FLASHINFER_AVAILABLE else ())
 DEFAULT_MAX_NUM_TOKENS = 8192
-# Selection representation per sparse algorithm (token- vs block-selecting).
-_SELECTION_UNIT_BY_ALGORITHM = {"dsa": "token", "deepseek_v4": "token", "rocket": "block"}
 
 
 def _dtype_to_torch(dtype: str):
@@ -152,18 +150,18 @@ class BackendCase:
         return self.sparse_attention_config is not None
 
     @property
-    def sparse_selection_unit(self) -> Optional[str]:
-        """Selection representation ("token" / "block") for this algorithm."""
-        if self.sparse_attention_config is None:
-            return None
-        return _SELECTION_UNIT_BY_ALGORITHM.get(self.sparse_attention_config.algorithm)
-
-    @property
     def sparse_topk(self) -> Optional[int]:
         """Per-token selection budget, resolved from the sparse config."""
         if self.sparse_attention_config is None:
             return None
         return self.sparse_attention_config.sparse_topk
+
+    @property
+    def sparse_block_size(self) -> Optional[int]:
+        """Selection granularity: token selection is a block of size 1."""
+        if self.sparse_attention_config is None:
+            return None
+        return self.sparse_attention_config.get_indices_block_size()
 
     @property
     def prompt_lens(self) -> List[int]:
@@ -244,13 +242,10 @@ def _rope_params_from_dict(d: dict) -> RopeParams:
 
 def _validate_sparse_case(case: BackendCase) -> None:
     """Reject unsupported sparse contracts (called only for sparse cases)."""
-    if case.sparse_selection_unit not in ("token", "block"):
-        raise ValueError(
-            f"Unsupported sparse selection unit: {case.sparse_selection_unit!r} "
-            "(expected 'token' or 'block')"
-        )
     if case.sparse_topk is None or case.sparse_topk <= 0:
         raise ValueError("Sparse backend cases require a positive top-k")
+    if case.sparse_block_size is None or case.sparse_block_size < 1:
+        raise ValueError("Sparse backend cases require a positive selection block size")
 
 
 def _randn(gen: torch.Generator, dtype: torch.dtype, *shape) -> torch.Tensor:
@@ -416,14 +411,17 @@ def _build_sparse_topk_indices(
     ``singleton`` row -- one logical token repeated across all top-k slots, which
     yields an analytic value oracle -- or a ``random`` row. ``singleton_oracle_mask``
     marks the singleton rows so the caller applies the analytic check only there.
+
+    Selections are block indices; with ``block_size == 1`` (DSA) a block is a
+    single token, so these are token selections.
     """
-    if case.sparse_selection_unit != "token":
+    if case.sparse_block_size != 1:
         raise ValueError(
-            f"Token selection builder cannot handle {case.sparse_selection_unit!r} selections"
+            f"Sparse MLA selection builder only supports block_size 1, got {case.sparse_block_size}"
         )
     topk = case.sparse_topk
     if topk is None or topk <= 0:
-        raise ValueError("Sparse token-selection cases require a positive top-k")
+        raise ValueError("Sparse selection cases require a positive top-k")
 
     indices = torch.full((case.nnz_q, topk), -1, dtype=torch.int32, device="cuda")
     singleton_oracle_mask = torch.zeros(case.nnz_q, dtype=torch.bool, device="cuda")
@@ -450,90 +448,10 @@ def _build_sparse_topk_indices(
     return indices, singleton_oracle_mask
 
 
-def _build_sparse_block_indices(
-    case: BackendCase,
-    generator: torch.Generator,
-    block_size: int,
-) -> torch.Tensor:
-    """Build causal request-local *block* selections for a block-sparse case.
-
-    Skeleton for the next block-granular algorithm family (e.g. RocketKV, whose
-    ``indices_block_size == page_size``). Mirrors ``_build_sparse_topk_indices``
-    but selects logical KV *blocks* instead of tokens: for a query at causal
-    position ``p`` the selectable blocks are ``0 .. p // block_size`` (the block
-    holding ``p`` is inclusive), and each row is padded to ``sparse_topk`` with
-    ``-1``. Returns ``[nnz_q, sparse_topk]`` int32 block indices.
-    """
-    if case.sparse_selection_unit != "block":
-        raise ValueError(
-            f"Block selection builder cannot handle {case.sparse_selection_unit!r} selections"
-        )
-    if block_size <= 0:
-        raise ValueError("Block-selection cases require a positive block size")
-    topk = case.sparse_topk
-    if topk is None or topk <= 0:
-        raise ValueError("Block-selection cases require a positive top-k")
-
-    indices = torch.full((case.nnz_q, topk), -1, dtype=torch.int32, device="cuda")
-    row = 0
-    for cached_len, q_len in zip(case.num_cached_tokens, case.seq_lens, strict=True):
-        for token_idx in range(q_len):
-            num_blocks = (cached_len + token_idx) // block_size + 1
-            valid = min(num_blocks, topk)
-            selected = torch.randperm(num_blocks, generator=generator, device="cuda")[:valid]
-            indices[row, :valid] = torch.sort(selected).values.to(torch.int32)
-            row += 1
-    return indices
-
-
-def generate_sparse_block_inputs(case: BackendCase, seed: int = 0) -> Dict:
-    """Skeleton input generator for block-selected sparse attention.
-
-    TODO(sparse-block): flesh out once a block-granular algorithm lands. The
-    reusable ``_build_sparse_block_indices`` builder is wired here; still missing
-    are (a) the standard/MLA input tensors for the block family and (b) the
-    matching Vanilla block reference forward in ``VanillaAttention`` that
-    ``_run_sparse_block_backend`` will call. Until both exist this raises so the
-    contract is explicit rather than silently mis-run.
-    """
-    sparse_config = case.sparse_attention_config
-    assert sparse_config is not None
-    sparse_params = sparse_config.to_sparse_params(layer_idx=None, pretrained_config=None)
-    block_size = getattr(sparse_params, "indices_block_size")
-    selection_gen = torch.Generator(device="cuda").manual_seed(seed + 1)
-    _ = _build_sparse_block_indices(case, selection_gen, block_size)
-    raise NotImplementedError(
-        "Block-selected sparse attention is a skeleton: add the block input "
-        "tensors and a VanillaAttention block reference forward, plus a block "
-        "ModelAttnConfig (e.g. RocketKV), before enabling this path."
-    )
-
-
-def _run_sparse_block_backend(
-    case: BackendCase,
-    backend: str,
-    inputs: Dict,
-    *,
-    kv_layout: str,
-) -> torch.Tensor:
-    """Skeleton runner for block-selected sparse attention.
-
-    TODO(sparse-block): implement the block-family forward once a Vanilla block
-    reference exists, following ``_run_sparse_mla_backend`` (lower the production
-    ``sparse_attention_config`` via ``to_sparse_params`` / the sparse KV-cache
-    manager, inject ``inputs`` block selections, and compare against the Vanilla
-    golden).
-    """
-    raise NotImplementedError(
-        "Block-selected sparse backend runner is a skeleton; see "
-        "_run_sparse_mla_backend for the token-selected MLA reference."
-    )
-
-
 def generate_sparse_mla_inputs(case: BackendCase, seed: int = 0) -> Dict:
     """Generate raw absorbed-MLA inputs plus backend-neutral sparse selections."""
-    if not case.is_mla or case.sparse_selection_unit != "token":
-        raise ValueError("This generator supports token-selected sparse MLA only")
+    if not case.is_mla or case.sparse_block_size != 1:
+        raise ValueError("This generator supports selected sparse MLA with block_size 1 only")
     gen = torch.Generator(device="cuda").manual_seed(seed)
     selection_gen = torch.Generator(device="cuda").manual_seed(seed + 1)
     cdt = case.compute_dtype
@@ -1316,14 +1234,9 @@ def run_backend(
     matrix). MLA cases are dispatched to the absorbed-generation path.
     """
     if case.is_sparse:
-        if case.is_mla and case.sparse_selection_unit == "token":
+        if case.is_mla:
             return _run_sparse_mla_backend(case, backend, inputs, kv_layout=kv_layout)
-        if case.sparse_selection_unit == "block":
-            return _run_sparse_block_backend(case, backend, inputs, kv_layout=kv_layout)
-        raise ValueError(
-            f"Unsupported sparse contract: is_mla={case.is_mla}, "
-            f"selection_unit={case.sparse_selection_unit!r}"
-        )
+        raise ValueError(f"Unsupported sparse contract: is_mla={case.is_mla}")
 
     if case.is_mla:
         if case.is_context_only:
@@ -1516,15 +1429,10 @@ def run_case(case: BackendCase, *, seed: int = 0) -> Dict[str, torch.Tensor]:
     is_mla = case.is_mla
     if case.is_sparse:
         _validate_sparse_case(case)
-        if case.is_mla and case.sparse_selection_unit == "token":
+        if case.is_mla:
             inputs = generate_sparse_mla_inputs(case, seed)
-        elif case.sparse_selection_unit == "block":
-            inputs = generate_sparse_block_inputs(case, seed)
         else:
-            raise ValueError(
-                f"Unsupported sparse contract: is_mla={case.is_mla}, "
-                f"selection_unit={case.sparse_selection_unit!r}"
-            )
+            raise ValueError(f"Unsupported sparse contract: is_mla={case.is_mla}")
     elif is_mla:
         if case.is_context_only:
             inputs = generate_mla_context_inputs(case, seed)

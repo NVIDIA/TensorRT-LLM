@@ -725,9 +725,16 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
         """Run selected sparse MLA from caller-provided local top-k rows.
 
         The sparse algorithm owns selection. This golden consumes its
-        request-local token positions, gathers the selected latent K/V, and
-        performs the absorbed MLA attention directly in PyTorch.
+        request-local selections, gathers the selected latent K/V, and performs
+        the absorbed MLA attention directly in PyTorch. Selections are block
+        indices; this reference implements ``block_size == 1`` (token selection),
+        which is what the MLA sparse algorithms (DSA / DeepSeek-V4) use.
         """
+        block_size = getattr(self.sparse_params, "indices_block_size", 1)
+        if block_size != 1:
+            raise NotImplementedError(
+                "Vanilla selected MLA supports block_size 1 (token selection); "
+                f"got block_size {block_size}")
         if attention_input_type == AttentionInputType.context_only:
             seq_start, seq_end = 0, metadata.num_contexts
         elif attention_input_type == AttentionInputType.generation_only:
