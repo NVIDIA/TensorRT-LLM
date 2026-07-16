@@ -2354,9 +2354,6 @@ class BaseKVCacheCompressionManager(BaseResourceManager):
     adjusts_generation_kv_length: ClassVar[bool] = False
     """Whether this manager can make target and logical KV lengths diverge."""
 
-    physically_evicts_cached_tokens: ClassVar[bool] = False
-    """True for evicting methods; attention modules then keep RoPE unfused."""
-
     def __init__(
         self,
         kv_cache_manager: "KVCacheManagerV2",
@@ -2384,11 +2381,6 @@ class BaseKVCacheCompressionManager(BaseResourceManager):
             # The draft cache is compacted together with the target.
             draft_kv_cache_manager.kv_compression_manages_history = (
                 self.adjusts_generation_kv_length)
-
-    @classmethod
-    def is_eviction_method(cls) -> bool:
-        """Whether this method physically evicts cached tokens."""
-        return cls.physically_evicts_cached_tokens
 
     @property
     def has_independent_draft_kv_cache(self) -> bool:
