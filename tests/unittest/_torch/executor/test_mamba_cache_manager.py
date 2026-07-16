@@ -393,6 +393,28 @@ def test_cpp_hybrid_prepare_expect_snapshot_points_clears_for_invalid_interval(i
     assert request.expect_snapshot_points == []
 
 
+def test_cpp_hybrid_next_chunk_uses_request_snapshot_points() -> None:
+    mgr = object.__new__(CppMambaHybridCacheManager)
+    mgr.kv_cache_config = KvCacheConfig(
+        enable_block_reuse=True,
+        mamba_state_cache_interval=64,
+    )
+    request = SimpleNamespace(
+        prompt_len=150,
+        context_current_position=70,
+        expect_snapshot_points=[140, 75],
+    )
+
+    assert mgr.calc_next_context_chunk_size(request) == 5
+
+    request.expect_snapshot_points = [200]
+    assert mgr.calc_next_context_chunk_size(request) == 80
+
+    request.expect_snapshot_points = [140, 75]
+    request.context_current_position = 145
+    assert mgr.calc_next_context_chunk_size(request) == 5
+
+
 def test_expect_snapshot_points_binding_round_trip():
     request = LlmRequest(
         request_id=1,

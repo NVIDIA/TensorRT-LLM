@@ -2041,9 +2041,8 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
         """Compute the next prefill chunk size for a context request when block reuse is enabled.
 
         When kv_cache_config.enable_block_reuse is True, context prefill must
-        stop at each regular interval returned by
-        calc_context_stop_positions. The prompt end remains an implicit final
-        boundary.
+        stop at each position in ``request.expect_snapshot_points``. The
+        prompt end remains an implicit final boundary.
 
         Args:
             request: Context request with prompt_len and context_current_position set.
@@ -2060,14 +2059,10 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
                 "Expected context_current_position to be 0 when block reuse is "
                 f"disabled, but got {current}")
             return prompt_len - current
-        step = self.linear_attention_metadata.states_snapshot_interval
-        stop_positions = calc_context_stop_positions(prompt_len,
-                                                     self.tokens_per_block,
-                                                     step)
-        stop_positions = sorted(set(stop_positions))
+        stop_positions = sorted(set(request.expect_snapshot_points))
         for pos in stop_positions:
             if pos > current:
-                return pos - current
+                return min(pos, prompt_len) - current
         return prompt_len - current
 
     def _setup_states(self) -> None:
