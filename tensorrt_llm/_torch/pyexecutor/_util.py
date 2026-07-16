@@ -2087,7 +2087,8 @@ def compute_max_num_sequences(mapping: Mapping,
 def should_enable_dsv4_adp_dummy_fixes(model_type: Optional[str],
                                        mapping: Mapping) -> bool:
     """Gate DSv4 ADP dummy behavior while PP remains follow-up scope."""
-    return (model_type == "deepseek_v4" or model_type == "kimi_k25") and not mapping.has_pp()
+    return (model_type == "deepseek_v4"
+            or model_type == "kimi_k25") and not mapping.has_pp()
 
 
 def should_enable_dsv4_overlap_headroom(
