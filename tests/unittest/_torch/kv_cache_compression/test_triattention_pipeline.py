@@ -893,7 +893,7 @@ class TestStepEndHookRefactor:
         # the factory then builds a manager that validates cleanly.
         from tensorrt_llm._torch.pyexecutor._util import (
             create_kv_cache_compression_manager,
-            kv_cache_compression_supported_with_spec,
+            validate_kv_cache_compression_with_spec,
         )
         from tensorrt_llm.llmapi.llm_args import (
             MTPDecodingConfig,
@@ -903,11 +903,8 @@ class TestStepEndHookRefactor:
         config = TriAttentionKvCacheCompressionConfig(model_path="/models/test", top_B=8)
         assert config.kv_cache_compression_mode.is_eviction_method() is True
         draft_manager = _make_fake_v2(is_draft=True)
-        assert (
-            kv_cache_compression_supported_with_spec(
-                config, MTPDecodingConfig(max_draft_len=1), draft_manager
-            )
-            is True
+        validate_kv_cache_compression_with_spec(
+            config, MTPDecodingConfig(max_draft_len=1), draft_manager
         )
         manager = create_kv_cache_compression_manager(
             config,
@@ -928,38 +925,33 @@ class TestStepEndHookRefactor:
             )
         else:
             spec_config = PARDDecodingConfig(max_draft_len=3)
-        # The call-site speculative gate declines before any manager is
-        # created; the run stays uncompressed.
-        from tensorrt_llm._torch.pyexecutor._util import kv_cache_compression_supported_with_spec
+        # The call-site speculative gate rejects before any manager is created.
+        from tensorrt_llm._torch.pyexecutor._util import validate_kv_cache_compression_with_spec
         from tensorrt_llm.llmapi.llm_args import TriAttentionKvCacheCompressionConfig
 
-        assert (
-            kv_cache_compression_supported_with_spec(
+        with pytest.raises(ValueError, match="standard paged cache compacted together"):
+            validate_kv_cache_compression_with_spec(
                 TriAttentionKvCacheCompressionConfig(model_path="/models/test", top_B=8),
                 spec_config,
                 _make_fake_v2(is_draft=True),
             )
-            is False
-        )
 
     def test_dflash_spec_mode_is_rejected(self):
         # Policy: the DFlash draft reads cross-attention context buffers, not
         # a paged KV cache, so compression cannot cover it. The call-site
-        # speculative gate declines to create a manager.
-        from tensorrt_llm._torch.pyexecutor._util import kv_cache_compression_supported_with_spec
+        # speculative gate rejects before any manager is created.
+        from tensorrt_llm._torch.pyexecutor._util import validate_kv_cache_compression_with_spec
         from tensorrt_llm.llmapi.llm_args import (
             DFlashDecodingConfig,
             TriAttentionKvCacheCompressionConfig,
         )
 
-        assert (
-            kv_cache_compression_supported_with_spec(
+        with pytest.raises(ValueError, match="standard paged cache compacted together"):
+            validate_kv_cache_compression_with_spec(
                 TriAttentionKvCacheCompressionConfig(model_path="/models/test", top_B=8),
                 DFlashDecodingConfig(max_draft_len=3),
                 _make_fake_v2(is_draft=True),
             )
-            is False
-        )
 
     def test_prepare_snapshots_fixed_linear_generation_growth(self):
         manager = _make_fake_v2()
