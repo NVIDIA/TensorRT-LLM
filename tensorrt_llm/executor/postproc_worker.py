@@ -14,7 +14,7 @@ from ..llmapi.utils import print_traceback_on_error
 from ..logger import logger
 from ..sampling_params import SamplingParams
 from .ipc import ZeroMqQueue
-from .utils import ErrorResponse, is_llm_response
+from .utils import ErrorResponse, bucket_responses_by_frontend, is_llm_response
 
 if TYPE_CHECKING:
     from ..disaggregated_params import DisaggregatedParams
@@ -78,7 +78,8 @@ class PostprocWorker:
     def __init__(
         self,
         pull_pipe_addr: tuple[str, Optional[bytes]],
-        push_pipe_addr: tuple[str, Optional[bytes]],
+        push_pipe_addr: Union[tuple[str, Optional[bytes]],
+                              List[tuple[str, Optional[bytes]]]],
         tokenizer_dir: str,
         record_creator: Callable[
             ["PostprocWorker.Input", TransformersTokenizer], Any],
@@ -86,7 +87,10 @@ class PostprocWorker:
         '''
         Args:
             pull_pipe_addr (tuple[str, Optional[bytes]]): The address and HMAC key of the input IPC.
-            push_pipe_addr (tuple[str, Optional[bytes]]): The address and HMAC key of the output IPC.
+            push_pipe_addr: The address and HMAC key of the output IPC, or a
+                list of them with multi-frontend serving -- one result lane
+                per frontend, selected by the frontend id in the output's
+                client_id top bits.
             tokenizer_dir (str): The directory to load tokenizer.
             record_creator (Callable[["ResponsePostprocessWorker.Input"], Any]): A creator for creating a record for a request.
             result_handler (Optional[Callable[[GenerationResultBase], Any]]): A callback handles the final result.
@@ -98,11 +102,16 @@ class PostprocWorker:
                                       is_async=True,
                                       is_server=False,
                                       name="postprocess_pull_pipe")
-        self._push_pipe = ZeroMqQueue(address=push_pipe_addr,
-                                      is_async=True,
-                                      is_server=False,
-                                      socket_type=zmq.PUSH,
-                                      name="postprocess_push_pipe")
+        push_pipe_addrs = (push_pipe_addr if isinstance(push_pipe_addr, list)
+                           else [push_pipe_addr])
+        self._push_pipes = [
+            ZeroMqQueue(address=addr,
+                        is_async=True,
+                        is_server=False,
+                        socket_type=zmq.PUSH,
+                        name=f"postprocess_push_pipe_{i}")
+            for i, addr in enumerate(push_pipe_addrs)
+        ]
         self._to_stop = asyncio.Event()
 
         self._q = deque()
@@ -172,11 +181,21 @@ class PostprocWorker:
         ''' Batched IPC send. '''
         async for batch in self._mainloop():
             if batch is None:
-                # notify dispatch_result corountine to quit
-                await self._push_pipe.put_async(None)
+                # notify the dispatch_result coroutine in every frontend to
+                # quit
+                for pipe in self._push_pipes:
+                    await pipe.put_async(None)
                 break
             assert isinstance(batch, list)
-            await self._push_pipe.put_async(batch)
+            if len(self._push_pipes) == 1:
+                await self._push_pipes[0].put_async(batch)
+                continue
+            # Multi-frontend serving: route each output to its origin
+            # frontend's result lane by the id in client_id's top bits.
+            for frontend_id, sub_batch in enumerate(
+                    bucket_responses_by_frontend(batch, len(self._push_pipes))):
+                if sub_batch:
+                    await self._push_pipes[frontend_id].put_async(sub_batch)
 
     async def _mainloop(self):
         ''' The loop for handle_response and keep producing outputs. '''
@@ -257,7 +276,9 @@ class PostprocWorker:
 
 @print_traceback_on_error
 def postproc_worker_main(feedin_ipc_addr: tuple[str, Optional[bytes]],
-                         feedout_ipc_addr: tuple[str, Optional[bytes]],
+                         feedout_ipc_addr: Union[tuple[str, Optional[bytes]],
+                                                 List[tuple[str,
+                                                            Optional[bytes]]]],
                          tokenizer_dir: str, record_creator: Callable):
     worker = PostprocWorker(feedin_ipc_addr,
                             feedout_ipc_addr,

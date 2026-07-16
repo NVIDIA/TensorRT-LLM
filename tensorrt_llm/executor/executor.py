@@ -1,6 +1,8 @@
 import atexit
 import faulthandler
+import json
 import multiprocessing
+import os
 import platform
 import signal
 import traceback
@@ -542,6 +544,28 @@ class GenerationExecutor(ABC):
             logger_debug(
                 f"Using {postproc_worker_config.num_postprocess_workers} postprocess parallel processes.\n",
                 "green")
+
+        # Multi-frontend serving: attach to an already-running executor
+        # instead of launching one. Set by trtllm-serve for the attached
+        # frontend processes (see commands/serve.py); the frontend id is
+        # picked up from TLLM_EXECUTOR_FRONTEND_ID.
+        attach_info_path = os.getenv("TLLM_EXECUTOR_ATTACH_INFO")
+        if attach_info_path:
+            with open(attach_info_path) as f:
+                attach_info = json.load(f)
+            if attach_info.get("mode") != "classic":
+                raise ValueError(
+                    "TLLM_EXECUTOR_ATTACH_INFO only supports the classic IPC "
+                    f"executor path, got mode={attach_info.get('mode')!r}")
+            from .proxy import GenerationExecutorFrontendProxy
+            frontend_id = int(os.environ["TLLM_EXECUTOR_FRONTEND_ID"])
+            logger.info(f"Attaching executor frontend {frontend_id} to the "
+                        f"running classic IPC worker via {attach_info_path}")
+            return GenerationExecutorFrontendProxy(
+                attach_info,
+                frontend_id=frontend_id,
+                postproc_worker_config=postproc_worker_config,
+                is_llm_executor=is_llm_executor)
 
         worker_kwargs = {
             "engine": engine,

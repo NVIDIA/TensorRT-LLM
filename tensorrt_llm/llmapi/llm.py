@@ -231,7 +231,13 @@ class BaseLLM:
                      "yellow")
         self.mpi_session = self.args.mpi_session
 
-        if self.args.parallel_config.is_multi_gpu:
+        # Attached serving frontends (TLLM_EXECUTOR_ATTACH_INFO) connect to
+        # an already-running executor worker: they need no MPI session of
+        # their own and must not spawn one (see executor.py
+        # GenerationExecutor.create).
+        is_attached_frontend = os.getenv(
+            "TLLM_EXECUTOR_ATTACH_INFO") is not None
+        if self.args.parallel_config.is_multi_gpu and not is_attached_frontend:
             if os.getenv("RAY_LOCAL_WORLD_SIZE") is None and get_device_count(
             ) < self.args.parallel_config.world_size_per_node:
                 raise RuntimeError(

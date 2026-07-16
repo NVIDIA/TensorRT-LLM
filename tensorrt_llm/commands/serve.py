@@ -9,6 +9,7 @@ import signal
 import socket
 import subprocess  # nosec B404
 import sys
+import tempfile
 import uuid
 from pathlib import Path
 from typing import Any, Dict, Literal, Mapping, Optional, Sequence
@@ -294,6 +295,64 @@ def get_llm_args(
     return llm_args, llm_args_extra_dict
 
 
+def _spawn_attached_frontends(llm, num_frontends: int) -> list:
+    """Spawn num_frontends - 1 attached serving frontend processes.
+
+    Multi-frontend serving (TLLM_SERVE_NUM_FRONTENDS > 1): each child
+    re-execs this trtllm-serve command line with env vars pointing at the
+    launcher executor's attach endpoints — the multi-frontend request
+    ingress plus per-frontend result lanes (see
+    GenerationExecutorProxy._setup_queues); the child's executor attaches to
+    the already-running worker instead of launching a new one (see
+    executor.py GenerationExecutor.create). All frontends bind the serving
+    port with SO_REUSEPORT, so the kernel load-balances accepted
+    connections across their independent processes (and GILs).
+    """
+    from tensorrt_llm.executor.proxy import GenerationExecutorProxy
+
+    executor = getattr(llm, "_executor", None)
+    if not isinstance(executor, GenerationExecutorProxy) or (
+            attach_info := executor.multi_frontend_attach_info()) is None:
+        raise ValueError(
+            "TLLM_SERVE_NUM_FRONTENDS > 1 requires the classic IPC executor "
+            f"proxy in multi-frontend mode, got {type(executor).__name__}")
+    # mkstemp creates the file 0600: it carries the executor HMAC keys.
+    fd, attach_info_path = tempfile.mkstemp(prefix="trtllm_frontend_",
+                                            suffix=".json")
+    with os.fdopen(fd, "w") as f:
+        json.dump(attach_info, f)
+
+    children = []
+    for frontend_id in range(1, num_frontends):
+        env = os.environ.copy()
+        env["TLLM_EXECUTOR_ATTACH_INFO"] = attach_info_path
+        env["TLLM_EXECUTOR_FRONTEND_ID"] = str(frontend_id)
+        # Attached frontends are plain RPC clients: keep them out of the
+        # launcher's MPI job (an inherited PMI rank identity would make
+        # mpi4py try to (re-)join it at import time).
+        env["TLLM_DISABLE_MPI"] = "1"
+        for key in list(env):
+            if key.startswith(("OMPI_", "PMIX_", "PMI_")):
+                del env[key]
+        child = subprocess.Popen([sys.executable] + sys.argv,
+                                 env=env)  # nosec B603
+        children.append(child)
+        logger.info(
+            f"Launched attached serving frontend {frontend_id} (pid {child.pid})"
+        )
+    return children
+
+
+def _terminate_attached_frontends(children: list) -> None:
+    for child in children:
+        child.terminate()
+    for child in children:
+        try:
+            child.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            child.kill()
+
+
 def launch_server(
         host: str,
         port: int,
@@ -309,6 +368,33 @@ def launch_server(
 
     backend = llm_args["backend"]
     model = served_model_name or llm_args["model"]
+
+    # Multi-frontend serving (prototype): TLLM_SERVE_NUM_FRONTENDS=K runs K
+    # HTTP frontend processes against ONE executor. The launcher (this
+    # process, frontend 0) launches the worker as usual and spawns K-1
+    # attached frontends; attached frontends (TLLM_EXECUTOR_ATTACH_INFO set)
+    # skip the spawning. Supported only on the classic IPC executor path
+    # (the default orchestrator).
+    num_frontends = int(os.getenv("TLLM_SERVE_NUM_FRONTENDS", "1") or "1")
+    if not 0 < num_frontends <= (1 << 16):
+        raise ValueError(
+            f"TLLM_SERVE_NUM_FRONTENDS out of range: {num_frontends}")
+    is_attached_frontend = os.getenv("TLLM_EXECUTOR_ATTACH_INFO") is not None
+    multi_frontend = num_frontends > 1 or is_attached_frontend
+    if multi_frontend and not is_attached_frontend:
+        if llm_args.get("orchestrator_type") is not None:
+            raise ValueError(
+                "TLLM_SERVE_NUM_FRONTENDS > 1 currently supports only the "
+                "default (classic IPC) executor path, not orchestrator_type="
+                f"{llm_args.get('orchestrator_type')!r}")
+        # Opt the launcher executor into multi-frontend mode BEFORE it is
+        # created: pre-generate the shared ipc directory and HMAC key so the
+        # launcher proxy, the rank0 worker and the attached frontends agree
+        # on deterministic endpoints (GenerationExecutorProxy._setup_queues).
+        os.environ["TLLM_MULTI_FRONTEND_IPC_DIR"] = tempfile.mkdtemp(
+            prefix="trtllm_frontends_")
+        os.environ["TLLM_MULTI_FRONTEND_HMAC"] = os.urandom(32).hex()
+
     addr_info = socket.getaddrinfo(host, port, socket.AF_UNSPEC,
                                    socket.SOCK_STREAM)
     address_family = socket.AF_INET6 if all(
@@ -316,6 +402,10 @@ def launch_server(
     with socket.socket(address_family, socket.SOCK_STREAM) as s:
         # If disagg cluster config is provided and port is not specified, try to find a free port, otherwise try to bind to the specified port
         assert port > 0 or disagg_cluster_config is not None, "Port must be specified if disagg cluster config is not provided"
+        if multi_frontend:
+            # Every frontend process binds its own listening socket on the
+            # same port; the kernel load-balances accepts across them.
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
         try:
             s.bind((host, port))
             if port == 0:
@@ -340,6 +430,10 @@ def launch_server(
                 f"{backend} is not a known backend, check help for available options.",
                 param_hint="backend")
 
+        frontend_children = []
+        if multi_frontend and not is_attached_frontend:
+            frontend_children = _spawn_attached_frontends(llm, num_frontends)
+
         server = OpenAIServer(generator=llm,
                               model=model,
                               tool_parser=tool_parser,
@@ -354,7 +448,11 @@ def launch_server(
         if os.getenv("TRTLLM_SERVER_DISABLE_GC", "0") == "1":
             gc.disable()
 
-        asyncio.run(server(host, port, sockets=[s]))
+        try:
+            asyncio.run(server(host, port, sockets=[s]))
+        finally:
+            if frontend_children:
+                _terminate_attached_frontends(frontend_children)
 
 
 def launch_grpc_server(host: str,
