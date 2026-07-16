@@ -241,11 +241,13 @@ public:
     {
         TLLM_CHECK_WITH_INFO(
             mCanonicalHandle, "emitBarrier: no slot allocated yet — _prepare must precede the first _async barrier.");
-        // 10s timeout: on hang, the kernel traps with rank+channel diagnostic instead of spinning silently
-        // until SLURM wall-clock kills. Generous enough to absorb first-touch IPC + first cuda_graph
-        // capture jitter. channel=0: V/Q/K issues all run on the same per-device side stream so
-        // they FIFO-serialize; channel multiplexing only matters across distinct streams.
-        mCanonicalHandle->barrier(/*channel=*/0, /*timeout_ms=*/10000);
+        // barrier() takes MILLISECONDS (its "microseconds" timeout-error text is mislabeled).
+        // 60 s absorbs the one-time first-touch warmup barrier stall (~10-20 s on 16-GPU
+        // cfg2xuly8) and still traps a real hang with a rank+channel diagnostic before the
+        // SLURM wall-clock. channel=0: V/Q/K issues share one per-device side stream and
+        // FIFO-serialize, so channel multiplexing (needed only across distinct streams) is moot.
+        size_t const barrierTimeoutMs = 60000;
+        mCanonicalHandle->barrier(/*channel=*/0, /*timeout_ms=*/barrierTimeoutMs);
     }
 
 private:
