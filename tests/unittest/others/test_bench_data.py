@@ -13,15 +13,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import io
+from typing import get_args
 from unittest import mock
 
 import pytest
 
+from tensorrt_llm.bench.utils import VALID_QUANT_ALGOS
 from tensorrt_llm.bench.utils.data import (
     DatasetFormatError,
     create_dataset_from_stream,
     initialize_tokenizer,
 )
+from tensorrt_llm.quantization.mode import QuantAlgo
 
 
 class _FakeTokenizer:
@@ -66,3 +69,9 @@ def test_initialize_tokenizer_routes_through_transformers_tokenizer():
     # Bench code uses the raw HF tokenizer (calls __call__, encode,
     # add_special_tokens on it), so the wrapper must be peeled off.
     assert out is inner
+
+
+def test_int8_not_offered_as_bench_quant_choice() -> None:
+    # INT8 is unsupported by the build path, so it must not be advertised as a
+    # trtllm-bench --quantization choice (issue #7091).
+    assert f"{QuantAlgo.INT8}" not in get_args(VALID_QUANT_ALGOS)
