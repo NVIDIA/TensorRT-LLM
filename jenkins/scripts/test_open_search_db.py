@@ -385,3 +385,87 @@ class TestEdgeCases:
             OpenSearchDB.queryFromOpenSearchDB("{}", VALID_PROJECT)
         assert f"{_TAG}[ERROR]" in caplog.text
         assert "cat=config" in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# 32-38: _log() helper unit tests
+# ---------------------------------------------------------------------------
+class TestLogHelper:
+    def test_basic_format(self, caplog):
+        """_log produces the expected structured tag and body."""
+        import logging
+
+        with caplog.at_level(logging.INFO):
+            OpenSearchDB._log("info", "query", "my-project", "hello world")
+        assert f"{_TAG}[INFO](op=query, db=my-project) hello world" in caplog.text
+
+    def test_all_optional_fields_in_order(self, caplog):
+        """Optional fields appear after op, before db, in documented order."""
+        import logging
+
+        with caplog.at_level(logging.WARNING):
+            OpenSearchDB._log(
+                "warning",
+                "post",
+                "my-project",
+                "will retry",
+                cat="transient",
+                status=503,
+                attempt=2,
+                total=5,
+            )
+        msg = caplog.records[0].getMessage()
+        assert "cat=transient" in msg
+        assert "status=503" in msg
+        assert "db=my-project" in msg
+        assert "attempt=2/5" in msg
+        assert msg.index("cat=") < msg.index("status=") < msg.index("db=") < msg.index("attempt=")
+
+    def test_sanitizes_db_newline(self, caplog):
+        """Newlines in db name are collapsed — no raw newline in the log record."""
+        import logging
+
+        with caplog.at_level(logging.ERROR):
+            OpenSearchDB._log("error", "query", "proj\ninjected", "msg")
+        for record in caplog.records:
+            assert "\n" not in record.getMessage()
+
+    def test_sanitizes_url(self, caplog):
+        """Newlines in url are collapsed."""
+        import logging
+
+        with caplog.at_level(logging.WARNING):
+            OpenSearchDB._log("warning", "query", "proj", "msg", url="http://x.com\nX-Header: evil")
+        for record in caplog.records:
+            assert "\n" not in record.getMessage()
+        assert "url: http://x.com | X-Header: evil" in caplog.text
+
+    def test_invalid_level_logs_error_no_exception(self, caplog):
+        """Invalid level emits an error record and never raises."""
+        import logging
+
+        with caplog.at_level(logging.ERROR):
+            OpenSearchDB._log("trace", "query", "proj", "msg")  # 'trace' is not standard
+        assert len(caplog.records) >= 1
+        assert any("invalid level" in r.getMessage() for r in caplog.records)
+
+    def test_attempt_without_total_logs_error_no_exception(self, caplog):
+        """Passing attempt without total emits an error record and never raises."""
+        import logging
+
+        with caplog.at_level(logging.ERROR):
+            OpenSearchDB._log("warning", "query", "proj", "msg", attempt=1)
+        assert any(
+            "attempt" in r.getMessage() and "total" in r.getMessage() for r in caplog.records
+        )
+        # attempt field must not appear in any structured log line
+        assert "attempt=1/" not in caplog.text
+
+    def test_warning_emits_warn_tag_not_warning(self, caplog):
+        """'warning' level uses [WARN] tag (not [WARNING]) for grep compatibility."""
+        import logging
+
+        with caplog.at_level(logging.WARNING):
+            OpenSearchDB._log("warning", "query", "proj", "msg")
+        assert f"{_TAG}[WARN]" in caplog.text
+        assert f"{_TAG}[WARNING]" not in caplog.text
