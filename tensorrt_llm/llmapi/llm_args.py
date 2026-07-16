@@ -5206,13 +5206,23 @@ class TorchLlmArgs(BaseLlmArgs):
     encoder_max_batch_size: Optional[int] = Field(
         default=None,
         description=
-        ("Maximum encoder batch size. For encoder-decoder models, this also "
-         "controls encoder microbatch admission and limits encoder CUDA graph "
-         "batch sizes. For multimodal models, it is the maximum number of "
-         "atomic items scheduled for encoder execution in one iteration, "
-         "shared across requests and modalities, and provides the "
-         "model-specific AttentionMetadata sizing input. "
-         "Falls back to `max_batch_size` when unset."),
+        ("Maximum encoder batch size for encoder-decoder models. This controls "
+         "encoder microbatch admission and limits encoder CUDA graph batch "
+         "sizes. Falls back to `max_batch_size` when unset."),
+        status="prototype")
+
+    encoder_max_num_items: Optional[int] = Field(
+        default=None,
+        description=
+        ("Maximum number of atomic multimodal items (e.g. one image or one "
+         "video) scheduled for encoder execution in one iteration, shared "
+         "across requests and modalities; per-modality limits may be added "
+         "later. Item size is budgeted separately by `encoder_max_num_tokens`. "
+         "This count also defines the many-item warmup boundary and the "
+         "default encoder attention capacity for encoders whose items map "
+         "1:1 to attention sequences; encoders that split one item into "
+         "multiple sequences derive their capacity from the token budget "
+         "instead. Falls back to `max_batch_size` when unset."),
         status="prototype")
 
     encoder_max_num_tokens: Optional[int] = Field(
@@ -5227,7 +5237,8 @@ class TorchLlmArgs(BaseLlmArgs):
             "model's largest atomic item when necessary."),
         status="prototype")
 
-    @field_validator("encoder_max_batch_size", "encoder_max_num_tokens")
+    @field_validator("encoder_max_batch_size", "encoder_max_num_items",
+                     "encoder_max_num_tokens")
     @classmethod
     def validate_encoder_runtime_sizes(cls, v: Optional[int]) -> Optional[int]:
         if v is not None and v <= 0:
@@ -5583,13 +5594,13 @@ class TorchLlmArgs(BaseLlmArgs):
     def get_encoder_runtime_sizes(self) -> Tuple[int, int]:
         """Return encoder runtime item-count and token limits.
 
-        Returns `(encoder_max_batch_size, encoder_max_num_tokens)`, falling
+        Returns `(encoder_max_num_items, encoder_max_num_tokens)`, falling
         back to the LLM-side `max_batch_size` / `max_num_tokens` when the
         encoder-specific knobs are not set.
         """
         return (
-            self.encoder_max_batch_size
-            if self.encoder_max_batch_size is not None else self.max_batch_size,
+            self.encoder_max_num_items
+            if self.encoder_max_num_items is not None else self.max_batch_size,
             self.encoder_max_num_tokens
             if self.encoder_max_num_tokens is not None else self.max_num_tokens,
         )

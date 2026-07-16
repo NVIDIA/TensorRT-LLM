@@ -88,7 +88,7 @@ def _load_config(checkpoint_dir: str) -> dict:
 _GPU_DTYPE = torch.bfloat16
 
 # Mirror the engine's encoder runtime sizes (``get_encoder_runtime_sizes`` ->
-# ``encoder_max_batch_size`` / ``encoder_max_num_tokens``, defaulting to
+# ``encoder_max_num_items`` / ``encoder_max_num_tokens``, defaulting to
 # ``max_batch_size`` / ``max_num_tokens``). Two distinct axes: requests =
 # image/sequence count budget, tokens = total patch budget.
 _ENCODER_TEST_MAX_NUM_ITEMS = 2048

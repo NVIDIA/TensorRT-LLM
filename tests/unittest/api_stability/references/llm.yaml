@@ -151,6 +151,10 @@ methods:
         annotation: Optional[int]
         default: null
         status: prototype
+      encoder_max_num_items:
+        annotation: Optional[int]
+        default: null
+        status: prototype
       encoder_max_num_tokens:
         annotation: Optional[int]
         default: null
