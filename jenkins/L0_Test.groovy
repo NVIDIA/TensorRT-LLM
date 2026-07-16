@@ -1741,8 +1741,10 @@ fi
 
 # Poll until the builder job finishes (success or failure); tail the builder log live.
 echo "Waiting for fat sqsh builder job \$BUILDER_ID to complete..."
-touch "${fatBuildLogPath}"
-tail -f "${fatBuildLogPath}" &
+_fatLogTemplate="${fatBuildLogPath}"
+actualFatBuildLogPath="\${_fatLogTemplate//%j/\$BUILDER_ID}"
+touch "\$actualFatBuildLogPath"
+tail -f "\$actualFatBuildLogPath" &
 FAT_TAIL_PID=\$!
 while true; do
     if ! STATUS=\$(sacct -j "\$BUILDER_ID" --format=State -Pn --allocations 2>&1); then
