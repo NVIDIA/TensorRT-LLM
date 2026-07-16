@@ -27,6 +27,7 @@ from tensorrt_llm._torch.pyexecutor.scheduler.scheduler import (
     MultimodalScheduler,
 )
 from tensorrt_llm._torch.pyexecutor.scheduler.waiting_queue import FCFSWaitingQueue
+from tensorrt_llm._torch.tensor_lru_cache import TensorLRUCache
 from tensorrt_llm.bindings import SamplingConfig
 from tensorrt_llm.inputs.multimodal import (
     MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
@@ -128,17 +129,20 @@ def test_multimodal_scheduler_keeps_items_atomic_and_backfills_requests():
     assert output.context_requests == [second]
 
 
-def test_multimodal_scheduler_schedules_full_request_batch_when_all_items_fit():
+def test_multimodal_scheduler_selects_all_items_and_admits_request_when_batch_fits():
     scheduler = MultimodalScheduler(_BaseScheduler(), max_num_items=2, max_num_tokens=10)
     request = _request(1, [6, 4])
 
     output = scheduler.schedule_request([request], set())
 
-    assert output.scheduled_mm_encoder_items is None
+    # The encoder step is the single encode site: an in-budget batch simply
+    # has every pending item selected, and the request still enters the LLM
+    # batch in the same iteration (encode runs before the LLM forward).
+    assert output.scheduled_mm_encoder_items == {1: [0, 1]}
     assert output.context_requests == [request]
 
 
-def test_multimodal_scheduler_uses_item_path_only_for_overflow():
+def test_multimodal_scheduler_withholds_request_on_budget_overflow():
     scheduler = MultimodalScheduler(_BaseScheduler(), max_num_items=3, max_num_tokens=10)
     request = _request(1, [6, 4, 1])
 
@@ -447,3 +451,187 @@ def test_mistral_item_metadata_separates_patch_and_embedding_units():
     assert metadata.item_refs == [("image", 0), ("image", 1)]
     assert metadata.encoder_token_lengths == [8, 16]
     assert metadata.output_embedding_lengths == [2, 4]
+
+
+# ---------------------------------------------------------------------------
+# Encoder cache x item scheduling integration
+# ---------------------------------------------------------------------------
+
+
+def _cache_request(request_id, *, hashes, embedding_lengths, kwargs_hash="kw"):
+    """A cache-keyable item-scheduling request with raw image payload."""
+    num_items = len(embedding_lengths)
+    multimodal_data = {
+        "image": {
+            "pixel_values": torch.arange(sum(embedding_lengths)).unsqueeze(1),
+            "image_grid_thw": torch.tensor([[1, 1, length] for length in embedding_lengths]),
+        },
+        MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalEncoderItemMetadata(
+            item_refs=[("image", item_idx) for item_idx in range(num_items)],
+            encoder_token_lengths=list(embedding_lengths),
+            output_embedding_lengths=list(embedding_lengths),
+        ),
+        "multimodal_embedding_lengths": list(embedding_lengths),
+    }
+    if kwargs_hash is not None:
+        multimodal_data["mm_processor_kwargs_hash"] = kwargs_hash
+    request = LlmRequest(
+        request_id=request_id,
+        max_new_tokens=1,
+        input_tokens=[1, 2, 3],
+        sampling_config=SamplingConfig(),
+        is_streaming=False,
+        py_multimodal_data=multimodal_data,
+        multimodal_hashes=hashes,
+    )
+    initialize_multimodal_encoder_request(request, max_num_tokens=1 << 30)
+    return request
+
+
+def _cache_engine(cache, monkeypatch):
+    class _Model(MultimodalModelMixin):
+        def __init__(self):
+            self.encoded_item_counts = []
+
+        def _get_multimodal_encoder_cache(self):
+            return cache
+
+        def forward_multimodal_encoder_items(self, encoder_inputs):
+            self.encoded_item_counts.append(len(encoder_inputs))
+            return [
+                torch.full((embedding_length, 2), float(embedding_length))
+                for _, embedding_length, _ in encoder_inputs
+            ]
+
+    monkeypatch.setattr(MultimodalParams, "to_device", lambda self, *args, **kwargs: self)
+    engine = object.__new__(PyTorchModelEngine)
+    engine.model = _Model()
+    engine.supports_mm_encoder_item_scheduling = True
+    return engine
+
+
+def _sweep_executor(engine, active_requests):
+    executor = object.__new__(PyExecutor)
+    executor.active_requests = active_requests
+    executor.model_engine = engine
+    executor._supports_mm_encoder_item_scheduling = True
+    return executor
+
+
+def test_item_cache_keys_pin_the_full_request_path_format():
+    hashes = [[1, 2], [3, 4]]
+
+    keys = MultimodalModelMixin.build_encoder_cache_item_keys(
+        hashes, [("image", 0), ("video", 0)], [2, 3], "kw"
+    )
+
+    # Must stay identical to `_encoder_cache_item_key` / `_encoder_cache_keys`
+    # so both encode paths hit each other's entries.
+    assert keys == [("image", (1, 2), 2, "kw"), ("video", (3, 4), 3, "kw")]
+
+
+def test_item_encode_writes_independent_cache_entries(monkeypatch):
+    cache = TensorLRUCache(1 << 20, name="test")
+    engine = _cache_engine(cache, monkeypatch)
+    request = _cache_request(1, hashes=[[1, 2], [3, 4]], embedding_lengths=[2, 3])
+
+    engine.forward_multimodal_encoder_items([request], {1: [0, 1]})
+
+    key0, key1 = MultimodalModelMixin.build_encoder_cache_item_keys(
+        [[1, 2], [3, 4]], [("image", 0), ("image", 1)], [2, 3], "kw"
+    )
+    assert torch.equal(cache.get(key0), request.py_mm_encoder_outputs[0])
+    assert torch.equal(cache.get(key1), request.py_mm_encoder_outputs[1])
+    # Entries are clones: they must not alias the request's shared buffer.
+    buffer_storage_ptr = request.py_mm_encoder_output_buffer.untyped_storage().data_ptr()
+    assert cache.get(key0).untyped_storage().data_ptr() != buffer_storage_ptr
+    assert cache.get(key1).untyped_storage().data_ptr() != buffer_storage_ptr
+
+
+def test_sweep_completes_duplicate_request_without_encoding_or_budget(monkeypatch):
+    cache = TensorLRUCache(1 << 20, name="test")
+    engine = _cache_engine(cache, monkeypatch)
+    first = _cache_request(1, hashes=[[1, 2], [3, 4]], embedding_lengths=[2, 3])
+    engine.forward_multimodal_encoder_items(
+        [
+            first,
+        ],
+        {1: [0, 1]},
+    )
+    assert engine.model.encoded_item_counts == [2]
+
+    second = _cache_request(2, hashes=[[1, 2], [3, 4]], embedding_lengths=[2, 3])
+    executor = _sweep_executor(engine, [second])
+    executor._attach_mm_encoder_cache_hits()
+
+    assert engine.model.encoded_item_counts == [2]  # no further encoding
+    assert get_multimodal_encoder_progress(second) is MultimodalEncoderProgress.READY
+    assert second.py_multimodal_data["multimodal_embedding"] is second.py_mm_encoder_output_buffer
+    assert "image" not in second.py_multimodal_data
+
+    scheduler = MultimodalScheduler(_BaseScheduler(), max_num_items=8, max_num_tokens=1 << 20)
+    output = scheduler.schedule_request([second], set())
+    assert output.scheduled_mm_encoder_items is None
+    assert output.context_requests == [second]
+
+
+def test_partial_hit_routes_to_item_path_and_schedules_only_misses(monkeypatch):
+    cache = TensorLRUCache(1 << 20, name="test")
+    engine = _cache_engine(cache, monkeypatch)
+    request = _cache_request(1, hashes=[[1, 2], [3, 4]], embedding_lengths=[2, 3])
+    key0, _ = MultimodalModelMixin.build_encoder_cache_item_keys(
+        [[1, 2], [3, 4]], [("image", 0), ("image", 1)], [2, 3], "kw"
+    )
+    cache.put(key0, torch.full((2, 2), 7.0))
+
+    executor = _sweep_executor(engine, [request])
+    executor._attach_mm_encoder_cache_hits()
+
+    assert get_multimodal_encoder_progress(request) is MultimodalEncoderProgress.PARTIAL
+
+    # A PARTIAL request must take the item path even though the whole batch
+    # would fit the budgets, and only the miss is scheduled.
+    scheduler = MultimodalScheduler(_BaseScheduler(), max_num_items=8, max_num_tokens=1 << 20)
+    output = scheduler.schedule_request([request], set())
+    assert output.scheduled_mm_encoder_items == {1: [1]}
+
+    engine.forward_multimodal_encoder_items([request], {1: [1]})
+    assert engine.model.encoded_item_counts == [1]
+    assert get_multimodal_encoder_progress(request) is MultimodalEncoderProgress.READY
+
+
+def test_eviction_after_commit_does_not_regress_progress(monkeypatch):
+    cache = TensorLRUCache(1 << 20, name="test")
+    engine = _cache_engine(cache, monkeypatch)
+    request = _cache_request(1, hashes=[[1, 2]], embedding_lengths=[2])
+    engine.forward_multimodal_encoder_items([request], {1: [0]})
+
+    cache.clear()
+
+    assert get_multimodal_encoder_progress(request) is MultimodalEncoderProgress.READY
+    assert request.py_multimodal_data["multimodal_embedding"].shape == (2, 2)
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["no_hashes", "no_kwargs_hash", "count_mismatch", "no_cache", "flag_off"],
+)
+def test_cache_context_guards_disable_cache_per_request(case, monkeypatch):
+    cache = None if case == "no_cache" else TensorLRUCache(1 << 20, name="test")
+    engine = _cache_engine(cache, monkeypatch)
+    if case == "flag_off":
+        engine.supports_mm_encoder_item_scheduling = False
+    request = _cache_request(
+        1,
+        hashes=None
+        if case == "no_hashes"
+        else ([[1, 2]] if case == "count_mismatch" else [[1, 2], [3, 4]]),
+        embedding_lengths=[2, 3],
+        kwargs_hash=None if case == "no_kwargs_hash" else "kw",
+    )
+
+    assert engine.get_mm_encoder_cache_and_keys(request) is None
+
+    # The request still runs the item path exactly as without a cache.
+    engine.forward_multimodal_encoder_items([request], {1: [0, 1]})
+    assert get_multimodal_encoder_progress(request) is MultimodalEncoderProgress.READY
