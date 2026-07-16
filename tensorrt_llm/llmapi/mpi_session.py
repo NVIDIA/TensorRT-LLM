@@ -128,7 +128,7 @@ class MpiSession(abc.ABC):
             logger.critical(f"MpiSession shutdown timeout after {timeout}s; "
                             "calling MPI_Abort to force-kill stuck ranks...")
             if reason is not None:
-                logger.info(f"Reason to shutdown: {repr(reason)}")
+                logger.info(f"Reason to shutdown: {reason!r}")
             self.abort()
             logger.critical("MpiSession MPI_Abort returned")
 

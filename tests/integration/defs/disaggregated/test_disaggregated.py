@@ -821,7 +821,9 @@ def setup_disagg_cluster(
                             if count > last_worker_count:
                                 last_worker_count = count
                                 last_progress_time = now
-                            elif now - last_progress_time > _NO_PROGRESS_TIMEOUT:
+                            elif (count < num_ctx_instances + num_gen_instances
+                                  and now - last_progress_time
+                                  > _NO_PROGRESS_TIMEOUT):
                                 raise RuntimeError(
                                     f"No new workers registered for "
                                     f"{_NO_PROGRESS_TIMEOUT}s "
@@ -854,7 +856,7 @@ def setup_disagg_cluster(
                 t.cancel()
                 try:
                     await t
-                except (asyncio.CancelledError, Exception):
+                except asyncio.CancelledError:
                     pass
 
             # Re-raise the first exception. Prefer tick_task's message (it names
