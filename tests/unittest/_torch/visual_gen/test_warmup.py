@@ -102,8 +102,8 @@ class _BaseStubPipeline(BasePipeline):
 
     def __init__(self, warmup_cfg):
         self._warmed_up_shapes = set()
-        self.model_config = MagicMock()
-        self.model_config.compilation = warmup_cfg or CompilationConfig()
+        self.pipeline_config = MagicMock()
+        self.pipeline_config.compilation = warmup_cfg or CompilationConfig()
 
     def forward(self, *args, **kwargs):
         pass

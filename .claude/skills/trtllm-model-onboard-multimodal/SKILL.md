@@ -31,7 +31,11 @@ metadata:
     asyncio.gather then decodes all media for one request in parallel.
 
 [2] Input pipeline  (asyncio.to_thread, off the event loop)
-    BaseMultimodalInputProcessor.__call__:
+    BaseMultimodalInputProcessor.__call__ dispatches by input shape: a text
+    prompt goes to the per-model call_with_text_prompt; prompt_token_ids +
+    mm_data goes to the base-class call_with_token_ids fast path (or is
+    detokenized back to call_with_text_prompt when the model opts out). The
+    per-model HF processing lives in call_with_text_prompt:
        HF AutoProcessor → pixel_values + token_ids
        mm-token layout (positions / lengths / special_token_offsets)
        (mRoPE) mrope_position_ids + deltas computed on CPU
@@ -79,7 +83,7 @@ metadata:
 When `@support_multimodal_disaggregated` is set and the deployment uses `TLLM_MULTIMODAL_DISAGGREGATED=1`:
 
 - **Encoder worker:** runs as a standalone `MultimodalEncoder` (`mm_encoder_only=True`). It executes only the multimodal encoder and ships `mm_embeddings` (+ mRoPE position ids/deltas) to prefill+decode workers as shared-tensor handles.
-- **Prefill+decode worker:** the model's `__init__` skips constructing `self.mm_encoder` when `_is_disagg()` is true; the input processor's `attach_multimodal_embeddings()` override binds the encoder handles into the request. For context-only requests, the engine re-clones mrope tensors so IPC handles outlive the encoder worker's freed memory — replicate that pattern for any new GPU-resident mm tensors.
+- **Prefill+decode worker:** the model's `__init__` skips constructing `self.mm_encoder` when `_is_mm_disagg()` is true; the input processor's `attach_multimodal_embeddings()` override binds the encoder handles into the request. For context-only requests, the engine re-clones mrope tensors so IPC handles outlive the encoder worker's freed memory — replicate that pattern for any new GPU-resident mm tensors.
 
 ### Templates to study
 
@@ -159,11 +163,11 @@ Three-arg **`torch.where(cond, x, y)`** is fine when **`cond`** is built only on
 
 CPU-bound work (decode / resize / normalize / mel-spectrogram / frame extraction) must not compete with GPU work, block the request loop, or serialize across requests.
 
-- HF AutoProcessor + image_processor + tokenizer run inside `BaseMultimodalInputProcessor.__call__` — *not* in the model worker.
+- HF AutoProcessor + image_processor + tokenizer run inside the input processor's `call_with_text_prompt` (dispatched from `__call__`) — *not* in the model worker.
 - URL/bytes media goes through `async_load_image` / `async_load_video` / `async_load_audio` (all wrap blocking decode in `asyncio.to_thread`). Never call `PIL.Image.open(...).load()` / `cv2.VideoCapture` / `soundfile.read` synchronously on the request hot path.
 - Pin host tensors before H2D with `prefer_pinned()` (False under Confidential Compute (CC), True otherwise). The engine pins `multimodal_data` automatically via `to_device(..., pin_memory=prefer_pinned())`.
 - **Declare `multimodal_data_device_paths`** on the model — list of dotted paths (e.g. `["image.pixel_values", "image.image_grid_thw", "video.pixel_values_videos", "video.video_grid_thw", "multimodal_embedding"]`) telling the engine which fields go to CUDA. Anything not listed stays on CPU.
-- Optional (refactor pending): `get_text_with_mm_placeholders` + `expand_prompt_token_ids_for_mm` enable the tokenized+MM fast path (`tokenized_multimodal_process`), skipping redundant detokenization. A cleaner alternative is being designed — skip unless you have a specific need.
+- Optional tokenized+MM fast path: set `supports_token_id_mm_expansion = True` (a `ClassVar`, default `False`) and implement `get_text_with_mm_placeholders` + `expand_prompt_token_ids_for_mm`. The base-class `__call__` then routes `prompt_token_ids + multi_modal_data` (no `prompt`) requests through `call_with_token_ids`, skipping redundant detokenization. When the flag is `False` (most VLMs), the base class detokenizes `prompt_token_ids → prompt` and re-runs `call_with_text_prompt`, so token-ID inputs still work — just less efficiently. Only LlavaNext + NanoV2VL opt in today.
 - Forward `mm_processor_kwargs` from `inputs.get("mm_processor_kwargs", {})` to the HF processor (callers tune things like video sample rate via this).
 
 ### Contract 3 — Large media via shared tensors, never raw pickle
@@ -225,7 +229,7 @@ class {Name}Model(PreTrainedModel):
         if hasattr(self, "llm"):
             return  # idempotency guard — re-entry from `post_config` etc.
 
-        if not _is_disagg():
+        if not _is_mm_disagg():
             self.mm_encoder = {Name}VisionModel(model_config)
         else:
             self.mm_encoder = None
@@ -265,7 +269,7 @@ class {Name}Model(PreTrainedModel):
 
         multimodal_params = kwargs.get("multimodal_params", [])
         mm_embeds = []
-        if len(multimodal_params) > 0 and not _is_disagg():
+        if len(multimodal_params) > 0 and not _is_mm_disagg():
             mm_embeds = get_multimodal_embeddings(
                 encoder_forward_fn=self.mm_encoder.forward,
                 multimodal_params=multimodal_params[:num_context_requests],
@@ -300,9 +304,20 @@ class {Name}Model(PreTrainedModel):
 
 ### Phase 3 — Input processor + dummy builder
 
-Subclass **both** `BaseMultimodalInputProcessor` (drives every real request) and `BaseMultimodalDummyInputsBuilder` (drives engine warmup / profiling — the base shrinks dummy image resolution until the synthetic prompt fits `input_seq_len`). Colocate in the modeling file. Reference: `Qwen3VLInputProcessorBase`.
+Subclass **both** `BaseMultimodalInputProcessor` (drives every real request) and `BaseMultimodalDummyInputsBuilder` (drives engine warmup / KV-cache profiling). Colocate in the modeling file. References: `Qwen3VLInputProcessorBase` (image+video), `Mistral3InputProcessor` (Pixtral).
 
-`__call__(inputs, sampling_params)` does:
+**Encoder KV-cache memory profiling (deterministic dummy sizing).** The KV-cache profiler sizes the encoder's memory contribution by running the encoder **once** on a worst-case dummy (held resident through the peak measurement), **decoupled** from the text-only LLM dummy. To opt in, the model exposes `encode_multimodal_inputs` (via `MultimodalModelMixin`) and the input processor implements the modality-agnostic dummy contract on `BaseMultimodalDummyInputsBuilder`:
+
+- `get_mm_max_tokens_per_item() -> {modality: tokens}` — per-modality worst-case single-item encoder-attention tokens. The keys enumerate the modalities the model encodes; the profiler splits the shared `encoder_max_num_tokens` across them in proportion to these (so they share one microbatch cap, not each the whole budget). Default `{}` → no direct encoder profiling.
+- `get_dummy_mm_data_for_tokens(*, max_tokens_per_modality, dtype) -> multimodal_data` — materialize the processed encoder tensors **directly** (zeros of the exact shape the processor would emit; no PIL image + HF-processor round-trip), merged into one `multimodal_data` dict so a single `encode_multimodal_inputs` profiles the combined peak. Default raises `NotImplementedError`.
+
+Vision models implement these via the size trio: `get_num_mm_tokens(*, width, height, num_frames)` (size → **pre-merger encoder-attention tokens**; the single source of truth shared with the hashing path `get_num_tokens_per_image`/`_video`), its inverse `get_size_for_max_tokens(max_tokens)` (largest aspect-bounded size whose token count ≤ budget, capped at `max_pixels`), and `get_dummy_mm_data_for_size(...)`. Qwen builds `pixel_values`/`image_grid_thw`; Mistral builds `pixel_values`/`image_sizes` and keeps its ViT patch count off `get_num_mm_tokens` (a private `_vit_tokens` helper) so the LLM-side Pixtral hashing count is unchanged. A model with neither contract falls back to a text-only dummy (encoder memory unaccounted). Don't hardcode the encoder attention workspace (`max_num_*=8192`): inherit `MultimodalEncoderMixin` and let the engine size it via `setup_attn_metadata` at load.
+
+The workspace dimensions come from `TorchLlmArgs.get_encoder_runtime_sizes()` → `(encoder_max_batch_size, encoder_max_num_tokens)` — two prototype knobs that size the encoder's `AttentionMetadata` independently of the LLM batch and fall back to the LLM-side `max_batch_size` / `max_num_tokens` when unset. `encoder_max_num_tokens` is exactly the per-iteration encoder microbatch token cap that `get_dummy_mm_data_for_tokens` saturates (and that the profiler splits across modalities), so an encoder microbatch can be sized larger than the LLM `max_num_tokens` without inflating the KV-cache budget. Read them via `get_encoder_runtime_sizes()` rather than the raw fields so the fallback is applied.
+
+> Mixed image+video+audio models (nemotron-nano / phi4mm) compose multiple modality dummies through the same `get_dummy_mm_data_for_tokens` (return `{"image": ..., "audio": ...}`); a per-modality `ModalityDummySizer` composition is the planned home for the shared orchestration.
+
+Implement `call_with_text_prompt(inputs, sampling_params)` — the per-model text-prompt path. **Don't override `__call__`**: the base class's concrete `__call__` dispatches here for text prompts, and also detokenizes `prompt_token_ids → prompt` and falls through to here for non-fast-path VLMs. `call_with_text_prompt` does:
 
 1. Pull `text_prompt`, `mm_data`, `mm_processor_kwargs` from `inputs`.
 2. `_preprocess(...)` — HF processor produces `pixel_values` / `pixel_values_videos` / `*_grid_thw` / `input_ids`.
@@ -311,9 +326,9 @@ Subclass **both** `BaseMultimodalInputProcessor` (drives every real request) and
 5. `_postprocess(input_ids)` rewrites HF's `image_token_id` / `video_token_id` to `tllm_multimodal_token_id = vocab_size + 1` (the OOV sentinel). Skip when `mm_data` is empty.
 6. Return `(prompt_token_ids_list, {"multimodal_data": multimodal_data})`.
 
-**Optional overrides (refactor pending; skip unless needed):** `get_text_with_mm_placeholders(mm_counts)` + `expand_prompt_token_ids_for_mm(prompt_token_ids, num_mm_tokens, ...)` enable the tokenized fast path. A cleaner replacement is being designed.
+**Optional tokenized+MM fast path (skip unless needed):** set `supports_token_id_mm_expansion = True` (`ClassVar`) and implement `get_text_with_mm_placeholders(mm_counts)` + `expand_prompt_token_ids_for_mm(prompt_token_ids, num_mm_tokens, ...)`. The base-class `call_with_token_ids` then builds dummy placeholder text, runs `call_with_text_prompt` on it, expands the real token IDs, and merges any returned `mm_data_updates` (e.g. video `evs_ids`) into `multimodal_data`. Leave the flag `False` and the base class just detokenizes token-ID inputs and re-runs `call_with_text_prompt`. Only LlavaNext + NanoV2VL opt in today.
 
-**EPD override (if `@support_multimodal_disaggregated`):** `attach_multimodal_embeddings(inputs, multimodal_embedding, sampling_params)` consumes encoder outputs in the prefill+decode worker.
+**EPD override (if `@support_multimodal_disaggregated`):** override `_attach_multimodal_embeddings_impl(inputs, multimodal_embedding, sampling_params)` — **not** the `attach_multimodal_embeddings` wrapper — to consume encoder outputs in the prefill+decode worker. The base wrapper detokenizes tokenized inputs for non-fast-path VLMs before delegating to your impl.
 
 **Decorator stack** — bottom-up application; `register_vision_encoder` requires `register_auto_model` to have run first:
 
@@ -337,7 +352,7 @@ class {Name}Model(PreTrainedModel): ...
 
 ```python
 def load_weights(self, weights, weight_mapper):
-    if not _is_disagg():
+    if not _is_mm_disagg():
         self.mm_encoder.load_weights(weights)
         # Release mmap pages backing the encoder weights as soon as we're done.
         if hasattr(weights, "mark_consumed"):
@@ -429,9 +444,10 @@ Follow `CONTRIBUTING.md`. Title `[JIRA/NVBUG/None][type] description`, `git comm
 
 **Input processor**
 - [ ] Subclasses both `BaseMultimodalInputProcessor` and `BaseMultimodalDummyInputsBuilder`.
-- [ ] `__call__` runs HF AutoProcessor + tokenizer, builds `multimodal_data` by modality, computes `mrope_config` on CPU, `_postprocess`-rewrites mm token ids to the OOV sentinel.
-- [ ] `mm_processor_kwargs` flow-through preserved. (Tokenized fast-path overrides — `get_text_with_mm_placeholders` / `expand_prompt_token_ids_for_mm` — are optional; a cleaner replacement is being designed.)
-- [ ] `attach_multimodal_embeddings` implemented if `@support_multimodal_disaggregated`.
+- [ ] Encoder KV-cache profiling: implements the deterministic dummy contract (`get_mm_max_tokens_per_item` + `get_dummy_mm_data_for_tokens`, vision via the `get_num_mm_tokens` / `get_size_for_max_tokens` / `get_dummy_mm_data_for_size` trio) and the model exposes `encode_multimodal_inputs`; encoder inherits `MultimodalEncoderMixin` (no hardcoded `max_num_*=8192` — sized by `setup_attn_metadata`). Skipping these = text-only dummy, encoder memory unaccounted.
+- [ ] `call_with_text_prompt` (not `__call__` — that's the base-class dispatcher) runs HF AutoProcessor + tokenizer, builds `multimodal_data` by modality, computes `mrope_config` on CPU, `_postprocess`-rewrites mm token ids to the OOV sentinel.
+- [ ] `mm_processor_kwargs` flow-through preserved. (Tokenized fast path is optional: set `supports_token_id_mm_expansion = True` + implement `get_text_with_mm_placeholders` / `expand_prompt_token_ids_for_mm`; otherwise the base class detokenizes token-ID inputs automatically.)
+- [ ] `_attach_multimodal_embeddings_impl` implemented (not the `attach_multimodal_embeddings` wrapper) if `@support_multimodal_disaggregated`.
 
 **Performance contracts**
 - [ ] Grep clean for Contract 1 bans (`.item()` / `.cpu()` / `.tolist()` / `torch.nonzero` / single-arg `torch.where` / value-dependent `if`, etc.) in modeling `forward` paths — elementwise `torch.where(cond, x, y)` with GPU-only `cond` is fine.

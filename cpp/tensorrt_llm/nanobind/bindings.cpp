@@ -273,8 +273,6 @@ NB_MODULE(TRTLLM_NB_MODULE, m)
 
         .def_prop_ro("has_w4a8_mxfp4_mxfp8", &tc::QuantMode::hasW4a8Mxfp4Mxfp8)
         .def_prop_ro("has_w4a16_mxfp4", &tc::QuantMode::hasW4a16Mxfp4)
-        .def_prop_ro("has_w4a16_nvfp4", &tc::QuantMode::hasW4a16Nvfp4)
-
         .def_prop_ro("has_kv_cache_quant", &tc::QuantMode::hasKvCacheQuant)
         .def_static("from_description", &tc::QuantMode::fromDescription, nb::arg("quantize_weights"),
             nb::arg("quantize_activations"), nb::arg("per_token"), nb::arg("per_channel"), nb::arg("per_group"),

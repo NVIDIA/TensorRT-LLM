@@ -10,6 +10,7 @@ LoRA (Low-Rank Adaptation) is a parameter-efficient fine-tuning technique that e
 3. [Advanced Usage](#advanced-usage)
    - [LoRA with Quantization](#lora-with-quantization)
    - [NeMo LoRA Format](#nemo-lora-format)
+   - [Routed-Expert MoE LoRA](#routed-expert-moe-lora)
    - [Cache Management](#cache-management)
 4. [TRTLLM serve with LoRA](#trtllm-serve-with-lora)
    - [YAML Configuration](#yaml-configuration)
@@ -134,6 +135,84 @@ lora_request = LoRARequest(
     lora_ckpt_source="nemo"
 )
 ```
+
+### Routed-Expert MoE LoRA
+
+LoRA can be applied to the routed-expert projections of a Mixture-of-Experts (MoE) layer in addition to the attention modules. The PyTorch backend's Cutlass MoE kernel fuses the LoRA application into the MoE forward pass, so multi-adapter batches run without an extra GEMM pass per layer.
+
+#### Supported configuration
+
+| Aspect | Supported |
+|---|---|
+| MoE backend | `CUTLASS` only (other backends raise an error at construction). |
+| Base-weight dtype | bf16 / fp16. Quantized base weights (FP8, NVFP4, INT4, INT8) are not yet supported. |
+| Adapter modules | `moe_h_to_4h` (gate side of SwiGLU), `moe_gate` (up side), `moe_4h_to_h` (down). `moe_h_to_4h` and `moe_4h_to_h` must both be present; `moe_gate` is optional (gated activations only). |
+| Adapter layout | Per-expert (stacked `[num_experts, ...]`). |
+| Multi-LoRA in flight | Yes. Reuses the existing slot manager. |
+| Execution modes | Eager and CUDA-graph capture/replay (see below). Both feed the same grouped-GEMM LoRA core. |
+| min-latency mode | Not supported with MoE LoRA. |
+| Alltoall (WideEP) | Not supported with MoE LoRA. |
+| DoRA on MoE modules | Not supported (and rejected at load time). |
+| `register_to_config` + `torch.compile` | Not supported with MoE LoRA. |
+
+#### Enabling routed-expert MoE LoRA
+
+```python
+from tensorrt_llm import LLM
+from tensorrt_llm.lora_manager import LoraConfig
+
+lora_config = LoraConfig(
+    lora_target_modules=[
+        "attn_q", "attn_k", "attn_v",  # optional: standard attention LoRA
+        "moe_h_to_4h",                 # gate/SiLU projection (required for MoE LoRA)
+        "moe_4h_to_h",                 # down projection (required for MoE LoRA)
+        "moe_gate",                    # up/linear projection (optional; gated activations)
+    ],
+    max_lora_rank=16,
+    max_loras=8,
+    max_cpu_loras=8,
+)
+
+llm = LLM(
+    model="/path/to/moe_base_model",
+    lora_config=lora_config,
+    # The MoE LoRA path requires the Cutlass backend. Other moe_backend values
+    # raise ValueError at construction.
+    moe_backend="CUTLASS",
+)
+```
+
+Adapters are loaded via `LoRARequest` exactly like attention-only LoRA; no API change.
+
+#### Adapter layout
+
+Each routed expert has its own `(A, B)` matrices, stored as stacked `[num_experts, rank, in_dim]` and `[num_experts, out_dim, rank]` tensors. This is the standard HuggingFace PEFT export shape for MoE LoRA; the MoE kernel reads each expert's slice at offset `expert_index * dim * rank`.
+
+A helper for assembling synthetic per-expert adapters (for unit tests and experimentation) is provided at `tensorrt_llm._torch.peft.lora.moe_layout`:
+
+```python
+from tensorrt_llm._torch.peft.lora.moe_layout import make_per_expert_lora
+
+fc1_adapter = make_per_expert_lora(
+    num_experts=8, rank=16, in_dim=2048, out_dim=5632,
+    dtype=torch.bfloat16,
+)
+# fc1_adapter["A"].shape == (8, 16, 2048)  -- independent per expert
+# fc1_adapter["B"].shape == (8, 5632, 16)  -- independent per expert
+```
+
+#### Execution modes
+
+Routed-expert MoE LoRA always runs through a single capture-safe grouped-GEMM core (on-stream pointer expansion, problem building, and grouped GEMMs). Two input schemas feed that core, and both produce identical results:
+
+- **Eager** uses the per-request input schema: the op expands the per-request adapter tables into per-token `(rank, A, B)` arrays before launching the core. This mode handles both context (prefill) and decode batches.
+- **CUDA-graph decode** uses the slot-indexed input schema: `CudaGraphLoraManager` maintains stable per-slot adapter tables and a `token_to_slot` map, and the slot→token expansion runs entirely on the stream. Because the tables live at stable addresses and are refreshed in place, reassigning a slot's adapter is reflected on replay without re-capture. CUDA-graph decode is generation-only.
+
+The per-request schema is not itself CUDA-graph capturable (its host-side adapter expansion would be frozen at capture time), so under capture the op uses the slot-indexed schema; supplying per-request inputs while capturing raises a clear error.
+
+#### What is rejected, and where
+
+If you supply MoE LoRA on a non-Cutlass backend or with quantization, `create_moe` raises at construction with a message pointing at the offending setting. At runtime, the fused MoE op also rejects min-latency mode + LoRA, alltoall + LoRA, and per-request (eager-schema) inputs under CUDA-graph capture (use the slot-indexed schema for capture).
 
 ### Cache Management
 

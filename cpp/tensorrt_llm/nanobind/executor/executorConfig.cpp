@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -76,27 +76,29 @@ void initConfigBindings(nb::module_& m)
 
     auto schedulerConfigSetstate = [](tle::SchedulerConfig& self, nb::tuple const& state)
     {
-        if (state.size() != 3)
+        if (state.size() != 4)
         {
             throw std::runtime_error("Invalid state!");
         }
         new (&self) tle::SchedulerConfig(nb::cast<tle::CapacitySchedulerPolicy>(state[0]),
             nb::cast<std::optional<tle::ContextChunkingPolicy>>(state[1]),
-            nb::cast<std::optional<tle::DynamicBatchConfig>>(state[2]));
+            nb::cast<std::optional<tle::DynamicBatchConfig>>(state[2]), nb::cast<bool>(state[3]));
     };
     auto schedulerConfigGetstate = [](tle::SchedulerConfig const& self)
     {
-        return nb::make_tuple(
-            self.getCapacitySchedulerPolicy(), self.getContextChunkingPolicy(), self.getDynamicBatchConfig());
+        return nb::make_tuple(self.getCapacitySchedulerPolicy(), self.getContextChunkingPolicy(),
+            self.getDynamicBatchConfig(), self.getEnablePrefixAwareScheduling());
     };
     nb::class_<tle::SchedulerConfig>(m, "SchedulerConfig")
         .def(nb::init<tle::CapacitySchedulerPolicy, std::optional<tle::ContextChunkingPolicy>,
-                 std::optional<tle::DynamicBatchConfig>>(),
+                 std::optional<tle::DynamicBatchConfig>, bool>(),
             nb::arg("capacity_scheduler_policy") = tle::CapacitySchedulerPolicy::kGUARANTEED_NO_EVICT,
-            nb::arg("context_chunking_policy") = nb::none(), nb::arg("dynamic_batch_config") = nb::none())
+            nb::arg("context_chunking_policy") = nb::none(), nb::arg("dynamic_batch_config") = nb::none(),
+            nb::arg("enable_prefix_aware_scheduling") = true)
         .def_prop_ro("capacity_scheduler_policy", &tle::SchedulerConfig::getCapacitySchedulerPolicy)
         .def_prop_ro("context_chunking_policy", &tle::SchedulerConfig::getContextChunkingPolicy)
         .def_prop_ro("dynamic_batch_config", &tle::SchedulerConfig::getDynamicBatchConfig)
+        .def_prop_ro("enable_prefix_aware_scheduling", &tle::SchedulerConfig::getEnablePrefixAwareScheduling)
         .def("__getstate__", schedulerConfigGetstate)
         .def("__setstate__", schedulerConfigSetstate);
 
@@ -431,15 +433,24 @@ void initConfigBindings(nb::module_& m)
         .def("__setstate__", guidedDecodingConfigSetstate);
 
     auto cacheTransceiverConfigGetstate = [](tle::CacheTransceiverConfig const& self)
-    { return nb::make_tuple(self.getBackendType(), self.getMaxTokensInBuffer(), self.getKvTransferTimeoutMs()); };
+    {
+        return nb::make_tuple(self.getBackendType(), self.getMaxTokensInBuffer(), self.getKvTransferTimeoutMs(),
+            self.getKvTransferSenderFutureTimeoutMs(), self.getKvTransferPollIntervalMs());
+    };
     auto cacheTransceiverConfigSetstate = [](tle::CacheTransceiverConfig& self, nb::tuple const& state)
     {
-        if (state.size() != 3)
+        if (state.size() < 3 || state.size() > 5)
         {
             throw std::runtime_error("Invalid CacheTransceiverConfig state!");
         }
-        new (&self) tle::CacheTransceiverConfig(nb::cast<tle::CacheTransceiverConfig::BackendType>(state[0]),
-            nb::cast<std::optional<size_t>>(state[1]), nb::cast<std::optional<int>>(state[2]));
+        auto kvTransferSenderFutureTimeoutMs
+            = state.size() >= 4 ? nb::cast<std::optional<int>>(state[3]) : std::optional<int>{std::nullopt};
+        auto kvTransferPollIntervalMs = state.size() >= 5
+            ? nb::cast<std::optional<int>>(state[4])
+            : std::optional<int>{tle::CacheTransceiverConfig::kDefaultKvTransferPollIntervalMs};
+        auto backendType = nb::cast<std::optional<tle::CacheTransceiverConfig::BackendType>>(state[0]);
+        new (&self) tle::CacheTransceiverConfig(backendType, nb::cast<std::optional<size_t>>(state[1]),
+            nb::cast<std::optional<int>>(state[2]), kvTransferSenderFutureTimeoutMs, kvTransferPollIntervalMs);
     };
 
     nb::enum_<tle::CacheTransceiverConfig::BackendType>(m, "CacheTransceiverBackendType")
@@ -466,10 +477,11 @@ void initConfigBindings(nb::module_& m)
 
     nb::class_<tle::CacheTransceiverConfig>(m, "CacheTransceiverConfig")
         .def(nb::init<std::optional<tle::CacheTransceiverConfig::BackendType>, std::optional<size_t>,
-                 std::optional<int>, std::optional<int>>(),
+                 std::optional<int>, std::optional<int>, std::optional<int>>(),
             nb::arg("backend") = std::nullopt, nb::arg("max_tokens_in_buffer") = std::nullopt,
             nb::arg("kv_transfer_timeout_ms") = std::nullopt,
-            nb::arg("kv_transfer_sender_future_timeout_ms") = std::nullopt)
+            nb::arg("kv_transfer_sender_future_timeout_ms") = std::nullopt,
+            nb::arg("kv_transfer_poll_interval_ms") = tle::CacheTransceiverConfig::kDefaultKvTransferPollIntervalMs)
         .def_prop_rw(
             "backend", &tle::CacheTransceiverConfig::getBackendType, &tle::CacheTransceiverConfig::setBackendType)
         .def_prop_rw("max_tokens_in_buffer", &tle::CacheTransceiverConfig::getMaxTokensInBuffer,
@@ -479,6 +491,8 @@ void initConfigBindings(nb::module_& m)
         .def_prop_rw("kv_transfer_sender_future_timeout_ms",
             &tle::CacheTransceiverConfig::getKvTransferSenderFutureTimeoutMs,
             &tle::CacheTransceiverConfig::setKvTransferSenderFutureTimeoutMs)
+        .def_prop_rw("kv_transfer_poll_interval_ms", &tle::CacheTransceiverConfig::getKvTransferPollIntervalMs,
+            &tle::CacheTransceiverConfig::setKvTransferPollIntervalMs)
         .def("__getstate__", cacheTransceiverConfigGetstate)
         .def("__setstate__", cacheTransceiverConfigSetstate);
 

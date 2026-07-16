@@ -33,10 +33,12 @@ from tensorrt_llm._torch.auto_deploy.compile.backends.torch_cudagraph import (
     DualModeCapturedGraph,
     PiecewiseCapturedGraph,
     _args_kwargs_flatten_spec,
+    _inject_out_param,
+    _setup_piecewise_mixed_batch,
 )
 from tensorrt_llm._torch.auto_deploy.compile.piecewise_runner import ADPiecewiseRunner, OutputInfo
 from tensorrt_llm._torch.auto_deploy.compile.piecewise_utils import SplitInfo, submod_has_cuda_ops
-from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import BatchInfo
+from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import BatchInfo, SequenceInfo
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.shim.ad_executor import _round_up_to_closest
 from tensorrt_llm._torch.auto_deploy.transform.library.compile_model import (
@@ -61,6 +63,162 @@ class ModelWithMultipleInputs(torch.nn.Module):
         if x2 is not None:
             out = out + self.base_model(x2)
         return out
+
+
+class _FakeSchemaArgument:
+    def __init__(self, name):
+        self.name = name
+
+
+class _FakeSchema:
+    def __init__(self, argument_names):
+        self.arguments = [_FakeSchemaArgument(name) for name in argument_names]
+
+
+class _FakeDynamicOpOverload:
+    """Mimics torch._ops.OpOverload enough for FX codegen and dynamic-op matching."""
+
+    def __init__(self, qualified_name, argument_names):
+        self._name = qualified_name
+        self._schema = _FakeSchema(argument_names)
+        short = qualified_name.split("::")[-1]
+        self.__name__ = short
+        self.__qualname__ = qualified_name
+        self.__module__ = __name__
+
+    def name(self):
+        return self._name
+
+    def __call__(self, *args, **kwargs):
+        return args[0] if args else None
+
+
+_TRTLLM_ATTENTION_ARG_NAMES = [
+    "q",
+    "k",
+    "v",
+    "batch_info_host",
+    "seq_len",
+    "seq_len_with_cache",
+    "kv_cache_block_offsets",
+    "kv_cache",
+    "scale",
+    "sliding_window",
+    "kv_scale_orig_quant",
+    "kv_scale_quant_orig",
+    "out_scale",
+    "out",
+    "rotary_cos_sin",
+    "position_embedding_type",
+    "rotary_embedding_dim",
+]
+
+
+def _find_out_placeholder(gm):
+    return next(
+        node for node in gm.graph.nodes if node.op == "placeholder" and node.target == "out"
+    )
+
+
+def _find_dynamic_op_node(gm):
+    return next(
+        node
+        for node in gm.graph.nodes
+        if node.op == "call_function"
+        and hasattr(node.target, "name")
+        and "trtllm_attention_mha_with_cache" in node.target.name()
+    )
+
+
+def test_inject_out_param_reuses_positional_out_schema_slot():
+    graph = Graph()
+    q = graph.placeholder("q")
+    k = graph.placeholder("k")
+    v = graph.placeholder("v")
+    batch_info_host = graph.placeholder("batch_info_host")
+    seq_len = graph.placeholder("seq_len")
+    seq_len_with_cache = graph.placeholder("seq_len_with_cache")
+    kv_cache_block_offsets = graph.placeholder("kv_cache_block_offsets")
+    kv_cache = graph.placeholder("kv_cache")
+    target = _FakeDynamicOpOverload(
+        "auto_deploy::trtllm_attention_mha_with_cache",
+        _TRTLLM_ATTENTION_ARG_NAMES,
+    )
+    attn = graph.create_node(
+        "call_function",
+        target,
+        args=(
+            q,
+            k,
+            v,
+            batch_info_host,
+            seq_len,
+            seq_len_with_cache,
+            kv_cache_block_offsets,
+            kv_cache,
+            None,
+            None,
+            1.0,
+            1.0,
+            None,
+            None,
+            None,
+            0,
+            0,
+        ),
+        name="attention",
+    )
+    graph.output(attn)
+    gm = GraphModule(nn.Module(), graph)
+
+    _inject_out_param(gm)
+
+    out_placeholder = _find_out_placeholder(gm)
+    dynamic_node = _find_dynamic_op_node(gm)
+    assert len(dynamic_node.args) == len(_TRTLLM_ATTENTION_ARG_NAMES)
+    assert dynamic_node.args[_TRTLLM_ATTENTION_ARG_NAMES.index("out")] is out_placeholder
+    assert "out" not in dynamic_node.kwargs
+
+
+def test_inject_out_param_uses_kwarg_when_out_slot_not_materialized():
+    graph = Graph()
+    q = graph.placeholder("q")
+    k = graph.placeholder("k")
+    v = graph.placeholder("v")
+    batch_info_host = graph.placeholder("batch_info_host")
+    seq_len = graph.placeholder("seq_len")
+    seq_len_with_cache = graph.placeholder("seq_len_with_cache")
+    kv_cache_block_offsets = graph.placeholder("kv_cache_block_offsets")
+    kv_cache = graph.placeholder("kv_cache")
+    target = _FakeDynamicOpOverload(
+        "auto_deploy::trtllm_attention_mha_with_cache",
+        _TRTLLM_ATTENTION_ARG_NAMES,
+    )
+    attn = graph.create_node(
+        "call_function",
+        target,
+        args=(
+            q,
+            k,
+            v,
+            batch_info_host,
+            seq_len,
+            seq_len_with_cache,
+            kv_cache_block_offsets,
+            kv_cache,
+            None,
+        ),
+        name="attention",
+    )
+    graph.output(attn)
+    gm = GraphModule(nn.Module(), graph)
+
+    _inject_out_param(gm)
+
+    out_placeholder = _find_out_placeholder(gm)
+    dynamic_node = _find_dynamic_op_node(gm)
+    assert len(dynamic_node.args) == 9
+    assert dynamic_node.kwargs["out"] is out_placeholder
 
 
 # Using pytest.mark.parametrize to test multiple cases
@@ -298,6 +456,35 @@ class TestCapturedGraphCapture:
         compiled_model.capture_graph(get_args_kwargs, [2])
 
         assert compiled_model.model.seen == [(2, 2)]
+
+    def test_capture_graph_skips_static_arg_mismatched_batch_size(self, monkeypatch):
+        class ModelWithStaticMetadata(nn.Module):
+            def forward(self, x, meta):
+                return x + meta[: x.shape[0], None]
+
+        compiled_model = CapturedGraph(
+            ModelWithStaticMetadata(),
+            num_batched_inputs=1,
+        )
+        captured_shapes = []
+
+        def fake_capture_one_graph(self, args, kwargs, refresh_args_static=None):
+            captured_shapes.append(args[0].shape)
+            return object(), (args[0].shape[0],)
+
+        monkeypatch.setattr(CapturedGraph, "_capture_one_graph", fake_capture_one_graph)
+
+        meta_by_batch_size = {}
+
+        def get_args_kwargs(bs):
+            meta = meta_by_batch_size.setdefault(bs, torch.arange(bs, dtype=torch.float32))
+            x = torch.arange(bs, dtype=torch.float32).reshape(bs, 1)
+            return (x,), {"meta": meta}
+
+        compiled_model.capture_graph(get_args_kwargs, [4, 2])
+
+        assert captured_shapes == [torch.Size([4, 1])]
+        assert set(compiled_model.cudagraphs) == {(4, 1)}
 
     def test_auto_batched_inputs_keep_explicit_resources_static(self, monkeypatch):
         class ModelWithInterleavedKwargs(nn.Module):
@@ -846,6 +1033,14 @@ class TestPiecewiseCapturedGraphOutputHandling:
 class TestPiecewiseCapturedGraphStaticInputBuffers:
     """Tests for static kwarg buffers used by piecewise capture."""
 
+    @staticmethod
+    def _add_static_runner_with_inputs(pcg, *input_names):
+        graph = Graph()
+        placeholders = [graph.placeholder(name) for name in input_names]
+        graph.output(placeholders[0])
+        submodule = GraphModule(nn.Module(), graph)
+        pcg._static_runners[0] = ADPiecewiseRunner(submodule)
+
     @pytest.mark.parametrize(
         ("buf_shape", "src_shape", "dyn_dim"),
         [
@@ -870,6 +1065,7 @@ class TestPiecewiseCapturedGraphStaticInputBuffers:
 
     def test_allocate_static_input_buffers_handles_static_shape_unstable_kwarg(self):
         pcg = PiecewiseCapturedGraph(nn.Linear(4, 4), piecewise_num_tokens=[8])
+        self._add_static_runner_with_inputs(pcg, "input_ids")
 
         def get_args_kwargs(_):
             return (), {"input_ids": torch.arange(8, dtype=torch.float32)}
@@ -888,6 +1084,41 @@ class TestPiecewiseCapturedGraphStaticInputBuffers:
         assert copied.data_ptr() == static_buffer.data_ptr()
         assert copied is static_buffer
         assert torch.equal(copied, src)
+
+    def test_allocate_static_input_buffers_skips_dynamic_only_kwargs(self):
+        pcg = PiecewiseCapturedGraph(nn.Linear(4, 4), piecewise_num_tokens=[8])
+        self._add_static_runner_with_inputs(pcg, "inputs_embeds")
+
+        def get_args_kwargs(num_tokens):
+            return (), {
+                "inputs_embeds": torch.ones((1, num_tokens, 4), dtype=torch.float32),
+                "mm_item_cu_seqlen": torch.arange(2, dtype=torch.int32),
+                "mm_special_offsets_cu_seqlen": torch.arange(2, dtype=torch.int32),
+            }
+
+        pcg._allocate_static_input_buffers(get_args_kwargs)
+
+        assert set(pcg._static_input_buffers) == {"inputs_embeds"}
+
+        inputs_embeds = torch.zeros((1, 3, 4), dtype=torch.float32)
+        mm_item_cu_seqlen = torch.arange(25, dtype=torch.int32)
+        mm_special_offsets_cu_seqlen = torch.arange(25, dtype=torch.int32)
+        kwargs = {
+            "inputs_embeds": inputs_embeds,
+            "mm_item_cu_seqlen": mm_item_cu_seqlen,
+            "mm_special_offsets_cu_seqlen": mm_special_offsets_cu_seqlen,
+        }
+
+        pcg._copy_to_static_buffers(kwargs)
+
+        copied_embeds = kwargs["inputs_embeds"]
+        assert copied_embeds.shape == inputs_embeds.shape
+        assert copied_embeds.data_ptr() == pcg._static_input_buffers["inputs_embeds"][0].data_ptr()
+        assert torch.equal(copied_embeds, inputs_embeds)
+        assert kwargs["mm_item_cu_seqlen"] is mm_item_cu_seqlen
+        assert kwargs["mm_special_offsets_cu_seqlen"] is mm_special_offsets_cu_seqlen
+        assert kwargs["mm_item_cu_seqlen"].shape == torch.Size([25])
+        assert kwargs["mm_special_offsets_cu_seqlen"].shape == torch.Size([25])
 
 
 # ============================================================================
@@ -1314,3 +1545,64 @@ class TestPiecewiseCapturedGraphMultiStreamWiring:
 
         assert isinstance(pcg.split_gm.submod_0, ADPiecewiseRunner)
         assert isinstance(pcg.split_gm.submod_1, ADPiecewiseRunner)
+
+
+class TestSetupPiecewiseMixedBatch:
+    """Coverage for piecewise warmup synthetic mixed-batch setup.
+
+    Regression for VSWA models (e.g. Gemma4 E2B) whose KV cache spans multiple
+    window groups: the synthetic capture batch must provide one cache_loc /
+    cu_num_pages entry per registered window group, otherwise nest_sequences
+    asserts ``cache_loc_per_pool has N entries, expected M`` during capture.
+    """
+
+    @staticmethod
+    def _make_seq_info() -> SequenceInfo:
+        return SequenceInfo(
+            max_seq_len=64,
+            max_batch_size=4,
+            max_num_tokens=64,
+            tokens_per_block=16,
+        )
+
+    @pytest.mark.parametrize("window_sizes", [None, [16, 64], [16, 32, 64]])
+    def test_setup_matches_registered_window_groups(self, window_sizes):
+        """_setup_piecewise_mixed_batch must not raise for single- or multi-pool seq_info."""
+        seq_info = self._make_seq_info()
+        if window_sizes is not None:
+            seq_info.register_window_groups(window_sizes)
+            expected_groups = len(window_sizes)
+        else:
+            # No VSWA registration -> single-pool path.
+            expected_groups = 0
+
+        assert seq_info.num_window_groups == expected_groups
+
+        # Must not raise the per-pool length assertion in nest_sequences.
+        _setup_piecewise_mixed_batch(seq_info, num_tokens=8)
+
+    def test_setup_replicates_cache_loc_per_pool(self):
+        """The synthetic per-pool cache_loc must be replicated for every window group."""
+        seq_info = self._make_seq_info()
+        seq_info.register_window_groups([16, 64])
+
+        captured = {}
+
+        original_nest = seq_info.nest_sequences
+
+        def _spy(*args, **kwargs):
+            captured.update(kwargs)
+            return original_nest(*args, **kwargs)
+
+        seq_info.nest_sequences = _spy
+        _setup_piecewise_mixed_batch(seq_info, num_tokens=8)
+
+        assert len(captured["cache_loc_per_pool"]) == seq_info.num_window_groups == 2
+        assert len(captured["cu_num_pages_per_pool"]) == 2
+        # Replicated metadata: each pool sees the same page indices (uniform block geometry).
+        torch.testing.assert_close(
+            captured["cache_loc_per_pool"][0], captured["cache_loc_per_pool"][1]
+        )
+        torch.testing.assert_close(
+            captured["cu_num_pages_per_pool"][0], captured["cu_num_pages_per_pool"][1]
+        )

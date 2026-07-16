@@ -17,7 +17,7 @@
 r"""Evaluate VisualGen image/video quality with LPIPS against a JSON dataset.
 
 The YAML config follows the same VisualGenArgs format used by trtllm-serve
---extra_visual_gen_options and examples/visual_gen/configs.
+--visual_gen_args and examples/visual_gen/configs.
 
 Example:
   python scripts/visualgen_eval/visual_gen_lpips_score_eval.py \\
@@ -128,7 +128,7 @@ def parse_args() -> argparse.Namespace:
         type=pathlib.Path,
         help=(
             "VisualGenArgs YAML config. This should match trtllm-serve "
-            "--extra_visual_gen_options / examples/visual_gen/configs format. "
+            "--visual_gen_args / examples/visual_gen/configs format. "
             "Required only when generation is needed."
         ),
     )
@@ -614,6 +614,9 @@ def _make_lpips_model(net: str, device: str) -> Any:
 
 
 def _evaluate(args: argparse.Namespace) -> dict[str, Any]:
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+    torch.use_deterministic_algorithms(True)
+
     if args.config is not None:
         _load_yaml(args.config)
     loaded_dataset = _load_json(args.dataset)

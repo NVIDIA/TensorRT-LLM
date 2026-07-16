@@ -7,6 +7,8 @@ attn_backend: torch
 max_seq_len: 4096
 max_num_tokens: 4096
 max_batch_size: 64
+cuda_graph_config:
+  max_batch_size: 64
 enable_chunked_prefill: true
 model_factory: AutoModelForCausalLM
 # disable_overlap_scheduler: false

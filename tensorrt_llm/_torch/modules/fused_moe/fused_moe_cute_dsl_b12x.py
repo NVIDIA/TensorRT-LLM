@@ -69,7 +69,7 @@ class CuteDslB12xFusedMoE(CuteDslFusedMoE):
     ``_get_quant_method``). The inherited CUTLASS NVFP4 layout is finalised
     by the base class, and the b12x-shaped tensors (un-normalised FP8 SF,
     ``convert_sf_to_mma_layout`` reshape, ``B12xMoEWrapper`` instance) are
-    materialised on top by the quant method's ``post_load_weights``. Both
+    materialised on top by the quant method's ``transform_weights``. Both
     layouts coexist in memory and the dispatcher picks per call based on
     ``x.shape[0]``.
 
@@ -160,10 +160,7 @@ class CuteDslB12xFusedMoE(CuteDslFusedMoE):
         if (
             self.quant_config is not None
             and self.quant_config.layer_quant_mode.has_any_quant(exclude_kv_cache=True)
-            and (
-                self.quant_config.layer_quant_mode.has_nvfp4()
-                or self.quant_config.layer_quant_mode.has_w4a16_nvfp4()
-            )
+            and self.quant_config.layer_quant_mode.has_nvfp4()
         ):
             from .quantization import NVFP4CuteDslB12xFusedMoEMethod
 
@@ -176,12 +173,12 @@ class CuteDslB12xFusedMoE(CuteDslFusedMoE):
         always stay on the b12x path (which rejects them) so the existing
         error message is preserved."""
         quant_config = getattr(self, "quant_config", None)
-        if quant_config is not None and quant_config.layer_quant_mode.has_w4a16_nvfp4():
+        if quant_config is not None and quant_config.quant_algo == QuantAlgo.W4A16_NVFP4:
             return False
         return isinstance(x, torch.Tensor) and x.shape[0] >= self._PREFILL_VIA_CUTLASS_THRESHOLD
 
     # ``post_load_weights`` is inherited from ``CutlassFusedMoE`` and
-    # dispatches to ``self.quant_method.post_load_weights(self)`` — for this
+    # dispatches to ``self.quant_method.transform_weights(self)`` — for this
     # backend ``self.quant_method`` is ``NVFP4CuteDslB12xFusedMoEMethod``
     # (see ``_get_quant_method`` override), which performs the SF un-normalization,
     # ``convert_sf_to_mma_layout`` reshape, ``B12xMoEWrapper`` instantiation,

@@ -5,19 +5,21 @@ CppMambaHybridCacheManager PP-sharding edge cases."""
 
 import os
 from types import SimpleNamespace
-from unittest.mock import MagicMock
 
 import pytest
 import torch
 
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDA_GRAPH_DUMMY_REQUEST_ID
+from tensorrt_llm._torch.pyexecutor.llm_request import ATTENTION_DP_DUMMY_REQUEST_ID
 from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import (
-    CppMambaCacheManager,
+    MIN_REPLAY_HISTORY_SIZE,
     CppMambaHybridCacheManager,
     PythonMambaCacheManager,
+    _get_mamba_hybrid_pool_size,
 )
-from tensorrt_llm._torch.pyexecutor.resource_manager import CacheTypeCpp, KVCacheManager
+from tensorrt_llm._torch.pyexecutor.resource_manager import CacheTypeCpp, DataType
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
+from tensorrt_llm._utils import torch_dtype_to_binding
 from tensorrt_llm.bindings.internal.batch_manager import LinearCacheType
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig, MTPDecodingConfig
 from tensorrt_llm.mapping import Mapping
@@ -25,9 +27,11 @@ from tensorrt_llm.mapping import Mapping
 skip_no_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 
 
-def _make_mgr(max_batch_size=4, max_draft_len=2):
-    # +1 headroom matches MixedMambaHybridCacheManager.pool_size.
-    pool = max_batch_size + 1
+def _make_mgr(
+    max_batch_size=4, max_draft_len=2, enable_attention_dp=False, use_replay_state_update=False
+):
+    mapping = Mapping(world_size=1, tp_size=1, pp_size=1, enable_attention_dp=enable_attention_dp)
+    pool = _get_mamba_hybrid_pool_size(max_batch_size, mapping)
     return PythonMambaCacheManager(
         d_state=8,
         d_conv=4,
@@ -37,11 +41,38 @@ def _make_mgr(max_batch_size=4, max_draft_len=2):
         num_layers=2,
         max_batch_size=pool,
         spec_state_size=max_batch_size,
-        mapping=Mapping(world_size=1, tp_size=1, pp_size=1),
+        mapping=mapping,
         dtype=torch.float16,
         ssm_cache_dtype=torch.float16,
         speculative_num_draft_tokens=max_draft_len,
+        use_replay_state_update=use_replay_state_update,
     )
+
+
+@skip_no_cuda
+@pytest.mark.parametrize("enable_attention_dp", [False, True])
+def test_python_mamba_resource_count_excludes_reserved_dummy_slots(enable_attention_dp):
+    max_batch_size = 4
+    mgr = _make_mgr(
+        max_batch_size=max_batch_size,
+        max_draft_len=2,
+        enable_attention_dp=enable_attention_dp,
+    )
+
+    assert mgr.get_max_resource_count() == max_batch_size
+    assert len(mgr.mamba_cache_free_blocks) == max_batch_size
+
+
+@skip_no_cuda
+def test_replay_inactive_without_spec_config():
+    mgr = _make_mgr(
+        max_batch_size=2,
+        max_draft_len=None,
+        use_replay_state_update=True,
+    )
+
+    assert mgr.use_replay_state_update is False
+    assert mgr.get_replay_state_update_metadata() is None
 
 
 @skip_no_cuda
@@ -113,6 +144,96 @@ def test_padding_slot_is_permanent():
         assert shared not in mgr.mamba_cache_free_blocks
 
     assert mgr._padding_slot == shared
+
+
+@skip_no_cuda
+def test_replay_update_mamba_states_uses_history_window():
+    """Replay path accumulates PNAT until layer kernels write a checkpoint."""
+    mgr = _make_mgr(max_batch_size=4, max_draft_len=5, use_replay_state_update=True)
+    assert mgr.replay_step_width == 6
+    assert mgr.replay_history_size == MIN_REPLAY_HISTORY_SIZE
+    assert mgr.mamba_cache.prev_num_accepted_tokens.dtype == torch.int32
+    assert mgr.mamba_cache.cache_buf_idx.dtype == torch.int32
+    assert mgr.mamba_cache.old_x.shape[3] == MIN_REPLAY_HISTORY_SIZE
+    assert mgr.mamba_cache.old_B.shape[3] == MIN_REPLAY_HISTORY_SIZE
+    assert mgr.mamba_cache.old_dt.shape[4] == MIN_REPLAY_HISTORY_SIZE
+    assert mgr.mamba_cache.old_dA_cumsum.shape[4] == MIN_REPLAY_HISTORY_SIZE
+
+    mgr._prepare_mamba_cache_blocks([100, 101])
+    slot_appended = mgr.mamba_cache_index[100]
+    slot_checkpointed = mgr.mamba_cache_index[101]
+
+    mgr.mamba_cache.prev_num_accepted_tokens[slot_appended] = 7
+    mgr.mamba_cache.prev_num_accepted_tokens[slot_checkpointed] = 13
+    mgr.mamba_cache.cache_buf_idx[slot_appended] = 0
+    mgr.mamba_cache.cache_buf_idx[slot_checkpointed] = 1
+    mgr.mamba_cache.conv.zero_()
+    mgr.mamba_cache.intermediate_conv_window.zero_()
+    mgr.mamba_cache.intermediate_conv_window[:, 0, 2] = 11.0
+    mgr.mamba_cache.intermediate_conv_window[:, 1, 2] = 13.0
+
+    state_indices = torch.tensor(
+        [slot_appended, slot_checkpointed], dtype=torch.int32, device="cuda"
+    )
+    attn = SimpleNamespace(num_seqs=2, num_contexts=0)
+    mgr.update_mamba_states(
+        attn,
+        torch.tensor([3, 3], dtype=torch.int32, device="cuda"),
+        state_indices=state_indices,
+    )
+
+    assert mgr.mamba_cache.prev_num_accepted_tokens[slot_appended].item() == 10
+    assert mgr.mamba_cache.prev_num_accepted_tokens[slot_checkpointed].item() == 3
+    assert mgr.mamba_cache.cache_buf_idx[slot_appended].item() == 0
+    assert mgr.mamba_cache.cache_buf_idx[slot_checkpointed].item() == 0
+    assert torch.all(mgr.mamba_cache.conv[:, slot_appended] == 11.0)
+    assert torch.all(mgr.mamba_cache.conv[:, slot_checkpointed] == 13.0)
+
+
+@skip_no_cuda
+def test_replay_update_mamba_states_skips_dummy_slots():
+    mgr = _make_mgr(max_batch_size=2, max_draft_len=5, use_replay_state_update=True)
+    mgr._prepare_mamba_cache_blocks([100])
+    mgr.add_dummy_requests([CUDA_GRAPH_DUMMY_REQUEST_ID])
+
+    real_slot = mgr.mamba_cache_index[100]
+    dummy_slot = mgr.mamba_cache_index[CUDA_GRAPH_DUMMY_REQUEST_ID]
+    mgr.mamba_cache.prev_num_accepted_tokens[real_slot] = 13
+    mgr.mamba_cache.prev_num_accepted_tokens[dummy_slot] = 13
+    mgr.mamba_cache.cache_buf_idx[real_slot] = 1
+    mgr.mamba_cache.cache_buf_idx[dummy_slot] = 1
+
+    state_indices = torch.tensor(
+        mgr.get_state_indices([100, CUDA_GRAPH_DUMMY_REQUEST_ID], [False, True]),
+        dtype=torch.int32,
+        device="cuda",
+    )
+    attn = SimpleNamespace(num_seqs=2, num_contexts=0)
+    mgr.update_mamba_states(
+        attn,
+        torch.tensor([3, 3], dtype=torch.int32, device="cuda"),
+        state_indices=state_indices,
+    )
+
+    assert mgr.mamba_cache.prev_num_accepted_tokens[real_slot].item() == 3
+    assert mgr.mamba_cache.prev_num_accepted_tokens[dummy_slot].item() == 13
+    assert mgr.mamba_cache.cache_buf_idx[real_slot].item() == 0
+    assert mgr.mamba_cache.cache_buf_idx[dummy_slot].item() == 1
+
+
+@skip_no_cuda
+def test_attention_dp_dummy_has_reserved_slot_with_batch_size_one():
+    mgr = _make_mgr(max_batch_size=1, max_draft_len=0, enable_attention_dp=True)
+    mgr._prepare_mamba_cache_blocks([100])
+
+    mgr.add_dummy_requests([ATTENTION_DP_DUMMY_REQUEST_ID])
+
+    assert mgr.mamba_cache_free_blocks == []
+    assert mgr.mamba_cache_index[100] != mgr._attention_dp_dummy_slot
+    assert mgr.mamba_cache_index[ATTENTION_DP_DUMMY_REQUEST_ID] == mgr._attention_dp_dummy_slot
+
+    mgr.free_resources(SimpleNamespace(py_request_id=ATTENTION_DP_DUMMY_REQUEST_ID))
+    assert mgr._attention_dp_dummy_slot not in mgr.mamba_cache_free_blocks
 
 
 @skip_no_cuda
@@ -221,45 +342,6 @@ def test_non_mtp_pytorch_prepare_and_get_state_indices_flow():
     ]
 
 
-def test_cpp_add_dummy_requests_noop_on_empty_list():
-    stub = SimpleNamespace(mamba_impl=MagicMock())
-    CppMambaCacheManager.add_dummy_requests(stub, [])
-    stub.mamba_impl.allocate_cache_blocks.assert_not_called()
-
-
-@skip_no_cuda
-def test_cpp_get_state_indices_resolves_sentinel_to_reserved_slot():
-    """End-to-end C++ path: add_dummy_requests + getStateIndices must
-    resolve the CUDA-graph sentinel to its reserved slot, distinct from
-    every live request's slot — guards the C++ mCacheIndex lookup, not
-    just the Python forwarder."""
-    mgr = CppMambaCacheManager(
-        d_state=8,
-        d_conv=4,
-        num_heads=4,
-        n_groups=1,
-        head_dim=8,
-        num_layers=2,
-        max_num_sequences=8,
-        mapping=Mapping(world_size=1, tp_size=1, pp_size=1),
-        dtype=torch.float16,
-        ssm_cache_dtype=torch.float16,
-    )
-    mgr.add_dummy_requests([100, 101, CUDA_GRAPH_DUMMY_REQUEST_ID])
-
-    request_ids = [100, 101, CUDA_GRAPH_DUMMY_REQUEST_ID]
-    is_padding = [False, False, True]
-    indices = mgr.get_state_indices(request_ids, is_padding)
-
-    sentinel_slot = indices[2]
-    real_slots = {indices[0], indices[1]}
-    assert sentinel_slot not in real_slots, (
-        f"sentinel slot {sentinel_slot} aliases a real request's slot {real_slots}"
-    )
-    # Resolve again — reserved slot must be stable across calls.
-    assert mgr.get_state_indices(request_ids, is_padding) == indices
-
-
 # ---------------------------------------------------------------------------
 # CppMambaHybridCacheManager: recurrent-state snapshot pool sizing
 #
@@ -273,29 +355,43 @@ def test_cpp_get_state_indices_resolves_sentinel_to_reserved_slot():
 # ---------------------------------------------------------------------------
 
 
-def _build_hybrid_with_mamba_layer(spec_config=None, max_batch_size=4, enable_block_reuse=False):
+def _build_hybrid_with_mamba_layer(
+    spec_config=None,
+    max_batch_size=4,
+    enable_block_reuse=False,
+    mamba_state_cache_interval=256,
+    is_estimating_kv_cache=False,
+    dtype=DataType.HALF,
+    mamba_layer_mask=None,
+    attention_layer_mask=None,
+    mamba_ssm_cache_dtype=torch.float16,
+):
     """Construct a real CppMambaHybridCacheManager with one mamba layer +
     one full-attention layer so the parent KVCacheManager goes through the
     linear-attention pool sizing path."""
     # Layer 0: mamba; Layer 1: full attention. Single rank, no MPI.
-    mamba_mask = [True, False]
-    attn_mask = [False, True]
+    mamba_mask = mamba_layer_mask or [True, False]
+    attn_mask = attention_layer_mask or [False, True]
     mapping = Mapping(world_size=1, rank=0, tp_size=1, pp_size=1)
     # Cap max_tokens to keep the real C++ pool allocation tiny.
-    kv_cache_config = KvCacheConfig(max_tokens=512, enable_block_reuse=enable_block_reuse)
+    kv_cache_config = KvCacheConfig(
+        max_tokens=512,
+        enable_block_reuse=enable_block_reuse,
+        mamba_state_cache_interval=mamba_state_cache_interval,
+    )
     return CppMambaHybridCacheManager(
         mamba_d_state=8,
         mamba_d_conv=4,
         mamba_num_heads=4,
         mamba_n_groups=1,
         mamba_head_dim=8,
-        mamba_num_layers=1,
+        mamba_num_layers=sum(mamba_mask),
         mamba_layer_mask=mamba_mask,
         mamba_cache_dtype=torch.float16,
-        mamba_ssm_cache_dtype=torch.float16,
+        mamba_ssm_cache_dtype=mamba_ssm_cache_dtype,
         kv_cache_config=kv_cache_config,
         kv_cache_type=CacheTypeCpp.SELF,
-        num_layers=1,
+        num_layers=sum(attn_mask),
         num_kv_heads=4,
         head_dim=64,
         tokens_per_block=32,
@@ -304,7 +400,62 @@ def _build_hybrid_with_mamba_layer(spec_config=None, max_batch_size=4, enable_bl
         mapping=mapping,
         spec_config=spec_config,
         layer_mask=attn_mask,
+        is_estimating_kv_cache=is_estimating_kv_cache,
+        dtype=dtype,
     )
+
+
+@skip_no_cuda
+@pytest.mark.parametrize(
+    "mamba_ssm_cache_dtype",
+    [torch.float16, torch.float32, torch.bfloat16],
+)
+def test_cpp_hybrid_passes_per_window_pool_dtypes_for_nvfp4_kv_cache(
+    mamba_ssm_cache_dtype,
+):
+    mgr = _build_hybrid_with_mamba_layer(
+        dtype=DataType.NVFP4,
+        mamba_ssm_cache_dtype=mamba_ssm_cache_dtype,
+    )
+    recurrent_pool_dtype = torch_dtype_to_binding(mamba_ssm_cache_dtype)
+
+    expected_dtypes = [
+        (LinearCacheType.RECURRENT_STATES.value, recurrent_pool_dtype),
+        (128, DataType.NVFP4),
+    ]
+    assert [
+        (config.window_size, config.dtype) for config in mgr.pool_configurations
+    ] == expected_dtypes
+    assert [
+        (config.window_size, config.dtype) for config in mgr.impl.pool_configurations
+    ] == expected_dtypes
+    assert mgr._layer_to_pool_idx == {0: 0, 1: 1}
+    assert mgr.recurrent_states_pool_index == 0
+    assert mgr.impl.get_recurrent_states_pool().dtype == mamba_ssm_cache_dtype
+
+    compact_scale_pointers = mgr.impl.get_block_scale_pool_pointers()
+    assert mgr.impl.get_block_pool_pointers().shape == (2, 2)
+    assert compact_scale_pointers.shape == (1, 2)
+    assert mgr.kv_cache_pool_pointers.shape == (2, 2, 2)
+    assert torch.count_nonzero(mgr.kv_cache_pool_pointers[0, :, 1]) == 0
+    assert torch.equal(mgr.kv_cache_pool_pointers[1, :, 1], compact_scale_pointers[0])
+
+
+@skip_no_cuda
+def test_cpp_hybrid_merges_compact_scale_rows_with_unmanaged_layers():
+    mgr = _build_hybrid_with_mamba_layer(
+        dtype=DataType.NVFP4,
+        mamba_layer_mask=[True, False, True, False],
+        attention_layer_mask=[False, False, False, True],
+    )
+
+    assert mgr.pp_layers == [0, 2, 3]
+    assert mgr.kv_cache_pool_mapping[:, 0].tolist() == [0, 0, 1]
+    compact_scale_pointers = mgr.impl.get_block_scale_pool_pointers()
+    assert compact_scale_pointers.shape == (1, 2)
+    assert mgr.kv_cache_pool_pointers.shape == (2, 2, 2)
+    assert torch.count_nonzero(mgr.kv_cache_pool_pointers[0, :, 1]) == 0
+    assert torch.equal(mgr.kv_cache_pool_pointers[1, :, 1], compact_scale_pointers[0])
 
 
 @skip_no_cuda
@@ -432,7 +583,10 @@ def test_cpp_hybrid_recurrent_pool_floor_with_block_reuse():
     """
     max_batch_size = 4
     mgr = _build_hybrid_with_mamba_layer(
-        spec_config=None, max_batch_size=max_batch_size, enable_block_reuse=True
+        spec_config=None,
+        max_batch_size=max_batch_size,
+        enable_block_reuse=True,
+        mamba_state_cache_interval=256,
     )
     recurrent_primary, _ = mgr.blocks_per_window[LinearCacheType.RECURRENT_STATES.value]
     assert recurrent_primary >= max_batch_size + 1, (
@@ -442,26 +596,30 @@ def test_cpp_hybrid_recurrent_pool_floor_with_block_reuse():
     )
 
 
-def test_cpp_hybrid_available_tokens_allows_live_state_only(monkeypatch):
-    """One recurrent-state block can hold a prompt shorter than the snapshot interval."""
-
-    interval = 8192
-    token_num_upper_bound = 4095
-    mgr = object.__new__(CppMambaHybridCacheManager)
-    mgr.linear_attention_metadata = SimpleNamespace(states_snapshot_interval=interval)
-    mgr.impl = SimpleNamespace(
-        get_kv_cache_stats=lambda: SimpleNamespace(
-            num_free_blocks_per_window_size={LinearCacheType.RECURRENT_STATES.value: 1}
-        )
+@skip_no_cuda
+def test_cpp_hybrid_dry_run_recurrent_pool_additive_with_block_reuse():
+    """Dry-run path (is_estimating_kv_cache=True) under block reuse must
+    keep the live-state floor *plus* room for snapshots, not collapse to
+    max(snapshots, live). With max_batch_size=4, interval=256, max_tokens=512:
+      old:  max_snapshots = max(512//256, 4)         = 4   (no headroom for snapshots)
+      new:  max_snapshots = 4 + 512//256             = 6   (live + snapshots)
+    """
+    max_batch_size = 4
+    mgr = _build_hybrid_with_mamba_layer(
+        spec_config=None,
+        max_batch_size=max_batch_size,
+        enable_block_reuse=True,
+        mamba_state_cache_interval=256,
+        is_estimating_kv_cache=True,
     )
-
-    monkeypatch.setattr(
-        KVCacheManager,
-        "get_num_available_tokens",
-        lambda self, token_num_upper_bound, max_num_draft_tokens=0, **kwargs: token_num_upper_bound,
+    recurrent_primary, _ = mgr.blocks_per_window[LinearCacheType.RECURRENT_STATES.value]
+    # 4 live state slots + 2 reuse snapshots = 6.
+    expected_min = max_batch_size + (512 // 256)
+    assert recurrent_primary >= expected_min, (
+        f"dry-run recurrent-state pool has {recurrent_primary} slots, "
+        f"need >= live_state + reuse_snapshots = {expected_min}; the old "
+        f"max(reuse, live) formula dropped reuse headroom"
     )
-
-    assert mgr.get_num_available_tokens(token_num_upper_bound) == token_num_upper_bound
 
 
 # ---------------------------------------------------------------------------
@@ -547,6 +705,14 @@ def test_cpp_hybrid_zero_local_mamba_layers():
     # On the early-exit branch, num_layers is forwarded as-is.
     assert mgr.num_layers == 4
     assert mgr.num_local_layers == 2
+    assert all(
+        config.window_size != LinearCacheType.RECURRENT_STATES.value
+        for config in mgr.pool_configurations
+    )
+    assert all(
+        config.window_size != LinearCacheType.RECURRENT_STATES.value
+        for config in mgr.impl.pool_configurations
+    )
 
     # No mamba-only state was allocated.
     for attr in (

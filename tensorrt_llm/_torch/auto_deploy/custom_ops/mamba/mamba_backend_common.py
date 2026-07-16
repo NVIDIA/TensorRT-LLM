@@ -19,10 +19,7 @@ import torch
 from torch._ops import OpOverloadPacket
 from torch.fx import Node
 
-from tensorrt_llm._torch.modules.mamba.mamba2_metadata import (
-    compute_extra_chunks_cpu,
-    cu_seqlens_to_chunk_indices_offsets_triton,
-)
+from tensorrt_llm._torch.modules.mamba.mamba2_metadata import cu_seqlens_to_chunk_indices_offsets
 from tensorrt_llm._torch.modules.mamba.ssd_combined import mamba_chunk_scan_combined
 
 from ..._compat import KvCacheConfig
@@ -44,7 +41,6 @@ def _mamba_ssm_prepare_metadata(
     position_ids: torch.Tensor,
     batch_info_host: torch.Tensor,
     seq_len: torch.Tensor,
-    seq_len_host: torch.Tensor,
     cu_seqlen: torch.Tensor,
     # EXTRA METADATA PROVIDED BY THE DESCRIPTOR
     chunk_size: int,
@@ -52,10 +48,6 @@ def _mamba_ssm_prepare_metadata(
     """Prepare metadata for cached SSM transform.
 
     Returns a tuple of (chunk_indices, chunk_offsets, seq_idx_prefill).
-
-    Uses seq_len_host (CPU tensor) and batch_info_host to derive total_seqlens
-    and extra_chunks without GPU->CPU synchronization, preventing deadlocks
-    when NCCL collectives from MoE expert-parallel layers are pending.
     """
     device = cu_seqlen.device
     batch_info = BatchInfo(batch_info_host)
@@ -63,20 +55,11 @@ def _mamba_ssm_prepare_metadata(
     num_prefill, _, _ = batch_info.get_num_sequences()
 
     if num_prefill > 0:
-        num_prefill_tokens, _, _ = batch_info.get_num_tokens()
-
-        _extra = compute_extra_chunks_cpu(seq_len_host, num_prefill, chunk_size)
-
-        chunk_indices, chunk_offsets = cu_seqlens_to_chunk_indices_offsets_triton(
-            cu_seqlen[: num_prefill + 1],
-            chunk_size,
-            total_seqlens=num_prefill_tokens,
-            extra_chunks=_extra,
+        chunk_indices, chunk_offsets = cu_seqlens_to_chunk_indices_offsets(
+            cu_seqlen[: num_prefill + 1], chunk_size
         )
         seq_idx_prefill = torch.repeat_interleave(
-            torch.arange(num_prefill, device=device, dtype=torch.int32),
-            seq_len[:num_prefill],
-            output_size=num_prefill_tokens,
+            torch.arange(num_prefill, device=device, dtype=torch.int32), seq_len[:num_prefill]
         ).view(1, -1)
     else:
         chunk_indices = torch.empty(0, dtype=torch.int32, device=device)
@@ -92,7 +75,6 @@ def _mamba_ssm_prepare_metadata_fake(
     position_ids: torch.Tensor,
     batch_info_host: torch.Tensor,
     seq_len: torch.Tensor,
-    seq_len_host: torch.Tensor,
     cu_seqlen: torch.Tensor,
     # EXTRA METADATA PROVIDED BY THE DESCRIPTOR
     chunk_size: int,

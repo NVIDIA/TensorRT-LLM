@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2024-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -188,6 +188,9 @@ tllmXqaJitStatus getMacroFlags(tllmXqaJitContext const* context, std::vector<std
     macros["LOW_PREC_OUTPUT"] = context->fp8_output ? "1" : "0";
     macros["USE_INPUT_KV"] = context->use_input_kv ? "1" : "0";
     macros["ROPE_STYLE"] = std::to_string(int(context->rope_style));
+    // Number of head elements RoPE is applied to. Defaults to head_size (full rotary) when unset.
+    macros["ROPE_ELEMS"]
+        = std::to_string(context->rotary_embedding_dim != 0 ? context->rotary_embedding_dim : head_size);
     macros["IS_SPEC_DEC_TREE"] = context->is_spec_dec_tree ? "1" : "0";
     macros["SKIP_SOFTMAX_ATTN"] = context->use_skip_softmax_attn ? "1" : "0";
 #ifdef SKIP_SOFTMAX_STAT

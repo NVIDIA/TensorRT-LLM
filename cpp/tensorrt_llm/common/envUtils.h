@@ -39,11 +39,6 @@ bool getBoolEnv(char const* name);
 // XQA kernels (optimized kernels for generation phase).
 bool forceXQAKernels();
 
-// Whether XQA JIT is enabled.
-//
-// Returns the value of TRTLLM_ENABLE_XQA_JIT env var. If such env var doesn't exist, std::nullopt is returned.
-std::optional<bool> getEnvEnableXQAJIT();
-
 // 0 means to use heuristics.
 std::optional<int32_t> getEnvXqaBlocksPerSequence();
 
@@ -59,6 +54,11 @@ int getEnvMmhaKernelBlockSize();
 
 // Whether PDL is enabled.
 bool getEnvEnablePDL();
+
+// Whether the experimental cascade attention kernel is enabled (replaces
+// masked_multihead_attention_kernel for beam-search decoding).
+// Controlled by env var TRTLLM_ENABLE_CASCADE_MMHA (default: false).
+bool getEnvEnableCascadeMmha();
 
 // Whether PDL is enabled for MoE Renormalize routing kernel.
 // Disabled by default to avoid NaN corruption (https://nvbugs/5955170).
@@ -115,6 +115,9 @@ std::string const& getEnvKVCacheTimeOutputPath();
 
 bool getEnvTryZCopyForKVCacheTransfer();
 
+// Opt-in for disaggregated KV transfer in-flight cancellation and fail-closed transfer-buffer quarantine.
+bool getEnvDisaggEnableInflightCancel();
+
 // Force deterministic behavior for all kernels.
 bool getEnvForceDeterministic();
 
@@ -143,6 +146,8 @@ bool getEnvKVCacheTransferUseSyncBuffer();
 size_t getEnvKVCacheSendMaxConcurrenceNum();
 
 size_t getEnvMemSizeForKVCacheTransferBuffer();
+
+bool getEnvKVCachePoolUseFabricMemory();
 
 uint16_t getEnvNixlPort();
 

@@ -36,6 +36,7 @@ from tensorrt_llm.inputs.registry import (MULTIMODAL_PLACEHOLDER_REGISTRY,
                                           MultimodalPlaceholderPlacement)
 from tensorrt_llm.llmapi.llm_utils import ModelLoader
 from tensorrt_llm.tokenizer import TokenizerBase, TransformersTokenizer
+from tensorrt_llm.tokenizer.deepseek_v4 import DeepseekV4Tokenizer
 from tensorrt_llm.tokenizer.deepseek_v32 import DeepseekV32Tokenizer
 
 logger = logging.get_logger(__name__)
@@ -653,8 +654,8 @@ def apply_chat_template(
     - STRING: keeps flattened text with pre-inserted placeholders
     """
 
-    # Handle DeepSeek V32 tokenizer with custom chat template
-    if isinstance(tokenizer, DeepseekV32Tokenizer):
+    # Handle DeepSeek tokenizers with custom chat templates.
+    if isinstance(tokenizer, (DeepseekV32Tokenizer, DeepseekV4Tokenizer)):
         prompt = tokenizer.apply_chat_template(
             messages=conversation,
             tools=tools,
@@ -706,6 +707,37 @@ def apply_chat_template(
     return result
 
 
+async def async_apply_chat_template(
+    *,
+    model_type: str,
+    tokenizer: Union[TransformersTokenizer, TokenizerBase],
+    processor: ProcessorMixin,
+    conversation: list[ConversationMessage],
+    add_generation_prompt: bool,
+    mm_placeholder_counts: list[dict[str, int]],
+    tools: Optional[list[dict[str, Any]]] = None,
+    documents: Optional[list[dict[str, str]]] = None,
+    chat_template: Optional[str] = None,
+    chat_template_kwargs: Optional[dict[str, Any]] = None,
+    enable_tokenize: bool = False,
+) -> (str | List[str]):
+    """Apply chat template without blocking the event loop."""
+    return await asyncio.to_thread(
+        apply_chat_template,
+        model_type=model_type,
+        tokenizer=tokenizer,
+        processor=processor,
+        conversation=conversation,
+        add_generation_prompt=add_generation_prompt,
+        mm_placeholder_counts=mm_placeholder_counts,
+        tools=tools,
+        documents=documents,
+        chat_template=chat_template,
+        chat_template_kwargs=chat_template_kwargs,
+        enable_tokenize=enable_tokenize,
+    )
+
+
 def default_multimodal_input_loader(
     *,
     tokenizer: Optional[Union[TransformersTokenizer, TokenizerBase]],
@@ -720,6 +752,7 @@ def default_multimodal_input_loader(
                                   List[List[torch.Tensor]]]] = None,
     device: str = "cpu",
     extract_audio: bool = False,
+    trust_remote_code: bool = True,
 ) -> List[dict[str, Union[str, torch.Tensor]]]:
 
     def convert_to_conversation_message(
@@ -837,13 +870,13 @@ def default_multimodal_input_loader(
         model_type) == ContentFormat.PASSTHROUGH)
 
     if tokenizer is None and not is_passthrough:
-        tokenizer = ModelLoader.load_hf_tokenizer(model_dir, use_fast=True)
+        tokenizer = ModelLoader.load_hf_tokenizer(
+            model_dir, trust_remote_code=trust_remote_code, use_fast=True)
 
     processor = None
     if not is_passthrough:
-        processor = AutoProcessor.from_pretrained(model_dir,
-                                                  use_fast=True,
-                                                  trust_remote_code=True)
+        processor = AutoProcessor.from_pretrained(
+            model_dir, use_fast=True, trust_remote_code=trust_remote_code)
 
     inputs = []
     for prompt_idx, (prompt,

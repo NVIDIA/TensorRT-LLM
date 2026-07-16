@@ -204,13 +204,14 @@ class Quantization(BaseTransform):
 
             # when loading the state_dict, we need to convert input amax to input scale
             input_scale_name = self.scale_names()[0]
-            gm._register_load_state_dict_pre_hook(
-                partial(
-                    self.convert_amax_hook,
-                    scale_name=modname + "." + input_scale_name,
-                    amax_name=input_params.amax.target,
-                )
+            scale_name = modname + "." + input_scale_name
+            amax_name = input_params.amax.target
+            hook = partial(
+                self.convert_amax_hook,
+                scale_name=scale_name,
+                amax_name=amax_name,
             )
+            gm._register_load_state_dict_pre_hook(hook)
             # Note: canonicalize_graph() will remove input/weight/output quantizer
 
         for scale_name, scale in self.default_scales(lin_weight.tensor.shape).items():
@@ -219,7 +220,8 @@ class Quantization(BaseTransform):
         gm._register_load_state_dict_pre_hook(
             partial(self.load_hook, weight_name=lin_weight.node_key)
         )
-        if self.post_load_hook:
+        post_load_hook = getattr(type(self), "post_load_hook", None)
+        if post_load_hook is not None and post_load_hook is not Quantization.post_load_hook:
             gm.register_load_state_dict_post_hook(
                 partial(self.post_load_hook, weight_name=lin_weight.node_key)
             )
@@ -275,11 +277,12 @@ class Quantization(BaseTransform):
             setattr(submod, attrname, new_param)
 
             # Register load state dict hook
-            gm._register_load_state_dict_pre_hook(partial(self.load_hook, weight_name=param_name))
-            if self.post_load_hook:
-                gm.register_load_state_dict_post_hook(
-                    partial(self.post_load_hook, weight_name=param_name)
-                )
+            hook = partial(self.load_hook, weight_name=param_name)
+            gm._register_load_state_dict_pre_hook(hook)
+            post_load_hook = getattr(type(self), "post_load_hook", None)
+            if post_load_hook is not None and post_load_hook is not Quantization.post_load_hook:
+                hook = partial(self.post_load_hook, weight_name=param_name)
+                gm.register_load_state_dict_post_hook(hook)
 
             # Setup scale names and target module for parameter case
             def get_scale_name(scale_name):
@@ -459,8 +462,17 @@ class NVFP4LinearQuantizationFromConfig(Quantization):
                     TRTLLM_NVFP4_SCALING_VECTOR_SIZE,
                     False,
                 )
+                # ``fp4_quantize`` returns the (swizzled) block scale as a flat
+                # 1-D tensor, but ``default_scales`` registers the buffer with the
+                # padded 2-D ``(padded_m, padded_n)`` cutlass shape -- the same
+                # shape the unified-HF-checkpoint branch below produces. Reshape
+                # here so this on-the-fly (bf16 ModelOpt) path stays consistent
+                # with the registered buffer and the HF path; otherwise the flat
+                # scale fails ``load_state_dict`` with a size mismatch.
+                m_w, n_w = weight.shape
+                padded_m, padded_n = self._pad_m_n(m_w, n_w // TRTLLM_NVFP4_SCALING_VECTOR_SIZE)
                 state_dict[weight_name] = weight_fp4
-                state_dict[weight_name + "_scale"] = weight_scale
+                state_dict[weight_name + "_scale"] = weight_scale.reshape(padded_m, padded_n)
                 state_dict[weight_name + "_scale_2"] = weight_scale_2
                 state_dict[alpha_name] = 1 / torch.clamp(
                     weight_scale_2 * state_dict[input_scale_name], min=1e-30

@@ -159,6 +159,33 @@ bool find_special_algo_deprecated(cublasLtMatmulAlgo_t& algo, std::shared_ptr<Cu
     return true;
 }
 
+// Helper function: Get or create a workspace tensor for the given (device, stream).
+// Workspace is reused across multiple GEMM calls so the pointer captured by the
+// cublasLt kernel remains valid for CUDA-graph capture/replay. Keyed by
+// (device, stream) so concurrent GEMMs on different streams of the same device
+// don't race on the same scratch bytes.
+inline at::Tensor const& getWorkspaceTensor(c10::Device device, cudaStream_t stream)
+{
+    struct KeyHash
+    {
+        std::size_t operator()(std::pair<int, cudaStream_t> const& key) const noexcept
+        {
+            return std::hash<int>()(key.first) ^ (std::hash<cudaStream_t>()(key.second) << 1);
+        }
+    };
+
+    thread_local std::unordered_map<std::pair<int, cudaStream_t>, at::Tensor, KeyHash> workspace_tensors;
+    auto key = std::make_pair(device.index(), stream);
+
+    if (workspace_tensors.find(key) == workspace_tensors.end())
+    {
+        workspace_tensors[key]
+            = torch::empty(CUBLAS_WORKSPACE_SIZE, torch::TensorOptions().dtype(torch::kUInt8).device(device));
+    }
+
+    return workspace_tensors[key];
+}
+
 void cublas_gemm_caller(torch::Tensor& out, torch::Tensor const& a, torch::Tensor const& b,
     std::optional<at::Tensor> const& scale_a, std::optional<at::Tensor> const& scale_b,
     std::optional<at::Tensor> const& bias, bool fast_acc = false)
@@ -191,6 +218,7 @@ void cublas_gemm_caller(torch::Tensor& out, torch::Tensor const& a, torch::Tenso
     cublasWrapper->setGemmConfig(aType, bType, outType, /*computeType=*/scaleType);
 
     auto stream = at::cuda::getCurrentCUDAStream(a.get_device());
+    auto const& workspace = getWorkspaceTensor(a.device(), stream.stream());
 
     // Persistent per-stream cublasLt workspace. The cublasLt kernel records a
     // fixed pointer to this workspace; if we destruct the workspace storage at

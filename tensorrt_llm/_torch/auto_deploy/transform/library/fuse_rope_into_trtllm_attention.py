@@ -254,13 +254,13 @@ def _extract_complex_rope_info(gm: GraphModule, rope_node: Node) -> Optional[Dic
     return _build_rope_info(fi_tensor, is_neox=False, head_dim=head_dim)
 
 
-def _convert_to_thop_cos_sin(fi_cache: torch.Tensor, rotary_embedding_dim: int) -> torch.Tensor:
+def _convert_to_thop_cos_sin(fi_cache: torch.Tensor, rope_dim: int) -> torch.Tensor:
     """Convert FlashInfer-format cos_sin_cache to thop.attention format.
 
     FlashInfer: ``[max_pos, head_dim]`` — ``[cos_0..cos_{d/2-1}, sin_0..sin_{d/2-1}]``
     thop: ``[1, max_pos * dim]`` — interleaved ``[cos_0, sin_0, cos_1, sin_1, ...]``
     """
-    half = rotary_embedding_dim // 2
+    half = rope_dim // 2
     cos_part = fi_cache[:, :half]
     sin_part = fi_cache[:, half:]
     thop_cache = torch.stack([cos_part, sin_part], dim=-1)
@@ -272,7 +272,7 @@ def _build_rope_info(fi_cache: torch.Tensor, is_neox: bool, head_dim: int) -> Di
     return {
         "cos_sin_tensor": _convert_to_thop_cos_sin(fi_cache, fi_cache.shape[-1]),
         "position_embedding_type": 2 if is_neox else 1,
-        "rotary_embedding_dim": head_dim,
+        "rope_dim": head_dim,
     }
 
 

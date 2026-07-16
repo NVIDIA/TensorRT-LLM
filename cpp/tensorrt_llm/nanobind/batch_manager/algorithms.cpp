@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -85,10 +85,12 @@ void tensorrt_llm::nanobind::batch_manager::algorithms::initBindings(nb::module_
         .def("__setstate__", agentTreeConfigSetstate);
 
     nb::class_<CapacityScheduler>(m, CapacityScheduler::name)
-        .def(nb::init<SizeType32, executor::CapacitySchedulerPolicy, bool, bool, LlmRequestState, LlmRequestState>(),
+        .def(nb::init<SizeType32, executor::CapacitySchedulerPolicy, bool, bool, LlmRequestState, LlmRequestState,
+                 bool>(),
             nb::arg("max_num_requests"), nb::arg("capacity_scheduler_policy"), nb::arg("has_kv_cache_manager"),
             nb::arg("two_step_lookahead") = false, nb::arg("no_schedule_until_state") = LlmRequestState::kCONTEXT_INIT,
-            nb::arg("no_schedule_after_state") = LlmRequestState::kGENERATION_COMPLETE)
+            nb::arg("no_schedule_after_state") = LlmRequestState::kGENERATION_COMPLETE,
+            nb::arg("enable_prefix_aware_scheduling") = true)
         .def("__call__", &CapacityScheduler::operator(), nb::arg("active_requests"),
             nb::arg("kv_cache_manager") = nullptr, nb::arg("peft_cache_manager") = nullptr,
             nb::arg("cross_kv_cache_manager") = nullptr)

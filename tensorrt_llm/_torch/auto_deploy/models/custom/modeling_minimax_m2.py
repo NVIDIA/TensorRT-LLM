@@ -2,8 +2,7 @@
 # Licensed under the Apache License, Version 2.0.
 # Original source: https://github.com/huggingface/transformers
 #
-# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES.
-# All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
 """Slimmed-down PyTorch MiniMax-M2 model for AutoDeploy export (prefill only).
@@ -37,8 +36,7 @@ from transformers.generation import GenerationMixin
 from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import ModelOutput
 
-from tensorrt_llm._torch.utils import ActivationType
-
+from ..._compat import ActivationType
 from ..hf import AutoModelForCausalLMFactory
 from .rotary_utils import RotaryEmbeddingBase, build_rope_cos_sin_cache
 

@@ -41,6 +41,7 @@ add_library(
   allgatherOp.cpp
   allreduceOp.cpp
   alltoallOp.cpp
+  asyncUlyssesOp.cpp
   attentionOp.cpp
   causalConv1dOp.cpp
   convertSpecDecodingMaskToPackedMaskOp.cpp
@@ -49,6 +50,9 @@ add_library(
   cublasScaledMM.cpp
   cublasFp4ScaledMM.cpp
   cudaNvfp4MM.cpp
+  marlinNvfp4MM.cpp
+  marlinNvfp4MoeMM.cpp
+  marlinRepack.cpp
   cudaScaledMM.cpp
   w4a16Nvfp4Gemm.cpp
   dynamicDecodeOp.cpp
@@ -66,13 +70,20 @@ add_library(
   fp8RowwiseGemm.cpp
   fp8Quantize.cpp
   dsv3FusedAGemmOp.cpp
+  deepseekV4QNormOp.cpp
+  deepseekV4BlockTableOp.cpp
+  inverseRopeFp8QuantOp.cpp
   fusedQKNormRopeOp.cpp
   fusedDiTQKNormRopeOp.cpp
   fusedDiTSplitQKNormRopeOp.cpp
   fusedDiTSplitNormOp.cpp
+  ulyssesPostUnscatterOp.cpp
+  ulyssesPermuteScatterOp.cpp
+  fusedDiTGateResidNormShiftScaleOp.cpp
   fusedAddRMSNormQuant.cpp
   fusedActivationQuant.cpp
   fusedGatedRMSNormQuant.cpp
+  rmsNormFp4Quant.cpp
   fusedTopkSoftmax.cpp
   gatherTreeOp.cpp
   groupRmsNormOp.cpp
@@ -82,12 +93,15 @@ add_library(
   mambaConv1dOp.cpp
   moeOp.cpp
   moeUtilOp.cpp
+  moeGateOp.cpp
   moeCommOp.cpp
   moeAlltoAllOp.cpp
   moeLoadBalanceOp.cpp
   moeAlignOp.cpp
+  megaMoePrepareOp.cpp
   mxFp4BlockScaleMoe.cpp
   mxFp8Quantize.cpp
+  mxfp8Gemm.cpp
   fp8BlockScaleMoe.cpp
   fp8PerTensorScaleMoe.cpp
   fp4BlockScaleMoe.cpp
@@ -97,6 +111,7 @@ add_library(
   IndexerKCacheGatherOp.cpp
   IndexerKCacheScatterOp.cpp
   IndexerTopKOp.cpp
+  mlaRopeInplaceOp.cpp
   ncclCommunicatorOp.cpp
   allocateOutput.cpp
   parallelDecodeKVCacheUpdateOp.cpp
@@ -120,11 +135,18 @@ add_library(
   dsv3RopeOp.cpp
   fusedGemmAllreduceOp.cpp
   convertReqIndexToGlobalOp.cpp
-  trtllmGenQKVProcessOp.cpp)
+  trtllmGenQKVProcessOp.cpp
+  inplaceSliceCopyOp.cpp
+  mhcOp.cpp
+  compressorOp.cpp)
 set_property(TARGET th_common PROPERTY POSITION_INDEPENDENT_CODE ON)
 target_link_libraries(
   th_common PRIVATE ${TORCH_LIBRARIES} th_utils ${Python3_LIBRARIES}
                     ${SHARED_TARGET} pg_utils)
+
+if(BUILD_DEEP_GEMM)
+  target_compile_definitions(th_common PRIVATE TRTLLM_MHC_ENABLE_FUSED_HC)
+endif()
 
 if(USING_OSS_CUTLASS_LOW_LATENCY_GEMM)
   target_compile_definitions(th_common

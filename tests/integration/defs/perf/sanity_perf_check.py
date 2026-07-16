@@ -243,7 +243,7 @@ class SanityPerfCheck():
                              output_patch, self.base_perf_csv.name)
             print(f"patch_file was written to {output_patch}")
             print(
-                "You can download the file and update base_perf.csv by `git apply <patch file>`"
+                f"You can download the file and update {self.base_perf_csv.name} by `git apply <patch file>`"
             )
 
             # Check if any of the failed tests are autodeploy tests

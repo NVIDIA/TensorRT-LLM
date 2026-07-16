@@ -14,7 +14,6 @@
 # limitations under the License.
 import importlib
 import logging
-import os
 
 _logger = logging.getLogger(__name__)
 
@@ -63,17 +62,8 @@ _MODEL_MODULES = {
     "modeling_skywork_r1v2": ["SkyworkR1V2ForConditionalGeneration"],
     "modeling_smollm3": ["SmolLM3ForCausalLM"],
     "modeling_starcoder2": ["Starcoder2ForCausalLM"],
+    "modeling_step3p7": ["Step3p7ForCausalLM"],
 }
-
-# AD_USE_IR_MODELS: opt-in flag for staging additional ``_ir.py`` modeling
-# variants alongside the canonical models above. PR #13478 promoted the
-# deepseek/nemotron_h/qwen3/qwen3_5_moe ``_ir.py`` variants to canonical
-# names, so the gate currently has no entries to load. Keep the hook in
-# place: future model onboardings may stage an ``_ir.py`` variant here
-# for side-by-side comparison while the legacy ``detect_sharding`` path
-# is still supported and the canonical rename hasn't happened yet.
-if os.environ.get("AD_USE_IR_MODELS"):
-    pass  # no staged _ir.py variants at the moment
 
 __all__ = []
 for _module_name, _names in _MODEL_MODULES.items():

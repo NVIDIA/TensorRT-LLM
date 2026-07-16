@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import gc
 import json
 import math
 import os
@@ -21,16 +22,15 @@ from typing import Dict, List, Optional, Union
 
 import pytest
 import scipy
+import torch
 import yaml
 
 import tensorrt_llm.evaluate
 from tensorrt_llm import LLM as PyTorchLLM
-from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm._torch.auto_deploy import LLM as AutoDeployLLM
-from tensorrt_llm.builder import BuildConfig
 from tensorrt_llm.evaluate.audio_asr import AudioASREvaluator
 from tensorrt_llm.llmapi import SamplingParams
-from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
+from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig, TorchLlmArgs
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization import QuantAlgo
@@ -193,7 +193,7 @@ class AccuracyTask:
                                        self.HIGHER_IS_BETTER))
 
     def evaluate(self,
-                 llm: Union[LLM, PyTorchLLM, AutoDeployLLM],
+                 llm: Union[PyTorchLLM, AutoDeployLLM],
                  extra_acc_spec: Optional[str] = None,
                  extra_evaluator_kwargs: Optional[dict] = None,
                  sampling_params: Optional[SamplingParams] = None,
@@ -259,6 +259,7 @@ class AccuracyTask:
             f"Hypothesis testing report:\n{hypothesis_testing_params.report(score)}"
         )
         hypothesis_testing_params.assert_passing(score)
+        return score
 
 
 class VoxPopuli(AccuracyTask):
@@ -789,7 +790,7 @@ class CliFlowAccuracyTestHarness:
                 f"--max_tokens_in_paged_kv_cache={max_tokens_in_paged_kv_cache}"
             ])
 
-        if task.MAX_INPUT_LEN + task.MAX_OUTPUT_LEN > BuildConfig.model_fields[
+        if task.MAX_INPUT_LEN + task.MAX_OUTPUT_LEN > TorchLlmArgs.model_fields[
                 "max_num_tokens"].default:
             summarize_cmd.append("--enable_chunked_context")
 
@@ -974,6 +975,19 @@ class LlmapiAccuracyTestHarness:
         logger.set_level("info")
         yield
         logger.set_level(original_level)
+
+    @pytest.fixture(autouse=True)
+    def _cleanup_cuda_between_tests(self):
+        # Force Python GC + CUDA cache release after each test method.
+        # The LLM context manager's __exit__ schedules destruction of CUDA
+        # resources (streams, graph captures, KV cache pools), but objects in
+        # reference cycles aren't reclaimed until the next GC cycle. Without
+        # this teardown, a leftover CUDA stream/graph from a previous test can
+        # land in the next test's allocations and corrupt them, producing
+        # cross-test IMA reports that look like the current test crashed.
+        yield
+        gc.collect()
+        torch.cuda.empty_cache()
 
 
 def get_accuracy_task(dataset_name: str):

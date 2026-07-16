@@ -125,7 +125,8 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         self.mapping = model_config.mapping
 
         self.allreduce = AllReduce(mapping=model_config.mapping,
-                                   strategy=model_config.allreduce_strategy)
+                                   strategy=model_config.allreduce_strategy,
+                                   dtype=config.torch_dtype)
 
         self.aux_stream = aux_stream
 
@@ -146,6 +147,18 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         weight_loading_mode = (MoEWeightLoadingMode.FUSED_GATE_UP_PROJ
                                if config.model_type == "qwen3_5_moe_text" else
                                MoEWeightLoadingMode.VANILLA)
+        # For MIXED_PRECISION checkpoints (e.g. ModelOpt), the experts' real
+        # quant algo lives in the per-layer quant_config_dict keyed by TRT-LLM
+        # module name. Pass it as override_quant_config so the backend resolves
+        # the correct quant method (e.g. NVFP4) at construction, instead of
+        # inheriting the unquantized MIXED_PRECISION global and relying on
+        # apply_layerwise_quant_config (which rebinds the ConfigurableMoE
+        # wrapper but not its delegated backend).
+        expert_quant_config = None
+        quant_config_dict = getattr(model_config, "quant_config_dict", None)
+        if quant_config_dict and layer_idx is not None:
+            expert_quant_config = quant_config_dict.get(
+                f"model.layers.{layer_idx}.mlp.experts")
         self.experts = create_moe(
             num_experts=self.num_experts,
             routing_method=self.gate.routing_method,
@@ -157,6 +170,7 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             model_config=model_config,
             layer_idx=layer_idx,
             weight_loading_mode=weight_loading_mode,
+            override_quant_config=expert_quant_config,
         )
 
         self.shared_expert = GatedMLP(
@@ -346,7 +360,8 @@ class Qwen3NextLinearDecoderLayer(DecoderLayer):
         self.layer_idx = layer_idx
 
         self.allreduce = AllReduce(mapping=model_config.mapping,
-                                   strategy=model_config.allreduce_strategy)
+                                   strategy=model_config.allreduce_strategy,
+                                   dtype=config.torch_dtype)
 
         self.next_layer_layernorm: RMSNorm = None
 
@@ -490,7 +505,10 @@ class Qwen3NextFullAttentionDecoderLayer(DecoderLayer):
         self.self_attn = Qwen3NextAttention(
             model_config,
             layer_idx=layer_idx,
-            fuse_qk_norm_rope=False,
+            # Gemma-style QK-norm is now supported by the fused qk_norm_rope
+            # kernel (use_gemma path), so fuse instead of running separate
+            # split + q/k RMSNorm + RoPE kernels.
+            fuse_qk_norm_rope=True,
         )
 
         self.mlp = _create_mlp(model_config, aux_stream, layer_idx)
@@ -507,7 +525,8 @@ class Qwen3NextFullAttentionDecoderLayer(DecoderLayer):
         self.layer_idx = layer_idx
 
         self.allreduce = AllReduce(mapping=model_config.mapping,
-                                   strategy=model_config.allreduce_strategy)
+                                   strategy=model_config.allreduce_strategy,
+                                   dtype=config.torch_dtype)
 
         self.next_layer_layernorm: RMSNorm = None
 
@@ -973,11 +992,20 @@ class Qwen3NextForCausalLM(SpecDecOneEngineForCausalLM[Qwen3NextModel,
         # is supported for Mamba/SSM-based models
         return {"kv_cache_config": {"enable_block_reuse": False}}
 
-    def load_weights(self, weights: dict, weight_mapper: BaseWeightMapper):
+    def load_weights(self,
+                     weights: dict,
+                     weight_mapper: BaseWeightMapper,
+                     params_map: Optional[Dict[str, str]] = None,
+                     allow_partial_loading: bool = False):
         new_weights = weight_mapper.preprocess_weights(weights)
-        super().load_weights(new_weights, weight_mapper)
+        super().load_weights(
+            new_weights,
+            weight_mapper=weight_mapper,
+            params_map=params_map,
+            allow_partial_loading=allow_partial_loading,
+        )
 
-    def post_load_weights(self):
+    def setup_aliases(self) -> None:
         for idx, layer in enumerate(
                 self.model.layers[:self.config.num_hidden_layers]):
             if idx == self.config.num_hidden_layers - 1:

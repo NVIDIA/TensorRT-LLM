@@ -1,6 +1,8 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 import unittest
 from dataclasses import dataclass
-from types import SimpleNamespace
 from unittest.mock import Mock
 
 import torch
@@ -10,7 +12,8 @@ from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector import \
     KvCacheConnectorWorker
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
-from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
+from tensorrt_llm._torch.pyexecutor.model_engine import (
+    PyTorchModelEngine, _build_request_multimodal_input)
 from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 
 # isort: off
@@ -145,42 +148,24 @@ def create_model_engine_and_kvcache(llm_args: TorchLlmArgs = None,
 
 class PyTorchModelEngineTestCase(unittest.TestCase):
 
-    def test_create_warmup_request_rejects_zero_token_batch(self) -> None:
-        """A zero-token warmup must not create an empty scheduled batch."""
-
-        class ZeroTokenKvCacheManager:
-            tokens_per_block = 32
-
-            def get_num_available_tokens(self, **kwargs):
-                return 0
-
-            def get_num_free_blocks(self):
-                return 1
-
-            def add_dummy_requests(self, *args, **kwargs):
-                raise AssertionError(
-                    "zero-token warmup should not allocate dummy requests")
-
-        model_engine = SimpleNamespace(
-            kv_cache_manager_key=ResourceManagerType.KV_CACHE_MANAGER,
-            spec_config=None,
-            max_total_draft_tokens=0,
-            max_draft_loop_tokens=0,
-            max_beam_width=1,
-            max_num_tokens=4096,
-            batch_size=1,
-            max_seq_len=4096,
-            use_mrope=False,
-            _get_draft_kv_cache_manager=lambda resource_manager: None,
-            _get_num_extra_decoding_steps=lambda: 0,
+    def test_build_request_multimodal_input_skips_when_cache_disabled(
+            self) -> None:
+        request = LlmRequest(
+            request_id=1,
+            max_new_tokens=1,
+            input_tokens=[0, 1, 2],
+            sampling_config=tensorrt_llm.bindings.SamplingConfig(1),
+            is_streaming=False,
+            multimodal_hashes=[[1, 2, 3, 4, 5, 6, 7, 8]],
+            multimodal_positions=[1],
+            multimodal_lengths=[1],
+            multimodal_uuids=["image-0"],
         )
-        resource_manager = ResourceManager(
-            {ResourceManagerType.KV_CACHE_MANAGER: ZeroTokenKvCacheManager()})
 
-        warmup_request = PyTorchModelEngine._create_warmup_request(
-            model_engine, resource_manager, num_tokens=0, num_gen_requests=0)
-
-        self.assertIsNone(warmup_request)
+        # With the encoder cache disabled, nothing consumes `multimodal_input`,
+        # so it should not be built at all.
+        self.assertIsNone(
+            _build_request_multimodal_input(request, cache_enabled=False))
 
     def test_pad_generation_requests(self) -> None:
         model_engine, kv_cache_manager = create_model_engine_and_kvcache()
@@ -649,7 +634,8 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         multimodal_request.py_multimodal_data = {
             "mrope_config": {
                 "mrope_position_deltas": torch.tensor([[10]], dtype=torch.int32)
-            }
+            },
+            "multimodal_embedding": torch.ones((1, 1), dtype=torch.float16),
         }
 
         dummy_request = _create_request(6, 2)
@@ -677,6 +663,12 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
                                 dtype=torch.int32,
                                 device='cuda')
         torch.testing.assert_close(position_ids, expected, atol=0, rtol=0)
+        self.assertEqual(result["mrope_delta_write_seq_slots"].cpu().tolist(),
+                         [0])
+        self.assertEqual(result["mrope_delta_read_seq_slots"].cpu().tolist(),
+                         [0])
+        self.assertNotIn("multimodal_embedding",
+                         multimodal_request.py_multimodal_data)
         kv_cache_manager.shutdown()
 
     def test_kv_cache_manager_with_execution_stream(self):

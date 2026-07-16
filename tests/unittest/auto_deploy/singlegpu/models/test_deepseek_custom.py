@@ -190,6 +190,7 @@ class TestDeepSeekV3RotaryEmbedding:
                 return config, None
 
         actual = _compute_rotary_cos_sin_from_config(Factory()).cpu()
+        assert torch.equal(actual, expected)
         torch.testing.assert_close(actual, expected, atol=3e-7, rtol=1e-4)
 
 

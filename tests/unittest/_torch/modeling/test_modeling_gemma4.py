@@ -23,37 +23,21 @@ import unittest
 import unittest.mock
 from copy import deepcopy
 
-import pytest
 import torch
-import transformers
-from packaging.version import Version
+from transformers import Gemma4Config, Gemma4TextConfig
 
-# Gemma4 requires transformers>=5.5.0 (native Gemma4 config/model classes).
-# Use a module-level pytestmark.skipif (not pytest.importorskip) so collection
-# still picks up the test cases when the version gate fires. importorskip
-# causes pytest to report "collected 0 items / 1 skipped" with exit code 5
-# ("no tests collected"), which the CI test_unittests_v2 wrapper rejects.
-# With pytestmark.skipif, pytest reports "N collected, N skipped, exit 0".
-_HAS_GEMMA4 = Version(transformers.__version__) >= Version("5.5.0")
-
-pytestmark = pytest.mark.skipif(
-    not _HAS_GEMMA4,
-    reason=(f"Gemma4 requires transformers>=5.5.0 (installed: {transformers.__version__})"),
+from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.models.checkpoints.hf.gemma4_weight_mapper import Gemma4HfWeightMapper
+from tensorrt_llm._torch.models.modeling_gemma4 import (
+    Gemma4Attention,
+    Gemma4DecoderLayer,
+    Gemma4ForCausalLM,
+    Gemma4MoE,
+    Gemma4MoeRoutingMethod,
+    Gemma4TextModel,
+    Gemma4TextScaledWordEmbedding,
 )
-
-if _HAS_GEMMA4:
-    from transformers import Gemma4Config, Gemma4TextConfig  # noqa: E402
-
-    from tensorrt_llm._torch.model_config import ModelConfig  # noqa: E402
-    from tensorrt_llm._torch.models.modeling_gemma4 import (  # noqa: E402
-        Gemma4Attention,
-        Gemma4DecoderLayer,
-        Gemma4ForCausalLM,
-        Gemma4MoE,
-        Gemma4TextModel,
-        Gemma4TextScaledWordEmbedding,
-    )
-    from tensorrt_llm.mapping import Mapping  # noqa: E402
+from tensorrt_llm.mapping import Mapping
 
 # ---------------------------------------------------------------------------
 # Small test configs
@@ -374,6 +358,84 @@ class TestGemma4ModelInstantiation(unittest.TestCase):
             )
 
 
+class TestGemma4HfWeightMapper(unittest.TestCase):
+    """Tests for Gemma4-specific checkpoint key transformations."""
+
+    def test_remap_modelopt_nvfp4_per_expert_weights(self):
+        """ModelOpt's split expert tensors should map to the VANILLA MoE layout."""
+        mapper = Gemma4HfWeightMapper()
+        projection_map = {
+            "gate_proj": "w1",
+            "up_proj": "w3",
+            "down_proj": "w2",
+        }
+        fields = ("weight", "weight_scale", "input_scale", "weight_scale_2")
+        weights = {}
+        expected = {}
+        for projection, trt_projection in projection_map.items():
+            for field in fields:
+                marker = object()
+                weights[f"model.layers.7.experts.13.{projection}.{field}"] = marker
+                expected[f"model.layers.7.moe.experts.13.{trt_projection}.{field}"] = marker
+
+        remapped = mapper._remap_moe_keys(weights)
+
+        self.assertEqual(set(remapped), set(expected))
+        for key, marker in expected.items():
+            self.assertIs(remapped[key], marker)
+
+    def test_remap_modelopt_nvfp4_vlm_prefix(self):
+        """The VLM preprocessing prefix should use the same expert translation."""
+        marker = object()
+        weights = {
+            "language_model.model.layers.2.experts.5.down_proj.weight": marker,
+        }
+
+        remapped = Gemma4HfWeightMapper()._remap_moe_keys(weights)
+
+        self.assertEqual(
+            remapped,
+            {"language_model.model.layers.2.moe.experts.5.w2.weight": marker},
+        )
+
+    def test_remap_fused_bf16_experts(self):
+        """The existing fused Hugging Face expert layout should remain supported."""
+        gate_up = torch.arange(24).reshape(2, 6, 2)
+        down = torch.arange(16).reshape(2, 4, 2)
+        weights = {
+            "model.layers.1.experts.gate_up_proj": gate_up,
+            "model.layers.1.experts.down_proj": down,
+        }
+
+        remapped = Gemma4HfWeightMapper()._remap_moe_keys(weights)
+
+        for expert_id in range(2):
+            gate, up = gate_up[expert_id].chunk(2, dim=0)
+            self.assertTrue(
+                torch.equal(remapped[f"model.layers.1.moe.experts.{expert_id}.w1.weight"], gate)
+            )
+            self.assertTrue(
+                torch.equal(remapped[f"model.layers.1.moe.experts.{expert_id}.w3.weight"], up)
+            )
+            self.assertTrue(
+                torch.equal(
+                    remapped[f"model.layers.1.moe.experts.{expert_id}.w2.weight"],
+                    down[expert_id],
+                )
+            )
+
+    def test_reject_unrecognized_expert_weights(self):
+        """Unknown expert layouts should fail instead of leaving MoE weights uninitialized."""
+        weights = {"model.layers.0.experts.0.unknown_proj.weight": object()}
+
+        with self.assertRaisesRegex(
+            ValueError,
+            r"Unsupported Gemma4 expert checkpoint tensor: "
+            r"model\.layers\.0\.experts\.0\.unknown_proj\.weight",
+        ):
+            Gemma4HfWeightMapper()._remap_moe_keys(weights)
+
+
 # ---------------------------------------------------------------------------
 # HF reference comparison tests (sub-module + full model)
 # ---------------------------------------------------------------------------
@@ -609,7 +671,7 @@ def _build_gemma4_kv_cache_manager(config, num_blocks=4, tokens_per_block=32, ba
     sizes line up with what the model actually requests at runtime.
     """
     import tensorrt_llm
-    from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManagerV2
+    from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
     from tensorrt_llm.llmapi.llm_args import KvCacheConfig as KvCacheConfigV2
 
     dtype = config.torch_dtype
@@ -786,6 +848,34 @@ class TestGemma4HFComparison(unittest.TestCase):
 
     # ---- Full model E2E comparison (context + generation) ----
 
+    def _stabilize_moe_routing(self, hf_model, trt_model, config):
+        """Add identical expert-logit offsets to avoid random-init top-k ties.
+
+        Random router weights produce near-uniform expert scores. Small BF16 differences between
+        HF and TRT-LLM can then flip the top-k experts, sending a token through unrelated random
+        expert weights and overwhelming the otherwise small numerical error.
+
+        Unit-spaced offsets make the expert ordering stable while keeping the second expert's
+        normalized weight non-trivial (about 0.27 for top-2 routing). Applying the offsets after the
+        projection also preserves the random router weights, so their projection math remains part
+        of the comparison.
+
+        This intentionally favors the same top-k experts and therefore tests router projection,
+        dispatch, expert, and weighted-combine equivalence rather than routing diversity.
+        """
+        expert_offsets = torch.arange(
+            config.num_experts,
+            dtype=config.torch_dtype,
+            device=next(hf_model.parameters()).device,
+        )
+
+        def add_expert_offsets(_module, _inputs, output):
+            return output + expert_offsets
+
+        for hf_layer, trt_layer in zip(hf_model.model.layers, trt_model.model.layers, strict=True):
+            hf_layer.router.proj.register_forward_hook(add_expert_offsets)
+            trt_layer.moe.router.proj.register_forward_hook(add_expert_offsets)
+
     def _run_full_model_comparison(
         self,
         config_dict,
@@ -801,6 +891,8 @@ class TestGemma4HFComparison(unittest.TestCase):
 
         torch.random.manual_seed(42)
         hf, trt, gemma4_config = self._make_hf_and_trt_models(config_dict)
+        if gemma4_config.enable_moe_block:
+            self._stabilize_moe_routing(hf, trt, gemma4_config)
         hf_cache = DynamicCache()
 
         device = torch.device("cuda")
@@ -1018,10 +1110,9 @@ class TestGemma4HFComparison(unittest.TestCase):
         """MoE (Mixture of Experts) enabled — tests router + expert dispatch."""
         self._run_full_model_comparison(
             deepcopy(GEMMA4_MOE_HF_CONFIG),
-            # MoE routing may differ slightly between fused and reference
-            atol=1.0,
-            rtol=1.0,
-            max_failed_frac=0.05,
+            atol=0.1,
+            rtol=0.1,
+            max_failed_frac=0.015,
         )
 
     # ---- Mixed feature tests (matching real model patterns) ----
@@ -1031,9 +1122,9 @@ class TestGemma4HFComparison(unittest.TestCase):
         """26B-A4B pattern: hybrid head_dim + K=V + MoE + softcap."""
         self._run_full_model_comparison(
             deepcopy(GEMMA4_26B_LIKE_CONFIG),
-            atol=1.0,
-            rtol=1.0,
-            max_failed_frac=0.05,
+            atol=0.1,
+            rtol=0.1,
+            max_failed_frac=0.02,
         )
 
     @torch.no_grad()
@@ -1994,6 +2085,59 @@ class TestGemma4HFComparison(unittest.TestCase):
         self.assertTrue(mask_26b[4, 2].item(), "Image token 4 should attend to 2")
         # But causal for text tokens
         self.assertFalse(mask_26b[0, 1].item(), "Text token 0 should NOT attend to 1")
+
+    @torch.no_grad()
+    def test_bidirectional_mask_only_applies_to_sliding_layers(self):
+        """Full-attention layers retain the standard causal mask."""
+        config_dict = deepcopy(GEMMA4_E4B_LIKE_CONFIG)
+        config_dict["use_bidirectional_attention"] = "vision"
+        config = Gemma4TextConfig(**config_dict)
+        model_config = ModelConfig(pretrained_config=config, attn_backend="FLASHINFER")
+        model = Gemma4ForCausalLM(model_config).to(config.torch_dtype).to("cuda")
+
+        def passthrough(*, hidden_states, **_kwargs):
+            return hidden_states
+
+        layer_forwards = []
+        for layer in model.model.layers:
+            layer.forward = unittest.mock.MagicMock(side_effect=passthrough)
+            layer_forwards.append(layer.forward)
+
+        local_mask = torch.ones(1, dtype=torch.bool, device="cuda")
+        model.model(
+            attn_metadata=unittest.mock.MagicMock(),
+            inputs_embeds=torch.zeros(
+                4, config.hidden_size, dtype=config.torch_dtype, device="cuda"
+            ),
+            local_attention_mask_data=local_mask,
+        )
+
+        for layer, layer_forward in zip(model.model.layers, layer_forwards, strict=True):
+            actual_mask = layer_forward.call_args.kwargs["attention_mask_data"]
+            if layer.is_sliding:
+                self.assertIs(actual_mask, local_mask)
+            else:
+                self.assertIsNone(actual_mask)
+
+    @torch.no_grad()
+    def test_gemma4_routing_matches_hf_reference(self):
+        """Routing preserves Hugging Face's FP32 softmax operation order."""
+        torch.manual_seed(1234)
+        per_expert_scale = torch.linspace(0.5, 1.5, 128, dtype=torch.bfloat16, device="cuda")
+        routing = Gemma4MoeRoutingMethod(
+            top_k=8,
+            callable_per_expert_scale=lambda: per_expert_scale,
+        )
+        router_logits = torch.randn(16, 128, dtype=torch.bfloat16, device="cuda") * 0.02
+
+        actual_indices, actual_weights = routing.apply(router_logits)
+
+        router_probabilities = torch.softmax(router_logits, dim=-1, dtype=torch.float32)
+        expected_weights, expected_indices = torch.topk(router_probabilities, k=8, dim=-1)
+        expected_weights /= expected_weights.sum(dim=-1, keepdim=True)
+        expected_weights *= per_expert_scale[expected_indices]
+        torch.testing.assert_close(actual_indices, expected_indices.to(torch.int32))
+        torch.testing.assert_close(actual_weights, expected_weights.float())
 
 
 class TestGemma4ModelDefaults(unittest.TestCase):
@@ -3294,29 +3438,27 @@ class TestGemma4VisionCrossImageBatching(unittest.TestCase):
         )
 
     def test_vision_attn_metadata_max_num_requests_is_not_one(self):
-        """The vision tower's ``attn_metadata`` was hardcoded to
-        ``max_num_requests=1`` while the caller loop fed one image per
-        forward. After lifting the loop, the bound must accept ``B>1``
-        cross-image batches (capped vision-scale, not LLM-scale, to keep
-        unfused-MHA workspace under control)."""
-        import re
+        """The vision tower's ``attn_metadata`` must accept ``B>1`` cross-image
+        batches (capped vision-scale, not LLM-scale, to keep unfused-MHA
+        workspace under control). It is now sized by the engine through
+        ``MultimodalEncoderMixin.setup_attn_metadata`` -- a parameterized
+        ``max_num_requests`` -- rather than a hardcoded literal, so assert the
+        tower opts into that mixin and never pins ``max_num_requests=1``."""
 
         from tensorrt_llm._torch.models import modeling_gemma4_vision as mv
 
         src = open(mv.__file__).read()
-        # Find the Gemma4VisionModel.attn_metadata = self.metadata_cls(...) block.
-        m = re.search(
-            r"self\.attn_metadata\s*=\s*self\.metadata_cls\((.*?)\)",
+        # Engine-driven sizing: the tower must derive ``attn_metadata`` from the
+        # mixin (parameterized ``max_num_requests``), not a hardcoded literal.
+        self.assertIn(
+            "MultimodalEncoderMixin",
             src,
-            re.DOTALL,
+            "Vision tower must size ``attn_metadata`` via "
+            "``MultimodalEncoderMixin`` so ``max_num_requests`` is engine-driven.",
         )
-        self.assertIsNotNone(
-            m, "Could not locate ``self.attn_metadata = self.metadata_cls(...)`` in vision tower."
-        )
-        block = m.group(1)
-        # Reject the legacy ``max_num_requests=1,`` literal.
+        # Reject the legacy ``max_num_requests=1,`` literal anywhere in the tower.
         self.assertNotRegex(
-            block,
+            src,
             r"max_num_requests\s*=\s*1\s*,",
             "Vision tower ``max_num_requests`` must not be hardcoded to 1 — "
             "the caller no longer loops per-image, so the metadata must allow "

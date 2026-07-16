@@ -317,8 +317,7 @@ class DFlashWorker(SpecWorkerBase):
 
         # Project context tokens through fc + hidden_norm
         ctx_hs = captured_hs[:num_ctx_tokens]
-        ctx_proj = draft_model.fc(ctx_hs.to(draft_model.fc.weight.dtype))
-        ctx_proj = draft_model.hidden_norm(ctx_proj)
+        ctx_proj = draft_model.project_target_hidden(ctx_hs)
 
         # Split by request and store/append accumulated context.
         # Context requests may arrive in chunks (chunked prefill), so we
@@ -383,7 +382,18 @@ class DFlashWorker(SpecWorkerBase):
         num_gens = batch_size - num_contexts
 
         raw_logits = logits
-        K = self.max_draft_len
+        K = spec_metadata.runtime_draft_len
+
+        if K == 0:
+            return self.skip_drafting(
+                input_ids,
+                position_ids,
+                hidden_states,
+                logits,
+                attn_metadata,
+                spec_metadata,
+                draft_model,
+            )
 
         # Lazy init buffers and attach worker reference for prepare()
         self._lazy_init_ctx_buffers(draft_model, spec_metadata, attn_metadata)
@@ -396,17 +406,8 @@ class DFlashWorker(SpecWorkerBase):
 
         self._execute_guided_decoder_if_present(logits)
 
-        # Target now emits K+1 logits per gen request and the previous step
-        # stored K draft tokens per gen request (no filler padding).
-        if num_gens > 0:
-            draft_tokens = spec_metadata.draft_tokens.reshape(num_gens, K)
-        else:
-            draft_tokens = spec_metadata.draft_tokens.reshape(0, K)
-
-        logits_for_accept = logits
-
-        accepted_tokens, num_accepted_tokens = self._sample_and_accept_draft_tokens_base(
-            logits_for_accept, draft_tokens, num_contexts, batch_size, spec_metadata
+        accepted_tokens, num_accepted_tokens = self.sample_and_accept_draft_tokens(
+            logits, attn_metadata, spec_metadata
         )
 
         # Update GDN/Mamba recurrent states to the accepted token's state.
@@ -485,18 +486,23 @@ class DFlashWorker(SpecWorkerBase):
                 )
 
                 vocab_size = gen_logits.shape[-1]
-                gen_logits = gen_logits.reshape(num_gens, self.max_draft_len, vocab_size)
+                gen_logits = gen_logits.reshape(num_gens, K, vocab_size)
 
-                d2t = getattr(draft_model.model, "d2t", None)
-                gen_draft_tokens = torch.argmax(gen_logits, dim=-1, keepdim=False).long()
-
-                if d2t is not None:
-                    gen_draft_tokens = d2t[gen_draft_tokens] + gen_draft_tokens
-
-                gen_draft_tokens = gen_draft_tokens.type(torch.int32)
+                gen_draft_tokens = self.sample_draft_tokens(
+                    gen_logits,
+                    spec_metadata,
+                    batch_size,
+                    num_contexts=num_contexts,
+                )
 
         else:
             gen_draft_tokens = torch.empty((0, K), dtype=torch.int32, device="cuda")
+
+        # Context requests are not drafted by the block worker (zero placeholder
+        # token); fill their draft-prob slot rows with a one-hot placeholder so
+        # they are a legal distribution when they become gen requests next iter.
+        gen_vocab = vocab_size if num_gens > 0 else None
+        self.write_context_onehot_draft_probs(spec_metadata, num_contexts, num_gens, K, gen_vocab)
 
         if num_contexts > 0 and num_gens > 0:
             ctx_draft_tokens = torch.zeros((num_contexts, K), dtype=torch.int32, device="cuda")
@@ -583,7 +589,7 @@ class DFlashWorker(SpecWorkerBase):
             gen_accepted_tokens = accepted_tokens[num_contexts : num_contexts + num_gens, :]
 
             total_tokens_per_req = self._draft_tokens_per_req  # K+1
-            K = self.max_draft_len
+            K = spec_metadata.runtime_draft_len
 
             # Get captured multi-layer hidden states from spec_metadata
             captured_hs = spec_metadata.get_hidden_states(total_target_tokens)
@@ -632,10 +638,7 @@ class DFlashWorker(SpecWorkerBase):
                 # captured slice is already the full set we need to project.
                 gen_hs = captured_hs[gen_start : gen_start + num_gens * total_tokens_per_req]
                 gen_hs_to_project = gen_hs.reshape(-1, gen_hs.shape[-1])
-                projected_to_store = draft_model.fc(
-                    gen_hs_to_project.to(draft_model.fc.weight.dtype)
-                )
-                projected_to_store = draft_model.hidden_norm(projected_to_store)
+                projected_to_store = draft_model.project_target_hidden(gen_hs_to_project)
                 gen_num_accepted_long = gen_num_accepted.long()
                 col_idx = self._ctx_len[slots].unsqueeze(1) + offsets_kp1.unsqueeze(0)
                 write_mask = offsets_kp1.unsqueeze(0) < gen_num_accepted_long.unsqueeze(1)

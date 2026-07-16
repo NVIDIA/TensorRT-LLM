@@ -170,19 +170,52 @@ using tensorrt_llm::common::launchWithPdlWhenEnabled;
 // Helper Functions for Expert-to-Rank Mapping
 // ============================================================================
 
-__device__ int compute_target_rank_id(int expert_id, int num_experts_per_rank)
+// Compute which rank owns a given expert using contiguous ceil/floor partitioning.
+// Supports non-divisible distribution when num_experts % ep_size != 0:
+//   base      = num_experts / ep_size
+//   remainder = num_experts % ep_size
+//   - Ranks [0, remainder) each own (base + 1) experts.
+//   - Ranks [remainder, ep_size) each own base experts.
+//
+// Example A (uniform): 32 experts, 4 ranks -> base=8, remainder=0
+//   - Rank 0: experts 0-7
+//   - Rank 1: experts 8-15
+//   - Rank 2: experts 16-23
+//   - Rank 3: experts 24-31
+//
+// Example B (non-divisible): 384 experts, 5 ranks -> base=76, remainder=4
+//   - Rank 0: experts 0-76    (77 experts)
+//   - Rank 1: experts 77-153  (77 experts)
+//   - Rank 2: experts 154-230 (77 experts)
+//   - Rank 3: experts 231-307 (77 experts)
+//   - Rank 4: experts 308-383 (76 experts)
+//
+// `base` and `remainder` are precomputed by the caller once outside the per-token TOP_K loop
+// so the hot path performs at most one integer divide.
+__device__ __forceinline__ int compute_target_rank_id(int expert_id, int base, int remainder)
 {
-    // Compute which rank owns a given expert using contiguous partitioning
-    // Experts are divided evenly across EP ranks:
-    // - Rank 0 gets experts [0, num_experts_per_rank)
-    // - Rank 1 gets experts [num_experts_per_rank, 2*num_experts_per_rank)
-    // - etc.
-    // Example: 32 experts, 4 ranks -> 8 experts per rank
-    // - Rank 0: experts 0-7
-    // - Rank 1: experts 8-15
-    // - Rank 2: experts 16-23
-    // - Rank 3: experts 24-31
-    return expert_id / num_experts_per_rank;
+    // Fast path for the uniform (num_experts % ep_size == 0) case: identical to the
+    // pre-ceil/floor implementation, so existing divisible deployments incur no overhead.
+    if (remainder == 0)
+    {
+        return expert_id / base;
+    }
+    int const split = remainder * (base + 1); // boundary expert id
+    if (expert_id < split)
+    {
+        // Falls inside the (base + 1)-sized prefix block.
+        return expert_id / (base + 1);
+    }
+    // Falls inside the base-sized suffix block.
+    return remainder + (expert_id - split) / base;
+}
+
+// Test bit `rank` in a kRankMaskWords-wide little-endian uint64 bitmask.
+// Word 0 covers ranks 0..63, word 1 covers ranks 64..127, etc.
+// `rank >> 6` and `rank & 63` divide / modulo by 64.
+__device__ __forceinline__ bool is_rank_active(uint64_t const* mask, int rank)
+{
+    return (mask[rank >> 6] >> (rank & 63)) & 1ULL;
 }
 
 // ============================================================================
@@ -359,7 +392,7 @@ __global__ void moeA2APrepareDispatchKernel(
 // Dispatch Kernels
 // ============================================================================
 
-template <typename ThreadingPolicy, int TOP_K, bool ENABLE_EPLB>
+template <typename ThreadingPolicy, int TOP_K, bool ENABLE_EPLB, bool ENABLE_RANK_MASK>
 __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [local_num_tokens, TOP_K]
     const DispatchKernelPointers ptrs,                                      // Struct containing all kernel pointers
     int num_payloads,                                                       // Number of payloads
@@ -391,18 +424,33 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
         int* smem_topk_target_ranks = smem;
         int* smem_topk_send_indices = smem + TOP_K;
 
-        uint64_t already_copied = 0;
-        int num_experts_per_rank = num_experts / ep_size;
+        uint64_t already_copied[kRankMaskWords] = {};
+        // Precompute the ceil/floor partition parameters once per thread, outside the
+        // per-token TOP_K loop. The fast path (remainder == 0) then collapses to a single
+        // integer divide per call, matching the pre-PR uniform-partition cost exactly.
+        int const ep_base = num_experts / ep_size;
+        int const ep_remainder = num_experts - ep_base * ep_size; // == num_experts % ep_size
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
         cudaGridDependencySynchronize();
 #endif
         for (int k = 0; k < TOP_K; k++)
         {
             int expert_id = token_selected_experts[local_token_idx * TOP_K + k];
-            // Use contiguous partitioning to determine target rank
-            int target_rank = compute_target_rank_id(expert_id, num_experts_per_rank);
+            // Use contiguous ceil/floor partitioning to determine target rank.
+            // Supports the non-divisible case where num_experts % ep_size != 0.
+            int target_rank = compute_target_rank_id(expert_id, ep_base, ep_remainder);
 
-            if (already_copied & (1ULL << target_rank))
+            int const mask_word = target_rank >> 6;
+            uint64_t const mask_bit = 1ULL << (target_rank & 63);
+            bool const target_already_copied = (already_copied[mask_word] & mask_bit) != 0;
+            bool skip_target = target_already_copied;
+            if constexpr (ENABLE_RANK_MASK)
+            {
+                // This is a fail-closed safety guard until post-commit routing is enforced end to end.
+                // A masked route is not valid model output; the failed execution epoch must be discarded.
+                skip_target = skip_target || !is_rank_active(ptrs.active_rank_mask, target_rank);
+            }
+            if (skip_target)
             {
                 if (thread_idx == 0)
                 {
@@ -427,7 +475,7 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
                 smem_topk_target_ranks[k] = target_rank;
                 smem_topk_send_indices[k] = dst_token_idx;
             }
-            already_copied |= 1ULL << target_rank;
+            already_copied[mask_word] |= mask_bit;
         }
         // Sync before dispatching data
         ThreadingPolicy::sync();
@@ -481,10 +529,16 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
 
         if (is_last_token)
         {
-// Store send_counters to recv_counters
+// Store send_counters to recv_counters.
+// Skip masked target ranks: their symmetric memory may be inaccessible.
 #pragma unroll 1 // No unroll as one iter is typically enough
             for (int target_rank = lane_id; target_rank < ep_size; target_rank += warpSize)
             {
+                if constexpr (ENABLE_RANK_MASK)
+                {
+                    if (!is_rank_active(ptrs.active_rank_mask, target_rank))
+                        continue;
+                }
                 int send_count = ptrs.send_counters[target_rank];
                 ptrs.recv_counters[target_rank][rank_id] = send_count;
             }
@@ -492,9 +546,15 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
             if constexpr (ENABLE_EPLB)
             {
                 // Write local stats into peer buffers before the release fence below.
+                // Skip masked target ranks for the same reason as above.
 #pragma unroll 1
                 for (int target_rank = 0; target_rank < ep_size; ++target_rank)
                 {
+                    if constexpr (ENABLE_RANK_MASK)
+                    {
+                        if (!is_rank_active(ptrs.active_rank_mask, target_rank))
+                            continue;
+                    }
                     int* target_stats = ptrs.eplb_gathered_stats[target_rank];
                     for (int expert_id = lane_id; expert_id < eplb_stats_num_experts; expert_id += warpSize)
                     {
@@ -513,9 +573,16 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
 #else
             asm volatile("fence.acq_rel.sys;");
 #endif
+            // Signal completion to all active peers; skip dead ranks (their symmetric memory
+            // is unreachable).
 #pragma unroll 1 // No unroll as one iter is typically enough
             for (int target_rank = lane_id; target_rank < ep_size; target_rank += warpSize)
             {
+                if constexpr (ENABLE_RANK_MASK)
+                {
+                    if (!is_rank_active(ptrs.active_rank_mask, target_rank))
+                        continue;
+                }
                 uint32_t* flag_addr = &ptrs.completion_flags[target_rank][rank_id];
                 asm volatile("st.relaxed.sys.u32 [%0], %1;" ::"l"(flag_addr), "r"(expected_value));
 
@@ -525,9 +592,16 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
 #endif
             }
 
+            // Wait for all active peers to signal; skip dead ranks (otherwise we would
+            // spin forever — this is the bug the rank-mask is here to prevent).
 #pragma unroll 1 // No unroll
             for (int peer_rank = lane_id; peer_rank < ep_size; peer_rank += warpSize)
             {
+                if constexpr (ENABLE_RANK_MASK)
+                {
+                    if (!is_rank_active(ptrs.active_rank_mask, peer_rank))
+                        continue;
+                }
                 bool flag_set = false;
                 auto s = clock64();
                 do
@@ -573,8 +647,14 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params)
     // Validate parameters
     TLLM_CHECK(params.top_k > 0 && params.top_k <= kMaxTopK);
     TLLM_CHECK(params.ep_size > 0 && params.ep_size <= kMaxRanks);
+    TLLM_CHECK(params.ep_rank >= 0 && params.ep_rank < params.ep_size);
     TLLM_CHECK(params.local_num_tokens >= 0);
     TLLM_CHECK(params.num_payloads > 0 && params.num_payloads <= kMaxPayloads);
+    if (params.enable_rank_mask)
+    {
+        TLLM_CHECK_WITH_INFO((params.active_rank_mask[params.ep_rank >> 6] >> (params.ep_rank & 63)) & 1ULL,
+            "active_rank_mask must mark the local ep_rank (%d) as active", params.ep_rank);
+    }
 
     // Prepare kernel pointers struct
     DispatchKernelPointers kernel_ptrs = {};
@@ -612,6 +692,12 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params)
     kernel_ptrs.topk_send_indices = params.topk_send_indices;
     kernel_ptrs.eplb_local_stats = params.eplb_local_stats;
 
+    // Copy active-rank bitmask into the kernel pointers struct
+    for (int w = 0; w < kRankMaskWords; ++w)
+    {
+        kernel_ptrs.active_rank_mask[w] = params.active_rank_mask[w];
+    }
+
     int const kBlockSize = tensorrt_llm::common::getEnvMoeA2ADispatchBlockSize();
 
     // One block per token: grid_size == local_num_tokens. If 0, launch a single block to
@@ -622,12 +708,15 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params)
         grid_size = 1;
     }
     int shared_bytes = 2 * params.top_k * (int) sizeof(int);
-    SWITCH_BOOL(params.enable_eplb, EPLB_STATS, SWITCH_TOP_K(params.top_k, TOP_K, {
-        auto kernel_fn = moeA2ADispatchKernel<BlockPolicy, TOP_K, EPLB_STATS>;
-        launchWithPdlWhenEnabled("moeA2ADispatchKernel", kernel_fn, grid_size, kBlockSize, shared_bytes, params.stream,
-            params.token_selected_experts, kernel_ptrs, params.num_payloads, params.max_tokens_per_rank,
-            params.local_num_tokens, params.ep_rank, params.ep_size, params.num_experts, params.eplb_stats_num_experts);
-    }))
+    SWITCH_BOOL(params.enable_rank_mask, ENABLE_RANK_MASK, {SWITCH_BOOL(params.enable_eplb, EPLB_STATS, {
+        SWITCH_TOP_K(params.top_k, TOP_K, {
+            auto kernel_fn = moeA2ADispatchKernel<BlockPolicy, TOP_K, EPLB_STATS, ENABLE_RANK_MASK>;
+            launchWithPdlWhenEnabled("moeA2ADispatchKernel", kernel_fn, grid_size, kBlockSize, shared_bytes,
+                params.stream, params.token_selected_experts, kernel_ptrs, params.num_payloads,
+                params.max_tokens_per_rank, params.local_num_tokens, params.ep_rank, params.ep_size, params.num_experts,
+                params.eplb_stats_num_experts);
+        });
+    })})
 }
 
 // ============================================================================
@@ -1083,7 +1172,7 @@ __global__ void moeA2APrepareCombineKernel(uint8_t* recv_buffer_bytes, void cons
 // Generic Combine Kernel Implementation (Templated by data type)
 // ============================================================================
 
-template <typename T, typename ThreadingPolicy, int TOP_K>
+template <typename T, typename ThreadingPolicy, int TOP_K, bool ENABLE_RANK_MASK>
 __global__ void moeA2ACombineKernel(
     const CombineKernelPointers ptrs, // Combine-specific struct, src_data_ptrs[0] is output
     int max_tokens_per_rank, int elements_per_token, int local_num_tokens, int rank_id, int ep_size,
@@ -1123,9 +1212,16 @@ __global__ void moeA2ACombineKernel(
 
         if (blockIdx.x == 0)
         {
+            // Signal readiness to all active peers; skip dead ranks (their symmetric memory
+            // is unreachable).
 #pragma unroll 1 // No unroll
             for (int peer_rank = lane_id; peer_rank < ep_size; peer_rank += warpSize)
             {
+                if constexpr (ENABLE_RANK_MASK)
+                {
+                    if (!is_rank_active(ptrs.active_rank_mask, peer_rank))
+                        continue;
+                }
                 uint32_t* flag_addr = &ptrs.completion_flags[peer_rank][rank_id];
                 asm volatile("st.relaxed.sys.u32 [%0], %1;" ::"l"(flag_addr), "r"(expected_value));
 #if ENABLE_DEBUG_PRINT
@@ -1135,9 +1231,16 @@ __global__ void moeA2ACombineKernel(
             }
         }
 
+        // Wait for all active peers to signal; skip dead ranks (otherwise we would spin
+        // forever — this is the bug the rank-mask is here to prevent).
 #pragma unroll 1 // No unroll
         for (int peer_rank = lane_id; peer_rank < ep_size; peer_rank += warpSize)
         {
+            if constexpr (ENABLE_RANK_MASK)
+            {
+                if (!is_rank_active(ptrs.active_rank_mask, peer_rank))
+                    continue;
+            }
             bool flag_set = false;
             auto s = clock64();
             do
@@ -1241,8 +1344,14 @@ void moe_a2a_combine_launch(MoeA2ACombineParams const& params)
     // Validate parameters
     TLLM_CHECK(params.top_k > 0 && params.top_k <= kMaxTopK);
     TLLM_CHECK(params.ep_size > 0 && params.ep_size <= kMaxRanks);
+    TLLM_CHECK(params.ep_rank >= 0 && params.ep_rank < params.ep_size);
     TLLM_CHECK(params.local_num_tokens >= 0);
     TLLM_CHECK(params.elements_per_token > 0);
+    if (params.enable_rank_mask)
+    {
+        TLLM_CHECK_WITH_INFO((params.active_rank_mask[params.ep_rank >> 6] >> (params.ep_rank & 63)) & 1ULL,
+            "active_rank_mask must mark the local ep_rank (%d) as active", params.ep_rank);
+    }
 
     // Configure kernel launch (one block per token).
     int const kBlockSize = tensorrt_llm::common::getEnvMoeA2ACombineBlockSize();
@@ -1276,6 +1385,12 @@ void moe_a2a_combine_launch(MoeA2ACombineParams const& params)
     kernel_ptrs.topk_target_ranks = params.topk_target_ranks;
     kernel_ptrs.topk_send_indices = params.topk_send_indices;
 
+    // Copy active-rank bitmask into the kernel pointers struct
+    for (int w = 0; w < kRankMaskWords; ++w)
+    {
+        kernel_ptrs.active_rank_mask[w] = params.active_rank_mask[w];
+    }
+
     // stride_per_token: byte distance between tokens in the recv buffer.
     //   FP8 external payload: EPT × 1            (compact FP8 layout)
     //   FP8 in-place / non-FP8: EPT × sizeof(PayloadT)  (payload-dtype stride)
@@ -1291,14 +1406,16 @@ void moe_a2a_combine_launch(MoeA2ACombineParams const& params)
     auto const effective_dtype = params.use_low_precision ? nvinfer1::DataType::kFP8 : params.dtype;
 
     // Launch appropriate kernel with compact macros
-    SWITCH_DTYPE(effective_dtype, TKernelType, {
-        SWITCH_TOP_K(params.top_k, TOP_K, {
-            auto kernel_fn = moeA2ACombineKernel<TKernelType, BlockPolicy, TOP_K>;
-            launchWithPdlWhenEnabled("moeA2ACombineKernel", kernel_fn, grid, kBlockSize, 0, params.stream, kernel_ptrs,
-                params.max_tokens_per_rank, params.elements_per_token, params.local_num_tokens, params.ep_rank,
-                params.ep_size, stride_per_token);
+    SWITCH_BOOL(params.enable_rank_mask, ENABLE_RANK_MASK, {
+        SWITCH_DTYPE(effective_dtype, TKernelType, {
+            SWITCH_TOP_K(params.top_k, TOP_K, {
+                auto kernel_fn = moeA2ACombineKernel<TKernelType, BlockPolicy, TOP_K, ENABLE_RANK_MASK>;
+                launchWithPdlWhenEnabled("moeA2ACombineKernel", kernel_fn, grid, kBlockSize, 0, params.stream,
+                    kernel_ptrs, params.max_tokens_per_rank, params.elements_per_token, params.local_num_tokens,
+                    params.ep_rank, params.ep_size, stride_per_token);
+            });
         });
-    });
+    })
 }
 
 // Kernel to sanitize expert ids for invalid tokens

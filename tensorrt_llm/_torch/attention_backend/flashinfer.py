@@ -1,34 +1,137 @@
+import functools
 import math
 import os
+import sys
 import weakref
 from dataclasses import dataclass, field
-from typing import Any, Dict, Literal, Optional
+from itertools import chain
+from typing import Any, Dict, NewType, Optional, TypeAlias, cast
+
+if sys.version_info[:2] >= (3, 12):
+    from typing import override
+else:
+    from typing_extensions import override
 
 import flashinfer
+import numpy as np
 import torch
 from flashinfer.jit.core import check_cuda_arch
 from typing_extensions import Self
 
+from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.functional import AttentionMaskType
+from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from ..metadata import KVCacheParams
-from ..utils import get_global_attrs, get_model_extra_attrs
+from ..utils import get_global_attrs, get_model_extra_attrs, torch_multi_arange
 from .interface import (AttentionBackend, AttentionForwardArgs,
                         AttentionInputType, AttentionMetadata,
                         CustomAttentionMask, MLAParams, PredefinedAttentionMask,
                         merge_attention_forward_args)
 
-try:
-    check_cuda_arch()
-except RuntimeError:
-    # Override TORCH_CUDA_ARCH_LIST for JIT compilation of flashinfer kernels
-    # since the existed TORCH_CUDA_ARCH_LIST may be too general and flashinfer requires sm75+.
-    capability = torch.cuda.get_device_capability()
-    arch_list = f"{capability[0]}.{capability[1]}"
-    os.environ["TORCH_CUDA_ARCH_LIST"] = arch_list
+# Guard on a visible GPU: with CUDA_VISIBLE_DEVICES="" (pure client) the
+# check would force a CUDA context at import time.
+if torch.cuda.is_available() and torch.cuda.device_count() > 0:
+    try:
+        check_cuda_arch()
+    except RuntimeError:
+        # Override TORCH_CUDA_ARCH_LIST for JIT compilation of flashinfer kernels
+        # since the existed TORCH_CUDA_ARCH_LIST may be too general and flashinfer requires sm75+.
+        capability = torch.cuda.get_device_capability()
+        arch_list = f"{capability[0]}.{capability[1]}"
+        os.environ["TORCH_CUDA_ARCH_LIST"] = arch_list
 
-from tensorrt_llm._utils import prefer_pinned
+from tensorrt_llm._utils import maybe_pin_memory, prefer_pinned
+
+_FORCE_RAGGED_FA2 = False
+"""Used for testing."""
+
+_MAX_CUDA_THREADS_PER_BLOCK = 1024
+
+
+def _slice_paged_kv_cache_heads(
+    paged_kv_cache: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+    start: int,
+    end: int,
+    kv_layout: str,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    if kv_layout == "HND":
+        head_axis = 2
+    elif kv_layout == "NHD":
+        head_axis = 3
+    else:
+        raise ValueError(f"Unsupported kv_layout: {kv_layout}")
+
+    if isinstance(paged_kv_cache, tuple):
+        head_axis -= 1
+        index = [slice(None)] * 4
+        index[head_axis] = slice(start, end)
+        return tuple(cache[tuple(index)] for cache in paged_kv_cache)
+
+    index = [slice(None)] * 5
+    index[head_axis] = slice(start, end)
+    return paged_kv_cache[tuple(index)]
+
+
+def _append_paged_kv_cache(
+    append_key: torch.Tensor,
+    append_value: torch.Tensor,
+    batch_indices: torch.Tensor,
+    positions: torch.Tensor,
+    paged_kv_cache: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+    kv_indices: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    kv_last_page_len: torch.Tensor,
+    kv_layout: str = "NHD",
+) -> None:
+    """Split FlashInfer paged-KV appends that exceed CUDA's CTA limit."""
+    head_dim = append_key.shape[-1]
+    vec_size = max(16 // append_key.element_size(), head_dim // 32)
+    threads_per_head = head_dim // vec_size
+    max_heads_per_launch = _MAX_CUDA_THREADS_PER_BLOCK // threads_per_head
+
+    num_kv_heads = append_key.shape[1]
+    if num_kv_heads <= max_heads_per_launch:
+        flashinfer.page.append_paged_kv_cache(
+            append_key=append_key,
+            append_value=append_value,
+            batch_indices=batch_indices,
+            positions=positions,
+            paged_kv_cache=paged_kv_cache,
+            kv_indices=kv_indices,
+            kv_indptr=kv_indptr,
+            kv_last_page_len=kv_last_page_len,
+            kv_layout=kv_layout,
+        )
+        return
+
+    for start in range(0, num_kv_heads, max_heads_per_launch):
+        end = min(start + max_heads_per_launch, num_kv_heads)
+        flashinfer.page.append_paged_kv_cache(
+            append_key=append_key[:, start:end],
+            append_value=append_value[:, start:end],
+            batch_indices=batch_indices,
+            positions=positions,
+            paged_kv_cache=_slice_paged_kv_cache_heads(paged_kv_cache, start,
+                                                       end, kv_layout),
+            kv_indices=kv_indices,
+            kv_indptr=kv_indptr,
+            kv_last_page_len=kv_last_page_len,
+            kv_layout=kv_layout,
+        )
+
+
+@dataclass(kw_only=True, frozen=True)
+class FlashInferMultiItemParams:
+    """Multi-item scoring related parameters for FlashInfer APIs.
+
+    cf. https://github.com/flashinfer-ai/flashinfer/pull/1015 and FlashInfer wrapper.plan()
+    """
+    prefix_len_ptr: torch.Tensor
+    max_item_len_ptr: torch.Tensor
+    token_pos_in_items_ptr: torch.Tensor
+    token_pos_in_items_len: int
 
 
 @dataclass(kw_only=True, frozen=True)
@@ -45,8 +148,17 @@ class PlanParams:
 
     attention_mask_type: AttentionMaskType
     attention_mask_data: Optional[torch.Tensor] = None
+    multi_item_params: Optional[FlashInferMultiItemParams] = None
     sm_scale: Optional[float] = None
     window_left: Optional[int] = None
+
+
+# NB: Some features (multi-item scoring) are only supported with the paged KV-cache wrapper.
+#     With page_size=1, the latter can also be used for ragged KV data.
+_PageSizeOnePrefillWrapper = NewType(
+    "_PageSizeOnePrefillWrapper",
+    flashinfer.BatchPrefillWithPagedKVCacheWrapper)
+_RaggedPrefillWrapper: TypeAlias = flashinfer.BatchPrefillWithRaggedKVCacheWrapper | _PageSizeOnePrefillWrapper
 
 
 @dataclass(kw_only=True, frozen=True)
@@ -86,18 +198,20 @@ class FlashInferWrappers:
         flashinfer.BatchDecodeWithPagedKVCacheWrapper] = None
     prefill_wrapper: Optional[
         flashinfer.BatchPrefillWithPagedKVCacheWrapper] = None
-    ragged_prefill_wrapper: Optional[
-        flashinfer.BatchPrefillWithRaggedKVCacheWrapper] = None
+    ragged_prefill_wrapper: Optional[_RaggedPrefillWrapper] = None
+    # Persistent trtllm-gen decode block tables, built on the host by
+    # _build_decode_block_tables().  The device buffer must keep a stable
+    # address across steps so graph-captured decode kernels keep reading
+    # valid memory; the pinned host buffer feeds the async H2D.
+    decode_block_tables: Optional[torch.Tensor] = field(default=None,
+                                                        repr=False)
+    host_decode_block_tables: Optional[torch.Tensor] = field(default=None,
+                                                             repr=False)
 
 
 @dataclass(kw_only=True)
 class FlashInferAttentionMetadata(AttentionMetadata):
     workspace_buffer: Optional[torch.Tensor] = None
-
-    # cache concat/split kernels when using PD disaggregation
-    # expects KV cache in [max_num_pages, 2, num_kv_heads, page_size, head_dim] layout,
-    # so set kv_layout as "HND" here
-    kv_layout: Literal["NHD", "HND"] = "HND"
 
     paged_kv_indptr_decode: torch.Tensor = field(init=False)
     paged_kv_indptr_prefill: torch.Tensor = field(init=False)
@@ -105,6 +219,8 @@ class FlashInferAttentionMetadata(AttentionMetadata):
     _paged_kv_last_page_len: torch.Tensor = field(init=False)
     _qo_indptr: torch.Tensor = field(init=False)
     _kv_indptr: torch.Tensor = field(init=False)
+    _ragged_qo_indptr_buf: torch.Tensor = field(init=False)
+    _ragged_kv_indptr_buf: torch.Tensor = field(init=False)
     _cached_token_lens: torch.Tensor = field(init=False)
     _plan_params_to_wrappers: Dict[PlanParams,
                                    FlashInferWrappers] = field(init=False)
@@ -131,6 +247,9 @@ class FlashInferAttentionMetadata(AttentionMetadata):
     _mla_kv_len_arr_buf: Optional[torch.Tensor] = field(init=False,
                                                         default=None)
 
+    _multi_item_params: Optional[FlashInferMultiItemParams] = field(
+        init=False, default=None)
+
     def needs_plan(self, plan_params: PlanParams) -> bool:
         if plan_params not in self._plan_params_to_wrappers:
             return True
@@ -154,8 +273,7 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         return result
 
     def get_ragged_prefill_wrapper(
-        self, plan_params: PlanParams
-    ) -> flashinfer.BatchPrefillWithRaggedKVCacheWrapper:
+            self, plan_params: PlanParams) -> _RaggedPrefillWrapper:
         assert plan_params in self._plan_params_to_wrappers, "Plan params not found, make sure to call plan()"
         result = self._plan_params_to_wrappers[
             plan_params].ragged_prefill_wrapper
@@ -412,6 +530,9 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         src = self._vswa_pool_indices_cache[pool_id][:n]
         self._paged_kv_indices[:n].copy_(src, non_blocking=True)
         self._vswa_active_pool_id = pool_id
+        # Keep the host mirror in lockstep with the device buffer so decode
+        # plans build their block tables from the active pool's indices.
+        self._host_paged_kv_indices = self._host_pool_indices[pool_id]
 
     @property
     def paged_kv_last_page_len(self) -> torch.Tensor:
@@ -475,6 +596,21 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             self.max_num_requests + 1, device='cuda',
             dtype=torch.int) if self.is_cross else self._qo_indptr
 
+        self._ragged_qo_indptr_buf = self.get_empty(
+            buffers,
+            (self.max_num_requests + 1, ),
+            dtype=torch.int32,
+            cache_name="_ragged_qo_indptr_buf",
+            capture_graph=capture_graph,
+        )
+        self._ragged_kv_indptr_buf = self.get_empty(
+            buffers,
+            (self.max_num_requests + 1, ),
+            dtype=torch.int32,
+            cache_name="_ragged_kv_indptr_buf",
+            capture_graph=capture_graph,
+        )
+
         self._cached_token_lens = torch.empty((self.max_num_requests, ),
                                               dtype=torch.int,
                                               device='cuda')
@@ -486,6 +622,16 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                                       device='cuda')
         self._plan_params_to_wrappers = {}
 
+        # Host-side state for sync-free trtllm-gen decode plans, retained by
+        # prepare(): a host mirror of _paged_kv_indices (kept in lockstep
+        # with the device buffer, with per-pool copies for VSWA swaps) and a
+        # host copy of the decode indptr.  The per-plan_params persistent
+        # block-table buffers live on FlashInferWrappers.
+        self._host_pool_indices: Dict[int, torch.Tensor] = {}
+        self._host_paged_kv_indices: Optional[torch.Tensor] = None
+        self._host_paged_kv_indptr_decode: Optional[torch.Tensor] = None
+        self._max_num_blocks = 0
+
         # VSWA (Variable Sliding Window Attention): models with per-layer
         # max_attention_window create separate V2 pool groups with independent
         # page numbering.  We need per-pool paged_kv_indices so each layer can
@@ -494,26 +640,51 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         self._vswa_pool_indices_cache: Optional[Dict[int, torch.Tensor]] = None
 
         if self.kv_cache_manager is not None:
-            max_num_pages = self.kv_cache_manager.blocks_in_primary_pool
+            blocks_in_primary_pool = self.kv_cache_manager.blocks_in_primary_pool
             self._paged_kv_indices = self.get_empty(
                 buffers,
-                (max_num_pages, ),
+                (blocks_in_primary_pool, ),
                 dtype=torch.int,
                 cache_name="_paged_kv_indices",
                 capture_graph=capture_graph,
             )
 
-            # Detect VSWA: check if the manager has multiple pools.
-            # Guard on layer_to_pool_mapping_dict which is V2-specific — V1
-            # managers also expose is_vswa but lack the per-pool infrastructure.
-            if (getattr(self.kv_cache_manager, 'is_vswa', False) and hasattr(
-                    self.kv_cache_manager, 'layer_to_pool_mapping_dict')):
-                mgr = self.kv_cache_manager
-                self._vswa_layer_to_pool = {}
-                self._vswa_pool_to_rep_layer: Dict[int, int] = {}
+            # Maximum block count across ALL pools: sizes the VSWA pool
+            # buffers below and bounds the per-request width of the
+            # persistent trtllm-gen decode block tables (a request can
+            # never reference more blocks than its pool holds).  Computed
+            # for every model, not just VSWA — non-VSWA managers have a
+            # single pool, so this stays blocks_in_primary_pool for them.
+            max_num_blocks = blocks_in_primary_pool
+            if hasattr(self.kv_cache_manager, 'layer_offsets'):
+                for lid in self.kv_cache_manager.layer_offsets:
+                    lbuf = self.kv_cache_manager.get_buffers(lid)
+                    if lbuf is not None:
+                        max_num_blocks = max(max_num_blocks, lbuf.shape[0])
+            self._max_num_blocks = max_num_blocks
+
+            # Layers may share one page-index list only when they are in the
+            # same pool AND have the same page-index scale: VSWA splits pools,
+            # and per-layer geometry (e.g. Gemma4 sliding/global head_dim)
+            # splits scales even when all windows collapse to max_seq_len and
+            # is_vswa is False. Guarded on V2-specific attributes (V1 managers
+            # lack the per-pool infrastructure).
+            mgr = self.kv_cache_manager
+            get_scale = getattr(mgr, 'get_layer_page_index_scale', None)
+            layer_space: Dict[int, int] = {}
+            if hasattr(mgr, 'layer_to_pool_mapping_dict') and get_scale:
+                space_ids = {}
                 for layer_idx in getattr(mgr, 'layer_offsets', {}):
                     layer_offset = mgr.layer_offsets[layer_idx]
-                    pool_id = mgr.layer_to_pool_mapping_dict[layer_offset]
+                    key = (mgr.layer_to_pool_mapping_dict[layer_offset],
+                           get_scale(layer_idx))
+                    space_ids.setdefault(key, len(space_ids))
+                    layer_space[layer_idx] = space_ids[key]
+            if layer_space and (getattr(mgr, 'is_vswa', False)
+                                or len(set(layer_space.values())) > 1):
+                self._vswa_layer_to_pool = {}
+                self._vswa_pool_to_rep_layer: Dict[int, int] = {}
+                for layer_idx, pool_id in layer_space.items():
                     self._vswa_layer_to_pool[layer_idx] = pool_id
                     if pool_id not in self._vswa_pool_to_rep_layer:
                         self._vswa_pool_to_rep_layer[pool_id] = layer_idx
@@ -529,20 +700,14 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                 # Pre-allocate VSWA pool cache buffers.  These must be
                 # stable (never reallocated) so that CUDA-graph-recorded
                 # copies reference valid addresses across replays.
-                # Use the maximum page count across ALL pools (not just the
-                # primary) so that secondary pool buffers are large enough.
-                all_pool_pages = max_num_pages
-                if hasattr(self.kv_cache_manager, 'layer_offsets'):
-                    for lid in self.kv_cache_manager.layer_offsets:
-                        lbuf = self.kv_cache_manager.get_buffers(lid)
-                        if lbuf is not None:
-                            all_pool_pages = max(all_pool_pages, lbuf.shape[0])
+                # max_num_blocks (computed above) covers ALL pools so that
+                # secondary pool buffers are large enough.
                 for pool_id in set(self._vswa_layer_to_pool.values()):
                     buf_key = f'_vswa_pool_buf_{pool_id}'
                     if getattr(self, buf_key, None) is None:
                         setattr(
                             self, buf_key,
-                            torch.empty(all_pool_pages,
+                            torch.empty(max_num_blocks,
                                         dtype=torch.int,
                                         device='cuda'))
         # Stable buffers for FlashInfer MLA decode; required for CUDA graphs.
@@ -570,15 +735,18 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         self._mla_ragged_planned = False
         self._mla_context_planned = False
         self._mla_decode_planned = False
+        self._multi_item_params = None
 
     def create_cuda_graph_metadata(self,
                                    max_batch_size: int,
                                    sub_cross_metadata: bool = False,
                                    max_draft_tokens: int = 0,
-                                   buffers=None) -> Self:
+                                   buffers=None,
+                                   encode_only: bool = False) -> Self:
         metadata = super().create_cuda_graph_metadata(max_batch_size,
                                                       sub_cross_metadata,
-                                                      max_draft_tokens)
+                                                      max_draft_tokens, buffers,
+                                                      encode_only)
         metadata.max_num_requests = max_batch_size
         metadata.max_num_tokens = max_batch_size * (1 + max_draft_tokens)
         # Post init again to make sure all tensors are allocated
@@ -595,10 +763,11 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             "ragged prefill path instead.")
         return self.kv_cache_manager.tokens_per_block
 
-    def _plan_ragged_cudnn_no_kv(
+    def _plan_ragged_no_kv(
         self,
         plan_params: PlanParams,
         ragged_prefill_wrapper: Any,
+        flashinfer_backend: str,
     ) -> None:
         is_causal = plan_params.attention_mask_type == AttentionMaskType.causal
         if plan_params.attention_mask_data is not None:
@@ -610,71 +779,308 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         assert self.seq_lens_cuda is not None
         assert self.seq_lens is not None
 
-        # NOTE: When kv_cache_manager is None (e.g. ViT), ragged prefill runs only for the context phase.
-        # Restrict seq_lens to the first num_contexts entries accordingly.
-        q_seqlens = self.seq_lens[:self.num_contexts]
-        kv_seqlens = q_seqlens
-
-        max_query_tokens_per_sequence = int(
-            self.seq_lens[:self.num_contexts].max().item())
-        max_key_value_tokens_per_sequence = max_query_tokens_per_sequence
-
-        # cuDNN ragged prefill uses *element* offsets in qo/kv indptr, not token indptr.
-        num_context_sequences = int(q_seqlens.shape[0])
-        query_output_element_indptr = torch.zeros(
-            num_context_sequences + 1,
+        # NB: When kv_cache_manager is None (e.g. ViT), ragged prefill runs only for the context phase.
+        #     Restrict seq_lens and index tensors to the first num_contexts entries accordingly.
+        #
+        # NB: flashinfer expects seq_len (BatchPrefillWithPagedKVCacheWrapper only), paged_kv_last_page_len, qo_indptr,
+        #     and paged_kv_indptr to be host tensors (if not, it synchronously copies them to the host).
+        #     => not using self.qo_indptr and self.kv_indptr here
+        num_contexts = self.num_contexts
+        q_and_kv_seqlens = self.seq_lens[:num_contexts]
+        q_and_kv_seqlens_cuda = self.seq_lens_cuda[:self.num_contexts]
+        query_output_indptr = torch.zeros(
+            num_contexts + 1,
             dtype=torch.int32,
             pin_memory=prefer_pinned(),
         )
-        key_value_element_indptr = torch.zeros(
-            num_context_sequences + 1,
-            dtype=torch.int32,
-            pin_memory=prefer_pinned(),
-        )
-        if num_context_sequences > 0:
-            num_query_output_heads = plan_params.num_heads
-            num_key_value_heads = plan_params.num_kv_heads
-            attention_head_dim = plan_params.head_dim
-            query_output_element_indptr[1:].copy_(
-                torch.cumsum(q_seqlens, dim=0).mul_(num_query_output_heads *
-                                                    attention_head_dim))
-            key_value_element_indptr[1:].copy_(
-                torch.cumsum(kv_seqlens, dim=0).mul_(num_key_value_heads *
-                                                     attention_head_dim))
+        key_value_indptr = query_output_indptr
+        num_query_output_heads = plan_params.num_heads
+        num_key_value_heads = plan_params.num_kv_heads
+        attention_head_dim = plan_params.head_dim
 
-        q_seqlens_cuda = self.seq_lens_cuda[:self.num_contexts]
-        kv_seqlens_cuda = q_seqlens_cuda[:self.num_contexts]
+        max_query_tokens_per_sequence = 0
+        if num_contexts > 0:
+            query_output_indptr[1:].copy_(torch.cumsum(q_and_kv_seqlens, dim=0))
+            # key_value_indptr is query_output_indptr
+            max_query_tokens_per_sequence = cast(int,
+                                                 q_and_kv_seqlens.max().item())
 
+            if flashinfer_backend == "cudnn":
+                # cuDNN ragged prefill uses *element* offsets in qo/kv indptr, not token indptr.
+                key_value_indptr = key_value_indptr.clone(
+                )  # unalias query_output_indptr
+                query_output_indptr[1:].mul_(num_query_output_heads *
+                                             attention_head_dim)
+                key_value_indptr[1:].mul_(num_key_value_heads *
+                                          attention_head_dim)
+
+        if (multi_item_params := plan_params.multi_item_params) is not None:
+            if flashinfer_backend not in ["fa2", "fa3"]:
+                raise ValueError(
+                    "The selected FlashInfer attention backend does not support multi-item attention masking."
+                )
+            assert isinstance(ragged_prefill_wrapper,
+                              flashinfer.BatchPrefillWithPagedKVCacheWrapper
+                              )  # _PageSizeOnePrefillWrapper
+            plan_kwargs = dict(
+                prefix_len_ptr=multi_item_params.prefix_len_ptr,
+                token_pos_in_items_ptr=multi_item_params.token_pos_in_items_ptr,
+                token_pos_in_items_len=multi_item_params.token_pos_in_items_len,
+                max_item_len_ptr=multi_item_params.max_item_len_ptr,
+                paged_kv_indptr=key_value_indptr,
+                paged_kv_indices=torch.arange(key_value_indptr[-1].item(),
+                                              device=key_value_indptr.device,
+                                              dtype=key_value_indptr.dtype),
+                paged_kv_last_page_len=torch.ones_like(q_and_kv_seqlens),
+                page_size=1,
+                seq_lens=q_and_kv_seqlens,
+            )
+        else:
+            assert isinstance(ragged_prefill_wrapper,
+                              flashinfer.BatchPrefillWithRaggedKVCacheWrapper)
+            max_key_value_tokens_per_sequence = max_query_tokens_per_sequence
+            # Do not pass v_indptr/o_indptr for self-attention. When they are omitted, FlashInfer
+            # aliases them to the CUDA-graph-stable kv/qo buffers; passing them explicitly creates
+            # fresh CUDA tensors during plan(), leaving replay with stale captured offset pointers.
+            plan_kwargs = dict(
+                kv_indptr=key_value_indptr,
+                seq_lens=q_and_kv_seqlens_cuda,
+                seq_lens_q=q_and_kv_seqlens_cuda,
+                max_sequence_kv=
+                max_key_value_tokens_per_sequence,  # breaks BatchPrefillWithPagedKVCacheWrapper
+            )
         ragged_prefill_wrapper.plan(
-            qo_indptr=query_output_element_indptr,
-            kv_indptr=key_value_element_indptr,
-            num_qo_heads=plan_params.num_heads,
-            num_kv_heads=plan_params.num_kv_heads,
-            head_dim_qk=plan_params.head_dim,
+            qo_indptr=query_output_indptr,
+            num_qo_heads=num_query_output_heads,
+            num_kv_heads=num_key_value_heads,
+            head_dim_qk=attention_head_dim,
             custom_mask=plan_params.attention_mask_data,
             causal=is_causal,
             sm_scale=plan_params.sm_scale,
             window_left=window_left,
             q_data_type=plan_params.q_dtype,
             kv_data_type=plan_params.kv_dtype,
-            seq_lens=kv_seqlens_cuda,
-            seq_lens_q=q_seqlens_cuda,
             max_token_per_sequence=max_query_tokens_per_sequence,
-            max_sequence_kv=max_key_value_tokens_per_sequence,
-            v_indptr=key_value_element_indptr,
-            o_indptr=query_output_element_indptr,
+            **plan_kwargs,
         )
 
+    def _process_multi_item_part_lens(
+        self,
+        multi_item_part_lens: list[list[int]],
+        *,
+        device: torch.device,
+    ) -> FlashInferMultiItemParams:
+        if self.num_generations > 0:
+            raise ValueError(
+                "\"multi_item_part_lens\" not supported for generation requests."
+            )
+        if len(multi_item_part_lens) != self.num_contexts:
+            raise ValueError(
+                "\"multi_item_part_lens\" needs to be provided for all requests."
+            )
+        if any([len(part_lens) < 2 for part_lens in multi_item_part_lens]):
+            raise ValueError(
+                "\"multi_item_part_lens\" must have at least two elements")
+
+        prefix_len_ptr = torch.tensor(
+            [req_part_lens[0] for req_part_lens in multi_item_part_lens],
+            pin_memory=prefer_pinned(),
+            dtype=torch.uint32,
+        ).to(device=device, non_blocking=True)
+        token_pos_in_items_raw_lens = [  # 'raw' lengths before padding
+            sum(req_part_lens[1:]) + len(req_part_lens)
+            for req_part_lens in multi_item_part_lens
+        ]
+        token_pos_in_items_len = max(token_pos_in_items_raw_lens)
+        max_item_len_ptr = torch.tensor(
+            [max(req_part_lens[1:]) for req_part_lens in multi_item_part_lens],
+            pin_memory=prefer_pinned(),
+            dtype=torch.uint16,
+        ).to(device=device, non_blocking=True)
+
+        # token_pos_in_items_ptr is obtained by concatenating range(item_len + 1) for each item in
+        # every request, followed by [0] (final delimiter) which is fused with padding for simplicity.
+        range_ends = torch.tensor(
+            [
+                item_len + 1
+                for req_part_lens, token_pos_in_items_raw_len in zip(
+                    multi_item_part_lens,
+                    token_pos_in_items_raw_lens,
+                    strict=True) for item_len in
+                chain(req_part_lens[1:],
+                      [token_pos_in_items_len - token_pos_in_items_raw_len])
+            ],
+            pin_memory=prefer_pinned(),
+            dtype=torch.int32,
+        ).to(device=device, non_blocking=True)
+        token_pos_in_items_ptr = torch_multi_arange(
+            range_ends,
+            output_length=(token_pos_in_items_len * len(multi_item_part_lens)),
+        )
+        # next, mask out the padding
+        mask_entries = torch.arange(2, dtype=torch.uint8).to(
+            device=device,
+            non_blocking=True,
+            dtype=torch.bool,
+        ).repeat(len(multi_item_part_lens))  # NB: .expand() does not work here
+        mask_entry_repeats = torch.tensor(
+            [
+                repeat
+                for token_pos_in_items_raw_len in token_pos_in_items_raw_lens
+                for repeat in [
+                    token_pos_in_items_raw_len,
+                    token_pos_in_items_len - token_pos_in_items_raw_len,
+                ]
+            ],
+            pin_memory=prefer_pinned(),
+            dtype=torch.int32,
+        ).to(device=device, non_blocking=True)
+        padding_mask = torch.repeat_interleave(
+            input=mask_entries,
+            repeats=mask_entry_repeats,
+            output_size=token_pos_in_items_ptr.size(0),
+        )
+        token_pos_in_items_ptr.masked_fill_(padding_mask, 0)
+        token_pos_in_items_ptr = token_pos_in_items_ptr.to(dtype=torch.uint16,
+                                                           non_blocking=True)
+
+        return FlashInferMultiItemParams(
+            prefix_len_ptr=prefix_len_ptr,
+            max_item_len_ptr=max_item_len_ptr,
+            token_pos_in_items_ptr=token_pos_in_items_ptr,
+            token_pos_in_items_len=token_pos_in_items_len,
+        )
+
+    def _build_decode_block_tables(
+            self, plan_params: PlanParams,
+            wrappers: FlashInferWrappers) -> Optional[torch.Tensor]:
+        """Build the trtllm-gen decode block table on the host.
+
+        When ``block_tables`` is not passed to
+        ``BatchDecodeWithPagedKVCacheWrapper.plan()``, flashinfer rebuilds
+        it with a per-request loop whose slice bounds are GPU scalars —
+        one cudaStreamSynchronize + one scalar D2H read per generation
+        request per plan.  Instead, build the ``[num_gens, max_n]`` table
+        here with one vectorized pass over the host mirror of the active
+        pool's flat page indices (no GPU reads) and push it with a single
+        async H2D into a persistent device buffer held by ``wrappers``.
+        Under CUDA-graph metadata the buffer is allocated once at full
+        capacity width and never moves, so captured decode kernels keep
+        reading valid memory while prepare() refreshes the contents in
+        place; the eager path re-plans every step and may grow its buffer
+        geometrically.
+
+        Returns None when the host data (or memory for the buffer) is
+        unavailable; the caller then falls back to flashinfer's own
+        rebuild — itself sync-free now that the plan indptr is a host
+        tensor.
+        """
+        if plan_params.attention_mask_data is not None:
+            # Masked plans are flushed every step, taking their wrappers
+            # (and any buffers on them) along; don't churn per-step
+            # block-table allocations for them.
+            return None
+        num_gens = self.num_generations
+        if num_gens == 0:
+            return None
+        host_paged_kv_indices = self._host_paged_kv_indices
+        if host_paged_kv_indices is None:
+            return None
+        gen_num_blocks = np.asarray(self.num_blocks[self.num_contexts:],
+                                    dtype=np.int64)
+        max_n = int(gen_num_blocks.max())
+        if max_n > self._max_num_blocks:
+            # A request can never reference more blocks than any pool
+            # holds; defensive guard for inconsistent metadata.
+            return None
+        block_tables = wrappers.decode_block_tables
+        if (self.is_cuda_graph and block_tables is not None
+                and block_tables.size(1) < max_n):
+            # Never reallocate under CUDA graphs: captured decode kernels
+            # hold the buffer address.
+            return None
+        if block_tables is None or block_tables.size(1) < max_n:
+            if self.is_cuda_graph:
+                # Allocated once at capture warmup; full capacity width so
+                # replays never need a wider table.
+                width = self._max_num_blocks
+            else:
+                # Eager path replans (and re-reads the table) every step,
+                # so the buffer may grow geometrically as sequences do.
+                width = min(max(64, 1 << (max_n - 1).bit_length()),
+                            self._max_num_blocks)
+            try:
+                block_tables = torch.zeros((self.max_num_requests, width),
+                                           dtype=torch.int32,
+                                           device='cuda')
+            except torch.OutOfMemoryError:
+                # E.g. the KV-estimation warmup forwards run with device
+                # memory deliberately exhausted; fall back to flashinfer's
+                # rebuild rather than failing the forward.
+                return None
+            wrappers.decode_block_tables = block_tables
+        host_block_tables = wrappers.host_decode_block_tables
+        if host_block_tables is None or host_block_tables.size(1) < max_n:
+            host_width = min(max(64, 1 << (max_n - 1).bit_length()),
+                             block_tables.size(1))
+            host_block_tables = torch.zeros((self.max_num_requests, host_width),
+                                            dtype=torch.int32,
+                                            pin_memory=prefer_pinned())
+            wrappers.host_decode_block_tables = host_block_tables
+        start = self.num_context_blocks
+        decode_flat = host_paged_kv_indices.numpy()[start:start +
+                                                    int(gen_num_blocks.sum())]
+        table = host_block_tables.numpy()[:num_gens, :max_n]
+        table[:] = 0
+        table[np.arange(max_n)[None, :] < gen_num_blocks[:, None]] = \
+            decode_flat
+        # Rewriting the host buffer is safe: _plan_with_params synchronizes
+        # the stream before planning, so the previous plan's H2D has
+        # completed.
+        block_tables[:num_gens, :max_n].copy_(
+            host_block_tables[:num_gens, :max_n], non_blocking=True)
+        return block_tables[:num_gens]
+
+    def _clean_cached_plans(self, *, defer_plan: bool):
+        for plan_params in list(self._plan_params_to_wrappers.keys()):
+            # Generally, plan_params with non-trivial attention masking are relevant only the
+            # corresponding forward pass. So, flush them out here as they won't be relevant for
+            # subsequent forward calls.
+            if plan_params.attention_mask_data is None and plan_params.multi_item_params is None:
+                self._plan_params_to_wrappers[plan_params].is_planned = False
+                if not defer_plan:
+                    self._plan_with_params(plan_params)
+            else:
+                del self._plan_params_to_wrappers[plan_params]
+
     def prepare(self) -> None:
+
+        def _to_int32_tensor(arr: np.ndarray) -> torch.Tensor:
+            """Host int32 staging tensor for async H2D copies; pinned when
+            beneficial.
+
+            torch.tensor(..., pin_memory=True) rejects numpy sources, hence
+            from_numpy + pin.
+            """
+            return maybe_pin_memory(
+                torch.from_numpy(arr.astype(np.int32, copy=False)))
+
         super().prepare()
         extra_attrs = get_model_extra_attrs()
         if extra_attrs is None:
             get_global_attrs().attention_metadata = weakref.ref(self)
         # start and end indices of each sequence in the ragged query
+        assert self.seq_lens_cuda is not None
         torch.cumsum(self.seq_lens_cuda,
                      dim=0,
                      dtype=torch.int32,
                      out=self._qo_indptr[1:self.seq_lens_cuda.size(0) + 1])
+
+        if self.multi_item_part_lens is not None:
+            self._multi_item_params = self._process_multi_item_part_lens(
+                self.multi_item_part_lens, device=self.seq_lens_cuda.device)
+        else:
+            self._multi_item_params = None
 
         if self.kv_cache_manager is None:
             assert self.request_ids is not None
@@ -689,34 +1095,35 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             n = self.num_seqs
             self._cached_token_lens[:n].zero_()
             self.num_ctx_cached_tokens = 0
-            for plan_params in list(self._plan_params_to_wrappers.keys()):
-                if plan_params.attention_mask_data is None:
-                    self._plan_params_to_wrappers[
-                        plan_params].is_planned = False
-                    self._plan_with_params(plan_params)
-                else:
-                    del self._plan_params_to_wrappers[plan_params]
+            self._clean_cached_plans(defer_plan=False)
             return
 
-        # indices of used cache blocks for each sequence
-        assert self.request_ids is not None
-        block_ids_per_seq = self.kv_cache_manager.get_batch_cache_indices(
-            self.request_ids)
+        if self._multi_item_params is not None:
+            raise ValueError(
+                "multi_item_part_lens with KV cache is not supported")
 
         # number of tokens in the kv cache for each sequence in the batch
-        cached_token_lens = torch.tensor(
-            self.kv_cache_params.num_cached_tokens_per_seq, dtype=torch.int)
+        num_cached_tokens_per_seq = self.kv_cache_params.num_cached_tokens_per_seq
+        cached_token_lens = torch.tensor(num_cached_tokens_per_seq,
+                                         dtype=torch.int,
+                                         pin_memory=prefer_pinned())
         self._cached_token_lens[:cached_token_lens.size(0)].copy_(
             cached_token_lens, non_blocking=True)
         if self.num_contexts > 0:
             self.num_ctx_cached_tokens = sum(
-                self.kv_cache_params.num_cached_tokens_per_seq[:self.
-                                                               num_contexts])
+                num_cached_tokens_per_seq[:self.num_contexts])
         else:
             self.num_ctx_cached_tokens = 0
 
-        # number of tokens needed in the kv cache for each sequence after the next pass
-        kv_lens = self.cached_token_lens + self.seq_lens_kv_cuda
+        # Number of tokens needed in the KV cache for each sequence after the
+        # next pass. Kept on the host: every consumer below needs host values,
+        # so a device-side computation would force a sync per step.
+        kv_lens_host = np.asarray(num_cached_tokens_per_seq,
+                                  dtype=np.int64) + self.seq_lens_kv.numpy()
+        num_blocks = (kv_lens_host + self.page_size - 1) // self.page_size
+        self.num_blocks = num_blocks.tolist()
+
+        assert self.request_ids is not None
 
         # start and end indices of each sequence in the ragged key and value
         # for self attention it's the same as qo_indptr so avoid computing twice.
@@ -732,20 +1139,21 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         # NOTE: do not use len(block_ids) - that will give you a number
         # that can be too big if using chunked prefill/kv cache reuse
         # since we allocate all blocks ahead of time.
-        num_blocks = ((kv_lens + self.page_size - 1) // self.page_size)
-        self.num_blocks = num_blocks.tolist()
         self.num_context_blocks = sum(self.num_blocks[:self.num_contexts])
         self.num_generation_blocks = sum(self.num_blocks[self.num_contexts:])
 
-        paged_kv_indices_list = []
-        for i, block_ids in enumerate(block_ids_per_seq):
-            paged_kv_indices_list.extend(block_ids[:self.num_blocks[i]])
-
-        paged_kv_indices = torch.tensor(paged_kv_indices_list,
-                                        dtype=torch.int32)
+        # indices of used cache blocks for each sequence
+        paged_kv_indices = self.kv_cache_manager.get_batch_cache_indices_flat(
+            self.request_ids, self.num_blocks)
 
         self._paged_kv_indices[:paged_kv_indices.size(0)].copy_(
             paged_kv_indices, non_blocking=True)
+
+        # Retain a host mirror of _paged_kv_indices: decode plans build the
+        # trtllm-gen block tables from host data, with no GPU round trips.
+        # The VSWA block below re-points the mirror at the active pool's
+        # copy whenever the device buffer is swapped.
+        self._host_paged_kv_indices = paged_kv_indices
 
         # VSWA: build per-pool page index CUDA tensors so each layer can use
         # the indices that match its own pool's buffer.  Tensors live on CUDA
@@ -764,44 +1172,42 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             self._vswa_pool_indices_cache = {
                 primary_pool_id: primary_buf,
             }
+            self._host_pool_indices = {primary_pool_id: paged_kv_indices}
             for pool_id in unique_pools:
                 if pool_id == primary_pool_id:
                     continue
                 rep_layer = self._vswa_pool_to_rep_layer[pool_id]
-                pool_block_ids = self.kv_cache_manager.get_batch_cache_indices(
-                    self.request_ids, layer_idx=rep_layer)
-                pool_idx_list = []
-                for i, blk_ids in enumerate(pool_block_ids):
-                    pool_idx_list.extend(blk_ids[:self.num_blocks[i]])
-                pool_indices = torch.tensor(pool_idx_list, dtype=torch.int32)
+                pool_indices = \
+                    self.kv_cache_manager.get_batch_cache_indices_flat(
+                        self.request_ids, self.num_blocks, layer_idx=rep_layer)
                 buf = getattr(self, f'_vswa_pool_buf_{pool_id}')
                 buf[:pool_indices.size(0)].copy_(pool_indices,
                                                  non_blocking=True)
                 self._vswa_pool_indices_cache[pool_id] = buf
+                self._host_pool_indices[pool_id] = pool_indices
             self._vswa_active_pool_id = primary_pool_id
 
-        # number of tokens in the last cache block used by each sequence
-        paged_kv_last_page_len = kv_lens - (num_blocks - 1) * self.page_size
+        # number of tokens in the last cache block used by each sequence,
+        # derived on the host so no GPU arithmetic or sync is needed.
+        paged_kv_last_page_len = _to_int32_tensor(kv_lens_host -
+                                                  (num_blocks - 1) *
+                                                  self.page_size)
         self._paged_kv_last_page_len[:paged_kv_last_page_len.size(0)].copy_(
             paged_kv_last_page_len, non_blocking=True)
 
         # Ragged page table, see https://docs.flashinfer.ai/tutorials/kv_layout.html#page-table-layout
         # For decoding, this MUST be allocated ahead of time (for CUDA graphs).
         # Prefill is prepared here as well just for the sake of consistency.
-        paged_kv_indptr_decode = torch.cumsum(
-            torch.Tensor([0] + self.num_blocks[self.num_contexts:]).int(),
-            dtype=torch.int32,
-            dim=0,
-        )
+        paged_kv_indptr_decode = _to_int32_tensor(
+            np.concatenate([[0], np.cumsum(num_blocks[self.num_contexts:])]))
         self.paged_kv_indptr_decode[:paged_kv_indptr_decode.size(0)].copy_(
             paged_kv_indptr_decode, non_blocking=True)
+        # Retain the host copy: decode plans hand it to flashinfer so that
+        # its indptr.cpu()/get_seq_lens calls do no D2H work.
+        self._host_paged_kv_indptr_decode = paged_kv_indptr_decode
 
-        paged_kv_indptr_prefill = torch.cumsum(
-            torch.tensor([0] + self.num_blocks[:self.num_contexts],
-                         dtype=torch.int32),
-            dtype=torch.int32,
-            dim=0,
-        )
+        paged_kv_indptr_prefill = _to_int32_tensor(
+            np.concatenate([[0], np.cumsum(num_blocks[:self.num_contexts])]))
         self.paged_kv_indptr_prefill[:paged_kv_indptr_prefill.size(0)].copy_(
             paged_kv_indptr_prefill, non_blocking=True)
 
@@ -817,11 +1223,13 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                                                                 .size(0)]
         else:
             assert not self.is_cuda_graph, "Cannot mix decode/prefill with CUDA graphs"
-            self.paged_kv_indptr = torch.cumsum(
-                torch.tensor([0] + self.num_blocks, dtype=torch.int32),
-                dtype=torch.int32,
-                dim=0,
-            ).cuda()
+            # Accumulate on the host and stage through pinned memory: .cuda()
+            # on an unpinned tensor is a synchronous H2D that stalls the
+            # executor thread behind in-flight kernels on every mixed step.
+            self.paged_kv_indptr = _to_int32_tensor(
+                np.concatenate([[0],
+                                np.cumsum(num_blocks)])).to(device='cuda',
+                                                            non_blocking=True)
 
         # For cross attention, num_tokens is 0 during decode, and we don't need to update kv cache.
         if self.num_tokens > 0:
@@ -837,9 +1245,6 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             self._positions[:positions.size(0)].copy_(positions,
                                                       non_blocking=True)
 
-        # Generally, plan_params with non-trivial attention_mask_data are relevant only the
-        # corresponding forward pass. So, flush them out here as they won't be relevant for
-        # subsequent forward calls.
         # Multi-wrapper case (Gemma4 hybrid: different head_dim per layer)
         # shares one workspace_buffer; eager plan() would overwrite earlier
         # wrappers' workspace, so defer plan() to forward_impl. Single-wrapper
@@ -850,13 +1255,7 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             if pp.attention_mask_data is None
         ]
         defer_plan = len(active_wrappers) > 1
-        for plan_params in list(self._plan_params_to_wrappers.keys()):
-            if plan_params.attention_mask_data is None:
-                self._plan_params_to_wrappers[plan_params].is_planned = False
-                if not defer_plan:
-                    self._plan_with_params(plan_params)
-            else:
-                del self._plan_params_to_wrappers[plan_params]
+        self._clean_cached_plans(defer_plan=defer_plan)
 
         # Re-plan MLA wrappers outside of forward/capture using the params
         # cached by prior warmup forwards. Forward still handles first-use or
@@ -903,6 +1302,8 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             src = self._vswa_pool_indices_cache[primary_pool_id][:total_blocks]
             self._paged_kv_indices[:total_blocks].copy_(src, non_blocking=True)
             self._vswa_active_pool_id = primary_pool_id
+            self._host_paged_kv_indices = \
+                self._host_pool_indices[primary_pool_id]
 
         # CUDA graph + trtllm-gen: update _block_tables and _kv_lens_buffer
         # so the trtllm-gen decode kernel uses current page indices.
@@ -914,34 +1315,51 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             for plan_params, wrappers in self._plan_params_to_wrappers.items():
                 if plan_params.attention_mask_data is not None:
                     continue
-                dw = wrappers.decode_wrapper
-                bt = getattr(dw, '_block_tables', None)
-                if bt is None:
+                decode_wrapper = wrappers.decode_wrapper
+                block_tables = getattr(decode_wrapper, '_block_tables', None)
+                if block_tables is None:
                     continue
                 pool_id = (head_dim_to_pool.get(plan_params.head_dim)
                            if head_dim_to_pool else None)
                 if pool_id is None:
                     continue
                 pool_buf = self._vswa_pool_indices_cache[pool_id]
-                bs, max_blk = bt.shape
-                new_bt = torch.zeros_like(bt)
-                offset = self.num_context_blocks
-                flat_offset = 0
-                for i in range(min(bs, self.num_generations)):
-                    n = decode_blocks[i]
-                    ncopy = min(n, max_blk)
-                    new_bt[i, :ncopy] = pool_buf[offset + flat_offset:offset +
-                                                 flat_offset + ncopy]
-                    flat_offset += n
-                bt.copy_(new_bt)
-                kv_lens_buf = getattr(dw, '_kv_lens_buffer', None)
+                batch_size, table_width = block_tables.shape
+                rows = min(batch_size, self.num_generations)
+                # Vectorized equivalent of a per-request copy loop: row i
+                # gets pool_buf[offset + row_starts[i] :] for its first
+                # min(num_blocks_per_row[i], table_width) columns, zero-
+                # padded — one gather + where instead of ~batch slice
+                # copies per pool per step.
+                num_blocks_per_row = torch.tensor(
+                    decode_blocks[:rows],
+                    dtype=torch.int64).to(device=block_tables.device,
+                                          non_blocking=True)
+                row_starts = torch.cumsum(num_blocks_per_row,
+                                          dim=0) - num_blocks_per_row
+                columns = torch.arange(table_width,
+                                       dtype=torch.int64,
+                                       device=block_tables.device)
+                mask = columns.unsqueeze(0) < num_blocks_per_row.clamp(
+                    max=table_width).unsqueeze(1)
+                source_indices = (self.num_context_blocks +
+                                  row_starts.unsqueeze(1) +
+                                  columns.unsqueeze(0)).clamp(
+                                      max=pool_buf.numel() - 1)
+                new_block_tables = torch.zeros_like(block_tables)
+                new_block_tables[:rows] = torch.where(
+                    mask, pool_buf[source_indices.reshape(-1)].view(
+                        rows, table_width), new_block_tables[:rows])
+                block_tables.copy_(new_block_tables)
+                kv_lens_buf = getattr(decode_wrapper, '_kv_lens_buffer', None)
                 if kv_lens_buf is not None:
-                    decode_kv_lens = kv_lens[self.num_contexts:]
-                    kv_lens_buf[:self.num_generations].copy_(
-                        decode_kv_lens[:self.num_generations],
-                        non_blocking=True)
-                    if self.num_generations < bs:
-                        kv_lens_buf[self.num_generations:bs].zero_()
+                    decode_kv_lens = _to_int32_tensor(
+                        kv_lens_host[self.num_contexts:self.num_contexts +
+                                     self.num_generations])
+                    kv_lens_buf[:self.num_generations].copy_(decode_kv_lens,
+                                                             non_blocking=True)
+                    if self.num_generations < batch_size:
+                        kv_lens_buf[self.num_generations:batch_size].zero_()
         if self.cross is not None and self.cross is not self:
             self.cross.prepare()
 
@@ -971,13 +1389,21 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             window_left=attention_window_size
             if attention_window_size is not None else -1,
             attention_mask_type=AttentionMaskType(attention_mask_type),
-            attention_mask_data=attention_mask_data)
+            attention_mask_data=attention_mask_data,
+            multi_item_params=self._multi_item_params,
+        )
         return self._plan_with_params(plan_params, flashinfer_backend)
 
     def _use_tensor_cores(self, plan_params: PlanParams):
         return plan_params.kv_dtype in [
             torch.float8_e4m3fn, torch.float8_e5m2
         ] or (plan_params.num_heads // plan_params.num_kv_heads >= 4)
+
+    @staticmethod
+    @functools.wraps(flashinfer.BatchPrefillWithPagedKVCacheWrapper)
+    def _page_size_one_prefill_wrapper_builder(*args, **kwargs):
+        return _PageSizeOnePrefillWrapper(
+            flashinfer.BatchPrefillWithPagedKVCacheWrapper(*args, **kwargs))
 
     def _plan_with_params(self,
                           plan_params: PlanParams,
@@ -992,45 +1418,81 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             )
 
         if self.kv_cache_manager is None:
-            if self.is_cuda_graph:
-                raise NotImplementedError(
-                    "FlashInfer without a KV cache manager does not support "
-                    "CUDA graph capture; use the TRTLLM attention backend.")
+            if plan_params.multi_item_params is None:
+                ragged_builder = flashinfer.BatchPrefillWithRaggedKVCacheWrapper
+                # NB: cuDNN chosen in https://github.com/NVIDIA/TensorRT-LLM/pull/12911
+                ragged_flashinfer_backend = "cudnn" if not _FORCE_RAGGED_FA2 else "fa2"
+            else:
+                if self.is_cuda_graph:
+                    raise NotImplementedError(
+                        "FlashInfer multi-item masking without a KV cache manager "
+                        "does not support CUDA graph capture.")
+                ragged_flashinfer_backend = flashinfer_backend
+                # BatchPrefillWithRaggedKVCacheWrapper silently ignores multi-item scoring arguments,
+                # using flashinfer.BatchPrefillWithPagedKVCacheWrapper with page_size=1 instead.
+                # NB: https://github.com/sgl-project/sglang/pull/10979 also uses the paged-KV kernels.
+                ragged_builder = self._page_size_one_prefill_wrapper_builder
             if plan_params in self._plan_params_to_wrappers:
                 ragged_prefill_wrapper = self._plan_params_to_wrappers[
                     plan_params].ragged_prefill_wrapper
+                assert ragged_prefill_wrapper is not None
+                assert ragged_prefill_wrapper._backend == ragged_flashinfer_backend
             else:
-                ragged_prefill_wrapper = (
-                    flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
-                        self.workspace_buffer,
-                        self.kv_layout,
-                        backend="cudnn",
-                    ))
-            torch.cuda.current_stream().synchronize()
+                wrapper_kwargs: Dict[str, Any] = {}
+                if plan_params.multi_item_params is None:
+                    qo_indptr_buf = self._ragged_qo_indptr_buf[:self.
+                                                               num_contexts + 1]
+                    kv_indptr_buf = self._ragged_kv_indptr_buf[:self.
+                                                               num_contexts + 1]
+                    wrapper_kwargs = dict(
+                        use_cuda_graph=self.is_cuda_graph,
+                        qo_indptr_buf=qo_indptr_buf,
+                        kv_indptr_buf=kv_indptr_buf,
+                    )
+                ragged_prefill_wrapper = ragged_builder(
+                    self.workspace_buffer,
+                    "NHD",  # ragged KVs use always NHD
+                    backend=ragged_flashinfer_backend,
+                    **wrapper_kwargs,
+                )
             if self.num_contexts <= 0:
                 raise ValueError(
                     "FlashInfer ragged prefill without KV cache requires "
                     "num_contexts >= 1.")
-            self._plan_ragged_cudnn_no_kv(plan_params, ragged_prefill_wrapper)
+            self._plan_ragged_no_kv(
+                plan_params,
+                ragged_prefill_wrapper,
+                flashinfer_backend=ragged_flashinfer_backend)
             self._plan_params_to_wrappers[plan_params] = FlashInferWrappers(
                 is_planned=True,
                 ragged_prefill_wrapper=ragged_prefill_wrapper,
             )
             return plan_params
 
-        if plan_params in self._plan_params_to_wrappers:
-            prefill_wrapper = self._plan_params_to_wrappers[
-                plan_params].prefill_wrapper
-        else:
-            prefill_wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
-                self.workspace_buffer,
-                self.kv_layout,
-                backend=flashinfer_backend,
-                qo_indptr_buf=self.qo_indptr,
-                paged_kv_indptr_buf=self.paged_kv_indptr_prefill,
-                paged_kv_indices_buf=self._paged_kv_indices,
-                paged_kv_last_page_len_buf=self._paged_kv_last_page_len,
-                use_cuda_graph=self.is_cuda_graph)
+        if plan_params.multi_item_params is not None:
+            raise ValueError(
+                "Multi-item masking not implemented for paged KV cache.")
+
+        # One FlashInferWrappers per plan_params, mutated in place across
+        # replans: it carries the persistent decode block tables, whose
+        # device buffer address must survive replans for CUDA graphs.
+        wrappers = self._plan_params_to_wrappers.get(plan_params)
+        if wrappers is None:
+            wrappers = FlashInferWrappers(is_planned=False)
+            self._plan_params_to_wrappers[plan_params] = wrappers
+
+        if wrappers.prefill_wrapper is None:
+            wrappers.prefill_wrapper = \
+                flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+                    self.workspace_buffer,
+                    self.kv_layout,
+                    backend=flashinfer_backend,
+                    qo_indptr_buf=self.qo_indptr,
+                    paged_kv_indptr_buf=self.paged_kv_indptr_prefill,
+                    paged_kv_indices_buf=self._paged_kv_indices,
+                    paged_kv_last_page_len_buf=self._paged_kv_last_page_len,
+                    use_cuda_graph=self.is_cuda_graph)
+        prefill_wrapper = wrappers.prefill_wrapper
 
         is_causal = plan_params.attention_mask_type == AttentionMaskType.causal
 
@@ -1065,36 +1527,42 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                 custom_mask=plan_params.attention_mask_data,
             )
 
-        if plan_params in self._plan_params_to_wrappers:
-            decode_wrapper = self._plan_params_to_wrappers[
-                plan_params].decode_wrapper
-        else:
+        if wrappers.decode_wrapper is None:
             use_tensor_cores = self._use_tensor_cores(plan_params)
 
-            decode_wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
-                self.workspace_buffer,
-                self.kv_layout,
-                use_cuda_graph=self.is_cuda_graph,
-                paged_kv_indptr_buffer=self.paged_kv_indptr_decode,
-                paged_kv_indices_buffer=self._paged_kv_indices,
-                paged_kv_last_page_len_buffer=self._paged_kv_last_page_len,
-                use_tensor_cores=use_tensor_cores
-                or flashinfer_backend == "trtllm-gen",
-                backend=flashinfer_backend if flashinfer_backend != "fa2" else
-                ("fa2" if torch.cuda.get_device_capability(0) == (
-                    9, 0) else "auto"),
-            )
+            wrappers.decode_wrapper = \
+                flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+                    self.workspace_buffer,
+                    self.kv_layout,
+                    use_cuda_graph=self.is_cuda_graph,
+                    paged_kv_indptr_buffer=self.paged_kv_indptr_decode,
+                    paged_kv_indices_buffer=self._paged_kv_indices,
+                    paged_kv_last_page_len_buffer=self._paged_kv_last_page_len,
+                    use_tensor_cores=use_tensor_cores
+                    or flashinfer_backend == "trtllm-gen",
+                    backend=flashinfer_backend
+                    if flashinfer_backend != "fa2" else
+                    ("fa2" if torch.cuda.get_device_capability(0) == (
+                        9, 0) else "auto"),
+                )
+        decode_wrapper = wrappers.decode_wrapper
 
         def decode_plan():
-            paged_kv_indptr = torch.cumsum(
-                torch.Tensor([0] +
-                             self.num_blocks[self.num_contexts:]).int().cuda(),
-                dtype=torch.int32,
-                dim=0,
-            )
             assert decode_wrapper is not None
+            # Host int32 indptr (retained by prepare, which always runs
+            # before plans): flashinfer moves it to the device itself, and
+            # its indptr.cpu()/get_seq_lens calls stay free of D2H syncs.
+            paged_kv_indptr = self._host_paged_kv_indptr_decode
+            assert paged_kv_indptr is not None
+            # Persistent, host-built block table: skips flashinfer's
+            # per-request rebuild loop, whose GPU-scalar slice bounds cost
+            # one sync + one scalar D2H per generation request per plan.
+            block_tables = None
+            if decode_wrapper._backend == 'trtllm-gen':
+                block_tables = self._build_decode_block_tables(
+                    plan_params, wrappers)
             decode_wrapper.plan(
-                paged_kv_indptr,
+                paged_kv_indptr[:self.num_generations + 1],
                 self.paged_kv_indices[self.num_context_blocks:],
                 self.paged_kv_last_page_len[self.num_contexts:],
                 plan_params.num_heads,
@@ -1106,6 +1574,7 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                 q_data_type=plan_params.q_dtype,
                 kv_data_type=plan_params.kv_dtype,
                 o_data_type=o_dtype,
+                block_tables=block_tables,
             )
 
         # Must sync after append_paged_kv_cache and before plan.
@@ -1117,11 +1586,7 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         if self.num_generations > 0:
             decode_plan()
 
-        self._plan_params_to_wrappers[plan_params] = FlashInferWrappers(
-            prefill_wrapper=prefill_wrapper,
-            decode_wrapper=decode_wrapper,
-            is_planned=True,
-        )
+        wrappers.is_planned = True
 
         return plan_params
 
@@ -1132,6 +1597,11 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
 
     @classmethod
     def support_mla(cls) -> bool:
+        return True
+
+    @override
+    @classmethod
+    def support_multi_item_scoring(cls) -> bool:
         return True
 
     def __init__(
@@ -1166,33 +1636,6 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
         if self.quant_config:
             self.has_fp8_kv_cache = self.quant_config.layer_quant_mode.has_fp8_kv_cache(
             )
-
-    def mla_rope_generation(
-        self,
-        fused_q: torch.Tensor,
-        q_pe: torch.Tensor,
-        latent_cache: torch.Tensor,
-        metadata,
-        cu_q_seqlens: torch.Tensor,
-        cu_kv_seqlens: torch.Tensor,
-        fmha_scheduler_counter: torch.Tensor,
-        mla_bmm1_scale,
-        mla_bmm2_scale,
-        quant_q_buffer,
-        out_scale=None,
-    ) -> None:
-        """Stub for MLA generation rope step used when FlashInfer is the mqa backend.
-
-        FlashInferAttention does not fuse RoPE (support_fused_rope returns False),
-        so RoPE is applied externally in MLA.forward_impl before this point.
-        q_pe already has RoPE applied; we just copy it into the rope slot of
-        fused_q so that forward_absorption_generation can pass fused_q directly
-        to _mla_forward_generation.  The latent_cache KV-cache append is handled
-        inside _mla_forward_generation when forward() is called.
-        """
-        # fused_q shape: [num_tokens, num_heads, kv_lora_rank + qk_rope_head_dim]
-        # q_pe shape:    [num_tokens, num_heads, qk_rope_head_dim]
-        fused_q[..., self.kv_lora_rank:] = q_pe
 
     def _get_mla_caches(
         self,
@@ -1491,27 +1934,40 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
                 raise NotImplementedError(
                     "FP8 KV cache is not supported for FlashInfer without a "
                     "KV cache manager.")
+            # NB: BatchPrefillWithRaggedKVCacheWrapper initialization assumes NHD layout
+            assert q.shape[1:] == (self.num_heads, self.head_dim)
+            assert k.shape == (q.size(0), self.num_kv_heads * self.head_dim)
+            assert v.shape == (q.size(0), self.num_kv_heads * self.head_dim)
             k = k.view(-1, self.num_kv_heads, self.head_dim)
             v = v.view(-1, self.num_kv_heads, self.head_dim)
-            plan_params = metadata.plan(
-                self.num_heads,
-                self.num_kv_heads,
-                self.head_dim,
-                q_dtype=q.dtype,
-                kv_dtype=k.dtype,
-                q_scaling=self.q_scaling,
-                attention_window_size=attention_window_size,
-                attention_mask_type=attention_mask_type,
-                attention_mask_data=attention_mask_data,
-            )
+            with nvtx_range("metadata.plan"):
+                plan_params = metadata.plan(
+                    self.num_heads,
+                    self.num_kv_heads,
+                    self.head_dim,
+                    q_dtype=q.dtype,
+                    kv_dtype=k.dtype,
+                    q_scaling=self.q_scaling,
+                    attention_window_size=attention_window_size,
+                    attention_mask_type=attention_mask_type,
+                    attention_mask_data=attention_mask_data,
+                )
             wrapper = metadata.get_ragged_prefill_wrapper(plan_params)
-            # cuDNN's ragged prefill kernel assumes contiguous NHD tensors.
-            wrapper.run(
-                q.contiguous(),
-                k.contiguous(),
-                v.contiguous(),
-                out=output.view(-1, self.num_heads, self.head_dim),
-            )
+            if isinstance(wrapper,
+                          flashinfer.BatchPrefillWithPagedKVCacheWrapper):
+                wrapper.run(
+                    q,
+                    (k.unsqueeze(1), v.unsqueeze(1)),
+                    out=output.view(-1, self.num_heads, self.head_dim),
+                )
+            else:
+                # cuDNN's ragged prefill kernel assumes contiguous NHD tensors.
+                wrapper.run(
+                    q.contiguous(),
+                    k.contiguous(),
+                    v.contiguous(),
+                    out=output.view(-1, self.num_heads, self.head_dim),
+                )
             return
 
         # Key and Value
@@ -1535,7 +1991,7 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
                 f"KV cache dtype {kv_cache.dtype} does not match k/v dtype {k.dtype}/{v.dtype}"
             )
 
-            flashinfer.page.append_paged_kv_cache(
+            _append_paged_kv_cache(
                 append_key=k,
                 append_value=v,
                 batch_indices=metadata.batch_indices,
@@ -1630,6 +2086,8 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
             effective_mask_data = attention_mask_data
             if (self.flashinfer_backend == "trtllm-gen"
                     and attention_mask_data is not None):
+                logger.warning_once("Falling back to causal attention",
+                                    key="trtllm_gen_unsupported_custom_mask")
                 effective_mask_type = int(AttentionMaskType.causal)
                 effective_mask_data = None
 
@@ -1688,11 +2146,16 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
                 # MLA generation: output has kv_lora_rank per head
                 output = q.new_empty(
                     [q.shape[0], self.num_heads * self.kv_lora_rank])
+            elif q.dtype == torch.float8_e4m3fn:
+                # Q may arrive pre-quantized to FP8 (fused model-side QKV
+                # prep); the trtllm-gen FP8 cubins emit BF16
+                # (QkvE4m3OBfloat16), so the output must not follow q's dtype.
+                output = q.new_empty(q.shape, dtype=torch.bfloat16)
             else:
                 output = torch.empty_like(q)
 
-        # FlashInfer's sliding window attention is inclusive, while the attention window size defined in TRTLLM is exclusive.
-        # So we need to subtract 1 from the attention window size for a consistent behavior.
+        # FlashInfer's sliding window attention is inclusive, while the attention window size defined
+        # in TRTLLM is exclusive. Subtract 1 from the attention window size for consistent behavior.
         attention_window_size = forward_args.attention_window_size
         if attention_window_size is not None:
             attention_window_size = attention_window_size - 1
@@ -1707,5 +2170,6 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
             attention_window_size=attention_window_size,
             output=output,
             latent_cache=latent_cache,
-            attention_input_type=forward_args.attention_input_type)
+            attention_input_type=forward_args.attention_input_type,
+        )
         return output

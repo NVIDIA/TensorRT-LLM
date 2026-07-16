@@ -149,7 +149,12 @@ def get_device_count() -> int:
     return torch.cuda.device_count() if torch.cuda.is_available() else 0
 
 
-def get_total_gpu_memory(device: int) -> float:
+def get_total_gpu_memory(device: int) -> int:
+    # Compat for no GPU environment, only for device=0.
+    # Otherwise, the caller should ensure there are that many GPUs.
+    if device == 0 and get_device_count() == 0:
+        return 0
+
     return torch.cuda.get_device_properties(device).total_memory
 
 
@@ -542,6 +547,9 @@ def get_numa_aware_cpu_affinity(device_id):
 
     Args:
         device_id: The CUDA device ID to query for optimal CPU affinity.
+                   This is the logical CUDA device index (after
+                   CUDA_VISIBLE_DEVICES remapping). The function will
+                   resolve it to the physical NVML device index.
 
     Returns:
         List of CPU IDs representing the optimal CPU affinity mask for the device.
@@ -563,6 +571,35 @@ def get_numa_aware_cpu_affinity(device_id):
         import pynvml
         pynvml.nvmlInit()
 
+        # Resolve the physical NVML device index from the logical CUDA
+        # device_id.  NVML always enumerates *all* GPUs on the system
+        # regardless of CUDA_VISIBLE_DEVICES, so when the user restricts
+        # visibility (e.g. CUDA_VISIBLE_DEVICES=3,4), logical device 0
+        # actually corresponds to physical GPU 3.
+        cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+        if cuda_visible is not None and cuda_visible.strip():
+            visible_tokens = [
+                x.strip() for x in cuda_visible.split(",") if x.strip()
+            ]
+            if 0 <= device_id < len(visible_tokens):
+                token = visible_tokens[device_id]
+                if token.isdigit():
+                    nvml_device_id = int(token)
+                else:
+                    logger.warning(
+                        f"CUDA_VISIBLE_DEVICES token '{token}' is non-numeric; "
+                        f"falling back to device_id ({device_id}) as NVML index."
+                    )
+                    nvml_device_id = device_id
+            else:
+                logger.warning(
+                    f"device_id {device_id} exceeds CUDA_VISIBLE_DEVICES "
+                    f"list length ({len(visible_tokens)}), falling back to "
+                    f"device_id as NVML index.")
+                nvml_device_id = device_id
+        else:
+            nvml_device_id = device_id
+
         # Get the number of bits per ulong
         c_ulong_bits = ctypes.sizeof(ctypes.c_ulong) * 8
 
@@ -571,7 +608,7 @@ def get_numa_aware_cpu_affinity(device_id):
 
         # Get the optimal CPU affinity for this device according to the NUMA
         # topology
-        handle = pynvml.nvmlDeviceGetHandleByIndex(device_id)
+        handle = pynvml.nvmlDeviceGetHandleByIndex(nvml_device_id)
         affinity_masks = pynvml.nvmlDeviceGetCpuAffinity(handle, cpu_set_size)
 
         # Convert CPU masks to python list
@@ -588,6 +625,56 @@ def get_numa_aware_cpu_affinity(device_id):
             pass  # Ignore shutdown errors
 
     return cpu_affinity
+
+
+def configure_cpu_affinity(device_id: int) -> None:
+    """Probe and configure the CPU affinity of the calling process based on NUMA topology.
+
+    Args:
+        device_id: The CUDA device ID to determine optimal CPU affinity.
+
+    Note:
+        If the process already has constrained affinity, a warning is logged.
+        Configuration is handled as follows:
+            TLLM_NUMA_AWARE_WORKER_AFFINITY = <unset>
+                -> Affinity is automatically configured if it is unconstrained,
+                   and deleted if it is constrained externally by the user.
+            TLLM_NUMA_AWARE_WORKER_AFFINITY = 1
+                -> Affinity is unconditionally auto-configured.
+            TLLM_NUMA_AWARE_WORKER_AFFINITY = 0 or any other value
+                -> Affinity is unconditionally _not_ auto-configured.
+    """
+    pid = os.getpid()
+    process = psutil.Process(pid)
+    cpu_affinity = process.cpu_affinity()
+
+    all_cpus = list(range(psutil.cpu_count()))
+
+    constrained_affinity = (cpu_affinity != all_cpus)
+    numa_aware_affinity = os.environ.get("TLLM_NUMA_AWARE_WORKER_AFFINITY")
+
+    # If affinity is constrained but the user hasn't explicitly
+    # requested NUMA-aware affinity, remove the constraints.
+    if constrained_affinity:
+        logger.warning(
+            f"Worker process {pid} is affined to run on the following CPUs: "
+            f"{cpu_affinity} (subset of all logical CPUs). This may harm "
+            f"performance if set incorrectly.")
+        if numa_aware_affinity is None:
+            logger.warning(f"Worker process {pid} has constrained CPU affinity "
+                           f"but `TLLM_NUMA_AWARE_WORKER_AFFINITY` is not set. "
+                           f"Removing CPU affinity constraints.")
+            process.cpu_affinity(all_cpus)
+
+    # If affinity is unconstrained and the user hasn't explicitly
+    # prohibited it or the user has explicitly requested it, choose the
+    # optimal affinity based upon the NUMA topology
+    if ((numa_aware_affinity is None and not constrained_affinity)
+            or (numa_aware_affinity == "1")):
+        process.cpu_affinity(get_numa_aware_cpu_affinity(device_id))
+        logger.info(
+            f"Worker process {pid} CPU affinity set to "
+            f"{process.cpu_affinity()} for optimal NUMA-aware scheduling.")
 
 
 def generate_api_docs_as_docstring(model: Type[BaseModel],

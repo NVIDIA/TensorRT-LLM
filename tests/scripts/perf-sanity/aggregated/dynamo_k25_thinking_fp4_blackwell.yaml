@@ -29,9 +29,9 @@ server_configs:
       backend: UCX
       max_tokens_in_buffer: 8448
     client_configs:
-      - name: "con128_iter10_2k1k"
+      - name: "con128_iter5_2k1k"
         concurrency: 128
-        iterations: 10
+        iterations: 5
         isl: 2048
         osl: 1024
         backend: "openai"

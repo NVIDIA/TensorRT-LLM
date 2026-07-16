@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2019-2026, NVIDIA CORPORATION.  All rights reserved.
  * Copyright (c) 2021, NAVER Corp.  Authored by CLOVA.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -27,6 +27,13 @@ TRTLLM_NAMESPACE_BEGIN
 
 namespace kernels
 {
+// Number of blocks-per-row used by the multi-block split + merge dispatch path of
+// invokeIndexerTopKDecode. Returns 1 when the single-block path is preferred.
+// Callers that allocate aux buffers must use this same helper to size them, and
+// must pass the same splitWorkThreshold they will pass to invokeIndexerTopKDecode
+// (a value <= 0 selects the internal default).
+int computeIndexerTopKDecodeBlocksPerRow(int numRows, int numColumns, int splitWorkThreshold = 0);
+
 /// fp32 indexer TopK decode — L2-aware BS-threshold dispatcher with four
 /// fallback tiers:
 ///   - GVR Heuristic    (preIdx provided, kSeqSmall ≤ N < splitWork, BS < kBsLarge, K ∈ {512,1024,2048})
@@ -36,7 +43,8 @@ namespace kernels
 void invokeIndexerTopKDecode(float const* logits, int const* seqLens, int* indices, float* outLogitsAux,
     int* outIndicesAux, int const splitWorkThreshold, int const numRows, int const numColumns, int const stride0,
     int const stride1, int const next_n, int const topK = 2048, int const* preIdx = nullptr, int const preIdxStride = 0,
-    int const preIdxCount = 0, float* heuristicScratch = nullptr, cudaStream_t const stream = 0);
+    int const preIdxCount = 0, float* heuristicScratch = nullptr, int const compressRatio = 1,
+    cudaStream_t const stream = 0);
 
 /// bf16 indexer TopK decode — same dispatch axes as the fp32 entry, except
 /// kBsL2 uses sizeof(__nv_bfloat16) bytes/elem (L2 footprint is half) and
@@ -50,13 +58,14 @@ void invokeIndexerTopKDecode(float const* logits, int const* seqLens, int* indic
 void invokeIndexerTopKDecode(__nv_bfloat16 const* logits, int const* seqLens, int* indices,
     int const splitWorkThreshold, int const numRows, int const numColumns, int const stride0, int const stride1,
     int const next_n, int const topK = 2048, int const* preIdx = nullptr, int const preIdxStride = 0,
-    int const preIdxCount = 0, __nv_bfloat16* heuristicScratch = nullptr, cudaStream_t const stream = 0);
+    int const preIdxCount = 0, __nv_bfloat16* heuristicScratch = nullptr, int const compressRatio = 1,
+    cudaStream_t const stream = 0);
 
 /// fp16 indexer TopK decode — see bf16 overload for dispatcher contract.
 void invokeIndexerTopKDecode(__half const* logits, int const* seqLens, int* indices, int const splitWorkThreshold,
     int const numRows, int const numColumns, int const stride0, int const stride1, int const next_n,
     int const topK = 2048, int const* preIdx = nullptr, int const preIdxStride = 0, int const preIdxCount = 0,
-    __half* heuristicScratch = nullptr, cudaStream_t const stream = 0);
+    __half* heuristicScratch = nullptr, int const compressRatio = 1, cudaStream_t const stream = 0);
 
 void invokeIndexerTopKPrefill(float const* logits, int const* rowStarts, int const* rowEnds, int* indices,
     int const numRows, int const numColumns, int const stride0, int const stride1, int const topK = 2048,

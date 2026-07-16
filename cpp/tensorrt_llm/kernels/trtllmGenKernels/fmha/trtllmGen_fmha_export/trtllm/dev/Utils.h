@@ -32,7 +32,7 @@ namespace dev {
 
 // __block_size__ is only supported in CUDA 13 and later.
 // We can always emit the macro, and it will simply be ignored in CUDA 12.
-#if defined(__CUDACC_VER_MAJOR__) && __CUDACC_VER_MAJOR__ >= 13
+#if !defined(TLLM_DISABLE_BLOCK_SIZE) && defined(__CUDACC_VER_MAJOR__) && __CUDACC_VER_MAJOR__ >= 13
 #define TLLM_BLOCK_SIZE(bx, by, bz) __block_size__((bx, by, bz))
 #else
 #define TLLM_BLOCK_SIZE(bx, by, bz)
@@ -180,36 +180,34 @@ inline __device__ void cpAsyncPredicated(bool pred,
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template <bool CxIsOne, bool CyIsOne, bool CzIsOne>
-inline __device__ dim3 getBlockIdInCluster() {
+template <bool CxIsOne, bool CyIsOne, bool CzIsOne> inline __device__ dim3 getBlockIdInCluster() {
   dim3 result;
   if constexpr (CxIsOne) {
     result.x = 0u;
   } else {
-    asm volatile("mov.u32 %0, %%cluster_ctaid.x;\n" : "=r"(result.x) : );
+    asm volatile("mov.u32 %0, %%cluster_ctaid.x;\n" : "=r"(result.x) :);
   }
   if constexpr (CyIsOne) {
     result.y = 0u;
   } else {
-    asm volatile("mov.u32 %0, %%cluster_ctaid.y;\n" : "=r"(result.y) : );
+    asm volatile("mov.u32 %0, %%cluster_ctaid.y;\n" : "=r"(result.y) :);
   }
   if constexpr (CzIsOne) {
     result.z = 0u;
   } else {
-    asm volatile("mov.u32 %0, %%cluster_ctaid.z;\n" : "=r"(result.z) : );
+    asm volatile("mov.u32 %0, %%cluster_ctaid.z;\n" : "=r"(result.z) :);
   }
   return result;
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template <bool IsSingleBlock>
-inline __device__ uint32_t getBlockRankInCluster() {
+template <bool IsSingleBlock> inline __device__ uint32_t getBlockRankInCluster() {
   if constexpr (IsSingleBlock) {
     return 0u;
   } else {
     uint32_t rank;
-    asm volatile("mov.u32 %0, %%cluster_ctarank;\n" : "=r"(rank) : );
+    asm volatile("mov.u32 %0, %%cluster_ctarank;\n" : "=r"(rank) :);
     return rank;
   }
 }

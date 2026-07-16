@@ -24,9 +24,16 @@ _VIDEO_ENCODER: Optional["_VideoEncoder"] = None
 
 
 def _check_ffmpeg_available() -> bool:
-    """Return True if ffmpeg CLI is installed; cache its path."""
+    """Return True if ffmpeg CLI is installed; cache its path.
+
+    Only a successful probe is cached. A negative result is re-probed on the
+    next call: ffmpeg may be installed after import (e.g. a test fixture or
+    deployment step running ``apt-get install ffmpeg``), and permanently
+    caching the miss silently downgrades every later video encode in the
+    process to the fallback encoder.
+    """
     global _FFMPEG_PATH
-    if _FFMPEG_PATH is None:
+    if not _FFMPEG_PATH:
         ffmpeg_path = shutil.which("ffmpeg")
         if ffmpeg_path is not None:
             try:
@@ -338,9 +345,15 @@ class _PurePythonEncoder(_VideoEncoder):
 
 
 def _get_video_encoder() -> _VideoEncoder:
-    """Return the best available video encoder (cached singleton)."""
+    """Return the best available video encoder (cached singleton).
+
+    The pure-Python fallback is not cached permanently: if ffmpeg becomes
+    available later in the process lifetime, upgrade to the ffmpeg encoder.
+    """
     global _VIDEO_ENCODER
-    if _VIDEO_ENCODER is None:
+    if _VIDEO_ENCODER is None or (
+        isinstance(_VIDEO_ENCODER, _PurePythonEncoder) and _check_ffmpeg_available()
+    ):
         _VIDEO_ENCODER = _FfmpegCliEncoder() if _check_ffmpeg_available() else _PurePythonEncoder()
         logger.info(f"Using {_VIDEO_ENCODER.__class__.__name__} for video encoding")
     return _VIDEO_ENCODER
@@ -472,8 +485,10 @@ def save_image(
     """Encode and save an image tensor to disk.
 
     Args:
-        image: Image as ``torch.Tensor`` ``(H, W, C)`` or ``(B, H, W, C)``,
-            dtype ``uint8``. If batched, the first image is saved.
+        image: Image as ``torch.Tensor`` ``(H, W, C)`` or ``(B, H, W, C)``
+            with ``B == 1``, dtype ``uint8``. Batched inputs with
+            ``B > 1`` are rejected — pass a single tensor or use
+            :func:`save_images` with one path per batch item.
         output_path: Output file path (``str`` or :class:`pathlib.Path`).
         format: Image format (``'png'``/``'jpg'``/``'webp'``). If ``None``,
             inferred from the path extension; defaults to PNG when unknown.
@@ -481,11 +496,20 @@ def save_image(
 
     Returns:
         Path string where the image was actually saved.
+
+    Raises:
+        ValueError: When ``image`` is a 4-D tensor with ``B > 1``.
     """
     if isinstance(output_path, Path):
         output_path = str(output_path)
 
     if hasattr(image, "dim") and image.dim() == 4:
+        if image.shape[0] > 1:
+            raise ValueError(
+                f"save_image received a batched tensor of size {image.shape[0]}; "
+                "pass a single (H, W, C) tensor, or use save_images(images, paths) "
+                "with one path per batch item."
+            )
         image = image[0]
     output_dir = os.path.dirname(output_path)
     if output_dir:
@@ -530,8 +554,10 @@ def save_video(
     """Encode and save a video tensor (with optional audio) to disk.
 
     Args:
-        video: Video as ``torch.Tensor`` ``(T, H, W, C)`` or ``(B, T, H, W, C)``,
-            dtype ``uint8``. If batched, the first video is saved.
+        video: Video as ``torch.Tensor`` ``(T, H, W, C)`` or ``(B, T, H, W, C)``
+            with ``B == 1``, dtype ``uint8``. Batched inputs with
+            ``B > 1`` are rejected — pass a single tensor or use
+            :func:`save_videos` with one path per batch item.
         output_path: Output file path (``str`` or :class:`pathlib.Path`).
         audio: Optional audio tensor; ignored by the pure-Python AVI fallback.
         frame_rate: Frames per second.
@@ -542,10 +568,19 @@ def save_video(
 
     Returns:
         Path string where the video was actually saved.
+
+    Raises:
+        ValueError: When ``video`` is a 5-D tensor with ``B > 1``.
     """
     if isinstance(output_path, Path):
         output_path = str(output_path)
     if hasattr(video, "dim") and video.dim() == 5:
+        if video.shape[0] > 1:
+            raise ValueError(
+                f"save_video received a batched tensor of size {video.shape[0]}; "
+                "pass a single (T, H, W, C) tensor, or use save_videos(videos, paths) "
+                "with one path per batch item."
+            )
         video = video[0]
 
     output_dir = os.path.dirname(output_path)

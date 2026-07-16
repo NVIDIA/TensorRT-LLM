@@ -18,28 +18,32 @@ import pathlib as _pl
 from contextlib import contextmanager, nullcontext
 from copy import deepcopy
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Any, Callable, Generator, cast
 
 import pytest
 import torch
-from test_beam_search_util import (BeamSearchTestOutput, DummyConfigLoader,
-                                   DummyWeightLoader, get_expected_outputs)
+from test_beam_search_util import (BeamSearchTestOutput, DummyConfig,
+                                   DummyConfigLoader, DummyWeightLoader,
+                                   get_expected_outputs)
 from utils.llm_data import llm_models_root
 from utils.util import assert_no_cuda_sync, force_ampere, run_test_with_warmup
 
-from tensorrt_llm import LLM, SamplingParams, TorchLlmArgs
+from tensorrt_llm import LLM, DisaggregatedParams, SamplingParams, TorchLlmArgs
 from tensorrt_llm._torch.models.checkpoints import HfCheckpointLoader
 from tensorrt_llm._torch.pyexecutor.llm_request import (LlmRequest,
                                                         SamplingConfig)
 from tensorrt_llm._torch.pyexecutor.sampler import (BeamHistory,
                                                     SampleStateTorch,
                                                     TorchSampler)
-from tensorrt_llm._torch.pyexecutor.sampling_utils import (
+from tensorrt_llm._torch.pyexecutor.sampler.sampling_utils import (
     BEAM_SEARCH_PAD_TOKEN, BeamSearchMetadata, beam_search_sampling_batch)
 from tensorrt_llm.bindings.executor import FinishReason
 from tensorrt_llm.executor import RequestError
-from tensorrt_llm.executor.result import CompletionOutput, GenerationResult
-from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig
+from tensorrt_llm.executor.result import (CompletionOutput, GenerationResult,
+                                          Logprob)
+from tensorrt_llm.llmapi import (CacheTransceiverConfig, CudaGraphConfig,
+                                 KvCacheConfig)
 
 
 @pytest.fixture(scope="module")
@@ -52,9 +56,7 @@ def fixed_params():
     return {"max_tokens": 8, "max_beam_width": 2}
 
 
-@pytest.fixture(scope="module",
-                params=[("TRTLLMSampler", False), ("TorchSampler", False),
-                        ("TorchSampler", True)])
+@pytest.fixture(scope="module", params=["TRTLLMSampler", "TorchSampler"])
 def sampling_information(request):
     return request.param
 
@@ -70,8 +72,7 @@ def model_kwargs(fixed_params, sampling_information) -> dict[str, Any]:
             weight_loader=DummyWeightLoader(),
             config_loader=DummyConfigLoader(),
         ),
-        sampler_type=sampling_information[0],
-        disable_flashinfer_sampling=sampling_information[1],
+        sampler_type=sampling_information,
     )
 
 
@@ -83,6 +84,13 @@ def with_cuda_graph_and_overlap(request):
 
 
 def _build_llm(fixed_params, input_prompts, llm_kwargs: dict[str, Any]):
+    llm_kwargs = llm_kwargs.copy()
+    kv_cache_config = llm_kwargs.pop(
+        "kv_cache_config",
+        KvCacheConfig(
+            max_tokens=10000,  # pyright: ignore
+        ),
+    )
     if "max_batch_size" not in llm_kwargs:
         llm_kwargs = llm_kwargs | dict(
             max_batch_size=fixed_params["max_beam_width"] * len(
@@ -91,9 +99,7 @@ def _build_llm(fixed_params, input_prompts, llm_kwargs: dict[str, Any]):
         )
     return LLM(
         **llm_kwargs,
-        kv_cache_config=KvCacheConfig(
-            max_tokens=10000,  # pyright: ignore
-        ),
+        kv_cache_config=kv_cache_config,
         max_seq_len=32,
         max_beam_width=fixed_params["max_beam_width"],
     )
@@ -279,6 +285,31 @@ def validate_output(output: GenerationResult, input_prompt: list[int],
                              len(input_prompt), beam_idx)
 
 
+def validate_disagg_output(output: GenerationResult, input_prompt: list[int],
+                           sampling_params: SamplingParams) -> None:
+    """Validate disagg beam output without requiring full-run cache history."""
+    check_context_logits(output, sampling_params)
+    assert len(output.outputs) == sampling_params.n
+    expected_outputs = get_expected_outputs(
+        input_prompt[-1], num_iterations=sampling_params.max_tokens)
+
+    for beam_idx, beam_output in enumerate(output.outputs):
+        assert beam_output.finish_reason == "length"
+        check_generation_logits(beam_output, sampling_params, valid_tokens=None)
+        check_logprobs(beam_output, sampling_params, valid_tokens=None)
+        expected_token_ids = expected_outputs.outputs[beam_idx].tolist()
+        assert beam_output.token_ids == expected_token_ids, (
+            f"expected {expected_token_ids} token ids, "
+            f"got {beam_output.token_ids}")
+
+        assert beam_output.additional_generation_outputs is not None
+        cache_indirection = beam_output.additional_generation_outputs[
+            "cache_indirection"]
+        assert cache_indirection is not None
+        assert cache_indirection.shape[1] == sampling_params.best_of
+        assert cache_indirection.shape[0] == sampling_params.max_tokens - 1
+
+
 def validate_outputs(llm: LLM, input_prompts: list[list[int]],
                      sampling_params: SamplingParams,
                      monkeypatch: pytest.MonkeyPatch,
@@ -344,6 +375,51 @@ def validate_outputs(llm: LLM, input_prompts: list[list[int]],
         validate_output(output, input_prompts[output_idx], sampling_params)
 
 
+def validate_disagg_outputs(ctx_llm: LLM,
+                            gen_llm: LLM,
+                            input_prompts: list[list[int]],
+                            sampling_params: SamplingParams,
+                            request_id_base: int = 0) -> None:
+    """Run context-only then generation-only beam search and validate outputs."""
+
+    ctx_disagg_params = [
+        DisaggregatedParams(request_type="context_only",
+                            disagg_request_id=1000 + request_id_base + idx)
+        for idx in range(len(input_prompts))
+    ]
+    ctx_outputs = ctx_llm.generate(
+        deepcopy(input_prompts),
+        sampling_params=deepcopy(sampling_params),
+        disaggregated_params=ctx_disagg_params,
+        use_tqdm=False,
+    )
+    assert isinstance(ctx_outputs, list)
+    assert len(ctx_outputs) == len(input_prompts)
+
+    gen_disagg_params = []
+    for ctx_output in ctx_outputs:
+        disagg_params = ctx_output.disaggregated_params
+        assert disagg_params is not None
+        assert disagg_params.first_gen_tokens is not None
+        assert disagg_params.first_gen_log_probs is not None
+        assert len(disagg_params.first_gen_tokens) == sampling_params.best_of
+        assert len(disagg_params.first_gen_log_probs) == sampling_params.best_of
+        disagg_params.request_type = "generation_only"
+        gen_disagg_params.append(disagg_params)
+
+    gen_outputs = gen_llm.generate(
+        deepcopy(input_prompts),
+        sampling_params=deepcopy(sampling_params),
+        disaggregated_params=gen_disagg_params,
+        use_tqdm=False,
+    )
+    assert isinstance(gen_outputs, list)
+    assert len(gen_outputs) == len(input_prompts)
+    for output_idx, output in enumerate(gen_outputs):
+        validate_disagg_output(output, input_prompts[output_idx],
+                               sampling_params)
+
+
 ###########################################################################
 # End to end tests
 ###########################################################################
@@ -406,6 +482,133 @@ def test_beam_search_e2e(
         check_no_sync=single_process,
         monkeypatch=monkeypatch,
     )
+
+
+@pytest.mark.threadleak(enabled=False)
+def test_beam_search_disagg_e2e(
+    fixed_params,
+    input_prompts,
+    model_kwargs: dict[str, Any],
+) -> None:
+    if model_kwargs["sampler_type"] != "TorchSampler":
+        pytest.skip(
+            "Disaggregated beam score handoff is implemented for TorchSampler")
+
+    sampling_params = SamplingParams(
+        max_tokens=fixed_params["max_tokens"],
+        n=fixed_params["max_beam_width"],
+        best_of=fixed_params["max_beam_width"],
+        use_beam_search=True,
+        end_id=-1,
+        include_stop_str_in_output=True,
+        additional_model_outputs=["cache_indirection"],
+    )
+
+    disagg_kwargs = deepcopy(model_kwargs)
+    disagg_kwargs |= dict(
+        disable_overlap_scheduler=True,
+        cuda_graph_config=None,
+        kv_cache_config=KvCacheConfig(max_tokens=10000,
+                                      enable_block_reuse=True,
+                                      enable_partial_reuse=True,
+                                      use_kv_cache_manager_v2=True),
+        cache_transceiver_config=CacheTransceiverConfig(
+            backend="NIXL",
+            transceiver_runtime="PYTHON",
+            kv_transfer_timeout_ms=1000,
+            kv_transfer_sender_future_timeout_ms=1000,
+        ),
+    )
+
+    partial_reuse_prompts = [[1, 2, 3], [1, 5, 6]]
+
+    ctx_llm = _build_llm(fixed_params, partial_reuse_prompts, disagg_kwargs)
+    gen_llm = _build_llm(fixed_params, partial_reuse_prompts, disagg_kwargs)
+    try:
+        with ctx_llm, gen_llm:
+            validate_disagg_outputs(ctx_llm,
+                                    gen_llm,
+                                    partial_reuse_prompts[:1],
+                                    sampling_params,
+                                    request_id_base=0)
+            validate_disagg_outputs(ctx_llm,
+                                    gen_llm,
+                                    partial_reuse_prompts[1:],
+                                    sampling_params,
+                                    request_id_base=100)
+    finally:
+        ctx_llm.shutdown()
+        gen_llm.shutdown()
+
+
+@pytest.mark.parametrize("beam_width", [10])
+@pytest.mark.threadleak(enabled=False)
+def test_beam_search_large_beam_width_regression(
+    beam_width: int,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Fix https://nvbugs/6242591
+    """
+    num_prompts = 2
+    input_prompts = [[1, 2, 3], [4, 5, 6]]
+    vocab_size = DummyConfig().vocab_size
+    # The dummy model pushes each beam towards (token + 3) mod vocab_size, so an
+    # end id a few multiples of 3 ahead of the prompt is reachable and different
+    # beams hit it at different steps -> exercises the finished-slot reuse path.
+    end_id = 24
+
+    checkpoint_loader = HfCheckpointLoader(
+        weight_loader=DummyWeightLoader(),
+        config_loader=DummyConfigLoader(),
+    )
+
+    gc.collect(2)  # force destruction of any other LLM instances
+    with _single_process_context():
+        llm = LLM(
+            model=_pl.Path("dummy_path"),
+            checkpoint_loader=checkpoint_loader,
+            sampler_type="TRTLLMSampler",
+            max_beam_width=beam_width,
+            max_batch_size=beam_width * num_prompts,
+            max_seq_len=64,
+            kv_cache_config=KvCacheConfig(max_tokens=10000),
+            disable_overlap_scheduler=True,
+            cuda_graph_config=None,
+        )
+        with llm:
+            sampling_params = SamplingParams(
+                max_tokens=16,
+                n=beam_width,
+                best_of=beam_width,
+                use_beam_search=True,
+                beam_search_diversity_rate=0.5,
+                early_stopping=1,
+                length_penalty=0.5,
+                end_id=end_id,
+            )
+            outputs = llm.generate(deepcopy(input_prompts),
+                                   sampling_params=deepcopy(sampling_params))
+
+    assert isinstance(outputs, list)
+    assert len(outputs) == num_prompts
+    for output in outputs:
+        beams = output.outputs
+        assert len(beams) == beam_width, (
+            f"expected {beam_width} beams, but got {len(beams)}")
+        beam_sequences = []
+        for beam_idx, beam in enumerate(beams):
+            token_ids = beam.token_ids
+            assert token_ids is not None, f"beam {beam_idx} has no token_ids"
+            assert len(token_ids) > 0, f"beam {beam_idx} is empty"
+            assert all(0 <= t < vocab_size for t in token_ids), (
+                f"beam {beam_idx} has out-of-vocab tokens: {token_ids}")
+            beam_sequences.append(tuple(token_ids))
+        # Beams must not all collapse to the same sequence: corrupted state
+        # produced duplicated / garbled beams. With a non-zero diversity rate
+        # the beams are expected to differ.
+        assert len(set(beam_sequences)) > 1, (
+            f"all {beam_width} beams are identical: {beam_sequences[0]}")
 
 
 ###########################################################################
@@ -607,6 +810,172 @@ def test_beam_search_sampling_batch_basic():
             torch.testing.assert_close(
                 predecessor_beams_result[seq_slot, beam_idx],
                 torch.tensor(predecessor_beam, dtype=torch.int32))
+
+
+def test_beam_search_sampling_batch_disagg_handoff():
+    """Test context-first disagg beam handoff seeds gen-side beam scores."""
+
+    test_params = GeneralTestParams()
+    batch_size = test_params.batch_size
+    beam_width = test_params.beam_width
+    vocab_size = test_params.vocab_size
+    max_batch_size = test_params.max_batch_size
+    prompt_len = test_params.prompt_len
+    temperature = 1.0
+
+    seq_slots = torch.arange(
+        batch_size, dtype=torch.int64) + (max_batch_size - batch_size) // 2
+    seq_offsets = torch.arange(max_batch_size, dtype=torch.int64) * beam_width
+    beam_idx_arange = torch.arange(beam_width, dtype=torch.int32)
+
+    def make_metadata(seq_len: int) -> BeamSearchMetadata:
+        return BeamSearchMetadata(
+            cache_indirection=torch.zeros(
+                (max_batch_size, beam_width, prompt_len + 2),
+                dtype=torch.int32),
+            cache_indirection_buffer=torch.full(
+                (max_batch_size, beam_width, prompt_len + 2),
+                -1,
+                dtype=torch.int32),
+            cum_log_probs=torch.zeros((max_batch_size, beam_width),
+                                      dtype=torch.float32),
+            seq_slots=seq_slots,
+            seq_lens=torch.full((batch_size, ), seq_len, dtype=torch.int32),
+            finished_beams=torch.zeros((max_batch_size, beam_width),
+                                       dtype=torch.int32),
+            new_log_probs=torch.zeros((max_batch_size, beam_width),
+                                      dtype=torch.float32),
+            predecessor_beams=torch.zeros((max_batch_size, beam_width),
+                                          dtype=torch.int32),
+            seq_offsets=seq_offsets,
+            beam_idx_arange=beam_idx_arange,
+        )
+
+    torch.manual_seed(43)
+    context_logits = torch.randn((batch_size, vocab_size), dtype=torch.float32)
+    generation_logits = torch.randn((batch_size * beam_width, vocab_size),
+                                    dtype=torch.float32)
+    for req_idx in range(batch_size):
+        context_logits[req_idx, req_idx * beam_width:req_idx * beam_width +
+                       beam_width] += torch.tensor([8.0, 7.0, 1.0])
+        for beam_idx in range(beam_width):
+            row = req_idx * beam_width + beam_idx
+            generation_logits[row, 10 + beam_idx] += 4.0 + beam_idx
+
+    # Baseline: one continuous request. Context produces first beams, then
+    # generation continues with beam_width input beams.
+    continuous_metadata = make_metadata(prompt_len)
+    first_tokens, _ = beam_search_sampling_batch(
+        logits=context_logits,
+        beam_width_in=1,
+        beam_width_out=beam_width,
+        beam_search_args=continuous_metadata,
+        temperature=temperature,
+        return_probs=False,
+    )
+    first_gen_scores = continuous_metadata.cum_log_probs[
+        seq_slots, :beam_width].clone()
+    assert first_tokens.shape == (batch_size, beam_width)
+
+    continuous_metadata.seq_lens = torch.full((batch_size, ),
+                                              prompt_len + 1,
+                                              dtype=torch.int32)
+    continuous_next_tokens, _ = beam_search_sampling_batch(
+        logits=generation_logits,
+        beam_width_in=beam_width,
+        beam_width_out=beam_width,
+        beam_search_args=continuous_metadata,
+        temperature=temperature,
+        return_probs=False,
+    )
+    continuous_cum_log_probs = continuous_metadata.cum_log_probs[
+        seq_slots, :beam_width].clone()
+    continuous_new_log_probs = continuous_metadata.new_log_probs[
+        seq_slots, :beam_width].clone()
+    continuous_predecessor_beams = continuous_metadata.predecessor_beams[
+        seq_slots, :beam_width].clone()
+    continuous_cache_indirection = continuous_metadata.cache_indirection[
+        seq_slots, :beam_width, :prompt_len + 2].clone()
+
+    # Disaggregated generation starts from reset sampler buffers, then seeds
+    # the first-token beam scores derived from context first_gen_log_probs.
+    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+
+    disagg_metadata = make_metadata(prompt_len + 1)
+    original_tokens = torch.zeros((max_batch_size, beam_width, prompt_len + 2),
+                                  dtype=torch.int32)
+    fake_executor = cast(
+        PyExecutor,
+        SimpleNamespace(sampler=SimpleNamespace(store=SimpleNamespace(
+            beam_search_store=SimpleNamespace(
+                original_tokens=original_tokens,
+                cache_indirection=disagg_metadata.cache_indirection,
+                cum_log_probs=disagg_metadata.cum_log_probs,
+            )))))
+    for req_idx, seq_slot in enumerate(seq_slots.tolist()):
+        first_gen_tokens = first_tokens[req_idx, :beam_width].tolist()
+        first_gen_log_probs = [{
+            token_id:
+            Logprob(logprob=float(first_gen_scores[req_idx, beam_idx].item()))
+        } for beam_idx, token_id in enumerate(first_gen_tokens)]
+        req = SimpleNamespace(
+            py_seq_slot=seq_slot,
+            py_request_id=req_idx,
+            prompt_len=prompt_len,
+            py_disaggregated_params=DisaggregatedParams(
+                request_type="generation_only",
+                first_gen_log_probs=first_gen_log_probs,
+            ),
+        )
+        PyExecutor._update_sampler_state_for_disagg_gen_request(
+            fake_executor, req, beam_width, first_gen_tokens)
+
+    expected_beam_indices = torch.arange(beam_width, dtype=torch.int32).expand(
+        batch_size, beam_width)
+    torch.testing.assert_close(
+        original_tokens[seq_slots, :beam_width, prompt_len], first_tokens)
+    torch.testing.assert_close(
+        disagg_metadata.cache_indirection[seq_slots, :beam_width, prompt_len],
+        expected_beam_indices)
+    torch.testing.assert_close(
+        disagg_metadata.cum_log_probs[seq_slots, :beam_width], first_gen_scores)
+    disagg_next_tokens, _ = beam_search_sampling_batch(
+        logits=generation_logits,
+        beam_width_in=beam_width,
+        beam_width_out=beam_width,
+        beam_search_args=disagg_metadata,
+        temperature=temperature,
+        return_probs=False,
+    )
+
+    torch.testing.assert_close(disagg_next_tokens, continuous_next_tokens)
+    torch.testing.assert_close(
+        disagg_metadata.cache_indirection[seq_slots, :beam_width, :prompt_len +
+                                          2], continuous_cache_indirection)
+    torch.testing.assert_close(
+        disagg_metadata.cum_log_probs[seq_slots, :beam_width],
+        continuous_cum_log_probs)
+    torch.testing.assert_close(
+        disagg_metadata.new_log_probs[seq_slots, :beam_width],
+        continuous_new_log_probs)
+    torch.testing.assert_close(
+        disagg_metadata.predecessor_beams[seq_slots, :beam_width],
+        continuous_predecessor_beams)
+
+    # This is the regression guard for disagg: if gen-side cum_log_probs remain
+    # reset after receiving first_gen_tokens, the next step is scored incorrectly.
+    unseeded_metadata = make_metadata(prompt_len + 1)
+    beam_search_sampling_batch(
+        logits=generation_logits,
+        beam_width_in=beam_width,
+        beam_width_out=beam_width,
+        beam_search_args=unseeded_metadata,
+        temperature=temperature,
+        return_probs=False,
+    )
+    assert not torch.allclose(
+        unseeded_metadata.cum_log_probs[seq_slots, :beam_width],
+        continuous_cum_log_probs)
 
 
 def create_default_request(test_params: GeneralTestParams) -> LlmRequest:

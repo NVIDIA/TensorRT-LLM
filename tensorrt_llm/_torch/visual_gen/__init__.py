@@ -12,7 +12,7 @@ from tensorrt_llm._torch.visual_gen.executor import (
 from tensorrt_llm._torch.visual_gen.output import PipelineOutput
 
 from .checkpoints import WeightLoader
-from .config import DiffusionModelConfig
+from .config import DiffusionModelConfig, DiffusionPipelineConfig
 from .mapping import VisualGenMapping
 from .models import AutoPipeline, BasePipeline, WanPipeline
 from .pipeline_loader import PipelineLoader
@@ -20,6 +20,7 @@ from .pipeline_registry import PipelineComponent
 
 __all__ = [
     "DiffusionModelConfig",
+    "DiffusionPipelineConfig",
     "PipelineComponent",
     "WeightLoader",
     "PipelineLoader",

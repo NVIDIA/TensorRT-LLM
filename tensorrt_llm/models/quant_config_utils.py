@@ -19,26 +19,6 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
 
-def is_w4a16_nvfp4_hf_quant_config(hf_quant_config):
-    if hf_quant_config is None:
-        return False
-    config_groups = hf_quant_config.get("config_groups")
-    if config_groups is None:
-        return False
-
-    group_config = config_groups.get("group_0")
-    if group_config is None:
-        return False
-    weights_quant_config = group_config.get("weights", {})
-    inputs_quant_config = group_config.get("input_activations")
-    return (
-        hf_quant_config.get("format") == "nvfp4-pack-quantized"
-        and weights_quant_config.get("num_bits") == 4
-        and weights_quant_config.get("group_size") == 16
-        and inputs_quant_config is None
-    )
-
-
 def update_quant_config_from_compressed_tensors(
     quant_config: QuantConfig, hf_quant_config: Mapping[str, Any]
 ) -> None:
@@ -47,59 +27,63 @@ def update_quant_config_from_compressed_tensors(
     if config_groups is None:
         raise ValueError(f"config_groups is not set in {hf_quant_config}.")
 
-    group_config = config_groups["group_0"]
+    # compressed-tensors keys config_groups by group name: custom recipes use
+    # "group_0"; named preset schemes (e.g. FP8_DYNAMIC) use the scheme name.
+    # This path applies a single algo globally, so resolve to one group.
+    group_config = config_groups.get("group_0")
+    if group_config is None:
+        if len(config_groups) != 1:
+            raise ValueError(
+                f"Expected 'group_0' or exactly one config group, got {sorted(config_groups)}."
+            )
+        group_config = next(iter(config_groups.values()))
     weights_quant_config = group_config["weights"]
+    inputs_quant_config = group_config["input_activations"]
+    weights_quant_strategy = weights_quant_config["strategy"]
+    inputs_quant_strategy = inputs_quant_config["strategy"]
 
-    if is_w4a16_nvfp4_hf_quant_config(hf_quant_config):
-        quant_config.quant_algo = QuantAlgo.W4A16_NVFP4
-        quant_config.group_size = 16
-    else:
-        inputs_quant_config = group_config["input_activations"]
-        weights_quant_strategy = weights_quant_config["strategy"]
-        inputs_quant_strategy = inputs_quant_config["strategy"]
+    if weights_quant_config["num_bits"] == 8:
+        if weights_quant_strategy == "channel":
+            if inputs_quant_strategy != "token":
+                raise ValueError(f"Unsupported inputs_quant_strategy: {inputs_quant_strategy}.")
+            quant_config.quant_algo = QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN
+        elif weights_quant_strategy == "block":
+            if inputs_quant_strategy != "group":
+                raise ValueError(f"Unsupported inputs_quant_strategy: {inputs_quant_strategy}.")
+            quant_config.quant_algo = QuantAlgo.FP8_BLOCK_SCALES
+            group_size = inputs_quant_config["group_size"]
 
-        if weights_quant_config["num_bits"] == 8:
-            if weights_quant_strategy == "channel":
-                if inputs_quant_strategy != "token":
-                    raise ValueError(f"Unsupported inputs_quant_strategy: {inputs_quant_strategy}.")
-                quant_config.quant_algo = QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN
-            elif weights_quant_strategy == "block":
-                if inputs_quant_strategy != "group":
-                    raise ValueError(f"Unsupported inputs_quant_strategy: {inputs_quant_strategy}.")
-                quant_config.quant_algo = QuantAlgo.FP8_BLOCK_SCALES
-                group_size = inputs_quant_config["group_size"]
-
-                # TRT-LLM only supports group_size=128 for FP8_BLOCK_SCALES.
-                if group_size != 128:
-                    raise ValueError(f"Unsupported group_size: {group_size}. Supported: 128.")
-                quant_config.group_size = group_size
-
-            else:
-                raise ValueError(
-                    f"Unsupported weights_quant_strategy: {weights_quant_strategy}. "
-                    "Supported strategies: 'channel', 'block'."
-                )
-        elif (
-            weights_quant_config["num_bits"] == 4
-            and weights_quant_config.get("type") == "float"
-            and weights_quant_strategy == "tensor_group"
-        ):
-            # llm-compressor NVFP4: weights FP4 with FP8 per-group scales
-            # (group_size=16), scaled by an FP32 global scale.
-            if inputs_quant_strategy != "tensor_group":
-                raise ValueError(
-                    f"Unsupported inputs_quant_strategy for NVFP4: {inputs_quant_strategy}."
-                )
-            group_size = weights_quant_config["group_size"]
-            if group_size != 16:
-                raise ValueError(f"Unsupported group_size: {group_size}. Supported: 16 for NVFP4.")
-            quant_config.quant_algo = QuantAlgo.NVFP4
+            # TRT-LLM only supports group_size=128 for FP8_BLOCK_SCALES.
+            if group_size != 128:
+                raise ValueError(f"Unsupported group_size: {group_size}. Supported: 128.")
             quant_config.group_size = group_size
+
         else:
             raise ValueError(
-                f"Unsupported quant_bits: {weights_quant_config['num_bits']}. "
-                "Supported: 8 (FP8) or 4 (NVFP4)."
+                f"Unsupported weights_quant_strategy: {weights_quant_strategy}. "
+                "Supported strategies: 'channel', 'block'."
             )
+    elif (
+        weights_quant_config["num_bits"] == 4
+        and weights_quant_config.get("type") == "float"
+        and weights_quant_strategy == "tensor_group"
+    ):
+        # llm-compressor NVFP4: weights FP4 with FP8 per-group scales
+        # (group_size=16), scaled by an FP32 global scale.
+        if inputs_quant_strategy != "tensor_group":
+            raise ValueError(
+                f"Unsupported inputs_quant_strategy for NVFP4: {inputs_quant_strategy}."
+            )
+        group_size = weights_quant_config["group_size"]
+        if group_size != 16:
+            raise ValueError(f"Unsupported group_size: {group_size}. Supported: 16 for NVFP4.")
+        quant_config.quant_algo = QuantAlgo.NVFP4
+        quant_config.group_size = group_size
+    else:
+        raise ValueError(
+            f"Unsupported quant_bits: {weights_quant_config['num_bits']}. "
+            "Supported: 8 (FP8) or 4 (NVFP4)."
+        )
 
     # kv_cache_scheme (llm-compressor): FP8 per-tensor KV cache.
     kv_cache_scheme = hf_quant_config.get("kv_cache_scheme")

@@ -20,14 +20,9 @@ MODEL_PATH_DICT = {
     "llama_v3.1_8b_instruct": "llama-3.1-model/Llama-3.1-8B-Instruct",
     "llama_v3.1_8b_instruct_fp8": "llama-3.1-model/Llama-3.1-8B-Instruct-FP8",
     "llama_v3.1_8b_instruct_fp4": "modelopt-hf-model-hub/Llama-3.1-8B-Instruct-fp4",
-    "llama_v3.1_70b": "llama-3.1-model/Meta-Llama-3.1-70B",
     "llama_v3.3_70b_instruct": "llama-3.3-models/Llama-3.3-70B-Instruct",
-    "llama_v3.1_70b_instruct_fp8": "llama-3.1-model/Llama-3.1-70B-Instruct-FP8",
     "llama_v3.3_70b_instruct_fp8": "modelopt-hf-model-hub/Llama-3.3-70B-Instruct-fp8",
     "llama_v3.3_70b_instruct_fp4": "modelopt-hf-model-hub/Llama-3.3-70B-Instruct-fp4",
-    "llama_v3.1_405b_instruct_fp8": "llama-3.1-model/Llama-3.1-405B-Instruct-FP8",
-    "llama_v3.1_405b_instruct_fp4": "modelopt-hf-model-hub/Llama-3.1-405B-Instruct-fp4",
-    "llama_v3.1_70b_instruct": "llama-3.1-model/Meta-Llama-3.1-70B-Instruct",
     "llama_v3.2_1b": "llama-3.2-models/Llama-3.2-1B",
     "llama_v3.1_nemotron_nano_8b": "Llama-3.1-Nemotron-Nano-8B-v1",
     "llama_v3.1_nemotron_nano_8b_fp8": "Llama-3.1-Nemotron-Nano-8B-v1-FP8",
@@ -85,6 +80,8 @@ MODEL_PATH_DICT = {
     "phi_4_multimodal_instruct_fp4": "multimodals/Phi-4-multimodal-instruct-FP4",
     "phi_4_multimodal_instruct_fp8": "multimodals/Phi-4-multimodal-instruct-FP8",
     "mistral_small_v3.1_24b": "Mistral-Small-3.1-24B-Instruct-2503",
+    "bielik_11b_v2.2_instruct": "Bielik-11B-v2.2-Instruct",
+    "bielik_11b_v2.2_instruct_fp8": "Bielik-11B-v2.2-Instruct-FP8",
     "gpt_oss_120b_fp4": "gpt_oss/gpt-oss-120b",
     "gpt_oss_20b_fp4": "gpt_oss/gpt-oss-20b",
     "gpt_oss_120b_eagle3": "gpt_oss/gpt-oss-120b",
@@ -126,19 +123,9 @@ MODEL_PATH_DICT = {
     "glm_5_nvfp4": "GLM-5-NVFP4",
 }
 
-# Model PATH of HuggingFace
+# Models loaded directly by HuggingFace repo id (downloaded at runtime, not synced locally).
 HF_MODEL_PATH = {
-    "llama_v3.1_8b_hf": "meta-llama/Llama-3.1-8B",
-    "llama_v3.1_8b_instruct_hf": "nvidia/Llama-3.1-8B-Instruct-FP8",
-    "llama_v3.1_70b_instruct_hf": "meta-llama/Meta-Llama-3.1-70B-Instruct",
-    "llama_v3.1_70b_hf": "meta-llama/Llama-3.1-70B",
-    "llama_v3.1_405b_hf": "meta-llama/Llama-3.1-405B",
-    "llama_v3.1_nemotron_nano_8b_hf": "nvidia/Llama-3.1-Nemotron-Nano-8B-v1",
-    "llama_v3.1_nemotron_nano_8b_fp8_hf": "nvidia/Llama-3.1-Nemotron-Nano-8B-v1-FP8",
-    "llama_v3.3_nemotron_super_49b_hf": "nvidia/Llama-3_3-Nemotron-Super-49B-v1",
-    "llama_v3.3_nemotron_super_49b_fp8_hf": "nvidia/Llama-3_3-Nemotron-Super-49B-v1-FP8",
-    "llama_v3.1_nemotron_ultra_253b_fp8_hf": "nvidia/Llama-3_1-Nemotron-Ultra-253B-v1-FP8",
-    "phi_4_mini_instruct_hf": "microsoft/Phi-4-mini-instruct",
+    "nemotron_3_ultra_550b_nvfp4": "nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4",
 }
 
 LORA_MODEL_PATH = {

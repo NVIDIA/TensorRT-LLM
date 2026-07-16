@@ -16,9 +16,12 @@
 """Tests for OpenELM custom model implementation.
 
 Compares the custom AD model against an inline HF reference implementation.
-The HF config is loaded via trust_remote_code=True; for unit tests we create
-a small config using the same class.
+Unit tests construct a small config with the vendored ``OpenELMConfig`` —
+the same class production code uses — so the per-layer derivation logic is
+exercised by every test.
 """
+
+import json
 
 import pytest
 import torch
@@ -26,11 +29,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 from _model_test_utils import assert_rmse_close
 from torch.export import Dim
-from transformers import PretrainedConfig
+from transformers import AutoConfig
+from transformers.models.auto.configuration_auto import CONFIG_MAPPING
 
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.models.custom.modeling_openelm import (
     OpenELMAttention,
+    OpenELMConfig,
     OpenELMDecoderLayer,
     OpenELMFeedForwardNetwork,
     OpenELMForCausalLM,
@@ -52,28 +57,21 @@ def set_seed():
 # =============================================================================
 
 
-class _TestOpenELMConfig(PretrainedConfig):
-    """Standalone test config matching OpenELM's attribute interface."""
+def _create_small_config() -> OpenELMConfig:
+    """Create a small OpenELM config for testing (no network access needed).
 
-    model_type = "openelm"
-
-    def __init__(self, **kwargs):
-        for k, v in kwargs.items():
-            setattr(self, k, v)
-        super().__init__()
-
-
-def _create_small_config():
-    """Create a small OpenELM config for testing (no network access needed)."""
-    return _TestOpenELMConfig(
+    Uses the vendored ``OpenELMConfig`` directly so its per-layer derivation
+    runs in every test. ``qkv_multipliers=[0.5, 1.0]`` derives varying
+    per-layer heads: num_query_heads=[2, 4, 4], num_kv_heads=[1, 2, 2].
+    """
+    return OpenELMConfig(
         vocab_size=1000,
         max_context_length=128,
         num_transformer_layers=3,
         model_dim=64,
         head_dim=16,
+        qkv_multipliers=[0.5, 1.0],
         num_gqa_groups=2,
-        num_query_heads=[2, 3, 4],
-        num_kv_heads=[1, 1, 2],
         ffn_multipliers=[0.5, 2.0, 4.0],
         ffn_with_glu=True,
         ffn_dim_divisor=16,
@@ -470,3 +468,148 @@ def test_openelm_model_can_be_exported():
     assert logits2.shape == (B2, S2, config.vocab_size)
     assert torch.isfinite(logits2).all()
     assert_rmse_close(logits2, ref_out2.logits, rmse_ratio_tol=0.05, msg="Export dynamic: ")
+
+
+# =============================================================================
+# Vendored OpenELMConfig (CPU/offline): derivation + AutoConfig registration
+# =============================================================================
+#
+# The config is bundled locally (not loaded from Apple's hub remote code, which
+# is incompatible with transformers 5.x). These tests verify the per-layer
+# derivation matches Apple's published values and that registering the local
+# class makes AutoConfig.from_pretrained bypass the checkpoint's auto_map.
+
+# apple/OpenELM-270M-Instruct published config inputs (layer-wise scaling).
+_OPENELM_270M = dict(
+    num_transformer_layers=16,
+    model_dim=1280,
+    head_dim=64,
+    num_gqa_groups=4,
+    qkv_multipliers=[0.5, 1.0],
+    ffn_multipliers=[0.5, 4.0],
+    share_input_output_layers=True,
+    normalize_qk_projections=True,
+)
+# Known-good per-layer head counts derived by Apple's algorithm for the 270M preset.
+_EXPECTED_NUM_QUERY_HEADS = [12, 12, 12, 12, 12, 16, 16, 16, 16, 16, 16, 16, 20, 20, 20, 20]
+_EXPECTED_NUM_KV_HEADS = [3, 3, 3, 3, 3, 4, 4, 4, 4, 4, 4, 4, 5, 5, 5, 5]
+
+# apple/OpenELM-3B-Instruct preset. A different size point with head_dim=128 (vs 64),
+# exercising a separate divisibility path. Expected lists are Apple's published
+# num_query_heads / num_kv_heads from the 3B checkpoint's config.json.
+_OPENELM_3B = dict(
+    num_transformer_layers=36,
+    model_dim=3072,
+    head_dim=128,
+    num_gqa_groups=4,
+    qkv_multipliers=[0.5, 1.0],
+    ffn_multipliers=[0.5, 4.0],
+    share_input_output_layers=True,
+    normalize_qk_projections=True,
+)
+# fmt: off
+_EXPECTED_3B_NUM_QUERY_HEADS = [
+    12, 12, 12, 12, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16,
+    20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 24, 24, 24, 24, 24, 24,
+]
+_EXPECTED_3B_NUM_KV_HEADS = [
+    3, 3, 3, 3, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
+    5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 6, 6, 6, 6, 6, 6,
+]
+# fmt: on
+
+
+def test_openelm_config_derivation_matches_apple():
+    # `use_cache=True` would crash Apple's remote config under transformers 5.x;
+    # the vendored class must accept it without raising.
+    config = OpenELMConfig(use_cache=True, **_OPENELM_270M)
+
+    assert config.model_type == "openelm"
+    assert config.num_query_heads == _EXPECTED_NUM_QUERY_HEADS
+    assert config.num_kv_heads == _EXPECTED_NUM_KV_HEADS
+    assert len(config.ffn_multipliers) == 16
+    # per-layer FFN multipliers are a linspace(0.5, 4.0, 16)
+    assert config.ffn_multipliers[0] == 0.5 and config.ffn_multipliers[-1] == 4.0
+    # GQA divisibility holds for every layer
+    assert all(q % k == 0 for q, k in zip(config.num_query_heads, config.num_kv_heads, strict=True))
+
+
+def test_openelm_config_derivation_matches_apple_3b():
+    """Derivation must also be correct for a different size point (3B, head_dim=128)."""
+    config = OpenELMConfig(use_cache=True, **_OPENELM_3B)
+
+    assert config.num_transformer_layers == 36
+    assert config.num_query_heads == _EXPECTED_3B_NUM_QUERY_HEADS
+    assert config.num_kv_heads == _EXPECTED_3B_NUM_KV_HEADS
+    # ffn multipliers expand to a length-36 linspace(0.5, 4.0)
+    assert len(config.ffn_multipliers) == 36
+    assert config.ffn_multipliers[0] == 0.5 and config.ffn_multipliers[-1] == 4.0
+    assert all(q % k == 0 for q, k in zip(config.num_query_heads, config.num_kv_heads, strict=True))
+
+
+def test_openelm_config_fulfills_config_subclass_contract():
+    """Pin the two duties of a PreTrainedConfig subclass.
+
+    Real OpenELM config.json files carry keys outside this class's named
+    parameters (``architectures``, ``auto_map``, ``transformers_version``, ...),
+    so surplus kwargs are the steady-state input, not an edge case — and a
+    config class mishandling a forwarded kwarg is exactly the failure mode
+    behind issue 14672.
+
+    Duty 1 — accept ``**kwargs`` and pass them to ``super().__init__`` (HF's
+    documented rule for custom configs:
+    https://huggingface.co/docs/transformers/en/custom_models, "Configuration"
+    rule 2).
+
+    Duty 2 — leave ``__post_init__`` to the base class: the strict-dataclass
+    machinery routes leftover kwargs to ``self.__post_init__(**kwargs)``
+    (huggingface_hub ``dataclasses.py``), which must resolve to
+    ``PreTrainedConfig.__post_init__`` — the funnel that pops generation params
+    and absorbs unknown keys (transformers ``configuration_utils.py``).
+    Shadowing that hook with a legacy zero-kwarg method is what crashed
+    Apple's original class.
+    """
+    config = OpenELMConfig(use_cache=True, some_future_field=123, **_OPENELM_270M)
+
+    # Duty 1 + Duty 2 end-to-end: an unknown key can only become an attribute by
+    # traveling __init__ -> super().__init__ -> base __post_init__ -> setattr.
+    assert config.some_future_field == 123
+    # The funnel's discard step ran: use_cache is a generation param in 5.x and
+    # gets popped (not stored on the config) — the canonical handling Apple's
+    # shadowed hook prevented.
+    assert not hasattr(config, "use_cache")
+    # Structural tripwire: nobody reintroduces a __post_init__ on this class
+    # (the Apple pattern that caused issue 14672).
+    assert "__post_init__" not in OpenELMConfig.__dict__
+    # Construction stayed healthy alongside the surplus kwargs.
+    assert len(config.num_query_heads) == 16
+
+
+def test_openelm_config_registered_as_local_class():
+    assert "openelm" in CONFIG_MAPPING
+    registered = CONFIG_MAPPING["openelm"]
+    assert registered is OpenELMConfig
+    # transformers treats a registered class whose module is not under
+    # `transformers.` as `explicit_local_code`, which beats a remote auto_map.
+    assert not registered.__module__.startswith("transformers.")
+
+
+def test_openelm_autoconfig_prefers_local_over_remote(tmp_path):
+    """AutoConfig must prefer the local class over remote code.
+
+    Even with trust_remote_code=True and an auto_map present — and with no
+    configuration_openelm.py on disk, so a remote-code path would fail — the
+    local class is used. This proves Apple's remote code never runs.
+    """
+    config_json = {
+        "model_type": "openelm",
+        "auto_map": {"AutoConfig": "configuration_openelm.OpenELMConfig"},
+        "use_cache": True,
+        **_OPENELM_270M,
+    }
+    (tmp_path / "config.json").write_text(json.dumps(config_json))
+    # Deliberately NO configuration_openelm.py in tmp_path.
+
+    config = AutoConfig.from_pretrained(str(tmp_path), trust_remote_code=True)
+    assert type(config) is OpenELMConfig
+    assert config.num_query_heads == _EXPECTED_NUM_QUERY_HEADS

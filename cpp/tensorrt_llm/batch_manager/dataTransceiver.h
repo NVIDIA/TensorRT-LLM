@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -22,6 +22,7 @@
 #include <string>
 #include <vector>
 
+#include "tensorrt_llm/batch_manager/baseTransBuffer.h"
 #include "tensorrt_llm/batch_manager/cacheTransceiver.h"
 #include "tensorrt_llm/batch_manager/cacheTransferLayer.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h"
@@ -128,6 +129,20 @@ public:
 
     void appendMeasure(LlmRequest::TimePoint start, LlmRequest::TimePoint end, size_t size);
 
+    /// @brief Transfer ownership of pre-assigned receive buffers to this session.
+    void setReservedRecvBuffers(std::vector<BufferIndexHolder> holders);
+
+    [[nodiscard]] bool hasReservedRecvBuffer(BaseTransBufferManager const& manager) const noexcept;
+
+    /// @brief Release one formatter's pre-assigned buffer after its receive and postprocessing complete.
+    bool releaseReservedRecvBuffer(BaseTransBufferManager const& manager) noexcept;
+
+    /// @brief Release all pre-assigned receive buffers after the full receive pipeline completes.
+    void releaseReservedRecvBuffers() noexcept;
+
+    /// @brief Fail closed when receive-buffer quiescence cannot be established.
+    void poisonReservedRecvBuffers() noexcept;
+
     // TODO: 1. use global id instead of context request id; 2. export to llm metrics instead of file
     void exportMeasure(std::ofstream& outFile, bool isContext) const;
 
@@ -160,6 +175,7 @@ private:
     runtime::BufferManager const* mBufferManager;
     LlmRequest const* mRequest;
     std::unique_ptr<KVCacheTimes> mTimes;
+    std::vector<BufferIndexHolder> mReservedRecvBuffers;
     int32_t mIndexFromEnd{0};
     BlockKey mLastBlockKey{};
 };
@@ -256,10 +272,10 @@ public:
     CacheSender() = default;
 
     /// @brief Asynchronously respond to the request and send data.
-    /// @param llmRequest Request object. Its data should be ready when called, and the data for this request
-    /// should remain valid until future synchronization.
+    /// @param llmRequest Request object. Its data should be ready when called. shared_ptr so the async send
+    /// worker can extend the request's lifetime past the caller's reference.
     /// @return Once the data is fully sent, the future object will become valid.
-    [[nodiscard]] virtual std::future<void> sendAsync(LlmRequest& llmRequest) const;
+    [[nodiscard]] virtual std::future<void> sendAsync(std::shared_ptr<LlmRequest> const& llmRequest) const;
 
     /// @brief Return the internal communicator status.
     /// @return The communicator status.
@@ -319,10 +335,10 @@ public:
     CacheReceiver() = default;
 
     /// @brief Asynchronously send a request to receive data.
-    /// @param llmRequest Request object. Its data should be in an allocated but unwritten state when called, and the
-    /// data for this request should remain intact only after future synchronization.
+    /// @param llmRequest Request object. Its data should be in an allocated but unwritten state when called.
+    /// shared_ptr so the async receive worker can extend the request's lifetime past the caller's reference.
     /// @return Once the data is fully received, the future object will become valid.
-    [[nodiscard]] virtual std::future<void> receiveAsync(LlmRequest& llmRequest) const;
+    [[nodiscard]] virtual std::future<void> receiveAsync(std::shared_ptr<LlmRequest> const& llmRequest) const;
 
     virtual TransferSession sendRequestInfo(LlmRequest const& llmRequest);
 

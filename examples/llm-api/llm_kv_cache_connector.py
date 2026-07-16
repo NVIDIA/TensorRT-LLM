@@ -192,7 +192,7 @@ class PersistentKvCacheConnectorLeader(KvCacheConnectorScheduler):
                                    len(block_ids)):
                 if len(chunks[block_pos]) == self.block_size:
                     hashed_tokens = self._hash_tokens(chunks[block_pos],
-                                                      req.cache_salt_id)
+                                                      req.cache_salt)
 
                     file_path = self._file_path(hashed_tokens)
 
@@ -202,11 +202,10 @@ class PersistentKvCacheConnectorLeader(KvCacheConnectorScheduler):
 
         return metadata
 
-    def _hash_tokens(self, tokens: list[int],
-                     cache_salt_id: Optional[int]) -> int:
-        # cache_salt_id must participate in the hash so that requests carrying
+    def _hash_tokens(self, tokens: list[int], cache_salt: Optional[str]) -> int:
+        # cache_salt must participate in the hash so that requests carrying
         # different salts (or no salt) cannot collide on the same cache file.
-        return abs(hash((cache_salt_id, tuple(tokens))))
+        return abs(hash((cache_salt, tuple(tokens))))
 
     def _file_path(self, hash_value: int) -> Path:
         return Path(self.cache_folder) / f"{hash_value}.pt"
@@ -238,7 +237,7 @@ class PersistentKvCacheConnectorLeader(KvCacheConnectorScheduler):
         for chunk in remaining_chunks:
             # Only do full blocks.
             if len(chunk) == self.block_size:
-                hashed_tokens = self._hash_tokens(chunk, request.cache_salt_id)
+                hashed_tokens = self._hash_tokens(chunk, request.cache_salt)
 
                 file_path = self._file_path(hashed_tokens)
 

@@ -71,7 +71,17 @@ def service_discovery(request, disagg_host: str):
     if request.param == "etcd":
         work_dir = tempfile.mkdtemp()
         data_dir = f"{work_dir}/disagg_test-etcd-{uuid.uuid4()}"
-        etcd = subprocess.Popen(["etcd", "--data-dir", data_dir])
+        etcd = subprocess.Popen(
+            [
+                "etcd",
+                "--data-dir",
+                data_dir,
+                "--listen-client-urls",
+                "http://0.0.0.0:2379",
+                "--advertise-client-urls",
+                f"http://{disagg_host}:2379",
+            ]
+        )
         yield etcd, f"etcd://{disagg_host}:2379"
         try:
             etcd.kill()

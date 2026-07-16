@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 from abc import ABC, abstractmethod
 from typing import Any
 
@@ -67,6 +70,16 @@ class BaseCheckpointLoader(ABC):
 
     def is_weights_preloaded(self) -> bool:
         """Whether the last load wrote weights directly into the model."""
+        return False
+
+    def is_post_transform_weights_preloaded(self) -> bool:
+        """Whether the last direct preload delivered post-transform weights.
+
+        This is narrower than :meth:`is_weights_preloaded`: a loader may write
+        bytes directly into the model while those bytes still use the raw
+        checkpoint layout. Return True only when the source identity was
+        verified and the incoming bytes can safely skip module transform hooks.
+        """
         return False
 
     def post_load_apply(self,

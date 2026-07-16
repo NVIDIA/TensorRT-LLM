@@ -35,7 +35,8 @@ from typing import Optional, Tuple
 import torch
 from torch.fx import GraphModule, Node
 
-from ...custom_ops.mla.trtllm_mla import _TRTLLM_MLA_ROPE_INFO_KEY
+from ...custom_ops.mla.rope_metadata import _TRTLLM_MLA_ROPE_INFO_KEY
+from ...models.custom.mla_rope_utils import is_gptj_layout
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
 from ...utils.logger import ad_logger
@@ -122,14 +123,12 @@ def _build_rotary_cos_sin_from_buffers(
     if construction fails.
     """
     if is_op(rope_node, torch.ops.auto_deploy.torch_rope_with_explicit_cos_sin):
-        # torch_rope(q, k, cos, sin, unsqueeze_dim)
+        # NeoX-doubled cos/sin [max_pos, qk_rope_head_dim].
         cos_node = rope_node.args[2]
         sin_node = rope_node.args[3]
         cos_buf = _trace_to_buffer(gm, cos_node)
         sin_buf = _trace_to_buffer(gm, sin_node)
         if cos_buf is not None and sin_buf is not None:
-            # cos_buf/sin_buf are already in NeoX-doubled format
-            # [max_pos, head_dim] where head_dim = qk_rope_head_dim.
             # Stack interleaved [cos_0, sin_0, cos_1, sin_1, ...] as expected
             # by mla_rope_generation.
             result = torch.stack([cos_buf.float(), sin_buf.float()], dim=-1)
@@ -231,8 +230,10 @@ def _compute_rotary_cos_sin_from_config(
 
     max_position = getattr(model_config, "max_position_embeddings", 8192)
     half_dim = qk_rope_head_dim // 2
+    # Match the custom model's expression order; fused MLA is sensitive to RoPE table drift.
+    dim_indices = torch.arange(0, qk_rope_head_dim, 2, dtype=torch.float32)
 
-    inv_freq = 1.0 / (rope_theta ** (torch.arange(0, half_dim, dtype=torch.float32) / half_dim))
+    inv_freq = 1.0 / (rope_theta ** (dim_indices / qk_rope_head_dim))
 
     # Handle YaRN scaling if present
     rope_scaling = getattr(model_config, "rope_scaling", None)
@@ -255,7 +256,7 @@ def _compute_rotary_cos_sin_from_config(
             # The model's softmax_scale already includes mscale^2, so the
             # cos/sin table must NOT duplicate it.
             numerator = _yarn_get_mscale(factor, mscale_factor)
-            denominator = _yarn_get_mscale(factor, mscale_all_dim) if mscale_all_dim else 1.0
+            denominator = _yarn_get_mscale(factor, mscale_all_dim)
             mscale = numerator / denominator if denominator != 0 else 1.0
             original_max = rope_scaling.get("original_max_position_embeddings", max_position)
             beta_fast = rope_scaling.get("beta_fast", 32)
@@ -277,15 +278,16 @@ def _compute_rotary_cos_sin_from_config(
             if low == high:
                 high += 0.001
 
-            smooth = (torch.arange(half_dim, dtype=torch.float32) - low) / (high - low)
-            smooth = smooth.clamp(0, 1)
-            freq_extra = inv_freq
-            freq_inter = inv_freq / factor
-            inv_freq = freq_inter * smooth + freq_extra * (1 - smooth)
+            inv_freq_mask = 1.0 - torch.clamp(
+                (torch.arange(half_dim, dtype=torch.float32) - low) / (high - low), 0, 1
+            )
+            freq_extra = 1.0 / (rope_theta ** (dim_indices / qk_rope_head_dim))
+            freq_inter = 1.0 / (factor * rope_theta ** (dim_indices / qk_rope_head_dim))
+            inv_freq = freq_inter * (1 - inv_freq_mask) + freq_extra * inv_freq_mask
 
     t = torch.arange(max_position, dtype=torch.float32)
     freqs = torch.outer(t, inv_freq)
-    emb = torch.cat([freqs, freqs], dim=-1)
+    emb = torch.cat((freqs, freqs), dim=-1)
     cos_vals = emb.cos() * mscale
     sin_vals = emb.sin() * mscale
     result = torch.stack([cos_vals, sin_vals], dim=-1)
@@ -439,9 +441,23 @@ class FuseRopeIntoTrtllmMLA(BaseTransform):
             ad_logger.info("No torch_mla nodes found; skipping.")
             return gm, TransformInfo(skipped=True, detail="no MLA nodes")
 
+        # Whether MLA RoPE weights are in native GPTJ layout (model skipped the
+        # de-interleave load hook) — if so, _undo_rope_deinterleave must NOT run.
+        try:
+            _model_config, _ = factory._get_model_config()
+            already_gptj = is_gptj_layout(_model_config)
+        except (AttributeError, AssertionError, KeyError, OSError, ValueError):
+            already_gptj = False
+
         # Try to trace the RoPE pattern from the first MLA node.
         trace_result = _trace_rope_node(mla_nodes[0])
         if trace_result is None:
+            if already_gptj:
+                raise RuntimeError(
+                    "GPTJ-layout MLA model requires RoPE fused into trtllm_mla, but the RoPE "
+                    "pattern could not be traced from torch_mla. The eager rotation on "
+                    "native-layout weights is incorrect; do not disable this fusion."
+                )
             ad_logger.debug("Could not trace RoPE node from torch_mla; skipping fusion.")
             return gm, TransformInfo(skipped=True, detail="no rope pattern")
 
@@ -450,6 +466,12 @@ class FuseRopeIntoTrtllmMLA(BaseTransform):
         # Build the rotary_cos_sin tensor from the model's RoPE buffers.
         rotary_cos_sin = _build_rotary_cos_sin_from_buffers(gm, rope_node, factory)
         if rotary_cos_sin is None:
+            if already_gptj:
+                raise RuntimeError(
+                    "GPTJ-layout MLA model requires RoPE fused into trtllm_mla, but "
+                    "rotary_cos_sin could not be constructed. The eager rotation on "
+                    "native-layout weights is incorrect; do not disable this fusion."
+                )
             ad_logger.debug("Could not construct rotary_cos_sin; skipping fusion.")
             return gm, TransformInfo(skipped=True, detail="no rotary_cos_sin")
 
@@ -474,6 +496,13 @@ class FuseRopeIntoTrtllmMLA(BaseTransform):
             rewired_mla_nodes.append(mla_node)
             replaced += 1
 
+        if already_gptj and replaced != len(mla_nodes):
+            raise RuntimeError(
+                f"GPTJ-layout MLA model: RoPE fused into only {replaced}/{len(mla_nodes)} "
+                "MLA node(s); the rest would run eager rotation on native-layout weights "
+                "(incorrect). Do not disable fuse_rope_into_trtllm_mla for this model."
+            )
+
         # Stash rope metadata on rewired MLA nodes for cache_init.
         for mla_node in rewired_mla_nodes:
             mla_node.meta[_TRTLLM_MLA_ROPE_INFO_KEY] = {
@@ -486,9 +515,12 @@ class FuseRopeIntoTrtllmMLA(BaseTransform):
 
         # Reverse the NeoX weight de-interleave so projected data arrives in
         # GPTJ layout — matching what mla_rope_generation expects.
-        # The is_neox flag is always True when matching torch_rope_with_explicit_cos_sin
-        # (which uses the NeoX/split-half rotation style).
-        n_fixed = _undo_rope_deinterleave(gm, factory, shared_config)
+        # Skip when the graph was already in GPTJ layout (detected above before
+        # the rope nodes were consumed): those models never de-interleaved.
+        if not already_gptj:
+            n_fixed = _undo_rope_deinterleave(gm, factory, shared_config)
+        else:
+            n_fixed = 0
         ad_logger.info(
             f"Reversed RoPE weight de-interleave on {n_fixed} tensors "
             "(NeoX→GPTJ) for fused decode kernel."
