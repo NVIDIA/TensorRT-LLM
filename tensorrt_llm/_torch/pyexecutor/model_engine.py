@@ -11,7 +11,7 @@ import os
 import weakref
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, Hashable, List, Optional, Tuple, Union
 
 import torch
 import torch._dynamo.config
@@ -26,11 +26,11 @@ from tensorrt_llm.inputs.multimodal import (MultimodalInput, MultimodalParams,
                                             MultimodalRuntimeData,
                                             _has_mm_payload_keys,
                                             check_mm_embed_cumsum_if_needed,
-                                            strip_mm_data_for_generation,
-                                            strip_mm_encoder_inputs)
+                                            strip_mm_data_for_generation)
 from tensorrt_llm.inputs.registry import (BaseMultimodalInputProcessor,
                                           create_input_processor,
-                                          create_input_processor_with_hash)
+                                          create_input_processor_with_hash,
+                                          get_multimodal_encoder_item_metadata)
 from tensorrt_llm.llmapi.llm_args import (CudaGraphConfig, DecodingBaseConfig,
                                           EncodeCudaGraphConfig,
                                           SeqLenAwareSparseAttentionConfig,
@@ -70,6 +70,7 @@ from ..speculative import (SpecMetadata, get_draft_kv_cache_manager,
 from ..speculative.drafting_loops import BaseDraftingLoopWrapper
 from ..speculative.eagle3 import Eagle3ResourceManager, Eagle3SpecMetadata
 from ..speculative.spec_sampler_base import SampleStateTensorsSpec
+from ..tensor_lru_cache import TensorLRUCache
 from ..utils import (get_model_extra_attrs,
                      set_per_request_piecewise_cuda_graph_flag,
                      set_torch_compiling, with_model_extra_attrs)
@@ -81,7 +82,10 @@ from .cuda_graph_runner import (ENC_DEC_CUDA_GRAPH_DUMMY_TOKEN_NUM,
 from .guided_decoder import CapturableGuidedDecoder
 from .kv_cache_manager_v2 import KVCacheManagerV2
 from .layerwise_nvtx_marker import LayerwiseNvtxMarker
-from .llm_request import (LlmRequest, LlmRequestState, get_draft_token_length,
+from .llm_request import (LlmRequest, LlmRequestState,
+                          fill_mm_encoder_output_into_request,
+                          finalize_multimodal_encoder_request,
+                          get_draft_token_length,
                           get_multimodal_embedding_lengths)
 from .mamba_cache_manager import MambaHybridCacheManager
 from .model_loader import ModelLoader, _construct_checkpoint_loader
@@ -2567,11 +2571,15 @@ class PyTorchModelEngine(ModelEngine):
         request_by_id = {request.request_id: request for request in requests}
         selected_items = []
         selected_owners: List[Tuple[LlmRequest, int]] = []
+        cache_and_keys_by_id: Dict[int, Optional[Tuple[TensorLRUCache,
+                                                       List[Hashable]]]] = {}
         for request_id, item_indices in scheduled_items.items():
             request = request_by_id.get(request_id)
             if request is None:
                 raise RuntimeError(
                     f"Scheduled MM request {request_id} is no longer active")
+            cache_and_keys_by_id[
+                request_id] = self.get_mm_encoder_cache_and_keys(request)
             multimodal_param = MultimodalParams(
                 multimodal_data=request.py_multimodal_data)
             for item_idx in item_indices:
@@ -2597,49 +2605,57 @@ class PyTorchModelEngine(ModelEngine):
         for output, (request, item_idx) in zip(outputs,
                                                selected_owners,
                                                strict=True):
-            embedding_lengths = get_multimodal_embedding_lengths(request)
-            if embedding_lengths is None:
-                raise ValueError(
-                    f"MM request {request.py_request_id} is missing embedding lengths"
-                )
-            if output.shape[0] != embedding_lengths[item_idx]:
-                raise ValueError(
-                    f"MM item {item_idx} produced {output.shape[0]} embeddings; "
-                    f"expected {embedding_lengths[item_idx]}")
-            output_offsets = request.py_mm_encoder_output_offsets
-            if len(output_offsets) != len(embedding_lengths) + 1:
-                raise ValueError(
-                    f"MM request {request.py_request_id} has invalid output offsets"
-                )
-            if request.py_mm_encoder_output_buffer is None:
-                request.py_mm_encoder_output_buffer = torch.empty(
-                    (sum(embedding_lengths), *output.shape[1:]),
-                    dtype=output.dtype,
-                    device=output.device,
-                )
-            output_buffer = request.py_mm_encoder_output_buffer
-            if (output_buffer.shape[1:] != output.shape[1:]
-                    or output_buffer.dtype != output.dtype
-                    or output_buffer.device != output.device):
-                raise ValueError(
-                    "MM encoder items for one request must have matching "
-                    "output shape, dtype, and device")
-            output_start = output_offsets[item_idx]
-            output_end = output_offsets[item_idx + 1]
-            output_view = output_buffer[output_start:output_end]
-            output_view.copy_(output)
-            request.py_mm_encoder_outputs[item_idx] = output_view
+            fill_mm_encoder_output_into_request(request, item_idx, output)
+            cache_and_keys = cache_and_keys_by_id[request.request_id]
+            if cache_and_keys is not None:
+                encoder_cache, item_keys = cache_and_keys
+                # `put` clones, so the entry neither aliases the request
+                # buffer nor pins it alive after the request completes.
+                encoder_cache.put(item_keys[item_idx],
+                                  request.py_mm_encoder_outputs[item_idx])
 
         touched_requests = {
             request.request_id: request
             for request, _ in selected_owners
         }
         for request in touched_requests.values():
-            if all(output is not None
-                   for output in request.py_mm_encoder_outputs):
-                request.py_multimodal_data["multimodal_embedding"] = (
-                    request.py_mm_encoder_output_buffer)
-                strip_mm_encoder_inputs(request.py_multimodal_data)
+            finalize_multimodal_encoder_request(request)
+
+    def get_mm_encoder_cache_and_keys(
+            self, request: LlmRequest
+    ) -> Optional[Tuple[TensorLRUCache, List[Hashable]]]:
+        """Return the encoder cache and the request's per-item cache keys.
+
+        The single guard for encoder-cache participation of the item
+        scheduling path (both the pre-scheduling cache-hit attach and the encode
+        write-through). `None` means the request runs the item path without
+        the cache: the model has no enabled cache (same gate as the
+        full-request path), or the request lacks item metadata, content
+        hashes, or a processor-kwargs hash to build stable keys from.
+        """
+        # `getattr`: unit tests exercise partially constructed engines.
+        if not getattr(self, "supports_mm_encoder_item_scheduling", False):
+            return None
+        cache_getter = getattr(self.model, "_get_multimodal_encoder_cache",
+                               None)
+        if cache_getter is None:
+            return None
+        encoder_cache = cache_getter()
+        if encoder_cache is None:
+            return None
+        mm_data = request.py_multimodal_data
+        item_metadata = get_multimodal_encoder_item_metadata(mm_data)
+        if item_metadata is None:
+            return None
+        item_keys = self.model.build_encoder_cache_item_keys(
+            request.multimodal_hashes,
+            item_metadata.item_refs,
+            item_metadata.output_embedding_lengths,
+            mm_data.get("mm_processor_kwargs_hash"),
+        )
+        if item_keys is None:
+            return None
+        return encoder_cache, item_keys
 
     def _set_up_multimodal_encoder_attn_metadata(self) -> None:
         """Construct AttentionMetadata for any multimodal encoders inside the

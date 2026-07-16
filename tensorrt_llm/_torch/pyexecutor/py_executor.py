@@ -72,12 +72,16 @@ from .kv_cache_manager_v2 import KVCacheManagerV2
 from .kv_cache_stats import append_kv_cache_iteration_stats
 from .kv_cache_transceiver import (KvCacheTransceiver,
                                    is_disagg_inflight_cancel_enabled)
-from .llm_request import (ATTENTION_DP_DUMMY_REQUEST_ID,
-                          MAX_SPEC_DECODE_POSITIONS, ExecutorRequest,
-                          LlmRequest, LlmRequestState, LlmResponse,
-                          get_draft_token_length,
-                          initialize_multimodal_encoder_request,
-                          is_multimodal_encoder_ready)
+
+# isort and yapf disagree on how to wrap the block below.
+# isort: off
+from .llm_request import (
+    ATTENTION_DP_DUMMY_REQUEST_ID, MAX_SPEC_DECODE_POSITIONS, ExecutorRequest,
+    LlmRequest, LlmRequestState, LlmResponse,
+    fill_mm_encoder_output_into_request, finalize_multimodal_encoder_request,
+    get_draft_token_length, initialize_multimodal_encoder_request,
+    is_multimodal_encoder_ready)
+# isort: on
 from .mamba_cache_manager import (BaseMambaCacheManager,
                                   MixedMambaHybridCacheManager)
 from .model_engine import ModelEngine
@@ -5329,12 +5333,42 @@ class PyExecutor:
         self.batch_wait_iters_count = 0
         return context_requests
 
+    def _attach_mm_encoder_cache_hits(self) -> None:
+        """Complete pending MM items from the encoder cache before scheduling.
+
+        Cache hits are stored into the request's item slots ahead of
+        scheduler selection, so they neither consume the encoder budgets nor
+        get re-encoded. A request with remaining misses becomes PARTIAL and
+        keeps following the item path, which re-computes only those misses; a
+        fully attached request graduates to READY without any encoder work.
+        """
+        for request in self.active_requests:
+            if (not request.py_is_multimodal_encoder_request
+                    or is_multimodal_encoder_ready(request)):
+                continue
+            cache_and_keys = self.model_engine.get_mm_encoder_cache_and_keys(
+                request)
+            if cache_and_keys is None:
+                continue
+            encoder_cache, item_keys = cache_and_keys
+            for item_idx, output in enumerate(request.py_mm_encoder_outputs):
+                if output is not None:
+                    continue
+                cached_output = encoder_cache.get(item_keys[item_idx])
+                if cached_output is None:
+                    continue
+                fill_mm_encoder_output_into_request(request, item_idx,
+                                                    cached_output)
+            finalize_multimodal_encoder_request(request)
+
     @nvtx_range("_schedule")
     def _schedule(self):
         if hasattr(self.kv_cache_manager, "prepare_expect_snapshot_points"):
             self.kv_cache_manager.prepare_expect_snapshot_points(
                 self.active_requests)
 
+        if self._supports_mm_encoder_item_scheduling:
+            self._attach_mm_encoder_cache_hits()
         scheduler_output = self.scheduler.schedule_request(
             self.active_requests, self.inflight_req_ids)
 

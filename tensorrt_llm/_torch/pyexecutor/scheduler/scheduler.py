@@ -21,8 +21,6 @@ from tensorrt_llm.logger import logger
 from ..llm_request import (
     LlmRequest,
     LlmRequestState,
-    MultimodalEncoderProgress,
-    get_multimodal_encoder_progress,
     get_multimodal_encoder_token_lengths,
     is_multimodal_encoder_ready,
 )
@@ -553,35 +551,6 @@ class MultimodalScheduler(RequestScheduler):
 
         return selected, llm_eligible
 
-    def _can_schedule_full_request_mm_batch(self, requests: RequestList) -> bool:
-        """Return whether MM requests can use full-request batch encoding.
-
-        Keeping full-request encoding for an in-budget batch avoids item-state
-        bookkeeping and preserves its established latency characteristics.
-        Once item scheduling has made partial progress, continue through the
-        item path until the request is complete.
-        """
-        remaining_items = self.max_num_items
-        remaining_tokens = self.max_num_tokens
-
-        for request in requests:
-            if not request.py_is_multimodal_encoder_request:
-                continue
-            progress = get_multimodal_encoder_progress(request)
-            if progress is MultimodalEncoderProgress.READY:
-                continue
-            token_lengths = get_multimodal_encoder_token_lengths(request)
-            if token_lengths is None:
-                return False
-            if progress is MultimodalEncoderProgress.PARTIAL:
-                return False
-            if len(token_lengths) > remaining_items or sum(token_lengths) > remaining_tokens:
-                return False
-            remaining_items -= len(token_lengths)
-            remaining_tokens -= sum(token_lengths)
-
-        return True
-
     def _schedule_micro_batch(
         self,
         fitting_requests: RequestList,
@@ -611,23 +580,21 @@ class MultimodalScheduler(RequestScheduler):
         """Apply the default LLM-capacity-coupled MM scheduling policy.
 
         First use the wrapped scheduler to determine which requests fit
-        LLM/KV capacity. If all pending MM work for those requests fits the
-        encoder budgets, preserve the existing full-request encoder path.
-        Otherwise, select atomic MM items and allow only requests whose
-        encoder outputs are ready, or become ready this iteration, into LLM
-        microbatch scheduling.
+        LLM/KV capacity, then select their pending atomic MM items under the
+        encoder budgets. The executor's encoder step is the single site that
+        runs MM encoders: an in-budget batch is simply the case where every
+        pending item gets selected. Only requests whose encoder outputs are
+        ready, or become ready this iteration, enter LLM microbatch
+        scheduling.
         """
         if not self.has_separate_stages:
             # Compatibility path for schedulers exposing only a combined API:
             # schedule the LLM batch first, then enforce MM budgets on its
-            # context requests.
+            # context requests, withholding contexts that will still lack MM
+            # embeddings after this iteration.
             scheduler_output = self.scheduler.schedule_request(
                 active_requests, inflight_request_ids
             )
-            if self._can_schedule_full_request_mm_batch(list(scheduler_output.context_requests)):
-                return scheduler_output
-            # Select atomic items and withhold contexts that will still lack
-            # MM embeddings after this iteration.
             selected_items, llm_eligible = self._select_items(
                 list(scheduler_output.context_requests)
             )
@@ -641,17 +608,7 @@ class MultimodalScheduler(RequestScheduler):
         fitting_requests, fitting_disagg_gen_init_requests, paused_requests = (
             self.scheduler.capacity_scheduler.schedule_request(active_requests)
         )
-        selected_items = None
-        if self._can_schedule_full_request_mm_batch(list(fitting_requests)):
-            # Fast path: preserve full-request MM encoding and ordinary
-            # microbatch scheduling when the complete fitting set is within
-            # encoder budgets.
-            llm_eligible = fitting_requests
-        else:
-            # Item path: pack atomic MM items under the separate encoder
-            # budgets. Only ready or same-iteration-completing requests may
-            # enter the LLM batch.
-            selected_items, llm_eligible = self._select_items(list(fitting_requests))
+        selected_items, llm_eligible = self._select_items(list(fitting_requests))
         # Preserve the capacity scheduler's decisions while attaching the MM
         # item plan that the executor must run before the selected LLM
         # microbatch.

@@ -599,14 +599,59 @@ class MultimodalModelMixin:
         # different request layout; the current request order is restored when cached item tensors
         # are concatenated below.
         return [
-            (
-                modality,
-                tuple(item_hash),
-                int(embedding_length),
-                kwargs_hash,
-            )
+            cls._encoder_cache_item_key(modality, item_hash, embedding_length, kwargs_hash)
             for item_hash, embedding_length in zip(
                 mm_input.multimodal_hashes,
+                embedding_lengths,
+                strict=True,
+            )
+        ]
+
+    @staticmethod
+    def _encoder_cache_item_key(
+        modality: str,
+        item_hash: Sequence[int],
+        embedding_length: int,
+        kwargs_hash: str,
+    ) -> Hashable:
+        """Build the cache key of one atomic item.
+
+        The single source of the key format: the full-request path
+        (`_encoder_cache_keys`) and the item-scheduling path
+        (`build_encoder_cache_item_keys`) must produce identical keys so
+        entries written by either path hit from the other.
+        """
+        return (modality, tuple(item_hash), int(embedding_length), kwargs_hash)
+
+    @classmethod
+    def build_encoder_cache_item_keys(
+        cls,
+        multimodal_hashes: Optional[Sequence[Sequence[int]]],
+        item_refs: Sequence[tuple[str, int]],
+        embedding_lengths: Sequence[int],
+        kwargs_hash: Optional[str],
+    ) -> Optional[list[Hashable]]:
+        """Build per-item cache keys from request-level item metadata.
+
+        Unlike `_encoder_cache_keys`, the modality comes from each item's
+        `item_refs` entry, so mixed-modality requests are keyable per item.
+        Returns `None` when the request cannot participate in the cache
+        (missing hashes or kwargs hash, or item counts that do not line up).
+        """
+        if multimodal_hashes is None or kwargs_hash is None:
+            return None
+        if not (len(multimodal_hashes) == len(item_refs) == len(embedding_lengths)):
+            logger.debug(
+                f"{_MM_ENCODER_CACHE_LOG_NAME}: skipping item keys with "
+                "mismatched multimodal_hashes, item_refs, and "
+                "multimodal_embedding_lengths counts"
+            )
+            return None
+        return [
+            cls._encoder_cache_item_key(modality, item_hash, embedding_length, kwargs_hash)
+            for (modality, _), item_hash, embedding_length in zip(
+                item_refs,
+                multimodal_hashes,
                 embedding_lengths,
                 strict=True,
             )
@@ -638,6 +683,11 @@ class MultimodalModelMixin:
                 # `get_multimodal_embeddings` treats a param as either fully cached or uncached.
                 # Attaching partial hits would make the later concatenated tensor ambiguous because
                 # there is no placeholder for missing item rows inside `multimodal_embedding`.
+                # For models with item-level encoder scheduling the executor loop encodes
+                # exclusively through the item path (pre-scheduling cache-hit attachment plus
+                # per-item encoding of the misses), so this limitation applies to the remaining
+                # full-request consumers: side-stream prefetch, mm_encoder_only/disagg encoding,
+                # and cache-enabled models without item scheduling.
                 logger.debug(
                     f"{_MM_ENCODER_CACHE_LOG_NAME}: cache miss; hit_items={len(cached_embeddings)},"
                     f" total_items={len(keys)}."

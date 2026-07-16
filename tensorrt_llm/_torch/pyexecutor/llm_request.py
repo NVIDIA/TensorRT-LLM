@@ -15,6 +15,7 @@ from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.bindings import executor as tllm_executor
 from tensorrt_llm.executor.result import SimpleTokenLogprobs, TokenLogprobs
+from tensorrt_llm.inputs.multimodal import strip_mm_encoder_inputs
 from tensorrt_llm.inputs.registry import get_multimodal_encoder_item_metadata
 from tensorrt_llm.sampling_params import LogprobMode
 
@@ -58,8 +59,7 @@ class MultimodalEncoderProgress(Enum):
     """Python-only progress derived from request-local MM item outputs."""
 
     PENDING = auto()
-    """No MM item of the request has an encoder output yet; the request may
-    still take the full-request batch encoding path."""
+    """No MM item of the request has an encoder output yet."""
 
     PARTIAL = auto()
     """Some but not all items are encoded; the request must continue on the
@@ -708,12 +708,14 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         # scheduler must encode before the request may enter LLM prefill.
         self.py_is_multimodal_encoder_request = False
         # One slot per atomic MM item, in prompt order. `None` until the
-        # item's encoder forward ran; then a view into the shared
-        # `py_mm_encoder_output_buffer`. All-set == encoder READY.
+        # item is filled (by a fresh encoder forward or an embeddings-cache
+        # hit); then a view into the shared `py_mm_encoder_output_buffer`.
+        # All-set == encoder READY.
         self.py_mm_encoder_outputs: List[Optional[torch.Tensor]] = []
-        # Single preallocated embedding tensor covering all items; the
-        # per-item views above alias rows of it so items encoded across
-        # different iterations land in one contiguous fuse-ready buffer.
+        # Single lazily allocated embedding tensor covering all items; the
+        # per-item views above alias rows of it so items filled across
+        # different iterations and sources land in one contiguous
+        # fuse-ready buffer.
         self.py_mm_encoder_output_buffer: Optional[torch.Tensor] = None
         # Row offsets of each item within the buffer:
         # `accumulate(embedding_lengths, initial=0)`.
@@ -1160,6 +1162,63 @@ def initialize_multimodal_encoder_request(request: LlmRequest,
                              "multimodal_embedding_lengths")
         request.py_mm_encoder_output_offsets = list(
             accumulate(embedding_lengths, initial=0))
+
+
+def fill_mm_encoder_output_into_request(request: LlmRequest, item_idx: int,
+                                        output: torch.Tensor) -> None:
+    """Copy one item's encoder output into the request-owned buffer and slot.
+
+    The single writer of the request's per-item MM encoder state: both the
+    encode path and the cache-hit attach path fill items through here, so
+    validation and buffer allocation cannot diverge.
+
+    ``output`` may come from a fresh encoder forward or from the embeddings
+    cache; either way its rows are copied into the request's contiguous
+    output buffer at this item's reserved offsets, and the item slot records
+    the resulting view. Because the request owns the copy, the source
+    tensor's lifetime (for example, a later cache eviction) cannot affect
+    the request's progress.
+
+    Raises when the output does not match the item's reserved row count or
+    the buffer's shape/dtype/device.
+    """
+    output_offsets = request.py_mm_encoder_output_offsets
+    expected_rows = output_offsets[item_idx + 1] - output_offsets[item_idx]
+    if output.shape[0] != expected_rows:
+        raise ValueError(
+            f"MM item {item_idx} produced {output.shape[0]} embeddings; "
+            f"expected {expected_rows}")
+    if request.py_mm_encoder_output_buffer is None:
+        request.py_mm_encoder_output_buffer = torch.empty(
+            (output_offsets[-1], *output.shape[1:]),
+            dtype=output.dtype,
+            device=output.device,
+        )
+    output_buffer = request.py_mm_encoder_output_buffer
+    if (output_buffer.shape[1:] != output.shape[1:]
+            or output_buffer.dtype != output.dtype
+            or output_buffer.device != output.device):
+        raise ValueError("MM encoder items for one request must have matching "
+                         "output shape, dtype, and device")
+    output_view = output_buffer[output_offsets[item_idx]:output_offsets[item_idx
+                                                                        + 1]]
+    output_view.copy_(output)
+    request.py_mm_encoder_outputs[item_idx] = output_view
+
+
+def finalize_multimodal_encoder_request(request: LlmRequest) -> bool:
+    """Publish the fuse-ready embedding once every item slot is filled.
+
+    Attaches the shared buffer as `multimodal_embedding` and drops the raw
+    pre-encoder inputs. Returns whether the request completed.
+    """
+    if not request.py_mm_encoder_outputs or any(
+            output is None for output in request.py_mm_encoder_outputs):
+        return False
+    request.py_multimodal_data["multimodal_embedding"] = (
+        request.py_mm_encoder_output_buffer)
+    strip_mm_encoder_inputs(request.py_multimodal_data)
+    return True
 
 
 def get_multimodal_encoder_progress(
