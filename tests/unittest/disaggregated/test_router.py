@@ -107,6 +107,24 @@ async def test_coordinator_finish_retry_is_bounded():
 
     assert session.post.call_count == 3
     assert sleep.await_count == 2
+    assert all(call.kwargs["timeout"] == 5
+               for call in session.post.call_args_list)
+
+
+@pytest.mark.asyncio
+async def test_coordinator_finish_queue_is_bounded():
+    local_router = RoundRobinRouter(server_role=None, servers=["server1"])
+    router = CoordinatorDelegatingRouter("http://coordinator", local_router,
+                                         "generation")
+    router._finish_queue = asyncio.Queue(maxsize=1)
+    router._ensure_finish_workers = mock.Mock()
+
+    request = mock.Mock()
+    await router.finish_request(request, req_id=1)
+    await router.finish_request(request, req_id=2)
+
+    assert router._finish_queue.qsize() == 1
+    assert router._dropped_finishes == 1
 
 
 @pytest.fixture(autouse=True)
@@ -821,7 +839,7 @@ def test_kv_cache_aware_server_state_remove_blocks_silent_on_missing():
 
 
 @pytest.mark.asyncio
-async def test_kv_cache_aware_router_does_not_wait_for_finish_to_apply_blocks(
+async def test_kv_cache_aware_router_applies_blocks_after_successful_finish(
         servers):
     tokens_per_block = 4
     token_lists = [[2000, 2001, 2002, 2003, 2004, 2005, 2006, 2007, 2008]]
@@ -839,7 +857,7 @@ async def test_kv_cache_aware_router_does_not_wait_for_finish_to_apply_blocks(
     hash_algo = info["hash_algo"]
 
     assert await router._server_state[server].matched_tokens(
-        info["block_hashes"], hash_algo=hash_algo) == 8
+        info["block_hashes"], hash_algo=hash_algo) == 0
 
     await router.finish_request(request)
 
@@ -872,7 +890,7 @@ async def test_kv_cache_aware_router_routed_blocks_disabled_skips_pending(
 
 
 @pytest.mark.asyncio
-async def test_kv_cache_aware_router_keeps_routed_blocks_on_failure(servers):
+async def test_kv_cache_aware_router_discards_routed_blocks_on_failure(servers):
     tokens_per_block = 4
     token_lists = [[4000, 4001, 4002, 4003, 4004, 4005, 4006, 4007, 4008]]
     router = KvCacheAwareRouter(server_role=None,
@@ -886,12 +904,12 @@ async def test_kv_cache_aware_router_keeps_routed_blocks_on_failure(servers):
                                 prompt=copy.deepcopy(token_lists))
     server, info = await router.get_next_server(request)
     assert await router._server_state[server].matched_tokens(
-        info["block_hashes"], hash_algo=info["hash_algo"]) == 8
+        info["block_hashes"], hash_algo=info["hash_algo"]) == 0
 
     await router.finish_request(request, success=False)
 
     assert await router._server_state[server].matched_tokens(
-        info["block_hashes"], hash_algo=info["hash_algo"]) == 8
+        info["block_hashes"], hash_algo=info["hash_algo"]) == 0
 
 
 @pytest.mark.asyncio

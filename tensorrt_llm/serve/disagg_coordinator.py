@@ -220,14 +220,22 @@ class DisaggCoordinatorService(DisaggCoordinator):
         if previous is not None:
             previous.cancel()
             await router.finish_request_by_id(req_id, False)
-        result = await router.get_next_server_by_key(
+        server, info, request_id = await router.get_next_server_by_key(
             routing_key, req_id=req_id, exclude_server=exclude_server
         )
         self._reservation_tasks[reservation_key] = asyncio.create_task(
             self._expire_reservation(reservation_key, router)
         )
         self._api_lat(f"select[{role}]").record(time.monotonic() - _t0)
-        return result
+        return server, self._compact_route_info(info), request_id
+
+    @staticmethod
+    def _compact_route_info(info: dict) -> dict:
+        compact = {key: info[key] for key in ("match_length", "num_tokens") if key in info}
+        disaggregated_params = info.get("server_info", {}).get("disaggregated_params")
+        if disaggregated_params is not None:
+            compact["server_info"] = {"disaggregated_params": disaggregated_params}
+        return compact
 
     async def get_disagg_request_id(self) -> int:
         return get_global_disagg_request_id(self._config.node_id)
@@ -605,11 +613,20 @@ class CoordinatorClient(DisaggCoordinator):
             if isinstance(router, CoordinatorDelegatingRouter):
                 continue
             desired = set(servers)
+            for server in desired - set(router.servers):
+                if not await router.add_server(server):
+                    raise RuntimeError(
+                        f"Failed to prepare {server} before adding it to the "
+                        f"{router.server_role.name} router"
+                    )
+            await router.prepare_servers(list(desired))
+            unprepared = desired - router.prepared_servers
+            if unprepared:
+                raise RuntimeError(
+                    f"Servers are not prepared for {router.server_role.name}: {sorted(unprepared)}"
+                )
             for server in set(router.servers) - desired:
                 await router.remove_server(server)
-            for server in desired - set(router.servers):
-                await router.add_server(server)
-            await router.prepare_servers()
 
     async def cluster_info(self) -> Dict[str, Any]:
         try:

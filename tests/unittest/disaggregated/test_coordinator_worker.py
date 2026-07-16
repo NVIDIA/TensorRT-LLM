@@ -268,6 +268,28 @@ async def test_coordinator_expires_stale_reservation():
     assert coordinator._reservation_tasks == {}
 
 
+def test_coordinator_compacts_route_info():
+    compact = DisaggCoordinatorService._compact_route_info(
+        {
+            "block_hashes": [["large-hash"]],
+            "hash_algo": KV_CACHE_HASH_ALGO_V2,
+            "matches": [64, 32],
+            "match_length": 64,
+            "num_tokens": 128,
+            "server_info": {
+                "tokens_per_block": 32,
+                "disaggregated_params": {"ctx_info_endpoint": "tcp://ctx"},
+            },
+        }
+    )
+
+    assert compact == {
+        "match_length": 64,
+        "num_tokens": 128,
+        "server_info": {"disaggregated_params": {"ctx_info_endpoint": "tcp://ctx"}},
+    }
+
+
 def test_coordinator_reservation_timeout_env(monkeypatch):
     monkeypatch.delenv(COORDINATOR_RESERVATION_TIMEOUT_ENV, raising=False)
     assert coordinator_reservation_timeout() == 180
@@ -354,6 +376,7 @@ async def test_cluster_info_updates_readiness_and_stateless_servers():
     client.ctx_router.remove_server = AsyncMock(wraps=client.ctx_router.remove_server)
     client.ctx_router.add_server = AsyncMock(wraps=client.ctx_router.add_server)
     client.ctx_router.prepare_servers = AsyncMock()
+    client.ctx_router._fetch_server_info = AsyncMock(return_value={})
 
     await client._apply_cluster_info(
         {
@@ -473,6 +496,24 @@ async def test_stateless_router_syncs_coordinator_server_add_remove():
 
     assert client.ctx_router.servers == ["ctx-new:8001"]
     client.ctx_router._fetch_server_info.assert_awaited_once_with("ctx-new:8001", None)
+    await client.stop()
+
+
+@pytest.mark.asyncio
+async def test_stateless_router_keeps_old_server_when_replacement_is_unprepared():
+    config = _make_config(["ctx-old:8000"], [], "round_robin", "round_robin")
+    client = CoordinatorClient("http://coordinator", config)
+    client.ctx_router._prepared_ready_servers.add("ctx-old:8000")
+    client.ctx_router._fetch_server_info = AsyncMock(
+        side_effect=RuntimeError("server info unavailable")
+    )
+
+    with pytest.raises(RuntimeError, match="Failed to prepare ctx-new:8001"):
+        await client._sync_stateless_routers(
+            {"server_lists": {"context": ["ctx-new:8001"], "generation": []}}
+        )
+
+    assert client.ctx_router.servers == ["ctx-old:8000"]
     await client.stop()
 
 

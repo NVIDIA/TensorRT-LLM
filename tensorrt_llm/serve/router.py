@@ -40,6 +40,10 @@ from tensorrt_llm.serve.router_utils import (  # noqa: F401
 _MSGPACK_HEADERS = {"Content-Type": "application/msgpack"}
 COORDINATOR_FINISH_MAX_ATTEMPTS = 3
 COORDINATOR_FINISH_RETRY_DELAY_S = 0.1
+COORDINATOR_FINISH_TIMEOUT_S = 5.0
+COORDINATOR_FINISH_WORKERS = 16
+COORDINATOR_FINISH_QUEUE_SIZE = 4096
+COORDINATOR_FINISH_DRAIN_TIMEOUT_S = 5.0
 
 # Max number of conversations whose home-server pin is retained (LRU).
 ROUTE_AFFINITY_CACHE_SIZE = 50000
@@ -269,6 +273,13 @@ class LoadBalancingMixin:
         return self._server_state_class(server, self._use_tokens,
                                         lambda: self.session)
 
+    def _stage_server(self, server: str) -> None:
+        self._server_state.setdefault(server, self._create_server_state(server))
+
+    def _unstage_server(self, server: str) -> None:
+        if server not in self._servers:
+            self._server_state.pop(server, None)
+
     def _get_server_load(self, server: str) -> int:
         state = self._server_state[server]
         return state._num_active_tokens if self._use_tokens \
@@ -299,7 +310,7 @@ class LoadBalancingMixin:
                              exclude_server: Optional[str] = None
                              ) -> Optional[str]:
         """Pick the server with the lowest load. Round-robin breaks ties."""
-        candidates = [s for s in self._server_state if s != exclude_server]
+        candidates = [s for s in self._servers if s != exclude_server]
         if not candidates:
             return None
         loads = {s: self._get_server_load(s) for s in candidates}
@@ -365,6 +376,14 @@ class Router(ABC):
     def num_prepared_servers(self) -> int:
         return len(self._prepared_ready_servers)
 
+    @property
+    def prepared_servers(self) -> set[str]:
+        return set(self._prepared_ready_servers)
+
+    @property
+    def server_role(self) -> ServerRole:
+        return self._server_role
+
     @staticmethod
     def _ensure_url(server: str) -> str:
         return server if server.startswith("http") else f"http://{server}"
@@ -398,23 +417,45 @@ class Router(ABC):
             logger.warning(f"Error preparing server {server}: {e}")
 
     async def prepare_servers(self, servers: Optional[List[str]] = None):
-        for server in servers or self._servers:
+        targets = self._servers if servers is None else servers
+        for server in targets:
             if server not in self._servers:
                 continue
             await self._prepare_server(server)
 
-    async def add_server(self, server: str):
+    def _stage_server(self, server: str) -> None:
+        pass
+
+    def _unstage_server(self, server: str) -> None:
+        pass
+
+    async def add_server(self, server: str) -> bool:
         if server in self._servers:
             logger.warning(f"Server {server} already exists")
-            return
+            return True
         async with self._lock:
-            old_servers = self._servers.copy()
-            self._servers = [*old_servers, server]
-            self._on_servers_updated(old_servers, self._servers)
-        await self._prepare_server(server)
+            self._stage_server(server)
+        try:
+            await self._prepare_server(server)
+        except Exception:
+            async with self._lock:
+                self._unstage_server(server)
+            raise
+        if server not in self._prepared_ready_servers:
+            async with self._lock:
+                self._unstage_server(server)
+            logger.warning(
+                f"Server {server} was not added because preparation failed")
+            return False
+        async with self._lock:
+            if server not in self._servers:
+                old_servers = self._servers.copy()
+                self._servers = [*old_servers, server]
+                self._on_servers_updated(old_servers, self._servers)
         logger.debug(
             f"Added server {server}, {self._server_role.name} current server list: {self._servers}"
         )
+        return True
 
     async def remove_server(self, server: str):
         if server not in self._servers:
@@ -771,6 +812,7 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
         self._load_weight = load_weight
         self._load_cap = load_cap
         self._track_routed_blocks = track_routed_blocks
+        self._pending_routed_blocks: dict[int, tuple[list[BlockHash], str]] = {}
         # A coordinator client has no local server pool. The coordinator injects
         # the role's effective hash algorithm so this router can act solely as a
         # routing-key encoder.
@@ -786,14 +828,13 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
             await state.cancel_poll_task()
         await super().close()
 
-    def _apply_routed_blocks_on_route(self, server: str,
-                                      block_hashes: list[list[BlockHash]],
-                                      hash_algo: str) -> None:
+    def _stash_routed_blocks(self, key: int,
+                             block_hashes: list[list[BlockHash]],
+                             hash_algo: str) -> None:
         if not self._track_routed_blocks:
             return
         flat_block_hashes = [h for hashes in block_hashes for h in hashes]
-        self._server_state[server].add_blocks(flat_block_hashes,
-                                              hash_algo=hash_algo)
+        self._pending_routed_blocks[key] = (flat_block_hashes, hash_algo)
 
     def _get_server_hash_algo(self, server: str) -> str:
         # Lock-free attribute read; state is seeded at handshake and refreshed
@@ -950,7 +991,7 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
             server_states = {
                 server: state
                 for server, state in self._server_state.items()
-                if server != exclude_server
+                if server in self._servers and server != exclude_server
             }
         servers = list(server_states)
         if not servers:
@@ -1010,8 +1051,7 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
             await server_states[server].increment_load(request)
             self._req_routing_table[key] = server
             try:
-                self._apply_routed_blocks_on_route(server, block_hashes,
-                                                   hash_algo)
+                self._stash_routed_blocks(key, block_hashes, hash_algo)
             except Exception:
                 self._req_routing_table.pop(key, None)
                 await server_states[server].decrement_load(request)
@@ -1020,6 +1060,7 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
             "block_hashes": block_hashes,
             "hash_algo": hash_algo,
             "matches": matches,
+            "match_length": matches[winner],
             "num_tokens": num_tokens,
             "server_info": self._server_info.get(server, {}),
         }, req_id
@@ -1041,13 +1082,18 @@ class KvCacheAwareRouter(BlockHashMixin, LoadBalancingMixin, Router):
         """Finish through the core shared by standalone and coordinator paths.
 
         This removes the maps populated by ``_route``, decrements load, and
-        refreshes the block table. Routed blocks are applied at route time.
+        applies routed blocks only after successful completion.
         """
-        del success
         async with self._lock:
             server = self._req_routing_table.pop(key, None)
+            pending = self._pending_routed_blocks.pop(key, None)
             if server is not None and server in self._server_state:
                 await self._server_state[server].decrement_load(request)
+        if (success and pending is not None and server is not None
+                and server in self._server_state):
+            block_hashes, hash_algo = pending
+            self._server_state[server].add_blocks(block_hashes,
+                                                  hash_algo=hash_algo)
         self._poll_server_on_finish(server, session)
 
     def _poll_server_on_finish(self, server, session=None):
@@ -1627,7 +1673,10 @@ class CoordinatorDelegatingRouter(Router):
         self._role = role  # "context" | "generation"
         self._request_timeout_s = request_timeout_s
         self._session: Optional[aiohttp.ClientSession] = None
-        self._background_tasks: set[asyncio.Task] = set()
+        self._finish_queue: asyncio.Queue[tuple[int, bool]] = asyncio.Queue(
+            maxsize=COORDINATOR_FINISH_QUEUE_SIZE)
+        self._finish_workers: set[asyncio.Task] = set()
+        self._dropped_finishes = 0
         # Coordinator HTTP-client API latency (includes network round-trip to the
         # coordinator + its in-process handler). Compare against the owner-side
         # [coord_api] to isolate the fleet /select|/finish HTTP overhead.
@@ -1713,15 +1762,36 @@ class CoordinatorDelegatingRouter(Router):
                              session: Optional[aiohttp.ClientSession] = None,
                              success: bool = True,
                              req_id: Optional[int] = None):
-        # Fire-and-forget: /finish only releases the coordinator's routed-load
-        # bookkeeping, so run it as a background task instead of awaiting the HTTP
-        # round trip on every request's critical path. Capture req_id first (the
-        # request may be freed after return); errors are logged, not propagated.
+        # /finish only releases coordinator bookkeeping, so enqueue it off the
+        # request path. A fixed worker pool bounds tasks and connections during a
+        # coordinator outage; overflow relies on coordinator-side expiration.
         del session
         req_id = self._request_id(request, req_id)
-        task = asyncio.create_task(self._finish_async(req_id, success))
-        self._background_tasks.add(task)
-        task.add_done_callback(self._background_tasks.discard)
+        self._ensure_finish_workers()
+        try:
+            self._finish_queue.put_nowait((req_id, success))
+        except asyncio.QueueFull:
+            self._dropped_finishes += 1
+            if self._dropped_finishes == 1 or self._dropped_finishes % 1000 == 0:
+                logger.warning(
+                    f"CoordinatorDelegatingRouter finish queue full; "
+                    f"coordinator expiration will release dropped requests "
+                    f"(dropped={self._dropped_finishes})")
+
+    def _ensure_finish_workers(self) -> None:
+        if self._finish_workers:
+            return
+        for _ in range(COORDINATOR_FINISH_WORKERS):
+            task = asyncio.create_task(self._finish_worker())
+            self._finish_workers.add(task)
+
+    async def _finish_worker(self) -> None:
+        while True:
+            req_id, success = await self._finish_queue.get()
+            try:
+                await self._finish_async(req_id, success)
+            finally:
+                self._finish_queue.task_done()
 
     async def _finish_async(self, req_id: int, success: bool):
         _t0 = time.monotonic()
@@ -1737,7 +1807,8 @@ class CoordinatorDelegatingRouter(Router):
                             },
                             use_bin_type=True),
                         headers=_MSGPACK_HEADERS,
-                        timeout=self._request_timeout_s) as resp:
+                        timeout=min(self._request_timeout_s,
+                                    COORDINATOR_FINISH_TIMEOUT_S)) as resp:
                     if resp.status != 200:
                         raw_body = await resp.read()
                         try:
@@ -1764,9 +1835,19 @@ class CoordinatorDelegatingRouter(Router):
                                     (2**(attempt - 1)))
 
     async def close(self):
-        if self._background_tasks:
-            await asyncio.gather(*self._background_tasks,
-                                 return_exceptions=True)
+        if self._finish_workers:
+            try:
+                await asyncio.wait_for(
+                    self._finish_queue.join(),
+                    timeout=COORDINATOR_FINISH_DRAIN_TIMEOUT_S)
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Timed out draining coordinator finish queue; "
+                    "coordinator expiration will release remaining requests")
+            for task in self._finish_workers:
+                task.cancel()
+            await asyncio.gather(*self._finish_workers, return_exceptions=True)
+            self._finish_workers.clear()
         if self._session is not None:
             await self._session.close()
             self._session = None

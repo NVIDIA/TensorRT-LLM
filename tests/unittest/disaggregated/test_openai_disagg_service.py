@@ -23,6 +23,7 @@ import torch
 from tensorrt_llm.disaggregated_params import DisaggregatedParams as LlmDisaggregatedParams
 from tensorrt_llm.executor.result import Logprob
 from tensorrt_llm.llmapi.disagg_utils import (
+    ConditionalDisaggConfig,
     DisaggClusterConfig,
     DisaggServerConfig,
     MinimalInstances,
@@ -55,7 +56,7 @@ from tensorrt_llm.serve.postprocess_handlers import (
     chat_response_post_processor,
     completion_response_post_processor,
 )
-from tensorrt_llm.serve.router import Router
+from tensorrt_llm.serve.router import KvCacheAwareRouter, Router
 
 
 def _client_factory(*_args, **_kwargs):
@@ -76,6 +77,29 @@ def _make_service(schedule_style: str) -> OpenAIDisaggregatedService:
     service._ctx_router = ctx_router
     service._gen_router = gen_router
     return service
+
+
+@pytest.mark.asyncio
+async def test_conditional_disagg_uses_selected_server_match_length():
+    service = _make_service("context_first")
+    service._config.conditional_disagg_config = ConditionalDisaggConfig(max_local_prefill_length=32)
+    router = KvCacheAwareRouter(server_role=ServerRole.GENERATION, servers=[])
+    router.get_next_server = AsyncMock(
+        return_value=(
+            "gen:8000",
+            {
+                "match_length": 64,
+                "num_tokens": 96,
+            },
+        )
+    )
+    service._gen_router = router
+    request = CompletionRequest(model="model", prompt=[1] * 96)
+
+    server, need_context = await service._check_conditional_disagg(request, 123)
+
+    assert server == "gen:8000"
+    assert need_context is False
 
 
 def _make_completion_response(
