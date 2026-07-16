@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import numpy as np
 
 from tensorrt_llm._torch.disaggregation.base.region import (
@@ -6,9 +21,8 @@ from tensorrt_llm._torch.disaggregation.base.region import (
     SpecRegionPair,
 )
 from tensorrt_llm._torch.disaggregation.native.mixers.attention.peer import (
-    HeadMatchMapper,
-    HeadMismatchMapper,
-    IdentityMapper,
+    HNDHeadMismatchMapper,
+    IntactMapper,
 )
 from tensorrt_llm._torch.disaggregation.native.mixers.attention.spec import AttentionInfo
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
@@ -81,12 +95,13 @@ def test_spec_region_and_spec_region_pair():
     assert pair.dst.spec == "spec_dst"
 
 
-def test_identity_mapper():
+def test_intact_mapper_identity_degenerate():
+    """Full contiguous overlap degrades to a whole-region pass-through copy."""
     src_group = MemRegionGroup(ptrs=np.array([100, 200], dtype=np.int64), bytes_per_region=32)
     dst_group = MemRegionGroup(ptrs=np.array([300, 400], dtype=np.int64), bytes_per_region=32)
     src_spec = SpecRegion(memory=src_group, spec="a")
     dst_spec = SpecRegion(memory=dst_group, spec="b")
-    mapper = IdentityMapper()
+    mapper = IntactMapper([0, 16], [0, 16], 16, 16)
     result = mapper.map(src_spec, dst_spec)
     assert isinstance(result, SpecRegionPair)
     np.testing.assert_array_equal(result.src.memory.ptrs, [100, 200])
@@ -95,14 +110,11 @@ def test_identity_mapper():
     assert result.dst.memory.bytes_per_region == 32
 
 
-def test_head_match_mapper():
+def test_intact_mapper_partial_layers():
+    """Selecting a contiguous layer subset yields one shifted fragment."""
     self_ri = make_rankinfo(kv_heads_per_rank=2)
-    peer_ri = make_rankinfo(kv_heads_per_rank=2)
-    transfer_layers = 2
-    src_layer_off = 1
-    dst_layer_off = 1
-    # slot_size_per_layer = kv_factor * kv_heads * tokens_per_block * dims_per_head * element_bytes
-    slot_size_per_layer = (
+    # bytes_per_layer = kv_factor * kv_heads * tokens_per_block * dims_per_head * element_bytes
+    bytes_per_layer = (
         self_ri.attention.kv_factor
         * self_ri.attention.kv_heads_per_rank
         * self_ri.attention.tokens_per_block
@@ -113,39 +125,43 @@ def test_head_match_mapper():
     dst_group = MemRegionGroup(ptrs=np.array([30, 40], dtype=np.int64), bytes_per_region=1)
     src_spec = SpecRegion(memory=src_group, spec="srcspec")
     dst_spec = SpecRegion(memory=dst_group, spec="dstspec")
-    mapper = HeadMatchMapper(
-        transfer_layers,
-        src_layer_off,
-        dst_layer_off,
-        self_ri,
-        peer_ri,
-        slot_size_per_layer=slot_size_per_layer,
-    )
+    # Layers 1..2 of a 3-layer slot on both sides.
+    offsets = [bytes_per_layer, 2 * bytes_per_layer]
+    mapper = IntactMapper(offsets, offsets, bytes_per_layer, bytes_per_layer)
     result = mapper.map(src_spec, dst_spec)
-    expected_off = transfer_layers * slot_size_per_layer
+    expected_bytes = 2 * bytes_per_layer
     np.testing.assert_array_equal(
-        result.src.memory.ptrs, [10 + mapper._src_block_off, 20 + mapper._src_block_off]
+        result.src.memory.ptrs, [10 + bytes_per_layer, 20 + bytes_per_layer]
     )
     np.testing.assert_array_equal(
-        result.dst.memory.ptrs, [30 + mapper._dst_block_off, 40 + mapper._dst_block_off]
+        result.dst.memory.ptrs, [30 + bytes_per_layer, 40 + bytes_per_layer]
     )
-    assert result.src.memory.bytes_per_region == expected_off
-    assert result.dst.memory.bytes_per_region == expected_off
+    assert result.src.memory.bytes_per_region == expected_bytes
+    assert result.dst.memory.bytes_per_region == expected_bytes
 
 
 def test_head_mismatch_mapper():
     self_ri = make_rankinfo(kv_heads_per_rank=2, tp_size=2, tp_rank=1)
     peer_ri = make_rankinfo(kv_heads_per_rank=4, tp_size=4, tp_rank=2)
-    transfer_layers = 1
-    src_layer_off = 0
-    peer_layer_off = 1
+    # buffer bytes = heads * tokens_per_block * dims_per_head * element_bytes
+    self_bytes_per_layer = 2 * (2 * 4 * 2 * 1)  # kv_factor x K-buffer bytes
+    peer_bytes_per_layer = 2 * (4 * 4 * 2 * 1)
     src_group = MemRegionGroup(ptrs=np.array([111], dtype=np.int64), bytes_per_region=32)
     dst_group = MemRegionGroup(ptrs=np.array([222], dtype=np.int64), bytes_per_region=32)
     src_spec = SpecRegion(memory=src_group, spec="srcspec")
     dst_spec = SpecRegion(memory=dst_group, spec="dstspec")
-    mapper = HeadMismatchMapper(transfer_layers, src_layer_off, peer_layer_off, self_ri, peer_ri)
+    mapper = HNDHeadMismatchMapper(
+        src_layer_offsets=[0],
+        dst_layer_offsets=[peer_bytes_per_layer],  # layer 1 on the peer side
+        self_ri=self_ri,
+        peer_ri=peer_ri,
+        self_bytes_per_layer=self_bytes_per_layer,
+        peer_bytes_per_layer=peer_bytes_per_layer,
+        self_buffers_per_layer=2,
+        peer_buffers_per_layer=2,
+    )
     result = mapper.map(src_spec, dst_spec)
-    expected_frag_count = self_ri.attention.kv_factor * transfer_layers
+    expected_frag_count = 2  # one fragment per (layer, K/V buffer)
     assert isinstance(result, SpecRegionPair)
     assert len(result.src.memory.ptrs) == expected_frag_count
     assert len(result.dst.memory.ptrs) == expected_frag_count
