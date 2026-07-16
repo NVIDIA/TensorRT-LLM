@@ -96,7 +96,7 @@ def test_rank_info_roundtrip_with_aux_meta():
     assert restored.aux_meta.device == "cpu"
 
 
-def test_from_kv_cache_manager_uses_first_nonzero_kv_head_count(monkeypatch):
+def test_from_kv_cache_manager_uses_first_nonzero_kv_head_count(monkeypatch) -> None:
     monkeypatch.setattr(rank_info_module, "build_page_table_from_manager", lambda _: None)
     mapping = SimpleNamespace(
         rank=0,

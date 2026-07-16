@@ -1359,6 +1359,13 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
                 is_estimating_kv_cache=is_estimating_kv_cache,
                 is_draft=is_draft,
             )
+            # PP ranks replay the same scheduling decisions, so a rank without
+            # local Mamba layers must still publish the configured boundaries.
+            self.kv_cache_config = kv_cache_config
+            self.linear_attention_metadata = LinearAttentionMetadata()
+            self.linear_attention_metadata.states_snapshot_interval = (
+                kv_cache_config.mamba_state_cache_interval
+                if kv_cache_config.enable_block_reuse else 0)
             return
 
         # Derive ssm_state_shape and conv_state_shape from mamba params (same as MambaCacheManager)

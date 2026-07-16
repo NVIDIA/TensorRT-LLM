@@ -16,7 +16,7 @@ to PyExecutor, including:
 import threading
 import time
 import types
-from unittest.mock import Mock
+from unittest.mock import MagicMock, Mock
 
 import pytest
 
@@ -891,6 +891,59 @@ class TestDisaggTransferAdmissionPP:
 
         assert [req.py_request_id for req in fitting] == [2]
         assert wait_for_progress
+
+
+def test_nonzero_pp_rank_prepares_snapshot_points_before_local_schedule(
+    monkeypatch,
+):
+    class StopLocalSchedule(RuntimeError):
+        pass
+
+    executor = object.__new__(PyExecutor)
+    executor.dist = Mock(pp_rank=1, rank=1)
+    executor.device_id = 0
+    profiler = MagicMock()
+    profiler.__enter__.return_value = Mock()
+    executor._profiler = Mock(return_value=profiler)
+    executor.hang_detector = MagicMock()
+    executor.enable_iter_perf_stats = False
+    executor._handle_disagg_cache_errors_synced = Mock()
+    executor._fetch_and_activate_new_requests = Mock(return_value=[])
+    executor.is_shutdown = False
+    executor._handle_control_request = Mock()
+    executor.kv_cache_transceiver = None
+    executor._pad_attention_dp_dummy_request = Mock()
+    scheduled_batch = Mock()
+    executor._pp_schedule_and_propagate = Mock(return_value=(scheduled_batch, [], 0, False))
+    executor._pp_retry_until_can_schedule = Mock()
+    request = Mock()
+    executor.active_requests = [request]
+    executor.inflight_req_ids = set()
+    executor.kv_cache_manager = Mock()
+    executor.scheduler = Mock()
+
+    calls = []
+    executor.kv_cache_manager.prepare_expect_snapshot_points.side_effect = (
+        lambda requests: calls.append(("prepare", requests))
+    )
+
+    def stop_after_schedule(requests, inflight_req_ids):
+        calls.append(("schedule", requests, inflight_req_ids))
+        raise StopLocalSchedule
+
+    executor.scheduler.schedule_request.side_effect = stop_after_schedule
+
+    monkeypatch.setattr("tensorrt_llm._torch.pyexecutor.py_executor.torch.cuda.set_device", Mock())
+    monkeypatch.setattr("tensorrt_llm._torch.pyexecutor.py_executor.cudart.cudaSetDevice", Mock())
+    monkeypatch.setattr("tensorrt_llm._torch.pyexecutor.py_executor.CUASSERT", Mock())
+
+    with pytest.raises(StopLocalSchedule):
+        PyExecutor._executor_loop_pp(executor)
+
+    assert calls == [
+        ("prepare", executor.active_requests),
+        ("schedule", executor.active_requests, executor.inflight_req_ids),
+    ]
 
 
 class TestComputeScheduledTokens:

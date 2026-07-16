@@ -10,7 +10,11 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDA_GRAPH_DUMMY_REQUEST_ID
-from tensorrt_llm._torch.pyexecutor.llm_request import ATTENTION_DP_DUMMY_REQUEST_ID
+from tensorrt_llm._torch.pyexecutor.llm_request import (
+    ATTENTION_DP_DUMMY_REQUEST_ID,
+    LlmRequest,
+    SamplingConfig,
+)
 from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import (
     MIN_REPLAY_HISTORY_SIZE,
     CppMambaHybridCacheManager,
@@ -348,6 +352,7 @@ def test_calc_context_stop_positions_returns_regular_snapshot_points():
     assert calc_context_stop_positions(150, 32, 64) == [64, 128]
     assert calc_context_stop_positions(70, 32, 256) == []
     assert calc_context_stop_positions(70, 32, 0) == []
+    assert calc_context_stop_positions(70, 32, -64) == []
     assert calc_context_stop_positions(70, 32, None) == []
 
 
@@ -374,6 +379,32 @@ def test_cpp_hybrid_prepare_expect_snapshot_points_clears_when_reuse_disabled():
     mgr.prepare_expect_snapshot_points([request])
 
     assert request.expect_snapshot_points == []
+
+
+@pytest.mark.parametrize("interval", [0, -64, None])
+def test_cpp_hybrid_prepare_expect_snapshot_points_clears_for_invalid_interval(interval):
+    mgr = object.__new__(CppMambaHybridCacheManager)
+    mgr.kv_cache_config = SimpleNamespace(enable_block_reuse=True)
+    mgr.linear_attention_metadata = SimpleNamespace(states_snapshot_interval=interval)
+    request = SimpleNamespace(prompt_len=150, expect_snapshot_points=[64])
+
+    mgr.prepare_expect_snapshot_points([request])
+
+    assert request.expect_snapshot_points == []
+
+
+def test_expect_snapshot_points_binding_round_trip():
+    request = LlmRequest(
+        request_id=1,
+        max_new_tokens=1,
+        input_tokens=[1, 2, 3],
+        sampling_config=SamplingConfig(),
+        is_streaming=False,
+    )
+
+    assert request.expect_snapshot_points == []
+    request.expect_snapshot_points = [64, 128]
+    assert request.expect_snapshot_points == [64, 128]
 
 
 # ---------------------------------------------------------------------------
@@ -675,7 +706,10 @@ def test_cpp_hybrid_dry_run_recurrent_pool_additive_with_block_reuse():
 # ---------------------------------------------------------------------------
 
 
-def _build_zero_mamba_hybrid():
+def _build_zero_mamba_hybrid(
+    enable_block_reuse=False,
+    mamba_state_cache_interval=256,
+):
     """Construct a real CppMambaHybridCacheManager whose this-rank slice has
     no mamba layers. world_size=1 / pp_size=1 keeps the real parent
     KVCacheManager off the MPI path."""
@@ -688,7 +722,11 @@ def _build_zero_mamba_hybrid():
     mapping = Mapping(world_size=1, rank=0, tp_size=1, pp_size=1)
     # Cap KV pool size so the real C++ allocator only takes a tiny slice of
     # GPU memory; we don't actually use the cache.
-    kv_cache_config = KvCacheConfig(max_tokens=128)
+    kv_cache_config = KvCacheConfig(
+        max_tokens=128,
+        enable_block_reuse=enable_block_reuse,
+        mamba_state_cache_interval=mamba_state_cache_interval,
+    )
 
     mgr = CppMambaHybridCacheManager(
         # mamba cache parameters — values are unused on the early-exit path
@@ -723,7 +761,10 @@ def test_cpp_hybrid_zero_local_mamba_layers():
     """End-to-end: real parent KVCacheManager + real early-exit. Verifies
     early-exit invariants on the manager state AND that the three guarded
     methods no-op without raising on uninitialized mamba-only state."""
-    mgr = _build_zero_mamba_hybrid()
+    mgr = _build_zero_mamba_hybrid(
+        enable_block_reuse=True,
+        mamba_state_cache_interval=64,
+    )
 
     # Early-exit indicators.
     assert mgr.local_num_mamba_layers == 0
@@ -760,6 +801,15 @@ def test_cpp_hybrid_zero_local_mamba_layers():
         assert not hasattr(mgr, attr), f"{attr} must not be set on the zero-mamba early-exit path"
     # Parent must not have been told to treat this as linear attention.
     assert mgr.is_linear_attention is False
+
+    # The scheduler hook is still advertised on ranks without local Mamba
+    # layers, so its inputs must be initialized with the same interval as
+    # Mamba-owning PP ranks to keep their scheduling decisions aligned.
+    assert mgr.kv_cache_config.enable_block_reuse is True
+    assert mgr.linear_attention_metadata.states_snapshot_interval == 64
+    request = SimpleNamespace(prompt_len=150, expect_snapshot_points=[])
+    mgr.prepare_expect_snapshot_points([request])
+    assert request.expect_snapshot_points == [64, 128]
 
     # Guards on the three mamba-only methods must turn them into no-ops
     # instead of crashing on the missing state above.

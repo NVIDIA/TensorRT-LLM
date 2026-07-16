@@ -1523,6 +1523,25 @@ class TestChunkedContext:
         assert ids(out.context_requests) == [0]
         assert req.context_chunk_size == 150
 
+    def test_force_chunk_allows_snapshot_point_shorter_than_unit_size(self):
+        mgr = make_kv_cache_manager(tokens_per_block=32)
+        sched = make_scheduler(
+            mgr,
+            max_num_tokens=8192,
+            ctx_chunk_config=(ContextChunkingPolicy.FORCE_CHUNK, 256),
+        )
+        req = make_ctx_request(
+            0,
+            context_remaining_length=1176,
+            is_last_context_chunk=False,
+        )
+        req.expect_snapshot_points = [150]
+
+        out = sched.schedule_request([req], set())
+
+        assert ids(out.context_requests) == [0]
+        assert req.context_chunk_size == 150
+
     def test_multiple_ctx_share_budget(self):
         """Two ctx requests share the budget."""
         mgr = make_kv_cache_manager(tokens_per_block=64)
