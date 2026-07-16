@@ -778,7 +778,7 @@ class VisionTransformer(nn.Module, MultimodalEncoderMixin):
         # always in NHD format ([tokens, heads, dim]).
         # Floor the request capacity at the same legacy fallback as the mixin
         # default: one attention segment per image, which can exceed the
-        # atomic-item budget derived from `encoder_max_batch_size`.
+        # atomic-item budget derived from `encoder_max_num_items`.
         capacities = self.get_encoder_attention_metadata_capacity(
             max_num_items, max_num_tokens)
         metadata_kwargs = dict(

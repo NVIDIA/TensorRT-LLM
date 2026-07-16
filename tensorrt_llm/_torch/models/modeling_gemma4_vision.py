@@ -735,7 +735,7 @@ class Gemma4VisionModel(nn.Module, MultimodalEncoderMixin):
 
         # SigLip-style context-only metadata (kv_cache_manager=None, no decode);
         # built by the engine via ``MultimodalEncoderMixin.setup_attn_metadata``
-        # at the encoder ``(encoder_max_batch_size, encoder_max_num_tokens)``
+        # at the encoder ``(encoder_max_num_items, encoder_max_num_tokens)``
         # budget, then re-prepared each forward with the actual per-image seq
         # lens. The vision tower runs once per LLM step across all images, so
         # the batch axis is the cross-request image count.

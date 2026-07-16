@@ -479,7 +479,7 @@
       "annotation": "Optional[int]",
       "converter": "",
       "kind": "value",
-      "path": "encoder_max_batch_size"
+      "path": "encoder_max_num_items"
     },
     {
       "allowed_values": [],
