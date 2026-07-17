@@ -947,9 +947,33 @@ def sampling_batch_spec_dec_one_model(
     top_p: torch.Tensor,
     seed: Optional[torch.Tensor] = None,
     offset: Optional[torch.Tensor] = None,
+    advanced_sampling_mode: str = "full",
 ) -> torch.Tensor:
-    """CUDA-graph compatible sampling; supports mixed sampling params. Returns sampled tokens."""
+    """CUDA-graph compatible sampling; supports mixed sampling params. Returns sampled tokens.
+
+    advanced_sampling_mode: "full" (per-row tensor top_k/top_p) or "no_topk" (skip top_k,
+    honor top_p -> softmax + top_p_sampling_from_probs, matching "full").
+    """
     top_k = sanitize_top_k(top_k, logits.shape[-1])
+    if advanced_sampling_mode == "no_topk":
+        # Temperature + top-p sampling with top_k disabled, NO greedy override. The deployment
+        # guarantees every request is temperature-sampled (temp > GREEDY_TEMPERATURE_THRESHOLD),
+        # so we skip the full-vocab argmax and the torch.where greedy-override entirely. A runtime
+        # guard in SpecMetadata._scan_one_model_sampling rejects greedy requests in a mixed
+        # no_topk batch, since this path would sample them instead of returning argmax.
+        #
+        # NB: we deliberately reproduce the "full" advanced path's OUTCOME instead of calling
+        # sampling_from_logits. With top_k disabled, the full path resolves to
+        #     top_k_mask_logits(k=vocab)  ->  torch.softmax  ->  top_p_sampling_from_probs
+        # in which the top-k mask is a no-op (sanitize_top_k maps disabled top_k to vocab_size).
+        # sampling_from_logits would instead use a Gumbel-max kernel that consumes the RNG stream
+        # differently, so its tokens would NOT match the full path for the same seed/offset. Here
+        # we skip only the no-op top-k mask kernel and run the identical
+        # softmax -> top_p_sampling_from_probs path, so no_topk == full bit-for-bit.
+        # top_p is already threaded in as a per-row tensor by both call sites (interface.py).
+        logits = vanilla.safely_apply_temperature_inplace(logits, temperatures)
+        probs = torch.softmax(logits, dim=-1)
+        return flashinfer.top_p_sampling_from_probs_op(probs, top_p, seed=seed, offset=offset)
     # Greedy rows (temperature <= threshold) must return the argmax token, not a
     # sample from the temperature-scaled distribution. Capture the argmax from the
     # *original* logits up front; safely_apply_temperature_inplace then guards the division

@@ -111,6 +111,8 @@ def get_spec_metadata(spec_config,
             hidden_size=model_config.hidden_size,
             max_num_tokens=max_num_tokens,
             use_rejection_sampling=use_rejection_sampling,
+            advanced_sampling_mode=str(
+                getattr(spec_config, "advanced_sampling_mode", "full")),
             vocab_size=vocab_size,
             num_seq_slots=num_seq_slots,
             draft_vocab_size=draft_vocab_size,

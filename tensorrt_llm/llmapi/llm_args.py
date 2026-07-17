@@ -2476,6 +2476,20 @@ class DraftTargetDecodingConfig(DecodingBaseConfig):
         return TorchSpeculativeDecodingMode.DRAFT_TARGET
 
 
+class AdvancedSamplingMode(StrEnum):
+    """Deploy-time specialization of the MTP one-model advanced sampler.
+
+    FULL    - per-row tensor top_k/top_p (original; mixed per-request sampling).
+    NO_TOPK - top_k disabled, top_p honored -> softmax + top_p_sampling_from_probs. Produces
+              the same tokens as FULL but skips the (no-op) top_k mask kernel. Requires every
+              request to use temperature > GREEDY_TEMPERATURE_THRESHOLD.
+    Selects which sampler the (single) advanced CUDA graph captures; it is NOT part of
+    the graph key, so it adds no extra graphs.
+    """
+    FULL = "full"
+    NO_TOPK = "no_topk"
+
+
 class MTPDecodingConfig(DecodingBaseConfig):
     decoding_type: Literal["MTP"] = Field(default="MTP")
     use_relaxed_acceptance_for_thinking: bool = Field(
@@ -2546,6 +2560,30 @@ class MTPDecodingConfig(DecodingBaseConfig):
         description=
         "Token ID marking end of thinking phase. Strict acceptance resumes after this."
     )
+
+    advanced_sampling_mode: AdvancedSamplingMode = Field(
+        default=AdvancedSamplingMode.FULL,
+        description=
+        "Specialize the one-model advanced sampler for a fixed deployment sampling config. "
+        "FULL (default): original per-row tensor top_k/top_p. NO_TOPK: skip top_k, honor top_p "
+        "(softmax + top_p_sampling_from_probs), matching FULL bit-for-bit while dropping the "
+        "no-op top_k mask kernel; requires all requests to use temperature > "
+        "GREEDY_TEMPERATURE_THRESHOLD. No effect on greedy batches.")
+
+    @model_validator(mode="after")
+    def _log_advanced_sampling_mode(self):
+        """Startup log/guard for the deploy-time advanced sampler specialization."""
+        if self.advanced_sampling_mode == AdvancedSamplingMode.NO_TOPK:
+            from tensorrt_llm._torch.pyexecutor.sampler.sampling_utils import \
+                GREEDY_TEMPERATURE_THRESHOLD
+            logger.warning(
+                "MTP advanced_sampling_mode=NO_TOPK: top_k is disabled for every request "
+                "(top_p is still honored). All requests MUST use temperature > "
+                f"{GREEDY_TEMPERATURE_THRESHOLD} (GREEDY_TEMPERATURE_THRESHOLD); a greedy "
+                "request in a mixed batch is rejected at runtime, since NO_TOPK has no argmax "
+                "override. Use FULL if you need greedy + sampling in the same batch."
+            )
+        return self
 
     @model_validator(mode="before")
     @classmethod

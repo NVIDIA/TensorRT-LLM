@@ -538,6 +538,8 @@ class SpecMetadata:
     group_all_greedy_sample: Optional[bool] = None
     # Whether to use rejection sampling for one-model speculative decoding.
     use_rejection_sampling: bool = False
+    # Advanced-sampling specialization (deploy-time; from MTPDecodingConfig.advanced_sampling_mode).
+    advanced_sampling_mode: str = "full"
     # Sampling parameters for non-greedy sampling (per-request)
     temperatures: Optional[torch.Tensor] = None
     top_ks: Optional[torch.Tensor] = None
@@ -835,6 +837,7 @@ class SpecMetadata:
             self.skip_top_k = False
             self.skip_top_p = False
             self.is_all_greedy_sample = False
+            self.has_greedy_requests = False
             per_request_normalized = [
                 (0.7, 50, 0.9, num_tokens)
                 for (_, _, _, num_tokens) in per_request_normalized
@@ -847,6 +850,21 @@ class SpecMetadata:
         # resurrect the local value.
         if self.group_all_greedy_sample is not None:
             self.is_all_greedy_sample = self.group_all_greedy_sample
+
+        # no_topk specialization has no greedy-argmax override: a greedy request
+        # (temp <= GREEDY_TEMPERATURE_THRESHOLD) in a *mixed* batch (advanced graph,
+        # is_all_greedy_sample=False) would be sampled instead of returning argmax. All-greedy
+        # batches take the argmax greedy graph and are safe; warmup dummies are exempted above
+        # (has_greedy_requests reset under the capture override).
+        if (self.advanced_sampling_mode == "no_topk"
+                and not self.is_all_greedy_sample and self.has_greedy_requests):
+            raise ValueError(
+                "advanced_sampling_mode=no_topk requires every request to use temperature > "
+                f"GREEDY_TEMPERATURE_THRESHOLD ({GREEDY_TEMPERATURE_THRESHOLD}); a greedy "
+                "request was found in a mixed sampling batch. no_topk has no greedy-argmax "
+                "override, so greedy rows would be sampled instead of returning argmax. Use "
+                "advanced_sampling_mode=full for batches that mix greedy and non-greedy requests."
+            )
 
         return per_request_normalized, per_request_slot_ids
 
@@ -1532,12 +1550,14 @@ class SpecWorkerBase(nn.Module, ABC):
             spec_metadata.draft_probs[batch_slots, draft_step, :vocab] = probs
             spec_metadata.draft_probs_last_dim = vocab
         else:
-            draft_tokens = sampling_batch_spec_dec_one_model(logits,
-                                                             temperatures,
-                                                             top_ks,
-                                                             top_ps,
-                                                             seed=self.seed,
-                                                             offset=self.offset)
+            draft_tokens = sampling_batch_spec_dec_one_model(
+                logits,
+                temperatures,
+                top_ks,
+                top_ps,
+                seed=self.seed,
+                offset=self.offset,
+                advanced_sampling_mode=spec_metadata.advanced_sampling_mode)
 
         return draft_tokens.type(torch.int32)
 
@@ -1937,12 +1957,14 @@ class SpecWorkerBase(nn.Module, ABC):
                 spec_metadata.draft_probs[gen_slot_ids, :K, :vocab] = probs
                 spec_metadata.draft_probs_last_dim = vocab
         else:
-            flat_tokens = sampling_batch_spec_dec_one_model(flat_logits,
-                                                            temps,
-                                                            top_ks,
-                                                            top_ps,
-                                                            seed=self.seed,
-                                                            offset=self.offset)
+            flat_tokens = sampling_batch_spec_dec_one_model(
+                flat_logits,
+                temps,
+                top_ks,
+                top_ps,
+                seed=self.seed,
+                offset=self.offset,
+                advanced_sampling_mode=spec_metadata.advanced_sampling_mode)
 
         return flat_tokens.reshape(num_gens, K).type(torch.int32)
 
@@ -2213,7 +2235,8 @@ class SpecWorkerBase(nn.Module, ABC):
                 top_ks,
                 top_ps,
                 seed=self.seed,
-                offset=self.offset)
+                offset=self.offset,
+                advanced_sampling_mode=spec_metadata.advanced_sampling_mode)
         else:
             sampled_tokens = torch.argmax(logits, dim=-1)
 
