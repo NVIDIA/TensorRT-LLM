@@ -30,9 +30,9 @@ Cosmos3 supports the following generation modes from a single checkpoint:
 - **Transfer** — control-video conditioning via ``--extra_params`` hints
   (``edge``/``blur``/``depth``/``seg``/``wsm``): the control constrains
   structure, the prompt supplies appearance. ``edge``/``blur`` are computed
-  from ``--video_path``; any hint accepts ``{"control_path": ...}``. See the
-  README's transfer examples (incl. the synthetic bouncing-ball control from
-  ``generate_bouncing_ball_control.py``).
+  from ``--video_path``; any hint accepts ``{"control_path": ...}`` (a local
+  video file). See the README's transfer examples (incl. the synthetic
+  bouncing-ball control from ``generate_bouncing_ball_control.py``).
 - **T2AV** — text-to-video with synchronized audio (``prompts/t2av.json`` with
   ``enable_audio: true``, or pass ``--enable_audio``). Combine with a
   ``vision_path`` for image-conditioned audio-video (TI2AV).
@@ -121,6 +121,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from tensorrt_llm import VisualGen, VisualGenArgs
+from tensorrt_llm._torch.visual_gen.models.cosmos3.transfer import TRANSFER_HINT_KEYS
 from tensorrt_llm._torch.visual_gen.models.cosmos3.utils import load_reference_video
 
 _SCRIPT_DIR = Path(__file__).resolve().parent
@@ -310,6 +311,23 @@ def main():
     if args.extra_params:
         # Merged last: explicit JSON wins over flag-derived values.
         params.extra_params.update(args.extra_params)
+
+    # Precomputed transfer controls: a hint's client-local ``control_path`` (or a
+    # bare path string) is decoded here into multi_modal_data["control"] — media
+    # rides multi_modal_data, extra_params keeps only the knob; the worker never
+    # reads paths.
+    control_media = {}
+    for key in TRANSFER_HINT_KEYS:
+        hint = params.extra_params.get(key)
+        if isinstance(hint, str):
+            control_media[key] = load_reference_video(hint)
+            params.extra_params[key] = True
+        elif isinstance(hint, dict) and hint.get("control_path") is not None:
+            control_media[key] = load_reference_video(hint.pop("control_path"))
+            if not hint:
+                params.extra_params[key] = True
+    if control_media:
+        params.multi_modal_data = {**(params.multi_modal_data or {}), "control": control_media}
 
     if negative_prompt is None:
         params.negative_prompt = None

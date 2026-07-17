@@ -121,7 +121,9 @@ BILATERAL_ITERATIONS = 1  # number of bilateral passes
 @dataclass
 class Cosmos3TransferHint:
     key: str
-    control_path: str | None = None
+    # Precomputed control media (frames), attached from
+    # ``multi_modal_data["control"][key]`` by ``resolve_transfer_config`` —
+    # never a path; the worker does not decode media.
     control: Any | None = None
     preset_edge_threshold: str = "medium"
     preset_blur_strength: str = "medium"
@@ -173,8 +175,18 @@ def _extra_or_default(extra_params: dict, key: str, default: Any = None) -> Any:
 
 
 def resolve_transfer_config(
-    extra_params: dict, req_params: Any, prompt_data: Any = None
+    extra_params: dict,
+    req_params: Any,
+    prompt_data: Any = None,
+    control_media: Mapping[str, Any] | None = None,
 ) -> Cosmos3TransferConfig | None:
+    """Resolve transfer knobs (``extra_params``) + control media into a config.
+
+    ``extra_params`` carries only configuration; precomputed control media
+    arrives separately as ``control_media`` (``multi_modal_data["control"]``,
+    hint key -> ``VideoData`` or frames), decoded by the producer.
+    """
+    remaining_control_media = dict(control_media or {})
     hints: dict[str, Cosmos3TransferHint] = {}
     for key in TRANSFER_HINT_KEYS:
         raw = extra_params.get(key, None)
@@ -182,18 +194,28 @@ def resolve_transfer_config(
             continue
         if raw is True:
             raw = {}
-        elif isinstance(raw, str | Path):
-            raw = {"control_path": str(raw)}
         if not isinstance(raw, Mapping):
             raise TypeError(
-                f"Cosmos3 transfer hint '{key}' must be an object, path string, or true; got {type(raw)!r}."
+                f"Cosmos3 transfer hint '{key}' must be an object or true; got {type(raw)!r}."
             )
+        if "control_path" in raw or "control" in raw:
+            raise ValueError(
+                f"Cosmos3 transfer hint '{key}' no longer carries media; pass the "
+                f"decoded control frames under multi_modal_data['control'][{key!r}]."
+            )
+        control = remaining_control_media.pop(key, None)
+        if control is not None and hasattr(control, "frames"):
+            control = control.frames  # VideoData -> frame list
         hints[key] = Cosmos3TransferHint(
             key=key,
-            control_path=str(raw["control_path"]) if raw.get("control_path") is not None else None,
-            control=raw.get("control"),
+            control=control,
             preset_edge_threshold=str(raw.get("preset_edge_threshold") or "medium").lower(),
             preset_blur_strength=str(raw.get("preset_blur_strength") or "medium").lower(),
+        )
+    if remaining_control_media:
+        raise ValueError(
+            "Cosmos3 control media provided for hints that are not enabled: "
+            f"{sorted(remaining_control_media)}."
         )
 
     if not hints:
@@ -638,27 +660,23 @@ def load_or_compute_control_frames(
 ) -> torch.Tensor:
     if hint.control is not None:
         return media_to_uint8_cthw(hint.control, height=height, width=width, max_frames=max_frames)
-    if hint.control_path is not None:
-        return media_to_uint8_cthw(
-            hint.control_path, height=height, width=width, max_frames=max_frames
-        )
     if hint.key == "edge":
         if input_frames is None:
             raise ValueError(
                 "Cosmos3 transfer hint 'edge' requires either a video input for on-the-fly control generation "
-                "or a precomputed control_path."
+                "or precomputed control frames (multi_modal_data['control'])."
             )
         return make_edge_control(input_frames[:, :max_frames], hint.preset_edge_threshold)
     if hint.key == "blur":
         if input_frames is None:
             raise ValueError(
                 "Cosmos3 transfer hint 'blur' requires either a video input for on-the-fly control generation "
-                "or a precomputed control_path."
+                "or precomputed control frames (multi_modal_data['control'])."
             )
         return make_blur_control(input_frames[:, :max_frames], hint.preset_blur_strength)
-    raise FileNotFoundError(
-        f"Cosmos3 transfer hint '{hint.key}' requires a precomputed control_path; "
-        "on-the-fly generation is supported only for edge and blur."
+    raise ValueError(
+        f"Cosmos3 transfer hint '{hint.key}' requires precomputed control frames "
+        "(multi_modal_data['control']); on-the-fly generation is supported only for edge and blur."
     )
 
 

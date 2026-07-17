@@ -379,15 +379,17 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
     def infer(self, req):
         extra_params = req.params.extra_params or {}
         output_type = extra_params.get("output_type", "video")
-        transfer_config = resolve_transfer_config(extra_params, req.params, req.prompt)
 
-        # The V2V reference rides in ``multi_modal_data["video"]`` as a
-        # ``VideoData`` (framework convention); the worker crops + VAE-encodes its
-        # frames. Both producers (offline and serve) build it, so there is no
-        # legacy-path fallback.
+        # Media rides ``multi_modal_data`` (framework convention), decoded by the
+        # producer: the V2V/transfer input under "video" (a ``VideoData``), and
+        # precomputed transfer controls under "control" (hint key -> VideoData).
+        # ``extra_params`` carries only knobs — the worker never decodes media.
         mm_data = req.params.multi_modal_data or {}
         video_data = mm_data.get("video")
         video = video_data.frames if video_data is not None else None
+        transfer_config = resolve_transfer_config(
+            extra_params, req.params, req.prompt, control_media=mm_data.get("control")
+        )
 
         return self.forward(
             prompt=req.prompt,
@@ -1306,10 +1308,6 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
         for hint in transfer_config.ordered_hints:
             if hint.control is not None:
                 detected = media_height_width(hint.control)
-                if detected is not None:
-                    return detected
-            if hint.control_path is not None:
-                detected = media_height_width(hint.control_path)
                 if detected is not None:
                     return detected
         return None

@@ -165,13 +165,46 @@ class TestTransferConfig:
         assert resolve_transfer_config({"wsm": True}, _req()).fps == 10
         assert resolve_transfer_config({"wsm": True, "fps": 24.0}, _req()).fps == 24.0
 
-    def test_precomputed_control_tensor_passthrough(self):
+    def test_precomputed_control_via_multimodal(self):
+        # Control media rides multi_modal_data["control"] (here: the raw
+        # tensor form), never extra_params; the hint knob is just `true`.
         precomputed = torch.zeros(3, 2, 8, 8, dtype=torch.uint8)
-        cfg = resolve_transfer_config({"edge": {"control": precomputed}}, _req())
+        cfg = resolve_transfer_config({"edge": True}, _req(), control_media={"edge": precomputed})
         loaded = load_or_compute_control_frames(
             cfg.hints["edge"], height=8, width=8, max_frames=2, input_frames=None
         )
         assert tuple(loaded.shape) == (3, 2, 8, 8)
+
+    def test_control_media_videodata_unwraps_to_frames(self):
+        from tensorrt_llm.inputs.multimodal_data import VideoData
+
+        frames = [PIL.Image.new("RGB", (8, 8), (7, 7, 7))]
+        cfg = resolve_transfer_config(
+            {"depth": True}, _req(), control_media={"depth": VideoData(frames=frames, metadata={})}
+        )
+        assert cfg.hints["depth"].control is frames
+
+    def test_media_in_extra_params_rejected(self):
+        # The knob channel no longer carries media in any form.
+        with pytest.raises(ValueError, match="multi_modal_data"):
+            resolve_transfer_config({"depth": {"control_path": "/x.mp4"}}, _req())
+        with pytest.raises(ValueError, match="multi_modal_data"):
+            resolve_transfer_config({"edge": {"control": torch.zeros(3, 1, 4, 4)}}, _req())
+        with pytest.raises(TypeError, match="object or true"):
+            resolve_transfer_config({"depth": "/x.mp4"}, _req())  # path shorthand is gone
+
+    def test_control_media_for_disabled_hint_rejected(self):
+        with pytest.raises(ValueError, match="not enabled"):
+            resolve_transfer_config(
+                {"edge": True}, _req(), control_media={"depth": torch.zeros(3, 1, 4, 4)}
+            )
+
+    def test_depth_without_control_media_raises(self):
+        cfg = resolve_transfer_config({"depth": True}, _req())
+        with pytest.raises(ValueError, match="multi_modal_data"):
+            load_or_compute_control_frames(
+                cfg.hints["depth"], height=8, width=8, max_frames=2, input_frames=None
+            )
 
 
 # =============================================================================
@@ -499,7 +532,7 @@ class TestForwardTransferChunks:
         control = torch.zeros(3, 8, 16, 16, dtype=torch.uint8)
         cfg = resolve_transfer_config(
             {
-                "edge": {"control": control},
+                "edge": True,
                 "guidance_scale": 1.0,
                 "control_guidance": 1.0,
                 "max_frames": 8,
@@ -508,6 +541,7 @@ class TestForwardTransferChunks:
                 "num_first_chunk_conditional_frames": 2,
             },
             _req(num_frames=8, guidance_scale=1.0),
+            control_media={"edge": control},
         )
 
         output = pipeline._forward_transfer(
