@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+-->
+
 # Checkpoint Loading
 
 The PyTorch backend provides a flexible and extensible infrastructure for loading model checkpoints from different formats, such as HuggingFace (HF). This system allows you to load models from various sources (e.g., HuggingFace or custom formats) by implementing the required components, such as the checkpoint’s weight loader, mapper, and configuration parser.
@@ -6,8 +11,9 @@ The PyTorch backend provides a flexible and extensible infrastructure for loadin
 1. [Overview](#overview)
 2. [Core Components](#core-components)
 3. [Built-in Checkpoint Formats](#built-in-checkpoint-formats)
-4. [Using Checkpoint Loaders](#using-checkpoint-loaders)
-5. [Creating Custom Checkpoint Loaders](#creating-custom-checkpoint-loaders)
+4. [Distributing checkpoints and engine artifacts from object storage](#distributing-checkpoints-and-engine-artifacts-from-object-storage)
+5. [Using Checkpoint Loaders](#using-checkpoint-loaders)
+6. [Creating Custom Checkpoint Loaders](#creating-custom-checkpoint-loaders)
 
 ## Overview
 
@@ -16,7 +22,7 @@ The checkpoint loading design is built around a plugin-like architecture that is
 - **Checkpoint Loaders**: Orchestrate the loading process for specific formats
 - **Config Loaders**: Handle model configuration parsing and validation
 - **Weight Loaders**: Manage the actual loading of model weights from storage into memory
-- **Weight Mappers**: Map and transform loaded weights to TensorRT LLM model's definition
+- **Weight Mappers**: Map and transform loaded weights to TensorRT-LLM model's definition
 
 This modular design allows for easy extension to support new checkpoint formats while maintaining backward compatibility and performance optimizations. By separating the checkpoint loading components into four different subcomponents, any user can employ any relevant previous work while also introducing their own custom checkpoint-specific components.
 
@@ -82,6 +88,164 @@ Currently, HF checkpoint loader is the primary built-in format, supporting:
 - **Weights loading** (`.safetensors/.bin/.pth`) - Loading HF compatible weights from disk
 - **Configuration parser** - Parsing HF stored configuration information to TRTLLM `ModelConfig` object
 - **Weights Mapping** - Converting HF weights into TRTLLM compatible representation
+
+## Distributing checkpoints and engine artifacts from object storage
+
+TensorRT-LLM reads checkpoints and engines from a local directory and does
+not include an object-store client. To distribute artifacts across a GPU
+fleet you stage them in object storage and pull them onto each serving node
+with standard S3 tooling. This suits object storage that exposes the Amazon
+S3 API, because TensorRT engines are large and specific to a given GPU,
+driver, and TensorRT version, so an organization typically ends up hosting a
+matrix of engines keyed by model, GPU SKU, and precision. The workflow below
+is written against the S3 API, so the same `aws` CLI and `boto3` code work
+against Amazon S3 directly, or against any S3-compatible object store (for
+example Amazon S3, Backblaze B2, Cloudflare R2, and MinIO) once you point the
+tooling at that store's endpoint.
+
+The workflow has three stages: build the engine (or obtain a prebuilt one),
+upload the artifact directory to a bucket, and sync it to a local cache on
+each serving node before pointing `LLM(model=...)` or `trtllm-serve` at the
+cached path.
+
+### Credentials and endpoint
+
+The `aws` CLI and `boto3` read AWS-style environment variables. Set your
+access key, secret key, region, and bucket. For a non-AWS store, also set the
+S3 endpoint. Adjust the region and endpoint to match your bucket:
+
+```bash
+# S3 credentials, mapped onto the AWS_* names the tooling reads.
+export AWS_ACCESS_KEY_ID="$S3_ACCESS_KEY_ID"
+export AWS_SECRET_ACCESS_KEY="$S3_SECRET_ACCESS_KEY"
+export AWS_DEFAULT_REGION="${S3_REGION:-us-east-1}"
+
+# Bucket.
+export S3_BUCKET_NAME="my-trtllm-artifacts"
+
+# For non-AWS S3-compatible storage, uncomment and set the endpoint.
+# Leave S3_ENDPOINT unset for Amazon S3.
+# export S3_ENDPOINT="https://your-s3-endpoint.example.com"
+
+S3_ENDPOINT_ARGS=()
+if [ -n "${S3_ENDPOINT:-}" ]; then
+    S3_ENDPOINT_ARGS=(--endpoint-url "$S3_ENDPOINT")
+fi
+```
+
+For Amazon S3, leave `S3_ENDPOINT` unset and use AWS credentials directly. For
+any other S3-compatible store, set `S3_ENDPOINT` so the examples pass
+`--endpoint-url "$S3_ENDPOINT"` on each command.
+
+### Build and upload an engine
+
+Build an engine from a checkpoint with `trtllm-build` (the PyTorch backend can
+also load checkpoints directly, in which case you upload the checkpoint
+directory instead of a built engine):
+
+```bash
+trtllm-build --checkpoint_dir ./llama-3.1-8b-ckpt \
+             --output_dir ./engines/llama-3.1-8b-fp8
+
+# Sync the engine directory (config.json + rank*.engine shards) to the bucket.
+aws s3 sync ./engines/llama-3.1-8b-fp8 \
+    "s3://${S3_BUCKET_NAME}/engines/llama-3.1-8b-fp8" \
+    "${S3_ENDPOINT_ARGS[@]}"
+```
+
+### Download on the serving node
+
+On each serving node, sync the artifact directory into a local cache and serve
+from the cached path. `aws s3 sync` only transfers objects that are missing or
+changed, so a warm cache skips the download:
+
+```bash
+export TRTLLM_MODEL_CACHE="${TRTLLM_MODEL_CACHE:-/models/cache}"
+S3_PREFIX="${S3_PREFIX:-engines/llama-3.1-8b-fp8}"
+S3_PREFIX="$(printf '%s' "$S3_PREFIX" | sed 's#^/*##; s#/*$##')"
+LOCAL_DIR="${TRTLLM_MODEL_CACHE}/${S3_PREFIX}"
+
+aws s3 sync "s3://${S3_BUCKET_NAME}/${S3_PREFIX}" \
+    "$LOCAL_DIR" "${S3_ENDPOINT_ARGS[@]}"
+
+# Engine directories use the TensorRT backend. For checkpoint directories,
+# omit --backend tensorrt so trtllm-serve uses the PyTorch backend.
+trtllm-serve "$LOCAL_DIR" --backend tensorrt --host 0.0.0.0 --port 8000
+```
+
+### Equivalent download with boto3
+
+When you prefer to pull artifacts from application code (for example, inside a
+container entrypoint), `boto3` against the same endpoint is equivalent. Setting
+`user_agent_extra` identifies the traffic to the storage service:
+
+```python
+import os
+from pathlib import Path
+
+import boto3
+from botocore.config import Config
+
+from tensorrt_llm._tensorrt_engine import LLM
+
+CACHE_DIR = Path(os.environ.get("TRTLLM_MODEL_CACHE", "/models/cache"))
+BUCKET = os.environ["S3_BUCKET_NAME"]
+PREFIX = os.environ.get("S3_PREFIX", "engines/llama-3.1-8b-fp8/").strip("/") + "/"
+LOCAL_DIR = CACHE_DIR / PREFIX.rstrip("/")
+CACHE_ROOT = LOCAL_DIR.resolve()
+
+s3 = boto3.client(
+    "s3",
+    endpoint_url=os.environ.get("S3_ENDPOINT"),
+    aws_access_key_id=os.environ["AWS_ACCESS_KEY_ID"],
+    aws_secret_access_key=os.environ["AWS_SECRET_ACCESS_KEY"],
+    region_name=os.environ.get("AWS_DEFAULT_REGION", "us-east-1"),
+    config=Config(user_agent_extra="tensorrt-llm-docs"),
+)
+
+paginator = s3.get_paginator("list_objects_v2")
+for page in paginator.paginate(Bucket=BUCKET, Prefix=PREFIX):
+    for obj in page.get("Contents", []):
+        key = obj["Key"]
+        rel = key[len(PREFIX):]
+        if not rel:
+            continue
+        rel_path = Path(rel)
+        if rel_path.is_absolute() or ".." in rel_path.parts:
+            raise ValueError(f"Unsafe S3 object key: {key}")
+        dest = (LOCAL_DIR / rel_path).resolve()
+        if not dest.is_relative_to(CACHE_ROOT):
+            raise ValueError(f"Unsafe S3 object key: {key}")
+        remote_mtime = obj["LastModified"].timestamp()
+        if dest.exists():
+            stat = dest.stat()
+            if stat.st_size == obj["Size"] and int(stat.st_mtime) >= int(remote_mtime):
+                continue
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        s3.download_file(BUCKET, key, str(dest))
+        os.utime(dest, (remote_mtime, remote_mtime))
+
+llm = LLM(model=str(LOCAL_DIR))
+```
+
+### Recommended practices
+
+- **Bucket-scoped credentials.** Issue read-only credentials scoped to the
+  artifact bucket for serving nodes; never deploy with root or account-wide
+  keys.
+- **Match the cache key to the build.** TensorRT engines are not portable
+  across GPU SKU, driver, or TensorRT version. Encode those values in the
+  object prefix (for example, `engines/<model>/<gpu>/<precision>/`) so a node
+  never loads an engine built for a different configuration.
+- **Multipart transfers.** The default `boto3` and `aws` CLI transfer
+  configuration uses multipart requests, which suits the large `.safetensors`
+  checkpoint shards and `rank*.engine` files typical of LLM artifacts.
+- **Local cache reuse.** Mount `TRTLLM_MODEL_CACHE` on persistent storage so a
+  cold pull happens once per node rather than once per pod restart.
+- **Custom weight loader.** To stream checkpoint weights directly from the
+  object store without staging to disk, implement a `BaseWeightLoader`
+  subclass that reads each shard from `s3.get_object(...)["Body"]`. See
+  *Creating Custom Checkpoint Loaders* below.
 
 ## Using Checkpoint Loaders
 
