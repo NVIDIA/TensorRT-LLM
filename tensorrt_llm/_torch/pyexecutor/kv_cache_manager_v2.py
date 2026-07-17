@@ -17,7 +17,7 @@ import math
 import os
 import sys
 from collections import OrderedDict, defaultdict
-from dataclasses import dataclass, fields
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, Iterable, List, NamedTuple, Optional, Sequence, Tuple, Union
 
 import numpy as np
