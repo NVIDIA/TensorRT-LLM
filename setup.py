@@ -406,7 +406,10 @@ else:
 # internal absolute imports (e.g., "from triton_kernels.foo import bar") work.
 packages += find_packages(include=["triton_kernels", "triton_kernels.*"])
 
-msa_package_dir = {"fmha_sm100": "3rdparty/MSA/python/fmha_sm100"}
+msa_package_dir = {
+    "fmha_sm100":
+    os.environ.get("TRTLLM_MSA_PACKAGE_DIR", "3rdparty/MSA/python/fmha_sm100")
+}
 packages += ["fmha_sm100"]
 
 # https://setuptools.pypa.io/en/latest/references/keywords.html
