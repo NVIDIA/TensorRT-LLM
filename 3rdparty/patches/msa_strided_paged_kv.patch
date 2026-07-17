@@ -1,0 +1,184 @@
+diff --git a/python/fmha_sm100/cute/interface.py b/python/fmha_sm100/cute/interface.py
+index d72b17a..e27a74f 100644
+--- a/python/fmha_sm100/cute/interface.py
++++ b/python/fmha_sm100/cute/interface.py
+@@ -136,6 +136,32 @@ def _prepare_paged_kv_for_tma(k, v, blk_kv: int):
+     return k, v
+
+
++def _prepare_paged_hnd_input(tensor: torch.Tensor, blk_kv: int) -> torch.Tensor:
++    """Keep TMA-compatible paged HND views strided across physical pages.
++
++    The sparse prefill kernel imports the runtime tensor strides through
++    DLPack. It requires each ``[page_size, head_dim]`` head plane to be packed,
++    but the outer physical-page stride may include other coalesced cache roles.
++    Materialize every other layout to preserve the public API's old contract.
++    """
++    if tensor.ndim != 4 or int(tensor.shape[2]) != int(blk_kv):
++        return tensor.contiguous()
++
++    head_dim = int(tensor.shape[3])
++    page_size = int(tensor.shape[2])
++    packed_within_page = (
++        tensor.stride(3) == 1
++        and tensor.stride(2) == head_dim
++        and tensor.stride(1) == page_size * head_dim
++    )
++    alignment_bytes = 16
++    aligned_for_tma = (
++        tensor.data_ptr() % alignment_bytes == 0
++        and tensor.stride(0) * tensor.element_size() % alignment_bytes == 0
++    )
++    return tensor if packed_within_page and aligned_for_tma else tensor.contiguous()
++
++
+ def _validate_cu_seqlens(
+     cu_seqlens: torch.Tensor,
+     *,
+@@ -736,10 +762,21 @@ def sparse_atten_func(
+     max_seqlen_q = int(max_seqlen_q)
+     max_seqlen_k = int(max_seqlen_k)
+
++    k_input = (
++        k.contiguous()
++        if page_table is None
++        else _prepare_paged_hnd_input(k, blk_kv)
++    )
++    v_input = (
++        v.contiguous()
++        if page_table is None
++        else _prepare_paged_hnd_input(v, blk_kv)
++    )
++
+     return _sparse_atten_csr_varlen_forward(
+         q.contiguous(),
+-        k.contiguous(),
+-        v.contiguous(),
++        k_input,
++        v_input,
+         k2q_row_ptr.contiguous(),
+         k2q_q_indices.contiguous(),
+         int(topK),
+diff --git a/python/fmha_sm100/cute/test_sparse_atten.py b/python/fmha_sm100/cute/test_sparse_atten.py
+index 21c777e..c22beef 100644
+--- a/python/fmha_sm100/cute/test_sparse_atten.py
++++ b/python/fmha_sm100/cute/test_sparse_atten.py
+@@ -61,6 +61,43 @@ DECODE_DIM = 128
+ DECODE_KV_TOKEN_SWEEP = tuple(2**exp for exp in range(3, 21))
+
+
++def test_prepare_paged_hnd_input_keeps_aligned_outer_page_stride() -> None:
++    pages, roles, heads, page_size, head_dim = 5, 3, 2, 128, 128
++    pool = torch.empty(
++        pages,
++        roles,
++        heads,
++        page_size,
++        head_dim,
++        dtype=torch.float8_e4m3fn,
++        device="cuda",
++    )
++    view = pool[:, 1]
++
++    assert not view.is_contiguous()
++    prepared = sparse_interface._prepare_paged_hnd_input(view, page_size)
++    assert prepared.data_ptr() == view.data_ptr()
++    assert prepared.stride() == view.stride()
++
++
++def test_prepare_paged_hnd_input_materializes_unpacked_tokens() -> None:
++    pages, heads, page_size, head_dim = 5, 2, 128, 128
++    storage = torch.empty(
++        pages,
++        heads,
++        page_size * 2,
++        head_dim,
++        dtype=torch.float8_e4m3fn,
++        device="cuda",
++    )
++    view = storage[:, :, ::2, :]
++
++    prepared = sparse_interface._prepare_paged_hnd_input(view, page_size)
++    assert prepared.is_contiguous()
++    assert prepared.data_ptr() != view.data_ptr()
++    torch.testing.assert_close(prepared, view, rtol=0, atol=0)
++
++
+ @contextmanager
+ def _nvtx_range(message: str):
+     torch.cuda.nvtx.range_push(message)
+@@ -1786,6 +1823,74 @@ def test_sparse_page_atten(
+
+     _assert_forward_close(out, out_ref, out_pt.float(), lse, lse_ref)
+
++
++def test_sparse_page_atten_strided_outer_page_matches_packed() -> None:
++    inputs = _build_paged_inputs(
++        batch=1,
++        seqlen_q=2048,
++        seqlen_kv=2048,
++        head_kv=2,
++        qhead_per_kv=16,
++        dim=128,
++        topk=16,
++        blk_kv=128,
++        causal=True,
++        page_size=128,
++        seqused_trim=0,
++        dtype=torch.float8_e4m3fn,
++    )
++    k_packed = inputs["k_paged"].detach().clone()
++    v_packed = inputs["v_paged"].detach().clone()
++    pool = torch.empty(
++        k_packed.shape[0],
++        4,
++        *k_packed.shape[1:],
++        dtype=k_packed.dtype,
++        device=k_packed.device,
++    )
++    k_strided = pool[:, 1]
++    v_strided = pool[:, 3]
++    k_strided.copy_(k_packed)
++    v_strided.copy_(v_packed)
++
++    assert not k_strided.is_contiguous()
++    assert not v_strided.is_contiguous()
++    assert (
++        sparse_interface._prepare_paged_hnd_input(k_strided, inputs["blk_kv"]).data_ptr()
++        == k_strided.data_ptr()
++    )
++    assert (
++        sparse_interface._prepare_paged_hnd_input(v_strided, inputs["blk_kv"]).data_ptr()
++        == v_strided.data_ptr()
++    )
++
++    def run(k: torch.Tensor, v: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
++        return sparse_atten_func(
++            inputs["q"],
++            k,
++            v,
++            inputs["k2q_row_ptr"],
++            inputs["k2q_q_indices"],
++            16,
++            blk_kv=inputs["blk_kv"],
++            causal=True,
++            softmax_scale=inputs["softmax_scale"],
++            return_softmax_lse=True,
++            cu_seqlens_q=inputs["cu_seqlens_q"],
++            cu_seqlens_k=inputs["cu_seqlens_k"],
++            max_seqlen_q=inputs["max_seqlen_q"],
++            max_seqlen_k=inputs["max_seqlen_k"],
++            page_table=inputs["page_table"],
++            seqused_k=inputs["seqused_k"],
++            schedule=inputs["schedule"],
++        )
++
++    packed_out, packed_lse = run(k_packed, v_packed)
++    strided_out, strided_lse = run(k_strided, v_strided)
++    torch.testing.assert_close(strided_out, packed_out, rtol=0, atol=0)
++    torch.testing.assert_close(strided_lse, packed_lse, rtol=0, atol=0)
++
++
+ @pytest.mark.parametrize("paged", [False, True])
+ @pytest.mark.parametrize("causal", [True])
+ @pytest.mark.parametrize("batch", [3])
