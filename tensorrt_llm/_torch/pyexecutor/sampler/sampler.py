@@ -478,14 +478,14 @@ def _get_max_beam_width(request: LlmRequest) -> int:
 
 def _request_get_sampling_params(request: LlmRequest) -> UtilsSamplingParams:
     sampling_config = request.sampling_config
+    # These sampling fields live on the C++ SamplingConfig as optional<vector<T>>
+    # (a shape designed for the batched TRT-LLM sampler); the torch sampler consumes
+    # them per request, so we unwrap the singleton lists into scalars here. When the
+    # TRT-LLM sampler is removed, this SamplingConfig-based plumbing should be removed
+    # too in favor of reading the values directly from the per-request params.
     temperature = _unwrap_singleton(cast(Optional[list[float]], sampling_config.temperature))
     top_p = _unwrap_singleton(cast(Optional[list[float]], sampling_config.top_p))
     top_k = _unwrap_singleton(cast(Optional[list[int]], sampling_config.top_k))
-    # These top-p-decay fields live on the C++ SamplingConfig as optional<vector<T>>
-    # (a shape designed for the batched TRT-LLM sampler); the torch sampler consumes
-    # them per request, so we unwrap the singleton list into a scalar here. When the
-    # TRT-LLM sampler is removed, this SamplingConfig-based plumbing should be removed
-    # too in favor of reading the values directly from the per-request params.
     top_p_decay = _unwrap_singleton(cast(Optional[list[float]], sampling_config.top_p_decay))
     top_p_min = _unwrap_singleton(cast(Optional[list[float]], sampling_config.top_p_min))
     top_p_reset_ids = _unwrap_singleton(cast(Optional[list[int]], sampling_config.top_p_reset_ids))
@@ -800,10 +800,6 @@ def add_token(
 
 def int_tensor(shape: tuple[int, ...], device: str = "cuda") -> torch.Tensor:
     return torch.empty(shape, dtype=torch.int, device=device)
-
-
-def float_tensor(shape: tuple[int, ...], device: str = "cuda") -> torch.Tensor:
-    return torch.empty(shape, dtype=torch.float32, device=device)
 
 
 @dataclass(kw_only=True, frozen=True)
@@ -2290,6 +2286,21 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         fused post-sample update kernel filter decay-active slots on the GPU,
         avoiding a host-side ``.tolist()`` / set intersection each step."""
 
+        @classmethod
+        def create(cls, max_num_sequences: int) -> "TorchSampler.TopPDecayStore":
+            n = (max_num_sequences,)
+            return cls(
+                runtime_top_p_decay_cuda=torch.empty(n, dtype=torch.float32, device="cuda"),
+                initial_top_p_decay_cuda=torch.empty(n, dtype=torch.float32, device="cuda"),
+                top_p_decay_cuda=torch.empty(n, dtype=torch.float32, device="cuda"),
+                top_p_decay_min_cuda=torch.empty(n, dtype=torch.float32, device="cuda"),
+                top_p_decay_reset_ids_cuda=torch.empty(n, dtype=torch.int, device="cuda"),
+                # The gate buffer IS the gate, so (unlike the others) it must start
+                # False: a slot that was never admitted as decay-active must read
+                # False.
+                is_top_p_decay_slot_cuda=torch.zeros(n, dtype=torch.bool, device="cuda"),
+            )
+
     @dataclass(kw_only=True)
     class Store:
         new_tokens: torch.Tensor
@@ -2355,17 +2366,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             )
         # Per-slot Top-P Decay runtime state (FlashInfer path). Allocated for all
         # sampler instances; only slots in self._top_p_decay_slots are ever read.
-        n = (self.max_num_sequences,)
-        top_p_decay_store = self.TopPDecayStore(
-            runtime_top_p_decay_cuda=float_tensor(n),
-            initial_top_p_decay_cuda=float_tensor(n),
-            top_p_decay_cuda=float_tensor(n),
-            top_p_decay_min_cuda=float_tensor(n),
-            top_p_decay_reset_ids_cuda=int_tensor(n),
-            # The gate buffer IS the gate, so (unlike the others) it must start
-            # False: a slot that was never admitted as decay-active must read False.
-            is_top_p_decay_slot_cuda=torch.zeros(n, dtype=torch.bool, device="cuda"),
-        )
+        top_p_decay_store = self.TopPDecayStore.create(self.max_num_sequences)
 
         return self.Store(
             new_tokens=new_tokens,
@@ -2533,6 +2534,12 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         request is failed individually instead of aborting the whole batch.
         """
         params = _request_get_sampling_params(request)
+        # NB: value ranges need no re-check here. Every request enters through
+        # the executor::SamplingConfig constructor, which hard-validates
+        # top_p_decay in (0, 1], top_p_min in (0, 1] and top_p_reset_ids >= 0
+        # (samplingConfig.cpp check* helpers) for all frontends. A reset id
+        # >= vocab_size is not checked anywhere but is semantically inert: it
+        # can never match a sampled token, i.e. it behaves as "reset disabled".
         if not top_p_decay_active(params):
             return
         if params.use_beam_search:
@@ -3053,42 +3060,12 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         seq_slots: list[int] = []
         # Used for beam search updates
         max_prompt_len: int = 0
-        # Used for top-p-decay store updates (only populated for decay-active reqs)
-        decay_seq_slots: list[int] = []
-        decay_initial_top_p: list[float] = []
-        decay_top_p_decay: list[float] = []
-        decay_top_p_min: list[float] = []
-        decay_top_p_reset_ids: list[int] = []
-
         # Prepare finish reasons handler
         self._finish_reasons_handler.setup_new_request_handling()
         for request in new_requests:
             slot = request.py_seq_slot
             assert slot is not None
             seq_slots.append(slot)
-            # Drop any stale top-p-decay membership from a prior occupant of this
-            # slot; re-added below only if this request itself uses decay.
-            # (Unsupported decay combinations were already rejected per-request in
-            # validate_request at admission.)
-            self._top_p_decay_slots.discard(slot)
-            decay_params = _request_get_sampling_params(request)
-            if top_p_decay_active(decay_params):
-                self._top_p_decay_slots.add(slot)
-                decay_seq_slots.append(slot)
-                # Initial runtime top-p defaults to 1.0 when top_p is unset.
-                decay_initial_top_p.append(
-                    decay_params.top_p if decay_params.top_p is not None else 1.0
-                )
-                # decay is guaranteed non-None and < 1.0 here (top_p_decay_active);
-                # min/reset fall back to the C++ runtime defaults when unset.
-                assert decay_params.top_p_decay is not None
-                decay_top_p_decay.append(decay_params.top_p_decay)
-                decay_top_p_min.append(
-                    decay_params.top_p_min if decay_params.top_p_min is not None else 1e-6
-                )
-                decay_top_p_reset_ids.append(
-                    decay_params.top_p_reset_ids if decay_params.top_p_reset_ids is not None else -1
-                )
             # update temp_data with this requests data
             self._finish_reasons_handler.prepare_for_new_request(request)
 
@@ -3128,20 +3105,9 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             all_sampling_requests=new_requests + scheduled_requests.generation_requests,
         )
 
-        # Clear the device decay gate for every newly-admitted slot (covers slot
-        # reuse: a slot previously decay-active but reused by a non-decay request
-        # must read False). Decay-active slots are then set True below.
-        decay_gate = self.store.top_p_decay_store.is_top_p_decay_slot_cuda
-        decay_gate.index_fill_(0, seq_slots_tensor_cuda_long, False)
-
-        if decay_seq_slots:
-            self._update_top_p_decay_store_for_new_requests(
-                decay_seq_slots=decay_seq_slots,
-                initial_top_p=decay_initial_top_p,
-                top_p_decay=decay_top_p_decay,
-                top_p_min=decay_top_p_min,
-                top_p_reset_ids=decay_top_p_reset_ids,
-            )
+        self._setup_top_p_decay_for_new_requests(
+            new_requests, new_seq_slots_cuda_long=seq_slots_tensor_cuda_long
+        )
 
         if self._use_beam_search:
             beam_search_store = self.store.beam_search_store
@@ -3151,6 +3117,65 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 self.store.log_probs_store,
                 seq_slots_long=seq_slots_tensor_cuda_long,
                 max_prompt_len=max_prompt_len,
+            )
+
+    def _setup_top_p_decay_for_new_requests(
+        self,
+        new_requests: list[LlmRequest],
+        *,
+        new_seq_slots_cuda_long: torch.Tensor,
+    ) -> None:
+        """Refresh top-p-decay membership and per-slot buffers for admitted requests.
+
+        Drops stale membership from prior occupants of the newly-admitted slots
+        (host set and device gate), then re-admits the decay-active requests and
+        initializes their per-slot store entries. Unsupported decay combinations
+        were already rejected per-request in validate_request at admission.
+        """
+        # Clear the device decay gate for every newly-admitted slot (covers slot
+        # reuse: a slot previously decay-active but reused by a non-decay request
+        # must read False). Decay-active slots are then set True below.
+        decay_gate = self.store.top_p_decay_store.is_top_p_decay_slot_cuda
+        decay_gate.index_fill_(0, new_seq_slots_cuda_long, False)
+
+        decay_seq_slots: list[int] = []
+        initial_top_p: list[float] = []
+        top_p_decay: list[float] = []
+        top_p_min: list[float] = []
+        top_p_reset_ids: list[int] = []
+        for request in new_requests:
+            slot = request.py_seq_slot
+            assert slot is not None
+            self._top_p_decay_slots.discard(slot)
+            sampling_params = _request_get_sampling_params(request)
+            if not top_p_decay_active(sampling_params):
+                continue
+            self._top_p_decay_slots.add(slot)
+            decay_seq_slots.append(slot)
+            # Initial runtime top-p defaults to 1.0 when top_p is unset.
+            initial_top_p.append(
+                sampling_params.top_p if sampling_params.top_p is not None else 1.0
+            )
+            # decay is guaranteed non-None and < 1.0 here (top_p_decay_active);
+            # min/reset fall back to the C++ runtime defaults when unset.
+            assert sampling_params.top_p_decay is not None
+            top_p_decay.append(sampling_params.top_p_decay)
+            top_p_min.append(
+                sampling_params.top_p_min if sampling_params.top_p_min is not None else 1e-6
+            )
+            top_p_reset_ids.append(
+                sampling_params.top_p_reset_ids
+                if sampling_params.top_p_reset_ids is not None
+                else -1
+            )
+
+        if decay_seq_slots:
+            self._update_top_p_decay_store_for_new_requests(
+                decay_seq_slots=decay_seq_slots,
+                initial_top_p=initial_top_p,
+                top_p_decay=top_p_decay,
+                top_p_min=top_p_min,
+                top_p_reset_ids=top_p_reset_ids,
             )
 
     def _update_top_p_decay_store_for_new_requests(
@@ -3870,7 +3895,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
 
         for req_idx, req in enumerate(state.requests):
             if req.state == LlmRequestState.GENERATION_COMPLETE:
-                self._drop_top_p_decay_slot_if_finished(req)
+                self._retire_top_p_decay_slot(req)
                 continue
 
             if req.py_beam_width > 1:
@@ -3937,24 +3962,21 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 self._finish_reasons_handler.store.num_accepted_draft_tokens_host[
                     req.py_seq_slot
                 ] = req.py_num_accepted_draft_tokens
-            self._drop_top_p_decay_slot_if_finished(req)
+            if req.state == LlmRequestState.GENERATION_COMPLETE:
+                self._retire_top_p_decay_slot(req)
 
-    def _drop_top_p_decay_slot_if_finished(self, req: LlmRequest) -> None:
+    def _retire_top_p_decay_slot(self, req: LlmRequest) -> None:
         """Retire a finished request's slot from the top-p-decay membership set.
 
-        Without this, `_top_p_decay_slots` would only shrink on slot reuse, so the
-        O(1) early-outs on the sampling hot path (post-sample update, override
-        build) would stay disabled forever once any decay request had run. The
-        device-side buffers need no cleanup: a freed slot is never sampled, and
-        slot reuse re-initializes them in setup_sampler_step. Requests that finish
-        outside the sampler (e.g. cancellation) are covered by the slot-reuse
-        cleanup instead.
+        Callers ensure ``req`` has finished. Without this, `_top_p_decay_slots`
+        would only shrink on slot reuse, so the O(1) early-outs on the sampling
+        hot path (post-sample update, override build) would stay disabled forever
+        once any decay request had run. The device-side buffers need no cleanup:
+        a freed slot is never sampled, and slot reuse re-initializes them in
+        setup_sampler_step. Requests that finish outside the sampler (e.g.
+        cancellation) are covered by the slot-reuse cleanup instead.
         """
-        if (
-            self._top_p_decay_slots
-            and req.state == LlmRequestState.GENERATION_COMPLETE
-            and req.py_seq_slot is not None
-        ):
+        if self._top_p_decay_slots and req.py_seq_slot is not None:
             self._top_p_decay_slots.discard(req.py_seq_slot)
 
     def _return_log_probs(self, requests: list[LlmRequest]) -> bool:
@@ -4226,7 +4248,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
     def _build_top_p_runtime_override(
         self,
         *,
-        strategy_key: Any,
+        strategy_key: FlashInferGroupedStrategySampler.STRATEGY_KEY_TYPE,
         group_req_indices: torch.Tensor,
         req_num_steps: torch.Tensor,
         seq_slots: torch.Tensor,

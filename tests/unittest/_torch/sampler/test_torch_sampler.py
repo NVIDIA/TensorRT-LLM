@@ -2851,23 +2851,25 @@ class TestTopPDecay:
                     runtime[slot] = max(runtime[slot] * cfg["decay"], cfg["top_p_min"])
                 assert got[slot].item() == pytest.approx(runtime[slot], abs=1e-6), (step, slot)
 
+    @staticmethod
+    def _mock_request(params: SamplingParams, *, draft_tokens=None):
+        params._validate()
+        req = SimpleNamespace(
+            sampling_config=SamplingConfig(params._get_sampling_config()),
+            is_context_init_state=False,
+            py_sampling_strategy=None,
+            py_draft_tokens=draft_tokens,
+        )
+        req.get_beam_width_by_iter = lambda for_next_iteration=False: 1
+        return cast(LlmRequest, req)
+
     def test_reject_speculative_draft_tokens(self):
         # Decay + draft tokens through TorchSampler is rejected per-request at
         # admission (validate_request), so only the offending request fails.
         sampler = self._make_sampler(max_draft_len=4)
-
-        def _request(params: SamplingParams, draft_tokens):
-            params._validate()
-            req = SimpleNamespace(
-                sampling_config=SamplingConfig(params._get_sampling_config()),
-                is_context_init_state=False,
-                py_sampling_strategy=None,
-                py_draft_tokens=draft_tokens,
-            )
-            req.get_beam_width_by_iter = lambda for_next_iteration=False: 1
-            return cast(LlmRequest, req)
-
         with pytest.raises(ValueError, match="speculative"):
-            sampler.validate_request(_request(SamplingParams(top_p=0.9, top_p_decay=0.5), [1, 2]))
+            sampler.validate_request(
+                self._mock_request(SamplingParams(top_p=0.9, top_p_decay=0.5), draft_tokens=[1, 2])
+            )
         # Same request without decay is accepted.
-        sampler.validate_request(_request(SamplingParams(top_p=0.9), [1, 2]))
+        sampler.validate_request(self._mock_request(SamplingParams(top_p=0.9), draft_tokens=[1, 2]))
