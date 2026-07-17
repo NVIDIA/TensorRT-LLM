@@ -77,7 +77,7 @@ def _mark_presence_prefix_kernel(
     presence_prefix_row_stride,
     num_tokens,
     BLOCK_SIZE: tl.constexpr,
-):
+) -> None:
     """Atomically mark ignored-prefix tokens in the packed presence bitmap."""
     offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offsets < num_tokens
@@ -117,7 +117,7 @@ def _apply_batched_occurrence_penalties_kernel(
     LOGIT_LIMIT: tl.constexpr,
     HAS_PRESENCE_PREFIX: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
-):
+) -> None:
     """Update the workspace once and apply it to every row of a request."""
     request_idx = tl.program_id(0)
     vocab_block = tl.program_id(1)
@@ -183,12 +183,7 @@ def _apply_batched_occurrence_penalties_kernel(
             mask=vocab_mask,
         )
 
-    tl.store(counts_ptr + count_offset, count, mask=vocab_mask)
-    tl.store(
-        has_previous_token_ptr + slot,
-        1,
-        mask=vocab_block == 0,
-    )
+        tl.store(counts_ptr + count_offset, count, mask=vocab_mask)
 
 
 def apply_batched_occurrence_penalties_triton(
@@ -204,11 +199,11 @@ def apply_batched_occurrence_penalties_triton(
     repetition: torch.Tensor,
     presence: torch.Tensor,
     frequency: torch.Tensor,
-) -> torch.Tensor:
-    """Apply occurrence penalties before downstream temperature handling."""
+) -> None:
+    """Apply occurrence penalties to ``logits`` in place, before temperature handling."""
     num_requests = seq_slots.numel()
     if num_requests == 0:
-        return logits
+        return
 
     vocab = logits.size(-1)
     block_size = 1024
@@ -230,7 +225,7 @@ def apply_batched_occurrence_penalties_triton(
         vocab,
         logits.stride(0),
         counts.stride(0),
-        presence_prefix.stride(0) if has_presence_prefix else counts.stride(0),
+        presence_prefix.stride(0) if presence_prefix is not None else counts.stride(0),
         new_tokens.stride(0),
         new_tokens.stride(1),
         new_tokens.stride(2),
@@ -239,4 +234,3 @@ def apply_batched_occurrence_penalties_triton(
         BLOCK_SIZE=block_size,
         num_warps=4,
     )
-    return logits

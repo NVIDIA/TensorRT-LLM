@@ -26,7 +26,7 @@ from tensorrt_llm.llmapi import KvCacheConfig as TRT_KvCacheConfig
 
 
 @pytest.fixture(scope="module")
-def model_path():
+def model_path() -> Path:
     return llm_models_root() / "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
 
 
@@ -262,7 +262,7 @@ def _assert_completion_penalty_logprobs(
 
 
 @pytest.mark.high_cuda_memory
-def test_torch_sampler_penalty_logits_e2e(model_path):
+def test_torch_sampler_penalty_logits_e2e(model_path: Path) -> None:
     """Validate TorchSampler's processed logits against the penalty formulas."""
     cases = _make_penalty_e2e_cases()
     results, prompt_token_ids = _run_penalty_e2e_cases(model_path, cases)
@@ -277,18 +277,26 @@ def test_torch_sampler_penalty_logits_e2e(model_path):
 
 
 @pytest.mark.high_cuda_memory
-def test_torch_sampler_speculative_penalty_e2e(model_path):
-    """Validate penalties through overlap scheduling and confirmed-history updates."""
+def test_torch_sampler_speculative_penalty_e2e(model_path: Path) -> None:
+    """Validate the speculative (NGram) path's penalized logprobs against the formula.
+
+    A positive temperature keeps the processed logprobs a real distribution the penalty
+    formula can be checked against (greedy would collapse them to one-hot). At this
+    temperature the penalties push the target away from NGram's repetition drafts, so drafts
+    are proposed but not accepted -- every emitted token is target-sampled and its processed
+    logprobs match the formula. Accepted draft tokens report a one-hot logprob and cannot be
+    formula-checked; the accepted-token confirmed-history commit path is covered at the logit
+    level by ``test_handler_tracks_overlap_and_commits_speculative_tail``.
+    """
     case = _PenaltyE2ECase(
         "ngram_speculative_penalties",
         "red blue red blue red blue red blue red blue",
-        SamplingParams(
+        _penalty_sampling_params(
             max_tokens=8,
-            temperature=0.0,
-            seed=12345,
-            ignore_eos=True,
-            presence_penalty=0.01,
-            frequency_penalty=0.01,
+            logprobs=5,
+            repetition_penalty=1.5,
+            presence_penalty=1.0,
+            frequency_penalty=1.0,
             prompt_ignore_length=2,
         ),
     )
@@ -306,30 +314,16 @@ def test_torch_sampler_speculative_penalty_e2e(model_path):
         enable_iter_perf_stats=True,
     ) as llm:
         speculative_outputs = llm.generate(
-            [case.prompt],
-            sampling_params=[case.sampling_params],
-            use_tqdm=False,
+            [case.prompt], sampling_params=[case.sampling_params], use_tqdm=False
         )
         stats = llm.get_stats(timeout=5)
 
-    with _create_torch_llm(model_path, max_batch_size=1) as llm:
-        reference_outputs = llm.generate(
-            [case.prompt],
-            sampling_params=[case.sampling_params],
-            use_tqdm=False,
-        )
+    assert any(stat.get("specDecodingStats", {}).get("numDraftTokens", 0) > 0 for stat in stats), (
+        "NGram must produce draft tokens in this test"
+    )
 
-    assert len(speculative_outputs) == len(reference_outputs) == 1
-    speculative_stats = [
-        stat["specDecodingStats"]
-        for stat in stats
-        if stat.get("specDecodingStats", {}).get("numDraftTokens", 0) > 0
-    ]
-    assert speculative_stats, "NGram must produce draft tokens in this test"
-    assert sum(stat["numAcceptedTokens"] for stat in speculative_stats) > 0
-
-    speculative_completions = speculative_outputs[0].outputs
-    reference_completions = reference_outputs[0].outputs
-    assert [completion.token_ids for completion in speculative_completions] == [
-        completion.token_ids for completion in reference_completions
-    ]
+    speculative_prompt_token_ids = tuple(
+        int(token_id) for token_id in speculative_outputs[0].prompt_token_ids
+    )
+    for completion in speculative_outputs[0].outputs:
+        _assert_completion_penalty_logprobs(case, completion, speculative_prompt_token_ids)

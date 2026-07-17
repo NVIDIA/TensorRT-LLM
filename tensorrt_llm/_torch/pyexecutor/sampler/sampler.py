@@ -461,10 +461,6 @@ def _has_occurrence_penalty(request: LlmRequest) -> bool:
     )
 
 
-def _is_occurrence_penalty_active(request: LlmRequest) -> bool:
-    return _get_max_beam_width(request) == 1 and _has_occurrence_penalty(request)
-
-
 def _get_beam_width_in(request: LlmRequest) -> int:
     return (
         1
@@ -1453,7 +1449,7 @@ class _OccurrencePenaltyHandler:
         untouched.
         """
         was_active = self._slots[slot] is not None
-        if not _is_occurrence_penalty_active(request):
+        if not (_get_max_beam_width(request) == 1 and _has_occurrence_penalty(request)):
             self._slots[slot] = None
             if was_active:
                 self._num_active_slots -= 1
@@ -1549,12 +1545,18 @@ class _OccurrencePenaltyHandler:
             else:
                 counted_tokens.append(token)
 
+        slot_index = torch.full(
+            (len(counted_tokens),), slot, dtype=torch.int64, device=self._device
+        )
+        prefix_slot_index = torch.full(
+            (len(prefix_tokens),), slot, dtype=torch.int64, device=self._device
+        )
         update_occurrence_workspace(
             counts,
             self.store.presence_prefix,
-            self._to_device([slot] * len(counted_tokens), torch.int64),
+            slot_index,
             self._to_device(counted_tokens, torch.int64),
-            self._to_device([slot] * len(prefix_tokens), torch.int64),
+            prefix_slot_index,
             self._to_device(prefix_tokens, torch.int64),
         )
         state.initialized = True
@@ -1612,30 +1614,34 @@ class _OccurrencePenaltyHandler:
         seq_slots: torch.Tensor,
         request_offsets: torch.Tensor,
         request_num_steps: torch.Tensor,
-    ) -> torch.Tensor:
-        """Apply occurrence penalties to ``logits`` in place; returns ``logits``.
+    ) -> None:
+        """Apply occurrence penalties to ``logits`` in place.
 
         ``logits`` is the packed generated-token logits ``[sum(num_steps * num_beams),
         vocab_size]``; the row layout matches ``TorchSampler._apply_min_length_penalty``.
         """
         if self._num_active_slots == 0:
-            return logits
+            return
+
+        # Cheap per-batch scan so the vocab-sized workspace is only allocated when this
+        # batch actually contains a penalized request.
+        active_requests: list[tuple[LlmRequest, "_OccurrencePenaltyHandler._SlotState"]] = []
+        for request in requests:
+            slot = request.py_seq_slot
+            assert slot is not None
+            state = self._slots[slot]
+            if state is not None:
+                active_requests.append((request, state))
+        if not active_requests:
+            return
 
         self._ensure_workspace(logits.size(-1))
         store = self.store
-        has_active_request = False
         counts = store.counts
         assert counts is not None
-        for request in requests:
-            assert request.py_seq_slot is not None
-            slot = request.py_seq_slot
-            state = self._slots[slot]
-            if state is not None:
-                has_active_request = True
-                self._initialize_workspace(request, state, logits.size(-1))
+        for request, state in active_requests:
+            self._initialize_workspace(request, state, logits.size(-1))
 
-        if not has_active_request:
-            return logits
         num_requests = len(requests)
         kernel_request_offsets = self._request_offsets[:num_requests]
         kernel_request_num_steps = self._request_num_steps[:num_requests]
@@ -1655,7 +1661,20 @@ class _OccurrencePenaltyHandler:
             store.presence,
             store.frequency,
         )
-        return logits
+        # Flag has_previous_token for the slots this call penalized (active, num_steps > 0)
+        # so the next apply folds their sampled new_tokens. Kept on the host, out of the
+        # multi-vocab-block kernel, to avoid a cross-block race on the flag.
+        pending_token_slots: list[int] = []
+        for request, num_steps in zip(requests, request_num_steps.tolist()):
+            slot = request.py_seq_slot
+            if slot is None:
+                continue
+            if self._slots[slot] is not None and num_steps > 0:
+                pending_token_slots.append(slot)
+        if pending_token_slots:
+            store.has_previous_token.index_fill_(
+                0, self._to_device(pending_token_slots, torch.int64), True
+            )
 
 
 class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
@@ -3254,7 +3273,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
     @override
     def validate_request(self, request: LlmRequest) -> None:
         if self._use_beam_search:
-            if _has_occurrence_penalty(request):
+            if _get_max_beam_width(request) > 1 and _has_occurrence_penalty(request):
                 logger.warning(
                     "TorchSampler does not support repetition, presence, or frequency "
                     "penalties with beam search; these penalties will be ignored."
@@ -5043,9 +5062,9 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             sampling_requests_metadata.req_num_beams.tolist(),
         )
 
-        # Apply repetition/presence/frequency penalties (before the greedy fast path,
-        # so both greedy and grouped-sampling logits are penalized).
-        logits_cuda = self._penalty_handler.apply(
+        # Apply repetition/presence/frequency penalties in place (before the greedy fast
+        # path, so both greedy and grouped-sampling logits are penalized).
+        self._penalty_handler.apply(
             logits_cuda,
             sampling_requests,
             new_tokens=new_tokens_cuda,

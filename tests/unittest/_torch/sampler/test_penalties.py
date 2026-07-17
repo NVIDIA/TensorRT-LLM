@@ -24,11 +24,19 @@ from tensorrt_llm._torch.pyexecutor.sampler.ops.penalties import (
 from tensorrt_llm._torch.pyexecutor.sampler.sampler import _OccurrencePenaltyHandler
 
 
-def _col(values):
+def _col(values: list[float]) -> torch.Tensor:
     return torch.tensor(values, dtype=torch.float32, device="cuda").view(-1, 1)
 
 
-def _dense_penalty_reference(logits, counts, presence, rep, pre, freq, temp):
+def _dense_penalty_reference(
+    logits: torch.Tensor,
+    counts: torch.Tensor,
+    presence: torch.Tensor | None,
+    rep: torch.Tensor,
+    pre: torch.Tensor,
+    freq: torch.Tensor,
+    temp: torch.Tensor,
+) -> torch.Tensor:
     """Dense post-temperature reference for ``apply_occurrence_penalties_triton``.
 
     Follows the TorchSampler order: repetition where the token is present anywhere
@@ -50,7 +58,7 @@ def _dense_penalty_reference(logits, counts, presence, rep, pre, freq, temp):
     return (penalized - sub) / temp
 
 
-def _pack_presence_prefix(counts, presence):
+def _pack_presence_prefix(counts: torch.Tensor, presence: torch.Tensor) -> torch.Tensor:
     packed = torch.zeros(
         presence.size(0),
         (presence.size(1) + 31) // 32,
@@ -93,7 +101,15 @@ def _pack_presence_prefix(counts, presence):
     ],
 )
 @pytest.mark.parametrize("num_steps", [1, 3], ids=["regular", "speculative"])
-def test_triton_matches_dense_logits_reference(name, rep, pre, freq, temp, use_prefix, num_steps):
+def test_triton_matches_dense_logits_reference(
+    name: str,
+    rep: list[float],
+    pre: list[float],
+    freq: list[float],
+    temp: list[float],
+    use_prefix: bool,
+    num_steps: int,
+) -> None:
     # vocab=5000 is not a multiple of BLOCK_SIZE (1024), exercising the tail mask.
     A, V = len(rep), 5000
     gen = torch.Generator(device="cuda").manual_seed(sum(name.encode()) + num_steps)
@@ -138,7 +154,7 @@ def test_triton_matches_dense_logits_reference(name, rep, pre, freq, temp, use_p
     torch.testing.assert_close(got / temp_t[row_slots], ref, rtol=1e-4, atol=1e-4)
 
 
-def test_triton_indirect_indexing_bf16():
+def test_triton_indirect_indexing_bf16() -> None:
     # Permuted request offsets and sequence slots penalize a subset of logits rows, with
     # repeated slot mappings. Other rows must stay untouched. bfloat16 also covers the
     # fp32-compute -> bf16-store cast path.
@@ -202,7 +218,7 @@ def test_triton_indirect_indexing_bf16():
     torch.testing.assert_close(logits[untouched], orig[untouched], rtol=0, atol=0)
 
 
-def test_packed_prefix_boundaries_match_dense_logits_reference():
+def test_packed_prefix_boundaries_match_dense_logits_reference() -> None:
     vocab = 70
     counts = torch.zeros(1, vocab, dtype=torch.int32, device="cuda")
     presence_prefix = torch.zeros(1, (vocab + 31) // 32, dtype=torch.int32, device="cuda")
@@ -252,6 +268,46 @@ def test_packed_prefix_boundaries_match_dense_logits_reference():
     torch.testing.assert_close(logits, expected, rtol=1e-4, atol=1e-4)
 
 
+def test_batched_kernel_does_not_latch_pending_token() -> None:
+    """The batched kernel must not write ``has_previous_token``.
+
+    Every vocab block reads the flag at entry to decide whether to fold the pending
+    ``new_tokens`` token; a write from the kernel could be observed by a later block
+    (CTAs are unordered) and spuriously fold ``new_tokens`` into its ``counts`` slice.
+    Here the flag is False with a stale token in a high vocab block (above ``BLOCK_SIZE``):
+    nothing may be folded, the flag must stay False, and the logits must be untouched.
+    """
+    vocab = 3000  # > BLOCK_SIZE (1024) -> spans multiple vocab blocks
+    stale_token = 2500  # lives in vocab block 2, above block 0
+    has_previous_token = torch.zeros(1, dtype=torch.bool, device="cuda")
+    new_tokens = torch.zeros(1, 1, 1, dtype=torch.int32, device="cuda")
+    new_tokens[0, 0, 0] = stale_token
+    counts = torch.zeros(1, vocab, dtype=torch.int32, device="cuda")
+    logits = torch.linspace(-4.0, 4.0, steps=vocab, device="cuda").view(1, vocab)
+    original = logits.clone()
+
+    apply_batched_occurrence_penalties_triton(
+        logits,
+        counts,
+        None,
+        torch.ones(1, dtype=torch.bool, device="cuda"),
+        has_previous_token,
+        new_tokens,
+        torch.zeros(1, dtype=torch.int64, device="cuda"),
+        torch.zeros(1, dtype=torch.int32, device="cuda"),
+        torch.ones(1, dtype=torch.int32, device="cuda"),
+        torch.tensor([1.5], device="cuda"),
+        torch.tensor([0.5], device="cuda"),
+        torch.tensor([0.4], device="cuda"),
+    )
+
+    # Deterministic: the raw kernel must leave the latch untouched (host re-arms it).
+    assert not bool(has_previous_token.item())
+    # With has_previous_token False and counts all zero, no penalty may be applied; the
+    # stale high-block token in particular must not be folded (would perturb logits[2500]).
+    torch.testing.assert_close(logits, original, rtol=0, atol=0)
+
+
 def _make_handler_request(
     *,
     slot: int,
@@ -293,7 +349,7 @@ def _apply_handler(
     )
 
 
-def test_handler_tracks_overlap_and_commits_speculative_tail():
+def test_handler_tracks_overlap_and_commits_speculative_tail() -> None:
     vocab = 16
     slot = 2
     handler = _OccurrencePenaltyHandler(
@@ -372,7 +428,7 @@ def test_handler_tracks_overlap_and_commits_speculative_tail():
     torch.testing.assert_close(logits, expected, rtol=1e-4, atol=1e-4)
 
 
-def test_regular_handler_slot_reuse_does_not_leak_penalties():
+def test_regular_handler_slot_reuse_does_not_leak_penalties() -> None:
     vocab = 16
     handler = _OccurrencePenaltyHandler(
         max_num_sequences=1,
