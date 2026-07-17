@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import os
 import pathlib
 import subprocess
@@ -13,7 +16,7 @@ import tensorrt_llm
 import tensorrt_llm.bindings
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
-    KVCacheManager, PeftCacheManager,
+    KVCacheManager, PeftCacheManager, _merge_kv_cache_pool_pointers,
     _warn_if_unsupported_v1_kv_cache_event_hash_algo)
 from tensorrt_llm.bindings import LayerType
 from tensorrt_llm.bindings import ModelConfig as ModelConfigCpp
@@ -64,6 +67,101 @@ def test_v1_kv_cache_event_hash_algo_no_warning_for_auto():
             KV_CACHE_HASH_ALGO_AUTO)
 
     warning.assert_not_called()
+
+
+class TestMergeKVCachePoolPointers(unittest.TestCase):
+
+    def test_mixed_half_nvfp4_pools_align_scale_rows(self):
+        data_pointers = torch.tensor([[11, 12], [21, 22]])
+        scale_pointers = torch.tensor([[31, 32]])
+        layer_to_pool_mapping = torch.tensor([[0, 0], [1, 0]])
+
+        merged = _merge_kv_cache_pool_pointers(
+            data_pointers,
+            scale_pointers,
+            layer_to_pool_mapping,
+            [DataType.HALF, DataType.NVFP4],
+        )
+
+        expected = torch.tensor([
+            [[11, 0], [12, 0]],
+            [[21, 31], [22, 32]],
+        ])
+        self.assertEqual(merged.shape, (2, 2, 2))
+        self.assertTrue(torch.equal(merged, expected))
+
+    def test_shared_nvfp4_pool_consumes_one_scale_row(self):
+        data_pointers = torch.tensor([[11, 12], [21, 22]])
+        scale_pointers = torch.tensor([[31, 32]])
+        layer_to_pool_mapping = torch.tensor([[0, 0], [0, 0], [1, 0]])
+
+        merged = _merge_kv_cache_pool_pointers(
+            data_pointers,
+            scale_pointers,
+            layer_to_pool_mapping,
+            [DataType.NVFP4, DataType.NVFP4, DataType.HALF],
+        )
+
+        expected = torch.tensor([
+            [[11, 31], [12, 32]],
+            [[21, 0], [22, 0]],
+        ])
+        self.assertTrue(torch.equal(merged, expected))
+
+    def test_physical_pool_ids_map_to_compact_data_rows(self):
+        data_pointers = torch.tensor([[11, 12], [21, 22]])
+        scale_pointers = torch.tensor([[31, 32]])
+        layer_to_pool_mapping = torch.tensor([[0, 0], [2, 0]])
+
+        merged = _merge_kv_cache_pool_pointers(
+            data_pointers,
+            scale_pointers,
+            layer_to_pool_mapping,
+            [DataType.NVFP4, DataType.HALF],
+        )
+
+        expected = torch.tensor([
+            [[11, 31], [12, 32]],
+            [[21, 0], [22, 0]],
+        ])
+        self.assertTrue(torch.equal(merged, expected))
+
+
+class TestKVCacheManagerPoolPointers(unittest.TestCase):
+
+    @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
+    def test_default_nvfp4_pool_configuration_merges_scale_pointers(self):
+        manager = KVCacheManager(
+            kv_cache_config=KvCacheConfig(max_tokens=64),
+            kv_cache_type=tensorrt_llm.bindings.internal.batch_manager.
+            CacheType.SELF,
+            num_layers=1,
+            num_kv_heads=1,
+            head_dim=128,
+            tokens_per_block=32,
+            max_seq_len=64,
+            max_batch_size=1,
+            mapping=Mapping(),
+            dtype=DataType.NVFP4,
+        )
+        try:
+            data_pointers = manager.impl.get_block_pool_pointers()
+            scale_pointers = manager.impl.get_block_scale_pool_pointers()
+
+            self.assertEqual(manager.pool_configurations, [])
+            self.assertEqual(
+                [(config.window_size, config.dtype)
+                 for config in manager.impl.pool_configurations],
+                [(64, DataType.NVFP4)],
+            )
+            self.assertTrue(
+                torch.equal(manager.kv_cache_pool_pointers[..., 0],
+                            data_pointers))
+            self.assertTrue(
+                torch.equal(manager.kv_cache_pool_pointers[..., 1],
+                            scale_pointers))
+        finally:
+            manager.shutdown()
 
 
 class TestResourceManager(unittest.TestCase):
@@ -992,6 +1090,26 @@ class TestKVCacheManagerConfigForwarding(unittest.TestCase):
                 kwargs["secondary_offload_min_priority"], 0)
         finally:
             kv_cache_manager.shutdown()
+
+
+class TestResolveWindowSize(unittest.TestCase):
+
+    @staticmethod
+    def _make_manager(max_attention_window_vec, is_vswa):
+        mgr = KVCacheManager.__new__(KVCacheManager)
+        mgr.max_attention_window_vec = max_attention_window_vec
+        mgr.is_vswa = is_vswa
+        return mgr
+
+    def test_uniform_multi_layer_vector_does_not_raise(self):
+        mgr = self._make_manager([4096, 4096, 4096], is_vswa=False)
+        self.assertEqual(mgr._resolve_window_size(None), 4096)
+
+    def test_genuine_vswa_requires_window_size(self):
+        mgr = self._make_manager([4096, 8192], is_vswa=True)
+        with self.assertRaises(ValueError):
+            mgr._resolve_window_size(None)
+        self.assertEqual(mgr._resolve_window_size(8192), 8192)
 
 
 if __name__ == "__main__":

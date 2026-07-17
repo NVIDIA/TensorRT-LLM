@@ -572,14 +572,14 @@ files = [
 
 [[package]]
 name = "filelock"
-version = "3.29.7"
+version = "3.30.2"
 description = "A platform independent file lock."
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "filelock-3.29.7-py3-none-any.whl", hash = "sha256:987db6f789a3a2a59f55081801b2b3697cb97e2a736b5f1a9e99b559285fbc51"},
-    {file = "filelock-3.29.7.tar.gz", hash = "sha256:5b481979797ae69e72f0b389d89a80bdd585c260c5b3f1fb9c0a5ba9bb3f195d"},
+    {file = "filelock-3.30.2-py3-none-any.whl", hash = "sha256:a64b58f75048ec39589983e97f5117163f822261dcb6ba843e098f05aac9663f"},
+    {file = "filelock-3.30.2.tar.gz", hash = "sha256:1ea7c857465c897a4a6e64c1aace28ff6b83f5bc66c1c06ea148efa65bc2ec5d"},
 ]
 
 [[package]]
@@ -724,14 +724,14 @@ files = [
 
 [[package]]
 name = "google-api-core"
-version = "2.31.0"
+version = "2.32.0"
 description = "Google API client core library"
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "google_api_core-2.31.0-py3-none-any.whl", hash = "sha256:ef79fb3784c71cbac89cbd03301ba0c8fb8ad2aa95d7f9204dd9628f7adf59ab"},
-    {file = "google_api_core-2.31.0.tar.gz", hash = "sha256:2be84ee0f584c48e6bde1b36766e23348b361fb7e55e56135fc76ce1c397f9c2"},
+    {file = "google_api_core-2.32.0-py3-none-any.whl", hash = "sha256:ae1f0d58a6c8869350bf469f8eb3092e7f8c494a942d9525494afb6c162b0904"},
+    {file = "google_api_core-2.32.0.tar.gz", hash = "sha256:2b33aad226b19272458c46abfe5c5a38d9531ece0c44502129a1463ce83674ac"},
 ]
 
 [package.dependencies]
@@ -747,32 +747,32 @@ grpc = ["grpcio (>=1.41.0,<2.0.0)", "grpcio (>=1.49.1,<2.0.0) ; python_version >
 
 [[package]]
 name = "google-auth"
-version = "2.55.2"
+version = "2.56.0"
 description = "Google Authentication Library"
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "google_auth-2.55.2-py3-none-any.whl", hash = "sha256:d715f265f2cafc6a5f1bf0dc19870d20e3119f6f6682785a250bce3d03d38a3b"},
-    {file = "google_auth-2.55.2.tar.gz", hash = "sha256:97ae7790ff740f2bc9db60eb864a7804f4ac19f5f02c38b3d942f2fea6e9b9ae"},
+    {file = "google_auth-2.56.0-py3-none-any.whl", hash = "sha256:6e88c10217e07a92bfd01cac8ee99e32ccfb08414c3102e6c5b8d58f37a0d1e0"},
+    {file = "google_auth-2.56.0.tar.gz", hash = "sha256:f90fa030b569a92654b9d690665a073841df33d57487be53db583a9a0867a553"},
 ]
 
 [package.dependencies]
-cryptography = ">=38.0.3"
+cryptography = {version = ">=38.0.3", markers = "python_version < \"3.14\""}
 pyasn1-modules = ">=0.2.1"
 
 [package.extras]
-aiohttp = ["aiohttp (>=3.8.0,<4.0.0)", "requests (>=2.20.0,<3.0.0)"]
-cryptography = ["cryptography (>=38.0.3)"]
-enterprise-cert = ["cryptography (>=38.0.3)"]
+aiohttp = ["aiohttp (>=3.8.0,<4.0.0) ; python_version < \"3.14\"", "aiohttp (>=3.9.0,<4.0.0) ; python_version >= \"3.14\"", "requests (>=2.30.0,<3.0.0)"]
+cryptography = ["cryptography (>=38.0.3) ; python_version < \"3.14\"", "cryptography (>=41.0.5) ; python_version >= \"3.14\""]
+enterprise-cert = ["cryptography (>=38.0.3) ; python_version < \"3.14\"", "cryptography (>=41.0.5) ; python_version >= \"3.14\""]
 grpc = ["grpcio (>=1.59.0,<2.0.0) ; python_version < \"3.14\"", "grpcio (>=1.75.1,<2.0.0) ; python_version >= \"3.14\""]
 pyjwt = ["pyjwt (>=2.0)"]
-pyopenssl = ["cryptography (>=38.0.3)"]
+pyopenssl = ["cryptography (>=38.0.3) ; python_version < \"3.14\"", "cryptography (>=41.0.5) ; python_version >= \"3.14\""]
 reauth = ["pyu2f (>=0.1.5)"]
-requests = ["requests (>=2.20.0,<3.0.0)"]
-rsa = ["rsa (>=3.1.4,<5)"]
-testing = ["aiohttp (>=3.8.0,<4.0.0)", "aioresponses", "flask", "freezegun", "grpcio (>=1.59.0,<2.0.0) ; python_version < \"3.14\"", "grpcio (>=1.75.1,<2.0.0) ; python_version >= \"3.14\"", "packaging", "pyjwt (>=2.0)", "pytest", "pytest-asyncio", "pytest-cov", "pytest-localserver", "pyu2f (>=0.1.5)", "requests (>=2.20.0,<3.0.0)", "responses", "urllib3"]
-urllib3 = ["packaging", "urllib3"]
+requests = ["requests (>=2.30.0,<3.0.0)"]
+rsa = ["rsa (>=4.0.0,<5)"]
+testing = ["aiohttp (>=3.8.0,<4.0.0) ; python_version < \"3.14\"", "aiohttp (>=3.9.0,<4.0.0) ; python_version >= \"3.14\"", "aioresponses", "flask", "freezegun", "grpcio (>=1.59.0,<2.0.0) ; python_version < \"3.14\"", "grpcio (>=1.75.1,<2.0.0) ; python_version >= \"3.14\"", "packaging (>=20.0)", "pyjwt (>=2.0)", "pytest", "pytest-asyncio", "pytest-cov", "pytest-localserver", "pyu2f (>=0.1.5)", "requests (>=2.30.0,<3.0.0)", "responses", "urllib3 (>=1.26.15,<3.0.0)"]
+urllib3 = ["packaging (>=20.0)", "urllib3 (>=1.26.15,<3.0.0)"]
 
 [[package]]
 name = "googleapis-common-protos"
@@ -1177,14 +1177,14 @@ files = [
 
 [[package]]
 name = "opentelemetry-api"
-version = "1.43.0"
+version = "1.44.0"
 description = "OpenTelemetry Python API"
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "opentelemetry_api-1.43.0-py3-none-any.whl", hash = "sha256:20acf45e9b21851926835292e4045d290acade1edd2ff3de86d2f069687ba1fd"},
-    {file = "opentelemetry_api-1.43.0.tar.gz", hash = "sha256:107d0d03857ea8fc7c5fcbbbd83f800c281f0d560553d61c1d675fccfd1761c1"},
+    {file = "opentelemetry_api-1.44.0-py3-none-any.whl", hash = "sha256:94b98c893a91b88657eaac1e3ba89618cdb85be6918196705354f34728b2cdef"},
+    {file = "opentelemetry_api-1.44.0.tar.gz", hash = "sha256:67647e5e9566edcf421166fdf022b3537f818635daa852b289e34604dc6fb33a"},
 ]
 
 [package.dependencies]
@@ -1192,31 +1192,31 @@ typing-extensions = ">=4.5.0"
 
 [[package]]
 name = "opentelemetry-exporter-prometheus"
-version = "0.64b0"
+version = "0.65b0"
 description = "Prometheus Metric Exporter for OpenTelemetry"
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "opentelemetry_exporter_prometheus-0.64b0-py3-none-any.whl", hash = "sha256:9979a15f8d007d442bc7a6e16f4cbde5e8e0c5e99689887ceb5f33da251f0655"},
-    {file = "opentelemetry_exporter_prometheus-0.64b0.tar.gz", hash = "sha256:96fec79be9527cb9dc994d7e663051df35161eb936fe2d41954725e4595abbc1"},
+    {file = "opentelemetry_exporter_prometheus-0.65b0-py3-none-any.whl", hash = "sha256:3b3d24b586d0ad9712c7b52b7d19c8a9dfbb318b9b284121b5f95e90ed019367"},
+    {file = "opentelemetry_exporter_prometheus-0.65b0.tar.gz", hash = "sha256:2777cbf41c403c119e10f418fce5d645c956b47f673a2ee120285d1d0c6df2d5"},
 ]
 
 [package.dependencies]
 opentelemetry-api = ">=1.12,<2.0"
-opentelemetry-sdk = ">=1.43.0,<1.44.0"
+opentelemetry-sdk = ">=1.44.0,<1.45.0"
 prometheus-client = ">=0.5.0,<1.0.0"
 
 [[package]]
 name = "opentelemetry-proto"
-version = "1.43.0"
+version = "1.44.0"
 description = "OpenTelemetry Python Proto"
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "opentelemetry_proto-1.43.0-py3-none-any.whl", hash = "sha256:c58f1f7ef84bc7dc2834016c0c37fe0081dde7ca9f6339be1970fbf9cdaaa90d"},
-    {file = "opentelemetry_proto-1.43.0.tar.gz", hash = "sha256:224778df17e1f3fafeaaa21d874236ca5f6ffc2f86e0899298ec7351aac27924"},
+    {file = "opentelemetry_proto-1.44.0-py3-none-any.whl", hash = "sha256:898b155a0e1557afd867478fb6158e8122a46329ca0bb8dc53cc55e98f017f56"},
+    {file = "opentelemetry_proto-1.44.0.tar.gz", hash = "sha256:c547a79c2f8c0c515d31509154682e5921c7cfd5ca67b70e1f9266e2c3e103f3"},
 ]
 
 [package.dependencies]
@@ -1224,38 +1224,38 @@ protobuf = ">=5.0,<8.0"
 
 [[package]]
 name = "opentelemetry-sdk"
-version = "1.43.0"
+version = "1.44.0"
 description = "OpenTelemetry Python SDK"
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "opentelemetry_sdk-1.43.0-py3-none-any.whl", hash = "sha256:d1323a547c1ce69d6a069a17a44b7da82bb8b332051ecb074041f87642c86823"},
-    {file = "opentelemetry_sdk-1.43.0.tar.gz", hash = "sha256:d8187c81c162df9913e4003dd6485f7390d9a24fc17026ec7387b8b8218b08e9"},
+    {file = "opentelemetry_sdk-1.44.0-py3-none-any.whl", hash = "sha256:df081c4c6bcfdb1211e3e86140376792643128a25f8d72d1d27675936e7e96ad"},
+    {file = "opentelemetry_sdk-1.44.0.tar.gz", hash = "sha256:cebe7f65dc12f26ead75c6064de12fd2a9052e5060c0272d402cfa203aae123b"},
 ]
 
 [package.dependencies]
-opentelemetry-api = "1.43.0"
-opentelemetry-semantic-conventions = "0.64b0"
+opentelemetry-api = "1.44.0"
+opentelemetry-semantic-conventions = "0.65b0"
 typing-extensions = ">=4.5.0"
 
 [package.extras]
-file-configuration = ["jsonschema (>=4.0)", "pyyaml (>=6.0)"]
+file-configuration = ["opentelemetry-configuration (==0.65b0)"]
 
 [[package]]
 name = "opentelemetry-semantic-conventions"
-version = "0.64b0"
+version = "0.65b0"
 description = "OpenTelemetry Semantic Conventions"
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "opentelemetry_semantic_conventions-0.64b0-py3-none-any.whl", hash = "sha256:ea77e85e354b8f604ddbe5f3d9135216f982fa4d77e5859ac30f6d8a50505aa6"},
-    {file = "opentelemetry_semantic_conventions-0.64b0.tar.gz", hash = "sha256:72f76fb2d1582d9d033dd1fcd84532e961e6ff3d90d24ba6fabc72975a83864c"},
+    {file = "opentelemetry_semantic_conventions-0.65b0-py3-none-any.whl", hash = "sha256:1cacde7b0ad306f84c5ef08c3dbe1bbaf20165bba6f8bff43b670e555a086bcb"},
+    {file = "opentelemetry_semantic_conventions-0.65b0.tar.gz", hash = "sha256:f9b2b81e9d5b64f11bc952075e7e9c7fb0aab075c7fd1c46d597f1b919852d60"},
 ]
 
 [package.dependencies]
-opentelemetry-api = "1.43.0"
+opentelemetry-api = "1.44.0"
 typing-extensions = ">=4.5.0"
 
 [[package]]
@@ -2164,14 +2164,14 @@ files = [
 
 [[package]]
 name = "smart-open"
-version = "8.0.0"
+version = "8.0.1"
 description = "Utils for streaming large files (S3, HDFS, GCS, SFTP, Azure Blob Storage, gzip, bz2, zst...)"
 optional = false
 python-versions = "<4.0,>=3.10"
 groups = ["main"]
 files = [
-    {file = "smart_open-8.0.0-py3-none-any.whl", hash = "sha256:ff4f395c9e86f23e27771dc4ba756ad4bd145f181859a782c50d64168485761b"},
-    {file = "smart_open-8.0.0.tar.gz", hash = "sha256:5a2008d60688bd3b33c52e2ef666d3c60cf956e73e215de8c7b242cf56fdd1b2"},
+    {file = "smart_open-8.0.1-py3-none-any.whl", hash = "sha256:3e97f90e92a952cb57863dfe132082c400a52eeeb27c067692fb51dbcc5b0089"},
+    {file = "smart_open-8.0.1.tar.gz", hash = "sha256:18b1c4496003c6902be17c15f032b5c319f307c89c6ae9e6b028b508bed8b2cf"},
 ]
 
 [package.dependencies]

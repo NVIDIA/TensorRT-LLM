@@ -614,6 +614,79 @@ def _generate_ltx2_lpips_video(output_path, *, enable_cuda_graph=False):
     _save_lpips_video_mp4(generated_video, output_path, frame_rate=LTX2_T2V_FRAME_RATE)
 
 
+def _generate_ltx2_cuda_graph_trtllm_backend_video(output_path):
+    from tensorrt_llm import VisualGen, VisualGenArgs, VisualGenParams
+    from tensorrt_llm.visual_gen.args import (
+        AttentionConfig,
+        CompilationConfig,
+        CudaGraphConfig,
+        ParallelConfig,
+        TorchCompileConfig,
+    )
+
+    scratch_space = conftest.llm_models_root()
+    checkpoint_path = os.path.join(scratch_space, LTX2_MODEL_CHECKPOINT_PATH)
+    text_encoder_path = _ltx2_lpips_text_encoder_path()
+    spatial_upsampler_path = os.path.join(scratch_space, LTX2_UPSAMPLER_SUBPATH)
+    distilled_lora_path = os.path.join(scratch_space, LTX2_DISTILLED_LORA_SUBPATH)
+    _skip_if_missing(checkpoint_path, "LTX-2 checkpoint")
+    _skip_if_missing(text_encoder_path, "LTX-2 text encoder", is_dir=True)
+    _skip_if_missing(spatial_upsampler_path, "LTX-2 spatial upsampler")
+    _skip_if_missing(distilled_lora_path, "LTX-2 distilled LoRA")
+    _disable_inductor_compile_worker_quiesce()
+
+    visual_gen_args = VisualGenArgs(
+        model=checkpoint_path,
+        quant_config={"quant_algo": "NVFP4", "dynamic": True},
+        attention_config=AttentionConfig(backend="TRTLLM"),
+        parallel_config=ParallelConfig(
+            cfg_size=1,
+            ulysses_size=1,
+            parallel_vae_size=1,
+        ),
+        compilation_config=CompilationConfig(
+            resolutions=[
+                (
+                    LTX2_T2V_HEIGHT,
+                    LTX2_T2V_WIDTH,
+                )
+            ],
+            num_frames=[LTX2_LPIPS_NUM_FRAMES],
+        ),
+        cuda_graph_config=CudaGraphConfig(enable=True),
+        torch_compile_config=TorchCompileConfig(
+            enable=True,
+            enable_fullgraph=False,
+            enable_autotune=True,
+        ),
+        pipeline_config={
+            "text_encoder_path": text_encoder_path,
+            "spatial_upsampler_path": spatial_upsampler_path,
+            "distilled_lora_path": distilled_lora_path,
+        },
+    )
+
+    visual_gen = VisualGen(model=checkpoint_path, args=visual_gen_args)
+    try:
+        params = VisualGenParams(
+            height=LTX2_T2V_HEIGHT,
+            width=LTX2_T2V_WIDTH,
+            num_frames=LTX2_LPIPS_NUM_FRAMES,
+            num_inference_steps=LTX2_LPIPS_NUM_INFERENCE_STEPS,
+            guidance_scale=LTX2_T2V_GUIDANCE_SCALE,
+            max_sequence_length=LTX2_T2V_MAX_SEQ_LEN,
+            seed=LTX2_T2V_SEED,
+            frame_rate=LTX2_T2V_FRAME_RATE,
+            negative_prompt=LTX2_T2V_NEGATIVE_PROMPT,
+        )
+        output = visual_gen.generate(inputs=LTX2_T2V_PROMPT, params=params)
+        _save_lpips_video_mp4(output.video, output_path, frame_rate=LTX2_T2V_FRAME_RATE)
+    finally:
+        visual_gen.shutdown()
+
+    assert os.path.isfile(output_path), f"LTX-2 TRTLLM backend did not produce {output_path}"
+
+
 def _run_wan_lpips_pipeline(
     model_path,
     prompt,
@@ -738,17 +811,18 @@ def wan22_bf16_video_path(_visual_gen_deps, llm_venv):
     return output_path
 
 
-def _generate_qwenimage_lpips_image(model_path, output_path):
-    """Generate the QwenImage text-to-image LPIPS sample (default setting, compile-off)."""
+def _generate_qwenimage_lpips_image(model_path, output_path, *, enable_cuda_graph=False):
+    """Generate the QwenImage text-to-image LPIPS sample."""
     from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
     from tensorrt_llm.media.encoding import save_image
-    from tensorrt_llm.visual_gen.args import TorchCompileConfig, VisualGenArgs
+    from tensorrt_llm.visual_gen.args import CudaGraphConfig, TorchCompileConfig, VisualGenArgs
 
     _skip_if_missing(model_path, "QwenImage checkpoint", is_dir=True)
     _disable_inductor_compile_worker_quiesce()
     args = VisualGenArgs(
         model=model_path,
         torch_compile_config=TorchCompileConfig(enable=False),
+        cuda_graph_config=CudaGraphConfig(enable=enable_cuda_graph),
     )
     pipeline = PipelineLoader(args).load(skip_warmup=True)
     try:
@@ -921,6 +995,31 @@ def test_ltx2_cuda_graph_lpips_matches_eager(_visual_gen_deps, tmp_path):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_ltx2_cuda_graph_trtllm_backend(request, _visual_gen_deps, tmp_path):
+    generated_path = tmp_path / "ltx2_cuda_graph_trtllm_backend_generated.mp4"
+    golden_path = _golden_media_path(
+        tmp_path, "ltx2_lpips_golden_video.mp4", "LTX-2 LPIPS golden video"
+    )
+    _generate_ltx2_cuda_graph_trtllm_backend_video(generated_path)
+    score = _run_lpips_eval(
+        tmp_path,
+        "ltx2_cuda_graph_trtllm_backend",
+        "video",
+        LTX2_T2V_PROMPT,
+        golden_path,
+        generated_path,
+    )
+    _preserve_lpips_candidate_on_failure(
+        request,
+        score,
+        LTX2_LPIPS_THRESHOLD,
+        generated_path,
+        "ltx2_cuda_graph_trtllm_backend_generated.mp4",
+    )
+    _assert_lpips_below_threshold(score, LTX2_LPIPS_THRESHOLD)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 def test_wan21_t2v_lpips_against_golden(request, tmp_path, wan21_bf16_video_path):
     golden_path = _golden_media_path(
         tmp_path, "wan21_t2v_lpips_golden_video.mp4", "Wan 2.1 LPIPS golden video"
@@ -976,6 +1075,28 @@ def test_qwenimage_lpips_against_golden(tmp_path):
     score = _run_lpips_eval(
         tmp_path,
         "qwenimage",
+        "image",
+        QWENIMAGE_LPIPS_PROMPT,
+        golden_path,
+        generated_path,
+    )
+    _assert_lpips_below_threshold(score, QWENIMAGE_LPIPS_THRESHOLD)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_qwenimage_cuda_graph_lpips_against_golden(tmp_path):
+    generated_path = tmp_path / "qwenimage_cuda_graph_generated.png"
+    golden_path = _golden_media_path(
+        tmp_path, "qwenimage_lpips_golden.png", "QwenImage LPIPS golden image"
+    )
+    _generate_qwenimage_lpips_image(
+        _lpips_model_path(QWENIMAGE_MODEL_SUBPATH),
+        generated_path,
+        enable_cuda_graph=True,
+    )
+    score = _run_lpips_eval(
+        tmp_path,
+        "qwenimage_cuda_graph",
         "image",
         QWENIMAGE_LPIPS_PROMPT,
         golden_path,

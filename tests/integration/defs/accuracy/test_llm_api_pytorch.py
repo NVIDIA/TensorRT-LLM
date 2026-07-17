@@ -188,6 +188,16 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm, is_integration_test=True)
 
+    @pytest.mark.skip_less_device_memory(32000)
+    def test_gather_generation_logits_cuda_graph(self):
+        """RCCA: https://nvbugs/5365525."""
+        llm = LLM(self.MODEL_PATH,
+                  gather_generation_logits=True,
+                  cuda_graph_config=CudaGraphConfig())
+        with llm:
+            task = CnnDailymail(self.MODEL_NAME)
+            task.evaluate(llm)
+
     @pytest.mark.parametrize("use_dynamic_tree", [False, True],
                              ids=["no_dynamic_tree", "dynamic_tree"])
     def test_eagle3_rejection_dynamic_tree_smoke(self, use_dynamic_tree,
@@ -5945,6 +5955,72 @@ class TestLagunaXS(LlmapiAccuracyTestHarness):
         self._run_accuracy(self.NVFP4_MODEL_PATH,
                            expected_quant_algo=QuantAlgo.NVFP4,
                            expected_kv_cache_quant_algo=QuantAlgo.FP8)
+
+
+class TestLagunaXS_2_1(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "poolside/Laguna-XS-2.1"
+    POOLSIDE_PATH = f"{llm_models_root()}/poolside"
+
+    MODEL_PATH = f"{POOLSIDE_PATH}/Laguna-XS-2.1"
+    DFLASH_MODEL_PATH = f"{POOLSIDE_PATH}/Laguna-XS-2.1-DFlash"
+    FP8_MODEL_PATH = f"{POOLSIDE_PATH}/Laguna-XS-2.1-FP8"
+    FP8_DFLASH_MODEL_PATH = f"{POOLSIDE_PATH}/Laguna-XS-2.1-DFlash-FP8"
+    NVFP4_MODEL_PATH = f"{POOLSIDE_PATH}/Laguna-XS-2.1-NVFP4"
+    NVFP4_DFLASH_MODEL_PATH = f"{POOLSIDE_PATH}/Laguna-XS-2.1-DFlash-NVFP4"
+
+    GSM8K_EVALUATOR_KWARGS = dict(apply_chat_template=True)
+
+    def _run_dflash_accuracy(self,
+                             model_path,
+                             dflash_model_path,
+                             expected_quant_algo=None,
+                             expected_kv_cache_quant_algo=None):
+
+        spec_config = DFlashDecodingConfig(
+            max_draft_len=4,
+            speculative_model=dflash_model_path,
+        )
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.9,
+                                        enable_block_reuse=False)
+
+        with LLM(model_path,
+                 max_seq_len=4096,
+                 max_num_tokens=4096,
+                 max_batch_size=128,
+                 kv_cache_config=kv_cache_config,
+                 speculative_config=spec_config) as llm:
+            if expected_quant_algo is not None:
+                assert llm.args.quant_config.quant_algo == expected_quant_algo
+            if expected_kv_cache_quant_algo is not None:
+                assert (llm.args.quant_config.kv_cache_quant_algo ==
+                        expected_kv_cache_quant_algo)
+
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.GSM8K_EVALUATOR_KWARGS)
+
+    @pytest.mark.skip_less_device_memory(80000)
+    def test_bf16_dflash(self):
+        self._run_dflash_accuracy(self.MODEL_PATH, self.DFLASH_MODEL_PATH)
+
+    @skip_pre_hopper
+    @pytest.mark.skip_less_device_memory(80000)
+    def test_fp8_dflash(self):
+        self._run_dflash_accuracy(
+            self.FP8_MODEL_PATH,
+            self.FP8_DFLASH_MODEL_PATH,
+            expected_quant_algo=QuantAlgo.FP8_BLOCK_SCALES,
+            expected_kv_cache_quant_algo=QuantAlgo.FP8)
+
+    @skip_pre_blackwell
+    @pytest.mark.skip_less_device_memory(80000)
+    def test_nvfp4_dflash(self):
+        self._run_dflash_accuracy(self.NVFP4_MODEL_PATH,
+                                  self.NVFP4_DFLASH_MODEL_PATH,
+                                  expected_quant_algo=QuantAlgo.NVFP4,
+                                  expected_kv_cache_quant_algo=QuantAlgo.FP8)
 
 
 class TestQwen3_5_4B(LlmapiAccuracyTestHarness):

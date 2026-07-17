@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import math
 import tempfile
 from collections import defaultdict
@@ -17,16 +20,13 @@ from utils.util import force_ampere
 import tensorrt_llm.bindings.executor as tle
 import tensorrt_llm.llmapi.llm_args as llm_args_mod
 from tensorrt_llm import LLM as TorchLLM
-from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm._torch.auto_deploy.llm_args import \
     LlmArgs as AutoDeployLlmArgs
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_llama import LlamaForCausalLM
 from tensorrt_llm._torch.virtual_memory import RestoreMode
-from tensorrt_llm.builder import LoraConfig
 from tensorrt_llm.commands.serve import get_llm_args, is_non_default_or_required
-from tensorrt_llm.llmapi import (BuildConfig, CapacitySchedulerPolicy,
-                                 SchedulerConfig)
+from tensorrt_llm.llmapi import CapacitySchedulerPolicy, SchedulerConfig
 # fmt: off
 from tensorrt_llm.llmapi.llm_args import (BaseLlmArgs, CacheTransceiverConfig,
                                           CalibConfig, ContextChunkingPolicy,
@@ -49,16 +49,17 @@ from tensorrt_llm.llmapi.llm_args import (BaseLlmArgs, CacheTransceiverConfig,
                                           SkipSoftmaxAttentionConfig,
                                           SleepConfig, SpeculativeConfig,
                                           StrictBaseModel, TorchCompileConfig,
-                                          TorchLlmArgs, TrtLlmArgs,
+                                          TorchLlmArgs,
                                           UserProvidedDecodingConfig,
                                           update_llm_args_with_extra_dict)
 # fmt: on
 from tensorrt_llm.llmapi.llm_utils import (_resolve_kv_cache_manager_v2_auto,
+                                           _resolve_transceiver_runtime_auto,
                                            apply_model_defaults_to_llm_args)
 from tensorrt_llm.llmapi.mm_encoder import MultimodalEncoder
 from tensorrt_llm.llmapi.utils import print_traceback_on_error
+from tensorrt_llm.lora_helper import LoraConfig
 from tensorrt_llm.models.modeling_utils import LayerQuantConfig, QuantConfig
-from tensorrt_llm.plugin import PluginConfig
 
 from .test_llm import llama_model_path
 
@@ -115,45 +116,6 @@ class TestYaml:
             dict_content = yaml.safe_load(f)
         return dict_content
 
-    def test_llm_args_yaml_with_speculative_config(self):
-        yaml_content = """
-speculative_config:
-    decoding_type: Lookahead
-    max_window_size: 4
-    max_ngram_size: 3
-    """
-        llm_args_dict = self._yaml_to_dict(yaml_content)
-
-        llm_args = TrtLlmArgs(model=llama_model_path, **llm_args_dict)
-        assert llm_args.speculative_config.max_window_size == 4
-        assert llm_args.speculative_config.max_ngram_size == 3
-        assert llm_args.speculative_config.max_verification_set_size == 4
-
-    def test_llm_args_with_invalid_yaml(self):
-        yaml_content = """
-pytorch_backend_config: # this is deprecated
-    max_num_tokens: 1
-    max_seq_len: 1
-"""
-        llm_args_dict = self._yaml_to_dict(yaml_content)
-
-        with pytest.raises(ValueError):
-            llm_args = TrtLlmArgs(model=llama_model_path, **llm_args_dict)
-
-    def test_llm_args_with_build_config(self):
-        yaml_content = """
-build_config:
-    max_beam_width: 4
-    max_batch_size: 8
-    max_num_tokens: 256
-    """
-        llm_args_dict = self._yaml_to_dict(yaml_content)
-
-        llm_args = TrtLlmArgs(model=llama_model_path, **llm_args_dict)
-        assert llm_args.build_config.max_beam_width == 4
-        assert llm_args.build_config.max_batch_size == 8
-        assert llm_args.build_config.max_num_tokens == 256
-
     def test_llm_args_with_kvcache_config(self):
         yaml_content = """
 kv_cache_config:
@@ -163,7 +125,7 @@ kv_cache_config:
     """
         llm_args_dict = self._yaml_to_dict(yaml_content)
 
-        llm_args = TrtLlmArgs(model=llama_model_path, **llm_args_dict)
+        llm_args = TorchLlmArgs(model=llama_model_path, **llm_args_dict)
         assert llm_args.kv_cache_config.enable_block_reuse == True
         assert llm_args.kv_cache_config.max_tokens == 1024
         assert llm_args.kv_cache_config.max_attention_window == [
@@ -178,12 +140,12 @@ max_seq_len: 128
     """
         llm_args_dict = self._yaml_to_dict(yaml_content)
 
-        llm_args = TrtLlmArgs(model=llama_model_path, **llm_args_dict)
+        llm_args = TorchLlmArgs(model=llama_model_path, **llm_args_dict)
         assert llm_args.max_batch_size == 16
         assert llm_args.max_num_tokens == 256
         assert llm_args.max_seq_len == 128
 
-    @pytest.mark.parametrize("llm_args_cls", [TrtLlmArgs, TorchLlmArgs])
+    @pytest.mark.parametrize("llm_args_cls", [TorchLlmArgs])
     def test_llm_args_with_model_kwargs(self, llm_args_cls):
         yaml_content = """
 model_kwargs:
@@ -277,15 +239,6 @@ def test_decoding_type_eagle_warns_on_pytorch_backend(monkeypatch):
     assert any(
         "EAGLE (v1/v2) draft checkpoints are incompatible with Eagle3" in m
         for m in warnings_seen)
-
-
-def test_decoding_type_eagle3_errors_on_tensorrt_backend():
-    spec_cfg = Eagle3DecodingConfig(decoding_type="Eagle3",
-                                    max_draft_len=3,
-                                    speculative_model="/path/to/draft/model")
-    with pytest.raises(ValueError,
-                       match="only supported on the PyTorch backend"):
-        TrtLlmArgs(model=llama_model_path, speculative_config=spec_cfg)
 
 
 def test_post_processor_hook_rejected_with_skip_tokenizer_init():
@@ -501,6 +454,10 @@ def test_KvCacheConfig_declaration():
         kv_cache_event_hash_algo="auto").kv_cache_event_hash_algo == "auto"
     assert KvCacheConfig(kv_cache_event_hash_algo="v1_block_key"
                          ).kv_cache_event_hash_algo == "v1_block_key"
+    assert KvCacheConfig(kv_cache_event_hash_algo="v2_sha256"
+                         ).kv_cache_event_hash_algo == "v2_sha256"
+    assert KvCacheConfig(kv_cache_event_hash_algo="v2_sha256_64"
+                         ).kv_cache_event_hash_algo == "v2_sha256_64"
     assert pybind_config.enable_partial_reuse == True
     assert pybind_config.copy_on_partial_reuse == True
     assert pybind_config.attention_dp_events_gather_period_ms == 10
@@ -566,6 +523,7 @@ class TestMultimodalConfig:
     def test_default_encoder_cuda_graph_is_none(self):
         assert MultimodalConfig().encoder_cuda_graph is None
         assert MultimodalConfig().encoder_side_stream_max_ahead == 0
+        assert MultimodalConfig().encoder_cache_max_bytes == 128 * 1024**2
         assert MultimodalConfig().video_pruning_rate is None
 
     def test_torch_llm_args_default_multimodal_config(self):
@@ -573,12 +531,36 @@ class TestMultimodalConfig:
         assert isinstance(args.multimodal_config, MultimodalConfig)
         assert args.multimodal_config.encoder_cuda_graph is None
         assert args.multimodal_config.encoder_side_stream_max_ahead == 0
+        assert args.multimodal_config.encoder_cache_max_bytes == 128 * 1024**2
         assert args.multimodal_config.video_pruning_rate is None
 
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            (0, 0),
+            ("0", 0),
+            ("4KB", 4 * 1024),
+            ("512MB", 512 * 1024**2),
+            ("1GB", 1024**3),
+            ("1GiB", 1024**3),
+            ("2TB", 2 * 1024**4),
+        ],
+    )
+    def test_encoder_cache_max_bytes_parses_binary_units(self, value, expected):
+        config = MultimodalConfig(encoder_cache_max_bytes=value)
+        assert config.encoder_cache_max_bytes == expected
+
+    @pytest.mark.parametrize("value", ["-1", "1.5GB", "1XB", "GB", object()])
+    def test_encoder_cache_max_bytes_rejects_invalid_values(self, value):
+        with pytest.raises(ValidationError):
+            MultimodalConfig(encoder_cache_max_bytes=value)
+
     def test_torch_llm_args_with_encoder_side_stream_max_ahead(self):
-        args = TorchLlmArgs(
-            model=llama_model_path,
-            multimodal_config=MultimodalConfig(encoder_side_stream_max_ahead=2))
+        args = TorchLlmArgs(model=llama_model_path,
+                            multimodal_config=MultimodalConfig(
+                                encoder_side_stream_max_ahead=2,
+                                encoder_cache_max_bytes=0,
+                            ))
         assert args.multimodal_config.encoder_side_stream_max_ahead == 2
 
     def test_torch_llm_args_with_multimodal_video_pruning_rate(self):
@@ -618,6 +600,7 @@ class TestMultimodalConfig:
             model=llama_model_path,
             multimodal_config={
                 "encoder_side_stream_max_ahead": 2,
+                "encoder_cache_max_bytes": 0,
                 "video_pruning_rate": 0.5,
             },
         )
@@ -635,7 +618,15 @@ class TestMultimodalConfig:
                         }
                     },
                     "encoder_side_stream_max_ahead": 1,
+                    "encoder_cache_max_bytes": 0,
                 },
+            )
+
+    def test_encoder_cache_and_side_stream_max_ahead_are_exclusive(self):
+        with pytest.raises(ValidationError, match="mutually exclusive"):
+            MultimodalConfig(
+                encoder_cache_max_bytes="1MiB",
+                encoder_side_stream_max_ahead=1,
             )
 
 
@@ -877,54 +868,6 @@ def test_PeftCacheConfig_from_pybind_gets_python_only_default_values_when_none(
     assert config.lora_prefetch_dir == "."
 
 
-def test_update_llm_args_with_extra_dict_with_nested_dict():
-    llm_api_args_dict = {
-        "model":
-        "dummy-model",
-        "build_config":
-        None,  # Will override later.
-        "extended_runtime_perf_knob_config":
-        ExtendedRuntimePerfKnobConfig(multi_block_mode=True),
-        "kv_cache_config":
-        KvCacheConfig(enable_block_reuse=False),
-        "peft_cache_config":
-        PeftCacheConfig(num_host_module_layer=0),
-        "scheduler_config":
-        SchedulerConfig(capacity_scheduler_policy=CapacitySchedulerPolicy.
-                        GUARANTEED_NO_EVICT)
-    }
-    plugin_config = PluginConfig(dtype='float16', nccl_plugin=None)
-    build_config = BuildConfig(max_input_len=1024,
-                               lora_config=LoraConfig(lora_ckpt_source='hf'),
-                               plugin_config=plugin_config)
-    extra_llm_args_dict = {
-        "build_config": build_config.model_dump(mode="json"),
-    }
-
-    llm_api_args_dict = update_llm_args_with_extra_dict(llm_api_args_dict,
-                                                        extra_llm_args_dict,
-                                                        "build_config")
-    initialized_llm_args = TrtLlmArgs(**llm_api_args_dict)
-
-    def check_nested_dict_equality(dict1, dict2, path=""):
-        if not isinstance(dict1, dict) or not isinstance(dict2, dict):
-            if dict1 != dict2:
-                raise ValueError(f"Mismatch at {path}: {dict1} != {dict2}")
-            return True
-        if dict1.keys() != dict2.keys():
-            raise ValueError(f"Different keys at {path}:")
-        for key in dict1:
-            new_path = f"{path}.{key}" if path else key
-            if not check_nested_dict_equality(dict1[key], dict2[key], new_path):
-                raise ValueError(f"Mismatch at {path}: {dict1} != {dict2}")
-        return True
-
-    build_config_dict1 = build_config.model_dump(mode="json")
-    build_config_dict2 = initialized_llm_args.build_config.model_dump(
-        mode="json")
-    check_nested_dict_equality(build_config_dict1, build_config_dict2)
-
-
 class TestTelemetryConfigPrecedence:
     """Telemetry-config precedence in the merge helper.
 
@@ -1096,9 +1039,13 @@ class TestExplicitCliKeysPrecedence:
 
     def test_multimodal_config_yaml_siblings_preserved(self):
         base = {
-            "model": "dummy",
+            "model":
+            "dummy",
             "multimodal_config":
-            MultimodalConfig(encoder_side_stream_max_ahead=2),
+            MultimodalConfig(
+                encoder_side_stream_max_ahead=2,
+                encoder_cache_max_bytes=0,
+            ),
         }
         yaml_dict = {
             "multimodal_config": {
@@ -1112,55 +1059,18 @@ class TestExplicitCliKeysPrecedence:
 
     def test_multimodal_config_null_yaml_preserves_base_config(self):
         base = {
-            "model": "dummy",
+            "model":
+            "dummy",
             "multimodal_config":
-            MultimodalConfig(encoder_side_stream_max_ahead=2),
+            MultimodalConfig(
+                encoder_side_stream_max_ahead=2,
+                encoder_cache_max_bytes=0,
+            ),
         }
         yaml_dict = {"multimodal_config": None}
         merged = update_llm_args_with_extra_dict(base, yaml_dict)
         multimodal_config = merged["multimodal_config"]
         assert multimodal_config.encoder_side_stream_max_ahead == 2
-
-    def test_build_config_tier_cli_wins(self):
-        # Tier 1: explicit CLI scalar wins over both top-level YAML and nested.
-        base = {
-            "model": "dummy",
-            "max_batch_size": 64,
-            "build_config": BuildConfig(max_batch_size=64),
-        }
-        yaml_dict = {
-            "max_batch_size": 256,
-            "build_config": {
-                "max_batch_size": 300
-            },
-        }
-        merged = update_llm_args_with_extra_dict(
-            base, yaml_dict, explicit_cli_keys={"max_batch_size"})
-        assert merged["max_batch_size"] == 64
-        assert merged["build_config"].max_batch_size == 64
-
-    def test_build_config_tier_yaml_top_level_wins(self):
-        # Tier 2: no explicit CLI, but YAML top-level scalar -> propagate to
-        # build_config (legacy behavior).
-        base = {
-            "model": "dummy",
-            "build_config": BuildConfig(max_batch_size=8),
-        }
-        yaml_dict = {"max_batch_size": 256}
-        merged = update_llm_args_with_extra_dict(base, yaml_dict)
-        assert merged["max_batch_size"] == 256
-        assert merged["build_config"].max_batch_size == 256
-
-    def test_build_config_tier_yaml_nested_only_leaves_alone(self):
-        # Tier 3: no explicit CLI, no top-level YAML scalar; nested YAML
-        # build_config is imported by the outer merge.
-        base = {
-            "model": "dummy",
-            "build_config": BuildConfig(max_batch_size=8),
-        }
-        yaml_dict = {"build_config": {"max_batch_size": 256}}
-        merged = update_llm_args_with_extra_dict(base, yaml_dict)
-        assert merged["build_config"].max_batch_size == 256
 
     def test_telemetry_explicit_disabled_wins_over_yaml(self):
         from tensorrt_llm.usage.config import TelemetryConfig, UsageContext
@@ -1671,17 +1581,6 @@ class TestPiecewiseCudaGraphCaptureDefaults:
         assert kept == [1, 2, 4, 8, 1016]
 
 
-class TestTrtLlmArgs:
-
-    def test_dynamic_setattr(self):
-        with pytest.raises(pydantic_core._pydantic_core.ValidationError):
-            args = TrtLlmArgs(model=llama_model_path, invalid_arg=1)
-
-        with pytest.raises(ValueError):
-            args = TrtLlmArgs(model=llama_model_path)
-            args.invalid_arg = 1
-
-
 class TestTorchLlmArgs:
 
     @print_traceback_on_error
@@ -1735,101 +1634,6 @@ class TestTorchLlmArgs:
             llama_model_path, model_kwargs=model_kwargs).pretrained_config
         assert config_no_kwargs.num_hidden_layers != config_with_kwargs.num_hidden_layers
         assert config_with_kwargs.num_hidden_layers == 2
-
-
-class TestTrtLlmArgs:
-
-    def test_build_config_default(self):
-        args = TrtLlmArgs(model=llama_model_path)
-        # It will create a default build_config
-        assert args.build_config
-        assert args.build_config.max_beam_width == 1
-
-    def test_build_config_change(self):
-        build_config = BuildConfig(
-            max_beam_width=4,
-            max_batch_size=8,
-            max_num_tokens=256,
-        )
-        args = TrtLlmArgs(model=llama_model_path, build_config=build_config)
-        assert args.build_config.max_beam_width == build_config.max_beam_width
-        assert args.build_config.max_batch_size == build_config.max_batch_size
-        assert args.build_config.max_num_tokens == build_config.max_num_tokens
-
-    def test_LLM_with_build_config(self):
-        build_config = BuildConfig(
-            max_beam_width=4,
-            max_batch_size=8,
-            max_num_tokens=256,
-        )
-        args = TrtLlmArgs(model=llama_model_path, build_config=build_config)
-
-        assert args.build_config.max_beam_width == build_config.max_beam_width
-        assert args.build_config.max_batch_size == build_config.max_batch_size
-        assert args.build_config.max_num_tokens == build_config.max_num_tokens
-
-        assert args.max_beam_width == build_config.max_beam_width
-
-    def test_to_dict_and_from_dict(self):
-        build_config = BuildConfig(
-            max_beam_width=4,
-            max_batch_size=8,
-            max_num_tokens=256,
-        )
-        args = TrtLlmArgs(model=llama_model_path, build_config=build_config)
-        args_dict = args.model_dump()
-
-        new_args = TrtLlmArgs(**args_dict)
-
-        assert new_args.model_dump() == args_dict
-
-    def test_build_config_from_engine(self):
-        build_config = BuildConfig(max_batch_size=8, max_num_tokens=256)
-        tmp_dir = tempfile.mkdtemp()
-        with LLM(model=llama_model_path, build_config=build_config) as llm:
-            llm.save(tmp_dir)
-
-        args = TrtLlmArgs(
-            model=tmp_dir,
-            # runtime values
-            max_num_tokens=16,
-            max_batch_size=4,
-        )
-        assert args.build_config.max_batch_size == build_config.max_batch_size
-        assert args.build_config.max_num_tokens == build_config.max_num_tokens
-
-        assert args.max_num_tokens == 16
-        assert args.max_batch_size == 4
-
-    def test_model_dump_does_not_mutate_original(self):
-        """Test that model_dump() and update_llm_args_with_extra_dict don't mutate the original."""
-        # Create args with specific build_config values
-        build_config = BuildConfig(
-            max_batch_size=8,
-            max_num_tokens=256,
-        )
-        args = TrtLlmArgs(model=llama_model_path, build_config=build_config)
-
-        # Store original values
-        original_max_batch_size = args.build_config.max_batch_size
-        original_max_num_tokens = args.build_config.max_num_tokens
-
-        # Convert to dict and pass through update_llm_args_with_extra_dict with overrides
-        args_dict = args.model_dump()
-        extra_dict = {
-            "max_batch_size": 128,
-            "max_num_tokens": 1024,
-        }
-        updated_dict = update_llm_args_with_extra_dict(args_dict, extra_dict)
-
-        # Verify original args was NOT mutated
-        assert args.build_config.max_batch_size == original_max_batch_size
-        assert args.build_config.max_num_tokens == original_max_num_tokens
-
-        # Verify updated dict has new values
-        new_args = TrtLlmArgs(**updated_dict)
-        assert new_args.build_config.max_batch_size == 128
-        assert new_args.build_config.max_num_tokens == 1024
 
 
 class TestStrictBaseModelArbitraryArgs:
@@ -2032,19 +1836,6 @@ class TestStrictBaseModelArbitraryArgs:
                 match="MultimodalEncoder does not support encode_only"):
             encoder._validate_mm_args_for_torch_backend({"encode_only": True})
 
-    def test_trt_llm_args_arbitrary_args(self):
-        """Test that TrtLlmArgs rejects arbitrary arguments."""
-        # Valid arguments should work
-        args = TrtLlmArgs(model=llama_model_path, max_batch_size=8)
-        assert args.model == llama_model_path
-        assert args.max_batch_size == 8
-
-        # Arbitrary arguments should be rejected
-        with pytest.raises(
-                pydantic_core._pydantic_core.ValidationError) as exc_info:
-            TrtLlmArgs(model=llama_model_path, invalid_setting="should_fail")
-        assert "invalid_setting" in str(exc_info.value)
-
     def test_torch_llm_args_arbitrary_args(self):
         """Test that TorchLlmArgs rejects arbitrary arguments."""
         # Valid arguments should work
@@ -2171,13 +1962,6 @@ class TestServeDefaults:
                                            backend="pytorch")
         assert "build_config" not in llm_args_pytorch
         assert "scheduler_config" not in llm_args_pytorch
-
-        # TensorRT backend: both are non-None and differ from the LlmArgs
-        # class default, so the value-based filter keeps them.
-        llm_args_trt, _ = get_llm_args(model=llama_model_path,
-                                       backend="tensorrt")
-        assert "build_config" in llm_args_trt
-        assert "scheduler_config" in llm_args_trt
 
     def test_serve_explicit_cli_default_value_wins_over_yaml(self):
         """Typing --tensor_parallel_size 1 (the default) must beat YAML."""
@@ -3080,3 +2864,296 @@ class TestEnableLowLatencyHostDispatch:
         with pytest.raises(ValidationError):
             TorchLlmArgs(model="gpt2",
                          enable_low_latency_host_dispatch={"val": 1})
+
+
+class _PreferPythonTransceiverModel:
+    """Fake model class opting into the Python transceiver."""
+
+    @classmethod
+    def get_model_defaults(cls, llm_args):
+        return {}
+
+    @classmethod
+    def get_preferred_transceiver_runtime(cls, pretrained_config=None):
+        return "PYTHON"
+
+
+class _ArchSensitiveTransceiverModel:
+    """Fake shared implementation class with a per-checkpoint preference."""
+
+    @classmethod
+    def get_model_defaults(cls, llm_args):
+        return {}
+
+    @classmethod
+    def get_preferred_transceiver_runtime(cls, pretrained_config=None):
+        architectures = getattr(pretrained_config, "architectures", None) or []
+        if architectures and architectures[0] == "ModelAForCausalLM":
+            return "PYTHON"
+        return None
+
+
+class TestTransceiverRuntimeAutoResolution:
+    """Tests for the transceiver_runtime 'auto' selection mechanism."""
+
+    def _disagg_args(self, backend="NIXL", **cfg_kwargs):
+        return TorchLlmArgs(
+            model="/tmp/dummy_model",
+            cache_transceiver_config=CacheTransceiverConfig(backend=backend,
+                                                            **cfg_kwargs),
+        )
+
+    def test_default_is_auto(self):
+        cfg = CacheTransceiverConfig(backend="NIXL")
+        assert cfg.transceiver_runtime == "auto"
+
+    def test_auto_no_model_preference_falls_back_to_none(self):
+        """'auto' with no model preference resolves to None (C++ transceiver)."""
+        args = self._disagg_args()
+        _resolve_transceiver_runtime_auto(args)
+        assert args.cache_transceiver_config.transceiver_runtime is None
+
+    @pytest.mark.parametrize("explicit_auto", [False, True])
+    def test_model_preference_adopted(self, explicit_auto):
+        """Model preference applies whether 'auto' is implicit or explicit."""
+        cfg_kwargs = {"transceiver_runtime": "auto"} if explicit_auto else {}
+        args = self._disagg_args(**cfg_kwargs)
+        _resolve_transceiver_runtime_auto(args, _PreferPythonTransceiverModel)
+        assert args.cache_transceiver_config.transceiver_runtime == "PYTHON"
+
+    @pytest.mark.parametrize("explicit_runtime", ["CPP", "PYTHON", None])
+    def test_explicit_value_not_overridden_by_model_preference(
+            self, explicit_runtime):
+        """User's explicit transceiver_runtime wins over the model preference."""
+        args = self._disagg_args(transceiver_runtime=explicit_runtime)
+        _resolve_transceiver_runtime_auto(args, _PreferPythonTransceiverModel)
+        assert args.cache_transceiver_config.transceiver_runtime == explicit_runtime
+
+    @pytest.mark.parametrize("backend", ["UCX", "MPI", "MOONCAKE"])
+    def test_python_preference_incompatible_backend_falls_back_to_cpp(
+            self, backend):
+        """Python transceiver requires NIXL; other backends fall back to C++."""
+        args = self._disagg_args(backend=backend)
+        _resolve_transceiver_runtime_auto(args, _PreferPythonTransceiverModel)
+        assert args.cache_transceiver_config.transceiver_runtime is None
+
+    def test_default_backend_resolves_to_nixl_and_adopts_preference(
+            self, monkeypatch):
+        for env_var in ("TRTLLM_USE_NIXL_KVCACHE", "TRTLLM_USE_UCX_KVCACHE",
+                        "TRTLLM_USE_MOONCAKE_KVCACHE",
+                        "TRTLLM_USE_MPI_KVCACHE"):
+            monkeypatch.delenv(env_var, raising=False)
+        args = self._disagg_args(backend="DEFAULT")
+        _resolve_transceiver_runtime_auto(args, _PreferPythonTransceiverModel)
+        assert args.cache_transceiver_config.transceiver_runtime == "PYTHON"
+        # The resolver only peeks at the effective backend; the "DEFAULT"
+        # sentinel is still resolved (with its warning) at transceiver
+        # creation time.
+        assert args.cache_transceiver_config.backend == "DEFAULT"
+
+    def test_default_backend_env_override_falls_back_to_cpp(self, monkeypatch):
+        """DEFAULT + TRTLLM_USE_UCX_KVCACHE=1 means effective UCX -> C++."""
+        monkeypatch.delenv("TRTLLM_USE_NIXL_KVCACHE", raising=False)
+        monkeypatch.setenv("TRTLLM_USE_UCX_KVCACHE", "1")
+        args = self._disagg_args(backend="DEFAULT")
+        _resolve_transceiver_runtime_auto(args, _PreferPythonTransceiverModel)
+        assert args.cache_transceiver_config.transceiver_runtime is None
+
+    def test_disagg_disabled_is_noop(self):
+        """Resolver never creates a config when cache_transceiver_config is None."""
+        args = TorchLlmArgs(model="/tmp/dummy_model")
+        assert args.cache_transceiver_config is None
+        _resolve_transceiver_runtime_auto(args, _PreferPythonTransceiverModel)
+        assert args.cache_transceiver_config is None
+
+    def test_backend_none_is_noop(self):
+        """A config without a backend (disagg off) is left untouched."""
+        args = TorchLlmArgs(
+            model="/tmp/dummy_model",
+            cache_transceiver_config=CacheTransceiverConfig(),
+        )
+        _resolve_transceiver_runtime_auto(args, _PreferPythonTransceiverModel)
+        assert args.cache_transceiver_config.backend is None
+        assert args.cache_transceiver_config.transceiver_runtime == "auto"
+
+    def test_invalid_model_preference_raises(self):
+
+        class _BadModel:
+
+            @classmethod
+            def get_preferred_transceiver_runtime(cls, pretrained_config=None):
+                return "JAVA"
+
+        args = self._disagg_args()
+        with pytest.raises(ValueError, match="JAVA"):
+            _resolve_transceiver_runtime_auto(args, _BadModel)
+
+    @pytest.mark.parametrize("disagg_enabled", [False, True])
+    @pytest.mark.parametrize("transceiver_defaults", [
+        {
+            "transceiver_runtime": "PYTHON"
+        },
+        {
+            "max_tokens_in_buffer": 4096
+        },
+        {
+            "backend": "NIXL"
+        },
+    ])
+    def test_model_defaults_reject_cache_transceiver_config(
+            self, disagg_enabled, transceiver_defaults):
+        """get_model_defaults must never carry cache_transceiver_config.
+
+        The deep-merge could materialize a config in aggregated mode or
+        silently enable a disabled one; the runtime preference belongs to
+        get_preferred_transceiver_runtime().
+        """
+        args = (self._disagg_args() if disagg_enabled else TorchLlmArgs(
+            model="/tmp/dummy_model"))
+        with pytest.raises(ValueError, match="cache_transceiver_config"):
+            apply_model_defaults_to_llm_args(
+                args, {"cache_transceiver_config": transceiver_defaults})
+        if not disagg_enabled:
+            assert args.cache_transceiver_config is None
+
+    def test_model_defaults_reject_transceiver_config_object_form(self):
+        """A Pydantic object value must not bypass the guard either."""
+        args = TorchLlmArgs(model="/tmp/dummy_model")
+        with pytest.raises(ValueError, match="cache_transceiver_config"):
+            apply_model_defaults_to_llm_args(
+                args, {
+                    "cache_transceiver_config":
+                    CacheTransceiverConfig(backend="NIXL",
+                                           transceiver_runtime="PYTHON")
+                })
+        assert args.cache_transceiver_config is None
+
+    def test_model_loader_resolves_auto_without_checkpoint_loader(self):
+        """The checkpoint_loader=None early return must still resolve 'auto'."""
+        from tensorrt_llm._torch.pyexecutor.model_loader import ModelLoader
+        args = self._disagg_args()
+        ModelLoader.load_config_and_apply_defaults("/tmp/dummy_model", args,
+                                                   None)
+        assert args.cache_transceiver_config.transceiver_runtime is None
+
+    @staticmethod
+    def _fake_checkpoint_loader(architectures):
+        from unittest.mock import MagicMock
+        fake_loader = MagicMock()
+        fake_config = MagicMock()
+        fake_config.pretrained_config.architectures = architectures
+        fake_loader.load_config.return_value = fake_config
+        return fake_loader
+
+    def test_model_loader_full_chain_adopts_model_preference(self, monkeypatch):
+        """End-to-end: load config -> resolve model class -> adopt preference."""
+        from tensorrt_llm._torch.pyexecutor import \
+            model_loader as model_loader_mod
+
+        monkeypatch.setattr(
+            model_loader_mod.AutoModelForCausalLM, "_resolve_class",
+            staticmethod(lambda config: _PreferPythonTransceiverModel))
+        fake_loader = self._fake_checkpoint_loader(["NotInMappingForCausalLM"])
+
+        args = self._disagg_args()
+        model_loader_mod.ModelLoader.load_config_and_apply_defaults(
+            "/tmp/dummy_model", args, fake_loader)
+        assert args.cache_transceiver_config.transceiver_runtime == "PYTHON"
+
+    @pytest.mark.parametrize("arch,expected", [
+        ("ModelAForCausalLM", "PYTHON"),
+        ("ModelBForCausalLM", None),
+    ])
+    def test_shared_class_differentiates_per_architecture(
+            self, monkeypatch, arch, expected):
+        """Shared implementation classes differentiate per checkpoint.
+
+        The preference hook receives pretrained_config so one implementation
+        class can vary its answer by architecture.
+        """
+        from tensorrt_llm._torch.pyexecutor import \
+            model_loader as model_loader_mod
+
+        monkeypatch.setattr(
+            model_loader_mod.AutoModelForCausalLM, "_resolve_class",
+            staticmethod(lambda config: _ArchSensitiveTransceiverModel))
+        fake_loader = self._fake_checkpoint_loader([arch])
+
+        args = self._disagg_args()
+        model_loader_mod.ModelLoader.load_config_and_apply_defaults(
+            "/tmp/dummy_model", args, fake_loader)
+        assert args.cache_transceiver_config.transceiver_runtime == expected
+
+    def test_mtp_execution_class_rewrite_keeps_target_preference(
+            self, monkeypatch):
+        """The MTP execution-class rewrite keeps the target's preference.
+
+        _resolve_class may return an execution class (MTP draft); the
+        preference must still follow the checkpoint's original architecture
+        via MODEL_CLASS_MAPPING.
+        """
+        from tensorrt_llm._torch.models.modeling_utils import \
+            MODEL_CLASS_MAPPING
+        from tensorrt_llm._torch.pyexecutor import \
+            model_loader as model_loader_mod
+
+        class _MtpDraftExecutionModel:
+
+            @classmethod
+            def get_model_defaults(cls, llm_args):
+                return {}
+
+            @classmethod
+            def get_preferred_transceiver_runtime(cls, pretrained_config=None):
+                return None
+
+        monkeypatch.setitem(MODEL_CLASS_MAPPING, "FakeTargetForCausalLM",
+                            _PreferPythonTransceiverModel)
+        monkeypatch.setattr(
+            model_loader_mod.AutoModelForCausalLM, "_resolve_class",
+            staticmethod(lambda config: _MtpDraftExecutionModel))
+        fake_loader = self._fake_checkpoint_loader(["FakeTargetForCausalLM"])
+
+        args = self._disagg_args()
+        model_loader_mod.ModelLoader.load_config_and_apply_defaults(
+            "/tmp/dummy_model", args, fake_loader)
+        assert args.cache_transceiver_config.transceiver_runtime == "PYTHON"
+
+    def test_model_loader_full_chain_aggregated_stays_none(self, monkeypatch):
+        """Full chain in aggregated mode: no transceiver config appears."""
+        from tensorrt_llm._torch.pyexecutor import \
+            model_loader as model_loader_mod
+
+        monkeypatch.setattr(
+            model_loader_mod.AutoModelForCausalLM, "_resolve_class",
+            staticmethod(lambda config: _PreferPythonTransceiverModel))
+        fake_loader = self._fake_checkpoint_loader(["NotInMappingForCausalLM"])
+
+        args = TorchLlmArgs(model="/tmp/dummy_model")
+        model_loader_mod.ModelLoader.load_config_and_apply_defaults(
+            "/tmp/dummy_model", args, fake_loader)
+        assert args.cache_transceiver_config is None
+
+    def test_resolve_default_backend_env_priority(self, monkeypatch):
+        env_vars = ("TRTLLM_USE_NIXL_KVCACHE", "TRTLLM_USE_UCX_KVCACHE",
+                    "TRTLLM_USE_MOONCAKE_KVCACHE", "TRTLLM_USE_MPI_KVCACHE")
+        for env_var in env_vars:
+            monkeypatch.delenv(env_var, raising=False)
+        cfg = CacheTransceiverConfig(backend="DEFAULT")
+
+        # No env var set: NIXL fallback.
+        assert cfg._resolve_default_backend() == ("NIXL", None)
+        # Each env var alone, then stacked in reverse priority order: the
+        # higher-priority variable must win.
+        monkeypatch.setenv("TRTLLM_USE_MPI_KVCACHE", "1")
+        assert cfg._resolve_default_backend() == ("MPI",
+                                                  "TRTLLM_USE_MPI_KVCACHE")
+        monkeypatch.setenv("TRTLLM_USE_MOONCAKE_KVCACHE", "1")
+        assert cfg._resolve_default_backend()[0] == "MOONCAKE"
+        monkeypatch.setenv("TRTLLM_USE_UCX_KVCACHE", "1")
+        assert cfg._resolve_default_backend()[0] == "UCX"
+        monkeypatch.setenv("TRTLLM_USE_NIXL_KVCACHE", "1")
+        assert cfg._resolve_default_backend()[0] == "NIXL"
+        # An explicit backend bypasses the env vars entirely.
+        assert CacheTransceiverConfig(
+            backend="UCX")._resolve_default_backend() == ("UCX", None)

@@ -985,6 +985,14 @@ class _KVCache:
     def num_committed_tokens(self) -> int:
         return len(self._committed_tokens)
 
+    @property
+    def committed_tokens(self) -> list[TokenIdExt]:
+        return list(self._committed_tokens)
+
+    @property
+    def reuse_scope(self) -> ReuseScope:
+        return self._reuse_scope
+
     # Users promise to not commit any more tokens. For cases where we shouldn't reuse generated tokens
     # (eg. CoT), this helps us drop (instead of evict) out-of-window blocks for SWA layers.
     # If there is a uncommitted block containing committed tokens, we will commit the block immediately.
@@ -1086,7 +1094,7 @@ class _KVCache:
                 if self._never_resumed and (
                     type(life_cycles[lc_idx]) is SsmLifeCycle or has_partial
                 ):
-                    deferred_slots[lc_idx] = slot_lst.pop(0)
+                    deferred_slots[lc_idx] = slot_lst.pop()
                 scratch_slots_to_add[lc_idx] = slot_lst
 
             stream_wait_events(

@@ -30,14 +30,14 @@ from .interface import (AttentionBackend, AttentionForwardArgs,
                         CustomAttentionMask, MLAParams, PredefinedAttentionMask,
                         merge_attention_forward_args)
 
-try:
-    check_cuda_arch()
-except RuntimeError:
-    # Override TORCH_CUDA_ARCH_LIST for JIT compilation of flashinfer kernels
-    # since the existed TORCH_CUDA_ARCH_LIST may be too general and flashinfer requires sm75+.
-    # Guard on a visible GPU: with CUDA_VISIBLE_DEVICES="" (pure client) the
-    # capability query would force a CUDA context at import time.
-    if torch.cuda.is_available():
+# Guard on a visible GPU: with CUDA_VISIBLE_DEVICES="" (pure client) the
+# check would force a CUDA context at import time.
+if torch.cuda.is_available() and torch.cuda.device_count() > 0:
+    try:
+        check_cuda_arch()
+    except RuntimeError:
+        # Override TORCH_CUDA_ARCH_LIST for JIT compilation of flashinfer kernels
+        # since the existed TORCH_CUDA_ARCH_LIST may be too general and flashinfer requires sm75+.
         capability = torch.cuda.get_device_capability()
         arch_list = f"{capability[0]}.{capability[1]}"
         os.environ["TORCH_CUDA_ARCH_LIST"] = arch_list
@@ -663,17 +663,28 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                         max_num_blocks = max(max_num_blocks, lbuf.shape[0])
             self._max_num_blocks = max_num_blocks
 
-            # Detect VSWA: check if the manager has multiple pools.
-            # Guard on layer_to_pool_mapping_dict which is V2-specific — V1
-            # managers also expose is_vswa but lack the per-pool infrastructure.
-            if (getattr(self.kv_cache_manager, 'is_vswa', False) and hasattr(
-                    self.kv_cache_manager, 'layer_to_pool_mapping_dict')):
-                mgr = self.kv_cache_manager
-                self._vswa_layer_to_pool = {}
-                self._vswa_pool_to_rep_layer: Dict[int, int] = {}
+            # Layers may share one page-index list only when they are in the
+            # same pool AND have the same page-index scale: VSWA splits pools,
+            # and per-layer geometry (e.g. Gemma4 sliding/global head_dim)
+            # splits scales even when all windows collapse to max_seq_len and
+            # is_vswa is False. Guarded on V2-specific attributes (V1 managers
+            # lack the per-pool infrastructure).
+            mgr = self.kv_cache_manager
+            get_scale = getattr(mgr, 'get_layer_page_index_scale', None)
+            layer_space: Dict[int, int] = {}
+            if hasattr(mgr, 'layer_to_pool_mapping_dict') and get_scale:
+                space_ids = {}
                 for layer_idx in getattr(mgr, 'layer_offsets', {}):
                     layer_offset = mgr.layer_offsets[layer_idx]
-                    pool_id = mgr.layer_to_pool_mapping_dict[layer_offset]
+                    key = (mgr.layer_to_pool_mapping_dict[layer_offset],
+                           get_scale(layer_idx))
+                    space_ids.setdefault(key, len(space_ids))
+                    layer_space[layer_idx] = space_ids[key]
+            if layer_space and (getattr(mgr, 'is_vswa', False)
+                                or len(set(layer_space.values())) > 1):
+                self._vswa_layer_to_pool = {}
+                self._vswa_pool_to_rep_layer: Dict[int, int] = {}
+                for layer_idx, pool_id in layer_space.items():
                     self._vswa_layer_to_pool[layer_idx] = pool_id
                     if pool_id not in self._vswa_pool_to_rep_layer:
                         self._vswa_pool_to_rep_layer[pool_id] = layer_idx

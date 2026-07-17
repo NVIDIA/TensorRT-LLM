@@ -24,6 +24,29 @@ def lazy_convert_sqlite(nsys_rep_file_path, sqlite_file_path):
         )
 
 
+def require_cuda_kernel_events(conn, trace_path):
+    """Fail fast with an actionable error when a trace has no CUDA kernel events.
+
+    A trace with NVTX ranges but no CUPTI_ACTIVITY_KIND_KERNEL table means the
+    workload ran while nsys was not recording CUDA activity. This happens on
+    nodes where the host driver cannot natively serve the container's CUDA
+    stack (CUDA forward compatibility mode), under which profiling tools are
+    unsupported. Without this check the parsers fail later with an opaque
+    "no such table" database error.
+    """
+    num_kernel_tables = conn.execute(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table'"
+        " AND name = 'CUPTI_ACTIVITY_KIND_KERNEL'"
+    ).fetchone()[0]
+    if num_kernel_tables == 0:
+        raise RuntimeError(
+            f"{trace_path} contains no CUDA kernel events. The workload ran, but nsys"
+            " recorded no CUDA activity; this typically means CUDA tracing was not"
+            " functional on this node, e.g. because the host driver cannot natively"
+            " serve the container's CUDA stack (CUDA forward compatibility mode)."
+        )
+
+
 parser_keywords = [
     ("cuBLASGemm", "nvjet"),
     ("cutlassGroupGemm", "cutlass::device_kernel<cutlass::gemm::kernel::GemmUniversal"),

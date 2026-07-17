@@ -35,7 +35,7 @@ l0_dgx_h100:
   - accuracy/test_disaggregated_serving.py::TestQwen3_8B::test_chunked_prefill
   - accuracy/test_disaggregated_serving.py::TestQwen3_8B::test_nixl_backend
   - accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_nixl_backend
-  - accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_gen_only_sync
+  - accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_gen_only_sync[python]
   - accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_kv_cache_v2_nixl_python
   - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_ngram
   - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_kv_cache_v2_nixl_python
@@ -119,7 +119,6 @@ l0_dgx_h100:
   - unittest/disaggregated/test_py_cache_transceiver_mp.py -k "gen_first1"
   - unittest/disaggregated/test_py_cache_transceiver_mp.py -k "gen_first2"
   - disaggregated/test_disaggregated.py::test_disaggregated_multi_gpu[TinyLlama-1.1B-Chat-v1.0]
-  - disaggregated/test_disaggregated.py::test_disaggregated_multi_gpu_trt_backend[TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated.py::test_disaggregated_ctxpp2_genpp2[TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated.py::test_disaggregated_ctxtp2_genpp2[TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated.py::test_disaggregated_ctxpp2_gentp2[TinyLlama-1.1B-Chat-v1.0]
@@ -127,6 +126,7 @@ l0_dgx_h100:
   - disaggregated/test_disaggregated.py::test_disaggregated_genbs1[TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated.py::test_disaggregated_overlap[TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated.py::test_disaggregated_overlap_transceiver_runtime_python[TinyLlama-1.1B-Chat-v1.0]
+  - disaggregated/test_disaggregated.py::test_disaggregated_python_transceiver_host_offload[TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated.py::test_disaggregated_overlap_gen_first[ctx_pp1-TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated.py::test_disaggregated_overlap_gen_first[ctx_pp4-TinyLlama-1.1B-Chat-v1.0]
   - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_tp_pp_symmetric[GSM8K-tp1pp2]

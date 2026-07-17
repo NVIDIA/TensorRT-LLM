@@ -676,12 +676,13 @@ def custom_user_workspace(request):
 
 
 @pytest.fixture(scope="session")
-def llm_venv(llm_root, custom_user_workspace):
+def llm_venv(request, llm_root, custom_user_workspace):
     workspace_dir = custom_user_workspace
     subdir = datetime.datetime.now().strftime("ws-%Y-%m-%d-%H-%M-%S")
     if workspace_dir is None:
         workspace_dir = "llm-test-workspace"
     workspace_dir = os.path.join(workspace_dir, subdir)
+    keep_workspace = request.config.getoption("--keep-workspace", default=False)
     from defs.local_venv import PythonVenvRunnerImpl
 
     venv = PythonVenvRunnerImpl("", "", "python3",
@@ -689,11 +690,11 @@ def llm_venv(llm_root, custom_user_workspace):
     yield venv
     # Remove the workspace directory
     if os.path.exists(workspace_dir):
-        print(f"Cleaning up workspace: {workspace_dir}")
-        try:
-            shutil.rmtree(workspace_dir)
-        except Exception as e:
-            print(f"Failed to clean up workspace: {e}")
+        if keep_workspace:
+            print(f"Keeping workspace (--keep-workspace): {workspace_dir}")
+        else:
+            print(f"Cleaning up workspace: {workspace_dir}")
+            shutil.rmtree(workspace_dir, ignore_errors=True)
 
 
 @pytest.fixture(scope="session")
@@ -1807,13 +1808,17 @@ def get_gpu_device_list():
         suffix = ".exe" if is_windows() else ""
         # TODO: Use NRSU because we can't assume nvidia-smi across all platforms.
         cmd = " ".join(["nvidia-smi" + suffix, "-L"])
-        output = check_output(cmd, shell=True, cwd=temp_dirname)
+        try:
+            output = check_output(cmd, shell=True, cwd=temp_dirname)
+        except sp.CalledProcessError:
+            return []
     return [l.strip() for l in output.strip().split("\n")]
 
 
 def check_device_contain(keyword_list):
     "check device not contain keyword"
-    device = get_gpu_device_list()[0]
+    devices = get_gpu_device_list()
+    device = devices[0] if devices else ""
     return any(keyword in device for keyword in keyword_list)
 
 
@@ -2009,6 +2014,12 @@ def pytest_addoption(parser):
         "Enable Ray orchestrator path for integration tests (disables MPI).",
     )
     parser.addoption(
+        "--unittest-markexpr",
+        action="store",
+        default=None,
+        help="Marker expression forwarded to nested unittest pytest runs.",
+    )
+    parser.addoption(
         "--perf-log-formats",
         help=
         "Supply either 'yaml' or 'csv' as values. Supply multiple same flags for multiple formats.",
@@ -2063,6 +2074,13 @@ def pytest_addoption(parser):
         default=False,
         help="Enable GPU clock locking during tests. "
         "By default, GPU clock locking is disabled.",
+    )
+    parser.addoption(
+        "--keep-workspace",
+        action="store_true",
+        default=False,
+        help=
+        "Skip workspace cleanup at session end (useful for inspecting logs after a failure).",
     )
     parser.addoption(
         "--periodic-save-unfinished-test",
