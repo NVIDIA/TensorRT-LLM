@@ -257,11 +257,15 @@ class PeerRegistrar:
             peer_global_ids = get_global_layer_ids(peer_lg)
             self_num_layers = get_layer_group_num_layers(self_lg)
             peer_num_layers = get_layer_group_num_layers(peer_lg)
-        else:
+        elif self_pv.mapper_kind == MapperKind.INDEXED:
             self_global_ids = get_pool_view_global_layer_ids(self_pv, self_lg)
             peer_global_ids = get_pool_view_global_layer_ids(peer_pv, peer_lg)
             self_num_layers = get_pool_view_num_layers(self_pv)
             peer_num_layers = get_pool_view_num_layers(peer_pv)
+        else:
+            raise ValueError(
+                f"PeerRegistrar.get_kv_map: unexpected mapper kind {self_pv.mapper_kind!r}"
+            )
 
         overlap = set(self_global_ids) & set(peer_global_ids)
         transfer_layers = len(overlap)
