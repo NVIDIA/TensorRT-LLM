@@ -1424,7 +1424,7 @@ def _send_rsp(
             rsp_batch.append(response)
         else:
             lanes = worker.frontend_result_queues
-            lanes[frontend_lane_index(getattr(response, "client_id", None),
+            lanes[frontend_lane_index(response.client_id,
                                       len(lanes))].put(response)
     elif worker.result_queue is not None:
         if rsp_batch is not None:

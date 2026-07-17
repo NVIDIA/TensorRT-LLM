@@ -280,7 +280,7 @@ def bucket_responses_by_frontend(responses: list,
     """
     buckets = [[] for _ in range(num_frontends)]
     for rsp in responses:
-        buckets[frontend_lane_index(getattr(rsp, "client_id", None),
+        buckets[frontend_lane_index(rsp.client_id,
                                     num_frontends)].append(rsp)
     return buckets
 
