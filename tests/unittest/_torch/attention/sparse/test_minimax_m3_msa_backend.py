@@ -74,3 +74,152 @@ def test_msa_proxy_max_score_view_is_contiguous_over_stable_store():
     # Oversized requests are rejected rather than silently corrupting memory.
     with pytest.raises(ValueError, match=r"msa_max_score backing store"):
         metadata.msa_proxy_max_score_view(num_index_heads, worst_k, max_batch + 1)
+
+
+def test_msa_index_k_uses_hnd_cache_view_and_writer():
+    metadata_cls = MiniMaxM3MsaSparseAttention.Metadata
+    metadata = metadata_cls.__new__(metadata_cls)
+    num_pages, coalescing_scale, page_size, head_dim = 2, 7, 8, 16
+    pool = torch.zeros(
+        num_pages,
+        coalescing_scale,
+        1,
+        page_size,
+        head_dim,
+        dtype=torch.bfloat16,
+    )
+    hnd_cache = pool[:, 0]
+
+    class FakeCacheManager:
+        def __init__(self):
+            self.calls = []
+
+        def get_index_k_buffer(self, layer_idx, kv_layout="NHD"):
+            self.calls.append((layer_idx, kv_layout))
+            return hnd_cache
+
+    manager = FakeCacheManager()
+    metadata.kv_cache_manager = manager
+    metadata.msa_out_cache_loc = torch.tensor([2, page_size + 5], dtype=torch.int32)
+    values = torch.arange(2 * head_dim, dtype=torch.float32).reshape(2, 1, head_dim)
+
+    returned = metadata.msa_idx_k_cache(3)
+    metadata.msa_write_idx_k(3, values)
+
+    assert returned.data_ptr() == hnd_cache.data_ptr()
+    assert not returned.is_contiguous()
+    assert manager.calls == [(3, "HND"), (3, "HND")]
+    torch.testing.assert_close(hnd_cache[0, 0, 2], values[0, 0].to(torch.bfloat16))
+    torch.testing.assert_close(hnd_cache[1, 0, 5], values[1, 0].to(torch.bfloat16))
+
+
+def test_msa_indexer_preserves_strided_hnd_index_k(monkeypatch):
+    import tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_indexer as indexer_module
+    from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.common import MiniMaxM3SparseConfig
+
+    config = MiniMaxM3SparseConfig(
+        num_q_heads=4,
+        num_kv_heads=1,
+        head_dim=128,
+        num_index_heads=4,
+        sparse_index_dim=128,
+        block_size=128,
+        topk=16,
+    )
+    indexer = indexer_module.MsaIndexer(config)
+    pool = torch.randn(2, 7, 1, 128, 128, dtype=torch.bfloat16)
+    idx_k_paged = pool[:, 0]
+    captured = {}
+
+    def fake_proxy_max_score(idx_q, passed_idx_k, **kwargs):
+        del kwargs
+        captured["idx_k"] = passed_idx_k
+        return torch.zeros(4, 2, idx_q.shape[0])
+
+    expected = torch.zeros(1, 1, 16, dtype=torch.int32)
+
+    def fake_select_blocks_from_maxscore(*args, **kwargs):
+        del args, kwargs
+        return expected
+
+    monkeypatch.setattr(indexer_module, "_proxy_max_score", fake_proxy_max_score)
+    monkeypatch.setattr(
+        indexer_module,
+        "select_blocks_from_maxscore",
+        fake_select_blocks_from_maxscore,
+    )
+
+    result = indexer.select_blocks(
+        torch.zeros(1, 4, 128, dtype=torch.bfloat16),
+        idx_k_paged,
+        idx_sm_scale=128**-0.5,
+        kv_indices=torch.arange(2, dtype=torch.int32),
+        qo_lens_cpu=torch.tensor([1], dtype=torch.int32),
+        kv_lens_cpu=torch.tensor([256], dtype=torch.int32),
+        qo_offset_cpu=torch.tensor([255], dtype=torch.int32),
+    )
+
+    assert captured["idx_k"] is idx_k_paged
+    assert captured["idx_k"].data_ptr() == idx_k_paged.data_ptr()
+    assert not captured["idx_k"].is_contiguous()
+    assert result is expected
+
+
+def test_msa_proxy_max_score_strided_index_k_matches_packed():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    if torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("SM100 (Blackwell) required")
+
+    from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_indexer import _proxy_max_score
+    from tensorrt_llm._torch.attention_backend.sparse.minimax_m3.msa_utils import (
+        msa_package_available,
+    )
+
+    if not msa_package_available():
+        pytest.skip("fmha_sm100 (MSA) not importable")
+
+    page_size = head_dim = 128
+    num_index_heads = 4
+    coalescing_scale = 57
+    kv_lens_cpu = torch.tensor([1, 130, 257, 128, 511, 1024, 33, 900], dtype=torch.int32)
+    pages_per_sequence = (kv_lens_cpu + page_size - 1) // page_size
+    num_pages = int(pages_per_sequence.sum().item())
+
+    generator = torch.Generator(device="cuda").manual_seed(0)
+    index_k_pool = torch.randn(
+        num_pages,
+        coalescing_scale,
+        1,
+        page_size,
+        head_dim,
+        generator=generator,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    index_k_strided = index_k_pool[:, 0]
+    index_k_packed = index_k_strided.contiguous()
+    index_q = torch.randn(
+        kv_lens_cpu.numel(),
+        num_index_heads,
+        head_dim,
+        generator=generator,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    kwargs = {
+        "qo_lens_cpu": torch.ones_like(kv_lens_cpu),
+        "kv_lens_cpu": kv_lens_cpu,
+        "qo_offset_cpu": kv_lens_cpu - 1,
+        "kv_indices": torch.arange(num_pages, device="cuda", dtype=torch.int32),
+        "sm_scale": head_dim**-0.5,
+        "causal": True,
+    }
+
+    strided_scores = _proxy_max_score(index_q, index_k_strided, **kwargs)
+    packed_scores = _proxy_max_score(index_q, index_k_packed, **kwargs)
+    torch.cuda.synchronize()
+
+    assert not index_k_strided.is_contiguous()
+    assert index_k_strided.stride(0) == coalescing_scale * page_size * head_dim
+    assert torch.equal(strided_scores, packed_scores)

@@ -258,18 +258,18 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
             return torch.float32
         return torch.bfloat16
 
-    def get_index_k_buffer(self, layer_idx: int) -> Optional[torch.Tensor]:
+    def get_index_k_buffer(self, layer_idx: int, kv_layout: str = "NHD") -> Optional[torch.Tensor]:
         """Return the V2-managed paged index-K view for ``layer_idx``.
 
-        Shape: ``[num_pages, tokens_per_block, 1, sparse_index_dim]``.
-        Reads/writes decompose ``slot = (page, within)`` and use
-        multi-dim fancy indexing; writes propagate to pool storage.
+        NHD shape is ``[num_pages, tokens_per_block, 1, sparse_index_dim]``;
+        HND shape is ``[num_pages, 1, tokens_per_block, sparse_index_dim]``.
         """
         return super().get_index_k_buffer(
             layer_idx,
             num_heads=1,
             head_dim=self.sparse_index_dim,
             dtype=self._torch_dtype_for_index_cache(),
+            kv_layout=kv_layout,
         )
 
     def get_index_v_buffer(self, layer_idx: int) -> Optional[torch.Tensor]:
