@@ -164,6 +164,8 @@ def test_gdn_replay_vs_legacy_and_ref(H, HV, K, V, T, HIST, iters, pool_dtype, f
         replay_kwargs["launch_with_pdl"] = fused_gating
         if packed_qkv is not None:
             replay_kwargs["packed_qkv"] = packed_qkv
+        replay_output = torch.empty((N, T, HV, V), device=device, dtype=dtype)
+        replay_kwargs["output"] = replay_output
         o_replay = fused_recurrent_gated_delta_rule_cached_replay_update(
             q,
             k,
@@ -185,6 +187,7 @@ def test_gdn_replay_vs_legacy_and_ref(H, HV, K, V, T, HIST, iters, pool_dtype, f
             dt_bias=dt_bias_t,
             **replay_kwargs,
         )
+        assert o_replay is replay_output
 
         # --- legacy path ---
         src = pool_legacy[state_indices]

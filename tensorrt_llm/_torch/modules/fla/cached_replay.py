@@ -614,6 +614,7 @@ def commit_gdn_cached_replay_history_layers(
         "prev_num_accepted_tokens",
         "replay_work_items",
         "n_writes",
+        "output",
     ]
 )
 def fused_recurrent_gated_delta_rule_cached_replay_update(
@@ -646,6 +647,7 @@ def fused_recurrent_gated_delta_rule_cached_replay_update(
     main_num_stages: Optional[int] = None,
     packed_qkv: Optional[torch.Tensor] = None,
     use_all_layer_commit: bool = False,
+    output: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """GDN replay using cached causal updates rather than raw history."""
     del old_beta  # Signature-compatible placeholder; cached updates embed beta.
@@ -742,7 +744,10 @@ def fused_recurrent_gated_delta_rule_cached_replay_update(
     elif use_all_layer_commit:
         raise ValueError("use_all_layer_commit requires replay work items")
 
-    output = q.new_empty(N, T, HV, V)
+    if output is None:
+        output = q.new_empty(N, T, HV, V)
+    else:
+        assert output.is_contiguous(), "output must be contiguous"
     NV = triton.cdiv(V, BV)
     grid = (NV, N * HV)
 

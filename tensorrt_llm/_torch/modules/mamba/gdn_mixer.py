@@ -491,7 +491,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             raise RuntimeError(
                 "GDN cached replay requires draft_token_num <= 8 and replay_history_size <= 16."
             )
-        o = fused_recurrent_gated_delta_rule_cached_replay_update(
+        return fused_recurrent_gated_delta_rule_cached_replay_update(
             q=query,
             k=key,
             v=value,
@@ -514,11 +514,8 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             use_qk_l2norm_in_kernel=True,
             packed_qkv=packed_qkv,
             use_all_layer_commit=use_all_layer_commit,
+            output=output_d,
         )
-        if output_d is not None:
-            output_d.copy_(o)
-            return output_d
-        return o
 
     def forward_decode(
         self,
