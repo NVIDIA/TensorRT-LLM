@@ -2343,7 +2343,6 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         # to decide whether the newest token must be read device-side.
         self._track_pending_steps = not args.disable_overlap_scheduler
         self._pending_steps = [0] * self.max_num_sequences
-        self._warned_stale_bad_words = False
         self.NEW_TOKENS_SHAPE = (self.max_tokens, self.max_num_sequences, self.max_beam_width)
         self.CACHE_INDIRECTION_SHAPE = (
             self.max_num_sequences,
@@ -4855,17 +4854,17 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 if any(pending):
                     if self.max_tokens == 1 and self.max_beam_width == 1 and max(pending) == 1:
                         stale_by_one = [p > 0 for p in pending]
-                    elif not self._warned_stale_bad_words:
+                    else:
                         # Speculative decoding / beam search under overlap:
                         # the missing host tokens cannot be reconstructed with
                         # the single-token device-side check; multi-token bad
                         # words may be applied one step late.
-                        self._warned_stale_bad_words = True
-                        logger.warning(
+                        logger.warning_once(
                             "bad_words with the overlap scheduler and speculative "
                             "decoding or beam search: multi-token bad words are "
                             "matched against a host token history that lags the "
-                            "device state and may be enforced inexactly."
+                            "device state and may be enforced inexactly.",
+                            key="bad_words_stale_overlap",
                         )
             self._apply_bad_words(
                 logits_cuda,
