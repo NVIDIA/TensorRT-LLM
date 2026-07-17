@@ -2032,10 +2032,6 @@ class LTX2Pipeline(BasePipeline):
 
         def decode_video_fn(vid_latents):
             vid_latents = self.video_patchifier.unpatchify(vid_latents, video_shape)
-
-            if output_type == "latent":
-                return vid_latents
-
             vid_latents = vid_latents.to(self.dtype)
             tiling_config = TilingConfig.default()
             if self._parallel_vae_enabled:
@@ -2065,21 +2061,21 @@ class LTX2Pipeline(BasePipeline):
 
         def decode_audio_fn(aud_latents):
             aud_latents = self.audio_patchifier.unpatchify(aud_latents, audio_shape)
-
-            if output_type == "latent":
-                return aud_latents
-
             aud_latents = aud_latents.to(self.dtype)
             return decode_audio(aud_latents, self.audio_decoder, self.vocoder)
 
         if output_type == "latent":
-            # The latent "decode" is a cheap local unpatchify with no VAE work,
-            # and every rank already holds the full latents after the denoise
-            # loop — return them on every rank. decode_latents' vae_ranks/rank-0
-            # gate exists to skip real VAE decode only; the two-stage handoff
+            # Latent output is a local unpatchify with no VAE work, and every
+            # rank already holds the full latents after the denoise loop —
+            # return them on every rank. decode_latents' vae_ranks/rank-0 gate
+            # exists to skip real VAE decode only; the two-stage handoff
             # consumes these latents in place with zero collectives.
-            video = decode_video_fn(latents)
-            audio = decode_audio_fn(audio_latents) if audio_latents is not None else None
+            video = self.video_patchifier.unpatchify(latents, video_shape)
+            audio = (
+                self.audio_patchifier.unpatchify(audio_latents, audio_shape)
+                if audio_latents is not None
+                else None
+            )
         else:
             video, audio = self.decode_latents(
                 latents=latents,
