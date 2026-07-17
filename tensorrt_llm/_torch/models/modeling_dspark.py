@@ -57,8 +57,6 @@ from .dspark.attention import (
     _rope_last_dims_batched,
     dspark_attention_forward,
     dspark_attention_forward_batched,
-    dspark_sparse_attn,
-    get_dspark_topk_idxs,
     precompute_dspark_freqs_cis,
 )
 from .dspark.draft import build_draft_input_ids, dspark_propose
@@ -146,104 +144,13 @@ def remap_dspark_draft_keys(weights: Dict, num_stages: int) -> Dict:
     return out
 
 
-# Optional real-fp8 MLA path: run the captured-context draft attention
-# through the REAL fp8 MLA projection modules the draft already loads
-# (``kv_a_proj_with_mqa`` fused down-proj, ``q_a_layernorm``/``q_b_proj``,
-# ``kv_a_layernorm``, ``o_a_proj``/``o_b_proj``) instead of the bf16-dequant
-# ``dspark_attention_forward``. DeepSeek-V4 MLA is the *absorbed* latent form
-# (``qk_head_dim == kv_lora_rank + qk_rope_head_dim == 512``, no ``kv_b_proj``),
-# so the loaded projections produce exactly the reference DSpark attention's
-# per-head 512-dim latent query + MQA latent K/V. RoPE stays the reference
-# interleaved ``apply_dspark_rotary`` (applied to the projection outputs); only
-# the linear projections move from bf16 to the real fp8 kernels. The windowed
-# ``dspark_sparse_attn`` + worker-owned KV window are reused unchanged.
-#
-# Enabled by ``TLLM_DSPARK_REAL_MLA=1`` (default off): until benchmarked this is
-# opt-in so the validated bf16 path and its acceptance regression guard stay
-# the default.
-DSPARK_REAL_MLA_ENV = "TLLM_DSPARK_REAL_MLA"
-
 # The checkpoint stores
 # ``mtp.{s}.attn.wo_a`` as fp8_e4m3 + a UE8M0 128x128 block scale (verified), and
 # the reference (`inference/model.py`, ``self.wo_a`` is a bf16 ColumnParallelLinear
 # loaded from the fp8 ckpt) uses the DEQUANTIZED bf16 ``wo_a`` (== ``wo_a_fp8 *
 # scale`` ~ absmean 0.065). The bf16 captured-context path historically skipped
-# this dequant (raw fp8-cast-to-bf16, ~993x too large); confirmed buggy by the
-# real-MLA path's correctly-dequantized loader ``o_a_proj`` (cos 1.0 vs
-# ``wo_a_fp8 * scale``). Always dequantize now.
-
-
-def _dspark_mla_attention(
-    self_attn,
-    x: torch.Tensor,
-    main_x: torch.Tensor,
-    start_pos: int,
-    kv_cache: torch.Tensor,
-    *,
-    window_size: int,
-    eps: float,
-    softmax_scale: float,
-    freqs_cis: torch.Tensor,
-    persist: bool = False,
-) -> torch.Tensor:
-    """Captured-context DSpark draft attention via the real fp8 MLA projections.
-
-    Drop-in replacement for :func:`dspark_attention_forward` that sources the Q/KV
-    down-projection, per-head query, MQA latent K/V and grouped O projection from
-    the loaded :class:`DeepseekV4Attention` (``self_attn``) fp8 modules rather than
-    cached bf16 weights. Shapes and semantics match the reference dense
-    (``compress_ratio == 0``) ``DSparkAttention.forward``:
-
-      * ``kv_a_proj_with_mqa(x)`` → ``[q_lora_rank | kv_lora_rank + qk_rope]``;
-      * query = ``q_b_proj(q_a_layernorm(...))`` → per-head 512-dim latent, weightless
-        per-head RMS, interleaved RoPE on the rope dims;
-      * block/context latent K/V = ``kv_a_layernorm(...)`` (shared across heads, MQA),
-        interleaved RoPE; context K/V from ``main_x`` written into the rolling window;
-      * windowed attention-sink softmax (``mqa.attn_sink``); inverse RoPE on the output;
-      * grouped O projection via ``o_a_proj`` (bf16 ``[g, o_lora, d]``) einsum + the
-        fp8 ``o_b_proj`` Linear.
-
-    ``kv_cache`` is ``[b, window_size, head_dim]`` (head_dim == ``qk_head_dim``);
-    updated in place when ``persist`` (worker-owned cross-step window), else cloned.
-    """
-    assert start_pos > 0, "DSpark draft attention runs at generation (start_pos > 0)"
-    b, block, hidden = x.shape
-    n_heads = self_attn.num_heads_tp
-    head_dim = self_attn.qk_head_dim
-    rd = self_attn.qk_rope_head_dim
-    n_groups = self_attn.n_local_groups
-    qlr = self_attn.q_lora_rank
-    main_freqs = freqs_cis[start_pos : start_pos + 1]
-    blk_freqs = freqs_cis[start_pos + 1 : start_pos + 1 + block]
-
-    # Fused down-projection on the block tokens: [q_lora | kv_lora + rope].
-    qr_blk = self_attn.kv_a_proj_with_mqa(x.reshape(b * block, hidden))
-    # Query: low-rank + per-head (weightless) RMS in the query dtype + RoPE.
-    q = self_attn.q_a_layernorm(qr_blk[..., :qlr])
-    q = self_attn.q_b_proj(q).view(b, block, n_heads, head_dim)
-    q = q * torch.rsqrt(q.square().mean(-1, keepdim=True) + eps)
-    q = _rope_last_dims(q, rd, blk_freqs)
-    # Block latent K/V (MQA, shared across heads).
-    kv = self_attn.kv_a_layernorm(qr_blk[..., qlr:]).view(b, block, head_dim)
-    kv = _rope_last_dims(kv, rd, blk_freqs)
-    # Captured-context latent K/V from main_x.
-    qr_main = self_attn.kv_a_proj_with_mqa(main_x.reshape(b, hidden))
-    main_kv = self_attn.kv_a_layernorm(qr_main[..., qlr:]).view(b, 1, head_dim)
-    main_kv = _rope_last_dims(main_kv, rd, main_freqs)
-
-    # Rolling-window write + windowed attention with the per-head sink.
-    cache = kv_cache if persist else kv_cache.clone()
-    cache[:, start_pos % window_size] = main_kv.squeeze(1).to(cache.dtype)
-    kv_full = torch.cat([cache, kv], dim=1)
-    topk = get_dspark_topk_idxs(window_size, b, block, start_pos, device=x.device)
-    o = dspark_sparse_attn(q, kv_full, self_attn.mqa.attn_sink, topk, softmax_scale)
-    o = _rope_last_dims(o, rd, blk_freqs, inverse=True)
-
-    # Grouped low-rank O projection through the real o_a_proj (bf16) + o_b_proj (fp8).
-    o = o.reshape(b, block, n_groups, -1).to(self_attn.o_a_proj.dtype)
-    o = torch.einsum("bsgd,grd->bsgr", o, self_attn.o_a_proj)
-    out = self_attn.o_b_proj(o.flatten(2).reshape(b * block, -1).contiguous())
-    return out.view(b, block, hidden)
+# this dequant (raw fp8-cast-to-bf16, ~993x too large); the correct behavior is to
+# dequantize ``wo_a`` (cos 1.0 vs ``wo_a_fp8 * scale``). Always dequantize now.
 
 
 class DSparkBlock(DeepseekV4DecoderLayer):
@@ -447,13 +354,6 @@ class DSparkDraftModel(nn.Module):
             int(getattr(config, "max_position_embeddings", 163840)) + self.block_size + 2
         )
         self._freqs_table_cache: Dict = {}
-        # When enabled, the optional real-fp8 MLA path runs captured-context
-        # draft attention through the loaded fp8 MLA projection modules
-        # (``_dspark_mla_attention``) instead of the bf16-dequant
-        # ``dspark_attention_forward``. Opt-in (default off) until benchmarked.
-        self.use_real_mla = os.environ.get(DSPARK_REAL_MLA_ENV, "0") == "1"
-        if self.use_real_mla:
-            logger.info("[DSpark] real-fp8-MLA draft attention enabled (Increment A)")
 
     def post_load_weights(self) -> None:
         """Run the one-shot post-load transforms for the draft's quant linears.
@@ -464,20 +364,17 @@ class DSparkDraftModel(nn.Module):
         ``Linear.transform_weights`` is idempotent; the routed-expert MoE packs
         itself in its own ``load_weights``.
 
-        The bf16 captured-context attention (``use_real_mla`` off) does NOT use the
-        MLA module's forward — it runs ``dspark_attention_forward`` on dequantized
-        bf16 weights cached via :meth:`cache_attn_weights_from_checkpoint` — so the
-        MLA projection linears are skipped here (they would otherwise be transformed
-        into the deep_gemm layout we don't consume). When ``use_real_mla`` is on
-        (Increment A), the draft attention runs the loaded fp8 projections directly,
-        so those linears MUST be transformed too (else deep_gemm reads raw scales).
+        The bf16 captured-context attention does NOT use the MLA module's forward —
+        it runs ``dspark_attention_forward`` on dequantized bf16 weights cached via
+        :meth:`cache_attn_weights_from_checkpoint` — so the MLA projection linears are
+        skipped here (they would otherwise be transformed into the deep_gemm layout we
+        don't consume).
         """
         attn_linear_ids = set()
-        if not self.use_real_mla:
-            for stage in self.mtp_layers:
-                for m in stage.self_attn.modules():
-                    if isinstance(m, Linear):
-                        attn_linear_ids.add(id(m))
+        for stage in self.mtp_layers:
+            for m in stage.self_attn.modules():
+                if isinstance(m, Linear):
+                    attn_linear_ids.add(id(m))
 
         for module in self.modules():
             if isinstance(module, Linear) and id(module) not in attn_linear_ids:
@@ -689,7 +586,7 @@ class DSparkDraftModel(nn.Module):
             stage_windows: ``[num_stages, window_size, head_dim]`` window for one
                 request's slot; updated in place.
         """
-        if not self.use_real_mla and getattr(self.mtp_layers[0], "_dspark_attn", None) is None:
+        if getattr(self.mtp_layers[0], "_dspark_attn", None) is None:
             return
         M = int(main_hidden.shape[0])
         if M == 0:
@@ -705,17 +602,8 @@ class DSparkDraftModel(nn.Module):
         slots = positions % win  # [M]
         mx = main_x.unsqueeze(0)  # [1, M, hidden] for the per-position RoPE layout
         for s, stage in enumerate(self.mtp_layers):
-            if self.use_real_mla:
-                # Real fp8 MLA: latent K/V = kv_a_layernorm(kv_a_proj_with_mqa(main_x)[q_lora:]),
-                # matching ``_dspark_mla_attention``'s context-write (same math as the
-                # bf16 wkv/kv_norm path, via the loaded fp8 projection).
-                qlr = stage.self_attn.q_lora_rank
-                kv = stage.self_attn.kv_a_layernorm(
-                    stage.self_attn.kv_a_proj_with_mqa(mx)[..., qlr:]
-                )  # [1, M, head_dim]
-            else:
-                a = stage._dspark_attn
-                kv = _rmsnorm(F.linear(mx, a["wkv"]), a["kv_norm_w"], eps)  # [1, M, head_dim]
+            a = stage._dspark_attn
+            kv = _rmsnorm(F.linear(mx, a["wkv"]), a["kv_norm_w"], eps)  # [1, M, head_dim]
             kv = _rope_last_dims(kv, rd, freqs)  # [1, M, head_dim]
             stage_windows[s, slots] = kv[0].to(stage_windows.dtype)
 
@@ -746,7 +634,7 @@ class DSparkDraftModel(nn.Module):
             kv_windows: ``[N, num_stages, window_size, head_dim]`` persistent buffer;
                 updated in place.
         """
-        if not self.use_real_mla and getattr(self.mtp_layers[0], "_dspark_attn", None) is None:
+        if getattr(self.mtp_layers[0], "_dspark_attn", None) is None:
             return
         G, M = positions.shape
         if G == 0 or M == 0:
@@ -763,14 +651,8 @@ class DSparkDraftModel(nn.Module):
         stage0 = self.mtp_layers[0]
         main_x = stage0.main_norm(stage0.main_proj(main_hidden))  # [G, M, hidden]
         for s, stage in enumerate(self.mtp_layers):
-            if self.use_real_mla:
-                qlr = stage.self_attn.q_lora_rank
-                kv = stage.self_attn.kv_a_layernorm(
-                    stage.self_attn.kv_a_proj_with_mqa(main_x)[..., qlr:]
-                )  # [G, M, head_dim]
-            else:
-                a = stage._dspark_attn
-                kv = _rmsnorm(F.linear(main_x, a["wkv"]), a["kv_norm_w"], eps)  # [G, M, head_dim]
+            a = stage._dspark_attn
+            kv = _rmsnorm(F.linear(main_x, a["wkv"]), a["kv_norm_w"], eps)  # [G, M, head_dim]
             kv = _rope_last_dims_batched(kv, rd, freqs)  # [G, M, head_dim]
             win_s = kv_windows[:, s]  # [N, win, head_dim] view onto the base buffer
             # Read-modify-write so masked-out (g, m) entries keep their current
@@ -855,8 +737,7 @@ class DSparkDraftModel(nn.Module):
         )
         if slots is not None:
             # Batched, CUDA-graph-safe path (start_pos is a [G] tensor; window is
-            # written/read through ``slots``). Real-fp8-MLA (Increment A) is not
-            # supported under graphs — guarded in ``forward_batched``.
+            # written/read through ``slots``).
             attn = dspark_attention_forward_batched(
                 layer_input,
                 main_x,
@@ -867,19 +748,6 @@ class DSparkDraftModel(nn.Module):
                 persist=True,
                 **stage._dspark_attn,
                 **self._attn_params,
-            )
-        elif self.use_real_mla:
-            attn = _dspark_mla_attention(
-                stage.self_attn,
-                layer_input,
-                main_x,
-                start_pos,
-                kv_cache,
-                window_size=self._attn_params["window_size"],
-                eps=self._attn_params["eps"],
-                softmax_scale=self._attn_params["softmax_scale"],
-                freqs_cis=freqs_cis,
-                persist=persist,
             )
         else:
             attn = dspark_attention_forward(
@@ -964,7 +832,7 @@ class DSparkDraftModel(nn.Module):
             ``(draft_tokens [T, block], num_proposed [T])`` from ``forward_head``.
         """
         assert start_pos > 0, "DSpark draft runs at generation (start_pos > 0)"
-        if not self.use_real_mla and getattr(self.mtp_layers[0], "_dspark_attn", None) is None:
+        if getattr(self.mtp_layers[0], "_dspark_attn", None) is None:
             raise RuntimeError(
                 "DSpark attention weights not cached; call "
                 "cache_attn_weights_from_checkpoint(ckpt_dir, weight_map) after loading."
@@ -1031,12 +899,6 @@ class DSparkDraftModel(nn.Module):
         Returns:
             ``(draft_tokens [G, block], num_proposed [G])`` from ``forward_head``.
         """
-        if self.use_real_mla:
-            raise NotImplementedError(
-                "DSpark real-fp8-MLA draft attention (TLLM_DSPARK_REAL_MLA) is not "
-                "supported on the CUDA-graph-safe batched draft path; the worker uses "
-                "the eager per-request loop when real-fp8-MLA is enabled."
-            )
         if getattr(self.mtp_layers[0], "_dspark_attn", None) is None:
             raise RuntimeError(
                 "DSpark attention weights not cached; call "
@@ -1172,9 +1034,6 @@ class DSparkForCausalLM(nn.Module):
         # ``draft_model`` and calls forward()/reads these properties and scalars).
         self.num_stages = self.dspark_model.num_stages
         self._attn_params = self.dspark_model._attn_params
-        # The batched, CUDA-graph-safe gen path does not support real-fp8-MLA
-        # (Increment A); the worker falls back to the eager loop when this is set.
-        self.use_real_mla = self.dspark_model.use_real_mla
         self.lm_head = None  # shared from the target (load_weights_from_target_model)
         self.logits_processor = None  # set by the caller after construction
 
@@ -1221,10 +1080,8 @@ class DSparkForCausalLM(nn.Module):
         DeepseekV4WeightLoader(self.dspark_model).load_weights(remapped)
         self.dspark_model.post_load_weights()
         # bf16 captured-context attention path: dequantize the raw mtp.{s}.attn.*
-        # tensors for ``dspark_attention_forward``. Skipped under real-fp8-MLA
-        # (Increment A), which runs the loaded fp8 projections directly.
-        if not self.dspark_model.use_real_mla:
-            self.dspark_model.cache_attn_weights_from_state_dict(weights)
+        # tensors for ``dspark_attention_forward``.
+        self.dspark_model.cache_attn_weights_from_state_dict(weights)
         logger.info("[DSpark] draft weight load complete")
 
     def load_weights_from_target_model(self, target_model):

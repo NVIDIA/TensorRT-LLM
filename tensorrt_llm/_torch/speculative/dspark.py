@@ -102,10 +102,9 @@ class DSparkSpecMetadata(SpecMetadata):
         # CUDA-graph-safe path: maintain the request->slot mapping on the host
         # (outside the captured region) and mirror it into ``_batch_to_slot`` so the
         # captured gen forward can index the rolling windows by tensor. Mirrors
-        # ``DFlashSpecMetadata.prepare`` (dflash.py:96-113). Gated on the worker's
-        # flag so the legacy eager path's slot recycling is byte-for-byte unchanged.
+        # ``DFlashSpecMetadata.prepare`` (dflash.py:96-113).
         worker = getattr(self, "_dspark_worker", None)
-        if worker is not None and worker._use_batched and worker._win_inited:
+        if worker is not None and worker._win_inited:
             current = set(self.request_ids)
             for rid in list(worker._req_to_slot.keys()):
                 if rid not in current:
@@ -214,17 +213,12 @@ class DSparkWorker(SpecWorkerBase):
         self._free_slots = deque()  # available slot indices
         self._batch_to_slot: Optional[torch.Tensor] = None  # [max_batch] long, cuda
 
-        # The batched, host-sync-free generation draft path
-        # (``_draft_gen_block_batched`` + ``DSparkDraftModel.forward_batched`` +
-        # ``dspark_attention_forward_batched``) is the DEFAULT: it is correct in
-        # eager mode AND safe to capture into the target's CUDA graph (DSpark is a
-        # one-engine drafter — its worker forward runs inside that graph, so the
-        # draft path MUST be capture-safe whenever ``cuda_graph_config`` is set; we
-        # don't gate that behind a flag). The legacy per-request loop survives only
-        # as the fallback for real-fp8-MLA draft attention (Increment A,
-        # ``TLLM_DSPARK_REAL_MLA``), which the batched path doesn't implement and
-        # which is eager-only anyway. Resolved from the draft model in ``_lazy_init``.
-        self._use_batched = True
+        # The generation draft path is the batched, host-sync-free
+        # ``_draft_gen_block_batched`` + ``DSparkDraftModel.forward_batched`` +
+        # ``dspark_attention_forward_batched``: it is correct in eager mode AND safe
+        # to capture into the target's CUDA graph (DSpark is a one-engine drafter —
+        # its worker forward runs inside that graph, so the draft path MUST be
+        # capture-safe whenever ``cuda_graph_config`` is set).
 
         logger.info(
             f"DSparkWorker initialized with "
@@ -243,10 +237,6 @@ class DSparkWorker(SpecWorkerBase):
                 f"got block_size={block_size} and max_draft_len={self.max_draft_len}"
             )
 
-        # The batched path is the default; fall back to the eager per-request loop
-        # only for real-fp8-MLA draft attention (Increment A), which the batched
-        # path doesn't support (and which is never CUDA-graph captured anyway).
-        self._use_batched = not getattr(draft_model, "use_real_mla", False)
         if self._win_inited:
             return
         max_batch = spec_metadata.max_num_requests
@@ -326,83 +316,6 @@ class DSparkWorker(SpecWorkerBase):
                 draft_model.write_context_windows(hidden, window_positions, self._kv_windows[slot])
             context_offset += chunk_len
 
-    def _draft_gen_block(
-        self,
-        draft_model,
-        spec_metadata: "DSparkSpecMetadata",
-        attn_metadata,
-        accepted_tokens: torch.Tensor,
-        num_accepted_tokens: torch.Tensor,
-        num_contexts: int,
-        batch_size: int,
-        total_target_tokens: int,
-        all_rank_num_tokens: Optional[List[int]] = None,
-    ):
-        """Legacy per-request gen draft (eager only; default when the flag is off).
-
-        Drafts one block per gen request via a python loop with per-request host
-        syncs (``int(...item())``). Correct and validated, but NOT CUDA-graph
-        capturable — see :meth:`_draft_gen_block_batched` for the graph-safe path.
-        """
-        num_gens = batch_size - num_contexts
-        K = self.max_draft_len
-        Kp1 = K + 1
-        conf_thr = (
-            float(getattr(self.spec_config, "confidence_threshold", 0.0))
-            if getattr(self.spec_config, "enable_confidence_head", True)
-            else 0.0
-        )
-
-        captured = spec_metadata.get_hidden_states(total_target_tokens)
-        gen_start = attn_metadata.num_ctx_tokens
-
-        if captured is None:
-            return None
-
-        gen_req_ids = spec_metadata.request_ids[num_contexts:batch_size]
-        block_logits_rows = []
-        for i in range(num_gens):
-            slot = self._assign_slot(gen_req_ids[i], reset=False)
-            nacc = int(num_accepted_tokens[num_contexts + i].item())
-            # Bonus token = the last accepted token of the verified prefix.
-            bonus = accepted_tokens[num_contexts + i, nacc - 1].view(1).long()
-            # Captured target hidden at the bonus position within this request's
-            # K+1 processed tokens.
-            base = gen_start + i * Kp1
-            main_hidden = captured[base + nacc - 1].unsqueeze(0)  # [1, ncap*hidden]
-
-            old = int(self._ctx_len[slot].item())
-            # Back-fill the intermediate accepted tokens (all but the bonus) into
-            # the rolling window so a multi-accept step doesn't leave holes that
-            # starve the next draft's context. Intermediate token t_j (absolute
-            # old-1+j) -> frame old+1+j; the bonus (t_{nacc-1}) is written by the
-            # generation path at start_pos.
-            if nacc > 1:
-                interim = captured[base : base + nacc - 1]  # [nacc-1, ncap*hidden]
-                idx = torch.arange(1, nacc, device=interim.device) + old
-                draft_model.write_context_windows(interim, idx, self._kv_windows[slot])
-            # Advance the decode position by the accepted count.
-            self._ctx_len[slot] += nacc
-            start_pos = int(self._ctx_len[slot].item())
-            win_slice = self._kv_windows[slot : slot + 1]  # [1, num_stages, win, hd] view
-
-            # forward() returns (draft_tokens, num_proposed, block_logits); the
-            # worker proposes the full block (confidence truncation off, so
-            # num_proposed is unused) and surfaces the per-position corrected
-            # logits for SpecWorkerBase.sample_draft_tokens.
-            _toks, _num_proposed, logits_i = draft_model.forward(
-                main_hidden,
-                bonus,
-                start_pos,
-                kv_windows=win_slice,
-                temperature=0.0,
-                confidence_threshold=conf_thr,
-                return_logits=True,
-                all_rank_num_tokens=all_rank_num_tokens,
-            )
-            block_logits_rows.append(logits_i[0])
-        return torch.stack(block_logits_rows, dim=0)
-
     def _draft_gen_block_batched(
         self,
         draft_model,
@@ -417,15 +330,14 @@ class DSparkWorker(SpecWorkerBase):
     ) -> torch.Tensor:
         """CUDA-graph-safe batched gen draft (all gen requests in one forward).
 
-        Numerically equivalent to :meth:`_draft_gen_block` but free of host syncs
-        and data-dependent shapes: per-request quantities (``nacc``, the bonus,
-        ``main_hidden``, ``start_pos``, the multi-accept back-fill) are gathered as
-        tensors, slots come from the host-built ``_batch_to_slot`` mirror, and the
-        backbone runs once via ``DSparkDraftModel.forward_batched``. Returns the
-        per-position corrected block logits ``[num_gens, K, vocab]`` (or ``None``
-        when there is nothing to draft); the worker feeds them to
-        ``SpecWorkerBase.sample_draft_tokens``. Confidence truncation stays
-        disabled — the full block is proposed, matching the eager baseline.
+        Free of host syncs and data-dependent shapes: per-request quantities
+        (``nacc``, the bonus, ``main_hidden``, ``start_pos``, the multi-accept
+        back-fill) are gathered as tensors, slots come from the host-built
+        ``_batch_to_slot`` mirror, and the backbone runs once via
+        ``DSparkDraftModel.forward_batched``. Returns the per-position corrected
+        block logits ``[num_gens, K, vocab]`` (or ``None`` when there is nothing to
+        draft); the worker feeds them to ``SpecWorkerBase.sample_draft_tokens``.
+        Confidence truncation stays disabled — the full block is proposed.
         """
         num_gens = batch_size - num_contexts
         K = self.max_draft_len
@@ -532,10 +444,9 @@ class DSparkWorker(SpecWorkerBase):
         # side-effect-free. (During the capture pass itself the stream IS capturing,
         # so we skip the save/restore and let the ops be recorded; real requests
         # reset their slot's window+ctx_len at prefill, wiping any capture-time
-        # mutation.) Only relevant on the batched path.
+        # mutation.)
         is_warmup = (
-            self._use_batched
-            and getattr(spec_metadata, "is_cuda_graph", False)
+            getattr(spec_metadata, "is_cuda_graph", False)
             and not torch.cuda.is_current_stream_capturing()
         )
         if is_warmup:
@@ -583,14 +494,9 @@ class DSparkWorker(SpecWorkerBase):
         )
 
         if num_gens > 0:
-            # Both gen-block variants return the per-position corrected block
-            # logits [num_gens, K, vocab]; the batched one is the default
-            # (CUDA-graph-safe), the legacy per-request loop is the eager
-            # real-fp8-MLA fallback.
-            gen_block = (
-                self._draft_gen_block_batched if self._use_batched else self._draft_gen_block
-            )
-            gen_logits = gen_block(
+            # The batched gen-block draft returns the per-position corrected block
+            # logits [num_gens, K, vocab] and is CUDA-graph-safe.
+            gen_logits = self._draft_gen_block_batched(
                 draft_model,
                 spec_metadata,
                 attn_metadata,

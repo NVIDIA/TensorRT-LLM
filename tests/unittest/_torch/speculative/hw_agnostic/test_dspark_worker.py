@@ -104,11 +104,10 @@ def _make_worker():
     return DSparkWorker(cfg, Mapping())
 
 
-def _fake_draft_model(num_stages=3, window_size=128, head_dim=64, use_real_mla=False):
+def _fake_draft_model(num_stages=3, window_size=128, head_dim=64):
     return types.SimpleNamespace(
         num_stages=num_stages,
         block_size=5,
-        use_real_mla=use_real_mla,
         _attn_params={"window_size": window_size, "head_dim": head_dim},
     )
 
@@ -177,7 +176,6 @@ def test_seed_context_windows_preserves_state_across_prefill_chunks():
     class DraftModel:
         num_stages = 1
         block_size = 5
-        use_real_mla = False
         _attn_params = {"window_size": 8, "head_dim": 4}
 
         def __init__(self):
@@ -226,7 +224,6 @@ def test_prepare_builds_batch_to_slot_on_batched_path():
     worker = _make_worker()
     meta = _make_metadata(max_num_requests=4)
     worker._lazy_init(_fake_draft_model(), meta)  # batched is the default
-    assert worker._use_batched
     meta._dspark_worker = worker
 
     # Assign slots for two requests (as the prefill path would).
@@ -350,18 +347,3 @@ def test_forward_mixed_batch_routes_through_base_entries(monkeypatch):
     # Verified tokens are surfaced unchanged.
     assert torch.equal(out["new_tokens"], accepted)
     assert torch.equal(out["new_tokens_lens"], num_accepted)
-
-
-def test_prepare_leaves_slots_untouched_on_legacy_real_mla_path():
-    """With the real-fp8-MLA fallback (eager loop) prepare() doesn't recycle slots."""
-    worker = _make_worker()
-    meta = _make_metadata(max_num_requests=4)
-    worker._lazy_init(_fake_draft_model(use_real_mla=True), meta)
-    assert not worker._use_batched
-    meta._dspark_worker = worker
-
-    worker._assign_slot(100, reset=True)
-    meta.request_ids = [999]  # unknown request
-    meta.prepare()
-    # Legacy path must NOT free 100's slot via prepare().
-    assert 100 in worker._req_to_slot
