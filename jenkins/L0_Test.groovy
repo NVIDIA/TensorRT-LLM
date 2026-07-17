@@ -238,7 +238,7 @@ def echoRemoteLogTail(def pipeline, Map remote, String remotePath, int lines = 2
 // `postTag` uniquifies the uploaded tar filename, the Artifactory guard key and
 // the locally-staged result XMLs when the same stageName is uploaded more than
 // once in a build (e.g. SLURM infra-failure retries). First attempt passes "".
-def uploadResults(def pipeline, SlurmCluster cluster, String clusterName, String nodeName, String stageName, Boolean stageIsInterrupted, String postTag="") {
+def uploadResults(def pipeline, SlurmCluster cluster, String clusterName, String nodeName, String stageName, Boolean stageIsInterrupted, String postTag="", boolean suppressTestReporting=false) {
     CloudManager.withSlurmSshCredentialRemotes(pipeline, clusterName, cluster) { remotes ->
         // Pin one reachable frontend for the whole collect: every download targets
         // the same node workspace (/home/svc_tensorrt/bloom/scripts/${nodeName}),
@@ -354,8 +354,10 @@ def uploadResults(def pipeline, SlurmCluster cluster, String clusterName, String
             }
         }
 
-        if (hasTimeoutTest || downloadResultSucceed) {
+        if ((hasTimeoutTest || downloadResultSucceed) && !suppressTestReporting) {
             junit(allowEmptyResults: true, testResults: "${stageName}/results*.xml")
+        } else if (suppressTestReporting) {
+            echo "[INFRA-RETRY] ${stageName}${postTag}: suppressing junit() because a retry is still planned"
         }
     }
 }
@@ -744,7 +746,7 @@ boolean isNonTerminalSlurmState(String state) {
     return state != null && SLURM_NON_TERMINAL_STATES.contains(state.toUpperCase(java.util.Locale.ROOT))
 }
 
-def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, gpuCount=1, skipInstallWheel=false, cpver="cp312", String postTag="", boolean useClusterDurations=false, Map placementContext=null)
+def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, gpuCount=1, skipInstallWheel=false, cpver="cp312", String postTag="", boolean useClusterDurations=false, Map placementContext=null, Map retryContext=null)
 {
     SlurmPartition partition = SlurmConfig.resolvePlatform(platform)
     SlurmCluster cluster = SlurmConfig.clusterConfig[partition.clusterName]
@@ -1015,7 +1017,7 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
         }
         long executeStartMs = System.currentTimeMillis()
         try {
-            executeLLMTestOnSlurm(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, cpver, slurmRunner, postTag, useClusterDurations)
+            executeLLMTestOnSlurm(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, cpver, slurmRunner, postTag, useClusterDurations, retryContext)
         } catch (InterruptedException e) {
             throw e
         } catch (Exception e) {
@@ -1077,7 +1079,7 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
     }
 }
 
-def executeLLMTestOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, skipInstallWheel=false, cpver="cp312", runner, String postTag="", boolean useClusterDurations=false)
+def executeLLMTestOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, skipInstallWheel=false, cpver="cp312", runner, String postTag="", boolean useClusterDurations=false, Map retryContext=null)
 {
     runner {
         // TODO: refactor the finallyRunner to reuse within slurm or nonslurm job.
@@ -1104,7 +1106,7 @@ def executeLLMTestOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
             // Copy CPP test result
             sh "cp ${llmSrc}/cpp/build_backup/*.xml ${stageName} || true"
             sh "ls -al ${stageName}/"
-        }, false, postTag)
+        }, false, postTag, true, retryContext)
     }
 }
 // End of Methods to run Slurm job with Jenkins Agent
@@ -1254,7 +1256,7 @@ def getMountListForSlurmTest(SlurmCluster cluster, boolean useSbatch = false)
     return mounts
 }
 
-def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, gpuCount=1, nodeCount=1, skipInstallWheel=false, cpver="cp312", String postTag="", boolean useClusterDurations=false, Map placementContext=null)
+def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, gpuCount=1, nodeCount=1, skipInstallWheel=false, cpver="cp312", String postTag="", boolean useClusterDurations=false, Map placementContext=null, Map retryContext=null)
 {
     SlurmPartition partition = SlurmConfig.resolvePlatform(platform)
     SlurmCluster cluster = SlurmConfig.clusterConfig[partition.clusterName]
@@ -1275,6 +1277,10 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
     Utils.exec(pipeline, script: "env | sort && pwd && ls -alh")
 
     def stageIsInterrupted = false
+    // Captured so the finally can suppress this attempt's junit when the failure is
+    // a retryable infra failure (a retry follows) -- otherwise a stage that fails
+    // an intermediate attempt and passes on retry leaves the build UNSTABLE.
+    def caughtStageError = null
 
     try {
         // Run ssh command to start node in desired cluster via SLURM
@@ -1924,11 +1930,20 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
     } catch (InterruptedException e) {
         stageIsInterrupted = true
         throw e
+    } catch (Exception e) {
+        caughtStageError = e
+        throw e
     } finally {
         // Resource cleanup must run even if metadata capture or result upload is interrupted.
         try {
             captureSlurmJobNodeList(pipeline, cluster, partition.clusterName, placementContext?.slurmJobId ?: null, placementContext, stageName, jobWorkspace)
-            uploadResults(pipeline, cluster, partition.clusterName, jobUID, stageName, stageIsInterrupted, postTag)
+            // Suppress this attempt's junit when a retry is still planned (a retryable
+            // infra failure with budget), so a retried-and-passed stage doesn't leave
+            // the build UNSTABLE from an intermediate attempt's results. A genuine test
+            // failure classifies as UserFailure -> not suppressed -> reported.
+            boolean suppressTestReporting = (caughtStageError != null && retryContext != null) &&
+                retryContextAllowsRetry(null, retryContext, caughtStageError, false)
+            uploadResults(pipeline, cluster, partition.clusterName, jobUID, stageName, stageIsInterrupted, postTag, suppressTestReporting)
         } finally {
             stage("Clean Up Slurm Resource") {
                 // Workaround to handle the interruption during clean up SLURM resources
@@ -2014,10 +2029,20 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
       def innerSuffix = (attempt == 1) ? "" : "-attempt-${attempt}"
       def postTag = "${outerAttemptTag}${innerSuffix}"
 
+      // Describes this attempt so the stage body can suppress its junit when a
+      // retryable infra failure means another attempt will follow (mirrors the K8s
+      // path's retryContext). scope=SLURM so classification/budget match this loop.
+      def slurmRetryContext = [
+        scope: InfraFailure.SLURM,
+        stageName: stageName,
+        attempt: attempt,
+        backoffMs: 60L * 1000L,
+      ]
+
       if (nodeCount > 1 || runWithSbatch) {
-        runLLMTestlistWithSbatch(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, gpuCount, nodeCount, skipInstallWheel, cpver, postTag, useClusterDurations, attemptPlacementContext)
+        runLLMTestlistWithSbatch(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, gpuCount, nodeCount, skipInstallWheel, cpver, postTag, useClusterDurations, attemptPlacementContext, slurmRetryContext)
       } else {
-        runLLMTestlistWithAgent(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, gpuCount, skipInstallWheel, cpver, postTag, useClusterDurations, attemptPlacementContext)
+        runLLMTestlistWithAgent(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, gpuCount, skipInstallWheel, cpver, postTag, useClusterDurations, attemptPlacementContext, slurmRetryContext)
       }
 
       // Job succeeded
