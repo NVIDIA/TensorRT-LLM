@@ -52,33 +52,51 @@ from .transformer_ltx2 import Stage2Groups
 STAGE_2_DISTILLED_SIGMA_VALUES = [0.909375, 0.725, 0.421875, 0.0]
 
 
-class _GpuTimeline:
-    """Named ``torch.cuda.Event`` marks; consecutive deltas = per-phase GPU time.
+class _TwoStagePhaseTimer(CudaPhaseTimer):
+    """CudaPhaseTimer + the two-stage extras: the stage1→stage2 gap and the
+    stage-2 refinement loop.
 
-    Events complete in stream order, so deltas measure GPU-timeline distance
-    even when the host only enqueued the work (CUDA graphs, async kernels).
+    Inherited marks keep their contract (``denoise`` = the whole stage-1
+    forward; stage 2 folds into ``post_denoise`` on ``PipelineOutput``).
+    The two extra events subdivide the post phase on the GPU stream timeline:
+
+    - gap    = post_start → stage2_start (upsample + LoRA bind + stage-2
+      text-cache/scheduler prep)
+    - stage2 = stage2_start → stage2_end (refinement step loop only)
+
+    Event deltas are GPU-stream distances: they include GPU work plus any
+    CPU time exposed to the stream, and stay correct under CUDA graphs and
+    async enqueue (unlike host wall clocks read at enqueue time).
     """
 
     def __init__(self) -> None:
-        self._enabled = torch.cuda.is_available()
-        self._marks: List[Tuple[str, "torch.cuda.Event"]] = []
+        super().__init__()
+        self._stage2_marked = 0
+        if self._enabled:
+            self._stage2_start = torch.cuda.Event(enable_timing=True)
+            self._stage2_end = torch.cuda.Event(enable_timing=True)
 
-    def mark(self, name: str) -> None:
-        if not self._enabled:
-            return
-        ev = torch.cuda.Event(enable_timing=True)
-        ev.record()
-        self._marks.append((name, ev))
+    def mark_stage2_start(self) -> None:
+        if self._enabled:
+            self._stage2_start.record()
+            self._stage2_marked = 1
 
-    def phases(self) -> List[Tuple[str, float]]:
-        """Return ``(phase_name, seconds)`` between consecutive marks."""
-        if len(self._marks) < 2:
-            return []
-        self._marks[-1][1].synchronize()
-        return [
-            (name, prev_ev.elapsed_time(ev) / 1000.0)
-            for (_, prev_ev), (name, ev) in zip(self._marks, self._marks[1:])
-        ]
+    def mark_stage2_end(self) -> None:
+        if self._enabled and self._stage2_marked == 1:
+            self._stage2_end.record()
+            self._stage2_marked = 2
+
+    def two_stage_phases(self) -> Optional[Tuple[float, float, float]]:
+        """``(stage1_s, gap_s, stage2_s)``; None if stage 2 never completed."""
+        if not self._enabled or self._stage2_marked != 2:
+            return None
+        self._stage2_end.synchronize()
+        ms = 1.0 / 1000.0
+        return (
+            self._denoise_start.elapsed_time(self._post_start) * ms,
+            self._post_start.elapsed_time(self._stage2_start) * ms,
+            self._stage2_start.elapsed_time(self._stage2_end) * ms,
+        )
 
 
 _FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
@@ -929,25 +947,20 @@ class _PersistentLoRAWeightCache:
 
 
 class _LTX2TwoStageCUDAGraphRunner(_LTX2CUDAGraphRunner):
-    """CUDA graph runner keyed by LTX-2 two-stage LoRA weight state.
-
-    ``topology_getter`` (the pipeline's key state) feeds the graph key;
-    ``transformer_topology_getter`` (the transformer's actual state) is
-    cross-checked against the key before every capture and replay, so a
-    stale graph can never run against a transformer in the other topology.
-    """
+    """CUDA graph runner keyed by LTX-2 two-stage LoRA weight state and the
+    transformer's active topology (``topology_getter`` reads
+    ``LTXModel.active_topology``, the single source of truth, so the selected
+    graph always matches the live attention stacks)."""
 
     def __init__(
         self,
         config: CUDAGraphRunnerConfig,
         lora_state_getter: Callable[[], str],
         topology_getter: Callable[[], str],
-        transformer_topology_getter: Callable[[], str],
     ) -> None:
         super().__init__(config)
         self._lora_state_getter = lora_state_getter
         self._topology_getter = topology_getter
-        self._transformer_topology_getter = transformer_topology_getter
 
     def get_graph_key(self, *args, **kwargs):
         return (
@@ -955,28 +968,6 @@ class _LTX2TwoStageCUDAGraphRunner(_LTX2CUDAGraphRunner):
             ("ltx2_two_stage_lora_state", self._lora_state_getter()),
             ("ltx2_two_stage_topology", self._topology_getter()),
         )
-
-    def _check_topology(self, key) -> None:
-        for name, value in reversed(key):
-            if name == "ltx2_two_stage_topology":
-                active = self._transformer_topology_getter()
-                if value != active:
-                    raise RuntimeError(
-                        f"CUDA graph key topology '{value}' does not match the "
-                        f"transformer's active topology '{active}'; the graph key "
-                        "must be set before set_ulysses_topology() on entry and "
-                        "restored after it on exit."
-                    )
-                return
-        raise RuntimeError("CUDA graph key is missing the ltx2_two_stage_topology element")
-
-    def capture(self, key, fn, args, kwargs) -> None:
-        self._check_topology(key)
-        super().capture(key, fn, args, kwargs)
-
-    def replay(self, key, args, kwargs):
-        self._check_topology(key)
-        return super().replay(key, args, kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -1005,9 +996,6 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
 
     def _current_lora_cuda_graph_state(self) -> str:
         return getattr(self, "_lora_cuda_graph_state", "original")
-
-    def _current_topology_state(self) -> str:
-        return getattr(self, "_stage2_topology_state", "default")
 
     def _build_stage2_dit_groups(self) -> Optional[Stage2Groups]:
         """Build the stage-2 dual-topology groups (once, collectively, at load).
@@ -1078,7 +1066,6 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
         runner = _LTX2TwoStageCUDAGraphRunner(
             CUDAGraphRunnerConfig(use_cuda_graph=True),
             self._current_lora_cuda_graph_state,
-            self._current_topology_state,
             lambda: self.transformer.active_topology,
         )
         compile_note = " (with torch.compile)" if self.pipeline_config.torch_compile.enable else ""
@@ -1281,7 +1268,6 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
         """
         # Optional prompt enhancement (applied once and reused for both stages).
         self._lora_cuda_graph_state = "original"
-        self._stage2_topology_state = "default"
         if enhance_prompt:
             logger.info("Enhancing prompt with Gemma3 (two-stage)...")
             prompt_text = prompt if isinstance(prompt, str) else prompt[0]
@@ -1312,7 +1298,7 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
         # (spatial upsample + refinement denoise + decode) folds into
         # ``post_denoise``. Only the outer timer's numbers reach
         # ``PipelineOutput``.
-        timer = CudaPhaseTimer()
+        timer = _TwoStagePhaseTimer()
         timer.mark_pre_start()
         height_s1 = height // 2
         width_s1 = width // 2
@@ -1322,8 +1308,6 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
         # Stage 1: denoise at half resolution
         # ================================================================
         timer.mark_denoise_start()
-        gpu_tl = _GpuTimeline()
-        gpu_tl.mark("start")
         out = super().forward(
             prompt=prompt,
             negative_prompt=negative_prompt,
@@ -1347,7 +1331,6 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
             enhance_prompt=enhance_prompt,
         )
 
-        gpu_tl.mark("stage1")
         # Every rank computes the full stage-1 latents (all-rank denoise loop +
         # per-forward gather) and output_type="latent" returns them on every
         # rank, so Stage 2 needs no handoff collective in either parallel-VAE mode.
@@ -1360,20 +1343,106 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
         # ================================================================
         # Stage 2: spatial upsample + refinement denoise — all ranks, collectively
         # ================================================================
-        video_latents, audio_latents = self._upsample_and_refine(
-            gpu_timeline=gpu_tl,
-            video_latents=video_latents,
-            audio_latents=audio_latents,
-            prompt=prompt,
-            height=height,
-            width=width,
-            num_frames=num_frames,
-            frame_rate=frame_rate,
-            seed=seed,
-            max_sequence_length=max_sequence_length,
-            image=image,
-            image_cond_strength=image_cond_strength,
+        per_ch_stats = self._get_per_channel_statistics()
+        video_latents = upsample_video(
+            video_latents[:1],
+            per_ch_stats,
+            self.spatial_upsampler,
         )
+        logger.info("Upsampled video latents via learned upsampler")
+
+        # The persistent cache owns original and merged tensors when it can be
+        # built at load time. Stage 2 only rebinds pointers and FP4 quant_method
+        # state, so no per-request clone, merge, or unmerge math is needed.
+        self._assert_cuda_graph_safe_lora_bindings()
+        lora_cache = self._distilled_lora_weight_cache
+        using_persistent_lora = lora_cache is not None
+        saved_lora_state: Dict[str, Any] = {}
+        snapshot_required = 0
+        n = 0
+        dense_lora_merge_completed = False
+        stage2_start = time.time()
+        try:
+            if using_persistent_lora:
+                lora_cache.bind_merged()
+                self._lora_cuda_graph_state = "merged"
+                n = lora_cache.applied_count
+                logger.info(f"Bound persistent distilled LoRA ({n} params) for stage 2")
+            else:
+                transformer_device = next(self.transformer.parameters()).device
+                preload_free_gib = getattr(self, "_bf16_snapshot_preload_free_gib", None)
+                save_bf16_weights = _should_save_bf16_weights(
+                    device=transformer_device,
+                    preload_free_gib=preload_free_gib,
+                )
+                n, saved_lora_state, snapshot_required = _apply_lora_deltas(
+                    self.transformer,
+                    self._distilled_lora_deltas,
+                    sign=1.0,
+                    save_bf16_weights=save_bf16_weights,
+                )
+                dense_lora_merge_completed = True
+                self._lora_cuda_graph_state = "merged"
+                logger.info(f"Merged distilled LoRA ({n} params) for stage 2 (BF16 weights)")
+
+            if self.transformer._has_stage2:
+                # The switch atomically moves the graph-key topology with the
+                # attention stacks (the key reads active_topology). It precedes
+                # prepare_text_cache (topology-dependent) inside
+                # _refinement_denoise and is restored in the finally below.
+                self.transformer.set_ulysses_topology(is_stage2=True)
+            video_latents, audio_latents = self._refinement_denoise(
+                video_latents=video_latents,
+                audio_latents=audio_latents,
+                prompt=prompt,
+                height=height,
+                width=width,
+                num_frames=num_frames,
+                frame_rate=frame_rate,
+                seed=seed,
+                max_sequence_length=max_sequence_length,
+                image=image,
+                image_cond_strength=image_cond_strength,
+                timer=timer,
+            )
+        finally:
+            stage2_denoise_time = time.time() - stage2_start
+            logger.info(f"Stage 2 refinement time: {stage2_denoise_time:.2f}s (incl. prep)")
+            if self.transformer._has_stage2:
+                self.transformer.set_ulysses_topology(is_stage2=False)
+            if using_persistent_lora:
+                lora_cache.bind_original()
+                self._lora_cuda_graph_state = "original"
+                logger.info("Re-bound persistent distilled LoRA original weights after stage 2")
+            elif dense_lora_merge_completed:
+                if snapshot_required and not saved_lora_state:
+                    raise RuntimeError(
+                        "LoRA state was not saved; cannot safely restore stage 2 weights."
+                    )
+
+                snapshot_restored = 0
+                if snapshot_required:
+                    # Restore every LoRA-touched parameter from its snapshot. Packed
+                    # FP4 also restores the original quant_method.
+                    _restore_lora_state(self.transformer, saved_lora_state)
+                    snapshot_restored = _count_saved_lora_weight_tensors(saved_lora_state)
+
+                # BF16 weights that were not snapshotted are restored by
+                # subtracting LoRA deltas. FP8 and FP4 are exact snapshot restores.
+                dense_restored = _subtract_dense_lora_deltas(
+                    self.transformer,
+                    self._distilled_lora_deltas,
+                    saved_lora_state,
+                )
+                restored = snapshot_restored + dense_restored
+                if restored != n:
+                    raise RuntimeError(
+                        f"Restored {restored} LoRA-touched weights after stage 2, but {n} were applied."
+                    )
+                self._lora_cuda_graph_state = "original"
+                logger.info("Un-merged distilled LoRA after stage 2")
+            else:
+                self._lora_cuda_graph_state = "original"
 
         # ================================================================
         # Decode
@@ -1430,22 +1499,24 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
             # Non-decoding ranks (outside vae_ranks under parallel VAE, or
             # non-rank-0 otherwise) return no media.
             video = None
-        gpu_tl.mark("video_decode")
 
         # Audio decode is rank-0 only (not tile-parallel).
         audio_out = None
         if self.rank == 0 and audio_latents is not None:
             audio_latents = audio_latents.to(self.dtype)
             audio_out = decode_audio(audio_latents, self.audio_decoder, self.vocoder)
-        gpu_tl.mark("audio_decode")
 
         if self.rank == 0:
-            phases = ", ".join(f"{name}={sec * 1000.0:.0f}ms" for name, sec in gpu_tl.phases())
-            logger.info(
-                f"GPU timeline: {phases} | stage1 breakdown: "
-                f"pre(text-encode+prep)={out.pre_denoise * 1000.0:.0f}ms "
-                f"denoise={out.denoise * 1000.0:.0f}ms post={out.post_denoise * 1000.0:.0f}ms"
-            )
+            phases = timer.two_stage_phases()
+            if phases is not None:
+                stage1_s, gap_s, stage2_s = phases
+                logger.info(
+                    f"GPU timeline: stage1={stage1_s * 1000.0:.0f}ms, "
+                    f"gap={gap_s * 1000.0:.0f}ms, "
+                    f"stage2_denoise={stage2_s * 1000.0:.0f}ms | stage1 breakdown: "
+                    f"pre(text-encode+prep)={out.pre_denoise * 1000.0:.0f}ms "
+                    f"denoise={out.denoise * 1000.0:.0f}ms post={out.post_denoise * 1000.0:.0f}ms"
+                )
             logger.info(f"Two-stage total time: {time.time() - pipeline_start:.2f}s")
         timer.mark_end()
         return timer.fill(
@@ -1465,139 +1536,6 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
-
-    def _upsample_and_refine(
-        self,
-        video_latents: torch.Tensor,
-        audio_latents: Optional[torch.Tensor],
-        prompt: Union[str, List[str]],
-        height: int,
-        width: int,
-        num_frames: int,
-        frame_rate: float,
-        seed: int,
-        max_sequence_length: int,
-        image: Optional[Union[str, torch.Tensor]] = None,
-        image_cond_strength: float = 1.0,
-        gpu_timeline: Optional[_GpuTimeline] = None,
-    ) -> tuple:
-        """Stage 2: learned 2x spatial upsample + refinement denoise.
-
-        Runs collectively on every rank (identical inputs on all ranks).
-        Returns the refined ``(video_latents, audio_latents)`` in 5-D form.
-        """
-        gpu_tl = gpu_timeline if gpu_timeline is not None else _GpuTimeline()
-        per_ch_stats = self._get_per_channel_statistics()
-        video_latents = upsample_video(
-            video_latents[:1],
-            per_ch_stats,
-            self.spatial_upsampler,
-        )
-        gpu_tl.mark("upsample")
-        logger.info("Upsampled video latents via learned upsampler")
-
-        # The persistent cache owns original and merged tensors when it can be
-        # built at load time. Stage 2 only rebinds pointers and FP4 quant_method
-        # state, so no per-request clone, merge, or unmerge math is needed.
-        self._assert_cuda_graph_safe_lora_bindings()
-        lora_cache = self._distilled_lora_weight_cache
-        using_persistent_lora = lora_cache is not None
-        saved_lora_state: Dict[str, Any] = {}
-        snapshot_required = 0
-        n = 0
-        dense_lora_merge_completed = False
-        stage2_start = time.time()
-        try:
-            if using_persistent_lora:
-                lora_cache.bind_merged()
-                self._lora_cuda_graph_state = "merged"
-                n = lora_cache.applied_count
-                logger.info(f"Bound persistent distilled LoRA ({n} params) for stage 2")
-            else:
-                transformer_device = next(self.transformer.parameters()).device
-                preload_free_gib = getattr(self, "_bf16_snapshot_preload_free_gib", None)
-                save_bf16_weights = _should_save_bf16_weights(
-                    device=transformer_device,
-                    preload_free_gib=preload_free_gib,
-                )
-                n, saved_lora_state, snapshot_required = _apply_lora_deltas(
-                    self.transformer,
-                    self._distilled_lora_deltas,
-                    sign=1.0,
-                    save_bf16_weights=save_bf16_weights,
-                )
-                dense_lora_merge_completed = True
-                self._lora_cuda_graph_state = "merged"
-                logger.info(f"Merged distilled LoRA ({n} params) for stage 2 (BF16 weights)")
-
-            gpu_tl.mark("lora_bind")
-            if self.transformer._has_stage2:
-                # Graph key first, then transformer state: no window where the
-                # stage-2 stacks are live under the default key. The switch
-                # precedes prepare_text_cache (topology-dependent) inside
-                # _refinement_denoise and is restored in the finally below.
-                self._stage2_topology_state = "stage2"
-                self.transformer.set_ulysses_topology(is_stage2=True)
-            video_latents, audio_latents = self._refinement_denoise(
-                video_latents=video_latents,
-                audio_latents=audio_latents,
-                prompt=prompt,
-                height=height,
-                width=width,
-                num_frames=num_frames,
-                frame_rate=frame_rate,
-                seed=seed,
-                max_sequence_length=max_sequence_length,
-                image=image,
-                image_cond_strength=image_cond_strength,
-                gpu_tl=gpu_tl,
-            )
-        finally:
-            gpu_tl.mark("stage2_denoise")
-            stage2_denoise_time = time.time() - stage2_start
-            logger.info(f"Stage 2 denoising time: {stage2_denoise_time:.2f}s (BF16 weights)")
-            if self.transformer._has_stage2:
-                # Mirror of the entry order: the key must read "stage2" at every
-                # instant the stage-2 stacks might be live, so restore the
-                # transformer FIRST and flip the key only after it succeeded.
-                self.transformer.set_ulysses_topology(is_stage2=False)
-                self._stage2_topology_state = "default"
-            if using_persistent_lora:
-                lora_cache.bind_original()
-                self._lora_cuda_graph_state = "original"
-                logger.info("Re-bound persistent distilled LoRA original weights after stage 2")
-            elif dense_lora_merge_completed:
-                if snapshot_required and not saved_lora_state:
-                    raise RuntimeError(
-                        "LoRA state was not saved; cannot safely restore stage 2 weights."
-                    )
-
-                snapshot_restored = 0
-                if snapshot_required:
-                    # Restore every LoRA-touched parameter from its snapshot. Packed
-                    # FP4 also restores the original quant_method.
-                    _restore_lora_state(self.transformer, saved_lora_state)
-                    snapshot_restored = _count_saved_lora_weight_tensors(saved_lora_state)
-
-                # BF16 weights that were not snapshotted are restored by
-                # subtracting LoRA deltas. FP8 and FP4 are exact snapshot restores.
-                dense_restored = _subtract_dense_lora_deltas(
-                    self.transformer,
-                    self._distilled_lora_deltas,
-                    saved_lora_state,
-                )
-                restored = snapshot_restored + dense_restored
-                if restored != n:
-                    raise RuntimeError(
-                        f"Restored {restored} LoRA-touched weights after stage 2, but {n} were applied."
-                    )
-                self._lora_cuda_graph_state = "original"
-                logger.info("Un-merged distilled LoRA after stage 2")
-            else:
-                self._lora_cuda_graph_state = "original"
-
-        gpu_tl.mark("lora_restore")
-        return video_latents, audio_latents
 
     def _get_per_channel_statistics(self) -> torch.nn.Module:
         """Return per-channel statistics for un-normalize/normalize.
@@ -1625,7 +1563,7 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
         max_sequence_length: int,
         image: Optional[Union[str, torch.Tensor]] = None,
         image_cond_strength: float = 1.0,
-        gpu_tl: Optional[_GpuTimeline] = None,
+        timer: Optional[_TwoStagePhaseTimer] = None,
     ) -> tuple:
         """Run stage 2 refinement denoising on upsampled latents.
 
@@ -1755,10 +1693,11 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
             dtype=self.dtype,
         )
 
-        # Split the timeline so stage2_denoise measures ONLY the step loop
-        # (text-cache/scheduler/renoise prep lands in stage2_prep).
-        if gpu_tl is not None:
-            gpu_tl.mark("stage2_prep")
+        # stage2_denoise measures ONLY the step loop; everything since
+        # stage-1 end (upsample, LoRA bind, text-cache/scheduler prep)
+        # lands in the timer's gap interval.
+        if timer is not None:
+            timer.mark_stage2_start()
 
         # --- Euler denoising loop (no guidance) ---
         for i in range(len(sigmas) - 1):
@@ -1820,6 +1759,9 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
                     denoised_a = a_working.float() - vel_a.float() * sigma_a
                     velocity_a = (a_working.float() - denoised_a) / sigma_a
                     a_working = (a_working.float() + velocity_a * dt).to(a_working.dtype)
+
+        if timer is not None:
+            timer.mark_stage2_end()
 
         # --- Unpatchify ---
         video_out = self.video_patchifier.unpatchify(v_working, video_shape)

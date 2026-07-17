@@ -1251,7 +1251,6 @@ class TestLTX2TwoStageLoRAHelpers:
             ltx2_two_stages.CUDAGraphRunnerConfig(use_cuda_graph=True),
             lambda: state["lora"],
             lambda: state["topology"],
-            lambda: state["topology"],
         )
 
         keys = {}
@@ -1264,44 +1263,6 @@ class TestLTX2TwoStageLoRAHelpers:
         for (lora, topology), key in keys.items():
             assert key[-2] == ("ltx2_two_stage_lora_state", lora)
             assert key[-1] == ("ltx2_two_stage_topology", topology)
-
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    def test_two_stage_cuda_graph_rejects_topology_mismatch(self):
-        """Capture and replay both fail fast when the graph key's topology does
-        not match the transformer's active topology (key flipped without the
-        switch, or the switch without the key)."""
-        key_state = {"topology": "default"}
-        xf_state = {"topology": "default"}
-        runner = ltx2_two_stages._LTX2TwoStageCUDAGraphRunner(
-            ltx2_two_stages.CUDAGraphRunnerConfig(use_cuda_graph=True),
-            lambda: "original",
-            lambda: key_state["topology"],
-            lambda: xf_state["topology"],
-        )
-        lin = torch.nn.Linear(8, 8, device="cuda")
-        wrapped = runner.wrap(lin.forward)
-        x = torch.randn(2, 8, device="cuda")
-
-        # Mismatch on a fresh key: capture must refuse before creating a graph.
-        key_state["topology"] = "stage2"
-        with pytest.raises(RuntimeError, match="does not match"):
-            wrapped(x)
-        assert not runner.graphs
-
-        # Matched states capture and replay normally.
-        xf_state["topology"] = "stage2"
-        wrapped(x)
-        assert len(runner.graphs) == 1
-        wrapped(x)
-
-        # Existing graph + transformer flipped back: replay must refuse.
-        xf_state["topology"] = "default"
-        with pytest.raises(RuntimeError, match="does not match"):
-            wrapped(x)
-
-        # A key without the topology element is refused outright.
-        with pytest.raises(RuntimeError, match="missing the ltx2_two_stage_topology"):
-            runner._check_topology((("arg0", (2, 8)),))
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_two_stage_warmup_precaptures_both_topologies(self):
@@ -1331,7 +1292,6 @@ class TestLTX2TwoStageLoRAHelpers:
         x = torch.randn(2, 8, device="cuda")
 
         def run_stage(topology):
-            pipeline._stage2_topology_state = topology
             pipeline.transformer.active_topology = topology
             return pipeline.transformer.forward(x)
 
@@ -1380,7 +1340,6 @@ class TestLTX2TwoStageLoRAHelpers:
 
         def fake_forward(*args, **kwargs):
             for topology in ("default", "stage2"):
-                pipeline._stage2_topology_state = topology
                 pipeline.transformer.active_topology = topology
                 pipeline.transformer.forward(x)
 

@@ -2083,11 +2083,12 @@ class LTXModel(BaseDiffusionModel):
 
     def set_ulysses_topology(self, is_stage2: bool = False) -> None:
         """Switch every topology-bound piece between the default and stage-2
-        layouts: the active sharder on the model and every block, and the
-        {default, stage2} attention stacks. Called only by the two-stage
-        pipeline at the Stage-2 boundary (before ``prepare_text_cache``,
-        restored in a finally block); the graph-runner topology key must be
-        set BEFORE this call.
+        layouts: the active sharder on the model and every block, the
+        {default, stage2} attention stacks, and ``active_topology`` (which the
+        two-stage CUDA-graph key reads, so the switch moves the key with the
+        stacks atomically). Called only by the two-stage pipeline at the
+        Stage-2 boundary (before ``prepare_text_cache``, restored in a
+        finally block).
         """
         # Fail fast: a silent no-op here would let cfg>1 Stage 2 run duplicated
         # in the default topology (correct output, the perf win silently lost).
