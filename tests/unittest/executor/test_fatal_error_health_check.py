@@ -31,8 +31,6 @@ import importlib.util
 import logging
 import pathlib
 import signal
-import subprocess
-import sys
 import threading
 import time
 from concurrent.futures import Future
@@ -55,19 +53,6 @@ _mod = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_mod)
 classify_error = _mod.classify_error
 ErrorBudget = _mod.ErrorBudget
-
-_monitor_path = (
-    pathlib.Path(__file__).resolve().parents[3]
-    / "tensorrt_llm"
-    / "executor"
-    / "worker_process_monitor.py"
-)
-_monitor_spec = importlib.util.spec_from_file_location("worker_process_monitor", _monitor_path)
-_monitor_mod = importlib.util.module_from_spec(_monitor_spec)
-_monitor_spec.loader.exec_module(_monitor_mod)
-WorkerProcessMonitor = _monitor_mod.WorkerProcessMonitor
-_read_process_state = _monitor_mod._read_process_state
-capture_worker_process_identity = _monitor_mod.capture_worker_process_identity
 
 
 # ---------------------------------------------------------------------------
@@ -181,7 +166,6 @@ class ConcreteProxyExecutor(ConcreteExecutor):
         self.request_queue = Mock()
         self.workers_started: bool = True
         self._abort_all_requests_called: bool = False
-        self._worker_process_monitor = WorkerProcessMonitor()
 
     def _check_mpi_futures(self) -> bool:
         """Return True if any MPI worker future has completed."""
@@ -213,29 +197,13 @@ class ConcreteProxyExecutor(ConcreteExecutor):
                 break
         return drained
 
-    def _check_mpi_workers(self) -> bool:
-        """Return True if an OS process handle or MPI future is dead."""
-        dead_worker = self._worker_process_monitor.find_dead_worker()
-        if dead_worker is not None:
-            self._set_fatal_error(
-                RuntimeError(
-                    "MPI worker rank "
-                    f"{dead_worker.rank} (pid {dead_worker.pid}) "
-                    "exited unexpectedly"
-                )
-            )
-            if not self.doing_shutdown:
-                self.pre_shutdown()
-            return True
-        return self._check_mpi_futures()
-
     def check_health(self) -> bool:
         """Check executor health including MPI worker liveness."""
         if self.doing_shutdown or self._fatal_error is not None:
             return False
         if self._drain_error_queue():
             return self._fatal_error is None and not self.doing_shutdown
-        if self._check_mpi_workers():
+        if self._check_mpi_futures():
             return False
         return True
 
@@ -243,7 +211,7 @@ class ConcreteProxyExecutor(ConcreteExecutor):
         """Background loop using shared helpers."""
         while not self.doing_shutdown and self._fatal_error is None:
             try:
-                if self._check_mpi_workers():
+                if self._check_mpi_futures():
                     return
                 self._drain_error_queue()
                 if self._fatal_error is not None:
@@ -267,7 +235,6 @@ class ConcreteProxyExecutor(ConcreteExecutor):
         if self.doing_shutdown:
             return
         self.doing_shutdown = True
-        self._worker_process_monitor.close()
         self._pre_shutdown_called = True
         self._shutdown_event.set()
         self._abort_all_requests_called = True
@@ -520,114 +487,10 @@ class TestGenerationExecutor:
 
 
 # ---------------------------------------------------------------------------
-# WorkerProcessMonitor: pidfd and procfs liveness detection
-# ---------------------------------------------------------------------------
-class TestWorkerProcessMonitor:
-    """Tests for the production OS process-liveness monitor."""
-
-    @pytest.fixture
-    def identity(self):
-        return capture_worker_process_identity(rank=3)
-
-    def test_pidfd_exit_is_detected(self, identity):
-        monitor = WorkerProcessMonitor()
-        poller = Mock()
-        poller.poll.return_value = [(42, 1)]
-        monitor._poller = poller
-
-        with (
-            patch.object(_monitor_mod.os, "pidfd_open", return_value=42, create=True),
-            patch.object(_monitor_mod.os, "close"),
-        ):
-            monitor.register([identity])
-            assert monitor.find_dead_worker() == identity
-            monitor.close()
-
-        poller.register.assert_called_once()
-        poller.unregister.assert_called_once_with(42)
-
-    def test_exit_before_pidfd_registration_is_detected(self, identity):
-        monitor = WorkerProcessMonitor()
-        with patch.object(
-            _monitor_mod.os, "pidfd_open", side_effect=ProcessLookupError, create=True
-        ):
-            monitor.register([identity])
-            assert monitor.find_dead_worker() == identity
-
-    def test_pid_reuse_before_pidfd_registration_is_detected(self, identity):
-        if identity.start_time is None:
-            identity = identity._replace(start_time=100)
-        monitor = WorkerProcessMonitor()
-        with (
-            patch.object(_monitor_mod.os, "pidfd_open", return_value=42, create=True),
-            patch.object(
-                _monitor_mod,
-                "_read_process_state",
-                return_value=("S", identity.start_time + 1),
-            ),
-            patch.object(_monitor_mod.os, "close") as close,
-        ):
-            monitor.register([identity])
-            assert monitor.find_dead_worker() == identity
-
-        close.assert_called_once_with(42)
-
-    def test_procfs_start_time_change_is_detected(self, identity):
-        if identity.start_time is None:
-            identity = identity._replace(start_time=100)
-        monitor = WorkerProcessMonitor()
-        with (
-            patch.object(_monitor_mod.os, "pidfd_open", None, create=True),
-            patch.object(
-                _monitor_mod, "_read_process_state", return_value=("S", identity.start_time + 1)
-            ),
-        ):
-            monitor.register([identity])
-            assert monitor.find_dead_worker() == identity
-
-    def test_procfs_read_error_does_not_report_death(self, identity):
-        if identity.start_time is None:
-            identity = identity._replace(start_time=100)
-        monitor = WorkerProcessMonitor()
-        with (
-            patch.object(_monitor_mod.os, "pidfd_open", None, create=True),
-            patch.object(
-                _monitor_mod, "_read_process_state", side_effect=PermissionError("denied")
-            ),
-        ):
-            monitor.register([identity])
-            assert monitor.find_dead_worker() is None
-
-    def test_remote_worker_is_not_registered(self, identity):
-        monitor = WorkerProcessMonitor()
-        remote_identity = identity._replace(hostname="remote-host")
-        with patch.object(
-            _monitor_mod.os, "pidfd_open", return_value=42, create=True
-        ) as pidfd_open:
-            monitor.register([remote_identity])
-
-        pidfd_open.assert_not_called()
-        assert monitor.find_dead_worker() is None
-
-    def test_different_pid_namespace_is_not_registered(self, identity):
-        monitor = WorkerProcessMonitor()
-        namespace = monitor._local_pid_namespace
-        other_namespace = 1 if namespace is None else namespace + 1
-        other_identity = identity._replace(pid_namespace=other_namespace)
-        with patch.object(
-            _monitor_mod.os, "pidfd_open", return_value=42, create=True
-        ) as pidfd_open:
-            monitor.register([other_identity])
-
-        pidfd_open.assert_not_called()
-        assert monitor.find_dead_worker() is None
-
-
-# ---------------------------------------------------------------------------
-# GenerationExecutorProxy: check_health with MPI worker liveness
+# GenerationExecutorProxy: check_health with MPI futures
 # ---------------------------------------------------------------------------
 class TestProxyCheckHealth:
-    """Tests for GenerationExecutorProxy's MPI worker health checks."""
+    """Tests for GenerationExecutorProxy's check_health with MPI futures."""
 
     @pytest.fixture
     def executor(self):
@@ -659,39 +522,6 @@ class TestProxyCheckHealth:
         executor._set_fatal_error(RuntimeError("parent"))
         executor.mpi_futures = [Future()]
         assert executor.check_health() is False
-
-    @pytest.mark.skipif(
-        not sys.platform.startswith("linux"), reason="pidfd/procfs worker monitoring is Linux-only"
-    )
-    def test_killed_process_detected_while_future_remains_pending(self, executor):
-        """A SIGKILLed worker is fatal even when its MPI future stays pending."""
-        process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
-        future = Future()
-        try:
-            process_state = _read_process_state(process.pid)
-            assert process_state is not None
-            identity = capture_worker_process_identity(rank=0, pid=process.pid)
-            assert identity.start_time == process_state[1]
-            executor._worker_process_monitor.register([identity])
-            executor.mpi_futures = [future]
-            assert executor.check_health() is True
-
-            process.kill()
-            process.wait(timeout=5)
-
-            deadline = time.monotonic() + 5
-            while executor.check_health() and time.monotonic() < deadline:
-                time.sleep(0.01)
-
-            assert executor.check_health() is False
-            assert future.done() is False
-            assert "rank 0" in str(executor._fatal_error)
-            assert executor._pre_shutdown_called
-        finally:
-            executor._worker_process_monitor.close()
-            if process.poll() is None:
-                process.kill()
-                process.wait(timeout=5)
 
 
 # ---------------------------------------------------------------------------
