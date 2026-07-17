@@ -1601,7 +1601,7 @@ class TestFixedScoreMetadata:
                 freq,
                 omega,
                 offsets,
-                min_prompt_len=prompt_len,
+                output_width=seq_len - prompt_len,
             )
             valid_widths = torch.empty(request_count, dtype=torch.int32, device=device)
             fixed = group.launch(
@@ -1704,7 +1704,7 @@ class TestFixedScoreMetadata:
             freq,
             omega,
             offsets,
-            min_prompt_len=prompt_len,
+            output_width=seq_len - prompt_len,
         )
         valid_seq_lens = torch.tensor(seq_lens, dtype=torch.int32, device=device)
         valid_widths = torch.empty(request_count, dtype=torch.int32, device=device)

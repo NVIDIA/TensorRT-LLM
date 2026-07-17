@@ -923,7 +923,7 @@ def test_union_two_rounds_preserve_bytes_tail_and_v2_page_reuse():
             torch.zeros(num_freqs, dtype=torch.float32, device=device),
             page_table_keys=[("pool", 0)],
             num_page_table_slots=1,
-            min_prompt_len=prompt_len,
+            decode_width=seq_len - prompt_len,
             page_table_token_capacity=seq_len + protected_tail,
         )
         keep_set_selector = _BatchedUnionKeepSetSelector(

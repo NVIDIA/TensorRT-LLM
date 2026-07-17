@@ -969,7 +969,7 @@ class _FixedScoreStagingBuffers:
         omega: torch.Tensor,
         page_table_keys: Optional[List[object]] = None,
         num_page_table_slots: Optional[int] = None,
-        decode_width: int = 0,
+        decode_width: Optional[int] = None,
         page_table_token_capacity: Optional[int] = None,
         draft_layer_pools: Optional[List[torch.Tensor]] = None,
         draft_page_representatives: Optional[List[int]] = None,
@@ -1000,9 +1000,12 @@ class _FixedScoreStagingBuffers:
             raise ValueError("page-table capacity cannot be smaller than the score bucket")
         self.page_table_token_capacity = int(page_table_token_capacity)
         # Decode-width capacity of the score buffers; per-request prompt
-        # lengths are staged runtime metadata.
+        # lengths are staged runtime metadata. Default: the whole sequence
+        # capacity is scorable.
+        if decode_width is None:
+            decode_width = int(seq_len)
         if decode_width <= 0 or decode_width > seq_len:
-            raise ValueError("fixed score decode width is outside its bucket")
+            raise ValueError("fixed score decode width exceeds the sequence capacity")
         self.decode_width = int(decode_width)
         q_real = q_real.to(device=self.device, dtype=torch.float32).contiguous()
         q_imag = q_imag.to(device=self.device, dtype=torch.float32).contiguous()

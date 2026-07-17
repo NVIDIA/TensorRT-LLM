@@ -261,10 +261,15 @@ def test_draft_pack_matches_keep_broadcast_and_tail_ordinal_oracle(draft_protect
 
     assert draft_compaction.move_source_offsets.cpu().tolist() == expected_offsets
     draft_indices = draft_compaction.move_source_indices
-    assert draft_indices.shape == (int(built.draft_pool.shape[2]), expected_offsets[-1])
+    # The index buffer is sized for the widest tail (the capacity); this
+    # round's moves are packed at the front, where the offsets point.
+    capacity_total = built.request_count * (
+        int(built.keep.shape[1]) + max(built.draft_protected_tails)
+    )
+    assert draft_indices.shape == (int(built.draft_pool.shape[2]), capacity_total)
     for head in range(int(draft_indices.shape[0])):
         # Union mode broadcasts one keep set over every draft KV head.
-        assert torch.equal(draft_indices[head], expected_row)
+        assert torch.equal(draft_indices[head, : expected_offsets[-1]], expected_row)
 
 
 def test_mark_page_tables_consumed_orders_both_manager_streams():
