@@ -33,7 +33,8 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import (
     BaseResourceManager, CacheTypeCpp, DataType, KVCacheManager,
     PoolConfiguration, get_pp_layers)
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
-from tensorrt_llm._utils import nvtx_range, prefer_pinned
+from tensorrt_llm._utils import (nvtx_range, prefer_pinned,
+                                 torch_dtype_to_binding)
 from tensorrt_llm.bindings.internal.batch_manager import (
     LinearAttentionMetadata, LinearCacheType)
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
@@ -1448,6 +1449,21 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
                     LinearCacheType.RECURRENT_STATES.
                     value if mamba_layer_mask[i] else max_seq_len)
 
+        recurrent_states_window = LinearCacheType.RECURRENT_STATES.value
+        local_windows = {
+            recurrent_states_window
+            if mamba_layer_mask[layer_idx] else max_seq_len
+            for layer_idx in self.pp_layers
+        }
+        kwargs["pool_configurations"] = [
+            PoolConfiguration(
+                window_size=window_size,
+                head_dim=head_dim,
+                dtype=torch_dtype_to_binding(self.ssm_state_dtype)
+                if window_size == recurrent_states_window else dtype,
+            ) for window_size in sorted(local_windows)
+        ]
+
         # Normalize num_kv_heads to a per-layer list and zero out mamba
         # layer positions: those layers carry SSM/conv state instead of KV
         # heads, so the parent KV cache should not allocate KV head storage
@@ -1968,15 +1984,18 @@ class CppMambaHybridCacheManager(KVCacheManager, MambaHybridCacheManager):
 
         self.cuda_state_indices.copy_(self._host_state_indices,
                                       non_blocking=True)
+        is_dummy = [req.is_dummy for req in requests]
         self._refresh_dummy_request_mask(
-            [req.is_dummy for req in self.requests])
+            is_dummy if requests is
+            self.requests else [req.is_dummy for req in self.requests])
 
         # Build request_id → pool block offset mapping so that
         # get_state_indices can return indices in arbitrary request order.
-        for i, req in enumerate(requests):
-            self._request_id_to_state_index[
-                req.py_request_id] = self._host_state_indices[i].item()
-            self._request_id_to_is_dummy[req.py_request_id] = req.is_dummy
+        # Bulk tolist avoids a per-request tensor-index + .item() round-trip.
+        state_values = self._host_state_indices[:n].tolist()
+        for req, value, dummy in zip(requests, state_values, is_dummy):
+            self._request_id_to_state_index[req.py_request_id] = value
+            self._request_id_to_is_dummy[req.py_request_id] = dummy
 
     def get_state_indices(self,
                           request_ids: Optional[List[int]] = None,

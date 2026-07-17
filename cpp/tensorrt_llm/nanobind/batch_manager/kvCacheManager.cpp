@@ -693,7 +693,9 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
         .def("copy_linear_attention_block", &tbk::KVCacheManager::copyLinearAttentionBlock, nb::arg("llm_request"),
             nb::call_guard<nb::gil_scoped_release>())
         .def("copy_linear_attention_block_batch", &tbk::KVCacheManager::copyLinearAttentionBlockBatch,
-            nb::arg("llm_requests"), nb::call_guard<nb::gil_scoped_release>());
+            nb::arg("llm_requests"), nb::call_guard<nb::gil_scoped_release>())
+        .def("get_memory_pool_block_indices", &tbk::KVCacheManager::getMemoryPoolBlockIndicesByBlockIds,
+            nb::arg("block_ids"), nb::arg("window_size"), nb::call_guard<nb::gil_scoped_release>());
 }
 
 void tb::BasePeftCacheManagerBindings::initBindings(nb::module_& m)

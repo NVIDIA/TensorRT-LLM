@@ -187,9 +187,10 @@
     {
       "allowed_values": [
         "CPP",
-        "PYTHON"
+        "PYTHON",
+        "auto"
       ],
-      "annotation": "Optional[Literal['CPP', 'PYTHON']]",
+      "annotation": "Optional[Literal['CPP', 'PYTHON', 'auto']]",
       "converter": "",
       "kind": "categorical",
       "path": "cache_transceiver_config.transceiver_runtime"
@@ -306,6 +307,13 @@
       "converter": "",
       "kind": "value",
       "path": "cuda_graph_config.seq_lens"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "disable_mm_encoder"
     },
     {
       "allowed_values": [],
@@ -963,6 +971,13 @@
       "converter": "",
       "kind": "value",
       "path": "moe_tensor_parallel_size"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'int'>",
+      "converter": "",
+      "kind": "value",
+      "path": "multimodal_config.encoder_cache_max_bytes"
     },
     {
       "allowed_values": [],
