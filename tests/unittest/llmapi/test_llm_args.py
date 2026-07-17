@@ -3403,11 +3403,17 @@ class TestGlm5TransceiverPreference:
         cfg.model_type = model_type
         return cfg
 
-    @pytest.mark.parametrize("architectures,model_type,expected", [
-        (["GlmMoeDsaForCausalLM"], "glm_moe_dsa", "PYTHON"),
-        (["DeepseekV3ForCausalLM"], "deepseek_v3", None),
-        (["DeepseekV32ForCausalLM"], "deepseek_v32", None),
-    ])
+    @pytest.mark.parametrize(
+        "architectures,model_type,expected",
+        [
+            (["GlmMoeDsaForCausalLM"], "glm_moe_dsa", "PYTHON"),
+            (["DeepseekV3ForCausalLM"], "deepseek_v3", None),
+            (["DeepseekV32ForCausalLM"], "deepseek_v32", None),
+            # Each predicate in isolation: the architecture match and the
+            # model_type fallback must each suffice on their own.
+            (["GlmMoeDsaForCausalLM"], "deepseek_v32", "PYTHON"),
+            (["DeepseekV32ForCausalLM"], "glm_moe_dsa", "PYTHON"),
+        ])
     def test_preference_per_architecture(self, architectures, model_type,
                                          expected):
         from tensorrt_llm._torch.models.modeling_deepseekv3 import \
