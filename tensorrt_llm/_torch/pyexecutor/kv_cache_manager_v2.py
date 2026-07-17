@@ -27,7 +27,6 @@ from tensorrt_llm._utils import (
     TensorWrapper,
     convert_to_torch_tensor,
     get_size_in_bytes,
-    local_mpi_size,
     prefer_pinned,
 )
 from tensorrt_llm.bindings.internal.batch_manager import KvCacheIterationStats, KvCacheStats
@@ -889,7 +888,7 @@ class KVCacheManagerV2(BaseResourceManager):
             # co-located ranks each reserving a device-quota-sized block can
             # OOM the host (observed on GB300 NVL72 with 4 ranks/node and
             # ~170GiB device quota each on a 975GiB node).
-            local_ranks = max(1, local_mpi_size())
+            local_ranks = max(1, Distributed.get(mapping).local_world_size)
 
             try:
                 mem_available = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_AVPHYS_PAGES")
