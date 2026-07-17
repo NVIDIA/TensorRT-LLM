@@ -169,7 +169,8 @@ class GenerationExecutorProxy(GenerationExecutor):
         # dir + HMAC key for the per-frontend endpoints (_setup_queues);
         # trtllm-serve hands them to the attached frontends via
         # multi_frontend_attach_info().
-        self._num_frontends = getattr(_llm_args, "num_serve_frontends", 1) or 1
+        self._num_frontends = (_llm_args.num_serve_frontends
+                               if _llm_args is not None else 1)
         self._multi_frontend_ipc_dir: Optional[str] = None
         self._multi_frontend_hmac: Optional[bytes] = None
         if self._num_frontends > 1:
