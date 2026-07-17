@@ -45,7 +45,9 @@ class _CppCompactGroup(NamedTuple):
     pool_pointers: torch.Tensor
     source_layer_indices: Optional[torch.Tensor]
 
-    def launch(self, source: torch.Tensor, offsets: torch.Tensor, destination_base: int) -> None:
+    def launch(
+        self, source: torch.Tensor, offsets: torch.Tensor, destination_bases: torch.Tensor
+    ) -> None:
         torch.ops.trtllm.sparse_kv_cache_compact_layers(
             list(self.pools),
             self.pool_pointers,
@@ -53,7 +55,7 @@ class _CppCompactGroup(NamedTuple):
             source,
             offsets,
             self.source_layer_indices,
-            destination_base,
+            destination_bases,
         )
 
 
@@ -70,13 +72,17 @@ class _SingleCacheCompaction(NamedTuple):
     cpp_launch_groups: Tuple[_CppCompactGroup, ...]
     move_source_indices: torch.Tensor
     move_source_offsets: torch.Tensor
-    destination_base: int
+    # Per-request landing positions; may alias staged prompt lengths so the
+    # values track the current round without a refresh.
+    destination_bases: torch.Tensor
 
     def launch(self) -> None:
         if self.prepared_move_index_pack is not None:
             self.prepared_move_index_pack()
         for group in self.cpp_launch_groups:
-            group.launch(self.move_source_indices, self.move_source_offsets, self.destination_base)
+            group.launch(
+                self.move_source_indices, self.move_source_offsets, self.destination_bases
+            )
 
 
 def _cuda_int32_contiguous(tensors: Tuple[torch.Tensor, ...], device: torch.device) -> bool:
@@ -236,7 +242,6 @@ def _prepared_move_index_pack_launch(
     move_source_indices: torch.Tensor,
     *,
     eviction_mode: str,
-    prompt_len: int,
     decode_keep_count: int,
     num_dense_layers: int,
     num_kv_heads: int,
@@ -262,7 +267,9 @@ def _prepared_move_index_pack_launch(
     else:
         selection_rows = num_kv_heads
     selection_prefix = (request_count,) if union else (request_count, selection_rows)
-    expected_selection = (*selection_prefix, prompt_len + decode_keep_count)
+    # Selection rows carry decode-only kept ordinals (already absolute), so
+    # the rectangle is prompt-length independent.
+    expected_selection = (*selection_prefix, decode_keep_count)
     if (
         request_count <= 0
         or tuple(kept_token_ordinals.shape) != expected_selection
@@ -314,9 +321,8 @@ def _prepared_move_index_pack_launch(
         DENSE_TOTAL=int(move_source_indices.shape[-1]),
         SWA_TOTAL=swa_total,
         SELECTION_ROWS=selection_rows,
-        SELECTION_STRIDE=prompt_len + decode_keep_count,
+        SELECTION_STRIDE=decode_keep_count,
         KEEP_COUNT=decode_keep_count,
-        PROMPT_LEN=prompt_len,
         NUM_KV_HEADS=num_kv_heads,
         SWA_WINDOW=swa_window,
         UNION=union,
@@ -344,9 +350,12 @@ class BatchedKVCacheCompaction:
     protected tail, landing at the same destination base.
 
     Key constructor inputs:
-        `kept_token_ordinals`: increasing kept ordinals per request; shape
-            `[requests, prompt+keep]` for `union`, with a selection-row
-            dimension in between for the per-head modes.
+        `kept_token_ordinals`: increasing kept decode ordinals (absolute
+            positions) per request; shape `[requests, keep]` for `union`,
+            with a selection-row dimension in between for the per-head
+            modes. Prompt tokens never move, so the rectangle is
+            prompt-length independent and one cohort may mix prompt sizes;
+            `prompt_offsets` carries each request's pinned prompt length.
         `kv_block_offsets`: the staged V2 block-offset snapshot laid out as
             `[slot, request, K/V, block]`, where a block offset encodes
             page and K/V plane as `2*page + plane`.
@@ -373,7 +382,7 @@ class BatchedKVCacheCompaction:
         kv_block_offsets: torch.Tensor,
         page_table_slots: Dict[int, int],
         request_count: int,
-        prompt_len: int,
+        prompt_offsets: torch.Tensor,
         decode_keep_count: int,
         swa_window: Optional[int],
         protected_tail_lengths: Optional[List[int]] = None,
@@ -388,7 +397,7 @@ class BatchedKVCacheCompaction:
     ) -> None:
         if eviction_mode not in ("union", "per_head", "per_layer_perhead"):
             raise ValueError(f"unsupported compaction mode: {eviction_mode}")
-        if request_count <= 0 or decode_keep_count <= 0 or prompt_len < 0:
+        if request_count <= 0 or decode_keep_count <= 0:
             raise ValueError("batched compaction requires requests and retained tokens")
         if not dense_layers:
             raise ValueError("batched compaction requires at least one dense layer")
@@ -406,9 +415,18 @@ class BatchedKVCacheCompaction:
         if kept_token_ordinals.device != self.device:
             raise ValueError("kept-token ordinals must live on the pool device")
         self.request_count = int(request_count)
-        self.prompt_len = int(prompt_len)
+        # Per-request pinned prompt lengths; this usually aliases the staged
+        # prompt buffer, so the values track the current round. Only the
+        # geometry is validated here.
+        if (
+            prompt_offsets.shape != (self.request_count,)
+            or prompt_offsets.dtype != torch.int32
+            or prompt_offsets.device != self.device
+            or not prompt_offsets.is_contiguous()
+        ):
+            raise ValueError("per-request prompt offsets do not match the cohort")
+        self.prompt_offsets = prompt_offsets
         self.decode_keep_count = int(decode_keep_count)
-        self.keep_count = self.prompt_len + self.decode_keep_count
         self.protected_tail_lengths = _validated_tail_lengths(
             protected_tail_lengths, self.request_count, "protected-tail"
         )
@@ -449,13 +467,17 @@ class BatchedKVCacheCompaction:
         ]
 
         self.swa_window = 0
+        self.swa_destination_bases = None
         swa_move_indices = None
         swa_move_offsets = None
         swa_entries = []
         if self.swa_layers:
-            if swa_window is None or swa_window <= 0 or self.keep_count < swa_window:
+            if swa_window is None or swa_window <= 0:
                 raise ValueError("SWA compaction requires a valid retained window")
+            # Per-request window validity (prompt + decode keep >= window) is
+            # prompt-dependent and checked by the caller each round.
             self.swa_window = int(swa_window)
+            self.swa_destination_bases = torch.empty_like(self.prompt_offsets)
             swa_move_indices, swa_move_offsets = _make_move_buffers(
                 (self.num_kv_heads,),
                 [self.swa_window + length for length in self.protected_tail_lengths],
@@ -475,7 +497,6 @@ class BatchedKVCacheCompaction:
             dense_move_offsets,
             dense_move_indices,
             eviction_mode=self.eviction_mode,
-            prompt_len=self.prompt_len,
             decode_keep_count=self.decode_keep_count,
             num_dense_layers=len(self.dense_layers),
             num_kv_heads=self.num_kv_heads,
@@ -491,7 +512,7 @@ class BatchedKVCacheCompaction:
             ),
             move_source_indices=dense_move_indices,
             move_source_offsets=dense_move_offsets,
-            destination_base=self.prompt_len,
+            destination_bases=self.prompt_offsets,
         )
         # The dense pack launch fills the SWA move buffers in the same call.
         self.target_swa_compaction = None
@@ -501,7 +522,7 @@ class BatchedKVCacheCompaction:
                 cpp_launch_groups=_compact_groups(swa_entries, self.layer_pool_keys, self.device),
                 move_source_indices=swa_move_indices,
                 move_source_offsets=swa_move_offsets,
-                destination_base=self.keep_count - self.swa_window,
+                destination_bases=self.swa_destination_bases,
             )
 
         self.draft_compaction = None
@@ -597,7 +618,6 @@ class BatchedKVCacheCompaction:
             draft_move_offsets,
             draft_move_indices,
             eviction_mode="union",
-            prompt_len=self.prompt_len,
             decode_keep_count=self.decode_keep_count,
             num_dense_layers=1,
             num_kv_heads=draft_num_kv_heads,
@@ -613,10 +633,18 @@ class BatchedKVCacheCompaction:
             ),
             move_source_indices=draft_move_indices,
             move_source_offsets=draft_move_offsets,
-            destination_base=self.prompt_len,
+            destination_bases=self.prompt_offsets,
         )
 
     def launch(self) -> None:
         """Pack the move indices, then run every cache family's C++ compacts."""
+        if self.swa_destination_bases is not None:
+            # The prompt offsets may have been re-staged since construction;
+            # rebase the SWA landing positions for this round.
+            torch.add(
+                self.prompt_offsets,
+                self.decode_keep_count - self.swa_window,
+                out=self.swa_destination_bases,
+            )
         for compaction in self.cache_compactions:
             compaction.launch()

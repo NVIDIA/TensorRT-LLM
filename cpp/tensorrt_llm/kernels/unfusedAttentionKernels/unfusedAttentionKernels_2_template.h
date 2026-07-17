@@ -1765,7 +1765,7 @@ struct KvCacheV2LayersBuffer
     int64_t sourceLayerStride;
     int64_t pageTableRequestStride;
     int32_t tokensPerBlock;
-    int32_t destinationBase;
+    int32_t const* destinationBases;
     size_t bytesPerPage;
     size_t bytesPerKvHalf;
 
@@ -1807,9 +1807,10 @@ struct KvCacheV2LayersBuffer
         return sourceIndices[offset];
     }
 
-    __device__ __forceinline__ int32_t getSparseKvDestinationToken(int32_t requestMove) const
+    __device__ __forceinline__ int32_t getSparseKvDestinationToken(int32_t batchIdx, int32_t requestMove) const
     {
-        return destinationBase + requestMove;
+        // Per-request landing positions: cohorts may mix prompt lengths.
+        return destinationBases[batchIdx] + requestMove;
     }
 };
 
@@ -1900,7 +1901,7 @@ __global__ __launch_bounds__(BLOCK_SIZE) void updateSparseKvCacheAfterFmha(
             {
                 src_token_idx = params.kv_cache_buffer.getSparseKvSourceToken(
                     params.sparse_kv_indices, kv_head_idx, total_num_sparse_kv_tokens, global_sparse_idx);
-                dst_token_idx = params.kv_cache_buffer.getSparseKvDestinationToken(sparse_token_offset);
+                dst_token_idx = params.kv_cache_buffer.getSparseKvDestinationToken(batch_idx, sparse_token_offset);
             }
             else
             {
@@ -2009,7 +2010,7 @@ void launchSparseKvCacheCompactV2Layers(
 template <typename T>
 void invokeSparseKvCacheCompactV2Layers(int64_t const* poolPointers, int32_t const* pageTable, int32_t numLayers,
     int64_t pageTableRequestStride, int32_t const* sparseKvIndices, int32_t const* sourceLayerIndices,
-    int64_t sourceLayerStride, int32_t const* sparseKvOffsets, int32_t destinationBase, int32_t batchSize,
+    int64_t sourceLayerStride, int32_t const* sparseKvOffsets, int32_t const* destinationBases, int32_t batchSize,
     int32_t numKvHeads, int32_t tokensPerBlock, int32_t headDim, cudaStream_t stream)
 {
     KvCacheV2LayersBuffer buffer{};
@@ -2019,7 +2020,7 @@ void invokeSparseKvCacheCompactV2Layers(int64_t const* poolPointers, int32_t con
     buffer.sourceLayerStride = sourceLayerStride;
     buffer.pageTableRequestStride = pageTableRequestStride;
     buffer.tokensPerBlock = tokensPerBlock;
-    buffer.destinationBase = destinationBase;
+    buffer.destinationBases = destinationBases;
     buffer.bytesPerKvHalf = static_cast<size_t>(numKvHeads) * tokensPerBlock * headDim * sizeof(T);
     buffer.bytesPerPage = 2 * buffer.bytesPerKvHalf;
 

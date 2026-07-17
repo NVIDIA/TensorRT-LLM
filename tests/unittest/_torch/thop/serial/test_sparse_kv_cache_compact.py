@@ -93,7 +93,7 @@ def _reference_compact(
     page_tables: list[torch.Tensor],
     source_indices: torch.Tensor,
     source_offsets: torch.Tensor,
-    destination_base: int,
+    destination_base: "int | list[int]",
     source_layer_indices: Optional[torch.Tensor] = None,
 ) -> list[torch.Tensor]:
     original = [pool.clone() for pool in pools]
@@ -113,10 +113,15 @@ def _reference_compact(
         for request in range(_BATCH_SIZE):
             begin = int(source_offsets[request])
             end = int(source_offsets[request + 1])
+            request_base = (
+                destination_base[request]
+                if isinstance(destination_base, (list, tuple))
+                else destination_base
+            )
             for head in range(_NUM_KV_HEADS):
                 for request_move, global_move in enumerate(range(begin, end)):
                     source_token = int(layer_sources[head, global_move])
-                    destination_token = destination_base + request_move
+                    destination_token = request_base + request_move
                     source_page = int(raw_page_table[request, source_token // _TOKENS_PER_BLOCK])
                     destination_page = int(
                         raw_page_table[request, destination_token // _TOKENS_PER_BLOCK]
@@ -141,8 +146,16 @@ def _compact(
     pools: list[torch.Tensor],
     page_tables: list[torch.Tensor],
     arguments: _DeviceArguments,
-    destination_base: int,
+    destination_base: "int | list[int]",
 ) -> None:
+    # The op takes per-request destination bases; scalar test parameters are
+    # broadcast to the batch here. torch.full stays CUDA-graph-capturable.
+    if isinstance(destination_base, int):
+        destination_bases = torch.full(
+            (_BATCH_SIZE,), destination_base, dtype=torch.int32, device="cuda"
+        )
+    else:
+        destination_bases = torch.tensor(destination_base, dtype=torch.int32, device="cuda")
     torch.ops.trtllm.sparse_kv_cache_compact_layers(
         pools,
         arguments.pool_pointers,
@@ -150,7 +163,7 @@ def _compact(
         arguments.source_indices,
         arguments.source_offsets,
         arguments.source_layer_indices,
-        destination_base,
+        destination_bases,
     )
 
 
@@ -185,6 +198,31 @@ def test_sparse_kv_cache_compact_layers(dtype, head_dim, destination_base, page_
     arguments = _device_arguments(pools, source_indices, source_offsets)
 
     _compact(pools, page_tables, arguments, destination_base)
+    torch.cuda.synchronize()
+
+    for actual, reference in zip(pools, expected):
+        assert torch.equal(actual.cpu(), reference)
+
+
+def test_sparse_kv_cache_compact_layers_per_request_destination_bases():
+    # One launch may mix pinned-prompt lengths: each request lands at its own
+    # destination base.
+    pools_cpu, pools, page_tables = _make_pools(2, torch.bfloat16, 64)
+    page_tables_cpu = [page_table.cpu() for page_table in page_tables]
+    source_offsets = torch.tensor([0, 3, 6], dtype=torch.int32)
+    source_row = torch.tensor([3, 5, 8, 6, 7, 10], dtype=torch.int32)
+    source_indices = source_row.view(1, -1).expand(_NUM_KV_HEADS, -1).contiguous()
+    destination_bases = [2, 5]
+    expected = _reference_compact(
+        pools_cpu,
+        page_tables_cpu,
+        source_indices,
+        source_offsets,
+        destination_bases,
+    )
+    arguments = _device_arguments(pools, source_indices, source_offsets)
+
+    _compact(pools, page_tables, arguments, destination_bases)
     torch.cuda.synchronize()
 
     for actual, reference in zip(pools, expected):

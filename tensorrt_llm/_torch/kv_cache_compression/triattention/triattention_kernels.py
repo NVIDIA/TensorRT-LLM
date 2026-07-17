@@ -376,7 +376,6 @@ def _pack_compaction_sources_kernel(
     SELECTION_ROWS: tl.constexpr,
     SELECTION_STRIDE: tl.constexpr,
     KEEP_COUNT: tl.constexpr,
-    PROMPT_LEN: tl.constexpr,
     NUM_KV_HEADS: tl.constexpr,
     SWA_WINDOW: tl.constexpr,
     UNION: tl.constexpr,
@@ -398,9 +397,11 @@ def _pack_compaction_sources_kernel(
         selection_domain = 0
     else:
         selection_domain = domain
+    # Selection rows carry decode-only kept ordinals (already absolute), so
+    # rows are prompt-length independent and one cohort may mix prompt sizes.
     selection_row = request * SELECTION_ROWS + selection_domain
     selected = tl.load(
-        selected_indices + selection_row.to(tl.int64) * SELECTION_STRIDE + PROMPT_LEN + move,
+        selected_indices + selection_row.to(tl.int64) * SELECTION_STRIDE + move,
         mask=move < KEEP_COUNT,
         other=0,
     )
@@ -432,19 +433,23 @@ def _pack_compaction_sources_kernel(
 def _finalize_topk_indices_kernel(
     scores,
     seq_lens,
+    prompt_offsets,
     provisional_indices,
     output_indices,
     WIDTH: tl.constexpr,
     KEEP_COUNT: tl.constexpr,
     OUTPUT_WIDTH: tl.constexpr,
-    PROMPT_LEN: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     """Resolve boundary ties and emit increasing physical token indices."""
     row = tl.program_id(0)
     row_scores = scores + row * WIDTH
     row_selected = provisional_indices + row * KEEP_COUNT
-    row_output = output_indices + row * OUTPUT_WIDTH + PROMPT_LEN
+    row_output = output_indices + row * OUTPUT_WIDTH
+    # Scores are decode-relative; this row's pinned prompt length rebases the
+    # emitted ordinals to absolute positions (per row, so one launch may mix
+    # prompt lengths).
+    prompt_len = tl.load(prompt_offsets + row)
 
     threshold = float("inf")
     for start in tl.static_range(0, KEEP_COUNT, BLOCK):
@@ -494,7 +499,7 @@ def _finalize_topk_indices_kernel(
         write_offset = output_count + tl.cumsum(selected_i32, axis=0) - selected_i32
         tl.store(
             row_output + write_offset,
-            token_index + PROMPT_LEN,
+            token_index + prompt_len,
             mask=selected,
         )
         output_count += tl.sum(selected_i32)
@@ -504,33 +509,34 @@ def _finalize_topk_indices_kernel(
 def finalize_topk_indices(
     scores: torch.Tensor,
     seq_lens: torch.Tensor,
+    prompt_offsets: torch.Tensor,
     provisional_indices: torch.Tensor,
     output_indices: torch.Tensor,
     keep_count: int,
-    prompt_len: int,
 ) -> None:
     """Finalize one provisional TopK set without changing the CuTE selector.
 
     The kernel derives the provisional set's threshold, keeps all strictly
     better scores, resolves the remaining boundary ties by lower token index,
-    and writes increasing physical ordinals directly into ``output_indices``.
+    and writes increasing physical ordinals (decode index + this row's prompt
+    offset) directly into ``output_indices``.
     """
     keep_count = int(keep_count)
-    prompt_len = int(prompt_len)
     if not scores.is_cuda:
         raise ValueError("deterministic TopK finalization requires CUDA scores")
     if scores.ndim != 2 or scores.dtype != torch.float32 or not scores.is_contiguous():
         raise ValueError("TopK finalization requires contiguous two-dimensional FP32 scores")
     rows, width = scores.shape
-    if rows <= 0 or not 1 <= keep_count <= width or prompt_len < 0:
-        raise ValueError("TopK finalization requires valid rows, keep count, and prompt length")
-    if (
-        seq_lens.shape != (rows,)
-        or seq_lens.dtype != torch.int32
-        or seq_lens.device != scores.device
-        or not seq_lens.is_contiguous()
-    ):
-        raise ValueError("TopK finalization sequence lengths do not match the score rows")
+    if rows <= 0 or not 1 <= keep_count <= width:
+        raise ValueError("TopK finalization requires valid rows and keep count")
+    for name, tensor in (("sequence lengths", seq_lens), ("prompt offsets", prompt_offsets)):
+        if (
+            tensor.shape != (rows,)
+            or tensor.dtype != torch.int32
+            or tensor.device != scores.device
+            or not tensor.is_contiguous()
+        ):
+            raise ValueError(f"TopK finalization {name} do not match the score rows")
     if (
         provisional_indices.shape != (rows, keep_count)
         or provisional_indices.dtype != torch.int32
@@ -541,7 +547,7 @@ def finalize_topk_indices(
     if (
         output_indices.ndim != 2
         or output_indices.shape[0] != rows
-        or output_indices.shape[1] < prompt_len + keep_count
+        or output_indices.shape[1] < keep_count
         or output_indices.dtype != torch.int32
         or output_indices.device != scores.device
         or not output_indices.is_contiguous()
@@ -550,12 +556,12 @@ def finalize_topk_indices(
     _finalize_topk_indices_kernel[(rows,)](
         scores,
         seq_lens,
+        prompt_offsets,
         provisional_indices,
         output_indices,
         WIDTH=width,
         KEEP_COUNT=keep_count,
         OUTPUT_WIDTH=output_indices.shape[1],
-        PROMPT_LEN=prompt_len,
         BLOCK=256,
         num_warps=4,
     )
@@ -578,6 +584,9 @@ def _tri_score_perhead_kernel(
     req_seq_len,  # [num_requests] int32
     req_valid_width_out,  # [num_requests] int32: decode-only length for selection
     req_round_start,  # [num_requests] int32 logical token position
+    req_token_start,  # [num_requests] int32: pinned prompt length; scoring
+    #   starts at this decode-region origin, so prompt lengths may differ
+    #   across the cohort.
     # per-LAYER calibration, [L,H,F] flattened layer-major:
     q_real_ptr,  # [L*H*F] fp32
     q_imag_ptr,  # [L*H*F] fp32
@@ -606,7 +615,6 @@ def _tri_score_perhead_kernel(
     s_slot,
     s_dim,
     USE_MAX: tl.constexpr,
-    TOKEN_START: tl.constexpr,
     T_BLOCK: tl.constexpr,
     F_BLOCK: tl.constexpr,
 ):
@@ -624,11 +632,12 @@ def _tri_score_perhead_kernel(
 
     req_id = tl.load(seg_req_id + seg)
     seq_len = tl.load(req_seq_len + req_id)
+    token_start = tl.load(req_token_start + req_id)
     if (seg % num_layers == 0) & (t_blk == 0) & (kv_head == 0):
-        tl.store(req_valid_width_out + req_id, seq_len - TOKEN_START)
+        tl.store(req_valid_width_out + req_id, seq_len - token_start)
     # Derive the ragged launch bound in the score program instead of staging
     # one replicated length and block count for every request/layer segment.
-    n_tblk = (seq_len - TOKEN_START + T_BLOCK - 1) // T_BLOCK
+    n_tblk = (seq_len - token_start + T_BLOCK - 1) // T_BLOCK
     if t_blk >= n_tblk:
         return
 
@@ -650,7 +659,7 @@ def _tri_score_perhead_kernel(
 
     # ---- token tile of THIS segment ----
     t = t_blk * T_BLOCK + tl.arange(0, T_BLOCK)
-    absolute_t = t + TOKEN_START
+    absolute_t = t + token_start
     t_mask = absolute_t < seq_len
     blk_in_seq = absolute_t // tokens_per_block
     slot = (absolute_t % tokens_per_block).to(tl.int64)
@@ -738,7 +747,6 @@ def _launch_tri_score_perhead(
     geometry_args: tuple,
     *,
     score_aggregation: str,
-    token_start: int,
     token_block: int,
     num_freqs: int,
 ) -> None:
@@ -749,7 +757,6 @@ def _launch_tri_score_perhead(
         *pointer_args,
         *geometry_args,
         USE_MAX=(score_aggregation == "max"),
-        TOKEN_START=token_start,
         T_BLOCK=token_block,
         F_BLOCK=triton.next_power_of_2(num_freqs),
     )
@@ -780,17 +787,18 @@ class _FixedScoreGroup:
         freq_scale_sq: torch.Tensor,
         omega: torch.Tensor,
         offsets: torch.Tensor,
-        prompt_len: int = 0,
+        min_prompt_len: int = 0,
     ) -> None:
         if not layer_indices or min(max_requests, page_count, seq_len) <= 0:
             raise ValueError("fixed score group requires non-empty positive geometry")
-        if prompt_len < 0 or prompt_len >= seq_len:
+        if min_prompt_len < 0 or min_prompt_len >= seq_len:
             raise ValueError("fixed score prompt length must leave a non-empty decode region")
         if len(page_table_slots) != len(layer_indices):
             raise ValueError("page_table_slots must align with layer_indices")
         self.max_requests = max_requests
-        self.prompt_len = prompt_len
-        self.output_width = seq_len - prompt_len
+        # Prompt lengths are per-request kernel inputs; the smallest one only
+        # sizes the widest possible decode window of the output buffer.
+        self.output_width = seq_len - min_prompt_len
         self.num_layers = len(layer_indices)
         p0 = layer_pools[layer_indices[0]]
         if p0.ndim != 5:
@@ -896,6 +904,7 @@ class _FixedScoreGroup:
         valid_seq_lens: torch.Tensor,
         valid_widths: torch.Tensor,
         round_starts_device: torch.Tensor,
+        token_starts_device: torch.Tensor,
         mean_cos: torch.Tensor,
         mean_sin: torch.Tensor,
         score_aggregation: str,
@@ -923,6 +932,7 @@ class _FixedScoreGroup:
                 valid_seq_lens,
                 valid_widths,
                 round_starts_device,
+                token_starts_device,
                 *self.pointer_middle,
                 mean_cos.view(-1),
                 mean_sin.view(-1),
@@ -931,7 +941,6 @@ class _FixedScoreGroup:
             ),
             (self.output_width, self.num_layers, *self.geometry_args),
             score_aggregation=score_aggregation,
-            token_start=self.prompt_len,
             token_block=self.token_block,
             num_freqs=self.num_freqs,
         )

@@ -96,12 +96,14 @@ def _prepared_eviction(
     protected_tail=0,
     request_id=0,
     round_start=None,
+    prompt_len=0,
 ):
     return _PreparedEviction(
         request=request,
         request_id=request_id,
         seq_len=seq_len,
         round_start=int(seq_len if round_start is None else round_start),
+        prompt_len=prompt_len,
         expected_keep_count=expected_keep_count,
         protected_tail=protected_tail,
     )
@@ -481,7 +483,10 @@ class TestCompressedTokenPublication:
             launch_prepared_score=mock.Mock(return_value=torch.zeros(1)),
             mark_page_tables_consumed=mock.Mock(),
         )
-        keep_set_selector = SimpleNamespace(select_requests=mock.Mock())
+        keep_set_selector = SimpleNamespace(
+            select_requests=mock.Mock(),
+            refresh_row_prompt_offsets=mock.Mock(),
+        )
         resources = SimpleNamespace(
             score_staging=score_staging,
             keep_set_selector=keep_set_selector,
@@ -904,7 +909,8 @@ class TestStepEndHookRefactor:
         )
 
         config = TriAttentionKvCacheCompressionConfig(
-            model_path="/models/test", calibration_path="/calib/test.pt", top_B=8)
+            model_path="/models/test", calibration_path="/calib/test.pt", top_B=8
+        )
         assert config.kv_cache_compression_mode.is_eviction_method() is True
         draft_manager = _make_fake_v2(is_draft=True)
         validate_kv_cache_compression_with_spec(
@@ -936,7 +942,8 @@ class TestStepEndHookRefactor:
         with pytest.raises(ValueError, match="standard paged cache compacted together"):
             validate_kv_cache_compression_with_spec(
                 TriAttentionKvCacheCompressionConfig(
-            model_path="/models/test", calibration_path="/calib/test.pt", top_B=8),
+                    model_path="/models/test", calibration_path="/calib/test.pt", top_B=8
+                ),
                 spec_config,
                 _make_fake_v2(is_draft=True),
             )
@@ -954,7 +961,8 @@ class TestStepEndHookRefactor:
         with pytest.raises(ValueError, match="standard paged cache compacted together"):
             validate_kv_cache_compression_with_spec(
                 TriAttentionKvCacheCompressionConfig(
-            model_path="/models/test", calibration_path="/calib/test.pt", top_B=8),
+                    model_path="/models/test", calibration_path="/calib/test.pt", top_B=8
+                ),
                 DFlashDecodingConfig(max_draft_len=3),
                 _make_fake_v2(is_draft=True),
             )
@@ -1026,7 +1034,6 @@ class TestTopKRouting:
             request_scores[0].shape[0],
             width,
             keep_count,
-            0,
             dtype=request_scores[0].dtype,
             device=request_scores[0].device,
             max_requests=len(request_scores),
@@ -1076,6 +1083,7 @@ class TestFixedScoreMetadata:
         score_staging = SimpleNamespace(
             fused_group=SimpleNamespace(output=torch.empty(1, 4, 8)),
             bind_score_launcher=mock.Mock(),
+            token_starts_device=torch.zeros(1, dtype=torch.int32),
         )
         keep_set_selector = SimpleNamespace(valid_widths=torch.empty(1, dtype=torch.int32))
         prepared = [
@@ -1307,7 +1315,7 @@ class TestFixedScoreMetadata:
         other_stream = SimpleNamespace(device=torch.device("cuda:0"), cuda_stream=5)
         with mock.patch.object(torch.cuda, "current_stream", return_value=other_stream):
             with pytest.raises(_FixedScoreStreamMismatch, match="first CUDA stream"):
-                staging.stage(manager, [1], [8.0])
+                staging.stage(manager, [1], [8.0], [0])
         staging.copy_done.query.assert_not_called()
         staging.copy_done.synchronize.assert_not_called()
 
@@ -1324,6 +1332,7 @@ class TestFixedScoreMetadata:
                 request_id=7,
                 round_start=8,
                 seq_len=8,
+                prompt_len=3,
                 expected_keep_count=6,
                 protected_tail=2,
             ),
@@ -1332,6 +1341,7 @@ class TestFixedScoreMetadata:
                 request_id=8,
                 round_start=9,
                 seq_len=9,
+                prompt_len=5,
                 expected_keep_count=6,
                 protected_tail=3,
             ),
@@ -1343,6 +1353,7 @@ class TestFixedScoreMetadata:
             manager.kv_cache_manager,
             [7, 8],
             [8, 9],
+            [3, 5],
             [8, 9],
             [10, 12],
             draft_manager=None,
@@ -1424,6 +1435,8 @@ class TestFixedScoreMetadata:
 
         request_ids = list(range(request_count))
         round_starts = [131_071 + request for request in request_ids]
+        # Per-request pinned prompt lengths: one cohort may mix them.
+        token_starts = list(request_ids)
         host_table = torch.zeros(
             3,
             max_requests,
@@ -1459,6 +1472,7 @@ class TestFixedScoreMetadata:
             manager,
             request_ids,
             [2**31] * request_count,
+            token_starts,
             [seq_len] * request_count,
             [10] * request_count,
         )
@@ -1472,6 +1486,7 @@ class TestFixedScoreMetadata:
                 manager,
                 request_ids,
                 round_starts,
+                token_starts,
                 [seq_len] * request_count,
                 [10] * request_count,
             )
@@ -1487,6 +1502,10 @@ class TestFixedScoreMetadata:
             staging.valid_seq_lens_device[:request_count],
             torch.full((request_count,), seq_len, dtype=torch.int32, device=device),
         )
+        assert torch.equal(
+            staging.token_starts_device[:request_count],
+            torch.tensor(token_starts, dtype=torch.int32, device=device),
+        )
         for slot, global_layer in enumerate((10, 12, 13)):
             expected = torch.tensor(tables[global_layer], dtype=torch.int32, device=device) * 2
             assert torch.equal(
@@ -1497,7 +1516,7 @@ class TestFixedScoreMetadata:
         other_stream = torch.cuda.Stream(device=device)
         with torch.cuda.stream(other_stream):
             with pytest.raises(_FixedScoreStreamMismatch, match="first CUDA stream"):
-                staging.stage(manager, request_ids, round_starts)
+                staging.stage(manager, request_ids, round_starts, token_starts)
         assert gather.call_count == calls
 
     @pytest.mark.parametrize("request_count", [1, 7, 8])
@@ -1538,6 +1557,9 @@ class TestFixedScoreMetadata:
         assert not offsets.is_contiguous()
         round_device = torch.arange(max_requests, dtype=torch.int32, device=device) + 9
         round_starts = round_device[:request_count].tolist()
+        token_starts_device = torch.full(
+            (max_requests,), prompt_len, dtype=torch.int32, device=device
+        )
         seq_lens = [seq_len - request % 2 for request in range(request_count)]
         phase = (round_device[:, None, None] + offsets[None, :, None]) * omega[None, None]
         oracle = _torch_tri_score_oracle(
@@ -1570,7 +1592,7 @@ class TestFixedScoreMetadata:
                 freq,
                 omega,
                 offsets,
-                prompt_len=prompt_len,
+                min_prompt_len=prompt_len,
             )
             valid_widths = torch.empty(request_count, dtype=torch.int32, device=device)
             fixed = group.launch(
@@ -1578,6 +1600,7 @@ class TestFixedScoreMetadata:
                 torch.tensor(seq_lens, dtype=torch.int32, device=device),
                 valid_widths,
                 round_device,
+                token_starts_device,
                 torch.cos(phase).mean(dim=1),
                 torch.sin(phase).mean(dim=1),
                 aggregation,
@@ -1653,6 +1676,7 @@ class TestFixedScoreMetadata:
         offsets = torch.tensor([1.0, 2.0, 4.0], device=device)
         round_device = torch.arange(max_requests, dtype=torch.int32, device=device) + 9
         round_starts = round_device[:request_count].tolist()
+        token_starts = torch.full((max_requests,), prompt_len, dtype=torch.int32, device=device)
         seq_lens = [seq_len - request % 2 for request in range(request_count)]
         layer_order = list(range(num_layers))
         block_offsets = _encode_block_offsets(page_ids_3d)
@@ -1671,7 +1695,7 @@ class TestFixedScoreMetadata:
             freq,
             omega,
             offsets,
-            prompt_len=prompt_len,
+            min_prompt_len=prompt_len,
         )
         valid_seq_lens = torch.tensor(seq_lens, dtype=torch.int32, device=device)
         valid_widths = torch.empty(request_count, dtype=torch.int32, device=device)
@@ -1693,6 +1717,7 @@ class TestFixedScoreMetadata:
             valid_seq_lens,
             valid_widths,
             round_device,
+            token_starts,
             mean_cos,
             mean_sin,
             aggregation,
@@ -1703,6 +1728,7 @@ class TestFixedScoreMetadata:
         staging.fused_group = group
         staging.round_starts_device = round_device
         staging.valid_seq_lens_device = valid_seq_lens
+        staging.token_starts_device = token_starts
         staging.mean_cos = mean_cos
         staging.mean_sin = mean_sin
         staging.offsets = offsets
@@ -1779,6 +1805,7 @@ class TestFixedScoreMetadata:
             valid_seq_lens,
             valid_widths,
             round_device,
+            token_starts,
             mean_cos,
             mean_sin,
             aggregation,
@@ -1858,7 +1885,8 @@ class TestFactory:
         # no calibration file or CUDA.
         fake_v2 = _make_fake_v2(enable_block_reuse=False)
         cfg = TriAttentionKvCacheCompressionConfig(
-            top_B=32, beta=16, model_path="/models/test", calibration_path="/calib/test.pt")
+            top_B=32, beta=16, model_path="/models/test", calibration_path="/calib/test.pt"
+        )
         mgr = create_kv_cache_compression_manager(cfg, kv_cache_manager=fake_v2)
         assert isinstance(mgr, TriAttention)
         assert mgr.top_B == 32

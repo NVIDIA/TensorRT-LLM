@@ -34,14 +34,15 @@ namespace torch_ext
 
 //! Adapt one uniform group of KVCacheManagerV2 HND layer pools to the
 //! existing sparse-KV post-FMHA updater. Layers share one V2 block-offset
-//! table; destinationBase replaces the former arbitrary destination tensor
-//! because every compaction move targets one contiguous interval. Within
-//! each request and KV head, the caller must supply increasing source
-//! ordinals with destinationBase + move <= source[move], which makes the
-//! updater's forward tiled in-place copy safe.
+//! table; per-request destinationBases replace the former arbitrary
+//! destination tensor because every compaction move targets one contiguous
+//! interval per request. Within each request and KV head, the caller must
+//! supply increasing source ordinals with destinationBases[request] + move
+//! <= source[move], which makes the updater's forward tiled in-place copy
+//! safe.
 void sparseKvCacheCompactLayers(std::vector<th::Tensor> const& pools, th::Tensor const& poolPointers,
     th::Tensor const& pageTable, th::Tensor const& sourceIndices, th::Tensor const& sourceOffsets,
-    std::optional<th::Tensor> const& sourceLayerIndices, int64_t destinationBase)
+    std::optional<th::Tensor> const& sourceLayerIndices, th::Tensor const& destinationBases)
 {
     TORCH_CHECK(!pools.empty(), "sparse_kv_cache_compact_layers: pools must be non-empty");
 
@@ -119,29 +120,33 @@ void sparseKvCacheCompactLayers(std::vector<th::Tensor> const& pools, th::Tensor
             && sourceOffsets.scalar_type() == th::kInt32 && sourceOffsets.is_contiguous() && sourceOffsets.dim() == 1
             && sourceOffsets.size(0) == batchSize + 1,
         "sparse_kv_cache_compact_layers: source_offsets must be contiguous CUDA int32 [batch + 1]");
-    TORCH_CHECK(destinationBase >= 0 && destinationBase <= std::numeric_limits<int32_t>::max(),
-        "sparse_kv_cache_compact_layers: destination_base must fit a non-negative int32");
+    // Per-request landing positions: one launch covers a cohort with mixed
+    // pinned-prompt lengths. Values live on device; the kernel trusts them.
+    TORCH_CHECK(destinationBases.is_cuda() && destinationBases.get_device() == device
+            && destinationBases.scalar_type() == th::kInt32 && destinationBases.dim() == 1
+            && destinationBases.size(0) == batchSize && destinationBases.is_contiguous(),
+        "sparse_kv_cache_compact_layers: destination_bases must be contiguous CUDA int32 [batch]");
 
     auto const stream = at::cuda::getCurrentCUDAStream(device);
-    auto const base = static_cast<int32_t>(destinationBase);
+    auto const* bases = destinationBases.data_ptr<int32_t>();
     if (dtype == th::kBFloat16)
     {
         tk::invokeSparseKvCacheCompactV2Layers<__nv_bfloat16>(poolPointers.data_ptr<int64_t>(),
             pageTable.data_ptr<int32_t>(), numLayers, pageTableRequestStride, sourceIndices.data_ptr<int32_t>(),
-            sourceLayerPtr, sourceLayerStride, sourceOffsets.data_ptr<int32_t>(), base, batchSize, numKvHeads,
+            sourceLayerPtr, sourceLayerStride, sourceOffsets.data_ptr<int32_t>(), bases, batchSize, numKvHeads,
             tokensPerBlock, headDim, stream);
     }
     else if (dtype == th::kHalf)
     {
         tk::invokeSparseKvCacheCompactV2Layers<half>(poolPointers.data_ptr<int64_t>(), pageTable.data_ptr<int32_t>(),
             numLayers, pageTableRequestStride, sourceIndices.data_ptr<int32_t>(), sourceLayerPtr, sourceLayerStride,
-            sourceOffsets.data_ptr<int32_t>(), base, batchSize, numKvHeads, tokensPerBlock, headDim, stream);
+            sourceOffsets.data_ptr<int32_t>(), bases, batchSize, numKvHeads, tokensPerBlock, headDim, stream);
     }
     else if (dtype == th::kFloat)
     {
         tk::invokeSparseKvCacheCompactV2Layers<float>(poolPointers.data_ptr<int64_t>(), pageTable.data_ptr<int32_t>(),
             numLayers, pageTableRequestStride, sourceIndices.data_ptr<int32_t>(), sourceLayerPtr, sourceLayerStride,
-            sourceOffsets.data_ptr<int32_t>(), base, batchSize, numKvHeads, tokensPerBlock, headDim, stream);
+            sourceOffsets.data_ptr<int32_t>(), bases, batchSize, numKvHeads, tokensPerBlock, headDim, stream);
     }
     else
     {
@@ -158,7 +163,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
     m.def(
         "sparse_kv_cache_compact_layers(Tensor(a!)[] pools, Tensor pool_pointers, Tensor page_table, Tensor "
         "source_indices, Tensor source_offsets, Tensor? source_layer_indices=None, "
-        "int destination_base=0) -> ()");
+        "Tensor destination_bases) -> ()");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)

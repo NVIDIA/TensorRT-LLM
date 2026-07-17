@@ -131,9 +131,9 @@ def _launched_draft_compaction(draft_protected_tails):
     initial_target = [pool.clone() for pool in target_pools]
     initial_draft = draft_pool.clone()
 
-    prompt = torch.tensor([0, 1], dtype=torch.int64, device=device)
-    union_decode = torch.tensor([[2, 4, 7, 9], [3, 5, 6, 8]], dtype=torch.int64, device=device)
-    keep = torch.cat((prompt.view(1, -1).expand(request_count, -1), union_decode), dim=1)
+    # Kept ordinals are decode-only but absolute; the pinned prompt tokens
+    # never appear in the selection rectangle.
+    keep = torch.tensor([[2, 4, 7, 9], [3, 5, 6, 8]], dtype=torch.int64, device=device)
 
     compaction = BatchedKVCacheCompaction(
         eviction_mode="union",
@@ -147,7 +147,7 @@ def _launched_draft_compaction(draft_protected_tails):
         kv_block_offsets=_encode_block_offsets(target_tables),
         page_table_slots={0: 0, 1: 0},
         request_count=request_count,
-        prompt_len=prompt_len,
+        prompt_offsets=torch.full((request_count,), prompt_len, dtype=torch.int32, device=device),
         decode_keep_count=decode_keep_count,
         swa_window=None,
         protected_tail_lengths=target_protected_tails,
@@ -195,7 +195,7 @@ def test_draft_pools_receive_target_union_keep_set_and_own_tail():
             dtype=torch.int64,
             device=device,
         )
-        target_source = torch.cat((built.keep[request, prompt_len:], target_tail))
+        target_source = torch.cat((built.keep[request], target_tail))
         target_destination = torch.arange(
             prompt_len,
             prompt_len + target_source.numel(),
@@ -221,7 +221,7 @@ def test_draft_pools_receive_target_union_keep_set_and_own_tail():
             dtype=torch.int64,
             device=device,
         )
-        draft_source = torch.cat((built.keep[request, prompt_len:], draft_tail))
+        draft_source = torch.cat((built.keep[request], draft_tail))
         draft_destination = torch.arange(
             prompt_len,
             prompt_len + draft_source.numel(),
@@ -246,7 +246,7 @@ def test_draft_pack_matches_keep_broadcast_and_tail_ordinal_oracle(draft_protect
     expected_offsets = [0]
     expected_moves = []
     for request in range(built.request_count):
-        decode = built.keep[request, built.prompt_len :].to(torch.int32)
+        decode = built.keep[request].to(torch.int32)
         tail = torch.arange(
             built.valid_seq_lens[request],
             built.valid_seq_lens[request] + draft_protected_tails[request],
@@ -345,7 +345,10 @@ def _mocked_eviction_internals(manager):
         launch_prepared_score=mock.Mock(return_value=torch.zeros(1)),
         mark_page_tables_consumed=mock.Mock(),
     )
-    keep_set_selector = SimpleNamespace(select_requests=mock.Mock())
+    keep_set_selector = SimpleNamespace(
+        select_requests=mock.Mock(),
+        refresh_row_prompt_offsets=mock.Mock(),
+    )
     resources = SimpleNamespace(
         score_staging=score_staging,
         keep_set_selector=keep_set_selector,
@@ -479,6 +482,7 @@ def test_lru_score_staging_eviction_drops_dependent_batched_compactions():
     score_staging = SimpleNamespace(
         fused_group=SimpleNamespace(output=torch.empty(1, 4, 8)),
         bind_score_launcher=mock.Mock(),
+        token_starts_device=torch.zeros(1, dtype=torch.int32),
     )
     keep_set_selector = SimpleNamespace(valid_widths=torch.empty(1, dtype=torch.int32))
     prepared = [
@@ -487,6 +491,7 @@ def test_lru_score_staging_eviction_drops_dependent_batched_compactions():
             request_id=7,
             seq_len=8,
             round_start=8,
+            prompt_len=0,
             expected_keep_count=4,
             protected_tail=0,
         )

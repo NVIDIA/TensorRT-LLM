@@ -193,13 +193,12 @@ class _PreparedTopKFinalizer:
         self,
         scores: torch.Tensor,
         seq_lens: torch.Tensor,
+        prompt_offsets: torch.Tensor,
         provisional_indices: torch.Tensor,
         output_indices: torch.Tensor,
         keep_count: int,
-        prompt_len: int,
     ) -> None:
         rows, width = scores.shape
-        output_width = prompt_len + keep_count
         if (
             not scores.is_cuda
             or scores.dtype != torch.float32
@@ -207,13 +206,17 @@ class _PreparedTopKFinalizer:
             or seq_lens.shape != (rows,)
             or seq_lens.dtype != torch.int32
             or seq_lens.device != scores.device
+            or prompt_offsets.shape != (rows,)
+            or prompt_offsets.dtype != torch.int32
+            or prompt_offsets.device != scores.device
             or provisional_indices.shape != (rows, keep_count)
             or provisional_indices.dtype != torch.int32
             or provisional_indices.device != scores.device
-            or output_indices.shape != (rows, output_width)
+            or output_indices.shape != (rows, keep_count)
             or output_indices.dtype != torch.int32
             or output_indices.device != scores.device
             or not seq_lens.is_contiguous()
+            or not prompt_offsets.is_contiguous()
             or not provisional_indices.is_contiguous()
             or not output_indices.is_contiguous()
         ):
@@ -223,12 +226,11 @@ class _PreparedTopKFinalizer:
 
         self._prepared_launch = PreparedTritonKernelLaunch(
             _finalize_topk_indices_kernel,
-            (scores, seq_lens, provisional_indices, output_indices),
+            (scores, seq_lens, prompt_offsets, provisional_indices, output_indices),
             dict(
                 WIDTH=width,
                 KEEP_COUNT=keep_count,
-                OUTPUT_WIDTH=output_width,
-                PROMPT_LEN=prompt_len,
+                OUTPUT_WIDTH=keep_count,
                 BLOCK=256,
             ),
             grid=(rows, 1, 1),
@@ -239,10 +241,13 @@ class _PreparedTopKFinalizer:
         self,
         scores: torch.Tensor,
         seq_lens: torch.Tensor,
+        prompt_offsets: torch.Tensor,
         provisional_indices: torch.Tensor,
         output_indices: torch.Tensor,
     ) -> None:
-        self._prepared_launch(scores, seq_lens, provisional_indices, output_indices)
+        self._prepared_launch(
+            scores, seq_lens, prompt_offsets, provisional_indices, output_indices
+        )
 
 
 class _PreparedUnionScores:
@@ -319,14 +324,18 @@ class _PreparedUnionScores:
 def _deterministic_topk_indices_into(
     scores: torch.Tensor,
     seq_lens: torch.Tensor,
+    prompt_offsets: torch.Tensor,
     provisional_indices_i32: torch.Tensor,
     output_indices_i32: torch.Tensor,
     keep_count: int,
-    prompt_len: int,
     prepared_topk: Optional[_PreparedCuteTopK] = None,
     prepared_finalizer: Optional[_PreparedTopKFinalizer] = None,
 ) -> None:
-    """Write stable, increasing physical indices around one CuTE TopK call."""
+    """Write stable, increasing physical indices around one CuTE TopK call.
+
+    Scores are decode-relative; ``prompt_offsets`` rebases each row's emitted
+    ordinals to absolute positions, so one call may mix prompt lengths.
+    """
     if scores.is_cuda:
         if prepared_topk is None or prepared_finalizer is None:
             raise ValueError("CUDA selection requires prepared TopK launchers")
@@ -334,6 +343,7 @@ def _deterministic_topk_indices_into(
         prepared_finalizer(
             scores,
             seq_lens,
+            prompt_offsets,
             provisional_indices_i32,
             output_indices_i32,
         )
@@ -343,6 +353,7 @@ def _deterministic_topk_indices_into(
     _topk_indices_into(scores, seq_lens, provisional_indices_i32, keep_count)
     for row_index, row_scores in enumerate(scores):
         valid_width = int(seq_lens[row_index])
+        prompt_len = int(prompt_offsets[row_index])
         selected = provisional_indices_i32[row_index].to(torch.long)
         threshold = torch.amin(row_scores[selected])
         valid_scores = row_scores[:valid_width]
@@ -350,7 +361,7 @@ def _deterministic_topk_indices_into(
         tied = torch.nonzero(valid_scores == threshold, as_tuple=False).flatten()
         tie_count = keep_count - int(higher.numel())
         ordered = torch.sort(torch.cat((higher, tied[:tie_count]))).values
-        output_indices_i32[row_index, prompt_len : prompt_len + keep_count].copy_(
+        output_indices_i32[row_index, :keep_count].copy_(
             ordered.to(torch.int32).add(prompt_len)
         )
 
@@ -365,7 +376,6 @@ class _CrossRequestSelectionPlan(NamedTuple):
     rows: int
     width: int
     keep_count: int
-    prompt_len: int
     dtype: torch.dtype
     device: torch.device
     max_requests: int
@@ -401,7 +411,8 @@ class _BatchedKeepSetSelectorBase:
         num_kv_heads: int,
         width: int,
         keep_count: int,
-        prompt_len: int,
+        selection_rows_per_request: int = 1,
+        prompt_offsets_buffer: Optional[torch.Tensor] = None,
         dtype: torch.dtype,
         device: torch.device,
         max_requests: int,
@@ -416,14 +427,61 @@ class _BatchedKeepSetSelectorBase:
         self.num_kv_heads = int(num_kv_heads)
         self.width = int(width)
         self.keep_count = int(keep_count)
-        self.prompt_len = int(prompt_len)
-        self.total_keep = self.prompt_len + self.keep_count
         self.dtype = dtype
         self.device = _canonical_device(device)
         self.max_requests = int(max_requests)
         self.valid_widths = torch.full(
             (self.max_requests,), self.width, dtype=torch.int32, device=self.device
         )
+        # Per-request pinned prompt lengths, refreshed each round: scores are
+        # decode-relative and these offsets rebase emitted ordinals, so one
+        # cohort may mix prompt lengths. ``row_prompt_offsets`` is the
+        # row-major expansion consumed by the finalizer.
+        self.selection_rows_per_request = int(selection_rows_per_request)
+        if prompt_offsets_buffer is not None:
+            # Share the staging buffers' per-request prompt lengths so the
+            # values are written once per round.
+            if (
+                prompt_offsets_buffer.shape != (self.max_requests,)
+                or prompt_offsets_buffer.dtype != torch.int32
+                or prompt_offsets_buffer.device != self.device
+            ):
+                raise ValueError("prompt offsets buffer does not match the selector geometry")
+            self.prompt_offsets = prompt_offsets_buffer
+        else:
+            self.prompt_offsets = torch.zeros(
+                (self.max_requests,), dtype=torch.int32, device=self.device
+            )
+        if self.selection_rows_per_request == 1:
+            self.row_prompt_offsets = self.prompt_offsets
+        else:
+            self.row_prompt_offsets = torch.zeros(
+                (self.max_requests * self.selection_rows_per_request,),
+                dtype=torch.int32,
+                device=self.device,
+            )
+
+    def set_prompt_offsets(self, prompt_lens: torch.Tensor) -> None:
+        """Refresh the per-request prompt offsets for the coming round."""
+        count = int(prompt_lens.numel())
+        if count > self.max_requests:
+            raise ValueError("prompt offsets exceed the selector's request capacity")
+        self.prompt_offsets[:count].copy_(prompt_lens, non_blocking=True)
+        self.refresh_row_prompt_offsets()
+
+    def refresh_row_prompt_offsets(self) -> None:
+        """Re-expand the per-request prompt offsets into their row-major view.
+
+        Called after the shared per-request buffer was staged externally.
+        """
+        if self.row_prompt_offsets is not self.prompt_offsets:
+            self.row_prompt_offsets.view(
+                self.max_requests, self.selection_rows_per_request
+            ).copy_(
+                self.prompt_offsets.unsqueeze(1).expand(
+                    -1, self.selection_rows_per_request
+                )
+            )
 
     def _allocate_cpu_reference_buffers(
         self,
@@ -459,16 +517,11 @@ class _BatchedKeepSetSelectorBase:
         self.prepared_finalizer = _PreparedTopKFinalizer(
             scores_rows,
             row_lengths,
+            self.row_prompt_offsets,
             provisional_indices,
             keep_rows,
             self.keep_count,
-            self.prompt_len,
         )
-
-    def _prefill_prompt_ordinals(self, keep: torch.Tensor) -> None:
-        if self.prompt_len:
-            prompt = torch.arange(self.prompt_len, dtype=torch.int32, device=self.device)
-            keep[..., : self.prompt_len].copy_(prompt.expand(*keep.shape[:-1], self.prompt_len))
 
     def _validated_request_count(self, scores: torch.Tensor, what: str) -> int:
         request_count = int(scores.shape[0]) if scores.ndim >= 1 else 0
@@ -487,7 +540,6 @@ class _BatchedUnionKeepSetSelector(_BatchedKeepSetSelectorBase):
         rows: int,
         width: int,
         keep_count: int,
-        prompt_len: int,
         *,
         dtype: torch.dtype,
         device: torch.device,
@@ -497,6 +549,7 @@ class _BatchedUnionKeepSetSelector(_BatchedKeepSetSelectorBase):
         num_kv_heads: int = 0,
         input_scores: Optional[torch.Tensor] = None,
         normalize_scores: bool = True,
+        prompt_offsets_buffer: Optional[torch.Tensor] = None,
     ) -> None:
         if rows <= 0:
             raise ValueError("cross-request selection requires rows > 0")
@@ -507,7 +560,7 @@ class _BatchedUnionKeepSetSelector(_BatchedKeepSetSelectorBase):
             num_kv_heads=num_kv_heads,
             width=width,
             keep_count=keep_count,
-            prompt_len=prompt_len,
+            prompt_offsets_buffer=prompt_offsets_buffer,
             dtype=dtype,
             device=device,
             max_requests=max_requests,
@@ -522,8 +575,10 @@ class _BatchedUnionKeepSetSelector(_BatchedKeepSetSelectorBase):
         self.final_indices = torch.empty(
             (max_requests, keep_count), dtype=torch.int32, device=self.device
         )
+        # Kept decode ordinals only: rows are prompt-length independent, so
+        # one selector serves cohorts with mixed prompt lengths.
         self.keep = torch.empty(
-            (max_requests, self.total_keep), dtype=torch.int32, device=self.device
+            (max_requests, self.keep_count), dtype=torch.int32, device=self.device
         )
         self._allocate_cpu_reference_buffers(
             (max_requests, 1, 1), (max_requests, 1, width), torch.int32
@@ -543,7 +598,6 @@ class _BatchedUnionKeepSetSelector(_BatchedKeepSetSelectorBase):
             if self.device.type == "cuda" and input_scores is not None
             else None
         )
-        self._prefill_prompt_ordinals(self.keep)
 
     def _select_input_scores(
         self,
@@ -567,10 +621,10 @@ class _BatchedUnionKeepSetSelector(_BatchedKeepSetSelectorBase):
         _deterministic_topk_indices_into(
             combined,
             valid_widths,
+            self.prompt_offsets[:request_count],
             final_indices,
             self.keep[:request_count],
             self.keep_count,
-            self.prompt_len,
             self.prepared_topk,
             self.prepared_finalizer,
         )
@@ -584,10 +638,10 @@ class _BatchedUnionKeepSetSelector(_BatchedKeepSetSelectorBase):
         _deterministic_topk_indices_into(
             self.combined,
             self.valid_widths,
+            self.prompt_offsets,
             final_indices,
             self.keep,
             self.keep_count,
-            self.prompt_len,
             self.prepared_topk,
             self.prepared_finalizer,
         )
@@ -677,10 +731,10 @@ class _BatchedPerHeadKeepSetSelector(_BatchedKeepSetSelectorBase):
         num_kv_heads: int,
         width: int,
         keep_count: int,
-        prompt_len: int,
         dtype: torch.dtype,
         device: torch.device,
         max_requests: int,
+        prompt_offsets_buffer: Optional[torch.Tensor] = None,
     ) -> None:
         if eviction_mode not in ("per_head", "per_layer_perhead"):
             raise ValueError(f"unsupported per-head eviction mode: {eviction_mode}")
@@ -688,6 +742,11 @@ class _BatchedPerHeadKeepSetSelector(_BatchedKeepSetSelectorBase):
             raise ValueError("per-head selection requires positive layer, head, and request counts")
         if num_query_heads % num_kv_heads:
             raise ValueError("query heads must be divisible by KV heads")
+        selection_rows = (
+            num_kv_heads
+            if eviction_mode == "per_head"
+            else len(dense_layers) * num_kv_heads
+        )
         super().__init__(
             eviction_mode=eviction_mode,
             dense_layers=dense_layers,
@@ -695,7 +754,8 @@ class _BatchedPerHeadKeepSetSelector(_BatchedKeepSetSelectorBase):
             num_kv_heads=num_kv_heads,
             width=width,
             keep_count=keep_count,
-            prompt_len=prompt_len,
+            selection_rows_per_request=selection_rows,
+            prompt_offsets_buffer=prompt_offsets_buffer,
             dtype=dtype,
             device=device,
             max_requests=max_requests,
@@ -703,11 +763,7 @@ class _BatchedPerHeadKeepSetSelector(_BatchedKeepSetSelectorBase):
         self.num_layers = len(self.dense_layers)
         self.query_group_size = self.num_query_heads // self.num_kv_heads
         self.rows = self.num_layers * self.num_query_heads
-        self.selection_rows = (
-            self.num_kv_heads
-            if eviction_mode == "per_head"
-            else self.num_layers * self.num_kv_heads
-        )
+        self.selection_rows = selection_rows
 
         score_shape = (self.max_requests, self.num_layers, self.num_query_heads, self.width)
         grouped_shape = (self.max_requests, self.num_layers, self.num_kv_heads, self.width)
@@ -734,8 +790,10 @@ class _BatchedPerHeadKeepSetSelector(_BatchedKeepSetSelectorBase):
         )
         selection_shape = (self.max_requests, self.selection_rows, self.keep_count)
         self.top_indices_i32 = torch.empty(selection_shape, dtype=torch.int32, device=self.device)
+        # Kept decode ordinals only: rows are prompt-length independent, so
+        # one selector serves cohorts with mixed prompt lengths.
         self.keep = torch.empty(
-            (self.max_requests, self.selection_rows, self.total_keep),
+            (self.max_requests, self.selection_rows, self.keep_count),
             dtype=torch.int32,
             device=self.device,
         )
@@ -744,14 +802,13 @@ class _BatchedPerHeadKeepSetSelector(_BatchedKeepSetSelectorBase):
         )
         self.row_seq_lens_flat = self.row_seq_lens.view(-1)
         self.top_indices_i32_flat = self.top_indices_i32.view(-1, self.keep_count)
-        self.keep_flat = self.keep.view(-1, self.total_keep)
+        self.keep_flat = self.keep.view(-1, self.keep_count)
         self._build_prepared_selection_launchers(
             self.selection_scores_flat,
             self.row_seq_lens_flat,
             self.top_indices_i32_flat,
             self.keep_flat,
         )
-        self._prefill_prompt_ordinals(self.keep)
 
     def _select_input_scores(
         self,
@@ -788,10 +845,10 @@ class _BatchedPerHeadKeepSetSelector(_BatchedKeepSetSelectorBase):
         _deterministic_topk_indices_into(
             self.selection_scores_flat,
             self.row_seq_lens_flat,
+            self.row_prompt_offsets,
             self.top_indices_i32_flat,
             self.keep_flat,
             self.keep_count,
-            self.prompt_len,
             self.prepared_topk,
             self.prepared_finalizer,
         )
@@ -928,7 +985,7 @@ class _FixedScoreStagingBuffers:
         omega: torch.Tensor,
         page_table_keys: Optional[List[object]] = None,
         num_page_table_slots: Optional[int] = None,
-        prompt_len: int = 0,
+        min_prompt_len: int = 0,
         page_table_token_capacity: Optional[int] = None,
         draft_layer_pools: Optional[List[torch.Tensor]] = None,
         draft_page_representatives: Optional[List[int]] = None,
@@ -958,9 +1015,11 @@ class _FixedScoreStagingBuffers:
         if page_table_token_capacity < seq_len:
             raise ValueError("page-table capacity cannot be smaller than the score bucket")
         self.page_table_token_capacity = int(page_table_token_capacity)
-        if prompt_len < 0 or prompt_len > seq_len:
+        # The smallest cohort prompt only sizes the widest decode window;
+        # per-request prompt lengths are staged runtime metadata.
+        if min_prompt_len < 0 or min_prompt_len > seq_len:
             raise ValueError("fixed score metadata prompt length is outside its bucket")
-        self.prompt_len = prompt_len
+        self.min_prompt_len = min_prompt_len
         q_real = q_real.to(device=self.device, dtype=torch.float32).contiguous()
         q_imag = q_imag.to(device=self.device, dtype=torch.float32).contiguous()
         mlr_coef = mlr_coef.to(device=self.device, dtype=torch.float32).contiguous()
@@ -997,7 +1056,7 @@ class _FixedScoreStagingBuffers:
             self.copy_block_count,
         )
         self.request_metadata_host = torch.empty(
-            (2, max_requests),
+            (3, max_requests),
             dtype=torch.int32,
             device="cpu",
             pin_memory=prefer_pinned(),
@@ -1079,10 +1138,13 @@ class _FixedScoreStagingBuffers:
                 device=self.device,
             )
         self.request_metadata_device = torch.empty(
-            (2, max_requests), dtype=torch.int32, device=self.device
+            (3, max_requests), dtype=torch.int32, device=self.device
         )
         self.round_starts_device = self.request_metadata_device[0]
         self.valid_seq_lens_device = self.request_metadata_device[1]
+        # Per-request pinned prompt lengths: the score kernel starts each
+        # request's decode window here, so one bucket may mix prompt lengths.
+        self.token_starts_device = self.request_metadata_device[2]
         self.mean_cos = torch.empty(
             (max_requests, num_freqs), dtype=torch.float32, device=self.device
         )
@@ -1109,7 +1171,7 @@ class _FixedScoreStagingBuffers:
             freq_scale_sq,
             omega,
             offsets,
-            prompt_len=prompt_len,
+            min_prompt_len=min_prompt_len,
         )
         self.copy_done = torch.cuda.Event()
         # First record publishes constructor allocations to the V2 copy stream;
@@ -1160,6 +1222,7 @@ class _FixedScoreStagingBuffers:
             self.valid_seq_lens_device,
             valid_widths,
             self.round_starts_device,
+            self.token_starts_device,
             *group.pointer_middle,
             self.mean_cos.view(-1),
             self.mean_sin.view(-1),
@@ -1173,7 +1236,6 @@ class _FixedScoreStagingBuffers:
         )
         score_constants = (
             score_aggregation == "max",
-            group.prompt_len,
             group.token_block,
             frequency_block,
         )
@@ -1206,9 +1268,8 @@ class _FixedScoreStagingBuffers:
                 *score_pointer_args,
                 *score_geometry,
                 USE_MAX=score_constants[0],
-                TOKEN_START=score_constants[1],
-                T_BLOCK=score_constants[2],
-                F_BLOCK=score_constants[3],
+                T_BLOCK=score_constants[1],
+                F_BLOCK=score_constants[2],
                 grid=score_grid,
             )
             self._score_runner = compiled[score_grid]
@@ -1235,22 +1296,33 @@ class _FixedScoreStagingBuffers:
         manager: KVCacheManagerV2,
         request_ids: List[int],
         round_starts: List[int],
+        token_starts: List[int],
         seq_lens: Optional[List[int]] = None,
         page_table_seq_lens: Optional[List[int]] = None,
         draft_manager: Optional[KVCacheManagerV2] = None,
     ) -> bool:
-        """Copy one eager eviction cohort into reusable device buffers."""
+        """Copy one eager eviction cohort into reusable device buffers.
+
+        ``token_starts`` carries each request's pinned prompt length; the
+        score kernel starts that request's decode window there, so the cohort
+        may mix prompt lengths.
+        """
         request_count = len(request_ids)
         if (
             request_count == 0
             or request_count > self.max_requests
             or len(round_starts) != request_count
+            or len(token_starts) != request_count
             or any(
                 round_start != round_start
                 or round_start < 0
                 or round_start > _INT32_MAX
                 or round_start != int(round_start)
                 for round_start in round_starts
+            )
+            or any(
+                token_start < 0 or token_start > _INT32_MAX or token_start != int(token_start)
+                for token_start in token_starts
             )
         ):
             return False
@@ -1284,7 +1356,9 @@ class _FixedScoreStagingBuffers:
         if manager.enable_swa_scratch_reuse:
             raise RuntimeError("TriAttention does not support V2 SWA scratch page-table remapping")
         try:
-            request_metadata = torch.as_tensor((round_starts, seq_lens), dtype=torch.int32)
+            request_metadata = torch.as_tensor(
+                (round_starts, seq_lens, token_starts), dtype=torch.int32
+            )
         except (OverflowError, RuntimeError, TypeError, ValueError):
             return False
         if not self._stage_page_tables_bulk(
@@ -1415,6 +1489,7 @@ class _PreparedEviction:
     request_id: int
     seq_len: int
     round_start: int
+    prompt_len: int
     expected_keep_count: int
     protected_tail: int
 
@@ -1779,7 +1854,7 @@ class TriAttention(BaseKVCacheCompressionManager):
         if not resolved_requests or not self._calibrated:
             return
         protected_tails: Dict[int, int] = {}
-        eviction_groups = {}
+        due_requests = []
 
         # Resolve every active target cache before changing cadence state. The
         # captured cache objects also avoid repeating the V2 map lookup here.
@@ -1812,8 +1887,7 @@ class TriAttention(BaseKVCacheCompressionManager):
             request_state.generation_steps = step
             if previous_step // self.beta >= step // self.beta:
                 continue
-            keep_count = self._minimum_evictable_length(request, seq_len)
-            if seq_len <= keep_count:
+            if seq_len <= self._minimum_evictable_length(request, seq_len):
                 continue
             if self.draft_kv_cache_manager is not None:
                 draft_kv_cache = self.draft_kv_cache_manager.kv_cache_map.get(request_id)
@@ -1824,27 +1898,26 @@ class TriAttention(BaseKVCacheCompressionManager):
                         "be resumed before the final update hook"
                     )
             protected_tails[request_id] = protected_tail
-            prompt_len = min(int(request.py_prompt_len), seq_len)
-            key = (prompt_len, keep_count)
-            eviction_groups.setdefault(key, []).append((request, request_id))
+            due_requests.append((request, request_id))
 
         # (2) Compact all affected dense and kernel-masked SWA layers, then release
         # the unreachable tail directly through V2's public resize primitive.
-        if not eviction_groups:
+        # Prompt lengths are per-request metadata, so the whole due cohort runs
+        # as one batched round (chunked only by the staging memory bound).
+        if not due_requests:
             return
         num_layers = self._num_layers_from_manager()
 
-        for group in eviction_groups.values():
-            for begin in range(0, len(group), _EAGER_REQUEST_CHUNK_SIZE):
-                chunk = group[begin : begin + _EAGER_REQUEST_CHUNK_SIZE]
-                chunk_tails = {rid: protected_tails[rid] for _, rid in chunk}
-                with nvtx_range_debug("triattention.evict_request_group", color="purple"):
-                    capacity_targets = self._evict_requests(
-                        chunk,
-                        num_layers,
-                        protected_tail_lengths=chunk_tails,
-                    )
-                self._resize_compacted_requests(capacity_targets, protected_tails)
+        for begin in range(0, len(due_requests), _EAGER_REQUEST_CHUNK_SIZE):
+            chunk = due_requests[begin : begin + _EAGER_REQUEST_CHUNK_SIZE]
+            chunk_tails = {rid: protected_tails[rid] for _, rid in chunk}
+            with nvtx_range_debug("triattention.evict_request_group", color="purple"):
+                capacity_targets = self._evict_requests(
+                    chunk,
+                    num_layers,
+                    protected_tail_lengths=chunk_tails,
+                )
+            self._resize_compacted_requests(capacity_targets, protected_tails)
 
     def _resize_compacted_requests(self, capacity_targets, protected_tails) -> None:
         if not capacity_targets:
@@ -1943,6 +2016,7 @@ class TriAttention(BaseKVCacheCompressionManager):
         *,
         input_scores: Optional[torch.Tensor] = None,
         normalize_scores: bool = True,
+        prompt_offsets_buffer: Optional[torch.Tensor] = None,
     ) -> Union[_BatchedUnionKeepSetSelector, _BatchedPerHeadKeepSetSelector]:
         """Allocate one fixed ``[request, ...]`` keep-set selector."""
         if plan.eviction_mode == "union":
@@ -1950,7 +2024,6 @@ class TriAttention(BaseKVCacheCompressionManager):
                 plan.rows,
                 plan.width,
                 plan.keep_count,
-                plan.prompt_len,
                 dtype=plan.dtype,
                 device=plan.device,
                 max_requests=plan.max_requests,
@@ -1959,6 +2032,7 @@ class TriAttention(BaseKVCacheCompressionManager):
                 num_kv_heads=plan.num_kv_heads,
                 input_scores=input_scores,
                 normalize_scores=normalize_scores,
+                prompt_offsets_buffer=prompt_offsets_buffer,
             )
         return _BatchedPerHeadKeepSetSelector(
             eviction_mode=plan.eviction_mode,
@@ -1967,10 +2041,10 @@ class TriAttention(BaseKVCacheCompressionManager):
             num_kv_heads=plan.num_kv_heads,
             width=plan.width,
             keep_count=plan.keep_count,
-            prompt_len=plan.prompt_len,
             dtype=plan.dtype,
             device=plan.device,
             max_requests=plan.max_requests,
+            prompt_offsets_buffer=prompt_offsets_buffer,
         )
 
     def on_request_finish(self, request: "LlmRequest", **kwargs) -> None:
@@ -2298,10 +2372,9 @@ class TriAttention(BaseKVCacheCompressionManager):
         """Build or reuse eager score and selection buffers for one cohort."""
         if not prepared:
             raise ValueError("TriAttention eviction requires at least one request")
-        prompt_lens = {min(int(item.request.py_prompt_len), item.seq_len) for item in prepared}
-        if len(prompt_lens) != 1:
-            raise ValueError("TriAttention batches require one common prompt length")
-        prompt_len = next(iter(prompt_lens))
+        # Prompt lengths are per-request runtime metadata; the smallest one
+        # only sizes the widest decode window of the shared buffers.
+        min_prompt_len = min(item.prompt_len for item in prepared)
         seq_len = max(item.seq_len for item in prepared)
         page_table_token_capacity = max(item.seq_len + item.protected_tail for item in prepared)
         request_count = len(prepared)
@@ -2333,7 +2406,7 @@ class TriAttention(BaseKVCacheCompressionManager):
             self.eviction_mode,
             request_count,
             seq_len,
-            prompt_len,
+            min_prompt_len,
             page_table_token_capacity,
             self.top_B,
             tuple(layout.dense_layers),
@@ -2368,7 +2441,7 @@ class TriAttention(BaseKVCacheCompressionManager):
             omega=self.calibration["omega"],
             page_table_keys=self._page_table_pool_keys(representatives, layout.global_layers),
             num_page_table_slots=layout.manager.num_pools,
-            prompt_len=prompt_len,
+            min_prompt_len=min_prompt_len,
             page_table_token_capacity=page_table_token_capacity,
             **draft_kwargs,
         )
@@ -2379,9 +2452,8 @@ class TriAttention(BaseKVCacheCompressionManager):
                 num_query_heads=int(self._H),
                 num_kv_heads=int(first_pool.shape[2]),
                 rows=len(layout.dense_layers) * int(self._H),
-                width=seq_len - prompt_len,
+                width=seq_len - min_prompt_len,
                 keep_count=self.top_B,
-                prompt_len=prompt_len,
                 dtype=torch.float32,
                 device=first_pool.device,
                 max_requests=request_count,
@@ -2389,9 +2461,10 @@ class TriAttention(BaseKVCacheCompressionManager):
             input_scores=score_staging.fused_group.output.view(
                 request_count,
                 len(layout.dense_layers) * int(self._H),
-                seq_len - prompt_len,
+                seq_len - min_prompt_len,
             ),
             normalize_scores=self.normalize_scores,
+            prompt_offsets_buffer=score_staging.token_starts_device,
         )
         score_staging.bind_score_launcher(
             keep_set_selector.valid_widths,
@@ -2436,6 +2509,16 @@ class TriAttention(BaseKVCacheCompressionManager):
                 draft_kv_block_offsets=score_staging.draft_block_offsets_device,
                 draft_page_table_slots=score_staging.draft_representative_slots,
             )
+        if layout.swa_layers and layout.swa_window:
+            # SWA landing positions are prompt-dependent; reject a request
+            # whose retained span cannot cover the model window this round.
+            for item in prepared:
+                if item.prompt_len + self.top_B < int(layout.swa_window):
+                    raise ValueError(
+                        f"Request {item.request_id} retains "
+                        f"{item.prompt_len + self.top_B} tokens, below the "
+                        f"sliding window {layout.swa_window}"
+                    )
         key = (
             id(score_staging),
             id(keep_set_selector),
@@ -2458,7 +2541,7 @@ class TriAttention(BaseKVCacheCompressionManager):
                 kv_block_offsets=score_staging.block_offsets_device,
                 page_table_slots=score_staging.representative_slots,
                 request_count=len(prepared),
-                prompt_len=keep_set_selector.prompt_len,
+                prompt_offsets=score_staging.token_starts_device[: len(prepared)],
                 decode_keep_count=self.top_B,
                 swa_window=layout.swa_window,
                 protected_tail_lengths=list(protected_tail_lengths),
@@ -2512,6 +2595,7 @@ class TriAttention(BaseKVCacheCompressionManager):
                 self.kv_cache_manager,
                 [item.request_id for item in prepared],
                 [item.round_start for item in prepared],
+                [item.prompt_len for item in prepared],
                 [item.seq_len for item in prepared],
                 [item.seq_len + item.protected_tail for item in prepared],
                 draft_manager=self.draft_kv_cache_manager,
@@ -2567,6 +2651,7 @@ class TriAttention(BaseKVCacheCompressionManager):
                         request_id=rid,
                         seq_len=int(seq_len),
                         round_start=int(round_start),
+                        prompt_len=min(int(request.py_prompt_len), int(seq_len)),
                         expected_keep_count=expected_keep_count,
                         protected_tail=protected_tail,
                     )
@@ -2585,6 +2670,9 @@ class TriAttention(BaseKVCacheCompressionManager):
             )
         with nvtx_range_debug("triattention.page_table_stage", color="orange"):
             self._attach_page_ids(prepared, score_staging)
+            # The staged per-request prompt lengths are shared with the
+            # selector; per-head modes re-expand them to selection rows here.
+            keep_set_selector.refresh_row_prompt_offsets()
 
         try:
             with nvtx_range("triattention.score", color="blue"):
