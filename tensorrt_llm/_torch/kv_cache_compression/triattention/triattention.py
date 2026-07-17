@@ -719,6 +719,16 @@ class _FixedScoreStagingBuffers:
 
         if self._score_aggregation is None:
             raise RuntimeError("TriAttention score launcher is not bound")
+        stream = torch.cuda.current_stream(self.device)
+        if self.stream is None:
+            self.stream = stream
+        elif (stream.device, stream.cuda_stream) != (
+            self.stream.device,
+            self.stream.cuda_stream,
+        ):
+            raise _FixedScoreStreamMismatch(
+                "TriAttention score launches must stay on the staging CUDA stream"
+            )
         if self._score_aggregation == "mean":
             prepare_mean_phase(
                 self.round_starts_device,
