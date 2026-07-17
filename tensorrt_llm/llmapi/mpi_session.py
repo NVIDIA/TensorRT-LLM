@@ -125,10 +125,12 @@ class MpiSession(abc.ABC):
         try:
             fut.result(timeout=timeout)
         except TimeoutError:
-            logger.critical("MpiSession shutdown timeout, aborting...")
+            logger.critical(f"MpiSession shutdown timeout after {timeout}s; "
+                            "calling MPI_Abort to force-kill stuck ranks...")
             if reason is not None:
-                logger.info(f"Reason to shutdown: {repr(reason)}")
+                logger.info(f"Reason to shutdown: {reason!r}")
             self.abort()
+            logger.critical("MpiSession MPI_Abort returned")
 
     def shutdown_abort(self, grace: float = 60, reason=None):
         if sys.is_finalizing():
@@ -136,6 +138,9 @@ class MpiSession(abc.ABC):
             # simply don't wait to avoid hang
             return self.shutdown(wait=False)
 
+        logger.info(
+            f"MpiSession.shutdown_abort: waiting up to {grace}s for workers to exit"
+        )
         fut = Future()
         killer = threading.Thread(group=None,
                                   target=self._abort_on_timeout,
@@ -143,6 +148,7 @@ class MpiSession(abc.ABC):
                                   args=(fut, grace, reason))
         killer.start()
         self.shutdown()
+        logger.info("MpiSession.shutdown_abort: workers exited cleanly")
         fut.set_result(None)
         killer.join()
 
@@ -175,7 +181,11 @@ class MpiPoolSession(MpiSession):
 
     def shutdown(self, wait=True):
         if self.mpi_pool is not None:
+            logger.info(
+                f"MpiPoolSession.shutdown: joining {self.n_workers} worker(s) "
+                f"(wait={wait})")
             self.mpi_pool.shutdown(wait=wait)
+            logger.info("MpiPoolSession.shutdown: done")
             self.mpi_pool = None
 
     def abort(self):
@@ -258,7 +268,11 @@ class MpiCommSession(MpiSession):
         # Only shutdown the mpi_pool if this instance created it
         # For shared global mpi_pool, we don't shut it down
         if self.mpi_pool is not None and self.owns_mpi_pool:
+            logger.info(
+                f"MpiCommSession.shutdown: joining {self.n_workers - 1} worker(s) "
+                f"(wait={wait})")
             self.mpi_pool.shutdown(wait=wait)
+            logger.info("MpiCommSession.shutdown: mpi_pool done")
         self.mpi_pool = None
         if self.thread_pool is not None:
             self.thread_pool.shutdown(wait=wait)
