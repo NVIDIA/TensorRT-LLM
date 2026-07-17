@@ -1502,6 +1502,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                     }
                     if (GEN_POST_MERGE_BUILDS_ONLY) {
                         echo "Skipping OSS Compliance Check (GenPostMergeBuilds mode: builds only)"
+                        jUtils.markStageSkippedForConditional(STAGE_NAME)
                         return
                     }
                     def ref = env.gitlabBranch ?: "main"
