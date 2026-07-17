@@ -778,6 +778,7 @@ class SpecMetadata:
         top_k_enabled = False
         top_p_enabled = False
         has_non_greedy_requests = False
+        has_greedy_requests = False
         per_request_slot_ids: list[int] = []
 
         for request in requests:
@@ -807,6 +808,7 @@ class SpecMetadata:
             top_k_enabled |= use_top_k
             top_p_enabled |= use_top_p
             has_non_greedy_requests |= not is_greedy
+            has_greedy_requests |= is_greedy
 
             per_request_normalized.append(
                 (temp_val, tk_val, tp_val, num_tokens))
@@ -827,6 +829,8 @@ class SpecMetadata:
         # greediness, not from the skip_* filter flags (a non-greedy request may
         # enable no filter, e.g. temperature=1.0 with top_k/top_p unset).
         self.is_all_greedy_sample = not has_non_greedy_requests
+        # Whether any request is greedy (used by the non-FULL mixed-batch guard below).
+        self.has_greedy_requests = has_greedy_requests
 
         # Warmup-time override: force the advanced-sampling path so the CUDA
         # graph for the (is_all_greedy_sample=False) key gets captured. Dummy
@@ -851,19 +855,16 @@ class SpecMetadata:
         if self.group_all_greedy_sample is not None:
             self.is_all_greedy_sample = self.group_all_greedy_sample
 
-        # no_topk specialization has no greedy-argmax override: a greedy request
-        # (temp <= GREEDY_TEMPERATURE_THRESHOLD) in a *mixed* batch (advanced graph,
-        # is_all_greedy_sample=False) would be sampled instead of returning argmax. All-greedy
-        # batches take the argmax greedy graph and are safe; warmup dummies are exempted above
-        # (has_greedy_requests reset under the capture override).
-        if (self.advanced_sampling_mode == "no_topk"
+        # Non-FULL modes have no greedy-argmax override, so a greedy request in a mixed batch
+        # would be sampled instead of argmax'd. All-greedy batches use the greedy graph; warmup
+        # dummies are exempted above.
+        if (self.advanced_sampling_mode != "full"
                 and not self.is_all_greedy_sample and self.has_greedy_requests):
             raise ValueError(
-                "advanced_sampling_mode=no_topk requires every request to use temperature > "
-                f"GREEDY_TEMPERATURE_THRESHOLD ({GREEDY_TEMPERATURE_THRESHOLD}); a greedy "
-                "request was found in a mixed sampling batch. no_topk has no greedy-argmax "
-                "override, so greedy rows would be sampled instead of returning argmax. Use "
-                "advanced_sampling_mode=full for batches that mix greedy and non-greedy requests."
+                f"advanced_sampling_mode={self.advanced_sampling_mode} requires temperature > "
+                f"GREEDY_TEMPERATURE_THRESHOLD ({GREEDY_TEMPERATURE_THRESHOLD}) for every "
+                "request; a greedy request was found in a mixed batch. Use "
+                "advanced_sampling_mode=full for mixed greedy + sampling batches."
             )
 
         return per_request_normalized, per_request_slot_ids
@@ -1538,7 +1539,9 @@ class SpecWorkerBase(nn.Module, ABC):
                     top_ks,
                     top_ps,
                     seed=self.seed,
-                    offset=self.offset))
+                    offset=self.offset,
+                    advanced_sampling_mode=spec_metadata.advanced_sampling_mode)
+            )
             # Scatter probs into the slot-indexed buffer so each request's data
             # lands at its stable py_seq_slot row regardless of batch shifts.
             assert spec_metadata.batch_slot_ids is not None, (
@@ -1709,7 +1712,11 @@ class SpecWorkerBase(nn.Module, ABC):
                       spec_metadata.top_ps[gen_start:gen_end])
 
             target_probs_flat = compute_probs_from_logits(
-                gen_logits, temperatures, top_ks, top_ps)
+                gen_logits,
+                temperatures,
+                top_ks,
+                top_ps,
+                advanced_sampling_mode=spec_metadata.advanced_sampling_mode)
             target_probs = target_probs_flat.reshape(num_gens,
                                                      runtime_draft_len + 1,
                                                      vocab_size)
@@ -1945,7 +1952,9 @@ class SpecWorkerBase(nn.Module, ABC):
                     top_ks,
                     top_ps,
                     seed=self.seed,
-                    offset=self.offset))
+                    offset=self.offset,
+                    advanced_sampling_mode=spec_metadata.advanced_sampling_mode)
+            )
             # Scatter the K prob rows per gen request into its stable slot row.
             if spec_metadata.draft_probs is not None:
                 assert spec_metadata.batch_slot_ids is not None, (

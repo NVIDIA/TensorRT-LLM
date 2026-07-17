@@ -2480,14 +2480,20 @@ class AdvancedSamplingMode(StrEnum):
     """Deploy-time specialization of the MTP one-model advanced sampler.
 
     FULL    - per-row tensor top_k/top_p (original; mixed per-request sampling).
-    NO_TOPK - top_k disabled, top_p honored -> softmax + top_p_sampling_from_probs. Produces
-              the same tokens as FULL but skips the (no-op) top_k mask kernel. Requires every
-              request to use temperature > GREEDY_TEMPERATURE_THRESHOLD.
-    Selects which sampler the (single) advanced CUDA graph captures; it is NOT part of
-    the graph key, so it adds no extra graphs.
+    NO_TOPK - top_k disabled, top_p honored. Skips the top_k mask kernel; matches FULL.
+    NO_TOPP - top_p disabled, top_k honored. Skips the top_p renorm kernel (rejection
+              compute_probs path only). ONLY valid with use_rejection_sampling=True.
+    NO_TOPK_NO_TOPP - both top_k and top_p disabled -> pure temperature sampling (softmax only
+              in compute_probs); skips both the top_k mask and top_p renorm kernels. ONLY valid
+              with use_rejection_sampling=True.
+    All non-FULL modes assume a fixed deploy config: every request must use
+    temperature > GREEDY_TEMPERATURE_THRESHOLD (no greedy). Selects which sampler the (single)
+    advanced CUDA graph captures; NOT part of the graph key, so it adds no extra graphs.
     """
     FULL = "full"
     NO_TOPK = "no_topk"
+    NO_TOPP = "no_topp"
+    NO_TOPK_NO_TOPP = "no_topk_no_topp"
 
 
 class MTPDecodingConfig(DecodingBaseConfig):
@@ -2564,24 +2570,31 @@ class MTPDecodingConfig(DecodingBaseConfig):
     advanced_sampling_mode: AdvancedSamplingMode = Field(
         default=AdvancedSamplingMode.FULL,
         description=
-        "Specialize the one-model advanced sampler for a fixed deployment sampling config. "
-        "FULL (default): original per-row tensor top_k/top_p. NO_TOPK: skip top_k, honor top_p "
-        "(softmax + top_p_sampling_from_probs), matching FULL bit-for-bit while dropping the "
-        "no-op top_k mask kernel; requires all requests to use temperature > "
-        "GREEDY_TEMPERATURE_THRESHOLD. No effect on greedy batches.")
+        "Specialize the one-model advanced sampler for a fixed deploy config by skipping "
+        "disabled filter kernels (outputs match FULL bit-for-bit). FULL (default): per-row "
+        "top_k/top_p. NO_TOPK: skip top_k. NO_TOPP: skip top_p. NO_TOPK_NO_TOPP: skip both. "
+        "NO_TOPP/NO_TOPK_NO_TOPP require use_rejection_sampling=True; all non-FULL modes require "
+        "temperature > GREEDY_TEMPERATURE_THRESHOLD (no greedy).")
 
     @model_validator(mode="after")
     def _log_advanced_sampling_mode(self):
         """Startup log/guard for the deploy-time advanced sampler specialization."""
-        if self.advanced_sampling_mode == AdvancedSamplingMode.NO_TOPK:
+        if self.advanced_sampling_mode != AdvancedSamplingMode.FULL:
             from tensorrt_llm._torch.pyexecutor.sampler.sampling_utils import \
                 GREEDY_TEMPERATURE_THRESHOLD
             logger.warning(
-                "MTP advanced_sampling_mode=NO_TOPK: top_k is disabled for every request "
-                "(top_p is still honored). All requests MUST use temperature > "
-                f"{GREEDY_TEMPERATURE_THRESHOLD} (GREEDY_TEMPERATURE_THRESHOLD); a greedy "
-                "request in a mixed batch is rejected at runtime, since NO_TOPK has no argmax "
-                "override. Use FULL if you need greedy + sampling in the same batch."
+                f"MTP advanced_sampling_mode={self.advanced_sampling_mode.name}: assumes a "
+                "fixed deploy config; every request must use temperature > "
+                f"{GREEDY_TEMPERATURE_THRESHOLD} (no greedy). Use FULL for mixed batches."
+            )
+        if (self.advanced_sampling_mode
+                in (AdvancedSamplingMode.NO_TOPP,
+                    AdvancedSamplingMode.NO_TOPK_NO_TOPP)
+                and not self.use_rejection_sampling):
+            raise ValueError(
+                f"advanced_sampling_mode={self.advanced_sampling_mode.name} disables top_p, "
+                "which requires use_rejection_sampling=True (only the rejection path applies "
+                "top_p via a separable, skippable renorm kernel). Use NO_TOPK to keep top_p."
             )
         return self
 
@@ -5351,6 +5364,21 @@ class TorchLlmArgs(BaseLlmArgs):
                 eagle_data = self.speculative_config.model_dump(
                     exclude={"decoding_type"})
                 self.speculative_config = Eagle3DecodingConfig(**eagle_data)
+
+            # advanced_sampling_mode is only propagated by the MTP-Eagle one-model
+            # path (get_spec_metadata); every other resolved spec-dec mode keeps
+            # metadata mode "full" and would silently ignore the setting, so reject
+            # non-FULL there instead.
+            adv_mode = getattr(self.speculative_config,
+                               "advanced_sampling_mode", None)
+            if (adv_mode is not None and adv_mode != AdvancedSamplingMode.FULL
+                    and not self.speculative_config.spec_dec_mode.
+                    is_mtp_eagle_one_model()):
+                raise ValueError(
+                    f"advanced_sampling_mode={adv_mode.name} is only supported by "
+                    "MTP-Eagle one-model (mtp_eagle_one_model=True); the resolved "
+                    f"spec-decoding mode {self.speculative_config.spec_dec_mode.name} "
+                    "would ignore it. Use advanced_sampling_mode=FULL.")
 
             if self.speculative_config.use_rejection_sampling:
                 # Supported paths: Eagle3 one-model, MTP-Eagle one-model,
