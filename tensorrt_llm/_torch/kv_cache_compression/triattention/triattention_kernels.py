@@ -568,67 +568,6 @@ def _finalize_topk_indices_kernel(
         ties_seen += tl.sum(tied_i32)
 
 
-def finalize_topk_indices(
-    scores: torch.Tensor,
-    seq_lens: torch.Tensor,
-    prompt_offsets: torch.Tensor,
-    provisional_indices: torch.Tensor,
-    output_indices: torch.Tensor,
-    keep_count: int,
-) -> None:
-    """Finalize one provisional TopK set without changing the CuTE selector.
-
-    The kernel derives the provisional set's threshold, keeps all strictly
-    better scores, resolves the remaining boundary ties by lower token index,
-    and writes increasing physical ordinals (decode index + this row's prompt
-    offset) directly into ``output_indices``.
-    """
-    keep_count = int(keep_count)
-    if not scores.is_cuda:
-        raise ValueError("deterministic TopK finalization requires CUDA scores")
-    if scores.ndim != 2 or scores.dtype != torch.float32 or not scores.is_contiguous():
-        raise ValueError("TopK finalization requires contiguous two-dimensional FP32 scores")
-    rows, width = scores.shape
-    if rows <= 0 or not 1 <= keep_count <= width:
-        raise ValueError("TopK finalization requires valid rows and keep count")
-    for name, tensor in (("sequence lengths", seq_lens), ("prompt offsets", prompt_offsets)):
-        if (
-            tensor.shape != (rows,)
-            or tensor.dtype != torch.int32
-            or tensor.device != scores.device
-            or not tensor.is_contiguous()
-        ):
-            raise ValueError(f"TopK finalization {name} do not match the score rows")
-    if (
-        provisional_indices.shape != (rows, keep_count)
-        or provisional_indices.dtype != torch.int32
-        or provisional_indices.device != scores.device
-        or not provisional_indices.is_contiguous()
-    ):
-        raise ValueError("provisional TopK indices do not match the requested selection")
-    if (
-        output_indices.ndim != 2
-        or output_indices.shape[0] != rows
-        or output_indices.shape[1] < keep_count
-        or output_indices.dtype != torch.int32
-        or output_indices.device != scores.device
-        or not output_indices.is_contiguous()
-    ):
-        raise ValueError("TopK output does not fit the requested physical indices")
-    _finalize_topk_indices_kernel[(rows,)](
-        scores,
-        seq_lens,
-        prompt_offsets,
-        provisional_indices,
-        output_indices,
-        WIDTH=width,
-        KEEP_COUNT=keep_count,
-        OUTPUT_WIDTH=output_indices.shape[1],
-        BLOCK=256,
-        num_warps=4,
-    )
-
-
 @triton.jit
 def _tri_score_perhead_kernel(
     pool_anchor_ptr,  # typed pool pointer; used ONLY to infer the element type
