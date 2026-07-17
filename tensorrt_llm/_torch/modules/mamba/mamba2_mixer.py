@@ -24,8 +24,6 @@ from torch import nn
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
 from tensorrt_llm._torch.modules.multi_stream_utils import \
     maybe_execute_in_parallel
-from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import \
-    use_cpp_mamba_cache_manager
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
@@ -161,7 +159,9 @@ class Mamba2Mixer(nn.Module):
         # TODO: Update head_dims once flashinfer is updated.
         # Nemotron-v2-Nano (mamba_head_dim=80) is not supported by flashinfer yet.
         supported_head_dims = [64, 128]
-        supported_head_group_ratios = [1, 8, 16]
+        # flashinfer supports some head group ratios:
+        # https://github.com/flashinfer-ai/flashinfer/blob/v0.6.14/include/flashinfer/mamba/kernel_selective_state_update_stp.cuh#L1338
+        supported_head_group_ratios = [1, 2, 4, 8, 16, 32, 64]
         supported_d_states = [64, 128, 256]
         head_group_ratio = (self.tp_nheads //
                             self.tp_ngroups if self.tp_ngroups > 0 else 0)
@@ -250,8 +250,8 @@ class Mamba2Mixer(nn.Module):
         self.aux_steram = torch.cuda.Stream()
         self.events = [torch.cuda.Event(), torch.cuda.Event()]
 
-    def post_load_weights(self):
-        """Post-process after loading weights."""
+    def cache_derived_state(self) -> None:
+        """Recompute state derived from loaded weights."""
         if (self.norm.is_nvfp4 and fused_gated_rmsnorm_quant_shape_ok(
                 self.norm.hidden_size, self.norm.group_size)
                 and self.norm.nvfp4_scale is None):
@@ -273,6 +273,9 @@ class Mamba2Mixer(nn.Module):
             self._A_expanded.copy_(a_exp)
             self._dt_bias_expanded.copy_(dt_exp)
             self._D_expanded.copy_(d_exp)
+
+    def post_load_weights(self) -> None:
+        self.cache_derived_state()
 
     def _try_attach_nvfp4_scale(self):
         """Attach input_scale from out_proj to norm for fused RMSNorm+Quant."""
@@ -303,17 +306,10 @@ class Mamba2Mixer(nn.Module):
 
         state_indices = mamba_metadata.state_indices[:num_prefills +
                                                      num_decodes]
-        if use_cpp_mamba_cache_manager():
-            conv_states = attn_metadata.kv_cache_manager.get_conv_states(
-                self.layer_idx)
-            ssm_states = attn_metadata.kv_cache_manager.get_ssm_states(
-                self.layer_idx)
-            layer_cache = None  # Not used in C++ path
-        else:
-            layer_cache = attn_metadata.kv_cache_manager.mamba_layer_cache(
-                self.layer_idx)
-            conv_states = layer_cache.conv
-            ssm_states = layer_cache.temporal
+        layer_cache = attn_metadata.kv_cache_manager.mamba_layer_cache(
+            self.layer_idx)
+        conv_states = layer_cache.conv
+        ssm_states = layer_cache.temporal
 
         state_indices_p, state_indices_d = torch.split(state_indices,
                                                        batch_split_size)

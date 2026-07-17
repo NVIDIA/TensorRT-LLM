@@ -6,7 +6,7 @@ import sys
 
 import cloudpickle
 import pytest
-from defs.conftest import get_sm_version, skip_no_hopper
+from defs.conftest import get_sm_version, skip_no_hopper, skip_pre_hopper
 from mpi4py import MPI
 from mpi4py.futures import MPIPoolExecutor
 
@@ -393,6 +393,7 @@ def test_disaggregated_simple_qwen3(model, generation_overlap,
         ])
 
 
+@skip_pre_hopper
 @pytest.mark.parametrize("model", ["DeepSeek-V3-Lite-fp8/fp8"])
 @pytest.mark.parametrize("enable_cuda_graph", [False])
 @pytest.mark.parametrize("generation_overlap", [False])

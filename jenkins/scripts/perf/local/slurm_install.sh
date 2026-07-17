@@ -46,6 +46,8 @@ slurm_install_setup() {
 
         echo "(Installing TensorRT-LLM and requirements) Install mode: ${INSTALL_MODE:-source}"
 
+        retry_command pip install --retries 10 opencv-python-headless
+
         # Support two installation modes: source (default) and wheel
         if [ "${INSTALL_MODE:-source}" = "wheel" ]; then
             # Wheel installation mode

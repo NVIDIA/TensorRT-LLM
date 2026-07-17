@@ -15,7 +15,7 @@
 """Tests for CacheReuseAdapter, _create_kv_slice SWA trim, and Sender token-start derivation."""
 
 from types import SimpleNamespace
-from unittest.mock import MagicMock, Mock
+from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
@@ -269,8 +269,8 @@ class TestTokenRange:
 
 
 # ---------------------------------------------------------------------------
-# _create_kv_slice: default TokenRange spans prompt_len + num_extra_kv_tokens
-# so transferred KV matches what resize_context / _get_context_bytes allocate.
+# _create_kv_slice: default TokenRange spans prompt_len, matching the
+# trimmed block list actually transferred.
 # ---------------------------------------------------------------------------
 
 
@@ -310,15 +310,14 @@ def _build_transceiver_for_kv_slice(num_extra_kv_tokens: int, prompt_len: int):
 
 
 class TestCreateKvSliceTokenRange:
-    """Default TokenRange built by _create_kv_slice must align with KV-cache allocation.
+    """token_range.end must be prompt_len, matching the trimmed block list.
 
-    KV cache allocation in resize_context (V2) and prepare_resources (V1) reserves
-    prompt_len + num_extra_kv_tokens slots whenever speculative decoding (e.g.
-    EAGLE3, MTP) consumes extra KV positions per request. The transferred token
-    range must cover the same span, otherwise the receiver under-receives KV.
+    The sender reconstructs total_blocks from token_range.end (ceil(end / tpb)),
+    so end must stay at prompt_len -- not prompt_len + num_extra_kv_tokens --
+    to match the blocks actually transferred.
     """
 
-    def test_includes_num_extra_kv_tokens(self):
+    def test_excludes_num_extra_kv_tokens(self):
         prompt_len = 17
         num_extra_kv_tokens = 7
         transceiver, req = _build_transceiver_for_kv_slice(num_extra_kv_tokens, prompt_len)
@@ -326,10 +325,25 @@ class TestCreateKvSliceTokenRange:
         kv_slice = transceiver._create_kv_slice(req)
 
         assert kv_slice.token_range is not None
-        assert (kv_slice.token_range.start, kv_slice.token_range.end) == (
-            0,
-            prompt_len + num_extra_kv_tokens,
-        )
+        assert (kv_slice.token_range.start, kv_slice.token_range.end) == (0, prompt_len)
+
+    def test_extra_tokens_do_not_cross_block_boundary(self):
+        # Reconstructed total_blocks (ceil(end / tpb)) must match the blocks sent.
+        prompt_len = 16
+        num_extra_kv_tokens = 7
+        transceiver, req = _build_transceiver_for_kv_slice(num_extra_kv_tokens, prompt_len)
+        tpb = transceiver._reuse_adapter.tokens_per_block
+
+        # Setup must actually exercise a boundary crossing: prompt_len ends on a
+        # block boundary and the extra tokens would otherwise add a block.
+        assert prompt_len % tpb == 0
+        assert (prompt_len + num_extra_kv_tokens + tpb - 1) // tpb == prompt_len // tpb + 1
+
+        kv_slice = transceiver._create_kv_slice(req)
+
+        end = kv_slice.token_range.end
+        transferred_blocks = kv_slice.block_ids_per_layer_groups[0].size
+        assert (end + tpb - 1) // tpb == transferred_blocks
 
     def test_defaults_to_prompt_len_when_no_extra(self):
         prompt_len = 17
@@ -341,17 +355,6 @@ class TestCreateKvSliceTokenRange:
 
         assert kv_slice.token_range is not None
         assert (kv_slice.token_range.start, kv_slice.token_range.end) == (0, prompt_len)
-
-    def test_respects_explicit_token_range(self):
-        prompt_len = 17
-        transceiver, req = _build_transceiver_for_kv_slice(
-            num_extra_kv_tokens=7, prompt_len=prompt_len
-        )
-        explicit = TokenRange(start=0, end=8)
-
-        kv_slice = transceiver._create_kv_slice(req, token_range=explicit)
-
-        assert kv_slice.token_range is explicit
 
 
 # ---------------------------------------------------------------------------
@@ -648,47 +651,6 @@ class TestSenderTokenStarts:
         )
         # total_blocks for slice = 2 → raw start = 16; clamped = max(16, 16) = 16.
         assert (src_start, dst_start) == (16, 16)
-
-
-# ---------------------------------------------------------------------------
-# KvCacheTransceiverV2._trim_kv_to_prompt_history: capability-gated, graceful-degrade. (#14258)
-# ---------------------------------------------------------------------------
-class TestTrimKvToPromptHistory:
-    @staticmethod
-    def _tc(kv_cache_manager):
-        tc = object.__new__(KvCacheTransceiverV2)
-        tc._kv_cache_manager = kv_cache_manager
-        return tc
-
-    def test_noop_without_trim_capability(self):
-        # V1 / non-V2 managers lack trim_to_history -> getattr None -> no raise.
-        tc = self._tc(SimpleNamespace())
-        assert (
-            tc._trim_kv_to_prompt_history(SimpleNamespace(prompt_len=17, py_request_id=1)) is None
-        )
-
-    def test_noop_when_prompt_len_non_positive(self):
-        trim = Mock(return_value=True)
-        tc = self._tc(SimpleNamespace(trim_to_history=trim))
-        for prompt_len in (0, None):
-            tc._trim_kv_to_prompt_history(SimpleNamespace(prompt_len=prompt_len, py_request_id=1))
-        trim.assert_not_called()
-
-    def test_trims_to_prompt_len_on_success(self):
-        trim = Mock(return_value=True)
-        tc = self._tc(SimpleNamespace(trim_to_history=trim))
-        req = SimpleNamespace(prompt_len=17, py_request_id=1)
-        tc._trim_kv_to_prompt_history(req)
-        trim.assert_called_once_with(req, 17)
-
-    def test_swallows_trim_failure(self):
-        # trim returns False (degraded) -> method still returns None and never
-        # raises, so the downstream TRANS_COMPLETE transition is not gated on it.
-        trim = Mock(return_value=False)
-        tc = self._tc(SimpleNamespace(trim_to_history=trim))
-        req = SimpleNamespace(prompt_len=17, py_request_id=1)
-        assert tc._trim_kv_to_prompt_history(req) is None
-        trim.assert_called_once_with(req, 17)
 
 
 # ---------------------------------------------------------------------------

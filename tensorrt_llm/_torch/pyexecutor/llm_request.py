@@ -47,7 +47,7 @@ REQUEST_TYPE_MAPPING = {
 ATTENTION_DP_DUMMY_REQUEST_ID = 0
 
 if TYPE_CHECKING:
-    from .sampling_utils import Strategy
+    from .sampler.sampling_utils import Strategy
 
 
 @dataclass(slots=True)
@@ -736,6 +736,10 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_target_probs = None
         self.py_last_draft_tokens = None
         self.py_num_accepted_draft_tokens = 0
+        # One-model rejection: set per-iteration by _handle_dynamic_draft_len when
+        # this gen request produced 0 real draft tokens, so _prepare_tp_inputs
+        # one-hots its stale draft_probs slot. Consumed (and cleared) there.
+        self.py_needs_onehot_draft_probs = False
         self.py_num_accepted_draft_tokens_indices = []
         self.py_rewind_draft_token_separate_adjustment = 0
         self.py_per_pos_drafted = [0] * MAX_SPEC_DECODE_POSITIONS
@@ -801,6 +805,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_logprobs_mode = LogprobMode(
             logprobs_mode)  # handle passed a raw string
         self.py_disaggregated_params = None
+        self.py_conversation_params = None
 
         self.py_num_connector_matched_tokens = 0
 
@@ -1191,6 +1196,8 @@ def executor_request_to_llm_request(
     llm_request.py_disaggregated_params = getattr(executor_request,
                                                   "py_disaggregated_params",
                                                   None)
+    llm_request.py_conversation_params = getattr(executor_request,
+                                                 "py_conversation_params", None)
     if child_req_ids:
         for child_id in child_req_ids:
             llm_request.create_child_request(child_id)

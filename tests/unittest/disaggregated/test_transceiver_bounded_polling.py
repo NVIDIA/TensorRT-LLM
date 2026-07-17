@@ -98,6 +98,10 @@ def _make_transceiver(
     transceiver._send_sessions = sessions
     transceiver._send_reqs = reqs or {rid: _FakeRequest() for rid in sessions}
     transceiver._sender_future_timeout_ms = 123
+    # Attributes read by check_context_transfer_status before it processes sessions.
+    transceiver._ever_had_send_session = True
+    transceiver._ctx_need_tp_sync = False
+    transceiver._ctx_need_pp_sync = False
     transceiver._transfer_worker = _FakeTransferWorker()
     transceiver._ctx_consensus = lambda local_ids: list(local_ids)
     transceiver._ctx_consensus_outcome = (
@@ -185,7 +189,9 @@ def test_context_transfer_status_zero_budget_processes_task_level_failure() -> N
     assert 13 not in transceiver._send_reqs
 
 
-def test_context_transfer_status_enters_consensus_when_tp_sync_required() -> None:
+def test_context_transfer_status_skips_consensus_when_never_sent() -> None:
+    # A worker that never sends skips the ctx consensus even when TP sync would need it, but still
+    # sweeps so nothing leaks.
     transceiver = object.__new__(KvCacheTransceiverV2)
     transceiver._ever_had_send_session = False
     transceiver._ctx_need_tp_sync = True
@@ -193,17 +199,31 @@ def test_context_transfer_status_enters_consensus_when_tp_sync_required() -> Non
     transceiver._send_sessions = {}
     transceiver._send_reqs = {}
     transceiver._transfer_worker = _FakeTransferWorker()
-    transceiver._ctx_consensus = Mock(return_value=[])
-    transceiver._build_to_process = Mock(return_value=[])
-    transceiver._ctx_consensus_outcome = Mock(return_value=([], [], [], []))
-    transceiver._close_failed_sessions = Mock()
+    transceiver._ctx_consensus = Mock(side_effect=AssertionError("consensus must be skipped"))
 
     completed, failed = transceiver.check_context_transfer_status(at_least_request_num=0)
 
     assert completed == []
     assert failed == []
-    transceiver._ctx_consensus.assert_called_once_with([])
+    transceiver._ctx_consensus.assert_not_called()
     assert transceiver._transfer_worker.sweep_count == 1
+
+
+def test_context_transfer_status_never_sent_no_sync_is_a_noop() -> None:
+    # With no tp/pp sync (e.g. attention_dp), a never-sent worker skips the consensus and the sweep,
+    # unchanged from before -- a true no-op, so the fix can't slow attention_dp workers.
+    transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver._ever_had_send_session = False
+    transceiver._ctx_need_tp_sync = False
+    transceiver._ctx_need_pp_sync = False
+    transceiver._send_sessions = {}
+    transceiver._send_reqs = {}
+    transceiver._transfer_worker = _FakeTransferWorker()
+    transceiver._ctx_consensus = Mock(side_effect=AssertionError("consensus must be skipped"))
+
+    assert transceiver.check_context_transfer_status(at_least_request_num=0) == ([], [])
+    transceiver._ctx_consensus.assert_not_called()
+    assert transceiver._transfer_worker.sweep_count == 0  # matches the original early-out exactly
 
 
 def test_gen_transfer_status_enters_consensus_when_sync_required() -> None:
@@ -223,6 +243,30 @@ def test_gen_transfer_status_enters_consensus_when_sync_required() -> None:
     assert failed == []
     assert cancelled == []
     transceiver._gen_consensus.assert_called_once_with([])
+
+
+def test_consensus_outcome_uses_single_batched_allgather() -> None:
+    # The cancelled/failed/completed id lists are exchanged with ONE allgather
+    # (packed as a list-of-lists) instead of three; verify a single call and that
+    # union (cancelled/failed) + intersection (completed) semantics are preserved.
+    transceiver = object.__new__(KvCacheTransceiverV2)
+    calls: list = []
+
+    def fake_allgather(payload):
+        calls.append(payload)
+        # rank0 = this rank's [cancelled, failed, completed]; rank1 = a peer rank.
+        return [payload, [[], [99], [7, 8]]]
+
+    to_process = [1, 2, 7, 8, 99]
+    new_cancelled, new_failed, new_completed = transceiver._consensus_outcome(
+        to_process, [1], [2], [7], fake_allgather, True
+    )
+
+    assert len(calls) == 1  # batched: a single allgather, not three
+    assert calls[0] == [[1], [2], [7]]
+    assert new_cancelled == [1]  # union of cancelled across ranks
+    assert new_failed == [2, 99]  # union of failed across ranks
+    assert new_completed == [7]  # intersection only (8 is completed on the peer only)
 
 
 def test_tx_session_wait_complete_defaults_to_blocking() -> None:
@@ -256,3 +300,26 @@ def test_tx_session_has_failed_reports_task_error() -> None:
     session = _make_tx_session([task])
 
     assert session.has_failed()
+
+
+def test_check_context_runs_consensus_after_a_send() -> None:
+    # Once the worker has sent, the ctx consensus runs as usual.
+    transceiver = _make_transceiver({})
+    transceiver._ever_had_send_session = True
+    transceiver._ctx_need_tp_sync = True
+    transceiver._ctx_consensus = Mock(return_value=[])
+    transceiver._ctx_consensus_outcome = Mock(return_value=([], [], [], []))
+
+    transceiver.check_context_transfer_status(0)
+    transceiver._ctx_consensus.assert_called_once()
+
+
+def test_prepare_context_requests_skips_consensus_when_nothing_waiting() -> None:
+    # With nothing waiting on any rank, prepare_context_requests returns before the consensus; the
+    # waiting set is the same on every rank.
+    transceiver = _make_transceiver({})
+    transceiver._wait_reqs = {}
+    transceiver._ctx_consensus = Mock(side_effect=AssertionError("consensus must be skipped"))
+
+    transceiver.prepare_context_requests([])
+    transceiver._ctx_consensus.assert_not_called()

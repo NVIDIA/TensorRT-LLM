@@ -819,6 +819,8 @@ class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
                 **kwargs,
         ) as llm:
             _set_quant_config(llm, model_id)
+            # The NVFP4 Super V3 checkpoint is mixed precision; resolve gsm8k
+            # thresholds against the MIXED_PRECISION reference (matches test_accuracy).
             if model_id == "nvfp4":
                 llm.args.quant_config.quant_algo = QuantAlgo.MIXED_PRECISION
             print_memory_usage("after engine build")
@@ -1142,6 +1144,7 @@ class TestMiniMaxM2(LlmapiAccuracyTestHarness):
             "compile_backend": "torch-cudagraph",
             "kv_cache_config": {
                 "free_gpu_memory_fraction": 0.7,
+                "enable_block_reuse": False,
             },
             "max_batch_size": 64,
             "max_seq_len": self.MAX_SEQ_LEN,
@@ -1490,6 +1493,7 @@ class TestModelRegistryAccuracy(LlmapiAccuracyTestHarness):
         "nvidia/Llama-3.1-8B-Instruct-FP8": "meta-llama/Llama-3.1-8B-Instruct",
         "nvidia/Llama-3.1-8B-Instruct-NVFP4":
         "meta-llama/Llama-3.1-8B-Instruct",
+        "nvidia/DeepSeek-R1-0528-NVFP4-v2": "deepseek-ai/DeepSeek-R1-0528",
     }
 
     # Each param: (model_name, config_overrides, tasks). Marks skip when machine lacks GPUs/memory.
@@ -1538,6 +1542,17 @@ class TestModelRegistryAccuracy(LlmapiAccuracyTestHarness):
                 pytest.mark.skip_less_device_memory(120000),
             ),
             id="deepseek-ai_DeepSeek-R1-0528",
+        ),
+        pytest.param(
+            "nvidia/DeepSeek-R1-0528-NVFP4-v2",
+            {},
+            [GSM8K],
+            marks=(
+                skip_pre_blackwell,
+                pytest.mark.skip_less_device(8),
+                pytest.mark.skip_less_device_memory(120000),
+            ),
+            id="nvidia_DeepSeek-R1-0528-NVFP4-v2",
         ),
     ]
 

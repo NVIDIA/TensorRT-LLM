@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import contextlib
 import errno
 import json
@@ -45,31 +60,20 @@ TConfig = TypeVar("TConfig", bound=transformers.PretrainedConfig)
 _DEEPSEEK_V4_ARCHITECTURES = {"DeepseekV4ForCausalLM"}
 _DEEPSEEK_V4_ROUTED_EXPERT_WEIGHT = "layers.0.ffn.experts.0.w1.weight"
 
+_MINIMAX_M3_ARCHITECTURES = {
+    "MiniMaxM3SparseForCausalLM",
+    "MiniMaxM3SparseForConditionalGeneration",
+}
 
-def _unified_kv_pool_includes_mamba(
-        is_disagg: bool, spec_config: Optional['SpeculativeConfig']) -> bool:
-    """Whether the KV cache pool will include mamba layers for a hybrid model.
 
-    True for the default Python ``MambaHybridCacheManager`` route, where
-    mamba state is allocated alongside attention KV inside one pool (with
-    zero KV heads on mamba layers). False for the V1-route managers used
-    when:
-
-      * disaggregated serving forces the C++ mamba manager
-        (``TRTLLM_USE_CPP_MAMBA=1`` enables the same path locally), or
-      * ``TRTLLM_USE_PY_MAMBA=1`` forces the Python mamba manager locally
-        (agg-mode override), or
-      * one-model speculative decoding splits mamba and attention into
-        separate caches.
-
-    Single source of truth for the binding-side layer-counting decision; do
-    not duplicate the predicate at call sites.
-    """
-    use_split_pool = is_disagg \
-        or os.environ.get('TRTLLM_USE_CPP_MAMBA', '0') == '1' \
-        or os.environ.get('TRTLLM_USE_PY_MAMBA', '0') == '1'
-    use_spec = spec_config is not None
-    return not (use_split_pool or use_spec)
+def _is_lock_infra_error(exc: BaseException) -> bool:
+    """Whether exc indicates broken lock infrastructure (not mere contention)."""
+    if isinstance(exc, PermissionError):
+        return True
+    if isinstance(exc, OSError):
+        return exc.errno in (errno.EACCES, errno.EPERM, errno.ENOLCK,
+                             errno.ESTALE)
+    return False
 
 
 @contextlib.contextmanager
@@ -83,47 +87,44 @@ def config_file_lock(timeout: int = 10):
     Args:
         timeout: Maximum time to wait for lock acquisition in seconds
     """
-    # Use a single global lock file in HF cache directory
-    # This serializes all model loading operations to prevent race conditions
+    # Use a single global lock file in HF cache directory to serialize loads.
     lock_path = Path(HF_MODULES_CACHE) / "_remote_code.lock"
-
-    # Create and acquire the lock
     lock = filelock.FileLock(str(lock_path), timeout=timeout)
 
+    # Guard only acquisition so caller-body exceptions propagate (single-yield).
     try:
-        with lock:
-            yield
-    except (PermissionError, OSError, filelock.Timeout) as e:
-        # Fallback to tempdir when primary lock path is unusable (e.g.,
-        # NFS locking failures like ENOLCK/ESTALE, permission issues,
-        # or lock acquisition timeouts)
-        if isinstance(e,
-                      OSError) and e.errno not in (errno.EACCES, errno.EPERM,
-                                                   errno.ENOLCK, errno.ESTALE):
+        lock.acquire(timeout=timeout)
+    except filelock.Timeout:
+        # Contention, not broken infra: a tempdir lock can't serialize against
+        # the holder, so degrade to no lock instead of crashing the process.
+        logger.warning(
+            f"could not acquire config lock within {timeout}s, proceeding without lock"
+        )
+        yield
+    except (PermissionError, OSError) as e:
+        # Broken lock infra (perms / NFS ENOLCK/ESTALE): retry on a tempdir lock.
+        if not _is_lock_infra_error(e):
             raise
         tmp_dir = Path(tempfile.gettempdir())
         tmp_dir.mkdir(parents=True, exist_ok=True)
-        tmp_lock_path = tmp_dir / "_remote_code.lock"
-        tmp_lock = filelock.FileLock(str(tmp_lock_path), timeout=timeout)
+        tmp_lock = filelock.FileLock(str(tmp_dir / "_remote_code.lock"),
+                                     timeout=timeout)
         try:
-            with tmp_lock:
+            tmp_lock.acquire(timeout=timeout)
+        except (PermissionError, OSError, filelock.Timeout):
+            logger.warning(
+                "tempdir config lock unavailable, proceeding without lock")
+            yield
+        else:
+            try:
                 yield
-        except filelock.Timeout:
-            logger.warning(
-                f"failed to acquire tempdir config lock within {timeout} seconds, proceeding without lock"
-            )
-            # proceed without lock
+            finally:
+                tmp_lock.release()
+    else:
+        try:
             yield
-        except (PermissionError, OSError) as e:
-            if isinstance(
-                    e, OSError) and e.errno not in (errno.EACCES, errno.EPERM,
-                                                    errno.ENOLCK, errno.ESTALE):
-                raise
-            logger.warning(
-                f"tempdir config lock unavailable due to OS/permission issue: {e}, proceeding without lock"
-            )
-            # proceed without lock
-            yield
+        finally:
+            lock.release()
 
 
 @dataclass(kw_only=True)
@@ -140,6 +141,11 @@ class ModelConfig(Generic[TConfig]):
     skip_create_weights_in_init: bool = False
 
     spec_config: Optional["DecodingBaseConfig"] = None
+    # When False, the column-parallel LM head keeps its vocab-sharded output
+    # instead of all-gathering to full vocab. Used for one-model speculative
+    # draft models so greedy draft sampling can do a lighter TP gather. Defaults
+    # to True to preserve behavior for every non-draft model.
+    lm_head_gather_output: bool = True
     lora_config: Optional["LoraConfig"] = None
     sparse_attention_config: Optional["SparseAttentionConfig"] = None
 
@@ -188,6 +194,13 @@ class ModelConfig(Generic[TConfig]):
 
     # If true, ONLY the vision encoder part of the full model is loaded/executed.
     mm_encoder_only: bool = False
+
+    # If true, the multimodal encoder of a multimodal checkpoint is NOT
+    # instantiated/loaded and the model serves text-only requests. This is
+    # opt-in per model: each model implementation must honor this flag when
+    # building its encoder (currently the Qwen3-VL / Qwen3.5-VL models); a
+    # model that does not check it simply ignores the flag (no-op).
+    disable_mm_encoder: bool = False
 
     # Video pruning rate for VLM models (None = EVS disabled)
     video_pruning_rate: Optional[float] = None
@@ -308,7 +321,8 @@ class ModelConfig(Generic[TConfig]):
             return False
         return model_architectures[0] not in [
             "BertForSequenceClassification", "Qwen2ForProcessRewardModel",
-            "Qwen2ForRewardModel", "LlamaForTextEmbedding"
+            "Qwen2ForRewardModel", "LlamaForTextEmbedding",
+            "Qwen3ForTextEmbedding"
         ]
         # TODO: should be 'not model_type == ModelType.ENCODER_ONLY'
         # once ModelType is used in pytorch flow.
@@ -424,6 +438,7 @@ class ModelConfig(Generic[TConfig]):
                 'group_size', quant_config.group_size)
             quant_config.exclude_modules = json_quant_configs.get(
                 'exclude_modules', quant_config.exclude_modules)
+
             for layer in mixed_quant_configs:
                 layer_cfg = mixed_quant_configs[layer]
                 config = QuantConfig()
@@ -675,6 +690,81 @@ class ModelConfig(Generic[TConfig]):
         return layer_quant_config
 
     @staticmethod
+    def _set_minimax_m3_layer_quant_config(pretrained_config,
+                                           layer_quant_config):
+        """Normalize the Minimax M3 MIXED_PRECISION per-layer quant config.
+
+        Two fix-ups are applied:
+
+        1. Strip the ``language_model.`` prefix from every per-layer key.
+           The M3 VL checkpoint stores keys like
+           ``language_model.model.layers.0.self_attn.o_proj -> MXFP8`` in
+           ``hf_quant_config.json``, but the TRT-LLM module tree names the text
+           decoder ``model.layers.0.self_attn.o_proj`` (no ``language_model.``
+           prefix -- the loader strips it). ``apply_layerwise_quant_config``
+           matches *standalone* Linears (e.g. ``o_proj``, ``down_proj``) with an
+           **exact** ``name == key`` comparison, so the prefixed keys never match
+           and those layers silently fall back to the global ``MIXED_PRECISION``
+           config -> loaded unquantized (MXFP8 ``weight_scale`` dropped) -> the
+           attention/MLP output magnitude explodes. Stripping the prefix makes
+           the exact match succeed. (Fused qkv/gate_up Linears and the Attention
+           wrapper use substring matches and happened to work regardless.)
+
+        2. Inject a single coarse ``model.layers.N.block_sparse_moe.experts``
+           entry per MoE layer so ``MiniMaxM3MoE._get_experts_quant_config`` can
+           select the NVFP4 backend for the routed experts (the fine-grained
+           per-linear NVFP4 expert keys can't be used directly).
+
+        Does nothing when there is no per-layer config (e.g. the uniform MXFP8
+        or a BF16 checkpoint).
+        """
+        from tensorrt_llm.models.modeling_utils import QuantAlgo
+        if layer_quant_config is None:
+            return layer_quant_config
+
+        # (1) Strip the ``language_model.`` prefix so exact-match per-layer
+        # quant assignment works for standalone base Linears.
+        _LM_PREFIX = "language_model."
+        layer_quant_config = {
+            (k[len(_LM_PREFIX):] if k.startswith(_LM_PREFIX) else k): v
+            for k, v in layer_quant_config.items()
+        }
+
+        # (2) Inject coarse NVFP4 expert entries (only when routed experts are
+        # NVFP4).
+        has_nvfp4_experts = any(
+            "block_sparse_moe.experts" in k and isinstance(v, QuantConfig)
+            and v.quant_algo == QuantAlgo.NVFP4
+            for k, v in layer_quant_config.items())
+        if not has_nvfp4_experts:
+            return layer_quant_config
+
+        experts_quant_config = QuantConfig()
+        experts_quant_config.quant_algo = QuantAlgo.NVFP4
+        # TODO: remove the hardcoded group_size and read it from the per-linear
+        # NVFP4 expert entries in hf_quant_config.json instead. 16 is correct
+        # for standard NVFP4 today, but this is a latent bug if a checkpoint
+        # ever ships a different group size.
+        experts_quant_config.group_size = 16
+
+        text_config = getattr(pretrained_config, "text_config",
+                              pretrained_config)
+        if isinstance(text_config, dict):
+            moe_layer_freq = text_config.get("moe_layer_freq", [])
+        else:
+            moe_layer_freq = getattr(text_config, "moe_layer_freq", [])
+
+        for layer_idx, freq in enumerate(moe_layer_freq):
+            if int(freq) != 0:
+                layer_quant_config[
+                    f"model.layers.{layer_idx}.block_sparse_moe.experts"] = experts_quant_config
+
+        logger.info(
+            "Detected Minimax M3 NVFP4 routed MoE checkpoint; using NVFP4 "
+            "for routed experts.")
+        return layer_quant_config
+
+    @staticmethod
     def load_quant_config_from_dtypes_json(dtypes_json_file, moe_backend: str):
         quant_config = QuantConfig()
         layer_quant_config = None
@@ -737,7 +827,16 @@ class ModelConfig(Generic[TConfig]):
             if sparse_attention_config:
                 index_n_heads = sparse_attention_config.index_n_heads or pretrained_config.index_n_heads
                 index_head_dim = sparse_attention_config.index_head_dim or pretrained_config.index_head_dim
-                index_topk = sparse_attention_config.index_topk or pretrained_config.index_topk
+                # index_topk needs an explicit-set check rather than `or`: the
+                # DeepSeekV4SparseAttentionConfig default (512) is truthy, so a
+                # plain `or` shadows the checkpoint's index_topk (e.g. Pro's
+                # 1024) whenever the user did not set it. Mirror the window_size
+                # handling below and consult model_fields_set. (index_n_heads /
+                # index_head_dim stay on `or` since their defaults are None.)
+                if 'index_topk' in sparse_attention_config.model_fields_set:
+                    index_topk = sparse_attention_config.index_topk
+                else:
+                    index_topk = pretrained_config.index_topk
                 indexer_max_chunk_size = sparse_attention_config.indexer_max_chunk_size
                 skip_indexer_for_short_seqs = sparse_attention_config.skip_indexer_for_short_seqs
                 # Pass-through DSA tuning flags so user-set values survive the
@@ -758,13 +857,15 @@ class ModelConfig(Generic[TConfig]):
                 index_topk = pretrained_config.index_topk
                 indexer_max_chunk_size = None
                 skip_indexer_for_short_seqs = True
-                # Defaults match DeepSeekSparseAttentionConfig field defaults.
+                # Defaults match DeepSeekV4SparseAttentionConfig field defaults.
                 use_cute_dsl_topk = False
                 use_cute_dsl_paged_mqa_logits = False
                 q_split_threshold = 8192
                 indexer_rope_interleave = False
                 enable_heuristic_topk = False
-                indexer_k_dtype = "fp8"
+                default_sparse_attention_config = DeepSeekV4SparseAttentionConfig(
+                )
+                indexer_k_dtype = default_sparse_attention_config.indexer_k_dtype
             indexer_config = {}
             indexer_config['index_n_heads'] = index_n_heads
             indexer_config['index_head_dim'] = index_head_dim
@@ -802,7 +903,13 @@ class ModelConfig(Generic[TConfig]):
                     if sparse_attention_config:
                         index_n_heads = sparse_attention_config.index_n_heads or pretrained_config.index_n_heads
                         index_head_dim = sparse_attention_config.index_head_dim or pretrained_config.index_head_dim
-                        index_topk = sparse_attention_config.index_topk or pretrained_config.index_topk
+                        # Explicit-set check (see V4 path above): only honor a
+                        # user-provided index_topk; otherwise take the
+                        # checkpoint value rather than a truthy subclass default.
+                        if 'index_topk' in sparse_attention_config.model_fields_set:
+                            index_topk = sparse_attention_config.index_topk
+                        else:
+                            index_topk = pretrained_config.index_topk
                         indexer_max_chunk_size = sparse_attention_config.indexer_max_chunk_size
                         skip_indexer_for_short_seqs = sparse_attention_config.skip_indexer_for_short_seqs
                         use_cute_dsl_topk = sparse_attention_config.use_cute_dsl_topk
@@ -1059,6 +1166,10 @@ class ModelConfig(Generic[TConfig]):
                 layer_quant_config,
                 kwargs.get('spec_config', None),
                 require_layout=require_deepseek_v4_routed_moe_layout)
+
+        if architecture in _MINIMAX_M3_ARCHITECTURES:
+            layer_quant_config = cls._set_minimax_m3_layer_quant_config(
+                pretrained_config, layer_quant_config)
 
         model_config = cls(pretrained_config=pretrained_config,
                            quant_config=quant_config,
