@@ -106,24 +106,34 @@ AGG_SERVER_READY_TIMEOUT = 1800
 DISAGG_SERVER_READY_TIMEOUT = 3600
 
 
-def server_ready_timeout(default: int) -> int:
-    """Ready-wait bound; overridable via TRTLLM_TEST_SERVER_READY_TIMEOUT.
+def server_ready_timeout(default: int, mode: str) -> int:
+    """Ready-wait bound for one serving mode ("AGG" or "DISAGG").
 
-    Read at call time (not import time) so the env var can be adjusted per
+    Agg and disagg servers have very different init times (disagg's /health
+    answers only after every ctx/gen worker is up), so each mode has its own
+    override var, with the generic one as a shared fallback:
+    TRTLLM_TEST_<mode>_SERVER_READY_TIMEOUT > TRTLLM_TEST_SERVER_READY_TIMEOUT
+    > the built-in per-mode default.
+
+    Read at call time (not import time) so the env vars can be adjusted per
     invocation, and parsed defensively so a malformed value cannot break
     pytest collection of this module.
     """
-    raw = os.environ.get("TRTLLM_TEST_SERVER_READY_TIMEOUT")
-    if not raw:
-        return default
-    try:
-        timeout = int(raw)
-    except ValueError:
-        timeout = 0
-    if timeout <= 0:
-        print_info(f"Invalid TRTLLM_TEST_SERVER_READY_TIMEOUT={raw!r}; using default {default}s")
-        return default
-    return timeout
+    for var in (
+        f"TRTLLM_TEST_{mode.upper()}_SERVER_READY_TIMEOUT",
+        "TRTLLM_TEST_SERVER_READY_TIMEOUT",
+    ):
+        raw = os.environ.get(var)
+        if not raw:
+            continue
+        try:
+            timeout = int(raw)
+        except ValueError:
+            timeout = 0
+        if timeout > 0:
+            return timeout
+        print_info(f"Invalid {var}={raw!r}; ignoring it")
+    return default
 
 
 AGG_CONFIG_FOLDER = os.environ.get("AGG_CONFIG_FOLDER", "tests/scripts/perf-sanity/aggregated")
@@ -1125,7 +1135,9 @@ class AggrTestCmds(NamedTuple):
 
                 wait_for_endpoint_ready(
                     f"http://{server_hostname}:{server_port}/health",
-                    timeout=min(self.timeout, server_ready_timeout(AGG_SERVER_READY_TIMEOUT)),
+                    timeout=min(
+                        self.timeout, server_ready_timeout(AGG_SERVER_READY_TIMEOUT, "AGG")
+                    ),
                     check_files=[server_file_path],
                     server_proc=server_proc,
                 )
@@ -1458,7 +1470,9 @@ class DisaggTestCmds(NamedTuple):
 
                 wait_for_endpoint_ready(
                     f"http://{disagg_server_hostname}:{disagg_server_port}/health",
-                    timeout=min(self.timeout, server_ready_timeout(DISAGG_SERVER_READY_TIMEOUT)),
+                    timeout=min(
+                        self.timeout, server_ready_timeout(DISAGG_SERVER_READY_TIMEOUT, "DISAGG")
+                    ),
                     check_files=self.get_server_logs(server_idx),
                 )
 
