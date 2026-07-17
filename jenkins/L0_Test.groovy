@@ -155,7 +155,9 @@ K8S_INFRA_RETRY_MAX = 1
 // Per-stage override of the above: set `infraRetryMax` in a stage's opts map (the
 // 3rd element of its parallel-jobs config tuple, alongside singleAttempt) to cap
 // or disable stage-level infra retries for resource-scarce hardware pools --
-// `infraRetryMax: 0` disables retries entirely (1 attempt). It applies to whichever
+// `infraRetryMax: 0` disables retries entirely (1 attempt). It may only reduce the
+// budget: values above the scope global are clamped down to it (resolveInfraRetryMax),
+// so it can never increase retries past these caps. It applies to whichever
 // stage-level retry the stage uses: the SLURM retry (runLLMTestlistOnSlurm) for
 // dispatcher pods, or the K8s pod retry (runKubernetesPodWithInfraRetry) for regular
 // test pods. It does NOT touch the dispatcher-pod launch-retry (relaunching a cheap
@@ -1948,7 +1950,7 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
   // Per-stage override of the SLURM infra-retry budget (from opts.infraRetryMax,
   // threaded via the dispatcher's retryContext). Lets resource-scarce pools cap
   // or disable stage-level retries (0 = no retry). Null falls back to the global.
-  int slurmInfraRetryMax = (infraRetryMax != null) ? infraRetryMax : SLURM_INFRA_RETRY_MAX
+  int slurmInfraRetryMax = resolveInfraRetryMax(InfraFailure.SLURM, infraRetryMax)
 
   def attempt = 0
   // Avoided SLURM nodes keyed by cluster. The platform can resolve to a
@@ -2196,13 +2198,26 @@ long retrySafetyMarginMs(String scope)
     return scope == InfraFailure.SLURM ? 20L * 60L * 1000L : 15L * 60L * 1000L
 }
 
+// Resolve a per-stage infra-retry override (opts.infraRetryMax) against its
+// scope's global budget. The override may only CAP or DISABLE retries, never
+// exceed the global (which bounds CI time / worst-case attempts), so it is
+// clamped to [0, scopeDefault]; e.g. with the default of 1, infraRetryMax=2
+// still yields 1, and infraRetryMax=0 disables. Null falls back to the default.
+int resolveInfraRetryMax(String scope, Integer override)
+{
+    int scopeDefault = (scope == InfraFailure.SLURM) ? SLURM_INFRA_RETRY_MAX : K8S_INFRA_RETRY_MAX
+    if (override == null) {
+        return scopeDefault
+    }
+    return Math.max(0, Math.min(override, scopeDefault))
+}
+
 int retryMaxForFailure(String scope, InfraFailure failure, Integer infraRetryMax=null)
 {
-    // Per-stage override (from opts.infraRetryMax) replaces the scope default; a
+    // Per-stage override caps the scope default (see resolveInfraRetryMax); a
     // PERSISTENT failure is still capped to at most one retry, so infraRetryMax=0
     // disables retries for every severity.
-    int base = (infraRetryMax != null) ? infraRetryMax :
-               (scope == InfraFailure.SLURM ? SLURM_INFRA_RETRY_MAX : K8S_INFRA_RETRY_MAX)
+    int base = resolveInfraRetryMax(scope, infraRetryMax)
     return (failure.severity == InfraFailure.PERSISTENT) ? Math.min(1, base) : base
 }
 
@@ -4562,7 +4577,7 @@ def runKubernetesPodWithInfraRetry(Map opts = [:], pipeline, podSpec, containerN
     // to the outer test-pod retry loop below; the singleAttempt launch-retry keeps the
     // global (relaunching a dispatcher pod doesn't tax the scarce test hardware). SLURM
     // dispatchers carry the same opt through to their inner SLURM retry via retryContext.
-    int k8sInfraRetryMax = (opts.infraRetryMax != null) ? (opts.infraRetryMax as int) : K8S_INFRA_RETRY_MAX
+    int k8sInfraRetryMax = resolveInfraRetryMax(InfraFailure.K8S, opts.infraRetryMax as Integer)
 
     // DEBUG_MODE preserves the existing 2-hour-input human-inspection workflow
     // inside runLLMTestlistOnPlatform's finallyRunner: a single attempt only.
