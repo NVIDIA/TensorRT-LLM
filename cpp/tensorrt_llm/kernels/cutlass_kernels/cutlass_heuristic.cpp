@@ -575,12 +575,10 @@ std::vector<CutlassGemmConfig> get_candidate_configs_sm120(CutlassGemmConfig::Ca
         std::vector<CutlassGemmConfig> candidate_configs;
         if (config & CutlassGemmConfig::FP8FP4_MIXED)
         {
-            // Mixed FP8 x FP4: prefer 128x128x128B on devices with enough
-            // shared memory, but keep a low-SMEM fallback for SM120/SM121.
+            // Mixed FP8 x FP4 only supports the 128x128x128B tile.
             candidate_configs.push_back(CutlassGemmConfig{CutlassTileConfigSM120::CtaShape128x128x128B,
                 MainloopScheduleType::AUTO, EpilogueScheduleType::AUTO, ClusterShape::ClusterShape_1x1x1});
-            candidate_configs.push_back(CutlassGemmConfig{CutlassTileConfigSM120::CtaShape128x128x64B,
-                MainloopScheduleType::AUTO, EpilogueScheduleType::AUTO, ClusterShape::ClusterShape_1x1x1});
+            return candidate_configs;
         }
         else if (config & CutlassGemmConfig::FP4_ONLY)
         {
