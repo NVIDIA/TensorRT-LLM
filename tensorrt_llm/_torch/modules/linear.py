@@ -1269,11 +1269,40 @@ class FP8BlockScalesLinearMethod(UnquantizedLinearMethod):
 
     def transform_weights(self, module: Linear) -> None:
         super().transform_weights(module)
-        if (is_sm_100f() and not (module.use_cute_dsl_blockscaling_mm
-                                 or module.disable_deep_gemm)) or \
-           get_sm_version() == 120:
+        use_deep_gemm_layout = (
+            is_sm_100f()
+            and not (module.use_cute_dsl_blockscaling_mm
+                     or module.disable_deep_gemm)) or get_sm_version() == 120
+        use_indexer_q_cutedsl_layout = (use_deep_gemm_layout and getattr(
+            module, "use_indexer_q_cutedsl_fusion", False))
+        if use_deep_gemm_layout or use_indexer_q_cutedsl_layout:
             weight, weight_scale = resmooth_to_fp8_e8m0(module.weight,
                                                         module.weight_scale)
+
+            if use_indexer_q_cutedsl_layout:
+                # Native SM100 MXF8 MMA consumes one scale per 32 K values.
+                # The checkpoint/production quantization contract remains
+                # 128x128: expand each row block and repeat each K scale four
+                # times, then materialize CUTLASS/CuTe's 128x4 swizzle once at
+                # weight-load time.
+                n = weight.shape[0]
+                scale_cutedsl = weight_scale.repeat_interleave(128, dim=0)[:n]
+                scale_cutedsl = scale_cutedsl.repeat_interleave(4, dim=1)
+                scale_cutedsl = torch.ops.trtllm.block_scale_interleave(
+                    scale_cutedsl.to(torch.float8_e8m0fnu).view(torch.uint8))
+                module.register_buffer(
+                    "indexer_q_weight_scale_cutedsl",
+                    scale_cutedsl,
+                    persistent=False,
+                )
+                module.register_buffer(
+                    "indexer_q_alpha_cutedsl",
+                    torch.ones((1, ), dtype=torch.float32,
+                               device=weight.device),
+                    persistent=False,
+                )
+
+        if use_deep_gemm_layout:
             transformed_scale = transform_sf_into_required_layout(
                 weight_scale,
                 mn=weight.shape[0],
