@@ -30,6 +30,7 @@ from torch import nn
 from torch.nn.attention import SDPBackend, sdpa_kernel
 from transformers import PretrainedConfig
 
+from tensorrt_llm._utils import nvtx_range_debug
 from tensorrt_llm.functional import AllReduceStrategy, PositionEmbeddingType
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -1381,24 +1382,34 @@ class MiniMaxM3DecoderLayer(DecoderLayer):
         residual: Optional[torch.Tensor],
         **kwargs,
     ) -> torch.Tensor:
-        if residual is None:
-            residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
-        else:
-            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        # NVTX markers below are emitted only when TLLM_NVTX_DEBUG=1 (or
+        # TLLM_LLMAPI_ENABLE_NVTX=1) is set; otherwise they are no-ops.
+        attn_kind = "sparse_attn" if self.self_attn.is_sparse_attention_layer else "dense_attn"
+        ffn_kind = "moe" if self.block_sparse_moe is not None else "mlp"
 
-        hidden_states = self.self_attn(
-            position_ids=position_ids,
-            hidden_states=hidden_states,
-            attn_metadata=attn_metadata,
-            **kwargs,
-        )
+        with nvtx_range_debug(f"layer{self.layer_idx}.input_layernorm"):
+            if residual is None:
+                residual = hidden_states
+                hidden_states = self.input_layernorm(hidden_states)
+            else:
+                hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-        if self.block_sparse_moe is not None:
-            hidden_states = self.block_sparse_moe(hidden_states, attn_metadata)
-        else:
-            hidden_states = self.mlp(hidden_states)
+        with nvtx_range_debug(f"layer{self.layer_idx}.{attn_kind}"):
+            hidden_states = self.self_attn(
+                position_ids=position_ids,
+                hidden_states=hidden_states,
+                attn_metadata=attn_metadata,
+                **kwargs,
+            )
+
+        with nvtx_range_debug(f"layer{self.layer_idx}.post_attention_layernorm"):
+            hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+
+        with nvtx_range_debug(f"layer{self.layer_idx}.{ffn_kind}"):
+            if self.block_sparse_moe is not None:
+                hidden_states = self.block_sparse_moe(hidden_states, attn_metadata)
+            else:
+                hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
 
 
@@ -1459,13 +1470,16 @@ class MiniMaxM3Model(DecoderModel):
         hidden_states = inputs_embeds
 
         residual = None
-        for decoder_layer in self.layers:
-            hidden_states, residual = decoder_layer(
-                position_ids=position_ids,
-                hidden_states=hidden_states,
-                attn_metadata=attn_metadata,
-                residual=residual,
-            )
+        for layer_idx, decoder_layer in enumerate(self.layers):
+            # Per-layer NVTX range (layer0, layer1, ...). Emitted only when
+            # TLLM_NVTX_DEBUG=1 (or TLLM_LLMAPI_ENABLE_NVTX=1) is set.
+            with nvtx_range_debug(f"MiniMaxM3.layer{layer_idx}"):
+                hidden_states, residual = decoder_layer(
+                    position_ids=position_ids,
+                    hidden_states=hidden_states,
+                    attn_metadata=attn_metadata,
+                    residual=residual,
+                )
 
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
