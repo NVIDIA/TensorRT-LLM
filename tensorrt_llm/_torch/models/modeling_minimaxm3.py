@@ -676,6 +676,7 @@ class MiniMaxM3Attention(Attention):
         layer_idx: Optional[int] = None,
         is_sparse_attention_layer: bool = False,
         disable_index_value: bool = False,
+        aux_stream: Optional[torch.cuda.Stream] = None,
     ):
         config = model_config.pretrained_config
         self.pretrained_config = config
@@ -707,6 +708,11 @@ class MiniMaxM3Attention(Attention):
             getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
         )
 
+        # Dtype of the q/k/v activations fed into norm+RoPE. This is always the
+        # model compute dtype (bf16) for every M3 config. KV-cache quantization
+        # (fp8/fp4) only changes cache storage, not the activation dtype.
+        self.attn_activation_dtype = config.torch_dtype
+
         # Per-head Gemma RMSNorm — one set of weights shared across heads.
         self.q_norm = RMSNorm(
             hidden_size=self.head_dim_value,
@@ -720,6 +726,15 @@ class MiniMaxM3Attention(Attention):
             dtype=config.torch_dtype,
             use_gemma=self.use_gemma_norm,
         )
+
+        # Aux stream and events to run the per-head q-norm and k-norm
+        # concurrently on the separate-norm fallback path. The stream is shared
+        # across layers via aux_stream_dict, matching DeepSeekV3; it falls back
+        # to a private stream when constructed standalone (for example in tests).
+        # The bf16 fast path fuses norm and RoPE into one kernel and does not
+        # use these.
+        self.aux_stream = aux_stream if aux_stream is not None else torch.cuda.Stream()
+        self.ln_events = [torch.cuda.Event(), torch.cuda.Event()]
 
         self.is_sparse_attention_layer = bool(is_sparse_attention_layer)
         self.disable_index_value = bool(disable_index_value)
@@ -780,8 +795,23 @@ class MiniMaxM3Attention(Attention):
         """
         q_shape = q.shape
         k_shape = k.shape
-        q = self.q_norm(q.reshape(-1, self.head_dim_value)).reshape(q_shape)
-        k = self.k_norm(k.reshape(-1, self.head_dim_value)).reshape(k_shape)
+
+        def _q_norm():
+            return self.q_norm(q.reshape(-1, self.head_dim_value)).reshape(q_shape)
+
+        def _k_norm():
+            return self.k_norm(k.reshape(-1, self.head_dim_value)).reshape(k_shape)
+
+        # Run the independent q-norm and k-norm concurrently on the aux stream.
+        # Falls back to sequential execution under torch.compile.
+        q, k = maybe_execute_in_parallel(
+            _q_norm,
+            _k_norm,
+            self.ln_events[0],
+            self.ln_events[1],
+            self.aux_stream,
+            disable_on_compile=True,
+        )
         return q, k
 
     def apply_index_qk_norm(
@@ -808,26 +838,97 @@ class MiniMaxM3Attention(Attention):
             )
         idx_q_shape = idx_q.shape
         idx_k_shape = idx_k.shape
-        idx_q = self.index_q_norm(idx_q.reshape(-1, self.sparse_index_dim)).reshape(idx_q_shape)
-        idx_k = self.index_k_norm(idx_k.reshape(-1, self.sparse_index_dim)).reshape(idx_k_shape)
+
+        def _idx_q_norm():
+            return self.index_q_norm(idx_q.reshape(-1, self.sparse_index_dim)).reshape(idx_q_shape)
+
+        def _idx_k_norm():
+            return self.index_k_norm(idx_k.reshape(-1, self.sparse_index_dim)).reshape(idx_k_shape)
+
+        # Run the independent index q-norm and k-norm concurrently on the aux
+        # stream. Falls back to sequential execution under torch.compile.
+        idx_q, idx_k = maybe_execute_in_parallel(
+            _idx_q_norm,
+            _idx_k_norm,
+            self.ln_events[0],
+            self.ln_events[1],
+            self.aux_stream,
+            disable_on_compile=True,
+        )
         return idx_q, idx_k
 
-    def apply_rope(
+    def _fused_qk_norm_rope(
         self,
-        q: torch.Tensor,
-        k: Optional[torch.Tensor],
-        v: Optional[torch.Tensor],
-        position_ids: torch.Tensor,
-    ):
-        """Run per-head QK norm before partial RoPE.
+        qkv: torch.Tensor,
+        position_ids: Optional[torch.Tensor],
+        *,
+        num_heads_q: int,
+        num_heads_k: int,
+        num_heads_v: int,
+        head_dim: int,
+        q_norm: RMSNorm,
+        k_norm: RMSNorm,
+    ) -> Optional[torch.Tensor]:
+        """Fuse per-head Gemma RMSNorm and partial RoPE into one kernel.
 
-        The base ``Attention.apply_rope`` consumes split q/k/v. We split,
-        apply per-head QK norm, then defer to the base partial-RoPE
-        implementation (driven by ``RopeParams.dim < head_dim``).
+        Runs torch.ops.trtllm.fused_qk_norm_rope in place over the fused qkv
+        (Q heads then K heads, optional V heads left untouched) and returns the
+        mutated tensor. The kernel norms the full head_dim and rotates only the
+        first rotary_dim channels read from RopeParams.dim, which matches M3's
+        whole-head norm with front partial RoPE, and applies the same Gemma
+        (1 + weight) scaling as apply_qk_norm.
+
+        Returns None, leaving qkv untouched, when the fused path does not apply
+        so callers fall back to separate norm and RoPE. This happens when
+        activations are not bf16 (the kernel is bf16-only), when RoPE has no
+        position_ids, or when no partial-RoPE rotary_emb exists.
         """
-        q, k, v = self.split_qkv(q, k, v)
-        q, k = self.apply_qk_norm(q, k)
-        return super().apply_rope(q, k, v, position_ids)
+        if position_ids is None or qkv.dtype != torch.bfloat16:
+            return None
+        if (
+            self.rotary_emb is None
+            or self.pos_embd_params is None
+            or self.pos_embd_params.rope is None
+        ):
+            return None
+
+        # Partial-RoPE dim comes from RopeParams (M3 rotates 64 of 128).
+        rotary_dim = int(self.pos_embd_params.rope.dim)
+        # The kernel assumes a contiguous [num_tokens, total_heads * head_dim].
+        qkv = qkv.contiguous()
+        torch.ops.trtllm.fused_qk_norm_rope(
+            qkv,
+            num_heads_q,
+            num_heads_k,
+            num_heads_v,
+            head_dim,
+            rotary_dim,
+            q_norm.variance_epsilon,
+            q_norm.weight,
+            k_norm.weight,
+            self.pos_embd_params.rope.theta,
+            self.pos_embd_params.is_neox,
+            position_ids.reshape(-1).contiguous().to(torch.int32),
+            1.0,  # factor: no YARN (M3 has no rope_scaling)
+            0.0,  # low
+            0.0,  # high
+            1.0,  # attention_factor
+            True,  # is_qk_norm
+            self.use_gemma_norm,  # use_gemma
+            False,  # use_mrope
+            0,  # mrope_section1
+            0,  # mrope_section2
+        )
+        return qkv
+
+    def _expect_fused_qk_norm_rope(self, position_ids: Optional[torch.Tensor]) -> bool:
+        """Whether the fused path must run rather than fall back.
+
+        The fused kernel runs when attention activations are bf16 and RoPE has
+        position_ids. Every M3 config keeps bf16 attention activations, so a
+        fallback is a regression. Guards the forward asserts.
+        """
+        return self.attn_activation_dtype == torch.bfloat16 and position_ids is not None
 
     def forward(
         self,
@@ -876,9 +977,10 @@ class MiniMaxM3Attention(Attention):
 
         Steps:
           1. Project Q/K/V via fused ``qkv_proj``.
-          2. Apply per-head Gemma RMSNorm to Q/K (same as
-             :meth:`_sparse_forward` step 2 minus the index branch).
-          3. Apply partial RoPE.
+          2-3. Apply per-head Gemma RMSNorm and partial RoPE to Q/K. The bf16
+             fast path fuses both into one fused_qk_norm_rope kernel over the
+             fused qkv; the non-bf16-activation fallback runs apply_qk_norm then
+             rotary_emb separately.
           4. Pull the paged main K/V cache from the M3 cache manager.
           5. Read the pre-built :class:`MiniMaxM3SparseAttentionMetadata`
              from ``attn_metadata.minimax_m3``. Production code paths
@@ -903,16 +1005,37 @@ class MiniMaxM3Attention(Attention):
                 "attn_metadata; received None."
             )
 
-        # 1. Projections (no index branch).
+        # Projections (no index branch).
         qkv = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
-        # 2. Per-head Gemma RMSNorm on Q/K (no index norm).
-        q, k = self.apply_qk_norm(q, k)
-
-        # 3. Partial RoPE on Q/K (no index branch).
-        if self.rotary_emb is not None and position_ids is not None:
-            q, k = self.rotary_emb(position_ids, [q, k])
+        # Per-head Gemma RMSNorm and partial RoPE on Q/K. The bf16 fast
+        # path fuses both into one kernel over the fused qkv; otherwise fall
+        # back to separate norm and RoPE.
+        fused_qkv = self._fused_qk_norm_rope(
+            qkv,
+            position_ids,
+            num_heads_q=self.num_heads,
+            num_heads_k=self.num_key_value_heads,
+            num_heads_v=self.num_key_value_heads,
+            head_dim=self.head_dim,
+            q_norm=self.q_norm,
+            k_norm=self.k_norm,
+        )
+        if fused_qkv is not None:
+            q, k, v = fused_qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            # Match the fallback contiguity; V stays a column-slice view.
+            q, k = q.contiguous(), k.contiguous()
+        else:
+            assert not self._expect_fused_qk_norm_rope(position_ids), (
+                f"MiniMax-M3 dense attention (layer {self.layer_idx}) expected the "
+                f"fused QK-norm+RoPE kernel (bf16 activations, head_dim="
+                f"{self.head_dim}) but fell back to the separate path; qkv dtype "
+                f"is {qkv.dtype} (expected {self.attn_activation_dtype})."
+            )
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            q, k = self.apply_qk_norm(q, k)
+            if self.rotary_emb is not None and position_ids is not None:
+                q, k = self.rotary_emb(position_ids, [q, k])
 
         # Keep token-wise projections and the output projection visible to
         # torch.compile. Only the metadata/cache-dependent attention core is
@@ -1196,9 +1319,11 @@ class MiniMaxM3Attention(Attention):
         Steps:
           1. Project ``hidden_states`` to Q/K/V (fused ``qkv_proj``)
              plus index Q (per-head) and index K (single replicated).
-          2. Apply per-head Gemma RMSNorm to both branches.
-          3. Apply partial RoPE (``rotary_dim`` channels of ``head_dim``)
-             to both branches.
+          2-3. Apply per-head Gemma RMSNorm and partial RoPE to the main and
+             index branches. The bf16 fast path fuses each branch into one
+             fused_qk_norm_rope kernel (the index branch passes num_heads_v=0
+             and norms only the concatenated idx_q/idx_k); the non-bf16-activation
+             fallback runs the norm helpers then rotary_emb.
           4. Pull paged main K/V cache (reshaped to flat-slot view) and
              paged side index-K cache from the
              :class:`MiniMaxM3KVCacheManagerV2`.
@@ -1229,22 +1354,77 @@ class MiniMaxM3Attention(Attention):
                 f"MiniMax-M3 sparse forward (layer {self.layer_idx}) requires "
                 "attn_metadata; received None."
             )
-        # 1. Projections.
-        qkv = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        idx_qk = self.index_qk_proj(hidden_states)
-        idx_q, idx_k = idx_qk.split([self.index_q_size, self.index_k_size], dim=-1)
 
-        # 2. Per-head Gemma RMSNorm on both branches.
-        q, k = self.apply_qk_norm(q, k)
-        idx_q, idx_k = self.apply_index_qk_norm(idx_q, idx_k)
+        # Project, per-head Gemma RMSNorm, and partial RoPE for the main and
+        # index branches. Each branch fuses norm and RoPE into one bf16 kernel,
+        # falling back to separate norm and RoPE otherwise. The branches read
+        # only hidden_states and write disjoint outputs, so each runs its
+        # projection, norm, and RoPE concurrently on the aux stream when
+        # multi-stream is enabled, joining before the attention core.
+        def _main_norm_rope():
+            qkv = self.qkv_proj(hidden_states)
+            fused_qkv = self._fused_qk_norm_rope(
+                qkv,
+                position_ids,
+                num_heads_q=self.num_heads,
+                num_heads_k=self.num_key_value_heads,
+                num_heads_v=self.num_key_value_heads,
+                head_dim=self.head_dim,
+                q_norm=self.q_norm,
+                k_norm=self.k_norm,
+            )
+            if fused_qkv is not None:
+                q, k, v = fused_qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+                return q.contiguous(), k.contiguous(), v
+            assert not self._expect_fused_qk_norm_rope(position_ids), (
+                f"MiniMax-M3 sparse attention (layer {self.layer_idx}) expected the "
+                f"fused QK-norm+RoPE kernel (bf16 activations, head_dim="
+                f"{self.head_dim}) but fell back to the separate path; qkv dtype "
+                f"is {qkv.dtype} (expected {self.attn_activation_dtype})."
+            )
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            q, k = self.apply_qk_norm(q, k)
+            if self.rotary_emb is not None and position_ids is not None:
+                q, k = self.rotary_emb(position_ids, [q, k])
+            return q, k, v
 
-        # 3. Partial RoPE on both branches. The base ``Attention``
-        # constructor created ``self.rotary_emb`` for the configured
-        # partial ``rotary_dim`` because ``rope_fusion=False``.
-        if self.rotary_emb is not None and position_ids is not None:
-            q, k = self.rotary_emb(position_ids, [q, k])
-            idx_q, idx_k = self.rotary_emb(position_ids, [idx_q, idx_k])
+        def _index_norm_rope():
+            idx_qk = self.index_qk_proj(hidden_states)
+            fused_idx = self._fused_qk_norm_rope(
+                idx_qk,
+                position_ids,
+                num_heads_q=self.sparse_num_index_heads,
+                num_heads_k=1,
+                num_heads_v=0,
+                head_dim=self.sparse_index_dim,
+                q_norm=self.index_q_norm,
+                k_norm=self.index_k_norm,
+            )
+            if fused_idx is not None:
+                idx_q, idx_k = fused_idx.split(
+                    [self.sparse_num_index_heads * self.sparse_index_dim, self.sparse_index_dim],
+                    dim=-1,
+                )
+                return idx_q.contiguous(), idx_k.contiguous()
+            assert not self._expect_fused_qk_norm_rope(position_ids), (
+                f"MiniMax-M3 sparse index branch (layer {self.layer_idx}) expected the "
+                f"fused QK-norm+RoPE kernel (bf16 activations, index_dim="
+                f"{self.sparse_index_dim}) but fell back to the separate path; idx "
+                f"dtype is {idx_qk.dtype} (expected {self.attn_activation_dtype})."
+            )
+            idx_q, idx_k = self.apply_index_qk_norm(idx_q, idx_k)
+            if self.rotary_emb is not None and position_ids is not None:
+                idx_q, idx_k = self.rotary_emb(position_ids, [idx_q, idx_k])
+            return idx_q, idx_k
+
+        (q, k, v), (idx_q, idx_k) = maybe_execute_in_parallel(
+            _main_norm_rope,
+            _index_norm_rope,
+            self.ln_events[0],
+            self.ln_events[1],
+            self.aux_stream,
+            disable_on_compile=True,
+        )
 
         o = self._forward_attention_core(q, k, v, idx_q, idx_k, attn_metadata)
         return self.o_proj(o)
@@ -1387,6 +1567,7 @@ class MiniMaxM3DecoderLayer(DecoderLayer):
             layer_idx=layer_idx,
             is_sparse_attention_layer=is_sparse,
             disable_index_value=disable_index_value,
+            aux_stream=aux_stream_dict[AuxStreamType.Attention],
         )
 
         _, moe_layer_ids = get_moe_layer_ids(config)
@@ -1471,10 +1652,12 @@ class MiniMaxM3Model(DecoderModel):
             model_config.pretrained_config.torch_dtype = torch.bfloat16
         config = model_config.pretrained_config
         self.vocab_size = config.vocab_size
-        # Two aux streams: one for MoE shared/routed parallel execution,
-        # one for MoE chunking overlap inside the fused MoE kernel.
-        # Matches the DeepSeekV3 convention.
+        # Aux streams shared across layers, matching the DeepSeekV3 convention:
+        # one for the per-head q/k norm overlap in attention, one for MoE
+        # shared/routed parallel execution, and one for MoE chunking overlap
+        # inside the fused MoE kernel.
         self.aux_stream_dict = {
+            AuxStreamType.Attention: torch.cuda.Stream(),
             AuxStreamType.MoeShared: torch.cuda.Stream(),
             AuxStreamType.MoeChunkingOverlap: torch.cuda.Stream(),
         }
