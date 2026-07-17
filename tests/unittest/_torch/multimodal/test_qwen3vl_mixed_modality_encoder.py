@@ -14,8 +14,7 @@ from typing import Optional
 import pytest
 import torch
 
-from tensorrt_llm._torch.models.modeling_multimodal_mixin import MultimodalModelMixin
-from tensorrt_llm._torch.models.modeling_multimodal_utils import EncoderGroup
+from tensorrt_llm._torch.models.modeling_multimodal_mixin import EncoderGroup, MultimodalModelMixin
 from tensorrt_llm._torch.models.modeling_qwen3vl import _qwen3vl_build_batched_input
 
 
