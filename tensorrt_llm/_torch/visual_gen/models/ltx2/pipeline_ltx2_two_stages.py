@@ -7,7 +7,7 @@ import math
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Union
 
 import safetensors.torch
 import torch
@@ -58,11 +58,8 @@ class _TwoStagePhaseTimer(CudaPhaseTimer):
 
     Inherited marks keep their contract (``denoise`` = the whole stage-1
     forward; stage 2 folds into ``post_denoise`` on ``PipelineOutput``).
-    The two extra events subdivide the post phase on the GPU stream timeline:
-
-    - gap    = post_start → stage2_start (upsample + LoRA bind + stage-2
-      text-cache/scheduler prep)
-    - stage2 = stage2_start → stage2_end (refinement step loop only)
+    The extra event pair brackets the stage-2 refinement step loop only
+    (upsample / LoRA bind / text-cache prep stay outside).
 
     Event deltas are GPU-stream distances: they include GPU work plus any
     CPU time exposed to the stream, and stay correct under CUDA graphs and
@@ -86,17 +83,12 @@ class _TwoStagePhaseTimer(CudaPhaseTimer):
             self._stage2_end.record()
             self._stage2_marked = 2
 
-    def two_stage_phases(self) -> Optional[Tuple[float, float, float]]:
-        """``(stage1_s, gap_s, stage2_s)``; None if stage 2 never completed."""
+    def stage2_denoise_time(self) -> Optional[float]:
+        """Loop-only stage-2 denoise seconds; None if stage 2 never completed."""
         if not self._enabled or self._stage2_marked != 2:
             return None
         self._stage2_end.synchronize()
-        ms = 1.0 / 1000.0
-        return (
-            self._denoise_start.elapsed_time(self._post_start) * ms,
-            self._post_start.elapsed_time(self._stage2_start) * ms,
-            self._stage2_start.elapsed_time(self._stage2_end) * ms,
-        )
+        return self._stage2_start.elapsed_time(self._stage2_end) / 1000.0
 
 
 _FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
@@ -1467,6 +1459,7 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
                 )
             )
 
+        decode_start = time.time()
         vgm = self.pipeline_config.visual_gen_mapping
         if self._parallel_vae_enabled and self.rank in vgm.vae_ranks:
             # Parallel Stage 2 left identical refined latents on every rank;
@@ -1504,16 +1497,11 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
             audio_out = decode_audio(audio_latents, self.audio_decoder, self.vocoder)
 
         if self.rank == 0:
-            phases = timer.two_stage_phases()
-            if phases is not None:
-                stage1_s, gap_s, stage2_s = phases
-                logger.info(
-                    f"GPU timeline: stage1={stage1_s * 1000.0:.0f}ms, "
-                    f"gap={gap_s * 1000.0:.0f}ms, "
-                    f"stage2_denoise={stage2_s * 1000.0:.0f}ms | stage1 breakdown: "
-                    f"pre(text-encode+prep)={out.pre_denoise * 1000.0:.0f}ms "
-                    f"denoise={out.denoise * 1000.0:.0f}ms post={out.post_denoise * 1000.0:.0f}ms"
-                )
+            logger.info(f"Stage 1 denoising time: {out.denoise:.2f}s")
+            stage2_s = timer.stage2_denoise_time()
+            if stage2_s is not None:
+                logger.info(f"Stage 2 denoising time: {stage2_s:.2f}s")
+            logger.info(f"Decoding completed in {time.time() - decode_start:.2f}s")
             logger.info(f"Two-stage total time: {time.time() - pipeline_start:.2f}s")
         timer.mark_end()
         return timer.fill(
