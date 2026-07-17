@@ -556,7 +556,7 @@ class GptOssForCausalLM(SpecDecOneEngineForCausalLM[Transformer, GptOssConfig]):
     def get_preferred_transceiver_runtime(
         cls,
         pretrained_config: Any = None,
-    ) -> Literal["PYTHON"]:
+    ) -> Optional[Literal["CPP", "PYTHON"]]:
         return "PYTHON"
 
     params_map = {
