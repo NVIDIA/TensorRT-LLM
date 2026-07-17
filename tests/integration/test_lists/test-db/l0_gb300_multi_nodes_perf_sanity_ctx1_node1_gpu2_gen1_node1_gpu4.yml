@@ -11,7 +11,7 @@ l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu2_gen1_node1_gpu4:
       gpu:
       - '*gb300*'
     terms:
-      stage: pre_merge
+      stage: post_merge
       backend: pytorch
   tests:
   # glm-5-fp4
