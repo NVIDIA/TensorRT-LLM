@@ -563,8 +563,7 @@ class QwenImagePipeline(BasePipeline):
         # Denoise loop.
         timer.mark_denoise_start()
         logger.info("Denoising (%d steps)...", len(timesteps))
-        pipeline_config = getattr(self, "pipeline_config", None)
-        cuda_graph_enabled = getattr(getattr(pipeline_config, "cuda_graph", None), "enable", False)
+        cuda_graph_enabled = self.pipeline_config.cuda_graph.enable
         for i, t in enumerate(timesteps):
             timestep = t.expand(latents.shape[0]).to(latents.dtype)
             if do_cfg_parallel:
