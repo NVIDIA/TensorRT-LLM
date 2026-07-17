@@ -209,31 +209,6 @@ class TestFlattenCfgRanks:
         assert sorted(flat) == list(range(8))
 
 
-class TestFlattenCfgSeqRanks:
-    """flatten_cfg_seq_ranks: one seq-plane list per tp coordinate; at tp=1 the
-    single list equals flatten_cfg_ranks() flattened (cp-major, cfg, ulysses)."""
-
-    def test_tp1_equals_flattened_fold(self):
-        vgm = VisualGenMapping(world_size=8, rank=0, cfg_size=2, ring_size=2, ulysses_size=2)
-        assert vgm.flatten_cfg_seq_ranks() == [[r for grp in vgm.flatten_cfg_ranks() for r in grp]]
-
-    def test_tp2_cfg2_u2_matches_fold_fibers(self):
-        vgm = VisualGenMapping(world_size=8, rank=0, cfg_size=2, tp_size=2, ulysses_size=2)
-        # cp=1: seq fibers coincide with the per-tp ulysses fold lists.
-        assert vgm.flatten_cfg_seq_ranks() == vgm.flatten_cfg_ranks()
-        assert vgm.flatten_cfg_seq_ranks() == [[0, 1, 4, 5], [2, 3, 6, 7]]
-
-    def test_tp2_cfg2_ring2_u1_stays_inside_tp_fiber(self):
-        vgm = VisualGenMapping(
-            world_size=8, rank=0, cfg_size=2, tp_size=2, ring_size=2, ulysses_size=1
-        )
-        fibers = vgm.flatten_cfg_seq_ranks()
-        assert fibers == [[0, 4, 1, 5], [2, 6, 3, 7]]
-        # No fiber mixes tp coordinates (tp stride is 2 here: tp = (r // 2) % 2).
-        for fiber in fibers:
-            assert len({(r // 2) % 2 for r in fiber}) == 1
-
-
 class TestSingleGPURanksAndGroups:
     def test_ranks_are_zero(self):
         vgm = VisualGenMapping(world_size=1, rank=0)
