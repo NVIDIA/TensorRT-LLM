@@ -376,25 +376,21 @@ def _init_multi_frontend_mode(llm_args: dict,
                               enabled: bool) -> MultiFrontendMode:
     """num_serve_frontends=K runs K HTTP frontend processes against ONE
     executor: the launcher (frontend 0) owns the engine and spawns K-1
-    attached frontends (classic IPC executor path only). Entry points
-    that must not honor the knob pass enabled=False.
+    attached frontends (classic IPC executor path only). enabled=False
+    entry points (e.g. disaggregated MPI workers) never honor the knob.
     """
-    num_frontends = llm_args.get("num_serve_frontends", 1)
     if not enabled:
-        if num_frontends > 1:
-            logger.warning(
-                "num_serve_frontends is ignored on this entry point; "
-                "multi-frontend serving is only supported on plain "
-                "trtllm-serve.")
-        llm_args.pop("num_serve_frontends", None)
+        if llm_args.pop("num_serve_frontends", 1) > 1:
+            logger.warning("num_serve_frontends is only supported on plain "
+                           "trtllm-serve; ignored on this entry point.")
         return MultiFrontendMode(1, False)
 
-    mode = MultiFrontendMode(num_frontends,
+    mode = MultiFrontendMode(llm_args.get("num_serve_frontends", 1),
                              os.getenv("TLLM_EXECUTOR_ATTACH_INFO") is not None)
     if mode.is_launcher and llm_args.get("orchestrator_type") is not None:
         raise ValueError(
-            "num_serve_frontends > 1 currently supports only the "
-            "default (classic IPC) executor path, not orchestrator_type="
+            "num_serve_frontends > 1 requires the default (classic IPC) "
+            "executor path, not orchestrator_type="
             f"{llm_args.get('orchestrator_type')!r}")
     return mode
 
