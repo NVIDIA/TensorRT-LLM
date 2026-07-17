@@ -894,18 +894,17 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                                                                 self._d2t,
                                                                 draft_step=i)
 
-                # When ADP+LM-head-TP pads logits to max_num_requests, the
-                # padded rows are zero-filled placeholders only required so
-                # every TP rank produces logits of identical shape for the
-                # LM-head-TP all-gather. Drop them *before* sampling: the
-                # per-request sampling params (temperatures/top_k/top_p) are
-                # sized to token_count (== batch_size), so the padded logits
-                # would otherwise fail to broadcast in apply_temperature. This
-                # also keeps next_draft_tokens and the draft_probs buffer
-                # token_count-sized without a post-hoc trim.
+                # ADP+LM-head-TP logits are the LM-head-TP group's row-stacked
+                # batch (each rank's rows padded to max_num_requests, then
+                # all-gathered along dim 0) with the vocab sharded across the
+                # group. Rows [:token_count] would be group rank 0's requests,
+                # not this rank's, and a per-rank argmax would return a
+                # shard-local index -- so keep the full stacked logits and let
+                # greedy_sample_draft_with_tp_gather combine the group's vocab
+                # shards and slice this rank's own row segment; only then trim
+                # the max_num_requests padding down to token_count.
                 mapping_lm_head_tp = None
                 if use_lm_head_tp_in_adp:
-                    logits = logits[:token_count]
                     # The MTP head built this per-forward mapping when producing
                     # the vocab-sharded logits; the sampler needs it to gather.
                     mapping_lm_head_tp = getattr(
@@ -917,6 +916,8 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                     batch_size,
                     draft_step=i,
                     mapping_lm_head_tp=mapping_lm_head_tp)
+                if use_lm_head_tp_in_adp:
+                    new_draft_token = new_draft_token[:token_count]
                 next_draft_tokens.append(new_draft_token)
 
                 # Update hidden states for the next iteration.
