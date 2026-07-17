@@ -811,17 +811,18 @@ def wan22_bf16_video_path(_visual_gen_deps, llm_venv):
     return output_path
 
 
-def _generate_qwenimage_lpips_image(model_path, output_path):
-    """Generate the QwenImage text-to-image LPIPS sample (default setting, compile-off)."""
+def _generate_qwenimage_lpips_image(model_path, output_path, *, enable_cuda_graph=False):
+    """Generate the QwenImage text-to-image LPIPS sample."""
     from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
     from tensorrt_llm.media.encoding import save_image
-    from tensorrt_llm.visual_gen.args import TorchCompileConfig, VisualGenArgs
+    from tensorrt_llm.visual_gen.args import CudaGraphConfig, TorchCompileConfig, VisualGenArgs
 
     _skip_if_missing(model_path, "QwenImage checkpoint", is_dir=True)
     _disable_inductor_compile_worker_quiesce()
     args = VisualGenArgs(
         model=model_path,
         torch_compile_config=TorchCompileConfig(enable=False),
+        cuda_graph_config=CudaGraphConfig(enable=enable_cuda_graph),
     )
     pipeline = PipelineLoader(args).load(skip_warmup=True)
     try:
@@ -1074,6 +1075,28 @@ def test_qwenimage_lpips_against_golden(tmp_path):
     score = _run_lpips_eval(
         tmp_path,
         "qwenimage",
+        "image",
+        QWENIMAGE_LPIPS_PROMPT,
+        golden_path,
+        generated_path,
+    )
+    _assert_lpips_below_threshold(score, QWENIMAGE_LPIPS_THRESHOLD)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_qwenimage_cuda_graph_lpips_against_golden(tmp_path):
+    generated_path = tmp_path / "qwenimage_cuda_graph_generated.png"
+    golden_path = _golden_media_path(
+        tmp_path, "qwenimage_lpips_golden.png", "QwenImage LPIPS golden image"
+    )
+    _generate_qwenimage_lpips_image(
+        _lpips_model_path(QWENIMAGE_MODEL_SUBPATH),
+        generated_path,
+        enable_cuda_graph=True,
+    )
+    score = _run_lpips_eval(
+        tmp_path,
+        "qwenimage_cuda_graph",
         "image",
         QWENIMAGE_LPIPS_PROMPT,
         golden_path,
