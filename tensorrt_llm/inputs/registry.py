@@ -1115,7 +1115,8 @@ def create_input_processor_with_hash(
         # Extract optional UUIDs (can be None, or dict with same structure as mm_data)
         mm_uuids = inputs.get('multi_modal_uuids', None)
 
-        mm_hashes, mm_uuid_list = apply_mm_hashes(mm_data, mm_uuids, hash_lib)
+        mm_hashes, mm_uuids_by_key = apply_mm_hashes(mm_data, mm_uuids,
+                                                     hash_lib)
 
         prompt_token_ids, extra_processed_inputs = input_processor(
             inputs, sampling_params)
@@ -1147,7 +1148,17 @@ def create_input_processor_with_hash(
             raise ValueError(
                 "multimodal hashing could not determine multimodal token "
                 "lengths for the provided input.")
-        num_mm_tokens = next(iter(num_mm_tokens_by_key.values()))
+        # `mm_hashes_flat`, `start_positions`, and `num_mm_tokens` must all
+        # index items at the same offsets — project into prompt order via the
+        # manifest.
+        mm_item_order = inputs.get("mm_item_order")
+        if mm_item_order:
+            num_mm_tokens = [
+                num_mm_tokens_by_key[e["modality"]][e["index"]]
+                for e in mm_item_order
+            ]
+        else:
+            num_mm_tokens = next(iter(num_mm_tokens_by_key.values()))
         if len(num_mm_tokens) <= 0:
             raise ValueError("multimodal hashing produced an empty multimodal "
                              "token-length list.")
@@ -1193,8 +1204,30 @@ def create_input_processor_with_hash(
                ) > 0 and mm_special_token_ids is not None:
             extra_processed_inputs["multimodal_data"][
                 "special_token_offsets"] = start_special_token_positions
-        # flatten the hashes from dict to a single list
-        mm_hashes_flat = [h for hashes in mm_hashes.values() for h in hashes]
+        # Same prompt-order projection as `num_mm_tokens` above — the cache
+        # key indexes each item's digest by its `start_positions` offset.
+        mm_item_order = inputs.get("mm_item_order")
+        if mm_item_order:
+            mm_hashes_flat = [
+                mm_hashes[e["modality"]][e["index"]] for e in mm_item_order
+            ]
+        else:
+            mm_hashes_flat = [
+                h for hashes in mm_hashes.values() for h in hashes
+            ]
+        # `MultimodalInput.multimodal_uuids` must index in lockstep with
+        # `multimodal_hashes`, so project through the same manifest.
+        if mm_uuids_by_key is None:
+            mm_uuid_list = None
+        elif mm_item_order:
+            mm_uuid_list = [
+                mm_uuids_by_key[e["modality"]][e["index"]]
+                for e in mm_item_order
+            ]
+        else:
+            mm_uuid_list = [
+                u for uuids in mm_uuids_by_key.values() for u in uuids
+            ]
         validate_mm_inputs(prompt_token_ids, mm_hashes_flat, start_positions,
                            num_mm_tokens)
         mm_hashes_int32 = [hexdigest_to_int32(h) for h in mm_hashes_flat
@@ -1211,19 +1244,22 @@ def create_input_processor_with_hash(
     ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
         try_multimodal_hashing = False  # only used for first time
         use_multimodal_hashing = False  # used for subsequent calls
-        modalities = list(set(inputs['multi_modal_data'].keys())
-                          ) if 'multi_modal_data' in inputs else []
-        if len(modalities) > 0:
-            # TODO: support multimodal hashing for multiple modalities within the same request.
-            if len(modalities) == 1 and modalities[0] in [
-                    'image', 'video', 'audio'
-            ]:
-                # only try multimodal hashing if the inputs only contain a single modality.
-                if input_processor.multimodal_hashing_supported is not None:
-                    use_multimodal_hashing = input_processor.multimodal_hashing_supported
-                else:
-                    # we need to try the multimodal hashing for the first time to determine if it is supported
-                    try_multimodal_hashing = True
+        # Any subset of the supported modalities is eligible for hashing.
+        # ``None`` payloads are skipped so an empty bucket doesn't gate off
+        # hashing for the modalities that are actually present.
+        _SUPPORTED_HASHING_MODALITIES = ('image', 'video', 'audio')
+        modalities = [
+            m for m, d in inputs.get('multi_modal_data', {}).items()
+            if d is not None
+        ]
+        if modalities and all(m in _SUPPORTED_HASHING_MODALITIES
+                              for m in modalities):
+            if input_processor.multimodal_hashing_supported is not None:
+                use_multimodal_hashing = input_processor.multimodal_hashing_supported
+            else:
+                # First-time probe: attempt hashing and latch the result on
+                # the input processor.
+                try_multimodal_hashing = True
 
         if try_multimodal_hashing or use_multimodal_hashing:
             try:
