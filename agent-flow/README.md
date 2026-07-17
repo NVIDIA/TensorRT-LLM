@@ -68,7 +68,7 @@ python examples/quick_start.py
 
 ## Workflows
 
-Three ready-to-run multi-agent workflows ship as subpackages of
+Two ready-to-run multi-agent workflows ship as subpackages of
 `agent_flow.workflows`:
 
 - [`agent_flow.workflows.agent_team`](agent_flow/workflows/agent_team) —
@@ -80,11 +80,6 @@ Three ready-to-run multi-agent workflows ship as subpackages of
   verbatim, and only swaps the prompt bundle (source boundary, validation
   policy, attention/MoE/full-model scope, accuracy-gate framework).
   Launch via `modeling-bringup`.
-- [`agent_flow.workflows.pr_review`](agent_flow/workflows/pr_review) —
-  two-stage cross-model PR/MR review: Claude Code reviews ↔ Codex addresses,
-  then the roles swap (Codex reviews ↔ Claude Code addresses). The
-  conversation stays local (nothing is posted to the PR/MR) and edits are left
-  in the working tree. Launch via `pr-review`.
 
 ```
 PlanDrafter ⇄ PlanReviewer [⇄ Human]  →  Coder ⇄ Reviewer  →  QA  ✔
