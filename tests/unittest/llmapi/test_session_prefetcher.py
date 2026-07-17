@@ -492,6 +492,23 @@ def test_unreadable_reuse_module_errs_on_yielding(monkeypatch):
     assert session_prefetcher._reuse_layer_active()
 
 
+def test_install_wraps_seam_in_isinstance_transparent_shim(prefetcher, monkeypatch):
+    # The patched seam must stay a real TYPE: proxy.py's killed-worker
+    # detection runs isinstance(x, MpiPoolSession) against this attribute,
+    # and a bare function there raises TypeError (the #16338 breakage class).
+    mpi_mod = pytest.importorskip("tensorrt_llm.llmapi.mpi_session")
+    fake = types.ModuleType("fake_seam_mod")
+    fake.MpiPoolSession = mpi_mod.MpiPoolSession
+    monkeypatch.setitem(sys.modules, "fake_seam_mod", fake)
+    monkeypatch.setattr(session_prefetcher, "_PATCH_TARGETS", ("fake_seam_mod",))
+    monkeypatch.setattr(session_prefetcher, "_reuse_layer_active", lambda: False)
+    prefetcher.install_pool_factory_if_loaded()
+    assert fake.MpiPoolSession is not mpi_mod.MpiPoolSession  # patched
+    # isinstance must not raise, and must answer for the real class.
+    assert isinstance(object(), fake.MpiPoolSession) is False
+    assert issubclass(mpi_mod.MpiPoolSession, fake.MpiPoolSession)
+
+
 def test_patch_targets_cover_all_library_construction_sites():
     # The factory only intercepts the modules listed in _PATCH_TARGETS. If the
     # library grows another MpiPoolSession(...) construction site, prefetch

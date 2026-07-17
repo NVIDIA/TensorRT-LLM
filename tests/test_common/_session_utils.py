@@ -39,3 +39,34 @@ def _spawn_snapshot():
         {k: v for k, v in os.environ.items() if k not in _ENV_IGNORE},
         list(sys.path),
     )
+
+
+def _isinstance_transparent_shim(real_cls, factory):
+    """A seam replacement that intercepts construction but stays a real type.
+
+    The pool-creation seams used to hold a plain FUNCTION in place of
+    ``MpiPoolSession``. Library code that does ``isinstance(x,
+    MpiPoolSession)`` against the patched module attribute then raises
+    ``TypeError: isinstance() arg 2 must be a type`` — proxy.py's
+    killed-worker detection added exactly such a check and every bare
+    ``LLM()`` creation failed until it was worked around with an
+    exclusion-based match. This shim removes the hazard for good: a real
+    class whose metaclass routes construction to ``factory`` and
+    instance/subclass checks to ``real_cls``, so both usage patterns keep
+    working — including consumers added after this layer was written.
+    """
+
+    class _SeamMeta(type):
+        def __call__(cls, *args, **kwargs):
+            return factory(*args, **kwargs)
+
+        def __instancecheck__(cls, obj):
+            return isinstance(obj, real_cls)
+
+        def __subclasscheck__(cls, sub):
+            return issubclass(sub, real_cls)
+
+        def __repr__(cls):
+            return f"<pool seam shim for {real_cls!r}>"
+
+    return _SeamMeta("MpiPoolSession", (), {})

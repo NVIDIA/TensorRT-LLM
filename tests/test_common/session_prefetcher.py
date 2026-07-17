@@ -60,7 +60,7 @@ from typing import NamedTuple
 # The spawn snapshot is shared with the session-reuse layer (both hand a
 # live pool to a test that did not spawn it — same invariant: workers freeze
 # the FULL env + sys.path at spawn).
-from test_common._session_utils import _spawn_snapshot
+from test_common._session_utils import _isinstance_transparent_shim, _spawn_snapshot
 
 # The only places in the library that construct MpiPoolSession for a bare
 # LLM(...); tests passing their own _mpi_session never reach these lines.
@@ -539,7 +539,11 @@ class SessionPrefetcher:
         for name in pending:
             mod = sys.modules[name]
             if getattr(mod, "MpiPoolSession", None) is real_cls:
-                mod.MpiPoolSession = factory
+                # A real type, not a bare function: library code may run
+                # isinstance(x, MpiPoolSession) against the patched attribute
+                # (proxy.py's killed-worker detection did) — a function there
+                # raises TypeError and kills every LLM creation.
+                mod.MpiPoolSession = _isinstance_transparent_shim(real_cls, factory)
             self._patched.add(name)
 
     def dispose(self) -> None:

@@ -43,7 +43,7 @@ import threading
 
 # The spawn snapshot is shared with the session-prefetch layer (both hand a
 # live pool to a test that did not spawn it — same invariant).
-from test_common._session_utils import _spawn_snapshot
+from test_common._session_utils import _isinstance_transparent_shim, _spawn_snapshot
 from test_common.grouped_test_utils import reset_worker_torch_compile_state, submit_sync_per_worker
 
 # The only places in the library that construct MpiPoolSession for a bare
@@ -105,37 +105,6 @@ def _prefetcher():
     """
     mod = sys.modules.get("test_common.session_prefetcher")
     return getattr(mod, "PREFETCHER", None)
-
-
-def _isinstance_transparent_shim(real_cls, factory):
-    """A seam replacement that intercepts construction but stays a real type.
-
-    The pool-creation seams used to hold a plain FUNCTION in place of
-    ``MpiPoolSession``. Library code that does ``isinstance(x,
-    MpiPoolSession)`` against the patched module attribute then raises
-    ``TypeError: isinstance() arg 2 must be a type`` — proxy.py's
-    killed-worker detection added exactly such a check and every bare
-    ``LLM()`` creation failed until it was worked around with an
-    exclusion-based match. This shim removes the hazard for good: a real
-    class whose metaclass routes construction to ``factory`` and
-    instance/subclass checks to ``real_cls``, so both usage patterns keep
-    working — including consumers added after this layer was written.
-    """
-
-    class _SeamMeta(type):
-        def __call__(cls, *args, **kwargs):
-            return factory(*args, **kwargs)
-
-        def __instancecheck__(cls, obj):
-            return isinstance(obj, real_cls)
-
-        def __subclasscheck__(cls, sub):
-            return issubclass(sub, real_cls)
-
-        def __repr__(cls):
-            return f"<session-reuse seam shim for {real_cls!r}>"
-
-    return _SeamMeta("MpiPoolSession", (), {})
 
 
 def _describe_mismatch(spawn_snap, now_snap, uses, max_uses):
