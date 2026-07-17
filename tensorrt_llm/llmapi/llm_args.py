@@ -4121,6 +4121,17 @@ class BaseLlmArgs(StrictBaseModel):
         description="The path to the tokenizer directory for postprocessing.",
         status="prototype")
 
+    num_serve_frontends: int = Field(
+        default=1,
+        ge=1,
+        le=1 << 16,
+        description=
+        "The number of HTTP frontend processes serving one executor. Used by "
+        "trtllm-serve: values > 1 run additional attached frontend processes "
+        "that share the serving port via SO_REUSEPORT (classic IPC executor "
+        "path only).",
+        status="prototype")
+
     reasoning_parser: Optional[str] = Field(
         default=None,
         description="The parser to separate reasoning content from output.",

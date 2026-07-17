@@ -5,7 +5,6 @@ import inspect
 import json
 import os
 import secrets
-import shutil
 import signal
 import socket
 import subprocess  # nosec B404
@@ -201,6 +200,7 @@ def get_llm_args(
         free_gpu_memory_fraction: float = 0.9,
         kv_cache_dtype: str = "auto",
         num_postprocess_workers: int = 0,
+        num_serve_frontends: int = 1,
         trust_remote_code: bool = False,
         revision: Optional[str] = None,
         reasoning_parser: Optional[str] = None,
@@ -274,6 +274,8 @@ def get_llm_args(
         max_seq_len,
         "num_postprocess_workers":
         num_postprocess_workers,
+        "num_serve_frontends":
+        num_serve_frontends,
         "enable_chunked_prefill":
         enable_chunked_prefill,
         "enable_attention_dp":
@@ -382,49 +384,53 @@ def _init_multi_frontend_mode(llm_args: dict,
                               enabled: bool) -> MultiFrontendMode:
     """Resolve the multi-frontend serving mode (prototype).
 
-    TLLM_SERVE_NUM_FRONTENDS=K runs K HTTP frontend processes against ONE
-    executor. The launcher (frontend 0) launches the worker as usual and
-    spawns K-1 attached frontends; attached frontends
-    (TLLM_EXECUTOR_ATTACH_INFO set) skip the spawning. Supported only on
-    the classic IPC executor path (the default orchestrator).
+    num_serve_frontends=K (--num_serve_frontends / config yaml; the
+    TLLM_SERVE_NUM_FRONTENDS env is honored as a fallback when the knob is
+    unset) runs K HTTP frontend processes against ONE executor. The
+    launcher (frontend 0) launches the worker as usual and spawns K-1
+    attached frontends; attached frontends (TLLM_EXECUTOR_ATTACH_INFO set)
+    skip the spawning. Supported only on the classic IPC executor path
+    (the default orchestrator).
 
-    On the launcher this opts the executor into multi-frontend mode BEFORE
-    it is created: it pre-generates the shared ipc directory and HMAC key
-    (env) so the launcher proxy, the rank0 worker and the attached
-    frontends agree on deterministic endpoints
-    (GenerationExecutorProxy._setup_queues).
+    The executor proxy reads num_serve_frontends from llm_args and
+    provisions the shared ipc endpoints itself
+    (GenerationExecutorProxy._setup_queues); this function only normalizes
+    the knob into llm_args before the LLM is created.
 
-    Entry points that reach launch_server but must not honor the env knob
+    Entry points that reach launch_server but must not honor the knob
     (e.g. disaggregated MPI workers, which inherit the caller's env under
     Slurm export-all) pass enabled=False.
     """
+    num_frontends = llm_args.get(
+        "num_serve_frontends") or get_num_serve_frontends()
     if not enabled:
-        if os.getenv("TLLM_SERVE_NUM_FRONTENDS", "1") not in ("", "1"):
+        if num_frontends > 1:
             logger.warning(
-                "TLLM_SERVE_NUM_FRONTENDS is ignored on this entry point; "
+                "num_serve_frontends is ignored on this entry point; "
                 "multi-frontend serving is only supported on plain "
                 "trtllm-serve.")
+        llm_args.pop("num_serve_frontends", None)
         return MultiFrontendMode(1, False)
 
     mode = MultiFrontendMode(
-        get_num_serve_frontends(),
+        num_frontends,
         os.getenv("TLLM_EXECUTOR_ATTACH_INFO") is not None)
     if mode.is_launcher:
         if llm_args.get("orchestrator_type") is not None:
             raise ValueError(
-                "TLLM_SERVE_NUM_FRONTENDS > 1 currently supports only the "
+                "num_serve_frontends > 1 currently supports only the "
                 "default (classic IPC) executor path, not orchestrator_type="
                 f"{llm_args.get('orchestrator_type')!r}")
-        os.environ["TLLM_MULTI_FRONTEND_IPC_DIR"] = tempfile.mkdtemp(
-            prefix="trtllm_frontends_")
-        os.environ["TLLM_MULTI_FRONTEND_HMAC"] = os.urandom(32).hex()
+        # Make the resolved count visible to the executor proxy even when it
+        # came from the env fallback.
+        llm_args["num_serve_frontends"] = num_frontends
     return mode
 
 
 def _spawn_attached_frontends(llm, num_frontends: int) -> tuple[list, str]:
     """Spawn num_frontends - 1 attached serving frontend processes.
 
-    Multi-frontend serving (TLLM_SERVE_NUM_FRONTENDS > 1): each child
+    Multi-frontend serving (num_serve_frontends > 1): each child
     re-execs this trtllm-serve command line with env vars pointing at the
     launcher executor's attach endpoints — the multi-frontend request
     ingress plus per-frontend result lanes (see
@@ -443,7 +449,7 @@ def _spawn_attached_frontends(llm, num_frontends: int) -> tuple[list, str]:
     if not isinstance(executor, GenerationExecutorProxy) or (
             attach_info := executor.multi_frontend_attach_info()) is None:
         raise ValueError(
-            "TLLM_SERVE_NUM_FRONTENDS > 1 requires the classic IPC executor "
+            "num_serve_frontends > 1 requires the classic IPC executor "
             f"proxy in multi-frontend mode, got {type(executor).__name__}")
     # mkstemp creates the file 0600: it carries the executor HMAC keys.
     fd, attach_info_path = tempfile.mkstemp(prefix="trtllm_frontend_",
@@ -480,21 +486,17 @@ def _terminate_attached_frontends(children: list) -> None:
 
 
 def _cleanup_multi_frontend_artifacts(attach_info_path: Optional[str]) -> None:
-    """Remove the attach-info file (it carries HMAC keys) and the ipc dir.
+    """Remove the attach-info file (it carries HMAC keys).
 
-    Launcher-only, after the attached frontends have been terminated.
-    Unlinking ipc socket paths does not disturb established zmq connections
-    (the engine may still be draining its result lanes at teardown); it only
-    prevents new connects.
+    Launcher-only, after the attached frontends have been terminated. The
+    shared ipc directory is owned and removed by the launcher's executor
+    proxy (GenerationExecutorProxy.shutdown).
     """
     if attach_info_path is not None:
         try:
             os.unlink(attach_info_path)
         except OSError:
             pass
-    ipc_dir = os.environ.get("TLLM_MULTI_FRONTEND_IPC_DIR")
-    if ipc_dir:
-        shutil.rmtree(ipc_dir, ignore_errors=True)
 
 
 def launch_server(
@@ -1046,6 +1048,13 @@ def launch_visual_gen_server(
                   help="Number of workers to postprocess raw responses "
                   "to comply with OpenAI protocol.",
                   status="prototype")
+@stability_option("--num_serve_frontends",
+                  type=click.IntRange(min=1, max=1 << 16),
+                  default=1,
+                  help="Number of HTTP frontend processes serving one "
+                  "executor; values > 1 share the serving port via "
+                  "SO_REUSEPORT (classic IPC executor path only).",
+                  status="prototype")
 @stability_option("--num_input_processor_workers",
                   type=click.IntRange(min=1),
                   default=8,
@@ -1236,7 +1245,8 @@ def serve(
         moe_expert_parallel_size: Optional[int],
         moe_cluster_parallel_size: Optional[int], gpus_per_node: Optional[int],
         free_gpu_memory_fraction: float, kv_cache_dtype: str,
-        num_postprocess_workers: int, num_input_processor_workers: int,
+        num_postprocess_workers: int, num_serve_frontends: int,
+        num_input_processor_workers: int,
         num_media_load_workers: int, trust_remote_code: bool,
         revision: Optional[str], extra_llm_api_options: Optional[str],
         reasoning_parser: Optional[str], tool_parser: Optional[str],
@@ -1331,6 +1341,7 @@ def serve(
             free_gpu_memory_fraction=free_gpu_memory_fraction,
             kv_cache_dtype=kv_cache_dtype,
             num_postprocess_workers=num_postprocess_workers,
+            num_serve_frontends=num_serve_frontends,
             trust_remote_code=trust_remote_code,
             revision=revision,
             reasoning_parser=reasoning_parser,
@@ -1959,9 +1970,9 @@ def _launch_disaggregated_server(disagg_config_file: str, llm_args: dict):
         port=server_cfg.port,
         llm_args=llm_args,
         allow_request_chat_template=disagg_config.allow_request_chat_template,
-        # Disagg ctx/gen workers inherit the submitter's env (e.g. Slurm
-        # export-all); an exported TLLM_SERVE_NUM_FRONTENDS must not switch
-        # them into multi-frontend mode.
+        # Disagg ctx/gen workers must not enter multi-frontend mode (e.g.
+        # via a num_serve_frontends knob or an env fallback inherited under
+        # Slurm export-all).
         multi_frontend_enabled=False)
 
 

@@ -575,7 +575,13 @@ class GenerationExecutor(ABC):
                     "TLLM_EXECUTOR_ATTACH_INFO only supports the classic IPC "
                     f"executor path, got mode={attach_info.get('mode')!r}")
             from .proxy import GenerationExecutorFrontendProxy
-            frontend_id = int(os.environ["TLLM_EXECUTOR_FRONTEND_ID"])
+            frontend_id_env = os.getenv("TLLM_EXECUTOR_FRONTEND_ID")
+            if frontend_id_env is None:
+                raise ValueError(
+                    "TLLM_EXECUTOR_ATTACH_INFO is set but "
+                    "TLLM_EXECUTOR_FRONTEND_ID is not; both are set together "
+                    "by trtllm-serve when spawning attached frontends.")
+            frontend_id = int(frontend_id_env)
             logger.info(f"Attaching executor frontend {frontend_id} to the "
                         f"running classic IPC worker via {attach_info_path}")
             return GenerationExecutorFrontendProxy(

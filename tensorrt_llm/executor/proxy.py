@@ -16,6 +16,8 @@ import atexit
 import concurrent.futures
 import json
 import os
+import shutil
+import tempfile
 import threading
 import weakref
 from queue import Empty
@@ -43,7 +45,6 @@ from .rpc import RPCClient
 from .rpc.rpc_common import RPCError, get_unique_ipc_addr
 from .utils import (EngineDeadError, ErrorResponse, RequestError,
                     WorkerCommIpcAddrs, create_mpi_comm_session,
-                    get_multi_frontend_ipc_info, get_num_serve_frontends,
                     get_spawn_proxy_process_env, is_llm_response,
                     multi_frontend_request_addr, multi_frontend_result_addr,
                     namespace_client_id, print_alive_threads)
@@ -164,20 +165,24 @@ class GenerationExecutorProxy(GenerationExecutor):
         self._enable_resource_governor = bool(
             getattr(_llm_args, "enable_resource_governor", False))
 
-        # Multi-frontend serving (TLLM_SERVE_NUM_FRONTENDS > 1) on the classic
-        # IPC path: trtllm-serve (the launcher, frontend 0) pre-generates a
-        # shared ipc directory + HMAC key so this proxy, the rank0 worker and
-        # the attached frontends agree on deterministic endpoints (see
-        # _setup_queues). Attached frontends never reach this class -- they
-        # construct GenerationExecutorFrontendProxy instead.
-        self._multi_frontend_info = get_multi_frontend_ipc_info()
-        self._num_frontends = get_num_serve_frontends(
-        ) if self._multi_frontend_info is not None else 1
-        if self._num_frontends > 1 and self._enable_resource_governor:
-            raise ValueError(
-                "Multi-frontend serving does not support "
-                "enable_resource_governor: the resource-governor signal only "
-                "reaches the launcher frontend.")
+        # Multi-frontend serving (llm_args.num_serve_frontends > 1) on the
+        # classic IPC path: this launcher proxy owns the shared ipc directory
+        # + HMAC key for the per-frontend endpoints (see _setup_queues);
+        # trtllm-serve hands them to the attached frontends via
+        # multi_frontend_attach_info(). Attached frontends never reach this
+        # class -- they construct GenerationExecutorFrontendProxy instead.
+        self._num_frontends = getattr(_llm_args, "num_serve_frontends", 1) or 1
+        self._multi_frontend_ipc_dir: Optional[str] = None
+        self._multi_frontend_hmac: Optional[bytes] = None
+        if self._num_frontends > 1:
+            if self._enable_resource_governor:
+                raise ValueError(
+                    "Multi-frontend serving does not support "
+                    "enable_resource_governor: the resource-governor signal "
+                    "only reaches the launcher frontend.")
+            self._multi_frontend_ipc_dir = tempfile.mkdtemp(
+                prefix="trtllm_frontends_")
+            self._multi_frontend_hmac = os.urandom(32)
 
         # Generate RPC address and key for stats RPC
         self.rpc_addr = get_unique_ipc_addr()
@@ -421,7 +426,8 @@ class GenerationExecutorProxy(GenerationExecutor):
             # (including this launcher, frontend 0) binds its own result lane
             # (PULL) that the worker / postproc processes PUSH-connect to,
             # selected by the frontend id in client_id's top bits.
-            ipc_dir, hmac_key = self._multi_frontend_info
+            ipc_dir = self._multi_frontend_ipc_dir
+            hmac_key = self._multi_frontend_hmac
             request_addr = (multi_frontend_request_addr(ipc_dir), hmac_key)
             frontend_result_addrs = [(multi_frontend_result_addr(ipc_dir,
                                                                  i), hmac_key)
@@ -475,7 +481,8 @@ class GenerationExecutorProxy(GenerationExecutor):
         """
         if self._num_frontends <= 1:
             return None
-        ipc_dir, hmac_key = self._multi_frontend_info
+        ipc_dir = self._multi_frontend_ipc_dir
+        hmac_key = self._multi_frontend_hmac
         return {
             "mode":
             "classic",
@@ -702,8 +709,19 @@ class GenerationExecutorProxy(GenerationExecutor):
         if not self.mpi_futures or any(not f.done() for f in self.mpi_futures):
             self.request_queue.put_noblock(None, retry=4)
 
+    def _cleanup_multi_frontend_ipc_dir(self):
+        """Remove the launcher-owned multi-frontend ipc directory.
+
+        Unlinking ipc socket paths does not disturb established zmq
+        connections; it only prevents new connects.
+        """
+        if self._multi_frontend_ipc_dir is not None:
+            shutil.rmtree(self._multi_frontend_ipc_dir, ignore_errors=True)
+            self._multi_frontend_ipc_dir = None
+
     def shutdown(self):
         if not self.workers_started:
+            self._cleanup_multi_frontend_ipc_dir()
             return
 
         if not self.doing_shutdown:
@@ -743,6 +761,7 @@ class GenerationExecutorProxy(GenerationExecutor):
         self.result_queue.close()
         if self._resource_governor_queue is not None:
             self._resource_governor_queue.close()
+        self._cleanup_multi_frontend_ipc_dir()
 
         self.workers_started = False
         if self._owns_mpi_session:
