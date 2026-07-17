@@ -19,7 +19,6 @@ import torch
 
 from .msa_utils import (
     MSA_REQUIRED_TOPK,
-    cache_view_to_msa_paged,
     per_token_valid_blocks,
     require_msa_module,
     select_blocks_from_maxscore,
@@ -122,7 +121,7 @@ class MsaIndexer:
     def select_blocks(
         self,
         idx_q: torch.Tensor,
-        idx_k_cache: torch.Tensor,
+        idx_k_paged: torch.Tensor,
         *,
         idx_sm_scale: float,
         kv_indices: torch.Tensor,
@@ -144,7 +143,6 @@ class MsaIndexer:
         both, and generation is the one-query-token-per-request special case.
         """
         config = self.config
-        idx_k_paged = cache_view_to_msa_paged(idx_k_cache)
 
         if proxy_plan is None:
             max_score = _proxy_max_score(
