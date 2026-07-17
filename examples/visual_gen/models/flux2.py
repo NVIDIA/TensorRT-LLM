@@ -13,11 +13,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""FLUX.2 text-to-image generation.
+"""FLUX.2 text-to-image and reference-image generation.
 
 Usage:
     python flux2.py
     python flux2.py --visual_gen_args ../configs/flux2-dev-fp4-1gpu.yaml
+    python flux2.py --reference_image subject.png
+    python flux2.py --reference_image subject.png --reference_image style.png
 """
 
 import argparse
@@ -35,7 +37,9 @@ def _output_paths(output_path: str, num_images: int) -> str | list[str]:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="FLUX.2 Text-to-Image example")
+    parser = argparse.ArgumentParser(
+        description="FLUX.2 text-to-image and reference-image generation example"
+    )
     parser.add_argument(
         "--model",
         type=str,
@@ -62,6 +66,42 @@ def main():
         help="Number of images to generate for the prompt",
     )
     parser.add_argument(
+        "--reference_image",
+        action="append",
+        default=None,
+        help="Reference image path; repeat for a shared set of up to 10 images",
+    )
+    parser.add_argument(
+        "--height",
+        type=int,
+        default=None,
+        help="Output height; with references, omitted uses the first processed image",
+    )
+    parser.add_argument(
+        "--width",
+        type=int,
+        default=None,
+        help="Output width; with references, omitted uses the first processed image",
+    )
+    parser.add_argument(
+        "--num_inference_steps",
+        type=int,
+        default=None,
+        help="Number of denoising steps; omitted uses the model default",
+    )
+    parser.add_argument(
+        "--guidance_scale",
+        type=float,
+        default=None,
+        help="Embedded guidance scale; omitted uses the model default",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Random seed; omitted selects a fresh random seed",
+    )
+    parser.add_argument(
         "--output_path",
         type=str,
         default="flux2_output.png",
@@ -75,10 +115,25 @@ def main():
     extra_args = VisualGenArgs.from_yaml(args.visual_gen_args) if args.visual_gen_args else None
     visual_gen = VisualGen(model=args.model, args=extra_args)
 
-    # --- Model-specific: T2I request construction ---
-    # Start from per-model defaults (resolution, steps, guidance, seed, etc.) and set image count.
+    # Start from per-model defaults and override only user-provided request fields.
     params = visual_gen.default_params
     params.num_images_per_prompt = args.num_images_per_prompt
+    params.image = args.reference_image
+    if args.reference_image:
+        # Let FLUX.2 derive omitted dimensions from the first processed reference.
+        params.height = args.height
+        params.width = args.width
+    else:
+        if args.height is not None:
+            params.height = args.height
+        if args.width is not None:
+            params.width = args.width
+    if args.num_inference_steps is not None:
+        params.num_inference_steps = args.num_inference_steps
+    if args.guidance_scale is not None:
+        params.guidance_scale = args.guidance_scale
+    if args.seed is not None:
+        params.seed = args.seed
 
     output = visual_gen.generate(inputs=args.prompt, params=params)
 
