@@ -114,6 +114,22 @@ PROFILE_TRACE_ENV_VAR_NAME = "TLLM_TORCH_PROFILE_TRACE"
 # Default: "0" (only rank 0 prints, matching existing behavior).
 PROFILE_LOG_RANKS_ENV_VAR_NAME = "TLLM_PROFILE_LOG_RANKS"
 
+_DISAGG_TRANSFER_DIAGNOSTICS_ENV = "TRTLLM_DISAGG_TRANSFER_DIAGNOSTICS"
+_DISAGG_TRANSFER_DIAGNOSTICS_ENABLED = (
+    os.getenv(_DISAGG_TRANSFER_DIAGNOSTICS_ENV) == "1")
+_DISAGG_STATUS_POLL_LOG_THRESHOLD_MS = 1.0
+
+
+def _is_disagg_transfer_diagnostics_enabled() -> bool:
+    return _DISAGG_TRANSFER_DIAGNOSTICS_ENABLED
+
+
+def _format_disagg_diag_request_blocks(
+        request_blocks: Iterable[Tuple[int, int]]) -> str:
+    encoded = ",".join(f"{request_id}:{blocks}"
+                       for request_id, blocks in request_blocks)
+    return encoded or "-"
+
 
 class PPCommTag(IntEnum):
     """
@@ -3408,6 +3424,30 @@ class PyExecutor:
         return isinstance(getattr(self, "kv_cache_manager", None),
                           KVCacheManagerV2)
 
+    def _log_disagg_transfer_diagnostic(self, category: str, **fields) -> None:
+        if not _is_disagg_transfer_diagnostics_enabled():
+            return
+        timestamp = fields.pop("t", None)
+        if timestamp is None:
+            timestamp = get_steady_clock_now_in_seconds()
+        rank = getattr(getattr(self, "dist", None), "rank", -1)
+        encoded_fields = " ".join(f"{key}={value}"
+                                  for key, value in fields.items())
+        logger.info(f"[DISAGG_DIAG][{category}] t={timestamp:.9f} "
+                    f"rank={rank} {encoded_fields}")
+
+    @staticmethod
+    def _disagg_diag_request_id(request: LlmRequest) -> int:
+        return request.py_request_id
+
+    def _disagg_diag_request_blocks(
+            self, requests: Iterable[LlmRequest],
+            controller: DisaggTransferAdmissionController
+    ) -> List[Tuple[int, int]]:
+        return [(self._disagg_diag_request_id(request),
+                 controller._estimate_request_blocks(request))
+                for request in requests]
+
     def _apply_disagg_transfer_admission(
         self, fitting_disagg_gen_init_requests: List[LlmRequest]
     ) -> Tuple[List[LlmRequest], bool]:
@@ -3424,6 +3464,76 @@ class PyExecutor:
 
         admission_result = controller.select(self.active_requests,
                                              fitting_disagg_gen_init_requests)
+        if _is_disagg_transfer_diagnostics_enabled():
+            decision_time = get_steady_clock_now_in_seconds()
+            decision_sequence = getattr(
+                self, "_disagg_diag_admission_decision_sequence", 0) + 1
+            self._disagg_diag_admission_decision_sequence = decision_sequence
+            active_requests = [
+                request for request in self.active_requests
+                if request.is_disagg_generation_transmission_in_progress
+            ]
+            candidate_request_blocks = self._disagg_diag_request_blocks(
+                fitting_disagg_gen_init_requests, controller)
+            admitted_request_ids = {
+                self._disagg_diag_request_id(request)
+                for request in admission_result.admitted_requests
+            }
+            admitted_request_blocks = [
+                request_block for request_block in candidate_request_blocks
+                if request_block[0] in admitted_request_ids
+            ]
+            deferred_request_blocks = [
+                request_block for request_block in candidate_request_blocks
+                if request_block[0] not in admitted_request_ids
+            ]
+            active_request_blocks = self._disagg_diag_request_blocks(
+                active_requests, controller)
+            candidate_transfer_blocks = sum(
+                blocks for _, blocks in candidate_request_blocks)
+            deferred_transfer_blocks = sum(
+                blocks for _, blocks in deferred_request_blocks)
+            self._log_disagg_transfer_diagnostic(
+                "decision",
+                t=decision_time,
+                sequence=decision_sequence,
+                runtime=type(self.kv_cache_transceiver).__name__,
+                active_blocks=admission_result.active_transfer_blocks,
+                candidates=len(candidate_request_blocks),
+                candidate_blocks=candidate_transfer_blocks,
+                admitted=len(admitted_request_blocks),
+                admitted_blocks=admission_result.admitted_transfer_blocks,
+                deferred=admission_result.deferred_request_count,
+                deferred_blocks=deferred_transfer_blocks,
+                budget=controller.max_transfer_blocks)
+            snapshot = (tuple(active_request_blocks),
+                        tuple(candidate_request_blocks),
+                        tuple(admitted_request_blocks))
+            last_snapshot = getattr(self, "_last_disagg_diag_admission", None)
+            if admission_result.admitted_requests or snapshot != last_snapshot:
+                self._log_disagg_transfer_diagnostic(
+                    "admission",
+                    t=decision_time,
+                    sequence=decision_sequence,
+                    runtime=type(self.kv_cache_transceiver).__name__,
+                    active=len(active_request_blocks),
+                    active_blocks=admission_result.active_transfer_blocks,
+                    active_requests=_format_disagg_diag_request_blocks(
+                        active_request_blocks),
+                    candidates=len(candidate_request_blocks),
+                    candidate_blocks=candidate_transfer_blocks,
+                    candidate_requests=_format_disagg_diag_request_blocks(
+                        candidate_request_blocks),
+                    admitted=len(admitted_request_blocks),
+                    admitted_blocks=(admission_result.admitted_transfer_blocks),
+                    admitted_requests=_format_disagg_diag_request_blocks(
+                        admitted_request_blocks),
+                    deferred=admission_result.deferred_request_count,
+                    deferred_blocks=deferred_transfer_blocks,
+                    deferred_requests=_format_disagg_diag_request_blocks(
+                        deferred_request_blocks),
+                    budget=controller.max_transfer_blocks)
+                self._last_disagg_diag_admission = snapshot
         if admission_result.deferred_request_count > 0:
             logger.debug("Disagg transfer admission deferred "
                          f"{admission_result.deferred_request_count} requests; "
@@ -6039,8 +6149,27 @@ class PyExecutor:
             self._check_cache_transfer_errors("generation requests")
             return
 
+        diagnostics_enabled = _is_disagg_transfer_diagnostics_enabled()
+        controller = (self._get_disagg_transfer_admission_controller()
+                      if diagnostics_enabled else None)
         for req in new_gen_reqs:
+            if diagnostics_enabled:
+                submit_start = get_steady_clock_now_in_seconds()
             self.kv_cache_transceiver.request_and_receive_async(req)
+            if diagnostics_enabled:
+                submit_end = get_steady_clock_now_in_seconds()
+                assert controller is not None
+                self._log_disagg_transfer_diagnostic(
+                    "submit",
+                    t=submit_end,
+                    runtime=type(self.kv_cache_transceiver).__name__,
+                    request=self._disagg_diag_request_id(req),
+                    blocks=controller._estimate_request_blocks(req),
+                    bytes=getattr(req, "py_kv_cache_xfer_bytes", 0),
+                    submit_start_t=f"{submit_start:.9f}",
+                    submit_call_ms=(
+                        f"{(submit_end - submit_start) * 1000:.6f}"),
+                    state=getattr(req.state, "name", str(req.state)))
 
         if self.kv_cache_transceiver.kv_transfer_timeout_ms is not None:
             for req in new_gen_reqs:
@@ -6190,14 +6319,106 @@ class PyExecutor:
 
     @nvtx_range("_check_disagg_gen_cache_transfer_status")
     def _check_disagg_gen_cache_transfer_status(self, atLeastNum: int = 0):
+        diagnostics_enabled = _is_disagg_transfer_diagnostics_enabled()
+        tracked_requests = []
+        poll_start = 0.0
+        if diagnostics_enabled:
+            tracked_requests = [
+                request for request in self.active_requests
+                if request.is_disagg_generation_transmission_in_progress
+            ]
+            poll_start = get_steady_clock_now_in_seconds()
         result = self.kv_cache_transceiver.check_gen_transfer_status(atLeastNum)
+        completed_count = 0
+        failed_count = 0
+        cancelled_count = 0
         if isinstance(result, tuple):
-            _, _, cancelled_reqs = result
+            completed_reqs, failed_reqs, cancelled_reqs = result
+            completed_count = len(completed_reqs)
+            failed_count = len(failed_reqs)
+            cancelled_count = len(cancelled_reqs)
             user_canceled_set = set(self.canceled_req_ids)
             for req in cancelled_reqs:
                 req_id = req.py_request_id if not req.is_child else req.parent_request_id
                 if req_id not in user_canceled_set:
                     req.state = LlmRequestState.DISAGG_TRANS_ERROR
+        else:
+            # The C++ binding reports progress by mutating request state and
+            # returns no outcome tuple. Derive the same poll counters from the
+            # before/after request snapshot so no-progress samples are valid
+            # for both transceiver runtimes.
+            for request in tracked_requests:
+                if request.is_disagg_generation_transmission_in_progress:
+                    continue
+                if (request.state ==
+                        LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE):
+                    completed_count += 1
+                elif request.state == LlmRequestState.DISAGG_TRANS_ERROR:
+                    failed_count += 1
+                else:
+                    cancelled_count += 1
+        poll_end = 0.0
+        if diagnostics_enabled:
+            poll_end = get_steady_clock_now_in_seconds()
+            poll_call_ms = (poll_end - poll_start) * 1000
+            should_log_poll = (
+                atLeastNum is None or atLeastNum > 0
+                or poll_call_ms >= _DISAGG_STATUS_POLL_LOG_THRESHOLD_MS
+                or completed_count + failed_count + cancelled_count > 0)
+            if should_log_poll:
+                self._log_disagg_transfer_diagnostic(
+                    "status-poll",
+                    t=poll_end,
+                    runtime=type(self.kv_cache_transceiver).__name__,
+                    poll_start_t=f"{poll_start:.9f}",
+                    poll_call_ms=f"{poll_call_ms:.6f}",
+                    at_least_num=("all" if atLeastNum is None else atLeastNum),
+                    tracked=len(tracked_requests),
+                    completed=completed_count,
+                    failed=failed_count,
+                    cancelled=cancelled_count)
+        if tracked_requests:
+            reap_time = poll_end
+            controller = self._get_disagg_transfer_admission_controller()
+            offset = LlmRequest.global_steady_clock_offset
+            offset_seconds = (offset.total_seconds()
+                              if offset is not None else 0.0)
+            for request in tracked_requests:
+                if request.is_disagg_generation_transmission_in_progress:
+                    continue
+                request_state = getattr(request.state, "name",
+                                        str(request.state))
+                if (request.state ==
+                        LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE):
+                    outcome = "completed"
+                elif request.state == LlmRequestState.DISAGG_TRANS_ERROR:
+                    outcome = "failed"
+                else:
+                    outcome = "cancelled"
+                ready_time = getattr(request, "py_kv_transfer_ready_time_s",
+                                     0.0)
+                if not ready_time:
+                    transfer_end = getattr(request, "kv_cache_transfer_end",
+                                           None)
+                    if transfer_end is not None:
+                        ready_time = max(
+                            0.0,
+                            transfer_end.total_seconds() - offset_seconds)
+                ready_to_reap_ms = (-1.0 if not ready_time else
+                                    (reap_time - ready_time) * 1000)
+                self._log_disagg_transfer_diagnostic(
+                    "reap",
+                    t=reap_time,
+                    runtime=type(self.kv_cache_transceiver).__name__,
+                    request=self._disagg_diag_request_id(request),
+                    blocks=controller._estimate_request_blocks(request),
+                    bytes=getattr(request, "py_kv_cache_xfer_bytes",
+                                  getattr(request, "kv_cache_size", 0)),
+                    ready_t=f"{ready_time:.9f}",
+                    ready_to_reap_ms=f"{ready_to_reap_ms:.6f}",
+                    poll_call_ms=f"{(poll_end - poll_start) * 1000:.6f}",
+                    outcome=outcome,
+                    state=request_state)
         if not self._is_disagg_inflight_cancel_active():
             self._check_cache_transfer_errors("generation requests")
 
