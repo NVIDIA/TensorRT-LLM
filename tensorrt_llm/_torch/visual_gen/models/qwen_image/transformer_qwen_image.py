@@ -32,11 +32,27 @@ from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.models.modeling import BaseDiffusionModel
 from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode
 from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
+from tensorrt_llm.models.modeling_utils import QuantConfig
 
 _WEIGHT_KEY_REMAPS = [
     (".net.0.proj.", ".up_proj."),
     (".net.2.", ".down_proj."),
 ]
+
+# Parameters created by the shared FP8/NVFP4 Linear methods that ModelOpt does
+# not serialize. ``alpha`` and ``inv_input_scale`` are derived from serialized
+# scales by the shared ``Linear.load_weights()`` path. ``kv_scales`` and
+# ``inv_kv_scales`` are placeholders for the LLM fused-QKV path; Qwen-Image
+# uses separate Q/K/V projections without a KV cache, so they remain at their
+# defaults and are never read. Keep the list scoped to parameters actually
+# registered on each Linear so other missing checkpoint weights still fail
+# strict validation.
+_NON_SERIALIZED_QUANT_PARAM_NAMES = (
+    "alpha",
+    "inv_input_scale",
+    "kv_scales",
+    "inv_kv_scales",
+)
 
 
 def _remap_checkpoint_keys(weights: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
@@ -825,6 +841,8 @@ class QwenImageTransformer2DModel(BaseDiffusionModel):
             **linear_kwargs,
         )
 
+        self.apply_quant_config_exclude_modules()
+
     @property
     def device(self) -> torch.device:
         return self.proj_out.weight.device
@@ -873,6 +891,40 @@ class QwenImageTransformer2DModel(BaseDiffusionModel):
                     buffer.data = buffer.data.to(target_dtype)
         return self
 
+    def apply_quant_config_exclude_modules(self) -> None:
+        quant_config = self.model_config.quant_config
+        if quant_config is None or quant_config.exclude_modules is None:
+            return
+
+        kv_cache_quant_algo = quant_config.kv_cache_quant_algo if quant_config else None
+        no_quant_config = QuantConfig(kv_cache_quant_algo=kv_cache_quant_algo)
+
+        for name, module in self.named_modules():
+            if isinstance(module, Linear):
+                is_excluded = quant_config.is_module_excluded_from_quantization(name)
+                if is_excluded and getattr(module, "quant_config", None) is not None:
+                    module.quant_config = no_quant_config
+                    if getattr(module, "_weights_created", False):
+                        # Rebuild weights so quant_method and parameter layout match the no-quant config.
+                        module._weights_created = False
+                        module._parameters.clear()
+                        module._buffers.clear()
+                        module.create_weights()
+
+    def _non_serialized_quant_parameter_names(self) -> set[str]:
+        """Return shared Linear parameters absent from ModelOpt checkpoints."""
+        non_serialized = set()
+        for module_name, module in self.named_modules():
+            if not isinstance(module, Linear) or module.quant_config is None:
+                continue
+            prefix = f"{module_name}." if module_name else ""
+            non_serialized.update(
+                f"{prefix}{param_name}"
+                for param_name in _NON_SERIALIZED_QUANT_PARAM_NAMES
+                if module._parameters.get(param_name) is not None
+            )
+        return non_serialized
+
     def load_weights(self, weights: Dict[str, torch.Tensor]) -> None:
         """Load HF ``transformer/*.safetensors`` state_dict.
 
@@ -889,7 +941,10 @@ class QwenImageTransformer2DModel(BaseDiffusionModel):
 
         expected = {name for name, _ in self.named_parameters()}
         provided = set(weights)
-        missing = sorted(expected - provided)
+        # WAN uses the same shared Linear methods but does not perform this
+        # model-vs-checkpoint key check. Exempt only their known non-serialized
+        # parameters while retaining strict validation for real Qwen weights.
+        missing = sorted((expected - provided) - self._non_serialized_quant_parameter_names())
         unexpected = sorted(provided - expected)
         # Dynamic quantization creates scale parameters while loading Linear
         # modules, so those keys are expected to be absent from BF16 checkpoints.

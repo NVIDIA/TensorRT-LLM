@@ -70,6 +70,10 @@ class KvCacheConfigV2:
     copy_on_partial_reuse: bool = False
     dtype: str = "auto"
     disk_prefetch_num_reqs: int = 4
+    pool_ratio: Optional[List[float]] = None
+    avg_seq_len: Optional[int] = None
+    block_reuse_policy: str = "all_reusable"
+    enable_swa_scratch_reuse: bool = False
     # V2 specific field
     max_util_for_resume: float = 0.95
 
@@ -506,7 +510,15 @@ def get_block_data(
     """Unified block data retrieval for both V1 and V2 KVCacheManager."""
     if use_v2:
         layer_grouping = kv_cache_manager.impl.layer_grouping
-        local_layer_indices = layer_grouping[layer_group_id]
+        # Read layers in ascending global-layer order so this verification does
+        # not depend on the KV-cache manager's internal layer_grouping order
+        # (an implementation detail, not an API contract). The merge below packs
+        # ranks at ascending layer offsets, so the per-rank stack must also be
+        # ascending by global layer.
+        local_layer_indices = sorted(
+            layer_grouping[layer_group_id],
+            key=lambda lid: kv_cache_manager.pp_layers[lid],
+        )
 
         all_layer_data = []
         for local_layer_idx in local_layer_indices:

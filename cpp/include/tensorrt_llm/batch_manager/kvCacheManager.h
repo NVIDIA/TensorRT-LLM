@@ -51,6 +51,11 @@
 
 namespace kvc = tensorrt_llm::executor::kv_cache;
 
+namespace tensorrt_llm::batch_manager::kv_cache_manager
+{
+class FabricMemory;
+} // namespace tensorrt_llm::batch_manager::kv_cache_manager
+
 namespace tensorrt_llm::batch_manager::eviction_policy
 {
 class BaseEvictionPolicy;
@@ -98,6 +103,13 @@ template <typename T>
 std::list<std::vector<T>> chopVectorIntoBlocks(
     std::vector<T> const& vec, SizeType32 usableSize, SizeType32 elementsPerBlock, bool allowPartial)
 {
+    // No usable elements yields no blocks. Guard non-positive usableSize explicitly: callers may pass
+    // usableSize = inputLength - 1, which is -1 for a Helix CP "empty" rank with 0 input tokens. With a
+    // negative usableSize, downstream usage of "vec.begin() + usableSize" is undefined behavior.
+    if (usableSize <= 0)
+    {
+        return {};
+    }
     TLLM_CHECK_WITH_INFO(
         usableSize <= static_cast<SizeType32>(vec.size()), "usableSize=%d > %ld=vec.size()", usableSize, vec.size());
     std::list<std::vector<T>> blockedVectors;
@@ -315,8 +327,8 @@ struct KvCacheStats
     std::size_t allocatedBytes{};
 };
 
-/// @brief Per-iteration KV cache statistics. All delta counters represent changes since the last call to
-/// getIterationStats(). Gauges are instantaneous snapshots.
+/// @brief Per-iteration KV cache statistics. All delta counters and peak gauges represent values since the last call
+/// to getIterationStats(). Snapshot gauges are instantaneous.
 struct KvCacheIterationStats
 {
     // --- Instantaneous gauges ---
@@ -324,10 +336,23 @@ struct KvCacheIterationStats
     SizeType32 primaryMaxNumBlocks{0};
     SizeType32 primaryFreeNumBlocks{0};
     SizeType32 primaryUsedNumBlocks{0};
+    // Cached-but-unpinned blocks in the primary pool. Distinct from primaryUsedNumBlocks,
+    // which also counts blocks pinned during onboard memcpy windows.
+    SizeType32 primaryEvictableNumBlocks{0};
+    SizeType32 primaryPeakFreeNumBlocks{0};
+    SizeType32 primaryPeakUsedNumBlocks{0};
+    SizeType32 primaryPeakEvictableNumBlocks{0};
     // Secondary (host) pool
     SizeType32 secondaryMaxNumBlocks{0};
     SizeType32 secondaryFreeNumBlocks{0};
     SizeType32 secondaryUsedNumBlocks{0};
+    // Cached-but-unpinned blocks in the secondary pool. Useful to gauge "how full is the
+    // host cache"; secondaryUsedNumBlocks only counts pinned blocks during the sub-ms
+    // onboard memcpy window so it cannot answer that question on its own.
+    SizeType32 secondaryEvictableNumBlocks{0};
+    SizeType32 secondaryPeakFreeNumBlocks{0};
+    SizeType32 secondaryPeakUsedNumBlocks{0};
+    SizeType32 secondaryPeakEvictableNumBlocks{0};
 
     // --- Per-iteration deltas (reset on each read) ---
     // Context phase: block allocation and reuse
@@ -349,6 +374,11 @@ struct KvCacheIterationStats
     // Intra-device (GPU → GPU) block copies (e.g. partial reuse when source block has refs)
     SizeType32 iterIntraDeviceCopyBlocks{0};
     std::size_t iterIntraDeviceCopyBytes{0};
+
+    // Pages released by LRU from the last cache tier without ever being onboarded back
+    // to GPU during their stay at that tier (i.e. fully dropped from the hierarchy).
+    SizeType32 iterHostDroppedBlocks{0};
+    std::size_t iterHostDroppedBytes{0};
 };
 
 // Basic building block of a paged KV cache - a single
@@ -486,6 +516,10 @@ public:
     [[nodiscard]] bool isShared() const;
 
     [[nodiscard]] bool isLeaf() const;
+
+    //! \brief Test if block is detached from radix search tree.
+    //! \return True if block is detached from search tree.
+    [[nodiscard]] bool isDetached() const;
 
     void setPriority(executor::RetentionPriority priority);
 
@@ -1340,6 +1374,8 @@ private:
 
     // Buffer manager
     runtime::BufferManager mBufferManager;
+    // Fabric memory backing for primary pools (MNNVL-capable allocation)
+    std::vector<std::unique_ptr<kv_cache_manager::FabricMemory>> mFabricMemoryPools;
 
     // Used to keep track of number of free blocks during scheduling
     SizeType32 mSchedulingNumFreeBlocks;
@@ -2541,6 +2577,24 @@ public:
 
     [[nodiscard]] std::vector<executor::IdType> commitAndGetBlockHashesForRequest(
         LlmRequest const& llmRequest, SizeType32 windowSize) override;
+
+    //! @brief Translate logical block IDs into primary-pool block indices.
+    //! @details A block ID is stable for the lifetime of a block, but its position inside the
+    //!          memory pool can change after offload/onboard cycles. This function performs
+    //!          that translation. The returned index is the value of
+    //!          `KVCacheBlock::getMemoryPoolBlockIndex()` for each input, with the pool flag
+    //!          stripped (see `kernels::KVCacheIndex::get()`), so it is only meaningful for
+    //!          blocks resident in the primary pool. Every referenced block must therefore be
+    //!          primary; this is asserted. Callers (e.g. the disaggregation cache transceiver
+    //!          on the Python side) cannot check residency themselves, and the invariant holds
+    //!          because allocation onboards offloaded blocks and offload only ever selects free
+    //!          blocks — a violation indicates a block-lifetime bug.
+    //! @param blockIds  IDs to translate.
+    //! @param windowSize Attention window the IDs belong to (selects the WindowBlockManager).
+    //! @throws Aborts via TLLM_CHECK_WITH_INFO if any referenced block is not found or is not
+    //!         currently in the primary pool.
+    [[nodiscard]] std::vector<kernels::KVCacheIndex::UnderlyingType> getMemoryPoolBlockIndicesByBlockIds(
+        std::vector<KVCacheBlock::IdType> const& blockIds, SizeType32 windowSize) const;
 
     std::optional<KVCacheBlock::IdType> getLastBlockId(LlmRequest::RequestIdType requestId) const override;
 

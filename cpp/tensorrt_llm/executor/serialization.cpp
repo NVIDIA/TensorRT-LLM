@@ -1427,7 +1427,9 @@ SchedulerConfig Serialization::deserializeSchedulerConfig(std::istream& is)
     auto capacitySchedulerPolicy = su::deserialize<CapacitySchedulerPolicy>(is);
     auto contextChunkingPolicy = su::deserialize<std::optional<ContextChunkingPolicy>>(is);
     auto dynamicBatchConfig = su::deserialize<std::optional<DynamicBatchConfig>>(is);
-    return SchedulerConfig{capacitySchedulerPolicy, contextChunkingPolicy, dynamicBatchConfig};
+    auto enablePrefixAwareScheduling = su::deserialize<bool>(is);
+    return SchedulerConfig{
+        capacitySchedulerPolicy, contextChunkingPolicy, dynamicBatchConfig, enablePrefixAwareScheduling};
 }
 
 void Serialization::serialize(SchedulerConfig const& schedulerConfig, std::ostream& os)
@@ -1435,6 +1437,7 @@ void Serialization::serialize(SchedulerConfig const& schedulerConfig, std::ostre
     su::serialize(schedulerConfig.getCapacitySchedulerPolicy(), os);
     su::serialize(schedulerConfig.getContextChunkingPolicy(), os);
     su::serialize(schedulerConfig.getDynamicBatchConfig(), os);
+    su::serialize(schedulerConfig.getEnablePrefixAwareScheduling(), os);
 }
 
 size_t Serialization::serializedSize(SchedulerConfig const& schedulerConfig)
@@ -1443,6 +1446,7 @@ size_t Serialization::serializedSize(SchedulerConfig const& schedulerConfig)
     totalSize += su::serializedSize(schedulerConfig.getCapacitySchedulerPolicy());
     totalSize += su::serializedSize(schedulerConfig.getContextChunkingPolicy());
     totalSize += su::serializedSize(schedulerConfig.getDynamicBatchConfig());
+    totalSize += su::serializedSize(schedulerConfig.getEnablePrefixAwareScheduling());
     return totalSize;
 }
 
@@ -1453,7 +1457,9 @@ CacheTransceiverConfig Serialization::deserializeCacheTransceiverConfig(std::ist
     auto maxTokensInBuffer = su::deserialize<std::optional<size_t>>(is);
     auto kvTransferTimeoutMs = su::deserialize<std::optional<int>>(is);
     auto kvTransferSenderFutureTimeoutMs = su::deserialize<std::optional<int>>(is);
-    return CacheTransceiverConfig{backendType, maxTokensInBuffer, kvTransferTimeoutMs, kvTransferSenderFutureTimeoutMs};
+    auto kvTransferPollIntervalMs = su::deserialize<std::optional<int>>(is);
+    return CacheTransceiverConfig{
+        backendType, maxTokensInBuffer, kvTransferTimeoutMs, kvTransferSenderFutureTimeoutMs, kvTransferPollIntervalMs};
 }
 
 void Serialization::serialize(CacheTransceiverConfig const& cacheTransceiverConfig, std::ostream& os)
@@ -1462,6 +1468,7 @@ void Serialization::serialize(CacheTransceiverConfig const& cacheTransceiverConf
     su::serialize(cacheTransceiverConfig.getMaxTokensInBuffer(), os);
     su::serialize(cacheTransceiverConfig.getKvTransferTimeoutMs(), os);
     su::serialize(cacheTransceiverConfig.getKvTransferSenderFutureTimeoutMs(), os);
+    su::serialize(cacheTransceiverConfig.getKvTransferPollIntervalMs(), os);
 }
 
 size_t Serialization::serializedSize(CacheTransceiverConfig const& cacheTransceiverConfig)
@@ -1471,6 +1478,7 @@ size_t Serialization::serializedSize(CacheTransceiverConfig const& cacheTranscei
     totalSize += su::serializedSize(cacheTransceiverConfig.getMaxTokensInBuffer());
     totalSize += su::serializedSize(cacheTransceiverConfig.getKvTransferTimeoutMs());
     totalSize += su::serializedSize(cacheTransceiverConfig.getKvTransferSenderFutureTimeoutMs());
+    totalSize += su::serializedSize(cacheTransceiverConfig.getKvTransferPollIntervalMs());
     return totalSize;
 }
 

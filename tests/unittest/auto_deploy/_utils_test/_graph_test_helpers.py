@@ -244,11 +244,15 @@ def run_sharding_pattern_detection_test(
         detected_transformations: List of detected transformation configurations
         expected_transformations: List of expected transformation configurations
     """
-    # Remove config field from transformations
+    # Remove non-identity fields (config, derived weight_name) before comparison:
+    # detected transforms carry a from_node-resolved weight_name; expected ones are
+    # hand-built without it, so normalize both to None.
     for transform in detected_transformations:
         transform.config = None
+        transform.weight_name = None
     for transform in expected_transformations:
         transform.config = None
+        transform.weight_name = None
 
     # Convert to sets for unordered comparison
     detected_set = set(detected_transformations)

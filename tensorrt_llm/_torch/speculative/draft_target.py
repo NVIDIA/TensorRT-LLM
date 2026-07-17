@@ -70,7 +70,7 @@ class DraftTargetOneModelSpecMetadata(SpecMetadata):
             num_seqs, dtype=torch.int, device="cpu", pin_memory=prefer_pinned()
         )
         self.batch_indices_cuda[:num_seqs].copy_(batch_indices, non_blocking=True)
-        self.num_tokens -= self.num_generations * self.max_draft_len
+        self.num_tokens -= self.num_generations * self.runtime_draft_len
         self.is_spec_dec_tree = False
         self.is_spec_dec_dynamic_tree = False
 
@@ -131,10 +131,11 @@ class DraftTargetOneModelWorker(SpecWorkerBase):
         num_accepted_tokens: torch.Tensor,
         num_contexts: int,
         batch_size: int,
+        runtime_draft_len: int,
     ):
         if hasattr(attn_metadata, "kv_lens_cuda"):
             attn_metadata.kv_lens_cuda[num_contexts:batch_size] -= (
-                self.max_draft_len - num_accepted_tokens[num_contexts:batch_size]
+                runtime_draft_len - num_accepted_tokens[num_contexts:batch_size]
             )
             attn_metadata.kv_lens_cuda[:num_contexts] += 1
 
@@ -175,6 +176,18 @@ class DraftTargetOneModelWorker(SpecWorkerBase):
         batch_size = attn_metadata.num_seqs
         num_contexts = attn_metadata.num_contexts
         num_gens = batch_size - num_contexts
+        runtime_draft_len = spec_metadata.runtime_draft_len
+
+        if runtime_draft_len == 0:
+            return self.skip_drafting(
+                input_ids,
+                position_ids,
+                hidden_states,
+                logits,
+                attn_metadata,
+                spec_metadata,
+                draft_model,
+            )
 
         raw_logits = logits
 
@@ -204,10 +217,10 @@ class DraftTargetOneModelWorker(SpecWorkerBase):
         draft_kv_cache_manager = self.get_draft_kv_cache_manager(resource_manager)
 
         with self.draft_kv_cache_context(attn_metadata, draft_kv_cache_manager):
-            for i in range(self.max_draft_len):
+            for i in range(runtime_draft_len):
                 if i == 0:
                     start_ids_gen = (
-                        spec_metadata.batch_indices_cuda[:num_gens] * (self.max_draft_len + 1)
+                        spec_metadata.batch_indices_cuda[:num_gens] * (runtime_draft_len + 1)
                     ).long()
                     gather_ids_gen = (
                         start_ids_gen
@@ -244,10 +257,14 @@ class DraftTargetOneModelWorker(SpecWorkerBase):
                     hidden_states[gather_ids], draft_model.lm_head, attn_metadata, True
                 )
                 if self.guided_decoder is not None:
-                    d2t = getattr(draft_model.model, "d2t", None)
-                    self.guided_decoder.execute_draft_batch(logits, d2t, draft_step=i)
+                    self.guided_decoder.execute_draft_batch(logits, self._d2t, draft_step=i)
 
-                new_draft_token = self.draft_decoder(logits, draft_model)
+                new_draft_token = self.sample_draft_tokens(
+                    logits,
+                    spec_metadata,
+                    batch_size,
+                    draft_step=i,
+                )
                 next_draft_tokens.append(new_draft_token)
 
                 # Update inputs and metadata for next draft step
@@ -260,7 +277,11 @@ class DraftTargetOneModelWorker(SpecWorkerBase):
                         attn_metadata.host_request_types[: attn_metadata.num_contexts].fill_(1)
                         attn_metadata.num_contexts = 0
                     self._update_kv_after_first_draft_step(
-                        attn_metadata, num_accepted_tokens, num_contexts, batch_size
+                        attn_metadata,
+                        num_accepted_tokens,
+                        num_contexts,
+                        batch_size,
+                        runtime_draft_len,
                     )
                 else:
                     self._update_kv_for_chained_draft_step(attn_metadata, batch_size)
@@ -297,35 +318,6 @@ class DraftTargetOneModelWorker(SpecWorkerBase):
             "next_new_tokens": next_new_tokens,
         }
 
-    def sample_and_accept_draft_tokens(
-        self,
-        logits: torch.Tensor,
-        attn_metadata: AttentionMetadata,
-        spec_metadata: DraftTargetOneModelSpecMetadata,
-    ):
-        batch_size = attn_metadata.num_seqs
-        num_contexts = attn_metadata.num_contexts
-        num_gens = batch_size - num_contexts
-
-        if spec_metadata.draft_tokens is None:
-            draft_tokens = torch.zeros(
-                (num_gens, self.max_draft_len), dtype=torch.int, device=logits.device
-            )
-        else:
-            draft_tokens = spec_metadata.draft_tokens.reshape(num_gens, self.max_draft_len)
-
-        return self._sample_and_accept_draft_tokens_base(
-            logits, draft_tokens, num_contexts, batch_size, spec_metadata
-        )
-
-    def draft_decoder(
-        self,
-        logits: torch.Tensor,
-        draft_model: nn.Module,
-    ):
-        d2t = getattr(draft_model.model, "d2t", None)
-        return self._draft_sampler_greedy(logits, d2t)
-
     def prepare_1st_drafter_inputs(
         self,
         input_ids: torch.LongTensor,
@@ -337,6 +329,7 @@ class DraftTargetOneModelWorker(SpecWorkerBase):
         num_contexts = attn_metadata.num_contexts
         batch_size = attn_metadata.num_seqs
         num_gens = batch_size - num_contexts
+        runtime_draft_len = spec_metadata.runtime_draft_len
 
         if num_contexts > 0:
             input_ids_ctx = self._prepare_context_input_ids(
@@ -350,7 +343,9 @@ class DraftTargetOneModelWorker(SpecWorkerBase):
             input_ids_ctx = torch.empty(0, dtype=torch.int32, device="cuda")
 
         if num_gens > 0:
-            input_ids_gen = accepted_tokens[num_contexts:, :].flatten().to(torch.int32)
+            input_ids_gen = (
+                accepted_tokens[num_contexts:, : runtime_draft_len + 1].flatten().to(torch.int32)
+            )
         else:
             input_ids_gen = torch.empty(0, dtype=torch.int32, device="cuda")
 

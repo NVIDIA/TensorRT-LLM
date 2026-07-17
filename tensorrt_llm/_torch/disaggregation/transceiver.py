@@ -1,3 +1,4 @@
+import time
 import uuid
 from collections import defaultdict
 from itertools import chain
@@ -16,19 +17,20 @@ from tensorrt_llm._torch.disaggregation.base.transfer import (
     WaitResult,
     get_unique_rid,
 )
+from tensorrt_llm._torch.disaggregation.native.bounce import (
+    config_from_size as bounce_config_from_size,
+)
 from tensorrt_llm._torch.disaggregation.native.transfer import TransferWorker, TransferWorkerConfig
 from tensorrt_llm._torch.disaggregation.resource.cache_reuse import (
     CacheReuseAdapter,
     create_cache_reuse_adapter,
 )
 from tensorrt_llm._torch.disaggregation.resource.page import MambaLayerGroup
+from tensorrt_llm._torch.disaggregation.resource.utils import get_physical_pool
 from tensorrt_llm._torch.distributed.communicator import Distributed
 from tensorrt_llm._torch.pyexecutor.kv_cache_transceiver import KvCacheTransceiver
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
-from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import (
-    MambaHybridCacheManager,
-    PythonMambaCacheManager,
-)
+from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import MambaHybridCacheManager
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.bindings import LlmRequestState
@@ -63,6 +65,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         self._kv_cache_manager = kv_cache_manager
         self._mapping = mapping
         self.kv_transfer_timeout_ms = cache_transceiver_config.kv_transfer_timeout_ms
+        self.kv_transfer_poll_interval_ms = cache_transceiver_config.kv_transfer_poll_interval_ms
         self._sender_future_timeout_ms = (
             cache_transceiver_config.kv_transfer_sender_future_timeout_ms
         )
@@ -83,6 +86,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 max_concurrent_sessions=max(1, int(kv_cache_manager.max_batch_size)) * 20000,
                 tx_timeout_s=self._sender_future_timeout_ms / 1000.0,
                 rx_timeout_s=self.kv_transfer_timeout_ms / 1000.0,
+                # Size 0 turns bounce off; the block-count gate is internal (tuned via env).
+                bounce=bounce_config_from_size(cache_transceiver_config.kv_cache_bounce_size_mb),
             )
         )
         self._dp_rank = mapping.tp_rank if mapping.enable_attention_dp else 0
@@ -96,6 +101,9 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         self._recv_reqs = {}
         self._wait_reqs = {}
         self._page_table = self._transfer_worker.page_table
+        # _slice_num_bytes() is this rank's KV shard, so scale by tp_size to get the request total (kv_cache_size),
+        # except under attention DP where the local count already is the total.
+        self._kv_size_rank_factor = 1 if mapping.enable_attention_dp else max(1, mapping.tp_size)
 
         # Sticky role markers; flip True once any session opens, used to short-circuit
         # per-iter tp_allgather when this transceiver never sends/receives.
@@ -130,9 +138,6 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         endpoints = cast(list, self._dist.allgather(self._transfer_worker.sender_endpoint))
         layer_num = len(self._kv_cache_manager.pp_layers)
         if isinstance(self._kv_cache_manager, MambaHybridCacheManager):
-            assert isinstance(self._kv_cache_manager._impl, PythonMambaCacheManager), (
-                "CppMambaCacheManager is not supported with Python transceiver, please set TRTLLM_USE_CPP_MAMBA=0"
-            )
             layer_num += len(self._kv_cache_manager._impl.mamba_layer_offsets)
         layer_num_per_pp = cast(list, getattr(self._dist, "pp_allgather")(layer_num))
         self._transfer_worker.populate_instance_and_rank_info(
@@ -162,12 +167,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
     def __exit__(self, _exc_type, _exc_val, _exc_tb):
         self.shutdown()
 
-    def _create_kv_slice(
-        self,
-        req: LlmRequest,
-        token_range: Optional[TokenRange] = None,
-        is_last_slice: bool = True,
-    ) -> KVSlice:
+    def _create_kv_slice(self, req: LlmRequest) -> KVSlice:
         adapter = self._reuse_adapter
         tpb = adapter.tokens_per_block
         assert self._page_table is not None
@@ -180,13 +180,18 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             else [0] * len(layer_groups)
         )
 
-        if token_range is None and req.prompt_len > 0:
-            # Align with KV cache allocation (resize_context /
-            # _get_context_bytes), which reserves prompt_len +
-            # num_extra_kv_tokens slots for speculative decoding methods
-            # (e.g. EAGLE3) that consume extra KV positions per request.
-            num_extra_kv_tokens = getattr(self._kv_cache_manager, "num_extra_kv_tokens", 0) or 0
-            token_range = TokenRange(start=0, end=req.prompt_len + num_extra_kv_tokens)
+        token_range = None
+        if req.prompt_len > 0:
+            # end must match the trimmed block list below (ceil(prompt_len / tpb)
+            # blocks). num_extra_kv_tokens slots (speculative decoding) are not
+            # transferred. In the previously added support for ctx disabling
+            # speculative decoding while gen enables it, both sides currently
+            # use prompt_len as the transfer range, so the ranges stay
+            # consistent.
+            # TODO: the accuracy impact of not transferring num_extra_kv_tokens
+            # on MTP and other speculative decoding paths is currently unclear;
+            # revisit whether these extra KV slots need to be transferred.
+            token_range = TokenRange(start=0, end=req.prompt_len)
 
         groups = []
         for idx, lg in enumerate(layer_groups):
@@ -195,8 +200,6 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 continue
             block_ids = adapter.get_block_ids(req, idx, lg)
             # Limit to prompt_len blocks, matching C++ cacheFormatter behavior.
-            # Extra blocks from num_extra_kv_tokens (speculative decoding) have
-            # uninitialized KV data and must not be transferred.
             total_blocks = (req.prompt_len + tpb - 1) // tpb
             if block_ids.size > total_blocks:
                 block_ids = block_ids[:total_blocks]
@@ -231,11 +234,32 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             mamba_state_index = self._kv_cache_manager.mamba_cache_index[req.py_request_id]
 
         return KVSlice(
-            is_last_slice=is_last_slice,
+            is_last_slice=True,
             block_ids_per_layer_groups=groups,
             mamba_state_index=mamba_state_index,
             token_range=token_range,
         )
+
+    def _slice_num_bytes(self, slice: KVSlice) -> int:
+        """Local-rank KV bytes covered by a slice (sum of num_valid_blocks * pool.slot_bytes), enough to populate
+        kv_cache_size and unblock the perf-metric timestamps that gate on it."""
+        pt = self._page_table
+        if pt is None:
+            return 0
+        total = 0
+        for lg_id, block_ids in enumerate(slice.block_ids_per_layer_groups):
+            if block_ids is None or block_ids.size == 0:
+                continue
+            lg = pt.layer_groups[lg_id]
+            if isinstance(lg, MambaLayerGroup):
+                continue
+            n = int((block_ids >= 0).sum())
+            if n == 0:
+                continue
+            for pv in lg.pool_views:
+                pool = get_physical_pool(pt, lg_id, pv.pool_idx)
+                total += n * pool.slot_bytes
+        return total
 
     @staticmethod
     def _split_packed_beam_block_ids(
@@ -321,14 +345,6 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         return _find_consensus_request_ids(all_ranks, sync_size)
 
     @staticmethod
-    def _allgather_or_passthrough(
-        local_ids, allgather: Callable, need_sync: bool
-    ) -> List[List[int]]:
-        if not need_sync:
-            return [list(local_ids)]
-        return list(allgather(list(local_ids)))
-
-    @staticmethod
     def _union(all_lists: List[List[int]]) -> set:
         merged: set = set()
         for ids in all_lists:
@@ -349,9 +365,14 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         self, to_process, cancelled, failed, completed, allgather: Callable, need_sync: bool
     ):
         # CANCELLED/FAILED on any rank → global; COMPLETED only when ALL ranks agree.
-        all_c = self._allgather_or_passthrough(cancelled, allgather, need_sync)
-        all_f = self._allgather_or_passthrough(failed, allgather, need_sync)
-        all_done = self._allgather_or_passthrough(completed, allgather, need_sync)
+        # Batch the three id lists into one allgather to cut the per-step collective count.
+        if not need_sync:
+            all_c, all_f, all_done = [list(cancelled)], [list(failed)], [list(completed)]
+        else:
+            packed = list(allgather([list(cancelled), list(failed), list(completed)]))
+            all_c = [p[0] for p in packed]
+            all_f = [p[1] for p in packed]
+            all_done = [p[2] for p in packed]
         n = len(all_c)
         global_cancelled = self._union(all_c)
         global_failed = self._union(all_f)
@@ -480,13 +501,16 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             session = self._transfer_worker.create_rx_session(req)
             self._recv_sessions[rid] = session
             self._recv_reqs[rid] = req
-            session.receive(self._create_kv_slice(req))
+            kv_slice = self._create_kv_slice(req)
+            session.receive(kv_slice)
             result = session.wait_complete(blocking=True)
 
             if result == WaitResult.COMPLETED:
+                # KV-transfer timing setters deferred to #15871 (clock-source consistency); size only.
+                req.set_kv_cache_size(self._slice_num_bytes(kv_slice) * self._kv_size_rank_factor)
                 if self._need_aux_transfer(req):
                     self._apply_aux(session, req)
-                self._trim_kv_to_prompt_history(req)
+                self._assert_disagg_history_declared(req)
                 req.state = LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
             else:
                 req.state = LlmRequestState.DISAGG_TRANS_ERROR
@@ -511,13 +535,21 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         req.state = LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
         session = self._transfer_worker.create_rx_session(req)
         self._recv_sessions[rid] = session
-        session.receive(self._create_kv_slice(req))
+        kv_slice = self._create_kv_slice(req)
+        req.py_kv_cache_xfer_bytes = self._slice_num_bytes(kv_slice) * self._kv_size_rank_factor
+        session.receive(kv_slice)
         self._recv_reqs[rid] = req
 
     def check_context_transfer_status(
         self, at_least_request_num: Optional[int], mark_complete: bool = False
     ):
-        if not self._ever_had_send_session and not self._ctx_need_pp_sync:
+        # A worker that never sends KV has nothing to reconcile here, so skip the consensus. Safe
+        # because the flag flips together on every rank and never resets, so they all skip in step;
+        # gating on the live session dict instead would not be, since a cancel clears it per-rank.
+        # Keep the original sweep (only when tp/pp sync is on) so nothing is leaked.
+        if not self._ever_had_send_session:
+            if self._ctx_need_tp_sync or self._ctx_need_pp_sync:
+                self._transfer_worker.sweep_stale_req_infos()
             return [], []
         block_all = at_least_request_num is None
         wait_num = at_least_request_num if not block_all else 0
@@ -533,11 +565,13 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         completed, timed_out, failed, cancelled = [], [], [], []
         for rid in to_process:
             session = self._send_sessions[rid]
-            result = session.wait_complete()
+            result = session.wait_complete(blocking=block_all)
             if session.status == SessionStatus.CANCELLED:
                 cancelled.append(rid)
             elif result == WaitResult.COMPLETED:
                 completed.append(rid)
+            elif result is None:
+                continue
             elif result == WaitResult.TIMEOUT:
                 logger.warning(
                     f"TxSession rid={session.disagg_request_id} timed out after {self._sender_future_timeout_ms}ms"
@@ -572,16 +606,19 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         return completed, failed
 
     def check_gen_transfer_status(self, at_least_request_num: Optional[int]):
-        if not self._ever_had_recv_session and not self._ctx_need_pp_sync:
+        if not self._ever_had_recv_session and not self._gen_need_sync:
             return [], [], []
         block_all = at_least_request_num is None
         wait_num = at_least_request_num if not block_all else 0
+        need_progress = wait_num > 0
+        if need_progress:
+            self._poll_gen_sessions_for_poll_interval(wait_num)
 
         local_completed, local_failed = self._collect_done(self._recv_sessions, self._recv_reqs)
         to_process = self._build_to_process(
             self._recv_sessions,
             self._gen_consensus(local_completed + local_failed),
-            wait_num,
+            0 if need_progress else wait_num,
             block_all,
         )
 
@@ -616,9 +653,11 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         for rid in completed:
             session = self._recv_sessions[rid]
             req = self._recv_reqs[rid]
+            # transfer_end already stamped at completion detection above.
+            req.set_kv_cache_size(getattr(req, "py_kv_cache_xfer_bytes", 0))
             if self._need_aux_transfer(req):
                 self._apply_aux(session, req)
-            self._trim_kv_to_prompt_history(req)
+            self._assert_disagg_history_declared(req)
             req.state = LlmRequestState.DISAGG_GENERATION_TRANS_COMPLETE
             session.close()
             del self._recv_reqs[rid]
@@ -632,38 +671,56 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
 
         return completed, failed, cancelled_reqs
 
+    def _poll_gen_sessions_for_poll_interval(self, wait_num: int) -> None:
+        poll_interval_s = (self.kv_transfer_poll_interval_ms or 0) / 1000.0
+        deadline = time.monotonic() + poll_interval_s
+        while True:
+            completed, failed = self._collect_done(self._recv_sessions, self._recv_reqs)
+            if len(completed) + len(failed) >= wait_num:
+                return
+            remaining_s = deadline - time.monotonic()
+            if remaining_s <= 0:
+                return
+            for session in self._recv_sessions.values():
+                session.wait_complete(blocking=False)
+            time.sleep(min(0.001, remaining_s))
+
     def check_gen_transfer_complete(self):
         return len(self._recv_sessions) == 0
 
-    def _trim_kv_to_prompt_history(self, req: LlmRequest) -> None:
-        """Mark received KV as historic so SWA pools release pre-window blocks.
+    def _assert_disagg_history_declared(self, req: LlmRequest) -> None:
+        """Verify the V2 scheduler pre-declared prompt_len as history.
 
-        Call right before the TRANS_COMPLETE state transition.  The cache
-        was sized to hold the full prompt by ``resize_context`` and just
-        got fully populated by the transfer; setting ``history_length`` to
-        the prompt length triggers ``_unlock_stale_blocks`` inside V2's
-        ``resize()`` for any sliding-window life cycle, releasing blocks
-        before the window back to their pool group.
+        Call right before the TRANS_COMPLETE state transition.  The V2
+        scheduler's ``_try_schedule_disagg_gen_init`` calls
+        ``prepare_disagg_gen_init``, which sets ``kv_cache.history_length``
+        to ``prompt_len`` at allocation time so SWA stale computation
+        skips pre-window blocks. If that contract is violated, SWA /
+        sparse-attn pools may fill with pre-window prompt blocks and the
+        V2 scheduler can deadlock under high concurrency (e.g., benchmark
+        fill-phase).
 
-        This closes the gap between transfer completion and
-        ``update_resources`` (which only runs after the *first* forward
-        pass and would otherwise be the first thing to update
-        ``history_length``).  In benchmark fill-phase the first forward
-        is gated until every disagg-gen request is ready, so without
-        this trim the SWA / sparse-attn pool groups stay 100% occupied
-        with pre-window prompt blocks and the V2 scheduler deadlocks
-        on the next ``resize(+1)``.
-
-        No-op for V1 managers and for V2 caches with only full-context
-        life cycles.
+        No-op for V1 managers (which lack ``get_history_length``) and for
+        V2 caches with only full-context life cycles (where the watermark
+        has no allocation effect).
         """
-        trim = getattr(self._kv_cache_manager, "trim_to_history", None)
-        if trim is None:
+        get_history = getattr(self._kv_cache_manager, "get_history_length", None)
+        if get_history is None:
             return
         prompt_len = getattr(req, "prompt_len", None)
         if not prompt_len or prompt_len <= 0:
             return
-        trim(req, prompt_len)
+        history = get_history(req)
+        if history is None:
+            # Cache was already released (e.g., cancelled mid-transfer); nothing to verify.
+            return
+        if history < prompt_len:
+            raise RuntimeError(
+                f"req {req.py_request_id}: kv_cache.history_length={history} "
+                f"< prompt_len={prompt_len} at TRANS_COMPLETE boundary. "
+                f"V2 scheduler must call prepare_disagg_gen_init() in "
+                f"_try_schedule_disagg_gen_init."
+            )
 
     def cancel_request(self, req: LlmRequest) -> bool:
         """Cancel the transfer for the given request.
@@ -727,6 +784,11 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             if rid not in self._send_sessions:
                 self._wait_reqs[rid] = req
                 req.state = LlmRequestState.DISAGG_CONTEXT_WAIT_SCHEDULER
+
+        # Nothing waiting on any rank, so skip the consensus. The waiting set is the same on every
+        # rank, so they all skip together.
+        if not self._wait_reqs:
+            return
 
         # Check which waiting requests have peer info locally, then allgather
         # consensus so all TP/PP ranks agree before promoting.

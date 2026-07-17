@@ -42,9 +42,10 @@ Operating modes:
   whose `post_load_weights()` is pure alias wiring; models that additionally
   rely on plain Python attributes set inside `post_load_weights()` (rather
   than registered `nn.Buffer` / `nn.Parameter` assignments) need to migrate
-  those side effects to `cache_derived_state()` or another path that runs on
-  RO readers. The GMS RO reader runs `setup_aliases()` before
-  `materialize_module()` and `cache_derived_state()` afterward; it does not
+  those side effects to `cache_derived_state()` or another hook that runs on
+  RO readers. One-shot tensor layout changes belong in `transform_weights()`
+  on the writer; the GMS RO reader runs `setup_aliases()` before
+  `materialize_module()`, then `cache_derived_state()` afterward. It does not
   run `transform_weights()`.
 """
 

@@ -1,9 +1,10 @@
-"""Multi-GPU tests for parallel VAE (ParallelVAE_Wan).
+"""Multi-GPU tests for parallel VAE (ParallelVAE_Wan and ParallelVAE_TrtllmWan).
 
-Validates that the parallel VAE adapter produces numerically equivalent
-decode/encode output compared to the original single-GPU AutoencoderKLWan.
+Validates that both parallel VAE adapters produce numerically equivalent
+decode/encode output compared to their single-GPU counterparts
+(diffusers ``AutoencoderKLWan`` and the native ``WanVAE``).
 
-Uses a small randomly-initialised model (no pretrained weights required).
+Uses small randomly-initialised models (no pretrained weights required).
 
 Run with:
     pytest tests/unittest/_torch/visual_gen/multi_gpu/test_parallel_vae.py -v
@@ -21,10 +22,22 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 try:
+    import sys
+    from pathlib import Path
+
     from diffusers.models.autoencoders.autoencoder_kl_wan import AutoencoderKLWan
 
-    from tensorrt_llm._torch.visual_gen.models.wan.parallel_vae import ParallelVAE_Wan
-    from tensorrt_llm._utils import get_free_port
+    from tensorrt_llm._torch.visual_gen.models.wan.parallel_vae import (
+        ParallelVAE_TrtllmWan,
+        ParallelVAE_Wan,
+    )
+    from tensorrt_llm._torch.visual_gen.models.wan.wan_vae import WanVAE, WanVAEConfig
+    from tensorrt_llm._torch.visual_gen.modules.vae.parallel_vae_interface import ParallelVAEFactory
+
+    # Spawn distributed workers via a helper that retries with a fresh master
+    # port when the c10d rendezvous TCPStore loses the bind race (EADDRINUSE).
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from _visual_gen_dist_utils import spawn_with_retry
 
     MODULES_AVAILABLE = True
 except ImportError:
@@ -72,8 +85,14 @@ def _run(world_size: int, test_fn: Callable):
         pytest.skip("Required modules not available")
     if torch.cuda.device_count() < world_size:
         pytest.skip(f"Need {world_size} GPUs, have {torch.cuda.device_count()}")
-    port = get_free_port()
-    mp.spawn(_distributed_worker, args=(world_size, test_fn, port), nprocs=world_size, join=True)
+    spawn_with_retry(
+        lambda port: mp.spawn(
+            _distributed_worker,
+            args=(world_size, test_fn, port),
+            nprocs=world_size,
+            join=True,
+        )
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -117,6 +136,46 @@ def _create_parallel_vae(vae, world_size, split_dim):
         for i in range(world_size - 1)
     ]
     return ParallelVAE_Wan(vae, pg, ParallelVAE_Wan.make_spec(split_dim), adj_groups)
+
+
+def _create_small_trtllm_vae(device):
+    """Create a small native ``WanVAE`` with random weights for testing.
+
+    Config mirrors ``_create_small_vae``: base_dim=32, z_dim=4, 2 resolution
+    levels, 1 res block, ``attn_scales=[]``, no temporal downsampling. Note
+    ``attn_scales=[]`` only disables the optional down-block attention; the
+    encoder and decoder mid-blocks each still contain a ``WanAttentionBlock``,
+    so the parallel attention replacement IS exercised by these tests. The
+    native WanVAE always runs in channels-last (no layout knob).
+    """
+    vae = (
+        WanVAE(
+            WanVAEConfig(
+                base_dim=32,
+                z_dim=4,
+                dim_mult=[1, 2],
+                num_res_blocks=1,
+                attn_scales=[],
+                temperal_downsample=[False],
+            )
+        )
+        .to(device)
+        .float()
+    )
+    vae.eval()
+    return vae
+
+
+def _create_parallel_trtllm_vae(vae, world_size, split_dim):
+    # Route through ParallelVAEFactory so the registry mapping
+    # (WanVAE -> ParallelVAE_TrtllmWan) is exercised, not just direct construction.
+    ranks = list(range(world_size))
+    pg = dist.new_group(ranks, use_local_synchronization=False)
+    adj_groups = [
+        dist.new_group([ranks[i], ranks[i + 1]], use_local_synchronization=False)
+        for i in range(world_size - 1)
+    ]
+    return ParallelVAEFactory.from_vae(vae, split_dim, pg, adj_groups)
 
 
 # ===========================================================================
@@ -317,6 +376,117 @@ class TestParallelVAEEncode:
 
     def test_encode_height_2gpu(self):
         _run(2, _logic_encode_height)
+
+
+# ===========================================================================
+# Trtllm WanVAE parallel test-logic functions
+# ===========================================================================
+
+
+def _logic_trtllm_decode_width(rank, world_size):
+    """ParallelVAE_TrtllmWan decode (width split) matches single-GPU WanVAE."""
+    device = f"cuda:{rank}"
+
+    vae = _create_small_trtllm_vae(device)
+    _broadcast_params(vae)
+
+    latent = torch.randn(1, 4, 3, 16, 16, dtype=torch.float32, device=device)
+    dist.broadcast(latent, src=0)
+
+    with torch.no_grad():
+        ref = vae.decode(latent, return_dict=False)[0].detach().clone()
+
+    parallel = _create_parallel_trtllm_vae(vae, world_size, "width")
+    # The factory must resolve the native WanVAE to the trtllm parallel wrapper.
+    assert isinstance(parallel, ParallelVAE_TrtllmWan)
+
+    with torch.no_grad():
+        par = parallel.decode(latent, return_dict=False)[0]
+
+    max_diff = torch.max(torch.abs(par - ref)).item()
+    assert max_diff < 0.01, f"Rank {rank}: trtllm decode width max_diff={max_diff:.6f}"
+
+
+def _logic_trtllm_decode_height(rank, world_size):
+    """ParallelVAE_TrtllmWan decode (height split) matches single-GPU WanVAE."""
+    device = f"cuda:{rank}"
+
+    vae = _create_small_trtllm_vae(device)
+    _broadcast_params(vae)
+
+    latent = torch.randn(1, 4, 3, 16, 16, dtype=torch.float32, device=device)
+    dist.broadcast(latent, src=0)
+
+    with torch.no_grad():
+        ref = vae.decode(latent, return_dict=False)[0].detach().clone()
+
+    parallel = _create_parallel_trtllm_vae(vae, world_size, "height")
+
+    with torch.no_grad():
+        par = parallel.decode(latent, return_dict=False)[0]
+
+    max_diff = torch.max(torch.abs(par - ref)).item()
+    assert max_diff < 0.01, f"Rank {rank}: trtllm decode height max_diff={max_diff:.6f}"
+
+
+def _logic_trtllm_encode_width(rank, world_size):
+    """ParallelVAE_TrtllmWan encode (width split) matches single-GPU WanVAE."""
+    device = f"cuda:{rank}"
+
+    vae = _create_small_trtllm_vae(device)
+    _broadcast_params(vae)
+
+    video = torch.randn(1, 3, 3, 32, 32, dtype=torch.float32, device=device)
+    dist.broadcast(video, src=0)
+
+    with torch.no_grad():
+        ref = vae.encode(video).latent_dist.mode().detach().clone()
+
+    parallel = _create_parallel_trtllm_vae(vae, world_size, "width")
+
+    with torch.no_grad():
+        par = parallel.encode(video).latent_dist.mode()
+
+    max_diff = torch.max(torch.abs(par - ref)).item()
+    assert max_diff < 0.01, f"Rank {rank}: trtllm encode width max_diff={max_diff:.6f}"
+
+
+def _logic_trtllm_encode_height(rank, world_size):
+    """ParallelVAE_TrtllmWan encode (height split) matches single-GPU WanVAE."""
+    device = f"cuda:{rank}"
+
+    vae = _create_small_trtllm_vae(device)
+    _broadcast_params(vae)
+
+    video = torch.randn(1, 3, 3, 32, 32, dtype=torch.float32, device=device)
+    dist.broadcast(video, src=0)
+
+    with torch.no_grad():
+        ref = vae.encode(video).latent_dist.mode().detach().clone()
+
+    parallel = _create_parallel_trtllm_vae(vae, world_size, "height")
+
+    with torch.no_grad():
+        par = parallel.encode(video).latent_dist.mode()
+
+    max_diff = torch.max(torch.abs(par - ref)).item()
+    assert max_diff < 0.01, f"Rank {rank}: trtllm encode height max_diff={max_diff:.6f}"
+
+
+class TestParallelVAETrtllmDecode:
+    def test_decode_width_2gpu(self):
+        _run(2, _logic_trtllm_decode_width)
+
+    def test_decode_height_2gpu(self):
+        _run(2, _logic_trtllm_decode_height)
+
+
+class TestParallelVAETrtllmEncode:
+    def test_encode_width_2gpu(self):
+        _run(2, _logic_trtllm_encode_width)
+
+    def test_encode_height_2gpu(self):
+        _run(2, _logic_trtllm_encode_height)
 
 
 if __name__ == "__main__":

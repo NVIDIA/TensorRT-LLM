@@ -1,3 +1,19 @@
+/*
+ * Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 @Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@main']) _
 
 import java.lang.InterruptedException
@@ -123,6 +139,13 @@ def DEBUG_MODE = "debug"
 def DETAILED_LOG = "detailed_log"
 @Field
 def CBTS_RESULT = "cbts_result"
+@Field
+def CBTS_COVERAGE = "cbts_coverage"
+@Field
+def DISABLE_CBTS = "disable_cbts"
+// Kill switch for CBTS per-test coverage; official post-merge pipeline only, single-GPU stages only in Phase 1.
+@Field
+def ENABLE_CBTS_COVERAGE = true
 
 def testFilter = [
     (REUSE_TEST): gitlabParamsFromBot.get(REUSE_TEST, null),
@@ -142,6 +165,8 @@ def testFilter = [
     (AUTO_TRIGGER_TAG_LIST): [],
     (DETAILED_LOG): gitlabParamsFromBot.get(DETAILED_LOG, false),
     (CBTS_RESULT): null,
+    (CBTS_COVERAGE): false,
+    (DISABLE_CBTS): gitlabParamsFromBot.get((DISABLE_CBTS), false),
 ]
 
 String reuseBuild = gitlabParamsFromBot.get('reuse_build', null)
@@ -313,6 +338,9 @@ def setupPipelineEnvironment(pipeline, testFilter, globalVars)
     testFilter[(ONLY_ONE_GROUP_CHANGED)] = getOnlyOneGroupChanged(pipeline, testFilter, globalVars)
     testFilter[(AUTO_TRIGGER_TAG_LIST)] = getAutoTriggerTagList(pipeline, testFilter, globalVars)
     testFilter[(CBTS_RESULT)] = getCbtsResult(pipeline, testFilter, globalVars)
+    // Decide CBTS coverage eligibility here so L0_Test only consumes the propagated flag.
+    testFilter[(CBTS_COVERAGE)] = ENABLE_CBTS_COVERAGE && (env.JOB_NAME ==~ /.*PostMerge.*/)
+    pipeline.echo("CBTS coverage eligible: ${testFilter[(CBTS_COVERAGE)]}")
     getContainerURIs().each { k, v ->
         globalVars[k] = v
     }
@@ -706,12 +734,20 @@ def getAutoTriggerTagList(pipeline, testFilter, globalVars) {
 //
 // Calls jenkins/scripts/cbts/main.py with PR changed_files + diffs and returns
 // a result map (or null = defer to existing filter chain). Result keys:
-// scope, affected_stages, reasons, test_db_dir_override, affected_stage_test_counts.
+// scope, affected_stages, reasons, test_db_dir_override,
+// affected_stage_test_counts, affected_stage_split_counts.
 // CBTS narrows test cases only — Build always runs. See cbts/README.md.
 // ============================================================================
 
 def getCbtsResult(pipeline, testFilter, globalVars)
 {
+    // Explicit kill switch: `/bot run --disable-cbts` forces a full run.
+    if (testFilter[(DISABLE_CBTS)]) {
+        pipeline.echo("CBTS: disabled — user-specified /bot run --disable-cbts")
+        _cbtsReportDecision(pipeline, globalVars, "disabled", "user flag: disable_cbts", null)
+        return null
+    }
+
     def isOfficialPostMergeJob = (env.JOB_NAME ==~ /.*PostMerge.*/)
     if (env.alternativeTRT || isOfficialPostMergeJob) {
         pipeline.echo("CBTS: deferring — post-merge job or alternativeTRT set")
@@ -747,7 +783,8 @@ def getCbtsResult(pipeline, testFilter, globalVars)
         def diffs = [:]
         for (f in changedFiles) {
             if (_cbtsMatchesAnyPattern(f, needsDiffFor)) {
-                diffs[f] = getMergeRequestOneFileChanges(pipeline, globalVars, f)
+                // Null (patch omitted for binary / rename / too-large diffs) coerces to empty.
+                diffs[f] = getMergeRequestOneFileChanges(pipeline, globalVars, f) ?: ""
             }
         }
 
@@ -780,8 +817,9 @@ def getCbtsResult(pipeline, testFilter, globalVars)
         // download fails.
         if (result.test_db_dir_override) {
             try {
-                sh "tar czf /tmp/cbts_test_db.tar.gz -C ${LLM_ROOT} ${result.test_db_dir_override}"
-                trtllm_utils.uploadArtifacts("/tmp/cbts_test_db.tar.gz", "${UPLOAD_PATH}/cbts/")
+                // Tar/upload from the workspace: rtUpload patterns are workspace-relative; /tmp uploads 0 files.
+                sh "tar czf ${LLM_ROOT}/cbts_test_db.tar.gz -C ${LLM_ROOT} ${result.test_db_dir_override}"
+                trtllm_utils.uploadArtifacts("${LLM_ROOT}/cbts_test_db.tar.gz", "${UPLOAD_PATH}/cbts/")
                 result.cbts_test_db_artifact_path = "${UPLOAD_PATH}/cbts/cbts_test_db.tar.gz"
                 pipeline.echo("CBTS Layer 3: uploaded cbts_test_db to ${result.cbts_test_db_artifact_path}")
             } catch (InterruptedException e) {
@@ -889,6 +927,7 @@ def _cbtsParseSelectionResult(String text)
         reasons: data.reasons ?: [],
         test_db_dir_override: data.test_db_dir_override,
         affected_stage_test_counts: data.affected_stage_test_counts ?: [:],
+        affected_stage_split_counts: data.affected_stage_split_counts ?: [:],
         // Explicit null check preserves `false`; default True is safe.
         sanity_required: data.sanity_required != null ? data.sanity_required : true,
         perfsanity_required: data.perfsanity_required != null ? data.perfsanity_required : true,
@@ -1200,8 +1239,16 @@ def collectTestResults(pipeline, testFilter, globalVars)
                     --output-file=rerun/rerun_report.xml \
                     --input-files=${inputfiles}
                 """
-                trtllm_utils.uploadArtifacts("rerun/rerun_report.html", "${UPLOAD_PATH}/test-results/")
-                echo "Rerun report: https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/test-results/rerun_report.html"
+                if (fileExists("rerun/rerun_report.html")) {
+                    try {
+                        trtllm_utils.uploadArtifacts("rerun/rerun_report.html", "${UPLOAD_PATH}/test-results/")
+                        echo "Rerun report: https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/test-results/rerun_report.html"
+                    } catch (Exception e) {
+                        echo "Failed to upload rerun report: ${e.toString()}"
+                    }
+                } else {
+                    echo "No rerun test results found, skipping rerun report upload."
+                }
                 catchError(
                     buildResult: 'SUCCESS',
                     stageResult: 'UNSTABLE') {
@@ -1219,34 +1266,27 @@ def collectTestResults(pipeline, testFilter, globalVars)
             try {
                 stage("Test Coverage") {
                     sh "ls"
-                    def CUR_PATH = sh(returnStdout: true, script: 'pwd').replaceAll("\\s","")
-                    sh "echo ${CUR_PATH}"
                     sh "rm -rf cov && mkdir -p cov"
-                    sh "find . -type f -wholename '*/.coverage.*' -exec mv {} cov/ \\; || true"
-                    sh "cd cov && find . -type f"
-                    def fileCount = sh(returnStdout: true, script: 'find cov -type f | wc -l').replaceAll("\\s","").toInteger()
+                    // Collect the per-process PY_START data files from every stage's results tarball.
+                    sh "find . -type f -name '.cbtscov.*.sqlite' -exec mv -t cov/ {} + || true"
+                    sh "cd cov && ls -la"
+                    def fileCount = sh(returnStdout: true, script: 'find cov -name ".cbtscov.*.sqlite" | wc -l').replaceAll("\\s","").toInteger()
                     if (fileCount == 0) {
-                        echo "Test coverage is skipped because there is no test data file."
+                        echo "CBTS coverage skipped: no PY_START data files."
                         return
                     }
-                    trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install coverage")
-                    sh "coverage --version"
-
-                    sh "cp llm/examples/openai_triton/manual_plugin/fmha_triton.py llm/examples/openai_triton/plugin_autogen/"
-                    def coverageConfigFile = "cov/.coveragerc"
+                    // Merge into the indexed touch DB, a per-file HTML report, and the coverage rate.
                     sh """
-                        echo '[paths]' > ${coverageConfigFile}
-                        echo 'source1=\n    ${CUR_PATH}/llm/examples/\n    */TensorRT-LLM/src/examples/' >> ${coverageConfigFile}
-                        echo 'source2=\n    ${CUR_PATH}/llm/tensorrt_llm/\n    */tensorrt_llm/' >> ${coverageConfigFile}
-                        cat ${coverageConfigFile}
+                        python3 llm/jenkins/scripts/cbts/coverage_utils/pystart_report.py \
+                            --glob 'cov/.cbtscov.*.sqlite' \
+                            --out-sqlite cov/cbts_touchmap.sqlite \
+                            --out-dir cov/cbts_report \
+                            --source-root llm/tensorrt_llm
                     """
-
-                    sh "cd cov && coverage combine"
-                    sh "cd cov && find . -type f"
-                    sh "cd cov && coverage report -i"   // -i: ignore errors. Ignore the error that the source code file cannot be found.
-                    sh "cd cov && coverage html -d test_coverage_html -i"
-                    trtllm_utils.uploadArtifacts("cov/test_coverage_html/*", "${UPLOAD_PATH}/test-results/coverage-report/")
-                    echo "Test coverage report: https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/test-results/coverage-report/index.html"
+                    // Upload compressed only: the guardword scanner byte-matches raw files but not archives.
+                    sh "cd cov && tar czf cbts_pystart_report.tar.gz cbts_touchmap.sqlite cbts_report"
+                    trtllm_utils.uploadArtifacts("cov/cbts_pystart_report.tar.gz", "${UPLOAD_PATH}/cbts-coverage/")
+                    echo "CBTS coverage (touch DB + report): https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/cbts-coverage/cbts_pystart_report.tar.gz"
                 } // Test coverage
             }
             catch (InterruptedException e)
@@ -1506,8 +1546,8 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                 }
 
                 if (singleGpuTestFailed) {
-                    if (env.JOB_NAME ==~ /.*PostMerge.*/ || !enableFailFast) {
-                        echo "In the official post-merge pipeline or when fail fast is disabled, x86_64 single-GPU test failed, whereas multi-GPU test is still kept running."
+                    if (env.JOB_NAME ==~ /.*PostMerge.*/) {
+                        echo "In the official post-merge pipeline, x86_64 single-GPU test failed, whereas multi-GPU test is still kept running."
                     } else {
                         stage("[Test-x86_64-Multi-GPU] Blocked") {
                             error "This pipeline requires running multi-GPU test, but x86_64 single-GPU test has failed."
@@ -1617,8 +1657,8 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                 }
 
                 if (singleGpuTestFailed) {
-                    if (env.JOB_NAME ==~ /.*PostMerge.*/ || !enableFailFast) {
-                        echo "In the official post-merge pipeline or when fail fast is disabled, SBSA single-GPU test failed, whereas multi-GPU test is still kept running."
+                    if (env.JOB_NAME ==~ /.*PostMerge.*/) {
+                        echo "In the official post-merge pipeline, SBSA single-GPU test failed, whereas multi-GPU test is still kept running."
                     } else {
                         stage("[Test-SBSA-Multi-GPU] Blocked") {
                             error "This pipeline requires running SBSA multi-GPU test, but SBSA single-GPU test has failed."

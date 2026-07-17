@@ -48,7 +48,7 @@ class PARDSpecMetadata(SpecMetadata):
         if sa_manager is not None:
             gen_request_ids = self.request_ids[num_seqs - self.num_generations :]
             if gen_request_ids:
-                sa_manager.prepare(gen_request_ids, self.max_draft_len)
+                sa_manager.prepare(gen_request_ids, self.runtime_draft_len)
 
     def _get_sa_manager(self):
         """Get SA manager from spec_resource_manager.
@@ -98,15 +98,6 @@ class PARDWorker(SpecWorkerBase):
     @property
     def max_draft_len(self) -> int:
         return self.spec_config.max_draft_len
-
-    @property
-    def _draft_tokens_per_req(self) -> int:
-        """Total tokens per gen request in the draft forward.
-
-        Uses 2K to fit all accepted tokens (up to K+1) plus K-1 mask tokens,
-        ensuring K unique predictions regardless of how many tokens were accepted.
-        """
-        return 2 * self.max_draft_len
 
     def _prepare_attn_metadata_for_pard(self, attn_metadata, spec_metadata):
         """
@@ -190,28 +181,23 @@ class PARDWorker(SpecWorkerBase):
         num_gens = batch_size - num_contexts
 
         raw_logits = logits
-        K = self.max_draft_len
+        K = spec_metadata.runtime_draft_len
+
+        if K == 0:
+            return self.skip_drafting(
+                input_ids,
+                position_ids,
+                hidden_states,
+                logits,
+                attn_metadata,
+                spec_metadata,
+                draft_model,
+            )
 
         self._execute_guided_decoder_if_present(logits)
 
-        # draft_tokens buffer has (2K-1) entries per gen request; extract the K real drafts
-        if num_gens > 0:
-            draft_tokens = spec_metadata.draft_tokens.reshape(num_gens, 2 * K - 1)[:, :K]
-        else:
-            draft_tokens = spec_metadata.draft_tokens.reshape(0, K)
-
-        # logits have 2K entries per gen request; extract K+1 for acceptance
-        if num_gens > 0:
-            ctx_logits = logits[:num_contexts]
-            vocab_size = logits.shape[-1]
-            gen_logits_2k = logits[num_contexts:].reshape(num_gens, 2 * K, vocab_size)
-            gen_logits_kp1 = gen_logits_2k[:, : K + 1, :].reshape(-1, vocab_size)
-            logits_for_accept = torch.cat([ctx_logits, gen_logits_kp1], dim=0)
-        else:
-            logits_for_accept = logits
-
-        accepted_tokens, num_accepted_tokens = self._sample_and_accept_draft_tokens_base(
-            logits_for_accept, draft_tokens, num_contexts, batch_size, spec_metadata
+        accepted_tokens, num_accepted_tokens = self.sample_and_accept_draft_tokens(
+            logits, attn_metadata, spec_metadata
         )
 
         # Pad accepted_tokens from (batch, K+1) to (batch, 2K) to match sampler buffer
@@ -262,14 +248,13 @@ class PARDWorker(SpecWorkerBase):
                 gen_start_idx = attn_metadata.num_ctx_tokens
 
                 request_bases = (
-                    torch.arange(num_gens, dtype=torch.long, device="cuda")
-                    * self._draft_tokens_per_req
+                    torch.arange(num_gens, dtype=torch.long, device="cuda") * (2 * K)
                     + gen_start_idx
                 )
 
                 gen_num_accepted = num_accepted_tokens[num_contexts:batch_size].long()
                 base_offsets = gen_num_accepted - 1  # M = bonus position
-                offsets = torch.arange(self.max_draft_len, dtype=torch.long, device="cuda")
+                offsets = torch.arange(K, dtype=torch.long, device="cuda")
 
                 gen_gather_ids = (
                     request_bases.unsqueeze(1) + base_offsets.unsqueeze(1) + offsets.unsqueeze(0)
@@ -281,16 +266,14 @@ class PARDWorker(SpecWorkerBase):
                 )
 
                 vocab_size = gen_logits.shape[-1]
-                gen_logits = gen_logits.reshape(num_gens, self.max_draft_len, vocab_size)
+                gen_logits = gen_logits.reshape(num_gens, K, vocab_size)
 
-                # Use torch.argmax directly to avoid cute_argmax stride issues
-                d2t = getattr(draft_model.model, "d2t", None)
-                gen_draft_tokens = torch.argmax(gen_logits, dim=-1, keepdim=False).long()
-
-                if d2t is not None:
-                    gen_draft_tokens = d2t[gen_draft_tokens] + gen_draft_tokens
-
-                gen_draft_tokens = gen_draft_tokens.type(torch.int32)
+                gen_draft_tokens = self.sample_draft_tokens(
+                    gen_logits,
+                    spec_metadata,
+                    batch_size,
+                    num_contexts=num_contexts,
+                )
 
                 if self.sa_enhancer is not None and sa_manager is not None:
                     gen_draft_tokens = self.sa_enhancer.maybe_override_all_draft_tokens(
@@ -311,6 +294,12 @@ class PARDWorker(SpecWorkerBase):
 
         else:
             gen_draft_tokens = torch.empty((0, 2 * K - 1), dtype=torch.int32, device="cuda")
+
+        # Context requests are not drafted by the block worker (zero placeholder
+        # token); fill their draft-prob slot rows with a one-hot placeholder so
+        # they are a legal distribution when they become gen requests next iter.
+        gen_vocab = vocab_size if num_gens > 0 else None
+        self.write_context_onehot_draft_probs(spec_metadata, num_contexts, num_gens, K, gen_vocab)
 
         if num_contexts > 0 and num_gens > 0:
             ctx_draft_tokens = torch.zeros(
@@ -345,23 +334,26 @@ class PARDWorker(SpecWorkerBase):
             "next_new_tokens": next_new_tokens,
         }
 
-    def draft_decoder(
-        self,
-        logits: torch.Tensor,
-        draft_model: nn.Module,
-    ):
-        """
-        Sample draft tokens using greedy decoding.
+    def _reshape_draft_tokens_for_accept(self, spec_metadata, num_gens, device):
+        # draft_tokens buffer has (2K-1) entries per gen request; extract the K real drafts.
+        K = spec_metadata.runtime_draft_len
+        if num_gens > 0:
+            draft_tokens = spec_metadata.draft_tokens[: num_gens * (2 * K - 1)]
+            return draft_tokens.reshape(num_gens, 2 * K - 1)[:, :K]
+        # Context-only batch: return an empty view without reshaping the
+        # (possibly preallocated, non-empty) draft_tokens buffer.
+        return torch.empty((0, K), dtype=torch.int32, device=device)
 
-        Args:
-            logits: [num_tokens, vocab_size] from the draft model.
-            draft_model: The draft model (used to read the d2t mapping).
-
-        Returns:
-            draft_tokens: [batch_size * max_draft_len] flattened token ids.
-        """
-        d2t = getattr(draft_model.model, "d2t", None)
-        return self._draft_sampler_greedy(logits, d2t)
+    def _reshape_logits_for_accept(self, logits, num_contexts, num_gens, spec_metadata):
+        # logits have 2K entries per gen request; extract K+1 for acceptance.
+        if num_gens == 0:
+            return logits
+        K = spec_metadata.runtime_draft_len
+        ctx_logits = logits[:num_contexts]
+        vocab_size = logits.shape[-1]
+        gen_logits_2k = logits[num_contexts:].reshape(num_gens, 2 * K, vocab_size)
+        gen_logits_kp1 = gen_logits_2k[:, : K + 1, :].reshape(-1, vocab_size)
+        return torch.cat([ctx_logits, gen_logits_kp1], dim=0)
 
     def prepare_1st_drafter_inputs(
         self,
@@ -384,6 +376,8 @@ class PARDWorker(SpecWorkerBase):
         num_contexts = attn_metadata.num_contexts
         batch_size = attn_metadata.num_seqs
         num_gens = batch_size - num_contexts
+        runtime_draft_len = spec_metadata.runtime_draft_len
+        total_tokens_per_req = 2 * runtime_draft_len
 
         if (
             hasattr(self.spec_config, "mask_token_id")
@@ -411,8 +405,6 @@ class PARDWorker(SpecWorkerBase):
         if num_gens > 0:
             gen_num_accepted = num_accepted_tokens[num_contexts : num_contexts + num_gens]
             gen_accepted_tokens = accepted_tokens[num_contexts : num_contexts + num_gens, :]
-
-            total_tokens_per_req = self._draft_tokens_per_req  # 2K
 
             # Start with all mask tokens
             request_ids_2d = torch.full(
@@ -452,9 +444,9 @@ class PARDWorker(SpecWorkerBase):
                     - total_tokens_per_req
                 )
             else:
-                gen_pos_starts = position_ids[
-                    attn_metadata.num_ctx_tokens :: self._draft_tokens_per_req
-                ][:num_gens]
+                gen_pos_starts = position_ids[attn_metadata.num_ctx_tokens :: total_tokens_per_req][
+                    :num_gens
+                ]
 
             offsets = torch.arange(total_tokens_per_req, dtype=torch.int32, device="cuda")
             position_ids_gen = (gen_pos_starts.unsqueeze(1) + offsets.unsqueeze(0)).flatten()
