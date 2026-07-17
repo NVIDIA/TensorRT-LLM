@@ -3948,7 +3948,74 @@ if IS_CUTLASS_DSL_AVAILABLE:
         ret = mat_a.new_empty(shape, dtype=torch.bfloat16)
         return ret
 
-    class CuteDSLFp8SplitKGemmRunner:
+    def _dsv4_ob_gen_split4_tuning_buckets(
+            max_num_tokens: int) -> tuple[int, ...]:
+        del max_num_tokens
+        return (1, 2, 4, 8, 16)
+
+    def _dsv4_ob_map_split4_tuning_bucket(num_tokens: int) -> int:
+        return min(next_positive_power_of_2(num_tokens), 16)
+
+    def _dsv4_ob_gen_split2_tuning_buckets(
+            max_num_tokens: int) -> tuple[int, ...]:
+        del max_num_tokens
+        return (32, 64, 128)
+
+    def _dsv4_ob_map_split2_tuning_bucket(num_tokens: int) -> int:
+        return min(max(next_positive_power_of_2(num_tokens), 32), 128)
+
+    _DSV4_OB_SPLIT1_TUNING_BUCKETS = (
+        192,
+        256,
+        320,
+        384,
+        448,
+        512,
+        640,
+        768,
+        1024,
+        1280,
+        1536,
+        2048,
+        3072,
+        4096,
+        6144,
+        8192,
+        12288,
+        16384,
+    )
+
+    def _dsv4_ob_gen_split1_tuning_buckets(
+            max_num_tokens: int) -> tuple[int, ...]:
+        # Include the first bucket above the warmup shape. This guarantees that
+        # every runtime M up to the engine's configured maximum maps to a
+        # profiled cache entry without sweeping hundreds of nearly identical
+        # 64-token points during startup.
+        for index, bucket in enumerate(_DSV4_OB_SPLIT1_TUNING_BUCKETS):
+            if bucket >= max_num_tokens:
+                return _DSV4_OB_SPLIT1_TUNING_BUCKETS[:index + 1]
+        return _DSV4_OB_SPLIT1_TUNING_BUCKETS
+
+    def _dsv4_ob_map_split1_tuning_bucket(num_tokens: int) -> int:
+        for bucket in _DSV4_OB_SPLIT1_TUNING_BUCKETS:
+            if num_tokens <= bucket:
+                return bucket
+        return _DSV4_OB_SPLIT1_TUNING_BUCKETS[-1]
+
+    def _prepare_dsv4_ob_tuning_inputs(
+            inputs: List[torch.Tensor]) -> List[torch.Tensor]:
+        """Restore the packed activation-scale layout after M-bucket expansion."""
+        a, sfa, b, sfb, partials = inputs
+        m, packed_k = sfa.shape
+        aligned_m = pad_up(m, 4)
+        sfa_storage = torch.empty(aligned_m * packed_k,
+                                  dtype=sfa.dtype,
+                                  device=sfa.device)
+        packed_sfa = torch.as_strided(sfa_storage, (m, packed_k),
+                                      (1, aligned_m))
+        return [a, packed_sfa, b, sfb, partials]
+
+    class CuteDSLFp8SplitKGemmRunner(TunableRunner):
         """DSV4-Pro O_b runner using native block-scaled tcgen05 MMA."""
 
         kernel_class = Sm100BlockScaledPersistentDenseGemmKernel
@@ -3963,8 +4030,93 @@ if IS_CUTLASS_DSL_AVAILABLE:
         _SPLIT_K4_MAX_M = 16
         _SPLIT_K2_MAX_M = 128
 
+        # Candidate pools contain structurally distinct, production-validated
+        # kernels. Runtime AutoTuner profiling, rather than an M-based table,
+        # selects the winner for every token bucket and GPU SKU.
+        _SPLIT_K4_TACTICS = (
+            ((128, 32), (1, 1), True, None, False),
+            ((128, 32), (1, 1), True, None, True),
+            ((256, 32), (2, 1), True, None, False),
+            ((256, 32), (2, 1), True, None, True),
+        )
+        _SPLIT_K2_TACTICS = (
+            ((128, 32), (1, 1), True, None, False),
+            ((128, 32), (1, 1), True, None, True),
+            ((256, 64), (2, 1), True, 8, False),
+            ((256, 64), (2, 1), True, 8, True),
+            ((256, 128), (2, 1), True, None, False),
+            ((256, 128), (2, 1), True, None, True),
+        )
+        _SPLIT_K1_TACTICS = (
+            ((128, 128), (1, 1), True, None, False),
+            ((128, 128), (1, 1), True, None, True),
+            ((256, 128), (2, 1), True, None, False),
+            ((256, 128), (2, 1), True, None, True),
+            ((256, 144), (2, 1), True, None, False),
+            ((256, 144), (2, 1), True, None, True),
+            ((256, 160), (2, 1), True, None, True),
+            ((256, 192), (2, 1), True, None, True),
+            ((256, 208), (2, 1), False, None, True),
+            ((256, 256), (2, 1), True, None, True),
+        )
+
+        _TUNING_CONFIGS = {
+            1:
+            TuningConfig(
+                dynamic_tensor_specs=(DynamicTensorSpec(
+                    0,
+                    0,
+                    _dsv4_ob_gen_split1_tuning_buckets,
+                    _dsv4_ob_map_split1_tuning_bucket,
+                ), ),
+                constraint_specs=(
+                    ConstraintSpec(1, 0, lambda shapes: shapes[0][0]),
+                    ConstraintSpec(4, 1, lambda shapes: shapes[0][0]),
+                ),
+                inputs_pre_hook=_prepare_dsv4_ob_tuning_inputs,
+                exclude_from_cache=True,
+            ),
+            2:
+            TuningConfig(
+                dynamic_tensor_specs=(DynamicTensorSpec(
+                    0,
+                    0,
+                    _dsv4_ob_gen_split2_tuning_buckets,
+                    _dsv4_ob_map_split2_tuning_bucket,
+                ), ),
+                constraint_specs=(
+                    ConstraintSpec(1, 0, lambda shapes: shapes[0][0]),
+                    ConstraintSpec(4, 1, lambda shapes: shapes[0][0]),
+                ),
+                inputs_pre_hook=_prepare_dsv4_ob_tuning_inputs,
+                exclude_from_cache=True,
+            ),
+            4:
+            TuningConfig(
+                dynamic_tensor_specs=(DynamicTensorSpec(
+                    0,
+                    0,
+                    _dsv4_ob_gen_split4_tuning_buckets,
+                    _dsv4_ob_map_split4_tuning_bucket,
+                ), ),
+                constraint_specs=(
+                    ConstraintSpec(1, 0, lambda shapes: shapes[0][0]),
+                    ConstraintSpec(4, 1, lambda shapes: shapes[0][0]),
+                ),
+                inputs_pre_hook=_prepare_dsv4_ob_tuning_inputs,
+                exclude_from_cache=True,
+            ),
+        }
+
         @staticmethod
         def _select_num_splits(num_tokens: int) -> int:
+            """Resolve the shape-affecting split-output contract.
+
+            Unlike tile/cluster/stage choices, this value changes the public
+            output shape consumed by mHC and therefore must be resolved before
+            fake-tensor propagation. Kernel tactics within each fixed contract
+            are selected exclusively by AutoTuner.
+            """
             env_split = int(os.environ.get("TRTLLM_DSV4_OB_SPLIT_K", "0"))
             if env_split:
                 num_splits = env_split
@@ -3981,58 +4133,60 @@ if IS_CUTLASS_DSL_AVAILABLE:
         def __init__(self, use_tvm_ffi: bool = True):
             self.use_tvm_ffi = use_tvm_ffi
 
+        def unique_id(self):
+            return (self.use_tvm_ffi, )
+
         @classmethod
-        def _get_tactic(cls, m: int, n: int, num_splits: int,
-                        max_active_clusters: int):
-            del n, num_splits, max_active_clusters
-            # Keep the number of compiled kernels finite. Problem dimensions are
-            # runtime arguments, and the standard CUDA graph warmup sizes exercise
-            # every (split-K, tile) combination used below. Runtime request shapes
-            # therefore cannot trigger synchronous CuTe compilation.
-            # Split-1 tactics are warmed at M=192, 320, 384, and 448; the wider
-            # ranges reuse the best or near-best of those measured B200 tactics.
-            if m <= 32:
-                return ((128, 32), (cls._CLUSTER_M, 1), True, None, True)
-            if m <= 64:
-                return ((cls._TILE_M, 64), (cls._CLUSTER_M, 1), True, 8, True)
-            if m <= 128:
-                return ((cls._TILE_M, 128), (cls._CLUSTER_M, 1), True, None,
-                        True)
-            if m <= 256:
-                return ((cls._TILE_M, 144), (cls._CLUSTER_M, 1), True, None,
-                        True)
-            if m <= 352:
-                return ((cls._TILE_M, 160), (cls._CLUSTER_M, 1), True, None,
-                        True)
-            if m <= 416:
-                return ((cls._TILE_M, 192), (cls._CLUSTER_M, 1), True, None,
-                        True)
-            if m <= 512:
-                return ((cls._TILE_M, 208), (cls._CLUSTER_M, 1), False, None,
-                        True)
-            if m <= 704:
-                return ((cls._TILE_M, 144), (cls._CLUSTER_M, 1), True, None,
-                        True)
-            if m <= 896:
-                return ((cls._TILE_M, 160), (cls._CLUSTER_M, 1), True, None,
-                        True)
-            if m <= 1792:
-                return ((cls._TILE_M, 208), (cls._CLUSTER_M, 1), False, None,
-                        True)
-            return ((cls._TILE_M, 192), (cls._CLUSTER_M, 1), True, None, True)
+        def get_tuning_config(cls, num_splits: int) -> TuningConfig:
+            return cls._TUNING_CONFIGS[num_splits]
+
+        def get_valid_tactics(
+            self,
+            inputs: List[torch.Tensor],
+            profile: OptimizationProfile,
+            **kwargs,
+        ) -> List[tuple]:
+            del inputs, profile
+            num_splits = kwargs["num_splits"]
+            if num_splits == 4:
+                return list(self._SPLIT_K4_TACTICS)
+            if num_splits == 2:
+                return list(self._SPLIT_K2_TACTICS)
+            if num_splits == 1:
+                return list(self._SPLIT_K1_TACTICS)
+            raise ValueError(
+                f"unsupported DeepSeek-V4 O_b split-K factor: {num_splits}")
+
+        @classmethod
+        def _get_fallback_tactic(cls, num_splits: int) -> tuple:
+            if num_splits == 4:
+                return cls._SPLIT_K4_TACTICS[0]
+            if num_splits == 2:
+                return cls._SPLIT_K2_TACTICS[0]
+            if num_splits == 1:
+                return cls._SPLIT_K1_TACTICS[0]
+            raise ValueError(
+                f"unsupported DeepSeek-V4 O_b split-K factor: {num_splits}")
 
         @staticmethod
         def _get_compile_key(k: int, num_splits: int, mma_tiler_mn: tuple,
                              cluster_shape_mn: tuple, swap_ab: bool,
                              max_ab_stages: Optional[int], l2_swizzle: bool,
+                             max_active_clusters: int,
                              use_tvm_ffi: bool) -> tuple:
             # Exact problem dimensions and scale strides are runtime arguments.
             # Do not add them here: doing so causes multi-second synchronous JIT
             # compilation on previously unseen request token counts.
             return (k, num_splits, mma_tiler_mn, cluster_shape_mn, swap_ab,
-                    max_ab_stages, l2_swizzle, use_tvm_ffi)
+                    max_ab_stages, l2_swizzle, max_active_clusters, use_tvm_ffi)
 
-        def forward(self, inputs: List[torch.Tensor], num_splits: int) -> None:
+        def forward(
+            self,
+            inputs: List[torch.Tensor],
+            *,
+            tactic=-1,
+            num_splits: int,
+        ) -> None:
             a_tensor, a_sf_tensor, b_tensor, b_sf_tensor, partials = inputs
             m, k = a_tensor.shape
             n = b_tensor.shape[0]
@@ -4046,9 +4200,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 ).get_max_active_clusters(self._CLUSTER_M)
                 self.__class__.active_clusters_cache[
                     device_key] = max_active_clusters
+            if tactic == -1:
+                tactic = self._get_fallback_tactic(num_splits)
             (mma_tiler_mn, cluster_shape_mn, swap_ab, max_ab_stages,
-             l2_swizzle) = self._get_tactic(m, n, num_splits,
-                                            max_active_clusters)
+             l2_swizzle) = tactic
             if swap_ab:
                 # Swap M/N to expose more output tiles.
                 kernel_m, kernel_n = n, m
@@ -4068,6 +4223,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 swap_ab,
                 max_ab_stages,
                 l2_swizzle,
+                max_active_clusters,
                 self.use_tvm_ffi,
             )
 
@@ -4233,9 +4389,67 @@ if IS_CUTLASS_DSL_AVAILABLE:
         output = torch.empty((num_splits * m, n),
                              device=a.device,
                              dtype=torch.bfloat16)
+        if m == 0:
+            return output
         partials = output.view(num_splits, m, n)
-        CuteDSLFp8SplitKGemmRunner(use_tvm_ffi=True).forward(
-            [a, sfa, b, sfb, partials], num_splits)
+        runner = CuteDSLFp8SplitKGemmRunner(use_tvm_ffi=True)
+        tuner = AutoTuner.get()
+
+        def choose_tactic(tuning_inputs: List[torch.Tensor], split_k: int):
+            return tuner.choose_one(
+                f"trtllm::dsv4_fp8_splitk_gemm::split{split_k}",
+                [runner],
+                runner.get_tuning_config(split_k),
+                tuning_inputs,
+                num_splits=split_k,
+            )
+
+        best_tactic = None
+        if tuner.is_tuning_mode:
+            # The engine's autotuner warmup is context-only and normally sees
+            # split-1. Explicitly tune the smaller split-output contracts that
+            # generation can reach so CUDA-graph capture and inference never
+            # trigger synchronous CuTe compilation.
+            tuning_splits = [(4, min(m, runner._SPLIT_K4_MAX_M))]
+            if m > runner._SPLIT_K4_MAX_M:
+                tuning_splits.append((2, min(m, runner._SPLIT_K2_MAX_M)))
+            if m > runner._SPLIT_K2_MAX_M:
+                tuning_splits.append((1, m))
+            if (num_splits, m) not in tuning_splits:
+                tuning_splits.append((num_splits, m))
+
+            for tuning_split, tuning_m in tuning_splits:
+                if tuning_split == num_splits and tuning_m == m:
+                    tuning_inputs = [a, sfa, b, sfb, partials]
+                else:
+                    tuning_output = torch.empty(
+                        (tuning_split, tuning_m, n),
+                        device=a.device,
+                        dtype=torch.bfloat16,
+                    )
+                    tuning_inputs = [
+                        a[:tuning_m],
+                        sfa[:tuning_m],
+                        b,
+                        sfb,
+                        tuning_output,
+                    ]
+                _, tuning_tactic = choose_tactic(tuning_inputs, tuning_split)
+                if tuning_split == num_splits and tuning_m == m:
+                    best_tactic = tuning_tactic
+        else:
+            _, best_tactic = choose_tactic([a, sfa, b, sfb, partials],
+                                           num_splits)
+
+        if best_tactic is None:
+            raise RuntimeError(
+                f"DSV4 O_b autotuner did not select a split-{num_splits} tactic"
+            )
+        runner(
+            [a, sfa, b, sfb, partials],
+            tactic=best_tactic,
+            num_splits=num_splits,
+        )
         logger.info_once(
             f"[obsk-fused] O_b CuTe DSL ENGAGED: SK={num_splits} M={m} K={k} N={n}",
             key="obsk_fused_engaged",

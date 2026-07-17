@@ -10,6 +10,7 @@ import torch.nn.functional as F
 from torch.profiler import ProfilerActivity, profile
 from utils.util import skip_pre_blackwell
 
+from tensorrt_llm._torch.autotuner import OptimizationProfile
 from tensorrt_llm._torch.modules.mhc.hyper_connection import HCHead, mHC
 
 BENCH_WARMUP = 50
@@ -553,6 +554,50 @@ def test_mhc_fused_hc_mma_tactic_filter_hidden_sizes():
     assert supported_by_hidden_size[4096] == {1, 2, 4, 8, 16, 32, 64}
     assert supported_by_hidden_size[7168] == {1, 2, 4, 7, 8, 14, 16, 28, 56, 112}
     assert supported_by_hidden_size[8192] == set()
+
+
+@pytest.mark.parametrize("x_num_splits", [1, 2, 4])
+def test_mhc_fused_hc_tuning_config_tracks_residual_m(x_num_splits: int):
+    from tensorrt_llm._torch.modules.mhc.mhc_cuda import MhcFusedHcRunner
+
+    config = MhcFusedHcRunner.get_tuning_config(x_num_splits)
+    dynamic_spec = config.dynamic_tensor_specs[0]
+
+    assert (dynamic_spec.input_idx, dynamic_spec.dim_idx) == (1, 0)
+    inferred_shapes = [[x_num_splits * 37, 7168], [37, 4, 7168], [37, 4], [37, 4, 4]]
+    assert config.constraint_specs[0].infer_shape(inferred_shapes) == x_num_splits * 37
+    assert config.constraint_specs[1].infer_shape(inferred_shapes) == 37
+    assert config.constraint_specs[2].infer_shape(inferred_shapes) == 37
+
+
+@pytest.mark.parametrize("x_num_splits", [2, 4])
+def test_mhc_fused_hc_split_inputs_exclude_unsupported_all_in_one_tactics(
+    x_num_splits: int, monkeypatch: pytest.MonkeyPatch
+):
+    from tensorrt_llm._torch.modules.mhc import mhc_cuda
+
+    monkeypatch.setattr(mhc_cuda, "_fused_hc_mma_supported", lambda: True)
+    runner = mhc_cuda.MhcFusedHcRunner(
+        n=4,
+        hidden_size=7168,
+        rms_eps=1e-5,
+        hc_pre_eps=1e-6,
+        hc_sinkhorn_eps=1e-6,
+        hc_post_mult_value=1.0,
+        sinkhorn_repeat=20,
+    )
+    m = 32
+    inputs = [
+        torch.empty((x_num_splits * m, 7168), device="meta", dtype=torch.bfloat16),
+        torch.empty((m, 4, 7168), device="meta", dtype=torch.bfloat16),
+        torch.empty((m, 4), device="meta"),
+        torch.empty((m, 4, 4), device="meta"),
+    ]
+
+    tactics = runner.get_valid_tactics(inputs, OptimizationProfile())
+
+    assert tactics
+    assert all(tactic[0] in ("fused_half_mma", "fused_half_fma") for tactic in tactics)
 
 
 @pytest.mark.parametrize("n", [128, 2048])
