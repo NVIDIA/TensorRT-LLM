@@ -117,17 +117,6 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
             self.qk_nope_head_dim = mla_params.qk_nope_head_dim
             self.v_head_dim = mla_params.v_head_dim
 
-        self.sparse_mla_rope_cos_sin = None
-        self.sparse_mla_rope_is_neox = True
-        if (self.is_mla_enable
-                and getattr(self.sparse_params, "algorithm", None) == "dsa"
-                and pos_embd_params is not None
-                and pos_embd_params.rope is not None):
-            self.sparse_mla_rope_cos_sin = pos_embd_params.rope.create_rope_const_params(
-                interleave=False)[1].reshape(pos_embd_params.rope.max_positions,
-                                             2, -1)
-            self.sparse_mla_rope_is_neox = pos_embd_params.is_neox
-
     @classmethod
     def support_mla(cls) -> bool:
         return True
@@ -151,82 +140,6 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
     ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         """Use request-local caller-provided selections in the Vanilla backend."""
         return forward_args.topk_indices, None
-
-    @staticmethod
-    def _apply_rotary_embedding(x: torch.Tensor, cos: torch.Tensor,
-                                sin: torch.Tensor,
-                                is_neox: bool) -> torch.Tensor:
-        """Apply RoPE to ``x`` using one cos/sin row per packed token."""
-        cos = cos.to(device=x.device, dtype=x.dtype).unsqueeze(1)
-        sin = sin.to(device=x.device, dtype=x.dtype).unsqueeze(1)
-        rotary_dim = cos.shape[-1] * 2
-        x_rotary, x_pass = x[..., :rotary_dim], x[..., rotary_dim:]
-        if is_neox:
-            x1, x2 = x_rotary.chunk(2, dim=-1)
-        else:
-            x1, x2 = x_rotary[..., ::2], x_rotary[..., 1::2]
-        out1 = x1 * cos - x2 * sin
-        out2 = x2 * cos + x1 * sin
-        if is_neox:
-            rotated = torch.cat((out1, out2), dim=-1)
-        else:
-            rotated = torch.stack((out1, out2), dim=-1).flatten(-2)
-        return torch.cat((rotated, x_pass), dim=-1)
-
-    def _prepare_sparse_mla_inputs(
-        self,
-        fused_q: torch.Tensor,
-        latent_cache: torch.Tensor,
-        q_pe: Optional[torch.Tensor],
-        positions: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Apply sparse MLA RoPE to raw packed query and latent-cache inputs.
-
-        As with the other attention paths, omitting positional-embedding
-        parameters means the caller already applied RoPE.
-        """
-        if self.sparse_mla_rope_cos_sin is None:
-            return fused_q, latent_cache
-
-        if positions.numel() == 0:
-            return fused_q, latent_cache
-        max_position = int(positions.max().item())
-        if max_position >= self.sparse_mla_rope_cos_sin.shape[0]:
-            raise ValueError(
-                f"Sparse MLA position {max_position} exceeds the configured RoPE table "
-                f"size {self.sparse_mla_rope_cos_sin.shape[0]}")
-
-        num_tokens = fused_q.shape[0]
-        fused_head_dim = self.kv_lora_rank + self.qk_rope_head_dim
-        query = fused_q.view(num_tokens, self.num_heads, fused_head_dim).clone()
-        if q_pe is None:
-            raise ValueError(
-                "Vanilla sparse MLA requires raw q_pe when RoPE parameters are configured"
-            )
-        expected_numel = num_tokens * self.num_heads * self.qk_rope_head_dim
-        if q_pe.numel() != expected_numel:
-            raise ValueError(
-                f"Sparse MLA q_pe has {q_pe.numel()} elements, expected {expected_numel}"
-            )
-        query_rope = q_pe.reshape(num_tokens, self.num_heads,
-                                  self.qk_rope_head_dim)
-
-        if latent_cache.shape[1] != fused_head_dim:
-            raise ValueError(
-                f"Sparse MLA latent cache width must be {fused_head_dim}, got "
-                f"{latent_cache.shape[1]}")
-        latent_cache = latent_cache.clone()
-        key_rope = latent_cache[:, self.kv_lora_rank:].unsqueeze(1)
-        cos_sin = self.sparse_mla_rope_cos_sin.index_select(
-            0,
-            positions.to(device=self.sparse_mla_rope_cos_sin.device,
-                         dtype=torch.long))
-        cos, sin = cos_sin.unbind(dim=1)
-        query[..., -self.qk_rope_head_dim:] = self._apply_rotary_embedding(
-            query_rope, cos, sin, self.sparse_mla_rope_is_neox)
-        latent_cache[:, self.kv_lora_rank:] = self._apply_rotary_embedding(
-            key_rope, cos, sin, self.sparse_mla_rope_is_neox).squeeze(1)
-        return query.view(num_tokens, -1), latent_cache
 
     def _single_request_sparse_attn_predict(
             self, q: torch.Tensor, k: Optional[torch.Tensor],
@@ -718,23 +631,19 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
         fused_q: torch.Tensor,
         metadata: VanillaAttentionMetadata,
         latent_cache: torch.Tensor,
-        q_pe: Optional[torch.Tensor],
         topk_indices: torch.Tensor,
         attention_input_type: AttentionInputType,
     ) -> torch.Tensor:
         """Run selected sparse MLA from caller-provided local top-k rows.
 
         The sparse algorithm owns selection. This golden consumes its
-        request-local selections, gathers the selected latent K/V, and performs
-        the absorbed MLA attention directly in PyTorch. Selections are block
-        indices; this reference implements ``block_size == 1`` (token selection),
-        which is what the MLA sparse algorithms (DSA / DeepSeek-V4) use.
+        request-local per-token selections, gathers the selected latent K/V, and
+        performs the absorbed MLA attention directly in PyTorch. The MLA sparse
+        algorithms (DSA / DeepSeek-V4) select individual tokens.
+
+        ``fused_q`` and ``latent_cache`` arrive with RoPE already applied (like
+        every other Vanilla attention path); the caller owns positional embedding.
         """
-        block_size = getattr(self.sparse_params, "indices_block_size", 1)
-        if block_size != 1:
-            raise NotImplementedError(
-                "Vanilla selected MLA supports block_size 1 (token selection); "
-                f"got block_size {block_size}")
         if attention_input_type == AttentionInputType.context_only:
             seq_start, seq_end = 0, metadata.num_contexts
         elif attention_input_type == AttentionInputType.generation_only:
@@ -807,26 +716,6 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
         if torch.any(valid_mask & (topk_indices > causal_limits.unsqueeze(1))):
             raise ValueError("DSA top-k index selects a future token")
         del valid_mask, kv_lengths, causal_limits
-
-        phase_token_start = sum(seq_lens[:seq_start])
-        if metadata.position_ids is not None:
-            positions = metadata.position_ids.reshape(
-                -1)[phase_token_start:phase_token_start + num_phase_tokens].to(
-                    device=fused_q.device, dtype=torch.long)
-            if positions.numel() != num_phase_tokens:
-                raise ValueError(
-                    "DSA metadata does not provide one position ID per phase token"
-                )
-        else:
-            positions = torch.cat([
-                torch.arange(int(past),
-                             int(past) + q_len,
-                             device=fused_q.device,
-                             dtype=torch.long) for past, q_len in zip(
-                                 phase_past_tokens, phase_seq_lens, strict=True)
-            ])
-        fused_q, latent_cache = self._prepare_sparse_mla_inputs(
-            fused_q, latent_cache, q_pe, positions)
 
         from .utils import append_mla_latent_cache
         kv_cache = append_mla_latent_cache(
@@ -966,7 +855,6 @@ class VanillaAttention(AttentionBackend[VanillaAttentionMetadata]):
                     q,
                     metadata,
                     forward_args.latent_cache,
-                    forward_args.q_pe,
                     sparse_attn_indices,
                     forward_args.attention_input_type,
                 )

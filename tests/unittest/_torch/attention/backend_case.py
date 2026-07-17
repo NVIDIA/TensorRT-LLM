@@ -156,13 +156,6 @@ class BackendCase:
         return self.sparse_attention_config.sparse_topk
 
     @property
-    def sparse_block_size(self) -> Optional[int]:
-        """Selection granularity: token selection is a block of size 1."""
-        if self.sparse_attention_config is None:
-            return None
-        return self.sparse_attention_config.get_indices_block_size()
-
-    @property
     def prompt_lens(self) -> List[int]:
         """Original prompt lengths expected by fused generation kernels."""
         return [
@@ -243,8 +236,6 @@ def _validate_sparse_case(case: BackendCase) -> None:
     """Reject unsupported sparse contracts (called only for sparse cases)."""
     if case.sparse_topk is None or case.sparse_topk <= 0:
         raise ValueError("Sparse backend cases require a positive top-k")
-    if case.sparse_block_size is None or case.sparse_block_size < 1:
-        raise ValueError("Sparse backend cases require a positive selection block size")
 
 
 def _randn(gen: torch.Generator, dtype: torch.dtype, *shape) -> torch.Tensor:
@@ -405,13 +396,8 @@ def _build_sparse_topk_indices(
     yields an analytic value oracle -- or a ``random`` row. ``singleton_oracle_mask``
     marks the singleton rows so the caller applies the analytic check only there.
 
-    Selections are block indices; with ``block_size == 1`` (DSA) a block is a
-    single token, so these are token selections.
+    Selections are per-token (DSA / DeepSeek-V4 select individual tokens).
     """
-    if case.sparse_block_size != 1:
-        raise ValueError(
-            f"Sparse MLA selection builder only supports block_size 1, got {case.sparse_block_size}"
-        )
     topk = case.sparse_topk
     if topk is None or topk <= 0:
         raise ValueError("Sparse selection cases require a positive top-k")
@@ -443,8 +429,8 @@ def _build_sparse_topk_indices(
 
 def generate_sparse_mla_inputs(case: BackendCase, seed: int = 0) -> Dict:
     """Generate raw absorbed-MLA inputs plus backend-neutral sparse selections."""
-    if not case.is_mla or case.sparse_block_size != 1:
-        raise ValueError("This generator supports selected sparse MLA with block_size 1 only")
+    if not case.is_mla:
+        raise ValueError("This generator supports selected sparse MLA only")
     gen = torch.Generator(device="cuda").manual_seed(seed)
     selection_gen = torch.Generator(device="cuda").manual_seed(seed + 1)
     cdt = case.compute_dtype
@@ -455,15 +441,29 @@ def generate_sparse_mla_inputs(case: BackendCase, seed: int = 0) -> Dict:
 
     q_nope = _randn(gen, cdt, case.nnz_q, num_heads, kv_lora_rank)
     q_pe = _randn(gen, cdt, case.nnz_q, num_heads, qk_rope_head_dim)
-    fused_q = torch.cat((q_nope, q_pe), dim=-1).reshape(case.nnz_q, num_heads * d_latent)
     compressed_kv = _randn(gen, cdt, case.nnz_q, kv_lora_rank)
     k_pe = _randn(gen, cdt, case.nnz_q, qk_rope_head_dim)
-    latent_cache = torch.cat((compressed_kv, k_pe), dim=-1)
 
     pos_embd_params = _mla_context_pos_embd_params(case)
     rope_params = pos_embd_params.rope
     assert rope_params is not None
     new_positions = make_position_ids(case.seq_lens, case.num_cached_tokens)
+    # Two input flavors, because RoPE happens in different places per phase:
+    #   * generation: the absorbed path runs with skip_mla_rope_generation, so no
+    #     backend ropes -- feed the RoPE'd (pre-formed) inputs to every backend.
+    #   * context: the TRTLLM MLA context kernel ropes internally (no skip exists
+    #     for context), so it must get RAW inputs and rope them once itself; Vanilla
+    #     (which never ropes) still gets the RoPE'd inputs.
+    # q_pe rotates per head; k_pe is shared across heads.
+    rotated_q_pe = apply_rope(
+        q_pe.reshape(case.nnz_q, num_heads * qk_rope_head_dim),
+        new_positions,
+        rope_params,
+        qk_rope_head_dim,
+        is_neox=pos_embd_params.is_neox,
+    ).reshape(case.nnz_q, num_heads, qk_rope_head_dim)
+    fused_q = torch.cat((q_nope, rotated_q_pe), dim=-1).reshape(case.nnz_q, num_heads * d_latent)
+    fused_q_raw = torch.cat((q_nope, q_pe), dim=-1).reshape(case.nnz_q, num_heads * d_latent)
     rotated_new_k_pe = apply_rope(
         k_pe,
         new_positions,
@@ -472,6 +472,10 @@ def generate_sparse_mla_inputs(case: BackendCase, seed: int = 0) -> Dict:
         is_neox=pos_embd_params.is_neox,
     )
     expected_new_latent = torch.cat((compressed_kv, rotated_new_k_pe), dim=-1)
+    # RoPE'd new-token latent: with skip_mla_rope_generation the backend appends it
+    # verbatim. The raw variant is roped in-kernel by the TRTLLM context path.
+    latent_cache = expected_new_latent
+    latent_cache_raw = torch.cat((compressed_kv, k_pe), dim=-1)
 
     cached_latent = []
     for cached_len in case.num_cached_tokens:
@@ -510,8 +514,14 @@ def generate_sparse_mla_inputs(case: BackendCase, seed: int = 0) -> Dict:
 
     return dict(
         fused_q=fused_q,
-        q_pe=q_pe,
+        # The RoPE'd q_pe view is passed explicitly since the MLA RoPE step is
+        # skipped (skip_mla_rope_generation); it must match the fused_q pe slot.
+        q_pe=fused_q.view(case.nnz_q, num_heads, d_latent)[..., kv_lora_rank:],
         latent_cache=latent_cache,
+        # Raw (un-RoPE'd) variants for the TRTLLM context path, which ropes in-kernel.
+        fused_q_raw=fused_q_raw,
+        q_pe_raw=q_pe,
+        latent_cache_raw=latent_cache_raw,
         cached_latent=cached_latent,
         expected_new_latent=expected_new_latent,
         topk_indices=topk_indices,
@@ -728,38 +738,29 @@ def _run_sparse_mla_backend(
 
         outputs = []
         for attention_input_type, token_slice in phases:
-            fused_q = inputs["fused_q"][token_slice].clone()
-            q_pe = inputs["q_pe"][token_slice]
-            latent_cache = inputs["latent_cache"][token_slice].clone()
-            forward_kwargs = {}
-            if backend == "TRTLLM" and attention_input_type == AttentionInputType.generation_only:
-                cu_q_seqlens = torch.empty(case.num_seqs + 1, dtype=torch.int32, device="cuda")
-                cu_kv_seqlens = torch.empty(case.num_seqs + 1, dtype=torch.int32, device="cuda")
-                fmha_scheduler_counter = torch.empty(1, dtype=torch.uint32, device="cuda")
-                attn.mla_rope_generation(
-                    fused_q,
-                    q_pe,
-                    latent_cache,
-                    metadata,
-                    cu_q_seqlens,
-                    cu_kv_seqlens,
-                    fmha_scheduler_counter,
-                    None,
-                    None,
-                    None,
-                )
-                forward_kwargs.update(
-                    cu_q_seqlens=cu_q_seqlens,
-                    cu_kv_seqlens=cu_kv_seqlens,
-                    fmha_scheduler_counter=fmha_scheduler_counter,
-                )
-
+            # RoPE placement differs by phase (see generate_sparse_mla_inputs):
+            #   * TRTLLM context ropes in-kernel -> feed RAW inputs, no skip.
+            #   * generation (both backends) + Vanilla context consume the
+            #     pre-RoPE'd inputs; TRTLLM generation runs with
+            #     skip_mla_rope_generation (it still appends the new latent + inits
+            #     the trtllm-gen scheduler buffers inside forward).
+            kernel_ropes = (
+                backend == "TRTLLM" and attention_input_type == AttentionInputType.context_only
+            )
+            if kernel_ropes:
+                fused_q = inputs["fused_q_raw"][token_slice].clone()
+                q_pe = inputs["q_pe_raw"][token_slice]
+                latent_cache = inputs["latent_cache_raw"][token_slice].clone()
+            else:
+                fused_q = inputs["fused_q"][token_slice].clone()
+                q_pe = inputs["q_pe"][token_slice]
+                latent_cache = inputs["latent_cache"][token_slice].clone()
             forward_args = AttentionForwardArgs(
                 latent_cache=latent_cache,
                 q_pe=q_pe,
                 topk_indices=inputs["topk_indices"][token_slice],
                 attention_input_type=attention_input_type,
-                **forward_kwargs,
+                skip_mla_rope_generation=not kernel_ropes,
             )
             out = attn.forward(
                 fused_q,
@@ -769,10 +770,6 @@ def _run_sparse_mla_backend(
                 forward_args=forward_args,
             )
             assert forward_args.sparse_prediction.sparse_attn_indices is not None
-            assert (
-                forward_args.sparse_prediction.sparse_attn_indices_block_size
-                == sparse_params.indices_block_size
-            )
             outputs.append(out[0] if isinstance(out, tuple) else out)
 
         expected_latents = _split_packed_tokens(inputs["expected_new_latent"], case.seq_lens)
