@@ -21,16 +21,10 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from tensorrt_llm import VisualGen, VisualGenArgs
-from tensorrt_llm._torch.visual_gen.models.cosmos3.action import VIDEO_RES_SIZE_INFO
-from tensorrt_llm._torch.visual_gen.models.cosmos3.defaults import (
-    COSMOS3_ACTION_PARAMS,
-    get_domain_preset,
-    resolve_domain_action_config,
-)
 
 _SCRIPT_DIR = Path(__file__).resolve().parent
-
-ACTION_MODES = frozenset({"policy", "forward_dynamics", "inverse_dynamics"})
+_ACTION_MODES = ("policy", "forward_dynamics", "inverse_dynamics")
+_TENSOR_OUTPUT_SUFFIXES = {".pt", ".safetensors"}
 
 
 def _resolve_path(path: str) -> str:
@@ -98,10 +92,11 @@ def _validate_action_args(
     has_first_frame = resolved_image_path is not None or args.video_path is not None
 
     mode = args.action_mode.strip().lower()
-    if mode not in ACTION_MODES:
+    if mode not in _ACTION_MODES:
         raise SystemExit(
-            f"Invalid --action_mode {args.action_mode!r}; expected one of {sorted(ACTION_MODES)}."
+            f"Invalid --action_mode {args.action_mode!r}; expected one of {list(_ACTION_MODES)}."
         )
+    args.action_mode = mode
     if args.enable_audio:
         raise SystemExit("Cosmos3 does not support joint action and audio generation.")
     if args.output_type != "video":
@@ -121,53 +116,29 @@ def _validate_action_args(
                 f"{mode} requires --image_path, a prompt-file vision_path, or --video_path "
                 "for the first frame."
             )
-        preset = get_domain_preset(args.domain_name, args.domain_id)
-        effective_raw_dim = args.raw_action_dim or (preset or {}).get("raw_action_dim")
-        if effective_raw_dim is None:
-            raise SystemExit(
-                f"{mode} requires --raw_action_dim or a known --domain_name with a preset."
-            )
+        if args.raw_action_dim is None and args.domain_name is None and args.domain_id is None:
+            raise SystemExit(f"{mode} requires --raw_action_dim, --domain_name, or --domain_id.")
     elif mode == "inverse_dynamics":
         if args.video_path is None:
             raise SystemExit(
                 f"{mode} requires --video_path (frame directory, .mp4/.avi, or image)."
             )
-        preset = get_domain_preset(args.domain_name, args.domain_id)
-        effective_raw_dim = args.raw_action_dim or (preset or {}).get("raw_action_dim")
-        if effective_raw_dim is None:
-            raise SystemExit(
-                f"{mode} requires --raw_action_dim or a known --domain_name with a preset."
-            )
+        if args.raw_action_dim is None and args.domain_name is None and args.domain_id is None:
+            raise SystemExit(f"{mode} requires --raw_action_dim, --domain_name, or --domain_id.")
 
 
-def _apply_action_generation_params(params, args: argparse.Namespace) -> None:
-    """Set action defaults on the request; domain presets override generic 480p."""
-    cfg = resolve_domain_action_config(
-        domain_name=args.domain_name,
-        domain_id=args.domain_id,
-        raw_action_dim=args.raw_action_dim,
-        action_chunk_size=args.action_chunk_size,
-        action_resolution=args.action_resolution,
-    )
-    bucket = str(cfg["action_resolution"])
-    width, height = VIDEO_RES_SIZE_INFO[bucket]["16,9"]
-    params.width = width
-    params.height = height
-    params.num_frames = cfg["num_frames"]
-    params.num_inference_steps = COSMOS3_ACTION_PARAMS["num_inference_steps"]
-    params.guidance_scale = COSMOS3_ACTION_PARAMS["guidance_scale"]
-    params.frame_rate = cfg["frame_rate"]
-    params.extra_params["action_chunk_size"] = cfg["action_chunk_size"]
-    if cfg["raw_action_dim"] is not None:
-        params.extra_params["raw_action_dim"] = cfg["raw_action_dim"]
-    params.extra_params["action_resolution"] = cfg["action_resolution"]
+def _resolved_output_path(path: str, action_mode: Optional[str]) -> str:
+    if action_mode is None:
+        return path
+    output_path = Path(path)
+    if output_path.suffix.lower() in _TENSOR_OUTPUT_SUFFIXES:
+        return str(output_path)
+    return str(output_path.with_suffix(".safetensors"))
 
 
-def _default_action_output_path(video_path: str) -> str:
-    stem = Path(video_path)
-    if stem.suffix:
-        return str(stem.with_name(f"{stem.stem}_action.json"))
-    return f"{video_path}_action.json"
+def _default_action_output_path(output_path: str) -> str:
+    stem = Path(output_path)
+    return str(stem.with_suffix(".action.json"))
 
 
 def _save_action_output(output, path: str) -> None:
@@ -259,7 +230,7 @@ def main():
         "--action_mode",
         type=str,
         default=None,
-        choices=sorted(ACTION_MODES),
+        choices=list(_ACTION_MODES),
         help="Action mode: policy, forward_dynamics, or inverse_dynamics",
     )
     parser.add_argument(
@@ -284,7 +255,7 @@ def main():
         "--action_chunk_size",
         type=int,
         default=None,
-        help=f"Action tokens to generate (default {COSMOS3_ACTION_PARAMS['action_chunk_size']})",
+        help="Action tokens to generate. Defaults to the domain preset or model default.",
     )
     parser.add_argument(
         "--action_json",
@@ -345,9 +316,8 @@ def main():
     params = visual_gen.default_params
     if image_path is not None:
         params.image = image_path
-
-    if args.action_mode is not None:
-        _apply_action_generation_params(params, args)
+    if args.action_mode is not None and args.video_path is not None:
+        params.image = args.video_path
 
     negative_prompt_path = _resolve_path(args.negative_prompt)
     if args.negative_prompt is not None:
@@ -385,8 +355,6 @@ def main():
     if args.action_json is not None:
         with open(args.action_json, encoding="utf-8") as f:
             params.extra_params["action"] = json.load(f)
-    if args.video_path is not None:
-        params.extra_params["video"] = args.video_path
 
     if negative_prompt is None:
         params.negative_prompt = None
@@ -400,11 +368,12 @@ def main():
         params=params,
     )
 
-    output.save(args.output_path)
-    print(f"Saved: {args.output_path}")
+    output_path = _resolved_output_path(args.output_path, args.action_mode)
+    output.save(output_path)
+    print(f"Saved: {output_path}")
 
     if args.action_mode is not None:
-        action_path = args.action_output_path or _default_action_output_path(args.output_path)
+        action_path = args.action_output_path or _default_action_output_path(output_path)
         _save_action_output(output, action_path)
         if output.action is not None:
             print(f"Saved action: {action_path}")

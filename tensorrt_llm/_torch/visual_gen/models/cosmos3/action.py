@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, List, Optional
+from typing import Any
 
 import numpy as np
 import PIL.Image
@@ -249,8 +249,8 @@ ACTION_VIDEO_EXTENSIONS = frozenset({".mp4", ".avi"})
 
 
 def pil_to_rgb(value: Any) -> PIL.Image.Image:
-    if isinstance(value, str):
-        return PIL.Image.open(value).convert("RGB")
+    if isinstance(value, (str, Path)):
+        return PIL.Image.open(Path(value)).convert("RGB")
     if isinstance(value, PIL.Image.Image):
         return value.convert("RGB")
     raise TypeError(
@@ -258,7 +258,7 @@ def pil_to_rgb(value: Any) -> PIL.Image.Image:
     )
 
 
-def decode_action_video_file(path: Path, max_frames: Optional[int] = None) -> List[PIL.Image.Image]:
+def decode_action_video_file(path: Path, max_frames: int | None = None) -> list[PIL.Image.Image]:
     import torchvision.io as io
 
     frames, _, _ = io.read_video(str(path), pts_unit="sec")
@@ -269,7 +269,7 @@ def decode_action_video_file(path: Path, max_frames: Optional[int] = None) -> Li
     return [PIL.Image.fromarray(frames[i].numpy()) for i in range(frames.shape[0])]
 
 
-def normalize_action_video_path(path: Path, max_frames: Optional[int] = None) -> List[Any]:
+def normalize_action_video_path(path: Path, max_frames: int | None = None) -> list[Any]:
     if not path.exists():
         raise ValueError(f"Cosmos3 action video path does not exist: {path}")
     if path.is_dir():
@@ -293,7 +293,7 @@ def normalize_action_video_path(path: Path, max_frames: Optional[int] = None) ->
     )
 
 
-def normalize_action_video_input(video: Any, max_frames: Optional[int] = None) -> List[Any]:
+def normalize_action_video_input(video: Any, max_frames: int | None = None) -> list[Any]:
     """Normalize action video input to a frame list.
 
     Accepts a list of PIL images / paths, a single image or video file path,
@@ -313,8 +313,8 @@ def normalize_action_video_input(video: Any, max_frames: Optional[int] = None) -
 
 
 def resolve_action_size(
-    height: Optional[int],
-    width: Optional[int],
+    height: int | None,
+    width: int | None,
     ref_image: PIL.Image.Image,
     action_resolution: int,
 ) -> tuple[int, int]:
@@ -349,10 +349,10 @@ def action_reference_image(
         raise ValueError(f"Cosmos3 action_mode={action_mode!r} requires an image or video input.")
     if isinstance(source, PIL.Image.Image):
         return source.convert("RGB")
-    if isinstance(source, str):
+    if isinstance(source, (str, Path)):
         path = Path(source)
         if path.is_file() and path.suffix.lower() in ACTION_IMAGE_EXTENSIONS:
-            return PIL.Image.open(source).convert("RGB")
+            return PIL.Image.open(path).convert("RGB")
         frames = normalize_action_video_input(source, max_frames=1)
         if not frames:
             raise ValueError(
@@ -392,13 +392,36 @@ def prepare_action_latents(
     *,
     mode: str,
     action_chunk_size: int,
-    raw_action_dim: Optional[int],
+    raw_action_dim: int | None,
     action_dim: int,
     generator: torch.Generator,
     device: torch.device,
     dtype: torch.dtype,
     action_input: Any = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+    """Prepare action latents and conditioning masks for a denoise request.
+
+    Args:
+        mode: Cosmos3 action mode. ``forward_dynamics`` conditions all action
+            tokens on ``action_input``; ``policy`` and ``inverse_dynamics`` start
+            from action noise and predict the raw action dimensions.
+        action_chunk_size: Number of action tokens in the generated trajectory.
+        raw_action_dim: Number of semantic action dimensions before padding.
+            Required for ``policy`` and ``inverse_dynamics``. For
+            ``forward_dynamics``, omitted values are inferred from
+            ``action_input.shape[-1]`` and explicit values must match it.
+        action_dim: Model action embedding width after zero-padding.
+        generator: Random generator used for action noise.
+        device: Target device for the returned tensors.
+        dtype: Target dtype for the returned tensors.
+        action_input: Forward-dynamics action trajectory with shape ``[T, D]``.
+
+    Returns:
+        Tuple of ``(action_latents, action_velocity_mask, clean_action,
+        raw_action_dim)``. The tensors have shape ``[1, action_chunk_size,
+        action_dim]`` except the mask, which has shape ``[1, action_chunk_size,
+        1]``.
+    """
     if mode == ACTION_MODE_FORWARD_DYNAMICS:
         action = load_action_tensor(action_input)
         if action.shape[0] < action_chunk_size:
@@ -408,6 +431,11 @@ def prepare_action_latents(
             action = action[:action_chunk_size]
         if raw_action_dim is None:
             raw_action_dim = int(action.shape[-1])
+        elif int(raw_action_dim) != int(action.shape[-1]):
+            raise ValueError(
+                "Cosmos3 forward_dynamics raw_action_dim must match action input width; "
+                f"got raw_action_dim={raw_action_dim}, action width={action.shape[-1]}."
+            )
         clean_action = pad_action_to_dim(action, action_dim)
     else:
         if raw_action_dim is None:

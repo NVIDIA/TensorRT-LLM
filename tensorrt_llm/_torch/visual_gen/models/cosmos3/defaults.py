@@ -26,7 +26,7 @@ explicit values differ. See Cosmos3 omni ``action_*.json`` inputs for reference
 configs (bridge, av, droid, libero, etc.).
 """
 
-from typing import Any, Dict, List, Optional, TypedDict
+from typing import Any, TypedDict
 
 from tensorrt_llm._torch.visual_gen.models.cosmos3.action import (
     COSMOS3_ACTION_RESOLUTIONS,
@@ -95,7 +95,7 @@ class Cosmos3DomainPreset(TypedDict, total=False):
 
 
 # Training-aligned defaults. Values mirror Cosmos3 omni action JSON examples where available.
-COSMOS3_DOMAIN_PRESETS: Dict[str, Cosmos3DomainPreset] = {
+COSMOS3_DOMAIN_PRESETS: dict[str, Cosmos3DomainPreset] = {
     # WidowX bridge; 7-DOF arm + gripper in 10-D state.
     "bridge_orig_lerobot": {
         "raw_action_dim": 10,
@@ -179,7 +179,7 @@ COSMOS3_DOMAIN_PRESETS: Dict[str, Cosmos3DomainPreset] = {
 }
 
 # Map alias domain_name keys to a canonical preset entry.
-COSMOS3_DOMAIN_PRESET_ALIASES: Dict[str, str] = {
+COSMOS3_DOMAIN_PRESET_ALIASES: dict[str, str] = {
     "robomind-franka": "droid_lerobot",
     "robomind-franka-dual": "droid_lerobot",
     "robomind-ur": "droid_lerobot",
@@ -190,9 +190,9 @@ COSMOS3_DOMAIN_PRESET_ALIASES: Dict[str, str] = {
 
 
 def canonical_domain_preset_key(
-    domain_name: Any = None,
-    domain_id: Any = None,
-) -> Optional[str]:
+    domain_name: str | None = None,
+    domain_id: str | int | None = None,
+) -> str | None:
     if domain_name is not None and str(domain_name).strip():
         key = str(domain_name).strip().lower()
         key = COSMOS3_DOMAIN_PRESET_ALIASES.get(key, key)
@@ -207,7 +207,7 @@ def canonical_domain_preset_key(
     if resolved_id == 0:
         return None
 
-    candidates: List[str] = []
+    candidates: list[str] = []
     for name, mapped_id in EMBODIMENT_TO_DOMAIN_ID.items():
         if mapped_id != resolved_id:
             continue
@@ -221,9 +221,9 @@ def canonical_domain_preset_key(
 
 
 def get_domain_preset(
-    domain_name: Any = None,
-    domain_id: Any = None,
-) -> Optional[Cosmos3DomainPreset]:
+    domain_name: str | None = None,
+    domain_id: str | int | None = None,
+) -> Cosmos3DomainPreset | None:
     key = canonical_domain_preset_key(domain_name, domain_id)
     if key is None:
         return None
@@ -232,19 +232,29 @@ def get_domain_preset(
 
 def resolve_domain_action_config(
     *,
-    domain_name: Any = None,
-    domain_id: Any = None,
-    raw_action_dim: Optional[int] = None,
-    action_chunk_size: Optional[int] = None,
-    action_resolution: Optional[int] = None,
-    frame_rate: Optional[float] = None,
-    action_fps: Optional[float] = None,
-    num_frames: Optional[int] = None,
-) -> Dict[str, Any]:
+    domain_name: str | None = None,
+    domain_id: str | int | None = None,
+    raw_action_dim: int | None = None,
+    action_chunk_size: int | None = None,
+    action_resolution: int | None = None,
+    frame_rate: float | None = None,
+    action_fps: float | None = None,
+    num_frames: int | None = None,
+) -> dict[str, Any]:
     """Merge user action params with domain presets and generic fallbacks."""
     preset_key = canonical_domain_preset_key(domain_name, domain_id)
     preset = COSMOS3_DOMAIN_PRESETS.get(preset_key) if preset_key else None
-    warnings: List[str] = []
+    warnings: list[str] = []
+
+    domain_requested = (domain_name is not None and str(domain_name).strip() != "") or (
+        domain_id is not None and str(domain_id).strip() not in {"", "0"}
+    )
+    if domain_requested and preset is None:
+        warnings.append(
+            "Cosmos3 action domain preset was not found for "
+            f"domain_name={domain_name!r}, domain_id={domain_id!r}; "
+            "using generic action defaults for omitted fields."
+        )
 
     def _resolve_field(
         field: str,
@@ -288,6 +298,16 @@ def resolve_domain_action_config(
     resolved_action_fps = (
         float(action_fps) if action_fps is not None else float(resolved_frame_rate)
     )
+    if resolved_raw_action_dim is not None and int(resolved_raw_action_dim) <= 0:
+        raise ValueError(f"Cosmos3 raw_action_dim must be positive, got {resolved_raw_action_dim}.")
+    if int(resolved_chunk) <= 0:
+        raise ValueError(f"Cosmos3 action_chunk_size must be positive, got {resolved_chunk}.")
+    if float(resolved_frame_rate) <= 0.0:
+        raise ValueError(f"Cosmos3 frame_rate must be positive, got {resolved_frame_rate}.")
+    if resolved_action_fps <= 0.0:
+        raise ValueError(f"Cosmos3 action_fps must be positive, got {resolved_action_fps}.")
+    if int(resolved_num_frames) <= 0:
+        raise ValueError(f"Cosmos3 num_frames must be positive, got {resolved_num_frames}.")
 
     return {
         "raw_action_dim": resolved_raw_action_dim,
@@ -301,7 +321,7 @@ def resolve_domain_action_config(
     }
 
 
-COSMOS3_EXTRA_SPECS: Dict[str, ExtraParamSchema] = {
+COSMOS3_EXTRA_SPECS: dict[str, ExtraParamSchema] = {
     "use_duration_template": ExtraParamSchema(
         type="bool",
         default=True,
@@ -333,7 +353,7 @@ COSMOS3_EXTRA_SPECS: Dict[str, ExtraParamSchema] = {
         description="Output modality: 'video' (T2V/I2V) or 'image' (text-to-image).",
     ),
     "action_mode": ExtraParamSchema(
-        type="str",
+        type="Literal['policy', 'forward_dynamics', 'inverse_dynamics']",
         default=None,
         description="Action generation mode: policy, forward_dynamics, or inverse_dynamics.",
     ),
@@ -361,7 +381,7 @@ COSMOS3_EXTRA_SPECS: Dict[str, ExtraParamSchema] = {
     ),
     "action_chunk_size": ExtraParamSchema(
         type="int",
-        default=COSMOS3_ACTION_PARAMS["action_chunk_size"],
+        default=None,
         description=(
             "Number of action tokens to generate (16 for most robots, 60 for av/camera_pose). "
             "Inferred from domain_name preset when omitted."
@@ -373,8 +393,8 @@ COSMOS3_EXTRA_SPECS: Dict[str, ExtraParamSchema] = {
         description="Action trajectory [T, D] for forward_dynamics mode.",
     ),
     "action_resolution": ExtraParamSchema(
-        type="int",
-        default=480,
+        type="Literal[256, 480, 704, 720]",
+        default=None,
         description=(
             "Resolution bucket for action image sizing. Must be one of "
             f"{list(COSMOS3_ACTION_RESOLUTIONS)}. Inferred from domain_name preset when omitted."

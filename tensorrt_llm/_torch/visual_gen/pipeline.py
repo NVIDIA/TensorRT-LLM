@@ -1,4 +1,3 @@
-import inspect
 import itertools
 import os
 import time
@@ -1044,12 +1043,9 @@ class BasePipeline(nn.Module):
                               is active. Outside the interval the effective scale is 1.0
                               (conditional prediction only); both branches still run.
             post_step_fn: Optional callable applied after each scheduler step.
-                         If the callable accepts one argument, it is invoked as
-                         ``post_step_fn(latents) -> latents``. If it accepts two
-                         or more, it is invoked as
-                         ``post_step_fn(latents, extra_stream_latents) ->
-                         (latents, extra_stream_latents)``, where
-                         ``extra_stream_latents`` is the dict of parallel streams
+                         It is invoked as ``post_step_fn(latents,
+                         extra_stream_latents) -> (latents, extra_stream_latents)``,
+                         where ``extra_stream_latents`` is the dict of parallel streams
                          from ``extra_streams`` (e.g. ``{"action": ...}``).
                          Use for constraints that must hold throughout denoising.
 
@@ -1181,11 +1177,7 @@ class BasePipeline(nn.Module):
             )
 
             if post_step_fn is not None:
-                sig = inspect.signature(post_step_fn)
-                if len(sig.parameters) >= 2:
-                    latents, extra_stream_latents = post_step_fn(latents, extra_stream_latents)
-                else:
-                    latents = post_step_fn(latents)
+                latents, extra_stream_latents = post_step_fn(latents, extra_stream_latents)
 
             # Logging
             if self.rank == 0:

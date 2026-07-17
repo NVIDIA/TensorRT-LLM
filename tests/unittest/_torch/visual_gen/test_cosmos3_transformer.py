@@ -442,6 +442,14 @@ class TestCosmos3Action:
         model = Cosmos3VFMTransformer(model_config=cosmos3_model_config_noaction)
         assert model.action_gen is False
         assert not hasattr(model, "action_proj_in")
+        assert not hasattr(model, "action_proj_out")
+        assert not hasattr(model, "action_modality_embed")
+
+    def test_pack_action_rejects_wrong_last_dim(self, action_model_config):
+        model = Cosmos3VFMTransformer(model_config=action_model_config)
+        action_latents = torch.randn(1, self.T_ACTION, model.action_dim - 1)
+        with pytest.raises(ValueError, match="action latent dimension mismatch"):
+            model.pack_action(action_latents)
 
     @pytest.mark.high_cuda_memory
     def test_forward_with_action(self, action_model_config):
@@ -466,6 +474,27 @@ class TestCosmos3Action:
         _assert_finite_output(out.video, hs.shape)
         assert out.action is not None
         _assert_finite_output(out.action, torch.Size([1, self.T_ACTION, model.action_dim]))
+
+    @pytest.mark.high_cuda_memory
+    def test_forward_with_action_domain_id_out_of_range_raises(self, action_model_config):
+        cfg = action_model_config.pretrained_config
+        model = _build_random_weight_model(action_model_config)
+        hs, ts, text_ids, text_mask, video_shape = _cosmos3_inputs(
+            DEVICE, channels=cfg.latent_channel
+        )
+        action_latents = torch.randn(1, self.T_ACTION, model.action_dim, device=DEVICE, dtype=DTYPE)
+        domain_ids = torch.tensor([self.NUM_DOMAINS], dtype=torch.long, device=DEVICE)
+        with torch.inference_mode(), pytest.raises(ValueError, match="domain_id"):
+            model(
+                hidden_states=hs,
+                timestep=ts,
+                text_ids=text_ids,
+                text_mask=text_mask,
+                video_shape=video_shape,
+                fps=24.0,
+                action_latents=action_latents,
+                action_domain_ids=domain_ids,
+            )
 
     @pytest.mark.high_cuda_memory
     def test_forward_without_action_latents_returns_none(self, action_model_config):

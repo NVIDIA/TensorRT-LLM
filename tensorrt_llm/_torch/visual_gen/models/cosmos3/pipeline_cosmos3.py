@@ -855,6 +855,11 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
 
         action_ref_image = None
         if do_action:
+            if isinstance(image, torch.Tensor) or isinstance(video, torch.Tensor):
+                raise ValueError(
+                    "Cosmos3 action generation does not support tensor image/video inputs; "
+                    "pass a PIL image, image path, frame directory, video path, or frame list."
+                )
             action_ref_image = action_reference_image(
                 action_mode=normalized_action_mode,
                 image=image,
@@ -995,6 +1000,11 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
             if normalized_action_mode == ACTION_MODE_INVERSE_DYNAMICS:
                 inverse_video = video if video is not None else image
                 video = normalize_action_video_input(inverse_video, max_frames=num_frames)
+                if len(video) < num_frames:
+                    raise ValueError(
+                        "Cosmos3 inverse_dynamics requires at least "
+                        f"{num_frames} frames, got {len(video)}."
+                    )
                 video_tensor = self._preprocess_action_video(video, height, width)
                 latents, velocity_mask, condition_latents = self._prepare_latents_action_video(
                     video_tensor,

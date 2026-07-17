@@ -10,15 +10,22 @@ Run:
 import numpy as np
 import PIL.Image
 import pytest
+import torch
 
 from tensorrt_llm._torch.visual_gen.models.cosmos3.action import (
     VIDEO_RES_SIZE_INFO,
     action_reference_image,
     find_closest_target_size,
+    normalize_action_resolution,
     normalize_action_video_input,
+    prepare_action_latents,
     resolve_action_size,
 )
-from tensorrt_llm._torch.visual_gen.models.cosmos3.defaults import COSMOS3_EXTRA_SPECS
+from tensorrt_llm._torch.visual_gen.models.cosmos3.defaults import (
+    COSMOS3_EXTRA_SPECS,
+    get_domain_preset,
+    resolve_domain_action_config,
+)
 
 pytestmark = pytest.mark.cosmos3
 
@@ -78,16 +85,12 @@ class TestResolveActionSize:
 class TestActionResolutionExtraParam:
     def test_extra_param_spec_uses_action_resolution_key(self):
         spec = COSMOS3_EXTRA_SPECS["action_resolution"]
-        assert spec.type == "int"
-        assert spec.default == 480
+        assert spec.type == "Literal[256, 480, 704, 720]"
+        assert spec.default is None
 
 
 class TestDomainActionPresets:
     def test_bridge_preset_fills_missing_fields(self):
-        from tensorrt_llm._torch.visual_gen.models.cosmos3.defaults import (
-            resolve_domain_action_config,
-        )
-
         cfg = resolve_domain_action_config(domain_name="bridge_orig_lerobot")
         assert cfg["raw_action_dim"] == 10
         assert cfg["action_chunk_size"] == 16
@@ -97,20 +100,12 @@ class TestDomainActionPresets:
         assert cfg["warnings"] == []
 
     def test_av_preset_uses_longer_chunk(self):
-        from tensorrt_llm._torch.visual_gen.models.cosmos3.defaults import (
-            resolve_domain_action_config,
-        )
-
         cfg = resolve_domain_action_config(domain_name="av")
         assert cfg["action_chunk_size"] == 60
         assert cfg["num_frames"] == 61
         assert cfg["raw_action_dim"] == 9
 
     def test_mismatch_emits_warning(self):
-        from tensorrt_llm._torch.visual_gen.models.cosmos3.defaults import (
-            resolve_domain_action_config,
-        )
-
         cfg = resolve_domain_action_config(
             domain_name="bridge_orig_lerobot",
             raw_action_dim=9,
@@ -120,33 +115,32 @@ class TestDomainActionPresets:
         assert "raw_action_dim=9" in cfg["warnings"][0]
 
     def test_action_fps_defaults_to_frame_rate(self):
-        from tensorrt_llm._torch.visual_gen.models.cosmos3.defaults import (
-            resolve_domain_action_config,
-        )
-
         cfg = resolve_domain_action_config(domain_name="av")
         assert cfg["frame_rate"] == 10.0
         assert cfg["action_fps"] == 10.0
 
     def test_explicit_action_fps_overrides_default(self):
-        from tensorrt_llm._torch.visual_gen.models.cosmos3.defaults import (
-            resolve_domain_action_config,
-        )
-
         cfg = resolve_domain_action_config(domain_name="av", action_fps=5.0, frame_rate=24.0)
         assert cfg["frame_rate"] == 24.0
         assert cfg["action_fps"] == 5.0
 
     def test_alias_maps_to_canonical_preset(self):
-        from tensorrt_llm._torch.visual_gen.models.cosmos3.defaults import get_domain_preset
-
         preset = get_domain_preset("robomind-franka")
         assert preset is not None
         assert preset["raw_action_dim"] == 10
 
-    def test_unknown_resolution_raises(self):
-        from tensorrt_llm._torch.visual_gen.models.cosmos3.action import normalize_action_resolution
+    def test_unknown_domain_warns_and_uses_generic_defaults(self):
+        cfg = resolve_domain_action_config(domain_name="typo_domain")
+        assert cfg["action_chunk_size"] == 16
+        assert cfg["action_resolution"] == 480
+        assert cfg["warnings"]
+        assert "preset was not found" in cfg["warnings"][0]
 
+    def test_non_positive_action_timing_raises(self):
+        with pytest.raises(ValueError, match="action_fps must be positive"):
+            resolve_domain_action_config(domain_name="av", action_fps=0.0)
+
+    def test_unknown_resolution_raises(self):
         with pytest.raises(ValueError, match="Unknown Cosmos3 action_resolution"):
             normalize_action_resolution(1080)
 
@@ -182,8 +176,25 @@ class TestActionReferenceImage:
         )
         assert ref.getpixel((0, 0)) == (0, 0, 255)
 
+    def test_policy_accepts_path_image(self, tmp_path):
+        image_path = tmp_path / "frame.png"
+        PIL.Image.new("RGB", (3, 3), "green").save(image_path)
+        ref = action_reference_image(
+            action_mode="policy",
+            image=image_path,
+            video=None,
+        )
+        assert ref.getpixel((0, 0)) == (0, 128, 0)
+
 
 class TestNormalizeActionVideoInput:
+    def test_none_returns_empty_list(self):
+        assert normalize_action_video_input(None) == []
+
+    def test_empty_list_raises(self):
+        with pytest.raises(ValueError, match="at least one frame"):
+            normalize_action_video_input([])
+
     def test_image_path_returns_singleton_list(self, tmp_path):
         image_path = tmp_path / "frame.png"
         PIL.Image.new("RGB", (8, 4), "red").save(image_path)
@@ -252,3 +263,18 @@ class TestNormalizeActionVideoInput:
             max_frames=2,
         )
         assert len(frames) == 2
+
+
+class TestPrepareActionLatents:
+    def test_forward_dynamics_raw_dim_mismatch_raises(self):
+        with pytest.raises(ValueError, match="raw_action_dim must match"):
+            prepare_action_latents(
+                mode="forward_dynamics",
+                action_chunk_size=2,
+                raw_action_dim=3,
+                action_dim=8,
+                generator=torch.Generator(device="cpu").manual_seed(0),
+                device=torch.device("cpu"),
+                dtype=torch.float32,
+                action_input=[[0.0, 1.0], [2.0, 3.0]],
+            )

@@ -520,6 +520,8 @@ class TestCosmos3Action:
             raw_action_dim=self.RAW_ACTION_DIM,
             chunk_size=self.ACTION_CHUNK,
         )
+        assert result.action_mode == "forward_dynamics"
+        assert result.domain_id == 7
 
     def test_inverse_dynamics_smoke(self, cosmos3_pipeline):
         _require_action_pipeline(cosmos3_pipeline)
@@ -549,6 +551,27 @@ class TestCosmos3Action:
             raw_action_dim=self.RAW_ACTION_DIM,
             chunk_size=NUM_FRAMES,
         )
+        assert result.action_mode == "inverse_dynamics"
+        assert result.domain_id == 7
+
+    def test_inverse_dynamics_rejects_short_video(self, cosmos3_pipeline):
+        _require_action_pipeline(cosmos3_pipeline)
+        image = _make_test_image().resize((self.ACTION_WIDTH, self.ACTION_HEIGHT))
+        video = [image.copy() for _ in range(NUM_FRAMES - 1)]
+        with pytest.raises(ValueError, match="requires at least"):
+            _run_forward(
+                cosmos3_pipeline,
+                image=None,
+                height=self.ACTION_HEIGHT,
+                width=self.ACTION_WIDTH,
+                num_frames=NUM_FRAMES,
+                guidance_scale=COSMOS3_ACTION_PARAMS["guidance_scale"],
+                action_mode="inverse_dynamics",
+                domain_name="bridge_orig_lerobot",
+                raw_action_dim=self.RAW_ACTION_DIM,
+                action_chunk_size=NUM_FRAMES,
+                video=video,
+            )
 
     def test_action_and_audio_rejected(self, cosmos3_pipeline):
         _require_action_pipeline(cosmos3_pipeline)

@@ -60,6 +60,7 @@ def _make_action_output(batch: int = 1, t: int = 4, action_dim: int = 7) -> Visu
         action=action,
         action_mode="policy",
         raw_action_dim=action_dim,
+        domain_id=7,
     )
 
 
@@ -152,6 +153,27 @@ class TestActionRoundTrip:
         loaded = self._load(serialize_visual_gen_output(output, fmt, batch_index=0), fmt)
         assert loaded["action"].shape == (4, 7)
         assert torch.equal(loaded["action"], output.action)
+
+    def test_action_metadata_serialized(self, fmt):
+        output = _make_action_output(batch=1)
+        data = serialize_visual_gen_output(output, fmt, batch_index=0)
+        loaded = self._load(data, fmt)
+        assert loaded["raw_action_dim"] == 7
+        assert loaded["domain_id"] == 7
+        if fmt == "pt":
+            assert loaded["action_mode"] == "policy"
+        else:
+            assert "action_mode" not in loaded
+            import tempfile
+
+            from safetensors import safe_open
+
+            with tempfile.NamedTemporaryFile(suffix=".safetensors") as tf:
+                tf.write(data)
+                tf.flush()
+                with safe_open(tf.name, framework="pt") as f:
+                    meta = f.metadata() or {}
+            assert meta.get("action_mode") == "policy"
 
 
 @pytest.mark.parametrize("fmt", ["safetensors", "pt"])
