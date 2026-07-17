@@ -113,9 +113,10 @@ void sparseKvCacheCompactLayers(std::vector<th::Tensor> const& pools, th::Tensor
         sourceLayerPtr = layerIndices.data_ptr<int32_t>();
     }
 
-    // The last element of source_offsets is the total move count and must equal
-    // source_indices.size(-1); it lives on device, so checking it here would
-    // force a sync -- the kernel trusts the caller.
+    // source_offsets carve each request's move range out of source_indices;
+    // the values live on device and the kernel trusts them. The index buffer
+    // may be wider than one round's total move count, so the head-plane
+    // stride passed below comes from the tensor shape, not from the offsets.
     TORCH_CHECK(sourceOffsets.is_cuda() && sourceOffsets.get_device() == device
             && sourceOffsets.scalar_type() == th::kInt32 && sourceOffsets.is_contiguous() && sourceOffsets.dim() == 1
             && sourceOffsets.size(0) == batchSize + 1,
@@ -129,24 +130,27 @@ void sparseKvCacheCompactLayers(std::vector<th::Tensor> const& pools, th::Tensor
 
     auto const stream = at::cuda::getCurrentCUDAStream(device);
     auto const* bases = destinationBases.data_ptr<int32_t>();
+    auto const sourceHeadStride = sourceIndices.size(-1);
     if (dtype == th::kBFloat16)
     {
         tk::invokeSparseKvCacheCompactV2Layers<__nv_bfloat16>(poolPointers.data_ptr<int64_t>(),
             pageTable.data_ptr<int32_t>(), numLayers, pageTableRequestStride, sourceIndices.data_ptr<int32_t>(),
-            sourceLayerPtr, sourceLayerStride, sourceOffsets.data_ptr<int32_t>(), bases, batchSize, numKvHeads,
-            tokensPerBlock, headDim, stream);
+            sourceLayerPtr, sourceLayerStride, sourceHeadStride, sourceOffsets.data_ptr<int32_t>(), bases, batchSize,
+            numKvHeads, tokensPerBlock, headDim, stream);
     }
     else if (dtype == th::kHalf)
     {
         tk::invokeSparseKvCacheCompactV2Layers<half>(poolPointers.data_ptr<int64_t>(), pageTable.data_ptr<int32_t>(),
             numLayers, pageTableRequestStride, sourceIndices.data_ptr<int32_t>(), sourceLayerPtr, sourceLayerStride,
-            sourceOffsets.data_ptr<int32_t>(), bases, batchSize, numKvHeads, tokensPerBlock, headDim, stream);
+            sourceHeadStride, sourceOffsets.data_ptr<int32_t>(), bases, batchSize, numKvHeads, tokensPerBlock, headDim,
+            stream);
     }
     else if (dtype == th::kFloat)
     {
         tk::invokeSparseKvCacheCompactV2Layers<float>(poolPointers.data_ptr<int64_t>(), pageTable.data_ptr<int32_t>(),
             numLayers, pageTableRequestStride, sourceIndices.data_ptr<int32_t>(), sourceLayerPtr, sourceLayerStride,
-            sourceOffsets.data_ptr<int32_t>(), bases, batchSize, numKvHeads, tokensPerBlock, headDim, stream);
+            sourceHeadStride, sourceOffsets.data_ptr<int32_t>(), bases, batchSize, numKvHeads, tokensPerBlock, headDim,
+            stream);
     }
     else
     {

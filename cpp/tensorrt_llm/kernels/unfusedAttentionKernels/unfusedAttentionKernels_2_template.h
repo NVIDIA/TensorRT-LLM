@@ -1763,6 +1763,10 @@ struct KvCacheV2LayersBuffer
     int32_t const* pageTable;
     int32_t const* sourceLayerIndices;
     int64_t sourceLayerStride;
+    // Head-plane stride of the packed move-source indices. The move buffers
+    // may be wider than one round's move count, so the stride comes from the
+    // host-side allocation width, not from the last source-offsets entry.
+    int64_t sourceHeadStride;
     int64_t pageTableRequestStride;
     int32_t tokensPerBlock;
     int32_t const* destinationBases;
@@ -1798,12 +1802,12 @@ struct KvCacheV2LayersBuffer
     }
 
     __device__ __forceinline__ int32_t getSparseKvSourceToken(
-        int32_t const* sourceIndices, int32_t headIdx, int32_t totalMoves, int32_t globalMove) const
+        int32_t const* sourceIndices, int32_t headIdx, int32_t globalMove) const
     {
         int32_t const layer
             = sourceLayerIndices == nullptr ? static_cast<int32_t>(blockIdx.x) : sourceLayerIndices[blockIdx.x];
-        int64_t const offset
-            = static_cast<int64_t>(layer) * sourceLayerStride + static_cast<int64_t>(headIdx) * totalMoves + globalMove;
+        int64_t const offset = static_cast<int64_t>(layer) * sourceLayerStride
+            + static_cast<int64_t>(headIdx) * sourceHeadStride + globalMove;
         return sourceIndices[offset];
     }
 
@@ -1828,7 +1832,10 @@ __global__ __launch_bounds__(BLOCK_SIZE) void updateSparseKvCacheAfterFmha(
     int const batch_idx = blockIdx.z;
     int const kv_head_idx = blockIdx.y;
 
-    int const total_num_sparse_kv_tokens = params.sparse_kv_offsets[params.batch_size];
+    // Head-plane stride of the packed indices for the non-layered layout; the
+    // layered layout carries its stride on the buffer (its index buffers may
+    // be wider than one round's move count).
+    [[maybe_unused]] int const total_num_sparse_kv_tokens = params.sparse_kv_offsets[params.batch_size];
 
     int const sparse_start_idx = params.sparse_kv_offsets[batch_idx];
     int const sparse_end_idx = params.sparse_kv_offsets[batch_idx + 1];
@@ -1854,7 +1861,7 @@ __global__ __launch_bounds__(BLOCK_SIZE) void updateSparseKvCacheAfterFmha(
             if constexpr (Layered)
             {
                 src_token_idx = params.kv_cache_buffer.getSparseKvSourceToken(
-                    params.sparse_kv_indices, kv_head_idx, total_num_sparse_kv_tokens, global_sparse_idx);
+                    params.sparse_kv_indices, kv_head_idx, global_sparse_idx);
             }
             else
             {
@@ -1900,7 +1907,7 @@ __global__ __launch_bounds__(BLOCK_SIZE) void updateSparseKvCacheAfterFmha(
             if constexpr (Layered)
             {
                 src_token_idx = params.kv_cache_buffer.getSparseKvSourceToken(
-                    params.sparse_kv_indices, kv_head_idx, total_num_sparse_kv_tokens, global_sparse_idx);
+                    params.sparse_kv_indices, kv_head_idx, global_sparse_idx);
                 dst_token_idx = params.kv_cache_buffer.getSparseKvDestinationToken(batch_idx, sparse_token_offset);
             }
             else
@@ -2010,14 +2017,16 @@ void launchSparseKvCacheCompactV2Layers(
 template <typename T>
 void invokeSparseKvCacheCompactV2Layers(int64_t const* poolPointers, int32_t const* pageTable, int32_t numLayers,
     int64_t pageTableRequestStride, int32_t const* sparseKvIndices, int32_t const* sourceLayerIndices,
-    int64_t sourceLayerStride, int32_t const* sparseKvOffsets, int32_t const* destinationBases, int32_t batchSize,
-    int32_t numKvHeads, int32_t tokensPerBlock, int32_t headDim, cudaStream_t stream)
+    int64_t sourceLayerStride, int64_t sourceHeadStride, int32_t const* sparseKvOffsets,
+    int32_t const* destinationBases, int32_t batchSize, int32_t numKvHeads, int32_t tokensPerBlock, int32_t headDim,
+    cudaStream_t stream)
 {
     KvCacheV2LayersBuffer buffer{};
     buffer.poolPointers = poolPointers;
     buffer.pageTable = pageTable;
     buffer.sourceLayerIndices = sourceLayerIndices;
     buffer.sourceLayerStride = sourceLayerStride;
+    buffer.sourceHeadStride = sourceHeadStride;
     buffer.pageTableRequestStride = pageTableRequestStride;
     buffer.tokensPerBlock = tokensPerBlock;
     buffer.destinationBases = destinationBases;
@@ -2060,8 +2069,8 @@ void invokeSparseKvCacheCompactV2Layers(int64_t const* poolPointers, int32_t con
 
 #define INSTANTIATE_SPARSE_KV_CACHE_COMPACT_V2_LAYERS(T)                                                               \
     template void invokeSparseKvCacheCompactV2Layers<T>(int64_t const*, int32_t const*, int32_t, int64_t,              \
-        int32_t const*, int32_t const*, int64_t, int32_t const*, int32_t const*, int32_t, int32_t, int32_t, int32_t,   \
-        cudaStream_t);
+        int32_t const*, int32_t const*, int64_t, int64_t, int32_t const*, int32_t const*, int32_t, int32_t, int32_t,   \
+        int32_t, cudaStream_t);
 
 } // namespace kernels
 

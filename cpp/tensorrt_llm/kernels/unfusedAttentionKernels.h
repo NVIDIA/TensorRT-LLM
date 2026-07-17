@@ -418,11 +418,14 @@ void invokeUpdateSparseKvCacheAfterFmha(QKVPreprocessingParams<T, KVCacheBuffer>
 //! each request and head, source ordinals must increase strictly and satisfy
 //! destinationBases[request] + move <= source[move]; the per-request bases
 //! let one launch cover a cohort with mixed pinned-prompt lengths.
+//! sourceHeadStride is the head-plane stride of sparseKvIndices: the index
+//! buffers may be wider than one round's total move count.
 template <typename T>
 void invokeSparseKvCacheCompactV2Layers(int64_t const* poolPointers, int32_t const* pageTable, int32_t numLayers,
     int64_t pageTableRequestStride, int32_t const* sparseKvIndices, int32_t const* sourceLayerIndices,
-    int64_t sourceLayerStride, int32_t const* sparseKvOffsets, int32_t const* destinationBases, int32_t batchSize,
-    int32_t numKvHeads, int32_t tokensPerBlock, int32_t headDim, cudaStream_t stream);
+    int64_t sourceLayerStride, int64_t sourceHeadStride, int32_t const* sparseKvOffsets,
+    int32_t const* destinationBases, int32_t batchSize, int32_t numKvHeads, int32_t tokensPerBlock, int32_t headDim,
+    cudaStream_t stream);
 
 // Debug function to test basic parameter access
 template <typename T, typename KVCacheBuffer>
